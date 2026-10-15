@@ -1155,7 +1155,7 @@ def gluon_kda_fused_decode_gfx950(
             graph-padding rows.
         write_indices: Destination state page per batch row. Negative entries
             suppress state updates.
-        num_heads: Number of local KDA heads; this specialization requires 12.
+        num_heads: Number of local KDA heads.
         head_dim: Per-head key/value width; this specialization requires 128.
         cu_seqlens: Packed row boundaries with shape ``[batch + 1]``. Active
             rows contain one token and graph-padding rows contain zero tokens.
@@ -1183,8 +1183,8 @@ def gluon_kda_fused_decode_gfx950(
     )
     if not all(tensor.is_cuda for tensor in tensors):
         raise ValueError("gfx950 fused KDA decode requires GPU tensors")
-    if num_heads != 12 or head_dim != 128:
-        raise ValueError("gfx950 fused KDA decode requires 12 heads of width 128")
+    if head_dim != 128:
+        raise ValueError("gfx950 fused KDA decode requires heads of width 128")
 
     tokens = read_indices.numel()
     projection_width = num_heads * head_dim
@@ -1318,8 +1318,8 @@ def gluon_kda_fused_verify_gfx950(
 ) -> torch.Tensor:
     """Run fused no-store KDA verify and capture its raw-g replay payload."""
     del conv_scratch, state_scratch, write_indices
-    if num_heads != 12 or head_dim != 128:
-        raise ValueError("gfx950 fused KDA verify requires H=12, D=128")
+    if head_dim != 128:
+        raise ValueError("gfx950 fused KDA verify requires D=128")
     if draft_token_num <= 0:
         raise ValueError("draft_token_num must be positive")
     batch = read_indices.numel()
@@ -1471,8 +1471,8 @@ def launch_gluon_kda_fused_replay_gfx950(
 ) -> None:
     """Replay every raw-g layer through the established Gluon recurrence."""
     del f_a_dim, f_a_stride
-    if num_heads != 12 or head_dim != 128 or conv_width != 4:
-        raise ValueError("gfx950 batched KDA replay requires H=12, D=128, W=4")
+    if head_dim != 128 or conv_width != 4:
+        raise ValueError("gfx950 batched KDA replay requires D=128, W=4")
     if descriptors.ndim != 2 or descriptors.shape[1] != 10:
         raise ValueError("descriptors must have shape [layers, 10]")
     if descriptors.dtype != torch.uint64 or not descriptors.is_contiguous():

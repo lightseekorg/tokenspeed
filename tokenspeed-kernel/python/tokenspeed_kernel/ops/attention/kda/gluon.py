@@ -155,7 +155,6 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "conv_kernel_size": frozenset({4}),
             "paged_state": frozenset({True}),
@@ -259,7 +258,6 @@ if current_platform().is_amd:
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
         priority=Priority.SPECIALIZED,
         traits={
-            "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "paged_state": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
@@ -282,7 +280,6 @@ if current_platform().is_amd:
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
         priority=Priority.SPECIALIZED,
         traits={
-            "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "batched_layers": frozenset({True}),
             "flat_state": frozenset({True}),
@@ -374,7 +371,6 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "conv_kernel_size": frozenset({4}),
             "paged_state": frozenset({True}),
@@ -478,7 +474,6 @@ if current_platform().is_amd:
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
         priority=Priority.SPECIALIZED,
         traits={
-            "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "paged_state": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
@@ -501,7 +496,6 @@ if current_platform().is_amd:
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
         priority=Priority.SPECIALIZED,
         traits={
-            "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "batched_layers": frozenset({True}),
             "flat_state": frozenset({True}),

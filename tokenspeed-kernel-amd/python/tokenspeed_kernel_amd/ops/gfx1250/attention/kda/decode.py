@@ -1130,13 +1130,13 @@ def gluon_kda_fused_decode_gfx1250(
             ``[pages, num_heads, head_dim(V), head_dim(K)]`` (V-major).
         read_indices: Source state page per batch row.
         write_indices: Destination state page per batch row.
-        num_heads: Number of local heads; this specialization requires 12.
+        num_heads: Number of local heads.
         head_dim: Per-head width; this specialization requires 128.
         cu_seqlens: Packed row boundaries with shape ``[batch + 1]``.
         lower_bound: Optional safe lower bound for the log-decay gate.
 
     Returns:
-        Gated-RMSNorm output with shape ``[1, batch, 12, 128]``. Valid
+        Raw KDA output with shape ``[1, batch, num_heads, 128]``. Valid
         destination convolution and recurrent states are updated in place.
     """
     tensors = (
@@ -1154,8 +1154,8 @@ def gluon_kda_fused_decode_gfx1250(
     )
     if not all(tensor.is_cuda for tensor in tensors):
         raise ValueError("gfx1250 fused KDA decode requires GPU tensors")
-    if num_heads != 12 or head_dim != 128:
-        raise ValueError("gfx1250 fused KDA decode requires 12 heads of width 128")
+    if head_dim != 128:
+        raise ValueError("gfx1250 fused KDA decode requires heads of width 128")
 
     tokens = read_indices.numel()
     projection_width = num_heads * head_dim
@@ -1299,7 +1299,7 @@ def gluon_kda_fused_verify_gfx1250(
         state_scratch: Unused; verification stores no recurrent tape.
         read_indices: Committed source state page per batch row.
         write_indices: Unused; no state is written.
-        num_heads: Number of local heads; this specialization requires 12.
+        num_heads: Number of local heads.
         head_dim: Per-head width; this specialization requires 128.
         draft_token_num: Speculative window length per request.
         lower_bound: Optional safe lower bound for the log-decay gate.
@@ -1311,12 +1311,13 @@ def gluon_kda_fused_verify_gfx1250(
         replay_beta: Destination for the captured beta logits.
 
     Returns:
-        Verify output with shape ``[1, batch * draft_token_num, 12, 128]``.
-        Neither state pool is modified.
+        Verify output with shape
+        ``[1, batch * draft_token_num, num_heads, 128]``. Neither state pool
+        is modified.
     """
     del conv_scratch, state_scratch, write_indices
-    if num_heads != 12 or head_dim != 128:
-        raise ValueError("gfx1250 fused KDA verify requires H=12, D=128")
+    if head_dim != 128:
+        raise ValueError("gfx1250 fused KDA verify requires D=128")
     if draft_token_num <= 0:
         raise ValueError("draft_token_num must be positive")
     batch = read_indices.numel()
@@ -1486,7 +1487,7 @@ def launch_gluon_kda_fused_replay_gfx1250(
             target token always advances state, and a zero-step row would
             leave its destination page unwritten.
         draft_token_num: Speculative window length per request.
-        num_heads: Number of local heads; this specialization requires 12.
+        num_heads: Number of local heads.
         head_dim: Per-head width; this specialization requires 128.
         f_a_dim: Unused; the raw-g payload has no low-rank stage to replay.
         qkv_stride: Row stride of the QKV payload.
@@ -1502,8 +1503,8 @@ def launch_gluon_kda_fused_replay_gfx1250(
         None. Committed convolution and recurrent pages are updated in place.
     """
     del f_a_dim, f_a_stride
-    if num_heads != 12 or head_dim != 128 or conv_width != 4:
-        raise ValueError("gfx1250 batched KDA replay requires H=12, D=128, W=4")
+    if head_dim != 128 or conv_width != 4:
+        raise ValueError("gfx1250 batched KDA replay requires D=128, W=4")
     if descriptors.ndim != 2 or descriptors.shape[1] != 10:
         raise ValueError("descriptors must have shape [layers, 10]")
     if descriptors.dtype != torch.uint64 or not descriptors.is_contiguous():

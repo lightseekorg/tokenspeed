@@ -22,6 +22,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     kda_recurrent_layout,
     kda_replay_commit_supported,
     kda_verify_conv_update,
+    resolve_kda_batched_replay_commit,
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
     try_kda_replay_commit,
@@ -1159,11 +1160,27 @@ def test_kda_paged_decode_graph_padding_and_page_stride() -> None:
     )
 
 
+# Local KDA heads: Kimi K3 at TP8 (12) across batch shapes, and GLM-5.3 at TP8
+# (8) and TP4 (16) at one full and one padded batch.
 @pytest.mark.parametrize(
-    ("batch", "active"),
-    [(1, 1), (2, 2), (4, 2), (8, 8), (16, 16), (32, 32), (64, 60)],
+    ("batch", "active", "heads"),
+    [
+        (1, 1, 12),
+        (2, 2, 12),
+        (4, 2, 12),
+        (8, 8, 12),
+        (16, 16, 12),
+        (32, 32, 12),
+        (64, 60, 12),
+        (1, 1, 8),
+        (4, 2, 8),
+        (1, 1, 16),
+        (4, 2, 16),
+    ],
 )
-def test_kda_fused_paged_decode_matches_reference(batch: int, active: int) -> None:
+def test_kda_fused_paged_decode_matches_reference(
+    batch: int, active: int, heads: int
+) -> None:
     """Convolution/gate/recurrent fusion returns raw output and updates paged state."""
     if not (
         current_platform().is_nvidia
@@ -1173,7 +1190,7 @@ def test_kda_fused_paged_decode_matches_reference(batch: int, active: int) -> No
         pytest.skip("NVIDIA/gfx950/gfx1250 KDA fusion test")
 
     torch.manual_seed(31)
-    heads, head_dim, pages = 12, 128, 2 * active
+    head_dim, pages = 128, 2 * active
     projection_width = heads * head_dim
     used_width = 4 * projection_width + head_dim + heads
     packed_width = (used_width + 15) // 16 * 16
@@ -1327,6 +1344,199 @@ def test_kda_fused_decode_rejects_unsupported_conv_width() -> None:
     )
 
     assert result is None
+
+
+@pytest.mark.parametrize(
+    ("batch", "heads"),
+    [(1, 12), (4, 12), (16, 12), (1, 8), (4, 8), (1, 16), (4, 16)],
+)
+def test_kda_fused_verify_and_replay_match_sequential_reference(
+    batch: int, heads: int
+) -> None:
+    """No-store verify and raw-g replay reproduce sequential KDA decode."""
+    if not (current_platform().is_cdna4 or current_platform().is_cdna5):
+        pytest.skip("gfx950/gfx1250 KDA verify/replay test")
+
+    torch.manual_seed(37)
+    head_dim, draft = 128, 4
+    width = heads * head_dim
+    rows = batch * draft
+    # Multi-request batches end in one graph-padding row.
+    active = batch - 1 if batch > 1 else batch
+    pages = 2 * batch + 1
+    used = 4 * width + head_dim + heads
+    packed = torch.randn(
+        rows, (used + 15) // 16 * 16, device="cuda", dtype=torch.bfloat16
+    )
+    # Verify is not a decode forward, so the model compacts Q/K/V first.
+    mixed_qkv = packed[:, : 3 * width].contiguous()
+    f_a_out = packed[:, 4 * width : 4 * width + head_dim]
+    beta_logits = packed[:, 4 * width + head_dim : used]
+    conv_weights = 0.1 * torch.randn(3 * width, 4, device="cuda", dtype=torch.bfloat16)
+    conv_pool = 0.1 * torch.randn(
+        pages, 3 * width, 3, device="cuda", dtype=torch.bfloat16
+    )
+    f_b_weight = 0.1 * torch.randn(width, head_dim, device="cuda", dtype=torch.bfloat16)
+    a_log = torch.randn(heads, device="cuda", dtype=torch.float32)
+    dt_bias = torch.randn(width, device="cuda", dtype=torch.float32)
+    state_pool = 0.01 * torch.randn(
+        pages, heads, head_dim, head_dim, device="cuda", dtype=torch.float32
+    )
+    read_indices = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
+    write_indices = read_indices + batch
+    read_indices[active:] = -1
+    write_indices[active:] = -1
+    accepted = torch.arange(batch, device="cuda", dtype=torch.int32) % draft + 1
+    initial_conv = conv_pool.clone()
+    initial_state = state_pool.clone()
+    replay_qkv = torch.empty_like(mixed_qkv)
+    replay_gate = torch.empty(rows, width, device="cuda", dtype=torch.bfloat16)
+    replay_beta = torch.empty(rows, heads, device="cuda", dtype=torch.bfloat16)
+
+    output = try_kda_fused_paged_verify(
+        mixed_qkv,
+        conv_weights,
+        conv_pool,
+        conv_pool,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        a_log,
+        dt_bias,
+        state_pool=state_pool,
+        state_scratch=None,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        num_heads=heads,
+        head_dim=head_dim,
+        draft_token_num=draft,
+        lower_bound=LOWER_BOUND,
+        recurrent_layout="v_major",
+        store_states=False,
+        replay_mixed_qkv=replay_qkv,
+        replay_gate=replay_gate,
+        replay_beta=replay_beta,
+    )
+    assert output is not None
+    torch.testing.assert_close(conv_pool, initial_conv, atol=0, rtol=0)
+    torch.testing.assert_close(state_pool, initial_state, atol=0, rtol=0)
+
+    tape = slice(0, active * draft)
+    raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
+    torch.testing.assert_close(replay_qkv[tape], mixed_qkv[tape], atol=0, rtol=0)
+    torch.testing.assert_close(replay_beta[tape], beta_logits[tape], atol=0, rtol=0)
+    torch.testing.assert_close(
+        replay_gate[tape].float(), raw_g[tape].float(), atol=1e-2, rtol=1e-2
+    )
+
+    weights = conv_weights.view(3, heads, head_dim, 4).float()
+    expected_out = torch.zeros(
+        rows, heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    expected_conv = initial_conv.clone()
+    expected_state = initial_state.clone()
+    for sequence in range(active):
+        read_idx = read_indices[sequence].item()
+        write_idx = write_indices[sequence].item()
+        window = slice(sequence * draft, (sequence + 1) * draft)
+        history = initial_conv[read_idx].view(3, heads, head_dim, 3)
+        # Oldest history tap first, then the draft window: [3 + T, 3, H, D].
+        taps = torch.cat(
+            (
+                history.permute(3, 0, 1, 2),
+                mixed_qkv[window].view(draft, 3, heads, head_dim),
+            )
+        ).float()
+        convolved = torch.nn.functional.silu(
+            torch.stack(
+                [
+                    sum(taps[token + tap] * weights[..., tap] for tap in range(4))
+                    for token in range(draft)
+                ]
+            )
+        )
+        q, k, v = convolved.unbind(dim=1)
+        gate = raw_g[window].view(draft, heads, head_dim)
+        beta = beta_logits[window]
+        reference_args = (
+            initial_state[read_idx],
+            a_log,
+            dt_bias.view(heads, head_dim),
+        )
+        reference_kwargs = {
+            "output_dtype": torch.bfloat16,
+            "lower_bound": LOWER_BOUND,
+            "eps": NORM_EPS,
+        }
+        expected_out[window], _ = reference_kda_recurrent(
+            q, k, v, gate, beta, *reference_args, **reference_kwargs
+        )
+        steps = accepted[sequence].item()
+        _, expected_state[write_idx] = reference_kda_recurrent(
+            q[:steps],
+            k[:steps],
+            v[:steps],
+            gate[:steps],
+            beta[:steps],
+            *reference_args,
+            **reference_kwargs,
+        )
+        expected_conv[write_idx] = (
+            taps[steps : steps + 3]
+            .to(torch.bfloat16)
+            .permute(1, 2, 3, 0)
+            .reshape(3 * width, 3)
+        )
+
+    torch.testing.assert_close(
+        output[0, tape].float(), expected_out[tape].float(), atol=1e-3, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        output[0, active * draft :],
+        torch.zeros_like(output[0, active * draft :]),
+    )
+
+    replay = resolve_kda_batched_replay_commit(num_heads=heads, head_dim=head_dim)
+    assert replay is not None
+    descriptors = torch.tensor(
+        [
+            [
+                replay_qkv.data_ptr(),
+                conv_weights.data_ptr(),
+                conv_pool.data_ptr(),
+                f_a_out.data_ptr(),
+                f_b_weight.data_ptr(),
+                replay_beta.data_ptr(),
+                a_log.data_ptr(),
+                dt_bias.data_ptr(),
+                state_pool.data_ptr(),
+                replay_gate.data_ptr(),
+            ]
+        ],
+        dtype=torch.uint64,
+        device="cuda",
+    )
+    replay(
+        descriptors=descriptors,
+        group_indices=torch.zeros(1, device="cuda", dtype=torch.int32),
+        read_indices=read_indices[None],
+        write_indices=write_indices[None],
+        accepted_length=accepted,
+        draft_token_num=draft,
+        num_heads=heads,
+        head_dim=head_dim,
+        f_a_dim=head_dim,
+        qkv_stride=replay_qkv.stride(0),
+        conv_stride=conv_pool.stride(0),
+        f_a_stride=f_a_out.stride(0),
+        beta_stride=replay_beta.stride(0),
+        state_stride=state_pool.stride(0),
+        gate_stride=replay_gate.stride(0),
+        conv_width=4,
+        lower_bound=LOWER_BOUND,
+    )
+    torch.testing.assert_close(conv_pool, expected_conv, atol=0, rtol=0)
+    torch.testing.assert_close(state_pool, expected_state, atol=5e-4, rtol=5e-4)
 
 
 def test_kda_paged_decode_does_not_select_nvidia_kernel_on_amd() -> None:
