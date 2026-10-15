@@ -18,13 +18,14 @@ Blackwell runners alongside the other Inkling suites.
 
 import os
 import sys
-import unittest
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from test.runtime.models.inkling_fixtures import load_inkling_config  # noqa: E402
+
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
-from runtime.models.inkling_fixtures import load_inkling_config  # noqa: E402
 
 register_cuda_ci(
     est_time=60,
@@ -121,10 +122,10 @@ def _replicate_heads(w: torch.Tensor, ckpt_heads: int, target: int, hd: int):
     return x.reshape(target * hd, *w.shape[1:])
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
-class TestInklingMTPLoadWeights(unittest.TestCase):
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs a CUDA device"))
+class TestInklingMTPLoadWeights:
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         from tokenspeed.runtime.distributed.mapping import Mapping
         from tokenspeed.runtime.models.inkling_nextn import (
             InklingForConditionalGenerationNextN,
@@ -155,24 +156,27 @@ class TestInklingMTPLoadWeights(unittest.TestCase):
     def test_structure_full_attention_dense_mlp(self):
         from tokenspeed.runtime.models.inkling import InklingDenseMLP
 
-        self.assertEqual(len(self.model.model.layers), NUM_DEPTHS)
+        assert (len(self.model.model.layers)) == (NUM_DEPTHS)
         # The multi-depth drafter's depth-count contract attribute.
-        self.assertEqual(self.model.num_mtp_layers, NUM_DEPTHS)
+        assert (self.model.num_mtp_layers) == (NUM_DEPTHS)
         for layer in self.model.model.layers:
             block = layer.transformer_block
-            self.assertFalse(block.is_moe)
-            self.assertIsInstance(block.mlp, InklingDenseMLP)
-            self.assertFalse(block.attn.is_local)
-            self.assertEqual(block.attn.rel_extent, self.text.rel_extent)
+            assert not (block.is_moe)
+            assert isinstance((block.mlp), (InklingDenseMLP))
+            assert not (block.attn.is_local)
+            assert (block.attn.rel_extent) == (self.text.rel_extent)
 
     def test_all_params_loaded_except_shared(self):
         shared = {"model.embed_tokens.weight", "lm_head.weight"}
         missing = set(self.params) - self.loaded - shared
-        self.assertEqual(missing, set(), f"params not loaded: {sorted(missing)}")
+        _pytest_first_1 = missing
+        _pytest_second_2 = set()
+        _pytest_msg_3 = f"params not loaded: {sorted(missing)}"
+        assert _pytest_first_1 == _pytest_second_2, _pytest_msg_3
 
     def test_qkvr_fusion_with_kv_replication(self):
         text = self.text
-        hd, heads = text.head_dim, text.num_attention_heads
+        hd, _heads = text.head_dim, text.num_attention_heads
         # Hetero (default): depth blocks are full-attention and serve their
         # native ckpt KV heads — the loader's replication is a no-op.
         hetero = True  # gate retired 2026-07-15; hetero KV is unconditional
@@ -201,7 +205,9 @@ class TestInklingMTPLoadWeights(unittest.TestCase):
             got = self.params[
                 f"model.layers.{i}.transformer_block.attn.qkvr.weight"
             ].cpu()
-            self.assertTrue(torch.equal(got, expect), f"qkvr mismatch depth {i}")
+            _pytest_expr_7 = torch.equal(got, expect)
+            _pytest_msg_8 = f"qkvr mismatch depth {i}"
+            assert _pytest_expr_7, _pytest_msg_8
 
     def test_w13_deinterleave(self):
         for i in range(NUM_DEPTHS):
@@ -209,7 +215,7 @@ class TestInklingMTPLoadWeights(unittest.TestCase):
             got = self.params[
                 f"model.layers.{i}.transformer_block.mlp.gate_up_proj.weight"
             ].cpu()
-            self.assertTrue(torch.equal(got, _deinterleave_rows(src)))
+            assert torch.equal(got, _deinterleave_rows(src))
 
     def test_sconv_kv_replication(self):
         text = self.text
@@ -230,20 +236,18 @@ class TestInklingMTPLoadWeights(unittest.TestCase):
             got = self.params[
                 f"model.layers.{i}.transformer_block.attn.k_sconv.weight"
             ].cpu()
-            self.assertTrue(torch.equal(got, expect))
+            assert torch.equal(got, expect)
 
     def test_chain_norm_and_fusion_norms(self):
-        self.assertTrue(
-            torch.equal(
-                self.params["model.chain_norm.weight"].cpu(),
-                self.ckpt["model.mtp.chain_norm.weight"],
-            )
+        assert torch.equal(
+            self.params["model.chain_norm.weight"].cpu(),
+            self.ckpt["model.mtp.chain_norm.weight"],
         )
         for i in range(NUM_DEPTHS):
             for leaf in ("hidden_norm", "embed_norm", "input_proj"):
                 got = self.params[f"model.layers.{i}.{leaf}.weight"].cpu()
-                self.assertTrue(
-                    torch.equal(got, self.ckpt[f"model.mtp.layers.{i}.{leaf}.weight"])
+                assert torch.equal(
+                    got, self.ckpt[f"model.mtp.layers.{i}.{leaf}.weight"]
                 )
 
     def test_missing_depth_raises(self):
@@ -264,19 +268,19 @@ class TestInklingMTPLoadWeights(unittest.TestCase):
             for k, v in self.ckpt.items()
             if not k.startswith("model.mtp.layers.1.")
         }
-        with self.assertRaisesRegex(ValueError, r"depth layer\(s\) \[1\]"):
+        with pytest.raises((ValueError), match=(r"depth layer\(s\) \[1\]")):
             model.load_weights(iter(partial.items()))
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
-class TestInklingMTPLoadWeightsSWADepths(unittest.TestCase):
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs a CUDA device"))
+class TestInklingMTPLoadWeightsSWADepths:
     """4d71c3ea-style head: mixed SWA/full depths + steps pruning."""
 
     NUM_DEPTHS = 3
     LOCAL_IDS = (0, 2)
 
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         from tokenspeed.runtime.distributed.mapping import Mapping
         from tokenspeed.runtime.models.inkling_nextn import (
             InklingForConditionalGenerationNextN,
@@ -302,26 +306,29 @@ class TestInklingMTPLoadWeightsSWADepths(unittest.TestCase):
         cls.params = dict(cls.model.named_parameters())
 
     def test_structure_mixed_local_full(self):
-        self.assertEqual(len(self.model.model.layers), self.NUM_DEPTHS)
+        assert (len(self.model.model.layers)) == (self.NUM_DEPTHS)
         for i, layer in enumerate(self.model.model.layers):
             attn = layer.transformer_block.attn
             if i in self.LOCAL_IDS:
-                self.assertTrue(attn.is_local, f"depth {i}")
-                self.assertEqual(attn.rel_extent, self.text.sliding_window_size)
-                self.assertEqual(
-                    attn.num_tp_kv_heads, self.text.swa_num_key_value_heads
-                )
+                _pytest_expr_11 = attn.is_local
+                _pytest_msg_12 = f"depth {i}"
+                assert _pytest_expr_11, _pytest_msg_12
+                assert (attn.rel_extent) == (self.text.sliding_window_size)
+                assert (attn.num_tp_kv_heads) == (self.text.swa_num_key_value_heads)
             else:
-                self.assertFalse(attn.is_local, f"depth {i}")
-                self.assertEqual(attn.rel_extent, self.text.rel_extent)
-                self.assertEqual(
-                    attn.num_tp_kv_heads, self.text.ckpt_num_key_value_heads
-                )
+                _pytest_expr_13 = attn.is_local
+                _pytest_msg_14 = f"depth {i}"
+                assert not _pytest_expr_13, _pytest_msg_14
+                assert (attn.rel_extent) == (self.text.rel_extent)
+                assert (attn.num_tp_kv_heads) == (self.text.ckpt_num_key_value_heads)
 
     def test_all_params_loaded_except_shared(self):
         shared = {"model.embed_tokens.weight", "lm_head.weight"}
         missing = set(self.params) - self.loaded - shared
-        self.assertEqual(missing, set(), f"params not loaded: {sorted(missing)}")
+        _pytest_first_4 = missing
+        _pytest_second_5 = set()
+        _pytest_msg_6 = f"params not loaded: {sorted(missing)}"
+        assert _pytest_first_4 == _pytest_second_5, _pytest_msg_6
 
     def test_qkvr_fusion_no_replication_per_depth(self):
         # Hetero serving: every depth serves its native ckpt head count, so
@@ -340,7 +347,9 @@ class TestInklingMTPLoadWeightsSWADepths(unittest.TestCase):
             got = self.params[
                 f"model.layers.{i}.transformer_block.attn.qkvr.weight"
             ].cpu()
-            self.assertTrue(torch.equal(got, expect), f"qkvr mismatch depth {i}")
+            _pytest_expr_9 = torch.equal(got, expect)
+            _pytest_msg_10 = f"qkvr mismatch depth {i}"
+            assert _pytest_expr_9, _pytest_msg_10
 
     def test_pruned_depths_are_skipped(self):
         from tokenspeed.runtime.configs.inkling_config import (
@@ -361,18 +370,18 @@ class TestInklingMTPLoadWeightsSWADepths(unittest.TestCase):
                 model = InklingForConditionalGenerationNextN(config, self.mapping)
             finally:
                 torch.set_default_dtype(torch.float32)
-        self.assertEqual(len(model.model.layers), 2)
-        self.assertEqual(config.text_config.local_layer_ids, [0])
+        assert (len(model.model.layers)) == (2)
+        assert (config.text_config.local_layer_ids) == ([0])
         # The full 3-depth checkpoint loads cleanly; depth 2 is skipped.
         loaded = model.load_weights(iter(self.ckpt.items()))
-        self.assertFalse(any(n.startswith("model.layers.2.") for n in loaded))
+        assert not (any(n.startswith("model.layers.2.") for n in loaded))
         missing = (
             set(dict(model.named_parameters()))
             - loaded
             - {"model.embed_tokens.weight", "lm_head.weight"}
         )
-        self.assertEqual(missing, set())
+        assert (missing) == (set())
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

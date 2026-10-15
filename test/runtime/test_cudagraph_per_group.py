@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import os
 import sys
-import unittest
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -52,17 +53,17 @@ def _stacks(device, max_bs=6):
     )
 
 
-class UnpackKernelParityTest(unittest.TestCase):
+class TestUnpackKernelParityTest:
     """The per-group unpack launch must agree with the torch reference at
     shapes the bridge really produces: shared packed storage, per-group
     column counts, holes and ragged -1 pads, padded rows."""
 
-    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
-    def test_kernel_matches_torch_reference_at_odd_shapes(self):
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs CUDA"))
+    def test_kernel_matches_torch_reference_at_odd_shapes(self, subtests):
         torch.manual_seed(7)
         rows = 5
         for bs, actual_bs, cols in ((5, 3, (7, 5, 3)), (4, 4, (2, 9, 1))):
-            with self.subTest(bs=bs, actual_bs=actual_bs, cols=cols):
+            with subtests.test(bs=bs, actual_bs=actual_bs, cols=cols):
                 total = rows * sum(cols)
                 packed = torch.randint(
                     -1, 20, (total,), dtype=torch.int32, device="cuda"
@@ -82,16 +83,16 @@ class UnpackKernelParityTest(unittest.TestCase):
                     stacks_cuda.tables[:, :bs], stacks_ref.tables[:, :bs]
                 )
 
-    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs CUDA"))
     def test_separate_storages_take_the_same_kernel(self):
         stacks = _stacks("cuda")
         srcs = [torch.ones((2, 3), dtype=torch.int32, device="cuda") for _ in range(3)]
         stacks.fill(2, 2, dict(zip((G0, G1, G2), srcs)))
         # Ratio 4 group: raw page 1 -> kernel pages 4..7, truncated to width 5.
-        self.assertEqual(stacks.table(G2, 2)[0].tolist(), [4, 5, 6, 7, 4])
+        assert (stacks.table(G2, 2)[0].tolist()) == ([4, 5, 6, 7, 4])
 
 
-class PaddingContractTest(unittest.TestCase):
+class TestPaddingContractTest:
     """Column tails and dummy rows are ALWAYS the null page 0 (safe to
     dereference, never a live request) — the old -1 tails plus wrapper
     masking are gone, and no previous step's residue may survive a refill."""
@@ -106,14 +107,11 @@ class PaddingContractTest(unittest.TestCase):
         }
         stacks.fill(bs=1, actual_bs=1, block_tables=raw)
         # ratio 1, width 7: 2 live columns then 5 zeros.
-        self.assertEqual(stacks.table(G0, 1)[0].tolist(), [5, 6, 0, 0, 0, 0, 0])
+        assert (stacks.table(G0, 1)[0].tolist()) == ([5, 6, 0, 0, 0, 0, 0])
         # ratio 2, width 13: 4 live kernel pages then 9 zeros.
-        self.assertEqual(
-            stacks.table(G1, 1)[0].tolist(),
-            [10, 11, 12, 13] + [0] * 9,
-        )
+        assert (stacks.table(G1, 1)[0].tolist()) == ([10, 11, 12, 13] + [0] * 9)
         # ratio 4, width 5: truncated inside page 5's expansion — no tail.
-        self.assertEqual(stacks.table(G2, 1)[0].tolist(), [20, 21, 22, 23, 24])
+        assert (stacks.table(G2, 1)[0].tolist()) == ([20, 21, 22, 23, 24])
 
     def test_dummy_rows_are_zero_and_residue_is_cleared(self):
         stacks = _stacks("cpu")
@@ -131,12 +129,12 @@ class PaddingContractTest(unittest.TestCase):
             G2: torch.tensor([[5]], dtype=torch.int32),
         }
         stacks.fill(bs=3, actual_bs=1, block_tables=narrow)
-        self.assertEqual(
-            stacks.table(G0, 3).tolist(), [[5, 0, 0, 0, 0, 0, 0]] + [[0] * 7] * 2
+        assert (stacks.table(G0, 3).tolist()) == (
+            [[5, 0, 0, 0, 0, 0, 0]] + [[0] * 7] * 2
         )
-        self.assertEqual(stacks.table(G1, 3)[0, :2].tolist(), [10, 11])
-        self.assertEqual(int(stacks.table(G1, 3)[0, 2:].abs().sum()), 0)
-        self.assertEqual(int(stacks.table(G1, 3)[1:].abs().sum()), 0)
+        assert (stacks.table(G1, 3)[0, :2].tolist()) == ([10, 11])
+        assert (int(stacks.table(G1, 3)[0, 2:].abs().sum())) == (0)
+        assert (int(stacks.table(G1, 3)[1:].abs().sum())) == (0)
 
     def test_idle_fill_zeroes_the_whole_padded_batch(self):
         stacks = _stacks("cpu")
@@ -145,8 +143,8 @@ class PaddingContractTest(unittest.TestCase):
             gid: torch.ones((4, 2), dtype=torch.int32) for gid in (G0, G1, G2)
         }
         stacks.fill(bs=4, actual_bs=0, block_tables=placeholder)
-        self.assertEqual(int(stacks.tables[:, :4].abs().sum()), 0)
+        assert (int(stacks.tables[:, :4].abs().sum())) == (0)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

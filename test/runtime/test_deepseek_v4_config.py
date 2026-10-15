@@ -3,12 +3,13 @@ import json
 import os
 import sys
 import tempfile
-import unittest
 from contextlib import redirect_stderr
 from io import StringIO
 from types import MethodType, SimpleNamespace
 from typing import ClassVar
 from unittest.mock import Mock, patch
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -218,7 +219,7 @@ def _make_planned_deepseek_v4_pool(
     max_packing = max(group.cache_blocks_per_lcm_block for group in plan.groups)
     pool_size = num_lcm_blocks * max_packing * plan.prefix_granularity
     specs = tuple(spec for spec, _ in groups)
-    from cache_pool_test_utils import make_pool
+    from test.runtime.cache_pool_test_utils import make_pool
 
     _, pool = make_pool(
         HybridDeepseekV4TokenToKVPool,
@@ -290,7 +291,7 @@ def _mhc_post_reference(
     return (mixed_residual + block_update).to(hidden_states.dtype)
 
 
-class TestDeepseekV4Config(unittest.TestCase):
+class TestDeepseekV4Config:
     quant_config: ClassVar = {
         "quant_method": "fp8",
         "activation_scheme": "dynamic",
@@ -298,8 +299,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     }
 
     def test_config_registry(self):
-        self.assertEqual(DeepseekV4Config.model_type, "deepseek_v4")
-        self.assertIs(_CONFIG_REGISTRY["deepseek_v4"], DeepseekV4Config)
+        assert (DeepseekV4Config.model_type) == ("deepseek_v4")
+        assert (_CONFIG_REGISTRY["deepseek_v4"]) is (DeepseekV4Config)
 
     def test_fp4_expert_contract_overrides_model_wide_fp8_config(self):
         quant_config = Fp8Config(
@@ -313,11 +314,11 @@ class TestDeepseekV4Config(unittest.TestCase):
             SimpleNamespace(expert_dtype="fp4"), quant_config
         )
 
-        self.assertFalse(is_block_fp8)
-        self.assertIsInstance(routed_quant_config, Mxfp4Config)
-        self.assertTrue(routed_quant_config.is_checkpoint_mxfp4_serialized)
+        assert not (is_block_fp8)
+        assert isinstance((routed_quant_config), (Mxfp4Config))
+        assert routed_quant_config.is_checkpoint_mxfp4_serialized
 
-    def test_fp8_expert_contract_keeps_model_wide_fp8_config(self):
+    def test_fp8_expert_contract_keeps_model_wide_fp8_config(self, subtests):
         quant_config = Fp8Config(
             is_checkpoint_fp8_serialized=True,
             activation_scheme="dynamic",
@@ -326,30 +327,30 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         for expert_dtype in (None, "fp8"):
-            with self.subTest(expert_dtype=expert_dtype):
+            with subtests.test(expert_dtype=expert_dtype):
                 routed_quant_config, is_block_fp8 = (
                     _deepseek_v4_routed_expert_quant_config(
                         SimpleNamespace(expert_dtype=expert_dtype), quant_config
                     )
                 )
 
-                self.assertTrue(is_block_fp8)
-                self.assertIs(routed_quant_config, quant_config)
+                assert is_block_fp8
+                assert (routed_quant_config) is (quant_config)
 
     def test_forward_mode_mixed_predicate(self):
-        self.assertTrue(ForwardMode.MIXED.is_mixed())
-        self.assertFalse(ForwardMode.EXTEND.is_mixed())
-        self.assertFalse(ForwardMode.DECODE.is_mixed())
-        self.assertTrue(ForwardMode.EXTEND.is_extend_or_mixed())
-        self.assertTrue(ForwardMode.MIXED.is_extend_or_mixed())
-        self.assertFalse(ForwardMode.DECODE.is_extend_or_mixed())
-        self.assertTrue(ForwardMode.DECODE.is_decode_or_idle())
-        self.assertTrue(ForwardMode.IDLE.is_decode_or_idle())
-        self.assertFalse(ForwardMode.EXTEND.is_decode_or_idle())
-        self.assertEqual(ForwardMode.from_num_extends(0, 0), ForwardMode.IDLE)
-        self.assertEqual(ForwardMode.from_num_extends(0, 2), ForwardMode.DECODE)
-        self.assertEqual(ForwardMode.from_num_extends(2, 2), ForwardMode.EXTEND)
-        self.assertEqual(ForwardMode.from_num_extends(1, 2), ForwardMode.MIXED)
+        assert ForwardMode.MIXED.is_mixed()
+        assert not (ForwardMode.EXTEND.is_mixed())
+        assert not (ForwardMode.DECODE.is_mixed())
+        assert ForwardMode.EXTEND.is_extend_or_mixed()
+        assert ForwardMode.MIXED.is_extend_or_mixed()
+        assert not (ForwardMode.DECODE.is_extend_or_mixed())
+        assert ForwardMode.DECODE.is_decode_or_idle()
+        assert ForwardMode.IDLE.is_decode_or_idle()
+        assert not (ForwardMode.EXTEND.is_decode_or_idle())
+        assert (ForwardMode.from_num_extends(0, 0)) == (ForwardMode.IDLE)
+        assert (ForwardMode.from_num_extends(0, 2)) == (ForwardMode.DECODE)
+        assert (ForwardMode.from_num_extends(2, 2)) == (ForwardMode.EXTEND)
+        assert (ForwardMode.from_num_extends(1, 2)) == (ForwardMode.MIXED)
 
     def test_model_runner_forwards_supported_spec_step_idx(self):
         class ModelWithSpecStep:
@@ -372,7 +373,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         runner._model_forward_accepts_spec_step_idx = (
             ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
         )
-        self.assertTrue(runner.forward_accepts_spec_step_idx)
+        assert runner.forward_accepts_spec_step_idx
 
         empty = torch.empty(0, dtype=torch.int32)
         result = runner.forward(
@@ -382,8 +383,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             spec_step_idx=2,
         )
 
-        self.assertEqual(result, 2)
-        self.assertEqual(runner.model.received_spec_step_idx, 2)
+        assert (result) == (2)
+        assert (runner.model.received_spec_step_idx) == (2)
 
     def test_model_runner_omits_unsupported_spec_step_idx(self):
         class ModelWithoutSpecStep:
@@ -401,7 +402,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         runner._model_forward_accepts_spec_step_idx = (
             ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
         )
-        self.assertFalse(runner.forward_accepts_spec_step_idx)
+        assert not (runner.forward_accepts_spec_step_idx)
 
         empty = torch.empty(0, dtype=torch.int32)
         result = runner.forward(
@@ -411,7 +412,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             spec_step_idx=2,
         )
 
-        self.assertEqual(result, "ok")
+        assert (result) == ("ok")
 
     def test_model_runner_does_not_forward_spec_step_idx_to_var_kwargs(self):
         class ModelWithKwargs:
@@ -434,7 +435,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         runner._model_forward_accepts_spec_step_idx = (
             ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
         )
-        self.assertFalse(runner.forward_accepts_spec_step_idx)
+        assert not (runner.forward_accepts_spec_step_idx)
 
         empty = torch.empty(0, dtype=torch.int32)
         result = runner.forward(
@@ -444,8 +445,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             spec_step_idx=2,
         )
 
-        self.assertEqual(result, "ok")
-        self.assertEqual(runner.model.received_kwargs, {})
+        assert (result) == ("ok")
+        assert (runner.model.received_kwargs) == ({})
 
     def test_spec_helpers_preserve_non_v4_backend_contracts(self):
         seq_lens = object()
@@ -457,7 +458,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         _advance_draft_forward_metadata_if_supported(V4LikeBackend(), seq_lens)
         _advance_draft_forward_metadata_if_supported(SimpleNamespace(), seq_lens)
-        self.assertEqual(calls, [seq_lens])
+        assert (calls) == ([seq_lens])
 
     def _bind_deepseek_v4_moe_methods(self, moe):
         for name in (
@@ -482,25 +483,25 @@ class TestDeepseekV4Config(unittest.TestCase):
     ):
         def routing_inputs(states, ids):
             calls.append("routing_inputs")
-            self.assertIs(states, hidden_states)
-            self.assertIs(ids, input_ids)
+            assert (states) is (hidden_states)
+            assert (ids) is (input_ids)
             return torch.zeros(states.shape[0], 4), None, None, ids
 
         def topk(states, router_logits, **kwargs):
             calls.append("topk")
-            self.assertIs(states, hidden_states)
-            self.assertEqual(tuple(router_logits.shape), (states.shape[0], 4))
+            assert (states) is (hidden_states)
+            assert (tuple(router_logits.shape)) == ((states.shape[0], 4))
             return SimpleNamespace(scale=2.0)
 
         def routed_experts(**kwargs):
             calls.append("routed")
-            self.assertIs(kwargs["hidden_states"], hidden_states)
-            self.assertIsNotNone(kwargs["topk_output"])
+            assert (kwargs["hidden_states"]) is (hidden_states)
+            assert (kwargs["topk_output"]) is not None
             return (hidden_states + 1) * kwargs["topk_output"].scale
 
         def shared_experts(states):
             calls.append("shared")
-            self.assertIs(states, hidden_states)
+            assert (states) is (hidden_states)
             return hidden_states + 3
 
         moe = SimpleNamespace(
@@ -537,10 +538,10 @@ class TestDeepseekV4Config(unittest.TestCase):
                 hash_routing=False,
             )(hidden_states, router_logits)
 
-        self.assertIs(output.topk_weights, topk_weights)
-        self.assertIs(output.topk_ids, topk_ids)
-        self.assertIs(output.router_logits, router_logits)
-        self.assertEqual(calls[0][0][2:6], ("sqrt_softplus", "topk", True, 2.0))
+        assert (output.topk_weights) is (topk_weights)
+        assert (output.topk_ids) is (topk_ids)
+        assert (output.router_logits) is (router_logits)
+        assert (calls[0][0][2:6]) == (("sqrt_softplus", "topk", True, 2.0))
 
     def test_deepseek_v4_topk_routes_simulated_logits(self):
         router_logits = torch.zeros((2, 4))
@@ -565,8 +566,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             expected = topk_module.simulated_router_logits(router_logits)
 
         torch.testing.assert_close(seen[0], expected, rtol=0, atol=0)
-        self.assertFalse(torch.equal(seen[0], router_logits))
-        self.assertIs(output.router_logits, seen[0])
+        assert not (torch.equal(seen[0], router_logits))
+        assert (output.router_logits) is (seen[0])
 
     def test_deepseek_v4_moe_stream_fork_disabled_order(self):
         calls = []
@@ -588,17 +589,15 @@ class TestDeepseekV4Config(unittest.TestCase):
             max_num_tokens_per_gpu=2,
         )
 
-        self.assertEqual(calls, ["routing_inputs", "topk", "routed", "shared"])
-        self.assertTrue(
-            torch.equal(actual, (hidden_states + 1) * 2 + hidden_states + 3)
-        )
+        assert (calls) == (["routing_inputs", "topk", "routed", "shared"])
+        assert torch.equal(actual, (hidden_states + 1) * 2 + hidden_states + 3)
 
-    def test_deepseek_v4_moe_always_builds_topk_output(self):
+    def test_deepseek_v4_moe_always_builds_topk_output(self, subtests):
         hidden_states = torch.ones(2, 3)
         input_ids = torch.arange(2)
 
         for norm_topk_prob in (False, True):
-            with self.subTest(norm_topk_prob=norm_topk_prob):
+            with subtests.test(norm_topk_prob=norm_topk_prob):
                 calls = []
                 moe = self._make_fake_deepseek_v4_moe(
                     hidden_states,
@@ -617,8 +616,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                 )
 
                 expected = (hidden_states + 1) * 2 + hidden_states + 3
-                self.assertEqual(calls, ["routing_inputs", "topk", "routed", "shared"])
-                self.assertTrue(torch.equal(actual, expected))
+                assert (calls) == (["routing_inputs", "topk", "routed", "shared"])
+                assert torch.equal(actual, expected)
 
     def test_deepseek_v4_moe_topk_owns_routed_scaling(self):
         captured = {}
@@ -674,10 +673,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         ):
             moe = DeepseekV4MoE(config, mapping, None, 0, "model.layers.0.ffn")
 
-        self.assertEqual(moe.routed_scaling_factor, 2.5)
-        self.assertEqual(captured["routing_mode"], "precomputed_topk")
-        self.assertEqual(captured["routing_config"]["routed_scaling_factor"], 1.0)
-        self.assertEqual(topk_config["routed_scaling_factor"], 2.5)
+        assert (moe.routed_scaling_factor) == (2.5)
+        assert (captured["routing_mode"]) == ("precomputed_topk")
+        assert (captured["routing_config"]["routed_scaling_factor"]) == (1.0)
+        assert (topk_config["routed_scaling_factor"]) == (2.5)
 
     def test_deepseek_v4_shared_mlp_uses_dense_tp(self):
         mapping = Mapping(
@@ -701,30 +700,30 @@ class TestDeepseekV4Config(unittest.TestCase):
             prefix="model.layers.0.ffn.shared_experts",
         )
 
-        self.assertEqual(shared_mlp.tp_rank, mapping.dense.tp_rank)
-        self.assertEqual(shared_mlp.tp_size, mapping.dense.tp_size)
-        self.assertEqual(shared_mlp.tp_group, mapping.dense.tp_group)
-        self.assertNotEqual(shared_mlp.tp_size, mapping.moe.tp_ep_size)
+        assert (shared_mlp.tp_rank) == (mapping.dense.tp_rank)
+        assert (shared_mlp.tp_size) == (mapping.dense.tp_size)
+        assert (shared_mlp.tp_group) == (mapping.dense.tp_group)
+        assert (shared_mlp.tp_size) != (mapping.moe.tp_ep_size)
 
     def _make_fake_mega_deepseek_v4_moe(
         self, hidden_states, input_ids, shared_experts, calls
     ):
         def routing_inputs(states, ids):
             calls.append("routing_inputs")
-            self.assertIs(states, hidden_states)
-            self.assertIs(ids, input_ids)
+            assert (states) is (hidden_states)
+            assert (ids) is (input_ids)
             return torch.zeros(states.shape[0], 4), None, None, ids
 
         def topk(states, router_logits, **kwargs):
             calls.append("topk")
-            self.assertIs(states, hidden_states)
-            self.assertEqual(tuple(router_logits.shape), (states.shape[0], 4))
+            assert (states) is (hidden_states)
+            assert (tuple(router_logits.shape)) == ((states.shape[0], 4))
             return object()
 
         def routed_experts(**kwargs):
             calls.append("routed")
-            self.assertIs(kwargs["hidden_states"], hidden_states)
-            self.assertIsNotNone(kwargs["topk_output"])
+            assert (kwargs["hidden_states"]) is (hidden_states)
+            assert (kwargs["topk_output"]) is not None
             return hidden_states + 1
 
         moe = SimpleNamespace(
@@ -744,7 +743,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         calls = []
         hidden_states = torch.ones(2, 3)
         input_ids = torch.arange(2)
-        test_case = self
 
         class SharedExperts:
             tp_rank = 0
@@ -753,7 +751,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
             def __call__(self, states):
                 calls.append("shared")
-                test_case.assertIs(states, hidden_states)
+                assert states is hidden_states
                 return states + 3
 
         moe = self._make_fake_mega_deepseek_v4_moe(
@@ -763,11 +761,11 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         class FakeCommManager:
             def pre_dense_comm(self, states, actual_ctx):
-                test_case.assertIs(actual_ctx, ctx)
+                assert actual_ctx is ctx
                 return states
 
             def post_dense_comm(self, states, residual, actual_ctx):
-                test_case.assertIs(actual_ctx, ctx)
+                assert actual_ctx is ctx
                 return states, residual
 
         actual = DeepseekV4MoE.forward(
@@ -780,15 +778,14 @@ class TestDeepseekV4Config(unittest.TestCase):
             comm_manager=FakeCommManager(),
         )
 
-        self.assertEqual(calls, ["routing_inputs", "topk", "routed", "shared"])
-        self.assertTrue(torch.equal(actual, hidden_states + 1 + hidden_states + 3))
+        assert (calls) == (["routing_inputs", "topk", "routed", "shared"])
+        assert torch.equal(actual, hidden_states + 1 + hidden_states + 3)
 
     def test_deepseek_v4_mega_moe_shared_uses_comm_manager(self):
         calls = []
         hidden_states = torch.ones(2, 3)
         input_ids = torch.arange(2)
         ctx = object()
-        test_case = self
 
         class SharedExperts:
             tp_rank = 1
@@ -797,7 +794,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
             def __call__(self, states):
                 calls.append("shared")
-                test_case.assertTrue(torch.equal(states, hidden_states + 2))
+                assert torch.equal(states, hidden_states + 2)
                 return states + 3
 
         moe = self._make_fake_mega_deepseek_v4_moe(
@@ -808,15 +805,15 @@ class TestDeepseekV4Config(unittest.TestCase):
         class FakeCommManager:
             def pre_dense_comm(self, states, actual_ctx):
                 comm_calls.append(("pre", actual_ctx))
-                test_case.assertIs(actual_ctx, ctx)
-                test_case.assertIs(states, hidden_states)
+                assert actual_ctx is ctx
+                assert states is hidden_states
                 return states + 2
 
             def post_dense_comm(self, states, residual, actual_ctx):
                 comm_calls.append(("post", actual_ctx))
-                test_case.assertIsNone(residual)
-                test_case.assertIs(actual_ctx, ctx)
-                test_case.assertTrue(torch.equal(states, hidden_states + 5))
+                assert residual is None
+                assert actual_ctx is ctx
+                assert torch.equal(states, hidden_states + 5)
                 return states - 2, residual
 
         actual = DeepseekV4MoE.forward(
@@ -829,11 +826,11 @@ class TestDeepseekV4Config(unittest.TestCase):
             comm_manager=FakeCommManager(),
         )
 
-        self.assertEqual(calls, ["routing_inputs", "topk", "routed", "shared"])
-        self.assertEqual(comm_calls, [("pre", ctx), ("post", ctx)])
-        self.assertTrue(torch.equal(actual, hidden_states + 1 + hidden_states + 3))
+        assert (calls) == (["routing_inputs", "topk", "routed", "shared"])
+        assert (comm_calls) == ([("pre", ctx), ("post", ctx)])
+        assert torch.equal(actual, hidden_states + 1 + hidden_states + 3)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("CUDA is required"))
     def test_deepseek_v4_moe_stream_fork_aux_path_matches_serial(self):
         calls = []
         hidden_states = torch.ones(2, 3, device="cuda")
@@ -856,10 +853,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         torch.cuda.synchronize()
 
-        self.assertEqual(calls, ["routing_inputs", "topk", "routed", "shared"])
-        self.assertTrue(
-            torch.equal(actual, (hidden_states + 1) * 2 + hidden_states + 3)
-        )
+        assert (calls) == (["routing_inputs", "topk", "routed", "shared"])
+        assert torch.equal(actual, (hidden_states + 1) * 2 + hidden_states + 3)
 
     def test_cuda_graph_replay_keeps_idle_actual_bs_with_padded_group_tables(self):
         captured = {}
@@ -891,12 +886,9 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         # (padded_bs, actual_bs) are the leading positional args.
-        self.assertEqual(captured["args"][0], 4)
-        self.assertEqual(captured["args"][1], 0)
-        self.assertEqual(
-            captured["kwargs"]["block_tables"]["v4.swa"].shape,
-            (4, 1),
-        )
+        assert (captured["args"][0]) == (4)
+        assert (captured["args"][1]) == (0)
+        assert (captured["kwargs"]["block_tables"]["v4.swa"].shape) == ((4, 1))
 
     def test_cuda_graph_replay_forwards_group_tables_to_draft_backend(self):
         captured = {"target": {}, "draft": {}}
@@ -935,14 +927,13 @@ class TestDeepseekV4Config(unittest.TestCase):
         # The draft consumes its own groups out of the SAME delivered dict;
         # row padding is the backend's job now.
         draft_kwargs = captured["draft"]["kwargs"]
-        self.assertIs(draft_kwargs["block_tables"]["v4.swa"], table)
-        self.assertEqual(draft_kwargs["forward_mode"], ForwardMode.DECODE)
+        assert (draft_kwargs["block_tables"]["v4.swa"]) is (table)
+        assert (draft_kwargs["forward_mode"]) == (ForwardMode.DECODE)
         draft_seq_lens = captured["draft"]["args"][3]
-        self.assertEqual(
-            draft_seq_lens.data_ptr(),
-            wrapper.drafter.draft_seq_lens_buf.data_ptr(),
+        assert (draft_seq_lens.data_ptr()) == (
+            wrapper.drafter.draft_seq_lens_buf.data_ptr()
         )
-        self.assertEqual(wrapper.drafter.draft_seq_lens_buf.tolist(), [1, 1, 1, 1])
+        assert (wrapper.drafter.draft_seq_lens_buf.tolist()) == ([1, 1, 1, 1])
 
     def test_cuda_graph_eager_draft_extend_round_runs_init_then_refresh(self):
         captured = {"target": [], "draft": []}
@@ -982,22 +973,19 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         # The unified draft contract is two steps: prefill init, then the
         # same decode refresh the pure-decode path uses.
-        self.assertEqual(
-            [kind for kind, _, _ in captured["draft"]], ["init", "refresh"]
-        )
+        assert ([kind for kind, _, _ in captured["draft"]]) == (["init", "refresh"])
         _, _, init_kwargs = captured["draft"][0]
-        self.assertEqual(init_kwargs["forward_mode"], ForwardMode.EXTEND)
+        assert (init_kwargs["forward_mode"]) == (ForwardMode.EXTEND)
         # The init reads the accepted-prefix view, never the drafter's mutable
         # buffer; the buffer is only seeded for the round.
-        self.assertEqual(init_kwargs["seq_lens"].data_ptr(), seq_lens.data_ptr())
-        self.assertEqual(wrapper.drafter.draft_seq_lens_buf.tolist(), [21, 22])
+        assert (init_kwargs["seq_lens"].data_ptr()) == (seq_lens.data_ptr())
+        assert (wrapper.drafter.draft_seq_lens_buf.tolist()) == ([21, 22])
         # The refresh prepares plain 1-token rows over the drafter buffer.
         _, refresh_args, refresh_kwargs = captured["draft"][1]
-        self.assertEqual(refresh_kwargs["forward_mode"], ForwardMode.DECODE)
-        self.assertNotIn("num_tokens", refresh_kwargs)
-        self.assertEqual(
-            refresh_args[3].data_ptr(),
-            wrapper.drafter.draft_seq_lens_buf.data_ptr(),
+        assert (refresh_kwargs["forward_mode"]) == (ForwardMode.DECODE)
+        assert ("num_tokens") not in (refresh_kwargs)
+        assert (refresh_args[3].data_ptr()) == (
+            wrapper.drafter.draft_seq_lens_buf.data_ptr()
         )
 
     def test_cuda_graph_eager_v4_draft_uses_only_its_cache_group_subset(self):
@@ -1047,10 +1035,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         # Two steps per round (init + decode refresh); both receive the same
         # delivered dict — each node consumes its own groups, so there is no
         # per-side table subsetting (and no cache-metadata side channel).
-        self.assertEqual(len(captured["draft"]), 2)
+        assert (len(captured["draft"])) == (2)
         for _, draft_kwargs in captured["draft"]:
-            self.assertIs(draft_kwargs["block_tables"]["v4.swa_kv"], swa_table)
-            self.assertIs(draft_kwargs["block_tables"]["v4.state"], state_table)
+            assert (draft_kwargs["block_tables"]["v4.swa_kv"]) is (swa_table)
+            assert (draft_kwargs["block_tables"]["v4.state"]) is (state_table)
 
     def test_cuda_graph_eager_draft_decode_aliases_drafter_seq_lens_buffer(self):
         captured = {"target": [], "draft": []}
@@ -1089,12 +1077,11 @@ class TestDeepseekV4Config(unittest.TestCase):
         draft_args, draft_kwargs = captured["draft"][-1]
         # Draft decode metadata aliases the drafter-owned mutable buffer,
         # freshly seeded from the batch seq_lens.
-        self.assertEqual(
-            draft_args[3].data_ptr(),
-            wrapper.drafter.draft_seq_lens_buf.data_ptr(),
+        assert (draft_args[3].data_ptr()) == (
+            wrapper.drafter.draft_seq_lens_buf.data_ptr()
         )
-        self.assertEqual(wrapper.drafter.draft_seq_lens_buf.tolist(), [21, 22])
-        self.assertEqual(draft_kwargs["forward_mode"], ForwardMode.DECODE)
+        assert (wrapper.drafter.draft_seq_lens_buf.tolist()) == ([21, 22])
+        assert (draft_kwargs["forward_mode"]) == (ForwardMode.DECODE)
 
     def test_deepseek_v4_tokenizer_wrapper_uses_model_encoder(self):
         calls = []
@@ -1130,21 +1117,20 @@ class TestDeepseekV4Config(unittest.TestCase):
             max_length=16,
         )
 
-        self.assertEqual(prompt, "<encoded>")
-        self.assertEqual(token_ids, [9])
-        self.assertEqual(len(tokenizer), 6)
-        self.assertEqual(calls[0][1]["thinking_mode"], "thinking")
-        self.assertIsNone(calls[0][1]["reasoning_effort"])
-        self.assertEqual(calls[1][1]["thinking_mode"], "chat")
-        self.assertEqual(
-            tokenizer.last_call,
-            ("<encoded>", False, {"truncation": True, "max_length": 16}),
+        assert (prompt) == ("<encoded>")
+        assert (token_ids) == ([9])
+        assert (len(tokenizer)) == (6)
+        assert (calls[0][1]["thinking_mode"]) == ("thinking")
+        assert (calls[0][1]["reasoning_effort"]) is None
+        assert (calls[1][1]["thinking_mode"]) == ("chat")
+        assert (tokenizer.last_call) == (
+            ("<encoded>", False, {"truncation": True, "max_length": 16})
         )
 
     def test_deepseek_v4_tokenizer_is_auto_selected_by_architecture(self):
-        self.assertTrue(prefers_deepseek_v4_tokenizer(["DeepseekV4ForCausalLM"]))
-        self.assertFalse(prefers_deepseek_v4_tokenizer(["KimiK2ForCausalLM"]))
-        self.assertFalse(prefers_deepseek_v4_tokenizer(None))
+        assert prefers_deepseek_v4_tokenizer(["DeepseekV4ForCausalLM"])
+        assert not (prefers_deepseek_v4_tokenizer(["KimiK2ForCausalLM"]))
+        assert not (prefers_deepseek_v4_tokenizer(None))
 
     def test_auto_tokenizer_mode_wraps_deepseek_v4_architecture(self):
         class DummyTokenizer:
@@ -1182,24 +1168,23 @@ class TestDeepseekV4Config(unittest.TestCase):
                 architectures=["DeepseekV4ForCausalLM"],
             )
 
-        self.assertEqual(
+        assert (
             tokenizer.apply_chat_template(
                 [{"role": "user", "content": "hi"}],
-            ),
-            [9],
-        )
+            )
+        ) == ([9])
 
     def test_deepseek_v4_server_args_cli_flags_round_trip(self):
         # Defaults match dataclass declaration
-        self.assertEqual(ServerArgs.deepseek_v4_mega_moe_max_num_tokens, 0)
-        self.assertEqual(ServerArgs.deepseek_v4_indexer_prefill_max_logits_mb, 512)
-        self.assertEqual(ServerArgs.deepseek_v4_prefill_chunk_size, 4)
-        self.assertFalse(hasattr(ServerArgs, "deepseek_v4_prefix_state_policy"))
+        assert (ServerArgs.deepseek_v4_mega_moe_max_num_tokens) == (0)
+        assert (ServerArgs.deepseek_v4_indexer_prefill_max_logits_mb) == (512)
+        assert (ServerArgs.deepseek_v4_prefill_chunk_size) == (4)
+        assert not (hasattr(ServerArgs, "deepseek_v4_prefix_state_policy"))
 
         # CLI flags parse
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
-        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+        with redirect_stderr(StringIO()), pytest.raises((SystemExit)):
             parser.parse_args(
                 [
                     "--model=stub",
@@ -1215,24 +1200,21 @@ class TestDeepseekV4Config(unittest.TestCase):
             ]
         )
         args = ServerArgs.from_cli_args(ns)
-        self.assertEqual(args.deepseek_v4_mega_moe_max_num_tokens, 128)
-        self.assertEqual(args.deepseek_v4_indexer_prefill_max_logits_mb, 256)
-        self.assertEqual(args.deepseek_v4_prefill_chunk_size, 8)
+        assert (args.deepseek_v4_mega_moe_max_num_tokens) == (128)
+        assert (args.deepseek_v4_indexer_prefill_max_logits_mb) == (256)
+        assert (args.deepseek_v4_prefill_chunk_size) == (8)
 
         # Propagation into global_server_args_dict
         snapshot = dict(global_server_args_dict)
         try:
             global_server_args_dict_update(args)
-            self.assertEqual(
-                global_server_args_dict["deepseek_v4_mega_moe_max_num_tokens"], 128
+            assert (global_server_args_dict["deepseek_v4_mega_moe_max_num_tokens"]) == (
+                128
             )
-            self.assertEqual(
-                global_server_args_dict["deepseek_v4_indexer_prefill_max_logits_mb"],
-                256,
-            )
-            self.assertEqual(
-                global_server_args_dict["deepseek_v4_prefill_chunk_size"], 8
-            )
+            assert (
+                global_server_args_dict["deepseek_v4_indexer_prefill_max_logits_mb"]
+            ) == (256)
+            assert (global_server_args_dict["deepseek_v4_prefill_chunk_size"]) == (8)
         finally:
             global_server_args_dict.clear()
             global_server_args_dict.update(snapshot)
@@ -1252,10 +1234,10 @@ class TestDeepseekV4Config(unittest.TestCase):
                     "max_running_requests": 4096,
                 }
             )
-            self.assertEqual(_deepseek_v4_mega_moe_max_num_tokens(), 128)
+            assert (_deepseek_v4_mega_moe_max_num_tokens()) == (128)
 
             global_server_args_dict["deepseek_v4_mega_moe_max_num_tokens"] = 256
-            self.assertEqual(_deepseek_v4_mega_moe_max_num_tokens(), 256)
+            assert (_deepseek_v4_mega_moe_max_num_tokens()) == (256)
         finally:
             global_server_args_dict.clear()
             global_server_args_dict.update(snapshot)
@@ -1265,14 +1247,14 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         config = quantization.from_config(self.quant_config)
 
-        self.assertEqual(quantization.get_name(), "fp8")
-        self.assertIsNone(
+        assert (quantization.get_name()) == ("fp8")
+        assert (
             quantization.override_quantization_method(self.quant_config, None)
-        )
-        self.assertEqual(config.activation_scheme, "dynamic")
-        self.assertTrue(config.is_checkpoint_fp8_serialized)
+        ) is None
+        assert (config.activation_scheme) == ("dynamic")
+        assert config.is_checkpoint_fp8_serialized
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+    @pytest.mark.skipif((not torch.cuda.is_available()), reason=("CUDA is required"))
     def test_deepseek_v4_fused_qkv_rmsnorm_matches_separate(self):
         torch.manual_seed(0)
         q = torch.randn(8, 1536, device="cuda", dtype=torch.bfloat16)
@@ -1286,11 +1268,11 @@ class TestDeepseekV4Config(unittest.TestCase):
         try:
             fused_norm(q, kv, output_q_a=q_out, output_kv_a=kv_out)
         except RuntimeError as exc:
-            self.skipTest(str(exc))
+            pytest.skip(str(exc))
 
         torch.cuda.synchronize()
-        self.assertTrue(torch.equal(q_out, q_norm(q)))
-        self.assertTrue(torch.equal(kv_out, kv_norm(kv)))
+        assert torch.equal(q_out, q_norm(q))
+        assert torch.equal(kv_out, kv_norm(kv))
 
     def test_model_config_maps_deepseek_v4_to_standard_fp8(self):
         model_config = object.__new__(ModelConfig)
@@ -1301,7 +1283,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         model_config._verify_quantization()
 
-        self.assertEqual(model_config.quantization, "fp8")
+        assert (model_config.quantization) == ("fp8")
 
     def test_model_config_overrides_default_block_size_for_deepseek_v4(self):
         def make_hf_config():
@@ -1356,8 +1338,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                 )
             return server_args
 
-        self.assertEqual(build(64).prefix_granularity, 256)
-        self.assertEqual(build(128).prefix_granularity, 128)
+        assert (build(64).prefix_granularity) == (256)
+        assert (build(128).prefix_granularity) == (128)
 
     def test_model_config_advertises_v4_dspark_prefix_replay_requirement(self):
         hf_config = SimpleNamespace(
@@ -1415,8 +1397,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                 is_draft_worker=True,
                 server_args=server_args,
             )
-        self.assertEqual(model_config.dspark_prefix_replay_tokens, 96)
-        self.assertEqual(model_config.num_attention_layers, 2)
+        assert (model_config.dspark_prefix_replay_tokens) == (96)
+        assert (model_config.num_attention_layers) == (2)
         count_stages.assert_called_once_with("external-draft", revision=None)
 
     def test_model_config_keeps_incompatible_user_quantization_error(self):
@@ -1426,12 +1408,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         model_config.quantization = "mxfp4"
 
-        with self.assertRaisesRegex(ValueError, "does not match"):
+        with pytest.raises((ValueError), match=("does not match")):
             model_config._verify_quantization()
 
     def test_deepseek_v4_flashmla_wrapper_exposes_required_api(self):
         if not current_platform().is_hopper_plus:
-            self.skipTest("FlashMLA requires NVIDIA Hopper or newer")
+            pytest.skip("FlashMLA requires NVIDIA Hopper or newer")
 
         from tokenspeed_kernel.ops.attention.mla.cuda import (
             flash_mla_sparse_fwd,
@@ -1439,9 +1421,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             get_mla_metadata,
         )
 
-        self.assertTrue(callable(flash_mla_with_kvcache))
-        self.assertTrue(callable(flash_mla_sparse_fwd))
-        self.assertTrue(callable(get_mla_metadata))
+        assert callable(flash_mla_with_kvcache)
+        assert callable(flash_mla_sparse_fwd)
+        assert callable(get_mla_metadata)
 
     def test_deepseek_v4_model_config_uses_mla_runtime_metadata(self):
         model_config = object.__new__(ModelConfig)
@@ -1453,29 +1435,34 @@ class TestDeepseekV4Config(unittest.TestCase):
             rope_scaling=None,
         )
 
-        self.assertTrue(is_deepseek_v4(model_config.hf_config))
+        assert is_deepseek_v4(model_config.hf_config)
 
         configure_deepseek_v4_attention(model_config, ServerArgs(model="x"))
 
-        self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
-        self.assertEqual(model_config.head_dim, 512)
-        self.assertEqual(model_config.kv_lora_rank, 512)
-        self.assertEqual(model_config.qk_rope_head_dim, 64)
-        self.assertEqual(model_config.qk_nope_head_dim, 448)
-        self.assertEqual(model_config.v_head_dim, 512)
-        self.assertEqual(model_config.index_head_dim, 128)
-        self.assertAlmostEqual(model_config.scaling, 512**-0.5)
+        assert (model_config.attention_arch) == (AttentionArch.MLA)
+        assert (model_config.head_dim) == (512)
+        assert (model_config.kv_lora_rank) == (512)
+        assert (model_config.qk_rope_head_dim) == (64)
+        assert (model_config.qk_nope_head_dim) == (448)
+        assert (model_config.v_head_dim) == (512)
+        assert (model_config.index_head_dim) == (128)
+        _pytest_first_1 = model_config.scaling
+        _pytest_second_2 = 512**-0.5
+        assert (
+            _pytest_first_1 == _pytest_second_2
+            or round(abs(_pytest_first_1 - _pytest_second_2), 7) == 0
+        )
 
     def test_deepseek_v4_cache_helpers_match_attention_contract(self):
         head_dim = 512
         rope_dim = 64
         index_head_dim = 128
 
-        self.assertEqual(deepseek_v4_nope_dim(head_dim, rope_dim), 448)
-        self.assertEqual(deepseek_v4_swa_token_stride(head_dim, rope_dim), 576)
-        self.assertEqual(deepseek_v4_swa_row_bytes(head_dim, rope_dim), 584)
-        self.assertEqual(deepseek_v4_indexer_fp8_row_bytes(index_head_dim), 132)
-        self.assertEqual(deepseek_v4_indexer_mxfp4_row_bytes(index_head_dim), 68)
+        assert (deepseek_v4_nope_dim(head_dim, rope_dim)) == (448)
+        assert (deepseek_v4_swa_token_stride(head_dim, rope_dim)) == (576)
+        assert (deepseek_v4_swa_row_bytes(head_dim, rope_dim)) == (584)
+        assert (deepseek_v4_indexer_fp8_row_bytes(index_head_dim)) == (132)
+        assert (deepseek_v4_indexer_mxfp4_row_bytes(index_head_dim)) == (68)
 
     def test_deepseek_v4_nextn_architecture_uses_v4_runtime_metadata(self):
         model_config = object.__new__(ModelConfig)
@@ -1487,38 +1474,34 @@ class TestDeepseekV4Config(unittest.TestCase):
             rope_scaling=None,
         )
 
-        self.assertTrue(is_deepseek_v4(model_config.hf_config))
-        self.assertTrue(is_deepseek_v4_nextn(model_config.hf_config))
-        self.assertTrue(
-            is_deepseek_v4(
-                SimpleNamespace(architectures=["DeepseekV4ForCausalLMDSpark"])
-            )
+        assert is_deepseek_v4(model_config.hf_config)
+        assert is_deepseek_v4_nextn(model_config.hf_config)
+        assert is_deepseek_v4(
+            SimpleNamespace(architectures=["DeepseekV4ForCausalLMDSpark"])
         )
 
         configure_deepseek_v4_attention(model_config, ServerArgs(model="x"))
 
-        self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
-        self.assertEqual(model_config.head_dim, 512)
-        self.assertEqual(model_config.qk_nope_head_dim, 448)
-        self.assertEqual(
+        assert (model_config.attention_arch) == (AttentionArch.MLA)
+        assert (model_config.head_dim) == (512)
+        assert (model_config.qk_nope_head_dim) == (448)
+        assert (
             _derive_num_attention_layers(
                 SimpleNamespace(
                     architectures=["DeepseekV4ForCausalLMNextN"],
                     num_nextn_predict_layers=1,
                 ),
                 num_hidden_layers=43,
-            ),
-            1,
-        )
-        self.assertFalse(is_deepseek_v4(SimpleNamespace(architectures=None)))
-        self.assertFalse(is_deepseek_v4_nextn(SimpleNamespace()))
-        self.assertEqual(
+            )
+        ) == (1)
+        assert not (is_deepseek_v4(SimpleNamespace(architectures=None)))
+        assert not (is_deepseek_v4_nextn(SimpleNamespace()))
+        assert (
             _derive_num_attention_layers(
                 SimpleNamespace(architectures=None),
                 num_hidden_layers=43,
-            ),
-            43,
-        )
+            )
+        ) == (43)
 
     def test_dspark_stage_count_requires_contiguous_namespaces(self):
         with tempfile.TemporaryDirectory() as model_path:
@@ -1534,7 +1517,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     },
                     handle,
                 )
-            self.assertEqual(count_dspark_stages(model_path), 3)
+            assert (count_dspark_stages(model_path)) == (3)
 
             with open(index_path, "w", encoding="utf-8") as handle:
                 json.dump(
@@ -1546,7 +1529,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     },
                     handle,
                 )
-            with self.assertRaisesRegex(ValueError, "contiguous from zero"):
+            with pytest.raises((ValueError), match=("contiguous from zero")):
                 count_dspark_stages(model_path)
 
     def test_dspark_stage_count_resolves_hub_index(self):
@@ -1566,9 +1549,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                 "tokenspeed.runtime.utils.spec_block_geometry.hf_hub_download",
                 return_value=index_path,
             ) as download:
-                self.assertEqual(
-                    count_dspark_stages("public/model", revision="revision-a"),
-                    2,
+                assert (count_dspark_stages("public/model", revision="revision-a")) == (
+                    2
                 )
 
         download.assert_called_once_with(
@@ -1582,7 +1564,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             "tokenspeed.runtime.utils.spec_block_geometry.hf_hub_download",
             side_effect=OSError("offline"),
         ):
-            self.assertIsNone(count_dspark_stages("public/model"))
+            assert (count_dspark_stages("public/model")) is None
 
     def test_dspark_graph_safe_context_indices_mask_unwritten_slots(self):
         indices = get_dspark_topk_idxs_batched(
@@ -1591,11 +1573,11 @@ class TestDeepseekV4Config(unittest.TestCase):
             start_pos=torch.tensor([0, 2, 8]),
         )
 
-        self.assertEqual(tuple(indices.shape), (3, 2, 6))
-        self.assertTrue(torch.equal(indices[0, 0], torch.tensor([0, -1, -1, -1, 4, 5])))
-        self.assertTrue(torch.equal(indices[1, 0], torch.tensor([0, 1, 2, -1, 4, 5])))
-        self.assertTrue(torch.equal(indices[2, 0], torch.tensor([0, 1, 2, 3, 4, 5])))
-        self.assertTrue(torch.equal(indices[:, 0], indices[:, 1]))
+        assert (tuple(indices.shape)) == ((3, 2, 6))
+        assert torch.equal(indices[0, 0], torch.tensor([0, -1, -1, -1, 4, 5]))
+        assert torch.equal(indices[1, 0], torch.tensor([0, 1, 2, -1, 4, 5]))
+        assert torch.equal(indices[2, 0], torch.tensor([0, 1, 2, 3, 4, 5]))
+        assert torch.equal(indices[:, 0], indices[:, 1])
 
     def test_dspark_bonus_selection_matches_verify_layout(self):
         output = torch.tensor(
@@ -1625,7 +1607,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             out=out,
         )
 
-        self.assertTrue(torch.equal(out, torch.tensor([9, 23], dtype=torch.int32)))
+        assert torch.equal(out, torch.tensor([9, 23], dtype=torch.int32))
 
     def test_dspark_decode_positions_follow_target_absolute_positions(self):
         (
@@ -1639,30 +1621,26 @@ class TestDeepseekV4Config(unittest.TestCase):
             block_offsets=torch.arange(5),
         )
 
-        self.assertTrue(
-            torch.equal(
-                interim_positions,
-                torch.tensor(
-                    [
-                        [128, 129, 130, 131, 132],
-                        [128, 129, 130, 131, 132],
-                    ]
-                ),
-            )
+        assert torch.equal(
+            interim_positions,
+            torch.tensor(
+                [
+                    [128, 129, 130, 131, 132],
+                    [128, 129, 130, 131, 132],
+                ]
+            ),
         )
-        self.assertTrue(
-            torch.equal(
-                interim_valid,
-                torch.tensor(
-                    [
-                        [False, False, False, False, False],
-                        [True, True, True, False, False],
-                    ]
-                ),
-            )
+        assert torch.equal(
+            interim_valid,
+            torch.tensor(
+                [
+                    [False, False, False, False, False],
+                    [True, True, True, False, False],
+                ]
+            ),
         )
-        self.assertTrue(torch.equal(main_positions, torch.tensor([128, 131])))
-        self.assertTrue(torch.equal(next_context_lengths, torch.tensor([129, 132])))
+        assert torch.equal(main_positions, torch.tensor([128, 131]))
+        assert torch.equal(next_context_lengths, torch.tensor([129, 132]))
 
     def test_dspark_prefill_positions_are_not_shifted(self):
         target_positions = torch.tensor([[124, 125, 126, 127]])
@@ -1671,8 +1649,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             target_positions
         )
 
-        self.assertTrue(torch.equal(window_positions, target_positions))
-        self.assertTrue(torch.equal(next_context_lengths, torch.tensor([128])))
+        assert torch.equal(window_positions, target_positions)
+        assert torch.equal(next_context_lengths, torch.tensor([128]))
 
     @staticmethod
     def _greedy_fixture(vocab, rank, rows, block, tp_size, device):
@@ -1703,7 +1681,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         candidates, partials = dspark_greedy_workspace(tp_size, rows + 3, vocab, device)
         return markov, lm_head, logits, bonus, expected, candidates, partials
 
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
     def test_dspark_single_rank_block_sampler_matches_reference_without_gathers(self):
         markov, lm_head, logits, bonus, expected, candidates, partials = (
             self._greedy_fixture(300, 32, 5, 4, 1, "cuda")
@@ -1718,11 +1696,11 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
 
         gather.assert_not_called()
-        self.assertIsNone(partials)
-        self.assertEqual(candidates.shape[:2], (2, 1))
-        self.assertTrue(torch.equal(output.long(), expected))
+        assert (partials) is None
+        assert (candidates.shape[:2]) == ((2, 1))
+        assert torch.equal(output.long(), expected)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
     def test_dspark_tp_block_sampler_gathers_one_candidate_buffer_per_step(self):
         markov, lm_head, logits, bonus, expected, candidates, partials = (
             self._greedy_fixture(300, 32, 5, 4, 4, "cuda")
@@ -1732,8 +1710,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         def fake_all_gather(gathered, scored, group):
             # Every rank contributes this shard: the packed keys tie and the
             # resolve must still pick this shard's winner.
-            self.assertTrue(gathered.is_contiguous() and scored.is_contiguous())
-            self.assertEqual(gathered.numel(), 4 * scored.numel())
+            assert gathered.is_contiguous() and scored.is_contiguous()
+            assert (gathered.numel()) == (4 * scored.numel())
             gathered.view(4, -1).copy_(scored.expand(4, -1))
 
         with patch(
@@ -1744,10 +1722,10 @@ class TestDeepseekV4Config(unittest.TestCase):
                 logits, bonus, markov, lm_head, object(), candidates, partials, output
             )
 
-        self.assertEqual(gather.call_count, 4)
-        self.assertTrue(torch.equal(output.long(), expected))
+        assert (gather.call_count) == (4)
+        assert torch.equal(output.long(), expected)
 
-        with self.assertRaisesRegex(ValueError, "does not cover the batch"):
+        with pytest.raises((ValueError), match=("does not cover the batch")):
             sample_dspark_block_greedy(
                 logits,
                 bonus,
@@ -1759,7 +1737,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 output,
             )
         lm_head.shard_indices.num_added_elements = 8
-        with self.assertRaisesRegex(ValueError, "without added vocabulary"):
+        with pytest.raises((ValueError), match=("without added vocabulary")):
             sample_dspark_block_greedy(
                 logits, bonus, markov, lm_head, object(), candidates, partials, output
             )
@@ -1777,9 +1755,9 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         drafter.wire_target(target_model)
 
-        self.assertIs(drafter.target_model, target_model)
-        self.assertIs(drafter.lm_head, draft_head)
-        self.assertEqual(drafter.tp_group, (0, 1))
+        assert (drafter.target_model) is (target_model)
+        assert (drafter.lm_head) is (draft_head)
+        assert (drafter.tp_group) == ((0, 1))
         # The draft model's configure_target installs the capture layers
         # before any drafter exists; wiring only binds execution resources.
         target_model.set_dspark_layers_to_capture.assert_not_called()
@@ -1789,7 +1767,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         DeepseekV4DSpark._validate_tp_only_mapping(mapping)
 
         invalid = SimpleNamespace(attn=SimpleNamespace(dp_size=2))
-        with self.assertRaisesRegex(ValueError, "tensor parallelism only"):
+        with pytest.raises((ValueError), match=("tensor parallelism only")):
             DeepseekV4DSpark._validate_tp_only_mapping(invalid)
 
     def test_dspark_padding_slots_reset_before_every_graph_replay(self):
@@ -1813,43 +1791,33 @@ class TestDeepseekV4Config(unittest.TestCase):
             drafter.kv_windows[3:].fill_(9)
             drafter.context_lengths[3:].fill_(1048575)
             drafter.prepare_request_state(["request-1"], [1], num_extends=0)
-            self.assertTrue(
-                torch.equal(
-                    drafter.kv_windows[3:],
-                    torch.zeros_like(drafter.kv_windows[3:]),
-                )
+            assert torch.equal(
+                drafter.kv_windows[3:],
+                torch.zeros_like(drafter.kv_windows[3:]),
             )
-            self.assertTrue(
-                torch.equal(
-                    drafter.context_lengths[3:],
-                    torch.zeros_like(drafter.context_lengths[3:]),
-                )
+            assert torch.equal(
+                drafter.context_lengths[3:],
+                torch.zeros_like(drafter.context_lengths[3:]),
             )
-            self.assertTrue(
-                torch.equal(
-                    drafter.slot_indices_buf,
-                    torch.tensor([1, 4, 5, 6]),
-                )
+            assert torch.equal(
+                drafter.slot_indices_buf,
+                torch.tensor([1, 4, 5, 6]),
             )
 
-        self.assertTrue(torch.equal(drafter.kv_windows[1], active_window))
-        self.assertTrue(torch.equal(drafter.context_lengths[1], active_context))
+        assert torch.equal(drafter.kv_windows[1], active_window)
+        assert torch.equal(drafter.context_lengths[1], active_context)
 
         drafter.kv_windows[3:].fill_(11)
         drafter.context_lengths[3:].fill_(999)
         drafter.prepare_request_state([], [], num_extends=0)
-        self.assertTrue(torch.equal(drafter.slot_indices_buf, drafter.padding_slots))
-        self.assertTrue(
-            torch.equal(
-                drafter.kv_windows[3:],
-                torch.zeros_like(drafter.kv_windows[3:]),
-            )
+        assert torch.equal(drafter.slot_indices_buf, drafter.padding_slots)
+        assert torch.equal(
+            drafter.kv_windows[3:],
+            torch.zeros_like(drafter.kv_windows[3:]),
         )
-        self.assertTrue(
-            torch.equal(
-                drafter.context_lengths[3:],
-                torch.zeros_like(drafter.context_lengths[3:]),
-            )
+        assert torch.equal(
+            drafter.context_lengths[3:],
+            torch.zeros_like(drafter.context_lengths[3:]),
         )
 
     def test_dspark_fp8_quant_dequant_matches_ue8m0_reference(self):
@@ -1868,8 +1836,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             .flatten(-2)
         )
 
-        self.assertTrue(torch.equal(actual, expected))
-        with self.assertRaisesRegex(ValueError, "must be divisible"):
+        assert torch.equal(actual, expected)
+        with pytest.raises((ValueError), match=("must be divisible")):
             dspark_fp8_quant_dequant(values[:, :-1], 64)
 
     def test_dspark_rmsnorm_cpu_matches_reference(self):
@@ -1881,7 +1849,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         normalized.mul_(torch.rsqrt(normalized.square().mean(-1, keepdim=True) + 1e-6))
         expected = (weight.float() * normalized).to(values.dtype)
 
-        self.assertTrue(torch.equal(actual, expected))
+        assert torch.equal(actual, expected)
 
     def test_dspark_query_per_head_norm_cpu_matches_reference(self):
         values = torch.linspace(-7.0, 7.0, 2 * 3 * 4 * 8).reshape(2, 3, 4, 8)
@@ -1889,9 +1857,9 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         actual = _normalize_query_per_head(values.clone(), head_dim=8, eps=1e-6)
 
-        self.assertTrue(torch.equal(actual, expected))
+        assert torch.equal(actual, expected)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
     def test_dspark_rmsnorm_cuda_graph_replays_exact_reference(self):
         torch.manual_seed(7)
         values = torch.randn((8, 5, 512), device="cuda", dtype=torch.bfloat16)
@@ -1910,21 +1878,19 @@ class TestDeepseekV4Config(unittest.TestCase):
         normalized.mul_(torch.rsqrt(normalized.square().mean(-1, keepdim=True) + 1e-6))
         expected = (weight.float() * normalized).to(values.dtype)
 
-        self.assertTrue(torch.equal(actual, expected))
+        assert torch.equal(actual, expected)
 
     def test_dspark_kv_quantizes_only_non_rope_channels(self):
         tensor = torch.linspace(-8.0, 8.0, 512, dtype=torch.float32).reshape(1, 1, 512)
 
         actual = _quantize_dspark_non_rope(tensor, rope_head_dim=64)
 
-        self.assertTrue(torch.equal(actual[..., -64:], tensor[..., -64:]))
-        self.assertTrue(
-            torch.equal(
-                actual[..., :-64],
-                dspark_fp8_quant_dequant(tensor[..., :-64], 64),
-            )
+        assert torch.equal(actual[..., -64:], tensor[..., -64:])
+        assert torch.equal(
+            actual[..., :-64],
+            dspark_fp8_quant_dequant(tensor[..., :-64], 64),
         )
-        self.assertFalse(torch.equal(actual[..., :-64], tensor[..., :-64]))
+        assert not (torch.equal(actual[..., :-64], tensor[..., :-64]))
 
     def test_dspark_output_projection_keeps_wo_a_input_in_bf16(self):
         output = torch.linspace(
@@ -1967,11 +1933,11 @@ class TestDeepseekV4Config(unittest.TestCase):
             dspark_fp8_quant_dequant(bf16_intermediate, 128),
             wo_b,
         )
-        self.assertTrue(torch.equal(actual, expected))
-        self.assertEqual(quantize.call_count, 1)
+        assert torch.equal(actual, expected)
+        assert (quantize.call_count) == (1)
         quantize_input, quantize_block_size = quantize.call_args.args
-        self.assertTrue(torch.equal(quantize_input, bf16_intermediate))
-        self.assertEqual(quantize_block_size, 128)
+        assert torch.equal(quantize_input, bf16_intermediate)
+        assert (quantize_block_size) == (128)
 
     def test_dspark_speculative_config_uses_block_plus_bonus_width(self):
         server_args = ServerArgs(
@@ -1983,9 +1949,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(server_args.speculative_algorithm, "DSPARK")
-        self.assertEqual(server_args.speculative_num_steps, 5)
-        self.assertEqual(server_args.speculative_num_draft_tokens, 6)
+        assert (server_args.speculative_algorithm) == ("DSPARK")
+        assert (server_args.speculative_num_steps) == (5)
+        assert (server_args.speculative_num_draft_tokens) == (6)
 
     def test_dspark_allows_prefix_cache_when_kvstore_is_disabled(self):
         server_args = ServerArgs(
@@ -1996,8 +1962,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             ),
         )
 
-        self.assertTrue(server_args.enable_prefix_caching)
-        self.assertTrue(server_args.draft_model_path_use_base)
+        assert server_args.enable_prefix_caching
+        assert server_args.draft_model_path_use_base
 
     def test_dspark_same_checkpoint_keeps_kvstore_default(self):
         # Whether same-checkpoint DSpark can use KVStore depends on where the
@@ -2014,8 +1980,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             ),
         )
 
-        self.assertTrue(server_args.enable_kvstore)
-        self.assertTrue(server_args.draft_model_path_use_base)
+        assert server_args.enable_kvstore
+        assert server_args.draft_model_path_use_base
 
     def test_dspark_explicit_external_checkpoint_preserves_cache_behavior(self):
         server_args = ServerArgs(
@@ -2025,10 +1991,10 @@ class TestDeepseekV4Config(unittest.TestCase):
             speculative_num_steps=5,
         )
 
-        self.assertTrue(server_args.enable_kvstore)
-        self.assertTrue(server_args.enable_prefix_caching)
-        self.assertFalse(server_args.draft_model_path_use_base)
-        self.assertEqual(server_args.speculative_draft_model_path, "external-draft")
+        assert server_args.enable_kvstore
+        assert server_args.enable_prefix_caching
+        assert not (server_args.draft_model_path_use_base)
+        assert (server_args.speculative_draft_model_path) == ("external-draft")
 
     def test_decode_kvstore_without_prefix_cache_preserves_generic_behavior(self):
         server_args = ServerArgs(
@@ -2037,8 +2003,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             disaggregation_mode="decode",
         )
 
-        self.assertTrue(server_args.enable_kvstore)
-        self.assertFalse(server_args.enable_prefix_caching)
+        assert server_args.enable_kvstore
+        assert not (server_args.enable_prefix_caching)
 
     def test_dspark_external_decode_preserves_generic_cache_behavior(self):
         server_args = ServerArgs(
@@ -2050,10 +2016,10 @@ class TestDeepseekV4Config(unittest.TestCase):
             speculative_num_steps=5,
         )
 
-        self.assertTrue(server_args.enable_kvstore)
-        self.assertFalse(server_args.enable_prefix_caching)
-        self.assertFalse(server_args.draft_model_path_use_base)
-        self.assertEqual(server_args.speculative_draft_model_path, "external-draft")
+        assert server_args.enable_kvstore
+        assert not (server_args.enable_prefix_caching)
+        assert not (server_args.draft_model_path_use_base)
+        assert (server_args.speculative_draft_model_path) == ("external-draft")
 
     def test_dspark_external_checkpoint_preserves_generic_cache_behavior(self):
         server_args = ServerArgs(
@@ -2067,12 +2033,12 @@ class TestDeepseekV4Config(unittest.TestCase):
             ),
         )
 
-        self.assertTrue(server_args.enable_kvstore)
-        self.assertTrue(server_args.enable_prefix_caching)
-        self.assertFalse(server_args.draft_model_path_use_base)
-        self.assertEqual(server_args.speculative_draft_model_path, "external-draft")
-        self.assertEqual(server_args.speculative_num_steps, 5)
-        self.assertEqual(server_args.speculative_num_draft_tokens, 6)
+        assert server_args.enable_kvstore
+        assert server_args.enable_prefix_caching
+        assert not (server_args.draft_model_path_use_base)
+        assert (server_args.speculative_draft_model_path) == ("external-draft")
+        assert (server_args.speculative_num_steps) == (5)
+        assert (server_args.speculative_num_draft_tokens) == (6)
 
     def test_deepseek_v4_attention_layout_matches_compressed_cache_contract(self):
         config = SimpleNamespace(
@@ -2095,16 +2061,16 @@ class TestDeepseekV4Config(unittest.TestCase):
             use_fp4_indexer_cache=True,
         )
 
-        self.assertEqual(layout.layer_ratio, (1, 4, 128))
-        self.assertEqual(layout.swa_token_stride, 576)
-        self.assertEqual(layout.swa_scale_dim, 8)
-        self.assertEqual(layout.swa_row_bytes, 584)
-        self.assertEqual(layout.state_width(0), 512)
-        self.assertEqual(layout.state_width(1), 1024)
-        self.assertEqual(layout.state_width(2), 512)
-        self.assertEqual(layout.state_width(1, indexer=True), 256)
-        self.assertEqual(layout.indexer_row_bytes, 132)
-        self.assertEqual(layout_fp4.indexer_row_bytes, 68)
+        assert (layout.layer_ratio) == ((1, 4, 128))
+        assert (layout.swa_token_stride) == (576)
+        assert (layout.swa_scale_dim) == (8)
+        assert (layout.swa_row_bytes) == (584)
+        assert (layout.state_width(0)) == (512)
+        assert (layout.state_width(1)) == (1024)
+        assert (layout.state_width(2)) == (512)
+        assert (layout.state_width(1, indexer=True)) == (256)
+        assert (layout.indexer_row_bytes) == (132)
+        assert (layout_fp4.indexer_row_bytes) == (68)
 
     def test_deepseek_v4_cache_layout_can_slice_mtp_layer_range(self):
         config = SimpleNamespace(
@@ -2121,8 +2087,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             layer_indices=range(3, 4),
         )
 
-        self.assertEqual(layout.layer_ratio, (1,))
-        with self.assertRaisesRegex(ValueError, "out of range"):
+        assert (layout.layer_ratio) == ((1,))
+        with pytest.raises((ValueError), match=("out of range")):
             deepseek_v4_cache_layout_from_config(
                 config,
                 page_size=64,
@@ -2140,7 +2106,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             index_head_dim=128,
         )
 
-        with self.assertRaisesRegex(ValueError, "compress_ratio=8"):
+        with pytest.raises((ValueError), match=("compress_ratio=8")):
             deepseek_v4_cache_layout_from_config(
                 config,
                 page_size=64,
@@ -2163,38 +2129,32 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         pool, plan = _make_planned_deepseek_v4_pool(layout, config)
 
-        self.assertEqual(
-            tuple(pool.get_swa_kv_buffer(0).shape),
-            (plan.group("v4.swa_kv").page_count, 37440),
+        assert (tuple(pool.get_swa_kv_buffer(0).shape)) == (
+            (plan.group("v4.swa_kv").page_count, 37440)
         )
-        self.assertIsNone(pool.compressed_kv_buffer[0])
-        self.assertEqual(
-            tuple(pool.get_compressed_kv_buffer_2d(1).shape),
-            (plan.group("v4.c4a.compressed_kv").page_count, 37440),
+        assert (pool.compressed_kv_buffer[0]) is None
+        assert (tuple(pool.get_compressed_kv_buffer_2d(1).shape)) == (
+            (plan.group("v4.c4a.compressed_kv").page_count, 37440)
         )
-        self.assertEqual(
-            tuple(pool.get_compressor_state_buffer(1).shape),
-            (plan.group("v4.c4a.compressor_state").page_count, 4, 2048),
+        assert (tuple(pool.get_compressor_state_buffer(1).shape)) == (
+            (plan.group("v4.c4a.compressor_state").page_count, 4, 2048)
         )
-        self.assertEqual(
-            tuple(pool.get_compressor_state_buffer(2).shape),
-            (plan.group("v4.c128a.compressor_state").page_count, 8, 1024),
+        assert (tuple(pool.get_compressor_state_buffer(2).shape)) == (
+            (plan.group("v4.c128a.compressor_state").page_count, 8, 1024)
         )
-        self.assertEqual(pool.get_compressor_state_buffer(1).dtype, torch.float32)
-        self.assertEqual(pool.get_compressor_state_buffer(2).dtype, torch.float32)
-        self.assertEqual(
-            tuple(pool.get_indexer_kv_buffer_2d(1).shape),
-            (plan.group(V4_INDEXER_KV_GROUP_ID).page_count, 64 * 68),
+        assert (pool.get_compressor_state_buffer(1).dtype) == (torch.float32)
+        assert (pool.get_compressor_state_buffer(2).dtype) == (torch.float32)
+        assert (tuple(pool.get_indexer_kv_buffer_2d(1).shape)) == (
+            (plan.group(V4_INDEXER_KV_GROUP_ID).page_count, 64 * 68)
         )
-        self.assertEqual(
-            tuple(pool.get_indexer_state_buffer(1).shape),
+        assert (tuple(pool.get_indexer_state_buffer(1).shape)) == (
             (
                 plan.group("v4.c4a.indexer_compressor_state").page_count,
                 4,
                 512,
-            ),
+            )
         )
-        self.assertEqual(pool.get_indexer_state_buffer(1).dtype, torch.float32)
+        assert (pool.get_indexer_state_buffer(1).dtype) == (torch.float32)
 
     def test_deepseek_v4_kv_pool_binds_no_paged_attention_layer(self):
         # Every V4 group stores rows of token history, and a layer's fused
@@ -2215,18 +2175,16 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         pool, _ = _make_planned_deepseek_v4_pool(layout, config)
 
-        self.assertTrue(
-            all(spec.attn_kind != "state" for spec in pool.arena.cache_group_specs)
-        )
-        with self.assertRaisesRegex(ValueError, "more than one history"):
+        assert all(spec.attn_kind != "state" for spec in pool.arena.cache_group_specs)
+        with pytest.raises((ValueError), match=("more than one history")):
             derive_history_groups_by_layer(
                 pool.arena,
                 first_layer=0,
                 num_layers=len(layout.layer_ratio),
                 kv_planes=pool.layer_plane_bindings,
             )
-        self.assertEqual(pool.history_group_by_layer(), {})
-        self.assertEqual(pool.paged_group_ids, ())
+        assert (pool.history_group_by_layer()) == ({})
+        assert (pool.paged_group_ids) == (())
         bind_cache_groups(torch.nn.Module(), pool)
 
     def test_deepseek_v4_kv_pool_uses_compressed_storage_blocks_for_page256(self):
@@ -2244,16 +2202,14 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         pool, plan = _make_planned_deepseek_v4_pool(layout, config)
 
-        self.assertEqual(pool.swa_block_size, 64)
-        self.assertEqual(pool.get_compressed_block_size(1), 64)
-        self.assertEqual(pool.get_compressed_block_size(2), 2)
-        self.assertEqual(
-            tuple(pool.get_compressed_kv_buffer_2d(1).shape),
-            (plan.group("v4.c4a.compressed_kv").page_count, 37440),
+        assert (pool.swa_block_size) == (64)
+        assert (pool.get_compressed_block_size(1)) == (64)
+        assert (pool.get_compressed_block_size(2)) == (2)
+        assert (tuple(pool.get_compressed_kv_buffer_2d(1).shape)) == (
+            (plan.group("v4.c4a.compressed_kv").page_count, 37440)
         )
-        self.assertEqual(
-            tuple(pool.get_indexer_kv_buffer_2d(1).shape),
-            (plan.group(V4_INDEXER_KV_GROUP_ID).page_count, 64 * 68),
+        assert (tuple(pool.get_indexer_kv_buffer_2d(1).shape)) == (
+            (plan.group(V4_INDEXER_KV_GROUP_ID).page_count, 64 * 68)
         )
 
     def test_deepseek_v4_plan_rejects_nonpositive_capacity(self):
@@ -2269,7 +2225,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         cache_layout = _v4_layout(config)[2]
 
         for capacity in (0, -1):
-            with self.assertRaisesRegex(ValueError, "must be a positive integer"):
+            with pytest.raises((ValueError), match=("must be a positive integer")):
                 cache_layout.bind(capacity)
 
     def test_deepseek_v4_group_slot_mapping_expands_per_request_indices(self):
@@ -2280,9 +2236,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             rows_per_page=64,
         )
 
-        self.assertTrue(
-            torch.equal(slots, torch.tensor([640, 641, 642, 1344, 1345, 1346]))
-        )
+        assert torch.equal(slots, torch.tensor([640, 641, 642, 1344, 1345, 1346]))
 
     def test_deepseek_v4_kv_pool_requires_matching_layout_layers(self):
         config = SimpleNamespace(
@@ -2298,9 +2252,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             use_fp4_indexer_cache=True,
         )
 
-        from cache_pool_test_utils import make_pool
+        from test.runtime.cache_pool_test_utils import make_pool
 
-        with self.assertRaisesRegex(ValueError, "layer_num"):
+        with pytest.raises((ValueError), match=("layer_num")):
             make_pool(
                 HybridDeepseekV4TokenToKVPool,
                 _v4_layout(config)[2].bind(1),
@@ -2319,7 +2273,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             rows_per_page=64,
             entry_stride_tokens=1,
         )
-        self.assertTrue(torch.equal(slots, torch.tensor([640, 703, 704, 1289, 1290])))
+        assert torch.equal(slots, torch.tensor([640, 703, 704, 1289, 1290]))
 
         compressed_slots = _group_slot_mapping_from_raw(
             positions=torch.tensor([0, 255, 256, 511], dtype=torch.int64),
@@ -2328,9 +2282,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             rows_per_page=64,
             entry_stride_tokens=4,
         )
-        self.assertTrue(
-            torch.equal(compressed_slots, torch.tensor([640, 703, 704, -1]))
-        )
+        assert torch.equal(compressed_slots, torch.tensor([640, 703, 704, -1]))
 
     def test_deepseek_v4_slot_mapping_masks_invalid_tokens(self):
         slots = _mask_invalid_graph_tokens(
@@ -2338,7 +2290,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.tensor([True, False, True, False]),
         )
 
-        self.assertTrue(torch.equal(slots, torch.tensor([10, -1, -1, -1])))
+        assert torch.equal(slots, torch.tensor([10, -1, -1, -1]))
 
     def test_deepseek_v4_spec_geometry_is_prefix_granularity_free(self):
         """The spec constructors take no P; block spans come from the kernel
@@ -2351,18 +2303,18 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         }
         c4 = specs["v4.c4a.compressed_kv"]
-        self.assertEqual(c4.rows_per_page, 64)
-        self.assertEqual(c4.entry_stride_tokens, 4)
-        self.assertEqual(c4.block_granularity, 256)
+        assert (c4.rows_per_page) == (64)
+        assert (c4.entry_stride_tokens) == (4)
+        assert (c4.block_granularity) == (256)
         c128 = specs["v4.c128a.compressed_kv"]
-        self.assertEqual(c128.rows_per_page, 2)
-        self.assertEqual(c128.entry_stride_tokens, 128)
-        self.assertEqual(c128.block_granularity, 256)
+        assert (c128.rows_per_page) == (2)
+        assert (c128.entry_stride_tokens) == (128)
+        assert (c128.block_granularity) == (256)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("CUDA is required"))
     def test_deepseek_v4_prefill_topk_cuda_op_matches_torch_topk(self):
         if not has_indexer_topk_prefill():
-            self.skipTest("DeepSeek V4 prefill top-k op is unavailable")
+            pytest.skip("DeepSeek V4 prefill top-k op is unavailable")
 
         torch.manual_seed(0)
         lengths = torch.tensor([0, 3, 17, 33], device="cuda", dtype=torch.int32)
@@ -2377,7 +2329,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             selected = min(raw_len, out.shape[-1])
             actual = out[row, :selected].sort().values.cpu()
             if selected == 0:
-                self.assertTrue(torch.equal(out[row], torch.full_like(out[row], -1)))
+                assert torch.equal(out[row], torch.full_like(out[row], -1))
                 continue
             expected = (
                 torch.topk(
@@ -2390,12 +2342,10 @@ class TestDeepseekV4Config(unittest.TestCase):
                 .values.cpu()
                 .to(torch.int32)
             )
-            self.assertTrue(torch.equal(actual, expected))
-            self.assertTrue(
-                torch.equal(
-                    out[row, selected:],
-                    torch.full_like(out[row, selected:], -1),
-                )
+            assert torch.equal(actual, expected)
+            assert torch.equal(
+                out[row, selected:],
+                torch.full_like(out[row, selected:], -1),
             )
 
     def test_deepseek_v4_global_topk_cpu_masks_invalid_req_before_indexing(self):
@@ -2407,13 +2357,11 @@ class TestDeepseekV4Config(unittest.TestCase):
             is_valid_token=torch.tensor([True, False]),
         )
 
-        self.assertTrue(
-            torch.equal(
-                indices,
-                torch.tensor([[40, -1], [-1, -1]], dtype=torch.int32),
-            )
+        assert torch.equal(
+            indices,
+            torch.tensor([[40, -1], [-1, -1]], dtype=torch.int32),
         )
-        self.assertTrue(torch.equal(lens, torch.tensor([2, 0], dtype=torch.int32)))
+        assert torch.equal(lens, torch.tensor([2, 0], dtype=torch.int32))
 
     def test_hidden_compression_reference_preserves_expected_shapes(self):
         torch.manual_seed(0)
@@ -2435,10 +2383,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         updated = _mhc_post_reference(layer_input, residual, post, comb)
 
-        self.assertEqual(tuple(layer_input.shape), (tokens, hidden))
-        self.assertEqual(tuple(post.shape), (tokens, hc_mult, 1))
-        self.assertEqual(tuple(comb.shape), (tokens, hc_mult, hc_mult))
-        self.assertEqual(tuple(updated.shape), tuple(residual.shape))
+        assert (tuple(layer_input.shape)) == ((tokens, hidden))
+        assert (tuple(post.shape)) == ((tokens, hc_mult, 1))
+        assert (tuple(comb.shape)) == ((tokens, hc_mult, hc_mult))
+        assert (tuple(updated.shape)) == (tuple(residual.shape))
 
     def test_hidden_compression_pre_reference_matches_math(self):
         torch.manual_seed(1)
@@ -2487,9 +2435,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             expected_pre.unsqueeze(-1) * residual.float(), dim=1
         ).to(residual.dtype)
 
-        self.assertTrue(torch.allclose(layer_input, expected_layer_input))
-        self.assertTrue(torch.allclose(post, expected_post))
-        self.assertTrue(torch.allclose(comb, expected_comb))
+        assert torch.allclose(layer_input, expected_layer_input)
+        assert torch.allclose(post, expected_post)
+        assert torch.allclose(comb, expected_comb)
 
     def test_hidden_compression_post_reference_matches_lane_orientation(self):
         hidden_states = torch.tensor([[10.0, 20.0]], dtype=torch.float32)
@@ -2510,7 +2458,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             + comb[:, 1, 1:2] * residual[:, 1]
             + post[:, 1] * hidden_states
         )
-        self.assertTrue(torch.allclose(updated, expected))
+        assert torch.allclose(updated, expected)
 
     def test_deepseek_v4_score_routing_does_not_forward_input_ids(self):
         hidden_states = torch.ones((2, 4))
@@ -2526,8 +2474,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             hidden_states, input_ids
         )
 
-        self.assertIsNone(hash_indices_table)
-        self.assertIsNone(routing_input_ids)
+        assert (hash_indices_table) is None
+        assert (routing_input_ids) is None
 
     def test_deepseek_v4_router_matches_noaux_bias_semantics(self):
         logits = torch.tensor(
@@ -2555,8 +2503,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         expected_weights = expected_scores.gather(1, expected_ids)
         expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
 
-        self.assertTrue(torch.equal(topk_ids, expected_ids.to(torch.int32)))
-        self.assertTrue(torch.allclose(topk_weights, expected_weights))
+        assert torch.equal(topk_ids, expected_ids.to(torch.int32))
+        assert torch.allclose(topk_weights, expected_weights)
 
     def test_deepseek_v4_hash_router_uses_table_ids_and_gate_scores(self):
         logits = torch.tensor(
@@ -2594,8 +2542,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         expected_weights = expected_scores.gather(1, expected_ids.long())
         expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
 
-        self.assertTrue(torch.equal(topk_ids, expected_ids))
-        self.assertTrue(torch.allclose(topk_weights, expected_weights))
+        assert torch.equal(topk_ids, expected_ids)
+        assert torch.allclose(topk_weights, expected_weights)
 
     def test_deepseek_v4_gate_cpu_returns_fp32_logits(self):
         config = SimpleNamespace(
@@ -2612,8 +2560,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         logits = gate(hidden_states)
         expected = F.linear(hidden_states, gate.weight, None).float()
 
-        self.assertEqual(logits.dtype, torch.float32)
-        self.assertTrue(torch.allclose(logits, expected))
+        assert (logits.dtype) == (torch.float32)
+        assert torch.allclose(logits, expected)
 
     def test_deepseek_v4_dummy_hash_table_spreads_tokens_over_experts(self):
         config = SimpleNamespace(
@@ -2629,15 +2577,15 @@ class TestDeepseekV4Config(unittest.TestCase):
         initialize_dummy_integer_weights(gate)
 
         table = gate.tid2eid
-        self.assertTrue(bool(((table >= 0) & (table < 16)).all()))
-        self.assertTrue(all(row.unique().numel() == 4 for row in table))
-        self.assertEqual(table.unique().numel(), 16)
+        assert bool(((table >= 0) & (table < 16)).all())
+        assert all(row.unique().numel() == 4 for row in table)
+        assert (table.unique().numel()) == (16)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("CUDA is required"))
     def test_deepseek_v4_gate_dsv3_router_gemm_shape(self):
         major, _ = torch.cuda.get_device_capability()
         if major < 9:
-            self.skipTest("DSV3 router GEMM requires SM90+")
+            pytest.skip("DSV3 router GEMM requires SM90+")
 
         config = SimpleNamespace(
             n_routed_experts=256,
@@ -2655,13 +2603,13 @@ class TestDeepseekV4Config(unittest.TestCase):
         except RuntimeError as exc:
             if "dsv3_gemm library not found" not in str(exc):
                 raise
-            self.skipTest(str(exc))
+            pytest.skip(str(exc))
         torch.cuda.synchronize()
 
-        self.assertEqual(tuple(logits.shape), (2, config.n_routed_experts))
-        self.assertEqual(logits.dtype, torch.float32)
+        assert (tuple(logits.shape)) == ((2, config.n_routed_experts))
+        assert (logits.dtype) == (torch.float32)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("CUDA is required"))
     def test_deepseek_v4_fused_softplus_sqrt_topk_matches_reference(self):
         logits = torch.linspace(
             -3.0, 3.0, 256, device="cuda", dtype=torch.float32
@@ -2673,7 +2621,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         try:
             softplus_sqrt_topk_flash(logits, bias, topk_ids, topk_weights, 1.0, True)
         except (AttributeError, RuntimeError) as exc:
-            self.skipTest(f"fused DeepSeek V4 router op unavailable: {exc}")
+            pytest.skip(f"fused DeepSeek V4 router op unavailable: {exc}")
         torch.cuda.synchronize()
 
         scores = F.softplus(logits).sqrt()
@@ -2681,10 +2629,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         expected_weights = scores.gather(1, expected_ids)
         expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
 
-        self.assertTrue(torch.equal(topk_ids, expected_ids.to(torch.int32)))
-        self.assertTrue(torch.allclose(topk_weights, expected_weights, atol=1e-6))
+        assert torch.equal(topk_ids, expected_ids.to(torch.int32))
+        assert torch.allclose(topk_weights, expected_weights, atol=1e-6)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("CUDA is required"))
     def test_deepseek_v4_fused_moe_topk_matches_reference(self):
         logits = torch.linspace(
             -3.0, 3.0, 256, device="cuda", dtype=torch.float32
@@ -2706,10 +2654,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         expected_weights = expected_scores.gather(1, expected_ids)
         expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
 
-        self.assertTrue(torch.equal(topk_ids, expected_ids.to(torch.int32)))
-        self.assertTrue(torch.allclose(topk_weights, expected_weights, atol=1e-6))
+        assert torch.equal(topk_ids, expected_ids.to(torch.int32))
+        assert torch.allclose(topk_weights, expected_weights, atol=1e-6)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("CUDA is required"))
     def test_deepseek_v4_fused_hash_topk_matches_reference(self):
         logits = torch.linspace(
             -2.0, 2.0, 256, device="cuda", dtype=torch.float32
@@ -2728,7 +2676,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 logits, input_ids, table, topk_ids, topk_weights, 1.0, True
             )
         except (AttributeError, RuntimeError) as exc:
-            self.skipTest(f"fused DeepSeek V4 hash router op unavailable: {exc}")
+            pytest.skip(f"fused DeepSeek V4 hash router op unavailable: {exc}")
         torch.cuda.synchronize()
 
         expected_ids = table[input_ids]
@@ -2736,12 +2684,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         expected_weights = scores.gather(1, expected_ids.long())
         expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
 
-        self.assertTrue(torch.equal(topk_ids, expected_ids))
-        self.assertTrue(torch.allclose(topk_weights, expected_weights, atol=1e-6))
+        assert torch.equal(topk_ids, expected_ids)
+        assert torch.allclose(topk_weights, expected_weights, atol=1e-6)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
 
 
 def test_v4_merged_solve_draft_is_a_continuation_layer():

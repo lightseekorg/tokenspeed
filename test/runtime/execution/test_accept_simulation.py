@@ -155,6 +155,7 @@ def _executor(pool_indices: list[int], cache_lengths: torch.Tensor) -> ModelExec
     req_pool_indices[: len(pool_indices)] = torch.tensor(pool_indices)
     executor.input_buffers = SimpleNamespace(
         req_pool_indices_buf=req_pool_indices,
+        input_lengths_buf=torch.ones(8, dtype=torch.int32),
         force_single_token_verify_buf=torch.zeros(8, dtype=torch.bool),
     )
     executor.runtime_states = SimpleNamespace(valid_cache_lengths=cache_lengths)

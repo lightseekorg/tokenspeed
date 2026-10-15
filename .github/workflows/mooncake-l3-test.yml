@@ -38,7 +38,7 @@ jobs:
         run: |
           python -m pip install --retries 10 --timeout 60 \
             'tokenspeed-mooncake==0.3.13.post20260825' \
-            'nvidia-cuda-runtime==13.0.96'
+            'nvidia-cuda-runtime==13.0.96' 'pytest>=9'
           # The wheel links CUDA 13 and libcuda even for Host-only TCP tests.
           # Install user-space driver libraries; no GPU or kernel driver is used.
           if ! sudo apt-get install -y --no-install-recommends \
@@ -55,4 +55,4 @@ jobs:
           MOONCAKE_REQUIRE_MASTER: "1"
           PYTHONPATH: python
         run: |
-          python -m unittest test.test_l3_kvstore test.test_l3_mooncake_master -v
+          python -m pytest test/test_l3_kvstore.py test/test_l3_mooncake_master.py -v -s --log-cli-level=INFO

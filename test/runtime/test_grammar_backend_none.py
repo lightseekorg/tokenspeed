@@ -33,8 +33,9 @@ from __future__ import annotations
 
 import os
 import sys
-import unittest
 from types import SimpleNamespace
+
+import pytest
 
 # CI registration (AST-parsed, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -85,22 +86,22 @@ def _state(**constraint) -> RequestState:
     )
 
 
-class TestAdmissionWithoutBackend(unittest.TestCase):
-    def test_constraint_is_rejected_as_bad_request(self):
+class TestAdmissionWithoutBackend:
+    def test_constraint_is_rejected_as_bad_request(self, subtests):
         manager = _manager_without_backend()
         for field, value in CONSTRAINTS.items():
-            with self.subTest(field=field):
+            with subtests.test(field=field):
                 state = _state(**{field: value})
-                self.assertTrue(manager.process_req_with_grammar(state))
+                assert manager.process_req_with_grammar(state)
                 reason = state.finished_reason.to_json()
-                self.assertEqual(reason["type"], "abort")
-                self.assertEqual(reason["status_code"], 400)
-                self.assertIn("--grammar-backend none", reason["message"])
+                assert (reason["type"]) == ("abort")
+                assert (reason["status_code"]) == (400)
+                assert ("--grammar-backend none") in (reason["message"])
 
     def test_unconstrained_request_is_admitted(self):
         state = _state()
-        self.assertTrue(_manager_without_backend().process_req_with_grammar(state))
-        self.assertFalse(state.finished)
+        assert _manager_without_backend().process_req_with_grammar(state)
+        assert not (state.finished)
 
 
 class _StubAsyncLLM(AsyncLLM):
@@ -117,7 +118,7 @@ class _StubAsyncLLM(AsyncLLM):
         )
 
 
-class TestFrontendSeesClientError(unittest.IsolatedAsyncioTestCase):
+class TestFrontendSeesClientError:
     async def _finish(self, reason: dict, *, stream: bool) -> list:
         llm = _StubAsyncLLM()
         obj = SimpleNamespace(rid="r1", stream=stream, input_ids=None, text=None)
@@ -134,23 +135,25 @@ class TestFrontendSeesClientError(unittest.IsolatedAsyncioTestCase):
         state.event.set()
         return [out async for out in llm._wait_one_response(obj)]
 
-    async def test_bad_request_abort_raises_value_error(self):
+    @pytest.mark.asyncio(loop_scope="function")
+    async def test_bad_request_abort_raises_value_error(self, subtests):
         state = _state(json_schema=CONSTRAINTS["json_schema"])
         _manager_without_backend().process_req_with_grammar(state)
         reason = state.finished_reason.to_json()
         for stream in (False, True):
-            with self.subTest(stream=stream):
-                with self.assertRaises(EngineGenerateError) as ctx:
+            with subtests.test(stream=stream):
+                with pytest.raises((EngineGenerateError)) as ctx:
                     await self._finish(reason, stream=stream)
-                self.assertIsInstance(ctx.exception, ValueError)
-                self.assertIn("--grammar-backend none", str(ctx.exception))
+                assert isinstance((ctx.value), (ValueError))
+                assert ("--grammar-backend none") in (str(ctx.value))
 
+    @pytest.mark.asyncio(loop_scope="function")
     async def test_abort_without_status_is_still_a_finish(self):
         reason = FINISH_ABORT("engine failure").to_json()
-        self.assertNotIn("status_code", reason)
+        assert ("status_code") not in (reason)
         outputs = await self._finish(reason, stream=False)
-        self.assertEqual(outputs[0]["meta_info"]["finish_reason"], reason)
+        assert (outputs[0]["meta_info"]["finish_reason"]) == (reason)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

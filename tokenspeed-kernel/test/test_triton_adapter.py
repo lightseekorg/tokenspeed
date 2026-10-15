@@ -21,10 +21,11 @@
 import ast
 import runpy
 import sys
-import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 ADAPTER = ROOT / "tokenspeed-kernel/python/tokenspeed_kernel/_triton.py"
@@ -70,12 +71,10 @@ def _load_adapter(*, is_npu):
     return adapter, modules
 
 
-class TestGluonAdapter(unittest.TestCase):
-    def test_ascend_decorates_gpu_kernel_without_importing_gluon(self):
+class TestGluonAdapter:
+    def test_ascend_decorates_gpu_kernel_without_importing_gluon(self, subtests):
         adapter, modules = _load_adapter(is_npu=True)
-        self.assertIs(
-            adapter["triton"], modules["tokenspeed_kernel_npu._triton"].triton
-        )
+        assert adapter["triton"] is modules["tokenspeed_kernel_npu._triton"].triton
         path = (
             ROOT / "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/_gluon/gemv.py"
         )
@@ -101,22 +100,20 @@ class TestGluonAdapter(unittest.TestCase):
         original = decorated.fn
         options = {"do_not_specialize": ["M"], "launch_metadata": object()}
         configured = adapter["gluon"].jit(**options)(original)
-        self.assertIs(configured.fn, original)
-        self.assertEqual(configured.options, options)
+        assert configured.fn is original
+        assert configured.options == options
         for candidate in (decorated, configured, adapter["gluon"].jit()(original)):
-            with self.subTest(options=candidate.options):
-                with self.assertRaisesRegex(RuntimeError, "Gluon.*Ascend"):
+            with subtests.test(options=candidate.options):
+                with pytest.raises(RuntimeError, match="Gluon.*Ascend"):
                     candidate()
-                with self.assertRaisesRegex(RuntimeError, "Gluon.*Ascend"):
+                with pytest.raises(RuntimeError, match="Gluon.*Ascend"):
                     candidate[(1,)]()
 
     def test_gpu_keeps_native_gluon_provider(self):
         adapter, modules = _load_adapter(is_npu=False)
-        self.assertIs(adapter["triton"], modules["tokenspeed_triton"])
-        self.assertIs(adapter["gluon"], modules["tokenspeed_triton.experimental.gluon"])
-        self.assertIs(
-            adapter["gl"], modules["tokenspeed_triton.experimental.gluon.language"]
-        )
+        assert adapter["triton"] is modules["tokenspeed_triton"]
+        assert adapter["gluon"] is modules["tokenspeed_triton.experimental.gluon"]
+        assert adapter["gl"] is modules["tokenspeed_triton.experimental.gluon.language"]
 
 
 def test_kernel_sources_use_tokenspeed_triton_adapter():
