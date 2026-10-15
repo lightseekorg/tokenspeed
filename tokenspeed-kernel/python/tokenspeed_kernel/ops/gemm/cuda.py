@@ -4,13 +4,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-
-try:
-    from tokenspeed_kernel.thirdparty.cuda.dsv3_gemm import dsv3_router_gemm
-except ImportError:
-    dsv3_router_gemm = error_fn
+from tokenspeed_kernel.thirdparty.cuda.dsv3_gemm import dsv3_router_gemm
 
 
 @register_kernel(

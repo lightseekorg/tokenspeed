@@ -24,7 +24,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.gemm import _gemm_format_signature
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
-from tokenspeed_kernel.ops.gemm.torch import TORCH_FP8_SCALED_MIN_M
+from tokenspeed_kernel.ops.gemm.native import TORCH_FP8_SCALED_MIN_M
 from tokenspeed_kernel.selection import select_kernel
 from utils import kernel_supported, make_fp8_per_channel_gemm_operands
 

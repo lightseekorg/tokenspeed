@@ -75,10 +75,6 @@ def test_draft_projections_use_common_gemm_dispatch(m: int) -> None:
         # New N/K signatures reach the shared tuning entry without a winner table.
         with (
             mock.patch(
-                "tokenspeed.runtime.layers.dense.unquant.use_decode_gemv",
-                return_value=False,
-            ),
-            mock.patch(
                 "tokenspeed.runtime.layers.dense.unquant.kernel_mm",
                 side_effect=torch.nn.functional.linear,
             ) as gemm,

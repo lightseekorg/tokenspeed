@@ -616,6 +616,10 @@ class TestVerifyCommitGPUTest:
 
         if not torch.cuda.is_available():
             pytest.skip("needs a CUDA device")
+        from tokenspeed_kernel.ops.kvcache.triton import (
+            _state_verify_commit_rows_kernel,
+        )
+
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
         from tokenspeed.runtime.layers.attention.backends.state import mamba
 
@@ -640,159 +644,83 @@ class TestVerifyCommitGPUTest:
         for replay_ssm in (False, True):
             for live_bs in (1, 3):
                 with subtests.test(replay_ssm=replay_ssm, live_bs=live_bs):
-                    torch.cuda.synchronize()
-                    with torch.profiler.profile(
-                        activities=[
-                            torch.profiler.ProfilerActivity.CPU,
-                            torch.profiler.ProfilerActivity.CUDA,
-                        ]
-                    ) as profile:
-                        components = {
-                            layer: (
-                                group,
-                                torch.full(
-                                    (16, 6, 3), -7, dtype=torch.bfloat16, device="cuda"
-                                ),
-                                torch.full(
-                                    (16, 1, 2, 2),
-                                    -7,
-                                    dtype=torch.float32,
-                                    device="cuda",
-                                ),
-                            )
-                            for layer, group in layer_groups.items()
-                        }
-                        pool = _ContractPool(components)
-                        pool.arena.runtime_contract.group_specs = tuple(
-                            reversed(pool.arena.runtime_contract.group_specs)
+                    components = {
+                        layer: (
+                            group,
+                            torch.full(
+                                (16, 6, 3), -7, dtype=torch.bfloat16, device="cuda"
+                            ),
+                            torch.full(
+                                (16, 1, 2, 2), -7, dtype=torch.float32, device="cuda"
+                            ),
                         )
-                        backend = mamba.MambaAttnBackend(
-                            *_mamba_config_pair(
-                                torch,
-                                heads=1,
-                                head_dim=2,
-                                spec_tokens=width,
-                                max_bs=capacity,
-                                device="cuda",
-                                replay_ssm=replay_ssm,
-                            )
+                        for layer, group in layer_groups.items()
+                    }
+                    pool = _ContractPool(components)
+                    pool.arena.runtime_contract.group_specs = tuple(
+                        reversed(pool.arena.runtime_contract.group_specs)
+                    )
+                    backend = mamba.MambaAttnBackend(
+                        *_mamba_config_pair(
+                            torch,
+                            heads=1,
+                            head_dim=2,
+                            spec_tokens=width,
+                            max_bs=capacity,
+                            device="cuda",
+                            replay_ssm=replay_ssm,
                         )
-                        backend.set_kv_pool(pool)
-                        backend.init_cuda_graph_state(capacity)
-                        backend.refresh_decode_metadata(
-                            capacity,
-                            live_bs,
-                            torch.arange(capacity, dtype=torch.int32, device="cuda"),
-                            seq_lens,
-                            forward_mode=ForwardMode.DECODE,
-                            block_tables=tables,
-                        )
-                        read_pages = backend._verify_commit_ctx[2]
-                        for layer, scratches in backend._verify_scratch.items():
-                            for tensor in scratches:
-                                if tensor is not None:
-                                    values = torch.arange(
-                                        tensor.shape[0],
-                                        device="cuda",
-                                        dtype=tensor.dtype,
-                                    ) + 100 * (layer + 1)
-                                    tensor.copy_(
-                                        values.view(
-                                            -1, *([1] * (tensor.ndim - 1))
-                                        ).expand_as(tensor)
-                                    )
-                        # Warm pointer tables outside the commit scope, as forward seeding does.
-                        backend._verify_copy_tables_get()
-                        torch.cuda.synchronize()
-                        with (
-                            patch.object(mamba, "gdn_replay_commit") as replay,
-                            torch.profiler.record_function("gdn_verify_commit"),
-                        ):
+                    )
+                    backend.set_kv_pool(pool)
+                    backend.init_cuda_graph_state(capacity)
+                    backend.refresh_decode_metadata(
+                        capacity,
+                        live_bs,
+                        torch.arange(capacity, dtype=torch.int32, device="cuda"),
+                        seq_lens,
+                        forward_mode=ForwardMode.DECODE,
+                        block_tables=tables,
+                    )
+                    read_pages = backend._verify_commit_ctx[2]
+                    for layer, scratches in backend._verify_scratch.items():
+                        for tensor in scratches:
+                            if tensor is not None:
+                                values = torch.arange(
+                                    tensor.shape[0], device="cuda", dtype=tensor.dtype
+                                ) + 100 * (layer + 1)
+                                tensor.copy_(
+                                    values.view(
+                                        -1, *([1] * (tensor.ndim - 1))
+                                    ).expand_as(tensor)
+                                )
+                    # Warm pointer tables outside profiling, as forward seeding does.
+                    backend._verify_copy_tables_get()
+                    # Count real launches directly: ROCm profiler traces can omit events.
+                    with (
+                        patch.object(mamba, "gdn_replay_commit") as replay,
+                        patch.object(
+                            _state_verify_commit_rows_kernel,
+                            "run",
+                            wraps=_state_verify_commit_rows_kernel.run,
+                        ) as commit_rows_launch,
+                    ):
+                        with torch.profiler.profile(
+                            activities=[
+                                torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA,
+                            ]
+                        ) as profile:
                             backend.commit_verified_state(
                                 accepted[:live_bs], accepted_path=None
                             )
                             torch.cuda.synchronize()
-                        source_rows = [1, 6, 11][:live_bs]
-                        for layer, group in layer_groups.items():
-                            for kind, name in enumerate(
-                                ("conv_state", "recurrent_state")
-                            ):
-                                actual = pool.get_component(layer, name)
-                                expected = torch.full_like(actual, -7)
-                                if kind == 0 or not replay_ssm:
-                                    for src, dst in zip(
-                                        source_rows,
-                                        expected_pages[group][:live_bs],
-                                        strict=True,
-                                    ):
-                                        if dst > 0:
-                                            expected[dst] = backend._verify_scratch[
-                                                layer
-                                            ][kind][src]
-                                torch.testing.assert_close(
-                                    actual, expected, rtol=0, atol=0
-                                )
-                        if replay_ssm:
-                            replay.assert_called_once()
-                            kwargs = replay.call_args.kwargs
-                            torch.testing.assert_close(
-                                kwargs["accepted_length"],
-                                accepted[:live_bs].clamp(1, width),
-                            )
-                            expected_write = torch.tensor(
-                                [
-                                    expected_pages[g][:live_bs]
-                                    for g in layer_groups.values()
-                                ],
-                                dtype=torch.int32,
-                                device="cuda",
-                            )
-                            torch.testing.assert_close(
-                                kwargs["write_indices"], expected_write
-                            )
-                            torch.testing.assert_close(
-                                kwargs["read_indices"],
-                                torch.stack(
-                                    [
-                                        read_pages[g][:live_bs]
-                                        for g in layer_groups.values()
-                                    ]
-                                ),
-                            )
-                        else:
-                            replay.assert_not_called()
-                        assert (backend._verify_commit_ctx) is None
                     events = profile.events()
-                    (commit_scope,) = (
-                        e
-                        for e in events
-                        if e.name == "gdn_verify_commit"
-                        and e.device_type == torch.autograd.DeviceType.CPU
-                    )
-                    commit_events = [
-                        e
-                        for e in events
-                        if e.device_type == torch.autograd.DeviceType.CPU
-                        and commit_scope.time_range.start <= e.time_range.start
-                        and e.time_range.end <= commit_scope.time_range.end
-                    ]
-                    launch_ids = {
-                        e.id
-                        for e in commit_events
-                        if e.activity_type in ("cuda_runtime", "cuda_driver")
-                    }
                     gpu_kernels = [
                         e.name
                         for e in events
                         if e.device_type == torch.autograd.DeviceType.CUDA
-                        and e.id in launch_ids
                     ]
-                    assert (
-                        sum(
-                            "_state_verify_commit_rows_kernel" in name
-                            for name in gpu_kernels
-                        )
-                    ) == (1), gpu_kernels
+                    commit_rows_launch.assert_called_once()
                     # Replay still assembles its separate read indices; the
                     # scratch-copy path needs no PyTorch index arithmetic.
                     if not replay_ssm:
@@ -802,9 +730,54 @@ class TestVerifyCommitGPUTest:
                                 "aten::add",
                                 "aten::repeat",
                                 "aten::stack",
-                            }.intersection(e.name for e in commit_events)
+                            }.intersection(e.name for e in events)
                         )
-                        assert not (any("elementwise" in name for name in gpu_kernels))
+                        assert not (
+                            any("elementwise" in name for name in gpu_kernels)
+                        )
+                    source_rows = [1, 6, 11][:live_bs]
+                    for layer, group in layer_groups.items():
+                        for kind, name in enumerate(("conv_state", "recurrent_state")):
+                            actual = pool.get_component(layer, name)
+                            expected = torch.full_like(actual, -7)
+                            if kind == 0 or not replay_ssm:
+                                for src, dst in zip(
+                                    source_rows,
+                                    expected_pages[group][:live_bs],
+                                    strict=True,
+                                ):
+                                    if dst > 0:
+                                        expected[dst] = backend._verify_scratch[layer][
+                                            kind
+                                        ][src]
+                            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    if replay_ssm:
+                        replay.assert_called_once()
+                        kwargs = replay.call_args.kwargs
+                        torch.testing.assert_close(
+                            kwargs["accepted_length"],
+                            accepted[:live_bs].clamp(1, width),
+                        )
+                        expected_write = torch.tensor(
+                            [
+                                expected_pages[g][:live_bs]
+                                for g in layer_groups.values()
+                            ],
+                            dtype=torch.int32,
+                            device="cuda",
+                        )
+                        torch.testing.assert_close(
+                            kwargs["write_indices"], expected_write
+                        )
+                        torch.testing.assert_close(
+                            kwargs["read_indices"],
+                            torch.stack(
+                                [read_pages[g][:live_bs] for g in layer_groups.values()]
+                            ),
+                        )
+                    else:
+                        replay.assert_not_called()
+                    assert backend._verify_commit_ctx is None
 
 
 class TestGDNStatePagingGPUTest:

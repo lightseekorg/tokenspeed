@@ -50,8 +50,7 @@ from tokenspeed_kernel.ops import gemm as gemm_module  # noqa: E402
 from tokenspeed_kernel.ops import moe as moe_module  # noqa: E402
 from tokenspeed_kernel.ops import tuning as tuning_module  # noqa: E402
 from tokenspeed_kernel.ops.gemm import flashinfer as fi_gemm_module  # noqa: E402
-from tokenspeed_kernel.ops.gemm import kimi3 as kimi3_module  # noqa: E402
-from tokenspeed_kernel.ops.gemm import triton_gemv as gemv_module  # noqa: E402
+from tokenspeed_kernel.ops.gemm import triton as gemm_triton_module  # noqa: E402
 from tokenspeed_kernel.ops.moe import flashinfer as mxfp4_module  # noqa: E402
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec  # noqa: E402
 from tokenspeed_kernel.selection import (  # noqa: E402
@@ -1182,27 +1181,30 @@ def test_projection_discovery_precedes_auto_dispatch(monkeypatch, name):
     fallback still computes the plain projection."""
     events = []
     monkeypatch.setattr(
-        kimi3_module,
+        gemm_module,
         "autotune_bf16_gemm",
         lambda x, weight: events.append(("discover", x, weight)),
     )
     _tap(
         monkeypatch,
-        kimi3_module,
-        "use_decode_gemv",
+        gemm_module,
+        "_use_mv",
         lambda *args: events.append(("gemv",)),
     )
+    # mv shares the patched module and runs its own discovery; keep only the
+    # projection's.
+    monkeypatch.setattr(gemm_module, "mv", lambda x, weight, out=None: x @ weight.T)
     x = torch.randn(3, 16, dtype=torch.bfloat16)
     weight = torch.randn(24, 16, dtype=torch.bfloat16)
     if name == "kimi3_mla_qkv_gate_projection":
-        result = kimi3_module.kimi3_mla_qkv_gate_projection(
+        result = gemm_module.kimi3_mla_qkv_gate_projection(
             x, weight, 16, solution="auto"
         )
         torch.testing.assert_close(result.qkv, x @ weight[:16].T)
         torch.testing.assert_close(result.gate, x @ weight[16:].T)
         assert [event for event, *_ in events] == ["discover"]
     else:
-        project = getattr(kimi3_module, name)
+        project = getattr(gemm_module, name)
         result = project(x, weight, solution="auto")
         torch.testing.assert_close(result, x @ weight.T)
         assert [event for event, *_ in events] == ["discover", "gemv"]
@@ -1251,21 +1253,21 @@ def test_decode_gemv_eligibility_preserves_fi_and_cdna5(
     selected = object() if registered else fallback
     select_calls = []
     monkeypatch.setattr(
-        gemv_module, "flashinfer_joint_bf16_supported", lambda *args: fi
+        gemm_module, "flashinfer_joint_bf16_supported", lambda *args: fi
     )
-    monkeypatch.setattr(gemv_module, "is_serving", lambda: False)
+    monkeypatch.setattr(gemm_module, "is_serving", lambda: False)
     monkeypatch.setattr(
-        gemv_module, "current_platform", lambda: _PlatformDouble(is_cdna5=cdna5)
+        gemm_module, "current_platform", lambda: _PlatformDouble(is_cdna5=cdna5)
     )
     monkeypatch.setattr(
-        gemv_module,
-        "_select",
+        gemm_module,
+        "_select_mv",
         lambda *args: select_calls.append(args) or selected,
     )
-    monkeypatch.setattr(gemv_module, "torch_decode_gemv", fallback)
+    monkeypatch.setattr(gemm_module, "torch_decode_gemv", fallback)
     x = _CudaTensorDouble((m, k))
     weight = _CudaTensorDouble((7168, k))
-    assert gemv_module.use_decode_gemv(x, weight) is expected
+    assert gemm_module._use_mv(x, weight) is expected
     if fi and m <= 32:
         assert select_calls == []
 
@@ -1295,9 +1297,9 @@ def test_decode_gemv_selection_obeys_shape_traits(
         KernelSpec(
             name="specialized",
             family="gemm",
-            mode="decode_gemv",
+            mode="mv",
             format_signatures=frozenset(
-                {gemv_module._SIGNATURES[(torch.bfloat16, torch.bfloat16)]}
+                {gemm_module._MV_SIGNATURES[(torch.bfloat16, torch.bfloat16)]}
             ),
             traits={
                 "m": frozenset({1}),
@@ -1307,10 +1309,10 @@ def test_decode_gemv_selection_obeys_shape_traits(
         ),
         specialized_gemv,
     )
-    monkeypatch.setattr(gemv_module, "KernelRegistry", _GetAccess(registry))
-    gemv_module._select.cache_clear()
-    fallback = gemv_module.torch_decode_gemv
-    selected = gemv_module._select(
+    monkeypatch.setattr(gemm_module, "KernelRegistry", _GetAccess(registry))
+    gemm_module._select_mv.cache_clear()
+    fallback = gemm_module.torch_decode_gemv
+    selected = gemm_module._select_mv(
         m, n, k, on_cuda, torch.bfloat16, torch.bfloat16, False
     )
     # A full trait match selects the registered kernel. Anything less keeps
@@ -1319,10 +1321,10 @@ def test_decode_gemv_selection_obeys_shape_traits(
     assert selected is (specialized_gemv if expected else fallback)
     # A dtype pair with no registry signature keeps the fallback as well.
     assert (
-        gemv_module._select(m, n, k, on_cuda, torch.float16, torch.float16, False)
+        gemm_module._select_mv(m, n, k, on_cuda, torch.float16, torch.float16, False)
         is fallback
     )
-    gemv_module._select.cache_clear()
+    gemm_module._select_mv.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -1341,7 +1343,7 @@ def test_decode_gemv_selection_obeys_shape_traits(
 def test_fp32_rowcta_routing_bounds_k(m, k, routed):
     # A direct call takes any width, but the registry sends a second 64K block
     # for one row, and more than 15 blocks of 512 for more rows, to Torch.
-    assert gemv_module._fp32_rowcta_k_fits(m, 256, k) is routed
+    assert gemm_triton_module._fp32_rowcta_k_fits(m, 256, k) is routed
 
 
 @pytest.mark.parametrize("serving", [False, True])
@@ -1351,24 +1353,26 @@ def test_serving_sends_joint_bf16_rows_to_a_gemm_that_never_compiles(
     """Once serving, FI's rows skip FI and the registry's possibly cold Triton GEMV."""
     joint_calls, fallback_calls, select_calls = [], [], []
     monkeypatch.setattr(
-        gemv_module, "flashinfer_joint_bf16_supported", lambda *args: True
+        gemm_module, "flashinfer_joint_bf16_supported", lambda *args: True
     )
     monkeypatch.setattr(
-        gemv_module,
+        gemm_module,
         "flashinfer_bf16_gemm",
         lambda *args: joint_calls.append(args) or torch.mm(args[0], args[1].T),
     )
-    monkeypatch.setattr(gemv_module, "is_serving", lambda: serving)
+    monkeypatch.setattr(gemm_module, "is_serving", lambda: serving)
     monkeypatch.setattr(
-        gemv_module,
+        gemm_module,
         "torch_decode_gemv",
         lambda *args: fallback_calls.append(args) or torch.mm(args[0], args[1].T),
     )
-    monkeypatch.setattr(gemv_module, "_select", lambda *args: select_calls.append(args))
+    monkeypatch.setattr(
+        gemm_module, "_select_mv", lambda *args: select_calls.append(args)
+    )
     x = torch.ones(1, 128, dtype=torch.bfloat16)
     w = torch.ones(32, 128, dtype=torch.bfloat16)
-    assert gemv_module.use_decode_gemv(x, w) is not serving
-    result = gemv_module.decode_gemv(x, w)
+    assert gemm_module._use_mv(x, w) is not serving
+    result = gemm_module.mv(x, w)
     torch.testing.assert_close(result, x @ w.T)
     used, idle = (
         (fallback_calls, joint_calls) if serving else (joint_calls, fallback_calls)
@@ -1409,16 +1413,16 @@ def test_skinny_add3_preserves_capture_trust(monkeypatch, capturing, warmed, fai
     key = (0, 1, 4, 8)
     known = {key} if warmed else set()
     kernel_calls, fallback_calls = [], []
-    monkeypatch.setattr(kimi3_module, "_SKINNY_ADD3_CONFIGS", {(1, 4, 8): (64, 4, 2)})
-    monkeypatch.setattr(kimi3_module, "_skinny_add3_arch_supported", lambda dev: True)
-    monkeypatch.setattr(kimi3_module, "_skinny_add3_warmed", known)
+    monkeypatch.setattr(gemm_module, "_SKINNY_ADD3_CONFIGS", {(1, 4, 8): (64, 4, 2)})
+    monkeypatch.setattr(gemm_module, "_skinny_add3_arch_supported", lambda dev: True)
+    monkeypatch.setattr(gemm_module, "_skinny_add3_warmed", known)
     monkeypatch.setattr(
-        kimi3_module,
+        gemm_module,
         "shape_dynamic_skinny_gemm",
         _SkinnyGemmDouble(kernel_calls, failure),
     )
     monkeypatch.setattr(
-        kimi3_module,
+        gemm_module,
         "_skinny_add3_fallback",
         lambda *args: fallback_calls.append(args) or "fallback",
     )
@@ -1429,15 +1433,15 @@ def test_skinny_add3_preserves_capture_trust(monkeypatch, capturing, warmed, fai
     a = torch.randn(1, 4, dtype=torch.bfloat16, generator=rng)
     c = torch.randn(1, 4, dtype=torch.bfloat16, generator=rng)
     if capturing and not warmed:
-        assert kimi3_module._skinny_gemv_add3(x, w, a, c, None) == "fallback"
+        assert gemm_module._skinny_gemv_add3(x, w, a, c, None) == "fallback"
         assert kernel_calls == []
         assert not known
     elif failure:
         with pytest.raises(RuntimeError, match="compile failed"):
-            kimi3_module._skinny_gemv_add3(x, w, a, c, None)
+            gemm_module._skinny_gemv_add3(x, w, a, c, None)
         assert known == ({key} if warmed else set())
     else:
-        result = kimi3_module._skinny_gemv_add3(x, w, a, c, None)
+        result = gemm_module._skinny_gemv_add3(x, w, a, c, None)
         torch.testing.assert_close(result, torch.addmm(c, x, w.t()) + a)
         assert len(kernel_calls) == 1
         assert fallback_calls == []
@@ -1449,14 +1453,14 @@ def test_skinny_add3_preserves_capture_trust(monkeypatch, capturing, warmed, fai
 )
 def test_skinny_add3_uses_only_measured_architecture(monkeypatch, capability, expected):
     monkeypatch.setattr(
-        kimi3_module,
+        gemm_module,
         "Platform",
         _GetAccess(_PlatformDouble(vendor="nvidia")),
     )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index: capability)
-    kimi3_module._skinny_add3_arch_supported.cache_clear()
-    assert kimi3_module._skinny_add3_arch_supported(0) is expected
-    kimi3_module._skinny_add3_arch_supported.cache_clear()
+    gemm_module._skinny_add3_arch_supported.cache_clear()
+    assert gemm_module._skinny_add3_arch_supported(0) is expected
+    gemm_module._skinny_add3_arch_supported.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1585,18 +1589,13 @@ def test_dense_mm_override_precedes_decode_shortcut(monkeypatch, kind, numerics)
     if kind == "environment":
         monkeypatch.setenv("TOKENSPEED_KERNEL_OVERRIDE_GEMM_MM", "forced")
     mm_result = object()
-    mm_calls, shortcut_calls = [], []
+    mm_calls = []
 
     def kernel_mm(*args, **kwargs):
         mm_calls.append((args, kwargs))
         return mm_result
 
     monkeypatch.setattr(unquant_module, "kernel_mm", kernel_mm)
-    monkeypatch.setattr(
-        unquant_module,
-        "use_decode_gemv",
-        lambda *args: shortcut_calls.append(args) or False,
-    )
     method = UnquantizedLinearMethod()
     layer = torch.nn.Linear(4, 8, bias=False)
     x = torch.randn(3, 4)
@@ -1611,7 +1610,6 @@ def test_dense_mm_override_precedes_decode_shortcut(monkeypatch, kind, numerics)
     if numerics == "rl-bitwise":
         expected["override"] = "aok"
     assert kwargs == expected
-    assert shortcut_calls == []
 
 
 if __name__ == "__main__":
