@@ -21,6 +21,15 @@ records every Python package mutation needed by this Ascend path, including the
 TokenSpeed applications should continue to import operators from
 `tokenspeed-kernel`; it owns registration and dispatch to this package.
 
+The Ascend plugin's explicit prefill composition can prepare a
+`W4A4GroupedPlan` from the existing fused W4A4 weight plan. It shares NZ
+weights, encodes official GMM scales once, and executes Cube FlatQuant before
+packed gather, GMM13, SwiGLU, Cube FlatQuant and GMM2. The caller supplies exact
+sorted route rows and per-expert counts; no token padding is added. Both NZ
+orientations are supported. This is an explicit composed implementation, not
+a fallback when the fused decode kernel rejects a shape. Official GMM's BF16
+epilogue has different intermediate rounding from fused vector dequantization.
+
 Run the operator correctness suite on a visible NPU with:
 
 ```bash

@@ -24,13 +24,14 @@ import contextlib
 import math
 import statistics
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
 import torch
 from tokenspeed_kernel.benchmark.profiler import ProfilePhase
+from tokenspeed_kernel.workspace import capture_session
 
 __all__ = [
     "GraphBenchmarkConfig",
@@ -178,18 +179,22 @@ class _TorchCudaBackend:
     def new_graph(self) -> object:
         return torch.cuda.CUDAGraph()
 
+    @contextlib.contextmanager
     def capture(
         self,
         graph: object,
         stream: object,
         *,
         capture_error_mode: str,
-    ) -> AbstractContextManager[None]:
-        return torch.cuda.graph(
+    ) -> Iterator[None]:
+        # As in serving, captured launches get kernel state zeroed outside the
+        # graph and kept alive with it.
+        with capture_session(graph), torch.cuda.graph(
             graph,
             stream=stream,
             capture_error_mode=capture_error_mode,
-        )
+        ):
+            yield
 
     def replay(self, graph: object) -> None:
         graph.replay()

@@ -6,13 +6,25 @@ per-aux-state ``fc_norm`` RMSNorms and the ``norm_output`` aux convention.
 
 from __future__ import annotations
 
+from dataclasses import replace
+from types import SimpleNamespace
+
 import pytest
 import torch
 from transformers import LlamaConfig
 
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+from tokenspeed.runtime.layers.attention.kv_cache.factory import (
+    create_cache_arena,
+    create_cache_pool,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+    prepare_cache_setup,
+)
 from tokenspeed.runtime.layers.layernorm import RMSNorm
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.paged_attention import PagedAttention, bind_cache_groups
 from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -124,6 +136,68 @@ def test_eagle3_attention_declares_full_visibility_and_no_storage(
     for layer in paged_layers:
         with pytest.raises(RuntimeError, match="no cache group bound"):
             layer.group_id
+
+
+def test_sliding_window_draft_layer_rides_a_sliding_cache_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``sliding_attention`` draft layer masks to its HF window, so it binds to a sliding group that retains it."""
+    model = _build_model(
+        monkeypatch,
+        _draft_config(layer_types=["sliding_attention"], sliding_window=128),
+    )
+    target = MHAConfig(
+        backend_name="fa2",
+        num_attention_heads=4,
+        num_kv_heads=4,
+        head_dim=8,
+        attn_tp_size=1,
+        cache_layer_types=("sliding_attention", "full_attention"),
+        sliding_window_tokens=128,
+    )
+    model_wide = dict(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        kv_cache_mxfp8=False,
+        prefix_granularity=64,
+        kernel_page_size=64,
+        context_len=1024,
+        max_bs=2,
+    )
+    draft_attn_config = AttnConfig(
+        components=(replace(target, cache_layer_types=("sliding_attention",)),),
+        **model_wide,
+    )
+    setup = prepare_cache_setup(
+        family="mha",
+        server_args=SimpleNamespace(
+            kv_offload_config=None,
+            max_total_tokens=None,
+            speculative_num_draft_tokens=4,
+            speculative_eagle_topk=1,
+        ),
+        model_config=SimpleNamespace(num_attention_layers=2),
+        attn_config=AttnConfig(components=(target,), **model_wide),
+        draft_model_config=SimpleNamespace(num_attention_layers=1),
+        draft_attn_config=draft_attn_config,
+        cache_budget_bytes=1 << 22,
+        probe_batch_rows=None,
+        decode_input_tokens=4,
+        overlap_schedule_depth=0,
+    )
+    arena = create_cache_arena(setup.spec, device="cpu", enable_memory_saver=False)
+    draft_view = create_cache_pool(
+        setup.spec, draft_attn_config, arena, num_layers=1, rank=0, field_layer_offset=2
+    )
+
+    bind_cache_groups(model, draft_view)
+
+    paged_layers = [
+        module for module in model.modules() if isinstance(module, PagedAttention)
+    ]
+    assert {layer.sliding_window_size for layer in paged_layers} == {127}
 
 
 def test_eagle3_fc_norm_and_norm_output_variant(

@@ -63,6 +63,8 @@ _CONTEXT_KV_WRITERS = {
 }
 # Keys the prologue does not own: sparse indexers'.
 _OTHER_KEY_OWNERS = {
+    "models/deepseek_v4.py:DeepseekV4Attention._project_q_kv",
+    "models/dots3_note.py:Dots3NoteIndexer.forward",
     "models/glm5.py:GlmDsaIndexer.forward",
     "models/glm53_flash.py:Glm53FlashIndexer.forward",
 }

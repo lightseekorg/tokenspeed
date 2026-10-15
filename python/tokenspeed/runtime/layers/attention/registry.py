@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.dots3_note_config import Dots3NoteConfig
 from tokenspeed.runtime.configs.model_config import (
     AttentionArch,
     is_deepseek_v4,
@@ -40,6 +41,9 @@ from tokenspeed.runtime.layers.attention.configs.base import (
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import (
     DeepseekV41Config,
     is_deepseek_v41_config,
+)
+from tokenspeed.runtime.layers.attention.configs.dots3_note import (
+    Dots3NoteAttentionConfig,
 )
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import (
@@ -539,6 +543,8 @@ def _resolve_cache_family(
     """The one dispatch from family facts (plus built config) to the recipe."""
     if profile.model_profile is not None:
         return profile.model_profile.cache_family
+    if config.component(Dots3NoteAttentionConfig) is not None:
+        return "dots3_note"
     if config.component(DeepseekV41Config) is not None:
         return "deepseek_v41"
     if profile.is_deepseek_v4:
@@ -617,6 +623,14 @@ def create_paged_router(
     )
 
     spec = config.component(SoftmaxAttnConfig)
+    if isinstance(spec, Dots3NoteAttentionConfig):
+        from tokenspeed.runtime.layers.attention.backends.dots3_note import (
+            create_dots3_note_router,
+        )
+
+        if backend_name not in (None, "dsa"):
+            raise ValueError("dots3-note requires the DSA/SWA paged router")
+        return create_dots3_note_router(config)
     name = backend_name if backend_name is not None else spec.backend_name
     if name == "hybrid_linear_attn":
         # The composite sentinel _apply_backend_overrides writes into
@@ -698,11 +712,12 @@ def _create_attn_config(
     arch = model_config.attention_arch
     if arch not in _CONFIG_CLS:
         raise NotImplementedError(f"Not supported Attention Arch: {arch!r}")
-    config_cls = (
-        DeepseekV41Config
-        if is_deepseek_v41_config(model_config.hf_config)
-        else _CONFIG_CLS[arch]
-    )
+    if isinstance(model_config.hf_config, Dots3NoteConfig):
+        config_cls = Dots3NoteAttentionConfig
+    elif is_deepseek_v41_config(model_config.hf_config):
+        config_cls = DeepseekV41Config
+    else:
+        config_cls = _CONFIG_CLS[arch]
     config = config_cls.generate(server_args, model_config, is_draft)
     # Extra components are built through the same generate() protocol and
     # composed into config.components (consumers look them up by class via

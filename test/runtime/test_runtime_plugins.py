@@ -85,6 +85,36 @@ class FixtureConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
+def test_plugin_multimodal_config_is_retained(isolated, tmp_path):
+    class VisionFixture(FixtureForCausalLM):
+        @classmethod
+        def model_profile(cls, hf_config):
+            return _profile(is_multimodal=True)
+
+    class VisionConfig(PretrainedConfig):
+        model_type = "fixture_vision"
+
+        def __init__(self, text_config=None, **kwargs):
+            self.text_config = PretrainedConfig(
+                **(
+                    text_config
+                    or {"num_attention_heads": 2, "architectures": ["FixtureText"]}
+                )
+            )
+            kwargs["architectures"] = ["VisionFixture"]
+            super().__init__(**kwargs)
+
+    registry.register_model(VisionFixture)
+    registry.register_config(VisionConfig, model_type="fixture_vision")
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "fixture_vision", "architectures": ["FixtureText"]})
+    )
+    config = hf_transformers_utils.get_config(str(tmp_path), trust_remote_code=False)
+    assert isinstance(config, VisionConfig)
+    resolved = registry.resolve_model_profile(config.architectures, config)
+    assert resolved is not None and resolved[1].is_multimodal
+
+
 class _Dist:
     metadata = {"Name": "fixture-plugin"}
     version = "1.2.3"

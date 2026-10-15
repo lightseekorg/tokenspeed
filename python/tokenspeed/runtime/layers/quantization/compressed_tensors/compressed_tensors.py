@@ -52,6 +52,7 @@ from tokenspeed.runtime.layers.quantization.compressed_tensors.gptq_marlin_moe i
 from tokenspeed.runtime.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsScheme,
+    CompressedTensorsW8A8Int8,
     CompressedTensorsWNA16,
 )
 from tokenspeed.runtime.layers.quantization.utils import find_matched_target
@@ -132,8 +133,20 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Container format: resolve the routed-expert scheme to a concrete MoE
         # kernel dtype. 4-bit group-32 weight-only: INT -> mxint4
         # (Kimi-K2.5 / K2.6 / K2.7), FLOAT -> mxfp4 (K3).
-        weight_quant = self.target_scheme_map["Linear"].get("weights")
-        input_quant = self.target_scheme_map["Linear"].get("input_activations")
+        # A MoE-specific scheme must not change shared/dense Linear quantization.
+        scheme = (
+            self.target_scheme_map.get("Moe", self.target_scheme_map.get("Linear"))
+            if current_platform().is_npu
+            else self.target_scheme_map.get("Linear")
+        )
+        if scheme is None:
+            raise ValueError("Missing MoE quantization scheme")
+        weight_quant = scheme.get("weights")
+        input_quant = scheme.get("input_activations")
+        if self._is_dynamic_token_int4(weight_quant, input_quant):
+            return "int4"
+        if self._is_dynamic_token_int8(weight_quant, input_quant):
+            return "int8"
         is_4bit_group32 = (
             weight_quant is not None
             and weight_quant.num_bits == 4
@@ -151,6 +164,46 @@ class CompressedTensorsConfig(QuantizationConfig):
         raise ValueError(
             f"unsupported compressed-tensors MoE scheme for kernel selection: "
             f"{weight_quant}"
+        )
+
+    def _is_dynamic_token_int8(self, weight_quant, input_quant) -> bool:
+        return (
+            current_platform().is_npu
+            and self.quant_format == CompressionFormat.int_quantized.value
+            and weight_quant is not None
+            and input_quant is not None
+            and weight_quant.num_bits == 8
+            and weight_quant.type == QuantizationType.INT
+            and weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+            and weight_quant.symmetric
+            and not weight_quant.dynamic
+            and input_quant.num_bits == 8
+            and input_quant.type == QuantizationType.INT
+            and input_quant.strategy == QuantizationStrategy.TOKEN.value
+            and input_quant.symmetric
+            and input_quant.dynamic
+        )
+
+    def _is_dynamic_token_int4(self, weight_quant, input_quant) -> bool:
+        """Ascend FlatQuant W4A4, distinct from group-wise weight-only INT4."""
+        return (
+            current_platform().is_npu
+            and self.quant_format == CompressionFormat.int_quantized.value
+            and weight_quant is not None
+            and input_quant is not None
+            and weight_quant.num_bits == input_quant.num_bits == 4
+            and weight_quant.type == input_quant.type == QuantizationType.INT
+            and weight_quant.strategy
+            in (
+                QuantizationStrategy.CHANNEL.value,
+                QuantizationStrategy.TENSOR.value,
+            )
+            and weight_quant.symmetric
+            and not weight_quant.dynamic
+            and not weight_quant.actorder
+            and input_quant.strategy == QuantizationStrategy.TOKEN.value
+            and input_quant.symmetric
+            and input_quant.dynamic
         )
 
     def get_scaled_act_names(self) -> list[str]:
@@ -348,6 +401,11 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _get_scheme_from_parts(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> CompressedTensorsScheme:
+
+        if self._is_dynamic_token_int8(weight_quant, input_quant):
+            if (self.config or {}).get("enable_smooth_quant", False):
+                raise NotImplementedError("Dense INT8 SmoothQuant is not implemented")
+            return CompressedTensorsW8A8Int8()
 
         # Detect If Mixed Precision
         if self._is_wNa16_group_channel(weight_quant, input_quant):

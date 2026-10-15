@@ -29,6 +29,13 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
     CausalConv1dPrefillMetadata,
 )
 from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 from tokenspeed.runtime.utils.triton import tl, triton
 
@@ -1262,3 +1269,122 @@ def causal_conv1d_update(
     if unsqueeze:
         out = out.squeeze(-1)
     return out
+
+
+# Keep the existing GPU implementations as registered leaves. Device-specific
+# plugins can replace them without adding model/backend-specific convolution
+# hooks to MambaAttnBackend.
+_triton_causal_conv1d_fn = causal_conv1d_fn
+_triton_causal_conv1d_update = causal_conv1d_update
+_CONV_DTYPES = {torch.bfloat16, torch.float16, torch.float32}
+
+
+def _state_layout(state: torch.Tensor, weight: torch.Tensor) -> str:
+    if (
+        state.ndim == 3
+        and state.shape[1] == weight.shape[1] - 1
+        and state.shape[2] == weight.shape[0]
+    ):
+        return "width_major"
+    return "channel_major"
+
+
+register_kernel(
+    "attention",
+    "causal_conv1d_prefill",
+    name="triton_causal_conv1d_prefill",
+    solution="triton",
+    signatures=format_signatures("x", "dense", _CONV_DTYPES),
+    priority=Priority.PORTABLE,
+)(_triton_causal_conv1d_fn)
+register_kernel(
+    "attention",
+    "causal_conv1d_update",
+    name="triton_causal_conv1d_update",
+    solution="triton",
+    signatures=format_signatures("x", "dense", _CONV_DTYPES),
+    priority=Priority.PORTABLE,
+)(_triton_causal_conv1d_update)
+
+
+def causal_conv1d_fn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+    validate_data=False,
+    *,
+    prefill_metadata: CausalConv1dPrefillMetadata,
+):
+    """Select a prefill convolution leaf while preserving the original ABI."""
+    kernel = select_kernel(
+        "attention",
+        "causal_conv1d_prefill",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={
+            "width": weight.shape[1],
+            "state_layout": _state_layout(conv_states, weight),
+        },
+    )
+    return kernel(
+        x=x,
+        weight=weight,
+        bias=bias,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation=activation,
+        pad_slot_id=pad_slot_id,
+        validate_data=validate_data,
+        prefill_metadata=prefill_metadata,
+    )
+
+
+def causal_conv1d_update(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    activation: bool | str | None = None,
+    cache_seqlens: torch.Tensor | None = None,
+    conv_state_indices: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    intermediate_conv_window: torch.Tensor | None = None,
+    output_state_indices: torch.Tensor | None = None,
+    pad_slot_id: int = PAD_SLOT_ID,
+    validate_data=False,
+    *,
+    parent_indices: torch.Tensor | None,
+):
+    """Select a decode/tree convolution leaf for the supplied state indices."""
+    kernel = select_kernel(
+        "attention",
+        "causal_conv1d_update",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={
+            "width": weight.shape[1],
+            "tree": parent_indices is not None,
+            "state_layout": _state_layout(conv_state, weight),
+        },
+    )
+    return kernel(
+        x=x,
+        conv_state=conv_state,
+        weight=weight,
+        bias=bias,
+        activation=activation,
+        cache_seqlens=cache_seqlens,
+        conv_state_indices=conv_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        intermediate_conv_window=intermediate_conv_window,
+        output_state_indices=output_state_indices,
+        pad_slot_id=pad_slot_id,
+        validate_data=validate_data,
+        parent_indices=parent_indices,
+    )

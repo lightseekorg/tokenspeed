@@ -21,6 +21,7 @@
 """Dense MXFP4 (dynamic MXFP4 activation) linears for gfx950."""
 
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp4.mm import (
+    gluon_mxfp4_linear_num_counters_gfx950,
     launch_gluon_mxfp4_linear_gfx950,
     launch_gluon_mxfp4_swiglu_linear_gfx950,
     preshuffle_mxfp4_weight,
@@ -28,6 +29,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp4.mm import (
 )
 
 __all__ = [
+    "gluon_mxfp4_linear_num_counters_gfx950",
     "launch_gluon_mxfp4_linear_gfx950",
     "launch_gluon_mxfp4_swiglu_linear_gfx950",
     "preshuffle_mxfp4_weight",
