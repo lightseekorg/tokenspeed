@@ -355,19 +355,22 @@ def test_token_quantization_takes_the_triton_quantizer_up_to_64_rows(
 
 
 @pytest.mark.parametrize(
-    "granularity,group_size,scale_encoding",
+    "granularity,group_size,scale_encoding,solution",
     [
-        ("token_group", 128, "float32"),
-        ("token_group", 128, "ue8m0"),
-        ("token_group", 32, "ue8m0"),
-        ("block", None, "float32"),
+        ("token_group", 128, "float32", None),
+        # Only TRT-LLM's quantizer serves 128-wide groups with UE8M0 scales.
+        ("token_group", 128, "ue8m0", "trtllm"),
+        ("token_group", 32, "ue8m0", None),
+        ("block", None, "float32", None),
     ],
 )
 def test_other_granularities_ignore_the_row_count(
-    arch, monkeypatch, granularity, group_size, scale_encoding
+    arch, require, monkeypatch, granularity, group_size, scale_encoding, solution
 ):
     """No other quantization.fp8_with_scale kernel bounds rows: a 2-D input
     (with ``m``) selects what the same row as a 3-D input (no ``m``) does."""
+    if solution is not None:
+        require("quantization", "fp8_with_scale", solution, torch.bfloat16, "x")
     selections = _quantizer_selections(monkeypatch)
     for shape in [(1, 4096), (1, 1, 4096)]:
         quantize_fp8(
