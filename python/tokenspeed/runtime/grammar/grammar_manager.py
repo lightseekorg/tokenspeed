@@ -83,6 +83,7 @@ class GrammarManager:
         server_args: ServerArgs,
         tokenizer,
         vocab_size: int,
+        stop_token_ids: set[int] | None = None,
     ) -> None:
 
         self.server_args = server_args
@@ -99,7 +100,7 @@ class GrammarManager:
         # RequestHandler loads the scheduler-side tokenizer unconditionally,
         # so the vocab the backend needs is always available here.
         self.grammar_backend = create_grammar_backend(
-            server_args, tokenizer, vocab_size
+            server_args, tokenizer, vocab_size, stop_token_ids=stop_token_ids
         )
 
         # Grammar admission must be coherent across attention TP ranks: every rank

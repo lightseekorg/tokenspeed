@@ -330,8 +330,12 @@ class RequestHandler:
             [(ProfileReq, self.profile)]
         )
 
+        # The grammar ends on the ids the engine stops on.
         self.grammar_manager = GrammarManager(
-            self.server_args, self.tokenizer, self.vocab_size
+            self.server_args,
+            self.tokenizer,
+            self.vocab_size,
+            stop_token_ids=self.hf_eos_token_id,
         )
 
         self.init_profiler()

@@ -25,6 +25,7 @@
 """Constrained decoding with xgrammar backend."""
 
 import json
+from collections.abc import Iterable
 
 import torch
 from xgrammar import (
@@ -136,12 +137,27 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         tokenizer,
         vocab_size: int,
         disable_any_whitespace: bool = False,
+        stop_token_ids: Iterable[int] | None = None,
     ) -> None:
 
         super().__init__()
 
+        # The matcher ends a grammar on the tokens the engine stops on, the
+        # model's end-of-sequence ids with the tokenizer's own EOS and extra
+        # stop ids, rather than on the tokenizer's one EOS only: a grammar that
+        # may end there then takes any of them as its end.
+        if stop_token_ids:
+            stop_token_ids = set(stop_token_ids)
+            eos_token_id = getattr(tokenizer, "eos_token_id", None)
+            if eos_token_id is not None:
+                stop_token_ids.add(eos_token_id)
+            extra = getattr(tokenizer, "additional_stop_token_ids", None)
+            stop_token_ids.update(extra or ())
+            stop_token_ids = sorted(stop_token_ids)
+        else:
+            stop_token_ids = None
         tokenizer_info = TokenizerInfo.from_huggingface(
-            tokenizer, vocab_size=vocab_size
+            tokenizer, vocab_size=vocab_size, stop_token_ids=stop_token_ids
         )
 
         self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
