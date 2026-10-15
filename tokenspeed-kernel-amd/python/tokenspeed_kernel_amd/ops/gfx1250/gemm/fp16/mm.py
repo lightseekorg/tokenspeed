@@ -28,14 +28,14 @@ from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 _LARGEM_MIN_M = 512
 _LARGEM_BLOCK_M_CROSSOVER = 12288
 _LARGEM_WIDE_N = 3072
-# From this many rows the 256 x 256 ping-pong tile fills the device.
+# From this many rows the 256 x 256 warp pipeline tile fills the device.
 _LARGEM_WIDE_M = 4096
 _LARGEM_BLOCK_K = 128
-_LARGEM_PINGPONG_GROUP_M = 4
-_LARGEM_PINGPONG_MIN_N = 1536
+_LARGEM_WARP_PIPELINE_GROUP_M = 4
+_LARGEM_WARP_PIPELINE_MIN_N = 1536
 # A 2 x 2 CTA cluster multicasts each A and B panel to two CTAs, halving
 # their L2 reads; it measured best across the K3 shapes, ragged ones included.
-_LARGEM_PINGPONG_CLUSTER = (2, 2)
+_LARGEM_WARP_PIPELINE_CLUSTER = (2, 2)
 # MI450 has eight XCDs, each with its own L2; workgroups are dispatched
 # round-robin over them.
 _LARGEM_NUM_XCDS = 8
@@ -1226,7 +1226,7 @@ def _wmma_tdm_dense_largem_kernel(
     )
 
 
-def _wmma_tdm_dense_largem_pingpong_launch_metadata(grid, kernel, args):
+def _wmma_tdm_dense_largem_warp_pipeline_launch_metadata(grid, kernel, args):
     """Report useful FLOPs and the issued A/B tile reads plus the BF16 store."""
     m, n, k = args["M"], args["N"], args["K"]
     block_m, block_n = 256 * args["CTA_M"], 256 * args["CTA_N"]
@@ -1243,7 +1243,7 @@ def _wmma_tdm_dense_largem_pingpong_launch_metadata(grid, kernel, args):
 
 
 @gluon.jit
-def _largem_pingpong_xcd_tile(
+def _largem_warp_pipeline_xcd_tile(
     pid, grid_m, grid_n, NUM_XCDS: gl.constexpr, GROUP_M: gl.constexpr
 ):
     # Workgroups are dispatched round-robin over the XCDs. Give each XCD a
@@ -1265,7 +1265,7 @@ def _largem_pingpong_xcd_tile(
 
 
 @gluon.jit
-def _largem_pingpong_consume(
+def _largem_warp_pipeline_consume(
     a_smem,
     b_smem,
     slot,
@@ -1324,7 +1324,7 @@ def _largem_pingpong_consume(
 
 
 @gluon.constexpr_function
-def _largem_pingpong_layouts(cta_m, cta_n, block_k, num_warps):
+def _largem_warp_pipeline_layouts(cta_m, cta_n, block_k, num_warps):
     """LDS and WMMA layouts for a ``cta_m x cta_n`` cluster of 256 x 256 tiles.
 
     The layouts span the whole cluster tile, and their CGA part places each
@@ -1391,10 +1391,10 @@ def _largem_pingpong_layouts(cta_m, cta_n, block_k, num_warps):
 # The live row count varies with the prefill chunk, so it must not split the
 # compile cache on its divisibility.
 @gluon.jit(
-    launch_metadata=_wmma_tdm_dense_largem_pingpong_launch_metadata,
+    launch_metadata=_wmma_tdm_dense_largem_warp_pipeline_launch_metadata,
     do_not_specialize=["M"],
 )
-def _wmma_tdm_dense_largem_pingpong_kernel(
+def _wmma_tdm_dense_largem_warp_pipeline_kernel(
     a_ptr,
     b_ptr,
     out_ptr,
@@ -1410,7 +1410,7 @@ def _wmma_tdm_dense_largem_pingpong_kernel(
     GROUP_M: gl.constexpr,
     NUM_XCDS: gl.constexpr,
 ):
-    """Eight-wave ping-pong BF16 CDNA5 GEMM for wide large-M projections.
+    """Eight-wave warp pipeline BF16 CDNA5 GEMM for wide large-M projections.
 
     Computes ``out = A @ B.T`` for unit-inner-stride A ``[M, K]``, B ``[N, K]``
     and out ``[M, N]``; K must be a multiple of BLOCK_K. Each program is a
@@ -1420,19 +1420,19 @@ def _wmma_tdm_dense_largem_pingpong_kernel(
     zero-fills the loads past the edge and clips the TDM store; CTAs wholly
     past the edge still run the loop, so every cluster barrier completes.
     """
-    gl.static_assert(gl.num_warps() == 8, "ping-pong needs two waves per SIMD")
+    gl.static_assert(gl.num_warps() == 8, "the warp pipeline needs two waves per SIMD")
     gl.static_assert(gl.num_ctas() == CTA_M * CTA_N, "one CTA per cluster tile")
     BLOCK_M: gl.constexpr = CTA_M * 256
     BLOCK_N: gl.constexpr = CTA_N * 256
     CLUSTER: gl.constexpr = CTA_M * CTA_N > 1
     # Built here rather than passed in: layout objects are not valid launch
     # arguments for the JIT hooks (compile monitor) that serialize them.
-    layouts: gl.constexpr = _largem_pingpong_layouts(CTA_M, CTA_N, BLOCK_K, 8)
+    layouts: gl.constexpr = _largem_warp_pipeline_layouts(CTA_M, CTA_N, BLOCK_K, 8)
     SHARED_A: gl.constexpr = layouts[0]
     SHARED_B: gl.constexpr = layouts[1]
     SHARED_OUT: gl.constexpr = layouts[2]
     WMMA_LAYOUT: gl.constexpr = layouts[3]
-    pid_m, pid_n = _largem_pingpong_xcd_tile(
+    pid_m, pid_n = _largem_warp_pipeline_xcd_tile(
         gl.program_id(0),
         gl.cdiv(M, BLOCK_M),
         gl.cdiv(N, BLOCK_N),
@@ -1474,7 +1474,7 @@ def _wmma_tdm_dense_largem_pingpong_kernel(
     gl.assume(num_k_tiles > 0)
     # Double buffer: consuming K tile i refills the other slot with tile i + 1.
     for i in range(0, num_k_tiles - 1):
-        a_desc, b_desc, acc = _largem_pingpong_consume(
+        a_desc, b_desc, acc = _largem_warp_pipeline_consume(
             a_smem,
             b_smem,
             i % 2,
@@ -1488,7 +1488,7 @@ def _wmma_tdm_dense_largem_pingpong_kernel(
             True,
             CLUSTER,
         )
-    a_desc, b_desc, acc = _largem_pingpong_consume(
+    a_desc, b_desc, acc = _largem_warp_pipeline_consume(
         a_smem,
         b_smem,
         (num_k_tiles - 1) % 2,
@@ -1528,7 +1528,7 @@ def gluon_mm_a16w16_largem_gfx1250(
 ) -> torch.Tensor:
     """Run K3 BF16 projections on one CDNA5 WMMA kernel launch.
 
-    From ``_LARGEM_WIDE_M`` rows this is the eight-wave ping-pong kernel with
+    From ``_LARGEM_WIDE_M`` rows this is the eight-wave warp pipeline kernel with
     256 x 256 tiles; fewer rows use the four-warp 128 x 128 kernel. Either
     covers the whole output, including ragged M and N edges, rather than
     having the caller peel them off into vendor calls.
@@ -1579,12 +1579,12 @@ def _launch_largem(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor) -> None:
     """Store ``A @ B.T`` in ``out``'s dtype with the large-M kernels."""
     m, k = A.shape
     n = B.shape[0]
-    # The ping-pong kernel writes its tile with one TDM store, so it needs a
+    # The warp pipeline kernel writes its tile with one TDM store, so it needs a
     # contiguous output; narrower outputs leave its 256-wide grid underfilled.
-    if m >= _LARGEM_WIDE_M and n >= _LARGEM_PINGPONG_MIN_N and out.is_contiguous():
-        cta_m, cta_n = _LARGEM_PINGPONG_CLUSTER
+    if m >= _LARGEM_WIDE_M and n >= _LARGEM_WARP_PIPELINE_MIN_N and out.is_contiguous():
+        cta_m, cta_n = _LARGEM_WARP_PIPELINE_CLUSTER
         grid = triton.cdiv(m, 256 * cta_m) * triton.cdiv(n, 256 * cta_n)
-        _wmma_tdm_dense_largem_pingpong_kernel[(grid,)](
+        _wmma_tdm_dense_largem_warp_pipeline_kernel[(grid,)](
             A,
             B,
             out,
@@ -1597,7 +1597,7 @@ def _launch_largem(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor) -> None:
             CTA_M=cta_m,
             CTA_N=cta_n,
             BLOCK_K=_LARGEM_BLOCK_K,
-            GROUP_M=_LARGEM_PINGPONG_GROUP_M,
+            GROUP_M=_LARGEM_WARP_PIPELINE_GROUP_M,
             NUM_XCDS=_LARGEM_NUM_XCDS,
             num_warps=8,
             waves_per_eu=2,

@@ -416,7 +416,7 @@ deterministic.
 
 #### Algorithm
 
-From 4096 rows and 1536 columns, `_wmma_tdm_dense_largem_pingpong_kernel`
+From 4096 rows and 1536 columns, `_wmma_tdm_dense_largem_warp_pipeline_kernel`
 computes a `256 x 256` tile on eight waves, two per SIMD, in 128-wide K steps
 through a double-buffered TDM pipeline. Each K step is two half-K rounds of
 `warp_pipeline_stage` pairs, so one wave's TDM issue and LDS reads overlap the
@@ -447,7 +447,7 @@ cost more than the tail it removed.
 
 The general BF16 GEMM's large-M route (`_launch_largem`) shares this
 selection: from 4096 rows, at least 1536 columns and a contiguous output it
-runs the ping-pong kernel, in FP32 or BF16. Anything else keeps
+runs the warp pipeline kernel, in FP32 or BF16. Anything else keeps
 `_wmma_tdm_dense_largem_kernel` and its earlier tile choice (`128 x 128` on
 four warps below 12288 rows), whose masked stores also accept a row-strided
 output.
