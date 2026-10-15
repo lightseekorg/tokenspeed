@@ -31,7 +31,7 @@ arguments or bucketed, never `constexpr`.
 
 ### NVFP4 routing-map padding
 
-The pinned FlashInfer version (0.7.1) initializes unused rows inside active
+The pinned FlashInfer version (0.7.2) initializes unused rows inside active
 expert tiles of `permuted_idx_to_token_idx` to `-1` in its routing producers.
 This prevents unnecessary activation loads in the first GEMM without a separate
 fill-kernel launch. Routing refreshes live mappings and tile padding on every
