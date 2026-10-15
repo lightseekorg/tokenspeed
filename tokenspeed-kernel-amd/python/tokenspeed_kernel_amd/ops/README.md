@@ -108,6 +108,44 @@ eight outputs per lane store C through a row-contiguous layout, 16 bytes per
 lane. An optional XCD remap keeps the M tiles that share a weight tile on one
 XCD's L2.
 
+### gfx950 dense BF16 decode GEMV
+
+`gluon_gemv_a16w16_gfx950` (`gemm/fp16/gemv.py`) computes `x @ w.T` for
+decode batches, `1 <= M <= 16`, with one program per CU.
+
+#### Contract
+
+- `x` is `[M, K]` with unit inner stride, `w` a contiguous `[N, K]` matrix
+  of `x`'s dtype (BF16 or FP16), `out` an `[M, N]` destination with unit
+  inner stride; `K` is a multiple of 16 and at least 64.
+- Automatic selection (`gemm.mv`, which `gemm.mm` takes for BF16 decode rows)
+  uses it only for the Qwen3.8-Flash-Next TP2 shapes and M buckets (1, 2-4,
+  5-16) in `_PREFERRED_BUCKETS`, where it beat the default (Torch's skinny
+  GEMM at one row, the decode GEMM or hipBLASLt above) in cold-cache
+  standalone sweeps. It is the only `mv` kernel that serves single rows on
+  gfx950; direct calls take any supported shape.
+- One binary per (shape, M bucket): M = 1, and M = 2-16. `M` and `N` are
+  runtime arguments.
+
+#### Algorithm
+
+A program computes `rows = cdiv(N, CUs)` consecutive outputs over full K for
+every row of `x`, padded to a power-of-2 block of `BLOCK_N` rows. Results do
+not depend on `rows`: each output's summation order is fixed by the
+constexprs alone.
+
+- M = 1 (FMA tile): waves split the rows; a lane loads 16 bytes of every
+  512-element K chunk, so one load instruction reads 1 KB of a row. Lanes keep
+  FP32 partial sums per chunk position and reduce once at the end. A share
+  that fits one register chunk is loaded in one go; larger shares stream
+  512-wide chunks through a ring of LDS buffers filled by direct-to-LDS copies,
+  one refill in flight per consumed chunk.
+- M = 2-16 (MFMA tile): a 16-row batched MFMA whose batch dimension is the
+  wave, so the four waves split every K iteration and reduce through LDS once;
+  weights load K-contiguous and reach the operand layout through LDS.
+- Weight loads are streaming (`.cg`). K loops are unrolled: a loop-carried
+  register copy of a pending load waits for the load and serialized the chunks.
+
 ### gfx950 MXFP8 projection
 
 The gfx950 package provides a prefill-oriented MXFP8 GEMM for DeepSeek V4.1

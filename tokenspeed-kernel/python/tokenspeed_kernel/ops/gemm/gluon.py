@@ -68,6 +68,15 @@ if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
         gluon_rowcta_bf16_gemv_gfx950 as _rowcta_bf16_gemv_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        launch_gluon_gemv_a16w16_gfx950 as _gemv_a16w16_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        prefers_gluon_gemv_a16w16_gfx950 as _prefers_gemv_a16w16,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        supports_gluon_gemv_a16w16_gfx950 as _supports_gemv_a16w16,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
         launch_gluon_mm_a16w16_prefill_gfx950 as _mm_a16w16_prefill_impl,
     )
@@ -286,6 +295,51 @@ if platform.is_amd:
             device=x.device,
         )
         return _mm_a16w16_decode_impl(x, weight, x.dtype, counters=counters, out=out)
+
+    def _gemv_a16w16_filter(m: int, n: int, k: int) -> bool:
+        return _supports_gemv_a16w16(m, n, k) and _prefers_gemv_a16w16(m, n, k)
+
+    # Ranked above the decode GEMM: the GEMV's measured buckets are the
+    # shapes where it beat the default selection.
+    @register_kernel(
+        "gemm",
+        "mv",
+        name="gluon_gemv_a16w16_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        # Above gluon_rowcta_bf16_gemv_gfx950, which takes any single row:
+        # this kernel claims only the shapes where it measured faster.
+        priority=Priority.SPECIALIZED + 2,
+        traits={"mnk_problem_filter": frozenset({_gemv_a16w16_filter})},
+    )
+    def gluon_gemv_a16w16_gfx950(
+        x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``x @ weight.T`` for decode batches (M <= 16), one program per CU.
+
+        Selection takes it only for the shapes and row buckets where it
+        measured faster than the default; a direct call serves any supported
+        shape.
+
+        Args:
+            x: ``[M, K]`` fp16/bf16 activation with unit inner stride.
+            weight: Contiguous ``[N, K]`` weight in ``x``'s dtype.
+            out: Optional ``[M, N]`` row-major destination.
+
+        Returns:
+            ``[M, N]`` output in ``x``'s dtype.
+        """
+        if out is None:
+            out = x.new_empty((x.shape[0], weight.shape[0]))
+        return _gemv_a16w16_impl(x, weight, out)
 
     @register_kernel(
         "gemm",

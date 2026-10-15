@@ -1520,10 +1520,17 @@ def _use_mv(x: torch.Tensor, weight: torch.Tensor) -> bool:
     platform = current_platform()
     n = weight.shape[0]
     if platform.is_cdna4:
-        measured_single_row = (m, n, k) == (1, 4608, 8192)
-        return (m >= 2 or measured_single_row) and _select_mv(
-            m, n, k, True, x.dtype, weight.dtype, False
-        ) is not (torch_decode_gemv)
+        impl = _select_mv(m, n, k, True, x.dtype, weight.dtype, False)
+        if impl is torch_decode_gemv:
+            return False
+        # Single rows keep mm's own path (Torch's skinny GEMM) except where a
+        # gfx950 kernel measured faster: the row-CTA GEMV on (4608, 8192) and
+        # the decode GEMV on its measured shapes.
+        return (
+            m >= 2
+            or (m, n, k) == (1, 4608, 8192)
+            or impl is KernelRegistry.get().get_impl("gluon_gemv_a16w16_gfx950")
+        )
     if not platform.is_cdna5 or k < 256:
         return False
     return (
