@@ -850,7 +850,9 @@ class ServerArgs:
 
     def resolve_kernel_backends(self):
         _require_choice(
-            "--dense-gemm-backend", self.dense_gemm_backend, ("auto", "trtllm_cutedsl")
+            "--dense-gemm-backend",
+            self.dense_gemm_backend,
+            ("auto", "trtllm_cutedsl", "deepgemm"),
         )
         # The numerics switches (docs/design/numerics.md) are closed sets.
         for flag, value, choices in (
@@ -2874,10 +2876,11 @@ class ServerArgs:
             "--dense-gemm-backend",
             type=str,
             default=ServerArgs.dense_gemm_backend,
-            choices=["auto", "trtllm_cutedsl"],
+            choices=["auto", "trtllm_cutedsl", "deepgemm"],
             help="Backend for standard 128x128 block-FP8 dense linears. "
             "trtllm_cutedsl requires Blackwell and preserves checkpoint FP8 "
             "weights and FP32 scales without requantization. "
+            "deepgemm requires Hopper and preserves FP32 scales. "
             "Other quantization formats and routed experts are unchanged.",
         )
         parser.add_argument(
