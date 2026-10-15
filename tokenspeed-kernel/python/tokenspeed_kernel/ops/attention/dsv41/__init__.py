@@ -69,6 +69,9 @@ __all__ = [
     "new_attention_schedule",
     "index_score",
     "index_topk",
+    "local_index_supported",
+    "index_candidates",
+    "merge_index_candidates",
     "compressor_tail_scatter",
     "compressor_pool",
     "compressor_metadata",
@@ -996,6 +999,43 @@ def compressor_metadata(
         read_slots,
         write_slots,
     )
+
+
+def local_index_supported(index_q, index_cache, candidates):
+    """Whether local FP8 candidate scoring has a native implementation."""
+    from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
+        is_hopper_indexer_available,
+    )
+
+    return (
+        index_q.is_cuda
+        and is_hopper_indexer_available()
+        and index_cache.shape[-1] == 132
+        and index_q.shape[1] % 8 == 0
+        and (candidates is None or (candidates.shape[1] > 0 and candidates.shape[1] % 16 == 0))
+    )
+
+
+def index_candidates(index_q, weights, index_cache, table, visible, candidates, topk):
+    """Return local TopK as int32 [N,K,2] (logical ID, FP32 score bits).
+
+    Table entries address local Index K pages; nonowned pages are -1.
+    Candidate blocks and causal lengths retain global logical coordinates.
+    candidates=None scans all locally owned visible pages for a Full pass.
+    Scores are transported as raw bits, never rounded or numerically reduced.
+    """
+    return _kernel("index_candidates", index_q)(
+        index_q, weights, index_cache, table, visible, candidates, topk
+    )
+
+
+def merge_index_candidates(packed, rows, lengths):
+    """Select from gathered int32 [N,ranks*K,2] ID/score pairs.
+
+    Writes sorted global logical IDs to rows [N,K], padded -1, and valid
+    counts to lengths [N]. All tensors have fixed shapes for graph replay.
+    """
+    return _kernel("merge_index_candidates", packed)(packed, rows, lengths)
 
 
 # Backend registration (side-effect imports)
