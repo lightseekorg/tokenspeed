@@ -263,11 +263,8 @@ class DeepseekV41Recipe(CacheRecipe):
             )
 
     @override
-    def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        budgeted = self._budgeted_parents(
-            self.cache_budget_bytes - self.workspace_bytes(), layout.lcm_block_bytes
-        )
-        return self.parents_needed(layout, self.token_capacity(layout, budgeted))
+    def select_num_lcm_blocks(self, layout: CacheLayout, *, max_lcm_blocks: int) -> int:
+        return self.parents_needed(layout, self.token_capacity(layout, max_lcm_blocks))
 
     @override
     def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:

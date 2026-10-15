@@ -430,12 +430,10 @@ class Glm53FlashRecipe(CacheRecipe):
             )
 
     @override
-    def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        usable_bytes = self.cache_budget_bytes - self.workspace_bytes()
-        budgeted = self._budgeted_parents(usable_bytes, layout.lcm_block_bytes)
+    def select_num_lcm_blocks(self, layout: CacheLayout, *, max_lcm_blocks: int) -> int:
         if self.token_limit is None:
-            return budgeted
-        return min(budgeted, self.parents_needed(layout, self.token_limit))
+            return max_lcm_blocks
+        return min(max_lcm_blocks, self.parents_needed(layout, self.token_limit))
 
     @override
     def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:

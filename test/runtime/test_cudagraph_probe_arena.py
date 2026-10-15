@@ -547,7 +547,7 @@ def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
         (
             "layers/attention/registry.py",
             "create_attn_components",
-            "prepare_cache_setup",
+            "cache_recipe",
         ),
         (
             "layers/attention/kv_cache/recipes/setup.py",
