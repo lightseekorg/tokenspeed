@@ -915,9 +915,8 @@ class CacheGroupRouter(AttentionBackend):
         block drafters hand it to their fused prep kernels).
         """
         bs = cache_start.shape[0]
-        # Window positions run cache_start .. cache_start+n-1; the decode
-        # kernel derives them as end-n .. end-1, so feed end = start + n.
-        self.stacks.compute_decode_locations(bs, cache_start + num_tokens, num_tokens)
+        # Window positions run cache_start .. cache_start+n-1.
+        self.stacks.compute_window_locations(bs, cache_start, num_tokens)
         self._decode_request_offset = 0
         self._publish_decode_locations(bs, num_tokens)
         i = self._draft_history_index()

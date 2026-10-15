@@ -38,6 +38,7 @@ from tokenspeed_kernel.signature import (
     format_signature,
     tensor_format,
 )
+from tokenspeed_kernel.workspace import zeroed_state
 
 platform = current_platform()
 _FP8_DTYPE = torch.float8_e4m3fn
@@ -69,6 +70,9 @@ if platform.is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
         supports_gluon_mm_a16w16_prefill_gfx950 as _supports_mm_a16w16_prefill,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        gluon_mm_a16w16_decode_num_counters_gfx950 as _mm_a16w16_decode_counters,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         launch_gluon_bmm_a16w16_gfx950 as _bmm_a16w16_impl,
@@ -162,7 +166,12 @@ if platform.is_amd:
         Returns:
             ``[M, N]`` output in ``x``'s dtype.
         """
-        return _mm_a16w16_decode_impl(x, weight, x.dtype, out=out)
+        counters = zeroed_state(
+            _mm_a16w16_decode_counters(x.shape[0], weight.shape[0], x.shape[1]),
+            dtype=torch.int32,
+            device=x.device,
+        )
+        return _mm_a16w16_decode_impl(x, weight, x.dtype, counters=counters, out=out)
 
     @register_kernel(
         "gemm",
@@ -231,6 +240,9 @@ else:
 
 
 if platform.is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (
+        gluon_mm_mxfp8_decode_num_counters_gfx950 as _mm_mxfp8_decode_counters,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (
         launch_gluon_mm_mxfp8_decode_gfx950 as _mm_mxfp8_decode_impl,
     )
@@ -349,6 +361,11 @@ if platform.is_amd:
             raise ValueError("gfx950 MXFP8 decode GEMM requires both scale tensors")
         if block_size is None:
             raise ValueError("gfx950 MXFP8 decode GEMM requires block_size")
+        counters = zeroed_state(
+            _mm_mxfp8_decode_counters(A.shape[0], B.shape[0], A.shape[1]),
+            dtype=torch.int32,
+            device=A.device,
+        )
         return _mm_mxfp8_decode_impl(
             A,
             B,
@@ -357,6 +374,7 @@ if platform.is_amd:
             out_dtype,
             alpha=alpha,
             block_size=block_size,
+            counters=counters,
             out=out,
         )
 
@@ -375,6 +393,9 @@ else:
 
 
 if platform.is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp4 import (
+        gluon_mxfp4_linear_num_counters_gfx950 as _mxfp4_linear_counters,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp4 import (
         launch_gluon_mxfp4_linear_gfx950 as _mxfp4_linear_impl,
     )
@@ -417,7 +438,12 @@ if platform.is_amd:
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """``mxfp4(x) @ W.T`` with in-kernel activation quantization."""
-        return _mxfp4_linear_impl(x, weight, weight_scale, out=out)
+        counters = zeroed_state(
+            _mxfp4_linear_counters(x.shape[0], weight.shape[0], x.shape[1], False),
+            dtype=torch.int32,
+            device=x.device,
+        )
+        return _mxfp4_linear_impl(x, weight, weight_scale, counters=counters, out=out)
 
     @register_kernel(
         "gemm",
@@ -442,7 +468,14 @@ if platform.is_amd:
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """``silu(gate) * up`` of ``mxfp4(x) @ W.T`` fused into one GEMM."""
-        return _mxfp4_swiglu_linear_impl(x, weight, weight_scale, out=out)
+        counters = zeroed_state(
+            _mxfp4_linear_counters(x.shape[0], weight.shape[0], x.shape[1], True),
+            dtype=torch.int32,
+            device=x.device,
+        )
+        return _mxfp4_swiglu_linear_impl(
+            x, weight, weight_scale, counters=counters, out=out
+        )
 
 else:
     MXFP4_LINEAR_MFMA_LAYOUT = None

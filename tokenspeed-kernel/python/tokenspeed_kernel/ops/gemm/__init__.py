@@ -66,6 +66,7 @@ from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm import (
     shape_dynamic_skinny_gemm,
 )
 from tokenspeed_kernel.weights import get_weight_broker
+from tokenspeed_kernel.workspace import zeroed_state
 
 logger = logging.getLogger(__name__)
 
@@ -3351,12 +3352,20 @@ def kimi3_router_projection(
                 "BF16 [M, 7168] input and [896, 7168] weight"
             )
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+            gluon_mm_a16w16_decode_num_counters_gfx950,
             launch_gluon_mm_a16w16_decode_gfx950,
         )
 
+        counters = zeroed_state(
+            gluon_mm_a16w16_decode_num_counters_gfx950(
+                hidden_states.shape[0], weight.shape[0], hidden_states.shape[1]
+            ),
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
         # FP32 accumulate and FP32 store, matching the other router paths.
         return launch_gluon_mm_a16w16_decode_gfx950(
-            hidden_states, weight, torch.float32, out=out
+            hidden_states, weight, torch.float32, counters=counters, out=out
         )
     if solution == "cuda":
         if not specialized:

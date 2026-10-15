@@ -95,7 +95,21 @@ class QwenGDNRecipe(CacheRecipe):
         )
         if num_full_attention == 0:
             raise ValueError("Qwen3.5 cache requires at least one full-attention layer")
-        return 1.0 + 2.0 * self.num_draft_layers / num_full_attention
+        # A draft layer whose K/V bytes exceed a target attention layer's counts as several.
+        width = 1.0
+        if self.num_draft_layers:
+            target_bytes, draft_bytes = (
+                sum(
+                    field.payload_bytes
+                    for field in self.fields_for_layer(layer_id, FULL_ATTENTION, 0)
+                )
+                for layer_id in (
+                    self.target_layer_types.index(FULL_ATTENTION),
+                    len(self.target_layer_types),
+                )
+            )
+            width = draft_bytes / target_bytes
+        return 1.0 + 2.0 * self.num_draft_layers * max(width, 1.0) / num_full_attention
 
     # ---- decoder-layer fields ----
 

@@ -280,6 +280,7 @@ if is_decode_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+            "strided_qkv": frozenset({False}),
         },
     )
     def flashinfer_gdn_decode_step(
