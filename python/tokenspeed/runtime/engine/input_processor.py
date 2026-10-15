@@ -36,6 +36,8 @@ from tokenspeed.runtime.engine.io_struct import (
 )
 from tokenspeed.runtime.engine.logprobs import resolve_logprob_start_len
 from tokenspeed.runtime.grammar.reasoning_structural_tag import (
+    prompt_ends_in_reasoning,
+    reasoning_block_markers,
     structural_tag_for_reasoning_json_schema,
 )
 from tokenspeed.runtime.multimodal.embedder import pad_input_tokens
@@ -60,8 +62,31 @@ class InputProcessor:
 
     def __init__(self, engine: AsyncLLM):
         self.engine = engine
+        # Token ids of the reasoning block's opener and closer, used to tell
+        # whether a prompt ends inside an open block. None when the server
+        # wraps no reasoning or the markers are not single tokens.
+        self._reasoning_marker_ids: tuple[int, int] | None = (
+            self._find_reasoning_marker_ids()
+        )
 
-    def _maybe_wrap_json_schema_for_reasoning(self, sampling: dict) -> None:
+    def _find_reasoning_marker_ids(self) -> tuple[int, int] | None:
+        reasoning_parser = self.engine.server_args.reasoning_parser
+        tokenizer = self.engine.tokenizer
+        if not reasoning_parser or tokenizer is None:
+            return None
+        markers = reasoning_block_markers(reasoning_parser)
+        if markers is None:
+            return None
+        ids = [tokenizer.convert_tokens_to_ids(marker) for marker in markers]
+        if not all(isinstance(i, int) for i in ids):
+            return None
+        if list(tokenizer.convert_ids_to_tokens(ids)) != list(markers):
+            return None
+        return ids[0], ids[1]
+
+    def _maybe_wrap_json_schema_for_reasoning(
+        self, sampling: dict, input_ids: list[int] | None
+    ) -> None:
         # Without this, xgrammar locks onto ``{`` at token 0 and the
         # model can't emit ``<think>…</think>`` before the JSON.
         if "json_schema" not in sampling:
@@ -73,7 +98,20 @@ class InputProcessor:
             schema = sampling["json_schema"]
             if isinstance(schema, str):
                 schema = json.loads(schema)
-            wrapped = structural_tag_for_reasoning_json_schema(reasoning_parser, schema)
+            # The reply either continues a reasoning block that the prompt
+            # opened or may open one itself. Without marker ids or prompt
+            # ids, assume the prompt opened it, as before.
+            marker_ids = self._reasoning_marker_ids
+            prompt_opens_reasoning = (
+                marker_ids is None
+                or input_ids is None
+                or prompt_ends_in_reasoning(input_ids, *marker_ids)
+            )
+            wrapped = structural_tag_for_reasoning_json_schema(
+                reasoning_parser,
+                schema,
+                prompt_opens_reasoning=prompt_opens_reasoning,
+            )
         except Exception as exc:
             self.engine.logger.warning(
                 f"reasoning-parser={reasoning_parser!s}: failed to wrap json_schema ("
@@ -387,7 +425,7 @@ class InputProcessor:
             )
             obj.sampling_params.update({"max_new_tokens": adjusted_max_new_tokens})
 
-        self._maybe_wrap_json_schema_for_reasoning(obj.sampling_params)
+        self._maybe_wrap_json_schema_for_reasoning(obj.sampling_params, input_ids)
 
         sampling_params = SamplingParams(**obj.sampling_params)
         sampling_params.resolve_seed(obj.rid)
