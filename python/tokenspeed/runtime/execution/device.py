@@ -576,6 +576,7 @@ class DeviceHandle:
                 request_history_seeds=planned.request_history_seeds,
                 input_logprob_plan=planned.input_logprob_plan,
                 sampled_top_k=planned.sampled_top_k,
+                stop_criteria=planned.stop_criteria,
             )
 
         return PendingExecution(self._thread.submit(_forward))

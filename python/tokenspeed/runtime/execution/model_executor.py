@@ -82,6 +82,7 @@ from tokenspeed.runtime.execution.types import (
     ModelExecutionResult,
     NGramInputs,
     RequestHistorySeeds,
+    StopCriteria,
 )
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.grammar.capturable_grammar import (
@@ -1434,6 +1435,13 @@ class ModelExecutor:
             num_prefill_tokens : ctx.input_num_tokens
         ].reshape(num_decodes, n)
 
+    def _state_group_ids(self) -> tuple[str, ...]:
+        return tuple(
+            spec.group_id
+            for spec in self._cache_runtime_contract.group_specs
+            if spec.attn_kind == "state"
+        )
+
     @nvtx_range("sampling", color="yellow")
     def _run_sampling(
         self,
@@ -1441,6 +1449,34 @@ class ModelExecutor:
         sampling_info: SamplingBatchInfo,
         ctx: ForwardContext,
         candidates: torch.Tensor | None = None,
+    ):
+        """Sample and verify, then end each request where the control plane
+        ends it: an accepted width is cut at the request's stop token or
+        token limit before anything reads it (the state commit, the accepted
+        frontier, the drafter, the reported tokens)."""
+        output_tokens, accept_lengths = self._sample_and_verify(
+            logits_output, sampling_info, ctx, candidates
+        )
+        ib = self.input_buffers
+        self.runtime_states.apply_stop_conditions(
+            ib.state_write_req_pool_indices_buf[: ctx.bs],
+            output_tokens,
+            accept_lengths,
+            ib.input_lengths_buf[: ctx.bs],
+            ib.extend_prompt_lens_buf[: ctx.num_extends],
+            num_extends=ctx.num_extends,
+            num_prefill_outputs=ctx.output_layout.num_prefill_outputs,
+            decode_width=ctx.output_layout.decode_width,
+            padding_index=ib.state_write_padding_pool_index,
+        )
+        return output_tokens, accept_lengths
+
+    def _sample_and_verify(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        ctx: ForwardContext,
+        candidates: torch.Tensor | None,
     ):
         """One sampling rule for every batch: prefill rows sample, decode
         rows verify.
@@ -1679,11 +1715,21 @@ class ModelExecutor:
             self._compact_accepted_tree(ctx.bs, logits_output)
 
         if self.drafter is not None:
+            draft_accept_lengths = accept_lengths
+            if ctx.output_layout.num_decodes:
+                # A stopped request keeps no token; its drafts are discarded,
+                # but the drafter indexes the last accepted position.
+                draft_accept_lengths = accept_lengths.clone()
+                draft_accept_lengths[ctx.output_layout.decode_request_slice] = (
+                    draft_accept_lengths[ctx.output_layout.decode_request_slice].clamp(
+                        min=1
+                    )
+                )
             next_round_input_ids = self.drafter.run(
                 base_ctx=ctx,
                 logits_output=logits_output,
                 output_tokens=output_tokens,
-                accept_lengths=accept_lengths,
+                accept_lengths=draft_accept_lengths,
             )
             # _update_runtime_state skips future_input_map when drafter is
             # active — drafter writes the next-round inputs directly, and the
@@ -2115,6 +2161,7 @@ class ModelExecutor:
         request_history_seeds: RequestHistorySeeds | None,
         input_logprob_plan: InputLogprobPlan | None,
         sampled_top_k: int,
+        stop_criteria: Sequence[StopCriteria],
     ) -> ModelExecutionResult:
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
@@ -2142,6 +2189,9 @@ class ModelExecutor:
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
+            self.runtime_states.bind_stop_criteria(
+                forward_op.request_ids, forward_op.request_pool_indices, stop_criteria
+            )
             cache_metadata = None
             block_tables = {}
             block_tables_cpu = {}
@@ -2163,6 +2213,19 @@ class ModelExecutor:
                 total_tokens=total_tokens,
                 ngram_inputs=ngram_inputs,
             )
+            state_group_ids = self._state_group_ids()
+            if (
+                self.config.overlap_schedule_depth > 0
+                and bs > num_extends
+                and state_group_ids
+            ):
+                # A decode dispatched before the round that ended its request
+                # landed runs as a padding row for the recurrent state.
+                block_tables = self.runtime_states.masked_state_tables(
+                    block_tables,
+                    self.input_buffers.req_pool_indices_buf[:bs],
+                    state_group_ids,
+                )
             if self.tree_spec is not None and num_extends == 0 and bs > 0:
                 self.tree_spec.load_step(
                     bs,

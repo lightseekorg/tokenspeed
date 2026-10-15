@@ -232,6 +232,21 @@ null slot 0 also means "read slot 1" for the rows the runtime fabricates
 commits the accepted state into slot 1 unconditionally
 (`commit_state_pages`).
 
+A slot's state block is a whole snapshot, so the token count that keys it
+must be exactly the tokens it consumed. The device therefore ends a request
+where the control plane does: the sampling epilogue cuts every round's
+accepted width at the request's first stop token and its token limit
+(`RuntimeStates.apply_stop_conditions`, the stop set the finish check reads),
+before the commit, the frontier or the drafter reads it, and marks the slot
+stopped. A decode the overlap schedule already dispatched behind that round
+runs the request as a padding row -- both slots `-1`
+(`RuntimeStates.masked_state_tables`): it reads the zero state, writes
+nothing, and keeps no token. The finish checkpoint is thus the state before
+the stop token under every schedule ([Scheduler
+§1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)); a finish
+dispatched as a rotating first decode publishes at the prompt end, where the
+prompt-end checkpoint it still holds in slot 0 is the canonical block.
+
 A **natural checkpoint** is a state block that exists because a forward ended
 there -- the prompt end (the block rotated out of slot 1 as the first decode
 runs), the finish (slot 1 in place), the chunk the junction cut ended, or the

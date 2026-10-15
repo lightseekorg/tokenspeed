@@ -1047,6 +1047,7 @@ def test_dispatch_owns_snapshot_until_forward_thread_consumes_it():
         request_history_seeds=None,
         input_logprob_plan=None,
         sampled_top_k=0,
+        stop_criteria=(),
     )
     pending = handle._submit_forward(planned, capture_next_input_ids=False)
     states["a"].prompt_input_ids.clear()

@@ -249,14 +249,27 @@ pages (`ReleaseEvent`). One path for every schedule: a request that finished
 quiescent settles with its Finish event — the timing every caller always
 saw — and one whose finish was decided on a landed token while the overlap
 schedule had already dispatched the next decode settles when that decode's
-result lands, at the frontier that decode produced (one token further: the
-token the finish was decided on, consumed). The live slot is therefore never
-published while a forward writes it, and a paused loop, which drains its
-forwards without building plans, settles its finishes all the same. The
-runtime reports every landed forward row, tracked or not
+result lands, at the frontier the tokens it reports leave. The live slot is
+therefore never published while a forward writes it, and a paused loop, which
+drains its forwards without building plans, settles its finishes all the
+same. The runtime reports every landed forward row, tracked or not
 (`generation_output_processor`), so the count always reaches zero. A
 `Finishing` request is never scheduled and never a retraction victim; an
 abort releases it without publishing.
+
+**A finish publishes the state before the stop token.** The device ends a
+request where the control plane does: a verify round keeps its accepted
+tokens only through the first stop token and within the token limit, so the
+state commit and the frontier never pass the token the finish is decided on,
+and the decode the overlap schedule dispatched behind that round runs the
+request as a padding row and reports no token. Whatever the schedule and
+however many tokens a round accepts, the finish frontier `T` is therefore the
+stop token's position (the last kept token's for a token limit): the state
+and KV before it, a prefix of the next turn's prompt whether or not its chat
+template keeps the stop token. A finish the device cannot decide (a stop
+string, a grammar, a client abort) reports every token the round kept
+instead, so the frontier still names the state the device holds
+(`cache-concepts.md`, "Recurrent state").
 
 **Hits.** The probe (§1, "What the probe may claim") resumes a hybrid model
 at the longest `T` with a published state checkpoint in every State group and

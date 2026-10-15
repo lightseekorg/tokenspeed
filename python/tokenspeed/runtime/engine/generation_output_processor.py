@@ -44,6 +44,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     make_finish_event,
     make_update_reserve_tokens_event,
 )
+from tokenspeed.runtime.execution.types import StopCriteria
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 if TYPE_CHECKING:
@@ -59,6 +60,28 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
+
+
+def resolve_stop_token_ids(
+    sampling_params: SamplingParams, eos_token_ids, tokenizer
+) -> frozenset[int]:
+    """The tokens that end a request: its own ``stop_token_ids``, the
+    model's EOS ids and the tokenizer's EOS and additional stop ids; none
+    under ``ignore_eos``.
+
+    The one definition both the control plane's finish check and the
+    device's verify cut (``StopCriteria``) read, so the two always end a
+    request on the same token.
+    """
+    if sampling_params.ignore_eos:
+        return frozenset()
+    ids = set(sampling_params.stop_token_ids or ())
+    ids.update(eos_token_ids or ())
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is not None:
+        ids.add(eos_id)
+    ids.update(getattr(tokenizer, "additional_stop_token_ids", None) or ())
+    return frozenset(int(token_id) for token_id in ids)
 
 
 class RequestState:
@@ -105,6 +128,10 @@ class RequestState:
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.tokenizer = tokenizer
+        self.stop_token_ids: frozenset[int] = resolve_stop_token_ids(
+            sampling_params, eos_token_ids, tokenizer
+        )
+        self._stop_criteria: StopCriteria | None = None
         self.computed_length = 0
         self.return_logprob = return_logprob
         self.top_logprobs_num = top_logprobs_num
@@ -201,10 +228,6 @@ class RequestState:
         # still receives a terminating finish.
         self.abort_notify_client = False
 
-        # cached tokenizer ids
-        self._eos_token_id_cached = None
-        self._additional_stop_token_ids_cached = None
-
         # Constrained-decoding state.
         self.grammar: BaseGrammarObject | None = None
         self.grammar_key: tuple[str, str] | None = None
@@ -267,6 +290,18 @@ class RequestState:
     @property
     def finished(self) -> bool:
         return self.finished_reason is not None
+
+    @property
+    def stop_criteria(self) -> StopCriteria:
+        """Where the device cuts this request's verify rounds. Built on the
+        first forward: admission clamps ``max_new_tokens`` after construction
+        and nothing changes it later."""
+        if self._stop_criteria is None:
+            self._stop_criteria = StopCriteria(
+                stop_token_ids=tuple(sorted(self.stop_token_ids)),
+                token_limit=self.input_length + self.sampling_params.max_new_tokens,
+            )
+        return self._stop_criteria
 
     @property
     def input_length(self) -> int:
@@ -431,24 +466,9 @@ class RequestState:
             return
 
         last_token_id = self.output_ids[-1]
-
-        if not self.sampling_params.ignore_eos:
-            matched_eos = False
-
-            # Check stop token ids
-            if self.sampling_params.stop_token_ids:
-                matched_eos = last_token_id in self.sampling_params.stop_token_ids
-            if self.eos_token_ids:
-                matched_eos |= last_token_id in self.eos_token_ids
-            if self._eos_token_id_cached is None:
-                self.set_cached_id()
-            if self._eos_token_id_cached is not None:
-                matched_eos |= last_token_id == self._eos_token_id_cached
-            if self._additional_stop_token_ids_cached:
-                matched_eos |= last_token_id in self._additional_stop_token_ids_cached
-            if matched_eos:
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
-                return
+        if last_token_id in self.stop_token_ids:
+            self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
+            return
 
         # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
@@ -460,15 +480,6 @@ class RequestState:
                 if stop_str in tail_str or stop_str in self.decoded_text:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                     return
-
-    def set_cached_id(self):
-        """Assign tokenizer and cache ids needed by check_finished()."""
-        eos_id = getattr(self.tokenizer, "eos_token_id", None)
-        self._eos_token_id_cached = int(eos_id) if eos_id is not None else None
-        extra = getattr(self.tokenizer, "additional_stop_token_ids", None)
-        self._additional_stop_token_ids_cached = (
-            set(int(x) for x in extra) if extra else None
-        )
 
 
 class OutputProcesser:
@@ -901,7 +912,9 @@ class OutputProcesser:
                 # nowhere, but the forward landed: the scheduler counts it
                 # against the request's pages and, for a finished request,
                 # publishes the frontier it consumed once nothing is in
-                # flight. The tokens keep the frontier exact (TokenSize - 1).
+                # flight. The tokens keep the frontier exact (TokenSize - 1);
+                # a forward behind the round the device stopped the request
+                # on keeps none, so the frontier stays before the stop token.
                 request_changes.append(
                     make_extend_result_event(rid, [] if mid_chunk else model_output_ids)
                 )
@@ -925,6 +938,12 @@ class OutputProcesser:
             # Do not output chunking result
             if not request_state.prefill_finished:
                 continue
+            if is_decode_slot and output_length == 0:
+                raise RuntimeError(
+                    f"decode request {rid} kept no token: only a request the "
+                    "device already stopped keeps none, and that request has "
+                    "finished"
+                )
 
             if not is_decode_slot:
                 request_state.finalize_input_token_logprobs()
@@ -1052,6 +1071,16 @@ class OutputProcesser:
                     self.log_accept_length(rid, request_state)
                     break
 
+            # The device cuts a round at the request's stop tokens and token
+            # limit, so a request ending on those finishes on its last kept
+            # token. One ending earlier on a condition only this side checks
+            # (a stop string, a grammar, an abort) still consumed the whole
+            # round on the device: the scheduler gets every kept token, so
+            # the frontier it publishes is the state and KV the device holds.
+            reported_ids = (
+                model_output_ids if len(new_ids) < len(model_output_ids) else new_ids
+            )
+
             # first output token == TTFT anchor
             if request_state.output_ids:
                 request_state.stats.mark_first_token(stats_now)
@@ -1065,7 +1094,7 @@ class OutputProcesser:
             # instead of waiting for KV that never comes.
             if is_prefill_instance and nan_detected:
                 request_changes.append(
-                    make_extend_result_event(rid, new_ids, spec_candidate_ids)
+                    make_extend_result_event(rid, reported_ids, spec_candidate_ids)
                 )
                 request_changes.append(make_abort_event(rid))
                 self._log_request_stats(rid, request_state, stats_now)
@@ -1079,7 +1108,7 @@ class OutputProcesser:
             # passive client that still needs a terminating finish streamed.
             if request_state.to_abort and request_state.finished:
                 request_changes.append(
-                    make_extend_result_event(rid, new_ids, spec_candidate_ids)
+                    make_extend_result_event(rid, reported_ids, spec_candidate_ids)
                 )
                 if is_prefill_instance:
                     # PD owns these pages until SucceededEvent or FailedEvent
@@ -1101,7 +1130,7 @@ class OutputProcesser:
                 continue
 
             request_changes.append(
-                make_extend_result_event(rid, new_ids, spec_candidate_ids)
+                make_extend_result_event(rid, reported_ids, spec_candidate_ids)
             )
             if is_prefill_instance:
                 # Prefill instances: never stream intermediate output to detokenizer.

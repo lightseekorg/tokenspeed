@@ -127,6 +127,7 @@ def _planned(*, num_extends=0):
         request_history_seeds=None,
         input_logprob_plan=None,
         sampled_top_k=0,
+        stop_criteria=(),
     )
 
 

@@ -140,6 +140,35 @@ class InputLogprobPlan:
         return sum(self.counts)
 
 
+# Most stop tokens a request may end on (its own plus the model's EOS ids):
+# the width of the per-slot stop table the device cuts verify rounds with.
+MAX_STOP_TOKEN_IDS = 16
+
+
+@dataclass(frozen=True)
+class StopCriteria:
+    """Where a request's generation ends, as the device cuts verify rounds.
+
+    Attributes:
+        stop_token_ids: The tokens that end the request, at most
+            ``MAX_STOP_TOKEN_IDS``; empty under ``ignore_eos``.
+        token_limit: Total token count (prompt plus ``max_new_tokens``) at
+            which the request ends.
+    """
+
+    stop_token_ids: tuple[int, ...]
+    token_limit: int
+
+    def __post_init__(self) -> None:
+        if len(self.stop_token_ids) > MAX_STOP_TOKEN_IDS:
+            raise ValueError(
+                f"{len(self.stop_token_ids)} stop token ids exceed the device "
+                f"table width {MAX_STOP_TOKEN_IDS}"
+            )
+        if self.token_limit <= 0:
+            raise ValueError(f"token_limit must be positive, got {self.token_limit}")
+
+
 @dataclass(frozen=True)
 class PlannedForward:
     """One round's planned work, as the device side needs to see it.
@@ -174,6 +203,8 @@ class PlannedForward:
         sampled_top_k: How many most likely tokens each prefill row's
             sampled token is reported with: the largest ``top_logprobs_num``
             among the extend slots, 0 for none. A plain int.
+        stop_criteria: Per-slot stop tokens and token limits, gathered by the
+            loop. Frozen values fixed for the request's lifetime.
     """
 
     forward_op: Any
@@ -185,6 +216,7 @@ class PlannedForward:
     request_history_seeds: RequestHistorySeeds | None
     input_logprob_plan: InputLogprobPlan | None
     sampled_top_k: int
+    stop_criteria: tuple[StopCriteria, ...]
 
 
 @dataclass

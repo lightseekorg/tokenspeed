@@ -84,9 +84,10 @@ SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX = float(1 << 20)
 # Spec-decode overshoot spans the physical KV extent must absorb past the
 # logical context_len. The overlap scheduler steps a finished request at most
 # ONE extra iteration (the depth-1 event loop commits the previous step every
-# round, so the Finish event reaches the C++ scheduler before the next plan),
-# and termination is checked CPU-side against max_new_tokens, so verify can
-# commit past context_len for exactly that window:
+# round, so the Finish event reaches the C++ scheduler before the next plan).
+# The device cuts a round at max_new_tokens and stops the request, but a
+# finish only the control plane decides (a stop string) leaves the rounds
+# uncut, so verify can still commit past context_len for exactly that window:
 #   1. the finishing step's own accept (up to spec_num_tokens past the limit),
 #   2. the single lingering step's accept,
 #   3. the lingering step laying out its next draft block after that accept.

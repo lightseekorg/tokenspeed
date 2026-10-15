@@ -1233,6 +1233,10 @@ class EventLoop:
                         # output_processor.rid_to_state, which would KeyError on
                         # rids still present in the current forward_op.
                         sampling_params_list = self._gather_sampling_params(forward_op)
+                        stop_criteria = tuple(
+                            self.output_processor.rid_to_state[rid].stop_criteria
+                            for rid in forward_op.request_ids
+                        )
                         grammar_inputs = self._gather_grammar_state(forward_op)
                         ngram_inputs = ngram_inputs_for_forward(
                             forward_op,
@@ -1269,6 +1273,7 @@ class EventLoop:
                             sampled_top_k=sampled_top_k_for_forward(
                                 forward_op, self.output_processor.rid_to_state
                             ),
+                            stop_criteria=stop_criteria,
                             multimodal_context=(
                                 multimodal_context_for_forward(
                                     forward_op,

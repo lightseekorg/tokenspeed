@@ -954,3 +954,138 @@ def test_a_client_abort_crossing_a_capacity_abort_keeps_the_clients_finish():
     (out,) = sender.items
     assert out.rids == ["paused"]
     assert out.finished_reasons[0] == paused.finished_reason.to_json()
+
+
+class _EosTokenizer(_Tokenizer):
+    eos_token_id = 3
+    additional_stop_token_ids = {4}
+
+
+def test_stop_token_ids_merge_every_source_unless_eos_is_ignored():
+    """The finish check and the device's verify cut read one stop set: the
+    request's own ids, the model's EOS ids and the tokenizer's."""
+    state = RequestState(
+        prompt_input_ids=[1, 2, 3, 4, 5],
+        sampling_params=SamplingParams(max_new_tokens=8, stop=[], stop_token_ids={5}),
+        stream=False,
+        tokenizer=_EosTokenizer(),
+        computes_prompt_logprobs=True,
+        eos_token_ids=[2],
+    )
+    assert state.stop_token_ids == {2, 3, 4, 5}
+    assert state.stop_criteria.stop_token_ids == (2, 3, 4, 5)
+    assert state.stop_criteria.token_limit == 5 + 8
+    state.output_ids = [4]
+    state.check_finished()
+    assert state.finished_reason.to_json()["matched"] == 4
+
+    ignoring = RequestState(
+        prompt_input_ids=[1],
+        sampling_params=SamplingParams(
+            max_new_tokens=8, stop=[], stop_token_ids={5}, ignore_eos=True
+        ),
+        stream=False,
+        tokenizer=_EosTokenizer(),
+        computes_prompt_logprobs=True,
+        eos_token_ids=[2],
+    )
+    assert ignoring.stop_criteria.stop_token_ids == ()
+
+
+class _DecodeOp:
+    request_ids = ["decode"]
+    request_pool_indices = [1]
+    input_lengths = [3]
+    prefill_lengths = []
+    extend_prefix_lens = []
+    extend_replay_lens = []
+
+    def num_extends(self):
+        return 0
+
+
+class _DecodeResult(_ExecutionResult):
+    output_tokens = torch.tensor([11, 12, 13], dtype=torch.int32)
+    output_lengths = torch.tensor([3], dtype=torch.int32)
+
+
+def test_a_finish_before_the_last_kept_token_reports_the_whole_round():
+    """A stop string ends the request on the round's first token, but the
+    device kept all three (it cuts only at stop tokens and the token limit):
+    the client sees the first, the scheduler gets every kept token so the
+    frontier it publishes matches the state and KV the device holds."""
+    processor = OutputProcesser(
+        _Sender(),
+        attn_tp_rank=0,
+        metrics=_Metrics(),
+        spec_algorithm="EAGLE",
+        spec_num_tokens=3,
+    )
+    state = RequestState(
+        prompt_input_ids=[5, 6, 7],
+        sampling_params=SamplingParams(max_new_tokens=8, stop=["11"]),
+        stream=False,
+        tokenizer=_Tokenizer(),
+        computes_prompt_logprobs=True,
+    )
+    state.computed_length = 3
+    processor.rid_to_state["decode"] = state
+
+    events = processor.post_process_forward_op(
+        _DecodeOp(), _DecodeResult(), is_prefill_instance=False
+    )
+
+    (extend,) = [e for e in events if type(e).__name__ == "ExtendResult"]
+    assert list(extend.tokens) == [11, 12, 13]
+    assert state.output_ids == [11]
+    assert any(type(e).__name__ == "Finish" for e in events)
+
+
+def test_a_live_decode_that_keeps_no_token_is_an_error():
+    """Only a request the device already stopped keeps nothing, and the
+    processor no longer tracks a finished request."""
+
+    class _Empty(_DecodeResult):
+        output_lengths = torch.tensor([0], dtype=torch.int32)
+
+    processor = OutputProcesser(
+        _Sender(),
+        attn_tp_rank=0,
+        metrics=_Metrics(),
+        spec_algorithm="EAGLE",
+        spec_num_tokens=3,
+    )
+    processor.rid_to_state["decode"] = _state([5, 6, 7], computed_length=3)
+    with pytest.raises(RuntimeError, match="kept no token"):
+        processor.post_process_forward_op(
+            _DecodeOp(), _Empty(), is_prefill_instance=False
+        )
+
+
+def test_a_request_with_more_stop_tokens_than_the_device_table_is_refused():
+    from http import HTTPStatus
+
+    from tokenspeed.runtime.engine.request_handler import RequestHandler
+    from tokenspeed.runtime.execution.types import MAX_STOP_TOKEN_IDS
+
+    def state(num_ids):
+        return RequestState(
+            prompt_input_ids=[1],
+            sampling_params=SamplingParams(
+                max_new_tokens=8, stop=[], stop_token_ids=set(range(100, 100 + num_ids))
+            ),
+            stream=False,
+            tokenizer=_EosTokenizer(),
+            computes_prompt_logprobs=True,
+        )
+
+    handler = object.__new__(RequestHandler)
+    # The tokenizer's two stop ids count against the limit.
+    fits = state(MAX_STOP_TOKEN_IDS - 2)
+    handler._refuse_too_many_stop_token_ids(fits)
+    assert not fits.finished
+    refused = state(MAX_STOP_TOKEN_IDS - 1)
+    handler._refuse_too_many_stop_token_ids(refused)
+    reason = refused.finished_reason.to_json()
+    assert reason["status_code"] == HTTPStatus.BAD_REQUEST
+    assert f"at most {MAX_STOP_TOKEN_IDS - 2} other" in reason["message"]

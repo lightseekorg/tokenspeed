@@ -24,6 +24,7 @@ import logging
 import os
 from collections import deque
 from collections.abc import Mapping
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -86,6 +87,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     make_spec,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.types import MAX_STOP_TOKEN_IDS
 from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
 from tokenspeed.runtime.moe.expert_location import (
     EXPERT_LOAD_RECORD_SUFFIX,
@@ -831,6 +833,7 @@ class RequestHandler:
             )
 
         self._refuse_unsupported_input_logprobs(req_state)
+        self._refuse_too_many_stop_token_ids(req_state)
         self._apply_generation_budget(req_spec, req_state)
         return (
             req_spec,
@@ -850,6 +853,23 @@ class RequestHandler:
                 "Invalid request: prompt logprobs (logprob_start_len) are not "
                 "available with --lm-head-tp-size > 1 under attention DP"
             )
+
+    def _refuse_too_many_stop_token_ids(self, req_state) -> None:
+        """Finish a request with a client error when its stop tokens -- its
+        own ``stop_token_ids`` and the model's EOS ids -- do not fit the
+        device's per-request stop table (``MAX_STOP_TOKEN_IDS``)."""
+        if len(req_state.stop_token_ids) <= MAX_STOP_TOKEN_IDS:
+            return
+        model_ids = req_state.stop_token_ids - set(
+            req_state.sampling_params.stop_token_ids or ()
+        )
+        req_state.finished_reason = FINISH_ABORT(
+            f"Invalid request: {len(req_state.stop_token_ids)} stop token ids "
+            f"exceed the limit of {MAX_STOP_TOKEN_IDS}, which includes the "
+            f"model's {len(model_ids)} EOS ids; pass at most "
+            f"{MAX_STOP_TOKEN_IDS - len(model_ids)} other stop_token_ids",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
     def _apply_generation_budget(self, req_spec, req_state) -> None:
         """Clamp ``max_new_tokens`` to the context and declare it to the
