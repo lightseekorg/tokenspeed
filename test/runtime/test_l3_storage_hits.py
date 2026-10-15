@@ -376,6 +376,7 @@ def loop_methods():
         "PlannedForward": SimpleNamespace,
         "ngram_inputs_for_forward": lambda *args: None,
         "input_logprob_plan_for_forward": lambda *args: None,
+        "sampled_top_k_for_forward": lambda *args: 0,
         "advance_scheduler": lambda scheduler, events: scheduler.advance(events),
     }
     exec(

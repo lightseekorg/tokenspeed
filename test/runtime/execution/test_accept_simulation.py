@@ -155,6 +155,7 @@ def _executor(pool_indices: list[int], cache_lengths: torch.Tensor) -> ModelExec
     req_pool_indices[: len(pool_indices)] = torch.tensor(pool_indices)
     executor.input_buffers = SimpleNamespace(
         req_pool_indices_buf=req_pool_indices,
+        input_lengths_buf=torch.ones(8, dtype=torch.int32),
         force_single_token_verify_buf=torch.zeros(8, dtype=torch.bool),
     )
     executor.runtime_states = SimpleNamespace(valid_cache_lengths=cache_lengths)
@@ -171,6 +172,7 @@ def test_decode_verify_keeps_simulated_widths_and_drafts_in_the_sampler_buffers(
         num_extends=0,
         decode_input_ids=None,
         output_layout=ForwardOutputLayout(0, 0, 3, VERIFY_WIDTH),
+        sampled_top_k=0,
     )
     candidates = _candidates(3)
 
@@ -200,6 +202,7 @@ def test_mixed_round_simulates_only_its_decode_rows():
         num_extends=2,
         decode_input_ids=None,
         output_layout=ForwardOutputLayout(2, 2, 2, VERIFY_WIDTH),
+        sampled_top_k=0,
     )
     logits = LogitsProcessorOutput(next_token_logits=torch.zeros(2 + 2 * 4, 16))
     info = SamplingBatchInfo(req_pool_indices=torch.tensor(pool), device="cpu")

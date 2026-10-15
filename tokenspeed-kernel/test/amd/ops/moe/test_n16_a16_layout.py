@@ -23,10 +23,12 @@
 """CPU address/layout contracts; no tensor, GPU, or compiler imports."""
 
 import ast
-import unittest
+import sys
 from collections import namedtuple
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 _ROOT = Path(__file__).resolve().parents[5]
 _SOURCE = (
@@ -54,8 +56,8 @@ def _definition(file, name):
     return namespace[name]
 
 
-class N16A16LayoutTests(unittest.TestCase):
-    def test_non_n16_warp_layouts_are_unchanged(self):
+class TestN16A16LayoutTests:
+    def test_non_n16_warp_layouts_are_unchanged(self, subtests):
         layouts = _definition("situ_decode.py", "_a16_weight_layouts")
         for n, k, waves in (
             (2, 1024, 1),
@@ -64,30 +66,30 @@ class N16A16LayoutTests(unittest.TestCase):
             (8, 128, 1),
             (8, 512, 8),
         ):
-            with self.subTest(n=n, k=k, waves=waves):
+            with subtests.test(n=n, k=k, waves=waves):
                 packed, expanded, compute = layouts(n, k, waves, False)
                 rows = (n + waves - 1) // waves
-                self.assertEqual(
-                    packed, _Layout((rows, k // 64), (1, 64), (waves, 1), (1, 0))
+                assert (packed) == (
+                    _Layout((rows, k // 64), (1, 64), (waves, 1), (1, 0))
                 )
-                self.assertEqual(
-                    expanded, _Layout((rows, k // 32), (1, 64), (waves, 1), (1, 0))
+                assert (expanded) == (
+                    _Layout((rows, k // 32), (1, 64), (waves, 1), (1, 0))
                 )
-                self.assertEqual(compute, expanded)
+                assert (compute) == (expanded)
 
     def test_n16_loads_cover_cells_with_original_compute_k_ownership(self):
         layouts = _definition("situ_decode.py", "_a16_weight_layouts")
         offset = _definition("n16_weights.py", "_n16_weight_offset")
         for n, k, waves in ((8, 1024, 4), (8, 512, 8), (4, 512, 4), (4, 128, 4)):
             packed, expanded, compute = layouts(n, k, waves, True)
-            self.assertEqual(compute, layouts(n, k, waves, False)[2])
-            self.assertEqual(compute.threads_per_warp, (1, 64))
-            self.assertEqual(compute.size_per_thread[1], 2 * k // 64)
+            assert (compute) == (layouts(n, k, waves, False)[2])
+            assert (compute.threads_per_warp) == ((1, 64))
+            assert (compute.size_per_thread[1]) == (2 * k // 64)
             n_lanes = min(compute.size_per_thread[0], 2)
             k_lanes = 64 // n_lanes
-            self.assertEqual(packed.threads_per_warp, (n_lanes, k_lanes))
-            self.assertEqual(packed.warps_per_cta, (waves, 1))
-            self.assertEqual(expanded.size_per_thread[1], 2 * packed.size_per_thread[1])
+            assert (packed.threads_per_warp) == ((n_lanes, k_lanes))
+            assert (packed.warps_per_cta) == ((waves, 1))
+            assert (expanded.size_per_thread[1]) == (2 * packed.size_per_thread[1])
             per_lane = packed.size_per_thread[1]
             k_tile = per_lane * k_lanes
             seen = set()
@@ -99,17 +101,16 @@ class N16A16LayoutTests(unittest.TestCase):
                         addresses = [
                             offset(row, column + r, k) for r in range(per_lane)
                         ]
-                        self.assertEqual(
-                            addresses,
-                            list(range(addresses[0], addresses[0] + per_lane)),
+                        assert (addresses) == (
+                            list(range(addresses[0], addresses[0] + per_lane))
                         )
                         for r in range(per_lane):
                             seen.add((row, column + r))
-            self.assertEqual(
-                seen, {(row, column) for row in range(n) for column in range(k)}
+            assert (seen) == (
+                {(row, column) for row in range(n) for column in range(k)}
             )
 
-    def test_n16_load_and_upcast_keep_each_compute_waves_rows(self):
+    def test_n16_load_and_upcast_keep_each_compute_waves_rows(self, subtests):
         layouts = _definition("situ_decode.py", "_a16_weight_layouts")
         for n, k, waves in (
             (8, 1024, 4),
@@ -120,13 +121,13 @@ class N16A16LayoutTests(unittest.TestCase):
             (2, 1024, 1),
             (8, 256, 1),
         ):
-            with self.subTest(n=n, k=k, waves=waves):
+            with subtests.test(n=n, k=k, waves=waves):
                 packed, expanded, compute = layouts(n, k, waves, True)
                 rows = compute.size_per_thread[0]
                 for layout in (packed, expanded):
-                    self.assertEqual(layout.warps_per_cta, (waves, 1))
+                    assert (layout.warps_per_cta) == ((waves, 1))
                     n_lanes = layout.threads_per_warp[0]
-                    self.assertEqual(n_lanes, min(rows, 2))
+                    assert (n_lanes) == (min(rows, 2))
                     per_lane = layout.size_per_thread[0]
                     for wave in range(waves):
                         actual = {
@@ -134,18 +135,16 @@ class N16A16LayoutTests(unittest.TestCase):
                             for lane in range(n_lanes)
                             for reg in range(per_lane)
                         }
-                        self.assertEqual(
-                            actual, set(range(wave * rows, (wave + 1) * rows))
-                        )
+                        assert (actual) == (set(range(wave * rows, (wave + 1) * rows)))
 
     def test_masked_small_k_loads_keep_whole_upcast_groups(self):
         layouts = _definition("situ_decode.py", "_a16_weight_layouts")
         for n, waves in ((4, 4), (8, 8)):
             packed, expanded, compute = layouts(n, 128, waves, True)
-            self.assertEqual(packed.size_per_thread[1], 4)
-            self.assertEqual(expanded.size_per_thread[1], 8)
-            self.assertEqual(compute.size_per_thread[1], 4)
-            self.assertEqual(layouts(n, 128, waves, False)[1].size_per_thread[1], 4)
+            assert (packed.size_per_thread[1]) == (4)
+            assert (expanded.size_per_thread[1]) == (8)
+            assert (compute.size_per_thread[1]) == (4)
+            assert (layouts(n, 128, waves, False)[1].size_per_thread[1]) == (4)
 
     def test_masked_partial_cells_never_address_outside_the_bank(self):
         offset = _definition("n16_weights.py", "_n16_weight_offset")
@@ -157,9 +156,9 @@ class N16A16LayoutTests(unittest.TestCase):
                     for k in range(base, base + 256):
                         if k < packed_k:
                             address = offset(n, k, packed_k)
-                            self.assertTrue(0 <= address < 16 * packed_k)
+                            assert 0 <= address < 16 * packed_k
                             seen.add(address)
-            self.assertEqual(seen, set(range(16 * packed_k)))
+            assert (seen) == (set(range(16 * packed_k)))
 
     def test_gate_up_cells_and_group32_scales_keep_their_roles(self):
         weight = _definition("n16_weights.py", "_n16_weight_offset")
@@ -168,12 +167,13 @@ class N16A16LayoutTests(unittest.TestCase):
             gate = n // 16 * 32 + n % 16
             up = gate + 16
             for group in range(24):
-                self.assertEqual(
-                    weight(up, group * 16, 384) - weight(gate, group * 16, 384),
-                    16 * 384,
-                )
-                self.assertEqual(scale(up, group, 24) - scale(gate, group, 24), 1)
+                assert (
+                    weight(up, group * 16, 384) - weight(gate, group * 16, 384)
+                ) == (16 * 384)
+                assert (scale(up, group, 24) - scale(gate, group, 24)) == (1)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(
+        pytest.main([__file__, f"--confcutdir={Path(__file__).parent}", *sys.argv[1:]])
+    )

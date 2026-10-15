@@ -108,48 +108,42 @@ def _radio(final_norm: bool) -> RadioVisionModel:
 
 
 def _reference_vit(model: RadioVisionModel, embedded: torch.Tensor) -> torch.Tensor:
-    """Pre-norm ViT over one embedded sequence in fp32, prefix tokens dropped."""
+    """Pre-norm ViT in the model dtype with independent per-sequence math attention."""
     heads = model.blocks[0].attn.num_attention_heads_per_partition
-    x = torch.cat([model.cls_token.float(), embedded])
+    x = torch.cat([model.cls_token, embedded.to(model.dtype)])
     for block in model.blocks:
         h = F.layer_norm(
-            x, x.shape[-1:], block.norm1.weight.float(), block.norm1.bias.float(), 1e-6
+            x, x.shape[-1:], block.norm1.weight, block.norm1.bias, block.norm1.eps
         )
-        qkv = F.linear(
-            h, block.attn.qkv_proj.weight.float(), block.attn.qkv_proj.bias.float()
-        )
+        qkv = F.linear(h, block.attn.qkv_proj.weight, block.attn.qkv_proj.bias)
         q, k, v = (
             t.unflatten(-1, (heads, -1)).transpose(0, 1) for t in qkv.chunk(3, -1)
         )
-        attn = F.scaled_dot_product_attention(q, k, v).transpose(0, 1).flatten(1)
-        x = x + F.linear(
-            attn, block.attn.proj.weight.float(), block.attn.proj.bias.float()
-        )
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+            attn = F.scaled_dot_product_attention(q, k, v).transpose(0, 1).flatten(1)
+        x = x + F.linear(attn, block.attn.proj.weight, block.attn.proj.bias)
         h = F.layer_norm(
-            x, x.shape[-1:], block.norm2.weight.float(), block.norm2.bias.float(), 1e-6
+            x, x.shape[-1:], block.norm2.weight, block.norm2.bias, block.norm2.eps
         )
         mlp = block.mlp
-        x = x + F.linear(
-            F.gelu(F.linear(h, mlp.fc1.weight.float(), mlp.fc1.bias.float())),
-            mlp.fc2.weight.float(),
-            mlp.fc2.bias.float(),
-        )
+        h = F.gelu(F.linear(h, mlp.fc1.weight, mlp.fc1.bias))
+        x = x + F.linear(h, mlp.fc2.weight, mlp.fc2.bias)
     if model.norm is not None:
         x = F.layer_norm(
-            x, x.shape[-1:], model.norm.weight.float(), model.norm.bias.float(), 1e-6
+            x, x.shape[-1:], model.norm.weight, model.norm.bias, model.norm.eps
         )
-    return x[model.num_prefix_tokens :]
+    return x[model.num_prefix_tokens :].float()
 
 
 def _reference_position(model: RadioVisionModel, rows: int, cols: int) -> torch.Tensor:
     grid = model.pos_embed.float().view(1, GRID, GRID, -1).permute(0, 3, 1, 2)
     side = max(rows, cols)
     grid = F.interpolate(grid, size=(side, side), mode="bilinear", align_corners=False)
-    return grid[0, :, :rows, :cols].flatten(1).T.bfloat16().float()
+    return grid[0, :, :rows, :cols].flatten(1).T.to(model.dtype).float()
 
 
 def _assert_close_bf16(out: torch.Tensor, ref: torch.Tensor) -> None:
-    # bf16 encoder against an fp32 reference on the same weights.
+    # bf16 encoder against independent references on the same weights.
     torch.testing.assert_close(out.float(), ref, atol=3e-2, rtol=3e-2)
 
 
@@ -176,8 +170,8 @@ def test_radio_packs_images_of_any_size_like_one_at_a_time(final_norm: bool):
         refs = [
             _reference_vit(
                 model,
-                F.linear(image.bfloat16().float(), model.embedder.weight.float())
-                + _reference_position(model, rows, cols),
+                F.linear(image.to(model.dtype), model.embedder.weight)
+                + _reference_position(model, rows, cols).to(model.dtype),
             )
             for image, (rows, cols) in zip(images, grids)
         ]
@@ -220,10 +214,10 @@ def test_radio_video_pairs_frames_and_repeats_an_odd_last_frame():
             _reference_vit(
                 model,
                 F.linear(
-                    torch.cat([pair[0], pair[1]], dim=-1).bfloat16().float(),
-                    model.video_embedder.weight.float(),
+                    torch.cat([pair[0], pair[1]], dim=-1).to(model.dtype),
+                    model.video_embedder.weight,
                 )
-                + _reference_position(model, rows, cols),
+                + _reference_position(model, rows, cols).to(model.dtype),
             )
             for pair in tubelets
         ]

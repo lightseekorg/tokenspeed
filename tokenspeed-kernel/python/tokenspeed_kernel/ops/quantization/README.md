@@ -16,3 +16,12 @@ and block quantization reject `enable_pdl=True`, which their kernels do not
 support. The common GEMM API predicts online activation scale storage from
 the weight scale encoding: uint8 UE8M0 weights use uint8 activation scales;
 FP32 weights use FP32 activation scales.
+
+`quantize_fp8_with_gate` combines an optional per-head RMSNorm, sigmoid
+output gate, and 128-element FP8 quantization. It rounds the gated result to
+BF16 before computing FP8 values and FP32 scales, matching the separate
+operations. KDA returns raw BF16 output for both single-token decode and
+verification; its output norm belongs to this stage. MLA uses the same
+stage without RMSNorm. Prequantized values and scales feed the output
+projection directly. The same Triton implementation serves NVIDIA and AMD;
+PDL is enabled only where supported.

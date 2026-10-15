@@ -361,8 +361,9 @@ def invoke_stage1(
     num_valid_ids: torch.Tensor,
     out: torch.Tensor,  # (num_tokens*topk, I) bf16
     topk: int,
-    BLOCK_M: int = 64,
-    BLOCK_N: int = 128,
+    *,
+    BLOCK_M: int,
+    BLOCK_N: int,
     BLOCK_K: int | None = None,
     num_warps: int = 4,
     num_xcds: int = 8,

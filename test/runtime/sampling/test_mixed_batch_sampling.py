@@ -227,6 +227,7 @@ def test_mixed_round_preserves_prefill_outputs():
     ctx.num_extends = num_extends
     ctx.bs = bs
     ctx.decode_input_ids = None
+    ctx.sampled_top_k = 0
 
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.sampling_backend = backend
@@ -315,6 +316,7 @@ def test_mixed_round_preserves_prefill_logprobs():
     ctx.num_extends = num_extends
     ctx.bs = bs
     ctx.decode_input_ids = None
+    ctx.sampled_top_k = 0
 
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.sampling_backend = backend

@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from tokenspeed_kernel.ops.kvcache.offload import seed_locations
+from tokenspeed_kernel.platform import current_platform
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci_system.ci_register import register_cuda_ci
@@ -38,7 +39,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
 )
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_hopper_plus,
+    reason="sparse KV offload CuTe kernels require NVIDIA SM90+",
+)
 
 
 def make_offload(arena, config):

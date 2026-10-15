@@ -366,7 +366,8 @@ private:
     // fires only when no prefill progressed and admission failed. Retracts
     // victims and RETRIES the blocked admission in the same plan build, so
     // the freed capacity reaches the request it was freed for -- never a
-    // free page waiting for whoever asks first next round.
+    // free page waiting for whoever asks first next round. The empty-round
+    // retraction offers it to the round's failed decodes first.
     void maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                  std::vector<WriteBackOperation>& write_back_operations);
     // Who gives way, and whether it can be imaged. `victim` is nullptr when
@@ -377,7 +378,8 @@ private:
         Request* victim{nullptr};
         bool image_fits{false};
     };
-    VictimChoice chooseVictim(std::span<Request* const> candidates) const;
+    // `ignore_exemption`: the empty-round retraction (docs/design/scheduler.md §2).
+    VictimChoice chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const;
     // The first half of a retraction: publishes the pages the victim completed
     // since its last admission (see forward.cpp).
     void publishCompletedPrefix(Request& victim);
@@ -409,6 +411,10 @@ private:
     // the batch until it is quiescent, then retracts it.
     void maybeForceRetraction(PlanBuild& build, std::span<Request* const> candidates,
                               std::vector<WriteBackOperation>& write_back_operations);
+
+    // The stall diagnostic (docs/design/scheduler.md §2), called once per
+    // NextExecutionPlan. It never changes a plan.
+    void trackStalledRounds(std::size_t num_live_requests, bool plan_is_empty);
 
     // One plan-building grammar per engine role: the roles share the
     // scheduling mechanism (schedulePrefill / scheduleDecode / admission)
@@ -450,6 +456,10 @@ private:
     // retracted.
     std::int64_t plan_calls_{0};
     std::string forced_victim_id_;
+
+    // Consecutive stalled rounds (trackStalledRounds); 0 after any round
+    // that schedules work or leaves work in flight.
+    std::int64_t stalled_rounds_{0};
 
     // Submission order -- the FIFO every scheduling phase walks, identical
     // on every rank because the mirrored schedulers receive identical

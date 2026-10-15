@@ -33,9 +33,6 @@ from tokenspeed.runtime.execution.context import ForwardContext  # noqa: E402
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.drafter import get_drafter_impl  # noqa: E402
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter  # noqa: E402
-from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (  # noqa: E402
-    DeepseekV4DSpark,
-)
 from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (  # noqa: E402
     DeepseekV41DSpark,
 )
@@ -772,7 +769,7 @@ def test_block_drafter_binds_local_embedding_on_last_pipeline_stage():
 
 
 def test_deepseek_dspark_wire_target_only_binds_resources():
-    drafter = DeepseekV4DSpark.__new__(DeepseekV4DSpark)
+    drafter = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
     draft_head = object()
     drafter.draft_model = SimpleNamespace(lm_head=draft_head)
     target = SimpleNamespace(

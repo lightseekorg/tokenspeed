@@ -65,6 +65,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     make_config,
     ngram_inputs_for_forward,
     resolve_dspark_prefix_replay_tokens,
+    sampled_top_k_for_forward,
     scheduler_cache_group_pages,
     scheduler_pd_lifecycle,
     should_use_overlap_schedule,
@@ -1265,6 +1266,9 @@ class EventLoop:
                             ngram_inputs=ngram_inputs,
                             request_history_seeds=request_history_seeds,
                             input_logprob_plan=input_logprob_plan,
+                            sampled_top_k=sampled_top_k_for_forward(
+                                forward_op, self.output_processor.rid_to_state
+                            ),
                             multimodal_context=(
                                 multimodal_context_for_forward(
                                     forward_op,

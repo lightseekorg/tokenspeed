@@ -22,9 +22,10 @@
 
 import os
 import sys
-import unittest
 from types import SimpleNamespace
 from unittest import mock
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,27 +36,27 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 from tokenspeed.runtime.sampling import registry  # noqa: E402
 
 
-class TestSamplingBackendRegistryDefaults(unittest.TestCase):
+class TestSamplingBackendRegistryDefaults:
     def test_unresolved_default_uses_flashinfer_on_nvidia(self):
         platform = SimpleNamespace(is_nvidia=True, is_npu=False)
         server_args = SimpleNamespace(sampling_backend=None)
 
         with mock.patch.object(registry, "current_platform", return_value=platform):
-            self.assertEqual(registry._resolve_backend_name(server_args), "flashinfer")
+            assert (registry._resolve_backend_name(server_args)) == ("flashinfer")
 
     def test_unresolved_default_uses_greedy_on_non_nvidia_non_npu(self):
         platform = SimpleNamespace(is_nvidia=False, is_npu=False)
         server_args = SimpleNamespace(sampling_backend=None)
 
         with mock.patch.object(registry, "current_platform", return_value=platform):
-            self.assertEqual(registry._resolve_backend_name(server_args), "greedy")
+            assert (registry._resolve_backend_name(server_args)) == ("greedy")
 
     def test_unresolved_default_uses_ascend_full_on_npu(self):
         platform = SimpleNamespace(is_nvidia=False, is_npu=True)
         server_args = SimpleNamespace(sampling_backend=None)
 
         with mock.patch.object(registry, "current_platform", return_value=platform):
-            self.assertEqual(registry._resolve_backend_name(server_args), "ascend_full")
+            assert (registry._resolve_backend_name(server_args)) == ("ascend_full")
 
     def test_explicit_backend_is_preserved(self):
         server_args = SimpleNamespace(sampling_backend="flashinfer")
@@ -65,8 +66,8 @@ class TestSamplingBackendRegistryDefaults(unittest.TestCase):
             "current_platform",
             side_effect=AssertionError("unexpected lookup"),
         ):
-            self.assertEqual(registry._resolve_backend_name(server_args), "flashinfer")
+            assert (registry._resolve_backend_name(server_args)) == ("flashinfer")
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

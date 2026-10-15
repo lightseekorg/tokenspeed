@@ -424,7 +424,7 @@ A new backend implements `refresh_decode_metadata` and inherits both
 `block_decode_expansion`; extend it for extra persistent state) and
 capture; a new override must name its kernel-imposed asymmetry here. Leaf
 capture/refresh signatures are pinned by
-`test_unified_decode_path.py::LeafSignatureConformanceTest`.
+`test_unified_decode_path.py::TestLeafSignatureConformanceTest`.
 
 ### Graded CUDA-graph support
 

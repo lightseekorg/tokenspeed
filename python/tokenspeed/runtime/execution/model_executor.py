@@ -77,6 +77,7 @@ from tokenspeed.runtime.execution.slot_state import SlotStateExporter
 from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
+    ForwardLogprobs,
     InputLogprobPlan,
     ModelExecutionResult,
     NGramInputs,
@@ -117,6 +118,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+from tokenspeed.runtime.sampling.utils import top_token_logprobs
 from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_available
 from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
@@ -179,6 +181,25 @@ def _with_prefill_sample_offsets(
         0, pool_rows, (last - 1).clamp_min(0).to(cache_lengths.dtype)
     )
     return replace(sampling_info, valid_cache_lengths=offsets)
+
+
+def _set_sampled_top_logprobs(
+    logits_output: LogitsProcessorOutput, prefill_logits: torch.Tensor, top_k: int
+) -> None:
+    """Report each prefill row's ``top_k`` most likely tokens beside its sample.
+
+    ``prefill_logits`` are the rows the sampler drew from (any grammar mask
+    already applied in place), so the alternatives are of the distribution
+    the sampled token's own logprob is read from: ``top_token_logprobs``, the
+    prompt rows' top-k arithmetic too, most likely first. Only eager
+    prefills ask (``ForwardContext.sampled_top_k`` is 0 in every captured
+    graph), so no graph records this.
+    """
+    if top_k <= 0 or prefill_logits.shape[0] == 0:
+        return
+    values, ids = top_token_logprobs(prefill_logits, top_k)
+    logits_output.sampled_top_logprobs_val = values
+    logits_output.sampled_top_logprobs_idx = ids
 
 
 PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
@@ -1432,14 +1453,21 @@ class ModelExecutor:
         num_decodes = ctx.bs - num_extends
         layout = ctx.output_layout
         num_prefill_outputs = layout.num_prefill_outputs
+        # Eager prefills only: 0 in every captured graph.
+        sampled_top_k = ctx.sampled_top_k
 
         if num_decodes == 0 and num_prefill_outputs == num_extends:
-            return self.sampling_backend.sample(
+            sampled = self.sampling_backend.sample(
                 logits_output,
                 _with_prefill_sample_offsets(
                     sampling_info, self.input_buffers.input_lengths_buf
                 ),
             )
+            if sampled_top_k:
+                _set_sampled_top_logprobs(
+                    logits_output, logits_output.next_token_logits, sampled_top_k
+                )
+            return sampled
         if num_extends == 0:
             output_tokens, accept_lengths = self.sampling_backend.verify(
                 logits_output,
@@ -1482,6 +1510,10 @@ class ModelExecutor:
                     self.input_buffers.input_lengths_buf,
                 ),
             )
+            if sampled_top_k:
+                _set_sampled_top_logprobs(
+                    logits_output, prefill_out.next_token_logits, sampled_top_k
+                )
             # verify writes the same backend buffers; snapshot the prefix.
             token_parts.append(tokens.clone() if num_decodes else tokens)
             length_parts.append(lengths.clone() if num_decodes else lengths)
@@ -1678,7 +1710,7 @@ class ModelExecutor:
             output_tokens,
             accept_lengths,
             output_logprobs,
-            logits_output.input_token_logprobs,
+            ForwardLogprobs.of(logits_output),
         )
 
     @nvtx_range("update_runtime_state", color="orange")
@@ -2082,6 +2114,7 @@ class ModelExecutor:
         ngram_inputs: NGramInputs | None,
         request_history_seeds: RequestHistorySeeds | None,
         input_logprob_plan: InputLogprobPlan | None,
+        sampled_top_k: int,
     ) -> ModelExecutionResult:
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
@@ -2166,7 +2199,7 @@ class ModelExecutor:
 
             grammar_completion = None
 
-            input_token_logprobs = None
+            forward_logprobs = None
             if total_tokens == 0:
                 # Fully prefix-cached prefill: no tokens to process.
                 output_tokens = torch.zeros(0, dtype=torch.int32, device=self.device)
@@ -2260,6 +2293,7 @@ class ModelExecutor:
                     input_logprob_rows=self._input_logprob_rows(
                         input_logprob_plan, num_extends, total_tokens, query_shard
                     ),
+                    sampled_top_k=sampled_top_k if num_extends > 0 else 0,
                     decode_input_ids=decode_input_ids,
                     output_layout=output_layout,
                     query_shard=query_shard,
@@ -2336,7 +2370,7 @@ class ModelExecutor:
                         output_tokens,
                         output_lengths,
                         output_logprobs,
-                        input_token_logprobs,
+                        forward_logprobs,
                     ) = self.forward_step(
                         bs=bs,
                         ctx=ctx,
@@ -2432,10 +2466,10 @@ class ModelExecutor:
 
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
-                if input_token_logprobs is not None:
-                    input_token_logprobs = input_token_logprobs.to(
-                        "cpu", non_blocking=True
-                    )
+                if forward_logprobs is not None:
+                    forward_logprobs = forward_logprobs.to_host()
+                else:
+                    forward_logprobs = ForwardLogprobs()
 
                 output_nan_flags = self.nan_guard.flags_cpu
 
@@ -2473,11 +2507,15 @@ class ModelExecutor:
             next_input_ids=next_input_ids,
             output_nan_flags=output_nan_flags,
             spec_candidate_tokens=spec_candidate_tokens,
-            input_token_logprobs=input_token_logprobs,
+            input_token_logprobs=forward_logprobs.input_token_logprobs,
             # The plan rides along whether or not this rank scored the rows: a
             # pipeline stage without logits adopts the last stage's logprobs on
             # the commit path and pairs them with its own (mirrored) plan.
             input_logprob_plan=input_logprob_plan,
+            input_top_logprobs_val=forward_logprobs.input_top_logprobs_val,
+            input_top_logprobs_idx=forward_logprobs.input_top_logprobs_idx,
+            output_top_logprobs_val=forward_logprobs.output_top_logprobs_val,
+            output_top_logprobs_idx=forward_logprobs.output_top_logprobs_idx,
         )
 
     def _input_logprob_rows(
@@ -2541,6 +2579,7 @@ class ModelExecutor:
             num_input_rows=num_input_rows,
             chunk_tokens=self.config.input_logprob_chunk_tokens,
             rows_per_rank=rows_per_rank,
+            top_k=plan.top_k,
         )
 
     def write_remote_spec_candidate_ids(

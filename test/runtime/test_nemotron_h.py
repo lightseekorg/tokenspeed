@@ -356,9 +356,6 @@ def test_mamba2_seams_match_the_sequential_recurrence():
         D=D,
         a=step_dt,
         b=None,
-        output_gate=None,
-        norm_weight=None,
-        norm_eps=None,
         **_UNUSED,
     )
     assert decoded.shape == (1, 3, heads, head_dim)
@@ -904,9 +901,6 @@ def test_mamba2_decode_reads_the_projection_view_in_place():
         D=torch.ones(heads, device="cuda"),
         a=dt,
         b=None,
-        output_gate=None,
-        norm_weight=None,
-        norm_eps=None,
         **_UNUSED,
     )
     pools = [torch.zeros(4, heads, head_dim, d_state, device="cuda") for _ in range(2)]
