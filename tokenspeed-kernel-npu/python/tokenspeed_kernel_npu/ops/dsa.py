@@ -47,7 +47,7 @@ def _scatter(
     tl.store(Y + loc * WIDTH + off, x, (off < WIDTH) & (loc >= PAGE) & (loc < CAP))
 
 
-def interleave_rope(tensor, positions, cos_sin_cache, *, rope_dim):
+def _composite_interleave_rope(tensor, positions, cos_sin_cache, *, rope_dim):
     """Run the one-sided interleaved RoPE used by FluentLLM's indexer."""
     if tensor.shape[0] == 0:
         return tensor
@@ -67,9 +67,96 @@ def interleave_rope(tensor, positions, cos_sin_cache, *, rope_dim):
     return torch.cat((rotated, tail), dim=-1)
 
 
+@triton.jit
+def _interleave_rope_fused(
+    X, P, C, Y, heads, s0, s1, s2, cs0, cs1, ps0, BH: tl.constexpr
+):
+    row = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1) * BH + tl.arange(0, BH)
+    lane = tl.arange(0, 64)
+    pos = tl.load(P + row * ps0).to(tl.int64)
+    # Read each rotary row contiguously, then split adjacent pairs in UB.
+    # Keeping the head axis avoids a per-lane gather from global memory.
+    rot = tl.load(
+        X + row * s0 + head[:, None] * s1 + lane[None, :] * s2,
+        head[:, None] < heads,
+        other=0,
+    ).to(tl.float32)
+    even, odd = tl.split(tl.reshape(rot, (BH, 32, 2)))
+    pair = tl.arange(0, 32)
+    c = tl.load(C + pos * cs0 + pair * cs1).to(tl.float32)
+    s = tl.load(C + pos * cs0 + (pair + 32) * cs1).to(tl.float32)
+    # CANN maps adjacent pairs into the two halves of the output.
+    lo = even * c[None, :] - odd * s[None, :]
+    hi = odd * c[None, :] + even * s[None, :]
+    tail = tl.load(
+        X + row * s0 + head[:, None] * s1 + (lane[None, :] + 64) * s2,
+        head[:, None] < heads,
+        other=0,
+    )
+    tl.store(
+        Y + (row * heads + head[:, None]) * 128 + pair[None, :],
+        lo,
+        head[:, None] < heads,
+    )
+    tl.store(
+        Y + (row * heads + head[:, None]) * 128 + pair[None, :] + 32,
+        hi,
+        head[:, None] < heads,
+    )
+    tl.store(
+        Y + (row * heads + head[:, None]) * 128 + lane[None, :] + 64,
+        tail,
+        head[:, None] < heads,
+    )
+
+
+def interleave_rope(x, positions, table, *, rope_dim):
+    # Specialize the measured decode layouts. Other geometries/strides keep
+    # the existing CANN path rather than relying on unsupported UB tiling.
+    if (
+        x.ndim not in (2, 3)
+        or rope_dim != 64
+        or x.shape[-1] != 128
+        or x.dtype not in (torch.bfloat16, torch.float16)
+        or positions.ndim != 1
+        or positions.stride(0) != 1
+        or x.stride(-1) != 1
+        or table.stride(-1) != 1
+        or (x.ndim == 3 and x.shape[1] not in (1, 8, 64))
+    ):
+        return _composite_interleave_rope(x, positions, table, rope_dim=rope_dim)
+    if positions.numel() != x.shape[0]:
+        raise ValueError("DSA RoPE needs one position per token row")
+    if table.ndim != 2 or table.shape[1] != rope_dim:
+        raise ValueError("DSA RoPE needs a [positions, rope_dim] trigonometric table")
+    rows = x.shape[0]
+    heads = 1 if x.ndim == 2 else x.shape[1]
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    if rows == 0:
+        return out
+    bh = min(64, triton.next_power_of_2(heads))
+    _interleave_rope_fused[(rows, triton.cdiv(heads, bh))](
+        x,
+        positions,
+        table,
+        out,
+        heads,
+        x.stride(0),
+        0 if x.ndim == 2 else x.stride(1),
+        x.stride(-1),
+        table.stride(0),
+        table.stride(1),
+        positions.stride(0),
+        bh,
+        enable_fp_fusion=False,
+    )
+    return out
+
+
 class AscendDSAKernels:
     def __init__(self):
-        import flash_ops
+        import flash_ops  # noqa: F401 -- registers the vendor operators
 
         library = os.environ.get("TOKENSPEED_LONGCAT_DSA_LIBRARY")
         if library:
@@ -90,6 +177,7 @@ class AscendDSAKernels:
                 "SparseFlashAttentionDecode operators"
             )
         self._full_scan_chunks = {}
+        self._selection_windows = {}
 
     interleave_rope = staticmethod(interleave_rope)
 
@@ -146,10 +234,19 @@ class AscendDSAKernels:
     def index(
         self, query, key, weights, q_ends, kv_lengths, table, topk, initial, local
     ):
-        initial_tensor = torch.full_like(q_ends, initial, dtype=torch.int32)
-        local_tensor = torch.full(
-            (query.shape[0],), local, dtype=torch.int32, device=query.device
-        )
+        # Immutable model constants. Keep their tensors alive for every graph
+        # that captured the pointers; lengths/page tables remain refreshed.
+        window_key = (query.device, q_ends.numel(), query.shape[0], initial, local)
+        windows = self._selection_windows.get(window_key)
+        if windows is None:
+            windows = (
+                torch.full_like(q_ends, initial, dtype=torch.int32),
+                torch.full(
+                    (query.shape[0],), local, dtype=torch.int32, device=query.device
+                ),
+            )
+            self._selection_windows[window_key] = windows
+        initial_tensor, local_tensor = windows
         result, _ = self._index(
             query.contiguous(),
             key,
@@ -242,6 +339,70 @@ class AscendDSAKernels:
             sparse_prep_mode=0,
         )
         return output.to(q.dtype)
+
+    def attention_packed(
+        self,
+        query,
+        key,
+        indices,
+        valid_chunks,
+        q_ends,
+        kv_lengths,
+        table,
+        scale,
+        *,
+        head_major_output,
+    ):
+        """Consume packed latent/aux Q and cast only the live output heads.
+
+        The existing rank-major ABI also represents a single rank. SFAD writes
+        head-major FP32 output directly; no context-parallel collective is used.
+        """
+        heads = query.shape[1]
+        if not 1 <= heads <= 64:
+            raise ValueError("Ascend DSA supports 1 through 64 local heads")
+        padded_heads = 32 if heads <= 32 else 64
+        if heads != padded_heads:
+            query = query.repeat(1, (padded_heads + heads - 1) // heads, 1)
+            query = query[:, :padded_heads].contiguous()
+        output, _, _ = self._attention(
+            query.unsqueeze(0),
+            key,
+            key,
+            indices,
+            scale,
+            valid_chunks=valid_chunks,
+            block_table=table,
+            actual_seq_lengths_query=q_ends,
+            actual_seq_lengths_kv=kv_lengths,
+            query_rope=None,
+            key_rope=None,
+            sparse_block_size=1,
+            layout_query="RANK_MAJOR_TND_PACKED_KVP_COMM",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            pre_tokens=9223372036854775807,
+            next_tokens=9223372036854775807,
+            attention_mode=2,
+            return_softmax_lse=False,
+            sparse_prep_mode=0,
+        )
+        output = output[:heads].to(query.dtype)
+        if head_major_output:
+            return output
+        return output.transpose(0, 1).contiguous().flatten(1)
+
+    @staticmethod
+    def project_value(attention, weight):
+        """Head-major absorbed attention to token-major projected values."""
+        return torch_npu.npu_transpose_batchmatmul(
+            attention,
+            weight,
+            perm_x1=[0, 1, 2],
+            perm_x2=[0, 1, 2],
+            perm_y=[1, 0, 2],
+            batch_split_factor=1,
+        ).flatten(1)
 
     def attention_partial(
         self,

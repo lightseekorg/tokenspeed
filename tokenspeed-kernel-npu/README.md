@@ -79,3 +79,17 @@ Verify the gRPC servicer and the source paths together:
 PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kernel-npu/python:${PYTHONPATH:-}" \
     python -m smg_grpc_servicer.tokenspeed --help
 ```
+
+## DSA decode layouts
+
+The DSA adapter rotates each indexer Q or K input in one kernel for validated
+BF16/FP16 decode layouts; other layouts retain the CANN path. The kernel includes
+position-table lookup, interleaved-to-split ordering and the unchanged tail. FP32 products round
+once at output, matching CANN InterleaveRope without FMA contraction. Immutable
+initial/local selection windows remain alive in a per-shape cache for graph replay.
+
+For local sparse attention, the existing rank-major packed-Q ABI is used with one
+rank. It writes head-major FP32 attention directly; the adapter selects live heads
+before casting to BF16. Small head counts still use the operator's 32-head kernel.
+The value projection can consume head-major attention and emit token-major values
+with TransposeBatchMatMul. No new vendor binary is required for these paths.
