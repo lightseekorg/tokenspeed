@@ -402,55 +402,47 @@ deterministic.
 
 ### gfx1250 dense BF16 large-M projection
 
-`gluon_mm_a16w16_largem_gfx1250` runs the K3 BF16 prefill projections.
+`gluon_mm_a16w16_largem_gfx1250` is a compute-bound BF16 GEMM for prefill
+projections with many rows.
 
 #### Contract
 
 - The operation computes `A @ B.T` from contiguous BF16 `[M, K]` and `[N, K]`
-  on one device, with `M >= 512` and `(K, N)` one of the fixed K3 shapes
-  (`use_gluon_largem_gfx1250`); K is a multiple of 128. Output is a
-  contiguous BF16 `[M, N]`.
-- Any M and N are accepted inside that contract; ragged edges are clipped
-  in-kernel. The row count is a runtime argument that does not specialize
-  the compile.
+  with `M >= 512` and K a multiple of 128, producing a contiguous BF16
+  `[M, N]`. The registered op accepts the weight shapes listed in
+  `use_gluon_largem_gfx1250`.
+- Ragged M and N are handled in-kernel. The row count is a runtime argument,
+  so any number of rows reuses one compiled kernel.
 
 #### Algorithm
 
-From 4096 rows and 1536 columns, `_wmma_tdm_dense_largem_warp_pipeline_kernel`
-computes a `256 x 256` tile on eight waves, two per SIMD, in 128-wide K steps
-through a double-buffered TDM pipeline. Each K step is two half-K rounds of
-`warp_pipeline_stage` pairs, so one wave's TDM issue and LDS reads overlap the
-other wave's WMMA on the same SIMD. A and B use partitioned padded LDS layouts
-so paired waves read different LDS partitions. TDM descriptors are bounded at
-the real M and N, which zero-fills loads past the edge; the tile is staged in
-the dead operand LDS and written by one clipped TDM store.
+Wide problems (at least 4096 rows and 1536 columns) run
+`_wmma_tdm_dense_largem_warp_pipeline_kernel`:
 
-Each program is a `2 x 2` CTA cluster. The A, B and output layouts carry a CGA
-part placing each CTA's `256 x 256` slice, so one TDM load multicasts an A row
-panel to both CTAs of a cluster row and a B panel to both of a cluster column,
-halving operand reads from L2. Every CTA joins a cluster arrive/wait per K
-tile, which keeps the cluster within one tile so each multicast refill finds
-its slot free. Edge clusters run whole: CTAs past M or N load zeros and store
-nothing, so the barriers always complete. The cluster bought 2 to 8% on the K3
-shapes over single CTAs; `4 x 4` and `4 x 1` were no better overall, and
-`2 x 2` pads at most one tile row or column. Unrolling the K loop by two to
-make the LDS slots static, as the upstream CDNA5 warp-pipeline example does,
-changed nothing. Clusters get contiguous runs per XCD (eight on MI450),
-grouped four cluster rows per column sweep, so clusters sharing operands
-share an L2.
+- Each CTA computes a `256 x 256` tile on eight waves, two per SIMD, through a
+  double-buffered TDM pipeline. `warp_pipeline_stage` alternates the two waves
+  on a SIMD between TDM issue plus LDS reads and WMMA, so one wave's memory
+  work overlaps the other's matrix work. Partitioned padded LDS layouts let
+  the paired waves read different LDS partitions.
+- CTAs run as `2 x 2` clusters. Each TDM load multicasts an A or B panel to
+  the two CTAs that share it, halving operand reads from L2, and a cluster
+  arrive/wait per K tile keeps the CTAs in step.
+- TDM descriptors are bounded at the real M and N, so loads past the edge read
+  zeros and the output, staged in the freed operand LDS, is written by one
+  clipped TDM store. Edge clusters run whole, so ragged shapes need no special
+  path and every cluster barrier completes.
+- Clusters are assigned contiguous runs per XCD so clusters sharing operands
+  share an L2.
 
-The 256-wide tile leaves a partial last wave when the tile count is not a
-multiple of 256 (896 tiles for `N = 7168`, 800 for `N = 6288`); that tail is
-the main remaining gap to the WMMA peak. Split-K of the tail tiles with FP32
-partials merged in-kernel measured slower, because the partial round trip
-cost more than the tail it removed.
+Narrower or shorter problems keep `_wmma_tdm_dense_largem_kernel` and its
+own tile choice. The general BF16 GEMM's large-M route
+(`_launch_largem`) uses the same selection for FP32 or BF16 output; a
+row-strided output also takes the older kernel, whose masked stores accept
+it.
 
-The general BF16 GEMM's large-M route (`_launch_largem`) shares this
-selection: from 4096 rows, at least 1536 columns and a contiguous output it
-runs the warp pipeline kernel, in FP32 or BF16. Anything else keeps
-`_wmma_tdm_dense_largem_kernel` and its earlier tile choice (`128 x 128` on
-four warps below 12288 rows), whose masked stores also accept a row-strided
-output.
+When the tile count is not a multiple of the CU count, the last partial wave
+of tiles leaves CUs idle; this tail is the main remaining gap to the WMMA
+peak.
 
 ### gfx1250 MXFP8 large-M projection
 
