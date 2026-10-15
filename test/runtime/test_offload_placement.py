@@ -28,12 +28,16 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_hopper_plus,
+    reason="sparse KV offload CuTe kernels require NVIDIA SM90+",
+)
 from tokenspeed.runtime.engine.scheduler_utils import _kv_pool_bytes
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.offload_config import KVOffloadConfig

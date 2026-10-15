@@ -14,10 +14,10 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-from runtime.cache_pd_test_utils import block_manifest  # noqa: E402
-from runtime.cache_pd_test_utils import group  # noqa: E402
-from runtime.cache_pd_test_utils import segment  # noqa: E402
-from runtime.cache_pd_test_utils import layout as make_layout  # noqa: E402
+from test.runtime.cache_pd_test_utils import block_manifest  # noqa: E402
+from test.runtime.cache_pd_test_utils import group  # noqa: E402
+from test.runtime.cache_pd_test_utils import segment  # noqa: E402
+from test.runtime.cache_pd_test_utils import layout as make_layout  # noqa: E402
 
 from tokenspeed.runtime.pd.transfer_plan import (
     CachePageOwnerFilter,
