@@ -75,9 +75,8 @@ class TestReadyPipe:
         )
         proc.join(_TIMEOUT_S)
         assert proc.exitcode == -signal.SIGKILL
-        assert reader.poll(_TIMEOUT_S), (
-            "recv() would block: the parent still holds the write end"
-        )
+        message = "recv() would block: the parent still holds the write end"
+        assert reader.poll(_TIMEOUT_S), message
         with pytest.raises(EOFError):
             reader.recv()
 
