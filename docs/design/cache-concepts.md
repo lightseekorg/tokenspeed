@@ -1143,13 +1143,17 @@ still bounds capacity. Grouping, packing and allocation are unchanged.
 
 Hybrid recurrent recipes keep their groups balanced instead: every group's page
 spans the whole parent, so a parent is fully used only when every group fills
-the same planes. Qwen3.5 groups state layers by position within its fixed
-state-state-state-full period. Nemotron-H's Mamba2 runs are four or five layers
-long, so its recipe deals state layers round-robin instead and splits the
-attention layers into two KV groups whose K and V pages pack to the size of
-one SSM state; `recipes/mamba2.py` documents the layout. State pages carry no
-padding; KV pages pad only by their share of the conv planes, about 1.5% for
-Nemotron-3 Super.
+the same planes. Both recipes size a plane segment to one SSM state and give an
+attention layer's K and V a segment each, so state pages carry no attention
+planes, and deal state layers round-robin. Qwen3.5 keeps its attention layers
+in one KV group, the full-history group drafters write through, and deals its
+state layers into groups of as many SSM states as that group has segments; a
+draft layer of a target attention layer's K/V bytes fills state segments, any
+other pads the state groups (`recipes/qwen35.py`). Nemotron-H's Mamba2 runs
+are four or five layers long; its recipe splits the attention layers into two
+KV groups (`recipes/mamba2.py`).
+KV pages pad by their share of the conv planes, about 1.5% for Nemotron-3 Super
+and 1-2% for Qwen3.5.
 
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
