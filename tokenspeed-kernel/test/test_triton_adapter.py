@@ -77,7 +77,7 @@ class TestGluonAdapter(unittest.TestCase):
             adapter["triton"], modules["tokenspeed_kernel_npu._triton"].triton
         )
         path = (
-            ROOT / "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/gluon_gemv.py"
+            ROOT / "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/_gluon/gemv.py"
         )
         source = ast.parse(path.read_text())
         kernel = next(
