@@ -736,23 +736,6 @@ def _silu_and_mul_quantize_fp8_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-@register_kernel(
-    "quantization",
-    "silu_and_mul_fp8",
-    name="triton_silu_and_mul_quantize_fp8",
-    features={"dequant"},
-    solution="triton",
-    # SM100 and newer, as the per-token quantizer whose codes it writes.
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
-        vendors=frozenset({"nvidia"}),
-    ),
-    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
-    traits={
-        "intermediate_size_max": frozenset({_SILU_AND_MUL_FP8_MAX_INTERMEDIATE_SIZE}),
-    },
-    priority=Priority.PERFORMANT,
-)
 def triton_silu_and_mul_quantize_fp8(
     x: torch.Tensor,
     token_scales: torch.Tensor,
@@ -831,20 +814,6 @@ def triton_silu_and_mul_quantize_fp8(
     return codes, scales
 
 
-@register_kernel(
-    "quantization",
-    "rmsnorm_fp8",
-    name="triton_rmsnorm_quantize_fp8",
-    features={"input_scales", "residual", "round_residual_sum_bf16"},
-    solution="triton",
-    # SM100 and newer, as the per-token quantizer whose codes it writes.
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
-        vendors=frozenset({"nvidia"}),
-    ),
-    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
-    priority=Priority.PERFORMANT,
-)
 def triton_rmsnorm_quantize_fp8(
     x: torch.Tensor,
     weight: torch.Tensor,

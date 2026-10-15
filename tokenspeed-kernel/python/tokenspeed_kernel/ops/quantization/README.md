@@ -9,16 +9,14 @@ For a 2-D input, the row count is a selection trait (`m`), so a kernel can
 bound the rows it takes (`m_max`). On NVIDIA SM100 and newer, `token`
 quantization of up to 64 rows runs the one-launch Triton per-token quantizer.
 
-Two ops write that quantizer's codes and scales from the kernel that
+Two functions write that quantizer's codes and scales from the kernel that
 produces the activation, so no separate quantize launch follows:
-`rmsnorm_quantize_fp8` (`quantization.rmsnorm_fp8`), an RMSNorm that also
-quantizes its output, and `silu_and_mul_quantize_fp8`
-(`quantization.silu_and_mul_fp8`), the SwiGLU of an FP8 GEMM output run with
-unit scales, which applies the GEMM's per-token and per-channel scales first.
-Each option a call uses is a required feature (`residual`,
-`round_residual_sum_bf16`, `input_scales`; `dequant` for the SwiGLU), and the
-SwiGLU's widest half is a trait bound (`intermediate_size_max`). Both are
-Triton kernels for NVIDIA SM100 and newer.
+`rmsnorm_quantize_fp8`, an RMSNorm that also quantizes its output, and
+`silu_and_mul_quantize_fp8`, the SwiGLU of an FP8 GEMM output run with unit
+scales, which applies the GEMM's per-token and per-channel scales first. Each
+has a single Triton kernel, so they call it directly instead of selecting a
+registered kernel. The SwiGLU takes a half of at most 16,384 columns and
+raises `ValueError` above that.
 
 `granularity="block"` accepts positive two-dimensional block sizes and
 BF16, FP16, or FP32 inputs. The quantizer masks partial edge blocks, and the

@@ -34,12 +34,10 @@ from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
 from tokenspeed_kernel.ops.quantization import rmsnorm_quantize_fp8
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize_per_token
 from tokenspeed_kernel.platform import pdl_enabled
-from utils import kernel_supported
+from utils import is_nvidia
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not kernel_supported("triton_rmsnorm_quantize_fp8"),
-    reason="the FP8-output RMSNorm is registered for NVIDIA SM100 and newer",
+    not torch.cuda.is_available() or not is_nvidia(), reason="NVIDIA GPU test"
 )
 
 FP8 = torch.float8_e4m3fn

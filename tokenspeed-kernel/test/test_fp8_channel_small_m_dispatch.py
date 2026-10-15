@@ -25,8 +25,8 @@ per-token x per-channel FP8 rows, what it receives for ``quant="fp8"``
 without ``A_scales`` (FP8 codes and ``[M, 1]`` scales, from the Triton
 quantizer up to 64 rows and from TRT-LLM's token quantizer above, as
 ``quantize_fp8`` selects them by row count), and the scale layouts and tile
-constexprs the small-M wrapper launches with. Also where the ops that write
-that quantizer's codes from an RMSNorm or a SwiGLU are selected.
+constexprs the small-M wrapper launches with. Also how the functions that
+write that quantizer's codes from an RMSNorm or a SwiGLU launch their kernels.
 Kernel bodies and launches are recorders; the numerics run on the GPU
 (``test/nvidia/ops/gemm/test_fp8_channel_small_m.py``,
 ``test_fp8_unscaled_consumers.py`` and ``layernorm/test_rmsnorm_token_fp8.py``).
@@ -50,7 +50,7 @@ from tokenspeed_kernel.ops.quantization import (
 from tokenspeed_kernel.ops.quantization import triton as quant_triton
 from tokenspeed_kernel.platform import ArchVersion, Platform, pdl_enabled
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import NoKernelFoundError, SelectedKernel
+from tokenspeed_kernel.selection import SelectedKernel
 
 FP8 = torch.float8_e4m3fn
 SMALL_M = "triton_mm_fp8_channel_small_m"
@@ -431,28 +431,17 @@ def _fused_fp8_calls(enable_pdl):
     return norm, swiglu
 
 
-@pytest.mark.parametrize("major,minor", [(9, 0), (10, 0), (10, 3)])
 @pytest.mark.parametrize("enable_pdl", [False, True])
-def test_fused_fp8_quantizers_run_on_sm100_and_newer(
-    arch, monkeypatch, major, minor, enable_pdl
-):
-    """rmsnorm_quantize_fp8 and silu_and_mul_quantize_fp8 select their Triton
-    kernels on SM100 and newer: one launch each, one program per row, with the
-    caller's ``enable_pdl`` and every option the call uses. On SM90 selection
-    refuses both before any launch."""
-    arch(major, minor)
+def test_fused_fp8_quantizers_launch_as_asked(arch, monkeypatch, enable_pdl):
+    """rmsnorm_quantize_fp8 and silu_and_mul_quantize_fp8 launch their Triton
+    kernels once each, one program per row, with the caller's ``enable_pdl``
+    and every option the call uses."""
     launches = {"norm": _LaunchRecorder(), "swiglu": _LaunchRecorder()}
     monkeypatch.setattr(triton_layernorm, "_rmsnorm_kernel", launches["norm"])
     monkeypatch.setattr(
         quant_triton, "_silu_and_mul_quantize_fp8_kernel", launches["swiglu"]
     )
     norm, swiglu = _fused_fp8_calls(enable_pdl)
-    if major < 10:
-        for call in (norm, swiglu):
-            with pytest.raises(NoKernelFoundError):
-                call()
-        assert not launches["norm"].launches and not launches["swiglu"].launches
-        return
     out, residual_sum, codes, scales = norm()
     act_codes, act_scales = swiglu()
     (norm_launch,) = launches["norm"].launches
@@ -473,18 +462,17 @@ def test_fused_fp8_quantizers_run_on_sm100_and_newer(
 
 
 @pytest.mark.parametrize("intermediate_size", [16384, 16385])
-def test_silu_and_mul_fp8_width_limit_is_a_selection_trait(
+def test_silu_and_mul_fp8_refuses_a_half_wider_than_16384(
     arch, monkeypatch, intermediate_size
 ):
-    """One program holds a SwiGLU half of at most 16,384 columns. Wider, no
-    kernel is selected (NoKernelFoundError, before any launch), so a caller
-    can take another path."""
+    """One program holds a SwiGLU half of at most 16,384 columns. Wider, the
+    call raises ValueError before any launch."""
     recorder = _LaunchRecorder()
     monkeypatch.setattr(quant_triton, "_silu_and_mul_quantize_fp8_kernel", recorder)
     x = torch.empty(2, 2 * intermediate_size, dtype=torch.bfloat16)
     args = (x, torch.ones(2, 1), torch.ones(2 * intermediate_size, 1))
     if intermediate_size > 16384:
-        with pytest.raises(NoKernelFoundError):
+        with pytest.raises(ValueError, match="I=16385 exceeds"):
             silu_and_mul_quantize_fp8(*args, enable_pdl=False)
         assert not recorder.launches
     else:
