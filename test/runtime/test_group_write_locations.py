@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import os
 import sys
-import unittest
 from types import SimpleNamespace
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -40,8 +41,7 @@ FULL = "full_attention"
 SWA = "sliding_attention"
 
 
-class WindowWriteLocationsTest(unittest.TestCase):
-
+class TestWindowWriteLocationsTest:
     def test_window_writes_its_slots_from_its_start(self):
         # Pages [3, 5, 0] (P=4): windows inside, across, over the hole, past the table and at the int32 limit.
         tables = torch.tensor([3, 5, 0], dtype=torch.int32).expand(2, 5, 3).contiguous()
@@ -63,11 +63,11 @@ class WindowWriteLocationsTest(unittest.TestCase):
                     5,
                     n,
                 )
-                self.assertEqual(out[:, : 5 * n].tolist(), [slots, slots], (device, n))
-                self.assertTrue(bool((out[:, 5 * n :] == -7).all()), (device, n))
+                assert out[:, : 5 * n].tolist() == [slots, slots], (device, n)
+                assert bool((out[:, 5 * n :] == -7).all()), (device, n)
 
 
-class HoleOverflowRoutingTest(unittest.TestCase):
+class TestHoleOverflowRoutingTest:
     """Holes (page id <= 0) and positions past the table route to slot 0,
     the zero-initialized dummy page that never aliases a live request."""
 
@@ -80,11 +80,11 @@ class HoleOverflowRoutingTest(unittest.TestCase):
         decode_write_locations(
             tables, page_sizes, torch.tensor([2], dtype=torch.int32), out, 1, 1
         )
-        self.assertEqual(int(out[0, 0]), 0)
+        assert (int(out[0, 0])) == (0)
         decode_write_locations(
             tables, page_sizes, torch.tensor([5], dtype=torch.int32), out, 1, 1
         )
-        self.assertEqual(int(out[0, 0]), 14)
+        assert (int(out[0, 0])) == (14)
 
     def test_ragged_minus_one_entry_routes_to_slot_zero(self):
         # A raw -1 (ragged pad that never went through the fill) is a hole too.
@@ -94,7 +94,7 @@ class HoleOverflowRoutingTest(unittest.TestCase):
         decode_write_locations(
             tables, page_sizes, torch.tensor([4], dtype=torch.int32), out, 1, 1
         )
-        self.assertEqual(int(out[0, 0]), 0)
+        assert (int(out[0, 0])) == (0)
 
     def test_extend_span_crossing_hole_and_table_end(self):
         # P=2, width 2, pages [3, 0]: positions 2,3 hit the hole, 4.. overflow.
@@ -107,7 +107,7 @@ class HoleOverflowRoutingTest(unittest.TestCase):
         )
         # pos 1 -> page 3 slot 1 = 7; pos 2, 3 -> hole page 0 -> 0; pos 4 ->
         # page index 2 >= width -> 0.
-        self.assertEqual(locs[0].tolist(), [7, 0, 0, 0])
+        assert (locs[0].tolist()) == ([7, 0, 0, 0])
 
 
 class _StubLeaf(PagedAttentionBackend):
@@ -159,7 +159,7 @@ class _StubLeaf(PagedAttentionBackend):
         raise NotImplementedError
 
 
-class MtpReanchorTest(unittest.TestCase):
+class TestMtpReanchorTest:
     """Vanilla MTP re-anchors the draft rows to the committed frontier:
     ``update_draft_forward_metadata`` republishes the frontier into every
     leaf's seq-lens buffer, and the next recompute over the SAME stacks
@@ -202,19 +202,19 @@ class MtpReanchorTest(unittest.TestCase):
         frontier = torch.tensor([6, 9], dtype=torch.int32)
         router.update_draft_forward_metadata(frontier)
         for leaf in leaves.values():
-            self.assertEqual(leaf.seq_lens_buf[:2].tolist(), [6, 9])
+            assert (leaf.seq_lens_buf[:2].tolist()) == ([6, 9])
         # Recompute over the unchanged stacks: the decode window is now the
         # frontier's last position, not the pre-verify one.
         router.stacks.compute_decode_locations(2, frontier, 1)
         # FULL (P=4): pos 5 -> page 6 slot 1 = 25; pos 8 -> page 3 slot 0 = 12.
-        self.assertEqual(router.stacks.decode_locations(FULL, 2, 1).tolist(), [25, 12])
+        assert (router.stacks.decode_locations(FULL, 2, 1).tolist()) == ([25, 12])
         # SWA (P=2, raw grain 4 -> ratio 2): pos 5 -> kernel page 12 slot 1 =
         # 25; pos 8 -> kernel page 6 slot 0 = 12 (same slots: page-size
         # invariant math over aliasing tables).
-        self.assertEqual(router.stacks.decode_locations(SWA, 2, 1).tolist(), [25, 12])
+        assert (router.stacks.decode_locations(SWA, 2, 1).tolist()) == ([25, 12])
 
 
-class BaseWriteLocationsDefaultTest(unittest.TestCase):
+class TestBaseWriteLocationsDefaultTest:
     """A backend that owns no paged write locations must refuse the accessor
     loudly — there is no caller-supplied fallback vector anymore."""
 
@@ -227,11 +227,11 @@ class BaseWriteLocationsDefaultTest(unittest.TestCase):
             pass
 
         backend = _MinimalBackend.__new__(_MinimalBackend)  # skip __init__
-        with self.assertRaisesRegex(NotImplementedError, "write locations"):
+        with pytest.raises((NotImplementedError), match=("write locations")):
             backend.write_locations(
                 SimpleNamespace(group_id="full_attention"), ForwardMode.DECODE
             )
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

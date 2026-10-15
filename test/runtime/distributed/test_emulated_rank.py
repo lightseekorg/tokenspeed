@@ -163,7 +163,9 @@ def test_grammar_sync_is_sized_by_its_process_group():
 
 
 def _server_args(**overrides) -> ServerArgs:
-    platform = SimpleNamespace(is_amd=True, is_nvidia=False, is_hopper_plus=False)
+    platform = SimpleNamespace(
+        is_amd=True, is_nvidia=False, is_npu=False, is_hopper_plus=False
+    )
     with (
         mock.patch.object(
             server_args_module, "current_platform", return_value=platform

@@ -21,7 +21,7 @@ sudo apt-get install -y --no-install-recommends \
     ninja-build
 
 python3 -m pip install --disable-pip-version-check "uv==${UV_VERSION}"
-pip3 install pytest-timeout pytest-xdist pytest-reportlog
+pip3 install "pytest>=9" pytest-timeout pytest-xdist pytest-reportlog
 sudo "$(command -v uv)" pip install --system --break-system-packages --prerelease allow \
     --index-url "${ROCM_NIGHTLY_INDEX}" \
     "rocm[devel,libraries]==${ROCM_SDK_VERSION}" \

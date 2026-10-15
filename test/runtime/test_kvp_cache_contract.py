@@ -27,10 +27,10 @@ checks -- none of which needs a GPU or a second process.
 """
 
 import sys
-import unittest
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -90,26 +90,24 @@ def _contract(*, parents: int, packing: int, shard_count: int) -> CacheRuntimeCo
     )
 
 
-class RuntimeContractTest(unittest.TestCase):
-    def test_virtual_counts_scale_physical_pages_by_shard_count(self):
+class TestRuntimeContractTest:
+    def test_virtual_counts_scale_physical_pages_by_shard_count(self, subtests):
         for shard_count in (1, 2, 4, 8):
-            with self.subTest(shard_count=shard_count):
+            with subtests.test(shard_count=shard_count):
                 contract = _contract(parents=5, packing=3, shard_count=shard_count)
-                self.assertEqual(
-                    contract.virtual_block_counts,
-                    {"sharded": 1 + 5 * 3 * shard_count, "replicated": 1 + 5 * 3},
+                assert (contract.virtual_block_counts) == (
+                    {"sharded": 1 + 5 * 3 * shard_count, "replicated": 1 + 5 * 3}
                 )
-                self.assertEqual(
-                    contract.virtual_packing,
-                    {"sharded": 3 * shard_count, "replicated": 3},
+                assert (contract.virtual_packing) == (
+                    {"sharded": 3 * shard_count, "replicated": 3}
                 )
                 # Physical facts are untouched by the placement.
-                self.assertEqual(contract.group_page_counts["sharded"], 1 + 5 * 3)
-                self.assertEqual(contract.group_packing["sharded"], 3)
+                assert (contract.group_page_counts["sharded"]) == (1 + 5 * 3)
+                assert (contract.group_packing["sharded"]) == (3)
 
     def test_token_capacity_may_use_the_sharded_group_but_not_exceed_it(self):
         _contract(parents=4, packing=2, shard_count=4)  # 4 * 2 * 4 * 256 tokens fit.
-        with self.assertRaisesRegex(ValueError, "child-page capacity"):
+        with pytest.raises((ValueError), match=("child-page capacity")):
             CacheRuntimeContract(
                 prefix_granularity=256,
                 num_lcm_blocks=4,
@@ -122,7 +120,7 @@ class RuntimeContractTest(unittest.TestCase):
     def test_virtual_ids_must_fit_int32_even_when_local_storage_does(self):
         spec = _full_history_spec("sharded", shard_count=8)
         pages = (1 << 29) + 1  # local IDs fit; 8 owners overflow int32
-        with self.assertRaisesRegex(ValueError, "int32"):
+        with pytest.raises((ValueError), match=("int32")):
             CacheRuntimeContract(
                 prefix_granularity=256,
                 num_lcm_blocks=pages - 1,
@@ -132,16 +130,16 @@ class RuntimeContractTest(unittest.TestCase):
                 group_packing={"sharded": 1},
             )
 
-    def test_shard_count_must_be_a_positive_integer(self):
+    def test_shard_count_must_be_a_positive_integer(self, subtests):
         for value in (0, -1, 2.0, True):
-            with self.subTest(value=value), self.assertRaises(ValueError):
+            with subtests.test(value=value), pytest.raises((ValueError)):
                 _full_history_spec("g", shard_count=value)
 
 
-class LocalPagesTest(unittest.TestCase):
-    def test_owned_blocks_partition_every_non_null_virtual_block(self):
+class TestLocalPagesTest:
+    def test_owned_blocks_partition_every_non_null_virtual_block(self, subtests):
         for shard_count in (1, 2, 3, 4):
-            with self.subTest(shard_count=shard_count):
+            with subtests.test(shard_count=shard_count):
                 count = 1 + 6 * shard_count
                 virtual = list(range(count))
                 seen = []
@@ -153,54 +151,49 @@ class LocalPagesTest(unittest.TestCase):
                         virtual_block_count=count,
                     )
                     # Each rank owns exactly the local pages 1..6, in order.
-                    self.assertEqual(owned.tolist(), list(range(1, 7)))
+                    assert (owned.tolist()) == (list(range(1, 7)))
                     seen.extend(
                         block
                         for block in virtual
                         if block > 0 and (block - 1) % shard_count == rank
                     )
-                self.assertEqual(sorted(seen), virtual[1:])
+                assert (sorted(seen)) == (virtual[1:])
 
     def test_null_block_and_duplicates(self):
-        self.assertEqual(
+        assert (
             local_pages(
                 [0, 3, 3, 0, 1], shard_count=2, rank=0, virtual_block_count=9
-            ).tolist(),
-            [2, 2, 1],
-        )
-        self.assertEqual(
-            local_pages([0, 0], shard_count=1, rank=0, virtual_block_count=9).tolist(),
-            [],
-        )
+            ).tolist()
+        ) == ([2, 2, 1])
+        assert (
+            local_pages([0, 0], shard_count=1, rank=0, virtual_block_count=9).tolist()
+        ) == ([])
         # The scheduler's zero-copy export is a read-only int32 array.
         exported = np.asarray([0, 3, 3, 0, 1], dtype=np.int32)
         exported.setflags(write=False)
-        self.assertEqual(
-            local_pages(
-                exported, shard_count=2, rank=0, virtual_block_count=9
-            ).tolist(),
-            [2, 2, 1],
-        )
+        assert (
+            local_pages(exported, shard_count=2, rank=0, virtual_block_count=9).tolist()
+        ) == ([2, 2, 1])
 
     def test_owner_mask_pairs_owned_pages_with_their_input_positions(self):
         owned, local = owned_local_pages(
             [0, 3, 3, 0, 1, 4], shard_count=2, rank=0, virtual_block_count=9
         )
-        self.assertEqual(owned.tolist(), [False, True, True, False, True, False])
-        self.assertEqual(local.tolist(), [2, 2, 1])
+        assert (owned.tolist()) == ([False, True, True, False, True, False])
+        assert (local.tolist()) == ([2, 2, 1])
         owned, local = owned_local_pages(
             [], shard_count=2, rank=0, virtual_block_count=9
         )
-        self.assertEqual((owned.tolist(), local.tolist()), ([], []))
+        assert ((owned.tolist(), local.tolist())) == (([], []))
 
     def test_out_of_range_ids_and_ranks_are_rejected(self):
-        with self.assertRaises(IndexError):
+        with pytest.raises((IndexError)):
             local_pages([9], shard_count=2, rank=0, virtual_block_count=9)
-        with self.assertRaises(IndexError):
+        with pytest.raises((IndexError)):
             local_pages([-1], shard_count=2, rank=0, virtual_block_count=9)
-        with self.assertRaises(ValueError):
+        with pytest.raises((ValueError)):
             local_pages([1], shard_count=2, rank=2, virtual_block_count=9)
-        with self.assertRaises(ValueError):
+        with pytest.raises((ValueError)):
             local_pages([1], shard_count=0, rank=0, virtual_block_count=9)
 
     def test_by_group_reads_shard_count_and_bounds_from_the_contract(self):
@@ -211,44 +204,43 @@ class LocalPagesTest(unittest.TestCase):
             rank=1,
         )
         # Sharded: rank 1 owns virtual 2, 4, 6, 8 -> local 1, 2, 3, 4.
-        self.assertEqual(
-            {group: pages.tolist() for group, pages in translated.items()},
-            {"sharded": [1, 2, 4], "replicated": [1, 4]},
+        assert ({group: pages.tolist() for group, pages in translated.items()}) == (
+            {"sharded": [1, 2, 4], "replicated": [1, 4]}
         )
-        with self.assertRaises(IndexError):
+        with pytest.raises((IndexError)):
             local_pages_by_group({"replicated": [5]}, contract=contract, rank=0)
 
 
-class MappingTest(unittest.TestCase):
+class TestMappingTest:
     def test_kvp_subgroups_are_consecutive_within_attention_tp(self):
         for rank in range(8):
             mapping = AttentionLayerMapping(
                 rank=rank, world_size=8, tp_size=8, dp_size=1, kvp_size=4
             )
-            self.assertTrue(mapping.has_kvp)
-            self.assertEqual(mapping.kvp_rank, rank % 4)
-            self.assertEqual(mapping.kvp_replica_rank, rank // 4)
-            self.assertEqual(
-                mapping.kvp_group, tuple(range(rank - rank % 4, rank - rank % 4 + 4))
+            assert mapping.has_kvp
+            assert (mapping.kvp_rank) == (rank % 4)
+            assert (mapping.kvp_replica_rank) == (rank // 4)
+            assert (mapping.kvp_group) == (
+                tuple(range(rank - rank % 4, rank - rank % 4 + 4))
             )
         plain = AttentionLayerMapping(
             rank=3, world_size=8, tp_size=8, dp_size=1, kvp_size=1
         )
-        self.assertFalse(plain.has_kvp)
-        self.assertEqual(plain.kvp_group, (3,))
+        assert not (plain.has_kvp)
+        assert (plain.kvp_group) == ((3,))
 
     def test_kvp_must_divide_attention_tp(self):
-        with self.assertRaisesRegex(ValueError, "divisible"):
+        with pytest.raises((ValueError), match=("divisible")):
             AttentionLayerMapping(
                 rank=0, world_size=8, tp_size=8, dp_size=1, kvp_size=3
             )
-        with self.assertRaisesRegex(ValueError, "positive"):
+        with pytest.raises((ValueError), match=("positive")):
             AttentionLayerMapping(
                 rank=0, world_size=8, tp_size=8, dp_size=1, kvp_size=0
             )
 
 
-class ConfigurationTest(unittest.TestCase):
+class TestConfigurationTest:
     @staticmethod
     def _component(backend_name: str) -> SoftmaxAttnConfig:
         return SoftmaxAttnConfig(
@@ -278,7 +270,7 @@ class ConfigurationTest(unittest.TestCase):
         return AttnConfig(**fields)
 
     def test_kvp_requires_a_dcp_capable_backend(self):
-        with self.assertRaisesRegex(ValueError, "DSA, FlashMLA"):
+        with pytest.raises((ValueError), match=("DSA, FlashMLA")):
             self._config(components=(self._component("mha"),))
 
     def test_kvp_keeps_the_host_kvstore_but_refuses_l3(self):
@@ -293,12 +285,12 @@ class ConfigurationTest(unittest.TestCase):
         args.enable_prefix_caching = True
         args.kvstore_storage_backend = None
         args._handle_kvstore()
-        self.assertTrue(args.enable_kvstore, "KVStore is on by default")
+        assert args.enable_kvstore, "KVStore is on by default"
         args.validate_cache_options()
         args.kvstore_storage_backend = "mooncake"
-        with self.assertRaisesRegex(ValueError, "L3"):
+        with pytest.raises((ValueError), match=("L3")):
             args.validate_cache_options()
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

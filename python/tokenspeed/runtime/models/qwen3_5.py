@@ -28,6 +28,7 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
@@ -1035,7 +1036,12 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.mapping = mapping
         self.hidden_size = config.hidden_size
 
-        alt_stream = torch.cuda.Stream()
+        # The shared expert overlaps the routed experts on this stream. In a
+        # ROCm HIP graph, each cross-stream edge costs microseconds of queue
+        # signaling; at decode the join alone idles the GPU for about 15 us
+        # per MoE layer, longer than the shared expert takes, so it runs
+        # inline there.
+        alt_stream = None if current_platform().is_amd else torch.cuda.Stream()
 
         # Embedding layer
         self.embed_tokens = VocabParallelEmbedding(

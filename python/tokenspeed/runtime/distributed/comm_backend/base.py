@@ -76,6 +76,18 @@ class CommBackend(ABC):
 
         return prepare_projection_workspace(spec, self, scratch_pool)
 
+    def try_fused_dp_column_linear(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scales: torch.Tensor | None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+        workspace: "ProjectionWorkspace",
+    ) -> bool:
+        """Run fused DP column-linear, or leave out untouched and return False."""
+        return False
+
     def projection_all_gather(
         self,
         tensor: torch.Tensor,

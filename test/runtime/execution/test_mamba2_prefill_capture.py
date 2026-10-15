@@ -187,6 +187,10 @@ def test_retained_chunk_plans_cover_the_live_chunks_in_place():
     assert not backend.prefill_metadata_is_capture_ready
 
 
+@pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="attention.mamba2_chunk_scan supports NVIDIA GPUs only",
+)
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 def test_outer_graph_replays_mamba2_lengths_pages_and_states(batch_size):
     """Replay equals eager on the retained metadata, which equals plain eager.

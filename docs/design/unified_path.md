@@ -225,6 +225,33 @@ another projection reuses it. Final outputs belong to the caller and
 remain valid across later forwards. Graphs referencing a workspace are destroyed
 before it is released.
 
+An optional complete projection kernel follows the same ownership contract:
+the backend prepares its shared communication storage, each Linear supplies
+its own weights, and the caller owns the final output. Selection uses all
+physical subgroup counts so every peer takes the same collective path.
+`try_fused_dp_column_linear` returns true after writing the complete local output,
+or false without modifying it so the caller can use the ordinary projection
+operations.
+The fused column projection specializes its prepared state by TP size and padded
+channel widths; actual owner counts remain runtime data within warmed row buckets.
+Its peer-memory transport requires a node-local group. Cross-node groups retain
+the ordinary collectives. Fusion is enabled automatically for eligible TP2 and
+TP4 projections when the maximum physical owner count is at least 64.
+Batch-invariant collectives retain the ordinary path. Row buckets select the
+prepared kernel variant independently of that threshold. Buckets are 32, 64,
+then 128-row steps through 2048. Above 2048, each power-of-two range has eight
+equal intervals: 256-row steps through 4096, 512-row steps through 8192, and so
+on. This bounds padding overhead below 12.5% above 2048 and makes the number of
+prepared variants grow logarithmically. All owner boundaries remain aligned to
+the 128-row GEMM tile. Unequal owners still pad to the shared bucket.
+All variants up to the rounded workspace capacity compile and warm before use;
+actual owner counts remain runtime inputs, including during graph replay.
+Preparation allocates fused state only for TP sizes enabled in automatic dispatch
+and capacities that can reach their minimum row count. Direct kernel APIs may
+support additional TP sizes without allocating their state in ordinary serving.
+When column projection fusion cannot be prepared, the first rank in each subgroup
+logs the reason once during workspace preparation, outside the forward path.
+
 ### Padding contract
 
 `bs` is the request count being prepared (the padded graph batch under
@@ -397,7 +424,7 @@ A new backend implements `refresh_decode_metadata` and inherits both
 `block_decode_expansion`; extend it for extra persistent state) and
 capture; a new override must name its kernel-imposed asymmetry here. Leaf
 capture/refresh signatures are pinned by
-`test_unified_decode_path.py::LeafSignatureConformanceTest`.
+`test_unified_decode_path.py::TestLeafSignatureConformanceTest`.
 
 ### Graded CUDA-graph support
 

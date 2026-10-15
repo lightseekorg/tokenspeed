@@ -4,8 +4,8 @@ import importlib.util
 import os
 import pathlib
 import sys
-import unittest
 
+import pytest
 import torch
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -33,9 +33,9 @@ def _load_page_table_module():
     return module
 
 
-class PageTableConversionTest(unittest.TestCase):
+class TestPageTableConversionTest:
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         cls.module = _load_page_table_module()
 
     def test_build_prefill_slots_with_known_output_size_matches_masked_path(self):
@@ -55,9 +55,9 @@ class PageTableConversionTest(unittest.TestCase):
             num_tokens=5,
         )
 
-        self.assertEqual(actual.tolist(), [10, 11, 12, 16, 17])
-        self.assertTrue(torch.equal(actual, expected))
+        assert (actual.tolist()) == ([10, 11, 12, 16, 17])
+        assert torch.equal(actual, expected)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
