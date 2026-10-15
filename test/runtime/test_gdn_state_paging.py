@@ -631,12 +631,12 @@ class VerifyCommitGPUTest(unittest.TestCase):
 
         if not torch.cuda.is_available():
             self.skipTest("needs a CUDA device")
-        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-        from tokenspeed.runtime.layers.attention.backends.state import mamba
-
         from tokenspeed_kernel.ops.kvcache.triton import (
             _state_verify_commit_rows_kernel,
         )
+
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.layers.attention.backends.state import mamba
 
         width, capacity = 3, 4
         # Sorted layers select groups [1, 0, 1], exercising both reordering
