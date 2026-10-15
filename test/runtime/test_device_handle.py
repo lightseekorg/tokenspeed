@@ -46,6 +46,7 @@ import numpy as np
 import pytest
 import torch
 from tokenspeed_scheduler import PD
+from transformers import PretrainedConfig
 
 from tokenspeed.runtime.cache.transfer.ops import (
     HostTier,
@@ -55,7 +56,7 @@ from tokenspeed.runtime.cache.transfer.ops import (
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.engine import scheduler_utils as scheduler_utils_module
-from tokenspeed.runtime.execution.device import DeviceHandle
+from tokenspeed.runtime.execution.device import DeviceHandle, EncoderModelFacts
 from tokenspeed.runtime.execution.types import PlannedForward
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
@@ -751,6 +752,62 @@ def test_the_remote_decode_and_the_arming_ride_the_fifo():
 # ----------------------------------------------------------------------
 # EPD admission: encoder facts resolve past the gate, never before.
 # ----------------------------------------------------------------------
+
+
+class _DiscreteEncoderModel:
+    """A prefill model can declare discrete output without loading a vision tower."""
+
+    def __init__(self, output_width: int) -> None:
+        self.config = PretrainedConfig(hidden_size=64)
+        self.output_width = output_width
+
+    def get_encoder_output_spec(self) -> tuple[int, torch.dtype]:
+        return self.output_width, torch.int64
+
+
+class _VisionEncoderModel:
+    def __init__(self, vision_tower: torch.nn.Module) -> None:
+        self.config = PretrainedConfig(hidden_size=64)
+        self.vision_tower = vision_tower
+        self.num_deepstack_embeddings = 3
+
+
+def test_encoder_facts_preserve_discrete_output_spec_without_a_vision_tower():
+    facts = EncoderModelFacts.from_model(_DiscreteEncoderModel(8), device="cpu")
+
+    assert facts == EncoderModelFacts(
+        device="cpu", hidden=8, num_deepstack=0, dtype=torch.int64
+    )
+
+
+@pytest.mark.parametrize("output_width", [0, -1])
+def test_encoder_facts_reject_nonpositive_output_width(output_width):
+    with pytest.raises(ValueError, match="Encoder output width must be positive"):
+        EncoderModelFacts.from_model(_DiscreteEncoderModel(output_width), device="cpu")
+
+
+def test_encoder_facts_fall_back_to_vision_dtype():
+    class VisionTower(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.dtype = torch.bfloat16
+
+    facts = EncoderModelFacts.from_model(
+        _VisionEncoderModel(VisionTower()), device="cpu"
+    )
+
+    assert facts == EncoderModelFacts(
+        device="cpu", hidden=64, num_deepstack=3, dtype=torch.bfloat16
+    )
+
+
+def test_encoder_facts_fall_back_to_vision_parameter_dtype():
+    vision = torch.nn.Linear(2, 4, bias=False, device="cpu", dtype=torch.float32)
+    facts = EncoderModelFacts.from_model(_VisionEncoderModel(vision), device="cpu")
+
+    assert facts == EncoderModelFacts(
+        device="cpu", hidden=64, num_deepstack=3, dtype=torch.float32
+    )
 
 
 def test_text_only_pd_nodes_never_read_the_encoder_facts():

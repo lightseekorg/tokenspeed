@@ -27,7 +27,6 @@ server:
     --disable-prefill-graph
     --trust-remote-code
     --max-cudagraph-capture-size 32
-    --reasoning-parser deepseek_v31
     --host 127.0.0.1
     --port 8000
   ready:

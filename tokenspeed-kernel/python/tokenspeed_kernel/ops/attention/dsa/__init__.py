@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -44,6 +44,28 @@ MXFP8_ATTENTION_BLOCK_SCALE = MXFP8_BLOCK_SCALE
 def _attention_format_signature(**roles: torch.Tensor):
     return format_signature(
         **{role: dense_tensor_format(tensor.dtype) for role, tensor in roles.items()}
+    )
+
+
+def dsa_interleave_rope(
+    tensor: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    *,
+    rope_dim: int,
+) -> torch.Tensor:
+    """Apply the indexer's interleaved RoPE through its selected device kernel."""
+    kernel = select_kernel(
+        "attention",
+        "dsa_interleave_rope",
+        _attention_format_signature(tensor=tensor),
+        traits={"rope_dim": int(rope_dim)},
+    )
+    return kernel(
+        tensor=tensor,
+        positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        rope_dim=rope_dim,
     )
 
 
@@ -1217,6 +1239,9 @@ import tokenspeed_kernel.ops.attention.dsa.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsa.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsa.gluon  # noqa: E402,F401
 
+if current_platform().is_npu:
+    import tokenspeed_kernel.ops.attention.dsa.ascend  # noqa: E402,F401
+
 # isort: on
 
 __all__ = [
@@ -1224,6 +1249,7 @@ __all__ = [
     "INDEX_K_WORKSPACE_ROWS_FEATURE",
     "SLOT_ORDERS",
     "dsa_decode",
+    "dsa_interleave_rope",
     "dsa_prefill",
     "dsa_prefill_topk",
     "dsa_decode_topk",

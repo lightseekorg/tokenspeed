@@ -609,7 +609,10 @@ def advance_scheduler(scheduler, events: list) -> None:
     ec = ExecutionEvent()
     for event in events:
         ec.add_event(event)
-    scheduler.advance(ec)
+    # nanobind calls emit no Python-tracer or Kineto events, so without this
+    # annotation the C++ time is an unlabeled gap in the profiler timeline.
+    with torch.profiler.record_function("scheduler.advance"):
+        scheduler.advance(ec)
 
 
 def cache_event_to_payload(event) -> dict:

@@ -40,6 +40,8 @@ _BACKEND_REGISTRY: dict[str, type[SamplingBackend]] = {}
 def _get_default_backend_name() -> str:
     if current_platform().is_nvidia:
         return "flashinfer"
+    if current_platform().is_npu:
+        return "ascend_full"
     return "greedy"
 
 
@@ -72,10 +74,14 @@ def create_sampling_backend(
     from tokenspeed.runtime.sampling.backends import triton_full as _tf  # noqa: F401
 
     name = _resolve_backend_name(server_args)
+    if current_platform().is_npu and name == "ascend_full":
+        from tokenspeed.runtime.sampling.backends import (  # noqa: F401
+            ascend_full as _af,
+        )
+
     if name not in _BACKEND_REGISTRY:
         raise ValueError(
-            f"Unknown sampling backend: {name!r}. "
-            f"Available: {list(_BACKEND_REGISTRY)}"
+            f"Unknown sampling backend: {name!r}. Available: {list(_BACKEND_REGISTRY)}"
         )
     cls = _BACKEND_REGISTRY[name]
 

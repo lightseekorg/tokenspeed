@@ -77,7 +77,7 @@ REQUIREMENTS_DIR = ROOT / "requirements"
 THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
 BASE_VERSION = "0.1.4"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
-VALID_BACKENDS = {"cuda", "rocm"}
+VALID_BACKENDS = {"cuda", "rocm", "npu"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
 
 # CUDA kernels source and output directories
@@ -231,7 +231,7 @@ def _selected_backend() -> str:
 
     raise RuntimeError(
         "Unable to detect CUDA or ROCm for tokenspeed_kernel dependencies. "
-        f"Set {BACKEND_ENV}=cuda or {BACKEND_ENV}=rocm."
+        f"Set {BACKEND_ENV}=cuda, {BACKEND_ENV}=rocm, or {BACKEND_ENV}=npu."
     )
 
 

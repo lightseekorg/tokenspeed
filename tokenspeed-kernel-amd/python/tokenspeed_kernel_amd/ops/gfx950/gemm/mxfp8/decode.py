@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd.ops.gfx950.gemm.splitk import check_splitk_counters
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
@@ -46,7 +47,6 @@ SCALE_GROUP = gl.constexpr(MXFP8_SCALE_GROUP)
 _SUPPORTED_OUTPUT_DTYPES = {torch.float16, torch.bfloat16}
 
 _partial_cache: dict[tuple[int, int, int], torch.Tensor] = {}
-_counter_cache: dict[tuple[int, int, int], torch.Tensor] = {}
 
 
 def _mxfp8_decode_launch_metadata(grid, kernel, args):
@@ -539,35 +539,16 @@ def _get_partial_scratch(device: torch.device, numel: int) -> torch.Tensor:
     return cached
 
 
-def _get_splitk_counters(device: torch.device, num_tiles: int) -> torch.Tensor:
-    """Return stream-local zeroed per-tile arrival counters.
-
-    The last split of each tile resets its counter, so the buffer is zero
-    again whenever a launch completes and same-stream launches can share it.
-    """
-    if torch.cuda.is_current_stream_capturing():
-        # Keep captured launches on graph-private counters.
-        return torch.zeros((num_tiles,), dtype=torch.int32, device=device)
-    device_index = torch.cuda.current_device() if device.index is None else device.index
-    stream_id = torch.cuda.current_stream(device_index).cuda_stream
-    key = (device_index, stream_id, num_tiles)
-    counters = _counter_cache.get(key)
-    if counters is None:
-        counters = torch.zeros((num_tiles,), dtype=torch.int32, device=device)
-        _counter_cache[key] = counters
-    return counters
-
-
-def _launch(A, B, A_scales, B_scales, C, config):
+def _launch(A, B, A_scales, B_scales, C, config, counters):
     block_m, block_n, block_k, warps_m, warps_n, num_buffers, split_k, num_xcds = config
     M, K = A.shape
     N = B.shape[0]
     num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
     if split_k > 1:
+        check_splitk_counters(counters, num_tiles, A.device, "gfx950 MXFP8 decode GEMM")
         partial = _get_partial_scratch(
             A.device, num_tiles * split_k * block_m * block_n
         )
-        counters = _get_splitk_counters(A.device, num_tiles)
     else:
         partial = counters = C
     # Four-group scale words need 4-byte aligned rows and whole words per tile.
@@ -720,6 +701,14 @@ def _choose_config(M: int, N: int, K: int) -> _Config:
     return _heuristic_config(M, N, K, bucket)
 
 
+def gluon_mm_mxfp8_decode_num_counters_gfx950(m: int, n: int, k: int) -> int:
+    """Split-K arrival counters a decode MXFP8 launch needs; 0 without split-K."""
+    block_m, block_n, *_, split_k, _ = _choose_config(m, n, k)
+    if split_k == 1:
+        return 0
+    return triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
+
+
 def supports_gluon_mm_mxfp8_decode_gfx950(m: int, n: int, k: int) -> bool:
     """Whether the decode MXFP8 GEMM covers an ``[m, k] x [n, k]`` problem."""
     return (
@@ -752,6 +741,7 @@ def launch_gluon_mm_mxfp8_decode_gfx950(
     *,
     alpha: torch.Tensor | None,
     block_size: list[int],
+    counters: torch.Tensor,
     out: torch.Tensor | None,
 ) -> torch.Tensor:
     """Compute a decode-sized MXFP8 ``A @ B.T`` on gfx950.
@@ -766,6 +756,9 @@ def launch_gluon_mm_mxfp8_decode_gfx950(
         out_dtype: BF16 or FP16 output element type.
         alpha: Optional output multiplier applied after the GEMM.
         block_size: Logical scale block; must be ``[1, 32]``.
+        counters: Zeroed int32 split-K arrival counters, at least
+            ``gluon_mm_mxfp8_decode_num_counters_gfx950(M, N, K)`` of them;
+            the launch leaves them zeroed (see ``splitk.py``).
         out: Optional ``[M, N]`` output with unit inner stride.
 
     Returns:
@@ -818,13 +811,14 @@ def launch_gluon_mm_mxfp8_decode_gfx950(
                 "gfx950 MXFP8 decode out must have matching shape/device/dtype "
                 "and unit inner stride"
             )
-    _launch(A, B, A_scales, B_scales, output, _choose_config(M, N, K))
+    _launch(A, B, A_scales, B_scales, output, _choose_config(M, N, K), counters)
     if alpha is not None:
         output.mul_(alpha.to(device=output.device, dtype=output.dtype))
     return output
 
 
 __all__ = [
+    "gluon_mm_mxfp8_decode_num_counters_gfx950",
     "launch_gluon_mm_mxfp8_decode_gfx950",
     "supports_gluon_mm_mxfp8_decode_gfx950",
 ]

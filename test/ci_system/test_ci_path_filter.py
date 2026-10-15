@@ -58,7 +58,7 @@ def test_gb300_slurm_path_filter_ignores_other_vendor_workflows():
         f"{KERNEL}/ops/attention/mha/__init__.py",
         f"{KERNEL}/ops/attention/mha/triton.py",
         f"{KERNEL}/ops/attention/mha/_triton/decode.py",
-        f"{KERNEL}/ops/gemm/triton_gemv.py",
+        f"{KERNEL}/ops/gemm/triton.py",
         f"{KERNEL}/thirdparty/__init__.py",
         "python/tokenspeed/runtime/sampling/backends/flashinfer.py",
     ],

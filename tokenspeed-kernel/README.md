@@ -11,6 +11,19 @@ performant kernels for multi-silicon AI inference. It features:
 TokenSpeed-kernel is pip-installable on its own. Others can use it
 directly.
 
+## Ascend source installation
+
+Select the NPU dependency set explicitly when installing from source:
+
+```bash
+TOKENSPEED_KERNEL_BACKEND=npu pip install --no-build-isolation ./python
+```
+
+This installs the Python registry and Ascend Triton provider and skips CUDA
+compilation. Install a compatible Torch/TorchNPU stack first. The
+`tokenspeed-kernel-npu` package and its native operator dependencies are separate
+installations.
+
 ## Nightly installation
 
 CUDA 13 nightly wheels are published daily from `main` for Linux x86_64 and
@@ -119,6 +132,11 @@ All of them register through the same decorator, and the same selection
 logic scores them, so adding a backend is one new file in the right family
 folder.
 
+On Ascend, `_triton.py` supplies import-only `gluon.jit` decorators so shared
+registration modules do not require the GPU Gluon package. Calling or launching
+one of these kernels raises an error. Kernel capability declarations still
+exclude Ascend from GPU implementations; CUDA and ROCm use native Gluon.
+
 ### Weight preprocessing
 
 Some kernels need loaded weights converted into a representation suited to their
@@ -129,6 +147,17 @@ their storage layout, making that representation visible to kernel selection.
 At execution, the registry matches the prepared weights to kernels that support
 their layout alongside the operation's other requirements. This lets preparation
 and execution remain separate while different kernels can share prepared weights.
+
+### Kernel state and graph capture
+
+Some kernels keep device state that must start at zero and that every launch
+restores to zero, such as split-K arrival counters. Such kernels take the state
+as an argument and report how much they need; the registered op gets it from
+`tokenspeed_kernel.workspace.zeroed_state`. Eager launches share one buffer per
+stream. A graph captured inside `capture_session` gets buffers of its own,
+zeroed once after capture outside the graph and kept alive as long as the
+graph, so replays carry no zeroing node. The runtime opens a session around
+every graph it captures.
 
 ### Solution choices
 

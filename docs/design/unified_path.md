@@ -225,6 +225,33 @@ another projection reuses it. Final outputs belong to the caller and
 remain valid across later forwards. Graphs referencing a workspace are destroyed
 before it is released.
 
+An optional complete projection kernel follows the same ownership contract:
+the backend prepares its shared communication storage, each Linear supplies
+its own weights, and the caller owns the final output. Selection uses all
+physical subgroup counts so every peer takes the same collective path.
+`try_fused_dp_column_linear` returns true after writing the complete local output,
+or false without modifying it so the caller can use the ordinary projection
+operations.
+The fused column projection specializes its prepared state by TP size and padded
+channel widths; actual owner counts remain runtime data within warmed row buckets.
+Its peer-memory transport requires a node-local group. Cross-node groups retain
+the ordinary collectives. Fusion is enabled automatically for eligible TP2 and
+TP4 projections when the maximum physical owner count is at least 64.
+Batch-invariant collectives retain the ordinary path. Row buckets select the
+prepared kernel variant independently of that threshold. Buckets are 32, 64,
+then 128-row steps through 2048. Above 2048, each power-of-two range has eight
+equal intervals: 256-row steps through 4096, 512-row steps through 8192, and so
+on. This bounds padding overhead below 12.5% above 2048 and makes the number of
+prepared variants grow logarithmically. All owner boundaries remain aligned to
+the 128-row GEMM tile. Unequal owners still pad to the shared bucket.
+All variants up to the rounded workspace capacity compile and warm before use;
+actual owner counts remain runtime inputs, including during graph replay.
+Preparation allocates fused state only for TP sizes enabled in automatic dispatch
+and capacities that can reach their minimum row count. Direct kernel APIs may
+support additional TP sizes without allocating their state in ordinary serving.
+When column projection fusion cannot be prepared, the first rank in each subgroup
+logs the reason once during workspace preparation, outside the forward path.
+
 ### Padding contract
 
 `bs` is the request count being prepared (the padded graph batch under
@@ -725,6 +752,22 @@ pool-indexed sampling route serves them, which is exactly what the captured
 graph records. `SamplingBatchInfo.is_all_greedy` and the eager-only argmax
 branches were deleted. Equivalence (top_k=1 == argmax, ties excepted) is
 pinned by `test/runtime/sampling/test_greedy_route_equivalence.py`.
+
+Synthetic acceptance length shares executor scheduling, logit processing,
+persistent output buffers and downstream state updates with ordinary
+verification. Only the greedy sampler supports this benchmark mode. It runs
+its ordinary full-width verification kernel
+before overriding the result with a forced draft prefix and a target token
+at the selected cutoff. This retains verification cost in the benchmark;
+synchronization and downstream state updates consume only the final synthetic
+outputs. The override reuses the target argmax at the cutoff, without resampling
+or a second executor path. DP sampling and other sampling backends are rejected.
+The persistent length
+buffer is refreshed in `prepare_step` or `prepare_capture`, outside graph
+capture, using a private device generator. Preparation must remain
+asynchronous so it does not stall forward launches.
+The sampler precomputes the configured length's floor, fractional part and
+integer flag at initialization and reuses them for each buffer refresh.
 
 ### Non-speculative serving is the N == 1 case, not a second path
 

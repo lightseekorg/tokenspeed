@@ -1522,3 +1522,47 @@ def test_query_block_support_distinguishes_causal_fp8_from_other_masks() -> None
     assert not supports_mla_decode_query_blocks(**{**probe, "noncausal_block_size": 4})
     assert not supports_mla_decode_query_blocks(**{**probe, "sliding_window": True})
     assert not supports_mla_decode_query_blocks(**{**probe, "q_dtype": torch.bfloat16})
+
+
+@pytest.mark.parametrize("solution", [None, "triton"])
+def test_fp8_swa_latent_1024_with_strided_pages(solution):
+    torch.manual_seed(194)
+    lengths = [31, 32, 33, 512, 513, 514, 1050]
+    batch, heads, page_size, width = len(lengths), 8, 32, 1088
+    pages_per_request = math.ceil(max(lengths) / page_size)
+    pages = batch * pages_per_request
+    storage = (torch.randn(pages, page_size + 3, 1, width, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    cache = storage[:, :page_size]
+    table = torch.randperm(pages, device="cuda", dtype=torch.int32).view(
+        batch, pages_per_request
+    )
+    query = (torch.randn(batch, 1, heads, width, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    out, lse = mla_decode_with_kvcache(
+        q=query,
+        kv_cache=cache,
+        page_table=table,
+        cache_seqlens=torch.tensor(lengths, device="cuda", dtype=torch.int32),
+        max_seqlen_k=max(lengths),
+        qk_nope_head_dim=192,
+        kv_lora_rank=1024,
+        qk_rope_head_dim=64,
+        softmax_scale=256**-0.5,
+        window_left=512,
+        return_lse=True,
+        solution=solution,
+    )
+    for row, length in enumerate(lengths):
+        positions = torch.arange(max(0, length - 513), length, device="cuda")
+        keys = cache[
+            table[row, positions // page_size], positions % page_size, 0
+        ].float()
+        logits = query[row, 0].float() @ keys.T * (256**-0.5)
+        ref = logits.softmax(-1) @ keys[:, :1024]
+        torch.testing.assert_close(out[row, 0].float(), ref, atol=0.01, rtol=0.01)
+        torch.testing.assert_close(
+            lse[row, 0], logits.logsumexp(-1), atol=1e-4, rtol=1e-4
+        )

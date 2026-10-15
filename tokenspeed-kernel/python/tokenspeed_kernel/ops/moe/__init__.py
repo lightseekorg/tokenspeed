@@ -821,6 +821,9 @@ def _moe_sigmoid_bias_topk(
 
 logger = logging.getLogger(__name__)
 
+if current_platform().is_npu:
+    import tokenspeed_kernel.ops.moe.ascend  # noqa: F401
+
 
 def _assert_indices_in_range(
     indices: torch.Tensor,

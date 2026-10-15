@@ -24,6 +24,8 @@ from tokenspeed.runtime.layers.moe.weights.fp8 import create_fp8_block_scale_inv
 from tokenspeed.runtime.layers.moe.weights.fp8_channel import (
     create_fp8_channel_weight_pair,
 )
+from tokenspeed.runtime.layers.moe.weights.int4 import create_int4_weight_pair
+from tokenspeed.runtime.layers.moe.weights.int8 import create_int8_weight_pair
 from tokenspeed.runtime.layers.moe.weights.mxfp4 import (
     create_mxfp4_fp8_input_scales,
     create_mxfp4_weight_pair,
@@ -73,6 +75,41 @@ def create_layer_weights(
 
     if quant_kind == "fp8_channel":
         create_fp8_channel_weight_pair(spec, layer)
+        return
+
+    if quant_kind == "int4":
+        if with_bias:
+            raise ValueError("FlatQuant W4A4 does not support expert bias")
+        options = quant_config.config or {}
+        if options.get(
+            "moe_enable_smooth_quant", options.get("enable_smooth_quant", False)
+        ):
+            raise ValueError(
+                "FlatQuant W4A4 cannot silently reuse SmoothQuant settings"
+            )
+        scheme = quant_config.target_scheme_map.get(
+            "Moe", quant_config.target_scheme_map.get("Linear")
+        )
+        create_int4_weight_pair(
+            spec,
+            layer,
+            transposed=options.get("w4a4_gmm_is_transposed", False),
+            scale_strategy=scheme["weights"].strategy,
+        )
+        return
+
+    if quant_kind == "int8":
+        int8_config = getattr(quant_config, "config", None) or {}
+        create_int8_weight_pair(
+            spec,
+            layer,
+            smooth_quant=bool(
+                int8_config.get(
+                    "moe_enable_smooth_quant",
+                    int8_config.get("enable_smooth_quant", False),
+                )
+            ),
+        )
         return
 
     if quant_kind == "nvfp4":

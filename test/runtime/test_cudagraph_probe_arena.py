@@ -83,12 +83,19 @@ def _deepseek_v41_recipe():
     return _recipe("cpu")
 
 
+def _dots3_note_recipe():
+    from test.runtime.test_dots3_note_cache import _recipe
+
+    return _recipe(draft_layers=1, pd=True)
+
+
 # The families whose per-group demand sizes their own parents.
 _RECIPES = {
     "kimi_k3": _kimi_k3_recipe,
     "glm53_flash": _glm53_flash_recipe,
     "deepseek_v4": _deepseek_v4_recipe,
     "deepseek_v41": _deepseek_v41_recipe,
+    "dots3_note": _dots3_note_recipe,
 }
 _NO_FIXTURE = {
     "mha",

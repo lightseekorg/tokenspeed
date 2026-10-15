@@ -61,6 +61,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     state_verify_commit_rows,
     store_state_rows,
 )
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,
@@ -1445,11 +1446,11 @@ class MambaAttnBackend(AttentionBackend):
         if fused_out is not None:
             return fused_out
 
-        # A family whose model hands over projection views makes them dense here.
-        mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
-        # Stride-aware fused decoders consume packed projection views directly.
-        # Preserve the shared fallback's established compact input layout.
+        # Stride-aware decoders consume packed projection views directly.
+        # Otherwise a family whose model hands over projection views makes them
+        # dense here, and the shared fallback keeps its compact input layout.
         if not self._decode_packed_qkv_views:
+            mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
             mixed_qkv = mixed_qkv.contiguous()
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
@@ -1720,7 +1721,7 @@ class MambaAttnBackend(AttentionBackend):
             )
             if fused_out is not None:
                 return fused_out
-            if self.tree_verify is None:
+            if self.tree_verify is None and not self._verify_packed_qkv_views:
                 # A chain verifies through the dense MTP kernels (FlashInfer's).
                 mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
             # Read the committed window and write per-position states into the
@@ -1836,6 +1837,11 @@ class MambaAttnBackend(AttentionBackend):
                 head_v=head_v_dim,
             )
         else:
+            valid_tokens = (
+                query_start_loc[-1:]
+                if current_platform().is_hopper and not is_target_verify
+                else None
+            )
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 num_q_heads=num_heads,
@@ -1845,6 +1851,7 @@ class MambaAttnBackend(AttentionBackend):
                 head_k=head_k_dim,
                 head_v=head_v_dim,
                 replay=replay_inputs,
+                valid_tokens=valid_tokens,
             )
 
         if is_target_verify:
