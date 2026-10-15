@@ -27,8 +27,11 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_drain_subgroup_vmem,
     _iris_heap_base,
     _iris_sync_rank_token,
+    iris_arch_config,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
+    k3_kernels_supported,
+)
 
 ATTNRES_WORLD_SIZE = 8
 ATTNRES_HIDDEN_SIZE = 7168
@@ -52,7 +55,7 @@ def attnres_supported(
     rows = partial.shape[0] if partial.ndim == 2 else 0
     hidden = ATTNRES_HIDDEN_SIZE
     return (
-        current_platform().is_cdna4
+        k3_kernels_supported()
         and world_size == ATTNRES_WORLD_SIZE
         and partial.is_cuda
         and 0 < rows <= ATTNRES_MAX_ROWS
@@ -132,6 +135,7 @@ class IrisAttnResState:
 
         hidden = torch.empty_like(partial)
         residual_out = torch.empty_like(residual)
+        arch = iris_arch_config()
         iris_k3attn_push_oneshot[(num_tokens,)](
             partial,
             residual,
@@ -156,7 +160,9 @@ class IrisAttnResState:
             EPS=eps,
             ELEMENTS_PER_THREAD=_ELEMENTS_PER_THREAD,
             NUM_WARPS=_NUM_SUBGROUPS,
-            SUBGROUP_SIZE=64,
+            SUBGROUP_SIZE=arch.subgroup_size,
+            SPLIT_WAIT_COUNTERS=arch.split_wait_counters,
+            REMOTE_STORE_CACHE=arch.remote_store_cache,
             num_warps=_NUM_SUBGROUPS,
         )
         return hidden, residual_out
@@ -277,6 +283,8 @@ def iris_k3attn_push_oneshot(
     ELEMENTS_PER_THREAD: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     SUBGROUP_SIZE: gl.constexpr,
+    SPLIT_WAIT_COUNTERS: gl.constexpr,
+    REMOTE_STORE_CACHE: gl.constexpr,
 ):
     """Push K3 attn rows into two alternating inboxes and reduce in rank order.
 
@@ -330,9 +338,9 @@ def iris_k3attn_push_oneshot(
             destination_inbox + inbox_slot_offset + RANK * MAX_ELEMENTS,
             row_offsets,
             mask=mask,
-            cache=".wt",
+            cache=REMOTE_STORE_CACHE,
         )
-    _iris_drain_subgroup_vmem()
+    _iris_drain_subgroup_vmem(SPLIT_WAIT_COUNTERS)
     # Join subgroup-local drains before publishing the generation to peers.
     gl.barrier()
 
@@ -353,6 +361,7 @@ def iris_k3attn_push_oneshot(
         WORLD_SIZE,
         NUM_WARPS,
         SUBGROUP_SIZE,
+        SPLIT_WAIT_COUNTERS,
     )
     local_inbox = inbox_sym_ptr + inbox_slot_offset
 

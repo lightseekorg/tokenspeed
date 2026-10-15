@@ -55,6 +55,78 @@ def _load_candidate(
 
 
 @gluon.jit
+def _attn_res_mix_gfx1250(
+    prefix,
+    block_residual,
+    res_weight,
+    score_rms_weight,
+    output_rms_weight,
+    token,
+    hidden,
+    hidden_mask,
+    stride_block_t: gl.constexpr,
+    stride_block_n: tl.int64,
+    H: gl.constexpr,
+    N: gl.constexpr,
+    SCORE_EPS: gl.constexpr,
+    OUTPUT_EPS: gl.constexpr,
+):
+    """Mix snapshots then the prefix, and normalize, keeping the BF16 boundary."""
+    prefix = prefix.to(gl.float32)
+    if N == 1:
+        mixed = prefix
+    else:
+        scorer = cdna5.buffer_load(
+            res_weight,
+            hidden.to(gl.int32),
+            mask=hidden_mask,
+            other=0.0,
+        ).to(gl.float32)
+        scorer *= cdna5.buffer_load(
+            score_rms_weight,
+            hidden.to(gl.int32),
+            mask=hidden_mask,
+            other=0.0,
+        ).to(gl.float32)
+        max_logit = -float("inf")
+        denominator = 0.0
+        mixed = gl.zeros_like(prefix)
+        for candidate in gl.static_range(N):
+            value = _load_candidate(
+                prefix,
+                block_residual,
+                token,
+                hidden,
+                hidden_mask,
+                stride_block_t,
+                stride_block_n,
+                candidate,
+                N,
+            )
+            square_sum = gl.sum(value * value, axis=0)
+            dot = gl.sum(value * scorer, axis=0)
+            score = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
+            next_max = gl.maximum(max_logit, score)
+            old_scale = gl.exp(max_logit - next_max)
+            candidate_scale = gl.exp(score - next_max)
+            denominator = denominator * old_scale + candidate_scale
+            mixed = mixed * old_scale + candidate_scale * value
+            max_logit = next_max
+        mixed /= denominator
+
+    # Preserve the AttnRes BF16 boundary before output RMSNorm.
+    mixed = mixed.to(gl.bfloat16).to(gl.float32)
+    inverse_rms = gl.rsqrt(gl.sum(mixed * mixed, axis=0) / H + OUTPUT_EPS)
+    output_weight = cdna5.buffer_load(
+        output_rms_weight,
+        hidden.to(gl.int32),
+        mask=hidden_mask,
+        other=0.0,
+    ).to(gl.float32)
+    return (mixed * inverse_rms * output_weight).to(gl.bfloat16)
+
+
+@gluon.jit
 def gluon_attn_res_fwd_gfx1250(
     layer_residual,
     delta,
@@ -113,58 +185,24 @@ def gluon_attn_res_fwd_gfx1250(
             mask=hidden_mask,
         )
 
-    if N == 1:
-        mixed = prefix
-    else:
-        scorer = cdna5.buffer_load(
-            res_weight,
-            hidden.to(gl.int32),
-            mask=hidden_mask,
-            other=0.0,
-        ).to(gl.float32)
-        scorer *= cdna5.buffer_load(
-            score_rms_weight,
-            hidden.to(gl.int32),
-            mask=hidden_mask,
-            other=0.0,
-        ).to(gl.float32)
-        max_logit = -float("inf")
-        denominator = 0.0
-        mixed = gl.zeros([_BLOCK_H], gl.float32, hidden_layout)
-        for candidate in gl.static_range(N):
-            value = _load_candidate(
-                prefix,
-                block_residual,
-                token,
-                hidden,
-                hidden_mask,
-                stride_block_t,
-                stride_block_n,
-                candidate,
-                N,
-            )
-            square_sum = gl.sum(value * value, axis=0)
-            dot = gl.sum(value * scorer, axis=0)
-            score = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
-            next_max = gl.maximum(max_logit, score)
-            old_scale = gl.exp(max_logit - next_max)
-            candidate_scale = gl.exp(score - next_max)
-            denominator = denominator * old_scale + candidate_scale
-            mixed = mixed * old_scale + candidate_scale * value
-            max_logit = next_max
-        mixed /= denominator
-
-    # Preserve the AttnRes BF16 boundary before output RMSNorm.
-    mixed = mixed.to(gl.bfloat16).to(gl.float32)
-    inverse_rms = gl.rsqrt(gl.sum(mixed * mixed, axis=0) / H + OUTPUT_EPS)
-    output_weight = cdna5.buffer_load(
+    mixed = _attn_res_mix_gfx1250(
+        prefix,
+        block_residual,
+        res_weight,
+        score_rms_weight,
         output_rms_weight,
-        hidden.to(gl.int32),
-        mask=hidden_mask,
-        other=0.0,
-    ).to(gl.float32)
+        token,
+        hidden,
+        hidden_mask,
+        stride_block_t,
+        stride_block_n,
+        H,
+        N,
+        SCORE_EPS,
+        OUTPUT_EPS,
+    )
     cdna5.buffer_store(
-        (mixed * inverse_rms * output_weight).to(output.dtype.element_ty),
+        mixed.to(output.dtype.element_ty),
         output,
         (token * stride_output_t + hidden).to(gl.int32),
         mask=hidden_mask,

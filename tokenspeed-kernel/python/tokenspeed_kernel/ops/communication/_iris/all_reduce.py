@@ -20,6 +20,8 @@
 
 """Iris all-reduce protocols and the synchronization used by its fusions."""
 
+import dataclasses
+import functools
 import math
 
 import torch
@@ -35,10 +37,69 @@ from tokenspeed_kernel.ops.communication.iris import (
 )
 from tokenspeed_kernel.platform import current_platform
 
-_SUBGROUP_SIZE = 64
 _PULL_MAX_PROGRAMS = 84
 _PULL_WORDS_PER_LANE = 2
 _TWO_SHOT_NUM_SUBGROUPS = 8
+
+
+@dataclasses.dataclass(frozen=True)
+class IrisArchConfig:
+    """Per-architecture code generation for the generic Iris protocols.
+
+    Attributes:
+        subgroup_size: Lanes per subgroup the Gluon layouts are built for.
+        split_wait_counters: Drain loads and stores with separate counters
+            (gfx12+) instead of the combined ``vmcnt``.
+        peer_load_cache: Cache modifier for loads of peer symmetric memory;
+            empty selects the default.
+        remote_store_cache: Cache modifier for stores into peer symmetric
+            memory; empty selects the default.
+    """
+
+    subgroup_size: int
+    split_wait_counters: bool
+    peer_load_cache: str
+    remote_store_cache: str
+
+    @property
+    def constexprs(self) -> dict:
+        """Keyword arguments for kernels that take every field."""
+        return {
+            "SUBGROUP_SIZE": self.subgroup_size,
+            "SPLIT_WAIT_COUNTERS": self.split_wait_counters,
+            "PEER_LOAD_CACHE": self.peer_load_cache,
+            "REMOTE_STORE_CACHE": self.remote_store_cache,
+        }
+
+
+_ARCH_CONFIGS = {
+    "gfx950": IrisArchConfig(
+        subgroup_size=64,
+        split_wait_counters=False,
+        peer_load_cache=".cg",
+        remote_store_cache=".wt",
+    ),
+    # On gfx1250 a ".cg" load lowers to a non-temporal load that refetches every
+    # partially read sector over the fabric, and ".wt" peer stores are an order
+    # of magnitude slower than plain ones.
+    "gfx1250": IrisArchConfig(
+        subgroup_size=32,
+        split_wait_counters=True,
+        peer_load_cache="",
+        remote_store_cache="",
+    ),
+}
+
+
+def iris_arch_name() -> str:
+    """Name the ``_ARCH_CONFIGS`` entry for this device; others keep gfx950's."""
+    return "gfx1250" if current_platform().is_cdna5 else "gfx950"
+
+
+@functools.cache
+def iris_arch_config(arch: str | None = None) -> IrisArchConfig:
+    """Return the configuration for ``arch``, or for the current device."""
+    return _ARCH_CONFIGS[arch or iris_arch_name()]
 
 
 def _pull_scratch_numel(max_numel: int, world_size: int) -> int:
@@ -146,6 +207,7 @@ class StagedPullOneShot:
             BLOCK_SIZE=self.block_size,
             SLOT_STRIDE=self.slots.shape[1],
             NUM_SLOTS=self.slots.shape[0],
+            PEER_LOAD_CACHE=iris_arch_config().peer_load_cache,
             num_warps=self.num_subgroups,
         )
 
@@ -159,11 +221,12 @@ def _launch_pull_twoshot(
     *,
     exit_barrier: bool,
 ) -> None:
+    arch = iris_arch_config()
     elements_per_word = _PACKED_WORD_BYTES // inputs.element_size()
     partition_words = out.numel() // peers.world_size // elements_per_word
     block_words = (
         _TWO_SHOT_NUM_SUBGROUPS
-        * _SUBGROUP_SIZE
+        * arch.subgroup_size
         * _PULL_WORDS_PER_LANE
         // peers.world_size
     )
@@ -182,11 +245,13 @@ def _launch_pull_twoshot(
         NUM_PROGRAMS=num_programs,
         NUM_TILES=num_tiles,
         NUM_WARPS=_TWO_SHOT_NUM_SUBGROUPS,
-        SUBGROUP_SIZE=_SUBGROUP_SIZE,
+        SUBGROUP_SIZE=arch.subgroup_size,
         WORDS_PER_LANE=_PULL_WORDS_PER_LANE,
         ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
         ELEMENTS_PER_WORD=elements_per_word,
         EXIT_BARRIER=exit_barrier,
+        PEER_LOAD_CACHE=arch.peer_load_cache,
+        REMOTE_STORE_CACHE=arch.remote_store_cache,
         num_warps=_TWO_SHOT_NUM_SUBGROUPS,
     )
 
@@ -288,6 +353,7 @@ class ProducerPull:
                 peers, inputs, self.scratch, self.ready_flags, out, exit_barrier=False
             )
             return
+        arch = iris_arch_config()
         num_tiles = triton.cdiv(out.numel(), self.BLOCK_SIZE)
         num_programs = min(num_tiles, _PULL_MAX_PROGRAMS)
         iris_pull_oneshot[(num_programs,)](
@@ -302,11 +368,13 @@ class ProducerPull:
             NUM_PROGRAMS=num_programs,
             NUM_TILES=num_tiles,
             NUM_WARPS=self.NUM_SUBGROUPS,
-            SUBGROUP_SIZE=_SUBGROUP_SIZE,
+            SUBGROUP_SIZE=arch.subgroup_size,
             WORDS_PER_LANE=_PULL_WORDS_PER_LANE,
             PUBLISH_READY=False,
             ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
             ELEMENTS_PER_WORD=_PACKED_WORD_BYTES // inputs.element_size(),
+            PEER_LOAD_CACHE=arch.peer_load_cache,
+            REMOTE_STORE_CACHE=arch.remote_store_cache,
             num_warps=self.NUM_SUBGROUPS,
         )
 
@@ -418,9 +486,13 @@ def all_reduce_heap_bytes(
 
 
 @gluon.jit
-def _iris_drain_subgroup_vmem():
+def _iris_drain_subgroup_vmem(SPLIT_WAIT_COUNTERS: gl.constexpr):
+    if SPLIT_WAIT_COUNTERS:
+        wait: gl.constexpr = "s_wait_loadcnt 0x0\n\ts_wait_storecnt 0x0"
+    else:
+        wait: gl.constexpr = "s_waitcnt vmcnt(0)"
     gl.inline_asm_elementwise(
-        "s_waitcnt vmcnt(0)",
+        wait,
         "=r,~{memory}",
         [],
         dtype=gl.int32,
@@ -442,6 +514,7 @@ def iris_pull_oneshot_staged(
     BLOCK_SIZE: tl.constexpr,
     SLOT_STRIDE: tl.constexpr,
     NUM_SLOTS: tl.constexpr,
+    PEER_LOAD_CACHE: tl.constexpr,
 ):
     """One-shot all-reduce over rotating staging slots.
 
@@ -501,7 +574,7 @@ def iris_pull_oneshot_staged(
                 heap_bases,
                 mask=mask,
                 other=0.0,
-                cache_modifier=".cg",
+                cache_modifier=PEER_LOAD_CACHE,
                 hint=BLOCK_SIZE,
             ).to(tl.float32)
     tl.store(output_ptr + offsets, acc.to(output_ptr.type.element_ty), mask=mask)
@@ -703,6 +776,7 @@ def _iris_sync_rank_token(
     WORLD_SIZE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     SUBGROUP_SIZE: gl.constexpr,
+    SPLIT_WAIT_COUNTERS: gl.constexpr,
 ):
     layout: gl.constexpr = gl.BlockedLayout([1], [SUBGROUP_SIZE], [NUM_WARPS], [0])
     peers = gl.arange(0, WORLD_SIZE, layout=layout)
@@ -749,7 +823,7 @@ def _iris_sync_rank_token(
         sem="acquire",
         scope="sys",
     )
-    _iris_drain_subgroup_vmem()
+    _iris_drain_subgroup_vmem(SPLIT_WAIT_COUNTERS)
     # The acquire is subgroup-local. Keep every subgroup at the protocol
     # boundary until all of them have observed the peer publications; the
     # caller consumes the peer inbox immediately after this helper returns.
@@ -775,6 +849,7 @@ def _iris_sync_rank_epoch(
     NUM_WARPS: gl.constexpr,
     SUBGROUP_SIZE: gl.constexpr,
     PUBLISH: gl.constexpr,
+    REMOTE_STORE_CACHE: gl.constexpr,
 ):
     """Synchronize by polling peer epochs or publishing them locally."""
     ready_layout: gl.constexpr = gl.BlockedLayout(
@@ -800,7 +875,7 @@ def _iris_sync_rank_epoch(
             remote_flags,
             epoch,
             mask=peer_mask,
-            cache_modifier=".wt",
+            cache_modifier=REMOTE_STORE_CACHE,
         )
         wait_flags = ready_flags + block_id * WORLD_SIZE + peer_ids
     else:
@@ -907,6 +982,8 @@ def iris_pull_oneshot(
     PUBLISH_READY: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
+    PEER_LOAD_CACHE: gl.constexpr,
+    REMOTE_STORE_CACHE: gl.constexpr,
 ):
     """Reduce producer outputs placed consecutively in symmetric memory."""
     block_id = gl.program_id(0)
@@ -941,6 +1018,7 @@ def iris_pull_oneshot(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=PUBLISH_READY,
+        REMOTE_STORE_CACHE=REMOTE_STORE_CACHE,
     )
 
     input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
@@ -983,7 +1061,7 @@ def iris_pull_oneshot(
                     packed_offset.to(gl.int32),
                     mask=mask,
                     other=0,
-                    cache=".cg",
+                    cache=PEER_LOAD_CACHE,
                 )
                 peer_0, peer_1, peer_2, peer_3 = _unpack_word(
                     peer_packed, ELEMENT_DTYPE, ELEMENTS_PER_WORD
@@ -1030,6 +1108,7 @@ def iris_pull_oneshot(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=PUBLISH_READY,
+        REMOTE_STORE_CACHE=REMOTE_STORE_CACHE,
     )
 
 
@@ -1061,6 +1140,8 @@ def iris_pull_twoshot(
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
     EXIT_BARRIER: gl.constexpr,
+    PEER_LOAD_CACHE: gl.constexpr,
+    REMOTE_STORE_CACHE: gl.constexpr,
 ):
     """Reduce-scatter producer outputs, then all-gather the rank partitions."""
     block_id = gl.program_id(0)
@@ -1095,6 +1176,7 @@ def iris_pull_twoshot(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=True,
+        REMOTE_STORE_CACHE=REMOTE_STORE_CACHE,
     )
 
     input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
@@ -1151,7 +1233,7 @@ def iris_pull_twoshot(
             peer_inputs + gl.expand_dims(input_offset.to(gl.int32), 0),
             mask=gl.expand_dims(mask, 0),
             other=0,
-            cache_modifier=".cg",
+            cache_modifier=PEER_LOAD_CACHE,
         )
         peer_values.store(values)
 
@@ -1195,6 +1277,7 @@ def iris_pull_twoshot(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=True,
+        REMOTE_STORE_CACHE=REMOTE_STORE_CACHE,
     )
 
     # Gather one reduced partition from every rank into the local output.
@@ -1206,7 +1289,7 @@ def iris_pull_twoshot(
             peer_scratch + gl.expand_dims(partition_offset.to(gl.int32), 0),
             mask=gl.expand_dims(mask, 0),
             other=0,
-            cache_modifier=".cg",
+            cache_modifier=PEER_LOAD_CACHE,
         )
         output_offset = gl.expand_dims(peer_ids * PARTITION_WORDS, 1) + gl.expand_dims(
             partition_offset, 0
@@ -1245,6 +1328,7 @@ def iris_pull_twoshot(
             NUM_WARPS,
             SUBGROUP_SIZE,
             PUBLISH=True,
+            REMOTE_STORE_CACHE=REMOTE_STORE_CACHE,
         )
 
 
