@@ -1393,7 +1393,7 @@ def test_kda_fused_verify_and_replay_match_sequential_reference(
     replay_gate = torch.empty(rows, width, device="cuda", dtype=torch.bfloat16)
     replay_beta = torch.empty(rows, heads, device="cuda", dtype=torch.bfloat16)
 
-    output = try_kda_fused_paged_verify(
+    verify_args = (
         mixed_qkv,
         conv_weights,
         conv_pool,
@@ -1403,19 +1403,27 @@ def test_kda_fused_verify_and_replay_match_sequential_reference(
         beta_logits,
         a_log,
         dt_bias,
-        state_pool=state_pool,
-        state_scratch=None,
-        read_indices=read_indices,
-        write_indices=write_indices,
-        num_heads=heads,
-        head_dim=head_dim,
-        draft_token_num=draft,
-        lower_bound=LOWER_BOUND,
-        recurrent_layout="v_major",
-        store_states=False,
-        replay_mixed_qkv=replay_qkv,
-        replay_gate=replay_gate,
-        replay_beta=replay_beta,
+    )
+    verify_kwargs = {
+        "state_pool": state_pool,
+        "state_scratch": None,
+        "read_indices": read_indices,
+        "write_indices": write_indices,
+        "num_heads": heads,
+        "head_dim": head_dim,
+        "draft_token_num": draft,
+        "lower_bound": LOWER_BOUND,
+        "recurrent_layout": "v_major",
+        "store_states": False,
+        "replay_mixed_qkv": replay_qkv,
+        "replay_beta": replay_beta,
+    }
+    with pytest.raises(ValueError, match="replay_gate"):
+        try_kda_fused_paged_verify(
+            *verify_args, **verify_kwargs, replay_gate=torch.empty_like(f_a_out)
+        )
+    output = try_kda_fused_paged_verify(
+        *verify_args, **verify_kwargs, replay_gate=replay_gate
     )
     assert output is not None
     torch.testing.assert_close(conv_pool, initial_conv, atol=0, rtol=0)
