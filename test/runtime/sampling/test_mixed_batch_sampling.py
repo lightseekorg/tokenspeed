@@ -352,10 +352,6 @@ def test_explicit_top_k_one_pins_seed():
     assert stochastic.seed != 0 or stochastic.seed is None
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-q"]))
-
-
 @requires_cuda
 def test_mixed_round_takes_fused_argmax_ids():
     """When the logits processor already reduced the argmax (sharded logits
@@ -424,3 +420,7 @@ def test_mixed_round_takes_fused_argmax_ids():
     # Request 0 accepts its draft 7 and takes the bonus 8; request 1 takes 9.
     assert out_tokens[num_extends : num_extends + 3].tolist() == [7, 8, 9]
     assert out_accept.tolist() == [1, 1, 2, 1]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))
