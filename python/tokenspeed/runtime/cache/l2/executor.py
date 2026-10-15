@@ -134,9 +134,11 @@ class _Ack(NamedTuple):
 
 class _PrefetchJob:
     """One in-flight L3 prefetch on the lane: the op, its pages by prefix page,
-    and the future that resolves to the pages landed (a prefix length). A
-    failed future is reported once (``failure_logged``), not on every poll
-    until the replica converges."""
+    the absolute ``deadline`` counted from submission, and the future that
+    resolves to the pages landed (a prefix length). A queued job whose deadline
+    expires may be cancelled and reported as landing nothing. A failed future
+    is reported once (``failure_logged``), not on every poll until the replica
+    converges."""
 
     __slots__ = ("request_id", "num_pages", "future", "failure_logged", "deadline")
 
@@ -855,6 +857,10 @@ class HostCacheExecutor:
                 if time.monotonic() > job.deadline and job.future.cancel():
                     # Cancellation succeeds only before the worker starts;
                     # active I/O must retire before its Host pages can be reused.
+                    logger.warning(
+                        f"[L3] prefetch {op_id} ({job.request_id}) expired before "
+                        f"its worker started; landing 0/{job.num_pages} pages"
+                    )
                     progress[op_id] = (True, 0)
                     continue
                 progress[op_id] = (False, 0)
