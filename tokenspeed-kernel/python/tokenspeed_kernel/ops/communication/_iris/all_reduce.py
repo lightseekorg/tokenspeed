@@ -463,7 +463,15 @@ def iris_pull_oneshot_staged(
     blocks' counters where they were. That is consistent across ranks -- every
     rank launches the same grid for the same collective -- and blocks never read
     each other's slots, so they may sit on different slots at once.
+
+    Epochs are int32 and wrap after 2**31 calls per block. The slot index is
+    taken from the unsigned epoch, so with a power-of-two slot count the
+    rotation continues across the wrap, and the wait compares modulo 2**32,
+    so an epoch just past the wrap still counts as newer.
     """
+    # 2**32 must be a multiple of the slot count for the rotation to survive
+    # the wrap.
+    tl.static_assert(NUM_SLOTS & (NUM_SLOTS - 1) == 0)
     block_id = tl.program_id(0)
     offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < NUMEL
@@ -471,7 +479,7 @@ def iris_pull_oneshot_staged(
     flag_offset = block_id * WORLD_SIZE
     local_ready = ready_flags + flag_offset + RANK
     epoch = tl.load(local_ready).to(tl.int32) + 1
-    slot = (epoch % NUM_SLOTS) * SLOT_STRIDE
+    slot = (epoch.to(tl.uint32, bitcast=True) % NUM_SLOTS).to(tl.int32) * SLOT_STRIDE
 
     local = tl.load(input_ptr + offsets, mask=mask, other=0.0)
     tl.store(input_sym_ptr + slot + offsets, local, mask=mask, cache_modifier=".wt")
@@ -480,8 +488,10 @@ def iris_pull_oneshot_staged(
     tl.atomic_xchg(local_ready, epoch, sem="release", scope="sys")
     for peer in tl.static_range(0, WORLD_SIZE):
         if peer != RANK:
-            seen = tl.full((), 0, dtype=tl.int32)
-            while seen < epoch:
+            # Start one behind so the first poll always happens, then compare
+            # modulo 2**32: a peer may already have passed the wrap.
+            seen = epoch - 1
+            while (seen - epoch) < 0:
                 seen = iris.load(
                     ready_flags + flag_offset + peer,
                     RANK,

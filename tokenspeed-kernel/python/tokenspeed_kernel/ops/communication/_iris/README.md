@@ -10,7 +10,9 @@ same fixed heap; Iris's allocator enforces capacity.
 
 - **State:** the persistent buffers and references needed by an operation.
 - **Epoch:** a GPU counter that distinguishes successive uses of synchronization
-  flags, including graph replays.
+  flags, including graph replays. Epochs are 32-bit and wrap during long
+  serving runs: compare them modulo 2**32 (`(seen - epoch) < 0` as int32), and
+  derive slot indices from the unsigned value with a power-of-two slot count.
 - **Scratch:** reusable buffers holding intermediate computation results.
 - **Borrowed tensor:** a view, without a copy, into storage owned by the state.
   Another operation can overwrite its contents even while the view is alive.
