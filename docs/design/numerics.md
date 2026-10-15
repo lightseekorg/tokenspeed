@@ -91,18 +91,22 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 ├── sampling.deterministic          sampling_stream=per-request: sampled rows
 │                                   draw from the Gumbel-max pool kernels,
 │                                   whose stream is keyed by the request's
-│                                   seed (crc32(rid)) and position (its cache
-│                                   length) and nothing else, so it is run-
-│                                   and batch-invariant by construction.
+│                                   seed (explicit, else crc32(rid)) and the
+│                                   absolute target token position. Prefill
+│                                   adds its chunk length to the KV frontier;
+│                                   decode adds one. Neither chunk counts nor
+│                                   prefix hits enter the random key.
 │                                   flashinfer's *_sampling_from_probs
 │                                   kernels are NOT: they read one seed and
 │                                   offset for the whole batch and seed
 │                                   curand with the batch row, so a request's
 │                                   draw moves with its co-batch (T>0
 │                                   'packed' fails while 'rerun' passes).
-│                                   Verify keeps flashinfer's chain kernels,
-│                                   whose coins come from per-slot
-│                                   generators. Greedy rows additionally take
+│                                   N=1 verify uses the same pool sampler.
+│                                   Multi-token verify keeps flashinfer's
+│                                   per-slot coins; its cache/scheduling
+│                                   invariance is not established here.
+│                                   Greedy rows additionally take
 │                                   the canonical lowest-index argmax, in
 │                                   sampling and in speculative verify
 │                                   (exact-match chain), because EXACT logit
