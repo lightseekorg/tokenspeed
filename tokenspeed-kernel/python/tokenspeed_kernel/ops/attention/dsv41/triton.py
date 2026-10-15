@@ -717,7 +717,9 @@ def selected_attention(
             out,
         ),
     )
-    if attn_sink is not None and (attn_sink.shape != (q.shape[1],) or attn_sink.dtype != torch.float32):
+    if attn_sink is not None and (
+        attn_sink.shape != (q.shape[1],) or attn_sink.dtype != torch.float32
+    ):
         raise ValueError("attn_sink must be FP32 [heads]")
     segments = [(swa_cache, swa_slots, swa_lens, "swa")]
     if global_cache is None:
@@ -3593,7 +3595,9 @@ def _index_select_all(
 
 
 @triton.jit(do_not_specialize=["K", "S0", "S1", "LS"])
-def _compact_slots_kernel(Slots, Lengths, Out, Counts, K, S0, S1, LS, BLOCK: tl.constexpr):
+def _compact_slots_kernel(
+    Slots, Lengths, Out, Counts, K, S0, S1, LS, BLOCK: tl.constexpr
+):
     row = tl.program_id(0)
     i = tl.arange(0, BLOCK)
     length = tl.load(Lengths + row * LS)
@@ -4023,13 +4027,18 @@ def index_block_select(logits, visible, candidate_topk, block_out, block_lens):
     capability=_CAPABILITY,
     priority=Priority.PORTABLE,
 )
-
 def compact_slots(slots, lengths):
     out = torch.empty(slots.shape, dtype=slots.dtype, device=slots.device)
     counts = torch.empty(slots.shape[0], dtype=torch.int32, device=slots.device)
     if slots.shape[0]:
         _compact_slots_kernel[(slots.shape[0],)](
-            slots, lengths, out, counts, slots.shape[1], *slots.stride(),
-            lengths.stride(0), BLOCK=triton.next_power_of_2(max(1, slots.shape[1])),
+            slots,
+            lengths,
+            out,
+            counts,
+            slots.shape[1],
+            *slots.stride(),
+            lengths.stride(0),
+            BLOCK=triton.next_power_of_2(max(1, slots.shape[1])),
         )
     return out, counts

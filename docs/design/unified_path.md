@@ -1997,3 +1997,11 @@ released, and the client receives a `CapacityAbort` finish. The fixed hot
 partition is reused only after the new owner's PD initialization invalidates
 its metadata. No snapshot store, restore, recovery prefill, or extend staging
 is used by offloaded arenas.
+
+## DeepSeek V4.1 context parallelism
+
+V4.1 uses operator-local prefill query partitions and page-sharded global
+cache groups. Its eager and captured decode share metadata refresh and DCP
+partial-output reduction; SWA and compressor tails remain replicated. See
+[the V4.1 context-parallel contract](deepseek-v41-context-parallelism.md) for
+ownership, graph lifetime and supported configurations.

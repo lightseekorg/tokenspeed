@@ -478,7 +478,6 @@ def test_full_scan_is_bounded_by_table_and_physical_capacity():
                 meta.request_indices,
                 ForwardMode.DECODE,
                 None,
-                projected_partition=None,
             )
             assert topk.call_args.args[3].shape[1] == pool.index_k(layer).shape[0] - 1
 
@@ -761,7 +760,6 @@ def _decode_compute(backend, inputs, bs):
                     req[order],
                     mode,
                     None,
-                    projected_partition=None,
                 )
             )
     return outputs
@@ -967,7 +965,6 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool, verify_
             meta.request_indices,
             ForwardMode.DECODE,
             None,
-            projected_partition=None,
         )
         assert slots.shape == (0, backend.spec.index_topk) and lens.shape == (0,)
     torch.cuda.synchronize()
@@ -1709,7 +1706,6 @@ def test_gpu_quantized_joint_attention_and_reindex_reuse():
         requests,
         ForwardMode.EXTEND,
         None,
-        projected_partition=None,
     )
     want = backend.global_read_slots(
         20, record.logical_rows[pick], positions, requests, ForwardMode.EXTEND
@@ -1724,7 +1720,6 @@ def test_gpu_quantized_joint_attention_and_reindex_reuse():
             requests,
             ForwardMode.EXTEND,
             None,
-            projected_partition=None,
         )
         assert backend.sparse_topk.prefill.candidates is candidates
         assert (lengths > 0).all() and (slots[:, 0] >= 0).all()
@@ -2984,11 +2979,12 @@ def test_indexer_projection_plan_preserves_execution_boundaries(
 
 
 @pytest.mark.parametrize("projected", [False, True])
-def test_projected_indexer_queries_are_not_sliced_twice(projected):
+@pytest.mark.parametrize("deferred", [False, True])
+def test_projected_indexer_queries_are_not_sliced_twice(projected, deferred):
     from tokenspeed.runtime.layers.attention.query_partition import InterleavedQueryPlan
 
     backend = _backend("cpu", 2)
-    _extend(backend, _tables("cpu"), [5, 4], [0, 0], [0, 0], [5, 4])
+    _extend(backend, _tables("cpu"), [5, 4], [20, 20], [0, 0], [25, 24])
     meta = backend.query_metadata(ForwardMode.EXTEND)
     plan = InterleavedQueryPlan(total_rows=9, rank=1, size=2)
     backend.spec = replace(
@@ -2998,8 +2994,19 @@ def test_projected_indexer_queries_are_not_sliced_twice(projected):
     weights = torch.ones(9, 2, dtype=torch.bfloat16)
     seen = []
 
+    if deferred:
+        q = dsv41.IndexQueryInput(
+            q, meta.positions, torch.zeros(25, 64), weight_scale=0.25
+        )
+
     def score(*args):
-        seen.extend(args[0][:, 0, 0].tolist())
+        query = args[0]
+        values = query.values if deferred else query
+        seen.extend(values[:, 0, 0].tolist())
+        if deferred:
+            expected_positions = meta.positions[values[:, 0, 0].long()]
+            torch.testing.assert_close(query.positions, expected_positions)
+            assert query.weight_scale == 0.25
         rows, lengths, _, _ = args[12]
         rows.fill_(0)
         lengths.fill_(1)

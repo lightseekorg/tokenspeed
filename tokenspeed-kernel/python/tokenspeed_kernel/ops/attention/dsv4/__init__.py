@@ -421,7 +421,11 @@ def dsv4_prefill(
     if lse is not None:
         if attn_sink is not None:
             raise ValueError("partial attention LSE requires no sink")
-        if lse.shape != q.shape[:2] or lse.dtype != torch.float32 or not lse.is_contiguous():
+        if (
+            lse.shape != q.shape[:2]
+            or lse.dtype != torch.float32
+            or not lse.is_contiguous()
+        ):
             raise ValueError("lse must be contiguous FP32 [tokens, heads]")
 
     signature = _attention_format_signature(q=q, kv=kv)

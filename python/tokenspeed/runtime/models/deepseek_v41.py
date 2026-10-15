@@ -1151,7 +1151,10 @@ class DeepseekV41Attention(nn.Module):
                             else None
                         )
                         index_x, index_input, index_scale, index_positions = (
-                            hidden_states, index_q_input, index_q_scale, positions
+                            hidden_states,
+                            index_q_input,
+                            index_q_scale,
+                            positions,
                         )
                         if partition is not None:
                             # Only indexer projections consume the local query rows.
@@ -1160,9 +1163,15 @@ class DeepseekV41Attention(nn.Module):
                                 for t in (hidden_states, index_q_input, positions)
                             )
                             if index_q_scale is not None:
-                                index_scale = index_q_scale[partition.local_slice].contiguous()
+                                index_scale = index_q_scale[
+                                    partition.local_slice
+                                ].contiguous()
                         index_q, index_weights = self.indexer(
-                            index_x, index_input, index_scale, index_positions, self.rotary_emb
+                            index_x,
+                            index_input,
+                            index_scale,
+                            index_positions,
+                            self.rotary_emb,
                         )
                     if mode.is_decode() or partition is not None:
                         prepared = backend.prepare_global_selection(

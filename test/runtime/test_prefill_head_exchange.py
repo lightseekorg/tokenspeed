@@ -19,11 +19,19 @@
 # SOFTWARE.
 
 
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
 from tokenspeed.runtime.execution.query_shard import scatter_count
 from tokenspeed.runtime.layers.attention import prefill_head_exchange as exchange
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
 @pytest.mark.parametrize("tokens", [1, 9, 1025])
@@ -136,3 +144,7 @@ def test_swa_and_global_thresholds(tokens, minimum, swa_minimum, has_global, exp
         )
         is expected
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

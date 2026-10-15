@@ -18,11 +18,19 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
 from tokenspeed.runtime.layers.attention import query_partition as implementation
 from tokenspeed.runtime.layers.attention.query_partition import InterleavedQueryPlan
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
 @pytest.mark.parametrize("total", [0, 1, 3, 9, 1025, 2051])
@@ -46,7 +54,9 @@ def test_request_spans_preserve_global_row_ownership(total, size):
 
 @pytest.mark.parametrize("total", [0, 1, 3, 9, 1025])
 @pytest.mark.parametrize("columns", [3, 512])
-def test_gather_restores_rows_and_lengths_including_empty_ranks(total, columns, monkeypatch):
+def test_gather_restores_rows_and_lengths_including_empty_ranks(
+    total, columns, monkeypatch
+):
     size = 8
     expected = torch.arange(total * columns, dtype=torch.int32).reshape(total, columns)
     lengths = torch.arange(total, dtype=torch.int32) % (columns + 1)
@@ -60,15 +70,19 @@ def test_gather_restores_rows_and_lengths_including_empty_ranks(total, columns, 
             assert group == tuple(range(size))
             assert backend is None
             assert value.shape[1] * value.element_size() % 16 == 0
-            torch.testing.assert_close(value[:plan.local_rows, :columns], expected[plan.local_slice])
-            torch.testing.assert_close(value[:plan.local_rows, columns], lengths[plan.local_slice])
+            torch.testing.assert_close(
+                value[: plan.local_rows, :columns], expected[plan.local_slice]
+            )
+            torch.testing.assert_close(
+                value[: plan.local_rows, columns], lengths[plan.local_slice]
+            )
             calls.append(True)
             for peer in range(size):
                 part = InterleavedQueryPlan(total_rows=total, rank=peer, size=size)
                 padded = torch.full((capacity, wire_columns), -1, dtype=torch.int32)
-                padded[:part.local_rows, :columns] = expected[part.local_slice]
-                padded[:part.local_rows, columns] = lengths[part.local_slice]
-                output[peer * capacity:(peer + 1) * capacity].copy_(padded)
+                padded[: part.local_rows, :columns] = expected[part.local_slice]
+                padded[: part.local_rows, columns] = lengths[part.local_slice]
+                output[peer * capacity : (peer + 1) * capacity].copy_(padded)
 
         monkeypatch.setattr(implementation, "all_gather_single", gather)
         rows, lens = plan.gather_selection(
@@ -77,3 +91,7 @@ def test_gather_restores_rows_and_lengths_including_empty_ranks(total, columns, 
         torch.testing.assert_close(rows, expected, atol=0, rtol=0)
         torch.testing.assert_close(lens, lengths, atol=0, rtol=0)
         assert len(calls) == int(total > 0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

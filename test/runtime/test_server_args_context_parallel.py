@@ -417,3 +417,38 @@ def test_the_attention_config_pins_query_sharding_to_a_bf16_native_cache():
     _dsa_attn_config(
         kv_cache_dtype=torch.float8_e4m3fn, qcp_size=1, qcp_rank=0, qcp_group=(0,)
     )
+
+
+@pytest.mark.parametrize("size", [2, 4, 8])
+def test_v41_aggregated_kvp_requires_explicit_matching_dcp(size):
+    argv = [
+        "--model",
+        "x",
+        "--attn-tp-size",
+        str(size),
+        "--attention-backend",
+        "deepseek_v41",
+        "--kv-parallel-size",
+        str(size),
+    ]
+    with pytest.raises(ValueError, match="requires --decode-context-parallel-size"):
+        prepare_server_args(argv)
+    args = prepare_server_args(argv + ["--decode-context-parallel-size", str(size)])
+    assert args.mapping.attn.kvp_size == args.decode_context_parallel_size == size
+    assert not args.mapping.attn.has_qcp
+    with pytest.raises(ValueError, match="Aggregated DCP.*--enable-mixed-batch"):
+        prepare_server_args(
+            argv + ["--decode-context-parallel-size", str(size), "--enable-mixed-batch"]
+        )
+    with pytest.raises(ValueError, match="must equal --kv-parallel-size"):
+        prepare_server_args(argv + ["--decode-context-parallel-size", str(size * 2)])
+    with pytest.raises(ValueError, match="requires --disaggregation-mode prefill"):
+        prepare_server_args(
+            argv
+            + [
+                "--decode-context-parallel-size",
+                str(size),
+                "--query-context-parallel-size",
+                str(size),
+            ]
+        )
