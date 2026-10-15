@@ -20,7 +20,7 @@
 
 """CPU contracts of the BF16x3 FP32-weight GEMM: the weight split, a CPU
 model of the kernel's arithmetic against FP64, the tile and split-K choice,
-and the route through ``decode_gemv``."""
+and the route through ``mv``."""
 
 from __future__ import annotations
 
@@ -28,10 +28,11 @@ import math
 from unittest.mock import Mock
 
 import pytest
-import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
+import tokenspeed_kernel.ops.gemm as gemm_api
 import torch
-from tokenspeed_kernel.ops.gemm import triton_bf16x3, triton_gemv
-from tokenspeed_kernel.ops.gemm.triton_bf16x3 import (
+from tokenspeed_kernel.ops.gemm import triton as gemm_triton
+from tokenspeed_kernel.ops.gemm._triton import bf16x3 as triton_bf16x3
+from tokenspeed_kernel.ops.gemm._triton.bf16x3 import (
     BF16X3_MIN_M,
     _bf16x3_config,
     split_fp32_weight_bf16x3,
@@ -313,16 +314,16 @@ def select_on(monkeypatch):
     reg._unregister(name)
 
     def use(platform):
-        monkeypatch.setattr(triton_gemv, "current_platform", lambda: platform)
-        triton_gemv._select.cache_clear()
+        monkeypatch.setattr(gemm_api, "current_platform", lambda: platform)
+        gemm_api._select_mv.cache_clear()
 
     yield use
     reg.register(spec, impl)
-    triton_gemv._select.cache_clear()
+    gemm_api._select_mv.cache_clear()
 
 
 def _selected(m, n, k, weight_split=True):
-    return triton_gemv._select(
+    return gemm_api._select_mv(
         m, n, k, True, torch.bfloat16, torch.float32, weight_split
     )
 
@@ -348,7 +349,7 @@ def test_registry_keeps_the_split_kernel_to_sm100(
 
 
 def _cuda_weight(n, k, dtype=torch.float32):
-    """A contiguous CUDA weight as decode_gemv_weight_split() reads it."""
+    """A contiguous CUDA weight as mv_weight_split() reads it."""
     weight = Mock(is_cuda=True, ndim=2, shape=(n, k), dtype=dtype)
     weight.is_contiguous.return_value = True
     return weight
@@ -358,19 +359,19 @@ def test_weight_split_follows_the_split_kernel_registration(
     monkeypatch, select_on, b200_platform, h100_platform, mi350_platform
 ):
     split = Mock(return_value=object())
-    monkeypatch.setattr(triton_gemv, "split_fp32_weight_bf16x3", split)
+    monkeypatch.setattr(gemm_api, "split_fp32_weight_bf16x3", split)
     select_on(b200_platform)
     weight = _cuda_weight(256, 4096)
-    assert triton_gemv.decode_gemv_weight_split(weight) is split.return_value
+    assert gemm_api.mv_weight_split(weight) is split.return_value
     split.assert_called_once_with(weight)
     for n, k in ((320, 4096), (2048, 4096), (256, 4000)):
-        assert triton_gemv.decode_gemv_weight_split(_cuda_weight(n, k)) is None
+        assert gemm_api.mv_weight_split(_cuda_weight(n, k)) is None
     for dtype in (torch.bfloat16, torch.float16):
         weight = _cuda_weight(256, 4096, dtype)
-        assert triton_gemv.decode_gemv_weight_split(weight) is None
+        assert gemm_api.mv_weight_split(weight) is None
     for platform in (h100_platform, mi350_platform):
         select_on(platform)
-        assert triton_gemv.decode_gemv_weight_split(_cuda_weight(256, 4096)) is None
+        assert gemm_api.mv_weight_split(_cuda_weight(256, 4096)) is None
     assert split.call_count == 1
 
 
@@ -381,17 +382,17 @@ def test_weights_of_128_rows_stay_off_the_split_kernel(
     most row counts up to 128, so the registration starts at 256 weight rows:
     a 128-row weight gets neither the kernel nor a split."""
     split = Mock(return_value=object())
-    monkeypatch.setattr(triton_gemv, "split_fp32_weight_bf16x3", split)
+    monkeypatch.setattr(gemm_api, "split_fp32_weight_bf16x3", split)
     select_on(b200_platform)
     for m in (17, 64, 128, 1024, 8192):
         assert _selected(m, 128, 4096) is not triton_bf16x3_gemm_fp32
-    assert triton_gemv.decode_gemv_weight_split(_cuda_weight(128, 4096)) is None
+    assert gemm_api.mv_weight_split(_cuda_weight(128, 4096)) is None
     split.assert_not_called()
     for n in (256, 384, 1024):
         for m in (17, 128, 8192):
             assert _selected(m, n, 4096) is triton_bf16x3_gemm_fp32
         weight = _cuda_weight(n, 4096)
-        assert triton_gemv.decode_gemv_weight_split(weight) is split.return_value
+        assert gemm_api.mv_weight_split(weight) is split.return_value
         split.assert_called_with(weight)
     assert split.call_count == 3
 
@@ -402,18 +403,18 @@ def test_k_outside_the_measured_2048_to_8192_stays_off_the_split_kernel(
     """The GB200 sweep covered K from 2048 to 8192, so the registration stops
     there: other K get neither the kernel nor a split, the ends get both."""
     split = Mock(return_value=object())
-    monkeypatch.setattr(triton_gemv, "split_fp32_weight_bf16x3", split)
+    monkeypatch.setattr(gemm_api, "split_fp32_weight_bf16x3", split)
     select_on(b200_platform)
     for k in (1024, 1984, 8256, 16384):
         for m in (17, 128, 8192):
             assert _selected(m, 256, k) is not triton_bf16x3_gemm_fp32
-        assert triton_gemv.decode_gemv_weight_split(_cuda_weight(256, k)) is None
+        assert gemm_api.mv_weight_split(_cuda_weight(256, k)) is None
     split.assert_not_called()
     for k in (2048, 8192):
         for m in (17, 128, 8192):
             assert _selected(m, 256, k) is triton_bf16x3_gemm_fp32
         weight = _cuda_weight(256, k)
-        assert triton_gemv.decode_gemv_weight_split(weight) is split.return_value
+        assert gemm_api.mv_weight_split(weight) is split.return_value
         split.assert_called_with(weight)
     assert split.call_count == 2
 
@@ -429,9 +430,9 @@ def test_weight_split_is_made_under_a_kernel_preferred_for_some_rows(
         KernelSpec(
             name="test_decode_gemv_rows_17_96",
             family="gemm",
-            mode="decode_gemv",
+            mode="mv",
             solution="test",
-            format_signatures=triton_gemv._BF16_FP32_SIG,
+            format_signatures=gemm_triton._BF16_FP32_SIG,
             traits={"m_min": frozenset({17}), "m_max": frozenset({96})},
             priority=Priority.SPECIALIZED + 1,
         ),
@@ -439,10 +440,10 @@ def test_weight_split_is_made_under_a_kernel_preferred_for_some_rows(
     )
     try:
         split = Mock(return_value=object())
-        monkeypatch.setattr(triton_gemv, "split_fp32_weight_bf16x3", split)
+        monkeypatch.setattr(gemm_api, "split_fp32_weight_bf16x3", split)
         select_on(b200_platform)
         weight = _cuda_weight(256, 4096)
-        assert triton_gemv.decode_gemv_weight_split(weight) is split.return_value
+        assert gemm_api.mv_weight_split(weight) is split.return_value
         split.assert_called_once_with(weight)
         for m in range(17, 97):
             assert _selected(m, 256, 4096) is stand_in
@@ -458,12 +459,12 @@ def test_decode_gemv_hands_the_split_to_the_split_kernel(monkeypatch):
     result = torch.empty(32, 128)
     kernel = Mock(return_value=result)
     select = Mock(return_value=kernel)
-    monkeypatch.setattr(triton_gemv, "triton_bf16x3_gemm_fp32", kernel)
-    monkeypatch.setattr(triton_gemv, "_select", select)
+    monkeypatch.setattr(gemm_api, "triton_bf16x3_gemm_fp32", kernel)
+    monkeypatch.setattr(gemm_api, "_select_mv", select)
     x = torch.zeros(32, 256, dtype=torch.bfloat16)
     w = torch.zeros(128, 256)
     pieces = torch.zeros(3, 128, 256, dtype=torch.bfloat16)
-    assert triton_gemv.decode_gemv(x, w, weight_split=pieces) is result
+    assert gemm_api.mv(x, w, weight_split=pieces) is result
     kernel.assert_called_once_with(x, pieces, None)
     assert select.call_args.args[-3:] == (torch.bfloat16, torch.float32, True)
 
@@ -474,12 +475,12 @@ def test_decode_gemv_widens_bf16_rows_for_an_fp32_weight_on_torch():
     w = torch.randn(32, 64, generator=g)
     out = torch.empty(20, 32)
     expected = x.float() @ w.t()
-    assert torch.equal(triton_gemv.decode_gemv(x, w), expected)
-    assert triton_gemv.decode_gemv(x, w, out=out) is out
+    assert torch.equal(gemm_api.mv(x, w), expected)
+    assert gemm_api.mv(x, w, out=out) is out
     assert torch.equal(out, expected)
     # On CPU the split is not used; the result is the same Torch product.
     pieces = split_fp32_weight_bf16x3(w)
-    assert torch.equal(triton_gemv.decode_gemv(x, w, weight_split=pieces), expected)
-    assert triton_gemv.decode_gemv_weight_split(w) is None
+    assert torch.equal(gemm_api.mv(x, w, weight_split=pieces), expected)
+    assert gemm_api.mv_weight_split(w) is None
     with pytest.raises(ValueError, match="out must match"):
-        triton_gemv.decode_gemv(x, w, out=torch.empty(20, 32, dtype=torch.bfloat16))
+        gemm_api.mv(x, w, out=torch.empty(20, 32, dtype=torch.bfloat16))

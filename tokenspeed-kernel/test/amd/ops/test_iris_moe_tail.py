@@ -114,7 +114,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
         iris_k3moe_push_gather,
     )
     from tokenspeed_kernel.ops.communication.iris import create_iris_ar_rmsnorm_state
-    from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_latent_projection_add3
+    from tokenspeed_kernel.ops.gemm import kimi3_latent_projection_add3
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
 
     k3_state = prepare_k3_communication(

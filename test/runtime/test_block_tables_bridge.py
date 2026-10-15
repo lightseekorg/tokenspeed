@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 import sys
-import unittest
 from types import SimpleNamespace
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,12 +22,12 @@ def _import_bridge():
     return block_tables_from_forward_op
 
 
-class BlockTablesBridgeTest(unittest.TestCase):
-    def setUp(self):
+class TestBlockTablesBridgeTest:
+    def setup_method(self):
         try:
             self.bridge = _import_bridge()
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(
+            pytest.skip(
                 f"cache bridge unavailable (needs torch + tokenspeed_scheduler "
                 f"extension): {exc}"
             )
@@ -57,43 +58,43 @@ class BlockTablesBridgeTest(unittest.TestCase):
             }
         )
         out = self.bridge(op, device="cpu", num_reqs=2)
-        self.assertEqual(set(out.keys()), {"full", "swa"})
+        assert (set(out.keys())) == ({"full", "swa"})
 
         full = out["full"]
-        self.assertEqual(tuple(full.shape), (2, 2))
-        self.assertEqual(full.dtype, self.torch.int32)
-        self.assertEqual(full.tolist(), [[11, 12], [13, 0]])
+        assert (tuple(full.shape)) == ((2, 2))
+        assert (full.dtype) == (self.torch.int32)
+        assert (full.tolist()) == ([[11, 12], [13, 0]])
 
         swa = out["swa"]
-        self.assertEqual(tuple(swa.shape), (2, 1))
-        self.assertEqual(swa.tolist(), [[21], [0]])
+        assert (tuple(swa.shape)) == ((2, 1))
+        assert (swa.tolist()) == ([[21], [0]])
 
     def test_array_export_is_consumed(self):
         op = self._make_op({"full": [[1]]})
         out = self.bridge(op, device="cpu", num_reqs=1)
-        self.assertEqual(out["full"].tolist(), [[1]])
+        assert (out["full"].tolist()) == ([[1]])
 
     def test_row_count_mismatch_raises(self):
         op = self._make_op({"full": [[1, 2]]})
-        with self.assertRaises(ValueError):
+        with pytest.raises((ValueError)):
             self.bridge(op, device="cpu", num_reqs=2)
 
     def test_empty_rows_group_on_live_batch_raises(self):
         # An empty row list may not silently vanish on a live op: downstream
         # replay would see a per-group hole over stale pages.
         op = self._make_op({"full": [[1, 2], [3, 4]], "swa": []})
-        with self.assertRaisesRegex(ValueError, r"swa.*0 rows"):
+        with pytest.raises((ValueError), match=(r"swa.*0 rows")):
             self.bridge(op, device="cpu", num_reqs=2)
 
     def test_empty_rows_group_on_zero_req_op_dropped(self):
         # bs==0 replay/idle paths treat the resulting {} as "no tables".
         op = self._make_op({"full": [], "swa": []})
-        self.assertEqual(self.bridge(op, device="cpu", num_reqs=0), {})
-        self.assertEqual(self.bridge(op, device="cpu"), {})
+        assert (self.bridge(op, device="cpu", num_reqs=0)) == ({})
+        assert (self.bridge(op, device="cpu")) == ({})
 
     def test_strict_contract_rejects_missing_extra_and_duplicate_normalized_ids(self):
         op = self._make_op({"full": [[1]]})
-        with self.assertRaisesRegex(ValueError, "missing=.*swa"):
+        with pytest.raises((ValueError), match=("missing=.*swa")):
             self.bridge(
                 op,
                 device="cpu",
@@ -102,7 +103,7 @@ class BlockTablesBridgeTest(unittest.TestCase):
             )
 
         op = self._make_op({"full": [[1]], "swa": [[2]], "extra": [[3]]})
-        with self.assertRaisesRegex(ValueError, "extra=.*extra"):
+        with pytest.raises((ValueError), match=("extra=.*extra")):
             self.bridge(
                 op,
                 device="cpu",
@@ -118,7 +119,7 @@ class BlockTablesBridgeTest(unittest.TestCase):
                 "1": np.array([[2]], dtype=np.int32),
             }
         )
-        with self.assertRaisesRegex(ValueError, "collide"):
+        with pytest.raises((ValueError), match=("collide")):
             self.bridge(collision, device="cpu", num_reqs=1, max_page_id=8)
 
     def test_strict_contract_rejects_malformed_and_out_of_range_tables(self):
@@ -127,11 +128,11 @@ class BlockTablesBridgeTest(unittest.TestCase):
         wrong_dtype = SimpleNamespace(
             block_tables_arrays=lambda: {"full": np.array([[1]], dtype=np.int64)}
         )
-        with self.assertRaisesRegex(ValueError, "int32"):
+        with pytest.raises((ValueError), match=("int32")):
             self.bridge(wrong_dtype, device="cpu", num_reqs=1, max_page_id=8)
 
         out_of_range = self._make_op({"full": [[1, 99]]})
-        with self.assertRaisesRegex(ValueError, "outside -1..8"):
+        with pytest.raises((ValueError), match=("outside -1..8")):
             self.bridge(
                 out_of_range,
                 device="cpu",
@@ -142,4 +143,4 @@ class BlockTablesBridgeTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

@@ -32,7 +32,7 @@ from collections.abc import Iterable
 
 import torch
 from tokenspeed_kernel.ops.activation import relu2
-from tokenspeed_kernel.ops.gemm.ll_bf16 import (
+from tokenspeed_kernel.ops.gemm.cute_dsl import (
     cute_dsl_ll_bf16_router,
     ll_bf16_router_supported,
 )

@@ -38,7 +38,7 @@ from tokenspeed_kernel.ops.communication.trtllm import (
     TrtllmAllGatherQuantState,
     trtllm_allgather_fp8_quantize,
 )
-from tokenspeed_kernel.ops.gemm.flashinfer import (
+from tokenspeed_kernel.ops.gemm._flashinfer.fp8_quant import (
     flashinfer_fp8_blockscale_quantize_prepacked,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8

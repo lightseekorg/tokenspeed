@@ -9,8 +9,9 @@ import json
 import os
 import sys
 import tempfile
-import unittest
 from types import SimpleNamespace
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -29,7 +30,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 )
 
 
-class TestFilterDuplicateSafetensorsFiles(unittest.TestCase):
+class TestFilterDuplicateSafetensorsFiles:
     def test_keeps_modelopt_input_scales_outside_weight_index(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             shard = os.path.join(tmpdir, "model-00001-of-00001.safetensors")
@@ -51,10 +52,10 @@ class TestFilterDuplicateSafetensorsFiles(unittest.TestCase):
                 "model.safetensors.index.json",
             )
 
-            self.assertEqual(kept, [shard, scales])
+            assert (kept) == ([shard, scales])
 
 
-class TestFilterSafetensorsFilesByWeightNames(unittest.TestCase):
+class TestFilterSafetensorsFilesByWeightNames:
     def _write_index(self, tmpdir, weight_map):
         index_path = os.path.join(tmpdir, "model.safetensors.index.json")
         with open(index_path, "w") as f:
@@ -84,7 +85,7 @@ class TestFilterSafetensorsFilesByWeightNames(unittest.TestCase):
             kept = filter_safetensors_files_by_weight_names(
                 files, tmpdir, "model.safetensors.index.json", lambda n: "mtp" in n
             )
-            self.assertEqual(kept, files[1:])
+            assert (kept) == (files[1:])
 
     def test_keeps_shards_absent_from_index(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -93,7 +94,7 @@ class TestFilterSafetensorsFilesByWeightNames(unittest.TestCase):
             kept = filter_safetensors_files_by_weight_names(
                 files, tmpdir, "model.safetensors.index.json", lambda n: "mtp" in n
             )
-            self.assertEqual(kept, files)
+            assert (kept) == (files)
 
     def test_missing_index_returns_input(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -101,7 +102,7 @@ class TestFilterSafetensorsFilesByWeightNames(unittest.TestCase):
             kept = filter_safetensors_files_by_weight_names(
                 files, tmpdir, "model.safetensors.index.json", lambda n: False
             )
-            self.assertEqual(kept, files)
+            assert (kept) == (files)
 
     def test_no_match_falls_back_to_all_shards(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -110,10 +111,10 @@ class TestFilterSafetensorsFilesByWeightNames(unittest.TestCase):
             kept = filter_safetensors_files_by_weight_names(
                 files, tmpdir, "model.safetensors.index.json", lambda n: "mtp" in n
             )
-            self.assertEqual(kept, files)
+            assert (kept) == (files)
 
 
-class TestLoaderSkipsFilteredShards(unittest.TestCase):
+class TestLoaderSkipsFilteredShards:
     def test_get_all_weights_reads_only_draft_shards(self):
         from safetensors.torch import save_file
 
@@ -148,7 +149,7 @@ class TestLoaderSkipsFilteredShards(unittest.TestCase):
             )
 
             names = [name for name, _ in loader._get_all_weights(model_config, model)]
-            self.assertEqual(names, ["model.mtp.fc.weight"])
+            assert (names) == (["model.mtp.fc.weight"])
 
     def test_target_model_without_filter_reads_everything(self):
         from safetensors.torch import save_file
@@ -168,7 +169,7 @@ class TestLoaderSkipsFilteredShards(unittest.TestCase):
             )
 
             names = [name for name, _ in loader._get_all_weights(model_config, model)]
-            self.assertEqual(names, ["model.layers.0.w"])
+            assert (names) == (["model.layers.0.w"])
 
     def test_checkpoint_load_group_falls_back_to_the_load_config(self):
         # A model reading a stage-specific checkpoint subset names its own
@@ -196,10 +197,10 @@ class TestLoaderSkipsFilteredShards(unittest.TestCase):
 
         list(loader._get_all_weights(model_config, declaring))
         list(loader._get_all_weights(model_config, silent))
-        self.assertEqual(groups, [(4, 5), (4, 5, 6, 7)])
+        assert (groups) == ([(4, 5), (4, 5, 6, 7)])
 
 
-class TestNextNModelFilters(unittest.TestCase):
+class TestNextNModelFilters:
     """The predicates must accept every name each ``load_weights`` consumes."""
 
     def test_qwen3_5_nextn(self):
@@ -208,11 +209,9 @@ class TestNextNModelFilters(unittest.TestCase):
         )
 
         model = object.__new__(Qwen3_5ForConditionalGenerationNextN)
-        self.assertTrue(model.checkpoint_weight_name_filter("mtp.fc.weight"))
-        self.assertTrue(
-            model.checkpoint_weight_name_filter("model.mtp.self_attn.q_proj.weight")
-        )
-        self.assertFalse(
+        assert model.checkpoint_weight_name_filter("mtp.fc.weight")
+        assert model.checkpoint_weight_name_filter("model.mtp.self_attn.q_proj.weight")
+        assert not (
             model.checkpoint_weight_name_filter("model.layers.0.mlp.gate.weight")
         )
 
@@ -221,21 +220,15 @@ class TestNextNModelFilters(unittest.TestCase):
 
         model = object.__new__(DeepseekV3ForCausalLMNextN)
         model.config = SimpleNamespace(num_nextn_predict_layers=1, num_hidden_layers=61)
-        self.assertTrue(
-            model.checkpoint_weight_name_filter("model.layers.61.eh_proj.weight")
-        )
-        self.assertFalse(
+        assert model.checkpoint_weight_name_filter("model.layers.61.eh_proj.weight")
+        assert not (
             model.checkpoint_weight_name_filter("model.layers.60.mlp.gate.weight")
         )
-        self.assertFalse(
-            model.checkpoint_weight_name_filter("model.embed_tokens.weight")
-        )
+        assert not (model.checkpoint_weight_name_filter("model.embed_tokens.weight"))
 
         # Standalone draft checkpoint keeps everything.
         model.config = SimpleNamespace(num_nextn_predict_layers=1, num_hidden_layers=1)
-        self.assertTrue(
-            model.checkpoint_weight_name_filter("model.layers.0.eh_proj.weight")
-        )
+        assert model.checkpoint_weight_name_filter("model.layers.0.eh_proj.weight")
 
     def test_glm_moe_dsa_nextn(self):
         from tokenspeed.runtime.models.glm_moe_dsa_nextn import (
@@ -244,13 +237,11 @@ class TestNextNModelFilters(unittest.TestCase):
 
         model = object.__new__(GlmMoeDsaForCausalLMNextN)
         model.config = SimpleNamespace(num_nextn_predict_layers=1, num_hidden_layers=92)
-        self.assertTrue(
-            model.checkpoint_weight_name_filter("model.layers.92.eh_proj.weight")
-        )
-        self.assertFalse(
+        assert model.checkpoint_weight_name_filter("model.layers.92.eh_proj.weight")
+        assert not (
             model.checkpoint_weight_name_filter("model.layers.10.mlp.gate.weight")
         )
-        self.assertFalse(model.checkpoint_weight_name_filter("lm_head.weight"))
+        assert not (model.checkpoint_weight_name_filter("lm_head.weight"))
 
     def test_kimi_k3_nextn(self):
         from tokenspeed.runtime.models.kimi_k3_nextn import (
@@ -260,10 +251,8 @@ class TestNextNModelFilters(unittest.TestCase):
 
         inner = object.__new__(KimiK3NextNForCausalLM)
         inner.config = SimpleNamespace(num_hidden_layers=48)
-        self.assertTrue(
-            inner.checkpoint_weight_name_filter("model.layers.48.eh_proj.weight")
-        )
-        self.assertFalse(
+        assert inner.checkpoint_weight_name_filter("model.layers.48.eh_proj.weight")
+        assert not (
             inner.checkpoint_weight_name_filter("model.layers.47.mlp.gate.weight")
         )
 
@@ -271,12 +260,10 @@ class TestNextNModelFilters(unittest.TestCase):
         # Bypass nn.Module.__setattr__: the wrapper is deliberately not
         # initialized as a module here.
         object.__setattr__(wrapper, "language_model", inner)
-        self.assertTrue(
-            wrapper.checkpoint_weight_name_filter(
-                "language_model.model.layers.48.eh_proj.weight"
-            )
+        assert wrapper.checkpoint_weight_name_filter(
+            "language_model.model.layers.48.eh_proj.weight"
         )
-        self.assertFalse(
+        assert not (
             wrapper.checkpoint_weight_name_filter("model.layers.48.eh_proj.weight")
         )
 
@@ -286,16 +273,10 @@ class TestNextNModelFilters(unittest.TestCase):
         )
 
         model = object.__new__(InklingForConditionalGenerationNextN)
-        self.assertTrue(
-            model.checkpoint_weight_name_filter("model.mtp.layers.0.qkv.weight")
-        )
-        self.assertTrue(
-            model.checkpoint_weight_name_filter("model.llm.embed_norm.weight")
-        )
-        self.assertFalse(
-            model.checkpoint_weight_name_filter("model.layers.5.qkv.weight")
-        )
+        assert model.checkpoint_weight_name_filter("model.mtp.layers.0.qkv.weight")
+        assert model.checkpoint_weight_name_filter("model.llm.embed_norm.weight")
+        assert not (model.checkpoint_weight_name_filter("model.layers.5.qkv.weight"))
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

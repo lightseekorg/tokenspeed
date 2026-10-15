@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import os
 import sys
-import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -126,10 +127,10 @@ def _no_extends(torch, device):
     return _extend_kwargs(torch, empty, empty, device)
 
 
-class ComputeStatePageIndicesTest(unittest.TestCase):
+class TestComputeStatePageIndicesTest:
     """CPU-only contract tests for the two-slot resolve."""
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import torch
 
@@ -137,7 +138,7 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
                 compute_state_block_indices,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.fn = compute_state_block_indices
 
@@ -153,77 +154,77 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
     def test_prefill_reads_the_input_slot_and_writes_the_live_slot(self):
         # A hit (or a rotated previous chunk) in slot 0, a fresh slot 1.
         state_in, state_out = self._run([[7, 9]], [4])
-        self.assertEqual(state_in.tolist(), [7])
-        self.assertEqual(state_out.tolist(), [9])
+        assert (state_in.tolist()) == ([7])
+        assert (state_out.tolist()) == ([9])
 
     def test_cold_prefill_reads_the_zero_state(self):
         state_in, state_out = self._run([[0, 7]], [0])
-        self.assertEqual(state_in.tolist(), [0])
-        self.assertEqual(state_out.tolist(), [7])
+        assert (state_in.tolist()) == ([0])
+        assert (state_out.tolist()) == ([7])
 
     def test_first_decode_reads_the_rotated_prompt_end_state(self):
         state_in, state_out = self._run([[5, 8]], [8])
-        self.assertEqual(state_in.tolist(), [5])
-        self.assertEqual(state_out.tolist(), [8])
+        assert (state_in.tolist()) == ([5])
+        assert (state_out.tolist()) == ([8])
 
     def test_later_decodes_evolve_the_live_slot_in_place(self):
         state_in, state_out = self._run([[0, 8]], [9])
-        self.assertEqual(state_in.tolist(), [8])
-        self.assertEqual(state_out.tolist(), [8])
+        assert (state_in.tolist()) == ([8])
+        assert (state_out.tolist()) == ([8])
 
     def test_wider_rows_are_read_at_the_two_slots(self):
         # The wire pads every group's rows to the batch's column count.
         state_in, state_out = self._run([[0, 8, -1, -1]], [9])
-        self.assertEqual(state_in.tolist(), [8])
-        self.assertEqual(state_out.tolist(), [8])
+        assert (state_in.tolist()) == ([8])
+        assert (state_out.tolist()) == ([8])
 
     def test_batch_mixed(self):
         rows = [[7, 9], [0, 22], [0, 31], [3, 5]]
         state_in, state_out = self._run(rows, [4, 5, 0, 8])
-        self.assertEqual(state_in.tolist(), [7, 22, 0, 3])
-        self.assertEqual(state_out.tolist(), [9, 22, 31, 5])
+        assert (state_in.tolist()) == ([7, 22, 0, 3])
+        assert (state_out.tolist()) == ([9, 22, 31, 5])
 
     def test_results_are_int32(self):
         state_in, state_out = self._run([[7, 9]], [4])
-        self.assertEqual(state_in.dtype, self.torch.int32)
-        self.assertEqual(state_out.dtype, self.torch.int32)
+        assert (state_in.dtype) == (self.torch.int32)
+        assert (state_out.dtype) == (self.torch.int32)
 
     def test_a_one_slot_table_raises(self):
-        with self.assertRaisesRegex(ValueError, "slots"):
+        with pytest.raises((ValueError), match=("slots")):
             self._run([[7]], [4])
 
     def test_live_slot_hole_raises(self):
-        with self.assertRaises(ValueError):
+        with pytest.raises((ValueError)):
             self._run([[7, 0]], [4])
 
     def test_live_slot_pad_raises(self):
-        with self.assertRaises(ValueError):
+        with pytest.raises((ValueError)):
             self._run([[7, -1]], [4])
 
     def test_in_place_pad_with_history_raises(self):
         # slot 0 null, slot 1 a pad: a request with history has no block to
         # read, and a silent zero-state resume must fail loud.
-        with self.assertRaises(ValueError):
+        with pytest.raises((ValueError)):
             self._run([[0, -1]], [5])
 
     def test_claimed_checkpoint_equal_to_live_block_raises(self):
-        with self.assertRaisesRegex(ValueError, "same block"):
+        with pytest.raises((ValueError), match=("same block")):
             self._run([[7, 7]], [4])
 
     def test_duplicate_out_pages_raise(self):
-        with self.assertRaisesRegex(ValueError, "unique"):
+        with pytest.raises((ValueError), match=("unique")):
             self._run([[7, 9], [0, 9]], [4, 0])
 
     def test_validate_off_masks_guards(self):
         state_in, state_out = self._run([[0, 0]], [0], validate=False)
-        self.assertEqual(state_in.tolist(), [0])
-        self.assertEqual(state_out.tolist(), [0])
+        assert (state_in.tolist()) == ([0])
+        assert (state_out.tolist()) == ([0])
 
 
-class CacheContractStateBlocksTest(unittest.TestCase):
+class TestCacheContractStateBlocksTest:
     """The backend resolves every declared group once per batch."""
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import torch
 
@@ -231,7 +232,7 @@ class CacheContractStateBlocksTest(unittest.TestCase):
                 MambaAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.backend = object.__new__(MambaAttnBackend)
         self.backend._state_group_ids = ("linear_attention_0", "linear_attention_1")
@@ -249,14 +250,14 @@ class CacheContractStateBlocksTest(unittest.TestCase):
             },
             validate=True,
         )
-        self.assertEqual(state_in["linear_attention_0"].tolist(), [7, 0])
-        self.assertEqual(state_out["linear_attention_0"].tolist(), [8, 9])
-        self.assertEqual(state_in["linear_attention_1"].tolist(), [17, 0])
-        self.assertEqual(state_out["linear_attention_1"].tolist(), [18, 19])
+        assert (state_in["linear_attention_0"].tolist()) == ([7, 0])
+        assert (state_out["linear_attention_0"].tolist()) == ([8, 9])
+        assert (state_in["linear_attention_1"].tolist()) == ([17, 0])
+        assert (state_out["linear_attention_1"].tolist()) == ([18, 19])
 
     def test_a_missing_group_table_is_a_delivery_bug(self):
         torch = self.torch
-        with self.assertRaisesRegex(RuntimeError, "missing state group"):
+        with pytest.raises((RuntimeError), match=("missing state group")):
             self.backend._cache_contract_state_blocks(
                 torch.tensor([4], dtype=torch.int32),
                 {"linear_attention_0": torch.tensor([[7, 8]], dtype=torch.int32)},
@@ -264,10 +265,10 @@ class CacheContractStateBlocksTest(unittest.TestCase):
             )
 
 
-class CacheContractMetadataTest(unittest.TestCase):
+class TestCacheContractMetadataTest:
     """Every metadata entry point resolves state through the cache contract."""
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import torch
 
@@ -278,7 +279,7 @@ class CacheContractMetadataTest(unittest.TestCase):
                 MambaAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.ForwardMode = ForwardMode
         backend = MambaAttnBackend(
@@ -288,7 +289,7 @@ class CacheContractMetadataTest(unittest.TestCase):
             {0: ("linear_attention", torch.zeros(2, 3), torch.zeros(2, 5))},
         )
         backend.set_kv_pool(stub_pool)
-        self.assertTrue(backend.state_paging_active)
+        assert backend.state_paging_active
         self.backend = backend
 
     def test_decode_metadata(self):
@@ -301,7 +302,7 @@ class CacheContractMetadataTest(unittest.TestCase):
         block_tables = {"linear_attention": torch.tensor([[2, 3]], dtype=torch.int32)}
         # Decode metadata is the refresh's alone; a DECODE init is a contract
         # violation on every node, the state backend included.
-        with self.assertRaisesRegex(RuntimeError, "refresh_decode_metadata"):
+        with pytest.raises((RuntimeError), match=("refresh_decode_metadata")):
             backend.init_forward_metadata(
                 bs=1,
                 num_extends=0,
@@ -321,12 +322,12 @@ class CacheContractMetadataTest(unittest.TestCase):
             block_tables=block_tables,
         )
         md = backend.forward_metadata
-        self.assertEqual(md.state_in_blocks_by_group["linear_attention"].tolist(), [2])
-        self.assertEqual(md.state_out_blocks_by_group["linear_attention"].tolist(), [3])
+        assert (md.state_in_blocks_by_group["linear_attention"].tolist()) == ([2])
+        assert (md.state_out_blocks_by_group["linear_attention"].tolist()) == ([3])
         # Decode builds no host boundary tuple; only extend batches carry one.
-        self.assertIsNone(md.cu_extend_seq_lens_cpu)
-        self.assertIsNone(md.query_start_loc_int64)
-        self.assertIsNone(md.conv_prefill_metadata)
+        assert (md.cu_extend_seq_lens_cpu) is None
+        assert (md.query_start_loc_int64) is None
+        assert (md.conv_prefill_metadata) is None
 
     def test_extend_metadata(self):
         torch = self.torch
@@ -348,20 +349,20 @@ class CacheContractMetadataTest(unittest.TestCase):
             ),
         )
         md = backend.forward_metadata
-        self.assertEqual(md.state_in_blocks_by_group["linear_attention"].tolist(), [0])
-        self.assertEqual(md.state_out_blocks_by_group["linear_attention"].tolist(), [2])
+        assert (md.state_in_blocks_by_group["linear_attention"].tolist()) == ([0])
+        assert (md.state_out_blocks_by_group["linear_attention"].tolist()) == ([2])
         # The metadata builds the host boundary tensor once, next to
         # query_start_loc, and keeps the raw lengths for the conv kernel.
-        self.assertEqual(md.cu_extend_seq_lens_cpu.tolist(), [0, 8])
-        self.assertEqual(md.cu_extend_seq_lens_cpu.dtype, self.torch.int64)
-        self.assertFalse(md.cu_extend_seq_lens_cpu.is_cuda)
-        self.assertEqual(md.extend_seq_lens_cpu.tolist(), [8])
-        self.assertEqual(md.query_start_loc.tolist(), [0, 8])
-        self.assertEqual(md.query_start_loc.dtype, torch.int32)
-        self.assertEqual(md.query_start_loc_int64.dtype, torch.int64)
-        self.assertEqual(md.query_start_loc_int64.tolist(), [0, 8])
-        self.assertEqual(md.conv_prefill_metadata.batch_indices.tolist(), [0])
-        self.assertEqual(md.conv_prefill_metadata.chunk_offsets.tolist(), [0])
+        assert (md.cu_extend_seq_lens_cpu.tolist()) == ([0, 8])
+        assert (md.cu_extend_seq_lens_cpu.dtype) == (self.torch.int64)
+        assert not (md.cu_extend_seq_lens_cpu.is_cuda)
+        assert (md.extend_seq_lens_cpu.tolist()) == ([8])
+        assert (md.query_start_loc.tolist()) == ([0, 8])
+        assert (md.query_start_loc.dtype) == (torch.int32)
+        assert (md.query_start_loc_int64.dtype) == (torch.int64)
+        assert (md.query_start_loc_int64.tolist()) == ([0, 8])
+        assert (md.conv_prefill_metadata.batch_indices.tolist()) == ([0])
+        assert (md.conv_prefill_metadata.chunk_offsets.tolist()) == ([0])
 
     def test_mixed_metadata_pads_decode_rows(self):
         torch = self.torch
@@ -385,19 +386,15 @@ class CacheContractMetadataTest(unittest.TestCase):
         md = backend.forward_metadata
         # One extend row (5 tokens) plus one decode row padded to
         # spec_num_tokens (= 1): boundaries and the raw cat agree.
-        self.assertEqual(md.cu_extend_seq_lens_cpu.tolist(), [0, 5, 6])
-        self.assertEqual(md.extend_seq_lens_cpu.tolist(), [5, 1])
-        self.assertEqual(md.query_start_loc.tolist(), [0, 5, 6])
+        assert (md.cu_extend_seq_lens_cpu.tolist()) == ([0, 5, 6])
+        assert (md.extend_seq_lens_cpu.tolist()) == ([5, 1])
+        assert (md.query_start_loc.tolist()) == ([0, 5, 6])
         # The cold extend row reads the zero state; the decode row runs in place.
-        self.assertEqual(
-            md.state_in_blocks_by_group["linear_attention"].tolist(), [0, 4]
-        )
-        self.assertEqual(
-            md.state_out_blocks_by_group["linear_attention"].tolist(), [1, 4]
-        )
-        self.assertEqual(md.query_start_loc_int64.tolist(), [0, 5, 6])
-        self.assertEqual(md.conv_prefill_metadata.batch_indices.tolist(), [0, 1])
-        self.assertEqual(md.conv_prefill_metadata.chunk_offsets.tolist(), [0, 0])
+        assert (md.state_in_blocks_by_group["linear_attention"].tolist()) == ([0, 4])
+        assert (md.state_out_blocks_by_group["linear_attention"].tolist()) == ([1, 4])
+        assert (md.query_start_loc_int64.tolist()) == ([0, 5, 6])
+        assert (md.conv_prefill_metadata.batch_indices.tolist()) == ([0, 1])
+        assert (md.conv_prefill_metadata.chunk_offsets.tolist()) == ([0, 0])
 
     def test_conv_metadata_is_owned_by_each_forward(self):
         torch = self.torch
@@ -422,15 +419,15 @@ class CacheContractMetadataTest(unittest.TestCase):
             boundaries.append(self.backend.forward_metadata.query_start_loc_int64)
         # Same total tokens/programs, different request partition. Keep the
         # first forward alive while preparing the next, as overlap can do.
-        self.assertIsNot(saved[0], saved[1])
-        self.assertNotEqual(
-            saved[0].batch_indices.data_ptr(), saved[1].batch_indices.data_ptr()
+        assert (saved[0]) is not (saved[1])
+        assert (saved[0].batch_indices.data_ptr()) != (
+            saved[1].batch_indices.data_ptr()
         )
-        self.assertEqual(saved[0].batch_indices.tolist(), [0, 0, 1])
-        self.assertEqual(saved[1].batch_indices.tolist(), [0, 1, 1])
-        self.assertNotEqual(boundaries[0].data_ptr(), boundaries[1].data_ptr())
-        self.assertEqual(boundaries[0].tolist(), [0, 9, 16])
-        self.assertEqual(boundaries[1].tolist(), [0, 7, 16])
+        assert (saved[0].batch_indices.tolist()) == ([0, 0, 1])
+        assert (saved[1].batch_indices.tolist()) == ([0, 1, 1])
+        assert (boundaries[0].data_ptr()) != (boundaries[1].data_ptr())
+        assert (boundaries[0].tolist()) == ([0, 9, 16])
+        assert (boundaries[1].tolist()) == ([0, 7, 16])
 
     def test_capture_replay_metadata(self):
         torch = self.torch
@@ -444,10 +441,8 @@ class CacheContractMetadataTest(unittest.TestCase):
         )
         md = backend.forward_metadata
         # Capture binds the persistent pad-filled buffers.
-        self.assertEqual(md.state_in_blocks_by_group["linear_attention"].tolist(), [-1])
-        self.assertEqual(
-            md.state_out_blocks_by_group["linear_attention"].tolist(), [-1]
-        )
+        assert (md.state_in_blocks_by_group["linear_attention"].tolist()) == ([-1])
+        assert (md.state_out_blocks_by_group["linear_attention"].tolist()) == ([-1])
 
         backend.refresh_decode_metadata(
             1,
@@ -461,14 +456,14 @@ class CacheContractMetadataTest(unittest.TestCase):
             },
         )
         md = backend.forward_metadata
-        self.assertEqual(md.state_in_blocks_by_group["linear_attention"].tolist(), [3])
-        self.assertEqual(md.state_out_blocks_by_group["linear_attention"].tolist(), [3])
+        assert (md.state_in_blocks_by_group["linear_attention"].tolist()) == ([3])
+        assert (md.state_out_blocks_by_group["linear_attention"].tolist()) == ([3])
 
 
-class VerifyMetadataTest(unittest.TestCase):
+class TestVerifyMetadataTest:
     """Qwen's state groups use per-layer verify scratch."""
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import torch
 
@@ -479,7 +474,7 @@ class VerifyMetadataTest(unittest.TestCase):
                 MambaAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.ForwardMode = ForwardMode
         self.backend = MambaAttnBackend(
@@ -520,40 +515,31 @@ class VerifyMetadataTest(unittest.TestCase):
         )
 
         metadata = self.backend.forward_metadata
-        self.assertEqual(metadata.mamba_output_indices.tolist(), [[1, 2, 3, 4]])
-        self.assertEqual(metadata.mamba_output_indices.dtype, torch.int32)
-        self.assertEqual(
-            metadata.state_in_blocks_by_group["linear_attention_0"].dtype,
-            torch.int32,
+        assert (metadata.mamba_output_indices.tolist()) == ([[1, 2, 3, 4]])
+        assert (metadata.mamba_output_indices.dtype) == (torch.int32)
+        assert (metadata.state_in_blocks_by_group["linear_attention_0"].dtype) == (
+            torch.int32
         )
-        self.assertEqual(
-            metadata.state_in_blocks_by_group["linear_attention_0"].tolist(),
-            [3],
+        assert (metadata.state_in_blocks_by_group["linear_attention_0"].tolist()) == (
+            [3]
         )
-        self.assertEqual(
-            metadata.state_in_blocks_by_group["linear_attention_1"].tolist(),
-            [5],
+        assert (metadata.state_in_blocks_by_group["linear_attention_1"].tolist()) == (
+            [5]
         )
-        self.assertEqual(set(self.backend._verify_scratch), {0, 1})
+        assert (set(self.backend._verify_scratch)) == ({0, 1})
         for conv_scratch, state_scratch in self.backend._verify_scratch.values():
-            self.assertEqual(conv_scratch.shape[0], 10)
-            self.assertEqual(state_scratch.shape[0], 10)
-        self.assertEqual(
-            self.backend.preallocate_verify_workspace(2, 4),
-            560,
-        )
+            assert (conv_scratch.shape[0]) == (10)
+            assert (state_scratch.shape[0]) == (10)
+        assert (self.backend.preallocate_verify_workspace(2, 4)) == (560)
 
     def test_target_verify_reuses_graph_stable_scratch_base_rows(self):
         rows = self.backend._verify_scratch_base_rows(3, 4)
         grid = self.backend._verify_scratch_grid(3, 4)
 
-        self.assertIs(rows, self.backend._verify_scratch_base_rows(3, 4))
-        self.assertEqual(rows.dtype, self.torch.int32)
-        self.assertEqual(rows.tolist(), [0, 5, 10])
-        self.assertEqual(
-            grid.tolist(),
-            [[1, 2, 3, 4], [6, 7, 8, 9], [11, 12, 13, 14]],
-        )
+        assert (rows) is (self.backend._verify_scratch_base_rows(3, 4))
+        assert (rows.dtype) == (self.torch.int32)
+        assert (rows.tolist()) == ([0, 5, 10])
+        assert (grid.tolist()) == ([[1, 2, 3, 4], [6, 7, 8, 9], [11, 12, 13, 14]])
 
     def test_verify_commit_resolves_pages_with_fused_group_kernel(self):
         torch = self.torch
@@ -602,35 +588,38 @@ class VerifyMetadataTest(unittest.TestCase):
         ):
             self.backend.commit_verified_state(accepted, accepted_path=None)
 
-        self.assertEqual(len(resolve_calls), 2)
-        self.assertEqual(
+        assert (len(resolve_calls)) == (2)
+        assert (
             [
                 kwargs["pages_out"][kwargs["out_row"]].tolist()
                 for _, kwargs in resolve_calls
-            ],
-            [[11, 23], [31, 43]],
-        )
+            ]
+        ) == ([[11, 23], [31, 43]])
         for _, kwargs in resolve_calls:
-            self.assertEqual(kwargs["batch_size"], 2)
-            self.assertEqual(kwargs["draft_tokens"], 4)
-            self.assertEqual(kwargs["pages_out"].dtype, torch.int32)
-            self.assertEqual(kwargs["steps_out"].tolist(), [1, 4])
+            assert (kwargs["batch_size"]) == (2)
+            assert (kwargs["draft_tokens"]) == (4)
+            assert (kwargs["pages_out"].dtype) == (torch.int32)
+            assert (kwargs["steps_out"].tolist()) == ([1, 4])
 
-        self.assertEqual(len(copy_calls), 2)
+        assert (len(copy_calls)) == (2)
         for args, _ in copy_calls:
-            self.assertEqual(args[2].dtype, torch.int32)
-            self.assertEqual(args[3].dtype, torch.int32)
-            self.assertEqual(args[2].tolist(), [1, 9, 1, 9])
-            self.assertEqual(args[3].tolist(), [11, 23, 31, 43])
-        self.assertIsNone(self.backend._verify_commit_ctx)
+            assert (args[2].dtype) == (torch.int32)
+            assert (args[3].dtype) == (torch.int32)
+            assert (args[2].tolist()) == ([1, 9, 1, 9])
+            assert (args[3].tolist()) == ([11, 23, 31, 43])
+        assert (self.backend._verify_commit_ctx) is None
 
 
-class VerifyCommitGPUTest(unittest.TestCase):
-    def test_grouped_commit_copies_and_replay_share_fused_rows(self):
+class TestVerifyCommitGPUTest:
+    def test_grouped_commit_copies_and_replay_share_fused_rows(self, subtests):
         import torch
 
         if not torch.cuda.is_available():
-            self.skipTest("needs a CUDA device")
+            pytest.skip("needs a CUDA device")
+        from tokenspeed_kernel.ops.kvcache.triton import (
+            _state_verify_commit_rows_kernel,
+        )
+
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
         from tokenspeed.runtime.layers.attention.backends.state import mamba
 
@@ -654,7 +643,7 @@ class VerifyCommitGPUTest(unittest.TestCase):
         expected_pages = {"group0": [1, 5, 9], "group1": [11, -1, 15]}
         for replay_ssm in (False, True):
             for live_bs in (1, 3):
-                with self.subTest(replay_ssm=replay_ssm, live_bs=live_bs):
+                with subtests.test(replay_ssm=replay_ssm, live_bs=live_bs):
                     components = {
                         layer: (
                             group,
@@ -706,7 +695,15 @@ class VerifyCommitGPUTest(unittest.TestCase):
                                 )
                     # Warm pointer tables outside profiling, as forward seeding does.
                     backend._verify_copy_tables_get()
-                    with patch.object(mamba, "gdn_replay_commit") as replay:
+                    # Count real launches directly: ROCm profiler traces can omit events.
+                    with (
+                        patch.object(mamba, "gdn_replay_commit") as replay,
+                        patch.object(
+                            _state_verify_commit_rows_kernel,
+                            "run",
+                            wraps=_state_verify_commit_rows_kernel.run,
+                        ) as commit_rows_launch,
+                    ):
                         with torch.profiler.profile(
                             activities=[
                                 torch.profiler.ProfilerActivity.CPU,
@@ -723,17 +720,11 @@ class VerifyCommitGPUTest(unittest.TestCase):
                         for e in events
                         if e.device_type == torch.autograd.DeviceType.CUDA
                     ]
-                    self.assertEqual(
-                        sum(
-                            "_state_verify_commit_rows_kernel" in name
-                            for name in gpu_kernels
-                        ),
-                        1,
-                    )
+                    commit_rows_launch.assert_called_once()
                     # Replay still assembles its separate read indices; the
                     # scratch-copy path needs no PyTorch index arithmetic.
                     if not replay_ssm:
-                        self.assertFalse(
+                        assert not (
                             {
                                 "aten::index_select",
                                 "aten::add",
@@ -741,9 +732,7 @@ class VerifyCommitGPUTest(unittest.TestCase):
                                 "aten::stack",
                             }.intersection(e.name for e in events)
                         )
-                        self.assertFalse(
-                            any("elementwise" in name for name in gpu_kernels)
-                        )
+                        assert not any("elementwise" in name for name in gpu_kernels)
                     source_rows = [1, 6, 11][:live_bs]
                     for layer, group in layer_groups.items():
                         for kind, name in enumerate(("conv_state", "recurrent_state")):
@@ -786,10 +775,10 @@ class VerifyCommitGPUTest(unittest.TestCase):
                         )
                     else:
                         replay.assert_not_called()
-                    self.assertIsNone(backend._verify_commit_ctx)
+                    assert backend._verify_commit_ctx is None
 
 
-class GDNStatePagingGPUTest(unittest.TestCase):
+class TestGDNStatePagingGPUTest:
     """MambaAttnBackend state paging vs the
     FLA chunk_gated_delta_rule oracle over the full contiguous sequence."""
 
@@ -800,7 +789,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
     DECODES = 3
     WIDTH = 4  # conv kernel width; state_len = WIDTH - 1
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import torch
             from tokenspeed_kernel.ops.attention.gdn import flashinfer as gdn
@@ -815,9 +804,9 @@ class GDNStatePagingGPUTest(unittest.TestCase):
                 MambaAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
         if not torch.cuda.is_available():
-            self.skipTest("needs a CUDA device")
+            pytest.skip("needs a CUDA device")
         self.torch = torch
         self.gdn = gdn
         self.ForwardMode = ForwardMode
@@ -839,11 +828,11 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             )
         )
         backend.set_kv_pool(pool)
-        self.assertTrue(backend.state_paging_active)
+        assert backend.state_paging_active
         backend.init_cuda_graph_state(max_bs=2)
         return backend
 
-    def test_chunked_prefill_resumes_from_the_live_block(self):
+    def test_chunked_prefill_resumes_from_the_live_block(self, subtests):
         """A chunk's final state in slot 1 is the next chunk's input in slot 0.
 
         The scheduler rotates the live block into slot 0 and grants a fresh
@@ -920,7 +909,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         # Boundaries off any kernel-chunk multiple: 7, 4 and 10 of 11 tokens.
         for boundary in (7, 4, 10):
             with (
-                self.subTest(boundary=boundary),
+                subtests.test(boundary=boundary),
                 patch.object(mamba, "gdn_chunk_prefill", triton_gdn_chunk_prefill),
             ):
                 slabs = []
@@ -942,7 +931,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
 
                 first = prefill(candidate, 0, boundary, [0, 1])
                 checkpoint = tuple(slab[1].clone() for slab in slabs[0])
-                self.assertGreater(checkpoint[1].abs().max().item(), 0.0)
+                assert (checkpoint[1].abs().max().item()) > (0.0)
                 resumed = prefill(candidate, boundary, total, [1, 3])
 
                 torch.testing.assert_close(
@@ -952,18 +941,18 @@ class GDNStatePagingGPUTest(unittest.TestCase):
                     rtol=1e-2,
                 )
                 difference = (resumed.float() - full_output[:, boundary:].float()).abs()
-                self.assertLess(difference.mean().item(), 1e-3)
+                assert (difference.mean().item()) < (1e-3)
                 for candidate_slab, reference_slab in zip(slabs[0], slabs[1]):
                     state_difference = (
                         candidate_slab[3].float() - reference_slab[3].float()
                     ).abs()
-                    self.assertLess(state_difference.mean().item(), 1e-3)
-                    self.assertLess(state_difference.max().item(), 5e-2)
+                    assert (state_difference.mean().item()) < (1e-3)
+                    assert (state_difference.max().item()) < (5e-2)
                 # The checkpoint read by the second chunk is immutable, and the
                 # null block is never written.
                 for slab, saved in zip(slabs[0], checkpoint):
-                    self.assertTrue(torch.equal(slab[1], saved))
-                    self.assertEqual(slab[0].abs().max().item(), 0.0)
+                    assert torch.equal(slab[1], saved)
+                    assert (slab[0].abs().max().item()) == (0.0)
 
     def test_verify_scratch_seeds_conv_but_omits_replayed_ssm_state(self):
         torch = self.torch
@@ -979,7 +968,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         ssm_slab[3].fill_(3)
         ssm_slab[5].fill_(5)
         if not self.gdn_replay_commit_supported(torch.bfloat16):
-            self.skipTest("GDN ReplaySSM kernel unavailable")
+            pytest.skip("GDN ReplaySSM kernel unavailable")
         pool = _ContractPool({0: ("linear_attention", conv_slab, ssm_slab)})
         backend = self._make_backend(pool, spec_num_tokens=4, replay_ssm=True)
         backend.refresh_decode_metadata(
@@ -999,9 +988,9 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         conv_scratch, ssm_scratch = backend._verify_scratch[0]
         torch.cuda.synchronize()
 
-        self.assertTrue(torch.equal(conv_scratch[0], conv_slab[3]))
-        self.assertTrue(torch.equal(conv_scratch[5], conv_slab[5]))
-        self.assertIsNone(ssm_scratch)
+        assert torch.equal(conv_scratch[0], conv_slab[3])
+        assert torch.equal(conv_scratch[5], conv_slab[5])
+        assert (ssm_scratch) is None
 
     def test_gating_reads_a_row_strided_decay_view(self):
         """The prefill scan gates over a row-strided view of the projection."""
@@ -1020,7 +1009,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
 
     def test_paged_states_match_fla_oracle(self):
         if not self.gdn.is_available():
-            self.skipTest("sm100 GDN kernel unavailable")
+            pytest.skip("sm100 GDN kernel unavailable")
         torch = self.torch
         ForwardMode = self.ForwardMode
         from tokenspeed_kernel.ops.attention.gdn._triton.chunk import (
@@ -1138,18 +1127,16 @@ class GDNStatePagingGPUTest(unittest.TestCase):
                 "cuda",
             ),
         )
-        self.assertEqual(
+        assert (
             backend.forward_metadata.state_in_blocks_by_group[
                 "linear_attention"
-            ].tolist(),
-            [0],
-        )
-        self.assertEqual(
+            ].tolist()
+        ) == ([0])
+        assert (
             backend.forward_metadata.state_out_blocks_by_group[
                 "linear_attention"
-            ].tolist(),
-            [2],
-        )
+            ].tolist()
+        ) == ([2])
         outputs = [
             backend.forward_extend(
                 None,
@@ -1190,18 +1177,16 @@ class GDNStatePagingGPUTest(unittest.TestCase):
                 forward_mode=ForwardMode.DECODE,
                 block_tables={"linear_attention": tables[i]},
             )
-            self.assertEqual(
+            assert (
                 backend.forward_metadata.state_in_blocks_by_group[
                     "linear_attention"
-                ].tolist(),
-                [expected_pages[i][0]],
-            )
-            self.assertEqual(
+                ].tolist()
+            ) == ([expected_pages[i][0]])
+            assert (
                 backend.forward_metadata.state_out_blocks_by_group[
                     "linear_attention"
-                ].tolist(),
-                [expected_pages[i][1]],
-            )
+                ].tolist()
+            ) == ([expected_pages[i][1]])
             outputs.append(
                 backend.forward_decode(
                     None,
@@ -1219,28 +1204,26 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             )
 
         paged_output = torch.cat(outputs, dim=1)
-        self.assertEqual(tuple(paged_output.shape), tuple(o_ref.shape))
+        assert (tuple(paged_output.shape)) == (tuple(o_ref.shape))
 
         # Fastpath-test tolerances: mean diff is the real bar, loose max.
         out_diff = (paged_output.float() - o_ref.float()).abs()
-        self.assertLess(out_diff.mean().item(), 1e-3)
-        self.assertTrue(
-            torch.allclose(paged_output.float(), o_ref.float(), atol=1e-1, rtol=1e-2)
-        )
+        assert (out_diff.mean().item()) < (1e-3)
+        assert torch.allclose(paged_output.float(), o_ref.float(), atol=1e-1, rtol=1e-2)
         st_diff = (ssm_slab[3] - st_ref[0].float().transpose(-1, -2)).abs()
-        self.assertLess(st_diff.mean().item(), 1e-3)
+        assert (st_diff.mean().item()) < (1e-3)
 
         # Null block 0 must never be written; block 2 (the published
         # prompt-end checkpoint) is untouched by the first decode that read it.
-        self.assertEqual(conv_slab[0].abs().max().item(), 0.0)
-        self.assertEqual(ssm_slab[0].abs().max().item(), 0.0)
-        self.assertTrue(torch.equal(conv_slab[2], conv_page2_after_prefill))
-        self.assertTrue(torch.equal(ssm_slab[2], ssm_page2_after_prefill))
-        self.assertGreater(ssm_slab[2].abs().max().item(), 0.0)
-        self.assertGreater(ssm_slab[3].abs().max().item(), 0.0)
+        assert (conv_slab[0].abs().max().item()) == (0.0)
+        assert (ssm_slab[0].abs().max().item()) == (0.0)
+        assert torch.equal(conv_slab[2], conv_page2_after_prefill)
+        assert torch.equal(ssm_slab[2], ssm_page2_after_prefill)
+        assert (ssm_slab[2].abs().max().item()) > (0.0)
+        assert (ssm_slab[3].abs().max().item()) > (0.0)
 
 
-class ReplayStateTapeGPUTest(unittest.TestCase):
+class TestReplayStateTapeGPUTest:
     """Decode replay refresh over many state groups and more rows than one tape block."""
 
     def _backend(self, num_groups, bs):
@@ -1299,35 +1282,46 @@ class ReplayStateTapeGPUTest(unittest.TestCase):
             ref_in = torch.where(rows[:, 0] > 0, rows[:, 0], rows[:, 1])
             state_in = md.state_in_blocks_by_group[gid]
             state_out = md.state_out_blocks_by_group[gid]
-            self.assertTrue(torch.equal(state_in[:real_bs], ref_in), gid)
-            self.assertTrue(torch.equal(state_out[:real_bs], rows[:, 1]), gid)
-            self.assertTrue((state_in[real_bs:] == -1).all(), gid)
-            self.assertTrue((state_out[real_bs:] == -1).all(), gid)
+            _pytest_expr_1 = torch.equal(state_in[:real_bs], ref_in)
+            _pytest_msg_2 = gid
+            assert _pytest_expr_1, _pytest_msg_2
+            _pytest_expr_3 = torch.equal(state_out[:real_bs], rows[:, 1])
+            _pytest_msg_4 = gid
+            assert _pytest_expr_3, _pytest_msg_4
+            _pytest_expr_5 = (state_in[real_bs:] == -1).all()
+            _pytest_msg_6 = gid
+            assert _pytest_expr_5, _pytest_msg_6
+            _pytest_expr_7 = (state_out[real_bs:] == -1).all()
+            _pytest_msg_8 = gid
+            assert _pytest_expr_7, _pytest_msg_8
 
     def test_tape_and_eager_fallback_match_the_two_slot_reference(self):
         import torch
 
         if not torch.cuda.is_available():
-            self.skipTest("GPU required")
+            pytest.skip("GPU required")
         torch.manual_seed(0)
         for num_groups, taped in ((1, True), (5, True), (8, True), (9, False)):
             backend = self._backend(num_groups, bs=160)
             self._refresh(backend, num_groups, bs=160, real_bs=150)
-            self.assertEqual(bool(backend._replay_state_tapes), taped, num_groups)
+            _pytest_first_9 = bool(backend._replay_state_tapes)
+            _pytest_second_10 = taped
+            _pytest_msg_11 = num_groups
+            assert _pytest_first_9 == _pytest_second_10, _pytest_msg_11
 
     def test_rebuilt_graph_state_drops_tapes_bound_to_the_old_buffers(self):
         import torch
 
         if not torch.cuda.is_available():
-            self.skipTest("GPU required")
+            pytest.skip("GPU required")
         torch.manual_seed(1)
         backend = self._backend(5, bs=8)
         self._refresh(backend, 5, bs=8, real_bs=6)
         backend.init_cuda_graph_state(max_bs=8)
-        self.assertFalse(backend._replay_state_tapes)
+        assert not (backend._replay_state_tapes)
         # The refresh must write the rebuilt buffers a recaptured graph reads.
         self._refresh(backend, 5, bs=8, real_bs=6)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

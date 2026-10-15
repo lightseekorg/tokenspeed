@@ -27,9 +27,9 @@ import os
 import re
 import sys
 import tempfile
-import unittest
 from pathlib import Path
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -51,13 +51,14 @@ def _deinterleave_rows(w: torch.Tensor) -> torch.Tensor:
     return torch.cat([w[..., 0::2, :], w[..., 1::2, :]], dim=-2)
 
 
-@unittest.skipUnless(
-    _CKPT and Path(_CKPT).is_dir(), "INKLING_REAL_CKPT must name a snapshot dir"
+@pytest.mark.skipif(
+    not (_CKPT and Path(_CKPT).is_dir()),
+    reason=("INKLING_REAL_CKPT must name a snapshot dir"),
 )
-@unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
-class TestInklingRealCheckpointLoad(unittest.TestCase):
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs a CUDA device"))
+class TestInklingRealCheckpointLoad:
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         from safetensors import safe_open
 
         snapshot = Path(_CKPT)
@@ -177,7 +178,7 @@ class TestInklingRealCheckpointLoad(unittest.TestCase):
         return model.eval(), config.get_text_config()
 
     @classmethod
-    def tearDownClass(cls):
+    def teardown_class(cls):
         del cls.model
         torch.cuda.empty_cache()
         cls._tmpdir.cleanup()
@@ -193,19 +194,27 @@ class TestInklingRealCheckpointLoad(unittest.TestCase):
 
     def _assert_eq(self, param: torch.Tensor, expected: torch.Tensor, what: str):
         expected = expected.to(device=param.device, dtype=param.dtype)
-        self.assertEqual(param.shape, expected.shape, what)
-        self.assertTrue(torch.equal(param, expected), f"{what} mismatch")
+        _pytest_first_1 = param.shape
+        _pytest_second_2 = expected.shape
+        _pytest_msg_3 = what
+        assert _pytest_first_1 == _pytest_second_2, _pytest_msg_3
+        _pytest_expr_4 = torch.equal(param, expected)
+        _pytest_msg_5 = f"{what} mismatch"
+        assert _pytest_expr_4, _pytest_msg_5
 
     def test_index_pattern_coverage(self):
-        self.assertEqual(
-            self.uncovered_patterns, [], "index patterns not exercised by the load"
-        )
+        assert (self.uncovered_patterns) == (
+            []
+        ), "index patterns not exercised by the load"
 
     def test_full_parameter_coverage(self):
         params = dict(self.model.named_parameters())
         missing = sorted(set(params) - self.loaded)
-        self.assertEqual(missing, [], f"replica params never loaded: {missing}")
-        self.assertNotIn("model.mtp.chain_norm.weight", self.loaded)
+        _pytest_first_6 = missing
+        _pytest_second_7 = []
+        _pytest_msg_8 = f"replica params never loaded: {missing}"
+        assert _pytest_first_6 == _pytest_second_7, _pytest_msg_8
+        assert ("model.mtp.chain_norm.weight") not in (self.loaded)
 
     def test_embed_and_lm_head(self):
         embed = self._ckpt_tensor("model.llm.embed.weight")
@@ -269,7 +278,7 @@ class TestInklingRealCheckpointLoad(unittest.TestCase):
         p = f"model.llm.layers.{real_id}.mlp"
         o = f"model.layers.{replica_id}.mlp"
         gate_bias = self._param(f"{o}.gate.bias")
-        self.assertEqual(gate_bias.dtype, torch.float32, "router bias stays fp32")
+        assert (gate_bias.dtype) == (torch.float32), "router bias stays fp32"
         self._assert_eq(gate_bias, self._ckpt_tensor(f"{p}.gate.bias"), "gate bias")
         self._assert_eq(
             self._param(f"{o}.gate.global_scale"),
@@ -301,17 +310,17 @@ class TestInklingRealCheckpointLoad(unittest.TestCase):
         land on the quantized layer, while the excluded first-MoE-layer
         experts (covered by test_moe_layer) stay BF16."""
         if not self.is_fp4:
-            self.skipTest("BF16 snapshot: no quantized experts")
+            pytest.skip("BF16 snapshot: no quantized experts")
         replica_id, real_id = 2, _LAYER_MAP[2]
         p = f"model.llm.layers.{real_id}.mlp.experts"
         o = f"model.layers.{replica_id}.mlp.experts"
         pw13 = self._param(f"{o}.w13_weight")
-        self.assertEqual(pw13.dtype, torch.uint8)
+        assert (pw13.dtype) == (torch.uint8)
         w13 = self._ckpt_tensor(f"{p}.w13_weight")
         for e in (0, 100, self.text.n_routed_experts - 1):
             self._assert_eq(pw13[e], _deinterleave_rows(w13[e]), f"fp4 w13 e{e}")
         scale = self._param(f"{o}.w13_weight_scale")
-        self.assertEqual(scale.dtype, torch.float8_e4m3fn)
+        assert (scale.dtype) == (torch.float8_e4m3fn)
         ckpt_scale = self._ckpt_tensor(f"{p}.w13_weight.scale")
         self._assert_eq(
             scale[0].view(torch.uint8),
@@ -326,14 +335,12 @@ class TestInklingRealCheckpointLoad(unittest.TestCase):
         expected = self._ckpt_tensor(f"{p}.w13_weight.input_amax").float() / (
             448.0 * 6.0
         )
-        self.assertTrue(
-            torch.allclose(input_scale.cpu(), expected.expand_as(input_scale.cpu())),
-            "fp4 input_scale conversion",
-        )
+        assert torch.allclose(
+            input_scale.cpu(), expected.expand_as(input_scale.cpu())
+        ), "fp4 input_scale conversion"
         # The excluded layer's experts must have stayed unquantized.
-        self.assertEqual(
-            self._param("model.layers.3.mlp.experts.w13_weight").dtype,
-            torch.bfloat16,
+        assert (self._param("model.layers.3.mlp.experts.w13_weight").dtype) == (
+            torch.bfloat16
         )
 
     def test_vision_tower(self):
@@ -350,4 +357,4 @@ class TestInklingRealCheckpointLoad(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

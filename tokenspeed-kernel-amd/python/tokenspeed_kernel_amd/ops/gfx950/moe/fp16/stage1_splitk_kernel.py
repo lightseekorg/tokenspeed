@@ -346,9 +346,10 @@ def invoke_stage1_splitk(
     out: torch.Tensor,  # (num_tokens*topk, I) bf16 (inter)
     topk: int,
     split_k: int,
-    BLOCK_M: int = 64,
-    BLOCK_N: int = 128,
-    BLOCK_K: int = 64,
+    *,
+    BLOCK_M: int,
+    BLOCK_N: int,
+    BLOCK_K: int,
     num_warps: int = 4,
     nbuf: int = 2,
 ):

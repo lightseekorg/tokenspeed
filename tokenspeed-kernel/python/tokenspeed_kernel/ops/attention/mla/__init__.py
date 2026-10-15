@@ -552,23 +552,19 @@ def _mla_normalize_project_query_fallback(
         eps=eps,
     )
     if platform.is_cdna5 and query.shape[0] > 1:
-        from tokenspeed_kernel.ops.gemm.kimi3 import _try_gluon_largem_gfx1250
-        from tokenspeed_kernel.ops.gemm.triton_gemv import use_decode_gemv
+        from tokenspeed_kernel.ops.gemm import _try_gluon_largem_gfx1250, mm
 
         if (
             _try_gluon_largem_gfx1250(query_norm, projection_weight, out=out)
             is not None
         ):
             return
-        if not use_decode_gemv(query_norm, projection_weight):
-            from tokenspeed_kernel.ops.gemm import mm
+        mm(query_norm, projection_weight, out=out)
+        return
 
-            mm(query_norm, projection_weight, out=out)
-            return
+    from tokenspeed_kernel.ops.gemm import mv
 
-    from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
-
-    decode_gemv(query_norm, projection_weight, out=out)
+    mv(query_norm, projection_weight, out=out)
 
 
 def mla_prefill_traits(

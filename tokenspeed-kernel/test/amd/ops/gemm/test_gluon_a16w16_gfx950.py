@@ -33,7 +33,7 @@ if not is_cdna4():
     )
 
 
-from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_router_projection  # noqa: E402
+from tokenspeed_kernel.ops.gemm import kimi3_router_projection  # noqa: E402
 from tokenspeed_kernel.workspace import capture_session, zeroed_state  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     launch_gluon_mm_a16w16_prefill_gfx950,
