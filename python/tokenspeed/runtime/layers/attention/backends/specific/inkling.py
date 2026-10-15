@@ -262,7 +262,7 @@ class InklingAttnBackend(AttentionBackend):
         # sconv state always has its checkpoint bridges; there is no rolling mode.
         self.conv_columns: InklingConvColumns
         self._conv_geometry_latched: _ConvGeometry | None = None
-        # The conv groups are state-family: the inner router builds leaves
+        # The conv groups are state groups: the inner router builds leaves
         # for history groups only, so it never sees them; this wrapper reads
         # them straight out of block_tables.
         # Two slots, like forward_prefill_metadata / forward_decode_metadata
@@ -364,8 +364,8 @@ class InklingAttnBackend(AttentionBackend):
         return self.inner.supports_layer_sliding_window
 
     @property
-    def cache_consumer_families(self):
-        return frozenset(self.inner.cache_consumer_families) | {"state"}
+    def cache_consumer_attn_kinds(self):
+        return frozenset(self.inner.cache_consumer_attn_kinds) | {"state"}
 
     def prepare_remote_cache_slots(self, slot_indices: list[int]) -> None:
         """Clear stale hydration state before publishing RDMA destinations."""
@@ -557,7 +557,7 @@ class InklingAttnBackend(AttentionBackend):
                 "Inkling decode metadata goes through refresh_decode_metadata; "
                 f"init_forward_metadata only serves extend ({forward_mode})"
             )
-        # The conv groups are state-family, so the inner router builds no leaf
+        # The conv groups are state groups, so the inner router builds no leaf
         # for them; this wrapper reads them straight out of block_tables.
         group_tables = block_tables
         extend_total = int(sum(extend_seq_lens_cpu[:bs].tolist()))

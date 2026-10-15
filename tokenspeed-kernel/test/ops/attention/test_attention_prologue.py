@@ -2022,7 +2022,10 @@ def _scale(dtype: torch.dtype, rows: int, width: int = 1):
             dict(cache__kv_cache=lambda c: c.kv_cache[:1].expand(8, -1, -1)),
             "latent cache rows",
         ),
-        (dict(cache__kv_cache=lambda c: c.kv_cache.unsqueeze(1)), "latent cache rows"),
+        (
+            dict(cache__kv_cache=lambda c: c.kv_cache.unsqueeze(1).unsqueeze(1)),
+            "latent cache rows",
+        ),
         (dict(cache__kv_cache=lambda c: c.kv_cache[..., :512]), "latent cache rows"),
         (
             dict(cache__kv_cache=lambda c: torch.cat([c.kv_cache] * 2, -1)[..., :640]),
@@ -2319,3 +2322,54 @@ def test_the_fused_kernel_declines_the_storeless_form():
                 torch.arange(tokens, device="cuda"),
             ),
         )
+
+
+@pytest.mark.parametrize("solution", ["triton", "composite"])
+@pytest.mark.parametrize("rank,page_size", [(512, 64), (1024, 32)])
+def test_mla_writes_strided_fp8_pages_without_touching_padding(
+    solution, rank, page_size
+):
+    tokens, heads, rope = 9, 8, 64
+    q_nope, q_pe, latent = mla_inputs(tokens, heads, rank, rope, seed=195)
+    loc = torch.tensor(
+        [
+            0,
+            page_size - 1,
+            page_size,
+            page_size + 2,
+            2 * page_size,
+            3 * page_size,
+            3 * page_size + 1,
+            3 * page_size + 3,
+            4 * page_size - 1,
+        ],
+        device="cuda",
+    )
+    mask = torch.tensor([1, 1, 0, 1, 0, 1, 1, 1, 1], device="cuda").bool()
+    storage = poisoned_latent(4 * (page_size + 5), rank + rope, FP8).view(
+        4, page_size + 5, 1, rank + rope
+    )
+    cache = storage[:, :page_size]
+    padding = storage[:, page_size:].clone()
+    flat = cache.reshape(-1, 1, rank + rope).clone()
+    rotary = Rotary(
+        cos_sin_cache(rope), torch.arange(tokens, device="cuda"), RopeStyle.GPTJ, None
+    )
+
+    def run(target):
+        return mla_prologue(
+            mla_query(q_nope, rope),
+            q_pe.clone(),
+            latent.clone(),
+            expanded=None,
+            rotary=rotary,
+            cache=latent_target(target, loc, write_mask=mask),
+            solution=solution,
+            override=None,
+        ).query
+
+    ref = run(flat)
+    got = run(cache)
+    assert bytes_equal(got, ref)
+    assert bytes_equal(cache, flat.view_as(cache))
+    assert bytes_equal(storage[:, page_size:], padding)

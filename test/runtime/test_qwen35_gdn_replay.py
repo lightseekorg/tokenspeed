@@ -421,7 +421,7 @@ def test_staged_verify_reading_committed_state_matches_seeded_scratch(
 def test_gdn_backend_resolves_verify_state_path_from_the_kernel():
     """GdnAttnBackend reads the committed state in place and the packed q/k/v
     views exactly where the selected verify kernel accepts them."""
-    from tokenspeed_kernel.ops.attention.gdn import gdn_decode_mtp_supports
+    from tokenspeed_kernel.ops.attention.gdn import gdn_decode_supports
 
     from tokenspeed.runtime.layers.attention.backends.state.gdn import (
         GdnAttnBackend,
@@ -432,15 +432,18 @@ def test_gdn_backend_resolves_verify_state_path_from_the_kernel():
     backend = GdnAttnBackend(*_config(replay=False))
     backend.set_kv_pool(pool)
 
-    def supports(trait):
-        return gdn_decode_mtp_supports(
-            torch.bfloat16, head_dim=HEAD_K_DIM, trait=trait, solution=None
+    def supports(op, trait):
+        return gdn_decode_supports(
+            op, torch.bfloat16, head_dim=HEAD_K_DIM, trait=trait, solution=None
         )
 
     assert backend._verify_reads_committed_recurrent_state == supports(
-        "separate_output_state"
+        "gdn_decode_mtp", "separate_output_state"
     )
-    assert backend._verify_packed_qkv_views == supports("strided_qkv")
+    assert backend._verify_packed_qkv_views == supports("gdn_decode_mtp", "strided_qkv")
+    assert backend._decode_packed_qkv_views == supports(
+        "gdn_decode_step", "strided_qkv"
+    )
 
 
 @pytest.mark.parametrize("chunked", [False, True])

@@ -33,9 +33,8 @@ Covers:
 import pytest
 from tokenspeed_scheduler import (
     PD,
+    AttnKind,
     CacheGroupConfig,
-    CacheGroupFamily,
-    CacheRetention,
     CacheTransferPolicy,
     ExecutionEvent,
     ExecutionPlan,
@@ -67,8 +66,7 @@ def make_config(
             group_id="full_attention",
             block_granularity=prefix_granularity,
             total_pages=num_device_pages,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
         )
     ]
     return cfg

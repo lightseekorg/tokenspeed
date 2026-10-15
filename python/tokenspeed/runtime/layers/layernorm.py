@@ -516,7 +516,16 @@ class FusedRMSNorm(nn.Module):
         Returns:
             Tuple of (normalized_q_a, normalized_kv_a)
         """
-        if _is_amd:
+        if _platform.is_npu:
+            # Ascend uses the registered RMSNorm leaves. Preserve the dual
+            # norm contract: omitted outputs overwrite their input buffers.
+            self.q_a_norm(
+                input_q_a, out=input_q_a if output_q_a is None else output_q_a
+            )
+            self.kv_a_norm(
+                input_kv_a, out=input_kv_a if output_kv_a is None else output_kv_a
+            )
+        elif _is_amd:
             triton_rmsnorm_fused_parallel(
                 input1=input_q_a,
                 weight1=self.weight_q_a,

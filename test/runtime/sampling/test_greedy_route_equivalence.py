@@ -54,6 +54,7 @@ MAX_N = 4
 
 def _make_config() -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         enable_speculative_sampling=False,
         sampling_stream="batch",
         logprob_order="torch",

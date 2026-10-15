@@ -20,8 +20,8 @@
 
 """A controller that dispatches requests to multiple data parallel workers."""
 
+import contextlib
 import copy
-import multiprocessing as mp
 import os
 import signal
 import threading
@@ -49,7 +49,11 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
-from tokenspeed.runtime.utils.process import register_usr_signal
+from tokenspeed.runtime.utils.process import (
+    receive_ready_messages,
+    register_usr_signal,
+    start_process_with_ready_pipe,
+)
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
 logger = get_colorful_logger(__name__)
@@ -351,6 +355,7 @@ class DataParallelController:
         from tokenspeed.runtime.engine.event_loop import run_event_loop
 
         scheduler_pipe_readers = []
+        group_procs = []
         mapping_template = server_args.mapping
         attn_tp_size = mapping_template.attn.tp_size
 
@@ -363,7 +368,6 @@ class DataParallelController:
         else:
             attn_tp_rank_range = range(0, attn_tp_size)
         for attn_tp_rank in attn_tp_rank_range:
-            reader, writer = mp.Pipe(duplex=False)
             global_rank = dp_rank * attn_tp_size + attn_tp_rank
 
             # Create per-rank server_args with rank-initialized mapping
@@ -371,19 +375,16 @@ class DataParallelController:
             rank_server_args.mapping = copy.deepcopy(mapping_template)
             rank_server_args.mapping.rank = global_rank
 
-            proc = mp.Process(
-                target=run_event_loop,
-                args=(
-                    rank_server_args,
-                    port_args,
-                    writer,
-                ),
+            proc, reader = start_process_with_ready_pipe(
+                run_event_loop,
+                (rank_server_args, port_args),
+                contextlib.nullcontext(),
             )
-            proc.start()
             self.scheduler_procs.append(proc)
+            group_procs.append(proc)
             scheduler_pipe_readers.append(reader)
         # Wait for model to finish loading
-        scheduler_info = [reader.recv() for reader in scheduler_pipe_readers]
+        scheduler_info = receive_ready_messages(scheduler_pipe_readers, group_procs)
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]

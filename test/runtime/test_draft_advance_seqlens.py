@@ -289,10 +289,10 @@ def test_router_fans_advance_out_to_every_leaf():
     router.bind(
         CacheGroupGeometry(
             granularities={"full_attention": 64},
-            families={"full_attention": "history"},
+            attn_kinds={"full_attention": "full_history"},
             full_history_group_id="full_attention",
             row_geometry={"full_attention": (64, 1)},
-            retentions={"full_attention": ("full_history", None)},
+            windows={"full_attention": None},
         ),
         {"full_attention": leaf},
     )

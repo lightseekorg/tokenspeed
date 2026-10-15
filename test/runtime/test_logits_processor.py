@@ -38,6 +38,12 @@ def test_logits_processor_only_uses_fused_lm_head_for_kimi(monkeypatch):
         return torch.matmul(hidden.to(weight.dtype), weight.T)
 
     monkeypatch.setattr(logits_processor_module, "_lm_head_matmul", fake_lm_head_matmul)
+    is_nvidia = logits_processor_module.current_platform().is_nvidia
+    monkeypatch.setattr(
+        logits_processor_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_amd=False, is_nvidia=is_nvidia),
+    )
 
     non_kimi = LogitsProcessor(
         config=SimpleNamespace(model_type="test", vocab_size=2), dp_lm_head_tp=False

@@ -182,7 +182,7 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
         (
             CacheGroupSpec(
                 group_id=group_id,
-                retention="full_history",
+                attn_kind="full_history",
                 rows_per_page=prefix_granularity,
                 entry_stride_tokens=1,
                 sliding_window_tokens=None,
@@ -191,9 +191,8 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
             if group_id == "full_attention"
             else CacheGroupSpec(
                 group_id=group_id,
-                retention="full_history",
+                attn_kind="state",
                 sliding_window_tokens=None,
-                family="state",
                 replayable=False,
             )
         )

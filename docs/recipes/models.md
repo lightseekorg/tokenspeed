@@ -772,9 +772,15 @@ ts serve \
     --trust-remote-code \
     --tensor-parallel-size 2 \
     --quantization mxfp4 \
+    --max-num-seqs 16 \
+    --max-cudagraph-capture-size 16 \
     --speculative-algorithm MTP \
     --speculative-num-steps 3
 ```
+
+The above configuration caps the batch at 16 sequences for latency; raise
+`--max-num-seqs` and `--max-cudagraph-capture-size` together for throughput.
+Keep ReplaySSM, the default.
 
 ### Optional `--hf-overrides`
 

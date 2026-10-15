@@ -46,7 +46,7 @@ import torch
 from tokenspeed.runtime.utils.triton import tl, triton
 
 
-@triton.jit(do_not_specialize=["num_tokens", "tokens_per_req"])
+@triton.jit(do_not_specialize=["num_tokens", "tokens_per_req", "seq_len_offset"])
 def _decode_locs_kernel(
     tables_ptr,  # [G, max_bs, max_num_pages] int32
     page_sizes_ptr,  # [G] int32
@@ -58,6 +58,7 @@ def _decode_locs_kernel(
     out_stride_g,
     num_tokens,  # bs * tokens_per_req
     tokens_per_req,
+    seq_len_offset,  # added to every loaded length
     BLOCK: tl.constexpr,
 ):
     g = tl.program_id(0)
@@ -67,7 +68,7 @@ def _decode_locs_kernel(
     req = tok // tokens_per_req
     step = tok % tokens_per_req
     seq_len = tl.load(seq_lens_ptr + req, mask=mask, other=1).to(tl.int64)
-    pos = tl.maximum(seq_len - tokens_per_req + step, 0)
+    pos = tl.maximum(seq_len + seq_len_offset - tokens_per_req + step, 0)
     page_size = tl.load(page_sizes_ptr + g).to(tl.int64)
     page_idx = pos // page_size
     overflow = page_idx >= max_num_pages
@@ -167,6 +168,32 @@ def decode_write_locations(
             slot 0).
         tokens_per_req: Trailing window width ``n``.
     """
+    _write_locations(tables, page_sizes, seq_lens, out, bs, tokens_per_req, 0)
+
+
+def window_write_locations(
+    tables: torch.Tensor,
+    page_sizes: torch.Tensor,
+    window_starts: torch.Tensor,
+    out: torch.Tensor,
+    bs: int,
+    tokens_per_req: int,
+) -> None:
+    """:func:`decode_write_locations` of the windows ``start .. start + n - 1`` for ``window_starts[:bs]``."""
+    _write_locations(
+        tables, page_sizes, window_starts, out, bs, tokens_per_req, tokens_per_req
+    )
+
+
+def _write_locations(
+    tables: torch.Tensor,
+    page_sizes: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+    bs: int,
+    tokens_per_req: int,
+    seq_len_offset: int,
+) -> None:
     n = max(int(tokens_per_req), 1)
     num_tokens = bs * n
     if num_tokens == 0 or tables.shape[0] == 0:
@@ -190,10 +217,11 @@ def decode_write_locations(
             out.stride(0),
             num_tokens,
             n,
+            seq_len_offset,
             BLOCK=block,
         )
         return
-    pos = _decode_positions(seq_lens[:bs], n)
+    pos = _decode_positions(seq_lens[:bs].to(torch.int64) + seq_len_offset, n)
     req = torch.arange(bs, device=tables.device).repeat_interleave(n)
     for g in range(tables.shape[0]):
         out[g, :num_tokens] = _gather_slots(tables[g], req, pos, int(page_sizes[g]))

@@ -14,6 +14,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import math
 from typing import Optional
 
 import torch
@@ -814,3 +815,135 @@ def triton_quantize_fp8_group32_ue8m0(
             num_stages=1,
         )
     return quantized, scales
+
+
+@triton.jit
+def _gated_fp8_quantize_kernel(
+    x_ptr,
+    gate_ptr,
+    norm_ptr,
+    out_ptr,
+    scale_ptr,
+    x_stride,
+    gate_stride,
+    columns,
+    eps,
+    HEAD_DIM: tl.constexpr,
+    HAS_NORM: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    groups = columns // 128
+    head = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    col = tl.arange(0, BLOCK_D)
+    valid = (head[:, None] < columns // HEAD_DIM) & (col[None, :] < HEAD_DIM)
+    offsets = head[:, None] * HEAD_DIM + col[None, :]
+    gate = tl.load(gate_ptr + row * gate_stride + offsets, valid, 0).to(tl.float32)
+    if HAS_NORM:
+        weight = tl.load(norm_ptr + col, col < HEAD_DIM, 0).to(tl.float32)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    value = tl.load(x_ptr + row * x_stride + offsets, valid, 0).to(tl.float32)
+    if HAS_NORM:
+        variance = tl.sum(value * value, axis=1) / HEAD_DIM
+        value = value * tl.rsqrt(variance + eps)[:, None] * weight[None, :]
+    value = (value * tl.sigmoid(gate)).to(x_ptr.dtype.element_ty).to(tl.float32)
+    if HEAD_DIM != BLOCK_D:
+        # Remove per-head padding before forming the 128-element FP8 groups.
+        linear = tl.arange(0, BLOCK_H * BLOCK_D)
+        source = linear // HEAD_DIM * BLOCK_D + linear % HEAD_DIM
+        value = tl.gather(
+            value.reshape(BLOCK_H * BLOCK_D),
+            tl.minimum(source, BLOCK_H * BLOCK_D - 1),
+            axis=0,
+        )
+    value = value.reshape(BLOCK_H * BLOCK_D // 128, 128)
+    # Match the native quantizer's input rounding and reciprocal scale convention.
+    floor = tl.full((), 1e-10, tl.float32).to(x_ptr.dtype.element_ty).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(value), axis=1), floor)
+    quant_scale = tl.div_rn(448.0, amax)
+    scale = tl.div_rn(1.0, quant_scale)
+    quantized = tl.clamp(value * quant_scale[:, None], -448.0, 448.0)
+    local_group = tl.arange(0, BLOCK_H * BLOCK_D // 128)
+    group = tl.program_id(1) * (BLOCK_H * HEAD_DIM // 128) + local_group
+    valid_group = (local_group < BLOCK_H * HEAD_DIM // 128) & (group < groups)
+    offsets = group[:, None] * 128 + tl.arange(0, 128)[None, :]
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    tl.store(out_ptr + row * columns + offsets, quantized, valid_group[:, None])
+    tl.store(scale_ptr + row * groups + group, scale, valid_group)
+
+
+@register_kernel(
+    "quantization",
+    "gated_fp8",
+    name="triton_gated_fp8_quantize",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=format_signatures(("x", "gate"), "dense", {torch.bfloat16}),
+    traits={},
+    priority=Priority.SPECIALIZED,
+)
+def triton_gated_fp8_quantize(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    *,
+    norm_weight: torch.Tensor | None,
+    eps: float,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply per-head RMSNorm, sigmoid gating, and per-128 FP8 quantization."""
+    if x.ndim != 2 or x.shape[-1] % 128 or x.stride(-1) != 1:
+        raise ValueError(
+            "Gated FP8 quantization requires rows of contiguous 128-element groups"
+        )
+    if (
+        gate.shape != x.shape
+        or gate.dtype != x.dtype
+        or gate.device != x.device
+        or gate.stride(-1) != 1
+    ):
+        raise ValueError("Gate must match input rows, dtype and device")
+    if norm_weight is not None and (
+        norm_weight.ndim != 1
+        or norm_weight.numel() == 0
+        or x.shape[1] % norm_weight.numel() != 0
+        or norm_weight.device != x.device
+        or norm_weight.stride(0) != 1
+        or eps <= 0
+    ):
+        raise ValueError(
+            "RMSNorm requires a contiguous weight whose length divides the row "
+            "and positive epsilon"
+        )
+    rows, columns = x.shape
+    head_dim = norm_weight.numel() if norm_weight is not None else 128
+    groups = columns // 128
+    # Tile boundaries must align with both whole heads and whole FP8 groups.
+    block_h = triton.next_power_of_2(
+        max(128 // math.gcd(head_dim, 128), triton.cdiv(1024, head_dim))
+    )
+    values = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
+    scales = torch.empty((rows, groups), device=x.device, dtype=torch.float32)
+    if rows:
+        _gated_fp8_quantize_kernel[(rows, triton.cdiv(columns, block_h * head_dim))](
+            x,
+            gate,
+            norm_weight,
+            values,
+            scales,
+            x.stride(0),
+            gate.stride(0),
+            columns,
+            eps,
+            HEAD_DIM=head_dim,
+            HAS_NORM=norm_weight is not None,
+            ENABLE_PDL=enable_pdl,
+            BLOCK_H=block_h,
+            BLOCK_D=triton.next_power_of_2(head_dim),
+            num_warps=4,
+            **({"launch_pdl": True} if enable_pdl else {}),
+        )
+    return values, scales

@@ -20,8 +20,12 @@ people and average people is more than tenfold.
 
 ## Code changes
 
-* Add tests for the changed code. Don't be excessive--avoid checking trivial
-  details or exceptions.
+* Add tests for the changed code. A unit test must fail only when the code
+  under test is wrong: test behavior through real classes, not structure
+  (symbol existence, hierarchies, signatures, source text), mock call
+  choreography, or third-party packages. Avoid mocks and `SimpleNamespace`
+  unless definitely required; mock only what the test environment genuinely
+  lacks: GPUs, process groups, network, model weights.
 * Update docs for the changed code. Use concise comments to explain code
   where it might be tricky for humans to understand. Leave project/component
   level (design) docs focusing on high-level picture. Put suitable docs at
@@ -53,17 +57,6 @@ people and average people is more than tenfold.
   committing. Always run the exact `pre-commit run --all-files` command and
   commit any formatter changes it makes.
 * When creating commits, perform sign off on behalf of the author.
-
-## Code review
-
-When Codex or Claude Code reviews code changes, consult these references for
-the languages involved:
-
-* For C++ changes, consult the
-  [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html) and
-  the [C++ Core Guidelines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines).
-* For Python changes, consult the
-  [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html).
 
 ## Design principles
 

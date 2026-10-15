@@ -1,8 +1,9 @@
+import sys
 import tempfile
-import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import tokenspeed_kernel.profiling as profiling
 import torch
 
@@ -47,12 +48,13 @@ def _start_req(output_dir: str, **kwargs) -> ProfileReq:
     )
 
 
-class TestRequestHandlerProtonProfile(unittest.TestCase):
-    def setUp(self):
+class TestRequestHandlerProtonProfile:
+    @pytest.fixture(autouse=True)
+    def _setup(self, request):
         self.handler = _make_handler()
         self.output_dir = tempfile.mkdtemp()
         profiling.ProfilingState.reset()
-        self.addCleanup(profiling.ProfilingState.reset)
+        request.addfinalizer(profiling.ProfilingState.reset)
         # stop_profile rendezvouses the attn-TP CPU group through
         # _profile_sync, which all-reduces a preallocated CPU tensor rather
         # than calling barrier (barrier would allocate on the bound CUDA
@@ -62,7 +64,7 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             request_handler_mod.torch.distributed, "all_reduce"
         )
         self.profile_sync = sync_patcher.start()
-        self.addCleanup(sync_patcher.stop)
+        request.addfinalizer(sync_patcher.stop)
 
     def test_init_fails_when_proton_unavailable(self):
         with mock.patch.object(
@@ -70,9 +72,9 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         ):
             result = self.handler.profile(_start_req(self.output_dir))
 
-        self.assertFalse(result.success)
-        self.assertIn("Proton is not available", result.message)
-        self.assertFalse(self.handler.profile_in_progress)
+        assert not (result.success)
+        assert ("Proton is not available") in (result.message)
+        assert not (self.handler.profile_in_progress)
 
     def test_init_rejects_proton_mixed_with_gpu_profilers(self):
         for conflicting in (["GPU"], ["CUDA_PROFILER"], ["GPU", "CUDA_PROFILER"]):
@@ -81,10 +83,10 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
 
             result = self.handler.profile(req)
 
-            self.assertFalse(result.success)
+            assert not (result.success)
             for activity in conflicting:
-                self.assertIn(activity, result.message)
-            self.assertFalse(self.handler.profile_in_progress)
+                assert (activity) in (result.message)
+            assert not (self.handler.profile_in_progress)
 
     def test_rejected_request_leaves_profiler_state_untouched(self):
         req = _start_req(self.output_dir, profile_by_stage=True, num_steps=2)
@@ -92,11 +94,11 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
 
         result = self.handler.profile(req)
 
-        self.assertFalse(result.success)
-        self.assertFalse(self.handler.profile_by_stage)
+        assert not (result.success)
+        assert not (self.handler.profile_by_stage)
         self.handler.forward_ct = 1
         self.handler._profile_batch_predicate(ForwardMode.EXTEND)
-        self.assertFalse(self.handler.profile_in_progress)
+        assert not (self.handler.profile_in_progress)
 
     def test_init_allows_proton_with_host_side_profilers(self):
         req = _start_req(self.output_dir)
@@ -116,7 +118,7 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
                 profile_id="test-profile",
             )
 
-        self.assertTrue(result.success)
+        assert result.success
 
     def test_init_fails_when_env_bootstrap_session_active(self):
         state = profiling.ProfilingState.get()
@@ -128,9 +130,9 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         ):
             result = self.handler.profile(_start_req(self.output_dir))
 
-        self.assertFalse(result.success)
-        self.assertIn("already active", result.message)
-        self.assertFalse(self.handler.profile_in_progress)
+        assert not (result.success)
+        assert ("already active") in (result.message)
+        assert not (self.handler.profile_in_progress)
 
     def test_init_rejects_hip_visible_devices_for_amd_proton(self):
         with (
@@ -144,9 +146,9 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         ):
             result = self.handler.profile(_start_req(self.output_dir))
 
-        self.assertFalse(result.success)
-        self.assertIn("ROCR_VISIBLE_DEVICES", result.message)
-        self.assertFalse(self.handler.profile_in_progress)
+        assert not (result.success)
+        assert ("ROCR_VISIBLE_DEVICES") in (result.message)
+        assert not (self.handler.profile_in_progress)
 
     def test_start_returns_failure_when_proton_cannot_initialize(self):
         with mock.patch.object(
@@ -158,9 +160,9 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         ):
             result = self.handler.profile(_start_req(self.output_dir))
 
-        self.assertFalse(result.success)
-        self.assertIn("Failed to start Proton profiling", result.message)
-        self.assertFalse(self.handler.profile_in_progress)
+        assert not (result.success)
+        assert ("Failed to start Proton profiling") in (result.message)
+        assert not (self.handler.profile_in_progress)
 
     def test_start_and_stop_drive_proton_session_per_rank(self):
         self.handler = _make_handler(_attn_mapping(tp_rank=3))
@@ -172,31 +174,29 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             request_handler_mod, "stop_profiling"
         ) as stop_profiling:
             result = self.handler.profile(_start_req(self.output_dir))
-            self.assertTrue(result.success)
-            self.assertTrue(self.handler.profile_in_progress)
+            assert result.success
+            assert self.handler.profile_in_progress
 
             config = start_profiling.call_args[0][0]
-            self.assertEqual(config.output.rsplit("/", 1)[0], self.output_dir)
-            self.assertTrue(config.output.endswith("test-profile-TP3.proton"))
+            assert (config.output.rsplit("/", 1)[0]) == (self.output_dir)
+            assert config.output.endswith("test-profile-TP3.proton")
             stop_profiling.assert_not_called()
 
             result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
-            self.assertTrue(result.success)
+            assert result.success
             stop_profiling.assert_called_once()
-            self.assertFalse(self.handler.profile_in_progress)
+            assert not (self.handler.profile_in_progress)
 
     def test_rank_tag_includes_dp_rank_when_present(self):
-        self.assertEqual(
-            request_handler_mod._profile_rank_tag(_attn_mapping(tp_rank=3)), "TP3"
+        assert (request_handler_mod._profile_rank_tag(_attn_mapping(tp_rank=3))) == (
+            "TP3"
         )
-        self.assertEqual(
-            request_handler_mod._profile_rank_tag(_attn_mapping(tp_rank=0, dp_rank=1)),
-            "DP1-TP0",
-        )
-        self.assertEqual(
-            request_handler_mod._profile_rank_tag(_attn_mapping(tp_rank=2, dp_rank=1)),
-            "DP1-TP2",
-        )
+        assert (
+            request_handler_mod._profile_rank_tag(_attn_mapping(tp_rank=0, dp_rank=1))
+        ) == ("DP1-TP0")
+        assert (
+            request_handler_mod._profile_rank_tag(_attn_mapping(tp_rank=2, dp_rank=1))
+        ) == ("DP1-TP2")
 
     def test_proton_outputs_do_not_collide_across_dp_ranks(self):
         # Two DP peers share attn_tp_rank=0 but must write distinct files.
@@ -211,13 +211,13 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
                 request_handler_mod, "stop_profiling"
             ):
                 result = handler.profile(_start_req(self.output_dir))
-                self.assertTrue(result.success)
+                assert result.success
                 outputs.append(start_profiling.call_args[0][0].output)
                 handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
 
-        self.assertNotEqual(outputs[0], outputs[1])
-        self.assertTrue(outputs[0].endswith("test-profile-DP0-TP0.proton"))
-        self.assertTrue(outputs[1].endswith("test-profile-DP1-TP0.proton"))
+        assert (outputs[0]) != (outputs[1])
+        assert outputs[0].endswith("test-profile-DP0-TP0.proton")
+        assert outputs[1].endswith("test-profile-DP1-TP0.proton")
 
     def test_stop_profile_syncs_tp_peers_after_proton_finalize(self):
         # Only attn-TP rank 0 replies to /stop_profile; the reply must wait
@@ -229,13 +229,15 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         ), mock.patch.object(request_handler_mod, "start_profiling"), mock.patch.object(
             request_handler_mod, "stop_profiling"
         ) as stop_profiling:
-            self.profile_sync.side_effect = lambda tensor, group: self.assertTrue(
-                stop_profiling.called
-            )
+
+            def sync_after_finalize(tensor, group):
+                assert stop_profiling.called
+
+            self.profile_sync.side_effect = sync_after_finalize
             self.handler.profile(_start_req(self.output_dir))
             result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
 
-        self.assertTrue(result.success)
+        assert result.success
         self.profile_sync.assert_called_once_with(
             self.handler._profile_sync_buf, group=self.handler.attn_tp_cpu_group
         )
@@ -260,7 +262,7 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         barrier.assert_not_called()
         self.profile_sync.assert_called_once()
         tensor = self.profile_sync.call_args.args[0]
-        self.assertEqual(tensor.device.type, "cpu")
+        assert (tensor.device.type) == ("cpu")
 
     def test_profile_sync_is_a_noop_without_peers(self):
         self.handler.attn_tp_size = 1
@@ -280,9 +282,9 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             self.handler.profile(_start_req(self.output_dir))
             result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
 
-        self.assertFalse(result.success)
-        self.assertIn("Failed to finalize Proton profiling", result.message)
-        self.assertFalse(self.handler.profile_in_progress)
+        assert not (result.success)
+        assert ("Failed to finalize Proton profiling") in (result.message)
+        assert not (self.handler.profile_in_progress)
         self.profile_sync.assert_called_once_with(
             self.handler._profile_sync_buf, group=self.handler.attn_tp_cpu_group
         )
@@ -294,8 +296,8 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             request_handler_mod, "stop_profiling"
         ) as stop_profiling:
             result = self.handler.profile(_start_req(self.output_dir, num_steps=2))
-            self.assertTrue(result.success)
-            self.assertTrue(self.handler.profile_in_progress)
+            assert result.success
+            assert self.handler.profile_in_progress
 
             self.handler.forward_ct = 1
             self.handler._profile_batch_predicate()
@@ -304,13 +306,14 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             self.handler.forward_ct = 2
             self.handler._profile_batch_predicate()
             stop_profiling.assert_called_once()
-            self.assertFalse(self.handler.profile_in_progress)
+            assert not (self.handler.profile_in_progress)
 
 
-class TestRequestHandlerExpertLoadProfile(unittest.TestCase):
+class TestRequestHandlerExpertLoadProfile:
     """EXPERT_LOAD zeroes the routing load counters at start and dumps at stop."""
 
-    def setUp(self):
+    @pytest.fixture(autouse=True)
+    def _setup(self, request):
         self.output_dir = tempfile.mkdtemp()
         self.device = mock.Mock()
         self.device.dump_expert_load.return_value = {
@@ -324,7 +327,7 @@ class TestRequestHandlerExpertLoadProfile(unittest.TestCase):
             request_handler_mod, "expert_load_recording_enabled", return_value=True
         )
         recording.start()
-        self.addCleanup(recording.stop)
+        request.addfinalizer(recording.stop)
 
     def _start(self, **kwargs) -> ProfileReq:
         return ProfileReq(
@@ -337,59 +340,58 @@ class TestRequestHandlerExpertLoadProfile(unittest.TestCase):
 
     def test_start_resets_and_stop_dumps_per_rank_record(self):
         result = self.handler.profile(self._start())
-        self.assertTrue(result.success)
+        assert result.success
         self.device.reset_expert_load.assert_called_once_with()
         self.device.dump_expert_load.assert_not_called()
 
         result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
-        self.assertTrue(result.success)
+        assert result.success
         self.device.dump_expert_load.assert_called_once_with(
             f"{self.output_dir}/load-TP2.expert-load.pt"
         )
-        self.assertFalse(self.handler.profile_in_progress)
+        assert not (self.handler.profile_in_progress)
 
     def test_stage_profiles_dump_one_record_per_stage(self):
         result = self.handler.profile(self._start(profile_by_stage=True, num_steps=1))
-        self.assertTrue(result.success)
+        assert result.success
         self.handler._profile_batch_predicate(ForwardMode.EXTEND)
         self.handler._profile_batch_predicate(ForwardMode.EXTEND)
         self.handler._profile_batch_predicate(ForwardMode.DECODE)
         self.handler._profile_batch_predicate(ForwardMode.DECODE)
         dumped = [call.args[0] for call in self.device.dump_expert_load.call_args_list]
-        self.assertEqual(
-            dumped,
+        assert (dumped) == (
             [
                 f"{self.output_dir}/load-TP2-EXTEND.expert-load.pt",
                 f"{self.output_dir}/load-TP2-DECODE.expert-load.pt",
-            ],
+            ]
         )
-        self.assertEqual(self.device.reset_expert_load.call_count, 2)
+        assert (self.device.reset_expert_load.call_count) == (2)
 
     def test_init_refuses_without_recording_or_device(self):
         with mock.patch.object(
             request_handler_mod, "expert_load_recording_enabled", return_value=False
         ):
             result = self.handler.profile(self._start())
-        self.assertFalse(result.success)
-        self.assertIn("--expert-distribution-recorder-mode stat", result.message)
-        self.assertFalse(self.handler.profile_in_progress)
+        assert not (result.success)
+        assert ("--expert-distribution-recorder-mode stat") in (result.message)
+        assert not (self.handler.profile_in_progress)
         self.device.reset_expert_load.assert_not_called()
 
         self.handler._device = None
         result = self.handler.profile(self._start())
-        self.assertFalse(result.success)
-        self.assertIn("device handle", result.message)
+        assert not (result.success)
+        assert ("device handle") in (result.message)
 
     def test_init_refuses_under_online_rebalancing(self):
         # The rebalance snapshots and zeroes the same counters, so a profile
         # window would be cut at every snapshot.
         self.handler.server_args = SimpleNamespace(enable_eplb=True)
         result = self.handler.profile(self._start())
-        self.assertFalse(result.success)
-        self.assertIn("--enable-eplb", result.message)
-        self.assertFalse(self.handler.profile_in_progress)
+        assert not (result.success)
+        assert ("--enable-eplb") in (result.message)
+        assert not (self.handler.profile_in_progress)
         self.device.reset_expert_load.assert_not_called()
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

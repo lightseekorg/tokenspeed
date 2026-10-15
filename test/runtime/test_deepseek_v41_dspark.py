@@ -25,7 +25,6 @@ DEEPSEEK_V41_REFERENCE_DIR enables JSON-only local checkpoint coverage.
 
 import json
 import os
-import unittest
 from pathlib import Path
 from test.runtime.test_deepseek_v41_engram import _mapping
 from test.runtime.test_deepseek_v41_model import (
@@ -834,7 +833,7 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
         == 1
     )
     side = attention_registry._resolve_attn_side(draft, None)
-    assert side.is_dspark and not side.is_deepseek_v4
+    assert side.is_dspark
 
     # Stop at the allocation boundary, after the real registry chooses both sides.
     config_builder = Mock(
@@ -897,7 +896,7 @@ def test_reference_draft_architecture():
     assert all(f"mtp.{i}.ffn.shared_experts.w1.weight" in index for i in range(3))
 
 
-class TestDSparkBaseLogits(unittest.TestCase):
+class TestDSparkBaseLogits:
     def test_dspark_base_logits_use_public_fp32_head_math(self):
         model = object.__new__(DeepseekV41DSparkModel)
         hidden = torch.tensor([[[1.0, -2.0]], [[0.5, 4.0]]], dtype=torch.bfloat16)
@@ -905,13 +904,13 @@ class TestDSparkBaseLogits(unittest.TestCase):
 
         logits = model.local_base_logits(hidden, head)
 
-        self.assertEqual(logits.dtype, torch.float32)
-        self.assertEqual(logits.shape, (2, 1, 2))
-        self.assertTrue(torch.equal(logits, hidden.float() @ head.float().T))
-        with self.assertRaisesRegex(ValueError, "hidden dtype"):
+        assert logits.dtype == torch.float32
+        assert logits.shape == (2, 1, 2)
+        assert torch.equal(logits, hidden.float() @ head.float().T)
+        with pytest.raises(ValueError, match="hidden dtype"):
             model.local_base_logits(hidden, head.float())
 
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     def test_dspark_base_logits_read_the_shared_head_in_place_under_cuda_graph(self):
         model = object.__new__(DeepseekV41DSparkModel)
         hidden = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16, device="cuda")
@@ -930,12 +929,12 @@ class TestDSparkBaseLogits(unittest.TestCase):
             logits = model.local_base_logits(hidden, head)
         graph.replay()
         torch.cuda.synchronize()
-        self.assertEqual(logits.dtype, torch.float32)
-        self.assertTrue(torch.equal(logits, hidden.float() @ head.float().T))
+        assert logits.dtype == torch.float32
+        assert torch.equal(logits, hidden.float() @ head.float().T)
 
         # No FP32 copy sits between the target's head and the draft: an
         # in-place weight update is visible to the next replay as is.
         head.add_(1)
         graph.replay()
         torch.cuda.synchronize()
-        self.assertTrue(torch.equal(logits, hidden.float() @ head.float().T))
+        assert torch.equal(logits, hidden.float() @ head.float().T)

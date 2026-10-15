@@ -525,15 +525,13 @@ def _qsa_router(
     router.bind(
         CacheGroupGeometry(
             granularities=dict(_QSA_GROUP_GRANULARITIES),
-            families={gid: "history" for gid in _QSA_GROUP_GRANULARITIES},
+            attn_kinds={gid: "full_history" for gid in _QSA_GROUP_GRANULARITIES},
             full_history_group_id=FULL_ATTENTION,
             row_geometry={
                 gid: (granularity, 1)
                 for gid, granularity in _QSA_GROUP_GRANULARITIES.items()
             },
-            retentions={
-                gid: ("full_history", None) for gid in _QSA_GROUP_GRANULARITIES
-            },
+            windows={gid: None for gid in _QSA_GROUP_GRANULARITIES},
         ),
         {
             gid: router._leaf_factory(gid, granularity)
@@ -581,8 +579,7 @@ def _qsa_root(
                 SimpleNamespace(
                     group_id=gid,
                     block_granularity=granularity,
-                    family="history",
-                    retention="full_history",
+                    attn_kind="full_history",
                     rows_per_page=granularity,
                     entry_stride_tokens=1,
                     sliding_window_tokens=None,
@@ -1864,19 +1861,19 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         fields[qsa_raw_key_field(1)].plane_id
         == fields[qsa_rope_position_field(1)].plane_id
     )
-    assert groups[QWEN4_EXP_PLE_CACHE_GROUP].family == "state"
-    assert groups[QWEN4_EXP_QSA_CACHE_GROUP].family == "history"
+    assert groups[QWEN4_EXP_PLE_CACHE_GROUP].attn_kind == "state"
+    assert groups[QWEN4_EXP_QSA_CACHE_GROUP].attn_kind != "state"
     assert fields[qsa_compressed_field(1)].group_id == QWEN4_EXP_QSA_CACHE_GROUP
     assert fields[qsa_raw_key_field(1)].group_id == QWEN4_EXP_QSA_RECENT_CACHE_GROUP
     assert (
         fields[qsa_rope_position_field(1)].group_id == QWEN4_EXP_QSA_RECENT_CACHE_GROUP
     )
-    assert groups[QWEN4_EXP_QSA_CACHE_GROUP].retention == "full_history"
+    assert groups[QWEN4_EXP_QSA_CACHE_GROUP].attn_kind == "full_history"
     assert groups[QWEN4_EXP_QSA_CACHE_GROUP].rows_per_page == 64
     assert groups[QWEN4_EXP_QSA_CACHE_GROUP].entry_stride_tokens == 4
     assert groups[QWEN4_EXP_QSA_CACHE_GROUP].block_granularity == 256
-    assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].family == "history"
-    assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].retention == "sliding_window"
+    assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].attn_kind != "state"
+    assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].attn_kind == "sliding_window"
     assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].sliding_window_tokens == 4
     assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].rows_per_page == 64
     assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].entry_stride_tokens == 1
@@ -1886,7 +1883,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     assert all(
         setup.spec.memory_plan.prefix_granularity % group.block_granularity == 0
         for group in groups.values()
-        if group.family != "state"
+        if group.attn_kind != "state"
     )
     assert fields[context_field].dtype == "int64"
     selected, consumers = select_layer_fields(

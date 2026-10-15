@@ -151,10 +151,14 @@ def _quantize_mxfp4_routine(values, valid_mask):
     abs_values = abs_values.reshape((block_m, num_scale_blocks, 32))
     max_values = tl.max(abs_values, axis=2, keep_dims=True)
 
-    dequant_scale = max_values / 6.0
-    scale_bits = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+    # Quark "even" scale (as the dense MXFP4 activation quantizer): round
+    # amax's mantissa to the nearest power of two, then back off E2M1's
+    # two-binade emax; values past 6.0 saturate below.
+    exponents = (max_values.to(tl.uint32, bitcast=True) + 0x200000) >> 23
+    exponents = tl.minimum(tl.maximum(exponents.to(tl.int32) - 2, 0), 254)
+    scale_bits = exponents.to(tl.uint32) << 23
     dequant_scale = scale_bits.to(tl.float32, bitcast=True)
-    scales = (scale_bits.reshape((block_m, num_scale_blocks)) >> 23).to(tl.uint8)
+    scales = exponents.reshape((block_m, num_scale_blocks)).to(tl.uint8)
     quant_scale = tl.where(dequant_scale == 0, 0.0, 1.0 / dequant_scale)
     normalized = values_f32.reshape((block_m, num_scale_blocks, 32)) * quant_scale
     normalized = normalized.reshape((block_m, block_k))

@@ -31,14 +31,14 @@ from __future__ import annotations
 import os
 import sys
 import types
-import unittest
 
 import numpy as np
 import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from cache_pool_test_utils import make_arena, one_group
+from test.runtime.cache_pool_test_utils import make_arena, one_group
+
 from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -92,7 +92,7 @@ def _contract(shard_counts: dict[str, int], virtual_block_count: int):
     )
 
 
-class PairTranslationTest(unittest.TestCase):
+class TestPairTranslationTest:
     def test_replicated_group_keeps_every_pair_minus_the_null_block_offset(self):
         pairs = local_page_pairs_by_group(
             {"kv": np.asarray([[3, 8], [5, 9]])},
@@ -116,13 +116,13 @@ class PairTranslationTest(unittest.TestCase):
         )
 
     def test_a_pair_across_owners_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "different owners"):
+        with pytest.raises((ValueError), match=("different owners")):
             local_page_pairs_by_group(
                 {"kv": np.asarray([[3, 4]])}, contract=_contract({"kv": 2}, 32), rank=0
             )
 
 
-class CopyCachePagesContractTest(unittest.TestCase):
+class TestCopyCachePagesContractTest:
     def _fake(self, trace, *, shard_counts, rank):
         arena = types.SimpleNamespace(
             copy_blocks=lambda pairs: trace.append(
@@ -145,9 +145,8 @@ class CopyCachePagesContractTest(unittest.TestCase):
         ModelExecutor.copy_cache_pages(
             fake, {"kv": np.asarray([[3, 8], [5, 9]], dtype=np.int32), "state": []}
         )
-        self.assertEqual(
-            trace,
-            [("wait", "execution-stream"), ("copy", {"kv": [[3, 8], [5, 9]]})],
+        assert (trace) == (
+            [("wait", "execution-stream"), ("copy", {"kv": [[3, 8], [5, 9]]})]
         )
 
     def test_a_rank_owning_no_pair_places_no_fence_and_copies_nothing(self):
@@ -156,10 +155,10 @@ class CopyCachePagesContractTest(unittest.TestCase):
         trace = []
         fake = self._fake(trace, shard_counts={"kv": 2}, rank=1)
         ModelExecutor.copy_cache_pages(fake, {"kv": np.asarray([[3, 9]])})
-        self.assertEqual(trace, [])
+        assert (trace) == ([])
 
 
-class CopyWavesTest(unittest.TestCase):
+class TestCopyWavesTest:
     """A block is read by every pair naming it as source before the pair
     that overwrites it runs; independent pairs share the first wave."""
 
@@ -169,28 +168,25 @@ class CopyWavesTest(unittest.TestCase):
         return [wave.tolist() for wave in _copy_waves(np.asarray(pairs))]
 
     def test_independent_pairs_form_one_wave(self):
-        self.assertEqual(
-            self._waves([[1, 3], [2, 4], [1, 5]]), [[[1, 3], [2, 4], [1, 5]]]
-        )
+        assert (self._waves([[1, 3], [2, 4], [1, 5]])) == ([[[1, 3], [2, 4], [1, 5]]])
 
     def test_a_chain_reads_before_it_overwrites(self):
         # (2, 1) overwrites block 1, which (1, 3) still reads; (0, 2)
         # overwrites block 2, which (2, 1) reads.
-        self.assertEqual(
-            self._waves([[2, 1], [1, 3], [0, 2]]),
-            [[[1, 3]], [[2, 1]], [[0, 2]]],
+        assert (self._waves([[2, 1], [1, 3], [0, 2]])) == (
+            [[[1, 3]], [[2, 1]], [[0, 2]]]
         )
 
     def test_a_cycle_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "cycle"):
+        with pytest.raises((ValueError), match=("cycle")):
             self._waves([[1, 2], [2, 1]])
 
     def test_no_pairs_no_waves(self):
-        self.assertEqual(self._waves(np.zeros((0, 2), dtype=np.int32)), [])
+        assert (self._waves(np.zeros((0, 2), dtype=np.int32))) == ([])
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-class FinishTailHitCopyCudaTest(unittest.TestCase):
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
+class TestFinishTailHitCopyCudaTest:
     """The hitter's private copy of a published partial page, end to end.
 
     The real scheduler publishes a finished request's partial page as a tail,
@@ -251,8 +247,7 @@ class FinishTailHitCopyCudaTest(unittest.TestCase):
                         group_id="kv",
                         block_granularity=self.PAGE,
                         total_pages=page_count,
-                        retention=ts.CacheRetention.FullHistory,
-                        family=ts.CacheGroupFamily.History,
+                        attn_kind=ts.AttnKind.Full,
                     )
                 ],
             )
@@ -276,7 +271,7 @@ class FinishTailHitCopyCudaTest(unittest.TestCase):
         finish = ts.ForwardEvent.Finish()
         finish.request_id = "a"
         advance_scheduler(scheduler, [finish])
-        self.assertEqual(scheduler.tail_entries(), 1)
+        assert (scheduler.tail_entries()) == (1)
 
         # Random bytes stand in for the KV the forward wrote.
         generator = torch.Generator(device="cpu").manual_seed(41)
@@ -294,13 +289,13 @@ class FinishTailHitCopyCudaTest(unittest.TestCase):
         scheduler.submit_requests([spec])
         plan = scheduler.next_execution_plan()
         (hit,) = forwards(plan)
-        self.assertEqual(list(hit.extend_prefix_lens), [41])
+        assert (list(hit.extend_prefix_lens)) == ([41])
         copies = plan.pages_to_copy_arrays()["kv"]
-        self.assertEqual(copies.shape, (1, 2))
+        assert (copies.shape) == ((1, 2))
         source, destination = (int(value) for value in copies[0])
-        self.assertEqual(source, tail_block)
-        self.assertEqual(int(hit.block_tables_arrays()["kv"][0][2]), destination)
-        self.assertNotIn(destination, plan.pages_to_zero["kv"])
+        assert (source) == (tail_block)
+        assert (int(hit.block_tables_arrays()["kv"][0][2])) == (destination)
+        assert (destination) not in (plan.pages_to_zero["kv"])
 
         local = local_page_pairs_by_group({"kv": copies}, contract=contract, rank=0)
         arena.copy_blocks(local)
@@ -310,25 +305,23 @@ class FinishTailHitCopyCudaTest(unittest.TestCase):
         src_segments = arena.block_byte_segments("kv", [local_source])
         dst_segments = arena.block_byte_segments("kv", [local_destination])
         # Every declared field of every layer, in the plan's own byte layout.
-        self.assertEqual(len(src_segments), 4 * self.LAYERS)
+        assert (len(src_segments)) == (4 * self.LAYERS)
         expected = before.clone()
         for (src_off, size), (dst_off, dst_size) in zip(
             src_segments, dst_segments, strict=True
         ):
-            self.assertEqual(size, dst_size)
+            assert (size) == (dst_size)
             expected[dst_off : dst_off + size] = before[src_off : src_off + size]
         torch.testing.assert_close(arena.buffer, expected, rtol=0, atol=0)
         for src_off, size in src_segments:
-            self.assertTrue(
-                torch.equal(
-                    arena.buffer[src_off : src_off + size],
-                    before[src_off : src_off + size],
-                )
+            assert torch.equal(
+                arena.buffer[src_off : src_off + size],
+                before[src_off : src_off + size],
             )
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-class CacheArenaCopyBlocksCudaTest(unittest.TestCase):
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
+class TestCacheArenaCopyBlocksCudaTest:
     def test_copies_every_field_of_the_source_block_byte_for_byte(self):
         arena = _arena("cuda")
         generator = torch.Generator(device="cpu").manual_seed(0)
@@ -349,7 +342,7 @@ class CacheArenaCopyBlocksCudaTest(unittest.TestCase):
                 for (src_off, size), (dst_off, dst_size) in zip(
                     src_segments, dst_segments, strict=True
                 ):
-                    self.assertEqual(size, dst_size)
+                    assert (size) == (dst_size)
                     expected[dst_off : dst_off + size] = initial[
                         src_off : src_off + size
                     ]
@@ -394,27 +387,27 @@ class CacheArenaCopyBlocksCudaTest(unittest.TestCase):
         arena = _arena("cuda")
         arena.buffer.fill_(7)
         state_pages = arena.plan.group("state").page_count
-        with self.assertRaises(IndexError):
+        with pytest.raises((IndexError)):
             arena.copy_blocks(
                 {
                     "history": np.asarray([[1, 2]]),
                     "state": np.asarray([[1, state_pages]]),
                 }
             )
-        with self.assertRaisesRegex(ValueError, "cycle"):
+        with pytest.raises((ValueError), match=("cycle")):
             arena.copy_blocks({"history": np.asarray([[1, 2], [2, 1]])})
-        with self.assertRaisesRegex(ValueError, "onto itself"):
+        with pytest.raises((ValueError), match=("onto itself")):
             arena.copy_blocks({"history": np.asarray([[2, 2]])})
-        with self.assertRaisesRegex(ValueError, "twice"):
+        with pytest.raises((ValueError), match=("twice")):
             arena.copy_blocks({"history": np.asarray([[1, 3], [2, 3]])})
-        with self.assertRaises(TypeError):
+        with pytest.raises((TypeError)):
             arena.copy_blocks({"history": np.asarray([1, 2])})
         torch.cuda.synchronize()
-        self.assertTrue(bool((arena.buffer == 7).all()))
+        assert bool((arena.buffer == 7).all())
         # Nothing to copy is a no-op, not a launch.
         arena.copy_blocks({"history": np.zeros((0, 2), dtype=np.int32)})
         arena.copy_blocks({})
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

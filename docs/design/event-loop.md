@@ -35,6 +35,16 @@ how long the caller may hold each piece:
 | `transfer` | the PD peer's CONTROL face — bootstrap register/abort, event polling — or None outside PD | held by the PD hooks |
 | `encoder_model_facts` | a callable resolving the encoder facts EPD admission needs (raises on text-only) | consumed at startup, past the EPD gate |
 
+Encoder facts describe the transferred tensor, independently of the language
+embedding width. A model may declare `get_encoder_output_spec()` as a width and
+dtype pair, including integer dtypes for discrete visual tokens, without a
+loaded vision tower. Without that declaration, the width comes from the language
+config and the dtype from the vision tower's dtype or parameters. The resolved
+width must be positive. The builder resolves this once; admission keeps only
+the resulting values. Converting an encoded payload into language embeddings
+remains model work on the forward thread, after all required items and prefill
+ranks have completed admission.
+
 `build_device_side` builds the device side **complete**, not built-then-wired:
 it constructs the transfer peer from its prepared components and startup
 arguments, and reads the engine's role off the peer once, at construction. An
@@ -78,9 +88,8 @@ plane, where it feeds Principle 3's tail advance.
 Consequences:
 
 * The loop cannot **name** a model runner, backend or KV pool, so it cannot
-  pass one implicitly or mutate one a forward is still using. A test asserts
-  this over the AST of `EventLoop.__init__` — locals included, because a name
-  it can write is a name a later change can keep.
+  pass one implicitly or mutate one a forward is still using. Locals count
+  too: a name it can write is a name a later change can keep.
 * A new device interaction that runs once at startup belongs **inside the
   builder**; it belongs on `DeviceHandle` only when the running loop genuinely
   needs it — the second widens what the loop can do to the GPU mid-flight.
@@ -91,8 +100,7 @@ Consequences:
   stage/drain device half; the commit-side SHM release). A generic "run this
   closure" slot is the hole this whole design closes, so a second KIND of
   user does not join it — it gets its own name.
-  The architecture test pins the exact public operation names, not a numeric
-  size limit. L3 adds named Host-tier operations for the existence probe,
+  L3 adds named Host-tier operations for the existence probe,
   the prefetch lane's progress and completion (the hooks converge them each
   round), namespace and weight-version changes, and cache shutdown. These
   keep the executor and Host buffer hidden; they do not introduce another
@@ -107,7 +115,10 @@ Consequences:
   `Cache.SnapshotOp` / `Cache.RestoreOp` become one per-request `SnapshotOp`
   / `RestoreOp` (`cache/transfer/ops.py`) each -- the executor's unit of
   work, one slot exported or imported, one ACK. `CacheOpHooks.count_plan_ops`
-  counts through the same adapter, so what is counted is what is submitted.
+  counts through the same adapter, so what is counted is what is submitted;
+  its return value — the plan's per-request `SnapshotOp` count, one per
+  retraction victim — is the round's preemption count, exported as
+  `tokenspeed:num_preemptions_total`.
   The `EXPERT_LOAD` profile activity adds two more named operations,
   `reset_expert_load` and `dump_expert_load`: the routing kernels bump the
   expert placement's load counters on the execution stream, so zeroing and
@@ -128,8 +139,7 @@ Consequences:
   op). Both are rank-local on the handle. The rebalance may reduce the
   snapshot over the EP group because its ops ride the same-round gate
   (below), unlike the profile's dump.
-  Changing this surface requires updating both this contract and the explicit
-  operation allowlist in `test/runtime/test_device_handle.py`.
+  Changing this surface requires updating this contract.
 * The role is a **value** (`DeviceRole`), not a class hierarchy. Subclassing
   per role forced the handle to publish its own internals so the subclasses
   could call back into it — a reference cycle for about a dozen lines of
@@ -169,6 +179,18 @@ reassembly all run on the forward thread — which also puts the reassembly
 broadcasts on the same issuing thread as the model's collectives, restoring
 the cross-rank launch-order guarantee the old non-overlap-loop assumption
 provided.
+
+With pipeline parallelism, only PP0 receives encoder payloads and reserves
+the receive pool. PP0's attention TP group first agrees on completion;
+`PipelineEpdPrefillAdmission` then broadcasts admitted/failed request IDs
+along the pipeline CPU groups. Every stage submits the same requests in
+the same loop iteration, while later stages hold no encoder receiver or
+payload. Decode does not build this admission controller.
+
+The encoder's TP ranks attach every pixel-SHM segment in a received batch
+before any rank submits it to the encode worker. A CPU-group rendezvous
+protects this ownership transition: submission consumes and unlinks SHM
+on both cache hits and misses, so broadcasting handles alone is insufficient.
 
 The symmetric rule holds on the data plane: **the forward thread never
 synchronizes with the device on the per-round path.** Every host

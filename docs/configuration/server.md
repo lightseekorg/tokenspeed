@@ -559,11 +559,12 @@ validates the parser names, so use the values accepted by the bundled
 | Parameter | Purpose |
 | --- | --- |
 | `--speculative-config` | JSON speculative decoding configuration. |
-| `--speculative-algorithm` | Speculative algorithm, such as `EAGLE3`, `MTP`, `DFLASH`, or `DSPARK`. |
+| `--speculative-algorithm` | Speculative algorithm, such as `EAGLE3`, `MTP`, `DFLASH`, `DSPARK`, or `DUMMY`. `DUMMY` generates deterministic candidates without a draft checkpoint; it tests target multi-token verification, not draft-model quality. Set `--speculative-num-draft-tokens` above 1 and do not pass a draft model path. |
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
 | `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`; required for draft trees. |
+| `--synthetic-acceptance-length` | Benchmark-only mean emitted tokens per speculative verification, including the guaranteed target token. Unset disables it. |
 | `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
 | `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters (see below). Off by default. |
 | `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. |
@@ -572,6 +573,45 @@ validates the parser names, so use the values accepted by the bundled
 
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.
+
+### Synthetic Acceptance Length
+
+The supported benchmark configuration is `--sampling-backend greedy`, with
+speculative decoding enabled and `--dp-sampling` and `--enable-output-logprobs`
+disabled. Draft trees are unsupported. Other sampling backends and these options
+are rejected at startup.
+As with ordinary greedy sampling, token selection is always argmax; stochastic
+sampling and penalties are not supported. Use unconstrained greedy requests
+(`temperature: 0`) for this benchmark.
+
+Use `--synthetic-acceptance-length L` to benchmark speculative execution at a
+fixed mean acceptance length (AL). AL includes the guaranteed target token,
+so `1 <= L <= --speculative-num-draft-tokens` (the verify width). AL `1`
+rejects every draft; AL equal to the verify width accepts every draft. A
+fractional AL emits either `floor(L)` or `ceil(L)` tokens per verification,
+with probability `L - floor(L)` of the larger length. For example, AL `2.6`
+accepts one draft token on 40% of steps and two on 60%, plus a target token.
+
+The draft and target models and the normal verification kernel still execute.
+The verification result is then overridden with synthetic acceptance before
+committing tokens and updating request state, preserving verification overhead.
+The override copies the forced draft prefix and selects the existing target
+argmax at the cutoff. It adds no second verification or target-resampling pass.
+**Do not use generated text for correctness or accuracy evaluation.** Request
+termination can truncate the last verification's output.
+
+Either spelling below configures three draft slots (verify width four) and
+AL `2.6`:
+
+```bash
+--sampling-backend greedy --speculative-algorithm MTP --speculative-num-steps 3 --synthetic-acceptance-length 2.6
+--sampling-backend greedy --speculative-config '{"method":"mtp","num_speculative_tokens":3,"synthetic_acceptance_length":2.6}'
+```
+
+Conflicting values between the flag and JSON configuration are rejected.
+The value must be finite and speculative decoding must be enabled.
+For block drafters with implicit widths, the upper bound is checked against
+the checkpoint's resolved verify width when the sampler is initialized.
 
 `EAGLE3` and `MTP` drafts are chains by default: `--speculative-num-draft-tokens`
 must equal `--speculative-num-steps + 1`. With `--speculative-eagle-topk` above 1
@@ -800,6 +840,56 @@ Where the endpoint lives depends on the launch mode:
 | `tokenspeed:inter_token_latency_seconds` | Per-token interval between output frames, measured by frontend wall clock. |
 | `tokenspeed:scheduler_inter_token_latency_seconds` | Per-token interval between output frames, measured by scheduler timestamps. |
 
+`tokenspeed:time_to_first_token_seconds` and
+`tokenspeed:e2e_request_latency_seconds` carry a `stream` label
+(`"true"`/`"false"`, the request's streaming flag) in addition to the base
+labels.
+
+### Request counters, token distributions, and preemptions
+
+The request counters `tokenspeed:num_requests_total` (every finished request)
+and `tokenspeed:request_success_total` (finished without an abort) carry two
+labels beyond the base `model_name`/`app_key`:
+
+| Label | Values |
+| --- | --- |
+| `finish_reason` | `stop`, `length`, `abort`, `abort:transfer_failed`, `abort:unknown_error`, `abort:numerical_error`, `abort:capacity_abort`, `unknown`. The finish-reason type (`BaseFinishReason.to_json()`), with the bounded `ABORT_CODE` subclass folded in as `abort:<code>`; an abort with an unrecognized `err_type` stays plain `abort`. Unbounded payloads (abort message, matched stop string) are never labels. |
+| `stream` | `"true"` / `"false"` — the request's streaming flag. |
+
+Two per-request histograms (same `stream` label, observed once at request
+finish) use a 1-2-5 bucket grid (1, 2, 5, 10, …) capped at the model's
+context length:
+
+| Metric | Semantics |
+| --- | --- |
+| `tokenspeed:request_prompt_tokens` | Prompt token count per finished request. |
+| `tokenspeed:request_generation_tokens` | Generation token count per finished request. |
+
+The scheduler process exports `tokenspeed:num_preemptions_total`: requests
+preempted by a capacity retraction — suspended
+with their pages imaged to the Host snapshot pool (they resume by restore;
+nothing is recomputed) to free Device pages for a blocked admission. One
+increment per retraction victim, counted from the plan's snapshot-store ops;
+forced retractions from `--debug-force-retraction-interval` count too. A
+retraction whose victim cannot be imaged aborts it instead — those are
+`tokenspeed:num_capacity_aborted_requests`, never preemptions.
+
+The cached/uncached token split (the billing split Baseten/Fireworks-style
+dashboards show) derives from existing counters, no dedicated metric needed:
+
+```promql
+cached_prompt_tokens   = tokenspeed:prefix_cache_hits_total
+uncached_prompt_tokens = tokenspeed:prompt_tokens_total - tokenspeed:prefix_cache_hits_total
+```
+
+**Wire-compatibility note.** Adding `finish_reason` to
+`tokenspeed:num_requests_total` / `tokenspeed:request_success_total` and
+`stream` to `tokenspeed:time_to_first_token_seconds` /
+`tokenspeed:e2e_request_latency_seconds` changes those metrics' series
+identity: the pre-change series (without the new labels) stop updating, and
+queries pinning an exact label set must include the new labels. Aggregate
+queries (`sum by (...)` that drops them) are unaffected.
+
 ### Per-request stats
 
 `--enable-log-request-stats` enriches the scheduler's per-request finish line for
@@ -989,6 +1079,21 @@ Host pinned buffer (L2 / flat KV)
 Mooncake Store (L3)
 ```
 
+**Sizing.** `--kvstore-size` (gigabytes per rank) wins over
+`--kvstore-ratio` (a multiple of this rank's Device KV, 2 by default).
+Every rank of a node pins its Host buffers at the same point of startup, so
+each rank checks the Host L2 and the retraction snapshot pool against an
+equal share of the Host memory its node has available, less a 10 GiB
+headroom per rank. Each buffer counts at the size it pins: PyTorch's pinned
+allocator rounds every allocation up to a power of two, so a 140 GB L2
+takes 274.88 GB. A ratio size larger than that share is capped to the
+largest L2 every rank's share holds beside its snapshot pool -- the whole
+LCM blocks in the largest power of two that fits, and one size on every
+rank, since the ranks' schedulers mirror each other -- and each rank logs a
+warning with the requested and the capped size. An explicit
+`--kvstore-size` is never shrunk: one that does not fit is refused at
+startup, as is a share without room for a single LCM block.
+
 Each packed Host CacheBlock is one Mooncake object, keyed as
 `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c0`
 (the trailing `c0` is the retired context-parallel shard id, kept literal so
@@ -1126,6 +1231,19 @@ knobs are required with `--kvstore-storage-backend` and refused without it:
 | `--kvstore-prefetch-timeout-base-s` | The prefetch deadline's base term in seconds (positive). The deadline says when the lane stops starting batches; it does not interrupt a batch in flight. |
 | `--kvstore-prefetch-timeout-per-page-s` | The deadline's per-page term in seconds (0 for a fixed deadline). |
 | `--kvstore-prefetch-batch-pages` | Prefix pages per `batch_get_into` of a prefetch; the fetch stops at the first batch with a missing page (the reference engine uses 128). |
+
+L3 diagnostics are log-based and byte-denominated. `L3HostStore` logs every
+backup (PUT) and prefetch batch (GET) with key counts, successful keys,
+successful payload bytes, and call latency. It logs each `batch_exists`
+probe at debug level; cumulative exists/GET/PUT counters (calls, keys, ok
+keys, ok bytes, total seconds) are kept per store. Above that, the Host
+cache executor logs each completed backup with queue wait separated from
+actual PUT time plus the pending backup pages, bytes, and oldest pending
+age. The backlog includes completed PUTs awaiting their write-back
+acknowledgment. A slow PUT retains Host pages (and Device pages for pinned
+write-backs) until that acknowledgment, delaying admission despite bounded
+pools. Transferred volume is reported as bytes, never as an effective token
+hit rate.
 
 `--kvstore-storage-backend memory` is an in-process dict for tests only.
 CI exercises that Mooncake-compatible contract end-to-end (scheduler

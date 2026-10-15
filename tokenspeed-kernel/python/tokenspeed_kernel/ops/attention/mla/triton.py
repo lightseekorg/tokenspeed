@@ -44,6 +44,7 @@ _PORTABLE_CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}
     capability=_PORTABLE_CAPABILITY,
     signatures=format_signatures(("q", "k", "v"), "dense", _PORTABLE_DTYPES),
     priority=Priority.PORTABLE,
+    features={"sliding_window", "query_start_offsets"},
     traits={
         "is_causal": frozenset({False, True}),
         "logit_cap": frozenset({False, True}),
@@ -65,6 +66,8 @@ def triton_mla_prefill(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
     seq_lens_kv: torch.Tensor | None = None,
+    window_left: int = -1,
+    query_start_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     return _triton_mla_prefill_impl(
         q=q,
@@ -80,6 +83,8 @@ def triton_mla_prefill(
         return_lse=return_lse,
         out=out,
         seq_lens_kv=seq_lens_kv,
+        window_left=window_left,
+        query_start_offsets=query_start_offsets,
     )
 
 

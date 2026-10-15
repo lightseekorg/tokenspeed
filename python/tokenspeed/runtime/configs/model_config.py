@@ -288,12 +288,32 @@ def configure_mla_attention(model_config, server_args: ServerArgs) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
+def configure_dots3_note_attention(model_config, server_args: ServerArgs) -> None:
+    """Configure the mixed DSA/SWA target or its SWA-only MTP draft."""
+    is_mtp = resolve_architecture(model_config.hf_config) == "Dots3NoteForCausalLMNextN"
+    _apply_attention_defaults(
+        server_args,
+        name="dots3-note",
+        default_backend="mla" if is_mtp else "dsa",
+        default_prefix_granularity=None,
+        is_draft_worker=is_mtp,
+    )
+    configure = configure_mla_attention if is_mtp else configure_dsa_attention
+    configure(model_config, server_args)
+
+
 def configure_minimax_m3_attention(model_config, server_args: ServerArgs) -> None:
     del server_args  # the geometry follows the checkpoint alone
     model_config.attention_arch = AttentionArch.MSA
 
 
 _ATTENTION_FAMILY_SPECS = (
+    _AttentionFamilySpec(
+        name="dots3-note",
+        architectures=frozenset({"Dots3NoteForCausalLM", "Dots3NoteForCausalLMNextN"}),
+        configure=configure_dots3_note_attention,
+        default_prefix_granularity=128,
+    ),
     _AttentionFamilySpec(
         name="DeepSeek V4.1",
         architectures=frozenset(
@@ -1026,6 +1046,7 @@ def is_generation_model(model_architectures: list[str]):
 
 def is_multimodal_model(model_architectures: list[str] | None):
     multimodal_architectures = {
+        "Dots3NoteForCausalLM",
         "DeepseekV41ForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
@@ -1052,6 +1073,7 @@ def is_image_gen_model(model_architectures: list[str]):
 
 def is_audio_model(model_architectures: list[str] | None):
     audio_architectures = {
+        "Dots3NoteForCausalLM",
         "InklingForConditionalGeneration",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",

@@ -132,6 +132,9 @@ class HcclBackend(CommBackend):
 
         gathered = tensor.new_empty(len(group) * max_tokens, tensor.shape[-1])
         self.all_gather_single(gathered, tensor.contiguous(), group)
+        # Equal-sized shards already form the contiguous, rank-ordered output.
+        if all(tokens == max_tokens for tokens in scattered_num_tokens):
+            return gathered
         return torch.cat(
             [
                 gathered[rank * max_tokens : rank * max_tokens + tokens]
@@ -145,7 +148,11 @@ class HcclBackend(CommBackend):
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
+        """Reduce rank-major rows, padding only unequal token counts."""
         max_tokens = max(scattered_num_tokens)
+        # Equal rank-major slices already have the collective's input layout.
+        if all(tokens == max_tokens for tokens in scattered_num_tokens):
+            return self.reduce_scatter(tensor.contiguous(), group)
         padded = tensor.new_zeros(
             len(group) * max_tokens,
             tensor.shape[-1],

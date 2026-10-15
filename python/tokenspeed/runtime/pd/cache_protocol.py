@@ -414,7 +414,7 @@ def _logical_slots(
     if spec.transfer_policy == "full_suffix":
         block_granularity = spec.block_granularity
         begin = prefix_len // block_granularity
-        if spec.retention == "sliding_window":
+        if spec.attn_kind == "sliding_window":
             # The next decode token can attend the preceding window - 1 raw
             # tokens. Include every group block intersecting that retained tail.
             retained_begin = max(0, prompt_len - spec.sliding_window_tokens + 1)
@@ -441,10 +441,9 @@ def validate_cache_peer_layout(
         # exchange which pages is the transfer planner's decision, not a
         # contract mismatch.
         if (
-            local_spec.family != peer_spec.family
+            local_spec.attn_kind != peer_spec.attn_kind
             or local_spec.rows_per_page != peer_spec.rows_per_page
             or local_spec.entry_stride_tokens != peer_spec.entry_stride_tokens
-            or local_spec.retention != peer_spec.retention
             or local_spec.sliding_window_tokens != peer_spec.sliding_window_tokens
             or local_spec.replayable != peer_spec.replayable
             or local_spec.transfer_policy != peer_spec.transfer_policy

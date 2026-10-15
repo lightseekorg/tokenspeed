@@ -22,7 +22,7 @@
 
 ``CacheGroupRouter`` is the runner-facing attention backend for every model
 whose attention is paged KV. It holds one ``PagedAttentionBackend`` leaf per
-attention (history-family) cache group and is the only object between the
+attention (history) cache group and is the only object between the
 scheduler bridge and the kernels that expands raw group tables:
 
 * it learns each group's block granularity from the pool's published specs
@@ -213,13 +213,13 @@ class CacheGroupRouter(AttentionBackend):
         if not group_ids:
             raise ValueError(
                 f"{type(self).__name__}: the bound pool view has no paged "
-                "(history-family) cache groups to route"
+                "(history) cache groups to route"
             )
         for gid in group_ids:
-            if geometry.families.get(gid, "history") != "history":
+            if geometry.attn_kinds[gid] == "state":
                 raise ValueError(
-                    f"cache group {gid!r} is family {geometry.families[gid]!r}; "
-                    "the router serves paged history groups only"
+                    f"cache group {gid!r} is a state group; the router serves "
+                    "paged history groups only"
                 )
 
     def _derive(
@@ -474,9 +474,9 @@ class CacheGroupRouter(AttentionBackend):
     def tree_support(self) -> TreeSupport:
         unsupported = []
         for gid in self.group_ids:
-            retention, _ = self.geometry.retentions[gid]
+            attn_kind = self.geometry.attn_kinds[gid]
             _, entry_stride_tokens = self.geometry.row_geometry[gid]
-            if retention != "full_history" or entry_stride_tokens not in (None, 1):
+            if attn_kind != "full_history" or entry_stride_tokens not in (None, 1):
                 unsupported.append(gid)
         if not unsupported:
             return TreeSupport(verify_blocker=None, draft_blocker=None)
@@ -915,9 +915,8 @@ class CacheGroupRouter(AttentionBackend):
         block drafters hand it to their fused prep kernels).
         """
         bs = cache_start.shape[0]
-        # Window positions run cache_start .. cache_start+n-1; the decode
-        # kernel derives them as end-n .. end-1, so feed end = start + n.
-        self.stacks.compute_decode_locations(bs, cache_start + num_tokens, num_tokens)
+        # Window positions run cache_start .. cache_start+n-1.
+        self.stacks.compute_window_locations(bs, cache_start, num_tokens)
         self._decode_request_offset = 0
         self._publish_decode_locations(bs, num_tokens)
         i = self._draft_history_index()

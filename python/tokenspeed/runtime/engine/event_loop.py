@@ -1183,8 +1183,17 @@ class EventLoop:
                     self._pause_hooks.paused_idle_step()
                     paused_round = True
                 else:
-                    execution_plan = self.scheduler.next_execution_plan()
-                    self._cache_hooks.count_plan_ops(execution_plan)
+                    with torch.profiler.record_function(
+                        "scheduler.next_execution_plan"
+                    ):
+                        execution_plan = self.scheduler.next_execution_plan()
+                    # One snapshot-store op per retraction victim: the plan
+                    # read that drives the in-flight accounting also yields
+                    # the round's preemption count (0 on rounds without
+                    # retraction, which are the overwhelming majority).
+                    num_retracted = self._cache_hooks.count_plan_ops(execution_plan)
+                    if num_retracted:
+                        self.metrics.record_preemptions(num_retracted)
                     # A capacity retraction whose victim could not be imaged
                     # aborted that request inside the plan build; it is gone
                     # from the scheduler, so finish it toward the client here

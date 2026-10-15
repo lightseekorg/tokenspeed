@@ -61,8 +61,7 @@ def _l3_config(
             group_id="full",
             block_granularity=cfg.prefix_granularity,
             total_pages=cfg.num_device_pages,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
         )
     ]
     if with_swa:
@@ -71,9 +70,8 @@ def _l3_config(
                 group_id="swa",
                 block_granularity=cfg.prefix_granularity,
                 total_pages=cfg.num_device_pages,
-                retention=ts.CacheRetention.SlidingWindow,
+                attn_kind=ts.AttnKind.SlidingWindow,
                 sliding_window_tokens=4,
-                family=ts.CacheGroupFamily.History,
             )
         )
     cfg.cache_groups = groups
@@ -301,15 +299,13 @@ def test_l3_host_shortage_skips_a_page_it_cannot_fetch_whole() -> None:
             group_id="full_fine",
             block_granularity=2,
             total_pages=cfg.num_device_pages,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
         ),
         ts.CacheGroupConfig(
             group_id="full_coarse",
             block_granularity=4,
             total_pages=cfg.num_device_pages,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
         ),
     ]
     scheduler = ts.Scheduler(cfg)

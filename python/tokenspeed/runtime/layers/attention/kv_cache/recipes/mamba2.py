@@ -61,10 +61,10 @@ class Mamba2Recipe(QwenGDNRecipe):
     * each conv window has a segment of its own, which the KV groups skip.
 
     State pages then carry no padding and KV pages only the conv segments.
-    Grouping state layers by their position between attention layers, as Qwen
-    does, fails here: Nemotron-3 Super's Mamba2 runs are four or five long.
-    Draft (MTP) attention layers continue the KV round-robin, so they pad
-    every other group by their K/V segments, as Qwen's drafts do.
+    Grouping state layers by their position between attention layers fails
+    here: Nemotron-3 Super's Mamba2 runs are four or five long. Draft (MTP)
+    attention layers continue the KV round-robin, so they pad every other
+    group by their K/V segments.
     """
 
     family = "mamba2"

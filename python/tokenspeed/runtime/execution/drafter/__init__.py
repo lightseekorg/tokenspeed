@@ -48,7 +48,7 @@ __all__ = [
 ]
 
 #: Algorithms the in-tree resolution below serves.
-_IN_TREE_ALGORITHMS = frozenset({"EAGLE3", "MTP", "DFLASH", "DSPARK"})
+_IN_TREE_ALGORITHMS = frozenset({"EAGLE3", "MTP", "DFLASH", "DSPARK", "DUMMY"})
 
 
 @dataclass
@@ -197,12 +197,14 @@ def require_plugin_draft_checkpoint(server_args: ServerArgs) -> None:
     )
 
 
-def get_drafter_impl(spec_algo: str, model: torch.nn.Module) -> type[BaseDrafter]:
+def get_drafter_impl(
+    spec_algo: str, model: torch.nn.Module | None
+) -> type[BaseDrafter]:
     """Resolve the drafter class for ``spec_algo`` and a loaded draft model.
 
     Args:
         spec_algo: The speculative algorithm name from server args.
-        model: The loaded draft model; some algorithms route on its class.
+        model: The loaded draft model; None for model-free DUMMY drafting.
 
     Returns:
         The ``BaseDrafter`` subclass to instantiate (not an instance).
@@ -221,6 +223,7 @@ def get_drafter_impl(spec_algo: str, model: torch.nn.Module) -> type[BaseDrafter
     # and this package init must stay importable from lightweight contexts.
     from tokenspeed.runtime.execution.drafter.dflash import DFlash
     from tokenspeed.runtime.execution.drafter.dspark import DSpark
+    from tokenspeed.runtime.execution.drafter.dummy import DummyDrafter
     from tokenspeed.runtime.execution.drafter.eagle import Eagle
     from tokenspeed.runtime.models.inkling_nextn import (
         InklingForConditionalGenerationNextN,
@@ -231,6 +234,7 @@ def get_drafter_impl(spec_algo: str, model: torch.nn.Module) -> type[BaseDrafter
         "MTP": Eagle,
         "DFLASH": DFlash,
         "DSPARK": DSpark,
+        "DUMMY": DummyDrafter,
     }
 
     if spec_algo == "DFLASH":

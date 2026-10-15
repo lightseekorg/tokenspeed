@@ -63,6 +63,8 @@ def _fused_qkv_split_kernel(
     qkv_dim,
     BLOCK_SIZE: tl.constexpr,
     GATE_BLOCK: tl.constexpr,
+    valid_tokens,
+    HAS_VALID_TOKENS: tl.constexpr,
     HAS_REPLAY_PAYLOAD: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
@@ -79,9 +81,12 @@ def _fused_qkv_split_kernel(
     qk_dim: tl.constexpr = q_dim + k_dim
 
     mask = offsets < qkv_dim
+    if HAS_VALID_TOKENS:
+        mask = mask & (i_t < tl.load(valid_tokens))
     values = tl.load(
         mixed_qkv + i_t * stride_t + offsets * stride_d,
         mask=mask,
+        other=0.0,
     )
 
     tl.store(q + i_t * q_dim + offsets, values, mask=offsets < q_dim)
@@ -165,6 +170,8 @@ def _fused_qkv_split_l2norm_kernel(  # noqa: E501
     qkv_dim,
     BLOCK_SIZE: tl.constexpr,
     GATE_BLOCK: tl.constexpr,
+    valid_tokens,
+    HAS_VALID_TOKENS: tl.constexpr,
     HAS_REPLAY_PAYLOAD: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
@@ -188,6 +195,8 @@ def _fused_qkv_split_l2norm_kernel(  # noqa: E501
     qk_dim: tl.constexpr = q_dim + k_dim
 
     mask = offsets < qkv_dim
+    if HAS_VALID_TOKENS:
+        mask = mask & (i_t < tl.load(valid_tokens))
     values = tl.load(
         mixed_qkv + i_t * stride_t + offsets * stride_d,
         mask=mask,
@@ -271,6 +280,8 @@ def fused_qkv_split_gdn_prefill(
     head_v: int,
     fuse_l2norm: bool = False,
     replay: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    *,
+    valid_tokens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Split packed post-conv GDN QKV into contiguous FLA prefill tensors.
 
@@ -284,6 +295,9 @@ def fused_qkv_split_gdn_prefill(
         fuse_l2norm: when True, Q and K are L2-normalised per head inside the
             kernel (sm100 fast-path only — caller must not call l2norm_fwd
             separately).
+        valid_tokens: Optional device integer scalar containing the live token
+            count. Rows beyond it are written as zero without reading the input.
+            None means every row is live. The scalar may change during graph replay.
         replay: Optional ``(payload, a, b)`` tuple. ``payload`` is a contiguous
             ``[T, K_width + V_width + 2 * num_v_heads]`` destination; ``a`` and
             ``b`` are scalar gate inputs shaped ``[T, num_v_heads]``.
@@ -291,6 +305,12 @@ def fused_qkv_split_gdn_prefill(
     Returns:
         (q, k, v) each shaped ``[1, T, H, D]``.
     """
+    if valid_tokens is not None and (
+        valid_tokens.numel() != 1
+        or valid_tokens.device != mixed_qkv.device
+        or valid_tokens.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError("valid_tokens must be a device int32/int64 scalar")
     enable_pdl = pdl_enabled()
     qkv_dim = num_q_heads * head_q + num_k_heads * head_k + num_v_heads * head_v
     span = mixed_qkv.stride(0) * (mixed_qkv.shape[0] - 1) + qkv_dim
@@ -355,6 +375,8 @@ def fused_qkv_split_gdn_prefill(
     block_size = triton.next_power_of_2(qkv_dim)
     gate_block = triton.next_power_of_2(num_v_heads) if has_replay else 1
     kernel = _fused_qkv_split_l2norm_kernel if fuse_l2norm else _fused_qkv_split_kernel
+    has_valid_tokens = valid_tokens is not None
+    valid_tokens_arg = valid_tokens if has_valid_tokens else q
     kernel[(seq_len,)](
         q,
         k,
@@ -377,6 +399,8 @@ def fused_qkv_split_gdn_prefill(
         GATE_BLOCK=gate_block,
         HAS_REPLAY_PAYLOAD=has_replay,
         ENABLE_PDL=enable_pdl,
+        valid_tokens=valid_tokens_arg,
+        HAS_VALID_TOKENS=has_valid_tokens,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
     return q, k, v

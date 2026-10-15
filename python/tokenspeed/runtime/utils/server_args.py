@@ -534,6 +534,7 @@ class ServerArgs:
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
+    synthetic_acceptance_length: float | None = None
     # Standard (draft-prob) rejection sampling for the chain drafters: the
     # drafter samples each step from its own distribution q and records it,
     # verify accepts with coin * q(x) < p(x). Off: the target-only rule
@@ -740,6 +741,27 @@ class ServerArgs:
             if not isinstance(config, dict):
                 raise ValueError("--speculative-config must be a JSON object")
 
+            if "synthetic_acceptance_length" in config:
+                length = config["synthetic_acceptance_length"]
+                if (
+                    isinstance(length, bool)
+                    or not isinstance(length, (int, float))
+                    or not math.isfinite(length)
+                ):
+                    raise ValueError(
+                        "synthetic_acceptance_length must be a finite number"
+                    )
+                if (
+                    self.synthetic_acceptance_length is not None
+                    and self.synthetic_acceptance_length != length
+                ):
+                    raise ValueError(
+                        "--synthetic-acceptance-length conflicts with "
+                        "synthetic_acceptance_length in --speculative-config"
+                    )
+                if self.synthetic_acceptance_length is None:
+                    self.synthetic_acceptance_length = length
+
             method = config.get("method")
             if method is not None and self.speculative_algorithm is None:
                 self.speculative_algorithm = str(method).upper()
@@ -854,11 +876,12 @@ class ServerArgs:
             # decoding but silently wrong for any serving deployment where
             # requests carry sampling params, since the model collapses into
             # repetition-mode loops within a few hundred steps. Default to the
-            # sampling-respecting backend on NVIDIA where flashinfer is
-            # available, fall back to greedy elsewhere; users can still opt
-            # into greedy explicitly via ``--sampling-backend greedy``.
+            # sampling-respecting backend on NVIDIA and Ascend; users can
+            # still opt into greedy explicitly via ``--sampling-backend greedy``.
             if current_platform().is_nvidia:
                 self.sampling_backend = "flashinfer"
+            elif current_platform().is_npu:
+                self.sampling_backend = "ascend_full"
             else:
                 self.sampling_backend = "greedy"
 
@@ -1304,6 +1327,61 @@ class ServerArgs:
         self.kv_offload_config = dict(options, layers=list(layers))
 
     def resolve_speculative_decoding(self):
+        if self.speculative_algorithm == "DUMMY":
+            if (
+                self.speculative_draft_model_path is not None
+                or self.draft_model_path_use_base
+            ):
+                raise ValueError("DUMMY drafting does not accept a draft model path")
+            if int(self.speculative_num_draft_tokens) <= 1:
+                raise ValueError(
+                    "DUMMY drafting requires --speculative-num-draft-tokens > 1"
+                )
+        if self.synthetic_acceptance_length is not None:
+            length = self.synthetic_acceptance_length
+            if (
+                isinstance(length, bool)
+                or not isinstance(length, (int, float))
+                or not math.isfinite(length)
+            ):
+                raise ValueError("synthetic_acceptance_length must be a finite number")
+            if self.speculative_algorithm is None:
+                raise ValueError(
+                    "--synthetic-acceptance-length requires speculative decoding"
+                )
+            # Block checkpoints may replace the default width in ModelConfig.
+            # SamplingBackend checks the final width before allocating buffers.
+            checkpoint_sets_width = (
+                self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS
+                and not self._speculative_widths_explicit
+            )
+            if length < 1 or (
+                not checkpoint_sets_width and length > self.speculative_num_draft_tokens
+            ):
+                raise ValueError(
+                    "synthetic_acceptance_length must be in "
+                    f"[1, {self.speculative_num_draft_tokens}] "
+                    "(the speculative verify width including the target token)"
+                )
+            if self.sampling_backend != "greedy":
+                raise ValueError(
+                    "--synthetic-acceptance-length requires --sampling-backend greedy"
+                )
+            if self.speculative_eagle_topk != 1:
+                raise ValueError(
+                    "--synthetic-acceptance-length does not support draft trees"
+                )
+            if self.dp_sampling or self.enable_output_logprobs:
+                raise ValueError(
+                    "--synthetic-acceptance-length does not support "
+                    "--dp-sampling or --enable-output-logprobs"
+                )
+            logger.warning(
+                f"Synthetic acceptance length {length:.4f} enabled for benchmarking. "
+                "Generated text is synthetic and must not be used for correctness "
+                "or accuracy evaluation."
+            )
+
         # Keep drafter backend consistent with the main model unless explicitly set.
         if (
             self.speculative_algorithm is not None
@@ -2395,13 +2473,15 @@ class ServerArgs:
             "--kvstore-ratio",
             type=float,
             default=ServerArgs.kvstore_ratio,
-            help="The ratio of the size of the KVStore host memory pool to the size of the device pool.",
+            help="The ratio of the size of the KVStore host memory pool to the size of the device pool. "
+            "Capped, with a warning, to what fits in this rank's share of the Host memory its node has available.",
         )
         parser.add_argument(
             "--kvstore-size",
             type=int,
             default=ServerArgs.kvstore_size,
-            help="The size of the KVStore host memory pool in gigabytes, which will override kvstore_ratio if set.",
+            help="The size of the KVStore host memory pool in gigabytes, which will override kvstore_ratio if set. "
+            "Refused at startup if it does not fit in this rank's share of the Host memory its node has available.",
         )
         parser.add_argument(
             "--kvstore-io-backend",
@@ -2950,6 +3030,7 @@ class ServerArgs:
                 "flashinfer_full",
                 "triton",
                 "triton_full",
+                "ascend_full",
             ],
             default=ServerArgs.sampling_backend,
             help="Sampling backend. "
@@ -2962,6 +3043,7 @@ class ServerArgs:
             "via the softmax+renorm+min_p kernel sequence. "
             "'triton_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
             "with Triton Gumbel-Max for single-step sampling. "
+            "'ascend_full': graph-safe Ascend top-k/top-p/min-p sampling and chain verify. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
             "Finite top_k values must be < 128 or -1.",
         )
@@ -3142,13 +3224,13 @@ class ServerArgs:
             "--speculative_config",
             type=str,
             default=ServerArgs.speculative_config,
-            help="JSON speculative decoding configuration. Supported keys are method, model, and num_speculative_tokens.",
+            help="JSON speculative decoding configuration. Supported keys are method, model, num_speculative_tokens, and synthetic_acceptance_length.",
         )
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
             help="Speculative algorithm. In-tree: EAGLE3, MTP, DFLASH, "
-            "DSPARK; plugins may register more (validated after plugin "
+            "DSPARK, DUMMY; plugins may register more (validated after plugin "
             "discovery).",
         )
         parser.add_argument(
@@ -3180,6 +3262,16 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--synthetic-acceptance-length",
+            type=float,
+            default=ServerArgs.synthetic_acceptance_length,
+            help="Benchmark-only mean accepted length including the guaranteed "
+            "target token, in [1, speculative_num_draft_tokens]. Forces a "
+            "floor/ceil acceptance distribution; generated text is not valid "
+            "for correctness evaluation. Requires --sampling-backend greedy without "
+            "--dp-sampling or --enable-output-logprobs. Unset disables it.",
         )
         parser.add_argument(
             "--enable-speculative-sampling",

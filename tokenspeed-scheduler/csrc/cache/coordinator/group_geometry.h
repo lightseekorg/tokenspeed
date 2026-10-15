@@ -116,7 +116,7 @@ public:
     // is where the sliding-window token policy meets page arithmetic, so it
     // lives here and not in the (token-free) allocator.
     std::int32_t ExpiredBlocksAt(const CacheGroupSpec& spec, std::int32_t num_computed_tokens) const {
-        if (spec.kind != AttnKind::kSlidingWindow) {
+        if (spec.attn_kind != AttnKind::kSlidingWindow) {
             return 0;
         }
         _assert(spec.sliding_window > 0, "retention window must be > 0");

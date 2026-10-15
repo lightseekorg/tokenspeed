@@ -81,7 +81,7 @@ class PLEForwardMetadata:
 class Qwen4ExpPLEBackend(AttentionBackend):
     """Bind PLE cache fields and own their metadata and verify workspace."""
 
-    cache_consumer_families = frozenset({"state"})
+    cache_consumer_attn_kinds = frozenset({"state"})
     # The PLE layer's break runs request-shaped state updates eagerly, using
     # live query lengths to exclude padded rows from state writes.
     cuda_graph_support = CudaGraphSupport(prefill_graph=True)
@@ -136,8 +136,8 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             ),
             None,
         )
-        if group is None or group.family != "state":
-            raise RuntimeError("PLE requires a state-family cache group")
+        if group is None or group.attn_kind != "state":
+            raise RuntimeError("PLE requires a state cache group")
         return (
             context_fields[0],
             tuple(sorted(conv_fields, key=cache_field_layer_id)),
