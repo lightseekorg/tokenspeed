@@ -79,3 +79,6 @@ Verify the gRPC servicer and the source paths together:
 PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kernel-npu/python:${PYTHONPATH:-}" \
     python -m smg_grpc_servicer.tokenspeed --help
 ```
+
+For DSA operator contracts, tests and synthetic benchmarks, see the
+[operator notes](python/tokenspeed_kernel_npu/ops/dsa_rope.md).

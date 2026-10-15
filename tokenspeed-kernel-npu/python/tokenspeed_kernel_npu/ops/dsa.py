@@ -47,7 +47,7 @@ def _scatter(
     tl.store(Y + loc * WIDTH + off, x, (off < WIDTH) & (loc >= PAGE) & (loc < CAP))
 
 
-def interleave_rope(tensor, positions, cos_sin_cache, *, rope_dim):
+def _composite_interleave_rope(tensor, positions, cos_sin_cache, *, rope_dim):
     """Run the one-sided interleaved RoPE used by FluentLLM's indexer."""
     if tensor.shape[0] == 0:
         return tensor
@@ -65,6 +65,93 @@ def interleave_rope(tensor, positions, cos_sin_cache, *, rope_dim):
     if tail.shape[-1] == 0:
         return rotated
     return torch.cat((rotated, tail), dim=-1)
+
+
+@triton.jit
+def _interleave_rope_fused(
+    X, P, C, Y, heads, s0, s1, s2, cs0, cs1, ps0, BH: tl.constexpr
+):
+    row = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1) * BH + tl.arange(0, BH)
+    lane = tl.arange(0, 64)
+    pos = tl.load(P + row * ps0).to(tl.int64)
+    # Read each rotary row contiguously, then split adjacent pairs in UB.
+    # Keeping the head axis avoids a per-lane gather from global memory.
+    rot = tl.load(
+        X + row * s0 + head[:, None] * s1 + lane[None, :] * s2,
+        head[:, None] < heads,
+        other=0,
+    ).to(tl.float32)
+    even, odd = tl.split(tl.reshape(rot, (BH, 32, 2)))
+    pair = tl.arange(0, 32)
+    c = tl.load(C + pos * cs0 + pair * cs1).to(tl.float32)
+    s = tl.load(C + pos * cs0 + (pair + 32) * cs1).to(tl.float32)
+    # CANN maps adjacent pairs into the two halves of the output.
+    lo = even * c[None, :] - odd * s[None, :]
+    hi = odd * c[None, :] + even * s[None, :]
+    tail = tl.load(
+        X + row * s0 + head[:, None] * s1 + (lane[None, :] + 64) * s2,
+        head[:, None] < heads,
+        other=0,
+    )
+    tl.store(
+        Y + (row * heads + head[:, None]) * 128 + pair[None, :],
+        lo,
+        head[:, None] < heads,
+    )
+    tl.store(
+        Y + (row * heads + head[:, None]) * 128 + pair[None, :] + 32,
+        hi,
+        head[:, None] < heads,
+    )
+    tl.store(
+        Y + (row * heads + head[:, None]) * 128 + lane[None, :] + 64,
+        tail,
+        head[:, None] < heads,
+    )
+
+
+def interleave_rope(x, positions, table, *, rope_dim):
+    # Specialize the measured decode layouts. Other geometries/strides keep
+    # the existing CANN path rather than relying on unsupported UB tiling.
+    if (
+        x.ndim not in (2, 3)
+        or rope_dim != 64
+        or x.shape[-1] != 128
+        or x.dtype not in (torch.bfloat16, torch.float16)
+        or positions.ndim != 1
+        or positions.stride(0) != 1
+        or x.stride(-1) != 1
+        or table.stride(-1) != 1
+        or (x.ndim == 3 and x.shape[1] not in (1, 8, 64))
+    ):
+        return _composite_interleave_rope(x, positions, table, rope_dim=rope_dim)
+    if positions.numel() != x.shape[0]:
+        raise ValueError("DSA RoPE needs one position per token row")
+    if table.ndim != 2 or table.shape[1] != rope_dim:
+        raise ValueError("DSA RoPE needs a [positions, rope_dim] trigonometric table")
+    rows = x.shape[0]
+    heads = 1 if x.ndim == 2 else x.shape[1]
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    if rows == 0:
+        return out
+    bh = min(64, triton.next_power_of_2(heads))
+    _interleave_rope_fused[(rows, triton.cdiv(heads, bh))](
+        x,
+        positions,
+        table,
+        out,
+        heads,
+        x.stride(0),
+        0 if x.ndim == 2 else x.stride(1),
+        x.stride(-1),
+        table.stride(0),
+        table.stride(1),
+        positions.stride(0),
+        bh,
+        enable_fp_fusion=False,
+    )
+    return out
 
 
 class AscendDSAKernels:
