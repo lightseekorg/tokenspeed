@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 import tqdm
+from tokenspeed_kernel.workspace import capture_session
 
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cudagraph_memory import (
@@ -648,7 +649,8 @@ class ForwardStepRunner:
         _is_capture_mode = True
         global global_graph_memory_pool
         graph_kwargs = {"auto_dispatch_capture": True} if self.device == "npu" else {}
-        with observer, self.device_module.graph(
+        # The kernel state captured launches need lives as long as the graph.
+        with observer, capture_session(graph), self.device_module.graph(
             graph,
             pool=global_graph_memory_pool,
             stream=self.stream,

@@ -30,9 +30,10 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
-from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8 import decode  # noqa: E402
+from tokenspeed_kernel.workspace import capture_session, zeroed_state  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (  # noqa: E402
     gluon_mm_mxfp8_decode_gfx950,
+    gluon_mm_mxfp8_decode_num_counters_gfx950,
     launch_gluon_mm_mxfp8_decode_gfx950,
 )
 
@@ -61,6 +62,11 @@ def _reference(a, b, a_scales, b_scales) -> torch.Tensor:
 
 
 def _run(a, b, a_scales, b_scales, out=None) -> torch.Tensor:
+    counters = zeroed_state(
+        gluon_mm_mxfp8_decode_num_counters_gfx950(a.shape[0], b.shape[0], a.shape[1]),
+        dtype=torch.int32,
+        device=a.device,
+    )
     return launch_gluon_mm_mxfp8_decode_gfx950(
         a,
         b,
@@ -69,6 +75,7 @@ def _run(a, b, a_scales, b_scales, out=None) -> torch.Tensor:
         torch.bfloat16,
         alpha=None,
         block_size=[1, 32],
+        counters=counters,
         out=out,
     )
 
@@ -133,7 +140,9 @@ def test_row_count_does_not_recompile() -> None:
             )
 
 
-def test_hip_graph_replay_uses_private_counters() -> None:
+def test_hip_graph_replay_keeps_counters_zeroed() -> None:
+    # A captured split-K launch gets counters zeroed outside the graph; every
+    # replay leaves them zeroed for the next.
     torch.manual_seed(0)
     m, n, k = 12, 1152, 5120  # split-K route
     a, b, a_scales, b_scales = _operands(m, n, k)
@@ -141,15 +150,12 @@ def test_hip_graph_replay_uses_private_counters() -> None:
     stream = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream):
-        # Eager warmup on the capture stream fills the per-stream caches.
         _run(a, b, a_scales, b_scales, out=out)
-        eager_counters = dict(decode._counter_cache)
-        with torch.cuda.graph(graph, stream=stream):
+        with capture_session(graph), torch.cuda.graph(graph, stream=stream):
             _run(a, b, a_scales, b_scales, out=out)
     stream.synchronize()
-    assert decode._counter_cache == eager_counters
 
-    for _ in range(2):
+    for _ in range(3):
         new_a, _, new_scales, _ = _operands(m, n, k)
         a.copy_(new_a)
         a_scales.copy_(new_scales)

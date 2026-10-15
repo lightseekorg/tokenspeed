@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 import torch
 from utils import assert_no_triton_compile, is_cdna4
@@ -31,7 +33,8 @@ if not is_cdna4():
     )
 
 
-import tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm as mm_module  # noqa: E402
+from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_router_projection  # noqa: E402
+from tokenspeed_kernel.workspace import capture_session, zeroed_state  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     launch_gluon_mm_a16w16_prefill_gfx950,
     supports_gluon_mm_a16w16_prefill_gfx950,
@@ -39,10 +42,10 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     _choose_mfma_lds_mediumm_config,
     _get_partial_scratch,
-    _get_splitk_counters,
     _supports_mfma_lds_smallm,
     _use_mfma_lds_largem,
     _use_warp_reduce_smallm,
+    gluon_mm_a16w16_decode_num_counters_gfx950,
     gluon_mm_a16w16_gfx950,
     gluon_mm_a16w16_medium_gfx950,
     launch_gluon_bmm_a16w16_gfx950,
@@ -342,6 +345,18 @@ _DECODE_CASES = [
 ]
 
 
+def _decode(a, b, out_dtype, out=None):
+    m, k = a.shape
+    counters = zeroed_state(
+        gluon_mm_a16w16_decode_num_counters_gfx950(m, b.shape[0], k),
+        dtype=torch.int32,
+        device=a.device,
+    )
+    return launch_gluon_mm_a16w16_decode_gfx950(
+        a, b, out_dtype, counters=counters, out=out
+    )
+
+
 def _decode_reference(a, b, out_dtype):
     if out_dtype == torch.float32:
         return a.float() @ b.float().T
@@ -359,7 +374,7 @@ def test_decode_gemm_correctness_across_repeated_calls(
     # resets them, so back-to-back launches must stay correct.
     for _ in range(3):
         a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
-        out = launch_gluon_mm_a16w16_decode_gfx950(a, b, out_dtype)
+        out = _decode(a, b, out_dtype)
         assert out.dtype == out_dtype
         # FP32 output differs from the reference only by summation order.
         rtol = 1e-5 if out_dtype == torch.float32 else _RTOL
@@ -368,76 +383,41 @@ def test_decode_gemm_correctness_across_repeated_calls(
         )
 
 
-def test_decode_gemm_graph_does_not_share_eager_counters() -> None:
+@pytest.mark.parametrize("session", [True, False], ids=["session", "no-session"])
+def test_decode_gemm_graph_replays(session: bool) -> None:
+    # The router bucket uses 16x16 tiles with split-K 7. A capture session
+    # zeroes the counters once outside the graph, otherwise the graph zeroes
+    # them itself; either way every replay leaves them zeroed for the next.
     torch.manual_seed(0)
     m, n, k = 4, 896, 7168
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
     out = torch.empty((m, n), device="cuda", dtype=torch.float32)
-    device = torch.device("cuda")
-    # The router bucket uses 16x16 tiles with split-K 7.
-    num_tiles = n // 16
 
     stream = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream):
-        # Eager warmup on the capture stream fills the per-stream cache.
-        launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=out)
-        eager = _get_splitk_counters(device, num_tiles)
-        with torch.cuda.graph(graph, stream=stream):
-            captured = _get_splitk_counters(device, num_tiles)
-            launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=out)
+        _decode(a, b, torch.float32, out=out)
+        scope = capture_session(graph) if session else contextlib.nullcontext()
+        with scope, torch.cuda.graph(graph, stream=stream):
+            _decode(a, b, torch.float32, out=out)
     stream.synchronize()
 
-    # The graph must use its own counters, not the eager stream's buffer.
-    assert captured.data_ptr() != eager.data_ptr()
-    # The counters are zeroed before capture, not by the graph: every replay
-    # relies on the previous one resetting them.
     for _ in range(3):
         a.copy_(torch.randn_like(a) * 0.25)
         graph.replay()
         torch.testing.assert_close(out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5)
 
 
-def test_decode_gemm_graphs_survive_counter_arena_replacement(monkeypatch) -> None:
-    # A small arena fills up after two captures; the next eager call replaces
-    # it while both graphs still bump counters in it on every replay.
-    monkeypatch.setattr(mm_module, "_GRAPH_COUNTER_ARENA_SIZE", 128)
-    monkeypatch.setattr(mm_module, "_graph_counter_arenas", {})
-    monkeypatch.setattr(mm_module, "_retired_graph_counter_arenas", [])
+@pytest.mark.parametrize("m", [4, 16])
+def test_kimi3_router_gluon_decode_matches_reference(m: int) -> None:
+    # The router's split-K decode buckets, through the model-facing op.
     torch.manual_seed(0)
-    m, n, k = 4, 896, 7168  # 56 tiles of the split-K router bucket
-    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
-    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
-    outs = [torch.empty((m, n), device="cuda", dtype=torch.float32) for _ in range(2)]
-
-    stream = torch.cuda.Stream()
-    graphs = [torch.cuda.CUDAGraph() for _ in range(2)]
-    with torch.cuda.stream(stream):
-        for graph, out in zip(graphs, outs, strict=True):
-            launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=out)
-            with torch.cuda.graph(graph, stream=stream):
-                launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=out)
-        launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=outs[0])
-    stream.synchronize()
-
-    # Fresh allocations on the arena's stream must not land on the counters
-    # the graphs still use.
-    with torch.cuda.stream(stream):
-        fillers = [
-            torch.full((128,), 7, device="cuda", dtype=torch.int32) for _ in range(8)
-        ]
-    stream.synchronize()
-    for _ in range(3):
-        a.copy_(torch.randn_like(a) * 0.25)
-        for graph in graphs:
-            graph.replay()
-        for out in outs:
-            torch.testing.assert_close(
-                out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5
-            )
-    torch.cuda.synchronize()
-    assert all(torch.all(filler == 7) for filler in fillers)
+    a = torch.randn((m, 7168), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((896, 7168), device="cuda", dtype=torch.bfloat16) * 0.25
+    for _ in range(2):
+        out = kimi3_router_projection(a, b, solution="gluon_decode")
+        torch.testing.assert_close(out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5)
 
 
 def test_decode_gemm_writes_strided_out() -> None:
@@ -448,7 +428,7 @@ def test_decode_gemm_writes_strided_out() -> None:
     backing = torch.empty((m, n + 17), device="cuda", dtype=torch.float32)
     out = backing[:, :n]
 
-    actual = launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=out)
+    actual = _decode(a, b, torch.float32, out=out)
 
     assert actual is out
     torch.testing.assert_close(out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5)
@@ -476,7 +456,7 @@ def test_decode_gemm_row_count_does_not_recompile() -> None:
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
 
     def run(rows):
-        out = launch_gluon_mm_a16w16_decode_gfx950(a[:rows], b, torch.bfloat16)
+        out = _decode(a[:rows], b, torch.bfloat16)
         torch.testing.assert_close(out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL)
 
     # Warm both integer classes (divisible by 16 or not) of each bucket.
@@ -556,7 +536,7 @@ def test_qwen38_decode_gemm_matches_reference(shape: tuple[int, int, int]) -> No
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
     for _ in range(2):
         a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
-        out = launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.bfloat16)
+        out = _decode(a, b, torch.bfloat16)
         torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-4, rtol=_RTOL)
 
 
@@ -567,7 +547,7 @@ def test_qwen38_decode_row_count_does_not_recompile() -> None:
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
 
     def run(rows):
-        out = launch_gluon_mm_a16w16_decode_gfx950(a[:rows], b, torch.bfloat16)
+        out = _decode(a[:rows], b, torch.bfloat16)
         torch.testing.assert_close(out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL)
 
     for rows in (3, 4, 5, 8, 9, 16, 17, 32, 33, 64):

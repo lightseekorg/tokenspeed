@@ -50,6 +50,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import _remap_xcd
+from tokenspeed_kernel_amd.ops.gfx950.gemm.splitk import check_splitk_counters
 
 cdna4 = gl.amd.cdna4
 
@@ -57,7 +58,6 @@ MXFP4_GROUP = 32
 GROUP = gl.constexpr(MXFP4_GROUP)
 
 _partial_cache: dict[tuple[int, int, int], torch.Tensor] = {}
-_counter_cache: dict[tuple[int, int, int], torch.Tensor] = {}
 
 
 def _launch_metadata(grid, kernel, args):
@@ -591,24 +591,6 @@ def _get_partial_scratch(device: torch.device, numel: int) -> torch.Tensor:
     return cached
 
 
-def _get_splitk_counters(device: torch.device, num_tiles: int) -> torch.Tensor:
-    """Return stream-local zeroed per-tile arrival counters.
-
-    The last split of each tile resets its counter, so the buffer is zero
-    again whenever a launch completes and same-stream launches can share it.
-    """
-    if torch.cuda.is_current_stream_capturing():
-        return torch.zeros((num_tiles,), dtype=torch.int32, device=device)
-    device_index = torch.cuda.current_device() if device.index is None else device.index
-    stream_id = torch.cuda.current_stream(device_index).cuda_stream
-    key = (device_index, stream_id, num_tiles)
-    counters = _counter_cache.get(key)
-    if counters is None:
-        counters = torch.zeros((num_tiles,), dtype=torch.int32, device=device)
-        _counter_cache[key] = counters
-    return counters
-
-
 # Tile configuration: (BLOCK_M, BLOCK_N, BLOCK_K, WARPS_M, WARPS_N, SPLIT_K).
 # A call uses the config of the smallest M bucket covering its M (None covers
 # the rest), so M stays a runtime argument within a bucket.
@@ -678,10 +660,30 @@ def supports_gluon_mxfp4_linear_gfx950(n: int, k: int, swiglu: bool) -> bool:
     )
 
 
+def _num_tiles(m: int, n: int, config: _Config, swiglu: bool) -> int:
+    block_m, block_n = config[0], config[1]
+    n_tiles = triton.cdiv(n // 2, block_n // 2) if swiglu else triton.cdiv(n, block_n)
+    return triton.cdiv(m, block_m) * n_tiles
+
+
+def gluon_mxfp4_linear_num_counters_gfx950(m: int, n: int, k: int, swiglu: bool) -> int:
+    """Split-K arrival counters an MXFP4 linear launch needs; 0 without split-K.
+
+    Args:
+        m: Activation rows.
+        n: Weight rows (gate and up rows together for SwiGLU).
+        k: Reduction width.
+        swiglu: Whether the launch is the fused SwiGLU linear.
+    """
+    config = _choose_config(m, n, k, swiglu)
+    return 0 if config[5] == 1 else _num_tiles(m, n, config, swiglu)
+
+
 def _launch(
     x: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
+    counters: torch.Tensor,
     out: torch.Tensor | None,
     swiglu: bool,
 ) -> torch.Tensor:
@@ -722,16 +724,14 @@ def _launch(
     if m == 0:
         return out
 
-    block_m, block_n, block_k, warps_m, warps_n, split_k = _choose_config(
-        m, n, k, swiglu
-    )
-    n_tiles = triton.cdiv(n // 2, block_n // 2) if swiglu else triton.cdiv(n, block_n)
-    num_tiles = triton.cdiv(m, block_m) * n_tiles
+    config = _choose_config(m, n, k, swiglu)
+    block_m, block_n, block_k, warps_m, warps_n, split_k = config
+    num_tiles = _num_tiles(m, n, config, swiglu)
     if split_k > 1:
+        check_splitk_counters(counters, num_tiles, x.device, "gfx950 MXFP4 linear")
         partial = _get_partial_scratch(
             x.device, num_tiles * split_k * block_m * block_n
         )
-        counters = _get_splitk_counters(x.device, num_tiles)
     else:
         partial = counters = out
     kernel = gluon_mxfp4_swiglu_linear_gfx950 if swiglu else gluon_mxfp4_linear_gfx950
@@ -765,6 +765,7 @@ def launch_gluon_mxfp4_linear_gfx950(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     *,
+    counters: torch.Tensor,
     out: torch.Tensor | None,
 ) -> torch.Tensor:
     """Compute ``mxfp4(x) @ W.T`` on gfx950.
@@ -776,12 +777,15 @@ def launch_gluon_mxfp4_linear_gfx950(
             order of ``preshuffle_mxfp4_weight``. ``N % 16 == 0`` and
             ``K % 64 == 0``.
         weight_scale: uint8 UE8M0 ``[N, K/32]`` with unit inner stride.
+        counters: Zeroed int32 split-K arrival counters, at least
+            ``gluon_mxfp4_linear_num_counters_gfx950(M, N, K, False)`` of
+            them; the launch leaves them zeroed (see ``splitk.py``).
         out: Optional BF16 ``[M, N]`` destination with unit inner stride.
 
     Returns:
         BF16 ``[M, N]``; ``out`` when provided.
     """
-    return _launch(x, weight, weight_scale, out, swiglu=False)
+    return _launch(x, weight, weight_scale, counters, out, swiglu=False)
 
 
 def launch_gluon_mxfp4_swiglu_linear_gfx950(
@@ -789,6 +793,7 @@ def launch_gluon_mxfp4_swiglu_linear_gfx950(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     *,
+    counters: torch.Tensor,
     out: torch.Tensor | None,
 ) -> torch.Tensor:
     """Compute ``silu(mxfp4(x) @ W_gate.T) * (mxfp4(x) @ W_up.T)`` on gfx950.
@@ -799,17 +804,21 @@ def launch_gluon_mxfp4_swiglu_linear_gfx950(
             ``[0, N/2)`` are the gate projection and ``[N/2, N)`` the up
             projection. ``N % 32 == 0`` and ``K % 64 == 0``.
         weight_scale: uint8 UE8M0 ``[N, K/32]`` with unit inner stride.
+        counters: Zeroed int32 split-K arrival counters, at least
+            ``gluon_mxfp4_linear_num_counters_gfx950(M, N, K, True)`` of them;
+            the launch leaves them zeroed (see ``splitk.py``).
         out: Optional BF16 ``[M, N/2]`` destination with unit inner stride.
 
     Returns:
         BF16 ``[M, N/2]``, rounded like the unfused GEMM, SiLU-and-mul path;
         ``out`` when provided.
     """
-    return _launch(x, weight, weight_scale, out, swiglu=True)
+    return _launch(x, weight, weight_scale, counters, out, swiglu=True)
 
 
 __all__ = [
     "gluon_mxfp4_linear_gfx950",
+    "gluon_mxfp4_linear_num_counters_gfx950",
     "gluon_mxfp4_swiglu_linear_gfx950",
     "launch_gluon_mxfp4_linear_gfx950",
     "launch_gluon_mxfp4_swiglu_linear_gfx950",

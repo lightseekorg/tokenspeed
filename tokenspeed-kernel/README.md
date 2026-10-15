@@ -148,6 +148,17 @@ At execution, the registry matches the prepared weights to kernels that support
 their layout alongside the operation's other requirements. This lets preparation
 and execution remain separate while different kernels can share prepared weights.
 
+### Kernel state and graph capture
+
+Some kernels keep device state that must start at zero and that every launch
+restores to zero, such as split-K arrival counters. Such kernels take the state
+as an argument and report how much they need; the registered op gets it from
+`tokenspeed_kernel.workspace.zeroed_state`. Eager launches share one buffer per
+stream. A graph captured inside `capture_session` gets buffers of its own,
+zeroed once after capture outside the graph and kept alive as long as the
+graph, so replays carry no zeroing node. The runtime opens a session around
+every graph it captures.
+
 ### Solution choices
 
 - **Triton** — in-tree; default portable JIT path for various kernels, including
