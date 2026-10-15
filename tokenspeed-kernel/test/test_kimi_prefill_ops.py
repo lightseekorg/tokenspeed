@@ -6,8 +6,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import tokenspeed_kernel.ops.gemm as kimi3_module
 import torch
-from tokenspeed_kernel.ops.gemm import kimi3 as kimi3_module
 from tokenspeed_kernel.ops.gemm import (
     kimi3_latent_projection,
     kimi3_mla_qkv_gate_projection,
