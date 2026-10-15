@@ -177,12 +177,17 @@ def test_context_builds_the_heap_on_the_requested_gpu(monkeypatch):
     from tokenspeed_kernel.ops.communication import _iris
 
     module = _iris.iris_host
-    switched, heaps = [], []
+    switched, heaps, contexts = [], [], []
+    build_device_context = module.Iris._build_device_context
 
     def build(heap_size, **options):
         module.set_device(0)
         heaps.append(module.SymmetricHeap(heap_size, 0, 0, 1, "torch"))
-        return SimpleNamespace(gpu_id=0, device="cuda:0")
+        ctx = SimpleNamespace(gpu_id=0, device="cuda:0")
+        # Iris.__init__ ends by building the device context on ctx.device.
+        module.Iris._build_device_context(ctx)
+        ctx._build_device_context = lambda: contexts.append(ctx.device)
+        return ctx
 
     monkeypatch.setattr(module, "set_device", switched.append)
     monkeypatch.setattr(module, "SymmetricHeap", lambda *args: args)
@@ -191,8 +196,36 @@ def test_context_builds_the_heap_on_the_requested_gpu(monkeypatch):
     ctx = _iris._create_context(1 << 20, None, 2)
     assert (ctx.gpu_id, ctx.device) == (2, "cuda:2")
     assert heaps == [(1 << 20, 2, 0, 1, "torch")]
+    assert contexts == ["cuda:2"]
     assert not switched
     assert module.set_device == switched.append
+    assert module.Iris._build_device_context is build_device_context
+
+
+def test_context_refuses_vmem_off_the_rank_gpu(monkeypatch):
+    """Iris without ``device=`` grants vmem access to GPUs 0..world_size-1."""
+    from tokenspeed_kernel.ops.communication import _iris
+
+    module = _iris.iris_host
+    heaps = []
+
+    def build(heap_size, allocator_type="torch"):
+        heaps.append(module.SymmetricHeap(heap_size, 0, 0, 2, allocator_type))
+        ctx = SimpleNamespace(gpu_id=0, device="cuda:0")
+        ctx._build_device_context = lambda: None
+        return ctx
+
+    monkeypatch.delenv("IRIS_ALLOCATOR", raising=False)
+    monkeypatch.setattr(module, "SymmetricHeap", lambda *args: args)
+    monkeypatch.setattr(_iris.iris, "iris", build)
+
+    with pytest.raises(RuntimeError, match="cannot place rank 0 on GPU 2"):
+        _iris._create_context(1 << 20, "vmem", 2)
+    monkeypatch.setenv("IRIS_ALLOCATOR", "vmem")
+    with pytest.raises(RuntimeError, match="cannot place rank 0 on GPU 2"):
+        _iris._create_context(1 << 20, None, 2)
+    _iris._create_context(1 << 20, "vmem", 0)
+    assert heaps == [(1 << 20, 0, 0, 2, "vmem")]
 
 
 def test_group_rejects_a_context_on_another_gpu():

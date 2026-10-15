@@ -23,6 +23,7 @@
 import inspect
 import itertools
 import math
+import os
 import socket
 from contextlib import contextmanager
 
@@ -77,15 +78,36 @@ def _job_spans_hosts() -> bool:
 
 @contextmanager
 def _heap_on(device: int):
-    """Build the heap on ``device``; Iris without ``device=`` uses rank % GPUs."""
+    """Build the heap on ``device``; Iris without ``device=`` uses rank % GPUs.
+
+    The device context is left for the caller to build once ``ctx.device`` is
+    corrected, so nothing is allocated on GPU rank % GPUs.
+    """
     heap = iris_host.SymmetricHeap
-    saved = iris_host.set_device, heap
+    saved = iris_host.set_device, heap, iris_host.Iris._build_device_context
+
+    def build_heap(size, gpu_id, rank, world_size, allocator_type="torch"):
+        allocator = os.environ.get("IRIS_ALLOCATOR", allocator_type).lower()
+        if allocator == "vmem" and device != gpu_id:
+            # Without device=, VMemAllocator grants access to GPUs 0..world_size-1.
+            raise RuntimeError(
+                f"Iris's vmem allocator cannot place rank {rank} on GPU {device}: "
+                "this Iris has no device= argument. Use the torch or vmem_chunked "
+                "allocator, or an Iris that accepts device=."
+            )
+        return heap(size, device, rank, world_size, allocator_type)
+
     iris_host.set_device = lambda gpu_id: None
-    iris_host.SymmetricHeap = lambda size, gpu_id, *args: heap(size, device, *args)
+    iris_host.SymmetricHeap = build_heap
+    iris_host.Iris._build_device_context = lambda self: None
     try:
         yield
     finally:
-        iris_host.set_device, iris_host.SymmetricHeap = saved
+        (
+            iris_host.set_device,
+            iris_host.SymmetricHeap,
+            iris_host.Iris._build_device_context,
+        ) = saved
 
 
 def _create_context(size: int, allocator_type: str | None, device: int):
@@ -95,6 +117,7 @@ def _create_context(size: int, allocator_type: str | None, device: int):
     with _heap_on(device):
         ctx = iris.iris(heap_size=size, **options)
     ctx.gpu_id, ctx.device = device, f"cuda:{device}"
+    ctx._build_device_context()
     return ctx
 
 
