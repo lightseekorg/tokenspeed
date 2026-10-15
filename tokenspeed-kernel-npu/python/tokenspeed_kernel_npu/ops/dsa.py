@@ -90,6 +90,7 @@ class AscendDSAKernels:
                 "SparseFlashAttentionDecode operators"
             )
         self._full_scan_chunks = {}
+        self._selection_windows = {}
 
     interleave_rope = staticmethod(interleave_rope)
 
@@ -146,10 +147,19 @@ class AscendDSAKernels:
     def index(
         self, query, key, weights, q_ends, kv_lengths, table, topk, initial, local
     ):
-        initial_tensor = torch.full_like(q_ends, initial, dtype=torch.int32)
-        local_tensor = torch.full(
-            (query.shape[0],), local, dtype=torch.int32, device=query.device
-        )
+        # Immutable model constants. Keep their tensors alive for every graph
+        # that captured the pointers; lengths/page tables remain refreshed.
+        window_key = (query.device, q_ends.numel(), query.shape[0], initial, local)
+        windows = self._selection_windows.get(window_key)
+        if windows is None:
+            windows = (
+                torch.full_like(q_ends, initial, dtype=torch.int32),
+                torch.full(
+                    (query.shape[0],), local, dtype=torch.int32, device=query.device
+                ),
+            )
+            self._selection_windows[window_key] = windows
+        initial_tensor, local_tensor = windows
         result, _ = self._index(
             query.contiguous(),
             key,
