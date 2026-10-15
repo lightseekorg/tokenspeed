@@ -634,6 +634,10 @@ class VerifyCommitGPUTest(unittest.TestCase):
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
         from tokenspeed.runtime.layers.attention.backends.state import mamba
 
+        from tokenspeed_kernel.ops.kvcache.triton import (
+            _state_verify_commit_rows_kernel,
+        )
+
         width, capacity = 3, 4
         # Sorted layers select groups [1, 0, 1], exercising both reordering
         # and a group shared by multiple non-adjacent layers.
@@ -706,7 +710,15 @@ class VerifyCommitGPUTest(unittest.TestCase):
                                 )
                     # Warm pointer tables outside profiling, as forward seeding does.
                     backend._verify_copy_tables_get()
-                    with patch.object(mamba, "gdn_replay_commit") as replay:
+                    # Count real launches directly: ROCm profiler traces can omit events.
+                    with (
+                        patch.object(mamba, "gdn_replay_commit") as replay,
+                        patch.object(
+                            _state_verify_commit_rows_kernel,
+                            "run",
+                            wraps=_state_verify_commit_rows_kernel.run,
+                        ) as commit_rows_launch,
+                    ):
                         with torch.profiler.profile(
                             activities=[
                                 torch.profiler.ProfilerActivity.CPU,
@@ -723,13 +735,7 @@ class VerifyCommitGPUTest(unittest.TestCase):
                         for e in events
                         if e.device_type == torch.autograd.DeviceType.CUDA
                     ]
-                    self.assertEqual(
-                        sum(
-                            "_state_verify_commit_rows_kernel" in name
-                            for name in gpu_kernels
-                        ),
-                        1,
-                    )
+                    commit_rows_launch.assert_called_once()
                     # Replay still assembles its separate read indices; the
                     # scratch-copy path needs no PyTorch index arithmetic.
                     if not replay_ssm:
