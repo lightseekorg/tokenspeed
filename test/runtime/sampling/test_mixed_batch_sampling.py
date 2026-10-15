@@ -401,6 +401,7 @@ def test_mixed_round_takes_fused_argmax_ids():
         num_extends=num_extends,
         bs=bs,
         decode_input_ids=None,
+        sampled_top_k=0,
     )
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.sampling_backend = backend
@@ -410,12 +411,12 @@ def test_mixed_round_takes_fused_argmax_ids():
     )
     executor._apply_force_single_token_verify = lambda accept, off, cnt, ids: accept
 
-    out_tokens, out_accept = ModelExecutor._run_sampling(
+    out_tokens, out_accept = ModelExecutor._sample_and_verify(
         executor,
         LogitsProcessorOutput(next_token_logits=shard, next_token_ids=ids),
         info,
         ctx,
-        candidates=candidates,
+        candidates,
     )
     torch.cuda.synchronize()
     assert out_tokens[:num_extends].tolist() == [5, 6]
