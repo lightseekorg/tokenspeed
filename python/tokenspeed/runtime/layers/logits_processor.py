@@ -37,6 +37,10 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
     supports_dist_argmax_shape,
     try_create_dist_argmax_state,
 )
+from tokenspeed_kernel.ops.sampling.triton.vocab_parallel_argmax import (
+    argmax_key_index,
+    vocab_parallel_argmax_keys,
+)
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -51,6 +55,7 @@ from tokenspeed.runtime.distributed.comm_manager import (
 from tokenspeed.runtime.distributed.comm_ops import (
     all_gather,
     all_gather_single,
+    all_reduce,
     all_to_all_transpose,
     token_all_gather,
     token_all_gather_rows,
@@ -142,6 +147,26 @@ def _dist_argmax_vetoed() -> bool:
         _force_deterministic_rsag()
         or global_server_args_dict["numerics"] in BITWISE_ENVELOPES
     )
+
+
+class VocabParallelArgmax:
+    """Greedy token ids from logits left sharded over the vocabulary.
+
+    Each rank packs its shard's row maximum and global index into an int64
+    key, and an all-reduce MAX over the group picks the same token the
+    argmax of the gathered row would. It exchanges 8 bytes per row instead
+    of the logits shards.
+    """
+
+    def __init__(self, tp_group: tuple[int, ...], vocab_offset: int):
+        self.tp_group = tp_group
+        self.vocab_offset = vocab_offset
+
+    def __call__(self, logits: torch.Tensor) -> torch.Tensor:
+        keys = torch.empty(logits.shape[0], dtype=torch.int64, device=logits.device)
+        vocab_parallel_argmax_keys(logits, vocab_offset=self.vocab_offset, out=keys)
+        keys = all_reduce(keys, self.tp_group, op=torch.distributed.ReduceOp.MAX)
+        return argmax_key_index(keys, out=torch.empty_like(keys))
 
 
 @dataclasses.dataclass
@@ -553,17 +578,19 @@ class LogitsProcessor(nn.Module):
         vocab_per_rank = lm_head.weight.size(0)
         if vocab_per_rank * self.tp_size != self.config.vocab_size:
             return None  # padded vocab: sharded argmax could pick a pad column
-        if not supports_dist_argmax_shape(
+        state = None
+        if supports_dist_argmax_shape(
             vocab_per_rank, lm_head.weight.dtype, self.tp_size
         ):
-            return None
-
-        return self.acquire_dist_argmax_state(
-            lm_head,
-            max_M=self._LOGITS_DIST_ARGMAX_MAX_TOKENS,
-            skip_ping_pong=True,
-            dtype=lm_head.weight.dtype,
-        )
+            state = self.acquire_dist_argmax_state(
+                lm_head,
+                max_M=self._LOGITS_DIST_ARGMAX_MAX_TOKENS,
+                skip_ping_pong=True,
+                dtype=lm_head.weight.dtype,
+            )
+        if state is None and not torch.cuda.is_current_stream_capturing():
+            state = VocabParallelArgmax(self.tp_group, self.tp_rank * vocab_per_rank)
+        return state
 
     def forward(
         self,
@@ -1062,6 +1089,8 @@ class LogitsProcessor(nn.Module):
             and not self.final_logit_softcapping
             and logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
         ):
+            if isinstance(self._dist_argmax_state, VocabParallelArgmax):
+                return self._dist_argmax_state(logits)
             _, idx = distributed_argmax(self._dist_argmax_state, logits)
             return idx
         else:
