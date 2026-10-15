@@ -2558,7 +2558,7 @@ if platform.is_amd:
             "latent_size": frozenset({3584}),
             "shared_size": frozenset({768}),
             "inputs_contiguous": frozenset({True}),
-            "tokens": frozenset(range(1, 33)),
+            "tokens": frozenset(range(1, 65)),
         },
     )
     def gluon_latent_input_decode_gfx1250(**kwargs):
