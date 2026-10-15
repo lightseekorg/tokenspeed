@@ -3618,15 +3618,15 @@ def index_block_select(logits, visible, candidate_topk, block_out, block_lens):
     """Select each query's best 8-row blocks from scored logits, position-sorted.
 
     Args:
-        logits: FP32 [Q, width] full-selection scores; columns at or past
-            ``visible[q]`` must be -inf and are not read.
+        logits: FP32 [Q, width] full-selection scores with unit inner stride;
+            columns at or past ``visible[q]`` must be -inf and are not read.
         visible: Int32/int64 [Q] visible row counts.
         candidate_topk: Number of blocks to keep.
-        block_out: Int32 [Q, cap] destination. Row q receives the ids of its
-            ``min(candidate_topk, width // 8)`` best blocks by maximum logit in
-            ascending order, then -1. The block holding row ``visible[q] - 1``
-            is forced in when it has a finite score; equal-score boundary ties
-            keep the lowest blocks.
+        block_out: Int32 [Q, cap] destination with unit inner stride. Row q
+            receives the ids of its ``min(candidate_topk, width // 8)`` best
+            blocks by maximum logit in ascending order, then -1. The block
+            holding row ``visible[q] - 1`` is forced in when it has a finite
+            score; equal-score boundary ties keep the lowest blocks.
         block_lens: Int32 [Q] destination for the number of ids written.
 
     Returns:

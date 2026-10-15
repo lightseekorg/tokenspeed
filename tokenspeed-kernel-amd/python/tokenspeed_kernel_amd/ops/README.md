@@ -524,7 +524,7 @@ Block selection takes the maximum logit of each 8-row block, forces the
 newest visible block to `+inf`, and keeps the top blocks in ascending order.
 On gfx950 the portable Triton block select runs one program per query: it
 reads only the visible blocks, runs a four-pass MSD radix select (8 key bits
-per pass) and emits the picks in block order, so no sort is needed. gfx1250
+per pass), and emits the picks in block order, so no sort is needed. gfx1250
 uses torch.
 
 ### gfx950 DeepSeek V4.1 selected attention
