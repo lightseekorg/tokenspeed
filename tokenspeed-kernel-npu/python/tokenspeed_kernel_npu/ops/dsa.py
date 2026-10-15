@@ -243,6 +243,58 @@ class AscendDSAKernels:
         )
         return output.to(q.dtype)
 
+    def attention_packed(
+        self,
+        query,
+        key,
+        indices,
+        valid_chunks,
+        q_ends,
+        kv_lengths,
+        table,
+        scale,
+        *,
+        head_major_output,
+    ):
+        """Consume packed latent/aux Q and cast only the live output heads.
+
+        The existing rank-major ABI also represents a single rank. SFAD writes
+        head-major FP32 output directly; no context-parallel collective is used.
+        """
+        heads = query.shape[1]
+        if not 1 <= heads <= 64:
+            raise ValueError("Ascend DSA supports 1 through 64 local heads")
+        padded_heads = 32 if heads <= 32 else 64
+        if heads != padded_heads:
+            query = query.repeat(1, (padded_heads + heads - 1) // heads, 1)
+            query = query[:, :padded_heads].contiguous()
+        output, _, _ = self._attention(
+            query.unsqueeze(0),
+            key,
+            key,
+            indices,
+            scale,
+            valid_chunks=valid_chunks,
+            block_table=table,
+            actual_seq_lengths_query=q_ends,
+            actual_seq_lengths_kv=kv_lengths,
+            query_rope=None,
+            key_rope=None,
+            sparse_block_size=1,
+            layout_query="RANK_MAJOR_TND_PACKED_KVP_COMM",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            pre_tokens=9223372036854775807,
+            next_tokens=9223372036854775807,
+            attention_mode=2,
+            return_softmax_lse=False,
+            sparse_prep_mode=0,
+        )
+        output = output[:heads].to(query.dtype)
+        if head_major_output:
+            return output
+        return output.transpose(0, 1).contiguous().flatten(1)
+
     def attention_partial(
         self,
         packed_query,
