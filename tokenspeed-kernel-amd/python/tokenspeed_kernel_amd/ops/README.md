@@ -1094,7 +1094,8 @@ order-preserving bits of the value above the inverted expert id (32-bit keys
 for 16-bit logits, 64-bit for FP32). Keys are unique, so each of the `topk`
 rounds is one wave max reduction followed by clearing the winning key. The
 selected logits come back exactly from the key bits, so no second gather is
-needed.
+needed. The ids and weights collect in registers and leave with one buffer
+store each.
 
 ### MXFP4 sorted experts
 
