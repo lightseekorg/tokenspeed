@@ -55,6 +55,7 @@ def backend(monkeypatch):
     instance._iris.producer_direct_max_bytes = 1024 * 1024
     instance._iris.can_acquire_outputs.return_value = True
     instance._iris.can_reduce_outputs.return_value = False
+    instance._iris.maps_across_hosts.return_value = False
     return instance
 
 
@@ -125,6 +126,16 @@ def test_iris_preparation_caps_only_ordinary_staging(monkeypatch):
     assert backend.prepare_all_reduce_buffers(group, **capacities)
     assert backend.state(group, torch.bfloat16) is state
     assert len(created) == 1
+
+
+@pytest.mark.parametrize(("cdna5", "across"), [(True, True), (False, False)])
+def test_only_gfx1250_heaps_map_across_hosts(monkeypatch, cdna5, across):
+    monkeypatch.setattr(
+        iris_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_amd=True, is_cdna5=cdna5),
+    )
+    assert IrisBackend.maps_across_hosts() is across
 
 
 def test_public_preparation_preserves_capacities(backend, monkeypatch):
