@@ -161,6 +161,8 @@ env:
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_triton_matches_softmax_topk[2-896-16-dtype4-True]
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_triton_matches_softmax_topk[7-16-3-dtype3-False]
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_public_entry_point_is_cuda_graph_capturable
+    # Iris collectives compile for wave32, and only flag polls bypass the cache.
+    tokenspeed-kernel/test/amd/ops/test_iris_codegen_gfx1250.py
     # MXFP4 MoE at four experts: static FP8-activation prefill and small-M
     # decode, routing and weighted top-k with invalid expert ids. DeepSeek
     # V4.1's A4W4 path: BF16 input quantized to MXFP4 in prefill and decode,

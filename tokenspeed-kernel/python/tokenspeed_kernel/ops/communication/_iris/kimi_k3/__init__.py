@@ -78,7 +78,7 @@ class K3IrisState:
         )
         self.lamport = (
             ProducerLamport(
-                all_reduce.producer, max_numel=self.lamport_max_rows * (3584 + 7168)
+                all_reduce.peers, max_numel=self.lamport_max_rows * (3584 + 7168)
             )
             if self.lamport_max_rows
             else None
@@ -107,7 +107,7 @@ class K3IrisState:
                 dtype=self.all_reduce.dtype,
                 device=self.all_reduce.device,
             )
-            self.lamport.run(output)
+            self.lamport.run(self.all_reduce.producer.data, output)
             return self.all_reduce.producer.views(output, shapes)
         return self.all_reduce.all_reduce_symmetric(tensors)
 
@@ -295,7 +295,7 @@ def prepare_k3_communication(
             3584 + 7168
         )
         if lamport_numel:
-            total_bytes += ProducerLamport.heap_bytes(lamport_numel)
+            total_bytes += ProducerLamport.heap_bytes(lamport_numel, world_size)
     sharded_bytes = (
         IrisAllReduceShardedState.heap_bytes(sharded_max_rows, world_size, dtype)
         if sharded_max_rows

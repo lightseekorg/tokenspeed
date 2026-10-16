@@ -48,9 +48,11 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
     """
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_arch_config,
         iris_lamport_allreduce,
     )
 
+    arch = iris_arch_config("gfx950")
     fn = iris_lamport_allreduce
     signature = {
         name: "*i32" if name == "epochs" else "*bf16" for name in fn.arg_names[:4]
@@ -65,6 +67,8 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
             "TOTAL_ELEMENTS": 6 * 10752,
             "MAX_ELEMENTS": 6 * 10752,
             "NUM_STAGES": 3,
+            "SUBGROUP_SIZE": arch.subgroup_size,
+            "REMOTE_STORE_CACHE": arch.remote_store_cache,
         },
         attrs={(index,): [["tt.divisibility", 16]] for index in range(12)},
     )
