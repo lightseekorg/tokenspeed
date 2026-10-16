@@ -85,9 +85,20 @@ class MoeBackend(Enum):
     DEEP_GEMM_MEGA_MOE = "deep_gemm_mega_moe"
     MEGA_MOE = "mega_moe"
 
-    # The batch-invariant fixed-reduction-order leaves (plugin-provided);
-    # --numerics rl-bitwise folds the auto default to this solution.
-    AOK = "aok"
+    @classmethod
+    def _missing_(cls, value):
+        # Built-in names describe runner-specific behavior. Plugin providers
+        # participate through registration and need no new enum member here.
+        from tokenspeed_kernel.registry import KernelRegistry
+
+        if not isinstance(value, str) or not KernelRegistry.get().get_for_operator(
+            "moe", "apply", solution=value
+        ):
+            return None
+        member = object.__new__(cls)
+        member._name_ = value
+        member._value_ = value
+        return cls._value2member_map_.setdefault(value, member)
 
     def is_auto(self):
         return self == MoeBackend.AUTO

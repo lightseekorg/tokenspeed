@@ -342,6 +342,10 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         layer.weight = Parameter(dequantized, requires_grad=False)
         layer.register_parameter("weight_scale", None)
         layer.register_parameter("input_scale", None)
+        from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
+
+        self._unquantized = UnquantizedLinearMethod()
+        self._unquantized.process_weights_after_loading(layer)
         self.dequantized = True
 
     def apply_weights(
@@ -351,10 +355,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.dequantized:
-            if self._unquantized is None:
-                from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
-
-                self._unquantized = UnquantizedLinearMethod()
+            assert self._unquantized is not None
             return self._unquantized.apply(layer, x, bias)
 
         input_2d = x.reshape(-1, x.shape[-1])

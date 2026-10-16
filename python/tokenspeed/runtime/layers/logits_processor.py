@@ -1042,10 +1042,24 @@ class LogitsProcessor(nn.Module):
             from tokenspeed.runtime.utils.env import global_server_args_dict
 
             if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
-                logits = kernel_mm(
-                    hidden_states.to(lm_head.weight.dtype),
-                    lm_head.weight,
-                    override="aok",
+                # The weight owner plans with its actual dtype, padding and TP
+                # geometry during construction. The processor must not guess
+                # that geometry or select from the first runtime batch.
+                from tokenspeed.runtime.layers.dense.unquant import (
+                    UnquantizedLinearMethod,
+                )
+                from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+                    UnquantizedEmbeddingMethod,
+                )
+
+                if not isinstance(
+                    quant_method, (UnquantizedLinearMethod, UnquantizedEmbeddingMethod)
+                ):
+                    raise ValueError(
+                        "Batch-invariant dense logits require a planned unquantized LM-head method"
+                    )
+                logits = quant_method.apply(
+                    lm_head, hidden_states.to(lm_head.weight.dtype), embedding_bias
                 )
             else:
                 cast_hidden = hidden_states.to(lm_head.weight.dtype)
