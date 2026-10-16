@@ -66,6 +66,14 @@ def test_legacy_default_and_explicit_jsonl_selection(tmp_path):
     assert not metrics_enabled(raw, "prometheus")
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_unset_reporters_keep_legacy_metrics_without_normalization(enabled):
+    args = options(enable_metrics=enabled)
+    assert metrics_enabled(args, "prometheus") is enabled
+    assert not metrics_enabled(args, "jsonl")
+    assert not metrics_enabled(args, "external")
+
+
 def test_dual_reporter_and_disabled_metrics(tmp_path):
     args = options(
         metrics_reporters=["jsonl", "prometheus", "jsonl"],

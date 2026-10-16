@@ -668,15 +668,15 @@ def _add_metrics_port(engine_args: list[str]) -> tuple[list[str], str | None]:
     the engine-side treatment of an unset port. Returns the scrape URL, or
     None when Prometheus reporting is off.
     """
-    if "--enable-metrics" not in engine_args:
-        return engine_args, None
     reporters = []
     for index, arg in enumerate(engine_args):
         if arg == "--metrics-reporters" and index + 1 < len(engine_args):
             reporters.append(engine_args[index + 1])
         elif arg.startswith("--metrics-reporters="):
             reporters.append(arg.split("=", 1)[1])
-    if reporters and "prometheus" not in reporters:
+    if "--enable-metrics" not in engine_args or (
+        reporters and "prometheus" not in reporters
+    ):
         return engine_args, None
     host = _get_from_args(engine_args, "--metrics-host", "127.0.0.1")
     pinned = _get_from_args(engine_args, "--metrics-port")

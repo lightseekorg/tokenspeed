@@ -76,11 +76,12 @@ def sample_multiproc_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_metrics_endpoint_serves_aggregated_metrics(sample_multiproc_dir):
+@pytest.mark.parametrize("reporters", [None, ["prometheus"]])
+def test_metrics_endpoint_serves_aggregated_metrics(sample_multiproc_dir, reporters):
     port = get_free_port()
     args = SimpleNamespace(
         enable_metrics=True,
-        metrics_reporters=["prometheus"],
+        metrics_reporters=reporters,
         metrics_host=None,
         metrics_port=port,
         host="127.0.0.1",

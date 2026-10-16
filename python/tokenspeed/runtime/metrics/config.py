@@ -33,8 +33,12 @@ if TYPE_CHECKING:
 
 
 def metrics_enabled(args: ServerArgs, reporter: str) -> bool:
-    """Whether a configured reporter should collect and export metrics."""
-    return args.enable_metrics and reporter in (args.metrics_reporters or [])
+    """Whether an output is enabled; an unset selection keeps Prometheus."""
+    if not args.enable_metrics:
+        return False
+    if args.metrics_reporters is None:
+        return reporter == "prometheus"
+    return reporter in args.metrics_reporters
 
 
 def raw_metrics_enabled(args: ServerArgs) -> bool:
