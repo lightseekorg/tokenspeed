@@ -274,24 +274,25 @@ class Engine(EngineBase):
 
     def shutdown(self):
         """Shutdown the engine"""
-        # Stop the sync-facade event loop before subprocess teardown so any
-        # in-flight blocking callers see a clean loop close instead of a
-        # stale-reference error.
-        if getattr(self, "llm", None) is not None:
-            self.llm.shutdown()
-        bootstrap_server = getattr(
-            getattr(self, "tokenizer_manager", None),
-            "bootstrap_server",
-            None,
-        )
-        close_bootstrap = getattr(bootstrap_server, "close", None)
+        # Drain the sync facade before subprocess teardown, but still release
+        # the subprocesses if the facade times out or fails during cleanup.
         try:
-            if callable(close_bootstrap):
-                close_bootstrap()
-        except Exception:
-            logger.exception("Failed to close the disaggregation bootstrap server")
+            if getattr(self, "llm", None) is not None:
+                self.llm.shutdown()
         finally:
-            kill_process_tree(os.getpid(), include_parent=False)
+            bootstrap_server = getattr(
+                getattr(self, "tokenizer_manager", None),
+                "bootstrap_server",
+                None,
+            )
+            close_bootstrap = getattr(bootstrap_server, "close", None)
+            try:
+                if callable(close_bootstrap):
+                    close_bootstrap()
+            except Exception:
+                logger.exception("Failed to close the disaggregation bootstrap server")
+            finally:
+                kill_process_tree(os.getpid(), include_parent=False)
 
     def __enter__(self):
         return self

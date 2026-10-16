@@ -32,6 +32,11 @@ Bridging at this layer — rather than maintaining a separate sync
 IPC client — keeps ``AsyncLLM`` single-producer and the scheduler
 IPC surface single-caller, while still letting ``Engine`` expose a
 blocking API to callers that cannot own an event loop themselves.
+
+Shutdown stops accepting submissions, then the loop's owner thread cancels
+and awaits pending tasks, finalizes async generators, and closes the loop.
+Normal shutdown waits for that thread to exit. ``Engine`` still releases its
+subprocesses if cleanup fails or times out.
 """
 
 import asyncio
@@ -62,6 +67,9 @@ class LLM:
     def __init__(self, async_llm: AsyncLLM) -> None:
         self.async_llm = async_llm
         self._loop = asyncio.new_event_loop()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_started = False
+        self._shutdown_error: BaseException | None = None
         self._thread = threading.Thread(
             target=self._run_loop,
             name="tokenspeed-llm-sync",
@@ -71,7 +79,62 @@ class LLM:
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
+        try:
+            try:
+                self._loop.run_forever()
+            finally:
+                with self._shutdown_lock:
+                    self._shutdown_started = True
+                try:
+                    pending = asyncio.all_tasks(self._loop)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        self._loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
+                        for task in pending:
+                            if not task.cancelled():
+                                error = task.exception()
+                                if error is not None and self._shutdown_error is None:
+                                    self._shutdown_error = error
+                    self._shutdown_asyncgens()
+                finally:
+                    self._loop.close()
+        except BaseException as exc:  # noqa: BLE001 — reported to the caller
+            self._shutdown_error = exc
+
+    def _shutdown_asyncgens(self) -> None:
+        previous_handler = self._loop.get_exception_handler()
+
+        def record_cleanup_error(loop, context) -> None:
+            # shutdown_asyncgens reports aclose failures through the loop's
+            # exception handler instead of raising them to its caller.
+            error = context.get("exception")
+            if (
+                "asyncgen" in context
+                and isinstance(error, BaseException)
+                and self._shutdown_error is None
+            ):
+                self._shutdown_error = error
+            if previous_handler is None:
+                loop.default_exception_handler(context)
+            else:
+                previous_handler(loop, context)
+
+        self._loop.set_exception_handler(record_cleanup_error)
+        try:
+            self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+        finally:
+            self._loop.set_exception_handler(previous_handler)
+
+    def _submit(self, coro):
+        # Serialize submission with shutdown so no work lands after loop.stop.
+        with self._shutdown_lock:
+            if self._shutdown_started:
+                coro.close()
+                raise RuntimeError("LLM has been shut down")
+            return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     def run(self, coro) -> Any:
         """Submit ``coro`` to the bg loop and block until it completes.
@@ -83,7 +146,7 @@ class LLM:
         ``run_until_complete(coro)`` idiom that previously lived inline
         at every call site.
         """
-        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+        return self._submit(coro).result()
 
     def generate(self, obj: GenerateReqInput) -> dict:
         """Run ``AsyncLLM.generate_request`` to completion and return the
@@ -126,7 +189,15 @@ class LLM:
                     q.put(pending_exc)
                 q.put(_STREAM_END)
 
-        asyncio.run_coroutine_threadsafe(_drain(), self._loop)
+        def _cancelled_before_start(future) -> None:
+            # A task cancelled before its first step never enters _drain's
+            # finally block, but the blocking iterator still needs a terminal.
+            if future.cancelled():
+                q.put(asyncio.CancelledError())
+                q.put(_STREAM_END)
+
+        future = self._submit(_drain())
+        future.add_done_callback(_cancelled_before_start)
 
         while True:
             item = q.get()
@@ -137,16 +208,24 @@ class LLM:
             yield item
 
     def shutdown(self) -> None:
-        """Stop the bg event loop and join the thread.
+        """Cancel pending work, close the bg event loop, and join its thread.
 
-        Idempotent. Safe to call before ``AsyncLLM`` teardown. The
-        daemon flag means an accidentally-skipped shutdown will not
-        hang interpreter exit, but leaving the loop running past
-        ``AsyncLLM`` teardown will surface as "Event loop is closed"
-        errors on later submissions, so call this before tearing
-        down the engine.
+        Idempotent, including concurrent callers. Pending sync calls receive
+        cancellation; later submissions fail immediately. Call this before
+        ``AsyncLLM`` teardown so task and generator cleanup can still use it.
+        Raises if the owner thread fails to clean up or cannot stop within
+        five seconds.
         """
-        if not self._loop.is_closed():
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        if threading.current_thread() is self._thread:
+            raise RuntimeError("Cannot shut down LLM from its event loop thread")
+        with self._shutdown_lock:
+            if not self._shutdown_started:
+                self._shutdown_started = True
+                self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=5.0)
         if self._thread.is_alive():
-            self._thread.join(timeout=5.0)
+            raise RuntimeError("LLM event loop did not shut down within 5 seconds")
+        if self._shutdown_error is not None:
+            raise RuntimeError(
+                "LLM event loop shutdown failed"
+            ) from self._shutdown_error
