@@ -57,37 +57,33 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   ├── NCCL_ALGO=Ring,             the algorithm/protocol switch by message
 │   │   NCCL_PROTO=Simple           size changes association order
 │   ├── batch_invariant_collectives AutoBackend.route, one decision for every
-│   │                               collective: a 2-D bf16 all-reduce on a
-│   │                               multicast-reachable group the startup
-│   │                               self-check verified is the NVLS in-switch
-│   │                               reduction issued by one fixed rank
-│   │                               (section below); every other
-│   │                               reduction is NCCL data movement plus a
-│   │                               fixed-rank-order fp32 fold (all-reduce =
-│   │                               all-gather + fold at world_size x traffic,
-│   │                               reduce-scatter = all-to-all + fold at no
-│   │                               extra traffic). A ring reduction chunks
-│   │                               by message size, so its per-element order
-│   │                               is run-stable but not batch-size-
-│   │                               invariant. MAX/MIN all-reduces are exact
+│   │                               collective: every reduction is NCCL data
+│   │                               movement plus a fixed-rank-order fp32
+│   │                               fold (all-reduce = all-gather + fold at
+│   │                               world_size x traffic, reduce-scatter =
+│   │                               all-to-all + fold at no extra traffic).
+│   │                               A ring reduction chunks by message size,
+│   │                               so its per-element order is run-stable
+│   │                               but not batch-size-invariant; the NVLS
+│   │                               in-switch reduction's order follows the
+│   │                               row's offset in the buffer (section
+│   │                               below). MAX/MIN all-reduces are exact
 │   │                               in any order and stay on NCCL. Gathers
 │   │                               move data and keep the multicast
-│   │                               kernels. The route reads only
-│   │                               static properties of the call site (group,
-│   │                               dtype, rank, width), never the row count,
-│   │                               so a site cannot change route with the
-│   │                               batch; a payload past the switch buffer
-│   │                               raises rather than reroutes
+│   │                               kernels. The route reads only static
+│   │                               properties of the call site, never the
+│   │                               row count, so a site cannot change route
+│   │                               with the batch
 │   ├── data movement               all-gather, token all-gather, all-to-all
 │   │                               (even or uneven, the transposes of the
 │   │                               decode TP layouts) move bytes without
 │   │                               reducing: nothing to fold, no branch
 │   └── force_deterministic_rsag    the user's "NCCL and the fold only" knob:
 │                                   no symmetric-memory path at all (multicast
-│                                   gathers, in-switch reduction, the trtllm
-│                                   and Iris all-reduce tiers, distributed
-│                                   argmax). Not folded by the envelope,
-│                                   honoured first by every route
+│                                   gathers, the trtllm and Iris all-reduce
+│                                   tiers, distributed argmax). Not folded by
+│                                   the envelope; under it the only change is
+│                                   that gathers move to NCCL
 ├── sampling.deterministic          sampling_stream=per-request: sampled rows
 │                                   draw from the Gumbel-max pool kernels,
 │                                   whose stream is keyed by the request's
@@ -233,55 +229,35 @@ teacher-forced comparison against a trainer dump described under Acceptance.
 In-tree models do not declare it; the out-of-tree LongCat 2.0 plugin is the
 first candidate.
 
-## The in-switch reduction
+## Why not the in-switch reduction
 
-The NVLS `multimem.ld_reduce` sums the group's copies of a row in the
-switch (fp32 accumulate, one rounding to bf16) and is the batch-invariant
-all-reduce under `--batch-invariant-collectives`. What was measured on
-8xH20 (`tokenspeed-kernel/test/ops/test_communcation.py` keeps the
-assertions): for a fixed issuing rank the result is bitwise stable across
-repetitions with launch jitter and independent of how many rows ride along;
-but the association order **depends on which rank issues the load** — two
-issuers disagree on a few elements per 10^7 where the fp32 sum is
-ill-conditioned, each also disagreeing with the sequential rank-ordered fold
-on a few. That rules out the natural reduce-scatter in which each rank
-reduces its own slice: a row's issuer would move with the slicing — with the
-co-batched tokens under attention TP, with the request's DP placement under
-attention DP — and so would its bits.
+The NVLS `multimem.ld_reduce` sums the group's copies of a row in the switch
+(fp32 accumulate, one rounding to bf16) and moves the payload through one
+port twice, far under the fold's `world_size` x all-gather, so it was the
+batch-invariant all-reduce for a while: one fixed rank issued every row's
+loads, and a startup self-check verified on each group that an
+ill-conditioned payload reduced to the same bits across repetitions and that
+its first half reproduced the first half's rows. Both held, and neither
+covers what a batch changes. A token's row lands at a different offset in
+the buffer with every batch, and the switch's association order follows that
+offset: on 8xH20 at width 3072 or 6144, the same rows reduced one or more rows
+further into the buffer come back different on more than half of an
+ill-conditioned payload's elements, and occasionally on ordinary
+activations (one element of 1.5 million in the probe). The order also differs between issuing ranks and
+between GPU sets, so nothing in software can pin it.
 
-Hence the shape of the route. The all-reduce pins the issuer
-(`TritonRSAGBackend.multimem_all_reduce`: group rank 0 reduces every row
-and multicasts the sum back; the others only join the kernels' barriers), so
-the sum is one function of its inputs for the deployment's lifetime; the
-issuer's port carries the payload twice, still far under the fold's
-`world_size` x all-gather, at every size. A pinned-issuer reduce-scatter is
-the same two kernels plus a slice and gains nothing over the fold, whose
-all-to-all moves each byte once, so the reduce-scatters keep the fold.
-
-Nothing in software pins the switch's order, so a deployment verifies it
-before serving (`comm_backend/self_check.py`, run by the distributed
-initializer on the attention TP, dense TP and MoE TP-EP groups the route
-sends to the switch) with a payload built to be ill-conditioned on most
-elements (`multimem_probe_payload`: per element one rank holds `+B`, another
-`-B`, the rest values whose low bits fall below fp32's resolution at `B`),
-so that two orders disagree on about half of it rather than on a few per ten
-million. Three legs: the payload reduced eight times must come back bitwise
-identical and its first half must reproduce the first half's rows — a
-difference is a fault and refuses startup, naming the kind, the group and
-what differed, and `--force-deterministic-rsag` as the way to keep every
-reduction on the fold. The third leg asks whether the kind is *one
-function*: every group of a kind reduces the identical payload, and every
-rank must take the same route for the kind and every group must return the
-same bits, or a request's bits would depend on the replica serving it. The
-switch's order is a property of the GPU set — on 8xH20 the groups `{0..3}`
-and `{4..7}` reduce the probe to different bits on half of its elements,
-while groups of two cannot differ (two addends have one sum) — so this is a
-topology, not a fault: the self-check pins the kind's groups to the ordered
-fold (`AutoBackend.pin_ordered_fold`, the same decision on every rank) and
-logs it, and the route honours the pin. A deployment whose attention TP
-groups are several sets of three or more GPUs therefore keeps its attention
-all-reduce on the fold and its single MoE group on the switch; one TP group
-of everything, or TP-2 replicas, run the switch throughout.
+One element in a million is enough. Under attention TP every layer
+all-reduces `o_proj` and the dense `down_proj`; a last-bit difference in one
+row changes the KV it writes, and every later token of that request inherits
+it. Measured on LongCat 2.0 at TP8 on GSM8K (128 greedy chat requests of up
+to 1024 tokens), the in-switch route left a quarter of the decode logprobs
+unequal to the prefill rescoring the same ids, 3-5% of the prompt logprobs
+unequal between two prefills of different batches, and tokens diverging
+between two machines; with the fold all of them were bitwise equal. Every batch-invariant reduction therefore takes the
+fold (`AutoBackend.route`), the in-switch kernels serve only the performance
+routes, and a deployment that cannot afford the fold's traffic removes the
+reduction instead: `--tp-batch-invariant` (below) leaves the decode layer no
+cross-rank sum outside MoE.
 
 ## Parallel layouts and the envelope
 
@@ -337,27 +313,13 @@ alone: its form, and for the row-parallel form the order in which the
 per-rank head partials are summed.
 
 Head TP with the row-parallel `o_proj` computes the same per-rank partials
-TP8 does, but reduce-scatters them to the shard rows where TP8 all-reduces,
-and under rl-bitwise (`--batch-invariant-collectives`) the two collectives
-do not take the same route (`comm_backend/auto.py: route`): a
-reduce-scatter always takes the ordered fold (ranks 0..W-1 left to right in
-fp32, one rounding), while a 2-D bf16 all-reduce on a multicast-reachable
-group takes the NVLS in-switch reduction through a fixed issuer, whose
-association order is a property of the GPU set and has been measured to
-differ between sets (`comm_backend/self_check.py`). So **QCP with head TP
-is bitwise the TP8 engine only when both engines sum `o_proj` in the same
-order** — both on the fold — the TP8 engine launched with
-`--force-deterministic-rsag` (or pinned there by its self-check); that is
-also what makes the comparison hold across machines, which the in-switch
-order does not promise. Within the QCP engine itself the two forward forms
-reduce differently too: the sharded extend reduce-scatters (the fold), the
-drafter's replicated decode steps all-reduce (the in-switch route where it
-applies); `--force-deterministic-rsag` on the engine pins both to the fold.
-Each form is run- and batch-invariant on its own either way. (Making the
-extend's tail all-reduce and slice, so one engine sums one way and matches
-TP8 on the same GPU set without the flag, was considered and left out: it
-moves W× the reduce-scatter's bytes on every layer of a prefill engine
-whose point is the extend, and buys nothing across GPU sets.) Known gap: the
+TP8 does, but reduce-scatters them to the shard rows where TP8 all-reduces.
+Under rl-bitwise (`--batch-invariant-collectives`) both collectives are the
+ordered fold (ranks 0..W-1 left to right in fp32, one rounding;
+`comm_backend/auto.py: route`), so **QCP with head TP sums `o_proj` exactly as
+the TP8 engine does**, on any GPU set, and within the QCP engine the sharded
+extend (reduce-scatter) and the drafter's replicated decode steps
+(all-reduce) agree likewise. Known gap: the
 GPU validation of this layout against a plain TP4 prefill engine matched
 tokens and logprobs bitwise on prompts within `index_topk`, while one
 prompt whose context exceeded it — the indexer's top-k selecting a strict

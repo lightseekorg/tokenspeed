@@ -741,14 +741,10 @@ cache takes.
 
 Numerics: with row-parallel `o_proj` the shard group computes the same
 per-rank head partials the plain TP8 prefill engine does and reduce-scatters
-them where TP8 all-reduces. The bits agree only when both engines sum in the
-same order. Under `--numerics rl-bitwise` the reduce-scatter always takes the
-ordered fold while an all-reduce takes the in-switch reduction where
-multicast reaches (an order that is per GPU set). Pin the TP8 engine to the
-fold with `--force-deterministic-rsag` for the two to be bitwise. The QCP
-engine's own drafter decode steps all-reduce `o_proj`
-(replicated rows). `--force-deterministic-rsag` on it pins them to the fold
-as well. With `--tp-batch-invariant attn` there is no cross-rank sum in
+them where TP8 all-reduces. Under `--numerics rl-bitwise` both are the
+rank-ordered fold, so the two engines sum `o_proj` bitwise alike, and so do
+the QCP engine's own drafter decode steps (replicated rows, all-reduced).
+With `--tp-batch-invariant attn` there is no cross-rank sum in
 `o_proj`, and QCP is bitwise the TP1 / head-replicated form the decode
 engine's batch-invariant layout computes (`docs/design/numerics.md`, "Layout
 invariance of query context parallelism").
@@ -902,14 +898,11 @@ across nodes. Logits all-gather and distributed argmax use the same
 cross-node fallback. Layouts such as attention DP with dense TP or MoE EP
 spanning nodes need this fallback.
 
-Under `--numerics rl-bitwise` (`--batch-invariant-collectives`) the
-all-reduce on a multicast-reachable group is the NVLS in-switch reduction
-issued by the group's rank 0 through the same RSAG buffers, verified
-bitwise at startup on every group it serves. AutoBackend keeps a kind whose
-groups the switch reduces in different orders (several TP groups of three or
-more GPUs) on the fold and logs it. The reduce-scatters, other payloads
-and unreachable groups take NCCL data movement plus a rank-ordered fp32
-fold, and the gathers stay on the multicast kernels. The distributed argmax
+Under `--numerics rl-bitwise` (`--batch-invariant-collectives`) every
+reduction takes NCCL data movement plus a rank-ordered fp32 fold, and the
+gathers stay on the multicast kernels; the in-switch reduction's order moves
+with a row's offset in the buffer, so it serves only the performance routes.
+The distributed argmax
 and the fused all-reduce kernels are off. `--force-deterministic-rsag` keeps
 every collective on NCCL (reductions on the fold). `AutoBackend.route` is
 the one place that decides. `docs/design/numerics.md` has the measured
