@@ -103,6 +103,24 @@ def _validate(
         raise TypeError("do_finalize must be a bool")
     if topk_weights is None or topk_ids is None:
         raise ValueError("Triton MoE requires precomputed topk weights and ids")
+    precision_policy = plan.get("precision_policy", "default")
+    if precision_policy not in {"default", "mxfp4_route_accum_fp32"}:
+        raise ValueError(
+            f"Unsupported MXFP4 MoE precision policy: {precision_policy!r}"
+        )
+    if precision_policy == "mxfp4_route_accum_fp32":
+        if (
+            upcast_weights
+            or x.dtype != torch.bfloat16
+            or topk_weights.dtype != torch.float32
+        ):
+            raise ValueError(
+                "mxfp4_route_accum_fp32 requires dynamic MXFP4, BF16 input and FP32 routes"
+            )
+        if not 0.0 < float(plan["output_scale"]) < float("inf"):
+            raise ValueError("MoE output_scale must be finite and positive")
+    elif plan.get("output_scale", 1.0) != 1.0:
+        raise ValueError("MoE output_scale requires an explicit precision policy")
 
     w13 = w.w13_weight
     w13_scale = w.w13_weight_scale
@@ -907,7 +925,14 @@ def _moe(
     )
     if not do_finalize:
         return route_output, None, expanded_idx
-    _combine(route_output, topk_weights, output)
+    _combine(
+        route_output,
+        topk_weights,
+        output,
+        round_weighted_routes=plan.get("precision_policy", "default")
+        == "mxfp4_route_accum_fp32",
+        output_scale=float(plan.get("output_scale", 1.0)),
+    )
     return output
 
 

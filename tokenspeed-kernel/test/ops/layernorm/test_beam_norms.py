@@ -150,8 +150,19 @@ def test_qk_ranked_selection_runs_triton_exactly_where_its_guard_admits(
                 selected = qk.select_qk_rmsnorm_ssmax_kernel(
                     *call, dequant=dequant, solution=None, override=None
                 )
+                amd_fused = (
+                    platform.is_amd
+                    and platform.arch_version == ArchVersion(9, 5)
+                    and on_cuda
+                    and not dequant
+                    and case in ("beam_tp8", "int32_positions")
+                )
                 assert selected.name == (
-                    qk.TRITON_FUSED_QK_RMSNORM_SSMAX
-                    if guard == ""
-                    else qk.TORCH_QK_RMSNORM_SSMAX
+                    "gluon_qk_rmsnorm_ssmax_gfx950"
+                    if amd_fused
+                    else (
+                        qk.TRITON_FUSED_QK_RMSNORM_SSMAX
+                        if guard == ""
+                        else qk.TORCH_QK_RMSNORM_SSMAX
+                    )
                 ), (platform.device_name, on_cuda, dequant)

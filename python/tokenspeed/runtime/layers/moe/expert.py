@@ -386,17 +386,24 @@ class MoELayer(torch.nn.Module):
         if precision_policy not in {
             "default",
             "bf16_route_accum_fp32",
+            "mxfp4_route_accum_fp32",
             "bf16_vendor_fp32_route",
             "nvfp4_vendor_fp32_route",
             "fp8ch_vendor_fp32_route",
+            "fp8ch_route_accum_fp32",
+            "fp8ch_gluon_bf16_route_accum_fp32",
         }:
             raise ValueError(f"Unsupported MoE precision policy: {precision_policy!r}")
-        if precision_policy == "bf16_route_accum_fp32":
+        if precision_policy in {"bf16_route_accum_fp32", "mxfp4_route_accum_fp32"}:
             # A BF16 finalized output cannot be rescaled to recover a scale
             # applied before its rounding. Select only the implementation that
             # owns all of the requested intermediate rounding boundaries.
+            weight_kind = (
+                "mxfp4" if precision_policy == "mxfp4_route_accum_fp32" else "unquant"
+            )
+            weight_label = "MXFP4" if weight_kind == "mxfp4" else "unquantized"
             if (
-                self._quant_kind != "unquant"
+                self._quant_kind != weight_kind
                 or input_dtype != torch.bfloat16
                 or self.activation != "silu"
                 or self.ep_size != 1
@@ -405,20 +412,18 @@ class MoELayer(torch.nn.Module):
                 or combine_order != "rank"
             ):
                 raise ValueError(
-                    "bf16_route_accum_fp32 requires BF16 unquantized SiLU experts "
+                    f"{precision_policy} requires BF16 {weight_label} SiLU experts "
                     "without expert parallelism, all-to-all, bias or slot combine"
                 )
             if moe_backend not in {None, "triton"}:
                 raise ValueError(
-                    "bf16_route_accum_fp32 is supported only by the Triton "
+                    f"{precision_policy} is supported only by the Triton "
                     f"BF16 MoE backend, not {moe_backend!r}"
                 )
             if routing_mode not in {None, "precomputed_topk"}:
-                raise ValueError("bf16_route_accum_fp32 requires precomputed top-k")
+                raise ValueError(f"{precision_policy} requires precomputed top-k")
             if self._routed_scaling_factor != 1.0:
-                raise ValueError(
-                    "bf16_route_accum_fp32 requires unscaled route weights"
-                )
+                raise ValueError(f"{precision_policy} requires unscaled route weights")
             if not 0.0 < output_scale < float("inf"):
                 raise ValueError("MoE output_scale must be finite and positive")
             moe_backend = "triton"
@@ -457,6 +462,56 @@ class MoELayer(torch.nn.Module):
             self._fp32_correction_bias = True
             if self.ep_size > 1:
                 routing_mode = "precomputed_topk"
+        elif precision_policy == "fp8ch_route_accum_fp32":
+            # The portable FP8 leaf owns activation quantization, the BF16
+            # expert output boundary and the FP32 weighted-route combine.
+            if (
+                self._quant_kind != "fp8_channel"
+                or input_dtype != torch.bfloat16
+                or self.activation != "silu"
+                or with_bias
+                or self._spec.use_deepep
+                or moe_backend != "triton"
+                or combine_order != "rank"
+                or output_scale != 1.0
+                or routing_mode not in {None, "precomputed_topk"}
+            ):
+                raise ValueError(
+                    "fp8ch_route_accum_fp32 requires BF16 input and FP8 "
+                    "per-channel SiLU experts on --moe-backend triton with "
+                    "precomputed top-k, without all-to-all, bias, slot combine "
+                    "or an output scale"
+                )
+            routing_mode = "precomputed_topk"
+        elif precision_policy == "fp8ch_gluon_bf16_route_accum_fp32":
+            # This explicit policy retains FP8 storage but uses BF16 operands
+            # in the registered grouped projections. Never infer it from dtype.
+            if (
+                self._quant_kind != "fp8_channel"
+                or input_dtype != torch.bfloat16
+                or self.activation != "silu"
+                or with_bias
+                or self._spec.use_deepep
+                or moe_backend != "gluon"
+                or combine_order != "rank"
+                or output_scale != 1.0
+                or routing_mode not in {None, "precomputed_topk"}
+                or self.ep_size != 1
+                or self.num_local_experts != 256
+                or hidden_size != 5120
+                or top_k != 8
+                or self.intermediate_size // self.tp_size not in {320, 640}
+                or self.w13_input_layout != "concatenated"
+                or internal_activation_dtype != "input"
+            ):
+                raise ValueError(
+                    "fp8ch_gluon_bf16_route_accum_fp32 requires explicit "
+                    "--moe-backend gluon, BF16 input and FP8 per-channel SiLU "
+                    "experts with E256/H5120/top8/local intermediate320 or640, "
+                    "concatenated gate/up and precomputed top-k, without expert "
+                    "parallelism, all-to-all, bias, slot combine or output scale"
+                )
+            routing_mode = "precomputed_topk"
         elif precision_policy in ("nvfp4_vendor_fp32_route", "fp8ch_vendor_fp32_route"):
             # The vendor policy's contract on FlashInfer's TRT-LLM NVFP4 or FP8
             # per-channel (fp8_channel) experts, always on precomputed routes
@@ -519,11 +574,41 @@ class MoELayer(torch.nn.Module):
             combine_order=combine_order,
             fp32_correction_bias=self._fp32_correction_bias,
         )
-        if precision_policy == "bf16_route_accum_fp32":
-            if self.plan["apply_kernel_name"] != "triton_bf16_precomputed_moe_apply":
+        if precision_policy in {"bf16_route_accum_fp32", "mxfp4_route_accum_fp32"}:
+            implementation = (
+                "triton_mxfp4_precomputed_moe_apply"
+                if precision_policy == "mxfp4_route_accum_fp32"
+                else "triton_bf16_precomputed_moe_apply"
+            )
+            if self.plan["apply_kernel_name"] != implementation:
                 raise ValueError(
                     "Selected MoE kernel does not implement the precision policy"
                 )
+            self.plan["precision_policy"] = precision_policy
+            self.plan["output_scale"] = output_scale
+        elif precision_policy == "fp8ch_route_accum_fp32":
+            if (
+                self.plan["solution"] != "triton"
+                or self.plan["apply_kernel_name"]
+                != "triton_fp8_channel_fused_precomputed_moe_apply"
+            ):
+                raise ValueError(
+                    "Selected MoE kernel does not implement fp8ch_route_accum_fp32"
+                )
+            self.plan["supports_deferred_finalize"] = False
+            self.plan["precision_policy"] = precision_policy
+            self.plan["output_scale"] = output_scale
+        elif precision_policy == "fp8ch_gluon_bf16_route_accum_fp32":
+            if (
+                self.plan["solution"] != "gluon"
+                or self.plan["apply_kernel_name"]
+                != "gluon_fp8_channel_bf16_precomputed_moe_apply"
+            ):
+                raise ValueError(
+                    "Selected MoE kernel does not implement "
+                    "fp8ch_gluon_bf16_route_accum_fp32"
+                )
+            self.plan["supports_deferred_finalize"] = False
             self.plan["precision_policy"] = precision_policy
             self.plan["output_scale"] = output_scale
         elif precision_policy in (

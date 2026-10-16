@@ -200,6 +200,60 @@ expert ids. With FP32 route weights the routed kernel stops before its
 finalize and `moe_finalize_fuse_shared` combines the per-route outputs with the
 FP32 weights, accumulating in FP32 and rounding once to BF16.
 
+### Portable MXFP4 route rounding
+
+`triton_mxfp4_precomputed_moe_apply` accepts the opt-in precision policy
+`mxfp4_route_accum_fp32`. It requires dynamic MXFP4 activations, BF16 hidden
+states, unscaled FP32 route weights and finalized execution without EP.
+GEMM2 stores BF16 expert outputs. The common combine rounds each weighted route
+to BF16, sums in FP32, applies the plan's finite positive `output_scale`, and
+stores BF16. This preserves a model's late-scaling boundary without rescaling
+an already-finalized BF16 tensor. The default MXFP4 policy is unchanged.
+
+### Portable FP8 per-channel experts on gfx950
+
+`triton_fp8_channel_fused_precomputed_moe_apply` implements the existing
+`moe.apply` operation with solution `triton`. It consumes contiguous BF16
+inputs, concatenated gate/up FP8 E4M3 weights, FP32 per-output-channel scales,
+precomputed global expert IDs and original FP32 route weights. It accepts
+intermediate widths divisible by 32 and hidden widths divisible by 128, including
+Beam's 320/640/2560 intermediate partitions. No weight shuffle is required.
+Expert-parallel ranks filter IDs to their local contiguous expert interval;
+nonlocal routes contribute zero. The caller owns distributed reduction.
+
+The first multiplication accumulates in FP32 and retains gate/up in FP32 through
+SiLU and multiplication, rounding only the resulting intermediate to BF16.
+Input quantization uses the public FP8 token operation. The private route
+quantizer uses `max(amax / 448, 1 / (448 * 512))`, with `amax >= 1e-6`, and
+rounds `x * min(448 / amax, 448 * 512)` to BF16 before saturated E4M3 conversion.
+That extra BF16 rounding is why the public input quantizer cannot serve this
+stage unchanged. The second multiplication accumulates in FP32 and stores BF16
+per route; combination retains FP32 weights and accumulation before BF16 output.
+IEEE division and portable sigmoid preserve these boundaries without claiming
+cross-vendor byte identity with native vendor instructions. The NVIDIA Triton
+implementation retains its existing separate gate/up BF16 rounding contract.
+
+On gfx950, native FP8 matrix instructions can lose small products within groups
+of eight reduction positions: even `256 * 256 + 1 * 1` can return 65536 rather
+than the exactly representable FP32 value 65537. The portable expert kernel
+zeros seven positions of each eight and accumulates eight native FP8 partitions
+in FP32, retaining the original reduction positions. Two partitions are
+insufficient. This preserves FP8 resident tensors and FP8 multiplication
+operands, at the cost of eight matrix instructions per original instruction.
+Exact mixed-magnitude cases, an FP32 rounding-error bound and full expert
+comparisons guard this workaround. Performance must be evaluated separately;
+it is a correctness baseline rather than a tuned implementation.
+
+Random Beam-shaped comparisons retain the existing portable FP8 expert test's
+normalized L2 error limit of 0.002 across sixteen deterministic seeds. Requiring
+each finalized element to match more closely than a BF16 rounding step is not
+valid for independent FP32 accumulation orders. A preserved seed demonstrates
+small, bounded FP32 differences straddling BF16 midpoints in the down projection,
+while quantization and combination match their independent stage references.
+The stage regression checks raw FP32 rounding-error bounds and exact rounding
+of the actual accumulator. This lawful midpoint behavior is distinct from the
+native FP8 instruction's loss of an exactly representable product sum.
+
 ## Shared MoE precision policies
 
 The unquantized Triton MoE normally keeps GEMM1 accumulators in FP32 through

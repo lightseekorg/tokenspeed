@@ -78,6 +78,7 @@ if platform.is_nvidia:
         "quantization",
         "fp8_with_scale",
         name="trtllm_quantize_fp8_with_scale",
+        features={"token_fp8_min_scaling"},
         solution="trtllm",
         capability=CapabilityRequirement(
             max_arch_version=ArchVersion(10, 9),

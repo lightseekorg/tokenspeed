@@ -29,7 +29,8 @@
     "gfx950/qwen38_flash/residual.json",
     "gfx950/qwen38_flash/gemm.json",
     "gfx950/qwen38_flash/qsa.json",
-    "gfx950/qwen38_flash/gdn.json"
+    "gfx950/qwen38_flash/gdn.json",
+    "gfx950/beam/moe.json"
   ],
   "cases": []
 }

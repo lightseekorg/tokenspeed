@@ -188,6 +188,18 @@ def _profile_rank_tag(attn_mapping) -> str:
     return "-".join(parts)
 
 
+def _all_thread_profile_config():
+    # The process-global flag also covers workers created before profiling.
+    if not isinstance(
+        getattr(torch.autograd.profiler, "_is_profiler_enabled", None), bool
+    ):
+        raise RuntimeError("missing process-global profiler state")
+    try:
+        return torch.profiler._ExperimentalConfig(profile_all_threads=True)
+    except (AttributeError, TypeError) as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
 class RequestHandler:
     """
     1. Recv Reqs from ZMQ
@@ -984,6 +996,15 @@ class RequestHandler:
                     "the server with --expert-distribution-recorder-mode stat.",
                 )
 
+        if {"CPU", "GPU"} & set(activities):
+            try:
+                _all_thread_profile_config()
+            except RuntimeError as exc:
+                return ProfileReqOutput(
+                    success=False,
+                    message=f"This PyTorch runtime cannot provide all-thread phase profiling: {exc}",
+                )
+
         self.profile_by_stage = profile_by_stage
         self.profiler_output_dir = output_dir
         self.torch_profiler_with_stack = with_stack
@@ -1031,10 +1052,18 @@ class RequestHandler:
         ]
 
         if torchprof_activities:
+            try:
+                experimental_config = _all_thread_profile_config()
+            except RuntimeError as exc:
+                return ProfileReqOutput(
+                    success=False,
+                    message=f"This PyTorch runtime cannot provide all-thread phase profiling: {exc}",
+                )
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,
                 record_shapes=record_shapes if record_shapes is not None else False,
+                experimental_config=experimental_config,
             )
             self.torch_profiler.start()
 

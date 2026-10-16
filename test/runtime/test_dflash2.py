@@ -262,6 +262,7 @@ _WINDOW_AWARE_BACKENDS = frozenset(
         "trtllm",
         "mla",
         "gluon",
+        "gluon_mha",
         "tokenspeed_mla",
         "qsa",
         "deepseek_v41",

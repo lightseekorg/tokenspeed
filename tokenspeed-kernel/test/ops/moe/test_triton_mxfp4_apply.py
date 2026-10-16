@@ -25,8 +25,9 @@ def _dequantize(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("activation", ["silu", "situ"])
 # 192 is a multiple of 64 but not 128, like a 640-wide expert sharded by TP2.
 @pytest.mark.parametrize("intermediate_size", [128, 192])
+@pytest.mark.parametrize("precision_policy", ["default", "mxfp4_route_accum_fp32"])
 def test_triton_mxfp4_moe_matches_torch(
-    activation: str, intermediate_size: int
+    activation: str, intermediate_size: int, precision_policy: str
 ) -> None:
     if not current_platform().is_amd:
         pytest.skip("Triton MXFP4 MoE is registered for AMD GPUs")
@@ -88,6 +89,8 @@ def test_triton_mxfp4_moe_matches_torch(
         fast_math=True,
         combine_order="rank",
     )
+    plan["precision_policy"] = precision_policy
+    plan["output_scale"] = 2.5 if precision_policy == "mxfp4_route_accum_fp32" else 1.0
     kernel_moe_process_weights(plan, weights)
     actual = kernel_moe_apply(
         plan,
@@ -125,11 +128,13 @@ def test_triton_mxfp4_moe_matches_torch(
         expert_output = F.linear(intermediate_dequant, w2_dequant[expert_id]).to(
             torch.bfloat16
         )
-        expected.index_add_(
-            0,
-            token_ids,
-            expert_output.float() * topk_weights[token_ids, slots, None],
-        )
+        weighted = expert_output.float() * topk_weights[token_ids, slots, None]
+        if precision_policy == "mxfp4_route_accum_fp32":
+            weighted = weighted.to(torch.bfloat16).float()
+        expected.index_add_(0, token_ids, weighted)
+
+    if precision_policy == "mxfp4_route_accum_fp32":
+        expected = (expected * 2.5).to(torch.bfloat16).float()
 
     torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.02)
 

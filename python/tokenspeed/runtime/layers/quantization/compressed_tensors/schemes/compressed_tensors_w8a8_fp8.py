@@ -29,8 +29,8 @@ time (``dynamic``) or with the checkpoint's static per-tensor ``input_scale``.
 
 Where tokenspeed_kernel registers a dense FP8 GEMM with per-token activation
 and per-channel weight scales (``gemm.mm`` on ``scaled-fp8`` channel scales)
-and the TRT-LLM per-token FP8 quantizer of its input (NVIDIA arch 10, SM100
-and SM103 among them, today) the layer runs on them. Elsewhere (SM90 and SM120
+and a per-token FP8 quantizer of its input (NVIDIA arch 10 and AMD gfx950,
+today) the layer runs on them. Elsewhere (SM90 and SM120
 among others) the weight is dequantized to the model dtype at load and the
 layer runs as an unquantized one; a warning names the platform. A dequantized
 value is the exact product of code and scale rounded once (BF16, FP16 or
@@ -84,7 +84,12 @@ def fp8_channel_gemm_available(platform=None) -> bool:
     import tokenspeed_kernel.ops.quantization  # noqa: F401  (and the quantizers)
     from tokenspeed_kernel.platform import current_platform
     from tokenspeed_kernel.registry import KernelRegistry
-    from tokenspeed_kernel.signature import ScaleFormat, format_signature, tensor_format
+    from tokenspeed_kernel.signature import (
+        ScaleFormat,
+        dense_tensor_format,
+        format_signature,
+        tensor_format,
+    )
 
     platform = platform or current_platform()
     registry = KernelRegistry.get()
@@ -96,15 +101,21 @@ def fp8_channel_gemm_available(platform=None) -> bool:
         platform=platform,
         format_signature=format_signature(a=operand, b=operand),
     )
-    # The per-token input quantizer is TRT-LLM's, registered as the token
-    # granularity of quantization.fp8_with_scale where it runs (not on SM120,
-    # which keeps the dequantized path).
+    # Check the shared activation format rather than requiring a vendor's
+    # implementation. Both the portable and vendor quantizers return FP32
+    # per-token scales for BF16/FP16 inputs.
     quantizers = [
         spec
         for spec in registry.get_for_operator(
-            "quantization", "fp8_with_scale", platform=platform, solution="trtllm"
+            "quantization",
+            "fp8_with_scale",
+            platform=platform,
+            format_signature=format_signature(x=dense_tensor_format(torch.bfloat16)),
         )
         if "token" in spec.traits.get("granularity", ())
+        and "float32" in spec.traits.get("scale_encoding", ())
+        and "m_max" not in spec.traits
+        and "token_fp8_min_scaling" in spec.features
     ]
     return bool(kernels) and bool(quantizers)
 
@@ -381,7 +392,8 @@ def fp8_dynamic_linear(
     Returns:
         ``[M, N]`` output in ``x``'s dtype. ``tokenspeed_kernel.ops.gemm.mm``
         quantizes ``x`` per token in one launch before the GEMM (the Triton
-        quantizer for decode rows, TRT-LLM's above 64 rows).
+        quantizer for decode rows on NVIDIA and every row count on gfx950;
+        TRT-LLM's above 64 rows on NVIDIA).
     """
     from tokenspeed_kernel.ops.gemm import mm
 

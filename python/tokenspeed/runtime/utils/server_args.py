@@ -3092,7 +3092,7 @@ class ServerArgs:
         # Kernel backend. Names are validated against the backend registry
         # after plugin discovery, so plugins can add their own.
         attention_backend_names = (
-            "mha, mla, fa3, fa4, triton, gluon, flashinfer, trtllm, trtllm_mla, "
+            "mha, mla, fa3, fa4, triton, gluon, gluon_mha, flashinfer, trtllm, trtllm_mla, "
             "flashmla, tokenspeed_mla, hybrid_linear_attn"
         )
         parser.add_argument(
@@ -3101,8 +3101,8 @@ class ServerArgs:
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers: "
             f"{attention_backend_names}, or a name a plugin registers. 'gluon' "
-            "forces registered Gluon kernels for supported attention "
-            "architectures.",
+            "forces registered Gluon MLA kernels; 'gluon_mha' selects Gluon "
+            "prefill, cached extension and decode for MHA.",
         )
         parser.add_argument(
             "--kda-backend",

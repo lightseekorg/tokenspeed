@@ -11,6 +11,28 @@ On CDNA4, ordinary GEMM dispatch admits the measured single-row
 Callers that publish directly into a collective buffer pass that buffer as
 `out` to the same `mv` operation.
 
+## Per-token/per-channel FP8
+
+`mm(..., quant="fp8")` accepts BF16/FP16 activations with FP8 E4M3 weights
+and FP32 per-output-channel scales. It quantizes activations per token through
+the operation registry, then accumulates the FP8 product in FP32, applies
+token and channel scales, and rounds to the requested output dtype. AMD
+gfx950 uses the portable Triton implementations. Weights stay FP8; hidden
+states and outputs stay BF16 for Beam. Empty batches return empty outputs,
+and masked partial matrix tiles contribute zero. This scale format does not
+accept block sizes or an additional alpha scale.
+
+The gfx950 native FP8 matrix instruction drops small products in its internal
+eight-position K reduction: even the exactly representable `256*256 + 1*1`
+can return `65536` instead of `65537`. This implementation partitions the
+original K positions into eight masked native FP8 dots and carries the FP32
+accumulator between them. Each instruction receives at most one nonzero
+product per affected group. This preserves FP8 operand storage and native
+FP8 multiplication while restoring the tested FP32 error bound. The
+workaround is restricted to gfx950; other architectures retain their prior
+path. It increases native matrix instructions eightfold, so it is a
+correctness baseline with a measured performance cost.
+
 ## DeepSeek V4 grouped output projection
 
 The grouped-projection plan describes the projection geometry and source formats.
