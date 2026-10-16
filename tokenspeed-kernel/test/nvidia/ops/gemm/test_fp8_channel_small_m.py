@@ -47,7 +47,9 @@ FP8 = torch.float8_e4m3fn
 # Q/K/V and output; Llama-3.3-70B down. They cover both weight-row tiles
 # (N up to 2,048 and above, N = 2,048 itself) and every K tile (512 for K a
 # multiple of 512 from 2,048 on, K = 2,048 itself; 256 for K = 512 and 1,792).
-# (200, 384) adds a partial last weight block and K tiles of 128.
+# (200, 384) adds a partial last weight block and K tiles of 128. Beam's TP8
+# rank shards (Q/K/V + output gate, output projection, dense gate/up, dense
+# down) take their measured ``_SMALL_M_TILES`` entries.
 SHAPES = [
     (768, 4096),
     (4096, 512),
@@ -57,6 +59,10 @@ SHAPES = [
     (2048, 512),
     (8192, 3584),
     (200, 384),
+    (1792, 5120),
+    (5120, 768),
+    (5120, 5120),
+    (5120, 2560),
 ]
 
 

@@ -24,7 +24,7 @@ import gc
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
 from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
@@ -323,6 +323,49 @@ def select_dspark_context_producer(
     return None
 
 
+@runtime_checkable
+class RopeTableModel(Protocol):
+    """A model that sizes its RoPE table itself (Beam's covers the
+    speculative pad past the context)."""
+
+    # Positions its precomputed cos/sin table covers; None without one.
+    rope_positions: int | None
+
+
+def warn_past_rope_table(
+    model: torch.nn.Module,
+    model_config: ModelConfig,
+    context_len: int,
+    physical_context_len: int,
+) -> None:
+    """Warn when spec verify can index past the model's RoPE table.
+
+    Spec verify commits positions up to physical_context_len - 1 for a
+    finished request lingering one overlap step, and the RoPE kernels read
+    the precomputed cos/sin table at those positions. A RopeTableModel
+    reports the table it built; any other model's tables are precomputed for
+    its derived context length. The values only feed a dead request's garbage
+    KV, but the read itself is out of table bounds — warn so the operator can
+    lower --max-model-len by the difference.
+    """
+    if isinstance(model, RopeTableModel):
+        table_len = model.rope_positions
+        if table_len is None:
+            return
+    else:
+        table_len = get_context_length(model_config.hf_text_config)
+    if physical_context_len > table_len:
+        logger.warning(
+            f"physical context extent {physical_context_len!s} (context_len "
+            f"{context_len!s} + spec overshoot "
+            f"pad {physical_context_len - context_len!s}) exceeds the "
+            f"{table_len!s} positions of the model's rope tables; "
+            "positions in the pad index past the precomputed rope tables. "
+            "Lower --max-model-len by at least "
+            f"{physical_context_len - table_len!s} to stay in bounds.",
+        )
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -430,6 +473,7 @@ class ModelExecutorConfig:
     def from_server_args(
         server_args: ServerArgs,
         model_config: ModelConfig,
+        model: torch.nn.Module,
         max_req_pool_size: int,
         gpu_id: int,
         global_rank: int,
@@ -444,25 +488,12 @@ class ModelExecutorConfig:
         rope_parameters = get_rope_parameters(model_config.hf_text_config)
         model_is_mrope = bool(rope_parameters and "mrope_section" in rope_parameters)
 
-        # Spec verify commits positions up to physical_context_len - 1 for a
-        # finished request lingering one overlap step. Rope cos/sin tables are
-        # precomputed for the model's derived context length, so positions in
-        # the pad read past them when context_len is set flush against the
-        # model limit. The values only feed a dead request's garbage KV, but
-        # the read itself is out of table bounds — warn so the operator can
-        # lower --max-model-len by the pad.
-        physical_context_len = model_config.context_len + server_args.spec_context_pad
-        derived_context_len = get_context_length(model_config.hf_text_config)
-        if physical_context_len > derived_context_len:
-            logger.warning(
-                f"physical context extent {physical_context_len!s} (context_len "
-                f"{model_config.context_len!s} + spec overshoot "
-                f"pad {server_args.spec_context_pad!s}) exceeds the model's derived "
-                f"context length {derived_context_len!s}; "
-                "positions in the pad index past the precomputed rope tables. "
-                "Lower --max-model-len by at least "
-                f"{physical_context_len - derived_context_len!s} to stay in bounds.",
-            )
+        warn_past_rope_table(
+            model,
+            model_config,
+            model_config.context_len,
+            model_config.context_len + server_args.spec_context_pad,
+        )
 
         # User intent only; backend-imposed graph restrictions are declared on
         # the backend classes (cuda_graph_support) and resolved in

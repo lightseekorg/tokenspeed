@@ -222,9 +222,9 @@ tail, so the extra dimensions do not change the MoE result. For example,
 TokenSpeed pads a 640-wide expert under MoE TP4 from 160 to 192 values per
 rank. TokenSpeed zero-pads BF16 SiLU/SwiGLU expert shards the same way to a
 multiple of 64 (128 when it cannot adapt the installed FlashInfer launcher,
-or when FlashInfer's JIT cannot build the adapted one, for example without
-nvcc). For example, Qwen3-30B-A3B's 768-wide experts need no padding under
-MoE TP4 (192 per rank), while TokenSpeed pads a 96-wide shard to 128.
+or when FlashInfer's JIT cannot build the adapted one). For example,
+Qwen3-30B-A3B's 768-wide experts need no padding under MoE TP4 (192 per
+rank), while TokenSpeed pads a 96-wide shard to 128.
 
 On Hopper, MXFP4 routed experts with a SiLU/SwiGLU activation and dense EP
 (`--all2all-backend none`) default to the FlashInfer CUTLASS mixed-input

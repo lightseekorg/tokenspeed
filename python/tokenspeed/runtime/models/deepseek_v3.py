@@ -420,6 +420,8 @@ class DeepseekV3MoE(nn.Module):
                 "normalize_topk_weights": config.norm_topk_prob,
                 "correction_bias": self.gate.e_score_correction_bias,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "precision_policy": getattr(config, "moe_precision_policy", "default"),
+                "output_scale": getattr(config, "moe_output_scale", 1.0),
             },
         )
 

@@ -480,7 +480,8 @@ def _routes(tokens, experts, top_k, weights_dtype, generator):
 
 @requires_sm100
 @pytest.mark.parametrize("tokens", [1, 8, 64, 512])
-@pytest.mark.parametrize("ispp", [192, 2048])
+# 320 and 2,560: Beam's partitions at TP8 and under --ep-size 8.
+@pytest.mark.parametrize("ispp", [192, 2048, 320, 2560])
 @pytest.mark.parametrize("weights_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("ep", [1, 4])
 def test_routed_kernel_matches_the_emulation(tokens, ispp, weights_dtype, ep):
@@ -541,12 +542,14 @@ def test_routed_kernel_matches_the_emulation(tokens, ispp, weights_dtype, ep):
 
 @requires_sm100
 @pytest.mark.parametrize("tokens", [1, 64, 512])
-def test_unpadded_partition_equals_the_padded_one(tokens, monkeypatch):
-    """A 192 partition runs unpadded: bit-identical to the same experts
-    padded to 256 (a 128 alignment)."""
+@pytest.mark.parametrize("ispp", [192, 320])
+def test_unpadded_partition_equals_the_padded_one(tokens, ispp, monkeypatch):
+    """A partition that is a multiple of 64 but not of 128 (192, and Beam's
+    320 at TP8) runs unpadded: bit-identical to the same experts padded to
+    the next multiple of 128."""
     import tokenspeed_kernel.ops.moe.flashinfer as module
 
-    experts, hidden, top_k, ispp = 16, 1024, 4, 192
+    experts, hidden, top_k = 16, 1024, 4
     w13, w13_scale, w2, w2_scale = _experts(experts, ispp, hidden, seed=tokens)
     generator = torch.Generator().manual_seed(tokens)
     x = torch.randn(tokens, hidden, generator=generator).to(torch.bfloat16).cuda()
@@ -555,7 +558,8 @@ def test_unpadded_partition_equals_the_padded_one(tokens, monkeypatch):
     for alignment in (module.TRTLLM_FP8_CHANNEL_ISPP_ALIGNMENT, 128):
         monkeypatch.setattr(module, "TRTLLM_FP8_CHANNEL_ISPP_ALIGNMENT", alignment)
         w = _vendor_experts(w13, w13_scale, w2, w2_scale, experts, top_k, 0)
-        assert w.intermediate_size_per_partition == (192 if alignment == 64 else 256)
+        padded = ispp if alignment == 64 else -(-ispp // 128) * 128
+        assert w.intermediate_size_per_partition == padded
         outputs.append(
             module.flashinfer_trtllm_fp8_channel_routed_moe_apply(
                 {}, x, w, None, topk_weights.cuda(), topk_ids.cuda()

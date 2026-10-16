@@ -304,11 +304,11 @@ def test_grammar_consumers_share_compact_token_offsets(hostfunc):
     if hostfunc:
         method = load_symbol(
             RUNTIME + "grammar/capturable_grammar.py",
-            "_advance_prev",
-            owner="CapturableGrammarExecutor",
+            "advance",
+            owner="GrammarHostBuffers",
         )
         method(
-            SimpleNamespace(output_tokens_host=tokens, accept_lengths_host=lengths),
+            SimpleNamespace(output_tokens=tokens, accept_lengths=lengths),
             dict(
                 completion=completion,
                 grammars=grammars,
@@ -624,10 +624,9 @@ def test_idle_graph_grammar_enqueues_an_identity_completion():
     assert grammar.queue.empty()
 
 
-@pytest.mark.parametrize("capturable", [True, False])
 @pytest.mark.parametrize("prefill_outputs", [1, 2])
-def test_grammar_mask_producers_walk_only_original_decode_candidates(
-    capturable, prefill_outputs, monkeypatch
+def test_grammar_mask_producer_walks_only_original_decode_candidates(
+    prefill_outputs, monkeypatch
 ):
     class MaskMatcher(Matcher):
         def __init__(self, tag):
@@ -648,53 +647,28 @@ def test_grammar_mask_producers_walk_only_original_decode_candidates(
     layout = ForwardOutputLayout(2, prefill_outputs, 1, 3)
     masks = torch.empty(9, 1, dtype=torch.int32)
     candidates = torch.full((3, 3), -99, dtype=torch.int32)
-    if capturable:
-        candidates[2] = torch.tensor([20, 21, 22])
-        fill = load_symbol(
-            RUNTIME + "grammar/capturable_grammar.py",
-            "_fill_current",
-            owner="CapturableGrammarExecutor",
-        )
-        executor = SimpleNamespace(
-            tree_spec=None,
-            max_tokens_per_req=3,
-            bitmask_host=masks,
-            candidates_host=candidates,
-        )
-        fill(
-            executor,
-            dict(
-                grammars=grammars,
-                bs=3,
-                has_candidates=True,
-                completion=SimpleNamespace(output_layout=layout),
-            ),
-        )
-    else:
-        fill = load_symbol(
-            RUNTIME + "grammar/capturable_grammar.py", "_fill_eager_bitmask"
-        )
-        monkeypatch.setattr(
-            torch.cuda,
-            "Event",
-            lambda: SimpleNamespace(record=lambda: None, synchronize=lambda: None),
-        )
-        buffers = SimpleNamespace(
-            candidates_cpu_buf=candidates,
-            vocab_mask_spec_cpu_buf=masks,
-            vocab_mask_spec_buf=torch.empty_like(masks),
-        )
-        fill(
-            grammars,
-            3,
-            buffers,
-            3,
-            True,
-            torch.tensor([1, 2, 3, 4, 5, 20, 21, 22]),
-            layout,
-        )
-        torch.testing.assert_close(buffers.vocab_mask_spec_buf, masks)
-        assert candidates[2].tolist() == [20, 21, 22]
+    fill = load_symbol(RUNTIME + "grammar/capturable_grammar.py", "_fill_eager_bitmask")
+    monkeypatch.setattr(
+        torch.cuda,
+        "Event",
+        lambda: SimpleNamespace(record=lambda: None, synchronize=lambda: None),
+    )
+    buffers = SimpleNamespace(
+        candidates_cpu_buf=candidates,
+        vocab_mask_spec_cpu_buf=masks,
+        vocab_mask_spec_buf=torch.empty_like(masks),
+    )
+    fill(
+        grammars,
+        3,
+        buffers,
+        3,
+        True,
+        torch.tensor([1, 2, 3, 4, 5, 20, 21, 22]),
+        layout,
+    )
+    torch.testing.assert_close(buffers.vocab_mask_spec_buf, masks)
+    assert candidates[2].tolist() == [20, 21, 22]
     assert masks[:, 0].tolist() == [
         100,
         -1,

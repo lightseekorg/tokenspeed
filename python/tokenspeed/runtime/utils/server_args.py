@@ -96,6 +96,19 @@ SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX = float(1 << 20)
 # evicted with the request one step later.
 _SPEC_OVERSHOOT_SPANS = 3
 
+
+def spec_rope_positions(context: int, verify_width: int) -> int:
+    """How many positions a RoPE table needs for a context.
+
+    The RoPE kernels index the table by raw position, and speculative
+    decoding writes up to ServerArgs.spec_context_pad positions past the
+    context (_SPEC_OVERSHOOT_SPANS verify widths). The table covers the
+    context, that pad and one more verify width of headroom; the verify width
+    is 0 without speculative decoding.
+    """
+    return context + (_SPEC_OVERSHOOT_SPANS + 1) * verify_width
+
+
 # Speculative algorithms a prefill server runs on the chunk pipeline
 # (--pipeline-parallel-size > 1). The drafter executes on the last stage, the
 # only stage that samples: an MTP (NextN) draft needs only that stage's final
@@ -122,6 +135,53 @@ def expert_placement_requested(server_args) -> bool:
     )
 
 
+def _checkpoint_architectures(
+    model: str, revision: str | None, download: bool = False
+) -> list[str] | None:
+    """The ``architectures`` of ``model``'s ``config.json``: from the model
+    directory, else from the local Hugging Face cache, else, with ``download``,
+    by downloading that file alone as ``get_config`` resolves a hub id
+    (HF_HUB_OFFLINE keeps it to the cache; a ModelScope id is not looked up on
+    the Hugging Face Hub). None when it cannot be read.
+    """
+    if not model:
+        return []
+    path = os.path.join(model, "config.json")
+    if not os.path.isdir(model):
+        import huggingface_hub.constants
+        from huggingface_hub import hf_hub_download, try_to_load_from_cache
+
+        from tokenspeed.runtime.utils.env import envs
+
+        try:
+            path = try_to_load_from_cache(model, "config.json", revision=revision)
+            if (
+                not isinstance(path, str)
+                and download
+                and not envs.TOKENSPEED_USE_MODELSCOPE.get()
+            ):
+                from tokenspeed.runtime.model_loader.weight_utils import get_lock
+
+                with get_lock(model):
+                    path = hf_hub_download(
+                        model,
+                        "config.json",
+                        revision=revision,
+                        local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                    )
+        except Exception:  # not a repo id, offline and not cached, unreachable
+            return None
+        if not isinstance(path, str):
+            return None
+    try:
+        with open(path) as file:
+            config = json.load(file)
+    except (OSError, ValueError):
+        return None
+    architectures = config.get("architectures") if isinstance(config, dict) else None
+    return list(architectures) if isinstance(architectures, list) else []
+
+
 def str_to_bool(value: str | bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -146,6 +206,11 @@ def _nonempty_str(value: str) -> str:
     if not value.strip():
         raise argparse.ArgumentTypeError("value must be a non-empty string")
     return value
+
+
+def kernel_override_env_key(family: str, mode: str) -> str:
+    """The variable ``tokenspeed_kernel.selection.select_kernel`` reads."""
+    return f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
 
 
 def validate_context_parallel_roles(
@@ -513,8 +578,10 @@ class ServerArgs:
     engram_host_table_dir: str | None = None
     engram_host_table_layout: str = "auto"
 
-    # Grammar backend
-    grammar_backend: str = "none"
+    # Grammar backend. None means the checkpoint default has not been resolved.
+    grammar_backend: str | None = None
+    # Model-declared constrained decoding policy, reported through server info.
+    constrained_decoding: Literal["requested", "always"] | None = None
     # Used by ``input_processor`` to defer json_schema grammars past the
     # model's reasoning channel.
     reasoning_parser: str | None = None
@@ -682,6 +749,7 @@ class ServerArgs:
 
     def __post_init__(self):
         self.resolve_basic_defaults()
+        self.resolve_model_defaults()
         self.resolve_launcher_topology()
         self.resolve_parallelism()
         self.resolve_memory_and_scheduling()
@@ -710,6 +778,51 @@ class ServerArgs:
 
         if self.seed is None:
             self.seed = random.randint(0, 1 << 30)
+
+        self._grammar_backend_unset = self.grammar_backend is None
+        if self.grammar_backend is None:
+            self.grammar_backend = "none"
+
+    def resolve_model_defaults(self, download: bool = False):
+        """Model defaults that must be known before any process starts.
+
+        ModelConfig applies a model's other defaults in the scheduler, but TF32
+        follows the environment the launch exports before it starts the
+        scheduler (``engine._set_envs_and_config``), so the checkpoint is read
+        here (``_checkpoint_architectures``). Beam serves without TF32: its FP32
+        router hands rows past the decode GEMV leaf's 16 to a Torch FP32
+        matmul, which TF32 would run with a 10-bit mantissa. Without the
+        network, ``_beam_checkpoint`` is None for a hub id the cache does not
+        hold yet; engine setup calls this again with ``download``.
+        """
+        architectures = _checkpoint_architectures(self.model, self.revision, download)
+        self._beam_checkpoint = (
+            None if architectures is None else "BeamForCausalLM" in architectures
+        )
+        if self._beam_checkpoint and not self.disable_tf32:
+            self.disable_tf32 = True
+            logger.info(
+                "Beam default disable_tf32=True: the FP32 router runs without TF32."
+            )
+        if (
+            self._beam_checkpoint
+            and self._grammar_backend_unset
+            and self.grammar_backend == "none"
+        ):
+            self.grammar_backend = "xgrammar"
+            logger.info("Beam default grammar_backend=xgrammar.")
+        elif (
+            self._beam_checkpoint
+            and not self._grammar_backend_unset
+            and self.grammar_backend == "none"
+            and not getattr(self, "_beam_grammar_none_warned", False)
+        ):
+            self._beam_grammar_none_warned = True
+            logger.warning(
+                "Beam was explicitly launched with --grammar-backend none; "
+                "constrained decoding requests will be rejected. This override is "
+                "intended only for benchmarking."
+            )
 
     def resolve_config_aliases(self):
         # Whether the block-drafter widths were given rather than defaulted.
@@ -1555,13 +1668,21 @@ class ServerArgs:
             )
 
     def resolve_communication(self):
-        # Auto-enable allreduce fusion on supported single-node TP configurations.
+        # Auto-enable allreduce fusion on supported single-node TP configurations,
+        # and for Beam on Hopper or newer at any node count: across nodes Beam's
+        # boundaries fuse only where the attention TP group has an MNNVL
+        # workspace and keep the unfused chain otherwise (beam_sandwich_fusion.py).
         platform = current_platform()
         if (
             not self.enable_allreduce_fusion
             and not self.emulate_rank_zero
             and (current_platform().is_hopper_plus or platform.is_amd)
-            and self.mapping.nnodes == 1
+            and (
+                self.mapping.nnodes == 1
+                or (
+                    getattr(self, "_beam_checkpoint", False) and platform.is_hopper_plus
+                )
+            )
             and self.mapping.has_attn_tp
             and not self.mapping.has_attn_dp
         ):
@@ -3170,7 +3291,8 @@ class ServerArgs:
             help=(
                 "Grammar backend. 'none' disables grammar-guided decoding "
                 "entirely; requests with json_schema, regex, ebnf or "
-                "structural_tag are then rejected as invalid requests."
+                "structural_tag are then rejected as invalid requests. The default "
+                "is checkpoint-specific."
             ),
         )
         parser.add_argument(
@@ -3848,7 +3970,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-allreduce-fusion",
             action="store_true",
-            help="Enable allreduce fusion for improved decode performance. Auto-enabled on supported single-node TP configurations.",
+            help="Enable allreduce fusion for improved decode performance. Auto-enabled on supported single-node TP configurations, and for Beam on any number of nodes (its boundaries fuse where an MNNVL workspace serves them).",
         )
         parser.add_argument(
             "--disaggregation-bootstrap-port",

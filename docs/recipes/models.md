@@ -1219,6 +1219,58 @@ tokenspeed serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
   --speculative-num-draft-tokens 4
 ```
 
+## Beam
+
+Beam (`model_type=beam`, `BeamForCausalLM`) is a mixture-of-experts model
+with 52 decoder layers: 9 full-attention layers and 43 sliding-window layers
+with a 512-token window. Its BF16, FP8 and NVFP4 checkpoints run with the same
+command: the checkpoint's own quantization config selects the path, with no
+flag. The [Beam recipe](beam.md) covers the defaults, the quantized paths, the
+chat format, the supported Hub revisions and the measurements.
+
+The command below runs one TP8 replica over two 4-GPU nodes, as in the
+recipe's GB200 measurements. Run it on both nodes, changing only
+`--node-rank`, and point `--dist-init-addr` at node 0, the only rank that
+serves the HTTP API. Pass the local checkpoint directory as the model, the
+same path on every node. Speculative decoding uses Beam's DFlash2 drafter
+checkpoint, which serves all three checkpoints.
+
+```bash
+# node 0 (serves the HTTP API); node 1 runs it with --node-rank 1
+ts serve --model <beam-checkpoint-dir> \
+  --nnodes 2 --node-rank 0 --nprocs-per-node 4 --world-size 8 \
+  --dist-init-addr <node0-host>:29000 \
+  --tensor-parallel-size 8 \
+  --dtype bfloat16 \
+  --max-model-len 1048576 \
+  --grammar-backend xgrammar \
+  --enable-mixed-batch --prefill-graph-max-tokens 8192 \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path <drafter-checkpoint-dir> \
+  --drafter-attention-backend trtllm \
+  --served-model-name reflection/Beam-1.0-501B-A23B-NVFP4 \
+  --host 0.0.0.0 --port 8000
+```
+
+Without `--served-model-name`, the API model id is the full checkpoint path.
+
+Notes:
+- Serving requires `--dtype bfloat16`. Beam's flag-free defaults, the `trtllm`
+  attention backend and the `flashinfer_trtllm` MoE backend, apply on NVIDIA
+  SM100 to SM103 and were validated on SM100 (GB200) only. Beam serves without
+  TF32 on every platform.
+- `--grammar-backend xgrammar` lets forced tool choice and JSON
+  `response_format` work, and `--enable-mixed-batch
+  --prefill-graph-max-tokens 8192` runs a prompt chunk in the same step as the
+  running decodes. Pass the same values on every node.
+- The preview drafter checkpoint declares 262,144 tokens of context: with it,
+  `--max-model-len 1048576` needs
+  `TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` on every node. With the
+  drafter the default batch limit is 80 requests, not 160.
+- Name no `--reasoning-parser` or `--tool-call-parser`. The bundled Day-0
+  gateway then reads the output through the `response_template` that the
+  checkpoint's `tokenizer_config.json` declares.
+
 ## Tuning order
 
 1. Set model ID, trust policy, tokenizer mode, and served model name.

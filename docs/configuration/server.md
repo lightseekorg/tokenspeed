@@ -554,6 +554,14 @@ Common reasoning parser values include `kimi_k25`, `base`, `qwen3`,
 validates the parser names, so use the values accepted by the bundled
 `tokenspeed-smg` package.
 
+When neither parser is named and the model family has no parser defaults,
+`ts serve` passes `--reasoning-parser passthrough` to the gateway, unless the
+model's `tokenizer_config.json` declares a `response_template` and no other
+`--tokenizer` is given: `ts serve` then passes `--parser symphony`,
+`--reasoning-parser hf`, and `--tool-call-parser hf` so the bundled
+`tokenspeed-smg` gateway selects both parsers from that template. Naming any
+parser option keeps its existing behavior.
+
 ## Speculative decoding
 
 | Parameter | Purpose |
@@ -727,6 +735,7 @@ path. One Triton kernel per verify step walks it. The target's verification
 step applies a request's `temperature`, `top_k` and `top_p`, never the
 proposal, so the served distribution is the target's whatever the drafter
 proposed.
+`DFlash2BeamDraftModel`, Beam's drafter, is a DFlash2 drafter as well.
 
 On a prefill server with `--pipeline-parallel-size > 1`, TokenSpeed accepts
 speculation for `MTP` and `DSPARK` only. The drafter runs on the last stage,
