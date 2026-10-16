@@ -1498,6 +1498,7 @@ def test_run_smg_from_args_reads_the_template_after_prewarm(tmp_path, monkeypatc
         "--disable-circuit-breaker",
         "--disable-retries",
         "--disable-load-monitoring",
+        "--disable-health-check",
         "--policy",
         "passthrough",
         "--tokenizer-cache-enable-l0",
