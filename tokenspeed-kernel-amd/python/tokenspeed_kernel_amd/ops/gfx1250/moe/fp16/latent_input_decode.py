@@ -49,7 +49,7 @@ _LATENT_N = 3584
 _SHARED_N = 768
 _TOTAL_N = _ROUTER_N + _LATENT_N + 2 * _SHARED_N
 
-_counter_cache: dict[tuple[int, int], torch.Tensor] = {}
+_counter_cache: dict[tuple[int, int, int], torch.Tensor] = {}
 
 
 def _decode_launch_metadata(grid, kernel, args):
@@ -507,10 +507,12 @@ def _get_counters(device: torch.device, count: int) -> torch.Tensor:
 
     The last split of each tile rearms its counter, so the buffer is zero
     again whenever a launch completes. Launches ordered on one stream,
-    including graph replays, can therefore share it.
+    including graph replays, can therefore share it; launches on different
+    streams may overlap, so each stream gets its own buffer.
     """
     index = device.index if device.index is not None else torch.cuda.current_device()
-    key = (index, count)
+    stream = triton.runtime.driver.active.get_current_stream(index)
+    key = (index, stream, count)
     counters = _counter_cache.get(key)
     if counters is None:
         counters = torch.zeros((count,), dtype=torch.int32, device=device)

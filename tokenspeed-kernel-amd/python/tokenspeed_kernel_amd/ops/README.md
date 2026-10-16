@@ -1201,8 +1201,8 @@ columns, so SiTU never needs a second kernel.
   exchange: each stores an FP32 partial at device scope, drains its stores,
   and bumps its column block's arrival counter. The last arrival sums the
   partials in split order, so results are deterministic, applies SiTU, and
-  rearms the counter for the next launch or graph replay. The counters live
-  in a per-device buffer that launches ordered on one stream share.
+  rearms the counter for the next launch or graph replay. Each stream keeps
+  its own counter buffer, which the launches ordered on it share.
 
 Prefill is one launch too: a `256 x 256` WMMA tile on eight warps with no
 split, accumulating in FP32 over 128-wide K steps. Like the whole-reduction
