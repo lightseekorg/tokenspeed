@@ -27,7 +27,10 @@ import json
 import os
 import signal
 import sys
+from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
+from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -47,9 +50,12 @@ from tokenspeed.cli.serve_smg import (
     INKLING_TOOL_CALL_PARSER,
     KIMI_K3_REASONING_PARSER,
     KIMI_K3_TOOL_CALL_PARSER,
+    MUSE_SPARK_REASONING_PARSER,
+    MUSE_SPARK_TOOL_CALL_PARSER,
     _add_metrics_port,
     _add_rl_control_port,
     _args_with_default_model_parsers,
+    _declares_response_template,
     _free_port_avoiding_ephemeral_range,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_policy,
@@ -62,8 +68,10 @@ from tokenspeed.cli.serve_smg import (
     _is_deepseek_v4_model,
     _is_inkling_model,
     _is_kimi_k3_model,
+    _is_muse_spark_model,
     _prewarm_hf_tokenizer,
     _set_default_grpc_max_message_bytes,
+    _template_tokenizer,
     run_smg,
 )
 
@@ -153,6 +161,7 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "--disable-circuit-breaker",
         "--disable-retries",
         "--disable-load-monitoring",
+        "--disable-health-check",
         "--policy",
         "passthrough",
         "--tokenizer-cache-enable-l0",
@@ -278,6 +287,7 @@ def test_smg_disable_flags_appended_when_absent():
         "--disable-circuit-breaker",
         "--disable-retries",
         "--disable-load-monitoring",
+        "--disable-health-check",
     ]
 
 
@@ -291,6 +301,7 @@ def test_smg_disable_flags_not_duplicated():
         "--disable-circuit-breaker",
         "--disable-retries",
         "--disable-load-monitoring",
+        "--disable-health-check",
     ]
 
 
@@ -300,11 +311,12 @@ def test_smg_disable_defaults_turn_off_load_monitoring():
     assert gateway_args.count("--disable-load-monitoring") == 1
 
 
-def test_smg_disable_flag_set_covers_all_three():
+def test_smg_disable_flag_set_covers_single_worker_safety_defaults():
     assert _DEFAULT_SMG_DISABLE_FLAGS == (
         "--disable-circuit-breaker",
         "--disable-retries",
         "--disable-load-monitoring",
+        "--disable-health-check",
     )
 
 
@@ -316,6 +328,7 @@ def test_cache_aware_policy_keeps_load_monitoring():
     assert "--disable-load-monitoring" not in gateway_args
     assert "--disable-circuit-breaker" in gateway_args
     assert "--disable-retries" in gateway_args
+    assert "--disable-health-check" in gateway_args
 
 
 def test_cache_aware_policy_equals_form_keeps_load_monitoring():
@@ -397,8 +410,88 @@ def test_get_from_args_takes_the_last_occurrence():
     assert _get_from_args(["--port", "8000", "--port", "8413"], "--port") == "8413"
 
 
-def test_deepseek_v4_model_id_gets_default_parsers():
-    model = "deepseek-ai/DeepSeek-V4-Flash"
+def _make_muse_spark_model_dir(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "muse_spark",
+                "architectures": ["MuseSparkForConditionalGeneration"],
+            }
+        )
+    )
+    return str(tmp_path)
+
+
+def _make_deepseek_v4_model_dir(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v4"}))
+    return str(tmp_path)
+
+
+def _make_kimi_k3_model_dir(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "kimi_k3",
+                "architectures": ["KimiK3ForConditionalGeneration"],
+            }
+        )
+    )
+    return str(tmp_path)
+
+
+class _ModelFamily(NamedTuple):
+    """One model family's detector and the parser defaults it injects."""
+
+    name: str
+    model_id: str
+    make_model_dir: Callable[[Path], str]
+    detector: Callable[[str | None], bool]
+    reasoning_parser: str
+    tool_call_parser: str
+
+
+_MODEL_FAMILIES = (
+    _ModelFamily(
+        "muse_spark",
+        "meta-models/Muse-Spark-Open-816B-A42B",
+        _make_muse_spark_model_dir,
+        _is_muse_spark_model,
+        MUSE_SPARK_REASONING_PARSER,
+        MUSE_SPARK_TOOL_CALL_PARSER,
+    ),
+    _ModelFamily(
+        "deepseek_v4",
+        "deepseek-ai/DeepSeek-V4-Flash",
+        _make_deepseek_v4_model_dir,
+        _is_deepseek_v4_model,
+        DEEPSEEK_V4_REASONING_PARSER,
+        DEEPSEEK_V4_TOOL_CALL_PARSER,
+    ),
+    _ModelFamily(
+        "kimi_k3",
+        "moonshotai/Kimi-K3",
+        _make_kimi_k3_model_dir,
+        _is_kimi_k3_model,
+        KIMI_K3_REASONING_PARSER,
+        KIMI_K3_TOOL_CALL_PARSER,
+    ),
+)
+
+
+@pytest.mark.parametrize("family", _MODEL_FAMILIES, ids=lambda f: f.name)
+def test_model_is_detected_from_id_or_local_config(tmp_path, family):
+    assert family.detector(family.model_id)
+    assert family.detector(family.make_model_dir(tmp_path))
+    for other in _MODEL_FAMILIES:
+        if other.model_id != family.model_id:
+            assert not family.detector(other.model_id)
+    assert not family.detector(None)
+
+
+@pytest.mark.parametrize("from_local_config", [False, True], ids=["id", "local_config"])
+@pytest.mark.parametrize("family", _MODEL_FAMILIES, ids=lambda f: f.name)
+def test_model_gets_default_parsers(tmp_path, family, from_local_config):
+    model = family.make_model_dir(tmp_path) if from_local_config else family.model_id
 
     engine_args, gateway_args = _args_with_default_model_parsers(
         ["--model", model],
@@ -409,42 +502,36 @@ def test_deepseek_v4_model_id_gets_default_parsers():
         "--model",
         model,
         "--reasoning-parser",
-        DEEPSEEK_V4_REASONING_PARSER,
+        family.reasoning_parser,
     ]
+    # Order matters: the reasoning parser is appended before the tool parser.
     assert gateway_args == [
         "--model",
         model,
         "--reasoning-parser",
-        DEEPSEEK_V4_REASONING_PARSER,
+        family.reasoning_parser,
         "--tool-call-parser",
-        DEEPSEEK_V4_TOOL_CALL_PARSER,
+        family.tool_call_parser,
     ]
 
 
-def test_deepseek_v4_parser_defaults_preserve_explicit_user_values():
-    model = "deepseek-ai/DeepSeek-V4-Flash"
+@pytest.mark.parametrize("family", _MODEL_FAMILIES, ids=lambda f: f.name)
+def test_model_parser_defaults_preserve_explicit_values(tmp_path, family):
+    model = family.make_model_dir(tmp_path)
+    engine_args = ["--model", model, "--reasoning-parser", "custom_reasoning"]
+    gateway_args = [
+        "--model",
+        model,
+        "--reasoning-parser",
+        "custom_reasoning",
+        "--tool-call-parser",
+        "custom_tools",
+    ]
 
-    engine_args, gateway_args = _args_with_default_model_parsers(
-        ["--model", model, "--reasoning-parser", "none"],
-        [
-            "--model",
-            model,
-            "--reasoning-parser",
-            "none",
-            "--tool-call-parser",
-            "json",
-        ],
+    assert _args_with_default_model_parsers(engine_args, gateway_args) == (
+        engine_args,
+        gateway_args,
     )
-
-    assert engine_args == ["--model", model, "--reasoning-parser", "none"]
-    assert gateway_args == [
-        "--model",
-        model,
-        "--reasoning-parser",
-        "none",
-        "--tool-call-parser",
-        "json",
-    ]
 
 
 def test_deepseek_v4_parser_defaults_fill_missing_parser_only():
@@ -501,73 +588,6 @@ def test_deepseek_v4_default_reasoning_parser_survives_gateway_defaults():
     assert gateway_args.count("--reasoning-parser") == 1
     idx = gateway_args.index("--reasoning-parser")
     assert gateway_args[idx + 1] == DEEPSEEK_V4_REASONING_PARSER
-
-
-def test_local_deepseek_v4_config_is_detected(tmp_path):
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v4"}))
-
-    assert _is_deepseek_v4_model(str(tmp_path))
-
-
-def _make_kimi_k3_model_dir(tmp_path):
-    (tmp_path / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "kimi_k3",
-                "architectures": ["KimiK3ForConditionalGeneration"],
-            }
-        )
-    )
-    return str(tmp_path)
-
-
-def test_kimi_k3_model_is_detected_from_id_or_local_config(tmp_path):
-    assert _is_kimi_k3_model("moonshotai/Kimi-K3")
-    assert _is_kimi_k3_model(_make_kimi_k3_model_dir(tmp_path))
-    assert not _is_kimi_k3_model("deepseek-ai/DeepSeek-V4-Flash")
-    assert not _is_kimi_k3_model(None)
-
-
-def test_kimi_k3_model_gets_default_parsers(tmp_path):
-    model = _make_kimi_k3_model_dir(tmp_path)
-
-    engine_args, gateway_args = _args_with_default_model_parsers(
-        ["--model", model],
-        ["--model", model],
-    )
-
-    assert engine_args == [
-        "--model",
-        model,
-        "--reasoning-parser",
-        KIMI_K3_REASONING_PARSER,
-    ]
-    assert gateway_args == [
-        "--model",
-        model,
-        "--reasoning-parser",
-        KIMI_K3_REASONING_PARSER,
-        "--tool-call-parser",
-        KIMI_K3_TOOL_CALL_PARSER,
-    ]
-
-
-def test_kimi_k3_parser_defaults_preserve_explicit_values(tmp_path):
-    model = _make_kimi_k3_model_dir(tmp_path)
-    engine_args = ["--model", model, "--reasoning-parser", "custom_reasoning"]
-    gateway_args = [
-        "--model",
-        model,
-        "--reasoning-parser",
-        "custom_reasoning",
-        "--tool-call-parser",
-        "custom_tools",
-    ]
-
-    assert _args_with_default_model_parsers(engine_args, gateway_args) == (
-        engine_args,
-        gateway_args,
-    )
 
 
 def _make_inkling_model_dir(tmp_path):
@@ -913,6 +933,8 @@ async def test_run_smg_wires_metrics_port_into_engine_spawn(capsys):
         side_effect=probe_then_schedule_release,
     ), patch(
         "tokenspeed.cli.serve_smg.terminate_then_kill", AsyncMock()
+    ), patch(
+        "tokenspeed.cli.serve_smg._start_control_server", AsyncMock(return_value=True)
     ):
         rc = await run_smg(
             engine_args=["--model", "/tmp/x", "--enable-metrics"],
@@ -932,8 +954,18 @@ async def test_run_smg_wires_metrics_port_into_engine_spawn(capsys):
 
 
 @pytest.mark.asyncio
-async def test_run_smg_without_metrics_leaves_engine_args_untouched(capsys):
-    """No --enable-metrics: no --metrics-port injection, no metrics output."""
+@pytest.mark.parametrize(
+    "metric_args",
+    [
+        [],
+        ["--enable-metrics", "--metrics-reporters", "test_reporter"],
+        ["--enable-metrics", "--metrics-reporters", "external_reporter"],
+    ],
+)
+async def test_run_smg_without_prometheus_omits_engine_metrics_port(
+    capsys, metric_args
+):
+    """No Prometheus reporter: no metrics port injection or scrape URL output."""
     engine = _make_proc(returncode=0)
     gateway = _make_proc(returncode=0)
 
@@ -959,9 +991,11 @@ async def test_run_smg_without_metrics_leaves_engine_args_untouched(capsys):
         side_effect=probe_then_schedule_release,
     ), patch(
         "tokenspeed.cli.serve_smg.terminate_then_kill", AsyncMock()
+    ), patch(
+        "tokenspeed.cli.serve_smg._start_control_server", AsyncMock(return_value=True)
     ):
         rc = await run_smg(
-            engine_args=["--model", "/tmp/x"],
+            engine_args=["--model", "/tmp/x", *metric_args],
             gateway_args=["--model", "/tmp/x"],
             opts=opts,
             user_host="127.0.0.1",
@@ -1255,6 +1289,57 @@ def test_add_metrics_port_noop_without_enable_metrics():
     assert url is None
 
 
+@pytest.mark.parametrize(
+    "reporter_args",
+    [
+        ["--metrics-reporters", "test_reporter"],
+        ["--metrics-reporters=test_reporter"],
+        ["--metrics-reporters", "test_reporter", "--metrics-reporters=test_reporter"],
+        ["--metrics-reporters=test_reporter", "--metrics-port", "5006"],
+        ["--metrics-reporters", "external_reporter"],
+        ["--metrics-reporters=external_reporter", "--metrics-port", "5006"],
+    ],
+)
+def test_add_metrics_port_noop_for_raw_outputs_only(monkeypatch, reporter_args):
+    def unexpected_allocation():
+        pytest.fail("Raw-only reporting must not allocate a Prometheus port")
+
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._free_port_avoiding_ephemeral_range",
+        unexpected_allocation,
+    )
+    engine_args = ["--enable-metrics", *reporter_args]
+
+    args, url = _add_metrics_port(engine_args)
+
+    assert args == engine_args
+    assert url is None
+
+
+@pytest.mark.parametrize(
+    "reporter_args",
+    [
+        ["--metrics-reporters", "prometheus"],
+        ["--metrics-reporters=prometheus"],
+        ["--metrics-reporters", "prometheus", "--metrics-reporters", "test_reporter"],
+        ["--metrics-reporters", "test_reporter", "--metrics-reporters", "prometheus"],
+        ["--metrics-reporters=prometheus", "--metrics-reporters=test_reporter"],
+        ["--metrics-reporters=test_reporter", "--metrics-reporters", "prometheus"],
+        ["--metrics-reporters=external_reporter", "--metrics-reporters", "prometheus"],
+    ],
+)
+def test_add_metrics_port_with_prometheus_reporter(monkeypatch, reporter_args):
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._free_port_avoiding_ephemeral_range", lambda: 40124
+    )
+    engine_args = ["--enable-metrics", *reporter_args]
+
+    args, url = _add_metrics_port(engine_args)
+
+    assert args == [*engine_args, "--metrics-port", "40124"]
+    assert url == "http://127.0.0.1:40124/metrics"
+
+
 def test_add_metrics_port_allocates_when_absent(monkeypatch):
     monkeypatch.setattr(
         "tokenspeed.cli.serve_smg._free_port_avoiding_ephemeral_range", lambda: 40124
@@ -1294,3 +1379,248 @@ def test_add_metrics_port_url_follows_metrics_host(monkeypatch):
         "40124",
     ]
     assert url == "http://0.0.0.0:40124/metrics"
+
+
+_RESPONSE_TEMPLATE = {
+    "fields": {"thinking": {"open": "<think>", "close": "</think>"}, "content": {}}
+}
+
+
+def _tokenizer_dir(path, tokenizer_file="tokenizer.json", **config):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "tokenizer_config.json").write_text(json.dumps(config))
+    (path / tokenizer_file).write_text("{}")
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    "declares, named, expected",
+    [
+        (
+            True,
+            [],
+            [
+                "--parser",
+                "symphony",
+                "--reasoning-parser",
+                "hf",
+                "--tool-call-parser",
+                "hf",
+            ],
+        ),
+        (True, ["--parser", "symphony"], []),
+        (True, ["--tool-call-parser", "json"], ["--reasoning-parser", "passthrough"]),
+        (True, ["--reasoning-parser", "passthrough"], []),
+        (False, [], ["--reasoning-parser", "passthrough"]),
+    ],
+    ids=[
+        "template",
+        "parser",
+        "tool-call-parser",
+        "reasoning-parser",
+        "no-template",
+    ],
+)
+def test_template_tokenizer_without_parsers_gets_hf_parsers(
+    tmp_path, capsys, declares, named, expected
+):
+    config = {"response_template": _RESPONSE_TEMPLATE} if declares else {}
+    tokenizer = _tokenizer_dir(tmp_path, **config)
+    args = ["--model", tokenizer, *named]
+
+    gateway_args = _gateway_args_with_default_reasoning_parser(args, tokenizer)
+
+    assert gateway_args == [*args, *expected]
+    assert ("response_template" in capsys.readouterr().out) is (declares and not named)
+
+
+def test_template_is_an_object_beside_a_tokenizer_json(tmp_path):
+    # The type is what ts serve checks; the gateway validates the rest.
+    assert _declares_response_template(
+        _tokenizer_dir(tmp_path / "empty", response_template={})
+    )
+    # Not an object: the gateway refuses it.
+    for name, value in (("null", None), ("string", ""), ("false", False), ("list", [])):
+        assert not _declares_response_template(
+            _tokenizer_dir(tmp_path / name, response_template=value)
+        )
+    # tiktoken: the gateway reads no template for it.
+    assert not _declares_response_template(
+        _tokenizer_dir(
+            tmp_path / "tiktoken",
+            tokenizer_file="tiktoken.model",
+            response_template=_RESPONSE_TEMPLATE,
+        )
+    )
+
+
+def test_unreadable_tokenizer_config_counts_as_no_template(tmp_path):
+    for name, content in (
+        ("invalid", b"{not json"),
+        ("binary", b"\xff\xfe\x00{"),
+        ("list", b"[1, 2]"),
+    ):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "tokenizer_config.json").write_bytes(content)
+        (tmp_path / name / "tokenizer.json").write_text("{}")
+    (tmp_path / "dir" / "tokenizer_config.json").mkdir(parents=True)
+    (tmp_path / "dir" / "tokenizer.json").write_text("{}")
+    (tmp_path / "missing").mkdir()
+
+    for name in ("invalid", "binary", "list", "dir", "missing"):
+        assert not _declares_response_template(str(tmp_path / name))
+    for tokenizer in (None, "", str(tmp_path / "no-such-dir"), "not a repo id!"):
+        assert not _declares_response_template(tokenizer)
+
+
+def _cache_hub_tokenizer(cache, repo_id, **config):
+    repo = cache / ("models--" + repo_id.replace("/", "--"))
+    (repo / "refs").mkdir(parents=True)
+    (repo / "refs" / "main").write_text("0123abcd")
+    return _tokenizer_dir(repo / "snapshots" / "0123abcd", **config)
+
+
+def test_hub_id_is_read_from_the_local_hf_cache(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
+    _cache_hub_tokenizer(
+        tmp_path, "org/with-template", response_template=_RESPONSE_TEMPLATE
+    )
+    _cache_hub_tokenizer(tmp_path, "org/without-template")
+
+    assert _declares_response_template("org/with-template")
+    assert not _declares_response_template("org/without-template")
+    # Not cached: no download, no template.
+    assert not _declares_response_template("org/not-cached")
+
+
+def test_template_tokenizer_is_the_gateway_model():
+    assert _template_tokenizer(["--model", "m"], ["--model", "m"]) == "m"
+    assert (
+        _template_tokenizer(["--model", "m", "--tokenizer", "m"], ["--model", "m"])
+        == "m"
+    )
+    # The gateway may parse with either tokenizer, so there is no answer.
+    assert (
+        _template_tokenizer(["--model", "m", "--tokenizer", "t"], ["--model", "m"])
+        is None
+    )
+    assert _template_tokenizer([], []) is None
+
+
+def _run_smg_from_args_with(monkeypatch, argv, prewarm):
+    captured = {}
+
+    async def fake_run_smg(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.print_logo", lambda: None)
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._check_serve_extra_installed", lambda: None
+    )
+    monkeypatch.setattr("tokenspeed.cli.serve_smg._prewarm_hf_tokenizer", prewarm)
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.run_smg", fake_run_smg)
+
+    from argparse import Namespace
+
+    from tokenspeed.cli.serve_smg import run_smg_from_args
+
+    with pytest.raises(SystemExit) as exc:
+        run_smg_from_args(Namespace(), argv)
+    assert exc.value.code == 0
+    return captured
+
+
+def test_run_smg_from_args_reads_the_template_after_prewarm(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
+    prewarmed = []
+
+    def prewarm(source):
+        # Stands in for the HF cache download: the template appears only now.
+        prewarmed.append(source)
+        _cache_hub_tokenizer(tmp_path, source, response_template=_RESPONSE_TEMPLATE)
+
+    captured = _run_smg_from_args_with(
+        monkeypatch, ["--model", "org/model", "--node-rank", "0"], prewarm
+    )
+
+    assert prewarmed == ["org/model"]
+    assert captured["gateway_args"] == [
+        "--model",
+        "org/model",
+        "--port",
+        "8000",
+        "--parser",
+        "symphony",
+        "--reasoning-parser",
+        "hf",
+        "--tool-call-parser",
+        "hf",
+        "--disable-circuit-breaker",
+        "--disable-retries",
+        "--disable-load-monitoring",
+        "--disable-health-check",
+        "--policy",
+        "passthrough",
+        "--tokenizer-cache-enable-l0",
+        "--tokenizer-cache-enable-l1",
+        "--log-level",
+        "warn",
+    ]
+    assert "--reasoning-parser" not in captured["engine_args"]
+
+
+@pytest.mark.parametrize(
+    "model_template, tokenizer_template",
+    [(False, True), (True, False), (True, True)],
+    ids=["tokenizer-only", "model-only", "both"],
+)
+def test_engine_tokenizer_other_than_the_model_keeps_passthrough(
+    tmp_path, monkeypatch, capsys, model_template, tokenizer_template
+):
+    # The gateway parses with the --model tokenizer, or with the engine's
+    # --tokenizer when --model has none or a served model name is set.
+    def tokenizer_dir(name, template):
+        if template:
+            return _tokenizer_dir(tmp_path / name, response_template=_RESPONSE_TEMPLATE)
+        return _tokenizer_dir(tmp_path / name)
+
+    model = tokenizer_dir("model", model_template)
+    tokenizer = tokenizer_dir("tokenizer", tokenizer_template)
+    prewarmed = []
+
+    captured = _run_smg_from_args_with(
+        monkeypatch,
+        ["--model", model, "--tokenizer", tokenizer, "--node-rank", "0"],
+        prewarmed.append,
+    )
+
+    # The prewarm fetches what the gateway loads at startup, as before.
+    assert prewarmed == [model]
+    assert _get_from_args(captured["gateway_args"], "--reasoning-parser") == (
+        "passthrough"
+    )
+    assert "response_template" not in capsys.readouterr().out
+
+
+def test_follower_node_does_not_read_the_template(tmp_path, monkeypatch, capsys):
+    model = _tokenizer_dir(tmp_path, response_template=_RESPONSE_TEMPLATE)
+    execs = []
+
+    def fake_execv(path, argv):
+        execs.append(argv)
+        raise SystemExit(0)
+
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.os.execv", fake_execv)
+    _run_smg_from_args_with(
+        monkeypatch,
+        ["--model", model, "--node-rank", "1"],
+        lambda _: pytest.fail("followers do not prewarm"),
+    )
+
+    assert len(execs) == 1
+    assert "response_template" not in capsys.readouterr().out

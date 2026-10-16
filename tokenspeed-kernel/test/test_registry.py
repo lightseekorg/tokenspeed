@@ -34,6 +34,7 @@ from tokenspeed_kernel.registry import (
 )
 from tokenspeed_kernel.signature import (
     ScaleFormat,
+    dense_format_signature,
     dense_tensor_format,
     format_signature,
     format_signatures,
@@ -527,6 +528,19 @@ class TestUnregister:
     def test_unregister_nonexistent_is_noop(self):
         reg = KernelRegistry.get()
         reg._unregister("does_not_exist")
+
+
+def test_dense_format_signature_is_cached_and_matches_format_signature():
+    signature = dense_format_signature(("x", "gate"), (torch.float32, torch.bfloat16))
+    assert signature == format_signature(
+        x=dense_tensor_format(torch.float32), gate=dense_tensor_format(torch.bfloat16)
+    )
+    assert (
+        dense_format_signature(("x", "gate"), (torch.float32, torch.bfloat16))
+        is signature
+    )
+    with pytest.raises(ValueError):
+        dense_format_signature(("x",), (torch.float32, torch.bfloat16))
 
 
 def test_vendor_min_arch_versions_apply_per_vendor(

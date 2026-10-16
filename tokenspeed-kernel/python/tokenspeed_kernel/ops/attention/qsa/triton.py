@@ -25,7 +25,7 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import max_active_ctas, tl, triton
 from tokenspeed_kernel.ops.attention.dsa.cuda import (
     has_ragged_decode_topk,
     ragged_decode_topk,
@@ -39,6 +39,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _is_nvidia = current_platform().is_nvidia
 _PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
+_SCORE_MAX_WAVES = 3
 LOG2E = math.log2(math.e)
 
 
@@ -1450,6 +1451,7 @@ def _qwen4_exp_qsa_stream_block_topk_kernel(
         mask=head_mask[:, None] & dim_mask[None, :],
         other=0.0,
     )
+    # Zero marks an invalid entry; every valid packed score/id key is positive.
     acc = tl.zeros((BLOCK_TOPK,), dtype=tl.int64)
     for tile_start in range(block_start, block_end, BLOCK_N):
         block_ids = tile_start + tl.arange(0, BLOCK_N)
@@ -1471,8 +1473,7 @@ def _qwen4_exp_qsa_stream_block_topk_kernel(
         scores = tl.maximum(scores, 0.0)
         scores = tl.sum(tl.where(head_mask[:, None], scores, 0.0), axis=0)
         # Pack (score, block id) into one monotonic int64 key: shifted
-        # score bits in the high word, block id in the low word, zero
-        # reserved as the invalid sentinel.
+        # score bits in the high word, block id in the low word.
         score_bits = scores.to(tl.int32, bitcast=True)
         packed = ((score_bits.to(tl.int64) + 1) << 32) | block_ids.to(tl.int64)
         packed = tl.where(tile_mask, packed, 0)
@@ -1612,7 +1613,9 @@ def _qwen4_exp_qsa_merge_chunk_kernel(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_blocks", "num_query_groups", "stride_pt_b", "stride_l_n"]
+)
 def _qwen4_exp_qsa_score_blocks_kernel(
     query,
     key_cache,
@@ -1623,6 +1626,7 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     num_heads,
     head_dim,
     num_blocks,
+    num_query_groups,
     page_size,
     stride_q_n,
     stride_q_h,
@@ -1635,69 +1639,80 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
+    LOOP_QUERY_GROUPS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
         # Successors may prepare now; their waits still protect these outputs.
         tl.extra.cuda.gdc_launch_dependents()
-    row = tl.program_id(0) * QUERY_GROUP_SIZE
-    tile = tl.program_id(1)
-    # Every group stays within one request, but each query keeps its own
-    # complete-block frontier and output row.
-    request = tl.load(request_indices + row).to(tl.int64)
-    query_offsets = tl.arange(0, QUERY_GROUP_SIZE)
-    complete = tl.load(complete_blocks + row + query_offsets).to(tl.int64)
-    max_complete = tl.max(complete, axis=0)
-    block_ids = tile * BLOCK_N + tl.arange(0, BLOCK_N)
-    tile_mask = block_ids < num_blocks
-    # A masked load alone still executes the dot on zero keys. Skip all
-    # producers and tensor-core work for tiles beyond every query frontier.
-    if tile * BLOCK_N < max_complete:
-        head_offsets = tl.arange(0, BLOCK_H * QUERY_GROUP_SIZE)
-        dim_offsets = tl.arange(0, BLOCK_D)
-        head_mask = head_offsets % BLOCK_H < num_heads
-        dim_mask = dim_offsets < head_dim
-        q = tl.load(
-            query
-            + (row + head_offsets[:, None] // BLOCK_H) * stride_q_n
-            + (head_offsets[:, None] % BLOCK_H) * stride_q_h
-            + dim_offsets[None, :] * stride_q_d,
-            mask=head_mask[:, None] & dim_mask[None, :],
-            other=0.0,
-        )
-        columns = block_ids // page_size
-        offsets = block_ids % page_size
-        pages = tl.load(
-            page_table + request * stride_pt_b + columns,
-            mask=tile_mask,
-            other=0,
-        ).to(tl.int64)
-        slots = pages * page_size + offsets
-        valid = tile_mask & (block_ids < max_complete)
-        keys = tl.load(
-            key_cache + slots[None, :] * stride_k_n + dim_offsets[:, None] * stride_k_d,
-            mask=valid[None, :] & dim_mask[:, None],
-            other=0.0,
-        )
-        scores = tl.dot(q, keys, out_dtype=tl.float32)
-        scores = tl.maximum(scores, 0.0)
-        scores = tl.sum(
-            tl.reshape(
-                tl.where(head_mask[:, None], scores, 0.0),
-                (QUERY_GROUP_SIZE, BLOCK_H, BLOCK_N),
-            ),
-            axis=1,
-        )
+    group_start = tl.program_id(0)
+    group_step = tl.num_programs(0)
+    if LOOP_QUERY_GROUPS:
+        group_iterations = tl.cdiv(num_query_groups - group_start, group_step)
     else:
-        scores = tl.full((QUERY_GROUP_SIZE, BLOCK_N), -float("inf"), tl.float32)
-    # Invalid blocks become -inf so the downstream selection drops them.
-    scores = tl.where(block_ids[None, :] < complete[:, None], scores, -float("inf"))
-    tl.store(
-        logits + (row + query_offsets[:, None]) * stride_l_n + block_ids[None, :],
-        scores,
-        mask=tile_mask[None, :],
-    )
+        group_iterations = 1
+    for iteration in range(group_iterations):
+        group = group_start + iteration * group_step
+        row = group * QUERY_GROUP_SIZE
+        tile = tl.program_id(1)
+        # Every group stays within one request, but each query keeps its own
+        # complete-block frontier and output row.
+        request = tl.load(request_indices + row).to(tl.int64)
+        query_offsets = tl.arange(0, QUERY_GROUP_SIZE)
+        complete = tl.load(complete_blocks + row + query_offsets).to(tl.int64)
+        max_complete = tl.minimum(tl.max(complete, axis=0), num_blocks)
+        # The grid stays bounded during graph replay. Each CTA walks only its
+        # valid tiles, reusing Q when a request outgrows the launch width.
+        if tile * BLOCK_N < max_complete:
+            head_offsets = tl.arange(0, BLOCK_H * QUERY_GROUP_SIZE)
+            dim_offsets = tl.arange(0, BLOCK_D)
+            head_mask = head_offsets % BLOCK_H < num_heads
+            dim_mask = dim_offsets < head_dim
+            q = tl.load(
+                query
+                + (row + head_offsets[:, None] // BLOCK_H) * stride_q_n
+                + (head_offsets[:, None] % BLOCK_H) * stride_q_h
+                + dim_offsets[None, :] * stride_q_d,
+                mask=head_mask[:, None] & dim_mask[None, :],
+                other=0.0,
+            )
+            for start in range(
+                tile * BLOCK_N, max_complete, tl.num_programs(1) * BLOCK_N
+            ):
+                block_ids = start + tl.arange(0, BLOCK_N)
+                valid = block_ids < max_complete
+                columns = block_ids // page_size
+                offsets = block_ids % page_size
+                pages = tl.load(
+                    page_table + request * stride_pt_b + columns,
+                    mask=valid,
+                    other=0,
+                ).to(tl.int64)
+                slots = pages * page_size + offsets
+                keys = tl.load(
+                    key_cache
+                    + slots[None, :] * stride_k_n
+                    + dim_offsets[:, None] * stride_k_d,
+                    mask=valid[None, :] & dim_mask[:, None],
+                    other=0.0,
+                )
+                scores = tl.dot(q, keys, out_dtype=tl.float32)
+                scores = tl.maximum(scores, 0.0)
+                scores = tl.sum(
+                    tl.reshape(
+                        tl.where(head_mask[:, None], scores, 0.0),
+                        (QUERY_GROUP_SIZE, BLOCK_H, BLOCK_N),
+                    ),
+                    axis=1,
+                )
+                tl.store(
+                    logits
+                    + (row + query_offsets[:, None]) * stride_l_n
+                    + block_ids[None, :],
+                    scores,
+                    mask=valid[None, :] & (block_ids[None, :] < complete[:, None]),
+                )
 
 
 def triton_qsa_block_topk_stream(
@@ -1841,6 +1856,17 @@ def triton_qsa_block_topk_stream(
     return selected
 
 
+def _score_grid(
+    kernel, query_groups: int, num_tiles: int, sm_count: int
+) -> tuple[int, int, int]:
+    # Use the loaded specialization's occupancy so resource changes preserve
+    # the wave limit. Round down to keep the whole grid within the budget.
+    max_ctas = _SCORE_MAX_WAVES * sm_count * max_active_ctas(kernel)
+    group_programs = min(query_groups, max_ctas)
+    tile_programs = min(num_tiles, max_ctas // group_programs)
+    return group_programs, tile_programs, 1
+
+
 def triton_qsa_block_scores(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -1858,6 +1884,8 @@ def triton_qsa_block_scores(
     num_blocks = page_table.shape[1] * page_size
     use_pdl = _is_nvidia and enable_pdl
     logits = torch.empty((rows, num_blocks), dtype=torch.float32, device=query.device)
+    if rows == 0 or num_blocks == 0:
+        return logits
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     block_h = triton.next_power_of_2(query.shape[1])
     # Long uniform runs reuse K across 32 queries. With four index heads this
@@ -1871,9 +1899,9 @@ def triton_qsa_block_scores(
     # The old 512-block tile used 129 KiB shared memory for 4x128 BF16 heads,
     # limiting a B300 SM to one CTA. 128 blocks leave room for concurrent CTAs.
     block_n = 128
-    _qwen4_exp_qsa_score_blocks_kernel[
-        (rows // query_group_size, triton.cdiv(num_blocks, block_n))
-    ](
+    query_groups = rows // query_group_size
+    sm_count = current_platform().sm_count
+    args = (
         query,
         key_cache,
         page_table,
@@ -1883,6 +1911,7 @@ def triton_qsa_block_scores(
         query.shape[1],
         query.shape[2],
         num_blocks,
+        query_groups,
         page_size,
         query.stride(0),
         query.stride(1),
@@ -1891,15 +1920,34 @@ def triton_qsa_block_scores(
         key_cache.stride(2),
         page_table.stride(0),
         logits.stride(0),
-        BLOCK_N=block_n,
-        BLOCK_H=block_h,
-        BLOCK_D=triton.next_power_of_2(query.shape[2]),
-        QUERY_GROUP_SIZE=query_group_size,
-        ENABLE_PDL=use_pdl,
+    )
+    constants = {
+        "BLOCK_N": block_n,
+        "BLOCK_H": block_h,
+        "BLOCK_D": triton.next_power_of_2(query.shape[2]),
+        "QUERY_GROUP_SIZE": query_group_size,
+        # Two buckets bound specialization. The small bucket fits even at
+        # one resident CTA/SM and folds away the outer loop during decode.
+        "LOOP_QUERY_GROUPS": query_groups > _SCORE_MAX_WAVES * sm_count,
+        "ENABLE_PDL": use_pdl,
+    }
+    # Warmup performs the usual JIT cache lookup without launching. Launch the
+    # same compiled kernel after sizing the grid; no device lengths are read.
+    kernel = _qwen4_exp_qsa_score_blocks_kernel.warmup(
+        *args,
+        **constants,
+        grid=(1,),
         num_warps=4,
         num_stages=2,
         **pdl_kwargs,
     )
+    grid = _score_grid(
+        kernel,
+        query_groups,
+        triton.cdiv(num_blocks, block_n),
+        sm_count,
+    )
+    kernel[grid](*args, *constants.values())
     return logits
 
 
@@ -1938,9 +1986,13 @@ def triton_qsa_block_topk_select(
             lengths=lengths,
             workspace=persistent_workspace,
             max_seq_len=logits.shape[1],
+            q_len_per_req=1,
+            enable_pdl=_is_nvidia and enable_pdl,
         )
         return selected
-    return triton_topk_from_logits(logits, topk, enable_pdl=_is_nvidia and enable_pdl)
+    return triton_topk_from_logits(
+        logits, topk, seq_lens=lengths, enable_pdl=_is_nvidia and enable_pdl
+    )
 
 
 _FP32_SCORES = format_signature(logits=dense_tensor_format(torch.float32))

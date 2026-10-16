@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.transform.triton import triton_hadamard_transform_128
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -31,9 +32,15 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
+# The portable one-row kernel is faster than the gfx1250 WMMA tiles below this.
+_HADAMARD_GFX1250_MIN_ROWS = 256
+
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.transform.hadamard import (
         launch_gluon_hadamard_transform_128_gfx950 as _hadamard_gfx950_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.transform import (
+        launch_gluon_hadamard_transform_128_gfx1250 as _hadamard_gfx1250_impl,
     )
 
     @register_kernel(
@@ -61,5 +68,38 @@ if current_platform().is_amd:
         """Apply a GFX950 BF16 length-128 butterfly transform."""
         return _hadamard_gfx950_impl(x, scale=scale)
 
+    @register_kernel(
+        "transform",
+        "hadamard_transform",
+        name="gluon_hadamard_transform_128_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(
+            "x",
+            "dense",
+            {torch.bfloat16, torch.float16, torch.float32},
+        ),
+        traits={
+            "last_dim": frozenset({128}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_hadamard_transform_128_gfx1250(
+        x: torch.Tensor,
+        *,
+        scale: float,
+    ) -> torch.Tensor:
+        """Apply a GFX1250 length-128 Sylvester Hadamard transform."""
+        if x.numel() < _HADAMARD_GFX1250_MIN_ROWS * 128:
+            return triton_hadamard_transform_128(x, scale=scale)
+        return _hadamard_gfx1250_impl(x, scale=scale)
 
-__all__ = ["gluon_hadamard_transform_128_gfx950"]
+
+__all__ = [
+    "gluon_hadamard_transform_128_gfx950",
+    "gluon_hadamard_transform_128_gfx1250",
+]

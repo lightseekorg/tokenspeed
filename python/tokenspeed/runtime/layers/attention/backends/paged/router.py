@@ -779,15 +779,32 @@ class CacheGroupRouter(AttentionBackend):
         self._refresh_decode_locations(bs, seq_lens)
         if num_extends and self._extend_write_locations is not None:
             self._append_decode_rows(bs, num_extends)
-        for gid, leaf in self.leaves.items():
-            leaf.refresh_decode_metadata(
-                bs,
-                actual_bs,
-                seq_lens,
-                self.stacks.table(gid, bs),
-                num_extends=num_extends,
-                for_graph_replay=for_graph_replay,
+        targets = {
+            gid: leaf.decode_buffer_targets(bs) for gid, leaf in self.leaves.items()
+        }
+        batched = [gid for gid, pair in targets.items() if pair is not None]
+        if batched:
+            # One launch fills every such leaf; two stream copies per leaf cost ~4 us each at bs=1.
+            torch._foreach_copy_(
+                [buf for gid in batched for buf in targets[gid]],
+                [
+                    src
+                    for gid in batched
+                    for src in (seq_lens[:bs], self.stacks.table(gid, bs))
+                ],
             )
+        for gid, leaf in self.leaves.items():
+            if targets[gid] is None:
+                leaf.refresh_decode_metadata(
+                    bs,
+                    actual_bs,
+                    seq_lens,
+                    self.stacks.table(gid, bs),
+                    num_extends=num_extends,
+                    for_graph_replay=for_graph_replay,
+                )
+            else:
+                leaf.publish_decode_metadata(bs, seq_lens, num_extends=num_extends)
             leaf.set_request_slots(req_pool_indices[:bs])
 
     def init_forward_metadata_capture_cuda_graph(

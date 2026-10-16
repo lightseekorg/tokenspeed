@@ -1670,8 +1670,8 @@ def launch_gluon_mm_a16w16_medium_gfx950(
     return C
 
 
-# Cold-cache sweeps on gfx950 at Kimi K3 TP8 and Qwen3.8-Flash-Next TP2 decode
-# shapes in HIP-graph replays, keyed by (N, K) and then by M bucket: a call
+# Cold-cache sweeps on gfx950 at Kimi K3 TP8, Muse TP4 and Qwen3.8-Flash-Next TP2
+# decode shapes in HIP-graph replays, keyed by (N, K) and then by M bucket: a call
 # uses the config of the smallest bucket covering its M, so M stays a runtime
 # argument within a bucket. A config is (BLOCK_M, BLOCK_N, BLOCK_K, WARPS_M,
 # WARPS_N, NUM_BUFFERS, SPLIT_K, NUM_XCDS); NUM_BUFFERS above three holds every
@@ -1681,6 +1681,20 @@ DECODE_M_BUCKETS = (4, 8, 16, 32, 64)
 _DECODE_CONFIGS: dict[
     tuple[int, int], dict[int, tuple[int, int, int, int, int, int, int, int]]
 ] = {
+    # Muse attention output and MoE post-expert projection. One single-pass tile covers all
+    # buckets, so the usual M=2/16 warmup also covers intermediate row counts.
+    (8192, 2048): {
+        4: (32, 32, 256, 2, 2, 3, 1, 8),
+        8: (32, 32, 256, 2, 2, 3, 1, 8),
+        16: (32, 32, 256, 2, 2, 3, 1, 8),
+        32: (32, 32, 256, 2, 2, 3, 1, 8),
+    },
+    (8192, 4096): {
+        4: (32, 32, 256, 2, 2, 3, 1, 8),
+        8: (32, 32, 256, 2, 2, 3, 1, 8),
+        16: (32, 32, 256, 2, 2, 3, 1, 8),
+        32: (32, 32, 256, 2, 2, 3, 1, 8),
+    },
     # o_proj
     (7168, 1536): {
         4: (16, 16, 512, 1, 4, 2, 1, 8),

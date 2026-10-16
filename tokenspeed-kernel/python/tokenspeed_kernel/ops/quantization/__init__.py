@@ -20,8 +20,12 @@ from typing import Literal
 
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.selection import select_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.selection import SelectedKernel, select_kernel
+from tokenspeed_kernel.signature import (
+    dense_format_signature,
+    dense_tensor_format,
+    format_signature,
+)
 
 __all__ = [
     "quantize_fp8",
@@ -32,7 +36,37 @@ __all__ = [
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_mxfp4",
+    "rmsnorm_mxfp4_quant",
+    "rmsnorm_nvfp4_quant",
 ]
+
+
+def rmsnorm_mxfp4_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    weight_offset: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse affine RMSNorm with CDNA4-native dynamic MXFP4 quantization.
+
+    Args:
+        x: BF16 rows shaped ``[tokens, width]``.
+        weight: Learned BF16 RMSNorm weight shaped ``[width]``.
+        eps: Epsilon added to the row variance.
+        weight_offset: Center added to the checkpoint weight.
+
+    Returns:
+        Packed E2M1 rows and CDNA4-swizzled E8M0 scales.
+    """
+    from tokenspeed_kernel.platform import current_platform
+
+    if not current_platform().is_cdna4:
+        raise RuntimeError("fused RMSNorm MXFP4 quantization requires CDNA4")
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
+        rmsnorm_mxfp4_quantize,
+    )
+
+    return rmsnorm_mxfp4_quantize(x, weight, eps, weight_offset)
 
 
 def _quantize_fp8_roundtrip(
@@ -262,20 +296,11 @@ def _quantize_fp8_dynamic(
         granularity_trait = "block"
     else:
         granularity_trait = granularity
-    traits = {
-        "granularity": granularity_trait,
-        "scale_encoding": scale_encoding,
-    }
-    if x.ndim == 2:
-        # Rows of a 2-D x, for kernels with a row bound (``m_max``). Kernels
-        # without one ignore it; a kernel with one never gets other ranks.
-        traits["m"] = x.shape[0]
-    signature = format_signature(x=dense_tensor_format(x.dtype))
-    kernel = select_kernel(
-        "quantization",
-        "fp8_with_scale",
-        signature,
-        traits=traits,
+    kernel = _select_fp8_dynamic(
+        x.dtype,
+        x.shape[0] if x.ndim == 2 else None,
+        granularity_trait,
+        scale_encoding,
         solution=solution,
         override=override,
     )
@@ -305,6 +330,50 @@ def _quantize_fp8_dynamic(
         if block_size is not None:
             kernel_args["block_size"] = tuple(block_size)
         return kernel(x, **kernel_args)
+
+
+def _select_fp8_dynamic(
+    dtype: torch.dtype,
+    rows: int | None,
+    granularity_trait: str,
+    scale_encoding: str,
+    *,
+    solution: str | None,
+    override: str | None,
+) -> SelectedKernel:
+    traits = {"granularity": granularity_trait, "scale_encoding": scale_encoding}
+    if rows is not None:
+        # Rows of a 2-D x, for kernels with a row bound (``m_max``). Kernels
+        # without one ignore it; a kernel with one never gets other ranks.
+        traits["m"] = rows
+    return select_kernel(
+        "quantization",
+        "fp8_with_scale",
+        format_signature(x=dense_tensor_format(dtype)),
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+
+def select_fp8_token_quantizer(
+    rows: int, dtype: torch.dtype, *, solution: str | None, override: str | None
+) -> SelectedKernel:
+    """The kernel ``quantize_fp8(x, granularity="token")`` runs for a 2-D ``x``
+    of ``rows`` rows of ``dtype``; nothing is launched.
+
+    Args:
+        rows: Row count of ``x``.
+        dtype: ``x``'s dtype.
+        solution: Restrict ranked selection to one solution, or ``None``.
+        override: Exact kernel name to force, or ``None`` for ranked selection.
+
+    Raises:
+        NoKernelFoundError: No registered kernel serves the call.
+    """
+    return _select_fp8_dynamic(
+        dtype, rows, "token", "float32", solution=solution, override=override
+    )
 
 
 def quantize_fp8_with_scale(
@@ -652,6 +721,59 @@ def quantize_fp8_with_gate(
         ),
     )
     return kernel(x, gate, norm_weight=norm_weight, eps=eps, enable_pdl=enable_pdl)
+
+
+def rmsnorm_nvfp4_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    weight_offset: float,
+    global_scale: torch.Tensor,
+    mailbox_sentinel: int | None,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """RMSNorm a BF16 row and quantize it to NVFP4 in one launch.
+
+    Reproduces ``affine_rmsnorm`` (with its BF16 output rounding) followed by
+    ``fp4_quantize(..., is_sf_swizzled_layout=False)`` bit for bit, so the
+    result feeds the TRT-LLM FP4 MoE kernels directly.
+
+    With ``mailbox_sentinel`` the rows are this rank's Lamport mailbox, still
+    being filled by the sharded projection's multicast stores: each program
+    polls its row until no BF16 element still holds the sentinel's half, then
+    re-arms the row, so no gather launch stands between the projection and
+    the experts.
+
+    Args:
+        x: BF16 rows ``[rows, width]`` with ``width`` a multiple of 16; with
+            a sentinel, the contiguous mailbox rows and a power-of-two width.
+        weight: Learned affine norm weight ``[width]``.
+        eps: Epsilon added to the variance.
+        weight_offset: Center added to the checkpoint weight.
+        global_scale: FP32 ``[1]`` NVFP4 global scale, the inverse of the
+            activation's input scale.
+        mailbox_sentinel: The 32-bit word ``x`` is armed with, whose 16-bit
+            halves agree, or None for an ordinary tensor.
+        enable_pdl: Enable NVIDIA programmatic dependent launch.
+
+    Returns:
+        ``(packed, scales)``: E2M1 pairs as ``uint8 [rows, width // 2]`` and
+        E4M3 block scales as ``uint8 [rows, width // 16]`` in linear layout.
+    """
+    kernel = select_kernel(
+        "quantization",
+        "rmsnorm_nvfp4",
+        dense_format_signature(("x",), (x.dtype,)),
+    )
+    return kernel(
+        x,
+        weight,
+        eps,
+        weight_offset,
+        global_scale,
+        mailbox_sentinel,
+        enable_pdl,
+    )
 
 
 # Backend registration (side-effect imports).

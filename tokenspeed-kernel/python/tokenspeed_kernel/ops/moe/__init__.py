@@ -31,9 +31,14 @@ from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.signature import (
+    dense_format_signature,
+    dense_tensor_format,
+    format_signature,
+)
 
 __all__ = [
+    "bf16_moe_routes",
     "COMBINE_ORDERS",
     "ExpertDispatch",
     "dispatch_topk_ids",
@@ -44,8 +49,15 @@ __all__ = [
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
+    "moe_warmup",
     "moe_topk",
     "packed_projection_weight_view",
+    "moe_sigmoid_bias_topk_routing",
+    "FUSED_ROUTING_MAX_TOKENS",
+    "PreparedNvfp4Routing",
+    "prepare_nvfp4_routing",
+    "routed_input_scale_rmsnorm_sum",
+    "routed_input_scale_rmsnorm_sum_gathered",
 ]
 
 
@@ -818,6 +830,53 @@ def _moe_sigmoid_bias_topk(
 # Routing and expert APIs
 # ===-----------------------------------------------------------------------===#
 
+from tokenspeed_kernel.ops.moe._triton.sigmoid_topk_routing import (  # noqa: E402
+    MAX_TOKENS as FUSED_ROUTING_MAX_TOKENS,
+)
+from tokenspeed_kernel.ops.moe.flashinfer import (  # noqa: E402
+    PreparedNvfp4Routing,
+    prepare_nvfp4_routing,
+)
+from tokenspeed_kernel.ops.moe.routed_norm import (  # noqa: E402
+    routed_input_scale_rmsnorm_sum,
+    routed_input_scale_rmsnorm_sum_gathered,
+)
+
+
+def moe_sigmoid_bias_topk_routing(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    local_expert_offset: int,
+    num_local_experts: int,
+    routing: object,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select experts as ``moe_sigmoid_bias_topk`` does and fill ``routing`` in the same launch.
+
+    Serves at most ``FUSED_ROUTING_MAX_TOKENS`` tokens, the batches where one
+    program beats the separate top-k and routing kernels. ``routing`` is a
+    flashinfer trtllm-gen routing metadata slot the expert GEMMs will read.
+    """
+    kernel = select_kernel(
+        "moe",
+        "sigmoid_bias_topk_routing",
+        format_signature(router_logits=dense_tensor_format(router_logits.dtype)),
+    )
+    return kernel(
+        router_logits=router_logits,
+        correction_bias=correction_bias,
+        topk=topk,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
+        local_expert_offset=local_expert_offset,
+        num_local_experts=num_local_experts,
+        routing=routing,
+        enable_pdl=enable_pdl,
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -1252,6 +1311,29 @@ def _log_fp32_correction_bias_fallback(kernel_name: str) -> None:
     )
 
 
+def bf16_moe_routes(
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_start: int,
+) -> torch.Tensor:
+    """Return unweighted BF16 SwiGLU outputs for every selected local expert.
+
+    Args:
+        x: Contiguous BF16 hidden states ``[tokens, hidden]``.
+        w13: Local concatenated gate/up weights ``[experts, 2I, hidden]``.
+        w2: Local down weights ``[experts, hidden, I]``.
+        topk_ids: Global selected expert ids ``[tokens, topk]``.
+        expert_start: First global expert represented by ``w13`` and ``w2``.
+
+    Returns:
+        Route outputs ``[tokens, topk, hidden]``; routes to other ranks' experts are zero.
+    """
+    kernel = select_kernel("moe", "routes", dense_format_signature(("x",), (x.dtype,)))
+    return kernel(x, w13, w2, topk_ids, expert_start)
+
+
 def moe_plan(
     weight_dtype: str,
     input_dtype: torch.dtype = torch.bfloat16,
@@ -1440,6 +1522,9 @@ def moe_plan(
     supports_deferred_finalize = True in apply_spec.traits.get(
         "supports_deferred_finalize", frozenset({False})
     )
+    supports_prequantized_input = True in apply_spec.traits.get(
+        "supports_prequantized_input", frozenset({False})
+    )
     return {
         "weight_dtype": weight_dtype,
         "activation": activation,
@@ -1458,6 +1543,7 @@ def moe_plan(
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
+        "supports_prequantized_input": supports_prequantized_input,
         # All-to-all EP (DeepEP, Petit): each rank runs its own tokens'
         # routes, so routing may pick per-rank replicas. Otherwise every
         # rank routes every token and must agree on one replica per route.
@@ -1509,6 +1595,17 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
     return result
 
 
+def moe_warmup(plan: dict, w: torch.nn.Module, *, max_num_tokens: int) -> None:
+    """Warm ``plan``'s selected backend using ``w``'s processed expert weights.
+
+    ``max_num_tokens`` bounds global routing rows. Plans without a warmup
+    callback need no work; this function returns nothing.
+    """
+    warmup = plan.get("warmup")
+    if warmup is not None:
+        warmup({**plan, "warmup_max_num_tokens": max_num_tokens}, w)
+
+
 def moe_apply(
     plan: dict,
     x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -1528,15 +1625,18 @@ def moe_apply(
     shared_input: torch.Tensor | None = None,
     shared_weight: torch.Tensor | None = None,
     shared_out: torch.Tensor | None = None,
+    x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
+    routing_prepared: object | None = None,
 ):
     """Apply a planned MoE kernel.
 
     Args:
         plan: Execution plan returned by moe_plan.
         x: Hidden states with shape [tokens, hidden_size], or a
-            (packed_nvfp4, block_scales) pair for a kernel supporting prequantized
+            (packed_fp4, block_scales) pair for a kernel supporting prequantized
             input. Packed data is uint8 [tokens, hidden_size // 2]; scales are
-            linear uint8/float8 [tokens, hidden_size // 16].
+            linear uint8/float8 [tokens, hidden_size // 16] for NVFP4 or
+            CDNA4-swizzled E8M0 bytes for the gfx950 MXFP4 kernel.
         w: Module containing processed MoE weights.
         router_logits: Router logits with shape [tokens, num_experts], or None
             for a precomputed-TopK kernel that consumes only IDs and weights.
@@ -1567,6 +1667,12 @@ def moe_apply(
         shared_out: Optional destination for the shared-expert down projection
             with shape [tokens, output_size]. Must be provided together with
             ``shared_input`` and ``shared_weight``.
+        x_quantized: Optional ``x`` already quantized in the kernel's
+            activation format, so the kernel skips its own quantize. Only
+            forwarded when given; kernels that cannot consume it reject it.
+        routing_prepared: Routing metadata the top-k kernel filled ahead of
+            this call, so the kernel skips its routing launch. Only forwarded
+            when given; kernels that cannot consume it reject it.
 
     Solutions may use precomputed top-k tensors or route from logits directly.
     """
@@ -1598,6 +1704,10 @@ def moe_apply(
         if all(value is not None for value in shared_tensors)
         else {}
     )
+    # Kernels that cannot consume a pre-quantized activation never see the argument.
+    quantized_kwargs = {"x_quantized": x_quantized} if x_quantized is not None else {}
+    if routing_prepared is not None:
+        quantized_kwargs["routing_prepared"] = routing_prepared
     return kernel(
         plan=plan,
         x=x,
@@ -1611,6 +1721,7 @@ def moe_apply(
         enable_pdl=pdl_enabled(),
         **a2a_kwargs,
         **shared_kwargs,
+        **quantized_kwargs,
     )
 
 

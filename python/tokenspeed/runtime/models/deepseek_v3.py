@@ -39,7 +39,7 @@ from tokenspeed_kernel.ops.attention.mla import (
 )
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV, MLAPrologueOutput
-from tokenspeed_kernel.ops.gemm import bmm
+from tokenspeed_kernel.ops.gemm import bmm, mm
 from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
@@ -355,6 +355,8 @@ class MoEGate(nn.Module):
                 self.weight,
                 out_dtype=torch.float32,
             )
+        elif _platform.is_amd:
+            logits = mm(hidden_states, self.weight)
         else:
             logits = F.linear(hidden_states, self.weight, None)
         return logits
@@ -420,6 +422,8 @@ class DeepseekV3MoE(nn.Module):
                 "normalize_topk_weights": config.norm_topk_prob,
                 "correction_bias": self.gate.e_score_correction_bias,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "precision_policy": getattr(config, "moe_precision_policy", "default"),
+                "output_scale": getattr(config, "moe_output_scale", 1.0),
             },
         )
 

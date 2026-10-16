@@ -43,8 +43,13 @@ from tokenspeed_kernel.ops.gemm._triton.kimi3 import (
     kimi3_projection_gemv,
     kimi3_shared_situ_projection_gemv,
 )
+from tokenspeed_kernel.ops.gemm.triton_router_gemv import fp32_router_gemv_counters
 from tokenspeed_kernel.ops.quantization import quantize_fp8
-from tokenspeed_kernel.platform import Platform, current_platform, pdl_enabled
+from tokenspeed_kernel.platform import (
+    Platform,
+    current_platform,
+    pdl_enabled,
+)
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
@@ -57,6 +62,7 @@ from tokenspeed_kernel.selection import (
 )
 from tokenspeed_kernel.signature import (
     ScaleFormat,
+    dense_format_signature,
     dense_tensor_format,
     format_signature,
     tensor_format,
@@ -88,6 +94,15 @@ __all__ = [
     # MV: small-M dense projection
     "mv",
     # Linear AttnRes partials
+    "fp32_router_gemv",
+    "fp32_router_gemv_counters",
+    "fp32_router_gemv_execute",
+    "fp32_router_gemv_plan",
+    "fp32_router_gemv_process_weight",
+    "fp8_linear",
+    "fp8_linear_into",
+    "fp8_linear_prepacked",
+    "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
     # Kimi K3 projections
@@ -110,6 +125,9 @@ __all__ = [
     "mxfp4_linear",
     "mxfp4_swiglu_linear",
     "prepare_mxfp4_linear",
+    "mm",
+    "prepare_fp8_linear",
+    "prepare_nvfp4_a16_weights",
 ]
 
 _platform = Platform.get()
@@ -1502,7 +1520,8 @@ def _use_mv(x: torch.Tensor, weight: torch.Tensor) -> bool:
     platform = current_platform()
     n = weight.shape[0]
     if platform.is_cdna4:
-        return m >= 2 and _select_mv(
+        measured_single_row = (m, n, k) == (1, 4608, 8192)
+        return (m >= 2 or measured_single_row) and _select_mv(
             m, n, k, True, x.dtype, weight.dtype, False
         ) is not (torch_decode_gemv)
     if not platform.is_cdna5 or k < 256:
@@ -3457,4 +3476,158 @@ from tokenspeed_kernel.ops.gemm.triton import (  # noqa: E402
     MXFP4_LINEAR_SIGNATURE,
 )
 
+
 # isort: on
+def fp32_router_gemv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    multiplier: float,
+    counters: torch.Tensor,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Compute ``(x @ weight) * multiplier`` in FP32 for decode-sized batches.
+
+    The weight keeps a row-major ``[K, N]`` layout (as MoE routers store it).
+    Up to ``ROUTER_GEMV_MAX_ROWS`` rows run as one exact-FP32 split-K Triton
+    launch whose partials are reduced in a fixed order. Where cuBLAS would use
+    TF32, up to ``ROUTER_DOT_MAX_ROWS`` rows run the same split-K on TF32 tensor
+    cores with cuBLAS's rounding; other batches take ``torch.matmul``. Repeat
+    calls on each path are bitwise stable, but the paths round differently, so
+    a batch that crosses a threshold sees differences at that path's precision.
+
+    Args:
+        x: Contiguous FP32 input ``[rows, hidden]``.
+        weight: Contiguous FP32 weight ``[hidden, columns]``.
+        multiplier: Scale applied to the logits.
+        counters: Buffer from ``fp32_router_gemv_counters`` for ``columns``.
+        enable_pdl: Enable NVIDIA programmatic dependent launch.
+
+    Returns:
+        FP32 outputs ``[rows, columns]``.
+    """
+    kernel = select_kernel(
+        "gemm",
+        "fp32_router_gemv",
+        dense_format_signature(("x", "weight"), (x.dtype, weight.dtype)),
+    )
+    return kernel(x, weight, multiplier, counters, enable_pdl)
+
+
+@dataclass(frozen=True)
+class _FP32RouterGEMVPlan:
+    kernel: SelectedKernel
+    weight_preprocessor: Callable
+    hidden_size: int
+    output_size: int
+    dtype: torch.dtype
+
+
+def fp32_router_gemv_plan(
+    *,
+    hidden_size: int,
+    output_size: int,
+    dtype: torch.dtype,
+    solution: str | None,
+) -> object:
+    """Select an FP32 router GEMV and its persistent weight layout.
+
+    Args:
+        hidden_size: Router input width.
+        output_size: Number of router outputs.
+        dtype: Input and canonical weight dtype, which must be FP32.
+        solution: Optional implementation family override.
+
+    Returns:
+        An opaque plan accepted by the related process and execute APIs.
+    """
+    if hidden_size <= 0 or output_size <= 0:
+        raise ValueError("router dimensions must be positive")
+    if dtype != torch.float32:
+        raise ValueError("router GEMV requires FP32 inputs and weights")
+    signature = dense_format_signature(("x", "weight"), (dtype, dtype))
+    kernel = select_kernel(
+        "gemm",
+        "prepared_fp32_router_gemv",
+        signature,
+        solution=solution,
+    )
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    if spec is None or spec.weight_preprocessor is None:
+        raise RuntimeError(f"Router GEMV kernel {kernel.name!r} has no preprocessor")
+    return _FP32RouterGEMVPlan(
+        kernel=kernel,
+        weight_preprocessor=spec.weight_preprocessor,
+        hidden_size=hidden_size,
+        output_size=output_size,
+        dtype=dtype,
+    )
+
+
+def _require_fp32_router_gemv_plan(plan: object) -> _FP32RouterGEMVPlan:
+    if not isinstance(plan, _FP32RouterGEMVPlan):
+        raise TypeError("plan must be returned by fp32_router_gemv_plan")
+    return plan
+
+
+def fp32_router_gemv_process_weight(
+    plan: object,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Convert a canonical router weight to the plan's persistent layout.
+
+    Args:
+        plan: Opaque router GEMV plan.
+        weight: Contiguous canonical FP32 weight in ``[hidden, outputs]`` layout.
+
+    Returns:
+        Weight in the selected implementation's persistent layout.
+    """
+    typed_plan = _require_fp32_router_gemv_plan(plan)
+    expected_shape = (typed_plan.hidden_size, typed_plan.output_size)
+    if tuple(weight.shape) != expected_shape:
+        raise ValueError(
+            f"router weight must have shape {expected_shape}, got {tuple(weight.shape)}"
+        )
+    if weight.dtype != typed_plan.dtype or not weight.is_contiguous():
+        raise ValueError("router weight must be contiguous FP32")
+    return typed_plan.weight_preprocessor(weight)
+
+
+def fp32_router_gemv_execute(
+    plan: object,
+    x: torch.Tensor,
+    prepared_weight: torch.Tensor,
+    multiplier: float,
+    counters: torch.Tensor,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Execute a planned router GEMV using a preprocessed weight.
+
+    Args:
+        plan: Opaque router GEMV plan.
+        x: Contiguous FP32 input rows.
+        prepared_weight: Result of :func:`fp32_router_gemv_process_weight`.
+        multiplier: Scale applied to the router logits.
+        counters: Per-call-site synchronization storage.
+        enable_pdl: Enable programmatic dependent launch when supported.
+
+    Returns:
+        FP32 router logits in ``[rows, outputs]`` layout.
+    """
+    typed_plan = _require_fp32_router_gemv_plan(plan)
+    if (
+        x.ndim != 2
+        or x.shape[1] != typed_plan.hidden_size
+        or x.dtype != typed_plan.dtype
+        or not x.is_contiguous()
+    ):
+        raise ValueError(
+            "router input must be contiguous FP32 " f"[rows, {typed_plan.hidden_size}]"
+        )
+    return typed_plan.kernel(
+        x,
+        prepared_weight,
+        multiplier,
+        counters,
+        enable_pdl,
+    )

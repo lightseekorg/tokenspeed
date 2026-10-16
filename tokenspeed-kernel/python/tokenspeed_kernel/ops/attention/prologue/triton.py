@@ -38,7 +38,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
 )
 from tokenspeed_kernel.ops.embedding import FusedMLASetKVBufferArg
 from tokenspeed_kernel.ops.embedding.triton import apply_rope_mla_set_kv_buffer_triton
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -229,6 +229,7 @@ def _gqa_prologue_kernel(
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     cos = 0.0
     sin = 0.0
@@ -345,9 +346,6 @@ def _gqa_prologue_kernel(
             value = tl.clamp(value.to(tl.float32) * v_inv_scale, -448.0, 448.0)
         tl.store(dst, value.to(dst.dtype.element_ty), mask=mask)
 
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
 
 def _block_tokens(num_tokens: int, block: int) -> int:
     """Tokens per program: at least four; 512 elements at decode sizes, 2048 past 256 tokens."""
@@ -384,19 +382,33 @@ def triton_gqa_prologue(
     return_kv: bool,
     enable_pdl: bool,
 ) -> GQAPrologueOutput:
+    prepared = current_platform().is_cdna4 and norm is None and rotary is None
     num_tokens = q.shape[0]
     num_kv_heads, head_dim = cache.k_cache.shape[1:]
     num_q_heads = q.shape[1:].numel() // head_dim
-    q_out = torch.empty(
-        (num_tokens, num_q_heads * head_dim), dtype=q.dtype, device=q.device
+    q_out = (
+        q.flatten(1)
+        if prepared
+        else torch.empty(
+            (num_tokens, num_q_heads * head_dim), dtype=q.dtype, device=q.device
+        )
     )
     k_out = (
-        torch.empty(
-            (num_tokens, num_kv_heads * head_dim), dtype=k.dtype, device=k.device
+        k
+        if prepared
+        else (
+            torch.empty(
+                (num_tokens, num_kv_heads * head_dim), dtype=k.dtype, device=k.device
+            )
+            if return_kv
+            else q_out
         )
-        if return_kv
-        else q_out
     )
+    if prepared:
+        # Prepared rows with flat heads need no Q/K copy. Only the slotted
+        # KV heads need a cache write.
+        num_q_heads = 0
+        num_tokens = cache.slots.numel()
     if num_tokens > 0:
         half_rotary = 0 if rotary is None else rotary.rotary_dim // 2
         positions = cache.slots if rotary is None else rotary.positions
@@ -448,7 +460,7 @@ def triton_gqa_prologue(
             S0=s0,
             S1=s1,
             S2=s2,
-            RETURN_K=return_kv,
+            RETURN_K=return_kv and not prepared,
             KV_SCALED=scales is not None,
             BLOCK_T=block_t,
             BLOCK=triton.next_power_of_2(head_dim),

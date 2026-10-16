@@ -35,6 +35,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+    empty_swizzled_cdna4_mxfp4_scale,
+)
 
 
 @gluon.constexpr_function
@@ -154,6 +157,125 @@ def _mxfp4_store_cdna4_scale(
         scale_byte,
         mask=mask,
     )
+
+
+@gluon.jit
+def _rmsnorm_mxfp4_quantize_kernel(
+    x_ptr,
+    weight_ptr,
+    out_ptr,
+    scale_ptr,
+    width: gl.constexpr,
+    eps: gl.constexpr,
+    weight_offset: gl.constexpr,
+    stride_scale_linear,
+    stride_scale_mblock,
+    BLOCK_K: gl.constexpr,
+):
+    row = gl.program_id(0)
+    layout: gl.constexpr = scaled_downcast_layout(1, BLOCK_K, gl.num_warps())
+    offsets = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, layout))
+    valid = offsets < width
+    values = gl.load(
+        x_ptr + row.to(gl.int64) * width + offsets,
+        mask=valid,
+        other=0.0,
+    ).to(gl.float32)
+    variance = gl.sum(values * values, axis=0) / width
+    values *= gl.rsqrt(variance + eps)
+    weight = gl.load(weight_ptr + offsets, mask=valid, other=0.0).to(gl.float32)
+    weight = (weight + weight_offset).to(gl.bfloat16).to(gl.float32)
+    values *= weight
+
+    values = values.reshape((1, BLOCK_K))
+    packed, scale_byte = _mxfp4_quantize_tile_in_layout(values)
+    packed_rows = gl.arange(
+        0,
+        1,
+        layout=gl.SliceLayout(1, packed.type.layout),
+    )
+    packed_offsets = gl.arange(
+        0,
+        BLOCK_K // 2,
+        layout=gl.SliceLayout(0, packed.type.layout),
+    )
+    gl.store(
+        out_ptr
+        + (row + packed_rows[:, None]).to(gl.int64) * (width // 2)
+        + packed_offsets[None, :],
+        packed,
+        mask=packed_offsets[None, :] < width // 2,
+    )
+
+    scale_groups = gl.arange(
+        0,
+        BLOCK_K // 32,
+        layout=gl.SliceLayout(0, scale_byte.type.layout),
+    )
+    _mxfp4_store_cdna4_scale(
+        scale_ptr,
+        scale_byte,
+        row
+        + gl.arange(0, 1, layout=gl.SliceLayout(1, scale_byte.type.layout))[:, None],
+        scale_groups[None, :],
+        stride_scale_linear,
+        stride_scale_mblock,
+        scale_groups[None, :] < width // 32,
+        M_SWIZZLE=32,
+        K_SWIZZLE=8,
+    )
+
+
+def rmsnorm_mxfp4_quantize(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    weight_offset: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse affine RMSNorm and dynamic MXFP4 quantization on CDNA4.
+
+    Args:
+        x: Contiguous BF16 rows shaped ``[tokens, width]``.
+        weight: Learned BF16 RMSNorm weight shaped ``[width]``.
+        eps: Epsilon added to the row variance.
+        weight_offset: Center added to the weight before BF16 rounding.
+
+    Returns:
+        Packed E2M1 rows and CDNA4-swizzled E8M0 group scales.
+    """
+    if x.ndim != 2 or x.dtype != torch.bfloat16 or not x.is_cuda:
+        raise ValueError("x must be a BF16 GPU tensor shaped [tokens, width]")
+    rows, width = x.shape
+    if width <= 0 or width % 32:
+        raise ValueError("the row width must be a positive multiple of 32")
+    if weight.shape != (width,) or weight.device != x.device:
+        raise ValueError("weight must be colocated and match the row width")
+    values = x.contiguous()
+    packed = torch.empty((rows, width // 2), dtype=torch.uint8, device=x.device)
+    scales = empty_swizzled_cdna4_mxfp4_scale(
+        rows,
+        width // 32,
+        device=x.device,
+    )
+    if rows == 0:
+        return packed, scales
+    block_k = triton.next_power_of_2(width)
+    if block_k > 65536:
+        raise ValueError("the normalized width exceeds one Gluon program")
+    _rmsnorm_mxfp4_quantize_kernel[(rows,)](
+        values,
+        weight,
+        packed,
+        scales,
+        width,
+        eps,
+        weight_offset,
+        scales.stride(0),
+        scales.stride(1),
+        BLOCK_K=block_k,
+        num_warps=8,
+    )
+    return packed, scales
 
 
 @gluon.jit

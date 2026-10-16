@@ -304,6 +304,7 @@ class DataParallelController:
                 dist_init_addr=port_args.dist_init_addr,
                 rpc_ipc_name=port_args.rpc_ipc_name,
                 metrics_ipc_name=port_args.metrics_ipc_name,
+                metrics_producer_configs=port_args.metrics_producer_configs,
                 tokenizer_worker_ipc_name=port_args.tokenizer_worker_ipc_name,
             )
             dp_port_args.append(tmp_port_args)

@@ -48,6 +48,7 @@ from tokenspeed.runtime.configs.numerics import (
     BITWISE_ENVELOPES,
     MEGATRON_VOCAB_BLOCK,
 )
+from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_manager import (
     dp_group_row_counts,
     gather_sampled_rows,
@@ -1114,6 +1115,18 @@ class LogitsProcessor(nn.Module):
                     skip_entry_sync=True,
                     safe=False,
                 )
+            elif (
+                current_platform().is_cdna4
+                and not require_full_vocab
+                and (
+                    iris := get_global_backend().get_prepared_all_gather(
+                        self.tp_group, logits.dtype
+                    )
+                )
+                is not None
+                and iris.can_run(logits)
+            ):
+                logits = iris.run(logits)
             else:
                 num_rows = logits.size(0)
                 local_vocab_size = logits.size(1)

@@ -49,6 +49,29 @@ logger = get_colorful_logger(__name__)
 
 MAX_ROLLBACK_TOKENS = 200
 
+# The matcher methods the capturable grammar's build hostfunc calls. tvm-ffi
+# releases the GIL around every call by default, and on the CUDA callback
+# thread each release lets the scheduler thread take the GIL for up to a
+# switch interval (5 ms). Each call takes microseconds, so they keep it.
+GIL_HOLDING_MATCHER_METHODS = frozenset(
+    (
+        "accept_token",
+        "fill_next_token_bitmask",
+        "traverse_draft_tree",
+        "rollback",
+        "is_terminated",
+    )
+)
+
+
+def keep_gil_in_matcher_calls() -> None:
+    """Make GIL_HOLDING_MATCHER_METHODS keep the GIL, for the whole process."""
+    from xgrammar.base import _core
+
+    for method in _core.GrammarMatcher.__tvm_ffi_type_info__.methods:
+        if method.name in GIL_HOLDING_MATCHER_METHODS:
+            method.func.release_gil = False
+
 
 class XGrammarGrammar(BaseGrammarObject):
     def __init__(
@@ -64,6 +87,9 @@ class XGrammarGrammar(BaseGrammarObject):
 
         self.ctx = ctx
         self.override_stop_tokens = override_stop_tokens
+
+        # Accepting one of these ends the grammar.
+        self.stop_token_ids = frozenset(matcher.stop_token_ids)
 
         self.finished = False
         self.accepted_tokens: list[int] = []
@@ -113,6 +139,25 @@ class XGrammarGrammar(BaseGrammarObject):
 
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
 
+    def fill_vocab_masks_along_drafts(
+        self,
+        vocab_masks: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        next_node: torch.Tensor,
+        next_sibling: torch.Tensor,
+    ) -> None:
+        """Fill ``vocab_masks[k]`` with the mask after ``draft_tokens[1..k]``,
+        in one matcher call; ``draft_tokens[0]`` is already accepted.
+
+        ``next_node`` / ``next_sibling`` give the draft tree (int64, one entry
+        per node, -1 for none). The walk stops at the first draft token the
+        grammar rejects or that ends it: that node's row is zeroed and the
+        rows below it are not written. The matcher state is unchanged.
+        """
+        self.matcher.traverse_draft_tree(
+            next_node, next_sibling, draft_tokens, vocab_masks
+        )
+
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
 
@@ -148,6 +193,8 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     ) -> None:
 
         super().__init__()
+
+        keep_gil_in_matcher_calls()
 
         # The matcher ends a grammar on the tokens the engine stops on, the
         # model's end-of-sequence ids with the tokenizer's own EOS and extra

@@ -117,15 +117,21 @@ def _relative_error(actual, expected):
     [
         # Kimi-K3 verify at TP8: one 64-row block per request, with lengths
         # on both sides of page and split boundaries.
-        (12, 4, [4, 5, 63, 64, 65, 1025, 4095, 4096, 4097, 16385], torch.float8_e4m3fn),
-        (12, 4, [129, 4097], torch.bfloat16),
+        pytest.param(
+            12,
+            4,
+            [4, 5, 63, 64, 65, 1025, 4095, 4096, 4097, 16385],
+            torch.float8_e4m3fn,
+            id="k3-tp8-fp8",
+        ),
+        pytest.param(12, 4, [129, 4097], torch.bfloat16, id="k3-tp8-bf16"),
         # 16 and 32 rows per block.
-        (4, 4, [4, 1025, 4097], torch.float8_e4m3fn),
-        (8, 4, [4, 2049], torch.float8_e4m3fn),
+        pytest.param(4, 4, [4, 1025, 4097], torch.float8_e4m3fn, id="rows16"),
+        pytest.param(8, 4, [4, 2049], torch.float8_e4m3fn, id="rows32"),
         # Several query blocks per request, the last one partial.
-        (16, 15, [15, 1025], torch.float8_e4m3fn),
+        pytest.param(16, 15, [15, 1025], torch.float8_e4m3fn, id="partial-block"),
         # Head blocks.
-        (128, 4, [1025, 4], torch.bfloat16),
+        pytest.param(128, 4, [1025, 4], torch.bfloat16, id="head-blocks"),
     ],
 )
 def test_query_block_mla_matches_reference(heads, queries, cache_lengths, dtype):

@@ -19,7 +19,12 @@ from typing import Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -1082,11 +1087,184 @@ def triton_quantize_mxfp4(
     return mxfp4_quantize(x)
 
 
+NVFP4_BLOCK = 16
+
+
+@triton.jit
+def _rcp_approx(x):
+    """flashinfer's reciprocal: the approximate, flush-to-zero PTX instruction."""
+    return tl.inline_asm_elementwise(
+        "rcp.approx.ftz.f32 $0, $1;",
+        "=f,f",
+        [x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _mailbox_row_dirty(halves, sentinel_half: tl.constexpr):
+    """Whether any BF16 element of the row still holds the sentinel's half."""
+    return tl.max((halves == sentinel_half).to(tl.int32), axis=0) != 0
+
+
+@triton.jit
+def _rmsnorm_nvfp4_quant_kernel(
+    x_ptr,
+    weight_ptr,
+    global_scale_ptr,
+    out_ptr,
+    scale_ptr,
+    width: tl.constexpr,
+    eps: tl.constexpr,
+    weight_offset: tl.constexpr,
+    sentinel_word: tl.constexpr,
+    sentinel_half: tl.constexpr,
+    MAILBOX: tl.constexpr,
+    BLOCK: tl.constexpr,
+    SF_BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    # flashinfer: sf = e4m3(gs * amax * rcp(6)), y = e2m1(x * rcp(sf * rcp(gs))).
+    row = tl.program_id(0).to(tl.int64)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < width
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        # Dependents may launch now; their own wait still covers this grid's completion.
+        tl.extra.cuda.gdc_launch_dependents()
+    if MAILBOX:
+        # One row-wide poll load keeps the plain path's variance sum order bitwise.
+        half_ptr = x_ptr.to(tl.pointer_type(tl.int16)) + row * width + offsets
+        halves = tl.load(half_ptr, mask=mask, other=0, volatile=True)
+        while _mailbox_row_dirty(halves, sentinel_half):
+            halves = tl.load(half_ptr, mask=mask, other=0, volatile=True)
+        values = halves.to(tl.bfloat16, bitcast=True).to(tl.float32)
+        word_ptr = x_ptr.to(tl.pointer_type(tl.int32)) + row * (width // 2)
+        word_ptr += tl.arange(0, BLOCK // 2)
+        tl.store(word_ptr, tl.full([BLOCK // 2], sentinel_word, tl.int32))
+    else:
+        values = tl.load(x_ptr + row * width + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+    variance = tl.sum(values * values, axis=0) / width
+    values *= tl.rsqrt(variance + eps)
+    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    values *= (weight + weight_offset).to(tl.bfloat16).to(tl.float32)
+    values = values.to(tl.bfloat16).to(tl.float32)
+    # flashinfer's quantizer is flush-to-zero: a subnormal input is a zero to it.
+    values = tl.where(tl.abs(values) < 1.1754944e-38, 0.0, values)
+    blocks = tl.reshape(values, [BLOCK // SF_BLOCK, SF_BLOCK])
+    amax = tl.max(tl.abs(blocks), axis=1)
+    global_scale = tl.load(global_scale_ptr) + tl.zeros_like(amax)
+    rcp_six = _rcp_approx(tl.full(amax.shape, 6.0, tl.float32))
+    sf_value = tl.where(amax != 0.0, global_scale * (amax * rcp_six), 0.0)
+    sf_e4m3 = sf_value.to(tl.float8e4nv)
+    sf_f32 = sf_e4m3.to(tl.float32)
+    out_scale = _rcp_approx(sf_f32 * _rcp_approx(global_scale))
+    out_scale = tl.where(amax != 0.0, out_scale, 0.0)
+    scaled = tl.reshape(blocks * out_scale[:, None], [BLOCK // 2, 2])
+    low, high = tl.split(scaled)
+    packed = tl.inline_asm_elementwise(
+        "{ .reg .b8 b; cvt.rn.satfinite.e2m1x2.f32 b, $2, $1; mov.b32 $0, {b, b, b, b}; }",
+        "=r,f,f",
+        [low, high],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    half = tl.arange(0, BLOCK // 2)
+    tl.store(
+        out_ptr + row * (width // 2) + half,
+        (packed & 0xFF).to(tl.uint8),
+        mask=half < width // 2,
+    )
+    sf_index = tl.arange(0, BLOCK // SF_BLOCK)
+    tl.store(
+        scale_ptr + row * (width // SF_BLOCK) + sf_index,
+        sf_e4m3.to(tl.uint8, bitcast=True),
+        mask=sf_index < width // SF_BLOCK,
+    )
+
+
+@register_kernel(
+    "quantization",
+    "rmsnorm_nvfp4",
+    name="triton_rmsnorm_nvfp4_quant",
+    solution="triton",
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    priority=Priority.PORTABLE,
+)
+def triton_rmsnorm_nvfp4_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    weight_offset: float,
+    global_scale: torch.Tensor,
+    mailbox_sentinel: int | None,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Triton kernel of :func:`tokenspeed_kernel.ops.quantization.rmsnorm_nvfp4_quant`."""
+    if x.ndim != 2 or x.dtype != torch.bfloat16 or not x.is_cuda:
+        raise ValueError("x must be a BF16 GPU tensor shaped [rows, width]")
+    rows, width = x.shape
+    if width % NVFP4_BLOCK:
+        raise ValueError(f"width must be a multiple of {NVFP4_BLOCK}, got {width}")
+    if weight.shape != (width,) or weight.device != x.device:
+        raise ValueError("weight must be colocated and match x's final dimension")
+    if global_scale.numel() != 1 or global_scale.dtype != torch.float32:
+        raise ValueError("global_scale must be one FP32 value")
+    if mailbox_sentinel is not None:
+        if not 0 <= mailbox_sentinel <= 0xFFFFFFFF or (mailbox_sentinel & 0xFFFF) != (
+            mailbox_sentinel >> 16
+        ):
+            raise ValueError("the mailbox sentinel is one word whose halves agree")
+        if width & (width - 1) or not x.is_contiguous():
+            raise ValueError("a mailbox needs contiguous rows of a power-of-two width")
+    values = x.contiguous()
+    packed = torch.empty((rows, width // 2), dtype=torch.uint8, device=x.device)
+    # flashinfer's consumers may touch the round_up(rows, 16) tail; keep that storage.
+    padded_rows = (rows + 15) // 16 * 16
+    scales = torch.empty(
+        (padded_rows, width // NVFP4_BLOCK), dtype=torch.uint8, device=x.device
+    )[:rows]
+    if rows == 0:
+        return packed, scales
+    block = triton.next_power_of_2(width)
+    if block > 65536:
+        raise ValueError("the normalized dimension is too wide for one Triton block")
+    use_pdl = enable_pdl and current_platform().is_hopper_plus
+    launch = {"launch_pdl": True} if use_pdl else {}
+    sentinel = 0 if mailbox_sentinel is None else mailbox_sentinel
+    _rmsnorm_nvfp4_quant_kernel[(rows,)](
+        values,
+        weight,
+        global_scale,
+        packed,
+        scales,
+        width=width,
+        eps=eps,
+        weight_offset=weight_offset,
+        # The kernel compares int16 halves and stores int32 words: signed images.
+        sentinel_word=sentinel - (1 << 32) if sentinel >= 1 << 31 else sentinel,
+        sentinel_half=(sentinel & 0xFFFF) - (1 << 16 if sentinel & 0x8000 else 0),
+        MAILBOX=mailbox_sentinel is not None,
+        BLOCK=block,
+        SF_BLOCK=NVFP4_BLOCK,
+        ENABLE_PDL=use_pdl,
+        num_warps=8,
+        **launch,
+    )
+    return packed, scales
+
+
 __all__ = [
     "fp8_quantize",
     "mxfp4_quantize",
     "triton_quantize_fp8_roundtrip",
     "triton_quantize_mxfp4",
+    "triton_rmsnorm_nvfp4_quant",
     "triton_quantize_fp8_with_scale",
 ]
 
