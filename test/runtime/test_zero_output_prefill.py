@@ -37,6 +37,9 @@ import torch
 
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.sampling.sampling_batch_info import (
+    SamplingBatchInfo,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME = "python/tokenspeed/runtime/"
@@ -72,14 +75,6 @@ def load_symbol(path, name, *, owner=None, **bindings):
     )
     exec(compile(ast.fix_missing_locations(module), str(ROOT / path), "exec"), scope)
     return scope[name]
-
-
-def _load_prefill_sample_offsets():
-    return load_symbol(
-        RUNTIME + "execution/model_executor.py",
-        "_with_prefill_sample_offsets",
-        replace=dataclasses.replace,
-    )
 
 
 @dataclasses.dataclass
@@ -141,9 +136,6 @@ class SharedBufferSampler:
 def test_sampling_preserves_request_parameters_and_shared_outputs(
     p, e, d, width, with_mask
 ):
-    info_cls = load_symbol(
-        RUNTIME + "sampling/sampling_batch_info.py", "SamplingBatchInfo"
-    )
     sample = load_symbol(
         RUNTIME + "execution/model_executor.py",
         "_sample_and_verify",
@@ -152,7 +144,6 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
         _sampling_info_for_requests=load_symbol(
             RUNTIME + "execution/model_executor.py", "_sampling_info_for_requests"
         ),
-        _with_prefill_sample_offsets=_load_prefill_sample_offsets(),
     )
     backend = SharedBufferSampler()
     input_lengths = torch.tensor([5, 9, 2, 7, 3], dtype=torch.int32)[: e + d]
@@ -171,11 +162,12 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
     )
     pool_indices = torch.tensor([17, 3, 11, 5, 13])[: e + d]
     cache_lengths = torch.arange(32)
-    info = info_cls(
+    info = SamplingBatchInfo(
         req_pool_indices=pool_indices,
         temperatures=torch.arange(e + d).float() + 0.5,
         top_ks=torch.arange(e + d) + 10,
         valid_cache_lengths=cache_lengths,
+        extend_lengths=input_lengths[:e],
         batch_row_offset=7,
         vocab_mask=torch.arange((e + d) * width)[:, None] if with_mask else None,
     )
@@ -210,14 +202,13 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
                 assert subset.vocab_mask[:, 0].tolist() == list(
                     range(mask_start, (e + d) * width)
                 )
+        # Both slices retain the original frontier, including across open
+        # prefill rows that emit no logits. The sampler derives offsets later.
+        assert subset.valid_cache_lengths is cache_lengths
         if kind == "sample":
-            # Prefill rows sample at their last input position.
-            expected = cache_lengths.clone()
-            for row, pool_idx in enumerate(pool_indices[:p].tolist()):
-                expected[pool_idx] = cache_lengths[pool_idx] + input_lengths[row] - 1
-            assert subset.valid_cache_lengths.tolist() == expected.tolist()
+            assert torch.equal(subset.extend_lengths, input_lengths[:p])
         else:
-            assert subset.valid_cache_lengths is cache_lengths
+            assert subset.extend_lengths is None
         if not with_mask:
             assert subset.vocab_mask is None
     if p or d:
@@ -225,40 +216,6 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
             [-float(i) for i in range(1, p + 1)]
             + [-float(10 + i) for i in range(d * width)]
         )
-
-
-def test_prefill_sample_offset_ignores_how_the_prompt_was_split():
-    """A seeded request's first token must not depend on its prefix-cache hit.
-
-    The pool samplers key a row's noise on (seed, valid_cache_lengths[pool]).
-    At prefill sampling time that table holds the chunk's prefix length, so
-    a cold 100-token prompt (prefix 0), the same prompt after a 64-token
-    prefix-cache hit and its last chunk all have to land on the
-    same offset: the last prompt position, one below the first decode's.
-    """
-    info_cls = load_symbol(
-        RUNTIME + "sampling/sampling_batch_info.py", "SamplingBatchInfo"
-    )
-    offsets = _load_prefill_sample_offsets()
-    prompt = 100
-    seen = set()
-    for prefix in (0, 64, 96, 99):
-        cache_lengths = torch.zeros(8, dtype=torch.int32)
-        cache_lengths[5] = prefix
-        cache_lengths[2] = 41  # another request's decode frontier stays put
-        info = info_cls(
-            req_pool_indices=torch.tensor([5]), valid_cache_lengths=cache_lengths
-        )
-        out = offsets(info, torch.tensor([prompt - prefix], dtype=torch.int32))
-        assert out.valid_cache_lengths[5].item() == prompt - 1
-        assert out.valid_cache_lengths[2].item() == 41
-        # The runtime table itself is untouched; advance reads it afterwards.
-        assert cache_lengths[5].item() == prefix
-        seen.add(out.valid_cache_lengths[5].item())
-    assert seen == {prompt - 1}
-    # Without a cache-length table (capture warm-up) the info passes through.
-    bare = info_cls(req_pool_indices=torch.tensor([5]))
-    assert offsets(bare, torch.tensor([3], dtype=torch.int32)) is bare
 
 
 def test_nan_and_oov_map_to_original_decode_rows():
@@ -510,15 +467,11 @@ def test_zero_decoder_skips_layers_and_normalization():
 
 @pytest.mark.parametrize("decode", [False, True])
 def test_identity_sampling_keeps_backend_buffer_aliases(decode):
-    info_cls = load_symbol(
-        RUNTIME + "sampling/sampling_batch_info.py", "SamplingBatchInfo"
-    )
     sample = load_symbol(
         RUNTIME + "execution/model_executor.py",
         "_sample_and_verify",
         owner="ModelExecutor",
         LogitsProcessorOutput=Output,
-        _with_prefill_sample_offsets=_load_prefill_sample_offsets(),
     )
     backend = SharedBufferSampler()
     executor = SimpleNamespace(
@@ -529,7 +482,7 @@ def test_identity_sampling_keeps_backend_buffer_aliases(decode):
             input_lengths_buf=torch.ones(2, dtype=torch.int32)
         ),
     )
-    info = info_cls(req_pool_indices=torch.tensor([3, 7]))
+    info = SamplingBatchInfo(req_pool_indices=torch.tensor([3, 7]))
     ctx = SimpleNamespace(
         bs=2,
         num_extends=0 if decode else 2,
@@ -710,11 +663,14 @@ def test_drafter_future_inputs_keep_original_request_rows():
         nan_guard=NanGuard(4, "cpu"),
         runtime_states=SimpleNamespace(
             future_input_map=future_inputs,
+            valid_cache_lengths=torch.zeros(6, dtype=torch.int32),
             mark_spec_candidates_drafted=lambda rows: drafted.extend(rows.tolist()),
             vocab_size=64,
         ),
         input_buffers=SimpleNamespace(
-            state_write_req_pool_indices_buf=torch.tensor([4, 2, 5, 1])
+            state_write_req_pool_indices_buf=torch.tensor([4, 2, 5, 1]),
+            req_pool_indices_buf=torch.tensor([4, 2, 5, 1]),
+            input_lengths_buf=torch.tensor([1, 1, 3, 3], dtype=torch.int32),
         ),
         _run_target_forward=lambda ctx: Output(torch.zeros(7, 64)),
         _decode_candidates=lambda ctx: None,
