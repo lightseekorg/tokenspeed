@@ -412,13 +412,14 @@ class MoELayer(torch.nn.Module):
                 or combine_order != "rank"
             ):
                 raise ValueError(
-                    f"{precision_policy} requires BF16 {weight_label} SiLU experts "
-                    "without expert parallelism, all-to-all, bias or slot combine"
+                    f"{precision_policy} requires BF16 input and {weight_label} "
+                    "weights with SiLU, without expert parallelism, all-to-all, "
+                    "bias or slot combine"
                 )
             if moe_backend not in {None, "triton"}:
                 raise ValueError(
-                    f"{precision_policy} is supported only by the Triton "
-                    f"BF16 MoE backend, not {moe_backend!r}"
+                    f"{precision_policy} requires --moe-backend triton for "
+                    f"{weight_label} weights, not {moe_backend!r}"
                 )
             if routing_mode not in {None, "precomputed_topk"}:
                 raise ValueError(f"{precision_policy} requires precomputed top-k")

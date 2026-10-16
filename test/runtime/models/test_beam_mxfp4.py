@@ -27,6 +27,7 @@ import pytest
 import torch
 
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.models.beam import BeamForCausalLM
 from tokenspeed.runtime.models.beam_quant import beam_quant_policy
@@ -47,6 +48,42 @@ def mxfp4_config():
         quant_method="quark",
         fp8_layer_patterns=[],
     )
+
+
+@pytest.mark.parametrize(
+    "quantized,policy,weight_label",
+    [
+        (False, "bf16_route_accum_fp32", "unquantized"),
+        (True, "mxfp4_route_accum_fp32", "MXFP4"),
+    ],
+)
+@pytest.mark.parametrize(
+    "backend,input_dtype,diagnostic",
+    [
+        ("triton", torch.float16, "requires BF16 input and {weight_label} weights"),
+        (
+            "gluon",
+            torch.bfloat16,
+            "requires --moe-backend triton for {weight_label} weights",
+        ),
+    ],
+)
+def test_precision_policy_errors_distinguish_input_and_weight_formats(
+    server, quantized, policy, weight_label, backend, input_dtype, diagnostic
+):
+    server(backend)
+    torch.set_default_dtype(input_dtype)
+    with pytest.raises(ValueError, match=diagnostic.format(weight_label=weight_label)):
+        MoELayer(
+            top_k=2,
+            num_experts=4,
+            hidden_size=128,
+            intermediate_size=512,
+            quant_config=mxfp4_config() if quantized else None,
+            layer_index=1,
+            prefix="model.layers.1.mlp.experts",
+            routing_config={"precision_policy": policy},
+        )
 
 
 @pytest.mark.parametrize("world,rank", [(1, 0), (4, 0), (4, 3)])
