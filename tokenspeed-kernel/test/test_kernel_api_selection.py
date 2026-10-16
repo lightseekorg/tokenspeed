@@ -1192,7 +1192,7 @@ def _mm_mxfp4() -> torch.Tensor:
     )
 
 
-def _attention_prefill() -> object:
+def _attention_prefill(solution: str | None = None) -> object:
     q = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     k = torch.empty((4, 8, 64), dtype=torch.bfloat16)
     v = torch.empty((4, 8, 64), dtype=torch.bfloat16)
@@ -1204,15 +1204,18 @@ def _attention_prefill() -> object:
         cu_seqlens,
         cu_seqlens_cpu=[0, 4],
         max_seqlen=4,
+        solution=solution,
     )
 
 
-def _attention_extend() -> object:
-    q = torch.empty((4, 16, 64), dtype=torch.bfloat16)
+def _attention_extend(
+    solution: str | None = None, dtype: torch.dtype = torch.bfloat16
+) -> object:
+    q = torch.empty((4, 16, 64), dtype=dtype)
     cu_seqlens_q = torch.tensor([0, 2, 4], dtype=torch.int32)
     cu_seqlens_kv = torch.tensor([0, 64, 192], dtype=torch.int32)
-    k_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
-    v_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
+    k_cache = torch.empty((8, 64, 8, 64), dtype=dtype)
+    v_cache = torch.empty((8, 64, 8, 64), dtype=dtype)
     page_table = torch.empty((2, 4), dtype=torch.int32)
     cache_seqlens = torch.tensor([64, 128], dtype=torch.int32)
     return _attention_mha_pkg.mha_extend_with_kvcache(
@@ -1225,13 +1228,16 @@ def _attention_extend() -> object:
         cache_seqlens,
         max_seqlen_q=2,
         max_seqlen_k=128,
+        solution=solution,
     )
 
 
-def _attention_decode() -> object:
-    q = torch.empty((2, 16, 64), dtype=torch.bfloat16)
-    k_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
-    v_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
+def _attention_decode(
+    solution: str | None = None, dtype: torch.dtype = torch.bfloat16
+) -> object:
+    q = torch.empty((2, 16, 64), dtype=dtype)
+    k_cache = torch.empty((8, 64, 8, 64), dtype=dtype)
+    v_cache = torch.empty((8, 64, 8, 64), dtype=dtype)
     page_table = torch.empty((2, 4), dtype=torch.int32)
     cache_seqlens = torch.tensor([64, 128], dtype=torch.int32)
     return _attention_mha_pkg.mha_decode_with_kvcache(
@@ -1242,6 +1248,7 @@ def _attention_decode() -> object:
         cache_seqlens,
         max_seqlen_k=128,
         max_seqlen_q=1,
+        solution=solution,
     )
 
 
@@ -5225,6 +5232,77 @@ _CASES = [
         _is_blackwell_sm103,
         "blackwell-sm103",
         "attention",
+        "mha_prefill",
+        "triton_mha_prefill",
+        _attention_prefill,
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
+        "mha_prefill",
+        "fa4_mha_prefill_sm103",
+        partial(_attention_prefill, solution="fa4"),
+        id_suffix="explicit-fa4",
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
+        "mha_extend_with_kvcache",
+        "fa4_mha_extend_with_kvcache_sm103",
+        partial(_attention_extend, solution="fa4"),
+        id_suffix="explicit-fa4",
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
+        "mha_decode_with_kvcache",
+        "fa4_mha_decode_with_kvcache_sm103",
+        partial(_attention_decode, solution="fa4"),
+        id_suffix="explicit-fa4",
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
+        "mha_extend_with_kvcache",
+        "flashinfer_trtllm_mha_extend_with_kvcache",
+        partial(_attention_extend, dtype=torch.float8_e4m3fn),
+        id_suffix="fp8",
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
+        "mha_extend_with_kvcache",
+        "fa4_mha_extend_with_kvcache_fp8_sm103",
+        partial(_attention_extend, solution="fa4", dtype=torch.float8_e4m3fn),
+        id_suffix="explicit-fa4-fp8",
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
+        "mha_decode_with_kvcache",
+        "flashinfer_trtllm_mha_decode_with_kvcache",
+        partial(_attention_decode, dtype=torch.float8_e4m3fn),
+        id_suffix="fp8",
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
+        "mha_decode_with_kvcache",
+        "fa4_mha_decode_with_kvcache_fp8_sm103",
+        partial(_attention_decode, solution="fa4", dtype=torch.float8_e4m3fn),
+        id_suffix="explicit-fa4-fp8",
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
         "attn_merge_state",
         "cuda_attn_merge_state",
         _attention_merge_state,
@@ -7306,6 +7384,20 @@ def test_dsv41_index_topk_fp8_rows_select_triton(
         registry.clear_cache()
         case.invoke()
         assert calls == [case.expected]
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+
+def test_mha_plan_keeps_b300_prefill_prewrite(b300_platform):
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    try:
+        Platform.override(b300_platform)
+        registry.clear_cache()
+        for solution in (None, "fa4"):
+            plan = _attention_mha_pkg.mha_plan(torch.bfloat16, 64, solution=solution)
+            assert plan["extend_mode"] == "prewrite"
     finally:
         Platform.override(host_platform)
         registry.clear_cache()
