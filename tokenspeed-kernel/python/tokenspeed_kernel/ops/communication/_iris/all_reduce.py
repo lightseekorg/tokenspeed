@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.communication.iris import (
     producer_direct_all_reduce_can_run,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel_amd._synchronization import wait_vmem
 
 _SUBGROUP_SIZE = 64
 _PULL_MAX_PROGRAMS = 84
@@ -417,18 +418,6 @@ def all_reduce_heap_bytes(
     return size
 
 
-@gluon.jit
-def _iris_drain_subgroup_vmem():
-    gl.inline_asm_elementwise(
-        "s_waitcnt vmcnt(0)",
-        "=r,~{memory}",
-        [],
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
-    )
-
-
 @triton.jit
 def iris_pull_oneshot_staged(
     input_ptr,
@@ -759,9 +748,9 @@ def _iris_sync_rank_token(
         sem="acquire",
         scope="sys",
     )
-    _iris_drain_subgroup_vmem()
+    wait_vmem(args=[], constraints="=r,~{memory}")
     # The acquire is subgroup-local. Keep every subgroup at the protocol
-    # boundary until all of them have observed the peer publications; the
+    # boundary until all of them have observed the peer ready flags; the
     # caller consumes the peer inbox immediately after this helper returns.
     gl.barrier()
 

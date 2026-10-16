@@ -24,11 +24,11 @@ import torch
 from tokenspeed_kernel._triton import gl, gluon, triton
 from tokenspeed_kernel.ops.communication._iris import IrisGroup, allocation_bytes
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-    _iris_drain_subgroup_vmem,
     _iris_heap_base,
     _iris_sync_rank_token,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel_amd._synchronization import wait_vmem
 
 ATTNRES_WORLD_SIZE = 8
 ATTNRES_HIDDEN_SIZE = 7168
@@ -332,8 +332,8 @@ def iris_k3attn_push_oneshot(
             mask=mask,
             cache=".wt",
         )
-    _iris_drain_subgroup_vmem()
-    # Join subgroup-local drains before publishing the generation to peers.
+    wait_vmem(args=[], constraints="=r,~{memory}")
+    # Wait for every subgroup's stores before signaling readiness to peers.
     gl.barrier()
 
     _iris_sync_rank_token(

@@ -38,12 +38,9 @@ Keep an explicit `gl.barrier()` only where the compiler cannot see the hazard:
   re-reading a global buffer other threads just wrote. Say what the barrier
   orders in a comment.
 
-Iris push collectives also keep explicit workgroup barriers around their
-cross-rank publication protocol. The VMEM drain and system-scope atomics order
-one subgroup's traffic, but the barriers join all producer subgroups before
-they publish a generation and all consumer subgroups before they read the
-peer inbox. Removing either rendezvous can potentially increase cross-rank
-skew and regress perf even when the generated kernel remains correct.
+Use `wait_vmem()` to wait for a subgroup's vector memory operations to
+complete. Keep workgroup barriers where all producer subgroups must finish
+before signaling completion, or all consumers must wait before reading data.
 
 ## GEMM
 
