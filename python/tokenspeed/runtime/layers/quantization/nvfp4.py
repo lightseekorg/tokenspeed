@@ -66,12 +66,14 @@ class Nvfp4Config(QuantizationConfig):
         group_size = 16
         exclude_modules = []
 
-        # Try flat format first (config.json quantization_config)
+        # Try flat format first: config.json's quantization_config ("ignore")
+        # or the flat dict ModelConfig builds from hf_quant_config.json
+        # ("exclude_modules").
         quant_method = config.get("quant_algo")
         if quant_method is not None:
             kv_cache_quant_algo = config.get("kv_cache_quant_algo", "auto")
             group_size = config.get("group_size", 16)
-            exclude_modules = config.get("ignore", [])
+            exclude_modules = config.get("ignore", config.get("exclude_modules", []))
         else:
             # Fall back to nested format (hf_quant_config.json)
             try:
