@@ -42,7 +42,7 @@ def metrics_enabled(args: ServerArgs, reporter: str) -> bool:
 
 
 def raw_metrics_enabled(args: ServerArgs) -> bool:
-    """Whether asynchronous event outputs need producer cleanup on shutdown."""
+    """Whether raw metric outputs are selected and enabled."""
     return args.enable_metrics and any(
         name != "prometheus" for name in (args.metrics_reporters or [])
     )

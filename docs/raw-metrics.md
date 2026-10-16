@@ -181,9 +181,9 @@ does not promise power-loss durability, and consumer checkpoints are not an
 exactly-once transaction with the destination. The files are a best-effort
 observability feed, not an audit log.
 
-Normal shutdown sends SIGTERM to workers, waits within a time budget, and kills
-remaining workers before closing the launcher's sender and writer. This gives
-worker senders a chance to drain while the writer remains available, with bounded
-best-effort draining throughout. Forced termination, including SIGKILL, can leave
-queued samples and a partial final line behind; normal shutdown also does not
+The reporter preserves the engine's existing worker termination behavior. Each
+process that reaches metrics cleanup drains its local sender within a time budget;
+the launcher closes its local sender before the writer. A forcibly terminated
+worker can lose queued samples without running cleanup. Forced termination,
+including SIGKILL, can also leave a partial final line; normal shutdown does not
 guarantee lossless delivery.

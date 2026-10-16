@@ -43,7 +43,7 @@ from collections.abc import AsyncIterator, Iterator
 
 from tokenspeed.runtime.engine.async_llm import AsyncLLM
 from tokenspeed.runtime.engine.llm import LLM
-from tokenspeed.runtime.metrics.config import metrics_enabled, raw_metrics_enabled
+from tokenspeed.runtime.metrics.config import metrics_enabled
 from tokenspeed.runtime.metrics.service import metrics_service
 
 
@@ -97,7 +97,6 @@ from tokenspeed.runtime.utils.process import (
     kill_process_tree,
     receive_ready_messages,
     start_process_with_ready_pipe,
-    terminate_child_processes,
 )
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -298,8 +297,6 @@ class Engine(EngineBase):
         except Exception:
             logger.exception("Failed to close the disaggregation bootstrap server")
         finally:
-            if raw_metrics_enabled(self.server_args):
-                terminate_child_processes(os.getpid(), timeout=2.0)
             kill_process_tree(os.getpid(), include_parent=False)
             metrics_service.close(timeout=2.0)
 
@@ -781,10 +778,6 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
             child_failed.set()
         for proc in scheduler_procs:
             if proc.is_alive():
-                if raw_metrics_enabled(server_args):
-                    # DP workers must drain before their controller exits and
-                    # they are reparented out of the launcher's process tree.
-                    terminate_child_processes(proc.pid, timeout=2.0)
                 proc.terminate()
 
     try:

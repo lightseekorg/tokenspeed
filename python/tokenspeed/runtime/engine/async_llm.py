@@ -82,7 +82,6 @@ from tokenspeed.runtime.engine.scheduler_control_client import (
 )
 from tokenspeed.runtime.entrypoints import rl_control
 from tokenspeed.runtime.metrics.collector import RequestMetrics
-from tokenspeed.runtime.metrics.config import raw_metrics_enabled
 from tokenspeed.runtime.metrics.service import metrics_service
 from tokenspeed.runtime.pd.utils import (
     DisaggregationMode,
@@ -97,10 +96,7 @@ from tokenspeed.runtime.utils import (
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
 from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
-from tokenspeed.runtime.utils.process import (
-    kill_process_tree,
-    terminate_child_processes,
-)
+from tokenspeed.runtime.utils.process import kill_process_tree
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -744,10 +740,8 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             else:
                 break
 
-        # Stop producers first, then drain the frontend and writer before
-        # this path kills itself (atexit does not run after SIGKILL).
-        if raw_metrics_enabled(self.server_args):
-            await asyncio.to_thread(terminate_child_processes, os.getpid(), timeout=2.0)
+        # Close local metric resources before this path kills itself;
+        # atexit does not run after SIGKILL.
         metrics_service.close(timeout=2.0)
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)

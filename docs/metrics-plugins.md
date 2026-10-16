@@ -134,9 +134,11 @@ outputs; its resources are retained for shutdown. TokenSpeed does not rebuild a
 failed sink on the observation path.
 
 Stop accepting new events when close begins, and make repeated close calls safe.
-Normal shutdown drains worker sinks, then local launcher sinks, then shared node
-resources. Outputs share a time budget. Factories must clean up resources they
-allocate before raising; TokenSpeed closes objects that were successfully
+Each process that reaches metrics cleanup drains its local sinks within a shared
+time budget. The launcher closes its local sinks before shared node resources.
+Metric reporters do not change worker termination: a forcibly terminated worker
+may lose queued events without running close. Factories must clean up resources
+they allocate before raising; TokenSpeed closes objects that were successfully
 returned. An exception while closing one object does not skip the others.
 
 These are cooperative contracts for trusted Python plugins. Catching exceptions

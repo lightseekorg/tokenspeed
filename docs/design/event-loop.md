@@ -358,7 +358,9 @@ Metric reporters share those collection points. Raw metric outputs, including
 JSONL and installed plugins, only freeze scalar observations and queue them on
 the producer thread; serialization, IPC, disk writes and file rotation run on
 background threads. Plugin discovery and creation happen outside the loop.
-A node-local writer is owned by the launcher and closes after producer sinks.
+A node-local writer is owned by the launcher and closes after its local sinks.
+Reporters preserve the engine's worker termination behavior; a forcibly
+terminated worker may lose queued observations without running metrics cleanup.
 Its event channel is separate from load snapshots: counter increments and
 histogram observations cannot be conflated. The metric adapter suppresses
 unchanged gauge assignments before constructing events or distributing them,

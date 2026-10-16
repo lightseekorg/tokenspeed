@@ -23,11 +23,9 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import multiprocessing as mp
 import os
-import signal
 import sys
 import time
 
@@ -38,11 +36,6 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.metrics.events import MetricEvent
 from tokenspeed.runtime.metrics.service import MetricsService
-from tokenspeed.runtime.utils.process import (
-    receive_ready_messages,
-    start_process_with_ready_pipe,
-    terminate_child_processes,
-)
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
 
@@ -100,53 +93,33 @@ def test_close_after_prepare_allows_retry_with_new_configuration(tmp_path):
     assert [row["metric"] for row in _rows(retry)] == ["retry"]
 
 
-def _metric_worker(configs, ready, rank):
+def _metric_worker(ports, rank):
     service = MetricsService()
-    service.connect(configs)
-    sink = service.get_event_sink()
-
-    def stop(signum, frame):
-        raise SystemExit(0)
-
-    signal.signal(signal.SIGTERM, stop)
     try:
-        ready.set()
-        while True:
-            time.sleep(0.01)
-    finally:
-        sink.emit(
-            MetricEvent(
-                time.time_ns(), "worker_shutdown", "inc", 1, {"rank": str(rank)}
-            )
+        service.connect(ports.metrics_producer_configs)
+        service.get_event_sink().emit(
+            MetricEvent(time.time_ns(), "worker_event", "inc", 1, {"rank": str(rank)})
         )
+    finally:
         service.close(timeout=2)
 
 
-def _metric_controller(ports, writer):
-    context = mp.get_context("spawn")
+def test_spawned_producers_share_node_writer_and_close_normally(tmp_path):
     service = MetricsService()
-    service.connect(ports.metrics_producer_configs)
+    ports = _ports()
+    service.start(_args(tmp_path), ports)
+    context = mp.get_context("spawn")
     workers = []
     try:
         for rank in range(2):
-            ready = context.Event()
-            worker = context.Process(
-                target=_metric_worker,
-                args=(ports.metrics_producer_configs, ready, rank),
-            )
+            worker = context.Process(target=_metric_worker, args=(ports, rank))
             worker.start()
             workers.append(worker)
-            if not ready.wait(timeout=30):
-                raise RuntimeError("metric producer failed to start")
-        writer.send({"status": "ready"})
         for worker in workers:
-            worker.join()
-            if worker.exitcode != 0:
-                raise RuntimeError(
-                    f"metric producer exited with code {worker.exitcode}"
-                )
+            worker.join(timeout=30)
+            assert worker.exitcode == 0
         service.get_event_sink().emit(
-            MetricEvent(time.time_ns(), "controller_shutdown", "inc", 1, {})
+            MetricEvent(time.time_ns(), "frontend_event", "inc", 1, {})
         )
     finally:
         for worker in workers:
@@ -155,32 +128,10 @@ def _metric_controller(ports, writer):
             worker.join(timeout=5)
         service.close(timeout=2)
 
-
-def test_worker_shutdown_events_reach_node_writer_before_it_closes(tmp_path):
-    service = MetricsService()
-    ports = _ports()
-    service.start(_args(tmp_path), ports)
-    controller, reader = start_process_with_ready_pipe(
-        _metric_controller, (ports,), contextlib.nullcontext()
-    )
-    try:
-        assert reader.poll(60), "metric controller failed to become ready"
-        assert receive_ready_messages([reader], [controller]) == [{"status": "ready"}]
-        terminate_child_processes(controller.pid, timeout=5)
-        controller.join(timeout=10)
-        assert controller.exitcode == 0
-    finally:
-        if controller.is_alive():
-            terminate_child_processes(controller.pid, timeout=1)
-            controller.kill()
-        controller.join(timeout=5)
-        reader.close()
-        service.close(timeout=2)
-
     rows = _rows(tmp_path)
     assert len(rows) == 3
     assert {
-        row["labels"]["rank"] for row in rows if row["metric"] == "worker_shutdown"
+        row["labels"]["rank"] for row in rows if row["metric"] == "worker_event"
     } == {"0", "1"}
-    assert sum(row["metric"] == "controller_shutdown" for row in rows) == 1
+    assert sum(row["metric"] == "frontend_event" for row in rows) == 1
     assert len({row["stream_id"] for row in rows}) == 1

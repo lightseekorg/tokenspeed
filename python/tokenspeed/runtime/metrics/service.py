@@ -20,8 +20,8 @@
 
 """Process-local ownership of registered raw metric outputs.
 
-Collectors share one protected sink. The launcher separately owns node sessions,
-which outlive producer processes so their local sinks can finish draining first.
+Collectors share one protected sink. The launcher separately owns node sessions
+and closes its local sinks before those sessions within a shared time budget.
 """
 
 from __future__ import annotations
@@ -210,7 +210,7 @@ class MetricsService:
                 sink.close(timeout=max(0.0, deadline - time.monotonic()))
 
     def close_nodes(self, timeout: float) -> None:
-        """Close launcher-owned sessions after all producer processes have stopped."""
+        """Close launcher-owned sessions within the remaining time budget."""
         deadline = time.monotonic() + max(0.0, timeout)
         with self._lock:
             self._nodes_closed = True

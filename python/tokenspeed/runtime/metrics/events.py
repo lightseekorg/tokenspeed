@@ -69,5 +69,5 @@ class MetricNodeSession(Protocol):
         ...
 
     def close(self, timeout: float) -> None:
-        """Release resources after producers drain; bounded and repeatable."""
+        """Release shared resources within the timeout; safe to call repeatedly."""
         ...

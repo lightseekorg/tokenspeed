@@ -28,7 +28,6 @@ import os
 import signal
 import sys
 import threading
-import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from multiprocessing import connection
@@ -48,55 +47,6 @@ def register_usr_signal():
         parent_process.send_signal(signal.SIGUSR1)
 
     signal.signal(signal.SIGUSR1, signal_handler)
-
-
-def terminate_child_processes(parent_pid: int, *, timeout: float) -> None:
-    """Give descendants a bounded cleanup opportunity, then kill survivors.
-
-    The parent is never signalled. Descendants are captured before sending
-    SIGTERM so workers remain addressable if an intermediate parent exits and
-    they are reparented. All children share one wait budget; SIGKILL is sent to
-    survivors without another wait. Process lookup or permission errors are
-    logged so the caller can still perform its ordinary teardown.
-
-    Args:
-        parent_pid: Root of the descendant tree to stop, excluding this root.
-        timeout: Total seconds available for discovery, SIGTERM and waiting.
-    """
-    deadline = time.monotonic() + max(0.0, timeout)
-    try:
-        children = psutil.Process(parent_pid).children(recursive=True)
-    except psutil.NoSuchProcess:
-        return
-    except (psutil.Error, OSError) as exc:
-        logger.warning(f"Could not enumerate children of {parent_pid}: {exc!r}")
-        return
-
-    for child in children:
-        try:
-            child.send_signal(signal.SIGTERM)
-        except psutil.NoSuchProcess:
-            pass
-        except (psutil.Error, OSError) as exc:
-            logger.warning(f"Could not send SIGTERM to child {child.pid}: {exc!r}")
-
-    survivors = children
-    try:
-        _, survivors = psutil.wait_procs(
-            children, timeout=max(0.0, deadline - time.monotonic())
-        )
-    except psutil.NoSuchProcess:
-        pass
-    except (psutil.Error, OSError) as exc:
-        logger.warning(f"Could not wait for children of {parent_pid}: {exc!r}")
-
-    for child in survivors:
-        try:
-            child.kill()
-        except psutil.NoSuchProcess:
-            pass
-        except (psutil.Error, OSError) as exc:
-            logger.warning(f"Could not kill child {child.pid} after SIGTERM: {exc!r}")
 
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
