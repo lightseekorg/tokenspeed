@@ -23,8 +23,9 @@
 The head embeds the next token and the target's final hidden state, merges
 them with ``eh_proj`` and runs the checkpoint's MTP blocks (one NoPE attention
 and one latent MoE block) with the target's block code, then
-``final_layernorm``. Embedding and LM head are the target's. The checkpoint
-keeps the whole MTP subtree in BF16, so it is built without quantization.
+``final_layernorm``. Embedding and LM head are the target's. The head follows
+the checkpoint's quantization, and stays in BF16 when nothing under ``mtp.`` is
+quantized.
 """
 
 from __future__ import annotations
