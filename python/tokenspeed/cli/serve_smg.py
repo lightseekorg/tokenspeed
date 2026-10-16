@@ -657,17 +657,26 @@ def _add_rl_control_port(engine_args: list[str]) -> tuple[list[str], str]:
 
 
 def _add_metrics_port(engine_args: list[str]) -> tuple[list[str], str | None]:
-    """Wire the engine's Prometheus /metrics port when metrics are enabled.
+    """Wire the engine's /metrics port when Prometheus reporting is enabled.
 
-    With ``--enable-metrics`` the engine serves /metrics from its main process
-    (see ``ServerArgs.metrics_port``). Pin a stable port — like
+    With ``--enable-metrics`` and the Prometheus reporter (the default), the
+    engine serves /metrics from its main process (see ``ServerArgs.metrics_port``).
+    Pin a stable port — like
     ``--rl-control-port`` — so the scrape target survives engine restarts and
     can be printed at startup. An operator-pinned ``--metrics-port`` is
     preserved untouched; ``--metrics-port 0`` means auto-allocate, matching
     the engine-side treatment of an unset port. Returns the scrape URL, or
-    None when metrics are off.
+    None when Prometheus reporting is off.
     """
     if "--enable-metrics" not in engine_args:
+        return engine_args, None
+    reporters = []
+    for index, arg in enumerate(engine_args):
+        if arg == "--metrics-reporters" and index + 1 < len(engine_args):
+            reporters.append(engine_args[index + 1])
+        elif arg.startswith("--metrics-reporters="):
+            reporters.append(arg.split("=", 1)[1])
+    if reporters and "prometheus" not in reporters:
         return engine_args, None
     host = _get_from_args(engine_args, "--metrics-host", "127.0.0.1")
     pinned = _get_from_args(engine_args, "--metrics-port")
@@ -811,7 +820,7 @@ async def run_smg(
         # before spawn_engine.
         engine_args, rl_control_url = _add_rl_control_port(engine_args)
 
-        # Wire the engine metrics port (only with --enable-metrics).
+        # Wire the engine metrics port when Prometheus reporting is enabled.
         engine_args, metrics_url = _add_metrics_port(engine_args)
 
         engine = await spawn_engine(engine_args, host="127.0.0.1", port=engine_port)

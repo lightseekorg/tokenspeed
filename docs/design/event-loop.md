@@ -354,6 +354,20 @@ The same reasoning fixes the metrics call: the loop records scheduler
 iteration metrics once per round, from the same pre-dispatch snapshot as the
 scheduler stats.
 
+Metric reporters share those collection points. Raw metric outputs, including
+JSONL and installed plugins, only freeze scalar observations and queue them on
+the producer thread; serialization, IPC, disk writes and file rotation run on
+background threads. Plugin discovery and creation happen outside the loop.
+A node-local writer is owned by the launcher and closes after producer sinks.
+Its event channel is separate from load snapshots: counter increments and
+histogram observations cannot be conflated. The metric adapter suppresses
+unchanged gauge assignments before constructing events or distributing them,
+while retaining
+value changes and refreshing snapshots on subsequent assignments as described in
+[raw metrics](../raw-metrics.md). This policy belongs to the reporter, not the
+scheduler loop or the writer. See [metric output plugins](../metrics-plugins.md)
+for registration and output lifecycle contracts.
+
 Per-request metrics anchor to request lifecycle points instead of the round
 snapshot. `tokenspeed:request_queue_time_seconds` stamps each request's
 waiting-queue entry at `_submit_scheduler_requests` — the single funnel

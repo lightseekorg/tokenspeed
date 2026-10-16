@@ -276,6 +276,7 @@ def test_run_event_loop_reports_exit_and_finally_closes(
         device="cpu",
         base_gpu_id=0,
         disaggregation_mode="decode",
+        enable_metrics=False,
         max_num_seqs=8,
         chunked_prefill_size=128,
     )

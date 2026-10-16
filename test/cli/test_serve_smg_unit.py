@@ -915,6 +915,8 @@ async def test_run_smg_wires_metrics_port_into_engine_spawn(capsys):
         side_effect=probe_then_schedule_release,
     ), patch(
         "tokenspeed.cli.serve_smg.terminate_then_kill", AsyncMock()
+    ), patch(
+        "tokenspeed.cli.serve_smg._start_control_server", AsyncMock(return_value=True)
     ):
         rc = await run_smg(
             engine_args=["--model", "/tmp/x", "--enable-metrics"],
@@ -934,8 +936,18 @@ async def test_run_smg_wires_metrics_port_into_engine_spawn(capsys):
 
 
 @pytest.mark.asyncio
-async def test_run_smg_without_metrics_leaves_engine_args_untouched(capsys):
-    """No --enable-metrics: no --metrics-port injection, no metrics output."""
+@pytest.mark.parametrize(
+    "metric_args",
+    [
+        [],
+        ["--enable-metrics", "--metrics-reporters", "jsonl"],
+        ["--enable-metrics", "--metrics-reporters", "external_jsonl"],
+    ],
+)
+async def test_run_smg_without_prometheus_omits_engine_metrics_port(
+    capsys, metric_args
+):
+    """No Prometheus reporter: no metrics port injection or scrape URL output."""
     engine = _make_proc(returncode=0)
     gateway = _make_proc(returncode=0)
 
@@ -961,9 +973,11 @@ async def test_run_smg_without_metrics_leaves_engine_args_untouched(capsys):
         side_effect=probe_then_schedule_release,
     ), patch(
         "tokenspeed.cli.serve_smg.terminate_then_kill", AsyncMock()
+    ), patch(
+        "tokenspeed.cli.serve_smg._start_control_server", AsyncMock(return_value=True)
     ):
         rc = await run_smg(
-            engine_args=["--model", "/tmp/x"],
+            engine_args=["--model", "/tmp/x", *metric_args],
             gateway_args=["--model", "/tmp/x"],
             opts=opts,
             user_host="127.0.0.1",
@@ -1255,6 +1269,57 @@ def test_add_metrics_port_noop_without_enable_metrics():
     args, url = _add_metrics_port(["--model", "/tmp/x"])
     assert args == ["--model", "/tmp/x"]
     assert url is None
+
+
+@pytest.mark.parametrize(
+    "reporter_args",
+    [
+        ["--metrics-reporters", "jsonl"],
+        ["--metrics-reporters=jsonl"],
+        ["--metrics-reporters", "jsonl", "--metrics-reporters=jsonl"],
+        ["--metrics-reporters=jsonl", "--metrics-port", "5006"],
+        ["--metrics-reporters", "external_jsonl"],
+        ["--metrics-reporters=external_jsonl", "--metrics-port", "5006"],
+    ],
+)
+def test_add_metrics_port_noop_for_raw_outputs_only(monkeypatch, reporter_args):
+    def unexpected_allocation():
+        pytest.fail("Raw-only reporting must not allocate a Prometheus port")
+
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._free_port_avoiding_ephemeral_range",
+        unexpected_allocation,
+    )
+    engine_args = ["--enable-metrics", *reporter_args]
+
+    args, url = _add_metrics_port(engine_args)
+
+    assert args == engine_args
+    assert url is None
+
+
+@pytest.mark.parametrize(
+    "reporter_args",
+    [
+        ["--metrics-reporters", "prometheus"],
+        ["--metrics-reporters=prometheus"],
+        ["--metrics-reporters", "prometheus", "--metrics-reporters", "jsonl"],
+        ["--metrics-reporters", "jsonl", "--metrics-reporters", "prometheus"],
+        ["--metrics-reporters=prometheus", "--metrics-reporters=jsonl"],
+        ["--metrics-reporters=jsonl", "--metrics-reporters", "prometheus"],
+        ["--metrics-reporters=external_jsonl", "--metrics-reporters", "prometheus"],
+    ],
+)
+def test_add_metrics_port_with_prometheus_reporter(monkeypatch, reporter_args):
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._free_port_avoiding_ephemeral_range", lambda: 40124
+    )
+    engine_args = ["--enable-metrics", *reporter_args]
+
+    args, url = _add_metrics_port(engine_args)
+
+    assert args == [*engine_args, "--metrics-port", "40124"]
+    assert url == "http://127.0.0.1:40124/metrics"
 
 
 def test_add_metrics_port_allocates_when_absent(monkeypatch):
