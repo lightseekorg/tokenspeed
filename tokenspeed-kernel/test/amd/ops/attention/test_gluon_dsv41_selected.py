@@ -199,15 +199,26 @@ def _padded_query(tokens, real_heads, heads, device, seed):
 
 @pytest.mark.parametrize(
     ("tokens", "real_heads", "heads"),
-    [(6, 16, 64), (6, 64, 64), (192, 16, 64), (192, 64, 64), (6, 16, 128)],
+    [
+        (6, 16, 64),
+        (6, 64, 64),
+        (24, 16, 64),
+        (48, 16, 64),
+        (192, 16, 64),
+        (192, 64, 64),
+        (6, 16, 128),
+    ],
 )
 def test_fused_selected_attention_decode_shapes(tokens, real_heads, heads):
-    """Split (6 rows) and single-workgroup (192 rows) paths at decode widths.
+    """Split (6, 24, 48 rows) and single-workgroup (192 rows) decode paths.
+
+    On gfx1250 the 6/24/48-row cases launch one, two and four 16-head groups
+    per workgroup, and 192 rows launch four groups without a split.
 
     Padded zero-query heads take the row-sum shortcut and must still match the
-    softmax over their (all-zero) scores. 128 heads span two head blocks, so
-    the split reduce maps active groups per block and both blocks write the
-    shared row sum.
+    softmax over their (all-zero) scores. 128 heads span several head blocks,
+    so the split reduce maps active groups per block and every block writes
+    the shared row sum.
     """
     platform = current_platform()
     if not (platform.is_cdna4 or platform.is_cdna5):
@@ -236,11 +247,31 @@ def test_fused_selected_attention_decode_shapes(tokens, real_heads, heads):
     torch.testing.assert_close(out, expected, rtol=0.008, atol=0.004)
 
 
-def test_fused_selected_attention_gfx950_no_recompile_across_rows():
-    """Row count changes the grid and split count, never a compile key."""
-    if not current_platform().is_cdna4:
-        pytest.skip("gfx950 kernel")
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import selected
+def test_fused_selected_attention_no_recompile_across_rows():
+    """Row count changes the grid and split count without recompiling.
+
+    On gfx1250 it also picks one of three head-group widths, all compiled by
+    the warmup rows.
+    """
+    platform = current_platform()
+    if platform.is_cdna4:
+        from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import selected
+
+        launch = selected.launch_gluon_dsv41_selected_attention_gfx950
+        kernels = (
+            selected.gluon_dsv41_selected_attention_gfx950,
+            selected.gluon_dsv41_selected_attention_reduce_gfx950,
+        )
+    elif platform.is_cdna5:
+        from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41 import selected
+
+        launch = selected.launch_gluon_dsv41_selected_attention_gfx1250
+        kernels = (
+            selected.gluon_dsv41_selected_attention_gfx1250,
+            selected.gluon_dsv41_selected_attention_reduce_gfx1250,
+        )
+    else:
+        pytest.skip("AMD fused selected attention")
 
     device = torch.device("cuda:0")
     segments = _decode_inputs(192, device, 3)
@@ -248,7 +279,7 @@ def test_fused_selected_attention_gfx950_no_recompile_across_rows():
     q, sink = _padded_query(192, 16, 64, device, 5)
 
     def run(tokens):
-        selected.launch_gluon_dsv41_selected_attention_gfx950(
+        launch(
             q[:tokens],
             swa,
             swa_slots[:tokens],
@@ -265,12 +296,9 @@ def test_fused_selected_attention_gfx950_no_recompile_across_rows():
             None,
         )
 
-    for tokens in (1, 192):
+    for tokens in (1, 24, 96, 192):
         run(tokens)
-    with assert_no_triton_compile(
-        selected.gluon_dsv41_selected_attention_gfx950,
-        selected.gluon_dsv41_selected_attention_reduce_gfx950,
-    ):
-        for tokens in (2, 5, 33, 96, 150, 191):
+    with assert_no_triton_compile(*kernels):
+        for tokens in (2, 5, 16, 17, 32, 33, 64, 150, 191):
             run(tokens)
     torch.cuda.synchronize()

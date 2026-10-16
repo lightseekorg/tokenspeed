@@ -129,14 +129,14 @@ def _serving_case(
     return q, kv, indices.to(torch.int32).contiguous(), lens, sink
 
 
-@pytest.mark.skipif(not is_cdna4(), reason="gfx950 dsv4_prefill")
+@pytest.mark.skipif(
+    not (is_cdna4() or is_cdna5()), reason="AMD dense dsv4_prefill gluon"
+)
 @pytest.mark.parametrize(
     "tokens, start, ratio",
     [(70, 0, 2), (64, 4000, 2), (37, 100, 0), (128, 7872, 1)],
 )
-def test_gluon_dsv4_prefill_gfx950_serving_layout(
-    tokens: int, start: int, ratio: int
-) -> None:
+def test_gluon_dsv4_prefill_serving_layout(tokens: int, start: int, ratio: int) -> None:
     q, kv, indices, lens, sink = _serving_case(tokens, start, ratio, 16, seed=3)
     scale = 512**-0.5
     actual = dsv4.dsv4_prefill(q, kv, indices, lens, sink, scale)
@@ -144,9 +144,11 @@ def test_gluon_dsv4_prefill_gfx950_serving_layout(
     torch.testing.assert_close(actual, expected, atol=4e-3, rtol=1e-2)
 
 
-@pytest.mark.skipif(not is_cdna4(), reason="gfx950 dsv4_prefill")
+@pytest.mark.skipif(
+    not (is_cdna4() or is_cdna5()), reason="AMD dense dsv4_prefill gluon"
+)
 @pytest.mark.parametrize("width", [384, 512, 768, 1024, 1152])
-def test_gluon_dsv4_prefill_gfx950_registered_widths(width: int) -> None:
+def test_gluon_dsv4_prefill_registered_widths(width: int) -> None:
     torch.manual_seed(5)
     device = torch.device("cuda:0")
     tokens, heads, kv_rows = 6, 16, width + 40
@@ -166,16 +168,23 @@ def test_gluon_dsv4_prefill_gfx950_registered_widths(width: int) -> None:
     torch.testing.assert_close(actual, expected, atol=4e-3, rtol=1e-2)
 
 
-@pytest.mark.skipif(not is_cdna4(), reason="gfx950 dsv4_prefill")
-def test_gluon_dsv4_prefill_gfx950_does_not_recompile() -> None:
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.prefill import (
-        gluon_dsv4_prefill_gfx950,
-    )
+@pytest.mark.skipif(
+    not (is_cdna4() or is_cdna5()), reason="AMD dense dsv4_prefill gluon"
+)
+def test_gluon_dsv4_prefill_does_not_recompile() -> None:
+    if is_cdna4():
+        from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.prefill import (
+            gluon_dsv4_prefill_gfx950 as kernel,
+        )
+    else:
+        from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4.prefill import (
+            gluon_dsv4_prefill_gfx1250 as kernel,
+        )
 
     scale = 512**-0.5
     # Token counts, kv rows, and lengths vary per batch; none may specialize.
     dsv4.dsv4_prefill(*_serving_case(17, 33, 2, 16, seed=0), scale)
-    with assert_no_triton_compile(gluon_dsv4_prefill_gfx950):
+    with assert_no_triton_compile(kernel):
         for tokens, start in ((1, 0), (16, 64), (32, 160), (129, 7000), (641, 3)):
             q, kv, indices, lens, sink = _serving_case(tokens, start, 2, 16, seed=1)
             lens[::3] = 17

@@ -29,7 +29,10 @@ from utils import assert_no_triton_compile, is_cdna5
 if not is_cdna5():
     pytest.skip("AMD CDNA5 is required", allow_module_level=True)
 
-from tokenspeed_kernel.ops.residual.gluon import gluon_mhc_mixes_gfx1250  # noqa: E402
+from tokenspeed_kernel.ops.residual.gluon import (  # noqa: E402
+    gluon_mhc_mixes_gfx1250,
+    gluon_mhc_pre_gfx1250,
+)
 from tokenspeed_kernel.ops.residual.triton import (  # noqa: E402
     compute_mhc_num_splits,
 )
@@ -40,6 +43,7 @@ from tokenspeed_kernel.signature import (  # noqa: E402
 )
 from tokenspeed_kernel_amd.ops.gfx1250.mhc import (  # noqa: E402
     gluon_mhc_mixes_project_gfx1250,
+    gluon_mhc_mixes_reduce_gfx1250,
     launch_gluon_mhc_mixes_project_gfx1250,
     use_gluon_mhc_mixes_project_gfx1250,
 )
@@ -140,6 +144,38 @@ def test_mhc_mixes_selects_gfx1250_kernel() -> None:
     assert kernel.name == "gluon_mhc_mixes_gfx1250"
 
 
+@pytest.mark.parametrize("tokens", [1, 96, 2048])
+def test_mhc_pre_matches_reference(tokens: int) -> None:
+    residual, weight, scale, base = _operands(tokens, 4096, seed=tokens)
+    layer_input, post, comb = gluon_mhc_pre_gfx1250(
+        residual, weight, scale, base, _RMS_EPS, _HC_EPS, _SINKHORN_ITERS, None, None
+    )
+    pre, post_ref, comb_ref = _reference(residual, weight, scale, base)
+    torch.testing.assert_close(post.squeeze(-1).double(), post_ref, atol=1e-4, rtol=0)
+    torch.testing.assert_close(comb.double(), comb_ref, atol=1e-4, rtol=0)
+    torch.testing.assert_close(
+        layer_input.double(),
+        (pre[:, :, None] * residual.double()).sum(1),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+def test_mhc_pre_selects_gfx1250_kernel() -> None:
+    kernel = select_kernel(
+        "residual",
+        "mhc_pre",
+        format_signature(
+            residual=dense_tensor_format(torch.bfloat16),
+            fn=dense_tensor_format(torch.float32),
+            hc_scale=dense_tensor_format(torch.float32),
+            hc_base=dense_tensor_format(torch.float32),
+        ),
+        traits={"num_tokens": 8, "hc_mult": 4, "hidden_size": 4096},
+    )
+    assert kernel.name == "gluon_mhc_pre_gfx1250"
+
+
 def test_mhc_mixes_cuda_graph_replay() -> None:
     tokens = 32
     residual, weight, scale, base = _operands(tokens, 5120, seed=5)
@@ -158,9 +194,13 @@ def test_projection_varying_tokens_reuse_compiled_kernels() -> None:
     def run(tokens: int) -> None:
         _run(_operands(tokens, 5120, seed=tokens)[0], weight, scale, base)
 
-    # Warm both tile widths: 64-wide K tiles at 64 or more splits, 128-wide below.
-    for tokens in (1, 2048):
+    # Warm both tile widths (64-wide K tiles at 64 or more splits, 128-wide
+    # below) and the three reduction layouts (splits in registers, also over
+    # lanes beyond 256 tokens, and also over waves at or below).
+    for tokens in (1, 848, 8192):
         run(tokens)
-    with assert_no_triton_compile(gluon_mhc_mixes_project_gfx1250):
-        for tokens in (6, 192, 848, 8192):
+    with assert_no_triton_compile(
+        gluon_mhc_mixes_project_gfx1250, gluon_mhc_mixes_reduce_gfx1250
+    ):
+        for tokens in (6, 192, 600, 2048, 4097):
             run(tokens)

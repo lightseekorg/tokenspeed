@@ -1,4 +1,22 @@
 # Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 from __future__ import annotations
 
@@ -6,15 +24,20 @@ from itertools import accumulate
 
 import pytest
 import torch
-from utils import is_cdna4
+from utils import is_cdna4, is_cdna5
 
-if not is_cdna4():
-    pytest.skip("AMD CDNA4 is required for Gluon KDA tests", allow_module_level=True)
-
-
-from tokenspeed_kernel_amd.ops.gfx950.attention.kda.prefill import (  # noqa: E402
-    launch_gluon_kda_paged_prefill_gfx950,
-)
+if is_cdna4():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.prefill import (
+        launch_gluon_kda_paged_prefill_gfx950 as launch_kda_prefill,
+    )
+elif is_cdna5():
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.prefill import (
+        launch_gluon_kda_paged_prefill_gfx1250 as launch_kda_prefill,
+    )
+else:
+    pytest.skip(
+        "AMD CDNA4 or CDNA5 is required for Gluon KDA tests", allow_module_level=True
+    )
 
 
 def _reference_sequence(
@@ -42,8 +65,8 @@ def _reference_sequence(
     beta = beta_logits.float().sigmoid()
 
     outputs = []
-    # V-major: state is [heads, V, K] (value-major), matching gfx950's
-    # physical recurrent-state pool layout.
+    # V-major: state is [heads, V, K] (value-major), matching the physical
+    # recurrent-state pool layout.
     state = state.float().clone()
     for token in range(q.shape[0]):
         state *= gate[token].exp()[:, None, :]
@@ -98,7 +121,7 @@ def test_kda_prefill_matches_packed_recurrent_reference(
         expected_outputs.append(output)
         expected_states.append(state)
 
-    actual_output, actual_state = launch_gluon_kda_paged_prefill_gfx950(
+    actual_output, actual_state = launch_kda_prefill(
         q,
         k,
         v,

@@ -627,13 +627,12 @@ preparation, validation and tiling, and runs two steps per query tile: a
 scorer writes one row of FP32 logits per query, one per candidate column, and
 a selector turns each row into that query's sorted list of logical KV row ids.
 gfx950 runs both steps in Gluon (`gluon_dsv41_index_topk_gfx950`, then
-`gluon_dsv41_index_topk_select_gfx950`) and selects candidate blocks with the
-portable Triton radix select (`tokenspeed_kernel` `index_block_select`);
-gfx1250 has a Gluon scorer and, for query tiles of 128 rows and up, a Triton
-radix selector
-(`triton_dsv41_index_topk_select_gfx1250`); smaller tiles use the portable
-torch selector. Both scorers take queries packed as MXFP4 values with one E8M0
-scale per 32 values.
+`gluon_dsv41_index_topk_select_gfx950`), and gfx1250 does the same
+(`gluon_dsv41_index_topk_gfx1250`, then
+`gluon_dsv41_index_topk_select_gfx1250`). Both select candidate blocks with
+the portable Triton radix select (`tokenspeed_kernel` `index_block_select`),
+and both scorers take queries packed as MXFP4 values with one E8M0 scale per
+32 values.
 
 #### Contract
 
@@ -647,8 +646,9 @@ scale per 32 values.
   without a candidate, or on a missing or out-of-range page stay `-inf`.
 - Row selection writes the logical ids of the `min(topk, width)` largest
   finite logits in ascending order, then -1, plus their count (the
-  `select_rows_torch` contract). The gfx950 selector and the gfx1250 radix
-  selector keep the lowest columns among equal-score boundary ties.
+  `select_rows_torch` contract). The Gluon selectors keep the lowest columns
+  among equal-score boundary ties; the gfx1250 selector also ties `-0.0` with
+  `+0.0`.
 - Optional block selection keeps the best 8-row blocks by their maximum logit.
   A valid newest visible block remains eligible regardless of its score.
 - Selection scores the configured page-table or candidate capacity without
@@ -686,18 +686,14 @@ ascending without candidates and with ascending candidate lists; otherwise an
 all-pairs rank sorts them. LDS atomics cost about one wave instruction per 64
 lanes regardless of conflicts, so the radix passes dominate on wide rows.
 
-The gfx1250 radix selector runs one program per row. Four 8-bit histogram
-passes find the K-th largest value, and a final pass writes the selected
-values and columns in ascending column order, taking ties at the threshold in
-column order. The adapter then maps the columns to logical rows and sorts them
-in torch. Tiles below 128 rows, including decode, use the torch selector.
+The gfx1250 selector runs the same passes on sixteen 32-lane waves, so each
+workgroup keeps 512 lanes and the 2048-bin histograms.
 
 Block selection takes the maximum logit of each 8-row block, forces the
 newest visible block to `+inf`, and keeps the top blocks in ascending order.
-On gfx950 the portable Triton block select runs one program per query: it
-reads only the visible blocks, runs a four-pass MSD radix select (8 key bits
-per pass), and emits the picks in block order, so no sort is needed. gfx1250
-uses torch.
+The portable Triton block select runs one program per query: it reads only
+the visible blocks, runs a four-pass MSD radix select (8 key bits per pass),
+and emits the picks in block order, so no sort is needed.
 
 ### gfx950 DeepSeek V4.1 selected attention
 
@@ -740,6 +736,23 @@ the row sum and count). `gluon_dsv41_selected_attention_reduce_gfx950` merges
 them in a fixed order and adds the sink once; each of its workgroups owns one
 token, 16 heads and a 64-dim slice, so the merge of a small batch still spreads
 over many CUs.
+
+### gfx1250 DeepSeek V4.1 selected attention
+
+`gluon_dsv41_selected_attention_gfx1250` and its reduce kernel follow the
+gfx950 contract, split and zero-query shortcut above. QK and PV use 16x16x32
+BF16 WMMA. Rows are dequantized with the CDNA5 `scaled_upcast` at a unit
+scale and then multiplied by the block scale: the E8M0 SWA scale as an exact
+BF16 power of two, the E4M3 global scale as BF16. Rows are not prefetched,
+and V is read from LDS only after QK: the registers this saves buy more
+workgroups per CU than the overlap would.
+
+The launch differs from gfx950 in two ways. Small batches give each
+workgroup one or two 16-head groups instead of four while rows x head blocks
+x tiles stays within 640. That re-reads each selected row once per head
+block in exchange for more parallel workgroups, so the token count picks one
+of three compiled head-group widths. A split also covers at least two tiles,
+so SWA-only calls, which have two tiles, never split.
 
 ### gfx950 QSA sparse attention
 
@@ -1174,7 +1187,7 @@ Input, weight, and output shapes and dtypes are the gfx950 entry's. Two
 things differ:
 
 - Automatic dispatch selects the decode kernel for 1 to 32 tokens and the
-  prefill kernel from 1536; the range between them retains the Triton kernel.
+  prefill kernel from 1025; the range between them retains the Triton kernel.
 - The packed tensor passed alongside the three weights must be their
   consecutive view. The kernels read only it, so the launchers reject a
   packed tensor the weights do not live inside.
@@ -1659,9 +1672,11 @@ four branches across waves, so the gate tensor never reaches memory.
 ### gfx1250 mHC mixes projection
 
 `gluon_mhc_mixes_gfx1250` computes the hc=4 prenorm mixing coefficients for
-BF16 residual streams. It shares split selection, normalization, and the
-Sinkhorn iterations with `triton_mhc_mixes`, and replaces only the projection
-`x @ fn.T` with its row sums of squares.
+BF16 residual streams. It shares split selection with `triton_mhc_mixes` and
+replaces both of its kernels: the projection `x @ fn.T` with its row sums of
+squares, and the reduction that runs normalization and the Sinkhorn
+iterations. `gluon_mhc_pre_gfx1250` runs the same two kernels for `mhc_pre`
+at every token count, then collapses the streams with the portable kernel.
 
 #### Contract
 
@@ -1680,6 +1695,10 @@ give the FP32 projection up to accumulation order. Each program covers 64 rows
 and one K partition, pipelines K tiles through three or four TDM buffers, and
 pads the 24 mixes to two 16-wide WMMA tiles. The token count and tiles per
 partition are runtime arguments.
+
+The reduction is the gfx950 kernel on 32-lane waves: sixteen lanes own a
+token's 4x4 matrix, so a wave covers two tokens when the splits stay in
+registers and one when they also spread over lanes.
 
 ## Quantization
 
