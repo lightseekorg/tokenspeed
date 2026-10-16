@@ -63,6 +63,7 @@ from tokenspeed_kernel.ops.attention.prologue import (
     mla_prologue,
     qk_norm_rope,
 )
+from tokenspeed_kernel.ops.attention.prologue.triton import _gqa_prologue_kernel
 from tokenspeed_kernel.ops.embedding import apply_rope, apply_rope_mla
 from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
@@ -72,9 +73,11 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 from tokenspeed_kernel.ops.layernorm import qk_rmsnorm
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from utils import assert_no_triton_compile
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -816,6 +819,73 @@ def test_a_single_kv_head_cache_may_carry_any_head_stride():
         caches.append((k_cache, v_cache))
     for a, b in zip(*caches):
         assert bytes_equal(a, b)
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna4,
+    reason="the Triton solution's no-copy prepared store exists only on CDNA4",
+)
+@pytest.mark.parametrize(
+    "dtype,cache_dtype,return_kv",
+    [(BF16, BF16, False), (torch.float16, BF16, True), (BF16, FP8, False)],
+)
+def test_prepared_gqa_reuses_rows_and_replays_the_cache_write(
+    dtype, cache_dtype, return_kv
+):
+    """A prepared receiver's rows survive the store; replay refreshes KV and slots."""
+
+    tokens, hq, hkv, dim, total = 2051, 32, 4, 64, 8192
+    packed = torch.randn(tokens, (hq + 2 * hkv) * dim, dtype=dtype, device="cuda")
+    q, k, v = split(packed, hq, hkv, dim)
+    k_cache, v_cache = (
+        torch.zeros(total, hkv + 1, dim, dtype=cache_dtype, device="cuda")[:, :hkv]
+        for _ in range(2)
+    )
+    loc = torch.arange(1, 2 * (tokens - 2) + 1, 2, device="cuda")
+    cache = HeadKVCache(k_cache, v_cache, None, loc)
+
+    def run(rows=tokens, target=cache):
+        return gqa_prologue(
+            q[:rows],
+            k[:rows],
+            v[:rows],
+            norm=None,
+            rotary=None,
+            cache=target,
+            return_kv=return_kv,
+            solution="triton",
+            override=None,
+        )
+
+    out = run()
+    assert out.q.data_ptr() == q.data_ptr()
+    assert bytes_equal(out.q, q)
+    if return_kv:
+        assert out.k.data_ptr() == k.data_ptr()
+        assert out.v.data_ptr() == v.data_ptr()
+    else:
+        assert out.k is None and out.v is None
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run()
+    packed.mul_(0.5)
+    loc.add_(1)
+    k_cache.zero_()
+    v_cache.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    expected_k, expected_v = torch.zeros_like(k_cache), torch.zeros_like(v_cache)
+    expected_k[loc] = k[: loc.numel()].view(-1, hkv, dim).to(cache_dtype)
+    expected_v[loc] = v[: loc.numel()].view(-1, hkv, dim).to(cache_dtype)
+    assert bytes_equal(k_cache, expected_k)
+    assert bytes_equal(v_cache, expected_v)
+    assert bytes_equal(out.q, q)
+    if return_kv:
+        assert bytes_equal(out.k, k) and bytes_equal(out.v, v)
+
+    with assert_no_triton_compile(_gqa_prologue_kernel):
+        run(2039, HeadKVCache(k_cache, v_cache, None, loc[:2037]))
 
 
 def test_composite_reads_kv_rows_past_int32_offsets():

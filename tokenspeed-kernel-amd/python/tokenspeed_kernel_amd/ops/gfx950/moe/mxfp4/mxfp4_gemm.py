@@ -872,7 +872,8 @@ def launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
             hidden,
             x.dtype,
             cfg.block_m,
-            compact_route_programs=False,
+            use_minimum_route_chunks=False,
+            runtime_rows=False,
             out=out,
         )
         padded_rows = int(sorted_ids.shape[0])

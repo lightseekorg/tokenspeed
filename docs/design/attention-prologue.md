@@ -35,6 +35,10 @@ Typed holders carry each optional step: `HeadNorm`, `Rotary` (with `MRope`),
 In the runtime, a layer states its steps once: `PagedAttention(...,
 rotary_emb=..., qk_norm=...)`, with `None` for a step the layer skips.
 `PagedAttention.forward` runs a GQA layer's prologue before core attention.
+When a projection or collective has already applied the same head-step numerics,
+`PagedAttention.store_prepared` uses `gqa_prologue` with no norm or rotary step.
+The prologue still owns slot selection and KV conversion/writes; the returned
+query/key rows need no additional copy in the Triton solution.
 Flows that dispatch core attention themselves call `PagedAttention.prologue`
 (GQA) or `PagedAttention.latent_prologue` (MLA). Passing `k = v = None` means
 that `prologue`/`latent_prologue` call has prepared the inputs and written

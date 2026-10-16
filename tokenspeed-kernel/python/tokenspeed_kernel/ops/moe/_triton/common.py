@@ -30,6 +30,7 @@ def _routing_kernel(
     expert_route_ids_ptr,
     expert_counts_ptr,
     num_routes,
+    expert_start,
     BLOCK_ROUTES: tl.constexpr,
 ):
     expert_id = tl.program_id(0)
@@ -39,7 +40,7 @@ def _routing_kernel(
         route_ids = block_id * BLOCK_ROUTES + tl.arange(0, BLOCK_ROUTES)
         route_mask = route_ids < num_routes
         selected_experts = tl.load(topk_ids_ptr + route_ids, mask=route_mask, other=-1)
-        matches = route_mask & (selected_experts == expert_id)
+        matches = route_mask & (selected_experts == expert_start + expert_id)
         local_rank = tl.cumsum(matches.to(tl.int32), axis=0) - 1
         tl.store(
             expert_route_ids_ptr + expert_id * num_routes + count + local_rank,
@@ -51,8 +52,9 @@ def _routing_kernel(
 
 
 def _routing(
-    topk_ids: torch.Tensor, num_experts: int
+    topk_ids: torch.Tensor, num_experts: int, expert_start: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Group route ids by the local experts ``expert_start + [0, num_experts)``."""
     topk_ids = topk_ids.to(torch.int32).contiguous()
     num_routes = topk_ids.numel()
     expert_route_ids = torch.empty(
@@ -65,6 +67,7 @@ def _routing(
         expert_route_ids,
         expert_counts,
         num_routes,
+        expert_start,
         BLOCK_ROUTES=block_routes,
         num_warps=4,
     )
@@ -142,7 +145,8 @@ def _prepare_routed_output(
     topk_ids: torch.Tensor,
     num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    expert_route_ids, expert_counts = _routing(topk_ids, num_experts)
+    # Callers reject expert parallelism in _validate_launch, so experts start at 0.
+    expert_route_ids, expert_counts = _routing(topk_ids, num_experts, 0)
     # Invalid expert ids are absent from routing; zero their canonical rows.
     route_output = torch.zeros(
         (topk_ids.numel(), x.shape[1]), device=x.device, dtype=x.dtype

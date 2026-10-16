@@ -6,6 +6,102 @@ set only the parameters that change runtime behavior.
 The commands below are templates. Validate exact model IDs, checkpoint formats,
 and backend choices against the build you deploy.
 
+## Muse Spark Open
+
+[Muse Spark Open](https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B)
+runs on the shared model path: vendor-neutral Triton kernels
+with capability-gated NVIDIA fast paths that keep the same numerics. The
+checkpoint must expose the model type `muse_spark` and the architecture
+`MuseSparkForConditionalGeneration`; the runtime reads the sliding-attention
+and no-RoPE schedule from that configuration. Expert parallelism spans the
+attention TP ranks with MoE TP1. The gateway loads the checkpoint's
+`chat_template.jinja`; pass `--chat-template` only to override it. The
+residual stream, the layer boundaries and the final norm run in FP32; the
+attention and MoE branch outputs and the final-norm output are BF16.
+
+`ts serve` selects the `muse` reasoning and tool parsers: the `self` channel
+becomes `reasoning_content`, `user` and `commentary` stay visible, `<|eom|>`
+closes a channel and `<|eot|>` closes the turn. Explicit parser flags override
+these defaults. Sample with the checkpoint's `generation_config.json` defaults
+(`temperature=1.0`, `top_p=1.0`, `top_k=64`); greedy decoding is loop-prone
+for this checkpoint. The checkpoint's
+`chat_template.jinja` renders `reasoning_effort` (`minimal`, `low`, `medium`,
+`high`, `xhigh`) as a reasoning-strength line and defaults to `medium`; the
+OpenAI field and `chat_template_kwargs.reasoning_effort` both reach it.
+`chat_template_kwargs.force_nonempty_content=true` promotes an unterminated
+`self` channel to visible content.
+
+Images and video use the chat template's `<image>` and `<video>` anchors and
+the checkpoint's vision tower. Audio uses the `<audio>` anchor: one `<|audio|>`
+token per 1,920 samples of mono 24 kHz, encoded by the checkpoint's audio
+tower. SMG performs the preprocessing and anchor expansion.
+
+### MI350X BF16
+
+The BF16 model and vision tower run on eight GPUs with attention TP8, vision
+TP8, and expert parallelism over all eight ranks:
+
+```bash
+ts serve \
+    --model meta-models/Muse-Spark-Open-816B-A42B \
+    --served-model-name muse-spark \
+    --tp 8 \
+    --ep-size 8 \
+    --dtype bfloat16 \
+    --max-model-len 65536 \
+    --max-num-seqs 16 \
+    --max-total-tokens 524288 \
+    --gpu-memory-utilization 0.92 \
+    --cudagraph-capture-sizes 1 2 4 8 16 \
+    --max-cudagraph-capture-size 16 \
+    --disable-prefill-graph \
+    --disable-overlap-schedule \
+    --sampling-backend triton \
+    --disable-kvstore \
+    --kvstore-ratio 0.0 \
+    --host 127.0.0.1 \
+    --port 8000
+```
+
+Prefill stays eager and overlap scheduling is off.
+
+### Blackwell NVFP4
+
+The NVFP4 checkpoint quantizes the experts of all but the first and last
+layers and keeps everything else in BF16. On a four-GPU B300 node the decode
+path pairs TRT-LLM attention with the TRT-LLM FP4 MoE kernels:
+
+```bash
+ts serve \
+    --model meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+    --served-model-name muse-spark \
+    --tp 4 \
+    --ep-size 4 \
+    --attention-backend trtllm \
+    --moe-backend flashinfer_trtllm \
+    --dtype bfloat16 \
+    --max-model-len 65536 \
+    --max-num-seqs 8 \
+    --cudagraph-capture-sizes 1 2 4 8 \
+    --max-cudagraph-capture-size 8 \
+    --sampling-backend flashinfer
+```
+
+Overlap scheduling and the prefill graph stay on: the graph serves text and
+multimodal prefills up to its largest bucket, where it cuts short-prompt
+time-to-first-token by several times. Decode is weight-stream bound, so the layer
+fuses its norms, residual gate, expert-input quantization, and the sharded
+pre-expert and post-expert projection gathers into few launches, all under programmatic
+dependent launch; at decode batch sizes the top-k kernel also writes the
+expert GEMMs' routing metadata, so the experts launch without a routing
+kernel of their own.
+
+Expert inputs are scaled by the checkpoint's calibrated static input scales,
+folded into the MoE kernel's dequantization scalars.
+
+`--kv-cache-dtype fp8_e4m3` halves the KV cache on the same decode path; the
+RoPE kernel writes K/V in FP8 directly.
+
 ## Inkling
 
 Blog: https://lightseek.org/blog/tokenspeed-inkling.html

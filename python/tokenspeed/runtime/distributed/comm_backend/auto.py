@@ -306,6 +306,26 @@ class AutoBackend(CommBackend):
 
     # ---- Public CommBackend interface ----
 
+    def get_prepared_all_gather(self, group: Group, dtype: torch.dtype):
+        if (
+            not current_platform().is_cdna4
+            or len(group) != 4
+            or self._force_deterministic_rsag()
+            or self._group_spans_nodes(group)
+            or self._trtllm_ar.has_trtllm_ar(group)
+        ):
+            return None
+        return self._iris.get_prepared_all_gather(group, dtype)
+
+    def broadcast_from_first_rank(self, tensor: torch.Tensor, group: Group) -> bool:
+        if (
+            not current_platform().is_cdna4
+            or len(group) != 4
+            or self._group_spans_nodes(group)
+        ):
+            return False
+        return self._iris.broadcast_from_first_rank(tensor, group)
+
     def all_reduce(
         self,
         tensor: torch.Tensor | tuple[torch.Tensor, ...],
@@ -477,6 +497,12 @@ class AutoBackend(CommBackend):
             and tensor.dim() == 2
             and dim in (-1, tensor.dim() - 1)
         ):
+            if (
+                current_platform().is_cdna4
+                and not self._group_spans_nodes(group)
+                and not self._trtllm_ar.has_trtllm_ar(group)
+            ):
+                return self._iris.all_gather(tensor, group, dim)
             # Small rows ride the all-reduce workspace's barrier-free exchange.
             gathered = self._trtllm_ar.lamport_all_gather(tensor, group)
             if gathered is not None:

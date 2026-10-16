@@ -65,6 +65,9 @@ _GFX950_CAPABILITY = CapabilityRequirement(
 
 
 if platform.is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
+        gluon_rowcta_bf16_gemv_gfx950 as _rowcta_bf16_gemv_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
         launch_gluon_mm_a16w16_prefill_gfx950 as _mm_a16w16_prefill_impl,
     )
@@ -83,7 +86,118 @@ if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         supports_gluon_mm_a16w16_decode_gfx950 as _supports_mm_a16w16_decode,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
+        gluon_fp32_router_gemv_gfx950 as _fp32_router_gemv_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
+        transpose_fp32_router_weight_gfx950 as _transpose_fp32_router_weight,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (
+        launch_gluon_mm_mxfp8_decode_gfx950 as _mm_mxfp8_decode_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (
+        supports_gluon_mm_mxfp8_decode_gfx950 as _supports_mxfp8_decode_problem,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
+        launch_gluon_mm_mxfp8_gfx950 as _mm_mxfp8_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
+        supports_mxfp8_gemm_shape as _supports_mxfp8_gemm_shape,
+    )
 
+    @register_kernel(
+        "gemm",
+        "mv",
+        name="gluon_rowcta_bf16_gemv_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED + 1,
+        traits={
+            "m": frozenset({1}),
+            "n_min": frozenset({128}),
+            "k_min": frozenset({128}),
+        },
+    )
+    def gluon_rowcta_bf16_gemv_gfx950(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Dispatch one-row BF16 GEMV to the gfx950 Gluon implementation."""
+        if out is None:
+            out = torch.empty(
+                (1, weight.shape[0]),
+                dtype=x.dtype,
+                device=x.device,
+            )
+        return _rowcta_bf16_gemv_impl(x, weight, out)
+
+    @register_kernel(
+        "gemm",
+        "prepared_fp32_router_gemv",
+        name="gluon_fp32_router_gemv_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.float32),
+                    weight=dense_tensor_format(torch.float32),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED + 1,
+        weight_preprocessor=_transpose_fp32_router_weight,
+    )
+    def gluon_fp32_router_gemv_gfx950(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        multiplier: float,
+        counters: torch.Tensor,
+        enable_pdl: bool,
+    ) -> torch.Tensor:
+        """Dispatch decode-sized FP32 router GEMV to the gfx950 kernel."""
+        return _fp32_router_gemv_impl(
+            x,
+            weight,
+            multiplier,
+            counters,
+            enable_pdl,
+        )
+
+    try:
+        from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.linear_attnres_partials_gfx950 import (
+            launch_gluon_linear_attnres_partials_gfx950 as _linear_attnres_partials_impl,
+        )
+    except ImportError as exc:
+        # Keep the message only: an exception object carries its traceback,
+        # which pins every frame that was importing at the time.
+        _IMPORT_ERROR_MESSAGE = str(exc)
+        _linear_attnres_partials_impl = None
+    else:
+        _IMPORT_ERROR_MESSAGE = None
+
+    _GFX950_CAPABILITY = CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    )
     _DENSE16_SIGNATURES = frozenset(
         {
             format_signature(

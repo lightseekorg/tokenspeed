@@ -75,6 +75,8 @@ INKLING_TOOL_CALL_PARSER = "inkling"
 INKLING_ATTENTION_BACKEND = "fa4"
 KIMI_K3_REASONING_PARSER = "kimi_k3"
 KIMI_K3_TOOL_CALL_PARSER = "kimi_k3"
+MUSE_SPARK_REASONING_PARSER = "muse"
+MUSE_SPARK_TOOL_CALL_PARSER = "muse"
 DEFAULT_SMG_LOG_LEVEL = "warn"
 GRPC_MAX_MESSAGE_BYTES_ENV = "TOKENSPEED_GRPC_MAX_MESSAGE_BYTES"
 DEFAULT_GRPC_MAX_MESSAGE_BYTES = "536870912"
@@ -91,6 +93,7 @@ _DEFAULT_SMG_DISABLE_FLAGS = (
     "--disable-circuit-breaker",
     "--disable-retries",
     "--disable-load-monitoring",
+    "--disable-health-check",
 )
 
 
@@ -231,10 +234,12 @@ def _operator_policy(gateway_args: list[str]) -> str | None:
 
 
 def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str]:
-    """Append smg reliability and load-monitoring disable switches when absent.
+    """Append smg reliability and background-monitor disable switches when absent.
 
     ``--policy cache_aware`` keeps load monitoring: its imbalance/overload
     triggers feed on the worker load monitor.
+
+    Health checks are off: ``ts serve`` supervises its one engine, and a generating probe stuck behind a saturated batch would strand healthy requests.
 
     NOTE: ``--dp-aware`` is deliberately NOT auto-injected — rank pinning
     needs smg releases with TokenSpeed dp-affinity support; bump the
@@ -516,6 +521,19 @@ def _is_kimi_k3_model(model_id: str | None) -> bool:
     )
 
 
+def _is_muse_spark_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+    normalized = model_id.lower().replace("_", "-").rstrip("/")
+    if "muse-spark" in normalized or "musespark" in normalized.replace("-", ""):
+        return True
+    config = _load_model_config(model_id)
+    architectures = config.get("architectures") or []
+    return config.get("model_type") == "muse_spark" or (
+        "MuseSparkForConditionalGeneration" in architectures
+    )
+
+
 def _args_with_default_model_parsers(
     engine_args: list[str], gateway_args: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -531,7 +549,17 @@ def _args_with_default_model_parsers(
     engine_result = list(engine_args)
     gateway_result = list(gateway_args)
 
-    if _is_deepseek_v41_model(model_id):
+    if _is_muse_spark_model(model_id):
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", MUSE_SPARK_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", MUSE_SPARK_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", MUSE_SPARK_TOOL_CALL_PARSER])
+
+    elif _is_deepseek_v41_model(model_id):
         if (
             "--reasoning-parser" not in engine_result
             and "--reasoning-parser" not in gateway_result
@@ -657,17 +685,26 @@ def _add_rl_control_port(engine_args: list[str]) -> tuple[list[str], str]:
 
 
 def _add_metrics_port(engine_args: list[str]) -> tuple[list[str], str | None]:
-    """Wire the engine's Prometheus /metrics port when metrics are enabled.
+    """Wire the engine's /metrics port when Prometheus reporting is enabled.
 
-    With ``--enable-metrics`` the engine serves /metrics from its main process
-    (see ``ServerArgs.metrics_port``). Pin a stable port — like
+    With ``--enable-metrics`` and the Prometheus reporter (the default), the
+    engine serves /metrics from its main process (see ``ServerArgs.metrics_port``).
+    Pin a stable port — like
     ``--rl-control-port`` — so the scrape target survives engine restarts and
     can be printed at startup. An operator-pinned ``--metrics-port`` is
     preserved untouched; ``--metrics-port 0`` means auto-allocate, matching
     the engine-side treatment of an unset port. Returns the scrape URL, or
-    None when metrics are off.
+    None when Prometheus reporting is off.
     """
-    if "--enable-metrics" not in engine_args:
+    reporters = []
+    for index, arg in enumerate(engine_args):
+        if arg == "--metrics-reporters" and index + 1 < len(engine_args):
+            reporters.append(engine_args[index + 1])
+        elif arg.startswith("--metrics-reporters="):
+            reporters.append(arg.split("=", 1)[1])
+    if "--enable-metrics" not in engine_args or (
+        reporters and "prometheus" not in reporters
+    ):
         return engine_args, None
     host = _get_from_args(engine_args, "--metrics-host", "127.0.0.1")
     pinned = _get_from_args(engine_args, "--metrics-port")
@@ -811,7 +848,7 @@ async def run_smg(
         # before spawn_engine.
         engine_args, rl_control_url = _add_rl_control_port(engine_args)
 
-        # Wire the engine metrics port (only with --enable-metrics).
+        # Wire the engine metrics port when Prometheus reporting is enabled.
         engine_args, metrics_url = _add_metrics_port(engine_args)
 
         engine = await spawn_engine(engine_args, host="127.0.0.1", port=engine_port)

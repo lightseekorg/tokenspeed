@@ -2,6 +2,17 @@
 
 Per-op notes for `ops/moe/`.
 
+## Deferred route outputs
+
+`bf16_moe_routes` returns individual, unweighted expert outputs. Deferred MXFP4
+execution also returns a map from each original route to its output row, with
+`-1` for remote experts. Consumers normalize each route before weighting and
+summation. Combining routes before normalization changes the operation.
+
+The solution modules register these operations. Shared Triton helpers live in
+`_triton/`, and the CuTe DSL routed reduction lives in `_cute_dsl/`. They use
+the same registry and public dispatchers as the other MoE operations.
+
 ## Expert placement dispatch
 
 With redundant experts (`--ep-num-redundant-experts R`) a logical expert has

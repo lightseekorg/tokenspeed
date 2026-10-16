@@ -46,6 +46,7 @@ from tokenspeed.runtime.configs.numerics import (
     YARN_RAMP_MASK_DEVICES,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
+from tokenspeed.runtime.metrics.config import resolve_metrics_options
 from tokenspeed.runtime.moe.dispatch_algorithm import (
     EP_DISPATCH_ALGORITHMS,
     STATIC_EP_DISPATCH_ALGORITHMS,
@@ -405,6 +406,7 @@ class ServerArgs:
     enable_metrics: bool = False
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
+    metrics_reporter_config: str | None = None
     # Port for the engine's Prometheus /metrics HTTP endpoint, served from the
     # engine's main process when --enable-metrics is on. None auto-allocates a
     # free port (logged at startup).
@@ -762,6 +764,7 @@ class ServerArgs:
         self.validate()
 
     def resolve_basic_defaults(self):
+        resolve_metrics_options(self)
         self.model = maybe_model_redirect(self.model)
 
         if self.kv_cache_dtype == "fp8":
@@ -2814,14 +2817,19 @@ class ServerArgs:
         parser.add_argument(
             "--enable-metrics",
             action="store_true",
-            help="Enable log metrics.",
+            help="Enable the selected metrics reporters.",
         )
         parser.add_argument(
             "--metrics-reporters",
             action="append",
-            choices=["prometheus"],
-            default=["prometheus"],
-            help="Select metrics reporter(can be specified multiple times)",
+            default=None,
+            help="Select prometheus or a registered metrics reporter (repeat for multiple; defaults to prometheus).",
+        )
+        parser.add_argument(
+            "--metrics-reporter-config",
+            type=str,
+            default=ServerArgs.metrics_reporter_config,
+            help="JSON file mapping external metrics reporter names to their configurations.",
         )
         parser.add_argument(
             "--metrics-port",
@@ -4147,6 +4155,11 @@ class PortArgs:
 
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: str | None
+
+    # Plain producer settings; live output resources remain in their owner process.
+    metrics_producer_configs: dict[str, dict[str, object]] = dataclasses.field(
+        default_factory=dict, repr=False
+    )
 
     @staticmethod
     def init_new(server_args: ServerArgs, dp_rank: int | None = None) -> "PortArgs":

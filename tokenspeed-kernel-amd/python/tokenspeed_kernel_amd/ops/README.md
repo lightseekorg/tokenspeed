@@ -1413,6 +1413,16 @@ that the activation loads and epilogue need. Long reductions (gate/up) load
 load 128-wide steps so three buffers hold all of K in a small LDS footprint,
 and more programs stay resident to hide each one's fixed latency.
 
+FP8-activation prefill (about 150 routed rows per expert at 8192-token
+chunks) uses 64x256 tiles. Neither GEMM saturates WMMA, TDM or HBM there:
+each program runs its load, LDS and WMMA phases largely back to back, so the
+tiles are picked for resident programs and L2 sharing. Gate/up uses eight
+warps, since four would need ~560 VGPRs per wave and leave one program per
+WGP. Down loads 128-wide K steps, which divide its K of 384 exactly. Both
+swizzle tiles over the XCDs so the tiles that share an expert's weights or an
+activation tile share an L2. MXFP4-activation prefill keeps the earlier
+four-warp tile with 256-wide K steps until it is measured.
+
 The launcher resolves the row tile from the gathered row count and expert
 count unless the caller pins it. The kernels mask ragged M and N edges rather
 than peeling them, so a trailing partial tile loads only the rows that exist.

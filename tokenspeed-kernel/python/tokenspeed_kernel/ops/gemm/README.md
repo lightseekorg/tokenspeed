@@ -1,5 +1,16 @@
 # GEMM weight preparation
 
+## Small dense projections
+
+`mv` selects the registered small-row projection implementation. Its dispatcher
+and registry both use the `("gemm", "mv")` operation. The gfx950 row-CTA GEMV
+declares its minimum N and K through the shared shape traits.
+
+On CDNA4, ordinary GEMM dispatch admits the measured single-row
+`[1,8192] @ [4608,8192].T` projection alongside the existing multirow cases.
+Callers that publish directly into a collective buffer pass that buffer as
+`out` to the same `mv` operation.
+
 ## DeepSeek V4 grouped output projection
 
 The grouped-projection plan describes the projection geometry and source formats.

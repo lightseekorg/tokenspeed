@@ -18,4 +18,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Multi-file Triton layernorm kernels."""
+"""Private Triton layer-normalization implementations."""

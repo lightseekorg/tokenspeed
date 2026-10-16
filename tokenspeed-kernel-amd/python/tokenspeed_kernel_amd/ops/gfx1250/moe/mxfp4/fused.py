@@ -707,7 +707,31 @@ class MoESliceNKProgram:
         return accumulator
 
 
-@gluon.jit
+def _matmul_launch_metadata(grid, kernel, args):
+    """Report the routed GEMM's work and modeled traffic to Proton.
+
+    ``bytes`` counts each operand once: the routed activation rows, every
+    expert's packed weights and scales, and the output rows. Re-reads of an
+    activation or weight tile by other tiles are left to the cache and not
+    counted.
+    """
+    m, n, k = args["M"], args["N"], args["K"]
+    x, w, y = args["X"], args["W"], args["Y"]
+    # Packed MXFP4 holds two values per byte.
+    x_bytes = m * k * x.element_size() // (2 if x.dtype == torch.uint8 else 1)
+    w_bytes = w.numel() * w.element_size()
+    if args["WMxScale"] is not None:
+        w_values = w.numel() * (2 if w.dtype == torch.uint8 else 1)
+        w_bytes += w_values // args["SCALE_BLOCK"]
+    y_bytes = m * (n // args["ACTIVATION_REDUCTION_N"]) * y.element_size()
+    return {
+        "name": f"{kernel.name} [M={m}, N={n}, K={k}]",
+        "flops8": 2 * m * n * k,
+        "bytes": x_bytes + w_bytes + y_bytes,
+    }
+
+
+@gluon.jit(launch_metadata=_matmul_launch_metadata)
 def _matmul(
     Y,
     stride_y_k,
@@ -1569,6 +1593,7 @@ def gluon_mxfp_combine(
     block_k: int = 256,
     num_warps: int = 4,
     num_buffers: int = 3,
+    xcd_swizzle: int = 1,
     use_warp_pipeline: bool | None = None,
     use_slice_mn: bool | None = None,
     use_slice_n: bool | None = None,
@@ -1615,6 +1640,7 @@ def gluon_mxfp_combine(
         block_k=block_k,
         num_warps=num_warps,
         num_buffers=num_buffers,
+        xcd_swizzle=xcd_swizzle,
         w_transpose=w_transpose,
         decode=decode,
         partial_tdm=partial_tdm,
@@ -2731,7 +2757,43 @@ def _precomputed_topk_route(
     )
 
 
-_PREFILL_TILES = {"block_n": 256, "block_k": 256, "num_warps": 4, "num_buffers": 3}
+# Prefill tiles for FP8 activations, measured at 8192-token chunks, 896
+# experts, top-16, so ~146 rows per expert. Neither GEMM saturates WMMA,
+# TDM, LDS or HBM; each program runs its load, LDS and WMMA phases mostly back
+# to back, so the tiles are chosen for how many programs stay resident and
+# how well they share L2.
+# - gate/up (K=3584): with four warps each wave needs ~560 VGPRs, so a WGP
+#   holds one program. Eight warps need ~170 VGPRs each, and two programs fit
+#   in LDS, putting four waves on each SIMD.
+# - down (K=384): 128-wide K steps cover K exactly, where 256-wide steps
+#   spend a quarter of the WMMAs on zero padding, and halve the operand ring
+#   so four programs fit in LDS.
+# - Workgroups are dispatched round-robin over the XCDs. xcd_swizzle=8 gives
+#   each XCD a contiguous run of tiles, so the M tiles reading one expert's
+#   weights and the N tiles reading one activation tile share an L2.
+_PREFILL_GATE_UP_TILES = {
+    "block_n": 256,
+    "block_k": 256,
+    "num_warps": 8,
+    "num_buffers": 3,
+    "xcd_swizzle": 8,
+}
+_PREFILL_DOWN_TILES = {
+    "block_n": 256,
+    "block_k": 128,
+    "num_warps": 4,
+    "num_buffers": 3,
+    "xcd_swizzle": 8,
+}
+
+# The tiles above were measured only with FP8 activations. MXFP4 activations
+# (A4W4) keep the original prefill tile until they are measured on that path.
+_PREFILL_MXFP4_ACTIVATION_TILES = {
+    "block_n": 256,
+    "block_k": 256,
+    "num_warps": 4,
+    "num_buffers": 3,
+}
 
 
 def gluon_mxfp_precomputed_mxfp4_fused_moe(
@@ -2848,7 +2910,11 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         # The down projection reduces over the activation's half of W13's N.
         down_tiles = decode_tile_config(int(w13_raw.shape[-1]) // 2)
     else:
-        gate_up_tiles = down_tiles = _PREFILL_TILES
+        if activation_dtype == "fp8":
+            gate_up_tiles = _PREFILL_GATE_UP_TILES
+            down_tiles = _PREFILL_DOWN_TILES
+        else:
+            gate_up_tiles = down_tiles = _PREFILL_MXFP4_ACTIVATION_TILES
     launch = dict(block_m=block_m, decode=decode, partial_tdm=partial_tdm)
     if activation_dtype == "mxfp4":
         x_mxfp4, x_mx_scale = launch_triton_quantize_mxfp4_activation_gfx1250(
@@ -2979,6 +3045,7 @@ def gluon_mxfp_ragged_matmul(
             "block_k",
             "num_buffers",
             "num_warps",
+            "xcd_swizzle",
             "decode",
             "partial_tdm",
         }

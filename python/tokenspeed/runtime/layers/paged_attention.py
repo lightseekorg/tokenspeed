@@ -266,6 +266,31 @@ class PagedAttention(nn.Module):
             override=None,
         )
 
+    def store_prepared(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> GQAPrologueOutput:
+        """Write rows whose projection or collective already applied norm/RoPE.
+
+        The producer must match this layer's prologue numerical contract.
+        This method owns the usual padded write slots and cache conversion;
+        call :meth:`attend` with its result to avoid repeating the head steps.
+        """
+        return gqa_prologue(
+            q,
+            k,
+            v,
+            norm=None,
+            rotary=None,
+            cache=self._write_target(q, ctx),
+            return_kv=not ctx.forward_mode.is_decode(),
+            solution=None,
+            override=None,
+        )
+
     def _steps(
         self, positions: torch.Tensor | None
     ) -> tuple[HeadNorm | None, Rotary | None]:

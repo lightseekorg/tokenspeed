@@ -59,6 +59,7 @@ import zmq
 from starlette.routing import Mount
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.metrics.config import metrics_enabled
 from tokenspeed.runtime.metrics.func_timer import enable_func_timer
 from tokenspeed.runtime.utils.network import get_free_port
 
@@ -770,7 +771,7 @@ def launch_metrics_server(server_args: ServerArgs) -> uvicorn.Server | None:
     (poll ``started`` for readiness), or None when --enable-metrics is off or
     the bind failed.
     """
-    if not server_args.enable_metrics:
+    if not metrics_enabled(server_args, "prometheus"):
         return None
 
     import uvicorn

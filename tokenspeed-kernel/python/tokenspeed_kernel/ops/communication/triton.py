@@ -109,6 +109,7 @@ __all__ = [
     "create_dp_sampling_state",
     "dp_sampling_gather",
     "dp_sampling_swap",
+    "multicast_publish",
 ]
 
 
@@ -2164,4 +2165,63 @@ def all_gather_inner(
         hidden_list_in_group=hidden_list_in_group,
         skip_entry_sync=skip_entry_sync,
         safe=safe,
+    )
+
+
+_PUBLISH_BLOCK = 1024
+
+
+@triton.jit
+def _publish_kernel(
+    src_ptr,
+    dst_ptr,
+    width_words,
+    src_stride_words,
+    dst_stride_words,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < width_words
+    words = tl.load(src_ptr + row * src_stride_words + cols, mask=mask, other=0)
+    tl.store(dst_ptr + row * dst_stride_words + cols, words, mask=mask)
+
+
+def multicast_publish(block: torch.Tensor, destination: torch.Tensor) -> None:
+    """Store ``block`` into ``destination`` as whole 32-bit words for a Lamport reader.
+
+    Args:
+        block: Contiguous BF16 ``[rows, width]`` block, ``width`` even.
+        destination: BF16 ``[rows, width]`` view whose rows may be strided,
+            typically this rank's column block of a multicast mailbox.
+
+    Returns:
+        None; ``destination`` holds ``block`` bit for bit.
+    """
+    rows, width = block.shape
+    if block.dtype != torch.bfloat16 or destination.dtype != torch.bfloat16:
+        raise ValueError("multicast_publish moves BF16 blocks")
+    if destination.shape != (rows, width) or width % 2 or not block.is_contiguous():
+        raise ValueError(
+            "block must be a contiguous [rows, width] tensor of even width"
+        )
+    if (
+        destination.stride(1) != 1
+        or destination.stride(0) % 2
+        or destination.data_ptr() % 4
+    ):
+        raise ValueError("destination rows must be contiguous and 32-bit aligned")
+    if rows == 0 or width == 0:
+        return
+    source_words = block.view(torch.int32)
+    destination_words = destination.view(torch.int32)
+    width_words = width // 2
+    _publish_kernel[(rows, triton.cdiv(width_words, _PUBLISH_BLOCK))](
+        source_words,
+        destination_words,
+        width_words,
+        source_words.stride(0),
+        destination_words.stride(0),
+        BLOCK=_PUBLISH_BLOCK,
+        num_warps=4,
     )
