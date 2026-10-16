@@ -42,6 +42,10 @@ from tokenspeed_kernel.ops.communication.iris import configure_iris
 configure_iris(heap_size=None, allocator_type="torch")
 ```
 
-`heap_size=None` sizes the heap automatically. `allocator_type=None` uses Iris's
-default (`torch` in the pinned version). Names pass through to Iris;
-`IRIS_ALLOCATOR` takes precedence. A live context cannot be reconfigured.
+`heap_size=None` sizes the heap automatically. `allocator_type=None` picks
+`vmem_chunked` when the job spans hosts and Iris's `torch` default otherwise.
+Names pass through to Iris; `IRIS_ALLOCATOR` takes precedence. Iris refuses an
+allocator that cannot reach every host. A live context cannot be reconfigured.
+
+The heap is built on the caller's current GPU, not on Iris's rank % visible
+GPUs, so ranks may start past GPU 0.

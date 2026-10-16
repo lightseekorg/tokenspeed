@@ -1441,7 +1441,7 @@ def run_event_loop(
     pipe_writer,
 ):
     mapping = server_args.mapping
-    gpu_id = mapping.rank % mapping.nprocs_per_node + server_args.base_gpu_id
+    gpu_id = mapping.gpu_id
     attn_tp_rank = mapping.attn.tp_rank
     dp_rank = mapping.attn.dp_rank
     global_rank = mapping.rank
