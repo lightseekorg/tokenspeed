@@ -51,6 +51,7 @@ from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.nemotron_h import NemotronHForCausalLM
+from tokenspeed.runtime.models.nemotron_h_nextn import NemotronHForCausalLMNextN
 from tokenspeed.runtime.models.parakeet import ParakeetEncoder
 from tokenspeed.runtime.models.radio import RadioVisionModel
 from tokenspeed.runtime.multimodal.embedder import (
@@ -374,4 +375,37 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_Omni_Reasoning_V3):  # noqa: N8
     """The same model under the architecture name of later checkpoints."""
 
 
-EntryClass = [NemotronH_Nano_Omni_Reasoning_V3, NemotronH_Omni_Reasoning_V3]
+class NemotronH_Omni_Reasoning_V3NextN(NemotronHForCausalLMNextN):  # noqa: N801
+    """The checkpoint's MTP head as the draft model; the checkpoint names the
+    language model, its MTP head and their quantization ``language_model.``."""
+
+    quant_module_name_replacements = (("language_model.", ""),)
+
+    def __init__(
+        self,
+        config: NemotronHOmniConfig,
+        mapping: Mapping,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config.text_config, mapping, quant_config, prefix)
+
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        return name.startswith("language_model.mtp.")
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        super().load_weights(
+            (name.removeprefix("language_model."), loaded)
+            for name, loaded in weights
+            if name.startswith("language_model.")
+        )
+
+    def load_kv_cache_scales(self, scales: dict[str, torch.Tensor]) -> None:
+        super().load_kv_cache_scales(_language_model_names(scales))
+
+
+EntryClass = [
+    NemotronH_Nano_Omni_Reasoning_V3,
+    NemotronH_Omni_Reasoning_V3,
+    NemotronH_Omni_Reasoning_V3NextN,
+]

@@ -542,6 +542,7 @@ def get_config(
         "MiniMaxM3SparseForConditionalGeneration",
         "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Omni_Reasoning_V3",
+        "NemotronH_Omni_Reasoning_V3NextN",
         "NemotronHOmniConfig",
     ]:
         if config is text_config:

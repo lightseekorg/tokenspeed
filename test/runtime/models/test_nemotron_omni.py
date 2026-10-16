@@ -554,7 +554,39 @@ def test_audio_feature_encodes_every_clip_of_every_item_in_order():
     assert torch.equal(out, expected)
 
 
-def test_kv_cache_scales_reach_the_language_model():
+def test_mtp_draft_reads_the_language_model_mtp_tensors(monkeypatch):
+    from tokenspeed.runtime.models.nemotron_h_nextn import NemotronHForCausalLMNextN
+
+    seen = []
+    monkeypatch.setattr(
+        NemotronHForCausalLMNextN,
+        "load_weights",
+        lambda self, weights: seen.extend(name for name, _ in weights),
+    )
+    draft_cls = nemotron_omni.NemotronH_Omni_Reasoning_V3NextN
+    draft = draft_cls.__new__(draft_cls)
+    names = [
+        "language_model.mtp.layers.0.mixer.k_proj.k_scale",
+        "language_model.mtp.layers.1.mixer.experts.3.up_proj.weight_scale",
+        "language_model.backbone.layers.0.mixer.in_proj.weight",
+        "vision_model.radio_model.model.blocks.0.attn.qkv.weight",
+    ]
+    draft.load_weights([(name, torch.zeros(1)) for name in names])
+    assert seen == [
+        "mtp.layers.0.mixer.k_proj.k_scale",
+        "mtp.layers.1.mixer.experts.3.up_proj.weight_scale",
+        "backbone.layers.0.mixer.in_proj.weight",
+    ]
+    assert [draft.checkpoint_weight_name_filter(n) for n in names] == [
+        True,
+        True,
+        False,
+        False,
+    ]
+    assert draft_cls.quant_module_name_replacements == (("language_model.", ""),)
+
+
+def test_kv_cache_scales_reach_the_language_model_and_its_mtp_head():
     from tokenspeed_kernel.ops.attention.prologue import FP8TensorScales
 
     from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
@@ -586,6 +618,7 @@ def test_kv_cache_scales_reach_the_language_model():
             is_multimodal_active=False,
             mm_attention_backend=None,
         )
+        draft = nemotron_omni.NemotronH_Omni_Reasoning_V3NextN(config, mapping)
     scales = {
         "language_model.backbone.layers.1.mixer.k_proj.k_scale": 0.25,
         "language_model.backbone.layers.1.mixer.v_proj.v_scale": 0.5,
@@ -594,7 +627,9 @@ def test_kv_cache_scales_reach_the_language_model():
     }
     scales = {name: torch.tensor([s]) for name, s in scales.items()}
     target.load_kv_cache_scales(scales)
+    draft.load_kv_cache_scales(scales)
     assert target.model.layers[1].mixer.attn.fp8_kv_scales == FP8TensorScales(0.25, 0.5)
+    assert draft.layers[0].mixer.attn.fp8_kv_scales == FP8TensorScales(0.125, 0.0625)
 
 
 def test_checkpoint_tensors_route_to_their_modules():
