@@ -857,13 +857,16 @@ def _triton_mha_decode_with_kvcache_impl(
 ) -> torch.Tensor:
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
-    out = torch.empty_like(q)
+    # Partial and final outputs carry the value width, which may be narrower
+    # than the query/key width.
+    v_head_dim = v_cache.shape[-1]
+    out = q.new_empty((*q.shape[:-1], v_head_dim))
     max_kv_splits = 4
     attn_logits = torch.empty(
         q.shape[0],
         q.shape[1],
         max_kv_splits,
-        q.shape[2],
+        v_head_dim,
         dtype=torch.float32,
         device=q.device,
     )

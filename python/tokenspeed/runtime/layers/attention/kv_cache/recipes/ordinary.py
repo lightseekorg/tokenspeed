@@ -105,6 +105,28 @@ class OrdinaryRecipe(CacheRecipe):
             draft = (FULL_ATTENTION,) * self.num_draft_layers
         return target + draft
 
+    @cached_property
+    @override
+    def layer_kv_head_counts(self) -> tuple[int, ...] | None:
+        """Merged per-layer KV heads, target then draft, when an MHA side's
+        layers differ (MiMo-V2); None when every layer is uniform."""
+        target = _config_layer_kv_heads(self.attn_config, self.num_target_layers)
+        draft = (
+            None
+            if self.draft_attn_config is None
+            else _config_layer_kv_heads(self.draft_attn_config, self.num_draft_layers)
+        )
+        if target is None and draft is None:
+            return None
+        return (
+            target or _uniform_kv_heads(self.attn_config, self.num_target_layers)
+        ) + (
+            ()
+            if self.draft_attn_config is None
+            else draft
+            or _uniform_kv_heads(self.draft_attn_config, self.num_draft_layers)
+        )
+
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
         groups = super().groups()
@@ -168,9 +190,23 @@ class OrdinaryRecipe(CacheRecipe):
         # padding; the profiled byte budget still bounds the arena capacity.
         return float("inf")
 
+    @property
+    def _layer_widths_differ(self) -> bool:
+        counts = self.layer_kv_head_counts
+        return counts is not None and len(set(counts)) > 1
+
     @override
-    def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
-        """One CacheBlock per parent: the block span is the identity grain."""
+    def packing(
+        self, groups: tuple[CacheGroupDeclaration, ...]
+    ) -> Mapping[str, int] | None:
+        """One CacheBlock per parent: the block span is the identity grain.
+
+        Layers whose KV head counts differ (MiMo-V2) share slab planes at
+        different page payloads, so the planner derives each group's blocks
+        per parent from the byte ratios instead.
+        """
+        if self._layer_widths_differ:
+            return None
         return {spec.group_id: 1 for spec, _ in groups}
 
     # ---- fields ----
@@ -195,6 +231,10 @@ class OrdinaryRecipe(CacheRecipe):
 
     @override
     def num_lcm_blocks(self, layout: CacheLayout) -> int:
+        if self._layer_widths_differ:
+            # Ratio packing: a parent no longer spans the identity grain for
+            # every group, so size parents by the packed layout's bytes.
+            return super().num_lcm_blocks(layout)
         bytes_per_token = self.attn_config.cache_cell_size() * _storage_layers(
             self.attn_config, self.num_target_layers
         )
@@ -238,6 +278,25 @@ def _storage_layers(config, num_layers: int) -> int:
     return group_size if group_size is not None else num_layers
 
 
+def _config_layer_kv_heads(config, num_layers: int) -> tuple[int, ...] | None:
+    """Pre-TP KV heads per layer of one MHA side whose layers differ."""
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+
+    spec = config.component(SoftmaxAttnConfig)
+    if not isinstance(spec, MHAConfig) or spec.layer_num_kv_heads is None:
+        return None
+    if len(spec.layer_num_kv_heads) != num_layers:
+        raise ValueError(
+            f"{len(spec.layer_num_kv_heads)} per-layer KV head counts do not "
+            f"cover {num_layers} layers"
+        )
+    return tuple(spec.layer_num_kv_heads)
+
+
+def _uniform_kv_heads(config, num_layers: int) -> tuple[int, ...]:
+    return (config.component(SoftmaxAttnConfig).num_kv_heads,) * num_layers
+
+
 def _config_group_ids(config, num_layers: int) -> tuple[str, ...]:
     """Per-layer group ids for one ordinary attention config."""
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -274,19 +333,26 @@ def _config_layer_fields(
             _index_k_field(config, layer_id),
         )
     if isinstance(spec, MSAConfig):
-        fields = _mha_layer_fields(config, layer_id, occurrence)
+        fields = _mha_layer_fields(config, layer_id, occurrence, local_layer_id)
         if local_layer_id in spec.sparse_layer_ids:
             fields += (_index_k_field(config, layer_id),)
         return fields
     if isinstance(spec, MLAConfig):
         return _mla_layer_fields(config, layer_id, occurrence)
     if isinstance(spec, MHAConfig):
-        return _mha_layer_fields(config, layer_id, occurrence)
+        return _mha_layer_fields(config, layer_id, occurrence, local_layer_id)
     raise TypeError(f"no ordinary cache recipe for {type(spec).__name__}")
 
 
-def _mha_layer_fields(config, layer_id: int, occurrence: int):
-    """One MHA layer's K/V pages, with mxfp8 scale planes when enabled."""
+def _mha_layer_fields(config, layer_id: int, occurrence: int, local_layer_id: int):
+    """One MHA layer's K/V pages, with mxfp8 scale planes when enabled.
+
+    A layer with fewer KV heads than the allocation width declares its own
+    head count; the pool reinterprets the shared plane as more rows. The value
+    plane carries the value head width, which may be narrower than the key's.
+    """
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+
     spec = config.component(SoftmaxAttnConfig)
     mxfp8 = bool(config.kv_cache_mxfp8)
     if mxfp8 and config.prefix_granularity != MXFP8_KV_SCALE_TILE_TOKENS:
@@ -295,11 +361,19 @@ def _mha_layer_fields(config, layer_id: int, occurrence: int):
             f"{MXFP8_KV_SCALE_TILE_TOKENS} (the attention kernel consumes "
             "the interleaved paged scale layout)"
         )
-    kv_heads = max(spec.num_kv_heads // spec.attn_tp_size, 1)
+    layer_kv_heads, v_head_dim = spec.num_kv_heads, spec.head_dim
+    if isinstance(spec, MHAConfig):
+        if spec.layer_num_kv_heads is not None:
+            layer_kv_heads = spec.layer_num_kv_heads[local_layer_id]
+        v_head_dim = spec.value_head_dim
+    kv_heads = max(layer_kv_heads // spec.attn_tp_size, 1)
     head_dim = spec.head_dim
     if config.prefix_granularity <= 0 or kv_heads <= 0 or head_dim <= 0:
         raise ValueError("MHA full-attention geometry must be positive")
+    if mxfp8 and v_head_dim != head_dim:
+        raise ValueError("mxfp8 KV cache requires values as wide as keys")
     shape = (config.prefix_granularity, kv_heads, head_dim)
+    v_shape = (config.prefix_granularity, kv_heads, v_head_dim)
     kv_dtype = (
         # MXFP8 writes go through dtype-aware kernels, so the arena keeps the
         # fp8 view; the scatter-written paths fall back to uint8.
@@ -309,7 +383,9 @@ def _mha_layer_fields(config, layer_id: int, occurrence: int):
     )
     fields = (
         CacheFieldSpec(f"layer.{layer_id}.k", f"unit.{occurrence}.k", shape, kv_dtype),
-        CacheFieldSpec(f"layer.{layer_id}.v", f"unit.{occurrence}.v", shape, kv_dtype),
+        CacheFieldSpec(
+            f"layer.{layer_id}.v", f"unit.{occurrence}.v", v_shape, kv_dtype
+        ),
     )
     if not mxfp8:
         return fields

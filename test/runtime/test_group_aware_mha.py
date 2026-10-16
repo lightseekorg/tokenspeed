@@ -67,6 +67,7 @@ class TestRouterOverMhaLeavesTest:
             num_kv_heads=8,
             attn_tp_size=1,
             head_dim=16,
+            value_head_dim=16,
             backend_name="mha",
             skip_softmax_threshold=0.0,
         )

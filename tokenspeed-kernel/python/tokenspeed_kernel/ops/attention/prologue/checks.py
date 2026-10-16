@@ -286,16 +286,22 @@ def _check_gqa_request(
             f"key cache {tuple(cache.k_cache.shape)} is not [slots, heads, head_dim] rows"
         )
     num_kv_heads, head_dim = cache.k_cache.shape[1:]
+    # The value head may be narrower than the query/key head (MiMo-V2 stores
+    # 192-wide keys and 128-wide values); slots, heads and dtype must agree.
+    v_head_dim = cache.v_cache.shape[-1]
     if (
-        cache.v_cache.shape != cache.k_cache.shape
+        cache.v_cache.dim() != 3
+        or cache.v_cache.shape[:2] != cache.k_cache.shape[:2]
+        or v_head_dim > head_dim
         or cache.v_cache.dtype != cache.k_cache.dtype
         or any(
-            x.stride(-1) != 1 or (num_kv_heads > 1 and x.stride(1) != head_dim)
+            x.stride(-1) != 1 or (num_kv_heads > 1 and x.stride(1) != x.shape[-1])
             for x in (cache.k_cache, cache.v_cache)
         )
     ):
         raise ValueError(
-            "key and value caches must be dense rows of one geometry and dtype"
+            "key and value caches must be dense rows of one geometry and dtype "
+            "(values may be narrower than keys)"
         )
     if (
         q.stride(-1) != 1
@@ -304,8 +310,8 @@ def _check_gqa_request(
     ):
         raise ValueError(f"q {tuple(q.shape)} is not dense {head_dim}-wide heads")
     if any(
-        x.dim() != 2 or x.shape[1] != num_kv_heads * head_dim or x.stride(-1) != 1
-        for x in (k, v)
+        x.dim() != 2 or x.shape[1] != num_kv_heads * width or x.stride(-1) != 1
+        for x, width in ((k, head_dim), (v, v_head_dim))
     ):
         raise ValueError(
             f"k {tuple(k.shape)} / v {tuple(v.shape)} are not dense rows of the cache heads"

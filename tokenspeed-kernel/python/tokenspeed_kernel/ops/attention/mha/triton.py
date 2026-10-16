@@ -46,6 +46,7 @@ _PORTABLE_DTYPES = {torch.float16, torch.bfloat16}
     signatures=format_signatures(("q", "k", "v"), "dense", _PORTABLE_DTYPES),
     priority=Priority.PORTABLE,
     traits={
+        "distinct_v_head_dim": frozenset({False, True}),
         "logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
         "sinks": frozenset({False, True}),
@@ -98,6 +99,7 @@ def triton_mha_prefill(
     ),
     priority=Priority.PORTABLE,
     traits={
+        "distinct_v_head_dim": frozenset({False, True}),
         "is_causal": frozenset({False, True}),
         "logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
@@ -160,6 +162,7 @@ def triton_mha_extend_with_kvcache(
     ),
     priority=Priority.PORTABLE,
     traits={
+        "distinct_v_head_dim": frozenset({False, True}),
         "logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False}),
         "sinks": frozenset({False, True}),
@@ -215,6 +218,7 @@ if current_platform().is_npu:
 
     _NPU_CAPABILITY = CapabilityRequirement(vendors=frozenset({"ascend"}))
     _NPU_OPTIONS = {
+        "distinct_v_head_dim": frozenset({False}),
         "logit_cap": frozenset({False}),
         "return_lse": frozenset({False}),
         "sinks": frozenset({False}),

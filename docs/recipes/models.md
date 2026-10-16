@@ -1292,6 +1292,39 @@ and graph flags. For 512 requests, use `--max-num-seqs 512`,
 `--cudagraph-capture-sizes 1 8 32 64 128 160 256 384 512`. Setting only the
 first one or two leaves larger decode batches outside the captured graph list.
 
+## MiMo-V2.6
+
+`XiaomiMiMo/MiMo-V2.6-Flash-RL` (310B total parameters, 48 layers) and
+`XiaomiMiMo/MiMo-V2.6-Pro-RL` (1T, 70 layers) are text-served here. Their
+encoders, DFlash drafter and MTP layers are not loaded.
+
+Every layer is grouped-query attention with 192-wide query/key heads and
+128-wide value heads. Full-attention layers alternate with 128-token
+sliding-window layers, which add a learned per-head attention sink; on Flash
+the full layers have 4 KV heads and the sliding layers 8. The sliding layers
+form cache sub-groups no larger than the full group, so an owned cache block
+leaves no unused slab rows. The value width selects the Triton attention
+kernels (FA3 on Hopper). Layer 0 is a dense MLP; the other layers route with
+sigmoid scores plus a correction bias, computed by TokenSpeed's top-k router,
+over experts stored as MXFP4 inside the FP8 block-quantized checkpoint.
+
+The checkpoint pre-shards each fused QKV projection into
+`num_key_value_heads` chunks (4 on Flash, 8 on Pro), so the attention TP size
+must divide that count.
+
+```bash
+tokenspeed serve XiaomiMiMo/MiMo-V2.6-Flash-RL \
+  --trust-remote-code \
+  --tensor-parallel-size 1 \
+  --max-model-len 8192 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+The chat template thinks by default; pass
+`"chat_template_kwargs": {"enable_thinking": false}` per request to answer
+directly.
+
 ## Tuning order
 
 1. Set model ID, trust policy, tokenizer mode, and served model name.

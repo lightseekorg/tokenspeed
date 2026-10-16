@@ -82,6 +82,7 @@ if platform.is_nvidia and platform.is_blackwell:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "distinct_v_head_dim": frozenset({False}),
             "head_dim": _FA4_BLACKWELL_PREFILL_HEAD_DIMS,
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
@@ -140,6 +141,7 @@ if platform.is_nvidia and platform.is_blackwell:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "distinct_v_head_dim": frozenset({False}),
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False}),
@@ -205,6 +207,7 @@ if platform.is_nvidia and platform.is_blackwell:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "distinct_v_head_dim": frozenset({False}),
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
@@ -271,6 +274,7 @@ if platform.is_nvidia and platform.is_blackwell:
         signatures=_FA4_FP8_DENSE_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
+            "distinct_v_head_dim": frozenset({False}),
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False}),
@@ -331,6 +335,7 @@ if platform.is_nvidia and platform.is_blackwell:
         signatures=_FA4_FP8_DENSE_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
+            "distinct_v_head_dim": frozenset({False}),
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
@@ -409,6 +414,7 @@ if platform.is_nvidia and platform.is_blackwell:
             signatures=_MXFP8_ATTENTION_SIGNATURES,
             priority=Priority.SPECIALIZED,
             traits={
+                "distinct_v_head_dim": frozenset({False}),
                 "head_dim": frozenset({128}),
                 "page_size": frozenset({128}),
                 "logit_cap": frozenset({False}),
@@ -476,6 +482,7 @@ if platform.is_nvidia and platform.is_blackwell:
             signatures=_MXFP8_ATTENTION_SIGNATURES,
             priority=Priority.SPECIALIZED,
             traits={
+                "distinct_v_head_dim": frozenset({False}),
                 "head_dim": frozenset({128}),
                 "page_size": frozenset({128}),
                 "is_causal": frozenset({True}),
@@ -552,6 +559,7 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "distinct_v_head_dim": frozenset({False, True}),
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
             "sinks": frozenset({False, True}),
@@ -609,6 +617,7 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "distinct_v_head_dim": frozenset({False, True}),
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
@@ -672,6 +681,7 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "distinct_v_head_dim": frozenset({False, True}),
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
             "sinks": frozenset({False, True}),
@@ -711,4 +721,5 @@ elif platform.is_nvidia and platform.is_hopper:
             softcap=logit_cap,
             sinks=sinks,
         )
-        return out.view_as(q)
+        # The output carries the value width, which may be narrower than q's.
+        return out.view(*q.shape[:-1], v_cache.shape[-1])

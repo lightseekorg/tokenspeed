@@ -483,7 +483,8 @@ def _triton_mha_prefill_impl(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
-    out = torch.empty_like(q)
+    # The output carries the value width, which may be narrower than q's.
+    out = q.new_empty((*q.shape[:-1], v.shape[-1]))
     lse = (
         torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
         if return_lse
@@ -550,7 +551,7 @@ def _triton_mha_extend_with_kvcache_impl(
         device=v_cache.device,
     )
 
-    out = torch.empty_like(q)
+    out = q.new_empty((*q.shape[:-1], v_cache.shape[-1]))
     lse = (
         torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
         if return_lse

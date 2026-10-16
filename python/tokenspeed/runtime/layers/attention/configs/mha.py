@@ -45,6 +45,30 @@ class MHAConfig(SoftmaxAttnConfig):
     # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950); see
     # ServerArgs.skip_softmax_threshold.
     skip_softmax_threshold: float = 0.0
+    # Value head width when it is narrower than head_dim (MiMo-V2 pairs
+    # 192-wide keys with 128-wide values); None keeps values as wide as keys.
+    v_head_dim: int | None = None
+    # Pre-TP KV head counts per layer when layers differ (MiMo-V2's full and
+    # sliding layers); num_kv_heads is then their maximum, the allocation
+    # width. None when every layer has num_kv_heads.
+    layer_num_kv_heads: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.v_head_dim is not None and not 0 < self.v_head_dim <= self.head_dim:
+            raise ValueError(
+                f"v_head_dim {self.v_head_dim} must be in (0, head_dim={self.head_dim}]"
+            )
+        if self.layer_num_kv_heads is not None and (
+            max(self.layer_num_kv_heads) != self.num_kv_heads
+        ):
+            raise ValueError(
+                "num_kv_heads must be the largest per-layer KV head count, "
+                f"got {self.num_kv_heads} for {self.layer_num_kv_heads}"
+            )
+
+    @property
+    def value_head_dim(self) -> int:
+        return self.head_dim if self.v_head_dim is None else self.v_head_dim
 
     @classmethod
     def generate(
@@ -69,6 +93,7 @@ class MHAConfig(SoftmaxAttnConfig):
         sliding_window_tokens = (
             None if draft_block_decode else getattr(hf_config, "sliding_window", None)
         )
+        layer_num_kv_heads = model_config.layer_num_key_value_heads
         spec = cls(
             backend_name=(
                 server_args.attention_backend
@@ -76,8 +101,18 @@ class MHAConfig(SoftmaxAttnConfig):
                 else server_args.drafter_attention_backend
             ),
             num_attention_heads=model_config.num_attention_heads,
-            num_kv_heads=model_config.num_key_value_heads,
+            num_kv_heads=(
+                model_config.num_key_value_heads
+                if layer_num_kv_heads is None
+                else max(layer_num_kv_heads)
+            ),
             head_dim=model_config.head_dim,
+            v_head_dim=(
+                None
+                if model_config.v_head_dim == model_config.head_dim
+                else model_config.v_head_dim
+            ),
+            layer_num_kv_heads=layer_num_kv_heads,
             attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
             cache_layer_types=cache_layer_types,
             sliding_window_tokens=sliding_window_tokens,
@@ -98,8 +133,7 @@ class MHAConfig(SoftmaxAttnConfig):
     def cache_cell_size(self, config: AttnConfig) -> int:
         cell = (
             max(self.num_kv_heads // self.attn_tp_size, 1)
-            * self.head_dim
-            * 2
+            * (self.head_dim + self.value_head_dim)
             * torch._utils._element_size(config.kv_cache_dtype)
         )
         if config.kv_cache_mxfp8:

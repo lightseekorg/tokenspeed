@@ -94,6 +94,7 @@ LSE_LN = math.log2(math.e)
 def mha_plan(
     dtype: torch.dtype,
     head_dim: int,
+    v_head_dim: int,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -104,7 +105,8 @@ def mha_plan(
 
     Args:
         dtype: Query/K/V dtype for prefill planning.
-        head_dim: Attention head dimension.
+        head_dim: Query/key head dimension.
+        v_head_dim: Value head dimension; it may be narrower than ``head_dim``.
         window_left: Exclusive left sliding-window size, or -1 for full-context
             attention.
         logit_cap: Logit soft-cap value, or 0.0 when disabled.
@@ -123,6 +125,7 @@ def mha_plan(
 
     traits = {
         "head_dim": head_dim,
+        "distinct_v_head_dim": v_head_dim != head_dim,
         "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
         "sinks": sinks is not None,
@@ -209,6 +212,7 @@ def mha_prefill(
     # Select kernel
     traits = {
         "head_dim": q.shape[-1],
+        "distinct_v_head_dim": v.shape[-1] != q.shape[-1],
         "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
         "sinks": sinks is not None,
@@ -341,6 +345,7 @@ def mha_extend_with_kvcache(
     # Select kernel
     traits = {
         "head_dim": q.shape[-1],
+        "distinct_v_head_dim": v_cache.shape[-1] != q.shape[-1],
         "page_size": k_cache.shape[1],
         "is_causal": is_causal,
         "logit_cap": logit_cap != 0.0,
@@ -466,6 +471,7 @@ def mha_decode_with_kvcache(
     traits = {
         "q_len": max_seqlen_q,
         "head_dim": q.shape[-1],
+        "distinct_v_head_dim": v_cache.shape[-1] != q.shape[-1],
         "page_size": k_cache.shape[1],
         "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
