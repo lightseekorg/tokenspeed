@@ -53,24 +53,6 @@ _REPORTERS: dict[str, MetricReporter] = {}
 _lock = threading.RLock()
 
 
-def _ensure_builtin_reporters() -> None:
-    """Establish built-in baselines outside any active plugin transaction."""
-    with _lock:
-        if "jsonl" in _REPORTERS:
-            return
-        from tokenspeed.runtime.metrics.jsonl import (
-            create_jsonl_sink,
-            start_jsonl_node,
-            validate_jsonl_config,
-        )
-
-        # A model plugin can trigger registration before metric discovery.
-        # Its rollback must restore this baseline, never remove the built-in.
-        _REPORTERS["jsonl"] = MetricReporter(
-            validate_jsonl_config, create_jsonl_sink, start_jsonl_node
-        )
-
-
 def register_metric_reporter(
     name: str,
     *,
@@ -103,7 +85,6 @@ def register_metric_reporter(
     if start_node is not None and not callable(start_node):
         raise TypeError("Metric reporter start_node must be callable or None")
 
-    _ensure_builtin_reporters()
     with _lock:
         previous = _REPORTERS.get(name)
         if previous is not None:
@@ -135,12 +116,9 @@ def get_metric_reporter(name: str) -> MetricReporter:
 
 
 def ensure_metric_reporters_loaded() -> None:
-    """Register the built-in before discovering installed runtime plugins."""
+    """Discover metric reporters through the existing runtime plugin loader."""
     from tokenspeed.runtime import plugins
 
-    _ensure_builtin_reporters()
-    # The plugin loader can call registrations while holding its own lock.
-    # Release ours first to avoid reversing that lock order on another thread.
     plugins.ensure_loaded()
 
 

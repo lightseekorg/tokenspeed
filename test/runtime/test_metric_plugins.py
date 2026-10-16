@@ -154,49 +154,63 @@ def _install_plugin(monkeypatch, register):
     return plugins
 
 
-def test_discovery_registers_builtin_before_entry_points_once(registry, monkeypatch):
-    from tokenspeed.runtime.metrics import jsonl
-
+def test_discovery_loads_entry_points_once(registry, monkeypatch):
+    _register(registry, "existing", override=False, validate=dict)
     external_calls = []
 
     def register_plugin():
-        builtin = registry.get_metric_reporter("jsonl")
-        assert builtin.validate is jsonl.validate_jsonl_config
-        external_calls.append(builtin)
+        existing = registry.get_metric_reporter("existing")
+        external_calls.append(existing.validate({"endpoint": "test"}))
         _register(registry, "fixture", override=False, validate=dict)
 
     plugins = _install_plugin(monkeypatch, register_plugin)
     registry.ensure_metric_reporters_loaded()
     registry.ensure_metric_reporters_loaded()
-    assert external_calls == [registry.get_metric_reporter("jsonl")]
-    assert registry.get_metric_reporter("fixture").validate is dict
+    assert external_calls == [{"endpoint": "test"}]
+    assert registry.get_metric_reporter("fixture").validate({"queue_size": 8}) == {
+        "queue_size": 8
+    }
     assert plugins.list_plugins()[0].registrations == (
         ("metric reporter", ("fixture",)),
     )
 
 
-def test_builtin_discovery_preserves_existing_jsonl_registration(registry, monkeypatch):
-    from tokenspeed.runtime import plugins
+def test_discovery_preserves_existing_registration(registry, monkeypatch):
+    def validate(config):
+        return {**config, "queue_size": 8}
 
-    _register(registry, "jsonl", override=True, validate=dict)
-    original = registry.get_metric_reporter("jsonl")
-    monkeypatch.setattr(plugins, "ensure_loaded", lambda: [])
+    _register(registry, "existing", override=False, validate=validate)
+    _install_plugin(
+        monkeypatch,
+        lambda: _register(registry, "fixture", override=False, validate=dict),
+    )
     registry.ensure_metric_reporters_loaded()
-    assert registry.get_metric_reporter("jsonl") is original
+    assert registry.get_metric_reporter("existing").validate({"endpoint": "test"}) == {
+        "endpoint": "test",
+        "queue_size": 8,
+    }
 
 
 @pytest.mark.parametrize(
     "override, fail_after_registration", [(False, False), (True, False), (True, True)]
 )
-def test_generic_loader_first_enforces_builtin_override_and_rollback(
+def test_generic_loader_first_enforces_override_and_rollback(
     registry, monkeypatch, override, fail_after_registration
 ):
-    from tokenspeed.runtime.metrics import jsonl
+    def original_validate(config):
+        return {**config, "queue_size": 8}
+
+    def replacement_validate(config):
+        return {**config, "queue_size": 16}
+
+    _register(registry, "existing", override=False, validate=original_validate)
 
     def register_plugin():
-        _register(registry, "jsonl", override=override, validate=dict)
+        _register(
+            registry, "existing", override=override, validate=replacement_validate
+        )
         if fail_after_registration:
-            raise RuntimeError("plugin failed after overriding JSONL")
+            raise RuntimeError("plugin failed after overriding existing reporter")
 
     plugins = _install_plugin(monkeypatch, register_plugin)
     successful_override = override and not fail_after_registration
@@ -206,16 +220,21 @@ def test_generic_loader_first_enforces_builtin_override_and_rollback(
         with pytest.warns(UserWarning, match="Failed to load plugin"):
             plugins.ensure_loaded()
 
-    # Check before metric discovery: rollback must leave the built-in baseline
-    # intact, rather than rely on a later ensure call to recreate it.
-    registered = registry.get_metric_reporter("jsonl")
-    expected = dict if successful_override else jsonl.validate_jsonl_config
-    assert registered.validate is expected
+    # The generic loader must restore the previous reporter on failure,
+    # before metrics discovery is called.
+    expected = {"endpoint": "test", "queue_size": 16 if successful_override else 8}
+    assert (
+        registry.get_metric_reporter("existing").validate({"endpoint": "test"})
+        == expected
+    )
     registry.ensure_metric_reporters_loaded()
-    assert registry.get_metric_reporter("jsonl") is registered
+    assert (
+        registry.get_metric_reporter("existing").validate({"endpoint": "test"})
+        == expected
+    )
     if successful_override:
         assert plugins.list_plugins()[0].registrations == (
-            ("metric reporter", ("jsonl",)),
+            ("metric reporter", ("existing",)),
         )
     else:
         assert plugins.list_plugins() == []

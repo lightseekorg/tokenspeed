@@ -126,6 +126,6 @@ def test_metrics_server_bind_failure_degrades_to_none(sample_multiproc_dir):
         blocker.close()
 
 
-def test_jsonl_only_does_not_start_prometheus_endpoint():
-    args = SimpleNamespace(enable_metrics=True, metrics_reporters=["jsonl"])
+def test_plugin_only_does_not_start_prometheus_endpoint():
+    args = SimpleNamespace(enable_metrics=True, metrics_reporters=["test_reporter"])
     assert launch_metrics_server(args) is None

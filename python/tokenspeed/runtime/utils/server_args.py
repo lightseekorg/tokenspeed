@@ -407,11 +407,6 @@ class ServerArgs:
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
     metrics_reporter_config: str | None = None
-    metrics_jsonl_dir: str | None = None
-    metrics_jsonl_max_size_mb: int = 256
-    metrics_jsonl_backup_count: int = 4
-    metrics_jsonl_queue_size: int = 10000
-    metrics_jsonl_flush_interval: float = 1.0
     # Port for the engine's Prometheus /metrics HTTP endpoint, served from the
     # engine's main process when --enable-metrics is on. None auto-allocates a
     # free port (logged at startup).
@@ -2828,43 +2823,13 @@ class ServerArgs:
             "--metrics-reporters",
             action="append",
             default=None,
-            help="Select a built-in or registered metrics reporter (repeat for multiple; defaults to prometheus).",
+            help="Select prometheus or a registered metrics reporter (repeat for multiple; defaults to prometheus).",
         )
         parser.add_argument(
             "--metrics-reporter-config",
             type=str,
             default=ServerArgs.metrics_reporter_config,
             help="JSON file mapping external metrics reporter names to their configurations.",
-        )
-        parser.add_argument(
-            "--metrics-jsonl-dir",
-            type=str,
-            default=ServerArgs.metrics_jsonl_dir,
-            help="Directory for raw JSONL metrics (required for the jsonl reporter).",
-        )
-        parser.add_argument(
-            "--metrics-jsonl-max-size-mb",
-            type=int,
-            default=ServerArgs.metrics_jsonl_max_size_mb,
-            help="Rotate raw metrics files at this size in MiB (default: 256).",
-        )
-        parser.add_argument(
-            "--metrics-jsonl-backup-count",
-            type=int,
-            default=ServerArgs.metrics_jsonl_backup_count,
-            help="Closed shards retained per writer, in addition to its active shard.",
-        )
-        parser.add_argument(
-            "--metrics-jsonl-queue-size",
-            type=int,
-            default=ServerArgs.metrics_jsonl_queue_size,
-            help="Bounded event queue size per metrics producer process.",
-        )
-        parser.add_argument(
-            "--metrics-jsonl-flush-interval",
-            type=float,
-            default=ServerArgs.metrics_jsonl_flush_interval,
-            help="JSONL buffer flush interval in seconds (default: 1).",
         )
         parser.add_argument(
             "--metrics-port",

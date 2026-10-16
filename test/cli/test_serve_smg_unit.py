@@ -940,8 +940,8 @@ async def test_run_smg_wires_metrics_port_into_engine_spawn(capsys):
     "metric_args",
     [
         [],
-        ["--enable-metrics", "--metrics-reporters", "jsonl"],
-        ["--enable-metrics", "--metrics-reporters", "external_jsonl"],
+        ["--enable-metrics", "--metrics-reporters", "test_reporter"],
+        ["--enable-metrics", "--metrics-reporters", "external_reporter"],
     ],
 )
 async def test_run_smg_without_prometheus_omits_engine_metrics_port(
@@ -1274,12 +1274,12 @@ def test_add_metrics_port_noop_without_enable_metrics():
 @pytest.mark.parametrize(
     "reporter_args",
     [
-        ["--metrics-reporters", "jsonl"],
-        ["--metrics-reporters=jsonl"],
-        ["--metrics-reporters", "jsonl", "--metrics-reporters=jsonl"],
-        ["--metrics-reporters=jsonl", "--metrics-port", "5006"],
-        ["--metrics-reporters", "external_jsonl"],
-        ["--metrics-reporters=external_jsonl", "--metrics-port", "5006"],
+        ["--metrics-reporters", "test_reporter"],
+        ["--metrics-reporters=test_reporter"],
+        ["--metrics-reporters", "test_reporter", "--metrics-reporters=test_reporter"],
+        ["--metrics-reporters=test_reporter", "--metrics-port", "5006"],
+        ["--metrics-reporters", "external_reporter"],
+        ["--metrics-reporters=external_reporter", "--metrics-port", "5006"],
     ],
 )
 def test_add_metrics_port_noop_for_raw_outputs_only(monkeypatch, reporter_args):
@@ -1303,11 +1303,11 @@ def test_add_metrics_port_noop_for_raw_outputs_only(monkeypatch, reporter_args):
     [
         ["--metrics-reporters", "prometheus"],
         ["--metrics-reporters=prometheus"],
-        ["--metrics-reporters", "prometheus", "--metrics-reporters", "jsonl"],
-        ["--metrics-reporters", "jsonl", "--metrics-reporters", "prometheus"],
-        ["--metrics-reporters=prometheus", "--metrics-reporters=jsonl"],
-        ["--metrics-reporters=jsonl", "--metrics-reporters", "prometheus"],
-        ["--metrics-reporters=external_jsonl", "--metrics-reporters", "prometheus"],
+        ["--metrics-reporters", "prometheus", "--metrics-reporters", "test_reporter"],
+        ["--metrics-reporters", "test_reporter", "--metrics-reporters", "prometheus"],
+        ["--metrics-reporters=prometheus", "--metrics-reporters=test_reporter"],
+        ["--metrics-reporters=test_reporter", "--metrics-reporters", "prometheus"],
+        ["--metrics-reporters=external_reporter", "--metrics-reporters", "prometheus"],
     ],
 )
 def test_add_metrics_port_with_prometheus_reporter(monkeypatch, reporter_args):

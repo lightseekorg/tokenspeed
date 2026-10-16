@@ -18,10 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Process-local metrics ownership and real writer shutdown."""
+"""Process-local ownership and cleanup of registered metric reporters."""
 
 import argparse
-import json
 import os
 import sys
 import threading
@@ -35,23 +34,18 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-from tokenspeed.runtime.metrics.jsonl import MetricEvent
+from tokenspeed.runtime.metrics.events import MetricEvent
 from tokenspeed.runtime.metrics.service import MetricsService
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
 
-def _args(directory, reporters):
+def _args(reporters):
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     parser.set_defaults(
         enable_metrics=True,
         metrics_reporter_config=None,
         metrics_reporters=reporters,
-        metrics_jsonl_dir=str(directory),
-        metrics_jsonl_queue_size=100,
-        metrics_jsonl_max_size_mb=1,
-        metrics_jsonl_backup_count=2,
-        metrics_jsonl_flush_interval=0.01,
     )
     return parser.parse_args(["--model", "test-model"])
 
@@ -68,37 +62,54 @@ def _ports():
     )
 
 
-def test_prometheus_only_does_not_start_file_service(tmp_path):
+def test_prometheus_only_does_not_create_plugin_sinks():
     service = MetricsService()
     ports = _ports()
-    service.start(_args(tmp_path, ["prometheus"]), ports)
+    service.start(_args(["prometheus"]), ports)
     assert ports.metrics_producer_configs == {}
     assert service.get_event_sink() is None
-    assert list(tmp_path.iterdir()) == []
     service.close(timeout=1)
 
 
-def test_service_joins_frontend_and_scheduler_into_one_stream(tmp_path):
+def test_services_create_separate_sinks_from_node_configuration():
+    created = []
+
+    class Session:
+        def __init__(self):
+            self.producer_config = {"service": "test-service"}
+            self.closed = False
+
+        def close(self, timeout):
+            assert all(sink.closed for _, sink in created)
+            self.closed = True
+
+    session = Session()
+
+    def create_sink(config):
+        sink = RecordingSink(fail_emit=False, fail_close=False)
+        created.append((config, sink))
+        return sink
+
+    _register("service_producers", create_sink, start_node=lambda _: session)
     owner = MetricsService()
     producer = MetricsService()
     ports = _ports()
-    args = _args(tmp_path, ["jsonl"])
+    args = _args(["service_producers"])
     owner.start(args, ports)
-    assert ports.metrics_producer_configs["jsonl"]["endpoint"].startswith("ipc://")
     producer.connect(ports.metrics_producer_configs)
     for service, metric in ((owner, "frontend"), (producer, "scheduler")):
         sink = service.get_event_sink()
         assert sink is service.get_event_sink()
         sink.emit(MetricEvent(time.time_ns(), metric, "observe", 0.5, {}))
     producer.close(timeout=2)
+    assert not session.closed
     owner.close(timeout=2)
-    rows = [
-        json.loads(line)
-        for file in tmp_path.glob("*.jsonl")
-        for line in file.read_text().splitlines()
+    assert [config for config, _ in created] == [
+        {"service": "test-service"},
+        {"service": "test-service"},
     ]
-    assert {row["metric"] for row in rows} == {"frontend", "scheduler"}
-    assert len({row["stream_id"] for row in rows}) == 1
+    assert [sink.events[0].metric for _, sink in created] == ["frontend", "scheduler"]
+    assert session.closed
     assert owner.get_event_sink() is None
     owner.close(timeout=1)
 
@@ -215,7 +226,7 @@ def test_sink_creation_failure_closes_previous_sinks_without_retry():
     assert len(attempts) == 1
 
 
-def test_partial_node_failure_closes_sessions_in_reverse_order(tmp_path):
+def test_partial_node_failure_closes_sessions_in_reverse_order():
     closed = []
 
     class Session:
@@ -233,7 +244,7 @@ def test_partial_node_failure_closes_sessions_in_reverse_order(tmp_path):
         _register(name, lambda _: None, start_node=lambda _, name=name: Session(name))
     _register("service_node_bad", lambda _: None, start_node=fail_start)
     service = MetricsService()
-    args = _args(tmp_path, ["service_node_a", "service_node_b", "service_node_bad"])
+    args = _args(["service_node_a", "service_node_b", "service_node_bad"])
     with pytest.raises(RuntimeError, match="node startup failed"):
         service.start(args, _ports())
     assert closed == ["service_node_b", "service_node_a"]
@@ -241,7 +252,7 @@ def test_partial_node_failure_closes_sessions_in_reverse_order(tmp_path):
     assert closed == ["service_node_b", "service_node_a"]
 
 
-def test_invalid_node_config_closes_session_before_error(tmp_path):
+def test_invalid_node_config_closes_session_before_error():
     closed = []
 
     class Session:
@@ -254,13 +265,13 @@ def test_invalid_node_config_closes_session_before_error(tmp_path):
     service = MetricsService()
     with pytest.raises((TypeError, ValueError)):
         service.start(
-            _args(tmp_path, ["service_invalid_node"]),
+            _args(["service_invalid_node"]),
             _ports(),
         )
     assert closed == [True]
 
 
-def test_local_sink_close_does_not_close_node_resources(tmp_path):
+def test_local_sink_close_does_not_close_node_resources():
     order = []
     sink = RecordingSink(fail_emit=False, fail_close=False)
 
@@ -274,7 +285,7 @@ def test_local_sink_close_does_not_close_node_resources(tmp_path):
     _register("service_node", lambda _: sink, start_node=lambda _: Session())
     service = MetricsService()
     ports = _ports()
-    service.start(_args(tmp_path, ["service_node"]), ports)
+    service.start(_args(["service_node"]), ports)
     service.get_event_sink()
     service.close_sinks(timeout=1)
     assert sink.closed
@@ -283,11 +294,7 @@ def test_local_sink_close_does_not_close_node_resources(tmp_path):
     assert order == ["node"]
 
 
-def test_close_uses_one_budget_and_continues_after_failure(monkeypatch):
-    import tokenspeed.runtime.metrics.service as service_module
-
-    now = [10.0]
-    monkeypatch.setattr(service_module.time, "monotonic", lambda: now[0])
+def test_close_uses_one_budget_and_continues_after_failure():
     timeouts = []
 
     class SlowSink:
@@ -296,7 +303,7 @@ def test_close_uses_one_budget_and_continues_after_failure(monkeypatch):
 
         def close(self, timeout):
             timeouts.append(timeout)
-            now[0] += 0.75
+            time.sleep(0.01)
             raise RuntimeError("close failed")
 
     _register("service_budget_a", lambda _: SlowSink(), start_node=None)
@@ -305,10 +312,11 @@ def test_close_uses_one_budget_and_continues_after_failure(monkeypatch):
     service.connect({"service_budget_a": {}, "service_budget_b": {}})
     service.get_event_sink()
     service.close(timeout=1)
-    assert timeouts == [1.0, 0.25]
+    assert len(timeouts) == 2
+    assert 0 <= timeouts[1] < timeouts[0] <= 1.0
 
 
-def test_explicit_start_can_begin_new_lifecycle_after_close(tmp_path):
+def test_explicit_start_can_begin_new_lifecycle_after_close():
     created = []
 
     def create_sink(config):
@@ -318,7 +326,7 @@ def test_explicit_start_can_begin_new_lifecycle_after_close(tmp_path):
 
     _register("service_restart", create_sink, start_node=None)
     service = MetricsService()
-    args = _args(tmp_path, ["service_restart"])
+    args = _args(["service_restart"])
     service.start(args, _ports())
     first = service.get_event_sink()
     service.close(timeout=1)
@@ -333,7 +341,7 @@ def test_explicit_start_can_begin_new_lifecycle_after_close(tmp_path):
     service.close(timeout=1)
 
 
-def test_prepare_validates_once_and_copies_session_configuration(tmp_path):
+def test_prepare_validates_once_and_copies_session_configuration():
     from tokenspeed.runtime.metrics.registry import register_metric_reporter
 
     validations = []
@@ -369,7 +377,7 @@ def test_prepare_validates_once_and_copies_session_configuration(tmp_path):
         override=True,
     )
     service = MetricsService()
-    args = _args(tmp_path, ["service_prepare"])
+    args = _args(["service_prepare"])
     service.prepare(args)
     service.prepare(args)
     assert validations == [{}]

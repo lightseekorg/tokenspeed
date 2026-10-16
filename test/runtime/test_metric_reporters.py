@@ -72,7 +72,7 @@ def test_external_output_preserves_weighted_observations():
         LABELS,
         max_model_len=MAX_MODEL_LEN,
         enabled=True,
-        reporters=["external_jsonl"],
+        reporters=["external_reporter"],
         event_sink=sink,
     )
     metrics.observe_time_to_first_token(0.25, stream=True)
@@ -87,12 +87,12 @@ def test_external_output_preserves_weighted_observations():
     ]
 
 
-def test_jsonl_only_does_not_load_prometheus(monkeypatch):
+def test_plugin_only_does_not_load_prometheus(monkeypatch):
     original_import = builtins.__import__
 
     def reject_prometheus(name, *args, **kwargs):
         if name == "prometheus_client" or name.startswith("prometheus_client."):
-            raise AssertionError("JSONL-only metrics imported Prometheus")
+            raise AssertionError("Plugin-only metrics imported Prometheus")
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", reject_prometheus)
@@ -101,7 +101,7 @@ def test_jsonl_only_does_not_load_prometheus(monkeypatch):
         LABELS,
         max_model_len=MAX_MODEL_LEN,
         enabled=True,
-        reporters=["jsonl"],
+        reporters=["test_reporter"],
         event_sink=sink,
     )
     metrics.observe_time_to_first_token(0.25, stream=True)
@@ -117,7 +117,7 @@ def test_dual_reporters_preserve_weighted_histogram():
         LABELS,
         max_model_len=MAX_MODEL_LEN,
         enabled=True,
-        reporters=["prometheus", "jsonl"],
+        reporters=["prometheus", "test_reporter"],
         event_sink=sink,
         registry=registry,
     )
@@ -138,7 +138,9 @@ def test_dual_reporters_preserve_weighted_histogram():
     assert len(sink.events) == 3
 
 
-@pytest.mark.parametrize("reporters", [["jsonl"], ["prometheus", "jsonl"]])
+@pytest.mark.parametrize(
+    "reporters", [["test_reporter"], ["prometheus", "test_reporter"]]
+)
 def test_request_finish_keeps_counter_deltas_observations_and_labels(reporters):
     sink = ListSink()
     registry = CollectorRegistry()
@@ -199,7 +201,9 @@ def test_request_finish_keeps_counter_deltas_observations_and_labels(reporters):
                 )
 
 
-@pytest.mark.parametrize("reporters", [["jsonl"], ["prometheus", "jsonl"]])
+@pytest.mark.parametrize(
+    "reporters", [["test_reporter"], ["prometheus", "test_reporter"]]
+)
 def test_preemptions_preserve_positive_round_deltas(reporters):
     sink = ListSink()
     registry = CollectorRegistry()
@@ -233,7 +237,7 @@ def test_dual_scheduler_snapshot_and_compile_deltas():
     metrics = EngineMetrics(
         LABELS,
         enabled=True,
-        reporters=["prometheus", "jsonl"],
+        reporters=["prometheus", "test_reporter"],
         event_sink=sink,
         registry=registry,
     )
@@ -271,7 +275,9 @@ def test_dual_scheduler_snapshot_and_compile_deltas():
     )
 
 
-@pytest.mark.parametrize("reporters", [["jsonl"], ["prometheus", "jsonl"]])
+@pytest.mark.parametrize(
+    "reporters", [["test_reporter"], ["prometheus", "test_reporter"]]
+)
 def test_idle_scheduler_gauges_emit_once_per_second(monkeypatch, reporters):
     clock = Clock()
     monkeypatch.setattr(reporter.time, "monotonic", clock.monotonic)
@@ -314,7 +320,7 @@ def test_gauge_changes_are_immediate_and_snapshot_uses_monotonic_time(monkeypatc
     metrics = EngineMetrics(
         LABELS,
         enabled=True,
-        reporters=["prometheus", "jsonl"],
+        reporters=["prometheus", "test_reporter"],
         event_sink=sink,
         registry=registry,
     )
@@ -343,7 +349,9 @@ def test_gauge_snapshot_state_is_independent_per_label_set(monkeypatch):
     clock = Clock()
     monkeypatch.setattr(reporter.time, "monotonic", clock.monotonic)
     sink = ListSink()
-    gauge = MetricFactory(enabled=True, reporters=["jsonl"], event_sink=sink).gauge(
+    gauge = MetricFactory(
+        enabled=True, reporters=["test_reporter"], event_sink=sink
+    ).gauge(
         name="tokenspeed:test_gauge",
         documentation="Gauge with independently updated labels.",
         labelnames=["worker"],
@@ -362,7 +370,9 @@ def test_gauge_snapshot_state_is_independent_per_label_set(monkeypatch):
 
 def test_repeated_counter_increments_and_histogram_observations_are_preserved():
     sink = ListSink()
-    metrics = EngineMetrics(LABELS, enabled=True, reporters=["jsonl"], event_sink=sink)
+    metrics = EngineMetrics(
+        LABELS, enabled=True, reporters=["test_reporter"], event_sink=sink
+    )
     for _ in range(3):
         metrics.record_nan_abort()
         metrics.observe_request_queue_time(0.25)
@@ -372,9 +382,11 @@ def test_repeated_counter_increments_and_histogram_observations_are_preserved():
     ] * 3
 
 
-def test_jsonl_speculation_and_abort_counters():
+def test_plugin_speculation_and_abort_counters():
     sink = ListSink()
-    metrics = EngineMetrics(LABELS, enabled=True, reporters=["jsonl"], event_sink=sink)
+    metrics = EngineMetrics(
+        LABELS, enabled=True, reporters=["test_reporter"], event_sink=sink
+    )
     metrics.record_spec_decode_step(
         num_decode_slots=2, accepted_draft_tokens=3, draft_width=4
     )
@@ -398,7 +410,7 @@ def test_aborted_zero_token_request_omits_success_and_tpot():
         LABELS,
         max_model_len=MAX_MODEL_LEN,
         enabled=True,
-        reporters=["jsonl"],
+        reporters=["test_reporter"],
         event_sink=sink,
     )
     metrics.record_request_finish(
@@ -428,7 +440,7 @@ def test_transfer_reporters_preserve_dynamic_stage_labels():
     metrics = KVTransferMetrics(
         LABELS,
         enabled=True,
-        reporters=["prometheus", "jsonl"],
+        reporters=["prometheus", "test_reporter"],
         event_sink=sink,
         registry=registry,
     )
@@ -460,7 +472,7 @@ def test_transfer_reporters_preserve_dynamic_stage_labels():
 
 
 @pytest.mark.parametrize(
-    "reporters", [["prometheus"], ["jsonl"], ["prometheus", "jsonl"]]
+    "reporters", [["prometheus"], ["test_reporter"], ["prometheus", "test_reporter"]]
 )
 def test_disabled_collectors_never_register_or_emit(reporters):
     sink = ListSink()
@@ -487,17 +499,20 @@ def test_disabled_collectors_never_register_or_emit(reporters):
     assert sink.events == []
 
 
-def test_enabled_jsonl_requires_a_sink():
+def test_enabled_plugin_requires_a_sink():
     with pytest.raises(ValueError, match="sink"):
         RequestMetrics(
-            LABELS, max_model_len=MAX_MODEL_LEN, enabled=True, reporters=["jsonl"]
+            LABELS,
+            max_model_len=MAX_MODEL_LEN,
+            enabled=True,
+            reporters=["test_reporter"],
         )
     RequestMetrics(
-        LABELS, max_model_len=MAX_MODEL_LEN, enabled=False, reporters=["jsonl"]
+        LABELS, max_model_len=MAX_MODEL_LEN, enabled=False, reporters=["test_reporter"]
     )
 
 
-def test_prometheus_only_ignores_optional_jsonl_sink():
+def test_prometheus_only_ignores_optional_plugin_sink():
     sink = ListSink()
     registry = CollectorRegistry()
     metrics = RequestMetrics(

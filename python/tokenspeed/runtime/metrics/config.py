@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import json
-import math
 from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.metrics.events import MetricConfig
@@ -58,21 +57,6 @@ def resolve_metrics_options(args: ServerArgs) -> None:
     ):
         raise ValueError("metrics reporters must contain nonempty names")
     args.metrics_reporters = list(dict.fromkeys(reporters))
-    if "jsonl" not in reporters:
-        return
-    if not args.metrics_jsonl_dir:
-        raise ValueError("JSONL metrics require a directory (--metrics-jsonl-dir)")
-    if args.metrics_jsonl_max_size_mb <= 0:
-        raise ValueError("JSONL metrics max size must be positive")
-    if args.metrics_jsonl_backup_count < 0:
-        raise ValueError("JSONL metrics backup count must be nonnegative")
-    if args.metrics_jsonl_queue_size <= 0:
-        raise ValueError("JSONL metrics queue size must be positive")
-    if (
-        not math.isfinite(args.metrics_jsonl_flush_interval)
-        or args.metrics_jsonl_flush_interval <= 0
-    ):
-        raise ValueError("JSONL metrics flush interval must be finite and positive")
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -107,9 +91,9 @@ def resolve_reporter_configs(args: ServerArgs) -> dict[str, MetricConfig]:
                 json.load(source, object_pairs_hook=_unique_object)
             )
         for name, value in data.items():
-            if name in {"prometheus", "jsonl"}:
+            if name == "prometheus":
                 raise ValueError(
-                    "Use existing CLI options to configure built-in metric reporters"
+                    "Use existing CLI options to configure Prometheus metrics"
                 )
             if name not in selected:
                 raise ValueError(
@@ -124,16 +108,7 @@ def resolve_reporter_configs(args: ServerArgs) -> dict[str, MetricConfig]:
     for name in selected:
         if name == "prometheus":
             continue
-        if name == "jsonl":
-            config = {
-                "directory": args.metrics_jsonl_dir,
-                "max_bytes": args.metrics_jsonl_max_size_mb * 1024 * 1024,
-                "backup_count": args.metrics_jsonl_backup_count,
-                "queue_size": args.metrics_jsonl_queue_size,
-                "flush_interval": args.metrics_jsonl_flush_interval,
-            }
-        else:
-            config = external.get(name, {})
+        config = external.get(name, {})
         reporter = get_metric_reporter(name)
         resolved[name] = copy_metric_config(reporter.validate(config))
     return resolved

@@ -774,7 +774,7 @@ the draft's attention to the full history.
 | `--log-requests-level` | Request logging verbosity. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
 | --enable-metrics | Enable the selected metrics reporters. |
-| --metrics-reporters | Select prometheus, jsonl, or an installed metric output; repeat for multiple. Defaults to prometheus. |
+| --metrics-reporters | Select prometheus or an installed metric output; repeat for multiple. Defaults to prometheus. |
 | --metrics-reporter-config | JSON file mapping external reporter names to their settings. See [metric output plugins](../metrics-plugins.md). |
 | `--metrics-port` | Port for the engine's `/metrics` HTTP endpoint. Defaults to an automatically allocated free port (logged at startup). |
 | `--metrics-host` | Bind host for the `/metrics` endpoint. Defaults to `--host`. |
@@ -817,9 +817,9 @@ is intentionally verbose. Enable it only while debugging. For
 decode-only batches it also logs the anchor, draft candidates, target verify
 tokens, and their position-wise matches.
 
-For raw observations that an independent consumer can forward to another monitoring
-system, see [Raw metrics JSONL](../raw-metrics.md). JSONL-only reporting does not
-start a Prometheus endpoint.
+To send observations to another monitoring system, install and select a
+[metric output plugin](../metrics-plugins.md). Selecting only external outputs
+does not start a Prometheus endpoint.
 
 ### Prometheus metrics
 

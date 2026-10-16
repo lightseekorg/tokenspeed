@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Raw metrics flags through the actual engine argument parser."""
+"""Plugin selection and configuration through the engine argument parser."""
 
 import argparse
 import os
@@ -39,11 +39,14 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
     "flags, expected",
     [
         ([], ["prometheus"]),
-        (["--metrics-reporters", "jsonl"], ["jsonl"]),
-        (["--metrics-reporters", "external_jsonl"], ["external_jsonl"]),
+        (["--metrics-reporters", "external"], ["external"]),
         (
-            ["--metrics-reporters=jsonl", "--metrics-reporters=prometheus"],
-            ["jsonl", "prometheus"],
+            ["--metrics-reporters=external", "--metrics-reporters=prometheus"],
+            ["external", "prometheus"],
+        ),
+        (
+            ["--metrics-reporters=first", "--metrics-reporters=second"],
+            ["first", "second"],
         ),
     ],
 )
@@ -55,45 +58,11 @@ def test_reporter_flags_do_not_append_prometheus_implicitly(flags, expected):
             "--model",
             "test-model",
             "--enable-metrics",
-            "--metrics-jsonl-dir",
-            "/tmp/metrics",
             *flags,
         ]
     )
     resolve_metrics_options(args)
     assert args.metrics_reporters == expected
-    assert args.metrics_jsonl_max_size_mb == 256
-
-
-def test_explicit_jsonl_rotation_parameters_survive_parser():
-    parser = argparse.ArgumentParser()
-    ServerArgs.add_cli_args(parser)
-    args = parser.parse_args(
-        [
-            "--model",
-            "test-model",
-            "--enable-metrics",
-            "--metrics-reporters",
-            "jsonl",
-            "--metrics-jsonl-dir",
-            "/tmp/metrics",
-            "--metrics-jsonl-max-size-mb",
-            "512",
-            "--metrics-jsonl-backup-count",
-            "0",
-            "--metrics-jsonl-queue-size",
-            "300",
-            "--metrics-jsonl-flush-interval",
-            "0.2",
-        ]
-    )
-    resolve_metrics_options(args)
-    assert (
-        args.metrics_jsonl_max_size_mb,
-        args.metrics_jsonl_backup_count,
-        args.metrics_jsonl_queue_size,
-        args.metrics_jsonl_flush_interval,
-    ) == (512, 0, 300, 0.2)
 
 
 def test_plugin_config_path_is_preserved_without_loading_file():
@@ -104,7 +73,7 @@ def test_plugin_config_path_is_preserved_without_loading_file():
             "--model",
             "test-model",
             "--metrics-reporters",
-            "external_jsonl",
+            "external",
             "--metrics-reporter-config",
             "/not-opened-during-parsing.json",
         ]

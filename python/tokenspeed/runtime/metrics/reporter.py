@@ -21,7 +21,7 @@
 """Dispatch metric operations to Prometheus and raw event reporters.
 
 Prometheus objects are created lazily, after its multiprocess directory is
-configured. JSONL keeps counter deltas, gauge snapshots and histogram samples;
+configured. Plugins receive counter deltas, gauge snapshots and histogram samples;
 batched histograms carry one per-token value and its token count as weight.
 """
 

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Reporter selection and JSONL configuration without loading a model."""
+"""Reporter selection and plugin configuration without loading a model."""
 
 import argparse
 import json
@@ -41,11 +41,6 @@ def options(**changes):
         enable_metrics=True,
         metrics_reporters=None,
         metrics_reporter_config=None,
-        metrics_jsonl_dir=None,
-        metrics_jsonl_max_size_mb=256,
-        metrics_jsonl_backup_count=4,
-        metrics_jsonl_queue_size=10000,
-        metrics_jsonl_flush_interval=1.0,
     )
     values.update(changes)
     parser = argparse.ArgumentParser()
@@ -54,15 +49,15 @@ def options(**changes):
     return parser.parse_args(["--model", "test-model"])
 
 
-def test_legacy_default_and_explicit_jsonl_selection(tmp_path):
+def test_legacy_default_and_explicit_plugin_selection():
     legacy = options()
     resolve_metrics_options(legacy)
     assert legacy.metrics_reporters == ["prometheus"]
     assert metrics_enabled(legacy, "prometheus")
-    assert not metrics_enabled(legacy, "jsonl")
-    raw = options(metrics_reporters=["jsonl"], metrics_jsonl_dir=str(tmp_path))
+    assert not metrics_enabled(legacy, "external")
+    raw = options(metrics_reporters=["external"])
     resolve_metrics_options(raw)
-    assert metrics_enabled(raw, "jsonl")
+    assert metrics_enabled(raw, "external")
     assert not metrics_enabled(raw, "prometheus")
 
 
@@ -70,46 +65,33 @@ def test_legacy_default_and_explicit_jsonl_selection(tmp_path):
 def test_unset_reporters_keep_legacy_metrics_without_normalization(enabled):
     args = options(enable_metrics=enabled)
     assert metrics_enabled(args, "prometheus") is enabled
-    assert not metrics_enabled(args, "jsonl")
     assert not metrics_enabled(args, "external")
 
 
-def test_dual_reporter_and_disabled_metrics(tmp_path):
-    args = options(
-        metrics_reporters=["jsonl", "prometheus", "jsonl"],
-        metrics_jsonl_dir=str(tmp_path),
-    )
+def test_dual_reporter_and_disabled_metrics():
+    args = options(metrics_reporters=["external", "prometheus", "external"])
     resolve_metrics_options(args)
-    assert args.metrics_reporters == ["jsonl", "prometheus"]
-    assert metrics_enabled(args, "jsonl") and metrics_enabled(args, "prometheus")
+    assert args.metrics_reporters == ["external", "prometheus"]
+    assert metrics_enabled(args, "external") and metrics_enabled(args, "prometheus")
     args.enable_metrics = False
-    assert not metrics_enabled(args, "jsonl")
+    assert not metrics_enabled(args, "external")
     assert not metrics_enabled(args, "prometheus")
 
 
 @pytest.mark.parametrize(
-    "changes, message",
-    [
-        ({"metrics_reporters": []}, "reporter"),
-        ({"metrics_jsonl_dir": None}, "directory"),
-        ({"metrics_jsonl_max_size_mb": 0}, "size"),
-        ({"metrics_jsonl_backup_count": -1}, "backup"),
-        ({"metrics_jsonl_queue_size": 0}, "queue"),
-        ({"metrics_jsonl_flush_interval": 0}, "flush"),
-        ({"metrics_jsonl_flush_interval": float("nan")}, "flush"),
-    ],
+    "reporters",
+    [[], [""], ["   "], [1]],
 )
-def test_reject_invalid_output_configuration(tmp_path, changes, message):
-    args = options(metrics_reporters=["jsonl"], metrics_jsonl_dir=str(tmp_path))
-    vars(args).update(changes)
-    with pytest.raises(ValueError, match=message):
+def test_reject_invalid_reporter_selection(reporters):
+    args = options(metrics_reporters=reporters)
+    with pytest.raises(ValueError, match="reporter"):
         resolve_metrics_options(args)
 
 
 def test_external_name_is_resolved_after_argument_parsing():
-    args = options(metrics_reporters=["external_jsonl", "external_jsonl"])
+    args = options(metrics_reporters=["external", "external"])
     resolve_metrics_options(args)
-    assert args.metrics_reporters == ["external_jsonl"]
+    assert args.metrics_reporters == ["external"]
 
 
 @pytest.fixture
@@ -181,8 +163,7 @@ def test_unknown_selection_fails_at_runtime_preparation(plugin_registry):
     "content, message",
     [
         ("[]", "object"),
-        ('{"jsonl": {}}', "built-in"),
-        ('{"prometheus": {}}', "built-in"),
+        ('{"prometheus": {}}', "CLI options"),
         ('{"unused": {}}', "not selected"),
         ('{"external": {}, "external": {}}', "Duplicate"),
         ('{"external": []}', "object"),
@@ -201,7 +182,7 @@ def test_bad_plugin_file_is_rejected_before_creation(
         config.resolve_reporter_configs(args)
 
 
-def test_raw_output_shutdown_selection_includes_external_plugins():
+def test_raw_output_selection_includes_external_plugins():
     from tokenspeed.runtime.metrics import config
 
     assert config.raw_metrics_enabled(options(metrics_reporters=["external"]))

@@ -1,10 +1,10 @@
 # Metric output plugins
 
 Metric output plugins receive the observations already collected by TokenSpeed.
-They adapt those observations to an external monitoring service or another output
-format. They do not replace metric definitions, request timing, or rank selection.
-Prometheus retains its native aggregation and /metrics endpoint. The built-in
-JSONL reporter uses the same output interface as installed plugins.
+They adapt those observations to an external monitoring service and own their
+delivery mechanism. They do not replace metric definitions, request timing, or
+rank selection. Prometheus remains the default and retains its native aggregation
+and /metrics endpoint.
 
 ## Discovery and selection
 
@@ -16,8 +16,8 @@ example_metrics = "example_metrics:register"
 ```
 
 TokenSpeed discovers installed entry points and calls register once per process.
-Registration must only declare factories; it must not start threads, connect to a
-service, or open output files. Install the package in the Python environment used
+Registration must only declare factories; it must not start threads or acquire
+external resources. Install the package in the Python environment used
 by every participating node. Installation makes an output available; selecting
 its registered name enables it.
 
@@ -43,10 +43,11 @@ The configuration file maps external reporter names to plugin-specific settings:
 
 An external output without a configuration entry receives an empty object.
 Unknown selections, duplicate JSON keys, configuration for an unselected output,
-and invalid plugin settings fail startup. Configure the built-in prometheus and
-jsonl reporters with their dedicated CLI flags, not this file. With metrics
-disabled, no output plugin resources are created. Without an explicit reporter
-selection, --enable-metrics continues to select Prometheus only.
+and invalid plugin settings fail startup. Configure Prometheus with its existing
+CLI flags, not this file. With metrics disabled, no output plugin resources are
+created. Without an explicit reporter selection, --enable-metrics continues to
+select Prometheus only. Selecting only external outputs does not start a
+Prometheus endpoint.
 
 ## Register creation callbacks
 
@@ -81,11 +82,11 @@ def register():
 | start_node(config) | Optionally create launcher-owned resources shared by the node. Return a MetricNodeSession with producer_config and close(timeout). |
 
 Pass start_node=None explicitly when no shared resource is needed. In this case,
-the normalized configuration becomes the producer configuration directly. A JSONL
-output can instead create a shared writer in start_node and local senders in
-create_sink. Only plain configuration crosses spawn; never return a live socket,
-thread, or SDK client in producer_config. TokenSpeed validates and copies both
-configuration results before passing them to another process.
+the normalized configuration becomes the producer configuration directly, and
+create_sink can construct the plugin's SDK adapter in each producer process.
+Only plain configuration crosses spawn; never return a live socket, thread, or
+SDK client in producer_config. TokenSpeed validates and copies both configuration
+results before passing them to another process.
 
 Registering an existing name requires override=True. Failed plugin registration
 rolls back its metric registrations along with its other runtime registrations.
@@ -104,21 +105,39 @@ close(timeout). Neither method requires inheriting a base class.
 | timestamp_ns | Observation wall-clock timestamp in Unix nanoseconds. |
 | metric | Existing metric name, including the counter _total suffix. |
 | operation | inc, set, or observe. |
-| value | Counter delta, current gauge value, or histogram observation. |
+| value | Counter delta, current gauge value, or histogram observation, in the metric's documented unit. |
 | labels | Labels supplied by the collection point. |
 | weight | Observation multiplicity; 1 for inc and set. |
 
 Treat the event and its labels as read-only and retain a stable snapshot before
 returning from emit. An observe event with value 0.01 and weight 3 contributes
-three samples of 0.01, not one. Preserve this weight when adapting a destination
-SDK. It does not recover per-token timing that the collector never measured.
+three samples of 0.01: a count of 3 and a sum of 0.03. Preserve this weight when
+adapting a destination SDK. It does not recover per-token timing that the
+collector never measured.
 
-All raw outputs receive gauge changes and refreshes according to the policy in
-[Raw metrics JSONL](raw-metrics.md#file-format). Filtering happens once before
-fan-out, so plugins do not each implement deduplication. Counter increments and
-histogram observations are not deduplicated. Prometheus continues to receive each
-update. Labels and collection ranks retain their existing meanings; a plugin
-must not independently discard every nonzero global rank.
+Events are observations before reporter aggregation, not cumulative Prometheus
+snapshots, request summaries, or request payload logs. Labels and collection
+ranks retain their existing meanings; a plugin must not independently discard
+every nonzero global rank. A headless engine has no frontend and therefore does
+not generate frontend request metrics. See
+[server observability](configuration/server.md#observability) for metric
+definitions and engine roles.
+
+For each metric and label set, plugins receive the first gauge value and every
+value change. Repeated assignments of the same value are suppressed before event
+construction and fan-out. If the value stays unchanged, the next assignment at
+least one second after the last emitted event produces a fresh snapshot. The
+interval uses a monotonic clock; event timestamps remain wall-clock observation
+times. There is no timer emitting values when the producer stops updating, and
+a long gap does not backfill snapshots. Plugins do not need to implement this
+filtering themselves.
+
+Gauge events describe state changes, not uniformly spaced samples. Carry the
+last value forward between updates and use elapsed time for time averages; do
+not sum successive gauge values. Counter increments and histogram observations
+are never deduplicated. Prometheus continues to receive every update. Delivery
+is best-effort: a later gauge snapshot can restore the current value but cannot
+recover a lost transition.
 
 ## Asynchronous delivery and shutdown
 
@@ -145,15 +164,3 @@ These are cooperative contracts for trusted Python plugins. Catching exceptions
 cannot prevent a plugin from blocking inside emit or ignoring its close timeout.
 Delivery is best-effort unless a particular plugin documents stronger guarantees;
 the runtime does not provide durable queues or exactly-once reporting.
-
-## Reuse the built-in JSONL output
-
-An independently packaged output can register the existing JSONL callbacks under
-its own name: validate_jsonl_config, start_jsonl_node, and create_jsonl_sink in
-tokenspeed.runtime.metrics.jsonl. Its configuration must explicitly supply
-directory, max_bytes, backup_count, flush_interval, and queue_size. This shares
-the writer implementation and preserves the [JSONL consumer contract](raw-metrics.md).
-
-Multiple selected JSONL outputs must use separate directories. A writer remains
-owned by one instance on one node; consumers read files independently and do not
-control file rotation or retention.
