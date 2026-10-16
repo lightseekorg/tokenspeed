@@ -1485,20 +1485,10 @@ extend, mixed batches and graph replay. The existing `gluon` attention name
 remains MLA-only. With `--attention-backend triton`, omit
 `--enable-mixed-batch`: that backend does not support mixed MHA batches.
 
-Use the gateway dependencies pinned by this checkout. Older gateways that
-do not recognize Jinja generation markers can use an explicit, gateway-only
-template override:
-
-```bash
-python -m tokenspeed.runtime.models.beam_chat_template \
-  --source <checkpoint-dir>/chat_template.jinja \
-  --output <new-file-outside-checkpoint-dir>
-```
-
-The helper accepts only the released template hash and never modifies the
-checkpoint. A template rendering override does not add missing reasoning or
-tool parsers to an older gateway. Check raw generation, parsed chat/tool APIs,
-numerical parity and performance independently before deployment.
+Use the gateway dependencies pinned by this checkout and the original
+checkpoint chat template. The pinned gateway supports its generation markers;
+no Beam-specific template conversion is needed. Check raw generation, parsed
+chat/tool APIs, numerical parity and performance independently before deployment.
 
 ## Tuning order
 
