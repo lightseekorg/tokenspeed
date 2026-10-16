@@ -29,10 +29,16 @@ import logging
 import random
 import time
 from collections.abc import Callable
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
-import httpx
 from huggingface_hub.utils import HfHubHTTPError
+
+if TYPE_CHECKING:
+    # Only annotated, never touched at runtime: the response type differs
+    # between huggingface_hub releases (httpx on 1.x, requests before), and
+    # httpx is not a declared tokenspeed dependency. The body duck-types
+    # .status_code and .headers.get, which both response classes provide.
+    import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +63,18 @@ def call_with_hf_rate_limit_retry(description: str, call: Callable[[], T]) -> T:
     waiting again would exceed ``HF_RATE_LIMIT_RETRY_BUDGET_S``, re-raise the
     last error so a hard quota failure still surfaces instead of hanging.
     Any non-429 error propagates immediately.
+
+    Args:
+        description (str): What ``call`` is doing, embedded in the retry
+            log warning.
+        call (Callable[[], T]): The zero-argument callable to run.
+
+    Returns:
+        T: The result of ``call``.
+
+    Raises:
+        HfHubHTTPError: Immediately for any non-429 hub error, and for a 429
+            once waiting again would exceed ``HF_RATE_LIMIT_RETRY_BUDGET_S``.
     """
     waited_s = 0.0
     attempt = 0
@@ -88,7 +106,7 @@ def call_with_hf_rate_limit_retry(description: str, call: Callable[[], T]) -> T:
             time.sleep(delay_s)
 
 
-def _retry_after_s(response: httpx.Response) -> float | None:
+def _retry_after_s(response: "httpx.Response") -> float | None:
     retry_after = response.headers.get("Retry-After")
     if retry_after is None:
         return None

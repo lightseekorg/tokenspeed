@@ -373,14 +373,17 @@ def get_config(
     if is_remote_model:
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
+        def download_metadata() -> str:
+            return snapshot_download(
+                model,
+                revision=revision,
+                ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+            )
+
         with get_lock(model):
             model_path = call_with_hf_rate_limit_retry(
                 f"downloading metadata of {model}",
-                lambda: snapshot_download(
-                    model,
-                    revision=revision,
-                    ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
-                ),
+                download_metadata,
             )
             raw_config = load_raw_config(model_path)
 
@@ -397,11 +400,17 @@ def get_config(
                     # into transformers_modules. Remote code must not call
                     # get_config/get_tokenizer recursively for this repo: the
                     # host-local FileLock is intentionally non-reentrant.
-                    config = AutoConfig.from_pretrained(
-                        model,
-                        trust_remote_code=True,
-                        revision=snapshot_revision,
-                        **kwargs,
+                    def load_remote_code_config():
+                        return AutoConfig.from_pretrained(
+                            model,
+                            trust_remote_code=True,
+                            revision=snapshot_revision,
+                            **kwargs,
+                        )
+
+                    config = call_with_hf_rate_limit_retry(
+                        f"loading remote-code config of {model}",
+                        load_remote_code_config,
                     )
                 else:
                     logger.warning(
@@ -559,14 +568,17 @@ def get_generation_config(
         if not os.path.isdir(model):
             from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
+            def download_generation_config() -> str:
+                return snapshot_download(
+                    model,
+                    revision=revision,
+                    ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                )
+
             with get_lock(model):
                 model_path = call_with_hf_rate_limit_retry(
                     f"downloading generation config of {model}",
-                    lambda: snapshot_download(
-                        model,
-                        revision=revision,
-                        ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
-                    ),
+                    download_generation_config,
                 )
         return GenerationConfig.from_pretrained(
             model_path, trust_remote_code=trust_remote_code, **kwargs
@@ -922,18 +934,24 @@ def get_tokenizer(
     if not os.path.isdir(tokenizer_name):
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
+        def download_tokenizer_files() -> str:
+            return snapshot_download(
+                tokenizer_name,
+                revision=tokenizer_revision,
+                ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+            )
+
         with get_lock(tokenizer_name):
             tokenizer_path = call_with_hf_rate_limit_retry(
                 f"downloading tokenizer files of {tokenizer_name}",
-                lambda: snapshot_download(
-                    tokenizer_name,
-                    revision=tokenizer_revision,
-                    ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
-                ),
+                download_tokenizer_files,
             )
             snapshot_revision = _snapshot_commit_hash(tokenizer_path)
             if trust_remote_code and snapshot_revision is not None:
-                tokenizer = load_tokenizer(tokenizer_name, snapshot_revision)
+                tokenizer = call_with_hf_rate_limit_retry(
+                    f"loading remote-code tokenizer of {tokenizer_name}",
+                    lambda: load_tokenizer(tokenizer_name, snapshot_revision),
+                )
             elif trust_remote_code:
                 logger.warning(
                     "Cannot derive an immutable Hugging Face commit from "
