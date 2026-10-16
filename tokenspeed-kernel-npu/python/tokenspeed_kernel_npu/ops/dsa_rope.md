@@ -5,7 +5,8 @@
 `interleave_rope` fuses position lookup, interleaved-pair rotation into split
 halves, and the unchanged tail copy. Validated fast layouts are BF16/FP16,
 width 128, rotary width 64, and 1/4/8/16/32/64 heads. The Ascend framework entry
-registers both BF16 and FP16; FP32 retains the CANN path.
+registers BF16 and FP32; FP32 retains the CANN path. FP16 is supported only
+through the direct NPU helper and is not registered at the framework entry.
 Products and additions compute separately in FP32 (no FMA
 contraction), then round once to the output dtype. The tail is copied exactly.
 This rotates indexer keys; it does not write the attention KV cache.
@@ -15,7 +16,7 @@ original composition, preserving its accepted inputs and error handling.
 Tests compare against both CANN and an independent CPU FP32 formula, including
 token/head strides, empty inputs, fallback layouts and graph-updated positions.
 Tests cover 264 CANN/CPU comparisons, 48 graph-update cases,
-48 public-framework dispatch cases and 15 empty/fallback cases, including
+24 BF16 public-framework dispatch cases and 15 empty/fallback cases, including
 metadata layouts accepted by the original composition.
 The measured token counts are T = 1/8/64/65/128/256/512/1024. H = 1 represents
 2D keys; H = 4/8/16/32/64 covers local query head counts for total head counts
@@ -35,7 +36,7 @@ measurements; other token counts, head counts and layouts retain CANN:
 
 Each program handles one token, so large T with few heads can be slower than
 the CANN composition. Tests also cover 257, 513 and 1025 to check the dispatch
-boundaries. The framework entry is exercised with both dtypes, layouts and
+boundaries. The framework entry is exercised with BF16, both layouts and
 every supported head count at T = 64 and 1024.
 
 ```bash

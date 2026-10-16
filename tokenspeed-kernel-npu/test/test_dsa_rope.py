@@ -128,11 +128,11 @@ def test_rope_preserves_composite_table_reshape(table_width, dtype):
 
 @pytest.mark.parametrize("rows", [64, 1024])
 @pytest.mark.parametrize("heads", [1, 4, 8, 16, 32, 64])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("strided", [False, True])
-def test_rope_framework_dispatch(rows, heads, dtype, strided):
+def test_rope_framework_dispatch(rows, heads, strided):
     from tokenspeed_kernel.ops.attention.dsa import dsa_interleave_rope
 
+    dtype = torch.bfloat16
     shape = (rows, 128) if heads == 1 else (rows, heads, 128)
     base = torch.randn(
         (*shape[:-1], 256 if strided else 128), dtype=dtype, device="npu"

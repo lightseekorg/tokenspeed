@@ -60,7 +60,6 @@ if platform.is_npu:
         capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
         signatures=frozenset(
             {
-                format_signature(tensor=dense_tensor_format(torch.float16)),
                 format_signature(tensor=dense_tensor_format(torch.bfloat16)),
                 format_signature(tensor=dense_tensor_format(torch.float32)),
             }
