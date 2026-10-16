@@ -47,9 +47,12 @@ def _project(a, b):
 
 
 # Ragged M and N edges (2112 = 8.25 tiles), an odd K-tile count (4224 / 128),
-# and full tiles.
+# and full tiles. The last case is a ragged M edge whose last row of 2x2
+# clusters holds one valid row, leaving half of those CTAs without rows, at a
+# size the MI450 simulator lane can run.
 @pytest.mark.parametrize(
-    "m,n,k", [(4097, 2112, 7168), (4352, 7168, 4224), (4096, 3072, 512)]
+    "m,n,k",
+    [(4097, 2112, 7168), (4352, 7168, 4224), (4096, 3072, 512), (4097, 3072, 512)],
 )
 def test_largem_warp_pipeline_matches_torch(m, n, k):
     torch.manual_seed(m + n + k)

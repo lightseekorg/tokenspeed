@@ -40,6 +40,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
+    pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     prepare_cache_setup,
@@ -655,6 +656,52 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
     # conv states; the commit holds two int64 ids per request per layer.
     assert ple_bytes == (8 * (16 + 2 * 24) + 2 * 2 * 2 * 8 if ple_enabled else 0)
     assert setup.fixed_workspace_bytes == 128 + ple_bytes  # GDN conv + SSM: 128 B.
+
+
+def test_parent_is_its_planes_whatever_the_group_packings() -> None:
+    # Coprime packings, as Qwen4-Exp's PLE and QSA side planes get: a parent
+    # rounded up to their LCM (5376 bytes here) would hold 4096 bytes no field
+    # addresses. At Qwen3.8-Flash-Next TP1 that rounding made a 255 MB parent
+    # 54 GB.
+    def state(group_id: str) -> CacheGroupSpec:
+        return CacheGroupSpec(
+            group_id=group_id,
+            attn_kind="state",
+            sliding_window_tokens=None,
+            replayable=False,
+        )
+
+    layout = pack(
+        (
+            (
+                state("ssm"),
+                (CacheFieldSpec("ssm.state", "plane.ssm", (4096,), "uint8"),),
+            ),
+            (
+                state("side_a"),
+                (CacheFieldSpec("side_a.key", "plane.a", (256,), "uint8"),),
+            ),
+            (
+                state("side_b"),
+                (CacheFieldSpec("side_b.key", "plane.b", (256,), "uint8"),),
+            ),
+        ),
+        prefix_granularity=16,
+        cache_blocks_per_lcm_block={"ssm": 1, "side_a": 3, "side_b": 7},
+        alignment=256,
+        max_padding_fraction=float("inf"),
+    )
+    plan = layout.bind(3)
+
+    planes = sum(plane.bytes_per_lcm_block for plane in plan.planes)
+    assert planes == 4096 + 3 * 256 + 7 * 256
+    assert plan.lcm_block_bytes == planes
+    assert plan.arena_bytes == 4 * planes
+    # Every group's last page still ends inside the arena.
+    for group in plan.groups:
+        _, fields = plan.page_field_layout(group.group_id)
+        for base, stride, size in fields:
+            assert base + (group.page_count - 1) * stride + size <= plan.arena_bytes
 
 
 @pytest.mark.parametrize(

@@ -190,9 +190,9 @@ def _sort_routes_one_program(
     expert = gl.arange(0, EXPERT_PAD, layout=layout)
     count = gl.where(expert < E, count, 0)
     padded = (count + BLOCK_M - 1) // BLOCK_M * BLOCK_M
-    end = gl.cumsum(padded, 0)
-    start = end - padded
-    gl.store(num_valid_ids_ptr, gl.sum(padded, 0))
+    start = gl.cumsum(padded, 0) - padded
+    rows = gl.sum(padded, 0)
+    gl.store(num_valid_ids_ptr, rows)
     gl.store(num_valid_ids_ptr + 1, M)
     gl.store(cursor_ptr + expert, start, mask=expert < E)
     for j in range(0, gl.max(padded, 0) // BLOCK_M):
@@ -201,10 +201,27 @@ def _sort_routes_one_program(
             expert,
             mask=j * BLOCK_M < padded,
         )
-    for j in gl.static_range(BLOCK_M):
-        slot = start + count + j
-        gl.store(sorted_ids_ptr + slot, (TOP_K << 24) | M, mask=slot < end)
-    # The cursors must be in place before any wave claims a slot.
+    # Every routed row first holds the padding id; the routes overwrite
+    # theirs below. One store per ROUTE_BLOCK rows: per-expert padding stores
+    # (BLOCK_M of them over every expert) fill the store queue and stall on
+    # its acknowledgements.
+    for row0 in range(0, rows, ROUTE_BLOCK):
+        row = row0 + route
+        gl.store(
+            sorted_ids_ptr + row,
+            gl.zeros_like(row) + ((TOP_K << 24) | M),
+            mask=row < rows,
+        )
+    # The padding and the cursors must be in place before any wave claims a
+    # slot: every wave drains its stores, then all meet.
+    gl.inline_asm_elementwise(
+        asm="s_waitcnt vmcnt(0)",
+        constraints="=v,0",
+        args=[route],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
     gl.barrier()
     slot = gl.atomic_add(
         cursor_ptr + expert_id,

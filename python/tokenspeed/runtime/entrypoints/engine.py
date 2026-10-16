@@ -526,6 +526,16 @@ def _set_socket_interface(server_args: ServerArgs):
     logger.info(f"socket interface reaching {head}: {interface}")
 
 
+def _force_env(owner: str, key: str, value: str) -> None:
+    """Set ``key`` to ``value``: ``owner``'s promise beats the ambient
+    environment, so a conflicting value is replaced, loudly, instead of
+    silently voiding it."""
+    prior = os.environ.get(key)
+    if prior is not None and prior != value:
+        logger.warning(f"{owner} replaces {key}={prior} with {value}")
+    os.environ[key] = value
+
+
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -535,29 +545,47 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+    if getattr(server_args, "_beam_checkpoint", False) is None:
+        # A hub id the local cache does not hold yet (a first launch): fetch
+        # its config.json now, before any process starts.
+        server_args.resolve_model_defaults(download=True)
+        if server_args._beam_checkpoint:
+            # Beam's all-reduce fusion default across nodes reads the
+            # checkpoint as well (ServerArgs.resolve_communication): resolve
+            # it again from the downloaded file, as from a directory, so that
+            # every node of a launch decides it from the same config.json
+            # whatever its cache held when its arguments resolved.
+            server_args.resolve_communication()
+            server_args.resolve_numerics()
+        if server_args._beam_checkpoint is None and not server_args.disable_tf32:
+            logger.warning(
+                f"Cannot read the config.json of {server_args.model} before "
+                "launch, so TF32 stays at its default. For a Beam checkpoint, "
+                "pass its local directory as --model or pass --disable-tf32 so "
+                "that its FP32 router runs without TF32."
+            )
     if not server_args.disable_tf32:
         # Force TF32 on for cuBLAS/cuDNN matmuls. setdefault so a user's
         # explicit env wins; --disable-tf32 is the documented opt-out.
         os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "1")
         os.environ.setdefault("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
+    if getattr(server_args, "_beam_checkpoint", False):
+        # Beam serves without TF32 (ServerArgs.resolve_model_defaults): both
+        # switches off for the processes started below, whatever the caller
+        # exported.
+        for key in ("NVIDIA_TF32_OVERRIDE", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"):
+            _force_env("Beam (no TF32)", key, "0")
     if server_args.numerics in BITWISE_ENVELOPES:
         # Bitwise envelopes: no TF32 anywhere, and pin NCCL to one
         # algorithm/protocol so the reduction association order cannot switch
         # with message size. The envelope's promise beats ambient
-        # environment: a conflicting value is replaced, loudly, instead of
-        # silently voiding the contract.
+        # environment (_force_env).
         for key, value in (
             ("NVIDIA_TF32_OVERRIDE", "0"),
             ("NCCL_ALGO", "Ring"),
             ("NCCL_PROTO", "Simple"),
         ):
-            prior = os.environ.get(key)
-            if prior is not None and prior != value:
-                logger.warning(
-                    f"--numerics {server_args.numerics} replaces {key}={prior} "
-                    f"with {value}"
-                )
-            os.environ[key] = value
+            _force_env(f"--numerics {server_args.numerics}", key, value)
 
     _set_socket_interface(server_args)
 

@@ -25,6 +25,10 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.dsa.cuda import (
+    has_ragged_decode_topk,
+    ragged_decode_topk,
+)
 from tokenspeed_kernel.ops.attention.qsa import (
     qsa_sparse_attention,
     qwen4_exp_qsa_block_topk,
@@ -135,6 +139,7 @@ def _check_replays(forward, sources, targets, enabled):
         ("stream", 1024, 64),
         ("stream", 16384, 512),
         ("logits", 1024, 64),
+        ("logits", 32768, 512),
     ],
 )
 def test_qsa_selection_waits_for_query_cache_and_metadata(
@@ -311,3 +316,309 @@ def test_qsa_attention_waits_for_slots_and_kv(
         return (output,)
 
     _check_replays(forward, sources, targets, enabled)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_qsa_selection_refreshes_block_frontiers(enabled, persistent, restore_pdl):
+    if persistent and not has_ragged_decode_topk():
+        pytest.skip("CUDA persistent top-k is unavailable")
+    batch, width, heads, dim, page_size, blocks = 3, 4, 4, 128, 64, 17408
+    rows = batch * width
+    query = torch.randn(rows, heads, dim, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn(
+        (batch * blocks + page_size, 1, dim), device="cuda", dtype=query.dtype
+    )
+    sources = (query, cache)
+    targets = tuple(torch.empty_like(t) for t in sources)
+    table = torch.arange(
+        1, batch * blocks // page_size + 1, device="cuda", dtype=torch.int32
+    ).reshape(batch, -1)
+    requests = torch.arange(batch, device="cuda").repeat_interleave(width)
+    complete = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    workspace = (
+        torch.empty(1024 * 1024, device="cuda", dtype=torch.uint8)
+        if persistent
+        else None
+    )
+
+    def forward(enable_pdl):
+        _publish(sources, targets)
+        return qwen4_exp_qsa_block_topk(
+            targets[0],
+            targets[1],
+            table,
+            requests,
+            complete,
+            page_size=page_size,
+            block_topk=512,
+            queries_per_request=width,
+            max_partial_bytes=32 * 1024 * 1024,
+            algorithm="logits",
+            persistent_topk_workspace=workspace,
+            enable_pdl=enable_pdl,
+        )
+
+    forward(enabled)
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        actual = forward(enabled)
+    _check_graph_edges(graph, enabled)
+    for frontiers in ((0, 511, blocks), (1, 8193, 16384), (512, 513, blocks)):
+        complete.copy_(
+            torch.tensor(frontiers, device="cuda", dtype=torch.int32).repeat_interleave(
+                width
+            )
+        )
+        for source in sources:
+            source.normal_()
+        expected = forward(False).sort(dim=1).values.clone()
+        for target in targets:
+            target.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(actual.sort(dim=1).values, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "length_dtype, length_stride",
+    [(torch.int32, 1), (torch.int64, 1), (torch.int32, 2)],
+)
+@pytest.mark.parametrize("q_len_per_req", [1, 4])
+@pytest.mark.parametrize(
+    "rows, columns",
+    [
+        (4, 4096),
+        (36, 16384),
+        (36, 65536),
+        (4, 65536),
+        (4, 131072),
+        (4, 262144),
+    ],
+)
+def test_persistent_topk_waits_for_producers(
+    enabled, length_dtype, length_stride, q_len_per_req, rows, columns, restore_pdl
+):
+    if not has_ragged_decode_topk():
+        pytest.skip("CUDA persistent top-k is unavailable")
+    logits = torch.randn(rows, columns, device="cuda")
+    length_values = torch.tensor(
+        [0, 1, 511, 512, 513, 8192, 8193, columns], device="cuda", dtype=length_dtype
+    ).clamp_max(columns)
+    length_storage = torch.zeros(
+        rows // q_len_per_req * length_stride, device="cuda", dtype=length_dtype
+    )
+    lengths = length_storage[::length_stride]
+    lengths.copy_(
+        length_values[
+            torch.arange(rows // q_len_per_req, device="cuda") % length_values.numel()
+        ]
+    )
+    lengths[-1] = columns
+    target_logits = torch.empty_like(logits)
+    target_length_storage = torch.empty_like(length_storage)
+    target_lengths = target_length_storage[::length_stride]
+    output = torch.empty(rows, 512, device="cuda", dtype=torch.int32)
+    workspace = torch.empty(1024 * 1024, device="cuda", dtype=torch.uint8)
+
+    def forward(enable_pdl):
+        _publish((logits, length_storage), (target_logits, target_length_storage))
+        ragged_decode_topk(
+            target_logits,
+            output,
+            512,
+            lengths=target_lengths,
+            workspace=workspace,
+            max_seq_len=columns,
+            q_len_per_req=q_len_per_req,
+            enable_pdl=enable_pdl,
+        )
+        return output
+
+    forward(enabled)
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        actual = forward(enabled)
+    # Length conversions add ordinary edges; the identity case checks PDL edges.
+    if length_dtype == torch.int32 and length_stride == 1:
+        _check_graph_edges(graph, enabled)
+    for step in range(3):
+        logits.normal_()
+        lengths.copy_(
+            length_values[
+                (torch.arange(lengths.numel(), device="cuda") + step)
+                % length_values.numel()
+            ]
+        )
+        lengths[-1] = columns
+        expected = forward(False).sort(dim=1).values.clone()
+        target_logits.fill_(float("nan"))
+        target_lengths.zero_()
+        graph.replay()
+        torch.testing.assert_close(actual.sort(dim=1).values, expected, rtol=0, atol=0)
+
+
+def _check_native_topk_edge(graph, enabled, rows, columns):
+    from cuda.bindings import driver as cu
+
+    # Identify the shared CUDA selector through a real reference launch,
+    # independently of its compiled symbol name or the model's other kernels.
+    logits = torch.zeros(rows, columns, device="cuda")
+    lengths = torch.full((rows,), columns, device="cuda", dtype=torch.int32)
+    output = torch.empty(rows, 512, device="cuda", dtype=torch.int32)
+    workspace = torch.empty(1024 * 1024, device="cuda", dtype=torch.uint8)
+    reference = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(reference):
+        ragged_decode_topk(
+            logits,
+            output,
+            512,
+            lengths=lengths,
+            workspace=workspace,
+            max_seq_len=columns,
+            q_len_per_req=1,
+            enable_pdl=enabled,
+        )
+    error, nodes, count = cu.cuGraphGetNodes(cu.CUgraph(reference.raw_cuda_graph()), 1)
+    assert error == cu.CUresult.CUDA_SUCCESS
+    assert count == 1
+    error, reference_params = cu.cuGraphKernelNodeGetParams(nodes[0])
+    assert error == cu.CUresult.CUDA_SUCCESS
+    expected_function = int(reference_params.func)
+
+    raw = cu.CUgraph(graph.raw_cuda_graph())
+    error, _, _, _, count = cu.cuGraphGetEdges(raw, 0)
+    assert error == cu.CUresult.CUDA_SUCCESS
+    error, _, targets, edges, _ = cu.cuGraphGetEdges(raw, count)
+    assert error == cu.CUresult.CUDA_SUCCESS
+    checked = 0
+    for target, edge in zip(targets, edges):
+        error, kind = cu.cuGraphNodeGetType(target)
+        assert error == cu.CUresult.CUDA_SUCCESS
+        if kind != cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+            continue
+        error, params = cu.cuGraphKernelNodeGetParams(target)
+        assert error == cu.CUresult.CUDA_SUCCESS
+        if int(params.func) == expected_function:
+            assert int(edge.type) == int(enabled)
+            checked += 1
+    assert checked == 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("rows, columns", [(4, 8192), (36, 16384), (4, 65536)])
+def test_dsa_persistent_decode_preserves_global_pdl(
+    enabled, rows, columns, restore_pdl, monkeypatch
+):
+    for package in ("deep_gemm", "deep_ep", "trtllm_kernel"):
+        pytest.importorskip(package)
+    from tokenspeed_kernel.ops.attention.dsa import deep_gemm as dsa
+
+    if not has_ragged_decode_topk():
+        pytest.skip("CUDA persistent top-k is unavailable")
+    # Exercise the supported TS_DSA_DECODE_TOPK_CUTEDSL=0 configuration.
+    monkeypatch.setattr(dsa, "_CUTE_DSL_DECODE_TOPK_ENABLED", False)
+    torch.manual_seed(397)
+    page, heads, dim, topk = 64, 32, 128, 512
+    query = torch.randn(rows, heads, dim, device="cuda", dtype=torch.bfloat16)
+    weights = torch.ones(rows, heads, device="cuda")
+    lengths = torch.full((rows,), columns, device="cuda", dtype=torch.int32)
+    table = torch.arange(rows * columns // page, device="cuda", dtype=torch.int32)
+    table = table.reshape(rows, columns // page)
+    # Zero keys make all valid scores equal; selected global slots must still
+    # belong to the request and be distinct, under either PDL setting.
+    cache = torch.zeros(rows * columns, dim + 4, device="cuda", dtype=torch.uint8)
+    lengths_2d = lengths[:, None].contiguous()
+    plan = dsa.deep_gemm_dsa_plan(page_size=page, seq_lens_2d=lengths_2d)
+    output = torch.empty(rows, topk, device="cuda", dtype=torch.int32)
+    counts = torch.empty(rows, device="cuda", dtype=torch.int32)
+
+    def forward():
+        return dsa.deep_gemm_dsa_decode_topk(
+            query,
+            weights,
+            lengths,
+            table,
+            page_size=page,
+            topk=topk,
+            softmax_scale=1.0,
+            q_len_per_req=1,
+            index_k_cache=cache,
+            seq_lens_2d=lengths_2d,
+            plan=plan,
+            out=output,
+            lens_out=counts,
+            initial_tokens=0,
+            local_tokens=0,
+            batch_invariant=False,
+        )
+
+    pdl_enabled(enabled)
+    forward()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        actual, actual_counts = forward()
+    _check_native_topk_edge(graph, enabled, rows, columns)
+    for _ in range(3):
+        query.normal_()
+        pdl_enabled(not enabled)
+        graph.replay()
+        start = torch.arange(rows, device="cuda")[:, None] * columns
+        assert ((actual >= start) & (actual < start + columns)).all()
+        selected = actual.sort(dim=1).values
+        assert (selected[:, 1:] > selected[:, :-1]).all()
+        torch.testing.assert_close(actual_counts, torch.full_like(actual_counts, topk))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("large_grid", [False, True])
+@pytest.mark.parametrize("columns", [8192, 16384, 65536])
+def test_persistent_topk_pdl_register_budget(enabled, large_grid, columns, restore_pdl):
+    from cuda.bindings import driver as cu
+
+    if not has_ragged_decode_topk():
+        pytest.skip("CUDA persistent top-k is unavailable")
+    sms = current_platform().sm_count
+    rows = sms + 4 if large_grid else max(36, sms - 4)
+    logits = torch.randn(rows, columns, device="cuda")
+    target = torch.empty_like(logits)
+    lengths = torch.full((rows,), min(16384, columns), device="cuda", dtype=torch.int32)
+    output = torch.empty(rows, 512, device="cuda", dtype=torch.int32)
+    workspace = torch.empty(1024 * 1024, device="cuda", dtype=torch.uint8)
+
+    def forward():
+        _publish((logits,), (target,))
+        ragged_decode_topk(
+            target,
+            output,
+            512,
+            lengths=lengths,
+            workspace=workspace,
+            max_seq_len=columns,
+            enable_pdl=enabled,
+            q_len_per_req=1,
+        )
+
+    forward()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        forward()
+    _check_graph_edges(graph, enabled)
+    error, _, _, _, count = cu.cuGraphGetEdges(cu.CUgraph(graph.raw_cuda_graph()), 0)
+    assert error == cu.CUresult.CUDA_SUCCESS
+    error, _, nodes, _, _ = cu.cuGraphGetEdges(
+        cu.CUgraph(graph.raw_cuda_graph()), count
+    )
+    assert error == cu.CUresult.CUDA_SUCCESS
+    assert len(nodes) == 1
+    error, params = cu.cuGraphKernelNodeGetParams(nodes[0])
+    assert error == cu.CUresult.CUDA_SUCCESS
+    expected_budget = 1 if enabled and not large_grid else 2
+    error, occupancy = cu.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        params.func, 1024, 0
+    )
+    assert error == cu.CUresult.CUDA_SUCCESS
+    # Register allocation varies by architecture/toolchain; guard the measured
+    # Blackwell configuration used to select this policy.
+    if torch.cuda.get_device_capability() == (10, 3):
+        assert occupancy == expected_budget

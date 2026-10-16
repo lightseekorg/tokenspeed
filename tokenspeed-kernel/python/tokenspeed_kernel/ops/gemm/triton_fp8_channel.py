@@ -124,11 +124,25 @@ def _fp8_channel_small_m_kernel(
 
 # (N, K, BLOCK_M) -> (BLOCK_N, BLOCK_K, num_warps, num_stages): measured
 # tiles that take precedence over the rule of ``_small_m_config`` for their
-# shape. Empty by default; a sweep of a model's weight shapes on its GPU
-# (each BLOCK_M bucket averaged over its row counts, 1-16 | 32 | 64) can
-# fill it. BLOCK_K must divide K: the kernel's K loop reads whole tiles,
-# masked along M and N only.
-_SMALL_M_TILES: dict[tuple[int, int, int], tuple[int, int, int, int]] = {}
+# shape. A sweep of a model's weight shapes on its GPU (each BLOCK_M bucket
+# averaged over its row counts, 1-16 | 32 | 64) fills it. The entries are the
+# fastest tiles of a GB200 sweep for Beam's TP8 rank shards: Q/K/V + output
+# gate, output projection, dense gate/up and down. BLOCK_K must divide K: the
+# kernel's K loop reads whole tiles, masked along M and N only.
+_SMALL_M_TILES: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
+    (1792, 5120, 16): (16, 512, 4, 3),
+    (1792, 5120, 32): (16, 256, 4, 4),
+    (1792, 5120, 64): (64, 256, 8, 3),
+    (5120, 768, 16): (64, 256, 4, 3),
+    (5120, 768, 32): (64, 256, 8, 3),
+    (5120, 768, 64): (64, 256, 4, 3),
+    (5120, 5120, 16): (64, 512, 4, 4),
+    (5120, 5120, 32): (64, 512, 4, 3),
+    (5120, 5120, 64): (64, 256, 8, 3),
+    (5120, 2560, 16): (64, 512, 4, 4),
+    (5120, 2560, 32): (64, 512, 4, 3),
+    (5120, 2560, 64): (64, 256, 8, 3),
+}
 
 
 def _small_m_config(m: int, n: int, k: int) -> tuple[int, int, int, int, int]:

@@ -840,7 +840,7 @@ def test_static_fp8_scale_names_only_per_tensor_static_linears():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mamba2_decode_reads_the_projection_view_in_place():
     """The flag that skips the decode copy: conv and state update read strided rows."""
-    from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+    from tokenspeed_kernel.ops.conv import (
         causal_conv1d_update,
     )
 

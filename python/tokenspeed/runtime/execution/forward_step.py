@@ -595,7 +595,7 @@ class ForwardStepRunner:
 
         def run_once():
             # Dummy add_batch keeps the grammar queue 1:1 with replays —
-            # fetch_batch pops once per forward, so warmup + capture
+            # build pops once per forward, so warmup + capture
             # would otherwise raise queue.Empty.
             if self.capturable_grammar is not None:
                 self.capturable_grammar.add_batch(

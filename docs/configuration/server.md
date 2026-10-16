@@ -89,8 +89,8 @@ switch an envelope folds is also available individually under `auto`.
 | Parameter | Purpose |
 | --- | --- |
 | `--numerics {auto,rl-bitwise}` | `auto` keeps every performance default. `rl-bitwise` folds the determinism switches (`--batch-invariant-collectives`, `--disable-autotune`, `--disable-tf32`, `--disable-pdl`, no fused all-reduce, `--moe-backend aok`, `--sampling-stream per-request`, `--dsa-slot-order sorted`) so tokens and logprobs are bitwise identical across runs and batch compositions, and the trainer-operation-order switches below so a teacher-forced pass reproduces the RL trainer's logprobs. Needs MoE TP 1 and a vocabulary that is a multiple of 32768; a model serves it only once its profile lists it. |
-| `--batch-invariant-collectives` | One association order per reduction, independent of the batch: a 2-D bf16 all-reduce on a multicast-reachable group runs as the NVLS in-switch reduction issued by one fixed rank (verified bitwise at startup), every other reduction as NCCL data movement plus a fixed-rank-order fp32 fold; gathers keep the multicast kernels. Folded in by `rl-bitwise`. |
-| `--force-deterministic-rsag` | NCCL and the fold only: no symmetric-memory path (multicast gathers, in-switch all-reduce, the trtllm/Triton all-reduce tiers, distributed argmax). Not folded in by `rl-bitwise`; the escape when the startup self-check refuses the switch. |
+| `--batch-invariant-collectives` | One association order per reduction, independent of the batch: every reduction runs as NCCL data movement plus a fixed-rank-order fp32 fold (an all-reduce costs world_size x the traffic); gathers keep the multicast kernels. Folded in by `rl-bitwise`. |
+| `--force-deterministic-rsag` | NCCL and the fold only: no symmetric-memory path (multicast gathers, the trtllm/Triton all-reduce tiers, distributed argmax). Not folded in by `rl-bitwise`, under which it only moves the gathers to NCCL. |
 | `--sampling-stream {batch,per-request}` | `per-request` draws every non-greedy row from a stream keyed by the request's seed and position only, so a request samples the same tokens alone and inside any batch. Folded in by `rl-bitwise`. |
 | `--yarn-ramp-mask-device {cuda,cpu}` | Device that computes the `deepseek_yarn` RoPE inverse frequencies (position frequencies, both divisions and the YaRN linear ramp mask) before the table is moved to the model device once; the trainer builds it on the host. Folded to `cpu` by `rl-bitwise`. |
 | `--mla-lora-scale {folded,runtime}` | Where LongCat-style MLA applies its `sqrt(hidden / lora_rank)` norm scales: folded into the norm weights at load, or multiplied at runtime after `q_b_proj` / `kv_a_layernorm` as the trainer does. Folded to `runtime` by `rl-bitwise`. |
@@ -554,6 +554,14 @@ Common reasoning parser values include `kimi_k25`, `base`, `qwen3`,
 validates the parser names, so use the values accepted by the bundled
 `tokenspeed-smg` package.
 
+When neither parser is named and the model family has no parser defaults,
+`ts serve` passes `--reasoning-parser passthrough` to the gateway, unless the
+model's `tokenizer_config.json` declares a `response_template` and no other
+`--tokenizer` is given: `ts serve` then passes `--parser symphony`,
+`--reasoning-parser hf`, and `--tool-call-parser hf` so the bundled
+`tokenspeed-smg` gateway selects both parsers from that template. Naming any
+parser option keeps its existing behavior.
+
 ## Speculative decoding
 
 | Parameter | Purpose |
@@ -727,6 +735,7 @@ path. One Triton kernel per verify step walks it. The target's verification
 step applies a request's `temperature`, `top_k` and `top_p`, never the
 proposal, so the served distribution is the target's whatever the drafter
 proposed.
+`DFlash2BeamDraftModel`, Beam's drafter, is a DFlash2 drafter as well.
 
 On a prefill server with `--pipeline-parallel-size > 1`, TokenSpeed accepts
 speculation for `MTP` and `DSPARK` only. The drafter runs on the last stage,

@@ -208,7 +208,8 @@ def ragged_decode_topk(
     lengths: torch.Tensor,
     workspace: torch.Tensor,
     max_seq_len: int | None = None,
-    q_len_per_req: int = 1,
+    q_len_per_req: int,
+    enable_pdl: bool,
 ) -> None:
     """Select per-row top-``topk`` local offsets over ragged (length-aware) logits.
 
@@ -222,6 +223,7 @@ def ragged_decode_topk(
         workspace: Scratch uint8 buffer for the persistent kernel.
         max_seq_len: Max scanned columns; defaults to ``logits.shape[1]``.
         q_len_per_req: Query rows per request (speculative decode); 1 for decode.
+        enable_pdl: Enable programmatic CUDA launch dependencies.
 
     Raises:
         RuntimeError: if the CUDA persistent kernel is unavailable.
@@ -234,8 +236,9 @@ def ragged_decode_topk(
         out,
         workspace,
         int(topk),
-        int(max_seq_len or logits.shape[1]),
+        int(logits.shape[1] if max_seq_len is None else max_seq_len),
         int(q_len_per_req),
+        enable_pdl=enable_pdl,
     )
 
 

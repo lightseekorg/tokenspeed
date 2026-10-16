@@ -55,6 +55,10 @@ from tokenspeed_kernel.ops.attention.kda.triton import (
     commit_state_pages,
     verify_state_blocks,
 )
+from tokenspeed_kernel.ops.conv import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 from tokenspeed_kernel.ops.kvcache.triton import (
     compact_window_rows,
     copy_state_rows,
@@ -82,10 +86,6 @@ from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
-)
-from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
-    causal_conv1d_fn,
-    causal_conv1d_update,
 )
 from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
 

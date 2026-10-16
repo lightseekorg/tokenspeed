@@ -30,11 +30,13 @@ from enum import IntEnum, auto
 
 import torch
 import yaml
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
+    TRTLLM_MHA_PAGE_SIZE,
 )
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.plugins import ensure_loaded
@@ -48,7 +50,7 @@ from tokenspeed.runtime.utils.hf_transformers_utils import (
     model_loader_architectures,
     resolve_architecture,
 )
-from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.server_args import ServerArgs, kernel_override_env_key
 from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_ALGORITHMS,
     count_dspark_stages,
@@ -130,7 +132,8 @@ class _AttentionFamilySpec:
     name: str
     architectures: frozenset[str]
     configure: Callable[[object, ServerArgs], None]
-    default_backend: str | None = None
+    # A name, or a function of the launch returning one (None: no default).
+    default_backend: str | Callable[[ServerArgs], str | None] | None = None
     default_prefix_granularity: int | None = None
 
 
@@ -307,6 +310,200 @@ def configure_minimax_m3_attention(model_config, server_args: ServerArgs) -> Non
     model_config.attention_arch = AttentionArch.MSA
 
 
+def configure_mha_attention(model_config, server_args: ServerArgs) -> None:
+    del server_args  # the geometry follows the checkpoint alone
+    model_config.attention_arch = AttentionArch.MHA
+
+
+def beam_default_platform() -> str:
+    """Why Beam's defaults are off here; "" on NVIDIA SM100 to SM103.
+
+    Blackwell (``is_blackwell``) up to the ``max_arch_version`` 10.3 of the
+    FlashInfer TRT-LLM MoE kernels behind the MoE default, so a later 10.x is
+    not admitted. FlashInfer's TRT-LLM-gen attention and MoE kernels cover SM100
+    and SM103; the defaults were validated on SM100 (GB200) only.
+    """
+    platform = current_platform()
+    if platform.is_blackwell and platform.arch_version <= ArchVersion(10, 3):
+        return ""
+    return (
+        f"platform {platform.vendor} {platform.arch_version} is not NVIDIA "
+        "SM100 to SM103"
+    )
+
+
+BEAM_DEFAULT_ATTENTION_BACKEND = "trtllm"
+
+
+def beam_default_attention_backend(server_args: ServerArgs) -> str | None:
+    """Beam's ``--attention-backend`` when the launch names none.
+
+    The TRT-LLM-gen paged FMHA leaf (``trtllm``) where it was admitted: NVIDIA
+    SM100 to SM103, a BF16 KV cache, a ``--prefix-granularity`` holding whole
+    64-token leaf pages, ``--numerics auto`` (its decode picks the KV split
+    count per batch bucket, which rl-bitwise excludes) and no
+    ``attention.mha_*`` kernel override (the leaf calls FlashInfer directly, so
+    such an override would be silently ignored). Otherwise None: the backend
+    stays unset, i.e. today's ranked ``mha`` leaf. One INFO line says which, and
+    why.
+    """
+    reason = beam_default_platform()
+    if not reason and server_args.kv_cache_dtype not in ("auto", "bfloat16"):
+        reason = f"--kv-cache-dtype {server_args.kv_cache_dtype} is not BF16"
+    if (
+        not reason
+        and server_args.kv_cache_dtype == "auto"
+        and server_args.dtype not in ("auto", "bfloat16")
+    ):
+        # An auto KV cache takes the model dtype (auto: the checkpoint's).
+        reason = f"--kv-cache-dtype auto follows --dtype {server_args.dtype}, not BF16"
+    if not reason and server_args.prefix_granularity % TRTLLM_MHA_PAGE_SIZE:
+        # A cache block must hold whole leaf pages (group_tables rejects it at
+        # startup); the unset mha leaf takes the block as its page instead.
+        reason = (
+            f"--prefix-granularity {server_args.prefix_granularity} is not a "
+            f"multiple of the leaf's {TRTLLM_MHA_PAGE_SIZE}-token pages"
+        )
+    if not reason and server_args.numerics != "auto":
+        reason = (
+            f"--numerics {server_args.numerics}: the TRT-LLM decode splits KV "
+            "by batch bucket"
+        )
+    if not reason:
+        # The override variables select_kernel reads.
+        prefix = kernel_override_env_key("attention", "mha_")
+        overrides = sorted(
+            f"{key}={name}"
+            for key, name in os.environ.items()
+            if key.startswith(prefix) and name
+        )
+        if overrides:
+            reason = f"MHA kernel override {', '.join(overrides)}"
+    if reason:
+        logger.info(
+            f"Beam default attention_backend={BEAM_DEFAULT_ATTENTION_BACKEND} "
+            f"not applied, left unset: {reason}",
+        )
+        return None
+    logger.info(
+        f"Beam default attention_backend={BEAM_DEFAULT_ATTENTION_BACKEND}; "
+        "pass --attention-backend to choose another.",
+    )
+    return BEAM_DEFAULT_ATTENTION_BACKEND
+
+
+BEAM_DEFAULT_MOE_BACKEND = "flashinfer_trtllm"
+
+
+def beam_default_moe_backend(
+    server_args: ServerArgs,
+    hf_text_config: PretrainedConfig,
+    dtype: torch.dtype,
+    quantization: str | None,
+    nvfp4_experts: bool = False,
+    fp8_channel_experts: bool = False,
+) -> str | None:
+    """Beam's ``--moe-backend`` when the launch leaves it ``auto``.
+
+    ``flashinfer_trtllm`` (Beam's vendor MoE policy, bf16_vendor_fp32_route:
+    FlashInfer's TRT-LLM BF16 experts with the FP32 correction bias) where the
+    policy starts: NVIDIA SM100 to SM103, a BF16 model whose checkpoint is
+    unquantized or one Beam admits (the caller passes ``quantization`` None for
+    it), no all-to-all backend, an expert-parallel size (MoE TP 1; ServerArgs
+    refuses TP x EP) that divides the experts, and an intermediate size per MoE
+    rank that is a multiple of the kernels' ``TRTLLM_UNQUANT_ISPP_ALIGNMENT`` (64
+    where FlashInfer's launcher is relaxed, else 128). Otherwise None: ``auto``
+    stays, i.e. the Triton ``bf16_route_accum_fp32`` MoE. One INFO line says
+    which, and why. ``nvfp4_experts``: the TRT-LLM NVFP4 kernels' alignment
+    (``TRTLLM_NVFP4_ISPP_ALIGNMENT``) applies instead. ``fp8_channel_experts``:
+    none applies, the FP8 per-channel kernels' preprocessor pads any partition
+    (Beam's 320 at TP8, 640 at TP4 and 2,560 under EP8 need no padding).
+    """
+    moe = server_args.mapping.moe
+    reason = beam_default_platform()
+    if not reason and dtype != torch.bfloat16:
+        reason = f"model dtype {str(dtype).removeprefix('torch.')} is not BF16"
+    if not reason and quantization is not None:
+        reason = f"quantization {quantization} (the vendor MoE runs BF16 experts)"
+    if not reason and server_args.all2all_backend != "none":
+        reason = f"--all2all-backend {server_args.all2all_backend}"
+    if not reason and moe.ep_size != 1:
+        experts = getattr(hf_text_config, "num_experts", None)
+        if experts is None or experts % moe.ep_size:
+            reason = f"moe ep_size {moe.ep_size} does not divide num_experts {experts}"
+    if not reason:
+        from tokenspeed_kernel.ops.moe.flashinfer import (
+            TRTLLM_NVFP4_ISPP_ALIGNMENT,
+            TRTLLM_UNQUANT_ISPP_ALIGNMENT,
+        )
+
+        if fp8_channel_experts:
+            alignment = 1
+        elif nvfp4_experts:
+            alignment = TRTLLM_NVFP4_ISPP_ALIGNMENT
+        else:
+            alignment = TRTLLM_UNQUANT_ISPP_ALIGNMENT
+        intermediate = getattr(hf_text_config, "moe_intermediate_size", None)
+        ispp = None if intermediate is None else intermediate // moe.tp_size
+        if ispp is None or ispp % alignment:
+            reason = (
+                f"intermediate size per MoE rank {ispp} (moe_intermediate_size "
+                f"{intermediate} / moe tp_size {moe.tp_size}) is not a multiple "
+                f"of {alignment}"
+            )
+    if reason:
+        logger.info(
+            f"Beam default moe_backend={BEAM_DEFAULT_MOE_BACKEND} not applied, "
+            f"left auto: {reason}",
+        )
+        return None
+    logger.info(
+        f"Beam default moe_backend={BEAM_DEFAULT_MOE_BACKEND}; "
+        "pass --moe-backend to choose another.",
+    )
+    return BEAM_DEFAULT_MOE_BACKEND
+
+
+def _apply_beam_moe_default(model_config, server_args: ServerArgs) -> None:
+    """Fill ``--moe-backend`` for a Beam model the launch left ``auto`` (an
+    explicit backend is never asked; another model's launch is not read)."""
+    architectures = _model_architectures(
+        model_config.hf_config, model_config.hf_text_config
+    )
+    if "BeamForCausalLM" not in architectures or server_args.moe_backend != "auto":
+        return
+    fmt = _beam_checkpoint_format(model_config)
+    backend = beam_default_moe_backend(
+        server_args,
+        model_config.hf_text_config,
+        model_config.dtype,
+        None if fmt else model_config.quantization,
+        nvfp4_experts=fmt == "nvfp4",
+        fp8_channel_experts=fmt == "fp8_channel",
+    )
+    if backend is not None:
+        server_args.moe_backend = backend
+
+
+def _beam_checkpoint_format(model_config) -> str | None:
+    """``"bf16"`` without quantization, else the format ``beam_quant_policy``
+    admits; None for a checkpoint Beam refuses, which keeps the MoE default
+    off (the model names why at startup)."""
+    from tokenspeed.runtime.models.beam_quant import beam_quant_policy
+
+    quantization = model_config.quantization
+    if quantization is None:
+        return "bf16"
+    hf_quant_config = model_config._parse_quant_hf_config()
+    if not hf_quant_config:  # online quantization Beam refuses
+        return None
+    try:
+        config = QUANTIZATION_METHODS[quantization].from_config(hf_quant_config)
+        return beam_quant_policy(config).fmt
+    except ValueError:  # refused: the model names the reason at startup
+        return None
+
+
 _ATTENTION_FAMILY_SPECS = (
     _AttentionFamilySpec(
         name="dots3-note",
@@ -347,6 +544,12 @@ _ATTENTION_FAMILY_SPECS = (
         architectures=_MSA_ARCHITECTURES,
         configure=configure_minimax_m3_attention,
         default_prefix_granularity=128,
+    ),
+    _AttentionFamilySpec(
+        name="Beam",
+        architectures=frozenset({"BeamForCausalLM"}),
+        configure=configure_mha_attention,
+        default_backend=beam_default_attention_backend,
     ),
 )
 
@@ -427,11 +630,15 @@ def _apply_attention_defaults(
     server_args: ServerArgs,
     *,
     name: str,
-    default_backend: str | None,
+    default_backend: str | Callable[[ServerArgs], str | None] | None,
     default_prefix_granularity: int | None,
     is_draft_worker: bool,
 ) -> None:
-    """Fill launch arguments the user left at their defaults."""
+    """Fill launch arguments the user left at their defaults.
+
+    A callable ``default_backend`` is asked only when the backend field it
+    would fill is unset, and may return None to leave it unset.
+    """
     if default_prefix_granularity is not None:
         granularity_default = ServerArgs.__dataclass_fields__[
             "prefix_granularity"
@@ -443,6 +650,13 @@ def _apply_attention_defaults(
                 f"with a value other than {granularity_default:d} to keep that value.",
             )
             server_args.prefix_granularity = default_prefix_granularity
+    if callable(default_backend):
+        unset = (
+            server_args.drafter_attention_backend
+            if is_draft_worker
+            else server_args.attention_backend
+        ) is None
+        default_backend = default_backend(server_args) if unset else None
     if default_backend is None:
         return
     # A draft model's default belongs to the drafter's backend selection;
@@ -483,6 +697,24 @@ def _derive_num_attention_layers(
     if any(arch in _CACHE_LAYER_VIEW_ARCHITECTURES for arch in architectures):
         num_attention_layers = len(hf_config.cache_layer_types)
     return num_attention_layers
+
+
+def _apply_constrained_decoding_policy(
+    hf_config: PretrainedConfig,
+    server_args: ServerArgs | None,
+    *,
+    is_draft_worker: bool,
+) -> None:
+    """Copy a model config class's constrained decoding policy to the launch."""
+    if server_args is None or is_draft_worker:
+        return
+    policy = getattr(type(hf_config), "constrained_decoding", None)
+    if policy not in (None, "requested", "always"):
+        raise ValueError(
+            f"{type(hf_config).__name__}.constrained_decoding must be None, "
+            f"'requested', or 'always', got {policy!r}"
+        )
+    server_args.constrained_decoding = policy
 
 
 class ModelConfig:
@@ -535,6 +767,11 @@ class ModelConfig:
                 else None
             ),
             **kwargs,
+        )
+        _apply_constrained_decoding_policy(
+            self.hf_config,
+            server_args,
+            is_draft_worker=bool(is_draft_worker),
         )
         self.hf_generation_config = get_generation_config(
             self.model_path,
@@ -809,6 +1046,10 @@ class ModelConfig:
                 self.quantization,
                 getattr(self.hf_text_config, "disable_quant_module", None) or (),
             )
+        if server_args is not None:
+            # After the checkpoint's quantization is known. A draft of Beam
+            # resolves to BeamForCausalLMNextN and is not asked.
+            _apply_beam_moe_default(self, server_args)
 
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
