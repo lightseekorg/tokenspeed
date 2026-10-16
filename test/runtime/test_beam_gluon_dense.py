@@ -105,7 +105,7 @@ def test_beam_offered_fp8_preserves_original_codes_and_scales(monkeypatch):
     assert attention._token_fp8 is None
 
 
-def test_removed_dense_option_does_not_remove_other_gluon_options():
+def test_removed_dense_option_keeps_mha_and_gluon_experts():
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     options = parser.parse_args(
@@ -113,14 +113,14 @@ def test_removed_dense_option_does_not_remove_other_gluon_options():
             "--model",
             "x",
             "--attention-backend",
-            "gluon_mha",
+            "mha",
             "--moe-backend",
             "gluon",
             "--enable-mixed-batch",
         ]
     )
     assert options.dense_gemm_backend == "auto"
-    assert options.attention_backend == "gluon_mha"
+    assert options.attention_backend == "mha"
     assert options.moe_backend == "gluon" and options.enable_mixed_batch
     with pytest.raises(SystemExit):
         parser.parse_args(["--model", "x", "--dense-gemm-backend", "gluon"])

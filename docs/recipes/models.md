@@ -1440,7 +1440,8 @@ first one or two leaves larger decode batches outside the captured graph list.
 ### AMD gfx950
 
 Beam supports BF16 and compressed-tensors dynamic W8A8 FP8 checkpoints on
-gfx950. Use explicit backends: `gluon_mha` for target and draft GQA attention,
+gfx950. Use `mha` for target and draft GQA attention, allowing the kernel
+registry to select compatible Gluon or Triton implementations. Use
 `triton` for BF16 experts, and `gluon` or `triton` for FP8 experts. NVIDIA's
 backend defaults and sandwich all-reduce fusion remain separate.
 
@@ -1450,7 +1451,7 @@ For an eight-GPU FP8 target with a BF16 DFlash2 drafter:
 ts serve --model <beam-fp8-checkpoint-dir> \
   --tensor-parallel-size 8 --ep-size 1 \
   --dtype bfloat16 --kv-cache-dtype bfloat16 \
-  --attention-backend gluon_mha --moe-backend gluon --all2all-backend none \
+  --attention-backend mha --moe-backend gluon --all2all-backend none \
   --sampling-backend triton_full --grammar-backend xgrammar \
   --disable-tf32 --layer-boundary-norm unfused \
   --max-model-len 262144 --max-num-seqs 16 --chunked-prefill-size 8192 \
@@ -1460,7 +1461,7 @@ ts serve --model <beam-fp8-checkpoint-dir> \
   --enable-mixed-batch --speculative-algorithm DFLASH \
   --speculative-draft-model-path <beam-dflash2-checkpoint-dir> \
   --speculative-draft-model-quantization unquant \
-  --drafter-attention-backend gluon_mha \
+  --drafter-attention-backend mha \
   --speculative-num-steps 15 --speculative-num-draft-tokens 16 \
   --host 127.0.0.1 --port 8000
 ```
@@ -1480,10 +1481,9 @@ they need separate numerical qualification rather than bitwise equivalence
 being assumed. The MXFP4 expert adapter is a separate path, not qualified by
 BF16 or FP8 results.
 
-`gluon_mha` supports the target's 6:1 and drafter's 5:1 GQA groups, cached
-extend, mixed batches and graph replay. The existing `gluon` attention name
-remains MLA-only. With `--attention-backend triton`, omit
-`--enable-mixed-batch`: that backend does not support mixed MHA batches.
+The `mha` path supports the target's 6:1 and drafter's 5:1 GQA groups, cached
+extend, mixed batches and graph replay through the registered kernels. The
+existing `gluon` attention name remains MLA-only.
 
 Use the gateway dependencies pinned by this checkout and the original
 checkpoint chat template. The pinned gateway supports its generation markers;

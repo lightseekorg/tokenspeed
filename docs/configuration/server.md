@@ -761,20 +761,20 @@ follows it. Any sliding window the draft checkpoint declares is an attention
 mask that the draft's own layers apply, never a cache-retention policy of its
 own. Only the backends that forward that mask to their kernels can serve such a
 draft: `mla` and `tokenspeed_mla` (`gluon` on AMD) for MLA drafts, and
-`mha`/`fa3`/`fa4`/`triton`/`gluon_mha`/`flashinfer`/`trtllm_mha` for GQA drafts. Startup
+`mha`/`fa3`/`fa4`/`triton`/`flashinfer`/`trtllm_mha` for GQA drafts. Startup
 rejects any other `--drafter-attention-backend` rather than quietly widening
 the draft's attention to the full history.
 
-On AMD gfx950, `--attention-backend gluon_mha` selects the registered Gluon
-MHA prefill, cached-extension and decode operations. Use
-`--drafter-attention-backend gluon_mha` to select the same solution for a
-GQA draft. The existing `gluon` name remains MLA-only. Defaults do not change;
-unsupported shapes fail normal kernel selection rather than falling back to
-another solution. The gfx950 decode operation requires page64 and head
-dimension64 or128; it handles compact causal verification blocks and expanded
-one-query metadata for non-causal block drafts. Full-history decode includes
-its matching split reducer; sliding-window decode uses its direct-output path.
-Operator qualification does not establish full-model correctness or speed.
+Use `--attention-backend mha` and `--drafter-attention-backend mha` for
+standard and grouped-query attention. The kernel registry chooses compatible
+implementations for each operation, including Gluon on AMD gfx950 and portable
+Triton. The existing `gluon` attention backend remains MLA-only. On gfx950,
+Gluon decode supports 64-token pages and head dimensions 64 or 128, including
+compact causal verification blocks and expanded one-query metadata for
+non-causal block drafts. Other shapes use another compatible registered
+implementation or fail selection when none exists. Explicit operation/kernel
+overrides remain available. Operator qualification does not establish
+full-model correctness or speed.
 
 ## Observability
 

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Explicit Gluon MHA selection does not change MLA or default selection."""
+"""Standard MHA selects compatible kernels without an implementation backend."""
 
 import os
 import sys
@@ -26,7 +26,11 @@ import sys
 import pytest
 import torch
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
+from tokenspeed_kernel.selection import (
+    NoKernelFoundError,
+    kernel_override,
+    select_kernel,
+)
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -34,7 +38,10 @@ from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBacken
 from tokenspeed.runtime.layers.attention.backends.paged.mla import MLAAttnBackend
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
-from tokenspeed.runtime.layers.attention.registry import _get_backend_cls
+from tokenspeed.runtime.layers.attention.registry import (
+    _get_backend_cls,
+    validate_attention_backend_name,
+)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -42,20 +49,29 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
-def test_gluon_architecture_selection():
-    assert _get_backend_cls("gluon_mha", AttentionArch.MHA) is MHAAttnBackend
+def test_mha_keeps_architecture_selection_and_existing_mla_gluon_backend():
+    assert _get_backend_cls("mha", AttentionArch.MHA) is MHAAttnBackend
     assert _get_backend_cls("gluon", AttentionArch.MLA) is MLAAttnBackend
     assert _get_backend_cls(None, AttentionArch.MHA) is MHAAttnBackend
     assert _get_backend_cls(None, AttentionArch.MLA) is MLAAttnBackend
     with pytest.raises(ValueError, match="does not support"):
-        _get_backend_cls("gluon_mha", AttentionArch.MLA)
+        _get_backend_cls("gluon", AttentionArch.MHA)
+
+
+@pytest.mark.parametrize("flag", ["--attention-backend", "--drafter-attention-backend"])
+def test_removed_implementation_alias_is_not_a_launch_backend(flag):
+    validate_attention_backend_name("mha", flag=flag)
+    with pytest.raises(ValueError, match="Unknown"):
+        validate_attention_backend_name("gluon_mha", flag=flag)
+    with pytest.raises(ValueError, match="Unknown attention backend"):
+        _get_backend_cls("gluon_mha", AttentionArch.MHA)
 
 
 @pytest.mark.parametrize("draft,heads", [(False, 48), (True, 40)])
 @pytest.mark.parametrize(
-    "name,solution", [("gluon_mha", "gluon"), ("triton", "triton"), (None, None)]
+    "name,solution", [("mha", None), ("triton", "triton"), (None, None)]
 )
-def test_explicit_solution_and_speculative_geometry(draft, heads, name, solution):
+def test_mha_preserves_target_and_block_draft_geometry(draft, heads, name, solution):
     spec = MHAConfig(
         backend_name=name,
         num_attention_heads=heads,
@@ -87,31 +103,85 @@ def test_explicit_solution_and_speculative_geometry(draft, heads, name, solution
     backend.init_cuda_graph_state(16)
     assert backend.page_table_buf.shape[0] == (256 if draft else 16)
     plan = backend.plan(window_left=4095 if draft else 511)
-    if solution == "gluon" and current_platform().is_cdna4:
-        assert plan["extend_mode"] == "postwrite"
+    if current_platform().is_cdna4:
+        assert plan["extend_mode"] == ("postwrite" if solution is None else "prewrite")
 
 
 @pytest.mark.parametrize("width", [1, 16])
 @pytest.mark.parametrize("window", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "mode", ["mha_prefill", "mha_extend_with_kvcache", "mha_decode_with_kvcache"]
+)
+@pytest.mark.parametrize(
+    "head_dim,page_size,logit_cap",
+    [(128, 64, False), (96, 64, False), (128, 16, False), (128, 64, True)],
+)
 @pytest.mark.skipif(not current_platform().is_cdna4, reason="gfx950 registry contract")
-def test_gluon_decode_normal_registry_selection(width, window):
-    dense = dense_tensor_format(torch.bfloat16)
+def test_mha_selects_compatible_gluon_or_triton_kernels(
+    width, window, dtype, mode, head_dim, page_size, logit_cap
+):
+    dense = dense_tensor_format(dtype)
+    signature = (
+        format_signature(q=dense, k=dense, v=dense)
+        if mode == "mha_prefill"
+        else format_signature(q=dense, k_cache=dense, v_cache=dense)
+    )
     kernel = select_kernel(
         "attention",
-        "mha_decode_with_kvcache",
-        format_signature(q=dense, k_cache=dense, v_cache=dense),
+        mode,
+        signature,
         traits={
             "q_len": width,
-            "head_dim": 128,
-            "page_size": 64,
-            "logit_cap": False,
+            "head_dim": head_dim,
+            "page_size": page_size,
+            "logit_cap": logit_cap,
             "return_lse": False,
             "sinks": False,
             "sliding_window": window,
+            "is_causal": True,
+            "skip_softmax": False,
         },
-        solution="gluon",
+        solution=None,
     )
-    assert kernel.name == "gluon_mha_decode_gfx950"
+    supports_gluon = (
+        head_dim == 128 and not logit_cap and (mode == "mha_prefill" or page_size == 64)
+    )
+    expected = (
+        f"gluon_{mode.removesuffix('_with_kvcache')}_gfx950"
+        if supports_gluon
+        else f"triton_{mode}"
+    )
+    assert kernel.name == expected
+
+
+@pytest.mark.skipif(not current_platform().is_cdna4, reason="gfx950 registry contract")
+def test_mha_honors_scoped_operation_override_and_restores_selection():
+    dense = dense_tensor_format(torch.bfloat16)
+
+    def select_decode():
+        return select_kernel(
+            "attention",
+            "mha_decode_with_kvcache",
+            format_signature(q=dense, k_cache=dense, v_cache=dense),
+            traits={
+                "q_len": 16,
+                "head_dim": 128,
+                "page_size": 64,
+                "logit_cap": False,
+                "return_lse": False,
+                "sinks": False,
+                "sliding_window": True,
+            },
+            solution=None,
+        )
+
+    assert select_decode().name == "gluon_mha_decode_gfx950"
+    with kernel_override(
+        "attention", "mha_decode_with_kvcache", "triton_mha_decode_with_kvcache"
+    ):
+        assert select_decode().name == "triton_mha_decode_with_kvcache"
+    assert select_decode().name == "gluon_mha_decode_gfx950"
 
 
 @pytest.mark.parametrize("head_dim,page_size", [(128, 16), (96, 64)])

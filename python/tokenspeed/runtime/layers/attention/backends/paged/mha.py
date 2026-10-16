@@ -55,7 +55,6 @@ _KERNEL_SOLUTION_BY_BACKEND = {
     "fa3": "fa3",
     "fa4": "fa4",
     "triton": "triton",
-    "gluon_mha": "gluon",
     "flashinfer": "flashinfer",
 }
 

@@ -58,7 +58,7 @@ def _backend(
     *, width=1, is_draft=False, block_decode=False, page_size=16, heads=(12, 2, 1)
 ):
     spec = MHAConfig(
-        backend_name="triton",
+        backend_name="mha",
         num_attention_heads=heads[0],
         num_kv_heads=heads[1],
         head_dim=128,
