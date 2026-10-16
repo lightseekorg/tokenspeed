@@ -87,9 +87,10 @@ def test_decode_matches_reference(tokens: int) -> None:
         torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
 
 
-def test_decode_replays_in_a_graph() -> None:
+@pytest.mark.parametrize("tokens", [1, 7, 8, 17, 32])
+def test_decode_replays_in_a_graph(tokens: int) -> None:
     _packed, views = _weights()
-    hidden = torch.randn(1, HIDDEN, dtype=torch.bfloat16, device="cuda")
+    hidden = torch.randn(tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
 
     def run():
         return _project(hidden, views, "gluon_latent_input_decode_gfx1250")
@@ -97,9 +98,14 @@ def test_decode_replays_in_a_graph() -> None:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = run()
+    previous = [output.clone() for output in captured]
     hidden.copy_(torch.randn_like(hidden))
     graph.replay()
-    for output, reference in zip(captured, run(), strict=True):
+    for output, eager, old, reference in zip(
+        captured, run(), previous, _reference(hidden, views), strict=True
+    ):
+        assert not torch.equal(output, old)
+        torch.testing.assert_close(output, eager, atol=0.0, rtol=0.0)
         torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
 
 
