@@ -30,7 +30,7 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.models import beam
 
-POLICY = "fp8ch_gluon_bf16_route_accum_fp32"
+POLICY = "fp8ch_bf16_route_accum_fp32"
 KERNEL = "gluon_fp8_channel_bf16_precomputed_moe_apply"
 
 

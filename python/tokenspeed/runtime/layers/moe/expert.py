@@ -391,7 +391,7 @@ class MoELayer(torch.nn.Module):
             "nvfp4_vendor_fp32_route",
             "fp8ch_vendor_fp32_route",
             "fp8ch_route_accum_fp32",
-            "fp8ch_gluon_bf16_route_accum_fp32",
+            "fp8ch_bf16_route_accum_fp32",
         }:
             raise ValueError(f"Unsupported MoE precision policy: {precision_policy!r}")
         if precision_policy in {"bf16_route_accum_fp32", "mxfp4_route_accum_fp32"}:
@@ -484,9 +484,10 @@ class MoELayer(torch.nn.Module):
                     "or an output scale"
                 )
             routing_mode = "precomputed_topk"
-        elif precision_policy == "fp8ch_gluon_bf16_route_accum_fp32":
-            # This explicit policy retains FP8 storage but uses BF16 operands
-            # in the registered grouped projections. Never infer it from dtype.
+        elif precision_policy == "fp8ch_bf16_route_accum_fp32":
+            # The policy specifies FP8 storage, BF16 projection operands and
+            # unweighted BF16 outputs before FP32 weighted-route accumulation.
+            # Only the Gluon implementation currently meets this contract.
             if (
                 self._quant_kind != "fp8_channel"
                 or input_dtype != torch.bfloat16
@@ -506,7 +507,7 @@ class MoELayer(torch.nn.Module):
                 or internal_activation_dtype != "input"
             ):
                 raise ValueError(
-                    "fp8ch_gluon_bf16_route_accum_fp32 requires explicit "
+                    "fp8ch_bf16_route_accum_fp32 requires explicit "
                     "--moe-backend gluon, BF16 input and FP8 per-channel SiLU "
                     "experts with E256/H5120/top8/local intermediate320 or640, "
                     "concatenated gate/up and precomputed top-k, without expert "
@@ -599,7 +600,7 @@ class MoELayer(torch.nn.Module):
             self.plan["supports_deferred_finalize"] = False
             self.plan["precision_policy"] = precision_policy
             self.plan["output_scale"] = output_scale
-        elif precision_policy == "fp8ch_gluon_bf16_route_accum_fp32":
+        elif precision_policy == "fp8ch_bf16_route_accum_fp32":
             if (
                 self.plan["solution"] != "gluon"
                 or self.plan["apply_kernel_name"]
@@ -607,7 +608,7 @@ class MoELayer(torch.nn.Module):
             ):
                 raise ValueError(
                     "Selected MoE kernel does not implement "
-                    "fp8ch_gluon_bf16_route_accum_fp32"
+                    "fp8ch_bf16_route_accum_fp32"
                 )
             self.plan["supports_deferred_finalize"] = False
             self.plan["precision_policy"] = precision_policy

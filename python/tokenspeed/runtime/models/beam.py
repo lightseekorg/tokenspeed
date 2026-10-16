@@ -132,7 +132,7 @@ BEAM_MOE_MXFP4_POLICY = "mxfp4_route_accum_fp32"
 # dynamic W8A8 checkpoint.
 BEAM_MOE_FP8_POLICY = "fp8ch_vendor_fp32_route"
 BEAM_MOE_TRITON_FP8_POLICY = "fp8ch_route_accum_fp32"
-BEAM_MOE_GLUON_FP8_POLICY = "fp8ch_gluon_bf16_route_accum_fp32"
+BEAM_MOE_GLUON_FP8_POLICY = "fp8ch_bf16_route_accum_fp32"
 
 
 def beam_kernels() -> bool:

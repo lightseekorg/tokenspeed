@@ -90,7 +90,10 @@ def gluon_bf16_moe_stage2_kernel(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    # Weight-only FP8: dequantize 128x128 weight blocks before the BF16 dot.
     WEIGHT_FP8: gl.constexpr,
+    # Per-channel FP8 weights and per-row FP8 activations: widen raw codes,
+    # apply both scales after the dot, and leave route weighting to the combine.
     CHANNEL_FP8: gl.constexpr,
 ):
     pid = gl.program_id(axis=0)

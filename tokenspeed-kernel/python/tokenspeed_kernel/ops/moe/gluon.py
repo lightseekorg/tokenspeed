@@ -43,7 +43,7 @@ from tokenspeed_kernel.signature import (
 platform = current_platform()
 
 GLUON_FP8_CHANNEL_APPLY = "gluon_fp8_channel_bf16_precomputed_moe_apply"
-GLUON_FP8_CHANNEL_POLICY = "fp8ch_gluon_bf16_route_accum_fp32"
+GLUON_FP8_CHANNEL_POLICY = "fp8ch_bf16_route_accum_fp32"
 
 
 @register_kernel(
