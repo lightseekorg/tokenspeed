@@ -28,7 +28,8 @@ import os
 import sys
 import threading
 import time
-import unittest
+
+import pytest
 
 # CI registration (AST-parsed, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -109,14 +110,14 @@ def _wait(port, path, timeout=15):
     return False
 
 
-class TestProxyPassthrough(unittest.TestCase):
+class TestProxyPassthrough:
     """Integration tests of the smg-passthrough path against a mock backend."""
 
     MOCK_PORT = 28310
     SIDECAR_PORT = 28311
 
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         from tokenspeed.runtime.entrypoints import control_server as hs
 
         cls.hs = hs
@@ -144,7 +145,7 @@ class TestProxyPassthrough(unittest.TestCase):
         assert _wait(cls.SIDECAR_PORT, "/health"), "sidecar failed to start"
 
     @classmethod
-    def tearDownClass(cls):
+    def teardown_class(cls):
         cls._mock_server.should_exit = True
         cls._sidecar_server.should_exit = True
 
@@ -163,19 +164,20 @@ class TestProxyPassthrough(unittest.TestCase):
             stream=True,
             timeout=15,
         ) as r:
-            self.assertEqual(r.status_code, 200)
-            self.assertIn("text/event-stream", r.headers.get("content-type", ""))
+            assert (r.status_code) == (200)
+            assert ("text/event-stream") in (r.headers.get("content-type", ""))
             for raw in r.iter_lines():
                 if raw:
                     chunks.append(raw.decode())
 
         # Every token must arrive, in order, followed by [DONE].
         for tok in _STREAM_TOKENS:
-            self.assertTrue(
-                any(f'"text":"{tok}"' in c for c in chunks),
-                f"missing streamed token {tok!r}; got {chunks}",
-            )
-        self.assertTrue(any("[DONE]" in c for c in chunks), f"no [DONE]: {chunks}")
+            _pytest_expr_5 = any(f'"text":"{tok}"' in c for c in chunks)
+            _pytest_msg_6 = f"missing streamed token {tok!r}; got {chunks}"
+            assert _pytest_expr_5, _pytest_msg_6
+        _pytest_expr_1 = any("[DONE]" in c for c in chunks)
+        _pytest_msg_2 = f"no [DONE]: {chunks}"
+        assert _pytest_expr_1, _pytest_msg_2
 
     def test_streaming_is_incremental(self):
         """The response must arrive incrementally, not buffered all-at-once —
@@ -196,12 +198,10 @@ class TestProxyPassthrough(unittest.TestCase):
                     last_byte_t = now
         # With 5 chunks * 0.1s delay, spread between first and last must be
         # clearly non-zero if streaming is truly incremental.
-        self.assertIsNotNone(first_byte_t)
-        self.assertGreater(
-            last_byte_t - first_byte_t,
-            _STREAM_DELAY,
-            "stream did not arrive incrementally",
-        )
+        assert (first_byte_t) is not None
+        assert (last_byte_t - first_byte_t) > (
+            _STREAM_DELAY
+        ), "stream did not arrive incrementally"
 
     # -- bug 2: non-streaming double-encoding -------------------------------
 
@@ -213,44 +213,44 @@ class TestProxyPassthrough(unittest.TestCase):
             json={"model": "m", "prompt": "hi", "max_tokens": 4},
             timeout=10,
         )
-        self.assertEqual(r.status_code, 200)
+        assert (r.status_code) == (200)
         # Raw body must be a JSON object literal.
-        self.assertTrue(
-            r.text.lstrip().startswith("{"), f"body looks double-encoded: {r.text[:80]}"
-        )
+        _pytest_expr_3 = r.text.lstrip().startswith("{")
+        _pytest_msg_4 = f"body looks double-encoded: {r.text[:80]}"
+        assert _pytest_expr_3, _pytest_msg_4
         data = r.json()
-        self.assertIsInstance(data, dict)
-        self.assertEqual(data["choices"][0]["text"], "paris")
+        assert isinstance((data), (dict))
+        assert (data["choices"][0]["text"]) == ("paris")
 
     # -- health proxy (plain-text passthrough) ------------------------------
 
     def test_health_proxies_plaintext(self):
         r = requests.get(self._url("/health"), timeout=10)
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.text, "OK")
+        assert (r.status_code) == (200)
+        assert (r.text) == ("OK")
 
     # -- other passthrough routes -------------------------------------------
 
     def test_flush_cache_passthrough(self):
         r = requests.post(self._url("/flush_cache"), timeout=10)
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["status"], "flushed")
+        assert (r.status_code) == (200)
+        assert (r.json()["status"]) == ("flushed")
 
     def test_start_profile_passthrough(self):
         r = requests.post(self._url("/start_profile"), timeout=10)
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["status"], "profiling")
+        assert (r.status_code) == (200)
+        assert (r.json()["status"]) == ("profiling")
 
     def test_status_code_relayed(self):
         """A non-200 from smg must be relayed, not masked as 200."""
         r = requests.get(self._url("/v1/models"), timeout=10)  # mock has no such route
-        self.assertEqual(r.status_code, 404)
+        assert (r.status_code) == (404)
 
 
-class TestGrpcDirect(unittest.TestCase):
+class TestGrpcDirect:
     """Unit tests for the gRPC-direct path (no live engine)."""
 
-    def setUp(self):
+    def setup_method(self):
         from tokenspeed.runtime.entrypoints import control_server as hs
 
         self.hs = hs
@@ -264,7 +264,7 @@ class TestGrpcDirect(unittest.TestCase):
         hs._grpc_stub = None
         hs._engine_grpc_addr = "127.0.0.1:1"
 
-    def tearDown(self):
+    def teardown_method(self):
         # Drop the cached channel/stub and restore loop state so we neither leak
         # the channel nor leave a closed loop as "current" for later tests.
         self.hs._grpc_channel = None
@@ -279,8 +279,8 @@ class TestGrpcDirect(unittest.TestCase):
         (creating a new channel per request leaks fds/sockets)."""
         s1 = self.hs._stub()
         s2 = self.hs._stub()
-        self.assertIs(s1, s2)
-        self.assertIsNotNone(self.hs._grpc_channel)
+        assert (s1) is (s2)
+        assert (self.hs._grpc_channel) is not None
 
     # -- bug 4: gRPC error -> 503 -------------------------------------------
 
@@ -295,15 +295,15 @@ class TestGrpcDirect(unittest.TestCase):
         try:
             assert _wait(port, "/get_server_info")
             r = requests.get(f"http://127.0.0.1:{port}/get_server_info", timeout=10)
-            self.assertEqual(r.status_code, 503)
+            assert (r.status_code) == (503)
             body = r.json()
-            self.assertEqual(body["error"], "engine unavailable")
-            self.assertIn("detail", body)
+            assert (body["error"]) == ("engine unavailable")
+            assert ("detail") in (body)
         finally:
             server.should_exit = True
 
 
-class TestSGLangRequestTranslation(unittest.TestCase):
+class TestSGLangRequestTranslation:
     def test_sampling_seed_is_translated(self):
         from tokenspeed.runtime.entrypoints import control_server as hs
 
@@ -316,28 +316,27 @@ class TestSGLangRequestTranslation(unittest.TestCase):
         ).encode()
         translated = asyncio.run(hs._prepare_sglang_generate_body(body))
         sampling_params = json.loads(translated)["sampling_params"]
-        self.assertEqual(sampling_params["seed"], 17)
-        self.assertNotIn("sampling_seed", sampling_params)
+        assert (sampling_params["seed"]) == (17)
+        assert ("sampling_seed") not in (sampling_params)
 
 
-class TestProxyTimeout(unittest.TestCase):
+class TestProxyTimeout:
     """The proxy must not impose a wall-clock `total` timeout, which would cut
     off long but healthy streaming generations (P2 review fix)."""
 
     def test_no_total_cap_but_inactivity_bounded(self):
         from tokenspeed.runtime.entrypoints import control_server as hs
 
-        self.assertIsNone(
-            hs._PROXY_TIMEOUT.total,
-            "a total timeout would abort long streams mid-flight",
-        )
+        assert (
+            hs._PROXY_TIMEOUT.total
+        ) is None, "a total timeout would abort long streams mid-flight"
         # Inactivity / connect bounds must still be set so a hung upstream is
         # detected.
-        self.assertIsNotNone(hs._PROXY_TIMEOUT.sock_read)
-        self.assertIsNotNone(hs._PROXY_TIMEOUT.sock_connect)
+        assert (hs._PROXY_TIMEOUT.sock_read) is not None
+        assert (hs._PROXY_TIMEOUT.sock_connect) is not None
 
 
-class TestControlServerReadiness(unittest.TestCase):
+class TestControlServerReadiness:
     """`_start_control_server` must wait for an actual bind before reporting
     ready, and report failure when the port is unavailable (P2 review fix)."""
 
@@ -354,9 +353,9 @@ class TestControlServerReadiness(unittest.TestCase):
                 timeout=15,
             )
         )
-        self.assertTrue(ok)
+        assert ok
         # The socket must really be accepting connections now.
-        self.assertTrue(_wait(port, "/health", timeout=2))
+        assert _wait(port, "/health", timeout=2)
 
     def test_reports_failure_when_port_in_use(self):
         from tokenspeed.cli.serve_smg import _start_control_server
@@ -379,35 +378,35 @@ class TestControlServerReadiness(unittest.TestCase):
                     timeout=5,
                 )
             )
-            self.assertFalse(ok, "should report failure when port is occupied")
+            assert not (ok), "should report failure when port is occupied"
         finally:
             sock.close()
 
 
-class TestControlPortArg(unittest.TestCase):
+class TestControlPortArg:
     """--control-port orchestrator-flag parsing (bug 5)."""
 
     def test_control_port_parsed(self):
         from tokenspeed.cli._argsplit import split_argv
 
         result = split_argv(["--model", "m", "--control-port", "8081"])
-        self.assertEqual(result.opts.control_port, 8081)
+        assert (result.opts.control_port) == (8081)
 
     def test_control_port_not_forwarded(self):
         from tokenspeed.cli._argsplit import split_argv
 
         result = split_argv(["--model", "m", "--control-port", "8081"])
-        self.assertNotIn("--control-port", result.engine)
-        self.assertNotIn("--control-port", result.gateway)
+        assert ("--control-port") not in (result.engine)
+        assert ("--control-port") not in (result.gateway)
 
     def test_control_port_defaults_none(self):
         from tokenspeed.cli._argsplit import split_argv
 
         result = split_argv(["--model", "m"])
-        self.assertIsNone(result.opts.control_port)
+        assert (result.opts.control_port) is None
 
 
-class TestFlattenServerInfo(unittest.TestCase):
+class TestFlattenServerInfo:
     """`flatten_server_info` (bug 6): merge `server_args` into the top level so
     slime's external-engine discovery finds engine flags where it looks
     (e.g. `info["enable_memory_saver"]`), keeping the nested key too."""
@@ -425,13 +424,13 @@ class TestFlattenServerInfo(unittest.TestCase):
 
         shaped = flatten_server_info(info)
 
-        self.assertIs(shaped["enable_memory_saver"], False)
-        self.assertEqual(shaped["tensor_parallel_size"], 1)
-        self.assertEqual(shaped["rl.control_url"], "http://127.0.0.1:31210")
+        assert (shaped["enable_memory_saver"]) is (False)
+        assert (shaped["tensor_parallel_size"]) == (1)
+        assert (shaped["rl.control_url"]) == ("http://127.0.0.1:31210")
         # Nested key stays, for existing consumers of the old shape.
-        self.assertEqual(shaped["server_args"], info["server_args"])
-        self.assertEqual(shaped["scheduler_info"], {"x": 1})
-        self.assertEqual(shaped["tokenspeed_version"], "1.0")
+        assert (shaped["server_args"]) == (info["server_args"])
+        assert (shaped["scheduler_info"]) == ({"x": 1})
+        assert (shaped["tokenspeed_version"]) == ("1.0")
 
     def test_control_api_key_is_not_returned(self):
         info = {
@@ -439,25 +438,25 @@ class TestFlattenServerInfo(unittest.TestCase):
             "rl_control_api_key": "test-secret",
         }
         shaped = flatten_server_info(info)
-        self.assertNotIn("rl_control_api_key", shaped)
-        self.assertNotIn("rl_control_api_key", shaped["server_args"])
-        self.assertEqual(info["server_args"]["rl_control_api_key"], "test-secret")
+        assert ("rl_control_api_key") not in (shaped)
+        assert ("rl_control_api_key") not in (shaped["server_args"])
+        assert (info["server_args"]["rl_control_api_key"]) == ("test-secret")
 
     def test_missing_server_args_is_returned_unchanged(self):
         info = {"scheduler_info": {}}
-        self.assertEqual(flatten_server_info(info), info)
+        assert (flatten_server_info(info)) == (info)
 
 
-class TestGetServerInfoRoute(unittest.TestCase):
+class TestGetServerInfoRoute:
     """`GET /get_server_info` (bug 6): the route must return the flattened
     shape end to end, against a real ``GetServerInfoResponse`` proto."""
 
     PORT = 28340
 
-    def setUp(self):
+    def setup_method(self):
         self._original_stub = control_server_mod._stub
 
-    def tearDown(self):
+    def teardown_method(self):
         control_server_mod._stub = self._original_stub
 
     def test_get_server_info_route_is_flat(self):
@@ -493,15 +492,15 @@ class TestGetServerInfoRoute(unittest.TestCase):
             r = requests.get(
                 f"http://127.0.0.1:{self.PORT}/get_server_info", timeout=10
             )
-            self.assertEqual(r.status_code, 200)
+            assert (r.status_code) == (200)
             body = r.json()
-            self.assertIs(body["enable_memory_saver"], False)
-            self.assertEqual(body["tensor_parallel_size"], 1)
-            self.assertIn("server_args", body)
-            self.assertEqual(body["server_args"]["enable_memory_saver"], False)
+            assert (body["enable_memory_saver"]) is (False)
+            assert (body["tensor_parallel_size"]) == (1)
+            assert ("server_args") in (body)
+            assert (body["server_args"]["enable_memory_saver"]) == (False)
         finally:
             server.should_exit = True
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

@@ -77,10 +77,12 @@ from tokenspeed.runtime.execution.slot_state import SlotStateExporter
 from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
+    ForwardLogprobs,
     InputLogprobPlan,
     ModelExecutionResult,
     NGramInputs,
     RequestHistorySeeds,
+    StopCriteria,
 )
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.grammar.capturable_grammar import (
@@ -117,6 +119,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+from tokenspeed.runtime.sampling.utils import top_token_logprobs
 from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_available
 from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
@@ -179,6 +182,25 @@ def _with_prefill_sample_offsets(
         0, pool_rows, (last - 1).clamp_min(0).to(cache_lengths.dtype)
     )
     return replace(sampling_info, valid_cache_lengths=offsets)
+
+
+def _set_sampled_top_logprobs(
+    logits_output: LogitsProcessorOutput, prefill_logits: torch.Tensor, top_k: int
+) -> None:
+    """Report each prefill row's ``top_k`` most likely tokens beside its sample.
+
+    ``prefill_logits`` are the rows the sampler drew from (any grammar mask
+    already applied in place), so the alternatives are of the distribution
+    the sampled token's own logprob is read from: ``top_token_logprobs``, the
+    prompt rows' top-k arithmetic too, most likely first. Only eager
+    prefills ask (``ForwardContext.sampled_top_k`` is 0 in every captured
+    graph), so no graph records this.
+    """
+    if top_k <= 0 or prefill_logits.shape[0] == 0:
+        return
+    values, ids = top_token_logprobs(prefill_logits, top_k)
+    logits_output.sampled_top_logprobs_val = values
+    logits_output.sampled_top_logprobs_idx = ids
 
 
 PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
@@ -605,7 +627,14 @@ class ModelExecutor:
             # already happened in create_model_runner, right after both
             # models loaded. Here only the drafter instance is built and
             # wired to the target.
-            DrafterImpl = get_drafter_impl(config.spec_algo, draft_model_runner.model)
+            if config.spec_algo != "DUMMY" and draft_model_runner is None:
+                raise ValueError(
+                    f"{config.spec_algo} speculative decoding requires a draft model"
+                )
+            DrafterImpl = get_drafter_impl(
+                config.spec_algo,
+                None if draft_model_runner is None else draft_model_runner.model,
+            )
             self.drafter = DrafterImpl(
                 spec_num_tokens=config.spec_num_tokens,
                 spec_num_steps=config.spec_num_steps,
@@ -626,6 +655,14 @@ class ModelExecutor:
             )
         else:
             self.drafter = None
+        if (
+            self._pp_is_last_stage
+            and self.sampling_backend.reads_only_argmax()
+            and config.grammar_backend == "none"
+        ):
+            # The sampler reads only each row's argmax, so the target head can
+            # reduce it across vocabulary shards instead of gathering logits.
+            self.model_runner.model.logits_processor.fuse_argmax()
         self._simulated_accept_length = parse_simulated_accept_length(
             envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get(),
             spec_algorithm=config.spec_algo,
@@ -1082,6 +1119,8 @@ class ModelExecutor:
         count lets the tuner enumerate every smaller bucket, exactly as the
         target's prefill does for the target experts.
         """
+        if self.drafter.draft_model_runner is None:
+            return
         from tokenspeed.runtime.layers.moe.expert import MoELayer
 
         tuned: set[tuple] = set()
@@ -1404,6 +1443,13 @@ class ModelExecutor:
             num_prefill_tokens : ctx.input_num_tokens
         ].reshape(num_decodes, n)
 
+    def _state_group_ids(self) -> tuple[str, ...]:
+        return tuple(
+            spec.group_id
+            for spec in self._cache_runtime_contract.group_specs
+            if spec.attn_kind == "state"
+        )
+
     @nvtx_range("sampling", color="yellow")
     def _run_sampling(
         self,
@@ -1411,6 +1457,34 @@ class ModelExecutor:
         sampling_info: SamplingBatchInfo,
         ctx: ForwardContext,
         candidates: torch.Tensor | None = None,
+    ):
+        """Sample and verify, then end each request where the control plane
+        ends it: an accepted width is cut at the request's stop token or
+        token limit before anything reads it (the state commit, the accepted
+        frontier, the drafter, the reported tokens)."""
+        output_tokens, accept_lengths = self._sample_and_verify(
+            logits_output, sampling_info, ctx, candidates
+        )
+        ib = self.input_buffers
+        self.runtime_states.apply_stop_conditions(
+            ib.state_write_req_pool_indices_buf[: ctx.bs],
+            output_tokens,
+            accept_lengths,
+            ib.input_lengths_buf[: ctx.bs],
+            ib.extend_prompt_lens_buf[: ctx.num_extends],
+            num_extends=ctx.num_extends,
+            num_prefill_outputs=ctx.output_layout.num_prefill_outputs,
+            decode_width=ctx.output_layout.decode_width,
+            padding_index=ib.state_write_padding_pool_index,
+        )
+        return output_tokens, accept_lengths
+
+    def _sample_and_verify(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        ctx: ForwardContext,
+        candidates: torch.Tensor | None,
     ):
         """One sampling rule for every batch: prefill rows sample, decode
         rows verify.
@@ -1423,14 +1497,21 @@ class ModelExecutor:
         num_decodes = ctx.bs - num_extends
         layout = ctx.output_layout
         num_prefill_outputs = layout.num_prefill_outputs
+        # Eager prefills only: 0 in every captured graph.
+        sampled_top_k = ctx.sampled_top_k
 
         if num_decodes == 0 and num_prefill_outputs == num_extends:
-            return self.sampling_backend.sample(
+            sampled = self.sampling_backend.sample(
                 logits_output,
                 _with_prefill_sample_offsets(
                     sampling_info, self.input_buffers.input_lengths_buf
                 ),
             )
+            if sampled_top_k:
+                _set_sampled_top_logprobs(
+                    logits_output, logits_output.next_token_logits, sampled_top_k
+                )
+            return sampled
         if num_extends == 0:
             output_tokens, accept_lengths = self.sampling_backend.verify(
                 logits_output,
@@ -1460,10 +1541,14 @@ class ModelExecutor:
             else None
         )
         logits = logits_output.next_token_logits
+        token_ids = logits_output.next_token_ids
         token_parts, length_parts, logprob_parts = [], [], []
 
         if num_prefill_outputs:
-            prefill_out = LogitsProcessorOutput(next_token_logits=logits[prefill])
+            prefill_out = LogitsProcessorOutput(
+                next_token_logits=logits[prefill],
+                next_token_ids=None if token_ids is None else token_ids[prefill],
+            )
             tokens, lengths = self.sampling_backend.sample(
                 prefill_out,
                 _with_prefill_sample_offsets(
@@ -1473,6 +1558,10 @@ class ModelExecutor:
                     self.input_buffers.input_lengths_buf,
                 ),
             )
+            if sampled_top_k:
+                _set_sampled_top_logprobs(
+                    logits_output, prefill_out.next_token_logits, sampled_top_k
+                )
             # verify writes the same backend buffers; snapshot the prefix.
             token_parts.append(tokens.clone() if num_decodes else tokens)
             length_parts.append(lengths.clone() if num_decodes else lengths)
@@ -1492,7 +1581,12 @@ class ModelExecutor:
                 )
             )
         if num_decodes:
-            decode_out = LogitsProcessorOutput(next_token_logits=logits[decode_outputs])
+            decode_out = LogitsProcessorOutput(
+                next_token_logits=logits[decode_outputs],
+                next_token_ids=(
+                    None if token_ids is None else token_ids[decode_outputs]
+                ),
+            )
             tokens, lengths = self.sampling_backend.verify(
                 decode_out,
                 _sampling_info_for_requests(
@@ -1638,11 +1732,21 @@ class ModelExecutor:
             self._compact_accepted_tree(ctx.bs, logits_output)
 
         if self.drafter is not None:
+            draft_accept_lengths = accept_lengths
+            if ctx.output_layout.num_decodes:
+                # A stopped request keeps no token; its drafts are discarded,
+                # but the drafter indexes the last accepted position.
+                draft_accept_lengths = accept_lengths.clone()
+                draft_accept_lengths[ctx.output_layout.decode_request_slice] = (
+                    draft_accept_lengths[ctx.output_layout.decode_request_slice].clamp(
+                        min=1
+                    )
+                )
             next_round_input_ids = self.drafter.run(
                 base_ctx=ctx,
                 logits_output=logits_output,
                 output_tokens=output_tokens,
-                accept_lengths=accept_lengths,
+                accept_lengths=draft_accept_lengths,
             )
             # _update_runtime_state skips future_input_map when drafter is
             # active — drafter writes the next-round inputs directly, and the
@@ -1669,7 +1773,7 @@ class ModelExecutor:
             output_tokens,
             accept_lengths,
             output_logprobs,
-            logits_output.input_token_logprobs,
+            ForwardLogprobs.of(logits_output),
         )
 
     @nvtx_range("update_runtime_state", color="orange")
@@ -1814,7 +1918,7 @@ class ModelExecutor:
             # each as the per-rank token counts sizing its collectives
             # (idle_forward_global_num_tokens); every step runs the IDLE forward
             # over an empty window with its own spec_step_idx.
-            if self.drafter is not None:
+            if self.drafter is not None and self.drafter.draft_model_runner is not None:
                 # A draft model that reads request-token history takes the view
                 # on every forward; the idle rank hands it an empty one, as the
                 # target's idle forward above does.
@@ -2073,6 +2177,8 @@ class ModelExecutor:
         ngram_inputs: NGramInputs | None,
         request_history_seeds: RequestHistorySeeds | None,
         input_logprob_plan: InputLogprobPlan | None,
+        sampled_top_k: int,
+        stop_criteria: Sequence[StopCriteria],
     ) -> ModelExecutionResult:
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
@@ -2100,6 +2206,9 @@ class ModelExecutor:
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
+            self.runtime_states.bind_stop_criteria(
+                forward_op.request_ids, forward_op.request_pool_indices, stop_criteria
+            )
             cache_metadata = None
             block_tables = {}
             block_tables_cpu = {}
@@ -2121,6 +2230,19 @@ class ModelExecutor:
                 total_tokens=total_tokens,
                 ngram_inputs=ngram_inputs,
             )
+            state_group_ids = self._state_group_ids()
+            if (
+                self.config.overlap_schedule_depth > 0
+                and bs > num_extends
+                and state_group_ids
+            ):
+                # A decode dispatched before the round that ended its request
+                # landed runs as a padding row for the recurrent state.
+                block_tables = self.runtime_states.masked_state_tables(
+                    block_tables,
+                    self.input_buffers.req_pool_indices_buf[:bs],
+                    state_group_ids,
+                )
             if self.tree_spec is not None and num_extends == 0 and bs > 0:
                 self.tree_spec.load_step(
                     bs,
@@ -2157,7 +2279,7 @@ class ModelExecutor:
 
             grammar_completion = None
 
-            input_token_logprobs = None
+            forward_logprobs = None
             if total_tokens == 0:
                 # Fully prefix-cached prefill: no tokens to process.
                 output_tokens = torch.zeros(0, dtype=torch.int32, device=self.device)
@@ -2251,6 +2373,7 @@ class ModelExecutor:
                     input_logprob_rows=self._input_logprob_rows(
                         input_logprob_plan, num_extends, total_tokens, query_shard
                     ),
+                    sampled_top_k=sampled_top_k if num_extends > 0 else 0,
                     decode_input_ids=decode_input_ids,
                     output_layout=output_layout,
                     query_shard=query_shard,
@@ -2293,6 +2416,17 @@ class ModelExecutor:
                         sampling_params_list=sampling_params_list,
                         num_tokens_per_req=self.config.output_length,
                     )
+                    if (
+                        self.sampling_backend.config.synthetic_acceptance_length
+                        is not None
+                        and decode_input_ids is not None
+                    ):
+                        self.sampling_backend.limit_synthetic_acceptance(
+                            self.input_buffers.force_single_token_verify_buf[
+                                num_extends:bs
+                            ],
+                            num_extends,
+                        )
                     if timing_enabled:
                         sampling_prep_ms = (
                             time.perf_counter() - sampling_start
@@ -2316,7 +2450,7 @@ class ModelExecutor:
                         output_tokens,
                         output_lengths,
                         output_logprobs,
-                        input_token_logprobs,
+                        forward_logprobs,
                     ) = self.forward_step(
                         bs=bs,
                         ctx=ctx,
@@ -2412,10 +2546,10 @@ class ModelExecutor:
 
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
-                if input_token_logprobs is not None:
-                    input_token_logprobs = input_token_logprobs.to(
-                        "cpu", non_blocking=True
-                    )
+                if forward_logprobs is not None:
+                    forward_logprobs = forward_logprobs.to_host()
+                else:
+                    forward_logprobs = ForwardLogprobs()
 
                 output_nan_flags = self.nan_guard.flags_cpu
 
@@ -2453,11 +2587,15 @@ class ModelExecutor:
             next_input_ids=next_input_ids,
             output_nan_flags=output_nan_flags,
             spec_candidate_tokens=spec_candidate_tokens,
-            input_token_logprobs=input_token_logprobs,
+            input_token_logprobs=forward_logprobs.input_token_logprobs,
             # The plan rides along whether or not this rank scored the rows: a
             # pipeline stage without logits adopts the last stage's logprobs on
             # the commit path and pairs them with its own (mirrored) plan.
             input_logprob_plan=input_logprob_plan,
+            input_top_logprobs_val=forward_logprobs.input_top_logprobs_val,
+            input_top_logprobs_idx=forward_logprobs.input_top_logprobs_idx,
+            output_top_logprobs_val=forward_logprobs.output_top_logprobs_val,
+            output_top_logprobs_idx=forward_logprobs.output_top_logprobs_idx,
         )
 
     def _input_logprob_rows(
@@ -2521,6 +2659,7 @@ class ModelExecutor:
             num_input_rows=num_input_rows,
             chunk_tokens=self.config.input_logprob_chunk_tokens,
             rows_per_rank=rows_per_rank,
+            top_k=plan.top_k,
         )
 
     def write_remote_spec_candidate_ids(

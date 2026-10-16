@@ -61,6 +61,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     state_verify_commit_rows,
     store_state_rows,
 )
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,
@@ -1406,9 +1407,6 @@ class MambaAttnBackend(AttentionBackend):
         f_b_weight = kwargs.get("f_b_weight")
         g_raw = kwargs.get("g_raw")
         beta_raw = kwargs.get("beta_raw")
-        output_gate = kwargs.get("output_gate")
-        norm_weight = kwargs.get("norm_weight")
-        norm_eps = kwargs.get("norm_eps")
         gate_lower_bound = kwargs.get("lower_bound")
         A_log = kwargs["A_log"]
         dt_bias = kwargs["dt_bias"]
@@ -1438,18 +1436,15 @@ class MambaAttnBackend(AttentionBackend):
             attn_tp_size=attn_tp_size,
             head_v_dim=head_v_dim,
             lower_bound=gate_lower_bound,
-            output_gate=output_gate,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
         )
         if fused_out is not None:
             return fused_out
 
-        # A family whose model hands over projection views makes them dense here.
-        mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
-        # Stride-aware fused decoders consume packed projection views directly.
-        # Preserve the shared fallback's established compact input layout.
+        # Stride-aware decoders consume packed projection views directly.
+        # Otherwise a family whose model hands over projection views makes them
+        # dense here, and the shared fallback keeps its compact input layout.
         if not self._decode_packed_qkv_views:
+            mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
             mixed_qkv = mixed_qkv.contiguous()
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
@@ -1497,9 +1492,6 @@ class MambaAttnBackend(AttentionBackend):
             f_b_weight=f_b_weight,
             beta_raw=beta_raw,
             lower_bound=gate_lower_bound,
-            output_gate=output_gate,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
         )
 
     def _decode(
@@ -1520,9 +1512,6 @@ class MambaAttnBackend(AttentionBackend):
         attn_tp_size: int,
         head_v_dim: int,
         lower_bound: float | None,
-        output_gate: torch.Tensor | None,
-        norm_weight: torch.Tensor | None,
-        norm_eps: float | None,
     ) -> torch.Tensor | None:
         """Whole-step decode attempt; ``None`` falls through to the shared flow.
 
@@ -1550,9 +1539,6 @@ class MambaAttnBackend(AttentionBackend):
             attn_tp_size: Attention tensor-parallel size.
             head_v_dim: Value head dimension.
             lower_bound: KDA decay clamp.
-            output_gate: Optional KDA gated-norm logits.
-            norm_weight: Optional KDA output RMSNorm weight.
-            norm_eps: Optional KDA output RMSNorm epsilon.
 
         Returns:
             The layer output when a fused kernel ran, else None.
@@ -1578,9 +1564,6 @@ class MambaAttnBackend(AttentionBackend):
         f_b_weight: torch.Tensor | None,
         beta_raw: torch.Tensor | None,
         lower_bound: float | None,
-        output_gate: torch.Tensor | None,
-        norm_weight: torch.Tensor | None,
-        norm_eps: float | None,
     ) -> torch.Tensor:
         """Single-token recurrent scan over the split, conv'd projections.
 
@@ -1607,9 +1590,6 @@ class MambaAttnBackend(AttentionBackend):
             f_b_weight: KDA second gate projection.
             beta_raw: KDA raw per-head beta logits.
             lower_bound: KDA decay clamp.
-            output_gate: Optional KDA gated-norm logits.
-            norm_weight: Optional KDA output RMSNorm weight.
-            norm_eps: Optional KDA output RMSNorm epsilon.
 
         Returns:
             ``[1, B, Hv, V]`` layer output.
@@ -1720,7 +1700,7 @@ class MambaAttnBackend(AttentionBackend):
             )
             if fused_out is not None:
                 return fused_out
-            if self.tree_verify is None:
+            if self.tree_verify is None and not self._verify_packed_qkv_views:
                 # A chain verifies through the dense MTP kernels (FlashInfer's).
                 mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
             # Read the committed window and write per-position states into the
@@ -1836,6 +1816,11 @@ class MambaAttnBackend(AttentionBackend):
                 head_v=head_v_dim,
             )
         else:
+            valid_tokens = (
+                query_start_loc[-1:]
+                if current_platform().is_hopper and not is_target_verify
+                else None
+            )
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 num_q_heads=num_heads,
@@ -1845,6 +1830,7 @@ class MambaAttnBackend(AttentionBackend):
                 head_k=head_k_dim,
                 head_v=head_v_dim,
                 replay=replay_inputs,
+                valid_tokens=valid_tokens,
             )
 
         if is_target_verify:

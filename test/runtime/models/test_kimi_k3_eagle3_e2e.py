@@ -9,7 +9,7 @@ Run on a 16-GPU PP1 node:
     KIMI_K3_EAGLE3_E2E=1 \
     KIMI_K3_MODEL=/models/Kimi-K3 \
     KIMI_K3_EAGLE3_DRAFT=/models/kimi-k3-eagle3 \
-    python3 -m unittest models.test_kimi_k3_eagle3_e2e -v
+    python3 -m pytest models/test_kimi_k3_eagle3_e2e.py -v
 """
 
 from __future__ import annotations
@@ -20,9 +20,9 @@ import subprocess
 import sys
 import tempfile
 import time
-import unittest
 from pathlib import Path
 
+import pytest
 import requests
 
 from tokenspeed.runtime.utils.process import kill_process_tree
@@ -35,11 +35,11 @@ PORT = int(os.environ.get("KIMI_K3_EAGLE3_PORT", "22080"))
 TIMEOUT = int(os.environ.get("KIMI_K3_EAGLE3_TIMEOUT", "3600"))
 
 
-@unittest.skipUnless(
-    ENABLED and DRAFT,
-    "set KIMI_K3_EAGLE3_E2E=1 and KIMI_K3_EAGLE3_DRAFT on a TP16 K3 host",
+@pytest.mark.skipif(
+    not (ENABLED and DRAFT),
+    reason=("set KIMI_K3_EAGLE3_E2E=1 and KIMI_K3_EAGLE3_DRAFT on a TP16 K3 host"),
 )
-class TestKimiK3Eagle3E2E(unittest.TestCase):
+class TestKimiK3Eagle3E2E:
     def _wait_for_ready(self) -> None:
         deadline = time.time() + TIMEOUT
         while time.time() < deadline:
@@ -50,7 +50,7 @@ class TestKimiK3Eagle3E2E(unittest.TestCase):
             except requests.RequestException:
                 pass
             time.sleep(5)
-        self.fail("K3 EAGLE3 server did not become ready")
+        assert False, "K3 EAGLE3 server did not become ready"
 
     def test_k3_eagle3_accepts_nonzero_drafts(self):
         with tempfile.TemporaryDirectory(prefix="tokenspeed-k3-eagle3-") as temp_dir:
@@ -146,8 +146,8 @@ class TestKimiK3Eagle3E2E(unittest.TestCase):
                     response.raise_for_status()
                     message = response.json()["choices"][0]["message"]
                     content = message.get("content", "")
-                    self.assertIn("1073", content)
-                    self.assertFalse(
+                    assert ("1073") in (content)
+                    assert not (
                         any(
                             tag in content
                             for tag in ("<|open|>", "<|sep|>", "<|close|>")
@@ -167,17 +167,11 @@ class TestKimiK3Eagle3E2E(unittest.TestCase):
                         if rates:
                             break
                         time.sleep(1)
-                    self.assertTrue(
-                        rates, "no EAGLE3 acceptance statistic in server log"
-                    )
-                    self.assertGreater(
-                        max(rates), 0.0, "EAGLE3 accepted no draft tokens"
-                    )
+                    assert rates, "no EAGLE3 acceptance statistic in server log"
+                    assert (max(rates)) > (0.0), "EAGLE3 accepted no draft tokens"
                 finally:
                     kill_process_tree(proc.pid)
 
 
 if __name__ == "__main__":
-    import pytest
-
-    raise SystemExit(pytest.main([__file__, "-q"]))
+    raise SystemExit(pytest.main([__file__, "-q", *sys.argv[1:]]))

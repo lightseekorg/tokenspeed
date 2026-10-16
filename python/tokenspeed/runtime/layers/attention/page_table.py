@@ -159,22 +159,3 @@ def group_slot_mapping_from_raw(
     page_ids = safe_page_ids(block_table, req_indices, logical_page)
     slots = page_ids * rows_per_page + offsets
     return torch.where(page_ids >= 0, slots, torch.full_like(slots, -1))
-
-
-def mask_invalid_graph_tokens(
-    slot_mapping: torch.Tensor,
-    is_valid_token: torch.Tensor | None,
-) -> torch.Tensor:
-    """Mask CUDA-graph padding rows to the ``-1`` sentinel (per-token or
-    per-request validity, expanded like the request indices)."""
-    if is_valid_token is None:
-        return slot_mapping
-    valid = expand_group_values_for_tokens(
-        is_valid_token,
-        slot_mapping.numel(),
-        "slot validity mask",
-    ).to(
-        device=slot_mapping.device,
-        dtype=torch.bool,
-    )
-    return torch.where(valid, slot_mapping, torch.full_like(slot_mapping, -1))

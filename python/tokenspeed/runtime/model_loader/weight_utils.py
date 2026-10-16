@@ -1014,14 +1014,15 @@ def initialize_dummy_integer_weights(model: torch.nn.Module, seed: int = 1234) -
     They are zeroed, which is valid for all three. A parameter can set
     ``dummy_initializer(param, generator)`` when zero is valid but
     unrepresentative, such as an expert-id table that would send every token
-    to one expert.
+    to one expert. A floating-point parameter that post-processing checks,
+    such as a scale that starts as NaN until the checkpoint fills it, can set
+    one too; other floating-point parameters are left as they are.
     """
     for param in model.parameters():
-        if torch.is_floating_point(param):
-            continue
         initializer = getattr(param, "dummy_initializer", None)
         if initializer is None:
-            param.data.zero_()
+            if not torch.is_floating_point(param):
+                param.data.zero_()
             continue
         generator = torch.Generator(device=param.data.device)
         generator.manual_seed(seed)

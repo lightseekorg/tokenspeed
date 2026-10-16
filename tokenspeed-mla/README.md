@@ -84,11 +84,10 @@ decode scenarios, especially token-by-token agent traffic. Example: with
 query tokens into `M` (`H_eff=128`) and schedules the remaining two query
 groups on the scheduler second dimension (`q_seqlen_eff=2`).
 
-The public `tokenspeed_mla_decode` also accepts `enable_packed_q=True` to
-opt into continuous query/head packing on the FP8 and FP16/BF16 M128 paths, adapted from
-FlashInfer PR #4178. The default is **False**, preserving the folded-query
-implementation. M64 and token-gapped Q/output views continue to
-use that implementation even when the option is enabled.
+`tokenspeed_mla_decode` automatically selects continuous query/head packing
+on the FP8 and FP16/BF16 M128 paths when it uses fewer tiles than folding.
+Ties, M64 kernels and token-gapped Q/output views retain folding.
+The packing implementation is adapted from FlashInfer PR #4178.
 
 The packing orders rows as `query_token * num_heads + head`. Each 2-CTA
 group owns 128 consecutive rows, including across query boundaries. Thus
@@ -99,13 +98,12 @@ per-row causal positions and predicates partial output/LSE rows.
 
 For packed queries, auto split-KV uses `ceil(H * q_len / 128)` query tiles,
 and workspace needs `B * 128 * ceil(H * q_len / 128) * split_kv * 513 * 4`
-bytes for D512/FP32 partials, or zero when split-KV is one. Callers enabling
-this option must provide sufficient workspace. Output shape, output dtype
+bytes for D512/FP32 partials, or zero when split-KV is one. Callers must
+provide sufficient workspace for the selected layout. Output shape, output dtype
 (BF16 for FP8; input dtype for FP16/BF16), and base-2 LSE semantics are unchanged.
 The FP16/BF16 implementation retains its existing split-KV heuristic, reducer
-capacity and PDL waits. The option is part of the
-compile cache key. Existing direct kernel callers retain the old layout;
-opting in through the public wrapper keeps tiling and workspace consistent.
+capacity and PDL waits. The selected layout is part of the compile cache key.
+The wrapper keeps tiling, workspace sizing and kernel selection consistent.
 
 Sliding-window and DCP masking remain supported; window boundaries use the
 packed row's original query-token position.
@@ -168,9 +166,9 @@ This limits workspace traffic and reduction work, but can reduce parallelism
 too far for some shapes. The H96/B16/Q4 cases regress when the split count
 drops from three to one.
 
-The M256 kernel supports up to four tiles per request for either output dtype.
-By default, `H` must divide 256 and `q_len` must be a multiple of `256 / H`;
-`enable_packed_q=True` accepts other shapes such as H96 and partial tiles.
+The M256 kernel always packs query/head rows into 256-row tiles and supports
+up to four tiles per request for either output dtype, including H96 and
+partial final tiles.
 The kernel supports causal/non-causal attention, split-KV, LSE, PDL and CUDA
 graphs; it does not support sliding windows, DCP, or `local_visible_lens`.
 Rows with no visible keys produce zero output and `-inf` LSE.

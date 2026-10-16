@@ -645,7 +645,8 @@ class DummyModelLoader(BaseModelLoader):
                     self.load_config,
                 )
             # Post-processing can read integer weights, such as index tables,
-            # so they need valid values before it runs.
+            # and check scales that start as NaN, so they need valid values
+            # before it runs.
             initialize_dummy_integer_weights(model)
             # An EAGLE3 draft cannot share a vocab-sharded target embedding,
             # and its own dummy embedding is as valid as a loaded one.

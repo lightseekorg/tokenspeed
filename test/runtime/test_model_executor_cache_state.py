@@ -190,7 +190,12 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         merge_oov=lambda *_args: None,
     )
     executor._run_target_forward = lambda *_args: SimpleNamespace(
-        next_token_logprobs=None, input_token_logprobs=None
+        next_token_logprobs=None,
+        input_token_logprobs=None,
+        input_top_logprobs_val=None,
+        input_top_logprobs_idx=None,
+        sampled_top_logprobs_val=None,
+        sampled_top_logprobs_idx=None,
     )
     executor._run_sampling = lambda *_args: (
         torch.tensor([3], dtype=torch.int32),
@@ -267,7 +272,7 @@ def test_non_spec_decode_routes_through_verify():
 
     Non-speculative decode is verify's N == 1 case — _decode_candidates
     yields the one-column window (this step's input token per request) and
-    _run_sampling must call verify(), never the sample() fast path.
+    _sample_and_verify must call verify(), never the sample() fast path.
     """
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
 
@@ -303,12 +308,13 @@ def test_non_spec_decode_routes_through_verify():
         input_num_tokens=3,
         decode_input_ids=None,
         output_layout=ForwardOutputLayout(0, 0, 3, 1),
+        sampled_top_k=0,
     )
     candidates = executor._decode_candidates(ctx)
     assert candidates.shape == (3, 1)
     assert candidates.view(-1).tolist() == [0, 1, 2]
 
-    executor._run_sampling(object(), object(), ctx, candidates)
+    executor._sample_and_verify(object(), object(), ctx, candidates)
     assert calls == [("verify", (3, 1))]
 
     # Pure prefill still samples.
@@ -319,9 +325,10 @@ def test_non_spec_decode_routes_through_verify():
         input_num_tokens=6,
         decode_input_ids=None,
         output_layout=ForwardOutputLayout(2, 2, 0, 1),
+        sampled_top_k=0,
     )
     assert executor._decode_candidates(ctx2) is None
-    executor._run_sampling(
+    executor._sample_and_verify(
         object(),
         SimpleNamespace(valid_cache_lengths=None, req_pool_indices=None),
         ctx2,

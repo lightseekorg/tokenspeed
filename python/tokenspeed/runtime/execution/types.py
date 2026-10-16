@@ -114,17 +114,23 @@ class InputLogprobPlan:
             0 for a slot that needs none.
         position_starts: Per extend slot, the prompt position of its first
             gathered row (meaningful only where the count is non-zero).
+        top_k: How many most likely next tokens every gathered row also
+            returns: the largest ``top_logprobs_num`` among the planned slots
+            (each slot keeps its own), 0 for none.
     """
 
     row_starts: tuple[int, ...]
     counts: tuple[int, ...]
     position_starts: tuple[int, ...]
+    top_k: int = 0
 
     def __post_init__(self) -> None:
         if not len(self.row_starts) == len(self.counts) == len(self.position_starts):
             raise ValueError("input logprob plan fields must have equal lengths")
         if any(count < 0 for count in self.counts):
             raise ValueError("input logprob plan counts must be non-negative")
+        if self.top_k < 0:
+            raise ValueError("input logprob plan top_k must be non-negative")
         if self.num_rows == 0:
             raise ValueError("an input logprob plan must name at least one row")
 
@@ -132,6 +138,35 @@ class InputLogprobPlan:
     def num_rows(self) -> int:
         """Rows gathered by the whole batch (the flat result's length)."""
         return sum(self.counts)
+
+
+# Most stop tokens a request may end on (its own plus the model's EOS ids):
+# the width of the per-slot stop table the device cuts verify rounds with.
+MAX_STOP_TOKEN_IDS = 16
+
+
+@dataclass(frozen=True)
+class StopCriteria:
+    """Where a request's generation ends, as the device cuts verify rounds.
+
+    Attributes:
+        stop_token_ids: The tokens that end the request, at most
+            ``MAX_STOP_TOKEN_IDS``; empty under ``ignore_eos``.
+        token_limit: Total token count (prompt plus ``max_new_tokens``) at
+            which the request ends.
+    """
+
+    stop_token_ids: tuple[int, ...]
+    token_limit: int
+
+    def __post_init__(self) -> None:
+        if len(self.stop_token_ids) > MAX_STOP_TOKEN_IDS:
+            raise ValueError(
+                f"{len(self.stop_token_ids)} stop token ids exceed the device "
+                f"table width {MAX_STOP_TOKEN_IDS}"
+            )
+        if self.token_limit <= 0:
+            raise ValueError(f"token_limit must be positive, got {self.token_limit}")
 
 
 @dataclass(frozen=True)
@@ -165,6 +200,11 @@ class PlannedForward:
         input_logprob_plan: The prompt rows whose logprobs this forward
             gathers, None when no extend row needs any. A frozen dataclass
             of plain tuples.
+        sampled_top_k: How many most likely tokens each prefill row's
+            sampled token is reported with: the largest ``top_logprobs_num``
+            among the extend slots, 0 for none. A plain int.
+        stop_criteria: Per-slot stop tokens and token limits, gathered by the
+            loop. Frozen values fixed for the request's lifetime.
     """
 
     forward_op: Any
@@ -175,6 +215,48 @@ class PlannedForward:
     ngram_inputs: NGramInputs | None
     request_history_seeds: RequestHistorySeeds | None
     input_logprob_plan: InputLogprobPlan | None
+    sampled_top_k: int
+    stop_criteria: tuple[StopCriteria, ...]
+
+
+@dataclass
+class ForwardLogprobs:
+    """The logprobs an eager extend forward returns beside its sampled
+    tokens': the planned prompt rows' (``ForwardContext.input_logprob_rows``),
+    and the top-k alternatives of those rows and of the prefill rows' sampled
+    tokens (``ForwardContext.sampled_top_k``). A forward that asked for none of
+    them -- every captured graph among them -- returns None in its place.
+    """
+
+    input_token_logprobs: torch.Tensor | None = None
+    input_top_logprobs_val: torch.Tensor | None = None
+    input_top_logprobs_idx: torch.Tensor | None = None
+    output_top_logprobs_val: torch.Tensor | None = None
+    output_top_logprobs_idx: torch.Tensor | None = None
+
+    @classmethod
+    def of(cls, logits_output: Any) -> ForwardLogprobs | None:
+        """The forward's logprobs from its ``LogitsProcessorOutput``."""
+        logprobs = cls(
+            input_token_logprobs=logits_output.input_token_logprobs,
+            input_top_logprobs_val=logits_output.input_top_logprobs_val,
+            input_top_logprobs_idx=logits_output.input_top_logprobs_idx,
+            output_top_logprobs_val=logits_output.sampled_top_logprobs_val,
+            output_top_logprobs_idx=logits_output.sampled_top_logprobs_idx,
+        )
+        return None if logprobs.is_empty() else logprobs
+
+    def is_empty(self) -> bool:
+        return all(value is None for value in vars(self).values())
+
+    def to_host(self) -> ForwardLogprobs:
+        """Non-blocking D2H copies, landed by the result's copy event."""
+        return ForwardLogprobs(
+            **{
+                name: None if value is None else value.to("cpu", non_blocking=True)
+                for name, value in vars(self).items()
+            }
+        )
 
 
 @dataclass
@@ -211,6 +293,13 @@ class ModelExecutionResult:
     # slices the flat tensor per request without re-deriving the rows.
     input_token_logprobs: torch.Tensor | None = None
     input_logprob_plan: InputLogprobPlan | None = None
+    # The top-k alternatives ([rows, k] fp32 values and int64 ids) of the
+    # planned prompt rows (plan order) and of the prefill rows' sampled tokens
+    # (prefill output order); None when the forward asked for none.
+    input_top_logprobs_val: torch.Tensor | None = None
+    input_top_logprobs_idx: torch.Tensor | None = None
+    output_top_logprobs_val: torch.Tensor | None = None
+    output_top_logprobs_idx: torch.Tensor | None = None
     _synced: bool = field(default=False, init=False, repr=False, compare=False)
 
     def sync(self) -> None:

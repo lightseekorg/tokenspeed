@@ -272,6 +272,24 @@ def _write_latent(
 @register_kernel(
     "attention",
     "mla_prologue",
+    name="ascend_composite_mla_prologue",
+    solution="composite",
+    capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+    signatures=format_signatures(("query",), "dense", {torch.bfloat16}),
+    priority=Priority.PORTABLE,
+    traits={
+        "expanded": BOOLS,
+        "full_write": BOOLS,
+        "kv_format": frozenset({"native"}),
+        "kv_convert": frozenset({False}),
+        "rope_style": ROPE_STYLES,
+        "sanitize": BOOLS,
+        "store": frozenset({True}),
+    },
+)
+@register_kernel(
+    "attention",
+    "mla_prologue",
     name="composite_mla_prologue",
     solution="composite",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),

@@ -27,6 +27,7 @@ implementation serves a collective; every public method asks it first.
 """
 
 import enum
+import logging
 
 import torch
 from tokenspeed_kernel.platform import current_platform
@@ -50,6 +51,8 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
     TrtllmAllReduceBackend,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+logger = logging.getLogger(__name__)
 
 
 def ordered_fold_sum(parts: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
@@ -390,6 +393,13 @@ class AutoBackend(CommBackend):
     def _all_reduce_one(self, tensor: torch.Tensor, group: Group, op) -> torch.Tensor:
         """All-reduce a single tensor along the route ``route`` picked for it."""
         route = self.route(Collective.ALL_REDUCE, tensor, group)
+        if route in (Route.ORDERED_FOLD, Route.MULTIMEM) and op in (
+            torch.distributed.ReduceOp.MAX,
+            torch.distributed.ReduceOp.MIN,
+        ):
+            # Max and min are exact in any reduction order, so NCCL already
+            # gives the batch-invariant result the fold exists for.
+            return self._nccl.all_reduce(tensor, group, op=op)
         if route is Route.ORDERED_FOLD:
             return self._ordered_fold_all_reduce(tensor, group, op)
         if route is Route.MULTIMEM:
@@ -558,6 +568,7 @@ class AutoBackend(CommBackend):
         Projection collectives have an explicit pre-capture lifetime. Their
         large-message and unsupported-topology paths return to this backend;
         batch-invariant reductions retain the rank-ordered fold at every size.
+        Batch-invariant fusion diagnostics apply only to column projections.
         """
         use_lamport = (
             current_platform().is_nvidia
@@ -565,11 +576,26 @@ class AutoBackend(CommBackend):
             and spec.dtype == torch.bfloat16
             and not self._force_deterministic_rsag()
         )
+        batch_invariant = self._batch_invariant_collectives()
         return self._projection.prepare(
             spec,
             use_lamport,
-            use_lamport and not self._batch_invariant_collectives(),
+            use_lamport and not batch_invariant,
+            batch_invariant,
             scratch_pool,
+        )
+
+    def try_fused_dp_column_linear(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scales: torch.Tensor | None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> bool:
+        return self._projection.try_fused_dp_column_linear(
+            tensor, weight, weight_scales, owner_rows, out, workspace
         )
 
     def projection_all_gather(

@@ -97,9 +97,10 @@ def test_per_request_reads_precede_the_dependent_drain() -> None:
     """Every per-request lookup on rid_to_state happens before the drain.
 
     A drained commit can finish a request and pop it from rid_to_state while
-    its id is still in the planned forward_op, so sampling params, grammar
-    state, ngram inputs and the batch log's context lengths must all be read
-    first. Pinned on the statement order of EventLoop.event_loop.
+    its id is still in the planned forward_op, so sampling params, stop
+    criteria, grammar state, ngram inputs and the batch log's context lengths
+    must all be read first. Pinned on the statement order of
+    EventLoop.event_loop.
     """
     import ast
     import inspect
@@ -120,6 +121,7 @@ def test_per_request_reads_precede_the_dependent_drain() -> None:
     drain = calls.index("_dispatch_depends_on_pending_commit")
     for reader in (
         "_gather_sampling_params",
+        "_gather_stop_criteria",
         "_gather_grammar_state",
         "log_dispatch",
     ):

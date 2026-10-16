@@ -90,6 +90,10 @@ class Output:
     hidden_states: torch.Tensor | None = None
     logits_layout_plan: object = None
     input_token_logprobs: torch.Tensor | None = None
+    input_top_logprobs_val: torch.Tensor | None = None
+    input_top_logprobs_idx: torch.Tensor | None = None
+    sampled_top_logprobs_val: torch.Tensor | None = None
+    sampled_top_logprobs_idx: torch.Tensor | None = None
 
 
 class SharedBufferSampler:
@@ -142,7 +146,7 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
     )
     sample = load_symbol(
         RUNTIME + "execution/model_executor.py",
-        "_run_sampling",
+        "_sample_and_verify",
         owner="ModelExecutor",
         LogitsProcessorOutput=Output,
         _sampling_info_for_requests=load_symbol(
@@ -163,6 +167,7 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
         num_extends=e,
         decode_input_ids=None,
         output_layout=ForwardOutputLayout(e, p, d, width),
+        sampled_top_k=0,
     )
     pool_indices = torch.tensor([17, 3, 11, 5, 13])[: e + d]
     cache_lengths = torch.arange(32)
@@ -510,7 +515,7 @@ def test_identity_sampling_keeps_backend_buffer_aliases(decode):
     )
     sample = load_symbol(
         RUNTIME + "execution/model_executor.py",
-        "_run_sampling",
+        "_sample_and_verify",
         owner="ModelExecutor",
         LogitsProcessorOutput=Output,
         _with_prefill_sample_offsets=_load_prefill_sample_offsets(),
@@ -534,6 +539,7 @@ def test_identity_sampling_keeps_backend_buffer_aliases(decode):
             if decode
             else ForwardOutputLayout(2, 2, 0, 1)
         ),
+        sampled_top_k=0,
     )
     tokens, lengths = sample(
         executor, Output(torch.eye(2)), info, ctx, torch.zeros(2, 1, dtype=torch.int32)
@@ -704,8 +710,13 @@ def test_grammar_mask_producers_walk_only_original_decode_candidates(
 
 
 def test_drafter_future_inputs_keep_original_request_rows():
+    from tokenspeed.runtime.execution.types import ForwardLogprobs
+
     forward = load_symbol(
-        RUNTIME + "execution/model_executor.py", "_forward_step", owner="ModelExecutor"
+        RUNTIME + "execution/model_executor.py",
+        "_forward_step",
+        owner="ModelExecutor",
+        ForwardLogprobs=ForwardLogprobs,
     )
     future_inputs = torch.full((6, 3), 77, dtype=torch.int32)
     draft_tokens = torch.tensor(

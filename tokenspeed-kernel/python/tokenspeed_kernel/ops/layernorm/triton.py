@@ -5,6 +5,11 @@ import os
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.quantization.triton import (
+    fp8_quantize_by_multiplier,
+    fp8_token_multiplier,
+    fp8_token_scale,
+)
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _FP32_MIN_NORMAL = tl.constexpr(1.1754943508222875e-38)
@@ -52,6 +57,9 @@ def _rmsnorm_kernel(
     ROUND_RESIDUAL_SUM_BF16: tl.constexpr,
     SCALE_INPUTS_BF16: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    fp8_out_ptr,
+    fp8_scale_ptr,
+    TOKEN_FP8_OUT: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK)
@@ -85,6 +93,22 @@ def _rmsnorm_kernel(
     x *= tl.rsqrt(variance + eps)
     weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     tl.store(out_ptr + row_offsets, x * weight, mask=mask)
+    if TOKEN_FP8_OUT:
+        # The stored row quantized per token (as fp8_quantize_per_token
+        # quantizes it): FP8 E4M3 codes and one FP32 dequant scale.
+        normed = (x * weight).to(out_ptr.dtype.element_ty).to(tl.float32)
+        amax = tl.max(tl.abs(normed), axis=0)
+        codes = fp8_quantize_by_multiplier(normed, fp8_token_multiplier(amax))
+        # Store the codes in vectors of at most 16 bytes of the output (8
+        # BF16 elements). A vector of 16 one-byte codes would have the
+        # compiler give every thread 16 elements of the row, loads included,
+        # and so sum the squares above in another order than the call
+        # without token_fp8_out, which changes some output bits.
+        code_offsets = tl.max_contiguous(
+            tl.arange(0, BLOCK), 128 // out_ptr.dtype.element_ty.primitive_bitwidth
+        )
+        tl.store(fp8_out_ptr + row * n_cols + code_offsets, codes, mask=mask)
+        tl.store(fp8_scale_ptr + row, fp8_token_scale(amax))
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -216,6 +240,7 @@ def rmsnorm(
     round_residual_sum_bf16: bool = False,
     x_scale: float | None = None,
     residual_scale: float | None = None,
+    token_fp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Apply RMSNorm over the last dimension with FP32 intermediates.
 
@@ -239,6 +264,12 @@ def rmsnorm(
             BF16 before the add, as an eager BF16 tensor times a Python float
             is. They are runtime arguments, so new values do not recompile.
             Need ``round_residual_sum_bf16=True`` and an NVIDIA GPU.
+        token_fp8_out: Optional ``(codes, scales)`` buffers, contiguous FP8
+            E4M3 ``[rows, hidden_size]`` and FP32 ``[rows, 1]``: the same
+            launch also writes the output quantized per token, as
+            ``ops/quantization/triton.py``'s ``fp8_quantize_per_token`` would
+            quantize the stored output, for an FP8 GEMM that reads it.
+            Callers reach it through ``ops.quantization.rmsnorm_quantize_fp8``.
 
     Returns:
         ``out``, or ``(out, residual_sum)`` when ``residual`` is given.
@@ -293,6 +324,24 @@ def rmsnorm(
     out_2d = out.view(-1, hidden_size)
 
     residual_out = torch.empty_like(x) if residual is not None else None
+    if token_fp8_out is not None:
+        codes, scales = token_fp8_out
+        if (
+            codes.dtype != torch.float8_e4m3fn
+            or tuple(codes.shape) != tuple(x_2d.shape)
+            or not codes.is_contiguous()
+            or scales.dtype != torch.float32
+            or scales.numel() != x_2d.shape[0]
+            or not scales.is_contiguous()
+        ):
+            raise ValueError(
+                "token_fp8_out takes contiguous FP8 E4M3 codes shaped like the "
+                f"{tuple(x_2d.shape)} rows and FP32 [rows, 1] scales, got "
+                f"{codes.dtype} {tuple(codes.shape)} and {scales.dtype} "
+                f"{tuple(scales.shape)}"
+            )
+    else:
+        codes, scales = None, None
     block = triton.next_power_of_2(hidden_size)
     enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     launch_kwargs = (
@@ -314,6 +363,9 @@ def rmsnorm(
         ROUND_RESIDUAL_SUM_BF16=round_residual_sum_bf16,
         SCALE_INPUTS_BF16=scale_inputs,
         ENABLE_PDL=enable_pdl,
+        fp8_out_ptr=codes,
+        fp8_scale_ptr=scales,
+        TOKEN_FP8_OUT=token_fp8_out is not None,
         **launch_kwargs,
     )
     if residual is None:

@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import os
 import sys
-import unittest
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,12 +32,12 @@ def _import_backend():
     return TRTLLMMHAAttnBackend
 
 
-class TRTLLMLeafMetadataTest(unittest.TestCase):
-    def setUp(self):
+class TestTRTLLMLeafMetadataTest:
+    def setup_method(self):
         try:
             self.Backend = _import_backend()
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
         import torch
 
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -81,14 +82,14 @@ class TRTLLMLeafMetadataTest(unittest.TestCase):
         )
         b.refresh_decode_metadata(2, 2, seq_lens, page_table)
         meta = b.forward_decode_metadata
-        self.assertEqual(meta.cache_seqlens_int32.tolist(), [65, 3])
-        self.assertEqual(meta.max_seq_len_q, 1)
-        self.assertEqual(meta.cu_seqlens_q.tolist(), [0, 1, 2])
+        assert (meta.cache_seqlens_int32.tolist()) == ([65, 3])
+        assert (meta.max_seq_len_q) == (1)
+        assert (meta.cu_seqlens_q.tolist()) == ([0, 1, 2])
         # The metadata views the persistent buffers the graph records.
-        self.assertEqual(meta.page_table.data_ptr(), b.page_table_buf.data_ptr())
-        self.assertEqual(meta.cache_seqlens_int32.data_ptr(), b.seq_lens_buf.data_ptr())
+        assert (meta.page_table.data_ptr()) == (b.page_table_buf.data_ptr())
+        assert (meta.cache_seqlens_int32.data_ptr()) == (b.seq_lens_buf.data_ptr())
         # Without speculation the verify slot stays untouched.
-        self.assertIsNone(b.forward_prefill_metadata)
+        assert (b.forward_prefill_metadata) is None
 
     def test_verify_slot_clamps_padded_rows_to_spec_floor(self):
         torch = self.torch
@@ -97,19 +98,17 @@ class TRTLLMLeafMetadataTest(unittest.TestCase):
         page_table = torch.zeros((2, 8), dtype=torch.int32)
         b.refresh_decode_metadata(2, 1, seq_lens, page_table, for_graph_replay=True)
         # The decode slot keeps the raw lengths...
-        self.assertEqual(
-            b.forward_decode_metadata.cache_seqlens_int32.tolist(), [65, 1]
-        )
+        assert (b.forward_decode_metadata.cache_seqlens_int32.tolist()) == ([65, 1])
         # ...while the verify slot reads the clamped buffer: q_len=4 against
         # seq_len 1 would be an empty causal span (NaN), so >= spec.
         meta = b.forward_prefill_metadata
-        self.assertEqual(
-            meta.cache_seqlens_int32.data_ptr(), b.spec_cache_seqlens_buf.data_ptr()
+        assert (meta.cache_seqlens_int32.data_ptr()) == (
+            b.spec_cache_seqlens_buf.data_ptr()
         )
-        self.assertEqual(meta.cache_seqlens_int32.tolist(), [65, 4])
-        self.assertEqual(meta.max_seq_len_q, 4)
-        self.assertEqual(meta.cu_seqlens_q.tolist(), [0, 4, 8])
-        self.assertEqual(meta.page_table.data_ptr(), b.page_table_buf.data_ptr())
+        assert (meta.cache_seqlens_int32.tolist()) == ([65, 4])
+        assert (meta.max_seq_len_q) == (4)
+        assert (meta.cu_seqlens_q.tolist()) == ([0, 4, 8])
+        assert (meta.page_table.data_ptr()) == (b.page_table_buf.data_ptr())
 
     def test_per_bs_views_are_pointer_stable_across_refreshes(self):
         torch = self.torch
@@ -127,15 +126,15 @@ class TRTLLMLeafMetadataTest(unittest.TestCase):
             for_graph_replay=True,
         )
         # Same objects, same tensors — a captured graph replays through them.
-        self.assertIs(b.forward_decode_metadata, decode_first)
-        self.assertIs(b.forward_prefill_metadata, verify_first)
-        self.assertEqual(decode_first.cache_seqlens_int32.tolist(), [66, 1])
-        self.assertEqual(verify_first.cache_seqlens_int32.tolist(), [66, 4])
+        assert (b.forward_decode_metadata) is (decode_first)
+        assert (b.forward_prefill_metadata) is (verify_first)
+        assert (decode_first.cache_seqlens_int32.tolist()) == ([66, 1])
+        assert (verify_first.cache_seqlens_int32.tolist()) == ([66, 4])
         # The capture seeding is the same idle refresh over the same views.
         b.init_forward_metadata_capture_cuda_graph(
             2, torch.ones(2, dtype=torch.int32), page_table
         )
-        self.assertIs(b.forward_decode_metadata, decode_first)
+        assert (b.forward_decode_metadata) is (decode_first)
 
     def test_block_decode_expands_rows_and_broadcasts_block_seq_lens(self):
         torch = self.torch
@@ -143,9 +142,9 @@ class TRTLLMLeafMetadataTest(unittest.TestCase):
         b = self._leaf(
             spec_num_tokens=spec, is_draft=True, draft_block_decode=True, max_bs=2
         )
-        self.assertTrue(b.block_decode_active)
+        assert b.block_decode_active
         # init_cuda_graph_state sized the buffers for max_bs * spec rows.
-        self.assertEqual(b.page_table_buf.shape[0], 2 * spec)
+        assert (b.page_table_buf.shape[0]) == (2 * spec)
         page_table = torch.tensor(
             [[11, 12, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0]],
             dtype=torch.int32,
@@ -154,17 +153,17 @@ class TRTLLMLeafMetadataTest(unittest.TestCase):
         b.refresh_decode_metadata(2, 2, block_ends, page_table)
         meta = b.forward_decode_metadata
         # Each request's table replicates to its spec rows...
-        self.assertEqual(meta.page_table.shape[0], 2 * spec)
-        self.assertTrue((meta.page_table[:spec] == page_table[0]).all())
-        self.assertTrue((meta.page_table[spec:] == page_table[1]).all())
+        assert (meta.page_table.shape[0]) == (2 * spec)
+        assert (meta.page_table[:spec] == page_table[0]).all()
+        assert (meta.page_table[spec:] == page_table[1]).all()
         # ...sharing the block-end seq_len (clamped to >= spec), one query
         # row each (the non-causal block trick).
-        self.assertEqual(meta.cache_seqlens_int32.tolist(), [66] * spec + [4] * spec)
-        self.assertEqual(meta.max_seq_len_q, 1)
-        self.assertEqual(meta.cu_seqlens_q.tolist(), list(range(2 * spec + 1)))
+        assert (meta.cache_seqlens_int32.tolist()) == ([66] * spec + [4] * spec)
+        assert (meta.max_seq_len_q) == (1)
+        assert (meta.cu_seqlens_q.tolist()) == (list(range(2 * spec + 1)))
         # The drafter's in-graph rewrite lands in the same buffer.
         b.fill_block_decode_seq_lens(2, torch.tensor([70, 8], dtype=torch.int32))
-        self.assertEqual(meta.cache_seqlens_int32.tolist(), [70] * spec + [8] * spec)
+        assert (meta.cache_seqlens_int32.tolist()) == ([70] * spec + [8] * spec)
 
     def test_extend_metadata_reads_the_router_expanded_table(self):
         torch = self.torch
@@ -186,17 +185,17 @@ class TRTLLMLeafMetadataTest(unittest.TestCase):
             page_table_cpu=None,
         )
         meta = b.forward_prefill_metadata
-        self.assertEqual(meta.page_table.tolist(), page_table.tolist())
-        self.assertEqual(meta.cache_seqlens_int32.tolist(), [66])
-        self.assertEqual(meta.cu_seqlens_k.tolist(), [0, 66])
-        self.assertEqual(meta.cu_seqlens_q.tolist(), [0, 2])
-        self.assertEqual(meta.max_seq_len_q, 2)
+        assert (meta.page_table.tolist()) == (page_table.tolist())
+        assert (meta.cache_seqlens_int32.tolist()) == ([66])
+        assert (meta.cu_seqlens_k.tolist()) == ([0, 66])
+        assert (meta.cu_seqlens_q.tolist()) == ([0, 2])
+        assert (meta.max_seq_len_q) == (2)
 
     def test_decode_mode_init_is_a_contract_violation(self):
         torch = self.torch
         b = self._leaf()
         no_extends = torch.zeros(0, dtype=torch.int32)
-        with self.assertRaisesRegex(RuntimeError, "refresh_decode_metadata"):
+        with pytest.raises((RuntimeError), match=("refresh_decode_metadata")):
             b.init_forward_metadata(
                 1,
                 0,
@@ -214,4 +213,4 @@ class TRTLLMLeafMetadataTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

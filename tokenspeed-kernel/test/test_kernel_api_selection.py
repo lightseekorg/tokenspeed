@@ -51,7 +51,6 @@ import tokenspeed_kernel.ops.attention.dsa.flashinfer as _attention_flashinfer_d
 import tokenspeed_kernel.ops.attention.dsa.gluon as _attention_gluon_dsa
 import tokenspeed_kernel.ops.attention.dsv4 as _attention_dsv4_pkg
 import tokenspeed_kernel.ops.attention.dsv4.cuda as _attention_cuda_dsv4
-import tokenspeed_kernel.ops.attention.dsv4.deep_gemm as _attention_deep_gemm_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.gluon as _attention_gluon_dsv4
 import tokenspeed_kernel.ops.attention.dsv41 as _attention_dsv41_pkg
 import tokenspeed_kernel.ops.attention.dsv41.gluon as _attention_gluon_dsv41
@@ -164,7 +163,6 @@ _RELOAD_MODULES = [
     _attention_cuda_dsv4,
     _attention_flashinfer_dsa,
     _attention_deep_gemm_dsa,
-    _attention_deep_gemm_dsv4,
     _attention_deep_gemm_kpool,
     _attention_cuda,
     _attention_flash_attn,
@@ -360,22 +358,6 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
 
     assert actual_offsets == available_expected
     assert all(spec.priority < Priority.PLUGIN for spec in registry.list_kernels("moe"))
-
-
-def test_dsv4_padded_heads_platform_policy(
-    mi350_platform: PlatformInfo,
-    h100_platform: PlatformInfo,
-) -> None:
-    host_platform = Platform.get()
-    try:
-        Platform.override(mi350_platform)
-        assert _attention_dsv4_pkg.dsv4_padded_heads(16) == 16
-        assert _attention_dsv4_pkg.dsv4_padded_heads(32) == 32
-        Platform.override(h100_platform)
-        assert _attention_dsv4_pkg.dsv4_padded_heads(16) == 64
-        assert _attention_dsv4_pkg.dsv4_padded_heads(65) == 128
-    finally:
-        Platform.override(host_platform)
 
 
 def test_moe_process_weights_returns_for_no_preprocessing_plan():
@@ -606,17 +588,20 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
 
 
 @pytest.mark.parametrize(
-    "contract,online,expected_name",
+    "contract,online,m,expected_name",
     [
-        ("ue8m0", False, "gluon_mm_mxfp8_ue8m0_gfx1250"),
-        ("ue8m0", True, "gluon_mm_mxfp8_ue8m0_gfx1250"),
-        ("fp32", False, "gluon_mm_fp8_blockscale_gfx1250"),
-        ("fp32", True, "gluon_mm_fp8_blockscale_gfx1250"),
+        ("ue8m0", False, 1, "gluon_mm_mxfp8_ue8m0_gfx1250"),
+        ("ue8m0", True, 1, "gluon_mm_mxfp8_ue8m0_gfx1250"),
+        ("ue8m0", False, 32, "gluon_mm_mxfp8_ue8m0_largem_gfx1250"),
+        ("ue8m0", True, 32, "gluon_mm_mxfp8_ue8m0_largem_gfx1250"),
+        ("fp32", False, 1, "gluon_mm_fp8_blockscale_gfx1250"),
+        ("fp32", True, 1, "gluon_mm_fp8_blockscale_gfx1250"),
     ],
 )
 def test_public_mm_selects_gfx1250_decode_kernel(
     contract: str,
     online: bool,
+    m: int,
     expected_name: str,
     mi450_platform: PlatformInfo,
     monkeypatch,
@@ -630,7 +615,7 @@ def test_public_mm_selects_gfx1250_decode_kernel(
         pytest.skip(f"{expected_name!r} is not registered (optional backend missing)")
     assert expected_spec.capability.satisfied_by(mi450_platform)
 
-    m, n, k = 1, 128, 256
+    n, k = 128, 256
     a_dtype = torch.bfloat16 if online else _fp8_dtype()
     a = torch.empty((m, k), dtype=a_dtype)
     b = torch.empty((n, k), dtype=_fp8_dtype())
@@ -652,6 +637,7 @@ def test_public_mm_selects_gfx1250_decode_kernel(
             selected_block_size: list[int],
             scale_encoding: str,
             enable_pdl: bool,
+            kernel_name: str,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             assert selected_block_size == block_size
             assert scale_encoding == ("ue8m0" if contract == "ue8m0" else "float32")
@@ -2119,59 +2105,6 @@ def _attention_dsv41_index_topk(
     )
 
 
-def _attention_dsv4_prefill_topk_mxfp4() -> object:
-    """Exercise public MXFP4 prefill selection with packed 128-wide queries."""
-    index_q = (
-        torch.empty((2, 64, 64), dtype=torch.uint8),
-        torch.empty((2, 64), dtype=torch.int32),
-    )
-    return _attention_dsv4_pkg.dsv4_prefill_topk(
-        index_q,
-        torch.empty((2, 64), dtype=torch.float32),
-        torch.empty((2, 64 * 68), dtype=torch.uint8),
-        torch.tensor([[0], [1]], dtype=torch.int32),
-        torch.tensor([0, 64, 128], dtype=torch.int32),
-        torch.tensor([0, 64], dtype=torch.int32),
-        torch.tensor([64, 128], dtype=torch.int32),
-        torch.tensor([64, 64], dtype=torch.int32),
-        page_size=64,
-        topk=512,
-        max_seqlen_k=64,
-        index_k_format="mxfp4",
-        block_table_base_offsets=None,
-        gathered_k=None,
-        gather_workspace=None,
-        out=None,
-        override=None,
-        solution=None,
-    )
-
-
-def _attention_dsv4_decode_topk_mxfp4() -> object:
-    """Exercise public MXFP4 decode selection without executing a kernel."""
-    index_q = (
-        torch.empty((2, 64, 64), dtype=torch.uint8),
-        torch.empty((2, 64), dtype=torch.int32),
-    )
-    return _attention_dsv4_pkg.dsv4_decode_topk(
-        index_q,
-        torch.empty((2, 64), dtype=torch.float32),
-        torch.empty((2, 64 * 68), dtype=torch.uint8),
-        torch.tensor([[64], [64]], dtype=torch.int32),
-        torch.tensor([[0], [1]], dtype=torch.int32),
-        page_size=64,
-        topk=512,
-        max_context_len=64,
-        plan=None,
-        index_k_format="mxfp4",
-        block_table_base_offsets=None,
-        out=None,
-        persistent_topk_workspace=None,
-        override=None,
-        solution=None,
-    )
-
-
 def _attention_dsa_decode_topk(*, weights_dtype: torch.dtype = torch.float32) -> object:
     q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
     weights = torch.empty((2, 2), dtype=weights_dtype)
@@ -3462,6 +3395,52 @@ def test_gfx950_softmax_topk_selects_gluon(
     assert too_many_experts.name == "torch_softmax_topk"
 
 
+def test_gfx950_dynamic_mxfp4_moe_selects_gluon_a4w4(
+    mi350_platform: PlatformInfo,
+) -> None:
+    """Dynamic-MXFP4 SiLU experts take the gfx950 A4W4 kernel; plans it does
+    not cover keep their previous kernels."""
+    if KernelRegistry.get().get_by_name("gluon_mxfp4_a4w4_moe_apply_gfx950") is None:
+        pytest.skip("gfx950 Gluon A4W4 MoE is unavailable")
+
+    def plan(**overrides):
+        # Qwen3.8-Flash-Next TP2 experts.
+        kwargs = dict(
+            input_dtype=torch.bfloat16,
+            activation="silu",
+            routing_mode="precomputed_topk",
+            ispp=320,
+            hidden=2560,
+            internal_activation_dtype="mxfp4",
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=False,
+            combine_order="rank",
+        )
+        return kernel_moe_plan("mxfp4", **{**kwargs, **overrides})
+
+    registry = KernelRegistry.get()
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        a4w4 = plan()
+        with_bias = plan(with_bias=True)
+        bf16_activations = plan(internal_activation_dtype="input")
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    _assert_moe_plan(
+        a4w4,
+        apply="gluon_mxfp4_a4w4_moe_apply_gfx950",
+        preprocessor="gluon_mxfp4_a4w4_moe_weights_gfx950",
+    )
+    assert with_bias["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
+    assert bf16_activations["apply_kernel_name"] == "gluon_mxfp4_precomputed_moe_apply"
+
+
 def _select_on(platform: PlatformInfo, *args, **kwargs) -> str:
     registry = KernelRegistry.get()
     real_platform = Platform.get()
@@ -3931,6 +3910,43 @@ def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(
     assert plan["support_routing"] is False
 
 
+def test_dsv41_mxfp4_swiglu_tp_selection_on_cdna5(
+    mi450_platform: PlatformInfo,
+) -> None:
+    kernel_name = "gluon_mxfp4_gfx1250_precomputed_moe_apply"
+    registry = KernelRegistry.get()
+    if registry.get_by_name(kernel_name) is None:
+        pytest.skip(f"{kernel_name} is unavailable")
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi450_platform)
+        registry.clear_cache()
+        plan = kernel_moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="swiglu",
+            routing_mode="precomputed_topk",
+            ep_size=1,
+            ispp=576,
+            internal_activation_dtype="input",
+            hidden=5120,
+            swiglu_form="standard",
+            activation_clamped=True,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    _assert_moe_plan(
+        plan,
+        apply=kernel_name,
+        preprocessor="gluon_mxfp4_gfx1250_moe_weights",
+    )
+
+
 def _make_fake_gluon_mxfp4_layer(top_k: int) -> torch.nn.Module:
     """Minimal ``w`` exposing only the attributes the apply wrapper reads.
 
@@ -4064,6 +4080,51 @@ def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
 
     assert out == "sentinel"
     assert captured["decode"] is expected_decode
+
+
+@pytest.mark.parametrize(
+    "internal_activation_dtype,expected",
+    [("fp8", "fp8"), ("input", "mxfp4"), ("mxfp4", "mxfp4")],
+)
+def test_gluon_mxfp4_gfx1250_apply_forwards_activation_dtype(
+    internal_activation_dtype: str,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not hasattr(_moe_gluon, "gluon_mxfp4_gfx1250_precomputed_moe_apply"):
+        pytest.skip("gfx1250 Gluon MXFP4 apply is AMD-only")
+
+    captured: dict[str, object] = {}
+
+    def fake_fused_moe(*args, **kwargs):
+        captured["activation_dtype"] = kwargs.get("activation_dtype")
+        return "sentinel"
+
+    monkeypatch.setattr(
+        _moe_gluon.fused_mxfp_gfx1250,
+        "gluon_mxfp_precomputed_mxfp4_fused_moe",
+        fake_fused_moe,
+    )
+
+    w = torch.nn.Module()
+    w.w13_weight_triton_tensor = torch.empty((4, 0, 0))
+    w.w2_weight_triton_tensor = object()
+    w.w13_precision_config = type("PC", (), {"b_mx_scale": object()})()
+    w.w2_precision_config = type(
+        "PC", (), {"b_mx_scale": object(), "out_dtype": torch.bfloat16}
+    )()
+
+    out = _moe_gluon.gluon_mxfp4_gfx1250_precomputed_moe_apply(
+        {"internal_activation_dtype": internal_activation_dtype},
+        torch.empty((2, 16), dtype=torch.bfloat16),
+        w,
+        torch.empty((2, 4), dtype=torch.float32),
+        topk_weights=torch.ones((2, 2), dtype=torch.float32),
+        topk_ids=torch.zeros((2, 2), dtype=torch.int32),
+    )
+
+    assert out == "sentinel"
+    assert captured["activation_dtype"] == expected
 
 
 def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
@@ -5010,42 +5071,6 @@ _CASES = [
         "dsv41_index_topk",
         "gluon_dsv41_index_topk_gfx1250",
         partial(_attention_dsv41_index_topk, 32, None, 68),
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
-        "dsv4_prefill_topk",
-        "gluon_dsv4_prefill_topk_mxfp4_gfx950",
-        _attention_dsv4_prefill_topk_mxfp4,
-        id_suffix="mxfp4",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
-        "dsv4_decode_topk",
-        "gluon_dsv4_decode_topk_mxfp4_gfx950",
-        _attention_dsv4_decode_topk_mxfp4,
-        id_suffix="mxfp4",
-    ),
-    _case(
-        _is_cdna5,
-        "cdna5",
-        "attention",
-        "dsv4_prefill_topk",
-        "gluon_dsv4_prefill_topk_mxfp4_gfx1250",
-        _attention_dsv4_prefill_topk_mxfp4,
-        id_suffix="mxfp4",
-    ),
-    _case(
-        _is_cdna5,
-        "cdna5",
-        "attention",
-        "dsv4_decode_topk",
-        "gluon_dsv4_decode_topk_mxfp4_gfx1250",
-        _attention_dsv4_decode_topk_mxfp4,
-        id_suffix="mxfp4",
     ),
     _case(
         _is_cdna5,
@@ -6101,6 +6126,14 @@ _CASES = [
         "cuda_dsv3_dsv4_linear_fp32",
         _dsv4_linear_fp32,
     ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "gemm",
+        "dsv4_linear_fp32",
+        "gluon_dsv4_linear_fp32_gfx1250",
+        _dsv4_linear_fp32,
+    ),
     # Quantization API x architecture golden cases.
     _case(
         _is_supported_gpu,
@@ -6540,16 +6573,6 @@ def selected_kernel_spy(monkeypatch):
                     ),
                     torch.empty((tokens,), dtype=torch.int32, device=index_q.device),
                 )
-            if case.mode in {"dsv4_prefill_topk", "dsv4_decode_topk"}:
-                q_values, _ = kwargs["index_q"]
-                indices = torch.empty(
-                    (q_values.shape[0], kwargs["topk"]),
-                    dtype=torch.int32,
-                    device=q_values.device,
-                )
-                if case.mode == "dsv4_prefill_topk":
-                    return indices, None
-                return indices
             if case.mode in {
                 "mla_decode_projected_value",
                 "mla_normalize_project_query",

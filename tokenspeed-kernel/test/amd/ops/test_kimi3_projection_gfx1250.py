@@ -457,7 +457,7 @@ def test_kimi3_gfx1250_large_m_qkvfab_matches(
 
 
 def test_kimi3_gfx1250_large_m_linear_o_proj_shape_matches() -> None:
-    from tokenspeed_kernel.ops.gemm.kimi3 import _try_gluon_largem_gfx1250
+    from tokenspeed_kernel.ops.gemm import _try_gluon_largem_gfx1250
 
     generator = torch.Generator(device="cuda")
     generator.manual_seed(3600)

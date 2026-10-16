@@ -48,6 +48,9 @@ from tokenspeed.runtime.layers.moe.utils import (
     get_moe_backend,
 )
 from tokenspeed.runtime.layers.moe.weights import create_layer_weights
+from tokenspeed.runtime.layers.moe.weights.fp8_channel import (
+    check_fp8_channel_scales,
+)
 from tokenspeed.runtime.layers.moe.weights.loaders import round_up
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -461,6 +464,8 @@ class MoELayer(torch.nn.Module):
         if self._weights_processed:
             return
 
+        if self._quant_kind == "fp8_channel":
+            check_fp8_channel_scales(module, self.prefix)
         kernel_moe_process_weights(self.plan, module)
         self._weights_processed = True
 

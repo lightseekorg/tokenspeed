@@ -50,8 +50,8 @@ skew and regress perf even when the generated kernel remains correct.
 ### gfx950 dense BF16 projections
 
 The gfx950 package provides dense BF16 projection kernels: an eight-wave
-warp-pipeline prefill kernel, and a split-K tiled MFMA kernel for Kimi K3
-decode batches.
+warp-pipeline prefill kernel, and a split-K tiled MFMA kernel for Kimi K3 and
+Qwen3.8-Flash-Next decode batches.
 
 #### Contract
 
@@ -69,7 +69,7 @@ decode batches.
   or FP32 (the MoE router). It runs only `(N, K)` and M buckets
   (`4, 8, 16, 32, 64`) with a measured config in `_DECODE_CONFIGS`; each
   entry beat `torch.mm` (hipBLASLt) by at least 4% in cold-cache sweeps at
-  Kimi K3 TP8 shapes.
+  Kimi K3 TP8 and Qwen3.8-Flash-Next TP2 shapes.
 - `launch_gluon_mm_a16w16_decode_add3_gfx950` computes `A @ B.T + X + Y` in
   one launch, adding both BF16 addends to the FP32 accumulator before the
   single rounding. It reuses the decode tile for `M` and accepts only buckets
@@ -92,15 +92,21 @@ vectorized buffer operations. Partial tiles clamp out-of-range rows and
 columns onto the last valid one and mask them out of the stores. XCD-aware
 grouped tile ordering distributes adjacent output tiles across the eight XCDs.
 
-Decode GEMMs are weight-bandwidth bound, so the decode kernel uses 16- or
-32-row tiles over one- to three-buffer LDS pipelines and splits K when the
-output alone has too few tiles to fill the GPU. Each split writes an FP32
-partial through to memory, waits for its stores, and bumps a per-tile counter
-with a relaxed atomic; the last split to arrive sums all partials in split
-order with cache-bypassing loads, writes C, and resets the counter, so one
-launch does both phases without an acquire-release fence and results are
-deterministic. An optional XCD remap keeps the M tiles that
-share a weight tile on one XCD's L2.
+Decode GEMMs are weight-bandwidth bound, so the decode kernel uses 16- to
+64-row tiles over one- to three-buffer LDS pipelines and splits K when the
+output alone has too few tiles to fill the GPU. When a program's K range has at
+most eight tiles, it can instead give each tile its own LDS buffer and issue
+every copy up front, waiting on one memory round trip rather than one per
+refilled buffer. Each split writes an FP32 partial through to memory, waits for
+its stores, and bumps a per-tile counter with a relaxed atomic; the last split
+to arrive sums all partials in split order with cache-bypassing loads, writes
+C, and resets the counter, so one launch does both phases without an
+acquire-release fence and results are deterministic. The caller passes the
+counters zeroed and gets them back zeroed (`gemm/splitk.py`);
+`gluon_mm_a16w16_decode_num_counters_gfx950` sizes them. Tiles with at least
+eight outputs per lane store C through a row-contiguous layout, 16 bytes per
+lane. An optional XCD remap keeps the M tiles that share a weight tile on one
+XCD's L2.
 
 ### gfx950 MXFP8 projection
 
@@ -366,6 +372,103 @@ prefill and decode warmups compile both before serving. Direct kernel callers
 must warm both token ranges; disabling startup warmups can defer compilation
 until the first call in an unwarmed range.
 
+### gfx1250 BF16 GEMM
+
+`gluon_mm_a16w16_gfx1250` is a general BF16 GEMM with FP32 or BF16 output. It
+backs the DeepSeek V4.1 FP32 projection (`gluon_dsv4_linear_fp32_gfx1250`) and
+single-group BF16 projections up to 2048 rows
+(`gluon_grouped_bf16_projection_gfx1250`).
+
+#### Contract
+
+- The operation computes `A @ B.T` from BF16 `A` `[M, K]` with a unit column
+  stride and contiguous BF16 `B` `[N, K]`, with `M >= 1`, `N` divisible by 16,
+  and `K` divisible by 128.
+- Output is FP32 or BF16, chosen explicitly. A caller-owned output needs a unit
+  column stride.
+
+#### Algorithm
+
+Batches that the dense WMMA kernel can tile within one wave of the 256 CUs run
+there. Up to 32 rows use one 16- or 32-row tile without split-K. From 33 to 128
+rows, a 64- or 128-row tile splits K by the first of 5, 4, or 2 that divides the
+K tiles, leaves at least two per split, and keeps the grid within the CUs. It
+keeps 16-column tiles when they fit a split of 5 and otherwise repeats the
+choice with 32-column tiles, where a split of 5 may then fit. Larger
+batches use `128 x 64` tiles, split K in two when the grid still fits, and move
+to the large-M kernel once those tiles alone exceed the CUs. Split partials are
+FP32 and the shared reduction sums them in split order, so results are
+deterministic.
+
+### gfx1250 dense BF16 large-M projection
+
+`gluon_mm_a16w16_largem_gfx1250` is a compute-bound BF16 GEMM for prefill
+projections with many rows.
+
+#### Contract
+
+- The operation computes `A @ B.T` from contiguous BF16 `[M, K]` and `[N, K]`
+  with `M >= 512` and K a multiple of 128, producing a contiguous BF16
+  `[M, N]`. The registered op accepts the weight shapes listed in
+  `use_gluon_largem_gfx1250`.
+- Ragged M and N are handled in-kernel. The row count is a runtime argument,
+  so any number of rows reuses one compiled kernel.
+
+#### Algorithm
+
+Wide problems (at least 4096 rows and 1536 columns) run
+`_wmma_tdm_dense_largem_warp_pipeline_kernel`:
+
+- Each CTA computes a `256 x 256` tile on eight waves, two per SIMD, through a
+  double-buffered TDM pipeline. `warp_pipeline_stage` alternates the two waves
+  on a SIMD between TDM issue plus LDS reads and WMMA, so one wave's memory
+  work overlaps the other's matrix work. Partitioned padded LDS layouts let
+  the paired waves read different LDS partitions.
+- CTAs run as `2 x 2` clusters. Each TDM load multicasts an A or B panel to
+  the two CTAs that share it, halving operand reads from L2, and a cluster
+  arrive/wait per K tile keeps the CTAs in step.
+- TDM descriptors are bounded at the real M and N, so loads past the edge read
+  zeros and the output, staged in the freed operand LDS, is written by one
+  clipped TDM store. Edge clusters run whole, so ragged shapes need no special
+  path and every cluster barrier completes.
+- Clusters are assigned contiguous runs per XCD so clusters sharing operands
+  share an L2.
+
+Narrower or shorter problems keep `_wmma_tdm_dense_largem_kernel` and its
+own tile choice. The general BF16 GEMM's large-M route
+(`_launch_largem`) uses the same selection for FP32 or BF16 output; a
+row-strided output also takes the older kernel, whose masked stores accept
+it.
+
+When the tile count is not a multiple of the CU count, the last partial wave
+of tiles leaves CUs idle; this tail is the main remaining gap to the WMMA
+peak.
+
+### gfx1250 MXFP8 large-M projection
+
+`gluon_mm_mxfp8_ue8m0_largem_gfx1250` covers DeepSeek V4.1 MXFP8 projections
+from 17 rows, above the decode projection's range.
+
+#### Contract
+
+- The operation computes `A @ B.T` from row-major E4M3 matrices shaped `[M, K]`
+  and `[N, K]` with raw UE8M0 scales shaped `[M, ceil(K/32)]` and
+  `[N, ceil(K/32)]` and an explicit `[1, 32]` scale block. All inner strides
+  must be one.
+- Output is BF16; `alpha` is not supported. Automatic selection requires
+  `M >= 17`, `N` divisible by 16, and `K` divisible by 32.
+
+#### Algorithm
+
+TDM stages A, B, and both scale planes into padded LDS slots that feed
+`16 x 16 x 128` scaled WMMA directly. Up to 128 rows, a 32-, 64-, or 128-row
+tile keeps 32 columns and three buffers below 16 K tiles; otherwise it uses 64
+columns and splits K by the first of 10, 8, 5, 4, or 2 that divides the K tiles
+and fits the CUs. Larger batches use `128 x 128` tiles, `128 x 256` tiles when
+those alone give at least 384 tiles, or `128 x 64` tiles split in two when
+there are fewer than 64 `128 x 128` tiles and at least 16 K tiles. Split
+partials are FP32 and use the dense BF16 GEMM's reduction.
+
 ## Attention
 
 ### gfx1250 standard-cache DSA and KPool scoring
@@ -523,8 +626,13 @@ preparation, validation and tiling, and runs two steps per query tile: a
 scorer writes one row of FP32 logits per query, one per candidate column, and
 a selector turns each row into that query's sorted list of logical KV row ids.
 gfx950 runs both steps in Gluon (`gluon_dsv41_index_topk_gfx950`, then
-`gluon_dsv41_index_topk_select_gfx950`); gfx1250 has a Gluon scorer and the
-portable torch selector.
+`gluon_dsv41_index_topk_select_gfx950`) and selects candidate blocks with the
+portable Triton radix select (`tokenspeed_kernel` `index_block_select`);
+gfx1250 has a Gluon scorer and, for query tiles of 128 rows and up, a Triton
+radix selector
+(`triton_dsv41_index_topk_select_gfx1250`); smaller tiles use the portable
+torch selector. Both scorers take queries packed as MXFP4 values with one E8M0
+scale per 32 values.
 
 #### Contract
 
@@ -538,8 +646,8 @@ portable torch selector.
   without a candidate, or on a missing or out-of-range page stay `-inf`.
 - Row selection writes the logical ids of the `min(topk, width)` largest
   finite logits in ascending order, then -1, plus their count (the
-  `select_rows_torch` contract). On gfx950, equal-score boundary ties keep
-  the lowest columns.
+  `select_rows_torch` contract). The gfx950 selector and the gfx1250 radix
+  selector keep the lowest columns among equal-score boundary ties.
 - Optional block selection keeps the best 8-row blocks by their maximum logit.
   A valid newest visible block remains eligible regardless of its score.
 - Selection scores the configured page-table or candidate capacity without
@@ -563,12 +671,9 @@ The 32 padded heads form two 16-head MFMA groups. For each 32-column tile it
 maps columns to pages through the candidate ids and page table, loads the
 MXFP4 key rows, and scores them with E2M1 scaled MFMA against the E8M0
 scales, then applies ReLU and the weighted head sum. A chunk bound that is
-not a multiple of 32 masks its last tile. The gfx1250 scorer dequantizes keys
-to BF16 and uses wave32 WMMA. Its two warps split the heads, which would
-replicate the key operand in both. Instead each warp loads and decodes half of
-a key tile, one 16-byte load of a row's packed bytes per lane, and a layout
-conversion through LDS assembles the WMMA operand. These loads need page
-strides that are multiples of 16 bytes.
+not a multiple of 32 masks its last tile. The gfx1250 scorer follows the
+same steps with E2M1 scaled wave32 WMMA: all 32 heads form one WMMA tile, and
+its four warps split each 64-column key tile, so no warp loads another's keys.
 
 The gfx950 selector runs one workgroup per query in a single launch,
 replacing `torch.topk`, a sort and about ten elementwise kernels. A
@@ -580,9 +685,18 @@ ascending without candidates and with ascending candidate lists; otherwise an
 all-pairs rank sorts them. LDS atomics cost about one wave instruction per 64
 lanes regardless of conflicts, so the radix passes dominate on wide rows.
 
-Block selection stays in torch: it takes the maximum logit of each 8-row
-block, forces the newest visible block to `+inf`, and keeps the top blocks
-in ascending order.
+The gfx1250 radix selector runs one program per row. Four 8-bit histogram
+passes find the K-th largest value, and a final pass writes the selected
+values and columns in ascending column order, taking ties at the threshold in
+column order. The adapter then maps the columns to logical rows and sorts them
+in torch. Tiles below 128 rows, including decode, use the torch selector.
+
+Block selection takes the maximum logit of each 8-row block, forces the
+newest visible block to `+inf`, and keeps the top blocks in ascending order.
+On gfx950 the portable Triton block select runs one program per query: it
+reads only the visible blocks, runs a four-pass MSD radix select (8 key bits
+per pass), and emits the picks in block order, so no sort is needed. gfx1250
+uses torch.
 
 ### gfx950 DeepSeek V4.1 selected attention
 
@@ -1163,18 +1277,71 @@ Both GEMMs overlap loads with matrix computation using double-buffered shared
 memory. Phased operand loading and scheduling barriers limit live registers;
 compiler-inserted shared-memory barriers provide inter-wave synchronization.
 
+### gfx950 dynamic-MXFP4 (A4W4) SiLU experts
+
+`gluon_mxfp4_a4w4_moe_apply_gfx950` serves MXFP4 checkpoints whose experts
+quantize activations to MXFP4 at runtime (`internal_activation_dtype="mxfp4"`,
+for example Quark MXFP4) with precomputed top-k and SiLU (or unclamped
+standard SwiGLU) on gfx950. It replaces the portable Triton path there.
+
+#### Contract
+
+- BF16 input `[M, H]` with `H % 512 == 0`; intermediate `I % 64 == 0`.
+- Weights use the N16 bank of `moe/mxfp4/n16_weights.py`, shared with the
+  MXFP8 SiTU pipelines: each 16-row group stores its K bytes as 64-byte
+  chunks laid out as 1 KiB blocks in MFMA lane order, so a wave reads a
+  weight fragment with one contiguous load; W13 alternates gate and up
+  groups and packs the gate/up scales of two 128-K steps into one 32-bit
+  word. W2 rows ending in a half chunk are stored flat without padding.
+  Wrapped `weight_loader`s keep checkpoint updates working.
+- Numerics follow the Triton path bit for bit up to FP32 accumulation order:
+  per-32 E8M0 scale in Quark's "even" mode (amax rounded to a power of two,
+  minus E2M1's emax of 2, as the dense MXFP4 activation quantizer), saturating
+  E2M1 round-to-nearest-even,
+  gate/up/SiLU/product rounded to BF16 before requantizing the intermediate,
+  BF16 per-route outputs summed in FP32 slot order. Expert ids outside
+  `[0, E)` contribute zero.
+
+#### Algorithm
+
+Four launches: activation quantization (scales stored lane-quad-major so a
+lane fetches four K steps' scales with one load), the gate/up GEMM with fused
+SiLU-and-mul and MXFP4 requantization in sorted-route order, the down GEMM
+writing BF16 per-route rows, and the slot-order combine. Up to 1024 routes,
+one extra program of the quantization launch sorts the routes into expert
+blocks (atomic per-expert cursors; order within a block does not matter);
+larger route sets run the block-aligned `gluon_moe_sorting` first. Both GEMMs
+are `e2m1 x e2m1` scaled 16x16x128 MFMAs that load weights straight into
+registers.
+
+Block height follows the average routes per expert: 16 rows up to 4 routes
+per expert (decode, including the 64-row MTP verify batches), 32 rows up to
+48, otherwise 64. Decode blocks stream each touched expert's weights once and
+load activations directly, keeping one 256-K step in flight. Larger blocks
+stage gathered activations through an LDS ring with async copies shared by
+the N-direction waves, keep each block's programs on one XCD so activations
+and an expert's weights are reused from L2, and redistribute the down GEMM
+output through LDS so each scattered route row is stored as one contiguous
+run; at 8K tokens that BF16 per-route write and its combine read dominate the
+second GEMM.
+
 ### gfx1250 MXFP4 experts
 
-On gfx1250, the MoE API selects Gluon kernels with FP8 activations and MXFP4
-weights for precomputed top-k routing. Two expert GEMMs run per layer: a
+On gfx1250, the MoE API selects Gluon kernels with FP8 or MXFP4 activations
+and MXFP4 weights for precomputed top-k routing. The `fp8` activation policy
+selects FP8; `input` and `mxfp4` select MXFP4, the A4W4 numerics gfx950 runs
+for DeepSeek V4.1. Two expert GEMMs run per layer: a
 gate/up GEMM with a fused SwiGLU or SiTU activation, then a down GEMM that
 combines into each token's output row.
 
 #### Contract
 
-- Activations enter both GEMMs as E4M3 divided by a per-tensor FP32 scale,
-  which the GEMM multiplies back into its FP32 accumulator. Weights are packed
-  MXFP4 with one UE8M0 scale per 32 values.
+- FP8 activations enter both GEMMs as E4M3 divided by a per-tensor FP32
+  scale, which the GEMM multiplies back into its FP32 accumulator. MXFP4
+  activations are quantized per row with one dynamic UE8M0 scale per 32
+  values, bit-identical to the portable `quantize_mxfp4`; scale rows are
+  padded to 16 bytes for TDM. Weights are packed MXFP4 with one UE8M0 scale
+  per 32 values.
 - `y_global_scale` divides the result by a scalar before the epilogue casts it
   to the output dtype. It applies after bias and after the fused activation,
   so combining it with an FP8 `out_dtype` produces an activation the next GEMM
@@ -1201,6 +1368,10 @@ weights:
 4. **Down GEMM + weighted combine** consumes that E4M3 intermediate,
    accumulates in FP32, and scatters into each token's output row, followed by
    the weighted top-k reduction.
+
+With MXFP4 activations, step 2 quantizes the input to MXFP4 instead, the
+gate/up GEMM stores a BF16 intermediate, and a second quantizer pass converts
+it to MXFP4 before the down GEMM.
 
 The launcher resolves the row tile from the gathered row count and expert
 count unless the caller pins it. The kernels mask ragged M and N edges rather
@@ -1368,6 +1539,31 @@ loaded as a 256 + 64 pair so every load is in flight at once. The epilogue
 multiplies `sigmoid(gate)` with the matching normalized branch and sums the
 four branches across waves, so the gate tensor never reaches memory.
 
+### gfx1250 mHC mixes projection
+
+`gluon_mhc_mixes_gfx1250` computes the hc=4 prenorm mixing coefficients for
+BF16 residual streams. It shares split selection, normalization, and the
+Sinkhorn iterations with `triton_mhc_mixes`, and replaces only the projection
+`x @ fn.T` with its row sums of squares.
+
+#### Contract
+
+- `x` is contiguous BF16 `[T, K]` (the four flattened streams) and `fn` is
+  contiguous FP32 `[24, K]`. The projection writes FP32 partials
+  `[splits, T, 24]` and `[splits, T]`.
+- The WMMA projection runs when `K` splits into whole 128- or 64-wide K tiles
+  that fill the TDM pipeline in every partition; other `K` uses the portable
+  Triton projection.
+
+#### Algorithm
+
+The FP32 weight tile splits into a BF16 rounding and two BF16 remainders that
+sum back to it exactly. BF16 products are exact in FP32, so three BF16 WMMAs
+give the FP32 projection up to accumulation order. Each program covers 64 rows
+and one K partition, pipelines K tiles through three or four TDM buffers, and
+pads the 24 mixes to two 16-wide WMMA tiles. The token count and tiles per
+partition are runtime arguments.
+
 ## Quantization
 
 ### gfx950 group-32 UE8M0 FP8 activations
@@ -1387,3 +1583,23 @@ Four lanes share a group, each loading one 16-byte vector, and a CTA covers
 so any K and ragged M fill whole CTAs. A power-of-two scale has an exact
 reciprocal, so one multiply per value rounds exactly like the reference
 division; infinite inputs keep the `x / inf` behavior through `1 / inf`.
+
+### gfx1250 group-32 FP8 activation quantization
+
+`gluon_quantize_fp8_group32_ue8m0_gfx1250` quantizes activations for DeepSeek
+V4.1 FP8 and MXFP8 projections.
+
+#### Contract
+
+- Input is BF16 or FP16 `[M, K]` with a unit column stride and `K` divisible by
+  32; padded row strides are accepted.
+- Output is contiguous E4M3 codes `[M, K]` and row-major uint8 UE8M0 biased
+  exponents `[M, K/32]`, bit-identical to `triton_quantize_fp8_group32_ue8m0`.
+
+#### Algorithm
+
+A group's scale is `2 ** ceil(log2(max(amax, 1e-4) / 448))`, taken from the
+FP32 bits of the quotient, and its codes are the correctly rounded
+`x / scale` cast to E4M3. Each program covers consecutive groups, with four
+threads per group and eight elements per thread: 32 groups and four warps
+below 49,152 groups, and 256 groups and eight warps from there.
