@@ -811,6 +811,54 @@ def test_mtp_head_refuses_patterns_its_narrowing_cannot_serve(blocks: list[str])
         NemotronHForCausalLMNextN(config, Mapping(rank=0, world_size=1))
 
 
+@pytest.mark.parametrize("mtp_quantized", [False, True])
+def test_mtp_head_follows_the_checkpoint_quantization(mtp_quantized: bool):
+    """Nemotron 3 Super's export names no MTP module and left the head in BF16;
+    a later export quantizes its experts."""
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
+        ModelOptMixedConfig,
+    )
+    from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
+    from tokenspeed.runtime.models.nemotron_h_nextn import NemotronHForCausalLMNextN
+
+    layers = {"backbone.layers.2.mixer.experts": "NVFP4"}
+    if mtp_quantized:
+        layers["mtp.layers.1.mixer.experts"] = "NVFP4"
+    quant_config = ModelOptMixedConfig(quantized_layers=layers)
+    assert quant_config.quantizes_any("mtp.") == mtp_quantized
+    config = _config(
+        hidden_size=256,
+        num_nextn_predict_layers=1,
+        mtp_layers_block_type=["attention", "moe"],
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=256,
+        moe_shared_expert_intermediate_size=256,
+    )
+    with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
+        head = NemotronHForCausalLMNextN(
+            config, Mapping(rank=0, world_size=1), quant_config
+        )
+    expected = "nvfp4" if mtp_quantized else "unquant"
+    assert head.layers[1].mixer.experts._quant_kind == expected
+
+
+def test_mtp_head_shares_the_target_head_module():
+    from tokenspeed.runtime.models.nemotron_h_nextn import NemotronHForCausalLMNextN
+
+    head = NemotronHForCausalLMNextN.__new__(NemotronHForCausalLMNextN)
+    torch.nn.Module.__init__(head)
+    head.embed_tokens = torch.nn.Embedding(8, 4)
+    head.lm_head = torch.nn.Linear(4, 8, bias=False)
+    embed = torch.nn.Parameter(torch.ones(8, 4))
+    target_head = torch.nn.Linear(4, 8, bias=False)
+    head.set_embed_and_head_module(embed, target_head)
+    assert head.embed_tokens.weight is embed
+    assert head.lm_head is target_head
+    assert head.get_embed_and_head() == (embed, target_head.weight)
+
+
 def test_static_fp8_scale_names_only_per_tensor_static_linears():
     from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
     from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod

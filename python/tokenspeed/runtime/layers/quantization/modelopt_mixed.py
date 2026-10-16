@@ -318,6 +318,9 @@ class ModelOptMixedConfig(QuantizationConfig):
 
         return None
 
+    def quantizes_any(self, prefix: str) -> bool:
+        return any(name.startswith(prefix) for name in self.quantized_layers)
+
     def is_quantized_layer(self, prefix: str) -> bool:
         """Whether a runtime module prefix resolves to a non-excluded algorithm."""
         return (

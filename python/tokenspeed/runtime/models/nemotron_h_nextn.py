@@ -92,7 +92,7 @@ class NemotronHForCausalLMNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        del quant_config, prefix
+        del prefix
         require_single_tp_group(mapping)
         block_types = tuple(config.mtp_layers_block_type)
         if (
@@ -107,6 +107,9 @@ class NemotronHForCausalLMNextN(nn.Module):
                 "attention block and has no Mamba2 blocks, got "
                 f"{config.num_nextn_predict_layers} of {block_types}"
             )
+        # An export that quantizes no MTP module (Nemotron 3 Super) left it in BF16.
+        if quant_config is not None and not quant_config.quantizes_any("mtp."):
+            quant_config = None
         self.config = config
         self.mapping = mapping
         attn = mapping.attn
@@ -122,7 +125,11 @@ class NemotronHForCausalLMNextN(nn.Module):
         self.enorm = RMSNorm(hidden, eps=eps)
         self.hnorm = RMSNorm(hidden, eps=eps)
         self.eh_proj = ReplicatedLinear(
-            2 * hidden, hidden, bias=False, prefix="mtp.layers.0.eh_proj"
+            2 * hidden,
+            hidden,
+            bias=False,
+            quant_config=quant_config,
+            prefix="mtp.layers.0.eh_proj",
         )
         alt_stream = torch.cuda.Stream()
         self.layers = nn.ModuleList(
@@ -132,7 +139,7 @@ class NemotronHForCausalLMNextN(nn.Module):
                 block_type,
                 0 if block_type == "attention" else None,
                 config.num_hidden_layers + i,
-                None,
+                quant_config,
                 f"mtp.layers.{i}",
                 alt_stream,
             )
@@ -164,11 +171,13 @@ class NemotronHForCausalLMNextN(nn.Module):
     def get_embed_and_head(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.embed_tokens.weight, self.lm_head.weight
 
-    def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
+    def set_embed_and_head_module(
+        self, embed: torch.Tensor, lm_head: nn.Module
+    ) -> None:
+        """Share the target's embedding and its whole LM head, quantized or not."""
         del self.embed_tokens.weight
-        del self.lm_head.weight
         self.embed_tokens.weight = embed
-        self.lm_head.weight = head
+        self.lm_head = lm_head
         torch.cuda.empty_cache()
 
     @torch.no_grad()
