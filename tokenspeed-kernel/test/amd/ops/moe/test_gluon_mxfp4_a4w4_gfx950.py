@@ -177,6 +177,33 @@ def test_matches_reference(m: int) -> None:
     assert (actual == portable).float().mean().item() > 0.99
 
 
+# Decode route sets whose padded expert blocks span one to several 256-row
+# padding stores of the fused sort.
+@pytest.mark.parametrize("m", [1, 16, 64, 128])
+def test_fused_sort_matches_the_standalone_sort(m: int, monkeypatch) -> None:
+    w = _weights()
+    moe_process_weights(_plan(None), w)
+    x, topk_weights, topk_ids = _routes(m, seed=m)
+
+    def run():
+        return mxfp4_gemm.launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
+            x,
+            w.w13_weight,
+            w.w13_weight_scale,
+            w.w2_weight,
+            w.w2_weight_scale,
+            topk_weights,
+            topk_ids,
+        )
+
+    fused = run()
+    # Every route set takes gluon_moe_sorting instead.
+    monkeypatch.setattr(mxfp4_gemm, "_FUSED_SORT_MAX_ROUTES", 0)
+    # Routes are computed per row and combined in slot order, so the order of
+    # routes within an expert block does not change the bits.
+    torch.testing.assert_close(fused, run(), atol=0, rtol=0)
+
+
 def test_row_strided_activations_match_contiguous() -> None:
     w = _weights()
     plan = _plan(None)

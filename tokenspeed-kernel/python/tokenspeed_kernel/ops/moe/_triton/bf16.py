@@ -84,6 +84,22 @@ def _validate(
         raise ValueError("Triton MoE does not support expert bias")
 
     activation = plan.get("activation") or getattr(w, "activation", "silu")
+    precision_policy = plan.get("precision_policy", "default")
+    if precision_policy not in {"default", "bf16_route_accum_fp32"}:
+        raise ValueError(f"Unsupported MoE precision policy: {precision_policy!r}")
+    if precision_policy == "bf16_route_accum_fp32":
+        if (
+            x.dtype != torch.bfloat16
+            or topk_weights.dtype != torch.float32
+            or activation != "silu"
+        ):
+            raise ValueError(
+                "bf16_route_accum_fp32 requires BF16 SiLU inputs and FP32 route weights"
+            )
+        if not 0.0 < float(plan["output_scale"]) < float("inf"):
+            raise ValueError("MoE output_scale must be finite and positive")
+    elif plan.get("output_scale", 1.0) != 1.0:
+        raise ValueError("MoE output_scale requires an explicit precision policy")
     if activation not in {"silu", "situ", "swiglu"}:
         raise ValueError(f"Triton MoE does not support activation {activation!r}")
     swiglu_arg = getattr(w, "swiglu_arg", None)
@@ -125,6 +141,7 @@ def _stage1_kernel(
     situ_linear_beta,
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
+    ROUND_GEMM_OUTPUTS: tl.constexpr,
     NUM_PROGRAMS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -189,6 +206,9 @@ def _stage1_kernel(
                     up = situ_linear_beta * libdevice.tanh(up / situ_linear_beta)
                 activated = (gate * up).to(inter_ptr.dtype.element_ty)
             else:
+                if ROUND_GEMM_OUTPUTS:
+                    gate_acc = gate_acc.to(inter_ptr.dtype.element_ty).to(tl.float32)
+                    up_acc = up_acc.to(inter_ptr.dtype.element_ty).to(tl.float32)
                 activated = (gate_acc * tl.sigmoid(gate_acc) * up_acc).to(
                     inter_ptr.dtype.element_ty
                 )
@@ -300,6 +320,7 @@ def _route_outputs(
     situ_beta: float,
     situ_linear_beta: float | None,
     expert_start: int,
+    round_intermediates: bool,
 ) -> torch.Tensor:
     num_tokens, hidden_size = x.shape
     num_experts, twice_intermediate_size, _ = w13.shape
@@ -353,12 +374,14 @@ def _route_outputs(
         situ_linear_beta=(1.0 if situ_linear_beta is None else situ_linear_beta),
         ACTIVATION=activation,
         HAS_LINEAR_BETA=situ_linear_beta is not None,
+        ROUND_GEMM_OUTPUTS=round_intermediates,
         NUM_PROGRAMS=stage1_programs,
         BLOCK_M=block_m,
         BLOCK_N=stage1_block_n,
         BLOCK_K=block_k,
         num_warps=num_warps,
         num_stages=num_stages,
+        enable_fp_fusion=not round_intermediates,
     )
     _stage2_kernel[(stage2_programs,)](
         intermediate,
@@ -390,9 +413,16 @@ def _moe(
     activation: str,
     situ_beta: float,
     situ_linear_beta: float | None,
+    round_intermediates: bool,
+    output_scale: float,
 ) -> torch.Tensor:
     if x.shape[0] == 0:
         return torch.empty_like(x)
+    if round_intermediates:
+        # Match ascending-expert accumulation, independently of routing's
+        # score-sorted output order. Keep the original top-k tensors unchanged.
+        topk_ids, order = topk_ids.sort(dim=-1)
+        topk_weights = topk_weights.gather(1, order)
     route_output = _route_outputs(
         x,
         w13,
@@ -402,7 +432,8 @@ def _moe(
         situ_beta,
         situ_linear_beta,
         0,
+        round_intermediates,
     )
     output = torch.empty_like(x)
-    _combine(route_output, topk_weights, output)
+    _combine(route_output, topk_weights, output, round_intermediates, output_scale)
     return output

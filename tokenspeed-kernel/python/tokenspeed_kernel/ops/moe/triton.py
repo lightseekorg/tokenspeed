@@ -494,6 +494,7 @@ def triton_bf16_moe_routes(
         1.0,
         None,
         expert_start,
+        False,
     )
 
 
@@ -532,6 +533,11 @@ def triton_bf16_precomputed_moe_apply(
 
     Args:
         plan: MoE plan selecting standard SiLU/SwiGLU or SiTU activation.
+            Opt-in ``precision_policy="bf16_route_accum_fp32"`` rounds GEMM1
+            gate/up outputs to BF16 before FP32 SiLU, rounds every weighted
+            BF16 GEMM2 output to BF16, accumulates those routes in FP32, and
+            applies the required ``output_scale`` before the final BF16 store.
+            Route weights must already be normalized, unscaled FP32 values.
         x: Contiguous hidden states `[tokens, hidden]` in FP16 or BF16.
         w: Module with contiguous `w13_weight` `[E, 2I, H]` and
             `w2_weight` `[E, H, I]` tensors matching `x.dtype`.
@@ -558,6 +564,8 @@ def triton_bf16_precomputed_moe_apply(
         activation,
         float(getattr(w, "activation_situ_beta", 1.0) or 1.0),
         getattr(w, "activation_situ_linear_beta", None),
+        plan.get("precision_policy", "default") == "bf16_route_accum_fp32",
+        float(plan.get("output_scale", 1.0)),
     )
 
 

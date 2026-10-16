@@ -563,7 +563,10 @@ def minimax_indexer(
         )
 
     selected = _topk_with_padding(
-        scores.view(tokens * num_heads, max_blocks), topk, enable_pdl=enable_pdl
+        scores.view(tokens * num_heads, max_blocks),
+        topk,
+        seq_lens=None,
+        enable_pdl=enable_pdl,
     )
     return selected.view(tokens, num_heads, int(topk))
 

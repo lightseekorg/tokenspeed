@@ -90,6 +90,7 @@ from tokenspeed.runtime.execution.types import (
 )
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
 from tokenspeed.runtime.metrics.collector import EngineMetrics
+from tokenspeed.runtime.metrics.service import metrics_service
 from tokenspeed.runtime.multimodal.inputs import multimodal_context_for_forward
 from tokenspeed.runtime.pd.kv_events import (
     EventPublisherFactory,
@@ -552,10 +553,10 @@ class EventLoop:
                 "app_key": server_args.app_key or "",
                 "dp_rank": str(dp_rank),
             },
-            enabled=(
-                server_args.enable_metrics
-                and attn_tp_rank == 0
-                and "prometheus" in (server_args.metrics_reporters or [])
+            enabled=server_args.enable_metrics and attn_tp_rank == 0,
+            reporters=server_args.metrics_reporters,
+            event_sink=(
+                metrics_service.get_event_sink() if attn_tp_rank == 0 else None
             ),
         )
 
@@ -1484,6 +1485,7 @@ def run_event_loop(
         shutdown_event.set()
 
     try:
+        metrics_service.connect(port_args.metrics_producer_configs)
         if server_args.disaggregation_mode == "encode":
             # The encode role is LM-free; run the lightweight vision-tower loop
             # instead of building the full EventLoop (KV/LM scheduler).
@@ -1567,6 +1569,7 @@ def run_event_loop(
                     f"{get_exception_traceback()!s}",
                 )
                 parent_process.send_signal(signal.SIGUSR1)
+        metrics_service.close(timeout=2.0)
         if (
             previous_sigterm_handler is not None
             and threading.current_thread() is threading.main_thread()

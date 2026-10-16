@@ -622,8 +622,7 @@ class _KDAHarness:
         from tokenspeed_kernel.ops.attention.kda._triton.fla import (
             kda_chunk_prefill,
         )
-
-        from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+        from tokenspeed_kernel.ops.conv import (
             causal_conv1d_fn,
         )
 

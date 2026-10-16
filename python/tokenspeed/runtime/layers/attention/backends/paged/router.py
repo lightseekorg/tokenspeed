@@ -978,6 +978,9 @@ class CacheGroupRouter(AttentionBackend):
     def cache_placement(self, layer):
         return self._leaf_for(layer).cache_placement(layer)
 
+    def reads_fp8_kv_scales(self, layer):
+        return self._leaf_for(layer).reads_fp8_kv_scales(layer)
+
     @break_point
     def forward(
         self,

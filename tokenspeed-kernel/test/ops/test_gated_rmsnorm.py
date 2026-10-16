@@ -20,26 +20,23 @@
 
 """Gated RMSNorm: several rows per program against a float32 reference."""
 
-import os
-import sys
+from __future__ import annotations
 
 import pytest
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.layernorm import gated_rmsnorm
+from tokenspeed_kernel.ops.layernorm.triton import GATED_RMSNORM_ROWS_PER_PROGRAM
+from tokenspeed_kernel.platform import current_platform
 
-sys.path.insert(
-    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
-from ci_system.ci_register import register_cuda_ci  # noqa: E402
+platform = current_platform()
 
-register_cuda_ci(est_time=20, suite="runtime-1gpu")
-
-from tokenspeed.runtime.layers.attention.linear.layernorm_gated import (  # noqa: E402
-    ROWS_PER_PROGRAM,
-    rmsnorm_fn,
+pytestmark = pytest.mark.skipif(
+    not (platform.is_nvidia or platform.is_amd),
+    reason="Triton layernorm tests require an NVIDIA or AMD GPU.",
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+ROWS_PER_PROGRAM = GATED_RMSNORM_ROWS_PER_PROGRAM
 
 
 def _reference(x, weight, z, eps, group_size, norm_before_gate, sigmoid_gate):
@@ -61,20 +58,21 @@ def _reference(x, weight, z, eps, group_size, norm_before_gate, sigmoid_gate):
 @pytest.mark.parametrize("norm_before_gate", [True, False])
 @pytest.mark.parametrize("sigmoid_gate", [False, True])
 def test_gated_rmsnorm_matches_reference(
-    rows, width, group_size, norm_before_gate, sigmoid_gate
+    rows, width, group_size, norm_before_gate, sigmoid_gate, device
 ):
     torch.manual_seed(rows + width)
-    x = torch.randn(rows, width, device="cuda", dtype=torch.bfloat16)
-    z = torch.randn(rows, width, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(width, device="cuda", dtype=torch.bfloat16)
-    out = rmsnorm_fn(
+    x = torch.randn(rows, width, device=device, dtype=torch.bfloat16)
+    z = torch.randn(rows, width, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(width, device=device, dtype=torch.bfloat16)
+    out = gated_rmsnorm(
         x,
         weight,
-        z=z,
+        z,
         eps=1e-6,
         group_size=group_size,
         norm_before_gate=norm_before_gate,
         sigmoid_gate=sigmoid_gate,
+        fp8_scale=None,
         weights_independent=True,
     )
     expected = _reference(
@@ -84,49 +82,65 @@ def test_gated_rmsnorm_matches_reference(
     torch.testing.assert_close(out.float(), expected, rtol=2**-7, atol=2**-7)
 
 
-def test_gated_rmsnorm_rows_are_independent_of_their_neighbours():
+def test_gated_rmsnorm_rows_are_independent_of_their_neighbours(device):
     """A row's output must not depend on which other rows share its program."""
     torch.manual_seed(0)
-    x = torch.randn(4 * ROWS_PER_PROGRAM + 3, 128, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(4 * ROWS_PER_PROGRAM + 3, 128, device=device, dtype=torch.bfloat16)
     z = torch.randn_like(x)
-    weight = torch.randn(128, device="cuda", dtype=torch.bfloat16)
-    kwargs = dict(eps=1e-6, norm_before_gate=True, weights_independent=True)
-    full = rmsnorm_fn(x, weight, z=z, **kwargs)
+    weight = torch.randn(128, device=device, dtype=torch.bfloat16)
+    kwargs = dict(
+        eps=1e-6,
+        group_size=None,
+        norm_before_gate=True,
+        sigmoid_gate=False,
+        fp8_scale=None,
+        weights_independent=True,
+    )
+    full = gated_rmsnorm(x, weight, z, **kwargs)
     for row in (0, ROWS_PER_PROGRAM - 1, ROWS_PER_PROGRAM, x.shape[0] - 1):
-        alone = rmsnorm_fn(x[row : row + 1], weight, z=z[row : row + 1], **kwargs)
+        alone = gated_rmsnorm(x[row : row + 1], weight, z[row : row + 1], **kwargs)
         torch.testing.assert_close(full[row : row + 1], alone, rtol=0, atol=0)
 
 
-def test_one_group_weight_on_whole_rows_matches_one_row_per_group():
+def test_one_group_weight_on_whole_rows_matches_one_row_per_group(device):
     """A ``group_size`` weight shared by every group of whole rows, with z a
     row-strided view, normalizes exactly like one row per group."""
     torch.manual_seed(0)
     tokens, heads, dim = 37, 12, 128
-    x = torch.randn(tokens, heads * dim, device="cuda", dtype=torch.bfloat16)
-    wide = torch.randn(tokens, (heads + 3) * dim, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(tokens, heads * dim, device=device, dtype=torch.bfloat16)
+    wide = torch.randn(tokens, (heads + 3) * dim, device=device, dtype=torch.bfloat16)
     z = wide[:, 3 * dim :]
-    weight = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
-    kwargs = dict(eps=1e-6, group_size=dim, weights_independent=True)
-    rows = rmsnorm_fn(x, weight, z=z, **kwargs)
-    per_group = rmsnorm_fn(
-        x.view(-1, dim), weight, z=z.contiguous().view(-1, dim), **kwargs
+    weight = torch.randn(dim, device=device, dtype=torch.bfloat16)
+    kwargs = dict(
+        eps=1e-6,
+        group_size=dim,
+        norm_before_gate=True,
+        sigmoid_gate=False,
+        fp8_scale=None,
+        weights_independent=True,
+    )
+    rows = gated_rmsnorm(x, weight, z, **kwargs)
+    per_group = gated_rmsnorm(
+        x.view(-1, dim), weight, z.contiguous().view(-1, dim), **kwargs
     )
     torch.testing.assert_close(rows.view(-1, dim), per_group, rtol=0, atol=0)
 
 
-def test_gated_rmsnorm_fp8_output_matches_quantized_bf16():
+def test_gated_rmsnorm_fp8_output_matches_quantized_bf16(device):
     """The FP8 output equals quantizing the activation-dtype output with the same scale."""
     torch.manual_seed(1)
-    x = torch.randn(531, 128, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(531, 128, device=device, dtype=torch.bfloat16)
     z = torch.randn_like(x)
-    weight = torch.randn(128, device="cuda", dtype=torch.bfloat16)
-    scale = torch.tensor([0.05], device="cuda", dtype=torch.float32)
-    kwargs = dict(eps=1e-6, norm_before_gate=True, weights_independent=True)
-    bf16 = rmsnorm_fn(x, weight, z=z, **kwargs)
-    fp8 = rmsnorm_fn(x, weight, z=z, fp8_scale=scale, **kwargs)
+    weight = torch.randn(128, device=device, dtype=torch.bfloat16)
+    scale = torch.tensor([0.05], device=device, dtype=torch.float32)
+    kwargs = dict(
+        eps=1e-6,
+        group_size=None,
+        norm_before_gate=True,
+        sigmoid_gate=False,
+        weights_independent=True,
+    )
+    bf16 = gated_rmsnorm(x, weight, z, fp8_scale=None, **kwargs)
+    fp8 = gated_rmsnorm(x, weight, z, fp8_scale=scale, **kwargs)
     expected = (bf16.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
     torch.testing.assert_close(fp8.float(), expected.float(), rtol=0, atol=0)
-
-
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))

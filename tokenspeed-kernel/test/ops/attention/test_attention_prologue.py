@@ -24,6 +24,7 @@ sequence, and the single rounding of the Triton GQA and MLA solutions."""
 from __future__ import annotations
 
 import dataclasses
+import functools
 import itertools
 
 import pytest
@@ -50,6 +51,7 @@ from attention_prologue_reference import (
     split,
 )
 from tokenspeed_kernel.ops.attention.prologue import (
+    FP8TensorScales,
     HeadKVCache,
     HeadNorm,
     KVCacheFormat,
@@ -534,6 +536,99 @@ def test_gqa_writes_only_the_slotted_rows(solution, cache_dtype):
     assert bytes_equal(v_cache[untouched], before_v[untouched])
     assert bytes_equal(k_cache[loc], k[:rows].view(rows, hkv, dim).to(cache_dtype))
     assert bytes_equal(v_cache[loc], v[:rows].view(rows, hkv, dim).to(cache_dtype))
+
+
+def _scaled_gqa(solution, inputs, hq, hkv, dim, loc, total, scales):
+    q, k, v = split(inputs.clone(), hq, hkv, dim)
+    k_cache, v_cache = gqa_cache(total, hkv, dim, FP8)
+    out = gqa_prologue(
+        q,
+        k,
+        v,
+        norm=None,
+        rotary=None,
+        cache=HeadKVCache(k_cache, v_cache, scales, loc),
+        return_kv=True,
+        solution=solution,
+        override=None,
+    )
+    return out, k_cache[loc], v_cache[loc]
+
+
+def test_gqa_scaled_fp8_cache_holds_rows_over_their_scale():
+    """A per-tensor scaled FP8 cache stores K / k and V / v, saturated to e4m3's
+    range; the query and the returned rows stay unscaled."""
+    tokens, hq, hkv, dim, total = 12, 4, 2, 128, 64
+    # Wide rows so that some values saturate past 448 * scale.
+    inputs = qkv(tokens, hq, hkv, dim, seed=13) * 8
+    loc = slots(tokens, total, seed=14)
+    scales = FP8TensorScales(k=0.0614, v=0.0513)
+    unit, _, _ = _scaled_gqa(None, inputs, hq, hkv, dim, loc, total, None)
+    out, k_rows, v_rows = _scaled_gqa(None, inputs, hq, hkv, dim, loc, total, scales)
+    for a, b in zip((out.q, out.k, out.v), (unit.q, unit.k, unit.v)):
+        assert bytes_equal(a, b)
+
+    def stored(x: torch.Tensor, scale: float) -> torch.Tensor:
+        x = x.view(tokens, hkv, dim).float() * (1.0 / scale)
+        return x.clamp(-448.0, 448.0).to(FP8)
+
+    assert bytes_equal(v_rows, stored(out.v, scales.v))
+    assert bytes_equal(k_rows, stored(out.k, scales.k))
+    assert (k_rows.float().abs() == 448).any()
+
+
+def test_kv_scale_values_reuse_the_compiled_kernel():
+    """Scales are runtime arguments: each layer's own values compile nothing new."""
+    from tokenspeed_kernel.ops.attention.prologue.triton import _gqa_prologue_kernel
+    from utils import assert_no_triton_compile
+
+    tokens, hq, hkv, dim, total = 6, 4, 2, 64, 32
+    inputs = qkv(tokens, hq, hkv, dim, seed=17)
+    loc = slots(tokens, total, seed=18)
+    run = functools.partial(_scaled_gqa, "triton", inputs, hq, hkv, dim, loc, total)
+    run(FP8TensorScales(0.5, 2.0))
+    with assert_no_triton_compile(_gqa_prologue_kernel):
+        for k, v in ((0.0614, 0.0513), (3.0, 0.25)):
+            run(FP8TensorScales(k, v))
+
+
+def test_only_the_triton_solution_writes_a_scaled_cache():
+    tokens, hq, hkv, dim, total = 4, 4, 2, 64, 16
+    inputs = qkv(tokens, hq, hkv, dim, seed=19)
+    with pytest.raises(NoKernelFoundError):
+        _scaled_gqa(
+            "composite",
+            inputs,
+            hq,
+            hkv,
+            dim,
+            slots(tokens, total, seed=20),
+            total,
+            FP8TensorScales(0.5, 0.5),
+        )
+
+
+def test_per_tensor_kv_scales_need_an_fp8_cache_and_positive_values():
+    tokens, hq, hkv, dim, total = 4, 4, 2, 64, 16
+    q, k, v = split(qkv(tokens, hq, hkv, dim, seed=15), hq, hkv, dim)
+    k_cache, v_cache = gqa_cache(total, hkv, dim, BF16)
+    with pytest.raises(ValueError, match="FP8 cache only"):
+        gqa_prologue(
+            q,
+            k,
+            v,
+            norm=None,
+            rotary=None,
+            cache=HeadKVCache(
+                k_cache, v_cache, FP8TensorScales(0.5, 0.5), slots(tokens, total, 16)
+            ),
+            return_kv=False,
+            solution=None,
+            override=None,
+        )
+    for bad in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="positive"):
+            FP8TensorScales(k=bad, v=1.0)
 
 
 def test_int32_indices_give_the_int64_bytes():

@@ -57,10 +57,11 @@ _TACTICS = tuple(
         (128, 256),
         (512, 1024),
         ("static", "atomic_counter"),
-        ("epi_warps", "reuse_dispatch_warps"),
+        # Exclude reuse_dispatch_warps to avoid allocating its large
+        # FC2 staging buffer in the fixed workspace.
+        ("epi_warps",),
         (1, 4, 8),
     )
-    if tile_n == 256 or token_back == "epi_warps"
 )
 
 
@@ -363,7 +364,7 @@ class MegaMoERunner(TunableRunner):
         self.max_capacity = max_capacity
         self.tactic_autotune = os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1"
         self._extras = (
-            "nvfp4_situ_bf16_graph_fixed_workspace_v3",
+            "nvfp4_situ_bf16_graph_fixed_workspace_epi_only_v4",
             self.world,
             num_experts,
             hidden,
@@ -427,7 +428,7 @@ class MegaMoERunner(TunableRunner):
                     256,
                     512,
                     "atomic_counter" if capacity >= 16384 else "static",
-                    "reuse_dispatch_warps",
+                    "epi_warps",
                     8,
                 )
         else:

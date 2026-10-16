@@ -58,14 +58,13 @@ from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
-_KV_SCALE_SUFFIXES = (
-    ".k_scale",
-    ".v_scale",
+# Checkpoint tensors holding a layer's key, value, or shared KV-cache scale.
+K_CACHE_SCALE_SUFFIXES = (".k_scale", "_k_scale", ".k_proj.output_scale")
+V_CACHE_SCALE_SUFFIXES = (".v_scale", "_v_scale", ".v_proj.output_scale")
+KV_CACHE_SCALE_SUFFIXES = (
+    *K_CACHE_SCALE_SUFFIXES,
+    *V_CACHE_SCALE_SUFFIXES,
     ".kv_scale",
-    "_k_scale",
-    "_v_scale",
-    ".k_proj.output_scale",
-    ".v_proj.output_scale",
 )
 
 _AUXILIARY_SAFETENSORS_FILES = {"input_scales.safetensors"}
@@ -1032,11 +1031,27 @@ def initialize_dummy_integer_weights(model: torch.nn.Module, seed: int = 1234) -
 def record_non_unit_kv_scales(
     weights: Iterable[tuple[str, torch.Tensor]], rejected: list[str]
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Pass weights through, appending each KV-cache scale other than one to
-    ``rejected``; KV caches are written and read at unit scale."""
+    """Pass weights through without their KV-cache scales, appending each one
+    other than one to ``rejected``: a weight update never changes the scales
+    an FP8 KV cache was loaded with."""
     for name, tensor in weights:
-        if name.endswith(_KV_SCALE_SUFFIXES) and not bool(torch.all(tensor == 1)):
-            rejected.append(f"{name}={tensor.flatten()[:4].tolist()}")
+        if name.endswith(KV_CACHE_SCALE_SUFFIXES):
+            if not bool(torch.all(tensor == 1)):
+                rejected.append(f"{name}={tensor.flatten()[:4].tolist()}")
+            continue
+        yield name, tensor
+
+
+def split_kv_cache_scales(
+    weights: Iterable[tuple[str, torch.Tensor]], scales: dict[str, torch.Tensor]
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Pass checkpoint weights through without their KV-cache scales,
+    collecting each one other than one into ``scales`` by checkpoint name."""
+    for name, tensor in weights:
+        if name.endswith(KV_CACHE_SCALE_SUFFIXES):
+            if not bool(torch.all(tensor == 1)):
+                scales[name] = tensor
+            continue
         yield name, tensor
 
 
@@ -1045,17 +1060,6 @@ def non_unit_kv_scale_message(rejected: list[str]) -> str:
         f"checkpoint KV-cache scales {', '.join(rejected)}; "
         "only unit KV-cache scales are supported"
     )
-
-
-def require_unit_kv_scales(
-    weights: Iterable[tuple[str, torch.Tensor]],
-) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Pass checkpoint weights through, raising once the stream is drained if
-    a KV-cache scale is not one."""
-    rejected: list[str] = []
-    yield from record_non_unit_kv_scales(weights, rejected)
-    if rejected:
-        raise ValueError(non_unit_kv_scale_message(rejected))
 
 
 def require_unit_kv_scale_file(path: str) -> None:

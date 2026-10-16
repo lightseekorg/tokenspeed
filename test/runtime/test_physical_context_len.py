@@ -23,8 +23,9 @@
 Spec verify on the overlap scheduler commits past the logical context_len for
 a finished request that lingers exactly one extra step. The physical extent
 (context_len + ServerArgs.spec_context_pad) absorbs that overshoot so no
-per-request table needs a runtime clamp; these tests pin the pad math and the
-tripwire that guards the one-lingering-step assumption.
+per-request table needs a runtime clamp; these tests pin the pad math, the
+tripwire that guards the one-lingering-step assumption, and the startup warning
+for a RoPE table the pad runs past.
 """
 
 from types import SimpleNamespace
@@ -109,3 +110,36 @@ class TestOutputProcessorTripwire:
     def test_disabled_when_none(self):
         p = self._processor(physical_context_len=None)
         p._check_physical_extent("r0", self._state(50, 470), output_length=4)
+
+
+class TestRopeTableWarning:
+    @pytest.fixture
+    def warning(self, monkeypatch, caplog):
+        """The startup warning for a model at a 4096-token context and
+        ``physical`` positions, or an empty string."""
+        import tokenspeed.runtime.execution.model_executor as module
+
+        # The colorful logger does not propagate; let caplog see its records.
+        monkeypatch.setattr(module.logger, "propagate", True)
+        model_config = SimpleNamespace(
+            hf_text_config=SimpleNamespace(max_position_embeddings=4096)
+        )
+
+        def warn(model, physical):
+            caplog.clear()
+            with caplog.at_level("WARNING"):
+                module.warn_past_rope_table(model, model_config, 4096, physical)
+            return caplog.text
+
+        return warn
+
+    def test_tables_are_assumed_to_end_at_the_derived_context(self, warning):
+        model = object()
+        assert "Lower --max-model-len by at least 48" in warning(model, 4096 + 48)
+        assert warning(model, 4096) == ""
+
+    def test_a_model_that_sizes_its_table_is_checked_against_it(self, warning):
+        assert warning(SimpleNamespace(rope_positions=4096 + 64), 4096 + 48) == ""
+        short = SimpleNamespace(rope_positions=4096)
+        assert "Lower --max-model-len by at least 48" in warning(short, 4096 + 48)
+        assert warning(SimpleNamespace(rope_positions=None), 4096 + 48) == ""

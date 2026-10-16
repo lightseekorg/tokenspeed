@@ -24,6 +24,23 @@ the online softmax; unused entries remain `-1`.
 Portable Triton implementations remain the fallback for trait combinations
 without a matching native registration.
 
+## Materialized Triton row top-k
+
+`triton_topk_from_logits(logits, topk, seq_lens=..., enable_pdl=...)` selects
+FP32 rows with descending scores and smaller column ids first on ties.
+`seq_lens` is an int32 or int64 vector on the scores' device, clamped per row
+to `[0, width]`; explicit `None` selects the full row. Scores and lengths may
+be strided. Invalid scores inside the visible prefix still use `-inf` and
+produce `-1` output padding. Entries beyond the prefix are never read and may
+be uninitialized.
+
+The sorting and radix implementations both bound input reads by these device
+lengths. Radix histogram reduction excludes unwritten tiles and selects at
+most `min(topk, seq_lens[row])` entries, including empty and short rows.
+CUDA Graph replay may change the lengths without changing allocation or launch
+capacity. QSA passes its complete compressed-block counts to both CUDA and
+Triton selection, so its scorer writes only valid prefixes.
+
 ## Index-K plane formats
 
 `dsa_prefill_topk` and `dsa_decode_topk` read the storage of the index-key
@@ -188,3 +205,14 @@ owned entries. Empty tiles still write negative-infinite logits, including
 when lengths or ownership change during graph replay. Partially valid tiles
 keep the per-entry mask and global forced-window policy. This avoids redundant
 arithmetic without changing the launch grid, logits capacity or Top-K scan.
+
+### Persistent CUDA top-k dependencies
+
+`ragged_decode_topk` requires an explicit `enable_pdl` argument. With PDL,
+selection waits at entry before reading lengths or scores, including empty and
+short rows. Cluster and single-CTA launches both honor the PDL flag.
+
+For non-cluster PDL grids with no more rows than SMs, the launcher selects a
+one-block register budget to reduce packing of waiting CTAs. Larger grids keep
+the two-block budget. Launch bounds guide register allocation; they are not a
+hard limit on resident CTAs. Both variants use the same radix algorithm.

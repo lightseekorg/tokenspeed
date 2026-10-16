@@ -1097,7 +1097,10 @@ layers ──group──▶ groups ──pack──▶ CacheLayout ──bind─
   plane sizes, per-field offsets and page strides, and how many of each
   group's CacheBlocks share a parent (`cache_blocks_per_lcm_block`). The
   result, `CacheLayout`, is **capacity-independent** — it describes one
-  parent, not an allocation.
+  parent, not an allocation. A parent's bytes are exactly its planes': each
+  plane is already a multiple of every tenant's packing, so the parent is not
+  rounded up again to the LCM of all the packings, which only added bytes no
+  field addresses.
 * **`bind`** (`CacheLayout.bind(num_lcm_blocks)`) multiplies that parent out
   by a count and yields the `CacheMemoryPlan` the arena allocates from and
   the PD wire carries.
@@ -1169,8 +1172,9 @@ draft layer of a target attention layer's K/V bytes fills state segments, any
 other pads the state groups (`recipes/qwen35.py`). Nemotron-H's Mamba2 runs
 are four or five layers long; its recipe splits the attention layers into two
 KV groups (`recipes/mamba2.py`).
-KV pages pad by their share of the conv planes, about 1.5% for Nemotron-3 Super
-and 1-2% for Qwen3.5.
+Qwen3.5's state groups leave segments free, so its conv windows pack into them
+and KV pages carry no padding; Nemotron-3 Super's state groups fill every
+segment, so its KV pages pad by their share of the conv planes, about 1.5%.
 
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:

@@ -65,6 +65,7 @@ from tokenspeed.runtime.configs import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
 )
+from tokenspeed.runtime.configs.beam_config import BeamConfig
 from tokenspeed.runtime.configs.dots3_note_config import Dots3NoteConfig
 from tokenspeed.runtime.configs.glm53_flash_config import Glm53FlashConfig
 from tokenspeed.runtime.configs.nemotron_h_config import NemotronHConfig
@@ -76,6 +77,7 @@ _TURN_FINAL_STOP_TOKEN_TEXTS = ("<|eom_id|>", "<|eot|>")
 logger = logging.getLogger(__name__)
 
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+    BeamConfig.model_type: BeamConfig,
     Dots3NoteConfig.model_type: Dots3NoteConfig,
     Qwen2Config.model_type: Qwen2Config,
     Qwen3Config.model_type: Qwen3Config,

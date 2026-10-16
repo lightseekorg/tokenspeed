@@ -1428,6 +1428,7 @@ def build_device_side(
             config=ModelExecutorConfig.from_server_args(
                 server_args=server_args,
                 model_config=model_config,
+                model=target.model,
                 max_req_pool_size=RequestSlotLayout(max_batch_size).padding,
                 gpu_id=gpu_id,
                 global_rank=global_rank,

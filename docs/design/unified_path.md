@@ -143,7 +143,9 @@ from one first bound to that pool:
   trees, re-runs `bind_cache_groups` and the initialisation sequence above,
   freezes the workspace again and captures again.
 * The KV budget reserves what the graphs will cost: a probe binds the
-  smallest arena the family can run on and captures a few entries of each
+  smallest arena the family can run on (refused, with the numbers, when the
+  memory profile cannot hold it, since a serving arena would not fit either)
+  and captures a few entries of each
   ladder -- the widest three, then one a third and one two thirds of the
   way down -- with a driver-memory delta around each capture. The widest
   samples form a window priced at its positive bytes, plus one granule the
@@ -370,9 +372,34 @@ page mapping. Mixed batches with device-only decode lengths, and persistent
 decode views, retain the capacity bound; decode graph shapes stay fixed.
 Uniform query runs may share a K tile, but groups must never cross requests.
 A single-request forward is uniform regardless of its forward mode. Long runs
-use larger query groups; ragged layouts retain independent rows. A score tile
-beyond all of its queries' complete-block frontiers must write `-inf` without
-reading K or executing its dot, including padded graph requests.
+use larger query groups; ragged layouts retain independent rows. Scoring writes
+only each query's complete-block prefix. Both CUDA persistent and portable
+Triton top-k read that per-row frontier on the device, so the score tail may
+remain uninitialized even when the frontier shrinks during graph replay.
+A bounded set of scoring CTAs walks tiles at the grid stride, stopping at each
+query group's current device frontier and reusing Q across its tiles. CTAs
+beyond that frontier skip Q/K reads, the dot and score stores, including for
+padded graph requests. Allocated score width retains its capacity bound; the
+grid depends on SM count, query-group count, capacity and the loaded kernel's
+occupancy, never live lengths. Its CTA budget is three waves of the kernel's
+resident capacity, queried once per compiled specialization. Both grid
+dimensions fit within that budget; excess query groups and longer frontiers
+need more device-loop iterations, not a new graph or a device-to-host read.
+Query-group counts use two compilation buckets: small grids fold away the
+group loop, while larger grids retain it with a runtime group count. This
+preserves decode register use without specializing on individual batch sizes.
+
+QSA logits scoring and persistent CUDA top-k wait at entry before reading
+producer-owned queries, cache entries or metadata. Both follow the captured PDL
+setting. DSA and DSv4 persistent decode selection also follow that setting,
+including cluster launches. Small non-cluster PDL grids use a one-block register
+budget when their row count fits the SM count; larger grids retain the two-block
+budget. These precompiled launch-bounds variants use the same algorithm and
+captured shapes, without reading device lengths. The compiler determines
+register allocation and occupancy. Register and streaming selectors retain both
+budgets: spreading waiting CTAs also benefits short-row selection while scoring finishes.
+Serving workers use one GPU or homogeneous full GPUs, so the SM count used for
+this policy is cached once per process.
 
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
@@ -779,9 +806,9 @@ persistent
 draft candidates. Without a drafter, `output_length == 1` — a one-column
 window that accepts nothing and resolves to exactly one sampled token
 through the same pool kernels, `accept_length == 1`
-(`test_decode_verify_n1_equivalence.py`; triton is bitwise identical to the
-old `sample()` route, flashinfer stochastic draws the same distribution
-through the coin stream). `future_input_map` is `[pool, output_length]` for
+(`test_decode_verify_n1_equivalence.py`; Triton and FlashInfer's
+`per-request` stream use the same draw in `sample()` and `verify(N=1)`;
+FlashInfer's legacy `batch` stream retains the coin route). `future_input_map` is `[pool, output_length]` for
 the same reason: single-token decode is a width-1 candidate window.
 
 Backends express verify geometry as a **floor**, not a mode: seq_lens clamp
@@ -789,6 +816,83 @@ to `clamp_min(q_len)` unconditionally (drafts and plain decode have floor 1,
 where the clamp is the identity). What legitimately remains conditional on
 the drafter is the *draft model's existence* — draft backend refresh and the
 drafter loop itself — not the sampling or metadata shape of the target.
+
+### Sampling positions are independent of the KV frontier
+
+`SamplingBatchInfo` borrows the accepted frontier (`valid_cache_lengths`)
+and the leading prefill requests' input lengths (`extend_lengths`). Paths
+that consume sampling offsets require a frontier, including standalone warmup
+and graph capture; missing metadata raises rather than substituting offset zero.
+Samplers that do not consume positions may leave it absent. Slicing a
+mixed batch slices the prefill lengths along with its request rows; a decode
+suffix has no extend lengths. These are execution inputs, not RNG state.
+
+The sampling backend owns the pool-indexed offsets scratch required by the
+existing Gumbel/scalar-gather kernels. `_prepare_sampling_offsets` prepares it
+immediately before consumption, on the same stream, in eager execution and
+CUDA graph replay. The executor and graph runner own no sampling-position
+buffer and run no position-preparation prologue. Non-emitting prefill chunks,
+intermediate PP stages, greedy-only backends, and coin-based multi-token
+verification do not prepare offsets they will not read.
+
+Preparation writes only the current call's unique positive request slots in
+one kernel, O(batch rows), without scanning the request pool. Slot zero is the
+scheduler's reserved padding slot: it stays zero, so repeated padding rows do
+not race. Unreferenced scratch entries may be stale and must not be consumed.
+The scratch is regenerated from execution inputs before use after a restore;
+it is not part of the request's retraction image. CUDA graph capture records
+the same preparation inside sampling, with stable scratch addresses. Frontier
+advancement happens after forward/replay, not before sampling reads it.
+
+A prefill chunk predicts at `frontier + input_length`; a decode/verify row's
+first target is at `frontier + 1`, regardless of candidate width. A chain adds
+its candidate index and a tree uses node depth. For example, a 2049-token prompt
+predicts position 2049 whether computed as `1024 + 1024 + 1`,
+`130 cached + 1024 + 895`, or 2048 cached tokens plus one decode input.
+Constructing the base position does not implement MTP acceptance/residual RNG
+or domain separation; multi-token FlashInfer still uses its existing coins.
+
+With `sampling_stream=per-request`, FlashInfer and FlashInferFull route both
+`sample()` and `verify(N=1)` through the existing Gumbel pool kernel, keyed by
+request seed and this absolute position. Neither consumes the CPU coin generator.
+Random-stream policy, verification geometry and TP agreement are separate:
+
+* `per_request_stream` selects the position-keyed direct sampler for a window
+  without draft candidates. `has_draft_candidates` describes the window, not a
+  model family: wider windows still require acceptance and residual sampling.
+* `_prepare_step_hook` skips coin preparation only where no coins are consumed.
+  Wider per-request windows currently fall through to `_refill_legacy_coins`;
+  they do not yet have position-keyed accept/residual randomness. That refill
+  owns only generator advancement and buffer writes, not sampler selection.
+* Each selected sampling implementation declares `needs_tp_sync` locally.
+  The common epilogue gathers DP-owned rows or broadcasts replicated TP outputs
+  as required; it does not infer synchronization from random-stream policy or
+  window width. These are the existing communication choices, not new guarantees
+  that per-request randomness alone makes per-rank probabilities identical.
+
+`_pack_single_verify_result` only writes caller-owned output buffers (including
+DP-local buffers): one emitted token per row and its identity output index. The chain path adds its bonus token to the
+accepted-draft count before the common communication/logprob epilogue. Both paths
+therefore hand that epilogue emitted-token lengths. Full sampling reuses `sample()`
+for penalties and count updates exactly once, then packs its result.
+
+This fixes the previous coupling to the number of `prepare_step` calls, including
+open prefill chunks that emitted nothing. Batch order, pool-slot reuse, prefix
+hits, and graph replay do not enter the random key. The fixed-seed token trajectory
+changes relative to the old coin-based decode implementation. Logits must still be
+identical for this to imply token equality, and sampling parameters and any
+penalty/grammar state must also match.
+
+Multi-token FlashInfer speculative verification retains rejection sampling and
+its per-slot coin state; this change does not establish its invariance to cache
+hits or speculative scheduling. The `batch` sampling stream is also outside this
+position-based equality guarantee.
+
+`test_sampling_positions.py` exercises the metadata and slot-write contract
+on CPU and CUDA, including untouched slots and duplicate padding. `test_flashinfer_position_invariance.py` exercises real CUDA sampling,
+bitwise selected-token logprobs, seed/position sensitivity, chunk counts, both
+phases, batch/slot permutations and graph replay; it fails if CUDA is absent.
+These are sampler tests with constructed logits, not full-model acceptance tests.
 
 ### Outputs are persistent-buffer slices on both paths
 

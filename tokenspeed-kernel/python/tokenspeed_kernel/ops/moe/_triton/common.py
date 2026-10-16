@@ -82,6 +82,8 @@ def _combine_kernel(
     num_tokens,
     hidden_size,
     top_k: tl.constexpr,
+    ROUND_WEIGHTED_ROUTES: tl.constexpr,
+    OUTPUT_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -100,7 +102,12 @@ def _combine_kernel(
             other=0.0,
         )
         weights = tl.load(topk_weights_ptr + route_offsets, mask=token_mask, other=0.0)
-        acc += values.to(tl.float32) * weights[:, None]
+        weighted = values.to(tl.float32) * weights[:, None]
+        if ROUND_WEIGHTED_ROUTES:
+            weighted = weighted.to(tl.bfloat16).to(tl.float32)
+        acc += weighted
+    if ROUND_WEIGHTED_ROUTES:
+        acc *= OUTPUT_SCALE
     tl.store(
         output_ptr + token_offsets[:, None] * hidden_size + hidden_offsets[None, :],
         acc,
@@ -112,6 +119,8 @@ def _combine(
     route_output: torch.Tensor,
     topk_weights: torch.Tensor,
     output: torch.Tensor,
+    round_weighted_routes: bool = False,
+    output_scale: float = 1.0,
 ) -> None:
     num_tokens, top_k = topk_weights.shape
     hidden_size = output.shape[1]
@@ -122,9 +131,12 @@ def _combine(
         num_tokens,
         hidden_size,
         top_k=top_k,
+        ROUND_WEIGHTED_ROUTES=round_weighted_routes,
+        OUTPUT_SCALE=output_scale,
         BLOCK_M=4,
         BLOCK_N=256,
         num_warps=4,
+        enable_fp_fusion=not round_weighted_routes,
     )
 
 

@@ -17,19 +17,3 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-
-"""Triton convolution kernel entry points."""
-
-from tokenspeed_kernel.ops.conv.triton.grouped import dflash2_grouped_conv
-from tokenspeed_kernel.ops.conv.triton.sconv import (
-    _inkling_ring_sconv_decode_kernel,
-    _inkling_ring_sconv_prefill_kernel,
-    select_prefill_config,
-)
-
-__all__ = [
-    "_inkling_ring_sconv_decode_kernel",
-    "_inkling_ring_sconv_prefill_kernel",
-    "dflash2_grouped_conv",
-    "select_prefill_config",
-]

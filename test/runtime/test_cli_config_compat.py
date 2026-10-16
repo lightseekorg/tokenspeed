@@ -310,6 +310,14 @@ class TestCLIConfigCompat:
         args = self._parse_args(["--model", "test/model", "--enable-mixed-batch"])
         assert args.enable_mixed_batch
 
+    def test_constrained_decoding_is_internal_and_defaults_to_none(self):
+        args = self._parse_args(["--model", "test/model"])
+        assert self._from_cli_args_no_init(args).constrained_decoding is None
+        with pytest.raises(SystemExit):
+            self._parse_args(
+                ["--model", "test/model", "--constrained-decoding", "always"]
+            )
+
     def test_distributed_timeout_seconds_arg(self):
         args = self._parse_args(
             ["--model", "test/model", "--distributed-timeout-seconds", "600"]

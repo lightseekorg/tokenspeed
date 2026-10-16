@@ -171,6 +171,8 @@ class TestDeepseekV4AttentionOpsTest:
             workspace,
             topk,
             int(lengths.max().item()),
+            enable_pdl=False,
+            q_len_per_req=1,
         )
         torch.cuda.synchronize()
 
@@ -208,6 +210,8 @@ class TestDeepseekV4AttentionOpsTest:
             workspace,
             topk,
             stride,
+            enable_pdl=False,
+            q_len_per_req=1,
         )
         torch.cuda.synchronize()
 
@@ -250,6 +254,8 @@ class TestDeepseekV4AttentionOpsTest:
                     workspace,
                     topk,
                     int(lengths.max().item()),
+                    enable_pdl=False,
+                    q_len_per_req=1,
                 )
                 torch.cuda.synchronize()
 
@@ -284,12 +290,30 @@ class TestDeepseekV4AttentionOpsTest:
                     dtype=torch.int32,
                 )
 
-                persistent_topk(logits, lengths, output, workspace, topk, stride)
+                persistent_topk(
+                    logits,
+                    lengths,
+                    output,
+                    workspace,
+                    topk,
+                    stride,
+                    enable_pdl=True,
+                    q_len_per_req=1,
+                )
                 torch.cuda.synchronize()
 
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
-                    persistent_topk(logits, lengths, output, workspace, topk, stride)
+                    persistent_topk(
+                        logits,
+                        lengths,
+                        output,
+                        workspace,
+                        topk,
+                        stride,
+                        enable_pdl=True,
+                        q_len_per_req=1,
+                    )
                 for _ in range(3):
                     graph.replay()
                 torch.cuda.synchronize()
@@ -326,6 +350,8 @@ class TestDeepseekV4AttentionOpsTest:
                     workspace,
                     topk,
                     max_seq_len,
+                    enable_pdl=False,
+                    q_len_per_req=1,
                 )
                 torch.cuda.synchronize()
 
@@ -375,6 +401,7 @@ class TestDeepseekV4AttentionOpsTest:
             topk,
             int(request_lengths.max().item()),
             q_len_per_req,
+            enable_pdl=False,
         )
         torch.cuda.synchronize()
 

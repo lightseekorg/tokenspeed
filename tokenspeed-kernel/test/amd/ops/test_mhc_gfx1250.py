@@ -97,9 +97,11 @@ def _splits(tokens: int, hidden: int) -> int:
     )
 
 
-# Token counts reach 80, 64 and at most 32 K splits; 4 * 1000 does not tile
-# into 64-wide K tiles, so that width keeps the Triton GEMM.
-@pytest.mark.parametrize("tokens", [1, 96, 192, 2048, 8192])
+# On 256 CUs these token counts reach 80, 64, 32 and fewer K splits, so both
+# 64-wide K tiles (64 or more splits) and 128-wide ones run; 320 is the
+# cheapest 128-wide case. 4 * 1000 does not tile into 64-wide K tiles, so that
+# width keeps the Triton GEMM.
+@pytest.mark.parametrize("tokens", [1, 96, 192, 320, 2048, 8192])
 @pytest.mark.parametrize("hidden", [5120, 1000])
 def test_mhc_mixes_matches_reference(tokens: int, hidden: int) -> None:
     operands = _operands(tokens, hidden, seed=tokens + hidden)

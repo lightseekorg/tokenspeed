@@ -38,6 +38,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # no
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import (  # noqa: E402
     fused as gfx1250_fused,
 )
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import (  # noqa: E402
+    decode_tile_config,
+)
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (  # noqa: E402
     _resolve_block_m,
 )
@@ -543,6 +546,14 @@ def test_gfx1250_small_m_route_matches_expert_grouping(
     torch.cuda.synchronize()
 
     _assert_gfx1250_large_route(ids, weights, experts, route)
+    # Rows are stably sorted by expert, so the indices are bit-identical to
+    # the torch argsort route.
+    _, gather, scatter, gate = gfx1250_fused._route_from_topk(
+        weights, ids, experts, dtype=weights.dtype
+    )
+    assert torch.equal(route[1], gather)
+    assert torch.equal(route[2], scatter)
+    assert torch.equal(route[3], gate)
 
 
 def test_gfx1250_small_m_route_ignores_invalid_experts() -> None:
@@ -585,13 +596,12 @@ def test_gfx1250_small_m_route_ignores_invalid_experts() -> None:
 
 
 @pytest.mark.parametrize(
-    ("route_fn", "kernels", "zero_tail", "warm", "sweep"),
+    ("route_fn", "kernels", "warm", "sweep"),
     [
         # 33 to 64 tokens fill one 1024-gate extent: the EAGLE3 verify batches.
         pytest.param(
             gfx1250_fused._precomputed_topk_route_small_m_gfx1250,
             (gfx1250_fused._precomputed_topk_route_small_m_gfx1250_kernel,),
-            False,
             33,
             (40, 48, 57, 64),
             id="one_launch",
@@ -605,7 +615,6 @@ def test_gfx1250_small_m_route_ignores_invalid_experts() -> None:
                 gfx1250_fused._precomputed_topk_route_large_stage3_gfx1250_kernel,
                 gfx1250_fused._precomputed_topk_route_large_stage4_gfx1250_kernel,
             ),
-            True,
             129,
             (130, 160, 200, 250),
             id="staged",
@@ -615,7 +624,6 @@ def test_gfx1250_small_m_route_ignores_invalid_experts() -> None:
 def test_gfx1250_route_reuses_binaries_across_batch_sizes(
     route_fn: Callable,
     kernels: tuple,
-    zero_tail: bool,
     warm: int,
     sweep: tuple[int, ...],
 ) -> None:
@@ -627,7 +635,7 @@ def test_gfx1250_route_reuses_binaries_across_batch_sizes(
     def run(tokens: int) -> None:
         weights, ids = make_round_robin_topk(tokens, experts, topk)
         route = route_fn(weights, ids, experts)
-        _assert_gfx1250_large_route(ids, weights, experts, route, zero_tail=zero_tail)
+        _assert_gfx1250_large_route(ids, weights, experts, route)
 
     run(warm)
     with assert_no_triton_compile(*kernels):
@@ -640,8 +648,6 @@ def _assert_gfx1250_large_route(
     weights: torch.Tensor,
     experts: int,
     route,
-    *,
-    zero_tail: bool = True,
 ) -> None:
     metadata, gather, scatter, gate = route
     flat_ids = ids.reshape(-1)
@@ -678,8 +684,7 @@ def _assert_gfx1250_large_route(
         gate[:valid_count],
         flat_weights[valid_scatter.long()],
     )
-    if zero_tail:
-        assert torch.count_nonzero(gate[valid_count:]) == 0
+    assert torch.count_nonzero(gate[valid_count:]) == 0
 
     for block_size in metadata.block_sizes():
         expected_blocks = (expected_sizes + block_size - 1) // block_size
@@ -702,21 +707,18 @@ def _assert_gfx1250_large_route(
 
 
 @pytest.mark.parametrize(
-    ("route_fn", "zero_tail"),
+    "route_fn",
     [
         pytest.param(
-            gfx1250_fused._precomputed_topk_route_large_m_gfx1250, True, id="staged"
+            gfx1250_fused._precomputed_topk_route_large_m_gfx1250, id="staged"
         ),
-        # The one-launch route leaves rows past the valid count unwritten.
         pytest.param(
-            gfx1250_fused._precomputed_topk_route_small_m_gfx1250,
-            False,
-            id="one_launch",
+            gfx1250_fused._precomputed_topk_route_small_m_gfx1250, id="one_launch"
         ),
     ],
 )
 def test_gfx1250_route_handles_duplicates_invalid_ids_and_block64(
-    route_fn: Callable, zero_tail: bool
+    route_fn: Callable,
 ) -> None:
     if not is_cdna5():
         pytest.skip("gfx1250 is required for the CDNA5 fused route")
@@ -738,7 +740,7 @@ def test_gfx1250_route_handles_duplicates_invalid_ids_and_block64(
     route = route_fn(weights, ids, experts)
     torch.cuda.synchronize()
 
-    _assert_gfx1250_large_route(ids, weights, experts, route, zero_tail=zero_tail)
+    _assert_gfx1250_large_route(ids, weights, experts, route)
     block64_offsets = route[0].block_offs(64)
     expected64 = (route[0].slice_sizes + 63) // 64
     assert torch.equal(block64_offsets[1:] - block64_offsets[:-1], expected64)
@@ -770,12 +772,7 @@ def test_gfx1250_large_m_route_handles_duplicates_invalid_ids_and_block64(
     route = gfx1250_fused._precomputed_topk_route(weights, ids, experts)
     torch.cuda.synchronize()
 
-    one_launch = (
-        0 < tokens <= gfx1250_fused._SMALL_ROUTE_MAX_TOKENS
-        and tokens * topk <= gfx1250_fused._SMALL_ROUTE_MAX_GATES
-        and experts <= 1024
-    )
-    _assert_gfx1250_large_route(ids, weights, experts, route, zero_tail=not one_launch)
+    _assert_gfx1250_large_route(ids, weights, experts, route)
     block64_offsets = route[0].block_offs(64)
     expected64 = (route[0].slice_sizes + 63) // 64
     assert torch.equal(block64_offsets[1:] - block64_offsets[:-1], expected64)
@@ -1218,6 +1215,64 @@ def test_dynamic_mxfp4_activation_moe_gfx1250_dsv41_shapes(
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
+def test_gfx1250_prefill_xcd_swizzle_covers_every_tile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prefill tiles' XCD swizzle must visit every tile exactly once.
+
+    The swizzle remaps program IDs over the routed tile count read on the
+    device, which here is not a multiple of the swizzle width. Remapping only
+    reorders tiles, so the output must match the unswizzled launch exactly.
+    """
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 MXFP4 MoE kernel")
+
+    generator = torch.Generator(device="cuda").manual_seed(20261012)
+    # Seven experts with ~57 rows each give 14 tiles per GEMM.
+    hidden_size, intermediate_size, num_experts, top_k, num_tokens = (
+        512,
+        256,
+        7,
+        2,
+        200,
+    )
+    raw = make_mxfp4_moe_weights(num_experts, hidden_size, intermediate_size, generator)
+    module = _make_static_fp8_moe_module(
+        raw, preprocess_gluon_mxfp4_gfx1250_moe_weights
+    )
+    hidden_states = torch.randn(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_weights, topk_ids = make_round_robin_topk(num_tokens, num_experts, top_k)
+
+    def run() -> torch.Tensor:
+        return _gfx1250_static_moe(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            module.w13_weight_triton_tensor,
+            module.w2_weight_triton_tensor,
+            w13_mx_scale=module.w13_precision_config.b_mx_scale,
+            w2_mx_scale=module.w2_precision_config.b_mx_scale,
+            activation="situ",
+            activation_dtype="fp8",
+        )
+
+    swizzled = run()
+    for name in ("_PREFILL_GATE_UP_TILES", "_PREFILL_DOWN_TILES"):
+        tiles = getattr(gfx1250_fused, name)
+        assert tiles["xcd_swizzle"] > 1
+        monkeypatch.setattr(gfx1250_fused, name, {**tiles, "xcd_swizzle": 1})
+    unswizzled = run()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(unswizzled).item() > 0
+    torch.testing.assert_close(swizzled, unswizzled, rtol=0.0, atol=0.0)
+
+
 def _gfx1250_first_expert_matmul(
     module, hidden_states, topk_ids, topk_weights, num_experts, **overrides
 ):
@@ -1321,3 +1376,114 @@ def test_gfx1250_epilogue_fp8_matches_fp32_result(
     assert fused.shape == staged.shape
     assert torch.count_nonzero(as_fp32).item() > 0
     torch.testing.assert_close(fused.float(), staged.float(), rtol=0.0, atol=0.0)
+
+
+def test_gfx1250_decode_tile_config_streams_long_k_in_wide_rows() -> None:
+    long_k = decode_tile_config(3584)
+    short_k = decode_tile_config(384)
+    assert long_k["block_k"] == 512 and short_k["block_k"] == 128
+    assert long_k["block_n"] == short_k["block_n"] == 128
+
+
+def _sparse_decode_moe_case(num_tokens: int):
+    """Decode MoE inputs where most experts are idle, leaving padded blocks."""
+    generator = torch.Generator(device="cuda").manual_seed(20261012 + num_tokens)
+    hidden_size, intermediate_size, num_experts, top_k = 2048, 256, 64, 4
+    raw = make_mxfp4_moe_weights(num_experts, hidden_size, intermediate_size, generator)
+    w13_bias = 0.05 * torch.randn(
+        (num_experts, 2 * intermediate_size), device="cuda", generator=generator
+    )
+    w2_bias = 0.05 * torch.randn(
+        (num_experts, hidden_size), device="cuda", generator=generator
+    )
+    module = _make_static_fp8_moe_module(
+        raw,
+        preprocess_gluon_mxfp4_gfx1250_moe_weights,
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+    )
+    hidden_states = torch.randn(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_ids = (
+        torch.rand(num_tokens, num_experts, device="cuda", generator=generator)
+        .argsort(dim=1)[:, :top_k]
+        .to(torch.int32)
+    )
+    topk_weights = torch.rand(num_tokens, top_k, device="cuda", generator=generator)
+    return raw, module, w13_bias, w2_bias, hidden_states, topk_ids, topk_weights
+
+
+def _run_gfx1250_decode_moe(module, hidden_states, topk_ids, topk_weights):
+    return _gfx1250_static_moe(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        module.w13_weight_triton_tensor,
+        module.w2_weight_triton_tensor,
+        w13_bias=module.w13_weight_bias,
+        w2_bias=module.w2_weight_bias,
+        w13_mx_scale=module.w13_precision_config.b_mx_scale,
+        w2_mx_scale=module.w2_precision_config.b_mx_scale,
+        activation_dtype="fp8",
+        decode=True,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 5, 16])
+def test_gfx1250_decode_moe_skips_idle_experts(num_tokens: int) -> None:
+    """Long-K gate/up and short-K down decode tiles over a sparse routing."""
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 MXFP4 MoE decode kernel")
+
+    raw, module, w13_bias, w2_bias, hidden_states, topk_ids, topk_weights = (
+        _sparse_decode_moe_case(num_tokens)
+    )
+    actual = _run_gfx1250_decode_moe(module, hidden_states, topk_ids, topk_weights)
+    expected = _fp8_mxfp4_swiglu_moe_reference(
+        hidden_states,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        w13_bias,
+        raw["w2_weight"],
+        raw["w2_scale"],
+        w2_bias,
+        topk_ids,
+        topk_weights,
+    )
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(expected).item() > 0
+    # The reference rounds the intermediate to BF16 before its FP8 cast, so an
+    # element on an FP8 rounding boundary can land one step away after the
+    # 2048-long gate/up reduction.
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=2e-2)
+
+
+def test_gfx1250_decode_moe_reuses_binaries_across_batch_sizes() -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 MXFP4 MoE decode kernel")
+
+    _, module, _, _, hidden_states, topk_ids, topk_weights = _sparse_decode_moe_case(16)
+    # Four routed rows per token: 1 token warms the non-divisible row-count
+    # class and 4 tokens the divisible-by-16 class.
+    for num_tokens in (1, 4):
+        _run_gfx1250_decode_moe(
+            module,
+            hidden_states[:num_tokens],
+            topk_ids[:num_tokens],
+            topk_weights[:num_tokens],
+        )
+    torch.cuda.synchronize()
+    with assert_no_triton_compile(gfx1250_fused._matmul_decode):
+        for num_tokens in (2, 3, 8, 13, 16):
+            _run_gfx1250_decode_moe(
+                module,
+                hidden_states[:num_tokens],
+                topk_ids[:num_tokens],
+                topk_weights[:num_tokens],
+            )
+        torch.cuda.synchronize()

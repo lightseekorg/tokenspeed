@@ -199,3 +199,104 @@ The kernel takes precomputed routes only as BF16 weights packed with the
 expert ids. With FP32 route weights the routed kernel stops before its
 finalize and `moe_finalize_fuse_shared` combines the per-route outputs with the
 FP32 weights, accumulating in FP32 and rounding once to BF16.
+
+## Shared MoE precision policies
+
+The unquantized Triton MoE normally keeps GEMM1 accumulators in FP32 through
+SiLU and combines route outputs with FP32 weights without intermediate rounding.
+Existing callers retain that behavior.
+
+An execution plan with `precision_policy="bf16_route_accum_fp32"` and an explicit
+positive finite `output_scale` requests these distinct boundaries:
+
+1. Round each GEMM1 gate/up projection to BF16; compute SiLU and multiplication
+   in FP32, then store the intermediate in BF16.
+2. Accumulate GEMM2 in FP32 and store each expert output in BF16.
+3. Multiply each expert output by its unscaled FP32 route weight, then round
+   each weighted route to BF16.
+4. Sum those routes in ascending expert-ID order in FP32, multiply by
+   `output_scale` in FP32, and only then store the final BF16 output.
+
+The result is rank-local: any tensor-parallel reduction is owned by the caller
+and occurs after this final BF16 boundary. Scaling an already-finalized BF16
+sum, or scaling routing weights before the per-route rounding, is not equivalent.
+Routing must independently implement the caller's selection and normalization
+contract. The expert kernel does not renormalize or rescale route weights.
+
+The runtime's existing `MoELayer` accepts this policy through `routing_config`
+keys `precision_policy` and `output_scale`. It requires unquantized BF16 SiLU,
+precomputed FP32 top-k weights, unit `routed_scaling_factor`, no expert bias, and
+no expert-parallel/all-to-all mode. Automatic backend selection chooses the
+shared Triton BF16 implementation. An explicitly requested unsupported backend
+fails closed; CUTLASS is not declared equivalent to these rounding boundaries.
+No new scheduling or model execution path is introduced.
+
+This correctness-first policy sorts the small selected-expert list before the
+existing dispatch. It is not a performance claim; check its numerics and graph
+replay before using its results as an optimization baseline.
+
+## Vendor policy `bf16_vendor_fp32_route`
+
+`precision_policy="bf16_vendor_fp32_route"` runs FlashInfer's TRT-LLM BF16
+experts (`--moe-backend flashinfer_trtllm`) with the DeepSeekV3 correction bias
+added in FP32. It is a different arithmetic contract, not an equivalent of
+`bf16_route_accum_fp32`:
+
+| Step | `bf16_route_accum_fp32` | `bf16_vendor_fp32_route` |
+| --- | --- | --- |
+| Route weights | Unscaled FP32 | Routed scale applied, rounded to BF16 for the kernel |
+| GEMM1 gate/up | Rounded to BF16 | Not rounded |
+| Weighted route | Each route rounded to BF16 | Not rounded |
+| Combine | Ascending expert ID, FP32, times `output_scale` | Vendor slot order, FP32 |
+| Output scale | `output_scale` | Must be 1 |
+
+`MoELayer` accepts it for BF16 unquantized SiLU experts with DeepSeekV3
+routing, without expert bias, all-to-all, `--moe-combine-order slot` or an
+output scale. The policy asks `moe_plan` for `fp32_correction_bias`: the plan
+routes inside the kernel (`flashinfer_trtllm_unquant_moe_apply`) when the
+kernel's hook builds FlashInfer's routing with the FP32 bias
+(`thirdparty/flashinfer/trtllm_bf16_moe.py`), and otherwise plans precomputed
+top-k (`flashinfer_trtllm_unquant_routed_moe_apply`), where the caller's
+router adds the bias in FP32. Under expert parallelism the layer plans
+precomputed top-k. In the kernel, `routing_config["routed_scaling_factor"]`
+is applied to the BF16 route weights; on precomputed routes the caller folds
+it into the FP32 route weights (Beam: in its route epilogue). The intermediate size per partition must be a
+multiple of the kernels' `TRTLLM_UNQUANT_ISPP_ALIGNMENT` (64 where FlashInfer's
+launcher is relaxed, else 128); the policy refuses a size the layer would pad.
+The kernel finalizes its output itself; deferred finalize is refused.
+
+The two routings are not byte-identical: the kernel computes
+`fl32(fl32(s * scale) / fl32(sum + 1e-20))` with its fast-math division, the
+precomputed path `fl32(fl32(s / fl32(sum + 1e-20)) * scale)`
+(Beam's route epilogue with the routed scale, the bytes of TopK's fold). An IEEE
+CPU emulation of the two orders on Beam's routing shape differs in about 5 of
+10^6 BF16 weights. A
+model whose ranks must agree on one routing checks the plan's
+`support_routing` across its MoE group.
+
+## Beam's grouped route
+
+`beam_route_weights` (`python/tokenspeed/runtime/models/beam.py`) routes each
+token with a grouped sigmoid: the FP32 sigmoid of the router logits plus the
+correction bias, the sum of the top two scores in each of 8 groups, the top 4
+groups, the top 8 experts of the kept groups, their unbiased scores renormalized
+(sum plus `1e-20`) and multiplied by the routed scale.
+
+- `grouped_route.torch_grouped_route` is those statements in PyTorch (any device).
+- `_triton/router_select.triton_router_route_lanepar` runs them in one launch,
+  one row per program on one warp, byte for byte: the FP32 sigmoid with Torch's
+  CUDA recipe (libdevice `exp`, inline `add.rn.f32` / `div.rn.f32`, no FTZ), the
+  grouped selection with Torch's radix keys, fill order and trimmed bitonic
+  network (`_triton/grouped_select.py`; the tie permutation is the pinned
+  Torch's), and the epilogue with the sum in Torch's CUDA K8 order
+  `((v0+v4)+(v2+v6)) + ((v1+v5)+(v3+v7))` (`_triton/route_epilogue.py`). Its host
+  guard `router_route_rejection` admits Beam's routing shape only (256 experts,
+  8 groups, top 2 per group, 4 groups, top 8, contiguous FP32 CUDA tensors, at
+  least one row, a scale that rounds to a finite zero or normal FP32). It
+  launches as a programmatic dependent where `pdl_enabled()`.
+
+Beam calls the Triton kernel on NVIDIA SM100 to SM103 where the guard admits the
+call and the Torch statements otherwise. The GPU tests
+(`test/nvidia/ops/moe/test_router_select_cuda.py`) pin Torch's FP32 sigmoid and
+K8 sum order first (a mismatch fails, never skips), then compare the two byte for
+byte on random rows, tie, edge and NaN corpora and in CUDA-graph replay.

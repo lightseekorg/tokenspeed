@@ -23,11 +23,12 @@
 # underlying distribution can be swapped in one place.
 
 import contextlib
+import ctypes
 import importlib
 import importlib.abc
 import importlib.util
 import sys
-from functools import partial
+from functools import cache, partial
 
 import torch
 
@@ -87,11 +88,62 @@ __all__ = [
     "gl",
     "gluon",
     "libdevice",
+    "max_active_ctas",
     "proton",
     "redirect_triton_to_tokenspeed_triton",
     "tl",
     "triton",
 ]
+
+
+@cache
+def max_active_ctas(kernel) -> int:
+    """Return the resident CTAs per SM/CU for a compiled non-cluster kernel.
+
+    The driver accounts for the loaded kernel's registers, shared memory and
+    threads. Results are cached by the device-specific compiled specialization.
+
+    Args:
+        kernel: A compiled Triton or Gluon kernel with one CTA per cluster.
+
+    Returns:
+        The maximum number of simultaneously resident CTAs on one SM/CU.
+    """
+    kernel._init_handles()
+    if kernel.metadata.num_ctas != 1:
+        raise ValueError("CTA occupancy requires a non-cluster kernel")
+    backend = kernel.metadata.target.backend
+    if backend == "cuda":
+        library = ctypes.CDLL("libcuda.so.1")
+        query = library.cuOccupancyMaxActiveBlocksPerMultiprocessor
+    elif backend == "hip":
+        from tokenspeed_triton.backends.amd.driver import (
+            _get_path_to_hip_runtime_dylib,
+        )
+
+        library = ctypes.CDLL(_get_path_to_hip_runtime_dylib())
+        query = library.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor
+    else:
+        raise ValueError(f"Unsupported occupancy backend: {backend}")
+    query.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_size_t,
+    ]
+    query.restype = ctypes.c_int
+    resident = ctypes.c_int()
+    status = query(
+        ctypes.byref(resident),
+        kernel.function,
+        kernel.metadata.num_warps * kernel.metadata.target.warp_size,
+        kernel.metadata.shared,
+    )
+    if status != 0 or resident.value < 1:
+        raise RuntimeError(
+            f"{backend} occupancy query failed: {status}, {resident.value}"
+        )
+    return resident.value
 
 
 _TRITON_SRC = "triton"

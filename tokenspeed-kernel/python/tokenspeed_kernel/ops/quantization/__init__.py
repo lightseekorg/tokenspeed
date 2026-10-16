@@ -20,7 +20,7 @@ from typing import Literal
 
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.selection import SelectedKernel, select_kernel
 from tokenspeed_kernel.signature import (
     dense_format_signature,
     dense_tensor_format,
@@ -296,20 +296,11 @@ def _quantize_fp8_dynamic(
         granularity_trait = "block"
     else:
         granularity_trait = granularity
-    traits = {
-        "granularity": granularity_trait,
-        "scale_encoding": scale_encoding,
-    }
-    if x.ndim == 2:
-        # Rows of a 2-D x, for kernels with a row bound (``m_max``). Kernels
-        # without one ignore it; a kernel with one never gets other ranks.
-        traits["m"] = x.shape[0]
-    signature = format_signature(x=dense_tensor_format(x.dtype))
-    kernel = select_kernel(
-        "quantization",
-        "fp8_with_scale",
-        signature,
-        traits=traits,
+    kernel = _select_fp8_dynamic(
+        x.dtype,
+        x.shape[0] if x.ndim == 2 else None,
+        granularity_trait,
+        scale_encoding,
         solution=solution,
         override=override,
     )
@@ -339,6 +330,50 @@ def _quantize_fp8_dynamic(
         if block_size is not None:
             kernel_args["block_size"] = tuple(block_size)
         return kernel(x, **kernel_args)
+
+
+def _select_fp8_dynamic(
+    dtype: torch.dtype,
+    rows: int | None,
+    granularity_trait: str,
+    scale_encoding: str,
+    *,
+    solution: str | None,
+    override: str | None,
+) -> SelectedKernel:
+    traits = {"granularity": granularity_trait, "scale_encoding": scale_encoding}
+    if rows is not None:
+        # Rows of a 2-D x, for kernels with a row bound (``m_max``). Kernels
+        # without one ignore it; a kernel with one never gets other ranks.
+        traits["m"] = rows
+    return select_kernel(
+        "quantization",
+        "fp8_with_scale",
+        format_signature(x=dense_tensor_format(dtype)),
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+
+def select_fp8_token_quantizer(
+    rows: int, dtype: torch.dtype, *, solution: str | None, override: str | None
+) -> SelectedKernel:
+    """The kernel ``quantize_fp8(x, granularity="token")`` runs for a 2-D ``x``
+    of ``rows`` rows of ``dtype``; nothing is launched.
+
+    Args:
+        rows: Row count of ``x``.
+        dtype: ``x``'s dtype.
+        solution: Restrict ranked selection to one solution, or ``None``.
+        override: Exact kernel name to force, or ``None`` for ranked selection.
+
+    Raises:
+        NoKernelFoundError: No registered kernel serves the call.
+    """
+    return _select_fp8_dynamic(
+        dtype, rows, "token", "float32", solution=solution, override=override
+    )
 
 
 def quantize_fp8_with_scale(
