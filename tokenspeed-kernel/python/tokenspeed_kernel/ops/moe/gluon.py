@@ -89,17 +89,18 @@ def gluon_fp8_channel_bf16_precomputed_moe_apply(
 ) -> torch.Tensor:
     """Experimental TP4/TP8 EP1 experts: FP8 storage, BF16 MFMA, FP32 accumulation.
 
-    Requires the explicit implementation name and matching precision policy.
+    Accepts the default policy and the legacy explicit precision policy.
     Uses pre-existing grouped Gluon stages, not native-FP8 projection kernels.
     The resident codes/scales and unweighted-BF16-before-FP32-combine boundary
     match the channel expert contract; BF16 arithmetic still needs qualification.
     """
-    if (
-        plan.get("apply_kernel_name") != GLUON_FP8_CHANNEL_APPLY
-        or plan.get("precision_policy") != GLUON_FP8_CHANNEL_POLICY
-    ):
+    if plan.get("precision_policy", "default") not in {
+        "default",
+        GLUON_FP8_CHANNEL_POLICY,
+    }:
         raise ValueError(
-            "Gluon BF16-compute channel experts require explicit implementation and precision_policy"
+            "Gluon BF16-compute channel experts require default or "
+            f"{GLUON_FP8_CHANNEL_POLICY} precision_policy"
         )
     if enable_pdl:
         raise ValueError("Gluon channel experts do not support enable_pdl=True")

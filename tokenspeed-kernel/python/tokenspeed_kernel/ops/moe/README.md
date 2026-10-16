@@ -221,6 +221,20 @@ Beam's 320/640/2560 intermediate partitions. No weight shuffle is required.
 Expert-parallel ranks filter IDs to their local contiguous expert interval;
 nonlocal routes contribute zero. The caller owns distributed reduction.
 
+On gfx950, Beam uses `precision_policy="default"` for BF16, FP8 and MXFP4 experts and requests
+precomputed routing, keeping its FP32 route coefficients and applying the routed
+scale exactly once in routing. `--moe-backend auto` uses normal registry
+priorities: Gluon for compatible BF16 and MXFP4 calls; Triton precedes Gluon for FP8.
+Explicit `triton` and `gluon` select within their respective registered backends.
+The Gluon FP8-storage/BF16-compute implementation also accepts the default
+policy; it remains restricted to gfx950, EP1, 256 experts, hidden width 5120,
+intermediate partition 320 or 640, and top-8 routing. Both implementations
+finalize locally. Expert count and top-k are checked by the Gluon launcher
+before GPU execution because the registry plan does not receive those dimensions.
+BF16 and MXFP4 use the selected backend's standard rounding,
+replacing Beam's former opt-in per-weighted-route BF16 rounding and late routed
+scale. NVIDIA retains its existing policies and backend selection.
+
 The first multiplication accumulates in FP32 and retains gate/up in FP32 through
 SiLU and multiplication, rounding only the resulting intermediate to BF16.
 Input quantization uses the public FP8 token operation. The private route

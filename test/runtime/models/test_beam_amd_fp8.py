@@ -110,19 +110,100 @@ def _fp8_layer():
     )
 
 
-def test_amd_fp8_admission_keeps_bf16_experts_on_the_existing_path(
-    server, amd_platform
+@pytest.mark.parametrize("fmt", ["bf16", "fp8_channel", "mxfp4"])
+@pytest.mark.parametrize("backend", ["auto", "triton", "gluon"])
+@pytest.mark.parametrize("tp_size", [4, 8])
+def test_amd_default_formats_select_registry_backend_and_scale_routes_once(
+    server, amd_platform, fmt, backend, tp_size
 ):
+    from test.runtime.models.test_beam_mxfp4 import mxfp4_config
+
+    server(backend)
+    config = tiny_config()
+    config.hidden_size = 5120
+    config.moe_intermediate_size = 2560
+    config.num_experts = 256
+    config.num_experts_per_tok = 8
+    config.n_group = 8
+    config.topk_group = 4
+    quant = {"bf16": None, "fp8_channel": ct(), "mxfp4": mxfp4_config()}[fmt]
+    cls = beam.beam_moe_class(quantized_experts=quant is not None)
+    with torch.device("meta"):
+        layer = cls(
+            config, Mapping(rank=0, world_size=tp_size), 1, "model.layers.1.mlp", quant
+        )
+    experts = layer.experts
+    expected_backend = (
+        backend
+        if backend != "auto"
+        else ("triton" if fmt == "fp8_channel" else "gluon")
+    )
+    assert experts.plan["solution"] == expected_backend
+    assert experts.plan.get("precision_policy", "default") == "default"
+    assert experts.plan.get("output_scale", 1.0) == 1.0
+    assert experts.supports_precomputed_topk
+    assert not experts.support_routing and not experts.supports_deferred_finalize
+    assert layer.gate.weight.dtype == torch.float32
+    layer.gate.e_score_correction_bias = torch.nn.Parameter(
+        torch.zeros(256, dtype=torch.float32)
+    )
+    logits = torch.linspace(-2, 2, 512, dtype=torch.float32).view(2, 256)
+    actual = layer.topk(torch.zeros(2, 5120), logits)
+    expected, ids = beam.beam_route_weights(
+        logits, layer.gate.e_score_correction_bias, 8, True, 8, 4, None
+    )
+    assert torch.equal(actual.topk_ids, ids)
+    assert actual.topk_weights.dtype == torch.float32
+    assert torch.equal(actual.topk_weights, expected * config.routed_scaling_factor)
+    assert layer.topk.topk_config.routed_scaling_factor is None
+
+
+@pytest.mark.parametrize("backend", ["auto", "triton", "gluon"])
+def test_amd_default_still_refuses_nvfp4(server, amd_platform, backend):
+    from test.runtime.models.test_beam_moe_quant import NVFP4
+
+    server(backend)
+    with pytest.raises(ValueError, match="NVFP4 experts require NVIDIA"):
+        beam.BeamVendorMoE(
+            tiny_config(), Mapping(rank=0, world_size=1), 1, "model.layers.1.mlp", NVFP4
+        )
+
+
+@pytest.mark.parametrize("backend", ["auto", "triton"])
+def test_nvidia_default_keeps_bf16_policy_and_late_scale(server, amd_platform, backend):
+    server(backend)
+    Platform.override(
+        dataclasses.replace(
+            current_platform(), vendor="nvidia", arch_version=ArchVersion(10, 3)
+        )
+    )
+    cls = beam.beam_moe_class()
+    assert cls is beam.BeamMoE
+    layer = cls(tiny_config(), Mapping(rank=0, world_size=1), 1, "model.layers.1.mlp")
+    assert layer.experts.plan["precision_policy"] == "bf16_route_accum_fp32"
+    assert layer.experts.plan["output_scale"] == 2.5
+    assert layer.route_scale is None
+    assert (
+        layer.experts.plan["apply_kernel_name"] == "triton_bf16_precomputed_moe_apply"
+    )
+    with pytest.raises(ValueError, match="flashinfer_trtllm"):
+        beam.beam_moe_class(quantized_experts=True)
+
+
+def test_amd_fp8_and_bf16_admission_share_the_default_path(server, amd_platform):
     server("triton")
     assert beam.beam_moe_class(quantized_experts=True) is beam.BeamVendorMoE
-    assert beam.beam_moe_class(quantized_experts=False) is beam.BeamMoE
+    assert beam.beam_moe_class(quantized_experts=False) is beam.BeamVendorMoE
 
 
-def test_amd_fp8_layer_keeps_checkpoint_codes_and_channel_scales(server, amd_platform):
-    server("triton")
+@pytest.mark.parametrize("backend", ["auto", "triton"])
+def test_amd_fp8_layer_keeps_checkpoint_codes_and_channel_scales(
+    server, amd_platform, backend
+):
+    server(backend)
     layer = _fp8_layer()
     experts = layer.experts
-    assert experts.plan["precision_policy"] == "fp8ch_route_accum_fp32"
+    assert experts.plan.get("precision_policy", "default") == "default"
     assert (
         experts.plan["apply_kernel_name"]
         == "triton_fp8_channel_fused_precomputed_moe_apply"
@@ -239,20 +320,59 @@ def test_portable_fp8_layer_refuses_an_incompatible_precision_contract(
         )
 
 
-def test_amd_fp8_precision_policy_refuses_another_leaf(
-    server, amd_platform, monkeypatch
+@pytest.mark.parametrize(
+    "capability", ["compatible", "kernel_routing", "deferred_finalize"]
+)
+def test_amd_fp8_auto_respects_registered_capabilities(
+    server, amd_platform, capability
 ):
-    server("triton")
-    real_plan = expert_module.kernel_moe_plan
+    from tokenspeed_kernel.registry import KernelRegistry
 
-    def wrong_leaf(*args, **kwargs):
-        plan = real_plan(*args, **kwargs)
-        plan["apply_kernel_name"] = "triton_fp8_channel_precomputed_moe_apply"
-        return plan
+    server("auto")
+    registry = KernelRegistry.get()
+    original = registry.get_by_name("triton_fp8_channel_fused_precomputed_moe_apply")
+    traits = dict(original.traits)
+    if capability == "kernel_routing":
+        traits["routing_mode"] = frozenset({"kernel_routing"})
+    elif capability == "deferred_finalize":
+        traits["supports_deferred_finalize"] = frozenset({True})
+    candidate = dataclasses.replace(
+        original,
+        name="test_compatible_fp8_apply",
+        priority=original.priority + 1,
+        traits=traits,
+    )
+    registry.register(candidate, registry.get_impl(original.name))
+    try:
+        if capability == "deferred_finalize":
+            with pytest.raises(NotImplementedError, match="finalized"):
+                _fp8_layer()
+            return
+        layer = _fp8_layer()
+        expected = original.name if capability == "kernel_routing" else candidate.name
+        assert layer.experts.plan["apply_kernel_name"] == expected
+        assert not layer.kernel_routing
+        assert layer.experts.supports_precomputed_topk
+        assert not layer.experts.supports_deferred_finalize
+    finally:
+        registry._unregister(candidate.name)
 
-    monkeypatch.setattr(expert_module, "kernel_moe_plan", wrong_leaf)
-    with pytest.raises(ValueError, match="does not implement fp8ch_route_accum_fp32"):
-        _fp8_layer()
+
+@pytest.mark.parametrize("backend", ["auto", "triton"])
+def test_amd_fp8_route_applies_the_scale_once(server, amd_platform, backend):
+    server(backend)
+    layer = _fp8_layer()
+    layer.gate.e_score_correction_bias.data.zero_()
+    logits = torch.arange(16, dtype=torch.float32).view(2, 8) / 10
+    hidden = torch.zeros(2, 128)
+    actual = layer.topk(hidden, logits)
+    expected, ids = beam.beam_route_weights(
+        logits, layer.gate.e_score_correction_bias, 2, True, 2, 1, None
+    )
+    assert actual.topk_weights.dtype == torch.float32
+    assert torch.equal(actual.topk_ids, ids)
+    assert torch.equal(actual.topk_weights, expected * 2.5)
+    assert layer.experts.plan.get("output_scale", 1.0) == 1.0
 
 
 @pytest.mark.parametrize("ep_size", [1, 4])
@@ -291,13 +411,15 @@ def test_amd_fp8_moe_partial_takes_one_shared_allreduce(
     assert reductions == [(0, 1, 2, 3)]
 
 
-@pytest.mark.parametrize("backend", ["auto", "flashinfer_cutlass"])
+@pytest.mark.parametrize("backend", ["flashinfer_cutlass"])
 def test_amd_quantized_admission_refuses_unqualified_backends(
     server, amd_platform, backend
 ):
     server(backend)
-    with pytest.raises(ValueError, match="gfx950 with --moe-backend triton"):
-        beam.beam_moe_class(quantized_experts=True)
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    with pytest.raises(NoKernelFoundError):
+        _fp8_layer()
 
 
 def test_beam_amd_keeps_unfused_boundaries_when_fusion_is_requested(
@@ -321,7 +443,7 @@ def test_beam_amd_does_not_admit_other_architectures(server, amd_platform):
     Platform.override(
         dataclasses.replace(current_platform(), arch_version=ArchVersion(12, 5))
     )
-    with pytest.raises(ValueError, match="gfx950 with --moe-backend triton"):
+    with pytest.raises(ValueError, match="gfx950 with --moe-backend auto"):
         beam.beam_moe_class(quantized_experts=True)
 
 

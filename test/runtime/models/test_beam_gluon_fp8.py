@@ -74,7 +74,9 @@ def test_explicit_policy_selects_registered_gluon_and_preserves_storage(
 
 
 @pytest.mark.parametrize("tp_size", [4, 8])
-def test_beam_explicit_selector_carries_policy_and_original_router(server, tp_size):
+def test_beam_explicit_selector_carries_default_policy_and_original_router(
+    server, tp_size
+):
     server("gluon")
     config = tiny_config()
     config.hidden_size = 5120
@@ -94,11 +96,11 @@ def test_beam_explicit_selector_carries_policy_and_original_router(server, tp_si
             ct(),
         )
     assert layer.experts.plan["apply_kernel_name"] == KERNEL
-    assert layer.experts.plan["precision_policy"] == POLICY
+    assert layer.experts.plan.get("precision_policy", "default") == "default"
     assert layer.route_scale == config.routed_scaling_factor
     assert layer.gate.weight.dtype == torch.float32
     assert layer.topk.topk_config.routed_scaling_factor is None
-    assert beam.beam_moe_class(quantized_experts=False) is beam.BeamMoE
+    assert beam.beam_moe_class(quantized_experts=False) is beam.BeamVendorMoE
 
 
 @pytest.mark.parametrize("backend", ["triton", "auto", "flashinfer_trtllm"])
@@ -128,7 +130,7 @@ def test_candidate_policy_refuses_unsupported_contract(server, overrides):
         make_experts(8, **overrides)
 
 
-def test_triton_policy_and_beam_unquantized_default_remain_unchanged(server):
+def test_legacy_triton_policy_remains_available(server):
     server("triton")
     experts = make_experts(
         8, routing_config={"precision_policy": "fp8ch_route_accum_fp32"}
@@ -138,12 +140,14 @@ def test_triton_policy_and_beam_unquantized_default_remain_unchanged(server):
         == "triton_fp8_channel_fused_precomputed_moe_apply"
     )
     assert experts.plan["precision_policy"] == "fp8ch_route_accum_fp32"
-    assert beam.beam_moe_class(quantized_experts=False) is beam.BeamMoE
+    assert beam.beam_moe_class(quantized_experts=False) is beam.BeamVendorMoE
 
 
-def test_gluon_beam_refuses_unquantized_experts(server):
+def test_gluon_beam_refuses_unsupported_unquantized_geometry(server):
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
     server("gluon")
-    with pytest.raises(ValueError, match="requires FP8 experts"):
+    with pytest.raises(NoKernelFoundError):
         beam.BeamVendorMoE(
             tiny_config(), Mapping(rank=0, world_size=1), 1, "model.layers.1.mlp", None
         )

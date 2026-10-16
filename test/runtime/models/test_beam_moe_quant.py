@@ -30,6 +30,7 @@ instead.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import logging
 import os
@@ -40,6 +41,7 @@ from unittest import mock
 import pytest
 import torch
 from safetensors.torch import save_file
+from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
 from tokenspeed_kernel.thirdparty.flashinfer import trtllm_bf16_moe
 
 from tokenspeed.runtime.configs import model_config as model_config_module
@@ -83,6 +85,17 @@ ROUTED_APPLY = "flashinfer_trtllm_unquant_routed_moe_apply"
 FP8_ROUTED = "flashinfer_trtllm_fp8_channel_routed_moe_apply"
 NVFP4_ROUTED = "flashinfer_trtllm_nvfp4_routed_moe_apply"
 FP8 = torch.float8_e4m3fn
+
+
+@pytest.fixture(autouse=True)
+def nvidia_platform():
+    """These vendor policy and launch tests exercise the NVIDIA path on CPU."""
+    original = current_platform()
+    Platform.override(
+        dataclasses.replace(original, vendor="nvidia", arch_version=ArchVersion(10, 3))
+    )
+    yield
+    Platform.override(original)
 
 
 def _moe(mapping=None, config=None, cls=None):

@@ -112,10 +112,10 @@ def test_beam_mxfp4_keeps_packed_experts_and_bf16_dense_weights(
     assert model.load_weights(checkpoint.items()) == checkpoint.keys()
     moe = model.model.layers[1].mlp
     experts = moe.experts
-    assert experts.plan["precision_policy"] == "mxfp4_route_accum_fp32"
+    assert experts.plan.get("precision_policy", "default") == "default"
     assert experts.plan["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
-    assert experts.plan["output_scale"] == 2.5
-    assert moe.route_scale is None and not experts.supports_deferred_finalize
+    assert experts.plan.get("output_scale", 1.0) == 1.0
+    assert moe.route_scale == 2.5 and not experts.supports_deferred_finalize
     width = 512 // world
     channels = slice(rank * width, (rank + 1) * width)
     packed_channels = slice(rank * width // 2, (rank + 1) * width // 2)
@@ -190,12 +190,12 @@ def test_beam_mxfp4_refuses_unpacked_selected_experts():
 def test_beam_mxfp4_refuses_unqualified_backends_and_expert_parallelism(
     server, amd_platform, backend, ep
 ):
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
     server(backend)
     config = tiny_config()
     config.moe_intermediate_size = 512
     config.num_key_value_heads = 8
     mapping = Mapping(rank=0, world_size=4, moe_ep_size=ep)
-    with pytest.raises(
-        ValueError, match="mxfp4_route_accum_fp32 requires|MXFP4 experts require"
-    ):
+    with pytest.raises(NoKernelFoundError):
         BeamForCausalLM(config, mapping, mxfp4_config())

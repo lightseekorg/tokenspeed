@@ -919,11 +919,10 @@ class BeamVendorMoE(BeamMoE):
     Beam's routes with their FP32 weights; the kernel quantizes its input per
     token.
 
-    On AMD gfx950 with ``--moe-backend triton``, FP8 per-channel experts use
-    the portable registered kernel and ``fp8ch_route_accum_fp32`` policy.
-    It takes the same checkpoint layout and precomputed FP32 routes.
-    Quark MXFP4 experts use ``mxfp4_route_accum_fp32``: each weighted BF16
-    route rounds to BF16 before FP32 summation and the late routed scale.
+    On AMD gfx950, BF16, FP8 per-channel and Quark MXFP4 experts use the default
+    precision policy and registry selection, with precomputed FP32 routes.
+    Explicit backend selection is passed through to the registry. Routing
+    applies the routed scale once; experts use their standard default arithmetic.
     """
 
     def __init__(
@@ -938,13 +937,19 @@ class BeamVendorMoE(BeamMoE):
         if not config.norm_topk_prob:
             raise NotImplementedError("Beam's vendor MoE requires normalized routes")
         fmt = None if quant_config is None else beam_checkpoint_format(quant_config)
+        platform = current_platform()
+        amd_default = platform.is_amd and platform.arch_version == ArchVersion(9, 5)
+        if platform.is_amd and fmt == "nvfp4":
+            raise ValueError("Beam NVFP4 experts require NVIDIA vendor MoE")
         policy = {
             None: BEAM_MOE_VENDOR_POLICY,
             "nvfp4": BEAM_MOE_NVFP4_POLICY,
             "mxfp4": BEAM_MOE_MXFP4_POLICY,
             "fp8_channel": BEAM_MOE_FP8_POLICY,
         }[fmt]
-        if get_moe_backend().value == "triton":
+        if amd_default:
+            policy = "default"
+        elif get_moe_backend().value == "triton":
             if fmt not in {"fp8_channel", "mxfp4"}:
                 raise ValueError(
                     "Beam's portable finalized MoE requires FP8 or MXFP4 experts"
@@ -956,24 +961,31 @@ class BeamVendorMoE(BeamMoE):
         elif get_moe_backend().value == "gluon":
             if fmt != "fp8_channel":
                 raise ValueError("Beam's Gluon finalized MoE requires FP8 experts")
-            # Explicit opt-in: FP8 resident codes, BF16 projection operands.
             policy = BEAM_MOE_GLUON_FP8_POLICY
         adapted = copy(config)
         adapted.moe_precision_policy = policy
+        if amd_default:
+            # Beam owns grouped selection and folds the routed scale into its
+            # FP32 coefficients once, independent of the selected expert backend.
+            adapted.moe_routing_mode = "precomputed_topk"
         adapted.moe_output_scale = (
-            config.routed_scaling_factor if fmt == "mxfp4" else 1.0
+            config.routed_scaling_factor if fmt == "mxfp4" and not amd_default else 1.0
         )
-        if fmt == "mxfp4":
+        if fmt == "mxfp4" and not amd_default:
             # Preserve the BF16 reference's unscaled routes and late output scale.
             adapted.routed_scaling_factor = 1.0
         self._init_moe(adapted, mapping, layer_id, prefix, quant_config)
         experts = self.experts
         self.kernel_routing = experts.support_routing
         if (
-            experts.plan.get("precision_policy") != policy
-            or experts.plan.get("output_scale") != adapted.moe_output_scale
+            (not amd_default and experts.plan.get("precision_policy") != policy)
+            or experts.plan.get("output_scale", 1.0) != adapted.moe_output_scale
             or experts.supports_deferred_finalize
             or self.kernel_routing != self.topk.topk_config.output_format.is_bypassed()
+            or (
+                amd_default
+                and (self.kernel_routing or not experts.supports_precomputed_topk)
+            )
         ):
             raise NotImplementedError(
                 f"Beam's vendor MoE requires the finalized {policy} policy"
@@ -997,7 +1009,11 @@ class BeamVendorMoE(BeamMoE):
             self.topk.topk_config.custom_routing_function = self._route
             self.topk.topk_config.correction_bias = None
             # _route's epilogue applies the routed scale; TopK must not again.
-            self.route_scale = None if fmt == "mxfp4" else config.routed_scaling_factor
+            self.route_scale = (
+                None
+                if fmt == "mxfp4" and not amd_default
+                else config.routed_scaling_factor
+            )
             self.topk.topk_config.routed_scaling_factor = None
         if layer_id == config.mlp_layer_types.index("sparse"):
             logger.info(
@@ -1063,25 +1079,19 @@ def beam_moe_class(quantized_experts: bool = False) -> type[BeamMoE]:
 
     ``--moe-backend flashinfer_trtllm`` (Beam's model default on NVIDIA SM100 to
     SM103 where the policy starts) selects :class:`BeamVendorMoE`; every other
-    backend keeps BeamMoE. AMD gfx950 with explicit ``triton`` selects the
-    finalized FP8 or MXFP4 path; explicit ``gluon`` selects finalized FP8
-    with BF16 projection operands.
+    backend keeps BeamMoE. AMD gfx950 uses the finalized default-policy path
+    for BF16, FP8 and MXFP4 experts, with backend selection left to the registry.
     Unsupported quantized backends fail before loading.
     """
     if get_moe_backend().value == "flashinfer_trtllm":
         return BeamVendorMoE
     platform = current_platform()
-    if (
-        quantized_experts
-        and get_moe_backend().value in {"triton", "gluon"}
-        and platform.is_amd
-        and platform.arch_version == ArchVersion(9, 5)
-    ):
+    if platform.is_amd and platform.arch_version == ArchVersion(9, 5):
         return BeamVendorMoE
     if quantized_experts:
         raise ValueError(
-            "Beam runs FP8 experts on AMD gfx950 with --moe-backend triton "
-            "or explicit --moe-backend gluon (BF16 projection operands); "
+            "Beam runs FP8 experts on AMD gfx950 with --moe-backend auto, triton "
+            "or gluon (BF16 projection operands); "
             "NVFP4 and NVIDIA FP8 experts use the vendor MoE, which needs "
             "--moe-backend flashinfer_trtllm (Beam's default on NVIDIA SM100 "
             f"to SM103 where it applies), not {get_moe_backend().value}"
