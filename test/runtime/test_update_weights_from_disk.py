@@ -324,8 +324,7 @@ class TestRealCheckpoint:
         assert (runner.model_config.model_path) == (str(self.root / "step-1"))
 
     def test_non_unit_kv_scale_fails_the_update(self):
-        # A reload keeps the startup KV-cache scales, as a distributed update
-        # does.
+        # A reload keeps the startup KV-cache scales, as a distributed update does.
         directory = self.root / "scaled"
         directory.mkdir()
         save_file(

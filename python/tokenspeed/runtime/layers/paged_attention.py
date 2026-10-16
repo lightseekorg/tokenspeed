@@ -162,9 +162,7 @@ class PagedAttention(nn.Module):
         self._group_id: str | None = None
         self.rotary_emb = rotary_emb
         self.qk_norm = qk_norm
-        # Per-tensor scales of an FP8 KV cache from the checkpoint
-        # (load_kv_cache_scale); None at unit scale. A cache of another dtype
-        # ignores them, as the write and the attention reads both do.
+        # Per-tensor FP8 KV-cache scales (None at unit); a non-FP8 cache ignores them.
         self.fp8_kv_scales: FP8TensorScales | None = None
 
     def load_kv_cache_scale(self, name: str, scale: torch.Tensor) -> None:
