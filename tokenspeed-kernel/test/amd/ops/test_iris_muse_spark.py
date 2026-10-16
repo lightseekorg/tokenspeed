@@ -418,7 +418,7 @@ def _muse_boundary_worker(rank, world_size, device, sharded):
 def _muse_collective_policy_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
         iris_lamport_bf16_allreduce,
-        iris_pull_twoshot_allreduce,
+        iris_pull_twoshot,
         iris_push_twoshot_allreduce,
     )
     from utils import assert_no_triton_compile
@@ -480,6 +480,7 @@ def _muse_collective_policy_worker(rank, world_size, device):
     state.reduction.epochs.fill_(2**32 - 4)
     state.reduction.ready_flags.fill_(2**32 - 4)
     state.reduction.lamport_epochs.fill_(2)
+    state.all_reduce.producer_pull.ready_flags.fill_(2**31 - 4)
     torch.cuda.synchronize()
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
@@ -518,7 +519,7 @@ def _muse_collective_policy_worker(rank, world_size, device):
     with assert_no_triton_compile(
         iris_lamport_bf16_allreduce,
         iris_push_twoshot_allreduce,
-        iris_pull_twoshot_allreduce,
+        iris_pull_twoshot,
     ):
         for rows in (3, 17, 127, 130):
             branch = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
@@ -530,8 +531,10 @@ def _muse_collective_policy_worker(rank, world_size, device):
                 rtol=0,
                 atol=0,
             )
-    for numel in (512, 44 * 4096, 129 * 8192):
-        ordinary = torch.full((numel,), rank + 1, dtype=torch.bfloat16, device=device)
+    for numel, offset in ((512, 0), (44 * 4096, 0), (129 * 8192, 4 * (rank % 2))):
+        storage = torch.full((numel + 8,), -19, dtype=torch.bfloat16, device=device)
+        ordinary = storage[offset : offset + numel]
+        ordinary.fill_(rank + 1)
         result = state.reduce(ordinary)
         assert result.data_ptr() == ordinary.data_ptr()
         torch.testing.assert_close(
@@ -540,6 +543,27 @@ def _muse_collective_policy_worker(rank, world_size, device):
             rtol=0,
             atol=0,
         )
+        torch.testing.assert_close(
+            storage[:offset], torch.full_like(storage[:offset], -19), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            storage[offset + numel :],
+            torch.full_like(storage[offset + numel :], -19),
+            rtol=0,
+            atol=0,
+        )
+
+    # The borrowed output has full capacity; reduce only the active prefix.
+    numel = 129 * 8192
+    branch = state.all_reduce.acquire_outputs(((numel,),))[0]
+    base = (torch.arange(numel, device=device) % 17).float() / 32
+    branch.copy_(base + (rank + 1) / 8)
+    tail = state.gather.output[numel : numel + 128]
+    tail.fill_(-19)
+    output = state.reduce_outputs((branch,))[0]
+    expected = (world_size * base + world_size * (world_size + 1) / 16).bfloat16()
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(tail, torch.full_like(tail, -19), rtol=0, atol=0)
 
 
 def _muse_owned_packet_worker(rank, world_size, device):

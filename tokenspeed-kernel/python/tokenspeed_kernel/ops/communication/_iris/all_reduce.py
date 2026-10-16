@@ -294,6 +294,7 @@ class ProducerPull:
         )
 
     def run(self, out: torch.Tensor) -> None:
+        assert out.data_ptr() % _PACKED_WORD_BYTES == 0
         peers = self.producer.peers
         inputs = self.producer.data
         if _use_two_stage_producer_direct(peers.world_size, out.numel(), inputs.dtype):
@@ -1691,19 +1692,7 @@ class ProducerAllReduce:
             return self.push_output
         if input.data_ptr() != self.pull.producer.data.data_ptr():
             self.pull.producer.data[:numel].copy_(input.view(-1))
-        iris_pull_twoshot_allreduce[(_PULL_MAX_PROGRAMS,)](
-            self.pull.producer.data,
-            self.pull.scratch,
-            output,
-            self.ready_flags,
-            self.epochs,
-            self.pull.producer.peers.addresses[: self.world_size],
-            numel,
-            RANK=self.pull.producer.peers.rank,
-            BLOCK=2048,
-            NUM_SUBGROUPS=4,
-            num_warps=4,
-        )
+        self.pull.run(output.view(-1)[:numel])
         return output
 
 
@@ -1930,67 +1919,6 @@ def iris_push_twoshot_allreduce(
     _iris_drain_subgroup_vmem()
     gl.barrier()
     _iris_rendezvous(flags, heaps, block, epoch, RANK, NUM_SUBGROUPS, False)
-    gl.store(epochs + block, epoch)
-
-
-@gluon.jit(do_not_specialize=["numel"])
-def iris_pull_twoshot_allreduce(
-    input_ptr,
-    scratch_ptr,
-    output_ptr,
-    flags,
-    epochs,
-    heaps,
-    numel,
-    RANK: gl.constexpr,
-    BLOCK: gl.constexpr,
-    NUM_SUBGROUPS: gl.constexpr,
-):
-    """Reduce BF16 input partitions, then gather the full result locally.
-
-    Each rank pulls its consecutive partition of input_ptr from all peers, sums
-    in FP32, and stores BF16 values in scratch_ptr. After exchanging ready
-    counters, pull each peer's scratch into output_ptr. The next invocation's
-    entry wait protects scratch while peers finish reading the previous result.
-    """
-    WORLD_SIZE: gl.constexpr = len(heaps)
-    inputs = _iris_peer_pointers(input_ptr, heaps, RANK)
-    scratch = _iris_peer_pointers(scratch_ptr, heaps, RANK)
-    block = gl.program_id(0)
-    epoch = gl.load(epochs + block).to(gl.uint32) + 2
-    _iris_rendezvous(flags, heaps, block, epoch - 1, RANK, NUM_SUBGROUPS, True)
-    part = gl.multiple_of(numel // WORLD_SIZE, 8)
-    layout: gl.constexpr = gl.BlockedLayout([8], [64], [NUM_SUBGROUPS], [0])
-    offsets = gl.arange(0, BLOCK, layout=layout)
-    for tile in range(block, gl.cdiv(part, BLOCK), gl.num_programs(0)):
-        index = tile * BLOCK + offsets
-        mask = index < part
-        values = ()
-        for peer in gl.static_range(WORLD_SIZE):
-            values += (
-                gl.amd.cdna4.buffer_load(
-                    inputs[peer], RANK * part + index, mask, 0, cache=".cg"
-                ).to(gl.float32),
-            )
-        result = (values[0] + values[1]) + (values[2] + values[3])
-        if WORLD_SIZE == 8:
-            result += (values[4] + values[5]) + (values[6] + values[7])
-        result = result.to(gl.bfloat16)
-        gl.amd.cdna4.buffer_store(result, scratch_ptr, index, mask, cache=".wt")
-    _iris_drain_subgroup_vmem()
-    gl.barrier()
-    _iris_rendezvous(flags, heaps, block, epoch, RANK, NUM_SUBGROUPS, False)
-    for tile in range(block, gl.cdiv(part, BLOCK), gl.num_programs(0)):
-        index = tile * BLOCK + offsets
-        mask = index < part
-        for step in gl.static_range(WORLD_SIZE):
-            peer = (RANK + step) % WORLD_SIZE
-            values = gl.amd.cdna4.buffer_load(
-                scratch[(RANK + step) % WORLD_SIZE], index, mask, 0, cache=".cg"
-            )
-            gl.amd.cdna4.buffer_store(values, output_ptr, peer * part + index, mask)
-    # Phase two proves every peer consumed the old input. The next scratch
-    # writer must enter an all-peer rendezvous after these gathers complete.
     gl.store(epochs + block, epoch)
 
 
