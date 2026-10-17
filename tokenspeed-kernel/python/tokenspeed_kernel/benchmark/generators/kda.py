@@ -64,16 +64,19 @@ class _KdaModelProfile:
     head_dim: int
     projection_width: int
     beta_offset: int
-    # Output-gate and decay-gate (f_a) columns, set when the projection feeds
-    # the fused pre-convolution kernels.
-    gate_offset: int | None = None
+    # Decay-gate (f_a) column, set when the projection feeds the fused
+    # pre-convolution kernels.
     f_a_offset: int | None = None
 
 
 _MODEL_PROFILES = {
-    # Rows are [q | k | v | beta | f_a | f_b].
+    # Rows are [q | k | v | beta | f_a | g_a].
     "glm53_flash_tp4": _KdaModelProfile(
-        heads=16, head_dim=128, projection_width=6416, beta_offset=6144
+        heads=16,
+        head_dim=128,
+        projection_width=6416,
+        beta_offset=6144,
+        f_a_offset=6160,
     ),
     # KimiKDAMergedProj rows are [q | k | v | g | f_a | beta | pad].
     "kimi_k3_tp8": _KdaModelProfile(
@@ -81,7 +84,6 @@ _MODEL_PROFILES = {
         head_dim=128,
         projection_width=6288,
         beta_offset=6272,
-        gate_offset=4608,
         f_a_offset=6144,
     ),
 }
@@ -621,7 +623,7 @@ def _bool_parameter(parameters: dict[str, Any], name: str) -> bool:
 
 def _fused_profile(model_profile: str) -> _KdaModelProfile:
     profile = _MODEL_PROFILES[model_profile]
-    if profile.gate_offset is None or profile.f_a_offset is None:
+    if profile.f_a_offset is None:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
             f"KDA {model_profile} does not project inputs for the fused kernels",
@@ -634,7 +636,6 @@ class _FusedProjection:
     """Strided views of one packed KDA input projection."""
 
     mixed_qkv: torch.Tensor
-    output_gate: torch.Tensor
     f_a_out: torch.Tensor
     beta_logits: torch.Tensor
 
@@ -658,7 +659,6 @@ def _fused_projection(
 
     return _FusedProjection(
         mixed_qkv=columns(0, 3 * width),
-        output_gate=columns(profile.gate_offset, width),
         f_a_out=columns(profile.f_a_offset, profile.head_dim),
         beta_logits=columns(profile.beta_offset, profile.heads),
     )
