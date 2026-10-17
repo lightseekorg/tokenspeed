@@ -51,38 +51,31 @@ def mxfp4_config():
 
 
 @pytest.mark.parametrize(
-    "quantized,policy,weight_label",
-    [
-        (False, "bf16_route_accum_fp32", "unquantized"),
-        (True, "mxfp4_route_accum_fp32", "MXFP4"),
-    ],
-)
-@pytest.mark.parametrize(
     "backend,input_dtype,diagnostic",
     [
-        ("triton", torch.float16, "requires BF16 input and {weight_label} weights"),
+        ("triton", torch.float16, "requires BF16 input and unquantized weights"),
         (
             "gluon",
             torch.bfloat16,
-            "requires --moe-backend triton for {weight_label} weights",
+            "requires --moe-backend triton for unquantized weights",
         ),
     ],
 )
-def test_precision_policy_errors_distinguish_input_and_weight_formats(
-    server, quantized, policy, weight_label, backend, input_dtype, diagnostic
+def test_bf16_precision_policy_keeps_input_and_backend_validation(
+    server, backend, input_dtype, diagnostic
 ):
     server(backend)
     torch.set_default_dtype(input_dtype)
-    with pytest.raises(ValueError, match=diagnostic.format(weight_label=weight_label)):
+    with pytest.raises(ValueError, match=diagnostic):
         MoELayer(
             top_k=2,
             num_experts=4,
             hidden_size=128,
             intermediate_size=512,
-            quant_config=mxfp4_config() if quantized else None,
+            quant_config=None,
             layer_index=1,
             prefix="model.layers.1.mlp.experts",
-            routing_config={"precision_policy": policy},
+            routing_config={"precision_policy": "bf16_route_accum_fp32"},
         )
 
 

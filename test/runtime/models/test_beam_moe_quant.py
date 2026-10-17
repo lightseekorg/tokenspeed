@@ -490,6 +490,17 @@ def test_quantized_experts_need_the_vendor_moe(server, backend):
             _model(quant_config)
 
 
+@pytest.mark.parametrize("backend", ["auto", "triton", "gluon", "flashinfer_trtllm"])
+def test_nvidia_mxfp4_experts_remain_unsupported(server, backend):
+    from test.runtime.models.test_beam_mxfp4 import mxfp4_config
+
+    server(backend)
+    with pytest.raises(
+        ValueError, match="requires? AMD gfx950|needs --moe-backend flashinfer_trtllm"
+    ):
+        _model(mxfp4_config())
+
+
 def _stacked(tensors, layer, names):
     return torch.cat([tensors[f"{layer}.{name}"] for name in names])
 

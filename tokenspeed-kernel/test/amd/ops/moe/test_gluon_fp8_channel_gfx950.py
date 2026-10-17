@@ -305,7 +305,6 @@ def tp8_channel_fixture():
     _require_device()
     from tokenspeed_kernel.benchmark.generators.moe import _prepare_routed_weights
     from tokenspeed_kernel.ops.moe import moe_plan
-    from tokenspeed_kernel.ops.moe.gluon import GLUON_FP8_CHANNEL_POLICY
 
     native, weights = _prepare_routed_weights(
         weight_dtype_name="fp8_channel",
@@ -327,7 +326,7 @@ def tp8_channel_fixture():
         fast_math=False,
         weight_seed=1861433681,
     )
-    native["precision_policy"] = "fp8ch_route_accum_fp32"
+    native["precision_policy"] = "default"
     candidate = moe_plan(
         weight_dtype="fp8_channel",
         input_dtype=torch.bfloat16,
@@ -344,7 +343,7 @@ def tp8_channel_fixture():
         solution="gluon",
         fast_math=False,
     )
-    candidate["precision_policy"] = GLUON_FP8_CHANNEL_POLICY
+    candidate["precision_policy"] = "default"
     return native, candidate, weights
 
 

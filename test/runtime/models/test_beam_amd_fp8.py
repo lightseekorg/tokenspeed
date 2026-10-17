@@ -316,7 +316,7 @@ def test_portable_fp8_layer_refuses_an_incompatible_precision_contract(
             tp_size=1,
             ep_rank=0,
             ep_size=1,
-            routing_config={"precision_policy": "fp8ch_route_accum_fp32", **change},
+            routing_config={"precision_policy": "default", **change},
         )
 
 

@@ -200,20 +200,20 @@ expert ids. With FP32 route weights the routed kernel stops before its
 finalize and `moe_finalize_fuse_shared` combines the per-route outputs with the
 FP32 weights, accumulating in FP32 and rounding once to BF16.
 
-### Portable MXFP4 route rounding
+### Portable MXFP4 experts
 
-`triton_mxfp4_precomputed_moe_apply` accepts the opt-in precision policy
-`mxfp4_route_accum_fp32`. It requires dynamic MXFP4 activations, BF16 hidden
-states, unscaled FP32 route weights and finalized execution without EP.
-GEMM2 stores BF16 expert outputs. The common combine rounds each weighted route
-to BF16, sums in FP32, applies the plan's finite positive `output_scale`, and
-stores BF16. This preserves a model's late-scaling boundary without rescaling
-an already-finalized BF16 tensor. The default MXFP4 policy is unchanged.
+`triton_mxfp4_precomputed_moe_apply` accepts only the default precision policy
+and unit `output_scale`, with finalized execution without EP. GEMM2 stores
+expert outputs in the input dtype. The combine multiplies route weights and
+sums in FP32 before the final store, without rounding each weighted route.
+Any routed scale belongs in the route weights. Dynamic MXFP4 activations
+support FP16/BF16 inputs; weight-only MXFP4 uses BF16 inputs.
 
 ### Portable FP8 per-channel experts on gfx950
 
 `triton_fp8_channel_fused_precomputed_moe_apply` implements the existing
-`moe.apply` operation with solution `triton`. It consumes contiguous BF16
+`moe.apply` operation with solution `triton` and the default precision policy.
+It consumes contiguous BF16
 inputs, concatenated gate/up FP8 E4M3 weights, FP32 per-output-channel scales,
 precomputed global expert IDs and original FP32 route weights. It accepts
 intermediate widths divisible by 32 and hidden widths divisible by 128, including
@@ -226,7 +226,7 @@ precomputed routing, keeping its FP32 route coefficients and applying the routed
 scale exactly once in routing. `--moe-backend auto` uses normal registry
 priorities: Gluon for compatible BF16 and MXFP4 calls; Triton precedes Gluon for FP8.
 Explicit `triton` and `gluon` select within their respective registered backends.
-The Gluon FP8-storage/BF16-compute implementation also accepts the default
+The Gluon FP8-storage/BF16-compute implementation accepts only the default
 policy; it remains restricted to gfx950, EP1, 256 experts, hidden width 5120,
 intermediate partition 320 or 640, and top-8 routing. Both implementations
 finalize locally. Expert count and top-k are checked by the Gluon launcher

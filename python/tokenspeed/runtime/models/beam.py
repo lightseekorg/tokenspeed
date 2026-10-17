@@ -127,12 +127,9 @@ BEAM_MOE_PRECISION_POLICY = "bf16_route_accum_fp32"
 BEAM_MOE_VENDOR_POLICY = "bf16_vendor_fp32_route"
 # The vendor policy on the NVFP4 experts of a ModelOpt NVFP4 checkpoint.
 BEAM_MOE_NVFP4_POLICY = "nvfp4_vendor_fp32_route"
-BEAM_MOE_MXFP4_POLICY = "mxfp4_route_accum_fp32"
 # The vendor policy on the FP8 per-channel experts of a compressed-tensors FP8
 # dynamic W8A8 checkpoint.
 BEAM_MOE_FP8_POLICY = "fp8ch_vendor_fp32_route"
-BEAM_MOE_TRITON_FP8_POLICY = "fp8ch_route_accum_fp32"
-BEAM_MOE_GLUON_FP8_POLICY = "fp8ch_bf16_route_accum_fp32"
 
 
 def beam_kernels() -> bool:
@@ -941,39 +938,23 @@ class BeamVendorMoE(BeamMoE):
         amd_default = platform.is_amd and platform.arch_version == ArchVersion(9, 5)
         if platform.is_amd and fmt == "nvfp4":
             raise ValueError("Beam NVFP4 experts require NVIDIA vendor MoE")
-        policy = {
-            None: BEAM_MOE_VENDOR_POLICY,
-            "nvfp4": BEAM_MOE_NVFP4_POLICY,
-            "mxfp4": BEAM_MOE_MXFP4_POLICY,
-            "fp8_channel": BEAM_MOE_FP8_POLICY,
-        }[fmt]
         if amd_default:
             policy = "default"
-        elif get_moe_backend().value == "triton":
-            if fmt not in {"fp8_channel", "mxfp4"}:
-                raise ValueError(
-                    "Beam's portable finalized MoE requires FP8 or MXFP4 experts"
-                )
-            if fmt == "fp8_channel":
-                policy = BEAM_MOE_TRITON_FP8_POLICY
         elif fmt == "mxfp4":
-            raise ValueError("Beam MXFP4 experts require --moe-backend triton")
-        elif get_moe_backend().value == "gluon":
-            if fmt != "fp8_channel":
-                raise ValueError("Beam's Gluon finalized MoE requires FP8 experts")
-            policy = BEAM_MOE_GLUON_FP8_POLICY
+            raise ValueError("Beam MXFP4 experts require AMD gfx950")
+        else:
+            policy = {
+                None: BEAM_MOE_VENDOR_POLICY,
+                "nvfp4": BEAM_MOE_NVFP4_POLICY,
+                "fp8_channel": BEAM_MOE_FP8_POLICY,
+            }[fmt]
         adapted = copy(config)
         adapted.moe_precision_policy = policy
         if amd_default:
             # Beam owns grouped selection and folds the routed scale into its
             # FP32 coefficients once, independent of the selected expert backend.
             adapted.moe_routing_mode = "precomputed_topk"
-        adapted.moe_output_scale = (
-            config.routed_scaling_factor if fmt == "mxfp4" and not amd_default else 1.0
-        )
-        if fmt == "mxfp4" and not amd_default:
-            # Preserve the BF16 reference's unscaled routes and late output scale.
-            adapted.routed_scaling_factor = 1.0
+        adapted.moe_output_scale = 1.0
         self._init_moe(adapted, mapping, layer_id, prefix, quant_config)
         experts = self.experts
         self.kernel_routing = experts.support_routing
@@ -1009,11 +990,7 @@ class BeamVendorMoE(BeamMoE):
             self.topk.topk_config.custom_routing_function = self._route
             self.topk.topk_config.correction_bias = None
             # _route's epilogue applies the routed scale; TopK must not again.
-            self.route_scale = (
-                None
-                if fmt == "mxfp4" and not amd_default
-                else config.routed_scaling_factor
-            )
+            self.route_scale = config.routed_scaling_factor
             self.topk.topk_config.routed_scaling_factor = None
         if layer_id == config.mlp_layer_types.index("sparse"):
             logger.info(

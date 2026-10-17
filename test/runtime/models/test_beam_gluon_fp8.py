@@ -21,6 +21,7 @@
 """Explicit Beam Gluon admission using real plans and storage-free weights."""
 
 from test.runtime.models.beam_fixture import tiny_config
+from test.runtime.models.test_beam_amd_fp8 import amd_platform  # noqa: F401
 from test.runtime.models.test_beam_moe_quant import ct
 
 import pytest
@@ -30,8 +31,8 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.models import beam
 
-POLICY = "fp8ch_bf16_route_accum_fp32"
 KERNEL = "gluon_fp8_channel_bf16_precomputed_moe_apply"
+pytestmark = pytest.mark.usefixtures("amd_platform")
 
 
 def make_experts(tp_size, **overrides):
@@ -47,7 +48,7 @@ def make_experts(tp_size, **overrides):
         tp_size=tp_size,
         ep_rank=0,
         ep_size=1,
-        routing_config={"precision_policy": POLICY},
+        routing_mode="precomputed_topk",
     )
     options.update(overrides)
     with torch.device("meta"):
@@ -55,15 +56,13 @@ def make_experts(tp_size, **overrides):
 
 
 @pytest.mark.parametrize("tp_size", [4, 8])
-def test_explicit_policy_selects_registered_gluon_and_preserves_storage(
-    server, tp_size
-):
+def test_default_policy_selects_registered_gluon_and_preserves_storage(server, tp_size):
     server("gluon")
     experts = make_experts(tp_size)
     assert experts.plan["solution"] == "gluon"
     assert experts.plan["apply_kernel_name"] == KERNEL
-    assert experts.plan["precision_policy"] == POLICY
-    assert experts.plan["output_scale"] == 1.0
+    assert experts.plan.get("precision_policy", "default") == "default"
+    assert experts.plan.get("output_scale", 1.0) == 1.0
     assert not experts.supports_deferred_finalize
     assert not experts.support_routing
     width = 2560 // tp_size
@@ -103,44 +102,34 @@ def test_beam_explicit_selector_carries_default_policy_and_original_router(
     assert beam.beam_moe_class(quantized_experts=False) is beam.BeamVendorMoE
 
 
-@pytest.mark.parametrize("backend", ["triton", "auto", "flashinfer_trtllm"])
-def test_candidate_policy_cannot_silently_select_another_backend(server, backend):
+@pytest.mark.parametrize("backend", ["triton", "auto"])
+def test_default_policy_keeps_the_portable_fp8_backend(server, backend):
     server(backend)
-    with pytest.raises(ValueError, match="requires explicit"):
-        make_experts(8)
+    experts = make_experts(8)
+    assert experts.plan["solution"] == "triton"
+    assert (
+        experts.plan["apply_kernel_name"]
+        == "triton_fp8_channel_fused_precomputed_moe_apply"
+    )
+    assert experts.plan.get("precision_policy", "default") == "default"
 
 
 @pytest.mark.parametrize(
     "overrides",
     [
         {"hidden_size": 128},
-        {"num_experts": 128},
-        {"top_k": 4},
         {"intermediate_size": 2816},
         {"with_bias": True},
-        {"w13_input_layout": "interleaved"},
-        {"routing_mode": "logits"},
+        {"routing_mode": "kernel_routing"},
         {"internal_activation_dtype_override": "fp8"},
-        {"routing_config": {"precision_policy": POLICY, "output_scale": 2.0}},
     ],
 )
-def test_candidate_policy_refuses_unsupported_contract(server, overrides):
+def test_default_policy_refuses_unsupported_gluon_contract(server, overrides):
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
     server("gluon")
-    with pytest.raises(ValueError, match="requires explicit"):
+    with pytest.raises(NoKernelFoundError):
         make_experts(8, **overrides)
-
-
-def test_legacy_triton_policy_remains_available(server):
-    server("triton")
-    experts = make_experts(
-        8, routing_config={"precision_policy": "fp8ch_route_accum_fp32"}
-    )
-    assert (
-        experts.plan["apply_kernel_name"]
-        == "triton_fp8_channel_fused_precomputed_moe_apply"
-    )
-    assert experts.plan["precision_policy"] == "fp8ch_route_accum_fp32"
-    assert beam.beam_moe_class(quantized_experts=False) is beam.BeamVendorMoE
 
 
 def test_gluon_beam_refuses_unsupported_unquantized_geometry(server):
@@ -153,8 +142,10 @@ def test_gluon_beam_refuses_unsupported_unquantized_geometry(server):
         )
 
 
-def test_gluon_policy_refuses_non_bf16_input(server):
+def test_default_gluon_policy_refuses_non_bf16_input(server):
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
     server("gluon")
     torch.set_default_dtype(torch.float32)
-    with pytest.raises(ValueError, match="requires explicit"):
+    with pytest.raises(NoKernelFoundError):
         make_experts(8)

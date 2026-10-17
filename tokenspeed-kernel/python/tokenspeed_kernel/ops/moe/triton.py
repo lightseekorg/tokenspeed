@@ -694,9 +694,10 @@ def triton_fp8_channel_precomputed_moe_apply(
     """Apply FP8 per-output-channel experts with dynamic per-token activations.
 
     Args:
-        plan: MoE plan for standard SiLU/SwiGLU. The rounding points are
-            those of the ``_triton/fp8_channel.py`` docstring; fold any routed
-            scale into ``topk_weights``.
+        plan: MoE plan for standard SiLU/SwiGLU and the default precision
+            policy. The rounding points are those of the
+            ``_triton/fp8_channel.py`` docstring; fold any routed scale into
+            ``topk_weights``.
         x: Contiguous BF16 hidden states ``[tokens, hidden]``.
         w: Module with contiguous FP8 E4M3 ``w13_weight`` ``[E, 2I, H]`` (gate
             rows, then up rows), FP32 ``w13_weight_scale`` ``[E, 2I]``, FP8
@@ -870,10 +871,9 @@ def triton_mxfp4_precomputed_moe_apply(
 ) -> torch.Tensor | tuple[torch.Tensor, None, torch.Tensor]:
     """Apply experts with dynamic MXFP4 activations or weight-only MXFP4.
 
-    ``precision_policy="mxfp4_route_accum_fp32"`` requires BF16 input,
-    dynamic MXFP4 activations and unscaled FP32 route weights. It rounds each
-    weighted expert output to BF16, sums in FP32 and applies ``output_scale``
-    before the final BF16 store. The default policy remains unchanged.
+    Only the default precision policy and unit ``output_scale`` are supported.
+    Expert outputs are stored in the input dtype, then weighted and summed
+    in FP32 before the final store. Fold any routed scale into ``topk_weights``.
 
     Args:
         plan: MoE plan selecting standard SiLU/SwiGLU or SiTU activation.

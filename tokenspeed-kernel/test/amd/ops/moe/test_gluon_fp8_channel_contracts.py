@@ -23,7 +23,6 @@ import torch
 from tokenspeed_kernel.ops.moe import moe_plan
 from tokenspeed_kernel.ops.moe.gluon import (
     GLUON_FP8_CHANNEL_APPLY,
-    GLUON_FP8_CHANNEL_POLICY,
     gluon_fp8_channel_bf16_precomputed_moe_apply,
 )
 from tokenspeed_kernel.platform import Platform
@@ -108,14 +107,10 @@ def test_gluon_plan_rejects_unsupported_geometry(mi350_platform, override):
         _plan(mi350_platform, solution="gluon", **override)
 
 
-@pytest.mark.parametrize(
-    "policy",
-    [None, "fp8ch_route_accum_fp32", "bf16_route_accum_fp32"],
-)
-def test_apply_rejects_incompatible_policy(policy):
+def test_apply_rejects_unknown_policy():
     with pytest.raises(ValueError, match="precision_policy"):
         gluon_fp8_channel_bf16_precomputed_moe_apply(
-            {"precision_policy": policy},
+            {"precision_policy": "unknown"},
             None,
             None,
             None,
@@ -134,7 +129,7 @@ def test_apply_rejects_unsupported_launch_before_device_use(options, error):
     options = dict(options)
     plan = {
         "apply_kernel_name": GLUON_FP8_CHANNEL_APPLY,
-        "precision_policy": GLUON_FP8_CHANNEL_POLICY,
+        "precision_policy": "default",
     }
     plan.update(options.pop("plan_extra", {}))
     with pytest.raises(ValueError, match=error):
@@ -144,8 +139,7 @@ def test_apply_rejects_unsupported_launch_before_device_use(options, error):
 
 
 @pytest.mark.parametrize("intermediate", [320, 640])
-@pytest.mark.parametrize("policy", ["default", GLUON_FP8_CHANNEL_POLICY])
-def test_correct_policy_still_rejects_non_gpu_tensors(intermediate, policy):
+def test_default_policy_still_rejects_non_gpu_tensors(intermediate):
     weights = torch.nn.Module()
     weights.w13_weight = torch.empty(
         256, 2 * intermediate, 5120, device="meta", dtype=torch.float8_e4m3fn
@@ -159,7 +153,7 @@ def test_correct_policy_still_rejects_non_gpu_tensors(intermediate, policy):
         gluon_fp8_channel_bf16_precomputed_moe_apply(
             {
                 "apply_kernel_name": GLUON_FP8_CHANNEL_APPLY,
-                "precision_policy": policy,
+                "precision_policy": "default",
             },
             torch.empty(1, 5120, device="meta", dtype=torch.bfloat16),
             weights,
@@ -174,7 +168,6 @@ def test_correct_policy_still_rejects_non_gpu_tensors(intermediate, policy):
     [
         {},
         {"precision_policy": "default"},
-        {"precision_policy": GLUON_FP8_CHANNEL_POLICY},
     ],
 )
 def test_default_policy_executes_empty_gluon_batch_without_name_pin(
@@ -225,4 +218,32 @@ def test_default_policy_rejects_unsupported_expert_geometry(
                 None,
                 topk_weights=torch.empty(1, topk, dtype=torch.float32),
                 topk_ids=torch.empty(1, topk, dtype=torch.int32),
+            )
+
+
+@pytest.mark.parametrize("ep_size,ep_rank", [(2, 0), (1, 1)])
+def test_default_policy_rejects_expert_parallelism(ep_size, ep_rank):
+    weights = torch.nn.Module()
+    weights.ep_size = ep_size
+    weights.ep_rank = ep_rank
+    with pytest.raises(ValueError, match="EP1 rank-local"):
+        gluon_fp8_channel_bf16_precomputed_moe_apply(
+            {"precision_policy": "default"}, None, weights, None
+        )
+
+
+def test_default_policy_rejects_interleaved_weights():
+    weights = torch.nn.Module()
+    weights.w13_input_layout = "interleaved"
+    with torch.device("meta"):
+        weights.w13_weight = torch.empty(256, 640, 5120, dtype=torch.float8_e4m3fn)
+        weights.w2_weight = torch.empty(256, 5120, 320, dtype=torch.float8_e4m3fn)
+        with pytest.raises(ValueError, match="concatenated gate/up weights"):
+            gluon_fp8_channel_bf16_precomputed_moe_apply(
+                {"precision_policy": "default"},
+                torch.empty(0, 5120, dtype=torch.bfloat16),
+                weights,
+                None,
+                topk_weights=torch.empty(0, 8, dtype=torch.float32),
+                topk_ids=torch.empty(0, 8, dtype=torch.int32),
             )

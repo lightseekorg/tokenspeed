@@ -1853,17 +1853,16 @@ below 49,152 groups, and 256 groups and eight warps from there.
 `gluon_fp8_channel_bf16_precomputed_moe_apply` is an explicit research candidate
 for gfx950 TP4/TP8 with EP1, 256 local experts, hidden width 5120, local
 intermediate width 640/320 respectively and top-eight routing.
-Its plan must carry both that implementation name and
-`precision_policy="fp8ch_bf16_route_accum_fp32"`. This policy describes the
-arithmetic: FP8 storage, BF16 projection operands, unweighted BF16 expert
-outputs and FP32 weighted-route accumulation. Gluon names its current
-implementation, not a precision format.
+It accepts only `precision_policy="default"` (also used when omitted), with
+unit output scale. Its arithmetic uses FP8 storage, BF16 projection operands,
+unweighted BF16 expert outputs and FP32 weighted-route accumulation.
 
-Beam admits this policy only with explicit `--moe-backend gluon`. The registry
-does not select by this precision policy, and the Gluon candidate's priority
-is below the portable native-FP8 implementation. Ordinary plans retain the
-native-FP8 selection. Promoting this candidate to automatic selection would
-change projection arithmetic and requires separate numerical qualification.
+Beam selects this implementation with explicit `--moe-backend gluon` through
+the normal registry; no implementation-name pin is required. The Gluon
+candidate's priority remains below the portable native-FP8 implementation,
+so automatic plans retain native-FP8 selection. Promoting this candidate to
+automatic selection would change projection arithmetic and requires separate
+numerical qualification.
 
 The candidate extends the pre-existing compact-FP8 grouped gate/up and down
 stages. FP8 codes remain resident; register loads widen raw codes exactly to
