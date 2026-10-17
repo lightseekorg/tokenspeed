@@ -530,6 +530,9 @@ class DeepseekV4MoE(nn.Module):
         if deferred_finalize:
             # Reduce routed rows and add the shared expert in one finalize.
             gemm2_out, expert_weights, expanded_idx = routed
+            if expert_weights is None:
+                # Precomputed-route kernels return no weights; routing holds them.
+                expert_weights = topk_output.topk_weights
             return moe_finalize_fuse_shared(
                 gemm2_out,
                 expanded_idx,
