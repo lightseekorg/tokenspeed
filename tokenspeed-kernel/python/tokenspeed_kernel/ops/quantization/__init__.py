@@ -69,6 +69,7 @@ def rmsnorm_mxfp4_quant(
 
     return rmsnorm_mxfp4_quantize(x, weight, eps, weight_offset)
 
+
 def rmsnorm_quantize_fp8_group32(
     x: torch.Tensor,
     weight: torch.Tensor,
