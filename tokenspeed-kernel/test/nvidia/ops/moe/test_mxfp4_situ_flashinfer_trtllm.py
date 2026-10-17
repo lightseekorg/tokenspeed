@@ -261,25 +261,25 @@ def test_swiglu_deferred_finalize(num_tokens, precomputed, monkeypatch) -> None:
     routes = (
         dict(topk_weights=weights.cuda(), topk_ids=ids.cuda()) if precomputed else {}
     )
-    from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxfp4
+    from tokenspeed_kernel.ops.moe import flashinfer as flashinfer_moe
 
     # Compare CuTe and CUDA quantization through the expert kernels.
     with monkeypatch.context() as context:
-        context.setattr(trtllm_mxfp4, "is_cute_dsl_available", lambda: False)
+        context.setattr(flashinfer_moe, "is_cute_dsl_available", lambda: False)
         expected = kernel_moe_apply(plan, x, w, logits, do_finalize=True, **routes)
     seen = []
-    original_quantizer = trtllm_mxfp4.mxfp8_quantize
+    original_quantizer = flashinfer_moe.mxfp8_quantize
 
     def observe_quantizer(*args, **kwargs):
         seen.append(kwargs["backend"])
         return original_quantizer(*args, **kwargs)
 
     with monkeypatch.context() as context:
-        context.setattr(trtllm_mxfp4, "mxfp8_quantize", observe_quantizer)
+        context.setattr(flashinfer_moe, "mxfp8_quantize", observe_quantizer)
         actual_finalized = kernel_moe_apply(
             plan, x, w, logits, do_finalize=True, **routes
         )
-    expected_backend = "cute-dsl" if trtllm_mxfp4.is_cute_dsl_available() else "cuda"
+    expected_backend = "cute-dsl" if flashinfer_moe.is_cute_dsl_available() else "cuda"
     assert seen == ([expected_backend] if num_tokens else [])
     torch.testing.assert_close(actual_finalized, expected, rtol=0, atol=0)
     if precomputed:
@@ -347,7 +347,7 @@ def test_swiglu_deferred_finalize(num_tokens, precomputed, monkeypatch) -> None:
             )
         x.normal_()
         with monkeypatch.context() as context:
-            context.setattr(trtllm_mxfp4, "is_cute_dsl_available", lambda: False)
+            context.setattr(flashinfer_moe, "is_cute_dsl_available", lambda: False)
             expected_replay = kernel_moe_apply(
                 plan, x, w, logits, do_finalize=True, **routes
             )
@@ -386,7 +386,7 @@ def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
 
 @requires_flashinfer_situ
 def test_swiglu_quantizer_keeps_native_padding(monkeypatch) -> None:
-    from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxfp4
+    from tokenspeed_kernel.ops.moe import flashinfer as flashinfer_moe
 
     raw, x, logits, _, ids, weights = _kernel_routing_case(37, 4)
     w = _MoEWeights(raw).cuda()
@@ -421,13 +421,13 @@ def test_swiglu_quantizer_keeps_native_padding(monkeypatch) -> None:
         do_finalize=True,
     )
     seen = []
-    original_quantizer = trtllm_mxfp4.mxfp8_quantize
+    original_quantizer = flashinfer_moe.mxfp8_quantize
 
     def observe_quantizer(*args, **kwargs):
         seen.append(kwargs["backend"])
         return original_quantizer(*args, **kwargs)
 
-    monkeypatch.setattr(trtllm_mxfp4, "mxfp8_quantize", observe_quantizer)
+    monkeypatch.setattr(flashinfer_moe, "mxfp8_quantize", observe_quantizer)
     actual = kernel_moe_apply(
         plan,
         x,
