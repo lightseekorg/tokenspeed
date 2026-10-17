@@ -139,6 +139,28 @@ def test_attention_dp_lm_head_uses_mixed_quantization(monkeypatch):
     assert lm_head.weight.shape == (64, 16)
 
 
+def test_fp8_lm_head_loads_scalar_per_tensor_scales():
+    from tokenspeed.runtime.layers.dense import Fp8LinearMethod
+    from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
+
+    quant_config = ModelOptMixedConfig(quantized_layers={"lm_head": "FP8"})
+    lm_head = ParallelLMHead(
+        64,
+        32,
+        quant_config=quant_config,
+        prefix="lm_head",
+        tp_rank=0,
+        tp_size=1,
+        tp_group=(0,),
+    )
+
+    assert isinstance(lm_head.quant_method, Fp8LinearMethod)
+    # The checkpoint stores the per-tensor scales as scalars.
+    for name in ("weight_scale", "input_scale"):
+        lm_head.weight_loader(lm_head.get_parameter(name), torch.tensor(0.25))
+        assert lm_head.get_parameter(name).tolist() == [0.25]
+
+
 def test_qwen35_w4a16_and_static_fp8_routing(monkeypatch):
     monkeypatch.setattr(
         nvfp4_module,

@@ -34,6 +34,9 @@ def _rowcta_config(n: int, k: int) -> tuple[int, int]:
         return (256, 2) if n <= 1024 else (1024, 2)
     if k == 2048:
         return 1024, 2
+    if k <= 1536:
+        # Short rows: one wave with 16-byte loads measured fastest.
+        return 512, 1
     return 512, 4
 
 
@@ -132,4 +135,44 @@ def gluon_rowcta_bf16_gemv_gfx950(
     return out
 
 
-__all__ = ["gluon_rowcta_bf16_gemv_gfx950"]
+# Single-row shapes (N, K) where this GEMV beat ``gemm.mm``'s own path (Torch's
+# skinny GEMM or hipBLASLt) by at least 5% in cold-cache standalone sweeps on
+# MI350X, and stayed faster in serving traces. ``gemm.mm`` hands a single row
+# to this GEMV only on these shapes (the decode GEMV's own measured shapes
+# route to ``gemm.mv`` separately); direct ``gemm.mv`` calls take this GEMV for
+# any single row.
+_PREFERRED_SHAPES: frozenset[tuple[int, int]] = frozenset(
+    {
+        (160, 4096),
+        (288, 4096),
+        (512, 5120),
+        (896, 21504),
+        (2112, 14336),
+        (2560, 2560),
+        (2560, 3072),
+        (3648, 7168),
+        (4608, 7168),
+        (4608, 8192),
+        (6656, 2560),
+        (7168, 1536),
+        (7168, 2304),
+        (7168, 4224),
+        (8448, 7168),
+        (12800, 2560),
+        (20480, 7168),
+        (32320, 5120),
+        (38720, 4096),
+        (124160, 2560),
+    }
+)
+
+
+def prefers_gluon_rowcta_bf16_gemv_gfx950(n: int, k: int) -> bool:
+    """Whether a single row of ``[N, K]`` measured faster here than in mm."""
+    return (n, k) in _PREFERRED_SHAPES
+
+
+__all__ = [
+    "gluon_rowcta_bf16_gemv_gfx950",
+    "prefers_gluon_rowcta_bf16_gemv_gfx950",
+]

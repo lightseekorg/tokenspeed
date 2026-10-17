@@ -30,9 +30,11 @@ if not is_cdna4():
 from tokenspeed_kernel.ops.gemm import (  # noqa: E402
     _select_mv,
     _use_mv,
+    mm,
     mv,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (  # noqa: E402
+    _PREFERRED_SHAPES,
     gluon_rowcta_bf16_gemv_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
@@ -40,7 +42,10 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
 )
 
 
-@pytest.mark.parametrize(("n", "k"), [(128, 128), (257, 1000), (1024, 8192)])
+# (257, 1000) and (7168, 1536) take the one-wave short-row config.
+@pytest.mark.parametrize(
+    ("n", "k"), [(128, 128), (257, 1000), (7168, 1536), (1024, 8192)]
+)
 def test_gluon_rowcta_bf16_gemv_matches_reference(n: int, k: int) -> None:
     generator = torch.Generator(device="cuda").manual_seed(20260915 + n + k)
     x = torch.randn((1, k), dtype=torch.bfloat16, device="cuda", generator=generator)
@@ -60,6 +65,31 @@ def test_decode_gemv_selects_gluon_on_gfx950() -> None:
     assert _select_mv(
         1, 1024, 8192, True, torch.bfloat16, torch.bfloat16, False
     ).__name__ == ("gluon_rowcta_bf16_gemv_gfx950")
+
+
+def test_mm_takes_the_rowcta_gemv_on_every_listed_single_row_shape() -> None:
+    for n, k in sorted(_PREFERRED_SHAPES):
+        x = torch.empty((1, k), dtype=torch.bfloat16, device="cuda")
+        weight = torch.empty((n, k), dtype=torch.bfloat16, device="cuda")
+        assert _use_mv(x, weight), (n, k)
+        assert _select_mv(
+            1, n, k, True, torch.bfloat16, torch.bfloat16, False
+        ).__name__ == ("gluon_rowcta_bf16_gemv_gfx950"), (n, k)
+
+
+def test_mm_keeps_its_own_path_for_an_unlisted_single_row() -> None:
+    x = torch.empty((1, 1536), dtype=torch.bfloat16, device="cuda")
+    weight = torch.empty((1536, 1536), dtype=torch.bfloat16, device="cuda")
+    assert not _use_mv(x, weight)
+
+
+def test_mm_routes_a_listed_single_row_through_the_rowcta_gemv() -> None:
+    torch.manual_seed(20261017)
+    x = torch.randn((1, 3072), dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn((2560, 3072), dtype=torch.bfloat16, device="cuda") / 3072**0.5
+    expected = torch.empty((1, 2560), dtype=torch.bfloat16, device="cuda")
+    gluon_rowcta_bf16_gemv_gfx950(x, weight, expected)
+    assert torch.equal(mm(x, weight), expected)
 
 
 def test_qkvg_single_row_dispatch_and_graph_replay() -> None:

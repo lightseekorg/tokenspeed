@@ -443,8 +443,6 @@ void dsv4_indexer_topk_prefill(TensorView logits, TensorView row_starts,
 
 namespace {
 
-constexpr int64_t kRadixTopkWorkspaceSize = 1024 * 1024;
-
 cudaError_t launch_persistent_cluster_topk(
     const vllm::persistent::PersistentTopKParams& params, uint32_t num_rows,
     uint32_t cluster_size, cudaStream_t stream,
@@ -557,18 +555,13 @@ void launch_noncluster_persistent_topk(
 }
 
 template <int TopK, bool kUsePDL>
-void launch_persistent_topk(const TensorView& logits,
-                            const TensorView& lengths,
-                            TensorView& output,
-                            TensorView& workspace,
-                            int64_t max_seq_len,
-                            int64_t q_len_per_req,
-                            cudaStream_t stream) {
+void launch_persistent_topk(const TensorView& logits, const TensorView& lengths,
+                            TensorView& output, int64_t max_seq_len,
+                            int64_t q_len_per_req, cudaStream_t stream) {
   namespace P = vllm::persistent;
 
   const int64_t num_rows = logits.size(0);
   const int64_t stride = logits.size(1);
-  (void)workspace;
 
   P::PersistentTopKParams params;
   params.input = static_cast<float*>(logits.data_ptr());
@@ -635,45 +628,35 @@ void launch_persistent_topk(const TensorView& logits,
 template <int TopK>
 void dispatch_persistent_topk(const TensorView& logits,
                               const TensorView& lengths, TensorView& output,
-                              TensorView& workspace, int64_t max_seq_len,
-                              int64_t q_len_per_req, bool enable_pdl,
-                              cudaStream_t stream) {
+                              int64_t max_seq_len, int64_t q_len_per_req,
+                              bool enable_pdl, cudaStream_t stream) {
   if (enable_pdl) {
-    launch_persistent_topk<TopK, true>(logits, lengths, output, workspace,
-                                       max_seq_len, q_len_per_req, stream);
+    launch_persistent_topk<TopK, true>(logits, lengths, output, max_seq_len,
+                                       q_len_per_req, stream);
   } else {
-    launch_persistent_topk<TopK, false>(logits, lengths, output, workspace,
-                                        max_seq_len, q_len_per_req, stream);
+    launch_persistent_topk<TopK, false>(logits, lengths, output, max_seq_len,
+                                        q_len_per_req, stream);
   }
 }
 
 }  // namespace
 
-void dsv4_persistent_topk(TensorView logits,
-                                 TensorView lengths,
-                                 TensorView output,
-                                 TensorView workspace,
-                                 int64_t k,
-                                 int64_t max_seq_len,
-                                 int64_t q_len_per_req,
-                                 bool enable_pdl) {
+void dsv4_persistent_topk(TensorView logits, TensorView lengths,
+                          TensorView output, int64_t k, int64_t max_seq_len,
+                          int64_t q_len_per_req, bool enable_pdl) {
   CHECK_CUDA(logits);
   CHECK_CUDA(lengths);
   CHECK_CUDA(output);
-  CHECK_CUDA(workspace);
   CHECK_DIM(2, logits);
   TVM_FFI_ICHECK(lengths.ndim() == 1 || lengths.ndim() == 2)
       << "lengths must be 1D or 2D";
   CHECK_DIM(2, output);
-  CHECK_DIM(1, workspace);
   CHECK_CONTIGUOUS(logits);
   CHECK_CONTIGUOUS(lengths);
   CHECK_CONTIGUOUS(output);
-  CHECK_CONTIGUOUS(workspace);
   TVM_FFI_ICHECK(logits.dtype() == dl_float32) << "logits must be float32";
   TVM_FFI_ICHECK(lengths.dtype() == dl_int32) << "lengths must be int32";
   TVM_FFI_ICHECK(output.dtype() == dl_int32) << "output must be int32";
-  TVM_FFI_ICHECK(workspace.dtype() == dl_uint8) << "workspace must be uint8";
   TVM_FFI_ICHECK(q_len_per_req >= 1) << "q_len_per_req must be >= 1";
   TVM_FFI_ICHECK(logits.size(0) % q_len_per_req == 0)
       << "q_len_per_req must divide num_rows";
@@ -690,16 +673,13 @@ void dsv4_persistent_topk(TensorView logits,
       << "cudaSetDevice failed: " << cudaGetErrorString(err);
   cudaStream_t stream = get_stream(logits.device());
   if (k == 512) {
-    dispatch_persistent_topk<512>(logits, lengths, output, workspace,
-                                  max_seq_len, q_len_per_req, enable_pdl,
-                                  stream);
+    dispatch_persistent_topk<512>(logits, lengths, output, max_seq_len,
+                                  q_len_per_req, enable_pdl, stream);
   } else if (k == 1024) {
-    dispatch_persistent_topk<1024>(logits, lengths, output, workspace,
-                                   max_seq_len, q_len_per_req, enable_pdl,
-                                   stream);
+    dispatch_persistent_topk<1024>(logits, lengths, output, max_seq_len,
+                                   q_len_per_req, enable_pdl, stream);
   } else {
-    dispatch_persistent_topk<2048>(logits, lengths, output, workspace,
-                                   max_seq_len, q_len_per_req, enable_pdl,
-                                   stream);
+    dispatch_persistent_topk<2048>(logits, lengths, output, max_seq_len,
+                                   q_len_per_req, enable_pdl, stream);
   }
 }

@@ -243,7 +243,7 @@ class TestApplyRopeWithCosSinCacheInplace:
 class TestDsv3RouterGemm:
     """dsv3_router_gemm
 
-    Supports num_tokens > 16 via cuBLAS fallback.
+    Supports num_tokens > 32 via cuBLAS fallback.
 
     Signature:
       dsv3_router_gemm(hidden_states, router_weights, out_dtype=torch.float32)
@@ -252,6 +252,33 @@ class TestDsv3RouterGemm:
 
     NUM_EXPERTS = 256
     HIDDEN_DIM = 7168
+
+    @pytest.mark.parametrize(
+        "hidden_dim,num_tokens",
+        [
+            (3072, 8),
+            (5120, 1),
+            (5120, 32),
+            (5120, 33),
+            (6144, 8),
+            (7168, 8),
+        ],
+    )
+    @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize("num_experts", [128, 384])
+    def test_small_batch_shapes(
+        self, hidden_dim, num_tokens, weight_dtype, num_experts
+    ):
+        from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm
+
+        torch.manual_seed(42)
+        x = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)
+        weight = (
+            torch.randn(num_experts, hidden_dim, device="cuda") / hidden_dim**0.5
+        ).to(weight_dtype)
+        expected = (x.double() @ weight.double().T).float()
+        actual = dsv3_router_gemm(x, weight, out_dtype=torch.float32, enable_pdl=True)
+        torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-5)
 
     def _make_inputs(self, num_tokens=8, seed=42):
         torch.manual_seed(seed)
@@ -286,7 +313,7 @@ class TestDsv3RouterGemm:
         assert torch.allclose(out, ref, atol=1e-1, rtol=1e-2)
 
     def test_large_batch(self):
-        """Supports num_tokens > 16 (cuBLAS fallback)."""
+        """Supports num_tokens > 32 (cuBLAS fallback)."""
         from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as tk_gemm
 
         hidden, weights = self._make_inputs(num_tokens=64)
