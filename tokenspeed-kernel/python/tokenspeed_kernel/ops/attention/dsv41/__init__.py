@@ -89,6 +89,7 @@ __all__ = [
     "swa_rope_scatter",
     "global_rope_scatter",
     "rope_inplace",
+    "rope_weights_inplace",
     "rope_pad_query",
     "dspark_rows",
     "dspark_anchors",
@@ -772,6 +773,16 @@ def _validate_rope(values, positions, cos_sin_cache):
         raise ValueError("RoPE tensors must share a device")
 
 
+def _validate_writable_rope(values):
+    if any(
+        size > 1 and stride == 0
+        for size, stride in zip(values.shape[:-1], values.stride()[:-1])
+    ):
+        raise ValueError(
+            "In-place V4.1 RoPE requires non-overlapping writable rows/heads"
+        )
+
+
 def rope_inplace(
     values: torch.Tensor,
     positions: torch.Tensor,
@@ -795,13 +806,7 @@ def rope_inplace(
         are separately rounded before the final low-precision store.
     """
     _validate_rope(values, positions, cos_sin_cache)
-    if any(
-        size > 1 and stride == 0
-        for size, stride in zip(values.shape[:-1], values.stride()[:-1])
-    ):
-        raise ValueError(
-            "In-place V4.1 RoPE requires non-overlapping writable rows/heads"
-        )
+    _validate_writable_rope(values)
     kernel = select_kernel(
         "attention",
         "dsv41_rope_inplace",
@@ -810,6 +815,64 @@ def rope_inplace(
         solution=solution,
     )
     return kernel(values, positions, cos_sin_cache)
+
+
+def rope_weights_inplace(
+    values: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weights: torch.Tensor,
+    weight_scale: float,
+    solution: str | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate owned index queries and scale owned projection weights.
+
+    Grids up to 4096 token-head pairs combine both operations in one launch.
+    Larger grids retain ordinary RoPE and separately scale weights in place.
+
+    Args:
+        values: Writable BF16/FP16 [tokens,heads,dim], dense in head channels.
+        positions: Int32/int64 [tokens]; negative padding positions use row0.
+        cos_sin_cache: FP32 [max_positions,rotary_dim], cosine then sine halves.
+        weights: Writable [tokens,heads] in values' dtype and device. Rows and
+            heads may be strided, but must not overlap each other or values.
+        weight_scale: FP32 scalar applied after the projection has rounded to
+            weights' dtype. The product rounds once back to that dtype.
+        solution: Optional registered implementation restriction.
+
+    Returns:
+        The same values and weights tensors, updated in place. Call only on
+        fresh projection outputs: neither input may have other live consumers.
+    """
+    _validate_rope(values, positions, cos_sin_cache)
+    _validate_writable_rope(values)
+    if (
+        values.ndim != 3
+        or weights.shape != values.shape[:2]
+        or weights.dtype != values.dtype
+        or weights.device != values.device
+    ):
+        raise ValueError(
+            "Indexer weights must match query tokens, heads, dtype and device"
+        )
+    # For two dimensions, nonoverlap follows when either axis spans the other.
+    n, h = weights.shape
+    w0, w1 = weights.stride()
+    if (
+        (n > 1 and w0 == 0)
+        or (h > 1 and w1 == 0)
+        or (n > 1 and h > 1 and w0 < h * w1 and w1 < n * w0)
+    ):
+        raise ValueError("Indexer weights require non-overlapping writable rows/heads")
+    kernel = select_kernel(
+        "attention",
+        "dsv41_rope_weights_inplace",
+        format_signature(values=dense_tensor_format(values.dtype)),
+        traits={},
+        solution=solution,
+    )
+    kernel(values, positions, cos_sin_cache, weights, weight_scale)
+    return values, weights
 
 
 def rope_pad_query(
