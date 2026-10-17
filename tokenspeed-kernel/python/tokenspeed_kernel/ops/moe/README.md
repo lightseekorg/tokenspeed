@@ -295,7 +295,7 @@ groups, the top 8 experts of the kept groups, their unbiased scores renormalized
   least one row, a scale that rounds to a finite zero or normal FP32). It
   launches as a programmatic dependent where `pdl_enabled()`.
 
-Beam calls the Triton kernel on NVIDIA SM100 to SM103 where the guard admits the
+Beam calls the Triton kernel on NVIDIA SM90 to SM103 where the guard admits the
 call and the Torch statements otherwise. The GPU tests
 (`test/nvidia/ops/moe/test_router_select_cuda.py`) pin Torch's FP32 sigmoid and
 K8 sum order first (a mismatch fails, never skips), then compare the two byte for

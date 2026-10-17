@@ -41,7 +41,7 @@ tensors. Two kernels are registered:
   statements of ``apply_ssmax_root10`` with Beam's constants. Admits every shape
   the statements admit.
 * ``triton_fused_qk_rmsnorm_ssmax`` (solution ``triton``, SPECIALIZED, NVIDIA
-  SM100 to SM103, checked on SM100): one launch of the shared
+  SM90 to SM103, checked on SM90 and SM100): one launch of the shared
   ``_fused_qk_rmsnorm_kernel`` through
   ``qk_rmsnorm(..., ssmax_positions=positions)`` with the constexprs
   ``ROUND_AFTER_AFFINE`` (the affine output rounded once to BF16, the value the
@@ -99,8 +99,8 @@ __all__ = [
     "QK_RMSNORM_SSMAX_FAMILY",
     "QK_RMSNORM_SSMAX_MODE",
     "QK_RMSNORM_SSMAX_SIGNATURES",
-    "SM100",
     "SM103",
+    "SM90",
     "SSMAX_DENOMINATOR",
     "SSMAX_OFFSET",
     "TORCH_QK_RMSNORM_SSMAX",
@@ -130,11 +130,11 @@ SSMAX_DENOMINATOR = 2048.0
 POSITION_DTYPES = (torch.int32, torch.int64)
 # The feature a call requests when it passes ``dequant``; both kernels declare it.
 DEQUANT = "dequant"
-# The architectures the fused kernel admits: NVIDIA SM100 to SM103, the range of
-# Beam's flag-free defaults; its byte identity was checked on SM100 (GB200) only.
+# The architectures the fused kernel admits: NVIDIA SM90 to SM103, where Beam calls
+# its kernels; its byte identity was checked on SM90 (H200) and SM100 (GB200).
 # The capability filter states the range for ranked selection, the host guard for a
 # by-name override.
-SM100 = ArchVersion(10, 0)
+SM90 = ArchVersion(9, 0)
 SM103 = ArchVersion(10, 3)
 # The dtypes Beam's NoPE branch produces (``BeamRMSNorm`` is built with
 # ``torch.bfloat16``; the runtime hands int64 or int32 positions). Both kernels
@@ -507,7 +507,7 @@ def qk_rmsnorm_ssmax_rejection(
     width (Beam's ``qkv.split`` column views or contiguous tensors); contiguous
     ``[128]`` weights; ``positions`` a contiguous int32 / int64 ``[tokens]``
     vector; a finite positive float ``eps`` (a kernel constexpr); every tensor a
-    CUDA tensor on ``q``'s device; one NVIDIA SM100 to SM103 device.
+    CUDA tensor on ``q``'s device; one NVIDIA SM90 to SM103 device.
     ``positions >= 0`` is not a clause: it is the caller's contract, as it is
     for ``apply_ssmax_root10``. The reason names the first rejecting clause; the
     device and platform clauses come last so that shape and layout findings are
@@ -598,9 +598,9 @@ def qk_rmsnorm_ssmax_rejection(
         if tensor.device != q.device:
             return f"{name} is on {tensor.device}, q is on {q.device}"
     platform = current_platform()
-    if not (platform.is_nvidia and SM100 <= platform.arch_version <= SM103):
+    if not (platform.is_nvidia and SM90 <= platform.arch_version <= SM103):
         return (
-            f"{TRITON_FUSED_QK_RMSNORM_SSMAX} runs on NVIDIA SM100 to SM103 only, "
+            f"{TRITON_FUSED_QK_RMSNORM_SSMAX} runs on NVIDIA SM90 to SM103 only, "
             f"got {platform.device_name}"
         )
     return ""
@@ -614,7 +614,7 @@ def qk_rmsnorm_ssmax_rejection(
     solution="triton",
     capability=CapabilityRequirement(
         vendors=frozenset({"nvidia"}),
-        min_arch_version=SM100,
+        min_arch_version=SM90,
         max_arch_version=SM103,
     ),
     # The same BF16 q/k/weights x int32|int64 positions signatures as
@@ -671,7 +671,7 @@ def triton_fused_qk_rmsnorm_ssmax(
 
     Raises:
         ValueError: :func:`qk_rmsnorm_ssmax_rejection` rejects the call (zero
-            tokens and a device outside SM100 to SM103 included). There is no
+            tokens and a device outside SM90 to SM103 included). There is no
             fallback to the torch statements.
     """
     rejection = qk_rmsnorm_ssmax_rejection(q, k, q_weight, k_weight, eps, positions)

@@ -452,7 +452,7 @@ else:
 
 
 # ===-----------------------------------------------------------------------===#
-# FP32 decode GEMM: Triton BF16x3 (NVIDIA SM100)
+# FP32 decode GEMM: Triton BF16x3 (NVIDIA SM90 to SM103)
 # ===-----------------------------------------------------------------------===#
 
 
@@ -462,7 +462,7 @@ register_kernel(
     name="triton_bf16x3_gemm_fp32",
     solution="triton",
     capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
+        min_arch_version=ArchVersion(9, 0),
         max_arch_version=ArchVersion(10, 3),
         vendors=frozenset({"nvidia"}),
     ),
@@ -481,7 +481,9 @@ register_kernel(
         # this kernel was up to 1.6x slower than the FP32 Torch product for
         # 128-row weights at most row counts up to 128, and at least 1.05x
         # faster at every point for weights of 256 rows and more. 128-row
-        # weights stay on Torch.
+        # weights stay on Torch. On H200, at Beam's 256 x 5120 router weight
+        # with a cold L2, it was 1.4x faster than the FP32 Torch product at 97
+        # rows and 2.9x to 4.0x from 256 to 16384 rows.
         "n_min": frozenset({256}),
         "n_max": frozenset({1024}),
         "k_align": frozenset({64}),
