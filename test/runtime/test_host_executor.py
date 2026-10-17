@@ -529,28 +529,26 @@ class TestGroupAwareWireTest:
                 executor.submit_prefetches(
                     [self._prefetch_op(module, 1, 1, groups=(0,))]
                 )
-                self.assertTrue(entered.wait(5.0))
+                assert entered.wait(5.0)
                 executor.submit_prefetches([queued])
                 clock.return_value = 2.0
                 expected = {1: (False, 0), 2: (True, 0)}
-                self.assertEqual(executor.l3_prefetch_progress(), expected)
+                assert executor.l3_prefetch_progress() == expected
                 # A second poll must handle the cancelled Future without raising.
-                self.assertEqual(executor.l3_prefetch_progress(), expected)
-                self.assertTrue(executor._prefetch_jobs[2].future.cancelled())
-                self.assertFalse(executor._prefetch_jobs[1].future.done())
-                self.assertEqual(executor.poll_results(), [])
+                assert executor.l3_prefetch_progress() == expected
+                assert executor._prefetch_jobs[2].future.cancelled()
+                assert not executor._prefetch_jobs[1].future.done()
+                assert executor.poll_results() == []
                 executor.complete_l3_prefetch(2, 0)
-                self.assertEqual(
-                    [(ack.op_id, ack.landed_pages) for ack in executor.poll_results()],
-                    [(2, 0)],
-                )
+                assert [
+                    (ack.op_id, ack.landed_pages) for ack in executor.poll_results()
+                ] == [(2, 0)]
                 release.set()
-                self.assertEqual(self._settle(executor, 1), 1)
+                assert self._settle(executor, 1) == 1
                 executor.complete_l3_prefetch(1, 1)
-                self.assertEqual(
-                    [(ack.op_id, ack.landed_pages) for ack in executor.poll_results()],
-                    [(1, 1)],
-                )
+                assert [
+                    (ack.op_id, ack.landed_pages) for ack in executor.poll_results()
+                ] == [(1, 1)]
                 executor.l3_store.prefetch.assert_called_once()
         finally:
             release.set()
