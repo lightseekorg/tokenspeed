@@ -24,6 +24,7 @@ from typing import Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.moe._routing_output import routing_output_buffers
 
 __all__ = ["minimax_biased_grouped_topk"]
 
@@ -45,6 +46,7 @@ def _minimax_biased_grouped_topk_kernel(
     routed_scaling_factor: tl.constexpr,
     renormalize: tl.constexpr,
     has_static_expert_map: tl.constexpr,
+    ROUND_WEIGHTS_TO_BF16: tl.constexpr,
     BLOCK_E: tl.constexpr,
     TOPK: tl.constexpr,
 ):
@@ -103,6 +105,8 @@ def _minimax_biased_grouped_topk_kernel(
         factor = 1.0
     for k in tl.static_range(0, TOPK):
         weight = kept_weights[k] / denom * factor
+        if ROUND_WEIGHTS_TO_BF16:
+            weight = weight.to(tl.bfloat16)
         # tl.store casts to the output pointer dtype.
         tl.store(topk_weights_ptr + token_id * stride_wm + k * stride_wk, weight)
 
@@ -193,6 +197,7 @@ def minimax_biased_grouped_topk(
     num_token_non_padded: Optional[torch.Tensor] = None,
     logical_to_physical_map: Optional[torch.Tensor] = None,
     weights_dtype: torch.dtype = torch.float32,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     if (
         gating_output.ndim != 2
@@ -207,6 +212,8 @@ def minimax_biased_grouped_topk(
         or routed_scaling_factor is None
         or num_token_non_padded is not None
     ):
+        if out is not None:
+            raise ValueError("Routing output buffers require fused single-group top-k")
         ref_w, ref_i = _biased_grouped_topk_reference(
             hidden_states,
             gating_output,
@@ -223,11 +230,8 @@ def minimax_biased_grouped_topk(
         return ref_w.to(weights_dtype), ref_i
 
     num_tokens, num_experts = gating_output.shape
-    topk_weights = torch.empty(
-        (num_tokens, topk), dtype=weights_dtype, device=gating_output.device
-    )
-    topk_ids = torch.empty(
-        (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+    topk_weights, topk_ids = routing_output_buffers(
+        gating_output, topk, weights_dtype, out
     )
     if num_tokens == 0:
         return topk_weights, topk_ids
@@ -254,8 +258,39 @@ def minimax_biased_grouped_topk(
         routed_scaling_factor=float(routed_scaling_factor),
         renormalize=renormalize,
         has_static_expert_map=logical_to_physical_map is not None,
+        ROUND_WEIGHTS_TO_BF16=weights_dtype == torch.bfloat16,
         BLOCK_E=block_e,
         TOPK=topk,
         num_warps=1,
     )
     return topk_weights, topk_ids
+
+
+@triton.jit
+def _scale_sigmoid_weights_kernel(
+    weights,
+    count,
+    scale,
+    ROUND_WEIGHTS_TO_BF16: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(weights + offsets, mask=offsets < count, other=0).to(tl.float32)
+    values *= scale
+    if ROUND_WEIGHTS_TO_BF16:
+        values = values.to(tl.bfloat16).to(tl.float32)
+    tl.store(weights + offsets, values, mask=offsets < count)
+
+
+def scale_sigmoid_weights_inplace(
+    weights: torch.Tensor, scale: float, weights_dtype: torch.dtype
+) -> None:
+    """Scale FP32 output in place, preserving the requested BF16 rounding."""
+    if weights.numel():
+        _scale_sigmoid_weights_kernel[(triton.cdiv(weights.numel(), 256),)](
+            weights,
+            weights.numel(),
+            scale,
+            ROUND_WEIGHTS_TO_BF16=weights_dtype == torch.bfloat16,
+            BLOCK=256,
+        )

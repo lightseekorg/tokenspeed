@@ -300,3 +300,47 @@ call and the Torch statements otherwise. The GPU tests
 (`test/nvidia/ops/moe/test_router_select_cuda.py`) pin Torch's FP32 sigmoid and
 K8 sum order first (a mismatch fails, never skips), then compare the two byte for
 byte on random rows, tie, edge and NaN corpora and in CUDA-graph replay.
+
+## MegaMoE token-back workspace
+
+The NVFP4 SiTU runner uses `epi_warps` for BF16 token-back. Its fixed
+workspace takes the largest region sizes across all supported tactics.
+Including `reuse_dispatch_warps` would allocate an FC2 staging buffer even
+when autotuning is off and the heuristic selects `epi_warps`.
+
+The candidate set and the large-capacity heuristic both use `epi_warps`.
+This removes the FC2 staging buffer and its completion counter from the
+workspace. At K3 geometry with EP16 and a capacity of 8192 tokens per rank,
+the staging buffer alone would use about 14 GiB per GPU. The tuning-cache
+identity excludes selections saved before this change.
+
+## MegaMoE producer input buffers
+
+`moe_input_buffers(plan, w, num_tokens, max_num_tokens_per_gpu)` exposes the
+selected kernel's producer outputs. It returns `None` for kernels without
+this interface. Initialize the views before CUDA graph capture.
+
+K3 NVFP4 routing and quantization write directly into these views.
+Packed activation, linear block scales, and FP32 routing-weight storage use
+one symmetric allocation. Expert IDs use local INT64 storage.
+The quantizer reserves scale rows rounded up to 16. It returns only valid
+token rows. Routing stores preserve the previous FP32 to BF16 to FP32
+rounding of the K3 weights.
+
+The NVIDIA packed routing entries accept these output buffers. The AMD
+gfx1250 entries keep their existing allocating interfaces.
+
+All EP ranks use the same capacity. The launch masks unused expert-ID rows
+with `-1`, including on idle ranks. A caller must finish the previous
+consumer before another producer overwrites the same workspace. The views
+share the existing workspace across layers, token buckets, and tactics.
+
+The adapter skips staging when inputs already use these views. External
+prequantized inputs retain the existing staging behavior. Both forms use
+the same MegaMoE compute kernel.
+
+Autotune retains its existing measurement path, including input staging
+copies, and its existing cache identity. Profiling overwrites the same
+workspace used by the producers. Treat autotuning calls that use these
+views as warmup: discard their outputs and regenerate the inputs before
+inference. TokenSpeed runs autotuning on dummy inputs during startup.

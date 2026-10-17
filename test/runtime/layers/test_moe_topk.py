@@ -28,6 +28,13 @@ def test_topk_call_can_override_configured_output_format() -> None:
     assert output.router_logits is router_logits
 
 
+def test_bypassed_route_rejects_output_buffers() -> None:
+    topk = TopK(top_k=2, output_format=TopKOutputFormat.BYPASSED)
+    buffers = (torch.empty(3, 2), torch.empty(3, 2, dtype=torch.int64))
+    with pytest.raises(ValueError, match="Bypassed routing"):
+        topk(torch.empty(3, 4), torch.empty(3, 8), out=buffers)
+
+
 def test_plain_route_uses_kernel_package_topk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

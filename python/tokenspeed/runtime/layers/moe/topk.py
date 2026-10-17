@@ -568,6 +568,7 @@ class TopK(torch.nn.Module):
         output_format: TopKOutputFormat | None = None,
         num_token_non_padded: torch.Tensor | None = None,
         expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
+        out: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> TopKOutput:
         output_format = (
             output_format or self.topk_config.output_format or TopKOutputFormat.STANDARD
@@ -576,6 +577,8 @@ class TopK(torch.nn.Module):
             router_logits = simulated_router_logits(router_logits)
 
         if output_format == TopKOutputFormat.BYPASSED:
+            if out is not None:
+                raise ValueError("Bypassed routing does not accept output buffers")
             return BypassedTopKOutput(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -591,6 +594,7 @@ class TopK(torch.nn.Module):
                 topk_config=self.topk_config,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
+                **({"out": out} if out is not None else {}),
             )
 
     def empty_topk_output(
@@ -651,6 +655,7 @@ def select_experts(
     *,
     num_token_non_padded: torch.Tensor | None = None,
     expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> StandardTopKOutput:
 
     top_k = topk_config.top_k
@@ -663,6 +668,19 @@ def select_experts(
     correction_bias = topk_config.correction_bias
     torch_native = topk_config.torch_native
     routed_scaling_factor = topk_config.routed_scaling_factor
+    if out is not None and not (
+        use_grouped_topk
+        and num_expert_group == 1
+        and topk_group == 1
+        and correction_bias is not None
+        and num_fused_shared_experts == 0
+        and routed_scaling_factor is not None
+        and num_token_non_padded is None
+        and custom_routing_function is None
+    ):
+        raise ValueError(
+            "Routing output buffers require single-group biased sigmoid top-k"
+        )
 
     if (
         expert_location_dispatch_info is not None
@@ -752,8 +770,17 @@ def select_experts(
                     correction_bias=correction_bias,
                     logical_to_physical_map=logical_to_physical_map,
                     topk_weights_dtype=topk_config.topk_weights_dtype,
+                    **(
+                        {"out": out, "topk_indices_dtype": out[1].dtype}
+                        if out is not None
+                        else {}
+                    ),
                 )
             else:
+                if out is not None:
+                    raise ValueError(
+                        "Selected routing configuration cannot write output buffers"
+                    )
                 topk_weights, topk_ids = minimax_biased_grouped_topk(
                     hidden_states,
                     router_logits,

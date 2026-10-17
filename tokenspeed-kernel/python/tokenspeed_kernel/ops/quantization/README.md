@@ -1,4 +1,4 @@
-# FP8 quantization
+# Quantization
 
 `quantize_fp8` returns `(values, scales)`. A plain cast has no scales;
 static scaling returns the supplied scale. Dynamic `token` quantization
@@ -38,3 +38,21 @@ verification; its output norm belongs to this stage. MLA uses the same
 stage without RMSNorm. Prequantized values and scales feed the output
 projection directly. The same Triton implementation serves NVIDIA and AMD;
 PDL is enabled only where supported.
+
+## NVFP4 output buffers
+
+The `flashinfer.fp4_quantize` adapter accepts `out=(values, scales)`.
+This form writes directly into caller-owned CUDA memory. It uses the same
+CUDA quantization binding as the allocating form.
+
+Use contiguous FP16 or BF16 input `[M, K]`, with `K` divisible by 64.
+Select linear scales with `is_sf_swizzled_layout=False`. Packed values use
+uint8 `[M, K/2]`. Scale storage uses uint8 `[ceil(M/16)*16, K/16]`.
+Both buffers need 16-byte alignment on the input device. The return value
+contains the packed buffer and a view of the first `M` scale rows.
+Unsupported layout or backend arguments raise an error. The adapter
+preserves supplied scale, inverse-scale, recipe, and PDL arguments.
+
+Initialize this binding eagerly before capturing a graph. Keep output
+addresses stable across replay. Omission of `out` retains the existing
+FlashInfer allocation behavior.

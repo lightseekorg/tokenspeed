@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.moe._input_buffers import MoEInputBuffers
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -28,6 +29,38 @@ from tokenspeed_kernel.signature import format_signatures
 # ===-----------------------------------------------------------------------===#
 # NVFP4 MegaMoE: TRT-LLM (NVIDIA SM100)
 # ===-----------------------------------------------------------------------===#
+
+
+def trtllm_nvfp4_mega_moe_input_buffers(
+    plan: dict,
+    w: torch.nn.Module,
+    num_tokens: int,
+    max_num_tokens_per_gpu: int,
+) -> MoEInputBuffers:
+    """Return local producer views in the fixed MegaMoE input workspace.
+
+    Args:
+        plan: Selected MegaMoE plan containing the EP process group.
+        w: Expert module with hidden width, expert geometry, and SiTU values.
+        num_tokens: Number of local tokens, including zero on an idle rank.
+        max_num_tokens_per_gpu: Common token bound on every EP rank.
+
+    Returns:
+        Packed activation, padded scale storage, expert IDs, and routing
+        weights owned by the shared workspace. The next use may overwrite them.
+    """
+    from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.runner import get_runner
+
+    runner = get_runner(
+        plan["process_group"],
+        w.num_experts,
+        w.hidden_size,
+        w.intermediate_size,
+        w.top_k,
+        w.activation_situ_beta,
+        w.activation_situ_linear_beta,
+    )
+    return runner.input_buffers(num_tokens, max_num_tokens_per_gpu)
 
 
 def trtllm_mega_moe_process_weights(plan: dict, w: torch.nn.Module) -> None:
@@ -120,9 +153,9 @@ def trtllm_nvfp4_mega_moe_apply(
     Uses the upstream heuristic by default. Set MEGAMOE_TACTIC_AUTOTUNE=1
     identically on every EP rank before startup to participate in FlashInfer's
     autotuning context and reuse tuned tactics across compatible layers.
-    Graph timing includes input staging. One buffer set sized by the configured
-    autotuning maximum backs all token views and tactics, with fixed scratch
-    offsets so captured calls can alternate sizes without host-side resets.
+    Autotuning includes input staging in each measured call. One buffer set
+    sized by the configured autotuning maximum backs all token views and tactics.
+    Fixed scratch offsets let captured calls alternate sizes without host resets.
     Outside tuning, cache misses use the heuristic tactic. Tune and warm up
     before CUDA graph capture; all EP ranks must enter with identical caches.
 

@@ -620,7 +620,9 @@ def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(
         gate=mock.Mock(return_value=torch.zeros(rows, 2)),
         routed_expert_down_proj=mock.Mock(return_value=(latent, None)),
         experts=SimpleNamespace(
-            plan={"weight_dtype": weight_dtype}, w13_input_scale_quant=torch.ones(1)
+            plan={"weight_dtype": weight_dtype},
+            w13_input_scale_quant=torch.ones(1),
+            input_buffers=lambda num_tokens, max_tokens: None,
         ),
         moe_alltoall=None,
         _routed_experts=routed,

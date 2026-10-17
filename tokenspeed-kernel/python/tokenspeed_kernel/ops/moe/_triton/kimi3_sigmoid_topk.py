@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.moe._routing_output import routing_output_buffers
 from tokenspeed_kernel.platform import Platform, current_platform
 
 
@@ -46,6 +47,7 @@ def _kimi3_sigmoid_bias_topk_kernel(
     NORMALIZE_TOPK_WEIGHTS: tl.constexpr,
     HAS_DISPATCH_MAP: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    ROUND_WEIGHTS_TO_BF16: tl.constexpr,
 ):
     num_experts: tl.constexpr = 896
     padded_experts: tl.constexpr = 1024
@@ -104,6 +106,8 @@ def _kimi3_sigmoid_bias_topk_kernel(
 
     offset = tl.arange(0, topk)
     tl.store(topk_ids + offset, selected_ids)
+    if ROUND_WEIGHTS_TO_BF16:
+        selected_weights = selected_weights.to(tl.bfloat16)
     tl.store(topk_weights + offset, selected_weights)
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -118,6 +122,7 @@ def kimi3_sigmoid_bias_topk(
     logical_to_physical_map: torch.Tensor | None = None,
     weights_dtype: torch.dtype = torch.float32,
     enable_pdl: bool = False,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Route Kimi K3 tokens to their top 16 of 896 experts, one row per CTA.
 
@@ -135,10 +140,13 @@ def kimi3_sigmoid_bias_topk(
             router-logits read with ``gdc_wait`` / ``gdc_launch_dependents``
             (NVIDIA only; ignored elsewhere). Safe only when the router GEMV
             that writes ``router_logits`` is chained on the same stream/graph.
+        out: Optional contiguous weight and expert-ID output buffers. FP32
+            weight storage can hold values rounded to BF16. Omission allocates
+            weights in ``weights_dtype`` and IDs in INT32.
 
     Returns:
-        ``(topk_weights, topk_ids)`` shaped ``[tokens, 16]`` with ``weights_dtype``
-        weights and INT32 ids (physical ids when a dispatch map is given).
+        ``(topk_weights, topk_ids)`` shaped ``[tokens, 16]``. Supplied output
+        buffers are returned in place. A dispatch map produces physical IDs.
     """
     if (
         router_logits.dim() != 2
@@ -171,15 +179,8 @@ def kimi3_sigmoid_bias_topk(
             "int32/int64 [896] tensor"
         )
 
-    topk_ids = torch.empty(
-        (tokens, 16),
-        dtype=torch.int32,
-        device=router_logits.device,
-    )
-    topk_weights = torch.empty(
-        (tokens, 16),
-        dtype=weights_dtype,
-        device=router_logits.device,
+    topk_weights, topk_ids = routing_output_buffers(
+        router_logits, 16, weights_dtype, out
     )
     # waves_per_eu is a CDNA-only occupancy hint; NVIDIA Triton rejects it.
     amd_kwargs = {"waves_per_eu": 1} if Platform.get().is_amd else {}
@@ -196,6 +197,7 @@ def kimi3_sigmoid_bias_topk(
         NORMALIZE_TOPK_WEIGHTS=normalize_topk_weights,
         HAS_DISPATCH_MAP=logical_to_physical_map is not None,
         ENABLE_PDL=enable_pdl,
+        ROUND_WEIGHTS_TO_BF16=weights_dtype == torch.bfloat16,
         num_warps=8,
         num_stages=1,
         **amd_kwargs,

@@ -24,7 +24,9 @@ from collections.abc import Callable
 from dataclasses import replace
 
 import torch
+from tokenspeed_kernel.ops.moe import MoEInputBuffers
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_input_buffers as kernel_moe_input_buffers
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from tokenspeed_kernel.ops.moe.flashinfer import (
@@ -625,6 +627,14 @@ class MoELayer(torch.nn.Module):
         its own tokens. Otherwise every rank routes every token and an expert
         placement must pick the same replica for a route on every rank."""
         return self.plan["supports_all_to_all_ep"]
+
+    def input_buffers(
+        self, num_tokens: int, max_num_tokens_per_gpu: int
+    ) -> MoEInputBuffers | None:
+        """Return optional producer views from the selected MoE kernel."""
+        return kernel_moe_input_buffers(
+            self.plan, self, num_tokens, max_num_tokens_per_gpu
+        )
 
     def forward(
         self,

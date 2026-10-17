@@ -42,6 +42,7 @@ from flashinfer.autotuner import (
     autotuner_initializer_ones,
     is_in_profile_measurement,
 )
+from tokenspeed_kernel.ops.moe._input_buffers import MoEInputBuffers
 from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.megamoe_kernel import (
     Sm100MegaMoEKernel,
@@ -152,7 +153,7 @@ class MegaMoEWorkspace:
         sf_cols = ((hidden // 16 + 3) // 4) * 4
         layouts = [
             ((capacity, hidden // 2), torch.uint8),
-            ((capacity, sf_cols), torch.float8_e4m3fn),
+            (((capacity + 15) // 16 * 16, sf_cols), torch.float8_e4m3fn),
             ((capacity, top_k), torch.float32),
             ((sizes["shared"],), torch.uint8),
         ]
@@ -258,6 +259,45 @@ class MegaMoEWorkspace:
             kernel.shared_zero_i32_count = leading[1] // 4
         return kernel
 
+    def input_buffers(self, tokens: int, capacity: int) -> MoEInputBuffers:
+        if not 0 <= tokens <= capacity <= self.capacity:
+            raise ValueError("MegaMoE token count exceeds workspace capacity")
+        return MoEInputBuffers(
+            self.x[:tokens],
+            self.scales[: (tokens + 15) // 16 * 16].view(torch.uint8),
+            self.topk_ids[:tokens],
+            self.topk_weights[:tokens],
+        )
+
+    def stage_inputs(
+        self,
+        x: tuple[torch.Tensor, torch.Tensor],
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        capacity: int,
+    ) -> None:
+        """Stage external inputs and invalidate unused expert-ID rows."""
+        tokens = x[0].shape[0]
+        if not 0 <= tokens <= capacity <= self.capacity:
+            raise ValueError("MegaMoE token count exceeds workspace capacity")
+        for target, source in (
+            (self.x[:tokens], x[0]),
+            (
+                self.scales[:tokens, : self.hidden // 16].view(torch.uint8),
+                x[1][:tokens].view(torch.uint8),
+            ),
+            (self.topk_ids[:tokens], topk_ids),
+            (self.topk_weights[:tokens], topk_weights),
+        ):
+            # Producers can write into these views. External inputs still stage.
+            if not (
+                target.data_ptr() == source.data_ptr()
+                and target.dtype == source.dtype
+                and target.stride() == source.stride()
+            ):
+                target.copy_(source)
+        self.topk_ids[tokens:capacity].fill_(-1)
+
     def run(
         self,
         x: tuple[torch.Tensor, torch.Tensor],
@@ -271,13 +311,7 @@ class MegaMoEWorkspace:
         if not tokens <= capacity <= self.capacity:
             raise ValueError("MegaMoE token count exceeds workspace capacity")
         kernel = self._kernel(capacity, tactic)
-        self.x[:tokens].copy_(x[0])
-        self.scales[:tokens, : self.hidden // 16].view(torch.uint8).copy_(
-            x[1].view(torch.uint8)
-        )
-        self.topk_ids[:tokens].copy_(topk_ids)
-        self.topk_ids[tokens:capacity].fill_(-1)
-        self.topk_weights[:tokens].copy_(topk_weights)
+        self.stage_inputs(x, topk_ids, topk_weights, capacity)
         profiling = is_in_profile_measurement()
         key = (capacity, tactic, *[t.data_ptr() for t in weights], output.data_ptr())
         # Do not retain temporary profiling clones through cached DLPack views.
@@ -442,10 +476,7 @@ class MegaMoERunner(TunableRunner):
             tactic,
         )
 
-    def run(self, x, topk_ids, topk_weights, weights, max_tokens: int):
-        capacity = _token_capacity(max_tokens)
-        if capacity > self.max_capacity:
-            raise ValueError("MegaMoE token count exceeds the configured maximum")
+    def _ensure_workspace(self) -> MegaMoEWorkspace:
         if self.workspace is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
@@ -461,13 +492,26 @@ class MegaMoERunner(TunableRunner):
                 self.situ_beta,
                 self.situ_linear_beta,
             )
+        return self.workspace
+
+    def input_buffers(self, tokens: int, max_tokens: int) -> MoEInputBuffers:
+        capacity = _token_capacity(max_tokens)
+        if capacity > self.max_capacity:
+            raise ValueError("MegaMoE token count exceeds the configured maximum")
+        return self._ensure_workspace().input_buffers(tokens, capacity)
+
+    def run(self, x, topk_ids, topk_weights, weights, max_tokens: int):
+        capacity = _token_capacity(max_tokens)
+        if capacity > self.max_capacity:
+            raise ValueError("MegaMoE token count exceeds the configured maximum")
+        workspace = self._ensure_workspace()
         # All ranks use the same capacity, including ranks with no local tokens.
         inputs = [
             *x,
             topk_ids,
             topk_weights,
             *weights,
-            self.workspace.output[:capacity],
+            workspace.output[:capacity],
         ]
         if not self.tactic_autotune:
             return self.forward(inputs, tactic=-1)

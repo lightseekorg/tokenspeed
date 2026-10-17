@@ -47,6 +47,7 @@ from tokenspeed_kernel.ops.moe._triton.latent_input import (
 )
 from tokenspeed_kernel.ops.moe._triton.minimax_topk import (
     minimax_biased_grouped_topk,
+    scale_sigmoid_weights_inplace,
 )
 from tokenspeed_kernel.ops.moe._triton.mxfp4 import _moe as _triton_mxfp4_moe_impl
 from tokenspeed_kernel.ops.moe._triton.sigmoid_topk_routing import (
@@ -134,6 +135,7 @@ register_kernel(
         "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
     ),
     priority=Priority.PERFORMANT,
+    traits={"supports_output_buffers": frozenset({True})},
 )
 def triton_minimax_sigmoid_bias_topk(
     *,
@@ -143,6 +145,7 @@ def triton_minimax_sigmoid_bias_topk(
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
     weights_dtype: torch.dtype = torch.float32,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused single-kernel routing via the minimax biased-topk Triton kernel.
 
@@ -151,6 +154,10 @@ def triton_minimax_sigmoid_bias_topk(
     (40us vs 13us at [1, 896] topk=16). ``hidden_states`` is only shape-
     validated by the kernel wrapper, so the logits stand in for it.
     """
+    if out is not None and not normalize_topk_weights and out[0].dtype != torch.float32:
+        raise ValueError(
+            "Unnormalized routing output buffers require FP32 weight storage"
+        )
     # The kernel scales only when it renormalizes, so keep fp32 through mul_.
     topk_weights, topk_ids = minimax_biased_grouped_topk(
         router_logits,
@@ -163,11 +170,17 @@ def triton_minimax_sigmoid_bias_topk(
         num_fused_shared_experts=0,
         routed_scaling_factor=routed_scaling_factor,
         weights_dtype=weights_dtype if normalize_topk_weights else torch.float32,
+        out=out,
     )
     if not normalize_topk_weights:
-        topk_weights.mul_(routed_scaling_factor)
-        topk_weights = topk_weights.to(weights_dtype)
-    return topk_weights, topk_ids.to(torch.int32)
+        if out is None:
+            topk_weights.mul_(routed_scaling_factor)
+            topk_weights = topk_weights.to(weights_dtype)
+        else:
+            scale_sigmoid_weights_inplace(
+                topk_weights, float(routed_scaling_factor), weights_dtype
+            )
+    return topk_weights, topk_ids if out is not None else topk_ids.to(torch.int32)
 
 
 # ===-----------------------------------------------------------------------===#
@@ -200,6 +213,7 @@ def _invoke_packed(
     normalize_topk_weights: bool,
     weights_dtype: torch.dtype,
     logical_to_physical_map: torch.Tensor | None = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch the packed K3 specialist after layout/dtype adapters.
 
@@ -222,6 +236,7 @@ def _invoke_packed(
         ),
         weights_dtype=weights_dtype,
         enable_pdl=pdl_enabled(),
+        out=out,
     )
 
 
@@ -236,7 +251,11 @@ _PACKED_SIGNATURES = format_signatures("router_logits", "dense", {torch.float32}
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_PACKED_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    traits={**_PACKED_CONTRACT, "tokens": _PACKED_ROWS_NVIDIA},
+    traits={
+        **_PACKED_CONTRACT,
+        "tokens": _PACKED_ROWS_NVIDIA,
+        "supports_output_buffers": frozenset({True}),
+    },
 )
 def triton_kimi3_packed_sigmoid_bias_topk_nvidia(
     *,
@@ -246,6 +265,7 @@ def triton_kimi3_packed_sigmoid_bias_topk_nvidia(
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
     weights_dtype: torch.dtype,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return packed top-16 weights and ids for FP32 ``[tokens, 896]`` logits.
 
@@ -261,6 +281,7 @@ def triton_kimi3_packed_sigmoid_bias_topk_nvidia(
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
         weights_dtype=weights_dtype,
+        out=out,
     )
 
 
@@ -272,7 +293,11 @@ def triton_kimi3_packed_sigmoid_bias_topk_nvidia(
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_PACKED_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    traits={**_PACKED_CONTRACT, "tokens": _PACKED_ROWS_NVIDIA},
+    traits={
+        **_PACKED_CONTRACT,
+        "tokens": _PACKED_ROWS_NVIDIA,
+        "supports_output_buffers": frozenset({True}),
+    },
 )
 def triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped(
     *,
@@ -283,6 +308,7 @@ def triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped(
     normalize_topk_weights: bool,
     logical_to_physical_map: torch.Tensor,
     weights_dtype: torch.dtype,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return packed top-16 weights and ids for FP32 ``[tokens, 896]`` logits.
 
@@ -299,6 +325,7 @@ def triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped(
         normalize_topk_weights=normalize_topk_weights,
         logical_to_physical_map=logical_to_physical_map,
         weights_dtype=weights_dtype,
+        out=out,
     )
 
 

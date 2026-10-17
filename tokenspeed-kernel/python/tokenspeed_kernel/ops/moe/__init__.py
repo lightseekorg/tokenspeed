@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import torch
+from tokenspeed_kernel.ops.moe._input_buffers import MoEInputBuffers
+from tokenspeed_kernel.ops.moe._routing_output import routing_output_buffers
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -47,6 +49,8 @@ __all__ = [
     "latent_moe_expert_shared",
     "latent_moe_input_projections",
     "moe_apply",
+    "moe_input_buffers",
+    "MoEInputBuffers",
     "moe_plan",
     "moe_process_weights",
     "moe_warmup",
@@ -719,6 +723,7 @@ def _moe_sigmoid_bias_topk(
     weights_dtype: torch.dtype = torch.float32,
     override: str | None = None,
     solution: str | None = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select experts using ``sigmoid(logits) + correction_bias``.
 
@@ -735,11 +740,14 @@ def _moe_sigmoid_bias_topk(
             runs in FP32).
         override: Optional exact registered kernel name.
         solution: Optional implementation solution.
+        out: Optional contiguous weight and expert-ID output buffers. FP32
+            weight storage can hold values rounded to BF16. IDs can use
+            INT32 or INT64. The selected kernel must support these buffers.
 
     Returns:
-        ``(topk_weights, topk_ids)`` with shapes ``[tokens, topk]``. Weights
-        are ``weights_dtype`` and ids are INT32 (physical ids when a dispatch
-        map is given).
+        ``(topk_weights, topk_ids)`` with shapes ``[tokens, topk]``. Supplied
+        output buffers are returned in place. Without buffers, weights use
+        ``weights_dtype`` and IDs use INT32. A dispatch map produces physical IDs.
     """
     if router_logits.dim() != 2:
         raise ValueError("router_logits must have shape [tokens, experts]")
@@ -761,11 +769,7 @@ def _moe_sigmoid_bias_topk(
     if not 0 < topk <= experts:
         raise ValueError(f"topk must be in [1, {experts}], got {topk}")
     if tokens == 0:
-        shape = (0, topk)
-        return (
-            torch.empty(shape, device=router_logits.device, dtype=weights_dtype),
-            torch.empty(shape, device=router_logits.device, dtype=torch.int32),
-        )
+        return routing_output_buffers(router_logits, topk, weights_dtype, out)
     if (
         override is None
         and solution is None
@@ -794,6 +798,14 @@ def _moe_sigmoid_bias_topk(
         except NoKernelFoundError:
             mapped_kernel = None
         if mapped_kernel is not None:
+            if out is not None:
+                spec = KernelRegistry.get().get_by_name(mapped_kernel.name)
+                if spec is None or True not in spec.traits.get(
+                    "supports_output_buffers", frozenset({False})
+                ):
+                    raise ValueError(
+                        f"{mapped_kernel.name} does not accept routing output buffers"
+                    )
             topk_weights, topk_ids = mapped_kernel(
                 router_logits=router_logits,
                 correction_bias=correction_bias,
@@ -802,6 +814,7 @@ def _moe_sigmoid_bias_topk(
                 normalize_topk_weights=normalize_topk_weights,
                 logical_to_physical_map=logical_to_physical_map,
                 weights_dtype=weights_dtype,
+                **({"out": out} if out is not None else {}),
             )
             return topk_weights, topk_ids
 
@@ -813,6 +826,12 @@ def _moe_sigmoid_bias_topk(
         override=override,
         solution=solution,
     )
+    if out is not None:
+        spec = KernelRegistry.get().get_by_name(kernel.name)
+        if spec is None or True not in spec.traits.get(
+            "supports_output_buffers", frozenset({False})
+        ):
+            raise ValueError(f"{kernel.name} does not accept routing output buffers")
     topk_weights, topk_ids = kernel(
         router_logits=router_logits,
         correction_bias=correction_bias,
@@ -820,9 +839,13 @@ def _moe_sigmoid_bias_topk(
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
         weights_dtype=weights_dtype,
+        **({"out": out} if out is not None else {}),
     )
     if logical_to_physical_map is not None:
         topk_ids = logical_to_physical_map[topk_ids.long()].to(torch.int32)
+        if out is not None:
+            out[1].copy_(topk_ids)
+            topk_ids = out[1]
     return topk_weights, topk_ids
 
 
@@ -924,6 +947,7 @@ def moe_topk(
     topk_weights_dtype: torch.dtype = torch.float32,
     override: str | None = None,
     solution: str | None = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Produce expert weights and ids using a registered MoE TopK kernel.
 
@@ -944,11 +968,15 @@ def moe_topk(
         logical_to_physical_map: Optional expert-id map for sigmoid routing.
         topk_indices_dtype: Integer dtype for returned expert ids.
         topk_weights_dtype: Floating-point dtype for returned routing weights.
+            With out, this selects the rounding precision before the final store.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
+        out: Optional (weights, ids) output buffers for biased sigmoid routing.
+            IDs must use topk_indices_dtype. Weights may hold BF16 values in
+            FP32 storage. Omission allocates the outputs in the selected kernel.
     Returns:
         Weights and expert ids shaped [tokens, top_k], using the requested
-        output dtypes (FP32 weights and INT32 ids by default).
+        output dtypes, or the supplied out buffers.
     """
     if selection_method not in {"topk", "hash"}:
         raise ValueError(f"unsupported MoE selection method: {selection_method!r}")
@@ -963,6 +991,13 @@ def moe_topk(
         raise ValueError("topk_indices_dtype must be torch.int32 or torch.int64")
     if not topk_weights_dtype.is_floating_point:
         raise ValueError("topk_weights_dtype must be a floating-point dtype")
+    if out is not None:
+        if score_function != "sigmoid":
+            raise ValueError(
+                "Routing output buffers currently support biased sigmoid top-k"
+            )
+        if out[1].dtype != topk_indices_dtype:
+            raise ValueError("Routing expert-ID output must match topk_indices_dtype")
 
     scaling_factor = 1.0 if routed_scaling_factor is None else routed_scaling_factor
     if score_function == "softmax":
@@ -998,6 +1033,7 @@ def moe_topk(
             weights_dtype=topk_weights_dtype,
             override=override,
             solution=solution,
+            **({"out": out} if out is not None else {}),
         )
         return topk_weights, topk_ids.to(topk_indices_dtype)
 
@@ -1552,6 +1588,39 @@ def moe_plan(
         "internal_activation_dtype": internal_activation_dtype,
         "fp32_correction_bias": fp32_correction_bias,
     }
+
+
+def moe_input_buffers(
+    plan: dict,
+    w: torch.nn.Module,
+    num_tokens: int,
+    max_num_tokens_per_gpu: int,
+) -> MoEInputBuffers | None:
+    """Return producer output views owned by the selected MoE kernel.
+
+    Args:
+        plan: Selected MoE plan, including its process group.
+        w: Expert module holding the model geometry and processed weights.
+        num_tokens: Number of local tokens, including zero on an idle rank.
+        max_num_tokens_per_gpu: Rank-identical token bound for the next call.
+
+    Returns:
+        Input views when the kernel provides them, or None otherwise.
+        Scale rows include the NVFP4 quantizer's padding to 16 rows.
+        Use the views only until the next call using the same workspace.
+        Autotuning may overwrite the views. Discard tuning-call outputs and
+        regenerate the inputs before inference.
+        Initialize the views eagerly before capturing a CUDA graph.
+    """
+    if plan["apply_kernel_name"] != "trtllm_nvfp4_mega_moe_apply":
+        return None
+    from tokenspeed_kernel.ops.moe.cute_dsl import (
+        trtllm_nvfp4_mega_moe_input_buffers,
+    )
+
+    return trtllm_nvfp4_mega_moe_input_buffers(
+        plan, w, num_tokens, max_num_tokens_per_gpu
+    )
 
 
 def moe_process_weights(plan: dict, w: torch.nn.Module):
