@@ -730,6 +730,35 @@ def test_select_all_causal_pages_and_replay(target, candidate_capacity):
             )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_select_all_tile_slices_reuse_compilation():
+    from utils import assert_no_triton_compile
+
+    # Prefill tiles pass row slices of shared buffers; the slice start must
+    # not select a compilation through the pointers' alignment.
+    table = torch.arange(1, 9, dtype=torch.int32, device="cuda").repeat(9, 1)
+    lengths = torch.full((9,), 300, dtype=torch.int32, device="cuda")
+    out = tuple(
+        torch.empty(shape, dtype=torch.int32, device="cuda")
+        for shape in ((9, 512), (9,), (9, 64), (9,))
+    )
+
+    def run(start, stop):
+        dsv41.index_select_all(
+            table[start:stop],
+            lengths[start:stop],
+            9,
+            8,
+            tuple(x[start:stop] for x in out),
+        )
+
+    run(0, 4)
+    with assert_no_triton_compile(implementation._index_select_all):
+        for start, stop in ((1, 4), (3, 9), (5, 6), (2, 7)):
+            run(start, stop)
+    torch.testing.assert_close(out[1], lengths)
+
+
 def _candidate_reference(logits, lengths, candidates, block_size, alignment):
     logits, lengths, candidates = (x.cpu() for x in (logits, lengths, candidates))
     count = candidates.shape[1]

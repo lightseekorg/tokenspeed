@@ -31,6 +31,16 @@ from tokenspeed_kernel.thirdparty.deep_select import deep_select_alignment
 
 @triton.jit(
     do_not_specialize=["X0", "L0", "T0", "T1", "TC", "NP", "CAP", "STRIDE"],
+    do_not_specialize_on_alignment=[
+        "X0",
+        "L0",
+        "T0",
+        "T1",
+        "TC",
+        "NP",
+        "CAP",
+        "STRIDE",
+    ],
 )
 def _clean_logits_block_max(
     X,
