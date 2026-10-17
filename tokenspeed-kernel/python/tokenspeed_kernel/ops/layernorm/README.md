@@ -40,6 +40,25 @@ CUDA-graph capture).
 | `torch_qk_rmsnorm_ssmax` | `torch`, PORTABLE | every shape of the BF16 q/k/weights x int32/int64 positions signatures, any device the shared kernel runs on | `BeamRMSNorm.forward` for `residual=None, out=None` on the q heads and on the k heads (the same `rmsnorm(...)` call with the module's weight and eps), then the three statements of `apply_ssmax_root10` with Beam's constants -- the NoPE branch transcribed; 2-D views of the fresh 3-D tensors |
 | `triton_fused_qk_rmsnorm_ssmax` | `triton`, SPECIALIZED, NVIDIA SM100 to SM103 | traits `tokens_min {1}`, `head_dim {128}`, `heads {(48, 8), (6, 1)}`, `ndim {2}`, `unit_stride`, `rows_disjoint`, `weights_contiguous`, `positions_contiguous`, `eps_ok`, `is_cuda`: BF16 rank-2 `q`/`k` with a contiguous last axis and token strides covering the row (Beam's `qkv.split` column views or contiguous), the pair `(48, 8)` or `(6, 1)`, contiguous BF16 `[128]` weights, contiguous int32/int64 `[tokens]` positions, a finite positive `eps`, `tokens > 0`, every tensor on one CUDA device; a by-name call outside them raises (`qk_rmsnorm_ssmax_rejection`) | `qk_rmsnorm(q, k, q_weight, k_weight, eps, weight_offset=0.0, ssmax_positions=positions)`: one launch of `_fused_qk_rmsnorm_kernel` with `ROUND_AFTER_AFFINE=True, SSMAX_INKERNEL=True` |
 
+### AMD query-producer fusion
+
+`gluon_qk_rmsnorm_ssmax_gfx950` (solution `gluon`, SPECIALIZED) admits BF16
+rank-2 Q6/KV1, head dimension128; positive token counts; disjoint, unit-column-stride
+Q/K rows (including the1792-column fused projection); contiguous BF16 weights and
+int32/int64 positions; and finite positive epsilon. Query RMSNorm and positional
+scaling share one producer. Key normalization remains the existing shared RMSNorm
+call. The affine query rounds to BF16 **before** the FP32 positional scale and
+final BF16 store.
+
+The implementation uses HIP libdevice `log1p` and `exp`, not an approximate power
+or an `exp2` substitution. Positions and row strides remain runtime values;
+changing positions in a captured graph does not specialize the kernel. Automatic
+selection changes only the admitted gfx950 geometry. NVIDIA selection and every
+unsupported geometry retain their previous implementation. Requests with optional
+unscaled-FP8 dequantization retain the portable operation; an explicit Gluon call
+with that feature raises before launch. No output gating, rotary transform, cache
+write or residual arithmetic is included in this producer.
+
 The keyword `ssmax_positions` of `triton.qk_rmsnorm` (default `None`) maps to
 the two kernel constexprs `ROUND_AFTER_AFFINE` and `SSMAX_INKERNEL` (last,
 defaulted `False`): the affine output `x * inv_rms * w` is rounded once to BF16

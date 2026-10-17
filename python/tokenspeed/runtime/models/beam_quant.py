@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Quantized Beam checkpoints: the two formats Beam admits and their loading.
+"""Quantized Beam checkpoints: admitted formats and their loading.
 
 - compressed-tensors FP8 dynamic W8A8 (llm-compressor's FP8_DYNAMIC: FP8 E4M3
   weights with a static scale per output channel, activations quantized per
@@ -30,6 +30,9 @@
 - ModelOpt NVFP4 (group 16) of the experts only. The expert tensors load
   unchanged into FlashInfer's TRT-LLM NVFP4 MoE; attention, the dense MLP
   layers, the router and the LM head must be stored unquantized.
+- Quark MXFP4 (group 32) of the experts only, with dynamic MXFP4 activations.
+  The portable Triton MoE retains linear packed E2M1 values and E8M0 scales.
+  Attention, dense MLPs, routers and the output head remain unquantized.
 
 Any other quantization is refused with the reason, as are a declared KV-cache
 quantization (the KV cache stays BF16) and a router or correction bias that is
@@ -49,6 +52,7 @@ from compressed_tensors.quantization import QuantizationStrategy, QuantizationTy
 from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
+from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
     check_equal_or_regex_match,
@@ -57,8 +61,9 @@ from tokenspeed.runtime.layers.quantization.utils import (
 )
 
 ADMITTED = (
-    "admitted: compressed-tensors FP8 dynamic W8A8 with channel weight scales "
-    "and ModelOpt NVFP4 experts with group size 16"
+    "admitted: compressed-tensors FP8 dynamic W8A8 with channel weight scales, "
+    "ModelOpt NVFP4 experts with group size 16, and dynamic Quark MXFP4 experts "
+    "with group size 32"
 )
 _CT_FORMATS = ("float-quantized", "naive-quantized")
 # The weight scale dtypes a compressed-tensors tool writes (the model's dtype or
@@ -128,13 +133,25 @@ def _ct_fp8_dynamic_refusal(config: CompressedTensorsConfig) -> str | None:
 
 
 def beam_checkpoint_format(quant_config: Any) -> str:
-    """``"fp8_channel"`` or ``"nvfp4"``; ValueError names why a quantization is
-    refused."""
+    """Return ``fp8_channel``, ``nvfp4`` or ``mxfp4`` for an admitted export.
+
+    Raise ValueError with the unsupported format or quantization setting.
+    """
     if type(quant_config) is CompressedTensorsConfig:
         refusal = _ct_fp8_dynamic_refusal(quant_config)
         if refusal is not None:
             raise ValueError(f"Beam refuses compressed-tensors {refusal}; {ADMITTED}")
         return "fp8_channel"
+    if type(quant_config) is Mxfp4Config:
+        if (
+            quant_config.is_checkpoint_mxfp4_serialized
+            and quant_config.use_dynamic_mxfp4_activations
+            and not quant_config.is_w4a8_fp8
+            and not quant_config.fp8_layer_patterns
+            and quant_config.group_size == 32
+        ):
+            return "mxfp4"
+        raise ValueError(f"Beam requires serialized dynamic MXFP4 experts; {ADMITTED}")
     if type(quant_config) is Nvfp4Config:
         kv = quant_config.kv_cache_quant_algo
         if quant_config.group_size != 16:
@@ -215,6 +232,20 @@ def _module_role(module: str) -> str:
     return module.rpartition(".")[2]
 
 
+def _check_mxfp4(module: str, weight: torch.Tensor, scale: torch.Tensor) -> None:
+    if weight.dtype != torch.uint8 or weight.ndim != 2:
+        raise TypeError(f"{module}.weight: expected a packed uint8 MXFP4 matrix")
+    rows, packed_width = weight.shape
+    if (
+        packed_width % 16
+        or scale.dtype != torch.uint8
+        or scale.shape != (rows, packed_width // 16)
+    ):
+        raise TypeError(f"{module}.weight_scale: expected uint8 group-32 E8M0 scales")
+    if bool((scale == 255).any()):
+        raise ValueError(f"{module}.weight_scale: E8M0 scales must be finite")
+
+
 @dataclass
 class BeamQuantPolicy:
     """How Beam loads one admitted quantized checkpoint (``fmt``: its
@@ -229,6 +260,8 @@ class BeamQuantPolicy:
         config = self.quant_config
         if self.fmt == "nvfp4":
             return not should_exclude_quant_module(module, config.exclude_modules)
+        if self.fmt == "mxfp4":
+            return not should_ignore_quant_layer(module, config.ignored_layers)
         if should_ignore_quant_layer(module, config.ignored_layers):
             return False
         return any(
@@ -238,6 +271,8 @@ class BeamQuantPolicy:
 
     def load_witness(self) -> str:
         counts = ", ".join(f"{k} {v}" for k, v in sorted(self.counts.items()))
+        if self.fmt == "mxfp4":
+            return f"Beam Quark MXFP4 checkpoint (experts only) loaded as packed MXFP4: {counts}"
         if self.fmt == "fp8_channel":
             return (
                 "Beam FP8 checkpoint (compressed-tensors FP8 dynamic W8A8) "
@@ -276,6 +311,14 @@ class BeamQuantPolicy:
                     )
             elif not quantized:
                 if leaf == "weight":
+                    if (
+                        self.fmt == "mxfp4"
+                        and role == "experts"
+                        and self._quantizes(module)
+                    ):
+                        raise TypeError(
+                            f"{name}: MXFP4 expert weights must be packed uint8"
+                        )
                     if module in pending:
                         raise ValueError(f"{name}: an unquantized weight with scales")
                     plain.add(module)
@@ -298,9 +341,13 @@ class BeamQuantPolicy:
                         self._note_input_scale(module, value)
                 self.counts["expert tensors kept NVFP4"] += 1
             else:
+                if self.fmt == "mxfp4" and role != "experts":
+                    raise ValueError(
+                        f"{name}: Beam quantizes only routed experts to MXFP4"
+                    )
                 if leaf not in ("weight", "weight_scale"):
                     raise ValueError(
-                        f"{name}: compressed-tensors FP8 dynamic W8A8 has no "
+                        f"{name}: {self.fmt} has no "
                         f"{leaf} (activations are quantized per token at run time)"
                     )
                 entry = pending.setdefault(module, {})
@@ -311,8 +358,12 @@ class BeamQuantPolicy:
                     continue
                 del pending[module]
                 done.add(module)
-                _check_fp8_channel(module, entry["weight"], entry["weight_scale"])
-                self.counts[f"{role} kept FP8"] += 1
+                if self.fmt == "mxfp4":
+                    _check_mxfp4(module, entry["weight"], entry["weight_scale"])
+                    self.counts["experts kept MXFP4"] += 1
+                else:
+                    _check_fp8_channel(module, entry["weight"], entry["weight_scale"])
+                    self.counts[f"{role} kept FP8"] += 1
                 yield f"{module}.weight", entry["weight"]
                 yield f"{module}.weight_scale", entry["weight_scale"]
                 continue

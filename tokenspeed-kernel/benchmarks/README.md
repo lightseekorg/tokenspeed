@@ -110,6 +110,35 @@ Correctness runs before timing. A failure prevents the case from producing a
 successful measurement. Correctness remains within the revision-local process,
 and tensor values are never serialized for cross-revision comparison.
 
+## Beam FP8 expert apply
+
+The gfx950 suite includes six `beam.moe.apply/` cases: 1, 2, 4, 8, 16 and
+8192 token rows on each TP4/EP1 rank. They use nonzero, seeded per-output-channel
+E4M3 weights with FP32 scales and BF16 inputs. A separate weight generator
+preserves the input/router random stream; construction version and seed are
+reported. Grouped sigmoid routing (8 groups, group top-2, 4 retained groups,
+8 experts, normalized weights scaled by 2.5) runs once before timing. Its
+synthetic per-expert counts are reported, not claimed as trained imbalance.
+
+Timing covers the public `moe_apply` call: route packing, native activation
+quantization, both expert projections, activation and route combination.
+BF16 inputs are not prequantized by the generator; the selected registration
+owns all quantization boundaries. Router projection/selection, weight creation,
+plan selection, TP reduction and serving are outside the measured operation.
+These cases inherit the suite timer and have no generator correctness validator;
+successful timing must retain correctness-unavailable status, not imply accuracy.
+The existing stronger expert GPU tests and a separately qualified full-layout
+comparison remain correctness gates before optimization claims.
+
+First check ordinary admission without a kernel override. A separate timing
+process may use `TOKENSPEED_KERNEL_OVERRIDE_MOE_APPLY` to name the exact baseline
+registration; the actual registration and resolved override are reported.
+Exact overrides bypass platform/signature/trait filtering, so forced timing is
+not admission evidence. Request-level selectors remain refused, and routing,
+plan or FP8 quantizer overrides are rejected for these cases. Run native timing with
+`--profiler none`; profile separately. Do not force an override through tests
+whose purpose is to check normal selection or unsupported contracts.
+
 ## Suite contract
 
 A suite declares:

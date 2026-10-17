@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import tokenspeed_kernel.ops.layernorm._triton.weightless  # noqa: F401
+import tokenspeed_kernel.ops.layernorm.gluon  # noqa: F401
 
 # Registers the ``layernorm.qk_rmsnorm_ssmax`` kernels at package import (the
 # module itself imports ``tokenspeed_kernel.ops.layernorm.triton``). The package

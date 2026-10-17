@@ -559,6 +559,7 @@ def scaled_mm_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_SCALE_A: tl.constexpr,
     BLOCK_SIZE_SCALE_B: tl.constexpr,
+    FP8_ACCUMULATION_STREAMS: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
 
@@ -609,13 +610,24 @@ def scaled_mm_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         masks_k = offsets_k < K
         masks_a = masks_am[:, None] & masks_k[None, :]
-        a = tl.load(a_ptrs, mask=masks_a)
+        a = tl.load(a_ptrs, mask=masks_a, other=0.0)
 
         masks_b = masks_k[:, None] & masks_bn[None, :]
-        b = tl.load(b_ptrs, mask=masks_b)
+        b = tl.load(b_ptrs, mask=masks_b, other=0.0)
 
         # Accumulate results.
-        accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
+        if FP8_ACCUMULATION_STREAMS > 1:
+            # gfx950 native FP8 MFMA loses small products within groups of
+            # eight K positions (65536 + 1 can become 65536). Keep only one
+            # nonzero position per group in each native dot. The accumulator
+            # carries between dots in FP32; storage and operands remain FP8.
+            zero = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K), 0.0, a.dtype)
+            for stream in tl.static_range(FP8_ACCUMULATION_STREAMS):
+                mask = (offsets_k % FP8_ACCUMULATION_STREAMS == stream)[None, :]
+                a_stream = tl.where(mask, a, zero)
+                accumulator = tl.dot(a_stream, b, accumulator, out_dtype=tl.float32)
+        else:
+            accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
 
         offsets_k += BLOCK_SIZE_K
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -671,11 +683,13 @@ def triton_scaled_mm(
     block_size_k: int = 32,
     use_heuristic=True,
     out: torch.Tensor | None = None,
+    *,
+    fp8_accumulation_streams: int,
 ) -> torch.Tensor:
     M, K = input.shape
     N = weight.shape[1]
 
-    assert N > 0 and K > 0 and M > 0
+    assert N > 0 and K > 0 and M >= 0
     assert weight.shape[0] == K
     assert input.dtype == weight.dtype
 
@@ -703,6 +717,9 @@ def triton_scaled_mm(
         raise ValueError(
             f"triton_scaled_mm out expects dtype {out_dtype}, got {result.dtype}"
         )
+
+    if M == 0:
+        return result
 
     has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
 
@@ -749,6 +766,7 @@ def triton_scaled_mm(
         BLOCK_SIZE_K=block_size_k,
         BLOCK_SIZE_SCALE_A=block_size_sa,
         BLOCK_SIZE_SCALE_B=block_size_sb,
+        FP8_ACCUMULATION_STREAMS=fp8_accumulation_streams,
     )
 
     return result

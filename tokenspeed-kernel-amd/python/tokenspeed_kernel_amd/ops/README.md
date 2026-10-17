@@ -1,5 +1,16 @@
 # AMD LLM kernels
 
+## Beam query normalization and positional scaling
+
+`gluon_qk_rmsnorm_ssmax_gfx950` fuses the query RMSNorm producer and SSMax scale
+for six128-wide BF16 query heads. Each workgroup handles one token/head with a
+128-element FP32 sum-of-squares reduction, preserving the BF16 affine rounding
+before multiplying by `exp(0.1 * log1p((position + 1) / 2048))` in FP32 and storing
+BF16. HIP libdevice provides `log1p`/`exp`; the launch disables reassociation.
+Token strides, positions and epsilon are runtime data. The public operation
+retains the existing key-normalization call and falls back for optional unscaled
+FP8 dequantization. This kernel does not change rotary or output-gating arithmetic.
+
 ## Kernel conventions
 
 ### Names
@@ -1001,6 +1012,23 @@ FP8 conversion. A wave skips the rescale when none of its rows moved. Empty
 asm statements keep LLVM from moving each cluster's results across cluster
 barriers.
 
+### gfx950 MHA cached extension
+
+`gluon_mha_extend_gfx950` groups query heads sharing one KV head and reuses
+each paged KV tile across several query positions. Head groups are padded
+to a power of two inside the matrix tile. Query positions advance by this
+padded head span, while global head addresses use the real group width.
+Unused head lanes never load queries or sinks and never store outputs,
+normalization values or split partials. This supports groups such as five
+and six without changing logical token/head ordering or the existing
+full-attention, sliding-window and split-reduction algorithms.
+
+The public operation remains `attention.mha_extend_with_kvcache` with
+`solution="gluon"`. BF16/FP16, 64/128-wide heads, page size 64, optional sinks
+and causal/noncausal masks follow the existing registration. CPU tile tests
+and device tests cover padded groups, speculative query blocks, chunk/tail
+prefills, ragged cached extensions and graph replay after metadata changes.
+
 ### gfx950 MLA extend
 
 `gluon_mla_extend_gfx950` computes absorbed MLA attention for cached extend
@@ -1819,3 +1847,41 @@ FP32 bits of the quotient, and its codes are the correctly rounded
 `x / scale` cast to E4M3. Each program covers consecutive groups, with four
 threads per group and eight elements per thread: 32 groups and four warps
 below 49,152 groups, and 256 groups and eight warps from there.
+
+## Experimental channel-FP8 grouped Gluon experts
+
+`gluon_fp8_channel_bf16_precomputed_moe_apply` is an explicit research candidate
+for gfx950 TP4/TP8 with EP1, 256 local experts, hidden width 5120, local
+intermediate width 640/320 respectively and top-eight routing.
+It accepts only `precision_policy="default"` (also used when omitted), with
+unit output scale. Its arithmetic uses FP8 storage, BF16 projection operands,
+unweighted BF16 expert outputs and FP32 weighted-route accumulation.
+
+Beam selects this implementation with explicit `--moe-backend gluon` through
+the normal registry; no implementation-name pin is required. The Gluon
+candidate's priority remains below the portable native-FP8 implementation,
+so automatic plans retain native-FP8 selection. Promoting this candidate to
+automatic selection would change projection arithmetic and requires separate
+numerical qualification.
+
+The candidate extends the pre-existing compact-FP8 grouped gate/up and down
+stages. FP8 codes remain resident; register loads widen raw codes exactly to
+BF16 shared operands, preserving the established grouped MFMA pipeline and
+FP32 accumulation. This is BF16 compute, not native FP8 or scaled-BF16 weights.
+It avoids the unsupported 64-bit vector that a dtype-only activation async-copy
+change would create. Actual compilation/instruction behavior remains a device
+qualification gate.
+The channel FC1 launcher uses an N64 output tile for local width 320, which
+does not divide N128; width 640 keeps its existing tile choices. FC2 retains
+K64, which divides both widths. No projection tail or new kernel is needed.
+
+Projection epilogues apply token then channel scales with fusion disabled.
+Gate/up stay FP32 through SiLU and multiplication, then round once to BF16.
+The existing route quantizer retains scaled-product BF16 rounding before FP8.
+Down outputs round to **unweighted** BF16 before the unchanged ordered FP32
+weighted combine. No split-K, atomic output or materialized-weight
+fallback is selected. Existing BF16/block-FP8 launchers retain explicit legacy
+mode. Qualification is shape-specific, not a default replacement or a serving
+speedup claim. TP8 tests cover physical decode rows 16/32/64/128/256 and
+prefill/tail rows 848/896/8192 against the unchanged normalized L2 limit 0.002,
+then require exact eager/graph replay with changed live expert populations.

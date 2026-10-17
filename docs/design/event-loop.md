@@ -245,6 +245,35 @@ same on every rank, so the ranks collect in the same round and each
 collection walks only what serving keeps alive. The young generations still
 collect automatically.
 
+### Profiling the issuing thread
+
+CPU/GPU profiler sessions enable PyTorch's experimental all-thread capture so
+the already-running forward thread is included. The actual model-forward
+closure emits `tokenspeed.forward.v1:` followed by compact JSON with `mode`,
+`num_extends`, ordered `request_ids`, per-request current-step `input_lengths`,
+total-prompt `prefill_lengths`, and prefill-only `extend_prefix_lens`.
+The mode is derived from the immutable submitted batch, including MIXED and
+IDLE, not from result-commit time or a stage-profile filename.
+
+The range encloses `execute_forward_op`, including preparation, model work,
+sampling, state updates and output-copy submission. Separately submitted cache
+or transfer work is not forced into this range. No tensors are read for the
+annotation and no synchronization, collective, graph or scheduling behavior
+changes. Device kernels can finish after the host range closes: analysis must
+join the issuing host launch to its device work by correlation identifiers,
+scoped by rank/process/thread, rather than clip device time to the CPU range.
+Request IDs permit measured traffic to be distinguished from health requests.
+
+Metadata serialization runs only while the installed PyTorch process-global
+`torch.autograd.profiler._is_profiler_enabled` flag is true. Its C++ enabled
+query is thread-local and remains false on a pre-existing all-thread worker.
+This is an explicitly version-dependent internal/experimental dependency:
+profile startup refuses missing global state or unsupported all-thread options
+instead of claiming partial coverage. Without profiling, including a runtime
+missing that flag, ordinary forwards build no metadata; they pay only the flag
+check and an empty context manager. CPU tests qualify the selected PyTorch
+behavior; a device trace must still prove kernel and graph-child attribution.
+
 ### The capture contract
 
 Information crosses to the data plane **only** inside the submitted closure,

@@ -765,6 +765,17 @@ draft: `mla` and `tokenspeed_mla` (`gluon` on AMD) for MLA drafts, and
 rejects any other `--drafter-attention-backend` rather than quietly widening
 the draft's attention to the full history.
 
+Use `--attention-backend mha` and `--drafter-attention-backend mha` for
+standard and grouped-query attention. The kernel registry chooses compatible
+implementations for each operation, including Gluon on AMD gfx950 and portable
+Triton. The existing `gluon` attention backend remains MLA-only. On gfx950,
+Gluon decode supports 64-token pages and head dimensions 64 or 128, including
+compact causal verification blocks and expanded one-query metadata for
+non-causal block drafts. Other shapes use another compatible registered
+implementation or fail selection when none exists. Explicit operation/kernel
+overrides remain available. Operator qualification does not establish
+full-model correctness or speed.
+
 ## Observability
 
 | Parameter | Purpose |
