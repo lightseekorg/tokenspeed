@@ -160,6 +160,22 @@ optional:
   amd-mi355-1gpu: true
 ```
 
+`paths` limits a `per-commit` or `post-submit` task to diffs that touch the
+code it covers. It lists repository-relative path prefixes; the scan keeps the
+task when a changed path starts with one of them or the task's own YAML
+changed. An unknown, empty, or possibly truncated (300 or more files) diff runs
+the task anyway, and `nightly` and manual scans ignore `paths`. Pair `paths`
+with `nightly` when shared code outside the prefixes can also break the task.
+
+```yaml
+triggers:
+  - per-commit
+  - nightly
+paths:
+  - python/tokenspeed/runtime/models/muse_spark
+  - tokenspeed-kernel/python/tokenspeed_kernel/ops/communication/_iris/muse_spark/
+```
+
 The NVIDIA PR workflow routes `b200-<Ngpu>` task labels to
 `b200v2-<Ngpu>` by default. Set the `TOKENSPEED_B200_RUNNER_LABEL` repository
 variable in GitHub Actions (`Settings` -> `Secrets and variables` -> `Actions`

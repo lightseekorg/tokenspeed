@@ -1273,6 +1273,83 @@ def test_scan_runs_only_kernel_benchmarks_for_suite_only_changes(
     assert [entry["name"] for entry in matrix["include"]] == expected
 
 
+_GATED_PATHS = "paths:\n  - python/tokenspeed/runtime/models/gated\n"
+
+
+def _gated_body() -> str:
+    body = _default_body("gated", ["amd-mi350-1gpu"], extra=_GATED_PATHS)
+    return body.replace("  - per-commit\n", "  - per-commit\n  - nightly\n")
+
+
+@pytest.mark.parametrize(
+    ("trigger", "changed", "expected"),
+    [
+        ("per-commit", None, ["gated", "plain"]),
+        ("per-commit", "", ["gated", "plain"]),
+        ("per-commit", "python/other.py\n", ["plain"]),
+        (
+            "per-commit",
+            "python/tokenspeed/runtime/models/gated_vision.py\n",
+            ["gated", "plain"],
+        ),
+        ("per-commit", "test/ci/gated.yaml\npython/other.py\n", ["gated", "plain"]),
+        ("post-submit", "python/other.py\n", ["plain"]),
+        ("nightly", "python/other.py\n", ["gated"]),
+        (
+            "per-commit",
+            "\n".join(f"python/{index}.py" for index in range(300)),
+            ["gated", "plain"],
+        ),
+    ],
+)
+def test_scan_runs_path_gated_tasks_only_for_matching_changes(
+    trigger, changed, expected, tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    _write_task_yaml(root, "gated.yaml", _gated_body())
+    _write_task_yaml(root, "plain.yaml", _default_body("plain", ["amd-mi350-1gpu"]))
+    argv = ["scan", "--repo-root", str(tmp_path), "--trigger", trigger]
+    if changed is not None:
+        changed_file = tmp_path / "changed.txt"
+        changed_file.write_text(changed)
+        argv += ["--changed-files", str(changed_file)]
+    assert pipeline.main(argv) == 0
+    matrix = json.loads(capsys.readouterr().out)
+    assert [entry["name"] for entry in matrix["include"]] == expected
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [
+        "paths: python/model.py\n",
+        "paths: []\n",
+        "paths:\n  - /python/model.py\n",
+        "paths:\n  - python/../model.py\n",
+        'paths:\n  - ""\n',
+    ],
+)
+def test_validate_task_rejects_malformed_paths(paths, tmp_path):
+    body = _default_body("ut-a", ["b300-1gpu"], extra=paths)
+    path = _write_task_yaml(tmp_path, "bad.yaml", body)
+    import yaml as _yaml
+
+    with pytest.raises(ValueError, match=r"paths must be a non-empty list"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_validate_task_rejects_paths_without_diff_trigger(tmp_path):
+    body = _default_body("ut-a", ["b300-1gpu"], extra=_GATED_PATHS).replace(
+        "  - per-commit\n", "  - nightly\n"
+    )
+    path = _write_task_yaml(tmp_path, "bad.yaml", body)
+    import yaml as _yaml
+
+    with pytest.raises(ValueError, match=r"paths requires the 'per-commit'"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
 def test_validate_task_accepts_known_priorities(tmp_path):
     for priority in ("low", "normal", "high"):
         body = _default_body("ut-a", ["b300-1gpu"], extra=f"priority: {priority}\n")

@@ -47,6 +47,10 @@ SUPPORTED_TRIGGERS = {
 # Task triggers each scan trigger selects. `per-commit` tasks run on pull
 # requests and on pushes to main; `post-submit` tasks run only on pushes.
 SCAN_TRIGGER_TASK_TRIGGERS = {"post-submit": {"per-commit", "post-submit"}}
+# Scan triggers whose changed-file list gates tasks that declare `paths`.
+PATH_GATED_SCAN_TRIGGERS = {"per-commit", "post-submit"}
+# GitHub comparisons may truncate the changed-file list at this many entries.
+GITHUB_CHANGED_FILES_LIMIT = 300
 WORKFLOW_STAGE_TYPES = {
     "unit-test": {"ut", "server_smoke"},
     "kernel-benchmark": {"perf"},
@@ -281,6 +285,27 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
             raise ValueError(
                 f"{path}: retries is only supported for eval and perf tasks"
             )
+    if "paths" in data:
+        prefixes = data["paths"]
+        if (
+            not isinstance(prefixes, list)
+            or not prefixes
+            or not all(
+                isinstance(prefix, str)
+                and prefix
+                and not prefix.startswith("/")
+                and ".." not in prefix.split("/")
+                for prefix in prefixes
+            )
+        ):
+            raise ValueError(
+                f"{path}: paths must be a non-empty list of repository-relative "
+                "path prefixes"
+            )
+        if PATH_GATED_SCAN_TRIGGERS.isdisjoint(data["triggers"]):
+            raise ValueError(
+                f"{path}: paths requires the 'per-commit' or 'post-submit' trigger"
+            )
     if "slurm" in data:
         slurm = data["slurm"]
         if not isinstance(slurm, dict):
@@ -397,6 +422,32 @@ def resolve_optional_for_label(optional: Any, label: str) -> bool:
     return False
 
 
+def task_paths_match(task: Dict[str, Any], changed_files: List[str] | None) -> bool:
+    """Whether a task that declares `paths` should run for a diff.
+
+    Args:
+        task: A normalized task; its optional `paths` lists repository-relative
+            path prefixes.
+        changed_files: Repository-relative paths changed by the tested commit
+            range, or None when the diff is unknown.
+
+    Returns:
+        True when the task declares no `paths`; when the diff is unknown, empty
+        or possibly truncated; when the task's own YAML changed; or when a
+        changed path starts with one of the task's prefixes.
+    """
+    prefixes = task.get("paths")
+    if not prefixes:
+        return True
+    if not changed_files or len(changed_files) >= GITHUB_CHANGED_FILES_LIMIT:
+        return True
+    if task["_source_path"] in changed_files:
+        return True
+    return any(
+        changed.startswith(prefix) for changed in changed_files for prefix in prefixes
+    )
+
+
 def build_matrix(
     root: Path,
     repo_root: Path,
@@ -404,6 +455,7 @@ def build_matrix(
     runner_group: str = "all",
     workflow_stage: str | None = None,
     multi_node: str = "exclude",
+    changed_files: List[str] | None = None,
 ) -> Dict[str, Any]:
     if multi_node not in SUPPORTED_MULTI_NODE_FILTERS:
         raise ValueError(f"unsupported multi-node filter: {multi_node!r}")
@@ -413,6 +465,11 @@ def build_matrix(
     for path in find_task_files(root):
         task = normalize_task(path, repo_root)
         if trigger and task_triggers.isdisjoint(task["triggers"]):
+            continue
+        # Nightly and manual scans run path-gated tasks regardless of the diff.
+        if trigger in PATH_GATED_SCAN_TRIGGERS and not task_paths_match(
+            task, changed_files
+        ):
             continue
         is_multi_node = task.get("slurm", {}).get("nodes", 1) > 1
         if multi_node == "only" and not is_multi_node:
@@ -2256,6 +2313,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.command == "scan":
         repo_root = Path(args.repo_root).resolve()
         root = (repo_root / args.root).resolve()
+        changed = (
+            args.changed_files.read_text(encoding="utf-8").splitlines()
+            if args.changed_files is not None
+            else None
+        )
         matrix = build_matrix(
             root,
             repo_root,
@@ -2263,14 +2325,13 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.runner_group,
             args.workflow_stage,
             args.multi_node,
+            changed_files=changed,
         )
-        if args.changed_files is not None:
-            changed = args.changed_files.read_text(encoding="utf-8").splitlines()
+        if changed is not None:
             suite_changed = any(
                 path.startswith(KERNEL_BENCHMARK_SUITE_DIRECTORY) for path in changed
             )
-            # GitHub comparisons may truncate the file list at 300 entries.
-            if 0 < len(changed) < 300 and all(
+            if 0 < len(changed) < GITHUB_CHANGED_FILES_LIMIT and all(
                 (path.startswith("test/ci/") and path.endswith(".yaml"))
                 or path.startswith(KERNEL_BENCHMARK_SUITE_DIRECTORY)
                 for path in changed
