@@ -63,7 +63,13 @@ def mxfp8_situ_prefill(
     weights = (w13, s13, w2, s2)
     e, weight_d, i = n16_mxfp4_shape(*weights)
     m, d = x.shape
-    if weight_d != d or e <= 0 or expert_start < 0 or expert_start + e > global_experts:
+    if (
+        weight_d != d
+        or i % 256
+        or e <= 0
+        or expert_start < 0
+        or expert_start + e > global_experts
+    ):
         raise ValueError("inconsistent MXFP8 expert shapes or expert range")
     if any(t.numel() // e * t.element_size() >= 2**31 for t in weights):
         raise ValueError("MXFP8 expert cells exceed the buffer-offset range")

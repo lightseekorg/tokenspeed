@@ -162,6 +162,7 @@ class EpdPrefillHooks:
         """
         if (
             self._admission is None
+            or not self._admission.receives_embeddings
             or multimodal_context is None
             or not multimodal_context.has_extend_inputs()
         ):

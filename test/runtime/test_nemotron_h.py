@@ -44,6 +44,7 @@ from tokenspeed.runtime.layers.moe.loader import (
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.weights.nvfp4 import create_nvfp4_weight_pair
+from tokenspeed.runtime.utils.server_args import ServerArgs
 
 register_cuda_ci(
     est_time=60,
@@ -95,9 +96,8 @@ def test_cache_layers_are_the_mamba_and_attention_blocks_in_order():
 def test_mamba2_component_maps_ssd_geometry_onto_the_linear_fields():
     config = _config()
     model_config = SimpleNamespace(hf_text_config=config)
-    server_args = SimpleNamespace(
-        mapping=SimpleNamespace(linear_attn=SimpleNamespace(tp_size=2))
-    )
+    # world_size=2 resolves mapping.linear_attn.tp_size=2.
+    server_args = ServerArgs(model="x", world_size=2)
     mamba2 = Mamba2Config.generate(server_args, model_config)
     assert mamba2.layer_ids == (0, 2, 3)
     assert mamba2.chunk_size == 128
@@ -111,9 +111,7 @@ def test_mamba2_component_maps_ssd_geometry_onto_the_linear_fields():
 def test_mamba2_component_reads_a_1e30_dt_bound_as_unbounded():
     config = _config(time_step_limit=(0.0, 1e30))
     model_config = SimpleNamespace(hf_text_config=config)
-    server_args = SimpleNamespace(
-        mapping=SimpleNamespace(linear_attn=SimpleNamespace(tp_size=1))
-    )
+    server_args = ServerArgs(model="x")
     assert Mamba2Config.generate(server_args, model_config).dt_limit == (
         0.0,
         float("inf"),
@@ -358,9 +356,6 @@ def test_mamba2_seams_match_the_sequential_recurrence():
         D=D,
         a=step_dt,
         b=None,
-        output_gate=None,
-        norm_weight=None,
-        norm_eps=None,
         **_UNUSED,
     )
     assert decoded.shape == (1, 3, heads, head_dim)
@@ -816,6 +811,54 @@ def test_mtp_head_refuses_patterns_its_narrowing_cannot_serve(blocks: list[str])
         NemotronHForCausalLMNextN(config, Mapping(rank=0, world_size=1))
 
 
+@pytest.mark.parametrize("mtp_quantized", [False, True])
+def test_mtp_head_follows_the_checkpoint_quantization(mtp_quantized: bool):
+    """Nemotron 3 Super's export names no MTP module and left the head in BF16;
+    a later export quantizes its experts."""
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
+        ModelOptMixedConfig,
+    )
+    from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
+    from tokenspeed.runtime.models.nemotron_h_nextn import NemotronHForCausalLMNextN
+
+    layers = {"backbone.layers.2.mixer.experts": "NVFP4"}
+    if mtp_quantized:
+        layers["mtp.layers.1.mixer.experts"] = "NVFP4"
+    quant_config = ModelOptMixedConfig(quantized_layers=layers)
+    assert quant_config.quantizes_any("mtp.") == mtp_quantized
+    config = _config(
+        hidden_size=256,
+        num_nextn_predict_layers=1,
+        mtp_layers_block_type=["attention", "moe"],
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=256,
+        moe_shared_expert_intermediate_size=256,
+    )
+    with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
+        head = NemotronHForCausalLMNextN(
+            config, Mapping(rank=0, world_size=1), quant_config
+        )
+    expected = "nvfp4" if mtp_quantized else "unquant"
+    assert head.layers[1].mixer.experts._quant_kind == expected
+
+
+def test_mtp_head_shares_the_target_head_module():
+    from tokenspeed.runtime.models.nemotron_h_nextn import NemotronHForCausalLMNextN
+
+    head = NemotronHForCausalLMNextN.__new__(NemotronHForCausalLMNextN)
+    torch.nn.Module.__init__(head)
+    head.embed_tokens = torch.nn.Embedding(8, 4)
+    head.lm_head = torch.nn.Linear(4, 8, bias=False)
+    embed = torch.nn.Parameter(torch.ones(8, 4))
+    target_head = torch.nn.Linear(4, 8, bias=False)
+    head.set_embed_and_head_module(embed, target_head)
+    assert head.embed_tokens.weight is embed
+    assert head.lm_head is target_head
+    assert head.get_embed_and_head() == (embed, target_head.weight)
+
+
 def test_static_fp8_scale_names_only_per_tensor_static_linears():
     from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
     from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
@@ -845,7 +888,7 @@ def test_static_fp8_scale_names_only_per_tensor_static_linears():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mamba2_decode_reads_the_projection_view_in_place():
     """The flag that skips the decode copy: conv and state update read strided rows."""
-    from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+    from tokenspeed_kernel.ops.conv import (
         causal_conv1d_update,
     )
 
@@ -906,9 +949,6 @@ def test_mamba2_decode_reads_the_projection_view_in_place():
         D=torch.ones(heads, device="cuda"),
         a=dt,
         b=None,
-        output_gate=None,
-        norm_weight=None,
-        norm_eps=None,
         **_UNUSED,
     )
     pools = [torch.zeros(4, heads, head_dim, d_state, device="cuda") for _ in range(2)]
@@ -995,6 +1035,7 @@ def test_mamba2_verify_scan_continues_each_request_from_its_committed_state(repl
         batch_size=batch,
         draft_token_num=steps,
         seq_len=rows,
+        replay_payload=None,
         **_UNUSED,
     )
     assert out.shape == (1, rows, heads, head_dim)
@@ -1169,6 +1210,54 @@ def test_static_per_tensor_checkpoint_runs_a_merged_projection(
     out_prequantized = method.apply(layer, x_prequantized)
     assert out_prequantized.dtype == torch.bfloat16
     assert torch.equal(out_prequantized, out)
+
+
+def test_mtp_head_takes_its_checkpoint_kv_cache_scales_at_startup_only(
+    tmp_path, monkeypatch
+):
+    from safetensors.torch import save_file
+    from tokenspeed_kernel.ops.attention.prologue import FP8TensorScales
+
+    from tokenspeed.runtime.configs.load_config import LoadConfig
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.model_loader import loader
+    from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
+    from tokenspeed.runtime.models.nemotron_h_nextn import NemotronHForCausalLMNextN
+
+    config = _config(
+        hidden_size=256,
+        num_nextn_predict_layers=1,
+        mtp_layers_block_type=["attention", "moe"],
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=256,
+        moe_shared_expert_intermediate_size=256,
+    )
+    mapping = Mapping(rank=0, world_size=1)
+    with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
+        head = NemotronHForCausalLMNextN(config, mapping)
+    attn = head.layers[0].mixer.attn
+    scales = {
+        "mtp.layers.0.mixer.k_proj.k_scale": torch.tensor([0.0614]),
+        "mtp.layers.0.mixer.v_proj.v_scale": torch.tensor([0.0513]),
+    }
+    # A raw update stream (the Model Updater SDK) may carry them; it changes nothing.
+    head.load_weights(list(scales.items()))
+    assert attn.fp8_kv_scales is None
+
+    save_file(scales, str(tmp_path / "model.safetensors"))
+    monkeypatch.setattr(loader, "_initialize_model", lambda *args: head)
+    loader.DefaultModelLoader(LoadConfig()).load_model(
+        model_config=SimpleNamespace(
+            model_path=str(tmp_path),
+            revision=None,
+            dtype=torch.bfloat16,
+            mapping=mapping,
+        ),
+        device_config=SimpleNamespace(device="cuda"),
+    )
+    k, v = (t.item() for t in scales.values())
+    assert attn.fp8_kv_scales == FP8TensorScales(k, v)
 
 
 def test_mtp_checkpoint_names_map_onto_the_head():

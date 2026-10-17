@@ -55,32 +55,28 @@ from tokenspeed.runtime.pd.cache_protocol import (
 
 def _group_spec(
     group_id: str,
-    family: str,
+    attn_kind: str,
     policy: str,
     *,
     prefix_granularity: int = 4,
-    retention: str = "full_history",
     sliding_window_tokens: int | None = None,
     shard_count: int = 1,
 ) -> CacheGroupSpec:
     # A state group is one state per block; a history group is rows.
-    if family == "state":
+    if attn_kind == "state":
         return CacheGroupSpec(
             group_id=group_id,
-            retention=retention,
-            sliding_window_tokens=sliding_window_tokens,
-            family=family,
+            attn_kind=attn_kind,
             transfer_policy=policy,
             replayable=False,
             shard_count=shard_count,
         )
     return CacheGroupSpec(
         group_id=group_id,
-        retention=retention,
+        attn_kind=attn_kind,
         rows_per_page=prefix_granularity,
         entry_stride_tokens=1,
         sliding_window_tokens=sliding_window_tokens,
-        family=family,
         transfer_policy=policy,
         replayable=False,
         shard_count=shard_count,
@@ -150,7 +146,7 @@ def _contract(
 
 def _layout(capacity: int = 64) -> CacheTransferContract:
     specs = (
-        _group_spec("attention", "history", "full_suffix"),
+        _group_spec("attention", "full_history", "full_suffix"),
         _group_spec("linear-a", "state", "latest_snapshot"),
         _group_spec("linear-b", "state", "latest_snapshot"),
     )
@@ -394,7 +390,11 @@ def test_manifest_accepts_reordered_mapping_but_rejects_wrong_keys() -> None:
 
 def _sharded_layout(shard_count: int, capacity: int = 64) -> CacheTransferContract:
     return _contract(
-        (_group_spec("attention", "history", "full_suffix", shard_count=shard_count),),
+        (
+            _group_spec(
+                "attention", "full_history", "full_suffix", shard_count=shard_count
+            ),
+        ),
         (_field("attention", "attention.k"),),
         capacity=capacity,
     )
@@ -493,7 +493,7 @@ def test_contract_and_manifest_wire_round_trip_has_no_version_field() -> None:
 
 
 def test_lcm_group_capacity_uses_its_cache_blocks_per_parent() -> None:
-    spec = _group_spec("history", "history", "full_suffix")
+    spec = _group_spec("history", "full_history", "full_suffix")
     # Null parent plus three usable parents, each packing two child pages.
     layout = _contract(
         (spec,),
@@ -537,7 +537,7 @@ def test_destination_manifest_uses_peer_local_group_packing() -> None:
     def layout(*, packing: int, physical_page_bytes: int) -> CacheTransferContract:
         spec = _group_spec(
             "history",
-            "history",
+            "full_history",
             "full_suffix",
             prefix_granularity=2,
         )
@@ -589,7 +589,7 @@ def test_destination_manifest_uses_peer_local_group_packing() -> None:
 
 
 def test_logical_slots_follow_the_group_spec() -> None:
-    history = _group_spec("attention", "history", "full_suffix")
+    history = _group_spec("attention", "full_history", "full_suffix")
     state = _group_spec("linear", "state", "latest_snapshot")
     assert _logical_slots(history, 4, 14, state_prefix_cached=False) == (1, 2, 3)
     assert _logical_slots(history, 5, 14, state_prefix_cached=False) == (1, 2, 3)
@@ -678,11 +678,10 @@ def _two_plane_lcm_plan(num_lcm_blocks: int) -> CacheMemoryPlan:
 _LCM_SPECS = (
     CacheGroupSpec(
         group_id="history",
-        retention="full_history",
+        attn_kind="full_history",
         rows_per_page=4,
         entry_stride_tokens=1,
         sliding_window_tokens=None,
-        family="history",
         transfer_policy="full_suffix",
         replayable=False,
     ),
@@ -858,7 +857,7 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
     assert layout.plan.prefix_granularity == 16
     assert len(layout.group_specs) == 1
     group = layout.group_specs[0]
-    assert (group.group_id, group.family) == ("full_attention", "history")
+    assert (group.group_id, group.attn_kind) == ("full_attention", "full_history")
     # Packing lives on the plan, not on the group spec.
     assert layout.plan.group("full_attention").cache_blocks_per_lcm_block == 1
 
@@ -896,7 +895,7 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
 
 
 def test_producer_schedule_groups_draft_fields_in_the_final_step() -> None:
-    spec = _group_spec("history", "history", "full_suffix")
+    spec = _group_spec("history", "full_history", "full_suffix")
     layout = _contract(
         (spec,),
         tuple(

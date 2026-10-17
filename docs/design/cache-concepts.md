@@ -26,34 +26,38 @@ Two quantities anchor the vocabulary:
   tokens). Two requests share cache below the longest published boundary that
   is a prefix of both.
 * **`block_granularity`** — the number of tokens covered by one block-table
-  slot (one `CacheBlock`) of a `history` group. This is the unit in which
-  family-agnostic code (admission, capacity planning, PD slot selection)
+  slot (one `CacheBlock`) of a history group. This is the unit in which
+  kind-agnostic code (admission, capacity planning, PD slot selection)
   addresses the cache.
 
-A group's **family** (Python `CacheGroupSpec`) says whether its blocks span
-tokens at all:
+A group's **attention kind** (Python `CacheGroupSpec.attn_kind`, the C++
+`AttnKind`) is its one classification: what its blocks hold and how long they
+stay. There are exactly three, and every scheduler decision that depends on
+the group's nature switches on this value and nothing else:
 
-* **Row geometry** (`rows_per_page` × `entry_stride_tokens`, exposed as
-  **`page_size`**, the group's `block_granularity`) — the `history` family:
-  paged KV-cache consumers whose blocks physically hold rows of entries
-  (per-token KV, sliding windows, compressed entries, compressor input
-  tails). "Page" vocabulary is *only* legal here. Retention is
-  `full_history` or `sliding_window`.
-* **No span** — the `state` family: recurrent/conv state whose block holds
-  the state after some token count, whichever count a forward happened to
-  end at. Such a group has no rows, no pages and no token span per block;
-  declaring row geometry for it is a bug, not a convention, and its
-  `block_granularity` is a `TypeError`. A state summarizes everything before
-  it, so nothing in it ever slides out: retention is always `full_history`.
-  A request holds exactly two blocks of every state group (see "Recurrent
-  state: two slots, natural checkpoints").
+* **`full_history`** (`kFull`) — rows of token history that stay resident for
+  the request's whole life; prefix-closed and shared.
+* **`sliding_window`** (`kSlidingWindow`) — rows of token history of which
+  only the trailing `sliding_window_tokens` stay resident; the rest slide out
+  (`ExpiredBlocksAt`). A trailing window of token rows (DeepSeek V4's SWA kv
+  and compressor tails) is this kind whatever a kernel calls its buffer.
+* **`state`** (`kState`) — recurrent/conv state whose block holds the state
+  after some token count, whichever count a forward happened to end at. A
+  state summarizes everything before it, so nothing in it ever slides out and
+  it carries no window. A request holds exactly two blocks of every state
+  group (see "Recurrent state: two slots, natural checkpoints").
 
-`CacheGroupSpec.__post_init__` holds each family to its shape, so exactly
-three `(family, retention)` combinations exist — the C++ `AttnKind { kFull,
-kSlidingWindow, kMambaState }`. A trailing window of token rows (DeepSeek
-V4's SWA kv and compressor tails) is a sliding `history` group whatever a
-kernel calls its buffer; `state` is not a routing label for "some backend
-owns this table".
+The first two are the **history** groups: their declaration is **row
+geometry** (`rows_per_page` × `entry_stride_tokens`, exposed as
+**`page_size`**, the group's `block_granularity`), and they are the paged
+KV-cache consumers whose blocks physically hold rows of entries (per-token KV,
+sliding windows, compressed entries, compressor input tails). "Page"
+vocabulary is *only* legal here. A `state` group declares **no span**: no
+rows, no pages, no token span per block; declaring row geometry for it is a
+bug, not a convention, and its `block_granularity` is a `TypeError`.
+`CacheGroupSpec.__post_init__` holds each kind to its shape (a window only on
+a sliding group, rows only on a history group, replay only on a sliding
+group). `state` is not a routing label for "some backend owns this table".
 
 None of these say anything about storage. A slot of `block_granularity = 64`
 tokens may be backed by only 16 units of physical storage under compression —
@@ -69,20 +73,6 @@ A fourth quantity lives outside the logical world entirely:
   set (trtllm-mla ∈ {32, 64}), and flexible kernels carry a chosen default.
   `config.kernel_page_size` overrides any default; deriving kernel_page_size
   from `prefix_granularity` is a category error and a bug.
-
-  DeepSeek V4's geometry is fully
-  registry-sourced: the compressed full-history chains declare
-  `DEEPSEEK_V4_PAGE_SIZE // ratio` rows × ratio-token stride, the SWA
-  window declares `V4_KERNEL_BLOCK_ROWS`, and the layout's field byte
-  shapes are built from the kernel page constant — nothing derives from
-  `prefix_granularity`. The V4 backend's scalar is therefore a true
-  registry-sourced `kernel_page_size` (config-overridable), and the
-  scheduler grain is free: any positive multiple of the kernel page is
-  accepted (asserted at backend construction and in the recipe's
-  `check_layout`). The V4 architecture spec defaults P to exactly one kernel
-  page by naming `DEEPSEEK_V4_PAGE_SIZE` as its
-  `default_prefix_granularity` — the registry constant itself, not a second
-  copy of the number.
 
 ### Physical world (storage units)
 
@@ -154,7 +144,7 @@ contradict. Three types carry one group across the boundary, and none of
 them says "paged":
 
 ```
-Python  CacheGroupSpec     declaration shape (rows | no span) + policy
+Python  CacheGroupSpec     kind + declaration shape (rows | no span)
   ↓     pool_to_cache_groups                      the single folding point
 C++     CacheGroupConfig   boundary config, nanobind-exposed (SchedulerConfig.cache_groups)
   ↓     MakeSpecsFromConfig
@@ -165,10 +155,10 @@ The first and third share a name and differ in fields, so always qualify
 which side you mean; `CacheGroupConfig` in between is the only one visible
 from both.
 
-Declaration-shape vocabulary stops at the bridge; only the generic span
-crosses it. Neither `rows_per_page` nor `entry_stride_tokens` enters
-`tokenspeed-scheduler` at all: they are the Python-side *declaration shape*
-of a `history` `CacheGroupSpec`, and the bridge
+Declaration-shape vocabulary stops at the bridge; only the kind and the
+generic span cross it. Neither `rows_per_page` nor `entry_stride_tokens`
+enters `tokenspeed-scheduler` at all: they are the Python-side *declaration
+shape* of a history `CacheGroupSpec`, and the bridge
 (`scheduler_utils.pool_to_cache_groups`) folds them to
 `CacheGroupSpec.block_granularity = rows_per_page × entry_stride_tokens`
 before constructing the C++ `CacheGroupConfig`, whose only span field is
@@ -178,15 +168,16 @@ bridge with `block_granularity = 0`: its blocks cover no tokens, and
 carrying a fictional span for it would be a claim its contents contradict,
 the same way a `Paged` type name would.
 
-A `history` group's `block_granularity` is **required and explicit**: a
+A history group's `block_granularity` is **required and explicit**: a
 positive divisor of `prefix_granularity`, rejected by
 `SchedulerConfig::Validate()` before construction and asserted again at
 coordinator construction. There is no zero-means-default fallback — every
-paged group states its span, and `0` is the `state` family's declaration
-that it has none.
+paged group states its span, and `0` is the `state` kind's declaration that
+it has none.
 
-One flag crosses the bridge beside the token quantities: `replayable`, set
-only on a sliding History group that is **regenerated by bounded replay**
+One flag crosses the bridge beside the kind and the token quantities:
+`replayable`, set only on a `sliding_window` group that is **regenerated by
+bounded replay**
 instead of being prefix-cached (DeepSeek V4.1's SWA rows and compressor
 tails). Before a prefix hit the model re-feeds the group's whole
 `sliding_window_tokens`: retention keeps exactly what the queries after the
@@ -240,6 +231,23 @@ null slot 0 also means "read slot 1" for the rows the runtime fabricates
 (capture dummies) and for the decode role's landing row. Speculative verify
 commits the accepted state into slot 1 unconditionally
 (`commit_state_pages`).
+
+A slot's state block is a whole snapshot, so the token count that keys it
+must be exactly the tokens it consumed. The device therefore ends a request
+where the control plane does: the sampling epilogue cuts every round's
+accepted width at the request's first stop token and its token limit
+(`RuntimeStates.apply_stop_conditions`, the stop set the finish check reads),
+before the commit, the frontier or the drafter reads it, and marks the slot
+stopped. A decode the overlap schedule already dispatched behind that round
+runs the request as a padding row—both slots `-1`
+(`RuntimeStates.masked_state_tables`): it reads the zero state, writes
+nothing, and keeps no token. (Pipeline parallelism serves only the prefill
+role, which neither decodes nor overlaps, so its stages, which do not sample,
+never run a forward behind a stopped request.) The finish checkpoint is thus the state before
+the stop token under every schedule ([Scheduler
+§1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)); a finish
+dispatched as a rotating first decode publishes at the prompt end, where the
+prompt-end checkpoint it still holds in slot 0 is the canonical block.
 
 A **natural checkpoint** is a state block that exists because a forward ended
 there -- the prompt end (the block rotated out of slot 1 as the first decode
@@ -1089,7 +1097,10 @@ layers ──group──▶ groups ──pack──▶ CacheLayout ──bind─
   plane sizes, per-field offsets and page strides, and how many of each
   group's CacheBlocks share a parent (`cache_blocks_per_lcm_block`). The
   result, `CacheLayout`, is **capacity-independent** — it describes one
-  parent, not an allocation.
+  parent, not an allocation. A parent's bytes are exactly its planes': each
+  plane is already a multiple of every tenant's packing, so the parent is not
+  rounded up again to the LCM of all the packings, which only added bytes no
+  field addresses.
 * **`bind`** (`CacheLayout.bind(num_lcm_blocks)`) multiplies that parent out
   by a count and yields the `CacheMemoryPlan` the arena allocates from and
   the PD wire carries.
@@ -1152,13 +1163,18 @@ still bounds capacity. Grouping, packing and allocation are unchanged.
 
 Hybrid recurrent recipes keep their groups balanced instead: every group's page
 spans the whole parent, so a parent is fully used only when every group fills
-the same planes. Qwen3.5 groups state layers by position within its fixed
-state-state-state-full period. Nemotron-H's Mamba2 runs are four or five layers
-long, so its recipe deals state layers round-robin instead and splits the
-attention layers into two KV groups whose K and V pages pack to the size of
-one SSM state; `recipes/mamba2.py` documents the layout. State pages carry no
-padding; KV pages pad only by their share of the conv planes, about 1.5% for
-Nemotron-3 Super.
+the same planes. Both recipes size a plane segment to one SSM state and give an
+attention layer's K and V a segment each, so state pages carry no attention
+planes, and deal state layers round-robin. Qwen3.5 keeps its attention layers
+in one KV group, the full-history group drafters write through, and deals its
+state layers into groups of as many SSM states as that group has segments; a
+draft layer of a target attention layer's K/V bytes fills state segments, any
+other pads the state groups (`recipes/qwen35.py`). Nemotron-H's Mamba2 runs
+are four or five layers long; its recipe splits the attention layers into two
+KV groups (`recipes/mamba2.py`).
+Qwen3.5's state groups leave segments free, so its conv windows pack into them
+and KV pages carry no padding; Nemotron-3 Super's state groups fill every
+segment, so its KV pages pad by their share of the conv planes, about 1.5%.
 
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
@@ -1193,7 +1209,7 @@ An attention layer has two contracts that a single `layer_types` string used
 to carry at once, and they are kept apart on purpose:
 
 * **Storage** — which cache group the layer's KV rides, hence how long the
-  scheduler retains it (`CacheGroupSpec.retention`, `sliding_window_tokens`).
+  scheduler retains it (`CacheGroupSpec.attn_kind`, `sliding_window_tokens`).
   Owned by the cache plan: the recipe assigns `group_ids` per layer, `pack`
   places the fields, and the model never spells a group id. At executor
   startup `bind_cache_groups` (`layers/paged_attention.py`) reads
@@ -1653,7 +1669,7 @@ Enforced:
   are grep-zero across `tokenspeed-scheduler` (csrc, tests, python bindings)
   — the slot span is spelled `block_granularity` everywhere, and
   `CacheGroupConfig` carries it as its only span field;
-* a `history` group's `block_granularity` is required and explicit: every
+* a history group's `block_granularity` is required and explicit: every
   paged group states its span, with no zero-means-default fallback, and the
   coordinator asserts a positive divisor of P at construction; a `state`
   group crosses the bridge as `0`, the declaration that its blocks span no
@@ -1745,7 +1761,7 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   several history groups one V4 layer reads at once (its pool view reports
   no `PagedAttention` binding and no router leaf). Mamba's group set comes from
   its recurrent fields, so a PLE state group cannot arm its verify
-  state. `cache_consumer_families` remains the boot-time coverage
+  state. `cache_consumer_attn_kinds` remains the boot-time coverage
   declaration (`validate_scheduler_config`). Extra delivered groups ride
   through untouched; a table for a group the bound pool never published
   fails loudly.
@@ -1775,13 +1791,8 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   (`backends/paged/write_locations.py`, failing to slot 0 — the reserved dummy
   page) and the token-shaped resolve
   (`attention/page_table.py::group_slot_mapping_from_raw` +
-  `safe_page_ids` / `mask_invalid_graph_tokens`, failing closed to the
-  `-1` skip sentinel for group buffers with no dummy page). DeepSeek-V4 is
-  a *composer*, not an owner: its SWA / compressor-state / indexer-state
-  writes call the shared token-shaped resolve over its delivered tables;
-  only the compression-boundary orchestration (per-ratio strides, boundary
-  masks, the fused dsv4 kernel) is V4-specific
-  (`kv_cache/hybrid_deepseek_v4.py`).
+  `safe_page_ids`, failing closed to the `-1` skip sentinel for group
+  buffers with no dummy page).
 
 ### Principle 6 — provenance discipline: fixed
 
@@ -1856,10 +1867,10 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   V4.1's same-checkpoint DSpark. ✓
 * Capacity has three shapes and no more, and one place to read the scheduler's
   concurrency (see *The cache pipeline* above). ✓
-* Kernel geometry does not live under the recipes package. DeepSeek V4's byte
+* Kernel geometry does not live under the recipes package. DeepSeek V4.1's byte
   formulas, cache layout and group-id vocabulary sit in
-  `attention/deepseek_v4_geometry.py`, which the backends, ops, model and pool
-  read directly; the recipe depends on it, not the reverse. ✓
+  `attention/deepseek_v41_geometry.py`, which the backend, model and pool read
+  directly; the recipe depends on it, not the reverse. ✓
 * One kernel layout has one definition. The interleaved mxfp8 KV-scale planes
   come from `plan.mxfp8_kv_scale_fields`, which also owns the page-span and
   head-dim constraints that layout imposes, so no recipe restates the shape or

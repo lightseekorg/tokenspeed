@@ -59,6 +59,9 @@ def _publish_after_release(source, target, rows, BLOCK: tl.constexpr):
         pytest.param(4, 4096, id="fused-cached"),
         pytest.param(129, 65536, id="fused-uncached"),
         pytest.param(4, 32768, id="map-reduce"),
+        pytest.param(3, 40001, id="map-reduce-ragged"),
+        # Rows that alone fill the SMs normalize whole rows.
+        pytest.param(120, 40001, id="map-reduce-whole-rows"),
     ],
 )
 @pytest.mark.parametrize("graph_replay", [False, True])

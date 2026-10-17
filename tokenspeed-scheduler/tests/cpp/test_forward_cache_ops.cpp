@@ -48,8 +48,8 @@ static_assert(!HasLegacyGranularityField<CacheGroupSpec>);
 CacheCoordinator MakeTwoGroup(BlockPool& pool) {
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
-        CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
                        .sliding_window = 4,
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
@@ -88,8 +88,8 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
     // so all 4 prefix pages stay real hits and nothing slides out of window.
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
-        CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
                        .sliding_window = 16,
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
@@ -305,7 +305,7 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
     BlockPool pool(/*num_lcm_blocks=*/32, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                                    /*snapshot_pool=*/nullptr,
@@ -376,61 +376,44 @@ TEST(MakeSpecsFromConfigTest, TranslatesCacheGroups) {
     CacheGroupConfig full_grp;
     full_grp.group_id = "full";
     full_grp.block_granularity = 16;
-    full_grp.retention = CacheGroupConfig::Retention::FullHistory;
+    full_grp.attn_kind = AttnKind::kFull;
     CacheGroupConfig swa_grp;
     swa_grp.group_id = "swa";
     swa_grp.block_granularity = 16;
-    swa_grp.retention = CacheGroupConfig::Retention::SlidingWindow;
+    swa_grp.attn_kind = AttnKind::kSlidingWindow;
     swa_grp.sliding_window_tokens = 128;
     config.cache_groups = {full_grp, swa_grp};
 
     std::vector<CacheGroupSpec> specs = MakeSpecsFromConfig(config);
     ASSERT_EQ(specs.size(), 2u);
-    EXPECT_EQ(specs[0].kind, AttnKind::kFull);
+    EXPECT_EQ(specs[0].attn_kind, AttnKind::kFull);
     EXPECT_EQ(specs[0].sliding_window, 0);
     EXPECT_EQ(specs[0].cache_blocks_per_lcm_block, 1);
-    EXPECT_EQ(specs[1].kind, AttnKind::kSlidingWindow);
+    EXPECT_EQ(specs[1].attn_kind, AttnKind::kSlidingWindow);
     EXPECT_EQ(specs[1].sliding_window, 128);
     EXPECT_EQ(specs[1].cache_blocks_per_lcm_block, 1);
 }
 
-TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
+TEST(MakeSpecsFromConfigTest, StateGroupCarriesNoSpan) {
     SchedulerConfig config;
     config.prefix_granularity = 4;
     CacheGroupConfig full_grp;
     full_grp.group_id = "full_attention";
     full_grp.block_granularity = 4;
-    full_grp.retention = CacheGroupConfig::Retention::FullHistory;
+    full_grp.attn_kind = AttnKind::kFull;
     CacheGroupConfig state_grp;
     state_grp.group_id = "linear_attention";
     state_grp.block_granularity = 0;
-    state_grp.family = CacheGroupFamily::State;
+    state_grp.attn_kind = AttnKind::kState;
     config.cache_groups = {full_grp, state_grp};
 
     std::vector<CacheGroupSpec> specs = MakeSpecsFromConfig(config);
     ASSERT_EQ(specs.size(), 2u);
-    EXPECT_EQ(specs[0].kind, AttnKind::kFull);
-    EXPECT_EQ(specs[1].kind, AttnKind::kMambaState);
+    EXPECT_EQ(specs[0].attn_kind, AttnKind::kFull);
+    EXPECT_EQ(specs[1].attn_kind, AttnKind::kState);
     EXPECT_EQ(specs[1].sliding_window, 0);
     EXPECT_EQ(specs[1].block_granularity, 0) << "a State group has no token span";
     EXPECT_EQ(specs[1].cache_blocks_per_lcm_block, 1);
-}
-
-TEST(CacheGroupConfigKindTest, EachValidFamilyRetentionPairHasOneKind) {
-    CacheGroupConfig full_grp;
-    full_grp.retention = CacheGroupConfig::Retention::FullHistory;
-    EXPECT_EQ(full_grp.Kind(), AttnKind::kFull);
-
-    CacheGroupConfig swa_grp;
-    swa_grp.retention = CacheGroupConfig::Retention::SlidingWindow;
-    swa_grp.sliding_window_tokens = 128;
-    EXPECT_EQ(swa_grp.Kind(), AttnKind::kSlidingWindow);
-    swa_grp.replayable = true;
-    EXPECT_EQ(swa_grp.Kind(), AttnKind::kSlidingWindow);
-
-    CacheGroupConfig state_grp;
-    state_grp.family = CacheGroupFamily::State;
-    EXPECT_EQ(state_grp.Kind(), AttnKind::kMambaState);
 }
 
 TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
@@ -443,7 +426,7 @@ TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
     CacheGroupConfig state0;
     state0.group_id = "state0";
     state0.block_granularity = 0;
-    state0.family = CacheGroupFamily::State;
+    state0.attn_kind = AttnKind::kState;
     CacheGroupConfig state1 = state0;
     state1.group_id = "state1";
     CacheGroupConfig state2 = state0;
@@ -541,34 +524,35 @@ TEST(SchedulerConfigValidateTest, RejectsBlockGranularityThatDoesNotDivideP) {
 TEST(SchedulerConfigValidateTest, RejectsMissingSlidingWindowWithGroupId) {
     SchedulerConfig config = MakeValidConfig();
     config.cache_groups[0].group_id = "missing_window";
-    config.cache_groups[0].retention = CacheGroupConfig::Retention::SlidingWindow;
+    config.cache_groups[0].attn_kind = AttnKind::kSlidingWindow;
     ExpectRejectedNamingGroup(config, "missing_window");
 }
 
 TEST(SchedulerConfigValidateTest, RejectsNonPositiveSlidingWindowWithGroupId) {
     SchedulerConfig config = MakeValidConfig();
     config.cache_groups[0].group_id = "nonpositive_window";
-    config.cache_groups[0].retention = CacheGroupConfig::Retention::SlidingWindow;
+    config.cache_groups[0].attn_kind = AttnKind::kSlidingWindow;
     for (const std::int32_t window : {0, -1}) {
         config.cache_groups[0].sliding_window_tokens = window;
         ExpectRejectedNamingGroup(config, "nonpositive_window");
     }
 }
 
-TEST(SchedulerConfigValidateTest, RejectsSlidingWindowStateGroupWithGroupId) {
-    // A State group holds checkpoints, never a token window that could slide
-    // out; the same window declared as History is an ordinary SWA group.
+TEST(SchedulerConfigValidateTest, RejectsWindowOnNonSlidingGroupWithGroupId) {
+    // Only a sliding-window group slides rows out, so only it carries a
+    // window: a State group holds checkpoints and a full group every row.
     SchedulerConfig config = MakeValidConfig();
     CacheGroupConfig& group = config.cache_groups[0];
-    group.group_id = "sliding_state";
-    group.retention = CacheGroupConfig::Retention::SlidingWindow;
+    group.group_id = "windowed";
     group.sliding_window_tokens = 256;
-    group.family = CacheGroupFamily::State;
+    group.attn_kind = AttnKind::kState;
     group.block_granularity = 0;
-    ExpectRejectedNamingGroup(config, "sliding_state");
-
-    group.family = CacheGroupFamily::History;
+    ExpectRejectedNamingGroup(config, "windowed");
+    group.attn_kind = AttnKind::kFull;
     group.block_granularity = 128;
+    ExpectRejectedNamingGroup(config, "windowed");
+
+    group.attn_kind = AttnKind::kSlidingWindow;
     EXPECT_NO_THROW(config.Validate());
 }
 
@@ -577,14 +561,14 @@ TEST(SchedulerConfigValidateTest, StateGroupHasNoTokenSpanAndNoChunkAlignmentRul
     // the chunk budget owes it nothing (a chunk may be any length).
     SchedulerConfig config = MakeValidConfig();
     config.cache_groups[0].group_id = "state";
-    config.cache_groups[0].family = CacheGroupFamily::State;
+    config.cache_groups[0].attn_kind = AttnKind::kState;
     ExpectRejectedNamingGroup(config, "state");
     config.cache_groups[0].block_granularity = 0;
     EXPECT_NO_THROW(config.Validate());
     config.max_scheduled_tokens = 1;
     EXPECT_NO_THROW(config.Validate());
-    // A History group still declares a positive span that divides P.
-    config.cache_groups[0].family = CacheGroupFamily::History;
+    // A full group still declares a positive span that divides P.
+    config.cache_groups[0].attn_kind = AttnKind::kFull;
     ExpectRejectedNamingGroup(config, "state");
 }
 
@@ -596,7 +580,7 @@ TEST(SchedulerConfigValidateTest, RejectsPdTransferPolicyMismatch) {
     config.role = Role::kD;
     CacheGroupConfig& history = config.cache_groups[0];
 
-    // A History group ships its full suffix; leaving the policy to the default
+    // A full group ships its full suffix; leaving the policy to the default
     // or claiming a snapshot layout are both rejected.
     ExpectRejectedNamingGroup(config, history.group_id);
     history.transfer_policy = CacheTransferPolicy::LatestSnapshot;
@@ -605,28 +589,29 @@ TEST(SchedulerConfigValidateTest, RejectsPdTransferPolicyMismatch) {
     EXPECT_NO_THROW(config.Validate());
 
     // A State group is the mirror image.
-    history.family = CacheGroupFamily::State;
+    history.attn_kind = AttnKind::kState;
     history.block_granularity = 0;
     ExpectRejectedNamingGroup(config, history.group_id);
     history.transfer_policy = CacheTransferPolicy::LatestSnapshot;
     EXPECT_NO_THROW(config.Validate());
 }
 
-TEST(SchedulerConfigValidateTest, ReplayableRequiresASlidingHistoryGroup) {
+TEST(SchedulerConfigValidateTest, ReplayableRequiresASlidingWindowGroup) {
     SchedulerConfig config = MakeValidConfig();
     CacheGroupConfig& group = config.cache_groups[0];
     group.group_id = "swa";
-    group.retention = CacheGroupConfig::Retention::SlidingWindow;
+    group.attn_kind = AttnKind::kSlidingWindow;
     group.sliding_window_tokens = 256;
     group.replayable = true;
     EXPECT_NO_THROW(config.Validate());
 
-    // Only a sliding History group can be regenerated: a full-history group is
+    // Only a sliding-window group can be regenerated: a full group is
     // prefix-closed and shared, and a State group cannot slide at all.
     SchedulerConfig full = MakeValidConfig();
     full.cache_groups[0].replayable = true;
     ExpectRejectedNamingGroup(full, full.cache_groups[0].group_id);
-    group.family = CacheGroupFamily::State;
+    group.attn_kind = AttnKind::kState;
+    group.sliding_window_tokens.reset();
     group.block_granularity = 0;
     ExpectRejectedNamingGroup(config, "swa");
 }
@@ -637,7 +622,7 @@ TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowOnEveryRole) {
     swa.group_id = "swa";
     swa.block_granularity = 64;
     swa.total_pages = config.device_allocator.total_pages;
-    swa.retention = CacheGroupConfig::Retention::SlidingWindow;
+    swa.attn_kind = AttnKind::kSlidingWindow;
     swa.sliding_window_tokens = 128;
     swa.replayable = true;
     config.cache_groups.push_back(swa);
@@ -662,7 +647,7 @@ TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowOnEveryRole) {
     state.group_id = "state";
     state.block_granularity = 0;
     state.total_pages = config.device_allocator.total_pages;
-    state.family = CacheGroupFamily::State;
+    state.attn_kind = AttnKind::kState;
     with_state.cache_groups.push_back(state);
     EXPECT_NO_THROW(with_state.Validate());
 
@@ -836,7 +821,7 @@ TEST(ForwardCacheOpsBuildBlockTables, SingleGroupRowMatchesSource) {
     BlockPool pool(/*num_lcm_blocks=*/32, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                                    /*snapshot_pool=*/nullptr,
@@ -873,7 +858,7 @@ TEST(ForwardCacheOpsBuildBlockTables, KeyMatchesSuppliedGroupIdStrings) {
 TEST(ForwardCacheOpsBuildBlockTables, ChildSlotsWithinOneParentHaveDistinctKernelPageIds) {
     BlockPool pool(/*num_lcm_blocks=*/4, {2});
     const std::vector<CacheGroupSpec> specs{
-        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
+        {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
     };
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, pool, /*enable_l3_storage=*/false,
@@ -894,8 +879,8 @@ TEST(ForwardCacheOpsBuildBlockTables, ChildSlotsWithinOneParentHaveDistinctKerne
 TEST(ForwardCacheOpsBuildBlockTables, ResolvesEachGroupsPackingRecipe) {
     BlockPool pool(/*num_lcm_blocks=*/16, {2, 1});
     const std::vector<CacheGroupSpec> specs{
-        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
-        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
+        {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, pool, /*enable_l3_storage=*/false,

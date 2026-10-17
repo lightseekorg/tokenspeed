@@ -22,6 +22,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa:
 from tokenspeed.runtime.layers.logits_processor import (  # noqa: E402
     LogitsMetadata,
     LogitsProcessor,
+    VocabParallelArgmax,
     fused_softcap,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict  # noqa: E402
@@ -38,6 +39,12 @@ def test_logits_processor_only_uses_fused_lm_head_for_kimi(monkeypatch):
         return torch.matmul(hidden.to(weight.dtype), weight.T)
 
     monkeypatch.setattr(logits_processor_module, "_lm_head_matmul", fake_lm_head_matmul)
+    is_nvidia = logits_processor_module.current_platform().is_nvidia
+    monkeypatch.setattr(
+        logits_processor_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_amd=False, is_nvidia=is_nvidia),
+    )
 
     non_kimi = LogitsProcessor(
         config=SimpleNamespace(model_type="test", vocab_size=2), dp_lm_head_tp=False
@@ -234,7 +241,8 @@ def test_tp_logits_custom_collectives_skip_host_spread_group_without_fabric(
     )
     # Distributed argmax is no longer topology-gated: cross-node groups probe
     # for NVLS instead. This shard is below the kernel's vocab floor, so the
-    # state is rejected before any collective work.
+    # kernel state is rejected before any collective work and the argmax
+    # falls back to the portable all-reduce of packed keys.
     monkeypatch.setattr(
         logits_processor_module,
         "try_create_dist_argmax_state",
@@ -244,7 +252,7 @@ def test_tp_logits_custom_collectives_skip_host_spread_group_without_fabric(
     )
 
     assert processor._init_all_gather_state(lm_head) is None
-    assert processor._init_dist_argmax_state(lm_head) is None
+    assert isinstance(processor._init_dist_argmax_state(lm_head), VocabParallelArgmax)
 
 
 def test_a_strided_tp_group_smaller_than_one_host_is_still_probed(monkeypatch):
@@ -321,7 +329,8 @@ def test_tp_logits_custom_collectives_serve_host_spread_group_with_fabric(monkey
 
 
 def test_dist_argmax_probe_failure_falls_back_and_latches(monkeypatch):
-    """A failed probe falls back, latches its verdict, and skips capture."""
+    """A failed probe falls back to the portable argmax, latches its
+    verdict, and skips capture."""
     monkeypatch.setitem(
         global_server_args_dict,
         "mapping",
@@ -372,9 +381,10 @@ def test_dist_argmax_probe_failure_falls_back_and_latches(monkeypatch):
     assert len(calls) == 0
 
     capturing["on"] = False
-    assert processor._init_dist_argmax_state(lm_head) is None
+    # Without the kernel state, the argmax all-reduces packed keys instead.
+    assert isinstance(processor._init_dist_argmax_state(lm_head), VocabParallelArgmax)
     # The verdict is cached: the constructor must not be retried.
-    assert processor._init_dist_argmax_state(lm_head) is None
+    assert isinstance(processor._init_dist_argmax_state(lm_head), VocabParallelArgmax)
     assert len(calls) == 1
 
 

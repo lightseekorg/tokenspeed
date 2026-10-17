@@ -65,6 +65,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     make_config,
     ngram_inputs_for_forward,
     resolve_dspark_prefix_replay_tokens,
+    sampled_top_k_for_forward,
     scheduler_cache_group_pages,
     scheduler_pd_lifecycle,
     should_use_overlap_schedule,
@@ -85,9 +86,11 @@ from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     PendingExecution,
     PlannedForward,
+    StopCriteria,
 )
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
 from tokenspeed.runtime.metrics.collector import EngineMetrics
+from tokenspeed.runtime.metrics.service import metrics_service
 from tokenspeed.runtime.multimodal.inputs import multimodal_context_for_forward
 from tokenspeed.runtime.pd.kv_events import (
     EventPublisherFactory,
@@ -550,10 +553,10 @@ class EventLoop:
                 "app_key": server_args.app_key or "",
                 "dp_rank": str(dp_rank),
             },
-            enabled=(
-                server_args.enable_metrics
-                and attn_tp_rank == 0
-                and "prometheus" in (server_args.metrics_reporters or [])
+            enabled=server_args.enable_metrics and attn_tp_rank == 0,
+            reporters=server_args.metrics_reporters,
+            event_sink=(
+                metrics_service.get_event_sink() if attn_tp_rank == 0 else None
             ),
         )
 
@@ -1182,8 +1185,17 @@ class EventLoop:
                     self._pause_hooks.paused_idle_step()
                     paused_round = True
                 else:
-                    execution_plan = self.scheduler.next_execution_plan()
-                    self._cache_hooks.count_plan_ops(execution_plan)
+                    with torch.profiler.record_function(
+                        "scheduler.next_execution_plan"
+                    ):
+                        execution_plan = self.scheduler.next_execution_plan()
+                    # One snapshot-store op per retraction victim: the plan
+                    # read that drives the in-flight accounting also yields
+                    # the round's preemption count (0 on rounds without
+                    # retraction, which are the overwhelming majority).
+                    num_retracted = self._cache_hooks.count_plan_ops(execution_plan)
+                    if num_retracted:
+                        self.metrics.record_preemptions(num_retracted)
                     # A capacity retraction whose victim could not be imaged
                     # aborted that request inside the plan build; it is gone
                     # from the scheduler, so finish it toward the client here
@@ -1223,6 +1235,7 @@ class EventLoop:
                         # output_processor.rid_to_state, which would KeyError on
                         # rids still present in the current forward_op.
                         sampling_params_list = self._gather_sampling_params(forward_op)
+                        stop_criteria = self._gather_stop_criteria(forward_op)
                         grammar_inputs = self._gather_grammar_state(forward_op)
                         ngram_inputs = ngram_inputs_for_forward(
                             forward_op,
@@ -1256,6 +1269,10 @@ class EventLoop:
                             ngram_inputs=ngram_inputs,
                             request_history_seeds=request_history_seeds,
                             input_logprob_plan=input_logprob_plan,
+                            sampled_top_k=sampled_top_k_for_forward(
+                                forward_op, self.output_processor.rid_to_state
+                            ),
+                            stop_criteria=stop_criteria,
                             multimodal_context=(
                                 multimodal_context_for_forward(
                                     forward_op,
@@ -1364,6 +1381,14 @@ class EventLoop:
             for rid in forward_op.request_ids
         ]
 
+    def _gather_stop_criteria(self, forward_op) -> tuple[StopCriteria, ...]:
+        """Per-request stop tokens and token limits the device cuts verify
+        rounds with, from the same state the finish check reads."""
+        return tuple(
+            self.output_processor.rid_to_state[rid].stop_criteria
+            for rid in forward_op.request_ids
+        )
+
     def _gather_grammar_state(self, forward_op) -> GrammarStepInputs | None:
         """Build ``GrammarStepInputs`` for the current batch, or ``None``.
 
@@ -1460,6 +1485,7 @@ def run_event_loop(
         shutdown_event.set()
 
     try:
+        metrics_service.connect(port_args.metrics_producer_configs)
         if server_args.disaggregation_mode == "encode":
             # The encode role is LM-free; run the lightweight vision-tower loop
             # instead of building the full EventLoop (KV/LM scheduler).
@@ -1543,6 +1569,7 @@ def run_event_loop(
                     f"{get_exception_traceback()!s}",
                 )
                 parent_process.send_signal(signal.SIGUSR1)
+        metrics_service.close(timeout=2.0)
         if (
             previous_sigterm_handler is not None
             and threading.current_thread() is threading.main_thread()

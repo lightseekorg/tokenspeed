@@ -41,9 +41,10 @@ from __future__ import annotations
 
 import os
 import sys
-import unittest
 from types import SimpleNamespace
 from unittest import mock
+
+import pytest
 
 # CI registration (AST-parsed, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -76,7 +77,7 @@ def _server_args(**overrides) -> SimpleNamespace:
     return args
 
 
-class TestGrammarManagerHeadless(unittest.TestCase):
+class TestGrammarManagerHeadless:
     def test_skip_tokenizer_init_does_not_suppress_backend(self):
         """The headless flag must not discard a configured grammar backend."""
         args = _server_args(skip_tokenizer_init=True)
@@ -88,17 +89,27 @@ class TestGrammarManagerHeadless(unittest.TestCase):
         ) as factory:
             manager = GrammarManager(args, tokenizer, vocab_size=32)
 
-        factory.assert_called_once_with(args, tokenizer, 32)
-        self.assertIs(manager.grammar_backend, backend)
+        factory.assert_called_once_with(args, tokenizer, 32, stop_token_ids=None)
+        assert (manager.grammar_backend) is (backend)
+
+    def test_the_backend_gets_the_engines_stop_ids(self):
+        """The ids the engine stops on reach the backend's tokenizer info."""
+        args = _server_args()
+        with mock.patch.object(
+            grammar_manager_mod, "create_grammar_backend", return_value=object()
+        ) as factory:
+            GrammarManager(args, None, vocab_size=32, stop_token_ids={2, 7})
+
+        factory.assert_called_once_with(args, None, 32, stop_token_ids={2, 7})
 
     def test_backend_none_only_from_explicit_none(self):
         """--grammar-backend none is the sole path to a missing backend."""
         args = _server_args(grammar_backend="none", skip_tokenizer_init=True)
-        self.assertIsNone(create_grammar_backend(args, tokenizer=None, vocab_size=32))
+        assert (create_grammar_backend(args, tokenizer=None, vocab_size=32)) is None
 
         manager = GrammarManager(args, tokenizer=None, vocab_size=32)
-        self.assertIsNone(manager.grammar_backend)
+        assert (manager.grammar_backend) is None
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

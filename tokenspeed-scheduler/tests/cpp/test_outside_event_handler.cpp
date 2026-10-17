@@ -136,7 +136,7 @@ protected:
         for (std::int32_t i = 0; i < 3; ++i) {
             CacheGroupConfig state = cfg.cache_groups.front();
             state.group_id = "state_" + std::to_string(i);
-            state.family = CacheGroupFamily::State;
+            state.attn_kind = AttnKind::kState;
             state.block_granularity = 0;
             cfg.cache_groups.push_back(std::move(state));
         }
@@ -255,8 +255,7 @@ protected:
         full.group_id = "full";
         full.block_granularity = cfg.prefix_granularity;
         full.total_pages = cfg.device_allocator.total_pages;
-        full.retention = CacheGroupConfig::Retention::FullHistory;
-        full.family = CacheGroupFamily::History;
+        full.attn_kind = AttnKind::kFull;
         full.transfer_policy = CacheTransferPolicy::FullSuffix;
         cfg.cache_groups = {full};
         SetTestSnapshotPool(cfg);
@@ -784,7 +783,7 @@ protected:
         state.group_id = "state";
         state.total_pages = 7;
         state.cache_blocks_per_lcm_block = 1;
-        state.family = CacheGroupFamily::State;
+        state.attn_kind = AttnKind::kState;
         state.block_granularity = 0;
         state.transfer_policy = CacheTransferPolicy::LatestSnapshot;
         cfg.cache_groups = {full, state};
@@ -828,7 +827,7 @@ protected:
         swa.block_granularity = 2;
         swa.total_pages = 1 + 64 * 2;
         swa.cache_blocks_per_lcm_block = 2;
-        swa.retention = CacheGroupConfig::Retention::SlidingWindow;
+        swa.attn_kind = AttnKind::kSlidingWindow;
         swa.sliding_window_tokens = 4;
         cfg.cache_groups = {full, swa};
         SetTestSnapshotPool(cfg);
@@ -928,9 +927,8 @@ protected:
         sliding.group_id = "sliding";
         sliding.block_granularity = 2;
         sliding.total_pages = cfg.device_allocator.total_pages;
-        sliding.retention = CacheGroupConfig::Retention::SlidingWindow;
+        sliding.attn_kind = AttnKind::kSlidingWindow;
         sliding.sliding_window_tokens = 4;
-        sliding.family = CacheGroupFamily::History;
         sliding.transfer_policy = CacheTransferPolicy::FullSuffix;
         cfg.cache_groups = {sliding};
         SetTestSnapshotPool(cfg);

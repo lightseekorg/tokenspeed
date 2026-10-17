@@ -20,10 +20,16 @@
 
 """QSA attention kernels for AMD GFX950."""
 
+from tokenspeed_kernel_amd.ops.gfx950.attention.qsa.indexer import (
+    launch_gluon_qsa_block_scores_gfx950,
+    launch_gluon_qsa_block_topk_select_gfx950,
+)
 from tokenspeed_kernel_amd.ops.gfx950.attention.qsa.sparse_attention import (
     launch_gluon_qsa_sparse_attention_gfx950,
 )
 
 __all__ = [
+    "launch_gluon_qsa_block_scores_gfx950",
+    "launch_gluon_qsa_block_topk_select_gfx950",
     "launch_gluon_qsa_sparse_attention_gfx950",
 ]

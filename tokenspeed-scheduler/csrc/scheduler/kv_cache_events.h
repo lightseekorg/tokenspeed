@@ -28,11 +28,6 @@
 
 namespace tokenspeed {
 
-enum class KvCacheEventKind {
-    kBlockStored,
-    kBlockRemoved,
-};
-
 struct KvBlockStoredEvent {
     std::vector<std::uint64_t> block_hashes;
     std::optional<std::uint64_t> parent_block_hash;

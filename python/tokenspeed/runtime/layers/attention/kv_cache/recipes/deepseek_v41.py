@@ -214,14 +214,13 @@ class DeepseekV41Recipe(CacheRecipe):
         specs = [
             CacheGroupSpec(
                 group_id=gid,
-                retention=(
+                attn_kind=(
                     "full_history" if windows[gid] is None else "sliding_window"
                 ),
                 rows_per_page=rows,
                 entry_stride_tokens=stride,
                 sliding_window_tokens=windows[gid],
                 replayable=windows[gid] is not None,
-                family="history",
                 transfer_policy=None,
             )
             for gid, (rows, stride) in V41_GROUP_GEOMETRY.items()

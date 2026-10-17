@@ -279,6 +279,27 @@ def gdn_chunk_prefill(
         )
 
 
+def _qkv_rows_strided(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    """Whether q/k/v rows lie farther apart than one packed q|k|v row.
+
+    Contiguous tensors, and the sections of one dense ``[..., q | k | v]``
+    row split apart (as the dense decode path hands them over), are not
+    strided; views into a wider projection row are.
+    """
+    width = sum(t.shape[-2] * t.shape[-1] for t in (q, k, v))
+    for t in (q, k, v):
+        if t.is_contiguous():
+            continue
+        if t.stride(-1) != 1 or t.stride(-2) != t.shape[-1]:
+            return True
+        row = width
+        for dim in reversed(range(t.ndim - 2)):
+            if t.shape[dim] != 1 and t.stride(dim) != row:
+                return True
+            row *= t.shape[dim]
+    return False
+
+
 def gdn_decode_step(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -302,6 +323,10 @@ def gdn_decode_step(
         q: Query tensor shaped ``[B, 1, num_q_heads, head_dim]``.
         k: Key tensor shaped ``[B, 1, num_q_heads, head_dim]``.
         v: Value tensor shaped ``[B, 1, num_v_heads, head_v_dim]``.
+            q/k/v may be sections of one packed ``q | k | v`` row. Rows
+            spaced wider (views into a projection row; heads stay
+            contiguous) only reach kernels declaring the ``strided_qkv``
+            trait (see ``gdn_decode_supports``).
         A_log: Floating-point log decay parameter shaped ``[num_v_heads]``.
             Backends that require FP32 normalize it internally.
         a: Input-dependent decay shaped ``[B, 1, num_v_heads]``.
@@ -326,11 +351,14 @@ def gdn_decode_step(
     """
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
+    traits = {"head_dim": head_dim}
+    if _qkv_rows_strided(q, k, v):
+        traits["strided_qkv"] = True
     kernel = select_kernel(
         "attention",
         "gdn_decode_step",
         signature,
-        traits={"head_dim": head_dim},
+        traits=traits,
         solution=solution,
         override=override,
     )
@@ -411,7 +439,9 @@ def gdn_decode_mtp(
     use_qk_l2norm: bool = True,
     intermediate_states_buffer: torch.Tensor | None = None,
     output_state_indices: torch.Tensor | None = None,
+    output_state: torch.Tensor | None = None,
     tree_ancestors: torch.Tensor | None,
+    replay_payload: torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -455,6 +485,13 @@ def gdn_decode_mtp(
             non-negative. This is mutually exclusive with
             ``intermediate_states_buffer`` and requires
             ``disable_state_update=False``.
+        output_state: Optional K-last pool shaped like ``initial_state`` (any
+            row count) that ``output_state_indices`` addresses instead of
+            ``initial_state``, so a verify can read the committed state in
+            place and stage its per-token states elsewhere. Requires
+            ``output_state_indices``; only kernels declaring the
+            ``separate_output_state`` trait accept it (see
+            ``gdn_decode_supports``).
         tree_ancestors: Optional contiguous int64 ``[B, T]`` draft-tree
             ancestor-or-self bitmask, ``T <= 64``: bit ``s`` of row ``t`` is
             set when step ``s`` is ``t`` or one of its ancestors, and ancestors
@@ -465,6 +502,10 @@ def gdn_decode_mtp(
             needs ``disable_state_update``, and an ``intermediate_states_buffer``
             is given exactly when ``gdn_tree_verify_needs_node_states(T)``.
             Runs the Triton solution; ``None`` is a chain.
+        replay_payload: Optional contiguous ``[B * T, num_q_heads * head_dim +
+            num_v_heads * head_v_dim + 2 * num_v_heads]`` ReplaySSM payload, in
+            the inputs' dtype, that a chunked ReplaySSM tree verify fills with
+            each token's ``[k | v | a | b]`` as read.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -491,6 +532,18 @@ def gdn_decode_mtp(
             )
         if disable_state_update:
             raise ValueError("output_state_indices requires disable_state_update=False")
+    if output_state is not None:
+        if output_state_indices is None:
+            raise ValueError("output_state requires output_state_indices")
+        if (
+            output_state.shape[1:] != initial_state.shape[1:]
+            or output_state.dtype != initial_state.dtype
+        ):
+            raise ValueError(
+                "output_state must match initial_state's row shape and dtype, got "
+                f"{output_state.dtype} {tuple(output_state.shape)} vs "
+                f"{initial_state.dtype} {tuple(initial_state.shape)}"
+            )
 
     if tree_ancestors is not None:
         if (
@@ -526,11 +579,16 @@ def gdn_decode_mtp(
 
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
+    traits = {"head_dim": head_dim}
+    if output_state is not None:
+        traits["separate_output_state"] = True
+    if _qkv_rows_strided(q, k, v):
+        traits["strided_qkv"] = True
     kernel = select_kernel(
         "attention",
         "gdn_decode_mtp",
         signature,
-        traits={"head_dim": head_dim},
+        traits=traits,
         solution=solution,
         override=override,
     )
@@ -560,7 +618,9 @@ def gdn_decode_mtp(
             use_qk_l2norm=use_qk_l2norm,
             intermediate_states_buffer=intermediate_states_buffer,
             output_state_indices=output_state_indices,
+            output_state=output_state,
             tree_ancestors=tree_ancestors,
+            replay_payload=replay_payload,
         )
 
 
@@ -615,6 +675,53 @@ def validate_replay_commit_setup(
         raise ValueError(
             "replay parameters must be contiguous FP32 on the payload device"
         )
+
+
+def gdn_decode_supports(
+    op: str,
+    dtype: torch.dtype,
+    *,
+    head_dim: int,
+    trait: str,
+    solution: str | None,
+) -> bool:
+    """Whether the kernel a GDN decode op selects by default also accepts a
+    feature, so a caller can use it without changing the selected kernel.
+
+    Args:
+        op: ``"gdn_decode_step"`` or ``"gdn_decode_mtp"``.
+        dtype: q/k/v dtype.
+        head_dim: Key head dimension.
+        trait: ``"separate_output_state"`` (an ``output_state`` pool) or
+            ``"strided_qkv"`` (q/k/v rows spaced wider than one packed
+            ``q | k | v`` row, with contiguous heads; such kernels read a/b by
+            stride too).
+        solution: The solution the caller forces, or ``None``.
+
+    Returns:
+        ``True`` when the default selection and the selection requiring
+        ``trait`` pick the same kernel.
+    """
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    try:
+        default = select_kernel(
+            "attention",
+            op,
+            signature,
+            traits={"head_dim": head_dim},
+            solution=solution,
+        )
+        featured = select_kernel(
+            "attention",
+            op,
+            signature,
+            traits={"head_dim": head_dim, trait: True},
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return False
+    return default.name == featured.name
 
 
 def validate_replay_commit_args(
@@ -794,6 +901,7 @@ def gdn_replay_commit_supported(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.gdn.flashinfer  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.gdn.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.gdn.triton  # noqa: E402,F401
 
 # isort: on
@@ -808,6 +916,7 @@ __all__ = [
     "gdn_chunk_prefill_capturable",
     "gdn_decode_step",
     "gdn_decode_mtp",
+    "gdn_decode_supports",
     "gdn_replay_commit",
     "gdn_replay_commit_supported",
     "gdn_tree_verify_needs_node_states",

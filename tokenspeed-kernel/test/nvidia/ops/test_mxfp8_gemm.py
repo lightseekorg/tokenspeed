@@ -92,7 +92,9 @@ def test_triton_mxfp8_1x32_raw_ue8m0_weight(device: str, override: str | None) -
     scales = torch.exp2(b_scales.float() - 127.0).repeat_interleave(32, dim=1)
     # Compare against the operands mm() actually quantizes; UE8M0 scales are
     # stored as biased exponent bytes.
-    q_a, a_scales = _online_quantize_mxfp8(a, [1, 32], "ue8m0", enable_pdl=False)
+    q_a, a_scales = _online_quantize_mxfp8(
+        a, [1, 32], "ue8m0", enable_pdl=False, kernel_name=None
+    )
     activation_scales = torch.exp2(a_scales.float() - 127.0).repeat_interleave(
         32, dim=1
     )

@@ -158,7 +158,6 @@ if current_platform().is_amd:
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "conv_kernel_size": frozenset({4}),
-            "fused_output_norm": frozenset({True}),
             "paged_state": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
         },
@@ -180,13 +179,8 @@ if current_platform().is_amd:
         head_dim: int,
         cu_seqlens: torch.Tensor,
         lower_bound: float | None,
-        output_gate: torch.Tensor | None,
-        norm_weight: torch.Tensor | None,
-        norm_eps: float | None,
     ):
         """Run V-major gfx950 fused decode, decay projection included."""
-        if output_gate is None or norm_weight is None or norm_eps is None:
-            raise ValueError("gfx950 fused KDA decode requires output normalization")
         return _kda_fused_decode_impl(
             mixed_qkv=mixed_qkv,
             conv_weights=conv_weights,
@@ -196,9 +190,6 @@ if current_platform().is_amd:
             beta_logits=beta_logits,
             A_log=A_log,
             dt_bias=dt_bias,
-            output_gate=output_gate,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
             state_pool=state_pool,
             read_indices=read_indices,
             write_indices=write_indices,
@@ -386,7 +377,6 @@ if current_platform().is_amd:
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "conv_kernel_size": frozenset({4}),
-            "fused_output_norm": frozenset({True}),
             "paged_state": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
         },
@@ -408,13 +398,8 @@ if current_platform().is_amd:
         head_dim: int,
         cu_seqlens: torch.Tensor,
         lower_bound: float | None,
-        output_gate: torch.Tensor | None,
-        norm_weight: torch.Tensor | None,
-        norm_eps: float | None,
     ):
         """Run the decay projection and V-major gfx1250 fused decode."""
-        if output_gate is None or norm_weight is None or norm_eps is None:
-            raise ValueError("gfx1250 fused KDA decode requires output normalization")
         raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
         return _kda_fused_decode_gfx1250_impl(
             mixed_qkv=mixed_qkv,
@@ -424,9 +409,6 @@ if current_platform().is_amd:
             beta_logits=beta_logits,
             A_log=A_log,
             dt_bias=dt_bias,
-            output_gate=output_gate,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
             state_pool=state_pool,
             read_indices=read_indices,
             write_indices=write_indices,

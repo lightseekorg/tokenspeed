@@ -24,7 +24,6 @@ import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 
 _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz})
-_MLA_PREFILL_DTYPES = frozenset({torch.float16, torch.bfloat16}) | _FP8_DTYPES
 
 
 @triton.jit
@@ -36,6 +35,7 @@ def _mla_prefill_kernel(
     LSE,
     cu_seqlens_q,
     cu_seqlens_kv,
+    query_start_offsets,
     sm_scale,
     kv_group_num,
     stride_qbs,
@@ -57,6 +57,8 @@ def _mla_prefill_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    HAS_QUERY_START_OFFSETS: tl.constexpr,
     HAS_LSE: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
@@ -68,7 +70,10 @@ def _mla_prefill_kernel(
     q_len = tl.load(cu_seqlens_q + cur_seq + 1) - q_start
     kv_start = tl.load(cu_seqlens_kv + cur_seq)
     kv_len = tl.load(cu_seqlens_kv + cur_seq + 1) - kv_start
-    q_causal_start = tl.maximum(kv_len - q_len, 0)
+    if HAS_QUERY_START_OFFSETS:
+        q_causal_start = tl.load(query_start_offsets + cur_seq)
+    else:
+        q_causal_start = tl.maximum(kv_len - q_len, 0)
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
@@ -101,7 +106,14 @@ def _mla_prefill_kernel(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    for start_n in range(0, kv_len, BLOCK_N):
+    begin_n, end_n = 0, kv_len
+    if WINDOW_LEFT >= 0:
+        first_query = q_causal_start + cur_block_m * BLOCK_M
+        begin_n = tl.maximum(0, first_query - WINDOW_LEFT) // BLOCK_N * BLOCK_N
+        if IS_CAUSAL:
+            end_n = tl.minimum(kv_len, first_query + BLOCK_M)
+
+    for start_n in range(begin_n, end_n, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         kv_offsets_n = start_n + offs_n
         mask_n = kv_offsets_n < kv_len
@@ -111,6 +123,9 @@ def _mla_prefill_kernel(
             query_positions = q_causal_start + q_offsets_m[:, None]
             key_positions = kv_offsets_n[None, :]
             final_mask &= query_positions >= key_positions
+        if WINDOW_LEFT >= 0:
+            query_positions = q_causal_start + q_offsets_m[:, None]
+            final_mask &= kv_offsets_n[None, :] >= query_positions - WINDOW_LEFT
 
         offs_k = (
             (kv_start + kv_offsets_n[None, :]) * stride_kbs
@@ -186,6 +201,8 @@ def mla_prefill_fwd(
     softmax_scale: float,
     *,
     is_causal: bool,
+    window_left: int,
+    query_start_offsets: torch.Tensor | None,
     logit_cap: float = 0.0,
     lse: torch.Tensor | None = None,
 ) -> None:
@@ -241,6 +258,7 @@ def mla_prefill_fwd(
         lse_arg,
         cu_seqlens_q,
         cu_seqlens_kv,
+        query_start_offsets,
         softmax_scale,
         q.shape[1] // k.shape[1],
         q.stride(0),
@@ -262,6 +280,8 @@ def mla_prefill_fwd(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         IS_CAUSAL=is_causal,
+        WINDOW_LEFT=window_left,
+        HAS_QUERY_START_OFFSETS=query_start_offsets is not None,
         HAS_LSE=lse is not None,
         num_warps=num_warps,
         num_stages=1,
@@ -283,6 +303,8 @@ def _triton_mla_prefill_impl(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
     seq_lens_kv: torch.Tensor | None = None,
+    window_left: int = -1,
+    query_start_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if out is None:
         out_dtype = torch.bfloat16 if q.dtype in _FP8_DTYPES else q.dtype
@@ -308,6 +330,8 @@ def _triton_mla_prefill_impl(
         max_seqlen_kv,
         softmax_scale,
         is_causal=is_causal,
+        window_left=window_left,
+        query_start_offsets=query_start_offsets,
         logit_cap=logit_cap,
         lse=lse,
     )

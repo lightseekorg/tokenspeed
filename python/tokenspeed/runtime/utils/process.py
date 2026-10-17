@@ -23,10 +23,16 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing as mp
 import os
 import signal
 import sys
 import threading
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager
+from multiprocessing import connection
+from multiprocessing.connection import Connection
+from typing import Any
 
 import psutil
 
@@ -76,3 +82,79 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             itself.send_signal(signal.SIGQUIT)
         except psutil.NoSuchProcess:
             pass
+
+
+def start_process_with_ready_pipe(
+    target: Callable[..., None],
+    args: tuple,
+    start_context: AbstractContextManager,
+) -> tuple[mp.Process, Connection]:
+    """Start ``target(*args, writer)`` and return it with the pipe's read end.
+
+    The child reports readiness by sending on ``writer``. The parent closes
+    its own copy of ``writer`` once the child has started, so ``recv()`` on
+    the returned reader raises ``EOFError`` if the child dies first (e.g. it
+    is OOM-killed) instead of blocking forever.
+
+    Args:
+        target: The child process entry point.
+        args: Positional arguments passed before ``writer``.
+        start_context: Entered around ``Process.start()``.
+
+    Returns:
+        The started process and the read end of its pipe.
+    """
+    reader, writer = mp.Pipe(duplex=False)
+    proc = mp.Process(target=target, args=(*args, writer))
+    with start_context:
+        proc.start()
+    writer.close()
+    return proc, reader
+
+
+def receive_ready_messages(
+    readers: Sequence[Connection], procs: Sequence[mp.Process]
+) -> list[Any]:
+    """Receive one message per reader, failing as soon as any child dies.
+
+    ``readers[i]`` is the ready pipe of ``procs[i]``. Waiting on every pipe
+    and every process at once matters with several ranks: when one rank is
+    killed, the others can block in a collective and never report, so
+    waiting on their pipes alone would hang.
+
+    Args:
+        readers: The read ends from ``start_process_with_ready_pipe``.
+        procs: The processes, in the same order.
+
+    Returns:
+        The messages, in the order of ``readers``.
+
+    Raises:
+        RuntimeError: A process exited before every reader got its message,
+            including one that had already reported: its peers may be
+            waiting on it.
+    """
+    messages: list[Any] = [None] * len(readers)
+    pending = {reader: index for index, reader in enumerate(readers)}
+    sentinels = {proc.sentinel: index for index, proc in enumerate(procs)}
+    while pending:
+        ready = connection.wait([*pending, *sentinels])
+        for reader in [obj for obj in ready if obj in pending]:
+            index = pending.pop(reader)
+            try:
+                messages[index] = reader.recv()
+            except EOFError:
+                _raise_process_died(procs, index)
+        for index in [sentinels[obj] for obj in ready if obj in sentinels]:
+            _raise_process_died(procs, index)
+    return messages
+
+
+def _raise_process_died(procs: Sequence[mp.Process], index: int) -> None:
+    proc = procs[index]
+    proc.join()
+    raise RuntimeError(
+        f"Scheduler process {index} (pid {proc.pid}) exited with code "
+        f"{proc.exitcode} before startup finished. Please check if there are "
+        "relevant logs."
+    )

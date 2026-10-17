@@ -377,7 +377,7 @@ class FusedMulticastLatentDownGemmKernel:
     this rank's columns before every call, and same-slot rounds must be spaced
     by a rank rendezvous. ``LamportCopy`` releases its PDL dependents before
     re-arming, so an unspaced peer can overwrite fresh data with sentinels and
-    hang the round -- see the pool rotation in ``ops/moe/latent_tail.py``.
+    hang the round -- see the pool rotation in ``ops/moe/_cute_dsl/latent_tail.py``.
     """
 
     def __init__(

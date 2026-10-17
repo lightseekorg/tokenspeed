@@ -162,8 +162,7 @@ def _qsa_pool(*, device: str, layer_offset: int) -> SimpleNamespace:
                 SimpleNamespace(
                     group_id=gid,
                     block_granularity=granularity,
-                    family="history",
-                    retention="full_history",
+                    attn_kind="full_history",
                     rows_per_page=granularity,
                     entry_stride_tokens=1,
                     sliding_window_tokens=None,

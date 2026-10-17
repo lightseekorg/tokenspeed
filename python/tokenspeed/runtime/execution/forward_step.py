@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 import tqdm
+from tokenspeed_kernel.workspace import capture_session
 
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cudagraph_memory import (
@@ -594,7 +595,7 @@ class ForwardStepRunner:
 
         def run_once():
             # Dummy add_batch keeps the grammar queue 1:1 with replays —
-            # fetch_batch pops once per forward, so warmup + capture
+            # build pops once per forward, so warmup + capture
             # would otherwise raise queue.Empty.
             if self.capturable_grammar is not None:
                 self.capturable_grammar.add_batch(
@@ -648,7 +649,8 @@ class ForwardStepRunner:
         _is_capture_mode = True
         global global_graph_memory_pool
         graph_kwargs = {"auto_dispatch_capture": True} if self.device == "npu" else {}
-        with observer, self.device_module.graph(
+        # The kernel state captured launches need lives as long as the graph.
+        with observer, capture_session(graph), self.device_module.graph(
             graph,
             pool=global_graph_memory_pool,
             stream=self.stream,
@@ -1046,8 +1048,10 @@ class ForwardStepRunner:
         device.
 
         Returns ``(output_tokens, output_lengths, output_logprobs,
-        input_token_logprobs)``; the last is the prompt-logprob gather of an
-        extend/mixed forward (``ctx.input_logprob_rows``) and None otherwise.
+        forward_logprobs)``; the last is an extend/mixed forward's
+        ``ForwardLogprobs`` (the prompt-logprob gather of
+        ``ctx.input_logprob_rows`` and the top-k alternatives
+        ``ctx.sampled_top_k`` asks for) and None otherwise.
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
@@ -1167,13 +1171,13 @@ class ForwardStepRunner:
             if self._expert_load_rows is not None:
                 self._expert_load_rows.clear()
 
-            # A decode graph never gathers prompt logprobs (its captured
-            # fourth output is None).
+            # A decode graph never gathers prompt logprobs or top-k
+            # alternatives (its captured fourth output is None).
             (
                 output_tokens,
                 output_lengths,
                 output_logprobs,
-                _input_token_logprobs,
+                _forward_logprobs,
             ) = self.output_buffers[graph_key]
 
             result = (

@@ -52,86 +52,12 @@ kWarpSize = l.constexpr(64)
 
 
 @g.jit
-def llvm_amdgcn_raw_buffer_load_lds(
-    rsrc,
-    lds_ptr,
-    size: l.constexpr,
-    voffset,
-    soffset,
-    offset: l.constexpr,
-    aux: l.constexpr,
-):
-    _native_call(
-        "llvm.amdgcn.raw.buffer.load.lds",
-        "void",
-        ("v4i32", "p3", "#i32", "i32", "i32", "#i32", "#i32"),
-        (rsrc, lds_ptr.to(l.uint64).to(l.uint32), size, voffset, soffset, offset, aux),
-        False,
-    )
-
-
-@g.jit
 def llvm_amdgcn_raw_buffer_load_v4i32(rsrc, voffset, soffset, AUX: l.constexpr):
     return _native_call(
         "llvm.amdgcn.raw.buffer.load.v4i32",
         "v4i32",
         ("v4i32", "i32", "i32", "#i32"),
         (rsrc, voffset, soffset, AUX),
-        False,
-    )
-
-
-@g.jit
-def llvm_amdgcn_raw_buffer_store_v4i32(data, rsrc, voffset, soffset, aux: l.constexpr):
-    _native_call(
-        "llvm.amdgcn.raw.buffer.store.v4i32",
-        "void",
-        ("v4i32", "v4i32", "i32", "i32", "#i32"),
-        (data, rsrc, voffset, soffset, aux),
-        False,
-    )
-
-
-@g.jit
-def llvm_amdgcn_raw_buffer_load_v2i32(rsrc, voffset, soffset, aux: l.constexpr):
-    return _native_call(
-        "llvm.amdgcn.raw.buffer.load.v2i32",
-        "v2i32",
-        ("v4i32", "i32", "i32", "#i32"),
-        (rsrc, voffset, soffset, aux),
-        False,
-    )
-
-
-@g.jit
-def llvm_amdgcn_raw_buffer_load_i32(rsrc, voffset, soffset, aux: l.constexpr):
-    return _native_call(
-        "llvm.amdgcn.raw.buffer.load.i32",
-        "i32",
-        ("v4i32", "i32", "i32", "#i32"),
-        (rsrc, voffset, soffset, aux),
-        False,
-    )
-
-
-@g.jit
-def llvm_amdgcn_raw_buffer_store_v2i32(data, rsrc, voffset, soffset, aux: l.constexpr):
-    return _native_call(
-        "llvm.amdgcn.raw.buffer.store.v2i32",
-        "void",
-        ("v2i32", "v4i32", "i32", "i32", "#i32"),
-        (data, rsrc, voffset, soffset, aux),
-        False,
-    )
-
-
-@g.jit
-def llvm_amdgcn_raw_buffer_store_i32(data, rsrc, voffset, soffset, aux: l.constexpr):
-    return _native_call(
-        "llvm.amdgcn.raw.buffer.store.i32",
-        "void",
-        ("i32", "v4i32", "i32", "i32", "#i32"),
-        (data, rsrc, voffset, soffset, aux),
         False,
     )
 
@@ -164,13 +90,6 @@ def amdgcn_exp2f(x):
 
 
 @g.jit
-def amdgcn_perm_b32(hi, lo, selector):
-    return _native_call(
-        "llvm.amdgcn.perm", "i32", ("i32", "i32", "i32"), (hi, lo, selector), True
-    )
-
-
-@g.jit
 def amdgcn_cvt_pk_fp8_f32(a, b, old, WORD_HI: l.constexpr):
     return _native_call(
         "llvm.amdgcn.cvt.pk.fp8.f32",
@@ -197,25 +116,6 @@ def amdgcn_sched_group_barrier(
         (mask, size, sync_id),
         False,
     )
-
-
-@g.jit
-def amdgcn_wave_inclusive_add(value, lane):
-    remote = amdgcn_mov_dpp(value, 0x111, 0xF, 0xF, True)
-    value = l.where(lane >= 1, value + remote, value)
-    remote = amdgcn_mov_dpp(value, 0x112, 0xF, 0xF, True)
-    value = l.where(lane >= 2, value + remote, value)
-    remote = amdgcn_mov_dpp(value, 0x114, 0xF, 0xF, True)
-    value = l.where(lane >= 4, value + remote, value)
-    remote = amdgcn_mov_dpp(value, 0x118, 0xF, 0xF, True)
-    value = l.where(lane >= 8, value + remote, value)
-    source16 = (lane & 0x30) - 1
-    remote = amdgcn_ds_bpermute(source16 * 4, value)
-    value = l.where(lane >= 16, value + remote, value)
-    source32 = (lane & 0x30) - 17
-    remote = amdgcn_ds_bpermute(source32 * 4, value)
-    value = l.where(lane >= 32, value + remote, value)
-    return value
 
 
 class BufferResourceFields(NamedTuple):
@@ -281,41 +181,44 @@ class BufferResource(NamedTuple):
         )
 
     @g.jit
-    def Store(resource, voffset, soffset, data, AUX: l.constexpr, predicate=True):
-        # This predicate is the calling thread's native conditional store.
-        llvm_amdgcn_raw_buffer_store_v4i32(
-            data,
-            _resource_content(resource),
-            l.where(
-                predicate, (l.full((), 0, l.uint32) + voffset).to(l.uint32), 0xFFFFFFFF
-            ),
-            soffset,
-            AUX,
-        )
-
-    @g.jit
     def LoadU64(resource, voffset, soffset, AUX: l.constexpr):
-        return llvm_amdgcn_raw_buffer_load_v2i32(
-            _resource_content(resource), voffset, soffset, AUX
+        return _native_call(
+            "llvm.amdgcn.raw.buffer.load.v2i32",
+            "v2i32",
+            ("v4i32", "i32", "i32", "#i32"),
+            (_resource_content(resource), voffset, soffset, AUX),
+            False,
         )
 
     @g.jit
     def LoadU32(resource, voffset, soffset, AUX: l.constexpr):
-        return llvm_amdgcn_raw_buffer_load_i32(
-            _resource_content(resource), voffset, soffset, AUX
+        return _native_call(
+            "llvm.amdgcn.raw.buffer.load.i32",
+            "i32",
+            ("v4i32", "i32", "i32", "#i32"),
+            (_resource_content(resource), voffset, soffset, AUX),
+            False,
         )
 
     @g.jit
     def StoreU64(resource, voffset, soffset, data, AUX: l.constexpr):
-        result = llvm_amdgcn_raw_buffer_store_v2i32(
-            data, _resource_content(resource), voffset, soffset, AUX
+        _native_call(
+            "llvm.amdgcn.raw.buffer.store.v2i32",
+            "void",
+            ("v2i32", "v4i32", "i32", "i32", "#i32"),
+            (data, _resource_content(resource), voffset, soffset, AUX),
+            False,
         )
 
     @g.jit
     def StoreU32(resource, voffset, soffset, data, AUX: l.constexpr, predicate=True):
         if isinstance(predicate, l.constexpr) and predicate:
-            llvm_amdgcn_raw_buffer_store_i32(
-                data, _resource_content(resource), voffset, soffset, AUX
+            _native_call(
+                "llvm.amdgcn.raw.buffer.store.i32",
+                "void",
+                ("i32", "v4i32", "i32", "i32", "#i32"),
+                (data, _resource_content(resource), voffset, soffset, AUX),
+                False,
             )
         else:
             _native_call(
@@ -338,14 +241,20 @@ class BufferResource(NamedTuple):
         predicate=True,
     ):
         if isinstance(predicate, l.constexpr) and predicate:
-            llvm_amdgcn_raw_buffer_load_lds(
-                _resource_content(resource),
-                lds_ptr,
-                SIZE,
-                voffset,
-                soffset,
-                OFFSET,
-                AUX,
+            _native_call(
+                "llvm.amdgcn.raw.buffer.load.lds",
+                "void",
+                ("v4i32", "p3", "#i32", "i32", "i32", "#i32", "#i32"),
+                (
+                    _resource_content(resource),
+                    lds_ptr.to(l.uint64).to(l.uint32),
+                    SIZE,
+                    voffset,
+                    soffset,
+                    OFFSET,
+                    AUX,
+                ),
+                False,
             )
         else:
             _native_call(
@@ -394,23 +303,6 @@ def amdgcn_s_waitcnt_barrier(
 
 
 @g.jit
-def amdgcn_mov_dpp(
-    src,
-    ctrl: l.constexpr,
-    row_mask: l.constexpr,
-    bank_mask: l.constexpr,
-    bound_ctrl: l.constexpr,
-):
-    return _native_call(
-        "llvm.amdgcn.mov.dpp.i32",
-        "i32",
-        ("i32", "#i32", "#i32", "#i32", "#i1"),
-        (src, ctrl, row_mask, bank_mask, bound_ctrl),
-        True,
-    )
-
-
-@g.jit
 def amdgcn_rcpf(x):
     # A unit numerator preserves the native reciprocal, unlike general fdiv.
     return libdevice.fast_dividef(1.0, l.cast(x, l.float32))
@@ -422,13 +314,6 @@ def amdgcn_readfirstlane(x):
 
 
 @g.jit
-def amdgcn_ds_bpermute(index, src):
-    return _native_call(
-        "llvm.amdgcn.ds.bpermute", "i32", ("i32", "i32"), (index, src), True
-    )
-
-
-@g.jit
 def amdgcn_cvt_scalef32_pk_fp4_f32(old, a, b, scale, byte: l.constexpr):
     return _native_call(
         "llvm.amdgcn.cvt.scalef32.pk.fp4.f32",
@@ -436,13 +321,6 @@ def amdgcn_cvt_scalef32_pk_fp4_f32(old, a, b, scale, byte: l.constexpr):
         ("i32", "f32", "f32", "f32", "#i32"),
         (old, a, b, scale, byte),
         True,
-    )
-
-
-@g.jit
-def amdgcn_ds_swizzle(value, pattern: l.constexpr):
-    return _native_call(
-        "llvm.amdgcn.ds.swizzle", "i32", ("i32", "#i32"), (value, pattern), True
     )
 
 
@@ -466,16 +344,6 @@ def amdgcn_thread_id(reference):
         l.num_warps() * 64,
         layout=l.BlockedLayout([1], [64], [l.num_warps()], [0]),
     ).to(l.uint32)
-
-
-@g.jit
-def amdgcn_shuffle(value, source_lane, width: l.constexpr = 64):
-    # HIP __shfl operates inside the caller's width-sized lane subgroup.
-    lane = l.arange(0, value.numel, layout=value.type.layout) % 64
-    source = (lane // width) * width + source_lane % width
-    return amdgcn_ds_bpermute(source * 4, value.to(l.uint32, bitcast=True)).to(
-        value.dtype, bitcast=True
-    )
 
 
 @g.jit

@@ -60,35 +60,24 @@ def _glm53_flash_recipe():
     return _recipe(tp_size=8, mla_cache_dtype=torch.bfloat16)
 
 
-def _deepseek_v4_recipe():
-    from test.runtime.test_deepseek_v4_config import _v4_recipe
-
-    return _v4_recipe(
-        SimpleNamespace(
-            num_hidden_layers=3,
-            compress_ratios=[0, 4, 128],
-            num_attention_heads=64,
-            head_dim=512,
-            qk_rope_head_dim=64,
-            sliding_window=128,
-            index_head_dim=128,
-            attention_config={},
-        )
-    )
-
-
 def _deepseek_v41_recipe():
     from test.runtime.test_deepseek_v41_cache import _recipe
 
     return _recipe("cpu")
 
 
+def _dots3_note_recipe():
+    from test.runtime.test_dots3_note_cache import _recipe
+
+    return _recipe(draft_layers=1, pd=True)
+
+
 # The families whose per-group demand sizes their own parents.
 _RECIPES = {
     "kimi_k3": _kimi_k3_recipe,
     "glm53_flash": _glm53_flash_recipe,
-    "deepseek_v4": _deepseek_v4_recipe,
     "deepseek_v41": _deepseek_v41_recipe,
+    "dots3_note": _dots3_note_recipe,
 }
 _NO_FIXTURE = {
     "mha",
@@ -412,7 +401,9 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
         device,
         "current_platform",
         lambda: SimpleNamespace(
-            restore_stack_limit=restore_stack_limit, is_nvidia=is_nvidia
+            restore_stack_limit=restore_stack_limit,
+            is_nvidia=is_nvidia,
+            is_cdna4=False,
         ),
     )
     monkeypatch.setattr(factory, "create_model_runner", lambda *a: (target, None))

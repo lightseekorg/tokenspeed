@@ -20,21 +20,25 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
+import tokenspeed_kernel.ops.attention.qsa as qsa_api
 import tokenspeed_kernel.ops.attention.qsa.triton as qsa_ops
 import torch
 from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.ops.attention.dsa.cuda import has_ragged_decode_topk
+from tokenspeed_kernel.ops.attention.qsa import qwen4_exp_qsa_block_topk
 from tokenspeed_kernel.ops.attention.qsa.triton import (
     _qwen4_exp_qsa_merge_block_topk_kernel,
     _qwen4_exp_qsa_stream_block_topk_kernel,
-    qwen4_exp_qsa_block_topk,
     qwen4_exp_qsa_commit_verify_layers,
     qwen4_exp_qsa_compress_and_store,
     qwen4_exp_qsa_prepare_metadata,
     qwen4_exp_qsa_recent_write,
     qwen4_exp_qsa_selected_slots,
 )
+from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -780,7 +784,7 @@ def test_qwen4_exp_qsa_block_topk_matches_torch(device: str) -> None:
         block_topk=block_topk,
         queries_per_request=1,
         max_partial_bytes=32 * 1024 * 1024,
-        solution="stream",
+        algorithm="stream",
         persistent_topk_workspace=None,
         enable_pdl=False,
     )
@@ -840,7 +844,7 @@ def test_qwen4_exp_qsa_block_topk_two_stage_merge_matches_torch(device: str) -> 
         block_topk=block_topk,
         queries_per_request=1,
         max_partial_bytes=32 * 1024 * 1024,
-        solution="stream",
+        algorithm="stream",
         persistent_topk_workspace=None,
         enable_pdl=False,
     )
@@ -927,6 +931,147 @@ def _expected_logits_ids(scores: torch.Tensor, k: int, n_cols_padded: int) -> li
     return [int(i) for i in order[:k].tolist() if torch.isfinite(scores[int(i)])]
 
 
+@pytest.mark.parametrize("query_group_size", [1, 4])
+@pytest.mark.parametrize("tile_programs", [1, 2, 5])
+@pytest.mark.parametrize("group_programs", [1, 4])
+def test_qwen4_exp_qsa_scores_leave_invalid_blocks_unwritten(
+    device: str, query_group_size: int, tile_programs: int, group_programs: int
+) -> None:
+    rows, heads, dim, page_size, columns = 4, 3, 32, 64, 9
+    num_blocks = page_size * columns
+    query = torch.randn(rows, heads, dim, device=device, dtype=torch.bfloat16)
+    keys = torch.randn(
+        (columns + 1) * page_size, 1, dim, device=device, dtype=query.dtype
+    )
+    keys[:page_size].fill_(float("nan"))
+    table = torch.arange(1, columns + 1, device=device, dtype=torch.int32)[None, :]
+    requests = torch.zeros(rows, device=device, dtype=torch.int64)
+    complete = torch.tensor([0, 1, 129, 513], device=device, dtype=torch.int32)
+    logits = torch.full((rows, num_blocks), float("nan"), device=device)
+    qsa_ops._qwen4_exp_qsa_score_blocks_kernel[
+        (min(rows // query_group_size, group_programs), tile_programs)
+    ](
+        query,
+        keys,
+        table,
+        requests,
+        complete,
+        logits,
+        heads,
+        dim,
+        num_blocks,
+        rows // query_group_size,
+        page_size,
+        *query.stride(),
+        keys.stride(0),
+        keys.stride(2),
+        table.stride(0),
+        logits.stride(0),
+        BLOCK_N=128,
+        BLOCK_H=4,
+        BLOCK_D=32,
+        QUERY_GROUP_SIZE=query_group_size,
+        LOOP_QUERY_GROUPS=group_programs < rows // query_group_size,
+        ENABLE_PDL=False,
+        num_warps=4,
+        num_stages=2,
+    )
+    expected = torch.stack(
+        _block_topk_reference_scores(
+            query, keys, table, requests, complete, page_size, num_blocks
+        )
+    )
+    valid = torch.arange(num_blocks, device=device)[None, :] < complete[:, None]
+    torch.testing.assert_close(logits[valid], expected[valid], rtol=1e-5, atol=1e-4)
+    assert torch.isnan(logits[~valid]).all()
+
+
+def test_qwen4_exp_qsa_score_grid_refreshes_without_recompile(device: str) -> None:
+    torch.manual_seed(149)
+    batch, width, heads, dim, page_size = 3, 4, 4, 128, 64
+    rows, max_columns = batch * width, 19
+    query = torch.randn(rows, heads, dim, device=device, dtype=torch.bfloat16)
+    keys = torch.randn(
+        (batch * max_columns + 1) * page_size,
+        1,
+        dim,
+        device=device,
+        dtype=query.dtype,
+    )
+    keys[:page_size].fill_(float("nan"))
+    requests = torch.arange(batch, device=device).repeat_interleave(width)
+    complete = torch.zeros(rows, device=device, dtype=torch.int32)
+    kernel = qsa_ops._qwen4_exp_qsa_score_blocks_kernel
+
+    def launch(table, logits, tile_programs):
+        kernel[(batch, tile_programs)](
+            query,
+            keys,
+            table,
+            requests,
+            complete,
+            logits,
+            heads,
+            dim,
+            table.shape[1] * page_size,
+            batch,
+            page_size,
+            *query.stride(),
+            keys.stride(0),
+            keys.stride(2),
+            table.stride(0),
+            logits.stride(0),
+            BLOCK_N=128,
+            BLOCK_H=heads,
+            BLOCK_D=dim,
+            QUERY_GROUP_SIZE=width,
+            LOOP_QUERY_GROUPS=False,
+            ENABLE_PDL=False,
+            num_warps=4,
+            num_stages=2,
+        )
+
+    for columns, tile_programs in ((9, 1), (16, 2), (19, 3)):
+        num_blocks = columns * page_size
+        table = torch.arange(
+            1, batch * columns + 1, device=device, dtype=torch.int32
+        ).reshape(batch, columns)
+        logits = torch.empty(rows, num_blocks, device=device)
+        # Width, row stride and grid changes must reuse one compiled kernel.
+        if columns == 9:
+            launch(table, logits, tile_programs)
+            torch.cuda.synchronize()
+        with assert_no_triton_compile(kernel):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch(table, logits, tile_programs)
+            for frontiers in (
+                [num_blocks] * rows,
+                [0, 1, 127, 128, 129, 511, 513, num_blocks, 0, 0, 0, 0],
+                [num_blocks] * rows,
+                [0] * rows,
+            ):
+                query.normal_()
+                keys[page_size:].normal_()
+                complete.copy_(
+                    torch.tensor(frontiers, device=device, dtype=torch.int32)
+                )
+                logits.fill_(float("nan"))
+                graph.replay()
+                expected = torch.stack(
+                    _block_topk_reference_scores(
+                        query, keys, table, requests, complete, page_size, num_blocks
+                    )
+                )
+                valid = (
+                    torch.arange(num_blocks, device=device)[None, :] < complete[:, None]
+                )
+                torch.testing.assert_close(
+                    logits[valid], expected[valid], rtol=1e-5, atol=1e-4
+                )
+                assert torch.isnan(logits[~valid]).all()
+
+
 @pytest.mark.parametrize("queries_per_request", [None, 1, 2, 3, 4, 6, 8])
 @pytest.mark.parametrize(("heads", "head_dim"), [(3, 32), (4, 128), (6, 96)])
 def test_qwen4_exp_qsa_grouped_scores_match_independent_queries(
@@ -969,17 +1114,19 @@ def test_qwen4_exp_qsa_grouped_scores_match_independent_queries(
         device=device,
         dtype=torch.int32,
     )
-    # A padded request must write -inf for every block without reading page 0.
+    # A padded request must select no blocks without reading page 0.
     table[1].zero_()
     complete[-widths[-1] :].zero_()
     scores = []
-    select = qsa_ops.triton_topk_from_logits
+    select = qsa_api.qsa_block_topk_select
 
-    def record_scores(logits, topk, *, enable_pdl):
-        scores.append(logits)
-        return select(logits, topk, enable_pdl=enable_pdl)
+    def record_scores(logits, topk, **kwargs):
+        assert kwargs["lengths"] is complete
+        valid = torch.arange(num_blocks, device=device)[None, :] < complete[:, None]
+        scores.append(logits.masked_fill(~valid, -float("inf")))
+        return select(logits, topk, **kwargs)
 
-    monkeypatch.setattr(qsa_ops, "triton_topk_from_logits", record_scores)
+    monkeypatch.setattr(qsa_api, "qsa_block_topk_select", record_scores)
     selected = []
     for width in (queries_per_request, None):
         selected.append(
@@ -993,7 +1140,7 @@ def test_qwen4_exp_qsa_grouped_scores_match_independent_queries(
                 block_topk=block_topk,
                 queries_per_request=width,
                 max_partial_bytes=32 * 1024 * 1024,
-                solution="logits",
+                algorithm="logits",
                 persistent_topk_workspace=None,
                 enable_pdl=False,
             )
@@ -1019,9 +1166,14 @@ def test_qwen4_exp_qsa_grouped_scores_match_independent_queries(
             assert sorted(indices[row].tolist()) == sorted(expected_ids)
 
 
-def test_qwen4_exp_qsa_grouped_scores_refresh_during_graph_replay(device: str) -> None:
+def test_qwen4_exp_qsa_grouped_scores_refresh_during_graph_replay(
+    device: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     torch.manual_seed(127)
-    batch, width, heads, dim, page_size, columns = 3, 4, 4, 128, 64, 9
+    # Force a bounded production grid so replay must walk multiple tiles per CTA.
+    platform = replace(qsa_ops.current_platform(), sm_count=1)
+    monkeypatch.setattr(qsa_ops, "current_platform", lambda: platform)
+    batch, width, heads, dim, page_size, columns = 3, 4, 4, 128, 64, 19
     rows = batch * width
     query = torch.randn(rows, heads, dim, device=device, dtype=torch.bfloat16)
     keys = torch.randn(
@@ -1035,7 +1187,7 @@ def test_qwen4_exp_qsa_grouped_scores_refresh_during_graph_replay(device: str) -
         1, batch * columns + 1, device=device, dtype=torch.int32
     ).reshape(batch, columns)
     requests = torch.arange(batch, device=device).repeat_interleave(width)
-    complete = torch.full((rows,), 576, device=device, dtype=torch.int32)
+    complete = torch.full((rows,), 1216, device=device, dtype=torch.int32)
 
     def forward(queries_per_request):
         return qwen4_exp_qsa_block_topk(
@@ -1048,7 +1200,7 @@ def test_qwen4_exp_qsa_grouped_scores_refresh_during_graph_replay(device: str) -
             block_topk=64,
             queries_per_request=queries_per_request,
             max_partial_bytes=32 * 1024 * 1024,
-            solution="logits",
+            algorithm="logits",
             persistent_topk_workspace=None,
             enable_pdl=False,
         )
@@ -1058,8 +1210,8 @@ def test_qwen4_exp_qsa_grouped_scores_refresh_during_graph_replay(device: str) -
     with torch.cuda.graph(graph):
         actual = forward(width)
     for frontiers in (
-        [0, 1, 127, 128, 129, 511, 513, 576, 0, 0, 0, 0],
-        [576, 513, 511, 129, 128, 127, 1, 0, 0, 0, 0, 0],
+        [0, 1, 127, 128, 129, 511, 513, 1216, 0, 0, 0, 0],
+        [1216, 513, 511, 129, 128, 127, 1, 0, 0, 0, 0, 0],
         [0] * rows,
     ):
         query.normal_()
@@ -1098,13 +1250,18 @@ def test_qwen4_exp_qsa_long_query_groups_match_independent_rows(
     complete = torch.arange(rows, device=device, dtype=torch.int32) % 577
     complete[width : width + 64] = 0
     scores = []
-    selector = qsa_ops.triton_topk_from_logits
+    selector = qsa_api.qsa_block_topk_select
 
-    def record(logits, topk, *, enable_pdl):
-        scores.append(logits)
-        return selector(logits, topk, enable_pdl=enable_pdl)
+    def record(logits, topk, **kwargs):
+        assert kwargs["lengths"] is complete
+        valid = (
+            torch.arange(columns * page_size, device=device)[None, :]
+            < complete[:, None]
+        )
+        scores.append(logits.masked_fill(~valid, -float("inf")))
+        return selector(logits, topk, **kwargs)
 
-    monkeypatch.setattr(qsa_ops, "triton_topk_from_logits", record)
+    monkeypatch.setattr(qsa_api, "qsa_block_topk_select", record)
     selected = []
     for query_width in (width, None):
         selected.append(
@@ -1118,7 +1275,7 @@ def test_qwen4_exp_qsa_long_query_groups_match_independent_rows(
                 block_topk=64,
                 queries_per_request=query_width,
                 max_partial_bytes=32 * 1024 * 1024,
-                solution="logits",
+                algorithm="logits",
                 persistent_topk_workspace=None,
                 enable_pdl=False,
             )
@@ -1159,7 +1316,7 @@ def test_qwen4_exp_qsa_rejects_invalid_query_width(
             block_topk=64,
             queries_per_request=queries_per_request,
             max_partial_bytes=32 * 1024 * 1024,
-            solution="logits",
+            algorithm="logits",
             persistent_topk_workspace=None,
             enable_pdl=False,
         )
@@ -1201,7 +1358,7 @@ def test_qwen4_exp_qsa_block_topk_logits_matches_stream(device: str) -> None:
         page_table,
         requests,
         complete_blocks,
-        solution="stream",
+        algorithm="stream",
         **kwargs,
     )
     logits = qwen4_exp_qsa_block_topk(
@@ -1210,7 +1367,7 @@ def test_qwen4_exp_qsa_block_topk_logits_matches_stream(device: str) -> None:
         page_table,
         requests,
         complete_blocks,
-        solution="logits",
+        algorithm="logits",
         **kwargs,
     )
 
@@ -1250,17 +1407,36 @@ def test_qwen4_exp_qsa_block_topk_logits_dispatches_persistent_radix(
     workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
     calls = {}
 
-    def fake_radix_topk(logits, out, topk, *, lengths, workspace, max_seq_len):
+    def fake_radix_topk(
+        logits,
+        out,
+        topk,
+        *,
+        lengths,
+        workspace,
+        max_seq_len,
+        enable_pdl,
+        q_len_per_req,
+    ):
         calls.update(
             logits=logits,
             topk=topk,
             lengths=lengths,
             workspace=workspace,
             max_seq_len=max_seq_len,
+            enable_pdl=enable_pdl,
+            q_len_per_req=q_len_per_req,
         )
         out.fill_(7)
 
     monkeypatch.setattr(qsa_ops, "_is_nvidia", True)
+    # Exercise the portable selection, which owns the persistent radix path.
+    select = qsa_api.qsa_block_topk_select
+    monkeypatch.setattr(
+        qsa_api,
+        "qsa_block_topk_select",
+        lambda *args, **kwargs: select(*args, **{**kwargs, "solution": "triton"}),
+    )
     monkeypatch.setattr(qsa_ops, "has_ragged_decode_topk", lambda: True)
     monkeypatch.setattr(qsa_ops, "ragged_decode_topk", fake_radix_topk)
     monkeypatch.setattr(
@@ -1279,7 +1455,7 @@ def test_qwen4_exp_qsa_block_topk_logits_dispatches_persistent_radix(
         block_topk=block_topk,
         queries_per_request=1,
         max_partial_bytes=32 * 1024 * 1024,
-        solution="logits",
+        algorithm="logits",
         persistent_topk_workspace=workspace,
         enable_pdl=False,
     )
@@ -1290,6 +1466,53 @@ def test_qwen4_exp_qsa_block_topk_logits_dispatches_persistent_radix(
     assert calls["lengths"] is complete_blocks
     assert calls["workspace"] is workspace
     assert calls["max_seq_len"] == num_blocks
+    assert calls["enable_pdl"] is False
+    assert calls["q_len_per_req"] == 1
+
+
+@pytest.mark.parametrize("topk", [64, 512])
+def test_qwen4_exp_qsa_registered_selection_ignores_uninitialized_tails(
+    device: str, topk: int
+) -> None:
+    rows, heads, dim, page_size, columns = 4, 4, 32, 64, 9
+    query = torch.randn(rows, heads, dim, device=device, dtype=torch.bfloat16)
+    keys = torch.randn(
+        (columns + 1) * page_size, 1, dim, device=device, dtype=query.dtype
+    )
+    table = torch.arange(1, columns + 1, device=device, dtype=torch.int32)[None]
+    requests = torch.zeros(rows, device=device, dtype=torch.int64)
+    complete = torch.tensor([0, 1, 129, 513], device=device, dtype=torch.int32)
+    scores = qsa_api.qsa_block_scores(
+        query,
+        keys,
+        table,
+        requests,
+        complete,
+        page_size=page_size,
+        queries_per_request=rows,
+        enable_pdl=False,
+        override=None,
+        solution="triton",
+    )
+    valid = torch.arange(scores.shape[1], device=device)[None, :] < complete[:, None]
+    scores.masked_fill_(~valid, float("nan"))
+    selected = qsa_api.qsa_block_topk_select(
+        scores,
+        topk,
+        lengths=complete,
+        persistent_workspace=None,
+        enable_pdl=False,
+        override=None,
+        solution="triton",
+    )
+    reference = scores.masked_fill(~valid, -float("inf"))
+    for row, count in enumerate(complete.tolist()):
+        expected = torch.argsort(reference[row], descending=True, stable=True)[
+            : min(topk, count)
+        ]
+        actual = selected[row][selected[row] >= 0]
+        torch.testing.assert_close(actual.sort().values.long(), expected.sort().values)
+        assert (selected[row] < 0).sum().item() == max(0, topk - count)
 
 
 @pytest.mark.parametrize("columns", [1, 2, 8])
@@ -1319,7 +1542,7 @@ def test_qwen4_exp_qsa_compact_logits_shorter_than_persistent_topk(
         block_topk=topk,
         queries_per_request=rows,
         max_partial_bytes=32 * 1024 * 1024,
-        solution="logits",
+        algorithm="logits",
         persistent_topk_workspace=torch.empty(
             1024 * 1024, device=device, dtype=torch.uint8
         ),
@@ -1373,7 +1596,7 @@ def test_qwen4_exp_qsa_block_topk_logits_persistent_radix_matches_stream(
         page_table,
         requests,
         complete_blocks,
-        solution="stream",
+        algorithm="stream",
         persistent_topk_workspace=None,
         **kwargs,
     )
@@ -1383,7 +1606,7 @@ def test_qwen4_exp_qsa_block_topk_logits_persistent_radix_matches_stream(
         page_table,
         requests,
         complete_blocks,
-        solution="logits",
+        algorithm="logits",
         persistent_topk_workspace=workspace,
         **kwargs,
     )
@@ -1478,7 +1701,7 @@ def test_qwen4_exp_qsa_block_topk_reads_strided_inputs(device: str) -> None:
     requests = torch.arange(rows, device=device)
     complete_blocks = torch.tensor([num_blocks, 40, 200], device=device)
 
-    for solution in ("stream", "logits"):
+    for algorithm in ("stream", "logits"):
         strided = qwen4_exp_qsa_block_topk(
             query,
             key_cache,
@@ -1489,7 +1712,7 @@ def test_qwen4_exp_qsa_block_topk_reads_strided_inputs(device: str) -> None:
             block_topk=block_topk,
             queries_per_request=1,
             max_partial_bytes=32 * 1024 * 1024,
-            solution=solution,
+            algorithm=algorithm,
             persistent_topk_workspace=None,
             enable_pdl=False,
         )
@@ -1503,7 +1726,7 @@ def test_qwen4_exp_qsa_block_topk_reads_strided_inputs(device: str) -> None:
             block_topk=block_topk,
             queries_per_request=1,
             max_partial_bytes=32 * 1024 * 1024,
-            solution=solution,
+            algorithm=algorithm,
             persistent_topk_workspace=None,
             enable_pdl=False,
         )

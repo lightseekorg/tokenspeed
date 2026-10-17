@@ -23,9 +23,8 @@
 import tokenspeed_scheduler.tokenspeed_scheduler_ext as _ext
 from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution plan; Events
     AbortReason,
+    AttnKind,
     CacheGroupConfig,
-    CacheGroupFamily,
-    CacheRetention,
     CacheTransferPolicy,
     CapacityModel,
     ExecutionEvent,
@@ -65,9 +64,8 @@ __all__ = [
     "Scheduler",
     "SchedulerConfig",
     "RequestSpec",
-    "CacheRetention",
+    "AttnKind",
     "CacheGroupConfig",
-    "CacheGroupFamily",
     "CacheTransferPolicy",
     "CapacityModel",
     # Execution plan & operations

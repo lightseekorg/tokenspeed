@@ -40,7 +40,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install build and validation tools
-        run: python -m pip install --upgrade build packaging pytest twine
+        run: python -m pip install --upgrade build packaging "pytest>=9" twine
 
       - name: Test release validation
         working-directory: tokenspeed-mla

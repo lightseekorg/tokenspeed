@@ -28,7 +28,6 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention.kda import (
     KdaPrefillCapacity,
     kda_batched_replay_uses_raw_gate,
@@ -47,7 +46,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     try_kda_fused_paged_verify,
 )
 from tokenspeed_kernel.ops.attention.kda.triton import capture_replay_payload
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
@@ -529,19 +528,12 @@ class KdaAttnBackend(CapacityPrefillBackend):
         attn_tp_size: int,
         head_v_dim: int,
         lower_bound: float | None,
-        output_gate: torch.Tensor | None,
-        norm_weight: torch.Tensor | None,
-        norm_eps: float | None,
     ) -> torch.Tensor | None:
-        if output_gate is not None and (norm_weight is None or norm_eps is None):
-            raise ValueError(
-                "norm_weight and norm_eps are required with a KDA output gate"
-            )
         if f_a_out is None:
             return None
 
         num_value_heads = value_dim // attn_tp_size // head_v_dim
-        result = try_kda_fused_paged_decode(
+        return try_kda_fused_paged_decode(
             mixed_qkv,
             conv_weights,
             conv_states,
@@ -557,24 +549,8 @@ class KdaAttnBackend(CapacityPrefillBackend):
             head_dim=head_v_dim,
             cu_seqlens=self.forward_metadata.query_start_loc,
             lower_bound=lower_bound,
-            output_gate=output_gate,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
             recurrent_layout=self.kda_recurrent_layout,
         )
-        if result is None:
-            return None
-        if result.output_norm_applied or output_gate is None:
-            return result.out
-        return rmsnorm_gated_sigmoid(
-            result.out.reshape(-1, num_value_heads * head_v_dim).contiguous(),
-            output_gate,
-            norm_weight,
-            norm_eps,
-            num_value_heads,
-            head_v_dim,
-            enable_pdl=pdl_enabled(),
-        ).view(1, -1, num_value_heads, head_v_dim)
 
     @override
     def _decode_scan(
@@ -596,9 +572,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
         f_b_weight: torch.Tensor | None,
         beta_raw: torch.Tensor | None,
         lower_bound: float | None,
-        output_gate: torch.Tensor | None,
-        norm_weight: torch.Tensor | None,
-        norm_eps: float | None,
     ) -> torch.Tensor:
         _reject_skip_term(D)
         seq_len = query.shape[0]
@@ -630,16 +603,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
             lower_bound=lower_bound,
             recurrent_layout=self.kda_recurrent_layout,
         )
-        if output_gate is not None:
-            core_attn_out = rmsnorm_gated_sigmoid(
-                core_attn_out.reshape(-1, num_value_heads * head_v_dim).contiguous(),
-                output_gate,
-                norm_weight,
-                norm_eps,
-                num_value_heads,
-                head_v_dim,
-                enable_pdl=pdl_enabled(),
-            ).view(1, -1, num_value_heads, head_v_dim)
         return core_attn_out.squeeze(0)
 
     @override
@@ -825,9 +788,12 @@ class KdaAttnBackend(CapacityPrefillBackend):
         draft_token_num: int,
         seq_len: int,
         lower_bound: float | None,
+        replay_payload: torch.Tensor | None,
     ) -> torch.Tensor:
 
         _reject_skip_term(D)
+        if replay_payload is not None:
+            raise ValueError("the KDA verify scan fills no replay payload")
         from tokenspeed_kernel.ops.attention.kda.triton import (
             kda_recurrent_decode_mtp,
         )

@@ -48,7 +48,9 @@ def _state() -> RequestState:
 
 def _make_loop(*, enabled: bool = True):
     registry = CollectorRegistry()
-    metrics = EngineMetrics(LABELS, enabled=enabled, registry=registry)
+    metrics = EngineMetrics(
+        LABELS, reporters=["prometheus"], enabled=enabled, registry=registry
+    )
     submitted = []
     loop = SimpleNamespace(
         metrics=metrics,

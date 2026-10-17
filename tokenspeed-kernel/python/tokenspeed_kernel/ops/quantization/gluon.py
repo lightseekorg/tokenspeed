@@ -35,6 +35,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.quantization import (
         launch_gluon_quantize_fp8_group32_ue8m0_gfx950,
     )
+    from tokenspeed_kernel_amd.ops.gfx1250.quantization import (
+        launch_gluon_quantize_fp8_group32_ue8m0_gfx1250,
+    )
 
     # Bit-exact with ``triton_quantize_fp8_group32_ue8m0`` (the V4.1 reference
     # rounding, which differs from generic MXFP8 quantizers).
@@ -85,3 +88,53 @@ if current_platform().is_amd:
         if enable_pdl:
             raise ValueError("gfx950 FP8 group-32 quantization does not support PDL")
         return launch_gluon_quantize_fp8_group32_ue8m0_gfx950(x)
+
+    @register_kernel(
+        "quantization",
+        "fp8_with_scale",
+        name="gluon_quantize_fp8_group32_ue8m0_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+        traits={
+            "granularity": frozenset({"token_group_32"}),
+            "scale_encoding": frozenset({"ue8m0"}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_quantize_fp8_group32_ue8m0_gfx1250(
+        x: torch.Tensor,
+        granularity: str,
+        group_size: int,
+        scale_encoding: str,
+        enable_pdl: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize group-32 E4M3 data with UE8M0 scales, matching V4.1 act_quant.
+
+        Args:
+            x: [M,K] BF16/FP16 input with contiguous K divisible by 32.
+            granularity: Must be ``token_group``.
+            group_size: Must be 32.
+            scale_encoding: Must be ``ue8m0``.
+            enable_pdl: Must be False; this kernel has no PDL.
+
+        Returns:
+            FP8 [M,K] data and uint8 UE8M0 [M,K/32] scales, bit-identical to
+            ``triton_quantize_fp8_group32_ue8m0``.
+        """
+        if (
+            granularity != "token_group"
+            or group_size != 32
+            or scale_encoding != "ue8m0"
+        ):
+            raise ValueError(
+                "gluon_quantize_fp8_group32_ue8m0_gfx1250 requires token_group "
+                "granularity, group_size 32 and ue8m0 scales"
+            )
+        if enable_pdl:
+            raise ValueError("gfx1250 FP8 group-32 quantization does not support PDL")
+        return launch_gluon_quantize_fp8_group32_ue8m0_gfx1250(x)

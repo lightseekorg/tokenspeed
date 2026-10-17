@@ -427,7 +427,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             # FP8 on the wire, mirroring the low-latency leg: dispatch carries
             # (fp8 tokens, 1x128 block scales) instead of a single bf16 tensor.
             if self.ue8m0_scales:
-                from tokenspeed_kernel.ops.moe.deep_gemm.ue8m0 import (
+                from tokenspeed_kernel.ops.moe._deep_gemm.ue8m0 import (
                     per_token_group_quant_fp8_ue8m0,
                 )
 

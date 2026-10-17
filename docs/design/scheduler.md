@@ -112,9 +112,10 @@ pages (`cache-concepts.md`, copy-in).
 
 **Reserve.** What an admission holds beyond the chunk it computes is stated
 once per round (`PrefillReserve`: decode width, whether the round completes
-the prompt, prompt headroom) and turned into each group's page demand by
+the prompt, prompt headroom, the sliding-window growth recycling cannot
+fund) and turned into each group's page demand by
 `ReservePrefillDemands` — the only writer of `GroupDemand::reserve_tokens`.
-It picks the rule by the group's retention, never by call site:
+It picks the rule by the group's kind, never by call site:
 
 - *Full-history* groups hold the decode slot — the chunk that
   completes the prompt reserves `decode_input_tokens`, so the first decode step
@@ -122,8 +123,25 @@ It picks the rule by the group's retention, never by call site:
   to decode — raised on a decoding role's first chunk to the rest of the prompt
   plus the admission headroom (§4), so a partially prefetched request is never
   stranded.
-- *Sliding-window* groups recycle slid-out pages, so the rest
-  of the prompt costs them nothing: they hold only the decode slot.
+- *Sliding-window* groups recycle slid-out pages, so they hold the decode
+  slot, raised on a decoding role's first chunk, while another request holds
+  pages, only to the growth recycling cannot fund, capped by the window's
+  lookback (`window - 1` tokens) and the prompt headroom. That growth is the
+  larger of two terms: a prefix hit (a shared page frees nothing when it
+  slides out), and the rest of the prompt when a local chunk leaves some
+  behind (the next chunk reads this one's lookback before any of it can slide
+  out). The hit term is 0 in a replayable group, whose pages over the hit are
+  private (§1.3), and once the prompt's own tokens after the hit reach
+  `window - 1 + block_granularity`: every hit page then slides out before the
+  first decode. A remote landing has no later local chunk, so it prepays only
+  the hit. Any other page holder raises the reserve, not only one sharing the
+  hit: the prepay deliberately covers hit pages that may become shared after
+  the admission. With no other request holding pages the raise is 0 and the
+  group holds only the decode slot: hit pages are then held by the prefix
+  index alone and recycle like the request's own, and the single-request bound
+  (§1.4) counts no prepay, so a prepay could leave a request the bound accepts
+  inadmissible on its own. Growth left unfunded by pages taken after the
+  admission is left to the victim policy's empty-round retraction (§2).
   Broadcasting the headroom to them once kept a 54K-token DeepSeek-V4 prompt
   waiting on a pool that had room for it.
 - *State* groups reserve nothing: their table is two slots whatever the
@@ -176,7 +194,7 @@ orders prefills against each other, never a decode behind a prefill.
 
 ### 1.2 State groups: two slots, natural checkpoints
 
-A State group (a recurrent layer's state, `CacheGroupFamily::State`) keeps no
+A State group (a recurrent layer's state, `AttnKind::kState`) keeps no
 history: one block holds the whole state after some prefix, so the group has
 no token span (`block_granularity = 0`) and its table is **two slots**
 whatever the prompt length. Slot 0 is the input checkpoint a forward reads,
@@ -217,7 +235,7 @@ ordinary chunk end or decode step publishes nothing for a State group
 (`CompletedPages::publish_state` is false). The key is the key of the exact
 token count `T`: the chain hash of the last page when `T` is a page multiple,
 otherwise the tail hash `hash@T` the KV groups use — so one key names a
-request's progress across every family (`cache-concepts.md`). A published
+request's progress across every group kind (`cache-concepts.md`). A published
 state block is never written again: rotation moves it to slot 0, where it is
 read only, and the next step releases the request's reference while the
 cache keeps the block.
@@ -231,14 +249,27 @@ pages (`ReleaseEvent`). One path for every schedule: a request that finished
 quiescent settles with its Finish event — the timing every caller always
 saw — and one whose finish was decided on a landed token while the overlap
 schedule had already dispatched the next decode settles when that decode's
-result lands, at the frontier that decode produced (one token further: the
-token the finish was decided on, consumed). The live slot is therefore never
-published while a forward writes it, and a paused loop, which drains its
-forwards without building plans, settles its finishes all the same. The
-runtime reports every landed forward row, tracked or not
+result lands, at the frontier the tokens it reports leave. The live slot is
+therefore never published while a forward writes it, and a paused loop, which
+drains its forwards without building plans, settles its finishes all the
+same. The runtime reports every landed forward row, tracked or not
 (`generation_output_processor`), so the count always reaches zero. A
 `Finishing` request is never scheduled and never a retraction victim; an
 abort releases it without publishing.
+
+**A finish publishes the state before the stop token.** The device ends a
+request where the control plane does: a verify round keeps its accepted
+tokens only through the first stop token and within the token limit, so the
+state commit and the frontier never pass the token the finish is decided on,
+and the decode the overlap schedule dispatched behind that round runs the
+request as a padding row and reports no token. Whatever the schedule and
+however many tokens a round accepts, the finish frontier `T` is therefore the
+stop token's position (the last kept token's for a token limit): the state
+and KV before it, a prefix of the next turn's prompt whether or not its chat
+template keeps the stop token. A finish the device cannot decide (a stop
+string, a grammar, a client abort) reports every token the round kept
+instead, so the frontier still names the state the device holds
+(`cache-concepts.md`, "Recurrent state").
 
 **Hits.** The probe (§1, "What the probe may claim") resumes a hybrid model
 at the longest `T` with a published state checkpoint in every State group and
@@ -356,7 +387,13 @@ the largest prompt whose worst-case working set — dense or sliding history
 with its decode reserve and overlap-depth protection, the blocks a tail
 handover holds for one admission, two slots per State group — fits the pool.
 It is not a live check against currently free capacity; a prompt within the
-bound can still fail admission right now and waits.
+bound can still fail admission right now and waits. The bound counts
+no sliding-window prepay (§1), and a request with no other request holding
+pages prepays nothing, so the prepay never makes a request the bound accepts
+inadmissible on its own. Beside other requests the prepay can ask for up to
+one window lookback more than the bound counts; such a request waits until
+their pages are released, at the latest until it is alone, unless later
+arrivals keep taking the pages.
 
 The `CapacityModel` is deliberately **config-only**: it reads every
 `SchedulerConfig` field that is known before a pool exists and no
@@ -368,6 +405,8 @@ recipes size a pool from the same model before the arena is allocated
 demand at `max_batch_size` live requests), and then lets the `Scheduler`
 bound requests against the pool they sized. The per-request working set —
 `decode_width + overlap_schedule_depth * decode_width` protected tokens, the
+next verify window a speculative decode's draft steps write on the roles that
+decode (`DraftWindowTokens`, which `scheduleDecode` reserves from), the
 two slots of a State group (`kStateSlots`), the most blocks a sliding
 window can need behind a boundary (one more than behind a page-aligned one,
 `SlidingWindowBlocks`) — exists in that one file; neither side restates it. The two answers are tied by an
@@ -380,7 +419,7 @@ Per group, `ConcurrentGroupPages` charges: a State group two slots per live
 request (the working set does not grow with history); a prefix-closed history
 group `ceil(T / g)` dense pages plus,
 per request, `ceil((g - 1 + protected) / g)` for the unaligned tail and the
-protected tokens that may spill past it; a sliding group, per request,
+protected tokens (the draft window included) that may spill past it; a sliding group, per request,
 `ceil((min(W - 1, ctx) + decode_width + protected + g - 1) / g)` resident
 pages, plus one in-flight prefill chunk behind its lookback (or, on the
 decode role, the landing bound `min(dense, lookback + window)` per request).
@@ -400,7 +439,10 @@ needing a copy), the owner publishes nothing at that point instead of
 waiting (§1).
 
 Speculative decode admission grows from the committed token frontier plus the verify
-spans still in flight and the span being scheduled. Already reserved slots
+spans still in flight, the span being scheduled and the next span, which the
+draft steps write; that last span stops at the request's token limit, so it
+stays inside the admission limit, a request without a declared budget reserves
+none, and the capacity model charges it per live request. Already reserved slots
 cover that extent first. A prefill interruption must not charge the same
 speculative slots again when decode resumes; otherwise rejected draft tokens
 accumulate in the logical tables beyond the context-length bound.
@@ -436,7 +478,9 @@ admission is **retried in the same plan build**, looping (retract → retry →
 retract) until it fits or the victims run out. The freed capacity therefore
 reaches the request it was freed for within the round; there is never a free
 page waiting for whoever asks first next round, which is what previously
-required a cross-round capacity barrier. Two edges of the loop:
+required a cross-round capacity barrier. The empty-round retraction (below) is
+the one exception: it offers the freed pages to the round's decodes first. Two
+edges of the loop:
 
 - **The victim may BE the blocker** (a resident request blocked on its own
   next page is the preferred victim). It comes back through the restore
@@ -444,9 +488,10 @@ required a cross-round capacity barrier. Two edges of the loop:
   failed for capacity this round (`AdmissionFeedback::capacity_blocked`, in
   phase order), else to the first waiting prompt — granting the pages straight
   back to the victim's own readmission is the loop the grant exists to break.
-  With nobody to redirect to, the victim is **not** retracted: the retraction
-  would cost its image's copies and its restore and serve no one, so it waits
-  for a completion instead.
+  With nobody to redirect to, the victim is **not** retracted (except in the
+  empty-round retraction below, when a decode is left to take its pages): the
+  retraction would cost its image's copies and its restore and serve no one,
+  so it waits for a completion instead.
 - **A grant that cannot legally join its round's batch** (a fused prefill
   beside decodes outside mixed mode) still retracts one victim, and the next
   round's phase order (§3) tries the blocker before any other claim.
@@ -496,7 +541,8 @@ abort, in one place.** `chooseVictim` ranks only candidates whose image fits
 (`imageFits`: a blob slot is free and `CacheCoordinator::SnapshotPoolHolds`
 the tail, the published pages being assumed to ride L2); when none does — and
 without a pool none ever does — it names the newest retractable resident (the
-least work lost; exempt requests excluded, they finish on their own reserve)
+least work lost; exempt requests excluded, they finish on their own reserve,
+except in the empty-round retraction below)
 and `Scheduler::onImageDoesNotFit` aborts it: `fsm::AbortEvent` frees its
 pages and slot in that very round, the blocked grant proceeds exactly as after
 a retraction, and the plan records it (`ExecutionPlan::aborts`, a
@@ -588,8 +634,44 @@ Only candidates whose image fits are ranked (the abort fallback above takes
 over when none does). Exempt in both tiers: a request whose reserve already
 covers its whole generation (`Request::ReserveCoversGeneration`) — retracting
 it frees exactly what its restore must take back, pure thrash — and it is not
-aborted either. Excluded by state: `Retracted`, `Restoring`,
-`RemotePrefilling`.
+aborted either, except in the empty-round retraction below. Excluded by state:
+`Retracted`, `Restoring`, `RemotePrefilling`.
+
+**Empty-round retraction.** The exemption trusts the admission reserve to cover
+all growth, and a sliding-window group's does not always: it prepays only
+against pages other requests hold at the admission (§1). A page that becomes
+shared after the admission (a later prefix hit on it, or publish-time dedup of
+identical prompt pages) frees nothing when it slides out, and a sequence still
+shorter than the window, or a prompt whose next chunk still reads its
+lookback, has nothing to recycle yet. When no resident can be retracted under
+the exemption and the round built nothing — no forward, restore, remote
+prefill or decode — no completion of it can free capacity, so the choice is
+repeated with the exemption dropped. A round that runs anything keeps the
+exemption: that work moves toward completions that free capacity without a
+retraction. So does a round in which a finished request still waits for its
+last forward (`Finishing`, §1.2): its pages come back when that forward
+lands. The empty-round retraction changes who may be chosen and where
+the freed pages go first; the quiescence checks, the global gates and the
+abort of a victim whose image does not fit still apply. The round ran
+nothing, so none of its decodes got a page, and they are offered the freed
+pages before the blocker: a generated token survives any later retraction, so
+each empty-round retraction that lets a decode run is progress no
+retract/restore cycle can undo. Granted to a prompt instead, the pages can go
+to one that blocks the same way on its next chunk and becomes the next
+victim; granted to nobody (the victim was the blocker and nobody else is
+blocked or waiting), the victim can be restored ahead of the decodes and take
+the same pages back, round after round. A victim that is the blocker, with
+nobody to redirect to, is therefore retracted here whenever the round has a
+decode left to offer its pages to — there is no completion to wait for — and
+otherwise waits as above. Only when no decode fits does the blocker get the
+grant, by the same rules as for any victim, and the loop may take several
+victims in one round until a decode or the blocked admission fits.
+
+**Stall diagnostic.** `NextExecutionPlan` counts consecutive rounds whose plan
+carries nothing — no forward, remote stream, cache op or abort — while
+requests are live and nothing is out (no forward result, PD transfer or tier
+transfer) that could change the next plan, and warns at 1024 such rounds and
+every doubling after. It never changes a plan.
 
 **Forced retraction** (`debug_force_retraction_interval`, a debug knob; `0`
 off) exercises the path without pressure: every `|interval|` plans the oldest
@@ -911,12 +993,15 @@ Request::AdmissionHeadroom(safe_steps)
 with `safe_steps = 4096` — note the `1 +`: a *fresh* admission already
 prepays one window (see `schedulePrefillFirstChunk`), so for prompts with
 `max_new_tokens <= 4096` the reserve covers the whole generation up front and
-retraction never touches them. Capped by the generation budget the request
+retraction never touches them, except the empty-round retraction (§2).
+Capped by the generation budget the request
 could ever use, so after a couple of retractions it holds enough room to run
 to completion — at which point `ReserveCoversGeneration` exempts it from the
 victim policy and it **cannot be retracted again**, and is not aborted either
 (§2): it needs no further page, so it finishes on its own reserve and frees
-its pages then. This is a per-request adaptive backoff: it penalises only the
+its pages then — except where a sliding-window group's growth outruns that
+reserve (§1), which the empty-round retraction covers (§2). This is a
+per-request adaptive backoff: it penalises only the
 request whose admission proved over-optimistic, and never makes anyone else
 wait. The constant is a thrash bound only; no liveness argument rests on it.
 
@@ -928,8 +1013,8 @@ exactly as fast as it shrinks that budget, so judging the window against
 today's remainder would count spent headroom as still held: a request that
 outgrew a partial reserve would look covered the moment its remainder dipped
 under the window — exactly when it needs a new page — and once every resident
-request looked covered, retraction would have no victim and nothing could
-free that page.
+request looked covered, retraction would have no victim short of the
+empty-round retraction (§2), and nothing else could free that page.
 
 **There is no retraction without an image.** The one case that used to
 recompute — an L3 prefetch that missed after admission — no longer exists:
@@ -995,8 +1080,12 @@ lands in the same change as the pin, never a release apart.
 
 - Admission never grants pages for tokens beyond the chunk being scheduled,
   except the decode reserve on the completing chunk (1) and the admission
-  headroom (4) — which only full-history groups hold. A State group holds two
-  slots and nothing else (1.2).
+  headroom (4) — which full-history groups hold whole and sliding-window
+  groups at most one window lookback of, and only while another request holds
+  pages: the growth recycling cannot fund on a first chunk (1). A request
+  alone prepays nothing, so the prepay never makes a request the
+  single-request bound (1.4) accepts inadmissible on its own. A State group
+  holds two slots and nothing else (1.2).
   A replayable group's private suffix starts at the replay window, which is
   inside the forward's input, not beyond it (1.3). A restore grants exactly
   the imaged shape plus the same reserve a first chunk of its resume shape
@@ -1020,7 +1109,9 @@ lands in the same change as the pin, never a release apart.
   retracted. A victim whose image does not fit is aborted through
   `onImageDoesNotFit` and nowhere else; the debug knob never aborts.
 - Freed capacity is granted to the request it was freed for in the same plan
-  build whenever the round's grammar admits the grant (2); the image copies →
+  build whenever the round's grammar admits the grant, except that the
+  empty-round retraction offers it to the round's decodes first (2); the
+  image copies →
   page copies (`ExecutionPlan::pages_to_copy`) → zero → load → forward order
   on the forward thread's stream is what makes the immediate release safe --
   a tail hit's copy source may be evicted and re-granted by a later admission
@@ -1041,6 +1132,8 @@ lands in the same change as the pin, never a release apart.
   group's rotation swaps a released block for a fresh one, and the owner's
   copy-in is best effort (1). Without this a pool full of retraction-exempt
   requests wedges at their first decodes.
+  A sliding-window group's growth can outrun its reserve (1); the
+  empty-round retraction keeps such a pool live (2).
 - A store either pins its Device sources until the ack or is stream-ordered;
   never neither (2). Only the two legs of a retraction image are
   stream-ordered — their sources are granted away in the same round — and
@@ -1074,8 +1167,13 @@ lands in the same change as the pin, never a release apart.
   and never re-probed (4). A readmission that fails admission waits, seals
   new prompts for the round, and never triggers retraction (4).
 - A request whose admission prepaid the generation budget open at that
-  admission is never a victim (2); with the fresh-admission prepay this bounds
-  retraction to requests whose `max_new_tokens` exceeds one safe-step window
-  (or is undeclared). Spending a partial reserve never makes it qualify: the
+  admission is never a victim (2) in a round that builds a forward, restore,
+  remote prefill or remote decode, or waits for a finished request's last
+  forward; with the
+  fresh-admission prepay this bounds such retraction to requests whose
+  `max_new_tokens` exceeds one safe-step window (or is undeclared). Spending
+  a partial reserve never makes it qualify: the
   exemption is judged against the budget open at admission, not the current
-  remainder (4).
+  remainder (4). Only the empty-round retraction (2), in a round that builds
+  nothing and waits for no finished request, retracts or aborts an exempt
+  request.

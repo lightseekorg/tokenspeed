@@ -269,26 +269,6 @@ def test_copy_into_rejects_oversized_embedding():
 # send can still read the pointer (in-flight, or parked for re-send). ---
 
 
-class _LeaseManager:
-    """Fake manager exposing the status/parking surface the lease probes."""
-
-    def __init__(self, engine):
-        self.engine = engine
-        self.request_status = {}
-        self._pending = {}
-        self._pending_lock = threading.Lock()
-        # Deadline already in the past: a blocked lease raises immediately
-        # instead of stalling the test for the real 130s parking window.
-        self.bootstrap_time_out = -11.0
-
-    def room_status(self, room):
-        return self.request_status.get(room)
-
-    def is_parked(self, room):
-        with self._pending_lock:
-            return room in self._pending
-
-
 # --- Staging errors on the UNGUARDED paths must fail the room, not the worker.
 # EncodeWorker.step only wraps execute(); the cache-hit send_item() and the
 # deferred drain_deferred() reach _stage_and_send unguarded, so an oversized
