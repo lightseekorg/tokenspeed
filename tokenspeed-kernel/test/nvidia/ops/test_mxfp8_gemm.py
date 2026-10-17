@@ -313,6 +313,31 @@ def test_rmsnorm_group32_quantization_dynamic_rows():
             triton_rmsnorm_fp8_group32_ue8m0(x[::2][:rows], weight, 1e-6)
 
 
+def test_group32_infinite_amax_keeps_finite_codes_zero():
+    from tokenspeed_kernel.ops.quantization.triton import (
+        triton_quantize_fp8_group32_ue8m0,
+    )
+
+    x = torch.randn(2, 64, device="cuda", dtype=torch.bfloat16)
+    x[0, 3] = torch.inf
+    codes, scales = triton_quantize_fp8_group32_ue8m0(
+        x, "token_group", 32, "ue8m0", False
+    )
+    finite_codes, finite_scales = triton_quantize_fp8_group32_ue8m0(
+        x[1:], "token_group", 32, "ue8m0", False
+    )
+    # An infinite group gets the all-ones exponent and a zero reciprocal, so
+    # its finite values quantize to +-0 rather than saturating with a flipped sign.
+    assert scales[0, 0].item() == 255
+    group = codes[0, :32].float()
+    assert torch.isnan(group[3])
+    assert (group[torch.arange(32, device="cuda") != 3] == 0).all()
+    torch.testing.assert_close(
+        codes[1:].view(torch.uint8), finite_codes.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(scales[1:], finite_scales, rtol=0, atol=0)
+
+
 def test_group32_reciprocal_finite_bf16_constant_blocks():
     from tokenspeed_kernel.ops.quantization.triton import (
         triton_quantize_fp8_group32_ue8m0,
