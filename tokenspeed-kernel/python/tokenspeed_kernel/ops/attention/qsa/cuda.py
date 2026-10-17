@@ -79,15 +79,11 @@ if current_platform().is_nvidia:
                 return selected
             if logits.shape[1] == 0:
                 return selected.fill_(-1)
-            # The native ABI still takes a workspace tensor, but the kernel no
-            # longer uses it. A zero-sized tensor avoids per-layer GPU buffers.
-            workspace = torch.empty(0, dtype=torch.uint8, device=logits.device)
             ragged_decode_topk(
                 logits,
                 selected,
                 topk,
                 lengths=lengths,
-                workspace=workspace,
                 max_seq_len=logits.shape[1],
                 q_len_per_req=1,
                 enable_pdl=enable_pdl,

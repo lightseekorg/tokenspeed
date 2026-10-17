@@ -413,7 +413,6 @@ def test_persistent_topk_waits_for_producers(
     target_length_storage = torch.empty_like(length_storage)
     target_lengths = target_length_storage[::length_stride]
     output = torch.empty(rows, 512, device="cuda", dtype=torch.int32)
-    workspace = torch.empty(1024 * 1024, device="cuda", dtype=torch.uint8)
 
     def forward(enable_pdl):
         _publish((logits, length_storage), (target_logits, target_length_storage))
@@ -422,7 +421,6 @@ def test_persistent_topk_waits_for_producers(
             output,
             512,
             lengths=target_lengths,
-            workspace=workspace,
             max_seq_len=columns,
             q_len_per_req=q_len_per_req,
             enable_pdl=enable_pdl,
@@ -460,7 +458,6 @@ def _check_native_topk_edge(graph, enabled, rows, columns):
     logits = torch.zeros(rows, columns, device="cuda")
     lengths = torch.full((rows,), columns, device="cuda", dtype=torch.int32)
     output = torch.empty(rows, 512, device="cuda", dtype=torch.int32)
-    workspace = torch.empty(1024 * 1024, device="cuda", dtype=torch.uint8)
     reference = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.graph(reference):
         ragged_decode_topk(
@@ -468,7 +465,6 @@ def _check_native_topk_edge(graph, enabled, rows, columns):
             output,
             512,
             lengths=lengths,
-            workspace=workspace,
             max_seq_len=columns,
             q_len_per_req=1,
             enable_pdl=enabled,
@@ -578,7 +574,6 @@ def test_persistent_topk_pdl_register_budget(enabled, large_grid, columns, resto
     target = torch.empty_like(logits)
     lengths = torch.full((rows,), min(16384, columns), device="cuda", dtype=torch.int32)
     output = torch.empty(rows, 512, device="cuda", dtype=torch.int32)
-    workspace = torch.empty(1024 * 1024, device="cuda", dtype=torch.uint8)
 
     def forward():
         _publish((logits,), (target,))
@@ -587,7 +582,6 @@ def test_persistent_topk_pdl_register_budget(enabled, large_grid, columns, resto
             output,
             512,
             lengths=lengths,
-            workspace=workspace,
             max_seq_len=columns,
             enable_pdl=enabled,
             q_len_per_req=1,

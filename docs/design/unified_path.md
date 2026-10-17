@@ -393,7 +393,7 @@ Only the query-group count disables implicit integer specialization; table
 views keep their allocation stride and score widths keep page alignment.
 
 QSA top-k uses separate CUDA, Triton and Gluon solutions selected through
-`select_kernel`; native CUDA workspace arguments stay inside its solution.
+`select_kernel`; CUDA launch details stay inside its solution.
 
 On NVIDIA, QSA scoring and both CUDA and Triton top-k follow the captured PDL
 setting and wait before producer-owned reads when enabled. gfx950 Gluon has
