@@ -21,11 +21,9 @@
 """GFX1250 transform kernels."""
 
 from tokenspeed_kernel_amd.ops.gfx1250.transform.hadamard import (
-    gluon_hadamard_transform_128_gfx1250,
     launch_gluon_hadamard_transform_128_gfx1250,
 )
 
 __all__ = [
-    "gluon_hadamard_transform_128_gfx1250",
     "launch_gluon_hadamard_transform_128_gfx1250",
 ]

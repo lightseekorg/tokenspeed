@@ -694,7 +694,8 @@ if platform.is_amd:
             validated_ids = (
                 validated_ids - int(getattr(w, "ep_rank", 0)) * num_local_experts
             )
-        expert_route_ids, expert_counts = _routing(validated_ids, num_experts)
+        # The ids above are already relative to this rank, so experts start at 0.
+        expert_route_ids, expert_counts = _routing(validated_ids, num_experts, 0)
         route_output = torch.empty(
             (validated_ids.numel(), x.shape[1]), device=x.device, dtype=x.dtype
         )

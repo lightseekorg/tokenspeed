@@ -43,17 +43,13 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     _choose_mfma_lds_mediumm_config,
     _get_partial_scratch,
     _supports_mfma_lds_smallm,
-    _use_mfma_lds_largem,
-    _use_warp_reduce_smallm,
     gluon_mm_a16w16_decode_num_counters_gfx950,
-    gluon_mm_a16w16_gfx950,
     gluon_mm_a16w16_medium_gfx950,
     launch_gluon_bmm_a16w16_gfx950,
     launch_gluon_mm_a16w16_decode_add3_gfx950,
     launch_gluon_mm_a16w16_decode_gfx950,
     launch_gluon_mm_a16w16_medium_gfx950,
     launch_gluon_mm_a16w16_splitk_gfx950,
-    launch_gluon_mm_a16w16_warp_gfx950,
     supports_gluon_mm_a16w16_decode_add3_gfx950,
     supports_gluon_mm_a16w16_decode_gfx950,
 )
@@ -65,11 +61,6 @@ _ATOL = 1e-5
 _RTOL = 2**-7
 
 _CORRECTNESS_CASES = [
-    pytest.param(
-        launch_gluon_mm_a16w16_warp_gfx950,
-        (2, 128, 1024),
-        id="warp-reduce",
-    ),
     pytest.param(
         launch_gluon_mm_a16w16_splitk_gfx950,
         (4, 256, 2048),
@@ -162,19 +153,6 @@ def test_splitk_smallm_out_handles_padded_reducer_rows() -> None:
     torch.testing.assert_close(out, torch.mm(a, b.T), atol=_ATOL, rtol=_RTOL)
 
 
-def test_use_warp_reduce_covers_small_k_decode_shapes() -> None:
-    assert _use_warp_reduce_smallm(1, 1280, 1024)
-    assert _use_warp_reduce_smallm(2, 2560, 2048)
-    assert _use_warp_reduce_smallm(4, 1280, 512)
-    assert _use_warp_reduce_smallm(4, 1280, 1024)
-
-
-def test_use_warp_reduce_rejects_splitk_or_medium_shapes() -> None:
-    assert not _use_warp_reduce_smallm(1, 1280, 2880)
-    assert not _use_warp_reduce_smallm(4, 2560, 2048)
-    assert not _use_warp_reduce_smallm(8, 1280, 512)
-
-
 def test_supports_splitk_covers_smallm_high_k_shapes() -> None:
     assert _supports_mfma_lds_smallm(1, 4096, 4096)
     assert _supports_mfma_lds_smallm(2, 4096, 4096)
@@ -191,15 +169,6 @@ def test_supports_splitk_rejects_non_target_shapes() -> None:
     assert not _supports_mfma_lds_smallm(4, 4224, 4096)
     assert not _supports_mfma_lds_smallm(3, 4096, 4096)
     assert not _supports_mfma_lds_smallm(8, 8192, 4096)
-
-
-def test_dispatcher_falls_back_for_splitk_shapes() -> None:
-    dtype = torch.bfloat16
-    a = torch.empty((1, 4096), device="cuda", dtype=dtype)
-    b = torch.empty((4096, 4096), device="cuda", dtype=dtype)
-
-    assert _supports_mfma_lds_smallm(1, 4096, 4096)
-    assert gluon_mm_a16w16_gfx950(a, b, dtype) is None
 
 
 def test_splitk_partial_scratch_is_stream_local() -> None:
@@ -324,12 +293,6 @@ def test_prefill_routes_k3_shapes_with_busy_cus() -> None:
     # Unmeasured or losing shapes keep hipBLASLt at any token count.
     assert not supports_gluon_mm_a16w16_prefill_gfx950(4096, 4096, 4096)
     assert not supports_gluon_mm_a16w16_prefill_gfx950(7168, 2304, 1536)
-
-
-def test_use_largem_routes_only_dispatch_target_shapes() -> None:
-    assert _use_mfma_lds_largem(2048, 4096, 4096)
-    assert not _use_mfma_lds_largem(1024, 8192, 8192)
-    assert not _use_mfma_lds_largem(2048, 1280, 2880)
 
 
 # Kimi K3 TP8 decode shapes covering split-K (router with FP32 output, shared

@@ -176,7 +176,7 @@ def _resolve_mxfp4_activation(
 # batch size and whether the caller supplied precomputed top-k:
 #   M <= _DIRECT_DECODE_MAX_M                       -> direct top-k MXFP4 MFMA decode
 #   _PRECOMPUTED_MFMA_MIN_M <= M <= _DECODE_MAX_M   -> precomputed-activation MFMA decode
-#   (no precomputed top-k) M <= _ROUTE_OWNED_DECODE_MAX_M -> route-owned direct decode
+#   (no precomputed top-k) M <= _DECODE_MAX_M       -> route-owned direct decode
 # These replace the former GLUON_MXFP4_* environment overrides.
 _DECODE_MAX_M = 8
 
@@ -188,9 +188,6 @@ _DEFERRED_DIRECT_DECODE_MAX_M = 16
 
 
 _PRECOMPUTED_MFMA_MIN_M = 4
-
-
-_ROUTE_OWNED_DECODE_MAX_M = 2
 
 
 # Widest activation the precomputed-SiTU entry point serves with the
