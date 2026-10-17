@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Numerical correctness of fused DP column-linear and CUDA graph replay."""
+"""Numerical correctness of fused DP row/column-linear and CUDA graph replay."""
 
 import os
 import sys
@@ -34,28 +34,51 @@ sys.path.insert(
 )
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, suite="runtime-2gpu")
+register_cuda_ci(est_time=360, suite="runtime-2gpu")
 
 
-@torch.no_grad()
-def _worker(rank, world_size, rendezvous):
-    from tokenspeed_kernel.ops.communication.cute_dsl import (
-        create_fused_tp_projection_state,
-        cute_dsl_fused_fp8_dp_column_linear,
-    )
-    from tokenspeed_kernel.ops.quantization import quantize_fp8
-
-    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
-    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
-    from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
+def _context(rank, counts, physical):
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
-    from tokenspeed.runtime.layers.linear import (
-        DPColumnParallelLinear,
-        prepare_dp_linear_communication,
-        release_dp_linear_communication,
+
+    return ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=physical[rank],
+        num_extends=0,
+        input_num_tokens=physical[rank],
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, physical[rank], 1),
+        global_num_tokens=list(counts),
+        collective_global_num_tokens=list(physical),
     )
+
+
+def _initialize_weights(layers, rank):
+    for index, linear in enumerate(layers):
+        torch.manual_seed(917 + rank + 4 * index)
+        linear.weight.copy_(
+            torch.randn_like(linear.weight, dtype=torch.bfloat16).to(
+                torch.float8_e4m3fn
+            )
+        )
+        linear.weight_scale_inv.copy_(
+            torch.rand_like(linear.weight_scale_inv) * 0.005 + 0.005
+        )
+
+
+def _reset_epochs(state):
+    # Replay across the 32-bit boundary to exercise persistent 64-bit epochs.
+    for flags in (state.ready, state.ack, state.input_flags):
+        flags.fill_(2**32 - 4)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
+@torch.no_grad()
+def _worker(rank, world_size, rendezvous, kind):
+    from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
     from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 
     torch.cuda.set_device(rank)
@@ -78,6 +101,28 @@ def _worker(rank, world_size, rendezvous):
         weight_block_size=[128, 128],
         scale_fmt=None,
     )
+    try:
+        check = {"column": _check_column_projection, "row": _check_row_projection}[kind]
+        check(rank, world_size, device, parallel, config)
+    finally:
+        dist.destroy_process_group()
+
+
+def _check_column_projection(rank, world_size, device, parallel, config):
+    from tokenspeed_kernel.ops.communication.cute_dsl import (
+        create_fused_tp_column_projection_state,
+        cute_dsl_fused_fp8_dp_column_linear,
+    )
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
+
+    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+    from tokenspeed.runtime.layers.linear import (
+        DPColumnParallelLinear,
+        prepare_dp_linear_communication,
+        release_dp_linear_communication,
+    )
+
     models = []
     for backend in (NcclBackend(), AutoBackend()):
         with torch.device(device):
@@ -99,16 +144,7 @@ def _worker(rank, world_size, rendezvous):
                     for index in range(2)
                 ]
             )
-        for index, linear in enumerate(model):
-            torch.manual_seed(917 + rank + 4 * index)
-            linear.weight.copy_(
-                torch.randn_like(linear.weight, dtype=torch.bfloat16).to(
-                    torch.float8_e4m3fn
-                )
-            )
-            linear.weight_scale_inv.copy_(
-                torch.rand_like(linear.weight_scale_inv) * 0.005 + 0.005
-            )
+        _initialize_weights(model, rank)
         prepare_dp_linear_communication(model, 4097, torch.bfloat16, backend)
         models.append(model)
     baseline, candidate = models
@@ -117,24 +153,11 @@ def _worker(rank, world_size, rendezvous):
     state = workspace.fused_column
     if world_size == 8:
         # TP8 is available only through an explicitly prepared native state.
-        state = create_fused_tp_projection_state(
+        state = create_fused_tp_column_projection_state(
             dist.group.WORLD, device, 4097, 7168, candidate[0].output_size
         )
     else:
         assert state is not None
-
-    def context(counts, physical):
-        return ForwardContext(
-            attn_backend=None,
-            token_to_kv_pool=None,
-            bs=physical[rank],
-            num_extends=0,
-            input_num_tokens=physical[rank],
-            forward_mode=ForwardMode.DECODE,
-            output_layout=ForwardOutputLayout(0, 0, physical[rank], 1),
-            global_num_tokens=counts,
-            collective_global_num_tokens=physical,
-        )
 
     def counts_for_group(pattern):
         return (tuple(pattern) * ((world_size + len(pattern) - 1) // len(pattern)))[
@@ -189,7 +212,7 @@ def _worker(rank, world_size, rendezvous):
         fused = uses_fusion(max(counts))
         torch.manual_seed(712 + rank)
         x = torch.randn((counts[rank], 7168), device=device, dtype=torch.bfloat16)
-        ctx = context(counts, counts)
+        ctx = _context(rank, counts, counts)
         epoch = int(state.ready[0])
         for left, right in zip(baseline, candidate):
             expected = left(x, ctx=ctx)[0]
@@ -206,7 +229,7 @@ def _worker(rank, world_size, rendezvous):
                     padded_inputs[: x.shape[0]].copy_(x)
                     padded_counts = (32,) * world_size
                     native_expected = left(
-                        padded_inputs, ctx=context(padded_counts, padded_counts)
+                        padded_inputs, ctx=_context(rank, padded_counts, padded_counts)
                     )[0][: x.shape[0]]
                 out = x.new_empty((counts[rank], right.output_size))
                 cute_dsl_fused_fp8_dp_column_linear(
@@ -269,7 +292,7 @@ def _worker(rank, world_size, rendezvous):
         (counts_for_group(counts), native) for counts, native in graph_cases
     )
     contexts = {
-        counts: context([int(n > 0) for n in counts], list(counts))
+        counts: _context(rank, [int(n > 0) for n in counts], counts)
         for counts, _ in graph_cases
     }
     inputs = {
@@ -295,10 +318,7 @@ def _worker(rank, world_size, rendezvous):
                 layer(inputs[counts], ctx=contexts[counts])
     stream.synchronize()
     # Exercise device epoch width and successive layers without host joins.
-    for flags in (state.ready, state.ack, state.input_flags):
-        flags.fill_(2**32 - 4)
-    torch.cuda.synchronize()
-    dist.barrier()
+    _reset_epochs(state)
     graph = torch.cuda.CUDAGraph()
     # Interleave automatic 32-row fallback with padded and unequal fused calls.
     # Explicit 32-row fusion remains available for kernel experiments.
@@ -362,11 +382,219 @@ def _worker(rank, world_size, rendezvous):
             atol=0,
         )
         release_dp_linear_communication(candidate)
-    dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("world_size", (2, 4, 8))
-def test_registered_tp_projection(tmp_path, world_size):
+def _check_row_projection(rank, world_size, device, parallel, config):
+    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+    from tokenspeed.runtime.layers.linear import (
+        DPRowParallelLinear,
+        RowParallelLinear,
+        prepare_dp_linear_communication,
+        release_dp_linear_communication,
+    )
+
+    models = []
+    for _ in range(2):
+        with torch.device(device):
+            model = DPRowParallelLinear(
+                12288,
+                7168,
+                parallel=parallel,
+                params_dtype=torch.bfloat16,
+                quant_config=config,
+                prefix="o_proj",
+            )
+        _initialize_weights((model,), rank)
+        prepare_dp_linear_communication(model, 4097, torch.bfloat16, AutoBackend())
+        models.append(model)
+    baseline, candidate = models
+    # Retain the real AutoBackend transport and GEMM for the unfused reference.
+    if baseline.projection_workspace.fused_row is not None:
+        baseline.projection_workspace.fused_row.close()
+    baseline.projection_workspace.fused_row = None
+
+    from tokenspeed_kernel.ops.communication.cute_dsl import (
+        cute_dsl_fused_fp8_dp_row_linear,
+    )
+
+    def fused(x, ctx):
+        out = torch.empty((x.shape[0], 7168), device=device, dtype=torch.bfloat16)
+        return cute_dsl_fused_fp8_dp_row_linear(
+            candidate.projection_workspace.fused_row,
+            x,
+            candidate.weight,
+            candidate.weight_scale_inv,
+            tuple(ctx.collective_global_num_tokens),
+            out,
+        )
+
+    def reference(x, ctx):
+        rows = max(ctx.collective_global_num_tokens)
+        if rows <= 128:
+            return baseline(x, ctx=ctx)[0].clone()
+        # Above 128 rows, the ordinary path uses NCCL's BF16 reduction.
+        # Verify the fused contract with ordinary GEMM partials and an FP32 sum.
+        from tokenspeed.runtime.distributed.comm_backend.projection import (
+            projection_all_to_all,
+        )
+
+        values, _ = projection_all_to_all(
+            x,
+            rows,
+            False,
+            False,
+            None,
+            baseline.projection_workspace,
+            baseline.comm_backend,
+        )
+        partial = RowParallelLinear.forward(baseline, values, scale=None, out=None)[0]
+        parts = [torch.empty_like(partial) for _ in range(world_size)]
+        dist.all_gather(parts, partial)
+        total = torch.zeros_like(partial, dtype=torch.float32)
+        for part in parts:
+            total.add_(part.float())
+        return total[rank * rows : rank * rows + x.shape[0]].to(torch.bfloat16)
+
+    patterns = [
+        (n,) * world_size
+        for n in (
+            0,
+            1,
+            31,
+            32,
+            33,
+            63,
+            64,
+            65,
+            95,
+            96,
+            97,
+            127,
+            128,
+            129,
+            256,
+            257,
+            384,
+            512,
+            1024,
+            2048,
+            2049,
+            4096,
+            4097,
+        )
+    ]
+    patterns += [
+        tuple((256, 192, 65, 0)[:world_size]),
+        tuple((128, 65, 1, 0)[:world_size]),
+        tuple((96, 65, 1, 0)[:world_size]),
+        tuple((32, 17, 1, 0)[:world_size]),
+        tuple((0, 64, 32, 1)[:world_size]),
+    ]
+    for counts in patterns:
+        x = torch.randn((counts[rank], 12288), device=device, dtype=torch.bfloat16)
+        ctx = _context(rank, counts, counts)
+        expected = reference(x, ctx)
+        actual = candidate(x, ctx=ctx)[0]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        if max(counts) > 0:
+            torch.testing.assert_close(fused(x, ctx), expected, rtol=0, atol=0)
+    # Neighboring quantization groups have different maxima at different lanes.
+    # This catches accidental scale sharing between the eight-lane groups.
+    counts = (128,) * world_size
+    x = torch.zeros((128, 12288), device=device, dtype=torch.bfloat16)
+    row_ids = torch.arange(128, device=device)[:, None]
+    group_ids = torch.arange(96, device=device)[None, :]
+    columns = group_ids * 128 + (row_ids + 17 * group_ids + rank) % 128
+    x.scatter_(
+        1, columns, torch.exp2((group_ids % 17 - 8).float()).expand(128, -1).to(x.dtype)
+    )
+    ctx = _context(rank, counts, counts)
+    expected = reference(x, ctx)
+    torch.testing.assert_close(candidate(x, ctx=ctx)[0], expected, rtol=0, atol=0)
+    torch.testing.assert_close(fused(x, ctx), expected, rtol=0, atol=0)
+    # Reuse the prepared kernel with different weight and scale allocations.
+    # Prefetch must use each call's descriptors rather than a previous layer's.
+    alternate_weight = (-candidate.weight.to(torch.bfloat16)).to(candidate.weight.dtype)
+    alternate_scales = candidate.weight_scale_inv * 2
+    baseline.weight.copy_(alternate_weight)
+    baseline.weight_scale_inv.copy_(alternate_scales)
+    for rows in (96, 128):
+        counts = (rows,) * world_size
+        x = torch.randn((rows, 12288), device=device, dtype=torch.bfloat16)
+        ctx = _context(rank, counts, counts)
+        expected = reference(x, ctx)
+        actual = cute_dsl_fused_fp8_dp_row_linear(
+            candidate.projection_workspace.fused_row,
+            x,
+            alternate_weight,
+            alternate_scales,
+            counts,
+            torch.empty_like(expected),
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    baseline.weight.copy_(candidate.weight)
+    baseline.weight_scale_inv.copy_(candidate.weight_scale_inv)
+    # Replay across the 32-bit boundary to exercise persistent 64-bit epochs.
+    state = candidate.projection_workspace.fused_row
+    _reset_epochs(state)
+    # One graph switches buckets and includes an empty owner; replay new inputs.
+    counts_list = [
+        tuple((256, 192, 65, 0)[:world_size]),
+        (129,) * world_size,
+        (256,) * world_size,
+        (257,) * world_size,
+        (1024,) * world_size,
+        tuple((4097, 129, 0, 1)[:world_size]),
+        tuple((2049, 128, 0, 1)[:world_size]),
+        (64,) * world_size,
+        (64,) * world_size,
+        (32,) * world_size,
+        (32,) * world_size,
+        (65,) * world_size,
+        (96,) * world_size,
+        (128,) * world_size,
+        (32,) * world_size,
+        tuple((128, 65, 1, 0)[:world_size]),
+        tuple((96, 65, 1, 0)[:world_size]),
+        tuple((32, 17, 1, 0)[:world_size]),
+        tuple((0, 64, 32, 1)[:world_size]),
+    ]
+    xs = [
+        torch.randn((c[rank], 12288), device=device, dtype=torch.bfloat16)
+        for c in counts_list
+    ]
+    ctxs = [_context(rank, c, c) for c in counts_list]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for x, ctx in zip(xs, ctxs):
+            candidate(x, ctx=ctx)
+            fused(x, ctx)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        outputs = [
+            (candidate(x, ctx=ctx)[0], fused(x, ctx)) for x, ctx in zip(xs, ctxs)
+        ]
+    for replay in range(12):
+        for x in xs:
+            x.copy_(torch.randn_like(x))
+        expected = [reference(x, ctx) for x, ctx in zip(xs, ctxs)]
+        torch.cuda._sleep(100000 * ((rank + replay) % world_size))
+        graph.replay()
+        for pair, ref in zip(outputs, expected):
+            for actual in pair:
+                torch.testing.assert_close(actual, ref, rtol=0, atol=0)
+    graph.reset()
+    for model in models:
+        release_dp_linear_communication(model)
+
+
+@pytest.mark.parametrize(
+    ("kind", "world_size"),
+    (("column", 2), ("column", 4), ("column", 8), ("row", 2), ("row", 4)),
+)
+def test_registered_tp_projection(tmp_path, kind, world_size):
     if torch.cuda.device_count() < world_size or torch.cuda.get_device_capability() != (
         10,
         3,
@@ -374,7 +602,7 @@ def test_registered_tp_projection(tmp_path, world_size):
         pytest.skip(f"requires {world_size} node-local GB300 GPUs")
     mp.spawn(
         _worker,
-        args=(world_size, f"file://{tmp_path / 'rendezvous'}"),
+        args=(world_size, f"file://{tmp_path / 'rendezvous'}", kind),
         nprocs=world_size,
         join=True,
     )

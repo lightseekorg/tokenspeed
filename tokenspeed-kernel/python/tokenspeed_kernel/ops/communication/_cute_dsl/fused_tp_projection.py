@@ -47,11 +47,13 @@ class FusedTPProjectionState:
     """Collectively prepare a TP2/4/8 projection before graph capture.
 
     Args:
-        group: Two, four, or eight node-local GB300 ranks in output-shard order.
+        group: Node-local GB300 ranks in weight-shard order: TP2/4 for rows,
+            TP2/4/8 for columns.
         device: This rank's CUDA device, with 152 SMs available to the grid.
         max_rows: Maximum physical rows on any owner.
         input_size: Full input channel count, divisible by 128.
         output_size: Padded output width, divisible by group size times 128.
+        row_parallel: Shard GEMM input channels and reduce output partials.
 
     Tile-aligned row buckets share storage and epochs and compile before use.
     Above 2048 rows, bucket spacing grows with capacity to bound compilation.
@@ -67,6 +69,8 @@ class FusedTPProjectionState:
         max_rows: int,
         input_size: int,
         output_size: int,
+        *,
+        row_parallel: bool,
     ) -> None:
         if (
             group.size() not in (2, 4, 8)
@@ -81,28 +85,39 @@ class FusedTPProjectionState:
             raise ValueError(
                 "Fused TP projection requires aligned widths and TP2/4/8 GB300 GPUs"
             )
+        if row_parallel and (
+            group.size() not in (2, 4) or input_size % (128 * group.size())
+        ):
+            raise ValueError("Row projection requires TP2/4 and aligned input shards")
+        self.row_parallel = row_parallel
+        self.gemm_input_size = (
+            input_size // group.size() if row_parallel else input_size
+        )
         self.group = group
         self.device = device
         self.rank = group.rank()
         self.world_size = group.size()
         self.input_size = input_size
         self.output_size = output_size
-        self.shard_size = output_size // self.world_size
+        self.shard_size = (
+            output_size if row_parallel else output_size // self.world_size
+        )
+        self.receive_width = self.shard_size * self.world_size
         self.closed = False
         self.max_rows = max_rows
         capacity = _row_bucket(max_rows)
         self.a = symm_mem.empty(
-            (capacity * self.world_size, input_size),
+            (capacity * self.world_size, self.gemm_input_size),
             dtype=torch.float8_e4m3fn,
             device=device,
         )
         self.sa = symm_mem.empty(
-            (capacity * self.world_size, input_size // 128),
+            (capacity * self.world_size, self.gemm_input_size // 128),
             dtype=torch.float32,
             device=device,
         )
         self.receive = symm_mem.empty(
-            (capacity, output_size), dtype=torch.bfloat16, device=device
+            (capacity, self.receive_width), dtype=torch.bfloat16, device=device
         )
         self.ready = symm_mem.empty((168,), dtype=torch.int64, device=device)
         self.ack = symm_mem.empty((168,), dtype=torch.int64, device=device)
@@ -177,10 +192,12 @@ class FusedTPProjectionState:
         self.ack_cute = from_dlpack(self.ack, assumed_align=16)
         self.input_flags_cute = from_dlpack(self.input_flags, assumed_align=16)
         weight = torch.zeros(
-            (self.shard_size, input_size), dtype=torch.float8_e4m3fn, device=device
+            (self.shard_size, self.gemm_input_size),
+            dtype=torch.float8_e4m3fn,
+            device=device,
         )
         scales = torch.ones(
-            (self.shard_size // 128, input_size // 128),
+            (self.shard_size // 128, self.gemm_input_size // 128),
             dtype=torch.float32,
             device=device,
         )
@@ -188,15 +205,34 @@ class FusedTPProjectionState:
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
         self.compiled = {}
+        # This TP2 projection has 112 GEMM tiles in the 128-row bucket.
+        # Keep the grid fixed across buckets so every live epoch slot advances.
+        active_clusters = (
+            112
+            if row_parallel
+            and self.world_size == 2
+            and input_size == 12288
+            and output_size == 7168
+            else 152
+        )
         for rows in self.row_views:
             inputs = torch.zeros(
                 (rows, input_size), dtype=torch.bfloat16, device=device
             )
             out = torch.empty((rows, output_size), dtype=torch.bfloat16, device=device)
-            kernel = FusedTPProjectionKernel(cutlass.Float32, False, (128, 128), (1, 1))
+            # At 32 rows per rank, TP4 needs more GEMM tiles to occupy the GPU.
+            tile_m = 64 if row_parallel and self.world_size == 4 and rows == 32 else 128
+            kernel = FusedTPProjectionKernel(
+                cutlass.Float32, False, (tile_m, 128), (1, 1), row_parallel=row_parallel
+            )
             args = self._arguments(inputs, weight, scales, rows, out)
             self.compiled[rows] = cute.compile(
-                kernel, *args[:5], 152, *args[5:], lambda v: v, options="--opt-level=2"
+                kernel,
+                *args[:5],
+                active_clusters,
+                *args[5:],
+                lambda v: v,
+                options="--opt-level=2",
             )
             # Warm every supported bucket before capture; they share device epochs.
             self.compiled[rows](*args)
@@ -258,10 +294,10 @@ class FusedTPProjectionState:
         bucket = _row_bucket(max(owner_rows))
         for tensor, shape, dtype in (
             (inputs, (rows, self.input_size), torch.bfloat16),
-            (weight, (self.shard_size, self.input_size), torch.float8_e4m3fn),
+            (weight, (self.shard_size, self.gemm_input_size), torch.float8_e4m3fn),
             (
                 weight_scales,
-                (self.shard_size // 128, self.input_size // 128),
+                (self.shard_size // 128, self.gemm_input_size // 128),
                 torch.float32,
             ),
             (out, (rows, self.output_size), torch.bfloat16),

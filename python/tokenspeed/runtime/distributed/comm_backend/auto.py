@@ -549,7 +549,6 @@ class AutoBackend(CommBackend):
         Projection collectives have an explicit pre-capture lifetime. Their
         large-message and unsupported-topology paths return to this backend;
         batch-invariant reductions retain the rank-ordered fold at every size.
-        Batch-invariant fusion diagnostics apply only to column projections.
         """
         use_lamport = (
             current_platform().is_nvidia
@@ -576,6 +575,19 @@ class AutoBackend(CommBackend):
         workspace: ProjectionWorkspace,
     ) -> bool:
         return self._projection.try_fused_dp_column_linear(
+            tensor, weight, weight_scales, owner_rows, out, workspace
+        )
+
+    def try_fused_dp_row_linear(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scales: torch.Tensor | None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> bool:
+        return self._projection.try_fused_dp_row_linear(
             tensor, weight, weight_scales, owner_rows, out, workspace
         )
 

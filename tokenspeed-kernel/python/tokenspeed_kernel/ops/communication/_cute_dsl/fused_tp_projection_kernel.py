@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Fused FP8 DP-column projection for a resident TP2/4/8 GPU grid.
+"""Fused FP8 DP projections for a fully resident GPU grid.
 
 Derived from NVIDIA CUTLASS blockwise_gemm.py at revision
 0b55a2f691d69981583568fd9eb69687b1f0de8a; retain its BSD license above.
@@ -34,19 +34,28 @@ Derived from NVIDIA CUTLASS blockwise_gemm.py at revision
 One launch quantizes owned BF16 rows with FP32 1x128 scales, pushes FP8 rows
 and scales to peers, computes the column-sharded GEMM, and TMA-stores each
 output tile into its row owner's symmetric receive buffer. A final local
-copy preserves ordinary caller-owned output tensors. Input publication and
+copy preserves ordinary caller-owned output tensors. Row-parallel TP2/4
+projections send input-channel shards and reduce the received BF16 partials
+in FP32 into caller-owned outputs. Input publication and
 output consumption use 64-bit device epochs; no flag reset occurs on replay.
 
 Scheduling changes: the TMA and scale producers acquire their required input
 owners once, after independent pipeline initialization. Schedules whose M-tile
 count does not divide the grid acquire all input owners. Quantization
-uses 64-bit BF16 loads and hardware warp-max reduction. Scale storage is
+uses 64-bit BF16 loads and hardware warp-max reduction in small buckets.
+Row projection in buckets of at least 128 rows uses 128-bit loads and eight-lane maxima
+to process 16 values per lane. Scale storage is
 released after register loads; the final partial-accumulator slot is released
 after its TMEM read completes and before the remaining FP32 arithmetic.
+TP4 row projection uses 64-row MMA tiles in the 32-row bucket to double the
+number of GEMM tiles. Other cases retain 128-row MMA tiles.
 The accumulator loop uses four statically unrolled 32-column TMEM transfers;
 the epilogue retains 64-column transfers and releases TMEM after its last read.
-Two scale stages and two output stages preserve all six A/B stages within
-shared-memory capacity. Accumulator and epilogue register budgets remain 256
+Row projection buckets of at least 128 rows use four scale stages and five A/B stages;
+other cases keep two scale stages and six A/B stages. Larger row buckets
+reduce output by row and column tiles across the resident grid, instead of
+assigning one CTA to an entire column strip. Two output stages fit
+within shared-memory capacity. Accumulator and epilogue register budgets remain 256
 and 128. One lane per peer in CTA zero acquires the final acknowledgements;
 other warps can retire while stream ordering protects the next scratch reuse.
 
@@ -74,8 +83,8 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 class FusedTPProjectionKernel:
     """Fuse owner quantization, column-sharded block-FP8 GEMM and output exchange.
 
-    Use 128x128 tiles, one-CTA clusters and a fully resident grid on node-local
-    GB300 peers. Persistent scheduling and warp specialization overlap TMA,
+    Use 64x128 or 128x128 tiles and one-CTA clusters on node-local GB300 peers.
+    A fully resident grid and warp specialization overlap TMA,
     tensor-core MMA, FP32 block scaling, and the output epilogue.
     """
 
@@ -85,6 +94,8 @@ class FusedTPProjectionKernel:
         use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        *,
+        row_parallel: bool,
     ):
         """Initializes the configuration for a Blackwell blockwise dense GEMM kernel.
 
@@ -109,14 +120,22 @@ class FusedTPProjectionKernel:
         :type cluster_shape_mn: Tuple[int, int]
         """
 
-        if mma_tiler_mn != (128, 128) or cluster_shape_mn != (1, 1) or use_2cta_instrs:
+        supported_tiles = ((64, 128), (128, 128)) if row_parallel else ((128, 128),)
+        if (
+            mma_tiler_mn not in supported_tiles
+            or cluster_shape_mn != (1, 1)
+            or use_2cta_instrs
+        ):
             raise ValueError(
-                "Fused TP projection requires 128x128 tiles and one-CTA clusters"
+                "Fused TP projection requires a supported 128-column tile and one-CTA clusters"
             )
+        self.row_parallel = row_parallel
+        self.local_flag_scope = "gpu" if row_parallel else "sys"
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
         self.num_ctas = 0
+        self.large_row_bucket = False
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
@@ -248,7 +267,7 @@ class FusedTPProjectionKernel:
             self.c_dtype,
         )
 
-        self.epi_tile = (128, 64)
+        self.epi_tile = (self.mma_tiler[0], 64)
 
         # Setup A/B/C/Scale stage count in shared memory and ACC stage count in tensor memory
         (
@@ -271,6 +290,7 @@ class FusedTPProjectionKernel:
             self.scale_n_per_tile * self.scale_k_per_tile,
             self.num_smem_capacity,
             self.occupancy,
+            self.large_row_bucket,
         )
 
         # Compute A/B/C/Scale shared memory layout
@@ -388,6 +408,7 @@ class FusedTPProjectionKernel:
             raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
 
         # Setup attributes that dependent on gemm inputs
+        self.large_row_bucket = self.row_parallel and peers[1].shape[0] >= 128
         self._setup_attributes()
 
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -451,9 +472,9 @@ class FusedTPProjectionKernel:
 
         remote_atoms = ()
         remote_tensors = ()
-        # Keep the efficient 128-row TMEM transfer, then split shared memory
+        # Keep the whole MMA tile for the TMEM transfer, then split shared memory
         # at owner boundaries for remote stores.
-        remote_epi_tile = (min(peers[1].shape[0], 128), self.epi_tile[1])
+        remote_epi_tile = (min(peers[1].shape[0], self.mma_tiler[0]), self.epi_tile[1])
         remote_smem_layout = cute.composition(epi_smem_layout, remote_epi_tile)
         for peer in cutlass.range_constexpr(len(peer_ready)):
             remote = peers[peer + 2]
@@ -651,15 +672,16 @@ class FusedTPProjectionKernel:
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
-        self.stage_input(
-            input_source,
-            peers[1].shape[0],
-            input_peers,
-            scale_peers,
-            input_flags,
-            peer_input_flags,
-            rank,
-        )
+        if cutlass.const_expr(not (self.large_row_bucket and len(peer_ready) == 2)):
+            self.stage_input(
+                input_source,
+                peers[1].shape[0],
+                input_peers,
+                scale_peers,
+                input_flags,
+                peer_input_flags,
+                rank,
+            )
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
         lane_idx = cute.arch.lane_idx()
@@ -671,6 +693,18 @@ class FusedTPProjectionKernel:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
             cpasync.prefetch_descriptor(tma_atom_c)
+
+        # Overlap TP2 descriptor fetches with quantization in large row buckets.
+        if cutlass.const_expr(self.large_row_bucket and len(peer_ready) == 2):
+            self.stage_input(
+                input_source,
+                peers[1].shape[0],
+                input_peers,
+                scale_peers,
+                input_flags,
+                peer_input_flags,
+                rank,
+            )
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
@@ -1515,7 +1549,7 @@ class FusedTPProjectionKernel:
                 tCgC,
                 sSFA_view_as_C,
                 sSFB_view_as_C,
-                (128, 32),
+                (self.mma_tiler[0], 32),
             )
 
             #
@@ -1766,7 +1800,7 @@ class FusedTPProjectionKernel:
             )
 
             remote_partitions = ()
-            remote_epi_tile = (min(peers[1].shape[0], 128), epi_tile[1])
+            remote_epi_tile = (min(peers[1].shape[0], self.mma_tiler[0]), epi_tile[1])
             for peer in cutlass.range_constexpr(len(remote_atoms)):
                 remote_global = cute.local_tile(
                     remote_tensors[peer],
@@ -1903,10 +1937,11 @@ class FusedTPProjectionKernel:
                     #
                     if warp_idx == self.epilog_warp_id[0]:
                         owner_rows = peers[1].shape[0]
-                        owners_per_tile = max(1, 128 // owner_rows)
+                        owners_per_tile = max(1, self.mma_tiler[0] // owner_rows)
                         for owner_slice in cutlass.range_constexpr(owners_per_tile):
                             owner = (
-                                mma_tile_coord_mnl[0] * 128 // owner_rows + owner_slice
+                                mma_tile_coord_mnl[0] * self.mma_tiler[0] // owner_rows
+                                + owner_slice
                             )
                             for peer in cutlass.range_constexpr(len(remote_atoms)):
                                 if owner == (rank + peer) % len(remote_atoms):
@@ -1916,7 +1951,7 @@ class FusedTPProjectionKernel:
                                             0,
                                             subtile_idx,
                                             mma_tile_coord_mnl[0]
-                                            % max(1, owner_rows // 128),
+                                            % max(1, owner_rows // self.mma_tiler[0]),
                                             mma_tile_coord_mnl[1],
                                             mma_tile_coord_mnl[2],
                                         )
@@ -2001,28 +2036,47 @@ class FusedTPProjectionKernel:
         valid_rows, width = source.shape
         groups_per_row = width // 128
         epoch = cute.arch.load(
-            flags.iterator + 16 + block, cutlass.Int64, sem="acquire", scope="sys"
+            flags.iterator + 16 + block,
+            cutlass.Int64,
+            sem="acquire",
+            scope=self.local_flag_scope,
         ) + cutlass.Int64(1)
-        input_values = cute.make_rmem_tensor((4,), source.element_type)
+        # Eight lanes quantize one 128-channel group in large row buckets.
+        # Wider loads reduce loop overhead without mixing neighboring scales.
+        values_per_lane = 16 if self.large_row_bucket else 4
+        lanes_per_group = 128 // values_per_lane
+        groups_per_warp = 32 // lanes_per_group
+        input_values = cute.make_rmem_tensor((values_per_lane,), source.element_type)
         input_copy = cute.make_copy_atom(
-            cute.nvgpu.CopyG2ROp(), source.element_type, num_bits_per_copy=64
+            cute.nvgpu.CopyG2ROp(),
+            source.element_type,
+            num_bits_per_copy=min(128, values_per_lane * 16),
         )
-        fragment = cute.make_rmem_tensor((4,), cutlass.Float32)
-        quantized = cute.make_rmem_tensor((4,), self.a_dtype)
+        fragment = cute.make_rmem_tensor((values_per_lane,), cutlass.Float32)
+        quantized = cute.make_rmem_tensor((values_per_lane,), self.a_dtype)
         copy_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), self.a_dtype, num_bits_per_copy=32
+            cute.nvgpu.CopyUniversalOp(),
+            self.a_dtype,
+            num_bits_per_copy=values_per_lane * 8,
         )
         for group in cutlass.range(
-            block * (self.threads_per_cta // 32) + warp,
+            block * (self.threads_per_cta // lanes_per_group)
+            + warp * groups_per_warp
+            + lane // lanes_per_group,
             rows * groups_per_row,
-            blocks * (self.threads_per_cta // 32),
+            blocks * (self.threads_per_cta // lanes_per_group),
         ):
             row = group // groups_per_row
             k_group = group % groups_per_row
             input_tile = cute.make_tensor(
                 source.iterator
-                + cute.assume(row * width + k_group * 128 + lane * 4, divby=4),
-                cute.make_layout((4,), stride=(1,)),
+                + cute.assume(
+                    row * width
+                    + k_group * 128
+                    + (lane % lanes_per_group) * values_per_lane,
+                    divby=values_per_lane,
+                ),
+                cute.make_layout((values_per_lane,), stride=(1,)),
             )
             input_values.fill(0)
             if row < valid_rows:
@@ -2036,12 +2090,19 @@ class FusedTPProjectionKernel:
             else:
                 fragment.store(values)
             amax = cutlass.Float32(0.0)
-            for i in cutlass.range_constexpr(4):
+            for i in cutlass.range_constexpr(values_per_lane):
                 value = fragment[i]
                 amax = cute.arch.fmax(amax, cute.arch.fmax(value, -value))
-            amax = cute.arch.warp_redux_sync(
-                amax, kind="fmax", mask_and_clamp=0xFFFFFFFF, abs=False, nan=False
-            )
+            if cutlass.const_expr(self.large_row_bucket):
+                # XOR distances below eight keep each group's maximum separate.
+                for delta in cutlass.range_constexpr(3):
+                    amax = cute.arch.fmax(
+                        amax, cute.arch.shuffle_sync_bfly(amax, 1 << delta)
+                    )
+            else:
+                amax = cute.arch.warp_redux_sync(
+                    amax, kind="fmax", mask_and_clamp=0xFFFFFFFF, abs=False, nan=False
+                )
             # Exact FP32 representation of BF16(1e-10), bits 0x2edc0000.
             # A compile-time BF16 literal followed by .to(Float32) preserves
             # the Python literal in this DSL and does not round it to BF16.
@@ -2050,34 +2111,56 @@ class FusedTPProjectionKernel:
             inverse = cutlass.Float32(1.0) / multiplier
             quantized.store((fragment.load() * multiplier).to(self.a_dtype))
             for peer in cutlass.range_constexpr(len(input_peers)):
-                target = cute.make_tensor(
-                    input_peers[peer].iterator
-                    + cute.assume(
-                        (rank * rows + row) * width + k_group * 128 + lane * 4, divby=4
-                    ),
-                    cute.make_layout((4,), stride=(1,)),
-                )
-                cute.copy(copy_atom, quantized, target)
-                if lane == 0:
-                    scale_peers[peer][rank * rows + row, k_group, 0] = inverse
-        # Publish all data and scale stores from this CTA before its arrival.
-        cute.arch.fence_acq_rel_sys()
+                peer_width = width
+                peer_group = k_group
+                send = cutlass.Boolean(True)
+                if cutlass.const_expr(self.row_parallel):
+                    peer_width = width // len(input_peers)
+                    peer_group = k_group % (peer_width // 128)
+                    send = k_group // (peer_width // 128) == (rank + peer) % len(
+                        input_peers
+                    )
+                if send:
+                    target = cute.make_tensor(
+                        input_peers[peer].iterator
+                        + cute.assume(
+                            (rank * rows + row) * peer_width
+                            + peer_group * 128
+                            + (lane % lanes_per_group) * values_per_lane,
+                            divby=values_per_lane,
+                        ),
+                        cute.make_layout((values_per_lane,), stride=(1,)),
+                    )
+                    cute.copy(copy_atom, quantized, target)
+                    if lane % lanes_per_group == 0:
+                        scale_peers[peer][rank * rows + row, peer_group, 0] = inverse
+        # The CTA barrier orders every writer before its leader's release.
+        # Row projection joins these device-local arrivals in CTA zero, then
+        # publishes one system-release epoch for remote input consumers.
+        if cutlass.const_expr(not self.row_parallel):
+            cute.arch.fence_acq_rel_sys()
         cute.arch.barrier()
         if tid == 0:
             cute.arch.store(
-                flags.iterator + 16 + block, epoch, sem="release", scope="sys"
+                flags.iterator + 16 + block,
+                epoch,
+                sem="release",
+                scope=self.local_flag_scope,
             )
         if block == 0:
             if tid < blocks:
                 arrival = cute.arch.load(
-                    flags.iterator + 16 + tid, cutlass.Int64, sem="acquire", scope="sys"
+                    flags.iterator + 16 + tid,
+                    cutlass.Int64,
+                    sem="acquire",
+                    scope=self.local_flag_scope,
                 )
                 while arrival < epoch:
                     arrival = cute.arch.load(
                         flags.iterator + 16 + tid,
                         cutlass.Int64,
                         sem="acquire",
-                        scope="sys",
+                        scope=self.local_flag_scope,
                     )
             cute.arch.barrier()
             if tid == 0:
@@ -2100,7 +2183,10 @@ class FusedTPProjectionKernel:
         gx, gy, gz = cute.arch.grid_dim()
         block = bx + gx * (by + gy * bz)
         epoch = cute.arch.load(
-            flags.iterator + 16 + block, cutlass.Int64, sem="acquire", scope="sys"
+            flags.iterator + 16 + block,
+            cutlass.Int64,
+            sem="acquire",
+            scope=self.local_flag_scope,
         )
         first_owner = tile_m * self.cta_tile_shape_mnk[0] // rows
         owners_per_tile = max(1, self.cta_tile_shape_mnk[0] // rows)
@@ -2111,23 +2197,45 @@ class FusedTPProjectionKernel:
         if cutlass.const_expr(self.num_ctas % m_tiles != 0):
             first_owner = cutlass.Int32(0)
             owners_per_tile = len(peer_flags)
-        if cute.arch.lane_idx() == 0:
+        if cutlass.const_expr(self.row_parallel):
+            # One lane per peer issues the acquire in parallel. The warp join
+            # below orders every TMA/scale producer after all required owners.
+            lane = cute.arch.lane_idx()
+            address = peer_flags[0].iterator
             for peer in cutlass.range_constexpr(len(peer_flags)):
-                owner = (rank + peer) % len(peer_flags)
-                if owner >= first_owner and owner < first_owner + owners_per_tile:
+                if lane == peer:
+                    address = peer_flags[peer].iterator
+            owner = (rank + lane) % len(peer_flags)
+            if (
+                lane < len(peer_flags)
+                and owner >= first_owner
+                and owner < first_owner + owners_per_tile
+            ):
+                arrival = cute.arch.load(
+                    address, cutlass.Int64, sem="acquire", scope="sys"
+                )
+                while arrival < epoch:
                     arrival = cute.arch.load(
-                        peer_flags[peer].iterator,
-                        cutlass.Int64,
-                        sem="acquire",
-                        scope="sys",
+                        address, cutlass.Int64, sem="acquire", scope="sys"
                     )
-                    while arrival < epoch:
+        else:
+            if cute.arch.lane_idx() == 0:
+                for peer in cutlass.range_constexpr(len(peer_flags)):
+                    owner = (rank + peer) % len(peer_flags)
+                    if owner >= first_owner and owner < first_owner + owners_per_tile:
                         arrival = cute.arch.load(
                             peer_flags[peer].iterator,
                             cutlass.Int64,
                             sem="acquire",
                             scope="sys",
                         )
+                        while arrival < epoch:
+                            arrival = cute.arch.load(
+                                peer_flags[peer].iterator,
+                                cutlass.Int64,
+                                sem="acquire",
+                                scope="sys",
+                            )
         cute.arch.sync_warp()
         cute.arch.fence_proxy("async.global")
 
@@ -2151,7 +2259,10 @@ class FusedTPProjectionKernel:
         rows = peers[1].shape[0]
         valid_rows = output.shape[0]
         epoch = cute.arch.load(
-            ready.iterator + 16 + block, cutlass.Int64, sem="acquire", scope="sys"
+            ready.iterator + 16 + block,
+            cutlass.Int64,
+            sem="acquire",
+            scope=self.local_flag_scope,
         ) + cutlass.Int64(1)
         cute.arch.barrier()
         if tid == 0:
@@ -2167,47 +2278,45 @@ class FusedTPProjectionKernel:
         copy_out = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), self.c_dtype, num_bits_per_copy=128
         )
-        values = cute.make_rmem_tensor((8,), self.c_dtype)
-        # M is the contiguous scheduler coordinate. Each copy CTA handles a
-        # weight shard and strided N tiles. Smaller row buckets put multiple
-        # owners in one GEMM tile, so those N tiles can have different producer
-        # CTAs. Acquire each distinct producer before reading its output.
-        # Small buckets divide one M tile; larger owners contain whole M tiles.
-        # This keeps owner boundaries aligned for remote stores and producer waits.
-        assert rows in (32, 64) or (rows >= 128 and rows % 128 == 0)
-        world = len(peer_ready)
-        shard_width = width // world
-        n_tiles = shard_width // 128
-        producer_groups = blocks // world
-        producer = block // producer_groups
-        first_column_tile = block % producer_groups
-        tile_count = (
-            n_tiles - first_column_tile + producer_groups - 1
-        ) // producer_groups
-        # TP2 at the 32-row bucket has one partially filled M tile.
-        m_tiles = cute.ceil_div(world * rows, self.cta_tile_shape_mnk[0])
-        # For whole-tile owners, advancing by producer_groups N tiles shifts
-        # the producer by blocks * (rows / 128), hence wraps to the same CTA.
-        # Small buckets repeat after max(1, 128 / rows) such steps.
-        # Owners larger than a GEMM tile also need each local M-tile producer.
-        for row_tile in cutlass.range_constexpr(max(1, rows // 128)):
-            if row_tile * 128 < valid_rows:
-                for step in cutlass.range_constexpr(max(1, 128 // rows)):
-                    if step < tile_count:
-                        column_tile = first_column_tile + step * producer_groups
-                        producer_block = (
-                            rank * rows // 128 + row_tile + m_tiles * column_tile
-                        ) % blocks
-                        for peer in cutlass.range_constexpr(len(peer_ready)):
-                            if producer == (rank + peer) % world:
-                                if tid == 0:
-                                    count = cute.arch.load(
-                                        peer_ready[peer].iterator + 16 + producer_block,
-                                        cutlass.Int64,
-                                        sem="acquire",
-                                        scope="sys",
-                                    )
-                                    while count < epoch:
+        if cutlass.const_expr(self.row_parallel):
+            self.reduce_output(
+                output, peers, peer_ready, rank, epoch, copy_in, copy_out
+            )
+        else:
+            values = cute.make_rmem_tensor((8,), self.c_dtype)
+            # M is the contiguous scheduler coordinate. Each copy CTA handles a
+            # weight shard and strided N tiles. Smaller row buckets put multiple
+            # owners in one GEMM tile, so those N tiles can have different producer
+            # CTAs. Acquire each distinct producer before reading its output.
+            # Small buckets divide one M tile; larger owners contain whole M tiles.
+            # This keeps owner boundaries aligned for remote stores and producer waits.
+            assert rows in (32, 64) or (rows >= 128 and rows % 128 == 0)
+            world = len(peer_ready)
+            shard_width = width // world
+            n_tiles = shard_width // 128
+            producer_groups = blocks // world
+            producer = block // producer_groups
+            first_column_tile = block % producer_groups
+            tile_count = (
+                n_tiles - first_column_tile + producer_groups - 1
+            ) // producer_groups
+            # TP2 at the 32-row bucket has one partially filled M tile.
+            m_tiles = cute.ceil_div(world * rows, self.cta_tile_shape_mnk[0])
+            # For whole-tile owners, advancing by producer_groups N tiles shifts
+            # the producer by blocks * (rows / 128), hence wraps to the same CTA.
+            # Small buckets repeat after max(1, 128 / rows) such steps.
+            # Owners larger than a GEMM tile also need each local M-tile producer.
+            for row_tile in cutlass.range_constexpr(max(1, rows // 128)):
+                if row_tile * 128 < valid_rows:
+                    for step in cutlass.range_constexpr(max(1, 128 // rows)):
+                        if step < tile_count:
+                            column_tile = first_column_tile + step * producer_groups
+                            producer_block = (
+                                rank * rows // 128 + row_tile + m_tiles * column_tile
+                            ) % blocks
+                            for peer in cutlass.range_constexpr(len(peer_ready)):
+                                if producer == (rank + peer) % world:
+                                    if tid == 0:
                                         count = cute.arch.load(
                                             peer_ready[peer].iterator
                                             + 16
@@ -2216,68 +2325,98 @@ class FusedTPProjectionKernel:
                                             sem="acquire",
                                             scope="sys",
                                         )
-        cute.arch.barrier()
-        vectors_per_tile = valid_rows * 16
-        total_vectors = vectors_per_tile * tile_count
-        fragments = tuple(cute.make_rmem_tensor((8,), self.c_dtype) for _ in range(4))
-        for base in cutlass.range(tid, total_vectors, self.threads_per_cta * 4):
-            for item in cutlass.range_constexpr(4):
-                vector = base + item * self.threads_per_cta
-                if vector < total_vectors:
-                    row = (vector // 16) % valid_rows
-                    column_tile = (
-                        first_column_tile
-                        + (vector // vectors_per_tile) * producer_groups
-                    )
-                    column = (
-                        producer * shard_width + column_tile * 128 + (vector % 16) * 8
-                    )
-                    offset = cute.assume(row * width + column, divby=8)
-                    source = cute.make_tensor(
-                        peers[1].iterator + offset, cute.make_layout((8,), stride=(1,))
-                    )
-                    cute.copy(copy_in, source, fragments[item])
-            for item in cutlass.range_constexpr(4):
-                vector = base + item * self.threads_per_cta
-                if vector < total_vectors:
-                    row = (vector // 16) % valid_rows
-                    column_tile = (
-                        first_column_tile
-                        + (vector // vectors_per_tile) * producer_groups
-                    )
-                    column = (
-                        producer * shard_width + column_tile * 128 + (vector % 16) * 8
-                    )
-                    offset = cute.assume(row * width + column, divby=8)
-                    target = cute.make_tensor(
-                        output.iterator + offset, cute.make_layout((8,), stride=(1,))
-                    )
-                    cute.copy(copy_out, fragments[item], target)
+                                        while count < epoch:
+                                            count = cute.arch.load(
+                                                peer_ready[peer].iterator
+                                                + 16
+                                                + producer_block,
+                                                cutlass.Int64,
+                                                sem="acquire",
+                                                scope="sys",
+                                            )
+            cute.arch.barrier()
+            vectors_per_tile = valid_rows * 16
+            total_vectors = vectors_per_tile * tile_count
+            fragments = tuple(
+                cute.make_rmem_tensor((8,), self.c_dtype) for _ in range(4)
+            )
+            for base in cutlass.range(tid, total_vectors, self.threads_per_cta * 4):
+                for item in cutlass.range_constexpr(4):
+                    vector = base + item * self.threads_per_cta
+                    if vector < total_vectors:
+                        row = (vector // 16) % valid_rows
+                        column_tile = (
+                            first_column_tile
+                            + (vector // vectors_per_tile) * producer_groups
+                        )
+                        column = (
+                            producer * shard_width
+                            + column_tile * 128
+                            + (vector % 16) * 8
+                        )
+                        offset = cute.assume(row * width + column, divby=8)
+                        source = cute.make_tensor(
+                            peers[1].iterator + offset,
+                            cute.make_layout((8,), stride=(1,)),
+                        )
+                        cute.copy(copy_in, source, fragments[item])
+                for item in cutlass.range_constexpr(4):
+                    vector = base + item * self.threads_per_cta
+                    if vector < total_vectors:
+                        row = (vector // 16) % valid_rows
+                        column_tile = (
+                            first_column_tile
+                            + (vector // vectors_per_tile) * producer_groups
+                        )
+                        column = (
+                            producer * shard_width
+                            + column_tile * 128
+                            + (vector % 16) * 8
+                        )
+                        offset = cute.assume(row * width + column, divby=8)
+                        target = cute.make_tensor(
+                            output.iterator + offset,
+                            cute.make_layout((8,), stride=(1,)),
+                        )
+                        cute.copy(copy_out, fragments[item], target)
         # CTA zero acquires each per-CTA arrival in parallel and publishes
-        # one rank epoch. Avoid serializing every CTA on one atomic counter.
-        cute.arch.fence_acq_rel_sys()
+        # one rank epoch. The barrier completes every reader before the local
+        # release; CTA zero forwards that ordering with a system-release ack.
+        if cutlass.const_expr(not self.row_parallel):
+            cute.arch.fence_acq_rel_sys()
         cute.arch.barrier()
         if tid == 0:
             cute.arch.store(
-                ack.iterator + 16 + block, epoch, sem="release", scope="sys"
+                ack.iterator + 16 + block,
+                epoch,
+                sem="release",
+                scope=self.local_flag_scope,
             )
         if block == 0:
             if tid < blocks:
                 arrival = cute.arch.load(
-                    ack.iterator + 16 + tid, cutlass.Int64, sem="acquire", scope="sys"
+                    ack.iterator + 16 + tid,
+                    cutlass.Int64,
+                    sem="acquire",
+                    scope=self.local_flag_scope,
                 )
                 while arrival < epoch:
                     arrival = cute.arch.load(
                         ack.iterator + 16 + tid,
                         cutlass.Int64,
                         sem="acquire",
-                        scope="sys",
+                        scope=self.local_flag_scope,
                     )
             cute.arch.barrier()
             if tid == 0:
                 # The local consumption join also implies every local CTA
                 # already published its ready epoch.
-                cute.arch.store(ready.iterator, epoch, sem="release", scope="sys")
+                if cutlass.const_expr(self.row_parallel):
+                    # This counter is diagnostic; consumers acquire per-CTA ready
+                    # flags or the following system-release acknowledgement.
+                    cute.arch.store(ready.iterator, epoch, sem="relaxed", scope="sys")
+                else:
+                    cute.arch.store(ready.iterator, epoch, sem="release", scope="sys")
                 cute.arch.store(ack.iterator, epoch, sem="release", scope="sys")
             cute.arch.barrier()
         # One lane per peer acquires its acknowledgement in CTA zero.
@@ -2295,6 +2434,154 @@ class FusedTPProjectionKernel:
                     count = cute.arch.load(
                         address, cutlass.Int64, sem="acquire", scope="sys"
                     )
+
+    @cute.jit
+    def reduce_output(self, output, peers, peer_ready, rank, epoch, copy_in, copy_out):
+        # Large batches need row parallelism as well as column parallelism.
+        if cutlass.const_expr(peers[1].shape[0] > 128):
+            self.reduce_output_tiles(
+                output, peers, peer_ready, rank, epoch, copy_in, copy_out
+            )
+        else:
+            self.reduce_output_columns(
+                output, peers, peer_ready, rank, epoch, copy_in, copy_out
+            )
+
+    @cute.jit
+    def reduce_output_tiles(
+        self, output, peers, peer_ready, rank, epoch, copy_in, copy_out
+    ):
+        tid = cute.arch.thread_idx()[0]
+        bx, by, bz = cute.arch.block_idx()
+        gx, gy, gz = cute.arch.grid_dim()
+        block = bx + gx * (by + gy * bz)
+        blocks = gx * gy * gz
+        rows = peers[1].shape[0]
+        width = output.shape[1]
+        valid_rows = output.shape[0]
+        world = len(peer_ready)
+        m_tiles = cute.ceil_div(world * rows, self.mma_tiler[0])
+        column_tiles = width // 128
+        row_tiles = cute.ceil_div(valid_rows, self.mma_tiler[0])
+        fragment = cute.make_rmem_tensor((8,), self.c_dtype)
+        accum = cute.make_rmem_tensor((8,), cutlass.Float32)
+        # Acquire only this tile's GEMM producers before consuming its partials.
+        for tile in cutlass.range(block, row_tiles * column_tiles, blocks):
+            row_tile = tile // column_tiles
+            column_tile = tile % column_tiles
+            producer_block = (
+                rank * rows // self.mma_tiler[0] + row_tile + m_tiles * column_tile
+            ) % blocks
+            address = peer_ready[0].iterator
+            for peer in cutlass.range_constexpr(world):
+                if tid == peer:
+                    address = peer_ready[peer].iterator
+            if tid < world:
+                count = cute.arch.load(
+                    address + 16 + producer_block,
+                    cutlass.Int64,
+                    sem="acquire",
+                    scope="sys",
+                )
+                while count < epoch:
+                    count = cute.arch.load(
+                        address + 16 + producer_block,
+                        cutlass.Int64,
+                        sem="acquire",
+                        scope="sys",
+                    )
+            cute.arch.barrier()
+            for vector in cutlass.range(
+                tid, self.mma_tiler[0] * 16, self.threads_per_cta
+            ):
+                row = row_tile * self.mma_tiler[0] + vector // 16
+                column = column_tile * 128 + (vector % 16) * 8
+                if row < valid_rows:
+                    accum.fill(0)
+                    for producer in cutlass.range_constexpr(world):
+                        source = cute.make_tensor(
+                            peers[1].iterator
+                            + cute.assume(
+                                row * width * world + producer * width + column, divby=8
+                            ),
+                            cute.make_layout((8,), stride=(1,)),
+                        )
+                        cute.copy(copy_in, source, fragment)
+                        accum.store(accum.load() + fragment.load().to(cutlass.Float32))
+                    fragment.store(accum.load().to(self.c_dtype))
+                    target = cute.make_tensor(
+                        output.iterator + cute.assume(row * width + column, divby=8),
+                        cute.make_layout((8,), stride=(1,)),
+                    )
+                    cute.copy(copy_out, fragment, target)
+
+    @cute.jit
+    def reduce_output_columns(
+        self, output, peers, peer_ready, rank, epoch, copy_in, copy_out
+    ):
+        # Each GEMM shard writes BF16 partials into its own columns of the
+        # owner's receive buffer. Acquire every producer before the FP32 sum.
+        tid = cute.arch.thread_idx()[0]
+        bx, by, bz = cute.arch.block_idx()
+        gx, gy, gz = cute.arch.grid_dim()
+        block = bx + gx * (by + gy * bz)
+        blocks = gx * gy * gz
+        rows = peers[1].shape[0]
+        width = output.shape[1]
+        valid_rows = output.shape[0]
+        world = len(peer_ready)
+        m_tiles = cute.ceil_div(world * rows, self.mma_tiler[0])
+        for column_tile in cutlass.range(block, width // 128, blocks):
+            for row_tile in cutlass.range_constexpr(max(1, rows // self.mma_tiler[0])):
+                if row_tile * self.mma_tiler[0] < valid_rows:
+                    producer_block = (
+                        rank * rows // self.mma_tiler[0]
+                        + row_tile
+                        + m_tiles * column_tile
+                    ) % blocks
+                    # Poll all contributors in one warp instruction, rather
+                    # than serializing one NVLink round trip per producer.
+                    address = peer_ready[0].iterator
+                    for peer in cutlass.range_constexpr(world):
+                        if tid == peer:
+                            address = peer_ready[peer].iterator
+                    if tid < world:
+                        count = cute.arch.load(
+                            address + 16 + producer_block,
+                            cutlass.Int64,
+                            sem="acquire",
+                            scope="sys",
+                        )
+                        while count < epoch:
+                            count = cute.arch.load(
+                                address + 16 + producer_block,
+                                cutlass.Int64,
+                                sem="acquire",
+                                scope="sys",
+                            )
+            cute.arch.barrier()
+            fragment = cute.make_rmem_tensor((8,), self.c_dtype)
+            accum = cute.make_rmem_tensor((8,), cutlass.Float32)
+            for vector in cutlass.range(tid, valid_rows * 16, self.threads_per_cta):
+                row = vector // 16
+                column = column_tile * 128 + (vector % 16) * 8
+                accum.fill(0)
+                for producer in cutlass.range_constexpr(world):
+                    source = cute.make_tensor(
+                        peers[1].iterator
+                        + cute.assume(
+                            row * width * world + producer * width + column, divby=8
+                        ),
+                        cute.make_layout((8,), stride=(1,)),
+                    )
+                    cute.copy(copy_in, source, fragment)
+                    accum.store(accum.load() + fragment.load().to(cutlass.Float32))
+                fragment.store(accum.load().to(self.c_dtype))
+                target = cute.make_tensor(
+                    output.iterator + cute.assume(row * width + column, divby=8),
+                    cute.make_layout((8,), stride=(1,)),
+                )
+                cute.copy(copy_out, fragment, target)
 
     def acc_update_tmem_copy_and_partition(
         self,
@@ -2353,7 +2640,7 @@ class FusedTPProjectionKernel:
         tmem_store_atom = None
         if cutlass.const_expr(self.mma_tiler[0] == 64):
             tmem_load_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)),
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
                 self.acc_dtype,
             )
         else:
@@ -2363,7 +2650,7 @@ class FusedTPProjectionKernel:
             )
         if cutlass.const_expr(self.mma_tiler[0] == 64):
             tmem_store_atom = cute.make_copy_atom(
-                tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(8)),
+                tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(4)),
                 self.acc_dtype,
             )
         else:
@@ -2598,6 +2885,7 @@ class FusedTPProjectionKernel:
         sfb_count: int,
         num_smem_capacity: int,
         occupancy: int,
+        large_row_bucket: bool,
     ) -> Tuple[int, int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -2631,7 +2919,7 @@ class FusedTPProjectionKernel:
         num_c_stage = 2
 
         # Default ScaleA/B stages
-        num_scale_stage = 2
+        num_scale_stage = 4 if large_row_bucket else 2
 
         # Default Tile info stages
         num_tile_stage = 2
@@ -2676,6 +2964,12 @@ class FusedTPProjectionKernel:
             - (mbar_helpers_bytes + c_bytes + scale_bytes)
         ) // ab_bytes_per_stage
 
+        if large_row_bucket:
+            # Reserve space for more scales instead of a sixth operand stage.
+            num_ab_stage = min(num_ab_stage, 5)
+        if mma_tiler_mnk[0] == 64:
+            # Keep six operand stages for the 32-row TP4 bucket.
+            num_ab_stage = min(num_ab_stage, 6)
         # Refine epilogue stages:
         # Calculate remaining smem after allocating for A/B stages and reserved bytes
         # Add remaining unused smem to epilogue
@@ -2684,6 +2978,9 @@ class FusedTPProjectionKernel:
             - occupancy * ab_bytes_per_stage * num_ab_stage
             - occupancy * (mbar_helpers_bytes + c_bytes + scale_bytes)
         ) // (occupancy * c_bytes_per_stage)
+        if mma_tiler_mnk[0] == 64 or large_row_bucket:
+            # Two 64-column stores cover the tile.
+            num_c_stage = 2
         return num_acc_stage, num_ab_stage, num_c_stage, num_scale_stage, num_tile_stage
 
     @staticmethod

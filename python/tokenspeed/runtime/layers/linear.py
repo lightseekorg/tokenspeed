@@ -42,6 +42,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     projection_all_to_all,
     projection_reduce_scatter,
     try_fused_dp_column_linear,
+    try_fused_dp_row_linear,
 )
 from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
 from tokenspeed.runtime.distributed.utils import divide, split_tensor_along_last_dim
@@ -1561,11 +1562,29 @@ class DPRowParallelLinear(RowParallelLinear):
         *,
         ctx: "ForwardContext",
     ) -> tuple[torch.Tensor, None]:
-        rows, _ = _projection_rows(
+        rows, owner_rows = _projection_rows(
             inputs, ctx, self.parallel, self.projection_workspace
         )
         if rows == 0:
             return inputs.new_empty((0, self.output_size)), None
+        weight_scales = (
+            self.weight_scale_inv
+            if isinstance(self.quant_method, Fp8LinearMethod)
+            and self.quant_method.block_quant
+            and tuple(self.quant_method.quant_config.weight_block_size) == (128, 128)
+            else None
+        )
+        fused_output = inputs.new_empty((inputs.shape[0], self.output_size))
+        if try_fused_dp_row_linear(
+            inputs,
+            self.weight,
+            weight_scales,
+            owner_rows,
+            fused_output,
+            self.projection_workspace,
+            self.comm_backend,
+        ):
+            return fused_output, None
         values, _ = projection_all_to_all(
             inputs,
             rows,

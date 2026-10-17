@@ -227,32 +227,31 @@ another projection reuses it. Final outputs belong to the caller and
 remain valid across later forwards. Graphs referencing a workspace are destroyed
 before it is released.
 
-An optional complete projection kernel follows the same ownership contract:
-the backend prepares its shared communication storage, each Linear supplies
-its own weights, and the caller owns the final output. Selection uses all
-physical subgroup counts so every peer takes the same collective path.
-`try_fused_dp_column_linear` returns true after writing the complete local output,
-or false without modifying it so the caller can use the ordinary projection
-operations.
-The fused column projection specializes its prepared state by TP size and padded
-channel widths; actual owner counts remain runtime data within warmed row buckets.
-Its peer-memory transport requires a node-local group. Cross-node groups retain
-the ordinary collectives. Fusion is enabled automatically for eligible TP2 and
-TP4 projections when the maximum physical owner count is at least 64.
-Batch-invariant collectives retain the ordinary path. Row buckets select the
-prepared kernel variant independently of that threshold. Buckets are 32, 64,
-then 128-row steps through 2048. Above 2048, each power-of-two range has eight
-equal intervals: 256-row steps through 4096, 512-row steps through 8192, and so
-on. This bounds padding overhead below 12.5% above 2048 and makes the number of
-prepared variants grow logarithmically. All owner boundaries remain aligned to
-the 128-row GEMM tile. Unequal owners still pad to the shared bucket.
-All variants up to the rounded workspace capacity compile and warm before use;
-actual owner counts remain runtime inputs, including during graph replay.
-Preparation allocates fused state only for TP sizes enabled in automatic dispatch
-and capacities that can reach their minimum row count. Direct kernel APIs may
-support additional TP sizes without allocating their state in ordinary serving.
-When column projection fusion cannot be prepared, the first rank in each subgroup
-logs the reason once during workspace preparation, outside the forward path.
+Projection fusion replaces communication, quantization, and GEMM with one
+kernel within the same backend dispatch path. Column projection fuses
+all-gather, FP8 GEMM, and all-to-all; row projection fuses all-to-all, FP8 GEMM,
+and reduce-scatter. The goal is to reduce launch overhead and let computation
+consume peer data as it becomes available.
+
+Both directions follow the existing workspace ownership contract: the backend
+prepares shared communication storage, each Linear supplies its weights, and
+the caller owns the final output. All ranks select the same path using their
+physical subgroup counts, including unequal and empty owners. Eligible
+node-local TP2 and TP4 projections use fusion; smaller batches, batch-invariant
+collectives, and unsupported configurations retain the ordinary operations.
+
+Row counts remain runtime inputs. Prepared row buckets bound specialization
+and are warmed before graph capture, so changing batch sizes does not compile
+kernels during forward execution. Row fusion covers the prepared workspace
+capacity without a separate upper dispatch cutoff. Peer readiness is enforced
+inside the kernel; fused execution requires an isolated, fully resident grid
+and does not support concurrent workspace use or competing distributed kernels.
+
+For row projection, each rank computes BF16 partial outputs and their owner
+sums them in FP32 before rounding to BF16. This preserves the fused numerical
+contract, though ordinary BF16 collective reductions can round differently.
+Larger batches distribute the reduction across row and output-channel tiles
+to use more of the resident grid.
 
 ### Padding contract
 
