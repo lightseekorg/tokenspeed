@@ -108,6 +108,23 @@ eight outputs per lane store C through a row-contiguous layout, 16 bytes per
 lane. An optional XCD remap keeps the M tiles that share a weight tile on one
 XCD's L2.
 
+### gfx950 single-row BF16 GEMV
+
+`gluon_rowcta_bf16_gemv_gfx950` (`gemm/fp16/decode_gemv.py`) computes
+`x @ w.T` for one BF16 row with one program per output: program `n` streams
+weight row `n` (`.cg`) against `x` in `BLOCK_K` chunks, keeps per-lane FP32
+partial sums and reduces them once. `N` programs per launch keep many
+independent weight streams in flight per CU, which suits cold weights.
+
+- `x` is a contiguous `[1, K]` row, `w` a contiguous `[N, K]` matrix and `out`
+  a contiguous `[1, N]` destination, all BF16. `K` is a compile-time constant.
+- `BLOCK_K` and the wave count depend on `K` alone: one wave of 16-byte loads
+  for `K <= 1536`, wider programs above.
+- `gemm.mv` takes it for any single row with `N, K >= 128`. `gemm.mm` hands a
+  single row to `mv` only for the `(N, K)` shapes in `_PREFERRED_SHAPES`,
+  where it beat mm's own path (Torch's skinny GEMM or hipBLASLt) in
+  cold-cache standalone sweeps.
+
 ### gfx950 dense BF16 decode GEMV
 
 `gluon_gemv_a16w16_gfx950` (`gemm/fp16/gemv.py`) computes `x @ w.T` for

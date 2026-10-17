@@ -1629,12 +1629,12 @@ def _use_mv(x: torch.Tensor, weight: torch.Tensor) -> bool:
         impl = _select_mv(m, n, k, True, x.dtype, weight.dtype, False)
         if impl is torch_decode_gemv:
             return False
-        # Single rows keep mm's own path (Torch's skinny GEMM) except where a
-        # gfx950 kernel measured faster: the row-CTA GEMV on (4608, 8192) and
-        # the decode GEMV on its measured shapes.
+        # Single rows keep mm's own path (Torch's skinny GEMM or hipBLASLt)
+        # except where a gfx950 GEMV measured faster: the row-CTA GEMV and the
+        # decode GEMV each on their measured shapes.
         return (
             m >= 2
-            or (m, n, k) == (1, 4608, 8192)
+            or prefers_gluon_rowcta_bf16_gemv_gfx950(n, k)
             or impl is KernelRegistry.get().get_impl("gluon_gemv_a16w16_gfx950")
         )
     if not platform.is_cdna5 or k < 256:
@@ -2089,6 +2089,9 @@ def linear_attnres_partials(
 # it beats hipBLASLt.
 
 if _platform.is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
+        prefers_gluon_rowcta_bf16_gemv_gfx950,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
         supports_gluon_mm_a16w16_prefill_gfx950,
     )
@@ -2116,6 +2119,9 @@ else:
         return False
 
     def supports_gluon_mm_a16w16_prefill_gfx950(m: int, n: int, k: int) -> bool:
+        return False
+
+    def prefers_gluon_rowcta_bf16_gemv_gfx950(n: int, k: int) -> bool:
         return False
 
 
