@@ -26,8 +26,6 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 __all__ = [
-    "argmax",
-    "argmax_pair",
     "launch_gluon_argmax_gfx950",
 ]
 
@@ -234,14 +232,6 @@ def _validate_argmax_out(logits: torch.Tensor, out: torch.Tensor) -> None:
         raise ValueError("out must be on the same device as logits")
 
 
-def _validate_argmax_pair_out(logits: torch.Tensor, out: torch.Tensor) -> None:
-    shape = (logits.shape[0], 2)
-    if out.shape != shape:
-        raise ValueError(f"out must have shape (M, 2)={shape}, got {tuple(out.shape)}")
-    if out.dtype != torch.float32 or out.device != logits.device:
-        raise ValueError("out must be float32 on the same device as logits")
-
-
 def _argmax_torch_fallback(
     logits: torch.Tensor,
     *,
@@ -254,25 +244,6 @@ def _argmax_torch_fallback(
         out.copy_(result)
         return out
     return result
-
-
-def _argmax_pair_torch_fallback(
-    logits: torch.Tensor,
-    *,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if logits.dim() != 2:
-        raise ValueError(f"argmax_pair expects 2D input, got {logits.dim()}D")
-    if out is None:
-        out = torch.empty(
-            (logits.shape[0], 2), dtype=torch.float32, device=logits.device
-        )
-    else:
-        _validate_argmax_pair_out(logits, out)
-    max_vals, max_indices = torch.max(logits, dim=-1, keepdim=True)
-    out[:, 0:1].copy_(max_vals.to(torch.float32))
-    out[:, 1:2].copy_(max_indices.to(torch.float32))
-    return out
 
 
 def _supports_gluon(logits: torch.Tensor) -> bool:
@@ -404,7 +375,3 @@ def launch_gluon_argmax_gfx950(
             num_warps=num_warps,
         )
     return out
-
-
-argmax = launch_gluon_argmax_gfx950
-argmax_pair = _argmax_pair_torch_fallback
