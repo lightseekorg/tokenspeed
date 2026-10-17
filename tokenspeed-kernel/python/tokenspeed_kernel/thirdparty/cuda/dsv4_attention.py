@@ -154,7 +154,6 @@ def persistent_topk(
     logits: torch.Tensor,
     lengths: torch.Tensor,
     output: torch.Tensor,
-    workspace: torch.Tensor,
     k: int,
     max_seq_len: int,
     q_len_per_req: int,
@@ -167,7 +166,6 @@ def persistent_topk(
         logits: Contiguous FP32 scores shaped ``[rows, columns]``.
         lengths: Valid lengths per row, or per request with grouped queries.
         output: Int32 ``[rows, k]`` buffer, filled with indices and ``-1`` padding.
-        workspace: Caller-owned uint8 workspace.
         k: Number of selected columns: 512, 1024 or 2048.
         max_seq_len: Maximum columns scanned by a row.
         q_len_per_req: Query rows per request; 1 selects per-row lengths.
@@ -182,8 +180,6 @@ def persistent_topk(
         lengths = lengths.to(torch.int32)
     if output.dtype != torch.int32:
         raise TypeError(f"output must be int32, got {output.dtype}")
-    if workspace.dtype != torch.uint8:
-        raise TypeError(f"workspace must be uint8, got {workspace.dtype}")
     if not logits.is_contiguous():
         logits = logits.contiguous()
     if not lengths.is_contiguous():
@@ -192,7 +188,6 @@ def persistent_topk(
         logits,
         lengths,
         output,
-        workspace,
         int(k),
         int(max_seq_len),
         int(q_len_per_req),

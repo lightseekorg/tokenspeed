@@ -373,28 +373,34 @@ decode views, retain the capacity bound; decode graph shapes stay fixed.
 Uniform query runs may share a K tile, but groups must never cross requests.
 A single-request forward is uniform regardless of its forward mode. Long runs
 use larger query groups; ragged layouts retain independent rows. Scoring writes
-only each query's complete-block prefix. Both CUDA persistent and portable
-Triton top-k read that per-row frontier on the device, so the score tail may
-remain uninitialized even when the frontier shrinks during graph replay.
+only each query's complete-block prefix. CUDA, Triton and gfx950 Gluon top-k
+read that per-row frontier on the device, so the score tail may remain
+uninitialized even when the frontier shrinks during graph replay.
 A bounded set of scoring CTAs walks tiles at the grid stride, stopping at each
 query group's current device frontier and reusing Q across its tiles. CTAs
 beyond that frontier skip Q/K reads, the dot and score stores, including for
 padded graph requests. Allocated score width retains its capacity bound; the
 grid depends on SM count, query-group count, capacity and the loaded kernel's
 occupancy, never live lengths. Its CTA budget is three waves of the kernel's
-resident capacity, queried once per compiled specialization. Both grid
-dimensions fit within that budget; excess query groups and longer frontiers
-need more device-loop iterations, not a new graph or a device-to-host read.
+resident capacity, cached per compiled specialization in the platform layer.
+Both grid dimensions fit within that budget; excess query groups and longer
+frontiers need more device-loop iterations, not a new graph or a device-to-host
+read.
 Query-group counts use two compilation buckets: small grids fold away the
 group loop, while larger grids retain it with a runtime group count. This
 preserves decode register use without specializing on individual batch sizes.
+Only the query-group count disables implicit integer specialization; table
+views keep their allocation stride and score widths keep page alignment.
 
-QSA logits scoring and persistent CUDA top-k wait at entry before reading
-producer-owned queries, cache entries or metadata. Both follow the captured PDL
-setting. DSA and DSv4 persistent decode selection also follow that setting,
-including cluster launches. Small non-cluster PDL grids use a one-block register
-budget when their row count fits the SM count; larger grids retain the two-block
-budget. These precompiled launch-bounds variants use the same algorithm and
+QSA top-k uses separate CUDA, Triton and Gluon solutions selected through
+`select_kernel`; CUDA launch details stay inside its solution.
+
+On NVIDIA, QSA scoring and both CUDA and Triton top-k follow the captured PDL
+setting and wait before producer-owned reads when enabled. gfx950 Gluon has
+no dependency wait. DSA and DSv4 persistent decode selection also follow that
+setting, including cluster launches. Small non-cluster PDL grids use a one-block
+register budget when their row count fits the SM count; larger grids retain the
+two-block budget. These precompiled launch-bounds variants use the same algorithm and
 captured shapes, without reading device lengths. The compiler determines
 register allocation and occupancy. Register and streaming selectors retain both
 budgets: spreading waiting CTAs also benefits short-row selection while scoring finishes.

@@ -208,8 +208,8 @@ arithmetic without changing the launch grid, logits capacity or Top-K scan.
 
 ### Persistent CUDA top-k dependencies
 
-`ragged_decode_topk` requires an explicit `enable_pdl` argument. With PDL,
-selection waits at entry before reading lengths or scores, including empty and
+`ragged_decode_topk` needs no workspace and requires an explicit `enable_pdl`.
+With PDL, selection waits before reading lengths or scores, including empty and
 short rows. Cluster and single-CTA launches both honor the PDL flag.
 
 For non-cluster PDL grids with no more rows than SMs, the launcher selects a
