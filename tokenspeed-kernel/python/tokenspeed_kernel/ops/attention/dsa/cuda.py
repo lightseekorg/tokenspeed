@@ -261,11 +261,13 @@ def _finish_sparse_attention(
     # Empty ranks contribute the identity element to the shared DCP reduction.
     empty = ~(slots >= 0).any(dim=-1)
     result.masked_fill_(empty[:, None, None], 0)
-    lse = lse.contiguous().masked_fill(empty[:, None], -float("inf"))
     if out is not None:
         out.reshape_as(result).copy_(result)
         result = out
-    return (result, lse) if return_lse else result
+    if not return_lse:
+        return result
+    lse = lse.contiguous().masked_fill(empty[:, None], -float("inf"))
+    return result, lse
 
 
 if platform.is_nvidia and platform.is_hopper_plus:
