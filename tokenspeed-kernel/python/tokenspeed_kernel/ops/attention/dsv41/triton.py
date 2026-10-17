@@ -3982,7 +3982,10 @@ def _block_select_keys(row, start, n, latest, BLOCK: tl.constexpr):
     return idx, key, valid
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["visible_capacity"],
+    do_not_specialize_on_alignment=["visible_capacity"],
+)
 def _index_block_select_kernel(
     logits,
     visible,
@@ -3993,11 +3996,14 @@ def _index_block_select_kernel(
     stride_block_out,
     k,
     cap,
+    visible_capacity,
     BLOCK: tl.constexpr,
 ):
     query = tl.program_id(0)
     row = logits + query.to(tl.int64) * stride_logits
-    seen = tl.load(visible + query).to(tl.int32)
+    seen = tl.minimum(
+        tl.maximum(tl.load(visible + query).to(tl.int64), 0), visible_capacity
+    ).to(tl.int32)
     latest = tl.where(seen > 0, (seen - 1) // 8, -1)
     # Logits past the visible rows are -inf, so only visible blocks are read.
     n = tl.minimum(width // 8, (tl.maximum(seen, 0) + 7) // 8)
@@ -4069,20 +4075,32 @@ def _radix_digits(hist, k, PASSES: tl.constexpr):
 
 
 @triton.jit
-def _visible_blocks(visible, query, n_blocks):
-    seen = tl.load(visible + query).to(tl.int32)
+def _visible_blocks(visible, query, n_blocks, visible_capacity):
+    seen = tl.minimum(
+        tl.maximum(tl.load(visible + query).to(tl.int64), 0), visible_capacity
+    ).to(tl.int32)
     return seen, tl.minimum(n_blocks, (tl.maximum(seen, 0) + 7) // 8)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["visible_capacity"],
+    do_not_specialize_on_alignment=["visible_capacity"],
+)
 def _block_keys_pass(
-    logits, visible, keys, hist, n_blocks, stride_logits, BLOCK: tl.constexpr
+    logits,
+    visible,
+    keys,
+    hist,
+    n_blocks,
+    stride_logits,
+    visible_capacity,
+    BLOCK: tl.constexpr,
 ):
     # Long rows, step 1: one key per visible block (0 marks no finite score),
     # and the histogram of the keys' top byte.
     query = tl.program_id(0)
     start = tl.program_id(1) * BLOCK
-    seen, n = _visible_blocks(visible, query, n_blocks)
+    seen, n = _visible_blocks(visible, query, n_blocks, visible_capacity)
     if start >= n:
         return
     latest = tl.where(seen > 0, (seen - 1) // 8, -1)
@@ -4109,15 +4127,25 @@ def _load_block_keys(keys, query, start, n, n_blocks, BLOCK: tl.constexpr):
     return idx, key, in_range & (key != 0)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["visible_capacity"],
+    do_not_specialize_on_alignment=["visible_capacity"],
+)
 def _block_hist_pass(
-    keys, visible, hist, n_blocks, k, PASS: tl.constexpr, BLOCK: tl.constexpr
+    keys,
+    visible,
+    hist,
+    n_blocks,
+    k,
+    visible_capacity,
+    PASS: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     # Long rows, steps 2-4: histogram of byte PASS among the keys that match
     # the digits chosen so far.
     query = tl.program_id(0)
     start = tl.program_id(1) * BLOCK
-    _, n = _visible_blocks(visible, query, n_blocks)
+    _, n = _visible_blocks(visible, query, n_blocks, visible_capacity)
     if start >= n:
         return
     prefix, high, _, _ = _radix_digits(hist + query * 1024, k, PASS)
@@ -4134,14 +4162,25 @@ def _block_hist_pass(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["visible_capacity"],
+    do_not_specialize_on_alignment=["visible_capacity"],
+)
 def _block_count_pass(
-    keys, visible, hist, counts, n_blocks, k, chunks, BLOCK: tl.constexpr
+    keys,
+    visible,
+    hist,
+    counts,
+    n_blocks,
+    k,
+    chunks,
+    visible_capacity,
+    BLOCK: tl.constexpr,
 ):
     # Long rows, step 5: per chunk, keys above the threshold, ties, and valid keys.
     query = tl.program_id(0)
     chunk = tl.program_id(1)
-    _, n = _visible_blocks(visible, query, n_blocks)
+    _, n = _visible_blocks(visible, query, n_blocks, visible_capacity)
     if chunk * BLOCK >= n:
         return
     prefix, _, _, _ = _radix_digits(hist + query * 1024, k, 4)
@@ -4152,7 +4191,10 @@ def _block_count_pass(
     tl.store(out + 2, tl.sum(valid.to(tl.int32)))
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["visible_capacity"],
+    do_not_specialize_on_alignment=["visible_capacity"],
+)
 def _block_emit_pass(
     keys,
     visible,
@@ -4165,6 +4207,7 @@ def _block_emit_pass(
     k,
     cap,
     chunks,
+    visible_capacity,
     CHUNKS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -4172,7 +4215,7 @@ def _block_emit_pass(
     # ties of earlier chunks taken from their counts.
     query = tl.program_id(0)
     chunk = tl.program_id(1)
-    _, n = _visible_blocks(visible, query, n_blocks)
+    _, n = _visible_blocks(visible, query, n_blocks, visible_capacity)
     prefix, _, remaining, total = _radix_digits(hist + query * 1024, k, 4)
     take_all = total <= k
     others = tl.arange(0, CHUNKS)
@@ -4209,13 +4252,17 @@ def _block_emit_pass(
     tl.store(out + position, idx, mask=take)
 
 
-def index_block_select(logits, visible, candidate_topk, block_out, block_lens):
+def index_block_select(
+    logits, visible, candidate_topk, block_out, block_lens, *, visible_capacity
+):
     """Select each query's best 8-row blocks from scored logits, position-sorted.
 
     Args:
         logits: FP32 [Q, width] full-selection scores with unit inner stride;
             columns at or past ``visible[q]`` must be -inf and are not read.
-        visible: Int32/int64 [Q] visible row counts.
+        visible: Int32/int64 [Q] raw visible row counts.
+        visible_capacity: Page-table row capacity used to clamp lengths before
+            narrowing to int32. This may exceed compact Reindex logits width.
         candidate_topk: Number of blocks to keep.
         block_out: Int32 [Q, cap] destination with unit inner stride. Row q
             receives the ids of its ``min(candidate_topk, width // 8)`` best
@@ -4250,14 +4297,29 @@ def index_block_select(logits, visible, candidate_topk, block_out, block_lens):
             (queries, chunks, 3), dtype=torch.int32, device=logits.device
         )
         _block_keys_pass[grid](
-            logits, visible, keys, hist, n_blocks, logits.stride(0), BLOCK=chunk
+            logits,
+            visible,
+            keys,
+            hist,
+            n_blocks,
+            logits.stride(0),
+            visible_capacity,
+            BLOCK=chunk,
         )
         for p in range(1, 4):
             _block_hist_pass[grid](
-                keys, visible, hist, n_blocks, k, PASS=p, BLOCK=chunk
+                keys, visible, hist, n_blocks, k, visible_capacity, PASS=p, BLOCK=chunk
             )
         _block_count_pass[grid](
-            keys, visible, hist, counts, n_blocks, k, chunks, BLOCK=chunk
+            keys,
+            visible,
+            hist,
+            counts,
+            n_blocks,
+            k,
+            chunks,
+            visible_capacity,
+            BLOCK=chunk,
         )
         _block_emit_pass[grid](
             keys,
@@ -4271,6 +4333,7 @@ def index_block_select(logits, visible, candidate_topk, block_out, block_lens):
             k,
             block_out.shape[1],
             chunks,
+            visible_capacity,
             CHUNKS=triton.next_power_of_2(chunks),
             BLOCK=chunk,
         )
@@ -4285,6 +4348,7 @@ def index_block_select(logits, visible, candidate_topk, block_out, block_lens):
         block_out.stride(0),
         k,
         block_out.shape[1],
+        visible_capacity,
         BLOCK=1024,
         num_warps=8,
     )
