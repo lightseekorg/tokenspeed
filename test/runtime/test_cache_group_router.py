@@ -1075,6 +1075,109 @@ class TestCacheGroupRouterTest:
         )
         assert (leaves[FULL].calls[-1][2].tolist()) == ([39])
 
+    def test_a_sharded_extend_hands_each_leaf_its_raw_host_block_rows(self):
+        """Page ownership is per scheduler block, so a leaf that splits a
+        history gather by page owner reads its group's host block table as
+        the scheduler delivered it -- the extend requests' rows, never
+        expanded to kernel pages (the SWA leaf's pages are half a block) --
+        and, with no group page-sharded, a forward that splits nothing hands
+        it ``None``."""
+        from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+        router, leaves = self._router(spec=1)
+        tables = self._tables()
+        tables_cpu = {gid: table.clone() for gid, table in tables.items()}
+        new = torch.tensor([5], dtype=torch.int32)
+        prefix = torch.tensor([4], dtype=torch.int32)
+
+        def init(query_shard):
+            # Request 0 extends, request 1 decodes.
+            router.init_forward_metadata(
+                2,
+                1,
+                torch.arange(2, dtype=torch.int32),
+                torch.tensor([9, 4], dtype=torch.int32),
+                ForwardMode.MIXED,
+                block_tables=tables,
+                extend_seq_lens=new,
+                extend_seq_lens_cpu=new.clone(),
+                extend_prefix_lens=prefix,
+                extend_prefix_lens_cpu=prefix.clone(),
+                extend_replay_lens_cpu=torch.zeros_like(prefix),
+                extend_prompt_lens_cpu=prefix + new,
+                extend_with_prefix=True,
+                query_shard=query_shard,
+                block_tables_cpu=tables_cpu,
+            )
+
+        init(
+            QueryShardPlan.from_forward(
+                total_tokens=5, input_lengths=[5], size=2, rank=0
+            )
+        )
+        for leaf in leaves.values():
+            assert leaf.last_init_kwargs["block_table_cpu"].tolist() == [[5, 6, -1]]
+        init(None)
+        for leaf in leaves.values():
+            assert leaf.last_init_kwargs["block_table_cpu"] is None
+
+    def test_a_kvp_page_sharded_group_takes_its_host_block_rows_on_a_prefix_extend(
+        self,
+    ):
+        """Without a query shard, only a group whose pages are dealt over KVP
+        owners reads its host block rows -- its prefix-chunk gather takes the
+        page owners and their send slots from them -- and only on an extend
+        that continues a prefix."""
+        router = CacheGroupRouter(
+            lambda group_id, granularity: _StubLeaf(granularity),
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
+        router.set_cache_pool(
+            _pool(
+                _spec(FULL, shard_count=2),
+                _spec(SWA),
+                _spec("linear_attention_0", granularity=8, attn_kind="state"),
+            )
+        )
+        router.configure_runtime()
+        router.init_cuda_graph_state(4)
+        tables = self._tables()
+        tables_cpu = {gid: table.clone() for gid, table in tables.items()}
+        new = torch.tensor([5], dtype=torch.int32)
+
+        def init(prefix_len):
+            prefix = torch.tensor([prefix_len], dtype=torch.int32)
+            # Request 0 extends, request 1 decodes.
+            router.init_forward_metadata(
+                2,
+                1,
+                torch.arange(2, dtype=torch.int32),
+                torch.tensor([prefix_len + 5, 4], dtype=torch.int32),
+                ForwardMode.MIXED,
+                block_tables=tables,
+                extend_seq_lens=new,
+                extend_seq_lens_cpu=new.clone(),
+                extend_prefix_lens=prefix,
+                extend_prefix_lens_cpu=prefix.clone(),
+                extend_replay_lens_cpu=torch.zeros_like(prefix),
+                extend_prompt_lens_cpu=prefix + new,
+                extend_with_prefix=prefix_len > 0,
+                query_shard=None,
+                block_tables_cpu=tables_cpu,
+            )
+
+        init(4)
+        assert router.leaves[FULL].last_init_kwargs["block_table_cpu"].tolist() == [
+            [5, 6, -1]
+        ]
+        assert router.leaves[SWA].last_init_kwargs["block_table_cpu"] is None
+        init(0)
+        for leaf in router.leaves.values():
+            assert leaf.last_init_kwargs["block_table_cpu"] is None
+
     def test_a_graph_padded_mixed_round_records_the_persistent_buffer(self):
         router, _ = self._router(spec=1)
         router.init_cuda_graph_state(4, max_extend_tokens=8)
@@ -1483,6 +1586,7 @@ def _spec(
     rows_per_page=None,
     entry_stride_tokens=None,
     sliding_window_tokens=None,
+    shard_count=1,
 ):
     return SimpleNamespace(
         group_id=group_id,
@@ -1491,12 +1595,19 @@ def _spec(
         rows_per_page=rows_per_page,
         entry_stride_tokens=entry_stride_tokens,
         sliding_window_tokens=sliding_window_tokens,
+        shard_count=shard_count,
     )
 
 
 def _pool(*specs, paged=(FULL, SWA)):
     return SimpleNamespace(
-        arena=SimpleNamespace(cache_group_specs=tuple(specs), offload=None),
+        arena=SimpleNamespace(
+            cache_group_specs=tuple(specs),
+            offload=None,
+            runtime_contract=SimpleNamespace(
+                virtual_block_counts={spec.group_id: 64 for spec in specs}
+            ),
+        ),
         paged_group_ids=tuple(paged),
     )
 

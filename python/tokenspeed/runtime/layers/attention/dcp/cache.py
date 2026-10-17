@@ -302,16 +302,15 @@ class PrefixHistoryWindow:
 def plan_prefix_history_gather(
     chunk_kv_indices_list: Sequence[torch.Tensor],
     *,
-    page_table_cpu: torch.Tensor,
+    block_table_cpu: torch.Tensor,
     prefix_lens_cpu: torch.Tensor,
     chunk_len: int,
-    page_size: int,
     placement: CachePlacement,
 ) -> tuple[PrefixHistoryWindow, ...]:
     """Plan one forward's page-owner gathers of its prefix-chunk loops.
 
     Consecutive loops share a window (``PREFIX_HISTORY_WINDOW_LOOPS``); every
-    MLA layer reuses the plan. The owned-row counts come from the host page
+    MLA layer reuses the plan. The owned-row counts come from the host block
     table, so nothing waits on the device; one kernel per window
     (``split_slots_by_owner``) gives every row its all-gather output row and
     this rank's rows their physical slots.
@@ -319,22 +318,21 @@ def plan_prefix_history_gather(
     Args:
         chunk_kv_indices_list: Each loop's ``[rows]`` virtual slots, position
             order (``chunk.get_chunks_paged``), identical on every rank.
-        page_table_cpu: ``[requests, columns]`` host kernel-page table of the
-            extend requests.
+        block_table_cpu: ``[requests, columns]`` host block table of the
+            extend requests (virtual scheduler blocks of
+            ``placement.block_granularity`` rows).
         prefix_lens_cpu: ``[requests]`` host cached-prefix lengths.
         chunk_len: Prefix rows every request contributes to one loop.
-        page_size: Tokens per kernel page.
         placement: The MLA history group's page ownership.
 
     Returns:
         The windows, in loop order.
     """
     counts = owned_prefix_chunk_rows(
-        page_table_cpu,
+        block_table_cpu,
         prefix_lens_cpu,
         chunk_len=chunk_len,
         num_chunks=len(chunk_kv_indices_list),
-        page_size=page_size,
         placement=placement,
     )
     degree = len(placement.group)
@@ -411,14 +409,13 @@ class PrefixHistoryGather:
     layer's history in the same order.
     """
 
-    def __init__(self, placement: CachePlacement, *, page_size: int, comm: CommBackend):
+    def __init__(self, placement: CachePlacement, *, comm: CommBackend):
         self._placement = placement
-        self._page_size = page_size
         self._comm = comm
         # The current forward's loops and planning inputs, and its windows
         # once the first read planned them.
         self._chunk_kv_indices_list: Sequence[torch.Tensor] = ()
-        self._page_table_cpu: torch.Tensor | None = None
+        self._block_table_cpu: torch.Tensor | None = None
         self._prefix_lens_cpu: torch.Tensor | None = None
         self._chunk_len = 0
         self._windows: tuple[PrefixHistoryWindow, ...] | None = None
@@ -428,19 +425,17 @@ class PrefixHistoryGather:
         self._sharded_layer_ids: list[int] | None = None
 
     @classmethod
-    def on_history_groups(
-        cls, placement: CachePlacement, *, page_size: int
-    ) -> PrefixHistoryGather:
+    def on_history_groups(cls, placement: CachePlacement) -> PrefixHistoryGather:
         """Reads that gather on the named KVP history groups, which the
         distributed initializer creates whenever KVP is on."""
         comm = get_global_backend().for_named_groups(KVP_HISTORY_GROUP_NAME)
-        return cls(placement, page_size=page_size, comm=comm)
+        return cls(placement, comm=comm)
 
     def prepare(
         self,
         chunk_kv_indices_list: Sequence[torch.Tensor],
         *,
-        page_table_cpu: torch.Tensor | None,
+        block_table_cpu: torch.Tensor | None,
         prefix_lens_cpu: torch.Tensor,
         chunk_len: int,
     ) -> None:
@@ -450,8 +445,9 @@ class PrefixHistoryGather:
             chunk_kv_indices_list: Each loop's ``[rows]`` virtual slots,
                 position order (``chunk.get_chunks_paged``), identical on
                 every rank.
-            page_table_cpu: ``[requests, columns]`` host kernel-page table of
-                the extend requests; required when there are loops.
+            block_table_cpu: ``[requests, columns]`` host block table of the
+                extend requests (virtual scheduler blocks); required when
+                there are loops.
             prefix_lens_cpu: ``[requests]`` host cached-prefix lengths.
             chunk_len: Prefix rows every request contributes to one loop.
         """
@@ -460,13 +456,13 @@ class PrefixHistoryGather:
         for launched in self._launched.values():
             launched.work.wait()
         self._launched.clear()
-        if chunk_kv_indices_list and page_table_cpu is None:
+        if chunk_kv_indices_list and block_table_cpu is None:
             raise RuntimeError(
-                "a page-sharded MLA prefix needs the host page table to split "
+                "a page-sharded MLA prefix needs the host block table to split "
                 "its history gather by page owner"
             )
         self._chunk_kv_indices_list = chunk_kv_indices_list
-        self._page_table_cpu = page_table_cpu
+        self._block_table_cpu = block_table_cpu
         self._prefix_lens_cpu = prefix_lens_cpu
         self._chunk_len = chunk_len
         # A forward without prefix loops has nothing to gather.
@@ -479,10 +475,9 @@ class PrefixHistoryGather:
         if self._windows is None:
             self._windows = plan_prefix_history_gather(
                 self._chunk_kv_indices_list,
-                page_table_cpu=self._page_table_cpu,
+                block_table_cpu=self._block_table_cpu,
                 prefix_lens_cpu=self._prefix_lens_cpu,
                 chunk_len=self._chunk_len,
-                page_size=self._page_size,
                 placement=self._placement,
             )
         return self._windows

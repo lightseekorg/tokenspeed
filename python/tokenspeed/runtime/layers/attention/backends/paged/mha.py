@@ -181,11 +181,11 @@ class MHAAttnBackend(PagedAttentionBackend):
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         query_shard: QueryShardPlan | None,
-        page_table_cpu: torch.Tensor | None,
+        block_table_cpu: torch.Tensor | None,
         **kwargs,
     ) -> None:
         reject_query_shard(query_shard, "MHAAttnBackend")
-        del page_table_cpu
+        del block_table_cpu
         if not forward_mode.is_extend_or_mixed():
             raise RuntimeError(
                 "MHA decode metadata goes through refresh_decode_metadata; "

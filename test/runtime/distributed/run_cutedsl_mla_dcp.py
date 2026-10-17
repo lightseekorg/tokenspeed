@@ -406,7 +406,7 @@ def run_prefill_case(*, rank, mapping, context, dtype):
             prefix,
             extend.to(device),
             extend,
-            page_table_cpu=pages.cpu(),
+            block_table_cpu=order.int().cpu(),
         )
     assert leaf.chunked_prefill_metadata.chunked_loop_num > 1
     assert (

@@ -99,7 +99,7 @@ def _init(backend, *, lengths, queries, prefixes, mode, tables=None):
         extend_prefix_lens_cpu=prefixes,
         extend_with_prefix=bool(prefixes.any()),
         query_shard=None,
-        page_table_cpu=None,
+        block_table_cpu=None,
     )
     return backend.forward_extend_metadata
 

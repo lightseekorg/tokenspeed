@@ -627,7 +627,7 @@ class DSABackend(PagedAttentionBackend):
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         query_shard: QueryShardPlan | None,
-        page_table_cpu: torch.Tensor | None,
+        block_table_cpu: torch.Tensor | None,
         **kwargs,
     ):
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
@@ -650,7 +650,7 @@ class DSABackend(PagedAttentionBackend):
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             extend_with_prefix=extend_with_prefix,
             query_shard=None,
-            page_table_cpu=None,
+            block_table_cpu=None,
             **kwargs,
         )
         self.query_shard_metadata = None
@@ -660,16 +660,16 @@ class DSABackend(PagedAttentionBackend):
                     "DSA query context parallelism serves pure extend forwards; a "
                     "MIXED round carries replicated decode rows"
                 )
-            if page_table_cpu is None:
+            if block_table_cpu is None:
                 raise RuntimeError(
-                    "DSA query context parallelism needs the host page table to "
+                    "DSA query context parallelism needs the host block table to "
                     "split the history gather by page owner"
                 )
             self.query_shard_metadata = self._plan_query_shard(
                 query_shard,
                 num_extends=num_extends,
                 page_table=page_table,
-                page_table_cpu=page_table_cpu,
+                block_table_cpu=block_table_cpu,
                 seq_lens=seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
@@ -718,17 +718,17 @@ class DSABackend(PagedAttentionBackend):
         *,
         num_extends: int,
         page_table: torch.Tensor,
-        page_table_cpu: torch.Tensor,
+        block_table_cpu: torch.Tensor,
         seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
     ) -> DSAQueryShardMetadata:
         """Group the extend requests by history and plan each group's gather.
 
-        Host arithmetic over the pinned length mirrors and the host page table
-        (owned-row counts per rank); the device work is one slot build per
-        group. Greedy grouping by summed history length against the gather
-        workspace, a request never splits.
+        Host arithmetic over the pinned length mirrors and the host block
+        table (owned-row counts per rank); the device work is one slot build
+        per group. Greedy grouping by summed history length against the
+        gather workspace, a request never splits.
         """
         if self._history_workspace is None:
             raise RuntimeError(
@@ -736,6 +736,10 @@ class DSABackend(PagedAttentionBackend):
                 "preallocate_history_gather_workspace (or the draft's adoption of "
                 "the target's) did not run"
             )
+        # The group's block granularity, configured whether or not KVP shards
+        # it: the host block table's rows per entry.
+        if self.kvp_block_granularity is None:
+            raise RuntimeError("DSA cache geometry is not configured")
         extend_lens = [int(x) for x in extend_seq_lens_cpu[:num_extends].tolist()]
         prefix_lens = [int(x) for x in extend_prefix_lens_cpu[:num_extends].tolist()]
         if sum(extend_lens) != plan.total_rows:
@@ -746,9 +750,9 @@ class DSABackend(PagedAttentionBackend):
         history_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
         placement = self.cache_placement(None)
         owned = owned_history_rows(
-            page_table_cpu[:num_extends],
+            block_table_cpu[:num_extends],
             torch.tensor(history_lens, dtype=torch.int64),
-            page_size=self.kernel_page_size,
+            block_granularity=self.kvp_block_granularity,
             placement=placement,
         )
         cap = self._history_workspace.rows

@@ -690,14 +690,14 @@ class CacheGroupRouter(AttentionBackend):
         table. ``extend_with_prefix`` (some extend request continues a cached
         or chunked prefix) travels with the extend lengths: leaves size their
         paged-prefix metadata by it, so it must reach them unchanged. A
-        ``query_shard`` reaches every leaf too, with the host mirror of the
-        extend rows of its kernel page table (``block_tables_cpu``, the
-        runner's host mirror of ``block_tables``, expanded the way the stack
-        expands the device tables), so a leaf that gathers history by page
-        owner can split the gather without a device sync. A page-sharded
-        group's leaf gets the mirror for an extend with a prefix too, to split
-        its prefix-chunk gathers the same way; any other forward reads nothing
-        from the mirror.
+        ``query_shard`` reaches every leaf too, with the extend rows of its
+        group's host block table (``block_tables_cpu``, the runner's host
+        mirror of ``block_tables``, as scheduler blocks: page ownership is
+        per block, so nothing is expanded on the host), so a leaf that
+        gathers history by page owner can split the gather without a device
+        sync. A page-sharded group's leaf gets the rows for an extend with a
+        prefix too, to split its prefix-chunk gathers the same way; any other
+        forward reads nothing from the mirror.
         """
         del extend_prompt_lens_cpu
         reject_bounded_replay(extend_replay_lens_cpu, "CacheGroupRouter")
@@ -740,8 +740,8 @@ class CacheGroupRouter(AttentionBackend):
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
                 extend_with_prefix=extend_with_prefix,
                 query_shard=query_shard,
-                page_table_cpu=(
-                    self.stacks.host_table(gid, block_tables_cpu[gid], num_extends)
+                block_table_cpu=(
+                    block_tables_cpu[gid][:num_extends]
                     if sharded
                     or (extend_with_prefix and gid in self._page_sharded_groups)
                     else None

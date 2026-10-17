@@ -490,33 +490,49 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     assert "kvp_group" not in vars(pool)
     assert "kvp_rank" not in vars(pool)
 
-    # One request whose three rows sit on pages of virtual blocks 1, 2, 3:
-    # rank 0 owns rows 0 and 2, rank 1 owns row 1.
+    # One request whose nine prefix rows fill virtual blocks 1 and 2 and
+    # start block 3 (four rows a block): rank 0 owns rows 0-3 (block 1, its
+    # local block 1) and row 8 (block 3, its local block 2), rank 1 owns
+    # rows 4-7 (block 2).
+    prefix_loc = torch.arange(4, 13, device="cuda")
+    # Row r holds r + [0, 0.5): every row tells its position.
+    prefix_values = (
+        torch.arange(9, device="cuda", dtype=torch.float32).view(9, 1, 1)
+        + torch.linspace(0, 0.5, 576, device="cuda")
+    ).to(torch.bfloat16)
+    slots, mask = resolve_cache_slots(prefix_loc, backend.cache_placement(layer))
+    pool.set_mla_kv_buffer(
+        layer,
+        slots,
+        prefix_values[..., :512],
+        prefix_values[..., 512:],
+        write_mask=mask,
+    )
+    block_table_cpu = torch.tensor([[1, 2, 3]], dtype=torch.int32)
     (window,) = plan_prefix_history_gather(
-        [loc],
-        page_table_cpu=torch.tensor([[4, 8, 12]], dtype=torch.int32),
-        prefix_lens_cpu=torch.tensor([3]),
-        chunk_len=3,
-        page_size=1,
+        [prefix_loc],
+        block_table_cpu=block_table_cpu,
+        prefix_lens_cpu=torch.tensor([9]),
+        chunk_len=9,
         placement=backend.cache_placement(layer),
     )
-    assert window.owned_rows_per_rank == (2, 1)
-    assert window.send_rows == 2
-    assert window.gathered_index.tolist() == [0, 2, 1]
-    assert window.fetch_slots.tolist() == [4, 8]
-    assert window.loop_bounds == (0, 3)
+    assert window.owned_rows_per_rank == (5, 4)
+    assert window.send_rows == 5
+    assert window.gathered_index.tolist() == [0, 1, 2, 3, 5, 6, 7, 8, 4]
+    assert window.fetch_slots.tolist() == [4, 5, 6, 7, 8]
+    assert window.loop_bounds == (0, 9)
 
     class OwnerRows:
-        """Rank 0's view of the all-gather: rank 1 owns row 1."""
+        """Rank 0's view of the all-gather: rank 1 owns rows 4-7."""
 
         def all_gather_single_async(self, gathered, send, group):
             assert group == (0, 1)
-            row_bytes = values.view(torch.uint8).view(3, 1, -1)
-            torch.testing.assert_close(send, row_bytes[[0, 2]], rtol=0, atol=0)
-            gathered[:2] = send
-            gathered[2] = row_bytes[1]
+            row_bytes = prefix_values.view(torch.uint8).view(9, 1, -1)
+            torch.testing.assert_close(send, row_bytes[[0, 1, 2, 3, 8]], rtol=0, atol=0)
+            gathered[:5] = send
+            gathered[5:9] = row_bytes[4:8]
             # Rank 1's padding row is never read.
-            gathered[3] = 0xFF
+            gathered[9] = 0xFF
             return SimpleNamespace(wait=lambda: None)
 
     # The leaf's prefill metadata prepares the prefix it reads back; the
@@ -528,20 +544,22 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
             for_named_groups={KVP_HISTORY_GROUP_NAME: OwnerRows()}.__getitem__
         ),
     )
-    monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 3)
+    # One loop covers the nine rows.
+    monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 9)
+    monkeypatch.setitem(global_server_args_dict, "mla_chunk_multiplier", 1)
     backend.kernel_page_size = 1
     backend._prefix_history = None
-    loops = [loc]
+    loops = [prefix_loc]
     backend._prepare_prefix_history(
         loops,
-        page_table_cpu=torch.tensor([[4, 8, 12]], dtype=torch.int32),
-        prefix_lens_cpu=torch.tensor([3]),
+        block_table_cpu=block_table_cpu,
+        prefix_lens_cpu=torch.tensor([9]),
     )
     ((nope, rope),) = backend.read_prefix_history(
         pool, layer, loops, dst_dtype=torch.float32
     )
     torch.testing.assert_close(
-        torch.cat((nope, rope), dim=-1), values.float(), rtol=0, atol=0
+        torch.cat((nope, rope), dim=-1), prefix_values.float(), rtol=0, atol=0
     )
     # A sharded leaf never falls back to reading its own rows alone.
     backend._prefix_history = None
