@@ -84,6 +84,13 @@ path, not a fallback.
 
 ### Rebinding a cache pool
 
+Prefill autotune and graph capture use distinct writable pages per fabricated
+request and disjoint physical parents per cache group. Groups can share byte
+planes, so reusing the same parent across groups corrupts their state even when
+the group-local page IDs differ. The probe arena reserves the sum of each
+group's rounded-up parent demand, using its virtual packing for sharded groups.
+Decode capture continues to use the reserved null page.
+
 `set_cache_pool` may run more than once on the same backend tree: a memory
 probe binds a small pool, captures into a throwaway graph pool, then binds
 the real pool. The contract is that a rebound backend is indistinguishable

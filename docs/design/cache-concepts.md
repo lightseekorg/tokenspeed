@@ -251,8 +251,8 @@ prompt-end checkpoint it still holds in slot 0 is the canonical block.
 
 A **natural checkpoint** is a state block that exists because a forward ended
 there -- the prompt end (the block rotated out of slot 1 as the first decode
-runs), the finish (slot 1 in place), the chunk the junction cut ended, or the
-retraction image -- published under the hash of that token count, page
+runs), the finish (slot 1 in place), a chunk ended at a junction or before a
+long prompt's replay tail, or the retraction image -- published under the hash of that token count, page
 boundary or not. No forward computes an interior checkpoint, no scan is split
 into body and tail, and no state group declares a token span: a hit resumes
 at the published token count `T` exactly, with its state in slot 0 and the KV
@@ -847,7 +847,11 @@ Its responsibilities:
   finished local backup must not `CacheHostBlock` on one mirrored
   scheduler while a CP/PP peer still has the op pending. A truncated
   `batch_is_exist` reply is a failed put, not an implicit success:
-  `WriteBackDone` follows only a completed backup. A backup future that
+  `WriteBackDone` follows only a completed backup. Mooncake allocation
+  pressure (`NO_AVAILABLE_HANDLE`) retries only unwritten pages on the
+  backup worker, with at most three retries after 10, 50, and 200 ms.
+  Host pages remain pinned until success; exhausted retries, other errors,
+  and malformed replies retain the failure path. A backup future that
   fails is MAX-reduced with the replica idle/work flag before the
   completion gather so every rank raises together. Every rank
   stays in every replica-group gather even when an earlier intersection
@@ -993,7 +997,10 @@ Its responsibilities:
   shadow with this prompt's suffix; later unrelated keys LRU-evict older
   prompts. Unregister removes keys from both the live set and the LRU
   order deque so a vanished object cannot accumulate tombstones
-  while the live set stays below capacity. Submit-time registration
+  while the live set stays below capacity. Bulk removals maintain that order;
+  publishing one Host block only appends its key and trims excess keys from
+  the front, without scanning the whole shadow for every block.
+  Submit-time registration
   restores keys that were dropped from the shadow.
   That probe is not a lease: an object can vanish between `batch_exists`
   and the fetch. So the fetch happens before admission, where a miss costs
@@ -1012,7 +1019,17 @@ Its responsibilities:
   later `batch_exists` hit may register them again; there is no blacklist),
   and returns the request to `Submitted` at its original queue position. Its
   admission is then a plain Host hit: no forward is ever skipped or retracted
-  for L3, and no admission load-back can miss. The D role probes the Device
+  for L3, and no admission load-back can miss. The shared aligned probe
+  matches token-spanned groups only. The L3 prefetch probe then adds available
+  State checkpoints within that coverage and each checkpoint's required
+  sliding-window blocks, so an earlier checkpoint remains usable when the KV
+  coverage extends farther. Missing intermediate checkpoints do not truncate
+  the fetch coverage; this coverage is not an admissible resume boundary.
+  Device and Host retain their ordinary candidate phase, which requires every
+  State group and window at the chosen boundary. It uses the same window
+  geometry as prefetch and checks actual cached entries, whether they were
+  published locally or landed from L3, including after a partial landing.
+  The D role probes the Device
   alone and never prefetches. Existence and prefetch are skipped when L3 is
   unset: Host-only and `--disable-kvstore` admission must not hash prefixes
   or copy `group_keys` for a storage index that does not exist. CI covers this
@@ -1175,6 +1192,14 @@ KV groups (`recipes/mamba2.py`).
 Qwen3.5's state groups leave segments free, so its conv windows pack into them
 and KV pages carry no padding; Nemotron-3 Super's state groups fill every
 segment, so its KV pages pad by their share of the conv planes, about 1.5%.
+
+Qwen4-Exp also reuses the attention planes for PLE and QSA groups. A parent
+belongs to one cache group at a time, so these groups do not need separate
+planes reserved in every attention or recurrent-state parent. Compressed QSA
+keeps its exact page stride; PLE and recent QSA state consume the explicit
+strides chosen by the common packer.
+Groups whose fields do not fit the attention planes, or whose exact strides
+require inconsistent packing ratios, retain separate planes.
 
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
@@ -1603,6 +1628,8 @@ including QSA's full-KV, compressed and recent cache groups. Verify-state layer
 ownership and cache addresses come from the bound plan's layer window,
 including under PP and target/draft sharing. Cache recipes reserve verify
 workspace before sizing the arena.
+A Qwen4 PD prefill role retains the target/draft cache layout for transfer,
+but reserves no speculative verify workspace: only the decode role verifies.
 
 Qwen4-Exp selects its cache recipe by model family, including targets with
 only full-attention layers. PLE and QSA fields and their verify budget do

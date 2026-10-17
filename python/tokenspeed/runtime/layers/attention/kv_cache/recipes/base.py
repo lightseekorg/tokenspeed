@@ -132,6 +132,19 @@ class CacheRecipe(ABC):
         )
         self.check_layout(layout)
         specs = tuple(spec for spec, _ in groups)
+        probe_parents = None
+        if self.probe_batch_rows is not None:
+            probe_parents = max(
+                self.probe_batch_rows,
+                self.parents_needed(layout, 1),
+                sum(
+                    -(
+                        -self.probe_batch_rows
+                        // (packing * self._shard_counts[group_id])
+                    )
+                    for group_id, packing in layout.group_packing
+                ),
+            )
         policy = self.offload_policy()
         offload = (
             None
@@ -152,14 +165,10 @@ class CacheRecipe(ABC):
                     2**31 - 1,
                     parent_tokens=self._max_packing(layout) * layout.prefix_granularity,
                 ),
-                probe_lcm_blocks=(
-                    max(self.probe_batch_rows, self.parents_needed(layout, 1))
-                    if self.probe_batch_rows is not None
-                    else None
-                ),
+                probe_lcm_blocks=probe_parents,
             )
-        elif self.probe_batch_rows is not None:
-            num_lcm_blocks = max(self.probe_batch_rows, self.parents_needed(layout, 1))
+        elif probe_parents is not None:
+            num_lcm_blocks = probe_parents
         else:
             num_lcm_blocks = self.num_lcm_blocks(layout)
         memory_plan = layout.bind(num_lcm_blocks)
