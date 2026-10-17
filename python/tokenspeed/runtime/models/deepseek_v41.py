@@ -1720,7 +1720,11 @@ class DeepseekV41Model(nn.Module):
 def _image_mask_from_spans(
     input_ids: torch.Tensor, mm_context: MultimodalForwardContext
 ) -> torch.Tensor:
-    """Mark image spans; InputBuffers may already have clamped hashed IDs."""
+    """Mark image spans; InputBuffers may already have clamped hashed IDs.
+
+    Walks the spans exactly as ``MultimodalEmbedder._plan`` places embeddings,
+    so routing and embedding placement agree; change the two together.
+    """
     mask = torch.zeros_like(input_ids, dtype=torch.bool)
     base = 0
     for mm_input, prefix, length in zip(
