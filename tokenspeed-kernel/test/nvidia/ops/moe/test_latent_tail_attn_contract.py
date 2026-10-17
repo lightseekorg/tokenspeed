@@ -26,8 +26,7 @@ cuda.bindings, which ROCm images do not have.
 """
 
 import pytest
-import torch
-from tokenspeed_kernel.ops.moe.latent_tail import (
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_tail import (
     attn_reduce_shape_supported,
     build_attn_reduce_collective,
 )
@@ -50,7 +49,6 @@ def test_the_attention_builder_asks_for_the_residual_epilogue(
     adding the residual to it. Nothing downstream would raise.
     """
     import tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail as tail_pkg
-    from tokenspeed_kernel.ops.moe.latent_tail import build_attn_reduce_collective
 
     seen = {}
 
@@ -76,7 +74,6 @@ def test_the_attention_builder_asks_for_the_residual_epilogue(
 
 def test_the_attention_shape_probe_declines_instead_of_raising() -> None:
     """The constructor raises inside a rendezvous, so the probe answers first."""
-    from tokenspeed_kernel.ops.moe.latent_tail import attn_reduce_shape_supported
 
     assert attn_reduce_shape_supported(tp_size=8, hidden_size=7168)
     # Cluster width is tp_size here, and the kernel takes powers of two up to 16.

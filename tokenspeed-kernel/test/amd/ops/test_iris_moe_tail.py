@@ -37,7 +37,7 @@ pytestmark = pytest.mark.skipif(not is_amd(), reason="Iris requires AMD ROCm")
 
 @pytest.fixture(autouse=True)
 def _require_iris():
-    pytest.importorskip("tokenspeed_kernel.ops.communication.iris")
+    pytest.importorskip("tokenspeed_kernel.ops.communication._iris")
 
 
 @pytest.mark.parametrize("rank", (0, 7))
@@ -45,11 +45,11 @@ def _require_iris():
 def test_moe_gather_vector_codegen(rank, prefix_is_sharded, tmp_path):
     """Runtime row counts must retain vectorized payload loads and peer stores."""
     from tokenspeed_kernel._triton import gluon, triton
-    from tokenspeed_kernel.ops.communication.iris import (
-        iris_moe_add_push_gather_gluon_kernel,
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
+        iris_k3moe_push_gather,
     )
 
-    fn = iris_moe_add_push_gather_gluon_kernel
+    fn = iris_k3moe_push_gather
     constants = {
         "RANK": rank,
         "BLOCK_ELEMENTS": 2048,
@@ -106,33 +106,32 @@ def _moe_tail_worker(rank: int, port: int) -> None:
 
 
 def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -> None:
-    from tokenspeed_kernel.ops.communication import triton as comm
-    from tokenspeed_kernel.ops.communication.iris import (
-        create_iris_ar_rmsnorm_state,
-        iris_kimi3_moe_tail,
-        iris_moe_add_push_gather_gluon_kernel,
-        iris_moe_reduce_scatter_gluon_kernel,
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
+        prepare_k3_communication,
     )
-    from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_latent_projection_add3
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
+        iris_k3moe_pull_scatter,
+        iris_k3moe_push_gather,
+    )
+    from tokenspeed_kernel.ops.communication.iris import create_iris_ar_rmsnorm_state
+    from tokenspeed_kernel.ops.gemm import kimi3_latent_projection_add3
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
 
-    backing = comm.TritonCommState(
+    k3_state = prepare_k3_communication(
         group=group,
         rank_in_group=rank,
-        world_size=8,
-        device=device,
+        staged_max_numel=0,
+        producer_direct_max_numel=8192 * 10752,
         attnres_max_numel=0,
+        attnres_max_rows=0,
         enable_lamport=True,
-        moe_tail_max_rows=8192,
-        max_numel=0,
-        max_bytes=8192 * 10752 * 2,
-        max_token_num=0,
-        hidden_dim=0,
-        comm_buff=None,
-        symm_mem_hdl=None,
+        sharded_max_rows=8192,
+        dtype=torch.bfloat16,
+        device=device,
+        all_reduce=None,
     )
-    comm.initialize_all_reduce_state(backing, torch.bfloat16)
-    state = comm._get_or_create_iris_state(backing, torch.bfloat16)
+    state = k3_state.all_reduce
+    sharded = k3_state.sharded
     # Check that the shared heap still has room for EAGLE3's reduction state.
     rmsnorm_state = create_iris_ar_rmsnorm_state(
         group=group,
@@ -144,13 +143,13 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
         device=device,
         persistent=False,
     )
-    assert rmsnorm_state._ctx is state._ctx
+    assert rmsnorm_state._ctx is state.peers.ctx
     allocations = (
-        state._input_buf,
-        state._producer_direct_scratch_buf,
-        state._producer_direct_ready_flags,
-        state._moe_tail_output_buf,
-        state._moe_tail_ready_flags,
+        state.producer.data,
+        state.producer_pull.scratch,
+        state.producer_pull.ready_flags,
+        sharded.output,
+        sharded.gather_flags,
     )
     allocation_pointers = tuple(t.data_ptr() for t in allocations)
     generator = torch.Generator(device=device).manual_seed(72391)
@@ -163,16 +162,14 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
     )
 
     def acquire(rows):
-        return comm.acquire_symm_outputs(
-            backing, ((rows, 3584), (rows, 7168)), torch.bfloat16
-        )
+        return state.acquire_outputs(((rows, 3584), (rows, 7168)))
 
     def restore(inputs, sources):
         for destination, source in zip(inputs, sources, strict=True):
             destination.copy_(source)
 
     def ordinary(inputs, prefix, norm_weight):
-        routed, shared = comm.all_reduce_symmetric(backing, inputs)
+        routed, shared = state.all_reduce_symmetric(inputs)
         if norm_weight is not None:
             routed = rmsnorm(routed, norm_weight, 1e-5, residual=None, out=None)
         return kimi3_latent_projection_add3(
@@ -193,18 +190,17 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
         with ExitStack() as stack:
             if prefix_is_sharded in tail_kernels_warmed:
                 for kernel in (
-                    iris_moe_reduce_scatter_gluon_kernel,
-                    iris_moe_add_push_gather_gluon_kernel,
+                    iris_k3moe_pull_scatter,
+                    iris_k3moe_push_gather,
                 ):
                     stack.enter_context(assert_no_triton_compile(kernel))
-            output = iris_kimi3_moe_tail(
+            output = k3_state.moe_tail(
                 *inputs,
                 prefix,
                 weight,
                 prefix_is_sharded=prefix_is_sharded,
                 norm_weight=norm_weight,
                 eps=1e-5 if norm_weight is not None else None,
-                group=group,
             )
         assert output is not None
         tail_kernels_warmed.add(prefix_is_sharded)
@@ -233,7 +229,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
             if rank == rows % 8:
                 torch.cuda._sleep(100_000)
             result = projected(inputs, prefix, norm_weight, prefix_is_sharded=False)
-            assert result.data_ptr() == state._moe_tail_output_buf.data_ptr()
+            assert result.data_ptr() == sharded.output.data_ptr()
             torch.testing.assert_close(result, expected, atol=0.03125, rtol=0.015625)
             output = result.clone()
             for tensor, source in zip(inputs, sources, strict=True):
@@ -297,31 +293,29 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
     inputs = acquire(848)
     restore(inputs, tuple(t[:848] for t in sources))
     prefix = torch.zeros((848, 7168), dtype=torch.bfloat16, device=device)
-    flags_before = state._producer_direct_ready_flags.clone()
-    gather_flags_before = state._moe_tail_ready_flags.clone()
+    flags_before = state.producer_pull.ready_flags.clone()
+    gather_flags_before = sharded.gather_flags.clone()
     inputs_before = tuple(t.clone() for t in inputs)
     unsupported = [
-        (inputs[0].clone(), inputs[1], prefix, norm, 1e-5, group),
-        (inputs[0], inputs[1].clone(), prefix, norm, 1e-5, group),
-        (inputs[0], inputs[1], prefix, norm, 1e-5, dist.group.WORLD),
-        (inputs[0], inputs[1], prefix, norm.float(), 1e-5, group),
-        (inputs[0], inputs[1], prefix, norm, float("nan"), group),
-        (inputs[0], inputs[1], prefix, norm, 0.0, group),
-        (inputs[0], inputs[1], prefix, None, 1e-5, group),
-        (inputs[0], inputs[1], prefix.T.contiguous().T, norm, 1e-5, group),
+        (inputs[0].clone(), inputs[1], prefix, norm, 1e-5),
+        (inputs[0], inputs[1].clone(), prefix, norm, 1e-5),
+        (inputs[0], inputs[1], prefix, norm.float(), 1e-5),
+        (inputs[0], inputs[1], prefix, norm, float("nan")),
+        (inputs[0], inputs[1], prefix, norm, 0.0),
+        (inputs[0], inputs[1], prefix, None, 1e-5),
+        (inputs[0], inputs[1], prefix.T.contiguous().T, norm, 1e-5),
         (
             inputs[0],
             inputs[1],
-            state._input_buf[: 848 * 7168].view(848, 7168),
+            state.producer.data[: 848 * 7168].view(848, 7168),
             norm,
             1e-5,
-            group,
         ),
-        (inputs[0][:-1], inputs[1][:-1], prefix[:-1], norm, 1e-5, group),
+        (inputs[0][:-1], inputs[1][:-1], prefix[:-1], norm, 1e-5),
     ]
-    for routed, shared, residual, norm_weight, eps, owner in unsupported:
+    for routed, shared, residual, norm_weight, eps in unsupported:
         assert (
-            iris_kimi3_moe_tail(
+            k3_state.moe_tail(
                 routed,
                 shared,
                 residual,
@@ -329,13 +323,12 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
                 prefix_is_sharded=False,
                 norm_weight=norm_weight,
                 eps=eps,
-                group=owner,
             )
             is None
         )
-    torch.testing.assert_close(state._producer_direct_ready_flags, flags_before)
+    torch.testing.assert_close(state.producer_pull.ready_flags, flags_before)
     # Reject shifted prefixes and weights that overlap the output.
-    result_buffer = state._moe_tail_output_buf
+    result_buffer = sharded.output
     invalid_aliases = (
         (result_buffer[1:849], weight, norm),
         (result_buffer.flatten()[1 : 848 * 7168 + 1].view(848, 7168), weight, norm),
@@ -344,14 +337,13 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
     )
     for residual, projection, norm_weight in invalid_aliases:
         assert (
-            iris_kimi3_moe_tail(
+            k3_state.moe_tail(
                 *inputs,
                 residual,
                 projection,
                 prefix_is_sharded=False,
                 norm_weight=norm_weight,
                 eps=1e-5,
-                group=group,
             )
             is None
         )
@@ -359,19 +351,18 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
     # owner's push before this rank consumes it, even at the exact base pointer.
     for first_row in (0, rank * (848 // 8)):
         assert (
-            iris_kimi3_moe_tail(
+            k3_state.moe_tail(
                 *inputs,
                 result_buffer[first_row : first_row + 848 // 8],
                 weight,
                 prefix_is_sharded=True,
                 norm_weight=norm,
                 eps=1e-5,
-                group=group,
             )
             is None
         )
-    torch.testing.assert_close(state._producer_direct_ready_flags, flags_before)
-    torch.testing.assert_close(state._moe_tail_ready_flags, gather_flags_before)
+    torch.testing.assert_close(state.producer_pull.ready_flags, flags_before)
+    torch.testing.assert_close(sharded.gather_flags, gather_flags_before)
     for tensor, before in zip(inputs, inputs_before, strict=True):
         torch.testing.assert_close(tensor, before, atol=0, rtol=0)
     # Finish checking flags on every rank before the next collective changes them.
@@ -402,7 +393,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
         other = acquire((1, 48, 520)[iteration % 3])
         for tensor in other:
             tensor.fill_(rank + 1)
-        ordinary_snapshots.extend(comm.all_reduce_symmetric(backing, other))
+        ordinary_snapshots.extend(k3_state.reduce_moe(other))
     torch.cuda.synchronize()
     for scale, output in snapshots:
         torch.testing.assert_close(
@@ -441,8 +432,8 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
             )
     torch.cuda.synchronize()
     dist.barrier()
-    state._producer_direct_ready_flags.fill_(-2)
-    state._moe_tail_ready_flags.fill_(-2)
+    state.producer_pull.ready_flags.fill_(-2)
+    sharded.gather_flags.fill_(-2)
     torch.cuda.synchronize()
     dist.barrier()
     result_graph.replay()
@@ -457,7 +448,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
         restore(inputs, base_sources)
         residual = projected(inputs, residual, norm, prefix_is_sharded=False).clone()
         expected_chain.append(residual.clone())
-    inplace_prefix = state._moe_tail_output_buf[:848]
+    inplace_prefix = sharded.output[:848]
     chain_snapshots = [torch.empty_like(prefix) for _ in range(4)]
     torch.cuda.synchronize()
     dist.barrier()

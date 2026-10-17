@@ -37,9 +37,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
     MambaForwardMetadata,
-    _PrefillCheckpointBatch,
 )
-from tokenspeed.runtime.utils.tensor import upload_packed
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import (
@@ -85,175 +83,28 @@ class CapacityPrefillMetadata(MambaForwardMetadata):
     def prefill_token_extent(self) -> int:
         return self.capacity.token_capacity
 
+    def scrub_padding(self, *tensors: torch.Tensor | None) -> None:
+        """Zero the rows past the live tokens of bucket-shaped inputs.
 
-@dataclass(frozen=True)
-class _CheckpointCapacityBatch(_PrefillCheckpointBatch):
-    """Fixed execution slots, not additional scheduler requests or state blocks.
-
-    ``rows`` and ``body_rows`` map request rows, never cache block IDs.
-    Negative ``tail_state_rows`` keep a dummy tail from replacing body state.
-    ``output_token_sources`` maps original output rows into concatenated
-    body/tail storage; the tail base is the body capacity, not its live length.
-    ``packed_capacity`` is the restored outer output capacity, not the sum of
-    the two scan allocations.
-    """
-
-    packed_capacity: int
-    tail_state_rows: torch.Tensor
-    output_token_sources: torch.Tensor
-
-    @property
-    def output_sources(self) -> torch.Tensor:
-        return self.output_token_sources
-
-    @property
-    def state_update_rows(self) -> torch.Tensor:
-        return self.tail_state_rows
-
-    @property
-    def use_token_views(self) -> bool:
-        # Live body/tail offsets change between replays; Python slices would
-        # freeze their capture-time values. Both scans use the shared packer.
-        return False
-
-    @property
-    def token_extent(self) -> int:
-        return self.packed_capacity
+        The live total changes between replays of one captured shape, so the
+        bound is read from the device boundaries (the last convolution
+        boundary, which the refresh pads with the live total), never from a
+        Python int the capture would freeze.
+        """
+        live_total = self.query_start_loc[-1]
+        for tensor in tensors:
+            if tensor is None:
+                continue
+            rows = torch.arange(tensor.shape[0], device=tensor.device)
+            padding = (rows >= live_total).view(-1, *([1] * (tensor.ndim - 1)))
+            tensor.masked_fill_(padding, 0)
 
 
-def _checkpoint_slot_batch(source, bucket, tail_capacity, num_sequences):
-    """Pad checkpoint execution to the captured request capacity.
-
-    Inactive slots get one zero-input token, never a zero-length native scan.
-    Their token map and state destination are negative, so dummy results cannot
-    escape into request outputs or persistent state. Real cache ownership and
-    checkpoint selection continue to come exclusively from source metadata.
-    """
-    lengths = source.extend_seq_lens_cpu
-    padding = num_sequences - lengths.numel()
-    if padding < 0:
-        raise ValueError("live request count exceeds the captured capacity")
-    live = source.prefill_checkpoint_batch
-    body_lengths = lengths if live is None else live.body_seq_lens_cpu
-    tail_lengths = lengths - body_lengths
-    active = tail_lengths > 0
-    slot_lengths = tail_lengths.clamp_min(1)
-    rows = torch.arange(num_sequences, dtype=torch.int64)
-    starts = source.cu_extend_seq_lens_cpu[:-1]
-
-    def bounds(values):
-        return torch.cat((values.new_zeros(1), values.cumsum(0))).to(torch.int64)
-
-    # Native scans require positive lengths even for unused request slots.
-    # These slots have no source tokens, output rows or cache destinations.
-    body_slots = torch.cat((body_lengths, body_lengths.new_ones(padding)))
-    tail_slots = torch.cat((slot_lengths, slot_lengths.new_ones(padding)))
-    body_bounds, tail_bounds = bounds(body_slots), bounds(tail_slots)
-    PrefillCapacity(bucket, rows.numel()).validate(body_bounds, bucket)
-    PrefillCapacity(tail_capacity, rows.numel()).validate(tail_bounds, tail_capacity)
-
-    def indices(sequence_starts, sequence_lengths, capacity):
-        offsets = torch.arange(int(sequence_lengths.sum()), dtype=torch.int64)
-        offsets -= torch.repeat_interleave(
-            bounds(sequence_lengths)[:-1], sequence_lengths
-        )
-        packed = torch.repeat_interleave(sequence_starts, sequence_lengths) + offsets
-        result = torch.full((capacity,), -1, dtype=torch.int64)
-        result[: packed.numel()] = packed
-        return result
-
-    body_indices = indices(starts, body_lengths, bucket)
-    tail_indices = indices(starts + body_lengths, slot_lengths, tail_capacity)
-    tail_indices[: int(slot_lengths.sum())].masked_fill_(
-        ~torch.repeat_interleave(active, slot_lengths), -1
-    )
-    active = torch.cat((active, active.new_zeros(padding)))
-    starts = torch.cat(
-        (starts, starts.new_full((padding,), int(source.cu_extend_seq_lens_cpu[-1])))
-    )
-    # Build the inverse once with the other host metadata, not once per layer.
-    # Negative sources also make the gather write zero to all bucket padding.
-    output_sources = torch.full((bucket,), -1, dtype=torch.int64)
-    for indices_, offset in ((body_indices, 0), (tail_indices, bucket)):
-        valid = indices_ >= 0
-        output_sources[indices_[valid]] = torch.arange(indices_.numel())[valid] + offset
-    parts = (
-        rows,
-        starts,
-        body_slots,
-        torch.zeros_like(rows),
-        body_indices,
-        body_bounds,
-        tail_indices,
-        tail_bounds,
-        rows.masked_fill(~active, -1),
-        output_sources,
-    )
-    (
-        device_rows,
-        device_starts,
-        checkpoint_lengths,
-        positions,
-        body_indices,
-        body_boundaries,
-        tail_indices,
-        tail_boundaries,
-        state_rows,
-        output_sources,
-    ) = upload_packed(parts, source.query_start_loc.device)
-    if live is not None:
-        positions.index_copy_(0, live.rows, live.checkpoint_positions)
-    return _CheckpointCapacityBatch(
-        rows=device_rows,
-        sequence_starts=device_starts,
-        checkpoint_seq_lens=checkpoint_lengths,
-        checkpoint_positions=positions,
-        body_rows=device_rows,
-        body_token_indices=body_indices,
-        body_query_start_loc=body_boundaries,
-        body_seq_lens_cpu=body_slots,
-        body_cu_seqlens_cpu=body_bounds,
-        tail_token_indices=tail_indices,
-        tail_query_start_loc=tail_boundaries,
-        tail_seq_lens_cpu=tail_slots,
-        tail_cu_seqlens_cpu=tail_bounds,
-        packed_capacity=bucket,
-        tail_state_rows=state_rows,
-        output_token_sources=output_sources,
-    )
-
-
-def _refresh_checkpoint_destinations(target, source):
-    """Refresh existing destination buffers and mask inactive checkpoint slots.
-
-    No live checkpoints clears all destinations, preventing prior page IDs
-    from leaking into this replay. State-group keys, shapes and dtypes must
-    match; incompatible storage raises rather than rebinding captured tensors.
-    """
-    old = target.state_checkpoint_blocks_by_group
-    new = source.state_checkpoint_blocks_by_group
-    if new is not None and old.keys() != new.keys():
-        raise RuntimeError("graph state groups changed without pool rebind")
-    inactive = target.prefill_checkpoint_batch.state_update_rows < 0
-    for group, indices in old.items():
-        if new is None:
-            indices.fill_(-1)
-        else:
-            if (
-                indices.numel() < new[group].numel()
-                or indices.dtype != new[group].dtype
-            ):
-                raise RuntimeError("graph state index geometry changed")
-            indices[: new[group].numel()].copy_(new[group])
-            indices[new[group].numel() :].fill_(-1)
-            indices.masked_fill_(inactive, -1)
-
-
-def _capacity_metadata(source, bucket, tail_capacity):
+def _capacity_metadata(source, bucket):
     """Create an isolated execution snapshot without allocating request state.
 
-    Eager and captured forwards reserve the same checkpoint/tail slots.
-    Startup capture retains the snapshot; uncaptured shapes do not retain it.
+    Eager and captured forwards share the shape. Startup capture retains the
+    snapshot; uncaptured shapes do not retain it.
     """
     capacity = PrefillCapacity(bucket, source.extend_seq_lens_cpu.numel())
     capacity.validate(source.cu_extend_seq_lens_cpu, bucket)
@@ -265,14 +116,6 @@ def _capacity_metadata(source, bucket, tail_capacity):
         },
         capacity=capacity,
     )
-    result.prefill_checkpoint_batch = _checkpoint_slot_batch(
-        source, bucket, tail_capacity, capacity.num_sequences
-    )
-    result.state_checkpoint_blocks_by_group = {
-        group: torch.full_like(indices, -1)
-        for group, indices in source.state_out_blocks_by_group.items()
-    }
-    _refresh_checkpoint_destinations(result, source)
     # Bound total packed work plus one partial block per request. Stable maps
     # are shared across layers and refreshed before replay on its consumer stream.
     result.conv_prefill_metadata = build_causal_conv1d_capacity_metadata(
@@ -304,25 +147,19 @@ def _clone_metadata(value):
     return value
 
 
-def prepare_capacity_prefill_metadata(
-    source, token_capacity, prefix_granularity, target
-):
+def prepare_capacity_prefill_metadata(source, token_capacity, target):
     """Prepare one execution shape, optionally refreshing retained storage.
 
     ``source`` is the scheduler-derived metadata for this forward. Fresh
     execution metadata reserves its positive-length request count. A retained
-    target may have extra request slots: convolution gives them zero length,
-    while each native scan packs one masked dummy token per slot. ``target`` is
-    either a startup-retained view for that shape or None for fresh per-forward storage.
+    target may have extra request slots: convolution gives them zero length
+    and the scan one masked dummy token per slot. ``target`` is either a
+    startup-retained view for that shape or None for fresh per-forward storage.
     No request state is allocated here. Returns the metadata consumed by every
     recurrent layer, without a temporary backend binding or an execution-mode flag.
     """
     if target is None:
-        tail_capacity = min(
-            token_capacity,
-            source.extend_seq_lens_cpu.numel() * max(1, prefix_granularity - 1),
-        )
-        return _capacity_metadata(source, token_capacity, tail_capacity)
+        return _capacity_metadata(source, token_capacity)
     if target.capacity.token_capacity != token_capacity:
         raise ValueError("prefill metadata token capacity changed")
     _refresh_capacity_metadata(target, source)
@@ -333,10 +170,9 @@ def _refresh_capacity_metadata(target, source):
     """Refresh target contents at stable addresses without modifying source.
 
     Run once before all consuming layers, in consumer-stream order; do not
-    overlap a refresh with replay using the same buffers. Checkpoint maps are
-    rebuilt on CPU and uploaded through temporary packed storage before being
-    copied into the target. In-place refresh is not allocation-free or H2D-free.
-    State-group geometry changes raise instead of replacing bound storage.
+    overlap a refresh with replay using the same buffers. In-place refresh is
+    not allocation-free or H2D-free. State-group geometry changes raise
+    instead of replacing bound storage.
     """
     actual_bs = source.extend_seq_lens_cpu.numel()
     capacity = target.capacity
@@ -349,41 +185,35 @@ def _refresh_capacity_metadata(target, source):
         or int(source.cu_extend_seq_lens_cpu[-1]) + padding > capacity.token_capacity
     ):
         raise ValueError("padded requests exceed the captured capacity")
+    live_total = int(source.cu_extend_seq_lens_cpu[-1])
+    # Convolution gives unused request slots no work: repeated boundaries.
+    target.query_start_loc[: actual_bs + 1].copy_(source.query_start_loc)
+    target.query_start_loc[actual_bs + 1 :].fill_(live_total)
+    # The scan needs a positive length per slot: each unused slot scans one
+    # padding row past the live tokens (zeroed by ``scrub_padding`` before
+    # and after the convolution; its output row and final state are dropped).
     for name in (
-        "query_start_loc",
         "scan_query_start_loc",
         "query_start_loc_int64",
-        "extend_seq_lens_cpu",
         "cu_extend_seq_lens_cpu",
     ):
         old, new = getattr(target, name), getattr(source, name)
-        old[: new.numel()].copy_(new)
-        # Repeated boundaries give convolution no work for unused requests.
-        # Body/tail scans use their separate positive-length packed boundaries.
-        pad_value = (
-            0
-            if name == "extend_seq_lens_cpu"
-            else int(source.cu_extend_seq_lens_cpu[-1])
+        old[: actual_bs + 1].copy_(new)
+        # Built where the target lives: no pageable H2D copy on the forward thread.
+        torch.arange(
+            live_total + 1,
+            live_total + padding + 1,
+            dtype=old.dtype,
+            device=old.device,
+            out=old[actual_bs + 1 :],
         )
-        old[new.numel() :].fill_(pad_value)
+    target.extend_seq_lens_cpu[:actual_bs].copy_(source.extend_seq_lens_cpu)
+    target.extend_seq_lens_cpu[actual_bs:].fill_(1)
     refresh_causal_conv1d_capacity_metadata(
         target.query_start_loc,
         target.conv_prefill_metadata,
         target.capacity.token_capacity,
     )
-    checkpoint = target.prefill_checkpoint_batch
-    if checkpoint is not None:
-        live = _checkpoint_slot_batch(
-            source,
-            target.capacity.token_capacity,
-            checkpoint.tail_token_indices.numel(),
-            capacity.num_sequences,
-        )
-        for field in fields(_CheckpointCapacityBatch):
-            old, new = getattr(checkpoint, field.name), getattr(live, field.name)
-            if isinstance(old, torch.Tensor):
-                old.copy_(new)
-        _refresh_checkpoint_destinations(target, source)
     for name in (
         "state_in_blocks_by_group",
         "state_out_blocks_by_group",
@@ -478,9 +308,7 @@ class CapacityPrefillBackend(MambaAttnBackend):
         actual_bs = source.extend_seq_lens_cpu.numel()
         if actual_bs > bs or (actual_bs != bs and (capture or retained is None)):
             raise ValueError("request padding requires an existing captured capacity")
-        target = prepare_capacity_prefill_metadata(
-            source, token_capacity, self._prefix_granularity, retained
-        )
+        target = prepare_capacity_prefill_metadata(source, token_capacity, retained)
         if capture:
             # Only startup grows retained storage; serving never captures.
             self._prefill_metadata[key] = target

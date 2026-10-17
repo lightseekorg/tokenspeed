@@ -27,11 +27,20 @@ the drafts plus the anchor row.
 
 from __future__ import annotations
 
+import json
+import logging
+import os
+import re
 from typing import Any
+
+from huggingface_hub import hf_hub_download
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "BLOCK_SPEC_ALGORITHMS",
     "BLOCK_SPEC_RULES",
+    "count_dspark_stages",
     "read_checkpoint_block_size",
     "resolve_block_widths",
     "validate_block_widths",
@@ -51,6 +60,48 @@ _BLOCK_SIZE_KEYS = ("dspark_block_size", "block_size")
 _NESTED_CONFIG_KEYS = ("dflash_config", "dspark_config")
 #: Rows the checkpoint's block_size counts beyond the drafted tokens.
 _STEP_OFFSET = {"DSPARK": 0, "DFLASH": 1}
+
+
+def count_dspark_stages(
+    model_path: str,
+    revision: str | None = None,
+) -> int | None:
+    """Count contiguous ``mtp.<stage>`` namespaces in a safetensors index."""
+
+    index_filename = "model.safetensors.index.json"
+    if os.path.isdir(model_path):
+        index_path = os.path.join(model_path, index_filename)
+    else:
+        try:
+            index_path = hf_hub_download(
+                repo_id=model_path,
+                filename=index_filename,
+                revision=revision,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed below
+            logger.debug(
+                f"Unable to resolve DSpark safetensors index for {model_path!s}: "
+                f"{exc!s}",
+            )
+            return None
+    if not os.path.isfile(index_path):
+        return None
+    with open(index_path, encoding="utf-8") as handle:
+        weight_map = json.load(handle).get("weight_map", {})
+    stages = {
+        int(match.group(1))
+        for name in weight_map
+        if (match := re.match(r"^mtp\.(\d+)\.(.+)$", name))
+    }
+    if not stages:
+        return None
+    expected = set(range(max(stages) + 1))
+    if stages != expected:
+        raise ValueError(
+            "DSpark checkpoint stages must be contiguous from zero; "
+            f"found {sorted(stages)}."
+        )
+    return len(stages)
 
 
 def read_checkpoint_block_size(*configs: Any) -> int | None:

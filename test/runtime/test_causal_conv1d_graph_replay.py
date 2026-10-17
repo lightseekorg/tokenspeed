@@ -11,8 +11,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
-
-from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+from tokenspeed_kernel.ops.conv._triton.causal_conv1d import (
     _causal_conv1d_fwd_kernel,
 )
 

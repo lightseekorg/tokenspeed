@@ -123,6 +123,8 @@ class LlamaAttention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         qkv_input_size: int | None = None,
+        *,
+        sliding_window_size: int,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -190,6 +192,7 @@ class LlamaAttention(nn.Module):
             self.head_dim**-0.5,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            sliding_window_size=sliding_window_size,
             rotary_emb=self.rotary_emb,
             qk_norm=None,
         )
@@ -237,6 +240,7 @@ class LlamaDecoderLayer(BaseDecoderLayer):
             layer_id=self.layer_id,
             quant_config=self.quant_config,
             prefix=add_prefix("self_attn", prefix),
+            sliding_window_size=-1,
         )
 
     def resolve_mlp(self, prefix: str) -> nn.Module:

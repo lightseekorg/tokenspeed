@@ -22,8 +22,8 @@
 """K3 fused skinny-add3 correctness and capture-safety contracts."""
 
 import pytest
+import tokenspeed_kernel.ops.gemm as kimi3
 import torch
-from tokenspeed_kernel.ops.gemm import kimi3
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cute_dsl import skinny_gemm
 

@@ -290,6 +290,69 @@ def load_per_tensor_weight_scale(
         raise ValueError(f"Unknown shard_id: {shard_id}")
 
 
+def load_channel_weight_scale(
+    param: torch.nn.Parameter,
+    loaded_weight: torch.Tensor,
+    shard_id: str | None = None,
+    local_expert_id: int | None = None,
+    *,
+    tp_rank: int,
+    tp_size: int,
+    param_name: str = "expert weight scale",
+    use_presharded_weights: bool = False,
+) -> None:
+    """Load one projection's scales into ``[experts, 2 * ispp]`` (w13) or
+    ``[experts, hidden]`` (w2) FP32 scales per output channel.
+
+    ``loaded_weight`` holds one scale per output channel (``[N, 1]`` or
+    ``[N]``) or one per tensor (one value, which fills the projection's
+    channels on every rank). Gate (``w1``) and up (``w3``) fill the first and
+    second half of w13's channels: ``tp_size * ispp`` of them, of which each
+    rank takes its partition as ``load_w13`` does for the weight rows (``ispp``
+    when presharded). ``w2``'s channels are the hidden size, which tensor
+    parallelism does not split: every rank holds all of them. Any other count
+    is refused. The values convert exactly to FP32 (from BF16, FP16, FP32 or
+    FP8 E4M3).
+
+    A tensor that holds every expert's scales at once (stacked or fused, such
+    as ``[experts, N, 1]``) is refused: it comes without ``shard_id`` and
+    ``local_expert_id``, and this loader does not split it.
+    """
+    stacked = loaded_weight.dim() > 2 or (
+        loaded_weight.dim() == 2 and loaded_weight.shape[1] != 1
+    )
+    if shard_id is None or local_expert_id is None or stacked:
+        raise ValueError(
+            f"{param_name}: got one scale tensor of shape "
+            f"{tuple(loaded_weight.shape)} for shard_id={shard_id!r}, "
+            f"local_expert_id={local_expert_id!r}. FP8 per-channel experts load "
+            f"one projection of one expert at a time ([N, 1], [N] or one value); "
+            f"stacked or fused expert scales such as [experts, N, 1] are not "
+            f"supported yet."
+        )
+    scale = loaded_weight.reshape(-1)
+    expert = param.data[local_expert_id]
+    if shard_id == "w2":
+        dst, channels = expert, expert.shape[0]
+    elif shard_id in {"w1", "w3"}:
+        size = expert.shape[0] // 2
+        dst = expert.narrow(0, 0 if shard_id == "w1" else size, size)
+        channels = size if use_presharded_weights else size * tp_size
+    else:
+        raise ValueError(f"Unknown shard_id: {shard_id}")
+    if scale.numel() == 1:
+        dst.copy_(scale.expand(dst.shape[0]))
+        return
+    if scale.numel() != channels:
+        raise ValueError(
+            f"{shard_id} scales per output channel: expected {channels}, got "
+            f"{tuple(loaded_weight.shape)}"
+        )
+    if channels != dst.shape[0]:
+        scale = scale.narrow(0, dst.shape[0] * tp_rank, dst.shape[0])
+    dst.copy_(scale)
+
+
 def load_per_tensor_input_scale(
     param: torch.nn.Parameter,
     loaded_weight: torch.Tensor,
@@ -298,6 +361,41 @@ def load_per_tensor_input_scale(
 ) -> None:
     value = loaded_weight.detach().to(torch.float32).amax().to(param.device)
     torch.maximum(param.data, value, out=param.data)
+
+
+def load_per_expert_input_scale(
+    param: torch.nn.Parameter,
+    loaded_weight: torch.Tensor,
+    shard_id: str,
+    local_expert_id: int | None,
+) -> None:
+    """Keep one activation scale per expert, broadcasting a checkpoint that ships one.
+
+    Checkpoints that ship a scalar scale per expert load it once per expert
+    with ``local_expert_id=None``; accumulate the running maximum so every
+    expert uses the global maximum, matching ``load_per_tensor_input_scale``.
+
+    Args:
+        param: The layer's ``[num_local_experts]`` activation scale.
+        loaded_weight: A scalar, or one scale per expert.
+        shard_id: Unused; the scale covers the whole projection.
+        local_expert_id: Expert this scale belongs to, or None when the tensor
+            already covers every local expert.
+    """
+    del shard_id
+    value = loaded_weight.detach().to(dtype=torch.float32, device=param.device)
+    if local_expert_id is not None:
+        param.data[local_expert_id] = value.amax()
+        return
+    if value.numel() == 1:
+        torch.maximum(param.data, value, out=param.data)
+        return
+    if value.numel() != param.data.numel():
+        raise ValueError(
+            f"expected one activation scale per expert, got {value.numel()} "
+            f"for {param.data.numel()} experts"
+        )
+    param.data.copy_(value.reshape(param.data.shape))
 
 
 def make_weight_loader(
@@ -314,6 +412,17 @@ def make_weight_loader(
         use_presharded_weights=use_presharded_weights,
         do_transpose=do_transpose,
         tp_size=spec.tp_size,
+    )
+
+
+def make_channel_scale_loader(
+    spec: MoELayerSpec, param_name: str = "expert weight scale"
+) -> Callable:
+    return partial(
+        load_channel_weight_scale,
+        tp_rank=spec.tp_rank,
+        tp_size=spec.tp_size,
+        param_name=f"{spec.prefix}.{param_name}",
     )
 
 
@@ -335,8 +444,10 @@ def round_up(value: int, multiple: int) -> int:
 
 
 __all__ = [
+    "load_channel_weight_scale",
     "load_per_tensor_input_scale",
     "load_per_tensor_weight_scale",
+    "make_channel_scale_loader",
     "make_group_scale_loader",
     "make_weight_loader",
     "round_up",

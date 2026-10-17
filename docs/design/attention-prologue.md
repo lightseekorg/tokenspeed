@@ -35,6 +35,10 @@ Typed holders carry each optional step: `HeadNorm`, `Rotary` (with `MRope`),
 In the runtime, a layer states its steps once: `PagedAttention(...,
 rotary_emb=..., qk_norm=...)`, with `None` for a step the layer skips.
 `PagedAttention.forward` runs a GQA layer's prologue before core attention.
+When a projection or collective has already applied the same head-step numerics,
+`PagedAttention.store_prepared` uses `gqa_prologue` with no norm or rotary step.
+The prologue still owns slot selection and KV conversion/writes; the returned
+query/key rows need no additional copy in the Triton solution.
 Flows that dispatch core attention themselves call `PagedAttention.prologue`
 (GQA) or `PagedAttention.latent_prologue` (MLA). Passing `k = v = None` means
 that `prologue`/`latent_prologue` call has prepared the inputs and written
@@ -156,6 +160,12 @@ extend span, then a MIXED round's decode rows, then the dummy slot 0 for the
 padding. Per-mode callers, such as MLA models that split a MIXED round, keep
 using `write_locations`.
 
+Sparse KV offloading keeps `write_locations` as the authoritative-history
+accessor. Before the latent write, the caller supplies selection and positions
+to `prepare_sparse_kv_access`. The router's `forward_write_locations` and
+`padded_write_locations` then expose the prepared hot
+slots to the prologue. Index-K continues to address history directly.
+
 A pool describes its destination with `kv_write_target(layer_id, slots,
 write_mask)`: buffers, scale planes and whether the write sanitizes. Pools do
 not override the prologue's write.
@@ -233,9 +243,22 @@ step writes every row itself and skips the pre-break prologue.
 
 ## Formats and scales
 
-KV caches run at unit scale. `require_unit_kv_scales` rejects a checkpoint KV
-scale other than one. `require_unit_kv_scale_file` does the same for an
-FP8 KV cache's `--quantization-param-path`. No layer carries a KV scale.
+KV caches run at unit scale unless the checkpoint gives a GQA layer per-tensor
+KV-cache scales. The startup loader takes every scale other than one out of the
+weight stream and hands them to the model's `load_kv_cache_scales`, which puts
+each on its layer's `PagedAttention` (`load_kv_cache_scale`); a model without
+that method refuses them. Weight updates drop scale tensors, rejecting one
+other than one, so a loaded scale never changes. `require_unit_kv_scale_file`
+rejects a `--quantization-param-path` scale other than one.
+
+An FP8 cache of a scaled layer holds `K / k_scale` and `V / v_scale` saturated
+to e4m3's range: the layer passes `FP8TensorScales` as the write target's
+`scales` (format `fp8_per_tensor`, which the Triton solution writes). Every
+reader must apply them, so the layer refuses a backend whose
+`reads_fp8_kv_scales` is false. The MHA leaf reads through kernels that declare
+the `scaled-fp8` cache signature: trtllm-gen folds `k_scale` into the logit
+scale and `v_scale` into the output's. A cache of another dtype ignores the
+scales. MLA caches run at unit scale.
 
 An MLA layer reads its query in the activation dtype, except that an FP8
 latent cache gets an FP8 query, and FP8 expanded keys and values, whichever MLA
@@ -284,7 +307,7 @@ returns per-head keys and values.
 | Solution | Kernel | Covers |
 | --- | --- | --- |
 | `triton` | one launch that also assembles the query | absorbed, dense cache, full write, up to 32768 token-heads |
-| `composite` | `embedding.rope` or `embedding.rope_mla`, then the latent store | everything on AMD and NVIDIA; its latent store needs `kv_lora_rank` a multiple of 256 below 512 written rows and a power of two above (every in-tree MLA model uses 512); the only solution of the store-less form (`cache=None`, trait `store=False`), whose returned latent `latent_store(latent, kv_lora_rank=, cache=)` writes into a native cache |
+| `composite` | `embedding.rope` or `embedding.rope_mla`, then the latent store | everything on AMD and NVIDIA; Ascend BF16 native absorbed and expanded writes; its latent store needs `kv_lora_rank` a multiple of 256 below 512 written rows and a power of two above (every in-tree MLA model uses 512); the only solution of the store-less form (`cache=None`, trait `store=False`), whose returned latent `latent_store(latent, kv_lora_rank=, cache=)` writes into a native cache |
 
 ## Adding a fused kernel
 

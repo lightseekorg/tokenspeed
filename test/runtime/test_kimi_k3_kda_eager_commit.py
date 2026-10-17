@@ -108,7 +108,9 @@ class _Harness:
     def prepare_metadata(self, rpis, pages, seq_lens):
         bs = len(rpis)
         tables = {
-            group_id: np.asarray([[page] for page in pages[group_id]], dtype=np.int32)
+            group_id: np.asarray(
+                [[0, page] for page in pages[group_id]], dtype=np.int32
+            )
             for group_id in _STATE_GROUPS
         }
         delivered = _tables_for(self.contract, tables, DEV)
@@ -442,7 +444,7 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
     req_pool_indices = torch.tensor(rpis, dtype=torch.int32, device=DEV)
     seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32, device=DEV)
     capture_tables = {
-        group_id: torch.full((bs, 1), -1, dtype=torch.int32, device=DEV)
+        group_id: torch.full((bs, 2), -1, dtype=torch.int32, device=DEV)
         for group_id in _STATE_GROUPS
     }
     captured.backend.init_forward_metadata_capture_cuda_graph(
@@ -476,7 +478,9 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
     accepts = ([1, T], [T, 1], [2, T])
     for round_index, accepted in enumerate(accepts):
         tables = {
-            group_id: np.asarray([[page] for page in pages[group_id]], dtype=np.int32)
+            group_id: np.asarray(
+                [[0, page] for page in pages[group_id]], dtype=np.int32
+            )
             for group_id in _STATE_GROUPS
         }
         delivered = _tables_for(captured.contract, tables, DEV)
@@ -510,7 +514,7 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
     # Negative control: replaying the next round without the required
     # post-forward commit must diverge from the multi-round eager oracle.
     tables = {
-        group_id: np.asarray([[page] for page in pages[group_id]], dtype=np.int32)
+        group_id: np.asarray([[0, page] for page in pages[group_id]], dtype=np.int32)
         for group_id in _STATE_GROUPS
     }
     delivered = _tables_for(captured.contract, tables, DEV)
@@ -822,26 +826,23 @@ def test_a_rejected_hybrid_rebind_publishes_nothing():
     hybrid = HybridLinearAttnBackend(full, harness.backend, [])
     hybrid.set_cache_pool(harness.pool)
 
-    contract = harness.pool.arena.runtime_contract
+    first_layer = harness.backend._state_layer_ids()[0]
+    recurrent = harness.pool.get_component(first_layer, "recurrent_state")
+    widened = torch.zeros(
+        (recurrent.shape[0], recurrent.shape[1] * 2, *recurrent.shape[2:]),
+        dtype=recurrent.dtype,
+        device=recurrent.device,
+    )
+
+    def get_component(layer_id, name):
+        if layer_id == first_layer and name == "recurrent_state":
+            return widened
+        return harness.pool.get_component(layer_id, name)
+
     coarser = SimpleNamespace(
-        arena=SimpleNamespace(
-            runtime_contract=SimpleNamespace(
-                group_specs=tuple(
-                    (
-                        SimpleNamespace(
-                            group_id=spec.group_id,
-                            family=spec.family,
-                            checkpoint_granularity=2 * spec.checkpoint_granularity,
-                        )
-                        if spec.family == "state"
-                        else spec
-                    )
-                    for spec in contract.group_specs
-                )
-            )
-        ),
+        arena=harness.pool.arena,
         state_group_by_layer=harness.pool.state_group_by_layer,
-        get_component=harness.pool.get_component,
+        get_component=get_component,
     )
     with pytest.raises(RuntimeError, match="different state geometry"):
         hybrid.set_cache_pool(coarser)

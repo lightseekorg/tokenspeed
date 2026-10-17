@@ -21,7 +21,8 @@
 import asyncio
 import os
 import sys
-import unittest
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -40,7 +41,8 @@ class _RecordingSender:
         self.sent.append(obj)
 
 
-class TestWatchingCommunicator(unittest.IsolatedAsyncioTestCase):
+class TestWatchingCommunicator:
+    @pytest.mark.asyncio(loop_scope="function")
     async def test_overlapping_watchers_share_one_complete_result(self):
         sender = _RecordingSender()
         communicator = _Communicator(sender, fan_out=2, mode="watching")
@@ -48,19 +50,20 @@ class TestWatchingCommunicator(unittest.IsolatedAsyncioTestCase):
         first = asyncio.create_task(communicator("request"))
         second = asyncio.create_task(communicator("request"))
         await asyncio.sleep(0)
-        self.assertEqual(sender.sent, ["request"])
+        assert (sender.sent) == (["request"])
 
         communicator.handle_recv({"rank": 0})
-        self.assertFalse(first.done())
-        self.assertFalse(second.done())
+        assert not (first.done())
+        assert not (second.done())
         communicator.handle_recv({"rank": 1})
 
         first_result, second_result = await asyncio.gather(first, second)
-        self.assertEqual(first_result, [{"rank": 0}, {"rank": 1}])
-        self.assertEqual(second_result, first_result)
-        self.assertIsNot(first_result, second_result)
-        self.assertIsNot(first_result[0], second_result[0])
+        assert (first_result) == ([{"rank": 0}, {"rank": 1}])
+        assert (second_result) == (first_result)
+        assert (first_result) is not (second_result)
+        assert (first_result[0]) is not (second_result[0])
 
+    @pytest.mark.asyncio(loop_scope="function")
     async def test_cancelled_watcher_does_not_cancel_other_watcher_or_reuse(self):
         sender = _RecordingSender()
         communicator = _Communicator(sender, fan_out=2, mode="watching")
@@ -69,26 +72,21 @@ class TestWatchingCommunicator(unittest.IsolatedAsyncioTestCase):
         survivor = asyncio.create_task(communicator("first request"))
         await asyncio.sleep(0)
         cancelled.cancel()
-        with self.assertRaises(asyncio.CancelledError):
+        with pytest.raises((asyncio.CancelledError)):
             await cancelled
 
         communicator.handle_recv({"rank": 0})
         communicator.handle_recv({"rank": 1})
-        self.assertEqual(
-            await survivor,
-            [{"rank": 0}, {"rank": 1}],
-        )
+        assert (await survivor) == ([{"rank": 0}, {"rank": 1}])
 
         reused = asyncio.create_task(communicator("second request"))
         await asyncio.sleep(0)
-        self.assertEqual(sender.sent, ["first request", "second request"])
+        assert (sender.sent) == (["first request", "second request"])
         communicator.handle_recv({"rank": 0, "flight": 2})
         communicator.handle_recv({"rank": 1, "flight": 2})
-        self.assertEqual(
-            await reused,
-            [{"rank": 0, "flight": 2}, {"rank": 1, "flight": 2}],
-        )
+        assert (await reused) == ([{"rank": 0, "flight": 2}, {"rank": 1, "flight": 2}])
 
+    @pytest.mark.asyncio(loop_scope="function")
     async def test_cancelled_sole_watcher_preserves_and_drains_active_flight(self):
         sender = _RecordingSender()
         communicator = _Communicator(sender, fan_out=2, mode="watching")
@@ -96,29 +94,23 @@ class TestWatchingCommunicator(unittest.IsolatedAsyncioTestCase):
         cancelled = asyncio.create_task(communicator("first request"))
         await asyncio.sleep(0)
         cancelled.cancel()
-        with self.assertRaises(asyncio.CancelledError):
+        with pytest.raises((asyncio.CancelledError)):
             await cancelled
 
         observer = asyncio.create_task(communicator("duplicate request"))
         await asyncio.sleep(0)
-        self.assertEqual(sender.sent, ["first request"])
+        assert (sender.sent) == (["first request"])
         communicator.handle_recv({"rank": 0})
         communicator.handle_recv({"rank": 1})
-        self.assertEqual(
-            await observer,
-            [{"rank": 0}, {"rank": 1}],
-        )
+        assert (await observer) == ([{"rank": 0}, {"rank": 1}])
 
         fresh = asyncio.create_task(communicator("fresh request"))
         await asyncio.sleep(0)
-        self.assertEqual(sender.sent, ["first request", "fresh request"])
+        assert (sender.sent) == (["first request", "fresh request"])
         communicator.handle_recv({"rank": 0, "flight": 2})
         communicator.handle_recv({"rank": 1, "flight": 2})
-        self.assertEqual(
-            await fresh,
-            [{"rank": 0, "flight": 2}, {"rank": 1, "flight": 2}],
-        )
+        assert (await fresh) == ([{"rank": 0, "flight": 2}, {"rank": 1, "flight": 2}])
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

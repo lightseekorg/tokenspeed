@@ -6,8 +6,8 @@ via the /v1/chat/completions API with known prompts and expected content.
 
 Usage:
     cd test/runtime
-    python3 -m unittest models.test_gpt_oss -v
-    python3 -m unittest models.test_gpt_oss.TestGptOss.test_pure_tp -v
+    python3 -m pytest models/test_gpt_oss.py -v
+    python3 -m pytest models/test_gpt_oss.py::TestGptOss::test_pure_tp -v
 
 Environment (all optional):
     GPT_OSS_MODEL       model path  (default: openai/gpt-oss-120b)
@@ -19,9 +19,8 @@ import os
 import subprocess
 import sys
 import time
-import unittest
-from typing import Optional
 
+import pytest
 import requests
 
 from tokenspeed.runtime.utils.process import kill_process_tree
@@ -194,24 +193,26 @@ MESH_CASES = {
 # ── Tests ────────────────────────────────────────────────────────────
 
 
-class TestGptOss(unittest.TestCase):
+class TestGptOss:
 
     def _run_quality_checks(self, case: MeshCase):
         port = _next_server_port()
         proc = _serve_server(port, case.extra_args)
         try:
             if not _wait_for_server(port):
-                self.fail(f"[{case.name}] Server did not start within {TIMEOUT}s")
+                _pytest_msg_1 = f"[{case.name}] Server did not start within {TIMEOUT}s"
+                assert False, _pytest_msg_1
 
             for i, q in enumerate(QUALITY_CHECKS):
                 data = _chat(port, q["messages"], max_tokens=q["max_tokens"])
                 content = data["choices"][0]["message"]["content"]
-                self.assertIn(
-                    q["expected"],
-                    content,
+                _pytest_member_2 = q["expected"]
+                _pytest_container_3 = content
+                _pytest_msg_4 = (
                     f"[{case.name}] check {i}: "
-                    f'expected {q["expected"]!r} in {content!r}',
+                    f'expected {q["expected"]!r} in {content!r}'
                 )
+                assert _pytest_member_2 in _pytest_container_3, _pytest_msg_4
         finally:
             kill_process_tree(proc.pid)
 
@@ -232,4 +233,4 @@ class TestGptOss(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

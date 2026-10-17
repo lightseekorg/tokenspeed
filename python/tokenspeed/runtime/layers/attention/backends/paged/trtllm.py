@@ -224,7 +224,17 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # extend_seq_lens_cpu holds those new-token counts in either case.
         max_seq_len_q = int(extend_seq_lens_cpu[:prefill_bs].max().item())
 
-        if extend_with_prefix and bool(extend_prefix_lens_cpu[:prefill_bs].any()):
+        if prefill_bs > num_extends:
+            # A target MIXED round: each decode request after the extend
+            # requests queries only its spec_num_tokens new rows (1 without
+            # speculation) at the end of its cache, as in a decode step.
+            q_lens = seq_lens.new_full((prefill_bs,), self.spec_num_tokens)
+            q_lens[:num_extends] = extend_seq_lens[:num_extends]
+            cu_seqlens_q = torch.nn.functional.pad(
+                torch.cumsum(q_lens, dim=0, dtype=torch.int32), (1, 0)
+            )
+            max_seq_len_q = max(max_seq_len_q, self.spec_num_tokens)
+        elif extend_with_prefix and bool(extend_prefix_lens_cpu[:prefill_bs].any()):
             extend_lens = seq_lens[:prefill_bs] - extend_prefix_lens[:prefill_bs]
             cu_seqlens_q = torch.nn.functional.pad(
                 torch.cumsum(extend_lens, dim=0, dtype=torch.int32), (1, 0)
@@ -326,6 +336,18 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
 
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs])
         self.page_table_buf[:bs].copy_(page_table[:bs])
+        self.publish_decode_metadata(bs, seq_lens, num_extends=num_extends)
+
+    def decode_buffer_targets(
+        self, bs: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if self.block_decode_active:
+            return None
+        return self.seq_lens_buf[:bs], self.page_table_buf[:bs]
+
+    def publish_decode_metadata(
+        self, bs: int, seq_lens: torch.Tensor, *, num_extends: int
+    ) -> None:
         self.forward_decode_metadata = self._decode_views(bs)
         # Pure verify (and the draft's multi-token step 1) reads the prefill
         # slot. An extend/mixed draft refresh only seeds later decode steps and

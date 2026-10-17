@@ -24,6 +24,7 @@ import logging
 import os
 from collections import deque
 from collections.abc import Mapping
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -86,6 +87,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     make_spec,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.types import MAX_STOP_TOKEN_IDS
 from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
 from tokenspeed.runtime.moe.expert_location import (
     EXPERT_LOAD_RECORD_SUFFIX,
@@ -120,6 +122,7 @@ _WEIGHT_OPS: tuple[tuple[type, type], ...] = (
     (DestroyWeightsUpdateGroupReqInput, DestroyWeightsUpdateGroupReqOutput),
     (UpdateWeightsFromMooncakeReqInput, UpdateWeightsFromMooncakeReqOutput),
     (RebalanceExpertsReqInput, RebalanceExpertsReqOutput),
+    (UpdateWeightFromDiskReqInput, UpdateWeightFromDiskReqOutput),
 )
 _WEIGHT_OP_CODES: dict[type, int] = {
     req_type: code for code, (req_type, _) in enumerate(_WEIGHT_OPS, start=1)
@@ -130,6 +133,7 @@ _WEIGHT_OP_OUTPUTS: dict[type, type] = dict(_WEIGHT_OPS)
 _WEIGHT_LOAD_OPS = (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromMooncakeReqInput,
+    UpdateWeightFromDiskReqInput,
 )
 # Internal control ops: the online expert rebalance's steps, enqueued by the
 # engine itself at rank-identical rounds (``enqueue_internal_op``) and
@@ -328,8 +332,12 @@ class RequestHandler:
             [(ProfileReq, self.profile)]
         )
 
+        # The grammar ends on the ids the engine stops on.
         self.grammar_manager = GrammarManager(
-            self.server_args, self.tokenizer, self.vocab_size
+            self.server_args,
+            self.tokenizer,
+            self.vocab_size,
+            stop_token_ids=self.hf_eos_token_id,
         )
 
         self.init_profiler()
@@ -430,25 +438,16 @@ class RequestHandler:
                     )
                 else:
                     self._pending_weight_ops.append(recv_req)
-            # The in-engine RL control app refuses these two sources up front
+            # The in-engine RL control app refuses this source up front
             # (SUPPORTED_WEIGHT_UPDATE_SOURCES in io_struct, also advertised to
-            # gateways as rl.update_from); keep that set in step with the load
-            # branches above.
+            # gateways as rl.update_from); keep that set in step with
+            # _WEIGHT_LOAD_OPS.
             elif isinstance(recv_req, UpdateWeightsFromTensorReqInput):
                 self.send_func.send_pyobj(
                     UpdateWeightsFromTensorReqOutput(
                         success=False,
                         message="update_weights_from_tensor is not supported on "
                         "this engine",
-                    )
-                )
-            elif isinstance(recv_req, UpdateWeightFromDiskReqInput):
-                self.send_func.send_pyobj(
-                    UpdateWeightFromDiskReqOutput(
-                        success=False,
-                        message="update_weights_from_disk is not supported on "
-                        "this engine",
-                        num_paused_requests=0,
                     )
                 )
             else:
@@ -501,7 +500,7 @@ class RequestHandler:
         objects remain and can be restored for incompatible weights.
         """
 
-        storage_backend = getattr(self.server_args, "kvstore_storage_backend", None)
+        storage_backend = self.server_args.kvstore_storage_backend
         if (
             storage_backend is None
             or not recv_req.flush_cache
@@ -520,7 +519,7 @@ class RequestHandler:
         as if they belonged to the new weights.
         """
 
-        storage_backend = getattr(self.server_args, "kvstore_storage_backend", None)
+        storage_backend = self.server_args.kvstore_storage_backend
         if storage_backend is None or recv_req.flush_cache:
             return True, ""
         version = resolve_l3_weight_version(
@@ -760,7 +759,7 @@ class RequestHandler:
             self.server_args.weight_version,
             _requested_weight_version(recv_req),
             flush_cache=recv_req.flush_cache,
-            storage_backend=getattr(self.server_args, "kvstore_storage_backend", None),
+            storage_backend=self.server_args.kvstore_storage_backend,
         )
         if version is None:
             return True, msg
@@ -834,6 +833,7 @@ class RequestHandler:
             )
 
         self._refuse_unsupported_input_logprobs(req_state)
+        self._refuse_too_many_stop_token_ids(req_state)
         self._apply_generation_budget(req_spec, req_state)
         return (
             req_spec,
@@ -853,6 +853,23 @@ class RequestHandler:
                 "Invalid request: prompt logprobs (logprob_start_len) are not "
                 "available with --lm-head-tp-size > 1 under attention DP"
             )
+
+    def _refuse_too_many_stop_token_ids(self, req_state) -> None:
+        """Finish a request with a client error when its stop tokens -- its
+        own ``stop_token_ids`` and the model's EOS ids -- do not fit the
+        device's per-request stop table (``MAX_STOP_TOKEN_IDS``)."""
+        if len(req_state.stop_token_ids) <= MAX_STOP_TOKEN_IDS:
+            return
+        model_ids = req_state.stop_token_ids - set(
+            req_state.sampling_params.stop_token_ids or ()
+        )
+        req_state.finished_reason = FINISH_ABORT(
+            f"Invalid request: {len(req_state.stop_token_ids)} stop token ids "
+            f"exceed the limit of {MAX_STOP_TOKEN_IDS}, which includes the "
+            f"model's {len(model_ids)} EOS ids; pass at most "
+            f"{MAX_STOP_TOKEN_IDS - len(model_ids)} other stop_token_ids",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
     def _apply_generation_budget(self, req_spec, req_state) -> None:
         """Clamp ``max_new_tokens`` to the context and declare it to the

@@ -131,6 +131,8 @@ def _triton_backend_unavailable(cause: Exception) -> NoReturn:
 
 @functools.cache
 def get_available_device() -> str:
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return "npu"
     try:
         return triton.runtime.driver.active.get_current_target().backend
     except Exception as e:

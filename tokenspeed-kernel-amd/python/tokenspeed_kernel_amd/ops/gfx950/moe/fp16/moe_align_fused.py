@@ -35,7 +35,7 @@ atomics). One kernel:
   * ``gl.gather`` of the per-expert block offset + scatter each slot to
     ``block_off[e]*block_m + rank``.
 
-Sync-free: outputs sized at the compile-time bound ``EM_MAX = (M*topk)*block_m``;
+Sync-free: outputs sized at the bound ``EM_MAX = (M*topk)*block_m``;
 ``num_valid`` (real EM) is on-device and the GEMM stages early-out on the padded
 tail. Decode-only (EM_MAX + the O(G^2) rank tile grow with M*topk).
 """
@@ -54,20 +54,20 @@ def _next_pow2(x: int) -> int:
 def _fused_align_kernel(
     ids_ptr,  # [G] int32  flat topk_ids
     wts_ptr,  # [G] fp32   flat topk_weights
-    sti_ptr,  # [EM_MAX] int32  out (packed slot<<24|token)
-    sw_ptr,  # [EM_MAX] fp32   out (routed weight)
-    sei_ptr,  # [NB_MAX] int32  out (expert per block, -1 pad)
+    sti_ptr,  # [em_max] int32  out (packed slot<<24|token)
+    sw_ptr,  # [em_max] fp32   out (routed weight)
+    sei_ptr,  # [nb_max] int32  out (expert per block, -1 pad)
     nv_ptr,  # [1] int32       out (EM)
     G,
     num_experts,
     block_m,
     sentinel,
+    nb_max,  # == G (max blocks) == sei length
+    em_max,  # == nb_max * block_m
     TOPK: gl.constexpr,
-    GP: gl.constexpr,  # next_pow2(G)  (>= NB_MAX == G)
+    GP: gl.constexpr,  # next_pow2(G)  (>= nb_max == G)
     EP: gl.constexpr,  # next_pow2(num_experts)
     EXPERT_START: gl.constexpr,
-    NB_MAX: gl.constexpr,  # == G (max blocks) == sei length
-    EM_MAX: gl.constexpr,  # == NB_MAX * block_m
     INIT_TILE: gl.constexpr,
 ):
     LG: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])  # [GP]
@@ -76,15 +76,15 @@ def _fused_align_kernel(
     LT: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [4, 1], [1, 0])  # 2D rank
 
     # ---- in-kernel init of the full output (folds away a separate launch) ----
-    for r0 in gl.static_range(0, EM_MAX, INIT_TILE):
+    for r0 in range(0, em_max, INIT_TILE):
         r = r0 + gl.arange(0, INIT_TILE, layout=LR)
-        rm = r < EM_MAX
+        rm = r < em_max
         gl.store(
             sti_ptr + r, gl.full([INIT_TILE], sentinel, gl.int32, layout=LR), mask=rm
         )
         gl.store(sw_ptr + r, gl.full([INIT_TILE], 0.0, gl.float32, layout=LR), mask=rm)
     jb = gl.arange(0, GP, layout=LG)
-    gl.store(sei_ptr + jb, gl.full([GP], -1, gl.int32, layout=LG), mask=jb < NB_MAX)
+    gl.store(sei_ptr + jb, gl.full([GP], -1, gl.int32, layout=LG), mask=jb < nb_max)
     gl.barrier()  # order init stores before the (overlapping) scatter below
 
     g = gl.arange(0, GP, layout=LG)
@@ -189,13 +189,15 @@ def moe_align_block_size_fused(
         num_experts,
         block_m,
         sentinel,
+        NB_MAX,
+        EM_MAX,
         TOPK=topk,
         GP=GP,
         EP=EP,
         EXPERT_START=expert_start,
-        NB_MAX=NB_MAX,
-        EM_MAX=EM_MAX,
-        INIT_TILE=_next_pow2(min(1024, EM_MAX)),
+        # The batch-derived output bounds stay runtime arguments; only the
+        # power-of-two route bucket GP and a fixed init tile specialize.
+        INIT_TILE=1024,
         num_warps=4,
     )
     return sti, sei, sw, nv

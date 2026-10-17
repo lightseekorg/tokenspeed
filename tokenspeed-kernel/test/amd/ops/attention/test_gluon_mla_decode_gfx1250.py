@@ -38,7 +38,7 @@ from tokenspeed_kernel.ops.attention.mla import (  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (  # noqa: E402
     _mla_decode_fwd_kernel,
     _mla_decode_fwd_reduce_kernel,
-    _select_query_block_num_kv_splits,
+    _select_num_kv_splits,
 )
 
 _KV_LORA_RANK = 512
@@ -117,15 +117,23 @@ def _relative_error(actual, expected):
     [
         # Kimi-K3 verify at TP8: one 64-row block per request, with lengths
         # on both sides of page and split boundaries.
-        (12, 4, [4, 5, 63, 64, 65, 1025, 4095, 4096, 4097, 16385], torch.float8_e4m3fn),
-        (12, 4, [129, 4097], torch.bfloat16),
+        pytest.param(
+            12,
+            4,
+            [4, 5, 63, 64, 65, 1025, 4095, 4096, 4097, 16385],
+            torch.float8_e4m3fn,
+            id="k3-tp8-fp8",
+        ),
+        # One request takes the 128-split cap, two or three pages per split.
+        pytest.param(12, 4, [16385], torch.float8_e4m3fn, id="k3-tp8-fp8-128-splits"),
+        pytest.param(12, 4, [129, 4097], torch.bfloat16, id="k3-tp8-bf16"),
         # 16 and 32 rows per block.
-        (4, 4, [4, 1025, 4097], torch.float8_e4m3fn),
-        (8, 4, [4, 2049], torch.float8_e4m3fn),
+        pytest.param(4, 4, [4, 1025, 4097], torch.float8_e4m3fn, id="rows16"),
+        pytest.param(8, 4, [4, 2049], torch.float8_e4m3fn, id="rows32"),
         # Several query blocks per request, the last one partial.
-        (16, 15, [15, 1025], torch.float8_e4m3fn),
+        pytest.param(16, 15, [15, 1025], torch.float8_e4m3fn, id="partial-block"),
         # Head blocks.
-        (128, 4, [1025, 4], torch.bfloat16),
+        pytest.param(128, 4, [1025, 4], torch.bfloat16, id="head-blocks"),
     ],
 )
 def test_query_block_mla_matches_reference(heads, queries, cache_lengths, dtype):
@@ -197,7 +205,7 @@ def test_query_block_mla_reuses_binaries_across_batch_and_table_width():
     num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
     # Each request is one program, so the batch size sets the KV split count.
     splits = {
-        _select_query_block_num_kv_splits(
+        _select_num_kv_splits(
             num_sms=num_sms,
             num_q_programs=batch_size,
             max_seqlen_k=65_536,
@@ -213,6 +221,20 @@ def test_query_block_mla_reuses_binaries_across_batch_and_table_width():
     ):
         for batch_size, table_width in sweep:
             run(batch_size, table_width)
+
+
+def test_query_block_mla_split_count_fills_cus():
+    def splits(requests):
+        return _select_num_kv_splits(
+            num_sms=256,
+            num_q_programs=requests,
+            max_seqlen_k=65_536,
+            tile_size=_PAGE_SIZE,
+        )
+
+    # Few requests spread up to 128 splits over the CUs; more requests double
+    # up to two programs per CU while every split keeps at least 12 pages.
+    assert [splits(n) for n in (1, 2, 4, 8, 16)] == [128, 128, 64, 64, 32]
 
 
 def test_query_block_mla_projected_value_composes_on_query_axis():

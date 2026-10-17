@@ -31,6 +31,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from compressed_tensors.quantization import QuantizationStrategy
 from tokenspeed_kernel.ops.attention import attn_merge_state
 from tokenspeed_kernel.ops.attention.mla import (
     mla_project_value,
@@ -38,11 +39,11 @@ from tokenspeed_kernel.ops.attention.mla import (
 )
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV, MLAPrologueOutput
-from tokenspeed_kernel.ops.gemm import bmm
-from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
-from tokenspeed_kernel.ops.gemm.cute_dsl import (
+from tokenspeed_kernel.ops.gemm import bmm, mm
+from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
+from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
@@ -108,6 +109,12 @@ from tokenspeed.runtime.layers.paged_attention import (
     QueryShardGather,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsLinearMethod,
+)
+from tokenspeed.runtime.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW8A8Fp8,
+)
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
     block_dequant,
@@ -348,6 +355,8 @@ class MoEGate(nn.Module):
                 self.weight,
                 out_dtype=torch.float32,
             )
+        elif _platform.is_amd:
+            logits = mm(hidden_states, self.weight)
         else:
             logits = F.linear(hidden_states, self.weight, None)
         return logits
@@ -413,6 +422,8 @@ class DeepseekV3MoE(nn.Module):
                 "normalize_topk_weights": config.norm_topk_prob,
                 "correction_bias": self.gate.e_score_correction_bias,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "precision_policy": getattr(config, "moe_precision_policy", "default"),
+                "output_scale": getattr(config, "moe_output_scale", 1.0),
             },
         )
 
@@ -533,6 +544,30 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
             quant_config=quant_config,
             prefix=prefix,
         )
+        # Model loaders write q_a_proj and kv_a_proj_with_mqa into this one
+        # linear at row offsets (begin_size). Per-channel FP8 weight scales
+        # follow their rows, but a per-tensor weight scale or a static input
+        # scale has a single slot here, not one per source layer.
+        if isinstance(self.quant_method, CompressedTensorsLinearMethod) and isinstance(
+            self.scheme, CompressedTensorsW8A8Fp8
+        ):
+            per_channel = self.scheme.strategy == QuantizationStrategy.CHANNEL
+            static_input = self.scheme.is_static_input_scheme
+            if not per_channel or static_input:
+                weights = "per-channel" if per_channel else "per-tensor"
+                inputs = (
+                    "static input scales" if static_input else "dynamic activations"
+                )
+                raise ValueError(
+                    f"{prefix}: compressed-tensors FP8 {weights} weight scales "
+                    f"with {inputs} are not supported on the fused q_a_proj and "
+                    "kv_a_proj_with_mqa linear. Both layers load into it at row "
+                    "offsets, which keeps per-channel weight scales with their "
+                    "rows but has one slot for a per-tensor weight scale and one "
+                    "for a static input scale, so kv_a_proj_with_mqa's would be "
+                    "dropped. Per-channel weight scales with dynamic per-token "
+                    "activations are supported."
+                )
         self.use_min_latency = (
             self.bias is None
             and self.weight.dtype == torch.bfloat16
@@ -874,11 +909,11 @@ class DeepseekV3AttentionMLA(nn.Module):
             return hidden_states.new_empty(0, self.hidden_size)
         if self.has_head_tp and ctx.num_extends > 0:
             # Unreachable by configuration (see _validate_decode_tp_layouts
-            # and validate_qcp): a guard against a prefill row reaching the
-            # expanded prologue on a head-sharded layout. Head TP serves
-            # decode rows, or extend rows under query context parallelism
-            # through the absorbed sparse prefill (the shard was refused
-            # above); the expanded path never.
+            # and validate_context_parallel_roles): a guard against a prefill
+            # row reaching the expanded prologue on a head-sharded layout.
+            # Head TP serves decode rows, or extend rows under query context
+            # parallelism through the absorbed sparse prefill (the shard was
+            # refused above); the expanded path never.
             raise RuntimeError(
                 "attention head TP serves decode rows, or extend rows under query "
                 "context parallelism with an absorbed sparse prefill: the "

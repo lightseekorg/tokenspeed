@@ -20,10 +20,11 @@
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 import torch
 from torch import nn
@@ -69,6 +70,37 @@ class FusedExpertWeightPlanEntry(CheckpointPlanEntry):
     split_dim: int | None = None
     split_chunks: int | None = None
     split_index: int | None = None
+
+
+_PlanEntry = TypeVar("_PlanEntry", bound=CheckpointPlanEntry)
+_EXPERT_NAME_ANCHOR = re.compile(r"experts\.[0-9]+\.")
+
+
+class _ExpertPlanIndex(Generic[_PlanEntry]):
+    """Narrow substring matching by expert ID, retaining plan order and replicas.
+
+    An entry's expert anchor must occur in any name matching that entry.
+    Entries without an anchor stay in every candidate set. The original
+    matches() predicate still decides projection and layer membership; this
+    index never selects a destination or removes replicated load entries.
+    """
+
+    def __init__(self, plan: Sequence[_PlanEntry]) -> None:
+        self.by_expert: dict[str, list[tuple[int, _PlanEntry]]] = defaultdict(list)
+        self.fallback: list[tuple[int, _PlanEntry]] = []
+        for position, entry in enumerate(plan):
+            anchor = _EXPERT_NAME_ANCHOR.search(entry.checkpoint_weight_name)
+            bucket = self.by_expert[anchor.group()] if anchor else self.fallback
+            bucket.append((position, entry))
+
+    def candidates(self, name: str) -> tuple[_PlanEntry, ...]:
+        # A checkpoint name can contain several anchors. Deduplicate anchors,
+        # not entries: replicated expert slots must all receive the tensor.
+        selected = list(self.fallback)
+        for anchor in dict.fromkeys(_EXPERT_NAME_ANCHOR.findall(name)):
+            selected.extend(self.by_expert.get(anchor, ()))
+        selected.sort(key=lambda item: item[0])
+        return tuple(entry for _, entry in selected)
 
 
 class MoECheckpointLoadError(RuntimeError):
@@ -352,6 +384,7 @@ class MoECheckpointLoader:
         self._params_dict = params_dict
         self._expert_plan = tuple(expert_plan)
         self._global_expert_plan = tuple(global_expert_plan)
+        self._global_expert_index = _ExpertPlanIndex(global_expert_plan)
         self._fused_plan = tuple(fused_plan)
         self._num_experts = num_experts
         self._ep_rank = ep_rank
@@ -366,9 +399,10 @@ class MoECheckpointLoader:
         by_layer: dict[int | None, list[ExpertWeightPlanEntry]] = defaultdict(list)
         for plan_entry in self._expert_plan:
             by_layer[plan_entry.layer_id].append(plan_entry)
-        self._expert_plan_by_layer: dict[
-            int | None, tuple[ExpertWeightPlanEntry, ...]
-        ] = {layer_id: tuple(entries) for layer_id, entries in by_layer.items()}
+        self._expert_plan_by_layer = {
+            layer_id: _ExpertPlanIndex(entries)
+            for layer_id, entries in by_layer.items()
+        }
 
         if self._fused_plan and self._num_experts is None:
             raise ValueError("num_experts is required when fused_plan is used")
@@ -382,14 +416,18 @@ class MoECheckpointLoader:
     def _expert_plan_for(self, name: str) -> tuple[ExpertWeightPlanEntry, ...]:
         """The per-expert entries that may serve ``name``: the layer-agnostic
         ones plus those of the layer named in ``name``."""
-        shared = self._expert_plan_by_layer.get(None, ())
-        if len(self._expert_plan_by_layer) == 1 and shared:
+        shared_index = self._expert_plan_by_layer.get(None)
+        shared = shared_index.candidates(name) if shared_index is not None else ()
+        if len(self._expert_plan_by_layer) == 1 and shared_index is not None:
             return shared
-        return shared + self._expert_plan_by_layer.get(get_layer_id(name), ())
+        layer_index = self._expert_plan_by_layer.get(get_layer_id(name))
+        return shared + (
+            layer_index.candidates(name) if layer_index is not None else ()
+        )
 
     def matches(self, name: str) -> bool:
         plan = (
-            self._global_expert_plan
+            self._global_expert_index.candidates(name)
             if name.endswith(".input_scale")
             else self._expert_plan_for(name)
         )
@@ -409,12 +447,16 @@ class MoECheckpointLoader:
             checkpoint tensors.
         """
         return self._matches_plan(self._fused_plan, name) or self._matches_plan(
-            self._global_expert_plan, name
+            self._global_expert_index.candidates(name), name
         )
 
     def _load_expert(self, name: str, loaded_weight: torch.Tensor) -> str | None:
         input_scale = name.endswith(".input_scale")
-        plan = self._global_expert_plan if input_scale else self._expert_plan_for(name)
+        plan = (
+            self._global_expert_index.candidates(name)
+            if input_scale
+            else self._expert_plan_for(name)
+        )
         mapped_name: str | None = None
         loaded_name: str | None = None
         # Every matching entry loads: under an expert placement one logical

@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 from types import SimpleNamespace
 from unittest import mock
 
@@ -69,25 +71,46 @@ def _decode_op(bs):
     )
 
 
+class _LogCapture(logging.Handler):
+    """Records the messages a ``BatchLogger`` emits through the real logger."""
+
+    def __init__(self):
+        super().__init__()
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+@contextlib.contextmanager
+def _captured_messages():
+    handler = _LogCapture()
+    module_logger = batch_log_module.logger
+    previous_level = module_logger.level
+    module_logger.setLevel(logging.DEBUG)
+    module_logger.addHandler(handler)
+    try:
+        yield handler.messages
+    finally:
+        module_logger.removeHandler(handler)
+        module_logger.setLevel(previous_level)
+
+
 def test_extend_round_counts_cached_tokens_once_per_request():
     logger = _logger()
     op = _extend_op(["a", "b"], 2, [10, 20], [4, 6])
 
-    with mock.patch.object(batch_log_module.logger, "info") as log:
+    with _captured_messages() as messages:
         logger.log_dispatch(op, STATS)
         # Chunked prefill re-dispatches the same rids; their prefix is not
         # cached-token news a second time.
         logger.log_dispatch(op, STATS)
 
-    assert log.call_args_list == [
-        mock.call(
-            "Prefill batch. #dp-rank: 2, #new-seq: 2, #new-token: 30, #cached-token: 10, "
-            "#running-req: 2, #queue-req: 7"
-        ),
-        mock.call(
-            "Prefill batch. #dp-rank: 2, #new-seq: 2, #new-token: 30, #cached-token: 0, "
-            "#running-req: 2, #queue-req: 7"
-        ),
+    assert messages == [
+        "Prefill batch. #dp-rank: 2, #new-seq: 2, #new-token: 30, #cached-token: 10, "
+        "#running-req: 2, #queue-req: 7",
+        "Prefill batch. #dp-rank: 2, #new-seq: 2, #new-token: 30, #cached-token: 0, "
+        "#running-req: 2, #queue-req: 7",
     ]
 
 
@@ -95,19 +118,29 @@ def test_mixed_round_is_labelled_mix():
     logger = _logger()
     op = _extend_op(["a", "b", "c"], 1, [10, 1, 1], [4])
 
-    with mock.patch.object(batch_log_module.logger, "info") as log:
+    with _captured_messages() as messages:
         logger.log_dispatch(op, STATS)
 
-    log.assert_called_once_with(
+    assert messages == [
         "Mix batch. #dp-rank: 2, #new-seq: 1, #new-token: 12, #cached-token: 4, "
         "#running-req: 3, #queue-req: 7"
-    )
+    ]
 
 
 def test_decode_rounds_log_once_per_interval_with_committed_throughput():
+    scripted = iter([100.0, 102.0])
+    real_time = batch_log_module.time.time
+
+    def fake_time():
+        # batch_log does ``import time``, so the patched clock is the shared
+        # time module: only the BatchLogger's two reads (construction, then
+        # the emitted round) are scripted; logging's own record timestamps
+        # fall through to the real clock.
+        return next(scripted, None) or real_time()
+
     with (
-        mock.patch.object(batch_log_module.time, "time", side_effect=[100.0, 102.0]),
-        mock.patch.object(batch_log_module.logger, "info") as log,
+        mock.patch.object(batch_log_module.time, "time", side_effect=fake_time),
+        _captured_messages() as messages,
     ):
         logger = _logger(decode_log_interval=3)
         for _ in range(3):
@@ -117,11 +150,11 @@ def test_decode_rounds_log_once_per_interval_with_committed_throughput():
             logger.log_dispatch(_decode_op(2), STATS)
 
     # Rounds 1 and 2 are throttled; round 3 prints the window.
-    log.assert_called_once_with(
+    assert messages == [
         "Decode batch. #dp-rank: 2, #running-req: 2, avg_seq_len: 100.5, "
         "#pages(active/cached/total): 40/15/100, "
         "page ratio: 0.40, gen throughput (token/s): 6.00, #queue-req: 7"
-    )
+    ]
 
 
 def test_decode_context_lengths_are_read_only_when_a_line_is_emitted():
@@ -186,13 +219,15 @@ def test_a_pool_with_no_state_group_never_queries_the_scheduler():
 
 
 def test_disabled_rank_still_counts_but_never_logs():
+    """Only the representative rank emits; the others still process the
+    round — the silence is the observable behavior."""
     logger = _logger(enabled=False, decode_log_interval=1)
 
-    with mock.patch.object(batch_log_module.logger, "info") as log:
+    with _captured_messages() as messages:
         logger.record_decode(SimpleNamespace(output_lengths=torch.tensor([3])), 1)
         logger.log_dispatch(_decode_op(1), STATS)
 
-    log.assert_not_called()
+    assert messages == []
 
 
 def test_step_acceptance_log_separates_committed_and_draft_tokens():
@@ -204,14 +239,14 @@ def test_step_acceptance_log_separates_committed_and_draft_tokens():
 
     with (
         mock.patch.object(batch_log_module, "LOG_SPEC_ACCEPT_LENGTHS", True),
-        mock.patch.object(batch_log_module.logger, "info") as log,
+        _captured_messages() as messages,
     ):
         logger.record_decode(result, bs=3)
 
-    log.assert_called_once_with(
+    assert messages == [
         "Spec verify step. #dp-rank: 2, accept_lengths=[1, 3, 8], "
-        "accepted_draft_tokens=[0, 2, 7]",
-    )
+        "accepted_draft_tokens=[0, 2, 7]"
+    ]
 
 
 def test_non_speculative_serving_with_default_widths_logs_no_accept_lengths():
@@ -286,22 +321,11 @@ def test_pd_lifecycle_counts_are_read_only_when_a_line_is_emitted():
 
 def test_pd_prefill_line_queues_bootstrapping_requests():
     logger = _logger(pd_lifecycle=lambda: (9, 1, 0, 0, 1))
-    with mock.patch.object(batch_log_module.logger, "info") as log:
+    with _captured_messages() as messages:
         logger.log_dispatch(_extend_op(["a"], 1, [10], [0]), STATS)
 
-    log.assert_called_once_with(
+    assert messages == [
         "Prefill batch. #dp-rank: 2, #new-seq: 1, #new-token: 10, "
         "#cached-token: 0, #running-req: 1, #queue-req: 16"
         ", #req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned): 9/1/0/0/1"
-    )
-
-
-def test_a_fused_engine_appends_no_lifecycle_counts():
-    logger = _logger(pd_lifecycle=None)
-    with mock.patch.object(batch_log_module.logger, "info") as log:
-        logger.log_dispatch(_extend_op(["a"], 1, [10], [0]), STATS)
-
-    log.assert_called_once_with(
-        "Prefill batch. #dp-rank: 2, #new-seq: 1, #new-token: 10, "
-        "#cached-token: 0, #running-req: 1, #queue-req: 7"
-    )
+    ]

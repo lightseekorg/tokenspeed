@@ -113,6 +113,7 @@ def _make_moe(fork: _SpyFork, *, num_tokens: int) -> SimpleNamespace:
         mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
         execution_plan=SimpleNamespace(use_native=False),
         native_latent_moe=None,
+        iris_state=None,
         stream_fork=fork,
         _topk_ready=None,
         routed_hidden=4,
@@ -305,7 +306,6 @@ def test_row_sharded_moe_tail_selection_and_fallback(
     expected = torch.empty_like(shared)
     fallback = torch.empty_like(shared)
     group = tuple(range(8))
-    process_group = object()
     norm = (
         mock.Mock(
             return_value=routed,
@@ -345,15 +345,13 @@ def test_row_sharded_moe_tail_selection_and_fallback(
 
     candidate = mock.Mock(side_effect=run_tail)
     joined = mock.Mock(side_effect=reduce_partials)
-    resolve = mock.Mock(return_value=process_group)
-    monkeypatch.setitem(
-        sys.modules,
-        "tokenspeed_kernel.ops.communication.iris",
-        SimpleNamespace(iris_kimi3_moe_tail=candidate),
+    moe.iris_state = SimpleNamespace(
+        moe_tail=candidate,
+        all_reduce=SimpleNamespace(owns_outputs=lambda tensors: producer_direct),
+        reduce_moe=lambda tensors: joined(tensors, group),
     )
     monkeypatch.setattr(mod, "current_platform", lambda: SimpleNamespace(is_cdna4=True))
     monkeypatch.setattr(mod, "all_reduce", joined)
-    monkeypatch.setattr(mod, "_get_process_group", resolve)
     monkeypatch.setattr(mod, "get_is_cuda_graph_phase", lambda: graph_phase)
     monkeypatch.setattr(mod, "get_is_capture_mode", lambda: capture_mode)
     monkeypatch.setattr(
@@ -382,12 +380,9 @@ def test_row_sharded_moe_tail_selection_and_fallback(
             prefix_is_sharded=False,
             norm_weight=norm.weight if has_norm else None,
             eps=norm.variance_epsilon if has_norm else None,
-            group=process_group,
         )
-        resolve.assert_called_once_with(group)
     else:
         candidate.assert_not_called()
-        resolve.assert_not_called()
     if attempted and accepted:
         assert output is expected
         joined.assert_not_called()
@@ -491,10 +486,10 @@ def test_sharded_attention_residual_is_gathered_before_moe_fallback(
     candidate = mock.Mock(return_value=expected if accepted else None)
     gather = mock.Mock(side_effect=gather_prefix)
     joined = mock.Mock(side_effect=reduce_partials)
-    monkeypatch.setitem(
-        sys.modules,
-        "tokenspeed_kernel.ops.communication.iris",
-        SimpleNamespace(iris_kimi3_moe_tail=candidate),
+    moe.iris_state = SimpleNamespace(
+        moe_tail=candidate,
+        all_reduce=SimpleNamespace(owns_outputs=lambda tensors: producer_direct),
+        reduce_moe=lambda tensors: joined(tensors, group),
     )
     monkeypatch.setattr(mod, "current_platform", lambda: SimpleNamespace(is_cdna4=True))
     monkeypatch.setattr(mod, "all_gather", gather)

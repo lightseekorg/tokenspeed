@@ -24,7 +24,7 @@ import dataclasses
 
 import torch
 from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
-from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv, use_decode_gemv
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
     DistArgmaxState,
@@ -37,6 +37,10 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
     supports_dist_argmax_shape,
     try_create_dist_argmax_state,
 )
+from tokenspeed_kernel.ops.sampling.triton.vocab_parallel_argmax import (
+    argmax_key_index,
+    vocab_parallel_argmax_keys,
+)
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -44,6 +48,7 @@ from tokenspeed.runtime.configs.numerics import (
     BITWISE_ENVELOPES,
     MEGATRON_VOCAB_BLOCK,
 )
+from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_manager import (
     dp_group_row_counts,
     gather_sampled_rows,
@@ -51,6 +56,7 @@ from tokenspeed.runtime.distributed.comm_manager import (
 from tokenspeed.runtime.distributed.comm_ops import (
     all_gather,
     all_gather_single,
+    all_reduce,
     all_to_all_transpose,
     token_all_gather,
     token_all_gather_rows,
@@ -74,7 +80,10 @@ from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutExecutor,
     LogitsLayoutPlan,
 )
-from tokenspeed.runtime.sampling.utils import gather_token_logprobs
+from tokenspeed.runtime.sampling.utils import (
+    gather_token_logprobs,
+    top_token_logprobs,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.triton import tl, triton
 
@@ -144,6 +153,26 @@ def _dist_argmax_vetoed() -> bool:
     )
 
 
+class VocabParallelArgmax:
+    """Greedy token ids from logits left sharded over the vocabulary.
+
+    Each rank packs its shard's row maximum and global index into an int64
+    key, and an all-reduce MAX over the group picks the same token the
+    argmax of the gathered row would. It exchanges 8 bytes per row instead
+    of the logits shards.
+    """
+
+    def __init__(self, tp_group: tuple[int, ...], vocab_offset: int):
+        self.tp_group = tp_group
+        self.vocab_offset = vocab_offset
+
+    def __call__(self, logits: torch.Tensor) -> torch.Tensor:
+        keys = torch.empty(logits.shape[0], dtype=torch.int64, device=logits.device)
+        vocab_parallel_argmax_keys(logits, vocab_offset=self.vocab_offset, out=keys)
+        keys = all_reduce(keys, self.tp_group, op=torch.distributed.ReduceOp.MAX)
+        return argmax_key_index(keys, out=torch.empty_like(keys))
+
+
 @dataclasses.dataclass
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/tokenspeed/runtime/layers/logits_processor.py::LogitsProcessor
@@ -165,11 +194,20 @@ class LogitsProcessorOutput:
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     next_token_token_ids_logprobs_val: list | None = None
     next_token_token_ids_logprobs_idx: list | None = None
+    # Eager prefills only (``ForwardContext.sampled_top_k``): the most likely
+    # tokens of each prefill row's sampled position, fp32 log-softmax values
+    # and int64 ids, set by the executor after sampling. shape: [#prefill rows, k]
+    sampled_top_logprobs_val: torch.Tensor | None = None
+    sampled_top_logprobs_idx: torch.Tensor | None = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/tokenspeed/runtime/layers/logits_processor.py::LogitsProcessor
     # The logprobs of the prompt rows the forward's ``InputLogprobPlan``
     # named, fp32 in plan order, whole on every rank.  shape: [#rows]
     input_token_logprobs: torch.Tensor | None = None
+    # With the plan's ``top_k``: each row's most likely next tokens, fp32
+    # values and int64 ids, most likely first.  shape: [#rows, k]
+    input_top_logprobs_val: torch.Tensor | None = None
+    input_top_logprobs_idx: torch.Tensor | None = None
 
 
 @dataclasses.dataclass
@@ -371,6 +409,18 @@ class LogitsProcessor(nn.Module):
         """
         self.do_argmax = False
 
+    def fuse_argmax(self) -> None:
+        """Emit ``next_token_ids`` from every forward, as draft models do.
+
+        For a target model whose sampler reads only each row's argmax (greedy
+        sampling without logprobs or grammar masks). Under tensor parallelism
+        the argmax is then reduced across the vocabulary shards, and
+        ``next_token_logits`` stays this rank's shard instead of the gathered
+        vocabulary. Call once after construction and before the first forward.
+        Returns None.
+        """
+        self.do_argmax = True
+
     def configure_dp_logits_layout(self, runtime: DpSamplingRuntimeConfig) -> None:
         if (
             not runtime.enabled
@@ -467,17 +517,11 @@ class LogitsProcessor(nn.Module):
         key = (self.tp_group, vocab_padded)
         if key not in self._LOGITS_AG_STATES:
             self._LOGITS_AG_STATES[key] = create_state(
-                enable_lamport=False,
-                moe_tail_max_rows=0,
                 group=pg_manager.get_process_group("nccl", self.tp_group),
                 rank_in_group=self.tp_rank,
-                attnres_max_numel=0,
-                attnres_max_rows=0,
                 max_tokens=self._LOGITS_AG_MAX_TOKENS,
                 hidden_size=vocab_padded,
                 device=None,
-                max_numel=0,
-                max_bytes=0,
             )
         return self._LOGITS_AG_STATES[key]
 
@@ -559,17 +603,19 @@ class LogitsProcessor(nn.Module):
         vocab_per_rank = lm_head.weight.size(0)
         if vocab_per_rank * self.tp_size != self.config.vocab_size:
             return None  # padded vocab: sharded argmax could pick a pad column
-        if not supports_dist_argmax_shape(
+        state = None
+        if supports_dist_argmax_shape(
             vocab_per_rank, lm_head.weight.dtype, self.tp_size
         ):
-            return None
-
-        return self.acquire_dist_argmax_state(
-            lm_head,
-            max_M=self._LOGITS_DIST_ARGMAX_MAX_TOKENS,
-            skip_ping_pong=True,
-            dtype=lm_head.weight.dtype,
-        )
+            state = self.acquire_dist_argmax_state(
+                lm_head,
+                max_M=self._LOGITS_DIST_ARGMAX_MAX_TOKENS,
+                skip_ping_pong=True,
+                dtype=lm_head.weight.dtype,
+            )
+        if state is None and not torch.cuda.is_current_stream_capturing():
+            state = VocabParallelArgmax(self.tp_group, self.tp_rank * vocab_per_rank)
+        return state
 
     def forward(
         self,
@@ -624,9 +670,9 @@ class LogitsProcessor(nn.Module):
         # Prompt logprobs read the [num_input_rows, hidden] activations this
         # rank holds, so they are scored before the sampled-row selection
         # below (on a shard: before the sampled rows leave it).
-        input_token_logprobs = None
+        input_token_logprobs = input_top = None
         if logits_metadata.input_logprob_rows is not None:
-            input_token_logprobs = self.compute_input_token_logprobs(
+            input_token_logprobs, input_top = self.compute_input_token_logprobs(
                 hidden_states, lm_head, logits_metadata, shard
             )
 
@@ -722,6 +768,8 @@ class LogitsProcessor(nn.Module):
             hidden_states=hidden_states_to_store,
             logits_layout_plan=logits_layout_plan,
             input_token_logprobs=input_token_logprobs,
+            input_top_logprobs_val=None if input_top is None else input_top[0],
+            input_top_logprobs_idx=None if input_top is None else input_top[1],
         )
 
     def _query_shard(self, logits_metadata: LogitsMetadata) -> QueryShardPlan | None:
@@ -732,7 +780,7 @@ class LogitsProcessor(nn.Module):
         head's vocab-shard group, every rank of which must hold the same rows
         for the vocab all-gather to be consistent, and query context
         parallelism shards queries over exactly that group
-        (``validate_qcp``: ``qcp_size == attn_tp_size``). A plan of another
+        (``Mapping``: ``qcp_size == attn_tp_size``). A plan of another
         width, or a replicated head (attention DP), names a layout this
         processor cannot serve.
         """
@@ -758,7 +806,7 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
         shard: QueryShardPlan | None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """Logprob of each named prompt row's next token, position-chunked.
 
         The rows (``logits_metadata.input_logprob_rows``) are pushed through the
@@ -796,8 +844,18 @@ class LogitsProcessor(nn.Module):
                 (``_query_shard``): the plan whose rows ``hidden_states`` are,
                 ``None`` when they are the whole forward's.
 
+        With the plan's ``top_k`` each chunk's rows also get their ``top_k``
+        most likely tokens from ``top_token_logprobs``, the function the
+        sampled rows' alternatives come from, so a row's alternatives are
+        the same whether it is a prompt row or a sampled one, and a target's
+        value equals its own top-k entry bit for bit. Top-k is taken in
+        torch's logprob order only (the ingress refuses it otherwise).
+
         Returns:
-            fp32 ``[plan rows]`` logprobs in row order, the whole plan's.
+            fp32 ``[plan rows]`` logprobs in row order, the whole plan's, and
+            with a ``top_k`` the ``([plan rows, top_k]`` fp32 values,
+            ``[plan rows, top_k]`` int64 ids``) of each row's most likely next
+            tokens, most likely first; None without one.
 
         Raises:
             ValueError: The model narrowed its logits rows (``hidden_states``
@@ -854,7 +912,25 @@ class LogitsProcessor(nn.Module):
             raise ValueError(
                 f"{num_rows} prompt-logprob targets for {staged_rows} rows"
             )
+        # A k larger than the vocabulary returns every token
+        # (``top_token_logprobs``), so the buffers below hold that many.
+        top_k = min(plan.top_k, self.config.vocab_size)
+        if top_k > 0 and self.logprob_order != "torch":
+            raise ValueError(
+                "top-k prompt logprobs need --logprob-order torch, not "
+                f"{self.logprob_order}"
+            )
         out = torch.empty(num_rows, dtype=torch.float32, device=hidden_states.device)
+        top = None
+        if top_k > 0:
+            top = (
+                torch.empty(
+                    (num_rows, top_k), dtype=torch.float32, device=hidden_states.device
+                ),
+                torch.empty(
+                    (num_rows, top_k), dtype=torch.int64, device=hidden_states.device
+                ),
+            )
         for begin in range(0, num_rows, plan.chunk_tokens):
             end = min(begin + plan.chunk_tokens, num_rows)
             rows = source[begin:end] if index is None else source[index[begin:end]]
@@ -868,8 +944,10 @@ class LogitsProcessor(nn.Module):
             out[begin:end] = gather_token_logprobs(
                 logits, plan.targets[begin:end], logprob_order=self.logprob_order
             )
+            if top is not None:
+                top[0][begin:end], top[1][begin:end] = top_token_logprobs(logits, top_k)
             del logits
-        return out
+        return out, top
 
     def _lm_head_tp_row_counts(
         self, hidden_states: torch.Tensor, logits_metadata: LogitsMetadata
@@ -962,8 +1040,6 @@ class LogitsProcessor(nn.Module):
             from tokenspeed.runtime.utils.env import global_server_args_dict
 
             if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
-                from tokenspeed_kernel.ops.gemm import mm as kernel_mm
-
                 logits = kernel_mm(
                     hidden_states.to(lm_head.weight.dtype),
                     lm_head.weight,
@@ -971,10 +1047,8 @@ class LogitsProcessor(nn.Module):
                 )
             else:
                 cast_hidden = hidden_states.to(lm_head.weight.dtype)
-                if current_platform().is_amd and use_decode_gemv(
-                    cast_hidden, lm_head.weight
-                ):
-                    logits = decode_gemv(cast_hidden, lm_head.weight)
+                if current_platform().is_amd:
+                    logits = kernel_mm(cast_hidden, lm_head.weight)
                 elif self._use_fused_lm_head:
                     logits = _lm_head_matmul(cast_hidden, lm_head.weight)
                 else:
@@ -1041,6 +1115,18 @@ class LogitsProcessor(nn.Module):
                     skip_entry_sync=True,
                     safe=False,
                 )
+            elif (
+                current_platform().is_cdna4
+                and not require_full_vocab
+                and (
+                    iris := get_global_backend().get_prepared_all_gather(
+                        self.tp_group, logits.dtype
+                    )
+                )
+                is not None
+                and iris.can_run(logits)
+            ):
+                logits = iris.run(logits)
             else:
                 num_rows = logits.size(0)
                 local_vocab_size = logits.size(1)
@@ -1072,6 +1158,8 @@ class LogitsProcessor(nn.Module):
             and not self.final_logit_softcapping
             and logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
         ):
+            if isinstance(self._dist_argmax_state, VocabParallelArgmax):
+                return self._dist_argmax_state(logits)
             _, idx = distributed_argmax(self._dist_argmax_state, logits)
             return idx
         else:

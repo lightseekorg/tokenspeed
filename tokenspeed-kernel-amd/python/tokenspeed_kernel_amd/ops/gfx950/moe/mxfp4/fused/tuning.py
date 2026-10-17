@@ -18,10 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Host-side block-size autotuning and launch heuristics for the
-pipelined ragged GEMM."""
+"""Host-side tuning and configuration selection for MXFP4 expert GEMMs."""
 
 from __future__ import annotations
+
+from typing import NamedTuple
 
 import torch
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
@@ -33,6 +34,110 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
     _SWIZZLE_K_S_INNER,
     _TCP_INFLIGHT_CAP_BYTES,
 )
+
+
+class _GroupedMoEConfig(NamedTuple):
+    """Sorting and stage-1 settings; both GEMMs share ``block_m``."""
+
+    block_m: int
+    stage1_num_warps: int
+    use_minimum_route_chunks: bool
+    runtime_rows: bool
+
+
+# Key: hidden width, intermediate width, padded W2 K, local/global experts, top-k.
+# Entries: inclusive row bounds and the shared sorting/GEMM configuration.
+_GROUPED_MOE_CONFIGS = {
+    (4096, 4096, 4096, local_experts, 256, 8): (
+        (
+            49,
+            128,
+            _GroupedMoEConfig(32, 4, use_minimum_route_chunks=True, runtime_rows=False),
+        ),
+        (
+            129,
+            191,
+            _GroupedMoEConfig(32, 4, use_minimum_route_chunks=False, runtime_rows=True),
+        ),
+        (
+            192,
+            8192,
+            _GroupedMoEConfig(
+                64, 2, use_minimum_route_chunks=False, runtime_rows=False
+            ),
+        ),
+    )
+    for local_experts in (32, 64)
+}
+
+
+def _select_grouped_moe_block_m(
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+) -> int:
+    """Limit per-expert padding for sparse routes without shrinking dense tiles."""
+    routed_rows = num_tokens * top_k
+    if routed_rows <= 8 * num_experts:
+        return 16
+    if routed_rows <= 32 * num_experts:
+        return 32
+    if routed_rows <= 64 * num_experts:
+        return 64
+    # Lower padding outweighs 128-row tile reuse at these route densities.
+    if 128 * num_experts < routed_rows <= 320 * num_experts:
+        return 64
+    return 128
+
+
+def _select_grouped_moe_config(
+    num_tokens: int,
+    *,
+    hidden_dim: int,
+    inter_dim: int,
+    stage2_k: int,
+    num_local_experts: int,
+    num_experts: int,
+    top_k: int,
+    activation_format: str,
+    do_finalize: bool,
+    precomputed_routes: bool,
+    swiglu_args: tuple[float, float, float],
+    situ_linear_beta: float | None,
+) -> _GroupedMoEConfig:
+    """Select shape-tuned tiles and sorting, retaining density-based fallbacks."""
+    if (
+        activation_format == "e2m1"
+        and not do_finalize
+        and precomputed_routes
+        and swiglu_args == (1.0, 0.0, 0.0)
+        and situ_linear_beta is None
+    ):
+        shape = (
+            hidden_dim,
+            inter_dim,
+            stage2_k,
+            num_local_experts,
+            num_experts,
+            top_k,
+        )
+        for min_rows, max_rows, config in _GROUPED_MOE_CONFIGS.get(shape, ()):
+            if min_rows <= num_tokens <= max_rows:
+                return config
+    if activation_format == "e4m3":
+        return _GroupedMoEConfig(
+            32 if num_tokens <= 2048 else 64,
+            8,
+            use_minimum_route_chunks=False,
+            runtime_rows=False,
+        )
+    block_m = _select_grouped_moe_block_m(num_tokens, top_k, num_experts)
+    return _GroupedMoEConfig(
+        block_m,
+        max(1, block_m // 32),
+        use_minimum_route_chunks=False,
+        runtime_rows=False,
+    )
 
 
 def _effective_scale_load_mode(

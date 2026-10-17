@@ -29,8 +29,9 @@
 namespace tokenspeed {
 
 // The per-request cache working-set model: the decode reservation, the
-// overlap-protected step, a snapshot-state group's checkpoints and banked
-// growth, a sliding group's lookback and resident window. Two callers must
+// overlap-protected step, the next verify window a speculative decode's draft
+// steps write, a State group's two slots, a sliding group's
+// lookback and resident window. Two callers must
 // agree on it -- the Python recipes size a pool from it before any pool
 // exists, and the Scheduler bounds a single request against the pool they
 // sized -- so it lives here once and reads only SchedulerConfig fields that
@@ -62,17 +63,24 @@ public:
     // Largest token_limit whose SingleRequestGroupPages fit usable_lcm_blocks.
     std::int32_t MaxSingleRequestTokens(std::int64_t usable_lcm_blocks) const;
 
+    // Tokens of the next verify window a speculative decode reserves for its draft steps; 0 without one or on P.
+    static std::int64_t DraftWindowTokens(const SchedulerConfig& config);
+
 private:
     struct Group {
         std::int64_t block_granularity{};
         std::int64_t cache_blocks_per_lcm_block{};
         // Prefix-match policy, the same one the coordinator's matcher answers.
         bool prefix_closed{};
+        // The most blocks a sliding window needs behind a boundary
+        // (CacheCoordinator::SlidingWindowBlocks over every alignment); 0 for
+        // other groups.
         std::int64_t lookback_pages{};
     };
 
     std::int64_t decodeWidth() const;
     std::int64_t protectedTokens() const;
+    std::int64_t tailHandoverBlocks(std::size_t group_index) const;
 
     SchedulerConfig config_;
     std::vector<Group> groups_;
