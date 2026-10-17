@@ -475,7 +475,10 @@ pause or memory-release operation finishes.
 For orientation, one iteration of `event_loop`:
 
 1. Receive and admit new requests (`_process_new_requests`), with the pause
-   and EPD admission hooks inline as single lines.
+   and EPD admission hooks inline as single lines. A health probe that
+   arrives while the scheduler holds requests is answered with
+   `HealthCheckOutput` here rather than admitted: reaching the round is the
+   liveness proof, and a probe queued behind a long prefill would time out.
 2. Converge the in-flight L3 prefetches (`_l3_hooks.converge_prefetches`:
    a replica MIN of each op's landed prefix; a finished op is completed on
    the device), then poll completed Host cache ops (L2 write-backs/

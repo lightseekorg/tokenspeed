@@ -59,6 +59,7 @@ from tokenspeed.cli.serve_smg import (
     _args_with_default_model_parsers,
     _declares_response_template,
     _free_port_avoiding_ephemeral_range,
+    _gateway_args_with_default_health_check_timeout,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_policy,
     _gateway_args_with_default_port,
@@ -147,7 +148,9 @@ def test_gateway_args_preserve_user_policy():
     assert gateway_args == ["--policy", "round_robin"]
 
 
-def test_gateway_args_defaults_include_port_and_reasoning_parser():
+def test_gateway_args_defaults_include_port_and_reasoning_parser(monkeypatch):
+    monkeypatch.delenv("TOKENSPEED_HEALTH_CHECK_TIMEOUT", raising=False)
+
     gateway_args = _gateway_args_with_defaults(["--model", "/tmp/x"])
 
     # No --prometheus-port here: run_smg allocates it right before
@@ -168,9 +171,41 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "passthrough",
         "--tokenizer-cache-enable-l0",
         "--tokenizer-cache-enable-l1",
+        "--health-check-timeout-secs",
+        "25",
         "--log-level",
         "warn",
     ]
+
+
+def test_gateway_health_check_timeout_outlasts_engine_probe(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_HEALTH_CHECK_TIMEOUT", "180")
+
+    gateway_args = _gateway_args_with_default_health_check_timeout(
+        ["--model", "/tmp/x"]
+    )
+
+    assert gateway_args == ["--model", "/tmp/x", "--health-check-timeout-secs", "185"]
+
+
+@pytest.mark.parametrize(
+    "user_args",
+    [["--health-check-timeout-secs", "7"], ["--health-check-timeout-secs=7"]],
+    ids=["separate-value", "equals-value"],
+)
+def test_gateway_args_preserve_user_health_check_timeout(user_args):
+    assert _gateway_args_with_default_health_check_timeout(user_args) == user_args
+
+
+def test_ts_serve_keeps_an_equals_form_health_check_timeout(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_HEALTH_CHECK_TIMEOUT", "180")
+
+    split = split_argv(["/tmp/x", "--health-check-timeout-secs=7"])
+    gateway_args = _gateway_args_with_defaults(split.gateway)
+
+    assert gateway_args.count("--health-check-timeout-secs") == 1
+    flag = gateway_args.index("--health-check-timeout-secs")
+    assert gateway_args[flag + 1] == "7"
 
 
 def test_gateway_args_defaults_inject_passthrough_policy():
@@ -730,6 +765,14 @@ def test_muse_spark_chain_drafting_keeps_xgrammar_default(tmp_path):
     assert (
         _get_from_args(engine_args, "--grammar-backend") == MUSE_SPARK_GRAMMAR_BACKEND
     )
+
+
+@pytest.mark.parametrize("value", ["0", "-30"])
+def test_gateway_health_check_timeout_rejects_non_positive(monkeypatch, value):
+    monkeypatch.setenv("TOKENSPEED_HEALTH_CHECK_TIMEOUT", value)
+
+    with pytest.raises(ValueError, match="TOKENSPEED_HEALTH_CHECK_TIMEOUT"):
+        _gateway_args_with_default_health_check_timeout(["--model", "/tmp/x"])
 
 
 def _make_inkling_model_dir(tmp_path):
