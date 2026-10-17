@@ -42,6 +42,7 @@ if _IS_NPU:
     aggregate = None
     TensorDescriptor = None
     gl = None
+    hip_utils = None
 
     class _UnavailableGluonKernel:
         def __init__(self, fn, options):
@@ -75,6 +76,7 @@ else:
     from tokenspeed_triton.experimental import gluon
     from tokenspeed_triton.language.core import _aggregate as aggregate
     from tokenspeed_triton.language.extra import libdevice
+    from tokenspeed_triton.language.extra.hip import utils as hip_utils
     from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
 
     try:
@@ -87,6 +89,7 @@ __all__ = [
     "aggregate",
     "gl",
     "gluon",
+    "hip_utils",
     "libdevice",
     "max_active_ctas",
     "proton",

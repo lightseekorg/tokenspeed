@@ -114,9 +114,8 @@ def test_plain_two_stage_admits_partitionable_shapes(dtype):
         pytest.skip("iris is not installed")
 
     elements_per_word = 8 // dtype.itemsize
-    # The plain path carries no minimum size -- two-stage measured faster than
-    # one-shot at every shape down to 14 KB -- so the predicate is purely the
-    # kernel's partitioning requirement.
+    # This is the kernel's partitioning requirement; the staged two-shot state
+    # applies its payload minimum separately.
     aligned = 8 * elements_per_word
     assert _use_two_stage_plain(8, aligned, dtype)
     assert _use_two_stage_plain(8, aligned * 4096, dtype)
@@ -155,7 +154,13 @@ def _ar_shape_cases() -> List[Tuple[int, ...]]:
 
 
 def _ar_graph_shape_cases() -> List[Tuple[int, ...]]:
-    return [(16, 4096), (64, 4096)]
+    # A one-shot payload, then a payload past the TP4 two-shot minimum.
+    return [(16, 4096), (128, 4096)]
+
+
+def _ar_offset_shape_cases() -> List[Tuple[int, ...]]:
+    # Staged one-shot, then two-shot, with element-offset storage.
+    return [(1024,), (1 << 19,)]
 
 
 def _ar_output_shape_cases() -> List[Tuple[Tuple[int, ...], ...]]:
@@ -212,6 +217,7 @@ def _ar_worker_main(
         staged_max_numel = max(
             max(int(torch.tensor(shape).prod()) for shape in _ar_shape_cases()),
             max(int(torch.tensor(shape).prod()) for shape in _ar_graph_shape_cases()),
+            max(int(torch.tensor(shape).prod()) for shape in _ar_offset_shape_cases()),
         )
         producer_direct_max_numel = max(
             sum(int(torch.tensor(shape).prod()) for shape in shapes)
@@ -229,12 +235,6 @@ def _ar_worker_main(
             heap_size=None,
             device=device,
         )
-        if world_size == 4 and current_platform().is_cdna4:
-            assert state.tuned_staged.slots.data_ptr() != state.staged.slots.data_ptr()
-            assert (
-                state.tuned_staged.ready_flags.data_ptr()
-                != state.staged.ready_flags.data_ptr()
-            )
         k3 = None
         if attnres_max_numel:
             from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
@@ -257,23 +257,24 @@ def _ar_worker_main(
         for shape in _ar_shape_cases():
             _check_all_reduce(state, rank, world_size, shape, device)
         if state.staged_two_shot is not None:
-            for safe in (False, True):
-                _check_all_reduce_graph_replay(
-                    state,
-                    rank,
-                    world_size,
-                    (1024,),
-                    device,
-                    storage_offset=rank % 2,
-                    safe=safe,
-                )
+            for shape in _ar_offset_shape_cases():
+                for safe in (False, True):
+                    _check_all_reduce_graph_replay(
+                        state,
+                        rank,
+                        world_size,
+                        shape,
+                        device,
+                        storage_offset=rank % 2,
+                        safe=safe,
+                    )
         if world_size == 4:
             for shape in _ar_graph_shape_cases():
-                verify_tuning = current_platform().is_cdna4
-                if verify_tuning:
+                verify_protocols = current_platform().is_cdna4
+                if verify_protocols:
                     torch.cuda.synchronize()
                     dist.barrier()
-                    tuned_before = state.tuned_staged.ready_flags.clone()
+                    staged_before = state.staged.ready_flags.clone()
                     twoshot_before = state.staged_two_shot.ready_flags.clone()
                     torch.cuda.synchronize()
                     dist.barrier()
@@ -286,20 +287,20 @@ def _ar_worker_main(
                     storage_offset=0,
                     safe=False,
                 )
-                if verify_tuning:
+                if verify_protocols:
                     torch.cuda.synchronize()
                     dist.barrier()
-                    tuned_changed = not torch.equal(
-                        state.tuned_staged.ready_flags, tuned_before
+                    staged_changed = not torch.equal(
+                        state.staged.ready_flags, staged_before
                     )
                     twoshot_changed = not torch.equal(
                         state.staged_two_shot.ready_flags, twoshot_before
                     )
-                    assert tuned_changed == (math.prod(shape) == 65536)
+                    assert staged_changed == (math.prod(shape) == 65536)
                     assert twoshot_changed == (math.prod(shape) != 65536)
                     dist.barrier()
             if current_platform().is_cdna4:
-                _check_mixed_geometry_graph_replay(
+                _check_partial_tile_graph_replay(
                     state,
                     rank,
                     world_size,
@@ -451,7 +452,7 @@ def _check_all_reduce_graph_replay(
         assert storage[0].item() == -1
 
 
-def _check_mixed_geometry_graph_replay(
+def _check_partial_tile_graph_replay(
     state,
     rank: int,
     world_size: int,
@@ -736,7 +737,7 @@ def _ar_epoch_worker_main(rank, world_size, port, path, rows):
         state = create_iris_state(
             group=dist.group.WORLD,
             rank_in_group=rank,
-            staged_max_numel=16 * 7168,
+            staged_max_numel=max(rows, 16) * 7168,
             producer_direct_max_numel=16 * 7168,
             dtype=torch.bfloat16,
             heap_size=None,
@@ -768,14 +769,18 @@ def _ar_epoch_worker_main(rank, world_size, port, path, rows):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = reduce()
-        if path == "staged_one_shot":
+        if not producer_direct:
             # Guard against the dispatcher silently picking another path.
             before = flags.clone()
             graph.replay()
             torch.cuda.synchronize()
             dist.barrier()
-            used = math.ceil(rows * 7168 / state.staged.block_size)
-            assert torch.equal(flags[:used, rank], before[:used, rank] + 1)
+            if path == "staged_one_shot":
+                used = math.ceil(rows * 7168 / state.staged.block_size)
+                assert torch.equal(flags[:used, rank], before[:used, rank] + 1)
+            else:
+                # Entry, partition and exit rendezvous each advance the epoch.
+                assert flags[0, rank] == before[0, rank] + 3
 
         for replay in (False, True):
             # Include entry and intermediate-stage wraps, plus a normal epoch.
@@ -819,7 +824,7 @@ def _ar_epoch_worker_main(rank, world_size, port, path, rows):
     [
         (8, "producer_direct", 1),
         (8, "producer_direct", 16),
-        (8, "staged_two_shot", 16),
+        (8, "staged_two_shot", 64),
         (2, "staged_one_shot", 1),
         (2, "staged_one_shot", 16),
     ],

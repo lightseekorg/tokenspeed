@@ -42,6 +42,9 @@ IRIS_ALL_REDUCE_MAX_BYTES = 512 << 10
 _PACKED_WORD_BYTES = 8
 _TWO_SHOT_WORLD_SIZES = (4, 8)
 _PRODUCER_TWO_SHOT_MIN_BYTES = {4: 160 << 10, 8: 96 << 10}
+# Ordinary tensors use the staged one-shot below these sizes; measured on
+# gfx950 with BF16 against the Gluon one-shot's single rendezvous.
+_STAGED_TWO_SHOT_MIN_BYTES = {4: 1 << 20, 8: 448 << 10}
 _PRODUCER_DIRECT_GL_DTYPES = {
     torch.bfloat16: gl.bfloat16,
     torch.float16: gl.float16,
@@ -159,7 +162,6 @@ class IrisAllReduce:
             ProducerPull,
             StagedPullOneShot,
             StagedPullTwoShot,
-            staged_tuning,
         )
 
         if min(staged_max_numel, producer_direct_max_numel) < 0:
@@ -191,14 +193,6 @@ class IrisAllReduce:
             if staged_max_numel
             else None
         )
-        tuning = staged_tuning(staged_max_numel, peers.world_size, dtype)
-        self.tuned_staged = (
-            StagedPullOneShot(
-                peers, tuning[0], dtype, block_size=tuning[1], num_subgroups=tuning[2]
-            )
-            if tuning is not None
-            else None
-        )
         self.staged_two_shot = (
             StagedPullTwoShot(peers, staged_max_numel, dtype)
             if staged_max_numel and StagedPullTwoShot.supported(peers.world_size, dtype)
@@ -215,12 +209,7 @@ class IrisAllReduce:
         assert not async_op, "Iris all-reduce does not support async_op"
         assert tensor.dtype == self.dtype
         assert 0 < tensor.numel() <= self.staged_max_numel
-        if (
-            self.tuned_staged is not None
-            and tensor.numel() == self.tuned_staged.slots.shape[1]
-        ):
-            self.tuned_staged.run(tensor, tensor)
-        elif self.staged_two_shot is not None and self.staged_two_shot.can_run(
+        if self.staged_two_shot is not None and self.staged_two_shot.can_run(
             tensor.numel()
         ):
             self.staged_two_shot.run(tensor, tensor)

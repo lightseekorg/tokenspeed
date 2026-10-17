@@ -24,7 +24,7 @@ import math
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
+from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton, triton
 
 with redirect_triton_to_tokenspeed_triton():
     import iris
@@ -81,6 +81,7 @@ class IrisGroup:
         self.group = group
         self.rank = rank
         self.device = device
+        self.subgroup_size = triton.runtime.driver.active.get_current_target().warp_size
         self.world_size = group.size()
         ranks = dist.get_process_group_ranks(group)
         assert ranks[rank] == dist.get_rank()

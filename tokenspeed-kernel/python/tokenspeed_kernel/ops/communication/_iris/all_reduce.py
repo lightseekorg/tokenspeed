@@ -23,11 +23,12 @@
 import math
 
 import torch
-from tokenspeed_kernel._triton import gl, gluon, tl, triton
+from tokenspeed_kernel._triton import gl, gluon, hip_utils, tl, triton
 from tokenspeed_kernel.ops.communication._iris import IrisGroup, allocation_bytes, iris
 from tokenspeed_kernel.ops.communication.iris import (
     _PACKED_WORD_BYTES,
     _PRODUCER_DIRECT_GL_DTYPES,
+    _STAGED_TWO_SHOT_MIN_BYTES,
     _TWO_SHOT_WORLD_SIZES,
     _use_two_stage_plain,
     _use_two_stage_producer_direct,
@@ -35,7 +36,6 @@ from tokenspeed_kernel.ops.communication.iris import (
 )
 from tokenspeed_kernel.platform import current_platform
 
-_SUBGROUP_SIZE = 64
 _PULL_MAX_PROGRAMS = 84
 _PULL_WORDS_PER_LANE = 2
 _TWO_SHOT_NUM_SUBGROUPS = 8
@@ -102,7 +102,7 @@ class StagedPullOneShot:
     """Own rotating slots and epochs for one staging geometry."""
 
     BLOCK_SIZE = 2048
-    NUM_SUBGROUPS = 4
+    NUM_SUBGROUPS = 8
     INPUT_SLOTS = 2
 
     @staticmethod
@@ -127,7 +127,10 @@ class StagedPullOneShot:
         self.peers = peers
         self.block_size = block_size
         self.num_subgroups = num_subgroups
+        self.arch_major = current_platform().arch_version.major
         self.slots = peers.ctx.zeros((self.INPUT_SLOTS, max_numel), dtype=dtype)
+        # Kernels mark peer slot bases as 16-byte aligned.
+        assert self.slots.data_ptr() % 16 == 0
         self.ready_flags = peers.ctx.zeros(
             (triton.cdiv(max_numel, self.block_size), peers.world_size),
             dtype=torch.int32,
@@ -139,13 +142,15 @@ class StagedPullOneShot:
             self.slots.view(-1),
             out.view(-1),
             self.ready_flags,
-            self.peers.bases,
+            *self.peers.addresses,
             tensor.numel(),
             RANK=self.peers.rank,
             WORLD_SIZE=self.peers.world_size,
             BLOCK_SIZE=self.block_size,
             SLOT_STRIDE=self.slots.shape[1],
             NUM_SLOTS=self.slots.shape[0],
+            NUM_WARPS=self.num_subgroups,
+            ARCH_MAJOR=self.arch_major,
             num_warps=self.num_subgroups,
         )
 
@@ -163,7 +168,7 @@ def _launch_pull_twoshot(
     partition_words = out.numel() // peers.world_size // elements_per_word
     block_words = (
         _TWO_SHOT_NUM_SUBGROUPS
-        * _SUBGROUP_SIZE
+        * peers.subgroup_size
         * _PULL_WORDS_PER_LANE
         // peers.world_size
     )
@@ -182,17 +187,20 @@ def _launch_pull_twoshot(
         NUM_PROGRAMS=num_programs,
         NUM_TILES=num_tiles,
         NUM_WARPS=_TWO_SHOT_NUM_SUBGROUPS,
-        SUBGROUP_SIZE=_SUBGROUP_SIZE,
         WORDS_PER_LANE=_PULL_WORDS_PER_LANE,
         ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
         ELEMENTS_PER_WORD=elements_per_word,
         EXIT_BARRIER=exit_barrier,
+        FLAG_ROW_STRIDE=ready_flags.stride(0),
         num_warps=_TWO_SHOT_NUM_SUBGROUPS,
     )
 
 
 class StagedPullTwoShot:
     """Own stable staging, partition scratch, and completion epochs."""
+
+    # Keep independent workgroups on separate 128-byte cache lines.
+    FLAG_ROW_STRIDE = 32
 
     @staticmethod
     def supported(world_size: int, dtype: torch.dtype) -> bool:
@@ -207,7 +215,9 @@ class StagedPullTwoShot:
         return (
             allocation_bytes((max_numel,), dtype)
             + allocation_bytes((_pull_scratch_numel(max_numel, world_size),), dtype)
-            + allocation_bytes((_PULL_MAX_PROGRAMS, world_size), torch.int32)
+            + allocation_bytes(
+                (_PULL_MAX_PROGRAMS, StagedPullTwoShot.FLAG_ROW_STRIDE), torch.int32
+            )
         )
 
     def __init__(self, peers: IrisGroup, max_numel: int, dtype: torch.dtype):
@@ -217,12 +227,16 @@ class StagedPullTwoShot:
             (_pull_scratch_numel(max_numel, peers.world_size),), dtype=dtype
         )
         self.ready_flags = peers.ctx.zeros(
-            (_PULL_MAX_PROGRAMS, peers.world_size), dtype=torch.int32
+            (_PULL_MAX_PROGRAMS, self.FLAG_ROW_STRIDE), dtype=torch.int32
         )
 
     def can_run(self, numel: int) -> bool:
-        return 0 < numel <= self.input.numel() and _use_two_stage_plain(
-            self.peers.world_size, numel, self.input.dtype
+        world_size = self.peers.world_size
+        return (
+            0 < numel <= self.input.numel()
+            and numel * self.input.element_size()
+            >= _STAGED_TWO_SHOT_MIN_BYTES[world_size]
+            and _use_two_stage_plain(world_size, numel, self.input.dtype)
         )
 
     def run(self, tensor: torch.Tensor, out: torch.Tensor) -> None:
@@ -302,7 +316,6 @@ class ProducerPull:
             NUM_PROGRAMS=num_programs,
             NUM_TILES=num_tiles,
             NUM_WARPS=self.NUM_SUBGROUPS,
-            SUBGROUP_SIZE=_SUBGROUP_SIZE,
             WORDS_PER_LANE=_PULL_WORDS_PER_LANE,
             PUBLISH_READY=False,
             ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
@@ -379,21 +392,6 @@ class ProducerLamport:
         )
 
 
-def staged_tuning(
-    max_numel: int, world_size: int, dtype: torch.dtype
-) -> tuple[int, int, int] | None:
-    """Return the measured TP4 geometry when this state can serve its payload."""
-    # This exact CDNA4 TP4 payload is faster with the one-shot geometry.
-    if (
-        current_platform().is_cdna4
-        and world_size == 4
-        and dtype == torch.bfloat16
-        and max_numel >= 16 * 4096
-    ):
-        return 16 * 4096, 512, 1
-    return None
-
-
 def all_reduce_heap_bytes(
     staged_max_numel: int,
     producer_max_numel: int,
@@ -408,10 +406,6 @@ def all_reduce_heap_bytes(
         size += StagedPullOneShot.heap_bytes(
             staged_max_numel, world_size, dtype, StagedPullOneShot.BLOCK_SIZE
         )
-        tuning = staged_tuning(staged_max_numel, world_size, dtype)
-        if tuning is not None:
-            numel, block_size, _ = tuning
-            size += StagedPullOneShot.heap_bytes(numel, world_size, dtype, block_size)
         if StagedPullTwoShot.supported(world_size, dtype):
             size += StagedPullTwoShot.heap_bytes(staged_max_numel, world_size, dtype)
     return size
@@ -430,95 +424,216 @@ def _iris_drain_subgroup_vmem():
     )
 
 
-@triton.jit
-def iris_pull_oneshot_staged(
+@gluon.jit
+def wait_vmem(ARCH_MAJOR: gl.constexpr):
+    """Wait for this subgroup's outstanding vector memory operations to complete."""
+    if ARCH_MAJOR >= 12:
+        gl.inline_asm_elementwise(
+            "s_wait_loadcnt 0; s_wait_storecnt 0",
+            "=r,~{memory}",
+            [],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
+    else:
+        _iris_drain_subgroup_vmem()
+
+
+@gluon.jit
+def _iris_staged_pull_reduce(
     input_ptr,
-    input_sym_ptr,
-    output_ptr,
+    slots_ptr,
     ready_flags,
-    heap_bases,
-    NUMEL,
-    RANK: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    SLOT_STRIDE: tl.constexpr,
-    NUM_SLOTS: tl.constexpr,
+    flag_row,
+    offsets,
+    mask,
+    heap_base_0,
+    heap_base_1,
+    heap_base_2,
+    heap_base_3,
+    heap_base_4,
+    heap_base_5,
+    heap_base_6,
+    heap_base_7,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    SLOT_STRIDE: gl.constexpr,
+    NUM_SLOTS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    ARCH_MAJOR: gl.constexpr,
 ):
-    """One-shot all-reduce over rotating staging slots.
+    """Stage local values, pull every peer's copy, and return the FP32 sum.
 
-    Copy input_ptr into input_sym_ptr's selected slot, sum peer slots in FP32,
-    and write output_ptr at its supplied dtype.
+    Staging precedes the entry wait, so a rank called straight back would
+    overwrite a slot a slower peer is still reading. With two or more rotating
+    slots, the entry wait is sufficient: before a rank returns to epoch E's
+    slot it must pass the wait at E+1, and a peer publishes E+1 only after it
+    has finished reading E. A single slot instead needs a completion
+    rendezvous before returning, trading heap for one more peer wait.
 
-    A single staging slot is not safe across calls. Each rank stages, publishes
-    a ready epoch, waits for its peers, sums their slots and returns -- but the
-    store happens *before* the wait, so a rank called straight back overwrites
-    the slot a slower peer is still summing, and that peer silently sums the
-    next collective's data. No error, no hang, just wrong numbers on whichever
-    ranks lagged.
-
-    Rotating over at least two slots closes it, and the existing entry barrier
-    makes two sufficient. Writing epoch E+1 lands on a different slot. Before a
-    rank can wrap back to E's slot, it must pass the entry wait at E+1; a peer
-    publishes ready(E+1) only after it has finished reading E. By the time a
-    slot is reused, every peer is provably done with it, and no consumption flag
-    or exit barrier has to be paid for.
-
-    Epochs are per-block, so a grid that shrinks between calls leaves the higher
-    blocks' counters where they were. That is consistent across ranks -- every
-    rank launches the same grid for the same collective -- and blocks never read
-    each other's slots, so they may sit on different slots at once.
-
-    Epochs are int32 and wrap after 2**31 calls per block. The slot index is
-    taken from the unsigned epoch, so with a power-of-two slot count the
-    rotation continues across the wrap, and the wait compares modulo 2**32,
-    so an epoch just past the wrap still counts as newer.
+    Each ``flag_row`` is an independent epoch domain; every rank launches the
+    same rows for a collective, so a shrinking grid leaves unused rows' epochs
+    consistent. Epochs are int32 and wrap: the slot comes from the low bits
+    and the wait compares modulo 2**32.
     """
-    # 2**32 must be a multiple of the slot count for the rotation to survive
-    # the wrap.
-    tl.static_assert(NUM_SLOTS & (NUM_SLOTS - 1) == 0)
-    block_id = tl.program_id(0)
-    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < NUMEL
+    gl.static_assert(NUM_SLOTS & (NUM_SLOTS - 1) == 0)
+    local_heap = _iris_heap_base(
+        RANK,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+    )
+    epoch_ptr = ready_flags + flag_row * WORLD_SIZE + RANK
+    # Only this rank writes its own counter, and the previous launch finished.
+    epoch = gl.load(epoch_ptr) + 1
+    slot = (epoch & (NUM_SLOTS - 1)) * SLOT_STRIDE
 
-    flag_offset = block_id * WORLD_SIZE
-    local_ready = ready_flags + flag_offset + RANK
-    epoch = tl.load(local_ready).to(tl.int32) + 1
-    slot = (epoch.to(tl.uint32, bitcast=True) % NUM_SLOTS).to(tl.int32) * SLOT_STRIDE
+    local = gl.load(input_ptr + offsets, mask=mask, other=0.0)
+    gl.store(slots_ptr + slot + offsets, local, mask=mask, cache_modifier=".wt")
+    # Join every subgroup's staging stores before peers can observe the epoch.
+    wait_vmem(ARCH_MAJOR)
+    gl.barrier()
+    gl.atomic_xchg(epoch_ptr, epoch, sem="release", scope="sys")
+    # Pushing epochs lets each rank poll local memory for all peers at once.
+    _iris_sync_rank_epoch(
+        ready_flags,
+        flag_row,
+        epoch,
+        local_heap,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+        RANK,
+        WORLD_SIZE,
+        NUM_WARPS,
+        FLAG_ROW_STRIDE=WORLD_SIZE,
+        PUBLISH=True,
+    )
 
-    local = tl.load(input_ptr + offsets, mask=mask, other=0.0)
-    tl.store(input_sym_ptr + slot + offsets, local, mask=mask, cache_modifier=".wt")
-    tl.debug_barrier()
-
-    tl.atomic_xchg(local_ready, epoch, sem="release", scope="sys")
-    for peer in tl.static_range(0, WORLD_SIZE):
-        if peer != RANK:
-            # Start one behind so the first poll always happens, then compare
-            # modulo 2**32: a peer may already have passed the wrap.
-            seen = epoch - 1
-            while (seen - epoch) < 0:
-                seen = iris.load(
-                    ready_flags + flag_offset + peer,
-                    RANK,
+    # Every rank adds in rank order so all ranks hold bitwise-equal results.
+    for peer in gl.static_range(0, WORLD_SIZE):
+        if peer == RANK:
+            term = local
+        else:
+            peer_slots = _iris_translate(
+                slots_ptr,
+                local_heap,
+                _iris_heap_base(
                     peer,
-                    heap_bases,
-                    cache_modifier=".cv",
-                    volatile=True,
-                )
-
-    acc = local.to(tl.float32)
-    for peer in tl.static_range(0, WORLD_SIZE):
-        if peer != RANK:
-            acc += iris.load(
-                input_sym_ptr + slot + offsets,
-                RANK,
-                peer,
-                heap_bases,
+                    heap_base_0,
+                    heap_base_1,
+                    heap_base_2,
+                    heap_base_3,
+                    heap_base_4,
+                    heap_base_5,
+                    heap_base_6,
+                    heap_base_7,
+                ),
+            )
+            term = gl.load(
+                peer_slots + slot + offsets,
                 mask=mask,
                 other=0.0,
                 cache_modifier=".cg",
-                hint=BLOCK_SIZE,
-            ).to(tl.float32)
-    tl.store(output_ptr + offsets, acc.to(output_ptr.type.element_ty), mask=mask)
+            )
+        if peer == 0:
+            acc = term.to(gl.float32)
+        else:
+            acc += term.to(gl.float32)
+
+    if NUM_SLOTS == 1:
+        # Peers must finish reading this slot before the next call restages it.
+        wait_vmem(ARCH_MAJOR)
+        gl.barrier()
+        gl.atomic_xchg(epoch_ptr, epoch + 1, sem="release", scope="sys")
+        _iris_sync_rank_epoch(
+            ready_flags,
+            flag_row,
+            epoch + 1,
+            local_heap,
+            heap_base_0,
+            heap_base_1,
+            heap_base_2,
+            heap_base_3,
+            heap_base_4,
+            heap_base_5,
+            heap_base_6,
+            heap_base_7,
+            RANK,
+            WORLD_SIZE,
+            NUM_WARPS,
+            FLAG_ROW_STRIDE=WORLD_SIZE,
+            PUBLISH=True,
+        )
+    return acc
+
+
+@gluon.jit
+def iris_pull_oneshot_staged(
+    input_ptr,
+    slots_ptr,
+    output_ptr,
+    ready_flags,
+    heap_base_0,
+    heap_base_1,
+    heap_base_2,
+    heap_base_3,
+    heap_base_4,
+    heap_base_5,
+    heap_base_6,
+    heap_base_7,
+    NUMEL,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    BLOCK_SIZE: gl.constexpr,
+    SLOT_STRIDE: gl.constexpr,
+    NUM_SLOTS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    ARCH_MAJOR: gl.constexpr,
+):
+    """Reduce an ordinary tensor through rotating symmetric staging slots."""
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // hip_utils.num_warps()
+    gl.static_assert(BLOCK_SIZE % (SUBGROUP_SIZE * NUM_WARPS) == 0)
+    layout: gl.constexpr = gl.BlockedLayout(
+        [BLOCK_SIZE // (SUBGROUP_SIZE * NUM_WARPS)], [SUBGROUP_SIZE], [NUM_WARPS], [0]
+    )
+    block_id = gl.program_id(0)
+    offsets = block_id * BLOCK_SIZE + gl.arange(0, BLOCK_SIZE, layout=layout)
+    mask = offsets < NUMEL
+    acc = _iris_staged_pull_reduce(
+        input_ptr,
+        slots_ptr,
+        ready_flags,
+        block_id,
+        offsets,
+        mask,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+        RANK,
+        WORLD_SIZE,
+        SLOT_STRIDE,
+        NUM_SLOTS,
+        NUM_WARPS,
+        ARCH_MAJOR,
+    )
+    gl.store(output_ptr + offsets, acc.to(output_ptr.dtype.element_ty), mask=mask)
 
 
 @gluon.jit
@@ -709,6 +824,13 @@ def _iris_heap_base(
 
 
 @gluon.jit
+def _iris_translate(pointer, local_heap, peer_heap):
+    """Map a 16-byte-aligned symmetric pointer from this heap to a peer's."""
+    offset = tl.cast(pointer, gl.uint64) - local_heap
+    return gl.multiple_of(tl.cast(peer_heap + offset, pointer.dtype), 16)
+
+
+@gluon.jit
 def _iris_sync_rank_token(
     flags,
     row,
@@ -725,9 +847,9 @@ def _iris_sync_rank_token(
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
 ):
     """Publish a counter to peers and wait for their matching counters."""
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // hip_utils.num_warps()
     layout: gl.constexpr = gl.BlockedLayout([1], [SUBGROUP_SIZE], [NUM_WARPS], [0])
     peers = gl.arange(0, WORLD_SIZE, layout=layout)
     peer_mask = peers != RANK
@@ -780,6 +902,11 @@ def _iris_sync_rank_token(
     gl.barrier()
 
 
+@triton.constexpr_function
+def _peer_lanes(world_size):
+    return triton.next_power_of_2(world_size)
+
+
 @gluon.jit
 def _iris_sync_rank_epoch(
     ready_flags,
@@ -797,7 +924,7 @@ def _iris_sync_rank_epoch(
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
+    FLAG_ROW_STRIDE: gl.constexpr,
     PUBLISH: gl.constexpr,
 ):
     """Wait until each peer's workgroup counter reaches the requested epoch.
@@ -806,10 +933,11 @@ def _iris_sync_rank_epoch(
     otherwise read each peer's counter directly. Counter comparisons allow
     wraparound and peers that have already advanced to the next epoch.
     """
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // hip_utils.num_warps()
     ready_layout: gl.constexpr = gl.BlockedLayout(
         [1], [SUBGROUP_SIZE], [NUM_WARPS], [0]
     )
-    peer_ids = gl.arange(0, WORLD_SIZE, layout=ready_layout)
+    peer_ids = gl.arange(0, _peer_lanes(WORLD_SIZE), layout=ready_layout)
     peer_heaps = gl.where(peer_ids == 0, heap_base_0, heap_base_7)
     peer_heaps = gl.where(peer_ids == 1, heap_base_1, peer_heaps)
     peer_heaps = gl.where(peer_ids == 2, heap_base_2, peer_heaps)
@@ -818,26 +946,26 @@ def _iris_sync_rank_epoch(
     peer_heaps = gl.where(peer_ids == 5, heap_base_5, peer_heaps)
     peer_heaps = gl.where(peer_ids == 6, heap_base_6, peer_heaps)
     flags_heap_offset = tl.cast(ready_flags, gl.uint64) - local_heap
-    peer_mask = peer_ids != RANK
+    peer_mask = (peer_ids != RANK) & (peer_ids < WORLD_SIZE)
     if PUBLISH:
         remote_flags = tl.cast(
             peer_heaps + flags_heap_offset,
             gl.pointer_type(gl.int32),
         )
-        remote_flags += block_id * WORLD_SIZE + RANK
+        remote_flags += block_id * FLAG_ROW_STRIDE + RANK
         gl.store(
             remote_flags,
             epoch,
             mask=peer_mask,
             cache_modifier=".wt",
         )
-        wait_flags = ready_flags + block_id * WORLD_SIZE + peer_ids
+        wait_flags = ready_flags + block_id * FLAG_ROW_STRIDE + peer_ids
     else:
         wait_flags = tl.cast(
             peer_heaps + flags_heap_offset,
             gl.pointer_type(gl.int32),
         )
-        wait_flags += block_id * WORLD_SIZE + peer_ids
+        wait_flags += block_id * FLAG_ROW_STRIDE + peer_ids
     seen = gl.load(
         wait_flags,
         mask=peer_mask,
@@ -935,7 +1063,6 @@ def iris_pull_oneshot(
     NUM_PROGRAMS,
     NUM_TILES,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
     WORDS_PER_LANE: gl.constexpr,
     PUBLISH_READY: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
@@ -978,11 +1105,12 @@ def iris_pull_oneshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
+        FLAG_ROW_STRIDE=WORLD_SIZE,
         PUBLISH=PUBLISH_READY,
     )
 
     input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // hip_utils.num_warps()
     layout: gl.constexpr = gl.BlockedLayout(
         [WORDS_PER_LANE], [SUBGROUP_SIZE], [NUM_WARPS], [0]
     )
@@ -1067,7 +1195,7 @@ def iris_pull_oneshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
+        FLAG_ROW_STRIDE=WORLD_SIZE,
         PUBLISH=PUBLISH_READY,
     )
 
@@ -1095,11 +1223,11 @@ def iris_pull_twoshot(
     NUM_PROGRAMS,
     NUM_TILES,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
     WORDS_PER_LANE: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
     EXIT_BARRIER: gl.constexpr,
+    FLAG_ROW_STRIDE: gl.constexpr,
 ):
     """Reduce-scatter producer outputs, then all-gather the rank partitions.
 
@@ -1121,8 +1249,10 @@ def iris_pull_twoshot(
         heap_base_6,
         heap_base_7,
     )
-    epoch_ptr = ready_flags + block_id * WORLD_SIZE + RANK
-    epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
+    epoch_ptr = ready_flags + block_id * FLAG_ROW_STRIDE + RANK
+    # Only this rank writes its counter; later phases advance this known epoch.
+    epoch = gl.load(epoch_ptr) + 1
+    gl.atomic_xchg(epoch_ptr, epoch, sem="release", scope="sys")
     _iris_sync_rank_epoch(
         ready_flags,
         block_id,
@@ -1139,12 +1269,13 @@ def iris_pull_twoshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
+        FLAG_ROW_STRIDE=FLAG_ROW_STRIDE,
         PUBLISH=True,
     )
 
     input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
     scratch_heap_offset = tl.cast(scratch_sym_ptr, gl.uint64) - local_heap
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // hip_utils.num_warps()
     load_layout: gl.constexpr = gl.BlockedLayout(
         [1, WORDS_PER_LANE],
         [1, SUBGROUP_SIZE],
@@ -1222,7 +1353,8 @@ def iris_pull_twoshot(
         )
         tile_id += NUM_PROGRAMS
 
-    partitions_ready = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
+    partitions_ready = epoch + 1
+    gl.atomic_xchg(epoch_ptr, partitions_ready, sem="release", scope="sys")
     _iris_sync_rank_epoch(
         ready_flags,
         block_id,
@@ -1239,7 +1371,7 @@ def iris_pull_twoshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
+        FLAG_ROW_STRIDE=FLAG_ROW_STRIDE,
         PUBLISH=True,
     )
 
@@ -1272,7 +1404,8 @@ def iris_pull_twoshot(
         # kernel until every peer has finished reading makes a single staging
         # buffer correct by construction, at the price of one more rendezvous.
         # Producer-direct callers own their input and pass False.
-        reads_done = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
+        reads_done = epoch + 2
+        gl.atomic_xchg(epoch_ptr, reads_done, sem="release", scope="sys")
         _iris_sync_rank_epoch(
             ready_flags,
             block_id,
@@ -1289,7 +1422,7 @@ def iris_pull_twoshot(
             RANK,
             WORLD_SIZE,
             NUM_WARPS,
-            SUBGROUP_SIZE,
+            FLAG_ROW_STRIDE=FLAG_ROW_STRIDE,
             PUBLISH=True,
         )
 

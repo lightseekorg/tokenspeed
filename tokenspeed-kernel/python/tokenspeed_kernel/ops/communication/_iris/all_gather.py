@@ -251,7 +251,7 @@ def iris_pull_allgather_columns(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
+        FLAG_ROW_STRIDE=WORLD_SIZE,
         PUBLISH=True,
     )
     gl.atomic_add(epoch_ptr, 0, sem="acquire", scope="sys")
@@ -294,7 +294,7 @@ def iris_pull_allgather_columns(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
+        FLAG_ROW_STRIDE=WORLD_SIZE,
         PUBLISH=True,
     )
 

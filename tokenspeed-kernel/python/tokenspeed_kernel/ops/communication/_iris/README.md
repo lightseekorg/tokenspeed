@@ -29,6 +29,11 @@ prepared variants using the existing shape and topology policies. Different
 staging geometries have separate synchronization buffers because their workgroup
 IDs cover different element ranges. Triton RSAG remains independent.
 
+Ordinary tensors use a Gluon one-shot that stages and reduces in one launch,
+with two rotating input slots. Producer-direct reductions use the shared Gluon
+one-shot or pull two-shot implementation without staging the producer input.
+Staged two-shot uses separate flag rows padded to 128 bytes per workgroup.
+
 Model preparation, dispatch, and fusions live in `kimi_k3/` and
 `muse_spark/`. General collectives live in `all_reduce.py`,
 `reduce_scatter.py`, `all_gather.py`, and `broadcast.py`. The all-gather module
