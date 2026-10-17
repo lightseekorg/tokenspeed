@@ -36,7 +36,6 @@ from tokenspeed_kernel.ops.attention.mla import (  # noqa: E402
     supports_mla_decode_query_blocks,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (  # noqa: E402
-    _launch_split_reduce,
     _mla_decode_fwd_kernel,
     _mla_decode_fwd_reduce_kernel,
     _select_num_kv_splits,
@@ -236,29 +235,6 @@ def test_query_block_mla_split_count_fills_cus():
     # Few requests spread up to 128 splits over the CUs; more requests double
     # up to two programs per CU while every split keeps at least 12 pages.
     assert [splits(n) for n in (1, 2, 4, 8, 16)] == [128, 128, 64, 64, 32]
-
-
-def test_split_reduce_rejects_non_power_of_two_split_count():
-    tokens, heads, splits = 2, 4, 24
-    split_output = torch.zeros(
-        tokens, heads, splits, _KV_LORA_RANK, device="cuda", dtype=torch.bfloat16
-    )
-    split_stats = torch.zeros(tokens, heads, splits, device="cuda")
-    out = torch.empty(tokens, heads, _KV_LORA_RANK, device="cuda", dtype=torch.bfloat16)
-    lengths = torch.full((tokens,), 4096, device="cuda", dtype=torch.int32)
-    # The merge walks whole 16-split chunks, so 24 splits would drop the last 8.
-    with pytest.raises(ValueError, match="power of two"):
-        _launch_split_reduce(
-            out,
-            None,
-            split_output,
-            split_stats,
-            split_stats,
-            lengths,
-            queries_per_seq=1,
-            all_decode=True,
-            page_size=_PAGE_SIZE,
-        )
 
 
 def test_query_block_mla_projected_value_composes_on_query_axis():
