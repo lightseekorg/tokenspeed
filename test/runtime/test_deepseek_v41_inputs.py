@@ -266,6 +266,10 @@ def test_chunked_prefill_and_pending_overlap_samples(buffers, overlap):
         "ngram_request_ids",
         "request_token_history_ids",
         "draft_request_token_history_ids",
+        "stop_token_ids",
+        "token_limits",
+        "_stop_criteria_owners",
+        "stopped",
     }
     assert not runtime.has_request_token_history
     assert runtime.ngram_accepted_tokens.shape == (6, 3)

@@ -1833,10 +1833,6 @@ class ModelExecutor:
             self.runtime_states.valid_cache_lengths,
             num_extends,
             ib.state_write_padding_pool_index,
-            ngram_tail=None,
-            ngram_previous_tokens=None,
-            ngram_token_mask=None,
-            input_ids=None,
         )
 
     def _build_sampling_info(self, bs: int, num_extends: int) -> SamplingBatchInfo:

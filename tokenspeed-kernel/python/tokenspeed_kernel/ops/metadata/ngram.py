@@ -164,13 +164,13 @@ def _ngram_predecessor(
     live,
     distance: tl.constexpr,
     vocab: tl.constexpr,
-    CHECK_HISTORY: tl.constexpr,
+    check_history,
 ):
     from_batch = live & (local_row >= distance)
     current = tl.load(ids + rows - distance, from_batch, other=-1).to(tl.int64)
     # Most programs in a long packed run need no request history. Skip its
     # pointer chasing and seed checks when every live row has this predecessor.
-    if not CHECK_HISTORY or tl.sum((live & ~from_batch).to(tl.int32), 0) > 0:
+    if (check_history == 0) | (tl.sum((live & ~from_batch).to(tl.int32), 0) > 0):
         prefix = _ngram_prefix(
             snapshots,
             positions,
@@ -190,7 +190,16 @@ def _ngram_predecessor(
     return tl.where(live & (value >= 0) & (value < vocab), value, -1)
 
 
-@triton.jit(do_not_specialize=["total", "capacity", "bs", "uniform_length"])
+# The seed views (snapshots, positions, reset, ends) start at batch-dependent
+# offsets of one buffer, so their alignment must not select a compilation.
+_SEED_VIEWS = ["snapshots", "positions", "reset", "ends"]
+_BATCH_SCALARS = ["total", "capacity", "bs", "uniform_length", "check_history"]
+
+
+@triton.jit(
+    do_not_specialize=_BATCH_SCALARS,
+    do_not_specialize_on_alignment=_SEED_VIEWS + _BATCH_SCALARS,
+)
 def _prepare_ngram_hash(
     snapshots,
     positions,
@@ -214,21 +223,22 @@ def _prepare_ngram_hash(
     capacity,
     bs,
     uniform_length,
+    check_history,
     vocab: tl.constexpr,
     layers: tl.constexpr,
     heads: tl.constexpr,
     pad_id: tl.constexpr,
-    UNIFORM: tl.constexpr,
-    CHECK_HISTORY: tl.constexpr,
     ROWS: tl.constexpr,
     COLS: tl.constexpr,
 ):
     rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     layer = tl.program_id(1)
     live = rows < total
-    if UNIFORM:
+    # Uniform request lengths index directly; ragged batches binary-search the
+    # request ends. A runtime branch, so batch shape never selects a compile.
+    if uniform_length > 0:
         request = rows // uniform_length
-        start = request * uniform_length
+        start = (request * uniform_length).to(tl.int64)
     else:
         lo = tl.full((ROWS,), 0, tl.int32)
         hi = tl.full((ROWS,), bs, tl.int32)
@@ -260,7 +270,7 @@ def _prepare_ngram_hash(
             live,
             distance,
             vocab,
-            CHECK_HISTORY,
+            check_history,
         )
         lookbacks += (value,)
         if layer == 0:
@@ -408,18 +418,21 @@ def prepare_ngram_inputs(
         capacity,
         bs,
         uniform_length,
+        int(capacity > 2048),
         vocab_size,
         layers,
         heads,
         hash_params.pad_id,
-        uniform_length > 0,
-        capacity > 2048,
         rows,
         triton.next_power_of_2(3 * heads),
         num_warps=4,
         # Reject uncovered snapshots instead of silently hashing stale history.
         debug=True,
     )
+
+
+# Fixed tile: a batch-sized tile would compile once per power-of-two batch.
+_COMMIT_ROWS = 128
 
 
 @triton.jit(do_not_specialize=["bs", "num_extends", "capacity"])
@@ -522,7 +535,7 @@ def commit_ngram_inputs(
         cache_lengths[slots[live]] += delta[live]
         return
     if bs:
-        rows = min(1024, triton.next_power_of_2(bs))
+        rows = _COMMIT_ROWS
         _commit_ngram[(triton.cdiv(bs, rows),)](
             slots,
             lengths,
