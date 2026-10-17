@@ -395,12 +395,12 @@ views keep their allocation stride and score widths keep page alignment.
 QSA top-k uses separate CUDA, Triton and Gluon solutions selected through
 `select_kernel`; native CUDA workspace arguments stay inside its solution.
 
-QSA logits scoring and persistent CUDA top-k wait at entry before reading
-producer-owned queries, cache entries or metadata. Both follow the captured PDL
-setting. DSA and DSv4 persistent decode selection also follow that setting,
-including cluster launches. Small non-cluster PDL grids use a one-block register
-budget when their row count fits the SM count; larger grids retain the two-block
-budget. These precompiled launch-bounds variants use the same algorithm and
+On NVIDIA, QSA scoring and both CUDA and Triton top-k follow the captured PDL
+setting and wait before producer-owned reads when enabled. gfx950 Gluon has
+no dependency wait. DSA and DSv4 persistent decode selection also follow that
+setting, including cluster launches. Small non-cluster PDL grids use a one-block
+register budget when their row count fits the SM count; larger grids retain the
+two-block budget. These precompiled launch-bounds variants use the same algorithm and
 captured shapes, without reading device lengths. The compiler determines
 register allocation and occupancy. Register and streaming selectors retain both
 budgets: spreading waiting CTAs also benefits short-row selection while scoring finishes.
