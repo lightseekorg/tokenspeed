@@ -121,9 +121,10 @@ independent weight streams in flight per CU, which suits cold weights.
 - `BLOCK_K` and the wave count depend on `K` alone: one wave of 16-byte loads
   for `K <= 1536`, wider programs above.
 - `gemm.mv` takes it for any single row with `N, K >= 128`. `gemm.mm` hands a
-  single row to `mv` only for the `(N, K)` shapes in `_PREFERRED_SHAPES`,
-  where it beat mm's own path (Torch's skinny GEMM or hipBLASLt) in
-  cold-cache standalone sweeps.
+  single row to this GEMV only for the `(N, K)` shapes in
+  `_PREFERRED_SHAPES`, where it beat mm's own path (Torch's skinny GEMM or
+  hipBLASLt) in cold-cache standalone sweeps. The dense decode GEMV's own
+  measured shapes route single rows to `mv` separately.
 
 ### gfx950 dense BF16 decode GEMV
 

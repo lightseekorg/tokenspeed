@@ -138,8 +138,9 @@ def gluon_rowcta_bf16_gemv_gfx950(
 # Single-row shapes (N, K) where this GEMV beat ``gemm.mm``'s own path (Torch's
 # skinny GEMM or hipBLASLt) by at least 5% in cold-cache standalone sweeps on
 # MI350X, and stayed faster in serving traces. ``gemm.mm`` hands a single row
-# to ``gemm.mv`` only on these; direct ``gemm.mv`` calls take this GEMV for any
-# single row.
+# to this GEMV only on these shapes (the decode GEMV's own measured shapes
+# route to ``gemm.mv`` separately); direct ``gemm.mv`` calls take this GEMV for
+# any single row.
 _PREFERRED_SHAPES: frozenset[tuple[int, int]] = frozenset(
     {
         (160, 4096),
