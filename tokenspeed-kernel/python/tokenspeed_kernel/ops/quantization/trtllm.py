@@ -119,6 +119,44 @@ if platform.is_nvidia:
 
         raise ValueError(f"unsupported TRT-LLM FP8 granularity: {granularity!r}")
 
+    @register_kernel(
+        "quantization",
+        "fp8_with_scale",
+        name="trtllm_quantize_fp8_mn_major",
+        solution="trtllm",
+        capability=CapabilityRequirement(
+            max_arch_version=ArchVersion(10, 9),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "granularity": frozenset({"token_group_128"}),
+            "scale_encoding": frozenset({"float32"}),
+            "scale_layout": frozenset({"mn_major"}),
+            "pdl_enabled": frozenset({False}),
+        },
+        features=frozenset({"mn_major_scales"}),
+        priority=Priority.REFERENCE,
+    )
+    def trtllm_quantize_fp8_mn_major(
+        x: torch.Tensor,
+        *,
+        granularity: str,
+        group_size: int,
+        scale_encoding: str,
+        enable_pdl: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return FP8 values and a logical [M,K/128] view of native scales."""
+        if granularity != "token_group" or scale_encoding != "float32":
+            raise ValueError(
+                "MN-major FP8 quantization requires FP32 token-group scales"
+            )
+        if enable_pdl:
+            raise ValueError("TRT-LLM FP8 quantization does not expose PDL control")
+        q, scale = _per_token_group_quant_8bit(x, group_size, use_ue8m0=False)
+        # Native storage already has the padded M stride needed by SM90 TMA.
+        return q, scale.t()
+
     __all__ = [
         "trtllm_fp8_token_group_128",
         "trtllm_fp8_token",

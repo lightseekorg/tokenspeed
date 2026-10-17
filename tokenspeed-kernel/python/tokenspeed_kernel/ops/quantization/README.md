@@ -38,3 +38,17 @@ verification; its output norm belongs to this stage. MLA uses the same
 stage without RMSNorm. Prequantized values and scales feed the output
 projection directly. The same Triton implementation serves NVIDIA and AMD;
 PDL is enabled only where supported.
+
+## Native FP32 token-group scales
+
+Explicitly selecting `override="trtllm_quantize_fp8_mn_major"` with
+`granularity="token_group"`, `group_size=128` and `scale_encoding="float32"`
+returns FP8 values and a strided `[M, K / 128]` view of the native scales.
+This kernel accepts BF16 matrix inputs and does not support PDL. The scale
+strides are `(1, round_up(M, 4))`, matching Hopper TMA alignment without a
+contiguous-scale copy. Values and logical scales match the canonical TRT-LLM
+quantizer exactly.
+
+Ordinary quantization continues to select token-major storage. Callers opting
+into the native kernel must support its strides. This entry does not change
+model projections or GEMM dispatch.
