@@ -119,11 +119,10 @@ decode batches, `1 <= M <= 16`, with one program per CU.
   of `x`'s dtype (BF16 or FP16), `out` an `[M, N]` destination with unit
   inner stride; `K` is a multiple of 16 and at least 64.
 - Automatic selection (`gemm.mv`, which `gemm.mm` takes for BF16 decode rows)
-  uses it only for the Qwen3.8-Flash-Next TP2 shapes and M buckets (1, 2-4,
-  5-16) in `_PREFERRED_BUCKETS`, where it beat the default (Torch's skinny
-  GEMM at one row, the decode GEMM or hipBLASLt above) in cold-cache
-  standalone sweeps. It is the only `mv` kernel that serves single rows on
-  gfx950; direct calls take any supported shape.
+  uses it only for the `(N, K)` shapes and M buckets (1, 2-4, 5-16) listed in
+  `_PREFERRED_BUCKETS`, where it beat the default (Torch's skinny GEMM at one
+  row, the decode GEMM or hipBLASLt above) in cold-cache standalone sweeps.
+  Direct calls take any supported shape.
 - One binary per (shape, M bucket): M = 1, and M = 2-16. `M` and `N` are
   runtime arguments.
 

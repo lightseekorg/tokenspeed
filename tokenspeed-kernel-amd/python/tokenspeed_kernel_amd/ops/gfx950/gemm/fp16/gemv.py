@@ -497,7 +497,6 @@ _PREFERRED_BUCKETS: dict[tuple[int, int], frozenset[int]] = {
     (6656, 2560): frozenset({4, 16}),  # attention QKV with the output gate
     (512, 2560): frozenset({1, 4}),  # MoE router gate
     (640, 2560): frozenset({1, 4}),  # shared-expert gate-up, QSA indexer
-    (2560, 320): frozenset({1, 4, 16}),  # shared-expert down
 }
 
 
