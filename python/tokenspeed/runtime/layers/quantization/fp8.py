@@ -134,6 +134,70 @@ class Fp8Config(QuantizationConfig):
         return []
 
 
+class ModelOptFp8Config(Fp8Config):
+    """ModelOpt ``quant_algo: FP8``: FP8 weights with one FP32 ``weight_scale``
+    per tensor and a static per-tensor ``input_scale``."""
+
+    def __init__(
+        self,
+        kv_cache_quant_algo: str | None = None,
+        exclude_modules: list[str] | None = None,
+    ) -> None:
+        super().__init__(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="static",
+            ignored_layers=exclude_modules,
+        )
+        self.kv_cache_quant_algo = kv_cache_quant_algo
+        self.exclude_modules = exclude_modules or []
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "modelopt_fp8"
+
+    @classmethod
+    def get_config_filenames(cls) -> list[str]:
+        return ["hf_quant_config.json"]
+
+    @staticmethod
+    def _quantization_section(config: dict[str, Any]) -> dict[str, Any]:
+        # hf_quant_config.json nests under "quantization"; config.json's
+        # quantization_config is flat.
+        section = config.get("quantization", config)
+        return section if isinstance(section, dict) else config
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> ModelOptFp8Config:
+        section = cls._quantization_section(config)
+        if section.get("quant_algo") != "FP8":
+            raise ValueError(
+                "ModelOptFp8Config only supports FP8, got "
+                f"{section.get('quant_algo')!r}"
+            )
+        return cls(
+            kv_cache_quant_algo=section.get("kv_cache_quant_algo"),
+            exclude_modules=(
+                section.get("exclude_modules") or section.get("ignore") or []
+            ),
+        )
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> str | None:
+        """Detect ModelOpt FP8, which would otherwise stay ``modelopt``."""
+        if not isinstance(hf_quant_cfg, dict):
+            return None
+        section = cls._quantization_section(hf_quant_cfg)
+        if (
+            hf_quant_cfg.get("quant_method") == "modelopt"
+            and section.get("quant_algo") == "FP8"
+        ):
+            return cls.get_name()
+        return None
+
+    def moe_weight_dtype(self, prefix: str = "") -> str:
+        return "fp8"
+
+
 class Mxfp8Config(Fp8Config):
     """Config class for MXFP8."""
 
