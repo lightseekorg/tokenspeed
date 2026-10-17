@@ -106,6 +106,61 @@ def get_lock(
     return filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
 
 
+def _json_folder(model_config: ModelConfig, load_config: LoadConfig) -> str:
+    """The checkpoint folder holding its JSON files, fetched if remote."""
+    model_name_or_path = model_config.model_path
+    if os.path.isdir(model_name_or_path):
+        return model_name_or_path
+
+    def download_config_files() -> str:
+        return snapshot_download(
+            model_name_or_path,
+            revision=model_config.revision,
+            allow_patterns="*.json",
+            cache_dir=load_config.download_dir,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            tqdm_class=DisabledTqdm,
+        )
+
+    # Download the config files.
+    with get_lock(model_name_or_path, load_config.download_dir):
+        return call_with_hf_rate_limit_retry(
+            f"downloading config files of {model_name_or_path}",
+            download_config_files,
+        )
+
+
+def with_hf_quant_layers(quant_cfg: dict, hf_quant: dict) -> dict:
+    """Complete a per-layer ``quantization_config`` from ``hf_quant_config.json``.
+
+    ModelOpt writes both; a config.json copy can lack entries the export file
+    has (Nemotron 3.5 Super VL's leaves out its MTP experts), which would load
+    those modules as unquantized. Entries whose algorithms disagree are refused.
+    """
+    layers = dict(quant_cfg["quantized_layers"])
+    missing = {}
+    for name, entry in hf_quant.get("quantized_layers", {}).items():
+        if name not in layers:
+            missing[name] = entry
+        elif (
+            str(layers[name].get("quant_algo")).upper()
+            != str(entry.get("quant_algo")).upper()
+        ):
+            raise ValueError(
+                f"config.json quantizes {name} as {layers[name]}, "
+                f"hf_quant_config.json as {entry}"
+            )
+    if not missing:
+        return quant_cfg
+    logger.warning(
+        f"config.json's quantization_config lacks {len(missing)} quantized "
+        f"layers that hf_quant_config.json lists (e.g. {next(iter(missing))}); "
+        "taking them from hf_quant_config.json"
+    )
+    layers.update(missing)
+    return {**quant_cfg, "quantized_layers": layers}
+
+
 def get_quant_config(
     model_config: ModelConfig, load_config: LoadConfig
 ) -> QuantizationConfig:
@@ -121,29 +176,16 @@ def get_quant_config(
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
     if hf_quant_config is not None:
+        if "quantized_layers" in hf_quant_config:
+            hf_quant_path = os.path.join(
+                _json_folder(model_config, load_config), "hf_quant_config.json"
+            )
+            if os.path.isfile(hf_quant_path):
+                with open(hf_quant_path, encoding="utf-8") as f:
+                    hf_quant = json.load(f).get("quantization", {})
+                hf_quant_config = with_hf_quant_layers(hf_quant_config, hf_quant)
         return quant_cls.from_config(hf_quant_config)
-    model_name_or_path = model_config.model_path
-    is_local = os.path.isdir(model_name_or_path)
-    if not is_local:
-
-        def download_config_files() -> str:
-            return snapshot_download(
-                model_name_or_path,
-                revision=model_config.revision,
-                allow_patterns="*.json",
-                cache_dir=load_config.download_dir,
-                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-                tqdm_class=DisabledTqdm,
-            )
-
-        # Download the config files.
-        with get_lock(model_name_or_path, load_config.download_dir):
-            hf_folder = call_with_hf_rate_limit_retry(
-                f"downloading config files of {model_name_or_path}",
-                download_config_files,
-            )
-    else:
-        hf_folder = model_name_or_path
+    hf_folder = _json_folder(model_config, load_config)
 
     possible_config_filenames = quant_cls.get_config_filenames()
 
