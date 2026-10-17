@@ -344,10 +344,6 @@ def test_amd_fp8_auto_respects_registered_capabilities(
     )
     registry.register(candidate, registry.get_impl(original.name))
     try:
-        if capability == "deferred_finalize":
-            with pytest.raises(NotImplementedError, match="finalized"):
-                _fp8_layer()
-            return
         layer = _fp8_layer()
         expected = original.name if capability == "kernel_routing" else candidate.name
         assert layer.experts.plan["apply_kernel_name"] == expected

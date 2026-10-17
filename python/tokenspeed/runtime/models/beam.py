@@ -957,6 +957,10 @@ class BeamVendorMoE(BeamMoE):
         adapted.moe_output_scale = 1.0
         self._init_moe(adapted, mapping, layer_id, prefix, quant_config)
         experts = self.experts
+        if amd_default:
+            # Beam consumes finalized output, even when the selected kernel
+            # also supports separate routes for other models' combiners.
+            experts.plan["supports_deferred_finalize"] = False
         self.kernel_routing = experts.support_routing
         if (
             (not amd_default and experts.plan.get("precision_policy") != policy)

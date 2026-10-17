@@ -203,7 +203,8 @@ FP32 weights, accumulating in FP32 and rounding once to BF16.
 ### Portable MXFP4 experts
 
 `triton_mxfp4_precomputed_moe_apply` accepts only the default precision policy
-and unit `output_scale`, with finalized execution without EP. GEMM2 stores
+and unit `output_scale`. It supports contiguous expert shards and either
+finalized output or separate local routes for deferred combination. GEMM2 stores
 expert outputs in the input dtype. The combine multiplies route weights and
 sums in FP32 before the final store, without rounding each weighted route.
 Any routed scale belongs in the route weights. Dynamic MXFP4 activations
@@ -225,6 +226,8 @@ On gfx950, Beam uses `precision_policy="default"` for BF16, FP8 and MXFP4 expert
 precomputed routing, keeping its FP32 route coefficients and applying the routed
 scale exactly once in routing. `--moe-backend auto` uses normal registry
 priorities: Gluon for compatible BF16 and MXFP4 calls; Triton precedes Gluon for FP8.
+Beam requests finalized output from the selected AMD kernel, even when that
+kernel also supports deferred combination for other models.
 Explicit `triton` and `gluon` select within their respective registered backends.
 The Gluon FP8-storage/BF16-compute implementation accepts only the default
 policy; it remains restricted to gfx950, EP1, 256 experts, hidden width 5120,

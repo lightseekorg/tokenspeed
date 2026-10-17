@@ -79,9 +79,11 @@ def test_bf16_precision_policy_keeps_input_and_backend_validation(
         )
 
 
-@pytest.mark.parametrize("world,rank", [(1, 0), (4, 0), (4, 3)])
+@pytest.mark.parametrize(
+    "world,rank,ep", [(1, 0, 1), (4, 0, 1), (4, 3, 1), (4, 0, 4), (4, 3, 4)]
+)
 def test_beam_mxfp4_keeps_packed_experts_and_bf16_dense_weights(
-    server, amd_platform, world, rank
+    server, amd_platform, world, rank, ep
 ):
     server("triton")
     config = tiny_config()
@@ -100,7 +102,7 @@ def test_beam_mxfp4_keeps_packed_experts_and_bf16_dense_weights(
             (rows, width // 32), 120, dtype=torch.uint8
         )
     model = BeamForCausalLM(
-        config, Mapping(rank=rank, world_size=world), mxfp4_config()
+        config, Mapping(rank=rank, world_size=world, moe_ep_size=ep), mxfp4_config()
     )
     assert model.load_weights(checkpoint.items()) == checkpoint.keys()
     moe = model.model.layers[1].mlp
@@ -109,12 +111,15 @@ def test_beam_mxfp4_keeps_packed_experts_and_bf16_dense_weights(
     assert experts.plan["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
     assert experts.plan.get("output_scale", 1.0) == 1.0
     assert moe.route_scale == 2.5 and not experts.supports_deferred_finalize
-    width = 512 // world
-    channels = slice(rank * width, (rank + 1) * width)
-    packed_channels = slice(rank * width // 2, (rank + 1) * width // 2)
-    scale_channels = slice(rank * width // 32, (rank + 1) * width // 32)
-    for expert in range(config.num_experts):
-        prefix = f"model.layers.1.mlp.experts.{expert}"
+    width = 512 // (world // ep)
+    first_channel = 0 if ep > 1 else rank * width
+    channels = slice(first_channel, first_channel + width)
+    packed_channels = slice(first_channel // 2, (first_channel + width) // 2)
+    scale_channels = slice(first_channel // 32, (first_channel + width) // 32)
+    local_experts = config.num_experts // ep
+    first_expert = rank * local_experts if ep > 1 else 0
+    for expert in range(local_experts):
+        prefix = f"model.layers.1.mlp.experts.{first_expert + expert}"
         for half, projection in enumerate(("gate_proj", "up_proj")):
             resident_rows = slice(half * width, (half + 1) * width)
             name = f"{prefix}.{projection}.weight"
@@ -177,18 +182,14 @@ def test_beam_mxfp4_refuses_unpacked_selected_experts():
         list(policy.adapt([("model.layers.1.mlp.experts.0.gate_proj.weight", weight)]))
 
 
-@pytest.mark.parametrize(
-    "backend,ep", [("triton", 4), ("flashinfer_trtllm", 1), ("gluon", 1)]
-)
-def test_beam_mxfp4_refuses_unqualified_backends_and_expert_parallelism(
-    server, amd_platform, backend, ep
-):
+@pytest.mark.parametrize("backend", ["flashinfer_trtllm", "gluon"])
+def test_beam_mxfp4_refuses_unqualified_backends(server, amd_platform, backend):
     from tokenspeed_kernel.selection import NoKernelFoundError
 
     server(backend)
     config = tiny_config()
     config.moe_intermediate_size = 512
     config.num_key_value_heads = 8
-    mapping = Mapping(rank=0, world_size=4, moe_ep_size=ep)
+    mapping = Mapping(rank=0, world_size=4)
     with pytest.raises(NoKernelFoundError):
         BeamForCausalLM(config, mapping, mxfp4_config())
