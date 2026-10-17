@@ -45,6 +45,8 @@ This keeps CPU-to-GPU flow arrows within a rank while preventing matching
 launch IDs on different ranks from cross-linking. When TokenSpeed emits
 VizTracer scope-entry flows and Proton exports their scope IDs, the merger also
 links VizTracer Python slices to Proton CPU scopes.
+VizTracer process IDs that collide across ranks or with Proton's synthetic
+process IDs are remapped so separate processes do not share a timeline lane.
 
 Open the merged report in vizviewer or https://ui.perfetto.dev — Python
 frames and Proton's kernel/scope lanes share one time axis. Alignment
@@ -289,7 +291,9 @@ def merge_all_ranks(rank_traces: Iterable[TracePair], output_path: str | Path) -
     the all-ranks output gives it a pid of ``10000 + rank`` and encodes its TP
     rank in each numeric flow ID. The latter preserves CPU-to-GPU arrows
     within a rank without allowing equal launch IDs from two ranks to
-    cross-link.
+    cross-link. VizTracer process IDs are preserved unless they collide with
+    another rank or a synthetic Proton process; colliding IDs are remapped
+    consistently across slices, metadata, and flows. Thread IDs stay unchanged.
 
     Args:
         rank_traces: ``(rank, viztracer_path, proton_path)`` triples. Ranks
@@ -331,6 +335,22 @@ def merge_all_ranks(rank_traces: Iterable[TracePair], output_path: str | Path) -
         "baseTimeNanoseconds"
     ] = global_base_ns
 
+    used_pids = {_PROTON_PID_BASE + rank for rank in ranks}
+    # Allocate above every input PID so an early collision cannot take a
+    # later rank's original PID.
+    next_pid = (
+        max(
+            used_pids
+            | {
+                event["pid"]
+                for _, report, _, _, _ in loaded_pairs
+                for event in report.get("traceEvents", [])
+                if "pid" in event
+            }
+        )
+        + 1
+    )
+
     proton_event_count = 0
     for (
         rank,
@@ -344,6 +364,19 @@ def merge_all_ranks(rank_traces: Iterable[TracePair], output_path: str | Path) -
             proton_json, proton_path, viztracer_base_ns, rank=rank
         )
         viztracer_events = viztracer_json.get("traceEvents", [])
+        pid_map: dict[int, int] = {}
+        for event in viztracer_events:
+            if "pid" not in event:
+                continue
+            pid = event["pid"]
+            if pid not in pid_map:
+                if pid in used_pids:
+                    pid_map[pid] = next_pid
+                    next_pid += 1
+                else:
+                    pid_map[pid] = pid
+                used_pids.add(pid_map[pid])
+            event["pid"] = pid_map[pid]
         linked_flow_events = _link_viztracer_to_proton_cpu(
             viztracer_events, proton_events, rank
         )
