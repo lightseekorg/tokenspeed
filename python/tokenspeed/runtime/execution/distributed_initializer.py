@@ -24,6 +24,7 @@ import torch
 
 from tokenspeed.runtime.distributed.comm_backend import set_global_backend
 from tokenspeed.runtime.distributed.comm_backend.emulated import EmulatedRankBackend
+from tokenspeed.runtime.distributed.mapping import KVP_HISTORY_GROUP_NAME
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -35,10 +36,6 @@ from tokenspeed.runtime.utils.common import maybe_set_numa_aware_cpu_affinity
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
 logger = get_colorful_logger(__name__)
-
-# Launches of the in-switch all-reduce whose results must agree bitwise before
-# a batch-invariant deployment serves.
-MULTIMEM_SELF_CHECK_REPETITIONS = 8
 
 
 @dataclass
@@ -92,9 +89,6 @@ class DistributedConfig:
 
     # Feature flags
     force_deterministic_rsag: bool = False
-    # --batch-invariant-collectives: the in-switch all-reduce it routes to is
-    # verified on this deployment's groups before anything serves.
-    batch_invariant_collectives: bool = False
 
     # The full Mapping object for pg_manager initialization
     mapping: object = None
@@ -135,7 +129,6 @@ class DistributedConfig:
             hidden_size=hidden_size,
             max_num_tokens=max_num_tokens,
             force_deterministic_rsag=server_args.force_deterministic_rsag,
-            batch_invariant_collectives=server_args.batch_invariant_collectives,
             mapping=mapping,
         )
 
@@ -196,6 +189,12 @@ class DistributedInitializer:
         # group of one still is. init_process_group is idempotent and handles
         # size 1.
         pg_manager.init_process_group(config.mapping.attn.kvp_group)
+        if config.mapping.attn.has_kvp:
+            pg_manager.init_process_group(
+                config.mapping.attn.kvp_group,
+                backend=backend,
+                name=KVP_HISTORY_GROUP_NAME,
+            )
         # The query-context-parallel group of a sharded extend; equal to the
         # attention TP group while qcp == tp, so this is idempotent there.
         pg_manager.init_process_group(config.mapping.attn.qcp_group)
@@ -223,10 +222,6 @@ class DistributedInitializer:
             from tokenspeed.runtime.distributed.comm_backend import (
                 get_global_backend,
             )
-            from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
-            from tokenspeed.runtime.distributed.comm_backend.self_check import (
-                verify_multimem_all_reduce,
-            )
 
             backend = get_global_backend()
             trtllm_ar = getattr(backend, "trtllm_ar", None)
@@ -250,30 +245,6 @@ class DistributedInitializer:
                             f"trtllm one-shot all-reduce for group {group!s}: "
                             f"{('enabled' if ok else 'unavailable (NCCL fallback)')!s}",
                         )
-
-            # Verify, don't trust: the batch-invariant all-reduce routes to
-            # the in-switch reduction on the groups below; it serves only
-            # where it reproduces its bits here (comm_backend/self_check.py).
-            if config.batch_invariant_collectives and isinstance(backend, AutoBackend):
-                outcome = verify_multimem_all_reduce(
-                    backend,
-                    groups=(
-                        ("attention TP", config.mapping.attn.tp_group),
-                        ("dense TP", config.mapping.dense.tp_group),
-                        ("MoE TP-EP", config.mapping.moe.tp_ep_group),
-                    ),
-                    world_group=config.mapping.world_group,
-                    rank=config.mapping.rank,
-                    hidden_size=config.hidden_size,
-                    device=torch.device(config.device, config.gpu_id),
-                    repetitions=MULTIMEM_SELF_CHECK_REPETITIONS,
-                )
-                routes = ", ".join(f"{kind}: {route.value}" for kind, route in outcome)
-                logger.info(
-                    "batch-invariant all-reduce: in-switch reduction verified "
-                    f"bitwise -- {routes or 'no group headed for the switch'}; every "
-                    "other reduction takes the ordered fold"
-                )
 
         logger.info(
             "Init comm buff end. Avail mem="

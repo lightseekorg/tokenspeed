@@ -1,0 +1,44 @@
+api_version: ci.tokenspeed.io/v1
+name: perf-qwen3.8-flash-next-nvfp4-tp4ep4-agentic
+type: perf
+workflow_stage: model-test
+triggers:
+  - manual
+runner:
+  labels:
+    - slurm-gb300-4gpu
+slurm:
+  nodes: 1
+  gpus_per_node: 4
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+  - bash test/agentic_benchmark/Qwen3.8-Flash-Next/tokenspeed/prepare.sh
+server:
+  command: bash test/agentic_benchmark/Qwen3.8-Flash-Next/tokenspeed/configs/attn_tp4_moe_ep4.sh
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 7200
+    interval: 10
+perf:
+  command: >-
+    BENCH_DIR="$PWD/test/agentic_benchmark/Qwen3.8-Flash-Next/tokenspeed" &&
+    SWEEP_DIR=$(mktemp -d "$BENCH_DIR/outputs/ci_XXXXXX") &&
+    bash "$BENCH_DIR/run_benchmark.sh"
+    "$BENCH_DIR/.venv-evalscope/bin/evalscope"
+    "$BENCH_DIR/data/agentic_dataset.json"
+    "$SWEEP_DIR"
+report:
+  github_step_summary: true
+perf_threshold: 0.9
+# Values are [Latency (tps/user), Output Throughput (tok/min/gpu)].
+# Initial targets use the four-GPU SM103 measurements in #2216, converted
+# from system-wide output tok/s to tok/min/GPU.
+perf_reference:
+  1:  [691.82, 7789.35]
+  2:  [595.52, 13069.65]
+  4:  [436.44, 17306.10]
+  8:  [285.27, 23041.65]
+  16: [177.00, 29504.25]
+  32: [106.70, 36064.35]

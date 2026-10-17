@@ -175,7 +175,11 @@ void dsv3_router_gemm(TensorView output, TensorView mat_a, TensorView mat_b, boo
 
   cudaStream_t stream = get_stream(device);
 
-  bool use_custom_kernel = (num_tokens >= 1 && num_tokens <= 32);
+  // The custom kernels read both operands as 16-byte vectors; offset views
+  // (e.g. storage[1:]) take the cuBLAS fallback instead.
+  bool aligned = reinterpret_cast<uintptr_t>(mat_a.data_ptr()) % 16 == 0 &&
+                 reinterpret_cast<uintptr_t>(mat_b.data_ptr()) % 16 == 0;
+  bool use_custom_kernel = (num_tokens >= 1 && num_tokens <= 32) && aligned;
   bool supported_hidden =
       (hidden_dim == 3072 || hidden_dim == 5120 || hidden_dim == 6144 || hidden_dim == 7168);
 

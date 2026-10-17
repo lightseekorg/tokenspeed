@@ -420,7 +420,7 @@ class TritonSamplingBackend(SamplingBackend):
         # so the pool route below serves them too — same path the CUDA graph
         # captures. Equivalence to argmax is pinned by
         # test_greedy_route_equivalence.py.
-        offsets_pool = self._offsets_pool_for_kernels(sampling_info)
+        offsets_pool = self._prepare_sampling_offsets(sampling_info)
         bs = logits.shape[0]
         req_pool_indices = self._req_pool_indices_for_kernels(
             sampling_info.req_pool_indices, bs
@@ -625,7 +625,7 @@ class TritonSamplingBackend(SamplingBackend):
         tree: TreeVerifyBatch,
         bs: int,
     ) -> torch.Tensor:
-        """Per-node target picks keyed by the node's position (vc + depth), not its row.
+        """Per-node target picks keyed by target base position + depth, not row.
 
         Every node row becomes its own sampling row: its request's parameters
         gathered per row, and its noise offset advanced by its depth, so the
@@ -675,7 +675,7 @@ class TritonSamplingBackend(SamplingBackend):
             )
 
         # Greedy verifies through the same pool route (top_k=1); see sample().
-        offsets_pool = self._offsets_pool_for_kernels(sampling_info)
+        offsets_pool = self._prepare_sampling_offsets(sampling_info)
         req_pool_indices = self._req_pool_indices_for_kernels(
             sampling_info.req_pool_indices, bs
         )

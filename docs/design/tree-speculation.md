@@ -44,7 +44,7 @@ payload packing).
 
 Node `i` of a request's verify window has RoPE position `vc + depth[i]` and KV
 slot `write_locations[b * N + i]`. Only positions change for a tree:
-`TreeSpec.depth_positions` shifts the window's `vc + i` to `vc + depth` before
+`TreeSpec.load_step` shifts the window's `vc + i` to `vc + depth` before
 the forward, and `TreeSpec.compact_rows` shifts them back after the forward
 (row `i` then holds the path node at depth `i`).
 
@@ -87,8 +87,11 @@ state after its parent, not after node `t - 1`: `mamba2_verify_scan` takes
 `parent_indices` and `gdn_decode_mtp` the tree's ancestor mask (the one tree
 attention reads), and both reload the parent's state at branch points (a chain
 never reloads). `causal_conv1d_update` with `parent_indices` rebuilds each
-node's window from its ancestors' inputs and the initial window. The commit
-copies the scratch row of the
+node's window from its ancestors' inputs and the initial window. Where the
+selected GDN verify kernel takes a separate destination pool
+(`gdn_decode_mtp(output_state=...)`), roots read the committed recurrent state
+in place and only the node states go to the scratch, so the scratch is never
+seeded with a copy of the committed state. The commit copies the scratch row of the
 last accepted node, `1 + path[accept_len - 1]`, which for a chain is the
 familiar `accept_len`. The fused KDA verify kernel follows a chain and refuses
 trees.
@@ -99,7 +102,9 @@ per node). Under ReplaySSM the verify
 never writes the state pool. The verify runs a GDN tree of 8 to 16 nodes
 (`GDN_TREE_VERIFY_CHUNKED_MIN_NODES`, `GDN_TREE_VERIFY_CHUNKED_MAX_NODES`) in
 the chunked form of the delta rule, every node at once with the ancestor mask
-in place of the causal one, and keeps no node states. In other
+in place of the causal one, and keeps no node states; it also writes each
+node's replay payload row (`[k | v | a | b]`) as it reads them, so that verify
+skips the q/k/v split. In other
 trees the state of every branch point (a node with a child other than the next
 node) goes to one workspace shared by all layers
 (`gdn_decode_mtp(intermediate_states_buffer=...)`, one layer's worth per node),
@@ -124,13 +129,20 @@ chain's draft steps (`(S - 1) * K <= N`, checked in `server_args`). Their K/V
 are valid only while the round drafts its tree. The target's verify overwrites
 the window.
 
-Known limitation, shared with the chain drafter: the decode reservation
-guarantees pages only through the verify window (`vc + N`), and draft writes
-reach past it (lanes up to `frontier + (S - 1) * K - 1`, chain steps up to
-`frontier + S - 2`). A position past the allocated extent resolves to the
-dummy slot, and attention reads it through page 0. This costs draft acceptance
-only. The next verify rewrites target KV. The fix is a draft headroom in the
-scheduler's decode reservation.
+Draft writes reach past the verify window: lanes up to
+`frontier + (S - 1) * K - 1`, chain steps up to `frontier + S - 2`. Both stay
+inside the next verify window (`(S - 1) * K <= N` and `S - 1 <= N`), so a
+speculative decode on a decoding role reserves one more verify window behind
+its own, from the first decode on (the prefill role hands off before drafting
+past its first window). That window stops at the request's token limit (prompt
+plus `max_new_tokens`), which admission may have prepaid in full, so it never
+demands a page past that limit. A request without a declared budget reserves
+no such window: admission validated only its first verify window. Known
+limitation: within `N` tokens of the
+limit some draft writes (chain steps, block drafters and tree lanes alike)
+still land past it. A position past the allocated extent resolves to the dummy
+slot, and attention reads it through page 0. This costs draft acceptance
+only. The next verify rewrites target KV.
 
 Lane attention is the same cascade with `R = K` over the draft paged cache:
 every lane row sees the accepted frontier and, inside the window, only its
@@ -169,8 +181,8 @@ lanes and nodes are always fully written.
 ### Sampled verify keys noise by position
 
 The triton sampling backend draws a verify row's target token by Gumbel-max
-keyed by `(seed, position)`. For a tree the key is the node's position
-`vc + depth`, never its row: each node row samples with its request's
+keyed by `(seed, position)`. For a tree the key is the position predicted by the node
+(`vc + depth + 1`, with `vc` the pre-forward input frontier), never its row: each node row samples with its request's
 parameters and its offset advanced by its depth, so the token accepted at every
 position is the one plain decoding samples there. Acceptance is the greedy tree
 walk over those draws, accepting a child when it equals its parent's draw.

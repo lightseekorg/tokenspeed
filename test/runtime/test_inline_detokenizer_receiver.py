@@ -48,8 +48,9 @@ from __future__ import annotations
 import os
 import sys
 import types
-import unittest
 from typing import Any, Dict, List, Optional
+
+import pytest
 
 # CI registration (AST-parsed, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -235,7 +236,7 @@ def _register(manager: _StubTokenizerManager, state: ReqState) -> None:
 # ---------------------------------------------------------------------------
 
 
-class TestFlagOffRegression(unittest.TestCase):
+class TestFlagOffRegression:
     """Flag off → inline path stays dormant. We verify this at the receiver
     level: when a ``BatchTokenIDOut`` reaches ``_handle_batch_output`` with
     the flag off, the inline helper is never invoked and no
@@ -264,17 +265,17 @@ class TestFlagOffRegression(unittest.TestCase):
         mgr.output_processor.handle_batch_output(recv)
 
         out = state.collector.take()
-        self.assertIsNotNone(out)
+        assert (out) is not None
         # The inline detokenizer does NOT run on this path (the assertion
         # this test exists for). What's emitted is the raw-token out_dict,
         # which since the D.1-regression hotfix carries an empty ``text``
         # key — matching the pre-D.1 BatchStrOut shape that subprocess
         # conversion used to guarantee. The state machine that would have
         # populated ``state.text`` never ran, so the value is "".
-        self.assertEqual(out["text"], "")
-        self.assertEqual(out["meta_info"]["accept_draft_tokens"], 1.5)
-        self.assertIsNone(state.inline_detokenizer)
-        self.assertEqual(state.text, "")
+        assert (out["text"]) == ("")
+        assert (out["meta_info"]["accept_draft_tokens"]) == (1.5)
+        assert (state.inline_detokenizer) is None
+        assert (state.text) == ("")
 
 
 # ---------------------------------------------------------------------------
@@ -282,11 +283,11 @@ class TestFlagOffRegression(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestInlineBasicEmit(unittest.TestCase):
+class TestInlineBasicEmit:
     """Flag-on path produces a BatchStrOut-shape out_dict with ``text``."""
 
     @classmethod
-    def setUpClass(cls) -> None:
+    def setup_class(cls) -> None:
         cls.tok = _gpt2_tokenizer()
 
     def test_single_frame_populates_text_and_output_ids(self):
@@ -306,12 +307,13 @@ class TestInlineBasicEmit(unittest.TestCase):
         mgr.output_processor.handle_batch_output(recv)
 
         out = state.collector.take()
-        self.assertIn("text", out)
-        self.assertEqual(out["text"], source)
-        self.assertEqual(out["output_ids"], ids)
-        self.assertIs(out["meta_info"]["id"], "r1")
+        assert ("text") in (out)
+        assert (out["text"]) == (source)
+        assert (out["output_ids"]) == (ids)
+        expected_id = "r1"
+        assert out["meta_info"]["id"] is expected_id
         # Inline detokenizer instantiated and still reachable on state.
-        self.assertIsInstance(state.inline_detokenizer, IncrementalDetokenizer)
+        assert isinstance((state.inline_detokenizer), (IncrementalDetokenizer))
 
     def test_second_frame_reuses_per_request_detokenizer(self):
         mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
@@ -323,7 +325,7 @@ class TestInlineBasicEmit(unittest.TestCase):
             _batch_token_id_out(["r1"], decode_ids=[first_ids])
         )
         det_after_first = state.inline_detokenizer
-        self.assertIsNotNone(det_after_first)
+        assert (det_after_first) is not None
 
         second_ids = self.tok.encode("world")
         mgr.output_processor.handle_batch_output(
@@ -333,10 +335,10 @@ class TestInlineBasicEmit(unittest.TestCase):
                 finished_reasons=[{"type": "stop", "matched": None}],
             )
         )
-        self.assertIs(state.inline_detokenizer, det_after_first)
+        assert (state.inline_detokenizer) is (det_after_first)
 
         # Final state.text must carry the full cumulative decoded string.
-        self.assertEqual(state.text, self.tok.decode(first_ids + second_ids))
+        assert (state.text) == (self.tok.decode(first_ids + second_ids))
 
     def test_meta_info_includes_finish_and_prompt_tokens(self):
         mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
@@ -354,13 +356,13 @@ class TestInlineBasicEmit(unittest.TestCase):
         )
         mgr.output_processor.handle_batch_output(recv)
         out = state.collector.take()
-        self.assertEqual(out["meta_info"]["prompt_tokens"], 7)
-        self.assertEqual(out["meta_info"]["completion_tokens"], len(ids))
-        self.assertEqual(
-            out["meta_info"]["finish_reason"], {"type": "stop", "matched": None}
+        assert (out["meta_info"]["prompt_tokens"]) == (7)
+        assert (out["meta_info"]["completion_tokens"]) == (len(ids))
+        assert (out["meta_info"]["finish_reason"]) == (
+            {"type": "stop", "matched": None}
         )
-        self.assertEqual(out["meta_info"]["weight_version"], "test-v0")
-        self.assertTrue(state.finished)
+        assert (out["meta_info"]["weight_version"]) == ("test-v0")
+        assert state.finished
 
 
 # ---------------------------------------------------------------------------
@@ -368,11 +370,11 @@ class TestInlineBasicEmit(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestOutputIdsShape(unittest.TestCase):
+class TestOutputIdsShape:
     """Inline path must match BatchStrOut branch's output_ids contract."""
 
     @classmethod
-    def setUpClass(cls) -> None:
+    def setup_class(cls) -> None:
         cls.tok = _gpt2_tokenizer()
 
     def test_stream_mode_emits_delta_output_ids(self):
@@ -397,10 +399,10 @@ class TestOutputIdsShape(unittest.TestCase):
         out2 = state.collector.take()
 
         # Deltas: first frame is ids_a, second is ids_b.
-        self.assertEqual(out1["output_ids"], ids_a)
-        self.assertEqual(out2["output_ids"], ids_b)
+        assert (out1["output_ids"]) == (ids_a)
+        assert (out2["output_ids"]) == (ids_b)
         # Cumulative state carries the full list.
-        self.assertEqual(state.output_ids, ids_a + ids_b)
+        assert (state.output_ids) == (ids_a + ids_b)
 
     def test_prompt_tail_in_decode_ids_is_not_exposed_as_output_ids(self):
         mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
@@ -419,8 +421,8 @@ class TestOutputIdsShape(unittest.TestCase):
         mgr.output_processor.handle_batch_output(recv)
 
         out = state.collector.take()
-        self.assertEqual(out["output_ids"], generated)
-        self.assertEqual(state.output_ids, generated)
+        assert (out["output_ids"]) == (generated)
+        assert (state.output_ids) == (generated)
 
     def test_non_stream_mode_emits_full_cumulative_output_ids(self):
         mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
@@ -443,8 +445,8 @@ class TestOutputIdsShape(unittest.TestCase):
         out2 = state.collector.take()
 
         # Full copy every frame in non-stream mode.
-        self.assertEqual(out1["output_ids"], ids_a)
-        self.assertEqual(out2["output_ids"], ids_a + ids_b)
+        assert (out1["output_ids"]) == (ids_a)
+        assert (out2["output_ids"]) == (ids_a + ids_b)
 
 
 # ---------------------------------------------------------------------------
@@ -452,9 +454,9 @@ class TestOutputIdsShape(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestStopTrimmingPassThrough(unittest.TestCase):
+class TestStopTrimmingPassThrough:
     @classmethod
-    def setUpClass(cls) -> None:
+    def setup_class(cls) -> None:
         cls.tok = _gpt2_tokenizer()
 
     def test_matched_string_is_trimmed_in_text(self):
@@ -472,7 +474,7 @@ class TestStopTrimmingPassThrough(unittest.TestCase):
         mgr.output_processor.handle_batch_output(recv)
         out = state.collector.take()
         # Matched stop string and everything after must be trimmed.
-        self.assertEqual(out["text"], "hello ")
+        assert (out["text"]) == ("hello ")
 
     def test_no_stop_trim_flag_preserves_matched_content(self):
         mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
@@ -489,7 +491,7 @@ class TestStopTrimmingPassThrough(unittest.TestCase):
         )
         mgr.output_processor.handle_batch_output(recv)
         out = state.collector.take()
-        self.assertEqual(out["text"], source)
+        assert (out["text"]) == (source)
 
     def test_matched_int_with_no_stop_trim_preserves_last_token(self):
         # Gap fill for ``matched=int`` (stop-token) case. The two places
@@ -513,7 +515,7 @@ class TestStopTrimmingPassThrough(unittest.TestCase):
 
         source = "Hello world"
         ids = self.tok.encode(source)
-        self.assertGreaterEqual(len(ids), 2)
+        assert (len(ids)) >= (2)
 
         recv = _batch_token_id_out(
             ["r1"],
@@ -525,8 +527,8 @@ class TestStopTrimmingPassThrough(unittest.TestCase):
         out = state.collector.take()
         # Full source preserved — matched=int + no_stop_trim means no
         # token is dropped from read_ids and no string trimming occurs.
-        self.assertEqual(out["text"], self.tok.decode(ids))
-        self.assertEqual(state.text, self.tok.decode(ids))
+        assert (out["text"]) == (self.tok.decode(ids))
+        assert (state.text) == (self.tok.decode(ids))
 
 
 # ---------------------------------------------------------------------------
@@ -534,9 +536,9 @@ class TestStopTrimmingPassThrough(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestPerRequestIndependence(unittest.TestCase):
+class TestPerRequestIndependence:
     @classmethod
-    def setUpClass(cls) -> None:
+    def setup_class(cls) -> None:
         cls.tok = _gpt2_tokenizer()
 
     def test_two_rids_share_one_manager_without_cross_talk(self):
@@ -564,9 +566,9 @@ class TestPerRequestIndependence(unittest.TestCase):
         out_a = s_a.collector.take()
         out_b = s_b.collector.take()
 
-        self.assertEqual(out_a["text"], text_a)
-        self.assertEqual(out_b["text"], text_b)
-        self.assertIsNot(s_a.inline_detokenizer, s_b.inline_detokenizer)
+        assert (out_a["text"]) == (text_a)
+        assert (out_b["text"]) == (text_b)
+        assert (s_a.inline_detokenizer) is not (s_b.inline_detokenizer)
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +652,7 @@ def _run_inline_path(
     return pieces
 
 
-class TestSubprocessVsInlineParity(unittest.TestCase):
+class TestSubprocessVsInlineParity:
     """For identical frame sequences the two paths must emit identical text.
 
     The per-frame emits are compared byte-for-byte; the cumulative text is
@@ -659,17 +661,16 @@ class TestSubprocessVsInlineParity(unittest.TestCase):
     """
 
     @classmethod
-    def setUpClass(cls) -> None:
+    def setup_class(cls) -> None:
         cls.tok = _gpt2_tokenizer()
 
     def _assert_parity(self, frames: List[Dict[str, Any]]) -> None:
         subp = _run_subprocess_path(self.tok, "r1", frames)
         inline = _run_inline_path(self.tok, "r1", frames)
-        self.assertEqual(
-            inline,
-            subp,
-            msg=f"inline={inline!r} subprocess={subp!r}",
-        )
+        _pytest_first_1 = inline
+        _pytest_second_2 = subp
+        _pytest_msg_3 = f"inline={inline!r} subprocess={subp!r}"
+        assert _pytest_first_1 == _pytest_second_2, _pytest_msg_3
 
     def test_parity_single_frame_ascii(self):
         self._assert_parity(
@@ -774,7 +775,7 @@ class TestSubprocessVsInlineParity(unittest.TestCase):
         # against the inline receiver path so any inline-specific drift shows up.
         source = "Hello world the long sentence STOP tail text"
         ids = self.tok.encode(source)
-        self.assertGreaterEqual(len(ids), 6)
+        assert (len(ids)) >= (6)
 
         # Pick the largest split whose decoded prefix is still
         # STOP-free so frame 1 commits a clean prefix.
@@ -783,7 +784,7 @@ class TestSubprocessVsInlineParity(unittest.TestCase):
             if "STOP" not in self.tok.decode(ids[:candidate]):
                 split = candidate
                 break
-        self.assertIsNotNone(split, "need a STOP-free prefix split")
+        assert (split) is not None, "need a STOP-free prefix split"
 
         self._assert_parity(
             [
@@ -801,9 +802,9 @@ class TestSubprocessVsInlineParity(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestSeedHandling(unittest.TestCase):
+class TestSeedHandling:
     @classmethod
-    def setUpClass(cls) -> None:
+    def setup_class(cls) -> None:
         cls.tok = _gpt2_tokenizer()
 
     def test_first_frame_honors_decoded_text_seed(self):
@@ -821,7 +822,7 @@ class TestSeedHandling(unittest.TestCase):
         )
         mgr.output_processor.handle_batch_output(recv)
         out = state.collector.take()
-        self.assertEqual(out["text"], seed + self.tok.decode(ids))
+        assert (out["text"]) == (seed + self.tok.decode(ids))
 
     def test_only_first_frame_seeds_detokenizer(self):
         mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
@@ -854,7 +855,7 @@ class TestSeedHandling(unittest.TestCase):
             )
         )
         state.collector.take()
-        self.assertEqual(state.text, "seed-" + self.tok.decode(ids_first + ids_second))
+        assert (state.text) == ("seed-" + self.tok.decode(ids_first + ids_second))
 
 
 # ---------------------------------------------------------------------------
@@ -893,14 +894,14 @@ def _mk_logprob_state(*, rid: str = "r1", fmt: str = "vllm") -> ReqState:
     )
 
 
-class TestInlineLogprobPassThrough(unittest.TestCase):
+class TestInlineLogprobPassThrough:
     """Verify the sampled-token output logprob arrays on a ``BatchTokenIDOut``
     flow through the inline branch of ``_handle_batch_output`` into ``meta_info``
     — in BOTH dialects, selected per request, from the same wire arrays.
     """
 
     @classmethod
-    def setUpClass(cls) -> None:
+    def setup_class(cls) -> None:
         cls.tok = _gpt2_tokenizer()
 
     def _run(self, fmt):
@@ -922,23 +923,28 @@ class TestInlineLogprobPassThrough(unittest.TestCase):
     def test_vllm_format(self):
         meta = self._run("vllm")
         # vLLM shape: "logprobs" is a list[dict[int, Logprob]], one per token.
-        self.assertIn("logprobs", meta)
-        self.assertNotIn("output_token_logprobs", meta)
-        self.assertEqual(len(meta["logprobs"]), 2)
-        self.assertEqual(meta["logprobs"][0][1].logprob, -0.5)
-        self.assertEqual(meta["logprobs"][0][1].rank, 0)
-        self.assertEqual(meta["logprobs"][1][2].logprob, -0.6)
-        self.assertAlmostEqual(meta["cumulative_logprob"], -1.1)
+        assert ("logprobs") in (meta)
+        assert ("output_token_logprobs") not in (meta)
+        assert (len(meta["logprobs"])) == (2)
+        assert (meta["logprobs"][0][1].logprob) == (-0.5)
+        assert (meta["logprobs"][0][1].rank) == (0)
+        assert (meta["logprobs"][1][2].logprob) == (-0.6)
+        _pytest_first_4 = meta["cumulative_logprob"]
+        _pytest_second_5 = -1.1
+        assert (
+            _pytest_first_4 == _pytest_second_5
+            or round(abs(_pytest_first_4 - _pytest_second_5), 7) == 0
+        )
 
     def test_sglang_format(self):
         meta = self._run("sglang")
         # SGLang shape: "output_token_logprobs" is a list of (val, idx, text)
         # tuples (text None when not decoding); no vLLM "logprobs" key.
-        self.assertIn("output_token_logprobs", meta)
-        self.assertNotIn("logprobs", meta)
-        self.assertEqual([e[0] for e in meta["output_token_logprobs"]], [-0.5, -0.6])
-        self.assertEqual([e[1] for e in meta["output_token_logprobs"]], [1, 2])
+        assert ("output_token_logprobs") in (meta)
+        assert ("logprobs") not in (meta)
+        assert ([e[0] for e in meta["output_token_logprobs"]]) == ([-0.5, -0.6])
+        assert ([e[1] for e in meta["output_token_logprobs"]]) == ([1, 2])
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    raise SystemExit(pytest.main([__file__, "-v", *sys.argv[1:]]))

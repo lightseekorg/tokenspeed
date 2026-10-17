@@ -11,23 +11,26 @@ import ast
 import os
 import sys
 import textwrap
-import unittest
 from types import SimpleNamespace
+from unittest import mock
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ci_system.ci_register import register_cuda_ci
-from runtime.cache_pool_test_utils import (
+from test.runtime.cache_pool_test_utils import (
     assert_no_alias,
     binding_state,
     reachable_tensors,
     storages_of,
 )
 
+from ci_system.ci_register import register_cuda_ci
+
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
@@ -48,7 +51,7 @@ FULL = "full_attention"
 SWA = "sliding_attention"
 
 
-class WriteLocationMathTest(unittest.TestCase):
+class TestWriteLocationMathTest:
     """The slot rule over stacked tables, on CPU (the reference)."""
 
     def _tables(self, device="cpu"):
@@ -73,9 +76,9 @@ class WriteLocationMathTest(unittest.TestCase):
         )
         # group 0 (P=4): pos 8 -> page 9 slot 0 = 36; pos 3 -> page 3 slot 3 = 15;
         # padded request pos 0 -> page 0 -> dummy slot 0.
-        self.assertEqual(out[0, :3].tolist(), [36, 15, 0])
+        assert (out[0, :3].tolist()) == ([36, 15, 0])
         # group 1 (P=2): pos 8 -> page 10 slot 0 = 20; pos 3 -> page 0 (hole) -> 0.
-        self.assertEqual(out[1, :3].tolist(), [20, 0, 0])
+        assert (out[1, :3].tolist()) == ([20, 0, 0])
 
     def test_verify_window_is_token_major_and_clamps_padded_requests(self):
         tables, page_sizes = self._tables()
@@ -86,11 +89,11 @@ class WriteLocationMathTest(unittest.TestCase):
         )
         # request 0 writes positions 6,7,8 -> group 0 page 8 slots 2,3 then
         # page 9 slot 0 -> 34, 35, 36.
-        self.assertEqual(out[0, :3].tolist(), [34, 35, 36])
+        assert (out[0, :3].tolist()) == ([34, 35, 36])
         # A short live request (seq_len 1 < 3) clamps every position at 0.
-        self.assertEqual(out[0, 3:6].tolist(), [12, 12, 12])
+        assert (out[0, 3:6].tolist()) == ([12, 12, 12])
         # A padded request is all null pages by the fill contract -> slot 0.
-        self.assertEqual(out[0, 6:9].tolist(), [0, 0, 0])
+        assert (out[0, 6:9].tolist()) == ([0, 0, 0])
 
     def test_extend_span_is_request_major(self):
         tables, page_sizes = self._tables()
@@ -99,11 +102,11 @@ class WriteLocationMathTest(unittest.TestCase):
         locs = extend_write_locations(
             tables, page_sizes, prefix, new, 7, torch.empty((2, 7), dtype=torch.int32)
         )
-        self.assertEqual(tuple(locs.shape), (2, 7))
+        assert (tuple(locs.shape)) == ((2, 7))
         # request 0, group 0: positions 4..8 -> page 8 slots 0..3, page 9 slot 0.
-        self.assertEqual(locs[0, :5].tolist(), [32, 33, 34, 35, 36])
+        assert (locs[0, :5].tolist()) == ([32, 33, 34, 35, 36])
         # request 1, group 1 (P=2): positions 0,1 -> page 1 -> slots 2,3.
-        self.assertEqual(locs[1, 5:].tolist(), [2, 3])
+        assert (locs[1, 5:].tolist()) == ([2, 3])
 
     def test_positions_past_the_table_route_to_the_dummy_slot(self):
         tables, page_sizes = self._tables()
@@ -112,9 +115,9 @@ class WriteLocationMathTest(unittest.TestCase):
         decode_write_locations(
             tables, page_sizes, seq_lens, out, bs=1, tokens_per_req=1
         )
-        self.assertEqual(out[:, 0].tolist(), [0, 0])
+        assert (out[:, 0].tolist()) == ([0, 0])
 
-    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs CUDA"))
     def test_fused_kernels_match_the_reference(self):
         torch.manual_seed(0)
         g, bs, max_num_pages = 3, 17, 40
@@ -154,7 +157,7 @@ class WriteLocationMathTest(unittest.TestCase):
         torch.testing.assert_close(out.cpu(), ref)
 
 
-class PersistentExtendSpanTest(unittest.TestCase):
+class TestPersistentExtendSpanTest:
     """The extend span lives in the stack's buffer so a captured prologue can pad
     over it; a span past the buffer is a fresh tensor."""
 
@@ -179,19 +182,19 @@ class PersistentExtendSpanTest(unittest.TestCase):
         prefix = torch.tensor([4, 0], dtype=torch.int32)
         new = torch.tensor([3, 2], dtype=torch.int32)
         span = stacks.extend_locations(prefix, new, 5)[FULL]
-        self.assertEqual(span.data_ptr(), stacks.extend_locs[0].data_ptr())
-        self.assertEqual(span.tolist(), [36, 37, 38, 12, 13])
-        self.assertEqual(stacks.extend_locs[0, 5:].tolist(), [0, 0, 0])
+        assert (span.data_ptr()) == (stacks.extend_locs[0].data_ptr())
+        assert (span.tolist()) == ([36, 37, 38, 12, 13])
+        assert (stacks.extend_locs[0, 5:].tolist()) == ([0, 0, 0])
         stacks.extend_locations(prefix, torch.tensor([1, 1], dtype=torch.int32), 2)
-        self.assertEqual(stacks.extend_locs[0].tolist(), [36, 12, 0, 0, 0, 0, 0, 0])
+        assert (stacks.extend_locs[0].tolist()) == ([36, 12, 0, 0, 0, 0, 0, 0])
 
     def test_a_span_past_the_buffer_is_fresh(self):
         stacks = self._stacks(capacity=3)
         prefix = torch.tensor([4, 0], dtype=torch.int32)
         new = torch.tensor([3, 2], dtype=torch.int32)
         span = stacks.extend_locations(prefix, new, 5)[FULL]
-        self.assertNotEqual(span.data_ptr(), stacks.extend_locs[0].data_ptr())
-        self.assertEqual(span.tolist(), [36, 37, 38, 12, 13])
+        assert (span.data_ptr()) != (stacks.extend_locs[0].data_ptr())
+        assert (span.tolist()) == ([36, 37, 38, 12, 13])
 
     def test_the_padded_span_widens_over_the_zero_tail(self):
         stacks = self._stacks(capacity=8)
@@ -201,15 +204,15 @@ class PersistentExtendSpanTest(unittest.TestCase):
             5,
         )[FULL]
         padded = stacks.padded_extend_span(FULL, 8)
-        self.assertEqual(padded.tolist(), [36, 37, 38, 12, 13, 0, 0, 0])
-        self.assertEqual(padded.data_ptr(), span.data_ptr())
-        self.assertEqual(stacks.padded_extend_span(FULL, 5).tolist(), span.tolist())
-        with self.assertRaisesRegex(ValueError, "cannot pad to 4 rows"):
+        assert (padded.tolist()) == ([36, 37, 38, 12, 13, 0, 0, 0])
+        assert (padded.data_ptr()) == (span.data_ptr())
+        assert (stacks.padded_extend_span(FULL, 5).tolist()) == (span.tolist())
+        with pytest.raises((ValueError), match=("cannot pad to 4 rows")):
             stacks.padded_extend_span(FULL, 4)
         # Past the buffer the forward runs eager: a fresh tensor, zero tail.
         wide = stacks.padded_extend_span(FULL, 9)
-        self.assertNotEqual(wide.data_ptr(), span.data_ptr())
-        self.assertEqual(wide.tolist(), [36, 37, 38, 12, 13, 0, 0, 0, 0])
+        assert (wide.data_ptr()) != (span.data_ptr())
+        assert (wide.tolist()) == ([36, 37, 38, 12, 13, 0, 0, 0, 0])
 
     def test_a_span_past_the_buffer_pads_onto_a_fresh_tail(self):
         stacks = self._stacks(capacity=3)
@@ -218,10 +221,10 @@ class PersistentExtendSpanTest(unittest.TestCase):
             torch.tensor([3, 2], dtype=torch.int32),
             5,
         )
-        self.assertEqual(
-            stacks.padded_extend_span(FULL, 8).tolist(), [36, 37, 38, 12, 13, 0, 0, 0]
+        assert (stacks.padded_extend_span(FULL, 8).tolist()) == (
+            [36, 37, 38, 12, 13, 0, 0, 0]
         )
-        with self.assertRaisesRegex(ValueError, "cannot pad to 4 rows"):
+        with pytest.raises((ValueError), match=("cannot pad to 4 rows")):
             stacks.padded_extend_span(FULL, 4)
 
     def test_a_mixed_round_places_its_decode_rows_after_the_span(self):
@@ -235,15 +238,14 @@ class PersistentExtendSpanTest(unittest.TestCase):
         stacks.decode_locs[0, :2] = torch.tensor([39, 14], dtype=torch.int32)
         stacks.append_decode_rows(1, 1)
         padded = stacks.padded_extend_span(FULL, 8)
-        self.assertEqual(padded.data_ptr(), span.data_ptr())
-        self.assertEqual(padded.tolist(), [36, 37, 38, 14, 0, 0, 0, 0])
-        self.assertEqual(stacks.padded_extend_span(FULL, 4).tolist(), [36, 37, 38, 14])
-        with self.assertRaisesRegex(ValueError, "cannot pad to 3 rows"):
+        assert (padded.data_ptr()) == (span.data_ptr())
+        assert (padded.tolist()) == ([36, 37, 38, 14, 0, 0, 0, 0])
+        assert (stacks.padded_extend_span(FULL, 4).tolist()) == ([36, 37, 38, 14])
+        with pytest.raises((ValueError), match=("cannot pad to 3 rows")):
             stacks.padded_extend_span(FULL, 3)
         # Widening past capacity preserves the decode row as well.
-        self.assertEqual(
-            stacks.padded_extend_span(FULL, 9).tolist(),
-            [36, 37, 38, 14, 0, 0, 0, 0, 0],
+        assert (stacks.padded_extend_span(FULL, 9).tolist()) == (
+            [36, 37, 38, 14, 0, 0, 0, 0, 0]
         )
         # A new pure extend drops the decode rows again.
         stacks.extend_locations(
@@ -251,7 +253,7 @@ class PersistentExtendSpanTest(unittest.TestCase):
             torch.tensor([3], dtype=torch.int32),
             3,
         )
-        self.assertEqual(stacks.padded_extend_span(FULL, 4).tolist(), [36, 37, 38, 0])
+        assert (stacks.padded_extend_span(FULL, 4).tolist()) == ([36, 37, 38, 0])
 
     def test_mixed_decode_rows_past_the_buffer_pad_onto_a_fresh_tail(self):
         stacks = self._stacks(capacity=3)
@@ -262,10 +264,8 @@ class PersistentExtendSpanTest(unittest.TestCase):
         )
         stacks.decode_locs[0, :2] = torch.tensor([39, 14], dtype=torch.int32)
         stacks.append_decode_rows(1, 1)
-        self.assertEqual(stacks.padded_extend_span(FULL, 4).tolist(), [36, 37, 38, 14])
-        self.assertEqual(
-            stacks.padded_extend_span(FULL, 6).tolist(), [36, 37, 38, 14, 0, 0]
-        )
+        assert (stacks.padded_extend_span(FULL, 4).tolist()) == ([36, 37, 38, 14])
+        assert (stacks.padded_extend_span(FULL, 6).tolist()) == ([36, 37, 38, 14, 0, 0])
 
     def test_a_backend_without_a_padded_span_serves_exact_counts_only(self):
         from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -273,14 +273,14 @@ class PersistentExtendSpanTest(unittest.TestCase):
         backend = object.__new__(AttentionBackend)
         span = torch.tensor([7, 8, 9], dtype=torch.int32)
         backend.forward_write_locations = lambda layer, mode: span
-        self.assertIs(
-            AttentionBackend.padded_write_locations(backend, None, None, 3), span
+        assert (AttentionBackend.padded_write_locations(backend, None, None, 3)) is (
+            span
         )
-        with self.assertRaisesRegex(ValueError, "3 write slots for 4 rows"):
+        with pytest.raises((ValueError), match=("3 write slots for 4 rows")):
             AttentionBackend.padded_write_locations(backend, None, None, 4)
 
 
-class GroupTableStacksTest(unittest.TestCase):
+class TestGroupTableStacksTest:
     def _stacks(self, device="cpu", max_bs=4):
         specs = [
             GroupTableSpec(
@@ -305,20 +305,17 @@ class GroupTableStacksTest(unittest.TestCase):
             SWA: torch.tensor([[5, 6, -1], [9, 0, 2]], dtype=torch.int32),
         }
         stacks.fill(bs=3, actual_bs=2, block_tables=raw)
-        self.assertEqual(
-            stacks.table(FULL, 3).tolist(), [[5, 6, 0], [9, 0, 2], [0, 0, 0]]
-        )
+        assert (stacks.table(FULL, 3).tolist()) == ([[5, 6, 0], [9, 0, 2], [0, 0, 0]])
         # ratio 2: page p -> 2p, 2p+1; holes / ragged pads stay on page 0.
-        self.assertEqual(
-            stacks.table(SWA, 3).tolist(),
-            [[10, 11, 12, 13, 0, 0], [18, 19, 0, 0, 4, 5], [0, 0, 0, 0, 0, 0]],
+        assert (stacks.table(SWA, 3).tolist()) == (
+            [[10, 11, 12, 13, 0, 0], [18, 19, 0, 0, 4, 5], [0, 0, 0, 0, 0, 0]]
         )
 
     def test_fill_rejects_short_tables(self):
         stacks = self._stacks()
         full = torch.ones((2, 3), dtype=torch.int32)
-        with self.assertRaisesRegex(
-            RuntimeError, "has 2 request rows for a live batch of 3"
+        with pytest.raises(
+            (RuntimeError), match=("has 2 request rows for a live batch of 3")
         ):
             stacks.fill(3, 3, {FULL: full, SWA: full})
 
@@ -329,7 +326,7 @@ class GroupTableStacksTest(unittest.TestCase):
         stacks.fill(
             bs=4, actual_bs=0, block_tables={FULL: placeholder, SWA: placeholder}
         )
-        self.assertEqual(int(stacks.tables.abs().sum()), 0)
+        assert (int(stacks.tables.abs().sum())) == (0)
 
     def test_decode_and_extend_locations_follow_the_stack(self):
         stacks = self._stacks()
@@ -337,25 +334,25 @@ class GroupTableStacksTest(unittest.TestCase):
         stacks.fill(1, 1, {FULL: raw, SWA: raw})
         stacks.compute_decode_locations(1, torch.tensor([5], dtype=torch.int32), 1)
         # pos 4: full (P=4) page 6 slot 0 = 24; swa (P=2) page 12 slot 0 = 24.
-        self.assertEqual(int(stacks.decode_locations(FULL, 1, 1)[0]), 24)
-        self.assertEqual(int(stacks.decode_locations(SWA, 1, 1)[0]), 24)
+        assert (int(stacks.decode_locations(FULL, 1, 1)[0])) == (24)
+        assert (int(stacks.decode_locations(SWA, 1, 1)[0])) == (24)
         locs = stacks.extend_locations(
             torch.tensor([2], dtype=torch.int32),
             torch.tensor([3], dtype=torch.int32),
             3,
         )
-        self.assertEqual(locs[FULL].tolist(), [22, 23, 24])
-        self.assertEqual(locs[SWA].tolist(), [22, 23, 24])
+        assert (locs[FULL].tolist()) == ([22, 23, 24])
+        assert (locs[SWA].tolist()) == ([22, 23, 24])
 
     def test_decode_locations_view_is_address_stable(self):
         stacks = self._stacks()
         a = stacks.decode_locations(FULL, 2, 2)
         b = stacks.decode_locations(FULL, 2, 2)
-        self.assertEqual(a.data_ptr(), b.data_ptr())
-        with self.assertRaisesRegex(RuntimeError, "sized for 2 tokens"):
+        assert (a.data_ptr()) == (b.data_ptr())
+        with pytest.raises((RuntimeError), match=("sized for 2 tokens")):
             stacks.decode_locations(FULL, 1, 3)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs CUDA"))
     def test_cuda_fill_and_extend_compile_once_across_batches(self):
         """Raw tables arrive as row slices at any offset and long extends size a
         fresh span per batch; neither may key a new binary."""
@@ -391,21 +388,24 @@ class GroupTableStacksTest(unittest.TestCase):
                     ]
                 )
             for want, got in zip(*results):
-                self.assertTrue(torch.equal(want, got))
+                assert torch.equal(want, got)
 
         # Spans past max_extend_tokens (16) take a fresh tensor strided by the total.
         run(2, 0, 9)
         kernels = (_unpack_group_kernel, _extend_locs_kernel)
-        with patch.object(
-            kernels[0], "_do_compile", wraps=kernels[0]._do_compile
-        ) as unpack, patch.object(
-            kernels[1], "_do_compile", wraps=kernels[1]._do_compile
-        ) as extend:
+        with (
+            patch.object(
+                kernels[0], "_do_compile", wraps=kernels[0]._do_compile
+            ) as unpack,
+            patch.object(
+                kernels[1], "_do_compile", wraps=kernels[1]._do_compile
+            ) as extend,
+        ):
             for rows, offset, length in ((1, 1, 1), (2, 1, 9), (4, 0, 8), (3, 1, 11)):
                 run(rows, offset, length)
-        self.assertEqual((unpack.call_count, extend.call_count), (0, 0))
+        assert ((unpack.call_count, extend.call_count)) == ((0, 0))
 
-    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs CUDA"))
     def test_cuda_fill_matches_torch_reference(self):
         torch.manual_seed(1)
         stacks_cuda = self._stacks("cuda", max_bs=8)
@@ -498,10 +498,14 @@ class _StubLeaf(PagedAttentionBackend):
 def _geometry():
     return CacheGroupGeometry(
         granularities={FULL: 4, SWA: 4, "linear_attention_0": 8},
-        families={FULL: "history", SWA: "history", "linear_attention_0": "state"},
+        attn_kinds={
+            FULL: "full_history",
+            SWA: "sliding_window",
+            "linear_attention_0": "state",
+        },
         full_history_group_id=FULL,
         row_geometry={FULL: (4, 1), SWA: (4, 1)},
-        retentions={FULL: ("full_history", None), SWA: ("sliding_window", 4)},
+        windows={FULL: None, SWA: 4},
     )
 
 
@@ -509,7 +513,7 @@ def _layer(group_id, layer_id=0):
     return SimpleNamespace(group_id=group_id, layer_id=layer_id)
 
 
-class CacheGroupRouterTest(unittest.TestCase):
+class TestCacheGroupRouterTest:
     def _router(self, *, is_draft=False, spec=1):
         leaves = {
             FULL: _StubLeaf(4, is_draft=is_draft, spec=spec),
@@ -536,14 +540,14 @@ class CacheGroupRouterTest(unittest.TestCase):
 
     def test_window_support_is_forwarded_from_the_leaves(self):
         router, leaves = self._router()
-        self.assertFalse(router.supports_layer_sliding_window)
+        assert not (router.supports_layer_sliding_window)
 
         for leaf in leaves.values():
             leaf.supports_layer_sliding_window = True
-        self.assertTrue(router.supports_layer_sliding_window)
+        assert router.supports_layer_sliding_window
 
         leaves[SWA].supports_layer_sliding_window = False
-        self.assertFalse(router.supports_layer_sliding_window)
+        assert not (router.supports_layer_sliding_window)
 
     def test_rejects_non_history_groups(self):
         router = CacheGroupRouter(
@@ -553,7 +557,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             device="cpu",
             consumed_group_ids=None,
         )
-        with self.assertRaisesRegex(ValueError, "family 'state'"):
+        with pytest.raises((ValueError), match=("is a state group")):
             router.bind(_geometry(), {"linear_attention_0": _StubLeaf(8)})
 
     def test_explicit_groups_do_not_build_indexer_attention_leaves(self):
@@ -567,18 +571,18 @@ class CacheGroupRouterTest(unittest.TestCase):
         pool = SimpleNamespace(
             paged_group_ids=groups,
             arena=SimpleNamespace(
+                offload=None,
                 cache_group_specs=tuple(
                     SimpleNamespace(
                         group_id=gid,
-                        family="history",
-                        retention="full_history",
+                        attn_kind="full_history",
                         block_granularity=4,
                         rows_per_page=4,
                         entry_stride_tokens=1,
                         sliding_window_tokens=None,
                     )
                     for gid in groups
-                )
+                ),
             ),
         )
         router = CacheGroupRouter(
@@ -593,8 +597,8 @@ class CacheGroupRouterTest(unittest.TestCase):
         # Rebinding must compare the same filtered group set as the first bind.
         router.set_cache_pool(pool)
         router.init_cuda_graph_state(2)
-        self.assertEqual(created, [FULL])
-        self.assertEqual(router.stacks.group_ids, (FULL,))
+        assert (created) == ([FULL])
+        assert (router.stacks.group_ids) == ((FULL,))
         # Delivery belongs to the selected consumer; peer groups are not
         # prerequisites for refreshing attention's own stable metadata.
         router.refresh_decode_metadata(
@@ -605,7 +609,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             forward_mode=ForwardMode.DECODE,
             block_tables={FULL: torch.tensor([[2]], dtype=torch.int32)},
         )
-        self.assertEqual(router.stacks.table(FULL, 1)[0, 0].item(), 2)
+        assert (router.stacks.table(FULL, 1)[0, 0].item()) == (2)
 
     def test_refresh_hands_each_leaf_its_own_kernel_page_table(self):
         router, leaves = self._router()
@@ -618,20 +622,61 @@ class CacheGroupRouterTest(unittest.TestCase):
             forward_mode=ForwardMode.DECODE,
             block_tables=self._tables(),
         )
-        self.assertEqual(
-            leaves[FULL].page_table_buf.tolist(),
-            [[5, 6, 0, 0, 0, 0], [9, 0, 2, 0, 0, 0], [0] * 6, [0] * 6],
+        assert (leaves[FULL].page_table_buf.tolist()) == (
+            [[5, 6, 0, 0, 0, 0], [9, 0, 2, 0, 0, 0], [0] * 6, [0] * 6]
         )
-        self.assertEqual(
-            leaves[SWA].page_table_buf.tolist(),
+        assert (leaves[SWA].page_table_buf.tolist()) == (
             [
                 [10, 11, 12, 13, 0, 0, 0, 0, 0, 0, 0, 0],
                 [18, 19, 0, 0, 4, 5, 0, 0, 0, 0, 0, 0],
                 [0] * 12,
                 [0] * 12,
-            ],
+            ]
         )
-        self.assertEqual(leaves[FULL].calls[-2], ("refresh", 4, 2, 0, False))
+        assert (leaves[FULL].calls[-2]) == (("refresh", 4, 2, 0, False))
+
+    def test_refresh_fills_copy_only_leaves_in_one_batched_copy(self):
+        class _CopyOnlyLeaf(_StubLeaf):
+            def decode_buffer_targets(self, bs):
+                return self.seq_lens_buf[:bs], self.page_table_buf[:bs]
+
+            def publish_decode_metadata(self, bs, seq_lens, *, num_extends):
+                self.calls.append(("publish", bs, num_extends))
+
+        batched, own = _CopyOnlyLeaf(4), _StubLeaf(2)
+        router = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
+        router.bind(_geometry(), {FULL: batched, SWA: own})
+        router.init_cuda_graph_state(4)
+        foreach_copy = torch._foreach_copy_
+        launches = []
+
+        def counting_copy(dsts, srcs):
+            launches.append(len(dsts))
+            foreach_copy(dsts, srcs)
+
+        with mock.patch.object(torch, "_foreach_copy_", counting_copy):
+            router.refresh_decode_metadata(
+                4,
+                2,
+                torch.arange(4, dtype=torch.int32),
+                torch.tensor([9, 4, 1, 1], dtype=torch.int32),
+                forward_mode=ForwardMode.DECODE,
+                block_tables=self._tables(),
+            )
+        assert launches == [2]
+        assert batched.seq_lens_buf.tolist() == [9, 4, 1, 1]
+        assert batched.page_table_buf.tolist() == (
+            [[5, 6, 0, 0, 0, 0], [9, 0, 2, 0, 0, 0], [0] * 6, [0] * 6]
+        )
+        assert batched.calls[-2] == ("publish", 4, 0)
+        # A leaf without targets keeps its own refresh.
+        assert own.calls[-2] == ("refresh", 4, 2, 0, False)
 
     def test_forward_dispatches_by_group_with_group_write_locations(self):
         router, leaves = self._router()
@@ -655,17 +700,17 @@ class CacheGroupRouterTest(unittest.TestCase):
             q, None, None, _layer(SWA), None, ForwardMode.DECODE, 2, save_kv_cache=False
         )
         kind, gid, loc = leaves[SWA].calls[-1]
-        self.assertEqual((kind, gid), ("decode", SWA))
+        assert ((kind, gid)) == (("decode", SWA))
         # Slot math is page-size invariant: pos 8 of request 0 is raw page 7
         # slot 0 (= kernel page 14 slot 0 at P=2) -> 28; pos 3 of request 1 is
         # raw page 9 slot 3 -> 39. Both groups agree because their tables alias.
-        self.assertEqual(loc.tolist(), [28, 39])
-        self.assertIs(loc, router.write_locations(_layer(SWA), ForwardMode.DECODE))
-        self.assertEqual(
-            router.write_locations(_layer(FULL), ForwardMode.DECODE).tolist(), [28, 39]
+        assert (loc.tolist()) == ([28, 39])
+        assert (loc) is (router.write_locations(_layer(SWA), ForwardMode.DECODE))
+        assert (router.write_locations(_layer(FULL), ForwardMode.DECODE).tolist()) == (
+            [28, 39]
         )
-        self.assertFalse(any(c[0] == "decode" for c in leaves[FULL].calls))
-        with self.assertRaisesRegex(KeyError, "names cache group 'nope'"):
+        assert not (any(c[0] == "decode" for c in leaves[FULL].calls))
+        with pytest.raises((KeyError), match=("names cache group 'nope'")):
             router.forward(
                 q,
                 None,
@@ -676,6 +721,38 @@ class CacheGroupRouterTest(unittest.TestCase):
                 2,
                 save_kv_cache=False,
             )
+
+    def test_ordinary_sparse_prepare_returns_history_writes(self):
+        router, leaves = self._router()
+        router.refresh_decode_metadata(
+            2,
+            2,
+            torch.arange(2, dtype=torch.int32),
+            torch.tensor([9, 4], dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            block_tables=self._tables(),
+        )
+        layer = _layer(FULL)
+        history = router.write_locations(layer, ForwardMode.DECODE)
+        selected = torch.tensor([[4096, -1, 4096], [8192, 0, -1]])
+        before = selected.clone()
+        positions = torch.tensor([8, 3], dtype=torch.int32)
+        assert (
+            router.prepare_sparse_kv_access(
+                layer, selected, positions, forward_mode=ForwardMode.DECODE
+            )
+        ) is (history)
+        assert (
+            AttentionBackend.prepare_sparse_kv_access(
+                router, layer, selected, positions, forward_mode=ForwardMode.DECODE
+            )
+        ) is (history)
+        assert torch.equal(selected, before)
+        q = torch.zeros(2)
+        router.forward(
+            q, None, None, layer, None, ForwardMode.DECODE, 2, save_kv_cache=False
+        )
+        assert (leaves[FULL].calls[-1][2]) is (history)
 
     def test_decode_write_location_views_are_pointer_stable_per_bs(self):
         router, _ = self._router(spec=2)
@@ -698,11 +775,11 @@ class CacheGroupRouterTest(unittest.TestCase):
             forward_mode=ForwardMode.DECODE,
             block_tables=self._tables(1),
         )
-        self.assertIs(router.decode_write_locations, first)
-        self.assertEqual(tuple(first.by_group[FULL].shape), (8,))
+        assert (router.decode_write_locations) is (first)
+        assert (tuple(first.by_group[FULL].shape)) == ((8,))
         # Verify window N=2 for request 0 (seq 9): positions 7, 8 -> 6*4+3, 6*4+... no:
         # kernel page for pos 7 is table[0][1]=6 -> 6*4+3=27; pos 8 -> table[0][2]=0 -> dummy.
-        self.assertEqual(first.by_group[FULL][:2].tolist(), [27, 0])
+        assert (first.by_group[FULL][:2].tolist()) == ([27, 0])
 
     def test_draft_router_owns_decode_locations_too(self):
         # Draft and target routers share the write-location contract: the
@@ -718,7 +795,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             forward_mode=ForwardMode.DECODE,
             block_tables=self._tables(),
         )
-        self.assertIsNotNone(router.decode_write_locations)
+        assert (router.decode_write_locations) is not None
         router.forward(
             torch.zeros(2),
             None,
@@ -729,17 +806,16 @@ class CacheGroupRouterTest(unittest.TestCase):
             2,
             save_kv_cache=False,
         )
-        self.assertIs(
-            leaves[FULL].calls[-1][2],
-            router.write_locations(_layer(FULL), ForwardMode.DECODE),
+        assert (leaves[FULL].calls[-1][2]) is (
+            router.write_locations(_layer(FULL), ForwardMode.DECODE)
         )
 
     def test_live_decode_without_every_group_table_raises(self):
         router, _ = self._router()
         tables = self._tables()
         del tables[SWA]
-        with self.assertRaisesRegex(
-            RuntimeError, "missing cache groups \\['sliding_attention'\\]"
+        with pytest.raises(
+            (RuntimeError), match=("missing cache groups \\['sliding_attention'\\]")
         ):
             router.refresh_decode_metadata(
                 2,
@@ -785,20 +861,18 @@ class CacheGroupRouterTest(unittest.TestCase):
             block_tables_cpu={},
         )
         kind, bs, num_extends, page_table, mode = leaves[FULL].calls[-2]
-        self.assertEqual(
-            (kind, bs, num_extends, mode), ("init", 2, 2, ForwardMode.EXTEND)
-        )
-        self.assertEqual(page_table.tolist(), [[5, 6, 0, 0, 0, 0], [9, 0, 2, 0, 0, 0]])
+        assert ((kind, bs, num_extends, mode)) == (("init", 2, 2, ForwardMode.EXTEND))
+        assert (page_table.tolist()) == ([[5, 6, 0, 0, 0, 0], [9, 0, 2, 0, 0, 0]])
         # The prefix flag rides along with the extend lengths to every leaf:
         # FlashMLA sizes its paged-prefix plan by it, and a dropped flag
         # overran that plan in-kernel (chunked prefill IMA).
         for leaf in leaves.values():
-            self.assertIs(leaf.last_init_kwargs["extend_with_prefix"], True)
-            self.assertIs(leaf.last_init_kwargs["extend_prefix_lens"], prefix)
+            assert (leaf.last_init_kwargs["extend_with_prefix"]) is (True)
+            assert (leaf.last_init_kwargs["extend_prefix_lens"]) is (prefix)
         locs = router.write_locations(_layer(FULL), ForwardMode.EXTEND)
         # req 0 positions 4..8 over pages [5,6,0]: 24,25,26,27, then page 0 -> 0.
         # req 1 positions 0..3 over page 9: 36..39.
-        self.assertEqual(locs.tolist(), [24, 25, 26, 27, 0, 36, 37, 38, 39])
+        assert (locs.tolist()) == ([24, 25, 26, 27, 0, 36, 37, 38, 39])
         router.forward(
             torch.zeros(9),
             torch.zeros(9),
@@ -809,9 +883,9 @@ class CacheGroupRouterTest(unittest.TestCase):
             2,
             save_kv_cache=False,
         )
-        self.assertIs(leaves[FULL].calls[-1][2], locs)
+        assert (leaves[FULL].calls[-1][2]) is (locs)
         no_extends = torch.zeros(0, dtype=torch.int32)
-        with self.assertRaisesRegex(RuntimeError, "serves extend/mixed/idle"):
+        with pytest.raises((RuntimeError), match=("serves extend/mixed/idle")):
             router.init_forward_metadata(
                 2,
                 0,
@@ -838,7 +912,7 @@ class CacheGroupRouterTest(unittest.TestCase):
         seq_lens = torch.tensor([9, 4], dtype=torch.int32)
         prefix = torch.tensor([4, 0], dtype=torch.int32)
         new = torch.tensor([5, 4], dtype=torch.int32)
-        with self.assertRaisesRegex(RuntimeError, "cannot mask bounded-replay"):
+        with pytest.raises((RuntimeError), match=("cannot mask bounded-replay")):
             router.init_forward_metadata(
                 2,
                 2,
@@ -882,24 +956,21 @@ class CacheGroupRouterTest(unittest.TestCase):
             query_shard=None,
             block_tables_cpu={},
         )
-        self.assertEqual(
-            router.write_locations(_layer(FULL), ForwardMode.EXTEND).tolist(),
-            [24, 25, 26, 27, 0],
+        assert (router.write_locations(_layer(FULL), ForwardMode.EXTEND).tolist()) == (
+            [24, 25, 26, 27, 0]
         )
         # Decode request 1: pos 3 on page 9 -> 39.
-        self.assertEqual(
-            router.write_locations(_layer(FULL), ForwardMode.DECODE).tolist(), [39]
+        assert (router.write_locations(_layer(FULL), ForwardMode.DECODE).tolist()) == (
+            [39]
         )
         # The prologue's slots for the whole forward: extend rows, decode rows,
         # then padding; wider than the (here empty) buffer, so a fresh tensor.
-        self.assertEqual(
-            router.padded_write_locations(_layer(FULL), ForwardMode.MIXED, 6).tolist(),
-            [24, 25, 26, 27, 0, 39],
-        )
-        self.assertEqual(
-            router.padded_write_locations(_layer(FULL), ForwardMode.MIXED, 8).tolist(),
-            [24, 25, 26, 27, 0, 39, 0, 0],
-        )
+        assert (
+            router.padded_write_locations(_layer(FULL), ForwardMode.MIXED, 6).tolist()
+        ) == ([24, 25, 26, 27, 0, 39])
+        assert (
+            router.padded_write_locations(_layer(FULL), ForwardMode.MIXED, 8).tolist()
+        ) == ([24, 25, 26, 27, 0, 39, 0, 0])
         router.forward(
             torch.zeros(1),
             torch.zeros(1),
@@ -910,7 +981,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             1,
             save_kv_cache=False,
         )
-        self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [39])
+        assert (leaves[FULL].calls[-1][2].tolist()) == ([39])
 
     def test_a_graph_padded_mixed_round_records_the_persistent_buffer(self):
         router, _ = self._router(spec=1)
@@ -934,8 +1005,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             block_tables_cpu={},
         )
         padded = router.padded_write_locations(_layer(FULL), ForwardMode.MIXED, 8)
-        self.assertEqual(padded.tolist(), [24, 25, 26, 27, 0, 39, 0, 0])
-        self.assertEqual(padded.data_ptr(), router.stacks.extend_locs[0].data_ptr())
+        assert (padded.tolist()) == ([24, 25, 26, 27, 0, 39, 0, 0])
+        assert (padded.data_ptr()) == (router.stacks.extend_locs[0].data_ptr())
 
     def test_draft_step_zero_local_decode_writes_the_full_extend_span(self):
         router, leaves = self._router(is_draft=True, spec=1)
@@ -978,7 +1049,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             1,
             save_kv_cache=False,
         )
-        self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [24, 25, 26, 27, 0])
+        assert (leaves[FULL].calls[-1][2].tolist()) == ([24, 25, 26, 27, 0])
 
     def test_draft_step_zero_one_token_extend_ignores_q_k_shape_equality(self):
         router, leaves = self._router(is_draft=True, spec=1)
@@ -1013,7 +1084,7 @@ class CacheGroupRouterTest(unittest.TestCase):
         )
         q = torch.zeros(1)
         router.forward_decode(q, q, q, _layer(FULL), None, 1, save_kv_cache=False)
-        self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [24])
+        assert (leaves[FULL].calls[-1][2].tolist()) == ([24])
 
     def _mixed_draft_router(self):
         """A draft router after a MIXED round's refresh: request 0 extends five
@@ -1062,7 +1133,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             2,
             save_kv_cache=False,
         )
-        self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [24, 25, 26, 27, 0, 39])
+        assert (leaves[FULL].calls[-1][2].tolist()) == ([24, 25, 26, 27, 0, 39])
 
         later = router.publish_draft_step_locations(
             cache_start=torch.tensor([4, 0], dtype=torch.int32), num_tokens=1
@@ -1077,14 +1148,14 @@ class CacheGroupRouterTest(unittest.TestCase):
             2,
             save_kv_cache=False,
         )
-        self.assertEqual(leaves[FULL].calls[-1][2].data_ptr(), later.data_ptr())
-        self.assertEqual(later.tolist(), [24, 36])
+        assert (leaves[FULL].calls[-1][2].data_ptr()) == (later.data_ptr())
+        assert (later.tolist()) == ([24, 36])
 
     def test_draft_step_zero_mixed_dispatch_writes_every_row(self):
         """Eagle3 prepares a MIXED round's step 0 in the round's own mode."""
         router, _ = self._mixed_draft_router()
         slots = router.forward_write_locations(_layer(FULL), ForwardMode.MIXED)
-        self.assertEqual(slots.tolist(), [24, 25, 26, 27, 0, 39])
+        assert (slots.tolist()) == ([24, 25, 26, 27, 0, 39])
 
     def test_capture_seeds_with_idle_rows_then_calls_leaf_capture_hooks(self):
         router, leaves = self._router()
@@ -1099,11 +1170,9 @@ class CacheGroupRouterTest(unittest.TestCase):
             ForwardMode.DECODE,
             block_tables=placeholder,
         )
-        self.assertEqual(leaves[FULL].calls[-2], ("refresh", 4, 0, 0, True))
-        self.assertEqual(int(leaves[FULL].page_table_buf.abs().sum()), 0)
-        self.assertEqual(
-            router.decode_write_locations.by_group[SWA].tolist(), [0, 0, 0, 0]
-        )
+        assert (leaves[FULL].calls[-2]) == (("refresh", 4, 0, 0, True))
+        assert (int(leaves[FULL].page_table_buf.abs().sum())) == (0)
+        assert (router.decode_write_locations.by_group[SWA].tolist()) == ([0, 0, 0, 0])
 
     def test_request_slots_reach_every_leaf_after_each_metadata_build(self):
         # The one side channel beyond page_table/seq_lens: leaves owning
@@ -1124,8 +1193,8 @@ class CacheGroupRouterTest(unittest.TestCase):
         )
         for leaf in leaves.values():
             kinds = [c[0] for c in leaf.calls]
-            self.assertEqual(kinds[-2:], ["refresh", "slots"])
-            self.assertEqual(leaf.calls[-1][1].tolist(), [7, 3])
+            assert (kinds[-2:]) == (["refresh", "slots"])
+            assert (leaf.calls[-1][1].tolist()) == ([7, 3])
 
     def test_single_group_model_surface_proxies_to_the_sole_leaf(self):
         leaf = _StubLeaf(4)
@@ -1137,9 +1206,9 @@ class CacheGroupRouterTest(unittest.TestCase):
             consumed_group_ids=None,
         )
         router.bind(_geometry(), {FULL: leaf})
-        self.assertEqual(router.chunked_prefill_metadata, "chunk-meta")
+        assert (router.chunked_prefill_metadata) == ("chunk-meta")
         multi, _ = self._router()
-        with self.assertRaisesRegex(RuntimeError, "single attention cache group"):
+        with pytest.raises((RuntimeError), match=("single attention cache group")):
             _ = multi.chunked_prefill_metadata
 
     def test_dsa_query_shard_surface_proxies_to_the_sole_leaf(self):
@@ -1161,12 +1230,12 @@ class CacheGroupRouterTest(unittest.TestCase):
             consumed_group_ids=None,
         )
         router.bind(_geometry(), {FULL: leaf})
-        self.assertIs(router.require_query_shard_metadata(), meta)
+        assert (router.require_query_shard_metadata()) is (meta)
         pool, group = object(), object()
-        self.assertIs(router.gather_history_index_k(3, pool, group), gathered)
-        self.assertEqual(calls, [(3, pool, group)])
+        assert (router.gather_history_index_k(3, pool, group)) is (gathered)
+        assert (calls) == ([(3, pool, group)])
         multi, _ = self._router()
-        with self.assertRaisesRegex(RuntimeError, "single attention cache group"):
+        with pytest.raises((RuntimeError), match=("single attention cache group")):
             multi.require_query_shard_metadata()
 
     def test_draft_write_locations_ride_the_history_stack(self):
@@ -1190,16 +1259,16 @@ class CacheGroupRouterTest(unittest.TestCase):
             block_tables=tables,
         )
         view = router.draft_history_view()
-        self.assertEqual(view.page_size, 4)  # FULL leaf kernel page
+        assert (view.page_size) == (4)  # FULL leaf kernel page
         # FULL leaf: max_num_pages = ceil(context_len 24 / kernel page 4) = 6.
-        self.assertEqual(view.max_tokens, 6 * 4)
+        assert (view.max_tokens) == (6 * 4)
         out = torch.zeros(4, dtype=torch.int32)
         router.draft_write_locations_uniform(
             out, cache_start=torch.tensor([4, 7], dtype=torch.int32), num_tokens=2
         )
         # Raw-table math (P=4): req0 pos 4,5 -> raw page 6 slots 0,1 = 24,25;
         # req1 pos 7 -> page 3 slot 3 = 15, pos 8 -> page 7 slot 0 = 28.
-        self.assertEqual(out.tolist(), [24, 25, 15, 28])
+        assert (out.tolist()) == ([24, 25, 15, 28])
         # Address stability across refreshes: the same storage is rewritten.
         ptr = view.table.data_ptr()
         router.refresh_decode_metadata(
@@ -1210,16 +1279,16 @@ class CacheGroupRouterTest(unittest.TestCase):
             forward_mode=ForwardMode.DECODE,
             block_tables=tables,
         )
-        self.assertEqual(router.draft_history_view().table.data_ptr(), ptr)
+        assert (router.draft_history_view().table.data_ptr()) == (ptr)
 
     def test_draft_hooks_fan_out_to_every_leaf(self):
         router, leaves = self._router()
         router.advance_draft_forward_metadata(torch.tensor([3, 5], dtype=torch.int32))
         for leaf in leaves.values():
-            self.assertEqual(leaf.seq_lens_buf[:2].tolist(), [3, 5])
+            assert (leaf.seq_lens_buf[:2].tolist()) == ([3, 5])
         router.update_draft_forward_metadata(torch.tensor([7, 7], dtype=torch.int32))
-        self.assertEqual(leaves[SWA].seq_lens_buf[:2].tolist(), [7, 7])
-        self.assertEqual(router.child_backends(), (leaves[FULL], leaves[SWA]))
+        assert (leaves[SWA].seq_lens_buf[:2].tolist()) == ([7, 7])
+        assert (router.child_backends()) == ((leaves[FULL], leaves[SWA]))
 
     def test_mtp_frontier_reaches_each_leaf_through_its_own_hook(self):
         """The MTP re-anchor is dispatched to the leaf's
@@ -1248,9 +1317,9 @@ class CacheGroupRouterTest(unittest.TestCase):
 
         router.update_draft_forward_metadata(torch.tensor([7, 3], dtype=torch.int32))
 
-        self.assertEqual(leaves[FULL].frontiers, [[7, 3]])
-        self.assertEqual(leaves[FULL].seq_lens_buf[:2].tolist(), [0, 0])
-        self.assertEqual(leaves[SWA].seq_lens_buf[:2].tolist(), [7, 3])
+        assert (leaves[FULL].frontiers) == ([[7, 3]])
+        assert (leaves[FULL].seq_lens_buf[:2].tolist()) == ([0, 0])
+        assert (leaves[SWA].seq_lens_buf[:2].tolist()) == ([7, 3])
 
     def test_every_metadata_build_clears_the_sparse_topk_share(self):
         """The sparse layers' shared selection is per forward: extend init,
@@ -1258,7 +1327,7 @@ class CacheGroupRouterTest(unittest.TestCase):
         layer can never consume the previous forward's top-k."""
         router, _ = self._router()
         share = router.sparse_topk
-        self.assertIs(share, router.sparse_topk, "one share per node")
+        assert (share) is (router.sparse_topk), "one share per node"
 
         def publish():
             share.prefill, share.decode = object(), object()
@@ -1284,7 +1353,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             query_shard=None,
             block_tables_cpu={},
         )
-        self.assertEqual((share.prefill, share.decode), (None, None))
+        assert ((share.prefill, share.decode)) == ((None, None))
 
         publish()
         router.refresh_decode_metadata(
@@ -1295,7 +1364,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             forward_mode=ForwardMode.DECODE,
             block_tables=self._tables(),
         )
-        self.assertEqual((share.prefill, share.decode), (None, None))
+        assert ((share.prefill, share.decode)) == ((None, None))
 
         publish()
         router.init_forward_metadata_capture_cuda_graph(
@@ -1305,29 +1374,27 @@ class CacheGroupRouterTest(unittest.TestCase):
             ForwardMode.DECODE,
             block_tables=self._tables(),
         )
-        self.assertEqual((share.prefill, share.decode), (None, None))
+        assert ((share.prefill, share.decode)) == ((None, None))
 
         # The drafter's in-loop seq_lens edit is not a new forward: it leaves
         # the share it just attached alone.
         publish()
         kept = (share.prefill, share.decode)
         router.advance_draft_forward_metadata(torch.ones(2, dtype=torch.int32))
-        self.assertEqual((share.prefill, share.decode), kept)
+        assert ((share.prefill, share.decode)) == (kept)
 
 
 def _spec(
     group_id,
-    family="history",
     granularity=4,
-    retention="full_history",
+    attn_kind="full_history",
     rows_per_page=None,
     entry_stride_tokens=None,
     sliding_window_tokens=None,
 ):
     return SimpleNamespace(
         group_id=group_id,
-        family=family,
-        retention=retention,
+        attn_kind=attn_kind,
         block_granularity=granularity,
         rows_per_page=rows_per_page,
         entry_stride_tokens=entry_stride_tokens,
@@ -1337,12 +1404,12 @@ def _spec(
 
 def _pool(*specs, paged=(FULL, SWA)):
     return SimpleNamespace(
-        arena=SimpleNamespace(cache_group_specs=tuple(specs)),
+        arena=SimpleNamespace(cache_group_specs=tuple(specs), offload=None),
         paged_group_ids=tuple(paged),
     )
 
 
-class CacheGroupRouterRebindTest(unittest.TestCase):
+class TestCacheGroupRouterRebindTest:
     """A same-geometry rebind must keep the leaves it already initialised."""
 
     def _router(self):
@@ -1366,7 +1433,7 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
         router, built = self._router()
         specs = (_spec(FULL), _spec(SWA), _spec("linear_attention_0", "state", 8))
         router.set_cache_pool(_pool(*specs))
-        self.assertEqual(sorted(built), sorted([FULL, SWA]))
+        assert (sorted(built)) == (sorted([FULL, SWA]))
         first = dict(router.leaves)
         counter = object()
         router.register_step_counter(counter)
@@ -1376,17 +1443,17 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
         bigger = _pool(*specs)  # a different pool object, the same published geometry
         router.set_cache_pool(bigger)
 
-        self.assertEqual(len(built), 2, "leaves must not be rebuilt")
-        self.assertIsNone(router._stacks)
-        self.assertIsNone(router.decode_write_locations)
-        self.assertIsNone(router._extend_write_locations)
-        self.assertEqual(router._decode_views, {})
-        self.assertEqual(router._decode_request_offset, 0)
+        assert (len(built)) == (2), "leaves must not be rebuilt"
+        assert (router._stacks) is None
+        assert (router.decode_write_locations) is None
+        assert (router._extend_write_locations) is None
+        assert (router._decode_views) == ({})
+        assert (router._decode_request_offset) == (0)
         for gid, leaf in router.leaves.items():
-            self.assertIs(leaf, first[gid])
-            self.assertIs(leaf.step_counter, counter)
-            self.assertIs(leaf.cache_pool, bigger)
-        self.assertIs(router.cache_pool, bigger)
+            assert (leaf) is (first[gid])
+            assert (leaf.step_counter) is (counter)
+            assert (leaf.cache_pool) is (bigger)
+        assert (router.cache_pool) is (bigger)
 
     def test_changed_geometry_rebind_is_rejected(self):
         router, built = self._router()
@@ -1394,14 +1461,14 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
         router.set_cache_pool(original)
         first = dict(router.leaves)
 
-        with self.assertRaises(RuntimeError):
+        with pytest.raises((RuntimeError)):
             router.set_cache_pool(_pool(_spec(FULL, granularity=8), _spec(SWA)))
 
-        self.assertEqual(len(built), 2)
-        self.assertEqual(router.leaves, first)
-        self.assertIs(router.cache_pool, original)
+        assert (len(built)) == (2)
+        assert (router.leaves) == (first)
+        assert (router.cache_pool) is (original)
         router.set_cache_pool(original)
-        self.assertEqual(router.leaves, first)
+        assert (router.leaves) == (first)
 
     def test_same_span_but_different_row_geometry_is_rejected(self):
         """Equal products do not make two published row geometries identical."""
@@ -1416,10 +1483,10 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
         )
         router.set_cache_pool(original)
 
-        with self.assertRaisesRegex(RuntimeError, "different geometry"):
+        with pytest.raises((RuntimeError), match=("different geometry")):
             router.set_cache_pool(changed)
 
-        self.assertIs(router.cache_pool, original)
+        assert (router.cache_pool) is (original)
 
     def test_reordered_full_history_groups_match_a_fresh_bind(self):
         """Spec declaration order is not published geometry."""
@@ -1432,47 +1499,46 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
 
         fresh, _ = self._router()
         fresh.set_cache_pool(_pool(*real_specs, paged=("full_history_1", FULL)))
-        self.assertEqual(rebound.geometry, fresh.geometry)
-        self.assertEqual(
-            rebound.geometry.full_history_group_id,
-            fresh.geometry.full_history_group_id,
+        assert (rebound.geometry) == (fresh.geometry)
+        assert (rebound.geometry.full_history_group_id) == (
+            fresh.geometry.full_history_group_id
         )
 
     def test_rebind_rejects_a_changed_sliding_window(self):
-        """The window length is part of the scheduler's retention contract."""
+        """The window length is part of the scheduler's cache-group contract."""
         router, _ = self._router()
         original = _pool(
-            _spec(FULL, retention="full_history"),
-            _spec(SWA, retention="sliding_window", sliding_window_tokens=128),
+            _spec(FULL, attn_kind="full_history"),
+            _spec(SWA, attn_kind="sliding_window", sliding_window_tokens=128),
         )
         changed = _pool(
-            _spec(FULL, retention="full_history"),
-            _spec(SWA, retention="sliding_window", sliding_window_tokens=256),
+            _spec(FULL, attn_kind="full_history"),
+            _spec(SWA, attn_kind="sliding_window", sliding_window_tokens=256),
         )
         router.set_cache_pool(original)
 
-        with self.assertRaisesRegex(RuntimeError, "different geometry"):
+        with pytest.raises((RuntimeError), match=("different geometry")):
             router.set_cache_pool(changed)
 
-        self.assertIs(router.cache_pool, original)
+        assert (router.cache_pool) is (original)
 
-    def test_rebind_rejects_a_changed_group_retention_contract(self):
-        """A group's allocation/retention meaning is part of its published contract."""
+    def test_rebind_rejects_a_changed_group_attn_kind(self):
+        """A group's attention kind is part of its published contract."""
         router, _ = self._router()
         original = _pool(
-            _spec(FULL, retention="full_history"),
-            _spec(SWA, retention="sliding_window", sliding_window_tokens=128),
+            _spec(FULL, attn_kind="full_history"),
+            _spec(SWA, attn_kind="sliding_window", sliding_window_tokens=128),
         )
         changed = _pool(
-            _spec(FULL, retention="full_history"),
-            _spec(SWA, retention="full_history"),
+            _spec(FULL, attn_kind="full_history"),
+            _spec(SWA, attn_kind="full_history"),
         )
         router.set_cache_pool(original)
 
-        with self.assertRaisesRegex(RuntimeError, "different geometry"):
+        with pytest.raises((RuntimeError), match=("different geometry")):
             router.set_cache_pool(changed)
 
-        self.assertIs(router.cache_pool, original)
+        assert (router.cache_pool) is (original)
 
     def test_the_alias_gate_sees_through_modules(self):
         """Registered side backends are nn.Modules; a view they keep must be found."""
@@ -1484,8 +1550,8 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
                 self._verify_scratch = slab[1:3]
 
         node = SimpleNamespace(indexer_backend=_Side())
-        self.assertEqual(len(reachable_tensors(node)), 1)
-        with self.assertRaisesRegex(AssertionError, "indexer_backend"):
+        assert (len(reachable_tensors(node))) == (1)
+        with pytest.raises((AssertionError), match=("indexer_backend")):
             assert_no_alias(node, storages_of(slab))
 
     def test_a_rebound_router_matches_a_fresh_one_field_by_field(self):
@@ -1510,10 +1576,10 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
         fresh.set_cache_pool(_pool(*specs))
         fresh.init_cuda_graph_state(2)
 
-        self.assertEqual(binding_state(rebound), binding_state(fresh))
+        assert (binding_state(rebound)) == (binding_state(fresh))
         for node in (rebound, *rebound.leaves.values()):
             assert_no_alias(node, old)
-        self.assertGreaterEqual(len(old_tensors), 2 * len(rebound.leaves))
+        assert (len(old_tensors)) >= (2 * len(rebound.leaves))
 
     def test_metadata_before_the_re_init_fails_loudly(self):
         router, _ = self._router()
@@ -1523,7 +1589,7 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
 
         router.set_cache_pool(_pool(*specs))
 
-        with self.assertRaisesRegex(RuntimeError, "init_cuda_graph_state must run"):
+        with pytest.raises((RuntimeError), match=("init_cuda_graph_state must run")):
             router.stacks
 
     def test_rebound_leaves_are_as_unbound_as_fresh_ones(self):
@@ -1534,16 +1600,18 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
         router.init_cuda_graph_state(2)
         for leaf in router.leaves.values():
             leaf._decode_views_by_bs[1] = object()
+            leaf._prefix_history = object()
 
         router.set_cache_pool(_pool(*specs))
 
         for leaf in router.leaves.values():
-            self.assertIsNone(leaf.page_table_buf)
-            self.assertIsNone(leaf.seq_lens_buf)
-            self.assertEqual(leaf._decode_views_by_bs, {})
+            assert (leaf.page_table_buf) is None
+            assert (leaf.seq_lens_buf) is None
+            assert (leaf._decode_views_by_bs) == ({})
+            assert (leaf._prefix_history) is None
 
 
-class PagedLeafRebindTest(unittest.TestCase):
+class TestPagedLeafRebindTest:
     """Every leaf forgets the per-forward and per-graph state it annotates as optional.
 
     The gate reads ``self.<name>: <Type> | None = None`` annotations in ``__init__``
@@ -1569,8 +1637,8 @@ class PagedLeafRebindTest(unittest.TestCase):
 
     def _check(self, backend_cls, expected, **publish_reads):
         slots = self._optional_slots(backend_cls)
-        self.assertTrue(slots)
-        self.assertEqual(sorted(slots), sorted(expected))
+        assert slots
+        assert (sorted(slots)) == (sorted(expected))
         leaf = backend_cls.__new__(backend_cls)
         leaf._init_pool_binding()
         leaf.cache_pool = object()
@@ -1583,9 +1651,11 @@ class PagedLeafRebindTest(unittest.TestCase):
 
         leaf.set_cache_pool(pool)
 
-        self.assertIs(leaf.cache_pool, pool)
+        assert (leaf.cache_pool) is (pool)
         for name in slots:
-            self.assertIsNone(getattr(leaf, name), name)
+            _pytest_obj_1 = getattr(leaf, name)
+            _pytest_msg_2 = name
+            assert _pytest_obj_1 is None, _pytest_msg_2
 
     def test_mha_leaf_forgets_the_previous_forward(self):
         from tokenspeed.runtime.layers.attention.backends.paged.mha import (
@@ -1649,8 +1719,8 @@ class PagedLeafRebindTest(unittest.TestCase):
             ],
         )
 
-    @unittest.skipUnless(
-        torch.version.hip is None, "FlashInfer wrappers are NVIDIA-only"
+    @pytest.mark.skipif(
+        not (torch.version.hip is None), reason=("FlashInfer wrappers are NVIDIA-only")
     )
     def test_flashmla_leaf_forgets_the_previous_forward(self):
         from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
@@ -1667,6 +1737,10 @@ class PagedLeafRebindTest(unittest.TestCase):
                 "kvp_block_granularity",
                 "kvp_virtual_block_count",
                 "dcp_metadata",
+                "_dcp_visible_lens_buf",
+                "_dcp_query_offsets",
+                "_dcp_page_table_rows",
+                "_dcp_kernel_seq_lens",
             ],
             workspace_buffer=torch.empty(1 << 20, dtype=torch.uint8, device="cuda"),
             indices_updater_prefill=SimpleNamespace(prefill_wrapper_ragged=None),
@@ -1681,10 +1755,10 @@ class PagedLeafRebindTest(unittest.TestCase):
         leaf._init_pool_binding()
         leaf._verify_views_by_bs = {1: object()}
         leaf.set_cache_pool(object())
-        self.assertEqual(leaf._verify_views_by_bs, {})
+        assert (leaf._verify_views_by_bs) == ({})
 
-    @unittest.skipUnless(
-        torch.version.hip is None, "FlashInfer wrappers are NVIDIA-only"
+    @pytest.mark.skipif(
+        not (torch.version.hip is None), reason=("FlashInfer wrappers are NVIDIA-only")
     )
     def test_flashmla_leaf_forgets_the_tile_keepalives(self):
         from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
@@ -1699,11 +1773,10 @@ class PagedLeafRebindTest(unittest.TestCase):
         leaf.prefill_wrapper_ragged = leaf.prefill_wrapper_paged = object()
         leaf.indices_updater_prefill = SimpleNamespace(prefill_wrapper_ragged=object())
         leaf.set_cache_pool(object())
-        self.assertEqual(leaf._decode_tile_metadata_keepalive, [])
-        self.assertIsNot(leaf.prefill_wrapper_paged, leaf.prefill_wrapper_ragged)
-        self.assertIs(
-            leaf.indices_updater_prefill.prefill_wrapper_ragged,
-            leaf.prefill_wrapper_ragged,
+        assert (leaf._decode_tile_metadata_keepalive) == ([])
+        assert (leaf.prefill_wrapper_paged) is not (leaf.prefill_wrapper_ragged)
+        assert (leaf.indices_updater_prefill.prefill_wrapper_ragged) is (
+            leaf.prefill_wrapper_ragged
         )
 
     def test_cutedsl_mla_leaf_forgets_the_previous_forward(self):
@@ -1742,10 +1815,10 @@ class PagedLeafRebindTest(unittest.TestCase):
 
         backend.set_cache_pool(pool)
 
-        self.assertIs(backend.cache_pool, pool)
-        self.assertIsNone(backend._prefill_page_table)
-        self.assertIsNone(backend.kpool_runtime.prefill_plan)
+        assert (backend.cache_pool) is (pool)
+        assert (backend._prefill_page_table) is None
+        assert (backend.kpool_runtime.prefill_plan) is None
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

@@ -460,6 +460,19 @@ def test_verify_raw_barriers_survive_clamp_and_acceptance(
     )
 
 
+def test_decode_gathers_each_request_row_from_its_slot(buffers):
+    ib, _ = buffers
+    runtime = _spec_runtime(ib, 4)
+    states = {rid: _state([10, 11, 12], []) for rid in "abc"}
+    rows = {3: [40, 41, 42, 43], 1: [20, 21, 22, 23], 2: [30, 31, 32, 33]}
+    for slot, row in rows.items():
+        runtime.valid_cache_lengths[slot] = 3
+        runtime.future_input_map[slot] = torch.tensor(row, device=ib.device)
+    op = _op(states, ["a", "b", "c"], list(rows), [4] * 3, [], [], [-1] * 3)
+    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    assert ib.input_ids_buf[:12].tolist() == rows[3] + rows[1] + rows[2]
+
+
 def test_mixed_verify_empty_prefix_recovery_and_override(buffers):
     ib, _ = buffers
     runtime = _spec_runtime(ib, 4)
@@ -954,6 +967,9 @@ def test_execute_idle_forward_passes_empty_engram_views(buffers):
 
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = ib.device
+    executor.device_module = torch.get_device_module(executor.device)
+    executor.default_stream = executor.device_module.current_stream()
+    executor.execution_stream = executor.device_module.Stream()
     executor.input_buffers = ib
     executor.runtime_states = runtime
     executor.attn_backend = SimpleNamespace()
@@ -1030,6 +1046,8 @@ def test_dispatch_owns_snapshot_until_forward_thread_consumes_it():
         ngram_inputs=snapshot,
         request_history_seeds=None,
         input_logprob_plan=None,
+        sampled_top_k=0,
+        stop_criteria=(),
     )
     pending = handle._submit_forward(planned, capture_next_input_ids=False)
     states["a"].prompt_input_ids.clear()

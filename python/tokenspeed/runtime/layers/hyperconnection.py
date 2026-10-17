@@ -30,7 +30,11 @@ from tokenspeed_kernel.ops.layernorm import (
     gated_residual_combine_norm,
     grouped_gemma_rmsnorm,
 )
-from tokenspeed_kernel.ops.residual import gated_residual_combine, gated_residual_mix
+from tokenspeed_kernel.ops.residual import (
+    gated_residual_combine,
+    gated_residual_mix,
+    pad_gated_residual_projection_weight,
+)
 from torch import nn
 
 
@@ -145,6 +149,7 @@ class GatedResidualSimple(nn.Module):
         projection_rows = (config.hc_lowrank if use_mix else 0) + (
             self.hc_count if use_combine else 0
         )
+        self._projection_rows = projection_rows
         self.mix_inject_proj = (
             nn.Linear(hc_size, projection_rows, bias=False) if projection_rows else None
         )
@@ -155,6 +160,16 @@ class GatedResidualSimple(nn.Module):
         )
         if self.input_mix_weight_up is not None:
             self.input_mix_weight_up.weight.weight_loader = self._load_up_weight
+
+    @staticmethod
+    def process_weights_after_loading(module: GatedResidualSimple) -> None:
+        """Align mix GEMM storage once, including dummy/sharded loading."""
+        if module.use_mix:
+            weight = module.mix_inject_proj.weight
+            weight.data = pad_gated_residual_projection_weight(
+                weight.data, projection_rows=module._projection_rows
+            )
+            module.mix_inject_proj.out_features = weight.shape[0]
 
     def _load_up_weight(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         """Load the fixed-shape up projection."""
@@ -179,7 +194,7 @@ class GatedResidualSimple(nn.Module):
         if size == 0:
             # This stream does not use that half of the projection.
             return
-        if loaded_weight.shape[0] != size or param.shape[0] != mix_rows + inject_rows:
+        if loaded_weight.shape != (size, param.shape[1]):
             raise ValueError(
                 f"hyper-connection {shard_id} shard shape mismatch: param "
                 f"{tuple(param.shape)}, loaded {tuple(loaded_weight.shape)}"
@@ -190,6 +205,9 @@ class GatedResidualSimple(nn.Module):
             else loaded_weight
         )
         param.data[start : start + size].copy_(weight.to(param.device, param.dtype))
+        # Allocate padding on the first shard only. Later shards and reloads
+        # write directly into the same parameter storage used by CUDA graphs.
+        self.process_weights_after_loading(self)
 
     def _inject_logits(self, normalized: torch.Tensor):
         """Inject logits alone, for residual rows ``mix`` never saw."""
@@ -197,7 +215,7 @@ class GatedResidualSimple(nn.Module):
             return None
         weight = self.mix_inject_proj.weight
         if self.use_mix:
-            weight = weight[self.hc_lowrank :]
+            weight = weight[self.hc_lowrank : self._projection_rows]
         logits = F.linear(normalized, weight)
         if self._projection_scale != 1.0:
             logits = logits * self._projection_scale
@@ -255,6 +273,7 @@ class GatedResidualSimple(nn.Module):
             self.hc_count,
             self.hidden_size,
             self.hc_lowrank,
+            projection_rows=self._projection_rows,
             projection_scale=self._projection_scale,
             weights_independent=True,
         )

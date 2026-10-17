@@ -10,7 +10,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "tokenspeed-scheduler"
-version = "0.1.30"
+version = "0.1.39"
 description = "TokenSpeed C++ scheduler with Python bindings"
 requires-python = ">=3.10"
 dependencies = [
@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
-    "pytest>=8,<9",
+    "pytest>=9",
 ]
 
 [tool.scikit-build]

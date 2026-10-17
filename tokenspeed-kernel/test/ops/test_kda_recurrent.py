@@ -84,7 +84,6 @@ def test_kda_prefill_relayouts_only_for_declaring_kernels(
         cu_seqlens=torch.tensor([0, 1]),
         cu_seqlens_cpu=torch.tensor([0, 1], dtype=torch.int64),
         capacity=None,
-        inputs_packed=False,
         recurrent_layout="v_major",
     )
 
@@ -665,7 +664,6 @@ def test_kda_replay_is_registered_for_the_platform_layout() -> None:
             "triton_nvidia_kda_fused_paged_decode",
             {
                 "paged_state": frozenset({True}),
-                "fused_output_norm": frozenset({False, True}),
                 "recurrent_layout": frozenset({"v_major"}),
             },
         ),
@@ -968,7 +966,6 @@ def test_kda_paged_prefill_preserves_native_state_layout() -> None:
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens.to("cpu", torch.int64),
         capacity=None,
-        inputs_packed=False,
     )
 
     torch.testing.assert_close(
@@ -1163,11 +1160,13 @@ def test_kda_paged_decode_graph_padding_and_page_stride() -> None:
     [(1, 1), (2, 2), (4, 2), (8, 8), (16, 16), (32, 32), (64, 60)],
 )
 def test_kda_fused_paged_decode_matches_reference(batch: int, active: int) -> None:
-    """The K3 megafusion preserves state paging and its fused norm epilogue."""
-    # NVIDIA is covered by test_kda_megafuse_fused_norm_matches_separate_norm: the
-    # 2e-4 state tolerance below is tuned to the gfx950 kernel's accumulation.
-    if not (current_platform().is_cdna4 or current_platform().is_cdna5):
-        pytest.skip("gfx950/gfx1250 KDA fusion test")
+    """Convolution/gate/recurrent fusion returns raw output and updates paged state."""
+    if not (
+        current_platform().is_nvidia
+        or current_platform().is_cdna4
+        or current_platform().is_cdna5
+    ):
+        pytest.skip("NVIDIA/gfx950/gfx1250 KDA fusion test")
 
     torch.manual_seed(31)
     heads, head_dim, pages = 12, 128, 2 * active
@@ -1209,9 +1208,6 @@ def test_kda_fused_paged_decode_matches_reference(batch: int, active: int) -> No
     beta_logits = packed_projection[:, beta_start : beta_start + heads]
     a_log = torch.randn(heads, device="cuda", dtype=torch.float32)
     dt_bias = torch.randn(projection_width, device="cuda", dtype=torch.float32)
-    output_gate = packed_projection[:, 3 * projection_width : f_a_start]
-    norm_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
-    norm_eps = 1e-6
     state_pool = 0.01 * torch.randn(
         pages,
         heads,
@@ -1235,7 +1231,11 @@ def test_kda_fused_paged_decode_matches_reference(batch: int, active: int) -> No
         )
     )
 
-    raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
+    # NVIDIA keeps the fused decay projection in FP32; AMD rounds it to BF16.
+    gate_dtype = torch.float32 if current_platform().is_nvidia else f_a_out.dtype
+    raw_g = torch.nn.functional.linear(
+        f_a_out.to(gate_dtype), f_b_weight.to(gate_dtype)
+    )
     expected_out = torch.zeros(
         batch,
         heads,
@@ -1266,14 +1266,7 @@ def test_kda_fused_paged_decode_matches_reference(batch: int, active: int) -> No
             lower_bound=LOWER_BOUND,
             eps=NORM_EPS,
         )
-        core_out = core_out[0].float()
-        inverse_rms = torch.rsqrt(core_out.square().mean(dim=-1) + norm_eps)
-        expected_out[row] = (
-            core_out
-            * inverse_rms[:, None]
-            * norm_weight.float()[None, :]
-            * torch.sigmoid(output_gate[row].view(heads, head_dim).float())
-        ).to(torch.bfloat16)
+        expected_out[row] = core_out[0].to(torch.bfloat16)
         expected_state_pool[write_idx] = final_state
         expected_conv_states[write_idx] = torch.stack(
             (history[..., 1], history[..., 2], current), dim=-1
@@ -1294,74 +1287,15 @@ def test_kda_fused_paged_decode_matches_reference(batch: int, active: int) -> No
         num_heads=heads,
         head_dim=head_dim,
         cu_seqlens=cu_seqlens,
-        output_gate=output_gate,
-        norm_weight=norm_weight,
-        norm_eps=norm_eps,
         recurrent_layout="v_major",
     )
 
     assert result is not None
-    assert result.output_norm_applied
     torch.testing.assert_close(
-        result.out[0].float(), expected_out.float(), atol=5e-2, rtol=5e-2
+        result[0, :active].float(), expected_out[:active].float(), atol=2e-4, rtol=2e-2
     )
     torch.testing.assert_close(state_pool, expected_state_pool, atol=2e-4, rtol=2e-4)
     torch.testing.assert_close(conv_states, expected_conv_states)
-
-
-def test_kda_fused_decode_override_preserves_external_output_norm(monkeypatch) -> None:
-    """A core-only override must not claim that it applied output normalization."""
-    assert KernelRegistry.get().get_by_name(
-        "triton_nvidia_kda_fused_paged_decode"
-    ).traits["fused_output_norm"] == frozenset({False, True})
-
-    # The verify kernel is registered without the trait at all.
-    kernel_name = "triton_nvidia_kda_fused_paged_verify_no_store"
-    spec = KernelRegistry.get().get_by_name(kernel_name)
-    assert spec is not None
-    assert "fused_output_norm" not in spec.traits
-
-    captured_kwargs = {}
-
-    class CoreOnlyKernel:
-        name = kernel_name
-
-        def __call__(self, **kwargs):
-            captured_kwargs.update(kwargs)
-            return kwargs["mixed_qkv"]
-
-    monkeypatch.setattr(
-        attention_ops,
-        "select_kernel",
-        lambda *_args, **_kwargs: CoreOnlyKernel(),
-    )
-    tensor = torch.empty(1, dtype=torch.bfloat16)
-    result = try_kda_fused_paged_decode(
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        state_pool=tensor,
-        read_indices=tensor,
-        write_indices=tensor,
-        num_heads=12,
-        head_dim=128,
-        cu_seqlens=tensor,
-        output_gate=tensor,
-        norm_weight=tensor,
-        norm_eps=1e-6,
-        override=kernel_name,
-    )
-
-    assert result is not None
-    assert not result.output_norm_applied
-    assert captured_kwargs["output_gate"] is None
-    assert captured_kwargs["norm_weight"] is None
-    assert captured_kwargs["norm_eps"] is None
 
 
 def test_kda_fused_decode_rejects_unsupported_conv_width() -> None:
@@ -1386,9 +1320,6 @@ def test_kda_fused_decode_rejects_unsupported_conv_width() -> None:
         num_heads=12,
         head_dim=128,
         cu_seqlens=tensor,
-        output_gate=tensor,
-        norm_weight=tensor,
-        norm_eps=1e-6,
     )
 
     assert result is None
@@ -1425,7 +1356,6 @@ def _megafuse_inputs(batch: int, seed: int = 17):
         "heads": heads,
         "head_dim": head_dim,
         "mixed_qkv": packed[:, : 3 * width],
-        "output_gate": packed[:, 3 * width : 4 * width],
         "f_a_out": packed[:, 4 * width : 4 * width + head_dim],
         "beta_logits": packed[:, 4 * width + head_dim : used],
         "conv_weights": 0.1
@@ -1436,7 +1366,6 @@ def _megafuse_inputs(batch: int, seed: int = 17):
         * torch.randn(width, head_dim, device="cuda", dtype=torch.bfloat16),
         "a_log": torch.randn(heads, device="cuda", dtype=torch.float32),
         "dt_bias": torch.randn(width, device="cuda", dtype=torch.float32),
-        "norm_weight": torch.randn(head_dim, device="cuda", dtype=torch.bfloat16),
         "state_pool": 0.01
         * torch.randn(
             pages, heads, head_dim, head_dim, device="cuda", dtype=torch.float32
@@ -1449,16 +1378,13 @@ def _megafuse_inputs(batch: int, seed: int = 17):
     }
 
 
-def _run_megafuse(inp, *, fused: bool):
-    """One megafuse decode, with the norm epilogue fused in or applied after."""
-    from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
+def _run_megafuse(inp):
+    """One fused convolution/gate/recurrent decode."""
     from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_recurrent_kda_megafuse,
     )
 
     heads, head_dim = inp["heads"], inp["head_dim"]
-    # Serving passes a row-strided slice of the packed projection, not a copy.
-    gate = inp["output_gate"]
     out = fused_recurrent_kda_megafuse(
         inp["mixed_qkv"],
         inp["conv_weights"],
@@ -1475,47 +1401,12 @@ def _run_megafuse(inp, *, fused: bool):
         head_dim=head_dim,
         cu_seqlens=inp["cu_seqlens"],
         lower_bound=LOWER_BOUND,
-        output_gate=gate if fused else None,
-        norm_weight=inp["norm_weight"] if fused else None,
-        norm_eps=NORM_EPS if fused else None,
     )
-    if fused:
-        return out
-    return rmsnorm_gated_sigmoid(
-        out.reshape(-1, heads * head_dim).contiguous(),
-        gate.contiguous(),
-        inp["norm_weight"],
-        NORM_EPS,
-        heads,
-        head_dim,
-        enable_pdl=False,
-    ).view_as(out)
+    return out
 
 
-@pytest.mark.parametrize("batch", [1, 4])
-def test_kda_megafuse_fused_norm_matches_separate_norm(batch: int) -> None:
-    """The fused epilogue reproduces megafuse followed by rmsnorm_gated_sigmoid."""
-    if not current_platform().is_nvidia:
-        pytest.skip("NVIDIA triton KDA megafusion test")
-
-    inp = _megafuse_inputs(batch)
-    conv0, state0 = inp["conv_states"].clone(), inp["state_pool"].clone()
-
-    expected = _run_megafuse(inp, fused=False)
-    conv_ref, state_ref = inp["conv_states"].clone(), inp["state_pool"].clone()
-
-    inp["conv_states"].copy_(conv0)
-    inp["state_pool"].copy_(state0)
-    fused = _run_megafuse(inp, fused=True)
-
-    torch.testing.assert_close(fused.float(), expected.float(), atol=0.5, rtol=2e-2)
-    # The epilogue must not disturb the state it writes back.
-    torch.testing.assert_close(inp["conv_states"], conv_ref)
-    torch.testing.assert_close(inp["state_pool"], state_ref)
-
-
-def test_kda_megafuse_fused_norm_is_cuda_graph_safe() -> None:
-    """The fused epilogue captures and replays inside a CUDA graph."""
+def test_kda_megafuse_is_cuda_graph_safe() -> None:
+    """The recurrent update captures and replays inside a CUDA graph."""
     if not current_platform().is_nvidia:
         pytest.skip("NVIDIA triton KDA megafusion test")
 
@@ -1523,7 +1414,7 @@ def test_kda_megafuse_fused_norm_is_cuda_graph_safe() -> None:
     conv0, state0 = inp["conv_states"].clone(), inp["state_pool"].clone()
 
     # Warm eagerly: the JIT must not compile inside the capture.
-    eager = _run_megafuse(inp, fused=True)
+    eager = _run_megafuse(inp)
     inp["conv_states"].copy_(conv0)
     inp["state_pool"].copy_(state0)
 
@@ -1531,17 +1422,17 @@ def test_kda_megafuse_fused_norm_is_cuda_graph_safe() -> None:
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        _run_megafuse(inp, fused=True)
+        _run_megafuse(inp)
     torch.cuda.current_stream().wait_stream(stream)
     inp["conv_states"].copy_(conv0)
     inp["state_pool"].copy_(state0)
 
     with torch.cuda.graph(graph):
-        captured = _run_megafuse(inp, fused=True)
+        captured = _run_megafuse(inp)
 
     inp["conv_states"].copy_(conv0)
     inp["state_pool"].copy_(state0)
     graph.replay()
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(captured.float(), eager.float(), atol=0.5, rtol=2e-2)
+    torch.testing.assert_close(captured, eager, atol=0, rtol=0)

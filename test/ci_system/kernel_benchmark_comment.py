@@ -296,6 +296,7 @@ def _artifact_names(run_id: int, run_attempt: int) -> tuple[str, ...]:
             "amd-mi350-1gpu-bench",
             "amd-mi35x-1gpu-test",
             "amd-mi355-1gpu-bench",
+            "amd-mi355-1gpu",
         )
     )
 

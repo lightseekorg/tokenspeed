@@ -47,6 +47,29 @@ files with the checkpoint. Pass a custom filename pattern through
 `{"pattern": "model-rank-{rank}-part-{part}.safetensors"}`. The serving CLI does
 not expose this loader or its extra configuration.
 
+## Sparse KV Offloading
+
+`--kv-offload-config` accepts a JSON object with four required fields:
+`layers` (unique target attention layer IDs), `hot_tokens` (a positive power of
+two), `host_gb` (a finite positive budget in GiB), and `overlap` (an explicit
+boolean enabling cross-layer prefetch). Omitting the argument disables offload.
+The model cache recipe validates supported fields, selection capacity and
+execution constraints; unsupported recipes reject the configuration.
+
+Model-specific behavior stays in `--hf-overrides`. For a plugin supporting a
+window ring, set its `kv_offload_window_ring` option explicitly. Do not put
+`window_ring` in the runtime object or use the legacy `hf_overrides.kv_offload`
+entry; both are rejected. This option does not enable MTP, CUDA Graph, scheduler
+overlap, or change numerical settings implicitly.
+
+Offloading uses capacity aborts instead of snapshot recovery. Its snapshot
+pool is disabled automatically; positive snapshot sizes, snapshot request
+caps and `--debug-force-retraction-interval` are rejected. Under decode
+memory pressure the scheduler releases the victim's history blocks and
+request slot and reports `CapacityAbort` to the client. A client that wants
+to continue must submit a new request. The fixed hot allocation persists;
+its request partition is invalidated before another PD owner uses it.
+
 ## Precision and quantization
 
 | Parameter | Purpose |
@@ -66,8 +89,8 @@ switch an envelope folds is also available individually under `auto`.
 | Parameter | Purpose |
 | --- | --- |
 | `--numerics {auto,rl-bitwise}` | `auto` keeps every performance default. `rl-bitwise` folds the determinism switches (`--batch-invariant-collectives`, `--disable-autotune`, `--disable-tf32`, `--disable-pdl`, no fused all-reduce, `--moe-backend aok`, `--sampling-stream per-request`, `--dsa-slot-order sorted`) so tokens and logprobs are bitwise identical across runs and batch compositions, and the trainer-operation-order switches below so a teacher-forced pass reproduces the RL trainer's logprobs. Needs MoE TP 1 and a vocabulary that is a multiple of 32768; a model serves it only once its profile lists it. |
-| `--batch-invariant-collectives` | One association order per reduction, independent of the batch: a 2-D bf16 all-reduce on a multicast-reachable group runs as the NVLS in-switch reduction issued by one fixed rank (verified bitwise at startup), every other reduction as NCCL data movement plus a fixed-rank-order fp32 fold; gathers keep the multicast kernels. Folded in by `rl-bitwise`. |
-| `--force-deterministic-rsag` | NCCL and the fold only: no symmetric-memory path (multicast gathers, in-switch all-reduce, the trtllm/Triton all-reduce tiers, distributed argmax). Not folded in by `rl-bitwise`; the escape when the startup self-check refuses the switch. |
+| `--batch-invariant-collectives` | One association order per reduction, independent of the batch: every reduction runs as NCCL data movement plus a fixed-rank-order fp32 fold (an all-reduce costs world_size x the traffic); gathers keep the multicast kernels. Folded in by `rl-bitwise`. |
+| `--force-deterministic-rsag` | NCCL and the fold only: no symmetric-memory path (multicast gathers, the trtllm/Triton all-reduce tiers, distributed argmax). Not folded in by `rl-bitwise`, under which it only moves the gathers to NCCL. |
 | `--sampling-stream {batch,per-request}` | `per-request` draws every non-greedy row from a stream keyed by the request's seed and position only, so a request samples the same tokens alone and inside any batch. Folded in by `rl-bitwise`. |
 | `--yarn-ramp-mask-device {cuda,cpu}` | Device that computes the `deepseek_yarn` RoPE inverse frequencies (position frequencies, both divisions and the YaRN linear ramp mask) before the table is moved to the model device once; the trainer builds it on the host. Folded to `cpu` by `rl-bitwise`. |
 | `--mla-lora-scale {folded,runtime}` | Where LongCat-style MLA applies its `sqrt(hidden / lora_rank)` norm scales: folded into the norm weights at load, or multiplied at runtime after `q_b_proj` / `kv_a_layernorm` as the trainer does. Folded to `runtime` by `rl-bitwise`. |
@@ -169,7 +192,7 @@ the vocabulary. `logprob_start_len=-1` is always accepted.
 Under pipeline parallelism (`--pipeline-parallel-size > 1`) the last stage scores the prompt
 rows and the commit path carries both logprob vectors to the other stages
 with the sampled tokens. Under query context parallelism
-(`--prefill-context-parallel-size N`) the prompt rows of a chunk live on the
+(`--query-context-parallel-size N`) the prompt rows of a chunk live on the
 rank whose shard holds them. Because the LM head is vocab-sharded over the
 same ranks, the ranks gather the planned rows' activations to the group and
 every rank scores the whole plan, so each rank's
@@ -192,7 +215,17 @@ scheduler drive (SMG) carries sampled-token logprobs only: it refuses a
 `logprob_start_len` that would produce prompt logprobs rather than compute
 and drop them.
 
-`top_logprobs_num > 0` and `token_ids_logprob` are not supported yet.
+`top_logprobs_num=k` (1 to 20) adds each position's `k` most likely tokens,
+most likely first, as `(logprob, token_id, text|null)` triples:
+`meta_info["input_top_logprobs"]` beside the prompt logprobs (`null` for the
+first position, like its value) and `meta_info["output_top_logprobs"]`
+beside the sampled token. They come from the same fp32 log-softmax as the
+values. The engine computes them where the forward runs eagerly, so the
+ingress takes `top_logprobs_num` only for a request whose every token is
+sampled in its prefill (`max_new_tokens` 0 or 1, as an `echo` scoring request
+sends) and with `--logprob-order torch`; a longer generation, pipeline
+parallelism and disaggregated prefill and decode get a 400, and the direct
+msgpack scheduler drive refuses it. `token_ids_logprob` is not supported yet.
 
 This runtime requires a `tokenspeed-scheduler` build that has
 `RequestSpec.max_cached_prefix_tokens` (the admission-probe bound; see
@@ -231,15 +264,44 @@ These slime paths are not yet supported end to end:
   `--rollout-top-p 1.0` until TokenSpeed returns that metadata;
 - rollout routing replay (`--use-rollout-routing-replay`).
 
-`POST /update_weights_from_disk` and `POST /update_weights_from_tensor` stay on
-the router for slime-compatible clients, but answer `501 Not Implemented` with
+`POST /update_weights_from_disk` reloads the weights in place from a checkpoint
+directory (`{"model_path": ..., "load_format": ...}`; `load_format` defaults to
+the server's). It takes the same scheduler path as the distributed and
+Mooncake updates: the `weight_version` checks, the attention-DP same-round gate,
+a cache flush before the load, and the replica-wide result. The reply counts
+the checkpoint tensors actually read, and a checkpoint that yields none is a
+failure. Load formats that do not read checkpoint files (for example `dummy`)
+are refused. The checkpoint is streamed the way the startup load streams it,
+so a model that reads tables from its checkpoint directory (DeepSeek-V4.1's
+Engram tables) reads them from the new one.
+
+The request is refused, with nothing written, when the startup loader
+transformed the model's weights after loading them, because a checkpoint holds
+those weights untransformed: quantized checkpoints (FP8, MXFP4, NVFP4,
+compressed-tensors), and MoE layers whose kernel repacks the experts, which
+includes the FlashInfer TRT-LLM and CUTLASS kernels for unquantized experts.
+Restart the engine with the new checkpoint instead. (`rl.update_from` still
+lists `disk` for such a model: it describes the engine, not the loaded model.)
+Unquantized dense models,
+and unquantized MoE on a kernel that keeps the checkpoint layout (the Triton
+kernel, or the Gluon kernel on gfx950), reload in place.
+
+For a safetensors checkpoint the shard headers are read before the first
+write. A shard shorter than its header declares (for example, one still being
+written) or a tensor whose shape differs from the same name in the checkpoint
+the model holds fails the request with the weights unchanged. A failure after
+the load has started says that the worker's weights may now mix the two
+checkpoints: reload a complete checkpoint or restart the engine before relying
+on its output. The weight version does not advance on any failure.
+
+`POST /update_weights_from_tensor` stays on the router for slime-compatible
+clients, but answers `501 Not Implemented` with
 `{"success": false, "message": "..."}` before anything reaches the scheduler:
-TokenSpeed's scheduler implements neither the disk load path nor the CUDA-IPC
-receive path and would answer such a request with `success=false` ("not
-supported on this engine"). Use `POST /update_weights_from_distributed` or the
-Mooncake update described below. For the same reason the engine advertises
-`rl.update_from = "distributed,mooncake"`, so a gateway never routes a disk
-or tensor update here.
+TokenSpeed's scheduler does not implement the CUDA-IPC receive path. Use
+`POST /update_weights_from_distributed`, `POST /update_weights_from_disk`, or
+the Mooncake update described below. For the same reason the engine advertises
+`rl.update_from = "disk,distributed,mooncake"`, so a gateway never routes a
+tensor update here.
 
 ### Weight updates under attention DP
 
@@ -247,19 +309,22 @@ With `--data-parallel-size > 1`, the frontend sends
 `init_weights_update_group`, `update_weights_from_distributed`,
 `update_weights_from_mooncake`, and `destroy_weights_update_group` to every
 attention-DP worker and ANDs the replies (joining distinct messages with
-` | `). Each scheduler queues the op and completes it only in a round where
-every DP rank holds the same kind of op at the head of its queue, decided on
-the per-round DP all-reduce that already carries flush intent. One op
-completes per round. TokenSpeed then MIN-reduces the device result across
-the replica before it publishes the L3 weight version, so a failure on one
-rank fails the update everywhere. A rank whose peer never receives the op
-waits indefinitely, as with `/flush_cache`. The design rationale is in
+` | `). It sends `update_weights_from_disk` to every worker the same way and
+ANDs those replies too, but joins every message with ` | `, repeats included.
+Each scheduler queues the op and completes it only in a round where every DP
+rank holds the same kind of op at the head of its queue, decided on the
+per-round DP all-reduce that already carries flush intent. One op completes
+per round. TokenSpeed then MIN-reduces the device result across the replica
+before it publishes the L3 weight version, so a failure on one rank fails the
+update everywhere. A rank whose peer never receives the op waits
+indefinitely, as with `/flush_cache`. The design rationale is in
 `docs/design/event-loop.md`.
 
-Only the two loads take the frontend's model-update writer lock (the lock
-keeps generation out while the load rewrites parameters).
-`init_weights_update_group` and `destroy_weights_update_group` rewrite
-nothing and do not wait for in-flight generation, so the trainer's
+Only the three loads (distributed, Mooncake and disk) take the frontend's
+model-update writer lock (the lock keeps generation out while the load
+rewrites parameters). `init_weights_update_group` and
+`destroy_weights_update_group` rewrite nothing and do not wait for in-flight
+generation, so the trainer's
 rendezvous is not held up by long requests.
 
 ### Mooncake weight updates
@@ -369,7 +434,7 @@ for gateway discovery.
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
 | `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
 | `--prefill-graph-capture-batch-sizes` | Request capacities for inline KDA prefill capture. Replay selects the smallest compatible capacity that fits the batch. |
-| `--retraction-snapshot-host-gb` | Explicit size, in gigabytes, of the per-rank pinned Host pool that holds a retraction image's tail (a retracted request's unaligned tail pages, its blocks of groups Host L2 never holds, and its slot state; the hash-complete blocks go to Host L2 and stay pinned there until the request is restored; with `--disable-kvstore` the pool holds whole images). Wins over `--retraction-snapshot-ratio` when set; `0` (the default) means not set, like `--kvstore-size` against `--kvstore-ratio`. A request a capacity retraction suspends is imaged here and resumes exactly where it stopped once the image is copied back; nothing is recomputed. When no resident's image fits -- the pool or its rows are exhausted -- the scheduler aborts the newest resident instead (finish `err_type` 524, see "Retraction snapshot pool" below), so the pool bounds how much can be suspended at once, never how long an admission waits. Fused and decode roles only; the prefill and encode roles never retract and ignore it with a log. Allowed under `--kv-parallel-size > 1`. |
+| `--retraction-snapshot-host-gb` | Explicit size, in gigabytes, of the per-rank pinned Host pool that holds a retraction image's tail (a retracted request's blocks of groups Host L2 never holds, a state group's unpublished input block, and its slot state; the published blocks, the partial last page and the live state block included, go to Host L2 and stay pinned there until the request is restored; with `--disable-kvstore` the pool holds whole images). Wins over `--retraction-snapshot-ratio` when set; `0` (the default) means not set, like `--kvstore-size` against `--kvstore-ratio`. A request a capacity retraction suspends is imaged here and resumes exactly where it stopped once the image is copied back; nothing is recomputed. When no resident's image fits -- the pool or its rows are exhausted -- the scheduler aborts the newest resident instead (finish `err_type` 524, see "Retraction snapshot pool" below), so the pool bounds how much can be suspended at once, never how long an admission waits. Fused and decode roles only; the prefill and encode roles never retract and ignore it with a log. Allowed under `--kv-parallel-size > 1`. |
 | `--retraction-snapshot-ratio` | Size of the retraction snapshot pool as a multiple of this rank's Device KV capacity (the base `--kvstore-ratio` scales too), used when `--retraction-snapshot-host-gb` is not set. Unset (the default) derives the pool at device build: 0.1 of the Device KV without the Host KVStore (whole images, kept cheap to pin; `1` makes every resident suspendable), else the image tails of `--retraction-snapshot-max-requests` requests (table below). An explicit `0` is the one way to run **without a pool**: nothing can be imaged, so every capacity block aborts its victim (the newest resident). |
 | `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, i.e. the most requests suspended at once, and the request count the derived pool size is multiplied by. `0` (the default) derives to `--max-num-seqs / attention-DP size`, which covers every resident request of the rank; refused with `--retraction-snapshot-ratio 0`, which has no rows to size. When no row is free the scheduler aborts a resident rather than waiting. |
 | `--debug-force-retraction-interval` | **Test only.** Every `N` scheduler plans retract the oldest quiescent decoding request (`N > 0`), or with `-N` the one prefilling request between its chunks, without capacity pressure, so a test run exercises the suspend/restore path on every request (the bitwise continuation oracle of [Numerics](../design/numerics.md)). Refused with `--retraction-snapshot-ratio 0` (no pool to image into). `0` (the default) is off; never set it in serving. |
@@ -397,11 +462,12 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | --- | --- |
 | `--tensor-parallel-size`, `--tp` | Familiar alias for setting attention tensor parallel size. |
 | `--attn-tp-size` | Tensor parallel size for attention. |
-| `--kv-parallel-size` | KV parallelism (KVP): shard full-history KV pages (MLA/DSA latent and index-K, DeepSeek V4 compressed KV) cyclically over a consecutive subgroup of attention TP; must divide `--attn-tp-size`. Each rank then stores one shard of every request's pages, so the KV capacity per GPU grows by that factor and the DSA indexer scores only owned pages; decode attends the owned pages and merges the partials by LSE (DCP, `docs/serving/parallelism.md`). Allowed on aggregated engines and with `--disaggregation-mode prefill` (every rank of the subgroup sends its owned pages to an unsharded decode). Not supported yet: the decode role; speculative decoding on any ordinary MLA/DSA model (the recipe refuses to shard a cache holding a draft group, whichever dense kernel runs it -- only the DeepSeek V4 and Kimi K3 recipes shard with a draft, and FlashMLA/GPU DSA reject speculation in their DCP decode outright); and L3 storage (`--kvstore-storage-backend`: a page-cyclic sharded group has no owner-stable L3 key). The Host KVStore and the retraction snapshot pool are supported: the scheduler allocates every Host block in its Device block's residue class and each rank copies the blocks it owns. |
-| `--attn-head-tp-size` | Shard the MLA head projections (`q_b_proj`, `kv_b_proj`, `o_proj`) by heads over this many contiguous ranks that hold different rows; the attention exchanges heads for tokens around its core. Over attention-DP ranks (needs attention TP 1, attention DP and `--disaggregation-mode decode`; each rank keeps its own KV) the layout serves decode rows only, so it sets `--disable-prefill-graph` and tunes on a decode step; it admits any `max_new_tokens`, because a retracted request resumes by restore rather than by a recovery prefill. Over the query shards of a prefill engine (must equal `--prefill-context-parallel-size`) the extend rows run the absorbed sparse prefill through the exchange and none of the decode-only rules apply. Defaults to the ranks holding the same rows: the attention TP size, or 1 (head-replicated) under `--prefill-context-parallel-size`. See [Parallelism](../serving/parallelism.md#decode-side-tp-layouts-under-attention-dp). |
+| `--kv-parallel-size` | KV parallelism (KVP): shard full-history KV pages (MLA/DSA latent and index-K, DeepSeek V4 compressed KV) cyclically over a consecutive subgroup of attention TP; must divide `--attn-tp-size`. Each rank then stores one shard of every request's pages, so the KV capacity per GPU grows by that factor and the DSA indexer scores only owned pages. PD roles only, each side sharding its cache independently (a transfer edge copies only the pages both its prefill rank and its decode rank own): the decode role reads the shards with `--decode-context-parallel-size` (required there, equal to this); the prefill role writes them, with or without `--query-context-parallel-size`. An aggregated engine does not shard, because its steady-state decode would be DCP. GPU MLA/DSA speculative decoding is supported within each backend's device, dtype and draft-attention capabilities: the recipe shards the draft group like the target's, FlashMLA verification uses per-query local causal lengths and GPU DSA uses causal Top-K selection; non-causal DSA block drafts remain unsupported. Not supported yet: L3 storage (`--kvstore-storage-backend`: a page-cyclic sharded group has no owner-stable L3 key). The Host KVStore and the retraction snapshot pool are supported: the scheduler allocates every Host block in its Device block's residue class and each rank copies the blocks it owns. |
+| `--decode-context-parallel-size` | Decode context parallelism (DCP) on the PD decode role: every rank attends the KV pages it owns under `--kv-parallel-size` and the partials are merged across the KVP group by their log-sum-exp (`docs/serving/parallelism.md`). Requires `--disaggregation-mode decode` and must equal `--kv-parallel-size`, which requires it in turn on that role: a sharded cache has no other decode, so the launch names the compute explicitly. The backends key the DCP path on the mapping's KVP size, which the drafter's decode-shaped steps on a sharded prefill engine take as well. 1 (default) is off. |
+| `--attn-head-tp-size` | Shard the MLA head projections (`q_b_proj`, `kv_b_proj`, `o_proj`) by heads over this many contiguous ranks that hold different rows; the attention exchanges heads for tokens around its core. Over attention-DP ranks (needs attention TP 1, attention DP and `--disaggregation-mode decode`; each rank keeps its own KV) the layout serves decode rows only, so it sets `--disable-prefill-graph` and tunes on a decode step; it admits any `max_new_tokens`, because a retracted request resumes by restore rather than by a recovery prefill. Over the query shards of a prefill engine (must equal `--query-context-parallel-size`) the extend rows run the absorbed sparse prefill through the exchange and none of the decode-only rules apply. Defaults to the ranks holding the same rows: the attention TP size, or 1 (head-replicated) under `--query-context-parallel-size`. See [Parallelism](../serving/parallelism.md#decode-side-tp-layouts-under-attention-dp). |
 | `--lm-head-tp-size` | Vocab-shard the LM head over this many contiguous ranks. Under attention DP the default 1 replicates it; a wider group gathers the ranks' rows before the logits GEMM and transposes the shards back. Without attention DP it must equal the attention TP size. Not combinable with `--dp-sampling`; under attention DP, requests asking for prompt logprobs (`logprob_start_len`) are refused. |
-| `--tp-batch-invariant` | `none` (default), `attn`, or `attn+dense`: make the head-sharded `o_proj` and the dense `down_proj` column-parallel on hidden (all-gather of the reduction dim, full-K GEMM, all-to-all back to own rows) so no cross-rank sum remains outside MoE and the bits equal a TP1 full-K GEMM. `attn` needs `--attn-head-tp-size` > 1; `attn+dense` also needs a dense TP group wider than attention TP (so not under `--prefill-context-parallel-size`, whose dense group is 1 or the attention TP width; only `attn` applies there); both need unquantized `o_proj` / `down_proj`, judged on the checkpoint's resolved quantization (a quantized checkpoint passes when its `disable_quant_module` excludes `self_attn` and, for `attn+dense`, `dense_mlp` / `mlps`). |
-| `--prefill-context-parallel-size` | Query context parallelism on the PD prefill role: shard every extend forward's rows over the attention TP group, rank `r` computing a contiguous slice of the chunk against the gathered KV history of its requests (the KV write, index-K write, sampled rows and prompt-logprob rows are gathered across the group; the scheduler, cache allocation and PD transfer are unchanged, and `--chunked-prefill-size` keeps counting the whole chunk). Must equal `--attn-tp-size`; requires `--disaggregation-mode prefill`, `--disable-prefill-graph`, attention DP 1, no `--enable-mixed-batch`, a DSA-family attention backend with a bf16 KV cache (the gathered write stores native latent rows), `--dense-tp-size` and the MoE TP×EP group each 1 or the attention TP width, and `--kv-parallel-size` 1 or equal to it (the sharded-page combination inherits KVP's rules: Host KVStore and snapshot pool allowed, L3 refused). The attention weights are head-replicated unless `--attn-head-tp-size` equals it, which shards them over the shard group. 1 (default) is off. |
+| `--tp-batch-invariant` | `none` (default), `attn`, or `attn+dense`: make the head-sharded `o_proj` and the dense `down_proj` column-parallel on hidden (all-gather of the reduction dim, full-K GEMM, all-to-all back to own rows) so no cross-rank sum remains outside MoE and the bits equal a TP1 full-K GEMM. `attn` needs `--attn-head-tp-size` > 1; `attn+dense` also needs a dense TP group wider than attention TP (so not under `--query-context-parallel-size`, whose dense group is 1 or the attention TP width; only `attn` applies there); both need unquantized `o_proj` / `down_proj`, judged on the checkpoint's resolved quantization (a quantized checkpoint passes when its `disable_quant_module` excludes `self_attn` and, for `attn+dense`, `dense_mlp` / `mlps`). |
+| `--query-context-parallel-size` | Query context parallelism (QCP) on the PD prefill role: shard every extend forward's rows over the attention TP group, rank `r` computing a contiguous slice of the chunk against the gathered KV history of its requests (the KV write, index-K write, sampled rows and prompt-logprob rows are gathered across the group; the scheduler, cache allocation and PD transfer are unchanged, and `--chunked-prefill-size` keeps counting the whole chunk). Requires `--disaggregation-mode prefill` and must equal both `--attn-tp-size` and `--kv-parallel-size` (the shard is a layout over the sharded pages, so it inherits KVP's rules: Host KVStore and snapshot pool allowed, L3 refused); attention DP 1, no `--enable-mixed-batch`, `--dense-tp-size` and the MoE TP×EP group each 1 or the attention TP width; GPU DSA attention with a bf16 KV cache (the gathered write stores native latent rows), checked where the attention config is built. The prefill stays eager -- the GPU DSA backend declares no prefill graph under a shard -- without `--disable-prefill-graph` on the launch. The attention weights are head-replicated unless `--attn-head-tp-size` equals it, which shards them over the shard group. 1 (default) is off. |
 | `--dense-tp-size` | Tensor parallel size for dense layers. Defaults to the attention TP width: the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | Tensor parallel size for MoE layers. |
 | `--data-parallel-size` | Number of data-parallel replicas. |
@@ -445,7 +511,7 @@ for the online variant.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. Names are checked against the backend registry at startup, after plugins load, so an installed plugin's backends are accepted too. |
+| `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. Names are checked against the backend registry at startup, after plugins load, so an installed plugin's backends are accepted too. On SM103 (B300/GB300), `fa4` ranks below every other attention kernel: naming it here or in `--drafter-attention-backend` selects it, and the default selection is unchanged. |
 | `--drafter-attention-backend` | Attention backend for speculative decoding drafter model; accepts the same names as `--attention-backend`. |
 | `--moe-backend` | MoE backend. |
 | `--moe-mxfp4-fp8-activation` | Opt-in: run MXFP4 routed experts with FP8 activations. On Hopper this is the FlashInfer cutlass W4A8 MoE (faster than the default W4A16 kernel, a few percent of extra error on expert outputs). Applies to every MXFP4 expert layer, target and draft; startup fails where the selected MoE backend has no FP8-activation kernel for a layer, when a model's routed experts are not MXFP4, when the model pins another activation precision (Kimi-K3 on Hopper Marlin), or when the layer's SwiGLU is unclamped (the W4A8 FC2 scale relies on the clamp). |
@@ -488,16 +554,25 @@ Common reasoning parser values include `kimi_k25`, `base`, `qwen3`,
 validates the parser names, so use the values accepted by the bundled
 `tokenspeed-smg` package.
 
+When neither parser is named and the model family has no parser defaults,
+`ts serve` passes `--reasoning-parser passthrough` to the gateway, unless the
+model's `tokenizer_config.json` declares a `response_template` and no other
+`--tokenizer` is given: `ts serve` then passes `--parser symphony`,
+`--reasoning-parser hf`, and `--tool-call-parser hf` so the bundled
+`tokenspeed-smg` gateway selects both parsers from that template. Naming any
+parser option keeps its existing behavior.
+
 ## Speculative decoding
 
 | Parameter | Purpose |
 | --- | --- |
 | `--speculative-config` | JSON speculative decoding configuration. |
-| `--speculative-algorithm` | Speculative algorithm, such as `EAGLE3`, `MTP`, `DFLASH`, or `DSPARK`. |
+| `--speculative-algorithm` | Speculative algorithm, such as `EAGLE3`, `MTP`, `DFLASH`, `DSPARK`, or `DUMMY`. `DUMMY` generates deterministic candidates without a draft checkpoint; it tests target multi-token verification, not draft-model quality. Set `--speculative-num-draft-tokens` above 1 and do not pass a draft model path. |
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
 | `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`; required for draft trees. |
+| `--synthetic-acceptance-length` | Benchmark-only mean emitted tokens per speculative verification, including the guaranteed target token. Unset disables it. |
 | `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
 | `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters (see below). Off by default. |
 | `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. |
@@ -506,6 +581,45 @@ validates the parser names, so use the values accepted by the bundled
 
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.
+
+### Synthetic Acceptance Length
+
+The supported benchmark configuration is `--sampling-backend greedy`, with
+speculative decoding enabled and `--dp-sampling` and `--enable-output-logprobs`
+disabled. Draft trees are unsupported. Other sampling backends and these options
+are rejected at startup.
+As with ordinary greedy sampling, token selection is always argmax; stochastic
+sampling and penalties are not supported. Use unconstrained greedy requests
+(`temperature: 0`) for this benchmark.
+
+Use `--synthetic-acceptance-length L` to benchmark speculative execution at a
+fixed mean acceptance length (AL). AL includes the guaranteed target token,
+so `1 <= L <= --speculative-num-draft-tokens` (the verify width). AL `1`
+rejects every draft; AL equal to the verify width accepts every draft. A
+fractional AL emits either `floor(L)` or `ceil(L)` tokens per verification,
+with probability `L - floor(L)` of the larger length. For example, AL `2.6`
+accepts one draft token on 40% of steps and two on 60%, plus a target token.
+
+The draft and target models and the normal verification kernel still execute.
+The verification result is then overridden with synthetic acceptance before
+committing tokens and updating request state, preserving verification overhead.
+The override copies the forced draft prefix and selects the existing target
+argmax at the cutoff. It adds no second verification or target-resampling pass.
+**Do not use generated text for correctness or accuracy evaluation.** Request
+termination can truncate the last verification's output.
+
+Either spelling below configures three draft slots (verify width four) and
+AL `2.6`:
+
+```bash
+--sampling-backend greedy --speculative-algorithm MTP --speculative-num-steps 3 --synthetic-acceptance-length 2.6
+--sampling-backend greedy --speculative-config '{"method":"mtp","num_speculative_tokens":3,"synthetic_acceptance_length":2.6}'
+```
+
+Conflicting values between the flag and JSON configuration are rejected.
+The value must be finite and speculative decoding must be enabled.
+For block drafters with implicit widths, the upper bound is checked against
+the checkpoint's resolved verify width when the sampler is initialized.
 
 `EAGLE3` and `MTP` drafts are chains by default: `--speculative-num-draft-tokens`
 must equal `--speculative-num-steps + 1`. With `--speculative-eagle-topk` above 1
@@ -621,6 +735,7 @@ path. One Triton kernel per verify step walks it. The target's verification
 step applies a request's `temperature`, `top_k` and `top_p`, never the
 proposal, so the served distribution is the target's whatever the drafter
 proposed.
+`DFlash2BeamDraftModel`, Beam's drafter, is a DFlash2 drafter as well.
 
 On a prefill server with `--pipeline-parallel-size > 1`, TokenSpeed accepts
 speculation for `MTP` and `DSPARK` only. The drafter runs on the last stage,
@@ -658,8 +773,11 @@ the draft's attention to the full history.
 | `--enable-log-requests` | Log request metadata and optionally payloads. On by default; `--no-enable-log-requests` disables. |
 | `--log-requests-level` | Request logging verbosity. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
-| `--enable-metrics` | Enable metrics reporting. |
-| `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
+| --enable-metrics | Enable the selected metrics reporters. |
+| --metrics-reporters | Select prometheus or an installed metric output; repeat for multiple. Defaults to prometheus. |
+| --metrics-reporter-config | JSON file mapping external reporter names to their settings. See [metric output plugins](../metrics-plugins.md). |
+| `--metrics-port` | Port for the engine's `/metrics` HTTP endpoint. Defaults to an automatically allocated free port (logged at startup). |
+| `--metrics-host` | Bind host for the `/metrics` endpoint. Defaults to `--host`. |
 | `--decode-log-interval` | Decode batch log interval. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
 
@@ -679,12 +797,112 @@ suffix also lists on its own. The Prometheus waiting gauge and the router
 load snapshot report the scheduler's narrower waiting count, without the
 bootstrapping share.
 
+`tokenspeed:request_queue_time_seconds` is the Prometheus per-request
+queue-wait histogram (`--enable-metrics`): the wall time from a request's
+submission to the scheduler's waiting queue to its first dispatch into a
+forward batch, observed once per request. The enqueue point is submission —
+tokenizer-manager and IPC wait are not included, and neither are the waits
+that precede submission: a structured-output request's grammar-compile wait
+(readiness gates submission), a pause admission hold, and an EPD embedding
+wait all stay out of the sample. A request preempted by capacity retraction
+re-enters the queue without recording a second sample. Under prefill/decode
+disaggregation each node records its own leg: the prefill node's sample spans
+its queue admission to the prefill batch, the decode node's its own admission
+to the decode batch. Bucket boundaries span 0.3 s to 7680 s.
+
 Set `TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS=1` to log each speculative verify
 step's committed widths and accepted draft-token counts. This reads the
 already-synchronized CPU result and does not add a GPU synchronization, but it
 is intentionally verbose. Enable it only while debugging. For
 decode-only batches it also logs the anchor, draft candidates, target verify
 tokens, and their position-wise matches.
+
+To send observations to another monitoring system, install and select a
+[metric output plugin](../metrics-plugins.md). Selecting only external outputs
+does not start a Prometheus endpoint.
+
+### Prometheus metrics
+
+With --enable-metrics and the prometheus reporter, every engine process on a node (scheduler ranks and
+the tokenizer manager) writes its metrics to a node-local
+`PROMETHEUS_MULTIPROC_DIR`, and the engine's main process aggregates and
+serves them as `GET /metrics` in Prometheus text format. Scrape it at
+`http://<metrics-host>:<metrics-port>/metrics`; the bound address is logged at
+startup. Scrape traffic shares nothing with the request path — a bind failure
+degrades to an error log and serving continues.
+
+Where the endpoint lives depends on the launch mode:
+
+- **Single node / `ts serve`**: the engine's main process serves `/metrics`
+  on `--metrics-port` (an allocated free port if unset). `ts serve` pins this
+  port itself and prints `engine metrics available at http://...` once ready.
+  The gateway's own router metrics are separate: smg serves them on its
+  `--prometheus-port`, which `ts serve` also allocates per launch.
+- **Multi-node**: the main node (`node_rank == 0`) behaves as above. Follower
+  nodes (`node_rank >= 1`) run no tokenizer manager; their dummy health-check
+  server exposes `/metrics` (plus `/health`) on the engine's `--host`/`--port`
+  instead. Scrape every node — the multiprocess directory is node-local, so no
+  single endpoint covers the whole cluster.
+
+### Latency histograms
+
+| Metric | Semantics |
+| --- | --- |
+| `tokenspeed:request_time_per_output_token_seconds` | End-to-end latency divided by output tokens; includes queueing and TTFT. |
+| `tokenspeed:request_queue_time_seconds` | Wall time from submission to the scheduler's waiting queue to first dispatch into a forward batch, observed once per request. |
+| `tokenspeed:decode_time_per_output_token_seconds` | Decode time per output token after the first output frame; excludes queueing and TTFT. |
+| `tokenspeed:inter_token_latency_seconds` | Per-token interval between output frames, measured by frontend wall clock. |
+| `tokenspeed:scheduler_inter_token_latency_seconds` | Per-token interval between output frames, measured by scheduler timestamps. |
+
+`tokenspeed:time_to_first_token_seconds` and
+`tokenspeed:e2e_request_latency_seconds` carry a `stream` label
+(`"true"`/`"false"`, the request's streaming flag) in addition to the base
+labels.
+
+### Request counters, token distributions, and preemptions
+
+The request counters `tokenspeed:num_requests_total` (every finished request)
+and `tokenspeed:request_success_total` (finished without an abort) carry two
+labels beyond the base `model_name`/`app_key`:
+
+| Label | Values |
+| --- | --- |
+| `finish_reason` | `stop`, `length`, `abort`, `abort:transfer_failed`, `abort:unknown_error`, `abort:numerical_error`, `abort:capacity_abort`, `unknown`. The finish-reason type (`BaseFinishReason.to_json()`), with the bounded `ABORT_CODE` subclass folded in as `abort:<code>`; an abort with an unrecognized `err_type` stays plain `abort`. Unbounded payloads (abort message, matched stop string) are never labels. |
+| `stream` | `"true"` / `"false"` — the request's streaming flag. |
+
+Two per-request histograms (same `stream` label, observed once at request
+finish) use a 1-2-5 bucket grid (1, 2, 5, 10, …) capped at the model's
+context length:
+
+| Metric | Semantics |
+| --- | --- |
+| `tokenspeed:request_prompt_tokens` | Prompt token count per finished request. |
+| `tokenspeed:request_generation_tokens` | Generation token count per finished request. |
+
+The scheduler process exports `tokenspeed:num_preemptions_total`: requests
+preempted by a capacity retraction — suspended
+with their pages imaged to the Host snapshot pool (they resume by restore;
+nothing is recomputed) to free Device pages for a blocked admission. One
+increment per retraction victim, counted from the plan's snapshot-store ops;
+forced retractions from `--debug-force-retraction-interval` count too. A
+retraction whose victim cannot be imaged aborts it instead — those are
+`tokenspeed:num_capacity_aborted_requests`, never preemptions.
+
+The cached/uncached token split (the billing split Baseten/Fireworks-style
+dashboards show) derives from existing counters, no dedicated metric needed:
+
+```promql
+cached_prompt_tokens   = tokenspeed:prefix_cache_hits_total
+uncached_prompt_tokens = tokenspeed:prompt_tokens_total - tokenspeed:prefix_cache_hits_total
+```
+
+**Wire-compatibility note.** Adding `finish_reason` to
+`tokenspeed:num_requests_total` / `tokenspeed:request_success_total` and
+`stream` to `tokenspeed:time_to_first_token_seconds` /
+`tokenspeed:e2e_request_latency_seconds` changes those metrics' series
+identity: the pre-change series (without the new labels) stop updating, and
+queries pinning an exact label set must include the new labels. Aggregate
+queries (`sum by (...)` that drops them) are unaffected.
 
 ### Per-request stats
 
@@ -738,6 +956,19 @@ number, and a msgpack payload. The payload is an array-like `KVEventBatch`:
 With attention data parallelism, each attention DP rank publishes on an offset
 port from the configured endpoint.
 
+### PD KV transfer metrics
+
+In a PD-disaggregated deployment (`--disaggregation-mode prefill` /
+`decode`), both engine roles record KV cache transfer metrics when metrics
+are enabled (`--enable-metrics --metrics-reporters prometheus`). All three
+carry the `model_name` and `app_key` labels:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `tokenspeed:kv_transfer_latency_seconds` | Histogram | Wall time of one KV transfer send to a peer, recorded on the prefill node (one sample per peer per transferred chunk — per layerwise interval in layerwise mode; buckets span 1 ms to 60 s). |
+| `tokenspeed:kv_transfer_timeouts_total` | Counter | Transfers that timed out, with a bounded `stage` label: `bootstrapping` (prefill never received the cache manifest; `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT`) or `waiting_for_input` (decode never received the transfer-done signal; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`). |
+| `tokenspeed:kv_transfer_failures_total` | Counter | Transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss (heartbeat) on the decode node. Timeouts are counted separately. |
+
 ## TokenSpeed-specific runtime knobs
 
 These parameters are TokenSpeed-specific. They expose runtime
@@ -768,15 +999,17 @@ pinned Host memory, and once Device pages are free again the image is copied
 back and the request continues exactly where it stopped -- a decoding
 request decodes, a mid-prompt request runs its next chunk
 (`docs/design/scheduler.md` section 4). The image is split: the
-hash-complete prefix pages go to Host L2 as a stream-ordered write-back and
-stay pinned there until the restore; the unaligned tail, the blocks of
-groups L2 never holds (a replayable sliding-window group, a state group's
-live block) and the slot-state blob go to the request-private pool
+retraction publishes the victim's completed prefix like a finish, its
+partial last page and its live state block included, and those blocks go to
+Host L2 as a stream-ordered write-back and stay pinned there until the
+restore; the blocks of groups L2 never holds (a replayable sliding-window
+group), a state group's input block when nothing published it (an ordinary
+chunk end's output) and the slot-state blob go to the request-private pool
 (`docs/design/cache-concepts.md`, "Retraction image"). The two buffers are
 separate allocations of one Host cache executor and both count against its
 Host-memory headroom check. The pool is independent of the KVStore: with
 `--disable-kvstore` there is no L2 leg and the pool holds whole images; with
-L2 it holds the tails plus the slot-state blob.
+L2 it holds the unpublished blocks plus the slot-state blob.
 
 **Sizing.** The pool is on by default on the roles that retract and sized
 like the Host KVStore, in LCM blocks of the rank's transfer layout
@@ -792,12 +1025,13 @@ The first rule that applies wins:
 | neither, `--disable-kvstore` | 0.1 x this rank's Device LCM blocks (whole images) | same as above |
 | neither, Host KVStore on | request cap x one image tail | same as above |
 
-One image tail, per cache group, is one page for a group that publishes
-to Host L2 (its unaligned last page; a state group's live block) and a
-request's worst-case pages at the context limit for a group that never
-publishes (a replayable sliding-window group), folded to LCM blocks by the
-scheduler's `CapacityModel`, so the pool is counted the way the scheduler
-later claims it. Without the KVStore a whole image is the request's every
+One image tail, per cache group, is one block for a group that publishes
+to Host L2 (a state group's unpublished input block; a history group's
+margin for a published page L2 could not take) and a request's worst-case
+pages at the context limit for a group that never publishes (a replayable
+sliding-window group), folded to LCM blocks by the scheduler's
+`CapacityModel`, so the pool is counted the way the scheduler later claims
+it. Without the KVStore a whole image is the request's every
 page, so the default is a tenth of the Device KV rather than all of it: an
 on-by-default pool must stay cheap to pin (the Device KV once is hundreds of
 gigabytes of pinned Host memory for a small model on a large GPU), and it
@@ -858,6 +1092,21 @@ Host pinned buffer (L2 / flat KV)
   ↕ batch_put_from / batch_get_into
 Mooncake Store (L3)
 ```
+
+**Sizing.** `--kvstore-size` (gigabytes per rank) wins over
+`--kvstore-ratio` (a multiple of this rank's Device KV, 2 by default).
+Every rank of a node pins its Host buffers at the same point of startup, so
+each rank checks the Host L2 and the retraction snapshot pool against an
+equal share of the Host memory its node has available, less a 10 GiB
+headroom per rank. Each buffer counts at the size it pins: PyTorch's pinned
+allocator rounds every allocation up to a power of two, so a 140 GB L2
+takes 274.88 GB. A ratio size larger than that share is capped to the
+largest L2 every rank's share holds beside its snapshot pool -- the whole
+LCM blocks in the largest power of two that fits, and one size on every
+rank, since the ranks' schedulers mirror each other -- and each rank logs a
+warning with the requested and the capped size. An explicit
+`--kvstore-size` is never shrunk: one that does not fit is refused at
+startup, as is a share without room for a single LCM block.
 
 Each packed Host CacheBlock is one Mooncake object, keyed as
 `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c0`
@@ -997,6 +1246,19 @@ knobs are required with `--kvstore-storage-backend` and refused without it:
 | `--kvstore-prefetch-timeout-per-page-s` | The deadline's per-page term in seconds (0 for a fixed deadline). |
 | `--kvstore-prefetch-batch-pages` | Prefix pages per `batch_get_into` of a prefetch; the fetch stops at the first batch with a missing page (the reference engine uses 128). |
 
+L3 diagnostics are log-based and byte-denominated. `L3HostStore` logs every
+backup (PUT) and prefetch batch (GET) with key counts, successful keys,
+successful payload bytes, and call latency. It logs each `batch_exists`
+probe at debug level; cumulative exists/GET/PUT counters (calls, keys, ok
+keys, ok bytes, total seconds) are kept per store. Above that, the Host
+cache executor logs each completed backup with queue wait separated from
+actual PUT time plus the pending backup pages, bytes, and oldest pending
+age. The backlog includes completed PUTs awaiting their write-back
+acknowledgment. A slow PUT retains Host pages (and Device pages for pinned
+write-backs) until that acknowledgment, delaying admission despite bounded
+pools. Transferred volume is reported as bytes, never as an effective token
+hit rate.
+
 `--kvstore-storage-backend memory` is an in-process dict for tests only.
 CI exercises that Mooncake-compatible contract end-to-end (scheduler
 prefetch after `register_storage_keys` / Host eviction, and a CUDA
@@ -1007,3 +1269,7 @@ ubuntu job boots `mooncake_master` and runs
 `MOONCAKE_MASTER=host:port`.
 Mooncake Store is the offload backend. PD KV transfer still uses the
 separate Mooncake TransferEngine (`--disaggregation-transfer-backend`).
+On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
+(unless it is already set) so Mooncake's handshake uses IPv6. The Mooncake L3
+store client reads `MC_USE_IPV6` on its own when the store starts, so export
+`MC_USE_IPV6=1` yourself when the L3 store runs on an IPv6 host.

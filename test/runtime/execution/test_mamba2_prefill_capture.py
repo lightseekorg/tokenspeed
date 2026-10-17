@@ -22,7 +22,7 @@
 
 import os
 import sys
-from dataclasses import fields, replace
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -45,7 +45,6 @@ from tokenspeed.runtime.execution.memory_delta import (  # noqa: E402
 )
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: E402
     MambaForwardMetadata,
-    _build_prefill_checkpoint_batch,
 )
 from tokenspeed.runtime.layers.attention.configs.linear_attn import (  # noqa: E402
     Mamba2Config,
@@ -92,17 +91,13 @@ def _backend():
     )
     backend = Mamba2AttnBackend(config, spec)
     backend.cache_pool = object()
-    backend._prefix_granularity = 128
     return backend
 
 
-def _source(lengths, prefixes, page_shift, *, checkpoint_states):
+def _source(lengths, prefixes, page_shift):
     lengths = torch.tensor(lengths)
     host = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
     bounds = host.to(device="cuda", dtype=torch.int32)
-    checkpoint = _build_prefill_checkpoint_batch(
-        lengths, torch.tensor(prefixes), lengths.numel(), 128, "cuda"
-    )
     pages = torch.arange(lengths.numel(), device="cuda", dtype=torch.int32)
     pages = pages + page_shift
     from tokenspeed_kernel.ops.attention.gdn.triton import (
@@ -112,7 +107,7 @@ def _source(lengths, prefixes, page_shift, *, checkpoint_states):
 
     return MambaForwardMetadata(
         query_start_loc=bounds,
-        scan_query_start_loc=bounds,
+        scan_query_start_loc=bounds.clone(),
         query_start_loc_int64=bounds.long(),
         extend_seq_lens_cpu=lengths,
         cu_extend_seq_lens_cpu=host,
@@ -124,10 +119,6 @@ def _source(lengths, prefixes, page_shift, *, checkpoint_states):
             )
         },
         state_out_blocks_by_group={"state": pages},
-        state_checkpoint_blocks_by_group=(
-            {"state": pages + checkpoint_states} if checkpoint is not None else None
-        ),
-        prefill_checkpoint_batch=checkpoint,
         conv_prefill_metadata=build_causal_conv1d_prefill_metadata(
             bounds, lengths, CAUSAL_CONV1D_BLOCK_M
         ),
@@ -137,7 +128,7 @@ def _source(lengths, prefixes, page_shift, *, checkpoint_states):
 def test_uncaptured_shapes_keep_the_scheduler_metadata():
     """Eager forwards of shapes without a graph skip the capacity layout."""
     backend = _backend()
-    source = _source([300], [0], 2, checkpoint_states=4)
+    source = _source([300], [0], 2)
     backend.forward_metadata = source
     assert backend.prepare_prefill_metadata(512, 1, ForwardMode.EXTEND, capture=False)
     assert backend.forward_metadata is source
@@ -148,54 +139,64 @@ def test_uncaptured_shapes_keep_the_scheduler_metadata():
 
 
 def test_retained_chunk_plans_cover_the_live_chunks_in_place():
-    """A retained shape owns one body and one tail plan; empty chunks pad them."""
+    """A retained shape owns one chunk plan; empty chunks pad it."""
     backend = _backend()
-    backend.forward_metadata = _source([300], [0], 2, checkpoint_states=4)
-    backend.prepare_prefill_metadata(512, 1, ForwardMode.EXTEND, capture=True)
+    backend.forward_metadata = _source([300, 100], [0, 0], 2)
+    backend.prepare_prefill_metadata(512, 2, ForwardMode.EXTEND, capture=True)
     retained = backend.forward_metadata
     assert backend.prefill_metadata_is_capture_ready
-    batch = retained.prefill_checkpoint_batch
-    plans = {
-        name: backend._chunk_plan(getattr(batch, name), torch.device("cuda"))
-        for name in ("body_cu_seqlens_cpu", "tail_cu_seqlens_cpu")
-    }
-    addresses = {
-        name: [t.data_ptr() for t in (p.cu_chunk_seqlens, p.seq_idx)]
-        for name, p in plans.items()
-    }
-    for lengths, prefixes in (([300], [0]), ([511], [100]), ([1], [0]), ([64], [127])):
-        backend.forward_metadata = _source(lengths, prefixes, 3, checkpoint_states=4)
+    bounds = retained.cu_extend_seq_lens_cpu
+    plan = backend._chunk_plan(bounds, torch.device("cuda"))
+    addresses = [t.data_ptr() for t in (plan.cu_chunk_seqlens, plan.seq_idx)]
+    for lengths, prefixes in (
+        ([300], [0]),
+        ([511], [100]),
+        ([1], [0]),
+        ([64], [127]),
+        ([200, 311], [0, 5]),
+    ):
+        backend.forward_metadata = _source(lengths, prefixes, 3)
         assert backend.prepare_prefill_metadata(
-            512, 1, ForwardMode.EXTEND, capture=False
+            512, 2, ForwardMode.EXTEND, capture=False
         )
         assert backend.forward_metadata is retained
-        for name, plan in plans.items():
-            bounds = getattr(batch, name)
-            assert backend._chunk_plan(bounds, torch.device("cuda")) is plan
-            assert [t.data_ptr() for t in (plan.cu_chunk_seqlens, plan.seq_idx)] == (
-                addresses[name]
-            )
-            live = build_mamba2_chunk_metadata(bounds, CHUNK, torch.device("cpu"))
-            n = live.seq_idx.numel()
-            cu = plan.cu_chunk_seqlens.cpu()
-            assert cu[: n + 1].tolist() == live.cu_chunk_seqlens.tolist()
-            assert torch.all(cu[n:] == cu[n]), "padding chunks must be empty"
-            assert plan.seq_idx.cpu()[:n].tolist() == live.seq_idx.tolist()
-            assert (
-                plan.last_chunk_indices.cpu().tolist()
-                == live.last_chunk_indices.tolist()
-            )
-    backend.init_prefill_graph_state(512, 1)
+        assert backend._chunk_plan(bounds, torch.device("cuda")) is plan
+        assert [t.data_ptr() for t in (plan.cu_chunk_seqlens, plan.seq_idx)] == (
+            addresses
+        )
+        # An unused request slot scans one padding row past the live tokens.
+        live_total = sum(lengths)
+        padding = 2 - len(lengths)
+        assert bounds.tolist() == [0, *torch.tensor(lengths).cumsum(0).tolist()] + [
+            live_total + 1 + i for i in range(padding)
+        ]
+        assert retained.query_start_loc.cpu().tolist()[len(lengths) + 1 :] == (
+            [live_total] * padding
+        )
+        live = build_mamba2_chunk_metadata(bounds, CHUNK, torch.device("cpu"))
+        n = live.seq_idx.numel()
+        cu = plan.cu_chunk_seqlens.cpu()
+        assert cu[: n + 1].tolist() == live.cu_chunk_seqlens.tolist()
+        assert torch.all(cu[n:] == cu[n]), "padding chunks must be empty"
+        assert plan.seq_idx.cpu()[:n].tolist() == live.seq_idx.tolist()
+        assert plan.last_chunk_indices.cpu().tolist() == (
+            live.last_chunk_indices.tolist()
+        )
+    backend.init_prefill_graph_state(512, 2)
     assert not backend._capacity_plans
     assert not backend.prefill_metadata_is_capture_ready
 
 
+@pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="attention.mamba2_chunk_scan supports NVIDIA GPUs only",
+)
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 def test_outer_graph_replays_mamba2_lengths_pages_and_states(batch_size):
-    """Replay equals eager on the retained metadata, which matches plain eager.
+    """Replay equals eager on the retained metadata, which equals plain eager.
 
-    One-token dummy tails can shift a later request's packed offset, and Mamba2
-    chunks align to the packed axis, so batches above one match within rounding.
+    Unused request slots scan one padding row each past the live tokens, so
+    the live tokens' packed offsets and chunking are those of the plain run.
     """
     from tokenspeed.runtime.execution.forward_batch_info import CaptureHiddenMode
     from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
@@ -214,11 +215,6 @@ def test_outer_graph_replays_mamba2_lengths_pages_and_states(batch_size):
         backend.forward_metadata.state_out_blocks_by_group["state"],
         conv,
         states,
-    )
-    backend._layer_prefill_checkpoint_blocks = lambda layer_id: (
-        backend.forward_metadata.state_checkpoint_blocks_by_group["state"]
-        if backend.forward_metadata.state_checkpoint_blocks_by_group is not None
-        else None
     )
     kwargs = dict(
         conv_weights=torch.randn(channels, 4, device="cuda", dtype=torch.bfloat16)
@@ -260,24 +256,21 @@ def test_outer_graph_replays_mamba2_lengths_pages_and_states(batch_size):
         states.copy_(initial_states)
 
     def live(lengths, prefixes, page_shift):
-        return _source(lengths, prefixes, page_shift, checkpoint_states=4)
+        return _source(lengths, prefixes, page_shift)
 
+    # Prefix hits end at arbitrary tokens; a resumed row reads block 1.
     cases = []
-    for checkpoint_count in range(batch_size + 1):
+    for resumed in range(batch_size + 1):
         for tail_lengths, prefix in [([837, 325, 197, 197], 0), ([70] * 4, 127)]:
-            lengths = tail_lengths[:checkpoint_count] + [128] * (
-                batch_size - checkpoint_count
-            )
-            prefixes = [prefix] * checkpoint_count + [0] * (
-                batch_size - checkpoint_count
-            )
+            lengths = tail_lengths[:resumed] + [128] * (batch_size - resumed)
+            prefixes = [prefix] * resumed + [0] * (batch_size - resumed)
             cases.extend([(lengths, prefixes), (lengths[::-1], prefixes[::-1])])
     if batch_size == 1:
-        cases.extend([([837], [50304]), ([769], [0]), ([1023], [128]), ([2047], [0])])
+        cases.extend([([837], [50303]), ([769], [0]), ([1023], [129]), ([2047], [0])])
     if batch_size == 4:
         for actual_bs in (3, 1, 2, 3):
-            cases.append(([64 + i for i in range(actual_bs)], [50304] * actual_bs))
-            cases.append(([837] + [128] * (actual_bs - 1), [50304] * actual_bs))
+            cases.append(([64 + i for i in range(actual_bs)], [50303] * actual_bs))
+            cases.append(([837] + [128] * (actual_bs - 1), [50303] * actual_bs))
     cases.append(([1] * batch_size, [0] * batch_size))
 
     owner = object.__new__(PrefillGraph)
@@ -314,14 +307,16 @@ def test_outer_graph_replays_mamba2_lengths_pages_and_states(batch_size):
     capture, captured = owner._captures[bucket, batch_size]
     output = captured.hidden_states
     assert capture.num_segments == 1
-    fixed = backend._prefill_metadata[bucket, batch_size].prefill_checkpoint_batch
-    addresses = {
-        field.name: getattr(fixed, field.name).data_ptr()
-        for field in fields(fixed)
-        if isinstance(getattr(fixed, field.name), torch.Tensor)
+    fixed = backend._prefill_metadata[bucket, batch_size]
+    retained = {
+        "query_start_loc": fixed.query_start_loc,
+        "scan_query_start_loc": fixed.scan_query_start_loc,
+        "query_start_loc_int64": fixed.query_start_loc_int64,
+        "state_in": fixed.state_in_blocks_by_group["state"],
+        "state_out": fixed.state_out_blocks_by_group["state"],
     }
-    exact = batch_size == 1
-    tolerance = dict(rtol=0, atol=0) if exact else dict(rtol=1e-2, atol=2e-3)
+    addresses = {name: tensor.data_ptr() for name, tensor in retained.items()}
+    tolerance = dict(rtol=0, atol=0)
     for index, (lengths, prefixes) in enumerate(cases * 2):
         tokens = sum(lengths)
         source = live(lengths, prefixes, 2 + index % 2)
@@ -343,7 +338,7 @@ def test_outer_graph_replays_mamba2_lengths_pages_and_states(batch_size):
         reset()
         capture.replay(valid_rows=tokens)
         assert addresses == {
-            name: getattr(fixed, name).data_ptr() for name in addresses
+            name: tensor.data_ptr() for name, tensor in retained.items()
         }
         torch.testing.assert_close(output[:tokens], eager, rtol=0, atol=0)
         torch.testing.assert_close(conv, eager_conv, rtol=0, atol=0)

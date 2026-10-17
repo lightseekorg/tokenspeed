@@ -209,10 +209,8 @@ class MooncakeKvStore:
             raise RuntimeError(f"Failed to setup Mooncake store, error code: {ret}")
         self._register_host_buffer(host_buffer)
         logger.info(
-            "Mooncake Store L3 ready (protocol=%s master=%s segment=%s)",
-            self.config.protocol,
-            self.config.master_server_address,
-            per_rank_segment,
+            f"Mooncake Store L3 ready (protocol={self.config.protocol} "
+            f"master={self.config.master_server_address} segment={per_rank_segment})"
         )
 
     def _register_host_buffer(self, host_buffer: Any) -> None:
@@ -298,10 +296,9 @@ class MooncakeKvStore:
             )
             if len(put_results) != len(missing_keys):
                 logger.error(
-                    "Mooncake batch_put_from returned %s results for %s keys; "
-                    "refusing to ACK Host pages that were not uploaded",
-                    len(put_results),
-                    len(missing_keys),
+                    f"Mooncake batch_put_from returned {len(put_results)} results "
+                    f"for {len(missing_keys)} keys; refusing to ACK Host pages "
+                    "that were not uploaded"
                 )
                 return [False] * len(keys)
             for index, ret in zip(missing_index, put_results):
@@ -338,14 +335,12 @@ class MooncakeKvStore:
         try:
             ret = remover(f"^{re.escape(prefix)}.*", True)
         except Exception:
-            logger.exception(
-                "Mooncake remove_by_regex raised while clearing %s", prefix
-            )
+            logger.exception(f"Mooncake remove_by_regex raised while clearing {prefix}")
             return False
         # Mooncake returns the number of removed objects; negative values are
         # error codes.
         if ret < 0:
-            logger.error("Failed to clear Mooncake L3 namespace, error code: %s", ret)
+            logger.error(f"Failed to clear Mooncake L3 namespace, error code: {ret}")
             return False
         return True
 

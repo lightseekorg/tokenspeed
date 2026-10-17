@@ -39,7 +39,10 @@ from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
+from tokenspeed.runtime.layers.quantization.utils import (
+    should_exclude_quant_module,
+    should_ignore_quant_layer,
+)
 from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpAttentionDecoderLayer,
@@ -52,8 +55,21 @@ from tokenspeed.runtime.utils import add_prefix
 def _resolve_mtp_quant_config(
     quant_config: QuantizationConfig | None,
 ) -> QuantizationConfig | None:
-    if quant_config is not None and should_exclude_quant_module(
-        "mtp.layers.0", quant_config.exclude_modules
+    if quant_config is None:
+        return None
+    if should_exclude_quant_module("mtp.layers.0", quant_config.exclude_modules):
+        return None
+    # AMD Quark expands an ``mtp.*`` exclusion into the MTP layer's linear
+    # module names only; its fused routed experts (and ``fc_embedding``) are
+    # left out of the list but stay BF16 as well.
+    if all(
+        should_ignore_quant_layer(f"mtp.layers.0.{module}", quant_config.ignored_layers)
+        for module in (
+            "self_attn.qkv_proj",
+            "self_attn.o_proj",
+            "mlp.shared_expert.gate_up_proj",
+            "mlp.shared_expert.down_proj",
+        )
     ):
         return None
     return quant_config
@@ -210,6 +226,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
+            do_argmax=True,
             dp_lm_head_tp=False,
         )
 

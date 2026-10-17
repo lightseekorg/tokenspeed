@@ -35,12 +35,13 @@ on:
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-gsm8k.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-mmlu.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-ocr-bench.yaml
-          - test/ci/eval/kimi-k2.5-mxfp4-eagle3-evalscope-aime25-amd.yaml
           - test/ci/eval/kimi-k3-eagle3-mxfp4-tp8ep1-evalscope-aime26-amd.yaml
           - test/ci/eval/kimi-k3-mxfp4-tp8ep8-evalscope-aime26-amd.yaml
           - test/ci/eval/kimi-k3-mxfp4-tp8ep1-evalscope-aime26-amd.yaml
           - test/ci/eval/minimax-m3-nvfp4-dspark-evalscope-aime26.yaml
           - test/ci/eval/minimax-m3-nvfp4-evalscope-aime25.yaml
+          - test/ci/eval/muse-spark-mxfp4-tp4ep4-evalscope-aime26-amd.yaml
+          - test/ci/eval/muse-spark-mxfp4-tp8ep8-evalscope-aime26-amd.yaml
           - test/ci/eval/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d-evalscope-ocr-bench.yaml
           - test/ci/eval/qwen3.5-122b-a10b-nvfp4-evalscope-ocr-bench.yaml
           - test/ci/eval/qwen3.5-35b-a3b-fp8-deepep-tp2dp2ep4-evalscope-gsm8k.yaml
@@ -48,7 +49,7 @@ on:
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-pd-1p1d-evalscope-aime25.yaml
           - test/ci/eval/qwen3.8-flash-next-fp8-evalscope-gsm8k.yaml
-          - test/ci/perf/gpt-oss-120b-mxfp4-evalscope-mi350.yaml
+          - test/ci/eval/qwen3.8-flash-next-mxfp4-evalscope-gsm8k-amd.yaml
           - test/ci/perf/kernel-benchmark-amd-gfx950.yaml
           - test/ci/perf/kimi-k2.5-nvfp4-evalscope-agentic.yaml
           - test/ci/perf/kimi-k3-eagle3-mxfp4-tp8ep1-evalscope-random-50k-500-mi35x.yaml
@@ -61,11 +62,14 @@ on:
           - test/ci/ut/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d.yaml
           - test/ci/ut/qwen3.5-397b-a17b-nvfp4-pd-1p1d.yaml
           - test/ci/ut/ut-runtime-1gpu.yaml
+          - test/ci/ut/ut-runtime-1gpu-part-i.yaml
+          - test/ci/ut/ut-runtime-1gpu-part-ii.yaml
           - test/ci/ut/ut-runtime-2gpu.yaml
           - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
           - test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml
           - test/ci/ut/ut-tokenspeed-kernel-part-i.yaml
           - test/ci/ut/ut-tokenspeed-kernel-part-ii.yaml
+          - test/ci/ut/ut-tokenspeed-kernel.yaml
       runner_pool:
         description: "Runner pool selected from the YAML labels"
         required: true

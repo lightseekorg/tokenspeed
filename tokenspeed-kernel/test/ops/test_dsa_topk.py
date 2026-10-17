@@ -69,7 +69,7 @@ def test_ragged_decode_topk_delegates_to_persistent_topk(monkeypatch):
     monkeypatch.setattr(cuda_dsa_topk, "has_persistent_topk", lambda: True)
 
     def fake_persistent_topk(
-        logits, lengths, output, workspace, k, max_seq_len, q_len_per_req=1
+        logits, lengths, output, workspace, k, max_seq_len, q_len_per_req, *, enable_pdl
     ):
         calls["logits"] = logits
         calls["lengths"] = lengths
@@ -93,6 +93,8 @@ def test_ragged_decode_topk_delegates_to_persistent_topk(monkeypatch):
         lengths=lengths,
         workspace=workspace,
         max_seq_len=8,
+        q_len_per_req=1,
+        enable_pdl=False,
     )
 
     assert torch.equal(output, torch.full_like(output, 7))
@@ -120,6 +122,8 @@ def test_ragged_decode_topk_raises_when_persistent_kernel_unavailable(monkeypatc
             lengths=lengths,
             workspace=workspace,
             max_seq_len=8,
+            enable_pdl=False,
+            q_len_per_req=1,
         )
 
 

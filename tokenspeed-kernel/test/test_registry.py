@@ -20,6 +20,9 @@
 
 from __future__ import annotations
 
+import pickle
+from dataclasses import replace
+
 import pytest
 import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
@@ -31,6 +34,7 @@ from tokenspeed_kernel.registry import (
 )
 from tokenspeed_kernel.signature import (
     ScaleFormat,
+    dense_format_signature,
     dense_tensor_format,
     format_signature,
     format_signatures,
@@ -39,6 +43,22 @@ from tokenspeed_kernel.signature import (
 from utils import dummy_impl, register_all_samples
 
 pytestmark = pytest.mark.usefixtures("fresh_registry")
+
+
+def _packed(weight):
+    return weight
+
+
+def test_signature_hash_and_pickle_include_function_layout():
+    signature = format_signature(
+        weight=dense_tensor_format(torch.bfloat16), layouts={_packed}
+    )
+    restored = pickle.loads(pickle.dumps(signature))
+    canonical = replace(signature, layouts=frozenset({None}))
+    assert restored == signature
+    assert len({signature, restored, canonical}) == 2
+    assert "_packed" in str(signature)
+    assert hash(restored) == hash(signature)
 
 
 class TestKernelSpec:
@@ -508,6 +528,19 @@ class TestUnregister:
     def test_unregister_nonexistent_is_noop(self):
         reg = KernelRegistry.get()
         reg._unregister("does_not_exist")
+
+
+def test_dense_format_signature_is_cached_and_matches_format_signature():
+    signature = dense_format_signature(("x", "gate"), (torch.float32, torch.bfloat16))
+    assert signature == format_signature(
+        x=dense_tensor_format(torch.float32), gate=dense_tensor_format(torch.bfloat16)
+    )
+    assert (
+        dense_format_signature(("x", "gate"), (torch.float32, torch.bfloat16))
+        is signature
+    )
+    with pytest.raises(ValueError):
+        dense_format_signature(("x",), (torch.float32, torch.bfloat16))
 
 
 def test_vendor_min_arch_versions_apply_per_vendor(

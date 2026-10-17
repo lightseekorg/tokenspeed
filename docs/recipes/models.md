@@ -6,6 +6,108 @@ set only the parameters that change runtime behavior.
 The commands below are templates. Validate exact model IDs, checkpoint formats,
 and backend choices against the build you deploy.
 
+## Muse Spark Open
+
+[Muse Spark Open](https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B)
+runs on the shared model path: vendor-neutral Triton kernels
+with capability-gated NVIDIA fast paths that keep the same numerics. The
+checkpoint must expose the model type `muse_spark` and the architecture
+`MuseSparkForConditionalGeneration`; the runtime reads the sliding-attention
+and no-RoPE schedule from that configuration. Expert parallelism spans the
+attention TP ranks with MoE TP1. The gateway loads the checkpoint's
+`chat_template.jinja`; pass `--chat-template` only to override it. The
+residual stream, the layer boundaries and the final norm run in FP32; the
+attention and MoE branch outputs and the final-norm output are BF16.
+
+`ts serve` selects the `muse` reasoning and tool parsers: the `self` channel
+becomes `reasoning_content`, `user` and `commentary` stay visible, `<|eom|>`
+closes a channel and `<|eot|>` closes the turn. The bundled gateway reads them
+with its Symphony parser, which `ts serve` selects with `--parser symphony`;
+forced tool calls and JSON answers run through the engine's xgrammar backend,
+which `ts serve` turns on for this model (`--grammar-backend xgrammar`). These
+parser and grammar-backend defaults need a `tokenspeed-smg` build with smg's
+Muse Spark support (smg main from 2026-10-16 on). Explicit parser and
+grammar-backend flags override these defaults. Sample with the checkpoint's
+`generation_config.json` defaults
+(`temperature=1.0`, `top_p=1.0`, `top_k=64`); greedy decoding is loop-prone
+for this checkpoint. The checkpoint's
+`chat_template.jinja` renders `reasoning_effort` (`minimal`, `low`, `medium`,
+`high`, `xhigh`) as a reasoning-strength line and defaults to `medium`; the
+OpenAI field and `chat_template_kwargs.reasoning_effort` both reach it.
+`chat_template_kwargs.force_nonempty_content=true` promotes an unterminated
+`self` channel to visible content.
+
+Images and video use the chat template's `<image>` and `<video>` anchors and
+the checkpoint's vision tower. Audio uses the `<audio>` anchor: one `<|audio|>`
+token per 1,920 samples of mono 24 kHz, encoded by the checkpoint's audio
+tower. SMG performs the preprocessing and anchor expansion.
+
+### MI350X BF16
+
+The BF16 model and vision tower run on eight GPUs with attention TP8, vision
+TP8, and expert parallelism over all eight ranks:
+
+```bash
+ts serve \
+    --model meta-models/Muse-Spark-Open-816B-A42B \
+    --served-model-name muse-spark \
+    --tp 8 \
+    --ep-size 8 \
+    --dtype bfloat16 \
+    --max-model-len 65536 \
+    --max-num-seqs 16 \
+    --max-total-tokens 524288 \
+    --gpu-memory-utilization 0.92 \
+    --cudagraph-capture-sizes 1 2 4 8 16 \
+    --max-cudagraph-capture-size 16 \
+    --disable-prefill-graph \
+    --disable-overlap-schedule \
+    --sampling-backend triton \
+    --disable-kvstore \
+    --kvstore-ratio 0.0 \
+    --host 127.0.0.1 \
+    --port 8000
+```
+
+Prefill stays eager and overlap scheduling is off.
+
+### Blackwell NVFP4
+
+The NVFP4 checkpoint quantizes the experts of all but the first and last
+layers and keeps everything else in BF16. On a four-GPU B300 node the decode
+path pairs TRT-LLM attention with the TRT-LLM FP4 MoE kernels:
+
+```bash
+ts serve \
+    --model meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+    --served-model-name muse-spark \
+    --tp 4 \
+    --ep-size 4 \
+    --attention-backend trtllm \
+    --moe-backend flashinfer_trtllm \
+    --dtype bfloat16 \
+    --max-model-len 65536 \
+    --max-num-seqs 8 \
+    --cudagraph-capture-sizes 1 2 4 8 \
+    --max-cudagraph-capture-size 8 \
+    --sampling-backend flashinfer
+```
+
+Overlap scheduling and the prefill graph stay on: the graph serves text and
+multimodal prefills up to its largest bucket, where it cuts short-prompt
+time-to-first-token by several times. Decode is weight-stream bound, so the layer
+fuses its norms, residual gate, expert-input quantization, and the sharded
+pre-expert and post-expert projection gathers into few launches, all under programmatic
+dependent launch; at decode batch sizes the top-k kernel also writes the
+expert GEMMs' routing metadata, so the experts launch without a routing
+kernel of their own.
+
+Expert inputs are scaled by the checkpoint's calibrated static input scales,
+folded into the MoE kernel's dequantization scalars.
+
+`--kv-cache-dtype fp8_e4m3` halves the KV cache on the same decode path; the
+RoPE kernel writes K/V in FP8 directly.
+
 ## Inkling
 
 Blog: https://lightseek.org/blog/tokenspeed-inkling.html
@@ -279,9 +381,10 @@ Notes:
   and CUDA graph capture. When K3's 128-token logical cache pages feed the
   64-token TRT-LLM MLA kernel, the backend expands each logical page into its
   two physical kernel pages before draft attention.
-- K3 DSpark does not support KVP (`--kv-parallel-size > 1`) yet: its context KV
-  injection path does not translate virtual slots into shard-local addresses or
-  mask nonowner writes.
+- K3 DSpark context injection supports KVP (`--kv-parallel-size > 1`) by
+  translating virtual slots into shard-local addresses and masking nonowner
+  writes. The selected draft backend must support DCP decode and non-causal
+  block attention on the device and cache dtype in use.
 - A K3 DFlash2 draft declares `sliding_attention` layers, so it needs a drafter
   backend that applies per-layer sliding windows: `--drafter-attention-backend
   mla`. Those layers dispatch to the CuteDSL windowed decode on Blackwell,
@@ -744,18 +847,8 @@ with optional predictive latent embeddings (PLE), optional QSA sparse
 attention, and a one-layer MTP draft. Dense and MoE checkpoints share the same
 launch command.
 
-QSA selects CuTe DSL sparse attention on B200 (SM100) and B300 (SM103) for
-BF16 queries with BF16 or FP8 E4M3 KV caches, 256-dimensional heads, 6/12/24
-query heads, 1/2/4 KV heads, and a selected-slot width of 2051. This applies to
-ordinary decode and MTP verification under CUDA Graph. Prefill and mixed queries,
-including one-token prefill, and other supported NVIDIA shapes and architectures
-use the FlashInfer FA2 fallback.
 
-The decoder passes ordinary sublayer-output tensors and residual tuples between
-layers. At adjacent HC boundaries, it explicitly calls the consuming mixer's
-`combine_norm()` to fuse residual injection with that mixer's grouped RMSNorm.
-PLE, deepstack updates and row-gather boundaries combine the residual first.
-The updated, unnormalized HC state remains available for MTP.
+### NVIDIA
 
 ```bash
 ts serve \
@@ -767,6 +860,40 @@ ts serve \
     --speculative-algorithm MTP \
     --speculative-num-steps 3
 ```
+
+### AMD
+
+On AMD MI350X/MI355X (gfx950), serve the
+[AMD Quark MXFP4](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4)
+checkpoint, which quantizes the routed and shared experts to MXFP4 and keeps
+the rest, including the MTP layer, in BF16:
+
+```bash
+ts serve \
+    --model amd/Qwen3.8-Flash-Next-Quark-MXFP4 \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --quantization mxfp4 \
+    --max-num-seqs 16 \
+    --max-cudagraph-capture-size 16 \
+    --kvstore-size 32 \
+    --speculative-algorithm MTP \
+    --speculative-num-steps 3
+```
+
+The above configuration caps the batch at 16 sequences for latency; raise
+`--max-num-seqs` and `--max-cudagraph-capture-size` together for throughput.
+Keep ReplaySSM, the default.
+
+`--kvstore-size 32` caps the Host KV cache at 32 GB per GPU. The default
+(twice the Device KV, about 96 GB per GPU here) keeps much more Host memory
+mapped for the GPU, and while the Linux kernel compacts memory and migrates
+those pages, the GPU stalls; on hosts with fragmented memory this showed as
+10-30 s pauses during decode. Raise the size if long prefixes are reused
+after the Device cache evicts them, or drop the Host cache with
+`--disable-kvstore` if they are not. On the host side, disabling proactive
+compaction (`sysctl vm.compaction_proactiveness=0`) removes the background
+trigger.
 
 ### Optional `--hf-overrides`
 
@@ -1204,6 +1331,79 @@ tokenspeed serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
   --speculative-num-steps 3 \
   --speculative-num-draft-tokens 4
 ```
+
+## Beam
+
+Beam (`model_type=beam`, `BeamForCausalLM`) is a mixture-of-experts model
+with 52 decoder layers: 9 full-attention layers and 43 sliding-window layers
+with a 512-token window. Its BF16, FP8 and NVFP4 checkpoints run with the same
+command: the checkpoint's own quantization config selects the path, with no
+flag. Use these supported Hub revisions:
+
+| Checkpoint | Revision |
+| --- | --- |
+| BF16 | `f40a3a29` |
+| FP8 | `21052137` |
+| NVFP4 | `81a5ab6b` |
+
+The command below runs one TP8 replica over two 4-GPU nodes, as in the
+recipe's GB200 measurements. Run it on both nodes, changing only
+`--node-rank`, and point `--dist-init-addr` at node 0, the only rank that
+serves the HTTP API. Pass the local checkpoint directory as the model, the
+same path on every node. Speculative decoding uses Beam's DFlash2 drafter
+checkpoint, which serves all three checkpoints.
+
+```bash
+# node 0 (serves the HTTP API); node 1 runs it with --node-rank 1
+ts serve --model <beam-checkpoint-dir> \
+  --nnodes 2 --node-rank 0 --nprocs-per-node 4 --world-size 8 \
+  --dist-init-addr <node0-host>:29000 \
+  --tensor-parallel-size 8 \
+  --dtype bfloat16 \
+  --max-model-len 1048576 \
+  --grammar-backend xgrammar \
+  --enable-mixed-batch --prefill-graph-max-tokens 8192 \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path <drafter-checkpoint-dir> \
+  --drafter-attention-backend trtllm \
+  --served-model-name reflection/Beam-1.0-501B-A23B-NVFP4 \
+  --host 0.0.0.0 --port 8000
+```
+
+Without `--served-model-name`, the API model id is the full checkpoint path.
+
+Notes:
+- Serving requires `--dtype bfloat16`. Beam's flag-free defaults, the `trtllm`
+  attention backend and the `flashinfer_trtllm` MoE backend, apply on NVIDIA
+  SM100 to SM103 and were validated on SM100 (GB200) only. Beam serves without
+  TF32 on every platform.
+- `--grammar-backend xgrammar` lets forced tool choice and JSON
+  `response_format` work, and `--enable-mixed-batch
+  --prefill-graph-max-tokens 8192` runs a prompt chunk in the same step as the
+  running decodes. Pass the same values on every node.
+- The `reflection/Beam-1.0-501B-A23B-DFlash2` drafter at revision `8d26c952`
+  serves all three checkpoints. It declares 1,048,576 positions, so leave
+  `TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN` unset. With the drafter the
+  default batch limit is 80 requests, not 160.
+- Name no `--reasoning-parser` or `--tool-call-parser`. The bundled
+  `tokenspeed-smg==1.13.0.post20261016` that TokenSpeed pins reads the output
+  through the checkpoint's `response_template`.
+
+The first start on a fresh machine tunes kernels for 30 to 45 minutes; pass
+`--engine-startup-timeout 5400`. Later starts reuse the caches.
+
+API notes:
+- Reasoning effort is `low`, `medium` (the default), `high`, `xhigh` or `max`.
+- Keep `--grammar-backend xgrammar`. With it, the bundled gateway constrains
+  every Beam turn to Beam's output format, including tool calls under
+  `tool_choice: auto`, forced tool choice (`required` or a named function) and
+  JSON `response_format` with `json_schema`.
+
+For batches above 160, or above 80 with the drafter, set all three scheduling
+and graph flags. For 512 requests, use `--max-num-seqs 512`,
+`--max-cudagraph-capture-size 512` and
+`--cudagraph-capture-sizes 1 8 32 64 128 160 256 384 512`. Setting only the
+first one or two leaves larger decode batches outside the captured graph list.
 
 ## Tuning order
 

@@ -935,6 +935,8 @@ class EpdPrefillAdmission:
     EventLoop collaborators, so they stay there.
     """
 
+    receives_embeddings = True
+
     def __init__(
         self,
         *,
@@ -1103,6 +1105,41 @@ class EpdPrefillAdmission:
         return admitted, failed
 
 
+class PipelineEpdPrefillAdmission:
+    """Replicate PP0's admission decisions without receiving payloads elsewhere.
+
+    All stages run the same scheduler. PP0 first agrees across its attention
+    TP ranks; each TP column then broadcasts that decision to its later stages.
+    Followers hold only request IDs and never contact the encoder.
+    """
+
+    def __init__(self, *, local_admission, pp_ranks, pp_cpu_group):
+        self._local = local_admission
+        self._pp_ranks = tuple(pp_ranks)
+        self._pp_cpu_group = pp_cpu_group
+        self._pending: set[str] = set()
+        self.receives_embeddings = local_admission is not None
+
+    def stage(self, request_id: str, mm_items) -> None:
+        if self._local is not None:
+            self._local.stage(request_id, mm_items)
+        self._pending.add(request_id)
+
+    def has_pending(self) -> bool:
+        return bool(self._pending)
+
+    def drain(self):
+        if not self._pending:
+            return [], []
+        payload = [self._local.drain() if self._local is not None else None]
+        dist.broadcast_object_list(
+            payload, src=self._pp_ranks[0], group=self._pp_cpu_group
+        )
+        admitted, failed = payload[0]
+        self._pending.difference_update(admitted, failed)
+        return admitted, failed
+
+
 def make_epd_prefill_admission(
     server_args,
     global_rank,
@@ -1120,6 +1157,17 @@ def make_epd_prefill_admission(
 
     Returns None unless this is a multimodal *prefill* node (the only node that
     receives encode->prefill embeddings)."""
+    if (
+        server_args.disaggregation_mode != "prefill"
+        or not model_config.is_multimodal_active
+    ):
+        return None
+    if not mapping.is_first_pp_rank:
+        return PipelineEpdPrefillAdmission(
+            local_admission=None,
+            pp_ranks=mapping.pp_group,
+            pp_cpu_group=pg_manager.get_process_group("gloo", mapping.pp_group),
+        )
     manager = build_prefill_embedding_manager(
         server_args, global_rank, model_config.is_multimodal_active
     )
@@ -1131,7 +1179,7 @@ def make_epd_prefill_admission(
     # Resolved only past the gate above — reading the vision tower's dtype
     # raises on a text-only model, and every text-only PD node passes here.
     facts = encoder_model_facts()
-    return EpdPrefillAdmission(
+    admission = EpdPrefillAdmission(
         manager=manager,
         device=facts.device,
         hidden=facts.hidden,
@@ -1144,3 +1192,10 @@ def make_epd_prefill_admission(
         pg_manager=pg_manager,
         run_device_work=run_device_work,
     )
+    if mapping.has_pp:
+        return PipelineEpdPrefillAdmission(
+            local_admission=admission,
+            pp_ranks=mapping.pp_group,
+            pp_cpu_group=pg_manager.get_process_group("gloo", mapping.pp_group),
+        )
+    return admission

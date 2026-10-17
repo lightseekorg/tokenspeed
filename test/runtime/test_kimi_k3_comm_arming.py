@@ -47,6 +47,108 @@ from tokenspeed.runtime.models.kimi_k3_comm import (  # noqa: E402
 )
 
 
+def _capture_iris_preparation(monkeypatch):
+    from tokenspeed_kernel.ops.communication._iris import kimi_k3 as iris_k3
+
+    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+    from tokenspeed.runtime.models import kimi_k3
+
+    backend = AutoBackend()
+    monkeypatch.setattr(
+        "tokenspeed.runtime.distributed.comm_backend.get_global_backend",
+        lambda: backend,
+    )
+    monkeypatch.setattr(
+        backend, "can_prepare_all_reduce_buffers", lambda group, dtype: len(group) > 1
+    )
+    monkeypatch.setattr(kimi_k3, "_get_process_group", lambda group: group)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(kimi_k3.torch.cuda, "current_device", lambda: 0)
+
+    def allocate(**kwargs):
+        return SimpleNamespace(
+            all_reduce=SimpleNamespace(
+                staged_max_numel=kwargs["staged_max_numel"],
+                producer_direct_max_numel=kwargs["producer_direct_max_numel"],
+                dtype=kwargs["dtype"],
+            ),
+            enable_lamport=kwargs["enable_lamport"],
+            attnres=SimpleNamespace(
+                max_numel=kwargs["attnres_max_numel"],
+                max_rows=kwargs["attnres_max_rows"],
+            ),
+            sharded=SimpleNamespace(
+                output=torch.empty((kwargs["sharded_max_rows"], 7168), device="meta")
+            ),
+        )
+
+    prepare = Mock(side_effect=allocate)
+    monkeypatch.setattr(iris_k3, "prepare_k3_communication", prepare)
+    return prepare
+
+
+@needs_iris
+def test_nextn_reuses_target_iris_state(monkeypatch):
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models import kimi_k3
+    from tokenspeed.runtime.models.kimi_k3_comm import K3AttnComm
+    from tokenspeed.runtime.models.kimi_k3_nextn import KimiK3NextNForCausalLM
+
+    prepare = _capture_iris_preparation(monkeypatch)
+    monkeypatch.setattr(
+        kimi_k3, "current_platform", lambda: SimpleNamespace(is_cdna4=True)
+    )
+    monkeypatch.setattr(K3AttnComm, "iris_states", {})
+    mapping = Mapping(rank=0, world_size=8, attn_tp_size=8, moe_tp_size=8)
+    config = SimpleNamespace(hidden_size=7168, routed_expert_hidden_size=3584)
+
+    def moe():
+        value = kimi_k3.KimiLinearMoE.__new__(kimi_k3.KimiLinearMoE)
+        torch.nn.Module.__init__(value)
+        value.iris_state = None
+        value.comm = None
+        value.shared_experts = SimpleNamespace(shared_parallel=None)
+        return value
+
+    layers = []
+    for _ in range(3):
+        layer = kimi_k3.KimiLinearDecoderLayer.__new__(kimi_k3.KimiLinearDecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.is_moe_layer = True
+        layer.block_sparse_moe = moe()
+        layer.k3_comm = K3AttnComm.__new__(K3AttnComm)
+        layer.k3_comm.iris_state = None
+        layers.append(layer)
+    prepare_tail = Mock(return_value=True)
+    for layer in layers[1:]:
+        layer.block_sparse_moe.comm = SimpleNamespace(prepare=prepare_tail)
+    target = kimi_k3.KimiLinearForCausalLM.__new__(kimi_k3.KimiLinearForCausalLM)
+    torch.nn.Module.__init__(target)
+    target.mapping = mapping
+    target.config = config
+    target.model = SimpleNamespace(layers=layers, iris_states=K3AttnComm.iris_states)
+
+    draft = KimiK3NextNForCausalLM.__new__(KimiK3NextNForCausalLM)
+    torch.nn.Module.__init__(draft)
+    draft.mapping = mapping
+    draft.config = config
+    draft.model = SimpleNamespace(decoder=SimpleNamespace(block_sparse_moe=moe()))
+
+    assert target.prepare_communication_runtime(128)
+    state = K3AttnComm.iris_states[mapping.moe.tp_ep_group]
+    for layer in layers:
+        assert layer.k3_comm.iris_state is state
+        assert layer.block_sparse_moe.iris_state is state
+    prepare_tail.assert_called_once_with(128)
+    assert draft.prepare_communication_runtime(8)
+    assert draft.model.decoder.block_sparse_moe.iris_state is state
+    assert target.prepare_communication_runtime(128)
+    assert draft.prepare_communication_runtime(4)
+    assert draft.model.decoder.block_sparse_moe.iris_state is state
+    assert prepare.call_count == 1
+    assert prepare_tail.call_args_list == [call(128), call(128)]
+
+
 @needs_iris
 @pytest.mark.parametrize("pp_size", [1, 2])
 @pytest.mark.parametrize(
@@ -64,30 +166,32 @@ def test_iris_preparation_caps_attnres_for_equal_tp8_groups(
         attn=SimpleNamespace(tp_size=8, tp_group=group),
         moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_size=8, tp_ep_group=group),
     )
-    prepare = Mock(return_value=True)
+    prepare = _capture_iris_preparation(monkeypatch)
     monkeypatch.setattr(
         kimi_k3,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    monkeypatch.setattr(kimi_k3, "prepare_all_reduce_buffers", prepare)
 
     assert kimi_k3.prepare_k3_all_reduce_buffers(
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
         max_num_tokens=max_rows,
+        states={},
     )
     prepare.assert_called_once_with(
-        group,
-        staged_max_numel=min(max_rows, 8192) * 7168,
+        group=group,
+        staged_max_numel=min(max_rows * 7168, 512 * 1024 // torch.bfloat16.itemsize),
         producer_direct_max_numel=min(max_rows, 8192) * (7168 + 3584),
         attnres_max_numel=16 * 7168,
         attnres_max_rows=16,
         enable_lamport=True,
-        moe_tail_max_rows=tail_rows if pp_size == 1 else 0,
+        sharded_max_rows=tail_rows if pp_size == 1 else 0,
         dtype=torch.bfloat16,
-        backend=None,
+        all_reduce=None,
+        device=torch.device("cuda:0"),
+        rank_in_group=0,
     )
 
 
@@ -102,42 +206,46 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
         attn=SimpleNamespace(tp_size=4, tp_group=attn_group),
         moe=SimpleNamespace(tp_ep_size=8, tp_ep_group=moe_group),
     )
-    prepare = Mock(return_value=True)
+    prepare = _capture_iris_preparation(monkeypatch)
     monkeypatch.setattr(
         kimi_k3,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    monkeypatch.setattr(kimi_k3, "prepare_all_reduce_buffers", prepare)
 
     assert kimi_k3.prepare_k3_all_reduce_buffers(
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
         max_num_tokens=8192,
+        states={},
     )
     assert prepare.call_args_list == [
         call(
-            attn_group,
-            staged_max_numel=8192 * 7168,
+            group=attn_group,
+            staged_max_numel=min(8192 * 7168, 512 * 1024 // torch.bfloat16.itemsize),
             producer_direct_max_numel=0,
             attnres_max_numel=0,
             attnres_max_rows=0,
             enable_lamport=False,
-            moe_tail_max_rows=0,
+            sharded_max_rows=0,
             dtype=torch.bfloat16,
-            backend=None,
+            all_reduce=None,
+            device=torch.device("cuda:0"),
+            rank_in_group=0,
         ),
         call(
-            moe_group,
-            staged_max_numel=8192 * 7168,
+            group=moe_group,
+            staged_max_numel=min(8192 * 7168, 512 * 1024 // torch.bfloat16.itemsize),
             producer_direct_max_numel=48 * (7168 + 3584),
             attnres_max_numel=0,
             attnres_max_rows=0,
             enable_lamport=False,
-            moe_tail_max_rows=0,
+            sharded_max_rows=0,
             dtype=torch.bfloat16,
-            backend=None,
+            all_reduce=None,
+            device=torch.device("cuda:0"),
+            rank_in_group=0,
         ),
     ]
 
@@ -153,30 +261,32 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
         attn=SimpleNamespace(tp_size=1, tp_group=attn_group),
         moe=SimpleNamespace(tp_ep_size=8, tp_ep_group=moe_group),
     )
-    prepare = Mock(return_value=True)
+    prepare = _capture_iris_preparation(monkeypatch)
     monkeypatch.setattr(
         kimi_k3,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    monkeypatch.setattr(kimi_k3, "prepare_all_reduce_buffers", prepare)
 
     assert kimi_k3.prepare_k3_all_reduce_buffers(
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
         max_num_tokens=8192,
+        states={},
     )
     prepare.assert_called_once_with(
-        moe_group,
-        staged_max_numel=8192 * 7168,
+        group=moe_group,
+        staged_max_numel=min(8192 * 7168, 512 * 1024 // torch.bfloat16.itemsize),
         producer_direct_max_numel=48 * (7168 + 3584),
         attnres_max_numel=0,
         attnres_max_rows=0,
         enable_lamport=False,
-        moe_tail_max_rows=0,
+        sharded_max_rows=0,
         dtype=torch.bfloat16,
-        backend=None,
+        all_reduce=None,
+        device=torch.device("cuda:0"),
+        rank_in_group=0,
     )
 
 
@@ -190,30 +300,32 @@ def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
         attn=SimpleNamespace(tp_size=4, tp_group=group),
         moe=SimpleNamespace(tp_ep_size=4, tp_ep_group=group),
     )
-    prepare = Mock(return_value=True)
+    prepare = _capture_iris_preparation(monkeypatch)
     monkeypatch.setattr(
         kimi_k3,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    monkeypatch.setattr(kimi_k3, "prepare_all_reduce_buffers", prepare)
 
     assert kimi_k3.prepare_k3_all_reduce_buffers(
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
         max_num_tokens=8192,
+        states={},
     )
     prepare.assert_called_once_with(
-        group,
-        staged_max_numel=8192 * 7168,
+        group=group,
+        staged_max_numel=min(8192 * 7168, 512 * 1024 // torch.bfloat16.itemsize),
         producer_direct_max_numel=48 * (7168 + 3584),
         attnres_max_numel=0,
         attnres_max_rows=0,
         enable_lamport=False,
-        moe_tail_max_rows=0,
+        sharded_max_rows=0,
         dtype=torch.bfloat16,
-        backend=None,
+        all_reduce=None,
+        device=torch.device("cuda:0"),
+        rank_in_group=0,
     )
 
 
@@ -248,14 +360,15 @@ def test_iris_lamport_requires_attention_and_moe_tp8(
             moe_tp_size=moe_tp,
             moe_ep_size=moe_ep,
         )
-        prepare = Mock(return_value=True)
-        monkeypatch.setattr(kimi_k3, "prepare_all_reduce_buffers", prepare)
+        prepare = _capture_iris_preparation(monkeypatch)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
 
         assert kimi_k3.prepare_k3_all_reduce_buffers(
             mapping=mapping,
             hidden_size=7168,
             routed_hidden_size=3584,
             max_num_tokens=8,
+            states={},
         )
 
         assert prepare.called
@@ -265,7 +378,7 @@ def test_iris_lamport_requires_attention_and_moe_tp8(
         moe_request = next(
             request
             for request in prepare.call_args_list
-            if request.args[0] == mapping.moe.tp_ep_group
+            if request.kwargs["group"] == mapping.moe.tp_ep_group
         )
         assert moe_request.kwargs["producer_direct_max_numel"] == 8 * 10752
 
@@ -301,6 +414,7 @@ def test_the_collective_is_what_serves_an_eligible_reduce():
     collective = Mock(return_value=(reduced, "shared"))
     vendor = Mock(return_value=(None, "vendor-residual", None))
     comm = K3AttnComm.__new__(K3AttnComm)
+    comm.iris_state = None
     comm.cute_ar = collective
     comm.dummy_norm = SimpleNamespace(
         weight="gamma", forward_with_allreduce_fusion=vendor
@@ -429,6 +543,7 @@ def test_attention_producer_window(monkeypatch, rows, eligible):
         moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_group=group),
     )
     comm = module.K3AttnComm.__new__(module.K3AttnComm)
+    comm.iris_state = None
     comm.mapping = mapping
     like = torch.empty((rows, 7168), dtype=torch.bfloat16)
     projection = SimpleNamespace(
@@ -473,21 +588,17 @@ def test_attention_mix_window(monkeypatch, rows, is_cdna4, eligible):
 
     group = tuple(range(8))
     comm = module.K3AttnComm.__new__(module.K3AttnComm)
+    comm.iris_state = None
     comm.mapping = SimpleNamespace(attn=SimpleNamespace(tp_group=group))
     partial = torch.empty((rows, 7168), dtype=torch.bfloat16, device="meta")
     history = torch.empty((4, rows, 7168), dtype=torch.bfloat16, device="meta")
     weight = torch.empty((7168,), dtype=torch.bfloat16, device="meta")
     expected = (object(), object())
     operation = Mock(return_value=expected)
-    monkeypatch.setitem(
-        sys.modules,
-        "tokenspeed_kernel.ops.communication.iris",
-        SimpleNamespace(iris_attention_mix=operation),
-    )
+    comm.iris_state = SimpleNamespace(attention_mix=operation)
     monkeypatch.setattr(
         module, "current_platform", lambda: SimpleNamespace(is_cdna4=is_cdna4)
     )
-    monkeypatch.setattr(module, "_get_process_group", lambda _: "owner")
     result = comm.mix_for_moe(
         partial,
         None,
@@ -511,7 +622,6 @@ def test_attention_mix_window(monkeypatch, rows, is_cdna4, eligible):
             out_norm_weight=weight,
             out_norm_eps=1e-5,
             num_valid_blocks=4,
-            group="owner",
         )
     else:
         assert result is None

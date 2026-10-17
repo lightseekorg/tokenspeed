@@ -27,10 +27,6 @@ MLA_QK_ROPE_DIM = 64
 MLA_LATENT_DIM = MLA_KV_LORA_RANK + MLA_QK_ROPE_DIM
 
 
-def _poison(shape, device="cuda", dtype=torch.int32):
-    return torch.full(shape, 987_654, device=device, dtype=dtype)
-
-
 def kimi_recipe(
     *,
     text_config=None,
@@ -108,6 +104,7 @@ def kimi_recipe(
     )
     return KimiK3Recipe(
         server_args=SimpleNamespace(
+            kv_offload_config=None,
             max_total_tokens=None,
             chunked_prefill_size=max_scheduled_tokens,
             disaggregation_mode="null",
@@ -184,11 +181,6 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
         cache_group_specs=_kimi_group_specs(group_ids, layer_types, plan),
     )
     return pool
-
-
-@pytest.fixture(scope="module")
-def kimi_pool():
-    return make_kimi_pool("cpu", usable_pages=1)
 
 
 def layer_for_group(pool, group_id: str) -> int:

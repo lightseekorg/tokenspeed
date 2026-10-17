@@ -28,12 +28,10 @@ the equivalence that licenses routing non-spec decode through verify():
 * triton: verify's target draw is the SAME gumbel pool kernel with the same
   seed/offset pools sample() uses — bitwise identical tokens, greedy and
   stochastic alike;
-* flashinfer: greedy is bitwise identical (top_k=1 renorm collapses to a
-  single atom, the coin is irrelevant). Stochastic draws from the same
-  renormalized distribution through the per-slot coin stream instead of the
-  philox stream — per-request deterministic, same distribution, different
-  draws — so it is asserted for validity and accept shape, not token
-  equality.
+* flashinfer's legacy batch stream: greedy is identical; stochastic verify
+  uses the per-slot coin stream and is checked for validity, not equality.
+  The per-request stream's stochastic phase equality is covered with real
+  kernels in test_flashinfer_position_invariance.py.
 """
 
 from __future__ import annotations
@@ -56,6 +54,7 @@ MAX_BS = 4
 
 def _make_config() -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         enable_speculative_sampling=False,
         sampling_stream="batch",
         logprob_order="torch",
@@ -89,7 +88,7 @@ def _prepare(backend, bs: int, greedy: bool):
     return torch.tensor(list(range(bs)), dtype=torch.int64, device="cuda")
 
 
-def _info(req_pool_indices, offsets=None) -> SamplingBatchInfo:
+def _info(req_pool_indices, offsets) -> SamplingBatchInfo:
     return SamplingBatchInfo(
         req_pool_indices=req_pool_indices,
         valid_cache_lengths=offsets,
@@ -151,11 +150,12 @@ def test_verify_n1_flashinfer_stochastic_is_valid():
     bs = MAX_BS
     backend = _backend("flashinfer")
     req = _prepare(backend, bs, greedy=False)
+    frontier = torch.zeros(POOL + 1, dtype=torch.int32, device="cuda")
     logits = torch.randn(bs, VOCAB, device="cuda", dtype=torch.float32)
     candidates = torch.randint(0, VOCAB, (bs, 1), dtype=torch.int32, device="cuda")
 
     predict, accept = backend.verify(
-        _logits_output(logits.clone()), _info(req), candidates, tree=None
+        _logits_output(logits.clone()), _info(req, frontier), candidates, tree=None
     )
     predict = predict.view(bs)
     assert ((predict >= 0) & (predict < VOCAB)).all()
@@ -164,7 +164,7 @@ def test_verify_n1_flashinfer_stochastic_is_valid():
     backend2 = _backend("flashinfer")
     req2 = _prepare(backend2, bs, greedy=False)
     predict2, _ = backend2.verify(
-        _logits_output(logits.clone()), _info(req2), candidates, tree=None
+        _logits_output(logits.clone()), _info(req2, frontier), candidates, tree=None
     )
     torch.testing.assert_close(predict.cpu(), predict2.view(bs).cpu())
 
@@ -178,13 +178,14 @@ def test_verify_n1_ignores_candidate_content(backend_name):
     bs = MAX_BS
     logits = torch.randn(bs, VOCAB, device="cuda", dtype=torch.float32)
 
+    frontier = torch.zeros(POOL + 1, dtype=torch.int32, device="cuda")
     outs = []
     for fill in (0, VOCAB - 1):
         backend = _backend(backend_name)
         req = _prepare(backend, bs, greedy=True)
         candidates = torch.full((bs, 1), fill, dtype=torch.int32, device="cuda")
         predict, accept = backend.verify(
-            _logits_output(logits.clone()), _info(req), candidates, tree=None
+            _logits_output(logits.clone()), _info(req, frontier), candidates, tree=None
         )
         torch.testing.assert_close(accept.cpu(), torch.ones(bs, dtype=torch.int32))
         outs.append(predict.view(bs).clone())

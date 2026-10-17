@@ -21,7 +21,7 @@
 """Abstract base class for communication backends."""
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
@@ -35,6 +35,15 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.workspace import WorkspacePool
 
 
+class CommWork(Protocol):
+    """A collective started by an ``*_async`` op (``torch.distributed.Work``
+    is one)."""
+
+    def wait(self) -> object:
+        """Order the current stream after the collective; the host does not
+        block on a device collective."""
+
+
 class CommBackend(ABC):
     """Interface that all communication backends must implement.
 
@@ -42,7 +51,28 @@ class CommBackend(ABC):
     Process groups are looked up from pg_manager, not created here.
     """
 
+    def for_named_groups(self, name: str) -> "CommBackend":
+        """A backend running its collectives on the process groups named
+        ``name`` (``ProcessGroupManager.init_process_group``) instead of the
+        shared ones.
+
+        A named group has communicators of its own, so these collectives never
+        queue behind the shared ones: a caller overlaps transfers with the
+        shared collectives by starting them with an ``*_async`` op here.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not run on named process groups"
+        )
+
     # ---- Collective ops ----
+
+    def get_prepared_all_gather(self, group: Group, dtype: torch.dtype):
+        """Return a prepared column all-gather allowed by this backend's policy."""
+        return None
+
+    def broadcast_from_first_rank(self, tensor: torch.Tensor, group: Group) -> bool:
+        """Broadcast in place when prepared; otherwise let the caller fall back."""
+        return False
 
     def prepare_projection(
         self, spec: "ProjectionSpec", scratch_pool: "WorkspacePool | None" = None
@@ -53,6 +83,18 @@ class CommBackend(ABC):
         )
 
         return prepare_projection_workspace(spec, self, scratch_pool)
+
+    def try_fused_dp_column_linear(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scales: torch.Tensor | None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+        workspace: "ProjectionWorkspace",
+    ) -> bool:
+        """Run fused DP column-linear, or leave out untouched and return False."""
+        return False
 
     def projection_all_gather(
         self,
@@ -132,10 +174,6 @@ class CommBackend(ABC):
         *,
         staged_max_numel: int,
         producer_direct_max_numel: int,
-        attnres_max_numel: int,
-        attnres_max_rows: int,
-        enable_lamport: bool,
-        moe_tail_max_rows: int,
         dtype: torch.dtype,
     ) -> bool:
         """Return false when the backend has no persistent buffers to prepare."""
@@ -196,6 +234,22 @@ class CommBackend(ABC):
     def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None: ...
+
+    def all_gather_single_async(
+        self, output: torch.Tensor, input: torch.Tensor, group: Group
+    ) -> CommWork:
+        """Start ``all_gather_single`` without ordering the current stream
+        after it.
+
+        The collective reads ``input`` after the work queued on the current
+        stream so far. ``wait()`` on the returned work orders the stream it is
+        called on after the collective; ``output`` holds the gathered rows
+        from there on. The backend keeps both tensors' memory from reuse until
+        the collective completes.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} has no asynchronous all-gather"
+        )
 
     @abstractmethod
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor: ...

@@ -24,10 +24,8 @@ reference (same expert set, same weights) and win selection on NVIDIA."""
 import pytest
 import torch
 from tokenspeed_kernel.ops.moe import moe_topk
-from tokenspeed_kernel.ops.moe.sigmoid_topk import (
-    torch_sigmoid_bias_topk,
-    triton_minimax_sigmoid_bias_topk,
-)
+from tokenspeed_kernel.ops.moe.native import torch_sigmoid_bias_topk
+from tokenspeed_kernel.ops.moe.triton import triton_minimax_sigmoid_bias_topk
 from tokenspeed_kernel.platform import Platform
 
 if not torch.cuda.is_available():

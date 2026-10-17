@@ -111,3 +111,21 @@ def reserve_cache_budget(profiled_cache_bytes: int, graph_reserve_bytes: int) ->
             "memory instead"
         )
     return cache_memory
+
+
+def check_probe_cache_fits(probe_cache_bytes: int, profiled_cache_bytes: int) -> None:
+    """Refuse a probe arena the memory profile cannot hold.
+
+    A probe sizes its arena by block count, not by budget, so nothing else
+    stops it from asking the device for more than it has. It is the smallest
+    arena the family runs on: a serving arena would not fit either.
+    """
+    if probe_cache_bytes <= profiled_cache_bytes:
+        return
+    raise ValueError(
+        f"the KV cache does not fit: its smallest arena needs "
+        f"{probe_cache_bytes / (1 << 30):.2f} GiB but the memory profile left "
+        f"{profiled_cache_bytes / (1 << 30):.2f} GiB after the weights and the "
+        "utilization headroom; add GPUs (a larger --tensor-parallel-size) or "
+        "raise --gpu-memory-utilization"
+    )

@@ -100,6 +100,9 @@ class InputBuffers:
             self.force_single_token_verify_buf = torch.zeros(max_bs, dtype=torch.bool)
             self.extend_prefix_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
             self.extend_seq_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
+            # Each extend row's whole prompt: the sampling epilogue stops a
+            # request only on the chunk that completes its prompt.
+            self.extend_prompt_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
 
         # NOT pinned: python readers only; the H2D uses the per-step bulk pinned staging (_bulk_pinned).
         self.extend_prefix_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
@@ -393,15 +396,21 @@ class InputBuffers:
             self.extend_prompt_lens_cpu[:num_extends] = torch.as_tensor(
                 forward_op.prefill_lengths[:num_extends], dtype=torch.int32
             )
-            ext_prefix_cpu, ext_seq_cpu = self._bulk_pinned(
-                (num_extends, torch.int32), (num_extends, torch.int32)
+            ext_prefix_cpu, ext_seq_cpu, ext_prompt_cpu = self._bulk_pinned(
+                (num_extends, torch.int32),
+                (num_extends, torch.int32),
+                (num_extends, torch.int32),
             )
             ext_prefix_cpu.copy_(self.extend_prefix_lens_cpu[:num_extends])
             ext_seq_cpu.copy_(self.extend_seq_lens_cpu[:num_extends])
+            ext_prompt_cpu.copy_(self.extend_prompt_lens_cpu[:num_extends])
             self.extend_prefix_lens_buf[:num_extends].copy_(
                 ext_prefix_cpu, non_blocking=True
             )
             self.extend_seq_lens_buf[:num_extends].copy_(ext_seq_cpu, non_blocking=True)
+            self.extend_prompt_lens_buf[:num_extends].copy_(
+                ext_prompt_cpu, non_blocking=True
+            )
 
         # Get valid cache lengths for requests
         req_pool_indices_device = self.req_pool_indices_buf[:batch_size]
@@ -564,9 +573,12 @@ class InputBuffers:
                     batch_size,
                     "decode forward",
                 )
-            self.input_ids_buf[:total_tokens].copy_(
-                runtime_states.future_input_map[req_pool_indices_device].flatten(),
-                non_blocking=True,
+            width = runtime_states.future_input_map.shape[1]
+            torch.index_select(
+                runtime_states.future_input_map,
+                0,
+                req_pool_indices_device,
+                out=self.input_ids_buf[:total_tokens].view(-1, width),
             )
 
         # Defensive clamp of the target-model IDs into the valid vocab range.

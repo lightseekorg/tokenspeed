@@ -643,7 +643,6 @@ struct TopKRegister : TopKRadixBase<12> {
   static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
   using Smem = typename TopKRadixBase<12>::Smem;
 
-  template <bool kUsePDL>
   TS_DEVICE static void forward(const TopKProblem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
@@ -659,7 +658,6 @@ struct TopKRegister : TopKRadixBase<12> {
     }
 
     __syncthreads();
-    PDLWaitPrimary<kUsePDL>();
 
     // A vector `vi` is fully in bounds iff vi < num_full; only full vectors are
     // vector-loaded (16B aligned, never straddling seq_len). The <kVecSize tail is
@@ -743,7 +741,6 @@ struct TopKStreaming : TopKRegister<2> {
  public:
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
-  template <bool kUsePDL>
   TS_DEVICE static void forward(const TopKProblem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
@@ -758,7 +755,6 @@ struct TopKStreaming : TopKRegister<2> {
       smem->count_gt = 0;
     }
     __syncthreads();
-    PDLWaitPrimary<kUsePDL>();
 
     // Phase 1: Load and build histogram
     for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
@@ -846,12 +842,11 @@ struct TopKCluster : TopKRadixBase<kHistBits_> {
     int32_t tmp_out[kMaxTopK];
   };
 
-  // Process one batch element (one cluster). The PDL wait follows CTA-local
-  // initialization, and the kernel wrapper emits the dependent-launch trigger.
+  // Process one batch element (one cluster). The kernel wrapper handles the
+  // PDL wait before reading lengths and triggers dependents after selection.
   // There is no trailing cluster barrier: kernel completion makes the final
   // local/global writes visible. Writes raw indices to out; the kernel's
   // transform pass applies the page-table transform.
-  template <bool kUsePDL>
   TS_DEVICE static void forward(TopKProblem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
@@ -883,7 +878,6 @@ struct TopKCluster : TopKRadixBase<kHistBits_> {
       smem->count_gt = 0;
     }
     __syncthreads();
-    PDLWaitPrimary<kUsePDL>();
 
     if constexpr (kLocalVecs > 0) {
 #pragma unroll
@@ -1105,8 +1099,8 @@ struct PersistentTopKParams {
   uint32_t q_len_per_req;
 };
 
-template <int TopK, int Level>
-__global__ void __launch_bounds__(kThreadsPerBlock, 2)
+template <int TopK, int Level, bool kUsePDL, int kMinBlocksPerSm>
+__global__ void __launch_bounds__(kThreadsPerBlock, kMinBlocksPerSm)
     persistent_topk_kernel(PersistentTopKParams params) {
   static_assert(TopK == 512 || TopK == 1024 || TopK == 2048);
   static_assert(Level >= 0 && Level <= 2);
@@ -1114,14 +1108,18 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
   const uint32_t row = blockIdx.x;
   if (row >= params.num_rows) return;
 
+  // Lengths and scores may both be produced by the preceding kernel.
+  tokenspeed::device::PDLWaitPrimary<kUsePDL>();
   const uint32_t seq_len =
       dsa_topk_row_seq_len(params.lengths, row, params.q_len_per_req);
   int32_t* row_output = params.output + row * params.top_k;
   if (seq_len <= static_cast<uint32_t>(TopK)) {
+    // Empty and short rows still participate in the dependency chain.
     for (uint32_t i = threadIdx.x; i < static_cast<uint32_t>(TopK);
          i += kThreadsPerBlock) {
       row_output[i] = i < seq_len ? static_cast<int32_t>(i) : -1;
     }
+    tokenspeed::device::PDLTriggerSecondary<kUsePDL>();
     return;
   }
 
@@ -1142,16 +1140,17 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
   };
 
   if constexpr (Level == 0) {
-    Register2::forward<false>(problem, &smem);
+    Register2::forward(problem, &smem);
   } else if constexpr (Level == 1) {
-    Register4::forward<false>(problem, &smem);
+    Register4::forward(problem, &smem);
   } else {
     if (seq_len <= kRegister4MaxSeqLen) {
-      Register4::forward<false>(problem, &smem);
+      Register4::forward(problem, &smem);
     } else {
-      Streaming::forward<false>(problem, &smem);
+      Streaming::forward(problem, &smem);
     }
   }
+  tokenspeed::device::PDLTriggerSecondary<kUsePDL>();
 }
 
 template <int TopK, bool kUsePDL, typename Cluster>
@@ -1165,13 +1164,14 @@ __device__ __forceinline__ void cluster_topk_body(
   if (row >= params.num_rows) return;
   const uint32_t rank = blockIdx.y;
   const uint32_t worker_rank = row % Cluster::kClusterSize;
+  // Lengths and scores may both be produced by the preceding kernel.
+  tokenspeed::device::PDLWaitPrimary<kUsePDL>();
   const uint32_t seq_len =
       dsa_topk_row_seq_len(params.lengths, row, params.q_len_per_req);
   int32_t* row_output = params.output + row * params.top_k;
   const auto cluster = cooperative_groups::this_cluster();
 
   if (seq_len <= static_cast<uint32_t>(TopK)) {
-    tokenspeed::device::PDLWaitPrimary<kUsePDL>();
     if (rank == worker_rank) {
       for (uint32_t i = threadIdx.x; i < static_cast<uint32_t>(TopK);
            i += kThreadsPerBlock) {
@@ -1193,11 +1193,11 @@ __device__ __forceinline__ void cluster_topk_body(
   };
 
   if (seq_len <= kRegister4MaxSeqLen) {
-    if (rank == worker_rank) Register4::forward<kUsePDL>(problem, smem);
+    if (rank == worker_rank) Register4::forward(problem, smem);
   } else if (seq_len <= kClusterFloor) {
-    if (rank == worker_rank) Streaming::forward<kUsePDL>(problem, smem);
+    if (rank == worker_rank) Streaming::forward(problem, smem);
   } else {
-    Cluster::forward<kUsePDL>(problem, smem);
+    Cluster::forward(problem, smem);
     // Cluster::forward's last DSMEM consumer is already preceded by a
     // cluster-wide barrier. Once it returns, each CTA only completes local or
     // global-memory writes, and kernel completion provides the launch-wide
@@ -1211,7 +1211,7 @@ __device__ __forceinline__ void cluster_topk_body(
   tokenspeed::device::PDLTriggerSecondary<kUsePDL>();
 }
 
-template <int TopK, uint32_t kClusterHistBits, bool kUsePDL = false>
+template <int TopK, uint32_t kClusterHistBits, bool kUsePDL>
 __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     __cluster_dims__(1, kClusterSize, 1)
         cluster_topk_kernel(PersistentTopKParams params) {
@@ -1225,7 +1225,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
   cluster_topk_body<TopK, kUsePDL, Cluster>(params, &smem);
 }
 
-template <int TopK, uint32_t kClusterHistBits, bool kUsePDL = false>
+template <int TopK, uint32_t kClusterHistBits, bool kUsePDL>
 __global__ void __launch_bounds__(kThreadsPerBlock, 1)
     __cluster_dims__(1, 8, 1)
         cluster8_register4_topk_kernel(PersistentTopKParams params) {
@@ -1239,7 +1239,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1)
   cluster_topk_body<TopK, kUsePDL, Cluster>(params, &smem);
 }
 
-template <int TopK, uint32_t kClusterHistBits, bool kUsePDL = false>
+template <int TopK, uint32_t kClusterHistBits, bool kUsePDL>
 __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     __cluster_dims__(1, 16, 1)
         cluster16_topk_kernel(PersistentTopKParams params) {

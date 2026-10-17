@@ -35,6 +35,16 @@ how long the caller may hold each piece:
 | `transfer` | the PD peer's CONTROL face — bootstrap register/abort, event polling — or None outside PD | held by the PD hooks |
 | `encoder_model_facts` | a callable resolving the encoder facts EPD admission needs (raises on text-only) | consumed at startup, past the EPD gate |
 
+Encoder facts describe the transferred tensor, independently of the language
+embedding width. A model may declare `get_encoder_output_spec()` as a width and
+dtype pair, including integer dtypes for discrete visual tokens, without a
+loaded vision tower. Without that declaration, the width comes from the language
+config and the dtype from the vision tower's dtype or parameters. The resolved
+width must be positive. The builder resolves this once; admission keeps only
+the resulting values. Converting an encoded payload into language embeddings
+remains model work on the forward thread, after all required items and prefill
+ranks have completed admission.
+
 `build_device_side` builds the device side **complete**, not built-then-wired:
 it constructs the transfer peer from its prepared components and startup
 arguments, and reads the engine's role off the peer once, at construction. An
@@ -78,9 +88,8 @@ plane, where it feeds Principle 3's tail advance.
 Consequences:
 
 * The loop cannot **name** a model runner, backend or KV pool, so it cannot
-  pass one implicitly or mutate one a forward is still using. A test asserts
-  this over the AST of `EventLoop.__init__` — locals included, because a name
-  it can write is a name a later change can keep.
+  pass one implicitly or mutate one a forward is still using. Locals count
+  too: a name it can write is a name a later change can keep.
 * A new device interaction that runs once at startup belongs **inside the
   builder**; it belongs on `DeviceHandle` only when the running loop genuinely
   needs it — the second widens what the loop can do to the GPU mid-flight.
@@ -91,8 +100,7 @@ Consequences:
   stage/drain device half; the commit-side SHM release). A generic "run this
   closure" slot is the hole this whole design closes, so a second KIND of
   user does not join it — it gets its own name.
-  The architecture test pins the exact public operation names, not a numeric
-  size limit. L3 adds named Host-tier operations for the existence probe,
+  L3 adds named Host-tier operations for the existence probe,
   the prefetch lane's progress and completion (the hooks converge them each
   round), namespace and weight-version changes, and cache shutdown. These
   keep the executor and Host buffer hidden; they do not introduce another
@@ -107,7 +115,10 @@ Consequences:
   `Cache.SnapshotOp` / `Cache.RestoreOp` become one per-request `SnapshotOp`
   / `RestoreOp` (`cache/transfer/ops.py`) each -- the executor's unit of
   work, one slot exported or imported, one ACK. `CacheOpHooks.count_plan_ops`
-  counts through the same adapter, so what is counted is what is submitted.
+  counts through the same adapter, so what is counted is what is submitted;
+  its return value — the plan's per-request `SnapshotOp` count, one per
+  retraction victim — is the round's preemption count, exported as
+  `tokenspeed:num_preemptions_total`.
   The `EXPERT_LOAD` profile activity adds two more named operations,
   `reset_expert_load` and `dump_expert_load`: the routing kernels bump the
   expert placement's load counters on the execution stream, so zeroing and
@@ -128,8 +139,7 @@ Consequences:
   op). Both are rank-local on the handle. The rebalance may reduce the
   snapshot over the EP group because its ops ride the same-round gate
   (below), unlike the profile's dump.
-  Changing this surface requires updating both this contract and the explicit
-  operation allowlist in `test/runtime/test_device_handle.py`.
+  Changing this surface requires updating this contract.
 * The role is a **value** (`DeviceRole`), not a class hierarchy. Subclassing
   per role forced the handle to publish its own internals so the subclasses
   could call back into it — a reference cycle for about a dozen lines of
@@ -170,6 +180,18 @@ broadcasts on the same issuing thread as the model's collectives, restoring
 the cross-rank launch-order guarantee the old non-overlap-loop assumption
 provided.
 
+With pipeline parallelism, only PP0 receives encoder payloads and reserves
+the receive pool. PP0's attention TP group first agrees on completion;
+`PipelineEpdPrefillAdmission` then broadcasts admitted/failed request IDs
+along the pipeline CPU groups. Every stage submits the same requests in
+the same loop iteration, while later stages hold no encoder receiver or
+payload. Decode does not build this admission controller.
+
+The encoder's TP ranks attach every pixel-SHM segment in a received batch
+before any rank submits it to the encode worker. A CPU-group rendezvous
+protects this ownership transition: submission consumes and unlinks SHM
+on both cache hits and misses, so broadcasting handles alone is insufficient.
+
 The symmetric rule holds on the data plane: **the forward thread never
 synchronizes with the device on the per-round path.** Every host
 synchronization it performs — `.cpu()`, `.item()`, `.tolist()`,
@@ -207,6 +229,21 @@ GEMM and the ll_bf16 router's dot-product kernel compile once per exact row
 count -- runs only before it:
 graph capture records it, and eager calls after it take a GEMM that never
 compiles instead of compiling on the forward thread.
+
+A full garbage collection is a stall of the same kind, for every thread of the
+process at once. Startup leaves millions of long-lived Python objects behind
+(modules, parameters, captured graphs, kernel caches), and CPython's full
+(generation 2) collection walks all of them in hundreds of milliseconds, at a
+moment each rank's own allocations decide. Since every round waits on the
+whole group, each rank's collection stalls every rank. So `run_event_loop`
+calls `freeze_startup_heap` (`engine/gc_hooks.py`) after the JIT mark: it
+collects once, freezes the survivors (`gc.freeze`: no later collection walks
+them) and raises the generation-2 threshold far enough that CPython does not
+start full collections by itself while the loop runs its own. `GcHooks` runs
+one every `FULL_COLLECTION_INTERVAL` forwarded rounds, a count that is the
+same on every rank, so the ranks collect in the same round and each
+collection walks only what serving keeps alive. The young generations still
+collect automatically.
 
 ### The capture contract
 
@@ -317,6 +354,29 @@ The same reasoning fixes the metrics call: the loop records scheduler
 iteration metrics once per round, from the same pre-dispatch snapshot as the
 scheduler stats.
 
+Metric reporters share those collection points. Installed plugins must accept
+scalar observations promptly on the producer thread and perform delivery in the
+background. Plugin discovery and creation happen outside the loop. Reporters
+preserve the engine's worker termination behavior; a forcibly terminated worker
+may lose queued observations without running metrics cleanup. Their event
+channel is separate from load snapshots: counter increments and histogram
+observations cannot be conflated. The metric adapter suppresses unchanged gauge
+assignments before constructing events or distributing them, while retaining
+value changes and refreshing snapshots on subsequent assignments. This policy
+belongs to the metric adapter, not the scheduler loop or individual plugins. See
+[metric output plugins](../metrics-plugins.md) for event semantics, registration,
+and output lifecycle contracts.
+
+Per-request metrics anchor to request lifecycle points instead of the round
+snapshot. `tokenspeed:request_queue_time_seconds` stamps each request's
+waiting-queue entry at `_submit_scheduler_requests` — the single funnel
+normal admission, the EPD drain and the pause resume all submit through —
+and observes it once, when the request first appears in a dispatched forward
+(`_record_request_queue_time`, beside `_mark_stats_scheduled`). A retracted
+request re-enters the C++ waiting queue without passing the funnel again, so
+preemption yields no second observation. The stamp and the recorded flag
+ride `RequestState` and die with it; no cleanup pass exists.
+
 Page gauges count LCM parents, excluding the reserved null parent. The
 per-round sampler reads `empty_lcm_blocks()` and `active_lcm_blocks()`.
 Cached-only parents are `num_usable_pages - empty - active`. Active and cached
@@ -350,6 +410,7 @@ Current inventory:
 | `_cache_hooks` | `CacheOpHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries; counts the Host L2 write-backs/load-backs and the retraction image's snapshot stores/restores alike) | `count_plan_ops`, `poll_ready_events` |
 | `_l3_hooks` | `L3CacheHooks` — `engine/l3_cache_hooks.py` | self-contained (injected scheduler, `DeviceHandle`, static replica groups; no loop reference) | `submit_requests`, `converge_prefetches` |
 | `_eplb_hooks` | `EplbHooks` — `engine/eplb_hooks.py` | glue (`ExpertRebalanceController` in `moe/expert_rebalance.py` is the state machine; handed the `DeviceHandle`, the request handler and the EP gloo group; no loop reference) | `note_round` |
+| `_gc_hooks` | `GcHooks` — `engine/gc_hooks.py` | self-contained (only its interval; no loop reference) | `note_round` |
 
 `_pause_hooks` and `_pd_hooks` also receive the `DeviceHandle`: both have
 work that must land on the data plane — the DP idle forward and the KV repair
@@ -444,7 +505,15 @@ For orientation, one iteration of `event_loop`:
    completion event fences the forward thread's default stream here, before
    anything else of the plan is enqueued; an ordinary store's sources are
    pinned by the scheduler until the ACK, so its copy rides the write stream
-   and fences nothing -- then page zeroing (the new owner's sanitization),
+   and fences nothing -- then the plan's Device-to-Device block copies
+   (`pages_to_copy`: a prefix hit's private copy of the block holding its
+   boundary, an owner's move off the block it published at its prompt end;
+   the copy waits on the execution stream and precedes the zeroing because
+   a source may be re-granted and zeroed by this very plan -- or re-granted
+   as another copy's destination, which the arena then writes only after the
+   pairs reading it; a destination is never zeroed; no op id, no ACK), then
+   page zeroing (the new
+   owner's sanitization),
    then L3 prefetches (`PrefetchOp`: Host-lane submissions with no stream
    dependency, nothing in the round reads their pages), then the
    Device-bound copies -- `LoadBackOp` and `RestoreOp`, ordered
@@ -463,7 +532,9 @@ For orientation, one iteration of `event_loop`:
    victim's bytes; a restore names the resumed request's new slot. `planned`
    is None on idle and empty rounds; the plan's own work (hygiene, the
    remote streams) still runs. The rebalance hook notes whether this rank
-   forwarded (`_eplb_hooks.note_round`). Then commit from the queue head
+   forwarded (`_eplb_hooks.note_round`), and so does the garbage-collection
+   hook, which runs a full collection every `FULL_COLLECTION_INTERVAL`
+   forwarded rounds (`_gc_hooks.note_round`). Then commit from the queue head
    down to the effective depth and poll PD transfer events.
 5. **Advance the scheduler (tail call site)** with the round's
    `request_changes`, publish KV events (once), and resolve any pending
@@ -508,6 +579,10 @@ For orientation, one iteration of `event_loop`:
   peers wait in ``all_gather_object``. Every rank stays in every
   replica-group gather, even when an earlier TP/CP intersection is empty;
   breaking out leaves a peer unmatched on the next ``all_gather_object``.
+  The poll runs these collectives only while a cache op is open (an L3
+  backup runs, and can fail, only while its write-back is): every rank
+  counts the same plans and commits the same intersections, so the open
+  count is the same everywhere and an idle replica polls nothing.
   Weight-update `flush_cache` and standalone `/flush_cache` first
   MAX-reduce flush intent across attention DP so every DP worker enters
   the same collectives — the frontend sends `FlushCacheReqInput`

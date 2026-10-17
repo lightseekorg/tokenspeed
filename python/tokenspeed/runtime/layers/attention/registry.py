@@ -27,9 +27,9 @@ from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.dots3_note_config import Dots3NoteConfig
 from tokenspeed.runtime.configs.model_config import (
     AttentionArch,
-    is_deepseek_v4,
     is_qwen4_exp,
 )
 from tokenspeed.runtime.configs.model_profile import ModelProfile
@@ -40,6 +40,9 @@ from tokenspeed.runtime.layers.attention.configs.base import (
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import (
     DeepseekV41Config,
     is_deepseek_v41_config,
+)
+from tokenspeed.runtime.layers.attention.configs.dots3_note import (
+    Dots3NoteAttentionConfig,
 )
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import (
@@ -74,6 +77,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     STATE_LAYER_TYPES,
 )
 from tokenspeed.runtime.layers.attention.utils import (
+    check_probe_cache_fits,
     profile_available_cache_memory_bytes,
     reserve_cache_budget,
 )
@@ -172,12 +176,12 @@ def _resolve_heterogeneous_draft_family(
 
 
 def _arena_allocated_bytes(arena) -> int:
-    """Bytes this model's cache actually occupies: the one arena allocation.
+    """Device bytes this model's cache owner actually occupies.
 
     Summing a pool's per-layer view sizes would answer a different question
     (and double-count aliased views), so read the owner directly.
     """
-    return int(arena.buffer.nbytes)
+    return int(arena.allocated_device_bytes)
 
 
 def _cache_storage_report(
@@ -211,20 +215,26 @@ def _cache_storage_report(
     # both models' layers.
     arena_bytes = _arena_allocated_bytes(arena)
     allocated_cache_bytes = arena_bytes + fixed_workspace_bytes
-    if allocated_cache_bytes > configured_cache_bytes:
+    storage = arena.storage_plan
+    planned_peak_bytes = allocated_cache_bytes + storage.temporary_workspace_bytes
+    if planned_peak_bytes > configured_cache_bytes:
         raise RuntimeError(
-            "allocated cache storage exceeds its profiled budget: "
-            f"{allocated_cache_bytes} > {configured_cache_bytes}"
+            "planned cache storage exceeds its profiled budget: "
+            f"{planned_peak_bytes} > {configured_cache_bytes}"
         )
     return {
         "configured_cache_bytes": int(configured_cache_bytes),
         "allocated_cache_bytes": allocated_cache_bytes,
+        "planned_peak_cache_bytes": planned_peak_bytes,
         "physical_token_capacity": physical_token_capacity,
         "capacity_source": "lcm_geometry",
         "geometry": geometry
         | {
             "arena_bytes": arena_bytes,
+            "host_history_bytes": arena.allocated_host_bytes,
             "fixed_workspace_bytes": fixed_workspace_bytes,
+            "offload_persistent_workspace_bytes": storage.persistent_workspace_bytes,
+            "offload_temporary_workspace_bytes": storage.temporary_workspace_bytes,
         },
     }
 
@@ -278,6 +288,7 @@ _HYBRID_GDN_ARCHITECTURES = {
 _HYBRID_MAMBA2_ARCHITECTURES = {
     "NemotronHForCausalLM",
     "NemotronHForCausalLMNextN",
+    "NemotronH_Nano_Omni_Reasoning_V3",
 }
 # Hybrid linear-attention models whose full-attention layers are MLA (not MHA)
 # and whose linear layers are KDA (per-channel gated delta rule), not GDN.
@@ -301,9 +312,7 @@ _INKLING_ARCHITECTURES = {
     "InklingForConditionalGenerationNextN",
 }
 
-_DSPARK_DRAFT_ARCHITECTURES = frozenset(
-    {"DeepseekV4ForCausalLMDSpark", "DeepseekV41ForCausalLMDSpark"}
-)
+_DSPARK_DRAFT_ARCHITECTURES = frozenset({"DeepseekV41ForCausalLMDSpark"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -327,7 +336,6 @@ class _AttnSideProfile:
     is_qwen4_exp: bool
     is_qsa: bool
     is_inkling: bool
-    is_deepseek_v4: bool
     is_dspark: bool
     # The model's own profile, when it declares one; the facts above are then
     # all False and the profile answers for the model.
@@ -371,7 +379,6 @@ def _resolve_attn_side(
             is_qwen4_exp=False,
             is_qsa=False,
             is_inkling=False,
-            is_deepseek_v4=False,
             is_dspark=False,
             model_profile=model_config.model_profile,
         )
@@ -390,9 +397,6 @@ def _resolve_attn_side(
         is_qwen4_exp=qwen4_exp,
         is_qsa=qwen4_exp and getattr(text_config, "indexer_n_heads", None) is not None,
         is_inkling=any(a in _INKLING_ARCHITECTURES for a in architectures),
-        # The DSpark draft resolves as a V4 architecture but has no paged
-        # attention config of its own; it must not take the V4 branches.
-        is_deepseek_v4=not is_dspark and is_deepseek_v4(hf_config),
         is_dspark=is_dspark,
         model_profile=None,
     )
@@ -408,11 +412,6 @@ def _check_pd_support(
     """Every disaggregated-serving support gate, raised up front."""
     if server_args.disaggregation_mode not in ("prefill", "decode"):
         return
-    if draft is not None and draft.is_deepseek_v4:
-        raise NotImplementedError(
-            "DeepSeek V4 PD supports target-only decoding; a DeepSeek V4 "
-            "draft cache is not transferable"
-        )
     if (target.is_inkling or (draft is not None and draft.is_inkling)) and (
         has_draft_model or server_args.speculative_algorithm is not None
     ):
@@ -434,21 +433,8 @@ def _apply_backend_overrides(
     ``_create_attn_config`` call. The user's pre-override choice survives
     as ``profile.requested_backend``.
     """
-    if (
-        draft is not None
-        and "K3DSparkModel" in draft.architectures
-        and server_args.kv_parallel_size > 1
-    ):
-        raise ValueError(
-            "K3 DSpark does not support KVP (--kv-parallel-size > 1): context "
-            "KV injection does not translate virtual slots or mask nonowner writes"
-        )
     if "DeepseekV41ForCausalLM" in target.architectures:
         server_args.attention_backend = "deepseek_v41"
-    elif target.is_deepseek_v4:
-        server_args.attention_backend = "deepseek_v4"
-    if draft is not None and draft.is_deepseek_v4:
-        server_args.drafter_attention_backend = "deepseek_v4"
 
     if target.is_hybrid_linear:
         # GDN (Qwen3.5) / KDA (Kimi-K3) hybrid models always need
@@ -541,10 +527,10 @@ def _resolve_cache_family(
     """The one dispatch from family facts (plus built config) to the recipe."""
     if profile.model_profile is not None:
         return profile.model_profile.cache_family
+    if config.component(Dots3NoteAttentionConfig) is not None:
+        return "dots3_note"
     if config.component(DeepseekV41Config) is not None:
         return "deepseek_v41"
-    if profile.is_deepseek_v4:
-        return "deepseek_v4"
     # PLE and QSA are cache consumers even in a view without GDN layers.
     if profile.is_qwen4_exp:
         return "qwen4_exp"
@@ -609,7 +595,7 @@ def create_paged_router(
     """Build the CacheGroupRouter for one side's paged attention.
 
     The router builds one ``PagedAttentionBackend`` leaf per paged
-    (history-family) cache group of the pool view bound later via
+    (history) cache group of the pool view bound later via
     ``set_cache_pool``; each leaf's kernel page size resolves from the
     config override, the leaf class default, or the group's own block
     granularity (``PagedAttentionBackend.resolve_kernel_page_size``).
@@ -619,6 +605,14 @@ def create_paged_router(
     )
 
     spec = config.component(SoftmaxAttnConfig)
+    if isinstance(spec, Dots3NoteAttentionConfig):
+        from tokenspeed.runtime.layers.attention.backends.dots3_note import (
+            create_dots3_note_router,
+        )
+
+        if backend_name not in (None, "dsa"):
+            raise ValueError("dots3-note requires the DSA/SWA paged router")
+        return create_dots3_note_router(config)
     name = backend_name if backend_name is not None else spec.backend_name
     if name == "hybrid_linear_attn":
         # The composite sentinel _apply_backend_overrides writes into
@@ -700,11 +694,12 @@ def _create_attn_config(
     arch = model_config.attention_arch
     if arch not in _CONFIG_CLS:
         raise NotImplementedError(f"Not supported Attention Arch: {arch!r}")
-    config_cls = (
-        DeepseekV41Config
-        if is_deepseek_v41_config(model_config.hf_config)
-        else _CONFIG_CLS[arch]
-    )
+    if isinstance(model_config.hf_config, Dots3NoteConfig):
+        config_cls = Dots3NoteAttentionConfig
+    elif is_deepseek_v41_config(model_config.hf_config):
+        config_cls = DeepseekV41Config
+    else:
+        config_cls = _CONFIG_CLS[arch]
     config = config_cls.generate(server_args, model_config, is_draft)
     # Extra components are built through the same generate() protocol and
     # composed into config.components (consumers look them up by class via
@@ -1148,9 +1143,18 @@ def _narrow_spec_for_pp(
     retains the complete plan separately for the PD wire contract.
     """
     stage_start, stage_end = ownership.resident_cache_window
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
+        plan_cache_storage,
+    )
+
+    memory_plan = spec.memory_plan.narrow_to_layers(stage_start, stage_end)
+    offload = None if spec.storage_plan is None else spec.storage_plan.offload
     return dataclasses.replace(
         spec,
-        memory_plan=spec.memory_plan.narrow_to_layers(stage_start, stage_end),
+        memory_plan=memory_plan,
+        storage_plan=plan_cache_storage(
+            memory_plan, spec.cache_group_specs, offload=offload
+        ),
     )
 
 
@@ -1167,21 +1171,18 @@ def _validate_mla_dcp_backend(name: str | None, arch: AttentionArch) -> None:
 def _validate_hybrid_kvp_cache(spec: CachePoolSpec, *, kvp_size: int) -> None:
     """Validate declared storage, independent of recipe name or inheritance."""
     groups = spec.cache_group_specs
-    if not any(
-        group.family == "history" and group.retention == "full_history"
-        for group in groups
-    ):
+    if not any(group.attn_kind == "full_history" for group in groups):
         raise ValueError("Hybrid MLA KVP requires a full-history cache group")
     for group in groups:
-        if group.family == "history" and group.retention != "full_history":
+        if group.attn_kind == "sliding_window":
             raise ValueError(
                 f"Hybrid MLA KVP cache group {group.group_id!r} "
-                "must use full-history retention"
+                "must be a full-history group"
             )
-        expected = kvp_size if group.family == "history" else 1
+        expected = kvp_size if group.attn_kind != "state" else 1
         if group.shard_count != expected:
             raise ValueError(
-                f"Hybrid MLA KVP cache group {group.group_id!r} ({group.family}) "
+                f"Hybrid MLA KVP cache group {group.group_id!r} ({group.attn_kind}) "
                 f"requires shard_count={expected}, got {group.shard_count}"
             )
 
@@ -1235,13 +1236,8 @@ def create_attn_components(
     target_full_attn_backend_name = _resolve_full_attn_backend_name(
         target, softmax_attn, hybrid_request=target.requested_backend
     )
-    # DeepSeek V4 validates its specialized KVP cache contract in its backend.
-    if (
-        config.kvp_size > 1
-        and not target.is_deepseek_v4
-        and (
-            model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
-        )
+    if config.kvp_size > 1 and (
+        model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
     ):
         _validate_mla_dcp_backend(
             target_full_attn_backend_name, model_config.attention_arch
@@ -1315,6 +1311,8 @@ def create_attn_components(
         overlap_schedule_depth=overlap_schedule_depth,
         probe_batch_rows=probe_batch_rows,
     )
+    if probe_batch_rows is not None:
+        check_probe_cache_fits(cache_setup.cache_budget_bytes, profiled_cache_bytes)
     spec = cache_setup.spec
     if config.kvp_size > 1 and target.is_hybrid_linear:
         _validate_hybrid_kvp_cache(spec, kvp_size=config.kvp_size)

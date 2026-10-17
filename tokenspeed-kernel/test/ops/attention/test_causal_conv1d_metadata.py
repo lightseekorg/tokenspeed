@@ -73,6 +73,10 @@ def test_metadata_matches_reference(device, lengths, block_m, dtype):
     assert metadata.batch_indices.dtype == metadata.chunk_offsets.dtype == torch.int32
     assert metadata.block_m == block_m
     assert metadata.batch_indices.device.type == device
+    assert metadata.cu_seqlens_cpu.tolist() == [
+        0,
+        *torch.tensor(lengths, dtype=torch.int64).cumsum(0).tolist(),
+    ]
 
 
 def test_metadata_compiles_once_across_request_counts():

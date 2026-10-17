@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Kimi-K3 communication routing and collective workspace ownership.
+"""Kimi-K3 communication routing and collective state ownership.
 
 The routed all-reduce and RMSNorm run before joining the shared-expert stream.
 The up-projection and shared all-reduce assemble the output after the join.
@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 import torch.distributed as dist
@@ -44,7 +44,7 @@ from tokenspeed_kernel.ops.communication.multimem import (
     multimem_prealloc,
     multimem_stage,
 )
-from tokenspeed_kernel.ops.moe.latent_tail import (
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_tail import (
     K3_SHARED_RS_MAX_TOKENS,
     KimiK3LatentTailOp,
     attn_reduce_shape_supported,
@@ -62,6 +62,9 @@ from tokenspeed.runtime.distributed.comm_ops import (
 )
 from tokenspeed.runtime.layers.layernorm import RMSNorm, _get_process_group
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3 import K3IrisState
 
 logger = logging.getLogger(__name__)
 
@@ -108,21 +111,24 @@ def _unified_tail_applicable(
 
 
 class K3AttnComm:
-    """Attention all-reduce, residual fusion, and shared workspaces for Kimi-K3.
+    """Attention all-reduce, residual fusion, and shared state for Kimi-K3.
 
-    Each decoder layer owns an instance. The first instance initializes the
-    class-level workspaces, which subsequent instances reuse. Layer-specific
-    weights are supplied to each reduction call.
+    Each decoder layer owns an instance. NVIDIA workspaces are initialized by
+    the first instance; Iris states are bound during model preparation.
+    Layers reuse this state and supply their own weights at each call.
     """
 
     _prepared_hidden_size: ClassVar[int | None] = None
     attn_ar_fusion_ok: ClassVar[bool] = False
     dummy_norm: ClassVar[RMSNorm | None] = None
     cute_ar: ClassVar[Callable | None] = None
+    # Target and draft execute sequentially and share each group's fixed buffers.
+    iris_states: ClassVar[dict[tuple[int, ...], K3IrisState]] = {}
 
     def __init__(self, *, mapping, hidden_size: int) -> None:
         self.mapping = mapping
         self.hidden_size = hidden_size
+        self.iris_state: K3IrisState | None = None
         if self._prepared_hidden_size is not None:
             if hidden_size != self._prepared_hidden_size:
                 raise ValueError(
@@ -252,11 +258,9 @@ class K3AttnComm:
             or partial.shape[0] % 8 != 0
         ):
             return None
-        from tokenspeed_kernel.ops.communication.iris import (
-            iris_attention_mix,
-        )
-
-        return iris_attention_mix(
+        if self.iris_state is None:
+            return None
+        return self.iris_state.attention_mix(
             partial,
             prefix,
             block_residual,
@@ -266,7 +270,6 @@ class K3AttnComm:
             out_norm_weight=out_norm_weight,
             out_norm_eps=out_norm_eps,
             num_valid_blocks=num_valid_blocks,
-            group=_get_process_group(self.mapping.attn.tp_group),
         )
 
     def fused_attnres_reduce_available(
@@ -280,9 +283,6 @@ class K3AttnComm:
         scratch, _, _, output_weight, _ = combine
         if score_weight is None or output_weight is None:
             return False
-        from tokenspeed_kernel.ops.communication.triton import (
-            allreduce_residual_attnres_combine_supported,
-        )
 
         # A symmetric-memory reduction in the kernel's own order: off under
         # the NCCL-only knob and under the batch-invariant contract alike.
@@ -290,15 +290,12 @@ class K3AttnComm:
             "force_deterministic_rsag", False
         ) or global_server_args_dict.get("batch_invariant_collectives", False):
             return False
-        return allreduce_residual_attnres_combine_supported(
+        return self.iris_state is not None and self.iris_state.attnres_supported(
             partial,
             residual,
             score_weight,
             output_weight,
             scratch,
-            rank=self.mapping.attn.tp_rank,
-            group=_get_process_group(self.mapping.attn.tp_group),
-            local_world_size=self.mapping.nprocs_per_node,
         )
 
     def attn_reduce(
@@ -395,20 +392,12 @@ class K3AttnComm:
                 combine,
                 mlp_wp,
             ):
-                from tokenspeed_kernel.ops.communication.triton import (
-                    allreduce_residual_attnres_combine,
-                )
-
-                group = _get_process_group(self.mapping.attn.tp_group)
-                h, residual_out = allreduce_residual_attnres_combine(
+                h, residual_out = self.iris_state.attnres_combine(
                     attn_partial,
                     prefix_sum,
                     mlp_wp,
                     out_norm_w,
                     scratch,
-                    rank=self.mapping.attn.tp_rank,
-                    group=group,
-                    local_world_size=self.mapping.nprocs_per_node,
                     eps=eps,
                 )
                 return residual_out, h

@@ -46,19 +46,19 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import replace
-from types import SimpleNamespace
-
-import pytest
-import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from _tp_layout_fakes import (
+from test.runtime.distributed._tp_layout_fakes import (
     HIDDEN,
     NUM_HEADS,
     attention_weights,
     build_attention,
     init_gloo,
 )
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from tokenspeed.runtime.distributed.comm_manager import (
     CommManager,

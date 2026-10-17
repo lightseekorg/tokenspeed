@@ -43,6 +43,10 @@ on:
           - manual
           - debug
 
+permissions:
+  contents: read
+  pull-requests: read
+
 env:
   PIP_BREAK_SYSTEM_PACKAGES: 1
   CUDA_VERSION: 13.0.1
@@ -132,7 +136,7 @@ jobs:
             matrix=$(python3 test/ci_system/pipeline.py scan \
               --root test/ci \
               --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
-              --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
+              --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || github.event_name == 'push' && 'post-submit' || 'per-commit' }}" \
               --runner-group "nvidia-arm" \
               --workflow-stage "$workflow_stage" \
               --multi-node exclude)

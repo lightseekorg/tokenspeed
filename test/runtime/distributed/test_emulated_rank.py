@@ -124,6 +124,8 @@ def test_one_process_world_backs_every_logical_group(emulated_manager):
     group = emulated_manager.get_process_group("gloo", TP8)
     assert group.size() == 1
     assert emulated_manager.get_process_group("gloo", (0, 2, 4, 6)) is group
+    emulated_manager.init_process_group(TP8, name="copy")
+    assert emulated_manager.get_process_group("gloo", TP8, name="copy") is group
 
     tensor = torch.ones(4)
     dist.all_reduce(tensor, group=group)
@@ -161,7 +163,9 @@ def test_grammar_sync_is_sized_by_its_process_group():
 
 
 def _server_args(**overrides) -> ServerArgs:
-    platform = SimpleNamespace(is_amd=True, is_nvidia=False, is_hopper_plus=False)
+    platform = SimpleNamespace(
+        is_amd=True, is_nvidia=False, is_npu=False, is_hopper_plus=False
+    )
     with (
         mock.patch.object(
             server_args_module, "current_platform", return_value=platform
@@ -191,9 +195,9 @@ def test_emulation_keeps_the_layout_without_fused_all_reduce():
         ({"mm_encoder_tp_mode": "data"}, "--mm-encoder-tp-mode data"),
         (
             {
-                "prefill_context_parallel_size": 8,
+                "kv_parallel_size": 8,
+                "query_context_parallel_size": 8,
                 "disaggregation_mode": "prefill",
-                "disable_prefill_graph": True,
                 "attention_backend": "dsa",
             },
             "query context parallelism",

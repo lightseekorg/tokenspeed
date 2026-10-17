@@ -18,15 +18,95 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Capability helpers for native latent-space MoE execution."""
+"""PyTorch reference MoE kernels."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
+
+# ===-----------------------------------------------------------------------===#
+# Routing: softmax top-k
+# ===-----------------------------------------------------------------------===#
+
+
+@register_kernel(
+    "moe",
+    "softmax_topk",
+    name="torch_softmax_topk",
+    solution="torch",
+    signatures=format_signatures(
+        "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+    ),
+    priority=Priority.PORTABLE,
+)
+def torch_softmax_topk(
+    *,
+    router_logits: torch.Tensor,
+    topk: int,
+    topk_indices_dtype: torch.dtype,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """PyTorch reference for ordinary softmax top-k routing."""
+    del enable_pdl
+    logits = router_logits.float()
+    topk_logits, topk_ids = torch.topk(logits, topk, dim=-1, sorted=True)
+    if renormalize:
+        topk_weights = torch.softmax(topk_logits, dim=-1)
+    else:
+        topk_weights = torch.softmax(logits, dim=-1).gather(-1, topk_ids)
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights, topk_ids.to(topk_indices_dtype)
+
+
+# ===-----------------------------------------------------------------------===#
+# Routing: sigmoid-bias top-k
+# ===-----------------------------------------------------------------------===#
+
+
+@register_kernel(
+    "moe",
+    "sigmoid_bias_topk",
+    name="torch_sigmoid_bias_topk",
+    solution="torch",
+    signatures=format_signatures(
+        "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+    ),
+    priority=Priority.PORTABLE,
+)
+def torch_sigmoid_bias_topk(
+    *,
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    weights_dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """PyTorch implementation matching Kimi's existing routing path."""
+    scores = router_logits.sigmoid()
+    topk_ids = torch.topk(
+        scores + correction_bias.unsqueeze(0), topk, dim=-1, sorted=False
+    ).indices
+    topk_weights = scores.gather(1, topk_ids)
+    if normalize_topk_weights:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights.to(weights_dtype), topk_ids.to(torch.int32)
+
+
+# ===-----------------------------------------------------------------------===#
+# Routing: sqrt-softplus top-k
+# ===-----------------------------------------------------------------------===#
 
 
 @register_kernel(
@@ -85,12 +165,3 @@ def torch_sqrt_softplus_topk(
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
     return topk_weights.to(weights_dtype), topk_ids.to(torch.int32), output_scores
-
-
-def native_latent_moe_available() -> bool:
-    """Return whether the active backend provides native latent-space MoE."""
-
-    return current_platform().is_amd
-
-
-__all__ = ["native_latent_moe_available"]

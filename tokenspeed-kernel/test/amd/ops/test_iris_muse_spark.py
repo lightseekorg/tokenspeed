@@ -1,0 +1,1282 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+
+"""Muse Spark protocol selection, ownership, and changed-input graph replay."""
+
+import socket
+import traceback
+from functools import partial
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from tokenspeed_kernel.platform import current_platform
+
+pytestmark = pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="Muse Iris fusions require gfx950"
+)
+
+
+def _get_open_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("", 0))
+        return sock.getsockname()[1]
+
+
+def _skip_if_unsupported(world_size: int, reason_prefix: str) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip(f"CUDA/ROCm is required for {reason_prefix}")
+    if world_size > torch.cuda.device_count():
+        pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
+    if not current_platform().is_amd:
+        pytest.skip(f"{reason_prefix} only targets AMD ROCm")
+    try:
+        import iris  # noqa: F401
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+
+def _spawn_and_collect(worker_fn, args, world_size: int) -> None:
+    error_dict = mp.Manager().dict()
+    mp.spawn(
+        worker_fn,
+        args=args + (error_dict,),
+        nprocs=world_size,
+        join=True,
+    )
+
+    if error_dict:
+        raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
+
+
+def _communication_worker(rank, world_size, port, check, backend, error_dict):
+    try:
+        device = torch.device("cuda", rank)
+        torch.cuda.set_device(device)
+        dist.init_process_group(
+            backend,
+            init_method=f"tcp://localhost:{port}",
+            rank=rank,
+            world_size=world_size,
+        )
+        check(rank, world_size, device)
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _column_all_gather_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris.all_gather import (
+        iris_pull_allgather_columns,
+    )
+    from tokenspeed_kernel.ops.quantization import rmsnorm_mxfp4_quant
+    from utils import assert_no_triton_compile
+
+    state = _muse_state(rank, device, 8, False)
+    weight = torch.linspace(0.75, 1.25, 4096, dtype=torch.bfloat16, device=device)
+    overwrite = torch.full(
+        (1, (4096 // world_size)), -7 * (rank + 1), dtype=torch.bfloat16, device=device
+    )
+    # Published M1, ordinary rows, and three chunks exceeding the prepared capacity.
+    for rows in (1, 4, 16, 33):
+        if rows == 1:
+            published = state.all_reduce.acquire_outputs(((1, 4096),))[0]
+            local = published[
+                :, rank * (4096 // world_size) : (rank + 1) * (4096 // world_size)
+            ]
+        else:
+            local = torch.empty(
+                (rows, (4096 // world_size)), dtype=torch.bfloat16, device=device
+            )
+        row_values = torch.arange(rows, dtype=torch.bfloat16, device=device)[:, None]
+        expected = torch.cat(
+            [
+                (row_values + peer + 1).expand(-1, (4096 // world_size))
+                for peer in range(world_size)
+            ],
+            dim=-1,
+        )
+        fused = rows <= 16 and current_platform().is_cdna4
+
+        def run():
+            gathered = state.gather.run(local)
+            if rows <= 16:
+                gathered = gathered.clone()  # Small outputs borrow shared storage.
+            quantized = (
+                state.all_gather_rmsnorm_mxfp4_quant(local, weight, 1e-6, 1.0)
+                if fused
+                else None
+            )
+            state.gather.run(overwrite)
+            return gathered, quantized
+
+        local.copy_(row_values + rank + 1)
+        run()
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            gathered, quantized = run()
+        for scale in (2, -1, 3):
+            local.copy_((row_values + rank + 1) * scale)
+            graph.replay()
+            torch.testing.assert_close(gathered, expected * scale, atol=0, rtol=0)
+            if fused:
+                reference = rmsnorm_mxfp4_quant(expected * scale, weight, 1e-6, 1.0)
+                torch.testing.assert_close(quantized[0], reference[0], atol=0, rtol=0)
+                torch.testing.assert_close(
+                    _logical_cdna4_scales(quantized[1], rows, 128),
+                    _logical_cdna4_scales(reference[1], rows, 128),
+                    atol=0,
+                    rtol=0,
+                )
+    with assert_no_triton_compile(iris_pull_allgather_columns):
+        for rows in (3, 7):
+            local = torch.full(
+                (rows, (4096 // world_size)),
+                rank + 1,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            expected = torch.cat(
+                [torch.full_like(local, peer + 1) for peer in range(world_size)], dim=-1
+            )
+            torch.testing.assert_close(
+                state.gather.run(local), expected, atol=0, rtol=0
+            )
+    if current_platform().is_cdna4:
+        _check_all_reduce_routed_rmsnorm_sum(state, rank, world_size, device)
+
+
+def _logical_cdna4_scales(
+    scales: torch.Tensor,
+    rows: int,
+    cols: int,
+) -> torch.Tensor:
+    """Read the logical values from a padded CDNA4 scale allocation."""
+    logical_m = torch.arange(rows, device=scales.device)[:, None]
+    logical_k = torch.arange(cols, device=scales.device)[None, :]
+    m_in_block = logical_m % 32
+    m_hi = m_in_block // 16
+    m_lo = m_in_block % 16
+    k_block = logical_k // 8
+    k_hi = (logical_k % 8) // 4
+    k_lo = logical_k % 4
+    swizzled_k = (((k_block * 4 + k_lo) * 16 + m_lo) * 2 + k_hi) * 2 + m_hi
+    offsets = swizzled_k + (logical_m // 32) * (cols * 32)
+    return scales.view(torch.uint8).flatten()[offsets]
+
+
+def _check_all_reduce_routed_rmsnorm_sum(state, rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
+        iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum,
+    )
+    from tokenspeed_kernel.ops.moe import routed_input_scale_rmsnorm_sum_gathered
+    from utils import assert_no_triton_compile
+
+    rows, topk, width = 4, 4, 2048
+    indices = torch.arange(rows * topk, dtype=torch.int32, device=device)
+    columns = torch.arange(width, device=device)
+    values = torch.sin(
+        columns[None, :] * 0.003
+        + (indices // topk)[:, None] * 0.1
+        + (indices % topk)[:, None] * 0.2
+    ).bfloat16()
+    routes = torch.empty_like(values)
+    mapping = torch.empty_like(indices)
+    weights = (
+        torch.tensor([0.1, 0.2, 0.3, 0.4], device=device)
+        .expand(rows, topk)
+        .contiguous()
+    )
+    norm = torch.linspace(0.75, 1.25, width, dtype=torch.bfloat16, device=device)
+
+    def update(scale, empty_last_rank):
+        owners = indices % topk
+        if empty_last_rank:
+            owners = torch.where(owners == 3, 0, owners)
+        mapping.copy_(torch.where(owners == rank, indices, -1))
+        routes.copy_(torch.where((owners == rank)[:, None], values * scale, torch.nan))
+        partials = [
+            routed_input_scale_rmsnorm_sum_gathered(
+                values * scale,
+                torch.where(owners == peer, indices, -1),
+                rows,
+                topk,
+                weights,
+                norm,
+                1e-6,
+                1.0,
+                False,
+                None,
+            )
+            for peer in range(world_size)
+        ]
+        reduced = partials[rank].float()
+        for peer, value in enumerate(partials):
+            if peer != rank:
+                reduced.add_(value.float())
+        return reduced.bfloat16()
+
+    def run():
+        return state.all_reduce_routed_rmsnorm_sum(
+            routes, mapping, rows, topk, weights, norm, 1e-6, 1.0
+        )
+
+    state.all_reduce.producer_pull.ready_flags.fill_(torch.iinfo(torch.int32).max - 1)
+    expected = update(1, False)
+    torch.cuda.synchronize()
+    dist.barrier()
+    torch.testing.assert_close(run(), expected, atol=2e-2, rtol=2e-2)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    for scale, empty in ((-1, False), (2, True)):
+        expected = update(scale, empty)
+        torch.cuda._sleep((rank + 1) * 20000)
+        with assert_no_triton_compile(
+            iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum
+        ):
+            graph.replay()
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_iris_column_all_gather(world_size):
+    """Concatenate model-shaped TP4/TP8 hidden shards with the Gluon transport."""
+    _skip_if_unsupported(world_size, "Iris inner all-gather tests")
+    port = _get_open_port()
+    _spawn_and_collect(
+        _communication_worker,
+        (world_size, port, _column_all_gather_worker, "gloo"),
+        world_size,
+    )
+
+
+def _muse_state(rank, device, max_rows, enable_lamport):
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import (
+        prepare_muse_communication,
+    )
+
+    return prepare_muse_communication(
+        group=dist.group.WORLD,
+        rank_in_group=rank,
+        staged_max_numel=0,
+        producer_direct_max_numel=max_rows * 8192,
+        enable_lamport=enable_lamport,
+        all_reduce=None,
+        device=device,
+    )
+
+
+def _boundary_reference(stream, reduced, post, alpha, beta, pre):
+    from tokenspeed_kernel.ops.residual._triton.gated_boundary import (
+        triton_post_norm_residual_pre_norm,
+    )
+
+    return triton_post_norm_residual_pre_norm(
+        stream,
+        reduced,
+        post,
+        1e-6,
+        1.0,
+        alpha,
+        beta,
+        pre,
+        1e-6,
+        1.0,
+        False,
+        None,
+        1,
+    )
+
+
+def _muse_boundary_worker(rank, world_size, device, sharded):
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
+        iris_fused_pull_allgather_muse_attntail,
+    )
+    from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
+        iris_pull_reduce_scatter,
+    )
+    from utils import assert_no_triton_compile
+
+    state = _muse_state(rank, device, 8192 if sharded else 32, sharded)
+    torch.manual_seed(101)
+    pre = torch.randn(8192, device=device).bfloat16()
+    post = torch.randn_like(pre)
+    beta = torch.sigmoid(torch.randn(8192, device=device))
+    alpha = torch.sqrt(1 - beta.square())
+    rows_sequence = (512, 1, 8191, 21, 513, 8192) if sharded else (26, 1, 25, 2)
+    bases = [torch.randn(rows, 8192, device=device) for rows in rows_sequence]
+    inputs = [(base + (rank + 1) / 8).bfloat16() for base in bases]
+    streams = [torch.randn_like(base) for base in bases]
+    posts = [
+        None if sharded or index % 2 == 0 else post for index in range(len(inputs))
+    ]
+
+    def boundary(values, stream, post_weight):
+        branch = state.all_reduce.acquire_outputs((tuple(values.shape),))[0]
+        branch.copy_(values)
+        return state.all_reduce_symmetric_boundary(
+            branch,
+            stream,
+            post_weight,
+            alpha,
+            beta,
+            pre,
+            1e-6,
+            1.0,
+            1e-6,
+            1.0,
+        )
+
+    def sequence():
+        outputs = []
+        for index, (values, stream, weight) in enumerate(zip(inputs, streams, posts)):
+            outputs.append(boundary(values, stream, weight))
+            if sharded:
+                # Alternate Lamport and pull reductions over the boundary's scratch.
+                n = 129 * 8192 if index % 2 else 43 * 4096
+                generic = state.all_reduce.acquire_outputs(((n,),))[0]
+                generic.fill_(rank + 1)
+                state.reduce_outputs((generic,))
+        return outputs
+
+    sequence()
+    if sharded:
+        state.row_scatter_flags.fill_(2**32 - 2)
+        state.row_gather_flags.fill_(2**32 - 2)
+    else:
+        state.boundary_generations.fill_(2**31 - 4)
+        state.boundary_ready_flags.fill_(2**31 - 4)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = sequence()
+    for step in range(4):
+        for base, values in zip(bases, inputs):
+            values.copy_(base + (rank + 1) * (step + 1) / 8)
+        if rank == step:
+            torch.cuda._sleep(10000)
+        graph.replay()
+        for base, stream, weight, actual in zip(bases, streams, posts, outputs):
+            reduced = (base + (step + 1) / 8).bfloat16().float()
+            for peer in range(1, world_size):
+                reduced.add_((base + (peer + 1) * (step + 1) / 8).bfloat16().float())
+            expected = _boundary_reference(
+                stream, reduced.bfloat16(), weight, alpha, beta, pre
+            )
+            for got, reference in zip(actual, expected):
+                torch.testing.assert_close(
+                    got,
+                    reference,
+                    atol=(
+                        0
+                        if sharded
+                        else (1e-5 if got.dtype == torch.float32 else 0.015625)
+                    ),
+                    rtol=(
+                        0
+                        if sharded
+                        else (2e-5 if got.dtype == torch.float32 else 0.008)
+                    ),
+                )
+    if sharded:
+        with assert_no_triton_compile(
+            iris_pull_reduce_scatter, iris_fused_pull_allgather_muse_attntail
+        ):
+            for rows in (1025, 4096):
+                values = torch.ones((rows, 8192), device=device, dtype=torch.bfloat16)
+                boundary(values, torch.zeros_like(values, dtype=torch.float32), None)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
+def _muse_collective_policy_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_lamport_bf16_allreduce,
+        iris_pull_twoshot_allreduce,
+        iris_push_twoshot_allreduce,
+    )
+    from utils import assert_no_triton_compile
+
+    state = _muse_state(rank, device, 8192, True)
+    counts = (
+        512,
+        43 * 4096,
+        44 * 4096,
+        21 * 8192,
+        22 * 8192,
+        26 * 8192,
+        27 * 8192,
+        128 * 8192,
+        129 * 8192,
+        8191 * 8192,
+        8192 * 8192,
+        32,
+    )
+    boundary_base = (
+        torch.arange(26 * 8192, device=device).view(26, 8192) % 31
+    ).float() / 32
+    boundary_values = (boundary_base + (rank + 1) / 8).bfloat16()
+    boundary_stream = torch.zeros_like(boundary_base)
+    coefficients = torch.ones(8192, device=device)
+    pre_weight = torch.zeros(8192, device=device, dtype=torch.bfloat16)
+
+    inputs = [
+        torch.full((n,), rank + 1, dtype=torch.bfloat16, device=device) for n in counts
+    ]
+
+    def sequence():
+        outputs = []
+        for index, values in enumerate(inputs):
+            branch = state.all_reduce.acquire_outputs((tuple(values.shape),))[0]
+            branch.copy_(values)
+            outputs.append(state.reduce_outputs((branch,))[0].clone())
+            if index == 5:
+                boundary_branch = state.all_reduce.acquire_outputs(((26, 8192),))[0]
+                boundary_branch.copy_(boundary_values)
+                fused = tuple(
+                    output.clone()
+                    for output in state.all_reduce_symmetric_boundary(
+                        boundary_branch,
+                        boundary_stream,
+                        None,
+                        coefficients,
+                        coefficients,
+                        pre_weight,
+                        1e-6,
+                        1.0,
+                        1e-6,
+                        1.0,
+                    )
+                )
+        return outputs, fused
+
+    sequence()
+    state.reduction.epochs.fill_(2**32 - 4)
+    state.reduction.ready_flags.fill_(2**32 - 4)
+    state.reduction.lamport_epochs.fill_(2)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs, fused = sequence()
+    for step in range(7):
+        for values in inputs:
+            values.fill_((rank + 1) * (step + 1) / 8)
+        boundary_values.copy_(boundary_base + (rank + 1) * (step + 1) / 8)
+        if rank == step % world_size:
+            torch.cuda._sleep(10000)
+        graph.replay()
+        for output in outputs:
+            torch.testing.assert_close(
+                output,
+                torch.full_like(
+                    output, (world_size * (world_size + 1) // 2) * (step + 1) / 8
+                ),
+                rtol=0,
+                atol=0,
+            )
+        reduced = (
+            world_size * boundary_base
+            + (world_size * (world_size + 1) // 2) * (step + 1) / 8
+        ).bfloat16()
+        expected = _boundary_reference(
+            boundary_stream, reduced, None, coefficients, coefficients, pre_weight
+        )
+        for actual, reference in zip(fused, expected):
+            torch.testing.assert_close(
+                actual,
+                reference,
+                atol=1e-5 if actual.dtype == torch.float32 else 0.015625,
+                rtol=2e-5 if actual.dtype == torch.float32 else 0.008,
+            )
+    with assert_no_triton_compile(
+        iris_lamport_bf16_allreduce,
+        iris_push_twoshot_allreduce,
+        iris_pull_twoshot_allreduce,
+    ):
+        for rows in (3, 17, 127, 130):
+            branch = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
+            branch.fill_(rank + 1)
+            output = state.reduce_outputs((branch,))[0]
+            torch.testing.assert_close(
+                output,
+                torch.full_like(output, world_size * (world_size + 1) // 2),
+                rtol=0,
+                atol=0,
+            )
+    for numel in (512, 44 * 4096, 129 * 8192):
+        ordinary = torch.full((numel,), rank + 1, dtype=torch.bfloat16, device=device)
+        result = state.reduce(ordinary)
+        assert result.data_ptr() == ordinary.data_ptr()
+        torch.testing.assert_close(
+            ordinary,
+            torch.full_like(ordinary, world_size * (world_size + 1) // 2),
+            rtol=0,
+            atol=0,
+        )
+
+
+def _muse_owned_packet_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
+        iris_pack_moe_inputs,
+        iris_pull_allgather_moe_inputs,
+    )
+    from tokenspeed_kernel.ops.quantization import rmsnorm_mxfp4_quant
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+        swizzle_cdna4_mxfp4_scale,
+    )
+    from utils import assert_no_triton_compile
+
+    state = _muse_state(rank, device, 8192, True)
+    norm_weight = torch.linspace(-0.25, 0.25, 4096, device=device).bfloat16()
+
+    def make_inputs(rows):
+        local_rows = (rows + world_size - 1) // world_size
+        first = rank * local_rows
+        valid_rows = min(local_rows, max(0, rows - first))
+        local = torch.empty((local_rows, 4096), device=device, dtype=torch.bfloat16)
+        ids = torch.empty((local_rows, 8), device=device, dtype=torch.int32)
+        weights = torch.empty((local_rows, 8), device=device, dtype=torch.float32)
+        branch = torch.empty((rows, 8192), device=device, dtype=torch.bfloat16)
+        return rows, first, valid_rows, local, ids, weights, branch
+
+    inputs = [make_inputs(rows) for rows in (193, 8192)]
+
+    def update(item, step):
+        rows, first, valid_rows, local, ids, weights, branch = item
+        global_row = torch.arange(rows, device=device)[:, None]
+        column = torch.arange(4096, device=device)[None, :]
+        full = (
+            ((global_row * 37 + column * 11 + step * 13) % 257 - 128) / 64
+        ).bfloat16()
+        full_ids = (
+            (global_row + torch.arange(8, device=device)[None, :] + step) % 256
+        ).int()
+        full_weights = (
+            (global_row % 31 + torch.arange(8, device=device)[None, :] + step) / 64
+        ).float()
+        local.fill_(float("nan"))
+        ids.fill_(-2147483648)
+        weights.fill_(float("nan"))
+        local[:valid_rows].copy_(full[first : first + valid_rows])
+        ids[:valid_rows].copy_(full_ids[first : first + valid_rows])
+        weights[:valid_rows].copy_(full_weights[first : first + valid_rows])
+        branch.fill_((rank + 1) * (step + 1))
+        return full, full_ids, full_weights
+
+    def one(item):
+        rows, _, valid_rows, local, ids, weights, branch = item
+        reduced = state.reduce_scatter_owned_rows(branch)
+        retained = state.all_gather_owned_rows(reduced, rows, True)
+        quantized = rmsnorm_mxfp4_quant(local, norm_weight, 1e-8, 1.0)
+        # Pull peers may still read scratch when this rank starts packet packing.
+        generic = state.all_reduce.acquire_outputs(((129, 8192),))[0]
+        generic.copy_(branch[:1])
+        generic_output = state.reduce_outputs((generic,))[0]
+        packed_result = state.gather_owned_moe_inputs(
+            quantized,
+            ids,
+            weights,
+            rows,
+            valid_rows,
+        )
+        bf16_result = state.gather_owned_moe_inputs(
+            local,
+            ids,
+            weights,
+            rows,
+            valid_rows,
+        )
+        generic_snapshot = generic_output.clone()
+        # The next scatter overwrites packet staging before outputs are checked.
+        state.reduce_scatter_owned_rows(branch)
+        return retained, packed_result, bf16_result, generic_snapshot
+
+    for item in inputs:
+        update(item, 0)
+        one(item)
+    state.row_gather_flags.fill_(2**32 - 2)
+    state.row_scatter_flags.fill_(2**32 - 2)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = [one(item) for item in inputs]
+    for step in range(4):
+        expected = [update(item, step) for item in inputs]
+        if rank == step:
+            torch.cuda._sleep(10000)
+        graph.replay()
+        for item, result, reference in zip(inputs, outputs, expected):
+            rows = item[0]
+            retained, packed_result, bf16_result, generic = result
+            full, full_ids, full_weights = reference
+            torch.testing.assert_close(
+                generic,
+                torch.full_like(
+                    generic, (world_size * (world_size + 1) // 2) * (step + 1)
+                ),
+                atol=0,
+                rtol=0,
+            )
+            expected_packed, expected_scales = rmsnorm_mxfp4_quant(
+                full, norm_weight, 1e-8, 1.0
+            )
+            valid_scale_mask = swizzle_cdna4_mxfp4_scale(
+                torch.ones((rows, 128), device=device, dtype=torch.uint8)
+            )[0].bool()
+            actual_packed, actual_scales = packed_result[0]
+            torch.testing.assert_close(actual_packed, expected_packed, atol=0, rtol=0)
+            torch.testing.assert_close(
+                actual_scales[valid_scale_mask],
+                expected_scales[valid_scale_mask],
+                atol=0,
+                rtol=0,
+            )
+            torch.testing.assert_close(bf16_result[0], full, atol=0, rtol=0)
+            for _, actual_ids, actual_weights in (packed_result, bf16_result):
+                assert actual_ids.is_contiguous() and actual_weights.is_contiguous()
+                torch.testing.assert_close(actual_ids, full_ids, atol=0, rtol=0)
+                torch.testing.assert_close(actual_weights, full_weights, atol=0, rtol=0)
+            torch.testing.assert_close(
+                retained,
+                torch.full_like(
+                    retained, (world_size * (world_size + 1) // 2) * (step + 1)
+                ),
+                atol=0,
+                rtol=0,
+            )
+    with assert_no_triton_compile(iris_pack_moe_inputs, iris_pull_allgather_moe_inputs):
+        item = make_inputs(2049)
+        update(item, 7)
+        one(item)
+    torch.cuda.synchronize()
+
+
+def _prepare_muse_backend(world_size, projection, moe):
+    from tokenspeed.runtime.distributed import process_group_manager as pgm
+    from tokenspeed.runtime.distributed.comm_backend.registry import (
+        initialize_comm_backend,
+    )
+    from tokenspeed.runtime.models.muse_spark import MuseSparkForConditionalGeneration
+
+    group = tuple(range(world_size))
+    pgm.process_group_manager.register_process_group("nccl", group, dist.group.WORLD)
+    backend = initialize_comm_backend()
+    if projection is None:
+        projection = SimpleNamespace(iris_state=None)
+    if moe is None:
+        moe = SimpleNamespace(
+            iris_state=None, pre_expert_proj=None, post_expert_proj=None
+        )
+    layer = SimpleNamespace(
+        iris_state=None,
+        self_attn=SimpleNamespace(iris_state=None, qkv_proj=projection),
+        mlp=moe,
+    )
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(
+            attn=SimpleNamespace(tp_size=world_size, tp_group=group),
+            moe=SimpleNamespace(tp_ep_group=group),
+        ),
+        config=SimpleNamespace(hidden_size=8192),
+        model=SimpleNamespace(iris_state=None, layers=[layer]),
+    )
+    assert MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
+    state = owner.model.iris_state
+    assert MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
+    assert owner.model.iris_state is state
+    assert projection.iris_state is state and moe.iris_state is state
+    assert backend.get_prepared_all_gather(group, torch.bfloat16) is state.gather
+    return group, state
+
+
+def _muse_owned_qkvg_worker(rank, world_size, device):
+    torch.set_grad_enabled(False)
+    torch.set_default_dtype(torch.bfloat16)
+    from tokenspeed_kernel.ops.attention.prologue import (
+        HeadKVCache,
+        HeadNorm,
+        RopeStyle,
+        Rotary,
+        gqa_prologue,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.all_to_all import (
+        iris_a2a_transpose_qkvg,
+        iris_fused_a2a_transpose_qkvg_norm_rope,
+    )
+    from utils import assert_no_triton_compile
+
+    from tokenspeed.runtime.models.muse_spark import (
+        MUSE_OWNED_QKVG_MIN_TOKENS,
+        QKVOGateParallelLinear,
+    )
+
+    group = tuple(range(world_size))
+    with torch.device(device):
+        projection = QKVOGateParallelLinear(
+            hidden_size=8192,
+            head_size=64,
+            total_num_heads=128,
+            total_num_kv_heads=16,
+            quant_config=None,
+            prefix="model.layers.1.self_attn.qkv_proj",
+            tp_rank=rank,
+            tp_size=world_size,
+            tp_group=group,
+            replicate_for_owned_rows=True,
+        )
+    group, state = _prepare_muse_backend(world_size, projection, None)
+    full_weights = {}
+    expected_columns = []
+    for index, (name, width) in enumerate(
+        (("q", 8192), ("k", 1024), ("v", 1024), ("g", 8192))
+    ):
+        weight = torch.zeros(width, 8192, device=device)
+        columns = (torch.arange(width, device=device) * 13 + index * 17) % 8192
+        weight[torch.arange(width, device=device), columns] = 1
+        full_weights[name] = weight
+        projection.weight_loader(projection.weight, weight, name)
+        expected_columns.append(
+            columns[rank * (width // world_size) : (rank + 1) * (width // world_size)]
+        )
+    expected_columns = torch.cat(expected_columns)
+    parameter_pointer = projection.weight.data_ptr()
+    local_pointer = projection._local_weight().data_ptr()
+
+    angles = torch.arange(16384, device=device, dtype=torch.float32)[:, None] / (
+        torch.arange(32, device=device, dtype=torch.float32)[None, :] + 1
+    )
+    rope = torch.cat((angles.cos(), angles.sin()), dim=1)
+    nope = torch.empty((1, 0), device=device, dtype=torch.float32)
+    eps, q_scale = 1e-5, 5.4730064863875
+    norm = HeadNorm(
+        torch.full((64,), q_scale, device=device, dtype=torch.float32),
+        torch.ones((64,), device=device, dtype=torch.float32),
+        0.0,
+        eps,
+    )
+
+    def make_inputs(rows):
+        local_rows = (rows + world_size - 1) // world_size
+        first = rank * local_rows
+        valid = min(local_rows, rows - first)
+        full = (
+            (
+                torch.arange(rows, device=device)[:, None] % 13
+                + torch.arange(8192, device=device)[None, :] % 7
+            )
+            / 16
+        ).bfloat16()
+        local = torch.full((local_rows, 8192), float("nan"), device=device)
+        local[:valid].copy_(full[first : first + valid])
+        poison = torch.full((rows, 8192), rank + 1, dtype=torch.bfloat16, device=device)
+        positions = (
+            torch.arange(rows, device=device, dtype=torch.int64) * 17 + 31
+        ) % 16384
+        k_cache = torch.empty(
+            (rows, 16 // world_size, 64), dtype=torch.bfloat16, device=device
+        )
+        cache = HeadKVCache(
+            k_cache,
+            torch.empty_like(k_cache),
+            None,
+            torch.arange(rows, device=device, dtype=torch.int64),
+        )
+        return full, local, poison, positions, cache
+
+    inputs = [make_inputs(rows) for rows in (2047, 2048, 8191)]
+
+    def run(item):
+        full, local, poison, positions, cache = item
+        generic = state.all_reduce.acquire_outputs(
+            ((state.reduction.push_max_numel + 8192,),)
+        )[0]
+        generic.fill_(rank + 1)
+        previous = state.reduce_outputs((generic,))[0]
+        fused = reference = None
+        if full.shape[0] >= MUSE_OWNED_QKVG_MIN_TOKENS:
+            projected = projection.project_owned_rows(local, full.shape[0])
+            output = state.all_to_all_transpose_qkvg(projected, full.shape[0])
+            table = rope if full.shape[0] < 4096 else nope
+            q, k, v, gate = output.split(
+                tuple(width // world_size for width in (8192, 1024, 1024, 8192)), dim=-1
+            )
+            prepared = gqa_prologue(
+                q,
+                k,
+                v,
+                norm=norm,
+                rotary=(
+                    Rotary(table, positions, RopeStyle.GPTJ, None)
+                    if table.shape[1]
+                    else None
+                ),
+                cache=cache,
+                return_kv=True,
+                solution="triton",
+                override=None,
+            )
+            reference = (prepared.q, prepared.k, prepared.v, gate)
+            projected = projection.project_owned_rows(local, full.shape[0])
+            if rank == full.shape[0] % world_size:
+                torch.cuda._sleep(20000)
+            fused = state.all_to_all_transpose_qkvg_norm_rope(
+                projected, full.shape[0], positions, table, eps, q_scale
+            )
+        else:
+            normalized = state.all_gather_owned_rows(local, full.shape[0], True)
+            output, _ = projection(normalized)
+        # O's next producer can overwrite every old QKVG source address.
+        reduced = state.reduce_scatter_owned_rows(poison)
+        gathered = state.all_gather_owned_rows(reduced, full.shape[0], True)
+        return output, gathered, previous, fused, reference
+
+    def sequence():
+        return [run(item) for item in inputs]
+
+    sequence()
+    state.row_gather_flags.fill_(2**32 - 2)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = sequence()
+    for replay in range(4):
+        gain = 2 ** (replay + 1)
+        for name, weight in full_weights.items():
+            weight.mul_(2)
+            projection.weight_loader(projection.weight, weight, name)
+        assert projection.weight.data_ptr() == parameter_pointer
+        assert projection._local_weight().data_ptr() == local_pointer
+        for full, local, _, positions, _ in inputs:
+            positions.add_(97).remainder_(16384)
+            full.add_(1 / 16)
+            first = rank * local.shape[0]
+            valid = min(local.shape[0], full.shape[0] - first)
+            local[:valid].copy_(full[first : first + valid])
+        if rank == replay:
+            torch.cuda._sleep(10000)
+        graph.replay()
+        for (full, *_), (output, gathered, previous, fused, reference) in zip(
+            inputs, outputs
+        ):
+            if fused is not None:
+                for actual, expected in zip(fused, reference):
+                    assert actual.is_contiguous() and bool(torch.isfinite(actual).all())
+                    torch.testing.assert_close(
+                        actual.view(torch.int16),
+                        expected.view(torch.int16),
+                        rtol=0,
+                        atol=0,
+                    )
+            expected = full.index_select(1, expected_columns) * gain
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            torch.testing.assert_close(
+                gathered,
+                torch.full_like(gathered, world_size * (world_size + 1) // 2),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                previous,
+                torch.full_like(previous, world_size * (world_size + 1) // 2),
+                rtol=0,
+                atol=0,
+            )
+        small = inputs[0][0][:4].contiguous()
+        small_output, _ = projection(small)
+        torch.testing.assert_close(
+            small_output,
+            small.index_select(1, expected_columns) * gain,
+            rtol=0,
+            atol=0,
+        )
+    with assert_no_triton_compile(
+        iris_a2a_transpose_qkvg, iris_fused_a2a_transpose_qkvg_norm_rope
+    ):
+        for rows in (2051, 8190):
+            output, _, _, fused, reference = run(make_inputs(rows))
+            for actual, expected in zip(fused, reference):
+                torch.testing.assert_close(
+                    actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
+                )
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
+def _muse_routed_lamport_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_lamport_bf16_allreduce,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
+        iris_fused_lamport_allreduce_routed_rmsnorm_sum,
+        iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum,
+    )
+    from tokenspeed_kernel.ops.moe._triton.routed_norm import (
+        triton_routed_input_scale_rmsnorm_sum_gathered,
+    )
+    from utils import assert_no_triton_compile
+
+    state = _muse_state(rank, device, 8192, True)
+    raw_inputs = [
+        torch.empty(count, dtype=torch.bfloat16, device=device)
+        for count in (43 * 4096, 512, 3 * 4096)
+    ]
+    raw_outputs = [torch.empty_like(value) for value in raw_inputs]
+
+    def raw(index):
+        value = raw_inputs[index]
+        iris_lamport_bf16_allreduce[(value.numel() // 512,)](
+            value,
+            state.reduction.lamport_region,
+            raw_outputs[index],
+            state.reduction.lamport_epochs,
+            state.reduction.lamport_peer_addresses[:world_size],
+            RANK=rank,
+            WORLD_SIZE=world_size,
+            total_elements=value.numel(),
+            MAX_ELEMENTS=state.reduction.lamport_max_numel,
+            NUM_STAGES=3,
+            num_warps=1,
+        )
+
+    state.all_reduce.producer_pull.ready_flags.fill_(-4)
+    state.all_reduce.peers.ctx.device_barrier()
+    for rows in (16, 43, 1, 17):
+        torch.manual_seed(1300 + rows)
+        values = torch.randn(rows * 8, 4096, device=device).bfloat16()
+        routes = torch.empty_like(values)
+        mapping = torch.empty(rows * 8, dtype=torch.int32, device=device)
+        weights = torch.rand(rows, 8, device=device)
+        weights /= weights.sum(-1, keepdim=True)
+        norm = torch.randn(4096, device=device).bfloat16() * 0.1
+        indices = torch.arange(rows * 8, dtype=torch.int32, device=device)
+
+        def update(phase):
+            owner = (indices + phase) % (world_size - 1 if phase == 3 else world_size)
+            mapping.copy_(torch.where(owner == rank, indices, -1))
+            routes.copy_(
+                torch.where((owner == rank)[:, None], values * (phase + 1), torch.nan)
+            )
+            for value in raw_inputs:
+                value.fill_((rank + 1) * (phase + 1) / 16)
+                value[0] = -0.0
+
+        def run():
+            raw(0)
+            if rank == 0:
+                torch.cuda._sleep(20000)
+            actual = state.all_reduce_routed_rmsnorm_sum(
+                routes, mapping, rows, 8, weights, norm, 1e-5, 1.0
+            ).clone()
+            raw(1)
+            if rows > 16:
+                local = state.all_reduce.producer.data[: rows * 4096].view(rows, 4096)
+                triton_routed_input_scale_rmsnorm_sum_gathered(
+                    routes,
+                    mapping,
+                    rows,
+                    8,
+                    weights,
+                    norm,
+                    1e-5,
+                    1.0,
+                    False,
+                    local,
+                )
+                expected = state.reduction.run(
+                    local,
+                    state.gather.output[: rows * 4096].view(rows, 4096),
+                    rows * 4096,
+                ).clone()
+            else:
+                iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum[(rows,)](
+                    routes,
+                    mapping,
+                    weights,
+                    norm,
+                    state.all_reduce.producer.data,
+                    state.gather.output,
+                    state.all_reduce.producer_pull.ready_flags,
+                    state.all_reduce.peers.addresses[:world_size],
+                    rank=rank,
+                    width=4096,
+                    row_stride=routes.stride(0),
+                    topk=8,
+                    eps=1e-5,
+                    weight_offset=1.0,
+                    block=4096,
+                    num_warps=8,
+                )
+                expected = state.gather.output[: rows * 4096].view(rows, 4096).clone()
+            raw(2)
+            return actual, expected
+
+        update(0)
+        if rows in (16, 43):
+            run()
+        else:
+            with assert_no_triton_compile(
+                iris_fused_lamport_allreduce_routed_rmsnorm_sum
+            ):
+                run()
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual, expected = run()
+        for phase in range(4):
+            update(phase)
+            if rank == phase % world_size:
+                torch.cuda._sleep(20000)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert bool(torch.isfinite(actual).all())
+            torch.testing.assert_close(
+                actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
+            )
+            for output in raw_outputs:
+                reference = torch.full_like(
+                    output, (world_size * (world_size + 1) // 2) * (phase + 1) / 16
+                )
+                reference[0] = 0.0
+                torch.testing.assert_close(output, reference, rtol=0, atol=0)
+        dist.barrier()
+
+
+def _muse_owned_routed_wt_worker(rank, world_size, device):
+    torch.set_grad_enabled(False)
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
+        iris_routed_rmsnorm_weighted_sum_write_through,
+    )
+    from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
+        iris_pull_reduce_scatter,
+    )
+    from tokenspeed_kernel.ops.moe import (
+        routed_input_scale_rmsnorm_sum,
+        routed_input_scale_rmsnorm_sum_gathered,
+    )
+    from tokenspeed_kernel.platform import pdl_enabled
+    from utils import assert_no_triton_compile
+
+    from tokenspeed.runtime.models.muse_spark import MuseSparkMoE, MuseSparkRMSNorm
+
+    group = tuple(range(world_size))
+    torch.manual_seed(181)
+    norm = torch.randn(4096, device=device, dtype=torch.bfloat16) / 8
+    moe = MuseSparkMoE.__new__(MuseSparkMoE)
+    torch.nn.Module.__init__(moe)
+    moe.iris_state = None
+    moe.pre_expert_proj = None
+    moe.post_expert_proj = None
+    moe.ep_group, moe.ep_size, moe.topk = group, world_size, 8
+    moe.post_expert_norm = MuseSparkRMSNorm(4096, 1e-8, True, 1.0)
+    moe.post_expert_norm.weight = torch.nn.Parameter(norm)
+    group, state = _prepare_muse_backend(world_size, None, moe)
+
+    def inputs(rows):
+        torch.manual_seed(rows + rank * 17)
+        original = torch.randn(rows * 8, 4096, device=device, dtype=torch.bfloat16)
+        local_rows = (rows + world_size - 1) // world_size
+        return dict(
+            rows=rows,
+            original=original,
+            routes=torch.empty_like(original),
+            index=torch.arange(rows * 8, device=device, dtype=torch.int32),
+            mapping=torch.empty(rows * 8, device=device, dtype=torch.int32),
+            weights=torch.full((rows, 8), 0.125, device=device),
+            packet=torch.empty(local_rows, 4096, device=device, dtype=torch.bfloat16),
+            ids=torch.zeros(local_rows, 8, device=device, dtype=torch.int32),
+            scores=torch.ones(local_rows, 8, device=device),
+            attention=torch.empty(rows, 8192, device=device, dtype=torch.bfloat16),
+        )
+
+    def update(case, step):
+        owner = (case["index"] + step) % (world_size - 1 if step == 2 else world_size)
+        case["mapping"].copy_(torch.where(owner == rank, case["index"], -1))
+        case["routes"].copy_(
+            torch.where(
+                (owner == rank)[:, None],
+                case["original"] * (1 + step / 8),
+                torch.nan,
+            )
+        )
+        case["packet"].fill_((rank + 1) * (step + 1) / 8)
+        case["attention"].fill_((rank + 1) * (step + 1) / 16)
+
+    def reference(routes, mapping, rows, weights):
+        norm = moe.post_expert_norm
+        if mapping is None:
+            combined = routed_input_scale_rmsnorm_sum(
+                routes,
+                weights,
+                norm.weight,
+                norm.eps,
+                norm.weight_offset,
+                pdl_enabled(),
+            )
+            output = state.all_reduce.acquire_outputs((tuple(combined.shape),))[0]
+            output.copy_(combined)
+        else:
+            output = state.all_reduce.acquire_outputs(((rows, 4096),))[0]
+            routed_input_scale_rmsnorm_sum_gathered(
+                routes,
+                mapping,
+                rows,
+                8,
+                weights,
+                norm.weight,
+                norm.eps,
+                norm.weight_offset,
+                pdl_enabled(),
+                output,
+            )
+        return state.reduce_scatter_owned_rows(output).clone()
+
+    def run(case):
+        rows = case["rows"]
+        expected = reference(case["routes"], case["mapping"], rows, case["weights"])
+        producer = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
+        producer.copy_(case["attention"])
+        state.reduce_scatter_owned_rows(producer)
+        local_rows = (rows + world_size - 1) // world_size
+        valid = max(0, min(local_rows, rows - rank * local_rows))
+        packet, _, _ = state.gather_owned_moe_inputs(
+            case["packet"], case["ids"], case["scores"], rows, valid
+        )
+        if rank == rows % world_size:
+            torch.cuda._sleep(20000)
+        actual = moe._reduce_expert_routes(
+            case["routes"], case["mapping"], rows, case["weights"], owned_rows=True
+        ).clone()
+        upper = state.acquire_owned_post_expert_output(rows, 8192)
+        upper[:, :4096].copy_(actual)
+        upper[:, 4096:].copy_(actual * 2)
+        full = state.all_gather_owned_rows(upper, rows, False)
+        return expected, actual, packet, full
+
+    cases = [inputs(rows) for rows in (192, 193, 8191)]
+    for case in cases:
+        update(case, 0)
+        run(case)
+    for flags in (state.row_scatter_flags, state.row_gather_flags):
+        flags.view(torch.int32).fill_(-2)
+    state.all_reduce.peers.ctx.device_barrier()
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        saved = [run(case) for case in cases]
+    for step in range(4):
+        for case in cases:
+            update(case, step)
+        graph.replay()
+        for case, (expected, actual, packet, full) in zip(cases, saved):
+            torch.testing.assert_close(
+                actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
+            )
+            rows = case["rows"]
+            local_rows = (rows + world_size - 1) // world_size
+            valid = max(0, min(local_rows, rows - rank * local_rows))
+            torch.testing.assert_close(
+                actual[valid:], torch.zeros_like(actual[valid:]), rtol=0, atol=0
+            )
+            owner = torch.arange(rows, device=device) // local_rows
+            torch.testing.assert_close(
+                packet,
+                ((owner + 1) * (step + 1) / 8)
+                .to(torch.bfloat16)[:, None]
+                .expand_as(packet),
+                rtol=0,
+                atol=0,
+            )
+            first = rank * local_rows
+            torch.testing.assert_close(
+                full[first : first + valid, :4096], actual[:valid], rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                full[first : first + valid, 4096:],
+                (actual * 2)[:valid],
+                rtol=0,
+                atol=0,
+            )
+    unseen = inputs(2051)
+    update(unseen, 0)
+    with assert_no_triton_compile(
+        iris_routed_rmsnorm_weighted_sum_write_through, iris_pull_reduce_scatter
+    ):
+        expected, actual, _, _ = run(unseen)
+        torch.testing.assert_close(
+            actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
+        )
+    moe.post_expert_norm.weight_offset = 0.0
+    expected, actual, _, _ = run(unseen)
+    torch.testing.assert_close(
+        actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
+    )
+    # The unmapped BF16 layer retains the portable producer and release path.
+    dense = cases[1]["original"].view(193, 8, 4096)
+    expected = reference(dense, None, 193, cases[1]["weights"])
+    actual = moe._reduce_expert_routes(
+        dense, None, 193, cases[1]["weights"], owned_rows=True
+    )
+    torch.testing.assert_close(
+        actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
+    )
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
+@pytest.mark.parametrize(
+    "check,backend",
+    [
+        pytest.param(
+            partial(_muse_boundary_worker, sharded=False), "nccl", id="boundary_push"
+        ),
+        pytest.param(
+            partial(_muse_boundary_worker, sharded=True), "nccl", id="boundary_scatter"
+        ),
+        pytest.param(_muse_collective_policy_worker, "nccl", id="collective_policy"),
+        pytest.param(_muse_owned_packet_worker, "gloo", id="owned_packets"),
+        pytest.param(_muse_owned_qkvg_worker, "nccl", id="qkvg_reload_and_receiver"),
+        pytest.param(_muse_routed_lamport_worker, "nccl", id="routed_lamport"),
+        pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
+    ],
+)
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_muse_collective_replay(check, backend, world_size):
+    _skip_if_unsupported(world_size, "Muse collective replay")
+    if not current_platform().is_cdna4:
+        pytest.skip("Muse collectives require CDNA4")
+    _spawn_and_collect(
+        _communication_worker,
+        (world_size, _get_open_port(), check, backend),
+        world_size,
+    )

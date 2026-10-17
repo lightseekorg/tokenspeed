@@ -18,6 +18,15 @@ The fused dispatch policy (`fused/moe.py`) is the top of the funnel: it calls
 `M >= 9`, staged MFMA decode), so the kernel dependency arrow points from
 `fused/` to the staged files, never back.
 
+Both direct decode and E2M1 package prefill accept token-ordered, prequantized
+activations. Package prefill reuses their packed data and gathers the existing
+CDNA4 scales into route order instead of quantizing the BF16 input again.
+
+Route-tiled GEMMs group each expert's routes into small tiles described by
+`(start, count, expert)`. Both GEMMs reuse these descriptors and preserve
+token/slot order for intermediates and outputs. Matrix dimensions, top-k and
+expert counts are explicit kernel parameters.
+
 For the staged package's second GEMM, TP uses direct BF16 atomic accumulation
 through 2048 tokens with E2M1 activations (64 with E4M3), and scratch-plus-FP32
 reduction at larger sizes. E2M1 atomics use adjacent column pairs per lane and
@@ -33,12 +42,14 @@ owns only a sparse subset of the routed experts.
 | --- | --- |
 | `__init__.py` | Package exports: the stage invokers, the top-k route entries, the prefill weight aliases, and the scale gather. |
 | `prefill_stage1.py` / `prefill_stage2.py` | Block-ragged MXFP4/MXFP8-activation, MXFP4-weight prefill GEMMs (gdot128-preshuffled weights). |
-| `decode_stage1.py` / `decode_stage2.py` | A4W4 direct-MFMA decode kernels plus their invokers: stage 1 fuses SwiGLU, stage 2 fuses the routed-weight top-k combine. |
+| `decode_stage1.py` / `decode_stage2.py` | A4W4 direct and route-tiled MFMA GEMMs. Stage 1 fuses SwiGLU and optional quantization; deferred execution preserves individual stage-2 route outputs. |
 | `decode_common.py` | Direct CDNA4 MFMA primitives shared by both decode stages: tile addressing, MXFP4 operand loads, `mfma_scaled`, and the compact scaled-upcast scale tile `situ_decode.py` reuses. |
 | `routing.py` | Fused dense top-k route kernels (softmax, sigmoid-bias, and a prefill variant); output is top-k only, **not** ragged metadata (contrast `fused/routing.py`). |
-| `moe_sorting.py` | Block-aligned expert sort feeding the package prefill stages. |
+| `moe_sorting.py` | Block-aligned expert sort for grouped GEMMs and route descriptors for route-tiled GEMMs. |
 | `situ_decode.py` / `situ_grouped.py` | A16W4 in-situ expert-parallel paths: route-direct warp decode reads linear or gdot128 weights, while the contiguous-EP grouped GEMM reads linear weights. |
 | `latent_shared_decode.py` | Latent shared-expert decode entry. |
+| `n16_weights.py` | N16 expert bank shared by the N16 pipelines (`mxfp4_gemm.py`, `prefill_mxfp8.py` / `mxfp8_gemm.py`, N16 `situ_decode.py`): lane-ordered 1 KiB blocks of 64-byte K chunks per 16-row group, word-packed scales, checkpoint-update loaders. |
+| `mxfp4_gemm.py` | Dynamic-MXFP4-activation (A4W4) SiLU experts on N16 weights, the E2M1 counterpart of `mxfp8_gemm.py`: quantization with a fused decode route sort, gate/up GEMM with fused SiLU-and-mul and MXFP4 requantization, down GEMM, slot-order combine (all batch sizes). |
 | `quantize_gluon.py` | Leaf Gluon helpers for MXFP4/MXFP8 tile quantization and CDNA4 scale stores shared by staged and fused kernels. |
 | `scale_layout.py` | Single source of truth for the CDNA4 MXFP4 scale swizzle (constants, swizzle/predicate/allocator helpers). Leaf module: torch only. |
 | `scale.py` | Activation-scale gather into sorted-route order for the package stages. |
@@ -59,7 +70,7 @@ Organized by approach; every module states which regime owns it:
 | `routing.py` | Single-launch route kernels emitting full ragged metadata + gather/scatter + gate scales; torch references; capability predicates. |
 | `quantize.py` | FP8 and dynamic-MXFP4 activation quantization (optionally fused with routed gather). |
 | `launch.py` | Host launch marshaling for the pipelined kernel; AMDGCN static-profile / spill checks. |
-| `tuning.py` | Block autotuning and launch heuristics. |
+| `tuning.py` | Shape-based grouped MoE configurations, block autotuning and launch heuristics. |
 | `_common.py` / `_layouts.py` | Shared host floor (constants, ragged helpers, wrapped-tensor extraction) and shared constexpr layout factories / device helpers. |
 
 The same-named file at both levels is deliberate: each fills the

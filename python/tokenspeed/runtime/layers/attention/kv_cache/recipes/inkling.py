@@ -131,10 +131,8 @@ class InklingRecipe(CacheRecipe):
             (
                 CacheGroupSpec(
                     group_id=group_id,
-                    retention="full_history",
+                    attn_kind="state",
                     sliding_window_tokens=None,
-                    family="state",
-                    checkpoint_granularity=self.prefix_granularity,
                     replayable=False,
                 ),
                 fields,

@@ -20,22 +20,22 @@ Runs on the released config (layer-truncated, experts shrunk; see
 ``inkling_fixtures``) with dummy weights. Requires Blackwell (FA4).
 """
 
-import math
 import os
 import sys
-import unittest
 
+import pytest
 import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ci_system.ci_register import register_cuda_ci  # noqa: E402
-from runtime.models.inkling_fixtures import (  # noqa: E402
+from test.runtime.models.inkling_fixtures import (  # noqa: E402
     INKLING_BF16,
     NUM_TEST_EXPERTS,
     load_inkling_config,
     truncation_hf_overrides,
 )
+
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(
     est_time=90,
@@ -193,10 +193,12 @@ def _reference_forward(model, text, input_ids: list[int]) -> torch.Tensor:
     return logits.log_softmax(-1)  # [T, V]: next-token logprobs per position
 
 
-@unittest.skipUnless(_has_blackwell(), "Inkling parity needs a Blackwell GPU (FA4)")
-class TestInklingReferenceParity(unittest.TestCase):
+@pytest.mark.skipif(
+    not (_has_blackwell()), reason=("Inkling parity needs a Blackwell GPU (FA4)")
+)
+class TestInklingReferenceParity:
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         # Torch MoE experts in BOTH the engine and the replica so parameter
         # shapes/values coincide (MoELayer stores backend-specific layouts).
         os.environ["INKLING_TORCH_MOE"] = "1"
@@ -245,7 +247,7 @@ class TestInklingReferenceParity(unittest.TestCase):
             output_lps = meta["output_token_logprobs"]
         finally:
             engine.shutdown()
-        self.assertEqual(len(output_lps), DECODE_STEPS)
+        assert (len(output_lps)) == (DECODE_STEPS)
 
         model, text = _build_replica()
         # One reference forward over prompt + engine trajectory gives
@@ -261,20 +263,21 @@ class TestInklingReferenceParity(unittest.TestCase):
         # append, SWA windows).
         for s, entry in enumerate(output_lps):
             lp, tid = float(entry[0]), int(entry[1])
-            self.assertEqual(tid, int(engine_ids[s]))
+            assert (tid) == (int(engine_ids[s]))
             pos = len(PROMPT_IDS) + s - 1
             diffs.append(abs(float(ref[pos, tid]) - lp))
 
-        self.assertEqual(len(diffs), DECODE_STEPS)
+        assert (len(diffs)) == (DECODE_STEPS)
         max_diff = max(diffs)
         # bf16 kernels vs fp32-accum reference across the whole stack.
-        self.assertLess(
-            max_diff,
-            2e-2,
+        _pytest_a_1 = max_diff
+        _pytest_b_2 = 2e-2
+        _pytest_msg_3 = (
             f"max |ref - engine| logprob diff {max_diff:.4e} over "
-            f"{len(diffs)} positions (all diffs: {[f'{d:.1e}' for d in diffs]})",
+            f"{len(diffs)} positions (all diffs: {[f'{d:.1e}' for d in diffs]})"
         )
+        assert _pytest_a_1 < _pytest_b_2, _pytest_msg_3
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

@@ -24,7 +24,7 @@ import pytest
 import torch
 from tokenspeed_kernel import compile_monitor
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
-from tokenspeed_kernel.ops.gemm.ll_bf16 import ll_bf16_router_supported
+from tokenspeed_kernel.ops.gemm.cute_dsl import ll_bf16_router_supported
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_router
 

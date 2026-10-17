@@ -43,7 +43,9 @@ tokenspeed serve <model> \
 | `--dense-tp-size` | Dense layer tensor parallel size. Defaults to the attention TP width: the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | MoE layer tensor parallel size. |
 | `--data-parallel-size` | Replicated data-parallel groups. |
-| `--kv-parallel-size` | KV parallelism: shard the full-history KV pages over a consecutive subgroup of attention TP (see "KV parallelism" below). |
+| `--kv-parallel-size` | KV parallelism: shard the full-history KV pages over a consecutive subgroup of attention TP on a PD prefill or decode engine (see "KV parallelism" below). |
+| `--decode-context-parallel-size` | Decode context parallelism: the decode role's compute over the sharded pages; required with and equal to `--kv-parallel-size` there. |
+| `--query-context-parallel-size` | Query context parallelism: the prefill role's query-row sharding over the sharded pages; equal to `--kv-parallel-size` and `--attn-tp-size` (see "Query context parallelism" below). |
 | `--mm-encoder-tp-mode` | `weights` (default), or TP1 whole-item DP within each attention TP group (`data`). |
 | `--enable-expert-parallel` | Expert parallelism across the selected world size. |
 | `--expert-parallel-size` | Explicit expert parallel size. |
@@ -64,7 +66,7 @@ instead. Three knobs shard those weights over contiguous groups of DP ranks
 
 | Parameter | Use |
 | --- | --- |
-| `--attn-head-tp-size W` | Shard `q_b_proj`, `kv_b_proj` and `o_proj` by heads over `W` contiguous ranks that hold different rows. Over DP ranks: requires attention TP 1, attention DP, `W` dividing the stage world, `num_heads % W == 0`, and a decode engine (`--disaggregation-mode decode`). Over the query shards of a prefill engine: `W` equal to `--prefill-context-parallel-size` (see [Query context parallelism](#query-context-parallelism-on-the-prefill-role)). |
+| `--attn-head-tp-size W` | Shard `q_b_proj`, `kv_b_proj` and `o_proj` by heads over `W` contiguous ranks that hold different rows. Over DP ranks: requires attention TP 1, attention DP, `W` dividing the stage world, `num_heads % W == 0`, and a decode engine (`--disaggregation-mode decode`). Over the query shards of a prefill engine: `W` equal to `--query-context-parallel-size` (see [Query context parallelism](#query-context-parallelism-on-the-prefill-role)). |
 | `--lm-head-tp-size W` | Vocab-shard the LM head over `W` contiguous ranks. Under attention DP the default is 1 (replicated); without attention DP it must equal the attention TP size (today's layout). |
 | `--dense-tp-size W` | Already shards the dense MLPs over `W` ranks (token all-gather in, token reduce-scatter out). |
 | `--tp-batch-invariant {none,attn,attn+dense}` | Make the sharded `o_proj` (`attn`) and dense `down_proj` (`attn+dense`) column-parallel on hidden so no cross-rank sum remains outside MoE; see below. |
@@ -220,9 +222,9 @@ tail, so the extra dimensions do not change the MoE result. For example,
 TokenSpeed pads a 640-wide expert under MoE TP4 from 160 to 192 values per
 rank. TokenSpeed zero-pads BF16 SiLU/SwiGLU expert shards the same way to a
 multiple of 64 (128 when it cannot adapt the installed FlashInfer launcher,
-or when FlashInfer's JIT cannot build the adapted one, for example without
-nvcc). For example, Qwen3-30B-A3B's 768-wide experts need no padding under
-MoE TP4 (192 per rank), while TokenSpeed pads a 96-wide shard to 128.
+or when FlashInfer's JIT cannot build the adapted one). For example,
+Qwen3-30B-A3B's 768-wide experts need no padding under MoE TP4 (192 per
+rank), while TokenSpeed pads a 96-wide shard to 128.
 
 On Hopper, MXFP4 routed experts with a SiLU/SwiGLU activation and dense EP
 (`--all2all-backend none`) default to the FlashInfer CUTLASS mixed-input
@@ -634,12 +636,16 @@ things:
 - **DCP** (decode context parallelism) is the *decode-side compute* over KVP
   pages: every rank keeps all of its query heads, attends only the pages it
   owns, and the partial outputs are merged across the KVP group by their
-  log-sum-exp (LSE). The attention backends' decode algorithms, their kernels
-  and the LSE-merge code carry the DCP name.
+  log-sum-exp (LSE). `--decode-context-parallel-size N` names it on the PD
+  decode role, where it is the only way to read a sharded cache (so the
+  decode role requires it with `--kv-parallel-size N`, equal); the attention
+  backends' decode algorithms, their kernels and the LSE-merge code carry the
+  DCP name and key on `kvp_size`, which the drafter's steps on a sharded
+  prefill engine take as well.
 - **QCP** (query context parallelism) is the *prefill-side* sharding of the
   query rows over the attention TP group against the full, gathered KV
-  history; there is no LSE merge. `--prefill-context-parallel-size` selects
-  it (next section).
+  history; there is no LSE merge. `--query-context-parallel-size` selects
+  it on the PD prefill role (next section).
 
 `--kv-parallel-size N` must divide `--attn-tp-size`; the KVP subgroups are
 aligned runs of `N` consecutive attention-TP ranks. It applies to the
@@ -649,16 +655,22 @@ compressor state) stay replicated. The attention backend decides how it
 attends the sharded pages (DCP decode, chunked or gathered prefill history);
 the scheduler plans the same virtual blocks on every rank and the runtime
 translates ownership where it reads, writes or copies them
-(`docs/design/cache-concepts.md`). Allowed on aggregated engines and on the PD
-prefill role (every rank of the subgroup sends the pages it owns to an
-unsharded decode engine), with the Host KVStore and the retraction snapshot
-pool; not yet on the decode role or with L3 storage. The full rule set,
-including the per-backend speculation limits, is in
+(`docs/design/cache-concepts.md`). PD roles only: a prefill engine (with or
+without a query shard) and a decode engine (with `--decode-context-parallel-size`)
+each shard their cache independently (a transfer edge copies the pages its
+prefill rank and its decode rank both own); an aggregated engine does not
+shard, since its steady-state decode would be DCP. Works with the Host
+KVStore and the retraction snapshot pool; not yet with L3 storage.
+Speculative decoding runs on a sharded cache with the backends whose DCP
+decode takes a verify window (FlashMLA, CuTe MLA, GPU DSA); the draft group
+shards like the target's. A FlashMLA verify under KVP runs one kernel row per
+query against that query's local causal length, so a width-`w` window reads
+each request's owned pages `w` times instead of once. The full rule set is in
 `docs/configuration/server.md`.
 
 ## Query context parallelism on the prefill role
 
-`--prefill-context-parallel-size N` (QCP) splits every extend forward's rows
+`--query-context-parallel-size N` (QCP) splits every extend forward's rows
 over the attention TP group of a PD prefill engine: rank `r` computes the
 batch-global contiguous rows `[sum(c[:r]), sum(c[:r+1]))` of the chunk, with
 `c` the same uneven split the reduce-scatter / all-gather communication path
@@ -679,17 +691,18 @@ rows (one per request) before the LM head. Every QCP collective is data
 movement, so a row's bits do not depend on which rank computes it
 (`docs/design/numerics.md`).
 
-Requirements: `N == --attn-tp-size`, `--disaggregation-mode prefill`,
-`--disable-prefill-graph`, attention DP 1, no `--enable-mixed-batch`, a
-DSA-family attention backend (GPU DSA) with a bf16 KV cache, `--dense-tp-size`
-and the MoE TP×EP group each 1 or `N` (attention returns complete rows, so
-the drafter's replicated decode rows are never scattered and a narrower group
-would have nothing to gather), and `--kv-parallel-size` 1 or `N`
-(a KV-page-sharded engine may keep the Host KVStore and the retraction
-snapshot pool -- every Host block sits in its Device block's residue class and
-each rank copies the blocks it owns -- but not L3 storage, whose keys have no
-owner-stable form under sharding). The drafter's extend step is sharded like
-the target's; its decode steps run every row on every rank.
+Requirements: `--disaggregation-mode prefill` with `--kv-parallel-size N`
+(the query shard is a layout over the sharded pages; the engine keeps the
+Host KVStore and the retraction snapshot pool but not L3 storage, as every
+KVP engine does), `N == --attn-tp-size`, attention DP 1, no
+`--enable-mixed-batch`, GPU DSA attention with a bf16 KV cache (checked where
+the attention config is built), and `--dense-tp-size` and the MoE TP×EP group
+each 1 or `N` (attention returns complete rows, so the drafter's replicated
+decode rows are never scattered and a narrower group would have nothing to
+gather). The prefill stays eager: the GPU DSA backend declares no prefill
+graph under a shard, so the launch need not say `--disable-prefill-graph`.
+The drafter's extend step is sharded like the target's; its decode steps run
+every row on every rank.
 
 **Head TP over the query shards.** Without `--attn-head-tp-size` the shard
 group's ranks hold different rows and every rank holds every head of
@@ -716,7 +729,7 @@ hidden shards under `--tp-batch-invariant attn`). The expanded (dense MLA)
 prefill still refuses head TP; the layout serves the absorbed sparse prefill
 only. The decode-only rules of the DP layout (role, decode-shaped autotune)
 do not apply: the prefill role's rules above and
-`--attn-head-tp-size == --prefill-context-parallel-size` gate it.
+`--attn-head-tp-size == --query-context-parallel-size` gate it.
 
 Memory: the head-shardable weights of one attention instance go from the
 whole matrices to `1 / N` of them per rank. For a model with hidden 8192, 64
@@ -728,14 +741,10 @@ cache takes.
 
 Numerics: with row-parallel `o_proj` the shard group computes the same
 per-rank head partials the plain TP8 prefill engine does and reduce-scatters
-them where TP8 all-reduces. The bits agree only when both engines sum in the
-same order. Under `--numerics rl-bitwise` the reduce-scatter always takes the
-ordered fold while an all-reduce takes the in-switch reduction where
-multicast reaches (an order that is per GPU set). Pin the TP8 engine to the
-fold with `--force-deterministic-rsag` for the two to be bitwise. The QCP
-engine's own drafter decode steps all-reduce `o_proj`
-(replicated rows). `--force-deterministic-rsag` on it pins them to the fold
-as well. With `--tp-batch-invariant attn` there is no cross-rank sum in
+them where TP8 all-reduces. Under `--numerics rl-bitwise` both are the
+rank-ordered fold, so the two engines sum `o_proj` bitwise alike, and so do
+the QCP engine's own drafter decode steps (replicated rows, all-reduced).
+With `--tp-batch-invariant attn` there is no cross-rank sum in
 `o_proj`, and QCP is bitwise the TP1 / head-replicated form the decode
 engine's batch-invariant layout computes (`docs/design/numerics.md`, "Layout
 invariance of query context parallelism").
@@ -747,9 +756,8 @@ batch-invariant `o_proj`:
 tokenspeed serve <dsa-model> \
   --disaggregation-mode prefill \
   --attn-tp-size 8 --dense-tp-size 1 --enable-expert-parallel \
-  --prefill-context-parallel-size 8 \
+  --kv-parallel-size 8 --query-context-parallel-size 8 \
   --attn-head-tp-size 8 --tp-batch-invariant attn \
-  --disable-prefill-graph \
   --chunked-prefill-size 16384
 ```
 
@@ -883,21 +891,18 @@ Cross-node groups arm the full two-shot capacity at startup. Single-node
 groups start at the one-shot window and serve larger shapes once
 model-level preparation widens the shared workspace. Other
 fan-ins and dtypes, and any shape the workspace rejects, fall back to NCCL
-(inside the trtllm backend for armed groups; the Triton all-reduce tier
+(inside the trtllm backend for armed groups; the Iris all-reduce tier
 serves AMD only, where no trtllm workspace exists). Single-node token
 all-gather/reduce-scatter runs on the Triton RSAG backend and uses NCCL
 across nodes. Logits all-gather and distributed argmax use the same
 cross-node fallback. Layouts such as attention DP with dense TP or MoE EP
 spanning nodes need this fallback.
 
-Under `--numerics rl-bitwise` (`--batch-invariant-collectives`) the
-all-reduce on a multicast-reachable group is the NVLS in-switch reduction
-issued by the group's rank 0 through the same RSAG buffers, verified
-bitwise at startup on every group it serves. AutoBackend keeps a kind whose
-groups the switch reduces in different orders (several TP groups of three or
-more GPUs) on the fold and logs it. The reduce-scatters, other payloads
-and unreachable groups take NCCL data movement plus a rank-ordered fp32
-fold, and the gathers stay on the multicast kernels. The distributed argmax
+Under `--numerics rl-bitwise` (`--batch-invariant-collectives`) every
+reduction takes NCCL data movement plus a rank-ordered fp32 fold, and the
+gathers stay on the multicast kernels; the in-switch reduction's order moves
+with a row's offset in the buffer, so it serves only the performance routes.
+The distributed argmax
 and the fused all-reduce kernels are off. `--force-deterministic-rsag` keeps
 every collective on NCCL (reductions on the fold). `AutoBackend.route` is
 the one place that decides. `docs/design/numerics.md` has the measured

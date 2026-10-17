@@ -50,7 +50,6 @@ def _prepare_capacity_scan_kernel(
     VS: tl.constexpr,
     GS: tl.constexpr,
     BS: tl.constexpr,
-    PACKED: tl.constexpr,
     MAX_CHUNKS,
     N_BLOCK: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -59,21 +58,18 @@ def _prepare_capacity_scan_kernel(
     row, col = x // (H * D), x % (H * D)
     live = tl.load(CU + N)
     valid = (row < T) & (row < live)
-    # The packer guarantees Q/K/V/beta padding, but gate projection may turn
-    # padded inputs into NaNs. Always scrub gate while converting it to FP32.
+    # Capacity padding may hold anything (the gate projection turns padded
+    # inputs into NaNs), so every input is copied with its padding scrubbed.
     tl.store(OG + x, tl.load(G + row * GS + col, valid, 0).to(tl.float32), row < T)
-    if not PACKED:
-        tl.store(OQ + x, tl.load(Q + row * QS + col, valid, 0), row < T)
-        tl.store(OK + x, tl.load(K + row * KS + col, valid, 0), row < T)
-        tl.store(OV + x, tl.load(V + row * VS + col, valid, 0), row < T)
-        beta_row, beta_col = x // H, x % H
-        tl.store(
-            OB + x,
-            tl.load(
-                B + beta_row * BS + beta_col, (beta_row < T) & (beta_row < live), 0
-            ),
-            beta_row < T,
-        )
+    tl.store(OQ + x, tl.load(Q + row * QS + col, valid, 0), row < T)
+    tl.store(OK + x, tl.load(K + row * KS + col, valid, 0), row < T)
+    tl.store(OV + x, tl.load(V + row * VS + col, valid, 0), row < T)
+    beta_row, beta_col = x // H, x % H
+    tl.store(
+        OB + x,
+        tl.load(B + beta_row * BS + beta_col, (beta_row < T) & (beta_row < live), 0),
+        beta_row < T,
+    )
     if tl.program_id(0) == 0:
         slot = tl.arange(0, N_BLOCK)
         begin = tl.load(CU + slot, slot < N, 0)
@@ -92,38 +88,27 @@ def _prepare_capacity_scan_kernel(
             )
 
 
-def prepare_capacity_scan(q, k, v, gate, beta, boundaries, inputs_packed: bool):
+def prepare_capacity_scan(q, k, v, gate, beta, boundaries):
     """Return native contiguous inputs and a compact device chunk plan.
 
     Q/K/V/gate have dense features [1, capacity, H, 128]; beta is
     [1, capacity, H]. Live positive sequence lengths come from boundaries.
-    inputs_packed is an explicit producer promise: the checkpoint packer
-    already materialized contiguous Q/K/V/beta and zeroed capacity padding.
-    The false case copies/scrubs every input. Neither case mutates its inputs.
+    Every input is copied with its capacity padding scrubbed; none is mutated.
 
     Returns (q, k, v, gate, beta, cu_chunks, chunk_to_seq). Gate is FP32 and
-    both plan tensors are int32. With inputs_packed, Q/K/V/beta alias the inputs;
-    gate and the device plan are still produced here. The native
+    both plan tensors are int32. The native
     cutedsl_kda_forward_with_prepared_plan adapter defines the chunk bounds.
     """
     _, tokens, heads, dim = q.shape
     sequences = boundaries.numel() - 1
-    if inputs_packed and not all(t.is_contiguous() for t in (q, k, v, beta)):
-        raise ValueError("packed KDA inputs must be contiguous")
     if not all(t.stride(-1) == 1 and t.stride(-2) == dim for t in (q, k, v, gate)):
         raise ValueError("KDA preparation requires dense feature dimensions")
     if beta.stride(-1) != 1:
         raise ValueError("KDA beta requires dense heads")
-    oq, ok, ov, ob = (
-        (q, k, v, beta)
-        if inputs_packed
-        else (
-            torch.empty(q.shape, dtype=q.dtype, device=q.device),
-            torch.empty(k.shape, dtype=k.dtype, device=k.device),
-            torch.empty(v.shape, dtype=v.dtype, device=v.device),
-            torch.empty(beta.shape, dtype=beta.dtype, device=beta.device),
-        )
-    )
+    oq = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    ok = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+    ov = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+    ob = torch.empty(beta.shape, dtype=beta.dtype, device=beta.device)
     og = torch.empty(gate.shape, dtype=torch.float32, device=gate.device)
     count = triton.cdiv(tokens, 16) + sequences - 1
     chunks = torch.empty(sequences + 1, dtype=torch.int32, device=q.device)
@@ -151,7 +136,6 @@ def prepare_capacity_scan(q, k, v, gate, beta, boundaries, inputs_packed: bool):
         VS=v.stride(1),
         GS=gate.stride(1),
         BS=beta.stride(1),
-        PACKED=inputs_packed,
         MAX_CHUNKS=count,
         N_BLOCK=triton.next_power_of_2(sequences),
         BLOCK=1024,

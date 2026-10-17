@@ -5,7 +5,8 @@
 
 Current trigger values:
 
-- `per-commit`
+- `per-commit`: pull requests and pushes to `main`
+- `post-submit`: pushes to `main` only
 - `manual`
 - `nightly`
 - `debug`
@@ -42,10 +43,17 @@ concurrently with unit tests. Matrix entries within
 each stage run in parallel. The workflow treats a stage with no matching tasks
 as successfully satisfied.
 
-`ut-tokenspeed-kernel-part-i` runs tests outside `tokenspeed-kernel/test/ops/`,
-keeping the numerics, TRT-LLM communication and CUDA suites in separate processes.
-`ut-tokenspeed-kernel-part-ii` runs `tokenspeed-kernel/test/ops/`. Together the
-two tasks cover the kernel suite once.
+On NVIDIA runners, `ut-tokenspeed-kernel-part-i` runs tests outside
+`tokenspeed-kernel/test/ops/`, keeping the numerics, TRT-LLM communication and
+CUDA suites in separate processes. `ut-tokenspeed-kernel-part-ii` runs
+`tokenspeed-kernel/test/ops/`. Together the two tasks cover the kernel suite
+once. AMD runners run the same commands in the single `ut-tokenspeed-kernel`
+task.
+
+Conversely, AMD runners split the `runtime-1gpu` suite across
+`ut-runtime-1gpu-part-i` and `ut-runtime-1gpu-part-ii`, which balance test files
+by their registered `est_time` (`run_ci_suite.py --auto-partition-*`). Other
+runners run the whole suite in `ut-runtime-1gpu`.
 
 PRs labeled `high priority` start `unit-test` and `model-test` concurrently.
 Applying the label starts a new CI run immediately and cancels the older run
@@ -67,11 +75,19 @@ tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
 bounded non-thinking chat template for CI stability. The task requires a score
 of at least 0.96.
 
+The AMD variant runs the AMD Quark MXFP4 checkpoint the same way on two MI35x
+GPUs. Its MTP layer is BF16 in the checkpoint, so the draft model runs
+unquantized.
+
 The long-context performance report accepts both current EvalScope metrics
 (`Avg TPOT (ms)`, `Avg Decoded Tok/Iter`) and their older names. Missing or
 invalid TPOT fails collection instead of producing a zero-throughput report.
 Unavailable acceptance metrics appear as `N/A` (empty CSV cells). An aggregate
 is unavailable if any run for that prompt length lacks the metric.
+
+Model performance CSVs support `Throughput (tps/gpu)` and
+`Output Throughput (tok/min/gpu)`. The second value in each `perf_reference`
+pair uses the throughput column's units and token-counting definition.
 
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
@@ -138,10 +154,10 @@ workflows map that to GitHub Actions `continue-on-error`.
 # whole task can fail without blocking the workflow
 optional: true
 
-# only the MI35x 1-GPU entry is non-blocking; other entries of the same
+# only the MI355 1-GPU entry is non-blocking; other entries of the same
 # task still block on failure
 optional:
-  amd-mi35x-1gpu-test: true
+  amd-mi355-1gpu: true
 ```
 
 The NVIDIA PR workflow routes `b200-<Ngpu>` task labels to
@@ -157,6 +173,11 @@ the jobs create the two directories beside that cache instead. This survives
 runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
+
+B200v2 CI stores FlashInfer tactics under `tokenspeed/flashinfer-autotune`
+in the same persistent root as the package cache: an explicit `CI_CACHE_ROOT`,
+the parent of `FLASHINFER_CACHE_DIR`, or `/raid/cache`. An explicit
+`TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR` takes precedence.
 
 CI runner images are expected to provide `ninja`. Runner setup checks for the
 executable and only refreshes apt metadata and installs `ninja-build` when it is
@@ -313,7 +334,7 @@ smoke test. For a meaningful manual comparison, use `K8s Dispatch`: selecting a
 pull request uses its target and head revisions, while selecting a commit
 compares it with the latest `main`. Both revisions always execute serially in one task allocation.
 
-The task requests the ci-infra-managed `amd-mi350-1gpu-bench` runner pool and
+The task requests the ci-infra-managed `amd-mi355-1gpu` runner pool and
 exposes logical device 0. Each allocation must provide one `gfx950` GPU,
 working ROCm device permissions, Git, Bash, Python virtual-environment support,
 sufficient temporary storage, and access to the configured package indexes. The normal AMD
@@ -626,10 +647,10 @@ This is a manual launcher, not a GitHub Actions runner. Override its defaults
 with `TS_CI_ARTIFACT_ROOT`, `TS_CI_CACHE_DIR`, or
 `TS_CI_CONTAINER_IMAGE`.
 
-The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.1rc2 by image digest.
+The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.2 by image digest.
 When upgrading, keep the FlashInfer Python requirement, release cubin checksum,
-and runner JIT-cache version aligned. FlashInfer 0.7.1rc2 also requires
-cuDNN frontend 1.30.0 or newer and splits its JIT cache into provider packages.
+and runner JIT-cache version aligned. FlashInfer 0.7.2 also requires
+cuDNN frontend 1.31.0 or newer and splits its JIT cache into provider packages.
 GB200/B200 setup resolves those providers from the matching FlashInfer CUDA
 index and checks their installed versions again after dependency installation.
 
@@ -739,54 +760,3 @@ attempts 10 seconds apart. Exhausted attempts stop before evaluation. This
 only changes dependency download handling. Retained files, source commit,
 image and test configuration stay unchanged.
 For workflows with one case per GitHub job, use **Re-run failed jobs**.
-
-## PR commands
-
-On an open same-repository PR into `main`, a repository writer can comment
-`@lightseek-bot watch` or `@lightseek-bot fix`.
-
-Completion triggers exclude `main`. Its push CI creates no assistance runs.
-`PR CI Assist Dispatch` handles planner and validation dispatches whose controller
-runs on `main`. Closed PRs and PRs without an active authorized watch/fix skip
-the control job. Other PR completions and comments can still create lightweight
-runs, but ordinary comments skip all jobs and inactive callbacks stop at resolve.
-
-- `watch` follows the current CI plan's selected tasks. Failed tasks get one
-  focused reproduction: NVIDIA uses Slurm GB200, then compatible GB300 only if
-  GB200 reports no capacity before submission; AMD uses K8s AMD. A repeated
-  failure or missing result requests human intervention. The watch reuses
-  running native checks. Queued NVIDIA checks can use the selected Slurm route.
-  The watch reuses queued Slurm allocations and AMD checks. A dispatched check
-  remains the watch's source of results even if native CI starts later.
-  Scheduler changes also watch the existing C++ and Python CPU workflows first;
-  NVIDIA library changes include the native GPU library workflow. The watch
-  matches each by its PR path filters, independently of manual dispatch support.
-  Completion requires successful test execution on the current PR head and base.
-  Skipped jobs wait for an eligible run. Failures or skipped test steps request
-  human intervention rather than a dispatch retry. CPU-only plans need no GPU
-  task. In-tree MLA Python changes also require a serving task with an explicit
-  `tokenspeed_mla` target or drafter backend. A kernel UT alone is insufficient.
-- `fix` resolves conflicts first, or attempts a focused source repair for an
-  already failed selected task. A separate branch receives the candidate.
-  Required pre-commit checks and all selected GPU tasks must pass before `fix`
-  cherry-picks the repair back. Conflict repairs also record the validated
-  merge with `main` so the PR becomes mergeable. A changed head or base stops
-  promotion.
-  Native workflow tracking is limited to `watch`. PR results cannot validate a
-  repair candidate, and conflicted PRs cannot start native PR workflows. `fix`
-  retains selected GPU validation before cherry-pick and required CI on the
-  updated PR.
-
-Only explicit writer commands start repairs. The bot does not edit tests,
-workflow/configuration files or task thresholds automatically, and does not
-merge PRs or bypass required checks. Comments contain a short status table.
-Versioned hidden records preserve the selected tasks and immutable source.
-The selected CI tasks must cover selected UT files with a known task mapping.
-The system refreshes older plans missing that coverage once before watching.
-A failed or incomplete refresh requests human intervention.
-For shared serving paths, prioritize the smallest existing model and bounded
-workload with equivalent coverage. When changed flags or callers require them,
-keep larger or model-specific checks.
-You can manually dispatch `PR CI Assist` with a PR number to reconcile an
-existing command. The workflows must be present on `main` for comment and
-completion events to activate them.

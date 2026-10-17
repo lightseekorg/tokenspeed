@@ -17,6 +17,11 @@ SLURM_RUNNER_PREFIXES = (
     "slurm-gb200-",
     "slurm-gb300-",
 )
+PR_TEST_WORKFLOWS = (
+    "amd-tests.yml",
+    "nvidia-b200-tests.yml",
+    "pr-test-nvidia-arm.yml",
+)
 
 
 def workflow_dispatch_inputs(name: str) -> dict:
@@ -28,6 +33,16 @@ def workflow_dispatch_inputs(name: str) -> dict:
 
 def load_yaml(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("name", PR_TEST_WORKFLOWS)
+def test_pr_workflow_can_classify_pull_request_files(name: str):
+    workflow = load_yaml(REPO_ROOT / ".github" / "workflows" / name)
+
+    assert workflow["permissions"] == {
+        "contents": "read",
+        "pull-requests": "read",
+    }
 
 
 def run_slurm_dispatch_script(
@@ -253,7 +268,9 @@ def test_k8s_dispatch_lists_every_supported_ci_yaml():
     assert all((REPO_ROOT / choice).is_file() for choice in choices)
 
 
-def test_kernel_ut_parts_cover_every_test_once():
+def test_kernel_ut_tasks_cover_every_test_once_per_runner():
+    # NVIDIA runners split the kernel suite across part-i and part-ii; AMD
+    # runs it in a single task.
     root = REPO_ROOT / "tokenspeed-kernel/test"
     files = {
         path
@@ -261,28 +278,74 @@ def test_kernel_ut_parts_cover_every_test_once():
         if path.name.startswith("test_") or path.name.endswith("_test.py")
     }
     assert files
-    executions = Counter()
-    for part in ("i", "ii"):
-        task = load_yaml(
-            REPO_ROOT / f"test/ci/ut/ut-tokenspeed-kernel-part-{part}.yaml"
-        )
+    tasks = [
+        load_yaml(REPO_ROOT / f"test/ci/ut/ut-tokenspeed-kernel{suffix}.yaml")
+        for suffix in ("-part-i", "-part-ii", "")
+    ]
+    labels = {label for task in tasks for label in task["runner"]["labels"]}
+    # Pin the runner set so dropping a runner from every task fails here.
+    assert labels == {
+        "h100-1gpu",
+        "b200-1gpu",
+        "gb200-1gpu",
+        "b300-1gpu",
+        "amd-mi355-1gpu",
+    }
+    for label in labels:
+        executions = Counter()
+        for task in tasks:
+            if label not in task["runner"]["labels"]:
+                continue
+            for command in task["ut"]["commands"]:
+                tokens = shlex.split(command)
+                arguments = tokens[tokens.index("pytest") + 1 :]
+                targets = [
+                    REPO_ROOT / arg for arg in arguments if not arg.startswith("-")
+                ]
+                ignores = [
+                    REPO_ROOT / arg.removeprefix("--ignore=")
+                    for arg in arguments
+                    if arg.startswith("--ignore=")
+                ]
+                executions.update(
+                    path
+                    for path in files
+                    if any(path.is_relative_to(target) for target in targets)
+                    and not any(path.is_relative_to(ignore) for ignore in ignores)
+                )
+
+        assert executions == Counter({path: 1 for path in files}), label
+
+
+def test_runtime_1gpu_tasks_run_every_partition_once_per_runner():
+    # AMD splits the runtime-1gpu suite across part-i and part-ii; other
+    # runners run it whole in ut-runtime-1gpu.
+    partitions = {}
+    for suffix in ("", "-part-i", "-part-ii"):
+        task = load_yaml(REPO_ROOT / f"test/ci/ut/ut-runtime-1gpu{suffix}.yaml")
         for command in task["ut"]["commands"]:
             tokens = shlex.split(command)
-            arguments = tokens[tokens.index("pytest") + 1 :]
-            targets = [REPO_ROOT / arg for arg in arguments if not arg.startswith("-")]
-            ignores = [
-                REPO_ROOT / arg.removeprefix("--ignore=")
-                for arg in arguments
-                if arg.startswith("--ignore=")
-            ]
-            executions.update(
-                path
-                for path in files
-                if any(path.is_relative_to(target) for target in targets)
-                and not any(path.is_relative_to(ignore) for ignore in ignores)
-            )
+            if "run_ci_suite.py" not in command:
+                continue
+            partition = (0, 1)
+            if "--auto-partition-size" in tokens:
+                partition = (
+                    int(tokens[tokens.index("--auto-partition-id") + 1]),
+                    int(tokens[tokens.index("--auto-partition-size") + 1]),
+                )
+            for label in task["runner"]["labels"]:
+                partitions.setdefault(label, []).append(partition)
 
-    assert executions == Counter({path: 1 for path in files})
+    # Pin the runner set so dropping a runner from every task fails here.
+    assert partitions.keys() == {
+        "h100-1gpu",
+        "b200-1gpu",
+        "gb200-1gpu",
+        "amd-mi355-1gpu",
+    }
+    for label, parts in partitions.items():
+        size = parts[0][1]
+        assert sorted(parts) == [(i, size) for i in range(size)], label
 
 
 def test_amd_kernel_benchmarks_run_in_their_own_workflow():
@@ -370,7 +433,7 @@ def test_kernel_benchmark_task_uses_shared_ci_contract():
     assert task["type"] == "perf"
     assert task["workflow_stage"] == "kernel-benchmark"
     assert task["triggers"] == ["per-commit", "manual"]
-    assert task["runner"]["labels"] == ["amd-mi350-1gpu-bench"]
+    assert task["runner"]["labels"] == ["amd-mi355-1gpu"]
     assert task["env"]["TOKENSPEED_KERNEL_BENCHMARK_PROFILER"] == "none"
     assert ".ci-artifacts/published" in task["perf"]["command"]
     for variable in ("BASE_REF", "CANDIDATE_REF", "PR_NUMBER", "MERGE_SHA"):
@@ -737,6 +800,7 @@ def test_only_dedicated_tasks_declare_gb300():
         "kimi-k3-nvfp4-dp16-four-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-dspark-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
+        "qwen3.8-flash-next-nvfp4-tp4ep4-evalscope-agentic.yaml",
     ]
 
 

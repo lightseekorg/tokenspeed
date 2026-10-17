@@ -88,46 +88,29 @@ def test_dependent_source_write_precedes_gather_read():
 
 
 @pytest.mark.parametrize("BS", [8, 300])
-def test_state_pages_matches_reference(BS):
+def test_state_pages_reads_the_input_slot_when_present(BS):
     torch.manual_seed(1)
     dev = "cuda"
-    SLOTS, P = 6, 64
-    rows = torch.randint(1, 500, (BS, SLOTS), dtype=torch.int32, device=dev)
-    edges = torch.tensor([1, 63, 64, 65, 128, 129, 200, 384], dtype=torch.int32)
-    seq_lens = torch.cat(
-        [edges, torch.randint(1, SLOTS * P + 1, (BS - 8,), dtype=torch.int32)]
-    ).to(dev)
+    rows = torch.randint(1, 500, (BS, 2), dtype=torch.int32, device=dev)
+    # Requests whose input checkpoint was consumed evolve slot 1 in place.
+    rows[::3, 0] = 0
     state_in = torch.zeros(BS + 4, dtype=torch.int32, device=dev)
     state_out = torch.zeros(BS + 4, dtype=torch.int32, device=dev)
 
     tape = PrepTape(dev)
     tape.state_pages(
-        state_in,
-        state_out,
-        rows_ptr=Reg.PTR0,
-        seq_lens_ptr=Reg.PTR1,
-        bs=Reg.BS,
-        max_slots=SLOTS,
-        page_size=P,
+        state_in, state_out, rows_ptr=Reg.PTR0, bs=Reg.BS, row_stride=Reg.USER0
     )
     tape.filltail(state_in, live=Reg.BS, total=BS + 4, value=-1)
     tape.filltail(state_out, live=Reg.BS, total=BS + 4, value=-1)
     tape.finalize()
     assert isinstance(tape._descs, torch.Tensor)
-    tape.run({Reg.BS: BS, Reg.PTR0: rows, Reg.PTR1: seq_lens})
+    tape.run({Reg.BS: BS, Reg.PTR0: rows, Reg.USER0: rows.stride(0)})
     torch.cuda.synchronize()
 
-    after = seq_lens.long()
-    before = after - 1
-    in_slots = torch.div(before - 1, P, rounding_mode="floor").clamp(min=0)
-    out_slots = torch.div(after - 1, P, rounding_mode="floor").clamp(
-        min=0, max=SLOTS - 1
-    )
-    ref_in = rows.gather(1, in_slots.unsqueeze(1)).squeeze(1)
-    ref_in = torch.where(before > 0, ref_in, torch.zeros_like(ref_in))
-    ref_out = rows.gather(1, out_slots.unsqueeze(1)).squeeze(1)
-    assert torch.equal(state_in[:BS], ref_in.int())
-    assert torch.equal(state_out[:BS], ref_out.int())
+    ref_in = torch.where(rows[:, 0] > 0, rows[:, 0], rows[:, 1])
+    assert torch.equal(state_in[:BS], ref_in)
+    assert torch.equal(state_out[:BS], rows[:, 1])
     assert (state_in[BS:] == -1).all()
     assert (state_out[BS:] == -1).all()
 

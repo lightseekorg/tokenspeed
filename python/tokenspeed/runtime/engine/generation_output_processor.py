@@ -44,6 +44,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     make_finish_event,
     make_update_reserve_tokens_event,
 )
+from tokenspeed.runtime.execution.types import StopCriteria
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 if TYPE_CHECKING:
@@ -59,6 +60,28 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
+
+
+def resolve_stop_token_ids(
+    sampling_params: SamplingParams, eos_token_ids, tokenizer
+) -> frozenset[int]:
+    """The tokens that end a request: its own ``stop_token_ids``, the
+    model's EOS ids and the tokenizer's EOS and additional stop ids; none
+    under ``ignore_eos``.
+
+    The one definition both the control plane's finish check and the
+    device's verify cut (``StopCriteria``) read, so the two always end a
+    request on the same token.
+    """
+    if sampling_params.ignore_eos:
+        return frozenset()
+    ids = set(sampling_params.stop_token_ids or ())
+    ids.update(eos_token_ids or ())
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is not None:
+        ids.add(eos_id)
+    ids.update(getattr(tokenizer, "additional_stop_token_ids", None) or ())
+    return frozenset(int(token_id) for token_id in ids)
 
 
 class RequestState:
@@ -105,6 +128,10 @@ class RequestState:
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.tokenizer = tokenizer
+        self.stop_token_ids: frozenset[int] = resolve_stop_token_ids(
+            sampling_params, eos_token_ids, tokenizer
+        )
+        self._stop_criteria: StopCriteria | None = None
         self.computed_length = 0
         self.return_logprob = return_logprob
         self.top_logprobs_num = top_logprobs_num
@@ -121,6 +148,13 @@ class RequestState:
         # request stats (host-side); tracker attached only with --enable-log-request-stats
         self.created_time: float = created_time
         self.stats: RequestStatsTracker = NOOP_STATS
+        # Queue-time metric (tokenspeed:request_queue_time_seconds): wall time
+        # the request entered the scheduler's waiting queue, stamped when its
+        # spec is submitted, and the once-per-request observation flag. A
+        # retracted request re-enters the C++ queue without a new stamp, so
+        # preemption never records a second sample.
+        self.scheduler_enqueue_time: float = 0.0
+        self.queue_time_recorded: bool = False
         # Sampled-token logprobs, accumulated per generated token.
         # None when return_logprob is False.
         self.output_token_logprobs_val: list[float] | None = (
@@ -155,6 +189,23 @@ class RequestState:
         self.input_token_logprobs_val: list[float | None] | None = None
         self.input_token_logprobs_idx: list[int] | None = None
         self.input_logprob_sent: bool = False
+        # Top-k alternatives (``top_logprobs_num``, ``return_logprob``'s
+        # dialect): one ``(values, ids)`` per scored prompt position, beside
+        # ``input_token_logprobs`` and finalized into ``[None] + rows``; and
+        # one ``values`` / ``ids`` list per generated token. None when the
+        # request asks for none.
+        self.input_top_logprobs: list[tuple[list[float], list[int]] | None] | None = (
+            [None] * len(self.input_token_logprobs)
+            if self.input_token_logprobs is not None and top_logprobs_num > 0
+            else None
+        )
+        self.input_top_logprobs_val: list[list[float] | None] | None = None
+        self.input_top_logprobs_idx: list[list[int] | None] | None = None
+        wants_top = return_logprob and top_logprobs_num > 0
+        self.output_top_logprobs_val: list[list[float]] | None = (
+            [] if wants_top else None
+        )
+        self.output_top_logprobs_idx: list[list[int]] | None = [] if wants_top else None
         # The NaN guard flagged this request on a prefill chunk that owed no
         # token yet (a NaN prompt logprob, or NaN logits of the chunk's last
         # row). The abort is issued when the prompt completes, like a flag on
@@ -177,26 +228,29 @@ class RequestState:
         # still receives a terminating finish.
         self.abort_notify_client = False
 
-        # cached tokenizer ids
-        self._eos_token_id_cached = None
-        self._additional_stop_token_ids_cached = None
-
         # Constrained-decoding state.
         self.grammar: BaseGrammarObject | None = None
         self.grammar_key: tuple[str, str] | None = None
         self.grammar_queued_ts: float = 0.0
 
-    def set_finish_with_abort(self, message: str, notify_client: bool = False) -> None:
+    def set_finish_with_abort(
+        self,
+        message: str,
+        notify_client: bool = False,
+        status_code: int | None = None,
+    ) -> None:
         """Mark this request as aborted with ``message``; finished_reason is
         materialized immediately so callers don't need a check_finished() pass.
 
         ``notify_client`` streams a terminating finish to the client (used for
         pause-initiated aborts, where the client did not tear down its state).
+        ``status_code`` is the HTTP status the frontend reports; None leaves
+        the abort an internal error.
         """
         self.to_abort = True
         self.to_abort_message = message
         self.abort_notify_client = notify_client
-        self.finished_reason = FINISH_ABORT(message=message)
+        self.finished_reason = FINISH_ABORT(message=message, status_code=status_code)
 
     @classmethod
     def from_recv_req(
@@ -238,6 +292,18 @@ class RequestState:
         return self.finished_reason is not None
 
     @property
+    def stop_criteria(self) -> StopCriteria:
+        """Where the device cuts this request's verify rounds. Built on the
+        first forward: admission clamps ``max_new_tokens`` after construction
+        and nothing changes it later."""
+        if self._stop_criteria is None:
+            self._stop_criteria = StopCriteria(
+                stop_token_ids=tuple(sorted(self.stop_token_ids)),
+                token_limit=self.input_length + self.sampling_params.max_new_tokens,
+            )
+        return self._stop_criteria
+
+    @property
     def input_length(self) -> int:
         return len(self.prompt_input_ids)
 
@@ -261,8 +327,15 @@ class RequestState:
             and self.logprob_start_len < self.input_length - 1
         )
 
-    def record_input_token_logprobs(self, start: int, logprobs: list[float]) -> None:
-        """Store one chunk's prompt logprobs for positions ``[start, start+n)``."""
+    def record_input_token_logprobs(
+        self,
+        start: int,
+        logprobs: list[float],
+        top: tuple[list[list[float]], list[list[int]]] | None = None,
+    ) -> None:
+        """Store one chunk's prompt logprobs for positions ``[start, start+n)``,
+        and their top-k alternatives (``top``: per-row values and ids, most
+        likely first) cut to the request's ``top_logprobs_num``."""
         if self.input_token_logprobs is None:
             raise RuntimeError("prompt logprobs recorded for a request that wants none")
         offset = start - self.logprob_start_len
@@ -272,6 +345,18 @@ class RequestState:
                 f"[{self.logprob_start_len}, {self.input_length - 1})"
             )
         self.input_token_logprobs[offset : offset + len(logprobs)] = logprobs
+        if self.input_top_logprobs is not None:
+            if top is None:
+                raise RuntimeError(
+                    "prompt logprobs recorded without the top-k alternatives the "
+                    "request asked for"
+                )
+            k = self.top_logprobs_num
+            values, ids = top
+            self.input_top_logprobs[offset : offset + len(logprobs)] = [
+                (row_values[:k], row_ids[:k])
+                for row_values, row_ids in zip(values, ids)
+            ]
 
     def finalize_input_token_logprobs(self) -> None:
         """Assemble the SGLang lists once the prompt's final chunk committed.
@@ -307,6 +392,22 @@ class RequestState:
                 f"for {len(self.input_token_logprobs_idx)} tokens"
             )
         self.input_token_logprobs = None
+        if self.top_logprobs_num > 0:
+            tops = (
+                list(self.input_top_logprobs)
+                if self.input_top_logprobs is not None
+                else []
+            )
+            if len(tops) != len(logprobs) or any(top is None for top in tops):
+                raise RuntimeError(
+                    "prompt top-k logprobs incomplete: "
+                    f"{sum(top is not None for top in tops)} of {len(logprobs)} "
+                    "positions have alternatives"
+                )
+            # Element 0 has no alternatives, like its value.
+            self.input_top_logprobs_val = [None] + [top[0] for top in tops]
+            self.input_top_logprobs_idx = [None] + [top[1] for top in tops]
+            self.input_top_logprobs = None
 
     def add_computed_length(self, incr: int):
         self.computed_length += incr
@@ -365,24 +466,9 @@ class RequestState:
             return
 
         last_token_id = self.output_ids[-1]
-
-        if not self.sampling_params.ignore_eos:
-            matched_eos = False
-
-            # Check stop token ids
-            if self.sampling_params.stop_token_ids:
-                matched_eos = last_token_id in self.sampling_params.stop_token_ids
-            if self.eos_token_ids:
-                matched_eos |= last_token_id in self.eos_token_ids
-            if self._eos_token_id_cached is None:
-                self.set_cached_id()
-            if self._eos_token_id_cached is not None:
-                matched_eos |= last_token_id == self._eos_token_id_cached
-            if self._additional_stop_token_ids_cached:
-                matched_eos |= last_token_id in self._additional_stop_token_ids_cached
-            if matched_eos:
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
-                return
+        if last_token_id in self.stop_token_ids:
+            self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
+            return
 
         # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
@@ -394,15 +480,6 @@ class RequestState:
                 if stop_str in tail_str or stop_str in self.decoded_text:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                     return
-
-    def set_cached_id(self):
-        """Assign tokenizer and cache ids needed by check_finished()."""
-        eos_id = getattr(self.tokenizer, "eos_token_id", None)
-        self._eos_token_id_cached = int(eos_id) if eos_id is not None else None
-        extra = getattr(self.tokenizer, "additional_stop_token_ids", None)
-        self._additional_stop_token_ids_cached = (
-            set(int(x) for x in extra) if extra else None
-        )
 
 
 class OutputProcesser:
@@ -781,6 +858,16 @@ class OutputProcesser:
         )
         output_lengths_list = model_execution_results.output_lengths.tolist()
         output_tokens_list = model_execution_results.output_tokens.tolist()
+        # The prefill rows' sampled-token alternatives, in prefill output
+        # order: extend slot i's rows start where its tokens do (``pt``).
+        output_top_val_list = output_top_idx_list = None
+        if model_execution_results.output_top_logprobs_val is not None:
+            output_top_val_list = (
+                model_execution_results.output_top_logprobs_val.tolist()
+            )
+            output_top_idx_list = (
+                model_execution_results.output_top_logprobs_idx.tolist()
+            )
         self._record_input_token_logprobs(forward_op, model_execution_results)
         # Per-slot total prefill length as the OP sees it (C++
         # Request::PrefillSize()): the prompt length. A capacity retraction
@@ -798,25 +885,48 @@ class OutputProcesser:
                 else None
             )
             is_decode_slot = i >= num_extends
-            if self.spec_num_tokens is not None and is_decode_slot:
-                pt += self.spec_num_tokens
+            model_output_top = (
+                (
+                    output_top_val_list[pt : pt + output_length],
+                    output_top_idx_list[pt : pt + output_length],
+                )
+                if output_top_val_list is not None and not is_decode_slot
+                else None
+            )
+            # A decode row stores its whole verify window (one token without
+            # speculation) however many it keeps -- none for a request the
+            # device stopped; a prefill row stores the one token it samples.
+            if is_decode_slot:
+                pt += self.spec_num_tokens if self.spec_num_tokens is not None else 1
             else:
                 pt += output_length
 
+            # Mid-chunk extend slot by the op's own prefill_lengths: C++ owes
+            # no token and the sampled one is garbage.
+            mid_chunk = (
+                not is_decode_slot
+                and forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
+                < prefill_lengths[i]
+            )
+
             if rid not in self.rid_to_state:
-                # means it's delayed token, do not process
+                # The request finished (or was aborted) on an earlier result
+                # while this forward was already dispatched. Its output goes
+                # nowhere, but the forward landed: the scheduler counts it
+                # against the request's pages and, for a finished request,
+                # publishes the frontier it consumed once nothing is in
+                # flight. The tokens keep the frontier exact (TokenSize - 1);
+                # a forward behind the round the device stopped the request
+                # on keeps none, so the frontier stays before the stop token.
+                request_changes.append(
+                    make_extend_result_event(rid, [] if mid_chunk else model_output_ids)
+                )
                 continue
 
             request_state: RequestState = self.rid_to_state[rid]
             # scheduled_time is stamped pre-forward in the event loop (queue end)
 
-            # Mid-chunk extend slot by the op's own prefill_lengths: C++ owes
-            # no token and the sampled one is garbage.
-            if (
-                not is_decode_slot
-                and forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
-                < prefill_lengths[i]
-            ):
+            if mid_chunk:
                 # It owes no token, but the chunk's KV has landed -- report
                 # that much, so the scheduler stops counting a forward
                 # against these pages and may retract the request (imaging
@@ -831,6 +941,12 @@ class OutputProcesser:
             # Do not output chunking result
             if not request_state.prefill_finished:
                 continue
+            if is_decode_slot and output_length == 0:
+                raise RuntimeError(
+                    f"decode request {rid} kept no token: only a request the "
+                    "device already stopped keeps none, and that request has "
+                    "finished"
+                )
 
             if not is_decode_slot:
                 request_state.finalize_input_token_logprobs()
@@ -917,6 +1033,27 @@ class OutputProcesser:
                         model_output_logprobs[j]
                     )
                     request_state.output_token_logprobs_idx.append(model_output_id)
+                if request_state.output_top_logprobs_val is not None:
+                    if model_output_top is None or j >= len(model_output_top[0]):
+                        # The ingress takes a top-k request only when every
+                        # token of it is sampled in a prefill, which reports
+                        # the alternatives; end the request rather than ship
+                        # a token without them.
+                        if not request_state.finished:
+                            request_state.finished_reason = FINISH_ABORT(
+                                message=(
+                                    "top-k logprobs are not computed for this "
+                                    "step (decode steps return none)"
+                                ),
+                            )
+                    else:
+                        k = request_state.top_logprobs_num
+                        request_state.output_top_logprobs_val.append(
+                            model_output_top[0][j][:k]
+                        )
+                        request_state.output_top_logprobs_idx.append(
+                            model_output_top[1][j][:k]
+                        )
                 if term_idx == j:
                     # Grammar termination takes precedence over
                     # length/EOS/stop_str at the same step (matching
@@ -937,6 +1074,18 @@ class OutputProcesser:
                     self.log_accept_length(rid, request_state)
                     break
 
+            # The device cuts a round at the request's stop tokens and token
+            # limit, so a request ending on those finishes on its last kept
+            # token. One ending earlier on a condition only this side checks
+            # (a stop string, a grammar, an abort) still consumed the whole
+            # round on the device: the scheduler gets every kept token, so
+            # the frontier it publishes is the state and KV the device holds.
+            # A NaN abort keeps one sanitized token instead; it is safe because
+            # an abort releases the pages without publishing them.
+            reported_ids = (
+                model_output_ids if len(new_ids) < len(model_output_ids) else new_ids
+            )
+
             # first output token == TTFT anchor
             if request_state.output_ids:
                 request_state.stats.mark_first_token(stats_now)
@@ -950,7 +1099,7 @@ class OutputProcesser:
             # instead of waiting for KV that never comes.
             if is_prefill_instance and nan_detected:
                 request_changes.append(
-                    make_extend_result_event(rid, new_ids, spec_candidate_ids)
+                    make_extend_result_event(rid, reported_ids, spec_candidate_ids)
                 )
                 request_changes.append(make_abort_event(rid))
                 self._log_request_stats(rid, request_state, stats_now)
@@ -964,7 +1113,7 @@ class OutputProcesser:
             # passive client that still needs a terminating finish streamed.
             if request_state.to_abort and request_state.finished:
                 request_changes.append(
-                    make_extend_result_event(rid, new_ids, spec_candidate_ids)
+                    make_extend_result_event(rid, reported_ids, spec_candidate_ids)
                 )
                 if is_prefill_instance:
                     # PD owns these pages until SucceededEvent or FailedEvent
@@ -986,7 +1135,7 @@ class OutputProcesser:
                 continue
 
             request_changes.append(
-                make_extend_result_event(rid, new_ids, spec_candidate_ids)
+                make_extend_result_event(rid, reported_ids, spec_candidate_ids)
             )
             if is_prefill_instance:
                 # Prefill instances: never stream intermediate output to detokenizer.
@@ -1035,6 +1184,10 @@ class OutputProcesser:
                 f"prompt logprob result has {len(values)} rows for a plan of "
                 f"{plan.num_rows}"
             )
+        top_values = top_ids = None
+        if model_execution_results.input_top_logprobs_val is not None:
+            top_values = model_execution_results.input_top_logprobs_val.tolist()
+            top_ids = model_execution_results.input_top_logprobs_idx.tolist()
         cursor = 0
         for i, count in enumerate(plan.counts):
             if count == 0:
@@ -1042,7 +1195,16 @@ class OutputProcesser:
             state = self.rid_to_state.get(forward_op.request_ids[i])
             if state is not None and state.input_token_logprobs is not None:
                 state.record_input_token_logprobs(
-                    plan.position_starts[i], values[cursor : cursor + count]
+                    plan.position_starts[i],
+                    values[cursor : cursor + count],
+                    (
+                        (
+                            top_values[cursor : cursor + count],
+                            top_ids[cursor : cursor + count],
+                        )
+                        if top_values is not None
+                        else None
+                    ),
                 )
             cursor += count
 
@@ -1058,6 +1220,9 @@ class OutputProcesser:
         The bootstrap_token is the first real output token produced by the prefill node.
         It is appended to output_ids so the decode side starts generation from the
         correct position.
+
+        ``cached_tokens`` reports prefill cache reuse and determines uncached prompt
+        work. Decode-local cache hits only reduce KV transfer.
 
         A constrained request also advances its matcher here. Prefill and decode
         each compiled their own matcher for the request, and this token is the
@@ -1076,8 +1241,7 @@ class OutputProcesser:
         if req_id not in self.rid_to_state:
             return
         state = self.rid_to_state[req_id]
-        # P and D reuse overlapping leading prefixes; never sum their hits.
-        state.cached_tokens = max(state.cached_tokens, cached_tokens)
+        state.cached_tokens = cached_tokens
         if bootstrap_token == -1:
             logger.warning(
                 f"[on_remote_prefill_done] rid={req_id!s} received bootstrap_token=-1, "
@@ -1244,6 +1408,17 @@ class OutputProcesser:
         output_token_logprobs_idx: list[list[int]] = []
         input_token_logprobs_val: list[list[float | None]] = []
         input_token_logprobs_idx: list[list[int]] = []
+        input_top_logprobs_val: list[list] = []
+        input_top_logprobs_idx: list[list] = []
+        output_top_logprobs_val: list[list[list[float]]] = []
+        output_top_logprobs_idx: list[list[list[int]]] = []
+        # The top-k columns get one entry per request only in a frame where a
+        # request asked for top-k. Otherwise they stay [] for the whole
+        # frame, which the frontend reads as no alternatives for every
+        # request, so the default path adds no per-request list to the frame.
+        ships_top_logprobs = any(
+            rs.output_top_logprobs_val is not None for rs in output_states
+        )
 
         for i, rs in enumerate(output_states):
             # For finished requests, always output (unless already output)
@@ -1322,17 +1497,40 @@ class OutputProcesser:
             else:
                 output_token_logprobs_val.append([])
                 output_token_logprobs_idx.append([])
-
             # Prompt logprobs ship once, on the first frame after the prompt's
             # final chunk committed; later frames (and a decode-role request,
             # which never finalizes) carry [] and the frontend keeps the lists.
-            if rs.input_token_logprobs_val is not None and not rs.input_logprob_sent:
+            ships_prompt_logprobs = (
+                rs.input_token_logprobs_val is not None and not rs.input_logprob_sent
+            )
+            if ships_prompt_logprobs:
                 rs.input_logprob_sent = True
                 input_token_logprobs_val.append(rs.input_token_logprobs_val)
                 input_token_logprobs_idx.append(rs.input_token_logprobs_idx)
             else:
                 input_token_logprobs_val.append([])
                 input_token_logprobs_idx.append([])
+
+            if ships_top_logprobs:
+                # The prompt's alternatives ride with its logprobs.
+                if ships_prompt_logprobs and rs.input_top_logprobs_val is not None:
+                    input_top_logprobs_val.append(rs.input_top_logprobs_val)
+                    input_top_logprobs_idx.append(rs.input_top_logprobs_idx)
+                else:
+                    input_top_logprobs_val.append([])
+                    input_top_logprobs_idx.append([])
+                if rs.output_top_logprobs_val is not None:
+                    # One entry per generated token, shipped with its logprob.
+                    n_new = rs.output_length - send_token_offset
+                    output_top_logprobs_val.append(
+                        rs.output_top_logprobs_val[-n_new:] if n_new > 0 else []
+                    )
+                    output_top_logprobs_idx.append(
+                        rs.output_top_logprobs_idx[-n_new:] if n_new > 0 else []
+                    )
+                else:
+                    output_top_logprobs_val.append([])
+                    output_top_logprobs_idx.append([])
 
         # Don't send empty batch to detokenizer
         if len(rids_to_send) == 0:
@@ -1357,10 +1555,10 @@ class OutputProcesser:
             input_token_logprobs_idx=input_token_logprobs_idx,
             output_token_logprobs_val=output_token_logprobs_val,
             output_token_logprobs_idx=output_token_logprobs_idx,
-            input_top_logprobs_val=[],
-            input_top_logprobs_idx=[],
-            output_top_logprobs_val=[],
-            output_top_logprobs_idx=[],
+            input_top_logprobs_val=input_top_logprobs_val,
+            input_top_logprobs_idx=input_top_logprobs_idx,
+            output_top_logprobs_val=output_top_logprobs_val,
+            output_top_logprobs_idx=output_top_logprobs_idx,
             input_token_ids_logprobs_val=[],
             input_token_ids_logprobs_idx=[],
             output_token_ids_logprobs_val=[],

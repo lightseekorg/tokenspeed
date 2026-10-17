@@ -23,11 +23,9 @@ from __future__ import annotations
 from unittest import mock
 
 import pytest
-import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as gluon_sigmoid_topk
+import tokenspeed_kernel.ops.moe.gluon as gluon_sigmoid_topk
 import torch
-from tokenspeed_kernel.ops.moe.sigmoid_topk import (
-    _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk,
-)
+from tokenspeed_kernel.ops.moe import _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk
 from utils import is_cdna4
 
 if not is_cdna4():

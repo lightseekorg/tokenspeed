@@ -7,8 +7,9 @@ import itertools
 import os
 import pathlib
 import sys
-import unittest
 from functools import partial
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -41,18 +42,9 @@ hybrid_slab_group_size = _pcs.hybrid_slab_group_size
 
 
 def _specs_for_layers(**kwargs):
-    from cache_pool_test_utils import specs_for_layers
+    from test.runtime.cache_pool_test_utils import specs_for_layers
 
     return specs_for_layers(**kwargs)
-
-
-def _real_spec():
-    # The REAL package module (not the file-loaded shadow above): pool
-    # constructions need specs whose class passes the contract's
-    # isinstance check.
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes import spec
-
-    return spec
 
 
 GPT_OSS_LAYER_TYPES = ("sliding_attention", "full_attention") * 12
@@ -64,103 +56,94 @@ SUBGROUP_LAYER_BLOCK = tuple(f"sliding_attention_{k}" for k in range(5)) + (
 )
 
 
-class HybridSlabGroupSizeTest(unittest.TestCase):
+class TestHybridSlabGroupSizeTest:
     """Each case pins exactly ONE reason the predicate returns None (or the
     single shape where it activates)."""
 
     def test_gpt_oss_shape_returns_group_size(self):
         # gpt-oss: 12 sliding + 12 full, alternating -> 12 layers per group.
-        self.assertEqual(
-            hybrid_slab_group_size(GPT_OSS_LAYER_TYPES),
-            12,
-        )
+        assert (hybrid_slab_group_size(GPT_OSS_LAYER_TYPES)) == (12)
 
     def test_none_when_single_group(self):
-        self.assertIsNone(hybrid_slab_group_size(("full_attention",) * 24))
+        assert (hybrid_slab_group_size(("full_attention",) * 24)) is None
 
     def test_unequal_groups_return_largest_count(self):
         # Unequal groups (e.g. Inkling: 55 sliding + 11 full): the slab
         # count is the largest group's layer count; slabs past the smaller
         # group's count are single-layer.
         lt = ("sliding_attention",) * 8 + ("full_attention",) * 16
-        self.assertEqual(hybrid_slab_group_size(lt), 16)
+        assert (hybrid_slab_group_size(lt)) == (16)
         lt_inkling = ("sliding_attention",) * 55 + ("full_attention",) * 11
-        self.assertEqual(hybrid_slab_group_size(lt_inkling), 55)
+        assert (hybrid_slab_group_size(lt_inkling)) == (55)
 
     def test_sliding_subgroups_return_group_size(self):
         # Inkling step 2.5: 5 sliding sub-groups + full, all count 11 ->
         # 11 slabs, every slab bound by one layer of each of the 6 groups.
         lt = SUBGROUP_LAYER_BLOCK * 11
-        self.assertEqual(
-            hybrid_slab_group_size(lt, sliding_window_tokens=512),
-            11,
-        )
+        assert (hybrid_slab_group_size(lt, sliding_window_tokens=512)) == (11)
 
     def test_none_when_subgroup_suffix_not_digit(self):
         lt = GPT_OSS_LAYER_TYPES + ("sliding_attention_x",)
-        self.assertIsNone(hybrid_slab_group_size(lt))
+        assert (hybrid_slab_group_size(lt)) is None
 
     def test_none_when_unknown_label(self):
         # Unknown input degrades to None (safe legacy layout), never raises;
         # loud rejection is spec.group's job.
         lt = GPT_OSS_LAYER_TYPES + ("banana_attention",)
-        self.assertIsNone(hybrid_slab_group_size(lt))
+        assert (hybrid_slab_group_size(lt)) is None
 
     def test_none_when_empty(self):
         # Plain models pass empty or None layer_types.
-        self.assertIsNone(hybrid_slab_group_size(()))
-        self.assertIsNone(hybrid_slab_group_size(None))
+        assert (hybrid_slab_group_size(())) is None
+        assert (hybrid_slab_group_size(None)) is None
 
     def test_none_when_multi_window_sequence(self):
         it = itertools.cycle((4, 512))
         windows = [
             next(it) if t == "sliding_attention" else None for t in GPT_OSS_LAYER_TYPES
         ]
-        self.assertIsNone(
+        assert (
             hybrid_slab_group_size(
                 GPT_OSS_LAYER_TYPES,
                 sliding_window_tokens=windows,
             )
-        )
+        ) is None
 
     def test_uniform_window_sequence_stays_active(self):
         windows = [None if t == "full_attention" else 128 for t in GPT_OSS_LAYER_TYPES]
-        self.assertEqual(
+        assert (
             hybrid_slab_group_size(
                 GPT_OSS_LAYER_TYPES,
                 sliding_window_tokens=windows,
-            ),
-            12,
-        )
+            )
+        ) == (12)
 
     def test_scalar_window_stays_active(self):
-        self.assertEqual(
+        assert (
             hybrid_slab_group_size(
                 GPT_OSS_LAYER_TYPES,
                 sliding_window_tokens=128,
-            ),
-            12,
-        )
+            )
+        ) == (12)
 
     def test_none_when_window_sequence_length_mismatch(self):
-        self.assertIsNone(
+        assert (
             hybrid_slab_group_size(
                 GPT_OSS_LAYER_TYPES,
                 sliding_window_tokens=[128],
             )
-        )
+        ) is None
 
     def test_garbage_elements_ignored_not_raised(self):
-        self.assertEqual(
+        assert (
             hybrid_slab_group_size(
                 GPT_OSS_LAYER_TYPES,
                 sliding_window_tokens=["a"] * len(GPT_OSS_LAYER_TYPES),
-            ),
-            12,
-        )
+            )
+        ) == (12)
 
 
-class MHAPoolSlabLayoutTest(unittest.TestCase):
+class TestMHAPoolSlabLayoutTest:
     """The memory plan may alias fields while MHA keeps one view per layer.
 
     When placement sharing is active, paired layer views address the same
@@ -168,7 +151,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
     Constructs a real (tiny, CPU) MHATokenToKVPool; skips without deps.
     """
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import torch
 
@@ -176,12 +159,12 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
                 MHATokenToKVPool,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.MHATokenToKVPool = MHATokenToKVPool
 
     def _pool(self, **overrides):
-        from cache_pool_test_utils import (
+        from test.runtime.cache_pool_test_utils import (
             make_mha_memory_plan,
             make_pool,
         )
@@ -224,30 +207,29 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
 
     def test_plan_aliases_distinct_layer_views(self):
         pool = self._pool()
-        self.assertEqual(len(pool.k_buffer), 24)
-        self.assertEqual(len({id(t) for t in pool.k_buffer}), 24)
-        self.assertEqual(len({id(t) for t in pool.v_buffer}), 24)
+        assert (len(pool.k_buffer)) == (24)
+        assert (len({id(t) for t in pool.k_buffer})) == (24)
+        assert (len({id(t) for t in pool.v_buffer})) == (24)
         for i in range(12):
-            self.assertIsNot(pool.k_buffer[2 * i], pool.k_buffer[2 * i + 1])
-            self.assertIsNot(pool.v_buffer[2 * i], pool.v_buffer[2 * i + 1])
-            self.assertEqual(
-                pool.k_buffer[2 * i].data_ptr(),
-                pool.k_buffer[2 * i + 1].data_ptr(),
+            assert (pool.k_buffer[2 * i]) is not (pool.k_buffer[2 * i + 1])
+            assert (pool.v_buffer[2 * i]) is not (pool.v_buffer[2 * i + 1])
+            assert (pool.k_buffer[2 * i].data_ptr()) == (
+                pool.k_buffer[2 * i + 1].data_ptr()
             )
         for buffers in (pool.k_buffer, pool.v_buffer):
             address_to_layers: dict[int, list[int]] = {}
             for layer_id, tensor in enumerate(buffers):
                 address_to_layers.setdefault(tensor.data_ptr(), []).append(layer_id)
-            self.assertEqual(len(address_to_layers), 12)
+            assert (len(address_to_layers)) == (12)
             for layer_ids in address_to_layers.values():
                 sliding = [lid for lid in layer_ids if lid % 2 == 0]
                 full = [lid for lid in layer_ids if lid % 2 == 1]
-                self.assertEqual(len(sliding), 1)
-                self.assertEqual(len(full), 1)
-        self.assertEqual(len({t.data_ptr() for t in pool.k_buffer}), 12)
-        self.assertEqual(len({t.data_ptr() for t in pool.v_buffer}), 12)
+                assert (len(sliding)) == (1)
+                assert (len(full)) == (1)
+        assert (len({t.data_ptr() for t in pool.k_buffer})) == (12)
+        assert (len({t.data_ptr() for t in pool.v_buffer})) == (12)
 
-    def test_fallback_matrix_keeps_24_buffers(self):
+    def test_fallback_matrix_keeps_24_buffers(self, subtests):
         cases = {
             "single_group": {
                 "layer_types": ("full_attention",) * 24,
@@ -255,10 +237,10 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             }
         }
         for name, overrides in cases.items():
-            with self.subTest(name):
+            with subtests.test(name):
                 pool = self._pool(**overrides)
-                self.assertEqual(len({id(t) for t in pool.k_buffer}), 24)
-                self.assertEqual(len({id(t) for t in pool.v_buffer}), 24)
+                assert (len({id(t) for t in pool.k_buffer})) == (24)
+                assert (len({id(t) for t in pool.v_buffer})) == (24)
 
     def test_unequal_groups_pair_smaller_into_larger(self):
         # 8 sliding + 16 full -> 16 slabs: the 8 sliding layers alias the
@@ -267,20 +249,16 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         pool = self._pool(
             layer_types=("sliding_attention",) * 8 + ("full_attention",) * 16
         )
-        self.assertEqual(len(pool.k_buffer), 24)
-        self.assertEqual(len({id(t) for t in pool.k_buffer}), 24)
-        self.assertEqual(len({id(t) for t in pool.v_buffer}), 24)
-        self.assertEqual(len({t.data_ptr() for t in pool.k_buffer}), 16)
-        self.assertEqual(len({t.data_ptr() for t in pool.v_buffer}), 16)
+        assert (len(pool.k_buffer)) == (24)
+        assert (len({id(t) for t in pool.k_buffer})) == (24)
+        assert (len({id(t) for t in pool.v_buffer})) == (24)
+        assert (len({t.data_ptr() for t in pool.k_buffer})) == (16)
+        assert (len({t.data_ptr() for t in pool.v_buffer})) == (16)
         for i in range(8):
-            self.assertEqual(
-                pool.k_buffer[i].data_ptr(), pool.k_buffer[8 + i].data_ptr()
-            )
-            self.assertEqual(
-                pool.v_buffer[i].data_ptr(), pool.v_buffer[8 + i].data_ptr()
-            )
+            assert (pool.k_buffer[i].data_ptr()) == (pool.k_buffer[8 + i].data_ptr())
+            assert (pool.v_buffer[i].data_ptr()) == (pool.v_buffer[8 + i].data_ptr())
         solo = [t.data_ptr() for t in pool.k_buffer[16:]]
-        self.assertEqual(len(set(solo)), 8)
+        assert (len(set(solo))) == (8)
 
     def test_sliding_subgroups_six_way_binding(self):
         # (s0..s4, full) x 2 -> 6 groups of 2 layers -> 2 slabs, each bound
@@ -290,24 +268,20 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             layer_types=SUBGROUP_LAYER_BLOCK * 2,
             sliding_window_tokens=512,
         )
-        self.assertEqual(len(pool.k_buffer), 12)
-        self.assertEqual(len({id(t) for t in pool.k_buffer}), 12)
-        self.assertEqual(len({id(t) for t in pool.v_buffer}), 12)
-        self.assertEqual(len({t.data_ptr() for t in pool.k_buffer}), 2)
-        self.assertEqual(len({t.data_ptr() for t in pool.v_buffer}), 2)
+        assert (len(pool.k_buffer)) == (12)
+        assert (len({id(t) for t in pool.k_buffer})) == (12)
+        assert (len({id(t) for t in pool.v_buffer})) == (12)
+        assert (len({t.data_ptr() for t in pool.k_buffer})) == (2)
+        assert (len({t.data_ptr() for t in pool.v_buffer})) == (2)
         for i in range(6):
-            self.assertEqual(pool.k_buffer[i].data_ptr(), pool.k_buffer[0].data_ptr())
-            self.assertEqual(
-                pool.k_buffer[6 + i].data_ptr(), pool.k_buffer[6].data_ptr()
-            )
-            self.assertEqual(pool.v_buffer[i].data_ptr(), pool.v_buffer[0].data_ptr())
-            self.assertEqual(
-                pool.v_buffer[6 + i].data_ptr(), pool.v_buffer[6].data_ptr()
-            )
-        self.assertNotEqual(pool.k_buffer[0].data_ptr(), pool.k_buffer[6].data_ptr())
+            assert (pool.k_buffer[i].data_ptr()) == (pool.k_buffer[0].data_ptr())
+            assert (pool.k_buffer[6 + i].data_ptr()) == (pool.k_buffer[6].data_ptr())
+            assert (pool.v_buffer[i].data_ptr()) == (pool.v_buffer[0].data_ptr())
+            assert (pool.v_buffer[6 + i].data_ptr()) == (pool.v_buffer[6].data_ptr())
+        assert (pool.k_buffer[0].data_ptr()) != (pool.k_buffer[6].data_ptr())
 
     def test_aliased_sliding_plan_publishes_one_typed_pd_arena(self):
-        from cache_pool_test_utils import make_layer_group_ids
+        from test.runtime.cache_pool_test_utils import make_layer_group_ids
 
         from tokenspeed.runtime.pd.cache_protocol import (
             build_arena_cache_transfer_contract,
@@ -331,19 +305,19 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
 
         layout, base_addr = build_arena_cache_transfer_contract(pool.arena)
 
-        self.assertTrue(pool.arena.supports_disaggregation)
-        self.assertEqual(base_addr, pool.arena.buffer.data_ptr())
-        self.assertEqual(layout.plan, pool.arena.plan)
-        groups = {spec.retention: spec for spec in layout.group_specs}
-        self.assertEqual(set(groups), {"full_history", "sliding_window"})
-        self.assertIsNone(groups["full_history"].sliding_window_tokens)
-        self.assertEqual(groups["sliding_window"].sliding_window_tokens, 128)
+        assert pool.arena.supports_disaggregation
+        assert (base_addr) == (pool.arena.buffer.data_ptr())
+        assert (layout.plan) == (pool.arena.plan)
+        groups = {spec.attn_kind: spec for spec in layout.group_specs}
+        assert (set(groups)) == ({"full_history", "sliding_window"})
+        assert (groups["full_history"].sliding_window_tokens) is None
+        assert (groups["sliding_window"].sliding_window_tokens) == (128)
 
     def test_arena_rejects_an_empty_group_spec_set(self):
         # Publication is unconditional: an arena with no groups is one no
         # scheduler can address, so it is rejected at construction rather
         # than left in a contract-less mode for callers to discover.
-        from cache_pool_test_utils import make_mha_memory_plan
+        from test.runtime.cache_pool_test_utils import make_mha_memory_plan
 
         from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 
@@ -357,13 +331,13 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             layer_types=("full_attention",),
         )
 
-        with self.assertRaisesRegex(ValueError, "at least one cache group spec"):
+        with pytest.raises((ValueError), match=("at least one cache group spec")):
             CacheArena(plan, "cpu", cache_group_specs=())
 
     def test_arena_aligns_recipe_specs_with_plan(self):
         # Recipe specs carry default packing; the arena overwrites it (and the
         # page counts) from the memory plan before publishing the contract.
-        from cache_pool_test_utils import make_arena, make_mha_memory_plan
+        from test.runtime.cache_pool_test_utils import make_arena, make_mha_memory_plan
 
         plan = make_mha_memory_plan(
             size=32,
@@ -385,21 +359,19 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             ),
         )
 
-        self.assertIsNotNone(arena.runtime_contract)
-        self.assertEqual(
-            [spec.group_id for spec in arena.cache_group_specs],
-            ["full_attention"],
+        assert (arena.runtime_contract) is not None
+        assert ([spec.group_id for spec in arena.cache_group_specs]) == (
+            ["full_attention"]
         )
-        self.assertEqual(
-            arena.cache_group_page_counts["full_attention"],
-            plan.group("full_attention").page_count,
+        assert (arena.cache_group_page_counts["full_attention"]) == (
+            plan.group("full_attention").page_count
         )
         # No explicit token capacity: the arena falls back to child capacity.
-        self.assertEqual(arena.runtime_contract.token_capacity, 32)
+        assert (arena.runtime_contract.token_capacity) == (32)
 
 
-class MLAPoolAllocationHookTest(unittest.TestCase):
-    def setUp(self):
+class TestMLAPoolAllocationHookTest:
+    def setup_method(self):
         try:
             import torch
 
@@ -407,13 +379,13 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
                 MLATokenToKVPool,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.MLATokenToKVPool = MLATokenToKVPool
 
     def test_pool_arranges_arena_views_without_allocating(self):
         torch = self.torch
-        from cache_pool_test_utils import make_mla_memory_plan, make_pool
+        from test.runtime.cache_pool_test_utils import make_mla_memory_plan, make_pool
 
         arena, pool = make_pool(
             self.MLATokenToKVPool,
@@ -441,30 +413,25 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
 
         # The pool allocates nothing: each per-layer buffer is a reshape of
         # the arena view the plan already materialized.
-        self.assertEqual(
-            pool.kv_buffer[0].untyped_storage().data_ptr(),
-            arena.buffer.untyped_storage().data_ptr(),
+        assert (pool.kv_buffer[0].untyped_storage().data_ptr()) == (
+            arena.buffer.untyped_storage().data_ptr()
         )
-        self.assertEqual(tuple(pool.kv_buffer[0].shape[1:]), (1, 6))
-        self.assertEqual(
-            [spec.group_id for spec in pool.arena.cache_group_specs],
-            ["full_attention"],
+        assert (tuple(pool.kv_buffer[0].shape[1:])) == ((1, 6))
+        assert ([spec.group_id for spec in pool.arena.cache_group_specs]) == (
+            ["full_attention"]
         )
-        self.assertGreater(
-            pool.arena.cache_group_page_counts["full_attention"],
-            1,
-        )
+        assert (pool.arena.cache_group_page_counts["full_attention"]) > (1)
 
 
-class StateCacheGroupPageCountTest(unittest.TestCase):
+class TestStateCacheGroupPageCountTest:
     """The scheduler's capacity model over a state + full-history pair: a
-    snapshot-state group's demand is a fixed working set per live request
-    (retained input checkpoint, aligned checkpoint, final continuation and
-    banked growth), independent of how much history the requests hold.
+    state group's demand is two blocks per live request (the input checkpoint
+    and the live block), independent of how much history the requests hold,
+    how the chunk is cut or how deep the overlap runs.
     Needs the real package and the scheduler extension.
     """
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import tokenspeed_scheduler  # noqa: F401
 
@@ -472,7 +439,7 @@ class StateCacheGroupPageCountTest(unittest.TestCase):
                 scheduler_bridge,
             )
         except ImportError as exc:
-            self.skipTest(f"page-count math needs the scheduler extension: {exc}")
+            pytest.skip(f"page-count math needs the scheduler extension: {exc}")
 
     def _pages(
         self,
@@ -516,40 +483,34 @@ class StateCacheGroupPageCountTest(unittest.TestCase):
 
     def test_state_count_positive_and_bounded_by_full_history(self):
         pages = self._pages()
-        self.assertGreater(pages["linear_attention"], 0)
-        self.assertLessEqual(pages["linear_attention"], pages["full_attention"])
+        assert (pages["linear_attention"]) > (0)
+        assert (pages["linear_attention"]) <= (pages["full_attention"])
 
-    def test_state_branch_is_independent_of_total_token_width(self):
+    def test_state_demand_is_two_blocks_per_live_request(self):
         small = self._pages(max_total_tokens=128)
         large = self._pages(max_total_tokens=1 << 20)
-        self.assertEqual(small["linear_attention"], large["linear_attention"])
-        # Per live request: the retained input checkpoint, the aligned
-        # checkpoint, and 1 + ceil((15 + 16) / 16) blocks for an unaligned
-        # finishing tail plus one banked growth block -- four, times two.
-        self.assertEqual(small["linear_attention"], 2 * 4)
-        # A chunk that always ends on a block boundary has no tail to hold.
-        self.assertEqual(
-            self._pages(max_scheduled_tokens=16)["linear_attention"], 2 * 3
-        )
+        assert (small["linear_attention"]) == (large["linear_attention"])
+        assert (small["linear_attention"]) == (2 * 2)
+        assert (self._pages(max_scheduled_tokens=16)["linear_attention"]) == (2 * 2)
+        assert (self._pages(max_scheduled_tokens=37)["linear_attention"]) == (2 * 2)
 
-    def test_overlap_protects_a_growth_block_only_past_one_block(self):
-        # One protected token still fits the banked growth block.
-        baseline = self._pages(overlap_schedule_depth=0, decode_input_tokens=1)
-        overlapped = self._pages(overlap_schedule_depth=1, decode_input_tokens=1)
-        self.assertEqual(baseline["linear_attention"], overlapped["linear_attention"])
-        # A full-block decode width plus its protected step needs one more.
-        wide = self._pages(overlap_schedule_depth=0, decode_input_tokens=16)
-        wide_overlapped = self._pages(overlap_schedule_depth=1, decode_input_tokens=16)
-        self.assertEqual(
-            wide_overlapped["linear_attention"] - wide["linear_attention"], 2 * 1
-        )
+    def test_overlap_and_decode_width_change_nothing_for_state(self):
+        for depth in (0, 1):
+            for width in (1, 16):
+                _pytest_first_1 = self._pages(
+                    overlap_schedule_depth=depth, decode_input_tokens=width
+                )["linear_attention"]
+                _pytest_second_2 = 2 * 2
+                _pytest_msg_3 = (depth, width)
+                assert _pytest_first_1 == _pytest_second_2, _pytest_msg_3
 
 
-class CachePoolFieldBindingTest(unittest.TestCase):
-    def setUp(self):
+class TestCachePoolFieldBindingTest:
+    def setup_method(self):
         try:
+            from test.runtime.cache_pool_test_utils import plan_fields
+
             import torch
-            from cache_pool_test_utils import plan_fields
 
             from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
                 HybridMHATokenToKVPool,
@@ -561,7 +522,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
                 CacheFieldSpec,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.pool_cls = HybridMHATokenToKVPool
         self.mha_pool_cls = MHATokenToKVPool
@@ -591,7 +552,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
         )
 
     def _pool(self):
-        from cache_pool_test_utils import make_pool
+        from test.runtime.cache_pool_test_utils import make_pool
 
         _, pool = make_pool(
             self.pool_cls,
@@ -612,7 +573,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
         return pool
 
     def _ordinary_pool(self):
-        from cache_pool_test_utils import make_mha_memory_plan, make_pool
+        from test.runtime.cache_pool_test_utils import make_mha_memory_plan, make_pool
 
         _, pool = make_pool(
             self.mha_pool_cls,
@@ -637,67 +598,64 @@ class CachePoolFieldBindingTest(unittest.TestCase):
         pool = self._pool()
 
         conv, ssm = pool.get_state_buffers(0)
-        self.assertIsNone(pool.k_buffer[0])
-        self.assertIsNone(pool.v_buffer[0])
-        self.assertIsNotNone(pool.k_buffer[1])
-        self.assertIsNotNone(pool.v_buffer[1])
-        self.assertEqual(
-            conv.untyped_storage().data_ptr(),
-            pool.arena.field("layer.0.conv").untyped_storage().data_ptr(),
+        assert (pool.k_buffer[0]) is None
+        assert (pool.v_buffer[0]) is None
+        assert (pool.k_buffer[1]) is not None
+        assert (pool.v_buffer[1]) is not None
+        assert (conv.untyped_storage().data_ptr()) == (
+            pool.arena.field("layer.0.conv").untyped_storage().data_ptr()
         )
-        self.assertEqual(
-            ssm.untyped_storage().data_ptr(),
-            pool.arena.field("layer.0.ssm").untyped_storage().data_ptr(),
+        assert (ssm.untyped_storage().data_ptr()) == (
+            pool.arena.field("layer.0.ssm").untyped_storage().data_ptr()
         )
 
     def test_pool_publishes_runtime_contract_and_component_mapping(self):
         pool = self._pool()
 
-        self.assertEqual(pool.arena.runtime_contract.prefix_granularity, 4)
-        self.assertEqual(pool.arena.runtime_contract.num_lcm_blocks, 1)
-        self.assertEqual(
-            pool.arena.runtime_contract.group_page_counts,
-            {"linear_attention_0": 3, "full_attention": 2},
+        assert (pool.arena.runtime_contract.prefix_granularity) == (4)
+        assert (pool.arena.runtime_contract.num_lcm_blocks) == (1)
+        assert (pool.arena.runtime_contract.group_page_counts) == (
+            {"linear_attention_0": 3, "full_attention": 2}
         )
-        self.assertEqual(pool.state_group_by_layer[0], "linear_attention_0")
+        assert (pool.state_group_by_layer[0]) == ("linear_attention_0")
         conv, ssm = pool.get_state_buffers(0)
-        self.assertIs(pool.get_component(0, "conv_state"), conv)
-        self.assertIs(pool.get_component(0, "recurrent_state"), ssm)
+        assert (pool.get_component(0, "conv_state")) is (conv)
+        assert (pool.get_component(0, "recurrent_state")) is (ssm)
 
     def test_pool_rejects_unknown_state_layer_and_field(self):
         pool = self._pool()
 
-        with self.assertRaisesRegex(ValueError, "not a state layer"):
+        with pytest.raises((ValueError), match=("not a state layer")):
             pool.get_state_buffers(1)
-        with self.assertRaisesRegex(ValueError, "not planned"):
+        with pytest.raises((ValueError), match=("not planned")):
             pool.arena.field("missing")
 
     def test_ordinary_pool_keeps_ordinary_per_layer_kv(self):
         pool = self._ordinary_pool()
 
-        self.assertTrue(all(buffer is not None for buffer in pool.k_buffer))
-        self.assertTrue(all(buffer is not None for buffer in pool.v_buffer))
-        self.assertFalse(hasattr(pool, "lcm_pool"))
-        self.assertFalse(hasattr(pool, "state_slabs"))
+        assert all(buffer is not None for buffer in pool.k_buffer)
+        assert all(buffer is not None for buffer in pool.v_buffer)
+        assert not (hasattr(pool, "lcm_pool"))
+        assert not (hasattr(pool, "state_slabs"))
 
 
-class DeriveStateGroupsByLayerTest(unittest.TestCase):
+class TestDeriveStateGroupsByLayerTest:
     """The plan's field declarations are the single layer -> group record."""
 
-    def setUp(self):
+    def setup_method(self):
         try:
             from tokenspeed.runtime.layers.attention.kv_cache.base import (
                 derive_state_groups_by_layer,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
         self.derive = partial(
             derive_state_groups_by_layer,
             state_field_suffixes=("conv", "ssm"),
         )
 
     @staticmethod
-    def _arena(fields, families):
+    def _arena(fields, attn_kinds):
         from types import SimpleNamespace
 
         return SimpleNamespace(
@@ -708,8 +666,8 @@ class DeriveStateGroupsByLayerTest(unittest.TestCase):
                 )
             ),
             cache_group_specs=tuple(
-                SimpleNamespace(group_id=group_id, family=family)
-                for group_id, family in families.items()
+                SimpleNamespace(group_id=group_id, attn_kind=attn_kind)
+                for group_id, attn_kind in attn_kinds.items()
             ),
         )
 
@@ -722,14 +680,14 @@ class DeriveStateGroupsByLayerTest(unittest.TestCase):
                 ("layer.1.k", "full_attention"),
                 ("layer.1.v", "full_attention"),
             ),
-            families={
+            attn_kinds={
                 "linear_attention_0": "state",
                 "qwen4_exp_ple": "state",
-                "full_attention": "history",
+                "full_attention": "full_history",
             },
         )
         mapping = self.derive(arena, first_layer=0, num_layers=2, state_layer_ids=(0,))
-        self.assertEqual(mapping, {0: "linear_attention_0"})
+        assert (mapping) == ({0: "linear_attention_0"})
 
     def test_draft_view_window_offsets_layer_ids(self):
         arena = self._arena(
@@ -737,10 +695,13 @@ class DeriveStateGroupsByLayerTest(unittest.TestCase):
                 ("layer.0.k", "full_attention"),
                 ("layer.1.conv", "linear_attention_0"),
             ),
-            families={"linear_attention_0": "state", "full_attention": "history"},
+            attn_kinds={
+                "linear_attention_0": "state",
+                "full_attention": "full_history",
+            },
         )
         mapping = self.derive(arena, first_layer=1, num_layers=1, state_layer_ids=(0,))
-        self.assertEqual(mapping, {0: "linear_attention_0"})
+        assert (mapping) == ({0: "linear_attention_0"})
 
     def test_rejects_a_layer_spanning_two_state_groups(self):
         arena = self._arena(
@@ -748,14 +709,14 @@ class DeriveStateGroupsByLayerTest(unittest.TestCase):
                 ("layer.0.conv", "linear_attention_0"),
                 ("layer.0.ssm", "linear_attention_1"),
             ),
-            families={
+            attn_kinds={
                 "linear_attention_0": "state",
                 "linear_attention_1": "state",
             },
         )
-        with self.assertRaisesRegex(ValueError, "more than one cache group"):
+        with pytest.raises((ValueError), match=("more than one cache group")):
             self.derive(arena, first_layer=0, num_layers=1, state_layer_ids=(0,))
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

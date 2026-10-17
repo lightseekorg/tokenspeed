@@ -244,7 +244,7 @@ def test_bf16_mode_unchanged() -> None:
 
 
 def test_qkvfab_fp8_w8a8_matches_dequant_reference() -> None:
-    from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_qkvfab_projection
+    from tokenspeed_kernel.ops.gemm import kimi3_qkvfab_projection
 
     torch.manual_seed(1)
     ckpt = _make_ckpt_segments(torch.Generator().manual_seed(20260819))
