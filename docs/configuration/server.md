@@ -1223,10 +1223,12 @@ admitted past it. The Host cache executor's prefetch lane (a CPU thread)
 fills the pages in prefix order, `--kvstore-prefetch-batch-pages` per
 `batch_get_into`, and stops at the first missing page or at the deadline
 `--kvstore-prefetch-timeout-base-s + --kvstore-prefetch-timeout-per-page-s
-x pages`, counted from when the op starts on the lane and checked between
-batches only (a `batch_get_into` already issued runs to completion -- the
-store API has no timeout -- so one batch may overrun the deadline, and a
-hung store holds the lane and every later prefetch behind it); the replica
+x pages`, counted from submission and checked between batches. A
+`batch_get_into` already issued runs to completion -- the store API has no
+timeout -- so one batch may overrun the deadline, and a hung store holds
+its active pages. Queued prefetches whose workers have not started may be
+cancelled as misses after their deadline expires; active native calls
+remain pinned until completion. The replica
 agrees (a MIN across TP, CP and PP) on the pages
 landed, the scheduler publishes exactly that prefix in Host L2 and forgets
 the rest of the keys, and the request's admission is then an ordinary Host
