@@ -207,6 +207,9 @@ class V41SWAQueryPlan:
 
 @dataclass
 class V41IndexGeometry:
+    # positions, request_indices and source_table are never read back: they
+    # pin the tensors whose id()s key the per-invocation geometry cache, so a
+    # freed tensor's id cannot be reused for a false hit while the entry lives.
     positions: torch.Tensor
     request_indices: torch.Tensor
     source_table: torch.Tensor
