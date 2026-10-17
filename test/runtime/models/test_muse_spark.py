@@ -794,8 +794,9 @@ def test_attention_leaves_norm_rope_and_kv_write_to_the_prologue(
 
 @requires_gpu
 @pytest.mark.parametrize("with_rope", [False, True])
+@pytest.mark.parametrize("world_size", [4, 8])
 def test_owned_attention_stores_prepared_rows_once(
-    monkeypatch: pytest.MonkeyPatch, with_rope: bool
+    monkeypatch: pytest.MonkeyPatch, with_rope: bool, world_size: int
 ) -> None:
     """Prepared receiver outputs pass through the real prologue's cache store,
     preserving prefix slots and reaching attention without another head norm."""
@@ -804,8 +805,9 @@ def test_owned_attention_stores_prepared_rows_once(
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers import paged_attention
 
-    rows, head_dim, heads, kv_heads = 2049, 64, 32, 4
+    rows, head_dim, heads, kv_heads = 2049, 64, 128 // world_size, 16 // world_size
     attention = _stub(MuseSparkAttention)
+    attention.tp_size = world_size
     attention.hidden_size, attention.head_dim = 8192, head_dim
     attention.num_heads, attention.num_kv_heads = heads, kv_heads
     attention.q_size, attention.kv_size = heads * head_dim, kv_heads * head_dim
@@ -845,10 +847,11 @@ def test_owned_attention_stores_prepared_rows_once(
             attention.q_size,
         )
     )
-    local_rows = (rows + 3) // 4
+    local_rows = (rows + world_size - 1) // world_size
     local = torch.empty(local_rows, 8192, dtype=torch.bfloat16, device="cuda")
     attention.qkv_proj = SimpleNamespace(
-        project_owned_rows=lambda value, global_rows: value, tp_group=(0, 1, 2, 3)
+        project_owned_rows=lambda value, global_rows: value,
+        tp_group=tuple(range(world_size)),
     )
     attention._project = lambda value: (value, None, 1)
 
@@ -1301,7 +1304,7 @@ def test_attention_output_preserves_dense_projection(
         assert result.data_ptr() == output.data_ptr()
 
 
-def _gathered_mxfp4_workspace_worker(rank: int, port: int) -> None:
+def _gathered_mxfp4_workspace_worker(rank: int, port: int, world_size: int) -> None:
     from tokenspeed_kernel.ops.communication._iris.muse_spark import (
         prepare_muse_communication,
     )
@@ -1312,7 +1315,7 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int) -> None:
         backend="gloo",
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
-        world_size=4,
+        world_size=world_size,
     )
     try:
         device = torch.device("cuda", rank)
@@ -1327,7 +1330,7 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int) -> None:
         )
         torch.set_default_dtype(torch.bfloat16)
         with torch.device(device):
-            linear = _shard_linear(4096, 256, tp_rank=rank, tp_size=4)
+            linear = _shard_linear(4096, 256, tp_rank=rank, tp_size=world_size)
         linear.weight.data.zero_()
         linear.weight.data[:, rank] = 1
         linear.workspace = torch.zeros(64, 4096, device=device)
@@ -1342,10 +1345,12 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int) -> None:
             )
             for tokens in (64, 65):
                 x = torch.ones(tokens, 256, device=device)
-                x[:, :4] = torch.arange(1, 5, device=device)
+                x[:, :world_size] = torch.arange(1, world_size + 1, device=device)
                 rows, packed = linear.forward_mxfp4(x, norm_weight, 1e-6, 1.0)
                 assert rows.shape == (tokens, 4096)
-                expected_rows = x[:, :4].repeat_interleave(1024, dim=1)
+                expected_rows = x[:, :world_size].repeat_interleave(
+                    4096 // world_size, dim=1
+                )
                 expected = rmsnorm_mxfp4_quant(expected_rows, norm_weight, 1e-6, 1.0)
                 torch.testing.assert_close(packed[0], expected[0], atol=0, rtol=0)
                 m = torch.arange(tokens, device=device)[:, None]
@@ -1356,8 +1361,8 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int) -> None:
                     + m // 32 * 4096
                 )
                 torch.testing.assert_close(
-                    packed[1].flatten()[offsets],
-                    expected[1].flatten()[offsets],
+                    packed[1].T.flatten()[offsets],
+                    expected[1].T.flatten()[offsets],
                     atol=0,
                     rtol=0,
                 )
@@ -1369,17 +1374,26 @@ def _gathered_mxfp4_workspace_worker(rank: int, port: int) -> None:
 
 
 @requires_gpu
-def test_gathered_mxfp4_preserves_rows_across_workspace_boundary() -> None:
-    if not current_platform().is_cdna4 or torch.cuda.device_count() < 4:
-        pytest.skip("requires four CDNA4 GPUs")
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_gathered_mxfp4_preserves_rows_across_workspace_boundary(world_size) -> None:
+    if not current_platform().is_cdna4 or torch.cuda.device_count() < world_size:
+        pytest.skip(f"requires {world_size} CDNA4 GPUs")
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-    mp.spawn(_gathered_mxfp4_workspace_worker, args=(port,), nprocs=4, join=True)
+    mp.spawn(
+        _gathered_mxfp4_workspace_worker,
+        args=(port, world_size),
+        nprocs=world_size,
+        join=True,
+    )
 
 
 @requires_gpu
-def test_replicated_pool_preserves_column_projection_after_reload(bf16_default_dtype):
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_replicated_pool_preserves_column_projection_after_reload(
+    bf16_default_dtype, world_size
+):
 
     torch.manual_seed(123)
     full_weight = torch.randn((4096, 8192), device="cuda", dtype=torch.bfloat16)
@@ -1387,7 +1401,7 @@ def test_replicated_pool_preserves_column_projection_after_reload(bf16_default_d
         torch.randn((rows, 8192), device="cuda", dtype=torch.bfloat16)
         for rows in (1, 17)
     ]
-    for rank in range(4):
+    for rank in range(world_size):
         pre_expert = object.__new__(module._MuseGatheredLinear)
         ColumnParallelLinear.__init__(
             pre_expert,
@@ -1400,11 +1414,11 @@ def test_replicated_pool_preserves_column_projection_after_reload(bf16_default_d
             tp_group=None,
         )
         pre_expert = pre_expert.cuda()
-        pre_expert.rank, pre_expert.group = rank, (0, 1, 2, 3)
+        pre_expert.rank, pre_expert.group = rank, tuple(range(world_size))
         pre_expert.gather_column_view = True
         pre_expert.workspace = None
         pre_expert.multicast = None
-        reference = _shard_linear(4096, 8192, rank, 4).cuda()
+        reference = _shard_linear(4096, 8192, rank, world_size).cuda()
         for scale in (1.0, -0.5):
             loaded = full_weight * scale
             pre_expert.weight_loader(pre_expert.weight, loaded)

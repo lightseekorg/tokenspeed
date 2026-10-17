@@ -24,8 +24,8 @@
 from tokenspeed_kernel._triton import gl, gluon
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_drain_subgroup_vmem,
-    _iris_tp4_heap_base,
-    _tp4_rendezvous,
+    _iris_group_heap_base,
+    _iris_rendezvous,
 )
 
 
@@ -98,36 +98,37 @@ def iris_fused_pull_allgather_muse_attntail(
 ):
     """Gather reduced attention rows and update Muse's full-row residuals.
 
-    Read BF16 shards from branch_sym_ptr across four ranks, masking padded rows.
+    Read BF16 shards from branch_sym_ptr across the group, masking padded rows.
     Apply post-normalization, the alpha/beta residual update, and MoE input
     normalization. Write the FP32 residual and router input plus the BF16 pre-expert projection
     input to the supplied outputs. Peer counters protect the source shard until
     every rank has finished reading it.
     """
+    WORLD_SIZE: gl.constexpr = len(heaps)
     gl.static_assert(WIDTH == 8192)
     program = gl.program_id(0)
     epoch = (
-        gl.atomic_add(ready_flags + program * 4 + RANK, 1, sem="relaxed", scope="gpu")
+        gl.atomic_add(
+            ready_flags + program * WORLD_SIZE + RANK, 1, sem="relaxed", scope="gpu"
+        )
         + 1
     )
     # Attention scatter uses write-through stores; no cache writeback is needed at entry.
     _iris_drain_subgroup_vmem()
     gl.barrier()
-    _tp4_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, False)
+    _iris_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, False)
     layout: gl.constexpr = gl.BlockedLayout(
         [ELEMENTS_PER_THREAD], [64], [NUM_WARPS], [0]
     )
     columns = gl.arange(0, WIDTH, layout=layout)
     branch_offset = branch_sym_ptr.to(gl.uint64) - heaps[RANK]
     # Interleave owners so the persistent grid uses every peer link together.
-    for job in range(program, 4 * local_rows, gl.num_programs(0)):
-        owner = job % 4
-        local_row = job // 4
+    for job in range(program, WORLD_SIZE * local_rows, gl.num_programs(0)):
+        owner = job % WORLD_SIZE
+        local_row = job // WORLD_SIZE
         row = owner * local_rows + local_row
         if row < rows:
-            source_base = gl.where(owner == 0, heaps[0], heaps[3])
-            source_base = gl.where(owner == 1, heaps[1], source_base)
-            source_base = gl.where(owner == 2, heaps[2], source_base)
+            source_base = _iris_group_heap_base(owner, heaps)
             source = gl.multiple_of(
                 (source_base + branch_offset).to(gl.pointer_type(gl.bfloat16)), 16
             )
@@ -155,8 +156,14 @@ def iris_fused_pull_allgather_muse_attntail(
     # Every rank consumed these rows before the next producer reuses its shard.
     _iris_drain_subgroup_vmem()
     gl.barrier()
-    _tp4_rendezvous(
-        ready_flags + FLAG_ROWS * 4, heaps, program, epoch, RANK, NUM_WARPS, False
+    _iris_rendezvous(
+        ready_flags + FLAG_ROWS * WORLD_SIZE,
+        heaps,
+        program,
+        epoch,
+        RANK,
+        NUM_WARPS,
+        False,
     )
 
 
@@ -187,14 +194,14 @@ def iris_fused_push_oneshot_allreduce_muse_attntail(
     ELEMENTS_PER_THREAD: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    """All-reduce TP4 attention contributions and update Muse's residuals.
+    """All-reduce TP4/TP8 attention contributions and update Muse's residuals.
 
     Push each BF16 branch_ptr row into peer inboxes, sum in FP32 rank order, and
     round to BF16 before post-normalization. Apply the alpha/beta residual update
     and MoE input norm, writing FP32 residual/router and BF16 pre-expert projection outputs.
     Per-row generations and two alternating inbox slots protect successive uses.
     """
-    gl.static_assert(WORLD_SIZE == 4)
+    gl.static_assert(WORLD_SIZE == 4 or WORLD_SIZE == 8)
     gl.static_assert(WIDTH == 8192)
     row = gl.program_id(0)
     layout: gl.constexpr = gl.BlockedLayout(
@@ -205,12 +212,12 @@ def iris_fused_push_oneshot_allreduce_muse_attntail(
     local = gl.amd.cdna4.buffer_load(branch_ptr, offsets)
     generation = gl.load(generations + row) + 1
     slot = generation & 1
-    local_heap = _iris_tp4_heap_base(RANK, heaps)
+    local_heap = _iris_group_heap_base(RANK, heaps)
     inbox_offset = inbox_ptr.to(gl.uint64) - local_heap
     slot_offset = slot * WORLD_SIZE * MAX_ROWS * WIDTH
     for delta in gl.static_range(1, WORLD_SIZE):
         peer = (RANK + delta) % WORLD_SIZE
-        peer_heap = _iris_tp4_heap_base(peer, heaps)
+        peer_heap = _iris_group_heap_base(peer, heaps)
         destination = gl.multiple_of(
             (peer_heap + inbox_offset).to(gl.pointer_type(gl.bfloat16)), 16
         )
@@ -222,7 +229,7 @@ def iris_fused_push_oneshot_allreduce_muse_attntail(
         )
     _iris_drain_subgroup_vmem()
     gl.barrier()
-    _tp4_rendezvous(
+    _iris_rendezvous(
         ready_flags + slot * MAX_ROWS * WORLD_SIZE,
         heaps,
         row,

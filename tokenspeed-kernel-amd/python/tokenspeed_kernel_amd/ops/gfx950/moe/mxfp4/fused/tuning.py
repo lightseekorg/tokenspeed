@@ -48,7 +48,7 @@ class _GroupedMoEConfig(NamedTuple):
 # Key: hidden width, intermediate width, padded W2 K, local/global experts, top-k.
 # Entries: inclusive row bounds and the shared sorting/GEMM configuration.
 _GROUPED_MOE_CONFIGS = {
-    (4096, 4096, 4096, 64, 256, 8): (
+    (4096, 4096, 4096, local_experts, 256, 8): (
         (
             49,
             128,
@@ -66,7 +66,8 @@ _GROUPED_MOE_CONFIGS = {
                 64, 2, use_minimum_route_chunks=False, runtime_rows=False
             ),
         ),
-    ),
+    )
+    for local_experts in (32, 64)
 }
 
 

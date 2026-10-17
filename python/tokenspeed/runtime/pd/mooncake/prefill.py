@@ -73,9 +73,9 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.network import (
-    get_free_port,
     get_ip,
     get_local_ip_by_remote,
+    join_host_port,
 )
 
 logger = get_colorful_logger(__name__)
@@ -772,11 +772,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                         self._mark_session_failed(
                             req.mooncake_session_id, reason="send_cache_layerwise"
                         )
+                    peer = join_host_port(registration.endpoint, registration.dst_port)
                     self.abort_room(
                         kv_chunk.room,
                         f"Failed to send cache layer interval of "
-                        f"{kv_chunk.room} to "
-                        f"{registration.endpoint}:{registration.dst_port}",
+                        f"{kv_chunk.room} to {peer}",
                     )
                     return False
                 self.kv_transfer_metrics.observe_kv_transfer_latency(
@@ -833,8 +833,6 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         bootstrap_token: int = -1,
         spec_candidate_ids: list[int] | None = None,
     ):
-        if ":" in remote:
-            remote = remote.split(":")[0]
         spec_candidate_payload = (
             np.asarray(spec_candidate_ids, dtype=np.int32).tobytes()
             if spec_candidate_ids is not None
@@ -850,7 +848,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             if bootstrap_logprob is not None
             else b""
         )
-        socket, lock = self._connect("tcp://" + remote + ":" + str(dst_port))
+        socket, lock = self._connect(f"tcp://{join_host_port(remote, dst_port)}")
         with lock:
             socket.send_multipart(
                 [
@@ -991,10 +989,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                             self._mark_session_failed(
                                 req.mooncake_session_id, reason="send_kvcache"
                             )
-                        raise RuntimeError(
-                            "Mooncake transfer failed for "
-                            f"{registration.endpoint}:{registration.dst_port}"
+                        peer = join_host_port(
+                            registration.endpoint, registration.dst_port
                         )
+                        raise RuntimeError(f"Mooncake transfer failed for {peer}")
                     self.kv_transfer_metrics.observe_kv_transfer_latency(
                         time.monotonic() - started_at
                     )
@@ -1172,8 +1170,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             self.update_status(parsed_room, TransferPoll.Bootstrapped)
 
     def start_prefill_thread(self):
-        self.rank_port = get_free_port()
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
+        self.bind_server_socket(get_local_ip_by_remote())
 
         def bootstrap_thread():
             """Receive registrations and pre-allocation manifests from Decode."""
@@ -1238,7 +1235,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         # requests with the same dst_sessions will be added into the same
         # queue, which enables early abort with failed sessions.
         dst_infos = self.transfer_infos[bootstrap_room].keys()
-        session_port_sum = sum(int(session.split(":")[1]) for session in dst_infos)
+        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
 
         self.transfer_queues[shard_idx].put(
@@ -1262,8 +1259,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         else:
             ip_address = get_ip()
 
-        bootstrap_server_url = f"{ip_address}:{self.bootstrap_port}"
-        url = f"http://{bootstrap_server_url}/route"
+        url = f"http://{join_host_port(ip_address, self.bootstrap_port)}/route"
         payload = {
             "role": "Prefill",
             "world_size": self.topology.world_size,

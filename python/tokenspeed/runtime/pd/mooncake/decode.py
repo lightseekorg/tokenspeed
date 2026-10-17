@@ -38,7 +38,7 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
 from tokenspeed.runtime.utils.env import envs
-from tokenspeed.runtime.utils.network import get_free_port, get_local_ip_by_remote
+from tokenspeed.runtime.utils.network import get_local_ip_by_remote
 
 logger = get_colorful_logger(__name__)
 
@@ -126,8 +126,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         self.start_decode_thread()
 
     def start_decode_thread(self):
-        self.rank_port = get_free_port()
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
+        self.bind_server_socket(get_local_ip_by_remote())
         # Maps bootstrap_room -> bootstrap_token (first output token from prefill).
         # Populated by decode_thread when a Success message carries a valid token,
         # consumed by DisaggDecodeExecutor.generate_events() via pop_bootstrap_token().

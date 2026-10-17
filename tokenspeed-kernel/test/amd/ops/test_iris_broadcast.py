@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 
-"""Bit-preserving TP4 broadcast under noncontiguous groups and graph replay."""
+"""Bit-preserving TP4/TP8 broadcast under noncontiguous groups and graph replay."""
 
 import socket
 import traceback
@@ -31,7 +31,7 @@ import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
-    not current_platform().is_cdna4, reason="TP4 broadcast requires gfx950"
+    not current_platform().is_cdna4, reason="TP4/TP8 broadcast requires gfx950"
 )
 
 
@@ -86,9 +86,22 @@ def _communication_worker(rank, world_size, port, check, backend, error_dict):
 
 
 def _broadcast_subgroup_worker(rank, world_size, device):
-    ranks = (tuple(range(0, world_size, 2)), tuple(range(1, world_size, 2)))
+    _broadcast_worker(rank, world_size, device, True)
+
+
+def _broadcast_world_worker(rank, world_size, device):
+    _broadcast_worker(rank, world_size, device, False)
+
+
+def _broadcast_worker(rank, world_size, device, subgroup):
+    ranks = (
+        (tuple(range(0, world_size, 2)), tuple(range(1, world_size, 2)))
+        if subgroup
+        else (tuple(range(world_size)),)
+    )
+    group_index = rank % 2 if subgroup else 0
     groups = tuple(dist.new_group(r) for r in ranks)
-    group_rank = ranks[rank % 2].index(rank)
+    group_rank = ranks[group_index].index(rank)
     from tokenspeed_kernel.ops.communication._iris import (
         IrisGroup,
         get_or_create_context,
@@ -97,7 +110,7 @@ def _broadcast_subgroup_worker(rank, world_size, device):
     from utils import assert_no_triton_compile
 
     ctx = get_or_create_context(heap_size=256 << 20)
-    peers = IrisGroup(ctx, groups[rank % 2], group_rank, device)
+    peers = IrisGroup(ctx, groups[group_index], group_rank, device)
     state = IrisBroadcast(peers, 8192)
     peers.finish_prepare()
     counts = (1, 63, 64, 65, 8191, 8192, 8193, 16385, 1)
@@ -124,7 +137,7 @@ def _broadcast_subgroup_worker(rank, world_size, device):
     for step in range(4):
         expected = []
         for n, value in zip(counts, inputs):
-            torch.manual_seed(8000 + n + 17 * step + rank % 2)
+            torch.manual_seed(8000 + n + 17 * step + group_index)
             reference = torch.randint(
                 -2147483648,
                 2147483647,
@@ -136,7 +149,7 @@ def _broadcast_subgroup_worker(rank, world_size, device):
                 reference[: extrema.numel()].copy_(extrema.roll(step % 6))
             expected.append(reference)
             value.copy_(reference if group_rank == 0 else reference ^ group_rank)
-        if group_rank == step % 4:
+        if group_rank == step % peers.world_size:
             torch.cuda._sleep(10000)
         graph.replay()
         for actual, reference in zip(outputs, expected):
@@ -144,10 +157,11 @@ def _broadcast_subgroup_worker(rank, world_size, device):
     torch.cuda.synchronize()
 
 
-def test_iris_broadcast_subgroup_mailbox_replay_and_tails():
-    _skip_if_unsupported(8, "Iris TP4 broadcast subgroup tests")
+@pytest.mark.parametrize("check", [_broadcast_subgroup_worker, _broadcast_world_worker])
+def test_iris_broadcast_mailbox_replay_and_tails(check):
+    _skip_if_unsupported(8, "Iris TP4/TP8 broadcast subgroup tests")
     _spawn_and_collect(
         _communication_worker,
-        (8, _get_open_port(), _broadcast_subgroup_worker, "gloo"),
+        (8, _get_open_port(), check, "gloo"),
         8,
     )

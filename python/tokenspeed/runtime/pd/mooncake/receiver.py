@@ -28,6 +28,7 @@ from dataclasses import dataclass
 import requests
 import zmq
 
+from tokenspeed.runtime.pd.base.manager import enable_ipv6_for_endpoint
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
     CachePDBlockManifest,
@@ -42,7 +43,7 @@ from tokenspeed.runtime.pd.transfer_plan import (
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
-from tokenspeed.runtime.utils.network import get_local_ip_by_remote
+from tokenspeed.runtime.utils.network import get_local_ip_by_remote, join_host_port
 
 logger = get_colorful_logger(__name__)
 
@@ -250,8 +251,8 @@ class MooncakeKVReceiver:
 
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:
-            self.prefill_server_url = (
-                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+            self.prefill_server_url = join_host_port(
+                bootstrap_info["rank_ip"], bootstrap_info["rank_port"]
             )
             packed_kv_data_ptr = struct.pack("Q", self.kv_mgr.kv_args.kv_data_ptr)
             cache_layout = self.kv_mgr.kv_args.cache_layout
@@ -278,6 +279,7 @@ class MooncakeKVReceiver:
         with cls._global_lock:
             if endpoint not in cls._socket_cache:
                 sock = cls._ctx.socket(zmq.PUSH)
+                enable_ipv6_for_endpoint(sock, endpoint)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
@@ -299,8 +301,8 @@ class MooncakeKVReceiver:
         self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.WaitingForInput)
 
         for bootstrap_info in self.bootstrap_infos:
-            self.prefill_server_url = (
-                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+            self.prefill_server_url = join_host_port(
+                bootstrap_info["rank_ip"], bootstrap_info["rank_port"]
             )
             is_dummy = bootstrap_info["is_dummy"]
 

@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 
-"""Prepared TP4 broadcast of exact int32 words from group rank zero."""
+"""Prepared TP4/TP8 broadcast of exact int32 words from group rank zero."""
 
 import torch
 from tokenspeed_kernel._triton import gl, gluon, triton
@@ -44,7 +44,7 @@ class IrisBroadcast:
         return allocation_bytes((tiles, 2 * IrisBroadcast.WORDS_PER_TILE), torch.uint32)
 
     def __init__(self, peers: IrisGroup, max_words: int):
-        assert peers.world_size == 4 and max_words > 0
+        assert peers.world_size in (4, 8) and max_words > 0
         self.peers = peers
         self.tiles = min(self.MAX_TILES, triton.cdiv(max_words, self.WORDS_PER_TILE))
         self.mailbox = peers.ctx.empty(
@@ -70,7 +70,7 @@ class IrisBroadcast:
         """
         assert self.mailbox is not None
         assert tensor.is_cuda and tensor.is_contiguous() and tensor.dtype == torch.int32
-        subgroups = 4 if self.peers.rank == 0 else 1
+        subgroups = self.peers.world_size if self.peers.rank == 0 else 1
         programs = min(
             triton.cdiv(tensor.numel(), self.WORDS_PER_TILE),
             self.tiles,
@@ -78,7 +78,7 @@ class IrisBroadcast:
         iris_lamport_broadcast[(programs,)](
             tensor,
             self.mailbox,
-            self.peer_addresses[:4],
+            self.peer_addresses[: self.peers.world_size],
             tensor.numel(),
             RANK=self.peers.rank,
             SOURCE=0,
@@ -99,7 +99,7 @@ def iris_lamport_broadcast(
     BLOCK: gl.constexpr,
     SUBGROUPS: gl.constexpr,
 ):
-    """Broadcast int32 values in place through sentinel-marked TP4 mailboxes.
+    """Broadcast int32 values in place through sentinel-marked TP4/TP8 mailboxes.
 
     The source writes each word as two 16-bit halves, so every int32 value is
     distinct from the empty marker. Receivers copy both halves into their local
@@ -109,33 +109,37 @@ def iris_lamport_broadcast(
         tensor: Contiguous int32 input on SOURCE and output on every other rank.
         mailbox: Local uint32 storage, initialized to 0x80000000, with two
             BLOCK-word halves per workgroup.
-        peer_addresses: Mailbox base addresses for the four group ranks.
+        peer_addresses: Mailbox base addresses for the group ranks.
         words: Number of int32 elements to broadcast.
-        RANK: This process's rank within the four-rank group.
+        RANK: This process's rank within the group.
         SOURCE: Group rank supplying the input; its tensor remains unchanged.
         BLOCK: Number of int32 elements handled by one mailbox tile.
-        SUBGROUPS: Subgroups per workgroup; the source requires four.
+        SUBGROUPS: Subgroups per workgroup; one per group rank at the source.
 
     Returns:
         Nothing. Writes the broadcast result into tensor on receiving ranks.
     """
     # Two 16-bit halves encode every int32 without colliding with the empty
     # DWORD sentinel. Polls consume the payload itself with system-scope reads.
+    WORLD_SIZE: gl.constexpr = len(peer_addresses)
     sentinel: gl.constexpr = 0x80000000
     # Program i always owns mailbox i, including when later calls change size.
     mailbox_offset = gl.program_id(0) * 2 * BLOCK
     first_word = gl.program_id(0) * BLOCK
     word_stride = gl.num_programs(0) * BLOCK
     if RANK == SOURCE:
-        gl.static_assert(SUBGROUPS == 4)
-        layout: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [4, 1], [1, 0])
-        peers = gl.arange(0, 4, layout=gl.SliceLayout(1, layout))
-        offsets = gl.arange(0, BLOCK, layout=gl.SliceLayout(0, layout))
-        destinations = gl.where(peers == 0, peer_addresses[0], peer_addresses[3])
-        destinations = gl.where(peers == 1, peer_addresses[1], destinations)
-        destinations = gl.where(peers == 2, peer_addresses[2], destinations).to(
-            gl.pointer_type(gl.uint32)
+        gl.static_assert(SUBGROUPS == WORLD_SIZE)
+        layout: gl.constexpr = gl.BlockedLayout(
+            [1, 1], [1, 64], [WORLD_SIZE, 1], [1, 0]
         )
+        peers = gl.arange(0, WORLD_SIZE, layout=gl.SliceLayout(1, layout))
+        offsets = gl.arange(0, BLOCK, layout=gl.SliceLayout(0, layout))
+        destinations = gl.full(
+            (WORLD_SIZE,), peer_addresses[0], gl.uint64, gl.SliceLayout(1, layout)
+        )
+        for peer in gl.static_range(1, WORLD_SIZE):
+            destinations = gl.where(peers == peer, peer_addresses[peer], destinations)
+        destinations = destinations.to(gl.pointer_type(gl.uint32))
         pointers = destinations[:, None] + mailbox_offset + offsets[None, :]
         mask = (peers != SOURCE)[:, None]
         for start in range(first_word, words, word_stride):

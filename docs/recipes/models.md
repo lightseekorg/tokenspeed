@@ -870,6 +870,7 @@ ts serve \
     --quantization mxfp4 \
     --max-num-seqs 16 \
     --max-cudagraph-capture-size 16 \
+    --kvstore-size 32 \
     --speculative-algorithm MTP \
     --speculative-num-steps 3
 ```
@@ -877,6 +878,16 @@ ts serve \
 The above configuration caps the batch at 16 sequences for latency; raise
 `--max-num-seqs` and `--max-cudagraph-capture-size` together for throughput.
 Keep ReplaySSM, the default.
+
+`--kvstore-size 32` caps the Host KV cache at 32 GB per GPU. The default
+(twice the Device KV, about 96 GB per GPU here) keeps much more Host memory
+mapped for the GPU, and while the Linux kernel compacts memory and migrates
+those pages, the GPU stalls; on hosts with fragmented memory this showed as
+10-30 s pauses during decode. Raise the size if long prefixes are reused
+after the Device cache evicts them, or drop the Host cache with
+`--disable-kvstore` if they are not. On the host side, disabling proactive
+compaction (`sysctl vm.compaction_proactiveness=0`) removes the background
+trigger.
 
 ### Optional `--hf-overrides`
 

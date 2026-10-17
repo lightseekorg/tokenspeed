@@ -425,14 +425,12 @@ def gluon_moe_sorting(
     # Keep route chunks at a practical vector width. The chunk prefix scan
     # preserves their source order even when there are fewer experts than
     # required route programs.
-    max_routes_per_program = 1024
+    max_routes_per_program = 32 if runtime_rows else 1024
     num_programs = triton.cdiv(numel, max_routes_per_program)
     if not use_minimum_route_chunks:
         num_programs = max(E, num_programs)
     tokens_per_program = triton.cdiv(numel, num_programs)
     if runtime_rows:
-        if tokens_per_program > 32:
-            raise ValueError("runtime-row sorting supports at most 32 routes per chunk")
         route_block = 32
     else:
         route_block = triton.next_power_of_2(tokens_per_program)

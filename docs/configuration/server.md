@@ -1269,3 +1269,7 @@ ubuntu job boots `mooncake_master` and runs
 `MOONCAKE_MASTER=host:port`.
 Mooncake Store is the offload backend. PD KV transfer still uses the
 separate Mooncake TransferEngine (`--disaggregation-transfer-backend`).
+On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
+(unless it is already set) so Mooncake's handshake uses IPv6. The Mooncake L3
+store client reads `MC_USE_IPV6` on its own when the store starts, so export
+`MC_USE_IPV6=1` yourself when the L3 store runs on an IPv6 host.

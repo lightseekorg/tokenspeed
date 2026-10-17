@@ -355,14 +355,22 @@ QKVFAB, QKV+gate, and add3 run the 64-row tile without split-K.
 
 Up to 16 rows, general dense projections use a two-warp `16 x 32` tile when
 `N` is divisible by 32 and has at least 192 such tiles; other accepted `N`
-uses one warp and a `16 x 16` tile. They use 256-wide K tiles when K is
-divisible by 256, falling back to 128-wide tiles otherwise, and request six
-TDM buffers. At up to 16 rows, KDA QKVFAB keeps its one-warp `16 x 16 x 128`
-tile and seven buffers, and add3 uses a two-warp `16 x 32` tile. The add3
-epilogue loads `X` and `Y` for the stored tile. The buffer count is clamped
-to the K tiles available per split. Once the K tiles fill that pipeline, the
-tail lowers the TDM wait before each remaining LDS read. Short K dimensions
-prefetch only valid tiles and drain each remaining pair before reading it.
+uses one warp and a `16 x 16` tile. KDA QKVFAB and MLA QKV+gate use the
+one-warp tile, and add3 uses the two-warp tile. All use 256-wide K tiles when
+K is divisible by 256, falling back to 128-wide tiles otherwise. The add3
+epilogue loads `X` and `Y` for the stored tile.
+
+The weight stream is latency bound per program: the TDM buffers ahead of the
+WMMAs set the bytes in flight. K3 projections request eight buffers and the
+BF16 GEMM below requests its per-tile counts. Every launch, the BF16 GEMM's
+included, caps the request by the K tiles per split and by LDS: a grid past
+256 CUs keeps two programs resident on a CU, and they share its 320 KB.
+
+One K loop serves every tile and K length. It keeps up to `buffers - 1` A/B
+TDM pairs in flight, waits only for the next tile, and reads that tile from
+LDS while the current tile's WMMAs run. Each tile's two K halves accumulate
+separately and are summed after the loop, so the WMMAs do not form one long
+dependent chain.
 
 Both paths accumulate in FP32 and round to BF16 once. Direct launches store
 that conversion from the producer. Split-K launches write one FP32 partial
@@ -1163,17 +1171,18 @@ separate Gluon kernel.
 
 ### gfx1250 latent input projection
 
-The same Kimi K3 packed projection as the preceding gfx950 entry, split into
-two kernels because the shape changes character with the batch. Decode streams the
-whole 86 MB weight past a handful of rows and is bound by memory; prefill is
-bound by arithmetic.
+The same Kimi K3 packed projection as the preceding gfx950 entry, with
+separate decode and prefill launchers because the shape changes character
+with the batch. Decode streams the whole 86 MB weight past a handful of rows
+and is bound by memory; prefill is bound by arithmetic. Every path is a
+single launch.
 
 #### Contract
 
 Input, weight, and output shapes and dtypes are the gfx950 entry's. Two
 things differ:
 
-- Automatic dispatch selects the decode kernel for 1 to 32 tokens and the
+- Automatic dispatch selects the decode launcher for 1 to 64 tokens and the
   prefill kernel from 1536; the range between them retains the Triton kernel.
 - The packed tensor passed alongside the three weights must be their
   consecutive view. The kernels read only it, so the launchers reject a
@@ -1181,26 +1190,48 @@ things differ:
 
 #### Algorithm
 
-Decode splits the reduction across workgroups, eight ways to 16 tokens and
-four above, because tiling the output alone leaves a 6016-column projection
-with too few workgroups to keep the device busy. Each writes FP32 partials
-that a companion kernel reduces and fans out to the three consumers. The
-split is what bounds the kernel: its partial traffic scales with the token
-count while the weight traffic does not.
+Decode is one launch that streams the weight once. Every output tile goes to
+one consumer, and a shared-region tile always holds matching gate and up
+columns, so SiTU never needs a second kernel.
 
-Prefill instead runs the wide large-M WMMA schedule from
-`gfx1250/gemm/fp16/mm.py`, a `256 x 256` tile on eight warps in 128-wide K
-steps through a double-buffered TDM pipeline, with no split at all. Before
-storing, the kernel redistributes the accumulator so neighboring lanes cover
-adjacent output columns, which coalesces the BF16 latent and shared stores. It
-then writes the three regions with one masked store each, so FP32 router logits
-reach memory without a round trip through BF16. A tile can straddle a region
-boundary, because the boundaries are 128-column aligned while the tile is 256
-wide, so the masks rather than the tile index decide where a column belongs.
-SiTU is a second launch, as on gfx950: the gate and up halves sit 768 columns
-apart, so no tile holds both.
+- From 17 tokens, `gluon_latent_input_decode_nosplit_gfx1250` gives each
+  workgroup the whole reduction for a 32-column tile built from two 16-row
+  weight slices: adjacent rows in the router and routed regions, the gate
+  rows and the up rows 768 below them in the shared region. Its 188
+  workgroups each stream 256-wide K steps through six TDM buffers,
+  with one warp per 16 rows of the 32- or 64-row tile.
+- Up to 16 tokens one row tile leaves those 188 weight streams too few to
+  saturate memory, so `gluon_latent_input_decode_gfx1250` gives each
+  one-warp workgroup a single 16-row weight slice through eight 256-wide
+  TDM buffers. The 280 router and routed slices stream the whole reduction
+  and store directly. The 48 gate and 48 up slices of the shared region
+  split it in two, launch first, and so finish early enough to hide their
+  exchange: each stores an FP32 partial at device scope, drains its stores,
+  and bumps its column block's arrival counter. The last arrival sums the
+  partials in split order, so results are deterministic, applies SiTU, and
+  rearms the counter for the next launch or graph replay. Each stream keeps
+  its own counter buffer, which the launches ordered on it share.
 
-Both kernels mask partial row tiles, so they accept any token count.
+Prefill is one launch too: a `256 x 256` WMMA tile on eight warps with no
+split, accumulating in FP32 over 128-wide K steps. Like the whole-reduction
+decode kernel, a tile is two 128-row weight slices, so the 4480 router and
+routed columns take 18 tiles (the last one half used) and the shared region
+six gate/up pairs that finish SiTU in the epilogue, with no BF16 gate/up
+buffer or second launch. That epilogue writes `sigmoid(x)` as
+`(1 + tanh(x / 2)) / 2`, so the whole activation runs on the hardware tanh.
+Each K tile is consumed in two half-K steps of an LDS-read stage and a WMMA
+stage (`warp_pipeline_stage`), and the two warps that share a SIMD run a
+stage apart, so one reads LDS while the other issues WMMA. The next K tile
+streams into the other of two TDM slots meanwhile, issued by one warp per
+SIMD. Workgroups are renumbered so each of the eight XCDs gets a contiguous
+run of the `GROUP_M`-grouped tile order, which keeps the workgroups that
+share A or B rows on one L2. Before storing, the kernel redistributes each
+half accumulator so neighboring lanes cover adjacent output columns, which
+coalesces the BF16 stores, and masks rather than the tile index place each
+column in the router or routed region, so FP32 router logits reach memory
+without a round trip through BF16.
+
+All kernels mask partial row tiles, so they accept any token count.
 
 ### gfx950 softmax top-k routing
 

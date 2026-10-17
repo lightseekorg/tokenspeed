@@ -309,7 +309,7 @@ class AutoBackend(CommBackend):
     def get_prepared_all_gather(self, group: Group, dtype: torch.dtype):
         if (
             not current_platform().is_cdna4
-            or len(group) != 4
+            or len(group) not in (4, 8)
             or self._force_deterministic_rsag()
             or self._group_spans_nodes(group)
             or self._trtllm_ar.has_trtllm_ar(group)
@@ -320,7 +320,7 @@ class AutoBackend(CommBackend):
     def broadcast_from_first_rank(self, tensor: torch.Tensor, group: Group) -> bool:
         if (
             not current_platform().is_cdna4
-            or len(group) != 4
+            or len(group) not in (4, 8)
             or self._group_spans_nodes(group)
         ):
             return False
