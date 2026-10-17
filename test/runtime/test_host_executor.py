@@ -97,7 +97,6 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     lanes.build_transfer_geometry = Mock()
     lanes.check_host_memory = Mock()
     lanes.host_memory_share = Mock(return_value=10**12)
-    lanes.largest_pinned_fit = Mock(side_effect=lambda room_bytes: max(room_bytes, 0))
     lanes.pinned_host_bytes = Mock(side_effect=lambda nbytes: nbytes)
     lanes.load_stream_priority = Mock(return_value=None)
     lanes.new_cache_stream = Mock()
@@ -1577,8 +1576,8 @@ class TestGroupAwareWireTest:
 
 class TestHostMemoryShareTest:
     """The ranks of a node pin their Host tiers at once: each sizes them
-    against an equal share of the Host memory the node has available, every
-    buffer at the power of two its pinned allocation rounds up to."""
+    against an equal share of the Host memory the node has available, the
+    Host storages at exactly their bytes."""
 
     GB = 10**9
     BLOCK_BYTES = 10**6  # one Host LCM block
@@ -1593,9 +1592,9 @@ class TestHostMemoryShareTest:
         self.headroom = self.executor_module._HOST_MEM_HEADROOM_BYTES
 
     def _fitting_blocks(self, available_gb, nprocs_per_node):
-        """The L2 blocks in the largest power of two of a rank's share."""
+        """The L2 blocks a rank's share holds."""
         share = int(available_gb * self.GB) // nprocs_per_node - self.headroom
-        return (1 << (share.bit_length() - 1)) // self.BLOCK_BYTES
+        return share // self.BLOCK_BYTES
 
     def _build(
         self,
@@ -1677,8 +1676,8 @@ class TestHostMemoryShareTest:
         return executor, logger
 
     def test_four_ranks_cap_an_over_committed_ratio_l2_to_the_node(self):
-        # 4 x 277.95 GB of L2 does not fit a node with 956 GB available, and
-        # neither does an L2 of the whole 228.26 GB share: it pins 274.88 GB.
+        # 4 x 277.95 GB of L2 does not fit a node with 956 GB available: each
+        # rank takes its whole share instead.
         executor, logger = self._build(
             available_gb=956,
             nprocs_per_node=4,
@@ -1686,18 +1685,17 @@ class TestHostMemoryShareTest:
         )
         l2_blocks = executor.num_host_pages - 1
         assert (l2_blocks) == (self._fitting_blocks(956, 4))
-        assert (l2_blocks) == (2**37 // self.BLOCK_BYTES)
-        pinned = _lanes_module().pinned_host_bytes(l2_blocks * self.BLOCK_BYTES)
-        assert (4 * (pinned + self.headroom)) <= (956 * self.GB)
+        assert (4 * (l2_blocks * self.BLOCK_BYTES + self.headroom)) <= (956 * self.GB)
         logger.warning.assert_called_once()
         message = logger.warning.call_args.args[0]
-        assert ("from 277.95 GB to 137.44 GB") in (message)
+        assert (f"from 277.95 GB to {l2_blocks * self.BLOCK_BYTES / 1e9:.2f} GB") in (
+            message
+        )
         assert ("--kvstore-ratio 2.0") in (message)
 
     def test_an_explicit_size_that_does_not_fit_the_node_is_refused(self, subtests):
-        # 278 GB and 200 GB pin 549.76 GB and 274.88 GB: neither fits the
-        # 228.26 GB share of 4 ranks on 956 GB.
-        for host_size_gb in (278, 200):
+        # Neither fits the 228.26 GB share of 4 ranks on 956 GB.
+        for host_size_gb in (278, 229):
             with (
                 subtests.test(host_size_gb=host_size_gb),
                 pytest.raises((ValueError), match=("Not enough Host memory")),
@@ -1708,20 +1706,20 @@ class TestHostMemoryShareTest:
                     device_lcm_blocks=self.LARGE_POOL_BLOCKS,
                     host_size_gb=host_size_gb,
                 )
-        # One whose pinned size fits the node's share is kept as asked.
+        # One that fits the node's share is kept as asked, exactly.
         executor, logger = self._build(
             available_gb=956,
             nprocs_per_node=4,
             device_lcm_blocks=self.LARGE_POOL_BLOCKS,
-            host_size_gb=128,
+            host_size_gb=200,
         )
-        assert (executor.num_host_pages - 1) == (128_000)
+        assert (executor.num_host_pages - 1) == (200_000)
         logger.warning.assert_not_called()
 
     def test_a_single_rank_and_a_small_pool_keep_the_ratio_size(self, subtests):
         for nprocs_per_node, device_lcm_blocks in (
-            (1, self.LARGE_POOL_BLOCKS),  # 277.95 GB pins 549.76 GB of 956
-            (4, 50_760),  # 4 x 101.52 GB pin 4 x 137.44 GB
+            (1, self.LARGE_POOL_BLOCKS),  # 277.95 GB of 956
+            (4, 50_760),  # 4 x 101.52 GB of 956
         ):
             with subtests.test(nprocs_per_node=nprocs_per_node):
                 executor, logger = self._build(
@@ -1774,21 +1772,12 @@ class TestHostMemoryShareTest:
         assert all(c.kwargs["group"] is group for c in reduce.call_args_list)
 
     def test_a_pinned_buffer_takes_the_power_of_two_it_rounds_up_to(self):
-        lanes_module = _lanes_module()
-        pinned = lanes_module.pinned_host_bytes
-        fit = lanes_module.largest_pinned_fit
+        # Buffers from PyTorch's pinned allocator (the slot-state arena).
+        pinned = _lanes_module().pinned_host_bytes
         assert (pinned(0)) == (0)
         assert (pinned(1)) == (1)
         assert (pinned(2**37)) == (2**37)
         assert (pinned(2**37 + 1)) == (2**38)
-        assert (pinned(228_260 * self.BLOCK_BYTES)) == (2**38)
-        assert (fit(-1)) == (0)
-        assert (fit(0)) == (0)
-        assert (fit(2**38 - 1)) == (2**37)
-        assert (fit(2**38)) == (2**38)
-        for room in (1, 3, 2**37 - 1, 228_260 * self.BLOCK_BYTES):
-            assert (pinned(fit(room))) <= (room)
-            assert (pinned(fit(room) + 1)) > (room)
 
 
 class TestL3FlatKvExecutorTest:

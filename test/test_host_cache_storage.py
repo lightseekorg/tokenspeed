@@ -20,10 +20,10 @@
 
 from __future__ import annotations
 
-import sys
-from types import SimpleNamespace
+import gc
 
 import pytest
+import torch
 
 from tokenspeed.runtime.cache.l2.storage import HostCacheStorage
 from tokenspeed.runtime.cache.transfer.layout import (
@@ -32,21 +32,9 @@ from tokenspeed.runtime.cache.transfer.layout import (
     CacheTransferLayout,
 )
 
-
-@pytest.fixture(autouse=True)
-def _fake_torch(monkeypatch):
-    uint8 = object()
-
-    def empty(num_bytes, *, dtype, pin_memory):
-        assert dtype is uint8
-        assert pin_memory is True
-        return bytearray(num_bytes)
-
-    monkeypatch.setitem(
-        sys.modules,
-        "torch",
-        SimpleNamespace(empty=empty, uint8=uint8),
-    )
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="pinning Host memory needs a GPU runtime"
+)
 
 
 def _layout():
@@ -113,3 +101,15 @@ def test_host_fields_are_packed_without_padding():
     assert storage.host_cache_block_bytes == (80, 1200)
     assert storage.host_field_offsets == ((0, 40), (0, 1000))
     assert storage.host_lcm_block_bytes == 1280
+
+
+def test_host_buffer_stays_pinned_exactly_as_long_as_its_storage():
+    storage = HostCacheStorage(_layout(), num_host_lcm_blocks=3)
+    buffer = storage.host_buffer
+
+    assert buffer.numel() == 3 * storage.host_lcm_block_bytes
+    assert buffer.is_pinned()
+
+    del storage
+    gc.collect()
+    assert not buffer.is_pinned()

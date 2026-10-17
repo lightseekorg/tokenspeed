@@ -86,7 +86,6 @@ from tokenspeed.runtime.cache.transfer.lanes import (
     build_transfer_geometry,
     check_host_memory,
     host_memory_share,
-    largest_pinned_fit,
     load_stream_priority,
     new_cache_stream,
     pinned_host_bytes,
@@ -358,14 +357,13 @@ class HostCacheExecutor:
         share_bytes = host_memory_share(
             nprocs_per_node=nprocs_per_node, headroom_bytes=_HOST_MEM_HEADROOM_BYTES
         )
-        # Each buffer takes the power of two its pinned allocation rounds to.
-        pool_pinned_bytes = pinned_host_bytes(snapshot_bytes) + pinned_host_bytes(
-            arena_bytes
-        )
+        # The Host storages pin exactly their bytes; the slot-state arena
+        # takes the power of two PyTorch's pinned allocator rounds it to.
+        pool_pinned_bytes = snapshot_bytes + pinned_host_bytes(arena_bytes)
         # The L2 blocks every rank's share holds beside the pool. Agreeing on
         # it is also a barrier: no rank pins before every rank read its share.
         fitting_l2_blocks = _min_over_ranks(
-            largest_pinned_fit(share_bytes - pool_pinned_bytes) // host_lcm_block_bytes,
+            max(share_bytes - pool_pinned_bytes, 0) // host_lcm_block_bytes,
             world_cpu_group,
         )
         if l2_tier and host_size_gb <= 0 and 0 < fitting_l2_blocks < host_lcm_blocks:
@@ -378,9 +376,8 @@ class HostCacheExecutor:
                 f"{fitting_l2_blocks * host_lcm_block_bytes / 1e9:.2f} GB per "
                 "rank, the most every rank's share of its node holds: "
                 f"--kvstore-ratio {host_ratio} asks for more. The "
-                f"{nprocs_per_node} ranks of a node pin Host memory together, "
-                "and each pinned buffer takes a power of two; this rank's share "
-                f"is {share_bytes / 1e9:.2f} GB (the node's available Host "
+                f"{nprocs_per_node} ranks of a node pin Host memory together; "
+                f"this rank's share is {share_bytes / 1e9:.2f} GB (the node's available Host "
                 "memory over its ranks, less "
                 f"{_HOST_MEM_HEADROOM_BYTES / 1e9:.2f} GB headroom each)"
             )
@@ -388,7 +385,7 @@ class HostCacheExecutor:
         l2_bytes = host_lcm_blocks * host_lcm_block_bytes
         # Both tiers count against the one check, at the sizes they pin.
         check_host_memory(
-            pinned_host_bytes(l2_bytes) + pool_pinned_bytes,
+            l2_bytes + pool_pinned_bytes,
             share_bytes=share_bytes,
             purpose="the compact Host cache",
         )

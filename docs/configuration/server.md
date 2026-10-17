@@ -1098,12 +1098,12 @@ Mooncake Store (L3)
 Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
 equal share of the Host memory its node has available, less a 10 GiB
-headroom per rank. Each buffer counts at the size it pins: PyTorch's pinned
-allocator rounds every allocation up to a power of two, so a 140 GB L2
-takes 274.88 GB. A ratio size larger than that share is capped to the
-largest L2 every rank's share holds beside its snapshot pool -- the whole
-LCM blocks in the largest power of two that fits, and one size on every
-rank, since the ranks' schedulers mirror each other -- and each rank logs a
+headroom per rank. The L2 and snapshot buffers are page-locked at exactly
+their size (registered for GPU access rather than taken from PyTorch's
+pinned allocator, which rounds up to a power of two). A ratio size larger
+than that share is capped to the largest L2 every rank's share holds beside
+its snapshot pool -- whole LCM blocks, and one size on every rank, since the
+ranks' schedulers mirror each other -- and each rank logs a
 warning with the requested and the capped size. An explicit
 `--kvstore-size` is never shrunk: one that does not fit is refused at
 startup, as is a share without room for a single LCM block.

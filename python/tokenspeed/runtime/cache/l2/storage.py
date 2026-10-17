@@ -22,6 +22,11 @@
 
 from __future__ import annotations
 
+import weakref
+
+import torch
+from tokenspeed_kernel.platform import current_platform
+
 from tokenspeed.runtime.cache.transfer.layout import CacheTransferLayout
 
 
@@ -75,12 +80,14 @@ class HostCacheStorage:
         ) = _compute_host_layout(layout)
         self.num_host_lcm_blocks = int(num_host_lcm_blocks)
         self.host_buffer_bytes = self.num_host_lcm_blocks * self.host_lcm_block_bytes
-        import torch
-
-        self.host_buffer = torch.empty(
-            self.host_buffer_bytes,
-            dtype=torch.uint8,
-            pin_memory=True,
+        # Page-lock exactly the buffer's bytes: PyTorch's pinned allocator
+        # would round a ~80 GB buffer up to 128 GB. The registration lasts as
+        # long as this storage, which owns the buffer.
+        self.host_buffer = torch.empty(self.host_buffer_bytes, dtype=torch.uint8)
+        platform = current_platform()
+        platform.register_host_tensor_for_gpu_access(self.host_buffer)
+        weakref.finalize(
+            self, platform.unregister_host_tensor_for_gpu_access, self.host_buffer
         )
 
     def host_block_offset(self, group_index: int, block_id: int) -> int:
