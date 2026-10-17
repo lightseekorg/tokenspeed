@@ -47,6 +47,8 @@ def _backend(
     backend.device = torch.device("cpu")
     backend.forward_decode_metadata = None
     backend._decode_views_by_bs = {}
+    backend._block_page_table_buf = None
+    backend._block_seq_lens_buf = None
     return backend
 
 

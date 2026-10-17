@@ -36,19 +36,15 @@ from fractions import Fraction
 from unittest.mock import Mock
 
 import pytest
-import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
+import tokenspeed_kernel.ops.gemm as gemm_api
 import torch
-from tokenspeed_kernel.ops.gemm import gluon_gemv, triton_gemv
-from tokenspeed_kernel.ops.gemm.gluon_gemv import gluon_simt_gemm_fp32
-from tokenspeed_kernel.ops.gemm.triton_bf16x3 import triton_bf16x3_gemm_fp32
-from tokenspeed_kernel.ops.gemm.triton_gemv import (
-    _BF16_FP32_SIG,
-    _FP32_SIG,
-    _select,
-    decode_gemv,
-    decode_gemv_weight_split,
-    torch_decode_gemv,
-)
+from tokenspeed_kernel.ops.gemm import _select_mv as _select
+from tokenspeed_kernel.ops.gemm import mv, mv_weight_split
+from tokenspeed_kernel.ops.gemm._gluon import gemv as gluon_gemv
+from tokenspeed_kernel.ops.gemm._gluon.gemv import gluon_simt_gemm_fp32
+from tokenspeed_kernel.ops.gemm._triton.bf16x3 import triton_bf16x3_gemm_fp32
+from tokenspeed_kernel.ops.gemm.native import torch_decode_gemv
+from tokenspeed_kernel.ops.gemm.triton import _BF16_FP32_SIG, _FP32_SIG
 from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     Platform,
@@ -253,7 +249,7 @@ def test_band_start_fp32_kernel_keeps_the_other_rows(nvidia_platform, fresh_regi
     # 96 and none inside, and every row of FP32 activations.
     @register_kernel(
         "gemm",
-        "decode_gemv",
+        "mv",
         name="band_start_fp32_gemm",
         solution="triton",
         capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
@@ -279,7 +275,7 @@ def test_band_start_fp32_kernel_keeps_the_other_rows(nvidia_platform, fresh_regi
 
 
 def _cuda_weight(n: int, k: int) -> Mock:
-    """A contiguous FP32 CUDA weight as decode_gemv_weight_split() reads it."""
+    """A contiguous FP32 CUDA weight as mv_weight_split() reads it."""
     weight = Mock(is_cuda=True, ndim=2, shape=(n, k), dtype=torch.float32)
     weight.is_contiguous.return_value = True
     return weight
@@ -291,12 +287,12 @@ def test_split_kernel_keeps_the_rows_above_96(nvidia_platform, monkeypatch):
     # them, this kernel serves rows 17 to 96 from the FP32 weight whether or
     # not the split is passed, and the split kernel serves rows from 97.
     split = Mock(return_value=object())
-    monkeypatch.setattr(triton_gemv, "split_fp32_weight_bf16x3", split)
+    monkeypatch.setattr(gemm_api, "split_fp32_weight_bf16x3", split)
     both = (gluon_simt_gemm_fp32, triton_bf16x3_gemm_fp32)
     shared = range(2048, 8192 + 1, 512)
     for k in shared:
         weight = _cuda_weight(256, k)
-        assert decode_gemv_weight_split(weight) is split.return_value
+        assert mv_weight_split(weight) is split.return_value
         split.assert_called_with(weight)
         for weight_split in (False, True):
             for m in range(17, 97):
@@ -310,11 +306,11 @@ def test_split_kernel_keeps_the_rows_above_96(nvidia_platform, monkeypatch):
     assert split.call_count == len(shared)
     # A weight that only one of them takes: 128 rows get no split and Torch
     # from 97 rows; 384 rows get the split kernel from 17 rows.
-    assert decode_gemv_weight_split(_cuda_weight(128, 4096)) is None
+    assert mv_weight_split(_cuda_weight(128, 4096)) is None
     assert split.call_count == len(shared)
     for m, expected in ((17, both[0]), (96, both[0]), (97, torch_decode_gemv)):
         assert _select(m, 128, 4096, True, *_MIXED, False) is expected
-    assert decode_gemv_weight_split(_cuda_weight(384, 7168)) is split.return_value
+    assert mv_weight_split(_cuda_weight(384, 7168)) is split.return_value
     for m in (17, 96, 97):
         assert _select(m, 384, 7168, True, *_MIXED, True) is both[1]
         assert _select(m, 384, 7168, True, *_MIXED, False) is torch_decode_gemv
@@ -324,11 +320,11 @@ def test_decode_gemv_hands_this_kernel_the_fp32_weight(monkeypatch):
     # The split goes only to the split kernel; this kernel reads the weight.
     result = torch.empty(32, 256)
     kernel = Mock(return_value=result)
-    monkeypatch.setattr(triton_gemv, "_select", Mock(return_value=kernel))
+    monkeypatch.setattr(gemm_api, "_select_mv", Mock(return_value=kernel))
     x = torch.zeros(32, 512, dtype=torch.bfloat16)
     weight = torch.zeros(256, 512)
     pieces = torch.zeros(3, 256, 512, dtype=torch.bfloat16)
-    assert decode_gemv(x, weight, weight_split=pieces) is result
+    assert mv(x, weight, weight_split=pieces) is result
     kernel.assert_called_once_with(x, weight, None)
 
 
@@ -381,12 +377,12 @@ def test_bf16_activations_widen_for_an_fp32_weight():
     x = torch.randn(20, 512, generator=generator).bfloat16()
     weight = torch.randn(64, 512, generator=generator)
     expected = torch.mm(x.float(), weight.t())
-    assert torch.equal(decode_gemv(x, weight), expected)
+    assert torch.equal(mv(x, weight), expected)
     out = torch.empty(20, 64)
-    assert decode_gemv(x, weight, out) is out
+    assert mv(x, weight, out) is out
     assert torch.equal(out, expected)
     with pytest.raises(ValueError):
-        decode_gemv(x, weight, torch.empty(20, 64, dtype=torch.bfloat16))
+        mv(x, weight, torch.empty(20, 64, dtype=torch.bfloat16))
 
 
 @pytest.mark.parametrize(
@@ -399,14 +395,14 @@ def test_noncontiguous_inputs_skip_the_registry(
     def registry_lookup(*args):
         raise AssertionError("a noncontiguous input reached the registry")
 
-    monkeypatch.setattr(triton_gemv, "_select", registry_lookup)
+    monkeypatch.setattr(gemm_api, "_select_mv", registry_lookup)
     generator = torch.Generator().manual_seed(2)
     x = torch.randn(24, 2 * 512, generator=generator).to(x_dtype)
     weight = torch.randn(2 * 64, 512, generator=generator).to(weight_dtype)
     x = x[:, :512] if strided == "x" else x[:, :512].contiguous()
     weight = weight[::2] if strided == "weight" else weight[:64]
     torch.testing.assert_close(
-        decode_gemv(x, weight),
+        mv(x, weight),
         torch_decode_gemv(x.contiguous(), weight.contiguous()),
     )
 
@@ -461,13 +457,13 @@ def test_decode_gemv_routes_rows_17_to_96(m):
     weight = torch.randn(256, 7168, device="cuda") * 0.02
     out = torch.full((m, 256), float("nan"), device="cuda")
     _select.cache_clear()
-    assert decode_gemv(x, weight, out) is out
+    assert mv(x, weight, out) is out
     assert torch.equal(_bits(out), _bits(gluon_simt_gemm_fp32(x, weight)))
     # BF16 to FP32 is exact and the order does not depend on the tile, so the
     # mixed call is the kernel's FP32 call on x.float().
     assert torch.equal(_bits(out), _bits(gluon_simt_gemm_fp32(x.float(), weight)))
     with pytest.raises(ValueError):
-        decode_gemv(x, weight, torch.empty(m, 256, device="cuda", dtype=x.dtype))
+        mv(x, weight, torch.empty(m, 256, device="cuda", dtype=x.dtype))
 
 
 @_requires_split_kernel
@@ -476,11 +472,11 @@ def test_split_weight_takes_this_kernel_up_to_96_rows(m):
     torch.manual_seed(m)
     x = torch.randn(m, 7168, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(256, 7168, device="cuda") * 0.02
-    pieces = decode_gemv_weight_split(weight)
+    pieces = mv_weight_split(weight)
     assert pieces is not None
     out = torch.full((m, 256), float("nan"), device="cuda")
     _select.cache_clear()
-    assert decode_gemv(x, weight, out, weight_split=pieces) is out
+    assert mv(x, weight, out, weight_split=pieces) is out
     if m <= 96:
         expected = gluon_simt_gemm_fp32(x, weight)
     else:
@@ -504,11 +500,11 @@ def test_graph_replay_matches_eager():
     x = torch.randn(64, 4096, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(128, 4096, device="cuda") * 0.02
     out = torch.empty(64, 128, device="cuda")
-    decode_gemv(x, weight, out)  # compile before capture
+    mv(x, weight, out)  # compile before capture
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        decode_gemv(x, weight, out)
+        mv(x, weight, out)
     for _ in range(2):
         x.normal_()
         out.fill_(float("nan"))
@@ -521,11 +517,11 @@ def test_graph_replay_matches_eager():
 def test_reduced_matmul_precision_does_not_change_the_bits():
     x = torch.randn(32, 4096, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(128, 4096, device="cuda") * 0.02
-    expected = _bits(decode_gemv(x, weight))
+    expected = _bits(mv(x, weight))
     previous = torch.get_float32_matmul_precision()
     try:
         torch.set_float32_matmul_precision("high")
-        assert torch.equal(_bits(decode_gemv(x, weight)), expected)
+        assert torch.equal(_bits(mv(x, weight)), expected)
     finally:
         torch.set_float32_matmul_precision(previous)
 
@@ -545,8 +541,8 @@ def test_noncontiguous_rows_take_torch(monkeypatch, x_dtype, strided):
         calls.append(args)
         return torch_decode_gemv(*args)
 
-    monkeypatch.setattr(triton_gemv, "torch_decode_gemv", torch_leaf)
-    got = decode_gemv(x, weight)
+    monkeypatch.setattr(gemm_api, "torch_decode_gemv", torch_leaf)
+    got = mv(x, weight)
     assert len(calls) == 1
     # Torch picks its own summation order: hold it to the bound of any order.
     exact = x.double().cpu() @ weight.double().cpu().t()
@@ -573,6 +569,6 @@ def test_inputs_left_to_torch_take_torch(x_dtype, m, n, k):
     _select.cache_clear()
     assert _select(m, n, k, True, x_dtype, weight.dtype, False) is torch_decode_gemv
     out = torch.full((m, n), float("nan"), device="cuda")
-    assert decode_gemv(x, weight, out) is out
+    assert mv(x, weight, out) is out
     expected = torch_decode_gemv(x, weight, torch.empty_like(out))
     assert torch.equal(_bits(out), _bits(expected))

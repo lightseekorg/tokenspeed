@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -161,9 +162,9 @@ class FlashInferSamplingBackend(SamplingBackend):
     matter for the workload.
 
     ``config.sampling_stream == "per-request"`` swaps the single-step kernel
-    for the Gumbel-max pool route (``_sample_per_request``); verification
-    keeps the chain kernels, whose coins already come from per-slot
-    generators.
+    for the Gumbel-max pool route (``_sample_per_request``), including
+    verification at N == 1. Multi-token speculative verification retains
+    the chain kernels and its per-slot coin generators.
     """
 
     _HAS_POOL_STATE = True
@@ -435,6 +436,31 @@ class FlashInferSamplingBackend(SamplingBackend):
         torch.index_select(draft_probs, 0, pool_indices, out=out)
         return out
 
+    @staticmethod
+    def _pack_single_verify_result(
+        tokens: torch.Tensor,
+        *,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_length: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Write one output per request into caller-owned verify buffers.
+
+        ``tokens`` and ``predict`` are [bs], ``accept_index`` is [bs, 1], and
+        ``accept_length`` is [bs]. Lengths count emitted tokens, including the
+        sole target token. Explicit destinations also serve DP-local buffers;
+        this adapter performs no sampling, communication or count updates.
+        """
+        predict.copy_(tokens)
+        accept_length.fill_(1)
+        torch.arange(
+            tokens.numel(),
+            dtype=accept_index.dtype,
+            device=accept_index.device,
+            out=accept_index.view(-1),
+        )
+        return predict, accept_length
+
     def _sample_per_request(
         self,
         logits: torch.Tensor,
@@ -448,15 +474,15 @@ class FlashInferSamplingBackend(SamplingBackend):
         offset and seed curand with the batch row, so a request's draw moves
         with its co-batch. The pool kernel keys the stream by
         ``(seed_pool[pool_idx], offsets_pool[pool_idx])`` — the request's seed
-        and cache length — so the draw is the same alone and in any batch
-        (``--sampling-stream per-request``). Temperature, top-k, top-p and
+        and absolute target position — so the draw is the same alone and in
+        any batch (``--sampling-stream per-request``). Temperature, top-k, top-p and
         min-p are read from the pool rows (no expanded per-row scalars are
         built); finite top-k is capped at the kernel's 128 candidates.
 
         Args:
             logits: ``[bs, vocab]`` logits (penalties already applied).
             sampling_info: Batch info carrying the pool indices and the
-                pool-indexed cache lengths.
+                borrowed frontier and prefill lengths.
             min_p_pool: Pool-indexed min-p values, or None for backends
                 without min-p.
 
@@ -475,7 +501,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             self._top_k_pool,
             self._top_p_pool,
             self._seed_pool,
-            self._offsets_pool_for_kernels(sampling_info),
+            self._prepare_sampling_offsets(sampling_info),
             self._per_request_out[:bs],
             min_p_pool=min_p_pool,
         )
@@ -493,7 +519,30 @@ class FlashInferSamplingBackend(SamplingBackend):
         populated via _reset_slot."""
         if bs <= 0:
             return
+        if self.config.sampling_stream == "per-request":
+            if num_tokens_per_req == 1:
+                # Position-keyed direct draws need no prepared coins.
+                return
+            # Multi-token rejection still consumes the legacy coin buffers.
+            # Position-keyed accept/residual coins are not implemented yet.
+        self._refill_legacy_coins(
+            num_tokens_per_req=num_tokens_per_req,
+            bs=bs,
+            request_pool_indices=request_pool_indices,
+        )
 
+    def _refill_legacy_coins(
+        self,
+        *,
+        num_tokens_per_req: int,
+        bs: int,
+        request_pool_indices: list[int] | None,
+    ) -> None:
+        """Advance per-step generators and fill the verifier's coin buffers.
+
+        Live requests use their CPU generators; capture uses the stub stream.
+        This is the existing coin protocol, not position-keyed randomness.
+        """
         n = min(num_tokens_per_req, self.config.max_draft_tokens_per_req)
         lo = coin_eps(self._coins_buf.dtype)
         if request_pool_indices is None:
@@ -548,7 +597,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 top_k=self._top_k_pool,
                 top_p=self._top_p_pool,
                 seed=self._seed_pool,
-                offsets=sampling_info.valid_cache_lengths,
+                offsets=self._prepare_sampling_offsets(sampling_info),
             )
             probs = softmax(
                 logits,
@@ -705,70 +754,97 @@ class FlashInferSamplingBackend(SamplingBackend):
         # Each request's N verified positions share one (temp, top_k, top_p)
         # tuple; flat [bs*N] per-row knobs match the flat [bs*N, vocab] logits.
         n = num_tokens_per_req
-        temperatures, top_ks, top_ps, _, _, _ = gather_and_expand_scalars(
-            pool_indices,
-            temperature=self._temperature_pool,
-            top_k=self._top_k_pool,
-            top_p=self._top_p_pool,
-            n=n,
-        )
 
-        target_probs = softmax(
-            logits,
-            temperature=temperatures,
-        )
-        if _FUSED_TOPK_TOPP_AVAILABLE:
-            # Fused replacement for the back-to-back top_k_renorm_prob +
-            # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
-            # K = 1<<30 in top_ks routes per-row through the radix top-p
-            # only path. Availability decided once in
-            # tokenspeed_kernel.ops.sampling.cuda.
-            target_probs = fused_topk_topp_renorm(
-                target_probs,
-                top_ks,
-                top_ps,
+        per_request_stream = self.config.sampling_stream == "per-request"
+        has_draft_candidates = n > 1
+        # Random-stream policy and verification geometry are independent.
+        # A one-token window needs only a target draw; wider windows must
+        # retain acceptance and residual sampling, even under per-request.
+        if per_request_stream and not has_draft_candidates:
+            sampled, top_ks = self._sample_per_request(
+                logits,
+                replace(sampling_info, req_pool_indices=pool_indices),
+                min_p_pool=None,
             )
-        else:
-            target_probs = top_k_renorm_prob(target_probs, top_ks)
-            target_probs = top_p_renorm_prob(
-                target_probs, top_ps, is_deterministic=True
-            )
-        target_probs = target_probs.reshape(bs, n, -1)
-
-        # Draft-prob rule when the drafter recorded its distributions (the
-        # DP shard gathers its own rows); target-only otherwise.
-        use_draft_prob = sampling_info.draft_probs is not None
-        draft_probs = (
-            self._gather_draft_probs(sampling_info.draft_probs, pool_indices, bs, n)
-            if use_draft_prob
-            else None
-        )
-        chain_speculative_sampling_target_only(
-            predicts=predict,
-            accept_index=accept_index,
-            accept_token_num=accept_length,
-            candidates=candidates,
-            uniform_samples=coins[:bs, :n],
-            uniform_samples_for_final_sampling=final_coins[:bs],
-            target_probs=target_probs,
-            draft_probs=draft_probs,
-            threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
-            threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-            deterministic=not dp_sampling,
-            use_draft_prob=use_draft_prob,
-            reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
-        )
-        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
-            canonical_greedy_verify(
-                logits=logits,
-                top_ks=top_ks,
-                candidates=candidates,
+            if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
+                sampled = canonical_greedy_tokens(logits, top_ks, sampled)
+            predict, accept_length = self._pack_single_verify_result(
+                sampled,
                 predict=predict,
                 accept_index=accept_index,
                 accept_length=accept_length,
             )
+            # Match sample(): publish rank 0's direct draw on replicated TP.
+            needs_tp_sync = True
+        else:
+            temperatures, top_ks, top_ps, _, _, _ = gather_and_expand_scalars(
+                pool_indices,
+                temperature=self._temperature_pool,
+                top_k=self._top_k_pool,
+                top_p=self._top_p_pool,
+                n=n,
+            )
 
-        accept_length += 1
+            target_probs = softmax(
+                logits,
+                temperature=temperatures,
+            )
+            if _FUSED_TOPK_TOPP_AVAILABLE:
+                # Fused replacement for the back-to-back top_k_renorm_prob +
+                # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
+                # K = 1<<30 in top_ks routes per-row through the radix top-p
+                # only path. Availability decided once in
+                # tokenspeed_kernel.ops.sampling.cuda.
+                target_probs = fused_topk_topp_renorm(
+                    target_probs,
+                    top_ks,
+                    top_ps,
+                )
+            else:
+                target_probs = top_k_renorm_prob(target_probs, top_ks)
+                target_probs = top_p_renorm_prob(
+                    target_probs, top_ps, is_deterministic=True
+                )
+            target_probs = target_probs.reshape(bs, n, -1)
+
+            # Draft-prob rule when the drafter recorded its distributions (the
+            # DP shard gathers its own rows); target-only otherwise.
+            use_draft_prob = sampling_info.draft_probs is not None
+            draft_probs = (
+                self._gather_draft_probs(sampling_info.draft_probs, pool_indices, bs, n)
+                if use_draft_prob
+                else None
+            )
+            chain_speculative_sampling_target_only(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=accept_length,
+                candidates=candidates,
+                uniform_samples=coins[:bs, :n],
+                uniform_samples_for_final_sampling=final_coins[:bs],
+                target_probs=target_probs,
+                draft_probs=draft_probs,
+                threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
+                threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+                deterministic=not dp_sampling,
+                use_draft_prob=use_draft_prob,
+                reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
+            )
+            if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
+                canonical_greedy_verify(
+                    logits=logits,
+                    top_ks=top_ks,
+                    candidates=candidates,
+                    predict=predict,
+                    accept_index=accept_index,
+                    accept_length=accept_length,
+                )
+
+            accept_length += 1
+            # This is the chain implementation's agreement requirement, not
+            # a property of the request's random-stream policy. The fused
+            # renorm path skips TP sync only when PDL is disabled.
+            needs_tp_sync = pdl_enabled() or not _FUSED_TOPK_TOPP_AVAILABLE
         logprobs_local = None
         if self.config.enable_output_logprobs and dp_sampling:
             # DP verify logits are still sharded by request at this point.
@@ -803,14 +879,9 @@ class FlashInferSamplingBackend(SamplingBackend):
                 logits_output.next_token_logprobs = logprobs_full.view(-1)[
                     : effective_bs * n
                 ]
-        # TP-rank sync: rank 0 wins on the full verify-output triple.
-        # Load-bearing: flashinfer top_k_renorm_prob has no is_deterministic
-        # knob and produces non-bit-identical results across ranks (sub-ulp
-        # FP accumulation order).
-        # PDL still uses rank-0 outputs to keep ranks aligned. Without PDL,
-        # fused top-k + top-p is bit-identical across ranks and does not need
-        # a broadcast.
-        elif pdl_enabled() or not _FUSED_TOPK_TOPP_AVAILABLE:
+        # DP above assembles disjoint request rows. Replicated TP follows
+        # the selected implementation's agreement requirement instead.
+        elif needs_tp_sync:
             self.broadcast_verify_outputs()
 
         if self.config.enable_output_logprobs and not dp_sampling:

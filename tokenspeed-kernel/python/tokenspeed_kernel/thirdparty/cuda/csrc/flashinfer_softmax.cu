@@ -4,6 +4,7 @@
  * Vendored from flashinfer/sampling.cuh (Apache-2.0), with the kernel
  * template split on input vs output dtype so bf16/fp16 input folds the
  * upcast into the kernel's load. Output is always fp32.
+ * Local change: at a few rows the map-reduce normalize runs one block per (row, slice).
  */
 
 #include <flashinfer/allocator.h>
@@ -242,6 +243,7 @@ __global__ void OnlineSoftmaxReduceKernel(DTypeIn* logits, DTypeOut* output,
                                           float* temperature_arr, float temperature_val,
                                           uint32_t d, uint32_t num_slices) {
   const uint32_t bx = blockIdx.x;
+  const uint32_t by = blockIdx.y;  // write slice: every slice block combines the same partials
   const uint32_t tx = threadIdx.x;
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   // All dependent inputs, including temperature, must follow the acquire.
@@ -275,15 +277,21 @@ __global__ void OnlineSoftmaxReduceKernel(DTypeIn* logits, DTypeOut* output,
   const float final_max = temp_storage.shared_state.max_val;
   const float inv_denominator = 1.0f / temp_storage.shared_state.denominator;
 
+  const uint32_t vec_alignment_elems = alignof(vec_t<DTypeIn, VEC_SIZE>) / sizeof(DTypeIn);
+  const uint32_t slice_stride = round_up(ceil_div(d, gridDim.y), vec_alignment_elems);
+  const uint32_t slice_start = by * slice_stride;
+  const uint32_t slice_size = slice_start < d ? min((by + 1) * slice_stride, d) - slice_start : 0;
+  const uint32_t offset = bx * d + slice_start;
+
   vec_t<DTypeIn, VEC_SIZE> in_vec;
   vec_t<DTypeOut, VEC_SIZE> prob_vec;
   float scaled[VEC_SIZE];
 
-  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+  for (uint32_t i = 0; i < ceil_div(slice_size, BLOCK_THREADS * VEC_SIZE); ++i) {
     in_vec.fill(-cuda::std::numeric_limits<DTypeIn>::infinity());
-    bool in_bounds = (i * BLOCK_THREADS + tx) * VEC_SIZE < d;
+    bool in_bounds = (i * BLOCK_THREADS + tx) * VEC_SIZE < slice_size;
     if (in_bounds) {
-      in_vec.cast_load(logits + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+      in_vec.cast_load(logits + offset + (i * BLOCK_THREADS + tx) * VEC_SIZE);
     }
 
 #pragma unroll
@@ -294,7 +302,7 @@ __global__ void OnlineSoftmaxReduceKernel(DTypeIn* logits, DTypeOut* output,
     }
 
     if (in_bounds) {
-      prob_vec.cast_store(output + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+      prob_vec.cast_store(output + offset + (i * BLOCK_THREADS + tx) * VEC_SIZE);
     }
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -353,7 +361,14 @@ cudaError_t OnlineSoftmax(DTypeIn* logits, DTypeOut* output, uint32_t batch_size
                                                   args, smem_size, stream));
           }
 
-          dim3 phase2_nblks(batch_size);
+          // Slices fill the SMs at a few rows; once the rows alone fill a third, whole rows win.
+          int device, num_sms;
+          FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+          FLASHINFER_CUDA_CALL(
+              cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
+          const uint32_t write_slices =
+              batch_size * 3 <= static_cast<uint32_t>(num_sms) ? num_slices : 1;
+          dim3 phase2_nblks(batch_size, write_slices);
           dim3 phase2_nthrs(BLOCK_THREADS);
           auto phase2_kernel = OnlineSoftmaxReduceKernel<BLOCK_THREADS, VEC_SIZE, DTypeIn, DTypeOut>;
           FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(

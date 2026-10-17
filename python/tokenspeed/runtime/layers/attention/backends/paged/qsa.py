@@ -65,6 +65,10 @@ class QSAAttnBackend(MHAAttnBackend):
         super().init_cuda_graph_state(max_bs)
         self._metadata_capacity_rows = max_bs * self.spec_num_tokens
 
+    def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
+        # The sparse kernel reads an FP8 cache at unit scale.
+        return False
+
     def _sparse_attention(
         self,
         q: torch.Tensor,

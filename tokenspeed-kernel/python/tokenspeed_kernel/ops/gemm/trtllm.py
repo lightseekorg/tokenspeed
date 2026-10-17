@@ -32,7 +32,12 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import ScaleFormat, format_signature, tensor_format
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    format_signature,
+    format_signatures,
+    tensor_format,
+)
 
 if current_platform().is_nvidia:
     # DeepEP must initialize before TRT-LLM's static CUDA runtime.
@@ -40,9 +45,19 @@ if current_platform().is_nvidia:
     import trtllm_kernel  # noqa: F401
 
 
+# ===-----------------------------------------------------------------------===#
+# DeepSeek V3 fused-A projection: TRT-LLM (NVIDIA)
+# ===-----------------------------------------------------------------------===#
+
+
 def dsv3_fused_a_gemm(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
     """Run TRT-LLM's shape-specialized DeepSeek V3 fused-A projection."""
     return torch.ops.trtllm.dsv3_fused_a_gemm_op(mat_a, mat_b, None, None)
+
+
+# ===-----------------------------------------------------------------------===#
+# NVFP4: TRT-LLM cuBLASLt (NVIDIA SM100+)
+# ===-----------------------------------------------------------------------===#
 
 
 _fp4_dtypes: frozenset[torch.dtype] = frozenset({torch.uint8, torch.float4_e2m1fn_x2})
@@ -123,3 +138,94 @@ def cublaslt_mm_nvfp4(
         out.copy_(output)
         return out
     return output
+
+
+# ===-----------------------------------------------------------------------===#
+# FP8 block-scale: TRT-LLM CuTe DSL (NVIDIA SM100)
+# ===-----------------------------------------------------------------------===#
+
+
+# Opt-in TRT-LLM CuTe-DSL FP8 GEMM with unmodified FP32 block scales.
+
+
+@register_kernel(
+    "gemm",
+    "mm",
+    name="trtllm_cutedsl_mm_fp8_blockscale",
+    solution="trtllm_cutedsl",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 9),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=format_signatures(
+        ("a", "b"),
+        "mxfp8",
+        {torch.float8_e4m3fn},
+        scale=ScaleFormat(
+            storage_dtype=torch.float32, granularity="block", block_shape=(128, 128)
+        ),
+    ),
+    traits={
+        "n_align": frozenset({128}),
+        "k_align": frozenset({128}),
+        "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
+    },
+    priority=Priority.REFERENCE,
+)
+def trtllm_cutedsl_mm_fp8_blockscale(
+    A, B, A_scales, B_scales, out_dtype, *, alpha, block_size, **kwargs
+):
+    """Compute FP8 A @ B.T using canonical FP32 1x128 and 128x128 scales.
+
+    Args:
+        A: Contiguous E4M3 activation matrix [M,K].
+        B: Contiguous E4M3 weight matrix [N,K].
+        A_scales: Logical FP32 [M,K/128] activation scales.
+        B_scales: FP32 [N/128,K/128] checkpoint scales.
+        out_dtype: BF16 output type.
+        alpha: Must be None; additional scaling is unsupported.
+        block_size: Must be [128,128].
+        kwargs: Optional preallocated contiguous BF16 output named out.
+    Returns:
+        BF16 result [M,N], using out when provided.
+    """
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise import blockwise_gemm
+
+    if (
+        alpha is not None
+        or tuple(block_size) != (128, 128)
+        or out_dtype != torch.bfloat16
+    ):
+        raise ValueError(
+            "TRT-LLM CuTe-DSL requires BF16 output, 128x128 blocks and alpha=None"
+        )
+    if A.dtype != torch.float8_e4m3fn or B.dtype != torch.float8_e4m3fn:
+        raise ValueError("TRT-LLM CuTe-DSL requires E4M3 inputs")
+    m, k = A.shape
+    n, bk = B.shape
+    if k != bk or n % 128 or k % 128 or not A.is_contiguous() or not B.is_contiguous():
+        raise ValueError("TRT-LLM CuTe-DSL requires contiguous aligned matrices")
+    if (
+        A_scales is None
+        or B_scales is None
+        or A_scales.dtype != torch.float32
+        or B_scales.dtype != torch.float32
+        or A_scales.shape != (m, k // 128)
+        or B_scales.shape != (n // 128, k // 128)
+        or any(t.device != A.device for t in (B, A_scales, B_scales))
+    ):
+        raise ValueError(
+            "TRT-LLM CuTe-DSL requires canonical FP32 scales on the input device"
+        )
+    out = kwargs.get("out")
+    if out is None:
+        out = torch.empty((m, n), device=A.device, dtype=out_dtype)
+    if (
+        out.shape != (m, n)
+        or out.dtype != out_dtype
+        or out.device != A.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError("Invalid TRT-LLM CuTe-DSL output buffer")
+    return blockwise_gemm(A, B, A_scales, B_scales, out)

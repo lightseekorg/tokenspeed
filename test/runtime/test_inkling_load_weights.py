@@ -14,17 +14,18 @@ exact-placement asserts and make the TP/EP slice tests single-process.
 
 import os
 import sys
-import unittest
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ci_system.ci_register import register_cuda_ci  # noqa: E402
-from runtime.models.inkling_fixtures import (  # noqa: E402
+from test.runtime.models.inkling_fixtures import (  # noqa: E402
     NUM_TEST_EXPERTS,
     has_blackwell,
     load_inkling_config,
 )
+
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(
     est_time=120,
@@ -33,7 +34,9 @@ register_cuda_ci(
 )
 
 if not has_blackwell():
-    raise unittest.SkipTest("Inkling loader tests require an NVIDIA Blackwell GPU")
+    pytest.skip(
+        "Inkling loader tests require an NVIDIA Blackwell GPU", allow_module_level=True
+    )
 
 SEED = 1234
 
@@ -181,10 +184,10 @@ def _make_checkpoint_tensors(
     return ckpt
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
-class TestInklingLoadWeights(unittest.TestCase):
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs a CUDA device"))
+class TestInklingLoadWeights:
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         os.environ["INKLING_TORCH_MOE"] = "1"  # experts as plain parameters
         config = load_inkling_config(num_experts=NUM_TEST_EXPERTS)
         cls.ckpt = _make_checkpoint_tensors(config.get_text_config())
@@ -193,7 +196,7 @@ class TestInklingLoadWeights(unittest.TestCase):
         cls.loaded = cls.model.load_weights(iter(cls.ckpt.items()))
 
     @classmethod
-    def tearDownClass(cls):
+    def teardown_class(cls):
         del cls.model, cls.ckpt
         torch.cuda.empty_cache()
 
@@ -203,13 +206,21 @@ class TestInklingLoadWeights(unittest.TestCase):
     def _assert_eq(self, name: str, expected: torch.Tensor):
         got = self._param(name)
         expected = expected.to(got.dtype)
-        self.assertEqual(got.shape, expected.shape, name)
-        self.assertTrue(torch.equal(got, expected), f"{name} mismatch")
+        _pytest_first_1 = got.shape
+        _pytest_second_2 = expected.shape
+        _pytest_msg_3 = name
+        assert _pytest_first_1 == _pytest_second_2, _pytest_msg_3
+        _pytest_expr_4 = torch.equal(got, expected)
+        _pytest_msg_5 = f"{name} mismatch"
+        assert _pytest_expr_4, _pytest_msg_5
 
     def test_full_parameter_coverage(self):
         params = dict(self.model.named_parameters())
         missing = sorted(set(params) - self.loaded)
-        self.assertEqual(missing, [], f"params never loaded: {missing}")
+        _pytest_first_6 = missing
+        _pytest_second_7 = []
+        _pytest_msg_8 = f"params never loaded: {missing}"
+        assert _pytest_first_6 == _pytest_second_7, _pytest_msg_8
 
     def test_qkvr_fusion(self):
         # Hetero KV serves every layer's native checkpoint head count, so the
@@ -293,9 +304,9 @@ class TestInklingLoadWeights(unittest.TestCase):
             out = block(x, ctx=None)
         finally:
             block.comm_manager.post_moe_comm = orig
-        self.assertEqual(len(seen), 1)
-        self.assertEqual(out.shape, x.shape)
-        self.assertTrue(torch.equal(out, seen[0]))
+        assert (len(seen)) == (1)
+        assert (out.shape) == (x.shape)
+        assert torch.equal(out, seen[0])
 
     def test_nvfp4_aux_names_are_consumed_without_error(self):
         """On unquantized layers the FP4 aux tensors drop with a warning; the
@@ -310,7 +321,7 @@ class TestInklingLoadWeights(unittest.TestCase):
             "model.llm.norm.weight": self.ckpt["model.llm.norm.weight"],
         }
         loaded = self.model.load_weights(iter(extra.items()))
-        self.assertEqual(loaded, {"model.norm.weight"})
+        assert (loaded) == ({"model.norm.weight"})
 
     def test_lm_head_ties_to_embedding_when_unembed_absent(self):
         stream = {k: v for k, v in self.ckpt.items() if k != "model.llm.unembed.weight"}
@@ -319,14 +330,14 @@ class TestInklingLoadWeights(unittest.TestCase):
             self.ckpt["model.llm.embed.weight"].float() + 1.0
         ).to(torch.bfloat16)
         loaded = self.model.load_weights(iter(stream.items()))
-        self.assertIn("lm_head.weight", loaded)
+        assert ("lm_head.weight") in (loaded)
         self._assert_eq("lm_head.weight", stream["model.llm.embed.weight"])
         # Restore the original weights for any later test.
         self.model.load_weights(iter(self.ckpt.items()))
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
-class TestInklingMoeBlockDeferredFinalize(unittest.TestCase):
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs a CUDA device"))
+class TestInklingMoeBlockDeferredFinalize:
     """The sparse block's deferred branch (routed trtllm do_finalize=False +
     moe_finalize_fuse_shared with the gate's full [T, k+S] weights) must
     match the fallback branch (in-kernel finalize + separate shared add) on
@@ -341,7 +352,7 @@ class TestInklingMoeBlockDeferredFinalize(unittest.TestCase):
             and plat.is_blackwell
             and plat.arch_version == ArchVersion(10, 0)
         ):
-            self.skipTest("routed trtllm MoE kernels need SM100")
+            pytest.skip("routed trtllm MoE kernels need SM100")
 
         from tokenspeed.runtime.distributed.mapping import Mapping
         from tokenspeed.runtime.layers.moe import utils as moe_utils
@@ -364,8 +375,8 @@ class TestInklingMoeBlockDeferredFinalize(unittest.TestCase):
                     block = InklingSparseMoeBlock(text, mapping, layer_id=2)
                 finally:
                     torch.set_default_dtype(torch.float32)
-            self.assertTrue(block.experts.supports_deferred_finalize)
-            self.assertFalse(block.experts.support_routing)
+            assert block.experts.supports_deferred_finalize
+            assert not (block.experts.support_routing)
 
             with torch.no_grad():
                 for p in block.parameters():
@@ -387,7 +398,7 @@ class TestInklingMoeBlockDeferredFinalize(unittest.TestCase):
             finally:
                 block.experts.plan["supports_deferred_finalize"] = True
 
-            self.assertEqual(out_deferred.shape, out_fallback.shape)
+            assert (out_deferred.shape) == (out_fallback.shape)
             # The two branches round differently (f32 vs bf16 weight
             # application, gamma pre- vs post-down-proj); tolerate bf16 noise.
             torch.testing.assert_close(
@@ -399,8 +410,8 @@ class TestInklingMoeBlockDeferredFinalize(unittest.TestCase):
                 os.environ["INKLING_TORCH_MOE"] = saved_torch_moe
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
-class TestInklingLoadWeightsParallel(unittest.TestCase):
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs a CUDA device"))
+class TestInklingLoadWeightsParallel:
     """Per-rank slice correctness under TP/EP.
 
     Builds one model per rank of a parallel layout in the same process (no
@@ -411,13 +422,13 @@ class TestInklingLoadWeightsParallel(unittest.TestCase):
     """
 
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         os.environ.pop("INKLING_TORCH_MOE", None)  # real MoELayer path
         cls.config = load_inkling_config(num_experts=NUM_TEST_EXPERTS)
         cls.ckpt = _make_checkpoint_tensors(cls.config.get_text_config())
 
     @classmethod
-    def tearDownClass(cls):
+    def teardown_class(cls):
         del cls.ckpt
         torch.cuda.empty_cache()
 
@@ -448,8 +459,8 @@ class TestInklingLoadWeightsParallel(unittest.TestCase):
                 qkvr = self._param(model, f"model.layers.{layer}.attn.qkvr.weight")
                 wq = self.ckpt[f"{p}.wq_du.weight"]
                 q_rows = q_heads * hd
-                self.assertTrue(
-                    torch.equal(qkvr[:q_rows], wq[rank * q_rows : (rank + 1) * q_rows])
+                assert torch.equal(
+                    qkvr[:q_rows], wq[rank * q_rows : (rank + 1) * q_rows]
                 )
                 # K section: rank's served heads <- ckpt head j // factor.
                 wk = self.ckpt[f"{p}.wk_dv.weight"]
@@ -458,17 +469,14 @@ class TestInklingLoadWeightsParallel(unittest.TestCase):
                     j = rank * (served // tp) + j_local
                     src = (j // factor) * hd
                     got = qkvr[q_rows + j_local * hd : q_rows + (j_local + 1) * hd]
-                    self.assertTrue(
-                        torch.equal(got, wk[src : src + hd]),
-                        f"layer{layer} rank{rank} kv head {j}",
-                    )
+                    _pytest_expr_18 = torch.equal(got, wk[src : src + hd])
+                    _pytest_msg_19 = f"layer{layer} rank{rank} kv head {j}"
+                    assert _pytest_expr_18, _pytest_msg_19
                 # wo_ud (row-parallel): input-dim shard.
                 wo = self._param(model, f"model.layers.{layer}.attn.wo_ud.weight")
                 full = self.ckpt[f"{p}.wo_ud.weight"]
                 cols = full.shape[1] // tp
-                self.assertTrue(
-                    torch.equal(wo, full[:, rank * cols : (rank + 1) * cols])
-                )
+                assert torch.equal(wo, full[:, rank * cols : (rank + 1) * cols])
             # Dense MLP (layer 0): per-half gate_up rows, down_proj cols.
             gu = self._param(model, "model.layers.0.mlp.gate_up_proj.weight")
             full = _deinterleave_rows(self.ckpt["model.llm.layers.0.mlp.w13_dn.weight"])
@@ -480,7 +488,7 @@ class TestInklingLoadWeightsParallel(unittest.TestCase):
                     full[half + rank * sh : half + (rank + 1) * sh],
                 ]
             )
-            self.assertTrue(torch.equal(gu, expected))
+            assert torch.equal(gu, expected)
             # Routed experts under MoE TP=2 (default moe layout for world 2).
             w13 = self._param(model, "model.layers.4.mlp.experts.w13_weight")
             full13 = _deinterleave_rows(
@@ -495,10 +503,12 @@ class TestInklingLoadWeightsParallel(unittest.TestCase):
                 ],
                 dim=1,
             )
-            self.assertTrue(torch.equal(w13, expected13), f"moe tp w13 rank{rank}")
+            _pytest_expr_12 = torch.equal(w13, expected13)
+            _pytest_msg_13 = f"moe tp w13 rank{rank}"
+            assert _pytest_expr_12, _pytest_msg_13
             w2 = self._param(model, "model.layers.4.mlp.experts.w2_weight")
             full2 = self.ckpt["model.llm.layers.4.mlp.experts.w2_weight"]
-            self.assertTrue(torch.equal(w2, full2[:, :, rank * isl : (rank + 1) * isl]))
+            assert torch.equal(w2, full2[:, :, rank * isl : (rank + 1) * isl])
             # Shared experts follow attention TP.
             sw13 = self._param(model, "model.layers.4.mlp.shared_experts.w13_weight")
             sfull = _deinterleave_rows(
@@ -513,7 +523,7 @@ class TestInklingLoadWeightsParallel(unittest.TestCase):
                 ],
                 dim=1,
             )
-            self.assertTrue(torch.equal(sw13, sexp))
+            assert torch.equal(sw13, sexp)
             del model
             torch.cuda.empty_cache()
 
@@ -536,14 +546,13 @@ class TestInklingLoadWeightsParallel(unittest.TestCase):
                 wk = self.ckpt[f"{p}.wk_dv.weight"]
                 src = ((rank * ckpt_kv) // tp) * hd
                 got = qkvr[q_rows : q_rows + hd]
-                self.assertTrue(
-                    torch.equal(got, wk[src : src + hd]),
-                    f"layer{layer} rank{rank} replicated kv",
-                )
+                _pytest_expr_14 = torch.equal(got, wk[src : src + hd])
+                _pytest_msg_15 = f"layer{layer} rank{rank} replicated kv"
+                assert _pytest_expr_14, _pytest_msg_15
                 # K sconv taps replicate identically.
                 ks = self._param(model, f"model.layers.{layer}.attn.k_sconv.weight")
                 full_ks = self.ckpt[f"{p}.k_sconv.weight"]
-                self.assertTrue(torch.equal(ks, full_ks[src : src + hd]))
+                assert torch.equal(ks, full_ks[src : src + hd])
             del model
             torch.cuda.empty_cache()
 
@@ -552,23 +561,22 @@ class TestInklingLoadWeightsParallel(unittest.TestCase):
             try:
                 model, text = self._load_rank(rank, 2, moe_ep_size=2, moe_tp_size=1)
             except Exception as e:  # pragma: no cover - environment specific
-                self.skipTest(f"EP-2 MoELayer construction unavailable: {e}")
+                pytest.skip(f"EP-2 MoELayer construction unavailable: {e}")
             n_local = text.n_routed_experts // 2
             w13 = self._param(model, "model.layers.4.mlp.experts.w13_weight")
-            self.assertEqual(w13.shape[0], n_local)
+            assert (w13.shape[0]) == (n_local)
             full13 = _deinterleave_rows(
                 self.ckpt["model.llm.layers.4.mlp.experts.w13_weight"]
             )
             for local in range(n_local):
-                self.assertTrue(
-                    torch.equal(w13[local], full13[rank * n_local + local]),
-                    f"ep rank{rank} expert {local}",
+                _pytest_expr_16 = torch.equal(
+                    w13[local], full13[rank * n_local + local]
                 )
+                _pytest_msg_17 = f"ep rank{rank} expert {local}"
+                assert _pytest_expr_16, _pytest_msg_17
             w2 = self._param(model, "model.layers.4.mlp.experts.w2_weight")
             full2 = self.ckpt["model.llm.layers.4.mlp.experts.w2_weight"]
-            self.assertTrue(
-                torch.equal(w2, full2[rank * n_local : (rank + 1) * n_local])
-            )
+            assert torch.equal(w2, full2[rank * n_local : (rank + 1) * n_local])
             del model
             torch.cuda.empty_cache()
 
@@ -582,12 +590,12 @@ class TestInklingLoadWeightsParallel(unittest.TestCase):
         model, _ = self._load_rank(1, 4)
         mapping = model.mapping.attn if hasattr(model, "mapping") else None
         lp = model.logits_processor
-        self.assertEqual(lp.tp_size, 4)
-        self.assertEqual(lp.tp_rank, 1)
-        self.assertIsNotNone(lp.tp_group)
-        self.assertFalse(lp.skip_all_gather)
+        assert (lp.tp_size) == (4)
+        assert (lp.tp_rank) == (1)
+        assert (lp.tp_group) is not None
+        assert not (lp.skip_all_gather)
         if mapping is not None:
-            self.assertEqual(lp.tp_group, mapping.tp_group)
+            assert (lp.tp_group) == (mapping.tp_group)
         del model
         torch.cuda.empty_cache()
 
@@ -622,13 +630,13 @@ def _checkpoint_style_exclude_list(text) -> list[str]:
     return exclude
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
-class TestInklingLoadWeightsNvfp4(unittest.TestCase):
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs a CUDA device"))
+class TestInklingLoadWeightsNvfp4:
     """NVFP4 flavor: mixed-precision experts (first MoE layer stays BF16),
     packed U8 weights, F8 block scales, scale2/input_amax routing."""
 
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 
         os.environ.pop("INKLING_TORCH_MOE", None)  # real MoELayer path
@@ -647,7 +655,7 @@ class TestInklingLoadWeightsNvfp4(unittest.TestCase):
         cls.loaded = cls.model.load_weights(iter(cls.ckpt.items()))
 
     @classmethod
-    def tearDownClass(cls):
+    def teardown_class(cls):
         del cls.model, cls.ckpt
         torch.cuda.empty_cache()
 
@@ -656,28 +664,29 @@ class TestInklingLoadWeightsNvfp4(unittest.TestCase):
 
     def test_exclusion_translation(self):
         translated = self.model.quant_config.exclude_modules
-        self.assertIn("model.layers.2.mlp.experts", translated)
-        self.assertIn("model.layers.2.mlp.experts.*", translated)
-        self.assertIn("model.layers.0.mlp.gate_up_proj", translated)
-        self.assertIn("lm_head", translated)
-        self.assertFalse([e for e in translated if e.startswith("model.llm.")])
+        assert ("model.layers.2.mlp.experts") in (translated)
+        assert ("model.layers.2.mlp.experts.*") in (translated)
+        assert ("model.layers.0.mlp.gate_up_proj") in (translated)
+        assert ("lm_head") in (translated)
+        assert not ([e for e in translated if e.startswith("model.llm.")])
 
     def test_full_parameter_coverage(self):
         params = dict(self.model.named_parameters())
         missing = sorted(set(params) - self.loaded)
-        self.assertEqual(missing, [], f"params never loaded: {missing}")
+        _pytest_first_9 = missing
+        _pytest_second_10 = []
+        _pytest_msg_11 = f"params never loaded: {missing}"
+        assert _pytest_first_9 == _pytest_second_10, _pytest_msg_11
 
     def test_first_moe_layer_experts_stay_bf16(self):
         i = self.text.dense_mlp_idx
         w13 = self._param(f"model.layers.{i}.mlp.experts.w13_weight")
-        self.assertEqual(w13.dtype, torch.bfloat16)
-        self.assertTrue(
-            torch.equal(
-                w13,
-                _deinterleave_rows(
-                    self.ckpt[f"model.llm.layers.{i}.mlp.experts.w13_weight"]
-                ),
-            )
+        assert (w13.dtype) == (torch.bfloat16)
+        assert torch.equal(
+            w13,
+            _deinterleave_rows(
+                self.ckpt[f"model.llm.layers.{i}.mlp.experts.w13_weight"]
+            ),
         )
 
     def test_quantized_experts_packed_and_scales(self):
@@ -685,21 +694,15 @@ class TestInklingLoadWeightsNvfp4(unittest.TestCase):
         p = f"model.llm.layers.{i}.mlp.experts"
         o = f"model.layers.{i}.mlp.experts"
         w13 = self._param(f"{o}.w13_weight")
-        self.assertEqual(w13.dtype, torch.uint8)
-        self.assertTrue(
-            torch.equal(w13, _deinterleave_rows(self.ckpt[f"{p}.w13_weight"]))
-        )
+        assert (w13.dtype) == (torch.uint8)
+        assert torch.equal(w13, _deinterleave_rows(self.ckpt[f"{p}.w13_weight"]))
         w2 = self._param(f"{o}.w2_weight")
-        self.assertTrue(torch.equal(w2, self.ckpt[f"{p}.w2_weight"]))
+        assert torch.equal(w2, self.ckpt[f"{p}.w2_weight"])
         scale = self._param(f"{o}.w13_weight_scale")
-        self.assertEqual(scale.dtype, torch.float8_e4m3fn)
-        self.assertTrue(
-            torch.equal(
-                scale.view(torch.uint8),
-                _deinterleave_rows(
-                    self.ckpt[f"{p}.w13_weight.scale"].view(torch.uint8)
-                ),
-            )
+        assert (scale.dtype) == (torch.float8_e4m3fn)
+        assert torch.equal(
+            scale.view(torch.uint8),
+            _deinterleave_rows(self.ckpt[f"{p}.w13_weight.scale"].view(torch.uint8)),
         )
 
     def test_scale2_and_input_scale_conversion(self):
@@ -708,29 +711,24 @@ class TestInklingLoadWeightsNvfp4(unittest.TestCase):
         o = f"model.layers.{i}.mlp.experts"
         scale_2 = self._param(f"{o}.w13_weight_scale_2")
         ckpt_scale2 = self.ckpt[f"{p}.w13_weight.scale2"]
-        self.assertTrue(torch.equal(scale_2[:, 0], ckpt_scale2))
-        self.assertTrue(torch.equal(scale_2[:, 1], ckpt_scale2))
+        assert torch.equal(scale_2[:, 0], ckpt_scale2)
+        assert torch.equal(scale_2[:, 1], ckpt_scale2)
         input_scale = self._param(f"{o}.w13_input_scale")
         expected = self.ckpt[f"{p}.w13_weight.input_amax"].float() / (448.0 * 6.0)
-        self.assertTrue(torch.allclose(input_scale, expected.expand_as(input_scale)))
+        assert torch.allclose(input_scale, expected.expand_as(input_scale))
         w2_input_scale = self._param(f"{o}.w2_input_scale")
         expected2 = self.ckpt[f"{p}.w2_weight.input_amax"].float() / (448.0 * 6.0)
-        self.assertTrue(
-            torch.allclose(w2_input_scale, expected2.expand_as(w2_input_scale))
-        )
+        assert torch.allclose(w2_input_scale, expected2.expand_as(w2_input_scale))
 
     def test_non_expert_modules_stay_bf16(self):
-        self.assertEqual(
-            self._param("model.layers.3.attn.qkvr.weight").dtype, torch.bfloat16
+        assert (self._param("model.layers.3.attn.qkvr.weight").dtype) == (
+            torch.bfloat16
         )
-        self.assertEqual(
-            self._param("model.layers.0.mlp.gate_up_proj.weight").dtype,
-            torch.bfloat16,
+        assert (self._param("model.layers.0.mlp.gate_up_proj.weight").dtype) == (
+            torch.bfloat16
         )
-        self.assertEqual(
-            self._param("model.layers.3.mlp.gate.bias").dtype, torch.float32
-        )
+        assert (self._param("model.layers.3.mlp.gate.bias").dtype) == (torch.float32)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

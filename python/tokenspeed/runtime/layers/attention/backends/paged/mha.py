@@ -59,6 +59,12 @@ _KERNEL_SOLUTION_BY_BACKEND = {
 }
 
 
+def _fp8_scale_kwargs(layer: PagedAttention) -> dict:
+    """The per-tensor scales an FP8 cache was written with, for the kernel's read."""
+    scales = layer.fp8_kv_scales
+    return {} if scales is None else {"fp8_kv_scales": (scales.k, scales.v)}
+
+
 def _slice_extend_inputs(metadata, *tensors):
     """Remove prefill-graph padding rows before calling an attention kernel.
 
@@ -149,6 +155,10 @@ class MHAAttnBackend(PagedAttentionBackend):
     def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
         # Decode metadata exists only in decode rounds.
         return forward_mode.is_decode()
+
+    def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
+        # Both reads hand them to the kernel (_fp8_scale_kwargs).
+        return True
 
     # ------------------------------------------------------------------
     # Metadata
@@ -281,6 +291,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
         elif self.is_fp8:
             q = q.to(self.kv_cache_dtype)
+            scale_kwargs = _fp8_scale_kwargs(layer)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         max_seqlen_q = q.shape[0] // metadata.seq_lens.shape[0]
@@ -372,6 +383,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
         elif self.is_fp8:
             q = q.to(self.kv_cache_dtype)
+            scale_kwargs = _fp8_scale_kwargs(layer)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         output = mha_extend_with_kvcache(

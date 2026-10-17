@@ -272,10 +272,8 @@ def test_unbuildable_private_module_keeps_trtllm_at_128(
     from tokenspeed_kernel.registry import KernelRegistry
     from tokenspeed_kernel.selection import NoKernelFoundError
 
-    unquant = pytest.importorskip("tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant")
-    cutlass = pytest.importorskip(
-        "tokenspeed_kernel.ops.moe.flashinfer.cutlass_unquant"
-    )
+    unquant = pytest.importorskip("tokenspeed_kernel.ops.moe.flashinfer")
+    cutlass = pytest.importorskip("tokenspeed_kernel.ops.moe.flashinfer")
     if KernelRegistry.get().get_by_name("flashinfer_trtllm_unquant_moe_apply") is None:
         pytest.skip("flashinfer_trtllm unquant MoE kernels are not registered")
 
@@ -325,7 +323,7 @@ def test_other_gpus_keep_128_without_checking_flashinfer_jit(
     from tokenspeed_kernel.platform import Platform
     from tokenspeed_kernel.registry import KernelRegistry
 
-    unquant = pytest.importorskip("tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant")
+    unquant = pytest.importorskip("tokenspeed_kernel.ops.moe.flashinfer")
     alignment = unquant.TRTLLM_UNQUANT_ISPP_ALIGNMENT
     monkeypatch.setattr(unquant, "TRTLLM_UNQUANT_ISPP_ALIGNMENT", alignment)
     real_platform, real_registry = Platform.get(), KernelRegistry.get()
@@ -384,7 +382,7 @@ def test_trtllm_unquant_admits_gated_sizes_the_launcher_accepts(
     from tokenspeed_kernel.platform import ArchVersion, Platform
     from tokenspeed_kernel.registry import KernelRegistry
 
-    unquant = pytest.importorskip("tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant")
+    unquant = pytest.importorskip("tokenspeed_kernel.ops.moe.flashinfer")
     registry = KernelRegistry.get()
     if registry.get_by_name("flashinfer_trtllm_unquant_moe_apply") is None:
         pytest.skip("flashinfer_trtllm unquant MoE kernels are not registered")
@@ -451,7 +449,7 @@ def test_64_aligned_outputs_match_128_padded(
         (10, 3),
     ):
         pytest.skip("TRT-LLM BF16 MoE kernels need SM100 or SM103")
-    from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as unquant
+    import tokenspeed_kernel.ops.moe.flashinfer as unquant
 
     if unquant.TRTLLM_UNQUANT_ISPP_ALIGNMENT != adapter.GATED_ISPP_ALIGNMENT:
         pytest.skip("the installed FlashInfer launcher cannot be relaxed or built")
@@ -859,7 +857,7 @@ def test_moe_plan_keeps_in_kernel_routing_only_with_an_fp32_bias(
 ):
     from tokenspeed_kernel.registry import KernelRegistry
 
-    pytest.importorskip("tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant")
+    pytest.importorskip("tokenspeed_kernel.ops.moe.flashinfer")
     if KernelRegistry.get().get_by_name("flashinfer_trtllm_unquant_moe_apply") is None:
         pytest.skip("flashinfer_trtllm MoE kernels are not registered")
     calls = []
@@ -907,7 +905,7 @@ def _gpu_bf16_moe_layer(
         (10, 3),
     ):
         pytest.skip("TRT-LLM BF16 MoE kernels need SM100 or SM103")
-    from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as unquant
+    import tokenspeed_kernel.ops.moe.flashinfer as unquant
 
     if intermediate_size % unquant.TRTLLM_UNQUANT_ISPP_ALIGNMENT:
         pytest.skip("the installed FlashInfer launcher cannot be relaxed")
@@ -995,7 +993,7 @@ def test_fp32_bias_routing_matches_the_fp32_reference(
     if n_group == 1 and case == "negative-logits":
         pytest.skip(_ONE_GROUP_ROUTER)
     w, x = _gpu_bf16_moe_layer(intermediate_size)
-    from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as unquant
+    import tokenspeed_kernel.ops.moe.flashinfer as unquant
 
     assert adapter.fp32_routing_bias_ready()
     unquant.flashinfer_trtllm_unquant_moe_weights({}, w)

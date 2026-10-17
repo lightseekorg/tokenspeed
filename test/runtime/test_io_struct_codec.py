@@ -40,7 +40,6 @@ from tokenspeed.runtime.engine.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
-    BatchTokenIDOutSlim,
     BlockReqInput,
     BlockReqType,
     CloseSessionReqInput,

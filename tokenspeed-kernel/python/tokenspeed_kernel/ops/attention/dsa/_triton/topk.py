@@ -736,56 +736,67 @@ def _ordered_key_to_fp32(x):
 
 
 @triton.jit
+def _topk_row_length(seq_lens, row, seq_lens_stride, n_cols):
+    length = n_cols
+    if seq_lens is not None:
+        length = tl.minimum(
+            tl.maximum(tl.load(seq_lens + row * seq_lens_stride), 0), n_cols
+        ).to(tl.int32)
+    return length
+
+
+@triton.jit(
+    do_not_specialize=[
+        "logits_stride",
+        "logits_col_stride",
+        "out_stride",
+        "seq_lens_stride",
+        "n_cols",
+    ]
+)
 def _dsa_logits_topk_kernel(
     logits,
     out,
+    seq_lens,
     # Runtime values: these track the batch's KV length, so keying the JIT
     # cache on them recompiles per request.  ``n_cols_padded`` stays a
     # constexpr -- it is a power of two that drives the unroll below.
     logits_stride,
+    logits_col_stride,
     out_stride,
+    seq_lens_stride,
     n_cols,
     n_cols_padded: tl.constexpr,
     topk: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    offsets = (n_cols_padded - BLOCK_N) + tl.arange(0, BLOCK_N)
-    valid = offsets < n_cols
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
-    values = tl.load(
-        logits + row * logits_stride + offsets,
-        mask=valid,
-        other=-float("inf"),
-    )
-    value_keys = _fp32_to_ordered_key(values).to(tl.uint64)
-    index_keys = (n_cols_padded - offsets).to(tl.uint64)
-    packed = (value_keys << 32) | index_keys
-    acc = tl.topk(packed[None, :], topk, dim=1)
-
-    loop_iterations: tl.constexpr = n_cols_padded // BLOCK_N - 1
-    for _ in tl.static_range(0, loop_iterations):
-        acc = tl.bitonic_merge(acc)
-        offsets -= BLOCK_N
-        valid = offsets < n_cols
-        values = tl.load(
-            logits + row * logits_stride + offsets,
-            mask=valid,
-            other=-float("inf"),
-        )
-        value_keys = _fp32_to_ordered_key(values).to(tl.uint64)
-        index_keys = (n_cols_padded - offsets).to(tl.uint64)
-        packed = (value_keys << 32) | index_keys
-        acc = tl.maximum(acc, tl.topk(packed[None, :], topk, dim=1))
+    row = tl.program_id(0)
+    row_cols = _topk_row_length(seq_lens, row, seq_lens_stride, n_cols)
+    # Valid columns have a positive index key, so zero is an invalid sentinel.
+    acc = tl.zeros((1, topk), dtype=tl.uint64)
+    for tile in tl.static_range(n_cols_padded // BLOCK_N - 1, -1, -1):
+        if tile * BLOCK_N < row_cols:
+            offsets = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+            values = tl.load(
+                logits + row * logits_stride + offsets * logits_col_stride,
+                mask=offsets < row_cols,
+                other=-float("inf"),
+            )
+            value_keys = _fp32_to_ordered_key(values).to(tl.uint64)
+            index_keys = (n_cols_padded - offsets).to(tl.uint64)
+            packed = (value_keys << 32) | index_keys
+            acc = tl.bitonic_merge(acc)
+            acc = tl.maximum(acc, tl.topk(packed[None, :], topk, dim=1))
 
     acc = tl.sort(acc, dim=1, descending=True)
     top_offsets = tl.arange(0, topk)
     packed_top = tl.reshape(acc, (topk,))
     indices = n_cols_padded - (packed_top & 0xFFFFFFFF).to(tl.int32)
     values = _ordered_key_to_fp32((packed_top >> 32).to(tl.uint32))
-    valid_top = (top_offsets < n_cols) & (indices >= 0) & (indices < n_cols)
+    valid_top = (top_offsets < row_cols) & (indices >= 0) & (indices < row_cols)
     valid_top = valid_top & (values != -float("inf"))
     tl.store(
         out + row * out_stride + top_offsets,
@@ -796,52 +807,86 @@ def _dsa_logits_topk_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "logits_stride",
+        "logits_col_stride",
+        "seq_lens_stride",
+        "hist_tiles",
+        "n_cols",
+    ]
+)
 def _dsa_radix_hist_kernel(
     logits,
     prefixes,
     hist,
+    seq_lens,
     logits_stride,
+    logits_col_stride,
+    seq_lens_stride,
     hist_tiles,
     n_cols,
     shift: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
     tile = tl.program_id(1)
-    offsets = tile * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = offsets < n_cols
-    values = tl.load(
-        logits + row * logits_stride + offsets,
-        mask=mask,
-        other=-float("inf"),
-    )
-    keys = _fp32_to_ordered_key(values)
-    prefix = tl.load(prefixes + row).to(tl.uint32)
-    if shift == 28:
-        prefix_match = mask
-    else:
-        prefix_match = (keys >> (shift + 4)) == prefix
-    bucket = (keys >> shift) & 0xF
-    base = (row * hist_tiles + tile) * 16
-    for b in tl.static_range(0, 16):
-        count = tl.sum(tl.where(mask & prefix_match & (bucket == b), 1, 0))
-        tl.store(hist + base + b, count)
+    row_cols = _topk_row_length(seq_lens, row, seq_lens_stride, n_cols)
+    if tile * BLOCK_N < row_cols:
+        offsets = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = offsets < row_cols
+        values = tl.load(
+            logits + row * logits_stride + offsets * logits_col_stride,
+            mask=mask,
+            other=-float("inf"),
+        )
+        keys = _fp32_to_ordered_key(values)
+        if shift == 28:
+            prefix_match = mask
+        else:
+            prefix = tl.load(prefixes + row).to(tl.uint32)
+            prefix_match = (keys >> (shift + 4)) == prefix
+        bucket = (keys >> shift) & 0xF
+        base = (row * hist_tiles + tile) * 16
+        for b in tl.static_range(0, 16):
+            count = tl.sum(tl.where(mask & prefix_match & (bucket == b), 1, 0))
+            tl.store(hist + base + b, count)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["seq_lens_stride", "hist_tiles", "n_cols"])
 def _dsa_radix_update_kernel(
     prefixes,
     remaining,
     hist,
+    seq_lens,
+    seq_lens_stride,
     hist_tiles,
+    n_cols,
+    topk: tl.constexpr,
+    INITIAL_PASS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     BLOCK_TILES: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
+    row_cols = _topk_row_length(seq_lens, row, seq_lens_stride, n_cols)
     tile_offsets = tl.arange(0, BLOCK_TILES)
-    tile_mask = tile_offsets < hist_tiles
+    # Histogram tiles outside this row's frontier were never written.
+    tile_mask = tile_offsets < tl.cdiv(row_cols, BLOCK_N)
     row_hist = hist + row * hist_tiles * 16
-    kth = tl.load(remaining + row).to(tl.int32)
+    if INITIAL_PASS:
+        kth = tl.minimum(topk, row_cols)
+        prefix = tl.full((), 0, tl.uint32)
+    else:
+        kth = tl.load(remaining + row).to(tl.int32)
+        prefix = tl.load(prefixes + row).to(tl.uint32)
     cumulative = tl.full((), 0, dtype=tl.int32)
     selected = tl.full((), 0, dtype=tl.uint32)
     selected_remaining = kth
@@ -855,39 +900,55 @@ def _dsa_radix_update_kernel(
         selected_remaining = tl.where(take, kth - cumulative, selected_remaining)
         cumulative += tl.where(found == False, count, 0)
         found = found | take
-    prefix = tl.load(prefixes + row).to(tl.uint32)
     tl.store(prefixes + row, (prefix << 4) | selected)
     tl.store(remaining + row, selected_remaining)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "logits_stride",
+        "logits_col_stride",
+        "out_stride",
+        "seq_lens_stride",
+        "n_cols",
+    ]
+)
 def _dsa_radix_scatter_kernel(
     logits,
     prefixes,
     remaining,
     out_values,
     out_indices,
+    seq_lens,
     logits_stride,
+    logits_col_stride,
     out_stride,
+    seq_lens_stride,
     n_cols,
     topk: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
+    row_cols = _topk_row_length(seq_lens, row, seq_lens_stride, n_cols)
     top_offsets = tl.arange(0, topk)
     tl.store(out_values + row * out_stride + top_offsets, -float("inf"))
     tl.store(out_indices + row * out_stride + top_offsets, -1)
 
     threshold = tl.load(prefixes + row).to(tl.uint32)
     keep_equal = tl.load(remaining + row).to(tl.int32)
-    count_greater = topk - keep_equal
+    count_greater = tl.minimum(topk, row_cols) - keep_equal
     num_greater = tl.full((), 0, dtype=tl.int32)
     num_equal = tl.full((), 0, dtype=tl.int32)
-    for start in tl.range(0, n_cols, BLOCK_N):
+    for start in tl.range(0, row_cols, BLOCK_N):
         offsets = start + tl.arange(0, BLOCK_N)
-        mask = offsets < n_cols
+        mask = offsets < row_cols
         values = tl.load(
-            logits + row * logits_stride + offsets,
+            logits + row * logits_stride + offsets * logits_col_stride,
             mask=mask,
             other=-float("inf"),
         )
@@ -925,9 +986,11 @@ def _dsa_radix_scatter_kernel(
             mask=equal_mask,
         )
         num_equal += tl.sum(equal.to(tl.int32))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride"])
 def _dsa_radix_sort_selected_kernel(
     values,
     indices,
@@ -935,7 +998,10 @@ def _dsa_radix_sort_selected_kernel(
     stride,
     n_cols_padded: tl.constexpr,
     topk: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
     offsets = tl.arange(0, topk)
     vals = tl.load(values + row * stride + offsets)
@@ -955,6 +1021,8 @@ def _dsa_radix_sort_selected_kernel(
         & (sorted_vals != -float("inf"))
     )
     tl.store(out + row * stride + offsets, tl.where(valid, sorted_idx, -1))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _is_power_of_2(value: int) -> bool:
@@ -967,41 +1035,63 @@ def _next_power_of_2(value: int) -> int:
     return 1 << (int(value) - 1).bit_length()
 
 
-def _radix_topk(logits: torch.Tensor, topk: int) -> torch.Tensor:
+def _radix_topk(
+    logits: torch.Tensor,
+    topk: int,
+    *,
+    seq_lens: torch.Tensor | None,
+    enable_pdl: bool,
+) -> torch.Tensor:
     rows, cols = logits.shape
     block_n = _RADIX_TOPK_BLOCK_N
     tiles = triton.cdiv(cols, block_n)
     hist = torch.empty((rows, tiles, 16), dtype=torch.int32, device=logits.device)
-    prefixes = torch.zeros((rows,), dtype=torch.int32, device=logits.device)
-    remaining = torch.full(
-        (rows,), min(int(topk), cols), dtype=torch.int32, device=logits.device
-    )
+    # The first radix pass initializes both arrays from each row's valid length.
+    prefixes = torch.empty((rows,), dtype=torch.int32, device=logits.device)
+    remaining = torch.empty((rows,), dtype=torch.int32, device=logits.device)
     out_values = torch.empty((rows, topk), dtype=torch.float32, device=logits.device)
     out_indices = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
     out = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
     block_tiles = _next_power_of_2(tiles)
+    seq_lens_stride = 0 if seq_lens is None else seq_lens.stride(0)
+    use_pdl = bool(enable_pdl and _is_nvidia)
+    # Keep stage releases late to limit resource use by waiting successor CTAs.
+    pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
 
     for shift in range(28, -1, -4):
         _dsa_radix_hist_kernel[(rows, tiles)](
             logits,
             prefixes,
             hist,
+            seq_lens,
             logits.stride(0),
+            logits.stride(1),
+            seq_lens_stride,
             tiles,
             n_cols=cols,
             shift=shift,
             BLOCK_N=block_n,
+            ENABLE_PDL=use_pdl,
             num_warps=8,
             num_stages=1,
+            **pdl_kwargs,
         )
         _dsa_radix_update_kernel[(rows,)](
             prefixes,
             remaining,
             hist,
+            seq_lens,
+            seq_lens_stride,
             hist_tiles=tiles,
+            n_cols=cols,
+            topk=int(topk),
+            INITIAL_PASS=shift == 28,
+            BLOCK_N=block_n,
             BLOCK_TILES=block_tiles,
+            ENABLE_PDL=use_pdl,
             num_warps=8,
             num_stages=1,
+            **pdl_kwargs,
         )
 
     _dsa_radix_scatter_kernel[(rows,)](
@@ -1010,13 +1100,18 @@ def _radix_topk(logits: torch.Tensor, topk: int) -> torch.Tensor:
         remaining,
         out_values,
         out_indices,
+        seq_lens,
         logits.stride(0),
+        logits.stride(1),
         out_indices.stride(0),
+        seq_lens_stride,
         n_cols=cols,
         topk=int(topk),
         BLOCK_N=block_n,
+        ENABLE_PDL=use_pdl,
         num_warps=8,
         num_stages=1,
+        **pdl_kwargs,
     )
     _dsa_radix_sort_selected_kernel[(rows,)](
         out_values,
@@ -1025,14 +1120,20 @@ def _radix_topk(logits: torch.Tensor, topk: int) -> torch.Tensor:
         out.stride(0),
         n_cols_padded=_next_power_of_2(max(cols, int(topk))),
         topk=int(topk),
+        ENABLE_PDL=use_pdl,
         num_warps=8,
         num_stages=1,
+        **pdl_kwargs,
     )
     return out
 
 
 def _topk_with_padding(
-    logits: torch.Tensor, topk: int, enable_pdl: bool = False
+    logits: torch.Tensor,
+    topk: int,
+    *,
+    seq_lens: torch.Tensor | None,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     topk = int(topk)
     if topk <= 0:
@@ -1045,13 +1146,19 @@ def _topk_with_padding(
         raise TypeError(f"logits must be FP32, got {logits.dtype}")
 
     rows, cols = logits.shape
+    if seq_lens is not None:
+        if seq_lens.shape != (rows,):
+            raise ValueError(f"seq_lens must be [{rows}], got {tuple(seq_lens.shape)}")
+        if seq_lens.dtype not in (torch.int32, torch.int64):
+            raise TypeError(f"seq_lens must be int32 or int64, got {seq_lens.dtype}")
+        if seq_lens.device != logits.device:
+            raise ValueError("seq_lens and logits must be on the same device")
     if rows == 0 or cols == 0:
         return torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
-    logits = logits.contiguous()
     n_cols_padded = _next_power_of_2(max(cols, topk))
     # Unrolled sort cost follows the padded width, including speculative KV padding.
     if n_cols_padded >= _RADIX_TOPK_MIN_COLS:
-        return _radix_topk(logits, topk)
+        return _radix_topk(logits, topk, seq_lens=seq_lens, enable_pdl=enable_pdl)
     out = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
     block_n = min(n_cols_padded, 2048)
     block_n = max(block_n, topk)
@@ -1065,8 +1172,11 @@ def _topk_with_padding(
     _dsa_logits_topk_kernel[(rows,)](
         logits,
         out,
+        seq_lens,
         logits.stride(0),
+        logits.stride(1),
         out.stride(0),
+        0 if seq_lens is None else seq_lens.stride(0),
         n_cols=cols,
         n_cols_padded=n_cols_padded,
         topk=topk,
@@ -1080,7 +1190,11 @@ def _topk_with_padding(
 
 
 def triton_topk_from_logits(
-    logits: torch.Tensor, topk: int, *, enable_pdl: bool = False
+    logits: torch.Tensor,
+    topk: int,
+    *,
+    seq_lens: torch.Tensor | None,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Select per-row top-k column indices from a materialized logits matrix.
 
@@ -1091,9 +1205,14 @@ def triton_topk_from_logits(
     automatically.
 
     Args:
-        logits: FP32 scores shaped ``[rows, cols]``. Padded or invalid
-            entries must be ``-inf``.
+        logits: FP32 scores shaped ``[rows, cols]``. Invalid entries within
+            each row's valid prefix must be ``-inf``; entries after that
+            prefix are never read and may be uninitialized.
         topk: Entries selected per row; must be a power of two.
+        seq_lens: Int32 or int64 valid prefix lengths shaped ``[rows]`` on
+            the logits device, clamped to ``[0, cols]`` in-kernel. Pass None
+            to select over the full width. Strided scores and lengths are
+            read directly without materializing contiguous copies.
         enable_pdl: Overlap the selection launch with the producer kernel
             on NVIDIA GPUs via programmatic dependent launch.
 
@@ -1102,7 +1221,7 @@ def triton_topk_from_logits(
         ``-1``.
     """
 
-    return _topk_with_padding(logits, topk, enable_pdl=enable_pdl)
+    return _topk_with_padding(logits, topk, seq_lens=seq_lens, enable_pdl=enable_pdl)
 
 
 def dsa_decode_topk_fp8(
@@ -1197,7 +1316,9 @@ def dsa_decode_topk_fp8(
         num_warps=4,
         num_stages=1,
     )
-    local_topk_offsets = _topk_with_padding(logits, int(topk))
+    local_topk_offsets = _topk_with_padding(
+        logits, int(topk), seq_lens=None, enable_pdl=False
+    )
     return local_topk_to_global_slots(
         local_topk_offsets=local_topk_offsets,
         block_table=block_table,
@@ -1301,7 +1422,9 @@ def dsa_prefill_topk_fp8(
             num_warps=4,
             num_stages=1,
         )
-        workspace_indices = _topk_with_padding(logits, int(topk))
+        workspace_indices = _topk_with_padding(
+            logits, int(topk), seq_lens=None, enable_pdl=False
+        )
         valid = (workspace_indices >= row_starts[start:end, None]) & (
             workspace_indices < row_ends[start:end, None]
         )

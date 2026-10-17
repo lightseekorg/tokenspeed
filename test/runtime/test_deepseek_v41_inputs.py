@@ -968,6 +968,9 @@ def test_execute_idle_forward_passes_empty_engram_views(buffers):
 
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = ib.device
+    executor.device_module = torch.get_device_module(executor.device)
+    executor.default_stream = executor.device_module.current_stream()
+    executor.execution_stream = executor.device_module.Stream()
     executor.input_buffers = ib
     executor.runtime_states = runtime
     executor.attn_backend = SimpleNamespace()
@@ -1044,6 +1047,8 @@ def test_dispatch_owns_snapshot_until_forward_thread_consumes_it():
         ngram_inputs=snapshot,
         request_history_seeds=None,
         input_logprob_plan=None,
+        sampled_top_k=0,
+        stop_criteria=(),
     )
     pending = handle._submit_forward(planned, capture_next_input_ids=False)
     states["a"].prompt_input_ids.clear()

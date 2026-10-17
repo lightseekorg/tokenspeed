@@ -30,8 +30,8 @@ from tokenspeed_kernel.ops.moe import (
     dispatch_topk_ids,
     moe_topk,
 )
-from tokenspeed_kernel.ops.moe.sigmoid_topk import minimax_biased_grouped_topk
-from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
+from tokenspeed_kernel.ops.moe._triton.inkling_topk import inkling_topk
+from tokenspeed_kernel.ops.moe._triton.minimax_topk import minimax_biased_grouped_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
 
 from tokenspeed.runtime.moe.dispatch_algorithm import STATIC_EP_DISPATCH_ALGORITHMS

@@ -115,6 +115,9 @@ class MooncakeKVSender:
                             "which means prefill instances fail to receive the cache manifest from the decode instance of this request. "
                             "If a greater mean TTFT is acceptable, you can 'export TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
                         )
+                        self.kv_mgr.kv_transfer_metrics.record_kv_transfer_timeout(
+                            "bootstrapping"
+                        )
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,
                             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in TransferPoll.Bootstrapping",

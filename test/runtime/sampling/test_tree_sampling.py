@@ -50,6 +50,7 @@ PARAMS = {
 
 def _config(logprobs: bool) -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         max_bs=BS,
         max_draft_tokens_per_req=N,
         max_req_pool_size=POOL,
@@ -82,10 +83,12 @@ def _backend(
     return backend, torch.tensor(pool, dtype=torch.int64, device="cuda")
 
 
-def _info(req, offsets) -> SamplingBatchInfo:
+def _info(req, target_positions) -> SamplingBatchInfo:
+    # Internal draw helpers consume target positions; runtime metadata carries
+    # the preceding input frontier and derives the target position at sampling.
     return SamplingBatchInfo(
         req_pool_indices=req,
-        valid_cache_lengths=offsets,
+        valid_cache_lengths=target_positions - 1,
         vocab_size=VOCAB,
         device="cuda",
     )
@@ -100,7 +103,9 @@ def _tree(parent: list[int], req: torch.Tensor) -> TreeSpec:
     parent_map = torch.tensor(parent, dtype=torch.int32, device="cuda").repeat(
         POOL + 1, 1
     )
-    spec.load_step(BS, req, parent_map)
+    spec.load_step(
+        BS, req, parent_map, torch.zeros(BS * N, dtype=torch.int64, device="cuda")
+    )
     return spec
 
 

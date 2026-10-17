@@ -434,17 +434,21 @@ def test_quantize_fp8_with_scale_token_group(
         assert scale.shape == (x.shape[0], x.shape[1] // group_size)
 
 
+# 16 rows take the Triton per-token quantizer on NVIDIA SM100+, 65 rows the
+# portable one (solution="triton") or the vendor one.
+@pytest.mark.parametrize("rows", [16, 65])
 @pytest.mark.parametrize("solution", [None, "trtllm", "triton"])
 def test_quantize_fp8_dynamic_token(
     device: str,
     solution: str | None,
+    rows: int,
     require,
 ) -> None:
     torch.manual_seed(4)
     dtype = torch.bfloat16
     require("quantization", "fp8_with_scale", solution, dtype, "x")
 
-    x = torch.randn(16, 128, device=device, dtype=dtype) * 10
+    x = torch.randn(rows, 128, device=device, dtype=dtype) * 10
     out, scale = quantize_fp8(
         x,
         granularity="token",

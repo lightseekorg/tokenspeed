@@ -43,7 +43,7 @@ pytestmark = pytest.mark.skipif(
 # Held to exit, exactly as `_MulticastVaGemm` holds it through the slot pool.
 _HELD = """
 import torch
-from tokenspeed_kernel.ops.moe.multicast_view import bf16_tensor_on_pointer
+from tokenspeed_kernel.ops.moe._cute_dsl.multicast_view import bf16_tensor_on_pointer
 
 base = torch.zeros(4, 16, dtype=torch.bfloat16, device="cuda")
 HELD = bf16_tensor_on_pointer(base.data_ptr(), (4, 3), (16, 1), 0)

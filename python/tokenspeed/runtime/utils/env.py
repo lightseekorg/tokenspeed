@@ -55,6 +55,7 @@ global_server_args_dict: dict = {
     "device": ServerArgs.device,
     "draft_model_path_use_base": ServerArgs.draft_model_path_use_base,
     "disable_pdl": ServerArgs.disable_pdl,
+    "disable_autotune": ServerArgs.disable_autotune,
     "enable_prefix_caching": ServerArgs.enable_prefix_caching,
     "mla_disable_ragged": ServerArgs.mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
@@ -115,6 +116,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "speculative_algorithm": server_args.speculative_algorithm,
             "speculative_num_draft_tokens": server_args.speculative_num_draft_tokens,
             "disable_pdl": server_args.disable_pdl,
+            "disable_autotune": server_args.disable_autotune,
             "enable_prefix_caching": server_args.enable_prefix_caching,
             "mla_disable_ragged": server_args.mla_disable_ragged,
             "chunked_prefill_size": server_args.chunked_prefill_size,
@@ -259,7 +261,6 @@ class Envs:
 
     # Model download
     TOKENSPEED_USE_MODELSCOPE = EnvBool(False)
-
 
     # Test and debug
     TOKENSPEED_CUDA_COREDUMP = EnvBool(False)

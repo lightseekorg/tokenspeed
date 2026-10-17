@@ -26,7 +26,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
     STATE_LAYER_TYPES,
-    split_recurrent_state_groups,
 )
 from tokenspeed.runtime.utils.env import envs
 
@@ -34,10 +33,23 @@ _QWEN_GDN_PREFIX_GRANULARITY = 128
 
 
 class QwenGDNRecipe(CacheRecipe):
-    """Qwen3.5 full attention interleaved with GDN state.
+    """Qwen3.5 full attention interleaved with GDN state, sharing one cache arena.
 
-    Draft (MTP) layers are full-attention continuation layers of the one big
-    model, so they join the target's full-attention group.
+    Every group's page spans the whole parent block, so a parent is only fully
+    used when all groups fill the same segments. Segment ``unit.i`` holds one
+    SSM state or one K or V field of an attention layer. The attention layers
+    form one KV group, the full-history group drafters write through; its
+    ``n`` layers span ``2 * n`` segments, K and V of one layer adjacent. The
+    state layers are dealt round-robin into as few groups as hold them at that
+    many SSM states each, so a state block carries no attention planes. Their
+    conv windows pack into the segments the states leave free, so a KV page
+    carries no state planes either; only when the states fill every segment
+    does each conv window take a plane of its own, which the KV group skips.
+
+    Draft layers are attention layers of the one big model. One whose fields
+    are a target attention layer's K and V byte for byte takes segments the
+    state layers fill too; any other (wider, another dtype, MXFP8 scales)
+    pads the state groups by its own planes.
     """
 
     family = "qwen_gdn"
@@ -72,12 +84,64 @@ class QwenGDNRecipe(CacheRecipe):
 
     @cached_property
     def group_ids(self) -> tuple[str, ...]:
-        # Recurrent state splits into its own groups; draft layers land in the
-        # target's full-attention group.
-        return (
-            tuple(split_recurrent_state_groups(self.target_layer_types))
-            + (FULL_ATTENTION,) * self.num_draft_layers
+        group_ids = []
+        state_index = 0
+        for label in self.layer_types:
+            if label in STATE_LAYER_TYPES:
+                group_ids.append(f"{label}_{state_index % self._num_state_groups}")
+                state_index += 1
+            else:
+                group_ids.append(label)
+        return tuple(group_ids)
+
+    @cached_property
+    def _num_state_layers(self) -> int:
+        return sum(label in STATE_LAYER_TYPES for label in self.target_layer_types)
+
+    @cached_property
+    def _num_segments(self) -> int:
+        """K/V segments of the KV group, a draft layer's included when it shares them."""
+        num_kv = len(self.target_layer_types) - self._num_state_layers
+        if num_kv == 0:
+            raise ValueError("Qwen3.5 cache requires at least one full-attention layer")
+        if self.num_draft_layers and self._draft_shares_segments:
+            num_kv += self.num_draft_layers
+        return 2 * num_kv
+
+    @cached_property
+    def _num_state_groups(self) -> int:
+        """State groups of at most as many SSM states as the KV group has K/V segments."""
+        return max(math.ceil(self._num_state_layers / self._num_segments), 1)
+
+    @cached_property
+    def _conv_planes(self) -> tuple[str, ...]:
+        """Each state occurrence's conv plane: the last segments when the states leave room, else its own."""
+        conv_shape, conv_dtype, ssm_shape, ssm_dtype = self._state_shapes
+        states = math.ceil(self._num_state_layers / self._num_state_groups)
+        per_segment = (math.prod(ssm_shape) * cache_dtype_bytes(ssm_dtype)) // (
+            math.prod(conv_shape) * cache_dtype_bytes(conv_dtype)
         )
+        if per_segment * (self._num_segments - states) < states:
+            return tuple(f"conv.{occurrence}" for occurrence in range(states))
+        return tuple(
+            f"unit.{self._num_segments - 1 - occurrence // per_segment}"
+            for occurrence in range(states)
+        )
+
+    @cached_property
+    def _draft_shares_segments(self) -> bool:
+        """Whether a draft layer's fields are a target attention layer's K and V, byte for byte."""
+        target, draft = (
+            [
+                field.payload_bytes
+                for field in self.fields_for_layer(layer_id, FULL_ATTENTION, 0)
+            ]
+            for layer_id in (
+                self.target_layer_types.index(FULL_ATTENTION),
+                len(self.target_layer_types),
+            )
+        )
+        return target == draft
 
     # ---- model geometry ----
 
@@ -95,7 +159,21 @@ class QwenGDNRecipe(CacheRecipe):
         )
         if num_full_attention == 0:
             raise ValueError("Qwen3.5 cache requires at least one full-attention layer")
-        return 1.0 + 2.0 * self.num_draft_layers / num_full_attention
+        # A draft layer whose K/V bytes exceed a target attention layer's counts as several.
+        width = 1.0
+        if self.num_draft_layers:
+            target_bytes, draft_bytes = (
+                sum(
+                    field.payload_bytes
+                    for field in self.fields_for_layer(layer_id, FULL_ATTENTION, 0)
+                )
+                for layer_id in (
+                    self.target_layer_types.index(FULL_ATTENTION),
+                    len(self.target_layer_types),
+                )
+            )
+            width = draft_bytes / target_bytes
+        return 1.0 + 2.0 * self.num_draft_layers * max(width, 1.0) / num_full_attention
 
     # ---- decoder-layer fields ----
 
@@ -146,13 +224,13 @@ class QwenGDNRecipe(CacheRecipe):
             return (
                 CacheFieldSpec(
                     f"layer.{layer_id}.ssm",
-                    f"unit.{occurrence}.a",
+                    f"unit.{occurrence}",
                     ssm_shape,
                     ssm_dtype,
                 ),
                 CacheFieldSpec(
                     f"layer.{layer_id}.conv",
-                    f"unit.{occurrence}.b",
+                    self._conv_planes[occurrence],
                     conv_shape,
                     conv_dtype,
                     exact_page_stride=False,
@@ -161,10 +239,16 @@ class QwenGDNRecipe(CacheRecipe):
         kv_dtype = scatter_stored_dtype_name(self.attn_config.kv_cache_dtype)
         return (
             CacheFieldSpec(
-                f"layer.{layer_id}.k", f"unit.{occurrence}.a", self._kv_shape, kv_dtype
+                f"layer.{layer_id}.k",
+                f"unit.{2 * occurrence}",
+                self._kv_shape,
+                kv_dtype,
             ),
             CacheFieldSpec(
-                f"layer.{layer_id}.v", f"unit.{occurrence}.b", self._kv_shape, kv_dtype
+                f"layer.{layer_id}.v",
+                f"unit.{2 * occurrence + 1}",
+                self._kv_shape,
+                kv_dtype,
             ),
         )
 
@@ -182,13 +266,13 @@ class QwenGDNRecipe(CacheRecipe):
         fields = (
             CacheFieldSpec(
                 f"layer.{layer_id}.k",
-                f"unit.{occurrence}.a",
+                f"unit.{2 * occurrence}",
                 self._draft_kv_shape,
                 kv_dtype,
             ),
             CacheFieldSpec(
                 f"layer.{layer_id}.v",
-                f"unit.{occurrence}.b",
+                f"unit.{2 * occurrence + 1}",
                 self._draft_kv_shape,
                 kv_dtype,
             ),

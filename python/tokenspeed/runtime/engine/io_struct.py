@@ -497,9 +497,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # SGLang dialect: prompt (input) logprobs are returned for positions
     # ``[logprob_start_len, len(input_ids))``; -1 selects the last prompt
     # token only (no prompt logits needed). The ingress resolves -1 and
-    # rejects starts past the prompt. Output top-k and token-id logprobs are
-    # not supported: InputProcessor keeps top_logprobs_num=0 and
-    # token_ids_logprob=None.
+    # rejects starts past the prompt. Top-k logprobs (``top_logprobs_num``)
+    # are taken only for a request whose tokens are all sampled in its
+    # prefill (see InputProcessor); token-id logprobs are not supported:
+    # InputProcessor keeps token_ids_logprob=None.
     logprob_start_len: int = -1
     top_logprobs_num: int = 0
     token_ids_logprob: list[int] | None = None
@@ -691,6 +692,11 @@ class BatchTokenIDOut(BaseBatchReq, kw_only=True):
     # logprobs are off (see stream_output).
     output_token_logprobs_val: list[list[float]]
     output_token_logprobs_idx: list[list[int]]
+    # The top-k alternatives (``top_logprobs_num``). Per-request lists in a
+    # frame where some request asked for top-k, and [] for the whole frame
+    # otherwise -- the shape the token-id columns below always have. Read
+    # them through LogprobsProcessor._row, which returns [] for a request
+    # the frame has no entry for.
     input_top_logprobs_val: list[list]
     input_top_logprobs_idx: list[list]
     output_top_logprobs_val: list[list]
@@ -905,7 +911,9 @@ class IsSchedulerPausedReqOutput(BaseReq, kw_only=True):
 # isinstance chain in the control-request handler). The in-engine RL control app
 # refuses the others up front instead of forwarding a request the scheduler
 # cannot handle, and advertises this set to gateways as `rl.update_from`.
-SUPPORTED_WEIGHT_UPDATE_SOURCES: frozenset[str] = frozenset({"distributed", "mooncake"})
+SUPPORTED_WEIGHT_UPDATE_SOURCES: frozenset[str] = frozenset(
+    {"distributed", "mooncake", "disk"}
+)
 
 
 class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
@@ -915,6 +923,8 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     load_format: str | None = None
     # Optional: update the weight version after a successful load.
     weight_version: str | None = None
+    # Drop cached KV before loading: it was computed under the old weights.
+    flush_cache: bool = True
 
 
 class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):

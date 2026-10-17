@@ -13,35 +13,34 @@ pool's device usage).
 
 import os
 import sys
-import unittest
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _inert_publish(bs, dim, rows=3):
-    """Publish plumbing that never fires: a hole-only table."""
-    table = torch.zeros(bs, 64, dtype=torch.int32, device="cuda")
+    """Publish plumbing that never fires: a hole-only two-slot table."""
+    table = torch.zeros(bs, 2, dtype=torch.int32, device="cuda")
     ckpt = torch.zeros(1, rows, dim, device="cuda")
     return table, ckpt
 
 
-class TestInklingCacheContract(unittest.TestCase):
+class TestInklingCacheContract:
     def test_wrapper_consumes_history_and_checkpoint_state(self):
         from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
             InklingAttnBackend,
         )
 
         class HistoryBackend:
-            cache_consumer_families = frozenset({"history"})
+            cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
         backend = InklingAttnBackend.__new__(InklingAttnBackend)
         backend.inner = HistoryBackend()
 
-        self.assertEqual(
-            backend.cache_consumer_families,
-            frozenset({"history", "state"}),
+        assert (backend.cache_consumer_attn_kinds) == (
+            frozenset({"full_history", "sliding_window", "state"})
         )
 
     def test_remote_restore_pending_is_consumed_once_and_cleared_on_reuse(self):
@@ -66,77 +65,108 @@ class TestInklingCacheContract(unittest.TestCase):
             torch.tensor([2, 3, -1], dtype=torch.int32),
             out=torch.zeros(3, dtype=torch.bool),
         )
-        self.assertEqual(mask.tolist(), [True, False, False])
+        assert (mask.tolist()) == ([True, False, False])
         one = torch.zeros(1, dtype=torch.bool)
-        self.assertFalse(
+        assert not (
             backend._consume_remote_restore_mask(torch.tensor([2]), out=one).item()
         )
 
         backend.mark_remote_cache_ready(2)
         backend.prepare_remote_cache_slots([2])
-        self.assertFalse(
+        assert not (
             backend._consume_remote_restore_mask(torch.tensor([2]), out=one).item()
         )
 
-    def test_non_aligned_endpoint_checkpoint_round_trip(self):
+    def test_committed_window_round_trip_through_the_live_slot(self):
+        """A verify round's commit publishes the window at the accepted
+        frontier from the ring into the live slot; a remote restore reads the
+        landed slot back into the ring at the prompt end."""
         from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
             InklingAttnBackend,
             InklingConvMetadata,
+            InklingConvStatePool,
         )
 
+        ring_size, k = 7, 4
+        pool = InklingConvStatePool(
+            num_layers=1,
+            num_slots=4,
+            conv_dim=2,
+            ring_size=ring_size,
+            dtype=torch.float32,
+            device="cpu",
+        )
         backend = InklingAttnBackend.__new__(InklingAttnBackend)
-        backend.conv_columns = {
-            "block_tokens": 128,
-            "group_block_tokens": {"kvconv": 128, "hiddenconv": 128},
-            "pd_endpoint_snapshots": False,
-        }
-
-        def metadata(*, seq_len: int, page: int, restore: bool = False):
-            return InklingConvMetadata(
-                query_start_loc=torch.tensor(
-                    [0, 1 if restore else 3], dtype=torch.int32
-                ),
-                cache_indices=torch.tensor([1], dtype=torch.int32),
-                has_initial_state=torch.ones(1, dtype=torch.bool),
-                seq_lens=torch.tensor([seq_len], dtype=torch.int32),
-                col_block_table={"state": torch.full((1, 2), page, dtype=torch.int32)},
-                remote_restore_mask=torch.tensor([True]) if restore else None,
-            )
-
-        ring_size = 7
-        state = torch.zeros(4, ring_size, 2)
-        for position in range(128, 131):
+        backend.conv_pool = pool
+        backend.conv_spec_num_tokens = k
+        backend._checkpoint_streams = {}
+        checkpoints = torch.zeros(8, 3, 2)
+        backend.register_shortconv_checkpoint_stream(
+            layer_id=0,
+            channel_offset=0,
+            dim=2,
+            group_id="state",
+            buffers=(checkpoints,),
+        )
+        state = pool.layer_state_wd(0)
+        # The ring holds the verify round's K rows at positions 128..131;
+        # the live slot is block 5, the input slot was released.
+        for position in range(125, 132):
             state[1, position % ring_size] = torch.tensor(
                 [float(position), float(-position)]
             )
-        checkpoints = torch.zeros(8, 3, 2)
-        publish_md = metadata(seq_len=131, page=5)
-        backend.publish_shortconv_endpoint(
-            state,
-            (checkpoints,),
-            publish_md,
-            "state",
+        backend.conv_decode_metadata = InklingConvMetadata(
+            query_start_loc=torch.tensor([0, k], dtype=torch.int32),
+            cache_indices=torch.tensor([1], dtype=torch.int32),
+            has_initial_state=torch.ones(1, dtype=torch.bool),
+            seq_lens=torch.tensor([132], dtype=torch.int32),
+            col_block_table={"state": torch.tensor([[0, 5]], dtype=torch.int32)},
+            num_extends=0,
         )
 
-        expected = torch.tensor([[128.0, -128.0], [129.0, -129.0], [130.0, -130.0]])
-        self.assertTrue(torch.equal(checkpoints[5], expected))
+        # Two of the four candidates were accepted: the frontier is 130.
+        backend.commit_speculative_state_after_verify(
+            torch.tensor([2], dtype=torch.int32), num_extends=0, accepted_path=None
+        )
+        expected = torch.tensor([[127.0, -127.0], [128.0, -128.0], [129.0, -129.0]])
+        assert torch.equal(checkpoints[5], expected)
+        assert torch.equal(checkpoints[:5], torch.zeros(5, 3, 2))
+
+        # An extend round commits nothing: its chunk end is the frontier.
+        backend.commit_speculative_state_after_verify(
+            torch.tensor([4], dtype=torch.int32), num_extends=1, accepted_path=None
+        )
+        assert torch.equal(checkpoints[5], expected)
 
         state[1].zero_()
-        restore_md = metadata(seq_len=132, page=5, restore=True)
-        backend.restore_shortconv_endpoint(
-            state,
-            (checkpoints,),
-            restore_md,
-            "state",
+        restore_md = InklingConvMetadata(
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+            cache_indices=torch.tensor([1], dtype=torch.int32),
+            has_initial_state=torch.ones(1, dtype=torch.bool),
+            seq_lens=torch.tensor([131], dtype=torch.int32),
+            col_block_table={"state": torch.tensor([[0, 5]], dtype=torch.int32)},
+            remote_restore_mask=torch.tensor([True]),
         )
+        backend.restore_shortconv_endpoint(state, (checkpoints,), restore_md, "state")
         actual = torch.stack(
-            [state[1, position % ring_size] for position in range(128, 131)]
+            [state[1, position % ring_size] for position in range(127, 130)]
         )
-        self.assertTrue(torch.equal(actual, expected))
+        assert torch.equal(actual, expected)
+
+        # A Decode that hit the prompt-end checkpoint in its own cache restores
+        # from the input slot instead.
+        state[1].zero_()
+        checkpoints[6] = expected + 1
+        restore_md.col_block_table["state"][0, 0] = 6
+        backend.restore_shortconv_endpoint(state, (checkpoints,), restore_md, "state")
+        actual = torch.stack(
+            [state[1, position % ring_size] for position in range(127, 130)]
+        )
+        assert torch.equal(actual, expected + 1)
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
-class TestInklingConvRingState(unittest.TestCase):
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs a CUDA device"))
+class TestInklingConvRingState:
     W = 4  # sconv kernel size (W-1 = 3 history taps)
     R = 9  # ring rows: >= (W-1) + K
     DIM = 8
@@ -188,8 +218,8 @@ class TestInklingConvRingState(unittest.TestCase):
                 group_id="state",
                 buffers=(buf,),
             )
-        self.assertEqual(len(backend._checkpoint_streams), 1)
-        with self.assertRaises(RuntimeError):
+        assert (len(backend._checkpoint_streams)) == (1)
+        with pytest.raises((RuntimeError)):
             backend.register_shortconv_checkpoint_stream(
                 layer_id=0,
                 channel_offset=0,
@@ -229,7 +259,7 @@ class TestInklingConvRingState(unittest.TestCase):
             *_inert_publish(self.BS, self.DIM),
             None,
             num_extends=0,
-            page_size=128,
+            publish_live=False,
         )
 
         for i in range(self.BS):
@@ -241,7 +271,9 @@ class TestInklingConvRingState(unittest.TestCase):
                     state, slot, range(L0 + accept - (self.W - 1), L0 + accept)
                 )
                 expect = torch.cat([old, chunk_i[:accept]], dim=0)[-(self.W - 1) :]
-                self.assertTrue(torch.equal(window, expect), f"req {i} accept {accept}")
+                _pytest_expr_5 = torch.equal(window, expect)
+                _pytest_msg_6 = f"req {i} accept {accept}"
+                assert _pytest_expr_5, _pytest_msg_6
 
     def test_verify_padded_batch_writes_nothing_for_pad_rows(self):
         """PAD rows (cache index -1) must leave every slot untouched, and
@@ -272,7 +304,7 @@ class TestInklingConvRingState(unittest.TestCase):
             *_inert_publish(self.BS, self.DIM),
             None,
             num_extends=0,
-            page_size=128,
+            publish_live=False,
         )
 
         expected = pre.clone()
@@ -281,7 +313,7 @@ class TestInklingConvRingState(unittest.TestCase):
             L0 = int(seq_lens[i]) - self.K
             for j in range(self.K):
                 expected[slot, (L0 + j) % self.R] = chunk[i * self.K + j]
-        self.assertTrue(torch.equal(state, expected))
+        assert torch.equal(state, expected)
 
     def test_channel_slice_ring_write(self):
         """The kernel on a channel-offset slice only touches that slice
@@ -315,26 +347,26 @@ class TestInklingConvRingState(unittest.TestCase):
             *_inert_publish(self.BS, dim),
             None,
             num_extends=0,
-            page_size=128,
+            publish_live=False,
         )
 
         # Outside the channel slice (and other layers): unchanged.
-        self.assertTrue(torch.equal(full[:, :, :off], pre[2][:, :, :off]))
-        self.assertTrue(torch.equal(full[:, :, off + dim :], pre[2][:, :, off + dim :]))
-        self.assertTrue(torch.equal(pool.conv_state[0], pre[0]))
+        assert torch.equal(full[:, :, :off], pre[2][:, :, :off])
+        assert torch.equal(full[:, :, off + dim :], pre[2][:, :, off + dim :])
+        assert torch.equal(pool.conv_state[0], pre[0])
         # Inside: the K chunk rows landed at their positions' ring rows.
         for i in range(self.BS):
             slot = int(cache_indices[i])
             for j in range(self.K):
-                self.assertTrue(
-                    torch.equal(state[slot, (20 + j) % self.R], chunk[i * self.K + j])
+                assert torch.equal(
+                    state[slot, (20 + j) % self.R], chunk[i * self.K + j]
                 )
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
-class TestSconvUnifiedKernel(unittest.TestCase):
-    """The single sconv compute kernel: decode = T=1 case, in-kernel ring
-    persistence and speculative boundary-checkpoint publish."""
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs a CUDA device"))
+class TestSconvUnifiedKernel:
+    """The sconv compute kernels: decode = T=1 case, in-kernel ring
+    persistence and chunk-end publication into the live slot."""
 
     W = 4
     R = 9
@@ -402,7 +434,7 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             *_inert_publish(B, self.DIM),
             None,
             num_extends=0,
-            page_size=128,
+            publish_live=False,
         )
 
         expected = pre.clone()
@@ -414,8 +446,10 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             else:
                 prefix = torch.zeros(self.W - 1, self.DIM, device="cuda")
             ref = self._ref_conv(x[b : b + 1], prefix, weight)
-            self.assertTrue(torch.allclose(y[b : b + 1], ref, atol=1e-4), f"req {b}")
-        self.assertTrue(torch.equal(state, expected))
+            _pytest_expr_1 = torch.allclose(y[b : b + 1], ref, atol=1e-4)
+            _pytest_msg_2 = f"req {b}"
+            assert _pytest_expr_1, _pytest_msg_2
+        assert torch.equal(state, expected)
 
     def _publish_setup(self, B, pages=40):
         from tokenspeed_kernel.ops.conv import seq_idx_from_cu_seqlens
@@ -423,27 +457,26 @@ class TestSconvUnifiedKernel(unittest.TestCase):
         k = self.K
         qsl = torch.arange(0, B * k + 1, k, dtype=torch.int32, device="cuda")
         seq_idx = seq_idx_from_cu_seqlens(qsl, B * k)
-        table = torch.arange(11, 11 + B * 2, dtype=torch.int32, device="cuda").reshape(
-            B, 2
-        )
+        # Two slots per request: a released input slot and a live block.
+        table = torch.zeros(B, 2, dtype=torch.int32, device="cuda")
+        table[:, 1] = torch.arange(11, 11 + B, dtype=torch.int32, device="cuda")
         checkpoint = torch.full((pages, self.W - 1, self.DIM), -7.0, device="cuda")
         return qsl, seq_idx, table, checkpoint
 
-    def test_publish_verify_boundaries(self):
-        """Verify-shaped chunks (uniform K): covered boundaries publish the
-        window (borrowing ring rows when the boundary falls early in the
-        chunk), uncovered/padded requests and untouched pages stay clean —
-        all independent of any accept decision."""
+    def test_publish_draft_chunk_ends(self):
+        """Draft-shaped chunks (uniform K, re-anchored at the committed
+        frontier) publish each request's chunk-end window to its live slot,
+        borrowing ring rows when the chunk is shorter than W-1; padded
+        requests and untouched pages stay clean."""
         from tokenspeed_kernel.ops.conv import inkling_ring_sconv
 
         weight = self._weight()
         state = self._state()
         pre = state.clone()
-        # S0 = [4, 2, 6, 5] -> boundary L=8 covered for reqs 0 (p*=4) and
-        # 2 (p*=2, borrows one ring row); req1 uncovered; req3 padded.
         cache_indices = torch.tensor([1, 2, 3, -1], dtype=torch.int32).cuda()
         seq_lens = torch.tensor([8, 6, 10, 9], dtype=torch.int32).cuda()
         qsl, seq_idx, table, checkpoint = self._publish_setup(4)
+        table[2, 1] = 0  # req2 has no live block
         x = torch.randn(4 * self.K, self.DIM, device="cuda")
 
         inkling_ring_sconv(
@@ -459,33 +492,59 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             checkpoint,
             None,
             num_extends=0,
-            page_size=8,
+            publish_live=True,
         )
 
-        # req0: p*=4 -> page table[0,0]=11
-        self.assertTrue(
-            torch.equal(
-                checkpoint[11],
-                self._ref_window(self._ring_prefix(pre, 1, 4), x[0 : self.K], 4),
-            )
-        )
-        # req2: p*=2 -> page table[2,0]=15, borrows one ring row
-        self.assertTrue(
-            torch.equal(
-                checkpoint[15],
+        for req, slot in ((0, 1), (1, 2)):
+            _pytest_expr_3 = torch.equal(
+                checkpoint[11 + req],
                 self._ref_window(
-                    self._ring_prefix(pre, 3, 6), x[2 * self.K : 3 * self.K], 2
+                    self._ring_prefix(pre, slot, int(seq_lens[req]) - self.K),
+                    x[req * self.K : (req + 1) * self.K],
+                    self.K,
                 ),
             )
-        )
-        touched = {11, 15}
+            _pytest_msg_4 = f"req {req}"
+            assert _pytest_expr_3, _pytest_msg_4
+        touched = {11, 12}
         for page in range(checkpoint.shape[0]):
             if page not in touched:
-                self.assertTrue(bool((checkpoint[page] == -7).all()), f"page {page}")
+                _pytest_expr_7 = bool((checkpoint[page] == -7).all())
+                _pytest_msg_8 = f"page {page}"
+                assert _pytest_expr_7, _pytest_msg_8
 
-    def test_publish_prefill_interior_boundaries(self):
-        """A prefill chunk spanning several pages publishes EVERY interior
-        boundary."""
+    def test_verify_publishes_nothing_in_kernel(self):
+        """A target verify's chunk end is speculative: the kernel leaves the
+        live slot alone and the commit publishes the accepted window."""
+        from tokenspeed_kernel.ops.conv import inkling_ring_sconv
+
+        weight = self._weight()
+        state = self._state()
+        cache_indices = torch.tensor([1, 2], dtype=torch.int32).cuda()
+        seq_lens = torch.tensor([8, 6], dtype=torch.int32).cuda()
+        qsl, seq_idx, table, checkpoint = self._publish_setup(2)
+        x = torch.randn(2 * self.K, self.DIM, device="cuda")
+
+        inkling_ring_sconv(
+            x,
+            weight,
+            state,
+            qsl,
+            seq_idx,
+            cache_indices,
+            torch.ones(2, dtype=torch.bool, device="cuda"),
+            seq_lens,
+            table,
+            checkpoint,
+            None,
+            num_extends=0,
+            publish_live=False,
+        )
+        assert bool((checkpoint == -7).all())
+
+    def test_publish_prefill_chunk_end_only(self):
+        """A prefill chunk spanning many positions publishes exactly its
+        chunk-end window; no interior position is a publication point."""
         from tokenspeed_kernel.ops.conv import (
             inkling_ring_sconv,
             seq_idx_from_cu_seqlens,
@@ -493,13 +552,12 @@ class TestSconvUnifiedKernel(unittest.TestCase):
 
         weight = self._weight()
         state = self._state()
-        T, page_size = 16, 4
+        T = 15
         qsl = torch.tensor([0, T], dtype=torch.int32, device="cuda")
         seq_idx = seq_idx_from_cu_seqlens(qsl, T)
         cache_indices = torch.tensor([1], dtype=torch.int32, device="cuda")
-        # Fresh prefill from length 0: boundaries at 4, 8, 12, 16.
         seq_lens = torch.tensor([T], dtype=torch.int32, device="cuda")
-        table = torch.arange(21, 21 + 4, dtype=torch.int32, device="cuda").reshape(1, 4)
+        table = torch.tensor([[0, 21]], dtype=torch.int32, device="cuda")
         checkpoint = torch.full((40, self.W - 1, self.DIM), -7.0, device="cuda")
         x = torch.randn(T, self.DIM, device="cuda")
 
@@ -516,15 +574,16 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             checkpoint,
             None,
             num_extends=1,
-            page_size=page_size,
+            publish_live=True,
         )
 
         zeros = torch.zeros(self.W - 1, self.DIM, device="cuda")
-        for i, boundary in enumerate([4, 8, 12, 16]):
-            expect = self._ref_window(zeros, x, boundary)
-            self.assertTrue(
-                torch.equal(checkpoint[21 + i], expect), f"boundary {boundary}"
-            )
+        assert torch.equal(checkpoint[21], self._ref_window(zeros, x, T))
+        for page in range(checkpoint.shape[0]):
+            if page != 21:
+                _pytest_expr_9 = bool((checkpoint[page] == -7).all())
+                _pytest_msg_10 = f"page {page}"
+                assert _pytest_expr_9, _pytest_msg_10
 
     def test_publish_two_field_split_and_fp8(self):
         """Fused K+V split across two fields, and an fp8 destination: the
@@ -534,7 +593,7 @@ class TestSconvUnifiedKernel(unittest.TestCase):
         weight = self._weight()
         state = self._state()
         cache_indices = torch.tensor([1], dtype=torch.int32).cuda()
-        seq_lens = torch.tensor([8], dtype=torch.int32).cuda()  # p*=4
+        seq_lens = torch.tensor([8], dtype=torch.int32).cuda()
         qsl, seq_idx, table, _ = self._publish_setup(1)
         field_a = torch.zeros(40, self.W - 1, 2, dtype=torch.bfloat16, device="cuda")
         field_b = torch.zeros(40, self.W - 1, 6, dtype=torch.float8_e5m2, device="cuda")
@@ -553,81 +612,19 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             field_a,
             field_b,
             num_extends=0,
-            page_size=8,
+            publish_live=True,
         )
 
-        window = self._ref_window(torch.zeros(3, self.DIM, device="cuda"), x, 4)
-        self.assertTrue(torch.equal(field_a[11], window[:, :2].to(torch.bfloat16)))
-        self.assertTrue(
-            torch.equal(
-                field_b[11].view(torch.uint8),
-                window[:, 2:].to(torch.float8_e5m2).view(torch.uint8),
-            )
+        window = self._ref_window(torch.zeros(3, self.DIM, device="cuda"), x, self.K)
+        assert torch.equal(field_a[11], window[:, :2].to(torch.bfloat16))
+        assert torch.equal(
+            field_b[11].view(torch.uint8),
+            window[:, 2:].to(torch.float8_e5m2).view(torch.uint8),
         )
-
-    def test_publish_overwrites_rejected_round(self):
-        """Round 1 publishes candidate rows past its accepted length; round 2
-        covering the same boundary overwrites with the committed rows — and
-        the ring's own speculative rows feed round 2's borrow correctly."""
-        from tokenspeed_kernel.ops.conv import inkling_ring_sconv
-
-        weight = self._weight()
-        state = self._state()
-        pre = state.clone()
-        cache_indices = torch.tensor([1], dtype=torch.int32).cuda()
-        seq_lens = torch.tensor([10], dtype=torch.int32).cuda()  # S0=6, p*=2
-        qsl, seq_idx, table, checkpoint = self._publish_setup(1)
-        ones = torch.ones(1, dtype=torch.bool, device="cuda")
-        x1 = torch.randn(self.K, self.DIM, device="cuda")
-
-        inkling_ring_sconv(
-            x1,
-            weight,
-            state,
-            qsl,
-            seq_idx,
-            cache_indices,
-            ones,
-            seq_lens,
-            table,
-            checkpoint,
-            None,
-            num_extends=0,
-            page_size=8,
-        )
-        self.assertTrue(
-            torch.equal(
-                checkpoint[11],
-                self._ref_window(self._ring_prefix(pre, 1, 6), x1, 2),
-            )
-        )
-
-        # accept=1: the frontier advances by one committed row; S0=7 -> p*=1.
-        # No state maintenance — round 1's ring write at position 6 IS the
-        # committed row round 2 borrows.
-        seq_lens.fill_(11)
-        x2 = torch.randn(self.K, self.DIM, device="cuda")
-        inkling_ring_sconv(
-            x2,
-            weight,
-            state,
-            qsl,
-            seq_idx,
-            cache_indices,
-            ones,
-            seq_lens,
-            table,
-            checkpoint,
-            None,
-            num_extends=0,
-            page_size=8,
-        )
-        expect = torch.stack([pre[1, 5 % self.R], x1[0], x2[0]])
-        self.assertTrue(torch.equal(checkpoint[11], expect))
 
     def test_cuda_graph_replay(self):
         """All inputs are stable buffers: replays after in-place updates
-        reproduce the eager result — ring writes and publish included."""
+        reproduce the eager result -- ring writes and publish included."""
         from tokenspeed_kernel.ops.conv import inkling_ring_sconv
 
         weight = self._weight()
@@ -652,7 +649,7 @@ class TestSconvUnifiedKernel(unittest.TestCase):
                 checkpoint,
                 None,
                 num_extends=0,
-                page_size=8,
+                publish_live=True,
             )
 
         run()  # warmup compiles outside capture
@@ -674,40 +671,34 @@ class TestSconvUnifiedKernel(unittest.TestCase):
                 slot = int(cache_indices[req])
                 # Ring rows: all K chunk rows at their positions.
                 for j in range(self.K):
-                    self.assertTrue(
-                        torch.equal(
-                            state[slot, (base + j) % self.R],
-                            x[req * self.K + j],
-                        ),
-                        f"ring req {req} row {j} lens {round_lens}",
+                    _pytest_expr_13 = torch.equal(
+                        state[slot, (base + j) % self.R],
+                        x[req * self.K + j],
                     )
-                # Publish: first covered boundary, if any.
-                p = 8 - base % 8
-                if p > self.K:
-                    continue
-                page = 11 + req * 2 + (base + p) // 8 - 1
+                    _pytest_msg_14 = f"ring req {req} row {j} lens {round_lens}"
+                    assert _pytest_expr_13, _pytest_msg_14
+                # Publish: the chunk-end window into the live slot.
                 expect = self._ref_window(
                     self._ring_prefix(snapshot, slot, base),
                     x[req * self.K : (req + 1) * self.K],
-                    p,
+                    self.K,
                 )
-                self.assertTrue(
-                    torch.equal(checkpoint[page], expect),
-                    f"publish req {req} lens {round_lens}",
-                )
+                _pytest_expr_11 = torch.equal(checkpoint[11 + req], expect)
+                _pytest_msg_12 = f"publish req {req} lens {round_lens}"
+                assert _pytest_expr_11, _pytest_msg_12
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
-class TestCheckpointMetadata(unittest.TestCase):
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs a CUDA device"))
+class TestCheckpointMetadata:
     W = 4
     DIM = 8
 
     def test_draft_frontier_window_reanchors_conv_metadata(self):
         """update_draft_forward_metadata keeps the k-row chunk shape and moves
-        only its anchor: seq_lens becomes the committed frontier, the paged
-        bridges ride through (positional publish re-covers rewritten
-        boundaries with committed content), and the inner backend gets the
-        same frontier for its seq_lens/write-loc re-anchor."""
+        only its anchor: seq_lens becomes the committed frontier, the
+        checkpoint tables ride through (the draft chunk's end is the frontier,
+        so its publish lands the committed window), and the inner backend
+        gets the same frontier for its seq_lens/write-loc re-anchor."""
         from types import SimpleNamespace
 
         from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
@@ -721,7 +712,7 @@ class TestCheckpointMetadata(unittest.TestCase):
         backend.inner = SimpleNamespace(
             update_draft_forward_metadata=lambda f: inner_calls.append(f)
         )
-        table = torch.tensor([[11, 12, 13]], dtype=torch.int32, device="cuda")
+        table = torch.tensor([[0, 12]], dtype=torch.int32, device="cuda")
         qsl = torch.arange(0, bs * k + 1, k, dtype=torch.int32, device="cuda")
         backend.conv_decode_metadata = InklingConvMetadata(
             query_start_loc=qsl,
@@ -736,12 +727,12 @@ class TestCheckpointMetadata(unittest.TestCase):
         backend.update_draft_forward_metadata(frontier)
 
         md = backend.conv_decode_metadata
-        self.assertEqual(md.query_start_loc.tolist(), [0, k], "same k-row chunk")
-        self.assertEqual(md.seq_lens.tolist(), [130], "chunk end at the frontier")
-        self.assertIsNotNone(md.col_block_table)
-        self.assertTrue(torch.equal(md.col_block_table["state"], table[:bs]))
-        self.assertEqual(len(inner_calls), 1)
-        self.assertEqual(inner_calls[0].tolist(), [130])
+        assert (md.query_start_loc.tolist()) == ([0, k]), "same k-row chunk"
+        assert (md.seq_lens.tolist()) == ([130]), "chunk end at the frontier"
+        assert (md.col_block_table) is not None
+        assert torch.equal(md.col_block_table["state"], table[:bs])
+        assert (len(inner_calls)) == (1)
+        assert (inner_calls[0].tolist()) == ([130])
 
     def test_update_draft_forward_metadata_reanchors_seq_lens(self):
         """The MTP re-anchor must replace the leaf's decode seq_lens with the
@@ -763,8 +754,8 @@ class TestCheckpointMetadata(unittest.TestCase):
 
         host.advance_draft_forward_metadata(frontier)
 
-        self.assertEqual(host.forward_decode_metadata.seq_lens.tolist(), [6])
+        assert (host.forward_decode_metadata.seq_lens.tolist()) == ([6])
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

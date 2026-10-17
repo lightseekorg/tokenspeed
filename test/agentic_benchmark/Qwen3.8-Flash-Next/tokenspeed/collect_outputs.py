@@ -19,7 +19,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Collect Qwen TP4EP4 agentic runs using the Kimi-K3 metric definitions."""
+"""Collect Qwen TP4EP4 agentic runs with output throughput in tok/min/GPU."""
 
 import argparse
 import csv
@@ -35,7 +35,7 @@ COLUMNS = [
     "config",
     "Conc.",
     "Latency (tps/user)",
-    "Throughput (tps/gpu)",
+    "Output Throughput (tok/min/gpu)",
     "Approx Cache Hit",
     "Decoded Tok/Iter",
 ]
@@ -82,17 +82,19 @@ def collect(sweep_dir: Path, *, expected_concurrencies: list[int]) -> list[dict]
         # EvalScope renamed TPOT in 1.10; preserve the same calculation.
         tpot_key = "Avg TPOT (ms)" if "Avg TPOT (ms)" in summary else "TPOT (ms)"
         tpot_ms = float(summary[tpot_key])
-        throughput = float(summary["Total Throughput (tok/s)"])
+        output_throughput = float(summary["Output Throughput (tok/s)"])
         if not math.isfinite(tpot_ms) or tpot_ms <= 0:
             raise ValueError(f"{summary_path}: TPOT must be finite and positive")
-        if not math.isfinite(throughput) or throughput < 0:
-            raise ValueError(f"{summary_path}: invalid total throughput")
+        if not math.isfinite(output_throughput) or output_throughput < 0:
+            raise ValueError(f"{summary_path}: invalid output throughput")
         rows.append(
             {
                 "config": CONFIG,
                 "Conc.": concurrency,
                 "Latency (tps/user)": round(1000.0 / tpot_ms, 2),
-                "Throughput (tps/gpu)": round(throughput / NUM_GPUS, 2),
+                "Output Throughput (tok/min/gpu)": round(
+                    output_throughput * 60 / NUM_GPUS, 2
+                ),
                 "Approx Cache Hit": round(summary["KV Cache Hit Rate (%)"], 2),
                 "Decoded Tok/Iter": round(decoded_tok_per_iter(summary_path.parent), 4),
             }

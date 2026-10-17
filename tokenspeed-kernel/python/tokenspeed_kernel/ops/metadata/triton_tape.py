@@ -89,23 +89,16 @@ def _prep_tape_kernel(descs_ptr, regs_ptr, BLOCK: tl.constexpr):
             else:
                 dst64 = tl.cast(dst, tl.pointer_type(tl.int64))
                 tl.store(dst64 + o, tl.full([BLOCK], 0, tl.int64) + scalar, mask=mask)
-    elif opcode == 5:  # STATE_PAGES (decode: before = after - 1)
-        rows = src  # [n, m] page table
+    elif opcode == 5:  # STATE_PAGES: two-slot table, row stride m
+        rows = src  # [n, m] block table: slot 0 input checkpoint, slot 1 live
         state_out = idx  # second output rides the idx slot
-        seq_ptr = tl.cast(scalar, tl.pointer_type(tl.int32))
-        page_size = stride
         for base in range(0, n, BLOCK):
             o = base + offs
             mask = o < n
-            after = tl.load(seq_ptr + o, mask=mask, other=1).to(tl.int64)
-            before = after - 1
-            in_slot = tl.maximum((before - 1) // page_size, 0)
-            out_slot = tl.minimum(tl.maximum((after - 1) // page_size, 0), m - 1)
-            s_in = tl.load(rows + o * m + in_slot, mask=mask, other=0)
-            s_in = tl.where(before > 0, s_in, 0)
-            s_out = tl.load(rows + o * m + out_slot, mask=mask, other=0)
-            tl.store(dst + o, s_in, mask=mask)
-            tl.store(state_out + o, s_out, mask=mask)
+            checkpoint = tl.load(rows + o * m, mask=mask, other=0)
+            working = tl.load(rows + o * m + 1, mask=mask, other=0)
+            tl.store(dst + o, tl.where(checkpoint > 0, checkpoint, working), mask=mask)
+            tl.store(state_out + o, working, mask=mask)
 
 
 def run_tape(descs, regs) -> None:

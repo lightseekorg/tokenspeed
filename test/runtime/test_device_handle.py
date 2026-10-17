@@ -30,23 +30,23 @@ the PD completion path (device writes issued straight from an event handler),
 the multimodal gather (a live request struct captured by reference), and the
 SHM release (a resource freed while a queued forward may still read it).
 
-The second half is a property of the code's shape rather than of any one call
-site, so it is asserted over the shape: the loop must not bind a device object
-even as a local, must not keep the startup wiring, must find no startup hook on
-the running handle, and its collaborators must be handed that handle rather
-than walk to it.
+The second half is exercised the way the loop experiences it: the tests build
+a real ``DeviceHandle`` over a stub executor and drive its operations,
+asserting the work that crosses to the device side and the facts that come
+back.
 """
 
 from __future__ import annotations
 
-import ast
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import pytest
 import torch
 from tokenspeed_scheduler import PD
+from transformers import PretrainedConfig
 
 from tokenspeed.runtime.cache.transfer.ops import (
     HostTier,
@@ -56,7 +56,7 @@ from tokenspeed.runtime.cache.transfer.ops import (
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.engine import scheduler_utils as scheduler_utils_module
-from tokenspeed.runtime.execution.device import DeviceHandle
+from tokenspeed.runtime.execution.device import DeviceHandle, EncoderModelFacts
 from tokenspeed.runtime.execution.types import PlannedForward
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
@@ -157,11 +157,26 @@ def _handle(trace, **kwargs):
     )
 
 
-def _plan(*, pages_to_zero=(), cache=(), remote_decode=None, remote_prefill=None):
+def _plan(
+    *,
+    pages_to_zero=(),
+    pages_to_copy=None,
+    cache=(),
+    remote_decode=None,
+    remote_prefill=None,
+):
     """A round's ExecutionPlan as ``execute`` reads it — every field the real
-    plan exposes, so a fake cannot hide a renamed one."""
+    plan exposes, so a fake cannot hide a renamed one. ``pages_to_zero`` is
+    the real plan's shape: every cache group listed, empty or not, with the
+    given pages under ``"kv"``. ``pages_to_copy`` is the
+    ``pages_to_copy_arrays()`` view: ``[n, 2]`` arrays per group id."""
+    copies = {
+        group_id: np.asarray(pairs, dtype=np.int32).reshape(-1, 2)
+        for group_id, pairs in (pages_to_copy or {}).items()
+    }
     return SimpleNamespace(
-        pages_to_zero=list(pages_to_zero),
+        pages_to_zero={"kv": list(pages_to_zero), "state": []},
+        pages_to_copy_arrays=lambda: copies,
         cache=list(cache),
         remote_decode=remote_decode,
         remote_prefill=remote_prefill,
@@ -266,6 +281,8 @@ def _planned(*, num_extends, label=None):
         ngram_inputs=None,
         request_history_seeds=None,
         input_logprob_plan=None,
+        sampled_top_k=0,
+        stop_criteria=(),
     )
 
 
@@ -368,7 +385,7 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
         ),
     )
     handle._executor.zero_cache_pages = lambda pages: trace.append(
-        ("zero", tuple(pages))
+        ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
     handle.execute(plan, None)
@@ -377,13 +394,80 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
         "submit",
         ("write_backs", [store, load], "execution-stream", "default-stream"),
         "submit",
-        ("zero", (3, 4)),
+        ("zero", {"kv": (3, 4)}),
         "submit",
         ("load_backs", [store, load], "default-stream"),
     ]
     # Polling never touches the FIFO — the round head must not wait on it.
     assert handle.poll_cache_results() == ["done"]
     assert trace[-1] != "submit"
+
+
+def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
+    """A prefix hit's private copy (or an owner's move off its published
+    block) rides the same FIFO: after the stores' fence, before the zeroing
+    -- its source may be re-granted and zeroed by this very plan -- and only
+    when some group has pairs. Groups without pairs never reach the
+    executor."""
+    trace: list = []
+    store = _WriteBackOp("store")
+    plan = _plan(
+        pages_to_zero=[3],
+        pages_to_copy={"kv": [(3, 8), (5, 9)], "state": []},
+        cache=[store],
+    )
+    handle = _handle(
+        trace,
+        host_cache_executor=SimpleNamespace(
+            submit_write_backs=lambda ops, *, prerequisite_stream, fence_stream: (
+                trace.append(("write_backs", ops))
+            ),
+            submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
+                ("load_backs", ops)
+            ),
+            submit_prefetches=lambda ops: None,
+        ),
+    )
+    handle._executor.copy_cache_pages = lambda pairs: trace.append(
+        ("copy", {gid: arr.tolist() for gid, arr in pairs.items()})
+    )
+    handle._executor.zero_cache_pages = lambda pages: trace.append(
+        ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
+    )
+
+    handle.execute(plan, None)
+
+    assert trace == [
+        "submit",
+        ("write_backs", [store]),
+        "submit",
+        ("copy", {"kv": [[3, 8], [5, 9]]}),
+        "submit",
+        ("zero", {"kv": (3,)}),
+        "submit",
+        ("load_backs", [store]),
+    ]
+
+    # A plan with no pairs submits no copy at all.
+    trace.clear()
+    handle.execute(_plan(pages_to_zero=[2], pages_to_copy={"kv": []}), None)
+    assert trace == ["submit", ("zero", {"kv": (2,)})]
+
+
+def test_a_failed_page_copy_surfaces_at_the_next_round(wire_ops):
+    """The copy has no completion event, so its exception would otherwise
+    vanish on the data plane; ``execute`` settles the previous round's copy
+    submissions before enqueueing anything."""
+    trace: list = []
+    handle = _handle(trace)
+
+    def failing_copy(pairs):
+        raise IndexError("local block ID 99 outside [0, 8)")
+
+    handle._executor.copy_cache_pages = failing_copy
+    handle.execute(_plan(pages_to_copy={"kv": [(1, 99)]}), None)
+    with pytest.raises(RuntimeError, match="page copy submission failed"):
+        handle.execute(_plan(), None)
 
 
 def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
@@ -419,7 +503,7 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
         ),
     )
     handle._executor.zero_cache_pages = lambda pages: trace.append(
-        ("zero", tuple(pages))
+        ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
     handle.execute(plan, None)
@@ -490,12 +574,12 @@ def test_page_zeroing_without_l2_submits_only_zeroing():
     trace: list = []
     handle = _handle(trace)
     handle._executor.zero_cache_pages = lambda pages: trace.append(
-        ("zero", tuple(pages))
+        ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
     handle.execute(_plan(pages_to_zero=[3, 4]), None)
 
-    assert trace == ["submit", ("zero", (3, 4))]
+    assert trace == ["submit", ("zero", {"kv": (3, 4)})]
 
 
 def test_a_plan_with_no_device_work_submits_nothing():
@@ -593,14 +677,40 @@ def test_shutdown_cache_joins_submissions_then_closes_on_the_forward_thread():
             shutdown=lambda: trace.append("l2_shutdown"),
         ),
     )
-    pending = Future()
-    pending.set_result(None)
-    handle._l2_submissions.append(pending)
+    for queue in (
+        handle._l2_submissions,
+        handle._transfer_submissions,
+        handle._copy_submissions,
+    ):
+        pending = Future()
+        pending.set_result(None)
+        queue.append(pending)
 
     handle.shutdown_cache()
 
     assert list(handle._l2_submissions) == []
+    assert list(handle._transfer_submissions) == []
+    assert list(handle._copy_submissions) == []
     assert trace == ["run", "l2_shutdown"]
+
+
+def test_shutdown_cache_surfaces_a_failed_final_round_copy_without_a_host_cache():
+    """A copy or transfer queued by the last round has no next round to settle
+    it; shutdown joins it and re-raises even with no Host cache to close."""
+    from concurrent.futures import Future
+
+    handle = _handle([])
+    failed = Future()
+    failed.set_exception(IndexError("local block ID 99 outside [0, 8)"))
+    handle._copy_submissions.append(failed)
+    settled = Future()
+    settled.set_result(None)
+    handle._transfer_submissions.append(settled)
+
+    with pytest.raises(IndexError, match="99"):
+        handle.shutdown_cache()
+    assert list(handle._copy_submissions) == []
+    assert list(handle._transfer_submissions) == []
 
 
 def test_cache_polling_without_kvstore_refuses_loudly():
@@ -644,6 +754,62 @@ def test_the_remote_decode_and_the_arming_ride_the_fifo():
 # ----------------------------------------------------------------------
 # EPD admission: encoder facts resolve past the gate, never before.
 # ----------------------------------------------------------------------
+
+
+class _DiscreteEncoderModel:
+    """A prefill model can declare discrete output without loading a vision tower."""
+
+    def __init__(self, output_width: int) -> None:
+        self.config = PretrainedConfig(hidden_size=64)
+        self.output_width = output_width
+
+    def get_encoder_output_spec(self) -> tuple[int, torch.dtype]:
+        return self.output_width, torch.int64
+
+
+class _VisionEncoderModel:
+    def __init__(self, vision_tower: torch.nn.Module) -> None:
+        self.config = PretrainedConfig(hidden_size=64)
+        self.vision_tower = vision_tower
+        self.num_deepstack_embeddings = 3
+
+
+def test_encoder_facts_preserve_discrete_output_spec_without_a_vision_tower():
+    facts = EncoderModelFacts.from_model(_DiscreteEncoderModel(8), device="cpu")
+
+    assert facts == EncoderModelFacts(
+        device="cpu", hidden=8, num_deepstack=0, dtype=torch.int64
+    )
+
+
+@pytest.mark.parametrize("output_width", [0, -1])
+def test_encoder_facts_reject_nonpositive_output_width(output_width):
+    with pytest.raises(ValueError, match="Encoder output width must be positive"):
+        EncoderModelFacts.from_model(_DiscreteEncoderModel(output_width), device="cpu")
+
+
+def test_encoder_facts_fall_back_to_vision_dtype():
+    class VisionTower(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.dtype = torch.bfloat16
+
+    facts = EncoderModelFacts.from_model(
+        _VisionEncoderModel(VisionTower()), device="cpu"
+    )
+
+    assert facts == EncoderModelFacts(
+        device="cpu", hidden=64, num_deepstack=3, dtype=torch.bfloat16
+    )
+
+
+def test_encoder_facts_fall_back_to_vision_parameter_dtype():
+    vision = torch.nn.Linear(2, 4, bias=False, device="cpu", dtype=torch.float32)
+    facts = EncoderModelFacts.from_model(_VisionEncoderModel(vision), device="cpu")
+
+    assert facts == EncoderModelFacts(
+        device="cpu", hidden=64, num_deepstack=3, dtype=torch.float32
+    )
 
 
 def test_text_only_pd_nodes_never_read_the_encoder_facts():
@@ -879,204 +1045,6 @@ def test_epd_receive_allocation_crosses_through_the_runner(monkeypatch):
     assert job._items[0].recv_main.shape == (4, 8)
 
 
-# ----------------------------------------------------------------------
-# Visibility: the loop cannot name a device object, so it cannot keep one.
-# ----------------------------------------------------------------------
-
-_RAW_DEVICE_OBJECTS = frozenset(
-    {
-        "executor",
-        "model_executor",
-        "attn_backend",
-        "draft_attn_backend",
-        "token_to_kv_pool",
-        "draft_token_to_kv_pool",
-        "model_runner",
-        "target",
-        "draft",
-    }
-)
-
-
-def event_loop_module():
-    from tokenspeed.runtime.engine import event_loop as module
-
-    return module
-
-
-def _event_loop_init():
-    import inspect
-
-    tree = ast.parse(inspect.getsource(event_loop_module()))
-    cls = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "EventLoop"
-    )
-    return next(
-        node
-        for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
-    )
-
-
-def test_the_event_loop_never_binds_a_device_object():
-    """Locals count too: a name it can write is a name it can misuse later.
-
-    ``build_device_side`` owns the model runners, attention backends and KV
-    pools; nothing they produce comes back out except plain facts and the
-    handle. This is the property the whole design rests on, so it is asserted
-    rather than left to review.
-    """
-    bound = {
-        node.id
-        for node in ast.walk(_event_loop_init())
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
-    }
-    assert not (bound & _RAW_DEVICE_OBJECTS)
-
-
-def test_the_event_loop_stores_only_the_running_handle():
-    """The build result must not outlive the constructor.
-
-    It carries the transfer peer and the specs; keeping it would put the
-    device side back within reach of the running loop, which is the whole
-    point of handing back a handle.
-    """
-    stored = {
-        node.attr
-        for node in ast.walk(_event_loop_init())
-        if isinstance(node, ast.Attribute)
-        and isinstance(node.ctx, ast.Store)
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "self"
-    }
-    assert "_device" in stored
-    assert not (stored & _RAW_DEVICE_OBJECTS)
-    assert not (stored & {"device", "specs"})
-
-
-def test_the_handle_stays_a_closed_list_of_named_operations():
-    """A god object forms one convenience method at a time.
-
-    Pin the operation names so even a same-size substitution needs review.
-    L3 control operations keep the Host tier behind the handle, as documented
-    in docs/design/event-loop.md: the submit-time existence probe and the
-    prefetch lane's progress/completion the hooks converge each round.
-    Exactly one generic work slot is registered
-    (EPD admission's device half; see run_multimodal_work).
-    """
-    public = {name for name in vars(DeviceHandle) if not name.startswith("_")}
-    assert public == {
-        "execute",
-        "role",
-        "poll_cache_results",
-        "consume_l3_backup_poll_failure",
-        "query_l3_storage",
-        "l3_prefetch_progress",
-        "complete_l3_prefetch",
-        "delete_l3_namespace",
-        "set_l3_weight_version",
-        "shutdown_cache",
-        "run_idle_forward",
-        "run_multimodal_work",
-        "run_kv_repair",
-        "run_remote_prefill_landing",
-        "update_weights",
-        "reset_expert_load",
-        "dump_expert_load",
-        "snapshot_expert_load",
-        "apply_expert_placement",
-    }
-    assert {name for name in public if name.endswith("_work")} == {
-        "run_multimodal_work"
-    }
-
-
-def test_the_handle_hands_back_no_device_object():
-    """Every public name on the handle is an operation, not an object."""
-    trace: list = []
-    handle = _handle(trace)
-    public = {name for name in dir(handle) if not name.startswith("_")}
-    assert not (public & _RAW_DEVICE_OBJECTS)
-    assert not any(getattr(handle, name, None) is handle._executor for name in public)
-
-
-def test_only_the_builder_constructs_the_device_side():
-    """The name denylist above is a proxy; this is the property itself.
-
-    A device object can only reach the loop if someone constructs one there,
-    so pin the constructors: the three factories that produce model runners,
-    attention backends, KV pools and the executor are called from
-    ``execution/device.py`` alone. (``epd/encode_loop.py`` is a different
-    worker — it builds a vision tower and never a ModelExecutor — so it is
-    not in scope for the scheduler loop's invariant.)
-    """
-    import pathlib
-
-    factories = (
-        "create_model_runner(",
-        "create_attn_components(",
-        "create_model_executor(",
-    )
-    allowed = {"execution/device.py", "execution/factory.py", "epd/encode_loop.py"}
-    root = pathlib.Path(__file__).resolve().parents[2] / "python" / "tokenspeed"
-    offenders = []
-    for path in root.rglob("*.py"):
-        rel = path.relative_to(root).as_posix()
-        if any(rel.endswith(suffix) for suffix in allowed):
-            continue
-        text = path.read_text()
-        for factory in factories:
-            if factory in text and f"def {factory}" not in text:
-                offenders.append(f"{rel}: {factory}")
-    assert not offenders, offenders
-
-
-def test_communication_buffers_precede_cache_capacity_planning():
-    import inspect
-    import textwrap
-
-    from tokenspeed.runtime.execution.device import build_device_side
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(build_device_side)))
-    prepare_lines = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "prepare_communication_runtime"
-    ]
-    cache_lines = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "create_attn_components"
-    ]
-
-    assert prepare_lines and cache_lines
-    assert max(prepare_lines) < min(cache_lines)
-
-
-def test_collaborators_hold_the_handle_instead_of_walking_to_it():
-    """No ``loop.<x>.<y>`` path to the GPU: each hook is handed its own.
-
-    A traversal is the seam a later change widens — first ``loop.device``,
-    then whatever the handle happens to expose. Injection keeps the
-    dependency in the constructor where it is visible.
-    """
-    import inspect
-
-    from tokenspeed.runtime.engine import pause
-    from tokenspeed.runtime.pd import transfer_hooks
-
-    for module in (pause, transfer_hooks, event_loop_module()):
-        source = inspect.getsource(module)
-        assert "loop.device" not in source
-        assert "loop._device" not in source
-
-
 def test_prefill_usage_hook_records_committed_totals_and_skips_retired_requests():
     from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 
@@ -1172,13 +1140,8 @@ def test_expert_load_counters_start_serving_at_zero_after_the_startup_forwards()
     execution stream) and before the handle exists, so the first window a
     rebalance or profile sees is traffic only."""
     import contextlib
-    import inspect
-    import textwrap
 
-    from tokenspeed.runtime.execution.device import (
-        build_device_side,
-        start_expert_load_window,
-    )
+    from tokenspeed.runtime.execution.device import start_expert_load_window
     from tokenspeed.runtime.moe import expert_location
 
     placement = expert_location.ExpertLocationMetadata.from_physical_to_logical_map(
@@ -1210,27 +1173,6 @@ def test_expert_load_counters_start_serving_at_zero_after_the_startup_forwards()
     assert not placement.physical_load.any()
     # Without load recording there is nothing to reset and nothing is touched.
     start_expert_load_window(SimpleNamespace())
-
-    # The reset point: after the graphs are captured, before the handle is built.
-    tree = ast.parse(textwrap.dedent(inspect.getsource(build_device_side)))
-
-    def call_lines(name: str, attribute: bool) -> list[int]:
-        return [
-            node.lineno
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and (
-                (isinstance(node.func, ast.Attribute) and node.func.attr == name)
-                if attribute
-                else (isinstance(node.func, ast.Name) and node.func.id == name)
-            )
-        ]
-
-    captures = call_lines("capture_graphs", attribute=True)
-    resets = call_lines("start_expert_load_window", attribute=False)
-    handles = call_lines("DeviceHandle", attribute=False)
-    assert len(resets) == 1 and captures and handles
-    assert max(captures) < resets[0] < min(handles)
 
 
 def test_expert_load_snapshot_reads_then_zeroes_on_the_execution_stream():

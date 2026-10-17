@@ -23,6 +23,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/map.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/variant.h>
@@ -94,13 +95,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("D", tokenspeed::Role::kD)
         .value("Fused", tokenspeed::Role::kFused);
 
-    nb::enum_<tokenspeed::CacheGroupConfig::Retention>(m, "CacheRetention")
-        .value("FullHistory", tokenspeed::CacheGroupConfig::Retention::FullHistory)
-        .value("SlidingWindow", tokenspeed::CacheGroupConfig::Retention::SlidingWindow);
-
-    nb::enum_<tokenspeed::CacheGroupFamily>(m, "CacheGroupFamily")
-        .value("History", tokenspeed::CacheGroupFamily::History)
-        .value("State", tokenspeed::CacheGroupFamily::State);
+    nb::enum_<tokenspeed::AttnKind>(m, "AttnKind")
+        .value("Full", tokenspeed::AttnKind::kFull)
+        .value("SlidingWindow", tokenspeed::AttnKind::kSlidingWindow)
+        .value("State", tokenspeed::AttnKind::kState);
 
     nb::enum_<tokenspeed::CacheTransferPolicy>(m, "CacheTransferPolicy")
         .value("Unspecified", tokenspeed::CacheTransferPolicy::Unspecified)
@@ -112,20 +110,17 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(
             "__init__",
             [](tokenspeed::CacheGroupConfig* self, std::string group_id, std::int32_t block_granularity,
-               std::int32_t total_pages, tokenspeed::CacheGroupConfig::Retention retention,
-               std::optional<std::int32_t> sliding_window_tokens, tokenspeed::CacheGroupFamily family,
-               std::int32_t cache_blocks_per_lcm_block, tokenspeed::CacheTransferPolicy transfer_policy,
-               std::int32_t shard_count, bool replayable) {
+               std::int32_t total_pages, tokenspeed::AttnKind attn_kind,
+               std::optional<std::int32_t> sliding_window_tokens, std::int32_t cache_blocks_per_lcm_block,
+               tokenspeed::CacheTransferPolicy transfer_policy, std::int32_t shard_count, bool replayable) {
                 new (self) tokenspeed::CacheGroupConfig{
                     std::move(group_id), block_granularity,     total_pages, cache_blocks_per_lcm_block,
-                    retention,           sliding_window_tokens, replayable,  family,
-                    transfer_policy,     shard_count,
+                    attn_kind,           sliding_window_tokens, replayable,  transfer_policy,
+                    shard_count,
                 };
             },
-            nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"),
-            nb::arg("retention") = tokenspeed::CacheGroupConfig::Retention::FullHistory,
-            nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("family") = tokenspeed::CacheGroupFamily::History,
-            nb::arg("cache_blocks_per_lcm_block") = 1,
+            nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"), nb::arg("attn_kind"),
+            nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("cache_blocks_per_lcm_block") = 1,
             nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified, nb::arg("shard_count") = 1,
             nb::arg("replayable") = false)
         .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
@@ -133,10 +128,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
         .def_rw("cache_blocks_per_lcm_block", &tokenspeed::CacheGroupConfig::cache_blocks_per_lcm_block)
         .def_rw("shard_count", &tokenspeed::CacheGroupConfig::shard_count)
-        .def_rw("retention", &tokenspeed::CacheGroupConfig::retention)
+        .def_rw("attn_kind", &tokenspeed::CacheGroupConfig::attn_kind)
         .def_rw("sliding_window_tokens", &tokenspeed::CacheGroupConfig::sliding_window_tokens)
         .def_rw("replayable", &tokenspeed::CacheGroupConfig::replayable)
-        .def_rw("family", &tokenspeed::CacheGroupConfig::family)
         .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
         .def("validate", &tokenspeed::CacheGroupConfig::Validate);
 
@@ -291,6 +285,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("shifted_input_ids", &tokenspeed::ForwardBatch::shifted_input_ids)
         .def_ro("extend_prefix_lens", &tokenspeed::ForwardBatch::extend_prefix_lens)
         .def_ro("extend_replay_lens", &tokenspeed::ForwardBatch::extend_replay_lens)
+        // Per extend row (the D role's remote admission only): every State
+        // group's prompt-end checkpoint sits in slot 0, so the peer omits the
+        // latest-snapshot transfer.
+        .def_ro("state_prefix_cached", &tokenspeed::ForwardBatch::state_prefix_cached)
         .def_prop_ro(
             "prefill_lengths",
             [](const tokenspeed::ForwardBatch& op) -> const std::vector<std::int32_t>& { return op.prefill_lengths; },
@@ -435,17 +433,40 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                          return nb::cast(*plan.remote_prefill, nb::rv_policy::copy);
                      })
         .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero)
-        .def("pages_to_zero_arrays", [](nb::handle self) {
-            // Zero-copy 1-D int32 views of pages_to_zero, one per cache group
-            // (empty groups included); `self` keeps the ExecutionPlan alive
-            // for the lifetime of each ndarray. The list export builds one
-            // Python int per page, which for a long prompt's admission is
-            // thousands of objects on the forward thread's critical path.
+        .def("pages_to_zero_arrays",
+             [](nb::handle self) {
+                 // Zero-copy 1-D int32 views of pages_to_zero, one per cache group
+                 // (empty groups included); `self` keeps the ExecutionPlan alive
+                 // for the lifetime of each ndarray. The list export builds one
+                 // Python int per page, which for a long prompt's admission is
+                 // thousands of objects on the forward thread's critical path.
+                 auto& plan = nb::cast<tokenspeed::ExecutionPlan&>(self);
+                 nb::dict out;
+                 for (auto& [gid, pages] : plan.pages_to_zero) {
+                     out[nb::str(gid.c_str())] =
+                         nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>>(pages.data(), {pages.size()}, self);
+                 }
+                 return out;
+             })
+        // Device -> Device whole-block copies per cache group, (source,
+        // destination) virtual block ids. The runtime runs them on the forward
+        // thread's default stream after the execution stream's in-flight
+        // forwards and before this plan's zeroing; destinations are never in
+        // pages_to_zero. No ACK.
+        .def_ro("pages_to_copy", &tokenspeed::ExecutionPlan::pages_to_copy)
+        .def("pages_to_copy_arrays", [](nb::handle self) {
+            // Zero-copy (n, 2) int32 views of pages_to_copy, one per cache
+            // group (empty groups included): column 0 the source, column 1
+            // the destination. std::pair<int32, int32> is two contiguous
+            // int32s, which the static_assert below holds the layout to.
+            static_assert(sizeof(std::pair<std::int32_t, std::int32_t>) == 2 * sizeof(std::int32_t),
+                          "a copy pair must be two contiguous int32 values");
             auto& plan = nb::cast<tokenspeed::ExecutionPlan&>(self);
             nb::dict out;
-            for (auto& [gid, pages] : plan.pages_to_zero) {
+            for (auto& [gid, pairs] : plan.pages_to_copy) {
+                const auto* data = pairs.empty() ? nullptr : reinterpret_cast<const std::int32_t*>(pairs.data());
                 out[nb::str(gid.c_str())] =
-                    nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>>(pages.data(), {pages.size()}, self);
+                    nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(data, {pairs.size(), 2}, self);
             }
             return out;
         });
@@ -481,7 +502,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "Count RemotePrefilling requests; these are also included in prefilling_size().")
         .def("pd_transfer_size", &tokenspeed::Scheduler::PdTransferSize,
              "Count requests with PD-pinned pages; this resource count overlaps lifecycle states.")
-        .def("pd_transfer_pinned", &tokenspeed::Scheduler::PdTransferPinned, nb::arg("request_id"))
         .def("available_lcm_blocks", &tokenspeed::Scheduler::AvailableLcmBlocks)
         .def("empty_lcm_blocks", &tokenspeed::Scheduler::EmptyLcmBlocks)
         .def("active_lcm_blocks", &tokenspeed::Scheduler::ActiveLcmBlocks)
@@ -490,6 +510,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "suspended request's image).")
         .def("host_pool_pinned_blocks", &tokenspeed::Scheduler::HostPoolPinnedBlocks,
              "Host L2 entries pinned by a request -- a suspended request's image, or an in-flight transfer.")
+        .def("tail_entries", &tokenspeed::Scheduler::TailEntries,
+             "Published partial-page boundaries (hash@T) the prefix probe can resume at.")
+        .def("tail_cap_evictions", &tokenspeed::Scheduler::TailCapEvictions,
+             "Tails dropped because more than eight were published under one prior page.")
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)

@@ -731,7 +731,6 @@ class Glm53FlashKDA(nn.Module):
 
         num_tokens = hidden_states.shape[0]
         projection_size = self.num_heads * self.head_dim
-        fuse_decode_output_norm = ctx.forward_mode.is_decode() and num_tokens == ctx.bs
         core_output = ctx.attn_backend.forward(
             q=None,
             k=None,
@@ -755,25 +754,21 @@ class Glm53FlashKDA(nn.Module):
             A_log=self.A_log,
             dt_bias=self.dt_bias,
             lower_bound=self.lower_bound,
-            output_gate=output_gate if fuse_decode_output_norm else None,
-            norm_weight=self.o_norm.weight if fuse_decode_output_norm else None,
-            norm_eps=self.o_norm.variance_epsilon if fuse_decode_output_norm else None,
             layer_id=self.layer_id,
             seq_len=num_tokens,
         )
         core_output = core_output.reshape(
             num_tokens, self.local_num_heads * self.head_dim
         )
-        if not fuse_decode_output_norm:
-            core_output = rmsnorm_gated_sigmoid(
-                core_output.contiguous(),
-                output_gate.contiguous(),
-                self.o_norm.weight,
-                self.o_norm.variance_epsilon,
-                self.local_num_heads,
-                self.head_dim,
-                enable_pdl=pdl_enabled(),
-            )
+        core_output = rmsnorm_gated_sigmoid(
+            core_output.contiguous(),
+            output_gate.contiguous(),
+            self.o_norm.weight,
+            self.o_norm.variance_epsilon,
+            self.local_num_heads,
+            self.head_dim,
+            enable_pdl=pdl_enabled(),
+        )
         return self.o_proj(core_output)[0]
 
 

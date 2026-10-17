@@ -94,8 +94,9 @@ def _record_rmsnorm_launches(monkeypatch, vendor: str) -> _KernelLaunches:
 )
 def test_triton_rmsnorm_launch_keywords(monkeypatch, options, changes, scales) -> None:
     """Each option sets only its own launch keywords. Without options every new
-    constexpr is False, which compiles the kernel body as it was before the
-    options existed, and ``launch_pdl`` is not passed."""
+    constexpr is False and the FP8 output pointers are None, which compiles the
+    kernel body as it was before the options existed, and ``launch_pdl`` is not
+    passed."""
     kernel = _record_rmsnorm_launches(monkeypatch, "nvidia")
     x = torch.zeros(3, 96, dtype=torch.bfloat16)
     weight = torch.ones(96, dtype=torch.bfloat16)
@@ -110,6 +111,9 @@ def test_triton_rmsnorm_launch_keywords(monkeypatch, options, changes, scales) -
         "ROUND_RESIDUAL_SUM_BF16": False,
         "SCALE_INPUTS_BF16": False,
         "ENABLE_PDL": False,
+        "fp8_out_ptr": None,
+        "fp8_scale_ptr": None,
+        "TOKEN_FP8_OUT": False,
         **changes,
     }
 

@@ -25,7 +25,6 @@ from tokenspeed_kernel.platform import current_platform
 platform = current_platform()
 
 from tokenspeed.runtime.layers.attention.backends.specific import (  # noqa: F401
-    deepseek_v4,
     deepseek_v41,
 )
 
@@ -43,6 +42,8 @@ if platform.is_nvidia:
         tokenspeed_mla,
     )
 
+from tokenspeed.runtime.layers.attention.backends.paged import ascend_dsa  # noqa: F401
+from tokenspeed.runtime.layers.attention.backends.paged import ascend_mla  # noqa: F401
 from tokenspeed.runtime.layers.attention.backends.paged import dsa  # noqa: F401
 from tokenspeed.runtime.layers.attention.backends.paged import mha  # noqa: F401
 from tokenspeed.runtime.layers.attention.backends.paged import mla  # noqa: F401

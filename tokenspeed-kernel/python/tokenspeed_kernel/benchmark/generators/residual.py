@@ -470,7 +470,8 @@ def prepare_hyperconnection_mix(
     ``lowrank`` mix gate (plus ``hc_count`` inject logits when ``inject`` is
     set, as for the per-layer mixers; the final mixer has none), applies the
     gate and mixes the streams back to one ``hidden_size`` input, as
-    ``GatedResidualSimple.mix`` does.
+    ``GatedResidualSimple.mix`` does. Projection storage is padded once during
+    preparation, matching model loading, and invocation uses its logical width.
     """
 
     _ = platform
@@ -504,6 +505,9 @@ def prepare_hyperconnection_mix(
 
     from tokenspeed_kernel.ops import residual as residual_ops
 
+    projection_weight = residual_ops.pad_gated_residual_projection_weight(
+        projection_weight, projection_rows=projection_rows
+    )
     load_builtin_kernels()
     try:
         kernel, _ = residual_ops.select_gated_residual_mix_kernel(
@@ -534,6 +538,7 @@ def prepare_hyperconnection_mix(
             hc_count,
             hidden_size,
             lowrank,
+            projection_rows=projection_rows,
             weights_independent=True,
         )
 
