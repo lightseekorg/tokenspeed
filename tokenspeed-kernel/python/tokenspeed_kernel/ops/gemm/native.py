@@ -31,6 +31,64 @@ from tokenspeed_kernel.signature import (
 )
 
 # ===-----------------------------------------------------------------------===#
+# BF16 grouped projection: direct contiguous output (AMD gfx950)
+# ===-----------------------------------------------------------------------===#
+
+
+@register_kernel(
+    "gemm",
+    "grouped_bf16_projection",
+    name="torch_grouped_bf16_projection_gfx950",
+    solution="torch",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=format_signatures(("x", "weight"), "dense", {torch.bfloat16}),
+    traits={
+        "batch": frozenset({2}),
+        "m_min": frozenset({2}),
+        "m_max": frozenset({192}),
+        "n": frozenset({1024}),
+        "k": frozenset({4096}),
+        "a_inner_stride_one": frozenset({True}),
+        "b_inner_stride_one": frozenset({True}),
+        "is_cuda": frozenset({True}),
+    },
+    priority=Priority.SPECIALIZED,
+)
+def torch_grouped_bf16_projection_gfx950(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
+) -> torch.Tensor:
+    """Project BF16 groups into their final contiguous token-major layout.
+
+    Args:
+        x: BF16 ``[tokens, groups, input_dim]`` with unit inner stride.
+        weight: BF16 ``[groups, output_dim, input_dim]`` with unit inner stride.
+        out: Optional contiguous BF16 ``[tokens, groups, output_dim]`` storage.
+
+    Returns:
+        BF16 output, or ``out`` when supplied. In inference the batched GEMM
+        writes contiguous token-major storage through a group-major view with
+        padded row strides, so flattening groups into features needs no copy.
+        Gradient-enabled calls retain the canonical reference layout.
+    """
+    # PyTorch's out= GEMM does not support autograd; retain the reference
+    # behavior for callers that explicitly request gradients.
+    if torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad):
+        from tokenspeed_kernel.numerics.torch.gemm import (
+            torch_grouped_bf16_projection,
+        )
+
+        return torch_grouped_bf16_projection(x, weight, out)
+    if out is None:
+        out = x.new_empty((x.shape[0], weight.shape[0], weight.shape[1]))
+    torch.bmm(x.permute(1, 0, 2), weight.transpose(1, 2), out=out.permute(1, 0, 2))
+    return out
+
+
+# ===-----------------------------------------------------------------------===#
 # Scaled FP8: PyTorch row-wise scaled GEMM (NVIDIA SM100)
 # ===-----------------------------------------------------------------------===#
 

@@ -46,3 +46,18 @@ converts canonical FP32 1x128 activation and 128x128 weight scales to the
 required layout without UE8M0 rounding. Conversion is part of each call,
 including graph capture; no persistent weight cache is created. Unsupported
 forced calls fail explicitly. It does not claim batch-invariant numerics.
+
+## gfx950 grouped BF16 projection output
+
+For the two-group V4.1 output projection, `torch_grouped_bf16_projection_gfx950`
+allocates contiguous `[tokens, groups, output_dim]` storage and supplies its
+permuted group-major view directly as the batched GEMM destination. The library
+receives the row and batch strides; flattening groups afterward is a view.
+Explicit output buffers retain their identity. Token counts 2 through 192 with
+K=4096 and output width 1024 use this candidate; single-token, single-group,
+nonunit-inner-stride and other shapes retain the original registered solutions.
+The canonical einsum reference is unchanged, including gradient-enabled calls.
+
+The gfx950 token-major Torch projection remains behind the Gluon implementation
+for supported contiguous weights. Its explicit `solution="torch"` path also
+covers strided weights; the model retains the fused grouped FP8 epilogue.
