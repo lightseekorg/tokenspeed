@@ -344,7 +344,6 @@ def test_builtin_moe_preprocessor_links_are_callables():
     assert errors == []
 
 
-
 def test_builtin_moe_specialized_offsets_are_intentional() -> None:
     """Only proven same-band overlaps may use specialized priority offsets."""
     registry = KernelRegistry.get()
@@ -6850,7 +6849,6 @@ _ARCH_FIXTURES: dict[str, tuple[str, ...]] = {
     ),
     "nvidia-cutedsl": ("h100_platform", "b200_platform", "b300_platform"),
 }
-
 
 
 def test_mxfp8_quantizer_capabilities_match_architecture(
