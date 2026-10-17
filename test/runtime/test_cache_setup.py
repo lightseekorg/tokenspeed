@@ -1248,6 +1248,27 @@ def test_qwen_state_blocks_carry_no_attention_planes() -> None:
     }
 
 
+def test_qwen_conv_windows_fill_a_free_state_segment() -> None:
+    """When the SSM states leave a segment free, the conv windows pack into it and KV pages pad nothing."""
+    plan = _qwen_gdn_setup(2).spec.memory_plan
+    payload = {
+        suffix: {
+            field.payload_bytes
+            for field in plan.fields
+            if field.field_id.endswith(suffix)
+        }.pop()
+        for suffix in (".ssm", ".conv")
+    }
+
+    # Six GDN layers over four segments: two groups of three states, one segment left for their conv windows.
+    assert plan.lcm_block_bytes == 4 * payload[".ssm"]
+    assert _page_padding(plan) == {
+        FULL_ATTENTION: 0,
+        "linear_attention_0": payload[".ssm"] - 3 * payload[".conv"],
+        "linear_attention_1": payload[".ssm"] - 3 * payload[".conv"],
+    }
+
+
 def test_qwen_mtp_draft_layer_fills_state_segments() -> None:
     """An MTP layer of a target attention layer's bytes takes segments the state layers fill too."""
     plan = _qwen_gdn_setup(2, draft_kv_heads=1).spec.memory_plan

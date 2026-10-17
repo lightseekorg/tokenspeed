@@ -2069,6 +2069,7 @@ class KimiLinearMoE(nn.Module):
                 model_scope=model_scope,
                 # The gate itself, so mailbox and gather meet by construction.
                 max_m=DOWN_MAILBOX_MAX_TOKENS,
+                publish_gemm=None,
             )
             # The mailbox and both producers are bf16; another activation dtype
             # keeps the replica rather than failing at the first forward.

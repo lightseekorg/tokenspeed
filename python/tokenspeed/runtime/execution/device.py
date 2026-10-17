@@ -1322,9 +1322,16 @@ def build_device_side(
     target, draft = create_model_runner(
         server_args, model_config, draft_model_config, gpu_id, global_rank
     )
-    with startup_phase("multimodal.init"):
-        if server_args.disaggregation_mode in ("null", "prefill"):
-            target.prepare_multimodal_runtime()
+
+    def prepare_multimodal():
+        with startup_phase("multimodal.init"):
+            if server_args.disaggregation_mode in ("null", "prefill"):
+                target.prepare_multimodal_runtime()
+
+    # CDNA4 encoders share the fixed Iris heap with the language model.
+    communication_first = current_platform().is_cdna4
+    if not communication_first:
+        prepare_multimodal()
     max_forward_tokens = (
         server_args.chunked_prefill_size
         if server_args.chunked_prefill_size > 0
@@ -1338,6 +1345,8 @@ def build_device_side(
         target.prepare_communication_runtime(max_forward_tokens)
         if draft is not None:
             draft.prepare_communication_runtime(max_forward_tokens)
+    if communication_first:
+        prepare_multimodal()
 
     post_profile_bytes = recv_pool_bytes(server_args, model_config.is_multimodal_active)
     if post_profile_bytes:

@@ -1110,8 +1110,12 @@ table expanded to its leaf's `kernel_page_size` and padded to the leaf's
 `[G, max_bs * N]` decode write-location stack. Both are allocated once and
 refilled in place: leaves copy their view out, while the decode write-slot
 views and the block drafters' `draft_history_view` read the stack storage
-inside captured graphs. QSA's indexer owns separate stacks for its two raw
-groups using the same fill at ratio one. The fill is one expand
+inside captured graphs. A leaf whose decode refresh is only that copy
+(`decode_buffer_targets`, then `publish_decode_metadata`) is filled by the
+router together with every other such leaf in one batched copy, since at
+bs=1 each separate stream copy costs a few microseconds. QSA's indexer
+owns separate stacks for its two raw groups using the same fill at ratio
+one. The fill is one expand
 launch per group with plain scalar arguments (scheduler block count, source
 stride, live requests) — no device-side metadata tensor, because the
 per-step pinned staging + H2D it would need lands on the bs=1 latency path;

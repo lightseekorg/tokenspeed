@@ -401,7 +401,9 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
         device,
         "current_platform",
         lambda: SimpleNamespace(
-            restore_stack_limit=restore_stack_limit, is_nvidia=is_nvidia
+            restore_stack_limit=restore_stack_limit,
+            is_nvidia=is_nvidia,
+            is_cdna4=False,
         ),
     )
     monkeypatch.setattr(factory, "create_model_runner", lambda *a: (target, None))

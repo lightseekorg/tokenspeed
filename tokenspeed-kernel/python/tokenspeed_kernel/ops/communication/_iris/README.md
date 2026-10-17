@@ -22,16 +22,24 @@ explicit: K3 fusions reuse producer storage and pull scratch, with producers
 finished and consumers ordered on one stream. Sharded activations are borrowed;
 ordinary producer-direct reductions return results in independent storage.
 
-`IrisBackend` retains generic operations by group and dtype. K3 additionally
-prepares `K3IrisState` before cache sizing and binds it to attention, MoE,
-and NextN callers. Other models initialize during warmup. Calls select among
+`IrisBackend` retains generic operations by group and dtype. Models prepare
+additional fusion state before cache sizing and bind it to their callers.
+Generic operations can also initialize during warmup. Calls select among
 prepared variants using the existing shape and topology policies. Different
 staging geometries have separate synchronization buffers because their workgroup
 IDs cover different element ranges. Triton RSAG remains independent.
 
-K3 preparation, dispatch, and fused implementations live in `kimi_k3/`.
-General all-reduce implementations remain in `all_reduce.py`, separate from
-K3's shapes and fusion policies.
+Model preparation, dispatch, and fusions live in `kimi_k3/` and
+`muse_spark/`. General collectives live in `all_reduce.py`,
+`reduce_scatter.py`, `all_gather.py`, and `broadcast.py`. The all-gather module
+also owns the width-parameterized RMSNorm/MXFP4 fusion. Exchanges with
+model-specific head layouts, route packets, or normalization semantics stay in
+the model package, along with dispatch and capacities.
+
+Muse Spark prepares its collectives for TP4/EP4 or TP8/EP8 on gfx950. Both
+topologies keep the same global token cutoffs for Lamport, push, pull, and
+owned-row paths. Owned rows use ceil(global rows / world size), with padded
+rows masked; QKVG exchange derives each rank's head widths from the group size.
 
 Configure the allocator and optional heap capacity on every rank before the
 first preparation:

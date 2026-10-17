@@ -153,9 +153,11 @@ env:
     tokenspeed-kernel/test/ops/test_gemm.py::test_linear_attnres_partials_gfx1250_matches_composition[3648]
     tokenspeed-kernel/test/ops/test_gemm.py::test_linear_attnres_partials_gfx1250_cuda_graph_replay[6288]
     tokenspeed-kernel/test/amd/ops/test_kimi3_prefill_gluon_amd.py::test_attn_res_amd_entrypoint_accepts_legacy_keywords
-    # Kimi K3 MoE front end: reduced latent-input decode pipeline, sigmoid-bias
-    # routing with and without renormalization, fused softmax top-k.
-    tokenspeed-kernel/test/amd/ops/moe/test_gluon_latent_input_gfx1250.py::test_decode_pipeline[sim]
+    # Kimi K3 MoE front end: reduced small-batch and whole-reduction
+    # latent-input decode pipelines, sigmoid-bias routing with and without
+    # renormalization, fused softmax top-k.
+    tokenspeed-kernel/test/amd/ops/moe/test_gluon_latent_input_gfx1250.py::test_decode_small_batch_pipeline[sim]
+    tokenspeed-kernel/test/amd/ops/moe/test_gluon_latent_input_gfx1250.py::test_decode_nosplit_pipeline[sim]
     tokenspeed-kernel/test/amd/ops/test_kimi3_sigmoid_topk_amd.py::test_prefill_sigmoid_bias_topk_matches_torch_and_captures[1.0-False]
     tokenspeed-kernel/test/amd/ops/test_kimi3_sigmoid_topk_amd.py::test_prefill_sigmoid_bias_topk_matches_torch_and_captures[2.5-True]
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_triton_matches_softmax_topk[2-896-16-dtype4-True]

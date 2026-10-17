@@ -89,8 +89,8 @@ switch an envelope folds is also available individually under `auto`.
 | Parameter | Purpose |
 | --- | --- |
 | `--numerics {auto,rl-bitwise}` | `auto` keeps every performance default. `rl-bitwise` folds the determinism switches (`--batch-invariant-collectives`, `--disable-autotune`, `--disable-tf32`, `--disable-pdl`, no fused all-reduce, `--moe-backend aok`, `--sampling-stream per-request`, `--dsa-slot-order sorted`) so tokens and logprobs are bitwise identical across runs and batch compositions, and the trainer-operation-order switches below so a teacher-forced pass reproduces the RL trainer's logprobs. Needs MoE TP 1 and a vocabulary that is a multiple of 32768; a model serves it only once its profile lists it. |
-| `--batch-invariant-collectives` | One association order per reduction, independent of the batch: a 2-D bf16 all-reduce on a multicast-reachable group runs as the NVLS in-switch reduction issued by one fixed rank (verified bitwise at startup), every other reduction as NCCL data movement plus a fixed-rank-order fp32 fold; gathers keep the multicast kernels. Folded in by `rl-bitwise`. |
-| `--force-deterministic-rsag` | NCCL and the fold only: no symmetric-memory path (multicast gathers, in-switch all-reduce, the trtllm/Triton all-reduce tiers, distributed argmax). Not folded in by `rl-bitwise`; the escape when the startup self-check refuses the switch. |
+| `--batch-invariant-collectives` | One association order per reduction, independent of the batch: every reduction runs as NCCL data movement plus a fixed-rank-order fp32 fold (an all-reduce costs world_size x the traffic); gathers keep the multicast kernels. Folded in by `rl-bitwise`. |
+| `--force-deterministic-rsag` | NCCL and the fold only: no symmetric-memory path (multicast gathers, the trtllm/Triton all-reduce tiers, distributed argmax). Not folded in by `rl-bitwise`, under which it only moves the gathers to NCCL. |
 | `--sampling-stream {batch,per-request}` | `per-request` draws every non-greedy row from a stream keyed by the request's seed and position only, so a request samples the same tokens alone and inside any batch. Folded in by `rl-bitwise`. |
 | `--yarn-ramp-mask-device {cuda,cpu}` | Device that computes the `deepseek_yarn` RoPE inverse frequencies (position frequencies, both divisions and the YaRN linear ramp mask) before the table is moved to the model device once; the trainer builds it on the host. Folded to `cpu` by `rl-bitwise`. |
 | `--mla-lora-scale {folded,runtime}` | Where LongCat-style MLA applies its `sqrt(hidden / lora_rank)` norm scales: folded into the norm weights at load, or multiplied at runtime after `q_b_proj` / `kv_a_layernorm` as the trainer does. Folded to `runtime` by `rl-bitwise`. |
@@ -511,7 +511,7 @@ for the online variant.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. Names are checked against the backend registry at startup, after plugins load, so an installed plugin's backends are accepted too. |
+| `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. Names are checked against the backend registry at startup, after plugins load, so an installed plugin's backends are accepted too. On SM103 (B300/GB300), `fa4` ranks below every other attention kernel: naming it here or in `--drafter-attention-backend` selects it, and the default selection is unchanged. |
 | `--drafter-attention-backend` | Attention backend for speculative decoding drafter model; accepts the same names as `--attention-backend`. |
 | `--moe-backend` | MoE backend. |
 | `--moe-mxfp4-fp8-activation` | Opt-in: run MXFP4 routed experts with FP8 activations. On Hopper this is the FlashInfer cutlass W4A8 MoE (faster than the default W4A16 kernel, a few percent of extra error on expert outputs). Applies to every MXFP4 expert layer, target and draft; startup fails where the selected MoE backend has no FP8-activation kernel for a layer, when a model's routed experts are not MXFP4, when the model pins another activation precision (Kimi-K3 on Hopper Marlin), or when the layer's SwiGLU is unclamped (the W4A8 FC2 scale relies on the clamp). |
@@ -773,8 +773,9 @@ the draft's attention to the full history.
 | `--enable-log-requests` | Log request metadata and optionally payloads. On by default; `--no-enable-log-requests` disables. |
 | `--log-requests-level` | Request logging verbosity. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
-| `--enable-metrics` | Enable metrics reporting and serve the engine's Prometheus metrics over HTTP (see "Prometheus metrics" below). |
-| `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
+| --enable-metrics | Enable the selected metrics reporters. |
+| --metrics-reporters | Select prometheus or an installed metric output; repeat for multiple. Defaults to prometheus. |
+| --metrics-reporter-config | JSON file mapping external reporter names to their settings. See [metric output plugins](../metrics-plugins.md). |
 | `--metrics-port` | Port for the engine's `/metrics` HTTP endpoint. Defaults to an automatically allocated free port (logged at startup). |
 | `--metrics-host` | Bind host for the `/metrics` endpoint. Defaults to `--host`. |
 | `--decode-log-interval` | Decode batch log interval. |
@@ -816,9 +817,13 @@ is intentionally verbose. Enable it only while debugging. For
 decode-only batches it also logs the anchor, draft candidates, target verify
 tokens, and their position-wise matches.
 
+To send observations to another monitoring system, install and select a
+[metric output plugin](../metrics-plugins.md). Selecting only external outputs
+does not start a Prometheus endpoint.
+
 ### Prometheus metrics
 
-With `--enable-metrics`, every engine process on a node (scheduler ranks and
+With --enable-metrics and the prometheus reporter, every engine process on a node (scheduler ranks and
 the tokenizer manager) writes its metrics to a node-local
 `PROMETHEUS_MULTIPROC_DIR`, and the engine's main process aggregates and
 serves them as `GET /metrics` in Prometheus text format. Scrape it at
@@ -1264,3 +1269,7 @@ ubuntu job boots `mooncake_master` and runs
 `MOONCAKE_MASTER=host:port`.
 Mooncake Store is the offload backend. PD KV transfer still uses the
 separate Mooncake TransferEngine (`--disaggregation-transfer-backend`).
+On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
+(unless it is already set) so Mooncake's handshake uses IPv6. The Mooncake L3
+store client reads `MC_USE_IPV6` on its own when the store starts, so export
+`MC_USE_IPV6=1` yourself when the L3 store runs on an IPv6 host.

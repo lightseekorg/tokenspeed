@@ -22,6 +22,16 @@ GPQA_HUGGINGFACE_DATASET_ARGS = (
 GPQA_MODELSCOPE_DATASET_ARGS = (
     '{"gpqa_diamond":{"dataset_id":"AI-ModelScope/gpqa_diamond"}}'
 )
+MUSE_SPARK_AIME26_CONFIGS = {
+    4: "muse-spark-mxfp4-tp4ep4-evalscope-aime26-amd.yaml",
+    8: "muse-spark-mxfp4-tp8ep8-evalscope-aime26-amd.yaml",
+}
+MUSE_SPARK_AIME26_PROMPT = (
+    "Solve the following math problem. Show your reasoning step by step.\n"
+    "Enclose only your final answer in standard LaTeX boxed-answer notation. "
+    "Once you provide the final answer, stop immediately.\n\n"
+    "Problem: {question}"
+)
 GPQA_DATASET_SOURCE_PRELUDE = (
     'if [ "${TOKENSPEED_CI_FORK_PR:-false}" = "true" ]; '
     "then GPQA_DATASET_HUB=modelscope; "
@@ -36,7 +46,7 @@ DATASETS = {
         "dataset_args": {"dataset_id": "math-ai/aime25"},
     },
     "aime26": {
-        "count": 13,
+        "count": 15,
         "dataset_args": {"dataset_id": "math-ai/aime26"},
     },
     "gpqa_diamond": {
@@ -145,7 +155,15 @@ def test_evalscope_configs_use_expected_dataset_sources():
                 "dataset_hub", "huggingface"
             ), path
             dataset_args = json.loads(flag_value(tokens, "--dataset-args"))
-        assert dataset_args == {dataset: expected["dataset_args"]}, path
+        expected_dataset_args = {dataset: expected["dataset_args"]}
+        if path.name in MUSE_SPARK_AIME26_CONFIGS.values():
+            expected_dataset_args = {
+                dataset: {
+                    **expected["dataset_args"],
+                    "prompt_template": MUSE_SPARK_AIME26_PROMPT,
+                }
+            }
+        assert dataset_args == expected_dataset_args, path
 
     expected_counts = Counter(
         {dataset: item["count"] for dataset, item in DATASETS.items()}
@@ -168,6 +186,36 @@ def test_gpt_oss_gpqa_uses_runner_specific_batch_sizes_and_retries():
         task["runner"]["env"]["amd-mi35x-2gpu-test"]["GPT_OSS_EVAL_BATCH_SIZE"] == "16"
     )
     assert flag_value(command, "--eval-batch-size") == "${GPT_OSS_EVAL_BATCH_SIZE:-64}"
+
+
+@pytest.mark.parametrize("world_size", MUSE_SPARK_AIME26_CONFIGS)
+def test_muse_spark_aime26_uses_validated_mxfp4_configuration(world_size):
+    path = EVAL_CONFIG_DIR / MUSE_SPARK_AIME26_CONFIGS[world_size]
+    task = yaml.safe_load(path.read_text(encoding="utf-8"))
+    server_tokens = shlex.split(task["server"]["command"])
+    eval_tokens = shlex.split(task["eval"]["command"])
+    generation_config = json.loads(flag_value(eval_tokens, "--generation-config"))
+
+    assert task["runner"]["labels"] == [f"amd-mi35x-{world_size}gpu-test"]
+    assert (
+        flag_value(server_tokens, "--model")
+        == "amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4"
+    )
+    assert flag_value(server_tokens, "--tp") == str(world_size)
+    assert flag_value(server_tokens, "--ep-size") == str(world_size)
+    assert flag_value(server_tokens, "--quantization") == "mxfp4"
+    assert flag_value(server_tokens, "--moe-backend") == "gluon"
+    assert flag_value(server_tokens, "--max-num-seqs") == "16"
+    assert flag_value(server_tokens, "--max-total-tokens") == "1048576"
+    assert flag_value(server_tokens, "--max-prefill-tokens") == "8192"
+    assert flag_value(server_tokens, "--chunked-prefill-size") == "8192"
+    assert flag_value(server_tokens, "--max-cudagraph-capture-size") == "16"
+    assert "--disable-prefill-graph" in server_tokens
+    assert "--disable-overlap-schedule" not in server_tokens
+    assert flag_value(eval_tokens, "--eval-batch-size") == "8"
+    assert generation_config["max_tokens"] == 32768
+    assert generation_config["extra_body"]["reasoning_effort"] == "high"
+    assert task["score_threshold"] == 0.91
 
 
 def test_qwen38_flash_next_runs_gsm8k_with_kvstore_enabled():

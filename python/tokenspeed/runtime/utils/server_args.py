@@ -46,6 +46,7 @@ from tokenspeed.runtime.configs.numerics import (
     YARN_RAMP_MASK_DEVICES,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
+from tokenspeed.runtime.metrics.config import resolve_metrics_options
 from tokenspeed.runtime.moe.dispatch_algorithm import (
     EP_DISPATCH_ALGORITHMS,
     STATIC_EP_DISPATCH_ALGORITHMS,
@@ -405,6 +406,7 @@ class ServerArgs:
     enable_metrics: bool = False
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
+    metrics_reporter_config: str | None = None
     # Port for the engine's Prometheus /metrics HTTP endpoint, served from the
     # engine's main process when --enable-metrics is on. None auto-allocates a
     # free port (logged at startup).
@@ -762,6 +764,7 @@ class ServerArgs:
         self.validate()
 
     def resolve_basic_defaults(self):
+        resolve_metrics_options(self)
         self.model = maybe_model_redirect(self.model)
 
         if self.kv_cache_dtype == "fp8":
@@ -1751,12 +1754,11 @@ class ServerArgs:
         """The rl-bitwise block: every envelope beyond auto runs it."""
         # Collectives: one association order per reduction. NCCL's ring
         # chunks by message size, so a plain NCCL sum is run-stable but not
-        # batch-size-invariant; batch_invariant_collectives routes the
-        # all-reduce to the NVLS in-switch reduction with a fixed issuer where
-        # multicast reaches (verified bitwise at startup) and every other
+        # batch-size-invariant; batch_invariant_collectives routes every
         # reduction to the rank-ordered fp32 fold (comm_backend/auto.py).
-        # force_deterministic_rsag stays the user's "NCCL and the fold only"
-        # knob; the envelope does not set it.
+        # Gathers move bytes and keep the multicast kernels;
+        # force_deterministic_rsag, which also moves them to NCCL, stays the
+        # user's knob and the envelope does not set it.
         self.batch_invariant_collectives = True
         self.enable_allreduce_fusion = False
         self.comm_fusion_max_num_tokens = -1
@@ -1819,26 +1821,18 @@ class ServerArgs:
         # Layouts stay explicit: the envelope does not fold them in. A
         # head-sharded o_proj that still sums its head partials across ranks
         # is batch-invariant under the envelope, but its bits are not the
-        # full-K GEMM a replicated or column-parallel o_proj computes, and
-        # they equal a TP-W engine's all-reduced o_proj only when both sides
-        # sum in the same order: the exchanging forward's reduce-scatter
-        # always takes the ordered fold, while an all-reduce (the TP-W
-        # engine's, and the replicated-row decode steps of a query-sharding
-        # engine) takes the in-switch reduction where multicast reaches, whose
-        # order is a property of the GPU set (comm_backend/self_check.py).
-        # --force-deterministic-rsag on the all-reducing side pins it to the
-        # fold; docs/design/numerics.md, "Layout invariance of query context
-        # parallelism".
+        # full-K GEMM a replicated or column-parallel o_proj computes. Every
+        # batch-invariant reduction (the exchanging forward's reduce-scatter,
+        # a TP-W engine's all-reduce) is the same rank-ordered fold, so it does
+        # equal a TP-W engine's all-reduced o_proj; docs/design/numerics.md,
+        # "Layout invariance of query context parallelism".
         if self.mapping.attn.has_head_tp and self.tp_batch_invariant == "none":
             logger.warning(
                 "--numerics rl-bitwise with --attn-head-tp-size > 1 but without "
                 "--tp-batch-invariant attn: the o_proj head partials are summed "
-                "across ranks (the ordered fold for the reduce-scatter, the "
-                "in-switch all-reduce where it applies), which is batch-invariant "
-                "but differs from the full-K o_proj of a TP1 or --tp-batch-invariant "
-                "engine, and equals a TP-W engine's o_proj only when both sides "
-                "sum in the same order (--force-deterministic-rsag on the "
-                "all-reducing side)"
+                "across ranks by the rank-ordered fold, which is batch-invariant "
+                "and equals a TP-W engine's o_proj, but differs from the full-K "
+                "o_proj of a TP1 or --tp-batch-invariant engine"
             )
 
     def resolve_disaggregation(self):
@@ -2472,7 +2466,8 @@ class ServerArgs:
             choices=["auto", "bfloat16", "fp8", "fp8_e4m3", "mxfp8"],
             help='Data type for kv cache storage. "auto" and "bfloat16" store BF16 '
             'rows (fp16 activations convert on write). "fp8" is an alias for '
-            '"fp8_e4m3" (unit scale). "mxfp8" stores '
+            '"fp8_e4m3" (unit scale, or the checkpoint\'s per-tensor KV-cache '
+            'scales where the model loads them). "mxfp8" stores '
             "block-scaled fp8-e4m3 (one UE8M0 scale per 32 head_dim elements) and "
             "requires --block-size 128 with an MHA attention backend.",
         )
@@ -2823,14 +2818,19 @@ class ServerArgs:
         parser.add_argument(
             "--enable-metrics",
             action="store_true",
-            help="Enable log metrics.",
+            help="Enable the selected metrics reporters.",
         )
         parser.add_argument(
             "--metrics-reporters",
             action="append",
-            choices=["prometheus"],
-            default=["prometheus"],
-            help="Select metrics reporter(can be specified multiple times)",
+            default=None,
+            help="Select prometheus or a registered metrics reporter (repeat for multiple; defaults to prometheus).",
+        )
+        parser.add_argument(
+            "--metrics-reporter-config",
+            type=str,
+            default=ServerArgs.metrics_reporter_config,
+            help="JSON file mapping external metrics reporter names to their configurations.",
         )
         parser.add_argument(
             "--metrics-port",
@@ -3776,25 +3776,23 @@ class ServerArgs:
             "--force-deterministic-rsag",
             action="store_true",
             help="NCCL and the rank-ordered fold only: no symmetric-memory "
-            "path -- neither the Triton multicast all-gather/reduce-scatter "
-            "and in-switch all-reduce, nor the trtllm and Triton all-reduce "
-            "tiers, nor the distributed argmax. With --batch-invariant-collectives every "
-            "reduction takes the fold; without it, NCCL. Not folded in by "
-            "--numerics rl-bitwise, which keeps the multicast paths and "
-            "verifies the in-switch reduction at startup.",
+            "path -- neither the Triton multicast all-gather/reduce-scatter, "
+            "nor the trtllm and Triton all-reduce tiers, nor the distributed "
+            "argmax. With --batch-invariant-collectives every reduction takes "
+            "the fold; without it, NCCL. Not folded in by --numerics "
+            "rl-bitwise, whose gathers keep the multicast kernels.",
         )
         parser.add_argument(
             "--batch-invariant-collectives",
             action="store_true",
             help="One association order per reduction, independent of the "
-            "batch. A 2-D bf16 all-reduce on a multicast-reachable group runs "
-            "as the NVLS in-switch reduction issued by one fixed rank, "
-            "verified bitwise at startup; every other reduction (other "
-            "payloads, unreachable groups, the reduce-scatters) runs as NCCL "
-            "data movement plus a fixed-rank-order fp32 fold, which for an "
-            "all-reduce costs world_size times the traffic. NCCL sums are "
-            "run-stable but chunk by message size, so they are not "
-            "batch-size-invariant. Folded in by --numerics rl-bitwise.",
+            "batch: every reduction runs as NCCL data movement plus a "
+            "fixed-rank-order fp32 fold, which for an all-reduce costs "
+            "world_size times the traffic. NCCL sums are run-stable but chunk "
+            "by message size, and the NVLS in-switch reduction's order moves "
+            "with a row's offset in the buffer, so neither is "
+            "batch-invariant. Gathers keep the multicast kernels. Folded in "
+            "by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--numerics",
@@ -4158,6 +4156,11 @@ class PortArgs:
 
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: str | None
+
+    # Plain producer settings; live output resources remain in their owner process.
+    metrics_producer_configs: dict[str, dict[str, object]] = dataclasses.field(
+        default_factory=dict, repr=False
+    )
 
     @staticmethod
     def init_new(server_args: ServerArgs, dp_rank: int | None = None) -> "PortArgs":

@@ -6,6 +6,9 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
+from tokenspeed_kernel.ops.layernorm._triton.gated_rmsnorm import (
+    gated_rmsnorm_kernel,
+)
 from tokenspeed_kernel.ops.quantization.triton import (
     fp8_dequantize_unscaled,
     fp8_quantize_by_multiplier,
@@ -13,6 +16,8 @@ from tokenspeed_kernel.ops.quantization.triton import (
     fp8_token_scale,
 )
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 _FP32_MIN_NORMAL = tl.constexpr(1.1754943508222875e-38)
 
@@ -1417,6 +1422,89 @@ def add_rmsnorm(
     )
 
 
+# Rows each gated RMSNorm program normalizes when one warp covers a row.
+GATED_RMSNORM_ROWS_PER_PROGRAM = 4
+
+
+@register_kernel(
+    "layernorm",
+    "gated_rmsnorm",
+    name="triton_gated_rmsnorm",
+    solution="triton",
+    signatures=format_signatures(
+        "x", "dense", {torch.bfloat16, torch.float16, torch.float32}
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_gated_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    z: torch.Tensor | None,
+    eps: float,
+    group_size: int,
+    norm_before_gate: bool,
+    sigmoid_gate: bool,
+    fp8_scale: torch.Tensor | None,
+    weights_independent: bool,
+) -> torch.Tensor:
+    """Gated RMSNorm over groups of ``group_size`` features; see
+    ``tokenspeed_kernel.ops.layernorm.gated_rmsnorm``."""
+    enable_pdl = pdl_enabled()
+    x_shape_og = x.shape
+    x = x.reshape(-1, x.shape[-1])
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    if z is not None:
+        assert z.shape == x_shape_og
+        z = z.reshape(-1, z.shape[-1])
+        if z.stride(-1) != 1:
+            z = z.contiguous()
+    weights_independent = weights_independent and weight.is_contiguous()
+    weight = weight.contiguous()
+
+    M, N = x.shape
+    assert N % group_size == 0
+    ngroups = N // group_size
+    assert weight.shape in ((N,), (group_size,))
+    out = torch.empty_like(
+        x, dtype=x.dtype if fp8_scale is None else torch.float8_e4m3fn
+    )
+    # Less than 64KB per feature: enqueue fused kernel
+    MAX_FUSED_SIZE = 65536 // x.element_size()
+    BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
+    if group_size > BLOCK_N:
+        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+    # heuristics for number of warps
+    num_warps = min(max(BLOCK_N // 256, 1), 8)
+    block_m = GATED_RMSNORM_ROWS_PER_PROGRAM if num_warps == 1 else 1
+    grid = (triton.cdiv(M, block_m), ngroups)
+    with torch.cuda.device(x.device.index):
+        gated_rmsnorm_kernel[grid](
+            x,
+            out,
+            weight,
+            z,
+            fp8_scale,
+            x.stride(0),
+            out.stride(0),
+            z.stride(0) if z is not None else 0,
+            M,
+            group_size,
+            eps,
+            BLOCK_M=block_m,
+            BLOCK_N=BLOCK_N,
+            NORM_BEFORE_GATE=norm_before_gate,
+            SIGMOID_GATE=sigmoid_gate,
+            num_warps=block_m * num_warps,
+            ENABLE_PDL=enable_pdl,
+            WEIGHTS_INDEPENDENT=weights_independent,
+            OUT_FP8=fp8_scale is not None,
+            SHARED_WEIGHT=weight.shape[0] != N,
+            **({"launch_pdl": True} if enable_pdl else {}),
+        )
+    return out.reshape(x_shape_og)
+
+
 @triton.jit
 def _dequantize_head_half(in_ptrs, scale_ptrs, out_ptrs, token_scale, mask):
     """Store the dequantized (``fp8_dequantize_unscaled``) values of an unscaled
@@ -1659,6 +1747,7 @@ def fused_qk_rmsnorm_rope(
 
 
 __all__ = [
+    "GATED_RMSNORM_ROWS_PER_PROGRAM",
     "UnscaledFP8QKVGate",
     "add_rmsnorm",
     "fused_qk_rmsnorm_rope",
@@ -1667,4 +1756,5 @@ __all__ = [
     "rmsnorm",
     "qk_rmsnorm",
     "rmsnorm_fused_parallel",
+    "triton_gated_rmsnorm",
 ]

@@ -25,15 +25,72 @@ from tokenspeed_kernel._triton import TensorDescriptor, libdevice, tl, triton
 from tokenspeed_kernel.ops.moe._triton.common import (
     _combine,
     _num_programs,
-    _prepare_routed_output,
     _swiglu,
     _swiglu_params,
-    _validate_launch,
     _validate_topk,
 )
 
 
-def _validate_mxfp4_moe(
+@triton.jit
+def _routing_kernel(
+    topk_ids_ptr,
+    expert_route_ids_ptr,
+    expert_counts_ptr,
+    expanded_idx_ptr,
+    num_routes,
+    expert_start,
+    BLOCK_ROUTES: tl.constexpr,
+):
+    expert_id = tl.program_id(0)
+    count = 0
+    num_blocks = tl.cdiv(num_routes, BLOCK_ROUTES)
+    for block_id in range(num_blocks):
+        route_ids = block_id * BLOCK_ROUTES + tl.arange(0, BLOCK_ROUTES)
+        route_mask = route_ids < num_routes
+        selected_experts = tl.load(topk_ids_ptr + route_ids, mask=route_mask, other=-1)
+        matches = route_mask & (selected_experts == expert_start + expert_id)
+        local_rank = tl.cumsum(matches.to(tl.int32), axis=0) - 1
+        tl.store(
+            expert_route_ids_ptr + expert_id * num_routes + count + local_rank,
+            route_ids,
+            mask=matches,
+        )
+        tl.store(expanded_idx_ptr + route_ids, route_ids, mask=matches)
+        count += tl.sum(matches.to(tl.int32), axis=0)
+    tl.store(expert_counts_ptr + expert_id, count)
+
+
+def _routing(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    expert_start: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    topk_ids = topk_ids.to(torch.int32).contiguous()
+    num_routes = topk_ids.numel()
+    expert_route_ids = torch.empty(
+        (num_experts, num_routes), device=topk_ids.device, dtype=torch.int32
+    )
+    expert_counts = torch.empty(num_experts, device=topk_ids.device, dtype=torch.int32)
+    # Deferred consumers use this map to distinguish local routes from routes
+    # owned by another EP rank. Local outputs stay in canonical route order.
+    expanded_idx = torch.full(
+        (num_routes,), -1, device=topk_ids.device, dtype=torch.int32
+    )
+    block_routes = 128 if num_routes <= 128 else 1024
+    _routing_kernel[(num_experts,)](
+        topk_ids,
+        expert_route_ids,
+        expert_counts,
+        expanded_idx,
+        num_routes,
+        expert_start,
+        BLOCK_ROUTES=block_routes,
+        num_warps=4,
+    )
+    return expert_route_ids, expert_counts, expanded_idx
+
+
+def _validate(
     plan: dict,
     x: torch.Tensor,
     w: torch.nn.Module,
@@ -41,8 +98,11 @@ def _validate_mxfp4_moe(
     topk_ids: torch.Tensor | None,
     do_finalize: bool,
     upcast_weights: bool,
-) -> tuple[torch.Tensor, torch.Tensor, str]:
-    _validate_launch(w, topk_weights, topk_ids, do_finalize)
+) -> tuple[torch.Tensor, torch.Tensor, str, int]:
+    if not isinstance(do_finalize, bool):
+        raise TypeError("do_finalize must be a bool")
+    if topk_weights is None or topk_ids is None:
+        raise ValueError("Triton MoE requires precomputed topk weights and ids")
 
     w13 = w.w13_weight
     w13_scale = w.w13_weight_scale
@@ -62,19 +122,36 @@ def _validate_mxfp4_moe(
     if any(t.device != x.device for t in (w13, w13_scale, w2, w2_scale)):
         raise ValueError("x and weights must be on the same device")
 
-    hidden_size = x.shape[1]
-    num_experts, twice_intermediate_size, packed_hidden_size = w13.shape
+    num_tokens, hidden_size = x.shape
+    num_local_experts, twice_intermediate_size, packed_hidden_size = w13.shape
     intermediate_size = twice_intermediate_size // 2
-    if num_experts == 0 or twice_intermediate_size % 2:
+    if num_local_experts == 0 or twice_intermediate_size % 2:
         raise ValueError("MXFP4 MoE requires at least one expert and paired w13 rows")
     if packed_hidden_size * 2 != hidden_size:
         raise ValueError("w13_weight has an incompatible packed shape")
-    if w13_scale.shape != (num_experts, 2 * intermediate_size, hidden_size // 32):
+    if w13_scale.shape != (
+        num_local_experts,
+        2 * intermediate_size,
+        hidden_size // 32,
+    ):
         raise ValueError("w13_weight_scale must have shape [E, 2I, H/32]")
-    if w2.shape != (num_experts, hidden_size, intermediate_size // 2):
+    if w2.shape != (num_local_experts, hidden_size, intermediate_size // 2):
         raise ValueError("w2_weight must have shape [E, H, I/2]")
-    if w2_scale.shape != (num_experts, hidden_size, intermediate_size // 32):
+    if w2_scale.shape != (
+        num_local_experts,
+        hidden_size,
+        intermediate_size // 32,
+    ):
         raise ValueError("w2_weight_scale must have shape [E, H, I/32]")
+
+    ep_size = int(getattr(w, "ep_size", 1))
+    ep_rank = int(getattr(w, "ep_rank", 0))
+    num_experts = int(getattr(w, "num_experts", num_local_experts * ep_size))
+    if ep_size <= 0 or not 0 <= ep_rank < ep_size:
+        raise ValueError("MXFP4 MoE received an invalid expert-parallel rank")
+    if num_local_experts * ep_size != num_experts:
+        raise ValueError("MXFP4 MoE requires equal contiguous expert shards")
+    expert_start = ep_rank * num_local_experts
 
     layout = getattr(w, "w13_input_layout", "concatenated")
     if upcast_weights:
@@ -138,7 +215,7 @@ def _validate_mxfp4_moe(
                 "hidden size must be a multiple of 128 and intermediate size "
                 "a multiple of 64"
             )
-    return topk_weights, topk_ids, activation
+    return topk_weights, topk_ids, activation, expert_start
 
 
 @triton.jit
@@ -609,14 +686,44 @@ def _stage2_kernel(
         problem_start += problem_tiles
 
 
-def _triton_mxfp4_moe_impl(
+def _prepare_routed_output(
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    expert_start: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    expert_route_ids, expert_counts, expanded_idx = _routing(
+        topk_ids,
+        num_experts,
+        expert_start,
+    )
+    # Invalid expert ids are absent from routing; zero their canonical rows.
+    route_output = torch.zeros(
+        (topk_ids.numel(), x.shape[1]), device=x.device, dtype=x.dtype
+    )
+    return (
+        expert_route_ids,
+        expert_counts,
+        expanded_idx,
+        route_output,
+        torch.empty_like(x),
+    )
+
+
+def _moe(
     plan: dict,
     x: torch.Tensor,
     w: torch.nn.Module,
     topk_weights: torch.Tensor | None,
     topk_ids: torch.Tensor | None,
     do_finalize: bool,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, None, torch.Tensor]:
     internal_activation_dtype = plan.get("internal_activation_dtype")
     if internal_activation_dtype == "mxfp4":
         upcast_weights = False
@@ -628,7 +735,7 @@ def _triton_mxfp4_moe_impl(
             "to be 'input' or 'mxfp4'"
         )
 
-    topk_weights, topk_ids, activation = _validate_mxfp4_moe(
+    topk_weights, topk_ids, activation, expert_start = _validate(
         plan, x, w, topk_weights, topk_ids, do_finalize, upcast_weights
     )
     if upcast_weights:
@@ -649,12 +756,22 @@ def _triton_mxfp4_moe_impl(
     intermediate_size = twice_intermediate_size // 2
     top_k = topk_ids.shape[1]
     if num_tokens == 0:
-        return torch.empty_like(x)
+        if do_finalize:
+            return torch.empty_like(x)
+        return (
+            torch.empty((0, hidden_size), device=x.device, dtype=x.dtype),
+            None,
+            torch.empty((0,), device=x.device, dtype=torch.int32),
+        )
 
     route_count = num_tokens * top_k
-    expert_route_ids, expert_counts, route_output, output = _prepare_routed_output(
-        x, topk_ids, num_experts
-    )
+    (
+        expert_route_ids,
+        expert_counts,
+        expanded_idx,
+        route_output,
+        output,
+    ) = _prepare_routed_output(x, topk_ids, num_experts, expert_start)
     block_m = 16 if num_tokens <= 16 else 64
     w13_bias = getattr(w, "w13_weight_bias", None)
     w2_bias = getattr(w, "w2_weight_bias", None)
@@ -788,5 +905,12 @@ def _triton_mxfp4_moe_impl(
         num_stages=3,
         **backend_options,
     )
+    if not do_finalize:
+        return route_output, None, expanded_idx
     _combine(route_output, topk_weights, output)
     return output
+
+
+# ===-----------------------------------------------------------------------===#
+# Kernel Registry
+# ===-----------------------------------------------------------------------===#

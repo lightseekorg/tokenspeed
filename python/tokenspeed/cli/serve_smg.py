@@ -29,6 +29,14 @@ this engine dials in at ``tcp://{--data-parallel-address}:
 {--data-parallel-rpc-port}`` (default ``tcp://127.0.0.1:30500``). Headless
 mode implies ``--zmq-msgpack`` + ``--skip-tokenizer-init`` (see
 ``launch_scheduler_headless``).
+
+Model-family defaults (``_args_with_default_model_parsers``) pick the
+reasoning and tool-call parsers from the model. Muse Spark Open also gets the
+gateway's Symphony parser (``--parser symphony``) and the engine's xgrammar
+backend (``--grammar-backend xgrammar``), so forced tool calls and JSON answers
+work out of the box; an explicit flag always wins, and the xgrammar default
+steps aside when the engine argv selects tree drafting, which rejects every
+non-``none`` grammar backend.
 """
 
 from __future__ import annotations
@@ -75,6 +83,10 @@ INKLING_TOOL_CALL_PARSER = "inkling"
 INKLING_ATTENTION_BACKEND = "fa4"
 KIMI_K3_REASONING_PARSER = "kimi_k3"
 KIMI_K3_TOOL_CALL_PARSER = "kimi_k3"
+MUSE_SPARK_REASONING_PARSER = "muse"
+MUSE_SPARK_TOOL_CALL_PARSER = "muse"
+MUSE_SPARK_GATEWAY_PARSER = "symphony"
+MUSE_SPARK_GRAMMAR_BACKEND = "xgrammar"
 DEFAULT_SMG_LOG_LEVEL = "warn"
 GRPC_MAX_MESSAGE_BYTES_ENV = "TOKENSPEED_GRPC_MAX_MESSAGE_BYTES"
 DEFAULT_GRPC_MAX_MESSAGE_BYTES = "536870912"
@@ -91,6 +103,7 @@ _DEFAULT_SMG_DISABLE_FLAGS = (
     "--disable-circuit-breaker",
     "--disable-retries",
     "--disable-load-monitoring",
+    "--disable-health-check",
 )
 
 
@@ -231,10 +244,12 @@ def _operator_policy(gateway_args: list[str]) -> str | None:
 
 
 def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str]:
-    """Append smg reliability and load-monitoring disable switches when absent.
+    """Append smg reliability and background-monitor disable switches when absent.
 
     ``--policy cache_aware`` keeps load monitoring: its imbalance/overload
     triggers feed on the worker load monitor.
+
+    Health checks are off: ``ts serve`` supervises its one engine, and a generating probe stuck behind a saturated batch would strand healthy requests.
 
     NOTE: ``--dp-aware`` is deliberately NOT auto-injected — rank pinning
     needs smg releases with TokenSpeed dp-affinity support; bump the
@@ -516,6 +531,38 @@ def _is_kimi_k3_model(model_id: str | None) -> bool:
     )
 
 
+def _is_muse_spark_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+    normalized = model_id.lower().replace("_", "-").rstrip("/")
+    if "muse-spark" in normalized or "musespark" in normalized.replace("-", ""):
+        return True
+    config = _load_model_config(model_id)
+    architectures = config.get("architectures") or []
+    return config.get("model_type") == "muse_spark" or (
+        "MuseSparkForConditionalGeneration" in architectures
+    )
+
+
+def _args_select_tree_drafting(engine_args: list[str]) -> bool:
+    """Whether the engine argv drafts a tree (``--speculative-eagle-topk`` != 1).
+
+    Tree drafting rejects every non-``none`` grammar backend at startup
+    (``ServerArgs._validate_tree_speculation``), so an injected grammar-backend
+    default must step aside for it. A chain draft (the default topk of 1)
+    accepts structured output and keeps the default. A non-integer topk fails
+    ``ServerArgs`` parsing either way; treating it as tree drafting only
+    decides which error the operator sees first.
+    """
+    topk = _get_from_args(engine_args, "--speculative-eagle-topk")
+    if topk is None:
+        return False
+    try:
+        return int(topk) != 1
+    except ValueError:
+        return True
+
+
 def _args_with_default_model_parsers(
     engine_args: list[str], gateway_args: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -524,6 +571,17 @@ def _args_with_default_model_parsers(
     Reasoning parser defaults must be visible to both processes: smg extracts
     reasoning_content after generation, while the engine uses the same parser
     name to defer json_schema grammars past the reasoning channel.
+
+    Muse Spark Open needs two more defaults. smg reads its ``muse`` parser
+    table only under the Symphony parser, so the gateway gets ``--parser
+    symphony``. Symphony constrains forced tool calls and JSON answers with
+    xgrammar structural tags, which the engine's default grammar backend
+    (``none``) rejects, so the engine gets ``--grammar-backend xgrammar``. As
+    with the parser names, an explicit operator flag wins. The xgrammar
+    default also steps aside when the engine argv selects tree drafting
+    (``--speculative-eagle-topk`` != 1), which rejects every non-``none``
+    grammar backend at startup; the launch keeps the pre-default ``none``
+    behavior instead of failing on a flag the operator never passed.
     """
     model_id = _get_from_args(gateway_args, "--model") or _get_from_args(
         engine_args, "--model"
@@ -531,7 +589,23 @@ def _args_with_default_model_parsers(
     engine_result = list(engine_args)
     gateway_result = list(gateway_args)
 
-    if _is_deepseek_v41_model(model_id):
+    if _is_muse_spark_model(model_id):
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", MUSE_SPARK_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", MUSE_SPARK_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", MUSE_SPARK_TOOL_CALL_PARSER])
+        if "--parser" not in gateway_result:
+            gateway_result.extend(["--parser", MUSE_SPARK_GATEWAY_PARSER])
+        if "--grammar-backend" not in engine_result and not _args_select_tree_drafting(
+            engine_result
+        ):
+            engine_result.extend(["--grammar-backend", MUSE_SPARK_GRAMMAR_BACKEND])
+
+    elif _is_deepseek_v41_model(model_id):
         if (
             "--reasoning-parser" not in engine_result
             and "--reasoning-parser" not in gateway_result
@@ -657,17 +731,26 @@ def _add_rl_control_port(engine_args: list[str]) -> tuple[list[str], str]:
 
 
 def _add_metrics_port(engine_args: list[str]) -> tuple[list[str], str | None]:
-    """Wire the engine's Prometheus /metrics port when metrics are enabled.
+    """Wire the engine's /metrics port when Prometheus reporting is enabled.
 
-    With ``--enable-metrics`` the engine serves /metrics from its main process
-    (see ``ServerArgs.metrics_port``). Pin a stable port — like
+    With ``--enable-metrics`` and the Prometheus reporter (the default), the
+    engine serves /metrics from its main process (see ``ServerArgs.metrics_port``).
+    Pin a stable port — like
     ``--rl-control-port`` — so the scrape target survives engine restarts and
     can be printed at startup. An operator-pinned ``--metrics-port`` is
     preserved untouched; ``--metrics-port 0`` means auto-allocate, matching
     the engine-side treatment of an unset port. Returns the scrape URL, or
-    None when metrics are off.
+    None when Prometheus reporting is off.
     """
-    if "--enable-metrics" not in engine_args:
+    reporters = []
+    for index, arg in enumerate(engine_args):
+        if arg == "--metrics-reporters" and index + 1 < len(engine_args):
+            reporters.append(engine_args[index + 1])
+        elif arg.startswith("--metrics-reporters="):
+            reporters.append(arg.split("=", 1)[1])
+    if "--enable-metrics" not in engine_args or (
+        reporters and "prometheus" not in reporters
+    ):
         return engine_args, None
     host = _get_from_args(engine_args, "--metrics-host", "127.0.0.1")
     pinned = _get_from_args(engine_args, "--metrics-port")
@@ -811,7 +894,7 @@ async def run_smg(
         # before spawn_engine.
         engine_args, rl_control_url = _add_rl_control_port(engine_args)
 
-        # Wire the engine metrics port (only with --enable-metrics).
+        # Wire the engine metrics port when Prometheus reporting is enabled.
         engine_args, metrics_url = _add_metrics_port(engine_args)
 
         engine = await spawn_engine(engine_args, host="127.0.0.1", port=engine_port)
@@ -848,8 +931,14 @@ async def run_smg(
         sys.stdout.write(f"ts serve ready on http://{user_host}:{user_port}\n")
         sys.stdout.flush()
 
+        # Drawn like the metrics port rather than defaulting to user_port + 1:
+        # that is the next instance's gateway port when several ts serve
+        # instances share a host on consecutive ports, so the first to bind
+        # it broke the other's gateway.
         control_port = (
-            opts.control_port if opts.control_port is not None else user_port + 1
+            opts.control_port
+            if opts.control_port is not None
+            else _free_port_avoiding_ephemeral_range()
         )
         control_ok = await _start_control_server(
             gateway_url=f"http://{user_host}:{user_port}",

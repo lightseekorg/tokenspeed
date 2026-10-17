@@ -43,6 +43,8 @@ from collections.abc import AsyncIterator, Iterator
 
 from tokenspeed.runtime.engine.async_llm import AsyncLLM
 from tokenspeed.runtime.engine.llm import LLM
+from tokenspeed.runtime.metrics.config import metrics_enabled
+from tokenspeed.runtime.metrics.service import metrics_service
 
 
 def _ignore_threading_atexit(*args, **kwargs) -> None:
@@ -133,6 +135,7 @@ class Engine(EngineBase):
                 kwargs["log_level"] = "error"
             server_args = ServerArgs(**kwargs)
 
+        self.server_args = server_args
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
@@ -141,11 +144,14 @@ class Engine(EngineBase):
         logger.info(f"server_args={server_args!r}")
 
         # Launch subprocesses
-        tokenizer_manager, _, scheduler_info = _launch_subprocesses(
-            server_args=server_args,
-            port_args=self.port_args,
-        )
-        self.server_args = server_args
+        try:
+            tokenizer_manager, _, scheduler_info = _launch_subprocesses(
+                server_args=server_args,
+                port_args=self.port_args,
+            )
+        except BaseException:
+            self.shutdown()
+            raise
         self.tokenizer_manager = tokenizer_manager
         self.scheduler_info = scheduler_info
 
@@ -292,6 +298,7 @@ class Engine(EngineBase):
             logger.exception("Failed to close the disaggregation bootstrap server")
         finally:
             kill_process_tree(os.getpid(), include_parent=False)
+            metrics_service.close(timeout=2.0)
 
     def __enter__(self):
         return self
@@ -590,7 +597,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     _set_socket_interface(server_args)
 
     # Set prometheus env vars
-    if server_args.enable_metrics:
+    if metrics_enabled(server_args, "prometheus"):
         set_prometheus_multiproc_dir()
 
     # Set ulimit
@@ -629,6 +636,7 @@ def _launch_subprocesses(
     # Configure global environment
     configure_logger(server_args)
     _set_envs_and_config(server_args)
+    metrics_service.prepare(server_args)
 
     # Allocate ports for inter-process communications
     if port_args is None:
@@ -639,6 +647,8 @@ def _launch_subprocesses(
     server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
         server_args.model, server_args.tokenizer
     )
+
+    metrics_service.start(server_args, port_args)
 
     scheduler_procs = []
     if not server_args.mapping.attn.has_dp:
@@ -686,7 +696,9 @@ def _launch_subprocesses(
             return None, None, None
 
         launch_dummy_health_check_server(
-            server_args.host, server_args.port, server_args.enable_metrics
+            server_args.host,
+            server_args.port,
+            metrics_enabled(server_args, "prometheus"),
         )
 
         for proc in scheduler_procs:
@@ -750,19 +762,6 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
 
     configure_logger(server_args)
     _set_envs_and_config(server_args)
-    # Headless runs no dummy health-check server on any node, so every node
-    # serves its own /metrics here.
-    launch_metrics_server(server_args)
-
-    # PortArgs is still derived (nccl_port drives torch.distributed); the pickle
-    # scheduler_input/tokenizer IPC names it carries are unused in msgpack mode.
-    port_args = PortArgs.init_new(server_args)
-    logger.info(f"headless server_args={server_args!r}")
-
-    server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
-        server_args.model, server_args.tokenizer
-    )
-
     scheduler_procs: list[mp.Process] = []
     scheduler_pipe_readers = []
 
@@ -781,38 +780,51 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
             if proc.is_alive():
                 proc.terminate()
 
-    # Install before spawning so a signal in the launch window is not lost;
-    # an unhandled SIGUSR1 would kill this supervisor without cleanup.
-    signal.signal(signal.SIGTERM, _terminate_schedulers)
-    signal.signal(signal.SIGINT, _terminate_schedulers)
-    signal.signal(signal.SIGUSR1, _terminate_schedulers)
-
-    if not server_args.mapping.attn.has_dp:
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
-        )
-        for rank in _scheduler_ranks(server_args):
-            rank_server_args = copy.copy(server_args)
-            rank_server_args.mapping = copy.deepcopy(server_args.mapping)
-            rank_server_args.mapping.rank = rank
-
-            proc, reader = start_process_with_ready_pipe(
-                run_event_loop,
-                (rank_server_args, port_args),
-                memory_saver_adapter.configure_subprocess(),
-            )
-            scheduler_procs.append(proc)
-            scheduler_pipe_readers.append(reader)
-    else:
-        proc, reader = start_process_with_ready_pipe(
-            run_data_parallel_controller_process,
-            (server_args, port_args),
-            contextlib.nullcontext(),
-        )
-        scheduler_pipe_readers.append(reader)
-        scheduler_procs.append(proc)
-
     try:
+        metrics_service.prepare(server_args)
+        # Headless runs no dummy health-check server on any node, so every node
+        # serves its own /metrics here.
+        launch_metrics_server(server_args)
+
+        # PortArgs is still derived (nccl_port drives torch.distributed); the
+        # pickle scheduler_input/tokenizer IPC names are unused in msgpack mode.
+        port_args = PortArgs.init_new(server_args)
+        logger.info(f"headless server_args={server_args!r}")
+        server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
+            server_args.model, server_args.tokenizer
+        )
+
+        # Install before spawning so a signal in the launch window is not lost;
+        # an unhandled SIGUSR1 would kill this supervisor without cleanup.
+        signal.signal(signal.SIGTERM, _terminate_schedulers)
+        signal.signal(signal.SIGINT, _terminate_schedulers)
+        signal.signal(signal.SIGUSR1, _terminate_schedulers)
+
+        metrics_service.start(server_args, port_args)
+        if not server_args.mapping.attn.has_dp:
+            memory_saver_adapter = TorchMemorySaverAdapter.create(
+                enable=server_args.enable_memory_saver
+            )
+            for rank in _scheduler_ranks(server_args):
+                rank_server_args = copy.copy(server_args)
+                rank_server_args.mapping = copy.deepcopy(server_args.mapping)
+                rank_server_args.mapping.rank = rank
+
+                proc, reader = start_process_with_ready_pipe(
+                    run_event_loop,
+                    (rank_server_args, port_args),
+                    memory_saver_adapter.configure_subprocess(),
+                )
+                scheduler_procs.append(proc)
+                scheduler_pipe_readers.append(reader)
+        else:
+            proc, reader = start_process_with_ready_pipe(
+                run_data_parallel_controller_process,
+                (server_args, port_args),
+                contextlib.nullcontext(),
+            )
+            scheduler_pipe_readers.append(reader)
+            scheduler_procs.append(proc)
         for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):
             if data.get("status") != "ready":
                 raise RuntimeError(
@@ -854,7 +866,9 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
         _terminate_schedulers()
         for proc in scheduler_procs:
             proc.join(timeout=5)
-        kill_process_tree(os.getpid(), include_parent=False)
+        if scheduler_procs:
+            kill_process_tree(os.getpid(), include_parent=False)
+        metrics_service.close(timeout=2.0)
 
 
 def run_scheduler_headless_from_cli(argv: list[str] | None = None) -> None:

@@ -1300,6 +1300,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
         "NemotronH_Nano_Omni_Reasoning_V3",
+        "MuseSparkForConditionalGeneration",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
 
@@ -1319,6 +1320,7 @@ def is_audio_model(model_architectures: list[str] | None):
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",
         "NemotronH_Nano_Omni_Reasoning_V3",
+        "MuseSparkForConditionalGeneration",
     }
     return any(arch in audio_architectures for arch in model_architectures or [])
 

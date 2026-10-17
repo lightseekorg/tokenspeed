@@ -18,18 +18,42 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Triton convolution kernel entry points."""
+import os
+import sys
+from types import SimpleNamespace
 
-from tokenspeed_kernel.ops.conv.triton.grouped import dflash2_grouped_conv
-from tokenspeed_kernel.ops.conv.triton.sconv import (
-    _inkling_ring_sconv_decode_kernel,
-    _inkling_ring_sconv_prefill_kernel,
-    select_prefill_config,
+import pytest
+
+from tokenspeed.runtime.utils.hf_transformers_utils import reconcile_special_tokens
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
+
+
+@pytest.mark.parametrize(
+    "added_vocab,stop_ids",
+    [
+        (
+            {"<|eom_id|>": 128_009, "<|eom|>": 200_007, "<|eot|>": 200_008},
+            {128_009, 200_008},
+        ),
+        ({"<|eom|>": 200_007}, None),
+    ],
 )
+def test_reconcile_special_tokens_stops_on_eot_but_not_eom(
+    added_vocab, stop_ids
+) -> None:
+    """<|eom|> ends a channel, not the turn, so only turn-final markers stop."""
+    tokenizer = SimpleNamespace(
+        added_tokens_decoder=None,
+        additional_stop_token_ids=None,
+        get_added_vocab=lambda: added_vocab,
+    )
+    reconcile_special_tokens(tokenizer)
+    assert tokenizer.additional_stop_token_ids == stop_ids
 
-__all__ = [
-    "_inkling_ring_sconv_decode_kernel",
-    "_inkling_ring_sconv_prefill_kernel",
-    "dflash2_grouped_conv",
-    "select_prefill_config",
-]
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

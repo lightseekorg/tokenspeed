@@ -188,7 +188,8 @@ def test_mxfp4_moe_sorting_route_count():
                 128,
                 torch.bfloat16,
                 block,
-                compact_route_programs=False,
+                use_minimum_route_chunks=False,
+                runtime_rows=False,
             )
         )
         assert int(valid[1]) == tokens

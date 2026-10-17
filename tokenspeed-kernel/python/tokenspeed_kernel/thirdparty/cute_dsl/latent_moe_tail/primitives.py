@@ -539,6 +539,17 @@ def fragment_is_dirty(packed, sentinel: cutlass.Constexpr[int]):
 
 
 @cute.jit
+def fragment_halves_dirty(packed, sentinel: cutlass.Constexpr[int]):
+    """Sentinel check per 16-bit half, for a sentinel whose two halves match."""
+    half = Uint32(sentinel & 0xFFFF)
+    dirty = ((packed[0] & Uint32(0xFFFF)) == half) | ((packed[0] >> Uint32(16)) == half)
+    for i in cutlass.range_constexpr(1, 4):
+        dirty = dirty | ((packed[i] & Uint32(0xFFFF)) == half)
+        dirty = dirty | ((packed[i] >> Uint32(16)) == half)
+    return dirty
+
+
+@cute.jit
 def warp_sum_specialized(
     value: Float32,
     warp_idx: Int32,

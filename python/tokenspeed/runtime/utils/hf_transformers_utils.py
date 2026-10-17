@@ -54,6 +54,7 @@ from tokenspeed.runtime.configs import (
     KimiK3DSparkConfig,
     KimiK25Config,
     MiniMaxM3Config,
+    MuseSparkConfig,
     Qwen2Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
@@ -69,9 +70,11 @@ from tokenspeed.runtime.configs.dots3_note_config import Dots3NoteConfig
 from tokenspeed.runtime.configs.glm53_flash_config import Glm53FlashConfig
 from tokenspeed.runtime.configs.nemotron_h_config import NemotronHConfig
 from tokenspeed.runtime.configs.nemotron_omni_config import NemotronHOmniConfig
+from tokenspeed.runtime.hf_hub_retry import call_with_hf_rate_limit_retry
 from tokenspeed.runtime.utils import lru_cache_frozenset
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
+_TURN_FINAL_STOP_TOKEN_TEXTS = ("<|eom_id|>", "<|eot|>")
 logger = logging.getLogger(__name__)
 
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
@@ -99,6 +102,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     Glm53FlashConfig.model_type: Glm53FlashConfig,
     NemotronHConfig.model_type: NemotronHConfig,
     NemotronHOmniConfig.model_type: NemotronHOmniConfig,
+    MuseSparkConfig.model_type: MuseSparkConfig,
     "glm5_next": Glm53FlashConfig,
 }
 
@@ -369,11 +373,17 @@ def get_config(
     if is_remote_model:
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
-        with get_lock(model):
-            model_path = snapshot_download(
+        def download_metadata() -> str:
+            return snapshot_download(
                 model,
                 revision=revision,
                 ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+            )
+
+        with get_lock(model):
+            model_path = call_with_hf_rate_limit_retry(
+                f"downloading metadata of {model}",
+                download_metadata,
             )
             raw_config = load_raw_config(model_path)
 
@@ -390,11 +400,24 @@ def get_config(
                     # into transformers_modules. Remote code must not call
                     # get_config/get_tokenizer recursively for this repo: the
                     # host-local FileLock is intentionally non-reentrant.
-                    config = AutoConfig.from_pretrained(
-                        model,
-                        trust_remote_code=True,
-                        revision=snapshot_revision,
-                        **kwargs,
+                    def load_remote_code_config():
+                        return AutoConfig.from_pretrained(
+                            model,
+                            trust_remote_code=True,
+                            revision=snapshot_revision,
+                            **kwargs,
+                        )
+
+                    # Guard, not retry coverage: Transformers converts hub
+                    # HTTP errors into OSError inside from_pretrained, which
+                    # call_with_hf_rate_limit_retry does not catch. The real
+                    # protection is the snapshot_revision pin: the retried
+                    # snapshot_download above already cached every non-weight
+                    # file, so the remote-code load resolves from the local
+                    # cache without new hub requests.
+                    config = call_with_hf_rate_limit_retry(
+                        f"loading remote-code config of {model}",
+                        load_remote_code_config,
                     )
                 else:
                     logger.warning(
@@ -552,11 +575,17 @@ def get_generation_config(
         if not os.path.isdir(model):
             from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
-            with get_lock(model):
-                model_path = snapshot_download(
+            def download_generation_config() -> str:
+                return snapshot_download(
                     model,
                     revision=revision,
                     ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                )
+
+            with get_lock(model):
+                model_path = call_with_hf_rate_limit_retry(
+                    f"downloading generation config of {model}",
+                    download_generation_config,
                 )
         return GenerationConfig.from_pretrained(
             model_path, trust_remote_code=trust_remote_code, **kwargs
@@ -912,15 +941,28 @@ def get_tokenizer(
     if not os.path.isdir(tokenizer_name):
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
-        with get_lock(tokenizer_name):
-            tokenizer_path = snapshot_download(
+        def download_tokenizer_files() -> str:
+            return snapshot_download(
                 tokenizer_name,
                 revision=tokenizer_revision,
                 ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
             )
+
+        with get_lock(tokenizer_name):
+            tokenizer_path = call_with_hf_rate_limit_retry(
+                f"downloading tokenizer files of {tokenizer_name}",
+                download_tokenizer_files,
+            )
             snapshot_revision = _snapshot_commit_hash(tokenizer_path)
             if trust_remote_code and snapshot_revision is not None:
-                tokenizer = load_tokenizer(tokenizer_name, snapshot_revision)
+                # Same guard as the remote-code config load in get_config:
+                # hub errors inside the reload surface as OSError and are not
+                # retried; the snapshot_revision pin makes the reload resolve
+                # from the local cache filled (and 429-retried) above.
+                tokenizer = call_with_hf_rate_limit_retry(
+                    f"loading remote-code tokenizer of {tokenizer_name}",
+                    lambda: load_tokenizer(tokenizer_name, snapshot_revision),
+                )
             elif trust_remote_code:
                 logger.warning(
                     "Cannot derive an immutable Hugging Face commit from "
@@ -960,9 +1002,11 @@ def reconcile_special_tokens(tokenizer):
                 replace_extra_special_tokens=False,
             )
 
-    # Special handling for stop token <|eom_id|> generated by llama 3 tool use.
+    # Turn-final markers resolve by name; Muse's <|eom|> only ends a channel, not the turn.
     added_vocab = tokenizer.get_added_vocab()
-    if "<|eom_id|>" in added_vocab:
-        tokenizer.additional_stop_token_ids = {added_vocab["<|eom_id|>"]}
-    else:
-        tokenizer.additional_stop_token_ids = None
+    stop_ids = {
+        added_vocab[token]
+        for token in _TURN_FINAL_STOP_TOKEN_TEXTS
+        if token in added_vocab
+    }
+    tokenizer.additional_stop_token_ids = stop_ids or None

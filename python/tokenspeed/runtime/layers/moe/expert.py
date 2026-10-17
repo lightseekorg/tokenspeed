@@ -616,6 +616,10 @@ class MoELayer(torch.nn.Module):
         return self.plan["supports_deferred_finalize"]
 
     @property
+    def supports_prequantized_input(self) -> bool:
+        return self.plan["supports_prequantized_input"]
+
+    @property
     def supports_all_to_all_ep(self) -> bool:
         """Whether the kernel owns all-to-all dispatch, so each rank routes only
         its own tokens. Otherwise every rank routes every token and an expert
@@ -634,13 +638,16 @@ class MoELayer(torch.nn.Module):
         shared_input: torch.Tensor | None = None,
         shared_weight: torch.Tensor | None = None,
         shared_out: torch.Tensor | None = None,
+        x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
+        routing_prepared: object | None = None,
     ):
         """Run the planned MoE kernel over this layer's weights.
 
         Args:
             hidden_states: ``[tokens, hidden]`` local hidden states, or a
-                ``(packed_nvfp4, block_scales)`` pair for kernels accepting
-                prequantized input. Block scales use linear per-token layout.
+                ``(packed_fp4, block_scales)`` pair for kernels accepting
+                prequantized input. NVFP4 scales use linear per-token layout;
+                gfx950 MXFP4 scales use the CDNA4 swizzle.
             topk_output: Routing result, or the raw logits when the kernel
                 routes itself.
             num_global_tokens: Token count summed over the attention DP ranks.
@@ -652,6 +659,13 @@ class MoELayer(torch.nn.Module):
                 ``moe.utils.use_deepep_low_latency``.
             overlap_fn: Optional work to run inside an all-to-all EP dispatch
                 window; ignored by plans that own no dispatch legs.
+            x_quantized: ``hidden_states`` already quantized in the kernel's
+                activation format (for NVFP4: packed E2M1 rows and linear E4M3
+                block scales); the kernel then skips its own quantize.
+                Only kernels advertising the format accept it.
+            routing_prepared: Routing metadata already populated from the
+                precomputed top-k, so the kernel skips its routing launch.
+                Only kernels advertising prepared routing accept it.
         """
         if not do_finalize and not self.supports_deferred_finalize:
             raise AssertionError("MoELayer does not support do_finalize=False")
@@ -694,6 +708,8 @@ class MoELayer(torch.nn.Module):
                 low_latency=low_latency,
                 overlap_fn=overlap_fn,
                 **shared_kwargs,
+                x_quantized=x_quantized,
+                routing_prepared=routing_prepared,
             )
             output_scale = topk_output.output_scale
             if isinstance(output_scale, torch.Tensor):
@@ -718,4 +734,6 @@ class MoELayer(torch.nn.Module):
             low_latency=low_latency,
             overlap_fn=overlap_fn,
             **shared_kwargs,
+            x_quantized=x_quantized,
+            routing_prepared=routing_prepared,
         )

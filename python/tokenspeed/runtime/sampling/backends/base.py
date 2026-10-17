@@ -27,7 +27,9 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.distributed.comm_backend import get_global_backend
 from tokenspeed.runtime.execution.slot_state import (
     PREPARED_MARKER_BYTES,
     pack_slot_rows,
@@ -346,11 +348,7 @@ class SamplingBackend(ABC):
         including stale rows past the live batch. No-op when sync is off or
         tp_size <= 1. Graph-safe.
         """
-        if self._tp_pg is None:
-            return
-        dist.broadcast(
-            self._output_pack_buf, src=self._tp_src_global_rank, group=self._tp_pg
-        )
+        self.maybe_broadcast(self._output_pack_buf)
 
     def accepted_path(self, bs: int, num_nodes: int) -> torch.Tensor:
         """``[bs, N]`` accepted path (root first, ``-1`` past it) of the last
@@ -392,6 +390,14 @@ class SamplingBackend(ABC):
         if self._tp_pg is None:
             return
         for t in tensors:
+            if (
+                current_platform().is_cdna4
+                and self.config.tp_group is not None
+                and get_global_backend().broadcast_from_first_rank(
+                    t, self.config.tp_group
+                )
+            ):
+                continue
             dist.broadcast(t, src=self._tp_src_global_rank, group=self._tp_pg)
 
     def prepare_step(

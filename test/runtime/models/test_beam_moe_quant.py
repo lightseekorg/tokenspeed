@@ -834,7 +834,12 @@ def test_nvfp4_expert_tensors_load_unchanged(server):
     assert model.load_weights(list(tensors.items())) == tensors.keys()
     experts = model.model.layers[1].mlp.experts
     _assert_experts_hold(experts, tensors)
-    assert experts.w13_input_scale.item() == experts.w2_input_scale.item() == 0.5
+    assert experts.w13_input_scale.item() == 0.5
+    # w2's input scale is stored per expert; scalar-per-expert loads accumulate
+    # the running layer maximum into every slot.
+    assert torch.equal(
+        experts.w2_input_scale, torch.full_like(experts.w2_input_scale, 0.5)
+    )
     # Every other tensor is the BF16 checkpoint's.
     reference.load_weights([(n, t) for n, t in tiny_weights(tiny_config()).items()])
     expected = dict(reference.named_parameters())
@@ -896,9 +901,9 @@ def test_an_input_scale_of_zero_loads_beside_others(server):
     model = _model(NVFP4)
     model.load_weights(list(tensors.items()))
     experts = model.model.layers[1].mlp.experts
-    assert (experts.w13_input_scale.item(), experts.w2_input_scale.item()) == (
-        0.75,
-        0.5,
+    assert experts.w13_input_scale.item() == 0.75
+    assert torch.equal(
+        experts.w2_input_scale, torch.full_like(experts.w2_input_scale, 0.5)
     )
 
 
