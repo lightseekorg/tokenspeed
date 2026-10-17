@@ -246,7 +246,6 @@ def test_qsa_indexer_public_ops_match_portable_solution() -> None:
     portable.masked_fill_(~valid, float("nan"))
     select_kwargs = dict(
         lengths=complete,
-        persistent_workspace=None,
         enable_pdl=False,
     )
     ids = qsa_block_topk_select(

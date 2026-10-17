@@ -139,7 +139,6 @@ def _qsa(rows, solution):
             queries_per_request=1,
             max_partial_bytes=32 * 1024 * 1024,
             algorithm=solution,
-            persistent_topk_workspace=None,
             enable_pdl=pdl_enabled(),
         )
         slots = qwen4_exp_qsa_selected_slots(

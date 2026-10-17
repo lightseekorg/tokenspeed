@@ -25,20 +25,19 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel._triton import max_active_ctas, tl, triton
-from tokenspeed_kernel.ops.attention.dsa.cuda import (
-    has_ragged_decode_topk,
-    ragged_decode_topk,
-)
+from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsa.triton import (
     triton_topk_from_logits,
 )
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.platform import (
+    CapabilityRequirement,
+    current_platform,
+    max_active_ctas,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _is_nvidia = current_platform().is_nvidia
-_PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
 _SCORE_MAX_WAVES = 3
 LOG2E = math.log2(math.e)
 
@@ -1613,9 +1612,7 @@ def _qwen4_exp_qsa_merge_chunk_kernel(
     )
 
 
-@triton.jit(
-    do_not_specialize=["num_blocks", "num_query_groups", "stride_pt_b", "stride_l_n"]
-)
+@triton.jit(do_not_specialize=["num_query_groups"])
 def _qwen4_exp_qsa_score_blocks_kernel(
     query,
     key_cache,
@@ -1956,40 +1953,9 @@ def triton_qsa_block_topk_select(
     topk: int,
     *,
     lengths: torch.Tensor,
-    persistent_workspace: torch.Tensor | None,
     enable_pdl: bool,
 ) -> torch.Tensor:
-    """Portable QSA block top-k selection; see ``qsa_block_topk_select``.
-
-    On NVIDIA, a valid caller-owned workspace routes selection through the
-    length-aware persistent CUDA radix kernel; ``lengths`` keeps it from
-    rescanning graph-padded columns. Otherwise the Triton top-k runs.
-    """
-
-    if (
-        _is_nvidia
-        and persistent_workspace is not None
-        and topk in (512, 1024, 2048)
-        and persistent_workspace.is_cuda
-        and persistent_workspace.device == logits.device
-        and persistent_workspace.dtype == torch.uint8
-        and persistent_workspace.numel() >= _PERSISTENT_TOPK_WORKSPACE_BYTES
-        and has_ragged_decode_topk()
-    ):
-        selected = torch.empty(
-            (logits.shape[0], topk), dtype=torch.int32, device=logits.device
-        )
-        ragged_decode_topk(
-            logits,
-            selected,
-            topk,
-            lengths=lengths,
-            workspace=persistent_workspace,
-            max_seq_len=logits.shape[1],
-            q_len_per_req=1,
-            enable_pdl=_is_nvidia and enable_pdl,
-        )
-        return selected
+    """Length-aware Triton selection; see ``qsa_block_topk_select``."""
     return triton_topk_from_logits(
         logits, topk, seq_lens=lengths, enable_pdl=_is_nvidia and enable_pdl
     )

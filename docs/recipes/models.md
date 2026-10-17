@@ -561,13 +561,10 @@ Install `ffmpeg` before serving multimodal requests:
 apt-get update && apt-get install -y ffmpeg
 ```
 
-On MI350X, use tensor parallel size 4 with expert parallelism disabled for the
-BF16 or block-FP8 checkpoints. The block-FP8 path retains compact expert
-weights for its decode-specialized Gluon kernel and materializes BF16 expert
-copies once at load time for prefill.
-
 On platforms without DeepGEMM, four-stream mHC uses a portable Triton path and
 switches to its tiled prefill projection above 256 tokens.
+
+### NVIDIA
 
 ```bash
 ts serve zai-org/GLM-5.3-Flash \
@@ -580,6 +577,28 @@ ts serve zai-org/GLM-5.3-Flash \
   --speculative-algorithm MTP \
   --speculative-num-steps 2 \
   --speculative-num-draft-tokens 3
+```
+
+### AMD
+
+On MI350X/MI355X (gfx950), use tensor parallel size 4 with expert parallelism
+disabled for the BF16 or block-FP8 checkpoints. The block-FP8 path retains
+compact expert weights for its decode-specialized Gluon kernel and
+materializes BF16 expert copies once at load time for prefill. Pass
+`--sampling-backend triton`: without it AMD defaults to greedy sampling, which
+ignores per-request `temperature`, `top_p` and `top_k`.
+
+```bash
+ts serve \
+  --model zai-org/GLM-5.3-Flash \
+  --trust-remote-code \
+  --attn-tp-size 4 \
+  --ep-size 1 \
+  --sampling-backend triton \
+  --speculative-algorithm MTP \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4
 ```
 
 ## Qwen3 Dense / Qwen3 30B-A3B
@@ -1144,14 +1163,19 @@ token id. A five-token block is therefore six kernels and five all-gathers
 instead of a per-step chain of masked embedding lookups, GEMMs, reductions and
 two all-gathers.
 
-Engram's per-step inputs follow the same pattern. Before each forward, one
-pinned upload carries every request's history snapshot, and two launches
-(`fill_ngram_history`) seed the per-slot accepted prefixes and write every
-input row's previous-three tokens and validity mask, blanking the graph
-padding rows. Inside the forward, `engram_hash` maps the current token and its
-three predecessors, applies the per-layer multipliers, rolling XOR and prime
-buckets, and emits the table rows for all Engram layers in one launch. Its
-output is bit-identical to the eager reference, which remains the CPU path.
+Before each forward, one pinned upload carries every request's Engram history
+snapshot. `prepare_ngram_inputs` resolves the previous-three tokens and validity
+mask, clears padding, and computes table rows for all Engram layers in one
+launch. The model consumes these prepared hashes through stable input buffers.
+Preparation leaves accepted request state unchanged; after sampling,
+`commit_ngram_inputs` advances accepted history and cache lengths together in
+a second launch. Hashes are bit-identical to the eager reference, which remains
+the CPU path. Per-batch token and request counts stay runtime kernel arguments;
+only bounded tile sizes and fixed model/pool geometry specialize compilation.
+Both kernels are checked against the default per-thread stack budget, so first
+use does not reserve extra spill memory on every SM. Retraction snapshots carry
+the accepted frontier; the first restored decode reseeds Engram history from
+its token snapshot, and commits it only after verification.
 
 The CUDA draft path also preserves the checkpoint's UE8M0-scaled FP8 activation
 round-trip with a fused `tokenspeed-kernel` operation. It computes the same
@@ -1172,6 +1196,11 @@ then check completion, speculative acceptance, and cache-hit metrics with fixed
 prompts and package/model revisions.
 
 ## DeepSeek V4.1-Flash
+
+The B200 and AMD GSM8K CI jobs, the GB300 Slurm 1P1D GSM8K job, and the
+manual 1P1D smoke test use `deepseek-ai/DeepSeek-V4.1-Flash-1017`.
+The 1P1D CI tasks set `MODEL` explicitly so both serving roles and the
+evaluation client select the same checkpoint.
 
 DeepSeek V4.1 (`deepseek_v41`) runs on its own FlatKV attention backend
 with a four-group KV cache: the global KV chains, the SWA rows and the
