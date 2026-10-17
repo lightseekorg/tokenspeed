@@ -49,6 +49,7 @@ from collections.abc import Iterable, Iterator
 from typing import Any
 
 import torch
+from typing_extensions import override
 
 from tokenspeed.runtime.layers.quantization.base_config import (
     QuantizationConfig,
@@ -318,6 +319,7 @@ class ModelOptMixedConfig(QuantizationConfig):
 
         return None
 
+    @override
     def quantizes_any(self, prefix: str) -> bool:
         return any(name.startswith(prefix) for name in self.quantized_layers)
 
