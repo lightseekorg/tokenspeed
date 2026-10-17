@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
+_T = TypeVar("_T")
 
 # Anonymous Hugging Face API access is bucketed per egress IP (a few hundred
 # requests per five-minute window). Data/expert-parallel startup fans out one
@@ -54,7 +54,7 @@ HF_RATE_LIMIT_BASE_DELAY_S = 5.0
 HF_RATE_LIMIT_MAX_DELAY_S = 300.0
 
 
-def call_with_hf_rate_limit_retry(description: str, call: Callable[[], T]) -> T:
+def call_with_hf_rate_limit_retry(description: str, call: Callable[[], _T]) -> _T:
     """Run ``call``, retrying Hugging Face Hub 429 rate limits.
 
     The hub answers an exhausted rate-limit window with 429 and usually a
@@ -67,10 +67,10 @@ def call_with_hf_rate_limit_retry(description: str, call: Callable[[], T]) -> T:
     Args:
         description (str): What ``call`` is doing, embedded in the retry
             log warning.
-        call (Callable[[], T]): The zero-argument callable to run.
+        call (Callable[[], _T]): The zero-argument callable to run.
 
     Returns:
-        T: The result of ``call``.
+        _T: The result of ``call``.
 
     Raises:
         HfHubHTTPError: Immediately for any non-429 hub error, and for a 429

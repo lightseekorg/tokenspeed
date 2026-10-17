@@ -408,6 +408,13 @@ def get_config(
                             **kwargs,
                         )
 
+                    # Guard, not retry coverage: Transformers converts hub
+                    # HTTP errors into OSError inside from_pretrained, which
+                    # call_with_hf_rate_limit_retry does not catch. The real
+                    # protection is the snapshot_revision pin: the retried
+                    # snapshot_download above already cached every non-weight
+                    # file, so the remote-code load resolves from the local
+                    # cache without new hub requests.
                     config = call_with_hf_rate_limit_retry(
                         f"loading remote-code config of {model}",
                         load_remote_code_config,
@@ -948,6 +955,10 @@ def get_tokenizer(
             )
             snapshot_revision = _snapshot_commit_hash(tokenizer_path)
             if trust_remote_code and snapshot_revision is not None:
+                # Same guard as the remote-code config load in get_config:
+                # hub errors inside the reload surface as OSError and are not
+                # retried; the snapshot_revision pin makes the reload resolve
+                # from the local cache filled (and 429-retried) above.
                 tokenizer = call_with_hf_rate_limit_retry(
                     f"loading remote-code tokenizer of {tokenizer_name}",
                     lambda: load_tokenizer(tokenizer_name, snapshot_revision),
