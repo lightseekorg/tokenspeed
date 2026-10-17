@@ -39,13 +39,16 @@ size_t getWorkspaceSize(SizeType32 batchSize, SizeType32 vocabSize);
 // Inputs (all on device):
 //   probs[bs, V]   — already softmax'd probabilities.
 //   topKs[bs]      — int32, per-row K. K_TOPK_MAX is hard upper bound for the
-//                    top-k path; K >= V (e.g. (1<<30)) routes the row through
-//                    the radix top-p path.
+//                    top-k path; K > K_TOPK_MAX (e.g. (1<<30)) means uncapped
+//                    top-p, retaining all ties at its threshold.
 //   topPs[bs]      — float, per-row P in (0, 1].
 //
 // Output:
 //   outProbs[bs, V] — same shape as probs; non-selected positions are 0; kept
 //                     positions are renormalized so the row sums to 1.
+// V <= K_TOPK_MAX sorts each whole row in the apply kernel; larger vocabularies
+// use the fixed-K radix top-K producer. The workspace size and the tensor
+// arguments are the same for both.
 //
 // CUDA-graph safe: every kernel launch has fixed grid/block; per-row mode is
 // resolved by the kernels themselves via topKs[row].

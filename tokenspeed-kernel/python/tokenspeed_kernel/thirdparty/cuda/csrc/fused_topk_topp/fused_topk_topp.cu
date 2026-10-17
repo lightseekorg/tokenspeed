@@ -19,9 +19,9 @@
 // SOFTWARE.
 
 // Fused TopK + TopP renorm. Picks one of three branches per row, but launches
-// the same kernels every call so the host-side path is deterministic and
-// CUDA-graph capturable. Per-row dispatch happens inside the apply kernel via
-// topKs[row].
+// the same kernels on every call for a given vocabulary size, so the host-side
+// path is deterministic and CUDA-graph capturable; V <= K_TOPK_MAX skips the
+// radix stages. Per-row dispatch happens inside the apply kernel via topKs[row].
 
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
@@ -327,13 +327,17 @@ size_t getWorkspaceSize(SizeType32 batchSize, SizeType32 vocabSize) {
 //   K_eff >  MAX_K → mode 3.2: use the top-p threshold left in the
 //     air_top_p counter, scan the row, renormalize, write outProbs[row].
 //
-// outProbs is pre-zeroed by an asynchronous memset on a side stream — both
-// branches write only the kept positions.
+// outProbs is pre-zeroed by an asynchronous memset (on the side stream when
+// V > MAX_K and one is given, otherwise on the main stream) — both branches
+// write only the kept positions.
 // ROWS_ALIGNED: the caller guarantees every row base of `probs`/`out_probs` is
 // 16B-aligned (both bases 16B-aligned and vocab_size % 4 == 0), so the top-p
 // V-scan can use float4 loads/stores with no peel. Decided host-side in
 // invokeFusedTopKTopP; see the mode 3.2 branch.
-template <int BLOCK_SIZE, int ITEMS_PER_THREAD, bool ROWS_ALIGNED>
+// DIRECT_INPUT: vocab_size <= MAX_K. Every row takes the sort branch and reads
+// `probs` directly instead of the top-K producer's output; the top_k_vals,
+// top_k_idx and topp_counters arguments are unused.
+template <int BLOCK_SIZE, int ITEMS_PER_THREAD, bool ROWS_ALIGNED, bool DIRECT_INPUT>
 __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
     float const* __restrict__ probs,
     float const* __restrict__ top_k_vals,
@@ -374,9 +378,9 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
         typename BlockReduce::TempStorage reduce;
     } temp_storage;
 
-    if (k_raw <= max_k) {
+    if (DIRECT_INPUT || k_raw <= max_k) {
         // ── Mode 3.1 / 3.3: top-K (post-process for top-P) ──────────────────
-        const int k = max(1, min(k_raw, max_k));
+        const int k = max(1, min(k_raw, DIRECT_INPUT ? vocab_size : max_k));
 
         __shared__ float s_vals[MAX_K];
         __shared__ int32_t s_idx[MAX_K];
@@ -392,7 +396,12 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
             const int pos = threadIdx.x * ITEMS_PER_THREAD + i;
             float val;
             int32_t idx;
-            if (pos < max_k) {
+            if constexpr (DIRECT_INPUT) {
+                // Small vocabularies fit the existing sort window. Invalid
+                // lanes must never read the next row or participate in top-K.
+                val = pos < vocab_size ? probs[b * vocab_size + pos] : -FLT_MAX;
+                idx = pos < vocab_size ? pos : INT32_MAX;
+            } else if (pos < max_k) {
                 val = top_k_vals[row_base + pos];
                 idx = top_k_idx[row_base + pos];
             } else {
@@ -453,6 +462,14 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
                         j = i;
                         break;
                     }
+                }
+            }
+            if constexpr (DIRECT_INPUT) {
+                // K >= V (including the K > max_k sentinel) applies no top-K
+                // cut, so keep every value tied at the top-P cutoff, as the
+                // radix top-p path does; a finite K < V keeps the stable prefix.
+                if (k_raw >= vocab_size) {
+                    while (j + 1 < k && s_vals[j + 1] == s_vals[j]) ++j;
                 }
             }
             s_cutoff_j = j;
@@ -626,6 +643,21 @@ void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float cons
                         float* outProbs, void* workspace, SizeType32 batchSize,
                         SizeType32 vocabSize, cudaStream_t mainStream,
                         cudaStream_t memsetStream, bool enable_pdl) {
+    if (vocabSize <= K_TOPK_MAX) {
+        // The fixed-K radix top-K producer cannot fill its K_TOPK_MAX outputs
+        // when V < K_TOPK_MAX and writes none when V == K_TOPK_MAX. The whole
+        // row fits the apply kernel's sort window, so sort it there directly.
+        // Zeroing and apply both run on mainStream (eager and graph capture).
+        cudaMemsetAsync(outProbs, 0,
+                        sizeof(float) * static_cast<size_t>(batchSize) * vocabSize, mainStream);
+        launchKernel(enable_pdl, applyKernel<128, 1, false, true>, dim3(batchSize),
+                     dim3(128), 0, mainStream, probs, static_cast<float const*>(nullptr),
+                     static_cast<int32_t const*>(nullptr), topKs, topPs,
+                     static_cast<air_top_p::Counter<float>*>(nullptr), outProbs,
+                     vocabSize, K_TOPK_MAX, enable_pdl);
+        return;
+    }
+
     // ── Workspace partitioning ──────────────────────────────────────────────
     size_t airTopkWS = airTopKWorkspaceBytes(batchSize, vocabSize);
     std::vector<size_t> sizes = {
@@ -742,7 +774,8 @@ void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float cons
     const bool rowsAligned = (reinterpret_cast<uintptr_t>(probs) & 0xFu) == 0 &&
                              (reinterpret_cast<uintptr_t>(outProbs) & 0xFu) == 0 &&
                              (vocabSize % 4 == 0);
-    auto applyFn = rowsAligned ? applyKernel<128, 1, true> : applyKernel<128, 1, false>;
+    auto applyFn = rowsAligned ? applyKernel<128, 1, true, false>
+                               : applyKernel<128, 1, false, false>;
     launchKernel(enable_pdl, applyFn, dim3(batchSize), dim3(128), 0, mainStream,
                  probs, topKVals, topKIdx, topKs, topPs, toppCounters, outProbs, vocabSize,
                  K_TOPK_MAX, enable_pdl);

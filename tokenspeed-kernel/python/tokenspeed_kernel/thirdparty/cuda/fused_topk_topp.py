@@ -100,8 +100,11 @@ def fused_topk_topp_renorm(
 
     Args:
         probs:  ``[bs, V]`` float32, softmax'd probabilities.
-        top_ks: ``[bs]`` int32. K in ``[1, V)`` plus the sentinel ``K = 1 << 30``
-                which routes the row through the radix top-p path.
+        top_ks: ``[bs]`` int32. K in ``[1, 128]`` keeps the K largest values;
+                K > 128 (e.g. the sentinel ``K = 1 << 30``) applies no top-K
+                cut, and values tied at the top-p cutoff are all kept. For
+                ``V <= 128`` any K >= V also applies no top-K cut, with the
+                same tie rule.
         top_ps: ``[bs]`` float32. P in ``(0, 1]``.
         workspace: optional pre-allocated uint8 scratch buffer; if omitted, a
                    fresh one is allocated via the CUDA caching allocator.
