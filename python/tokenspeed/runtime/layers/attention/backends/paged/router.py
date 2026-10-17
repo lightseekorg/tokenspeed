@@ -696,8 +696,10 @@ class CacheGroupRouter(AttentionBackend):
         per block, so nothing is expanded on the host), so a leaf that
         gathers history by page owner can split the gather without a device
         sync. A page-sharded group's leaf gets the rows for an extend with a
-        prefix too, to split its prefix-chunk gathers the same way; any other
-        forward reads nothing from the mirror.
+        prefix too, to split its prefix-chunk gathers the same way and to
+        address the owners' send rows, so the mirror must hold the rows this
+        call expands into the kernel page tables; any other forward reads
+        nothing from it.
         """
         del extend_prompt_lens_cpu
         reject_bounded_replay(extend_replay_lens_cpu, "CacheGroupRouter")

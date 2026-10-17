@@ -343,11 +343,13 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
                 ``page_table`` expands; ``0`` holes, ``-1`` ragged padding)
                 when the forward is sharded, or when it extends a prefix and
                 this leaf's group is KVP page-sharded; else ``None``. Page
-                ownership is a per-block fact, so the sharded extend arm and
-                the KVP prefix-chunk gather count how many history rows each
-                page owner holds from it on the host, and the gather's
-                per-rank split never waits on the device. Never an address
-                table: kernel pages come from ``page_table`` only.
+                ownership is a per-block fact, so the sharded extend arm
+                counts how many history rows each page owner holds from it
+                on the host, and the KVP prefix-chunk gather takes both the
+                page owners and the owners' physical send slots from it;
+                neither waits on the device. It must be the stage
+                ``page_table`` was expanded from: the prefix loops' device
+                slots are only counted.
         """
 
     @abstractmethod

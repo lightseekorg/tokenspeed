@@ -65,8 +65,10 @@ for a sharded forward, and for an extend with a prefix on a KVP page-sharded
 group; `None` otherwise). Page ownership is a per-block fact, so nothing is
 expanded to kernel pages on the host. The one leaf that attends a shard —
 GPU DSA — counts page ownership from it on the host, and an MLA leaf
-declaring `supports_mla_dcp` hands it to `_prepare_prefix_history`, which
-splits the prefix-chunk gathers by page owner the same way. No default values: the runner
+declaring `supports_mla_dcp` hands it to `_prepare_prefix_history`, whose
+prefix-chunk gathers take both the page owners and the owners' physical send
+slots from it: it must be the stage `page_table` was expanded from, and the
+loops' device slots are only counted. No default values: the runner
 passes the `[:num_extends]` slices of its input buffers on every call (the
 idle replay passes the empty `[:0]` slices), so a node that reads a field
 can never see a silently-defaulted one. This is deliberate — a `= False`
@@ -1345,7 +1347,11 @@ rows.
 ## One block-table route: router + leaves
 
 The layering between the scheduler's block vocabulary and the kernels' page
-vocabulary is fixed, with exactly one conversion point:
+vocabulary is fixed, with exactly one block-to-page conversion point, the
+router. The one leaf that reads block ids is the KVP prefix-chunk gather
+plan (`dcp/placement.py: prefix_chunk_segments`): it takes page owners and
+the owners' physical send slots from the same host block rows the router
+expands, never kernel pages.
 
 | layer | sees | never sees |
 |---|---|---|
@@ -1354,7 +1360,7 @@ vocabulary is fixed, with exactly one conversion point:
 | **`CacheGroupRouter`** | attention group geometry (`CacheGroupGeometry`), each leaf's `kernel_page_size`, expansion, padding, and KV write-location slot math | kernel calls |
 | `QSAIndexerBackend` | its raw compressed/recent group tables, query lengths, full-KV address view, and private verify workspace | MHA leaf metadata, persistent cache allocation |
 | `Qwen4ExpPLEBackend` | its PLE state table, input/output state blocks, and verify workspace | Mamba metadata and verify context, persistent cache allocation |
-| paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc`; under a query shard, or on an extend with a prefix when its group is KVP page-sharded, also `block_table_cpu`, its group's host block rows of the extend requests, read only to count page owners (ownership is per block; never an address table) | groups, device block tables, contracts, draft/target table provenance |
+| paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc`; under a query shard, or on an extend with a prefix when its group is KVP page-sharded, also `block_table_cpu`, its group's host block rows of the extend requests (ownership is per block): the query-shard gather counts page owners from it, and the KVP prefix-chunk gather takes both page owners and the owners' physical send slots from it, so it must be the stage `page_table` was expanded from | groups, device block tables, contracts, draft/target table provenance |
 | state consumers (Mamba/KDA, Inkling conv, V4) | their own groups' raw `block_tables[gid]` (block vocabulary) | other groups' tables, runner padding |
 
 The runner (`ForwardStepRunner`) does one thing with tables: hand the

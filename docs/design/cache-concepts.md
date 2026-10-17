@@ -1606,7 +1606,9 @@ unsharded read; a leaf declaring `supports_mla_dcp` only hands it each
 prefill's prefix loops and its group's host block table
 (`_prepare_prefix_history`), so planning the gathers never waits on the
 device; ownership is per block, so the plan reads scheduler blocks, never a
-host expansion to kernel pages. The gathers run on a named
+host expansion to kernel pages. It reads only that table, per block: the
+owners' physical send slots come from it too, and the loops' device slots,
+resolved through the same table, are only counted. The gathers run on a named
 copy of the KVP group, whose communicators are apart from the attention TP
 collectives, one window of loops ahead, so each transfer runs under the compute
 before its layer instead of queueing with those collectives. GPU DSA sparse
