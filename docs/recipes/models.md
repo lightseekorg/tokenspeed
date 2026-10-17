@@ -24,10 +24,11 @@ becomes `reasoning_content`, `user` and `commentary` stay visible, `<|eom|>`
 closes a channel and `<|eot|>` closes the turn. The bundled gateway reads them
 with its Symphony parser, which `ts serve` selects with `--parser symphony`;
 forced tool calls and JSON answers run through the engine's xgrammar backend,
-which `ts serve` turns on for this model (`--grammar-backend xgrammar`). This
-needs a `tokenspeed-smg` build with smg's Muse Spark support (smg main from
-2026-10-16 on). Explicit parser and grammar-backend flags override these
-defaults. Sample with the checkpoint's `generation_config.json` defaults
+which `ts serve` turns on for this model (`--grammar-backend xgrammar`). These
+parser and grammar-backend defaults need a `tokenspeed-smg` build with smg's
+Muse Spark support (smg main from 2026-10-16 on). Explicit parser and
+grammar-backend flags override these defaults. Sample with the checkpoint's
+`generation_config.json` defaults
 (`temperature=1.0`, `top_p=1.0`, `top_k=64`); greedy decoding is loop-prone
 for this checkpoint. The checkpoint's
 `chat_template.jinja` renders `reasoning_effort` (`minimal`, `low`, `medium`,

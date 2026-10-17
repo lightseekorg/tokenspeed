@@ -693,6 +693,45 @@ def test_muse_spark_defaults_follow_split_argv_routing():
     assert "--grammar-backend" not in gateway_args
 
 
+def test_muse_spark_tree_drafting_skips_xgrammar_default(tmp_path):
+    """Tree drafting rejects every non-``none`` grammar backend at startup
+    (``ServerArgs._validate_tree_speculation``), so the xgrammar default steps
+    aside for it; the gateway still runs Symphony."""
+    model = _make_muse_spark_model_dir(tmp_path)
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        [
+            "--model",
+            model,
+            "--speculative-algorithm",
+            "EAGLE3",
+            "--speculative-eagle-topk",
+            "4",
+            "--speculative-num-draft-tokens",
+            "8",
+        ],
+        ["--model", model],
+    )
+
+    assert "--grammar-backend" not in engine_args
+    assert _get_from_args(gateway_args, "--parser") == MUSE_SPARK_GATEWAY_PARSER
+
+
+def test_muse_spark_chain_drafting_keeps_xgrammar_default(tmp_path):
+    """A chain draft (the default topk of 1) accepts structured output, so the
+    xgrammar default still applies."""
+    model = _make_muse_spark_model_dir(tmp_path)
+
+    engine_args, _ = _args_with_default_model_parsers(
+        ["--model", model, "--speculative-algorithm", "EAGLE3"],
+        ["--model", model],
+    )
+
+    assert (
+        _get_from_args(engine_args, "--grammar-backend") == MUSE_SPARK_GRAMMAR_BACKEND
+    )
+
+
 def _make_inkling_model_dir(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps(

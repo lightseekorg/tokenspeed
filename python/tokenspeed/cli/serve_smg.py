@@ -34,7 +34,9 @@ Model-family defaults (``_args_with_default_model_parsers``) pick the
 reasoning and tool-call parsers from the model. Muse Spark Open also gets the
 gateway's Symphony parser (``--parser symphony``) and the engine's xgrammar
 backend (``--grammar-backend xgrammar``), so forced tool calls and JSON answers
-work out of the box; an explicit flag always wins.
+work out of the box; an explicit flag always wins, and the xgrammar default
+steps aside when the engine argv selects tree drafting, which rejects every
+non-``none`` grammar backend.
 """
 
 from __future__ import annotations
@@ -542,6 +544,25 @@ def _is_muse_spark_model(model_id: str | None) -> bool:
     )
 
 
+def _args_select_tree_drafting(engine_args: list[str]) -> bool:
+    """Whether the engine argv drafts a tree (``--speculative-eagle-topk`` != 1).
+
+    Tree drafting rejects every non-``none`` grammar backend at startup
+    (``ServerArgs._validate_tree_speculation``), so an injected grammar-backend
+    default must step aside for it. A chain draft (the default topk of 1)
+    accepts structured output and keeps the default. A non-integer topk fails
+    ``ServerArgs`` parsing either way; treating it as tree drafting only
+    decides which error the operator sees first.
+    """
+    topk = _get_from_args(engine_args, "--speculative-eagle-topk")
+    if topk is None:
+        return False
+    try:
+        return int(topk) != 1
+    except ValueError:
+        return True
+
+
 def _args_with_default_model_parsers(
     engine_args: list[str], gateway_args: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -556,7 +577,11 @@ def _args_with_default_model_parsers(
     symphony``. Symphony constrains forced tool calls and JSON answers with
     xgrammar structural tags, which the engine's default grammar backend
     (``none``) rejects, so the engine gets ``--grammar-backend xgrammar``. As
-    with the parser names, an explicit operator flag wins.
+    with the parser names, an explicit operator flag wins. The xgrammar
+    default also steps aside when the engine argv selects tree drafting
+    (``--speculative-eagle-topk`` != 1), which rejects every non-``none``
+    grammar backend at startup; the launch keeps the pre-default ``none``
+    behavior instead of failing on a flag the operator never passed.
     """
     model_id = _get_from_args(gateway_args, "--model") or _get_from_args(
         engine_args, "--model"
@@ -575,7 +600,9 @@ def _args_with_default_model_parsers(
             gateway_result.extend(["--tool-call-parser", MUSE_SPARK_TOOL_CALL_PARSER])
         if "--parser" not in gateway_result:
             gateway_result.extend(["--parser", MUSE_SPARK_GATEWAY_PARSER])
-        if "--grammar-backend" not in engine_result:
+        if "--grammar-backend" not in engine_result and not _args_select_tree_drafting(
+            engine_result
+        ):
             engine_result.extend(["--grammar-backend", MUSE_SPARK_GRAMMAR_BACKEND])
 
     elif _is_deepseek_v41_model(model_id):
