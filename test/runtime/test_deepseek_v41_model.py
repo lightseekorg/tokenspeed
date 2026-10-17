@@ -69,8 +69,8 @@ from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.utils import MoeBackend
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
-from tokenspeed.runtime.models import deepseek_v4 as v4
 from tokenspeed.runtime.models import deepseek_v41 as v41
+from tokenspeed.runtime.models import deepseek_v41_moe as v4
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.base.weight_update import weight_update_session
 from tokenspeed.runtime.models.deepseek_v41 import (
@@ -1244,8 +1244,7 @@ def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
         )
         layer = model.proj
         layer.quant_method.process_weights_after_loading(layer)
-        plan = layer.quant_method.fp8_linear_plan
-        native = plan.prepared_weight_scales
+        native = layer.quant_method.prepared_weight_scales
         address = native.data_ptr()
         assert set(model.state_dict()) == {"proj.weight", "proj.weight_scale_inv"}
         x = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
@@ -1277,8 +1276,7 @@ def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
                         )
                     ]
                 )
-            assert layer.quant_method.fp8_linear_plan is plan
-            assert plan.prepared_weight_scales is native
+            assert layer.quant_method.prepared_weight_scales is native
             assert native.data_ptr() == address
             x.normal_()
             graph.replay()

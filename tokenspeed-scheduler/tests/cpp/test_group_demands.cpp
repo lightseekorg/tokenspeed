@@ -35,14 +35,13 @@
 namespace tokenspeed::test {
 namespace {
 
-CacheGroupConfig Group(const char* id, CacheGroupConfig::Retention retention, CacheGroupFamily family) {
+CacheGroupConfig Group(const char* id, AttnKind kind) {
     CacheGroupConfig group;
     group.group_id = id;
-    group.block_granularity = family == CacheGroupFamily::State ? 0 : 4;
+    group.block_granularity = kind == AttnKind::kState ? 0 : 4;
     group.total_pages = 8;
-    group.retention = retention;
-    group.family = family;
-    if (retention == CacheGroupConfig::Retention::SlidingWindow) {
+    group.attn_kind = kind;
+    if (kind == AttnKind::kSlidingWindow) {
         group.sliding_window_tokens = 8;
     }
     return group;
@@ -50,8 +49,8 @@ CacheGroupConfig Group(const char* id, CacheGroupConfig::Retention retention, Ca
 
 TEST(MakeGroupDemandsTest, HistoryGroupsTakeThePrototypeAndStateGroupsTheStep) {
     const std::vector<CacheGroupConfig> groups = {
-        Group("full", CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-        Group("state", CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
+        Group("full", AttnKind::kFull),
+        Group("state", AttnKind::kState),
     };
     std::vector<BlockTable> tables(2);
     const std::vector<GroupDemand> demands =
@@ -66,11 +65,11 @@ TEST(MakeGroupDemandsTest, HistoryGroupsTakeThePrototypeAndStateGroupsTheStep) {
     EXPECT_EQ(demands[1].reserve_tokens, 0) << "a State group's slots hold no token reserve";
 }
 
-TEST(ReservePrefillDemandsTest, EachRetentionHoldsItsOwnShareOfTheRound) {
+TEST(ReservePrefillDemandsTest, EachKindHoldsItsOwnShareOfTheRound) {
     const std::vector<CacheGroupConfig> groups = {
-        Group("full", CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-        Group("swa", CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History),
-        Group("state", CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
+        Group("full", AttnKind::kFull),
+        Group("swa", AttnKind::kSlidingWindow),
+        Group("state", AttnKind::kState),
     };
     std::vector<BlockTable> tables(3);
     // A first chunk that does not complete the prompt: full history prepays
@@ -96,6 +95,48 @@ TEST(ReservePrefillDemandsTest, EachRetentionHoldsItsOwnShareOfTheRound) {
     EXPECT_EQ(demands[0].reserve_tokens, 2);
     EXPECT_EQ(demands[1].reserve_tokens, 2);
     EXPECT_EQ(demands[2].reserve_tokens, 0);
+}
+
+TEST(ReservePrefillDemandsTest, SlidingWindowPrepaysUnrecycledGrowthUpToItsLookback) {
+    // Window 8 and 4-token blocks: a token reads a 7-token lookback, the most
+    // growth recycling can fall behind by, and 7 + 4 prompt tokens after the
+    // hit slide every hit page out before the first decode.
+    CacheGroupConfig swa = Group("swa", AttnKind::kSlidingWindow);
+    CacheGroupConfig replayable = swa;
+    replayable.replayable = true;
+    const struct {
+        const char* name;
+        bool replayable;
+        bool completes_prefill;
+        std::int32_t prompt_headroom_tokens;
+        std::int32_t hit_tokens;
+        std::int32_t prompt_after_hit_tokens;
+        std::int32_t later_chunk_tokens;
+        std::int32_t expected;
+    } cases[] = {
+        {"nothing unrecycled", false, false, 30, 0, 10, 0, 0},
+        {"later chunk below the lookback", false, false, 30, 0, 10, 5, 5},
+        {"hit capped by the lookback", false, false, 30, 20, 10, 0, 7},
+        {"capped by the prompt headroom", false, false, 4, 20, 10, 0, 4},
+        {"never below the decode slot", false, true, 30, 1, 10, 0, 2},
+        {"hit slides out within the prompt", false, false, 30, 20, 11, 5, 5},
+        {"replayable hit pages are private", true, false, 30, 20, 10, 5, 5},
+    };
+    std::vector<BlockTable> tables(1);
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.name);
+        const std::vector<CacheGroupConfig> groups = {c.replayable ? replayable : swa};
+        std::vector<GroupDemand> demands = MakeGroupDemands(tables, groups, GroupDemand{.extent = DenseGrowth{6}},
+                                                            StateStep{StateStep::Kind::kRotate});
+        ReservePrefillDemands(demands, groups,
+                              PrefillReserve{.decode_input_tokens = 2,
+                                             .completes_prefill = c.completes_prefill,
+                                             .prompt_headroom_tokens = c.prompt_headroom_tokens,
+                                             .swa_hit_tokens = c.hit_tokens,
+                                             .swa_later_chunk_tokens = c.later_chunk_tokens,
+                                             .swa_prompt_after_hit_tokens = c.prompt_after_hit_tokens});
+        EXPECT_EQ(demands[0].reserve_tokens, c.expected);
+    }
 }
 
 }  // namespace

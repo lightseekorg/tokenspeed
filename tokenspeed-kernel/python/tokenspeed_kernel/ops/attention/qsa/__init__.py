@@ -234,7 +234,7 @@ def qsa_block_scores(
     override: str | None,
     solution: str | None,
 ) -> torch.Tensor:
-    """Score every compressed QSA block for each query row.
+    """Score each query row's complete compressed QSA blocks.
 
     Args:
         query: Index queries shaped ``[rows, heads, head_dim]`` with a
@@ -253,8 +253,8 @@ def qsa_block_scores(
 
     Returns:
         FP32 scores shaped ``[rows, pages * page_size]``: the summed ReLU of
-        the head dot products below each row's ``complete_blocks`` and
-        ``-inf`` elsewhere.
+        the head dot products below each row's ``complete_blocks``. Later
+        columns are unspecified; selectors must receive ``complete_blocks``.
     """
 
     kernel = select_kernel(
@@ -293,10 +293,11 @@ def qsa_block_topk_select(
     """Select each row's ``topk`` highest finite block scores.
 
     Args:
-        logits: FP32 scores shaped ``[rows, cols]``; ``-inf`` is never
-            selected.
+        logits: FP32 scores shaped ``[rows, cols]``. Columns at or beyond
+            ``lengths`` are ignored, and ``-inf`` is never selected.
         topk: Blocks selected per row.
-        lengths: Per-row count of scored columns; later columns are ``-inf``.
+        lengths: Per-row count of scored columns, clamped to the score width.
+            Later columns may be uninitialized.
         persistent_workspace: Optional caller-owned CUDA uint8 workspace of
             at least 1 MiB for implementations that keep persistent state.
         enable_pdl: Use programmatic dependent launch where supported.

@@ -181,8 +181,8 @@ lanes and nodes are always fully written.
 ### Sampled verify keys noise by position
 
 The triton sampling backend draws a verify row's target token by Gumbel-max
-keyed by `(seed, position)`. For a tree the key is the node's position
-`vc + depth`, never its row: each node row samples with its request's
+keyed by `(seed, position)`. For a tree the key is the position predicted by the node
+(`vc + depth + 1`, with `vc` the pre-forward input frontier), never its row: each node row samples with its request's
 parameters and its offset advanced by its depth, so the token accepted at every
 position is the one plain decoding samples there. Acceptance is the greedy tree
 walk over those draws, accepting a child when it equals its parent's draw.

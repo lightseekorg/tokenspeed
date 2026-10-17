@@ -39,11 +39,11 @@ from tokenspeed.runtime.execution.drafter.base import BaseDrafter  # noqa: E402
 from tokenspeed.runtime.execution.model_executor import ModelExecutor  # noqa: E402
 
 
-def _pool(tag, *, family="history"):
+def _pool(tag, *, attn_kind="full_history"):
     return SimpleNamespace(
         arena=SimpleNamespace(
             runtime_contract=SimpleNamespace(
-                tag=tag, group_specs=(SimpleNamespace(family=family),)
+                tag=tag, group_specs=(SimpleNamespace(attn_kind=attn_kind),)
             ),
             cache_group_specs=(f"{tag} spec",),
             cache_group_page_counts={f"{tag} group": 3},
@@ -54,7 +54,7 @@ def _pool(tag, *, family="history"):
 class _Holder:
     """A backend, drafter or context producer; logs what it is handed."""
 
-    cache_consumer_families = ("history",)
+    cache_consumer_attn_kinds = ("full_history", "sliding_window")
 
     def __init__(self, name, log, pool=None):
         self.name, self.log, self.token_to_kv_pool = name, log, pool
@@ -167,7 +167,7 @@ def test_a_rebind_republishes_every_holder_onto_the_new_pools(monkeypatch, with_
 def test_a_rebind_to_an_unconsumable_pool_fails_where_it_happens(monkeypatch):
     executor = _executor(monkeypatch, [], with_draft=False)
     with pytest.raises(RuntimeError, match="missing"):
-        executor.set_cache_pool(_pool("real", family="state"), None)
+        executor.set_cache_pool(_pool("real", attn_kind="state"), None)
 
 
 @pytest.mark.parametrize("spec_algo", ["DFLASH", "DSPARK"])
@@ -255,7 +255,6 @@ def test_releasing_frees_both_owners_the_drafter_and_the_workspace(monkeypatch):
 
 def test_the_drafter_hooks_take_the_pool_and_drop_what_named_the_old_one(monkeypatch):
     from tokenspeed.runtime.execution.drafter import _dflash_fused_kv
-    from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import DeepseekV4DSpark
     from tokenspeed.runtime.execution.drafter.dflash import DFlash
     from tokenspeed.runtime.execution.dspark_context import DSparkContextProducer
 
@@ -274,11 +273,6 @@ def test_the_drafter_hooks_take_the_pool_and_drop_what_named_the_old_one(monkeyp
     assert _dflash_fused_kv._cached_kv_ptrs == {}
     assert rebuilt == ["fused_kv", "incremental_proj"]
 
-    dspark = DeepseekV4DSpark.__new__(DeepseekV4DSpark)
-    dspark._prefill_graph = object()
-    dspark.release_prefill_graph()
-    assert dspark._prefill_graph is None
-
     # Only the last pipeline stage owns the draft context cache.
     producer = DSparkContextProducer.__new__(DSparkContextProducer)
     producer.token_to_kv_pool = _pool("probe draft")
@@ -290,7 +284,6 @@ def test_the_drafter_hooks_take_the_pool_and_drop_what_named_the_old_one(monkeyp
 def test_a_drafter_that_captures_a_prefill_graph_declares_and_releases_it():
     for name in (
         "deepseek_v41_dspark",
-        "deepseek_v4_dspark",
         "dflash",
         "dflash2",
         "dspark",
@@ -305,7 +298,7 @@ def test_a_drafter_that_captures_a_prefill_graph_declares_and_releases_it():
             yield from _descendants(sub)
 
     concrete = list(_descendants(BaseDrafter))
-    assert len(concrete) >= 7
+    assert len(concrete) >= 6
     hooks = {"capture_prefill_graph", "captures_prefill_graph", "release_prefill_graph"}
     for cls in concrete:
         assert hooks & set(vars(cls)) in (set(), hooks), cls.__name__

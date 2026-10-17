@@ -52,7 +52,8 @@ void dsv4_persistent_topk(TensorView logits,
                                  TensorView workspace,
                                  int64_t k,
                                  int64_t max_seq_len,
-                                 int64_t q_len_per_req);
+                                 int64_t q_len_per_req,
+                                 bool enable_pdl);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_dsv4_qnorm_rope_kv_rope_quant_insert,
                               fused_dsv4_qnorm_rope_kv_rope_quant_insert);

@@ -1066,7 +1066,7 @@ class PrefillGraph:
         # would be allocated and copied straight back off per group per bucket.
         first_block = torch.arange(1, bs + 1, dtype=torch.int32)
         for spec in self.token_to_kv_pool.arena.cache_group_specs:
-            if spec.family == "state":
+            if spec.attn_kind == "state":
                 rows = torch.zeros((bs, STATE_TABLE_SLOTS), dtype=torch.int32)
                 rows[:, STATE_LIVE_SLOT] = first_block
                 out[str(spec.group_id)] = rows

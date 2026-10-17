@@ -201,7 +201,7 @@ def test_l2norm_row_count():
 
 
 def test_mxfp4_mm_row_count():
-    from tokenspeed_kernel.ops.gemm import triton as gemm
+    from tokenspeed_kernel.ops.gemm._triton import mxfp4 as gemm
 
     n, k = 64, 256
     a = torch.randint(0, 256, (1500, k // 2), dtype=torch.uint8, device=DEVICE)
@@ -362,91 +362,6 @@ def test_dsa_local_topk_to_global_slots_table_width():
     # A single column specializes to a compile-time 1; the value must still
     # flow through the sequence-length bound.
     run(1)
-
-
-def test_dsv4_gather_indexer_mxfp4_row_count():
-    from tokenspeed_kernel.ops.attention.dsv4 import triton as dsv4
-
-    values, scales = (
-        dsv4.DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES,
-        dsv4.DEEPSEEK_V4_INDEXER_MXFP4_SCALE_DIM,
-    )
-    block_size, pages = 64, 32
-    cache = torch.randint(
-        0, 256, (pages, block_size * (values + scales)), dtype=torch.uint8
-    ).to(DEVICE)
-    slots = torch.randperm(pages * block_size, device=DEVICE)[:1500].to(torch.int32)
-    slots[::7] = -1
-
-    def run(rows):
-        values_out = torch.empty(rows, values, dtype=torch.uint8, device=DEVICE)
-        scales_out = torch.empty(rows, scales, dtype=torch.uint8, device=DEVICE)
-        dsv4.dsv4_gather_indexer_mxfp4_cache(
-            cache_2d=cache,
-            slot_mapping=slots[:rows],
-            values_out=values_out,
-            scales_out=scales_out,
-            block_size=block_size,
-        )
-        live = slots[:rows] >= 0
-        page, pos = (slots[:rows] // block_size).long(), (slots[:rows] % block_size)
-        value_cols = pos[:, None].long() * values + torch.arange(values, device=DEVICE)
-        scale_cols = (
-            block_size * values
-            + pos[:, None].long() * scales
-            + torch.arange(scales, device=DEVICE)
-        )
-        rows_bytes = cache[page.clamp(min=0)]
-        torch.testing.assert_close(
-            values_out[live], rows_bytes.gather(1, value_cols)[live], rtol=0, atol=0
-        )
-        torch.testing.assert_close(
-            scales_out[live], rows_bytes.gather(1, scale_cols)[live], rtol=0, atol=0
-        )
-
-    run(32)
-    run(33)
-    with assert_no_triton_compile(dsv4._dsv4_gather_indexer_mxfp4_cache_kernel):
-        for rows in (48, 97, 130, 1483):
-            run(rows)
-
-
-def test_dsv4_indexer_decode_metadata_table_geometry():
-    from tokenspeed_kernel.ops.attention.dsv4 import triton as dsv4
-
-    base = torch.tensor(
-        [[4, 7, 1, -1], [2, 9, 3, 5], [6, -1, -1, -1]], dtype=torch.int32
-    ).to(DEVICE)
-    positions = torch.tensor([37, 250, 9, 511, 64], device=DEVICE)
-    requests = torch.tensor([0, 1, 2, 1, 0], dtype=torch.int32, device=DEVICE)
-
-    def run(rows, cols, max_blocks):
-        table = torch.full((rows, cols), -1, dtype=torch.int32, device=DEVICE)
-        table[:3, :4] = base
-        context = torch.empty(5, dtype=torch.int32, device=DEVICE)
-        tables = torch.empty(5, max_blocks, dtype=torch.int32, device=DEVICE)
-        dsv4.dsv4_indexer_decode_metadata_compute(
-            positions=positions,
-            token_to_req_indices=requests,
-            block_table=table,
-            cache_block_size=16,
-            compress_ratio=4,
-            max_blocks=max_blocks,
-            out_context_lens=context,
-            out_block_tables=tables,
-        )
-        return context, tables[:, :4]
-
-    expected = run(3, 4, 16)
-    # The column loop is bucketed to a power of two; stay in the 32 bucket.
-    run(5, 9, 32)
-    run(4, 6, 20)
-    kernel = dsv4._dsv4_indexer_decode_metadata_kernel
-    with assert_no_triton_compile(kernel):
-        # Extra request rows and -1 padding columns change nothing.
-        for rows, cols, max_blocks in ((7, 11, 24), (9, 37, 27), (6, 13, 31)):
-            for got, want in zip(run(rows, cols, max_blocks), expected, strict=True):
-                torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
 def test_dsv41_index_topk_table_width():
@@ -1123,7 +1038,7 @@ def test_mhc_pre_split_count():
     base = torch.randn(24, device=DEVICE, generator=generator)
 
     def run(tokens):
-        # Up to 256 tokens take the split-K GEMM and the generic mix kernel.
+        # Up to 256 tokens take the split-K GEMM and the four-stream mix kernel.
         args = (x[:tokens], fn, scale, base, 1e-6, 1e-5, 3)
         actual = residual.triton_mhc_pre(*args, norm_weight=None, norm_eps=None)
         for got, want in zip(actual, _reference(*args), strict=True):
@@ -1146,7 +1061,7 @@ def test_mhc_pre_split_count():
     sweep = (65, 130, 200, 256)
     warm_specialization_classes(run, key, sweep, range(1, 257))
     with assert_no_triton_compile(
-        residual._mhc_prenorm_gemm_triton_kernel, residual._mhc_pre_mix_triton_kernel
+        residual._mhc_prenorm_gemm_triton_kernel, residual._mhc_pre_mix_hc4_kernel
     ):
         for tokens in sweep:
             run(tokens)

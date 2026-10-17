@@ -16,20 +16,21 @@ Runs on the released config (layer-truncated, experts shrunk; see
 
 import os
 import sys
-import unittest
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ci_system.ci_register import register_cuda_ci
-from runtime.test_inkling_reference_parity import (
+from test.runtime.test_inkling_reference_parity import (
     _build_replica,
     _has_blackwell,
     _ref_sconv,
     _rel_attention,
     _rms_norm,
 )
+
+from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=90,
@@ -230,18 +231,18 @@ class _Harness:
         inner.bind(
             CacheGroupGeometry(
                 granularities={gid: PAGE_SIZE for gid in self.attn_groups},
-                families={gid: "history" for gid in self.attn_groups},
+                attn_kinds={gid: "full_history" for gid in self.attn_groups},
                 full_history_group_id=(
                     "full_attention"
                     if "full_attention" in self.attn_groups
                     else self.attn_groups[0]
                 ),
                 row_geometry={gid: (PAGE_SIZE, 1) for gid in self.attn_groups},
-                retentions={gid: ("full_history", None) for gid in self.attn_groups},
+                windows={gid: None for gid in self.attn_groups},
             ),
             leaves,
         )
-        from cache_pool_test_utils import make_mha_memory_plan, make_pool
+        from test.runtime.cache_pool_test_utils import make_mha_memory_plan, make_pool
 
         layer_kv_heads = tuple(
             (
@@ -428,23 +429,26 @@ class _Harness:
         return states
 
 
-@unittest.skipUnless(_has_blackwell(), "Inkling parity needs a Blackwell GPU (FA4)")
-class TestInklingActivationParity(unittest.TestCase):
+@pytest.mark.skipif(
+    not (_has_blackwell()), reason=("Inkling parity needs a Blackwell GPU (FA4)")
+)
+class TestInklingActivationParity:
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         os.environ["INKLING_TORCH_MOE"] = "1"  # experts as plain parameters
         cls.model, cls.text = _build_replica()
 
     def _compare(self, phase, got_states, ref_states, positions):
         report = []
         for (name_g, got), (name_r, ref) in zip(got_states, ref_states):
-            self.assertEqual(name_g, name_r)
+            assert (name_g) == (name_r)
             diff = (got.float() - ref.float()[positions]).abs().max().item()
             scale = ref.float().abs().max().item()
             report.append(f"{phase}/{name_g}: max_diff={diff:.2e} (scale {scale:.2e})")
-            self.assertLess(
-                diff, TOL, f"{phase}/{name_g} diverged:\n" + "\n".join(report)
-            )
+            _pytest_a_1 = diff
+            _pytest_b_2 = TOL
+            _pytest_msg_3 = f"{phase}/{name_g} diverged:\n" + "\n".join(report)
+            assert _pytest_a_1 < _pytest_b_2, _pytest_msg_3
         return report
 
     def test_layerwise_prefill_and_decode(self):
@@ -466,7 +470,7 @@ class TestInklingActivationParity(unittest.TestCase):
         print("\n".join(report))
 
 
-class InklingRebindTest(unittest.TestCase):
+class TestInklingRebindTest:
     def test_rebinding_the_pool_forgets_recorded_checkpoint_streams(self):
         """Checkpoint streams are pool views and the ring held the old pool's requests."""
         from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
@@ -530,13 +534,13 @@ class InklingRebindTest(unittest.TestCase):
 
         # The transfer policy is part of the geometry a rebind keeps, as is
         # the set of conv groups.
-        with self.assertRaisesRegex(RuntimeError, "geometry changed on rebind"):
+        with pytest.raises((RuntimeError), match=("geometry changed on rebind")):
             backend.set_cache_pool(pool(both, transfer_policy="none"))
-        with self.assertRaisesRegex(RuntimeError, "geometry changed on rebind"):
+        with pytest.raises((RuntimeError), match=("geometry changed on rebind")):
             backend.set_cache_pool(pool(("kvconv",), "latest_snapshot"))
-        with self.assertRaisesRegex(RuntimeError, "geometry changed on rebind"):
+        with pytest.raises((RuntimeError), match=("geometry changed on rebind")):
             backend.set_cache_pool(pool((), "latest_snapshot"))
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

@@ -17,6 +17,11 @@ SLURM_RUNNER_PREFIXES = (
     "slurm-gb200-",
     "slurm-gb300-",
 )
+PR_TEST_WORKFLOWS = (
+    "amd-tests.yml",
+    "nvidia-b200-tests.yml",
+    "pr-test-nvidia-arm.yml",
+)
 
 
 def workflow_dispatch_inputs(name: str) -> dict:
@@ -28,6 +33,16 @@ def workflow_dispatch_inputs(name: str) -> dict:
 
 def load_yaml(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("name", PR_TEST_WORKFLOWS)
+def test_pr_workflow_can_classify_pull_request_files(name: str):
+    workflow = load_yaml(REPO_ROOT / ".github" / "workflows" / name)
+
+    assert workflow["permissions"] == {
+        "contents": "read",
+        "pull-requests": "read",
+    }
 
 
 def run_slurm_dispatch_script(
@@ -418,7 +433,7 @@ def test_kernel_benchmark_task_uses_shared_ci_contract():
     assert task["type"] == "perf"
     assert task["workflow_stage"] == "kernel-benchmark"
     assert task["triggers"] == ["per-commit", "manual"]
-    assert task["runner"]["labels"] == ["amd-mi350-1gpu-bench"]
+    assert task["runner"]["labels"] == ["amd-mi355-1gpu"]
     assert task["env"]["TOKENSPEED_KERNEL_BENCHMARK_PROFILER"] == "none"
     assert ".ci-artifacts/published" in task["perf"]["command"]
     for variable in ("BASE_REF", "CANDIDATE_REF", "PR_NUMBER", "MERGE_SHA"):

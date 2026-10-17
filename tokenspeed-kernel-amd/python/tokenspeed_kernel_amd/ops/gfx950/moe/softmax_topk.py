@@ -115,6 +115,7 @@ def gluon_softmax_topk_gfx950(
 
     slot = gl.expand_dims(gl.arange(0, TKP, layout=col_layout), 0)
     selected = gl.full([ROWS, TKP], float("-inf"), gl.float32, layout)
+    chosen = gl.full([ROWS, TKP], 0, gl.int32, layout)
     for rank in gl.static_range(TOPK):
         best = gl.max(key, axis=1)
         key = gl.where(key == gl.expand_dims(best, 1), gl.zeros_like(key), key)
@@ -136,11 +137,7 @@ def gluon_softmax_topk_gfx950(
                 gl.full(ordered_best.shape, 0xFFFF, gl.uint32, row_layout),
             )
             value = value_bits.to(gl.uint16).to(DTYPE, bitcast=True).to(gl.float32)
-        gl.store(
-            ids_ptr + rows * stride_im + rank,
-            expert.to(ids_ptr.dtype.element_ty),
-            mask=row_ok,
-        )
+        chosen = gl.where(slot == rank, gl.expand_dims(expert, 1), chosen)
         selected = gl.where(slot == rank, gl.expand_dims(value, 1), selected)
 
     # The first selection is the row maximum.
@@ -154,10 +151,19 @@ def gluon_softmax_topk_gfx950(
         full = gl.where(mask, gl.exp(logits.to(gl.float32) - row_max), 0.0)
         denominator = gl.sum(full, axis=1, keep_dims=True)
     weights = numerators / denominator * routed_scaling_factor
+    # The ids collect in registers like the weights, so each output leaves
+    # with one buffer store instead of one store per selection round.
     slot_mask = gl.expand_dims(row_ok, 1) & (slot < TOPK)
-    gl.store(
-        weights_ptr + gl.expand_dims(rows * stride_wm, 1) + slot,
+    cdna4.buffer_store(
+        chosen.to(ids_ptr.dtype.element_ty),
+        ids_ptr,
+        gl.expand_dims(rows * stride_im, 1) + slot,
+        mask=slot_mask,
+    )
+    cdna4.buffer_store(
         weights,
+        weights_ptr,
+        gl.expand_dims(rows * stride_wm, 1) + slot,
         mask=slot_mask,
     )
 

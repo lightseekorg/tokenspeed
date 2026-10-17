@@ -4,9 +4,8 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.gemm import (
     _online_quantize_mxfp8,
-    fp8_linear,
     mm,
-    prepare_fp8_linear,
+    prepare_mxfp8_weight_scales,
 )
 from tokenspeed_kernel.ops.gemm.flashinfer import swizzle_mxfp8_scale
 from tokenspeed_kernel.ops.quantization.triton import (
@@ -103,7 +102,9 @@ def test_triton_mxfp8_1x32_raw_ue8m0_weight(device: str, override: str | None) -
     scales = torch.exp2(b_scales.float() - 127.0).repeat_interleave(32, dim=1)
     # Compare against the operands mm() actually quantizes; UE8M0 scales are
     # stored as biased exponent bytes.
-    q_a, a_scales = _online_quantize_mxfp8(a, [1, 32], "ue8m0", enable_pdl=False)
+    q_a, a_scales = _online_quantize_mxfp8(
+        a, [1, 32], "ue8m0", enable_pdl=False, kernel_name=None
+    )
     activation_scales = torch.exp2(a_scales.float() - 127.0).repeat_interleave(
         32, dim=1
     )
@@ -341,10 +342,10 @@ class TestPreparedMxfp8:
             )
 
     @pytest.mark.parametrize("rows", [1, 129])
-    def test_linear_reuses_scales_without_repacking(self, monkeypatch, rows):
+    def test_prepacked_mm_reuses_scales_without_repacking(self, monkeypatch, rows):
         weight = torch.randn(256, 384, device="cuda").to(torch.float8_e4m3fn)
         scales = torch.randint(120, 126, (256, 12), device="cuda", dtype=torch.uint8)
-        plan = prepare_fp8_linear(weight, scales, [1, 32])
+        prepared = prepare_mxfp8_weight_scales(weight, scales)
         x = torch.randn(rows, 384, device="cuda", dtype=torch.bfloat16)
         bias = torch.randn(256, device="cuda", dtype=x.dtype)
         codes, input_scales = _online_quantize_mxfp8(
@@ -363,82 +364,72 @@ class TestPreparedMxfp8:
         )
 
         def unexpected_repack(*args, **kwargs):
-            pytest.fail("prepared linear repacked scales during forward")
+            pytest.fail("prepacked mm repacked scales during forward")
 
         monkeypatch.setattr(
             "tokenspeed_kernel.ops.gemm.flashinfer.swizzle_mxfp8_scale",
             unexpected_repack,
         )
-        actual = fp8_linear(plan, x, weight, scales, bias=bias, out_dtype=x.dtype)
+        actual = mm(
+            x,
+            weight,
+            B_scales=prepared,
+            bias=bias,
+            out_dtype=x.dtype,
+            quant="mxfp8",
+            block_size=[1, 32],
+            prepacked_scales=True,
+        )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        out = torch.empty_like(expected)
+        assert (
+            mm(
+                x,
+                weight,
+                B_scales=prepared,
+                bias=bias,
+                out=out,
+                out_dtype=x.dtype,
+                quant="mxfp8",
+                block_size=[1, 32],
+                prepacked_scales=True,
+            )
+            is out
+        )
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
     @pytest.mark.parametrize(
-        "backend", [None, "triton_mm_fp8_blockscale", "torch_mm_fp8_blockscale"]
+        "case",
+        ["pdl_disabled", "gemm_override", "quantizer_override", "small_n", "small_k"],
     )
-    def test_linear_canonical_fallback(self, backend):
+    def test_prepare_declines_when_native_kernel_does_not_apply(self, case):
+        n, k = {"small_n": (64, 128), "small_k": (256, 96)}.get(case, (256, 128))
+        weight = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+        scales = torch.full((n, k // 32), 123, device="cuda", dtype=torch.uint8)
+        if case == "pdl_disabled":
+            pdl_enabled(False)
+        gemm = "triton_mm_fp8_blockscale" if case == "gemm_override" else None
+        quantizer = (
+            "triton_quantize_fp8_group32_ue8m0"
+            if case == "quantizer_override"
+            else None
+        )
+        with kernel_override("gemm", "mm", gemm), kernel_override(
+            "quantization", "fp8_with_scale", quantizer
+        ):
+            assert prepare_mxfp8_weight_scales(weight, scales) is None
+
+    def test_prepacked_mm_rejects_canonical_scales(self):
         weight = torch.randn(256, 128, device="cuda").to(torch.float8_e4m3fn)
         scales = torch.full((256, 4), 123, device="cuda", dtype=torch.uint8)
-        plan = prepare_fp8_linear(weight, scales, [1, 32])
         x = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
-        x[0, :32] = 1e-7
-        if backend is None:
-            pdl_enabled(False)
-        # A fallback must use canonical scales even when the native cache is stale.
-        plan.prepared_weight_scales.zero_()
-        with kernel_override("gemm", "mm", backend):
-            codes, input_scales = _online_quantize_mxfp8(
-                x, [1, 32], "ue8m0", enable_pdl=False
-            )
-            expected = mm(
-                codes,
+        with pytest.raises(ValueError, match="prepare_mxfp8_weight_scales"):
+            mm(
+                x,
                 weight,
-                A_scales=input_scales,
                 B_scales=scales,
                 out_dtype=x.dtype,
                 quant="mxfp8",
                 block_size=[1, 32],
+                prepacked_scales=True,
             )
-            actual = fp8_linear(plan, x, weight, scales, out_dtype=x.dtype)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-    def test_linear_respects_quantizer_override(self, monkeypatch):
-        weight = torch.randn(256, 128, device="cuda").to(torch.float8_e4m3fn)
-        scales = torch.full((256, 4), 123, device="cuda", dtype=torch.uint8)
-        plan = prepare_fp8_linear(weight, scales, [1, 32])
-        x = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
-        expected = fp8_linear(plan, x, weight, scales, out_dtype=x.dtype)
-
-        def unexpected_fused_quantizer(*args):
-            pytest.fail("linear ignored the canonical quantizer override")
-
-        monkeypatch.setattr(
-            "tokenspeed_kernel.ops.gemm._quantize_fp8_group32_swizzled",
-            unexpected_fused_quantizer,
-        )
-        with kernel_override(
-            "quantization", "fp8_with_scale", "triton_quantize_fp8_group32_ue8m0"
-        ):
-            actual = fp8_linear(plan, x, weight, scales, out_dtype=x.dtype)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-    @pytest.mark.parametrize("n,k", [(64, 128), (256, 96)])
-    def test_linear_without_native_cache(self, n, k):
-        weight = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
-        scales = torch.full((n, k // 32), 123, device="cuda", dtype=torch.uint8)
-        plan = prepare_fp8_linear(weight, scales, [1, 32])
-        assert plan.prepared_weight_scales is None
-        x = torch.randn(3, k, device="cuda", dtype=torch.bfloat16)
-        codes, input_scales = _online_quantize_mxfp8(
-            x, [1, 32], "ue8m0", enable_pdl=False
-        )
-        expected = mm(
-            codes,
-            weight,
-            A_scales=input_scales,
-            B_scales=scales,
-            out_dtype=x.dtype,
-            quant="mxfp8",
-            block_size=[1, 32],
-        )
-        actual = fp8_linear(plan, x, weight, scales, out_dtype=x.dtype)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

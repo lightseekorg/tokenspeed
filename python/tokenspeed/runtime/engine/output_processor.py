@@ -51,7 +51,10 @@ from tokenspeed.runtime.engine.io_struct import (
     BatchTokenIDOut,
 )
 from tokenspeed.runtime.engine.logprobs import LogprobsProcessor
-from tokenspeed.runtime.metrics.collector import RequestFinishStats
+from tokenspeed.runtime.metrics.collector import (
+    RequestFinishStats,
+    finish_reason_label,
+)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.async_llm import AsyncLLM
@@ -352,7 +355,8 @@ class OutputProcessor:
             state.last_completion_tokens = completion_tokens
             state.first_completion_tokens = completion_tokens
             self.engine.metrics.observe_time_to_first_token(
-                state.first_token_time - state.created_time
+                state.first_token_time - state.created_time,
+                stream=bool(state.obj.stream),
             )
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
@@ -391,6 +395,8 @@ class OutputProcessor:
                     e2e_latency=state.finished_time - state.created_time,
                     cached_prompt_tokens=cached_prompt,
                     finished_ok=finished_ok,
+                    finish_reason=finish_reason_label(fr),
+                    stream=bool(state.obj.stream),
                 )
             )
             if (completion_tokens - state.first_completion_tokens) > 0:

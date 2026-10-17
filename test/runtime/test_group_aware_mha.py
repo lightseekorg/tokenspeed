@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import os
 import sys
-import unittest
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -33,10 +33,10 @@ def _layer(group_id, layer_id=0):
     return SimpleNamespace(group_id=group_id, layer_id=layer_id)
 
 
-class RouterOverMhaLeavesTest(unittest.TestCase):
+class TestRouterOverMhaLeavesTest:
     """A router with two real MHAAttnBackend leaves (P=4 and P=2)."""
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import torch
 
@@ -44,7 +44,7 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
                 MHAAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.MHAAttnBackend = MHAAttnBackend
 
@@ -92,10 +92,10 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
         router.bind(
             CacheGroupGeometry(
                 granularities={gid: 4 for gid in group_ids},
-                families={gid: "history" for gid in group_ids},
+                attn_kinds={gid: "full_history" for gid in group_ids},
                 full_history_group_id=FULL,
                 row_geometry={gid: (4, 1) for gid in group_ids},
-                retentions={gid: ("full_history", None) for gid in group_ids},
+                windows={gid: None for gid in group_ids},
             ),
             leaves,
         )
@@ -127,17 +127,15 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
             torch.tensor([9], dtype=torch.int32),
         )
         # FULL leaf runs at the raw grain (P=4, ratio 1): pages verbatim.
-        self.assertEqual(leaves[FULL].page_table_buf[0].tolist(), [5, 6, 7, 0, 0, 0])
+        assert (leaves[FULL].page_table_buf[0].tolist()) == ([5, 6, 7, 0, 0, 0])
         # SWA leaf runs at P=2 (ratio 2): raw page p -> kernel pages 2p, 2p+1
         # of ITS group's table — never the FULL group's pages.
-        self.assertEqual(
-            leaves[SWA].page_table_buf[0].tolist(),
-            [18, 19, 16, 17, 6, 7, 0, 0, 0, 0, 0, 0],
+        assert (leaves[SWA].page_table_buf[0].tolist()) == (
+            [18, 19, 16, 17, 6, 7, 0, 0, 0, 0, 0, 0]
         )
         # Each leaf's decode metadata views its own buffer, not a shared one.
-        self.assertNotEqual(
-            leaves[FULL].forward_decode_metadata.page_table.data_ptr(),
-            leaves[SWA].forward_decode_metadata.page_table.data_ptr(),
+        assert (leaves[FULL].forward_decode_metadata.page_table.data_ptr()) != (
+            leaves[SWA].forward_decode_metadata.page_table.data_ptr()
         )
 
     def test_write_locations_land_in_the_layers_own_group_pages(self):
@@ -155,11 +153,11 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
         )
         # pos 8, FULL (P=4): raw page 7 slot 0 -> 28 — inside FULL's pages.
         full_locs = router.write_locations(_layer(FULL), ForwardMode.DECODE)
-        self.assertEqual(full_locs.tolist(), [28])
+        assert (full_locs.tolist()) == ([28])
         # pos 8, SWA (P=2): raw page 3 -> kernel page 6 slot 0 -> 12 — SWA's
         # own table, so the two groups disagree, proving no shared table.
         swa_locs = router.write_locations(_layer(SWA), ForwardMode.DECODE)
-        self.assertEqual(swa_locs.tolist(), [12])
+        assert (swa_locs.tolist()) == ([12])
 
     def test_unknown_group_id_raises_even_with_a_sole_leaf(self):
         # The old single-group fallback (empty/unknown group_id -> the only
@@ -173,11 +171,11 @@ class RouterOverMhaLeavesTest(unittest.TestCase):
             {FULL: torch.tensor([[5, 6, 7]], dtype=torch.int32)},
             torch.tensor([9], dtype=torch.int32),
         )
-        with self.assertRaisesRegex(KeyError, "names cache group 'nope'"):
+        with pytest.raises((KeyError), match=("names cache group 'nope'")):
             router.write_locations(_layer("nope"), ForwardMode.DECODE)
-        with self.assertRaisesRegex(KeyError, "names cache group ''"):
+        with pytest.raises((KeyError), match=("names cache group ''")):
             router.write_locations(_layer(""), ForwardMode.DECODE)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

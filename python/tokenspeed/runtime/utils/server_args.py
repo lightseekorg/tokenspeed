@@ -46,6 +46,7 @@ from tokenspeed.runtime.configs.numerics import (
     YARN_RAMP_MASK_DEVICES,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
+from tokenspeed.runtime.metrics.config import resolve_metrics_options
 from tokenspeed.runtime.moe.dispatch_algorithm import (
     EP_DISPATCH_ALGORITHMS,
     STATIC_EP_DISPATCH_ALGORITHMS,
@@ -84,9 +85,10 @@ SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX = float(1 << 20)
 # Spec-decode overshoot spans the physical KV extent must absorb past the
 # logical context_len. The overlap scheduler steps a finished request at most
 # ONE extra iteration (the depth-1 event loop commits the previous step every
-# round, so the Finish event reaches the C++ scheduler before the next plan),
-# and termination is checked CPU-side against max_new_tokens, so verify can
-# commit past context_len for exactly that window:
+# round, so the Finish event reaches the C++ scheduler before the next plan).
+# The device cuts a round at max_new_tokens and stops the request, but a
+# finish only the control plane decides (a stop string) leaves the rounds
+# uncut, so verify can still commit past context_len for exactly that window:
 #   1. the finishing step's own accept (up to spec_num_tokens past the limit),
 #   2. the single lingering step's accept,
 #   3. the lingering step laying out its next draft block after that accept.
@@ -94,6 +96,19 @@ SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX = float(1 << 20)
 # whose output is already truncated by max_new_tokens; the garbage KV is
 # evicted with the request one step later.
 _SPEC_OVERSHOOT_SPANS = 3
+
+
+def spec_rope_positions(context: int, verify_width: int) -> int:
+    """How many positions a RoPE table needs for a context.
+
+    The RoPE kernels index the table by raw position, and speculative
+    decoding writes up to ServerArgs.spec_context_pad positions past the
+    context (_SPEC_OVERSHOOT_SPANS verify widths). The table covers the
+    context, that pad and one more verify width of headroom; the verify width
+    is 0 without speculative decoding.
+    """
+    return context + (_SPEC_OVERSHOOT_SPANS + 1) * verify_width
+
 
 # Speculative algorithms a prefill server runs on the chunk pipeline
 # (--pipeline-parallel-size > 1). The drafter executes on the last stage, the
@@ -121,6 +136,53 @@ def expert_placement_requested(server_args) -> bool:
     )
 
 
+def _checkpoint_architectures(
+    model: str, revision: str | None, download: bool = False
+) -> list[str] | None:
+    """The ``architectures`` of ``model``'s ``config.json``: from the model
+    directory, else from the local Hugging Face cache, else, with ``download``,
+    by downloading that file alone as ``get_config`` resolves a hub id
+    (HF_HUB_OFFLINE keeps it to the cache; a ModelScope id is not looked up on
+    the Hugging Face Hub). None when it cannot be read.
+    """
+    if not model:
+        return []
+    path = os.path.join(model, "config.json")
+    if not os.path.isdir(model):
+        import huggingface_hub.constants
+        from huggingface_hub import hf_hub_download, try_to_load_from_cache
+
+        from tokenspeed.runtime.utils.env import envs
+
+        try:
+            path = try_to_load_from_cache(model, "config.json", revision=revision)
+            if (
+                not isinstance(path, str)
+                and download
+                and not envs.TOKENSPEED_USE_MODELSCOPE.get()
+            ):
+                from tokenspeed.runtime.model_loader.weight_utils import get_lock
+
+                with get_lock(model):
+                    path = hf_hub_download(
+                        model,
+                        "config.json",
+                        revision=revision,
+                        local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                    )
+        except Exception:  # not a repo id, offline and not cached, unreachable
+            return None
+        if not isinstance(path, str):
+            return None
+    try:
+        with open(path) as file:
+            config = json.load(file)
+    except (OSError, ValueError):
+        return None
+    architectures = config.get("architectures") if isinstance(config, dict) else None
+    return list(architectures) if isinstance(architectures, list) else []
+
+
 def str_to_bool(value: str | bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -145,6 +207,11 @@ def _nonempty_str(value: str) -> str:
     if not value.strip():
         raise argparse.ArgumentTypeError("value must be a non-empty string")
     return value
+
+
+def kernel_override_env_key(family: str, mode: str) -> str:
+    """The variable ``tokenspeed_kernel.selection.select_kernel`` reads."""
+    return f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
 
 
 def validate_context_parallel_roles(
@@ -339,6 +406,7 @@ class ServerArgs:
     enable_metrics: bool = False
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
+    metrics_reporter_config: str | None = None
     # Port for the engine's Prometheus /metrics HTTP endpoint, served from the
     # engine's main process when --enable-metrics is on. None auto-allocates a
     # free port (logged at startup).
@@ -512,8 +580,10 @@ class ServerArgs:
     engram_host_table_dir: str | None = None
     engram_host_table_layout: str = "auto"
 
-    # Grammar backend
-    grammar_backend: str = "none"
+    # Grammar backend. None means the checkpoint default has not been resolved.
+    grammar_backend: str | None = None
+    # Model-declared constrained decoding policy, reported through server info.
+    constrained_decoding: Literal["requested", "always"] | None = None
     # Used by ``input_processor`` to defer json_schema grammars past the
     # model's reasoning channel.
     reasoning_parser: str | None = None
@@ -534,6 +604,7 @@ class ServerArgs:
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
+    synthetic_acceptance_length: float | None = None
     # Standard (draft-prob) rejection sampling for the chain drafters: the
     # drafter samples each step from its own distribution q and records it,
     # verify accepts with coin * q(x) < p(x). Off: the target-only rule
@@ -680,6 +751,7 @@ class ServerArgs:
 
     def __post_init__(self):
         self.resolve_basic_defaults()
+        self.resolve_model_defaults()
         self.resolve_launcher_topology()
         self.resolve_parallelism()
         self.resolve_memory_and_scheduling()
@@ -692,6 +764,7 @@ class ServerArgs:
         self.validate()
 
     def resolve_basic_defaults(self):
+        resolve_metrics_options(self)
         self.model = maybe_model_redirect(self.model)
 
         if self.kv_cache_dtype == "fp8":
@@ -708,6 +781,51 @@ class ServerArgs:
 
         if self.seed is None:
             self.seed = random.randint(0, 1 << 30)
+
+        self._grammar_backend_unset = self.grammar_backend is None
+        if self.grammar_backend is None:
+            self.grammar_backend = "none"
+
+    def resolve_model_defaults(self, download: bool = False):
+        """Model defaults that must be known before any process starts.
+
+        ModelConfig applies a model's other defaults in the scheduler, but TF32
+        follows the environment the launch exports before it starts the
+        scheduler (``engine._set_envs_and_config``), so the checkpoint is read
+        here (``_checkpoint_architectures``). Beam serves without TF32: its FP32
+        router hands rows past the decode GEMV leaf's 16 to a Torch FP32
+        matmul, which TF32 would run with a 10-bit mantissa. Without the
+        network, ``_beam_checkpoint`` is None for a hub id the cache does not
+        hold yet; engine setup calls this again with ``download``.
+        """
+        architectures = _checkpoint_architectures(self.model, self.revision, download)
+        self._beam_checkpoint = (
+            None if architectures is None else "BeamForCausalLM" in architectures
+        )
+        if self._beam_checkpoint and not self.disable_tf32:
+            self.disable_tf32 = True
+            logger.info(
+                "Beam default disable_tf32=True: the FP32 router runs without TF32."
+            )
+        if (
+            self._beam_checkpoint
+            and self._grammar_backend_unset
+            and self.grammar_backend == "none"
+        ):
+            self.grammar_backend = "xgrammar"
+            logger.info("Beam default grammar_backend=xgrammar.")
+        elif (
+            self._beam_checkpoint
+            and not self._grammar_backend_unset
+            and self.grammar_backend == "none"
+            and not getattr(self, "_beam_grammar_none_warned", False)
+        ):
+            self._beam_grammar_none_warned = True
+            logger.warning(
+                "Beam was explicitly launched with --grammar-backend none; "
+                "constrained decoding requests will be rejected. This override is "
+                "intended only for benchmarking."
+            )
 
     def resolve_config_aliases(self):
         # Whether the block-drafter widths were given rather than defaulted.
@@ -739,6 +857,27 @@ class ServerArgs:
 
             if not isinstance(config, dict):
                 raise ValueError("--speculative-config must be a JSON object")
+
+            if "synthetic_acceptance_length" in config:
+                length = config["synthetic_acceptance_length"]
+                if (
+                    isinstance(length, bool)
+                    or not isinstance(length, (int, float))
+                    or not math.isfinite(length)
+                ):
+                    raise ValueError(
+                        "synthetic_acceptance_length must be a finite number"
+                    )
+                if (
+                    self.synthetic_acceptance_length is not None
+                    and self.synthetic_acceptance_length != length
+                ):
+                    raise ValueError(
+                        "--synthetic-acceptance-length conflicts with "
+                        "synthetic_acceptance_length in --speculative-config"
+                    )
+                if self.synthetic_acceptance_length is None:
+                    self.synthetic_acceptance_length = length
 
             method = config.get("method")
             if method is not None and self.speculative_algorithm is None:
@@ -828,7 +967,9 @@ class ServerArgs:
 
     def resolve_kernel_backends(self):
         _require_choice(
-            "--dense-gemm-backend", self.dense_gemm_backend, ("auto", "trtllm_cutedsl")
+            "--dense-gemm-backend",
+            self.dense_gemm_backend,
+            ("auto", "trtllm_cutedsl", "deepgemm"),
         )
         # The numerics switches (docs/design/numerics.md) are closed sets.
         for flag, value, choices in (
@@ -854,11 +995,12 @@ class ServerArgs:
             # decoding but silently wrong for any serving deployment where
             # requests carry sampling params, since the model collapses into
             # repetition-mode loops within a few hundred steps. Default to the
-            # sampling-respecting backend on NVIDIA where flashinfer is
-            # available, fall back to greedy elsewhere; users can still opt
-            # into greedy explicitly via ``--sampling-backend greedy``.
+            # sampling-respecting backend on NVIDIA and Ascend; users can
+            # still opt into greedy explicitly via ``--sampling-backend greedy``.
             if current_platform().is_nvidia:
                 self.sampling_backend = "flashinfer"
+            elif current_platform().is_npu:
+                self.sampling_backend = "ascend_full"
             else:
                 self.sampling_backend = "greedy"
 
@@ -1304,6 +1446,61 @@ class ServerArgs:
         self.kv_offload_config = dict(options, layers=list(layers))
 
     def resolve_speculative_decoding(self):
+        if self.speculative_algorithm == "DUMMY":
+            if (
+                self.speculative_draft_model_path is not None
+                or self.draft_model_path_use_base
+            ):
+                raise ValueError("DUMMY drafting does not accept a draft model path")
+            if int(self.speculative_num_draft_tokens) <= 1:
+                raise ValueError(
+                    "DUMMY drafting requires --speculative-num-draft-tokens > 1"
+                )
+        if self.synthetic_acceptance_length is not None:
+            length = self.synthetic_acceptance_length
+            if (
+                isinstance(length, bool)
+                or not isinstance(length, (int, float))
+                or not math.isfinite(length)
+            ):
+                raise ValueError("synthetic_acceptance_length must be a finite number")
+            if self.speculative_algorithm is None:
+                raise ValueError(
+                    "--synthetic-acceptance-length requires speculative decoding"
+                )
+            # Block checkpoints may replace the default width in ModelConfig.
+            # SamplingBackend checks the final width before allocating buffers.
+            checkpoint_sets_width = (
+                self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS
+                and not self._speculative_widths_explicit
+            )
+            if length < 1 or (
+                not checkpoint_sets_width and length > self.speculative_num_draft_tokens
+            ):
+                raise ValueError(
+                    "synthetic_acceptance_length must be in "
+                    f"[1, {self.speculative_num_draft_tokens}] "
+                    "(the speculative verify width including the target token)"
+                )
+            if self.sampling_backend != "greedy":
+                raise ValueError(
+                    "--synthetic-acceptance-length requires --sampling-backend greedy"
+                )
+            if self.speculative_eagle_topk != 1:
+                raise ValueError(
+                    "--synthetic-acceptance-length does not support draft trees"
+                )
+            if self.dp_sampling or self.enable_output_logprobs:
+                raise ValueError(
+                    "--synthetic-acceptance-length does not support "
+                    "--dp-sampling or --enable-output-logprobs"
+                )
+            logger.warning(
+                f"Synthetic acceptance length {length:.4f} enabled for benchmarking. "
+                "Generated text is synthetic and must not be used for correctness "
+                "or accuracy evaluation."
+            )
+
         # Keep drafter backend consistent with the main model unless explicitly set.
         if (
             self.speculative_algorithm is not None
@@ -1474,13 +1671,21 @@ class ServerArgs:
             )
 
     def resolve_communication(self):
-        # Auto-enable allreduce fusion on supported single-node TP configurations.
+        # Auto-enable allreduce fusion on supported single-node TP configurations,
+        # and for Beam on Hopper or newer at any node count: across nodes Beam's
+        # boundaries fuse only where the attention TP group has an MNNVL
+        # workspace and keep the unfused chain otherwise (beam_sandwich_fusion.py).
         platform = current_platform()
         if (
             not self.enable_allreduce_fusion
             and not self.emulate_rank_zero
             and (current_platform().is_hopper_plus or platform.is_amd)
-            and self.mapping.nnodes == 1
+            and (
+                self.mapping.nnodes == 1
+                or (
+                    getattr(self, "_beam_checkpoint", False) and platform.is_hopper_plus
+                )
+            )
             and self.mapping.has_attn_tp
             and not self.mapping.has_attn_dp
         ):
@@ -1549,12 +1754,11 @@ class ServerArgs:
         """The rl-bitwise block: every envelope beyond auto runs it."""
         # Collectives: one association order per reduction. NCCL's ring
         # chunks by message size, so a plain NCCL sum is run-stable but not
-        # batch-size-invariant; batch_invariant_collectives routes the
-        # all-reduce to the NVLS in-switch reduction with a fixed issuer where
-        # multicast reaches (verified bitwise at startup) and every other
+        # batch-size-invariant; batch_invariant_collectives routes every
         # reduction to the rank-ordered fp32 fold (comm_backend/auto.py).
-        # force_deterministic_rsag stays the user's "NCCL and the fold only"
-        # knob; the envelope does not set it.
+        # Gathers move bytes and keep the multicast kernels;
+        # force_deterministic_rsag, which also moves them to NCCL, stays the
+        # user's knob and the envelope does not set it.
         self.batch_invariant_collectives = True
         self.enable_allreduce_fusion = False
         self.comm_fusion_max_num_tokens = -1
@@ -1617,26 +1821,18 @@ class ServerArgs:
         # Layouts stay explicit: the envelope does not fold them in. A
         # head-sharded o_proj that still sums its head partials across ranks
         # is batch-invariant under the envelope, but its bits are not the
-        # full-K GEMM a replicated or column-parallel o_proj computes, and
-        # they equal a TP-W engine's all-reduced o_proj only when both sides
-        # sum in the same order: the exchanging forward's reduce-scatter
-        # always takes the ordered fold, while an all-reduce (the TP-W
-        # engine's, and the replicated-row decode steps of a query-sharding
-        # engine) takes the in-switch reduction where multicast reaches, whose
-        # order is a property of the GPU set (comm_backend/self_check.py).
-        # --force-deterministic-rsag on the all-reducing side pins it to the
-        # fold; docs/design/numerics.md, "Layout invariance of query context
-        # parallelism".
+        # full-K GEMM a replicated or column-parallel o_proj computes. Every
+        # batch-invariant reduction (the exchanging forward's reduce-scatter,
+        # a TP-W engine's all-reduce) is the same rank-ordered fold, so it does
+        # equal a TP-W engine's all-reduced o_proj; docs/design/numerics.md,
+        # "Layout invariance of query context parallelism".
         if self.mapping.attn.has_head_tp and self.tp_batch_invariant == "none":
             logger.warning(
                 "--numerics rl-bitwise with --attn-head-tp-size > 1 but without "
                 "--tp-batch-invariant attn: the o_proj head partials are summed "
-                "across ranks (the ordered fold for the reduce-scatter, the "
-                "in-switch all-reduce where it applies), which is batch-invariant "
-                "but differs from the full-K o_proj of a TP1 or --tp-batch-invariant "
-                "engine, and equals a TP-W engine's o_proj only when both sides "
-                "sum in the same order (--force-deterministic-rsag on the "
-                "all-reducing side)"
+                "across ranks by the rank-ordered fold, which is batch-invariant "
+                "and equals a TP-W engine's o_proj, but differs from the full-K "
+                "o_proj of a TP1 or --tp-batch-invariant engine"
             )
 
     def resolve_disaggregation(self):
@@ -2270,7 +2466,8 @@ class ServerArgs:
             choices=["auto", "bfloat16", "fp8", "fp8_e4m3", "mxfp8"],
             help='Data type for kv cache storage. "auto" and "bfloat16" store BF16 '
             'rows (fp16 activations convert on write). "fp8" is an alias for '
-            '"fp8_e4m3" (unit scale). "mxfp8" stores '
+            '"fp8_e4m3" (unit scale, or the checkpoint\'s per-tensor KV-cache '
+            'scales where the model loads them). "mxfp8" stores '
             "block-scaled fp8-e4m3 (one UE8M0 scale per 32 head_dim elements) and "
             "requires --block-size 128 with an MHA attention backend.",
         )
@@ -2395,13 +2592,15 @@ class ServerArgs:
             "--kvstore-ratio",
             type=float,
             default=ServerArgs.kvstore_ratio,
-            help="The ratio of the size of the KVStore host memory pool to the size of the device pool.",
+            help="The ratio of the size of the KVStore host memory pool to the size of the device pool. "
+            "Capped, with a warning, to what fits in this rank's share of the Host memory its node has available.",
         )
         parser.add_argument(
             "--kvstore-size",
             type=int,
             default=ServerArgs.kvstore_size,
-            help="The size of the KVStore host memory pool in gigabytes, which will override kvstore_ratio if set.",
+            help="The size of the KVStore host memory pool in gigabytes, which will override kvstore_ratio if set. "
+            "Refused at startup if it does not fit in this rank's share of the Host memory its node has available.",
         )
         parser.add_argument(
             "--kvstore-io-backend",
@@ -2619,14 +2818,19 @@ class ServerArgs:
         parser.add_argument(
             "--enable-metrics",
             action="store_true",
-            help="Enable log metrics.",
+            help="Enable the selected metrics reporters.",
         )
         parser.add_argument(
             "--metrics-reporters",
             action="append",
-            choices=["prometheus"],
-            default=["prometheus"],
-            help="Select metrics reporter(can be specified multiple times)",
+            default=None,
+            help="Select prometheus or a registered metrics reporter (repeat for multiple; defaults to prometheus).",
+        )
+        parser.add_argument(
+            "--metrics-reporter-config",
+            type=str,
+            default=ServerArgs.metrics_reporter_config,
+            help="JSON file mapping external metrics reporter names to their configurations.",
         )
         parser.add_argument(
             "--metrics-port",
@@ -2794,10 +2998,11 @@ class ServerArgs:
             "--dense-gemm-backend",
             type=str,
             default=ServerArgs.dense_gemm_backend,
-            choices=["auto", "trtllm_cutedsl"],
+            choices=["auto", "trtllm_cutedsl", "deepgemm"],
             help="Backend for standard 128x128 block-FP8 dense linears. "
             "trtllm_cutedsl requires Blackwell and preserves checkpoint FP8 "
             "weights and FP32 scales without requantization. "
+            "deepgemm requires Hopper and preserves FP32 scales. "
             "Other quantization formats and routed experts are unchanged.",
         )
         parser.add_argument(
@@ -2950,6 +3155,7 @@ class ServerArgs:
                 "flashinfer_full",
                 "triton",
                 "triton_full",
+                "ascend_full",
             ],
             default=ServerArgs.sampling_backend,
             help="Sampling backend. "
@@ -2962,6 +3168,7 @@ class ServerArgs:
             "via the softmax+renorm+min_p kernel sequence. "
             "'triton_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
             "with Triton Gumbel-Max for single-step sampling. "
+            "'ascend_full': graph-safe Ascend top-k/top-p/min-p sampling and chain verify. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
             "Finite top_k values must be < 128 or -1.",
         )
@@ -3084,7 +3291,8 @@ class ServerArgs:
             help=(
                 "Grammar backend. 'none' disables grammar-guided decoding "
                 "entirely; requests with json_schema, regex, ebnf or "
-                "structural_tag are then rejected as invalid requests."
+                "structural_tag are then rejected as invalid requests. The default "
+                "is checkpoint-specific."
             ),
         )
         parser.add_argument(
@@ -3142,13 +3350,13 @@ class ServerArgs:
             "--speculative_config",
             type=str,
             default=ServerArgs.speculative_config,
-            help="JSON speculative decoding configuration. Supported keys are method, model, and num_speculative_tokens.",
+            help="JSON speculative decoding configuration. Supported keys are method, model, num_speculative_tokens, and synthetic_acceptance_length.",
         )
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
             help="Speculative algorithm. In-tree: EAGLE3, MTP, DFLASH, "
-            "DSPARK; plugins may register more (validated after plugin "
+            "DSPARK, DUMMY; plugins may register more (validated after plugin "
             "discovery).",
         )
         parser.add_argument(
@@ -3180,6 +3388,16 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--synthetic-acceptance-length",
+            type=float,
+            default=ServerArgs.synthetic_acceptance_length,
+            help="Benchmark-only mean accepted length including the guaranteed "
+            "target token, in [1, speculative_num_draft_tokens]. Forces a "
+            "floor/ceil acceptance distribution; generated text is not valid "
+            "for correctness evaluation. Requires --sampling-backend greedy without "
+            "--dp-sampling or --enable-output-logprobs. Unset disables it.",
         )
         parser.add_argument(
             "--enable-speculative-sampling",
@@ -3558,25 +3776,23 @@ class ServerArgs:
             "--force-deterministic-rsag",
             action="store_true",
             help="NCCL and the rank-ordered fold only: no symmetric-memory "
-            "path -- neither the Triton multicast all-gather/reduce-scatter "
-            "and in-switch all-reduce, nor the trtllm and Triton all-reduce "
-            "tiers, nor the distributed argmax. With --batch-invariant-collectives every "
-            "reduction takes the fold; without it, NCCL. Not folded in by "
-            "--numerics rl-bitwise, which keeps the multicast paths and "
-            "verifies the in-switch reduction at startup.",
+            "path -- neither the Triton multicast all-gather/reduce-scatter, "
+            "nor the trtllm and Triton all-reduce tiers, nor the distributed "
+            "argmax. With --batch-invariant-collectives every reduction takes "
+            "the fold; without it, NCCL. Not folded in by --numerics "
+            "rl-bitwise, whose gathers keep the multicast kernels.",
         )
         parser.add_argument(
             "--batch-invariant-collectives",
             action="store_true",
             help="One association order per reduction, independent of the "
-            "batch. A 2-D bf16 all-reduce on a multicast-reachable group runs "
-            "as the NVLS in-switch reduction issued by one fixed rank, "
-            "verified bitwise at startup; every other reduction (other "
-            "payloads, unreachable groups, the reduce-scatters) runs as NCCL "
-            "data movement plus a fixed-rank-order fp32 fold, which for an "
-            "all-reduce costs world_size times the traffic. NCCL sums are "
-            "run-stable but chunk by message size, so they are not "
-            "batch-size-invariant. Folded in by --numerics rl-bitwise.",
+            "batch: every reduction runs as NCCL data movement plus a "
+            "fixed-rank-order fp32 fold, which for an all-reduce costs "
+            "world_size times the traffic. NCCL sums are run-stable but chunk "
+            "by message size, and the NVLS in-switch reduction's order moves "
+            "with a row's offset in the buffer, so neither is "
+            "batch-invariant. Gathers keep the multicast kernels. Folded in "
+            "by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--numerics",
@@ -3752,7 +3968,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-allreduce-fusion",
             action="store_true",
-            help="Enable allreduce fusion for improved decode performance. Auto-enabled on supported single-node TP configurations.",
+            help="Enable allreduce fusion for improved decode performance. Auto-enabled on supported single-node TP configurations, and for Beam on any number of nodes (its boundaries fuse where an MNNVL workspace serves them).",
         )
         parser.add_argument(
             "--disaggregation-bootstrap-port",
@@ -3940,6 +4156,11 @@ class PortArgs:
 
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: str | None
+
+    # Plain producer settings; live output resources remain in their owner process.
+    metrics_producer_configs: dict[str, dict[str, object]] = dataclasses.field(
+        default_factory=dict, repr=False
+    )
 
     @staticmethod
     def init_new(server_args: ServerArgs, dp_rank: int | None = None) -> "PortArgs":

@@ -240,9 +240,8 @@ def plan_cache_storage(
                 continue
             spec = specs[f.group_id]
             if (
-                spec.family != "history"
+                spec.attn_kind != "full_history"
                 or spec.entry_stride_tokens != 1
-                or spec.retention != "full_history"
                 or spec.shard_count != 1
                 or f.shape[0] != spec.rows_per_page
             ):

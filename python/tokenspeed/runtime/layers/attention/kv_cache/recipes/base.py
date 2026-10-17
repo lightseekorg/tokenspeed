@@ -356,7 +356,9 @@ class CacheRecipe(ABC):
         if budgeted < 1:
             raise ValueError(
                 f"{self.family} cache budget must hold a null parent and one "
-                "usable LCM parent"
+                f"usable LCM parent of {parent_bytes / (1 << 30):.2f} GiB each, "
+                f"but the cache budget leaves {usable_bytes / (1 << 30):.2f} GiB "
+                "after this family's fixed workspaces"
             )
         return budgeted
 

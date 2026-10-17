@@ -19,14 +19,29 @@
 # SOFTWARE.
 
 import logging
+import os
 
 import numpy as np
+
+from tokenspeed.runtime.utils.network import is_valid_ipv6_address, join_host_port
 
 logger = logging.getLogger(__name__)
 
 
+def enable_mooncake_ipv6_for_host(hostname: str) -> None:
+    """Make Mooncake's handshake use IPv6 when ``hostname`` is an IPv6 address.
+
+    Mooncake opens its P2P handshake sockets as IPv4 unless ``MC_USE_IPV6`` is
+    set. Mooncake reads ``MC_USE_IPV6`` when its first engine starts, so set it
+    before then; an explicit setting is kept.
+    """
+    if is_valid_ipv6_address(hostname):
+        os.environ.setdefault("MC_USE_IPV6", "1")
+
+
 class MooncakeTransferEngine:
     def __init__(self, hostname: str, gpu_id: int, ib_device: str | None = None):
+        enable_mooncake_ipv6_for_host(hostname)
         try:
             from mooncake.engine import TransferEngine
         except ImportError as e:
@@ -53,7 +68,8 @@ class MooncakeTransferEngine:
             hostname=self.hostname,
             device_name=self.ib_device,
         )
-        self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
+        # Bracket IPv6 hosts the way Mooncake writes its own segment names.
+        self.session_id = join_host_port(self.hostname, self.engine.get_rpc_port())
         # The peer identifies this rank by session_id in its transfer logs
         # (Prefill's "session=..."), so name it once per process here.
         logger.info(

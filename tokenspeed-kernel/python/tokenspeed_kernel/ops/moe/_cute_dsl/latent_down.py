@@ -36,6 +36,10 @@ spell -0, which a product would have to reach twice over rather than once, and
 the publish overwrites rather than accumulates onto rows still holding
 sentinels. Which producer serves them is chosen in one place, ``_wide_producer``.
 
+A caller may instead arm its slot with ``HALF_POLLED_SENTINEL``, a NaN payload
+no GEMM emits: the gather then polls 16-bit halves, so a library GEMV may write
+its row straight into the mailbox one BF16 element at a time.
+
 Every rank must construct in lockstep: the mailbox rendezvous is collective.
 """
 
@@ -43,10 +47,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication.triton import multicast_publish
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_tail import (
     multicast_backend_unavailable_reason,
 )
@@ -59,10 +64,14 @@ _DOWN_POOL_DEPTH = 2
 _FUSED_MAX_M = 8
 # Widest k-tile the fused kernel's configs use; a hidden width off it cannot compile.
 _K_TILE = 448 * 8
+
+
 # Per-kernel sweeps separate 608 from 304; end to end the two are indistinguishable.
 _LAMPORT_CTAS = 608
 _LAMPORT_THREADS = 512
 # Both BF16 lanes -0, so an unsanitized producer needs two coincidences, not one.
+# Polled per 16-bit half: no GEMM emits 0xFFFF, so producers may store single elements.
+HALF_POLLED_SENTINEL = 0xFFFFFFFF
 _DOWN_SENTINEL = 0x80008000
 _BF16_BYTES = 2
 
@@ -180,6 +189,7 @@ class _MailboxSlot:
     multicast_ptr: int
     gemm_by_m: dict[int, _Producer]
     gather_by_m: dict[int, _Gather]
+    sentinel: int = _DOWN_SENTINEL
 
 
 class _MulticastVaGemm:
@@ -206,7 +216,9 @@ class _MulticastVaGemm:
         latent_size: int,
         max_m: int,
         device: torch.device,
+        publish_gemm: Callable[..., torch.Tensor] | None,
     ) -> None:
+        self._publish_gemm = publish_gemm
         with torch.inference_mode(False), torch.no_grad():
             self._block = bf16_tensor_on_pointer(
                 multicast_ptr + rank * shard_dim * _BF16_BYTES,
@@ -240,8 +252,18 @@ class _MulticastVaGemm:
         bitwise, so an accumulating publish would be byte-identical to this one.
         A witness would have to catch a peer reading mid-accumulation.
         """
-        published = self._block[: hidden_states.shape[0]]
-        torch.mm(hidden_states, weight_block.t(), out=published)
+        tokens = hidden_states.shape[0]
+        if not 1 <= tokens <= self._block.shape[0]:
+            raise ValueError(
+                f"{tokens} rows do not fit the mailbox's {self._block.shape[0]}"
+            )
+        published = self._block[:tokens]
+        if self._publish_gemm is None:
+            torch.mm(hidden_states, weight_block.t(), out=published)
+        else:
+            block = self._publish_gemm(hidden_states, weight_block, published)
+            if block.data_ptr() != published.data_ptr():
+                multicast_publish(block, published)
         return mailbox
 
 
@@ -253,6 +275,7 @@ def _wide_producer(
     latent_size: int,
     max_m: int,
     device: torch.device,
+    publish_gemm: Callable[..., torch.Tensor] | None,
 ) -> _Producer:
     """Choose the producer for widths past the fused kernel's ceiling.
 
@@ -269,6 +292,7 @@ def _wide_producer(
         latent_size=latent_size,
         max_m=max_m,
         device=device,
+        publish_gemm=publish_gemm,
     )
 
 
@@ -335,7 +359,7 @@ class KimiK3LatentDownOp:
         """
         return (
             cls._unavailable_reason(
-                hidden_size, latent_size, tp_size, layer_count, group
+                hidden_size, latent_size, tp_size, layer_count, group, True
             )
             is None
         )
@@ -348,6 +372,7 @@ class KimiK3LatentDownOp:
         tp_size: int,
         layer_count: int,
         group: dist.ProcessGroup,
+        fused_producer: bool,
     ) -> str | None:
         """The first condition this rank fails, or None when it can host.
 
@@ -371,7 +396,7 @@ class KimiK3LatentDownOp:
             return (
                 f"{layer_count} blocks is not whole {_DOWN_POOL_DEPTH}-slot rotations"
             )
-        if hidden_size % _K_TILE:
+        if fused_producer and hidden_size % _K_TILE:
             return f"hidden {hidden_size} is not a multiple of the {_K_TILE} k-tile"
         if latent_size % tp_size or (latent_size // tp_size) % 8:
             return f"latent {latent_size} does not split into {tp_size} blocks of 8"
@@ -389,6 +414,7 @@ class KimiK3LatentDownOp:
         layer_count: int,
         model_scope: str,
         max_m: int,
+        publish_gemm: Callable[..., torch.Tensor] | None,
     ) -> "KimiK3LatentDownOp | None":
         """Bind this layer to a pooled mailbox, or return None if unsupported.
 
@@ -409,6 +435,11 @@ class KimiK3LatentDownOp:
                 the column group too -- both need the latent width to divide the
                 group. Raised to the fused kernel's ceiling when smaller: those
                 widths are compiled either way and cost eight mailbox rows.
+            publish_gemm: ``None`` for K3's fused GEMM, whose failed rendezvous
+                raises on the validated architecture; else an ``(x, weight, out) -> [rows, shard]``
+                GEMM that writes ``out`` or returns a block to publish, writing
+                each element once, on a ``HALF_POLLED_SENTINEL`` mailbox whose
+                failed rendezvous declines.
 
         Returns:
             The op, or None when the platform or shapes cannot support it.
@@ -417,7 +448,9 @@ class KimiK3LatentDownOp:
             return _decline("no process group")
         if max_m < 1:
             raise ValueError("max_m must be at least one row")
-        max_m = max(max_m, _FUSED_MAX_M)
+        fused_producer = publish_gemm is None
+        if fused_producer:
+            max_m = max(max_m, _FUSED_MAX_M)
         rank = dist.get_rank(group)
         tp_size = dist.get_world_size(group)
         verdict = cls._agreed(
@@ -428,10 +461,17 @@ class KimiK3LatentDownOp:
             layer_count,
             max_m,
             device,
+            fused_producer,
         )
         if not verdict:
             key = cls._verdict_key(
-                group, hidden_size, latent_size, tp_size, layer_count, max_m
+                group,
+                hidden_size,
+                latent_size,
+                tp_size,
+                layer_count,
+                max_m,
+                fused_producer,
             )
             return _decline(cls._reasons.get(key, "the group declined"))
         cls._agree_on_ceiling(group, max_m, tp_size, device)
@@ -445,19 +485,25 @@ class KimiK3LatentDownOp:
             _pool_slot(block_index),
             max_m,
             group.group_name,
+            fused_producer,
         )
         if key not in cls._pools:
             # A failure is remembered too: repeating it per layer would leak.
             cls._pools[key] = cls._build_slot(
-                group, hidden_size, latent_size, device, max_m
+                group,
+                hidden_size,
+                latent_size,
+                device,
+                max_m,
+                publish_gemm,
             )
         slot = cls._pools[key]
         if slot is None:
             reason = "the rendezvous returned no multicast address"
-            if not _rendezvous_failure_is_a_fault():
+            if publish_gemm is not None or not _rendezvous_failure_is_a_fault():
                 return _decline(reason)
             raise RuntimeError(_fabric_fault_message(reason))
-        arm_mailbox(slot.mailbox)
+        arm_mailbox(slot.mailbox, slot.sentinel)
         return cls(slot, shard_dim, rank, max_m)
 
     @staticmethod
@@ -468,6 +514,7 @@ class KimiK3LatentDownOp:
         tp_size: int,
         layer_count: int,
         max_m: int,
+        fused_producer: bool,
     ) -> tuple:
         """The identity a verdict and its reason are both cached under.
 
@@ -482,6 +529,7 @@ class KimiK3LatentDownOp:
             tp_size,
             layer_count,
             max_m,
+            fused_producer,
         )
 
     @classmethod
@@ -494,6 +542,7 @@ class KimiK3LatentDownOp:
         layer_count: int,
         max_m: int,
         device: torch.device,
+        fused_producer: bool,
     ) -> bool:
         """One group-wide answer to a question every rank answers locally.
 
@@ -508,11 +557,11 @@ class KimiK3LatentDownOp:
         bug rather than something to negotiate.
         """
         key = cls._verdict_key(
-            group, hidden_size, latent_size, tp_size, layer_count, max_m
+            group, hidden_size, latent_size, tp_size, layer_count, max_m, fused_producer
         )
         if key not in cls._verdicts:
             reason = cls._unavailable_reason(
-                hidden_size, latent_size, tp_size, layer_count, group
+                hidden_size, latent_size, tp_size, layer_count, group, fused_producer
             )
             # A peer's reason is not knowable here, only that it voted no.
             cls._reasons[key] = reason or "a peer declined"
@@ -584,6 +633,7 @@ class KimiK3LatentDownOp:
         latent_size: int,
         device: torch.device,
         max_m: int,
+        publish_gemm: Callable[..., torch.Tensor] | None,
     ) -> _MailboxSlot | None:
         from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.fused_multicast_latent_down_gemm import (  # noqa: E501
             FusedMulticastLatentDownGemmKernel,
@@ -593,6 +643,9 @@ class KimiK3LatentDownOp:
         )
         from torch.distributed import _symmetric_memory as symm_mem
 
+        fused_producer = publish_gemm is None
+        # An unsanitized (-0, -0) pair spells K3's word, so a library GEMM gets the NaN one.
+        sentinel = _DOWN_SENTINEL if fused_producer else HALF_POLLED_SENTINEL
         with torch.inference_mode(False), torch.no_grad():
             mailbox = symm_mem.empty(
                 (1, max_m, latent_size), dtype=torch.bfloat16, device=device
@@ -601,10 +654,11 @@ class KimiK3LatentDownOp:
         multicast_ptr = handle.multicast_ptr
         if not cls._agree_on_pointer(group, multicast_ptr, device):
             return None
-        arm_mailbox(mailbox)
+        arm_mailbox(mailbox, sentinel)
         rank = dist.get_rank(group)
         tp_size = dist.get_world_size(group)
         shard_dim = latent_size // tp_size
+        fused_rows = min(max_m, _FUSED_MAX_M) if fused_producer else 0
         gemm_by_m: dict[int, _Producer] = {
             m: FusedMulticastLatentDownGemmKernel(
                 rank=rank,
@@ -613,9 +667,9 @@ class KimiK3LatentDownOp:
                 latent_dim=latent_size,
                 num_rows=m,
             )
-            for m in range(1, min(max_m, _FUSED_MAX_M) + 1)
+            for m in range(1, fused_rows + 1)
         }
-        if max_m > _FUSED_MAX_M:
+        if max_m > fused_rows:
             wide = _wide_producer(
                 multicast_ptr=multicast_ptr,
                 rank=rank,
@@ -623,8 +677,20 @@ class KimiK3LatentDownOp:
                 latent_size=latent_size,
                 max_m=max_m,
                 device=device,
+                publish_gemm=publish_gemm,
             )
-            gemm_by_m.update({m: wide for m in range(_FUSED_MAX_M + 1, max_m + 1)})
+            gemm_by_m.update({m: wide for m in range(fused_rows + 1, max_m + 1)})
+        if publish_gemm is not None:
+            # Compile on scratch now so a first-seen width never compiles under capture.
+            bound = torch.accelerator.device_index(device.index)
+            with bound, torch.inference_mode(False), torch.no_grad():
+                scratch = torch.zeros(
+                    1, latent_size, dtype=torch.bfloat16, device=device
+                )
+                multicast_publish(
+                    torch.zeros(1, shard_dim, dtype=torch.bfloat16, device=device),
+                    scratch[:, :shard_dim],
+                )
         gathers: dict[tuple[int, int], _Gather] = {}
         gather_by_m: dict[int, _Gather] = {}
         for m in range(1, max_m + 1):
@@ -636,14 +702,49 @@ class KimiK3LatentDownOp:
                     max_m=max_m,
                     ctas=ctas,
                     threads=threads,
-                    sentinel=_DOWN_SENTINEL,
+                    sentinel=sentinel,
+                    poll_halves=sentinel == HALF_POLLED_SENTINEL,
                 )
             gather_by_m[m] = gathers[geometry]
-        return _MailboxSlot(mailbox, handle, multicast_ptr, gemm_by_m, gather_by_m)
+        return _MailboxSlot(
+            mailbox, handle, multicast_ptr, gemm_by_m, gather_by_m, sentinel
+        )
 
     def handles(self, num_tokens: int) -> bool:
         """Whether this op covers a batch of this width."""
         return 1 <= num_tokens <= self.max_m
+
+    @property
+    def sentinel(self) -> int:
+        """The empty word the mailbox is armed with and a consumer re-arms."""
+        return self._slot.sentinel
+
+    def publish(
+        self, hidden_states: torch.Tensor, weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Project ``hidden_states`` through this rank's block into every mailbox.
+
+        Args:
+            hidden_states: Contiguous ``[tokens, hidden_size]`` activation.
+            weight: This rank's ``[shard_dim, hidden_size]`` block. The caller
+                slices it, because a projection that narrowed its storage has
+                no full width left to slice from.
+        Returns:
+            This rank's mailbox rows ``[tokens, latent_size]``, still arriving;
+            a consumer polls them for ``sentinel`` and re-arms what it read.
+
+        Every word transitions once a round (in halves only on a half-polled
+        slot), and the GEMM gets the full mailbox so its capacity guard holds.
+        """
+        tokens = hidden_states.shape[0]
+        slot = self._slot
+        slot.gemm_by_m[tokens](
+            hidden_states,
+            weight,
+            slot.mailbox,
+            slot.multicast_ptr,
+        )
+        return slot.mailbox[0, :tokens]
 
     def __call__(
         self,
@@ -656,49 +757,35 @@ class KimiK3LatentDownOp:
 
         Args:
             hidden_states: Contiguous ``[tokens, hidden_size]`` activation.
-            weight: This rank's ``[shard_dim, hidden_size]`` block. The caller
-                slices it, because a projection that narrowed its storage has
-                no full width left to slice from.
+            weight: This rank's ``[shard_dim, hidden_size]`` block.
             output_scale: NVFP4 encoding multiplier for the fused gather, or
                 None to gather BF16. NVFP4 requires its kernel prepared before
                 capture, a width divisible by 64, and at most 1280 live rows.
 
         Returns:
-            The full BF16 latent, or (packed NVFP4 values, linear E4M3 scales).
-
-        Three invariants the publish depends on: every aligned 32-bit word
-        transitions exactly once a round and never in halves; the publishing
-        GEMM's beta is 0, never accumulating into the mailbox; and it is handed
-        the full mailbox rather than a slice, because the capacity guard bounds
-        a raw-pointer write and cannot see what it protects if given only the
-        batch.
+            The full BF16 latent in caller-owned memory, or (packed NVFP4
+            values, linear E4M3 scales).
         """
         tokens = hidden_states.shape[0]
         if output_scale is not None and self._nvfp4_gather is None:
             raise RuntimeError("prepare_nvfp4 must run before requesting NVFP4 output")
+        self.publish(hidden_states, weight)
         slot = self._slot
-        slot.gemm_by_m[tokens](
-            hidden_states,
-            weight,
-            slot.mailbox,
-            slot.multicast_ptr,
-        )
         if output_scale is not None:
             return self._nvfp4_gather(slot.mailbox, output_scale, m=tokens)
         return slot.gather_by_m[tokens](slot.mailbox, m=tokens)[0]
 
 
-def arm_mailbox(mailbox: torch.Tensor) -> None:
-    """Fill a mailbox with the empty sentinel the Lamport gather spins on.
+def arm_mailbox(mailbox: torch.Tensor, sentinel: int) -> None:
+    """Fill a mailbox with ``sentinel``, the empty word the Lamport gather spins on.
 
-    The sentinel is four ``_DOWN_SENTINEL`` words per 128-bit fragment, which
-    as BF16 pairs is (-0, -0). The tail's mailboxes keep the upstream
-    0x80000000, (+0, -0): a producer that cannot be made to sanitize -0 away
-    spells that one with a single coincidence, since the +0 half is a value
-    real results carry all the time.
+    ``_DOWN_SENTINEL`` is (-0, -0) as BF16 pairs. The tail's mailboxes keep the
+    upstream 0x80000000, (+0, -0): a producer that cannot be made to sanitize
+    -0 away spells that one with a single coincidence, since the +0 half is a
+    value real results carry all the time.
     """
     # int32 cannot hold the sentinel's top bit; fill_ takes its signed image.
-    mailbox.view(torch.int32).fill_(_DOWN_SENTINEL - 0x1_0000_0000)
+    mailbox.view(torch.int32).fill_(sentinel - 0x1_0000_0000)
 
 
 __all__ = ["KimiK3LatentDownOp", "arm_mailbox"]

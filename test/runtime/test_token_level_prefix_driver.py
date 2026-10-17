@@ -51,8 +51,7 @@ def _scheduler(*, with_state: bool = False) -> ts.Scheduler:
             group_id="history",
             block_granularity=PAGE,
             total_pages=64 + 1,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
         )
     ]
     if with_state:
@@ -61,8 +60,7 @@ def _scheduler(*, with_state: bool = False) -> ts.Scheduler:
                 group_id="state",
                 block_granularity=0,
                 total_pages=64 + 1,
-                retention=ts.CacheRetention.FullHistory,
-                family=ts.CacheGroupFamily.State,
+                attn_kind=ts.AttnKind.State,
             )
         )
     return ts.Scheduler(

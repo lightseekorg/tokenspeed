@@ -66,6 +66,7 @@ from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41Model,
 )
 from tokenspeed.runtime.models.deepseek_v41_dspark import (
+    DeepseekV41DSparkModel,
     DeepseekV41ForCausalLMDSpark,
     _quantized_kv,
     _WindowAttention,
@@ -832,7 +833,7 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
         == 1
     )
     side = attention_registry._resolve_attn_side(draft, None)
-    assert side.is_dspark and not side.is_deepseek_v4
+    assert side.is_dspark
 
     # Stop at the allocation boundary, after the real registry chooses both sides.
     config_builder = Mock(
@@ -893,3 +894,47 @@ def test_reference_draft_architecture():
     ]
     assert {int(n.split(".")[1]) for n in index if n.startswith("mtp.")} == {0, 1, 2}
     assert all(f"mtp.{i}.ffn.shared_experts.w1.weight" in index for i in range(3))
+
+
+class TestDSparkBaseLogits:
+    def test_dspark_base_logits_use_public_fp32_head_math(self):
+        model = object.__new__(DeepseekV41DSparkModel)
+        hidden = torch.tensor([[[1.0, -2.0]], [[0.5, 4.0]]], dtype=torch.bfloat16)
+        head = torch.tensor([[0.5, 0.25], [-1.0, 2.0]], dtype=torch.bfloat16)
+
+        logits = model.local_base_logits(hidden, head)
+
+        assert logits.dtype == torch.float32
+        assert logits.shape == (2, 1, 2)
+        assert torch.equal(logits, hidden.float() @ head.float().T)
+        with pytest.raises(ValueError, match="hidden dtype"):
+            model.local_base_logits(hidden, head.float())
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_dspark_base_logits_read_the_shared_head_in_place_under_cuda_graph(self):
+        model = object.__new__(DeepseekV41DSparkModel)
+        hidden = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16, device="cuda")
+        head = torch.tensor(
+            [[0.5, 0.25], [-1.0, 2.0]], dtype=torch.bfloat16, device="cuda"
+        )
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                model.local_base_logits(hidden, head)
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            logits = model.local_base_logits(hidden, head)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert logits.dtype == torch.float32
+        assert torch.equal(logits, hidden.float() @ head.float().T)
+
+        # No FP32 copy sits between the target's head and the draft: an
+        # in-place weight update is visible to the next replay as is.
+        head.add_(1)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(logits, hidden.float() @ head.float().T)

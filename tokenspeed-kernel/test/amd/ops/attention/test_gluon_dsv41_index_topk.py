@@ -169,7 +169,7 @@ def test_index_topk_large_head_count_auto_fallback(device, require):
     ("arch", "dtype", "width", "metric", "kernel_name"),
     [
         ("gfx950", torch.uint8, 64, "flops4", "gluon_dsv41_index_topk_gfx950"),
-        ("gfx1250", torch.bfloat16, 128, "flops16", "gluon_dsv41_index_topk_gfx1250"),
+        ("gfx1250", torch.uint8, 64, "flops8", "gluon_dsv41_index_topk_gfx1250"),
     ],
 )
 def test_indexer_launch_metadata(arch, dtype, width, metric, kernel_name):
@@ -191,25 +191,26 @@ def test_indexer_launch_metadata(arch, dtype, width, metric, kernel_name):
 
 
 @pytest.mark.parametrize(
-    ("arch", "entry_name", "kernel_name"),
+    ("arch", "entry_name", "kernel_name", "tile_n"),
     [
-        ("gfx950", "dsv41_index_logits_gfx950", "gluon_dsv41_index_topk_gfx950"),
-        ("gfx1250", "dsv41_index_logits_gfx1250", "gluon_dsv41_index_topk_gfx1250"),
+        ("gfx950", "dsv41_index_logits_gfx950", "gluon_dsv41_index_topk_gfx950", 32),
+        ("gfx1250", "dsv41_index_logits_gfx1250", "gluon_dsv41_index_topk_gfx1250", 64),
     ],
 )
 @pytest.mark.parametrize(
-    ("requested_chunk", "score_chunk", "hardware_chunk"),
-    [(8, 8, 32), (64, 64, 64), (512, 256, 256)],
+    ("requested_chunk", "score_chunk"),
+    [(8, 8), (64, 64), (512, 256)],
 )
 def test_indexer_score_chunk_bound(
     monkeypatch,
     arch,
     entry_name,
     kernel_name,
+    tile_n,
     requested_chunk,
     score_chunk,
-    hardware_chunk,
 ):
+    hardware_chunk = (score_chunk + tile_n - 1) // tile_n * tile_n
     module = importlib.import_module(
         f"tokenspeed_kernel_amd.ops.{arch}.attention.dsv41.indexer"
     )
@@ -229,18 +230,10 @@ def test_indexer_score_chunk_bound(
     table = torch.empty((tokens, 5), dtype=torch.int32)
     visible = torch.empty((tokens,), dtype=torch.int32)
     logits = torch.empty((tokens, width), dtype=torch.float32)
-    args = (
-        (
-            torch.empty((tokens, 32, 64), dtype=torch.uint8),
-            torch.empty((tokens, 32), dtype=torch.int32),
-            weights,
-        )
-        if arch == "gfx950"
-        else (torch.empty((tokens, 32, 128), dtype=torch.bfloat16), weights)
-    )
-
     getattr(module, entry_name)(
-        *args,
+        torch.empty((tokens, 32, 64), dtype=torch.uint8),
+        torch.empty((tokens, 32), dtype=torch.int32),
+        weights,
         cache,
         table,
         visible,
@@ -258,8 +251,8 @@ def test_indexer_score_chunk_bound(
     ]
 
 
-# A 40-row score chunk masks part of each CTA's second 32-row tile, and in
-# Full mode CTAs span page boundaries.
+# A 40-row score chunk masks part of each CTA's 64-row tile, and in Full mode
+# CTAs span page boundaries.
 @pytest.mark.parametrize("reindex", [False, True])
 @pytest.mark.parametrize("score_chunk", [40, 256])
 def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
@@ -293,10 +286,21 @@ def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
     )
     width = 40 if reindex else 256
     out = torch.full((2, width), -torch.inf, device=device)
+    values, scales, packed_weights = gluon_indexer._pack_index_q(q, weights)
     dsv41_index_logits_gfx1250(
-        q, weights, cache.flatten(1), table, visible, candidates, out, score_chunk
+        values,
+        scales,
+        packed_weights,
+        cache.flatten(1),
+        table,
+        visible,
+        candidates,
+        out,
+        score_chunk,
     )
 
+    _, q_reference = _reference_quantize(q.reshape(-1, 128), "index")
+    q_reference = q_reference.reshape(2, 32, 128)
     expected = torch.full((2, width), -torch.inf)
     for row in range(2):
         logical = torch.arange(width)
@@ -306,7 +310,7 @@ def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
         pages = table[row].cpu()[logical.clamp(min=0) // 64].long()
         valid = (logical >= 0) & (logical < int(visible[row])) & (pages >= 0)
         slots = pages[valid] * 64 + logical[valid] % 64
-        dots = q[row].float().cpu() @ key_reference[slots].float().T
+        dots = q_reference[row] @ key_reference[slots].float().T
         expected[row, valid] = (dots.relu() * weights[row].cpu()[:, None]).sum(0)
     torch.testing.assert_close(out.cpu(), expected, atol=2e-4, rtol=2e-4)
 

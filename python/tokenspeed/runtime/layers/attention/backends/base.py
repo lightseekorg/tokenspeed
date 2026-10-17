@@ -148,6 +148,11 @@ class CachePoolBinding:
         """Return logical-slot ownership, or None for local/replicated storage."""
         return None
 
+    def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
+        """Whether ``layer``'s reads apply the per-tensor scales its FP8 cache
+        was written at (``PagedAttention.fp8_kv_scales``)."""
+        return False
+
     # ------------------------------------------------------------------
     # Slot-state image (SlotStateExporter)
     # ------------------------------------------------------------------
@@ -254,10 +259,12 @@ class AttentionBackend(CachePoolBinding, ABC):
     A subclass that skips ``__init__`` calls ``_init_pool_binding()`` itself.
     """
 
-    # Cache families this node consumes from the pool contract (startup
-    # validation: every published family must have a consumer); composites
-    # union their children's.
-    cache_consumer_families: frozenset[str] = frozenset({"history"})
+    # Cache-group kinds this node consumes from the pool contract (startup
+    # validation: every published kind must have a consumer); composites
+    # union their children's. Paged backends read rows of either history kind.
+    cache_consumer_attn_kinds: frozenset[str] = frozenset(
+        {"full_history", "sliding_window"}
+    )
     # Only backends whose model skips incomplete-prefill outputs opt in.
     skips_incomplete_prefill_outputs: bool = False
     # MLA sharded history reads/writes and global attention-partial merging,

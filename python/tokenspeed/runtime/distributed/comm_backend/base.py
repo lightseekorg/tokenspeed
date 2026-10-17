@@ -66,6 +66,14 @@ class CommBackend(ABC):
 
     # ---- Collective ops ----
 
+    def get_prepared_all_gather(self, group: Group, dtype: torch.dtype):
+        """Return a prepared column all-gather allowed by this backend's policy."""
+        return None
+
+    def broadcast_from_first_rank(self, tensor: torch.Tensor, group: Group) -> bool:
+        """Broadcast in place when prepared; otherwise let the caller fall back."""
+        return False
+
     def prepare_projection(
         self, spec: "ProjectionSpec", scratch_pool: "WorkspacePool | None" = None
     ) -> "ProjectionWorkspace":
@@ -75,6 +83,18 @@ class CommBackend(ABC):
         )
 
         return prepare_projection_workspace(spec, self, scratch_pool)
+
+    def try_fused_dp_column_linear(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scales: torch.Tensor | None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+        workspace: "ProjectionWorkspace",
+    ) -> bool:
+        """Run fused DP column-linear, or leave out untouched and return False."""
+        return False
 
     def projection_all_gather(
         self,

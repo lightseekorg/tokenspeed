@@ -34,6 +34,7 @@ from functools import cached_property
 from typing import Any, Protocol
 
 import torch
+from tokenspeed_kernel.workspace import capture_session
 
 from tokenspeed.runtime.multimodal.encoder_batching import pack_encoder_batches
 from tokenspeed.runtime.utils import logger
@@ -418,7 +419,9 @@ class EncoderForwardStepRunner:
         # No pool= argument: each budget graph gets its own private pool. A
         # shared pool collided IPC registrations across budgets.
         graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), ar_ctx, torch.cuda.graph(graph):
+        with capture_session(graph), torch.inference_mode(), ar_ctx, torch.cuda.graph(
+            graph
+        ):
             output = self.adapter.forward(input_buffers, metadata)
             output_buffer.copy_(output)
 

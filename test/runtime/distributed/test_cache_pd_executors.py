@@ -19,11 +19,11 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-from runtime.cache_pd_test_utils import block_manifest as make_block_manifest
-from runtime.cache_pd_test_utils import group as make_group  # noqa: E402
-from runtime.cache_pd_test_utils import layout as make_layout
-from runtime.cache_pd_test_utils import operation as make_operation
-from runtime.cache_pd_test_utils import segment as make_segment
+from test.runtime.cache_pd_test_utils import block_manifest as make_block_manifest
+from test.runtime.cache_pd_test_utils import group as make_group  # noqa: E402
+from test.runtime.cache_pd_test_utils import layout as make_layout
+from test.runtime.cache_pd_test_utils import operation as make_operation
+from test.runtime.cache_pd_test_utils import segment as make_segment
 
 from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
     CacheContractError,
@@ -99,7 +99,7 @@ def _layout(
                 offset=state_offset,
                 stride=page_stride_bytes,
             ),
-            family="state",
+            attn_kind="state",
         ),
         capacity=capacity,
         page_bytes=physical_page_bytes,
@@ -1365,7 +1365,9 @@ def test_transfer_worker_completes_real_heterogeneous_fanout_before_status() -> 
             (endpoint, port, room, status, rank, kwargs)
         )
     )
-    manager.kv_transfer_metrics = KVTransferMetrics({}, enabled=False)
+    manager.kv_transfer_metrics = KVTransferMetrics(
+        {}, reporters=["prometheus"], enabled=False
+    )
     manager.topology = _topology()
 
     with pytest.raises(_StopWorker):

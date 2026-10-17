@@ -69,8 +69,7 @@ protected:
             .group_id = "full_attention",
             .block_granularity = cfg.prefix_granularity,
             .total_pages = cfg.device_allocator.total_pages,
-            .retention = CacheGroupConfig::Retention::FullHistory,
-            .family = CacheGroupFamily::History,
+            .attn_kind = AttnKind::kFull,
         });
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -312,10 +311,9 @@ protected:
         for (std::size_t i = 0; i < GroupIds().size(); ++i) {
             CacheGroupConfig group;
             group.group_id = GroupIds()[i];
-            group.family = i == 0 ? CacheGroupFamily::History : CacheGroupFamily::State;
+            group.attn_kind = i == 0 ? AttnKind::kFull : AttnKind::kState;
             group.block_granularity = i == 0 ? cfg.prefix_granularity : 0;
             group.total_pages = cfg.device_allocator.total_pages;
-            group.retention = CacheGroupConfig::Retention::FullHistory;
             cfg.cache_groups.push_back(std::move(group));
         }
         SetTestSnapshotPool(cfg);
