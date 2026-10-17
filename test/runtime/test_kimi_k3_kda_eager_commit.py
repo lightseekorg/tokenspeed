@@ -1,8 +1,19 @@
 """Eager KDA replay commit versus the existing per-position scratch path."""
 
+import os
+import sys
+
 import numpy as np
 import pytest
 import torch
+
+# CI registration and absolute test imports use the same paths as the suite.
+_TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _TEST_DIR)
+sys.path.insert(0, os.path.dirname(_TEST_DIR))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=120, suite="runtime-1gpu")
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -406,8 +417,87 @@ def test_packed_qkv_views_match_materialized_split_across_commits():
         ]
 
 
+def _reference_committed_states(harness, pages, inputs, accepted):
+    """Evaluate accepted recurrence independently from each path's producers."""
+    bs = len(accepted)
+    raw = inputs["mixed_qkv"].float().view(bs, T, CONV_DIM)
+    beta = inputs["beta_raw"].float().sigmoid().view(bs, T, H)
+    expected = {}
+    for layer_id in harness.layer_ids:
+        params = harness.params[layer_id]
+        ids = pages[harness.pool.state_group_by_layer[layer_id]]
+        full_conv = harness.pool.get_component(layer_id, "conv_state")[ids].float()
+        full_state = harness.pool.get_component(layer_id, "recurrent_state")[
+            ids
+        ].clone()
+        conv = full_conv[:, :CONV_DIM]
+        state = full_state[:, :H]
+        weight = params["conv_weights"].float()
+        gate = (
+            inputs["f_a_out"].float()[:, None, :]
+            * params["f_b_weight"].float()[None, :, :]
+        ).sum(-1)
+        # The split vLLM path materializes both producers in BF16; the
+        # original fused scratch path keeps their intermediates in FP32.
+        split_producers = (
+            harness.backend._verify_split_producers and harness.backend._replay_active
+        )
+        if split_producers:
+            from tokenspeed_kernel.ops.attention.kda import kda_verify_conv_update
+
+            gate = torch.nn.functional.linear(
+                inputs["f_a_out"], params["f_b_weight"]
+            ).float()
+            produced_qkv = (
+                kda_verify_conv_update(
+                    inputs["mixed_qkv"],
+                    params["conv_weights"],
+                    harness.pool.get_component(layer_id, "conv_state"),
+                    torch.tensor(ids, device=DEV, dtype=torch.int32),
+                    num_heads=H,
+                    head_dim=D,
+                    draft_token_num=T,
+                    recurrent_layout="v_major",
+                )
+                .float()
+                .view(bs, T, CONV_DIM)
+            )
+        gate = gate.view(bs, T, H, D) + params["dt_bias"].view(H, D)
+        decay = (
+            _LOWER_BOUND
+            * torch.sigmoid(params["A_log"].exp()[None, None, :, None] * gate)
+        ).exp()
+        states, windows = [], []
+        for token in range(T):
+            current = raw[:, token]
+            if split_producers:
+                qkv = produced_qkv[:, token]
+            else:
+                acc = current * weight[:, 3]
+                for tap in range(3):
+                    acc = torch.addcmul(acc, conv[:, :, tap], weight[:, tap])
+                qkv = torch.nn.functional.silu(acc)
+            _, key, value = (part.view(bs, H, D) for part in qkv.chunk(3, -1))
+            key = key * torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)
+            state = state * decay[:, token, :, None, :]
+            correction = value - (state * key[:, :, None, :]).sum(-1)
+            correction = correction * beta[:, token, :, None]
+            state = state + correction[..., None] * key[:, :, None, :]
+            conv = torch.cat((conv[:, :, 1:], current[..., None]), dim=-1)
+            states.append(state.clone())
+            windows.append(conv.clone())
+        full_state[:, :H] = torch.stack(
+            [states[max(1, count) - 1][i] for i, count in enumerate(accepted)]
+        )
+        full_conv[:, :CONV_DIM] = torch.stack(
+            [windows[max(1, count) - 1][i] for i, count in enumerate(accepted)]
+        )
+        expected[layer_id] = full_state, full_conv
+    return expected
+
+
 def test_eager_replay_matches_scratch_over_multiple_rounds_and_layers():
-    """Absolute oracle: independent scratch and replay arms evolve identically."""
+    """Both paths commit their accepted prefix, with their producer precision."""
     replay = _Harness(eager_replay=True, seed=17)
     scratch = _Harness(eager_replay=False, seed=17)
     rpis = [0, 1, 2]
@@ -419,9 +509,24 @@ def test_eager_replay_matches_scratch_over_multiple_rounds_and_layers():
     accepts = ([0, 1, T], [T, 0, 2], [1, T, 0], [2, 1, T])
     for round_index, accepted in enumerate(accepts):
         for harness in (replay, scratch):
+            inputs = harness.inputs(len(rpis), 100 + round_index)
+            expected = _reference_committed_states(harness, pages, inputs, accepted)
             harness.round(rpis, pages, seq_lens, 100 + round_index, accepted)
-        _assert_committed_pages_equal(replay, scratch, pages)
-        seq_lens = [length + count for length, count in zip(seq_lens, accepted)]
+            for layer_id, (state, conv) in expected.items():
+                ids = pages[harness.pool.state_group_by_layer[layer_id]]
+                torch.testing.assert_close(
+                    harness.pool.get_component(layer_id, "recurrent_state")[ids],
+                    state,
+                    atol=2e-6,
+                    rtol=2e-5,
+                )
+                torch.testing.assert_close(
+                    harness.pool.get_component(layer_id, "conv_state")[ids].float(),
+                    conv,
+                    atol=0,
+                    rtol=0,
+                )
+        seq_lens = [length + max(1, count) for length, count in zip(seq_lens, accepted)]
 
 
 def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
@@ -912,3 +1017,200 @@ def test_hybrid_rebinding_reaches_the_state_child():
     assert share.prefill is None and share.decode is None
     assert_no_alias(hybrid, old_slabs)
     assert_no_alias(harness.backend, old_slabs)
+
+
+def test_padded_graph_verify_keeps_live_rows_and_commits_isolated():
+    """Padding may have undefined outputs, but cannot change live state."""
+    captured = _Harness(eager_replay=True, seed=982)
+    eager = _Harness(eager_replay=True, seed=982)
+    bs, real_bs = 4, 2
+    rpis = [0, 1]
+    pages = {
+        group_id: [2 + group * real_bs + i for i in range(real_bs)]
+        for group, group_id in enumerate(_STATE_GROUPS)
+    }
+    seq_lens = [8 + T] * real_bs
+    captured.prepare_metadata(rpis, pages, seq_lens)
+    captured.forward(captured.inputs(real_bs, 901), real_bs)
+    capture_tables = {
+        group_id: torch.full((bs, 2), -1, dtype=torch.int32, device=DEV)
+        for group_id in _STATE_GROUPS
+    }
+    captured.backend.init_forward_metadata_capture_cuda_graph(
+        bs,
+        torch.arange(bs, dtype=torch.int32, device=DEV),
+        torch.full((bs,), 8 + T, dtype=torch.int32, device=DEV),
+        ForwardMode.DECODE,
+        block_tables=capture_tables,
+    )
+    stable_inputs = captured.inputs(bs, 902)
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        captured.forward(stable_inputs, bs)
+    torch.cuda.current_stream().wait_stream(side_stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_outputs = captured.forward(stable_inputs, bs)
+
+    for round_index, counts in enumerate(([0, T], [1, 2])):
+        tables = {
+            group_id: np.asarray(
+                [[0, page] for page in pages[group_id]], dtype=np.int32
+            )
+            for group_id in _STATE_GROUPS
+        }
+        captured.backend.refresh_decode_metadata(
+            bs,
+            real_bs,
+            torch.tensor(rpis, dtype=torch.int32, device=DEV),
+            torch.tensor(seq_lens, dtype=torch.int32, device=DEV),
+            forward_mode=ForwardMode.DECODE,
+            for_graph_replay=True,
+            block_tables=_tables_for(captured.contract, tables, DEV),
+        )
+        inputs = captured.inputs(bs, 903 + round_index)
+        for name, value in inputs.items():
+            stable_inputs[name].copy_(value)
+        graph.replay()
+        accepted = torch.tensor(counts, dtype=torch.int32, device=DEV)
+        captured.backend.commit_verified_state(accepted, accepted_path=None)
+        eager.prepare_metadata(rpis, pages, seq_lens)
+        eager_outputs = eager.forward(
+            {name: value[: real_bs * T] for name, value in inputs.items()}, real_bs
+        )
+        eager.backend.commit_verified_state(accepted, accepted_path=None)
+        for actual, expected in zip(graph_outputs, eager_outputs, strict=True):
+            torch.testing.assert_close(
+                actual.reshape(-1, KEY_DIM)[: real_bs * T],
+                expected.reshape(-1, KEY_DIM),
+                atol=2e-2,
+                rtol=2e-2,
+            )
+        for layer_id in captured.layer_ids:
+            for component in ("conv_state", "recurrent_state"):
+                torch.testing.assert_close(
+                    captured.pool.get_component(layer_id, component),
+                    eager.pool.get_component(layer_id, component),
+                    atol=0 if component == "conv_state" else 1e-5,
+                    rtol=0 if component == "conv_state" else 1e-3,
+                )
+        seq_lens = [length + count for length, count in zip(seq_lens, counts)]
+
+
+def test_commit_plan_resolves_pages_when_packed_storage_moves():
+    """Resolve the new scheduler pages after replacing packed table storage."""
+    harness = _Harness(eager_replay=True, seed=173, max_bs=2, usable_pages=24)
+    first_pages = {
+        group: [1 + 2 * index, 2 + 2 * index]
+        for index, group in enumerate(_STATE_GROUPS)
+    }
+    next_pages = {
+        group: [7 + 2 * index, 8 + 2 * index]
+        for index, group in enumerate(_STATE_GROUPS)
+    }
+    harness.prepare_metadata([0, 1], first_pages, [64 + T, 64 + T])
+    # Retain the previous views so the allocator cannot reuse their address.
+    _previous_tables = harness.backend._verify_commit_ctx[0]
+    harness.prepare_metadata([0, 1], next_pages, [64 + T, 64 + T])
+
+    accepted = torch.tensor([2, T], dtype=torch.int32, device=DEV)
+    pages, steps = harness.backend._resolve_verify_commit_pages(
+        accepted, harness.backend._replay_group_ids
+    )
+    expected = torch.tensor(
+        [next_pages[group] for group in harness.backend._replay_group_ids],
+        dtype=torch.int32,
+        device=DEV,
+    )
+    torch.testing.assert_close(pages, expected, atol=0, rtol=0)
+    torch.testing.assert_close(steps, accepted, atol=0, rtol=0)
+    torch.testing.assert_close(
+        harness.backend._replay_commit_reads[: expected.numel()].view_as(expected),
+        expected,
+        atol=0,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize("batch", [2, 5])
+def test_commit_plan_queued_table_updates_keep_each_round_pages(batch):
+    """Queued descriptor uploads preserve each round's source and live pages."""
+    harness = _Harness(eager_replay=True, seed=174, max_bs=batch, usable_pages=24)
+    group_ids = harness.backend._replay_group_ids
+    request_indices = torch.arange(batch, dtype=torch.int32, device=DEV)
+    seq_lens = torch.full((batch,), 64 + T, dtype=torch.int32, device=DEV)
+    accepted = torch.arange(batch, dtype=torch.int32, device=DEV) % (T + 2)
+    rounds = []
+    for iteration in range(12):
+        tables = {}
+        expected_reads, expected_pages = [], []
+        for group_index, group in enumerate(group_ids):
+            rows, sources, destinations = [], [], []
+            for row in range(batch):
+                live = 1 + (iteration * 3 + group_index + row) % 20
+                checkpoint = (
+                    1 + (iteration + group_index * 7 + row) % 20
+                    if (iteration + row) % 2
+                    else 0
+                )
+                if iteration % 3 == 0 and row == batch - 1:
+                    checkpoint = live = -1
+                rows.append(
+                    [checkpoint, live] + [-1] * (1 + (iteration + group_index) % 3)
+                )
+                sources.append(checkpoint if checkpoint > 0 else live)
+                destinations.append(live)
+            # Retain independently allocated, strided tables across rounds.
+            tables[group] = torch.tensor(rows, dtype=torch.int32, device=DEV)[:, :2]
+            expected_reads.append(sources)
+            expected_pages.append(destinations)
+        rounds.append((tables, expected_reads, expected_pages))
+
+    def plan(tables):
+        harness.backend.refresh_decode_metadata(
+            batch,
+            batch,
+            request_indices,
+            seq_lens,
+            forward_mode=ForwardMode.DECODE,
+            for_graph_replay=True,
+            block_tables=tables,
+        )
+        return harness.backend._resolve_verify_commit_pages(accepted, group_ids)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # Compile and warm the metadata kernels before queuing delayed updates.
+        for tables, _, _ in rounds:
+            plan(tables)
+    stream.synchronize()
+
+    snapshots = []
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(100_000_000)
+        for tables, _, _ in rounds:
+            pages, steps = plan(tables)
+            reads = harness.backend._replay_commit_reads[: len(group_ids) * batch]
+            snapshots.append(
+                (pages.clone(), reads.view_as(pages).clone(), steps.clone())
+            )
+    torch.cuda.current_stream().wait_stream(stream)
+    for (_, expected_reads, expected_pages), (pages, reads, steps) in zip(
+        rounds, snapshots, strict=True
+    ):
+        torch.testing.assert_close(
+            pages,
+            torch.tensor(expected_pages, dtype=torch.int32, device=DEV),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            reads,
+            torch.tensor(expected_reads, dtype=torch.int32, device=DEV),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(steps, accepted.clamp(1, T), atol=0, rtol=0)

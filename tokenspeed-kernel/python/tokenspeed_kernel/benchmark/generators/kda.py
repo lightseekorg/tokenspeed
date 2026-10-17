@@ -976,6 +976,7 @@ def prepare_kda_fused_paged_verify(
             override=request.registration,
             solution=request.solution,
             store_states=store_states,
+            replay_records=None,
             **replay_payload,
         )
 

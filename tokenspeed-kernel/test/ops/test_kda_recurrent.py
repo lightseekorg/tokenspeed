@@ -498,6 +498,7 @@ def test_kda_fused_verify_selects_all_layout_traits(
         draft_token_num=1,
         recurrent_layout=recurrent_layout,
         store_states=store_states,
+        replay_records=None,
     )
     assert result is tensor
     expected = {
@@ -543,6 +544,7 @@ def test_kda_fused_verify_selects_split_producer_kernel_when_inputs_are_given(
         store_states=False,
         g_raw=tensor,
         conv_qkv=tensor,
+        replay_records=None,
     )
     assert result is tensor
     assert selected["split_producers"] is True
@@ -753,6 +755,11 @@ def test_batched_replay_call_contract() -> None:
         gate_stride=1,
         conv_width=4,
         lower_bound=-5.0,
+        **(
+            {"record_metadata": tensor, "record_stamps": tensor}
+            if "record_metadata" in parameters
+            else {}
+        ),
     )
 
 

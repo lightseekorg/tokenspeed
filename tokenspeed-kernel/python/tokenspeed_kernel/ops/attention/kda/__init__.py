@@ -107,6 +107,27 @@ class KdaPrefillResult:
     final_state: torch.Tensor
 
 
+@dataclass(frozen=True)
+class KdaReplayRecords:
+    """Current-round recovery destinations and record metadata.
+
+    correction and key_gate use slot/head/ring-position/channel order.
+    key_gate holds activation-dtype unnormalized K and raw gate.
+    Correction is always FP32.
+    metadata is INT64 [batch, 3]: physical slot, generation, absolute start.
+    stamps is INT64 [slots, capacity, 2]: absolute position and generation.
+    Position i maps to i % capacity. PR1 allocates one slot per batch row
+    and assigns a new generation on each metadata refresh.
+    query_start_loc maps packed tokens to request rows.
+    """
+
+    correction: torch.Tensor
+    metadata: torch.Tensor
+    stamps: torch.Tensor
+    key_gate: torch.Tensor
+    query_start_loc: torch.Tensor
+
+
 def kda_recurrent_layout() -> str:
     """Return the recurrent state layout this platform's KDA kernels consume.
 
@@ -406,6 +427,7 @@ def try_kda_fused_paged_verify(
     override: str | None = None,
     solution: str | None = None,
     store_states: bool = True,
+    replay_records: KdaReplayRecords | None,
     replay_mixed_qkv: torch.Tensor | None = None,
     replay_gate: torch.Tensor | None = None,
     replay_beta: torch.Tensor | None = None,
@@ -419,7 +441,10 @@ def try_kda_fused_paged_verify(
     scratches for partial-accept commit. ``store_states`` selects the
     rollback-tape variant and ``recurrent_layout`` defaults to the
     platform's state layout; which producer arrangement runs is the
-    registry's choice. Returns ``None`` only when no implementation
+    registry's choice. ``replay_records`` holds FP32 corrections,
+    activation-dtype unnormalized keys and raw gates, and query boundaries
+    for same-round recovery. Commit recomputes key normalization and gate decay.
+    Returns ``None`` only when no implementation
     supports the current platform.
     """
     recurrent_layout = recurrent_layout or kda_recurrent_layout()
@@ -460,6 +485,9 @@ def try_kda_fused_paged_verify(
         )
     if split_producers:
         kwargs.update({"g_raw": g_raw, "conv_qkv": conv_qkv})
+        kwargs["replay_records"] = replay_records
+    elif replay_records is not None:
+        raise ValueError("KDA replay records require split producers")
     return kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
@@ -797,6 +825,7 @@ def kda_replay_commit_supported(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.kda.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.kda.vllm_recoverssm  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401

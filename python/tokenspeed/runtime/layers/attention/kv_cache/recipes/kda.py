@@ -83,12 +83,23 @@ def kda_verify_workspace_bytes(
             * sum(field.payload_bytes for field in state_fields)
         )
 
-    from tokenspeed_kernel.ops.attention.kda import kda_batched_replay_uses_raw_gate
+    from tokenspeed_kernel.ops.attention.kda import (
+        kda_batched_replay_uses_raw_gate,
+        kda_fused_paged_verify_uses_split_producers,
+        kda_recurrent_layout,
+    )
 
     linear = config.component(LinearAttnConfig)
     heads, head_dim, _ = linear.temporal_state_shape
     raw_gate = kda_batched_replay_uses_raw_gate(
         config.dtype, num_heads=heads, head_dim=head_dim
+    )
+    records = kda_fused_paged_verify_uses_split_producers(
+        config.dtype,
+        store_states=False,
+        recurrent_layout=kda_recurrent_layout(),
+        num_heads=heads,
+        head_dim=head_dim,
     )
     conv_fields = tuple(
         field for field in state_fields if field.field_id.endswith(".conv_state")
@@ -104,4 +115,24 @@ def kda_verify_workspace_bytes(
         * head_dim
         * (torch.bfloat16.itemsize if raw_gate else torch.float32.itemsize)
     )
-    return conv_bytes + len(conv_fields) * config.max_bs * draft_token_num * row_bytes
+    if records:
+        # Raw QKV retains the accepted convolution window. Records store
+        # FP32 U and activation-dtype unnormalized K/raw gate.
+        row_bytes = linear.conv_state_shape[0] * config.dtype.itemsize
+        row_bytes += (
+            heads * head_dim * (torch.float32.itemsize + 2 * config.dtype.itemsize)
+        )
+    group_count = sum(spec.attn_kind == "state" for spec, _ in groups)
+    metadata_bytes = 0
+    if draft_token_num > 1:
+        metadata_bytes = len(conv_fields) * (10 * 8 + 4)
+        metadata_bytes += group_count * 4 * 8
+        metadata_bytes += (2 * group_count + 1) * config.max_bs * 4
+        if records:
+            metadata_bytes += config.max_bs * 3 * 8
+            metadata_bytes += len(conv_fields) * config.max_bs * draft_token_num * 2 * 8
+    return (
+        conv_bytes
+        + len(conv_fields) * config.max_bs * draft_token_num * row_bytes
+        + metadata_bytes
+    )

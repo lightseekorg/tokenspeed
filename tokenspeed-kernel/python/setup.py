@@ -1070,6 +1070,7 @@ setup(
             "csrc/*.jinja",
             "csrc/include/*",
         ],
+        "tokenspeed_kernel.thirdparty.vllm_recoverssm": ["LICENSE"],
         # Petit Gluon compiles its small HIP VMM binding lazily on first use.
         "tokenspeed_kernel.thirdparty.gluon_petit": [
             "LICENSE.txt",

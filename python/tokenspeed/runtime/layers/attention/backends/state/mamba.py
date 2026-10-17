@@ -467,6 +467,15 @@ class MambaAttnBackend(AttentionBackend):
             self.kv_pool.get_component(layer_id, "recurrent_state"),
         )
 
+    def _prepare_verify_records(
+        self, bs: int, seq_lens: torch.Tensor, draft_token_num: int
+    ) -> None:
+        """Refresh family-specific recovery records before eager or graph verify.
+
+        State-page ownership remains with the scheduler; families may use the
+        committed positions only to identify their current-round records.
+        """
+
     def _verify_state_blocks(
         self,
         bs: int,
@@ -1228,6 +1237,7 @@ class MambaAttnBackend(AttentionBackend):
                     draft_token_num,
                     state_in_blocks_by_group,
                 )
+                self._prepare_verify_records(real_bs, seq_lens, draft_token_num)
             else:
                 self._verify_commit_ctx = None
             for group_id in self._state_groups():

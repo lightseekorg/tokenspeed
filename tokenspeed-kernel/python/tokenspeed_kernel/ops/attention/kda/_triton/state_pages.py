@@ -243,3 +243,120 @@ def commit_state_pages(
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
+
+
+@triton.jit(
+    do_not_specialize=["bs", "draft_tokens", "out_stride"],
+    do_not_specialize_on_alignment=["table_base"],
+)
+def _commit_state_groups_kernel(
+    accepted,
+    table_base,
+    tables,
+    pages_out,
+    reads_out,
+    steps_out,
+    bs,
+    draft_tokens,
+    out_stride,
+    BLOCK: tl.constexpr,
+):
+    group = tl.program_id(1)
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    live = row < bs
+    table = table_base + tl.load(tables + group * 4)
+    reads = tl.load(tables + group * 4 + 3).to(tl.pointer_type(tl.int32))
+    source = tl.load(reads + row, mask=live, other=-1)
+    tl.store(reads_out + group * out_stride + row, source, mask=live)
+    table_stride = tl.load(tables + group * 4 + 1)
+    # Accepted length includes the target token, as in commit_state_pages.
+    steps = tl.minimum(
+        tl.maximum(tl.load(accepted + row, mask=live, other=1).to(tl.int64), 1),
+        draft_tokens,
+    )
+    # Latest scheduler ABI: commit always writes the live slot, even when
+    # verify read a different immutable prefix checkpoint from slot 0.
+    page = tl.load(table + row * table_stride + 1, mask=live, other=0)
+    tl.store(pages_out + group * out_stride + row, page, mask=live)
+    if group == 0:
+        tl.store(steps_out + row, steps.to(tl.int32), mask=live)
+
+
+def commit_state_groups(
+    accepted_length: torch.Tensor,
+    table_base: torch.Tensor,
+    tables: torch.Tensor,
+    *,
+    batch_size: int,
+    draft_tokens: int,
+    pages_out: torch.Tensor,
+    reads_out: torch.Tensor,
+    steps_out: torch.Tensor,
+) -> None:
+    """Resolve live write slots for all state groups in one GPU launch.
+
+    Args:
+        accepted_length: Contiguous accepted counts, including the target token.
+        table_base: INT32 tensor anchoring the current packed page tables.
+            Its address can change between eager launches without changing
+            the descriptors. A captured launch retains this tensor address.
+        tables: Contiguous INT64 [groups, 4] descriptors. Each row holds a
+            signed offset from table_base in INT32 elements, its row stride,
+            its number of columns and an INT32 source-page vector address.
+            The caller keeps the referenced tables alive through completion.
+        batch_size: Number of live request rows.
+        draft_tokens: Maximum accepted count for the current window.
+        pages_out: INT32 [groups, batch_size] destination block indices.
+        reads_out: INT32 [groups, batch_size] copied source block indices.
+        steps_out: INT32 [batch_size] clamped accepted counts.
+
+    Returns:
+        None. The caller owns all output storage.
+    """
+    if tables.ndim != 2 or tables.shape[1] != 4 or not tables.is_contiguous():
+        raise ValueError("state table descriptors must be contiguous [groups, 4]")
+    if tables.dtype != torch.int64:
+        raise ValueError("state table descriptors must use INT64")
+    if (
+        pages_out.shape != (tables.shape[0], batch_size)
+        or reads_out.shape != pages_out.shape
+    ):
+        raise ValueError("destination blocks must have shape [groups, batch_size]")
+    if any(
+        x.dtype != torch.int32 for x in (table_base, pages_out, reads_out, steps_out)
+    ):
+        raise ValueError("page tables, blocks and accepted counts must use INT32")
+    if min(accepted_length.numel(), steps_out.numel()) < batch_size:
+        raise ValueError("commit metadata does not cover the live batch")
+    if draft_tokens < 1:
+        raise ValueError("verify width must be positive")
+    if any(
+        not x.is_contiguous()
+        for x in (accepted_length, pages_out, reads_out, steps_out)
+    ):
+        raise ValueError("commit metadata must be contiguous")
+    if any(
+        x.device != tables.device
+        for x in (
+            accepted_length,
+            table_base,
+            pages_out,
+            reads_out,
+            steps_out,
+        )
+    ):
+        raise ValueError("commit metadata must use the descriptor device")
+    if batch_size == 0 or tables.shape[0] == 0:
+        return
+    _commit_state_groups_kernel[(triton.cdiv(batch_size, 256), tables.shape[0])](
+        accepted_length,
+        table_base,
+        tables,
+        pages_out,
+        reads_out,
+        steps_out,
+        batch_size,
+        draft_tokens,
+        pages_out.stride(0),
+        BLOCK=256,
+    )

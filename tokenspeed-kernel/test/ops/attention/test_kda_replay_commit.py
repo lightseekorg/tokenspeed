@@ -23,6 +23,7 @@ What has to hold for that to be lossless:
 
 import pytest
 import torch
+from kda_replay_reference import batched_recurrent_kda_replay_commit
 from utils import is_cdna4, is_cdna5
 
 if not torch.cuda.is_available():
@@ -44,7 +45,6 @@ requires_registered_replay = pytest.mark.skipif(
 from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (  # noqa: E402
     _gate_tiling,
     batched_kda_commit_conv_window_kernel,
-    batched_recurrent_kda_replay_commit,
     fused_recurrent_kda_replay_commit,
     fused_recurrent_kda_verify_megafuse,
 )
@@ -817,7 +817,9 @@ def test_split_verify_wrapper_matches_fused_wrapper(n):
         x["dt_bias"],
     )
     fused = triton_nvidia_kda_fused_paged_verify_no_store(*args, **kwargs)
-    split = triton_nvidia_kda_fused_paged_verify_split(*args, **kwargs)
+    split = triton_nvidia_kda_fused_paged_verify_split(
+        *args, **kwargs, replay_records=None
+    )
     conv_qkv = fused_kda_verify_conv_update(
         x["qkv_raw"],
         x["conv_w"],
@@ -829,7 +831,7 @@ def test_split_verify_wrapper_matches_fused_wrapper(n):
     )
     g_raw = torch.mm(x["f_a"], x["w_fb"].t())
     precomputed = triton_nvidia_kda_fused_paged_verify_split(
-        *args, **kwargs, g_raw=g_raw, conv_qkv=conv_qkv
+        *args, **kwargs, g_raw=g_raw, conv_qkv=conv_qkv, replay_records=None
     )
     torch.testing.assert_close(split, fused, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(precomputed, split, atol=0.0, rtol=0.0)
