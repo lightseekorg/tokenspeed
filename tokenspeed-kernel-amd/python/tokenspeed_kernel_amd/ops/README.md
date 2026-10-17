@@ -135,12 +135,14 @@ constexprs alone.
 
 - M = 1 (FMA tile): waves split the rows; a lane loads 16 bytes of every
   512-element K chunk, so one load instruction reads 1 KB of a row. Lanes keep
-  FP32 partial sums per chunk position and reduce once at the end. A share
-  that fits one register chunk is loaded in one go; larger shares stream
-  512-wide chunks through a ring of LDS buffers filled by direct-to-LDS copies,
-  one refill in flight per consumed chunk. The activation row sits in LDS too,
-  so the ring shrinks at long K, falling back to the register tile when fewer
-  than two chunks fit.
+  FP32 partial sums per chunk position and reduce once at the end. With up to
+  four rows per wave, the share streams its 512-wide chunks through a ring of
+  four to eight LDS buffers (at most 64 KB) filled by direct-to-LDS copies,
+  one refill in flight per consumed chunk; masked lanes rely on the
+  hardware's out-of-bounds zero fill. The activation row sits in LDS too, so
+  the ring shrinks at long K. The register tile (two chunks in flight, up to
+  128 bytes per lane each) takes the rest: more rows per wave, where it
+  measured 1-8% faster, and shares that leave fewer than four ring chunks.
 - M = 2-16 (MFMA tile): a 16-row batched MFMA whose batch dimension is the
   wave, so the four waves split every K iteration and reduce through LDS once;
   weights load K-contiguous and reach the operand layout through LDS.

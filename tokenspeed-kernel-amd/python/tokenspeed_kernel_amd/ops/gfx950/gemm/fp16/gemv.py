@@ -26,9 +26,9 @@ issues its whole weight share without split-K or cross-CU reductions:
 
 * M = 1, ``BLOCK_M == 1``: FMA tile. Waves split the rows, lanes split each
   K chunk with 16-byte loads (one load instruction reads a 1 KB contiguous
-  row segment); per-lane FP32 partial sums, one cross-lane reduction. A
-  share too large for one register chunk (``STAGES > 0``) streams its
-  512-wide chunks through a ring of ``STAGES`` LDS buffers instead.
+  row segment); per-lane FP32 partial sums, one cross-lane reduction. With
+  few rows per wave (``STAGES > 0``) the share streams its 512-wide chunks
+  through a ring of ``STAGES`` LDS buffers instead.
 * M = 2..16, ``BLOCK_M == 16``: MFMA tile. The waves split every K
   iteration (a batched MFMA whose batch dimension is the wave) and reduce
   through LDS once. Weights load in a K-contiguous layout and reach the MFMA
@@ -67,8 +67,15 @@ _FMA_MIN_CHUNK = 512
 _STAGED_CHUNK = gl.constexpr(_FMA_MIN_CHUNK)
 # Weight bytes per lane of one in-flight K chunk (two chunks are in flight).
 _CHUNK_BYTES_PER_LANE = 128
-# LDS the staged M = 1 tile may fill with weight chunks.
-_STAGED_LDS_BYTES = 128 * 1024
+# LDS and chunk count the staged M = 1 tile's weight ring may take; deeper
+# rings measured no faster on MI350X, and two-chunk rings slower than the
+# register tile.
+_STAGED_LDS_BYTES = 64 * 1024
+_STAGED_MIN_STAGES = 4
+_STAGED_MAX_STAGES = 8
+# The staged tile beat the register tile at up to this many rows per wave and
+# lost by 1-8% above it in MI350X sweeps (N = 512-16384, K = 1024-32768).
+_STAGED_MAX_ROWS_PER_WAVE = 4
 # LDS per workgroup on gfx950, shared by the weight ring and the activation row.
 _LDS_BYTES = 160 * 1024
 # MFMA tile: weight rows per tile are a multiple of the 16-wide instruction.
@@ -224,6 +231,9 @@ def _staged_tile(
     LW: gl.constexpr = gl.SliceLayout(2, L3)
     LX: gl.constexpr = gl.SliceLayout(0, L3)
     # The first STAGES chunks of the weight rows, one commit group each.
+    # Masked lanes read out of bounds, which the hardware fills with zeros;
+    # an explicit `other` branched around every copy and kept each chunk's
+    # registers live until the end of the unrolled loop, which spilled.
     smem = gl.allocate_shared_memory(
         w_ptr.dtype.element_ty,
         [STAGES, BLOCK_N, CHUNK // 8, 8],
@@ -236,7 +246,6 @@ def _staged_tile(
             w_ptr,
             offs + s * CHUNK,
             mask=mask & (k + s * CHUNK < K),
-            other=0.0,
             cache_modifier=".cg",
         )
         cdna4.async_copy.commit_group()
@@ -251,7 +260,7 @@ def _staged_tile(
     )
     for c in gl.static_range(CHUNKS):
         cdna4.async_copy.buffer_load_to_shared(
-            xsmem.index(c), x_ptr, xk + c * CHUNK, mask=xk + c * CHUNK < K, other=0.0
+            xsmem.index(c), x_ptr, xk + c * CHUNK, mask=xk + c * CHUNK < K
         )
     cdna4.async_copy.commit_group()
     acc = gl.zeros((BLOCK_N, CHUNK // 8), gl.float32, LW)
@@ -273,7 +282,6 @@ def _staged_tile(
                 w_ptr,
                 offs + (c + STAGES) * CHUNK,
                 mask=mask & (k + (c + STAGES) * CHUNK < K),
-                other=0.0,
                 cache_modifier=".cg",
             )
             cdna4.async_copy.commit_group()
@@ -474,11 +482,12 @@ def _config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int]:
         # to a power-of-2 chunk count; the ring gets what that leaves.
         x_bytes = triton.next_power_of_2(chunks) * _FMA_MIN_CHUNK * 2
         ring_bytes = min(_STAGED_LDS_BYTES, max(_LDS_BYTES - x_bytes, 0))
-        stages = min(chunks, ring_bytes // stage_bytes)
+        stages = min(chunks, ring_bytes // stage_bytes, _STAGED_MAX_STAGES)
         stages = 1 << (stages.bit_length() - 1) if stages > 0 else 0  # power of 2
-        if chunk < k and chunks >= NUM_WARPS and stages >= 2:
-            # The share does not fit one register chunk: stream it through
-            # an LDS ring of `stages` chunks.
+        staged = rows_per_wave <= _STAGED_MAX_ROWS_PER_WAVE
+        if staged and stages >= _STAGED_MIN_STAGES:
+            # Stream the share through an LDS ring of `stages` chunks; this
+            # also beats one register chunk that covers all of K.
             return rows, 1, block_n, _FMA_MIN_CHUNK, stages
         return rows, 1, block_n, chunk, 0
     block_k = 128 if k >= 128 * NUM_WARPS else 64

@@ -46,8 +46,8 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (  # noqa: E402
 _RTOL = {torch.bfloat16: 2**-7, torch.float16: 2**-10}
 _ATOL = 1e-3
 
-# (N, K): the register FMA tile, the LDS-staged FMA tile (long K shares),
-# ragged N, and a tiny N below one row per CU.
+# (N, K): the register FMA tile (one chunk and several), the LDS-staged FMA
+# tile, ragged N, and a tiny N below one row per CU.
 _SHAPES = [(2560, 320), (2560, 3072), (512, 2560), (6656, 2560), (1000, 1040), (8, 64)]
 
 
@@ -67,16 +67,39 @@ def test_gemv_matches_reference(m, n, k, dtype):
     torch.testing.assert_close(out, _reference(x, w), rtol=_RTOL[dtype], atol=_ATOL)
 
 
-@pytest.mark.parametrize("k", [16384, 20480])
+@pytest.mark.parametrize("k", [32768, 40960])
 def test_gemv_long_k_fits_lds(k):
     # The LDS-staged tile holds the whole activation row next to its weight
     # ring; at long K the ring must shrink so both fit gfx950's LDS. On 256
-    # CUs, K = 16384 fills the LDS exactly (32 KB row + 8 x 16 KB ring) and
-    # K = 20480 shrinks the ring (64 KB row + 4 x 16 KB ring).
-    m, n = 1, 2560
+    # CUs (two rows per wave), K = 32768 keeps the full ring (64 KB row +
+    # 8 x 8 KB ring) and K = 40960 shrinks it to fill the LDS exactly
+    # (128 KB row + 4 x 8 KB ring).
+    m, n = 1, 1280
     torch.manual_seed(k)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    out = x.new_empty(m, n)
+    launch_gluon_gemv_a16w16_gfx950(x, w, out)
+    torch.testing.assert_close(
+        out, _reference(x, w), rtol=_RTOL[torch.bfloat16], atol=_ATOL
+    )
+
+
+@pytest.mark.parametrize("m", [1, 5])
+def test_gemv_ignores_memory_past_k_and_n(m):
+    # NaN right after each activation row and after the weights: a masked K
+    # tail that reads them instead of zeros turns outputs NaN. (1000, 2576)
+    # has both a K tail and ragged N on the LDS-staged tile.
+    n, k = 1000, 2576
+    torch.manual_seed(m)
+    x_rows = torch.full((m, k + 512), float("nan"), device="cuda", dtype=torch.bfloat16)
+    x = x_rows[:, :k]
+    x.copy_(torch.randn(m, k, device="cuda", dtype=torch.bfloat16))
+    w_flat = torch.full(
+        ((n + 1) * k,), float("nan"), device="cuda", dtype=torch.bfloat16
+    )
+    w = w_flat[: n * k].view(n, k)
+    w.copy_(torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5)
     out = x.new_empty(m, n)
     launch_gluon_gemv_a16w16_gfx950(x, w, out)
     torch.testing.assert_close(
