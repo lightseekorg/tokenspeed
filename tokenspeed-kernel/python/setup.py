@@ -501,6 +501,7 @@ KERNEL_GROUPS = [
         ],
         [],
     ),
+    ("trtllm_mhc", [CUDA_CSRC_DIR / "trtllm_mnnvl_mhc.cu"], []),
     (
         "trtllm_comm",
         [

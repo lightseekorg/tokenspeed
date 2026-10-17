@@ -34,6 +34,96 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 platform = current_platform()
 
+
+def mega_mhc_eligible(
+    x, residual, pre, post, comb, weight, scale, base, sinkhorn_iters, norm_weight
+):
+    """Check the native shifted kernel contract without launching GPU work."""
+    if not (
+        platform.is_nvidia
+        and platform.arch_version.major == 10
+        and x.is_cuda
+        and x.ndim == 2
+        and 0 < x.shape[0] <= 1 << 20
+        and x.shape[1] > 0
+        and x.shape[1] % 1024 == 0
+        and sinkhorn_iters >= 1
+    ):
+        return False
+    tokens, hidden = x.shape
+    tensors = (
+        (x, (tokens, hidden), torch.bfloat16),
+        (residual, (tokens, 4, hidden), torch.bfloat16),
+        (pre, (tokens, 4), torch.float32),
+        (post, (tokens, 4), torch.float32),
+        (comb, (tokens, 4, 4), torch.float32),
+        (weight, (24, 4 * hidden), torch.float32),
+        (scale, (3,), torch.float32),
+        (base, (24,), torch.float32),
+        (norm_weight, (hidden,), torch.bfloat16),
+    )
+    if any(
+        t.shape != shape
+        or t.dtype != dtype
+        or t.device != x.device
+        or not t.is_contiguous()
+        for t, shape, dtype in tensors
+    ):
+        return False
+    from tokenspeed_kernel.thirdparty.cuda.mega_mhc import is_mega_mhc_available
+
+    return is_mega_mhc_available()
+
+
+@register_kernel(
+    "residual",
+    "mhc_shifted_post_pre_norm",
+    name="deep_gemm_mhc_shifted_post_pre_norm",
+    solution="deep_gemm",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 9),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=frozenset(
+        {format_signature(residual=dense_tensor_format(torch.bfloat16))}
+    ),
+    priority=Priority.PERFORMANT,
+)
+def deep_gemm_mhc_shifted_post_pre_norm(
+    x,
+    residual,
+    pre,
+    post,
+    comb,
+    weight,
+    scale,
+    base,
+    rms_eps,
+    hc_eps,
+    sinkhorn_iters,
+    norm_weight,
+    norm_eps,
+):
+    from tokenspeed_kernel.thirdparty.cuda.mega_mhc import shifted_post_pre_norm
+
+    return shifted_post_pre_norm(
+        x,
+        residual,
+        pre,
+        post,
+        comb,
+        weight,
+        scale,
+        base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+        norm_weight,
+        norm_eps,
+    )
+
+
 if platform.is_hopper_plus:
     prepare_cuda_toolkit_env()
     from deep_gemm import (

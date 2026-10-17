@@ -854,31 +854,31 @@ def gluon_mhc_post_gfx950(
     r1 = cdna4.buffer_load(residual, base + HIDDEN_SIZE, mask=mask).to(gl.float32)
     r2 = cdna4.buffer_load(residual, base + 2 * HIDDEN_SIZE, mask=mask).to(gl.float32)
     r3 = cdna4.buffer_load(residual, base + 3 * HIDDEN_SIZE, mask=mask).to(gl.float32)
-    # Same accumulation order as the portable kernel: post * x first, then
-    # input streams 0..3; comb is indexed [input stream, output stream].
+    # Match portable FP32 rounding: post * x, then FMA for input streams 0..3.
+    # comb is indexed [input stream, output stream].
     out0 = p0 * x
-    out0 += c0 * r0
-    out0 += c4 * r1
-    out0 += c8 * r2
-    out0 += c12 * r3
+    out0 = gl.fma(c0, r0, out0)
+    out0 = gl.fma(c4, r1, out0)
+    out0 = gl.fma(c8, r2, out0)
+    out0 = gl.fma(c12, r3, out0)
     cdna4.buffer_store(out0.to(gl.bfloat16), out, base, mask=mask)
     out1 = p1 * x
-    out1 += c1 * r0
-    out1 += c5 * r1
-    out1 += c9 * r2
-    out1 += c13 * r3
+    out1 = gl.fma(c1, r0, out1)
+    out1 = gl.fma(c5, r1, out1)
+    out1 = gl.fma(c9, r2, out1)
+    out1 = gl.fma(c13, r3, out1)
     cdna4.buffer_store(out1.to(gl.bfloat16), out, base + HIDDEN_SIZE, mask=mask)
     out2 = p2 * x
-    out2 += c2 * r0
-    out2 += c6 * r1
-    out2 += c10 * r2
-    out2 += c14 * r3
+    out2 = gl.fma(c2, r0, out2)
+    out2 = gl.fma(c6, r1, out2)
+    out2 = gl.fma(c10, r2, out2)
+    out2 = gl.fma(c14, r3, out2)
     cdna4.buffer_store(out2.to(gl.bfloat16), out, base + 2 * HIDDEN_SIZE, mask=mask)
     out3 = p3 * x
-    out3 += c3 * r0
-    out3 += c7 * r1
-    out3 += c11 * r2
-    out3 += c15 * r3
+    out3 = gl.fma(c3, r0, out3)
+    out3 = gl.fma(c7, r1, out3)
+    out3 = gl.fma(c11, r2, out3)
+    out3 = gl.fma(c15, r3, out3)
     cdna4.buffer_store(out3.to(gl.bfloat16), out, base + 3 * HIDDEN_SIZE, mask=mask)
 
 

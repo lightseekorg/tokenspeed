@@ -76,6 +76,14 @@ def _load_trtllm_comm_module():
     return tvm_ffi.load_module(str(so_path))
 
 
+@functools.cache
+def _load_trtllm_mhc_module():
+    import tvm_ffi
+
+    path = Path(__file__).resolve().parent / "objs/trtllm_mhc/trtllm_mhc.so"
+    return tvm_ffi.load_module(str(path))
+
+
 # ---------------------------------------------------------------------------
 # Pattern enums (pure Python, identical to flashinfer)
 # ---------------------------------------------------------------------------

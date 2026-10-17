@@ -309,6 +309,7 @@ def test_residual_family_exports_and_modes():
         "post_norm_residual_pre_norm",
         "post_norm_residual_pre_norm_bf16",
         "residual_gate_coefficients",
+        "try_mhc_shifted_post_pre_norm",
     }
     assert set(_residual_pkg.__all__) == expected_exports
     residual_modes = {
@@ -324,6 +325,7 @@ def test_residual_family_exports_and_modes():
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
+        "mhc_shifted_post_pre_norm",
         "normalized_dot_gate",
     }
 
