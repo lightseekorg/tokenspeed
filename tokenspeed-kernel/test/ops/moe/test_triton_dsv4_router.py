@@ -31,7 +31,9 @@ from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights, 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("weights_dtype", [torch.float32, torch.bfloat16])
-def test_router_reuses_compilation_across_token_counts(weights_dtype):
+def test_router_reuses_compilation_across_token_counts(
+    weights_dtype: torch.dtype,
+) -> None:
     from tokenspeed_kernel.ops.moe._triton import sqrt_softplus_topk
     from utils import assert_no_triton_compile
 

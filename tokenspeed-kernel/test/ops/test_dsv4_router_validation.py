@@ -181,7 +181,9 @@ def test_unified_router_preserves_override_and_output_dtypes(
 
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize("hash_routing", [False, True])
-def test_cuda_router_preserves_explicit_pdl(monkeypatch, enable_pdl, hash_routing):
+def test_cuda_router_preserves_explicit_pdl(
+    monkeypatch: pytest.MonkeyPatch, enable_pdl: bool, hash_routing: bool
+) -> None:
     from tokenspeed_kernel.thirdparty.cuda import routing
 
     module = Mock()

@@ -225,8 +225,9 @@ def cute_dsl_dsv4_linear_fp32(
     """Project DSV4 inputs with the shared low-latency BF16 router driver.
 
     Args:
-        hidden_states: Contiguous BF16 [M, K] activations, up to MAX_M rows.
-        weight: Contiguous BF16 [N, K] projection weights.
+        hidden_states: Contiguous BF16 ``[M, K]`` activations, up to ``MAX_M``
+            rows.
+        weight: Contiguous BF16 ``[N, K]`` projection weights.
         enable_pdl: PDL policy used for compilation and launch.
 
     Returns:

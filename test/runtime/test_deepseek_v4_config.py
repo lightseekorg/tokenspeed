@@ -628,6 +628,33 @@ class TestDeepseekV4Config:
         assert actual.is_contiguous()
         torch.testing.assert_close(actual, hidden_states * 2, atol=0, rtol=0)
 
+    def test_deepseek_v4_moe_deferred_finalize_uses_routes_without_kernel_weights(
+        self,
+    ):
+        # Precomputed-route kernels (Triton MXFP4) return no weights; the
+        # routing pass holds them.
+        hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
+        input_ids = torch.arange(2)
+        moe = self._make_fake_deepseek_v4_moe(
+            hidden_states,
+            input_ids,
+            StreamFork(None),
+            [],
+            norm_topk_prob=True,
+        )
+        route_weights = torch.tensor([[0.25, 0.75], [0.5, 0.5]])
+        moe.topk = lambda *args, **kwargs: SimpleNamespace(topk_weights=route_weights)
+        gemm = torch.ones(4, 3, dtype=torch.bfloat16)
+        indices = torch.arange(4, dtype=torch.int32)
+        moe.experts = Mock(return_value=(gemm, None, indices))
+        moe.experts.supports_deferred_finalize = True
+        with patch.object(
+            deepseek_v4_model, "moe_finalize_fuse_shared", return_value=hidden_states
+        ) as finalize:
+            moe.forward_normal(hidden_states, input_ids, 2, 2)
+        assert finalize.call_args.args[2] is route_weights
+        assert finalize.call_args.kwargs["top_k"] == 2
+
     def test_deepseek_v4_moe_keeps_finalize_for_unsupported_consumer(self):
         hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
         input_ids = torch.arange(2)

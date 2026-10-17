@@ -111,16 +111,16 @@ if platform.is_amd:
         priority=Priority.SPECIALIZED,
     )
     def gluon_sqrt_softplus_topk_gfx950(
-        router_logits,
-        top_k,
-        renormalize,
-        correction_bias,
-        hash_indices_table,
-        input_ids,
-        need_scores,
-        routed_scaling_factor,
-        weights_dtype,
-    ):
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        correction_bias: torch.Tensor | None,
+        hash_indices_table: torch.Tensor | None,
+        input_ids: torch.Tensor | None,
+        need_scores: bool,
+        routed_scaling_factor: float,
+        weights_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         weights, ids, scores = _topk_impl(
             router_logits,
             top_k,
