@@ -277,6 +277,7 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
         "eval-deepseek-v4.1-flash-dspark-gsm8k",
         "eval-deepseek-v4.1-flash-dspark-gsm8k-amd",
     )
+    model = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
 
     for filename, label, name in zip(filenames, labels, names, strict=True):
         task = yaml.safe_load((EVAL_CONFIG_DIR / filename).read_text(encoding="utf-8"))
@@ -286,7 +287,7 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
         assert task["triggers"] == ["per-commit", "manual"]
         assert task["name"] == name
         assert task["runner"]["labels"] == [label]
-        assert flag_value(server_tokens, "--model") == "deepseek-ai/DeepSeek-V4.1-Flash"
+        assert flag_value(server_tokens, "--model") == model
         assert flag_value(server_tokens, "--tensor-parallel-size") == "4"
         assert flag_value(server_tokens, "--dtype") == "bfloat16"
         assert flag_value(server_tokens, "--max-model-len") == "1048576"
@@ -296,7 +297,7 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
         assert flag_value(server_tokens, "--max-cudagraph-capture-size") == "32"
         assert "--disable-kvstore" in server_tokens
         assert "--trust-remote-code" in server_tokens
-        assert flag_value(eval_tokens, "--model") == "deepseek-ai/DeepSeek-V4.1-Flash"
+        assert flag_value(eval_tokens, "--model") == model
         assert flag_value(eval_tokens, "--datasets") == "gsm8k"
         assert flag_value(eval_tokens, "--eval-batch-size") == "32"
         assert task["score_threshold"] == 0.90

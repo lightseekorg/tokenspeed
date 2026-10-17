@@ -300,3 +300,17 @@ call and the Torch statements otherwise. The GPU tests
 (`test/nvidia/ops/moe/test_router_select_cuda.py`) pin Torch's FP32 sigmoid and
 K8 sum order first (a mismatch fails, never skips), then compare the two byte for
 byte on random rows, tie, edge and NaN corpora and in CUDA-graph replay.
+
+## Routing weight storage and deferred finalize
+
+`moe_plan` records the selected expert kernel's `topk_weights_dtype` alongside
+its communication and combine-order traits. DeepSeek V4 routing uses that
+storage dtype after FP32 scoring, normalization, and scaling. This does not
+change expert placement: all-to-all plans still route rank-local tokens, while
+replicated-input plans use the shared replica choice described in
+[Expert placement dispatch](#expert-placement-dispatch).
+
+The BF16 TRT-LLM MXFP4 SwiGLU path can return expert rows, route weights, and
+row indices for `moe_finalize_fuse_shared`. The finalizer combines the shared
+expert output in FP32 and trims to the original hidden width. FP16 input and
+backends without deferred finalize retain their ordinary finalized output.

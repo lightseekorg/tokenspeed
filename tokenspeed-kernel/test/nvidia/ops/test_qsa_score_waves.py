@@ -26,7 +26,7 @@ import pytest
 import torch
 from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.ops.attention.qsa import triton as qsa
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, max_active_ctas
 from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
@@ -100,6 +100,7 @@ def test_score_wave_budget_tracks_compiled_resources(batch: int, num_stages: int
     with torch.cuda.graph(graph):
         kernel[grid](*args, *constants.values())
     actual_grid, resident = _score_launch(graph)
+    assert max_active_ctas(kernel) == resident
     launched = math.prod(actual_grid)
     budget = 3 * sm_count * resident
     assert launched <= budget
@@ -144,6 +145,16 @@ def test_score_launch_bounds_waves_and_refreshes_groups(
     with assert_no_triton_compile(qsa._qwen4_exp_qsa_score_blocks_kernel):
         # Runtime row/group counts must reuse the same specialization.
         forward(query[:-1])
+        if not large_batch:
+            for count in (1, 3, 16, 32):
+                result = forward(query[:count])
+                expected = torch.relu(
+                    query[:count].float() @ keys[64:128, 0].float().T
+                ).sum(dim=1)
+                expected = expected.repeat(1, 3)[:, :129]
+                torch.testing.assert_close(
+                    result[:, :129], expected, rtol=1e-5, atol=1e-4
+                )
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         with torch.cuda.graph(graph):
             actual = forward(query)

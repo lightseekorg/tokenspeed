@@ -39,7 +39,6 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 platform = current_platform()
-_PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 # Default the DSA decode top-k to the CuTe DSL cluster kernel; set
 # ``TS_DSA_DECODE_TOPK_CUTEDSL=0`` to fall back to the ragged/persistent path.
@@ -409,11 +408,6 @@ if platform.is_hopper_plus:
                 topk,
                 lengths=seq_lens,
                 q_len_per_req=q_len_per_req,
-                workspace=torch.empty(
-                    (_PERSISTENT_TOPK_WORKSPACE_BYTES,),
-                    dtype=torch.uint8,
-                    device=q.device,
-                ),
                 max_seq_len=max_seq_len,
                 enable_pdl=pdl_enabled(),
             )

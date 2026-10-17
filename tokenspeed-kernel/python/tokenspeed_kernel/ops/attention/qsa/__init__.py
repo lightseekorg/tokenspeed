@@ -285,29 +285,26 @@ def qsa_block_topk_select(
     topk: int,
     *,
     lengths: torch.Tensor,
-    persistent_workspace: torch.Tensor | None,
     enable_pdl: bool,
     override: str | None,
     solution: str | None,
 ) -> torch.Tensor:
-    """Select each row's ``topk`` highest finite block scores.
+    """Select each row's ``topk`` highest QSA block scores.
 
     Args:
-        logits: FP32 scores shaped ``[rows, cols]``. Columns at or beyond
-            ``lengths`` are ignored, and ``-inf`` is never selected.
+        logits: FP32 scores shaped ``[rows, cols]`` from ``qsa_block_scores``.
+            Scored prefixes must be finite; later columns are ignored.
         topk: Blocks selected per row.
-        lengths: Per-row count of scored columns, clamped to the score width.
+        lengths: Per-row count of scored columns in ``[0, cols]``.
             Later columns may be uninitialized.
-        persistent_workspace: Optional caller-owned CUDA uint8 workspace of
-            at least 1 MiB for implementations that keep persistent state.
         enable_pdl: Use programmatic dependent launch where supported.
         override: Optional registered kernel name.
         solution: Optional kernel solution.
 
     Returns:
         Int32 column ids shaped ``[rows, topk]`` in no particular order,
-        padded with ``-1`` when a row has fewer finite scores. Among equal
-        scores at the threshold the smaller id is kept.
+        padded with ``-1`` when a row has fewer scored columns. Equal scores
+        at the threshold may select different column ids across solutions.
     """
 
     kernel = select_kernel(
@@ -322,7 +319,6 @@ def qsa_block_topk_select(
         logits,
         topk,
         lengths=lengths,
-        persistent_workspace=persistent_workspace,
         enable_pdl=enable_pdl,
     )
 
@@ -397,7 +393,6 @@ def qwen4_exp_qsa_block_topk(
     queries_per_request: int | None,
     max_partial_bytes: int,
     algorithm: str,
-    persistent_topk_workspace: torch.Tensor | None,
     enable_pdl: bool,
 ) -> torch.Tensor:
     """Select the highest-scoring compressed blocks for each query row.
@@ -423,10 +418,6 @@ def qwen4_exp_qsa_block_topk(
             materializing scores; ``"logits"`` materializes the
             ``[rows, num_blocks]`` FP32 scores with ``qsa_block_scores`` and
             selects them with ``qsa_block_topk_select``.
-        persistent_topk_workspace: Optional caller-owned CUDA uint8 workspace
-            of at least 1 MiB. The ``"logits"`` algorithm uses it for the
-            length-aware persistent radix top-k when that kernel is available;
-            otherwise selection falls back to portable Triton.
         enable_pdl: Wait for query/cache/metadata producers and release
             successor setup early between scoring and selection on NVIDIA GPUs.
 
@@ -471,7 +462,6 @@ def qwen4_exp_qsa_block_topk(
             scores,
             block_topk,
             lengths=complete_blocks,
-            persistent_workspace=persistent_topk_workspace,
             enable_pdl=enable_pdl,
             override=None,
             solution=None,
@@ -493,6 +483,7 @@ def qwen4_exp_qsa_block_topk(
 
 # Backend registration (side-effect imports)
 # isort: off
+import tokenspeed_kernel.ops.attention.qsa.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.qsa.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.qsa.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.qsa.flashinfer  # noqa: E402,F401
