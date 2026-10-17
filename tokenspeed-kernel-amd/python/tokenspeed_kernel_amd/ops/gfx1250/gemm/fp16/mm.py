@@ -393,9 +393,9 @@ def _dense_num_buffers(
     Decode streams B once, so the buffers ahead of the WMMAs set the bytes in
     flight. A grid past 256 CUs keeps two programs resident on a CU, which
     then split its 320 KB; deeper buffers beat a third resident program. The
-    padded layout adds 8 elements per 256.
+    padded layout adds 8 elements per K row.
     """
-    stage_bytes = (block_m + block_n) * block_k * 2 * 264 // 256
+    stage_bytes = (block_m + block_n) * (block_k + 8) * 2
     per_cta = _LDS_BYTES // min(triton.cdiv(ctas, _NUM_CUS), 2)
     return max(2, min(requested, k_tiles, per_cta // stage_bytes))
 

@@ -362,13 +362,15 @@ epilogue loads `X` and `Y` for the stored tile.
 
 The weight stream is latency bound per program: the TDM buffers ahead of the
 WMMAs set the bytes in flight. K3 projections request eight buffers and the
-BF16 GEMM below keeps its per-tile counts; launches cap the request by the K
-tiles per split and by LDS: a grid past 256 CUs keeps two programs resident
-on a CU, and they share its 320 KB. One K loop serves every tile and K length. It
-keeps up to `buffers - 1` A/B TDM pairs in flight, waits only for the next
-tile, and reads that tile from LDS while the current tile's WMMAs run. Each
-tile's two K halves accumulate separately and are summed after the loop, so
-the WMMAs do not form one long dependent chain.
+BF16 GEMM below requests its per-tile counts. Every launch, the BF16 GEMM's
+included, caps the request by the K tiles per split and by LDS: a grid past
+256 CUs keeps two programs resident on a CU, and they share its 320 KB.
+
+One K loop serves every tile and K length. It keeps up to `buffers - 1` A/B
+TDM pairs in flight, waits only for the next tile, and reads that tile from
+LDS while the current tile's WMMAs run. Each tile's two K halves accumulate
+separately and are summed after the loop, so the WMMAs do not form one long
+dependent chain.
 
 Both paths accumulate in FP32 and round to BF16 once. Direct launches store
 that conversion from the producer. Split-K launches write one FP32 partial
