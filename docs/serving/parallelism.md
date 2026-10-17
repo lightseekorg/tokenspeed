@@ -43,8 +43,8 @@ tokenspeed serve <model> \
 | `--dense-tp-size` | Dense layer tensor parallel size. Defaults to the attention TP width: the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | MoE layer tensor parallel size. |
 | `--data-parallel-size` | Replicated data-parallel groups. |
-| `--kv-parallel-size` | KV parallelism: shard the full-history KV pages over a consecutive subgroup of attention TP on a PD prefill or decode engine (see "KV parallelism" below). |
-| `--decode-context-parallel-size` | Decode context parallelism: the decode role's compute over the sharded pages; required with and equal to `--kv-parallel-size` there. |
+| `--kv-parallel-size` | KV parallelism: shard the full-history KV pages over a consecutive subgroup of attention TP on an aggregated or PD engine (see "KV parallelism" below). |
+| `--decode-context-parallel-size` | Decode context parallelism in aggregated or PD decode engines; required with and equal to `--kv-parallel-size` there. |
 | `--query-context-parallel-size` | Query context parallelism: the prefill role's query-row sharding over the sharded pages; equal to `--kv-parallel-size` and `--attn-tp-size` (see "Query context parallelism" below). |
 | `--mm-encoder-tp-mode` | `weights` (default), or TP1 whole-item DP within each attention TP group (`data`). |
 | `--enable-expert-parallel` | Expert parallelism across the selected world size. |
@@ -636,9 +636,9 @@ things:
 - **DCP** (decode context parallelism) is the *decode-side compute* over KVP
   pages: every rank keeps all of its query heads, attends only the pages it
   owns, and the partial outputs are merged across the KVP group by their
-  log-sum-exp (LSE). `--decode-context-parallel-size N` names it on the PD
-  decode role, where it is the only way to read a sharded cache (so the
-  decode role requires it with `--kv-parallel-size N`, equal); the attention
+  log-sum-exp (LSE). `--decode-context-parallel-size N` names it in aggregated
+  or PD decode engines, where it is the only way to decode over a sharded cache
+  (so both require it with `--kv-parallel-size N`, equal); the attention
   backends' decode algorithms, their kernels and the LSE-merge code carry the
   DCP name and key on `kvp_size`, which the drafter's steps on a sharded
   prefill engine take as well.
@@ -655,12 +655,26 @@ compressor state) stay replicated. The attention backend decides how it
 attends the sharded pages (DCP decode, chunked or gathered prefill history);
 the scheduler plans the same virtual blocks on every rank and the runtime
 translates ownership where it reads, writes or copies them
-(`docs/design/cache-concepts.md`). PD roles only: a prefill engine (with or
-without a query shard) and a decode engine (with `--decode-context-parallel-size`)
-each shard their cache independently (a transfer edge copies the pages its
-prefill rank and its decode rank both own); an aggregated engine does not
-shard, since its steady-state decode would be DCP. Works with the Host
-KVStore and the retraction snapshot pool; not yet with L3 storage.
+(`docs/design/cache-concepts.md`). An aggregated engine combines the existing
+sharded-history prefill with DCP decode, without a PD transfer or QCP. On PD,
+a prefill engine (with or without a query shard) and a decode engine (with
+`--decode-context-parallel-size`) each shard their cache independently; a
+transfer edge copies the pages its prefill rank and decode rank both own.
+Works with the Host KVStore and the retraction snapshot pool; not yet with
+L3 storage.
+
+For non-PD MLA serving, use a DCP-capable backend, for example:
+
+```bash
+ts serve --model MODEL --attention-backend flashmla \
+  --attn-tp-size 8 --kv-parallel-size 8 --decode-context-parallel-size 8
+```
+
+Keep `--disaggregation-mode` at `null` and QCP at 1. Aggregated DCP requires
+separate prefill/decode rounds and rejects `--enable-mixed-batch` for all
+backends, including MLA/DSA. MLA decode remains absorbed; MLA/KDA hybrids
+shard only MLA history. Ordinary TP with KVP = DCP = 1 is unaffected.
+
 Speculative decoding runs on a sharded cache with the backends whose DCP
 decode takes a verify window (FlashMLA, CuTe MLA, GPU DSA); the draft group
 shards like the target's. A FlashMLA verify under KVP runs one kernel row per

@@ -1339,13 +1339,14 @@ is the pool-less engine, where every capacity block aborts.
 
 ## Virtual block placement within a shared physical plan
 
-KV parallelism (KVP, `--kv-parallel-size`, PD roles only) is a storage
+KV parallelism (KVP, `--kv-parallel-size`) is a storage
 layout: a sharded group's pages are dealt page-cyclically to the ranks of the
 KVP subgroup by virtual block id, so each rank stores `1/N` of them. Decode
-context parallelism (DCP, `--decode-context-parallel-size` on the decode
-role) is the decode compute over those pages -- every rank attends the pages
-it owns and the partials are merged by LSE -- and belongs to the attention
-backends. This section is about the storage side.
+context parallelism (DCP, `--decode-context-parallel-size`) is the decode
+compute over those pages -- every rank attends the pages it owns and the
+partials are merged by LSE -- and belongs to the attention backends.
+Aggregated engines reuse the sharded-cache prefill and DCP decode paths in
+separate rounds. This section is about the storage side.
 
 A recipe declares each group as a `(CacheGroupSpec, fields)` tuple.
 `CacheGroupSpec.shard_count` defaults to 1 (replicated); a larger value assigns
