@@ -23,13 +23,13 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
+    _e2m1_encode,
     _index_gather_heads,
     _index_topk_outputs,
-    cache_pack,
 )
 
-_MFMA_HEADS = 32
 _PAGE_SIZE = 64
 # Match the native paged scorer's transient score budget. Heads are gathered
 # once per API chunk; only score/selection work is split at wider histories.
@@ -45,21 +45,68 @@ def _score_query_tile(queries: int, width: int) -> int:
     )
 
 
+@triton.jit(
+    do_not_specialize=["Q0", "Q1", "Q2", "W0", "W1"],
+    do_not_specialize_on_alignment=["Q0", "Q1", "Q2", "W0", "W1"],
+)
+def _pack_index_queries_padded(
+    Q,
+    W,
+    V,
+    S,
+    F,
+    Q0,
+    Q1,
+    Q2,
+    W0,
+    W1,
+    HEADS: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    d = tl.arange(0, 128)
+    live = head < HEADS
+    x = tl.load(Q + token * Q0 + head * Q1 + d * Q2, live, 0.0).to(tl.float32)
+    grouped = tl.reshape(x, (4, 32))
+    # Match cache_pack(index): multiplication by the rounded reciprocal of six.
+    raw = tl.maximum(tl.max(tl.abs(grouped), 1), 6 * 2.0**-126) * (1.0 / 6.0)
+    bits = raw.to(tl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    scale = (exponent << 23).to(tl.float32, bitcast=True)
+    normalized = tl.reshape(tl.div_rn(grouped, scale[:, None]), (128,))
+    code = _e2m1_encode(normalized).to(tl.int32)
+    pairs = tl.reshape(code, (64, 2))
+    packed = tl.sum(pairs << (tl.arange(0, 2)[None, :] * 4), 1).to(tl.uint8)
+    word = tl.sum(exponent.to(tl.uint32) << (tl.arange(0, 4) * 8), 0)
+    row = token * 32 + head
+    tl.store(V + row * 64 + tl.arange(0, 64), tl.where(live, packed, 0))
+    tl.store(S + row, tl.where(live, word.to(tl.int32), 0))
+    weight = tl.load(W + token * W0 + head * W1, live, 0.0).to(tl.float32)
+    tl.store(F + row, weight)
+
+
 def _pack_index_q(q: torch.Tensor, weights: torch.Tensor):
+    """Write AMD's dense 32-head FP4 planes and FP32 weights without relayouts."""
     tokens, heads, _ = q.shape
-    packed = cache_pack(q.contiguous().reshape(tokens * heads, 128), "index", None)
-    values = packed[:, :64].reshape(tokens, heads, 64)
-    scales = packed[:, 64:68].contiguous().view(torch.int32).reshape(tokens, heads)
-    pad = _MFMA_HEADS - heads
-    if pad < 0:
-        raise ValueError(f"AMD CSA2 MXFP4 indexer supports at most {_MFMA_HEADS} heads")
-    if pad:
-        values = torch.nn.functional.pad(values, (0, 0, 0, pad))
-        scales = torch.nn.functional.pad(scales, (0, pad))
-        weights = torch.nn.functional.pad(weights.float(), (0, pad))
-    else:
-        weights = weights.float()
-    return values.contiguous(), scales.contiguous(), weights.contiguous()
+    if not 1 <= heads <= 32:
+        raise ValueError("AMD CSA2 MXFP4 indexer supports 1..32 heads")
+    values = torch.empty((tokens, 32, 64), dtype=torch.uint8, device=q.device)
+    scales = torch.empty((tokens, 32), dtype=torch.int32, device=q.device)
+    folded = torch.empty((tokens, 32), dtype=torch.float32, device=q.device)
+    if tokens:
+        _pack_index_queries_padded[(tokens, 32)](
+            q,
+            weights,
+            values,
+            scales,
+            folded,
+            *q.stride(),
+            *weights.stride(),
+            heads,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return values, scales, folded
 
 
 def _logical_from_scan(columns: torch.Tensor, candidate_blocks: torch.Tensor | None):

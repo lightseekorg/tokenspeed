@@ -34,10 +34,12 @@ from tokenspeed_kernel.numerics.torch.attention.dsv41 import (
 )
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import gluon as gluon_backend
+from tokenspeed_kernel.ops.attention.dsv41 import triton as triton_backend
 from tokenspeed_kernel.ops.attention.dsv41._gluon import indexer as gluon_indexer
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from utils import assert_no_triton_compile
 
 pytest.importorskip("tokenspeed_triton")
 pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
@@ -467,3 +469,48 @@ def test_index_topk_preserves_arena_page_stride(
     for got, want in zip(actual, expected, strict=True):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
     assert actual[1].item() == (16 if reindex else 256)
+
+
+@pytest.mark.parametrize("rows", [0, 6, 12, 24, 48, 96, 192, 257])
+@pytest.mark.parametrize("heads", [1, 4, 32])
+@pytest.mark.parametrize("strided", [False, True])
+def test_index_query_planes_match_codec_and_padding(device, rows, heads, strided):
+    torch.manual_seed(333)
+    storage = torch.randn(rows, heads * 2, 128, dtype=torch.bfloat16, device=device)
+    ws = torch.randn(rows, heads * 2, dtype=torch.bfloat16, device=device)
+    q = storage[:, ::2] if strided else storage[:, :heads].contiguous()
+    w = ws[:, ::2] if strided else ws[:, :heads].contiguous()
+    packed = triton_backend.cache_pack(
+        q.contiguous().reshape(rows * heads, 128), "index", None
+    )
+    expected_values = packed[:, :64].reshape(rows, heads, 64).contiguous()
+    expected_scales = (
+        packed[:, 64:68].contiguous().view(torch.int32).reshape(rows, heads)
+    )
+    if heads < 32:
+        expected_values = torch.nn.functional.pad(
+            expected_values, (0, 0, 0, 32 - heads)
+        )
+        expected_scales = torch.nn.functional.pad(expected_scales, (0, 32 - heads))
+    expected_weights = torch.nn.functional.pad(w.float(), (0, 32 - heads))
+    actual = gluon_indexer._pack_index_q(q, w)
+    for got, expected in zip(
+        actual, (expected_values, expected_scales, expected_weights)
+    ):
+        assert got.is_contiguous()
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
+def test_index_query_planes_do_not_specialize_on_rows_or_row_strides(device):
+    q = torch.randn(257, 32, 128, dtype=torch.bfloat16, device=device)
+    w = torch.randn(257, 32, dtype=torch.bfloat16, device=device)
+    gluon_indexer._pack_index_q(q[:6], w[:6])
+    with assert_no_triton_compile(gluon_indexer._pack_index_queries_padded):
+        for rows in (12, 24, 48, 96, 192, 257):
+            gluon_indexer._pack_index_q(q[:rows], w[:rows])
+        for padding in (1, 7, 31):
+            padded_q = torch.randn(12, 32 * 128 + padding, dtype=q.dtype, device=device)
+            padded_w = torch.randn(12, 32 + padding, dtype=w.dtype, device=device)
+            gluon_indexer._pack_index_q(
+                padded_q[:, : 32 * 128].view(12, 32, 128), padded_w[:, :32]
+            )
