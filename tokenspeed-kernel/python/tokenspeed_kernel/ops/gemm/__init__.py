@@ -396,8 +396,7 @@ def prepare_mxfp8_weight_scales(
         and min(weight.shape) >= 128
         and weight.stride(-1) == 1
         and pdl_enabled()
-        and resolve_kernel_override("gemm", "mm", None)
-        in (None, "flashinfer_mm_mxfp8")
+        and resolve_kernel_override("gemm", "mm", None) in (None, "flashinfer_mm_mxfp8")
         and resolve_kernel_override("quantization", "fp8_with_scale", None) is None
     ):
         return None
