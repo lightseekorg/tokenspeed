@@ -91,6 +91,11 @@ jobs:
           python -m pip install "pytest>=9" packaging cryptography pyyaml
           python -m pytest -q test/ci_system/test_weekly_release.py
 
+      - name: Check AgentX launcher lifecycle and CI path filtering
+        run: |
+          python -m unittest discover -s test/agentic_benchmark/tests -p test_k3_inferencex_agentx.py -v
+          python -m pytest -q test/ci_system/test_ci_path_filter.py
+
       - name: Install scheduler C++ lint tools
         if: steps.scheduler_cpp_changes.outputs.changed == 'true'
         run: |
