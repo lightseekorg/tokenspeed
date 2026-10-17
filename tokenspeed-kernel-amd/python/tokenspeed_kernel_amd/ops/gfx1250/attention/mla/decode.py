@@ -677,6 +677,7 @@ _mla_decode_fwd_reduce_kernel_repr = make_kernel_repr(
         "KV_LORA_RANK",
         "NUM_KV_SPLITS",
         "SPLIT_CHUNK",
+        "BLOCK_D",
         "ALL_DECODE",
         "HAS_LSE",
         "num_warps",
@@ -702,17 +703,19 @@ def _mla_decode_fwd_reduce_kernel(
     KV_LORA_RANK: gl.constexpr,
     NUM_KV_SPLITS: gl.constexpr,
     SPLIT_CHUNK: gl.constexpr,
+    BLOCK_D: gl.constexpr,
     ALL_DECODE: gl.constexpr,
     HAS_LSE: gl.constexpr,
     num_warps: gl.constexpr,
 ):
-    # One program merges one (token, head) row. Each thread owns a short
-    # vector of the latent and streams SPLIT_CHUNK split partials at a time
-    # straight into registers, so any split count works without staging every
-    # split in LDS.
-    VEC: gl.constexpr = KV_LORA_RANK // (32 * num_warps)
+    # One program merges BLOCK_D latent columns of one (token, head) row, so
+    # a small batch still spreads its merge over KV_LORA_RANK / BLOCK_D times
+    # as many programs. Warps split the SPLIT_CHUNK splits of each step and
+    # keep their own running sums; the one cross-warp reduction happens after
+    # the last live split, which bounds the loop.
+    VEC: gl.constexpr = BLOCK_D // 32
     TILE_LAYOUT: gl.constexpr = gl.BlockedLayout(
-        [SPLIT_CHUNK, VEC], [1, 32], [1, num_warps], [1, 0]
+        [1, VEC], [1, 32], [num_warps, 1], [1, 0]
     )
     CHUNK_LAYOUT: gl.constexpr = gl.SliceLayout(1, TILE_LAYOUT)
     D_LAYOUT: gl.constexpr = gl.SliceLayout(0, TILE_LAYOUT)
@@ -720,6 +723,7 @@ def _mla_decode_fwd_reduce_kernel(
 
     token = gl.program_id(0)
     head = gl.program_id(1)
+    d_block = gl.program_id(2)
     if ALL_DECODE:
         seq_idx = token
     else:
@@ -745,9 +749,9 @@ def _mla_decode_fwd_reduce_kernel(
     )
     overall_expsum = gl.sum(split_expsum * gl.exp2(split_max - overall_max), axis=0)
 
-    offs_d = gl.arange(0, KV_LORA_RANK, layout=D_LAYOUT)
-    acc = gl.zeros([KV_LORA_RANK], gl.float32, layout=D_LAYOUT)
-    for chunk in gl.static_range(NUM_KV_SPLITS // SPLIT_CHUNK):
+    offs_d = d_block * BLOCK_D + gl.arange(0, BLOCK_D, layout=D_LAYOUT)
+    acc = gl.zeros([SPLIT_CHUNK, BLOCK_D], gl.float32, layout=TILE_LAYOUT)
+    for chunk in range(0, cdiv_fn(active_splits, SPLIT_CHUNK)):
         offs_split = chunk * SPLIT_CHUNK + gl.arange(
             0, SPLIT_CHUNK, layout=CHUNK_LAYOUT
         )
@@ -765,18 +769,25 @@ def _mla_decode_fwd_reduce_kernel(
             mask=live[:, None],
             other=0.0,
         ).to(gl.float32)
-        acc += gl.sum(partial * weight[:, None], axis=0)
-    acc = gl.where(overall_expsum == 0.0, 0.0, acc / overall_expsum)
+        acc += partial * weight[:, None]
+    merged = gl.sum(acc, axis=0)
+    merged = gl.where(overall_expsum == 0.0, 0.0, merged / overall_expsum)
     gl.store(
         output_ptr + token * output_stride_0 + head * output_stride_1 + offs_d,
-        acc.to(output_ptr.type.element_ty),
+        merged.to(output_ptr.type.element_ty),
     )
 
     if HAS_LSE:
-        # Split maxima are maintained in log2 space. TokenSpeed's attention
-        # API returns natural-log LSE, so convert after the final merge.
-        lse = (overall_max + gl.log2(overall_expsum)) * 0.6931471805599453
-        gl.store(lse_ptr + token * lse_stride_0 + head * lse_stride_1, lse)
+        if d_block == 0:
+            # Split maxima are maintained in log2 space. TokenSpeed's
+            # attention API returns natural-log LSE, so convert after the
+            # final merge.
+            lse = (overall_max + gl.log2(overall_expsum)) * 0.6931471805599453
+            gl.store(lse_ptr + token * lse_stride_0 + head * lse_stride_1, lse)
+
+
+# Latent columns merged per reduce program; 512-wide rows give four programs.
+_REDUCE_BLOCK_D = 128
 
 
 def _launch_split_reduce(
@@ -793,11 +804,13 @@ def _launch_split_reduce(
 ) -> None:
     """Merge FP32 or BF16 split partials ``[tokens, heads, splits, rank]`` into ``out``."""
     num_tokens, num_query_heads, num_kv_splits, kv_lora_rank = split_output.shape
-    # The kernel merges whole SPLIT_CHUNK-sized chunks; a count that is not a
-    # power of two above the chunk size would silently drop the trailing splits.
+    # The merge builds aranges over the split count and its chunk, and those
+    # extents must be powers of two.
     if num_kv_splits & (num_kv_splits - 1):
         raise ValueError(f"split count must be a power of two, got {num_kv_splits}")
-    _mla_decode_fwd_reduce_kernel[(num_tokens, num_query_heads)](
+    split_chunk = min(num_kv_splits, 64)
+    grid = (num_tokens, num_query_heads, kv_lora_rank // _REDUCE_BLOCK_D)
+    _mla_decode_fwd_reduce_kernel[grid](
         output_ptr=out,
         lse_ptr=lse,
         split_output_ptr=split_output,
@@ -813,10 +826,12 @@ def _launch_split_reduce(
         TILE_SIZE=page_size,
         KV_LORA_RANK=kv_lora_rank,
         NUM_KV_SPLITS=num_kv_splits,
-        SPLIT_CHUNK=min(num_kv_splits, 16),
+        SPLIT_CHUNK=split_chunk,
+        BLOCK_D=_REDUCE_BLOCK_D,
         ALL_DECODE=all_decode,
         HAS_LSE=lse is not None,
-        num_warps=4,
+        # Warps split each chunk's splits, so a chunk needs one per warp.
+        num_warps=min(4, split_chunk),
     )
 
 

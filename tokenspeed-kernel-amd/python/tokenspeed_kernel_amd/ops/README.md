@@ -837,10 +837,13 @@ projection and optional sigmoid gate into its split merge.
 Each workgroup of two warps owns one sequence, a block of up to 16 query
 heads, and one split of the keys, and walks one 64-key page per tile. TDM
 loads the latent and RoPE parts of each page into LDS as two loads. The
-splits write FP32 partials that a second kernel merges: one program per
-token and head streams the partials into registers a few splits at a time,
-so the merge has no split-count limit. The split count follows the
-query-block decode's rule below.
+splits write FP32 partials that a second kernel merges. Each merge program
+owns 128 latent columns of one token and head, so even a single request
+spreads its merge over many programs. It streams up to 64 splits per step
+straight into registers, stopping at the last split that holds keys, and
+reduces across warps once at the end, so a few dependent loads cover even
+the largest split count and the merge has no split-count limit. The split
+count follows the query-block decode's rule below.
 
 The QK product spreads rows over warps and the PV product spreads latent
 columns. When a block's rows really span several warps, each tile hands the
