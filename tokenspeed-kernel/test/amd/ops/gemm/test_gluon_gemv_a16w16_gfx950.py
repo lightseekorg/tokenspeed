@@ -67,10 +67,13 @@ def test_gemv_matches_reference(m, n, k, dtype):
     torch.testing.assert_close(out, _reference(x, w), rtol=_RTOL[dtype], atol=_ATOL)
 
 
-def test_gemv_long_k_fits_lds():
+@pytest.mark.parametrize("k", [16384, 20480])
+def test_gemv_long_k_fits_lds(k):
     # The LDS-staged tile holds the whole activation row next to its weight
-    # ring; at long K the ring must shrink so both fit gfx950's LDS.
-    m, n, k = 1, 2560, 20480
+    # ring; at long K the ring must shrink so both fit gfx950's LDS. On 256
+    # CUs, K = 16384 fills the LDS exactly (32 KB row + 8 x 16 KB ring) and
+    # K = 20480 shrinks the ring (64 KB row + 4 x 16 KB ring).
+    m, n = 1, 2560
     torch.manual_seed(k)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
