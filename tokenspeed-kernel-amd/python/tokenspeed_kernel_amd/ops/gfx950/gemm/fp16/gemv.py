@@ -69,6 +69,8 @@ _STAGED_CHUNK = gl.constexpr(_FMA_MIN_CHUNK)
 _CHUNK_BYTES_PER_LANE = 128
 # LDS the staged M = 1 tile may fill with weight chunks.
 _STAGED_LDS_BYTES = 128 * 1024
+# LDS per workgroup on gfx950, shared by the weight ring and the activation row.
+_LDS_BYTES = 160 * 1024
 # MFMA tile: weight rows per tile are a multiple of the 16-wide instruction.
 _MFMA_BLOCK_M = 16
 _MFMA_MIN_BLOCK_N = 16
@@ -468,7 +470,11 @@ def _config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int]:
         chunk = max(min(triton.next_power_of_2(k), chunk), _FMA_MIN_CHUNK)
         chunks = triton.cdiv(k, _FMA_MIN_CHUNK)
         stage_bytes = block_n * _FMA_MIN_CHUNK * 2
-        stages = min(chunks, _STAGED_LDS_BYTES // stage_bytes)
+        # The staged tile also holds the whole activation row in LDS, padded
+        # to a power-of-2 chunk count; the ring gets what that leaves.
+        x_bytes = triton.next_power_of_2(chunks) * _FMA_MIN_CHUNK * 2
+        ring_bytes = min(_STAGED_LDS_BYTES, max(_LDS_BYTES - x_bytes, 0))
+        stages = min(chunks, ring_bytes // stage_bytes)
         stages = 1 << (stages.bit_length() - 1) if stages > 0 else 0  # power of 2
         if chunk < k and chunks >= NUM_WARPS and stages >= 2:
             # The share does not fit one register chunk: stream it through

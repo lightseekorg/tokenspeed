@@ -138,7 +138,9 @@ constexprs alone.
   FP32 partial sums per chunk position and reduce once at the end. A share
   that fits one register chunk is loaded in one go; larger shares stream
   512-wide chunks through a ring of LDS buffers filled by direct-to-LDS copies,
-  one refill in flight per consumed chunk.
+  one refill in flight per consumed chunk. The activation row sits in LDS too,
+  so the ring shrinks at long K, falling back to the register tile when fewer
+  than two chunks fit.
 - M = 2-16 (MFMA tile): a 16-row batched MFMA whose batch dimension is the
   wave, so the four waves split every K iteration and reduce through LDS once;
   weights load K-contiguous and reach the operand layout through LDS.

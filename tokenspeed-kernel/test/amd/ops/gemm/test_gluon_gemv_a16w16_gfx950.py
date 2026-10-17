@@ -67,6 +67,20 @@ def test_gemv_matches_reference(m, n, k, dtype):
     torch.testing.assert_close(out, _reference(x, w), rtol=_RTOL[dtype], atol=_ATOL)
 
 
+def test_gemv_long_k_fits_lds():
+    # The LDS-staged tile holds the whole activation row next to its weight
+    # ring; at long K the ring must shrink so both fit gfx950's LDS.
+    m, n, k = 1, 2560, 20480
+    torch.manual_seed(k)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    out = x.new_empty(m, n)
+    launch_gluon_gemv_a16w16_gfx950(x, w, out)
+    torch.testing.assert_close(
+        out, _reference(x, w), rtol=_RTOL[torch.bfloat16], atol=_ATOL
+    )
+
+
 def test_gemv_honors_activation_and_output_row_strides():
     m, n, k = 4, 2560, 3072
     x_rows = torch.randn(m, k + 64, device="cuda", dtype=torch.bfloat16)
