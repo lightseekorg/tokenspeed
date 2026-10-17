@@ -500,18 +500,35 @@ def supports_gluon_gemv_a16w16_gfx950(m: int, n: int, k: int) -> bool:
     return 1 <= m <= MAX_M and n >= 1 and k % 16 == 0 and k >= 64
 
 
-# Qwen3.8-Flash-Next TP2 decode shapes (N, K) and the M buckets (1, 2-4,
-# 5-16) where this GEMV beat the default selection of ``gemm.mm`` (Torch's
-# skinny GEMM at one row, the decode GEMM or hipBLASLt above) in cold-cache
-# standalone sweeps on MI350X.
+# Decode shapes (N, K) and the M buckets (1, 2-4, 5-16) where this GEMV beat
+# the default selection of ``gemm.mm`` (Torch's skinny GEMM at one row, the
+# decode GEMM or hipBLASLt above) in cold-cache standalone sweeps on MI350X.
 _PREFERRED_BUCKETS: dict[tuple[int, int], frozenset[int]] = {
+    # Qwen3.8-Flash-Next, TP2 unless noted.
     (1280, 2560): frozenset({1, 4, 16}),  # shared-expert gate-up (TP1)
     (2560, 640): frozenset({1, 4, 16}),  # shared-expert down (TP1)
+    (2560, 2560): frozenset({4, 16}),
     (2560, 3072): frozenset({1, 4, 16}),  # GDN out_proj, attention o_proj
     (6144, 2560): frozenset({4}),
     (6656, 2560): frozenset({4, 16}),  # attention QKV with the output gate
     (512, 2560): frozenset({1, 4}),  # MoE router gate
     (640, 2560): frozenset({1, 4}),  # shared-expert gate-up, QSA indexer
+    # Kimi K3 TP8.
+    (1536, 1536): frozenset({4, 16}),
+    (2304, 1536): frozenset({4, 16}),
+    (3648, 7168): frozenset({4}),
+    (6288, 7168): frozenset({4, 16}),
+    (7168, 768): frozenset({4, 16}),
+    (7168, 1536): frozenset({4, 16}),
+    (7168, 3584): frozenset({4, 16}),
+    (7168, 4224): frozenset({4, 16}),
+    # GLM 5.3 Flash attention TP4.
+    (160, 4096): frozenset({4}),
+    (288, 4096): frozenset({4, 16}),  # MoE router gate
+    (4096, 1536): frozenset({4, 16}),
+    (4096, 2048): frozenset({16}),
+    # DeepSeek V4.1 Flash TP4.
+    (32, 5120): frozenset({4, 16}),
 }
 
 
