@@ -264,7 +264,7 @@ def _attend_kv_tile(
 
 @gluon.jit(repr=_mla_decode_fwd_kernel_repr, do_not_specialize=["block_tables_stride"])
 def _mla_decode_fwd_kernel(
-    split_output_ptr,  # [total_num_tokens, num_query_heads, KV_LORA_RANK + qk_rope_head_dim]
+    split_output_ptr,  # FP32 or BF16 [tokens, query heads, NUM_KV_SPLITS, KV_LORA_RANK]
     split_max_ptr,  # [total_num_tokens, num_query_heads, num_kv_splits]
     split_expsum_ptr,  # [total_num_tokens, num_query_heads, num_kv_splits]
     query_ptr,  # [total_num_tokens, num_query_heads, head_size]
@@ -793,6 +793,10 @@ def _launch_split_reduce(
 ) -> None:
     """Merge FP32 or BF16 split partials ``[tokens, heads, splits, rank]`` into ``out``."""
     num_tokens, num_query_heads, num_kv_splits, kv_lora_rank = split_output.shape
+    # The kernel merges whole SPLIT_CHUNK-sized chunks; a count that is not a
+    # power of two above the chunk size would silently drop the trailing splits.
+    if num_kv_splits & (num_kv_splits - 1):
+        raise ValueError(f"split count must be a power of two, got {num_kv_splits}")
     _mla_decode_fwd_reduce_kernel[(num_tokens, num_query_heads)](
         output_ptr=out,
         lse_ptr=lse,
