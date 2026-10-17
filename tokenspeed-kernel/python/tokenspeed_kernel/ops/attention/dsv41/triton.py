@@ -3544,7 +3544,22 @@ def _copy_attention_heads(dst, src, sink, sink_out):
 
 @triton.jit(
     do_not_specialize=["TS0", "TS1", "LS", "TC", "PAGES", "C"],
-    do_not_specialize_on_alignment=["TS0", "TS1", "LS", "TC", "PAGES", "C"],
+    # Prefill tiles pass row slices of shared buffers, so the pointers'
+    # alignment changes with the tile start.
+    do_not_specialize_on_alignment=[
+        "Table",
+        "Visible",
+        "Rows",
+        "Lengths",
+        "Blocks",
+        "BlockLengths",
+        "TS0",
+        "TS1",
+        "LS",
+        "TC",
+        "PAGES",
+        "C",
+    ],
 )
 def _index_select_all(
     Table,
