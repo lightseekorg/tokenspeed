@@ -766,4 +766,6 @@ def _use_sparse_candidate_scores(cache, candidates, candidate_topk):
         and candidates.shape[1] > 0
         and candidate_topk == 0
         and cache.stride(0) % 512 == 0
+        and cache.stride(0) < 2**31
+        and cache.data_ptr() % 16 == 0
     )
