@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -668,9 +669,7 @@ def test_minimax_m3_quant_rename_table_matches_module_prefixes():
 
 def test_config_json_layers_are_completed_from_hf_quant_config():
     """Nemotron 3.5 Super VL's config.json copy leaves out its MTP experts."""
-    from tokenspeed.runtime.model_loader.weight_utils import (
-        with_hf_quant_layers as _with_hf_quant_layers,
-    )
+    from tokenspeed.runtime.model_loader.weight_utils import with_hf_quant_layers
 
     nvfp4 = {"quant_algo": "NVFP4", "group_size": 16}
     config_json = {
@@ -687,25 +686,23 @@ def test_config_json_layers_are_completed_from_hf_quant_config():
         },
         "exclude_modules": ["mtp.layers.0.eh_proj"],
     }
-    merged = _with_hf_quant_layers(config_json, hf_quant)
+    merged = with_hf_quant_layers(config_json, hf_quant)
     assert set(merged["quantized_layers"]) == set(hf_quant["quantized_layers"])
     assert config_json["quantized_layers"].keys() == {"backbone.layers.1.mixer.experts"}
     assert ModelOptMixedConfig.from_config(merged).is_quantized_layer(
         "mtp.layers.1.mixer.experts"
     )
     complete = {**config_json, "quantized_layers": hf_quant["quantized_layers"]}
-    assert _with_hf_quant_layers(complete, hf_quant) is complete
+    assert with_hf_quant_layers(complete, hf_quant) is complete
     conflicting = {
         **hf_quant,
         "quantized_layers": {"backbone.layers.1.mixer.experts": {"quant_algo": "FP8"}},
     }
     with pytest.raises(ValueError, match="backbone.layers.1.mixer.experts"):
-        _with_hf_quant_layers(config_json, conflicting)
+        with_hf_quant_layers(config_json, conflicting)
 
 
 def test_quant_config_takes_layers_only_hf_quant_config_lists(tmp_path):
-    import json
-
     from tokenspeed.runtime.configs.load_config import LoadConfig
     from tokenspeed.runtime.model_loader.weight_utils import get_quant_config
 
