@@ -61,8 +61,7 @@ def _l3_config(
             group_id="full",
             block_granularity=cfg.prefix_granularity,
             total_pages=cfg.num_device_pages,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
         )
     ]
     if with_swa:
@@ -71,9 +70,8 @@ def _l3_config(
                 group_id="swa",
                 block_granularity=cfg.prefix_granularity,
                 total_pages=cfg.num_device_pages,
-                retention=ts.CacheRetention.SlidingWindow,
+                attn_kind=ts.AttnKind.SlidingWindow,
                 sliding_window_tokens=4,
-                family=ts.CacheGroupFamily.History,
             )
         )
     cfg.cache_groups = groups
@@ -301,15 +299,13 @@ def test_l3_host_shortage_skips_a_page_it_cannot_fetch_whole() -> None:
             group_id="full_fine",
             block_granularity=2,
             total_pages=cfg.num_device_pages,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
         ),
         ts.CacheGroupConfig(
             group_id="full_coarse",
             block_granularity=4,
             total_pages=cfg.num_device_pages,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
         ),
     ]
     scheduler = ts.Scheduler(cfg)
@@ -401,14 +397,19 @@ def test_l3_host_eviction_still_prefetches_registered_prefix() -> None:
     _ack_write_back(scheduler, wb1.op_ids[0])
     scheduler.next_execution_plan()
 
-    churn = _spec("churn", list(range(501, 511)))
-    wb2 = _find_op(_run_to_finalize(scheduler, churn), ts.Cache.WriteBackOp)
-    assert wb2 is not None, "a full Host pool must replace r1's committed entries"
-    _finish_and_reap(scheduler, "churn")
-    _ack_write_back(scheduler, wb2.op_ids[0])
-    scheduler.next_execution_plan()
+    # Two churns in a row: the first's write-back replaces r1's Host entries,
+    # and between them they recycle every Device page r1 left behind (the
+    # startup bound keeps one block per group for a tail handover, so a single
+    # prompt never fills the pool).
+    for request_id, start in (("churn", 501), ("churn2", 701)):
+        churn = _spec(request_id, list(range(start, start + 8)))
+        wb2 = _find_op(_run_to_finalize(scheduler, churn), ts.Cache.WriteBackOp)
+        assert wb2 is not None, "a full Host pool must replace the older entries"
+        _finish_and_reap(scheduler, request_id)
+        _ack_write_back(scheduler, wb2.op_ids[0])
+        scheduler.next_execution_plan()
 
-    r3_tokens = list(range(1, 11))
+    r3_tokens = list(range(1, 10))
     _register_prompt(scheduler, r3_tokens)
     scheduler.submit_requests([_spec("r3", r3_tokens)])
     plan = scheduler.next_execution_plan()

@@ -20,6 +20,7 @@
 
 """Projection collective dispatch with separately owned persistent workspaces."""
 
+import logging
 import socket
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -36,6 +37,14 @@ from tokenspeed.runtime.utils.tensor import prepare_padded_rows
 if TYPE_CHECKING:
     from tokenspeed.runtime.distributed.comm_backend.base import CommBackend
     from tokenspeed.runtime.execution.workspace import WorkspacePool
+
+
+# Minimum physical subgroup maximum for automatic fusion, independent of bucket.
+# Other TP sizes keep ordinary dispatch; direct kernel calls remain available.
+_FUSED_TP_SIZES = (2, 4)
+_FUSED_MIN_ROWS = 64
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -119,6 +128,7 @@ class ProjectionWorkspace:
         self.gather_quant = None
         self.a2a = None
         self.reduction = None
+        self.fused_column = None
 
     def close(self) -> None:
         """Collectively release native resources and owned scratch references.
@@ -133,6 +143,9 @@ class ProjectionWorkspace:
         if self.spec.device.type == "cuda":
             torch.cuda.synchronize(self.spec.device)
         dist.barrier(group=pg_manager.get_device_process_group(self.spec.group))
+        if self.fused_column is not None:
+            self.fused_column.close()
+            self.fused_column = None
         self.a2a = None
         if self.gather is not None:
             self.gather.close()
@@ -307,24 +320,132 @@ class ProjectionBackend:
         spec: ProjectionSpec,
         use_lamport: bool,
         use_lamport_reduction: bool,
+        batch_invariant: bool,
         scratch_pool: "WorkspacePool | None",
     ) -> ProjectionWorkspace:
         """Allocate and warm a workspace bound to this dispatcher's backend."""
         workspace = ProjectionWorkspace(spec, self._fallback, scratch_pool)
+        fused_disabled_reason = (
+            "Lamport transport is unavailable for this device, dtype, or routing policy"
+        )
         if use_lamport:
             # CUDA IPC requires a node-local group. Agree on topology before
             # any rank attempts collective native allocation.
+            from tokenspeed_kernel.ops.communication.cute_dsl import (
+                fused_tp_projection_supported,
+            )
+
+            if spec.kind != "column":
+                fused_disabled_reason = "only column projections support fusion"
+            elif batch_invariant:
+                fused_disabled_reason = "batch-invariant collectives are enabled"
+            elif len(spec.group) not in _FUSED_TP_SIZES:
+                fused_disabled_reason = (
+                    f"automatic TP{len(spec.group)} fusion is disabled"
+                )
+            elif spec.max_tokens < _FUSED_MIN_ROWS:
+                fused_disabled_reason = (
+                    f"prepared capacity {spec.max_tokens} is below the "
+                    f"TP{len(spec.group)} minimum of {_FUSED_MIN_ROWS} rows"
+                )
+            elif not fused_tp_projection_supported(
+                len(spec.group),
+                spec.input_size,
+                spec.output_size,
+                spec.max_tokens,
+                spec.dtype,
+                spec.device,
+            ):
+                fused_disabled_reason = (
+                    "unsupported device, activation dtype, or projection dimensions"
+                )
+            else:
+                fused_disabled_reason = None
             hosts = [None] * len(spec.group)
             dist.all_gather_object(
                 hosts,
-                socket.gethostname(),
+                (
+                    socket.gethostname(),
+                    batch_invariant,
+                    fused_disabled_reason is None,
+                ),
                 group=pg_manager.get_process_group("gloo", spec.group),
             )
-            if len(set(hosts)) == 1:
+            if len({value[1] for value in hosts}) != 1:
+                raise ValueError(
+                    "Batch-invariant collective setting differs across ranks"
+                )
+            if len({value[0] for value in hosts}) == 1:
                 self._prepare_lamport(workspace, use_lamport_reduction)
+                if all(value[2] for value in hosts):
+                    from tokenspeed_kernel.ops.communication.cute_dsl import (
+                        create_fused_tp_projection_state,
+                    )
+
+                    workspace.fused_column = create_fused_tp_projection_state(
+                        pg_manager.get_device_process_group(spec.group),
+                        spec.device,
+                        spec.max_tokens,
+                        spec.input_size,
+                        spec.output_size,
+                    )
+                elif fused_disabled_reason is None:
+                    fused_disabled_reason = "one or more peers cannot prepare fusion"
+            else:
+                fused_disabled_reason = "the projection group spans multiple nodes"
+
+        if (
+            spec.kind == "column"
+            and workspace.fused_column is None
+            and dist.get_rank() == spec.group[0]
+        ):
+            logger.info(
+                f"Fused TP projection not prepared for group {spec.group}: "
+                f"{fused_disabled_reason}; using ordinary projection"
+            )
 
         _warmup_projection(workspace)
         return workspace
+
+    def try_fused_dp_column_linear(
+        self,
+        inputs: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scales: torch.Tensor | None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> bool:
+        """Run fused DP column-linear, or leave out untouched and return False."""
+        # Use the subgroup maximum so unequal or empty owners take the same
+        # collective path. TP2 and TP4 share one cutoff across all row buckets.
+        rows = max(owner_rows)
+        if len(owner_rows) not in _FUSED_TP_SIZES:
+            return False
+        if (
+            workspace.fused_column is None
+            or rows < _FUSED_MIN_ROWS
+            or weight_scales is None
+            or weight.dtype != torch.float8_e4m3fn
+            or weight_scales.dtype != torch.float32
+            or not weight.is_contiguous()
+            or not weight_scales.is_contiguous()
+        ):
+            return False
+        from tokenspeed_kernel.ops.communication.cute_dsl import (
+            cute_dsl_fused_fp8_dp_column_linear,
+        )
+
+        _check_workspace(rows, workspace, self._fallback)
+        cute_dsl_fused_fp8_dp_column_linear(
+            workspace.fused_column,
+            inputs.contiguous(),
+            weight,
+            weight_scales,
+            owner_rows,
+            out[: inputs.shape[0]],
+        )
+        return True
 
     def _prepare_lamport(
         self, workspace: ProjectionWorkspace, use_reduction: bool

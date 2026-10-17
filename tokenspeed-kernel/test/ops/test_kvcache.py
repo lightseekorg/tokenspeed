@@ -23,13 +23,17 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
+    _copy_page_fields_kernel,
     _copy_state_rows_kernel,
     _state_verify_commit_rows_kernel,
+    _store_state_rows_kernel,
     _zero_page_fields_kernel,
+    copy_page_fields,
     copy_state_rows,
     fused_fp8_set_kv_buffer,
     index_k_block_split_scatter,
     state_verify_commit_rows,
+    store_state_rows,
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer,
@@ -209,6 +213,97 @@ def test_zero_page_fields_matches_host_expansion_without_recompiling(
             torch.zeros(4, dtype=torch.int32, device=device)[1:],
             field_table,
             max_field_bytes=1,
+        )
+
+
+def test_copy_page_fields_matches_host_expansion_without_recompiling(
+    device: str,
+) -> None:
+    fields = [(64, 4096, 48), (1_000_000, 8192, 3000), (3_000_000, 70_000, 65_537)]
+    field_table = torch.tensor(fields, dtype=torch.int64, device=device)
+    generator = torch.Generator(device="cpu").manual_seed(0)
+    initial = torch.randint(
+        0, 256, (8_000_000,), dtype=torch.uint8, generator=generator
+    )
+    backing = initial.to(device)
+
+    def run(pairs: list[tuple[int, int]], table: torch.Tensor) -> None:
+        expected = initial.clone()
+        rows = table.tolist()
+        for source, destination in pairs:
+            for base, stride, size in rows:
+                expected[
+                    base + destination * stride : base + destination * stride + size
+                ] = initial[base + source * stride : base + source * stride + size]
+        copy_page_fields(
+            backing,
+            torch.tensor(pairs, dtype=torch.int32, device=device),
+            table,
+            max_field_bytes=max(size for _, _, size in rows),
+        )
+        torch.testing.assert_close(backing.cpu(), expected, rtol=0, atol=0)
+        backing.copy_(initial)
+
+    run([(1, 2)], field_table)
+    with assert_no_triton_compile(_copy_page_fields_kernel):
+        # Pair and field counts vary per batch and per group; neither may
+        # trigger a compile.
+        run([(3, 0), (7, 4), (1, 9)], field_table)
+        run([(i, i + 30) for i in range(1, 30)], field_table[:2])
+        run([(5, 6)], field_table[:1])
+        run([(i, i + 30) for i in range(30)], field_table.repeat(6, 1)[:16])
+
+    with pytest.raises(ValueError, match="pairs"):
+        copy_page_fields(
+            backing,
+            torch.zeros(2, dtype=torch.int32, device=device),
+            field_table,
+            max_field_bytes=1,
+        )
+    with pytest.raises(ValueError, match="aligned"):
+        copy_page_fields(
+            backing,
+            torch.zeros(6, dtype=torch.int32, device=device)[2:].view(2, 2),
+            field_table,
+            max_field_bytes=1,
+        )
+
+
+def test_store_state_rows_skips_negative_blocks_without_recompiling(
+    device: str,
+) -> None:
+    heads, key, value = 4, 8, 16
+    slab = torch.zeros((12, heads, key, value), dtype=torch.bfloat16, device=device)
+    # Page-interleaved slab view, as the arena hands out.
+    strided = slab.as_strided(
+        (6, heads, key, value), (2 * heads * key * value, key * value, value, 1)
+    )
+
+    def run(blocks: list[int]) -> None:
+        strided.zero_()
+        states = torch.randn(
+            (len(blocks), heads, value, key), dtype=torch.float32, device=device
+        ).transpose(-1, -2)
+        expected = strided.clone()
+        for row, block in enumerate(blocks):
+            if block >= 0:
+                expected[block] = states[row].to(torch.bfloat16)
+        store_state_rows(
+            states, strided, torch.tensor(blocks, dtype=torch.int32, device=device)
+        )
+        torch.testing.assert_close(strided, expected, rtol=0, atol=0)
+
+    run([1, -1, 3])
+    with assert_no_triton_compile(_store_state_rows_kernel):
+        run([5])
+        run([2, 4, -1, -1, 1, 0])
+        run([-1, -1])
+
+    with pytest.raises(ValueError, match="one destination"):
+        store_state_rows(
+            torch.zeros((2, heads, key, value), device=device),
+            strided,
+            torch.zeros(3, dtype=torch.int32, device=device),
         )
 
 

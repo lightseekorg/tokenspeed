@@ -23,12 +23,12 @@
 import pytest
 import torch
 from tokenspeed_kernel import compile_monitor
-from tokenspeed_kernel.ops.gemm.kimi3 import (
+from tokenspeed_kernel.ops.gemm import (
     KIMI3_HIDDEN_SIZE,
     KIMI3_ROUTER_SIZE,
     kimi3_router_projection,
 )
-from tokenspeed_kernel.ops.gemm.ll_bf16 import (
+from tokenspeed_kernel.ops.gemm.cute_dsl import (
     MAX_M,
     ll_bf16_router_supported,
 )

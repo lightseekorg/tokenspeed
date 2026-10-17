@@ -41,6 +41,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     projection_all_gather,
     projection_all_to_all,
     projection_reduce_scatter,
+    try_fused_dp_column_linear,
 )
 from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
 from tokenspeed.runtime.distributed.utils import divide, split_tensor_along_last_dim
@@ -205,6 +206,9 @@ class LinearBase(torch.nn.Module):
                 # remain unquantized unless the checkpoint stores dense MXFP4.
                 self.quant_method = UnquantizedLinearMethod()
         elif isinstance(quant_config, CompressedTensorsConfig):
+            # get_quant_method resolves the scheme (setting layer.scheme),
+            # honors the checkpoint's ignored layers, and refuses unsupported
+            # combinations such as a quantized MLA kv_b_proj.
             self.quant_method = quant_config.get_quant_method(self, prefix)
         elif isinstance(quant_config, ModelOptMixedConfig):
             self.quant_method = quant_config.get_quant_method(self, prefix)
@@ -1155,6 +1159,10 @@ class RowParallelLinear(LinearBase):
                        We skip adding bias but instead return it.
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
+
+    Attributes:
+        supports_fp8_group128_input: Accepts prequantized E4M3 activations with
+            per-128 FP32 scales and produces BF16 output.
     """
 
     def __init__(
@@ -1198,6 +1206,16 @@ class RowParallelLinear(LinearBase):
         assert 0 <= tp_rank < tp_size
         assert tp_size == 1 or tp_group is not None
         self.tp_rank, self.tp_size, self.tp_group = tp_rank, tp_size, tp_group
+
+        method = self.quant_method
+        self.supports_fp8_group128_input = (
+            self.params_dtype == torch.bfloat16
+            and (self.input_is_parallel or self.tp_size == 1)
+            and isinstance(method, Fp8LinearMethod)
+            and method.block_quant
+            and method.quant_config.weight_block_size[1] == 128
+            and method.quant_config.weight_scale_dtype == torch.float32
+        )
 
         self.input_size_per_partition = divide(input_size, self.tp_size)
 
@@ -1362,11 +1380,14 @@ def _projection_rows(
     ctx: "ForwardContext",
     parallel: DenseLayerMapping,
     workspace: ProjectionWorkspace | None,
-) -> int:
+) -> tuple[int, tuple[int, ...]]:
     """Read explicit physical owner counts, including graph padding, by global rank.
 
     Projection TP/DP sizes describe weight sharding, not attention row ownership;
     they cannot supply missing counts or imply replicated inputs.
+
+    Returns:
+        Maximum physical rows in the subgroup and owner counts in subgroup order.
     """
     if workspace is None:
         raise RuntimeError("DP linear communication must be prepared before forward")
@@ -1391,10 +1412,11 @@ def _projection_rows(
         or inputs.device != spec.device
     ):
         raise ValueError("DP linear requires matching physical per-rank token counts")
-    rows = max(counts[rank] for rank in parallel.tp_group)
+    owner_rows = tuple(counts[rank] for rank in parallel.tp_group)
+    rows = max(owner_rows)
     if rows > spec.max_tokens:
         raise ValueError("DP linear exceeds its prepared per-rank row capacity")
-    return rows
+    return rows, owner_rows
 
 
 class DPColumnParallelLinear(ColumnParallelLinear):
@@ -1449,14 +1471,33 @@ class DPColumnParallelLinear(ColumnParallelLinear):
         *,
         ctx: "ForwardContext",
     ) -> tuple[torch.Tensor, None]:
-        rows = _projection_rows(inputs, ctx, self.parallel, self.projection_workspace)
+        rows, owner_rows = _projection_rows(
+            inputs, ctx, self.parallel, self.projection_workspace
+        )
         if rows == 0:
             return inputs.new_empty((0, self.logical_output_size)), None
+        output = inputs.new_empty((rows, self.output_size))
+        weight_scales = (
+            self.weight_scale_inv
+            if isinstance(self.quant_method, Fp8LinearMethod)
+            and self.quant_method.block_quant
+            and tuple(self.quant_method.quant_config.weight_block_size) == (128, 128)
+            else None
+        )
+        if try_fused_dp_column_linear(
+            inputs,
+            self.weight,
+            weight_scales,
+            owner_rows,
+            output,
+            self.projection_workspace,
+            self.comm_backend,
+        ):
+            return output[: inputs.shape[0], : self.logical_output_size], None
         values, _ = projection_all_gather(
             inputs, rows, False, self.projection_workspace, self.comm_backend
         )
         local, _ = super().forward(values, block_scale=None, output_dtype=None)
-        output = inputs.new_empty((rows, self.output_size))
         output, _ = projection_all_to_all(
             local,
             rows,
@@ -1508,6 +1549,8 @@ class DPRowParallelLinear(RowParallelLinear):
             override_kernel_name=None,
             interleave_linear_and_gate=False,
         )
+        # Its collectives exchange activation rows, without quantization scales.
+        self.supports_fp8_group128_input = False
         self.parallel = parallel
         self.projection_workspace: ProjectionWorkspace | None = None
         self.comm_backend: CommBackend | None = None
@@ -1518,7 +1561,9 @@ class DPRowParallelLinear(RowParallelLinear):
         *,
         ctx: "ForwardContext",
     ) -> tuple[torch.Tensor, None]:
-        rows = _projection_rows(inputs, ctx, self.parallel, self.projection_workspace)
+        rows, _ = _projection_rows(
+            inputs, ctx, self.parallel, self.projection_workspace
+        )
         if rows == 0:
             return inputs.new_empty((0, self.output_size)), None
         values, _ = projection_all_to_all(

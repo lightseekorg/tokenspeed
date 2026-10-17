@@ -38,7 +38,7 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
 from tokenspeed.runtime.utils.env import envs
-from tokenspeed.runtime.utils.network import get_free_port, get_local_ip_by_remote
+from tokenspeed.runtime.utils.network import get_local_ip_by_remote
 
 logger = get_colorful_logger(__name__)
 
@@ -126,8 +126,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         self.start_decode_thread()
 
     def start_decode_thread(self):
-        self.rank_port = get_free_port()
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
+        self.bind_server_socket(get_local_ip_by_remote())
         # Maps bootstrap_room -> bootstrap_token (first output token from prefill).
         # Populated by decode_thread when a Success message carries a valid token,
         # consumed by DisaggDecodeExecutor.generate_events() via pop_bootstrap_token().
@@ -330,16 +329,23 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         # Report the requests associated with the failed bootstrap addr and mark their status as TransferPoll.Failed
         affected_rooms = []
         for room in possible_affected_rooms:
-            if (
-                room in self.request_status
-                and self.check_status(room) != TransferPoll.Success
-            ):
-                self.record_failure(
-                    room,
-                    f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
-                )
-                self.update_status(room, TransferPoll.Failed)
-                affected_rooms.append(room)
+            # One failure counts once: skip rooms that already succeeded,
+            # already failed (the prefill counted those on its side), or were
+            # already recorded here (e.g. after a receiver-side timeout).
+            status = self.room_status(room)
+            if status is None or status in (TransferPoll.Success, TransferPoll.Failed):
+                continue
+            with self.failure_lock:
+                already_counted = room in self.failure_records
+            if already_counted:
+                continue
+            self.record_failure(
+                room,
+                f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
+            )
+            self.kv_transfer_metrics.record_kv_transfer_failure()
+            self.update_status(room, TransferPoll.Failed)
+            affected_rooms.append(room)
         logger.error(
             "Losing connection with prefill instance (bootstrap_addr: "
             f"{failed_bootstrap_addr!s}), affected {len(affected_rooms)!s} requests",

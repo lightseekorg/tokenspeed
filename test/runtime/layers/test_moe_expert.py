@@ -13,8 +13,45 @@ from tokenspeed.runtime.layers.moe.topk import (
     StandardTopKOutput,
     TopKConfig,
 )
-from tokenspeed.runtime.layers.moe.utils import All2AllBackend
+from tokenspeed.runtime.layers.moe.utils import All2AllBackend, MoeBackend
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
+
+
+@pytest.mark.parametrize(
+    "backend,dtype,routing_config,error",
+    [
+        ("flashinfer_cutlass", torch.bfloat16, {}, "only by the Triton"),
+        ("triton", torch.float16, {}, "requires BF16"),
+        ("triton", torch.bfloat16, {"routed_scaling_factor": 2.5}, "unscaled"),
+    ],
+)
+def test_moe_bf16_route_precision_rejects_unsupported_contract(
+    monkeypatch, backend, dtype, routing_config, error
+):
+    monkeypatch.setattr(expert_module, "get_moe_backend", lambda: MoeBackend(backend))
+    policy = {
+        "precision_policy": "bf16_route_accum_fp32",
+        "output_scale": 2.5,
+        "routed_scaling_factor": 1.0,
+        **routing_config,
+    }
+    original_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(dtype)
+        with pytest.raises(ValueError, match=error):
+            MoELayer(
+                top_k=2,
+                num_experts=4,
+                hidden_size=128,
+                intermediate_size=32,
+                quant_config=None,
+                layer_index=0,
+                activation="silu",
+                routing_mode="precomputed_topk",
+                routing_config=policy,
+            )
+    finally:
+        torch.set_default_dtype(original_dtype)
 
 
 def test_hybrid_moe_dispatches_from_actual_topk_format(
@@ -338,3 +375,93 @@ def test_kernel_routing_rejects_missing_logits(monkeypatch) -> None:
             max_num_tokens_per_gpu=1,
         )
     apply.assert_not_called()
+
+
+VENDOR_POLICY = {
+    "precision_policy": "bf16_vendor_fp32_route",
+    "output_scale": 1.0,
+    "routed_scaling_factor": 2.5,
+    "n_group": 2,
+    "topk_group": 1,
+    "normalize_topk_weights": True,
+    "correction_bias": torch.zeros(4, dtype=torch.float32),
+}
+KERNEL_ROUTING_APPLY = "flashinfer_trtllm_unquant_moe_apply"
+ROUTED_APPLY = "flashinfer_trtllm_unquant_routed_moe_apply"
+
+
+@pytest.fixture
+def vendor_layer(monkeypatch):
+    """Build a vendor-policy MoELayer; the kernel's FP32-bias routing hook
+    (``hook.return_value``: whether this GPU builds it) is faked."""
+    from tokenspeed_kernel.registry import KernelRegistry
+
+    hook = mock.Mock(return_value=True)
+    impl = KernelRegistry.get().get_impl(KERNEL_ROUTING_APPLY)
+    if impl is None:
+        pytest.skip("FlashInfer's TRT-LLM MoE is registered on NVIDIA SM100 to SM103")
+    monkeypatch.setattr(impl, "_tokenspeed_fp32_correction_bias", hook)
+
+    def build(backend="flashinfer_trtllm", **kwargs):
+        monkeypatch.setattr(
+            expert_module, "get_moe_backend", lambda: MoeBackend(backend)
+        )
+        combine_order = kwargs.pop("combine_order", "rank")
+        monkeypatch.setitem(
+            expert_module.global_server_args_dict, "moe_combine_order", combine_order
+        )
+        layer_kwargs = dict(
+            top_k=2,
+            num_experts=4,
+            hidden_size=128,
+            intermediate_size=320,
+            quant_config=None,
+            layer_index=0,
+            activation="silu",
+        )
+        layer_kwargs.update(kwargs)
+        layer_kwargs["routing_config"] = dict(VENDOR_POLICY)
+        original_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            return MoELayer(**layer_kwargs)
+        finally:
+            torch.set_default_dtype(original_dtype)
+
+    build.hook = hook
+    return build
+
+
+def test_vendor_policy_routes_in_the_kernel_when_the_hook_builds_it(vendor_layer):
+    layer = vendor_layer()
+    plan = layer.plan
+    assert plan["apply_kernel_name"] == KERNEL_ROUTING_APPLY
+    assert plan["precision_policy"] == "bf16_vendor_fp32_route"
+    assert plan["output_scale"] == 1.0
+    assert layer.support_routing and not layer.supports_deferred_finalize
+    assert layer.topk_output_format.is_bypassed()
+    # The routed scale stays in routing_config for the kernel; no padding.
+    assert layer.routing_config["routed_scaling_factor"] == 2.5
+    assert tuple(layer.w13_weight.shape) == (4, 640, 128)
+
+
+def test_vendor_policy_runs_on_precomputed_routes_without_the_hook(vendor_layer):
+    vendor_layer.hook.return_value = False
+    layer = vendor_layer()
+    assert layer.plan["apply_kernel_name"] == ROUTED_APPLY
+    assert not layer.support_routing and layer.supports_precomputed_topk
+    assert not layer.supports_deferred_finalize
+    assert layer.plan["fp32_correction_bias"] is True
+
+
+@pytest.mark.parametrize(
+    "build_kwargs,error",
+    [
+        ({"combine_order": "slot"}, "slot combine"),
+        ({"backend": "triton"}, "flashinfer_trtllm"),
+        ({"intermediate_size": 288}, "multiple of 64"),
+    ],
+)
+def test_vendor_policy_rejects_unsupported_contract(vendor_layer, build_kwargs, error):
+    with pytest.raises(ValueError, match=error):
+        vendor_layer(**build_kwargs)

@@ -41,6 +41,7 @@ cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
 cdiv = gl.cdiv
 _GFX950_SM_COUNT = 256
+_SLIDING_SPLIT_COUNTERS: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
 
 # ===-----------------------------------------------------------------------===#
@@ -426,15 +427,18 @@ class AttentionProgram:
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
         q_heads = self.kv_head * cfg.GROUP_SIZE + self.group_start + offs_m
-        valid = ((self.group_start + offs_m) < cfg.GROUP_SIZE) & (
-            self.split_start < self.split_end
-        )
+        valid = (self.group_start + offs_m) < cfg.GROUP_SIZE
+        split_active = self.split_start < self.split_end
         acc = gl.convert_layout(acc, cfg.store_layout)
         l_i = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.store_layout))
         m_i = gl.convert_layout(m_i, gl.SliceLayout(1, cfg.store_layout))
         recip_l_i = 1.0 / l_i
-        part_o = acc * recip_l_i[:, None]
-        part_lse = m_i * cfg.SM_SCALE + gl.log2(l_i)
+        part_o = gl.where(split_active, acc * recip_l_i[:, None], 0.0)
+        part_lse = gl.where(
+            split_active,
+            m_i * cfg.SM_SCALE + gl.log2(l_i),
+            -float("inf"),
+        )
         mid_o_offsets = (
             (self.q_index * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.NUM_KV_SPLITS
             + self.split_id
@@ -459,6 +463,90 @@ class AttentionProgram:
         offsets = (self.q_index * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.HEAD_DIM
         offsets += offs_d[None, :]
         cdna4.buffer_store(output, self.mid_o_ptr, offsets, mask=valid[:, None])
+
+    @gluon.jit
+    def finalize_splits(self, out_ptr, sink_ptr, counters_ptr, has_sink: gl.constexpr):
+        """Let the last arriving split merge this head block and reset its counter."""
+        cfg = self.cfg
+        counter_offset = (
+            self.q_index * (cfg.NUM_KV_HEADS * cfg.NUM_GROUPS)
+            + self.kv_head * cfg.NUM_GROUPS
+            + self.group_start // cfg.BLOCK_M
+        )
+        old = gl.atomic_add(
+            counters_ptr + counter_offset,
+            1,
+            sem="acq_rel",
+            scope="gpu",
+        )
+        if old == cfg.NUM_KV_SPLITS - 1:
+            offs_m = gl.arange(
+                0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout)
+            )
+            offs_d = gl.arange(
+                0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout)
+            )
+            q_heads = self.kv_head * cfg.GROUP_SIZE + self.group_start + offs_m
+            valid = (self.group_start + offs_m) < cfg.GROUP_SIZE
+            final_m = gl.full(
+                [cfg.BLOCK_M],
+                value=-float("inf"),
+                dtype=gl.float32,
+                layout=gl.SliceLayout(1, cfg.store_layout),
+            )
+            final_l = gl.zeros(
+                [cfg.BLOCK_M],
+                dtype=gl.float32,
+                layout=gl.SliceLayout(1, cfg.store_layout),
+            )
+            final_acc = gl.zeros(
+                [cfg.BLOCK_M, cfg.HEAD_DIM],
+                dtype=gl.float32,
+                layout=cfg.store_layout,
+            )
+            for split in range(0, cfg.NUM_KV_SPLITS):
+                base = (
+                    (self.q_index * cfg.NUM_Q_HEADS + q_heads[:, None])
+                    * cfg.NUM_KV_SPLITS
+                    + split
+                ) * cfg.HEAD_DIM + offs_d[None, :]
+                part_o = gl.load(
+                    self.mid_o_ptr + base,
+                    mask=valid[:, None],
+                    other=0.0,
+                    volatile=True,
+                ).to(gl.float32)
+                lse_offset = (
+                    self.q_index * cfg.NUM_Q_HEADS + q_heads
+                ) * cfg.NUM_KV_SPLITS + split
+                part_lse = gl.load(
+                    self.mid_lse_ptr + lse_offset,
+                    mask=valid,
+                    other=-float("inf"),
+                    volatile=True,
+                ).to(gl.float32)
+                next_m = maximum(final_m, part_lse)
+                alpha = gl.exp2(final_m - next_m)
+                beta = gl.exp2(part_lse - next_m)
+                final_acc = final_acc * alpha[:, None] + part_o * beta[:, None]
+                final_l = final_l * alpha + beta
+                final_m = next_m
+            if has_sink:
+                sink_log2 = (
+                    gl.load(sink_ptr + q_heads, mask=valid, other=0.0).to(gl.float32)
+                    * _INV_LN2
+                )
+                next_m = maximum(final_m, sink_log2)
+                alpha = gl.exp2(final_m - next_m)
+                beta = gl.exp2(sink_log2 - next_m)
+                final_acc *= alpha[:, None]
+                final_l = final_l * alpha + beta
+            output = (final_acc / final_l[:, None]).to(out_ptr.dtype.element_ty)
+            out_offsets = (
+                self.q_index * cfg.NUM_Q_HEADS + q_heads[:, None]
+            ) * cfg.HEAD_DIM + offs_d[None, :]
+            cdna4.buffer_store(output, out_ptr, out_offsets, mask=valid[:, None])
+            gl.store(counters_ptr + counter_offset, 0)
 
 
 # ===-----------------------------------------------------------------------===#
@@ -634,6 +722,95 @@ def gluon_mha_decode_sliding_gfx950(
 
 
 @gluon.jit
+def _mha_decode_sliding_split_atomic(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    page_table_ptr,
+    cache_seqlens_ptr,
+    mid_o_ptr,
+    mid_lse_ptr,
+    out_ptr,
+    sink_ptr,
+    counters_ptr,
+    Q_STRIDE_B: gl.constexpr,
+    Q_STRIDE_H: gl.constexpr,
+    Q_STRIDE_D: gl.constexpr,
+    SM_SCALE: gl.constexpr,
+    PAGE_TABLE_STRIDE: gl.constexpr,
+    PAGE_SIZE: gl.constexpr,
+    NUM_KV_SPLITS: gl.constexpr,
+    MAX_SEQLEN_Q: gl.constexpr,
+    NUM_Q_HEADS: gl.constexpr,
+    NUM_KV_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    WINDOW_LEFT: gl.constexpr,
+    HAS_SINK: gl.constexpr,
+    IS_FP8: gl.constexpr,
+):
+    cfg = AttentionConfig(
+        SM_SCALE,
+        PAGE_TABLE_STRIDE,
+        PAGE_SIZE,
+        NUM_KV_SPLITS,
+        MAX_SEQLEN_Q,
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        BLOCK_M,
+        BLOCK_N,
+        True,
+        WINDOW_LEFT,
+        IS_FP8,
+        k_cache_ptr.dtype.element_ty,
+        InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
+    )
+    program = AttentionProgram.create(
+        cfg,
+        q_ptr,
+        k_cache_ptr,
+        v_cache_ptr,
+        page_table_ptr,
+        cache_seqlens_ptr,
+        mid_o_ptr,
+        mid_lse_ptr,
+    )
+    k_smem = gl.allocate_shared_memory(
+        k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
+    )
+    v_smem = gl.allocate_shared_memory(
+        v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
+    )
+
+    q = program.load_q()
+    m_i, l_i, acc, _ = program.init_state(sink_ptr, False)
+    physical_page = program.load_page(program.split_start)
+
+    for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
+        with gl.amd.warp_pipeline_stage("load", priority=1):
+            program.issue_load_k(physical_page, k_smem)
+            program.issue_load_v(physical_page, v_smem)
+            physical_page = program.load_page(start_n + cfg.BLOCK_N)
+
+        with gl.amd.warp_pipeline_stage("qk_softmax", priority=0):
+            async_copy.wait_group(1)
+            k = program.shared_load_k(k_smem)
+            qk = program.compute_qk(q, k)
+            qk = program.apply_kv_mask(qk, start_n)
+            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+
+        with gl.amd.warp_pipeline_stage("pv", priority=1):
+            async_copy.wait_group(0)
+            v = program.shared_load_v(v_smem)
+            acc = program.compute_pv(p, v, acc)
+
+    program.store_split(acc, l_i, m_i)
+    program.finalize_splits(out_ptr, sink_ptr, counters_ptr, HAS_SINK)
+
+
+@gluon.jit
 def gluon_mha_decode_reduce_gfx950(
     mid_o_ptr,
     mid_lse_ptr,
@@ -735,6 +912,35 @@ class LaunchConfig(NamedTuple):
     window_left: int
 
 
+def _sliding_split_counters(
+    q: torch.Tensor,
+    total_q: int,
+    head_blocks: int,
+) -> torch.Tensor:
+    """Return stream-local counters reset by each fused split reduction.
+
+    Decode graph capture performs four warmup forwards on its capture stream.
+    Reusing that warmed allocation keeps the otherwise redundant ``zeros``
+    launch out of every replay; the last-arriving split resets every counter.
+    Batch size is part of the key, so independently captured graph shapes do
+    not alias one another.
+    """
+    device_index = q.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    stream_id = int(torch.cuda.current_stream(device_index).cuda_stream)
+    key = (device_index, stream_id, total_q, head_blocks)
+    counters = _SLIDING_SPLIT_COUNTERS.get(key)
+    if counters is None:
+        counters = torch.zeros(
+            (total_q, head_blocks),
+            device=q.device,
+            dtype=torch.int32,
+        )
+        _SLIDING_SPLIT_COUNTERS[key] = counters
+    return counters
+
+
 def get_config(
     *,
     q: torch.Tensor,
@@ -760,6 +966,22 @@ def get_config(
         num_pages=num_pages,
         sm_count=_GFX950_SM_COUNT,
     )
+    if is_sliding:
+        target_splits = 8 if q.shape[0] <= 4 else 4
+        num_kv_splits = min(target_splits, num_pages)
+        if num_kv_splits < 1:
+            num_kv_splits = 1
+    elif (
+        q.shape[0] == 1
+        and q.shape[1] == 32
+        and k_cache.shape[2] == 4
+        and head_dim == 64
+        and num_pages >= 80
+    ):
+        # Muse TP4 has only eight base CTAs.  A long full-attention row needs
+        # more than the generic 32-split ceiling to fill gfx950; 80 splits is
+        # the measured minimum of the compute/final-reduce trade-off at 50K.
+        num_kv_splits = 80
     return LaunchConfig(
         num_q_heads=q.shape[1],
         num_kv_heads=k_cache.shape[2],
@@ -808,8 +1030,7 @@ def launch_gluon_mha_decode_gfx950(
     out_dtype = torch.bfloat16 if is_fp8 else q.dtype
     output = torch.empty(q.shape, device=q.device, dtype=out_dtype)
 
-    if config.is_sliding:
-        # No split-k for sliding window attention
+    if config.is_sliding and config.num_kv_splits == 1:
         grid = (total_q, config.num_kv_heads * config.num_groups, 1)
         gluon_mha_decode_sliding_gfx950[grid](
             q,
@@ -832,6 +1053,56 @@ def launch_gluon_mha_decode_gfx950(
             config.block_m,
             config.block_n,
             config.is_sliding,
+            config.window_left,
+            has_sink,
+            is_fp8,
+            num_warps=1,
+        )
+    elif config.is_sliding:
+        mid_o = torch.empty(
+            (total_q, config.num_q_heads, config.num_kv_splits, config.head_dim),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        mid_lse = torch.empty(
+            (total_q, config.num_q_heads, config.num_kv_splits),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        counters = _sliding_split_counters(
+            q,
+            total_q,
+            config.num_kv_heads * config.num_groups,
+        )
+        grid = (
+            total_q,
+            config.num_kv_heads * config.num_groups,
+            config.num_kv_splits,
+        )
+        _mha_decode_sliding_split_atomic[grid](
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            mid_o,
+            mid_lse,
+            output,
+            sink_arg,
+            counters,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            config.sm_scale,
+            page_table.stride(0),
+            config.page_size,
+            config.num_kv_splits,
+            max_seqlen_q,
+            config.num_q_heads,
+            config.num_kv_heads,
+            config.head_dim,
+            config.block_m,
+            config.block_n,
             config.window_left,
             has_sink,
             is_fp8,

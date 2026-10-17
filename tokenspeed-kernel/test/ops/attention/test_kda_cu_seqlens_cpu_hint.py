@@ -222,7 +222,6 @@ def test_adapters_preserve_runtime_v_major_state(
         cu_seqlens=torch.tensor([0, T], dtype=torch.int64),
         cu_seqlens_cpu=torch.tensor([0, T], dtype=torch.int64),
         capacity=None,
-        inputs_packed=False,
         lower_bound=-5.0,
         override=None,
         solution=solution,
@@ -288,7 +287,6 @@ def test_cutedsl_original_adapter_split_matches_full_scan():
             cu_seqlens=host_boundaries.to("cuda"),
             cu_seqlens_cpu=host_boundaries,
             capacity=None,
-            inputs_packed=False,
             lower_bound=-5.0,
             override=None,
             solution="cutedsl_kda",
@@ -377,7 +375,6 @@ def test_facade_requires_host_boundaries(monkeypatch):
     cu_cpu = torch.tensor([0, T], dtype=torch.int64)
     common = dict(
         capacity=None,
-        inputs_packed=False,
         initial_state=torch.zeros(1, HV, K, V),
         cu_seqlens=cu,
         lower_bound=-5.0,

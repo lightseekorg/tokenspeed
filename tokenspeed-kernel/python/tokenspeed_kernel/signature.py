@@ -20,8 +20,9 @@
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 if TYPE_CHECKING:
     import torch
@@ -30,6 +31,7 @@ __all__ = [
     "FormatSignature",
     "ScaleFormat",
     "TensorFormat",
+    "dense_format_signature",
     "dense_tensor_format",
     "format_signature",
     "tensor_format",
@@ -130,9 +132,14 @@ class FormatSignature:
     A kernel that supports alternatives for a role represents them as multiple
     ``FormatSignature`` values in ``KernelSpec.format_signatures`` rather than
     as multiple formats inside one signature.
+
+    ``layouts`` contains accepted preprocessing functions on registrations, or
+    the layouts observed on a request's weight storage. ``None`` is canonical
+    storage; omitted layouts accept only canonical storage.
     """
 
     roles: tuple[tuple[str, TensorFormat], ...]
+    layouts: frozenset[Callable | None] = frozenset({None})
 
     def __post_init__(self) -> None:
         seen: set[str] = set()
@@ -143,6 +150,7 @@ class FormatSignature:
             seen.add(role)
             normalized.append((role, tensor_format))
         object.__setattr__(self, "roles", tuple(normalized))
+        object.__setattr__(self, "layouts", frozenset(self.layouts))
 
     def format_for(self, role: str) -> TensorFormat | None:
         """Return the format for role, or None if it is absent."""
@@ -159,10 +167,18 @@ class FormatSignature:
         return tensor_format.storage_dtype
 
     def __str__(self) -> str:
-        return (
+        roles = (
             ", ".join(f"{role}={tensor_format}" for role, tensor_format in self.roles)
             or "none"
         )
+        if self.layouts == frozenset({None}):
+            return roles
+        layouts = ", ".join(
+            sorted(
+                "canonical" if fn is None else fn.__qualname__ for fn in self.layouts
+            )
+        )
+        return f"{roles}, layouts={{{layouts}}}"
 
 
 def tensor_format(
@@ -188,7 +204,9 @@ def dense_tensor_format(storage_dtype: torch.dtype) -> TensorFormat:
     return tensor_format("dense", storage_dtype)
 
 
-def format_signature(**roles: TensorFormat) -> FormatSignature:
+def format_signature(
+    *, layouts: Iterable[Callable | None] | None = None, **roles: TensorFormat
+) -> FormatSignature:
     """Construct one concrete role-indexed format signature.
 
     Keyword names are logical tensor roles for the operator, for example
@@ -213,13 +231,38 @@ def format_signature(**roles: TensorFormat) -> FormatSignature:
         ...     )
         ... )
     """
-    return FormatSignature(tuple(roles.items()))
+    return FormatSignature(
+        tuple(roles.items()),
+        frozenset({None}) if layouts is None else frozenset(layouts),
+    )
+
+
+@functools.cache
+def dense_format_signature(
+    roles: tuple[str, ...], storage_dtypes: tuple[torch.dtype, ...]
+) -> FormatSignature:
+    """Cached signature of dense, unscaled roles for per-call dispatchers.
+
+    Args:
+        roles: Logical tensor roles.
+        storage_dtypes: Physical dtype of each role, in ``roles`` order.
+
+    Returns:
+        The ``format_signature`` of those roles; repeat calls return the same object.
+    """
+    return format_signature(
+        **{
+            role: dense_tensor_format(dtype)
+            for role, dtype in zip(roles, storage_dtypes, strict=True)
+        }
+    )
 
 
 def format_signatures(
     roles: str | Iterable[str],
     format: str,
     storage_dtypes: Iterable[torch.dtype],
+    layouts: Iterable[Callable | None] | None = None,
     *,
     scale: ScaleFormat | None = None,
 ) -> frozenset[FormatSignature]:
@@ -232,6 +275,8 @@ def format_signatures(
         storage_dtypes: Physical dtypes used by every role, one signature per
             dtype.
         scale: Optional scale sidecar metadata assigned to every role.
+        layouts: Accepted preprocessing functions. Omitted means canonical only;
+            include ``None`` to accept canonical alongside transformed storage.
 
     This helper expands dtype alternatives into separate signatures; it does
     not put multiple formats on one role. Use ``format_signature`` directly for
@@ -264,12 +309,14 @@ def format_signatures(
         ... )
     """
     normalized_roles = (roles,) if isinstance(roles, str) else tuple(roles)
+    layouts = frozenset({None}) if layouts is None else frozenset(layouts)
     return frozenset(
         format_signature(
+            layouts=layouts,
             **{
                 role: tensor_format(format, storage_dtype, scale=scale)
                 for role in normalized_roles
-            }
+            },
         )
         for storage_dtype in storage_dtypes
     )

@@ -6,6 +6,7 @@ from tokenspeed_kernel.ops.layernorm import add_rmsnorm, grouped_rmsnorm
 from tokenspeed_kernel.ops.layernorm.triton import (
     _add_rmsnorm_kernel,
     _rmsnorm_kernel,
+    fused_qk_rmsnorm_rope,
     qk_rmsnorm,
     rmsnorm,
 )
@@ -283,6 +284,72 @@ def test_rmsnorm_inplace(device: str) -> None:
     ref = (x_float * torch.rsqrt(variance + eps) * weight).to(torch.bfloat16)
     assert out.data_ptr() == x.data_ptr()
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# fused_qk_rmsnorm_rope -- Beam's sliding-window layers
+# ---------------------------------------------------------------------------
+
+
+def _rope_inputs(tokens: int, q_heads: int, kv_heads: int, device: str) -> tuple:
+    """``qkv.split`` views, BF16 weights, an FP32 ``[cos | sin]`` table and int32
+    positions."""
+    head_dim, max_pos = 128, 4096
+    q_size, kv_size = q_heads * head_dim, kv_heads * head_dim
+    qkv = torch.randn(tokens, q_size + 2 * kv_size, device=device, dtype=torch.bfloat16)
+    q, k, _ = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    weights = [
+        (1 + 0.1 * torch.randn(head_dim, device=device)).to(torch.bfloat16)
+        for _ in range(2)
+    ]
+    half = head_dim // 2
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, half, dtype=torch.float32) / half))
+    freqs = torch.outer(torch.arange(max_pos, dtype=torch.float32), inv_freq)
+    cache = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(device)
+    positions = torch.randint(0, max_pos, (tokens,), device=device, dtype=torch.int32)
+    return q, k, *weights, cache, positions
+
+
+def _rope(q, k, q_weight, k_weight, cache, positions):
+    head_dim = q_weight.shape[0]
+    heads = (q.shape[-1] // head_dim, k.shape[-1] // head_dim, head_dim)
+    return fused_qk_rmsnorm_rope(
+        q, k, q_weight, k_weight, cache, positions, 1e-6, *heads
+    )
+
+
+def _rope_statements(x, weight, cache, positions):
+    """Per head: FP32 RMSNorm rounded to the input dtype, then NeoX RoPE in FP32."""
+    head_dim = weight.shape[0]
+    heads = x.reshape(x.shape[0], -1, head_dim).float()
+    normed = heads * torch.rsqrt(heads.square().mean(-1, keepdim=True) + 1e-6)
+    normed = (normed * weight.float()).to(x.dtype).float()
+    table = cache[positions.long()][:, None, :]
+    cos, sin = table[..., : head_dim // 2], table[..., head_dim // 2 :]
+    x1, x2 = normed[..., : head_dim // 2], normed[..., head_dim // 2 :]
+    rotated = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+    return rotated.to(x.dtype).flatten(1)
+
+
+@pytest.mark.parametrize("q_heads,kv_heads", [(48, 8), (6, 1)])
+def test_fused_qk_rmsnorm_rope_matches_the_statements(
+    q_heads: int, kv_heads: int, device: str
+) -> None:
+    """Beam's per-rank head pairs on ``qkv.split`` views: within one BF16 rounding of
+    the statements (the squares are reduced in another order), and bit for bit
+    itself on contiguous copies."""
+    q, k, q_weight, k_weight, cache, positions = _rope_inputs(
+        13, q_heads, kv_heads, device
+    )
+    fused = _rope(q, k, q_weight, k_weight, cache, positions)
+    for got, x, weight in zip(fused, (q, k), (q_weight, k_weight), strict=True):
+        want = _rope_statements(x, weight, cache, positions)
+        torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
+    contiguous = _rope(
+        q.contiguous(), k.contiguous(), q_weight, k_weight, cache, positions
+    )
+    for got, want in zip(fused, contiguous, strict=True):
+        assert torch.equal(got, want)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])

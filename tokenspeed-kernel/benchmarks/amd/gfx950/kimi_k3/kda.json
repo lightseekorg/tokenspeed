@@ -69,7 +69,7 @@
     },
     {
       "id": "kimi_k3.attention.kda_fused_paged_decode/decode-bfloat16",
-      "comparison_epoch": 1,
+      "comparison_epoch": 2,
       "measurement_blocks": 50,
       "definition": {
         "family": "attention",
@@ -79,8 +79,7 @@
           "conv_kernel_size": 4,
           "state_page_bytes": 884736,
           "state_pages": 1025,
-          "state_page_relation": "in_place",
-          "norm_eps": 1e-05
+          "state_page_relation": "in_place"
         },
         "cold_cache": true,
         "seed": 4711
@@ -92,7 +91,7 @@
     },
     {
       "id": "kimi_k3.attention.kda_fused_paged_decode/decode-large-bfloat16",
-      "comparison_epoch": 1,
+      "comparison_epoch": 2,
       "measurement_blocks": 50,
       "definition": {
         "family": "attention",
@@ -102,8 +101,7 @@
           "conv_kernel_size": 4,
           "state_page_bytes": 884736,
           "state_pages": 1025,
-          "state_page_relation": "in_place",
-          "norm_eps": 1e-05
+          "state_page_relation": "in_place"
         },
         "cold_cache": true,
         "seed": 4712

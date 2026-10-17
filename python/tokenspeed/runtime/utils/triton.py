@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import tokenspeed_triton as triton
-import tokenspeed_triton.language as tl
+# Share the kernel package's CUDA/ROCm/Ascend selection for runtime kernels.
+from tokenspeed_kernel._triton import tl, triton
 
 __all__ = ["tl", "triton"]

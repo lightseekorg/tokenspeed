@@ -163,7 +163,9 @@ def test_grammar_sync_is_sized_by_its_process_group():
 
 
 def _server_args(**overrides) -> ServerArgs:
-    platform = SimpleNamespace(is_amd=True, is_nvidia=False, is_hopper_plus=False)
+    platform = SimpleNamespace(
+        is_amd=True, is_nvidia=False, is_npu=False, is_hopper_plus=False
+    )
     with (
         mock.patch.object(
             server_args_module, "current_platform", return_value=platform
@@ -193,9 +195,9 @@ def test_emulation_keeps_the_layout_without_fused_all_reduce():
         ({"mm_encoder_tp_mode": "data"}, "--mm-encoder-tp-mode data"),
         (
             {
-                "prefill_context_parallel_size": 8,
+                "kv_parallel_size": 8,
+                "query_context_parallel_size": 8,
                 "disaggregation_mode": "prefill",
-                "disable_prefill_graph": True,
                 "attention_backend": "dsa",
             },
             "query context parallelism",

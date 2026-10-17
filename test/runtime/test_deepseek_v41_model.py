@@ -68,8 +68,8 @@ from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.utils import MoeBackend
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
-from tokenspeed.runtime.models import deepseek_v4 as v4
 from tokenspeed.runtime.models import deepseek_v41 as v41
+from tokenspeed.runtime.models import deepseek_v41_moe as v4
 from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41Attention,
     DeepseekV41DecoderLayer,

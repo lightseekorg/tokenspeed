@@ -96,6 +96,7 @@ echo "[epd-1e1p2d] encode=gpu${ENCODE_GPUS}/${ENCODE_PORT} prefill=gpu${PREFILL_
 echo "[epd-1e1p2d] encode_routing=$ENCODE_ROUTING_POLICY enable_mtp=$ENABLE_MTP moe=$MOE_BACKEND attn=$ATTENTION_BACKEND"
 
 pids=()
+logs=()
 cleanup() {
   local code=$?
   trap - EXIT INT TERM
@@ -206,6 +207,7 @@ start_worker() {
       --port "$port"
   ) >"$log" 2>&1 &
   pids+=("$!")
+  logs+=("$log")
 }
 
 # Encode is LM-free (vision tower only); pixels reach it inline over gRPC.
@@ -244,8 +246,13 @@ python3 -m smg launch \
   --prometheus-port "$PROMETHEUS_PORT" \
   >"$LOG_DIR/gateway.log" 2>&1 &
 pids+=("$!")
+logs+=("$LOG_DIR/gateway.log")
 
 wait_http lb "http://127.0.0.1:${LB_PORT}/v1/models" "$startup_deadline"
 echo "[epd-1e1p2d] serving on http://127.0.0.1:${LB_PORT}/v1"
 
-wait -n "${pids[@]}"
+# A worker's failure status must not end the script (set -e) before the
+# report names it; the cleanup trap then exits with that status.
+wait -n "${pids[@]}" || status=$?
+report_exited_workers "epd-1e1p2d" logs pids
+exit "${status:-0}"

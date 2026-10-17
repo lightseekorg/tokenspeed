@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe import latent_moe_input_projections
-from tokenspeed_kernel.ops.moe.latent_input import packed_projection_weight_view
+from tokenspeed_kernel.ops.moe import (
+    latent_moe_input_projections,
+    packed_projection_weight_view,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 
@@ -23,18 +25,10 @@ UP_CLAMP = 1.0
 def test_amd_latent_moe_registrations_are_platform_scoped() -> None:
     registry = KernelRegistry.get()
     expected_modules = {
-        "gluon_latent_expert_shared_gfx950": (
-            "tokenspeed_kernel.ops.moe.gluon.latent_decode"
-        ),
-        "gluon_latent_input_decode_gfx950": (
-            "tokenspeed_kernel.ops.moe.gluon.latent_input"
-        ),
-        "gluon_latent_input_small_batch_gfx950": (
-            "tokenspeed_kernel.ops.moe.gluon.latent_input"
-        ),
-        "gluon_latent_input_decode_gfx1250": (
-            "tokenspeed_kernel.ops.moe.gluon.latent_input"
-        ),
+        "gluon_latent_expert_shared_gfx950": ("tokenspeed_kernel.ops.moe.gluon"),
+        "gluon_latent_input_decode_gfx950": ("tokenspeed_kernel.ops.moe.gluon"),
+        "gluon_latent_input_small_batch_gfx950": ("tokenspeed_kernel.ops.moe.gluon"),
+        "gluon_latent_input_decode_gfx1250": ("tokenspeed_kernel.ops.moe.gluon"),
     }
     implementations = {name: registry.get_impl(name) for name in expected_modules}
     if current_platform().is_amd:

@@ -26,7 +26,6 @@ MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-131072}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
 WORLD_SIZE=${WORLD_SIZE:-2}
 MAX_CUDAGRAPH_CAPTURE_SIZE=${MAX_CUDAGRAPH_CAPTURE_SIZE:-16}
-REASONING_PARSER=${REASONING_PARSER:-passthrough}
 STARTUP_TIMEOUT=${STARTUP_TIMEOUT:-2400}
 PD_SLURM=${PD_SLURM:-0}
 # mega_moe (Blackwell) needs expert parallelism; marlin (Hopper) runs plain TP.
@@ -335,7 +334,6 @@ python3 -m smg launch \
   --port "$LB_PORT" \
   --model-path "$MODEL_PATH" \
   --tokenizer-path "$MODEL_PATH" \
-  --reasoning-parser "$REASONING_PARSER" \
   --prefill-policy round_robin \
   --decode-policy round_robin \
   --max-concurrent-requests "$MAX_CONCURRENT_REQUESTS" \

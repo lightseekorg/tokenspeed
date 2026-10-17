@@ -493,7 +493,7 @@ def test_latent_input_generator_matches_runtime_packed_projection_contract(
     )
     seen = {}
     _use_cpu_allocations(monkeypatch)
-    latent_input_ops = importlib.import_module("tokenspeed_kernel.ops.moe.latent_input")
+    latent_input_ops = importlib.import_module("tokenspeed_kernel.ops.moe")
     monkeypatch.setattr(moe_generator, "load_builtin_kernels", lambda: None)
     monkeypatch.setattr(moe_generator, "_selected_spec", lambda *_args: spec)
     monkeypatch.setattr(
@@ -594,9 +594,7 @@ def test_latent_expert_shared_generator_uses_global_ep_routes_and_reset(
     )
     seen = {}
     _use_cpu_allocations(monkeypatch)
-    latent_decode_ops = importlib.import_module(
-        "tokenspeed_kernel.ops.moe.latent_decode"
-    )
+    latent_decode_ops = importlib.import_module("tokenspeed_kernel.ops.moe")
     monkeypatch.setattr(moe_generator, "load_builtin_kernels", lambda: None)
     monkeypatch.setattr(
         moe_generator,
@@ -728,7 +726,7 @@ def _qwen38_request(mode: str, **parameters: object) -> BenchmarkRequest:
 def test_softmax_topk_generator_selection_matches_operation_api(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import tokenspeed_kernel.ops.moe.softmax_topk as softmax_topk_ops
+    import tokenspeed_kernel.ops.moe as softmax_topk_ops
 
     captured: list[tuple] = []
 

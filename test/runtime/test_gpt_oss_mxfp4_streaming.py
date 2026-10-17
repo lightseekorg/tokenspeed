@@ -11,8 +11,8 @@ mid-load. This test pins that behavior without needing a GPU or real weights.
 import os
 import sys
 import types
-import unittest
 
+import pytest
 import torch
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -24,7 +24,7 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 from tokenspeed.runtime.models.gpt_oss import GptOssForCausalLM
 
 
-class TestGptOssMxfp4Streaming(unittest.TestCase):
+class TestGptOssMxfp4Streaming:
     def test_load_mxfp4_weights_streams_experts(self):
         # The "weight" stand-in is the name; the stubs never touch tensor data.
         items = [
@@ -74,29 +74,27 @@ class TestGptOssMxfp4Streaming(unittest.TestCase):
         )
 
         # Streamed, not buffered.
-        self.assertTrue(received["is_generator"])
-        self.assertEqual(received["pulled_after_first_expert"], 2)
+        assert received["is_generator"]
+        assert (received["pulled_after_first_expert"]) == (2)
 
-        self.assertEqual(
-            seen_experts,
+        assert (seen_experts) == (
             [
                 "model.layers.0.mlp.experts.gate_up_proj_blocks",
                 "model.layers.0.mlp.experts.down_proj_blocks",
-            ],
+            ]
         )
 
-        self.assertEqual(
-            normal_seen["names"],
+        assert (normal_seen["names"]) == (
             [
                 "model.embed_tokens.weight",
                 "model.layers.0.input_layernorm.weight",
                 "lm_head.weight",
-            ],
+            ]
         )
-        self.assertEqual(normal_seen["other"], {"loaded_expert_param"})
+        assert (normal_seen["other"]) == ({"loaded_expert_param"})
 
 
-class TestGptOssMxfp4ExpertRouting(unittest.TestCase):
+class TestGptOssMxfp4ExpertRouting:
     """Each expert tensor routes on its own name.
 
     The layout used to be decided by one ``any()`` probe over the whole list.
@@ -170,8 +168,8 @@ class TestGptOssMxfp4ExpertRouting(unittest.TestCase):
         )
 
         # Latching the layout off the leading ``format_marker`` would be empty.
-        self.assertEqual(loaded, set(params))
+        assert (loaded) == (set(params))
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

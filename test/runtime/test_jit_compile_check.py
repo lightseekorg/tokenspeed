@@ -67,7 +67,9 @@ def test_install_rejects_unknown_modes(monkeypatch, uninstall):
 
 def test_metrics_export_serving_compiles_as_deltas():
     registry = CollectorRegistry()
-    metrics = EngineMetrics({"model_name": "m"}, enabled=True, registry=registry)
+    metrics = EngineMetrics(
+        {"model_name": "m"}, reporters=["prometheus"], enabled=True, registry=registry
+    )
 
     def exported():
         return (

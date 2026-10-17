@@ -71,7 +71,10 @@ def kda_verify_workspace_bytes(
         and contributes zero. Callers decide whether this engine verifies.
     """
     state_fields = tuple(
-        field for spec, fields in groups if spec.family == "state" for field in fields
+        field
+        for spec, fields in groups
+        if spec.attn_kind == "state"
+        for field in fields
     )
     if not replay_kda:
         return (

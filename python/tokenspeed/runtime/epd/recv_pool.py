@@ -31,8 +31,12 @@ if TYPE_CHECKING:
 
 
 def is_epd_prefill_node(server_args: ServerArgs, is_multimodal_active: bool) -> bool:
-    """Whether this node receives encode->prefill embeddings: a multimodal prefill node."""
-    return server_args.disaggregation_mode == "prefill" and is_multimodal_active
+    """Only the embedding stage receives encoder payloads and owns their pool."""
+    return (
+        server_args.disaggregation_mode == "prefill"
+        and is_multimodal_active
+        and server_args.mapping.is_first_pp_rank
+    )
 
 
 def recv_pool_geometry() -> tuple[int, int]:

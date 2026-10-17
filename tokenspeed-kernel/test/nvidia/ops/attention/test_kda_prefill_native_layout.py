@@ -54,7 +54,6 @@ def _inputs(device, lengths):
 def _actual(inputs, state, bounds, cpu, layout):
     return kda_paged_prefill(
         capacity=None,
-        inputs_packed=False,
         *inputs,
         initial_state=state,
         cu_seqlens=bounds,
@@ -191,7 +190,6 @@ def test_capacity_compatibility_fallback(native_cuda, monkeypatch):
         cu_seqlens=bounds,
         cu_seqlens_cpu=cpu,
         capacity=KdaPrefillCapacity(100, 2),
-        inputs_packed=False,
         lower_bound=-5.0,
         override=None,
         solution="cutedsl_kda",
@@ -202,9 +200,8 @@ def test_capacity_compatibility_fallback(native_cuda, monkeypatch):
 
 
 @pytest.mark.parametrize("sequences", [1, 2, 4, 8])
-@pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("capacity", [256, 2048, 8192])
-def test_capacity_preparation_dynamic_replay(native_cuda, sequences, packed, capacity):
+def test_capacity_preparation_dynamic_replay(native_cuda, sequences, capacity):
     """Isolate device-plan replay with new GPU bounds and poisoned padding.
 
     The captured call does not rerun Python admission against its CPU mirror.
@@ -213,8 +210,6 @@ def test_capacity_preparation_dynamic_replay(native_cuda, sequences, packed, cap
     assert cutedsl_op.cutedsl_kda_supports_prepared_plan()
     lengths = [capacity // sequences] * sequences
     inputs, state, bounds, cpu = _inputs("cuda", lengths)
-    if packed:
-        inputs = tuple(t.contiguous() for t in inputs)
     state_before = state.clone()
 
     def run():
@@ -224,7 +219,6 @@ def test_capacity_preparation_dynamic_replay(native_cuda, sequences, packed, cap
             cu_seqlens=bounds,
             cu_seqlens_cpu=cpu,
             capacity=KdaPrefillCapacity(capacity, sequences),
-            inputs_packed=packed,
             lower_bound=-5.0,
             override=None,
             solution="cutedsl_kda",
@@ -251,10 +245,7 @@ def test_capacity_preparation_dynamic_replay(native_cuda, sequences, packed, cap
         bounds.copy_(new_cpu)
         for tensor in inputs[:5]:
             tensor.copy_(torch.randn_like(tensor) * 0.1)
-            # The packed producer guarantees only Q/K/V/beta; gate is always scrubbed.
-            tensor[:, live:].fill_(
-                0 if packed and tensor is not inputs[3] else float("nan")
-            )
+            tensor[:, live:].fill_(float("nan"))
         exact = tuple(t[:, :live] for t in inputs[:5]) + inputs[5:]
         expected = _actual(exact, state, bounds, new_cpu, "v_major")
         graph.replay()
