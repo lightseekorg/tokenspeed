@@ -484,7 +484,11 @@ class VocabParallelEmbedding(torch.nn.Module):
         # If parameter does not have output dim, then it should
         # be copied onto all gpus (e.g. g_idx for act_order gptq).
         if output_dim is None:
-            if getattr(param, "needs_scalar_to_array", False):
+            # A per-tensor scale may be stored as a scalar (an FP8 LM head's).
+            if (
+                getattr(param, "needs_scalar_to_array", False)
+                or loaded_weight.dim() == 0
+            ):
                 loaded_weight = loaded_weight.reshape(param.data.shape)
             assert param.data.shape == loaded_weight.shape
             param.data.copy_(loaded_weight)

@@ -284,9 +284,9 @@ def test_the_executor_hands_the_model_its_shard_of_the_row_inputs():
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
 
     executor = ModelExecutor.__new__(ModelExecutor)
-    history = torch.arange(10).unsqueeze(1)
+    history = torch.arange(120).reshape(10, 2, 6)
     executor.input_buffers = SimpleNamespace(
-        ngram_model_kwargs=lambda n: {"engram_previous_tokens": history[:n]},
+        ngram_model_kwargs=lambda n: {"engram_hash_ids": history[:n]},
         req_pool_indices_buf=torch.arange(3),
         input_start_offsets_buf=torch.tensor([0, 4, 5, 10]),
         active_request_mask_buf=torch.ones(3, dtype=torch.bool),
@@ -297,12 +297,12 @@ def test_the_executor_hands_the_model_its_shard_of_the_row_inputs():
         request_token_history_view=lambda **kw: views.update(kw) or "view",
     )
     kwargs = executor._model_input_kwargs(10, 3, slice(3, 6))
-    assert torch.equal(kwargs["engram_previous_tokens"], history[3:6])
+    assert torch.equal(kwargs["engram_hash_ids"], history[3:6])
     assert kwargs["request_token_history"] == "view"
     assert views["row_offset"] == 3
     assert views["input_start_offsets"].tolist() == [0, 4, 5, 10]
     kwargs = executor._model_input_kwargs(10, 3, slice(0, 10))
-    assert torch.equal(kwargs["engram_previous_tokens"], history)
+    assert torch.equal(kwargs["engram_hash_ids"], history)
     assert views["row_offset"] == 0
 
 

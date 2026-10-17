@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.attention.dsa.cuda import (
     ragged_decode_topk,
 )
 from tokenspeed_kernel.ops.attention.qsa import (
+    qsa_block_topk_select,
     qsa_sparse_attention,
     qwen4_exp_qsa_block_topk,
 )
@@ -108,7 +109,7 @@ def _check_graph_edges(graph, enabled):
     assert tested > 0
 
 
-def _check_replays(forward, sources, targets, enabled):
+def _check_replays(forward, sources, targets, enabled, *, unordered_outputs):
     # Explicit kernel arguments must take precedence over the global setting.
     pdl_enabled(not enabled)
     forward(enabled)
@@ -128,6 +129,9 @@ def _check_replays(forward, sources, targets, enabled):
         pdl_enabled(not enabled)
         graph.replay()
         for result, reference in zip(actual, expected):
+            if unordered_outputs:
+                result = result.sort(dim=-1).values
+                reference = reference.sort(dim=-1).values
             torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
@@ -184,7 +188,6 @@ def test_qsa_selection_waits_for_query_cache_and_metadata(
             queries_per_request=queries_per_request,
             max_partial_bytes=32 * 1024 * 1024,
             algorithm=algorithm,
-            persistent_topk_workspace=None,
             enable_pdl=enable_pdl,
         )
         slots = qwen4_exp_qsa_selected_slots(
@@ -200,7 +203,7 @@ def test_qsa_selection_waits_for_query_cache_and_metadata(
         )
         return selected, slots
 
-    _check_replays(forward, sources, targets, enabled)
+    _check_replays(forward, sources, targets, enabled, unordered_outputs=True)
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -276,7 +279,7 @@ def test_qsa_compression_orders_ring_reuse(enabled, write_rows, restore_pdl):
         )
         return out, compressed, raw, pos_cache
 
-    _check_replays(forward, sources, targets, enabled)
+    _check_replays(forward, sources, targets, enabled, unordered_outputs=False)
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -315,14 +318,12 @@ def test_qsa_attention_waits_for_slots_and_kv(
         )
         return (output,)
 
-    _check_replays(forward, sources, targets, enabled)
+    _check_replays(forward, sources, targets, enabled, unordered_outputs=False)
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("persistent", [False, True])
-def test_qsa_selection_refreshes_block_frontiers(enabled, persistent, restore_pdl):
-    if persistent and not has_ragged_decode_topk():
-        pytest.skip("CUDA persistent top-k is unavailable")
+@pytest.mark.parametrize("topk", [64, 512])
+def test_qsa_selection_refreshes_block_frontiers(enabled, topk, restore_pdl):
     batch, width, heads, dim, page_size, blocks = 3, 4, 4, 128, 64, 17408
     rows = batch * width
     query = torch.randn(rows, heads, dim, device="cuda", dtype=torch.bfloat16)
@@ -336,11 +337,6 @@ def test_qsa_selection_refreshes_block_frontiers(enabled, persistent, restore_pd
     ).reshape(batch, -1)
     requests = torch.arange(batch, device="cuda").repeat_interleave(width)
     complete = torch.zeros(rows, device="cuda", dtype=torch.int32)
-    workspace = (
-        torch.empty(1024 * 1024, device="cuda", dtype=torch.uint8)
-        if persistent
-        else None
-    )
 
     def forward(enable_pdl):
         _publish(sources, targets)
@@ -351,11 +347,10 @@ def test_qsa_selection_refreshes_block_frontiers(enabled, persistent, restore_pd
             requests,
             complete,
             page_size=page_size,
-            block_topk=512,
+            block_topk=topk,
             queries_per_request=width,
             max_partial_bytes=32 * 1024 * 1024,
             algorithm="logits",
-            persistent_topk_workspace=workspace,
             enable_pdl=enable_pdl,
         )
 
@@ -419,7 +414,6 @@ def test_persistent_topk_waits_for_producers(
     target_length_storage = torch.empty_like(length_storage)
     target_lengths = target_length_storage[::length_stride]
     output = torch.empty(rows, 512, device="cuda", dtype=torch.int32)
-    workspace = torch.empty(1024 * 1024, device="cuda", dtype=torch.uint8)
 
     def forward(enable_pdl):
         _publish((logits, length_storage), (target_logits, target_length_storage))
@@ -428,7 +422,6 @@ def test_persistent_topk_waits_for_producers(
             output,
             512,
             lengths=target_lengths,
-            workspace=workspace,
             max_seq_len=columns,
             q_len_per_req=q_len_per_req,
             enable_pdl=enable_pdl,
@@ -458,23 +451,87 @@ def test_persistent_topk_waits_for_producers(
         torch.testing.assert_close(actual.sort(dim=1).values, expected, rtol=0, atol=0)
 
 
-def _check_native_topk_edge(graph, enabled, rows, columns):
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("column_stride", [1, 2])
+@pytest.mark.parametrize("columns", [4096, 65536])
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_qsa_cuda_selection_orders_strided_score_copies(
+    enabled, column_stride, columns, topk, restore_pdl, require
+):
+    from cuda.bindings import driver as cu
+
+    require("attention", "qsa_block_topk_select", "cuda", torch.float32, "logits")
+    torch.manual_seed(449)
+    rows = 3
+    storage = torch.randn(rows, columns * column_stride, device="cuda")
+    scores = storage[:, ::column_stride]
+    lengths = torch.tensor([0, topk - 1, columns], device="cuda", dtype=torch.int32)
+    target_storage = torch.empty_like(storage)
+    target_scores = target_storage[:, ::column_stride]
+    target_lengths = torch.empty_like(lengths)
+
+    def forward():
+        _publish((storage, lengths), (target_storage, target_lengths))
+        return qsa_block_topk_select(
+            target_scores,
+            topk,
+            lengths=target_lengths,
+            enable_pdl=enabled,
+            solution="cuda",
+            override=None,
+        )
+
+    forward()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        selected = forward()
+    _check_native_topk_edge(graph, enabled, rows, columns, topk)
+    if column_stride != 1:
+        raw = cu.CUgraph(graph.raw_cuda_graph())
+        status, _, _, _, count = cu.cuGraphGetEdges(raw, 0)
+        assert status == cu.CUresult.CUDA_SUCCESS
+        status, _, _, edges, _ = cu.cuGraphGetEdges(raw, count)
+        assert status == cu.CUresult.CUDA_SUCCESS
+        # The ordinary copy must wait for the producer's full completion.
+        assert any(int(edge.type) == 0 for edge in edges)
+
+    offsets = torch.arange(columns, device="cuda")
+    for frontiers in ((0, topk - 1, columns), (1, topk, columns - 1), (0, 7, topk + 1)):
+        storage.normal_()
+        lengths.copy_(torch.tensor(frontiers, device="cuda", dtype=torch.int32))
+        target_storage.fill_(float("nan"))
+        target_lengths.zero_()
+        graph.replay()
+        live = selected >= 0
+        torch.testing.assert_close(live.sum(dim=1), lengths.clamp_max(topk).long())
+        assert torch.all((selected < lengths[:, None]) | ~live)
+        actual = scores.gather(1, selected.clamp_min(0).long()).masked_fill(
+            ~live, -float("inf")
+        )
+        expected = torch.topk(
+            scores.masked_fill(offsets[None, :] >= lengths[:, None], -float("inf")),
+            topk,
+        ).values
+        torch.testing.assert_close(
+            actual.sort(dim=1).values, expected.sort(dim=1).values, rtol=0, atol=0
+        )
+
+
+def _check_native_topk_edge(graph, enabled, rows, columns, topk):
     from cuda.bindings import driver as cu
 
     # Identify the shared CUDA selector through a real reference launch,
     # independently of its compiled symbol name or the model's other kernels.
     logits = torch.zeros(rows, columns, device="cuda")
     lengths = torch.full((rows,), columns, device="cuda", dtype=torch.int32)
-    output = torch.empty(rows, 512, device="cuda", dtype=torch.int32)
-    workspace = torch.empty(1024 * 1024, device="cuda", dtype=torch.uint8)
+    output = torch.empty(rows, topk, device="cuda", dtype=torch.int32)
     reference = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.graph(reference):
         ragged_decode_topk(
             logits,
             output,
-            512,
+            topk,
             lengths=lengths,
-            workspace=workspace,
             max_seq_len=columns,
             q_len_per_req=1,
             enable_pdl=enabled,
@@ -558,7 +615,7 @@ def test_dsa_persistent_decode_preserves_global_pdl(
     graph = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.graph(graph):
         actual, actual_counts = forward()
-    _check_native_topk_edge(graph, enabled, rows, columns)
+    _check_native_topk_edge(graph, enabled, rows, columns, topk)
     for _ in range(3):
         query.normal_()
         pdl_enabled(not enabled)
@@ -584,7 +641,6 @@ def test_persistent_topk_pdl_register_budget(enabled, large_grid, columns, resto
     target = torch.empty_like(logits)
     lengths = torch.full((rows,), min(16384, columns), device="cuda", dtype=torch.int32)
     output = torch.empty(rows, 512, device="cuda", dtype=torch.int32)
-    workspace = torch.empty(1024 * 1024, device="cuda", dtype=torch.uint8)
 
     def forward():
         _publish((logits,), (target,))
@@ -593,7 +649,6 @@ def test_persistent_topk_pdl_register_budget(enabled, large_grid, columns, resto
             output,
             512,
             lengths=lengths,
-            workspace=workspace,
             max_seq_len=columns,
             enable_pdl=enabled,
             q_len_per_req=1,

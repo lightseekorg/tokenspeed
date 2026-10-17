@@ -51,8 +51,8 @@ class RuntimeStates:
 
     #: Per-slot rows a restore does not copy: the history rows are reseeded
     #: by ``seed_request_token_history`` and the n-gram tail by the per-round
-    #: snapshot in ``InputBuffers.fill_ngram_history`` (which resets a slot
-    #: whose request id changed).
+    #: snapshot in ``InputBuffers.fill_ngram_inputs`` followed by the accepted
+    #: history commit. An explicit restore token also reseeds an unchanged slot.
     token_derived_slot_state: tuple[str, ...] = (
         "request_token_history_ids",
         "draft_request_token_history_ids",

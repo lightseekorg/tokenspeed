@@ -231,10 +231,6 @@ class _Engine:
             self.states.valid_cache_lengths,
             num_extends,
             self.buffers.state_write_padding_pool_index,
-            ngram_tail=None,
-            ngram_previous_tokens=None,
-            ngram_token_mask=None,
-            input_ids=None,
         )
         torch.cuda.synchronize()
         return sampled, kept

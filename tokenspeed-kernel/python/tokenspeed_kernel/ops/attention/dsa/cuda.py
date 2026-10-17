@@ -206,7 +206,6 @@ def ragged_decode_topk(
     topk: int,
     *,
     lengths: torch.Tensor,
-    workspace: torch.Tensor,
     max_seq_len: int | None = None,
     q_len_per_req: int,
     enable_pdl: bool,
@@ -220,7 +219,6 @@ def ragged_decode_topk(
             selected column indices.
         topk: Number of candidates to select per row.
         lengths: Per-row valid context length, cast to int32 and flattened.
-        workspace: Scratch uint8 buffer for the persistent kernel.
         max_seq_len: Max scanned columns; defaults to ``logits.shape[1]``.
         q_len_per_req: Query rows per request (speculative decode); 1 for decode.
         enable_pdl: Enable programmatic CUDA launch dependencies.
@@ -234,7 +232,6 @@ def ragged_decode_topk(
         logits.contiguous(),
         lengths.to(torch.int32).contiguous().reshape(-1),
         out,
-        workspace,
         int(topk),
         int(logits.shape[1] if max_seq_len is None else max_seq_len),
         int(q_len_per_req),
