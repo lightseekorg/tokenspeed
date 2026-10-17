@@ -1176,17 +1176,18 @@ class ModelConfig:
                 )
 
     def get_hf_eos_token_id(self) -> set[int] | None:
+        # An EOS id may be 0, so test for presence rather than truthiness.
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
-        if eos_ids:
+        if eos_ids is not None:
             # it can be either int or list of int
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
-        if eos_ids is None:
+        else:
             eos_ids = set()
         if self.hf_generation_config:
             generation_eos_ids = getattr(
                 self.hf_generation_config, "eos_token_id", None
             )
-            if generation_eos_ids:
+            if generation_eos_ids is not None:
                 generation_eos_ids = (
                     {generation_eos_ids}
                     if isinstance(generation_eos_ids, int)
