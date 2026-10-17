@@ -400,7 +400,11 @@ def max_active_ctas(kernel) -> int:
         library = ctypes.CDLL("libcuda.so.1")
         query = library.cuOccupancyMaxActiveBlocksPerMultiprocessor
     elif backend == "hip":
-        query = _get_hip_runtime().hipModuleOccupancyMaxActiveBlocksPerMultiprocessor
+        from tokenspeed_kernel._triton import get_hip_runtime_path
+
+        # Kernel handles belong to the runtime that loaded the Triton module.
+        library = ctypes.CDLL(get_hip_runtime_path())
+        query = library.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor
     else:
         raise ValueError(f"Unsupported occupancy backend: {backend}")
     query.argtypes = [

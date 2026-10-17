@@ -64,7 +64,8 @@ if current_platform().is_nvidia:
             """Select QSA blocks with the length-aware CUDA persistent kernel.
 
             Args:
-                logits: FP32 scores shaped ``[rows, cols]``.
+                logits: FP32 scores shaped ``[rows, cols]``. Strided inputs are
+                    copied using ordinary stream dependencies before selection.
                 topk: Selected blocks per row: 512, 1024 or 2048.
                 lengths: Per-row valid prefix lengths. Later columns are ignored.
                 enable_pdl: Enable programmatic launch dependencies.
