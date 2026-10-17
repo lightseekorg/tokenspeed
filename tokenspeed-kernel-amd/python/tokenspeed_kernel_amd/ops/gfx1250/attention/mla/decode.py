@@ -808,6 +808,11 @@ def _launch_split_reduce(
     # extents must be powers of two.
     if num_kv_splits & (num_kv_splits - 1):
         raise ValueError(f"split count must be a power of two, got {num_kv_splits}")
+    # Each program merges BLOCK_D latent columns; a remainder would go unwritten.
+    if kv_lora_rank % _REDUCE_BLOCK_D:
+        raise ValueError(
+            f"latent rank must be a multiple of {_REDUCE_BLOCK_D}, got {kv_lora_rank}"
+        )
     split_chunk = min(num_kv_splits, 64)
     grid = (num_tokens, num_query_heads, kv_lora_rank // _REDUCE_BLOCK_D)
     _mla_decode_fwd_reduce_kernel[grid](
