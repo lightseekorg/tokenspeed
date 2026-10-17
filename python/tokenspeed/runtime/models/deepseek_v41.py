@@ -34,10 +34,10 @@ The generic model loader owns dense and MoELayer postprocessing, including
 MegaMoE weight preparation.
 
 Call initialize_engram(tokenizer) once after construction, then pass caller-owned
-``engram_previous_tokens`` [T,3] and bool ``engram_token_mask`` [T] as forward
+``engram_hash_ids`` [T,layers,hash columns] and bool ``engram_token_mask`` [T] as forward
 kwargs. These are borrowed forward inputs, never request state or ForwardContext
 fields. The runner owns refresh/overlap/rollback and can use stable input views.
-No setter retains a mutable per-forward tensor; no hashes survive a forward.
+The model retains no mutable per-forward tensors; hash storage belongs to the runner.
 
 Every scheduled token runs through the encoder layers; the CED decoder (from
 the candidate source on) runs on the rows the backend's ``decoder_view()``
@@ -79,7 +79,12 @@ from tokenspeed_kernel.ops.attention.dsv41 import (
     rope_inplace,
     rope_pad_query,
 )
-from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32, grouped_bf16_projection
+from tokenspeed_kernel.ops.gemm import (
+    dsv4_linear_fp32,
+    grouped_bf16_projection,
+    mm,
+    prepare_mxfp8_weight_scales,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
@@ -224,6 +229,9 @@ class _V41Fp8Config(Mxfp8Config):
 class _ReferenceFp8LinearMethod(Fp8LinearMethod):
     def __init__(self, quant_config: Mxfp8Config):
         super().__init__(quant_config)
+        # 1x32 weight scales in the native GEMM's layout, or None for the
+        # canonical path; see prepare_weight_scales.
+        self.prepared_weight_scales: torch.Tensor | None = None
         # Hopper has no tensor-core kernel for 32-wide FP8 blocks; its FP8 GEMMs
         # rescale on CUDA cores every 32 K and trail the plain BF16 GEMM at
         # every shape. So load the codes straight into a BF16 weight and fold
@@ -290,6 +298,7 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         if not self.load_as_bf16:
             super().process_weights_after_loading(layer)
+            self.prepare_weight_scales(layer)
             return
         scale = layer.weight_scale_inv.data.view(torch.float8_e8m0fnu).to(
             torch.bfloat16
@@ -298,11 +307,46 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         layer.register_parameter("weight_scale_inv", None)
         layer.quant_method = UnquantizedLinearMethod()
 
+    @torch.no_grad()
+    def prepare_weight_scales(self, layer: nn.Module) -> None:
+        """Derive this layer's prepacked weight scales from the loaded ones.
+
+        Preparation swizzles the scales once instead of on every forward. The
+        first call keeps the result; a call after a weight update copies into
+        that buffer, so captured CUDA graphs keep reading the same address.
+        """
+        if self.load_as_bf16:
+            return
+        prepared = prepare_mxfp8_weight_scales(layer.weight, layer.weight_scale_inv)
+        cached = self.prepared_weight_scales
+        if cached is None:
+            self.prepared_weight_scales = prepared
+            return
+        if prepared is None or prepared.shape != cached.shape:
+            raise ValueError("V4.1 prepacked FP8 scales changed layout")
+        cached.copy_(prepared)
+
     def apply(
         self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
         if x.shape[0] == 0:
             return x.new_empty((*x.shape[:-1], layer.weight.shape[0]))
+        if (
+            self.prepared_weight_scales is not None
+            and x.is_cuda
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and x.stride(-1) == 1
+        ):
+            return mm(
+                x.reshape(-1, x.shape[-1]),
+                layer.weight,
+                B_scales=self.prepared_weight_scales,
+                bias=bias,
+                out_dtype=x.dtype,
+                quant="mxfp8",
+                block_size=[1, 32],
+                prepacked_scales=True,
+            ).view(*x.shape[:-1], layer.weight.shape[0])
         codes, scales = v41_quantize_fp8(x)
         return super().apply(layer, codes, bias, scales, x.dtype)
 
@@ -1394,13 +1438,13 @@ class DeepseekV41Model(nn.Module):
         input_embeds: torch.Tensor | None,
         pp_inbound: PPStageState | None,
         *,
-        engram_previous_tokens: torch.Tensor | None,
+        engram_hash_ids: torch.Tensor | None,
         engram_token_mask: torch.Tensor | None,
         image_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         """Run all layers and return normalized [T,hidden] plus optional hidden capture.
 
-        Engram history/mask must describe every input row in the same TP-replicated
+        Prepared Engram hashes/mask must describe every input row in the same TP-replicated
         order as backend metadata. image_mask marks image-span rows; None uses
         text routing. pp_inbound must be None; draft and memory-only/CED
         invocations are unsupported. The four stages below are the whole
@@ -1426,7 +1470,7 @@ class DeepseekV41Model(nn.Module):
             ctx,
             input_embeds,
             pp_inbound,
-            engram_previous_tokens=engram_previous_tokens,
+            engram_hash_ids=engram_hash_ids,
             engram_token_mask=engram_token_mask,
             image_mask=image_mask,
         )
@@ -1466,7 +1510,7 @@ class DeepseekV41Model(nn.Module):
         input_embeds: torch.Tensor | None,
         pp_inbound: PPStageState | None,
         *,
-        engram_previous_tokens: torch.Tensor | None,
+        engram_hash_ids: torch.Tensor | None,
         engram_token_mask: torch.Tensor | None,
         image_mask: torch.Tensor | None,
     ) -> V41RowState:
@@ -1477,19 +1521,26 @@ class DeepseekV41Model(nn.Module):
             raise ValueError(
                 "V4.1 expects packed one-dimensional token IDs and positions"
             )
-        hashes = None
+        hashes = engram_hash_ids
         if self.config.engram_layer_ids:
-            if (
-                self.engram_hash is None
-                or engram_previous_tokens is None
-                or engram_token_mask is None
-            ):
+            if hashes is None or engram_token_mask is None:
                 raise RuntimeError(
-                    "Initialize Engram and provide previous-three tokens and current token mask"
+                    "Engram requires prepared hash IDs and current token mask"
                 )
-            hashes = self.engram_hash(
-                input_ids, engram_previous_tokens, engram_token_mask
+            expected = (
+                input_ids.numel(),
+                len(self.config.engram_layer_ids),
+                (self.config.engram_max_ngram_size - 1) * self.config.engram_n_heads,
             )
+            if (
+                hashes.shape != expected
+                or hashes.dtype != torch.int64
+                or engram_token_mask.shape != input_ids.shape
+                or engram_token_mask.dtype != torch.bool
+            ):
+                raise ValueError(
+                    "Engram prepared hashes/mask have the wrong shape or dtype"
+                )
         h = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         if h.shape != (input_ids.numel(), self.config.hidden_size):
             raise ValueError("V4.1 input embeddings have the wrong shape")
@@ -1713,6 +1764,12 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         if self.model is not None:
             self.model.initialize_engram(tokenizer)
 
+    def get_ngram_hash_parameters(self):
+        """Borrow immutable hash constants for fused runtime input preparation."""
+        if self.model is None or self.model.engram_hash is None:
+            raise RuntimeError("Initialize Engram before binding input preparation")
+        return self.model.engram_hash.input_parameters
+
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         """Capture ordered, unique target layer inputs for the checkpoint draft."""
         layers = tuple(layer_ids)
@@ -1798,7 +1855,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         result = {
             "input_embeds": kwargs.get("input_embeds", kwargs.get("inputs_embeds")),
             "pp_inbound": kwargs.get("pp_inbound"),
-            "engram_previous_tokens": kwargs.get("engram_previous_tokens"),
+            "engram_hash_ids": kwargs.get("engram_hash_ids"),
             "engram_token_mask": kwargs.get("engram_token_mask"),
             "image_mask": kwargs.get("image_mask"),
         }
@@ -2186,6 +2243,12 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         for module in self.modules():
             if isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
+            elif isinstance(module, LinearBase) and isinstance(
+                module.quant_method, _ReferenceFp8LinearMethod
+            ):
+                # The target and DSpark share this hook. Refresh in place after
+                # a complete weight update; captured graphs retain the buffer.
+                module.quant_method.prepare_weight_scales(module)
 
     def post_quant_warmup(self) -> None:
         for module in self.modules():
