@@ -27,7 +27,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import _select_extend_tile
+from utils import is_amd
 
 
 @pytest.fixture
@@ -41,6 +41,15 @@ def require_gfx950():
 @pytest.mark.parametrize("group", [1, 2, 4, 5, 6, 8, 12])
 @pytest.mark.parametrize("query_rows", [1, 16, 64, 848, 896, 8192])
 def test_select_extend_tile(group, query_rows):
+    # Tile selection is CPU-only; the AMD kernel package is optional on other hosts.
+    if not is_amd():
+        pytest.importorskip(
+            "tokenspeed_kernel_amd", reason="AMD kernel package is optional"
+        )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
+        _select_extend_tile,
+    )
+
     block_m, block_q, block_n, warps = _select_extend_tile(query_rows, group)
     padded_group = 1 << (group - 1).bit_length()
     assert block_m & (block_m - 1) == 0

@@ -6,11 +6,11 @@ from ops.moe.test_triton_fp8_channel_apply import _layer, _plan, _plan_on
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.moe import moe_apply
 from tokenspeed_kernel.ops.moe._triton import fp8_channel_fused
-from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError
 from utils import (
     assert_no_triton_compile,
     int_specialization_class,
+    is_cdna4,
     warm_specialization_classes,
 )
 
@@ -112,12 +112,7 @@ def test_fused_channel_plan_refuses_unsupported_contract(mi350_platform, overrid
 
 
 def _require_gpu():
-    platform = current_platform()
-    if not (
-        torch.cuda.is_available()
-        and platform.is_amd
-        and platform.arch_version == ArchVersion(9, 5)
-    ):
+    if not is_cdna4():
         pytest.skip("Fused FP8 channel experts require gfx950")
 
 

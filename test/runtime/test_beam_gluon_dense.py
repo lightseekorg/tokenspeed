@@ -22,11 +22,13 @@
 
 import argparse
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import tokenspeed_kernel.ops.gemm as gemm
 import torch
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import ScaleFormat, format_signature, tensor_format
 
@@ -52,10 +54,13 @@ def test_channel_registry_selects_original_portable_implementation(m, n, k):
     operand = tensor_format("scaled-fp8", torch.float8_e4m3fn, scale=scale)
     signature = format_signature(a=operand, b=operand)
     traits = {"m": m, "n": n, "k": k, "b_layout": "KN", "out_dtype": torch.bfloat16}
-    selected = select_kernel("gemm", "mm", signature, traits=traits)
+    platform = replace(current_platform(), vendor="amd", arch_version=ArchVersion(9, 5))
+    selected = select_kernel("gemm", "mm", signature, traits=traits, platform=platform)
     assert selected.name == "triton_mm_fp8_scaled"
     with pytest.raises(NoKernelFoundError):
-        select_kernel("gemm", "mm", signature, traits=traits, solution="gluon")
+        select_kernel(
+            "gemm", "mm", signature, traits=traits, solution="gluon", platform=platform
+        )
 
 
 @pytest.mark.parametrize("n,k", FAMILIES)

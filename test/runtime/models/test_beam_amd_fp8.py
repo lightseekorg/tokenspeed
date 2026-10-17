@@ -28,6 +28,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
+from tokenspeed_kernel.registry import KernelRegistry
 
 from tokenspeed.runtime.distributed import comm_manager as comm_module
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -99,7 +100,7 @@ def amd_platform():
     Platform.override(
         dataclasses.replace(original, vendor="amd", arch_version=ArchVersion(9, 5))
     )
-    yield
+    yield original
     Platform.override(original)
 
 
@@ -118,6 +119,25 @@ def test_amd_default_formats_select_registry_backend_and_scale_routes_once(
 ):
     from test.runtime.models.test_beam_mxfp4 import mxfp4_config
 
+    expected_backend = (
+        backend
+        if backend != "auto"
+        else ("triton" if fmt == "fp8_channel" else "gluon")
+    )
+    # These Gluon registrations are loaded only on AMD. Keep portable
+    # formats/backends covered when the process was imported on another vendor.
+    amd_registration = {
+        "bf16": "gluon_bf16_precomputed_moe_apply",
+        "mxfp4": "gluon_mxfp4_precomputed_moe_apply",
+    }.get(fmt)
+    if (
+        not amd_platform.is_amd
+        and expected_backend == "gluon"
+        and amd_registration is not None
+        and KernelRegistry.get().get_by_name(amd_registration) is None
+    ):
+        pytest.skip(f"AMD backend {amd_registration!r} is not registered")
+
     server(backend)
     config = tiny_config()
     config.hidden_size = 5120
@@ -133,11 +153,6 @@ def test_amd_default_formats_select_registry_backend_and_scale_routes_once(
             config, Mapping(rank=0, world_size=tp_size), 1, "model.layers.1.mlp", quant
         )
     experts = layer.experts
-    expected_backend = (
-        backend
-        if backend != "auto"
-        else ("triton" if fmt == "fp8_channel" else "gluon")
-    )
     assert experts.plan["solution"] == expected_backend
     assert experts.plan.get("precision_policy", "default") == "default"
     assert experts.plan.get("output_scale", 1.0) == 1.0

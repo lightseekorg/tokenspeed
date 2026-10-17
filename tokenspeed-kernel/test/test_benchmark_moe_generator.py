@@ -247,6 +247,10 @@ def test_beam_preparation_keeps_routing_and_quantization_outside_the_wrong_bound
     monkeypatch, mi350_platform
 ):
     assert resolve_kernel_override("moe", "apply", None) is None
+    # The preparation API receives platform metadata, but public MoE planning
+    # also consults the global platform. Isolate both selection and its cache.
+    monkeypatch.setattr(Platform, "_instance", mi350_platform)
+    monkeypatch.setattr(KernelRegistry.get(), "_selection_cache", {})
     monkeypatch.setattr(
         moe_generator,
         "_generator",

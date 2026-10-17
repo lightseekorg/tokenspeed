@@ -22,17 +22,12 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.platform import ArchVersion, current_platform
+from utils import is_cdna4
 
 
 def _require_device():
-    platform = current_platform()
-    if not (
-        platform.is_amd
-        and platform.arch_version == ArchVersion(9, 5)
-        and torch.cuda.is_available()
-    ):
-        pytest.skip("requires explicitly granted gfx950 device")
+    if not is_cdna4():
+        pytest.skip("requires gfx950")
 
 
 def _raw_down(a, b, block_m):

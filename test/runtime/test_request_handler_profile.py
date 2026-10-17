@@ -14,6 +14,8 @@ from unittest import mock
 import pytest
 import tokenspeed_kernel.profiling as profiling
 import torch
+from tokenspeed_kernel._triton import triton
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.engine import request_handler as request_handler_mod
 from tokenspeed.runtime.engine.io_struct import ProfileReq, ProfileReqType
@@ -206,12 +208,16 @@ class TestRequestHandlerProtonProfile:
                         from tokenspeed_triton.backends.compiler import GPUTarget
                         from tokenspeed_triton.runtime.driver import DriverConfig
                         from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
+                        # Keep the parent's vendor classification so importing the
+                        # real handler does not require another vendor's packages.
+                        vendor, major, minor, backend, arch, warp_size = json.loads(sys.argv[3])
                         Platform.override(PlatformInfo(
-                            vendor='amd', arch_version=ArchVersion(9, 5),
+                            vendor=vendor, arch_version=ArchVersion(major, minor),
                             device_name='CPU test mock', device_count=0,
                             total_memory=0, memory_bandwidth=0, sm_count=0,
                             max_threads_per_sm=0, max_shared_memory_per_sm=0))
-                        discovery = SimpleNamespace(get_current_target=lambda: GPUTarget('hip', 'gfx950', 64))
+                        target = GPUTarget(backend, arch, warp_size)
+                        discovery = SimpleNamespace(get_current_target=lambda: target)
                         with mock.patch.object(DriverConfig, 'active', new_callable=mock.PropertyMock, return_value=discovery):
                             from tokenspeed.runtime.engine import request_handler as handler_module
                             audit['real_request_handler_import'] = str(Path(handler_module.__file__).resolve())
@@ -233,6 +239,8 @@ class TestRequestHandlerProtonProfile:
                 os.environ,
                 expected_handler=str(Path(request_handler_mod.__file__).resolve()),
             )
+            platform = current_platform()
+            target = triton.runtime.driver.active.get_current_target()
             child = subprocess.run(
                 [
                     sys.executable,
@@ -244,6 +252,16 @@ class TestRequestHandlerProtonProfile:
                             name: environment.get(name)
                             for name in _CANARY_VISIBILITY_NAMES
                         }
+                    ),
+                    json.dumps(
+                        [
+                            platform.vendor,
+                            platform.arch_version.major,
+                            platform.arch_version.minor,
+                            target.backend,
+                            target.arch,
+                            target.warp_size,
+                        ]
                     ),
                 ],
                 env=environment,

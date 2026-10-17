@@ -22,24 +22,16 @@
 
 import pytest
 import torch
+from utils import assert_no_triton_compile, is_cdna4
+
+if not is_cdna4():
+    pytest.skip("AMD CDNA4 is required", allow_module_level=True)
+
 from tokenspeed_kernel.ops.layernorm.gluon import NAME
 from tokenspeed_kernel.ops.layernorm.qk_rmsnorm_ssmax import qk_rmsnorm_ssmax
-from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel_amd.ops.gfx950.layernorm.qk_rmsnorm_ssmax import (
     gluon_qk_rmsnorm_ssmax_gfx950,
 )
-from utils import assert_no_triton_compile
-
-
-@pytest.fixture(autouse=True)
-def gfx950():
-    platform = current_platform()
-    if (
-        not platform.is_amd
-        or platform.arch_version != ArchVersion(9, 5)
-        or not torch.cuda.is_available()
-    ):
-        pytest.skip("requires gfx950")
 
 
 def fixture(rows, strided, dtype):

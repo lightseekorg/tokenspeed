@@ -28,6 +28,18 @@ from tokenspeed_kernel.ops.moe.gluon import (
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError
+from utils import is_amd
+
+
+@pytest.fixture
+def require_amd_kernel_package():
+    # These CPU checks reach a launcher that imports the optional AMD package.
+    if not is_amd():
+        pytest.importorskip(
+            "tokenspeed_kernel_amd", reason="AMD kernel package is optional"
+        )
+    else:
+        import tokenspeed_kernel_amd  # noqa: F401
 
 
 def _plan(platform, **overrides):
@@ -82,6 +94,8 @@ def test_explicit_gluon_plan_uses_channel_candidate(mi350_platform, intermediate
 def test_legacy_gluon_plans_keep_existing_implementation(
     mi350_platform, dtype, width, expected
 ):
+    if not is_amd() and KernelRegistry.get().get_by_name(expected) is None:
+        pytest.skip("Legacy Gluon implementations are only registered on AMD")
     assert (
         _plan(mi350_platform, weight_dtype=dtype, ispp=width, solution="gluon")[
             "apply_kernel_name"
@@ -139,6 +153,7 @@ def test_apply_rejects_unsupported_launch_before_device_use(options, error):
 
 
 @pytest.mark.parametrize("intermediate", [320, 640])
+@pytest.mark.usefixtures("require_amd_kernel_package")
 def test_default_policy_still_rejects_non_gpu_tensors(intermediate):
     weights = torch.nn.Module()
     weights.w13_weight = torch.empty(
@@ -170,6 +185,7 @@ def test_default_policy_still_rejects_non_gpu_tensors(intermediate):
         {"precision_policy": "default"},
     ],
 )
+@pytest.mark.usefixtures("require_amd_kernel_package")
 def test_default_policy_executes_empty_gluon_batch_without_name_pin(
     monkeypatch, policy
 ):
@@ -232,6 +248,7 @@ def test_default_policy_rejects_expert_parallelism(ep_size, ep_rank):
         )
 
 
+@pytest.mark.usefixtures("require_amd_kernel_package")
 def test_default_policy_rejects_interleaved_weights():
     weights = torch.nn.Module()
     weights.w13_input_layout = "interleaved"

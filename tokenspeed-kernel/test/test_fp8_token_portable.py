@@ -21,6 +21,7 @@
 """CPU behavior of portable FP8 dispatch; only GPU execution is emulated."""
 
 import pytest
+import tokenspeed_kernel.platform as kernel_platform
 import torch
 from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.gemm import triton as gemm_triton
@@ -31,13 +32,11 @@ from tokenspeed_kernel.registry import KernelRegistry
 
 
 @pytest.fixture
-def amd(mi350_platform):
-    original = Platform.get()
-    Platform.override(mi350_platform)
-    KernelRegistry.get().clear_cache()
-    yield
-    Platform.override(original)
-    KernelRegistry.get().clear_cache()
+def amd(mi350_platform, monkeypatch):
+    monkeypatch.setattr(Platform, "_instance", mi350_platform)
+    monkeypatch.setattr(KernelRegistry.get(), "_selection_cache", {})
+    # Dependent launches may already be cached as enabled by NVIDIA tests.
+    monkeypatch.setattr(kernel_platform, "_pdl_enabled", None)
 
 
 def _quantize_cpu(x, enable_pdl):

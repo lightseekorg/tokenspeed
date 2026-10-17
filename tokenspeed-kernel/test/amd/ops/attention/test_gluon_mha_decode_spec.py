@@ -42,6 +42,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.attention.mha import mha_decode_with_kvcache
 from tokenspeed_kernel.platform import current_platform
+from utils import is_cdna4
 
 MAX_CONTEXT = 50176
 
@@ -179,7 +180,7 @@ def test_reference_precision_is_restored(raises):
 @pytest.mark.parametrize("mode", ["full", "window", "draft"])
 @pytest.mark.parametrize("context", [17, 63, 64, 65, 8192, 50000])
 def test_spec_decode_graph_replay(concurrency, mode, context):
-    if not current_platform().is_cdna4:
+    if not is_cdna4():
         pytest.skip("requires gfx950")
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
         gluon_mha_decode_gfx950,
