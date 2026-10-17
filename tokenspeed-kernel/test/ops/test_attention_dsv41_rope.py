@@ -483,3 +483,29 @@ def test_global_rope_scatter_graph_refresh_and_raw_slot_zero(strided, dtype):
         _global_reference(values, positions, rope_cache, reference_cache, slots)
         graph.replay()
         torch.testing.assert_close(actual_storage, reference_storage, rtol=0, atol=0)
+
+
+def test_fused_rope_launches_reuse_compilation_across_token_counts():
+    from tokenspeed_kernel.ops.attention.dsv41._triton import rope
+    from utils import assert_no_triton_compile
+
+    def keys(tokens):
+        values, weight, positions, cache = _key_inputs(tokens, 64, True)
+        index_key_norm_rope(values, weight, positions, cache, 1e-6)
+
+    def global_keys(tokens):
+        values, positions, rope_cache, slots, pages = _global_inputs(
+            tokens, True, "normal"
+        )
+        _, cache = _global_cache(pages, True)
+        dsv41.global_rope_scatter(values, positions, rope_cache, cache, slots)
+
+    keys(17)
+    global_keys(17)
+    # Token counts and cache page counts change every batch; neither may key
+    # a new binary. (Above 512 tokens the global launch uses fewer warps.)
+    with assert_no_triton_compile(rope._index_key_norm_rope):
+        with assert_no_triton_compile(rope._global_rope_scatter):
+            for tokens in (1, 3, 64, 129, 500):
+                keys(tokens)
+                global_keys(tokens)
