@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-from utils import is_cdna4, is_cdna5
+from utils import assert_no_triton_compile, is_cdna4, is_cdna5
 
 if not (is_cdna4() or is_cdna5()):
     pytest.skip(
@@ -1342,11 +1342,17 @@ def test_dsa_with_sparse_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
     ],
 )
 @pytest.mark.parametrize(
-    "q_dtype",
+    ("q_dtype", "kv_dtype"),
     [
-        pytest.param(torch.bfloat16, id="q_bf16"),
-        pytest.param(torch.float8_e4m3fn, id="q_e4m3"),
-        pytest.param(torch.float8_e5m2, id="q_e5m2"),
+        pytest.param(torch.bfloat16, torch.bfloat16, id="bf16"),
+        pytest.param(torch.float8_e4m3fn, torch.float8_e4m3fn, id="e4m3"),
+        pytest.param(torch.float8_e5m2, torch.float8_e5m2, id="e5m2"),
+        pytest.param(torch.bfloat16, torch.float8_e4m3fn, id="bf16-q-e4m3-kv"),
+        pytest.param(torch.float8_e4m3fn, torch.bfloat16, id="e4m3-q-bf16-kv"),
+        pytest.param(torch.bfloat16, torch.float8_e5m2, id="bf16-q-e5m2-kv"),
+        pytest.param(torch.float8_e5m2, torch.bfloat16, id="e5m2-q-bf16-kv"),
+        pytest.param(torch.float8_e4m3fn, torch.float8_e5m2, id="e4m3-q-e5m2-kv"),
+        pytest.param(torch.float8_e5m2, torch.float8_e4m3fn, id="e5m2-q-e4m3-kv"),
     ],
 )
 @pytest.mark.parametrize(
@@ -1360,12 +1366,13 @@ def test_dsa_dense_kvcache(
     mode: str,
     api,
     q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
     kv_lora_rank: int,
 ) -> None:
     device = "cuda"
     tokens = 3
     num_heads = 2
-    num_slots = 16
+    num_slots = 144
     topk = 512
     qk_rope_head_dim = 64
     qk_nope_head_dim = 192 if kv_lora_rank == 512 else 128
@@ -1380,11 +1387,11 @@ def test_dsa_dense_kvcache(
     q = q_bf16.to(q_dtype)
     latent = torch.randn(num_slots, kv_lora_rank, device=device, dtype=torch.bfloat16)
     rope = torch.randn(num_slots, qk_rope_head_dim, device=device, dtype=torch.bfloat16)
-    kv_cache = torch.cat([latent, rope], dim=-1).to(q_dtype)
+    kv_cache = torch.cat([latent, rope], dim=-1).to(kv_dtype)
     dequant_latent = kv_cache[:, :kv_lora_rank].float().to(torch.bfloat16)
     dequant_rope = kv_cache[:, kv_lora_rank:].float().to(torch.bfloat16)
     topk_slots = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
-    topk_lens = torch.tensor([5, 7, 4], device=device, dtype=torch.int32)
+    topk_lens = torch.tensor([5, 65, 129], device=device, dtype=torch.int32)
     for token in range(tokens):
         count = int(topk_lens[token].item())
         topk_slots[token, :count] = torch.randperm(num_slots, device=device)[:count]
@@ -1850,9 +1857,25 @@ def test_dsa_decode_glm53_flash_bf16_split_matrix(tokens: int) -> None:
     not (is_cdna4() or is_cdna5()),
     reason="GLM-5.3-Flash graph replay requires AMD CDNA4 or CDNA5",
 )
-@pytest.mark.parametrize("tokens", (16, 64))
-def test_dsa_decode_glm53_flash_bf16_split_graph_tracks_live_lengths(
+@pytest.mark.parametrize("tokens", (1, 16, 64))
+@pytest.mark.parametrize(
+    ("q_dtype", "kv_dtype"),
+    (
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn),
+        (torch.bfloat16, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e5m2, torch.float8_e5m2),
+        (torch.bfloat16, torch.float8_e5m2),
+        (torch.float8_e5m2, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float8_e5m2),
+        (torch.float8_e5m2, torch.float8_e4m3fn),
+    ),
+)
+def test_dsa_decode_glm53_flash_graph_tracks_live_lengths(
     tokens: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
 ) -> None:
     device = "cuda"
     num_heads = 16
@@ -1863,10 +1886,10 @@ def test_dsa_decode_glm53_flash_bf16_split_graph_tracks_live_lengths(
     generator = _generator(device, 1220 + tokens)
     q = _randn_bf16(
         (tokens, num_heads, kv_lora_rank), device=device, generator=generator
-    )
+    ).to(q_dtype)
     kv_cache = _randn_bf16(
         (num_slots, kv_lora_rank), device=device, generator=generator
-    )
+    ).to(kv_dtype)
     topk_slots = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
     topk_lens = torch.empty(tokens, device=device, dtype=torch.int32)
     graph_out = torch.empty(
@@ -1877,14 +1900,14 @@ def test_dsa_decode_glm53_flash_bf16_split_graph_tracks_live_lengths(
     )
     softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim)
 
-    def invoke(out: torch.Tensor) -> None:
+    def invoke(out: torch.Tensor, max_seqlen_k: int) -> None:
         gluon_dsa_decode(
             q=q,
             kv_cache=kv_cache,
             sparse_kv_cache=None,
             topk_slots=topk_slots,
             topk_lens=topk_lens,
-            max_seqlen_k=131072,
+            max_seqlen_k=max_seqlen_k,
             qk_nope_head_dim=qk_nope_head_dim,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=0,
@@ -1896,33 +1919,49 @@ def test_dsa_decode_glm53_flash_bf16_split_graph_tracks_live_lengths(
 
     topk_lens.fill_(13)
     topk_slots[:, :13] = torch.arange(13, device=device, dtype=torch.int32)
-    invoke(graph_out)
+    initial_max_seqlen_k = 13 if is_cdna4() else 131072
+    invoke(graph_out, initial_max_seqlen_k)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        invoke(graph_out)
+        invoke(graph_out, initial_max_seqlen_k)
 
-    for visible in (13, 449, 526, 1961):
-        topk_slots.fill_(-1)
-        topk_lens.fill_(visible)
-        selected = torch.arange(visible, device=device, dtype=torch.int32)
-        for row in range(tokens):
-            topk_slots[row, :visible] = torch.roll(selected, row)
-        graph.replay()
-        torch.cuda.synchronize()
-        replayed = graph_out.clone()
-        invoke(eager_out)
-        torch.cuda.synchronize()
-        torch.testing.assert_close(replayed, eager_out, rtol=0.0, atol=0.0)
-        ref = _dsa_reference(
-            q,
-            kv_cache,
-            torch.empty((num_slots, 0), dtype=q.dtype, device=device),
-            topk_slots,
-            topk_lens,
-            softmax_scale,
+    # Revisit a long row after short/empty rows to exercise shared-buffer reuse
+    # and online-softmax state under the same captured launch.
+    # Changed host context bounds exercise gfx950's fixed-capacity contract.
+    # Other architectures retain their existing graph metadata coverage.
+    compile_kernels = (
+        (
+            gfx950_dsa_backend._dsa_dense_mfma_kv_kernel,
+            gfx950_dsa_backend._dsa_dense_mfma_reduce_kernel,
         )
-        torch.testing.assert_close(replayed.float(), ref.float(), rtol=8e-2, atol=8e-2)
+        if is_cdna4()
+        else ()
+    )
+    with assert_no_triton_compile(*compile_kernels):
+        for visible in (0, 1, 13, 63, 64, 65, 449, 526, 1961, 2048, 2051, 0, 65, 2051):
+            topk_slots.fill_(-1)
+            topk_lens.fill_(visible)
+            selected = torch.arange(visible, device=device, dtype=torch.int32)
+            for row in range(tokens):
+                topk_slots[row, :visible] = torch.roll(selected, row)
+            graph.replay()
+            torch.cuda.synchronize()
+            replayed = graph_out.clone()
+            invoke(eager_out, visible if is_cdna4() else initial_max_seqlen_k)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(replayed, eager_out, rtol=0.0, atol=0.0)
+            ref = _dsa_reference(
+                q,
+                kv_cache,
+                torch.empty((num_slots, 0), dtype=kv_cache.dtype, device=device),
+                topk_slots,
+                topk_lens,
+                softmax_scale,
+            )
+            torch.testing.assert_close(
+                replayed.float(), ref.float(), rtol=8e-2, atol=8e-2
+            )
 
 
 @pytest.mark.skipif(
@@ -2051,7 +2090,8 @@ def test_dsa_prefill_glm53_flash_dense_mfma(
     not (is_cdna4() or is_cdna5()),
     reason="GLM-5.3-Flash padded prefill requires AMD CDNA4 or CDNA5",
 )
-def test_dsa_prefill_glm53_flash_zero_length_rows_are_zero() -> None:
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
+def test_dsa_prefill_glm53_flash_zero_length_rows_are_zero(dtype: torch.dtype) -> None:
     device = "cuda"
     tokens = 4
     num_heads = 16
@@ -2071,6 +2111,8 @@ def test_dsa_prefill_glm53_flash_zero_length_rows_are_zero() -> None:
         generator=generator,
     )
     kv_cache[0].fill_(float("nan"))
+    q = q.to(dtype)
+    kv_cache = kv_cache.to(dtype)
     topk_slots = torch.full(
         (tokens, topk),
         -1,
