@@ -561,13 +561,10 @@ Install `ffmpeg` before serving multimodal requests:
 apt-get update && apt-get install -y ffmpeg
 ```
 
-On MI350X, use tensor parallel size 4 with expert parallelism disabled for the
-BF16 or block-FP8 checkpoints. The block-FP8 path retains compact expert
-weights for its decode-specialized Gluon kernel and materializes BF16 expert
-copies once at load time for prefill.
-
 On platforms without DeepGEMM, four-stream mHC uses a portable Triton path and
 switches to its tiled prefill projection above 256 tokens.
+
+### NVIDIA
 
 ```bash
 ts serve zai-org/GLM-5.3-Flash \
@@ -580,6 +577,28 @@ ts serve zai-org/GLM-5.3-Flash \
   --speculative-algorithm MTP \
   --speculative-num-steps 2 \
   --speculative-num-draft-tokens 3
+```
+
+### AMD
+
+On MI350X/MI355X (gfx950), use tensor parallel size 4 with expert parallelism
+disabled for the BF16 or block-FP8 checkpoints. The block-FP8 path retains
+compact expert weights for its decode-specialized Gluon kernel and
+materializes BF16 expert copies once at load time for prefill. Pass
+`--sampling-backend triton`: without it AMD defaults to greedy sampling, which
+ignores per-request `temperature`, `top_p` and `top_k`.
+
+```bash
+ts serve \
+  --model zai-org/GLM-5.3-Flash \
+  --trust-remote-code \
+  --attn-tp-size 4 \
+  --ep-size 1 \
+  --sampling-backend triton \
+  --speculative-algorithm MTP \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4
 ```
 
 ## Qwen3 Dense / Qwen3 30B-A3B
