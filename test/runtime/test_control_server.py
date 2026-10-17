@@ -88,6 +88,20 @@ def _build_mock_smg() -> FastAPI:
             }
         )
 
+    @mock.post("/generate")
+    async def generate(request: Request):
+        body = await request.json()
+        if body.get("stream"):
+
+            async def _gen():
+                for tok in _STREAM_TOKENS:
+                    await asyncio.sleep(_STREAM_DELAY)
+                    yield f'data: {{"text":"{tok}"}}\n\n'
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(_gen(), media_type="text/event-stream")
+        return JSONResponse([{"text": "paris", "meta_info": {}}])
+
     @mock.post("/flush_cache")
     async def flush_cache():
         return JSONResponse({"status": "flushed"})
@@ -202,6 +216,24 @@ class TestProxyPassthrough:
         assert (last_byte_t - first_byte_t) > (
             _STREAM_DELAY
         ), "stream did not arrive incrementally"
+
+    def test_generate_streaming_is_passed_through(self):
+        """``/generate`` post-processes non-streaming bodies; a streaming
+        response has no body to inspect and must be relayed as-is."""
+        chunks = []
+        with requests.post(
+            self._url("/generate"),
+            json={"text": "hi", "sampling_params": {}, "stream": True},
+            stream=True,
+            timeout=15,
+        ) as r:
+            assert (r.status_code) == (200)
+            assert ("text/event-stream") in (r.headers.get("content-type", ""))
+            chunks = [raw.decode() for raw in r.iter_lines() if raw]
+
+        for tok in _STREAM_TOKENS:
+            assert any(f'"text":"{tok}"' in c for c in chunks), chunks
+        assert any("[DONE]" in c for c in chunks), chunks
 
     # -- bug 2: non-streaming double-encoding -------------------------------
 

@@ -355,8 +355,8 @@ async def generate(request: Request):
         return await _proxy_request(request)
     body = await _prepare_sglang_generate_body(await request.body())
     resp = await _proxy_request(request, body_override=body)
-    if not (isinstance(resp, Response) and resp.body):
-        return resp  # streaming or empty: pass through
+    if isinstance(resp, StreamingResponse) or not resp.body:
+        return resp  # streaming (no body to inspect) or empty: pass through
     try:
         parsed = json.loads(resp.body)
     except (ValueError, TypeError):
