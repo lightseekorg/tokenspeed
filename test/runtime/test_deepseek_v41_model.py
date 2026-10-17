@@ -44,8 +44,9 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
+from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.moe import moe_topk
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -61,7 +62,7 @@ from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41DecoderView,
     V41PrefillSpan,
 )
-from tokenspeed.runtime.layers.linear import LinearBase
+from tokenspeed.runtime.layers.linear import LinearBase, ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.moe import expert as expert_module
 from tokenspeed.runtime.layers.moe.expert import MoELayer
@@ -70,6 +71,8 @@ from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
 from tokenspeed.runtime.models import deepseek_v41 as v41
 from tokenspeed.runtime.models import deepseek_v41_moe as v4
+from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
+from tokenspeed.runtime.models.base.weight_update import weight_update_session
 from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41Attention,
     DeepseekV41DecoderLayer,
@@ -231,6 +234,7 @@ class _DenseFFN(nn.Module):
         )
         self.shared_experts = None
         self.use_mega_moe = False
+        self.owns_ep_communication = False
 
     def forward(
         self, x, input_ids, num_global_tokens, max_num_tokens_per_gpu, ctx, comm_manager
@@ -767,6 +771,12 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
     positions = torch.arange(4)
     previous = torch.tensor([[-1, -1, -1], [0, -1, -1], [3, 0, -1], [4, 3, 0]])
     mask = torch.ones(4, dtype=torch.bool)
+    hashes = model.engram_hash(ids, previous, mask)
+    monkeypatch.setattr(
+        model.engram_hash,
+        "forward",
+        lambda *args: pytest.fail("model recomputed Engram hashes"),
+    )
     backend = _Backend(positions, torch.zeros(4, dtype=torch.int64))
     ctx = _ctx(backend, 4, ForwardMode.EXTEND)
     captured = []
@@ -779,7 +789,7 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
         ctx,
         None,
         None,
-        engram_previous_tokens=previous,
+        engram_hash_ids=hashes,
         engram_token_mask=mask,
         image_mask=None,
     )
@@ -793,14 +803,14 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
     )
     assert not hasattr(model, "hc_head_fn") and aux is None
     assert not hasattr(model, "engram_previous_tokens")
-    with pytest.raises(RuntimeError, match="previous-three"):
+    with pytest.raises(RuntimeError, match="prepared hash IDs"):
         model(
             ids,
             positions,
             ctx,
             None,
             None,
-            engram_previous_tokens=None,
+            engram_hash_ids=None,
             engram_token_mask=mask,
             image_mask=None,
         )
@@ -809,9 +819,9 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
     adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
     nn.Module.__init__(adapter)
     forwarded = adapter.prepare_model_kwargs(
-        ctx, ids, {"engram_previous_tokens": previous, "engram_token_mask": mask}
+        ctx, ids, {"engram_hash_ids": hashes, "engram_token_mask": mask}
     )
-    assert forwarded["engram_previous_tokens"] is previous
+    assert forwarded["engram_hash_ids"] is hashes
     assert forwarded["input_embeds"] is forwarded["pp_inbound"] is None
 
 
@@ -895,7 +905,9 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
         ctx,
         None,
         None,
-        engram_previous_tokens=previous,
+        engram_hash_ids=model.engram_hash(
+            ids, previous, torch.ones(6, dtype=torch.bool)
+        ),
         engram_token_mask=torch.ones(6, dtype=torch.bool),
         image_mask=None,
     )
@@ -971,7 +983,7 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
             ctx,
             None,
             None,
-            engram_previous_tokens=previous,
+            engram_hash_ids=model.engram_hash(ids, previous, mask),
             engram_token_mask=mask,
             image_mask=None,
         )
@@ -990,7 +1002,7 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
         ctx,
         None,
         None,
-        engram_previous_tokens=previous,
+        engram_hash_ids=model.engram_hash(ids, previous, mask),
         engram_token_mask=mask,
         image_mask=None,
     )
@@ -1079,7 +1091,7 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
         ctx,
         None,
         None,
-        engram_previous_tokens=None,
+        engram_hash_ids=None,
         engram_token_mask=None,
         image_mask=None,
     )
@@ -1198,6 +1210,100 @@ def test_cuda_exact_fp8_linear_and_engram_method(monkeypatch):
     )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_blackwell_plus,
+    reason="requires Blackwell MXFP8",
+)
+@torch.inference_mode()
+def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
+    class TinyModel(BaseCausalLM):
+        def __init__(self):
+            super().__init__(
+                config=SimpleNamespace(), mapping=SimpleNamespace(), encoder_only=True
+            )
+            self.proj = ReplicatedLinear(
+                input_size=128,
+                output_size=256,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=v41_mxfp8_config(_quant()),
+                prefix="proj",
+            )
+
+        def post_load_weights(self):
+            DeepseekV41ForCausalLM.post_load_weights(self)
+
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
+    previous_pdl = pdl_enabled()
+    pdl_enabled(True)
+    try:
+        with torch.device("cuda"):
+            model = TinyModel()
+        model.load_weights(
+            [
+                (
+                    "proj.weight",
+                    torch.randn(256, 128, device="cuda").to(torch.float8_e4m3fn),
+                ),
+                (
+                    "proj.weight_scale_inv",
+                    torch.full((8, 4), 123, device="cuda", dtype=torch.uint8),
+                ),
+            ]
+        )
+        layer = model.proj
+        layer.quant_method.process_weights_after_loading(layer)
+        native = layer.quant_method.prepared_weight_scales
+        address = native.data_ptr()
+        assert set(model.state_dict()) == {"proj.weight", "proj.weight_scale_inv"}
+        x = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
+        layer(x)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured, _ = layer(x)
+        for exponent in (125, 121):
+            before = native.clone()
+            with weight_update_session([model]):
+                model.load_weights(
+                    [
+                        (
+                            "proj.weight_scale_inv",
+                            torch.full(
+                                (8, 4), exponent, device="cuda", dtype=torch.uint8
+                            ),
+                        )
+                    ]
+                )
+                torch.testing.assert_close(native, before, rtol=0, atol=0)
+                model.load_weights(
+                    [
+                        (
+                            "proj.weight",
+                            torch.randn(256, 128, device="cuda").to(
+                                torch.float8_e4m3fn
+                            ),
+                        )
+                    ]
+                )
+            assert layer.quant_method.prepared_weight_scales is native
+            assert native.data_ptr() == address
+            x.normal_()
+            graph.replay()
+            codes, scales = v41_quantize_fp8(x)
+            expected = mm(
+                codes,
+                layer.weight,
+                A_scales=scales,
+                B_scales=layer.weight_scale_inv,
+                out_dtype=x.dtype,
+                quant="mxfp8",
+                block_size=[1, 32],
+            )
+            torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+    finally:
+        pdl_enabled(previous_pdl)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "execution_mode", ["eager", "decode", "prefill", "split_prefill_graph"]
@@ -1245,7 +1351,7 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
         ctx,
         None,
         None,
-        engram_previous_tokens=previous,
+        engram_hash_ids=model.engram_hash(ids, previous, mask),
         engram_token_mask=mask,
         image_mask=None,
     )
@@ -1268,7 +1374,9 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
         _ctx(backend, 1, ForwardMode.DECODE),
         None,
         None,
-        engram_previous_tokens=torch.tensor([[6, 4, 3]], device="cuda:0"),
+        engram_hash_ids=model.engram_hash(
+            ids[:1], torch.tensor([[6, 4, 3]], device="cuda:0"), mask[:1]
+        ),
         engram_token_mask=mask[:1],
         image_mask=None,
     )
@@ -1359,7 +1467,11 @@ def _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables):
             ctx=ctx,
             input_ids=prompt[rows],
             positions=backend.query_metadata(ForwardMode.EXTEND).positions,
-            engram_previous_tokens=history[rows],
+            engram_hash_ids=adapter.model.engram_hash(
+                prompt[rows],
+                history[rows],
+                torch.ones(count, dtype=torch.bool, device=device),
+            ),
             engram_token_mask=torch.ones(count, dtype=torch.bool, device=device),
             image_mask=None,
         )
@@ -1432,6 +1544,7 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
     embeds_buf = torch.zeros((bucket, hidden_size), dtype=dtype, device=device)
     previous_buf = torch.full((bucket, 3), -1, dtype=torch.int64, device=device)
     mask_buf = torch.zeros(bucket, dtype=torch.bool, device=device)
+    hashes_buf = model.engram_hash(ids_buf, previous_buf, mask_buf)
 
     def land(prompt, positions, history):
         n = prompt.numel()
@@ -1445,6 +1558,7 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
         previous_buf[n:].fill_(-1)
         mask_buf[:n].fill_(True)
         mask_buf[n:].fill_(False)
+        hashes_buf.copy_(model.engram_hash(ids_buf, previous_buf, mask_buf))
 
     def context(tokens, bs, gather_ids, num_prefill_outputs):
         return ForwardContext(
@@ -1466,7 +1580,7 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
             ctx,
             embeds_buf,
             None,
-            engram_previous_tokens=previous_buf,
+            engram_hash_ids=hashes_buf,
             engram_token_mask=mask_buf,
             image_mask=None,
         )
@@ -1509,7 +1623,7 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
             ctx,
             embeds_buf[:decoder_bucket],
             None,
-            engram_previous_tokens=previous_buf[:decoder_bucket],
+            engram_hash_ids=hashes_buf[:decoder_bucket],
             engram_token_mask=mask_buf[:decoder_bucket],
             image_mask=None,
         )
@@ -1563,7 +1677,9 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
                     ctx=ctx,
                     input_ids=prompt[rows],
                     positions=positions,
-                    engram_previous_tokens=history[rows],
+                    engram_hash_ids=model.engram_hash(
+                        prompt[rows], history[rows], mask
+                    ),
                     engram_token_mask=mask,
                     image_mask=None,
                 ).next_token_logits
@@ -1630,6 +1746,7 @@ def _assert_decode_graph_matches_eager(adapter, backend, tables, device, steps):
     ids = torch.zeros(2, dtype=torch.int64, device=device)
     previous = torch.full((2, 3), -1, dtype=torch.int64, device=device)
     mask = torch.zeros(2, dtype=torch.bool, device=device)
+    hashes = adapter.model.engram_hash(ids, previous, mask)
     ctx = _ctx(backend, 2, ForwardMode.DECODE)
     arena = backend.cache_pool.arena.buffer
     before_capture = arena.clone()
@@ -1639,7 +1756,7 @@ def _assert_decode_graph_matches_eager(adapter, backend, tables, device, steps):
             ctx=ctx,
             input_ids=ids,
             positions=backend.query_metadata(ForwardMode.DECODE).positions,
-            engram_previous_tokens=previous,
+            engram_hash_ids=hashes,
             engram_token_mask=mask,
             image_mask=None,
         ).next_token_logits
@@ -1665,6 +1782,7 @@ def _assert_decode_graph_matches_eager(adapter, backend, tables, device, steps):
         ids.fill_(7 + step)
         previous[0] = torch.tensor([6 + step, 4 + step, 3 + step], device=device)
         mask[0] = bool(actual_bs)
+        hashes.copy_(adapter.model.engram_hash(ids, previous, mask))
         before = arena.clone()
         for replay in (False, True):
             backend.refresh_decode_metadata(
@@ -1792,7 +1910,9 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
             _ctx(backend, 4, ForwardMode.EXTEND),
             None,
             None,
-            engram_previous_tokens=previous,
+            engram_hash_ids=adapter.model.engram_hash(
+                ids, previous, torch.ones(4, dtype=torch.bool, device=device)
+            ),
             engram_token_mask=torch.ones(4, dtype=torch.bool, device=device),
             image_mask=None,
         )

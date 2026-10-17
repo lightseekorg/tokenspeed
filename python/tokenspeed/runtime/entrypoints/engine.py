@@ -43,6 +43,8 @@ from collections.abc import AsyncIterator, Iterator
 
 from tokenspeed.runtime.engine.async_llm import AsyncLLM
 from tokenspeed.runtime.engine.llm import LLM
+from tokenspeed.runtime.metrics.config import metrics_enabled
+from tokenspeed.runtime.metrics.service import metrics_service
 
 
 def _ignore_threading_atexit(*args, **kwargs) -> None:
@@ -133,6 +135,7 @@ class Engine(EngineBase):
                 kwargs["log_level"] = "error"
             server_args = ServerArgs(**kwargs)
 
+        self.server_args = server_args
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
@@ -141,11 +144,14 @@ class Engine(EngineBase):
         logger.info(f"server_args={server_args!r}")
 
         # Launch subprocesses
-        tokenizer_manager, _, scheduler_info = _launch_subprocesses(
-            server_args=server_args,
-            port_args=self.port_args,
-        )
-        self.server_args = server_args
+        try:
+            tokenizer_manager, _, scheduler_info = _launch_subprocesses(
+                server_args=server_args,
+                port_args=self.port_args,
+            )
+        except BaseException:
+            self.shutdown()
+            raise
         self.tokenizer_manager = tokenizer_manager
         self.scheduler_info = scheduler_info
 
@@ -292,6 +298,7 @@ class Engine(EngineBase):
             logger.exception("Failed to close the disaggregation bootstrap server")
         finally:
             kill_process_tree(os.getpid(), include_parent=False)
+            metrics_service.close(timeout=2.0)
 
     def __enter__(self):
         return self
@@ -526,6 +533,16 @@ def _set_socket_interface(server_args: ServerArgs):
     logger.info(f"socket interface reaching {head}: {interface}")
 
 
+def _force_env(owner: str, key: str, value: str) -> None:
+    """Set ``key`` to ``value``: ``owner``'s promise beats the ambient
+    environment, so a conflicting value is replaced, loudly, instead of
+    silently voiding it."""
+    prior = os.environ.get(key)
+    if prior is not None and prior != value:
+        logger.warning(f"{owner} replaces {key}={prior} with {value}")
+    os.environ[key] = value
+
+
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -535,34 +552,52 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+    if getattr(server_args, "_beam_checkpoint", False) is None:
+        # A hub id the local cache does not hold yet (a first launch): fetch
+        # its config.json now, before any process starts.
+        server_args.resolve_model_defaults(download=True)
+        if server_args._beam_checkpoint:
+            # Beam's all-reduce fusion default across nodes reads the
+            # checkpoint as well (ServerArgs.resolve_communication): resolve
+            # it again from the downloaded file, as from a directory, so that
+            # every node of a launch decides it from the same config.json
+            # whatever its cache held when its arguments resolved.
+            server_args.resolve_communication()
+            server_args.resolve_numerics()
+        if server_args._beam_checkpoint is None and not server_args.disable_tf32:
+            logger.warning(
+                f"Cannot read the config.json of {server_args.model} before "
+                "launch, so TF32 stays at its default. For a Beam checkpoint, "
+                "pass its local directory as --model or pass --disable-tf32 so "
+                "that its FP32 router runs without TF32."
+            )
     if not server_args.disable_tf32:
         # Force TF32 on for cuBLAS/cuDNN matmuls. setdefault so a user's
         # explicit env wins; --disable-tf32 is the documented opt-out.
         os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "1")
         os.environ.setdefault("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
+    if getattr(server_args, "_beam_checkpoint", False):
+        # Beam serves without TF32 (ServerArgs.resolve_model_defaults): both
+        # switches off for the processes started below, whatever the caller
+        # exported.
+        for key in ("NVIDIA_TF32_OVERRIDE", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"):
+            _force_env("Beam (no TF32)", key, "0")
     if server_args.numerics in BITWISE_ENVELOPES:
         # Bitwise envelopes: no TF32 anywhere, and pin NCCL to one
         # algorithm/protocol so the reduction association order cannot switch
         # with message size. The envelope's promise beats ambient
-        # environment: a conflicting value is replaced, loudly, instead of
-        # silently voiding the contract.
+        # environment (_force_env).
         for key, value in (
             ("NVIDIA_TF32_OVERRIDE", "0"),
             ("NCCL_ALGO", "Ring"),
             ("NCCL_PROTO", "Simple"),
         ):
-            prior = os.environ.get(key)
-            if prior is not None and prior != value:
-                logger.warning(
-                    f"--numerics {server_args.numerics} replaces {key}={prior} "
-                    f"with {value}"
-                )
-            os.environ[key] = value
+            _force_env(f"--numerics {server_args.numerics}", key, value)
 
     _set_socket_interface(server_args)
 
     # Set prometheus env vars
-    if server_args.enable_metrics:
+    if metrics_enabled(server_args, "prometheus"):
         set_prometheus_multiproc_dir()
 
     # Set ulimit
@@ -601,6 +636,7 @@ def _launch_subprocesses(
     # Configure global environment
     configure_logger(server_args)
     _set_envs_and_config(server_args)
+    metrics_service.prepare(server_args)
 
     # Allocate ports for inter-process communications
     if port_args is None:
@@ -611,6 +647,8 @@ def _launch_subprocesses(
     server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
         server_args.model, server_args.tokenizer
     )
+
+    metrics_service.start(server_args, port_args)
 
     scheduler_procs = []
     if not server_args.mapping.attn.has_dp:
@@ -658,7 +696,9 @@ def _launch_subprocesses(
             return None, None, None
 
         launch_dummy_health_check_server(
-            server_args.host, server_args.port, server_args.enable_metrics
+            server_args.host,
+            server_args.port,
+            metrics_enabled(server_args, "prometheus"),
         )
 
         for proc in scheduler_procs:
@@ -722,19 +762,6 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
 
     configure_logger(server_args)
     _set_envs_and_config(server_args)
-    # Headless runs no dummy health-check server on any node, so every node
-    # serves its own /metrics here.
-    launch_metrics_server(server_args)
-
-    # PortArgs is still derived (nccl_port drives torch.distributed); the pickle
-    # scheduler_input/tokenizer IPC names it carries are unused in msgpack mode.
-    port_args = PortArgs.init_new(server_args)
-    logger.info(f"headless server_args={server_args!r}")
-
-    server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
-        server_args.model, server_args.tokenizer
-    )
-
     scheduler_procs: list[mp.Process] = []
     scheduler_pipe_readers = []
 
@@ -753,38 +780,51 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
             if proc.is_alive():
                 proc.terminate()
 
-    # Install before spawning so a signal in the launch window is not lost;
-    # an unhandled SIGUSR1 would kill this supervisor without cleanup.
-    signal.signal(signal.SIGTERM, _terminate_schedulers)
-    signal.signal(signal.SIGINT, _terminate_schedulers)
-    signal.signal(signal.SIGUSR1, _terminate_schedulers)
-
-    if not server_args.mapping.attn.has_dp:
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
-        )
-        for rank in _scheduler_ranks(server_args):
-            rank_server_args = copy.copy(server_args)
-            rank_server_args.mapping = copy.deepcopy(server_args.mapping)
-            rank_server_args.mapping.rank = rank
-
-            proc, reader = start_process_with_ready_pipe(
-                run_event_loop,
-                (rank_server_args, port_args),
-                memory_saver_adapter.configure_subprocess(),
-            )
-            scheduler_procs.append(proc)
-            scheduler_pipe_readers.append(reader)
-    else:
-        proc, reader = start_process_with_ready_pipe(
-            run_data_parallel_controller_process,
-            (server_args, port_args),
-            contextlib.nullcontext(),
-        )
-        scheduler_pipe_readers.append(reader)
-        scheduler_procs.append(proc)
-
     try:
+        metrics_service.prepare(server_args)
+        # Headless runs no dummy health-check server on any node, so every node
+        # serves its own /metrics here.
+        launch_metrics_server(server_args)
+
+        # PortArgs is still derived (nccl_port drives torch.distributed); the
+        # pickle scheduler_input/tokenizer IPC names are unused in msgpack mode.
+        port_args = PortArgs.init_new(server_args)
+        logger.info(f"headless server_args={server_args!r}")
+        server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
+            server_args.model, server_args.tokenizer
+        )
+
+        # Install before spawning so a signal in the launch window is not lost;
+        # an unhandled SIGUSR1 would kill this supervisor without cleanup.
+        signal.signal(signal.SIGTERM, _terminate_schedulers)
+        signal.signal(signal.SIGINT, _terminate_schedulers)
+        signal.signal(signal.SIGUSR1, _terminate_schedulers)
+
+        metrics_service.start(server_args, port_args)
+        if not server_args.mapping.attn.has_dp:
+            memory_saver_adapter = TorchMemorySaverAdapter.create(
+                enable=server_args.enable_memory_saver
+            )
+            for rank in _scheduler_ranks(server_args):
+                rank_server_args = copy.copy(server_args)
+                rank_server_args.mapping = copy.deepcopy(server_args.mapping)
+                rank_server_args.mapping.rank = rank
+
+                proc, reader = start_process_with_ready_pipe(
+                    run_event_loop,
+                    (rank_server_args, port_args),
+                    memory_saver_adapter.configure_subprocess(),
+                )
+                scheduler_procs.append(proc)
+                scheduler_pipe_readers.append(reader)
+        else:
+            proc, reader = start_process_with_ready_pipe(
+                run_data_parallel_controller_process,
+                (server_args, port_args),
+                contextlib.nullcontext(),
+            )
+            scheduler_pipe_readers.append(reader)
+            scheduler_procs.append(proc)
         for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):
             if data.get("status") != "ready":
                 raise RuntimeError(
@@ -826,7 +866,9 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
         _terminate_schedulers()
         for proc in scheduler_procs:
             proc.join(timeout=5)
-        kill_process_tree(os.getpid(), include_parent=False)
+        if scheduler_procs:
+            kill_process_tree(os.getpid(), include_parent=False)
+        metrics_service.close(timeout=2.0)
 
 
 def run_scheduler_headless_from_cli(argv: list[str] | None = None) -> None:

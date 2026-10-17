@@ -148,7 +148,9 @@ def _commit_state_pages_kernel(
         tl.extra.cuda.gdc_wait()
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     live = row < bs
-    # The target token always advances state, so a round commits at least one.
+    # A live round always advances state by the target token, so it commits
+    # at least one. A stopped request keeps none, but its row is padding
+    # (live page -1), so the commit writes nothing for it.
     steps = tl.minimum(
         tl.maximum(tl.load(accepted + row, mask=live, other=1).to(tl.int64), 1),
         draft_tokens,

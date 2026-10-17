@@ -58,29 +58,49 @@ if platform.is_nvidia and platform.is_blackwell:
     # FA4 on Blackwell supports prefill head_dim in [8, 256] divisible by 8,
     # but the 256-wide MHA path mishandles non-contiguous V split views, so we
     # restrict it to <256 for now until that is resolved.
-    # Keep the plain MHA registrations capped at SM100 so B300 retains its
-    # FlashInfer route.
     _FA4_BLACKWELL_PREFILL_HEAD_DIMS = frozenset(range(8, 256, 8))
     _FA4_BLACKWELL_DECODE_HEAD_DIMS = frozenset(range(8, 129, 8))
+
+    def _register_fa4_mha(mode: str, name: str, *, signatures, traits):
+        """Register a plain FA4 MHA kernel for SM100 and SM103.
+
+        SM100 selects FA4 first. On SM103 it ranks below every other kernel, so
+        it serves explicit fa4 requests and B300's default selection is unchanged.
+        """
+
+        def decorate(impl):
+            for arch, suffix, priority in (
+                (ArchVersion(10, 0), "", Priority.SPECIALIZED),
+                (ArchVersion(10, 3), "_sm103", Priority.REFERENCE),
+            ):
+                register_kernel(
+                    "attention",
+                    mode,
+                    name=f"{name}{suffix}",
+                    solution="fa4",
+                    capability=CapabilityRequirement(
+                        min_arch_version=arch,
+                        max_arch_version=arch,
+                        vendors=frozenset({"nvidia"}),
+                    ),
+                    signatures=signatures,
+                    priority=priority,
+                    traits=traits,
+                )(impl)
+            return impl
+
+        return decorate
 
     import inspect
 
     _FA4_HAS_BLOCKSCALED = "sfq" in inspect.signature(flash_attn_varlen_func).parameters
 
-    @register_kernel(
-        "attention",
+    @_register_fa4_mha(
         "mha_prefill",
-        name="fa4_mha_prefill",
-        solution="fa4",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
+        "fa4_mha_prefill",
         signatures=format_signatures(
             ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_PREFILL_HEAD_DIMS,
             "logit_cap": frozenset({False}),
@@ -125,20 +145,12 @@ if platform.is_nvidia and platform.is_blackwell:
             return out, lse.transpose(0, 1).contiguous()
         return out
 
-    @register_kernel(
-        "attention",
+    @_register_fa4_mha(
         "mha_extend_with_kvcache",
-        name="fa4_mha_extend_with_kvcache",
-        solution="fa4",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
+        "fa4_mha_extend_with_kvcache",
         signatures=format_signatures(
             ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "is_causal": frozenset({False, True}),
@@ -190,20 +202,12 @@ if platform.is_nvidia and platform.is_blackwell:
             return out, lse.transpose(0, 1).contiguous()
         return out
 
-    @register_kernel(
-        "attention",
+    @_register_fa4_mha(
         "mha_decode_with_kvcache",
-        name="fa4_mha_decode_with_kvcache",
-        solution="fa4",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
+        "fa4_mha_decode_with_kvcache",
         signatures=format_signatures(
             ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "logit_cap": frozenset({False}),
@@ -258,18 +262,10 @@ if platform.is_nvidia and platform.is_blackwell:
         ("q", "k_cache", "v_cache"), "dense", {torch.float8_e4m3fn}
     )
 
-    @register_kernel(
-        "attention",
+    @_register_fa4_mha(
         "mha_extend_with_kvcache",
-        name="fa4_mha_extend_with_kvcache_fp8",
-        solution="fa4",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
+        "fa4_mha_extend_with_kvcache_fp8",
         signatures=_FA4_FP8_DENSE_SIGNATURES,
-        priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "is_causal": frozenset({False, True}),
@@ -318,18 +314,10 @@ if platform.is_nvidia and platform.is_blackwell:
         )
         return out
 
-    @register_kernel(
-        "attention",
+    @_register_fa4_mha(
         "mha_decode_with_kvcache",
-        name="fa4_mha_decode_with_kvcache_fp8",
-        solution="fa4",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 0),
-            vendors=frozenset({"nvidia"}),
-        ),
+        "fa4_mha_decode_with_kvcache_fp8",
         signatures=_FA4_FP8_DENSE_SIGNATURES,
-        priority=Priority.SPECIALIZED,
         traits={
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "logit_cap": frozenset({False}),

@@ -66,6 +66,14 @@ class CommBackend(ABC):
 
     # ---- Collective ops ----
 
+    def get_prepared_all_gather(self, group: Group, dtype: torch.dtype):
+        """Return a prepared column all-gather allowed by this backend's policy."""
+        return None
+
+    def broadcast_from_first_rank(self, tensor: torch.Tensor, group: Group) -> bool:
+        """Broadcast in place when prepared; otherwise let the caller fall back."""
+        return False
+
     def prepare_projection(
         self, spec: "ProjectionSpec", scratch_pool: "WorkspacePool | None" = None
     ) -> "ProjectionWorkspace":

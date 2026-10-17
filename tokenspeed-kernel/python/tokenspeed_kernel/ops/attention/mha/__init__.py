@@ -29,6 +29,7 @@ from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import select_kernel, spec_matches_traits
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
+    ScaleFormat,
     dense_tensor_format,
     format_signature,
     tensor_format,
@@ -39,6 +40,10 @@ AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 
 # One UE8M0 scale per 32 consecutive head_dim elements (MXFP8).
 MXFP8_ATTENTION_BLOCK_SCALE = MXFP8_BLOCK_SCALE
+# One fp32 scale per K or V cache tensor (a layer's per-tensor scaled FP8 cache).
+FP8_ATTENTION_TENSOR_SCALE = ScaleFormat(
+    storage_dtype=torch.float32, granularity="tensor"
+)
 
 
 def _attention_format_signature(**roles: torch.Tensor):
@@ -65,12 +70,29 @@ def _blockscaled_signature_and_scales(
     q_scale: torch.Tensor | None,
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
+    fp8_kv_scales: tuple[float, float] | None,
 ):
-    """Pick dense vs MXFP8 signature and build the scale kwargs splat.
+    """Pick dense vs MXFP8 vs per-tensor scaled FP8 signature and build the
+    scale kwargs splat.
 
     q_scale selects the block-scaled path; k_scale/v_scale must accompany it.
+    fp8_kv_scales selects a per-tensor scaled FP8 cache, which only kernels
+    declaring that signature (and so taking ``fp8_kv_scales``) serve.
     Returns (signature, scale_kwargs) for the paged-KV-cache entry points.
     """
+    if fp8_kv_scales is not None:
+        assert (
+            q_scale is None and k_scale is None and v_scale is None
+        ), "a cache is MXFP8 or per-tensor scaled, not both"
+        scale = FP8_ATTENTION_TENSOR_SCALE
+        signature = format_signature(
+            q=dense_tensor_format(q.dtype),
+            k_cache=tensor_format("scaled-fp8", k_cache.dtype, scale=scale),
+            v_cache=tensor_format("scaled-fp8", v_cache.dtype, scale=scale),
+        )
+        return signature, dict(
+            q_scale=None, k_scale=None, v_scale=None, fp8_kv_scales=fp8_kv_scales
+        )
     if q_scale is not None:
         assert (
             k_scale is not None and v_scale is not None
@@ -296,6 +318,7 @@ def mha_extend_with_kvcache(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    fp8_kv_scales: tuple[float, float] | None = None,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
@@ -329,13 +352,16 @@ def mha_extend_with_kvcache(
             (interleaved [num_pages, num_kv_heads, 32, 4, 4] atom at
             page_size 128).
         v_scale: MXFP8 block scales for v_cache, same layout as k_scale.
+        fp8_kv_scales: ``(k_scale, v_scale)`` of a per-tensor scaled FP8
+            cache, whose rows hold ``K / k_scale`` and ``V / v_scale``;
+            ``None`` for a unit-scale cache.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
     Each request's query tokens attend all visible cached KV tokens.
     """
     signature, scale_kwargs = _blockscaled_signature_and_scales(
-        q, k_cache, v_cache, q_scale, k_scale, v_scale
+        q, k_cache, v_cache, q_scale, k_scale, v_scale, fp8_kv_scales
     )
 
     # Select kernel
@@ -425,6 +451,7 @@ def mha_decode_with_kvcache(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    fp8_kv_scales: tuple[float, float] | None = None,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
@@ -455,11 +482,14 @@ def mha_decode_with_kvcache(
             (interleaved [num_pages, num_kv_heads, 32, 4, 4] atom at
             page_size 128).
         v_scale: MXFP8 block scales for v_cache, same layout as k_scale.
+        fp8_kv_scales: ``(k_scale, v_scale)`` of a per-tensor scaled FP8
+            cache, whose rows hold ``K / k_scale`` and ``V / v_scale``;
+            ``None`` for a unit-scale cache.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
     """
     signature, scale_kwargs = _blockscaled_signature_and_scales(
-        q, k_cache, v_cache, q_scale, k_scale, v_scale
+        q, k_cache, v_cache, q_scale, k_scale, v_scale, fp8_kv_scales
     )
 
     # Select kernel

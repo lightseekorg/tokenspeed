@@ -89,8 +89,8 @@ switch an envelope folds is also available individually under `auto`.
 | Parameter | Purpose |
 | --- | --- |
 | `--numerics {auto,rl-bitwise}` | `auto` keeps every performance default. `rl-bitwise` folds the determinism switches (`--batch-invariant-collectives`, `--disable-autotune`, `--disable-tf32`, `--disable-pdl`, no fused all-reduce, `--moe-backend aok`, `--sampling-stream per-request`, `--dsa-slot-order sorted`) so tokens and logprobs are bitwise identical across runs and batch compositions, and the trainer-operation-order switches below so a teacher-forced pass reproduces the RL trainer's logprobs. Needs MoE TP 1 and a vocabulary that is a multiple of 32768; a model serves it only once its profile lists it. |
-| `--batch-invariant-collectives` | One association order per reduction, independent of the batch: a 2-D bf16 all-reduce on a multicast-reachable group runs as the NVLS in-switch reduction issued by one fixed rank (verified bitwise at startup), every other reduction as NCCL data movement plus a fixed-rank-order fp32 fold; gathers keep the multicast kernels. Folded in by `rl-bitwise`. |
-| `--force-deterministic-rsag` | NCCL and the fold only: no symmetric-memory path (multicast gathers, in-switch all-reduce, the trtllm/Triton all-reduce tiers, distributed argmax). Not folded in by `rl-bitwise`; the escape when the startup self-check refuses the switch. |
+| `--batch-invariant-collectives` | One association order per reduction, independent of the batch: every reduction runs as NCCL data movement plus a fixed-rank-order fp32 fold (an all-reduce costs world_size x the traffic); gathers keep the multicast kernels. Folded in by `rl-bitwise`. |
+| `--force-deterministic-rsag` | NCCL and the fold only: no symmetric-memory path (multicast gathers, the trtllm/Triton all-reduce tiers, distributed argmax). Not folded in by `rl-bitwise`, under which it only moves the gathers to NCCL. |
 | `--sampling-stream {batch,per-request}` | `per-request` draws every non-greedy row from a stream keyed by the request's seed and position only, so a request samples the same tokens alone and inside any batch. Folded in by `rl-bitwise`. |
 | `--yarn-ramp-mask-device {cuda,cpu}` | Device that computes the `deepseek_yarn` RoPE inverse frequencies (position frequencies, both divisions and the YaRN linear ramp mask) before the table is moved to the model device once; the trainer builds it on the host. Folded to `cpu` by `rl-bitwise`. |
 | `--mla-lora-scale {folded,runtime}` | Where LongCat-style MLA applies its `sqrt(hidden / lora_rank)` norm scales: folded into the norm weights at load, or multiplied at runtime after `q_b_proj` / `kv_a_layernorm` as the trainer does. Folded to `runtime` by `rl-bitwise`. |
@@ -215,7 +215,17 @@ scheduler drive (SMG) carries sampled-token logprobs only: it refuses a
 `logprob_start_len` that would produce prompt logprobs rather than compute
 and drop them.
 
-`top_logprobs_num > 0` and `token_ids_logprob` are not supported yet.
+`top_logprobs_num=k` (1 to 20) adds each position's `k` most likely tokens,
+most likely first, as `(logprob, token_id, text|null)` triples:
+`meta_info["input_top_logprobs"]` beside the prompt logprobs (`null` for the
+first position, like its value) and `meta_info["output_top_logprobs"]`
+beside the sampled token. They come from the same fp32 log-softmax as the
+values. The engine computes them where the forward runs eagerly, so the
+ingress takes `top_logprobs_num` only for a request whose every token is
+sampled in its prefill (`max_new_tokens` 0 or 1, as an `echo` scoring request
+sends) and with `--logprob-order torch`; a longer generation, pipeline
+parallelism and disaggregated prefill and decode get a 400, and the direct
+msgpack scheduler drive refuses it. `token_ids_logprob` is not supported yet.
 
 This runtime requires a `tokenspeed-scheduler` build that has
 `RequestSpec.max_cached_prefix_tokens` (the admission-probe bound; see
@@ -501,7 +511,7 @@ for the online variant.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. Names are checked against the backend registry at startup, after plugins load, so an installed plugin's backends are accepted too. |
+| `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. Names are checked against the backend registry at startup, after plugins load, so an installed plugin's backends are accepted too. On SM103 (B300/GB300), `fa4` ranks below every other attention kernel: naming it here or in `--drafter-attention-backend` selects it, and the default selection is unchanged. |
 | `--drafter-attention-backend` | Attention backend for speculative decoding drafter model; accepts the same names as `--attention-backend`. |
 | `--moe-backend` | MoE backend. |
 | `--moe-mxfp4-fp8-activation` | Opt-in: run MXFP4 routed experts with FP8 activations. On Hopper this is the FlashInfer cutlass W4A8 MoE (faster than the default W4A16 kernel, a few percent of extra error on expert outputs). Applies to every MXFP4 expert layer, target and draft; startup fails where the selected MoE backend has no FP8-activation kernel for a layer, when a model's routed experts are not MXFP4, when the model pins another activation precision (Kimi-K3 on Hopper Marlin), or when the layer's SwiGLU is unclamped (the W4A8 FC2 scale relies on the clamp). |
@@ -543,6 +553,14 @@ Common reasoning parser values include `kimi_k25`, `base`, `qwen3`,
 `kimik2`, `qwen`, `deepseek_v4`, `json`, and `passthrough`. The SMG gateway
 validates the parser names, so use the values accepted by the bundled
 `tokenspeed-smg` package.
+
+When neither parser is named and the model family has no parser defaults,
+`ts serve` passes `--reasoning-parser passthrough` to the gateway, unless the
+model's `tokenizer_config.json` declares a `response_template` and no other
+`--tokenizer` is given: `ts serve` then passes `--parser symphony`,
+`--reasoning-parser hf`, and `--tool-call-parser hf` so the bundled
+`tokenspeed-smg` gateway selects both parsers from that template. Naming any
+parser option keeps its existing behavior.
 
 ## Speculative decoding
 
@@ -717,6 +735,7 @@ path. One Triton kernel per verify step walks it. The target's verification
 step applies a request's `temperature`, `top_k` and `top_p`, never the
 proposal, so the served distribution is the target's whatever the drafter
 proposed.
+`DFlash2BeamDraftModel`, Beam's drafter, is a DFlash2 drafter as well.
 
 On a prefill server with `--pipeline-parallel-size > 1`, TokenSpeed accepts
 speculation for `MTP` and `DSPARK` only. The drafter runs on the last stage,
@@ -754,8 +773,9 @@ the draft's attention to the full history.
 | `--enable-log-requests` | Log request metadata and optionally payloads. On by default; `--no-enable-log-requests` disables. |
 | `--log-requests-level` | Request logging verbosity. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
-| `--enable-metrics` | Enable metrics reporting and serve the engine's Prometheus metrics over HTTP (see "Prometheus metrics" below). |
-| `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
+| --enable-metrics | Enable the selected metrics reporters. |
+| --metrics-reporters | Select prometheus or an installed metric output; repeat for multiple. Defaults to prometheus. |
+| --metrics-reporter-config | JSON file mapping external reporter names to their settings. See [metric output plugins](../metrics-plugins.md). |
 | `--metrics-port` | Port for the engine's `/metrics` HTTP endpoint. Defaults to an automatically allocated free port (logged at startup). |
 | `--metrics-host` | Bind host for the `/metrics` endpoint. Defaults to `--host`. |
 | `--decode-log-interval` | Decode batch log interval. |
@@ -797,9 +817,13 @@ is intentionally verbose. Enable it only while debugging. For
 decode-only batches it also logs the anchor, draft candidates, target verify
 tokens, and their position-wise matches.
 
+To send observations to another monitoring system, install and select a
+[metric output plugin](../metrics-plugins.md). Selecting only external outputs
+does not start a Prometheus endpoint.
+
 ### Prometheus metrics
 
-With `--enable-metrics`, every engine process on a node (scheduler ranks and
+With --enable-metrics and the prometheus reporter, every engine process on a node (scheduler ranks and
 the tokenizer manager) writes its metrics to a node-local
 `PROMETHEUS_MULTIPROC_DIR`, and the engine's main process aggregates and
 serves them as `GET /metrics` in Prometheus text format. Scrape it at
@@ -1245,3 +1269,7 @@ ubuntu job boots `mooncake_master` and runs
 `MOONCAKE_MASTER=host:port`.
 Mooncake Store is the offload backend. PD KV transfer still uses the
 separate Mooncake TransferEngine (`--disaggregation-transfer-backend`).
+On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
+(unless it is already set) so Mooncake's handshake uses IPv6. The Mooncake L3
+store client reads `MC_USE_IPV6` on its own when the store starts, so export
+`MC_USE_IPV6=1` yourself when the L3 store runs on an IPv6 host.

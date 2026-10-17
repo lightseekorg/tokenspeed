@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterable
 
@@ -30,6 +31,7 @@ __all__ = [
     "FormatSignature",
     "ScaleFormat",
     "TensorFormat",
+    "dense_format_signature",
     "dense_tensor_format",
     "format_signature",
     "tensor_format",
@@ -232,6 +234,27 @@ def format_signature(
     return FormatSignature(
         tuple(roles.items()),
         frozenset({None}) if layouts is None else frozenset(layouts),
+    )
+
+
+@functools.cache
+def dense_format_signature(
+    roles: tuple[str, ...], storage_dtypes: tuple[torch.dtype, ...]
+) -> FormatSignature:
+    """Cached signature of dense, unscaled roles for per-call dispatchers.
+
+    Args:
+        roles: Logical tensor roles.
+        storage_dtypes: Physical dtype of each role, in ``roles`` order.
+
+    Returns:
+        The ``format_signature`` of those roles; repeat calls return the same object.
+    """
+    return format_signature(
+        **{
+            role: dense_tensor_format(dtype)
+            for role, dtype in zip(roles, storage_dtypes, strict=True)
+        }
     )
 
 

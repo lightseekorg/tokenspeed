@@ -43,7 +43,9 @@ LABELS = {"model_name": "m", "app_key": "k"}
 
 
 def _make(registry: CollectorRegistry, *, enabled: bool = True) -> KVTransferMetrics:
-    return KVTransferMetrics(LABELS, enabled=enabled, registry=registry)
+    return KVTransferMetrics(
+        LABELS, reporters=["prometheus"], enabled=enabled, registry=registry
+    )
 
 
 def test_disabled_records_nothing() -> None:

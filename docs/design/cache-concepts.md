@@ -74,20 +74,6 @@ A fourth quantity lives outside the logical world entirely:
   `config.kernel_page_size` overrides any default; deriving kernel_page_size
   from `prefix_granularity` is a category error and a bug.
 
-  DeepSeek V4's geometry is fully
-  registry-sourced: the compressed full-history chains declare
-  `DEEPSEEK_V4_PAGE_SIZE // ratio` rows × ratio-token stride, the SWA
-  window declares `V4_KERNEL_BLOCK_ROWS`, and the layout's field byte
-  shapes are built from the kernel page constant — nothing derives from
-  `prefix_granularity`. The V4 backend's scalar is therefore a true
-  registry-sourced `kernel_page_size` (config-overridable), and the
-  scheduler grain is free: any positive multiple of the kernel page is
-  accepted (asserted at backend construction and in the recipe's
-  `check_layout`). The V4 architecture spec defaults P to exactly one kernel
-  page by naming `DEEPSEEK_V4_PAGE_SIZE` as its
-  `default_prefix_granularity` — the registry constant itself, not a second
-  copy of the number.
-
 ### Physical world (storage units)
 
 * **`CacheBlock`** (and its aggregation, the **LCM block**) is the unit of
@@ -245,6 +231,23 @@ null slot 0 also means "read slot 1" for the rows the runtime fabricates
 (capture dummies) and for the decode role's landing row. Speculative verify
 commits the accepted state into slot 1 unconditionally
 (`commit_state_pages`).
+
+A slot's state block is a whole snapshot, so the token count that keys it
+must be exactly the tokens it consumed. The device therefore ends a request
+where the control plane does: the sampling epilogue cuts every round's
+accepted width at the request's first stop token and its token limit
+(`RuntimeStates.apply_stop_conditions`, the stop set the finish check reads),
+before the commit, the frontier or the drafter reads it, and marks the slot
+stopped. A decode the overlap schedule already dispatched behind that round
+runs the request as a padding row—both slots `-1`
+(`RuntimeStates.masked_state_tables`): it reads the zero state, writes
+nothing, and keeps no token. (Pipeline parallelism serves only the prefill
+role, which neither decodes nor overlaps, so its stages, which do not sample,
+never run a forward behind a stopped request.) The finish checkpoint is thus the state before
+the stop token under every schedule ([Scheduler
+§1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)); a finish
+dispatched as a rotating first decode publishes at the prompt end, where the
+prompt-end checkpoint it still holds in slot 0 is the canonical block.
 
 A **natural checkpoint** is a state block that exists because a forward ended
 there -- the prompt end (the block rotated out of slot 1 as the first decode
@@ -1094,7 +1097,10 @@ layers ──group──▶ groups ──pack──▶ CacheLayout ──bind─
   plane sizes, per-field offsets and page strides, and how many of each
   group's CacheBlocks share a parent (`cache_blocks_per_lcm_block`). The
   result, `CacheLayout`, is **capacity-independent** — it describes one
-  parent, not an allocation.
+  parent, not an allocation. A parent's bytes are exactly its planes': each
+  plane is already a multiple of every tenant's packing, so the parent is not
+  rounded up again to the LCM of all the packings, which only added bytes no
+  field addresses.
 * **`bind`** (`CacheLayout.bind(num_lcm_blocks)`) multiplies that parent out
   by a count and yields the `CacheMemoryPlan` the arena allocates from and
   the PD wire carries.
@@ -1166,8 +1172,9 @@ draft layer of a target attention layer's K/V bytes fills state segments, any
 other pads the state groups (`recipes/qwen35.py`). Nemotron-H's Mamba2 runs
 are four or five layers long; its recipe splits the attention layers into two
 KV groups (`recipes/mamba2.py`).
-KV pages pad by their share of the conv planes, about 1.5% for Nemotron-3 Super
-and 1-2% for Qwen3.5.
+Qwen3.5's state groups leave segments free, so its conv windows pack into them
+and KV pages carry no padding; Nemotron-3 Super's state groups fill every
+segment, so its KV pages pad by their share of the conv planes, about 1.5%.
 
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
@@ -1784,13 +1791,8 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   (`backends/paged/write_locations.py`, failing to slot 0 — the reserved dummy
   page) and the token-shaped resolve
   (`attention/page_table.py::group_slot_mapping_from_raw` +
-  `safe_page_ids` / `mask_invalid_graph_tokens`, failing closed to the
-  `-1` skip sentinel for group buffers with no dummy page). DeepSeek-V4 is
-  a *composer*, not an owner: its SWA / compressor-state / indexer-state
-  writes call the shared token-shaped resolve over its delivered tables;
-  only the compression-boundary orchestration (per-ratio strides, boundary
-  masks, the fused dsv4 kernel) is V4-specific
-  (`kv_cache/hybrid_deepseek_v4.py`).
+  `safe_page_ids`, failing closed to the `-1` skip sentinel for group
+  buffers with no dummy page).
 
 ### Principle 6 — provenance discipline: fixed
 
@@ -1865,10 +1867,10 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   V4.1's same-checkpoint DSpark. ✓
 * Capacity has three shapes and no more, and one place to read the scheduler's
   concurrency (see *The cache pipeline* above). ✓
-* Kernel geometry does not live under the recipes package. DeepSeek V4's byte
+* Kernel geometry does not live under the recipes package. DeepSeek V4.1's byte
   formulas, cache layout and group-id vocabulary sit in
-  `attention/deepseek_v4_geometry.py`, which the backends, ops, model and pool
-  read directly; the recipe depends on it, not the reverse. ✓
+  `attention/deepseek_v41_geometry.py`, which the backend, model and pool read
+  directly; the recipe depends on it, not the reverse. ✓
 * One kernel layout has one definition. The interleaved mxfp8 KV-scale planes
   come from `plan.mxfp8_kv_scale_fields`, which also owns the page-span and
   head-dim constraints that layout imposes, so no recipe restates the shape or

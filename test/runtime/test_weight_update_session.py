@@ -215,7 +215,7 @@ def test_a_non_unit_kv_scale_is_loaded_derived_and_then_rejected(model):
 
 
 def test_kv_scales_are_not_screened_outside_a_session(model):
-    # The initial load screens the checkpoint itself (require_unit_kv_scales).
+    # The startup load takes the scales out itself (split_kv_cache_scales).
     model.load_weights([("layers.0.attn.k_scale", torch.tensor([2.0]))])
     assert model.post_load_calls == 2
 

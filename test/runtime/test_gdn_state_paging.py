@@ -207,6 +207,13 @@ class TestComputeStatePageIndicesTest:
         with pytest.raises((ValueError)):
             self._run([[0, -1]], [5])
 
+    def test_padding_rows_read_and_write_nothing(self):
+        # Both slots -1: a graph padding row or a request the device stopped
+        # behind an in-flight forward. Kernels skip negative blocks.
+        state_in, state_out = self._run([[-1, -1], [0, 8], [-1, -1]], [9, 9, 4])
+        assert (state_in.tolist()) == ([-1, 8, -1])
+        assert (state_out.tolist()) == ([-1, 8, -1])
+
     def test_claimed_checkpoint_equal_to_live_block_raises(self):
         with pytest.raises((ValueError), match=("same block")):
             self._run([[7, 7]], [4])
@@ -1019,10 +1026,10 @@ class TestGDNStatePagingGPUTest:
             CAUSAL_CONV1D_BLOCK_M,
             build_causal_conv1d_prefill_metadata,
         )
-
-        from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+        from tokenspeed_kernel.ops.conv import (
             causal_conv1d_fn,
         )
+
         from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
 
         H, D = self.H, self.D

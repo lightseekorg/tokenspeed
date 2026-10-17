@@ -393,13 +393,13 @@ def test_nvfp4_situ_megamoe(tune, monkeypatch):
                 MegaMoERunner,
             )
 
-            # Cover both layouts and schedulers; torchrun --autotune uses the full sweep.
+            # Cover both tile widths and schedulers; torchrun uses the full sweep.
             with patch.object(
                 MegaMoERunner,
                 "TACTICS",
                 (
                     (128, 512, "static", "epi_warps", 1),
-                    (256, 1024, "atomic_counter", "reuse_dispatch_warps", 8),
+                    (256, 1024, "atomic_counter", "epi_warps", 8),
                 ),
             ):
                 set_autotune_process_group(dist.group.WORLD)

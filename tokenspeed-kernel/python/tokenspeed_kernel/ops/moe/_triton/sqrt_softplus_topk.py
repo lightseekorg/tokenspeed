@@ -40,6 +40,7 @@ def _sqrt_softplus_topk_kernel(
     bias_stride,
     hash_stride_m,
     hash_stride_k,
+    scale,
     EXPERTS: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_E: tl.constexpr,
@@ -98,6 +99,7 @@ def _sqrt_softplus_topk_kernel(
         chosen_weights = tl.where(lanes == rank, weight, chosen_weights)
     if RENORMALIZE:
         chosen_weights /= tl.maximum(tl.sum(chosen_weights, 0), 1.1754943508222875e-38)
+    chosen_weights *= scale
     tl.store(weights_ptr + token * TOPK + lanes, chosen_weights, mask=lanes < TOPK)
     tl.store(experts_ptr + token * TOPK + lanes, chosen_ids, mask=lanes < TOPK)
 
@@ -110,6 +112,8 @@ def triton_sqrt_softplus_topk(
     hash_indices_table: torch.Tensor | None,
     input_ids: torch.Tensor | None,
     need_scores: bool,
+    routed_scaling_factor: float,
+    weights_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Select experts using the sqrt-softplus routing contract.
 
@@ -121,9 +125,11 @@ def triton_sqrt_softplus_topk(
         hash_indices_table: Optional [vocabulary, top_k] expert lookup table.
         input_ids: Token ids indexing the hash table.
         need_scores: Materialize all sqrt-softplus scores when true.
+        routed_scaling_factor: FP32 multiplier applied after normalization.
+        weights_dtype: FP32 or BF16 storage, converted only after scaling.
 
     Returns:
-        FP32 route weights, INT32 expert ids, and FP32 scores (or the unused
+        Route weights in weights_dtype, INT32 expert ids, and FP32 scores (or the unused
         input logits when need_scores is false).
     """
     if router_logits.ndim != 2:
@@ -137,7 +143,7 @@ def triton_sqrt_softplus_topk(
     if bias_routing and correction_bias.device != router_logits.device:
         raise ValueError("correction_bias must share the router_logits device")
     weights = torch.empty(
-        (tokens, top_k), dtype=torch.float32, device=router_logits.device
+        (tokens, top_k), dtype=weights_dtype, device=router_logits.device
     )
     ids = torch.empty((tokens, top_k), dtype=torch.int32, device=router_logits.device)
     scores = (
@@ -159,6 +165,7 @@ def triton_sqrt_softplus_topk(
             correction_bias.stride(0) if bias_routing else 0,
             hash_indices_table.stride(0) if hash_indices_table is not None else 0,
             hash_indices_table.stride(1) if hash_indices_table is not None else 0,
+            float(routed_scaling_factor),
             EXPERTS=experts,
             TOPK=top_k,
             BLOCK_E=triton.next_power_of_2(experts),

@@ -32,6 +32,11 @@ structural-tag JSON string that:
 2. Substitutes the response-channel content (default ``any_text``) with
    the supplied content format, so the constraint only kicks in inside
    that channel — reasoning content stays free-form.
+3. Picks the template's reasoning mode from the prompt. A chat template
+   may open the reasoning block in the prompt (``...<think>\\n``) or leave
+   it to the model, depending on the model and on options such as
+   ``enable_thinking``. ``prompt_ends_in_reasoning()`` tells which from
+   the prompt tokens.
 
 This avoids the channel-preamble corruption that activating any grammar
 at token 0 would cause for reasoning models (the model emits
@@ -45,6 +50,7 @@ already have an xgrammar Format instance can call the base function.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 # smg reasoning_parser name → xgrammar builtin model template. Keys
@@ -102,8 +108,58 @@ def _structural_tag_for_inkling(content_format: Any) -> str:
     return tag.model_dump_json(by_alias=True)
 
 
+def reasoning_block_markers(reasoning_parser: str) -> tuple[str, str] | None:
+    """Return the strings that open and close the reasoning block.
+
+    For example ``("<think>", "</think>")``. They are read from xgrammar's
+    builtin template in ``"auto"`` mode, where the block is optional and
+    keeps its opener. Returns ``None`` when the parser has no mapping or the
+    template has another layout.
+    """
+    model = _REASONING_PARSER_TO_XGRAMMAR_MODEL.get(reasoning_parser)
+    if model is None:
+        return None
+
+    import xgrammar
+
+    fmt = xgrammar.get_builtin_structural_tag(model=model, reasoning="auto").format
+    # Layout: [optional(reasoning block), response], where the block is a
+    # tag, or a sequence that starts with the tag.
+    if fmt.type != "sequence" or not fmt.elements:
+        return None
+    if fmt.elements[0].type != "optional":
+        return None
+    block = fmt.elements[0].content
+    if block.type == "sequence" and block.elements:
+        block = block.elements[0]
+    if block.type != "tag" or not block.begin or not block.end:
+        return None
+    return block.begin, block.end
+
+
+def prompt_ends_in_reasoning(
+    prompt_ids: Sequence[int], begin_id: int, end_id: int
+) -> bool:
+    """Return whether the prompt ends inside an open reasoning block.
+
+    True when the last reasoning marker in the prompt is the opener, as in a
+    prompt that ends with ``<think>\\n``. False when the prompt never opens
+    the block, or closes it, for example ``<think>\\n\\n</think>\\n\\n`` with
+    thinking off or the reasoning of an earlier turn.
+    """
+    for token_id in reversed(prompt_ids):
+        if token_id == end_id:
+            return False
+        if token_id == begin_id:
+            return True
+    return False
+
+
 def structural_tag_for_reasoning_response(
-    reasoning_parser: str, content_format: Any
+    reasoning_parser: str,
+    content_format: Any,
+    *,
+    prompt_opens_reasoning: bool | None,
 ) -> str | None:
     """Build a JSON-serialized xgrammar structural tag for ``reasoning + content``.
 
@@ -111,19 +167,31 @@ def structural_tag_for_reasoning_response(
     ``JSONSchemaFormat``, ``RegexFormat``, ``GrammarFormat``, etc. It
     replaces the response channel's default ``any_text``.
 
+    ``prompt_opens_reasoning`` says whether the prompt ends inside an open
+    reasoning block (see ``prompt_ends_in_reasoning``). If it does, the
+    reply continues that block (xgrammar's ``"enabled"`` mode). If not, the
+    reply may open the block itself or answer directly (``"auto"``).
+
     Returns ``None`` if ``reasoning_parser`` has no xgrammar mapping —
     the caller should leave the user's constraint unchanged in that case.
+    Also returns ``None`` when ``prompt_opens_reasoning`` is ``None``: the
+    mode depends on the prompt, so a caller that cannot see it (such as the
+    gRPC servicer, which converts sampling params before the request reaches
+    the engine) keeps the plain constraint, and ``InputProcessor`` wraps it
+    once the prompt is known.
     """
     if reasoning_parser == "inkling":
         return _structural_tag_for_inkling(content_format)
 
     model = _REASONING_PARSER_TO_XGRAMMAR_MODEL.get(reasoning_parser)
-    if model is None:
+    if model is None or prompt_opens_reasoning is None:
         return None
 
     import xgrammar
 
-    tag = xgrammar.get_builtin_structural_tag(model=model, reasoning=True)
+    tag = xgrammar.get_builtin_structural_tag(
+        model=model, reasoning="enabled" if prompt_opens_reasoning else "auto"
+    )
     fmt = tag.format
 
     # Track whether the substitution actually landed. If it didn't
@@ -197,33 +265,53 @@ def structural_tag_for_reasoning_response(
 
 
 def structural_tag_for_reasoning_json_schema(
-    reasoning_parser: str, user_schema: Any
+    reasoning_parser: str,
+    user_schema: Any,
+    *,
+    prompt_opens_reasoning: bool | None = None,
 ) -> str | None:
-    """Convenience wrapper: response channel constrained to a JSON schema."""
+    """Convenience wrapper: response channel constrained to a JSON schema.
+
+    ``prompt_opens_reasoning`` defaults to ``None`` because the gRPC servicer
+    calls this with two arguments, without the prompt; it then keeps
+    ``json_schema`` and ``InputProcessor`` wraps it.
+    """
     from xgrammar.structural_tag import JSONSchemaFormat
 
     return structural_tag_for_reasoning_response(
-        reasoning_parser, JSONSchemaFormat(json_schema=user_schema)
+        reasoning_parser,
+        JSONSchemaFormat(json_schema=user_schema),
+        prompt_opens_reasoning=prompt_opens_reasoning,
     )
 
 
 def structural_tag_for_reasoning_regex(
-    reasoning_parser: str, pattern: str
+    reasoning_parser: str,
+    pattern: str,
+    *,
+    prompt_opens_reasoning: bool | None,
 ) -> str | None:
     """Convenience wrapper: response channel constrained to a regex pattern."""
     from xgrammar.structural_tag import RegexFormat
 
     return structural_tag_for_reasoning_response(
-        reasoning_parser, RegexFormat(pattern=pattern)
+        reasoning_parser,
+        RegexFormat(pattern=pattern),
+        prompt_opens_reasoning=prompt_opens_reasoning,
     )
 
 
 def structural_tag_for_reasoning_grammar(
-    reasoning_parser: str, ebnf_grammar: str
+    reasoning_parser: str,
+    ebnf_grammar: str,
+    *,
+    prompt_opens_reasoning: bool | None,
 ) -> str | None:
     """Convenience wrapper: response channel constrained to an EBNF grammar."""
     from xgrammar.structural_tag import GrammarFormat
 
     return structural_tag_for_reasoning_response(
-        reasoning_parser, GrammarFormat(grammar=ebnf_grammar)
+        reasoning_parser,
+        GrammarFormat(grammar=ebnf_grammar),
+        prompt_opens_reasoning=prompt_opens_reasoning,
     )

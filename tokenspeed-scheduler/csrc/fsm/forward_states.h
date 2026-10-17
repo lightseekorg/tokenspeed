@@ -322,9 +322,10 @@ struct Restoring {
 // publishes the frontier (the state the last landed forward wrote and the KV
 // below the one unconsumed token) and releases the pages. Under the overlap
 // schedule the finish lands while the next decode is dispatched; that decode's
-// result still arrives and extends the tokens, so the frontier it published
-// is the one after the token the finish was decided on. Nothing is scheduled
-// for it, and it is no retraction victim.
+// result still arrives and extends the tokens by what it reports (nothing
+// when the device stopped the request, which keeps the frontier before the
+// token the finish was decided on). Nothing is scheduled for it, and it is no
+// retraction victim.
 struct Finishing {
     explicit Finishing(ForwardResources resources) : resources{std::move(resources)} {}
 

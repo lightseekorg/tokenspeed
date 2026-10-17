@@ -22,8 +22,7 @@
 
 import pytest
 import torch
-
-from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+from tokenspeed_kernel.ops.conv import (
     PAD_SLOT_ID,
     causal_conv1d_update,
 )
@@ -265,7 +264,7 @@ def test_decode_update_compiles_once_across_batch_sizes():
     """The decode batch changes every round; it must not key a new binary."""
     from unittest.mock import patch
 
-    from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+    from tokenspeed_kernel.ops.conv._triton.causal_conv1d import (
         _causal_conv1d_update_kernel,
     )
 

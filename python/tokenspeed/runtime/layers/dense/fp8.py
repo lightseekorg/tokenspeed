@@ -282,13 +282,14 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale_encoding=scale_encoding,
             )
         solution = None
-        if global_server_args_dict["dense_gemm_backend"] == "trtllm_cutedsl" and tuple(
-            self.quant_config.weight_block_size
-        ) == (
+        if global_server_args_dict["dense_gemm_backend"] in (
+            "trtllm_cutedsl",
+            "deepgemm",
+        ) and tuple(self.quant_config.weight_block_size) == (
             128,
             128,
         ):
-            solution = "trtllm_cutedsl"
+            solution = global_server_args_dict["dense_gemm_backend"]
         output = mm(
             input_2d,
             layer.weight,

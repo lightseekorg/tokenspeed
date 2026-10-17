@@ -321,9 +321,6 @@ class Mamba2AttnBackend(CapacityPrefillBackend):
         f_b_weight: torch.Tensor | None,
         beta_raw: torch.Tensor | None,
         lower_bound: float | None,
-        output_gate: torch.Tensor | None,
-        norm_weight: torch.Tensor | None,
-        norm_eps: float | None,
     ) -> torch.Tensor:
         """One SSD step per request between paged states; see the base seam.
 
@@ -333,8 +330,6 @@ class Mamba2AttnBackend(CapacityPrefillBackend):
         D = _require_mamba2_inputs(
             D, b, g_raw, f_a_out, f_b_weight, beta_raw, lower_bound
         )
-        if output_gate is not None or norm_weight is not None or norm_eps is not None:
-            raise ValueError("Mamba2 layers apply their gated norm outside the scan")
         x = value[:, 0]
         out = torch.empty_like(x)
         mamba2_state_update(
