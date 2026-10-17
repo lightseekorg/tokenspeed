@@ -79,7 +79,12 @@ from tokenspeed_kernel.ops.attention.dsv41 import (
     rope_inplace,
     rope_pad_query,
 )
-from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32, grouped_bf16_projection
+from tokenspeed_kernel.ops.gemm import (
+    dsv4_linear_fp32,
+    grouped_bf16_projection,
+    mm,
+    prepare_mxfp8_weight_scales,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
@@ -224,6 +229,9 @@ class _V41Fp8Config(Mxfp8Config):
 class _ReferenceFp8LinearMethod(Fp8LinearMethod):
     def __init__(self, quant_config: Mxfp8Config):
         super().__init__(quant_config)
+        # 1x32 weight scales in the native GEMM's layout, or None for the
+        # canonical path; see prepare_weight_scales.
+        self.prepared_weight_scales: torch.Tensor | None = None
         # Hopper has no tensor-core kernel for 32-wide FP8 blocks; its FP8 GEMMs
         # rescale on CUDA cores every 32 K and trail the plain BF16 GEMM at
         # every shape. So load the codes straight into a BF16 weight and fold
@@ -290,6 +298,7 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         if not self.load_as_bf16:
             super().process_weights_after_loading(layer)
+            self.prepare_weight_scales(layer)
             return
         scale = layer.weight_scale_inv.data.view(torch.float8_e8m0fnu).to(
             torch.bfloat16
@@ -298,11 +307,46 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         layer.register_parameter("weight_scale_inv", None)
         layer.quant_method = UnquantizedLinearMethod()
 
+    @torch.no_grad()
+    def prepare_weight_scales(self, layer: nn.Module) -> None:
+        """Derive this layer's prepacked weight scales from the loaded ones.
+
+        Preparation swizzles the scales once instead of on every forward. The
+        first call keeps the result; a call after a weight update copies into
+        that buffer, so captured CUDA graphs keep reading the same address.
+        """
+        if self.load_as_bf16:
+            return
+        prepared = prepare_mxfp8_weight_scales(layer.weight, layer.weight_scale_inv)
+        cached = self.prepared_weight_scales
+        if cached is None:
+            self.prepared_weight_scales = prepared
+            return
+        if prepared is None or prepared.shape != cached.shape:
+            raise ValueError("V4.1 prepacked FP8 scales changed layout")
+        cached.copy_(prepared)
+
     def apply(
         self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
         if x.shape[0] == 0:
             return x.new_empty((*x.shape[:-1], layer.weight.shape[0]))
+        if (
+            self.prepared_weight_scales is not None
+            and x.is_cuda
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and x.stride(-1) == 1
+        ):
+            return mm(
+                x.reshape(-1, x.shape[-1]),
+                layer.weight,
+                B_scales=self.prepared_weight_scales,
+                bias=bias,
+                out_dtype=x.dtype,
+                quant="mxfp8",
+                block_size=[1, 32],
+                prepacked_scales=True,
+            ).view(*x.shape[:-1], layer.weight.shape[0])
         codes, scales = v41_quantize_fp8(x)
         return super().apply(layer, codes, bias, scales, x.dtype)
 
@@ -2199,6 +2243,12 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         for module in self.modules():
             if isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
+            elif isinstance(module, LinearBase) and isinstance(
+                module.quant_method, _ReferenceFp8LinearMethod
+            ):
+                # The target and DSpark share this hook. Refresh in place after
+                # a complete weight update; captured graphs retain the buffer.
+                module.quant_method.prepare_weight_scales(module)
 
     def post_quant_warmup(self) -> None:
         for module in self.modules():

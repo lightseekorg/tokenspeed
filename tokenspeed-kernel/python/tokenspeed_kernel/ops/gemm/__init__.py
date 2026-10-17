@@ -45,6 +45,7 @@ from tokenspeed_kernel.ops.gemm._triton.kimi3 import (
 )
 from tokenspeed_kernel.ops.gemm.triton_router_gemv import fp32_router_gemv_counters
 from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.ops.quantization.triton import _quantize_fp8_group32_swizzled
 from tokenspeed_kernel.platform import (
     Platform,
     current_platform,
@@ -99,9 +100,6 @@ __all__ = [
     "fp32_router_gemv_execute",
     "fp32_router_gemv_plan",
     "fp32_router_gemv_process_weight",
-    "fp8_linear",
-    "fp8_linear_into",
-    "fp8_linear_prepacked",
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
@@ -126,7 +124,7 @@ __all__ = [
     "mxfp4_swiglu_linear",
     "prepare_mxfp4_linear",
     "mm",
-    "prepare_fp8_linear",
+    "prepare_mxfp8_weight_scales",
     "prepare_nvfp4_a16_weights",
 ]
 
@@ -358,6 +356,105 @@ def _validate_gemm_out(
         raise ValueError(f"{op} out must have stride(-1) == 1")
 
 
+def _mxfp8_swizzled_scale_count(rows: int, k: int) -> int:
+    # The F8_128x4 layout pads rows to 128 and scale columns to 4 (K to 128).
+    return -(-rows // 128) * 128 * -(-k // 128) * 4
+
+
+def prepare_mxfp8_weight_scales(
+    weight: torch.Tensor, weight_scales: torch.Tensor
+) -> torch.Tensor | None:
+    """Swizzle 1x32 UE8M0 weight scales once for ``mm(prepacked_scales=True)``.
+
+    The prepacked call skips the per-call weight-scale swizzle and quantizes
+    activations straight into the swizzled layout. Whether the native kernel
+    serves this weight is decided here, from the weight shape, the PDL policy
+    and any forced ``gemm``/``mm`` or ``quantization``/``fp8_with_scale``
+    kernel, so callers keep their canonical path when this returns None.
+
+    Args:
+        weight: E4M3 weight ``[N, K]`` with unit inner stride.
+        weight_scales: Canonical uint8 UE8M0 scales ``[N, K // 32]``; left
+            unchanged.
+
+    Returns:
+        New 1-D uint8 scales in FlashInfer's F8_128x4 layout, or None when
+        the prepacked path does not apply.
+    """
+    if (
+        weight.ndim != 2
+        or weight.dtype != _fp8_dtype
+        or weight.shape[1] % 32
+        or weight_scales.dtype != torch.uint8
+        or tuple(weight_scales.shape) != (weight.shape[0], weight.shape[1] // 32)
+        or weight_scales.device != weight.device
+    ):
+        raise ValueError("1x32 FP8 weights require canonical UE8M0 [N, K/32] scales")
+    if not (
+        has_flashinfer_mxfp8()
+        and weight.is_cuda
+        and min(weight.shape) >= 128
+        and weight.stride(-1) == 1
+        and pdl_enabled()
+        and resolve_kernel_override("gemm", "mm", None) in (None, "flashinfer_mm_mxfp8")
+        and resolve_kernel_override("quantization", "fp8_with_scale", None) is None
+    ):
+        return None
+    return swizzle_mxfp8_scale(weight_scales, *weight.shape)
+
+
+def _mm_mxfp8_prepacked(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    B_scales: torch.Tensor | None,
+    *,
+    bias: torch.Tensor | None,
+    out: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    n, k = B.shape
+    if (
+        A.ndim != 2
+        or A.dtype not in (torch.bfloat16, torch.float16)
+        or A.shape[1] != k
+        or A.stride(-1) != 1
+    ):
+        raise ValueError(
+            "mm(prepacked_scales=True) with block_size [1, 32] requires 16-bit "
+            "[M, K] activations with unit inner stride"
+        )
+    if (
+        B_scales is None
+        or B_scales.dtype != torch.uint8
+        or tuple(B_scales.shape) != (_mxfp8_swizzled_scale_count(n, k),)
+    ):
+        raise ValueError(
+            "mm(prepacked_scales=True) with block_size [1, 32] requires weight "
+            "scales from prepare_mxfp8_weight_scales"
+        )
+    if A.shape[0] == 0:
+        return out if out is not None else A.new_empty((0, n), dtype=out_dtype)
+    # Same codes and scales as the reference 1x32 quantizer, written directly
+    # in the layout the native kernel reads.
+    values, activation_scales = _quantize_fp8_group32_swizzled(A)
+    result = flashinfer_mm_mxfp8(
+        values,
+        B,
+        activation_scales,
+        B_scales,
+        out_dtype,
+        block_size=[1, 32],
+        out=out if bias is None else None,
+    )
+    if bias is None:
+        return result
+    result = result + bias
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
 def mm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -405,6 +502,11 @@ def mm(
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
         solution: Restrict selection to a registered implementation family.
+        prepacked_scales: ``B_scales`` are prepared once per weight and ``A``
+            is quantized here into the matching layout. With block_size
+            ``[128, 128]`` they come from
+            ``prepare_flashinfer_fp8_blockscale_weight_scales``; with
+            ``[1, 32]`` from ``prepare_mxfp8_weight_scales``.
     """
     override = resolve_kernel_override("gemm", "mm", override)
     enable_pdl = pdl_enabled()
@@ -430,6 +532,10 @@ def mm(
         if quant != "mxfp8" or block_size is None:
             raise ValueError(
                 "mm(prepacked_scales=True) requires quant='mxfp8' with block_size"
+            )
+        if list(block_size) == [1, 32]:
+            return _mm_mxfp8_prepacked(
+                A, B, B_scales, bias=bias, out=out, out_dtype=out_dtype
             )
         if B_scales is None or tuple(B_scales.shape) != (
             K // block_size[1],
@@ -3471,8 +3577,15 @@ from tokenspeed_kernel.ops.gemm.flashinfer import (  # noqa: E402
     flashinfer_joint_bf16_supported,
     gemm_fp8_nt_groupwise,
     has_flashinfer_cute_dsl_nvfp4_a16,
+    has_flashinfer_mxfp8,
     prepare_nvfp4_a16_weights,
+    swizzle_mxfp8_scale,
 )
+
+if has_flashinfer_mxfp8():
+    from tokenspeed_kernel.ops.gemm.flashinfer import (  # noqa: E402
+        flashinfer_mm_mxfp8,
+    )
 from tokenspeed_kernel.ops.gemm.gluon import (  # noqa: E402
     MXFP4_LINEAR_MFMA_LAYOUT,
     prepare_mxfp4_linear_mfma_weight,

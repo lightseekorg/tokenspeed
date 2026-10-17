@@ -1178,6 +1178,11 @@ prompts and package/model revisions.
 
 ## DeepSeek V4.1-Flash
 
+The B200 and AMD GSM8K CI jobs, the GB300 Slurm 1P1D GSM8K job, and the
+manual 1P1D smoke test use `deepseek-ai/DeepSeek-V4.1-Flash-1017`.
+The 1P1D CI tasks set `MODEL` explicitly so both serving roles and the
+evaluation client select the same checkpoint.
+
 DeepSeek V4.1 (`deepseek_v41`) runs on its own FlatKV attention backend
 with a four-group KV cache: the global KV chains, the SWA rows and the
 compressor tails. The recipe declares the last two **replayable**: they

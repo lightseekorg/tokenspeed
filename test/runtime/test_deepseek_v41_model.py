@@ -44,8 +44,9 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
+from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.moe import moe_topk
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -61,7 +62,7 @@ from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41DecoderView,
     V41PrefillSpan,
 )
-from tokenspeed.runtime.layers.linear import LinearBase
+from tokenspeed.runtime.layers.linear import LinearBase, ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.moe import expert as expert_module
 from tokenspeed.runtime.layers.moe.expert import MoELayer
@@ -70,6 +71,8 @@ from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
 from tokenspeed.runtime.models import deepseek_v41 as v41
 from tokenspeed.runtime.models import deepseek_v41_moe as v4
+from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
+from tokenspeed.runtime.models.base.weight_update import weight_update_session
 from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41Attention,
     DeepseekV41DecoderLayer,
@@ -1205,6 +1208,100 @@ def test_cuda_exact_fp8_linear_and_engram_method(monkeypatch):
     torch.testing.assert_close(
         captured, linear(x, block_scale=None, output_dtype=None)[0], rtol=0, atol=0
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_blackwell_plus,
+    reason="requires Blackwell MXFP8",
+)
+@torch.inference_mode()
+def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
+    class TinyModel(BaseCausalLM):
+        def __init__(self):
+            super().__init__(
+                config=SimpleNamespace(), mapping=SimpleNamespace(), encoder_only=True
+            )
+            self.proj = ReplicatedLinear(
+                input_size=128,
+                output_size=256,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=v41_mxfp8_config(_quant()),
+                prefix="proj",
+            )
+
+        def post_load_weights(self):
+            DeepseekV41ForCausalLM.post_load_weights(self)
+
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
+    previous_pdl = pdl_enabled()
+    pdl_enabled(True)
+    try:
+        with torch.device("cuda"):
+            model = TinyModel()
+        model.load_weights(
+            [
+                (
+                    "proj.weight",
+                    torch.randn(256, 128, device="cuda").to(torch.float8_e4m3fn),
+                ),
+                (
+                    "proj.weight_scale_inv",
+                    torch.full((8, 4), 123, device="cuda", dtype=torch.uint8),
+                ),
+            ]
+        )
+        layer = model.proj
+        layer.quant_method.process_weights_after_loading(layer)
+        native = layer.quant_method.prepared_weight_scales
+        address = native.data_ptr()
+        assert set(model.state_dict()) == {"proj.weight", "proj.weight_scale_inv"}
+        x = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
+        layer(x)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured, _ = layer(x)
+        for exponent in (125, 121):
+            before = native.clone()
+            with weight_update_session([model]):
+                model.load_weights(
+                    [
+                        (
+                            "proj.weight_scale_inv",
+                            torch.full(
+                                (8, 4), exponent, device="cuda", dtype=torch.uint8
+                            ),
+                        )
+                    ]
+                )
+                torch.testing.assert_close(native, before, rtol=0, atol=0)
+                model.load_weights(
+                    [
+                        (
+                            "proj.weight",
+                            torch.randn(256, 128, device="cuda").to(
+                                torch.float8_e4m3fn
+                            ),
+                        )
+                    ]
+                )
+            assert layer.quant_method.prepared_weight_scales is native
+            assert native.data_ptr() == address
+            x.normal_()
+            graph.replay()
+            codes, scales = v41_quantize_fp8(x)
+            expected = mm(
+                codes,
+                layer.weight,
+                A_scales=scales,
+                B_scales=layer.weight_scale_inv,
+                out_dtype=x.dtype,
+                quant="mxfp8",
+                block_size=[1, 32],
+            )
+            torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+    finally:
+        pdl_enabled(previous_pdl)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
