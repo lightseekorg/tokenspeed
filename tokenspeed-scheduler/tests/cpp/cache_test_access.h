@@ -53,6 +53,13 @@ struct CacheCoordinatorTestAccess {
     static bool EvictCachedBlock(CacheCoordinator& coordinator, std::uint32_t group_id, CacheBlockLocation location) {
         return coordinator.evictCachedBlock(group_id, location);
     }
+
+    // A Device-cached block, located rather than referenced: a held reference
+    // would pin it against eviction.
+    static std::optional<CacheBlockLocation> DeviceLocationOf(const CacheCoordinator& coordinator,
+                                                              std::size_t group_index, const CacheKey& key) {
+        return coordinator.deviceLocationOf(group_index, key);
+    }
 };
 
 inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
