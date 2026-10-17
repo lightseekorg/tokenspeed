@@ -685,7 +685,7 @@ def test_config_json_layers_are_completed_from_hf_quant_config():
             "backbone.layers.1.mixer.experts": nvfp4,
             "mtp.layers.1.mixer.experts": nvfp4,
         },
-        "exclude_modules": ["mtp.layers.0.eh_proj", "mtp.layers.0.mixer.q_proj"],
+        "exclude_modules": ["mtp.layers.0.eh_proj"],
     }
     merged = _with_hf_quant_layers(config_json, hf_quant)
     assert set(merged["quantized_layers"]) == set(hf_quant["quantized_layers"])

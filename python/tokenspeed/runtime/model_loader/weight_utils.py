@@ -135,7 +135,7 @@ def with_hf_quant_layers(quant_cfg: dict, hf_quant: dict) -> dict:
 
     ModelOpt writes both; a config.json copy can lack entries the export file
     has (Nemotron 3.5 Super VL's leaves out its MTP experts), which would load
-    those modules as unquantized. Entries the two disagree on are refused.
+    those modules as unquantized. Entries whose algorithms disagree are refused.
     """
     layers = dict(quant_cfg["quantized_layers"])
     missing = {}
