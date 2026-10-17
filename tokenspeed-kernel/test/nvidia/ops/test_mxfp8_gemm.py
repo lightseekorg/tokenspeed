@@ -304,7 +304,7 @@ class TestPreparedMxfp8:
             x[0, 64:96] = 448.0 / 64
         codes, scales = _quantize_fp8_group32_swizzled(x)
         reference_codes, reference_scales = _online_quantize_mxfp8(
-            x, [1, 32], "ue8m0", enable_pdl=False
+            x, [1, 32], "ue8m0", enable_pdl=False, kernel_name=None
         )
         torch.testing.assert_close(
             codes.view(torch.uint8), reference_codes.view(torch.uint8), rtol=0, atol=0
@@ -329,7 +329,7 @@ class TestPreparedMxfp8:
             x.normal_().mul_(magnitude)
             graph.replay()
             expected_codes, expected_scales = _online_quantize_mxfp8(
-                x[:17], [1, 32], "ue8m0", enable_pdl=False
+                x[:17], [1, 32], "ue8m0", enable_pdl=False, kernel_name=None
             )
             torch.testing.assert_close(
                 codes.view(torch.uint8),
@@ -349,7 +349,7 @@ class TestPreparedMxfp8:
         x = torch.randn(rows, 384, device="cuda", dtype=torch.bfloat16)
         bias = torch.randn(256, device="cuda", dtype=x.dtype)
         codes, input_scales = _online_quantize_mxfp8(
-            x, [1, 32], "ue8m0", enable_pdl=False
+            x, [1, 32], "ue8m0", enable_pdl=False, kernel_name=None
         )
         expected = mm(
             codes,
