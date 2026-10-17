@@ -1111,12 +1111,23 @@ def triton_embedding_rope_mla(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["index_width", "index_stride_row", "index_stride_col"],
+    do_not_specialize_on_alignment=[
+        "index_width",
+        "index_stride_row",
+        "index_stride_col",
+    ],
+)
 def _mxfp8_embedding_kernel(
     W,
     S,
     I,
     O,
+    index_width,
+    index_stride_row,
+    index_stride_col,
+    STRIDED_IDS: tl.constexpr,
     D: tl.constexpr,
     START: tl.constexpr,
     END: tl.constexpr,
@@ -1124,9 +1135,16 @@ def _mxfp8_embedding_kernel(
     SS: tl.constexpr,
     B: tl.constexpr,
 ):
-    row = tl.program_id(0)
     d = tl.arange(0, B)
-    index = tl.load(I + row)
+    if STRIDED_IDS:
+        index_col = tl.program_id(0).to(tl.int64)
+        index_row = tl.program_id(1).to(tl.int64)
+        row = index_row * index_width + index_col
+        index_offset = index_row * index_stride_row + index_col * index_stride_col
+    else:
+        row = tl.program_id(0).to(tl.int64)
+        index_offset = row
+    index = tl.load(I + index_offset).to(tl.int64)
     local = (index >= START) & (index < END)
     code = tl.load(W + (index - START) * WS + d, local & (d < D), 0.0).to(tl.float32)
     exponent = tl.load(S + (index - START) * SS + d // 32, local & (d < D), 127).to(
@@ -1224,11 +1242,24 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
         (*indices.shape, weight.shape[1]), dtype=torch.bfloat16, device=indices.device
     )
     if indices.numel():
-        _mxfp8_embedding_kernel[(indices.numel(),)](
+        strided = not indices.is_contiguous()
+        if strided and indices.shape[0] > 2048:
+            # Large prefills amortize the ID copy and favor the flat gather.
+            # This also keeps the second grid dimension within its limit.
+            indices = indices.contiguous()
+            strided = False
+        # A two-dimensional grid provides the ID coordinates without a
+        # per-workgroup runtime division for decode and short prefills.
+        grid = (indices.shape[1], indices.shape[0]) if strided else (indices.numel(),)
+        _mxfp8_embedding_kernel[grid](
             weight,
             scales,
             indices,
             out,
+            indices.shape[1] if strided else 1,
+            indices.stride(0) if strided else 1,
+            indices.stride(1) if strided else 1,
+            strided,
             weight.shape[1],
             row_start,
             row_end,
