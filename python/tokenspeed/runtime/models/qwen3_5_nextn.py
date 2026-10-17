@@ -192,6 +192,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
+            do_argmax=True,
             dp_lm_head_tp=False,
         )
 

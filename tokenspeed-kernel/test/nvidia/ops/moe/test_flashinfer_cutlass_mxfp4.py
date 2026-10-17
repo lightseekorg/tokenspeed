@@ -118,7 +118,7 @@ def _relative_l2(actual, expected):
 @pytest.mark.parametrize("num_tokens", [1, 8, 64])
 def test_w4a16_matches_clamped_reference(num_tokens) -> None:
     _requires_sm90_flashinfer()
-    from tokenspeed_kernel.ops.moe.flashinfer.cutlass_mxfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_cutlass_mxfp4_w4a16_moe_apply,
         flashinfer_cutlass_mxfp4_w4a16_moe_weights,
     )
@@ -143,7 +143,7 @@ def test_w4a16_matches_clamped_reference(num_tokens) -> None:
 @pytest.mark.parametrize("num_tokens", [8, 64])
 def test_w4a8_tracks_clamped_reference_within_fp8_noise(num_tokens) -> None:
     _requires_sm90_flashinfer()
-    from tokenspeed_kernel.ops.moe.flashinfer.cutlass_mxfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_cutlass_mxfp4_w4a8_moe_apply,
         flashinfer_cutlass_mxfp4_w4a8_moe_weights,
     )
@@ -169,7 +169,7 @@ def test_w4a8_tracks_clamped_reference_within_fp8_noise(num_tokens) -> None:
 def test_w4a16_ep_masks_nonlocal_experts() -> None:
     """EP: each rank owns half the experts; summed ranks == full reference."""
     _requires_sm90_flashinfer()
-    from tokenspeed_kernel.ops.moe.flashinfer.cutlass_mxfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_cutlass_mxfp4_w4a16_moe_apply,
         flashinfer_cutlass_mxfp4_w4a16_moe_weights,
     )

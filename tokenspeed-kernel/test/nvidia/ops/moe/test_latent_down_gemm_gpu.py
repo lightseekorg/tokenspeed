@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe.latent_down import (
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
     _DOWN_SENTINEL,
     _LAMPORT_CTAS,
     _LAMPORT_THREADS,
@@ -151,9 +151,10 @@ def test_the_gather_re_arms_the_rows_it_consumed(m: int) -> None:
         ctas=_LAMPORT_CTAS,
         threads=_LAMPORT_THREADS,
         sentinel=_DOWN_SENTINEL,
+        poll_halves=False,
     )
 
-    arm_mailbox(mailbox)
+    arm_mailbox(mailbox, _DOWN_SENTINEL)
     gemm(hidden, weight, mailbox, mailbox.data_ptr())
     # One GPU publishes one rank's columns; the gather waits on the whole row, so
     # the peers' columns have to be stood in for or it spins forever.
@@ -168,7 +169,7 @@ def test_the_gather_re_arms_the_rows_it_consumed(m: int) -> None:
     assert torch.equal(consumed, torch.full_like(consumed, DOWN_EMPTY))
     # The re-arm has to write what the host arming writes, or the next round hangs.
     rearmed = torch.empty_like(mailbox)
-    arm_mailbox(rearmed)
+    arm_mailbox(rearmed, _DOWN_SENTINEL)
     assert torch.equal(consumed, rearmed[0, :m].reshape(-1).view(torch.int32))
 
 
@@ -244,7 +245,7 @@ def test_the_widths_this_file_parametrizes_still_select_three_stores() -> None:
 # a gather that does NOT finish, which needs its own process to bound.
 _WAITER = """
 import torch
-from tokenspeed_kernel.ops.moe.latent_down import (
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
     _DOWN_SENTINEL,
     _LAMPORT_CTAS,
     _LAMPORT_THREADS,
@@ -256,7 +257,7 @@ from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.lamport_copy import (
 
 device = torch.device("cuda", 0)
 mailbox = torch.empty(1, {max_m}, {latent}, device=device, dtype=torch.bfloat16)
-arm_mailbox(mailbox)
+arm_mailbox(mailbox, _DOWN_SENTINEL)
 row = mailbox[0, 0].view(torch.int32)
 row.fill_(0x3F803F80)
 row[{word}] = {empty}
@@ -266,6 +267,7 @@ gather = LamportCopyKernel(
     ctas=_LAMPORT_CTAS,
     threads=_LAMPORT_THREADS,
     sentinel=_DOWN_SENTINEL,
+    poll_halves=False,
 )
 # The kernel compiles on its first call, so warm it on a mailbox that is fully
 # arrived; only then is the marker true and the window below purely the wait.
@@ -337,7 +339,7 @@ def test_the_gather_waits_for_every_word_of_a_fragment(word: int) -> None:
 # not a failure a pytest process can report, so this runs in a bounded child.
 _CROSS = """
 import torch
-from tokenspeed_kernel.ops.moe.latent_down import (
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
     _DOWN_SENTINEL,
     _LAMPORT_CTAS,
     _LAMPORT_THREADS,
@@ -357,6 +359,7 @@ down = LamportCopyKernel(
     ctas=_LAMPORT_CTAS,
     threads=_LAMPORT_THREADS,
     sentinel=_DOWN_SENTINEL,
+    poll_halves=False,
 )
 tail = LamportCopyKernel(
     hidden_dim={latent},
@@ -364,6 +367,7 @@ tail = LamportCopyKernel(
     ctas=_LAMPORT_CTAS,
     threads=_LAMPORT_THREADS,
     sentinel=NEG_ZERO_F32_BITS,
+    poll_halves=False,
 )
 
 mailbox = torch.empty(1, {max_m}, {latent}, device=device, dtype=torch.bfloat16)
@@ -372,7 +376,7 @@ out = down(mailbox, m={max_m})[0].contiguous().view(torch.int32)
 torch.cuda.synchronize(device)
 assert torch.equal(out, torch.full_like(out, {tail_empty})), "down misread a payload"
 armed = torch.empty_like(mailbox)
-arm_mailbox(armed)
+arm_mailbox(armed, _DOWN_SENTINEL)
 assert torch.equal(mailbox.view(torch.int32), armed.view(torch.int32)), "down re-arm"
 
 mailbox.view(torch.int32).fill_({down_empty})
@@ -437,6 +441,7 @@ def test_constructing_the_gather_compiles_what_its_first_launch_needs() -> None:
         ctas=_LAMPORT_CTAS,
         threads=_LAMPORT_THREADS,
         sentinel=_DOWN_SENTINEL,
+        poll_halves=False,
     )
     built = compile_kernel.cache_info().misses
     assert built == 2, "the constructor pre-warms the plain and the residual gather"
@@ -450,3 +455,13 @@ def test_constructing_the_gather_compiles_what_its_first_launch_needs() -> None:
         torch.cuda.synchronize(device)
         assert compile_kernel.cache_info().misses == built
     assert compile_kernel.cache_info().hits == 2
+
+
+def test_half_polling_needs_a_sentinel_whose_halves_agree() -> None:
+    """A half-polled gather compares each 16-bit lane with one 16-bit word."""
+    from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail import lamport_copy
+
+    with pytest.raises(ValueError, match="halves match"):
+        lamport_copy.compile_kernel(
+            4096, 4, 8, 256, 0, sentinel=0x80008001, poll_halves=True
+        )

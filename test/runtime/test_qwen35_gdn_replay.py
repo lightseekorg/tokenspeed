@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import os
 import sys
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -97,10 +96,7 @@ def _make_backend(
 ):
     if replay and not gdn_replay_commit_supported(torch.bfloat16):
         pytest.skip("GDN ReplaySSM kernel unavailable on this platform")
-    pool = _ContractPool(
-        4,
-        {0: ("linear_attention", conv_state, recurrent_state)},
-    )
+    pool = _ContractPool({0: ("linear_attention", conv_state, recurrent_state)})
     backend = MambaAttnBackend(
         *_config(replay=replay, draft_tree=draft_tree, draft_tokens=draft_tokens)
     )
@@ -388,6 +384,68 @@ def test_qwen_replay_tree_matches_staged_tree(state_dtype, parents, paths):
     )
 
 
+@pytest.mark.parametrize("parents", [None, [[-1, 0, 0], [-1, 0, 1]]])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_staged_verify_reading_committed_state_matches_seeded_scratch(
+    state_dtype, parents
+):
+    """A staged verify that reads the committed state in place (no seed copy
+    into the scratch) and q/k/v as packed conv-output views (no split copy)
+    verifies and commits exactly like the seeded scratch and split inputs."""
+    draft_tokens = DRAFT_TOKENS if parents is None else len(parents[0])
+    conv, recurrent = _initial_pools(state_dtype=state_dtype)
+    results = []
+    for in_place in (False, True):
+        backend, pool = _make_backend(
+            conv.clone(), recurrent.clone(), replay=False, draft_tokens=draft_tokens
+        )
+        backend._verify_reads_committed_recurrent_state = in_place
+        backend._verify_packed_qkv_views = in_place
+        if parents is not None:
+            backend.bind_tree_verify(_tree_verify_inputs(parents))
+        out = _prepare_verify(backend, pool, _inputs(draft_tokens=draft_tokens))
+        accepted = torch.tensor([2, 3], dtype=torch.int32, device=DEVICE)
+        path = (
+            None
+            if parents is None
+            else torch.tensor([[0, 2, -1], [0, 1, 2]], dtype=torch.int32, device=DEVICE)
+        )
+        backend.commit_verified_state(accepted, accepted_path=path)
+        torch.cuda.synchronize()
+        results.append((out, pool.get_component(0, "recurrent_state").clone()))
+    (seeded_out, seeded_state), (in_place_out, in_place_state) = results
+    torch.testing.assert_close(in_place_out, seeded_out, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(in_place_state, seeded_state, atol=0.0, rtol=0.0)
+
+
+def test_gdn_backend_resolves_verify_state_path_from_the_kernel():
+    """GdnAttnBackend reads the committed state in place and the packed q/k/v
+    views exactly where the selected verify kernel accepts them."""
+    from tokenspeed_kernel.ops.attention.gdn import gdn_decode_supports
+
+    from tokenspeed.runtime.layers.attention.backends.state.gdn import (
+        GdnAttnBackend,
+    )
+
+    conv, recurrent = _initial_pools()
+    pool = _ContractPool({0: ("linear_attention", conv, recurrent)})
+    backend = GdnAttnBackend(*_config(replay=False))
+    backend.set_kv_pool(pool)
+
+    def supports(op, trait):
+        return gdn_decode_supports(
+            op, torch.bfloat16, head_dim=HEAD_K_DIM, trait=trait, solution=None
+        )
+
+    assert backend._verify_reads_committed_recurrent_state == supports(
+        "gdn_decode_mtp", "separate_output_state"
+    )
+    assert backend._verify_packed_qkv_views == supports("gdn_decode_mtp", "strided_qkv")
+    assert backend._decode_packed_qkv_views == supports(
+        "gdn_decode_step", "strided_qkv"
+    )
+
+
 @pytest.mark.parametrize("chunked", [False, True])
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 def test_qwen_replay_chain_verifies_chunked_where_faster(state_dtype, chunked):
@@ -563,7 +621,6 @@ def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):
 
     def make_backend(replay, conv_states, recurrent_states):
         pool = _ContractPool(
-            4,
             {
                 layer_id: (
                     "linear_attention",
@@ -645,7 +702,7 @@ def test_rebinding_the_pool_retargets_the_verify_copy_tables(replay):
     backend.preallocate_verify_workspace(BATCH, DRAFT_TOKENS)
     stale = backend._verify_copy_tables_get()
 
-    replacement = _ContractPool(4, {0: ("linear_attention", *_initial_pools(seed=29))})
+    replacement = _ContractPool({0: ("linear_attention", *_initial_pools(seed=29))})
     backend.forward_metadata = object()
     backend._replay_state_tapes = {1: object()}
     backend.set_kv_pool(replacement)
@@ -675,9 +732,7 @@ def test_rebinding_a_pool_with_other_state_component_shapes_is_rejected():
         dtype=torch.float32,
     )
     with pytest.raises(RuntimeError, match="different state geometry"):
-        backend.set_kv_pool(
-            _ContractPool(4, {0: ("linear_attention", conv, recurrent)})
-        )
+        backend.set_kv_pool(_ContractPool({0: ("linear_attention", conv, recurrent)}))
     assert backend.kv_pool is original
 
 
@@ -685,7 +740,6 @@ def test_rebinding_rejects_geometry_change_in_a_nonfirst_state_layer():
     """Geometry validation must cover every layer, not only min(layer_id)."""
     conv, recurrent = _initial_pools(seed=37)
     original = _ContractPool(
-        4,
         {
             0: ("linear_attention", conv.clone(), recurrent.clone()),
             1: ("linear_attention", conv.clone(), recurrent.clone()),
@@ -703,7 +757,6 @@ def test_rebinding_rejects_geometry_change_in_a_nonfirst_state_layer():
         dtype=recurrent.dtype,
     )
     changed = _ContractPool(
-        4,
         {
             0: ("linear_attention", conv.clone(), recurrent.clone()),
             1: ("linear_attention", conv.clone(), changed_recurrent),
@@ -722,7 +775,6 @@ def test_rebinding_a_pool_whose_state_layers_moved_is_rejected():
 
     def pool(*layers):
         return _ContractPool(
-            4,
             {
                 layer: ("linear_attention", conv.clone(), recurrent.clone())
                 for layer in layers
@@ -744,12 +796,18 @@ def test_rebinding_a_pool_of_different_state_geometry_is_rejected():
     backend.set_cache_pool(original)
     with pytest.raises(RuntimeError, match="different state geometry"):
         backend.set_cache_pool(
-            _ContractPool(8, {0: ("linear_attention", *_initial_pools())})
+            _ContractPool(
+                {
+                    0: (
+                        "linear_attention",
+                        *_initial_pools(state_dtype=torch.bfloat16),
+                    )
+                }
+            )
         )
 
     assert backend.kv_pool is original
     assert backend.cache_pool is original
-    assert backend._checkpoint_granularity == 4
 
 
 def test_rebinding_a_state_backend_clears_sparse_metadata():
@@ -758,7 +816,7 @@ def test_rebinding_a_state_backend_clears_sparse_metadata():
     share.prefill = share.decode = share.qsa_metadata = object()
 
     backend.set_cache_pool(
-        _ContractPool(4, {0: ("linear_attention", *_initial_pools(seed=31))})
+        _ContractPool({0: ("linear_attention", *_initial_pools(seed=31))})
     )
     assert share.prefill is None
     assert share.decode is None

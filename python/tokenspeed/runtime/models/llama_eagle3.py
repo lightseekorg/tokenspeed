@@ -38,6 +38,7 @@ from tokenspeed.runtime.execution.context import (
     report_collective_sizing,
 )
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.attention.configs.base import resolve_cache_layer_types
 from tokenspeed.runtime.layers.common import concat
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -46,6 +47,7 @@ from tokenspeed.runtime.layers.linear import (
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+from tokenspeed.runtime.layers.paged_attention import hf_sliding_window_to_window_left
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -66,6 +68,21 @@ logger = get_colorful_logger(__name__)
 # ---------------------------------------------------------------------------
 # Attention
 # ---------------------------------------------------------------------------
+
+
+def _draft_window_left(config: LlamaConfig) -> int:
+    """``window_left`` of the draft layer from the labels its cache plan reads: -1 unless sliding."""
+    layer_types = resolve_cache_layer_types(
+        config,
+        num_layers=config.num_hidden_layers,
+        is_draft=True,
+        draft_block_decode=False,
+    ) or ("full_attention",)
+    if layer_types[0] == "full_attention":
+        return -1
+    if layer_types[0] == "sliding_attention":
+        return hf_sliding_window_to_window_left(config.sliding_window)
+    raise ValueError(f"unsupported draft layer type {layer_types[0]!r}")
 
 
 class LlamaAttention(BaseLlamaAttention):
@@ -207,6 +224,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             quant_config=self._eagle3_quant_config,
             prefix=add_prefix("self_attn", prefix),
             qkv_input_size=2 * config.hidden_size,
+            sliding_window_size=_draft_window_left(config),
         )
 
     def resolve_mlp(self, prefix: str) -> nn.Module:

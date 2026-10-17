@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import os
 import sys
-import unittest
 from types import SimpleNamespace
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,8 +21,8 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 
-class ExportFastPathTest(unittest.TestCase):
-    def setUp(self):
+class TestExportFastPathTest:
+    def setup_method(self):
         try:
             import numpy as np
             import torch
@@ -30,7 +31,7 @@ class ExportFastPathTest(unittest.TestCase):
                 block_tables_from_forward_op,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + runtime deps: {exc}")
+            pytest.skip(f"needs torch + runtime deps: {exc}")
         self.np = np
         self.torch = torch
         self.bridge = block_tables_from_forward_op
@@ -42,19 +43,19 @@ class ExportFastPathTest(unittest.TestCase):
     def test_ndarray_path_preserves_values(self):
         op = self._ndarray_op({"full": [[1, 2, -1], [3, 0, 4]]})
         out = self.bridge(op, "cpu", num_reqs=2)
-        self.assertEqual(out["full"].dtype, self.torch.int32)
-        self.assertEqual(out["full"].tolist(), [[1, 2, -1], [3, 0, 4]])
+        assert (out["full"].dtype) == (self.torch.int32)
+        assert (out["full"].tolist()) == ([[1, 2, -1], [3, 0, 4]])
 
     def test_ndarray_path_num_reqs_check(self):
         op = self._ndarray_op({"full": [[1], [2], [3]]})
-        with self.assertRaisesRegex(ValueError, "num_reqs=2"):
+        with pytest.raises((ValueError), match=("num_reqs=2")):
             self.bridge(op, "cpu", num_reqs=2)
 
     def test_missing_arrays_method_raises(self):
         op = SimpleNamespace(block_tables={"full": [[1]]})
-        with self.assertRaises(AttributeError):
+        with pytest.raises((AttributeError)):
             self.bridge(op, "cpu", num_reqs=1)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

@@ -21,52 +21,54 @@
 import contextlib
 import io
 import logging
-import unittest
+import sys
 from importlib import import_module
+
+import pytest
 
 from tokenspeed._logging import suppress_noisy_third_party_logs
 from tokenspeed.runtime.utils.common import CustomFormatter, get_colorful_logger
 
 
-class TestColorfulLogger(unittest.TestCase):
+class TestColorfulLogger:
     def test_repeated_construction_emits_each_record_once(self):
         name = "tokenspeed.test_logging.repeated_construction"
         first = get_colorful_logger(name)
         second = get_colorful_logger(name)
-        self.assertIs(first, second)
+        assert (first) is (second)
         colorful = [
             h for h in first.handlers if isinstance(h.formatter, CustomFormatter)
         ]
-        self.assertEqual(len(colorful), 1)
+        assert (len(colorful)) == (1)
 
         stderr = io.StringIO()
         for handler in colorful:
             handler.setStream(stderr)
         first.info("memory summary")
-        self.assertEqual(stderr.getvalue().count("memory summary"), 1)
+        assert (stderr.getvalue().count("memory summary")) == (1)
 
 
-class TestThirdPartyLogging(unittest.TestCase):
+class TestThirdPartyLogging:
     def test_flash_attn_jit_cache_debug_log_is_suppressed(self):
         try:
             cache_utils = import_module("flash_attn.cute.cache_utils")
         except ImportError:
-            self.skipTest("flash_attn.cute.cache_utils is unavailable")
+            pytest.skip("flash_attn.cute.cache_utils is unavailable")
 
         logging.basicConfig(level=logging.DEBUG, force=True)
         suppress_noisy_third_party_logs()
 
         logger = logging.getLogger("flash_attn.cute.cache_utils")
-        self.assertGreaterEqual(logger.getEffectiveLevel(), logging.WARNING)
+        assert (logger.getEffectiveLevel()) >= (logging.WARNING)
         for handler in logger.handlers:
-            self.assertGreaterEqual(handler.level, logging.WARNING)
+            assert (handler.level) >= (logging.WARNING)
 
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             cache_utils.get_jit_cache()
 
-        self.assertNotIn("Persistent cache disabled", stderr.getvalue())
+        assert ("Persistent cache disabled") not in (stderr.getvalue())
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

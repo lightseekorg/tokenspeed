@@ -31,7 +31,7 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
-from typing import Any, cast
+from typing import Any, Protocol, cast, runtime_checkable
 
 import huggingface_hub
 import torch
@@ -44,7 +44,10 @@ from tokenspeed.runtime.configs.device_config import DeviceConfig
 from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
 from tokenspeed.runtime.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
@@ -59,11 +62,12 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     initialize_dummy_integer_weights,
     initialize_dummy_weights,
     instanttensor_weights_iterator,
+    non_unit_kv_scale_message,
     np_cache_weights_iterator,
     pt_weights_iterator,
-    require_unit_kv_scales,
     safetensors_filtered_weights_iterator,
     safetensors_weights_iterator,
+    split_kv_cache_scales,
 )
 from tokenspeed.runtime.models.extensible import ExtensibleLM
 from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_available
@@ -167,6 +171,28 @@ def _initialize_model(
         quant_config=quant_config,
         **extra_kwargs,
     )
+
+
+@runtime_checkable
+class KVCacheScaleLoader(Protocol):
+    """A model that puts its checkpoint's KV-cache scales on its attention layers."""
+
+    def load_kv_cache_scales(self, scales: dict[str, torch.Tensor]) -> None:
+        """Hand each scale (keyed by checkpoint name) to its layer, skipping
+        only names that belong to another model; raise on any other name."""
+
+
+def _load_kv_cache_scales(model: nn.Module, scales: dict[str, torch.Tensor]) -> None:
+    """Startup is the only time a model takes KV-cache scales other than one;
+    weight updates drop them (``record_non_unit_kv_scales``)."""
+    if not isinstance(model, KVCacheScaleLoader):
+        raise ValueError(
+            f"{type(model).__name__}: "
+            + non_unit_kv_scale_message(
+                [f"{name}={t.flatten()[:4].tolist()}" for name, t in scales.items()]
+            )
+        )
+    model.load_kv_cache_scales(scales)
 
 
 class BaseModelLoader(ABC):
@@ -417,15 +443,30 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files)
 
-        return require_unit_kv_scales(
-            (source.prefix + name, tensor) for (name, tensor) in weights_iterator
-        )
+        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
     def _get_all_weights(
         self,
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        yield from self.get_checkpoint_weights(
+            model_config.model_path, model_config.revision, model, model_config.mapping
+        )
+
+    def get_checkpoint_weights(
+        self,
+        model_path: str,
+        revision: str | None,
+        model: nn.Module,
+        mapping: Mapping,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Stream the checkpoint at ``model_path`` the way ``load_model`` does.
+
+        The in-place reload (``ModelRunner.update_weights_from_disk``) reads
+        through here too, so a reloaded model binds the new checkpoint
+        directory and picks its load group exactly as at startup.
+        """
         # Draft (NextN/MTP) models embedded in the target checkpoint expose
         # ``checkpoint_weight_name_filter`` so only the shards holding their
         # weights are read instead of the whole checkpoint.
@@ -433,8 +474,8 @@ class DefaultModelLoader(BaseModelLoader):
         bind_checkpoint_dir = getattr(model, "bind_checkpoint_dir", None)
         if callable(bind_checkpoint_dir):
             hf_folder, _, _ = self._prepare_weights(
-                model_config.model_path,
-                model_config.revision,
+                model_path,
+                revision,
                 getattr(model, "fall_back_to_pt_during_load", False),
             )
             bind_checkpoint_dir(hf_folder)
@@ -445,8 +486,8 @@ class DefaultModelLoader(BaseModelLoader):
             checkpoint_load_group = self.load_config.checkpoint_load_group
 
         primary_weights = DefaultModelLoader.Source(
-            model_config.model_path,
-            model_config.revision,
+            model_path,
+            revision,
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", False),
         )
@@ -454,7 +495,7 @@ class DefaultModelLoader(BaseModelLoader):
             primary_weights,
             weight_name_filter,
             checkpoint_load_group,
-            model_config.mapping,
+            mapping,
         )
 
         secondary_weights = cast(
@@ -462,7 +503,7 @@ class DefaultModelLoader(BaseModelLoader):
         )
         for source in secondary_weights:
             yield from self._get_weights_iterator(
-                source, weight_name_filter, checkpoint_load_group, model_config.mapping
+                source, weight_name_filter, checkpoint_load_group, mapping
             )
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -486,9 +527,17 @@ class DefaultModelLoader(BaseModelLoader):
                     )
 
             with startup_phase("weights.read_copy"):
-                model.load_weights(self._get_all_weights(model_config, model))
+                kv_cache_scales: dict[str, torch.Tensor] = {}
+                model.load_weights(
+                    split_kv_cache_scales(
+                        self._get_all_weights(model_config, model), kv_cache_scales
+                    )
+                )
+                if kv_cache_scales:
+                    _load_kv_cache_scales(model, kv_cache_scales)
 
             with startup_phase("weights.postprocess"):
+                # post_load_transformed_modules must recognise every hook run here.
                 for _, module in model.named_modules():
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
@@ -513,6 +562,68 @@ class DefaultModelLoader(BaseModelLoader):
                     post_quant_warmup()
 
         return model.eval()
+
+
+def no_op_post_load_hooks() -> frozenset[Callable]:
+    """The ``process_weights_after_loading`` hooks that leave weights as loaded."""
+    from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
+    from tokenspeed.runtime.layers.linear import (
+        MergedColumnParallelLinear,
+        QKVParallelLinear,
+        RowParallelLinear,
+    )
+
+    return frozenset(
+        {
+            QuantizeMethodBase.process_weights_after_loading,
+            UnquantizedLinearMethod.process_weights_after_loading,
+            MergedColumnParallelLinear.process_weights_after_loading,
+            QKVParallelLinear.process_weights_after_loading,
+            RowParallelLinear.process_weights_after_loading,
+        }
+    )
+
+
+def post_load_transformed_modules(model: nn.Module) -> list[str]:
+    """Name the modules whose weights the startup post-load step rewrote.
+
+    After ``load_weights``, ``DefaultModelLoader.load_model`` runs each module's
+    quant-method hook and the module's own ``process_weights_after_loading``
+    once. Those hooks repack, quantize, shuffle or derive copies of what was
+    loaded and cannot run a second time, so checkpoint tensors streamed into
+    such a module later land in the processed layout. A hook counts as a
+    transform unless it is in ``no_op_post_load_hooks``; an MoE layer's hook
+    transforms exactly when its planned kernel has a weight preprocessor.
+
+    Returns:
+        ``"<module name> (<hook owner>)"`` for each such module, in
+        ``named_modules`` order; empty when every hook is a no-op.
+    """
+    from tokenspeed.runtime.layers.moe.expert import MoELayer
+
+    no_op_hooks = no_op_post_load_hooks()
+    transformed: list[str] = []
+    for name, module in model.named_modules():
+        owners = [type(module)]
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None:
+            owners.insert(0, type(quant_method))
+        for owner in owners:
+            hook = getattr(owner, "process_weights_after_loading", None)
+            if hook is None or hook in no_op_hooks:
+                continue
+            if hook is MoELayer.process_weights_after_loading:
+                preprocessor = (getattr(module, "plan", None) or {}).get(
+                    "weight_preprocessor"
+                )
+                if preprocessor is None:
+                    continue
+                owner_name = getattr(preprocessor, "__name__", repr(preprocessor))
+            else:
+                owner_name = owner.__name__
+            transformed.append(f"{name or type(module).__name__} ({owner_name})")
+            break
+    return transformed
 
 
 class ExtensibleModelLoader:
@@ -562,7 +673,8 @@ class DummyModelLoader(BaseModelLoader):
                     self.load_config,
                 )
             # Post-processing can read integer weights, such as index tables,
-            # so they need valid values before it runs.
+            # and check scales that start as NaN, so they need valid values
+            # before it runs.
             initialize_dummy_integer_weights(model)
             # An EAGLE3 draft cannot share a vocab-sharded target embedding,
             # and its own dummy embedding is as valid as a loaded one.

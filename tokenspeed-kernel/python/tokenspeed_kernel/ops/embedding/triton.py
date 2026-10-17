@@ -183,7 +183,9 @@ def _mla_rope_set_kv_buffer_kernel(
     k_rope_stride_t: tl.constexpr,
     q_out_rope_stride_t: tl.constexpr,
     q_out_rope_stride_h: tl.constexpr,
-    kv_buffer_stride_t: tl.constexpr,
+    kv_buffer_stride_t,
+    kv_buffer_stride_p,
+    PAGE_SIZE: tl.constexpr,
     cos_sin_stride_p: tl.constexpr,
     q_nope_stride_t: tl.constexpr,
     q_nope_stride_h: tl.constexpr,
@@ -300,7 +302,11 @@ def _mla_rope_set_kv_buffer_kernel(
                     tl.store(q_out_base + pair_hi, q2, mask=half_mask)
             else:
                 loc = tl.load(loc_ptr + token_idx * loc_stride).to(tl.int64)
-                kv_base = kv_buffer_ptr + loc * kv_buffer_stride_t
+                kv_base = (
+                    kv_buffer_ptr
+                    + (loc // PAGE_SIZE) * kv_buffer_stride_p
+                    + (loc % PAGE_SIZE) * kv_buffer_stride_t
+                )
                 nope_store = nope_mask
                 half_store = half_mask
                 if write_mask_ptr is not None:
@@ -394,7 +400,7 @@ def apply_rope_mla_set_kv_buffer_triton(
     assert q_rope.ndim == 3
     assert k_nope.ndim == 3 and k_nope.shape[1] == 1
     assert k_rope.ndim == 3 and k_rope.shape[1] == 1
-    assert kv_buffer.ndim == 2
+    assert kv_buffer.ndim in (2, 3)
     assert loc.numel() == num_tokens
     assert positions.numel() == num_tokens
     assert q_rope.dtype == k_nope.dtype == k_rope.dtype
@@ -410,7 +416,7 @@ def apply_rope_mla_set_kv_buffer_triton(
     num_q_heads = q_rope.shape[1]
     rope_dim = q_rope.shape[2]
     assert k_rope.shape == (num_tokens, 1, rope_dim)
-    assert kv_buffer.shape[1] == nope_dim + rope_dim
+    assert kv_buffer.shape[-1] == nope_dim + rope_dim
     assert rope_dim % 2 == 0
     assert loc.dtype in (torch.int32, torch.int64)
     assert loc.ndim == 1
@@ -467,7 +473,9 @@ def apply_rope_mla_set_kv_buffer_triton(
         k_rope.stride(0),
         q_rope_out.stride(0),
         q_rope_out.stride(1),
+        kv_buffer.stride(-2),
         kv_buffer.stride(0),
+        kv_buffer.shape[1] if kv_buffer.ndim == 3 else 1,
         0 if cos_sin_cache is None else cos_sin_cache.stride(0),
         0 if q_nope is None else q_nope.stride(0),
         0 if q_nope is None else q_nope.stride(1),

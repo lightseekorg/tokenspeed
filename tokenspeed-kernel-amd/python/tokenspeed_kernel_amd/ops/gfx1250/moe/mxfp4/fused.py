@@ -60,7 +60,13 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
     get_tdm_gather_scatter_idx_layout,
     ragged_metadata_fields,
 )
-from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import _matmul_decode
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import (
+    _matmul_decode,
+    decode_tile_config,
+)
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.quantize import (
+    launch_triton_quantize_mxfp4_activation_gfx1250,
+)
 
 
 @dataclass
@@ -161,11 +167,7 @@ class MoESliceKProgram:
         if cfg.WITH_X_MX_SCALE:
             x_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
-                shape=[
-                    NUM_BUFFERS,
-                    cfg.BLOCK_M_PRESHUFFLED,
-                    cfg.BLOCK_K_SCALE_PRESHUFFLED,
-                ],
+                shape=[NUM_BUFFERS, cfg.BLOCK_M, cfg.BLOCK_K // cfg.SCALE_BLOCK],
                 layout=cfg.shared_layout_x_scale,
             )
         else:
@@ -239,20 +241,6 @@ class MoESliceKProgram:
 
         if cfg.WITH_X_MX_SCALE:
             x_scale_buffer_slice = self.x_scale_buffer.index(wmma_idx % cfg.NUM_BUFFERS)
-            if cfg.SCALE_PRESHUFFLE:
-                x_scale_buffer_slice = (
-                    x_scale_buffer_slice.reshape(
-                        (
-                            cfg.BLOCK_M_PRESHUFFLED,
-                            BLOCK_K_SCALE // cfg.SCALE_KWIDTH,
-                            cfg.PRESHUFFLE_FACTOR // 4,
-                            4,
-                            cfg.SCALE_KWIDTH,
-                        )
-                    )
-                    .permute((0, 3, 2, 1, 4))
-                    .reshape((cfg.BLOCK_M, BLOCK_K_SCALE))
-                )
             x_scale_buffer_slice = x_scale_buffer_slice.slice(
                 subtile_start // cfg.SCALE_BLOCK, SUBTILE_LEN_SCALE, 1
             )
@@ -452,11 +440,7 @@ class MoESliceNKProgram:
         if cfg.WITH_X_MX_SCALE:
             x_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
-                shape=[
-                    NUM_BUFFERS,
-                    cfg.BLOCK_M_PRESHUFFLED,
-                    cfg.BLOCK_K_SCALE_PRESHUFFLED,
-                ],
+                shape=[NUM_BUFFERS, cfg.BLOCK_M, cfg.BLOCK_K // cfg.SCALE_BLOCK],
                 layout=cfg.shared_layout_x_scale,
             )
         else:
@@ -533,7 +517,7 @@ class MoESliceNKProgram:
             else:
                 gl.amd.cdna5.tdm.async_load(
                     self.x_scale_desc,
-                    [0, load_idx * cfg.BLOCK_K_SCALE_PRESHUFFLED],
+                    [0, load_idx * BLOCK_K_SCALE],
                     self.x_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
                     pred=pred,
                 )
@@ -573,7 +557,6 @@ class MoESliceNKProgram:
         cfg = self.cfg
         NUM_SUBTILES_K: gl.constexpr = cfg.NUM_SUBTILES[2]
         SUBTILE_LEN: gl.constexpr = cfg.BLOCK_K // NUM_SUBTILES_K
-        BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
         subtile_start: gl.constexpr = subtile_start_idx * SUBTILE_LEN
 
         x = (
@@ -586,20 +569,6 @@ class MoESliceNKProgram:
 
         if cfg.WITH_X_MX_SCALE:
             x_scale_buffer_slice = self.x_scale_buffer.index(wmma_idx % cfg.NUM_BUFFERS)
-            if cfg.SCALE_PRESHUFFLE:
-                x_scale_buffer_slice = (
-                    x_scale_buffer_slice.reshape(
-                        (
-                            cfg.BLOCK_M_PRESHUFFLED,
-                            BLOCK_K_SCALE // cfg.SCALE_KWIDTH,
-                            cfg.PRESHUFFLE_FACTOR // 4,
-                            4,
-                            cfg.SCALE_KWIDTH,
-                        )
-                    )
-                    .permute((0, 3, 2, 1, 4))
-                    .reshape((cfg.BLOCK_M, BLOCK_K_SCALE))
-                )
             x_scale_buffer_slice = x_scale_buffer_slice.slice(
                 subtile_start // cfg.SCALE_BLOCK, SUBTILE_LEN // cfg.SCALE_BLOCK, 1
             )
@@ -738,7 +707,31 @@ class MoESliceNKProgram:
         return accumulator
 
 
-@gluon.jit
+def _matmul_launch_metadata(grid, kernel, args):
+    """Report the routed GEMM's work and modeled traffic to Proton.
+
+    ``bytes`` counts each operand once: the routed activation rows, every
+    expert's packed weights and scales, and the output rows. Re-reads of an
+    activation or weight tile by other tiles are left to the cache and not
+    counted.
+    """
+    m, n, k = args["M"], args["N"], args["K"]
+    x, w, y = args["X"], args["W"], args["Y"]
+    # Packed MXFP4 holds two values per byte.
+    x_bytes = m * k * x.element_size() // (2 if x.dtype == torch.uint8 else 1)
+    w_bytes = w.numel() * w.element_size()
+    if args["WMxScale"] is not None:
+        w_values = w.numel() * (2 if w.dtype == torch.uint8 else 1)
+        w_bytes += w_values // args["SCALE_BLOCK"]
+    y_bytes = m * (n // args["ACTIVATION_REDUCTION_N"]) * y.element_size()
+    return {
+        "name": f"{kernel.name} [M={m}, N={n}, K={k}]",
+        "flops8": 2 * m * n * k,
+        "bytes": x_bytes + w_bytes + y_bytes,
+    }
+
+
+@gluon.jit(launch_metadata=_matmul_launch_metadata)
 def _matmul(
     Y,
     stride_y_k,
@@ -955,6 +948,8 @@ def _matmul(
         # Rows left in this expert fit i32 even when the weight slab needs the
         # wide index type.
         descriptor_m = (eM - off_m).to(gl.int32)
+    # The weight descriptors start at this N tile, so their bounds must too.
+    descriptor_n = (N - pid_n * BLOCK_N).to(gl.int32)
     x_desc, w_desc, x_scale_desc, w_scale_desc, gathered_m = create_descriptor(
         cfg,
         X_ptr,
@@ -966,7 +961,7 @@ def _matmul(
         w_offs,
         w_scale_offs,
         descriptor_m,
-        N,
+        descriptor_n,
         K,
         stride_x_m,
         stride_x_k,
@@ -1360,7 +1355,8 @@ def matmul(
         decode: Select the small-M, M-ragged decode kernel.
         partial_tdm: Split each TDM descriptor load across half the warps so a
             pair of operand loads issues as one fused TDM operation. Requires
-            4 or 8 warps.
+            4 or 8 warps. The decode kernel pairs each weight load with its
+            scale load instead, and requires weight scales.
 
     Returns:
         ``(output, kernel)`` where ``kernel`` is the Triton/Gluon launch object.
@@ -1597,6 +1593,7 @@ def gluon_mxfp_combine(
     block_k: int = 256,
     num_warps: int = 4,
     num_buffers: int = 3,
+    xcd_swizzle: int = 1,
     use_warp_pipeline: bool | None = None,
     use_slice_mn: bool | None = None,
     use_slice_n: bool | None = None,
@@ -1643,6 +1640,7 @@ def gluon_mxfp_combine(
         block_k=block_k,
         num_warps=num_warps,
         num_buffers=num_buffers,
+        xcd_swizzle=xcd_swizzle,
         w_transpose=w_transpose,
         decode=decode,
         partial_tdm=partial_tdm,
@@ -1829,6 +1827,31 @@ def _precomputed_topk_route_m1_canonical_gfx1250_kernel(
 
 
 @gluon.jit
+def _sum_and_max(sum_a, max_a, sum_b, max_b):
+    return sum_a + sum_b, gl.maximum(max_a, max_b)
+
+
+def _small_route_launch_metadata(grid, kernel, args):
+    gates = args["M"] * args["TOPK"]
+    programs = grid[0]
+    experts = args["E"]
+    nb = args["NB"]
+    return {
+        "name": f"{kernel.name} [G={gates}, programs={programs}]",
+        # Every program reads all ids; outputs are the slice sizes/offsets,
+        # block offsets and schedules, and the gather/scatter/gate rows.
+        "bytes": programs * gates * 4
+        + gates * 4
+        + (2 * experts + 1) * 4
+        + nb * ((experts + 1) + args["MAX_BLOCKS"]) * 4
+        + gates * (4 + 4 + args["gate_scale_ptr"].element_size()),
+    }
+
+
+@gluon.jit(
+    launch_metadata=_small_route_launch_metadata,
+    do_not_specialize=["M", "MAX_BLOCKS", "stride_bs"],
+)
 def _precomputed_topk_route_small_m_gfx1250_kernel(
     topk_ids_ptr,
     topk_weights_ptr,
@@ -1839,155 +1862,147 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
     gather_indices_ptr,
     scatter_indices_ptr,
     gate_scale_ptr,
-    route_positions_ptr,
-    stride_im,
-    stride_ik,
-    stride_wm,
-    stride_wk,
-    M: gl.constexpr,
+    M,
+    MAX_BLOCKS,
+    stride_bs,
     E: gl.constexpr,
     TOPK: gl.constexpr,
     GP: gl.constexpr,
     EP: gl.constexpr,
-    MAX_BLOCKS: gl.constexpr,
+    CH: gl.constexpr,
     MAX_BLOCKS_POW2: gl.constexpr,
     NB: gl.constexpr,
     OUTPUT_DTYPE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     stride_bo: gl.constexpr,
-    stride_bs: gl.constexpr,
 ):
-    """Build bounded small-M ragged metadata in one wave32 workgroup."""
-    gates: gl.constexpr = M * TOPK
-    expert_layout: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
-    gate_layout: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
-    block_layout: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
+    """Stable counting sort of contiguous ``[M, TOPK]`` ids by expert.
 
+    Program ``p < cdiv(G, CH)`` places rows ``[p * CH, (p + 1) * CH)`` at
+    (rows of lower experts) + (same-expert rows in earlier chunks) +
+    (same-expert rows earlier in this chunk). The ``NB`` trailing programs
+    write the slice and block metadata, one block size each. Every program
+    builds the full expert histogram itself, so no program waits on another.
+    M, MAX_BLOCKS and the schedule stride follow the batch and stay runtime
+    values; the power-of-two extents GP and MAX_BLOCKS_POW2 select a binary.
+    """
+    # G is a multiple of TOPK, which keeps the masked id loads vectorized.
+    G = M * TOPK
+    pid = gl.program_id(0)
+    n_chunks = gl.cdiv(G, CH)
+    start = pid * CH
+    gate_layout: gl.constexpr = gl.BlockedLayout(
+        [GP // (32 * NUM_WARPS)], [32], [NUM_WARPS], [0]
+    )
+    expert_layout: gl.constexpr = gl.BlockedLayout(
+        [EP // (32 * NUM_WARPS)], [32], [NUM_WARPS], [0]
+    )
+    # [CH, CH] rank tile: rows across lanes, columns split across warps, so
+    # each thread compares only CH * CH / (32 * NUM_WARPS) pairs.
+    rank_layout: gl.constexpr = gl.BlockedLayout(
+        [CH // 32, CH // NUM_WARPS], [32, 1], [1, NUM_WARPS], [1, 0]
+    )
+    row_layout: gl.constexpr = gl.SliceLayout(1, rank_layout)
+    col_layout: gl.constexpr = gl.SliceLayout(0, rank_layout)
+    shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+
+    # Issue every global load up front; the chunk loads do not depend on the
+    # histogram.
+    is_chunk = pid < n_chunks
     gate = gl.arange(0, GP, layout=gate_layout)
-    gate_mask = gate < gates
-    token = (gate // TOPK).to(gl.int32)
-    slot = (gate % TOPK).to(gl.int32)
-    expert = gl.load(
-        topk_ids_ptr + token * stride_im + slot * stride_ik,
-        mask=gate_mask,
-        other=0,
-    ).to(gl.int32)
-    valid = gate_mask & (expert >= 0) & (expert < E)
-    safe_expert = gl.where(valid, expert, 0)
-    weight = gl.load(
-        topk_weights_ptr + token * stride_wm + slot * stride_wk,
-        mask=gate_mask,
-        other=0.0,
-    )
+    gate_mask = gate < G
+    ids = gl.load(topk_ids_ptr + gate, mask=gate_mask, other=E)
+    row = start + gl.arange(0, CH, layout=row_layout)
+    row_mask = row < G
+    row_ids = gl.load(topk_ids_ptr + row, mask=row_mask & is_chunk, other=E)
+    row_weights = gl.load(topk_weights_ptr + row, mask=row_mask & is_chunk, other=0.0)
 
-    expert_offset = gl.arange(0, EP, layout=expert_layout)
-    expert_mask = expert_offset < E
-    histogram = gl.histogram(
-        safe_expert,
-        EP,
-        mask=valid,
-        layout=expert_layout,
+    # Invalid ids count in bin E, after every expert; padding lanes go to the
+    # unused bin E + 1 so the atomics need no mask.
+    key = gl.where((ids >= 0) & (ids < E), ids, E)
+    key = gl.where(gate_mask, key, E + 1)
+    # One LDS atomic per row builds both histograms: the low 16 bits count all
+    # rows of an expert, the high 16 bits those before this chunk (G < 2^15).
+    increment = gl.where(gate < start, 65537, 1)
+    counts_smem = gl.allocate_shared_memory(
+        gl.int32,
+        [EP],
+        shared_layout,
+        gl.zeros([EP], gl.int32, layout=expert_layout),
     )
-    gl.store(slice_sizes_ptr + expert_offset, histogram, mask=expert_mask)
+    counts_smem.atomic_scatter_add(increment, key, axis=0)
+    counts = counts_smem.load(expert_layout)
+    histogram = counts & 0xFFFF
+    exclusive = gl.cumsum(histogram, 0) - histogram
+    expert = gl.arange(0, EP, layout=expert_layout)
 
-    inclusive = gl.cumsum(histogram, 0)
-    exclusive = inclusive - histogram
-    last_expert = expert_offset == (E - 1)
-    gl.store(slice_offsets_ptr + expert_offset, exclusive, mask=expert_mask)
-    gl.store(
-        slice_offsets_ptr + expert_offset + 1,
-        inclusive,
-        mask=expert_mask & last_expert,
-    )
-
-    # The atomic rank does not need to be stable: gather/scatter preserve each
-    # routed row's token and top-k slot, and each expert row is independent.
-    gl.store(route_positions_ptr + expert_offset, 0, mask=expert_mask)
-    # Global-memory ordering the compiler cannot see: every thread's zero
-    # store must be issued before any thread's atomic on the same slots.
-    gl.barrier()
-    rank = gl.atomic_add(
-        route_positions_ptr + safe_expert,
-        1,
-        mask=valid,
-        sem="relaxed",
-        scope="gpu",
-    )
-    position = gl.gather(exclusive, safe_expert, axis=0) + rank
-    gl.store(gather_indices_ptr + position, token, mask=valid)
-    gl.store(scatter_indices_ptr + position, gate.to(gl.int32), mask=valid)
-    gl.store(
-        gate_scale_ptr + position,
-        weight.to(OUTPUT_DTYPE),
-        mask=valid,
-    )
-
-    block = gl.arange(0, MAX_BLOCKS_POW2, layout=block_layout)
-    block_mask = block < MAX_BLOCKS
-    if M == 1 and TOPK <= 16:
-        # A one-token route has at most TOPK <= 16 rows per expert, so every
-        # supported block size produces the same one-block-per-active-expert
-        # schedule. Build that prefix once rather than repeating four scans.
-        expert_blocks = (histogram > 0).to(gl.int32)
-        block_inclusive = gl.cumsum(expert_blocks, 0)
-        block_exclusive = block_inclusive - expert_blocks
-        active_blocks = gl.sum(expert_blocks, axis=0)
-        route_block = gl.gather(block_exclusive, safe_expert, axis=0)
-        starts_block = valid & (rank == 0)
-        for block_size_index in gl.static_range(NB):
-            gl.store(
-                block_offsets_ptr + block_size_index * stride_bo + expert_offset,
-                block_exclusive,
-                mask=expert_mask,
-            )
-            gl.store(
-                block_offsets_ptr + block_size_index * stride_bo + expert_offset + 1,
-                block_inclusive,
-                mask=expert_mask & last_expert,
-            )
-            gl.store(
-                block_schedule_ptr + block_size_index * stride_bs + block,
-                -1,
-                mask=block_mask & (block >= active_blocks),
-            )
-            gl.store(
-                block_schedule_ptr + block_size_index * stride_bs + route_block,
-                safe_expert,
-                mask=starts_block,
-            )
+    if is_chunk:
+        row_key = gl.where((row_ids >= 0) & (row_ids < E), row_ids, E)
+        # Every lane needs every key of the chunk; an LDS broadcast avoids a
+        # uniform global load per column.
+        col_key = gl.convert_layout(row_key, col_layout)
+        col = start + gl.arange(0, CH, layout=col_layout)
+        # Rows past G carry key E and sort after every real row, so they need
+        # no mask in the rank.
+        earlier = gl.expand_dims(col, 0) < gl.expand_dims(row, 1)
+        same = gl.expand_dims(col_key, 0) == gl.expand_dims(row_key, 1)
+        rank = gl.sum((same & earlier).to(gl.int32), axis=1)
+        # One LDS round trip looks up each row's base in its own layout.
+        base_smem = gl.allocate_shared_memory(
+            gl.int32, [EP], shared_layout, exclusive + (counts >> 16)
+        )
+        position = base_smem.gather(row_key, axis=0) + rank
+        weight = gl.where(row_key < E, row_weights, 0.0)
+        gl.store(gather_indices_ptr + position, row // TOPK, mask=row_mask)
+        gl.store(scatter_indices_ptr + position, row, mask=row_mask)
+        gl.store(gate_scale_ptr + position, weight.to(OUTPUT_DTYPE), mask=row_mask)
     else:
-        for block_size_index in gl.static_range(NB):
-            expert_blocks = (histogram + (16 << block_size_index) - 1) // (
-                16 << block_size_index
-            )
-            block_inclusive = gl.cumsum(expert_blocks, 0)
-            block_exclusive = block_inclusive - expert_blocks
-            active_blocks = gl.sum(expert_blocks, axis=0)
+        block_size_index = pid - n_chunks
+        if block_size_index == 0:
+            gl.store(slice_sizes_ptr + expert, histogram, mask=expert < E)
+            # Bin E is the invalid-id bin, so exclusive[E] is the valid total.
+            # Storing it apart keeps the expert-range store vectorized.
+            gl.store(slice_offsets_ptr + expert, exclusive, mask=expert < E)
+            gl.store(slice_offsets_ptr + expert, exclusive, mask=expert == E)
+        log2_block = 4 + block_size_index
+        expert_blocks = gl.where(
+            expert < E, (histogram + ((1 << log2_block) - 1)) >> log2_block, 0
+        )
+        block_exclusive = gl.cumsum(expert_blocks, 0) - expert_blocks
+        active_blocks, max_expert_blocks = gl.reduce(
+            (expert_blocks, expert_blocks), 0, _sum_and_max
+        )
+        block_offsets = block_offsets_ptr + block_size_index * stride_bo + expert
+        gl.store(block_offsets, block_exclusive, mask=expert < E)
+        gl.store(block_offsets, block_exclusive, mask=expert == E)
+        block_layout: gl.constexpr = gl.BlockedLayout(
+            [MAX_BLOCKS_POW2 // (32 * NUM_WARPS)], [32], [NUM_WARPS], [0]
+        )
+        block = gl.arange(0, MAX_BLOCKS_POW2, layout=block_layout)
+        gl.store(
+            block_schedule_ptr + block_size_index * stride_bs + block,
+            gl.full([MAX_BLOCKS_POW2], -1, gl.int32, layout=block_layout),
+            mask=(block < MAX_BLOCKS) & (block >= active_blocks),
+        )
+        # Schedule entry (block << 16) | expert for each block of each expert.
+        for expert_block in range(0, max_expert_blocks):
             gl.store(
-                block_offsets_ptr + block_size_index * stride_bo + expert_offset,
-                block_exclusive,
-                mask=expert_mask,
+                block_schedule_ptr
+                + block_size_index * stride_bs
+                + block_exclusive
+                + expert_block,
+                (expert_block << 16) | expert,
+                mask=expert_block < expert_blocks,
             )
-            gl.store(
-                block_offsets_ptr + block_size_index * stride_bo + expert_offset + 1,
-                block_inclusive,
-                mask=expert_mask & last_expert,
-            )
-            gl.store(
-                block_schedule_ptr + block_size_index * stride_bs + block,
-                -1,
-                mask=block_mask & (block >= active_blocks),
-            )
-            route_block = gl.gather(block_exclusive, safe_expert, axis=0) + rank // (
-                16 << block_size_index
-            )
-            starts_block = valid & ((rank & ((16 << block_size_index) - 1)) == 0)
-            packed_block = ((rank // (16 << block_size_index)) << 16) | safe_expert
-            gl.store(
-                block_schedule_ptr + block_size_index * stride_bs + route_block,
-                packed_block,
-                mask=starts_block,
-            )
+
+
+_SMALL_ROUTE_MAX_TOKENS = 512
+_SMALL_ROUTE_MAX_GATES = 2048
+_SMALL_ROUTE_NUM_WARPS = 4
+# Rows per placement program. Every program rebuilds the full histogram, while
+# the in-chunk rank costs CHUNK^2 compares; 64 rows measured fastest from 4 to
+# 64 tokens, and 32 rows only added programs.
+_SMALL_ROUTE_CHUNK = 64
 
 
 def _precomputed_topk_route_small_m_gfx1250(
@@ -2010,10 +2025,12 @@ def _precomputed_topk_route_small_m_gfx1250(
         raise ValueError("unsupported gfx1250 small-M precomputed route")
     tokens, topk = map(int, topk_ids.shape)
     gates = tokens * topk
-    if not (1 <= tokens <= 16 and 0 < topk <= num_experts <= 1024):
+    if not (1 <= tokens <= _SMALL_ROUTE_MAX_TOKENS and 0 < topk <= num_experts <= 1024):
         raise ValueError("unsupported gfx1250 small-M route shape")
-    if gates > 256:
-        raise ValueError("gfx1250 small-M route supports at most 256 rows")
+    if gates > _SMALL_ROUTE_MAX_GATES:
+        raise ValueError(
+            f"gfx1250 small-M route supports at most {_SMALL_ROUTE_MAX_GATES} rows"
+        )
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
     topk_ids = topk_ids.contiguous()
@@ -2066,9 +2083,11 @@ def _precomputed_topk_route_small_m_gfx1250(
             num_warps=num_warps,
         )
     else:
-        route_positions = torch.empty(num_experts, dtype=torch.int32, device=device)
-        num_warps = 8 if gates > 128 else 4
-        _precomputed_topk_route_small_m_gfx1250_kernel[(1,)](
+        num_warps = _SMALL_ROUTE_NUM_WARPS
+        lanes = 32 * num_warps
+        _precomputed_topk_route_small_m_gfx1250_kernel[
+            (triton.cdiv(gates, _SMALL_ROUTE_CHUNK) + _ROUTE_NB,)
+        ](
             topk_ids,
             topk_weights,
             slice_sizes,
@@ -2078,23 +2097,20 @@ def _precomputed_topk_route_small_m_gfx1250(
             gather_indices,
             scatter_indices,
             gate_scale,
-            route_positions,
-            topk_ids.stride(0),
-            topk_ids.stride(1),
-            topk_weights.stride(0),
-            topk_weights.stride(1),
             M=tokens,
+            MAX_BLOCKS=max_blocks,
+            stride_bs=block_schedule.stride(0),
             E=num_experts,
             TOPK=topk,
-            GP=_route_next_pow2(gates),
-            EP=_route_next_pow2(num_experts),
-            MAX_BLOCKS=max_blocks,
-            MAX_BLOCKS_POW2=_route_next_pow2(max_blocks),
+            GP=max(_route_next_pow2(gates), lanes),
+            # Bin E collects invalid ids and bin E + 1 padding rows.
+            EP=max(_route_next_pow2(num_experts + 2), lanes),
+            CH=_SMALL_ROUTE_CHUNK,
+            MAX_BLOCKS_POW2=max(_route_next_pow2(max_blocks), lanes),
             NB=_ROUTE_NB,
             OUTPUT_DTYPE=_ROUTE_GL_DTYPE[topk_weights.dtype],
             NUM_WARPS=num_warps,
             stride_bo=block_offsets.stride(0),
-            stride_bs=block_schedule.stride(0),
             num_warps=num_warps,
         )
     ragged_metadata = RaggedTensorMetadata(
@@ -2106,14 +2122,31 @@ def _precomputed_topk_route_small_m_gfx1250(
     return ragged_metadata, gather_indices, scatter_indices, gate_scale
 
 
-_LARGE_ROUTE_CHUNK = 128
 _LARGE_ROUTE_NUM_WARPS = 8
 _LARGE_ROUTE_HISTOGRAM_NUM_WARPS = 4
 _LARGE_ROUTE_SCAN_EXPERTS = 8
 _LARGE_ROUTE_SCAN_NUM_WARPS = 4
 
 
-@gluon.jit
+def _large_route_chunk(num_experts: int, gates: int) -> int:
+    # Every chunk stores one count per expert, and stage 4 ranks a chunk's
+    # gates pairwise. Longer chunks shrink that table but lengthen the ranking
+    # loop, so the best length grows with sqrt(experts * gates).
+    work = num_experts * gates
+    if work < 1 << 22:
+        return 32
+    return 64 if work < 1 << 24 else 128
+
+
+@gluon.jit(
+    do_not_specialize=[
+        "G",
+        "NUM_PROGRAMS",
+        "TOKENS_PER_PROGRAM",
+        "MAX_BLOCKS",
+        "stride_bs",
+    ]
+)
 def _precomputed_topk_route_large_stage1_gfx1250_kernel(
     topk_ids_ptr,
     chunk_offsets_ptr,
@@ -2122,17 +2155,21 @@ def _precomputed_topk_route_large_stage1_gfx1250_kernel(
     scatter_indices_ptr,
     gate_scale_ptr,
     E: gl.constexpr,
-    G: gl.constexpr,
+    G,
     EP: gl.constexpr,
-    NUM_PROGRAMS: gl.constexpr,
-    TOKENS_PER_PROGRAM: gl.constexpr,
+    NUM_PROGRAMS,
+    TOKENS_PER_PROGRAM,
     ROUTE_BLOCK: gl.constexpr,
-    MAX_BLOCKS: gl.constexpr,
+    MAX_BLOCKS,
     NB: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    stride_bs: gl.constexpr,
+    stride_bs,
 ):
-    """Count one bounded route chunk and initialize all output capacity."""
+    """Count one bounded route chunk and initialize all output capacity.
+
+    The gate count, chunking and schedule extent follow the batch, so they stay
+    runtime values; only the power-of-two chunk extent selects a binary.
+    """
     pid = gl.program_id(0)
     route_layout: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
     expert_layout: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
@@ -2169,7 +2206,7 @@ def _precomputed_topk_route_large_stage1_gfx1250_kernel(
     gl.store(gate_scale_ptr + idx, 0.0, mask=route_mask)
 
     # max_n_blocks(E, G) is at most G, so five passes cover all five rows.
-    schedule_stride: gl.constexpr = NUM_PROGRAMS * ROUTE_BLOCK
+    schedule_stride = NUM_PROGRAMS * ROUTE_BLOCK
     schedule_idx = pid * ROUTE_BLOCK + route
     for schedule_pass in gl.static_range(NB):
         schedule_offset = schedule_idx + schedule_pass * schedule_stride
@@ -2182,12 +2219,12 @@ def _precomputed_topk_route_large_stage1_gfx1250_kernel(
         )
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["NUM_PROGRAMS"])
 def _precomputed_topk_route_large_stage2_gfx1250_kernel(
     chunk_offsets_ptr,
     expert_totals_ptr,
     E: gl.constexpr,
-    NUM_PROGRAMS: gl.constexpr,
+    NUM_PROGRAMS,
     SCAN_BLOCK: gl.constexpr,
     EXPERT_BLOCK: gl.constexpr,
     NUM_WARPS: gl.constexpr,
@@ -2256,7 +2293,7 @@ def _precomputed_topk_route_large_stage3_gfx1250_kernel(
         )
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["G", "NUM_PROGRAMS", "TOKENS_PER_PROGRAM", "stride_bs"])
 def _precomputed_topk_route_large_stage4_gfx1250_kernel(
     topk_ids_ptr,
     topk_weights_ptr,
@@ -2269,16 +2306,16 @@ def _precomputed_topk_route_large_stage4_gfx1250_kernel(
     scatter_indices_ptr,
     gate_scale_ptr,
     E: gl.constexpr,
-    G: gl.constexpr,
+    G,
     TOPK: gl.constexpr,
-    NUM_PROGRAMS: gl.constexpr,
-    TOKENS_PER_PROGRAM: gl.constexpr,
+    NUM_PROGRAMS,
+    TOKENS_PER_PROGRAM,
     ROUTE_BLOCK: gl.constexpr,
     NB: gl.constexpr,
     OUTPUT_DTYPE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     stride_bo: gl.constexpr,
-    stride_bs: gl.constexpr,
+    stride_bs,
 ):
     """Materialize schedules and scatter valid routes into compact slices."""
     pid = gl.program_id(0)
@@ -2385,10 +2422,7 @@ def _precomputed_topk_route_large_m_gfx1250(
     topk_weights = topk_weights.contiguous()
 
     gates = tokens * topk
-    num_programs = max(
-        num_experts,
-        triton.cdiv(gates, _LARGE_ROUTE_CHUNK),
-    )
+    num_programs = triton.cdiv(gates, _large_route_chunk(num_experts, gates))
     tokens_per_program = triton.cdiv(gates, num_programs)
     route_block = _route_next_pow2(tokens_per_program)
     device = topk_ids.device
@@ -2693,8 +2727,13 @@ def _precomputed_topk_route(
     num_experts: int,
 ):
     # The one-launch bounded route wins in four paired whole-model repeats and
-    # preserves the canonical M1 path. Larger batches retain the generic route.
-    if 0 < topk_ids.shape[0] <= 16 and topk_ids.numel() <= 256 and num_experts <= 1024:
+    # preserves the canonical M1 path. Each of its programs re-reads every id,
+    # so past 2K gates the staged route is cheaper.
+    if (
+        0 < topk_ids.shape[0] <= _SMALL_ROUTE_MAX_TOKENS
+        and topk_ids.numel() <= _SMALL_ROUTE_MAX_GATES
+        and num_experts <= 1024
+    ):
         return _precomputed_topk_route_small_m_gfx1250(
             topk_weights,
             topk_ids,
@@ -2718,6 +2757,45 @@ def _precomputed_topk_route(
     )
 
 
+# Prefill tiles for FP8 activations, measured at 8192-token chunks, 896
+# experts, top-16, so ~146 rows per expert. Neither GEMM saturates WMMA,
+# TDM, LDS or HBM; each program runs its load, LDS and WMMA phases mostly back
+# to back, so the tiles are chosen for how many programs stay resident and
+# how well they share L2.
+# - gate/up (K=3584): with four warps each wave needs ~560 VGPRs, so a WGP
+#   holds one program. Eight warps need ~170 VGPRs each, and two programs fit
+#   in LDS, putting four waves on each SIMD.
+# - down (K=384): 128-wide K steps cover K exactly, where 256-wide steps
+#   spend a quarter of the WMMAs on zero padding, and halve the operand ring
+#   so four programs fit in LDS.
+# - Workgroups are dispatched round-robin over the XCDs. xcd_swizzle=8 gives
+#   each XCD a contiguous run of tiles, so the M tiles reading one expert's
+#   weights and the N tiles reading one activation tile share an L2.
+_PREFILL_GATE_UP_TILES = {
+    "block_n": 256,
+    "block_k": 256,
+    "num_warps": 8,
+    "num_buffers": 3,
+    "xcd_swizzle": 8,
+}
+_PREFILL_DOWN_TILES = {
+    "block_n": 256,
+    "block_k": 128,
+    "num_warps": 4,
+    "num_buffers": 3,
+    "xcd_swizzle": 8,
+}
+
+# The tiles above were measured only with FP8 activations. MXFP4 activations
+# (A4W4) keep the original prefill tile until they are measured on that path.
+_PREFILL_MXFP4_ACTIVATION_TILES = {
+    "block_n": 256,
+    "block_k": 256,
+    "num_warps": 4,
+    "num_buffers": 3,
+}
+
+
 def gluon_mxfp_precomputed_mxfp4_fused_moe(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -2727,6 +2805,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     *,
     w13_mx_scale: torch.Tensor,
     w2_mx_scale: torch.Tensor,
+    activation_dtype: str,
     w13_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
@@ -2745,13 +2824,17 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
 
     Args:
         hidden_states: Token activations in bf16/fp16/fp8, shaped
-            ``(n_tokens, hidden_size)``.
+            ``(n_tokens, hidden_size)``. The MXFP4 path takes bf16/fp16 only.
         topk_weights: Route weights, shaped ``(n_tokens, top_k)``.
         topk_ids: Expert ids, shaped ``(n_tokens, top_k)``.
         w13_weight: gfx1250-preprocessed interleaved gate/up expert weight.
         w2_weight: gfx1250-preprocessed down-projection expert weight.
         w13_mx_scale: gfx1250-swizzled MXFP4 scale for ``w13_weight``.
         w2_mx_scale: gfx1250-swizzled MXFP4 scale for ``w2_weight``.
+        activation_dtype: ``"fp8"`` feeds both projections FP8 activations
+            with the weights' static per-tensor scales. ``"mxfp4"`` quantizes
+            the input and the BF16 intermediate to MXFP4 with dynamic
+            per-32-value e8m0 scales.
         w13_bias: Optional expert bias for the gate/up projection.
         w2_bias: Optional expert bias for the down projection.
         out_dtype: Final output dtype.
@@ -2771,6 +2854,11 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     Returns:
         Tensor shaped ``(n_tokens, hidden_size)``.
     """
+    if activation_dtype not in ("fp8", "mxfp4"):
+        raise ValueError(
+            "gfx1250 Gluon MXFP4 MoE supports activation_dtype 'fp8' or "
+            f"'mxfp4', got {activation_dtype!r}"
+        )
     if topk_ids.ndim != 2:
         raise ValueError(f"topk_ids must be rank-2, got {tuple(topk_ids.shape)}")
     if topk_weights.shape != topk_ids.shape:
@@ -2797,10 +2885,6 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         num_experts,
     )
 
-    x_fp8 = _quantize_fp8_activation(
-        hidden_states,
-        w13_weight.act_scale,
-    )
     if activation == "situ":
         fused_activation = FusedActivation(
             FnSpecs("situ", None, ("beta", "linear_beta"), reduction_n=2),
@@ -2821,48 +2905,77 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             "gfx1250 Gluon MXFP4 MoE supports activation 'silu', "
             f"'swiglu', or 'situ', got {activation!r}"
         )
-    # The second matmul wants its activation in FP8, so the first one divides
-    # by that scale and casts in its epilogue. Quantizing separately would
-    # re-read and rewrite the whole intermediate for no other reason.
-    intermediate_fp8 = gluon_mxfp_ragged_matmul(
-        x_fp8,
-        w13_weight,
-        w13_bias,
-        w_mx_scale=w13_mx_scale,
-        x_format="e4m3",
-        x_global_scale=w13_weight.act_scale,
-        y_global_scale=w2_weight.act_scale,
-        a_ragged_metadata=ragged_metadata,
-        gather_indx=gather_indx,
-        out_dtype=torch.float8_e4m3fn,
-        fused_activation=fused_activation,
-        scale_preshuffle=True,
-        block_m=block_m,
-        block_n=256,
-        block_k=256,
-        num_warps=4,
-        num_buffers=3,
-        decode=decode,
-        partial_tdm=partial_tdm,
-    )
+    if decode:
+        gate_up_tiles = decode_tile_config(int(hidden_states.shape[-1]))
+        # The down projection reduces over the activation's half of W13's N.
+        down_tiles = decode_tile_config(int(w13_raw.shape[-1]) // 2)
+    else:
+        if activation_dtype == "fp8":
+            gate_up_tiles = _PREFILL_GATE_UP_TILES
+            down_tiles = _PREFILL_DOWN_TILES
+        else:
+            gate_up_tiles = down_tiles = _PREFILL_MXFP4_ACTIVATION_TILES
+    launch = dict(block_m=block_m, decode=decode, partial_tdm=partial_tdm)
+    if activation_dtype == "mxfp4":
+        x_mxfp4, x_mx_scale = launch_triton_quantize_mxfp4_activation_gfx1250(
+            hidden_states
+        )
+        intermediate = gluon_mxfp_ragged_matmul(
+            x_mxfp4,
+            w13_weight,
+            w13_bias,
+            w_mx_scale=w13_mx_scale,
+            x_mx_scale=x_mx_scale,
+            x_format="e2m1",
+            a_ragged_metadata=ragged_metadata,
+            gather_indx=gather_indx,
+            out_dtype=torch.bfloat16,
+            fused_activation=fused_activation,
+            scale_preshuffle=True,
+            **gate_up_tiles,
+            **launch,
+        )
+        intermediate, intermediate_mx_scale = (
+            launch_triton_quantize_mxfp4_activation_gfx1250(intermediate)
+        )
+        stage2_kwargs = dict(
+            x_scale=intermediate_mx_scale, x_format="e2m1", x_global_scale=None
+        )
+    else:
+        x_fp8 = _quantize_fp8_activation(hidden_states, w13_weight.act_scale)
+        # The second matmul wants its activation in FP8, so the first one
+        # divides by that scale and casts in its epilogue. Quantizing
+        # separately would re-read and rewrite the whole intermediate for no
+        # other reason.
+        intermediate = gluon_mxfp_ragged_matmul(
+            x_fp8,
+            w13_weight,
+            w13_bias,
+            w_mx_scale=w13_mx_scale,
+            x_format="e4m3",
+            x_global_scale=w13_weight.act_scale,
+            y_global_scale=w2_weight.act_scale,
+            a_ragged_metadata=ragged_metadata,
+            gather_indx=gather_indx,
+            out_dtype=torch.float8_e4m3fn,
+            fused_activation=fused_activation,
+            scale_preshuffle=True,
+            **gate_up_tiles,
+            **launch,
+        )
+        stage2_kwargs = dict(x_format="e4m3", x_global_scale=w2_weight.act_scale)
     flat = gluon_mxfp_combine(
-        intermediate_fp8,
+        intermediate,
         w2_weight,
         w2_mx_scale,
-        x_format="e4m3",
-        x_global_scale=w2_weight.act_scale,
+        **stage2_kwargs,
         bias=w2_bias,
         a_ragged_metadata=ragged_metadata,
         scatter_indx=scatter_indx,
         out_dtype=out_dtype,
-        block_m=block_m,
-        block_n=256,
-        block_k=256,
-        num_warps=4,
-        num_buffers=3,
+        **down_tiles,
         scale_load_mode="swizzle",
-        decode=decode,
-        partial_tdm=partial_tdm,
+        **launch,
     )
     return _weighted_topk_reduce_gfx1250(
         flat,
@@ -2932,6 +3045,7 @@ def gluon_mxfp_ragged_matmul(
             "block_k",
             "num_buffers",
             "num_warps",
+            "xcd_swizzle",
             "decode",
             "partial_tdm",
         }

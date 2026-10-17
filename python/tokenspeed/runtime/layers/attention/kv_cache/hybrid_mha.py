@@ -78,7 +78,7 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
 
     @cached_property
     def state_group_by_layer(self) -> dict[int, str]:
-        """View-local state layer id -> its state-family cache group id."""
+        """View-local state layer id -> its state cache group id."""
         return derive_state_groups_by_layer(
             self.arena,
             first_layer=self._field_layer_offset,

@@ -20,141 +20,138 @@
 
 """The --numerics envelope folds into the individual determinism switches."""
 
-import unittest
+import sys
+
+import pytest
 
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
-class TestNumericsMode(unittest.TestCase):
+class TestNumericsMode:
     def test_auto_keeps_performance_defaults(self):
         args = ServerArgs(model="x")
-        self.assertEqual(args.numerics, "auto")
-        self.assertFalse(args.force_deterministic_rsag)
-        self.assertFalse(args.disable_autotune)
-        self.assertFalse(args.disable_tf32)
+        assert (args.numerics) == ("auto")
+        assert not (args.force_deterministic_rsag)
+        assert not (args.disable_autotune)
+        assert not (args.disable_tf32)
 
     def test_rl_bitwise_tightens_every_switch(self):
         args = ServerArgs(model="x", numerics="rl-bitwise")
         # The envelope routes reductions itself (batch_invariant_collectives);
         # the NCCL-only knob stays the user's.
-        self.assertFalse(args.force_deterministic_rsag)
-        self.assertTrue(
-            ServerArgs(
-                model="x", numerics="rl-bitwise", force_deterministic_rsag=True
-            ).force_deterministic_rsag
-        )
-        self.assertTrue(args.disable_autotune)
-        self.assertTrue(args.disable_tf32)
-        self.assertTrue(args.disable_pdl)
-        self.assertFalse(args.enable_allreduce_fusion)
-        self.assertEqual(args.comm_fusion_max_num_tokens, -1)
-        self.assertEqual(args.moe_backend, "aok")
-        self.assertTrue(args.batch_invariant_collectives)
+        assert not (args.force_deterministic_rsag)
+        assert ServerArgs(
+            model="x", numerics="rl-bitwise", force_deterministic_rsag=True
+        ).force_deterministic_rsag
+        assert args.disable_autotune
+        assert args.disable_tf32
+        assert args.disable_pdl
+        assert not (args.enable_allreduce_fusion)
+        assert (args.comm_fusion_max_num_tokens) == (-1)
+        assert (args.moe_backend) == ("aok")
+        assert args.batch_invariant_collectives
 
     def test_rl_bitwise_refuses_non_invariant_backends(self):
-        with self.assertRaisesRegex(ValueError, "--moe-backend triton"):
+        with pytest.raises((ValueError), match=("--moe-backend triton")):
             ServerArgs(model="x", numerics="rl-bitwise", moe_backend="triton")
-        with self.assertRaisesRegex(ValueError, "--draft-moe-backend triton"):
+        with pytest.raises((ValueError), match=("--draft-moe-backend triton")):
             ServerArgs(model="x", numerics="rl-bitwise", draft_moe_backend="triton")
         # An explicit auto is a select-for-me request, folded like the target's.
         args = ServerArgs(model="x", numerics="rl-bitwise", draft_moe_backend="auto")
-        self.assertEqual(args.draft_moe_backend, "aok")
-        with self.assertRaisesRegex(ValueError, "--sampling-backend triton"):
+        assert (args.draft_moe_backend) == ("aok")
+        with pytest.raises((ValueError), match=("--sampling-backend triton")):
             ServerArgs(model="x", numerics="rl-bitwise", sampling_backend="triton")
         args = ServerArgs(
             model="x", numerics="rl-bitwise", sampling_backend="flashinfer_full"
         )
-        self.assertEqual(args.sampling_backend, "flashinfer_full")
+        assert (args.sampling_backend) == ("flashinfer_full")
 
     def test_auto_keeps_the_moe_backend_auto(self):
         args = ServerArgs(model="x")
-        self.assertEqual(args.moe_backend, "auto")
+        assert (args.moe_backend) == ("auto")
 
     def test_rl_bitwise_overrides_the_fusion_auto_enable(self):
         # resolve_communication auto-enables allreduce fusion on capable
         # topologies; the envelope must win regardless.
         args = ServerArgs(model="x", numerics="rl-bitwise", world_size=1)
-        self.assertFalse(args.enable_allreduce_fusion)
+        assert not (args.enable_allreduce_fusion)
 
     def test_unknown_mode_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "rl-bitwise"):
+        with pytest.raises((ValueError), match=("rl-bitwise")):
             ServerArgs(model="x", numerics="bitwise")
 
     def test_rl_bitwise_folds_the_per_request_sampling_stream(self):
-        self.assertEqual(ServerArgs(model="x").sampling_stream, "batch")
+        assert (ServerArgs(model="x").sampling_stream) == ("batch")
         args = ServerArgs(model="x", numerics="rl-bitwise")
-        self.assertEqual(args.sampling_stream, "per-request")
+        assert (args.sampling_stream) == ("per-request")
         args = ServerArgs(model="x", sampling_stream="per-request")
-        self.assertEqual(args.sampling_stream, "per-request")
-        with self.assertRaisesRegex(ValueError, "--sampling-stream"):
+        assert (args.sampling_stream) == ("per-request")
+        with pytest.raises((ValueError), match=("--sampling-stream")):
             ServerArgs(model="x", sampling_stream="philox")
 
     def test_rl_bitwise_computes_the_yarn_ramp_on_cpu(self):
-        self.assertEqual(ServerArgs(model="x").yarn_ramp_mask_device, "cuda")
-        self.assertEqual(
-            ServerArgs(model="x", numerics="rl-bitwise").yarn_ramp_mask_device, "cpu"
+        assert (ServerArgs(model="x").yarn_ramp_mask_device) == ("cuda")
+        assert (ServerArgs(model="x", numerics="rl-bitwise").yarn_ramp_mask_device) == (
+            "cpu"
         )
-        with self.assertRaisesRegex(ValueError, "--yarn-ramp-mask-device"):
+        with pytest.raises((ValueError), match=("--yarn-ramp-mask-device")):
             ServerArgs(model="x", yarn_ramp_mask_device="npu")
 
     def test_rl_bitwise_applies_the_mla_lora_scale_at_runtime(self):
-        self.assertEqual(ServerArgs(model="x").mla_lora_scale, "folded")
-        self.assertEqual(
-            ServerArgs(model="x", numerics="rl-bitwise").mla_lora_scale, "runtime"
+        assert (ServerArgs(model="x").mla_lora_scale) == ("folded")
+        assert (ServerArgs(model="x", numerics="rl-bitwise").mla_lora_scale) == (
+            "runtime"
         )
-        with self.assertRaisesRegex(ValueError, "--mla-lora-scale"):
+        with pytest.raises((ValueError), match=("--mla-lora-scale")):
             ServerArgs(model="x", mla_lora_scale="both")
 
     def test_rl_bitwise_unfuses_the_layer_boundary_norm(self):
-        self.assertEqual(ServerArgs(model="x").layer_boundary_norm, "fused")
-        self.assertEqual(
-            ServerArgs(model="x", numerics="rl-bitwise").layer_boundary_norm,
-            "unfused",
+        assert (ServerArgs(model="x").layer_boundary_norm) == ("fused")
+        assert (ServerArgs(model="x", numerics="rl-bitwise").layer_boundary_norm) == (
+            "unfused"
         )
         # On its own, under auto, it still vetoes the fused all-reduce+norm.
         args = ServerArgs(
             model="x", layer_boundary_norm="unfused", enable_allreduce_fusion=True
         )
-        self.assertFalse(args.enable_allreduce_fusion)
-        with self.assertRaisesRegex(ValueError, "--layer-boundary-norm"):
+        assert not (args.enable_allreduce_fusion)
+        with pytest.raises((ValueError), match=("--layer-boundary-norm")):
             ServerArgs(model="x", layer_boundary_norm="half")
 
     def test_rl_bitwise_routes_with_the_torch_router_topk(self):
-        self.assertEqual(ServerArgs(model="x").router_topk, "fused")
-        self.assertEqual(
-            ServerArgs(model="x", numerics="rl-bitwise").router_topk, "torch"
-        )
-        with self.assertRaisesRegex(ValueError, "--router-topk"):
+        assert (ServerArgs(model="x").router_topk) == ("fused")
+        assert (ServerArgs(model="x", numerics="rl-bitwise").router_topk) == ("torch")
+        with pytest.raises((ValueError), match=("--router-topk")):
             ServerArgs(model="x", router_topk="cuda")
 
     def test_rl_bitwise_reports_megatron_order_logprobs(self):
-        self.assertEqual(ServerArgs(model="x").logprob_order, "torch")
-        self.assertEqual(
-            ServerArgs(model="x", numerics="rl-bitwise").logprob_order, "megatron"
+        assert (ServerArgs(model="x").logprob_order) == ("torch")
+        assert (ServerArgs(model="x", numerics="rl-bitwise").logprob_order) == (
+            "megatron"
         )
-        with self.assertRaisesRegex(ValueError, "--logprob-order"):
+        with pytest.raises((ValueError), match=("--logprob-order")):
             ServerArgs(model="x", logprob_order="apex")
 
     def test_rl_bitwise_reduces_dsa_slots_sorted(self):
-        self.assertEqual(ServerArgs(model="x").dsa_slot_order, "selection")
-        self.assertEqual(
-            ServerArgs(model="x", numerics="rl-bitwise").dsa_slot_order, "sorted"
+        assert (ServerArgs(model="x").dsa_slot_order) == ("selection")
+        assert (ServerArgs(model="x", numerics="rl-bitwise").dsa_slot_order) == (
+            "sorted"
         )
-        with self.assertRaisesRegex(ValueError, "--dsa-slot-order"):
+        with pytest.raises((ValueError), match=("--dsa-slot-order")):
             ServerArgs(model="x", dsa_slot_order="shuffled")
 
     def test_rl_bitwise_combines_moe_slots_in_the_leaf(self):
-        self.assertEqual(ServerArgs(model="x").moe_combine_order, "rank")
-        self.assertEqual(
-            ServerArgs(model="x", numerics="rl-bitwise").moe_combine_order, "slot"
+        assert (ServerArgs(model="x").moe_combine_order) == ("rank")
+        assert (ServerArgs(model="x", numerics="rl-bitwise").moe_combine_order) == (
+            "slot"
         )
         # The leaf returns complete rows, so a fused all-reduce+norm at the
         # next layer boundary would sum them again: vetoed under auto too.
         args = ServerArgs(
             model="x", moe_combine_order="slot", enable_allreduce_fusion=True
         )
-        self.assertFalse(args.enable_allreduce_fusion)
-        with self.assertRaisesRegex(ValueError, "--moe-combine-order"):
+        assert not (args.enable_allreduce_fusion)
+        with pytest.raises((ValueError), match=("--moe-combine-order")):
             ServerArgs(model="x", moe_combine_order="tree")
 
     def test_slot_combine_is_validated_against_the_launch_at_startup(self):
@@ -163,9 +160,9 @@ class TestNumericsMode(unittest.TestCase):
         ServerArgs(model="x", moe_combine_order="slot", world_size=2, ep_size=2)
         # MoE TP defaults to the stage world over EP, so world_size=2 alone
         # is MoE TP 2.
-        with self.assertRaisesRegex(ValueError, "needs MoE TP 1"):
+        with pytest.raises((ValueError), match=("needs MoE TP 1")):
             ServerArgs(model="x", moe_combine_order="slot", world_size=2)
-        with self.assertRaisesRegex(ValueError, "--all2all-backend deepep"):
+        with pytest.raises((ValueError), match=("--all2all-backend deepep")):
             ServerArgs(
                 model="x",
                 moe_combine_order="slot",
@@ -174,15 +171,15 @@ class TestNumericsMode(unittest.TestCase):
                 all2all_backend="deepep",
             )
         # The envelope inherits both refusals: rl-bitwise needs MoE TP 1.
-        with self.assertRaisesRegex(ValueError, "needs MoE TP 1"):
+        with pytest.raises((ValueError), match=("needs MoE TP 1")):
             ServerArgs(model="x", numerics="rl-bitwise", world_size=2)
         ServerArgs(model="x", numerics="rl-bitwise", world_size=2, ep_size=2)
 
     def test_rl_bitwise_is_the_one_bitwise_envelope(self):
         from tokenspeed.runtime.configs.numerics import NUMERICS_ENVELOPES
 
-        self.assertEqual(NUMERICS_ENVELOPES, ("auto", "rl-bitwise"))
-        with self.assertRaisesRegex(ValueError, "rl-bitwise"):
+        assert (NUMERICS_ENVELOPES) == (("auto", "rl-bitwise"))
+        with pytest.raises((ValueError), match=("rl-bitwise")):
             ServerArgs(model="x", numerics="trainer-aligned")
 
     def test_bitwise_envelopes_cover_every_pinning_envelope(self):
@@ -191,7 +188,7 @@ class TestNumericsMode(unittest.TestCase):
             NUMERICS_ENVELOPES,
         )
 
-        self.assertEqual(BITWISE_ENVELOPES, set(NUMERICS_ENVELOPES) - {"auto"})
+        assert (BITWISE_ENVELOPES) == (set(NUMERICS_ENVELOPES) - {"auto"})
 
     def test_ordered_fold_matches_the_sum_and_only_depends_on_rank_order(self):
         import torch
@@ -205,13 +202,13 @@ class TestNumericsMode(unittest.TestCase):
         expected = parts[0].clone()
         for rank in range(1, 8):
             expected = expected + parts[rank]
-        self.assertTrue(torch.equal(out, expected.to(torch.bfloat16)))
+        assert torch.equal(out, expected.to(torch.bfloat16))
         # The same row folds to the same bits inside a larger payload: the
         # batch-invariance claim a ring all-reduce cannot make.
         wide = torch.cat((torch.randn(8, 300, 64), parts.narrow(1, 2, 1)), dim=1)
         wide_out = torch.empty(301, 64, dtype=torch.bfloat16)
         ordered_fold_sum(wide, wide_out)
-        self.assertTrue(torch.equal(wide_out[300], out[2]))
+        assert torch.equal(wide_out[300], out[2])
 
     def test_token_reduce_scatter_folds_each_slice_in_rank_order(self):
         from unittest import mock
@@ -252,10 +249,10 @@ class TestNumericsMode(unittest.TestCase):
                     expected
                     + inputs[other][offsets[rank] : offsets[rank] + counts[rank]]
                 )
-            self.assertTrue(torch.equal(got, expected))
+            assert torch.equal(got, expected)
 
 
-class TestModelVerificationGate(unittest.TestCase):
+class TestModelVerificationGate:
     def _profile(self, envelopes):
         from tokenspeed.runtime.configs.model_config import configure_mla_attention
         from tokenspeed.runtime.configs.model_profile import ModelProfile
@@ -267,6 +264,7 @@ class TestModelVerificationGate(unittest.TestCase):
             default_attention_backend=None,
             default_prefix_granularity=None,
             request_token_history=False,
+            is_multimodal=False,
             tokenizer_kwargs={},
             attention_instances_per_layer=1,
             numerics_envelopes=frozenset(envelopes),
@@ -289,7 +287,7 @@ class TestModelVerificationGate(unittest.TestCase):
             require_verified_numerics,
         )
 
-        with self.assertRaisesRegex(ValueError, "has not been verified"):
+        with pytest.raises((ValueError), match=("has not been verified")):
             require_verified_numerics(
                 "rl-bitwise",
                 model_profile=None,
@@ -297,7 +295,7 @@ class TestModelVerificationGate(unittest.TestCase):
                 quantization=None,
                 vocab_size=MEGATRON_VOCAB_BLOCK,
             )
-        with self.assertRaisesRegex(ValueError, "has not been verified"):
+        with pytest.raises((ValueError), match=("has not been verified")):
             require_verified_numerics(
                 "rl-bitwise",
                 model_profile=self._profile({"auto"}),
@@ -306,7 +304,7 @@ class TestModelVerificationGate(unittest.TestCase):
                 vocab_size=MEGATRON_VOCAB_BLOCK,
             )
         verified = self._profile({"auto", "rl-bitwise"})
-        with self.assertRaisesRegex(ValueError, "fp8-quantized"):
+        with pytest.raises((ValueError), match=("fp8-quantized")):
             require_verified_numerics(
                 "rl-bitwise",
                 model_profile=verified,
@@ -331,7 +329,7 @@ class TestModelVerificationGate(unittest.TestCase):
             require_verified_numerics,
         )
 
-        with self.assertRaisesRegex(ValueError, "vocab_size 32000, not a multiple"):
+        with pytest.raises((ValueError), match=("vocab_size 32000, not a multiple")):
             require_verified_numerics(
                 "rl-bitwise",
                 model_profile=self._profile({"auto", "rl-bitwise"}),
@@ -339,19 +337,19 @@ class TestModelVerificationGate(unittest.TestCase):
                 quantization=None,
                 vocab_size=32000,
             )
-        self.assertEqual(MEGATRON_VOCAB_BLOCK, 32768)
+        assert (MEGATRON_VOCAB_BLOCK) == (32768)
 
     def test_profile_envelopes_are_validated(self):
-        with self.assertRaisesRegex(ValueError, "must include 'auto'"):
+        with pytest.raises((ValueError), match=("must include 'auto'")):
             self._profile({"rl-bitwise"})
-        with self.assertRaisesRegex(ValueError, "must include 'auto'"):
+        with pytest.raises((ValueError), match=("must include 'auto'")):
             self._profile({"auto", "bitwise"})
-        with self.assertRaisesRegex(ValueError, "must include 'auto'"):
+        with pytest.raises((ValueError), match=("must include 'auto'")):
             self._profile({"auto", "trainer-aligned"})
-        self.assertIsInstance(self._profile(["auto"]).numerics_envelopes, frozenset)
+        assert isinstance((self._profile(["auto"]).numerics_envelopes), (frozenset))
 
 
-class TestCanonicalGreedyTies(unittest.TestCase):
+class TestCanonicalGreedyTies:
     def test_sampled_greedy_rows_take_the_lowest_tied_id(self):
         import torch
 
@@ -365,8 +363,8 @@ class TestCanonicalGreedyTies(unittest.TestCase):
         top_ks = torch.tensor([1, 20, 1])
         out = canonical_greedy_tokens(logits, top_ks, sampled)
         # Greedy rows resolve the tie to id 2; the sampled row is untouched.
-        self.assertEqual(out.tolist(), [2, 5, 2])
-        self.assertEqual(out.dtype, torch.int32)
+        assert (out.tolist()) == ([2, 5, 2])
+        assert (out.dtype) == (torch.int32)
 
     def test_verified_greedy_rows_follow_the_exact_match_chain(self):
         import torch
@@ -394,18 +392,18 @@ class TestCanonicalGreedyTies(unittest.TestCase):
             accept_length=accept_length,
         )
         # Row 0 (greedy): drafts 2, 2 both match argmax 2 -> two accepted.
-        self.assertEqual(accept_length.tolist(), [2, 2])
-        self.assertEqual(accept_index[0].tolist(), [0, 1, 2])
-        self.assertEqual(predict[:3].tolist(), [2, 2, 2])
+        assert (accept_length.tolist()) == ([2, 2])
+        assert (accept_index[0].tolist()) == ([0, 1, 2])
+        assert (predict[:3].tolist()) == ([2, 2, 2])
         # Row 1 (sampling) keeps the stochastic kernel's outputs.
-        self.assertEqual(accept_index[1].tolist(), [3, 4, 5])
-        self.assertEqual(predict[3:].tolist(), [5, 5, 5])
+        assert (accept_index[1].tolist()) == ([3, 4, 5])
+        assert (predict[3:].tolist()) == ([5, 5, 5])
 
     def test_verify_overlay_leaves_every_predict_slot_a_token_id(self):
         import torch
 
         if not torch.cuda.is_available():
-            self.skipTest("the CUDA chain kernel writes a partial predict row")
+            pytest.skip("the CUDA chain kernel writes a partial predict row")
         from tokenspeed.runtime.sampling.backends.flashinfer import (
             canonical_greedy_verify,
         )
@@ -426,11 +424,9 @@ class TestCanonicalGreedyTies(unittest.TestCase):
             accept_length=accept_length,
         )
         # Every slot is gathered for logprobs, accepted or not.
-        self.assertTrue(bool((predict < vocab).all()))
-        self.assertTrue(
-            torch.equal(predict.view(bs, n), logits.argmax(-1).view(bs, n).int())
-        )
+        assert bool((predict < vocab).all())
+        assert torch.equal(predict.view(bs, n), logits.argmax(-1).view(bs, n).int())
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

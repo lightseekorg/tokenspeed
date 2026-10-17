@@ -58,7 +58,7 @@ _E2M1_VALUES = torch.tensor(_E2M1_LUT + [-v for v in _E2M1_LUT])
 def _situ_runtime_reason() -> str | None:
     if not torch.cuda.is_available():
         return "requires CUDA"
-    import tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4  # noqa: F401
+    import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
     from tokenspeed_kernel.platform import current_platform
     from tokenspeed_kernel.registry import KernelRegistry
 
@@ -241,7 +241,7 @@ def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
 def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
     logical_ispp: int,
 ) -> None:
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_nvfp4_moe_weights,
         flashinfer_trtllm_nvfp4_routed_moe_apply,
         flashinfer_trtllm_nvfp4_situ_moe_weights,
@@ -370,6 +370,39 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
 
 
 @requires_flashinfer_situ
+@pytest.mark.parametrize("flaw", ["dtype", "layout"])
+def test_a_prequantized_input_is_checked_before_the_kernel_reads_it(
+    flaw: str,
+) -> None:
+    """The fused kernel takes raw pointers; a wrong buffer reads silently."""
+    from tokenspeed_kernel.ops.moe.flashinfer import (
+        flashinfer_trtllm_nvfp4_moe_weights,
+        flashinfer_trtllm_nvfp4_routed_moe_apply,
+    )
+
+    generator = torch.Generator().manual_seed(20260912)
+    w = _MoEWeights(_make_nvfp4_moe_weights(generator, logical_ispp=ISPP)).cuda()
+    flashinfer_trtllm_nvfp4_moe_weights({}, w)
+    hidden_states = torch.randn(4, HIDDEN, generator=generator).bfloat16().cuda()
+    topk_ids = torch.arange(4 * TOP_K, device="cuda", dtype=torch.int32) % NUM_EXPERTS
+    topk_weights = torch.full((4, TOP_K), 0.1, device="cuda").bfloat16()
+    packed = torch.zeros(4, HIDDEN // 2, dtype=torch.uint8, device="cuda")
+    scales = torch.zeros(4, HIDDEN // 8, dtype=torch.uint8, device="cuda")[:, ::2]
+    if flaw == "dtype":
+        packed, scales = packed.view(torch.int8), scales.contiguous()
+    with pytest.raises(ValueError, match="packed e2m1"):
+        flashinfer_trtllm_nvfp4_routed_moe_apply(
+            {},
+            hidden_states,
+            w,
+            router_logits=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids.view(4, TOP_K),
+            x_quantized=(packed, scales),
+        )
+
+
+@requires_flashinfer_situ
 @pytest.mark.parametrize("routing_mode", [None, "precomputed_topk"])
 def test_moe_plan_selects_nvfp4_situ_routed_kernel(
     routing_mode: str | None,
@@ -401,7 +434,7 @@ def test_moe_plan_selects_nvfp4_situ_routed_kernel(
 
 @requires_flashinfer_situ
 def test_situ_preprocessor_rejects_mismatched_gate_up_global_scales() -> None:
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_nvfp4_situ_moe_weights,
     )
 
@@ -421,7 +454,7 @@ def test_registry_deferred_finalize_bit_matches_wiring() -> None:
     while the situ apply actually serves do_finalize=False (the deferred
     triple); a bit/behavior mismatch crashes the experts layer at the first
     MoE forward of a TAIL_FUSION deployment."""
-    import tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4  # noqa: F401
+    import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
     from tokenspeed_kernel.registry import KernelRegistry
 
     spec = KernelRegistry.get().get_by_name(
@@ -441,7 +474,7 @@ def test_registry_deferred_finalize_bit_matches_wiring() -> None:
     ],
 )
 def test_nvfp4_trtllm_registry_declares_ispp_alignment(kernel_name: str) -> None:
-    import tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4  # noqa: F401
+    import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
     from tokenspeed_kernel.registry import KernelRegistry
 
     spec = KernelRegistry.get().get_by_name(kernel_name)
@@ -466,7 +499,7 @@ def test_nvfp4_trtllm_capability_range(
     arch_version: tuple[int, int],
     expected: bool,
 ) -> None:
-    import tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4  # noqa: F401
+    import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
     from tokenspeed_kernel.platform import ArchVersion
     from tokenspeed_kernel.registry import KernelRegistry
 
@@ -487,7 +520,7 @@ def test_nvfp4_situ_deferred_triple_matches_finalized() -> None:
     expert weights, expanded_idx) triple with the latent tail's recipe
     (fp32 ascending-k accumulate, single bf16 round) reproduces the
     do_finalize=True output."""
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_nvfp4_situ_moe_weights,
         flashinfer_trtllm_nvfp4_situ_routed_moe_apply,
     )
@@ -588,9 +621,9 @@ def test_nvfp4_route_padding_is_initialized_on_every_replay(
     map and its preceding padded-count allocation. Upstream routing initializes
     unused rows inside active expert tiles, not allocation slack or the guard.
     """
+    import tokenspeed_kernel.ops.moe.flashinfer as impl
     from flashinfer.fused_moe import core
     from flashinfer.tllm_enums import ActivationType
-    from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as impl
     from torch.utils._python_dispatch import TorchDispatchMode
 
     generator = torch.Generator().manual_seed(401)
@@ -711,11 +744,13 @@ def test_nvfp4_route_padding_is_initialized_on_every_replay(
         torch.testing.assert_close(graph_output, actual, rtol=0, atol=0)
         with monkeypatch.context() as context:
             context.setattr(
-                impl, "trtllm_fp4_block_scale_moe", core.trtllm_fp4_block_scale_moe
+                impl,
+                "tokenspeed_trtllm_fp4_block_scale_moe",
+                core.trtllm_fp4_block_scale_moe,
             )
             context.setattr(
                 impl,
-                "trtllm_fp4_block_scale_routed_moe",
+                "tokenspeed_trtllm_fp4_block_scale_routed_moe",
                 core.trtllm_fp4_block_scale_routed_moe,
             )
             reference = apply(True)

@@ -41,6 +41,7 @@ jobs:
       nightly: ${{ steps.metadata.outputs.nightly }}
       version: ${{ steps.metadata.outputs.version }}
       kernel_version: ${{ steps.metadata.outputs.kernel_version }}
+      source_sha: ${{ steps.metadata.outputs.source_sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -53,6 +54,7 @@ jobs:
       - name: Prepare nightly metadata
         id: metadata
         env:
+          GH_TOKEN: ${{ github.token }}
           NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly }}
           REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
           PUBLISH_GITHUB: ${{ github.event_name == 'schedule' || inputs.publish_github }}
@@ -64,6 +66,7 @@ jobs:
           fi
           echo "nightly=${NIGHTLY}" >> "$GITHUB_OUTPUT"
           if [ "$NIGHTLY" != "true" ]; then
+            echo "source_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "$PUBLISH_GITHUB" = "true" ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
@@ -72,25 +75,24 @@ jobs:
           fi
           python -m pip install --upgrade "setuptools<82" wheel packaging
           version_date="${VERSION_DATE:-$(date -u +%Y%m%d)}"
-          kernel_version=$(
-            cd tokenspeed-kernel/python
-            TOKENSPEED_KERNEL_BACKEND=cuda \
-            TOKENSPEED_KERNEL_NIGHTLY=true \
-            TOKENSPEED_KERNEL_VERSION_DATE="$version_date" \
-              python setup.py --version
-          )
-          version=$(python .github/scripts/prepare-tokenspeed-nightly.py \
-            . "$version_date" "$kernel_version")
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "kernel_version=${kernel_version}" >> "$GITHUB_OUTPUT"
-          echo "TokenSpeed ${version} requires tokenspeed-kernel==${kernel_version}"
+          kernel_version_here() {
+            (
+              cd tokenspeed-kernel/python
+              TOKENSPEED_KERNEL_BACKEND=cuda \
+              TOKENSPEED_KERNEL_NIGHTLY=true \
+              TOKENSPEED_KERNEL_VERSION_DATE="$version_date" \
+                python setup.py --version
+            )
+          }
+          kernel_version=$(kernel_version_here)
+          echo "TokenSpeed nightly ${version_date} requires tokenspeed-kernel==${kernel_version}"
 
           # The one-hour schedule offset is not a publication-order guarantee.
           for attempt in $(seq 1 60); do
             if python -m pip download --no-deps --only-binary=:all: \
               --index-url https://lightseek.org/whl/nightly \
               --dest kernel-ready "tokenspeed-kernel==${kernel_version}"; then
-              exit 0
+              break
             fi
             if [ "$attempt" = 60 ]; then
               echo "The same-date kernel nightly is not published; refusing to release TokenSpeed." >&2
@@ -98,6 +100,40 @@ jobs:
             fi
             sleep 60
           done
+
+          # The kernel nightly checks out main at 02:00 UTC and this workflow at
+          # 03:00 UTC. A commit that lands in between can move a kernel module the
+          # runtime imports, and the runtime wheel then pins a kernel wheel that
+          # predates it (2026-10-15: tokenspeed_kernel.ops.gemm._cute_dsl). Build
+          # the runtime from the commit the kernel wheel was built from, which its
+          # release notes record.
+          source_sha=$(gh release view "tokenspeed-kernel-nightly-v${kernel_version}-cu130" \
+            --repo lightseekorg/whl --json body --jq .body \
+            | grep -oE 'lightseekorg/tokenspeed@[0-9a-f]{40}' | tail -n 1 | cut -d@ -f2 || true)
+          if [ -z "$source_sha" ]; then
+            echo "The kernel nightly release does not record its source commit; refusing to release TokenSpeed." >&2
+            exit 1
+          fi
+          if [ "$source_sha" != "$GITHUB_SHA" ]; then
+            if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+              echo "Building ${GITHUB_REF} as checked out; the kernel nightly was built from ${source_sha}."
+              source_sha="$GITHUB_SHA"
+            else
+              echo "Building from ${source_sha}, the commit the kernel nightly was built from; main is at ${GITHUB_SHA}."
+              git fetch --depth 1 origin "$source_sha"
+              git checkout --detach "$source_sha"
+              if [ "$(kernel_version_here)" != "$kernel_version" ]; then
+                echo "tokenspeed-kernel at ${source_sha} is not ${kernel_version}; refusing to release TokenSpeed." >&2
+                exit 1
+              fi
+            fi
+          fi
+          version=$(python .github/scripts/prepare-tokenspeed-nightly.py \
+            . "$version_date" "$kernel_version")
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "kernel_version=${kernel_version}" >> "$GITHUB_OUTPUT"
+          echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
+          echo "TokenSpeed ${version} requires tokenspeed-kernel==${kernel_version}"
 
       - name: Build distributions
         run: |
@@ -154,6 +190,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           VERSION: ${{ needs.build.outputs.version }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
           REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
         run: |
           test "$(gh api user --jq .login)" = lightseek-bot
@@ -162,7 +199,7 @@ jobs:
           done
           tag="tokenspeed-nightly-v${VERSION}"
           title="tokenspeed ${VERSION}"
-          notes="${title} built from lightseekorg/tokenspeed@${GITHUB_SHA}"
+          notes="${title} built from lightseekorg/tokenspeed@${SOURCE_SHA}"
           assets=(dist/tokenspeed-dist/*.whl dist/tokenspeed-dist/*.tar.gz)
           if gh release view "$tag" --repo lightseekorg/whl >/dev/null 2>&1; then
             if [ "$REPLACE_NIGHTLY" = "true" ]; then
@@ -246,14 +283,16 @@ jobs:
 
       - name: Wait for same-date ROCm kernel nightly
         env:
+          GH_TOKEN: ${{ github.token }}
           KERNEL_VERSION: ${{ needs.build.outputs.kernel_version }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
         run: |
           # CUDA's successful publication does not guarantee ROCm is ready.
           for attempt in $(seq 1 60); do
             if python -m pip download --no-deps --only-binary=:all: \
               --index-url https://lightseek.org/whl/nightly/rocm7.2 \
               --dest kernel-ready "tokenspeed-kernel==${KERNEL_VERSION}"; then
-              exit 0
+              break
             fi
             if [ "$attempt" = 60 ]; then
               echo "The same-date ROCm kernel nightly is not published; refusing to index TokenSpeed for ROCm." >&2
@@ -261,6 +300,31 @@ jobs:
             fi
             sleep 60
           done
+
+          # The ROCm kernel nightly is its own 02:00 UTC build and can come from a
+          # later commit than the one TokenSpeed was built from. Index TokenSpeed
+          # for ROCm only when no packaged code differs between the two; a rename
+          # counts under both of its paths.
+          rocm_sha=$(gh release view "tokenspeed-kernel-nightly-v${KERNEL_VERSION}-rocm72" \
+            --repo lightseekorg/whl --json body --jq .body \
+            | grep -oE 'lightseekorg/tokenspeed@[0-9a-f]{40}' | tail -n 1 | cut -d@ -f2 || true)
+          if [ -z "$rocm_sha" ]; then
+            echo "The ROCm kernel nightly release does not record its source commit; refusing to index TokenSpeed for ROCm." >&2
+            exit 1
+          fi
+          if [ "$rocm_sha" != "$SOURCE_SHA" ]; then
+            files=""
+            for range in "${SOURCE_SHA}...${rocm_sha}" "${rocm_sha}...${SOURCE_SHA}"; do
+              files+=$(gh api "repos/lightseekorg/tokenspeed/compare/${range}" \
+                --jq 'if (.files | length) >= 300 then "too many files to compare" else .files[] | .filename, (.previous_filename // empty) end')$'\n' \
+                || { echo "Cannot compare ${range}; refusing to index TokenSpeed for ROCm." >&2; exit 1; }
+            done
+            if printf '%s' "$files" | grep -E '^(tokenspeed-kernel/python/|python/tokenspeed/|too many files)'; then
+              echo "The ROCm kernel nightly (${rocm_sha}) and TokenSpeed (${SOURCE_SHA}) differ in packaged code; refusing to index TokenSpeed for ROCm." >&2
+              exit 1
+            fi
+            echo "The ROCm kernel nightly was built from ${rocm_sha}; no packaged code differs from ${SOURCE_SHA}."
+          fi
 
   publish-nightly-rocm:
     if: needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github)

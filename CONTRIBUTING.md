@@ -22,6 +22,21 @@ These contributions are especially welcome:
 
 For larger features or architectural changes, consider starting with an RFC or design discussion before implementation.
 
+## Commit attribution
+
+The `Commit trailers` CI check requires every PR commit author and
+`Co-authored-by` email to resolve to a GitHub account. It reports the commit
+and email when attribution is missing; matching a display name is not enough.
+
+To fix a failure, add and verify the address in GitHub **Settings > Emails**
+and rerun the check, or use the exact noreply address shown in those settings.
+If changing an address, amend or rebase the affected commits, update any
+`Co-authored-by` trailers, and push the updated branch.
+
+`Signed-off-by` is a DCO attestation and remains subject to the DCO check.
+GitHub's attribution API resolves authors and co-authors, not sign-off-only
+addresses; this check does not require contributors to publish their profile email.
+
 ## Engineering principles
 
 TokenSpeed values:

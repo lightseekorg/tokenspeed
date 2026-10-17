@@ -20,7 +20,7 @@
 
 """Attention head TP over the query shards of a prefill engine, on CPU over gloo.
 
-Four ranks, attention TP 4 with ``--prefill-context-parallel-size 4`` and
+Four ranks, attention TP 4 with ``--query-context-parallel-size 4`` and
 ``--attn-head-tp-size 4``: the head group is the shard group. The reference
 is the same mapping without head TP -- head-replicated q_b / kv_b / o_proj,
 QCP's default -- so the exchanges, the shard row tables, the prologue's
@@ -50,13 +50,7 @@ Covered:
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
-import pytest
-import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from _tp_layout_fakes import (
+from test.runtime.distributed._tp_layout_fakes import (
     HIDDEN,
     KV_LORA,
     NUM_HEADS,
@@ -65,6 +59,12 @@ from _tp_layout_fakes import (
     build_attention,
     init_gloo,
 )
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from tokenspeed.runtime.distributed.comm_manager import (
     CommManager,

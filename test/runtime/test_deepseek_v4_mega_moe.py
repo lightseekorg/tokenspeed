@@ -11,8 +11,10 @@
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
-import unittest
 
+import sys
+
+import pytest
 import torch
 from torch import nn
 
@@ -20,7 +22,7 @@ from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.weights.mxfp4 import create_mxfp4_weight_pair
 
 
-class TestDeepseekV4MegaMoE(unittest.TestCase):
+class TestDeepseekV4MegaMoE:
     def test_standard_mxfp4_weights_load_expert_shards(self):
         experts = nn.Module()
         spec = MoELayerSpec(
@@ -70,4 +72,4 @@ class TestDeepseekV4MegaMoE(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

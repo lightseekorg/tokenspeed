@@ -61,15 +61,15 @@ from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41DecoderView,
     V41PrefillSpan,
 )
-from tokenspeed.runtime.layers.linear import LinearBase, MergedColumnParallelLinear
+from tokenspeed.runtime.layers.linear import LinearBase
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.moe import expert as expert_module
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.utils import MoeBackend
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
-from tokenspeed.runtime.models import deepseek_v4 as v4
 from tokenspeed.runtime.models import deepseek_v41 as v41
+from tokenspeed.runtime.models import deepseek_v41_moe as v4
 from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41Attention,
     DeepseekV41DecoderLayer,

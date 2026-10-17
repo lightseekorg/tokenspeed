@@ -429,7 +429,6 @@ def prepare_kda_paged_prefill(
             cu_seqlens=kernel_cu_seqlens,
             cu_seqlens_cpu=cu_seqlens_cpu,
             capacity=None,
-            inputs_packed=False,
             lower_bound=lower_bound,
             override=request.registration,
             solution=request.solution,
@@ -809,7 +808,7 @@ def prepare_kda_fused_paged_decode(
     """Prepare fused single-token KDA decode from the packed input projection.
 
     One call runs the short convolution, decay-gate projection, recurrent
-    update and gated output RMSNorm against paged state.
+    update against paged state.
     """
 
     common = _fused_common(request)
@@ -817,7 +816,6 @@ def prepare_kda_fused_paged_decode(
     batch = common["batch"]
     dtype = common["dtype"]
     state_page_relation = _parse_state_page_relation(request.parameters)
-    norm_eps = float(request.parameters["norm_eps"])
     write_page_offset = (
         _DISTINCT_WRITE_PAGE_OFFSET if state_page_relation == "distinct" else 0
     )
@@ -826,7 +824,6 @@ def prepare_kda_fused_paged_decode(
         "num_heads": profile.heads,
         "head_dim": profile.head_dim,
         "conv_kernel_size": common["conv_kernel_size"],
-        "fused_output_norm": True,
         "paged_state": True,
         "recurrent_layout": common["recurrent_layout"],
     }
@@ -840,7 +837,6 @@ def prepare_kda_fused_paged_decode(
     weights = _fused_layer_weights(
         profile, common["conv_kernel_size"], dtype=dtype, generator=generator
     )
-    norm_weight = _randn((profile.head_dim,), dtype=dtype, generator=generator)
     conv_pool, state_pool = _state_arena(
         common["state_pages"],
         common["state_page_bytes"],
@@ -877,9 +873,6 @@ def prepare_kda_fused_paged_decode(
             head_dim=profile.head_dim,
             cu_seqlens=cu_seqlens,
             lower_bound=common["lower_bound"],
-            output_gate=projection.output_gate,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
             recurrent_layout=common["recurrent_layout"],
             override=request.registration,
             solution=request.solution,
@@ -891,7 +884,6 @@ def prepare_kda_fused_paged_decode(
         parameters={
             **common["normalized"],
             "state_page_relation": state_page_relation,
-            "norm_eps": norm_eps,
             "projection_row_stride": projection.mixed_qkv.stride(0),
         },
         validation=None,

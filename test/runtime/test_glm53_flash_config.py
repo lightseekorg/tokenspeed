@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
-import unittest
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from tokenspeed.runtime.configs.glm53_flash_config import (
     Glm53FlashConfig,
@@ -49,7 +51,7 @@ def _linear_attn_config(
     }
 
 
-class Glm53FlashConfigTests(unittest.TestCase):
+class TestGlm53FlashConfigTests:
     def test_runtime_attention_config_preserves_kpool_geometry(self):
         text_config = Glm53FlashTextConfig(
             index_kpool=4,
@@ -62,8 +64,8 @@ class Glm53FlashConfigTests(unittest.TestCase):
 
         configure_dsa_attention(model_config, ServerArgs(model="x"))
 
-        self.assertEqual(model_config.attention_arch, AttentionArch.DSA)
-        self.assertEqual(model_config.index_kpool, 4)
+        assert (model_config.attention_arch) == (AttentionArch.DSA)
+        assert (model_config.index_kpool) == (4)
 
     def test_top_level_materializes_text_and_vision(self):
         config = Glm53FlashConfig(
@@ -83,14 +85,14 @@ class Glm53FlashConfigTests(unittest.TestCase):
             vision_config={"projection_intermediate_size": 10240},
         )
 
-        self.assertIsInstance(config.text_config, Glm53FlashTextConfig)
-        self.assertIsInstance(config.vision_config, Glm53FlashVisionConfig)
-        self.assertEqual(config.model_type, "glm53_flash")
-        self.assertEqual(config.hidden_size, 4096)
-        self.assertEqual(config.vocab_size, 154880)
-        self.assertEqual(config.text_config.qk_head_dim, 256)
-        self.assertEqual(config.vision_config.out_hidden_size, config.hidden_size)
-        self.assertEqual(config.vision_config.swiglu_limit, 10.0)
+        assert isinstance((config.text_config), (Glm53FlashTextConfig))
+        assert isinstance((config.vision_config), (Glm53FlashVisionConfig))
+        assert (config.model_type) == ("glm53_flash")
+        assert (config.hidden_size) == (4096)
+        assert (config.vocab_size) == (154880)
+        assert (config.text_config.qk_head_dim) == (256)
+        assert (config.vision_config.out_hidden_size) == (config.hidden_size)
+        assert (config.vision_config.swiglu_limit) == (10.0)
 
     def test_legacy_checkpoint_metadata_loads_canonical_config(self):
         raw_config = {
@@ -111,16 +113,15 @@ class Glm53FlashConfigTests(unittest.TestCase):
                 speculative_algorithm="MTP",
             )
 
-        self.assertIsInstance(config, Glm53FlashConfig)
-        self.assertIsInstance(config.text_config, Glm53FlashTextConfig)
-        self.assertIsInstance(config.vision_config, Glm53FlashVisionConfig)
-        self.assertEqual(config.model_type, "glm53_flash")
-        self.assertEqual(config.text_config.model_type, "glm53_flash_text")
-        self.assertEqual(config.vision_config.model_type, "glm53_flash_vision")
-        self.assertEqual(config.architectures, ["Glm53FlashForConditionalGeneration"])
-        self.assertEqual(
-            draft_config.architectures,
-            ["Glm53FlashForConditionalGenerationNextN"],
+        assert isinstance((config), (Glm53FlashConfig))
+        assert isinstance((config.text_config), (Glm53FlashTextConfig))
+        assert isinstance((config.vision_config), (Glm53FlashVisionConfig))
+        assert (config.model_type) == ("glm53_flash")
+        assert (config.text_config.model_type) == ("glm53_flash_text")
+        assert (config.vision_config.model_type) == ("glm53_flash_vision")
+        assert (config.architectures) == (["Glm53FlashForConditionalGeneration"])
+        assert (draft_config.architectures) == (
+            ["Glm53FlashForConditionalGenerationNextN"]
         )
 
     def test_vision_swiglu_limit_precedence(self):
@@ -133,12 +134,12 @@ class Glm53FlashConfigTests(unittest.TestCase):
             text_config=text_config,
             vision_config={"swiglu_limit": 7.0},
         )
-        self.assertEqual(explicit.vision_config.swiglu_limit, 7.0)
+        assert (explicit.vision_config.swiglu_limit) == (7.0)
 
         inherited = Glm53FlashConfig(text_config=text_config, vision_config={})
-        self.assertEqual(inherited.vision_config.swiglu_limit, 12.0)
+        assert (inherited.vision_config.swiglu_limit) == (12.0)
 
-        with self.assertRaisesRegex(ValueError, "vision_config requires swiglu_limit"):
+        with pytest.raises((ValueError), match=("vision_config requires swiglu_limit")):
             Glm53FlashConfig(
                 text_config=text_config,
                 vision_config={"swiglu_limit": None},
@@ -147,34 +148,31 @@ class Glm53FlashConfigTests(unittest.TestCase):
     def test_checkpoint_layer_schedules_match_model_contract(self):
         config = Glm53FlashTextConfig(linear_attn_config=_linear_attn_config())
 
-        self.assertEqual(len(config.linear_layer_ids), _NUM_KDA)
-        self.assertEqual(len(config.full_attention_layer_ids), _NUM_DSA)
-        self.assertEqual(config.full_attention_layer_ids, list(range(3, 45, 4)))
-        self.assertEqual(
-            config.layer_types[:4],
+        assert (len(config.linear_layer_ids)) == (_NUM_KDA)
+        assert (len(config.full_attention_layer_ids)) == (_NUM_DSA)
+        assert (config.full_attention_layer_ids) == (list(range(3, 45, 4)))
+        assert (config.layer_types[:4]) == (
             [
                 "linear_attention",
                 "linear_attention",
                 "linear_attention",
                 "deepseek_sparse_attention",
-            ],
+            ]
         )
-        self.assertEqual(
-            config.layers_block_type[:4],
-            ["linear_attention", "linear_attention", "linear_attention", "attention"],
+        assert (config.layers_block_type[:4]) == (
+            ["linear_attention", "linear_attention", "linear_attention", "attention"]
         )
-        self.assertEqual(
-            config.paged_cache_layer_types[:4],
+        assert (config.paged_cache_layer_types[:4]) == (
             [
                 "linear_attention",
                 "linear_attention",
                 "linear_attention",
                 "full_attention",
-            ],
+            ]
         )
-        self.assertEqual(config.mlp_layer_types[:3], ["dense"] * 3)
-        self.assertEqual(config.mlp_layer_types[3:], ["sparse"] * 42)
-        self.assertEqual(config.indexer_types, ["full"] * _NUM_LAYERS)
+        assert (config.mlp_layer_types[:3]) == (["dense"] * 3)
+        assert (config.mlp_layer_types[3:]) == (["sparse"] * 42)
+        assert (config.indexer_types) == (["full"] * _NUM_LAYERS)
 
     def test_nested_linear_attention_config_normalizes_legacy_fields(self):
         config = Glm53FlashTextConfig(
@@ -190,21 +188,20 @@ class Glm53FlashConfigTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(config.linear_num_heads, 8)
-        self.assertEqual(config.linear_head_dim, 64)
-        self.assertEqual(config.linear_conv_kernel_dim, 6)
-        self.assertEqual(config.linear_lower_bound, -3.0)
-        self.assertEqual(config.gate_lower_bound, -3.0)
-        self.assertEqual(config.linear_layer_ids, [0, 2])
-        self.assertEqual(config.full_attention_layer_ids, [1, 3])
-        self.assertEqual(
-            config.layer_types,
+        assert (config.linear_num_heads) == (8)
+        assert (config.linear_head_dim) == (64)
+        assert (config.linear_conv_kernel_dim) == (6)
+        assert (config.linear_lower_bound) == (-3.0)
+        assert (config.gate_lower_bound) == (-3.0)
+        assert (config.linear_layer_ids) == ([0, 2])
+        assert (config.full_attention_layer_ids) == ([1, 3])
+        assert (config.layer_types) == (
             [
                 "linear_attention",
                 "deepseek_sparse_attention",
                 "linear_attention",
                 "deepseek_sparse_attention",
-            ],
+            ]
         )
 
     def test_legacy_linear_attention_fields_materialize_nested_config(self):
@@ -222,8 +219,7 @@ class Glm53FlashConfigTests(unittest.TestCase):
             linear_lower_bound=-3.0,
         )
 
-        self.assertEqual(
-            config.linear_attn_config,
+        assert (config.linear_attn_config) == (
             {
                 "num_heads": 8,
                 "head_dim": 64,
@@ -231,7 +227,7 @@ class Glm53FlashConfigTests(unittest.TestCase):
                 "gate_lower_bound": -3.0,
                 "kda_layers": [0, 1, 2],
                 "full_attn_layers": [3],
-            },
+            }
         )
 
     def test_composite_attention_registry_assigns_kda_only_to_target(self):
@@ -245,12 +241,11 @@ class Glm53FlashConfigTests(unittest.TestCase):
             ],
             linear_attn_config=_linear_attn_config(num_layers=4),
         )
-        self.assertIs(
-            _LINEAR_ATTN_CLS["Glm53FlashForConditionalGeneration"],
-            LinearAttnConfig,
+        assert (_LINEAR_ATTN_CLS["Glm53FlashForConditionalGeneration"]) is (
+            LinearAttnConfig
         )
-        self.assertNotIn("Glm53FlashForConditionalGenerationNextN", _LINEAR_ATTN_CLS)
-        self.assertFalse(hasattr(text_config, "mamba2_cache_params"))
+        assert ("Glm53FlashForConditionalGenerationNextN") not in (_LINEAR_ATTN_CLS)
+        assert not (hasattr(text_config, "mamba2_cache_params"))
 
     def test_nested_linear_attn_config_remains_serializable(self):
         config = Glm53FlashConfig(
@@ -258,12 +253,11 @@ class Glm53FlashConfigTests(unittest.TestCase):
             vision_config={},
         )
         serialized = config.to_diff_dict()
-        self.assertEqual(
-            serialized["text_config"]["linear_attn_config"],
-            _linear_attn_config(),
+        assert (serialized["text_config"]["linear_attn_config"]) == (
+            _linear_attn_config()
         )
-        self.assertIn("linear_attn_config", repr(config.text_config))
+        assert ("linear_attn_config") in (repr(config.text_config))
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

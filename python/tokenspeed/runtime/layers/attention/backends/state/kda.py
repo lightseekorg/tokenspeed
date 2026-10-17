@@ -28,7 +28,6 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention.kda import (
     KdaPrefillCapacity,
     kda_batched_replay_uses_raw_gate,
@@ -47,7 +46,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     try_kda_fused_paged_verify,
 )
 from tokenspeed_kernel.ops.attention.kda.triton import capture_replay_payload
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
@@ -159,6 +158,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
         self.max_bs = config.max_bs
         # The platform layout; the workspace planner probes the same one.
         self.kda_recurrent_layout = kda_recurrent_layout_default()
+        if self.kda_recurrent_layout not in ("k_major", "v_major"):
+            raise ValueError(
+                f"unsupported KDA recurrent layout {self.kda_recurrent_layout!r}"
+            )
         self._replay_active = False
         self._batched_replay_kernel = None
         self._replay_uses_raw_gate = False
@@ -177,43 +180,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
 
     def _admits_capacity_prefill(self) -> bool:
         return self._prefill_graph_enabled and self.kda_backend == "cutedsl_kda"
-
-    def forward_extend(
-        self,
-        q,
-        k,
-        v,
-        layer,
-        token_to_kv_pool,
-        bs,
-        forward_mode,
-        *,
-        save_kv_cache,
-        **kwargs,
-    ):
-        output = super().forward_extend(
-            q,
-            k,
-            v,
-            layer,
-            token_to_kv_pool,
-            bs,
-            forward_mode,
-            save_kv_cache=save_kv_cache,
-            **kwargs,
-        )
-        if isinstance(self.forward_metadata, CapacityPrefillMetadata):
-            checkpoint = self.forward_metadata.prefill_checkpoint_batch
-            if checkpoint is not None and checkpoint.output_sources is not None:
-                # The fused gather writes the complete output, including padding.
-                return output
-            # No eager handoff remains to scrub undefined native output padding.
-            rows = torch.arange(output.shape[0], device=output.device)
-            padding = rows >= self.forward_metadata.query_start_loc[-1]
-            return output.masked_fill_(padding.view(-1, *([1] * (output.ndim - 1))), 0)
-        # Uncaptured batches keep eager attention inside the ordinary outer
-        # graph. Serving forwards never allocate or capture a KDA subgraph.
-        return output
 
     def _reset_replay_state(self) -> None:
         self._verify_producer_stream: torch.cuda.Stream | None = None
@@ -562,19 +528,12 @@ class KdaAttnBackend(CapacityPrefillBackend):
         attn_tp_size: int,
         head_v_dim: int,
         lower_bound: float | None,
-        output_gate: torch.Tensor | None,
-        norm_weight: torch.Tensor | None,
-        norm_eps: float | None,
     ) -> torch.Tensor | None:
-        if output_gate is not None and (norm_weight is None or norm_eps is None):
-            raise ValueError(
-                "norm_weight and norm_eps are required with a KDA output gate"
-            )
         if f_a_out is None:
             return None
 
         num_value_heads = value_dim // attn_tp_size // head_v_dim
-        result = try_kda_fused_paged_decode(
+        return try_kda_fused_paged_decode(
             mixed_qkv,
             conv_weights,
             conv_states,
@@ -590,24 +549,8 @@ class KdaAttnBackend(CapacityPrefillBackend):
             head_dim=head_v_dim,
             cu_seqlens=self.forward_metadata.query_start_loc,
             lower_bound=lower_bound,
-            output_gate=output_gate,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
             recurrent_layout=self.kda_recurrent_layout,
         )
-        if result is None:
-            return None
-        if result.output_norm_applied or output_gate is None:
-            return result.out
-        return rmsnorm_gated_sigmoid(
-            result.out.reshape(-1, num_value_heads * head_v_dim).contiguous(),
-            output_gate,
-            norm_weight,
-            norm_eps,
-            num_value_heads,
-            head_v_dim,
-            enable_pdl=pdl_enabled(),
-        ).view(1, -1, num_value_heads, head_v_dim)
 
     @override
     def _decode_scan(
@@ -629,9 +572,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
         f_b_weight: torch.Tensor | None,
         beta_raw: torch.Tensor | None,
         lower_bound: float | None,
-        output_gate: torch.Tensor | None,
-        norm_weight: torch.Tensor | None,
-        norm_eps: float | None,
     ) -> torch.Tensor:
         _reject_skip_term(D)
         seq_len = query.shape[0]
@@ -663,16 +603,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
             lower_bound=lower_bound,
             recurrent_layout=self.kda_recurrent_layout,
         )
-        if output_gate is not None:
-            core_attn_out = rmsnorm_gated_sigmoid(
-                core_attn_out.reshape(-1, num_value_heads * head_v_dim).contiguous(),
-                output_gate,
-                norm_weight,
-                norm_eps,
-                num_value_heads,
-                head_v_dim,
-                enable_pdl=pdl_enabled(),
-            ).view(1, -1, num_value_heads, head_v_dim)
         return core_attn_out.squeeze(0)
 
     @override
@@ -858,9 +788,12 @@ class KdaAttnBackend(CapacityPrefillBackend):
         draft_token_num: int,
         seq_len: int,
         lower_bound: float | None,
+        replay_payload: torch.Tensor | None,
     ) -> torch.Tensor:
 
         _reject_skip_term(D)
+        if replay_payload is not None:
+            raise ValueError("the KDA verify scan fills no replay payload")
         from tokenspeed_kernel.ops.attention.kda.triton import (
             kda_recurrent_decode_mtp,
         )
@@ -917,7 +850,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             return
         from tokenspeed_kernel.ops.attention.kda import try_kda_replay_commit
 
-        _, _, draft_token_num, read_pages_by_group = ctx
+        _, draft_token_num, read_pages_by_group = ctx
         bs = accepted_length.shape[0]
         group_ids = list(self._replay_group_ids or self._state_groups())
         write_stack, steps = self._resolve_verify_commit_pages(
@@ -998,7 +931,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
         seq_len: int,
         num_real_tokens: int,
         lower_bound: float | None,
-        inputs_packed: bool,
         cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run an exact-length or fixed-capacity KDA scan with live boundaries.
@@ -1007,14 +939,12 @@ class KdaAttnBackend(CapacityPrefillBackend):
         metadata retains the physical packed extent; GPU boundaries determine
         live work, so that extent is not a live-token count. The adapter clears
         inputs before full-tile loads; inline output padding is cleared by the
-        in-graph gather or scrub. Only an ordinary break uses the handoff copy.
+        in-graph scrub. Only an ordinary break uses the handoff copy.
 
         ``cu_seqlens_cpu`` is the required metadata-built int64 mirror of
         ``query_start_loc``. It supplies exact-length host planning and
         capacity admission without a per-layer synchronizing D2H. The prepared
         capacity path builds its chunk plan on device instead of on the host.
-        ``inputs_packed`` carries the producer promise defined by the kernel
-        facade; being inside a graph alone does not establish that promise.
         """
         _reject_skip_term(D)
         head_k_dim = query.shape[3]
@@ -1050,7 +980,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
             initial_state=recurrent_state,
             cu_seqlens=query_start_loc,
             cu_seqlens_cpu=cu_seqlens_cpu,
-            inputs_packed=inputs_packed,
             capacity=(
                 KdaPrefillCapacity(seq_len, query_start_loc.numel() - 1)
                 if isinstance(self.forward_metadata, CapacityPrefillMetadata)
@@ -1067,5 +996,5 @@ class KdaAttnBackend(CapacityPrefillBackend):
     def _prepare_prefill_scan_query_start_loc(
         self, query_start_loc: torch.Tensor
     ) -> torch.Tensor:
-        """Prepare reusable int64 boundaries for each full, body or tail scan."""
+        """Prepare the reusable int64 boundaries of the prefill scan."""
         return query_start_loc.to(torch.int64)

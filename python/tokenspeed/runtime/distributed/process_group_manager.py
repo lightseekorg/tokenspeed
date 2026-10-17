@@ -45,12 +45,17 @@ def _make_all_groups(group: Group) -> list[Group]:
 
 class ProcessGroupManager:
     def __init__(self):
-        self._process_groups: dict[str, dict[Group, dist.ProcessGroup]] = {}
+        # (backend, name) -> ranks -> process group; name None holds the
+        # groups shared by every collective over those ranks.
+        self._process_groups: dict[
+            tuple[str, str | None], dict[Group, dist.ProcessGroup]
+        ] = {}
         self._pg_timeout: timedelta | None = None
         self._device_backend = "nccl"
         # Set by init_emulated_rank_zero: one group per backend holding only
         # this process, standing in for every logical group.
         self._emulated_rank_groups: dict[str, dist.ProcessGroup] | None = None
+        self._dedicated_groups: dict[tuple[str, Group], dist.ProcessGroup] = {}
 
     def init_distributed(
         self,
@@ -133,27 +138,54 @@ class ProcessGroupManager:
             )
 
     def register_process_group(
-        self, backend: str, group: Group, process_group: dist.ProcessGroup
+        self,
+        backend: str,
+        group: Group,
+        process_group: dist.ProcessGroup,
+        *,
+        name: str | None = None,
     ) -> None:
-        if backend not in self._process_groups:
-            self._process_groups[backend] = {}
-        self._process_groups[backend][group] = process_group
+        self._process_groups.setdefault((backend, name), {})[group] = process_group
 
-    def get_process_group(self, backend: str, group: Group):
-        return self._process_groups[backend][group]
+    def get_process_group(self, backend: str, group: Group, *, name: str | None = None):
+        groups = self._process_groups.get((backend, name), {})
+        if group not in groups:
+            kind = "shared" if name is None else f"named {name!r}"
+            raise KeyError(
+                f"no {kind} {backend} process group over ranks {group}; "
+                "init_process_group creates it at startup"
+            )
+        return groups[group]
 
     def get_device_process_group(self, group: Group):
         """Return the accelerator collective group for the requested ranks."""
         return self.get_process_group(self._device_backend, group)
 
-    def has_process_group(self, backend: str, group: Group) -> bool:
-        if backend not in self._process_groups:
-            return False
-        return group in self._process_groups[backend]
+    def has_process_group(
+        self, backend: str, group: Group, *, name: str | None = None
+    ) -> bool:
+        return group in self._process_groups.get((backend, name), {})
 
     def init_process_group(
-        self, group: Group, backend: str | list[str] | None = None
+        self,
+        group: Group,
+        backend: str | list[str] | None = None,
+        *,
+        name: str | None = None,
     ) -> None:
+        """Create the process groups over ``group``'s ranks, once per backend.
+
+        Every rank of the world calls this, in the same order: each backend's
+        groups are created for every rank set shaped like ``group``, and this
+        rank keeps ``group``'s.
+
+        Name None creates the groups every collective over these ranks shares.
+        A named group is a copy over the same ranks with communicators of its
+        own, so its collectives never queue behind the shared group's: a
+        feature that overlaps its transfers with the shared collectives runs
+        them on one (``CommBackend.for_named_groups``). Each copy costs its own
+        communicator resources.
+        """
         if backend is None:
             backends = [self._device_backend, "gloo"]
         elif isinstance(backend, str):
@@ -162,7 +194,7 @@ class ProcessGroupManager:
             backends = backend
 
         for backend in backends:
-            if self.has_process_group(backend, group):
+            if self.has_process_group(backend, group, name=name):
                 continue
             if self._emulated_rank_groups is not None:
                 if backend not in self._emulated_rank_groups:
@@ -170,13 +202,32 @@ class ProcessGroupManager:
                         [0], backend=backend, timeout=self._pg_timeout
                     )
                 self.register_process_group(
-                    backend, group, self._emulated_rank_groups[backend]
+                    backend, group, self._emulated_rank_groups[backend], name=name
                 )
                 continue
             for g in _make_all_groups(group):
                 pg = dist.new_group(g, backend=backend, timeout=self._pg_timeout)
                 if g == group:
-                    self.register_process_group(backend, g, pg)
+                    self.register_process_group(backend, g, pg, name=name)
+
+    def get_dedicated_device_group(self, group: Group, namespace: str):
+        """Create an isolated device collective in deterministic global order.
+
+        Native communication windows must not share an HCCL communicator with
+        ordinary framework collectives. Every rank calls this with the same
+        namespace and group pattern before graph capture.
+        """
+        if self._emulated_rank_groups is not None:
+            raise RuntimeError("Dedicated device groups do not support rank emulation")
+        key = (namespace, tuple(group))
+        if key not in self._dedicated_groups:
+            for ranks in _make_all_groups(group):
+                process_group = dist.new_group(
+                    ranks, backend=self._device_backend, timeout=self._pg_timeout
+                )
+                if ranks == group:
+                    self._dedicated_groups[key] = process_group
+        return self._dedicated_groups[key]
 
 
 process_group_manager = ProcessGroupManager()

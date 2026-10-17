@@ -2700,61 +2700,6 @@ def launch_gluon_mla_decode_bf16xbf16_gfx950_bh64_small(*args, **kwargs):
     )
 
 
-def gluon_mla_decode_bf16xbf16_gfx950(
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    max_seqlen_k: int,
-    qk_nope_head_dim: int,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-    softmax_scale: float,
-    *,
-    logit_cap: float = 0.0,
-    return_lse: bool = False,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Dispatch BF16-Q/BF16-KV MLA decode to a fixed GFX950 regime."""
-    if q.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
-        raise NotImplementedError(
-            "gluon_mla_decode_bf16xbf16_gfx950 requires bf16 q and kv_cache"
-        )
-    if q.dim() != 4 or q.shape[1] != 1:
-        raise ValueError(
-            f"q must be [batch, 1, num_q_heads, R + rope], got {tuple(q.shape)}"
-        )
-    batch_size, _, nhead, _ = q.shape
-    if 1 <= nhead <= 16:
-        impl = launch_gluon_mla_decode_bf16xbf16_gfx950_bh16bn64
-    elif nhead == 64 and batch_size == 1:
-        impl = launch_gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock
-    elif nhead == 64 and batch_size in (2, 4):
-        impl = launch_gluon_mla_decode_bf16xbf16_gfx950_bh64_small
-    elif nhead in (64, 128) and batch_size % 64 == 0:
-        impl = launch_gluon_mla_decode_bf16xbf16_gfx950_bh64
-    else:
-        raise NotImplementedError(
-            "gluon MLA decode supports H in [1, 16], H=64 with B in {1, 2, 4}, "
-            "or H in {64, 128} with B divisible by 64; "
-            f"got H={nhead}, B={batch_size}"
-        )
-    return impl(
-        q,
-        kv_cache,
-        page_table,
-        cache_seqlens,
-        max_seqlen_k,
-        qk_nope_head_dim,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        softmax_scale,
-        logit_cap=logit_cap,
-        return_lse=return_lse,
-        out=out,
-    )
-
-
 def gluon_mla_decode_bf16xfp8_gfx950(
     q: torch.Tensor,
     kv_cache: torch.Tensor,

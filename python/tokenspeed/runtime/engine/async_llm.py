@@ -82,6 +82,7 @@ from tokenspeed.runtime.engine.scheduler_control_client import (
 )
 from tokenspeed.runtime.entrypoints import rl_control
 from tokenspeed.runtime.metrics.collector import RequestMetrics
+from tokenspeed.runtime.metrics.service import metrics_service
 from tokenspeed.runtime.pd.utils import (
     DisaggregationMode,
     KVClassType,
@@ -213,10 +214,11 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                 "model_name": self.server_args.served_model_name,
                 "app_key": self.server_args.app_key,
             },
-            enabled=(
-                self.enable_metrics
-                and "prometheus" in (server_args.metrics_reporters or [])
-            ),
+            enabled=self.enable_metrics,
+            # Caps the request-token histogram grids (the 1-2-5 series).
+            max_model_len=self.context_len,
+            reporters=server_args.metrics_reporters,
+            event_sink=metrics_service.get_event_sink(),
         )
 
         self.output_processor = OutputProcessor(self)
@@ -738,6 +740,9 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             else:
                 break
 
+        # Close local metric resources before this path kills itself;
+        # atexit does not run after SIGKILL.
+        metrics_service.close(timeout=2.0)
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 

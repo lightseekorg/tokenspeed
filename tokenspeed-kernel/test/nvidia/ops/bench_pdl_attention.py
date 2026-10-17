@@ -31,9 +31,11 @@ import statistics
 
 import torch
 from tokenspeed_kernel.ops.attention.gdn import gdn_decode_mtp, gdn_decode_step
-from tokenspeed_kernel.ops.attention.qsa import qsa_sparse_attention
-from tokenspeed_kernel.ops.attention.qsa.triton import (
+from tokenspeed_kernel.ops.attention.qsa import (
+    qsa_sparse_attention,
     qwen4_exp_qsa_block_topk,
+)
+from tokenspeed_kernel.ops.attention.qsa.triton import (
     qwen4_exp_qsa_selected_slots,
 )
 from tokenspeed_kernel.platform import pdl_enabled
@@ -136,7 +138,7 @@ def _qsa(rows, solution):
             block_topk=512,
             queries_per_request=1,
             max_partial_bytes=32 * 1024 * 1024,
-            solution=solution,
+            algorithm=solution,
             persistent_topk_workspace=None,
             enable_pdl=pdl_enabled(),
         )
