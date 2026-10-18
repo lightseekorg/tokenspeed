@@ -661,10 +661,7 @@ class ForwardStepRunner:
         _is_capture_mode = False
         _is_cuda_graph_phase = False
 
-        # Graph capture records the hostfunc launches without invoking
-        # them, so what the dummy run_once pushed stays queued — drop it,
-        # and reset current_batch so the first real replay's build
-        # doesn't advance the matcher from a stale warmup entry.
+        # Drop the capture's unconsumed gate decision; the first replay would pop it.
         if self.capturable_grammar is not None:
             self.capturable_grammar.reset_state()
 
