@@ -40,6 +40,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
+    pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     prepare_cache_setup,
@@ -657,6 +658,52 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
     assert setup.fixed_workspace_bytes == 128 + ple_bytes  # GDN conv + SSM: 128 B.
 
 
+def test_parent_is_its_planes_whatever_the_group_packings() -> None:
+    # Coprime packings, as Qwen4-Exp's PLE and QSA side planes get: a parent
+    # rounded up to their LCM (5376 bytes here) would hold 4096 bytes no field
+    # addresses. At Qwen3.8-Flash-Next TP1 that rounding made a 255 MB parent
+    # 54 GB.
+    def state(group_id: str) -> CacheGroupSpec:
+        return CacheGroupSpec(
+            group_id=group_id,
+            attn_kind="state",
+            sliding_window_tokens=None,
+            replayable=False,
+        )
+
+    layout = pack(
+        (
+            (
+                state("ssm"),
+                (CacheFieldSpec("ssm.state", "plane.ssm", (4096,), "uint8"),),
+            ),
+            (
+                state("side_a"),
+                (CacheFieldSpec("side_a.key", "plane.a", (256,), "uint8"),),
+            ),
+            (
+                state("side_b"),
+                (CacheFieldSpec("side_b.key", "plane.b", (256,), "uint8"),),
+            ),
+        ),
+        prefix_granularity=16,
+        cache_blocks_per_lcm_block={"ssm": 1, "side_a": 3, "side_b": 7},
+        alignment=256,
+        max_padding_fraction=float("inf"),
+    )
+    plan = layout.bind(3)
+
+    planes = sum(plane.bytes_per_lcm_block for plane in plan.planes)
+    assert planes == 4096 + 3 * 256 + 7 * 256
+    assert plan.lcm_block_bytes == planes
+    assert plan.arena_bytes == 4 * planes
+    # Every group's last page still ends inside the arena.
+    for group in plan.groups:
+        _, fields = plan.page_field_layout(group.group_id)
+        for base, stride, size in fields:
+            assert base + (group.page_count - 1) * stride + size <= plan.arena_bytes
+
+
 @pytest.mark.parametrize(
     ("full_layers", "sliding_layers", "usable_pages"),
     ((2, 0, 15), (1, 4, 7)),
@@ -906,54 +953,6 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
             is_heterogeneous=True,
             linear_attention="gdn",
             is_inkling=False,
-        )
-
-
-def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import tokenspeed.runtime.layers.attention.registry as registry
-
-    monkeypatch.setattr(
-        registry,
-        "is_deepseek_v4",
-        lambda config: getattr(config, "is_deepseek_v4", False),
-    )
-    server_args = SimpleNamespace(
-        kv_offload_config=None,
-        attention_backend=None,
-        drafter_attention_backend=None,
-        disaggregation_mode="prefill",
-    )
-    target = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            architectures=("LlamaForCausalLM",),
-            is_deepseek_v4=False,
-        ),
-        model_profile=None,
-    )
-    draft = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            architectures=("DeepseekV4ForCausalLMNextN",),
-            is_deepseek_v4=True,
-        ),
-        model_profile=None,
-    )
-
-    with pytest.raises(NotImplementedError, match="target-only"):
-        registry.create_attn_components(
-            server_args,
-            target,
-            gpu_id=0,
-            rank=0,
-            gpu_memory=0,
-            draft_model_config=draft,
-            graph_reserve_bytes=0,
-            post_profile_bytes=0,
-            probe_batch_rows=None,
-            profiled_cache_bytes=None,
-            reuse_target_backend=None,
-            reuse_draft_backend=None,
         )
 
 
@@ -1249,6 +1248,27 @@ def test_qwen_state_blocks_carry_no_attention_planes() -> None:
     }
 
 
+def test_qwen_conv_windows_fill_a_free_state_segment() -> None:
+    """When the SSM states leave a segment free, the conv windows pack into it and KV pages pad nothing."""
+    plan = _qwen_gdn_setup(2).spec.memory_plan
+    payload = {
+        suffix: {
+            field.payload_bytes
+            for field in plan.fields
+            if field.field_id.endswith(suffix)
+        }.pop()
+        for suffix in (".ssm", ".conv")
+    }
+
+    # Six GDN layers over four segments: two groups of three states, one segment left for their conv windows.
+    assert plan.lcm_block_bytes == 4 * payload[".ssm"]
+    assert _page_padding(plan) == {
+        FULL_ATTENTION: 0,
+        "linear_attention_0": payload[".ssm"] - 3 * payload[".conv"],
+        "linear_attention_1": payload[".ssm"] - 3 * payload[".conv"],
+    }
+
+
 def test_qwen_mtp_draft_layer_fills_state_segments() -> None:
     """An MTP layer of a target attention layer's bytes takes segments the state layers fill too."""
     plan = _qwen_gdn_setup(2, draft_kv_heads=1).spec.memory_plan
@@ -1451,7 +1471,6 @@ def _fake_around_the_budget(monkeypatch, free):
     )
     monkeypatch.setattr(common.torch, "get_device_module", lambda device: gpu)
     side = SimpleNamespace(
-        is_deepseek_v4=False,
         is_hybrid_linear=False,
         is_dspark=False,
         requested_backend=None,

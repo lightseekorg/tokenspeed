@@ -30,8 +30,7 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
     CausalConv1dPrefillMetadata,
     build_causal_conv1d_prefill_metadata,
 )
-
-from tokenspeed.runtime.layers.attention.linear.causal_conv1d import causal_conv1d_fn
+from tokenspeed_kernel.ops.conv import causal_conv1d_fn
 
 # CI registration is parsed via AST; standalone execution needs test/ on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -148,7 +147,7 @@ def test_conv_compiles_once_across_prefill_shapes():
     """Token totals, chunk-map offsets and output strides vary per prefill; none keys a binary."""
     from unittest.mock import patch
 
-    from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+    from tokenspeed_kernel.ops.conv._triton.causal_conv1d import (
         _causal_conv1d_fwd_kernel,
     )
 

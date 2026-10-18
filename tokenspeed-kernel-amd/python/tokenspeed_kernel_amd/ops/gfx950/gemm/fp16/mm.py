@@ -20,9 +20,8 @@
 
 """Dense16 Gluon GEMM kernels for gfx950.
 
-The public entry point computes ``A @ B.T`` for supported 16-bit floating-point
-dense inputs and returns ``None`` when the generic caller should use its torch
-fallback.
+The launchers compute ``A @ B.T`` (or batched ``A @ B``) for 16-bit
+floating-point inputs; ``tokenspeed-kernel`` selects among them by shape.
 """
 
 from __future__ import annotations
@@ -31,8 +30,6 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
     _dense16_mm_launch_metadata,
-    _supports_largem_shape,
-    launch_gluon_mm_a16w16_prefill_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.splitk import check_splitk_counters
 
@@ -42,8 +39,6 @@ async_copy = gl.amd.cdna4.async_copy
 DENSE16_BLOCK_M = 16
 DENSE16_BLOCK_N = 128
 DENSE16_BLOCK_K = 64
-WARP_REDUCE_OUTPUTS = 1
-WARP_REDUCE_BLOCK_K = 1024
 BMM_M1_BLOCK_N = 32
 BMM_M1_NUM_WARPS = 4
 CDNA_WAVEFRONT_SIZE = 64
@@ -54,7 +49,6 @@ MFMA_LDS_REDUCE_M = 4
 MFMA_LDS_SPLIT_K = 8
 GROUP_SIZE_M = 2
 MAX_M = 1024
-LARGEM_DISPATCH_MIN_M = 2048
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _partial_cache: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
@@ -318,70 +312,6 @@ def _mfma_lds_shared_layout_b(dot_layout_b, block_n: int, block_k: int, dtype):
     if layout is not None:
         return layout
     return _mfma_lds_manual_shared_layout_b(block_n, block_k)
-
-
-@gluon.jit(launch_metadata=_dense16_mm_launch_metadata)
-def gluon_mm_a16w16_warp_gfx950(
-    a_ptr,
-    b_ptr,
-    c_ptr,
-    M,
-    N,
-    K,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    BLOCK_OUT: gl.constexpr,
-    BLOCK_K: gl.constexpr,
-):
-    """Warp-reduce dense16 GEMM for very small-M low/medium-K decode tiles."""
-    pid = gl.program_id(axis=0)
-    layout: gl.constexpr = gl.BlockedLayout(
-        [1, 1],
-        [1, 64],
-        [BLOCK_OUT, 1],
-        [1, 0],
-    )
-    out_layout: gl.constexpr = gl.SliceLayout(1, layout)
-    k_layout: gl.constexpr = gl.SliceLayout(0, layout)
-
-    lane_out = gl.arange(0, BLOCK_OUT, out_layout)
-    offs_k = gl.arange(0, BLOCK_K, k_layout)
-    out_idx = pid * BLOCK_OUT + lane_out
-    n = out_idx // M
-    m = out_idx - n * M
-    valid_out = out_idx < (M * N)
-
-    acc = gl.zeros((BLOCK_OUT,), gl.float32, out_layout)
-    for kt in range(0, gl.cdiv(K, BLOCK_K)):
-        k = kt * BLOCK_K + offs_k
-        a_offsets = (m[:, None] * stride_am + k[None, :] * stride_ak).to(gl.int32)
-        b_offsets = (n[:, None] * stride_bn + k[None, :] * stride_bk).to(gl.int32)
-        k_valid = k < K
-        a = cdna4.buffer_load(
-            ptr=a_ptr,
-            offsets=a_offsets,
-            mask=valid_out[:, None] & k_valid[None, :],
-            other=0.0,
-        ).to(gl.float32)
-        b = cdna4.buffer_load(
-            ptr=b_ptr,
-            offsets=b_offsets,
-            mask=valid_out[:, None] & k_valid[None, :],
-            other=0.0,
-        ).to(gl.float32)
-        acc += gl.sum(a * b, axis=1)
-
-    c_offsets = (m * stride_cm + n * stride_cn).to(gl.int32)
-    cdna4.buffer_store(
-        ptr=c_ptr,
-        offsets=c_offsets,
-        stored_value=acc.to(c_ptr.dtype.element_ty),
-        mask=valid_out,
-    )
 
 
 @gluon.jit(launch_metadata=_dense16_bmm_launch_metadata)
@@ -1257,10 +1187,6 @@ def _resolve_output(
     return out
 
 
-def _use_warp_reduce_smallm(M: int, _N: int, K: int) -> bool:
-    return (M in (1, 2) and K <= 2048) or (M == 4 and K <= 1024)
-
-
 def _choose_mfma_lds_split_k(K: int) -> int:
     k_tiles = K // MFMA_LDS_BLOCK_K
     for split_k in (MFMA_LDS_SPLIT_K, 7, 6, 5, 4, 3, 2):
@@ -1277,12 +1203,6 @@ def _supports_mfma_lds_smallm(M: int, N: int, K: int) -> bool:
         and K % MFMA_LDS_BLOCK_K == 0
         and _choose_mfma_lds_split_k(K) > 1
     )
-
-
-def _use_mfma_lds_smallm(_M: int, _N: int, _K: int) -> bool:
-    # Keep the split-K kernels available for direct experiments, but do not
-    # route them by default until they are consistently faster than torch.mm.
-    return False
 
 
 def _choose_mfma_lds_mediumm_config(
@@ -1330,85 +1250,6 @@ def _choose_mfma_lds_mediumm_config(
         if M == 128 and N == 4096 and K == 4096:
             return 16, 128, DENSE16_BLOCK_K, 1, 4, 3
     return None
-
-
-def _use_mfma_lds_mediumm(M: int, N: int, K: int) -> bool:
-    return _choose_mfma_lds_mediumm_config(M, N, K) is not None
-
-
-def _use_mfma_lds_largem(M: int, N: int, K: int) -> bool:
-    return M >= LARGEM_DISPATCH_MIN_M and _supports_largem_shape(M, N, K)
-
-
-def launch_gluon_mm_a16w16_warp_gfx950(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    out_dtype: torch.dtype,
-    *,
-    alpha: torch.Tensor | None = None,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Compute small-M dense ``A @ B.T`` with one warp per output.
-
-    Intended for very small decode tiles: ``M`` in ``{1, 2}`` with ``K <= 2048``
-    or ``M == 4`` with ``K <= 1024``.
-    """
-    if A.ndim != 2 or B.ndim != 2:
-        raise ValueError(
-            f"small-M dense16 warp-reduce GEMM expects 2D inputs, got {A.ndim=} {B.ndim=}"
-        )
-    if A.dtype not in _SUPPORTED_DTYPES or B.dtype not in _SUPPORTED_DTYPES:
-        raise TypeError(
-            "small-M dense16 warp-reduce GEMM expects fp16/bf16 inputs, got "
-            f"{A.dtype=} {B.dtype=}"
-        )
-    if A.dtype != B.dtype:
-        raise TypeError(
-            "small-M dense16 warp-reduce GEMM expects matching input dtypes, got "
-            f"{A.dtype=} {B.dtype=}"
-        )
-    if out_dtype not in _SUPPORTED_DTYPES:
-        raise TypeError(
-            f"small-M dense16 warp-reduce GEMM expects fp16/bf16 output, got {out_dtype=}"
-        )
-    if not A.is_cuda or not B.is_cuda:
-        raise ValueError("small-M dense16 warp-reduce GEMM requires CUDA/HIP tensors")
-
-    M, K = A.shape
-    N, K_b = B.shape
-    if M > 4:
-        raise ValueError(f"small-M warp-reduce GEMM requires M <= 4; got M={M}")
-    if K_b != K:
-        raise ValueError(
-            "small-M dense16 warp-reduce GEMM K mismatch: "
-            f"A={tuple(A.shape)} B={tuple(B.shape)}"
-        )
-    _check_supported_dense16_shape(M, N, K)
-
-    C = _resolve_output(A, (M, N), out_dtype, out, "small-M dense16 warp-reduce GEMM")
-    total_outputs = M * N
-    grid = (triton.cdiv(total_outputs, WARP_REDUCE_OUTPUTS),)
-    gluon_mm_a16w16_warp_gfx950[grid](
-        A,
-        B,
-        C,
-        M,
-        N,
-        K,
-        A.stride(0),
-        A.stride(1),
-        B.stride(1),
-        B.stride(0),
-        C.stride(0),
-        C.stride(1),
-        BLOCK_OUT=WARP_REDUCE_OUTPUTS,
-        BLOCK_K=WARP_REDUCE_BLOCK_K,
-        num_warps=WARP_REDUCE_OUTPUTS,
-    )
-
-    if alpha is not None:
-        C.mul_(alpha.to(device=C.device, dtype=C.dtype))
-    return C
 
 
 def launch_gluon_bmm_a16w16_gfx950(
@@ -1670,8 +1511,8 @@ def launch_gluon_mm_a16w16_medium_gfx950(
     return C
 
 
-# Cold-cache sweeps on gfx950 at Kimi K3 TP8 and Qwen3.8-Flash-Next TP2 decode
-# shapes in HIP-graph replays, keyed by (N, K) and then by M bucket: a call
+# Cold-cache sweeps on gfx950 at Kimi K3 TP8, Muse TP4 and Qwen3.8-Flash-Next TP2
+# decode shapes in HIP-graph replays, keyed by (N, K) and then by M bucket: a call
 # uses the config of the smallest bucket covering its M, so M stays a runtime
 # argument within a bucket. A config is (BLOCK_M, BLOCK_N, BLOCK_K, WARPS_M,
 # WARPS_N, NUM_BUFFERS, SPLIT_K, NUM_XCDS); NUM_BUFFERS above three holds every
@@ -1681,6 +1522,20 @@ DECODE_M_BUCKETS = (4, 8, 16, 32, 64)
 _DECODE_CONFIGS: dict[
     tuple[int, int], dict[int, tuple[int, int, int, int, int, int, int, int]]
 ] = {
+    # Muse attention output and MoE post-expert projection. One single-pass tile covers all
+    # buckets, so the usual M=2/16 warmup also covers intermediate row counts.
+    (8192, 2048): {
+        4: (32, 32, 256, 2, 2, 3, 1, 8),
+        8: (32, 32, 256, 2, 2, 3, 1, 8),
+        16: (32, 32, 256, 2, 2, 3, 1, 8),
+        32: (32, 32, 256, 2, 2, 3, 1, 8),
+    },
+    (8192, 4096): {
+        4: (32, 32, 256, 2, 2, 3, 1, 8),
+        8: (32, 32, 256, 2, 2, 3, 1, 8),
+        16: (32, 32, 256, 2, 2, 3, 1, 8),
+        32: (32, 32, 256, 2, 2, 3, 1, 8),
+    },
     # o_proj
     (7168, 1536): {
         4: (16, 16, 512, 1, 4, 2, 1, 8),
@@ -2031,85 +1886,3 @@ def launch_gluon_mm_a16w16_decode_add3_gfx950(
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return C
-
-
-def gluon_mm_a16w16_gfx950(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    out_dtype: torch.dtype,
-    *,
-    alpha: torch.Tensor | None = None,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor | None:
-    """Compute dense16 GEMM ``A @ B.T`` on gfx950 when supported.
-
-    Dispatches among warp-reduce small-M, tuned medium-M, and large-M paths.
-    Returns ``None`` for unsupported or disabled dense16 shapes so the generic
-    GEMM caller can use its torch fallback.
-
-    Args:
-        A: Activation matrix with shape ``[M, K]``.
-        B: Weight matrix with shape ``[N, K]``.
-        out_dtype: Output dtype, either fp16 or bf16.
-        alpha: Optional post-GEMM scale.
-
-    Returns:
-        Tensor with shape ``[M, N]`` when a Gluon path is selected; otherwise
-        ``None``.
-    """
-    if A.ndim != 2 or B.ndim != 2:
-        return None
-    if A.dtype not in _SUPPORTED_DTYPES or B.dtype not in _SUPPORTED_DTYPES:
-        return None
-    if A.dtype != B.dtype:
-        return None
-    if out_dtype not in _SUPPORTED_DTYPES:
-        return None
-    if not A.is_cuda or not B.is_cuda:
-        return None
-
-    M, K = A.shape
-    N, K_b = B.shape
-    if K_b != K:
-        return None
-    if M <= 0 or N <= 0 or K <= 0:
-        return None
-    if N % DENSE16_BLOCK_N != 0 or K % DENSE16_BLOCK_K != 0:
-        return None
-
-    if _use_mfma_lds_largem(M, N, K):
-        return launch_gluon_mm_a16w16_prefill_gfx950(
-            A,
-            B,
-            out_dtype,
-            alpha=alpha,
-            out=out,
-        )
-    if M > MAX_M:
-        return None
-
-    if _use_warp_reduce_smallm(M, N, K):
-        return launch_gluon_mm_a16w16_warp_gfx950(
-            A,
-            B,
-            out_dtype,
-            alpha=alpha,
-            out=out,
-        )
-    if _use_mfma_lds_smallm(M, N, K):
-        return launch_gluon_mm_a16w16_splitk_gfx950(
-            A,
-            B,
-            out_dtype,
-            alpha=alpha,
-            out=out,
-        )
-    if _use_mfma_lds_mediumm(M, N, K):
-        return launch_gluon_mm_a16w16_medium_gfx950(
-            A,
-            B,
-            out_dtype,
-            alpha=alpha,
-            out=out,
-        )
-    return None

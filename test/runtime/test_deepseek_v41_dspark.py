@@ -75,6 +75,7 @@ from tokenspeed.runtime.models.deepseek_v41_dspark import (
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.hf_transformers_utils import get_config
+from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 @pytest.mark.parametrize(
@@ -94,7 +95,7 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
 
         def forward(self, hidden, hashes, mask):
             events.append(("engram", self.layer_id))
-            assert hashes.tolist() == [self.layer_hash_index] * 2
+            assert hashes.tolist() == [[self.layer_hash_index] * 3] * 2
             assert mask.tolist() == [True, True]
             return hidden + 100 * (self.layer_hash_index + 1)
 
@@ -116,7 +117,12 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
     target.model = DeepseekV41Model.__new__(DeepseekV41Model)
     nn.Module.__init__(target.model)
     target.model.config = SimpleNamespace(
-        num_hidden_layers=40, hidden_size=2, hc_mult=4, engram_layer_ids=[37, 38, 39]
+        num_hidden_layers=40,
+        hidden_size=2,
+        hc_mult=4,
+        engram_layer_ids=[37, 38, 39],
+        engram_max_ngram_size=4,
+        engram_n_heads=1,
     )
     target.model.ced_decoder_start = 20
     target.model.decoder_uses_engram = True
@@ -136,7 +142,7 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
         ctx,
         input_embeds=embeddings,
         pp_inbound=None,
-        engram_previous_tokens=torch.full((2, 3), -1, dtype=torch.int64),
+        engram_hash_ids=torch.arange(3).view(1, 3, 1).expand(2, 3, 3),
         engram_token_mask=torch.ones(2, dtype=torch.bool),
         image_mask=None,
     )
@@ -302,6 +308,46 @@ def _window_backend(positions, cache, history, block, rows_per_page):
     )
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_window_workspace_preserves_deferred_norm(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.manual_seed(418)
+    config = _config()
+    config.head_dim, config.qk_rope_head_dim = 512, 64
+    config.max_position_embeddings = 512
+    positions = torch.tensor([4, 5, 6, 7], device=device)
+    history = torch.tensor([[64, 65, -1, -1]], device=device)
+    cache = torch.randn(3, 64, 512, dtype=torch.bfloat16, device=device)
+    backend = _window_backend(positions, cache, history, 4, 64)
+    norm = v41.RMSNorm(512, eps=config.rms_norm_eps).to(
+        device=device, dtype=torch.bfloat16
+    )
+    with torch.no_grad():
+        norm.weight.uniform_(0.5, 1.5)
+    rotary = v41.DeepseekV41RotaryEmbedding(config, 0)
+    rotary._prepare_cache(torch.device(device))
+    rope_cache = rotary.cos_sin_cache if device == "cuda" else None
+    swa = torch.randn(4, 512, dtype=torch.bfloat16, device=device)
+    original = swa.clone()
+    expected = backend._workspace(
+        v41._norm(swa, norm),
+        positions,
+        rope_cache,
+        None,
+        norm.variance_epsilon,
+    )
+    actual = backend._workspace(
+        swa,
+        positions,
+        rope_cache,
+        norm.weight,
+        norm.variance_epsilon,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(swa, original, rtol=0, atol=0)
+
+
 def test_window_attention_matches_dense_reference():
     torch.manual_seed(41)
     batch, block, heads, dim, window, rows = 2, 5, 2, 64, 8, 4
@@ -326,6 +372,8 @@ def test_window_attention_matches_dense_reference():
         softmax_scale=dim**-0.5,
         index_process_group=None,
         swa_rope_cache=None,
+        swa_norm_weight=None,
+        swa_norm_eps=0.0,
     )
     decoded = _quantized_kv(current).reshape(batch, block, dim)
     expected = torch.empty_like(q).reshape(batch, block, heads, dim)
@@ -401,13 +449,22 @@ def test_window_attention_kernel_matches_reference():
         softmax_scale=dim**-0.5,
         index_process_group=None,
         swa_rope_cache=rotary.cos_sin_cache,
+        swa_norm_weight=None,
+        swa_norm_eps=config.rms_norm_eps,
     )
     actual = backend.forward_v41(q, swa, **kwargs)
-    kv = backend._workspace(swa, positions, rotary.cos_sin_cache)
+    kv = backend._workspace(
+        swa, positions, rotary.cos_sin_cache, None, config.rms_norm_eps
+    )
     expected = backend._reference_forward(q, kv, sink, dim**-0.5)
     # Both branches feed the kernel the very same quantized block rows.
     torch.testing.assert_close(
-        backend._workspace(swa, positions, rotary.cos_sin_cache), kv, rtol=0, atol=0
+        backend._workspace(
+            swa, positions, rotary.cos_sin_cache, None, config.rms_norm_eps
+        ),
+        kv,
+        rtol=0,
+        atol=0,
     )
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(
@@ -790,7 +847,14 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
             ),
             encoding="utf-8",
         )
-    args = SimpleNamespace(
+
+    class ConfigArgs(SimpleNamespace):
+        validate_tp_batch_invariant_weights = (
+            ServerArgs.validate_tp_batch_invariant_weights
+        )
+
+    args = ConfigArgs(
+        tp_batch_invariant="none",
         mapping=_mapping(0, 4, 4),
         speculative_algorithm="DSPARK",
         speculative_num_steps=None,
@@ -801,6 +865,7 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
         prefix_granularity=64,
         load_format="auto",
         disaggregation_mode="null",
+        validate_tp_batch_invariant_weights=Mock(),
     )
     configs = [
         ModelConfig(
@@ -833,7 +898,7 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
         == 1
     )
     side = attention_registry._resolve_attn_side(draft, None)
-    assert side.is_dspark and not side.is_deepseek_v4
+    assert side.is_dspark
 
     # Stop at the allocation boundary, after the real registry chooses both sides.
     config_builder = Mock(

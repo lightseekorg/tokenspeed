@@ -132,6 +132,8 @@ def torch_sqrt_softplus_topk(
     hash_indices_table: torch.Tensor | None,
     input_ids: torch.Tensor | None,
     need_scores: bool,
+    routed_scaling_factor: float,
+    weights_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     scores = torch.sqrt(F.softplus(router_logits.float()))
     if hash_indices_table is not None:
@@ -160,4 +162,6 @@ def torch_sqrt_softplus_topk(
             keepdim=True,
         ).clamp_min(torch.finfo(topk_weights.dtype).tiny)
     output_scores = scores if need_scores else router_logits
-    return topk_weights.to(torch.float32), topk_ids.to(torch.int32), output_scores
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights.to(weights_dtype), topk_ids.to(torch.int32), output_scores

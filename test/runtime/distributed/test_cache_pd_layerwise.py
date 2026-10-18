@@ -589,7 +589,9 @@ def _layerwise_fanout_context():
         for rank, request in enumerate(requests)
     }
     manager.layerwise_debug = False
-    manager.kv_transfer_metrics = KVTransferMetrics({}, enabled=False)
+    manager.kv_transfer_metrics = KVTransferMetrics(
+        {}, reporters=["prometheus"], enabled=False
+    )
     manager.session_failures = defaultdict(int)
     return manager, requests
 

@@ -31,6 +31,8 @@ lists, the admission-probe cap handed to the C++ scheduler, and the wire codec.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import inspect
 import os
 import sys
 from types import SimpleNamespace
@@ -60,14 +62,22 @@ from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
     TokenizedGenerateReqInput,
     ipc_message_union,
 )
-from tokenspeed.runtime.engine.logprobs import resolve_logprob_start_len  # noqa: E402
+from tokenspeed.runtime.engine.logprobs import (  # noqa: E402
+    LogprobsProcessor,
+    resolve_logprob_start_len,
+)
 from tokenspeed.runtime.engine.request_handler import RequestHandler  # noqa: E402
 from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
     UNBOUNDED_CACHED_PREFIX_TOKENS,
     input_logprob_plan_for_forward,
     make_spec,
+    sampled_top_k_for_forward,
 )
-from tokenspeed.runtime.execution.types import InputLogprobPlan  # noqa: E402
+from tokenspeed.runtime.execution.types import (  # noqa: E402
+    ForwardLogprobs,
+    InputLogprobPlan,
+    PlannedForward,
+)
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
 
 # --------------------------------------------------------------------------
@@ -93,7 +103,10 @@ class _StubTokenizer:
 
 
 def _input_processor(
-    *, enable_output_logprobs: bool = True, supports_prompt_logprobs: bool = True
+    *,
+    enable_output_logprobs: bool = True,
+    supports_prompt_logprobs: bool = True,
+    **server_args,
 ) -> InputProcessor:
     engine = SimpleNamespace(
         context_len=100,
@@ -105,8 +118,13 @@ def _input_processor(
             reasoning_parser=None,
             enable_prefix_caching=True,
             enable_output_logprobs=enable_output_logprobs,
-            disaggregation_mode="null",
             language_model_only=False,
+            **{
+                "logprob_order": "torch",
+                "mapping": None,
+                "disaggregation_mode": "null",
+                **server_args,
+            },
         ),
         model_config=SimpleNamespace(
             vocab_size=32000, is_multimodal=False, is_multimodal_active=False
@@ -117,11 +135,15 @@ def _input_processor(
 
 
 def _tokenize(
-    *, input_ids=None, processor: InputProcessor | None = None, **kwargs
+    *,
+    input_ids=None,
+    processor: InputProcessor | None = None,
+    sampling_params: dict | None = None,
+    **kwargs,
 ) -> TokenizedGenerateReqInput:
     obj = GenerateReqInput(
         input_ids=list(range(10)) if input_ids is None else input_ids,
-        sampling_params={},
+        sampling_params=dict(sampling_params or {}),
         **kwargs,
     )
     obj.normalize_batch_and_arguments()
@@ -189,6 +211,55 @@ def test_input_processor_refuses_prompt_logprobs_for_out_of_vocab_ids():
     )
 
 
+def test_input_processor_takes_top_k_for_a_request_sampled_in_its_prefill():
+    """Top-k alternatives exist for the prompt rows and the token a prefill
+    samples, so a request generating at most one token gets them; a longer
+    generation would reach a captured decode step, which computes none."""
+    for max_new_tokens in (0, 1):
+        tokenized = _tokenize(
+            return_logprob=True,
+            logprob_start_len=0,
+            top_logprobs_num=5,
+            sampling_params={"max_new_tokens": max_new_tokens},
+        )
+        assert tokenized.top_logprobs_num == 5
+        assert tokenized.logprob_start_len == 0
+    # The default start (no prompt rows) takes it too: the sampled token's.
+    assert (
+        _tokenize(
+            return_logprob=True,
+            top_logprobs_num=20,
+            sampling_params={"max_new_tokens": 1},
+        ).top_logprobs_num
+        == 20
+    )
+    # No logprobs asked for: nothing to gate.
+    assert _tokenize(top_logprobs_num=3).top_logprobs_num == 0
+
+
+@pytest.mark.parametrize(
+    ("server_args", "kwargs", "message"),
+    [
+        ({}, {"sampling_params": {"max_new_tokens": 2}}, "max_new_tokens <= 1"),
+        ({}, {"sampling_params": {}}, "max_new_tokens <= 1"),
+        ({}, {"top_logprobs_num": 21}, "between 1 and 20"),
+        ({"logprob_order": "megatron"}, {}, "logprob-order torch"),
+        ({"mapping": SimpleNamespace(has_pp=True)}, {}, "pipeline parallelism"),
+        ({"disaggregation_mode": "prefill"}, {}, "disaggregated"),
+    ],
+)
+def test_input_processor_refuses_top_k_it_cannot_compute(server_args, kwargs, message):
+    request = {
+        "return_logprob": True,
+        "logprob_start_len": 0,
+        "top_logprobs_num": 5,
+        "sampling_params": {"max_new_tokens": 1},
+        **kwargs,
+    }
+    with pytest.raises(ValueError, match=message):
+        _tokenize(processor=_input_processor(**server_args), **request)
+
+
 # --------------------------------------------------------------------------
 # RequestState
 # --------------------------------------------------------------------------
@@ -201,6 +272,7 @@ def _state(
     return_logprob: bool = True,
     computes_prompt_logprobs: bool = True,
     unpadded: list[int] | None = None,
+    top_k: int = 0,
 ) -> RequestState:
     return RequestState(
         prompt_input_ids=input_ids,
@@ -211,6 +283,7 @@ def _state(
         logprob_start_len=start,
         computes_prompt_logprobs=computes_prompt_logprobs,
         prompt_input_ids_unpadded=unpadded,
+        top_logprobs_num=top_k,
     )
 
 
@@ -337,6 +410,49 @@ def test_plan_validates_its_shape():
         InputLogprobPlan((0,), (-1,), (0,))
     with pytest.raises(ValueError, match="at least one row"):
         InputLogprobPlan((0, 0), (0, 0), (0, 0))
+    with pytest.raises(ValueError, match="top_k must be non-negative"):
+        InputLogprobPlan((0,), (1,), (0,), top_k=-1)
+
+
+def test_plan_top_k_is_the_largest_of_its_planned_slots():
+    ids = list(range(100, 110))
+    states = {
+        "a": _state(ids, start=0, top_k=2),
+        "b": _state(ids, start=5, top_k=5),
+        "default": _state(ids, top_k=7),  # no prompt rows: not planned
+        "plain": _state(ids, start=0),
+    }
+    op = _Op(["a", "b", "default", "plain"], [10, 10, 10, 10], [0, 0, 0, 0], 4)
+    plan = _plan(op, states)
+    assert plan.top_k == 5
+    assert _plan(_Op(["plain"], [10], [0], 1), states).top_k == 0
+
+
+def test_sampled_top_k_follows_the_extend_slots_that_return_logprobs():
+    ids = list(range(100, 110))
+    states = {
+        "a": _state(ids, top_k=3),
+        "b": _state(ids, start=0, top_k=6),
+        "off": _state(ids, return_logprob=False, top_k=9),
+        "decode": _state(ids, top_k=8),
+    }
+    op = _Op(["a", "off", "b", "decode"], [10, 10, 10, 1], [0, 0, 0], 3)
+    assert sampled_top_k_for_forward(op, states) == 6
+    assert sampled_top_k_for_forward(_Op(["off"], [10], [0], 1), states) == 0
+    # A decode row never asks: its token comes from a captured step.
+    assert sampled_top_k_for_forward(_Op(["decode"], [1], [], 0), states) == 0
+
+
+def test_the_sampled_k_has_no_default_like_the_prompt_logprob_plan():
+    """A caller that does not pass the sampled k fails where it builds the
+    round or calls the forward, not later at the output processor."""
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+
+    fields = {field.name: field for field in dataclasses.fields(PlannedForward)}
+    params = inspect.signature(ModelExecutor.execute_forward_op).parameters
+    for name in ("input_logprob_plan", "sampled_top_k"):
+        assert fields[name].default is dataclasses.MISSING
+        assert params[name].default is inspect.Parameter.empty
 
 
 # --------------------------------------------------------------------------
@@ -354,7 +470,13 @@ class _Sender:
 
 class _Result:
     def __init__(
-        self, output_tokens, plan=None, input_token_logprobs=None, nan_flags=None
+        self,
+        output_tokens,
+        plan=None,
+        input_token_logprobs=None,
+        nan_flags=None,
+        input_top=None,
+        output_top=None,
     ):
         self.output_tokens = torch.tensor(output_tokens, dtype=torch.int32)
         self.output_lengths = torch.ones(len(output_tokens), dtype=torch.int32)
@@ -374,6 +496,17 @@ class _Result:
             if input_token_logprobs is not None
             else None
         )
+        # ``(values, ids)`` rows, as the executor's [rows, k] tensors.
+        self.input_top_logprobs_val, self.input_top_logprobs_idx = (
+            (torch.tensor(input_top[0]), torch.tensor(input_top[1]))
+            if input_top is not None
+            else (None, None)
+        )
+        self.output_top_logprobs_val, self.output_top_logprobs_idx = (
+            (torch.tensor(output_top[0]), torch.tensor(output_top[1]))
+            if output_top is not None
+            else (None, None)
+        )
 
 
 def _processor(sender=None) -> OutputProcesser:
@@ -385,7 +518,18 @@ def _processor(sender=None) -> OutputProcesser:
 
 
 def _run_chunk(
-    processor, state, rid, ids, prefix, length, logprobs, *, prefill=False, nan=False
+    processor,
+    state,
+    rid,
+    ids,
+    prefix,
+    length,
+    logprobs,
+    *,
+    prefill=False,
+    nan=False,
+    input_top=None,
+    output_top=None,
 ):
     """Commit one prefill chunk of ``rid`` with its planned prompt logprobs."""
     op = _Op([rid], [length], [prefix], 1, prefill_lengths=[len(ids)])
@@ -398,6 +542,8 @@ def _run_chunk(
         plan,
         logprobs if plan else None,
         nan_flags=[int(nan)],
+        input_top=input_top if plan else None,
+        output_top=output_top,
     )
     return processor.post_process_forward_op(op, result, is_prefill_instance=prefill)
 
@@ -576,6 +722,160 @@ def test_decode_node_prepends_the_bootstrap_logprob_to_output_logprobs(
     )
 
 
+def _top_rows(first_ids, k=3):
+    """Per row: values -0.5, -1.5, ... and ids first, first+1, ..."""
+    values = [[-0.5 - j for j in range(k)] for _ in first_ids]
+    ids = [[first + j for j in range(k)] for first in first_ids]
+    return values, ids
+
+
+def test_top_k_accumulates_and_finalizes_beside_the_prompt_logprobs():
+    """The forward's alternatives (as many as the batch's largest ask) are
+    cut to the request's own count, land at their positions across chunks,
+    finalize as ``[None] + rows`` beside the values, and ship once; the
+    sampled token's alternatives ship with it."""
+    ids = list(range(100, 108))
+    sender = _Sender()
+    processor = _processor(sender)
+    state = _state(ids, start=0, top_k=2)
+    processor.rid_to_state["a"] = state
+    assert state.input_top_logprobs == [None] * 7
+    assert state.output_top_logprobs_val == []
+
+    _run_chunk(
+        processor,
+        state,
+        "a",
+        ids,
+        0,
+        4,
+        [-1.0] * 4,
+        input_top=_top_rows([10, 11, 12, 13]),
+    )
+    _run_chunk(
+        processor,
+        state,
+        "a",
+        ids,
+        4,
+        4,
+        [-2.0] * 3,
+        input_top=_top_rows([14, 15, 16]),
+        output_top=_top_rows([20]),
+    )
+
+    assert state.input_top_logprobs is None
+    assert state.input_top_logprobs_val == [None] + [[-0.5, -1.5]] * 7
+    assert state.input_top_logprobs_idx == [None] + [
+        [first, first + 1] for first in range(10, 17)
+    ]
+    assert len(state.input_top_logprobs_val) == len(state.input_token_logprobs_val)
+    assert state.output_top_logprobs_val == [[-0.5, -1.5]]
+    assert state.output_top_logprobs_idx == [[20, 21]]
+
+    [out] = sender.items
+    assert out.input_top_logprobs_val == [state.input_top_logprobs_val]
+    assert out.input_top_logprobs_idx == [state.input_top_logprobs_idx]
+    assert out.output_top_logprobs_val == [[[-0.5, -1.5]]]
+    assert out.output_top_logprobs_idx == [[[20, 21]]]
+    # A later frame carries no prompt alternatives and only its own tokens'.
+    state.stream = True
+    processor.stream_output(["a"], [state])
+    assert sender.items[1].input_top_logprobs_val == [[]]
+
+
+def test_top_k_of_a_request_without_prompt_rows_is_the_sampled_tokens():
+    """The default start scores no prompt row: the prompt entry is the lone
+    ``None`` and only the sampled token reports alternatives."""
+    ids = [5, 6, 7]
+    sender = _Sender()
+    processor = _processor(sender)
+    state = _state(ids, top_k=1)
+    processor.rid_to_state["a"] = state
+    op = _Op(["a"], [3], [0], 1)
+    assert input_logprob_plan_for_forward(op, {"a": state}) is None
+    processor.post_process_forward_op(
+        op, _Result([77], output_top=_top_rows([30])), is_prefill_instance=False
+    )
+    assert state.input_top_logprobs_val == [None]
+    assert state.output_top_logprobs_val == [[-0.5]]
+    assert sender.items[0].output_top_logprobs_idx == [[[30]]]
+
+
+_TOP_K_COLUMNS = (
+    "input_top_logprobs_val",
+    "input_top_logprobs_idx",
+    "output_top_logprobs_val",
+    "output_top_logprobs_idx",
+)
+
+
+def test_a_frame_without_top_k_requests_ships_the_top_k_columns_empty():
+    """The default path: no request of the frame asked for top-k, so the four
+    columns stay [] for the whole frame instead of holding a [] per request,
+    and the frontend still reads no alternatives for each request."""
+    sender = _Sender()
+    processor = _processor(sender)
+    states = {"a": _state([5, 6, 7]), "b": _state([5, 6, 7], return_logprob=False)}
+    processor.rid_to_state.update(states)
+    op = _Op(["a", "b"], [3, 3], [0, 0], 2)
+    processor.post_process_forward_op(op, _Result([77, 78]), is_prefill_instance=False)
+    [out] = sender.items
+    assert out.rids == ["a", "b"]
+    assert out.output_token_logprobs_val == [[-0.5], []]
+    for column in _TOP_K_COLUMNS:
+        assert getattr(out, column) == []
+        assert [LogprobsProcessor._row(out, column, i) for i in range(2)] == [[], []]
+
+
+def test_a_frame_with_a_top_k_request_ships_an_entry_per_request():
+    """One request of the frame asked for top-k: every request gets an entry,
+    so each row lines up with its rid, and the others' entries are []."""
+    sender = _Sender()
+    processor = _processor(sender)
+    states = {"a": _state([5, 6, 7]), "b": _state([5, 6, 7], top_k=1)}
+    processor.rid_to_state.update(states)
+    op = _Op(["a", "b"], [3, 3], [0, 0], 2)
+    processor.post_process_forward_op(
+        op,
+        _Result([77, 78], output_top=_top_rows([30, 40], k=1)),
+        is_prefill_instance=False,
+    )
+    [out] = sender.items
+    assert out.input_top_logprobs_val == [[], [None]]
+    assert out.output_top_logprobs_val == [[], [[-0.5]]]
+    assert out.output_top_logprobs_idx == [[], [[40]]]
+    assert LogprobsProcessor._row(out, "output_top_logprobs_idx", 1) == [[40]]
+
+
+def test_a_token_without_the_alternatives_its_request_asked_for_ends_it():
+    """The ingress keeps such requests to prefill-sampled tokens; should a
+    token come without alternatives anyway, the request ends with an error
+    rather than ship it with a hole."""
+    ids = [5, 6, 7]
+    sender = _Sender()
+    processor = _processor(sender)
+    state = _state(ids, top_k=2)
+    processor.rid_to_state["a"] = state
+    op = _Op(["a"], [3], [0], 1)
+    processor.post_process_forward_op(op, _Result([77]), is_prefill_instance=False)
+    assert state.finished
+    assert (
+        "top-k logprobs are not computed" in state.finished_reason.to_json()["message"]
+    )
+    assert state.output_top_logprobs_val == []
+    assert len(sender.items) == 1
+
+
+def test_prompt_logprobs_without_the_alternatives_asked_for_are_refused():
+    state = _state([1, 2, 3, 4], start=0, top_k=2)
+    with pytest.raises(RuntimeError, match="without the top-k"):
+        state.record_input_token_logprobs(0, [-1.0, -2.0, -3.0])
+    state.record_input_token_logprobs(0, [-1.0, -2.0], _top_rows([1, 2]))
+    with pytest.raises(RuntimeError, match="incomplete"):
+        state.finalize_input_token_logprobs()
+
+
 def test_result_rows_must_match_the_plan():
     ids = list(range(100, 106))
     processor = _processor()
@@ -632,7 +932,12 @@ def test_executor_expands_the_plan_into_rows_targets_and_slots(monkeypatch):
     assert staged.num_input_rows == 6
     assert staged.chunk_tokens == 3
     assert staged.rows_per_rank is None and staged.num_result_rows == 5
+    assert staged.top_k == 0
     assert executor.nan_guard.flags.tolist() == [0, 0, 0, 0]
+    plan = InputLogprobPlan(
+        row_starts=(0, 4), counts=(3, 2), position_starts=(5, 0), top_k=4
+    )
+    assert executor._input_logprob_rows(plan, 2, 6, None).top_k == 4
 
     # A slot without rows contributes nothing and shifts no other slot.
     plan = InputLogprobPlan(
@@ -824,6 +1129,188 @@ def test_batch_token_id_out_codec_carries_prompt_logprobs():
     assert decoded.input_token_logprobs_val == [[None, -0.5, -1.25]]
     assert decoded.input_token_logprobs_idx == [[7, 8, 9]]
     assert decoded.output_token_logprobs_val == [[-0.75]]
+
+
+def test_batch_token_id_out_codec_carries_top_logprobs():
+    out = BatchTokenIDOut(
+        rids=["r1"],
+        finished_reasons=[None],
+        decoded_texts=[""],
+        decode_ids=[[10]],
+        read_offsets=[0],
+        output_ids=[[10]],
+        output_multi_ids=[[]],
+        skip_special_tokens=[True],
+        spaces_between_special_tokens=[True],
+        no_stop_trim=[False],
+        prompt_tokens=[3],
+        completion_tokens=[1],
+        cached_tokens=[0],
+        spec_verify_ct=[0],
+        input_token_logprobs_val=[[None, -0.5, -1.25]],
+        input_token_logprobs_idx=[[7, 8, 9]],
+        output_token_logprobs_val=[[-0.75]],
+        output_token_logprobs_idx=[[10]],
+        input_top_logprobs_val=[[None, [-0.5, -1.5], [-0.25, -1.25]]],
+        input_top_logprobs_idx=[[None, [8, 3], [4, 9]]],
+        output_top_logprobs_val=[[[-0.75, -0.9]]],
+        output_top_logprobs_idx=[[[10, 11]]],
+        input_token_ids_logprobs_val=[],
+        input_token_ids_logprobs_idx=[],
+        output_token_ids_logprobs_val=[],
+        output_token_ids_logprobs_idx=[],
+        output_hidden_states=[],
+        batch_accept_draft_tokens=[],
+        output_extra_infos=[{}],
+        generated_time=0.0,
+    )
+    frames = MsgpackEncoder().encode(out)
+    decoded = MsgpackDecoder(ipc_message_union()).decode(frames)
+    assert decoded.input_top_logprobs_val == [[None, [-0.5, -1.5], [-0.25, -1.25]]]
+    assert decoded.input_top_logprobs_idx == [[None, [8, 3], [4, 9]]]
+    assert decoded.output_top_logprobs_val == [[[-0.75, -0.9]]]
+    assert decoded.output_top_logprobs_idx == [[[10, 11]]]
+
+    # The frontend renders them as (logprob, id, text) tuples, None first.
+    from tokenspeed.runtime.engine.logprobs import LogprobsProcessor
+
+    info: dict = {}
+    LogprobsProcessor(SimpleNamespace(tokenizer=None)).convert_logprob_style(
+        info, "sglang", 2, None, False, decoded, 0
+    )
+    assert info["input_top_logprobs"] == [
+        None,
+        [(-0.5, 8, None), (-1.5, 3, None)],
+        [(-0.25, 4, None), (-1.25, 9, None)],
+    ]
+    assert info["output_top_logprobs"] == [[(-0.75, 10, None), (-0.9, 11, None)]]
+
+
+def test_sampled_top_logprobs_are_the_prefill_rows_log_softmax_top_k():
+    from tokenspeed.runtime.execution.model_executor import _set_sampled_top_logprobs
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+
+    torch.manual_seed(0)
+    logits = (torch.randn(3, 50) * 4).to(torch.bfloat16)
+    out = LogitsProcessorOutput(next_token_logits=logits)
+    _set_sampled_top_logprobs(out, logits, 0)
+    assert out.sampled_top_logprobs_val is None
+    assert ForwardLogprobs.of(out) is None
+    _set_sampled_top_logprobs(out, logits, 5)
+    expected = torch.log_softmax(logits.float(), dim=-1).topk(5, dim=-1)
+    assert torch.equal(out.sampled_top_logprobs_val, expected.values)
+    assert torch.equal(out.sampled_top_logprobs_idx, expected.indices)
+    bundle = ForwardLogprobs.of(out).to_host()
+    assert bundle.input_token_logprobs is None
+    assert torch.equal(bundle.output_top_logprobs_idx, expected.indices)
+
+
+@pytest.mark.parametrize("chunk_tokens", [1, 2, 64])
+def test_prompt_top_k_rides_the_chunk_loop_of_the_prompt_logprobs(chunk_tokens):
+    """With a plan's top_k every chunk makes two calls: gather_token_logprobs
+    for the targets' values (bit for bit the logprob without top-k), then
+    top_token_logprobs for each row's alternatives; top_k 0 leaves the output
+    as it was, and a top_k past the vocabulary returns every token."""
+    from tokenspeed.runtime.execution.context import InputLogprobRows
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.logits_processor import (
+        LogitsMetadata,
+        LogitsProcessor,
+    )
+
+    torch.manual_seed(0)
+    vocab = 12
+    hidden = torch.randint(-8, 9, (5, 4)).float() / 8
+    weight = torch.randint(-8, 9, (vocab, 4)).float() / 8
+    rows, targets = [0, 1, 3], [5, 2, 3]
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=vocab),
+        dp_lm_head_tp=False,
+    )
+
+    def run(top_k):
+        metadata = LogitsMetadata(
+            forward_mode=ForwardMode.EXTEND,
+            query_shard=None,
+            gather_ids=torch.tensor([2, 4]),
+            input_logprob_rows=InputLogprobRows(
+                rows=torch.tensor(rows),
+                targets=torch.tensor(targets),
+                slots=torch.zeros(len(rows), dtype=torch.int64),
+                num_input_rows=5,
+                chunk_tokens=chunk_tokens,
+                rows_per_rank=None,
+                top_k=top_k,
+            ),
+        )
+        return processor(
+            input_ids=None,
+            hidden_states=hidden,
+            lm_head=SimpleNamespace(weight=weight),
+            logits_metadata=metadata,
+        )
+
+    plain, with_top = run(0), run(3)
+    assert plain.input_top_logprobs_val is None
+    assert torch.equal(with_top.input_token_logprobs, plain.input_token_logprobs)
+    logprobs = torch.log_softmax(hidden[rows] @ weight.T, dim=-1)
+    top = logprobs.topk(3, dim=-1)
+    assert torch.equal(with_top.input_top_logprobs_val, top.values)
+    assert torch.equal(with_top.input_top_logprobs_idx, top.indices)
+    assert with_top.input_top_logprobs_idx.dtype == torch.int64
+    every = run(vocab + 8)
+    whole = logprobs.topk(vocab, dim=-1)
+    assert torch.equal(every.input_top_logprobs_val, whole.values)
+    assert torch.equal(every.input_top_logprobs_idx, whole.indices)
+
+
+def test_prompt_rows_and_sampled_rows_take_the_same_top_k_of_the_same_logits():
+    """docs/design/numerics.md: one arithmetic for prompt and output. Scored
+    as prompt rows (in uneven chunks) or sampled, the same bf16 logits rows
+    get the same alternatives bit for bit, values and ids, exact ties in
+    the top-k included."""
+    from tokenspeed.runtime.execution.context import InputLogprobRows
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.model_executor import _set_sampled_top_logprobs
+    from tokenspeed.runtime.layers.logits_processor import (
+        LogitsMetadata,
+        LogitsProcessor,
+    )
+
+    torch.manual_seed(0)
+    vocab, k, num_rows = 64, 8, 5
+    # The identity head makes each row's logits its activations, exactly.
+    # Three tokens tie for every row's largest logit, and the coarse grid
+    # ties more of the rest.
+    hidden = (torch.randint(-16, 17, (num_rows, vocab)) / 4).to(torch.bfloat16)
+    hidden[:, [3, 17, 40]] = 5.0
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=vocab),
+        dp_lm_head_tp=False,
+    )
+    out = processor(
+        input_ids=None,
+        hidden_states=hidden,
+        lm_head=SimpleNamespace(weight=torch.eye(vocab, dtype=torch.bfloat16)),
+        logits_metadata=LogitsMetadata(
+            forward_mode=ForwardMode.EXTEND,
+            query_shard=None,
+            gather_ids=torch.arange(num_rows),
+            input_logprob_rows=InputLogprobRows(
+                rows=torch.arange(num_rows),
+                targets=torch.zeros(num_rows, dtype=torch.int64),
+                slots=torch.zeros(num_rows, dtype=torch.int64),
+                num_input_rows=num_rows,
+                chunk_tokens=2,
+                rows_per_rank=None,
+                top_k=k,
+            ),
+        ),
+    )
+    _set_sampled_top_logprobs(out, out.next_token_logits, k)
+
+    assert torch.equal(out.input_top_logprobs_val, out.sampled_top_logprobs_val)
+    assert torch.equal(out.input_top_logprobs_idx, out.sampled_top_logprobs_idx)
 
 
 if __name__ == "__main__":

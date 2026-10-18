@@ -37,52 +37,6 @@ two-stage unquantized fused MoE in Gluon:
 Reference shape: DeepSeek-V3 (E=256, D=7168, I=256, topk=8).
 """
 
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_decode import (
-    launch_gluon_latent_input_decode_gfx950,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_largem import (
-    launch_gluon_latent_input_largem_gfx950,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.latent_input_small_batch import (
-    launch_gluon_latent_input_small_batch_gfx950,
-)
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe import gluon_bf16_moe
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_device import (
-    moe_align_block_size_device,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_fused import (
-    moe_align_block_size_fused,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.stage1_kernel import (
-    gluon_bf16_moe_stage1_kernel,
-    invoke_stage1,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.stage1_splitk_kernel import (
-    auto_split_k,
-    invoke_stage1_splitk,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.stage2_decode_kernel import (
-    invoke_stage2_decode,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.stage2_kernel import (
-    gluon_bf16_moe_reduce_kernel,
-    gluon_bf16_moe_stage2_kernel,
-    invoke_stage2,
-)
 
-__all__ = [
-    "gluon_bf16_moe",
-    "launch_gluon_latent_input_decode_gfx950",
-    "launch_gluon_latent_input_largem_gfx950",
-    "launch_gluon_latent_input_small_batch_gfx950",
-    "invoke_stage1",
-    "invoke_stage1_splitk",
-    "auto_split_k",
-    "invoke_stage2",
-    "invoke_stage2_decode",
-    "moe_align_block_size_device",
-    "moe_align_block_size_fused",
-    "gluon_bf16_moe_stage1_kernel",
-    "gluon_bf16_moe_stage2_kernel",
-    "gluon_bf16_moe_reduce_kernel",
-]
+__all__ = ["gluon_bf16_moe"]

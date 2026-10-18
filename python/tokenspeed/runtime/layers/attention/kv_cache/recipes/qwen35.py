@@ -41,8 +41,10 @@ class QwenGDNRecipe(CacheRecipe):
     form one KV group, the full-history group drafters write through; its
     ``n`` layers span ``2 * n`` segments, K and V of one layer adjacent. The
     state layers are dealt round-robin into as few groups as hold them at that
-    many SSM states each, every conv window in a segment of its own that the
-    KV group skips, so a state block carries no attention planes.
+    many SSM states each, so a state block carries no attention planes. Their
+    conv windows pack into the segments the states leave free, so a KV page
+    carries no state planes either; only when the states fill every segment
+    does each conv window take a plane of its own, which the KV group skips.
 
     Draft layers are attention layers of the one big model. One whose fields
     are a target attention layer's K and V byte for byte takes segments the
@@ -93,15 +95,38 @@ class QwenGDNRecipe(CacheRecipe):
         return tuple(group_ids)
 
     @cached_property
-    def _num_state_groups(self) -> int:
-        """State groups of at most as many SSM states as the KV group has K/V segments."""
-        num_state = sum(label in STATE_LAYER_TYPES for label in self.target_layer_types)
-        num_kv = len(self.target_layer_types) - num_state
+    def _num_state_layers(self) -> int:
+        return sum(label in STATE_LAYER_TYPES for label in self.target_layer_types)
+
+    @cached_property
+    def _num_segments(self) -> int:
+        """K/V segments of the KV group, a draft layer's included when it shares them."""
+        num_kv = len(self.target_layer_types) - self._num_state_layers
         if num_kv == 0:
             raise ValueError("Qwen3.5 cache requires at least one full-attention layer")
         if self.num_draft_layers and self._draft_shares_segments:
             num_kv += self.num_draft_layers
-        return max(math.ceil(num_state / (2 * num_kv)), 1)
+        return 2 * num_kv
+
+    @cached_property
+    def _num_state_groups(self) -> int:
+        """State groups of at most as many SSM states as the KV group has K/V segments."""
+        return max(math.ceil(self._num_state_layers / self._num_segments), 1)
+
+    @cached_property
+    def _conv_planes(self) -> tuple[str, ...]:
+        """Each state occurrence's conv plane: the last segments when the states leave room, else its own."""
+        conv_shape, conv_dtype, ssm_shape, ssm_dtype = self._state_shapes
+        states = math.ceil(self._num_state_layers / self._num_state_groups)
+        per_segment = (math.prod(ssm_shape) * cache_dtype_bytes(ssm_dtype)) // (
+            math.prod(conv_shape) * cache_dtype_bytes(conv_dtype)
+        )
+        if per_segment * (self._num_segments - states) < states:
+            return tuple(f"conv.{occurrence}" for occurrence in range(states))
+        return tuple(
+            f"unit.{self._num_segments - 1 - occurrence // per_segment}"
+            for occurrence in range(states)
+        )
 
     @cached_property
     def _draft_shares_segments(self) -> bool:
@@ -205,7 +230,7 @@ class QwenGDNRecipe(CacheRecipe):
                 ),
                 CacheFieldSpec(
                     f"layer.{layer_id}.conv",
-                    f"conv.{occurrence}",
+                    self._conv_planes[occurrence],
                     conv_shape,
                     conv_dtype,
                     exact_page_stride=False,

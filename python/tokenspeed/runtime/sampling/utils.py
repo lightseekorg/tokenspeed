@@ -103,3 +103,28 @@ def gather_token_logprobs(
             logits, tokens.to(torch.int64), vocab_block=MEGATRON_VOCAB_BLOCK
         )
     return gather_token_logprobs_torch(logits, tokens)
+
+
+def top_token_logprobs(
+    logits: torch.Tensor,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return each row's ``top_k`` most likely tokens, most likely first.
+
+    The one top-k arithmetic for prompt rows and sampled rows, in torch's
+    logprob order (the ingress refuses top-k under any other): the fp32
+    log-softmax ``gather_token_logprobs_torch`` gathers from, so a token's
+    value in its row's top-k is the logprob gathered for it, bit for bit.
+
+    Args:
+        logits: ``[rows, vocab]`` logits.
+        top_k: Tokens per row; a ``top_k`` past the vocabulary returns every
+            token.
+
+    Returns:
+        ``[rows, min(top_k, vocab)]`` fp32 log probabilities and the int64
+        ids of those tokens.
+    """
+    logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float32)
+    values, ids = logprobs.topk(min(top_k, logprobs.shape[-1]), dim=-1)
+    return values, ids

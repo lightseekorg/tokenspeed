@@ -910,11 +910,19 @@ def mhc_fused_hc(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.residual.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.residual._cute_dsl.gated_boundary  # noqa: E402,F401
+import tokenspeed_kernel.ops.residual._triton.gated_boundary  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.cute_fused  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.torch  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.triton  # noqa: E402,F401
+from tokenspeed_kernel.ops.residual.gated_boundary import (  # noqa: E402
+    boundary_gathers_mailbox,
+    post_norm_residual_pre_norm,
+    post_norm_residual_pre_norm_bf16,
+    residual_gate_coefficients,
+)
 
 # isort: on
 
@@ -922,6 +930,7 @@ import tokenspeed_kernel.ops.residual.triton  # noqa: E402,F401
 __all__ = [
     "attn_res_fwd",
     "attn_res_fwd_available",
+    "boundary_gathers_mailbox",
     "gated_residual_combine",
     "gated_residual_mix",
     "mhc_apply_pre",
@@ -930,6 +939,9 @@ __all__ = [
     "mhc_post",
     "mhc_pre",
     "pad_gated_residual_projection_weight",
+    "post_norm_residual_pre_norm",
+    "post_norm_residual_pre_norm_bf16",
+    "residual_gate_coefficients",
 ]
 
 

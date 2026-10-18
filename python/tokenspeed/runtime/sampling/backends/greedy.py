@@ -149,6 +149,10 @@ class GreedySamplingBackend(SamplingBackend):
             (config.max_bs,), dtype=torch.int32, device=config.device
         )
 
+    def reads_only_argmax(self) -> bool:
+        # Logprobs read the full distribution.
+        return not self.config.enable_output_logprobs
+
     @nvtx_range("sampling:sample", color="yellow")
     def sample(
         self,
@@ -165,7 +169,10 @@ class GreedySamplingBackend(SamplingBackend):
                 logits=logits, vocab_mask=sampling_info.vocab_mask
             )
         bs = logits.shape[0]
-        tokens = sampling_argmax(logits, out=self._sample_token_buf[:bs])
+        if logits_output.next_token_ids is not None:
+            tokens = self._sample_token_buf[:bs].copy_(logits_output.next_token_ids)
+        else:
+            tokens = sampling_argmax(logits, out=self._sample_token_buf[:bs])
 
         # TP-rank sync (rank 0 wins), mirrors FlashInferSamplingBackend.sample.
         # All-gathered logits are not bit-identical across ranks, so per-rank
@@ -210,7 +217,11 @@ class GreedySamplingBackend(SamplingBackend):
                 logits=logits,
                 vocab_mask=sampling_info.vocab_mask,
             )
-        target_predict = sampling_argmax(logits).reshape(bs, num_tokens_per_req)
+        target_predict = (
+            logits_output.next_token_ids
+            if logits_output.next_token_ids is not None
+            else sampling_argmax(logits)
+        ).reshape(bs, num_tokens_per_req)
 
         if tree is not None:
             # The accepted path rides in accept_index so the TP broadcast below carries it.

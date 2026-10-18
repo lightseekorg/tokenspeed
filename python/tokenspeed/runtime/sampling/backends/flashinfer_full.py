@@ -309,6 +309,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             batch_next_token_ids, top_ks = self._sample_per_request(
                 logits, sampling_info, min_p_pool=self._min_p_pool
             )
+            needs_tp_sync = True
         else:
             temperatures, top_ks, top_ps, min_ps, seeds, offsets = (
                 gather_and_expand_scalars(
@@ -318,7 +319,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                     top_p=self._top_p_pool,
                     min_p=self._min_p_pool,
                     seed=self._seed_pool,
-                    offsets=sampling_info.valid_cache_lengths,
+                    offsets=self._prepare_sampling_offsets(sampling_info),
                 )
             )
             probs = softmax(logits, temperature=temperatures.view(-1, 1))
@@ -344,6 +345,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 offset=offsets,
                 deterministic=True,
             )
+            needs_tp_sync = not _FUSED_TOPK_TOPP_AVAILABLE
         if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
             # Greedy maximizes the penalized logits.
             batch_next_token_ids = canonical_greedy_tokens(
@@ -352,15 +354,9 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         sampled = batch_next_token_ids.to(torch.int32)
 
-        # TP-rank sync BEFORE _accumulate_counts so per-rank counts stay aligned.
-        # For fused top-k + top-p, the results are bit-identical across ranks.
-        # So we don't need to broadcast the results. The per-request route
-        # reads the gathered logits, which are not bit-identical across ranks,
-        # so it syncs like FlashInferSamplingBackend.sample.
-        if (
-            not _FUSED_TOPK_TOPP_AVAILABLE
-            or self.config.sampling_stream == "per-request"
-        ):
+        # Follow the selected sampler's agreement requirement before updating
+        # counts, so every TP rank records the same sampled token.
+        if needs_tp_sync:
             self.maybe_broadcast(sampled)
 
         if raw_logits is not None:
@@ -396,6 +392,18 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
+        per_request_stream = self.config.sampling_stream == "per-request"
+        has_draft_candidates = num_tokens_per_req > 1
+        if per_request_stream and not has_draft_candidates:
+            # sample() owns penalties, grammar, logprobs and the one count update.
+            # The adapter only publishes the single-token verify result.
+            tokens, _ = self.sample(logits_output, sampling_info)
+            return self._pack_single_verify_result(
+                tokens,
+                predict=self._predict_buf[:bs],
+                accept_index=self._accept_index_buf[:bs].view(bs, 1),
+                accept_length=self._accept_length_buf[:bs],
+            )
 
         predict = self._predict_buf[: bs * num_tokens_per_req]
         accept_index = (

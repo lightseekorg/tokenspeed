@@ -176,6 +176,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     COALESCE_SCALES: gl.constexpr = False,
     DIRECT_SCALE_LAYOUT: gl.constexpr = False,
     DEFER_EPILOGUE: gl.constexpr = True,
+    APPLY_ROUTED_WEIGHT: gl.constexpr = True,
     INPUT_SORTED: gl.constexpr = False,
     A_FORMAT: gl.constexpr = "e2m1",
 ):
@@ -1482,10 +1483,15 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                     c2 = acc2.to(c_ptr.type.element_ty)
                     c3 = acc3.to(c_ptr.type.element_ty)
                     routed_weight = moe_weight[:, None].to(c0.dtype)
-                    c0_co = gl.convert_layout(c0 * routed_weight, store_layout)
-                    c1_co = gl.convert_layout(c1 * routed_weight, store_layout)
-                    c2_co = gl.convert_layout(c2 * routed_weight, store_layout)
-                    c3_co = gl.convert_layout(c3 * routed_weight, store_layout)
+                    if APPLY_ROUTED_WEIGHT:
+                        c0 = c0 * routed_weight
+                        c1 = c1 * routed_weight
+                        c2 = c2 * routed_weight
+                        c3 = c3 * routed_weight
+                    c0_co = gl.convert_layout(c0, store_layout)
+                    c1_co = gl.convert_layout(c1, store_layout)
+                    c2_co = gl.convert_layout(c2, store_layout)
+                    c3_co = gl.convert_layout(c3, store_layout)
                     if USE_REDUCE:
                         # ``.cs`` (cache-streaming) on the partials write: the
                         # reduce kernel reads each cell exactly once.
@@ -1511,7 +1517,8 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                         acc=acc0,
                     )
                     c0 = acc0.to(c_ptr.type.element_ty)
-                    c0 = c0 * moe_weight[:, None].to(c0.dtype)
+                    if APPLY_ROUTED_WEIGHT:
+                        c0 = c0 * moe_weight[:, None].to(c0.dtype)
                     c0_co = gl.convert_layout(c0, store_layout)
                     if USE_REDUCE:
                         gl.store(p0, c0_co, mask=m0, cache_modifier=".cs")
@@ -1528,7 +1535,8 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                         acc=acc1,
                     )
                     c1 = acc1.to(c_ptr.type.element_ty)
-                    c1 = c1 * moe_weight[:, None].to(c1.dtype)
+                    if APPLY_ROUTED_WEIGHT:
+                        c1 = c1 * moe_weight[:, None].to(c1.dtype)
                     c1_co = gl.convert_layout(c1, store_layout)
                     if USE_REDUCE:
                         gl.store(p1, c1_co, mask=m1, cache_modifier=".cs")
@@ -1545,7 +1553,8 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                         acc=acc2,
                     )
                     c2 = acc2.to(c_ptr.type.element_ty)
-                    c2 = c2 * moe_weight[:, None].to(c2.dtype)
+                    if APPLY_ROUTED_WEIGHT:
+                        c2 = c2 * moe_weight[:, None].to(c2.dtype)
                     c2_co = gl.convert_layout(c2, store_layout)
                     if USE_REDUCE:
                         gl.store(p2, c2_co, mask=m2, cache_modifier=".cs")
@@ -1562,7 +1571,8 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                         acc=acc3,
                     )
                     c3 = acc3.to(c_ptr.type.element_ty)
-                    c3 = c3 * moe_weight[:, None].to(c3.dtype)
+                    if APPLY_ROUTED_WEIGHT:
+                        c3 = c3 * moe_weight[:, None].to(c3.dtype)
                     c3_co = gl.convert_layout(c3, store_layout)
                     if USE_REDUCE:
                         gl.store(p3, c3_co, mask=m3, cache_modifier=".cs")
@@ -1692,6 +1702,8 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     num_valid_ids,
     out,
     topk,
+    do_finalize: bool,
+    initialize_unowned_routes: bool,
     kernelName="",
     w2_scale=None,
     a2_scale=None,
@@ -1737,6 +1749,8 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
          ``out``.
 
     Layout contract:
+        initialize_unowned_routes: Zero deferred rows outside the local expert
+            range. If false, consumers must mask those rows with the route map.
         inter_states : E2M1-packed uint8 or E4M3 activation rows, optionally
                        already flattened and sorted. A 2D view can expose
                        logical K while keeping its physical row pitch.
@@ -1884,7 +1898,9 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
 
     # Preserve the standalone launcher's default; the package dispatcher
     # explicitly selects combine mode using the local/global expert range.
-    if force_reduce is not None:
+    if not do_finalize:
+        _use_reduce = True
+    elif force_reduce is not None:
         _use_reduce = bool(force_reduce)
     else:
         _use_reduce = token_num >= 512
@@ -1909,6 +1925,8 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         partials = torch.empty(
             (token_num, topk, N), dtype=torch.bfloat16, device=inter_states.device
         )
+        if not do_finalize and initialize_unowned_routes:
+            partials.zero_()
         c_ptr = partials
         # M-row index into `partials` is the flattened (token, slot) row;
         # row stride = topk * N // topk = N elements (one slot row).
@@ -1963,12 +1981,13 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         COALESCE_SCALES=COALESCE_SCALES,
         DIRECT_SCALE_LAYOUT=DIRECT_SCALE_LAYOUT,
         DEFER_EPILOGUE=DEFER_EPILOGUE,
+        APPLY_ROUTED_WEIGHT=do_finalize,
         INPUT_SORTED=bool(input_sorted),
         A_FORMAT=a_format,
         num_warps=NUM_WARPS,
     )
 
-    if _use_reduce:
+    if _use_reduce and do_finalize:
         # Step 6: reduce. Sum partials[token, :, n] over the topk dim
         # (fp32 accumulate, bf16 output) into `out`. Tile (1, 256),
         # 1 wave/CTA.
@@ -1994,4 +2013,6 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         )
     if _USES_FP32_ATOMIC is None:
         _record_atomic_lowering()
+    if not do_finalize:
+        return partials.view(token_num * topk, N)
     return out

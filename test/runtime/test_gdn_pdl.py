@@ -40,11 +40,11 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
     fused_qkv_split_gdn_prefill,
     pack_gdn_projection,
 )
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
-
-from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+from tokenspeed_kernel.ops.conv import (
     causal_conv1d_update,
 )
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
+
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import rmsnorm_fn
 
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -282,7 +282,7 @@ def test_gdn_chain_pdl_toggle(
         with torch.cuda.graph(graph):
             actual = forward()
         names, edges = _graph_kernel_edges(graph)
-        stages = ("pack_gdn", "causal_conv1d", "gdn", "rms_norm")
+        stages = ("pack_gdn", "causal_conv1d", "gdn", "gated_rmsnorm")
         for stage in stages:
             assert any(stage in name for name in names.values()), names
         if steps > 1:

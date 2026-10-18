@@ -443,13 +443,11 @@ void dsv4_indexer_topk_prefill(TensorView logits, TensorView row_starts,
 
 namespace {
 
-constexpr int64_t kRadixTopkWorkspaceSize = 1024 * 1024;
-
 cudaError_t launch_persistent_cluster_topk(
-    const vllm::persistent::PersistentTopKParams& params,
-    uint32_t num_rows, uint32_t cluster_size, cudaStream_t stream,
-    void (*kernel)(vllm::persistent::PersistentTopKParams),
-    bool allow_nonportable_cluster_size = false) {
+    const vllm::persistent::PersistentTopKParams& params, uint32_t num_rows,
+    uint32_t cluster_size, cudaStream_t stream,
+    void (*kernel)(vllm::persistent::PersistentTopKParams), bool enable_pdl,
+    bool allow_nonportable_cluster_size) {
   namespace P = vllm::persistent;
   if (allow_nonportable_cluster_size) {
     const cudaError_t attribute_error = cudaFuncSetAttribute(
@@ -465,7 +463,7 @@ cudaError_t launch_persistent_cluster_topk(
 
   cudaLaunchAttribute attributes[2]{};
   attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attributes[0].val.programmaticStreamSerializationAllowed = true;
+  attributes[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   attributes[1].id = cudaLaunchAttributeClusterDimension;
   attributes[1].val.clusterDim = {1, cluster_size, 1};
   config.attrs = attributes;
@@ -494,36 +492,76 @@ bool is_unsupported_cluster_launch_error(cudaError_t error) {
          error == cudaErrorNotSupported;
 }
 
-template <int TopK>
-void launch_noncluster_persistent_topk(
+int device_sm_count(int device_id) {
+  // Serving workers use one GPU or homogeneous full GPUs.
+  static const int sm_count = [device_id] {
+    int count = 0;
+    const cudaError_t error = cudaDeviceGetAttribute(
+        &count, cudaDevAttrMultiProcessorCount, device_id);
+    TVM_FFI_ICHECK(error == cudaSuccess) << cudaGetErrorString(error);
+    return count;
+  }();
+  return sm_count;
+}
+
+template <int TopK, int Level, bool kUsePDL>
+void launch_noncluster_topk_level(
     const vllm::persistent::PersistentTopKParams& params,
-    int64_t num_rows, int64_t max_seq_len, cudaStream_t stream) {
+    bool prefer_single_cta, cudaStream_t stream) {
   namespace P = vllm::persistent;
-  if (max_seq_len <= P::kRegister2MaxSeqLen) {
-    P::persistent_topk_kernel<TopK, 0>
-        <<<num_rows, P::kThreadsPerBlock, 0, stream>>>(params);
-  } else if (max_seq_len <= P::kRegister4MaxSeqLen) {
-    P::persistent_topk_kernel<TopK, 1>
-        <<<num_rows, P::kThreadsPerBlock, 0, stream>>>(params);
+  auto kernel = P::persistent_topk_kernel<TopK, Level, kUsePDL, 2>;
+  if constexpr (kUsePDL) {
+    // A one-block register budget spreads small grids of waiting CTAs
+    // across SMs as scoring finishes. The compiler may trade occupancy
+    // for fewer instructions in register and streaming selectors.
+    if (prefer_single_cta) {
+      kernel = P::persistent_topk_kernel<TopK, Level, true, 1>;
+    }
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(params.num_rows);
+    config.blockDim = dim3(P::kThreadsPerBlock);
+    config.stream = stream;
+    cudaLaunchAttribute attribute{};
+    attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute.val.programmaticStreamSerializationAllowed = true;
+    config.attrs = &attribute;
+    config.numAttrs = 1;
+    const cudaError_t error = cudaLaunchKernelEx(&config, kernel, params);
+    TVM_FFI_ICHECK(error == cudaSuccess) << cudaGetErrorString(error);
   } else {
-    P::persistent_topk_kernel<TopK, 2>
-        <<<num_rows, P::kThreadsPerBlock, 0, stream>>>(params);
+    kernel<<<params.num_rows, P::kThreadsPerBlock, 0, stream>>>(params);
   }
 }
 
-template <int TopK>
-void launch_persistent_topk(const TensorView& logits,
-                            const TensorView& lengths,
-                            TensorView& output,
-                            TensorView& workspace,
-                            int64_t max_seq_len,
-                            int64_t q_len_per_req,
-                            cudaStream_t stream) {
+template <int TopK, bool kUsePDL>
+void launch_noncluster_persistent_topk(
+    const vllm::persistent::PersistentTopKParams& params, int64_t num_rows,
+    int64_t max_seq_len, int device_id, cudaStream_t stream) {
+  namespace P = vllm::persistent;
+  bool prefer_single_cta = false;
+  if constexpr (kUsePDL) {
+    prefer_single_cta = num_rows <= device_sm_count(device_id);
+  }
+  if (max_seq_len <= P::kRegister2MaxSeqLen) {
+    launch_noncluster_topk_level<TopK, 0, kUsePDL>(params, prefer_single_cta,
+                                                   stream);
+  } else if (max_seq_len <= P::kRegister4MaxSeqLen) {
+    launch_noncluster_topk_level<TopK, 1, kUsePDL>(params, prefer_single_cta,
+                                                   stream);
+  } else {
+    launch_noncluster_topk_level<TopK, 2, kUsePDL>(params, prefer_single_cta,
+                                                   stream);
+  }
+}
+
+template <int TopK, bool kUsePDL>
+void launch_persistent_topk(const TensorView& logits, const TensorView& lengths,
+                            TensorView& output, int64_t max_seq_len,
+                            int64_t q_len_per_req, cudaStream_t stream) {
   namespace P = vllm::persistent;
 
   const int64_t num_rows = logits.size(0);
   const int64_t stride = logits.size(1);
-  (void)workspace;
 
   P::PersistentTopKParams params;
   params.input = static_cast<float*>(logits.data_ptr());
@@ -545,40 +583,40 @@ void launch_persistent_topk(const TensorView& logits,
         max_seq_len <= P::kClusterRegister4MaxSeqLen) {
       launch_error = launch_persistent_cluster_topk(
           params, rows, 8, stream,
-          P::cluster8_register4_topk_kernel<TopK, 10, true>);
+          P::cluster8_register4_topk_kernel<TopK, 10, kUsePDL>, kUsePDL, false);
     } else if (max_seq_len > P::kClusterRegister4MaxSeqLen &&
                max_seq_len <= P::kCluster16MaxSeqLen) {
       launch_error = launch_persistent_cluster_topk(
-          params, rows, 16, stream,
-          P::cluster16_topk_kernel<TopK, 10, true>, true);
+          params, rows, 16, stream, P::cluster16_topk_kernel<TopK, 10, kUsePDL>,
+          kUsePDL, true);
       if (is_unsupported_cluster_launch_error(launch_error)) {
         // A cluster of 16 CTAs is an architecture-specific optimization. Keep
         // the portable cluster-8 implementation as the correctness fallback.
         (void)cudaGetLastError();
         launch_error = launch_persistent_cluster_topk(
             params, rows, P::kClusterSize, stream,
-            P::cluster_topk_kernel<TopK, 10, true>);
+            P::cluster_topk_kernel<TopK, 10, kUsePDL>, kUsePDL, false);
       }
     } else if (max_seq_len > P::kClusterHist10Floor) {
       launch_error = launch_persistent_cluster_topk(
           params, rows, P::kClusterSize, stream,
-          P::cluster_topk_kernel<TopK, 10, true>);
+          P::cluster_topk_kernel<TopK, 10, kUsePDL>, kUsePDL, false);
     } else {
       launch_error = launch_persistent_cluster_topk(
           params, rows, P::kClusterSize, stream,
-          P::cluster_topk_kernel<TopK, 9, true>);
+          P::cluster_topk_kernel<TopK, 9, kUsePDL>, kUsePDL, false);
     }
     if (is_unsupported_cluster_launch_error(launch_error)) {
       // Some Hopper SKUs reject cluster launches despite sharing sm_90 with
       // cluster-capable devices. Fall back to the original single-CTA kernel.
       (void)cudaGetLastError();
-      launch_noncluster_persistent_topk<TopK>(params, num_rows, max_seq_len,
-                                               stream);
+      launch_noncluster_persistent_topk<TopK, kUsePDL>(
+          params, num_rows, max_seq_len, logits.device().device_id, stream);
       launch_error = cudaSuccess;
     }
   } else {
-    launch_noncluster_persistent_topk<TopK>(params, num_rows, max_seq_len,
-                                             stream);
+    launch_noncluster_persistent_topk<TopK, kUsePDL>(
+        params, num_rows, max_seq_len, logits.device().device_id, stream);
   }
 
   cudaError_t err =
@@ -587,32 +625,38 @@ void launch_persistent_topk(const TensorView& logits,
       << "dsv4_persistent_topk failed: " << cudaGetErrorString(err);
 }
 
+template <int TopK>
+void dispatch_persistent_topk(const TensorView& logits,
+                              const TensorView& lengths, TensorView& output,
+                              int64_t max_seq_len, int64_t q_len_per_req,
+                              bool enable_pdl, cudaStream_t stream) {
+  if (enable_pdl) {
+    launch_persistent_topk<TopK, true>(logits, lengths, output, max_seq_len,
+                                       q_len_per_req, stream);
+  } else {
+    launch_persistent_topk<TopK, false>(logits, lengths, output, max_seq_len,
+                                        q_len_per_req, stream);
+  }
+}
+
 }  // namespace
 
-void dsv4_persistent_topk(TensorView logits,
-                                 TensorView lengths,
-                                 TensorView output,
-                                 TensorView workspace,
-                                 int64_t k,
-                                 int64_t max_seq_len,
-                                 int64_t q_len_per_req) {
+void dsv4_persistent_topk(TensorView logits, TensorView lengths,
+                          TensorView output, int64_t k, int64_t max_seq_len,
+                          int64_t q_len_per_req, bool enable_pdl) {
   CHECK_CUDA(logits);
   CHECK_CUDA(lengths);
   CHECK_CUDA(output);
-  CHECK_CUDA(workspace);
   CHECK_DIM(2, logits);
   TVM_FFI_ICHECK(lengths.ndim() == 1 || lengths.ndim() == 2)
       << "lengths must be 1D or 2D";
   CHECK_DIM(2, output);
-  CHECK_DIM(1, workspace);
   CHECK_CONTIGUOUS(logits);
   CHECK_CONTIGUOUS(lengths);
   CHECK_CONTIGUOUS(output);
-  CHECK_CONTIGUOUS(workspace);
   TVM_FFI_ICHECK(logits.dtype() == dl_float32) << "logits must be float32";
   TVM_FFI_ICHECK(lengths.dtype() == dl_int32) << "lengths must be int32";
   TVM_FFI_ICHECK(output.dtype() == dl_int32) << "output must be int32";
-  TVM_FFI_ICHECK(workspace.dtype() == dl_uint8) << "workspace must be uint8";
   TVM_FFI_ICHECK(q_len_per_req >= 1) << "q_len_per_req must be >= 1";
   TVM_FFI_ICHECK(logits.size(0) % q_len_per_req == 0)
       << "q_len_per_req must divide num_rows";
@@ -629,13 +673,13 @@ void dsv4_persistent_topk(TensorView logits,
       << "cudaSetDevice failed: " << cudaGetErrorString(err);
   cudaStream_t stream = get_stream(logits.device());
   if (k == 512) {
-    launch_persistent_topk<512>(logits, lengths, output, workspace, max_seq_len,
-                                q_len_per_req, stream);
+    dispatch_persistent_topk<512>(logits, lengths, output, max_seq_len,
+                                  q_len_per_req, enable_pdl, stream);
   } else if (k == 1024) {
-    launch_persistent_topk<1024>(logits, lengths, output, workspace, max_seq_len,
-                                 q_len_per_req, stream);
+    dispatch_persistent_topk<1024>(logits, lengths, output, max_seq_len,
+                                   q_len_per_req, enable_pdl, stream);
   } else {
-    launch_persistent_topk<2048>(logits, lengths, output, workspace, max_seq_len,
-                                 q_len_per_req, stream);
+    dispatch_persistent_topk<2048>(logits, lengths, output, max_seq_len,
+                                   q_len_per_req, enable_pdl, stream);
   }
 }

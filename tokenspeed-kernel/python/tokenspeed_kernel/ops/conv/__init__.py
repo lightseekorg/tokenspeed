@@ -20,6 +20,11 @@
 
 """Convolution kernel entry points.
 
+:func:`causal_conv1d_fn` (prefill) and :func:`causal_conv1d_update` (decode,
+chain verify and draft trees) select the depthwise causal conv in front of
+the Mamba / GDN recurrences, over a slot-indexed conv-window pool; the
+selected leaves are registered in ``conv/triton.py``.
+
 :func:`dflash2_grouped_conv` is independent of everything below it: a
 block-local grouped depthwise convolution for DFlash2's draft layers, with no
 cache, no ring and no cross-request state.
@@ -47,20 +52,25 @@ from __future__ import annotations
 
 import torch
 
-# Aliased because the conv.triton submodule import below rebinds the name ``triton``.
-from tokenspeed_kernel._triton import triton as _triton
+# Aliased because importing the conv.triton and conv._triton submodules below
+# rebinds the names ``triton`` and ``_triton`` in this package.
+from tokenspeed_kernel._triton import triton as _triton_lang
+from tokenspeed_kernel.ops.attention.gdn.triton import CausalConv1dPrefillMetadata
 from tokenspeed_kernel.ops.conv.triton import (
+    PAD_SLOT_ID,
     _inkling_ring_sconv_decode_kernel,
     _inkling_ring_sconv_prefill_kernel,
     dflash2_grouped_conv,
     select_prefill_config,
 )
 from tokenspeed_kernel.platform import pdl_enabled
-
-PAD_SLOT_ID = -1
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "PAD_SLOT_ID",
+    "causal_conv1d_fn",
+    "causal_conv1d_update",
     "dflash2_grouped_conv",
     "inkling_ring_sconv",
     "seq_idx_from_cu_seqlens",
@@ -200,7 +210,7 @@ def inkling_ring_sconv(
     enable_pdl = pdl_enabled()
     use_silu = activation in ("silu", "swish")
     block_t, block_d, num_warps, num_stages = select_prefill_config(T, D)
-    grid = (_triton.cdiv(T, block_t), _triton.cdiv(D, block_d))
+    grid = (_triton_lang.cdiv(T, block_t), _triton_lang.cdiv(D, block_d))
     kernel[grid](
         x,
         weight,
@@ -242,9 +252,102 @@ def inkling_ring_sconv(
         BLOCK_T=block_t,
         BLOCK_D=block_d,
         W=W,
-        W_POW2=_triton.next_power_of_2(W),
+        W_POW2=_triton_lang.next_power_of_2(W),
         num_warps=num_warps,
         num_stages=num_stages,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
     return y
+
+
+def _state_layout(state: torch.Tensor, weight: torch.Tensor) -> str:
+    if (
+        state.ndim == 3
+        and state.shape[1] == weight.shape[1] - 1
+        and state.shape[2] == weight.shape[0]
+    ):
+        return "width_major"
+    return "channel_major"
+
+
+def causal_conv1d_fn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+    validate_data=False,
+    *,
+    prefill_metadata: CausalConv1dPrefillMetadata,
+):
+    """Select a prefill convolution leaf while preserving the original ABI."""
+    kernel = select_kernel(
+        "conv",
+        "causal_conv1d_prefill",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={
+            "width": weight.shape[1],
+            "state_layout": _state_layout(conv_states, weight),
+        },
+    )
+    return kernel(
+        x=x,
+        weight=weight,
+        bias=bias,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation=activation,
+        pad_slot_id=pad_slot_id,
+        validate_data=validate_data,
+        prefill_metadata=prefill_metadata,
+    )
+
+
+def causal_conv1d_update(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    activation: bool | str | None = None,
+    cache_seqlens: torch.Tensor | None = None,
+    conv_state_indices: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    intermediate_conv_window: torch.Tensor | None = None,
+    output_state_indices: torch.Tensor | None = None,
+    pad_slot_id: int = PAD_SLOT_ID,
+    validate_data=False,
+    *,
+    parent_indices: torch.Tensor | None,
+):
+    """Select a decode/tree convolution leaf for the supplied state indices."""
+    kernel = select_kernel(
+        "conv",
+        "causal_conv1d_update",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={
+            "width": weight.shape[1],
+            "tree": parent_indices is not None,
+            "state_layout": _state_layout(conv_state, weight),
+        },
+    )
+    return kernel(
+        x=x,
+        conv_state=conv_state,
+        weight=weight,
+        bias=bias,
+        activation=activation,
+        cache_seqlens=cache_seqlens,
+        conv_state_indices=conv_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        intermediate_conv_window=intermediate_conv_window,
+        output_state_indices=output_state_indices,
+        pad_slot_id=pad_slot_id,
+        validate_data=validate_data,
+        parent_indices=parent_indices,
+    )

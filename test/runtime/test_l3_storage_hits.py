@@ -376,6 +376,7 @@ def loop_methods():
         "PlannedForward": SimpleNamespace,
         "ngram_inputs_for_forward": lambda *args: None,
         "input_logprob_plan_for_forward": lambda *args: None,
+        "sampled_top_k_for_forward": lambda *args: 0,
         "advance_scheduler": lambda scheduler, events: scheduler.advance(events),
     }
     exec(
@@ -486,6 +487,7 @@ def test_prefetch_convergence_precedes_the_rounds_cache_poll(
             need_idle_forward=forward is None
         ),
         _gather_sampling_params=Mock(return_value=[]),
+        _gather_stop_criteria=Mock(return_value=()),
         _gather_grammar_state=Mock(return_value=None),
         output_processor=SimpleNamespace(
             rid_to_state={},

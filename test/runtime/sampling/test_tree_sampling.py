@@ -83,10 +83,12 @@ def _backend(
     return backend, torch.tensor(pool, dtype=torch.int64, device="cuda")
 
 
-def _info(req, offsets) -> SamplingBatchInfo:
+def _info(req, target_positions) -> SamplingBatchInfo:
+    # Internal draw helpers consume target positions; runtime metadata carries
+    # the preceding input frontier and derives the target position at sampling.
     return SamplingBatchInfo(
         req_pool_indices=req,
-        valid_cache_lengths=offsets,
+        valid_cache_lengths=target_positions - 1,
         vocab_size=VOCAB,
         device="cuda",
     )

@@ -370,6 +370,39 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
 
 
 @requires_flashinfer_situ
+@pytest.mark.parametrize("flaw", ["dtype", "layout"])
+def test_a_prequantized_input_is_checked_before_the_kernel_reads_it(
+    flaw: str,
+) -> None:
+    """The fused kernel takes raw pointers; a wrong buffer reads silently."""
+    from tokenspeed_kernel.ops.moe.flashinfer import (
+        flashinfer_trtllm_nvfp4_moe_weights,
+        flashinfer_trtllm_nvfp4_routed_moe_apply,
+    )
+
+    generator = torch.Generator().manual_seed(20260912)
+    w = _MoEWeights(_make_nvfp4_moe_weights(generator, logical_ispp=ISPP)).cuda()
+    flashinfer_trtllm_nvfp4_moe_weights({}, w)
+    hidden_states = torch.randn(4, HIDDEN, generator=generator).bfloat16().cuda()
+    topk_ids = torch.arange(4 * TOP_K, device="cuda", dtype=torch.int32) % NUM_EXPERTS
+    topk_weights = torch.full((4, TOP_K), 0.1, device="cuda").bfloat16()
+    packed = torch.zeros(4, HIDDEN // 2, dtype=torch.uint8, device="cuda")
+    scales = torch.zeros(4, HIDDEN // 8, dtype=torch.uint8, device="cuda")[:, ::2]
+    if flaw == "dtype":
+        packed, scales = packed.view(torch.int8), scales.contiguous()
+    with pytest.raises(ValueError, match="packed e2m1"):
+        flashinfer_trtllm_nvfp4_routed_moe_apply(
+            {},
+            hidden_states,
+            w,
+            router_logits=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids.view(4, TOP_K),
+            x_quantized=(packed, scales),
+        )
+
+
+@requires_flashinfer_situ
 @pytest.mark.parametrize("routing_mode", [None, "precomputed_topk"])
 def test_moe_plan_selects_nvfp4_situ_routed_kernel(
     routing_mode: str | None,
