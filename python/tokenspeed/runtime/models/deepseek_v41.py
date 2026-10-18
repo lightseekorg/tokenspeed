@@ -92,6 +92,7 @@ from tokenspeed_kernel.ops.gemm import (
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     rmsnorm_quantize_fp8_group32,
+    silu_and_mul_quantize_fp8_group32,
 )
 from tokenspeed_kernel.ops.residual import mhc_apply_pre_quantize_fp8
 from tokenspeed_kernel.platform import current_platform
@@ -112,6 +113,7 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
+from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41RowPlan,
 )
@@ -389,7 +391,22 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         activation: nn.Module,
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
-        # Fused activation quantizers do not implement the reference amax floor.
+        if (
+            isinstance(activation, SiluAndMul)
+            and self.prepared_weight_scales is None
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and x.ndim == 2
+            and x.stride(-1) == 1
+        ):
+            # The canonical path quantizes silu_and_mul's BF16 output with the
+            # reference rounding anyway; one kernel does both.
+            codes, scales = silu_and_mul_quantize_fp8_group32(
+                x, activation.swiglu_limit
+            )
+            return self.apply(layer, codes, bias, scales, x.dtype)
+        # Other fused activation quantizers do not implement the reference
+        # amax floor.
         return self.apply(layer, activation(x), bias)
 
 
