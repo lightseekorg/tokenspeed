@@ -1234,11 +1234,7 @@ def test_cuda_exact_fp8_linear_and_engram_method(monkeypatch):
         torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.002)
     else:
         codes, sf = v41_quantize_fp8(x)
-        prequantized, _ = linear(
-            (codes, sf, x.dtype),
-            block_scale=None,
-            output_dtype=None,
-        )
+        prequantized, _ = linear(codes, block_scale=sf, output_dtype=x.dtype)
         torch.testing.assert_close(prequantized, actual, rtol=0, atol=0)
         dequant = (
             codes.float().unflatten(-1, (-1, 32))

@@ -1547,7 +1547,9 @@ def test_packed_compressor_rejected_suffix_every_acceptance(prefix, accepted):
     live = positions >= 0
     pair = positions[live, None] + torch.arange(2)
     expected = (full_content[pair] * full_scores[pair].softmax(1)).sum(1)
-    torch.testing.assert_close(pooled[live], expected, rtol=0, atol=0)
+    # CPU float32 kernels round differently across vector widths (one ulp on
+    # some hosts), so compare at float32 precision rather than bit for bit.
+    torch.testing.assert_close(pooled[live], expected, rtol=1.3e-6, atol=1e-6)
     assert not pooled[~live].any()
     assert not backend.cache_pool.compressor_tail(2)[0].any()
 
