@@ -26,6 +26,8 @@ accepted tail per pool slot is retained, never a checkpoint-sized model/history
 cache. Run with CUDA_VISIBLE_DEVICES selecting an available GPU.
 """
 
+import os
+import sys
 from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
@@ -64,6 +66,11 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalForwardContext,
     MultimodalInputs,
 )
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 VOCAB_SIZE = 128
 

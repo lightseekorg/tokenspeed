@@ -32,6 +32,7 @@ import json
 import math
 import os
 import re
+import sys
 from copy import copy
 from pathlib import Path
 from test.runtime.test_deepseek_v41_cache import R1, R2, _backend, _extend, _tables
@@ -90,6 +91,11 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     is_engram_embed_checkpoint_name,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=120, suite="runtime-1gpu")
 
 _ENGRAM_INDEX = "model.safetensors.index.json"
 
