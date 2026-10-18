@@ -1095,7 +1095,7 @@ class DeepseekV41Attention(nn.Module):
             if swa.is_cuda and self.head_dim == 512 and self.rotary_emb.dim == 64:
                 self.rotary_emb._prepare_cache(swa.device)
                 swa_rope_cache = self.rotary_emb.cos_sin_cache
-                if current_platform().is_blackwell:
+                if current_platform().is_blackwell or current_platform().is_cdna4:
                     swa_norm_weight = self.kv_norm.weight
                 else:
                     swa = _attention_norm(swa, self.kv_norm)
