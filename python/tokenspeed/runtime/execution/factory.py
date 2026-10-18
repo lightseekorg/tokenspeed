@@ -124,13 +124,10 @@ def _refuse_aliased_quantized_head(target_model, draft_model, head) -> None:
     draft would read the quantized weight as a plain one. A draft that keeps its
     own head (an EAGLE3 draft not loading the target's) reports another weight.
     """
-    target_head = getattr(target_model, "lm_head", None)
-    if target_head is None or not should_apply_lm_head_quant_method(
-        target_head, getattr(target_head, "quant_method", None)
-    ):
+    target_head = target_model.lm_head
+    if not should_apply_lm_head_quant_method(target_head, target_head.quant_method):
         return
-    reporter = getattr(type(draft_model), "get_embed_and_head", None)
-    if reporter is not None and reporter(draft_model)[1] is head:
+    if draft_model.get_embed_and_head()[1] is head:
         raise ValueError(
             f"The target's lm_head is quantized "
             f"({type(target_head.quant_method).__name__}); "

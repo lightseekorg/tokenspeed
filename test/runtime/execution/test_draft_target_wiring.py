@@ -92,6 +92,10 @@ def _head_layout(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**layout)
 
 
+def _unquantized_head() -> SimpleNamespace:
+    return SimpleNamespace(quant_method=None)
+
+
 def test_get_drafter_impl_routing():
     from tokenspeed.runtime.models.deepseek_v41_dspark import (
         DeepseekV41ForCausalLMDSpark,
@@ -121,6 +125,7 @@ class _Eagle3Target:
 
     def __init__(self):
         self.captured = None
+        self.lm_head = _unquantized_head()
         self.logits_processor = _head_layout()
 
     def get_embed_and_head(self):
@@ -350,7 +355,7 @@ def test_wire_last_pipeline_stage_shares_the_head_and_keeps_the_draft_embedding(
     # The last stage owns the target head but not its embedding: the draft is
     # handed embed=None, binds the head, and must still draft with the
     # embedding its checkpoint ships.
-    lm_head = object()
+    lm_head = _unquantized_head()
     weight_draft, module_draft = _WeightSharingDraft(), _ModuleSharingDraft()
     with mock.patch.object(factory, "get_drafter_impl", return_value=Eagle):
         factory.configure_draft_target(
@@ -380,7 +385,7 @@ def test_wire_last_pipeline_stage_rejects_a_draft_that_dropped_its_embedding():
     ):
         factory.configure_draft_target(
             _server_args("MTP"),
-            _last_stage_target(object()),
+            _last_stage_target(_unquantized_head()),
             _draft_runner(_EmbedDroppingDraft()),
         )
 
@@ -393,7 +398,7 @@ def test_wire_last_pipeline_stage_rejects_a_draft_that_reports_no_embedding():
     ):
         factory.configure_draft_target(
             _server_args("MTP"),
-            _last_stage_target(object()),
+            _last_stage_target(_unquantized_head()),
             _draft_runner(
                 SimpleNamespace(
                     set_embed_and_head=lambda e, h: None,
