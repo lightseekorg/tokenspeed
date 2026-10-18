@@ -51,6 +51,8 @@ __all__ = [
     "moe_process_weights",
     "moe_warmup",
     "moe_topk",
+    "moe_router_topk",
+    "moe_router_topk_supported",
     "packed_projection_weight_view",
     "moe_sigmoid_bias_topk_routing",
     "FUSED_ROUTING_MAX_TOKENS",
@@ -1126,6 +1128,108 @@ def moe_topk(
             ),
         )
         return topk_weights.to(topk_weights_dtype), topk_ids.to(topk_indices_dtype)
+
+
+def _router_topk_kernel(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    top_k: int,
+    routing_kind: str,
+    override: str | None = None,
+    solution: str | None = None,
+):
+    traits = {
+        "tokens": int(hidden_states.shape[0]),
+        "experts": int(gate_weight.shape[0]),
+        "hidden": int(hidden_states.shape[1]),
+        "top_k": int(top_k),
+        "routing_kind": routing_kind,
+    }
+    kernel = select_kernel(
+        "moe",
+        "router_topk",
+        format_signature(
+            hidden_states=dense_tensor_format(hidden_states.dtype),
+            gate_weight=dense_tensor_format(gate_weight.dtype),
+        ),
+        traits=traits,
+        override=override,
+        solution=solution,
+    )
+    return kernel, traits
+
+
+def moe_router_topk_supported(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    top_k: int,
+    correction_bias: torch.Tensor | None = None,
+    hash_indices_table: torch.Tensor | None = None,
+) -> bool:
+    """Return whether a ``moe_router_topk`` kernel serves these inputs."""
+    try:
+        _router_topk_kernel(
+            hidden_states,
+            gate_weight,
+            top_k,
+            _routing_kind(correction_bias, hash_indices_table),
+        )
+    except NoKernelFoundError:
+        return False
+    return True
+
+
+def moe_router_topk(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    top_k: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    correction_bias: torch.Tensor | None = None,
+    hash_indices_table: torch.Tensor | None = None,
+    input_ids: torch.Tensor | None = None,
+    topk_weights_dtype: torch.dtype = torch.float32,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Route DeepSeek V4 tokens straight from the router gate weight.
+
+    Computes ``hidden_states @ gate_weight.T`` in FP32 and selects sqrt-softplus
+    top-k experts like ``moe_topk``, without materializing the logits.
+
+    Returns:
+        FP32 (or ``topk_weights_dtype``) weights and INT32 expert ids shaped
+        ``[tokens, top_k]``.
+    """
+    kernel, traits = _router_topk_kernel(
+        hidden_states,
+        gate_weight,
+        top_k,
+        _routing_kind(correction_bias, hash_indices_table),
+        override=override,
+        solution=solution,
+    )
+    ShapeCapture.get().record(
+        "moe", "router_topk", kernel.name, hidden_states.dtype, traits
+    )
+    with kernel_scope(
+        "moe",
+        "router_topk",
+        hidden_states.dtype,
+        kernel_name=kernel.name,
+        **traits,
+    ):
+        topk_weights, topk_ids = kernel(
+            hidden_states,
+            gate_weight,
+            top_k,
+            renormalize,
+            correction_bias,
+            hash_indices_table,
+            input_ids,
+            routed_scaling_factor,
+        )
+        return topk_weights.to(topk_weights_dtype), topk_ids
 
 
 def _normalize_weight_dtype(weight_dtype: str) -> str:

@@ -90,6 +90,7 @@ from tokenspeed_kernel.ops.gemm import (
     mm,
     prepare_mxfp8_weight_scales,
 )
+from tokenspeed_kernel.ops.moe import moe_router_topk, moe_router_topk_supported
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     rmsnorm_quantize_fp8_group32,
@@ -136,6 +137,7 @@ from tokenspeed.runtime.layers.linear import (
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
+from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
 from tokenspeed.runtime.layers.moe.utils import get_moe_backend
 from tokenspeed.runtime.layers.parameter import ModelWeightParameter
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -1298,6 +1300,35 @@ class DeepseekV41MoE(DeepseekV4MoE):
             bias = torch.where(image_mask.unsqueeze(-1), bias_vl, bias)
         logits = F.linear(hidden_states.float(), self.gate.weight.float())
         return logits, bias, None, None
+
+    def _compute_topk_output(self, hidden_states, image_mask):
+        gate, config = self.gate, self.topk.topk_config
+        if (
+            hidden_states.is_cuda
+            and (gate.bias_vl is None or image_mask is None)
+            and gate.tid2eid is None
+            and not self.topk.simulate_routing
+            and self.experts.supports_precomputed_topk
+            and moe_router_topk_supported(
+                hidden_states, gate.weight, config.top_k, gate.e_score_correction_bias
+            )
+        ):
+            # The router GEMM and top-k selection run without FP32 logits.
+            topk_weights, topk_ids = moe_router_topk(
+                hidden_states,
+                gate.weight,
+                config.top_k,
+                config.renormalize,
+                (
+                    1.0
+                    if config.routed_scaling_factor is None
+                    else config.routed_scaling_factor
+                ),
+                correction_bias=gate.e_score_correction_bias,
+                topk_weights_dtype=self.topk.weights_dtype,
+            )
+            return StandardTopKOutput(topk_weights, topk_ids, None)
+        return super()._compute_topk_output(hidden_states, image_mask)
 
 
 class DeepseekV41DecoderLayer(nn.Module):
