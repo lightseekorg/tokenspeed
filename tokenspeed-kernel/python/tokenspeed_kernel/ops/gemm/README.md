@@ -22,16 +22,18 @@ states and outputs stay BF16 for Beam. Empty batches return empty outputs,
 and masked partial matrix tiles contribute zero. This scale format does not
 accept block sizes or an additional alpha scale.
 
-The gfx950 native FP8 matrix instruction drops small products in its internal
-eight-position K reduction: even the exactly representable `256*256 + 1*1`
+Tests of gfx950 native FP8 matrix instructions show small-product loss within
+groups of eight K positions: even the exactly representable `256*256 + 1*1`
 can return `65536` instead of `65537`. This implementation partitions the
 original K positions into eight masked native FP8 dots and carries the FP32
 accumulator between them. Each instruction receives at most one nonzero
 product per affected group. This preserves FP8 operand storage and native
-FP8 multiplication while restoring the tested FP32 error bound. The
-workaround is restricted to gfx950; other architectures retain their prior
-path. It increases native matrix instructions eightfold, so it is a
-correctness baseline with a measured performance cost.
+FP8 multiplication and fixes the demonstrated grouping loss; it does not
+guarantee equivalence to sequential FP32 arithmetic. The implementation
+enables this workaround only on gfx950, where the issue was observed.
+The masking algorithm is vendor-neutral, but its need and behavior on other
+architectures have not been established. Other architectures retain their
+prior path, avoiding the additional eight-way matrix work.
 
 ## DeepSeek V4 grouped output projection
 

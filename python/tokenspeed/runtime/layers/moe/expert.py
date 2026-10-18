@@ -497,6 +497,8 @@ class MoELayer(torch.nn.Module):
             ep_size=self.ep_size,
             ispp=self.intermediate_size // self.tp_size,
             hidden=hidden_size,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
             swiglu_form=self._swiglu_form(),
             activation_clamped=(
                 self.swiglu_arg is not None and self.swiglu_arg.limit is not None

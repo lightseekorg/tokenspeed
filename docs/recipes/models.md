@@ -1442,8 +1442,9 @@ first one or two leaves larger decode batches outside the captured graph list.
 Beam supports BF16 and compressed-tensors dynamic W8A8 FP8 checkpoints on
 gfx950. Use `mha` for target and draft GQA attention, allowing the kernel
 registry to select compatible Gluon or Triton implementations. Use
-`triton` for BF16 experts, and `gluon` or `triton` for FP8 experts. NVIDIA's
-backend defaults and sandwich all-reduce fusion remain separate.
+`triton` for BF16 experts. FP8 experts with TP4/TP8 and EP1 select Gluon
+automatically; `--moe-backend triton` forces the Triton implementation.
+NVIDIA's backend defaults and sandwich all-reduce fusion remain separate.
 
 For an eight-GPU FP8 target with a BF16 DFlash2 drafter:
 

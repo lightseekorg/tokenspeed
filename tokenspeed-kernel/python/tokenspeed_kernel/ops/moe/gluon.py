@@ -68,11 +68,13 @@ GLUON_FP8_CHANNEL_APPLY = "gluon_fp8_channel_bf16_precomputed_moe_apply"
         "ep_size": frozenset({1}),
         "ispp": frozenset({320, 640}),
         "hidden": frozenset({5120}),
+        "num_experts": frozenset({256}),
+        "top_k": frozenset({8}),
         "internal_activation_dtype": frozenset({"input"}),
         "supports_bias": frozenset({False}),
         "expert_id_repeats": frozenset({False}),
     },
-    priority=Priority.PORTABLE - 1,
+    priority=Priority.SPECIALIZED,
 )
 def gluon_fp8_channel_bf16_precomputed_moe_apply(
     plan: dict,
@@ -86,12 +88,13 @@ def gluon_fp8_channel_bf16_precomputed_moe_apply(
     do_finalize: bool = True,
     enable_pdl: bool = False,
 ) -> torch.Tensor:
-    """Experimental TP4/TP8 EP1 experts: FP8 storage, BF16 MFMA, FP32 accumulation.
+    """TP4/TP8 EP1 experts: FP8 storage, BF16 MFMA, FP32 accumulation.
 
     Accepts only the default precision policy.
     Uses pre-existing grouped Gluon stages, not native-FP8 projection kernels.
     The resident codes/scales and unweighted-BF16-before-FP32-combine boundary
-    match the channel expert contract; BF16 arithmetic still needs qualification.
+    match the channel expert contract; FP32 accumulation order can differ from
+    native FP8.
     """
     if plan.get("precision_policy", "default") != "default":
         raise ValueError(

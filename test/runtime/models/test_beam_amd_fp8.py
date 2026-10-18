@@ -119,11 +119,7 @@ def test_amd_default_formats_select_registry_backend_and_scale_routes_once(
 ):
     from test.runtime.models.test_beam_mxfp4 import mxfp4_config
 
-    expected_backend = (
-        backend
-        if backend != "auto"
-        else ("triton" if fmt == "fp8_channel" else "gluon")
-    )
+    expected_backend = backend if backend != "auto" else "gluon"
     # These Gluon registrations are loaded only on AMD. Keep portable
     # formats/backends covered when the process was imported on another vendor.
     amd_registration = {

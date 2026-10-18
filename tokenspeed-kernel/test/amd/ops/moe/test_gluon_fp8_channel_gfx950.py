@@ -301,7 +301,7 @@ def tp8_channel_fixture():
     from tokenspeed_kernel.benchmark.generators.moe import _prepare_routed_weights
     from tokenspeed_kernel.ops.moe import moe_plan
 
-    native, weights = _prepare_routed_weights(
+    candidate, weights = _prepare_routed_weights(
         weight_dtype_name="fp8_channel",
         weight_dtype=torch.float8_e4m3fn,
         input_dtype=torch.bfloat16,
@@ -312,6 +312,7 @@ def tp8_channel_fixture():
         intermediate_size_per_partition=320,
         num_experts=256,
         num_local_experts=256,
+        top_k=8,
         ep_rank=0,
         swiglu_limit=None,
         situ_beta=None,
@@ -321,8 +322,8 @@ def tp8_channel_fixture():
         fast_math=False,
         weight_seed=1861433681,
     )
-    native["precision_policy"] = "default"
-    candidate = moe_plan(
+    candidate["precision_policy"] = "default"
+    native = moe_plan(
         weight_dtype="fp8_channel",
         input_dtype=torch.bfloat16,
         activation="silu",
@@ -330,15 +331,17 @@ def tp8_channel_fixture():
         ep_size=1,
         ispp=320,
         hidden=5120,
+        num_experts=256,
+        top_k=8,
         swiglu_form="standard",
         internal_activation_dtype="input",
         expert_id_repeats=False,
         activation_clamped=False,
         combine_order="rank",
-        solution="gluon",
+        solution="triton",
         fast_math=False,
     )
-    candidate["precision_policy"] = "default"
+    native["precision_policy"] = "default"
     return native, candidate, weights
 
 

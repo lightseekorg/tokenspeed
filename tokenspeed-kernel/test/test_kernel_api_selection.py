@@ -3504,23 +3504,60 @@ def _moe_fp8_channel_plan(platform: PlatformInfo, **overrides) -> dict:
 
 
 @pytest.mark.parametrize("intermediate", [320, 640])
-def test_default_plan_keeps_native_fp8(
+def test_default_fp8_channel_plan_selects_gluon(
     mi350_platform: PlatformInfo,
     intermediate: int,
 ) -> None:
-    plan = _moe_fp8_channel_plan(mi350_platform, ispp=intermediate)
-    assert plan["apply_kernel_name"] == "triton_fp8_channel_fused_precomputed_moe_apply"
+    plan = _moe_fp8_channel_plan(
+        mi350_platform, ispp=intermediate, num_experts=256, top_k=8
+    )
+    assert plan["apply_kernel_name"] == _moe_gluon.GLUON_FP8_CHANNEL_APPLY
 
 
 @pytest.mark.parametrize("intermediate", [320, 640])
-def test_explicit_gluon_plan_uses_channel_candidate(
+@pytest.mark.parametrize(
+    "solution,expected",
+    [
+        ("gluon", _moe_gluon.GLUON_FP8_CHANNEL_APPLY),
+        ("triton", "triton_fp8_channel_fused_precomputed_moe_apply"),
+    ],
+)
+def test_explicit_fp8_channel_plan_preserves_solution(
     mi350_platform: PlatformInfo,
     intermediate: int,
+    solution: str,
+    expected: str,
 ) -> None:
-    plan = _moe_fp8_channel_plan(mi350_platform, solution="gluon", ispp=intermediate)
-    assert plan["apply_kernel_name"] == _moe_gluon.GLUON_FP8_CHANNEL_APPLY
+    plan = _moe_fp8_channel_plan(
+        mi350_platform,
+        solution=solution,
+        ispp=intermediate,
+        num_experts=256,
+        top_k=8,
+    )
+    assert plan["apply_kernel_name"] == expected
     assert plan["weight_preprocessor"] is None
     assert not plan["supports_deferred_finalize"]
+
+
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        {},
+        {"num_experts": 256},
+        {"top_k": 8},
+        {"num_experts": 128, "top_k": 8},
+        {"num_experts": 256, "top_k": 4},
+    ],
+)
+def test_fp8_channel_plan_falls_back_for_unsupported_or_unknown_counts(
+    mi350_platform: PlatformInfo,
+    geometry: dict,
+) -> None:
+    plan = _moe_fp8_channel_plan(mi350_platform, **geometry)
+    assert plan["apply_kernel_name"] == "triton_fp8_channel_fused_precomputed_moe_apply"
+    with pytest.raises(kernel_NoKernelFoundError):
+        _moe_fp8_channel_plan(mi350_platform, solution="gluon", **geometry)
 
 
 @pytest.mark.parametrize(
@@ -3540,7 +3577,9 @@ def test_gluon_fp8_channel_plan_rejects_unsupported_geometry(
     override: dict,
 ) -> None:
     with pytest.raises(kernel_NoKernelFoundError):
-        _moe_fp8_channel_plan(mi350_platform, solution="gluon", **override)
+        _moe_fp8_channel_plan(
+            mi350_platform, solution="gluon", num_experts=256, top_k=8, **override
+        )
 
 
 @pytest.mark.parametrize(

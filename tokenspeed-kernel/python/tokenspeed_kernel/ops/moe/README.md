@@ -223,11 +223,14 @@ Expert-parallel ranks filter IDs to their local contiguous expert interval;
 nonlocal routes contribute zero. The caller owns distributed reduction.
 
 On gfx950, Beam requests the default policy with precomputed routing and
-finalized output for BF16, FP8 and MXFP4 experts. Automatic selection keeps
-this kernel ahead of the restricted Gluon FP8 implementation (recorded in
-`tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/README.md`), whose
-launcher checks expert count and top-k before GPU execution. NVIDIA retains
-its existing policies and backend selection.
+finalized output for BF16, FP8 and MXFP4 experts. Automatic selection prefers
+the specialized Gluon FP8 implementation for EP1, 256 experts, top-eight
+routing, hidden width 5120 and local intermediate width 320 or 640.
+The planner must receive `num_experts` and `top_k` to establish eligibility;
+unknown or unsupported geometry retains the Triton fallback. Explicit
+`solution="triton"` also retains this implementation. NVIDIA keeps its
+existing policies and backend selection. The Gluon algorithm is documented
+in `tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/README.md`.
 
 The first multiplication accumulates in FP32 and retains gate/up in FP32 through
 SiLU and multiplication, rounding only the resulting intermediate to BF16.

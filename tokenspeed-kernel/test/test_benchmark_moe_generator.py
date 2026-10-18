@@ -225,6 +225,8 @@ def test_beam_channel_ordinary_admission_without_a_timing_override(mi350_platfor
             ep_size=1,
             ispp=640,
             hidden=5120,
+            num_experts=256,
+            top_k=8,
             swiglu_form=None,
             activation_clamped=False,
             expert_id_repeats=False,
@@ -238,7 +240,7 @@ def test_beam_channel_ordinary_admission_without_a_timing_override(mi350_platfor
     finally:
         Platform.override(original)
         KernelRegistry.get().clear_cache()
-    assert plan["apply_kernel_name"] == "triton_fp8_channel_fused_precomputed_moe_apply"
+    assert plan["apply_kernel_name"] == "gluon_fp8_channel_bf16_precomputed_moe_apply"
     assert plan["weight_preprocessor"] is None
     assert plan["supports_precomputed_topk"] and not plan["supports_deferred_finalize"]
 

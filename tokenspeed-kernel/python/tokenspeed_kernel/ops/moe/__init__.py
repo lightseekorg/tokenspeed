@@ -1235,6 +1235,8 @@ def _build_traits(
     ep_size: int | None,
     ispp: int | None,
     hidden: int | None,
+    num_experts: int | None,
+    top_k: int | None,
     swiglu_form: str | None,
     activation_clamped: bool,
     expert_id_repeats: bool,
@@ -1247,6 +1249,9 @@ def _build_traits(
         internal_activation_dtype = "input"
 
     traits: dict[str, Any] = {"weight_dtype": weight_dtype}
+    # Unknown counts must not admit a kernel restricted to particular counts.
+    traits["num_experts"] = num_experts
+    traits["top_k"] = top_k
     # Seller-declared: excludes only kernels declaring another order; the
     # post-selection check turns a silent kernel down for "slot".
     traits["combine_order"] = combine_order
@@ -1348,6 +1353,8 @@ def moe_plan(
     swiglu_form: str | None,
     activation_clamped: bool,
     expert_id_repeats: bool,
+    num_experts: int | None = None,
+    top_k: int | None = None,
     fp8_scale_block_shape: tuple[int, int] | None = None,
     internal_activation_dtype: str | None = None,
     with_bias: bool = False,
@@ -1397,6 +1404,10 @@ def moe_plan(
             expert id more than once for one token (zero-expert placeholders).
             Kernels whose permutation needs distinct ids per token declare
             ``expert_id_repeats={False}``. Required keyword.
+        num_experts: Global expert count. None means unknown and excludes
+            kernels restricted to a particular expert count.
+        top_k: Number of selected experts per token. None means unknown and
+            excludes kernels restricted to a particular route count.
         fp8_scale_block_shape: Optional FP8 block-scale shape requirement.
         internal_activation_dtype: Optional internal activation dtype requirement.
             "input" is a special value that uses the whatever dtype the input
@@ -1470,6 +1481,8 @@ def moe_plan(
         ep_size=ep_size,
         ispp=ispp,
         hidden=hidden,
+        num_experts=num_experts,
+        top_k=top_k,
         swiglu_form=swiglu_form,
         activation_clamped=activation_clamped,
         expert_id_repeats=expert_id_repeats,
