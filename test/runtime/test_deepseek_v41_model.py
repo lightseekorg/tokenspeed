@@ -670,7 +670,7 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
             )
             x = _norm(collapsed, norm.weight, 1e-20)
             x = (
-                sublayer(positions, x, ctx)
+                sublayer(positions, x, ctx, reduce_output=True)
                 if name == "attn"
                 else sublayer(x, None, 3, 3, None, None)
             )
