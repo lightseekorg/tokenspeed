@@ -37,18 +37,6 @@ from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 
 @triton.jit
-def _fp8_dot(x, weight, acc):
-    # gfx950 FP8 MFMA can lose small products within an eight-position group.
-    # Keep original K positions, zero seven of each eight, and accumulate each
-    # partition in FP32. Compressing the selected positions reintroduces loss.
-    k = tl.arange(0, x.shape[1])
-    for part in tl.static_range(8):
-        selected = tl.where(k[None, :] % 8 == part, x, 0.0).to(x.dtype)
-        acc = tl.dot(selected, weight, acc, max_num_imprecise_acc=0)
-    return acc
-
-
-@triton.jit
 def _route_quantize_kernel(
     x_ptr, q_ptr, scale_ptr, width: tl.constexpr, BLOCK: tl.constexpr
 ):
@@ -133,14 +121,14 @@ def _expert_matmul_kernel(
                 (cols < width)[:, None] & (kvals < reduction)[None, :],
                 other=0.0,
             )
-            acc = _fp8_dot(x, weight.T, acc)
+            acc = tl.dot(x, weight.T, acc)
             if FC1:
                 up = tl.load(
                     weight_ptr + offsets + intermediate * reduction,
                     (cols < width)[:, None] & (kvals < reduction)[None, :],
                     other=0.0,
                 )
-                up_acc = _fp8_dot(x, up.T, up_acc)
+                up_acc = tl.dot(x, up.T, up_acc)
         input_scale = tl.load(x_scale_ptr + input_rows, rows < count, other=0)
         wscale = tl.load(
             weight_scale_ptr + expert * weight_rows + cols, cols < width, other=0

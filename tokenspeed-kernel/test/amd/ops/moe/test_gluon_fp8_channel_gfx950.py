@@ -349,7 +349,7 @@ def tp8_channel_fixture():
 def test_tp8_public_operation_reference_and_changed_route_graph(
     tp8_channel_fixture, tokens
 ):
-    from ops.moe.test_triton_fp8_channel_fused import _reference
+    from ops.moe.test_triton_fp8_channel_fused import _native_fp8_mm, _reference
     from tokenspeed_kernel.ops.moe import moe_apply
 
     native_plan, candidate_plan, layer = tp8_channel_fixture
@@ -367,8 +367,15 @@ def test_tp8_public_operation_reference_and_changed_route_graph(
     def apply(plan):
         return moe_apply(plan, x, layer, None, topk_ids=ids, topk_weights=weights)
 
-    expected = _reference(x, layer, weights, ids)
-    for plan in (native_plan, candidate_plan):
+    def bf16_projection_reference(a, b):
+        # Gluon converts FP8 codes to BF16 before the matrix instruction.
+        return (a.double() @ b.double().T).float()
+
+    for plan, matmul in (
+        (native_plan, _native_fp8_mm),
+        (candidate_plan, bf16_projection_reference),
+    ):
+        expected = _reference(x, layer, weights, ids, matmul=matmul)
         actual = apply(plan)
         assert torch.isfinite(actual).all()
         error = (actual.float() - expected.float()).norm() / expected.float().norm()

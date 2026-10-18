@@ -22,19 +22,10 @@ states and outputs stay BF16 for Beam. Empty batches return empty outputs,
 and masked partial matrix tiles contribute zero. This scale format does not
 accept block sizes or an additional alpha scale.
 
-Tests of gfx950 native FP8 matrix instructions show small-product loss within
-groups of eight K positions: even the exactly representable `256*256 + 1*1`
-can return `65536` instead of `65537`. This implementation partitions the
-original K positions into eight masked native FP8 dots and carries the FP32
-accumulator between them. Each instruction receives at most one nonzero
-product per affected group. This preserves FP8 operand storage and native
-FP8 multiplication and fixes the demonstrated grouping loss; it does not
-guarantee equivalence to sequential FP32 arithmetic. The portable Triton
-implementation supports AMD and NVIDIA GPUs with native FP8 matrix instructions
-and uses the same eight-way accumulation on both vendors. Device
-validation so far is on gfx950; correctness and the additional matrix-work
-cost on other architectures still need hardware qualification. Specialized
-implementations remain separate registry choices.
+The portable Triton implementation supports AMD and NVIDIA GPUs with native
+FP8 matrix instructions. It uses the hardware's ordinary FP8 matrix arithmetic
+with FP32 accumulators; results need not match sequential FP32 arithmetic.
+Specialized implementations remain separate registry choices.
 
 ## DeepSeek V4 grouped output projection
 

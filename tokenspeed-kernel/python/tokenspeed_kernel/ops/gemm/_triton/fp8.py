@@ -559,7 +559,6 @@ def scaled_mm_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_SCALE_A: tl.constexpr,
     BLOCK_SIZE_SCALE_B: tl.constexpr,
-    FP8_ACCUMULATION_STREAMS: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
 
@@ -616,24 +615,7 @@ def scaled_mm_kernel(
         b = tl.load(b_ptrs, mask=masks_b, other=0.0)
 
         # Accumulate results.
-        if FP8_ACCUMULATION_STREAMS > 1:
-            # Separate products in each group of eight K positions to avoid
-            # the small-product loss observed on gfx950. Use the same portable
-            # accumulation order on every supported vendor; FP8 operands feed
-            # native dots with an FP32 accumulator carried between passes.
-            zero = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K), 0.0, a.dtype)
-            for stream in tl.static_range(FP8_ACCUMULATION_STREAMS):
-                mask = (offsets_k % FP8_ACCUMULATION_STREAMS == stream)[None, :]
-                a_stream = tl.where(mask, a, zero)
-                accumulator = tl.dot(
-                    a_stream,
-                    b,
-                    accumulator,
-                    out_dtype=tl.float32,
-                    max_num_imprecise_acc=0,
-                )
-        else:
-            accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
+        accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
 
         offsets_k += BLOCK_SIZE_K
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -689,8 +671,6 @@ def triton_scaled_mm(
     block_size_k: int = 32,
     use_heuristic=True,
     out: torch.Tensor | None = None,
-    *,
-    fp8_accumulation_streams: int,
 ) -> torch.Tensor:
     M, K = input.shape
     N = weight.shape[1]
@@ -772,7 +752,6 @@ def triton_scaled_mm(
         BLOCK_SIZE_K=block_size_k,
         BLOCK_SIZE_SCALE_A=block_size_sa,
         BLOCK_SIZE_SCALE_B=block_size_sb,
-        FP8_ACCUMULATION_STREAMS=fp8_accumulation_streams,
     )
 
     return result

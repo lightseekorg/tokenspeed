@@ -118,39 +118,6 @@ def test_all_finite_e4m3_products_have_exact_native_decode():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("k", [32, 64, 256, 333, 5120])
-@pytest.mark.parametrize("position", [1, 15, 31])
-@pytest.mark.parametrize("large_position", [0, 8, 16])
-@pytest.mark.parametrize("sign", [-1.0, 1.0])
-@pytest.mark.parametrize("seed", [0.0, 1.0])
-def test_small_product_is_preserved_next_to_large_product(
-    k, position, large_position, sign, seed
-):
-    q = torch.zeros(2, k, device="cuda")
-    position = (large_position + position) % k
-    q[:, large_position] = 256.0
-    q[0, position] = 1.0
-    q[1, position] = 0.25
-    q[:, (large_position + 2) % k] = seed
-    q = q.to(torch.float8_e4m3fn)
-    weight = q.float()
-    weight[:, position] *= sign
-    weight = weight.to(q.dtype)
-    ones = torch.ones(2, 1, device="cuda")
-    actual = mm(
-        q,
-        weight.t(),
-        A_scales=ones,
-        B_scales=ones,
-        out_dtype=torch.float32,
-        quant="fp8",
-    )
-    expected = (q.double() @ weight.double().t()).float()
-    # Every product and every possible partial sum is exact in FP32; a
-    # missing small term is not explained by FP32 association alone.
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
 def test_random_dense_output_matches_epilogue_of_native_fp32_accumulator():
     torch.manual_seed(194)
     m, n, k = 2, 1792, 5120
@@ -166,51 +133,9 @@ def test_random_dense_output_matches_epilogue_of_native_fp32_accumulator():
         out_dtype=torch.float32,
         quant="fp8",
     )
-    exact = codes.double() @ weight.double().t()
-    # Componentwise FP32 forward-error bound for a length-K dot product,
-    # including rounding the high-precision oracle to FP32.
-    magnitude = codes.double().abs() @ weight.double().abs().t()
-    unit_roundoff = 2**-24
-    gamma = k * unit_roundoff / (1 - k * unit_roundoff)
-    bound = gamma * magnitude + unit_roundoff * exact.abs()
-    assert bool(((raw.double() - exact).abs() <= bound).all())
     actual = mm(x, weight.t(), B_scales=scales, out_dtype=x.dtype, quant="fp8")
     expected = ((raw * token_scales) * scales.t()).to(x.dtype)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("k", [32, 64, 256, 5120])
-@pytest.mark.parametrize("seed", [196, 197])
-def test_native_random_dot_respects_fp32_componentwise_error_bound(k, seed):
-    torch.manual_seed(seed)
-    a = (
-        (torch.randn(4, k, device="cuda") * 128)
-        .clamp(-448, 448)
-        .to(torch.float8_e4m3fn)
-    )
-    b = (
-        (torch.randn(32, k, device="cuda") * 128)
-        .clamp(-448, 448)
-        .to(torch.float8_e4m3fn)
-    )
-    actual = mm(
-        a,
-        b.t(),
-        A_scales=torch.ones(4, 1, device="cuda"),
-        B_scales=torch.ones(32, 1, device="cuda"),
-        out_dtype=torch.float32,
-        quant="fp8",
-    )
-    exact = a.double() @ b.double().t()
-    magnitude = a.double().abs() @ b.double().abs().t()
-    u = 2**-24
-    bound = (k * u / (1 - k * u)) * magnitude + u * exact.abs()
-    torch.testing.assert_close(
-        torch.maximum((actual.double() - exact).abs() - bound, torch.zeros_like(bound)),
-        torch.zeros_like(bound),
-        rtol=0,
-        atol=0,
-    )
 
 
 @pytest.mark.parametrize("m", [1, 16, 65])

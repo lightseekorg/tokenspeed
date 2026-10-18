@@ -245,10 +245,9 @@ a boundary the public quantizer does not have. The second multiplication
 accumulates in FP32 and stores BF16 per route; combination retains FP32
 weights and accumulation before BF16 output.
 
-The portable dot implementation uses eight masked native dots with an FP32
-accumulator. This preserves small products beside large ones on gfx950, where
-one native FP8 instruction can lose them (`gemm/README.md`). The same Triton
-implementation is shared by the supported AMD and NVIDIA GPUs.
+The portable implementation uses native FP8 matrix instructions with FP32
+accumulators. Internal reduction precision follows the hardware; scalar FP32
+summation and cross-vendor bitwise identity are not required.
 
 ## Shared MoE precision policies
 

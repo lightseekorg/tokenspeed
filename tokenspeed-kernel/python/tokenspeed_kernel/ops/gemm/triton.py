@@ -375,7 +375,6 @@ def triton_mm_fp8_scaled(
         out_dtype=out_dtype,
         bias=bias,
         out=out,
-        fp8_accumulation_streams=8,
     )
 
 

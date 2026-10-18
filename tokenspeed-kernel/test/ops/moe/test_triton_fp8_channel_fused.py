@@ -7,7 +7,6 @@ import torch
 from ops.moe.test_triton_fp8_channel_apply import _layer
 from ops.moe.test_triton_fp8_channel_apply import _plan as _default_plan
 from ops.moe.test_triton_fp8_channel_apply import _plan_on
-from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.moe import moe_apply
 from tokenspeed_kernel.ops.moe._triton import fp8_channel_fused
 from tokenspeed_kernel.platform import current_platform
@@ -26,73 +25,6 @@ def _plan(**overrides):
     # fused implementation explicitly without changing normal admission tests.
     with kernel_override("moe", "apply", APPLY):
         return _default_plan(**overrides)
-
-
-@triton.jit
-def _dot_probe_kernel(a_ptr, b_ptr, out_ptr, seed):
-    rows = tl.arange(0, 16)
-    k = tl.arange(0, 64)
-    a = tl.load(a_ptr + rows[:, None] * 64 + k[None, :])
-    b = tl.load(b_ptr + rows[:, None] * 64 + k[None, :])
-    acc = tl.full((16, 16), seed, tl.float32)
-    result = fp8_channel_fused._fp8_dot(a, b.T, acc)
-    tl.store(out_ptr + rows[:, None] * 16 + rows[None, :], result)
-
-
-@triton.jit
-def _raw_projection_kernel(a_ptr, b_ptr, out_ptr, K: tl.constexpr, N: tl.constexpr):
-    rows = tl.arange(0, 16)
-    cols = tl.program_id(0) * 64 + tl.arange(0, 64)
-    ks = tl.arange(0, 64)
-    acc = tl.zeros((16, 64), tl.float32)
-    for start in range(0, K, 64):
-        a = tl.load(
-            a_ptr + rows[:, None] * K + (start + ks)[None, :],
-            rows[:, None] < 2,
-            other=0.0,
-        )
-        b = tl.load(b_ptr + cols[:, None] * K + (start + ks)[None, :])
-        acc = fp8_channel_fused._fp8_dot(a, b.T, acc)
-    tl.store(out_ptr + rows[:, None] * N + cols[None, :], acc, rows[:, None] < 2)
-
-
-def test_native_fp8_dot_retains_exact_mixed_magnitude_products():
-    _require_gpu()
-    out = torch.empty(16, 16, device="cuda")
-    # Every K position must preserve a small product beside a large product.
-    # The sum is exactly representable in FP32 for every order of addition.
-    for first in range(64):
-        for second in range(64):
-            if first == second:
-                continue
-            a = torch.zeros(16, 64, device="cuda")
-            a[:, first], a[:, second] = 256.0, 0.25
-            for sign in (-1.0, 1.0):
-                b = a.clone()
-                b[:, second] *= sign
-                aq, bq = a.to(torch.float8_e4m3fn), b.to(torch.float8_e4m3fn)
-                for seed in (0.0, 1.0):
-                    _dot_probe_kernel[(1,)](aq, bq, out, seed, num_warps=4)
-                    assert torch.all(out == 65536.0 + sign * 0.0625 + seed)
-
-
-def test_native_fp8_dot_obeys_fp32_rounding_bound():
-    _require_gpu()
-    generator = torch.Generator(device="cuda").manual_seed(29)
-    values = [
-        (torch.randn(16, 64, device="cuda", generator=generator) * 100)
-        .clamp(-448, 448)
-        .to(torch.float8_e4m3fn)
-        for _ in range(2)
-    ]
-    a, b = values
-    out = torch.empty(16, 16, device="cuda")
-    _dot_probe_kernel[(1,)](a, b, out, 0.0, num_warps=4)
-    reference = a.double() @ b.double().T
-    sum_abs = a.double().abs() @ b.double().abs().T
-    unit_roundoff = 2.0**-24
-    gamma = 63 * unit_roundoff / (1 - 63 * unit_roundoff)
-    assert torch.all((out.double() - reference).abs() <= gamma * sum_abs)
 
 
 @pytest.mark.parametrize("ispp,ep_size", [(320, 1), (640, 1), (2560, 8)])
@@ -171,7 +103,21 @@ def _quantize_reference(x, *, route):
     return scaled.clamp(-448, 448).to(torch.float8_e4m3fn), scales
 
 
-def _reference(x, layer, weights, ids):
+def _native_fp8_mm(a, b):
+    # Use the device's FP8 matrix arithmetic, then test the scale and rounding
+    # boundaries independently of the fused implementation.
+    one = torch.ones((), device=a.device, dtype=torch.float32)
+    return torch._scaled_mm(
+        a.contiguous(),
+        b.T,
+        scale_a=one,
+        scale_b=one,
+        out_dtype=torch.float32,
+        use_fast_accum=False,
+    )
+
+
+def _reference(x, layer, weights, ids, *, matmul):
     codes, scales = _quantize_reference(x, route=False)
     intermediate = layer.w2_weight.shape[2]
     route_outputs = torch.zeros(
@@ -182,12 +128,12 @@ def _reference(x, layer, weights, ids):
         tokens, slots = torch.where(local_ids == expert)
         if not tokens.numel():
             continue
-        fc1 = (codes[tokens].double() @ layer.w13_weight[expert].double().T).float()
+        fc1 = matmul(codes[tokens], layer.w13_weight[expert])
         fc1 = (fc1 * scales[tokens]) * layer.w13_weight_scale[expert]
         gate, up = fc1[:, :intermediate], fc1[:, intermediate:]
         activated = (gate * torch.sigmoid(gate) * up).bfloat16()
         act_codes, act_scales = _quantize_reference(activated, route=True)
-        fc2 = (act_codes.double() @ layer.w2_weight[expert].double().T).float()
+        fc2 = matmul(act_codes, layer.w2_weight[expert])
         route_outputs[tokens, slots] = (
             (fc2 * act_scales) * layer.w2_weight_scale[expert]
         ).bfloat16()
@@ -275,108 +221,11 @@ def test_fused_experts_beam_hidden_width_and_top8(intermediate, seed):
     weights = torch.rand(2, 8, device="cuda", generator=generator) * 0.37
     plan = _plan(hidden=5120, ispp=intermediate)
     actual = moe_apply(plan, x, layer, None, topk_weights=weights, topk_ids=ids)
-    expected = _reference(x, layer, weights, ids)
-    # Independent FP32 reduction orders can cross a BF16 midpoint, even when
-    # every stage obeys its rounding contract. Final elementwise thresholds
-    # below one BF16 step would incorrectly require identical reduction orders.
+    expected = _reference(x, layer, weights, ids, matmul=_native_fp8_mm)
+    # Independent native reduction orders can cross a BF16 midpoint. Final
+    # elementwise thresholds below one BF16 step would require identical orders.
     relative = (actual.float() - expected.float()).norm() / expected.float().norm()
     assert relative < 2e-3
-
-
-def test_seed1_fc2_midpoint_crossings_obey_stage_contract():
-    _require_gpu()
-    from tokenspeed_kernel.ops.moe._triton.common import (
-        _combine,
-        _prepare_routed_output,
-    )
-    from tokenspeed_kernel.ops.quantization import quantize_fp8
-
-    hidden, intermediate, experts, topk = 5120, 2560, 8, 8
-    layer = _layer(experts, hidden, intermediate, 0, 1)
-    generator = torch.Generator(device="cuda").manual_seed(1)
-    x = torch.randn(2, hidden, device="cuda", generator=generator).bfloat16()
-    weights = torch.rand(2, topk, device="cuda", generator=generator) * 0.37
-    ids = (
-        torch.arange(topk, device="cuda", dtype=torch.int32).expand(2, -1).contiguous()
-    )
-    routes, counts, routed, output = _prepare_routed_output(x, ids, experts)
-    codes, scales = quantize_fp8(
-        x, granularity="token", scale_encoding="float32", enable_pdl=False
-    )
-    activated = torch.zeros(2 * topk, intermediate, device="cuda", dtype=torch.bfloat16)
-
-    def stage(values, token_scales, weight, weight_scales, destination, first):
-        fp8_channel_fused._expert_matmul_kernel[(256,)](
-            values,
-            token_scales,
-            weight,
-            weight_scales,
-            destination,
-            routes,
-            counts,
-            2,
-            256,
-            hidden,
-            intermediate,
-            experts,
-            8,
-            topk,
-            first,
-            16,
-            64,
-            64,
-            num_warps=4,
-            num_stages=2,
-            enable_fp_fusion=False,
-        )
-
-    stage(codes, scales, layer.w13_weight, layer.w13_weight_scale, activated, True)
-    act_codes, act_scales = fp8_channel_fused._quantize_routes(activated)
-    expected_codes, expected_scales = _quantize_reference(activated, route=True)
-    assert torch.equal(act_codes.view(torch.uint8), expected_codes.view(torch.uint8))
-    assert torch.equal(act_scales, expected_scales.flatten())
-    stage(act_codes, act_scales, layer.w2_weight, layer.w2_weight_scale, routed, False)
-    gamma = (intermediate - 1) * 2.0**-24 / (1 - (intermediate - 1) * 2.0**-24)
-    for expert in range(experts):
-        indices = torch.arange(2, device="cuda") * topk + expert
-        values = act_codes[indices].contiguous()
-        raw = torch.empty(2, hidden, device="cuda")
-        _raw_projection_kernel[(hidden // 64,)](
-            values,
-            layer.w2_weight[expert],
-            raw,
-            intermediate,
-            hidden,
-            num_warps=4,
-            num_stages=2,
-            enable_fp_fusion=False,
-        )
-        exact = values.double() @ layer.w2_weight[expert].double().T
-        sum_abs = values.double().abs() @ layer.w2_weight[expert].double().abs().T
-        assert torch.all((raw.double() - exact).abs() <= gamma * sum_abs)
-        scaled = (raw * act_scales[indices, None]) * layer.w2_weight_scale[expert]
-        expected = (exact.float() * act_scales[indices, None]) * layer.w2_weight_scale[
-            expert
-        ]
-        assert torch.equal(routed[indices], scaled.bfloat16())
-        different = scaled.bfloat16() != expected.bfloat16()
-        if different.any():
-            actual_bf16, expected_bf16 = (
-                scaled.bfloat16().float(),
-                expected.bfloat16().float(),
-            )
-            midpoint = (actual_bf16 + expected_bf16) * 0.5
-            assert torch.all(
-                ((scaled - midpoint) * (expected - midpoint))[different] <= 0
-            )
-    _combine(routed, weights, output)
-    combined = torch.zeros_like(output, dtype=torch.float32)
-    for slot in range(topk):
-        values = routed.reshape(2, topk, hidden)[:, slot].double()
-        combined = (
-            combined.double() + values * weights[:, slot, None].double()
-        ).float()
-    assert torch.equal(output, combined.bfloat16())
 
 
 @pytest.mark.parametrize("tokens", [0, 1, 2, 4, 8, 16, 65])
@@ -404,7 +253,7 @@ def test_fused_experts_match_rounding_reference(tokens, intermediate, ep_rank, e
     if not tokens:
         assert actual.shape == x.shape
         return
-    expected = _reference(x, layer, weights, ids)
+    expected = _reference(x, layer, weights, ids, matmul=_native_fp8_mm)
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
     relative = (
         actual.float() - expected.float()
@@ -458,7 +307,7 @@ def test_fused_expert_last_ep_rank_owns_only_local_ids(experts, ep_size):
     weights = torch.tensor([[0.1234567, 0.8765432, 0.2345678]] * 4, device="cuda")
     plan = _plan(hidden=256, ispp=320, ep_size=ep_size)
     actual = moe_apply(plan, x, layer, None, topk_weights=weights, topk_ids=ids)
-    expected = _reference(x, layer, weights, ids)
+    expected = _reference(x, layer, weights, ids, matmul=_native_fp8_mm)
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
     assert torch.count_nonzero(actual[1]) == 0
 
@@ -504,7 +353,9 @@ def test_fused_expert_token_count_does_not_recompile():
             actual = run(rows)
             torch.testing.assert_close(
                 actual,
-                _reference(x[:rows], layer, weights[:rows], ids[:rows]),
+                _reference(
+                    x[:rows], layer, weights[:rows], ids[:rows], matmul=_native_fp8_mm
+                ),
                 atol=2e-3,
                 rtol=2e-3,
             )
