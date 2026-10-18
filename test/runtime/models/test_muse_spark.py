@@ -1446,7 +1446,7 @@ def test_replicated_pool_preserves_column_projection_after_reload(
 def test_gathered_projection_hands_wider_batches_to_the_mailbox_publish(
     monkeypatch: pytest.MonkeyPatch, bf16_default_dtype
 ) -> None:
-    """One row lands in place; wider rows reach the mailbox through its word publish, bit for bit."""
+    """Wider rows reach the mailbox through its word publish, bit for bit; a GEMV row lands in place."""
     from tokenspeed_kernel.ops.moe._cute_dsl import latent_down
 
     bound = {}
@@ -1484,25 +1484,25 @@ def test_gathered_projection_hands_wider_batches_to_the_mailbox_publish(
         device=mailbox.device,
         publish_gemm=bound["publish_gemm"],
     )
-    published_rows = []
+    published_rows, expected_rows = [], []
     publish = latent_down.multicast_publish
-    monkeypatch.setattr(
-        latent_down,
-        "multicast_publish",
-        lambda block, destination: (
-            published_rows.append(block.shape[0]),
-            publish(block, destination),
-        ),
-    )
+
+    def record_publish(block, destination):
+        published_rows.append(block.shape[0])
+        publish(block, destination)
+
+    monkeypatch.setattr(latent_down, "multicast_publish", record_publish)
     for tokens in (1, 3):
         x = torch.randn(tokens, hidden, device="cuda")
+        if tokens > 1 or not module._use_mv(x, weight):
+            expected_rows.append(tokens)
         producer(x, weight, mailbox, mailbox.data_ptr())
         torch.cuda.synchronize()
         assert torch.equal(
             mailbox[:tokens, rank * shard : (rank + 1) * shard].view(torch.int16),
             linear._project(x, weight, None).view(torch.int16),
         )
-    assert published_rows == [3]
+    assert published_rows == expected_rows
 
 
 class _FakeMailbox:
