@@ -82,6 +82,34 @@ unconditionally at wrapper construction, `enforce_eager` included. A decode
 above the ladder runs the same refresh with no graph; it is a first-class
 path, not a fallback.
 
+### Ascend context-parallel decode
+
+Ascend DSA context-parallel decode uses one prepared communicator for fused
+TopK selection and LSE merging. Both stages run on the model stream. Its
+context object owns local page metadata only; it creates no auxiliary process
+group or stream. Bind the communicator, producer outputs and IPC tables before
+capture, and retain their storage until graph destruction. Missing resources
+fail before a context-parallel kernel is launched. The backend takes its CP
+degree and ranks from the host topology and passes that degree to every fused
+collective. The installed operators' Meta implementations validate topology
+and head layout before execution or graph capture; the framework carries no
+CP degree whitelist. The current native fusion remains specialized for DCP8.
+Bindings must supply Meta implementations for this startup check; a missing
+Meta kernel reports a binding upgrade, separately from unsupported topology.
+
+DSA CP prepares its metadata before the first fused Prolog. One device launch
+expands request lengths into causal query rows, compacts owned pages, counts
+visible/initial/window tokens, writes the Indexer's grouped layout, and maps
+write slots to local INT64 addresses (-1 for skipped writes). The kernel writes
+directly into persistent consumer buffers. Layers share this result within
+the forward; replay recomputes it from the live request inputs. Eager and Graph
+execution use this same path. This DSA-specific preparation retains the common
+DCP ownership semantics without changing the shared placement implementation.
+Single-rank decode uses the same preparation with identity page ownership:
+verify still needs one causal length and page-table row per candidate. Its
+Indexer and attention receive matching per-query batch axes, even without a
+collective; ordinary single-rank prefill retains its request-span layout.
+
 ### Rebinding a cache pool
 
 `set_cache_pool` may run more than once on the same backend tree: a memory
