@@ -26,6 +26,7 @@ import torch
 from tokenspeed_kernel.ops.gemm import KIMI3_HIDDEN_SIZE, KIMI3_QKVFAB_SIZE
 from tokenspeed_kernel.ops.gemm._gluon.gemv import gluon_simt_gemm_fp32
 from tokenspeed_kernel.ops.gemm.triton import MXFP4_LINEAR_SIGNATURES
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -390,6 +391,52 @@ if platform.is_amd:
             _grouped_decode_counters(m, g, n, k), dtype=torch.int32, device=x.device
         )
         return _grouped_decode_impl(x, weight, counters=counters, out=out)
+
+    @register_kernel(
+        "gemm",
+        "grouped_bf16_projection_fp8",
+        name="gluon_grouped_bf16_projection_fp8_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "batch": frozenset({2}),
+            "n": frozenset({1024}),
+            "k": frozenset({4096}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_contiguous": frozenset({True}),
+            "is_cuda": frozenset({True}),
+        },
+    )
+    def gluon_grouped_bf16_projection_fp8_gfx950(
+        x: torch.Tensor, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Grouped decode GEMM with a group-32 FP8 quantizing epilogue."""
+        m, g, k = x.shape
+        n = weight.shape[1]
+        if not _supports_grouped_decode(m, g, n, k):
+            projected = torch.einsum("tgd,grd->tgr", x, weight).flatten(1)
+            return quantize_fp8(
+                projected,
+                granularity="token_group",
+                group_size=32,
+                scale_encoding="ue8m0",
+                enable_pdl=False,
+                override=None,
+                solution=None,
+            )
+        counters = zeroed_state(
+            _grouped_decode_counters(m, g, n, k), dtype=torch.int32, device=x.device
+        )
+        return _grouped_decode_impl(x, weight, counters=counters, quantize=True)
 
     def _gemv_a16w16_filter(m: int, n: int, k: int) -> bool:
         return _supports_gemv_a16w16(m, n, k) and _prefers_gemv_a16w16(m, n, k)

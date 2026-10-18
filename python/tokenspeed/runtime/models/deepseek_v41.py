@@ -86,6 +86,7 @@ from tokenspeed_kernel.ops.attention.dsv41 import (
 from tokenspeed_kernel.ops.gemm import (
     dsv4_linear_fp32,
     grouped_bf16_projection,
+    grouped_bf16_projection_quantize_fp8,
     mm,
     prepare_mxfp8_weight_scales,
 )
@@ -1217,13 +1218,26 @@ class DeepseekV41Attention(nn.Module):
             out = self.rotary_emb.apply_owned(out, positions, True)
         grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
         weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
-        out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
         target = None
         if self.mapping.attn.has_tp:
             target = _all_reduce_output(
-                (out.shape[0], self.wo_b.output_size), out, self.mapping.attn.tp_group
+                (grouped.shape[0], self.wo_b.output_size),
+                grouped,
+                self.mapping.attn.tp_group,
             )
-        out, _ = self.wo_b(out, scale=None, out=target)
+        method = self.wo_b.quant_method
+        if (
+            grouped.is_cuda
+            and current_platform().is_cdna4
+            and isinstance(method, _ReferenceFp8LinearMethod)
+            and method.prepared_weight_scales is None
+        ):
+            # wo_b's group-32 activation quantization runs in wo_a's epilogue.
+            codes, scales = grouped_bf16_projection_quantize_fp8(grouped, weight)
+            out, _ = self.wo_b(codes, scale=scales, out=target)
+        else:
+            out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
+            out, _ = self.wo_b(out, scale=None, out=target)
         if self.mapping.attn.has_tp and reduce_output:
             out = all_reduce(
                 out,
