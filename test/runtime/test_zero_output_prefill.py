@@ -448,6 +448,7 @@ def test_zero_decoder_attention_still_runs_the_global_producer():
         positions,
         hidden,
         SimpleNamespace(attn_backend=None, forward_mode=object()),
+        reduce_output=True,
     )
     assert output.shape == (0, 8)
     torch.testing.assert_close(writes[0], hidden)
