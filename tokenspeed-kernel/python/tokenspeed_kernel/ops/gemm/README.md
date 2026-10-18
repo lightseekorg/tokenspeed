@@ -30,8 +30,8 @@ accumulator between them. Each instruction receives at most one nonzero
 product per affected group. This preserves FP8 operand storage and native
 FP8 multiplication and fixes the demonstrated grouping loss; it does not
 guarantee equivalence to sequential FP32 arithmetic. The portable Triton
-implementation uses the same eight-way accumulation on all devices with native
-FP8 matrix support, without a vendor or architecture-name branch. Device
+implementation supports AMD and NVIDIA GPUs with native FP8 matrix instructions
+and uses the same eight-way accumulation on both vendors. Device
 validation so far is on gfx950; correctness and the additional matrix-work
 cost on other architectures still need hardware qualification. Specialized
 implementations remain separate registry choices.

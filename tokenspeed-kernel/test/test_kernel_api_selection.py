@@ -36,7 +36,7 @@ import importlib
 import inspect
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from types import SimpleNamespace
 
@@ -3501,6 +3501,32 @@ def test_token_quantizer_preserves_required_minimum_scale(
         required_features=frozenset({"token_fp8_min_scaling"}),
     )
     assert selected.name == expected
+
+
+@pytest.mark.parametrize(
+    "family,mode,name",
+    [
+        ("gemm", "mm", "triton_mm_fp8_scaled"),
+        ("moe", "apply", "triton_fp8_channel_fused_precomputed_moe_apply"),
+        ("quantization", "fp8_with_scale", "triton_quantize_fp8_per_token_portable"),
+    ],
+)
+@pytest.mark.parametrize(
+    "platform_fixture,vendor,eligible",
+    [
+        ("mi350_platform", "amd", True),
+        ("h100_platform", "nvidia", True),
+        ("mi350_platform", "ascend", False),
+    ],
+)
+def test_portable_fp8_kernels_require_supported_vendor(
+    request, platform_fixture, vendor, eligible, family, mode, name
+) -> None:
+    platform = replace(request.getfixturevalue(platform_fixture), vendor=vendor)
+    candidates = KernelRegistry.get().get_for_operator(
+        family, mode, platform=platform, solution="triton"
+    )
+    assert (name in {candidate.name for candidate in candidates}) == eligible
 
 
 def _moe_fp8_channel_plan(platform: PlatformInfo, **overrides) -> dict:

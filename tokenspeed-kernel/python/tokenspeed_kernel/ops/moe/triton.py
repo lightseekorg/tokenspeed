@@ -745,6 +745,7 @@ def triton_fp8_channel_precomputed_moe_apply(
     name="triton_fp8_channel_fused_precomputed_moe_apply",
     solution="triton",
     capability=CapabilityRequirement(
+        vendors=frozenset({"amd", "nvidia"}),
         required_features=frozenset({"tensor_core:f8"}),
     ),
     signatures=format_signatures("x", "dense", {torch.bfloat16}),

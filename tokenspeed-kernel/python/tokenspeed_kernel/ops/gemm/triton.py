@@ -328,6 +328,7 @@ _FP8_SCALED_FORMAT_SIGNATURES = format_signatures(
     name="triton_mm_fp8_scaled",
     solution="triton",
     capability=CapabilityRequirement(
+        vendors=frozenset({"amd", "nvidia"}),
         required_features=frozenset({"tensor_core:f8"}),
     ),
     signatures=_FP8_SCALED_FORMAT_SIGNATURES,

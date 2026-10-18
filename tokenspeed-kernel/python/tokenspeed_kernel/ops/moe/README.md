@@ -214,9 +214,10 @@ support FP16/BF16 inputs; weight-only MXFP4 uses BF16 inputs.
 
 `triton_fp8_channel_fused_precomputed_moe_apply` implements the existing
 `moe.apply` operation with solution `triton` and the default precision policy.
-It requires FP8 matrix instructions, independently of vendor. It consumes contiguous BF16
-inputs, concatenated gate/up FP8 E4M3 weights, FP32 per-output-channel scales,
-precomputed global expert IDs and original FP32 route weights. It accepts
+It supports AMD and NVIDIA GPUs with FP8 matrix instructions. It consumes
+contiguous BF16 inputs, concatenated gate/up FP8 E4M3 weights, FP32
+per-output-channel scales, precomputed global expert IDs and original FP32
+route weights. It accepts
 intermediate widths divisible by 32 and hidden widths divisible by 128, including
 Beam's 320/640/2560 intermediate partitions. No weight shuffle is required.
 Expert-parallel ranks filter IDs to their local contiguous expert interval;
@@ -247,7 +248,7 @@ weights and accumulation before BF16 output.
 The portable dot implementation uses eight masked native dots with an FP32
 accumulator. This preserves small products beside large ones on gfx950, where
 one native FP8 instruction can lose them (`gemm/README.md`). The same Triton
-implementation is available on other FP8-capable GPUs.
+implementation is shared by the supported AMD and NVIDIA GPUs.
 
 ## Shared MoE precision policies
 

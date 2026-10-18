@@ -8,8 +8,8 @@ scales. Backend adapters normalize their results at this boundary.
 For a 2-D input, the row count is a selection trait (`m`), so a kernel can
 bound the rows it takes (`m_max`). On NVIDIA SM100 and newer, `token`
 quantization of up to 64 rows runs the one-launch Triton per-token quantizer.
-The portable per-token fallback serves every row count on GPUs advertising
-FP8 matrix instructions, including AMD gfx950/gfx1250 and NVIDIA.
+The portable per-token fallback serves every row count on AMD and NVIDIA GPUs
+with FP8 matrix instructions.
 It computes the FP32 scale as `max(amax / 448, 1 / (448 * 512))`, multiplies
 by the independently IEEE-rounded `min(448 / amax, 448 * 512)`, and rounds
 the saturated codes to E4M3 nearest even. Zero rows have zero codes and the
