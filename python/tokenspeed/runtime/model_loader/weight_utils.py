@@ -107,7 +107,7 @@ def get_lock(
 
 
 def _json_folder(model_config: ModelConfig, load_config: LoadConfig) -> str:
-    """The checkpoint folder holding its JSON files, fetched if remote."""
+    """Return the checkpoint folder holding its JSON files, fetched if remote."""
     model_name_or_path = model_config.model_path
     if os.path.isdir(model_name_or_path):
         return model_name_or_path
