@@ -305,7 +305,7 @@ def triton_mxfp4_swiglu_linear(
 
 
 # ===-----------------------------------------------------------------------===#
-# Scaled FP8: Triton (NVIDIA SM100+, AMD gfx950+)
+# Scaled FP8: portable Triton
 # ===-----------------------------------------------------------------------===#
 
 
@@ -328,11 +328,7 @@ _FP8_SCALED_FORMAT_SIGNATURES = format_signatures(
     name="triton_mm_fp8_scaled",
     solution="triton",
     capability=CapabilityRequirement(
-        vendors=frozenset({"nvidia", "amd"}),
-        vendor_min_arch_versions={
-            "nvidia": ArchVersion(10, 0),
-            "amd": ArchVersion(9, 5),
-        },
+        required_features=frozenset({"tensor_core:f8"}),
     ),
     signatures=_FP8_SCALED_FORMAT_SIGNATURES,
     traits={
@@ -370,7 +366,6 @@ def triton_mm_fp8_scaled(
     """
     if alpha is not None or block_size is not None:
         raise ValueError("row-wise scaled FP8 GEMM takes no alpha or block_size")
-    platform = Platform.get()
     return triton_scaled_mm(
         A,
         B,
@@ -379,7 +374,7 @@ def triton_mm_fp8_scaled(
         out_dtype=out_dtype,
         bias=bias,
         out=out,
-        fp8_accumulation_streams=8 if platform.is_cdna4 else 1,
+        fp8_accumulation_streams=8,
     )
 
 

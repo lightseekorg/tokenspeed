@@ -1,20 +1,31 @@
+"""Fused Triton FP8 channel experts and their floating-point boundaries."""
+
 from __future__ import annotations
 
 import pytest
 import torch
-from ops.moe.test_triton_fp8_channel_apply import _layer, _plan, _plan_on
+from ops.moe.test_triton_fp8_channel_apply import _layer
+from ops.moe.test_triton_fp8_channel_apply import _plan as _default_plan
+from ops.moe.test_triton_fp8_channel_apply import _plan_on
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.moe import moe_apply
 from tokenspeed_kernel.ops.moe._triton import fp8_channel_fused
-from tokenspeed_kernel.selection import NoKernelFoundError
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.selection import NoKernelFoundError, kernel_override
 from utils import (
     assert_no_triton_compile,
     int_specialization_class,
-    is_cdna4,
     warm_specialization_classes,
 )
 
 APPLY = "triton_fp8_channel_fused_precomputed_moe_apply"
+
+
+def _plan(**overrides):
+    # NVIDIA retains its existing Triton variant as the default; exercise the
+    # fused implementation explicitly without changing normal admission tests.
+    with kernel_override("moe", "apply", APPLY):
+        return _default_plan(**overrides)
 
 
 @triton.jit
@@ -85,8 +96,16 @@ def test_native_fp8_dot_obeys_fp32_rounding_bound():
 
 
 @pytest.mark.parametrize("ispp,ep_size", [(320, 1), (640, 1), (2560, 8)])
-def test_fused_channel_plan_admits_beam_partitions(mi350_platform, ispp, ep_size):
-    plan = _plan_on(mi350_platform, hidden=5120, ispp=ispp, ep_size=ep_size)
+@pytest.mark.parametrize("platform_fixture", ["mi350_platform", "mi450_platform"])
+def test_fused_channel_plan_admits_beam_partitions(
+    request, platform_fixture, ispp, ep_size
+):
+    plan = _plan_on(
+        request.getfixturevalue(platform_fixture),
+        hidden=5120,
+        ispp=ispp,
+        ep_size=ep_size,
+    )
     assert plan["apply_kernel_name"] == APPLY
     assert plan["weight_preprocessor"] is None
     assert plan["supports_precomputed_topk"]
@@ -112,8 +131,16 @@ def test_fused_channel_plan_refuses_unsupported_contract(mi350_platform, overrid
 
 
 def _require_gpu():
-    if not is_cdna4():
-        pytest.skip("Fused FP8 channel experts require gfx950")
+    if (
+        not torch.cuda.is_available()
+        or "tensor_core:f8" not in current_platform().sm_features
+    ):
+        pytest.skip("Fused FP8 channel experts require FP8 matrix instructions")
+
+
+def test_fused_channel_plan_requires_fp8_matrix_instructions(a100_platform):
+    with pytest.raises(NoKernelFoundError):
+        _plan_on(a100_platform, hidden=5120, ispp=320)
 
 
 def test_fused_channel_rejects_unsupported_launch_request():

@@ -617,15 +617,21 @@ def scaled_mm_kernel(
 
         # Accumulate results.
         if FP8_ACCUMULATION_STREAMS > 1:
-            # gfx950 native FP8 MFMA loses small products within groups of
-            # eight K positions (65536 + 1 can become 65536). Keep only one
-            # nonzero position per group in each native dot. The accumulator
-            # carries between dots in FP32; storage and operands remain FP8.
+            # Separate products in each group of eight K positions to avoid
+            # the small-product loss observed on gfx950. Use the same portable
+            # accumulation order on every supported vendor; FP8 operands feed
+            # native dots with an FP32 accumulator carried between passes.
             zero = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K), 0.0, a.dtype)
             for stream in tl.static_range(FP8_ACCUMULATION_STREAMS):
                 mask = (offsets_k % FP8_ACCUMULATION_STREAMS == stream)[None, :]
                 a_stream = tl.where(mask, a, zero)
-                accumulator = tl.dot(a_stream, b, accumulator, out_dtype=tl.float32)
+                accumulator = tl.dot(
+                    a_stream,
+                    b,
+                    accumulator,
+                    out_dtype=tl.float32,
+                    max_num_imprecise_acc=0,
+                )
         else:
             accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
 

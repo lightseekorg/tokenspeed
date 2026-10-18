@@ -25,15 +25,25 @@ import torch
 from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.ops.quantization import triton as quant_triton
-from tokenspeed_kernel.platform import ArchVersion, current_platform
-from utils import assert_no_triton_compile
+from tokenspeed_kernel.selection import kernel_override
+from utils import assert_no_triton_compile, kernel_supported
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not current_platform().is_amd
-    or current_platform().arch_version != ArchVersion(9, 5),
-    reason="native E4M3 tests require AMD gfx950",
+    not torch.cuda.is_available() or not kernel_supported("triton_mm_fp8_scaled"),
+    reason="portable E4M3 tests require native FP8 matrix support",
 )
+
+
+@pytest.fixture(autouse=True)
+def portable_kernels():
+    # Exercise these implementations even when a vendor specialization wins.
+    with (
+        kernel_override("gemm", "mm", "triton_mm_fp8_scaled"),
+        kernel_override(
+            "quantization", "fp8_with_scale", "triton_quantize_fp8_per_token_portable"
+        ),
+    ):
+        yield
 
 
 def _reference_quantize(x):
@@ -137,7 +147,7 @@ def test_small_product_is_preserved_next_to_large_product(
     )
     expected = (q.double() @ weight.double().t()).float()
     # Every product and every possible partial sum is exact in FP32; a
-    # missing small term is an instruction precision defect, not association.
+    # missing small term is not explained by FP32 association alone.
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 

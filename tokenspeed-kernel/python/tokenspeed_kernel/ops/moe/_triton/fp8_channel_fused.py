@@ -175,7 +175,11 @@ def _triton_fp8_channel_fused_moe_impl(
         x, local_ids, experts
     )
     xq, xs = quantize_fp8(
-        x, granularity="token", scale_encoding="float32", enable_pdl=False
+        x,
+        granularity="token",
+        scale_encoding="float32",
+        enable_pdl=False,
+        required_features=frozenset({"token_fp8_min_scaling"}),
     )
     # Nonlocal routes remain zero, including the full row read by quantization.
     activated = torch.zeros(

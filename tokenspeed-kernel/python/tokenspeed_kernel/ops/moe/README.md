@@ -210,11 +210,11 @@ sums in FP32 before the final store, without rounding each weighted route.
 Any routed scale belongs in the route weights. Dynamic MXFP4 activations
 support FP16/BF16 inputs; weight-only MXFP4 uses BF16 inputs.
 
-### Portable FP8 per-channel experts on gfx950
+### Portable FP8 per-channel experts with fused activation
 
 `triton_fp8_channel_fused_precomputed_moe_apply` implements the existing
 `moe.apply` operation with solution `triton` and the default precision policy.
-It consumes contiguous BF16
+It requires FP8 matrix instructions, independently of vendor. It consumes contiguous BF16
 inputs, concatenated gate/up FP8 E4M3 weights, FP32 per-output-channel scales,
 precomputed global expert IDs and original FP32 route weights. It accepts
 intermediate widths divisible by 32 and hidden widths divisible by 128, including
@@ -228,22 +228,26 @@ the specialized Gluon FP8 implementation for EP1, 256 experts, top-eight
 routing, hidden width 5120 and local intermediate width 320 or 640.
 The planner must receive `num_experts` and `top_k` to establish eligibility;
 unknown or unsupported geometry retains the Triton fallback. Explicit
-`solution="triton"` also retains this implementation. NVIDIA keeps its
-existing policies and backend selection. The Gluon algorithm is documented
+`solution="triton"` also retains this implementation on AMD. On NVIDIA
+SM90-SM103, the existing Triton variant has higher priority and keeps its
+BF16-before-activation rounding. The fused variant is also available there
+by registration override. The Gluon algorithm is documented
 in `tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/README.md`.
 
 The first multiplication accumulates in FP32 and retains gate/up in FP32 through
 SiLU and multiplication, rounding only the resulting intermediate to BF16.
-Input quantization uses the public FP8 token operation; the private route
+Input quantization requests the public FP8 token operation's
+`token_fp8_min_scaling` feature, preserving the minimum scale and independently
+rounded reciprocal across implementations. The private route
 quantizer rounds the scaled product to BF16 before saturated E4M3 conversion,
 a boundary the public quantizer does not have. The second multiplication
 accumulates in FP32 and stores BF16 per route; combination retains FP32
 weights and accumulation before BF16 output.
 
-On gfx950 the kernel shares the dense FP8 GEMM's workaround for native FP8
-matrix instructions losing small products (`gemm/README.md`): eight masked
-native dots per original instruction with an FP32 accumulator, a correctness
-baseline rather than a tuned implementation.
+The portable dot implementation uses eight masked native dots with an FP32
+accumulator. This preserves small products beside large ones on gfx950, where
+one native FP8 instruction can lose them (`gemm/README.md`). The same Triton
+implementation is available on other FP8-capable GPUs.
 
 ## Shared MoE precision policies
 

@@ -29,11 +29,12 @@ original K positions into eight masked native FP8 dots and carries the FP32
 accumulator between them. Each instruction receives at most one nonzero
 product per affected group. This preserves FP8 operand storage and native
 FP8 multiplication and fixes the demonstrated grouping loss; it does not
-guarantee equivalence to sequential FP32 arithmetic. The implementation
-enables this workaround only on gfx950, where the issue was observed.
-The masking algorithm is vendor-neutral, but its need and behavior on other
-architectures have not been established. Other architectures retain their
-prior path, avoiding the additional eight-way matrix work.
+guarantee equivalence to sequential FP32 arithmetic. The portable Triton
+implementation uses the same eight-way accumulation on all devices with native
+FP8 matrix support, without a vendor or architecture-name branch. Device
+validation so far is on gfx950; correctness and the additional matrix-work
+cost on other architectures still need hardware qualification. Specialized
+implementations remain separate registry choices.
 
 ## DeepSeek V4 grouped output projection
 

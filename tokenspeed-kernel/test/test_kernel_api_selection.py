@@ -3476,6 +3476,33 @@ def test_gfx950_dynamic_mxfp4_moe_selects_gluon_a4w4(
     assert bf16_activations["apply_kernel_name"] == "gluon_mxfp4_precomputed_moe_apply"
 
 
+@pytest.mark.parametrize(
+    "platform_fixture,rows,expected",
+    [
+        ("h100_platform", 129, "triton_quantize_fp8_per_token_portable"),
+        ("b200_platform", 1, "triton_quantize_fp8_per_token"),
+        ("b200_platform", 129, "triton_quantize_fp8_per_token_portable"),
+        ("mi350_platform", 129, "triton_quantize_fp8_per_token_portable"),
+        ("mi450_platform", 129, "triton_quantize_fp8_per_token_portable"),
+    ],
+)
+def test_token_quantizer_preserves_required_minimum_scale(
+    request, monkeypatch, platform_fixture, rows, expected
+):
+    monkeypatch.setattr(
+        Platform, "_instance", request.getfixturevalue(platform_fixture)
+    )
+    monkeypatch.setattr(KernelRegistry.get(), "_selection_cache", {})
+    selected = _quantization_pkg.select_fp8_token_quantizer(
+        rows,
+        torch.bfloat16,
+        solution="triton",
+        override=None,
+        required_features=frozenset({"token_fp8_min_scaling"}),
+    )
+    assert selected.name == expected
+
+
 def _moe_fp8_channel_plan(platform: PlatformInfo, **overrides) -> dict:
     kwargs = dict(
         weight_dtype="fp8_channel",

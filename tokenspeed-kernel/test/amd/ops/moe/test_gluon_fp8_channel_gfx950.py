@@ -349,7 +349,7 @@ def tp8_channel_fixture():
 def test_tp8_public_operation_reference_and_changed_route_graph(
     tp8_channel_fixture, tokens
 ):
-    from amd.ops.moe.test_triton_fp8_channel_fused import _reference
+    from ops.moe.test_triton_fp8_channel_fused import _reference
     from tokenspeed_kernel.ops.moe import moe_apply
 
     native_plan, candidate_plan, layer = tp8_channel_fixture

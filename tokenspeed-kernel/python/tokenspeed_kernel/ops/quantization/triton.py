@@ -704,9 +704,7 @@ def triton_quantize_fp8_per_token(
     solution="triton",
     features={"token_fp8_min_scaling"},
     capability=CapabilityRequirement(
-        vendors=frozenset({"amd"}),
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
+        required_features=frozenset({"tensor_core:f8"}),
     ),
     signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
     traits={
@@ -723,29 +721,35 @@ def triton_quantize_fp8_per_token_portable(
     scale_encoding: str,
     enable_pdl: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Portable per-token E4M3 quantization for gfx950, for any row count.
+    """Portable per-token E4M3 quantization with a minimum scale, for any row count.
 
     Args:
-        x: ``[M, K]`` BF16 or FP16 activations with contiguous rows.
+        x: BF16 or FP16 activations; the last dimension is one token.
         granularity: Must be ``"token"``.
         group_size: Must be None.
         scale_encoding: Must be ``"float32"``.
-        enable_pdl: Must be False; dependent launch is NVIDIA-specific.
+        enable_pdl: Launch with Programmatic Dependent Launch on Hopper+.
 
     Returns:
-        FP8 E4M3 ``[M, K]`` codes and FP32 ``[M, 1]`` scales. The scale
+        FP8 E4M3 codes with the input shape and FP32 scales with a singleton
+        last dimension. The scale
         floor and independently rounded reciprocal match the shared token
         quantizer, including zero and tiny rows.
     """
-    if enable_pdl:
-        raise ValueError("portable FP8 token quantization does not support enable_pdl")
-    return triton_quantize_fp8_per_token(
-        x,
+    if enable_pdl and not current_platform().is_hopper_plus:
+        raise ValueError("this platform does not support enable_pdl")
+    shape = x.shape
+    rows = x.reshape(-1, shape[-1])
+    if rows.stride(-1) != 1:
+        rows = rows.contiguous()
+    values, scales = triton_quantize_fp8_per_token(
+        rows,
         granularity=granularity,
         group_size=group_size,
         scale_encoding=scale_encoding,
-        enable_pdl=False,
+        enable_pdl=enable_pdl,
     )
+    return values.reshape(shape), scales.reshape(*shape[:-1], 1)
 
 
 # The widest SwiGLU half (intermediate size) one program holds: a row per
