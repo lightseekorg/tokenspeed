@@ -162,7 +162,7 @@ void MeasureEvictableCandidates(std::int32_t pool_size, std::int32_t iterations)
         index.Register(pool, blocks[static_cast<std::size_t>(i)],
                        CacheKey{.group_id = 0, .content_hash = std::to_string(i), .page_offset = 0},
                        /*access_epoch=*/static_cast<std::uint64_t>(i), /*logical_block_index=*/-1,
-                       CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
+                       /*newly_cached=*/nullptr);
     }
     blocks.clear();
     Measure("evictable_candidates", pool_size, pool_size, iterations,
@@ -188,8 +188,7 @@ void FillAdmissionCache(CacheCoordinator& coordinator, BlockPool& pool, std::int
         coordinator.GroupPrefixIndex(0).Register(
             pool, block,
             CacheKey{.group_id = 0, .content_hash = "admission-cache-" + std::to_string(i), .page_offset = 0},
-            /*access_epoch=*/static_cast<std::uint64_t>(i + 1), /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
-            /*newly_cached=*/nullptr);
+            /*access_epoch=*/static_cast<std::uint64_t>(i + 1), /*logical_block_index=*/-1, /*newly_cached=*/nullptr);
     }
 }
 
@@ -231,8 +230,7 @@ void MeasureAdmission(std::int32_t pool_size, std::int32_t iterations) {
         coordinator.GroupPrefixIndex(0).Register(
             pool, block,
             CacheKey{.group_id = 0, .content_hash = "admission-cache-" + std::to_string(next_key), .page_offset = 0},
-            /*access_epoch=*/next_key, /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
-            /*newly_cached=*/nullptr);
+            /*access_epoch=*/next_key, /*logical_block_index=*/-1, /*newly_cached=*/nullptr);
         return checksum;
     });
 }
@@ -247,8 +245,7 @@ void MeasurePinnedAdmission(std::int32_t pool_size, std::int32_t iterations) {
         coordinator.GroupPrefixIndex(0).Register(
             pool, pins[static_cast<std::size_t>(i)],
             CacheKey{.group_id = 0, .content_hash = "pinned-" + std::to_string(i), .page_offset = 0},
-            /*access_epoch=*/static_cast<std::uint64_t>(i + 1), /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
-            /*newly_cached=*/nullptr);
+            /*access_epoch=*/static_cast<std::uint64_t>(i + 1), /*logical_block_index=*/-1, /*newly_cached=*/nullptr);
     }
     BlockTable table;
     const std::array demand{GroupDemand{.table = &table, .extent = DenseGrowth{4}}};
@@ -289,8 +286,7 @@ void MeasureHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations
         coordinator.GroupPrefixIndex(0).Register(
             host_pool, block,
             CacheKey{.group_id = 0, .content_hash = "host-cache-" + std::to_string(i), .page_offset = 0},
-            /*access_epoch=*/static_cast<std::uint64_t>(i + 1), /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
-            /*newly_cached=*/nullptr);
+            /*access_epoch=*/static_cast<std::uint64_t>(i + 1), /*logical_block_index=*/-1, /*newly_cached=*/nullptr);
     }
 
     const std::array<std::uint32_t, 1> group_ids{0};

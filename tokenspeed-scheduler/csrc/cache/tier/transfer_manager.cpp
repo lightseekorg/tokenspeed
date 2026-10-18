@@ -431,8 +431,7 @@ ReqPoolIndex TierTransferManager::CompleteSnapshotRestore(std::uint32_t op_id, b
     if (publish) {
         for (BlockTransfer& transfer : it->second.transfers) {
             if (transfer.destination && !transfer.key.content_hash.empty()) {
-                coordinator_.CacheDeviceBlock(transfer.destination, transfer.key, transfer.logical_block_index,
-                                              transfer.boundary_kind);
+                coordinator_.CacheDeviceBlock(transfer.destination, transfer.key, transfer.logical_block_index);
             }
         }
     }

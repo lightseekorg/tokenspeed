@@ -36,13 +36,6 @@
 
 namespace tokenspeed {
 
-// Where a published boundary came from: an interior chunk end or decode
-// step (kChunk), or a point the owner stopped at -- prompt end, finish,
-// retraction, a junction cut (kEndpoint). Eviction ranks an unproven kChunk
-// boundary of a non-closed group behind the rest. The declaration order
-// ranks the kinds: a block republished at a later point keeps the higher one.
-enum class CacheBoundaryKind { kChunk, kEndpoint };
-
 using CacheNamespaceId = std::uint32_t;
 using ContentHash = std::string;
 
@@ -174,7 +167,7 @@ struct TailPublication {
 // publish. prefix_hashes is the request's cumulative completed prefix-page
 // history; the pages from first_new_prefix_page on are the new ones. The
 // struct exists only when there is something to publish: a non-empty page
-// range, a tail, or a state checkpoint. The request owns the storage behind
+// range, a tail, or a natural checkpoint. The request owns the storage behind
 // the spans.
 struct CompletedPages {
     std::span<const std::string> prefix_hashes{};
@@ -193,12 +186,11 @@ struct CompletedPages {
     // finish, retraction, a junction-cut chunk end): every State group
     // publishes slot 1 -- the block the forward that ended here wrote --
     // under the point's hash (the chain hash when aligned, the tail hash
-    // otherwise). Ordinary chunk ends and decode steps publish no state.
+    // otherwise), and every sliding group the window behind it. Ordinary chunk
+    // ends and decode steps publish neither.
     bool publish_state{false};
-    // Which kind of boundary the publication ends on (eviction provenance).
-    CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     // Prefill streams newly published history and state to Host. Decode
-    // leaves this false; only sliding windows keep streaming.
+    // leaves this false.
     bool stream_completed_to_host{false};
 };
 
@@ -240,15 +232,14 @@ struct GroupPrefixProbe {
 
 // Pinned source/destination blocks for one asynchronous cache transfer. A
 // keyed transfer (a restore's Host L2 row) republishes its destination at the
-// ACK under `key`, with the logical block index and boundary kind the entry
-// had before the retraction; an unkeyed one publishes nothing.
+// ACK under `key`, with the logical block index the entry had before the
+// retraction; an unkeyed one publishes nothing.
 struct BlockTransfer {
     std::uint32_t group_id{0};
     CacheBlockRef source;
     CacheBlockRef destination;
     CacheKey key{};
     std::int32_t logical_block_index{-1};
-    CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
 };
 
 // A Host L2 entry a store's ACK published: the key and the block that is now
@@ -277,7 +268,6 @@ struct ImageSlot {
     // slot only): the restore republishes its destination the same way, so
     // eviction ranks it as it did the original.
     std::int32_t logical_block_index{-1};
-    CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
 
     bool InHostCache() const noexcept { return !key.content_hash.empty(); }
 };

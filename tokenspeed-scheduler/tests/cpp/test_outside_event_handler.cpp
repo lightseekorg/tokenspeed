@@ -1102,20 +1102,21 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndClaimsAPageAligne
 }
 
 TEST_F(PdSlidingSparseDecodeAdmissionTestSuite, KeepsCachedPrefixIslandWhileMaterializingRemoteTail) {
-    // Seed a resumable W=4 lookback at raw-token boundary 8. At q=2 the
-    // cached island occupies slots [2, 4); earlier slots are null holes.
-    Submit({MakeRequestSpec("seed", /*num_pages=*/2, /*start=*/1)});
+    // Seed a resumable W=4 lookback at raw-token boundary 8, where the seed
+    // finishes (7 prompt tokens plus the peer's token). At q=2 the cached
+    // island occupies slots [2, 4); earlier slots are null holes.
+    const std::vector<std::int32_t> seed_tokens = MakeTokens(7);
+    Submit({RequestSpec{.request_id = "seed", .tokens = seed_tokens}});
     SendBootstrapped("seed");
     const ExecutionPlan seed_admission = PlanOnce();
     const ForwardBatch* seed_destination = FindRemoteAdmission(seed_admission);
     ASSERT_NE(seed_destination, nullptr);
     const auto seed_row = seed_destination->block_tables.at("sliding").at(0);
-    ASSERT_EQ(seed_row.size(), 5u);
+    ASSERT_EQ(seed_row.size(), 4u);
     EXPECT_EQ(seed_row[0], 0);
     EXPECT_EQ(seed_row[1], 0);
     EXPECT_GT(seed_row[2], 0);
     EXPECT_GT(seed_row[3], 0);
-    EXPECT_GT(seed_row[4], 0);
 
     SendRemotePrefillDone("seed", /*bootstrap_token=*/42);
     const ExecutionPlan seed_decode = PlanOnce();
@@ -1128,7 +1129,11 @@ TEST_F(PdSlidingSparseDecodeAdmissionTestSuite, KeepsCachedPrefixIslandWhileMate
     // The longer request hits through token 8. Its retained remote tail begins
     // at floor((16 - W + 1) / q)=6, leaving [4, 6) sparse while preserving the
     // cached island and materializing the phase page for decode reserve.
-    Submit({MakeRequestSpec("long", /*num_pages=*/4, /*start=*/1)});
+    std::vector<std::int32_t> long_tokens = seed_tokens;
+    long_tokens.push_back(42);
+    const std::vector<std::int32_t> rest = MakeTokens(/*count=*/8, /*start=*/9);
+    long_tokens.insert(long_tokens.end(), rest.begin(), rest.end());
+    Submit({RequestSpec{.request_id = "long", .tokens = long_tokens}});
     SendBootstrapped("long");
     const ExecutionPlan plan = PlanOnce();
     const ForwardBatch* destination = FindRemoteAdmission(plan);

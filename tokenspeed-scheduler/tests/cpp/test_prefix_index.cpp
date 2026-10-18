@@ -46,7 +46,7 @@ CacheBlockLocation Cache(PrefixCacheIndex& index, BlockPool& pool, const std::st
     EXPECT_TRUE(block);
     const CacheBlockLocation location = block->Location();
     index.Register(pool, block, KeyOf(content_hash), access_epoch, /*logical_block_index=*/-1,
-                   CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
+                   /*newly_cached=*/nullptr);
     return location;
 }
 
@@ -104,7 +104,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, SkipsPinnedEntriesWithoutLosingTheRest) 
     CacheBlockRef pinned = pool.AcquireBlock(kGroupId);
     ASSERT_TRUE(pinned);
     index.Register(pool, pinned, KeyOf("pinned"), /*access_epoch=*/10, /*logical_block_index=*/-1,
-                   CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
+                   /*newly_cached=*/nullptr);
 
     EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{unpinned}));
 
@@ -119,7 +119,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, SkipsPinnedEpochsAndReturnsTheWholeNextE
     for (std::uint64_t epoch : {1u, 2u, 3u}) {
         CacheBlockRef block = pool.AcquireBlock(kGroupId);
         index.Register(pool, block, KeyOf("pinned-" + std::to_string(epoch)), epoch,
-                       /*logical_block_index=*/-1, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
+                       /*logical_block_index=*/-1, /*newly_cached=*/nullptr);
         pinned.push_back(std::move(block));
     }
     const CacheBlockLocation first = Cache(index, pool, "first", /*access_epoch=*/3);
@@ -155,14 +155,14 @@ TEST(PrefixCacheIndexEvictionOrderTest, ReRegisteringAtAnOlderEpochMovesTheEntry
     ASSERT_TRUE(refreshed);
     const CacheBlockLocation moved = refreshed->Location();
     index.Register(pool, refreshed, KeyOf("moved"), /*access_epoch=*/30, /*logical_block_index=*/-1,
-                   CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
+                   /*newly_cached=*/nullptr);
     const CacheBlockLocation settled = Cache(index, pool, "settled", /*access_epoch=*/20);
 
     // A request that continues under its original epoch re-registers its pages
     // at an epoch older than entries published since, so the order cannot be
     // maintained by append alone.
     index.Register(pool, refreshed, KeyOf("moved"), /*access_epoch=*/5, /*logical_block_index=*/-1,
-                   CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
+                   /*newly_cached=*/nullptr);
     refreshed.reset();
 
     EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{moved, settled}));
@@ -206,7 +206,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, MatchesTheEvictableSetSeenByAFullScan) {
             CacheBlockRef block = pool.AcquireBlock(kGroupId);
             ASSERT_TRUE(block);
             index.Register(pool, block, KeyOf("pinned-" + std::to_string(i)), access_epoch,
-                           /*logical_block_index=*/-1, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
+                           /*logical_block_index=*/-1, /*newly_cached=*/nullptr);
             pinned.push_back(std::move(block));
             continue;
         }

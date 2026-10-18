@@ -169,10 +169,10 @@ public:
             std::int32_t num_common_tokens{0};
             // The full pages below it: num_common_tokens less the tail.
             std::int32_t full_page_tokens{0};
-            // The KV groups' own boundary before the State groups shortened
+            // The closed groups' own boundary before the others shortened
             // it: the junction a chunk may be cut at so the next prompt
             // resumes there.
-            std::int32_t kv_tokens{0};
+            std::int32_t closed_tokens{0};
             // Hits over group_keys (the full pages), relative to the tier's
             // floor.
             std::vector<GroupPrefixProbe> per_group;
@@ -200,9 +200,9 @@ public:
     struct AdmissionResult {
         std::int32_t device_prefix_tokens{0};
         std::int32_t host_prefix_tokens{0};
-        // The KV groups' boundary when it exceeds the admitted one (a State
-        // group had no checkpoint there): the junction a later chunk is cut
-        // at so its natural checkpoint lands where the KV is already cached.
+        // The closed groups' boundary when it exceeds the admitted one: the
+        // junction a later chunk is cut at so its natural checkpoint lands
+        // where the KV is already cached.
         std::int32_t junction_tokens{0};
         // The D role: every State group's prompt-end checkpoint was claimed,
         // so the peer omits the state transfer.
@@ -293,13 +293,17 @@ public:
                                                            std::int32_t num_tokens) const;
     // The same slots once `progress` has been published as well: the entries
     // that exist now plus the slots CacheCompletedBlocks(progress) would
-    // register (the single publication rule, completedBlockRanges). The
+    // register (the single publication rule, completedBlockRange). The
     // victim probe reads the image's L2/pool split off this before the
     // retraction publishes, so it sees exactly what StartRetractionStores
     // will see afterwards. Without completed pages it is PublishedDataSlots.
     std::vector<std::vector<ImageSlot>> PublishedDataSlotsAfter(std::span<const BlockTable> tables,
                                                                 std::int32_t num_tokens,
                                                                 const RequestProgress& progress) const;
+    // The first prefix page publishing `completed` registers an entry under (a
+    // natural checkpoint's window or state can lie before the new pages);
+    // prefix_hashes.size() when only the tail is touched.
+    std::int32_t FirstPublishedPrefixPage(const CompletedPages& completed) const;
 
     // A retracted request's KV image plus the Device -> snapshot-pool copies
     // that fill its snapshot-pool slots. The pairs pin the Device sources
@@ -375,7 +379,7 @@ public:
     // Registers an exact range, used for transferred prefix blocks and tests.
     // Runtime publication during Admit follows each group's boundary contract.
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
-                         std::uint64_t access_epoch, std::int32_t first_slot, CacheBoundaryKind boundary_kind);
+                         std::uint64_t access_epoch, std::int32_t first_slot);
     // Publication without admission, for finish, retraction and remote
     // completion. progress.completed_pages must be present.
     void CacheCompletedBlocks(std::span<BlockTable> tables, const RequestProgress& progress,
@@ -432,10 +436,9 @@ public:
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
     // Publishes a Device block a restore filled from Host L2
     // (CompleteSnapshotRestore): the entry comes back with the logical block
-    // index and boundary kind it was published under before the retraction,
-    // so eviction ranks it as it did the original.
-    void CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key, std::int32_t logical_block_index,
-                          CacheBoundaryKind boundary_kind);
+    // index it was published under before the retraction, so eviction ranks
+    // it as it did the original.
+    void CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key, std::int32_t logical_block_index);
 
     // L3 storage sits below Host: a bounded shadow of keys known to exist in
     // the remote store, with no local Host block. ProbePrefix reports them as
@@ -558,22 +561,20 @@ private:
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
-                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
-    // One run of table slots a publication registers in a group, the key of
-    // each (keys[j] is slot first_cache_block + j), and the boundary kind it
-    // registers them under.
+                                 bool stream_completed_to_host);
+    // One run of table slots a publication registers in a group and the key
+    // of each (keys[j] is slot first_cache_block + j).
     struct PublishedRange {
         std::int32_t first_cache_block{0};
         std::vector<CacheKey> keys;
-        CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     };
     // What publishing `completed` covers in one group -- every newly hashed
     // page plus the tail's blocks of a prefix-closed group, the blocks holding
-    // the window behind the newest boundary of a sliding group, slot 1 of a
+    // the window behind a non-chunk point of a sliding group, slot 1 of a
     // State group at a non-chunk point, nothing for a replayable one.
     // The one source for cacheCompletedBlocksForGroup and for
     // PublishedDataSlotsAfter.
-    std::vector<PublishedRange> completedBlockRanges(std::size_t group_index, const CompletedPages& completed) const;
+    std::optional<PublishedRange> completedBlockRange(std::size_t group_index, const CompletedPages& completed) const;
     // The key of table slot `block` of a History group at a publication point:
     // its page's chain hash below the full pages, the tail hash from there on.
     CacheKey historyBlockKey(std::size_t group_index, const CompletedPages& completed, std::int32_t block) const;

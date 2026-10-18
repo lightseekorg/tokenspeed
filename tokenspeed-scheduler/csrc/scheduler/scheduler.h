@@ -223,9 +223,10 @@ private:
                                   const RequestProgress& progress);
     void registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page);
-    // The descriptors a publication mutates: its newly hashed full pages and,
-    // at a tail, the partial page under its tail hash (token_ids = the rows
-    // below T, parent = the last full page).
+    // The descriptors a publication mutates: every full page it publishes into
+    // (a window can reach back into pages a drain dropped) and, at a tail, the
+    // partial page under its tail hash (token_ids = the rows below T, parent =
+    // the last full page).
     void registerKvEventPublication(const Request& request, std::span<const std::string> prefix_hashes,
                                     const CompletedPages& completed);
     void markKvEventBoundaryForReconcile(const CacheKey& boundary);

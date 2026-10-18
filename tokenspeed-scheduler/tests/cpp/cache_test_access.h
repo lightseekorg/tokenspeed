@@ -62,17 +62,15 @@ inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const st
 inline void CacheFullBlocksForTest(CacheCoordinator& coordinator, std::span<BlockTable> tables,
                                    std::span<const std::string> content_hashes, std::int32_t first_slot = 0) {
     coordinator.CacheFullBlocks(tables, content_hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
-                                first_slot, CacheBoundaryKind::kChunk);
+                                first_slot);
 }
 
 // Publishes the newly hashed pages [first_new_prefix_page, prefix_hashes.size())
-// at a page-aligned point; publish_state marks it a natural checkpoint of the
-// State groups (their slot 1 is registered under the last page's hash).
+// at a page-aligned point; publish_state marks it a natural checkpoint.
 inline void CacheCompletedBlocksForTest(CacheCoordinator& coordinator, std::span<BlockTable> tables,
                                         std::span<const std::string> prefix_hashes, std::uint64_t access_epoch,
                                         std::int32_t first_new_prefix_page, std::int32_t num_computed_tokens,
-                                        CacheBoundaryKind boundary_kind, bool stream_completed_to_host,
-                                        bool publish_state) {
+                                        bool stream_completed_to_host, bool publish_state) {
     _assert(tables.size() == static_cast<std::size_t>(coordinator.NumGroups()), "tables/groups size mismatch");
     _assert(first_new_prefix_page >= 0 && static_cast<std::size_t>(first_new_prefix_page) < prefix_hashes.size(),
             "completed page range must be non-empty");
@@ -82,7 +80,6 @@ inline void CacheCompletedBlocksForTest(CacheCoordinator& coordinator, std::span
                 .prefix_hashes = prefix_hashes,
                 .first_new_prefix_page = first_new_prefix_page,
                 .publish_state = publish_state,
-                .boundary_kind = boundary_kind,
                 .stream_completed_to_host = stream_completed_to_host,
             },
         .num_computed_tokens = num_computed_tokens,

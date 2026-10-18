@@ -166,7 +166,6 @@ TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
                                      CompletedPages{
                                          .prefix_hashes = hashes2,
                                          .first_new_prefix_page = 0,
-                                         .boundary_kind = CacheBoundaryKind::kChunk,
                                      },
                                  .num_computed_tokens = 4,
                              }));
@@ -177,9 +176,9 @@ TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
     }
 }
 
-// Register-before-punch: CacheFullBlocks skips holes, so punched pages' hashes
-// must be registered before the slide.
-TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
+// The admission after a natural point at 8 publishes only the window behind
+// it; the slid SWA pages are freed uncached.
+TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndPublishesOnlyTheWindow) {
     BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     CacheCoordinator coordinator = MakeTwoGroup(pool);  // page=2, W=4
     std::vector<BlockTable> tables(coordinator.NumGroups());
@@ -202,7 +201,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
                                      CompletedPages{
                                          .prefix_hashes = hashes,
                                          .first_new_prefix_page = 0,
-                                         .boundary_kind = CacheBoundaryKind::kChunk,
+                                         .publish_state = true,
                                      },
                                  .num_computed_tokens = 8,
                              }));
@@ -253,7 +252,6 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
                                      CompletedPages{
                                          .prefix_hashes = hashes,
                                          .first_new_prefix_page = 0,
-                                         .boundary_kind = CacheBoundaryKind::kChunk,
                                      },
                                  .num_computed_tokens = 12,
                              }));
@@ -330,7 +328,6 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
                                      CompletedPages{
                                          .prefix_hashes = hashes,
                                          .first_new_prefix_page = 2,
-                                         .boundary_kind = CacheBoundaryKind::kChunk,
                                      },
                                  .num_computed_tokens = 8,
                              }));

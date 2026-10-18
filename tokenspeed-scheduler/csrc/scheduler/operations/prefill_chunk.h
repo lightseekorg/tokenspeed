@@ -27,8 +27,8 @@
 namespace tokenspeed {
 
 // How a local prefill chunk is cut. A chunk is min(budget, unscheduled)
-// shaped by what the cache groups need: a junction cut when a hit's KV
-// coverage reached further than its state checkpoint; for replayable groups
+// shaped by what the cache groups need: a junction cut when a hit's closed
+// groups reached further than its natural checkpoint; for replayable groups
 // the re-fed window is debited from a hit chunk's budget and a prompt's final
 // chunk is never shorter than the window (ChunkKeepingFinalWindow). Every
 // function here is pure token arithmetic on the coordinator's facts; the

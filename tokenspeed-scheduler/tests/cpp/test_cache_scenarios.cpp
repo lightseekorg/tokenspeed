@@ -907,15 +907,14 @@ TEST_F(PrefillSlideAdmissionSuite, LongPromptAdmittedOnlyBecausePrefillSlides) {
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
-TEST_F(PrefillSlideAdmissionSuite, InFlightStorePinsItsSourcesUntilAck) {
+TEST_F(PrefillSlideAdmissionSuite, SlidSwaPagesFundTheNextChunkWithoutWaitingForAStore) {
     // Sink ON over the LongPromptAdmittedOnlyBecausePrefillSlides math: device
     // 13 -> 12 usable, c1+c2 charge 8, c3 needs 6 = free 4 + slide credit 2.
-    // An ordinary store ticket pins its device sources until the ACK, so the
-    // slid SWA pages op1 is copying are not evictable yet: c3 waits one round
-    // for the ACK -- and waits, rather than retracting anyone (least of all
-    // itself) for capacity that the ACK is about to return.
+    // The slid SWA pages were never published (with the prefix cache off only
+    // the finish publishes a window), so no store pins them and c3 admits
+    // before op1's ACK.
     config_.disable_l2_cache = false;
-    config_.host_allocator.total_pages = 15;  // 12 streamed pages plus the finish-time tail in both groups
+    config_.host_allocator.total_pages = 15;
     scheduler_ = std::make_unique<Scheduler>(config_);
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     ASSERT_EQ(free_at_start, 12);
@@ -926,36 +925,25 @@ TEST_F(PrefillSlideAdmissionSuite, InFlightStorePinsItsSourcesUntilAck) {
     ASSERT_EQ(FindForwardBatch(c1)->request_ids.size(), 1u);
     SendForwardDone("r1");
 
-    ExecutionPlan c2 = PlanOnce();  // registers pages 0,1 both groups: streaming op1
+    ExecutionPlan c2 = PlanOnce();  // registers the full group's pages 0,1: streaming op1
     ASSERT_NE(FindForwardBatch(c2), nullptr);
     ASSERT_EQ(FindForwardBatch(c2)->request_ids.size(), 1u);
     auto wb1 = ExtractCacheOpsOfKind<WriteBackBatch>(c2);
     ASSERT_EQ(wb1.size(), 1u);
     const auto op1 = std::get<WriteBackBatch>(wb1.front());
     ASSERT_EQ(op1.op_ids.size(), 1u);
-    EXPECT_EQ(op1.src_pages.at(0).size(), 4u) << "the first completed Full+SWA pages stream together";
+    EXPECT_EQ(op1.src_pages.at(0).size(), 2u) << "a chunk end streams the full group's pages only";
     EXPECT_EQ(op1.source_pinned, std::vector<bool>{true}) << "an ordinary publication pins its sources";
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 4);
     SendForwardDone("r1");
 
-    ExecutionPlan stalled = PlanOnce();  // slide credit 2 is pinned by op1: c3 cannot admit yet
-    const ForwardBatch* stalled_forward = FindForwardBatch(stalled);
-    ASSERT_TRUE(stalled_forward == nullptr || stalled_forward->request_ids.empty())
-        << "an in-flight pinned store holds the slid pages until the ACK";
-    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(stalled).empty())
-        << "a retraction would have emitted a snapshot store; the pinned store defers retraction instead";
-    EXPECT_EQ(scheduler_->WaitingSize(), 0u) << "the prefill keeps its place; nothing was retracted";
-    EXPECT_EQ(scheduler_->PrefillSize(), 1u);
-
-    SendWriteBackDone(op1.op_ids.at(0));
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
-
-    ExecutionPlan c3 = PlanOnce();  // the ACK released the pins: slide credit 2 -> admitted; emits op2
+    ExecutionPlan c3 = PlanOnce();  // slide credit 2 from unpublished SWA pages: admitted; emits op2
     ASSERT_NE(FindForwardBatch(c3), nullptr);
-    ASSERT_EQ(FindForwardBatch(c3)->request_ids.size(), 1u) << "the ACK returns the slid pages; c3 admits";
+    ASSERT_EQ(FindForwardBatch(c3)->request_ids.size(), 1u) << "the slid SWA pages fund c3 before op1's ACK";
     auto wb2 = ExtractCacheOpsOfKind<WriteBackBatch>(c3);
     ASSERT_EQ(wb2.size(), 1u);
     const auto op2 = std::get<WriteBackBatch>(wb2.front());
+    EXPECT_EQ(op2.src_pages.at(0).size(), 2u);
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
 
     SendForwardDone("r1", {99});
@@ -966,20 +954,22 @@ TEST_F(PrefillSlideAdmissionSuite, InFlightStorePinsItsSourcesUntilAck) {
     auto wb3 = ExtractCacheOpsOfKind<WriteBackBatch>(decode);
     ASSERT_EQ(wb3.size(), 1u);
     const auto op3 = std::get<WriteBackBatch>(wb3.front());
+    EXPECT_EQ(op3.src_pages.at(0).size(), 2u) << "full pages 4,5";
 
     SendForwardDone("r1", {100});
     SendFinish("r1");
-    ExecutionPlan finish = PlanOnce();  // the partial page at token 13 streams as a tail (full + swa)
+    ExecutionPlan finish = PlanOnce();  // the finish at token 13 streams the tails and the SWA window
     auto wb4 = ExtractCacheOpsOfKind<WriteBackBatch>(finish);
     ASSERT_EQ(wb4.size(), 1u);
     const auto op4 = std::get<WriteBackBatch>(wb4.front());
-    EXPECT_EQ(op4.src_pages.at(0).size(), 2u);
+    EXPECT_EQ(op4.src_pages.at(0).size(), 3u) << "the full tail, and the SWA window behind 13: page 5 and the tail";
     EXPECT_LT(scheduler_->AvailableLcmBlocks(), free_at_start)
-        << "op2/op3/op4 still pin their sources: the pool does not balance before their ACKs";
+        << "the stores still pin their sources: the pool does not balance before their ACKs";
+    SendWriteBackDone(op1.op_ids.at(0));
     SendWriteBackDone(op2.op_ids.at(0));
     SendWriteBackDone(op3.op_ids.at(0));
     SendWriteBackDone(op4.op_ids.at(0));
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 14);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 9) << "full 6 pages + tail, SWA page 5 + tail";
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "the ACKs return every pinned source";
 }
 
@@ -5040,71 +5030,52 @@ protected:
     std::int32_t SlidingWindowTokens() const override { return 4; }
 };
 
-TEST_F(DecodeCachingSmallWindowSuite, SwaPunchedDecodePageStillHittable) {
+TEST_F(DecodeCachingSmallWindowSuite, ADivergenceInsideTheReplyResumesAtThePromptEndAndCutsAJunction) {
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
-    // RunTurnOne's fill timing, inlined because the punch round +106 must land
-    // BEFORE finish. W=4 slides on top (punched pages = (N-3)/2): +102 punches
-    // slot 0, +103 registers page 2, +104 punches slot 1, +105 registers page 3.
-    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
-    ExecutionPlan r1_prefill = PlanOnce();
-    ASSERT_NE(FindForwardBatch(r1_prefill), nullptr);
-    AdvanceOneRound("r1", 101);
-    AdvanceOneRound("r1", 102);
-    AdvanceOneRound("r1", 103);
-    AdvanceOneRound("r1", 104);
-    const auto r1_rows = AdvanceOneRound("r1", 105);
-    ASSERT_EQ(r1_rows.at("swa").size(), 5u);
-    EXPECT_EQ(r1_rows.at("swa")[0], 0);
-    EXPECT_EQ(r1_rows.at("swa")[1], 0);
-    ASSERT_GT(r1_rows.at("swa")[2], 0) << "page 2 is registered AND still live after the +105 round";
-    ASSERT_GT(r1_rows.at("swa")[3], 0);
-
-    // +106 -> N=9 -> first kept page 3: slot 2 (REGISTERED at +103) is punched;
-    // its block reaches the free list with the hash intact.
-    const auto punched = AdvanceOneRound("r1", 106);
-    EXPECT_EQ(punched.at("swa")[2], 0) << "the registered decode page must be punched by now";
-    SendForwardDone("r1", {107});  // that round's decode lands: the finish is quiescent
-    SendFinish("r1");
-    PlanOnce();  // reap
+    // r1 (W=4) publishes SWA windows only at its prompt end 4 and finish 9.
+    RunTurnOne();
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
-    // r2: same 8-token prefix + 2 new. Fixpoint (W=4, needed 2): cap =
-    // (10-1)/2 = 4, all four hashes cached (0,1,2 punched WITH hash); full
-    // matches 4, swa bounded scan keeps 4 (2 holes) -> common 4 = 8 hit tokens.
-    std::vector<std::int32_t> r2_tokens = MakeTurnTwoPrompt();
-    Submit(MakeSpecWithTokens("r2", r2_tokens));
-    ExecutionPlan plan = PlanOnce();
-    const ForwardBatch* op = FindForwardBatch(plan);
-    ASSERT_NE(op, nullptr);
-    ASSERT_EQ(op->request_ids.size(), 1u);
-
-    EXPECT_EQ(op->input_lengths.at(0), 2);
-    EXPECT_EQ(op->extend_prefix_lens.at(0), 8);
-    EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/901));
-    EXPECT_EQ(op->block_tables.at("full").at(0).size(), 6u);
-    EXPECT_EQ(op->block_tables.at("swa").at(0).size(), 6u);
-
-    const std::vector<std::int32_t> full_prefix(r1_rows.at("full").begin(), r1_rows.at("full").begin() + 4);
-    ExpectRowPrefixEq(op->block_tables.at("full").at(0), full_prefix, "full row");
-
-    // Slot 2's expected id was captured at the +105 round, before the punch.
-    const auto& swa_row = op->block_tables.at("swa").at(0);
-    ASSERT_EQ(swa_row.size(), 6u);
-    EXPECT_EQ(swa_row[0], 0) << "out-of-window slot claimed as a null hole";
-    EXPECT_EQ(swa_row[1], 0) << "out-of-window slot claimed as a null hole";
-    EXPECT_EQ(swa_row[2], r1_rows.at("swa")[2]) << "punched decode page claimed back by hash";
-    EXPECT_EQ(swa_row[3], r1_rows.at("swa")[3]);
-    EXPECT_GT(swa_row[4], 0);
-    EXPECT_GT(swa_row[5], 0);
-
-    // Pool: full claims 4 + swa claims 2 + 1 fresh/group + 1 reserved/group = 10.
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 10);
-
+    // r2 shares 8 tokens with r1 but finds no SWA window behind 8: it resumes
+    // at 4, and its first chunk is cut at the junction 8.
+    Submit(MakeSpecWithTokens("r2", MakeTurnTwoPrompt()));
+    const ExecutionPlan first_plan = PlanOnce();
+    const ForwardBatch* first = FindForwardBatch(first_plan);
+    ASSERT_NE(first, nullptr);
+    ASSERT_EQ(first->request_ids.size(), 1u);
+    EXPECT_EQ(first->extend_prefix_lens.at(0), 4);
+    EXPECT_EQ(first->input_ids, MakeTokens(/*count=*/4, /*start=*/101)) << "the chunk ends at the junction 8";
+    SendForwardDone("r2");
+    // The next chunk's admission publishes the window behind 8.
+    const ExecutionPlan second_plan = PlanOnce();
+    const ForwardBatch* second = FindForwardBatch(second_plan);
+    ASSERT_NE(second, nullptr);
+    ASSERT_EQ(second->request_ids.size(), 1u);
+    EXPECT_EQ(second->extend_prefix_lens.at(0), 8);
+    EXPECT_EQ(second->input_ids, MakeTokens(/*count=*/2, /*start=*/901));
     SendForwardDone("r2", {199});
     PlanOnce();
     SendForwardDone("r2", {200});
     SendFinish("r2");
+    PlanOnce();
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
+
+    // r3 shares the same 8 tokens and resumes at the junction.
+    std::vector<std::int32_t> r3_tokens = MakeTurnTwoPrompt();
+    r3_tokens[8] = 951;
+    r3_tokens[9] = 952;
+    Submit(MakeSpecWithTokens("r3", r3_tokens));
+    const ExecutionPlan third_plan = PlanOnce();
+    const ForwardBatch* third = FindForwardBatch(third_plan);
+    ASSERT_NE(third, nullptr);
+    ASSERT_EQ(third->request_ids.size(), 1u);
+    EXPECT_EQ(third->extend_prefix_lens.at(0), 8);
+    EXPECT_EQ(third->input_ids, MakeTokens(/*count=*/2, /*start=*/951));
+    SendForwardDone("r3", {299});
+    PlanOnce();
+    SendForwardDone("r3", {300});
+    SendFinish("r3");
     PlanOnce();
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
@@ -5170,7 +5141,7 @@ protected:
     }
 
     // Prefill -> finalize; the finalize round registers the prompt's page
-    // hashes and streams every completed Full+SWA page.
+    // hashes and streams every completed Full page; SWA streams at finish.
     ExecutionPlan RunToFinalize(const RequestSpec& spec) {
         Submit(spec);
         PlanOnce();  // prefill
@@ -5199,24 +5170,29 @@ TEST_F(StreamingSinkSuite, RegisteredPagesEmitWriteBackAndIndexOnDone) {
 
     ExecutionPlan finalize = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
     auto stream_wb = FindWriteBack(finalize);
-    ASSERT_TRUE(stream_wb.has_value()) << "finalize must stream the 4 Full + 2 SWA completed pages";
+    ASSERT_TRUE(stream_wb.has_value()) << "finalize must stream the 4 completed Full pages";
     ASSERT_EQ(stream_wb->op_ids.size(), 1u);
-    EXPECT_EQ(stream_wb->src_pages.at(0).size(), 6u);
-    EXPECT_EQ(stream_wb->dst_pages.at(0).size(), 6u);
+    EXPECT_EQ(stream_wb->src_pages.at(0).size(), 4u);
+    EXPECT_EQ(stream_wb->dst_pages.at(0).size(), 4u);
     EXPECT_EQ(stream_wb->source_pinned, std::vector<bool>{true}) << "an ordinary publication pins its sources";
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0) << "nothing indexed until WriteBackDone";
-    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 0);
+    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 2);
 
+    // The finish at 9 adds the Full tail and the SWA window (page 3 and the
+    // tail); the two free Host pages take the first two.
     ExecutionPlan finish = FinishAndReap("r1");
-    EXPECT_FALSE(FindWriteBack(finish).has_value()) << "already-streamed prefill pages must not rewrite at finish";
+    auto finish_wb = FindWriteBack(finish);
+    ASSERT_TRUE(finish_wb.has_value());
+    EXPECT_EQ(finish_wb->src_pages.at(0).size(), 2u);
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 6)
-        << "the six sources stay pinned until the ACK: the finished request's other pages return, these do not";
+        << "the six sources stay pinned until the ACKs: the finished request's other pages return, these do not";
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0);
 
     SendWriteBackDone(stream_wb->op_ids.at(0));
+    SendWriteBackDone(finish_wb->op_ids.at(0));
     PlanOnce();
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "the ACK returns the pinned sources";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "the ACKs return the pinned sources";
 }
 
 TEST_F(StreamingSinkSuite, DuplicateRegistrationsAreDroppedAtDrain) {
@@ -5225,24 +5201,26 @@ TEST_F(StreamingSinkSuite, DuplicateRegistrationsAreDroppedAtDrain) {
     ExecutionPlan finalize1 = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
     auto stream_wb1 = FindWriteBack(finalize1);
     ASSERT_TRUE(stream_wb1.has_value());
-    EXPECT_FALSE(FindWriteBack(FinishAndReap("r1")).has_value());
+    auto finish_wb1 = FindWriteBack(FinishAndReap("r1"));
+    ASSERT_TRUE(finish_wb1.has_value());
     SendWriteBackDone(stream_wb1->op_ids.at(0));
+    SendWriteBackDone(finish_wb1->op_ids.at(0));
     PlanOnce();
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
     ExecutionPlan finalize2 = RunToFinalize(MakeRequestSpec("r2", /*num_pages=*/4));  // identical tokens
     EXPECT_FALSE(FindWriteBack(finalize2).has_value()) << "already-indexed keys must not re-emit a write-back";
-    // r1's finish found the Host pool fully in flight, so its tail never
-    // reached Host; r2's identical tail is the first store of that key and
-    // replaces two committed, unpinned entries in the 6-page pool.
+    // r1's finish found two free Host pages for three entries, so its SWA tail
+    // never reached Host; r2's identical SWA tail is the first store of that
+    // key and replaces one committed, unpinned entry in the 6-page pool.
     ExecutionPlan finish2 = FinishAndReap("r2");
     auto finish_wb2 = FindWriteBack(finish2);
     ASSERT_TRUE(finish_wb2.has_value());
-    EXPECT_EQ(finish_wb2->src_pages.at(0).size(), 2u) << "the tail with token 9001, in both groups";
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 2)
-        << "duplicate candidates are unpinned at drain; only the tail's sources are pinned";
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
+    EXPECT_EQ(finish_wb2->src_pages.at(0).size(), 1u) << "the SWA tail with token 9001";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 1)
+        << "duplicate candidates are unpinned at drain; only the SWA tail's source is pinned";
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 5);
     SendWriteBackDone(finish_wb2->op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
@@ -5254,7 +5232,8 @@ TEST_F(StreamingSinkSuite, HostPoolExhaustionSkipsSilently) {
     ExecutionPlan finalize1 = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
     auto stream_wb1 = FindWriteBack(finalize1);
     ASSERT_TRUE(stream_wb1.has_value());
-    EXPECT_FALSE(FindWriteBack(FinishAndReap("r1")).has_value());
+    auto finish_wb1 = FindWriteBack(FinishAndReap("r1"));
+    ASSERT_TRUE(finish_wb1.has_value()) << "r1's finish takes the two Host pages left";
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 6) << "r1's six sources stay pinned in flight";
     ASSERT_EQ(scheduler_->HostPoolFreeBlocks(), 0) << "r1 holds all 6 host pages in flight";
 
@@ -5268,6 +5247,7 @@ TEST_F(StreamingSinkSuite, HostPoolExhaustionSkipsSilently) {
         << "dropped candidates pin nothing; only r1's in-flight sources are held";
 
     SendWriteBackDone(stream_wb1->op_ids.at(0));
+    SendWriteBackDone(finish_wb1->op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "everything balances after r1's commit";
 }
@@ -5276,25 +5256,31 @@ TEST_F(StreamingSinkSuite, CommittedColdEntriesAreReplacedWhenHostPoolIsFull) {
     ExecutionPlan finalize1 = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
     auto stream_wb1 = FindWriteBack(finalize1);
     ASSERT_TRUE(stream_wb1.has_value());
-    EXPECT_FALSE(FindWriteBack(FinishAndReap("r1")).has_value());
+    auto finish_wb1 = FindWriteBack(FinishAndReap("r1"));
+    ASSERT_TRUE(finish_wb1.has_value());
     SendWriteBackDone(stream_wb1->op_ids.at(0));
+    SendWriteBackDone(finish_wb1->op_ids.at(0));
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     ASSERT_EQ(scheduler_->HostPoolFreeBlocks(), 0);
 
     ExecutionPlan finalize2 = RunToFinalize(MakeRequestSpec("r2", /*num_pages=*/4, /*start=*/501));
     auto stream_wb2 = FindWriteBack(finalize2);
     ASSERT_TRUE(stream_wb2.has_value()) << "committed, unpinned Host entries are replaceable";
-    EXPECT_EQ(stream_wb2->src_pages.at(0).size(), 6u);
-    EXPECT_FALSE(FindWriteBack(FinishAndReap("r2")).has_value());
+    EXPECT_EQ(stream_wb2->src_pages.at(0).size(), 4u);
+    // r2's finish replaces r1's two remaining committed entries.
+    auto finish_wb2 = FindWriteBack(FinishAndReap("r2"));
+    ASSERT_TRUE(finish_wb2.has_value());
+    EXPECT_EQ(finish_wb2->src_pages.at(0).size(), 2u);
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0) << "old keys are removed before replacement D2H";
     SendWriteBackDone(stream_wb2->op_ids.at(0));
+    SendWriteBackDone(finish_wb2->op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
 }
 
 TEST_F(StreamingSinkSuite, SameRoundDuplicateKeysDedupeAtDrain) {
     // Host pool with headroom (12 usable) so duplicates are dropped by the drain's batch
     // dedupe, NOT by pool exhaustion: two IDENTICAL prompts registering in one round drain
-    // 12 candidates into 6 pairs.
+    // 8 candidates into 4 pairs.
     config_.host_allocator.total_pages = 13;
     scheduler_ = std::make_unique<Scheduler>(config_);
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
@@ -5308,48 +5294,48 @@ TEST_F(StreamingSinkSuite, SameRoundDuplicateKeysDedupeAtDrain) {
     auto stream_wb = FindWriteBack(finalize);
     ASSERT_TRUE(stream_wb.has_value());
     ASSERT_EQ(stream_wb->op_ids.size(), 1u);
-    EXPECT_EQ(stream_wb->src_pages.at(0).size(), 6u) << "each Full+SWA key must be emitted at most once";
-    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 6) << "duplicates must not consume extra host pages";
+    EXPECT_EQ(stream_wb->src_pages.at(0).size(), 4u) << "each Full key must be emitted at most once";
+    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 8) << "duplicates must not consume extra host pages";
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0);
 
-    // Both prompts end with the same generated tokens, so their tails share
-    // one hash: r1's finish stores it, r2's finds it in flight and drops it.
+    // Both prompts end with the same generated tokens, so their tails and
+    // windows share keys: r1's finish stores them, r2's drops them in flight.
     // r2 finishes while its decode is still out, so it settles only when that
     // decode lands -- after r1's store was emitted.
     SendFinish("r2");
     auto tail_wb = FindWriteBack(FinishAndReap("r1"));
     ASSERT_TRUE(tail_wb.has_value());
-    EXPECT_EQ(tail_wb->src_pages.at(0).size(), 2u);
+    EXPECT_EQ(tail_wb->src_pages.at(0).size(), 3u) << "the Full tail and the SWA window behind it";
     SendForwardDone("r2", {9002});
     EXPECT_FALSE(FindWriteBack(PlanOnce()).has_value()) << "same-round duplicates must be dropped";
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 8)
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 7)
         << "one pinned source per emitted key; the dropped duplicates pin nothing";
 
     SendWriteBackDone(stream_wb->op_ids.at(0));
     SendWriteBackDone(tail_wb->op_ids.at(0));
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 8);
-    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 4) << "the eight cached host pages remain occupied";
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 7);
+    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 5) << "the seven cached host pages remain occupied";
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "the ACKs return the pinned sources";
 }
 
 TEST_F(StreamingSinkSuite, MidDrainPoolFillEmitsPartialOp) {
-    // 4 usable host pages against 6 candidates: the drain emits the 4 that fit and drops the
+    // 3 usable host pages against 4 candidates: the drain emits the 3 that fit and drops the
     // rest -- a partial op IS the contract when the pool fills mid-batch.
-    config_.host_allocator.total_pages = 5;
+    config_.host_allocator.total_pages = 4;
     scheduler_ = std::make_unique<Scheduler>(config_);
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
     ExecutionPlan finalize = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
     auto stream_wb = FindWriteBack(finalize);
     ASSERT_TRUE(stream_wb.has_value());
-    EXPECT_EQ(stream_wb->src_pages.at(0).size(), 4u) << "the drain emits the 4 Full pages that fit first";
+    EXPECT_EQ(stream_wb->src_pages.at(0).size(), 3u) << "the drain emits the 3 Full pages that fit";
     EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 0);
 
     ExecutionPlan finish = FinishAndReap("r1");
     EXPECT_FALSE(FindWriteBack(finish).has_value())
-        << "in-flight Full pages still occupy the host pool, so leftover SWA must skip";
+        << "in-flight Full pages still occupy the host pool, so the finish's entries must skip";
     SendWriteBackDone(stream_wb->op_ids.at(0));
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 3);
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "dropped candidates unpinned at drain";
 }
 
@@ -5357,18 +5343,20 @@ TEST_F(StreamingSinkSuite, DuplicateWriteBackDoneIsIgnored) {
     ExecutionPlan finalize = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
     auto stream_wb = FindWriteBack(finalize);
     ASSERT_TRUE(stream_wb.has_value());
-    EXPECT_FALSE(FindWriteBack(FinishAndReap("r1")).has_value());
+    auto finish_wb = FindWriteBack(FinishAndReap("r1"));
+    ASSERT_TRUE(finish_wb.has_value());
     const std::int32_t free_after_reap = scheduler_->AvailableLcmBlocks();
 
     SendWriteBackDone(stream_wb->op_ids.at(0));
-    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
     const std::int32_t free_after_ack = scheduler_->AvailableLcmBlocks();
-    EXPECT_EQ(free_after_ack, free_after_reap + 6) << "the ack publishes host entries and returns the six pins";
+    EXPECT_EQ(free_after_ack, free_after_reap + 4) << "the ack publishes host entries and returns the four pins";
 
     // A replayed ack must be a no-op (the ledger already retired the op).
     SendWriteBackDone(stream_wb->op_ids.at(0));
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_after_ack);
+    SendWriteBackDone(finish_wb->op_ids.at(0));
 }
 
 // ---------------------------------------------------------------------------
@@ -5794,9 +5782,9 @@ protected:
         // 21 -> 20 free: r2's first chunk holds 10 (6 ext + 4 fresh) and its second
         // chunk charges 6 with zero slide credit (ticket-held punches don't count).
         cfg.device_allocator.total_pages = 21;
-        // 36 usable: both seeding requests' pages and tails stay Host-resident
-        // (32 entries) with room for r2's own streams.
-        cfg.host_allocator.total_pages = 37;
+        // 40 usable: the three seeding requests' pages and tails stay
+        // Host-resident (36 entries) with room for r2's own streams.
+        cfg.host_allocator.total_pages = 41;
         for (auto& g : cfg.cache_groups) {
             g.total_pages = cfg.device_allocator.total_pages;
         }
@@ -5822,16 +5810,17 @@ protected:
         AckWriteBacks(FinishAndReap(spec.request_id));
     }
 
-    // r1 (4 pages) indexes 8 host entries over 2 chunks plus its tail in both
-    // groups at finish; the churn request must pop 22 free-list entries (full
-    // 10 + swa 10 + reserve 2) = the 10 fresh blocks still unused plus ALL 12
-    // of r1's cached blocks, so r1 survives host-only.
+    // r1 (4 pages) indexes 8 host entries: its full pages, the swa window
+    // behind its prompt end and its tail in both groups. One churn request
+    // evicts only 4 of r1's 8 cached blocks (its slid swa pages are reused),
+    // so a second churn evicts the rest and r1 survives host-only.
     void SeedHostThenEvictDeviceChunked() {
         RunChunkedSinkLifecycle(MakeRequestSpec("r1", /*num_pages=*/4), /*prefill_rounds=*/2);
-        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 10);
+        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 8);
         RunChunkedSinkLifecycle(MakeRequestSpec("churn", /*num_pages=*/10, /*start=*/501), /*prefill_rounds=*/5);
-        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 32);
-        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 20) << "both seeding requests fully retired";
+        RunChunkedSinkLifecycle(MakeRequestSpec("churn2", /*num_pages=*/10, /*start=*/701), /*prefill_rounds=*/5);
+        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 36);
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 20) << "the seeding requests fully retired";
     }
 };
 

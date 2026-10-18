@@ -114,16 +114,27 @@ protected:
     }
     virtual bool WithSlidingGroup() const { return false; }
 
+    // Where a run's first chunk resumed and where it ended.
+    struct FirstChunk {
+        std::int32_t hit{-1};
+        std::int32_t end{-1};
+    };
+
     // Runs one request to completion: prefill, `generated` decode steps, finish.
-    // Returns the boundary its first chunk resumed at.
-    std::int32_t Run(const std::string& id, const std::vector<std::int32_t>& prompt, std::int32_t generated,
-                     std::int32_t next_token) {
+    FirstChunk Run(const std::string& id, const std::vector<std::int32_t>& prompt, std::int32_t generated,
+                   std::int32_t next_token) {
         Submit(RequestSpec{.request_id = id, .tokens = prompt, .max_new_tokens = generated + 1});
         const ExecutionPlan prefill = PlanOnce();
         const ForwardBatch* batch = FindForwardBatch(prefill);
-        ASSERT_NE_RETURN(batch, nullptr, -1);
-        ASSERT_EQ_RETURN(batch->request_ids, std::vector<std::string>{id}, -1);
-        const std::int32_t hit = batch->extend_prefix_lens.at(0);
+        ASSERT_NE_RETURN(batch, nullptr, {});
+        ASSERT_EQ_RETURN(batch->request_ids, std::vector<std::string>{id}, {});
+        const FirstChunk first{.hit = batch->extend_prefix_lens.at(0),
+                               .end = batch->extend_prefix_lens.at(0) + batch->input_lengths.at(0)};
+        if (first.end < static_cast<std::int32_t>(prompt.size())) {
+            SendForwardDone(id);  // the junction chunk lands: KV only
+            const ExecutionPlan rest = PlanOnce();
+            ASSERT_NE_RETURN(FindForwardBatch(rest), nullptr, {});
+        }
         for (std::int32_t step = 0; step < generated; ++step) {
             SendForwardDone(id, {next_token + step});
             PlanOnce();
@@ -131,7 +142,7 @@ protected:
         SendForwardDone(id, {next_token + generated});
         SendFinish(id);
         PlanOnce();
-        return hit;
+        return first;
     }
 };
 
@@ -160,8 +171,7 @@ TEST_F(TokenLevelHitSuite, RandomStreamsResumeAtTheLongestPublishedBoundary) {
             const std::string id = "r" + std::to_string(trial) + "_" + std::to_string(r);
             const auto prompt_len = static_cast<std::int32_t>(prompt.size());
             const std::int32_t expected = OracleHit(published, prompt, prompt_len - 1);
-            const std::int32_t hit = Run(id, prompt, generated, next_token);
-            EXPECT_EQ(hit, expected) << id;
+            EXPECT_EQ(Run(id, prompt, generated, next_token).hit, expected) << id;
             next_token += generated + 1;
 
             // What this stream published: full pages below its frontier
@@ -227,14 +237,73 @@ protected:
     bool WithSlidingGroup() const override { return true; }
 };
 
-TEST_F(TokenLevelHitWithSlidingGroupSuite, ASlidingGroupFollowsTheSameBoundaries) {
-    // With an ample pool every published block of the sliding group stays
-    // cached, so its lookback behind any published boundary is intact and the
-    // joint boundary equals the closed group's.
+// The sliding group's (W=5, 4-token blocks) published blocks, keyed by the
+// token prefix up to each block's end, or up to the point for a partial one.
+class SlidingWindowOracle {
+public:
+    void Publish(const std::vector<std::int32_t>& tokens, std::int32_t point) {
+        ForEachWindowBlock(point, [&](std::int32_t prefix_tokens) {
+            (prefix_tokens % kP == 0 ? page_blocks_ : tails_).insert(Prefix(tokens, prefix_tokens));
+            return true;
+        });
+    }
+
+    // Whether the prompt's own window behind `boundary` was published.
+    bool Holds(const std::vector<std::int32_t>& prompt, std::int32_t boundary) const {
+        return ForEachWindowBlock(boundary, [&](std::int32_t prefix_tokens) {
+            return (prefix_tokens % kP == 0 ? page_blocks_ : tails_).contains(Prefix(prompt, prefix_tokens));
+        });
+    }
+
+private:
+    static constexpr std::int32_t kP = 4;
+    static constexpr std::int32_t kWindow = 5;
+
+    // Visits the key prefix length of each block holding rows
+    // [point - W + 1, point); stops at the first false.
+    template <typename Visit>
+    static bool ForEachWindowBlock(std::int32_t point, const Visit& visit) {
+        for (std::int32_t block = std::max(0, point - kWindow + 1) / kP; block * kP < point; ++block) {
+            if (!visit(std::min((block + 1) * kP, point))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static std::vector<std::int32_t> Prefix(const std::vector<std::int32_t>& tokens, std::int32_t length) {
+        return {tokens.begin(), tokens.begin() + length};
+    }
+
+    std::set<std::vector<std::int32_t>> page_blocks_;
+    std::set<std::vector<std::int32_t>> tails_;
+};
+
+// OracleHit over the boundaries the sliding group holds a window behind.
+std::int32_t OracleSlidingHit(const std::vector<PublishedStream>& published, const SlidingWindowOracle& sliding,
+                              const std::vector<std::int32_t>& prompt, std::int32_t max_tokens) {
+    std::int32_t best = 0;
+    for (const PublishedStream& stream : published) {
+        const std::int32_t common = CommonPrefix(stream.tokens, prompt);
+        for (const std::int32_t boundary : stream.boundaries) {
+            if (boundary <= common && boundary <= max_tokens && sliding.Holds(prompt, boundary)) {
+                best = std::max(best, boundary);
+            }
+        }
+    }
+    return best;
+}
+
+TEST_F(TokenLevelHitWithSlidingGroupSuite, ASlidingGroupResumesOnlyAtNaturalPoints) {
+    // With an ample pool nothing is evicted. The sliding group holds windows
+    // only behind natural points (prompt end, junction cut, finish); a prompt
+    // whose full-group coverage reaches further cuts a junction there.
     std::mt19937 rng{7};
     SetUp();
     std::vector<PublishedStream> published;
+    SlidingWindowOracle sliding;
     std::int32_t next_token = 1;
+    std::int32_t junctions = 0;
     for (std::int32_t r = 0; r < 3; ++r) {
         std::vector<std::int32_t> prompt;
         if (!published.empty()) {
@@ -242,13 +311,17 @@ TEST_F(TokenLevelHitWithSlidingGroupSuite, ASlidingGroupFollowsTheSameBoundaries
             const auto shared = static_cast<std::int32_t>(rng() % base.tokens.size()) + 1;
             prompt.assign(base.tokens.begin(), base.tokens.begin() + shared);
         }
-        for (std::int32_t i = 0; i < 7; ++i) {
+        // Long enough that a shared prefix usually ends at a junction.
+        for (std::int32_t i = 0; i < 18; ++i) {
             prompt.push_back(next_token++);
         }
         const std::int32_t generated = 3;
         const auto prompt_len = static_cast<std::int32_t>(prompt.size());
-        const std::int32_t expected = OracleHit(published, prompt, prompt_len - 1);
-        EXPECT_EQ(Run("r" + std::to_string(r), prompt, generated, next_token), expected);
+        const std::int32_t expected = OracleSlidingHit(published, sliding, prompt, prompt_len - 1);
+        const std::int32_t junction = OracleHit(published, prompt, prompt_len - 1);
+        const FirstChunk first = Run("r" + std::to_string(r), prompt, generated, next_token);
+        EXPECT_EQ(first.hit, expected) << r;
+        EXPECT_EQ(first.end, junction > expected ? junction : prompt_len) << r;
         std::vector<std::int32_t> tokens = prompt;
         for (std::int32_t step = 0; step <= generated; ++step) {
             tokens.push_back(next_token + step);
@@ -261,8 +334,16 @@ TEST_F(TokenLevelHitWithSlidingGroupSuite, ASlidingGroupFollowsTheSameBoundaries
         }
         stream.boundaries.push_back(prompt_len);
         stream.boundaries.push_back(frontier);
+        sliding.Publish(tokens, prompt_len);
+        sliding.Publish(tokens, frontier);
+        if (junction > expected) {
+            stream.boundaries.push_back(junction);
+            sliding.Publish(tokens, junction);
+            ++junctions;
+        }
         published.push_back(std::move(stream));
     }
+    EXPECT_GT(junctions, 0) << "the streams must exercise a junction cut";
     for (const PublishedStream& stream : published) {
         for (std::int32_t len = 1; len <= static_cast<std::int32_t>(stream.tokens.size()); ++len) {
             std::vector<std::int32_t> prompt(stream.tokens.begin(), stream.tokens.begin() + len);
@@ -273,7 +354,7 @@ TEST_F(TokenLevelHitWithSlidingGroupSuite, ASlidingGroupFollowsTheSameBoundaries
             const ForwardBatch* batch = FindForwardBatch(plan);
             ASSERT_NE(batch, nullptr);
             ASSERT_EQ(batch->request_ids, std::vector<std::string>{id});
-            EXPECT_EQ(batch->extend_prefix_lens.at(0), OracleHit(published, prompt, len)) << id;
+            EXPECT_EQ(batch->extend_prefix_lens.at(0), OracleSlidingHit(published, sliding, prompt, len)) << id;
             SendAbortEvent(id);
             PlanOnce();
         }
@@ -282,7 +363,8 @@ TEST_F(TokenLevelHitWithSlidingGroupSuite, ASlidingGroupFollowsTheSameBoundaries
 
 // The gpt-oss shape: full attention and a 128-token sliding window over
 // 64-token pages, no State group. A cold prompt decodes and finishes; a
-// prompt one token shorter resumes at the longest boundary both groups hold.
+// prompt one token shorter resumes at the longest boundary both groups hold,
+// and cuts a junction where only the full group holds its prefix.
 class GptOssShapeSuite : public SchedulerTestSuite {
 protected:
     static constexpr std::int32_t kP = 64;
@@ -319,7 +401,7 @@ protected:
     }
 };
 
-TEST_F(GptOssShapeSuite, APromptOneTokenShorterThanAFinishedOneResumesAtItsLastPage) {
+TEST_F(GptOssShapeSuite, APromptOneTokenShorterThanAFinishedOneCutsAJunctionAtItsLastPage) {
     const std::vector<std::int32_t> prompt = MakeTokens(276);
     Submit(RequestSpec{.request_id = "x", .tokens = prompt, .max_new_tokens = 32});
     const ExecutionPlan prefill = PlanOnce();
@@ -351,23 +433,36 @@ TEST_F(GptOssShapeSuite, APromptOneTokenShorterThanAFinishedOneResumesAtItsLastP
     SendFinish("xy");
     PlanOnce();
 
-    // X[:-1]: 275 tokens, probed up to 274. Pages 0..3 of the full group are
-    // cached and the sliding group holds the lookback behind 256, so the hit
-    // is the page boundary 256 (the tails at 276 and 299 lie beyond the bound).
+    // X[:-1]: 275 tokens, probed up to 274. The full group holds pages 0..3,
+    // but X published windows only behind 276 and 299, and the window behind
+    // 256 also needs the block [128, 144): y resumes at 0 and cuts its first
+    // chunk at the junction 256.
     std::vector<std::int32_t> shorter(prompt.begin(), prompt.end() - 1);
     Submit(RequestSpec{.request_id = "y", .tokens = shorter, .max_new_tokens = 4});
     const ExecutionPlan plan = PlanOnce();
     const ForwardBatch* batch = FindForwardBatch(plan);
     ASSERT_NE(batch, nullptr);
     ASSERT_EQ(batch->request_ids, std::vector<std::string>{"y"});
-    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{256});
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{0});
+    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{256});
+    SendForwardDone("y");
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr) << "the next chunk's admission publishes the junction";
     SendAbortEvent("y");
     PlanOnce();
 
+    // The same prompt again resumes at the junction.
+    Submit(RequestSpec{.request_id = "y2", .tokens = shorter, .max_new_tokens = 4});
+    const ExecutionPlan again_plan = PlanOnce();
+    const ForwardBatch* again = FindForwardBatch(again_plan);
+    ASSERT_NE(again, nullptr);
+    ASSERT_EQ(again->request_ids, std::vector<std::string>{"y2"});
+    EXPECT_EQ(again->extend_prefix_lens, std::vector<std::int32_t>{256});
+    SendAbortEvent("y2");
+    PlanOnce();
+
     // X[:-37]: 239 tokens, probed up to 238. The full group holds pages 0..2,
-    // but the sliding group publishes only the lookback behind its newest
-    // boundary (256) and its tails; the blocks behind 192 slid out of X's
-    // table unpublished, so no boundary below 256 is resumable.
+    // but no natural point at or below 238 holds the sliding window: z
+    // resumes at 0 and cuts its first chunk at the junction 192.
     std::vector<std::int32_t> cut(prompt.begin(), prompt.end() - 37);
     Submit(RequestSpec{.request_id = "z", .tokens = cut, .max_new_tokens = 4});
     const ExecutionPlan cut_plan = PlanOnce();
@@ -375,6 +470,7 @@ TEST_F(GptOssShapeSuite, APromptOneTokenShorterThanAFinishedOneResumesAtItsLastP
     ASSERT_NE(cut_batch, nullptr);
     ASSERT_EQ(cut_batch->request_ids, std::vector<std::string>{"z"});
     EXPECT_EQ(cut_batch->extend_prefix_lens, std::vector<std::int32_t>{0});
+    EXPECT_EQ(cut_batch->input_lengths, std::vector<std::int32_t>{192});
 }
 
 class GptOssShapeWithWholePagesSuite : public GptOssShapeSuite {

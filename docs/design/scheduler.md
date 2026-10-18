@@ -96,15 +96,15 @@ entry both prefill paths call), what each group demands for it in
 
 **Junction cut.** A chunk is never shortened to a page boundary: a prompt
 end publishes its partial page as a tail (§1.2), so a chunk ending mid-page
-costs nothing. The one cut is the *junction* of a hybrid hit: when the KV
-groups' hit `T` reaches past the longest state checkpoint `T_s`
+costs nothing. The one cut is the *junction* of a hybrid hit: when the
+full-history groups' hit `T` reaches past the longest natural checkpoint `T_s`
 (`AdmissionResult::junction_tokens`, kept in `CacheProgress::junction_tokens`
 until a chunk passes it), the first chunk after `T_s` ends exactly at `T`, so
 the natural checkpoint it leaves coincides with KV already cached and the next
 prompt sharing that prefix resumes at `T` in every group. A chunk that ends at
 the junction publishes like a prompt end (`PublicationPoint::kOwnerContinues`:
-KV tail and state) and moves off the published blocks; every other chunk end
-publishes only its completed full pages. The move-off needs fresh blocks the
+KV tail, sliding windows and state) and moves off the published blocks; every
+other chunk end publishes only its completed full pages. The move-off needs fresh blocks the
 completing chunk did not reserve, so it is best effort: when the pool cannot
 fund the copies the admission replans without the tail and the owner keeps
 its partial block private, publishing nothing at that point beyond its full
@@ -238,7 +238,10 @@ otherwise the tail hash `hash@T` the KV groups use — so one key names a
 request's progress across every group kind (`cache-concepts.md`). A published
 state block is never written again: rotation moves it to slot 0, where it is
 read only, and the next step releases the request's reference while the
-cache keeps the block.
+cache keeps the block. A sliding-window group publishes the window behind `T`
+at the same points only -- windows at every chunk end or decode page would
+fill the cache for boundaries a later prompt seldom resumes at; a prompt that
+diverges inside earlier history gets its window by a junction cut (§1).
 
 **A finish settles when its last forward has landed.** `forward::Finish`
 (and the P role's `pd::SucceededEvent`) moves a page-holding request to
@@ -275,10 +278,10 @@ instead, so the frontier still names the state the device holds
 at the longest `T` with a published state checkpoint in every State group and
 KV coverage in every token-spanned group; the state lands in slot 0 as a
 claimed cache block (a Host checkpoint is loaded into a fresh slot 0 like any
-Host hit). When the KV groups reach further than the state (`kv_tokens >
+Host hit). When the full-history groups reach further than the state (`closed_tokens >
 num_common_tokens`), the difference is the junction: the first chunk ends
 there and publishes the checkpoint the cache lacked, so the next prompt that
-shares the prefix resumes at the KV boundary in every group. No alignment is
+shares the prefix resumes there in every group. No alignment is
 ever imposed on a chunk for the state's sake, and no checkpoint is produced
 inside a forward: a chunk's state output is its own natural checkpoint.
 `CacheProgress::junction_tokens` is the only progress a State group adds to
@@ -328,7 +331,7 @@ which also carries the junction cut (§1):
   a chunk that would leave `0 < remainder < W` is shortened so exactly `W`
   remain. A junction (§1) that falls inside that final window yields: no
   chunk end satisfies both rules, so the chunk passes the junction and the
-  State groups publish their checkpoint at the prompt end instead of the
+  natural checkpoint is published at the prompt end instead of the
   request waiting forever. The model narrows its decoder to the prompt's last window, which
   must therefore arrive in one forward — as new tokens, never by re-feeding
   what an earlier chunk of the same request already computed.
@@ -951,9 +954,11 @@ harmless.
 **KV-event descriptors.** With `enable_kv_cache_events`, every Device
 publication is a mutation of a boundary that must already have its token
 descriptor (`registerKvEventPrefixPages`), and `DrainKvEvents` drops the
-descriptor of a boundary with no cached child. A boundary is `BlockStored`
-only while every group holds its child -- the State groups included, whose
-checkpoint exists only at a natural point -- so a hybrid model emits
+descriptor of a boundary with no cached child. A publication registers every
+page it lands on, including earlier pages a window or state checkpoint reaches
+back into (`CacheCoordinator::FirstPublishedPrefixPage`). A boundary is `BlockStored`
+only while every group holds its child -- the sliding-window and State groups
+included, which publish only at a natural point -- so a hybrid model emits
 `BlockStored` for its prompt end, its finish and its junction cuts, never
 for an interior chunk end's chain hash; a tail's descriptor carries the
 rows below `T` and the residency check counts a tail's blocks from it. Retraction publishes twice
@@ -1095,6 +1100,9 @@ lands in the same change as the pin, never a release apart.
   advances `num_computed_tokens`; only a hit's first chunk re-feeds, and no
   final chunk is shorter than the replay window (`ChunkKeepingFinalWindow`).
   Its request-private pages are imaged and restored like any other group's.
+- Sliding-window and State groups publish only at natural checkpoints, one
+  window or state per point (1.2); the junction is cut at the full-history
+  groups' coverage (1).
 - A prefill demand's reserve is decided once per group, by kind, in
   `ReservePrefillDemands` (1); no later step rewrites `reserve_tokens`, and the
   helper asserts it found none set.

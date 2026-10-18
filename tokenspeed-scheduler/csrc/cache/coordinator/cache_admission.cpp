@@ -117,11 +117,9 @@ private:
     // Current prefix hits are protected before candidates reach this policy.
     // A request-only block with no CacheEntry is reclaimed first. Cached
     // entries then compare request access epoch, followed within one epoch by
-    // the tier order below. Position keeps the deeper unproven non-closed
-    // boundary, while a closed prefix is reclaimed from its suffix.
+    // the tier order below; a closed prefix is reclaimed from its suffix.
     enum class EvictionTier {
         kUncached,  // physically allocated, but owned only by the request table
-        kProbationaryBoundary,
         kEstablishedBoundary,
         kClosedPrefix,
     };
@@ -303,27 +301,16 @@ private:
                                         const std::optional<PrefixCacheIndex::CachedBlockMetadata>& metadata) const {
         const std::uint64_t last_access_epoch = metadata ? metadata->last_access_epoch : 0;
         const std::int32_t logical_block_index = metadata ? metadata->logical_block_index : -1;
-        const CacheBoundaryKind boundary_kind = metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk;
         const bool is_prefix_closed = groups_[group_id].Matcher().IsPrefixClosed();
-        const bool is_probationary_boundary = !is_prefix_closed && boundary_kind == CacheBoundaryKind::kChunk &&
-                                              !(metadata && metadata->was_acquired) && logical_block_index >= 0;
         const EvictionTier eviction_tier = [&] {
             if (last_access_epoch == 0) {
                 return EvictionTier::kUncached;
             }
-            if (is_probationary_boundary) {
-                return EvictionTier::kProbationaryBoundary;
-            }
             return is_prefix_closed ? EvictionTier::kClosedPrefix : EvictionTier::kEstablishedBoundary;
         }();
-        std::int64_t position_rank = 0;
-        if (is_probationary_boundary) {
-            // Retain the longer unproven frontier.
-            position_rank = logical_block_index;
-        } else if (is_prefix_closed && logical_block_index >= 0) {
-            // Reclaim a closed prefix from its suffix.
-            position_rank = -static_cast<std::int64_t>(logical_block_index);
-        }
+        // Reclaim a closed prefix from its suffix.
+        const std::int64_t position_rank =
+            is_prefix_closed && logical_block_index >= 0 ? -static_cast<std::int64_t>(logical_block_index) : 0;
         return VictimCandidate{
             .group_id = group_id,
             .location = location,
@@ -580,7 +567,7 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
 }
 
 // The same progress without the tail it would publish: the full pages still
-// publish; the tail, the owner's move off it and the state checkpoint keyed
+// publish; the tail, the owner's move off it and the windows and state keyed
 // by it are dropped. Nothing left to publish leaves no CompletedPages.
 RequestProgress withoutTailPublication(const RequestProgress& progress) {
     RequestProgress out = progress;
@@ -662,7 +649,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     // past a tail it publishes needs a fresh copy of every published block;
     // when the pool cannot fund those copies the owner keeps its partial
     // block private instead and publishes nothing at this point -- neither
-    // the tail nor the state checkpoint keyed by it -- so a request whose
+    // the tail nor the windows and state keyed by it -- so a request whose
     // reserve covers its generation never waits on a block it did not
     // reserve. Its finish publishes the frontier later.
     RequestProgress effective = progress;
@@ -694,13 +681,13 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     const std::int32_t host_tail_tokens = plan.prefix.host.tail ? plan.prefix.host.tail->tail_tokens : 0;
     const std::int32_t admitted_tokens =
         std::max(plan.prefix.device.num_common_tokens, plan.prefix.host.num_common_tokens);
-    const std::int32_t kv_tokens = std::max(plan.prefix.device.kv_tokens, plan.prefix.host.kv_tokens);
+    const std::int32_t closed_tokens = std::max(plan.prefix.device.closed_tokens, plan.prefix.host.closed_tokens);
     const bool state_prefix_cached = plan.prefix.state_at_prompt_end.has_value();
     AcquiredPrefix acquired_prefix = acquirePrefix(std::move(plan.prefix), access_epoch);
     AdmissionResult result{
         .device_prefix_tokens = acquired_prefix.device.num_common_tokens,
         .host_prefix_tokens = acquired_prefix.host.num_common_tokens,
-        .junction_tokens = kv_tokens > admitted_tokens ? kv_tokens : 0,
+        .junction_tokens = closed_tokens > admitted_tokens ? closed_tokens : 0,
         .state_prefix_cached = state_prefix_cached,
         .access_epoch = access_epoch,
         .new_page_ids = std::vector<std::vector<std::int32_t>>(groups_.size()),
@@ -1016,7 +1003,6 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
                 .destination = destination,
                 .key = republish ? slot.key : CacheKey{},
                 .logical_block_index = slot.logical_block_index,
-                .boundary_kind = slot.boundary_kind,
             };
             // A published slot comes back from Host L2 (and is re-published at
             // the ACK); a private slot from the snapshot pool. Neither is

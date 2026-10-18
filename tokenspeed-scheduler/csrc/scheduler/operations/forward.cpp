@@ -122,9 +122,9 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
             cache_progress.prefix_hashes.empty() ? std::string{} : cache_progress.prefix_hashes.back();
         tail = request.TailPublicationAt(num_computed_tokens, prior);
     }
-    // A final point publishes the frontier's state even when its pages were
-    // all published by an earlier step (a D request leaving at a page-aligned
-    // frontier): the checkpoint is keyed by the last page's chain hash.
+    // A final point publishes the frontier's state and windows even when its
+    // pages were all published by an earlier step (a D request leaving at a
+    // page-aligned frontier): they are keyed by the last pages' chain hashes.
     const bool publish_state = point != PublicationPoint::kChunk;
     const bool state_only = publish_state && !tail && !cache_progress.prefix_hashes.empty() &&
                             num_computed_tokens == filled_prefix_pages * prefix_granularity;
@@ -135,8 +135,6 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
             .tail = tail,
             .owner_continues = point == PublicationPoint::kOwnerContinues,
             .publish_state = publish_state,
-            .boundary_kind =
-                point == PublicationPoint::kChunk ? CacheBoundaryKind::kChunk : CacheBoundaryKind::kEndpoint,
             .stream_completed_to_host = stream_completed_to_host,
         };
     }
@@ -318,11 +316,11 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
 
     const std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
-    // KV coverage beyond the state checkpoint the hit resumes from is the
+    // The closed groups' coverage beyond the hit's checkpoint is the
     // junction: the first chunk is cut there so its natural checkpoint lands
     // where the KV is already cached.
-    const std::int32_t kv_tokens = std::max(match.probe.device.kv_tokens, match.probe.host.kv_tokens);
-    const std::int32_t junction_tokens = kv_tokens > hit_tokens ? kv_tokens : 0;
+    const std::int32_t closed_tokens = std::max(match.probe.device.closed_tokens, match.probe.host.closed_tokens);
+    const std::int32_t junction_tokens = closed_tokens > hit_tokens ? closed_tokens : 0;
     _assert(junction_tokens == 0 || junction_tokens < request->PrefillSize(),
             "a junction lies inside the unmatched prompt");
 
@@ -416,8 +414,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         const std::int32_t first_extension_slot = match.probe.device.full_page_tokens / prefix_granularity;
         for (std::size_t i = 0; i < match.extension_hashes.size(); ++i) {
             coordinator_.CacheFullBlocks(tables, std::span<const std::string>(match.extension_hashes).subspan(i, 1),
-                                         admission->access_epoch, first_extension_slot + static_cast<std::int32_t>(i),
-                                         CacheBoundaryKind::kChunk);
+                                         admission->access_epoch, first_extension_slot + static_cast<std::int32_t>(i));
         }
     }
     fsm::CacheProgress cache_progress{
@@ -463,8 +460,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         .prompt_headroom_tokens = 0,
     };
     // The chunk that ended at the junction publishes its natural checkpoint
-    // (KV tail and state) and moves off the published blocks; every other
-    // chunk end publishes only its completed full pages.
+    // (KV tail, windows and state) and moves off the published blocks; every
+    // other chunk end publishes only its completed full pages.
     const bool ends_at_junction = cache_progress.junction_tokens > 0 && first_pos == cache_progress.junction_tokens;
     if (first_pos >= cache_progress.junction_tokens) {
         cache_progress.junction_tokens = 0;

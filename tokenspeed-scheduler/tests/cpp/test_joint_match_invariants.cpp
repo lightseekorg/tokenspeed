@@ -73,7 +73,6 @@ std::int32_t CacheBlockFor(CacheCoordinator& coordinator, BlockPool& pool, const
     const std::int32_t id = block_ref->Location().lcm_block_id;
     coordinator.GroupPrefixIndex(group_index)
         .Register(pool, block_ref, KeyFor(content_hash, group_id), ++g_epoch, /*logical_block_index=*/-1,
-                  CacheBoundaryKind::kChunk,
                   /*newly_cached=*/nullptr);
     block_ref.reset();
     return id;

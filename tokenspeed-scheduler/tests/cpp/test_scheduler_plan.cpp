@@ -331,6 +331,49 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesATailDescriptorAtAnUnalignedFini
     EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[1]).block_hashes, page.block_hashes);
 }
 
+// Without a full-history group, a natural point's window reaches back into
+// pages whose descriptors a drain dropped; publishing it registers them again.
+class SlidingOnlyKvCacheEventTestSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = 4;
+        cfg.device_allocator.total_pages = 64;
+        cfg.host_allocator.total_pages = 0;
+        cfg.disable_l2_cache = true;
+        cfg.max_scheduled_tokens = 8;
+        cfg.max_batch_size = 8;
+        cfg.enable_kv_cache_events = true;
+        CacheGroupConfig sliding;
+        sliding.group_id = "sliding";
+        sliding.block_granularity = 2;
+        sliding.total_pages = cfg.device_allocator.total_pages;
+        sliding.attn_kind = AttnKind::kSlidingWindow;
+        sliding.sliding_window_tokens = 8;
+        cfg.cache_groups = {sliding};
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(SlidingOnlyKvCacheEventTestSuite, AWindowReachingIntoAnEarlierChunkRegistersItsPages) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/3));  // tokens 1..12: chunks [0, 8) and [8, 12)
+    PlanOnce();
+    SendForwardDone("r1");
+    PlanOnce();  // the chunk end at 8 hashes pages 0 and 1 and publishes nothing
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+    SendForwardDone("r1", {42});
+    PlanOnce();  // the prompt end at 12 publishes the window [5, 12): blocks [4, 12)
+
+    // Pages 1 and 2 have every block cached; page 0 has none.
+    std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 2u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[1]));
+    EXPECT_EQ(std::get<KvBlockStoredEvent>(events[0]).token_ids, (std::vector<std::int32_t>{5, 6, 7, 8}));
+    EXPECT_EQ(std::get<KvBlockStoredEvent>(events[1]).token_ids, (std::vector<std::int32_t>{9, 10, 11, 12}));
+}
+
 class MultiGroupKvCacheEventTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

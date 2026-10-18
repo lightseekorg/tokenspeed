@@ -24,7 +24,7 @@ Two quantities anchor the vocabulary:
   wherever it stopped writing — its prompt end, a junction cut, its finish or
   retraction (`hash@T`, the same chained hash over the page's first `T mod P`
   tokens). Two requests share cache below the longest published boundary that
-  is a prefix of both.
+  is a prefix of both and that every matched group holds.
 * **`block_granularity`** — the number of tokens covered by one block-table
   slot (one `CacheBlock`) of a history group. This is the unit in which
   kind-agnostic code (admission, capacity planning, PD slot selection)
@@ -671,7 +671,10 @@ Its responsibilities:
   page-aligned boundary when the window's first row falls inside a block;
   the tail's blocks below that window stay holes). The Host tier runs the same two phases from the Device's
   full-page coverage and wins when it reaches further by a page or a longer
-  tail; the storage tier (L3) matches full pages only. The probe is bounded
+  tail; the storage tier (L3) matches full pages only, so it serves only
+  models whose matched groups are all full-history: it never fetches a State
+  checkpoint and seldom holds a sliding group's whole window behind a page
+  boundary. The probe is bounded
   in tokens, not pages, so a hit may end exactly at the bound. `Admit` then
   allocates, pins the hit prefix, and produces host→device `load_pairs`
   plus each group's fresh pages and `pages_to_copy`. **A table never keeps a
@@ -691,7 +694,7 @@ Its responsibilities:
   are the one thing such an admission may need beyond what the completing
   chunk reserved, so they are best effort: when the plan does not fit with
   them, `Admit` replans without the tail -- the owner keeps its partial
-  block private and publishes neither the tail nor the state checkpoint
+  block private and publishes neither the tail nor the sliding windows and state
   keyed by it at that point (its full pages still publish; its finish
   publishes the frontier later). A request whose reserve covers its
   generation therefore never waits on a block it did not reserve, which is
@@ -742,8 +745,7 @@ Its responsibilities:
   request says what the request has done since the coordinator's previous
   transaction for it: what it completed (`CompletedPages`, present only when
   there is something to publish -- newly hashed pages, a tail, or at a final
-  point the frontier's state -- so "new hashes without a boundary kind"
-  cannot be expressed) and its computed-token count for retention.
+  point the frontier's state) and its computed-token count for retention.
   Publication fields are request-scoped and therefore live on the progress,
   not replicated onto every group's demand.
 
@@ -793,9 +795,10 @@ Its responsibilities:
   them, so there is no mixed Host/L3 hash to special-case.
   A State group publishes its slot 1 — the state after exactly `T` tokens —
   under the same key as the KV at `T` (the chain hash of the last page, or
-  `hash@T` for a tail), and only at a point where the owner stops writing it
+  `hash@T` for a tail), and a sliding group the blocks holding the window
+  behind `T`, both only at a point where the owner stops writing
   (`CompletedPages::publish_state`: a prompt end, a junction cut, finish,
-  retraction); a chunk end or decode step publishes no state (see
+  retraction); a chunk end or decode step publishes neither (see
   [Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
   Evicting a History block under a chain hash evicts the state checkpoints
   under that hash as well, so a state never outlives the KV it continues.
@@ -810,19 +813,18 @@ Its responsibilities:
   `pending_stores_` queue drives D2H transfers, alongside Host-side
   acquire/contains/pin queries. During prefill, each chunk end queues the
   full-attention pages it published; the prompt end (the first decode's
-  admission, or a junction cut) queues its tail and state checkpoint too;
-  the candidates are merged into a batched writeback. Ordinary decode
-  publishes history-cache Device entries but streams none of them and
-  publishes no state. At finish — and at the PD transfer ACK — every entry the
-  request published (pages, tail, state slot 1) is queued before request
-  ownership is released. Ordinary sliding-window entries always stream when
-  published. The queue is drained by
+  admission, or a junction cut) queues its tail, sliding windows and state
+  checkpoint too; the candidates are merged into a batched writeback.
+  Ordinary decode publishes full-attention Device entries but streams none
+  of them and publishes no state. At finish — and at the PD transfer ACK —
+  every entry the request published (pages, tail, sliding windows, state
+  slot 1) is queued before request ownership is released. The queue is drained by
   `TierTransferManager::StartPendingStores(guard)`, and every store it
   issues pins its Device sources until the ACK. A retraction does not use the
   queue: the scheduler publishes the victim's computed prefix the same way,
   `CacheCoordinator::PublishedDataSlots` names the data slots that are
-  published entries (with the key, logical index and boundary kind each was
-  published under), `TierTransferManager::StartRetractionStores` gives those
+  published entries (with the key and logical index each was published
+  under), `TierTransferManager::StartRetractionStores` gives those
   their Host blocks — keys already Host-cached, or carried by a store in
   flight, are pinned; the rest become one stream-ordered write-back whose
   Host entries the image pins — and `CacheCoordinator::TakeImage` places only
@@ -1060,8 +1062,8 @@ once; each cache group loads and sorts one epoch of eligible candidates at a
 time, skipping epochs whose entries are all protected or already listed for
 request reclaim. Selection compares the next candidate from each group with
 the next request-reclaimable candidate using one policy: LRU access epoch,
-then tier (uncached request-only block → probationary boundary → established
-boundary → suffix of a closed prefix). Finally, walk the selected blocks in
+then tier (uncached request-only block → established boundary of a non-closed
+group → suffix of a closed prefix). Finally, walk the selected blocks in
 reverse and restore every block that is not strictly required, yielding a
 minimal eviction set in `victims`.
 

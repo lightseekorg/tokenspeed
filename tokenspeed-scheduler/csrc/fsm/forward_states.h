@@ -45,8 +45,8 @@ struct CacheProgress {
     // history needed to publish a resumable boundary across chunk edges.
     std::vector<std::string> prefix_hashes;
     std::uint64_t access_epoch{0};
-    // The junction a chunk is cut at: the KV coverage the admission probe
-    // found beyond the state checkpoint it resumed from. The chunk ending
+    // The junction a chunk is cut at: the closed groups' coverage the probe
+    // found beyond the natural checkpoint it resumed from. The chunk ending
     // there publishes its natural checkpoint where the KV is already cached,
     // so the next prompt resumes at the junction. Zero once passed or absent.
     std::int32_t junction_tokens{0};

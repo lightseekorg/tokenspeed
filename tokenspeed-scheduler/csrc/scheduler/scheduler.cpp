@@ -286,8 +286,13 @@ void Scheduler::registerKvEventPrefixPages(const Request& request, std::span<con
 
 void Scheduler::registerKvEventPublication(const Request& request, std::span<const std::string> prefix_hashes,
                                            const CompletedPages& completed) {
-    registerKvEventPrefixPages(request, prefix_hashes, completed.first_new_prefix_page);
-    if (!config_.enable_kv_cache_events || !completed.tail) {
+    if (!config_.enable_kv_cache_events) {
+        return;
+    }
+    registerKvEventPrefixPages(
+        request, prefix_hashes,
+        std::min(completed.first_new_prefix_page, coordinator_.FirstPublishedPrefixPage(completed)));
+    if (!completed.tail) {
         return;
     }
     const auto full_pages = static_cast<std::int32_t>(prefix_hashes.size());
