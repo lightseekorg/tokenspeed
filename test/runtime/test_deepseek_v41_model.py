@@ -1074,8 +1074,8 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
     # row-local compute in between covers every row. Emulate the handoff
     # here, where no CUDA graph can run.
     def landed(original):
-        def forward(self, positions, hidden_states, ctx):
-            out = original(self, positions, hidden_states, ctx)
+        def forward(self, positions, hidden_states, ctx, *quantized):
+            out = original(self, positions, hidden_states, ctx, *quantized)
             pad = hidden_states.shape[0] - out.shape[0]
             return (
                 torch.cat((out, out.new_zeros((pad, *out.shape[1:])))) if pad else out

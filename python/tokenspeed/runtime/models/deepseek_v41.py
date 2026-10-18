@@ -93,6 +93,7 @@ from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     rmsnorm_quantize_fp8_group32,
 )
+from tokenspeed_kernel.ops.residual import mhc_apply_pre_quantize_fp8
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -637,6 +638,15 @@ def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Te
     )
 
 
+def _v41_hc_input_fp8(
+    x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """HC input, plus its group-32 FP8 codes and scales on CDNA4 (else None)."""
+    if not (x.is_cuda and current_platform().is_cdna4):
+        return _v41_hc_input(x, pre, norm), None, None
+    return mhc_apply_pre_quantize_fp8(x, pre, norm.weight, norm.variance_epsilon)
+
+
 class DeepseekV41Compressor(nn.Module):
     def __init__(self, config, layer_id: int, prefix: str):
         super().__init__()
@@ -961,7 +971,11 @@ class DeepseekV41Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
+        hidden_codes: torch.Tensor | None = None,
+        hidden_scales: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """hidden_codes/hidden_scales optionally carry hidden_states already
+        quantized for wq_a_wkv (group-32 E4M3 codes and UE8M0 scales)."""
         backend, mode = ctx.attn_backend, ctx.forward_mode
         if mode is None:
             raise ValueError("V4.1 attention requires an explicit forward mode")
@@ -970,8 +984,14 @@ class DeepseekV41Attention(nn.Module):
         # Prefill buckets pad token-local compute; cache writes and selection
         # must use only the live rows, including the decode suffix of a mixed batch.
         if current_forward_ctx() is not None:
-            positions, hidden_states = slice_to_real_tokens(
-                meta.positions.numel(), positions, hidden_states
+            positions, hidden_states, hidden_codes, hidden_scales = (
+                slice_to_real_tokens(
+                    meta.positions.numel(),
+                    positions,
+                    hidden_states,
+                    hidden_codes,
+                    hidden_scales,
+                )
             )
         if (
             positions.shape != meta.positions.shape
@@ -983,7 +1003,11 @@ class DeepseekV41Attention(nn.Module):
         if rows.keep_rows is not None and rows.keep_rows.numel() == 0:
             self._write_global_kv(hidden_states, positions, requests, backend, mode)
             return hidden_states[:0]
-        qkv, _ = self.wq_a_wkv(hidden_states, block_scale=None, output_dtype=None)
+        qkv, _ = self.wq_a_wkv(
+            hidden_states if hidden_codes is None else hidden_codes,
+            block_scale=hidden_scales,
+            output_dtype=None if hidden_codes is None else hidden_states.dtype,
+        )
         qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
         if (
             qr.is_cuda
@@ -1329,8 +1353,15 @@ class DeepseekV41DecoderLayer(nn.Module):
             if overlap:
                 for tensor in (attn_pre, post, comb):
                     tensor.record_stream(consumer)
-            x = _v41_hc_input(residual, pre_mix, self.attn_norm)
-            x = self.attn(positions, x, ctx)
+            if isinstance(self.attn.wq_a_wkv.quant_method, _ReferenceFp8LinearMethod):
+                x, codes, scales = _v41_hc_input_fp8(residual, pre_mix, self.attn_norm)
+            else:
+                x, codes, scales = (
+                    _v41_hc_input(residual, pre_mix, self.attn_norm),
+                    None,
+                    None,
+                )
+            x = self.attn(positions, x, ctx, codes, scales)
         if rows.keep_rows is not None:
             # Keep mHC's original split-K shape before selecting the tail.
             residual, post, comb, attn_pre = (
