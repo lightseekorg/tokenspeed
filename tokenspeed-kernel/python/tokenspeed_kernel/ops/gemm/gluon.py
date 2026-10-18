@@ -296,6 +296,52 @@ if platform.is_amd:
         )
         return _mm_a16w16_decode_impl(x, weight, x.dtype, counters=counters, out=out)
 
+    @register_kernel(
+        "gemm",
+        "dsv4_linear_fp32",
+        name="gluon_dsv4_linear_fp32_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    hidden_states=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            # Shapes with measured decode GEMM configs.
+            "n": frozenset({384}),
+            "k": frozenset({5120}),
+            "has_tokens": frozenset({True}),
+            "hidden_inner_stride_one": frozenset({True}),
+            "hidden_rank": frozenset({2}),
+            "weight_contiguous": frozenset({True}),
+        },
+    )
+    def gluon_dsv4_linear_fp32_gfx950(
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        enable_pdl: bool,
+    ) -> torch.Tensor:
+        """FP32 ``hidden_states @ weight.T``: the decode GEMM for its measured
+        row buckets, hipBLASLt otherwise."""
+        if enable_pdl:
+            raise ValueError("gfx950 DSV4 FP32 linear does not support PDL")
+        m, n, k = hidden_states.shape[0], weight.shape[0], weight.shape[1]
+        if not hidden_states.is_contiguous() or not _supports_mm_a16w16_decode(m, n, k):
+            return torch.mm(hidden_states, weight.t(), out_dtype=torch.float32)
+        counters = zeroed_state(
+            _mm_a16w16_decode_counters(m, n, k),
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+        return _mm_a16w16_decode_impl(
+            hidden_states, weight, torch.float32, counters=counters
+        )
+
     def _gemv_a16w16_filter(m: int, n: int, k: int) -> bool:
         return _supports_gemv_a16w16(m, n, k) and _prefers_gemv_a16w16(m, n, k)
 
