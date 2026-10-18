@@ -122,11 +122,14 @@ def test_compressor_tail_scatter_graph_strides_and_replay(device):
     dsv41.compressor_tail_scatter(content[:0], scores[:0], tail, slots[:0])
 
 
-def test_public_arguments_are_explicit():
+def test_public_argument_defaults():
     for name in dsv41.__all__:
         fn = getattr(dsv41, name)
         assert fn.__doc__, name
         for parameter in inspect.signature(fn).parameters.values():
+            if name == "index_topk" and parameter.name == "index_metadata":
+                assert parameter.default is None
+                continue
             assert (
                 parameter.default is inspect.Parameter.empty
             ), f"{name}.{parameter.name} must be explicit"
@@ -894,7 +897,8 @@ def test_optional_snapshot_quantization_oracle(device):
 
 
 @pytest.mark.parametrize("fmt", ["swa", "swa_v4"])
-def test_fused_swa_matches_rope_quantization_and_page_bytes(device, fmt):
+@pytest.mark.parametrize("normalize", [False, True])
+def test_fused_swa_matches_rope_quantization_and_page_bytes(device, fmt, normalize):
     from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
 
     torch.manual_seed(419)
@@ -912,13 +916,30 @@ def test_fused_swa_matches_rope_quantization_and_page_bytes(device, fmt):
     storage = torch.zeros((6, 64 * width + 512), device=device, dtype=torch.uint8)
     cache = storage[:, : 64 * width].view(6, 64, width)
     expected = storage.clone()[:, : 64 * width].view(6, 64, width)
-    rotated = rope_inplace(values.clone(), positions, rope, None)
+    weight = (
+        torch.randn(512, device=device, dtype=torch.bfloat16) if normalize else None
+    )
+    normalized = values
+    if normalize:
+        from tokenspeed_kernel.ops.layernorm import rmsnorm
+
+        normalized = rmsnorm(values, weight, eps=1e-6, residual=None, out=None)
+    rotated = rope_inplace(normalized.clone(), positions, rope, None)
     dsv41.cache_scatter(rotated, expected, slots, fmt)
     out = torch.empty_like(values)
-    dsv41.swa_rope_scatter(values, positions, rope, cache, slots, fmt, out)
+    dsv41.swa_rope_scatter(
+        values, positions, rope, cache, slots, fmt, out, weight, 1e-6
+    )
     reference = dsv41.cache_unpack(dsv41.cache_pack(rotated, fmt, None), fmt, None)
-    torch.testing.assert_close(out, reference, rtol=0, atol=0)
-    torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+    if normalize:
+        error = (out.float() - reference.float()).square().mean().sqrt()
+        assert error < 1e-3 * reference.float().square().mean().sqrt()
+        stored = dsv41.cache_gather(cache, slots[1:], fmt, None)
+        torch.testing.assert_close(stored, out[1:], rtol=0, atol=0)
+        assert not cache[0].any()
+    else:
+        torch.testing.assert_close(out, reference, rtol=0, atol=0)
+        torch.testing.assert_close(cache, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("fmt", ["swa_v4", "global_v4"])

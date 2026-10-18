@@ -65,6 +65,12 @@ module.exports = async function checkCommitAttribution({ github, core, context }
               `${author.email || '(missing email)'} is not linked to a GitHub account.`
             );
             failures++;
+          } else if (author.user.login.endsWith('[bot]')) {
+            core.error(
+              `Commit ${commit.oid}: ${role} resolves to GitHub bot ${author.user.login}. ` +
+              'GitHub bots cannot be commit authors or co-authors.'
+            );
+            failures++;
           }
         }
         if (!authors.pageInfo.hasNextPage) break;
@@ -91,13 +97,15 @@ module.exports = async function checkCommitAttribution({ github, core, context }
 
   if (failures) {
     core.setFailed(
-      'Fix the unlinked commit emails listed above. Each contributor must add and verify ' +
+      'Fix the commit attribution errors listed above. Replace bot authors with the ' +
+      'responsible contributor and remove bot Co-authored-by trailers. ' +
+      'For unlinked emails, each contributor must add and verify ' +
       'their email in GitHub Settings > Emails, then rerun this check; or replace it with ' +
       'their exact GitHub-provided noreply address, amend/rebase the affected commits ' +
       '(including Co-authored-by trailers), and push the updated branch. ' +
       'A matching display name alone does not link an email to an account.'
     );
   } else {
-    core.info('All commit authors and co-authors are linked to GitHub accounts.');
+    core.info('All commit authors and co-authors are linked to non-bot GitHub accounts.');
   }
 };

@@ -447,7 +447,9 @@ class MultimodalEmbedder:
         # Walk the FULL batch (including text-only / decode requests)
         # so base offsets line up with the flat input_ids tensor that
         # the caller hands us. Requests without mm input contribute
-        # nothing but still advance ``base``.
+        # nothing but still advance ``base``. DeepSeek V4.1 derives its
+        # image routing mask from the same walk (_image_mask_from_spans);
+        # change the two together.
         base = 0
         for req_idx, mm_inputs in enumerate(ctx.mm_inputs):
             if req_idx >= len(ctx.extend_seq_lens) or req_idx >= len(

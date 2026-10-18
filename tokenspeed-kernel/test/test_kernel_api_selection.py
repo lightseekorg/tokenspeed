@@ -79,6 +79,7 @@ import tokenspeed_kernel.ops.attention.rmha.gluon as _attention_gluon_rmha
 import tokenspeed_kernel.ops.attention.triton as _attention_triton_merge_state
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.cuda as _gemm_cuda
+import tokenspeed_kernel.ops.gemm.cute_dsl as _gemm_cute_dsl
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
@@ -187,6 +188,7 @@ _RELOAD_MODULES = [
     # GEMM registration modules.
     _gemm_reference,
     _gemm_cuda,
+    _gemm_cute_dsl,
     _gemm_flashinfer,
     _gemm_gluon,
     _gemm_triton,
@@ -4743,6 +4745,33 @@ def test_mxfp4_w4a8_needs_the_swiglu_clamp() -> None:
         activation_clamped=True,
     )
     assert plan["apply_kernel_name"] == "flashinfer_cutlass_mxfp4_w4a8_moe_apply"
+
+
+@pytest.mark.parametrize(
+    "platform_fixture,solution,weights_dtype,deferred",
+    [
+        ("b200_platform", "flashinfer_trtllm", torch.bfloat16, True),
+        ("h100_platform", "flashinfer_cutlass", torch.float32, False),
+    ],
+)
+def test_mxfp4_plan_preserves_consumer_weight_precision(
+    request, platform_fixture, solution, weights_dtype, deferred
+) -> None:
+    if not Platform.get().is_nvidia:
+        pytest.skip("FlashInfer registrations require NVIDIA")
+    host_platform = Platform.get()
+    try:
+        Platform.override(request.getfixturevalue(platform_fixture))
+        plan = _moe_apply_mxfp4_plan(
+            activation="swiglu",
+            ispp=2304,
+            internal_activation_dtype="input",
+            solution=solution,
+        )
+        assert plan["topk_weights_dtype"] == weights_dtype
+        assert plan["supports_deferred_finalize"] == deferred
+    finally:
+        Platform.override(host_platform)
 
 
 def test_mxfp4_fp8_activation_fails_closed_on_backends_without_a_w4a8_kernel() -> None:

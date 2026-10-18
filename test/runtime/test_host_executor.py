@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import os
 import sys
@@ -479,11 +480,16 @@ class TestGroupAwareWireTest:
 
     def test_prefetch_lane_stops_at_the_deadline_and_on_a_backend_fault(self):
         module, executor = self._prefetch_executor(batch_pages=1, timeout_base_s=1.0)
-        # The lane reads the clock once for the deadline and once before each
-        # batch: the first batch is on time, the second past the deadline.
-        clock = iter([0.0, 0.0] + [10.0] * 100)
+        # The clock advances past the deadline after the first GET, regardless
+        # of how often the control thread polls the worker's progress.
         executor.l3_store.prefetch.side_effect = lambda pages: [True] * len(pages)
-        with patch.object(module.time, "monotonic", side_effect=lambda: next(clock)):
+        with patch.object(
+            module.time,
+            "monotonic",
+            side_effect=lambda: (
+                0.0 if executor.l3_store.prefetch.call_count == 0 else 10.0
+            ),
+        ):
             executor.submit_prefetches([self._prefetch_op(module, 1, 3)])
             assert (self._settle(executor, 1)) == (1)
         assert (executor.l3_store.prefetch.call_count) == (1)
@@ -498,6 +504,56 @@ class TestGroupAwareWireTest:
         assert ([(ack.op_id, ack.landed_pages) for ack in executor.poll_results()]) == (
             [(1, 1), (2, 0)]
         )
+
+    def test_expired_queued_prefetch_acks_while_active_get_retains_its_pages(self):
+        module, executor = self._prefetch_executor(
+            batch_pages=1, timeout_base_s=1.0, rank=0
+        )
+        entered, release = threading.Event(), threading.Event()
+
+        def prefetch(pages):
+            entered.set()
+            if not release.wait(5.0):
+                raise AssertionError("test did not release the active GET")
+            return [True] * len(pages)
+
+        executor.l3_store.prefetch.side_effect = prefetch
+        clock = Mock(return_value=0.0)
+        queued = self._prefetch_op(module, 2, 1, groups=(0,))
+        queued = dataclasses.replace(
+            queued,
+            rows=(dataclasses.replace(queued.rows[0], host_page=2),),
+        )
+        try:
+            with patch.object(module.time, "monotonic", clock):
+                executor.submit_prefetches(
+                    [self._prefetch_op(module, 1, 1, groups=(0,))]
+                )
+                assert entered.wait(5.0)
+                executor.submit_prefetches([queued])
+                clock.return_value = 2.0
+                expected = {1: (False, 0), 2: (True, 0)}
+                assert executor.l3_prefetch_progress() == expected
+                # A second poll must handle the cancelled Future without raising.
+                assert executor.l3_prefetch_progress() == expected
+                assert executor._prefetch_jobs[2].future.cancelled()
+                assert not executor._prefetch_jobs[1].future.done()
+                assert executor.poll_results() == []
+                executor.complete_l3_prefetch(2, 0)
+                assert [
+                    (ack.op_id, ack.landed_pages) for ack in executor.poll_results()
+                ] == [(2, 0)]
+                release.set()
+                assert self._settle(executor, 1) == 1
+                executor.complete_l3_prefetch(1, 1)
+                assert [
+                    (ack.op_id, ack.landed_pages) for ack in executor.poll_results()
+                ] == [(1, 1)]
+                executor.l3_store.prefetch.assert_called_once()
+        finally:
+            release.set()
+            if executor._l3_prefetch_lane is not None:
+                executor._l3_prefetch_lane.shutdown(wait=True)
 
     def test_prefetch_submission_validates_the_plan_before_starting_any_job(self):
         module, executor = self._prefetch_executor()
@@ -548,10 +604,18 @@ class TestGroupAwareWireTest:
         prefetches are too, a failed one included."""
         module, executor = self._prefetch_executor()
         executor._l3_prefix_for_weight_version = lambda version: f"prefix/{version}"
-        pending, failed = Future(), Future()
+        pending, failed, cancelled = Future(), Future(), Future()
+        cancelled.cancel()
         executor._prefetch_jobs = {
-            1: module._PrefetchJob(request_id="r1", num_pages=2, future=pending),
-            2: module._PrefetchJob(request_id="r2", num_pages=2, future=failed),
+            1: module._PrefetchJob(
+                request_id="r1", num_pages=2, future=pending, deadline=float("inf")
+            ),
+            2: module._PrefetchJob(
+                request_id="r2", num_pages=2, future=failed, deadline=float("inf")
+            ),
+            3: module._PrefetchJob(
+                request_id="r3", num_pages=2, future=cancelled, deadline=float("inf")
+            ),
         }
         failed.set_exception(RuntimeError("rpc"))
         swapped = threading.Event()

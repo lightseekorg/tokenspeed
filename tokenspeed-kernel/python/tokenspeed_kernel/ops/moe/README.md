@@ -307,3 +307,19 @@ call and the Torch statements otherwise. The GPU tests
 (`test/nvidia/ops/moe/test_router_select_cuda.py`) pin Torch's FP32 sigmoid and
 K8 sum order first (a mismatch fails, never skips), then compare the two byte for
 byte on random rows, tie, edge and NaN corpora and in CUDA-graph replay.
+
+## Routing weight storage and deferred finalize
+
+`moe_plan` records the selected expert kernel's `topk_weights_dtype`. DeepSeek V4
+routing stores its weights in that dtype after FP32 scoring, normalization, and
+scaling.
+
+On NVIDIA, the DeepSeek V4 MoE defers finalization for BF16 activations
+whenever the selected kernel supports it (TRT-LLM MXFP4 SwiGLU, Triton MXFP4,
+and the other deferred-capable kernels). The kernel returns expert rows and row
+indices, and `moe_finalize_fuse_shared` combines them with the precomputed
+route weights and the shared expert output in FP32, trimming to the original
+hidden width. Some kernels (Triton MXFP4) return no weights; `MoELayer` then
+returns the precomputed route weights it passed in. FP16 inputs, ROCm builds
+without the fused finalizer, and kernels without deferred finalize keep the
+kernel's own finalized output.

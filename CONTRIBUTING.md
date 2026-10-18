@@ -28,7 +28,13 @@ The `Commit trailers` CI check requires every PR commit author and
 `Co-authored-by` email to resolve to a GitHub account. It reports the commit
 and email when attribution is missing; matching a display name is not enough.
 
-To fix a failure, add and verify the address in GitHub **Settings > Emails**
+GitHub bot accounts, whose resolved logins end in `[bot]`, cannot be commit
+authors or co-authors. A bot-authored commit can become a bot co-author when
+the PR is squash merged. Amend the author to the responsible contributor and
+remove bot `Co-authored-by` trailers. Regular user accounts with `bot` in
+their names are allowed.
+
+To fix an unlinked email, add and verify the address in GitHub **Settings > Emails**
 and rerun the check, or use the exact noreply address shown in those settings.
 If changing an address, amend or rebase the affected commits, update any
 `Co-authored-by` trailers, and push the updated branch.
@@ -36,6 +42,9 @@ If changing an address, amend or rebase the affected commits, update any
 `Signed-off-by` is a DCO attestation and remains subject to the DCO check.
 GitHub's attribution API resolves authors and co-authors, not sign-off-only
 addresses; this check does not require contributors to publish their profile email.
+
+To enforce this policy before merging, configure `Commit trailers` as a
+required status check in the repository's branch rules.
 
 ## Engineering principles
 

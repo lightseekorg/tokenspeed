@@ -944,6 +944,8 @@ def moe_topk(
         logical_to_physical_map: Optional expert-id map for sigmoid routing.
         topk_indices_dtype: Integer dtype for returned expert ids.
         topk_weights_dtype: Floating-point dtype for returned routing weights.
+            Sqrt-softplus scoring, normalization and scaling use FP32; CUDA
+            and Triton can write BF16 directly after scaling.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
     Returns:
@@ -1116,9 +1118,13 @@ def moe_topk(
             hash_indices_table,
             input_ids,
             False,
+            scaling_factor,
+            (
+                topk_weights_dtype
+                if topk_weights_dtype in (torch.float32, torch.bfloat16)
+                else torch.float32
+            ),
         )
-        if scaling_factor != 1.0:
-            topk_weights = topk_weights * scaling_factor
         return topk_weights.to(topk_weights_dtype), topk_ids.to(topk_indices_dtype)
 
 
@@ -1535,6 +1541,23 @@ def moe_plan(
     supports_deferred_finalize = True in apply_spec.traits.get(
         "supports_deferred_finalize", frozenset({False})
     )
+    topk_weights_dtypes = apply_spec.traits.get(
+        "topk_weights_dtype", frozenset({torch.float32})
+    )
+    if len(topk_weights_dtypes) != 1:
+        raise ValueError(
+            f"MoE kernel {apply_spec.name!r} must declare exactly one "
+            "topk_weights_dtype"
+        )
+    topk_weights_dtype = next(iter(topk_weights_dtypes))
+    if supports_deferred_finalize and topk_weights_dtype not in (
+        torch.float32,
+        torch.bfloat16,
+    ):
+        raise ValueError(
+            f"MoE kernel {apply_spec.name!r} uses unsupported deferred-finalize "
+            f"weight dtype {topk_weights_dtype}"
+        )
     supports_prequantized_input = True in apply_spec.traits.get(
         "supports_prequantized_input", frozenset({False})
     )
@@ -1556,6 +1579,7 @@ def moe_plan(
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
+        "topk_weights_dtype": topk_weights_dtype,
         "supports_prequantized_input": supports_prequantized_input,
         # All-to-all EP (DeepEP, Petit): each rank runs its own tokens'
         # routes, so routing may pick per-rank replicas. Otherwise every

@@ -508,7 +508,7 @@ _PREFERRED_BUCKETS: dict[tuple[int, int], frozenset[int]] = {
     (1280, 2560): frozenset({1, 4, 16}),  # shared-expert gate-up (TP1)
     (2560, 640): frozenset({1, 4, 16}),  # shared-expert down (TP1)
     (2560, 2560): frozenset({4, 16}),
-    (2560, 3072): frozenset({1, 4, 16}),  # GDN out_proj, attention o_proj
+    (2560, 3072): frozenset({4, 16}),  # GDN out_proj, attention o_proj
     (6144, 2560): frozenset({4}),
     (6656, 2560): frozenset({4, 16}),  # attention QKV with the output gate
     (512, 2560): frozenset({1, 4}),  # MoE router gate
@@ -528,7 +528,7 @@ _PREFERRED_BUCKETS: dict[tuple[int, int], frozenset[int]] = {
     (4096, 1536): frozenset({4, 16}),
     (4096, 2048): frozenset({16}),
     # DeepSeek V4.1 Flash TP4.
-    (32, 5120): frozenset({4, 16}),
+    (32, 5120): frozenset({1, 4, 16}),
 }
 
 

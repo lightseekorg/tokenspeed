@@ -172,7 +172,7 @@ class InputBuffers:
         self.active_request_mask_buf[active_bs:padded_bs].fill_(False)
 
     def init_ngram_buffers(
-        self, context_len: int, hash_params: NGramHashParams | None
+        self, context_len: int, hash_params: NGramHashParams | None, vocab_size: int
     ) -> None:
         """Allocate forward-sized, pointer-stable Engram inputs; no request cache."""
         if context_len == 0:
@@ -180,6 +180,12 @@ class InputBuffers:
         if context_len != 3 or hash_params is None:
             raise ValueError(
                 "Engram preparation requires three-token history and hash constants"
+            )
+        if hash_params.token_map.numel() < vocab_size:
+            # Preparation treats every id below vocab_size as a valid token.
+            raise ValueError(
+                f"Engram token map covers {hash_params.token_map.numel()} ids, "
+                f"fewer than the vocabulary of {vocab_size}"
             )
         self.ngram_hash_params = hash_params
         self.ngram_previous_tokens_buf = torch.full(

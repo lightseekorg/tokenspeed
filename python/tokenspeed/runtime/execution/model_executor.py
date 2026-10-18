@@ -590,6 +590,7 @@ class ModelExecutor:
         self.input_buffers.init_ngram_buffers(
             ngram_context,
             model_runner.model.get_ngram_hash_parameters() if ngram_context else None,
+            config.vocab_size,
         )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,

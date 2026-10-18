@@ -607,6 +607,11 @@ class MoELayer(torch.nn.Module):
         return self.plan.get("supports_precomputed_topk", not self.support_routing)
 
     @property
+    def topk_weights_dtype(self) -> torch.dtype:
+        """Preferred route-weight storage at the selected expert boundary."""
+        return self.plan["topk_weights_dtype"]
+
+    @property
     def topk_output_format(self):
         if self.support_routing:
             return TopKOutputFormat.BYPASSED
@@ -615,6 +620,15 @@ class MoELayer(torch.nn.Module):
     @property
     def supports_deferred_finalize(self) -> bool:
         return self.plan["supports_deferred_finalize"]
+
+    @property
+    def supports_deferred_cuda_finalize(self) -> bool:
+        """Whether callers can defer to ``moe_finalize_fuse_shared``.
+
+        That fused finalizer is a CUDA library, so other platforms keep the
+        kernel's own finalize even when the kernel can defer it.
+        """
+        return current_platform().is_nvidia and self.supports_deferred_finalize
 
     @property
     def supports_prequantized_input(self) -> bool:
@@ -667,6 +681,12 @@ class MoELayer(torch.nn.Module):
             routing_prepared: Routing metadata already populated from the
                 precomputed top-k, so the kernel skips its routing launch.
                 Only kernels advertising prepared routing accept it.
+
+        Returns:
+            Finalized ``[tokens, hidden]`` hidden states, or with
+            ``do_finalize=False`` ``(route_outputs, route_weights,
+            expanded_idx)`` for the caller's finalize. Precomputed routes
+            always come with their weights.
         """
         if not do_finalize and not self.supports_deferred_finalize:
             raise AssertionError("MoELayer does not support do_finalize=False")
@@ -722,7 +742,7 @@ class MoELayer(torch.nn.Module):
             raise ValueError(
                 "selected MoE kernel does not support precomputed top-k routing"
             )
-        return kernel_moe_apply(
+        output = kernel_moe_apply(
             self.plan,
             hidden_states,
             self,
@@ -738,3 +758,8 @@ class MoELayer(torch.nn.Module):
             x_quantized=x_quantized,
             routing_prepared=routing_prepared,
         )
+        if not do_finalize and output[1] is None:
+            # Some precomputed-route kernels (Triton MXFP4) return no route
+            # weights; finalize with the ones they were given.
+            output = (output[0], topk_output.topk_weights, output[2])
+        return output

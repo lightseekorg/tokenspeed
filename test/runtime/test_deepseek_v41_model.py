@@ -32,6 +32,7 @@ import json
 import math
 import os
 import re
+import sys
 from copy import copy
 from pathlib import Path
 from test.runtime.test_deepseek_v41_cache import R1, R2, _backend, _extend, _tables
@@ -49,6 +50,7 @@ from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 
+from tokenspeed.runtime.configs.load_config import LoadConfig
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -68,6 +70,7 @@ from tokenspeed.runtime.layers.moe import expert as expert_module
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.utils import MoeBackend
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
+from tokenspeed.runtime.model_loader import loader as loader_module
 from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
 from tokenspeed.runtime.models import deepseek_v41 as v41
 from tokenspeed.runtime.models import deepseek_v41_moe as v4
@@ -88,6 +91,11 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     is_engram_embed_checkpoint_name,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=120, suite="runtime-1gpu")
 
 _ENGRAM_INDEX = "model.safetensors.index.json"
 
@@ -278,7 +286,10 @@ class _Backend:
             output = _norm(output.to(torch.bfloat16), norm_weight, norm_eps)
         return output, row_positions, row_requests
 
-    def write_global(self, owner, main, index, positions, requests, mode):
+    def write_global(
+        self, owner, main, index, positions, requests, mode, main_rope_cache
+    ):
+        assert main_rope_cache is None
         self.global_writes[owner] = (
             main.clone(),
             index.clone(),
@@ -301,6 +312,8 @@ class _Backend:
         softmax_scale,
         index_process_group,
         swa_rope_cache,
+        swa_norm_weight,
+        swa_norm_eps,
     ):
         self.calls.append(
             (
@@ -319,6 +332,18 @@ class _Backend:
             for requests in (request_indices,)
         )
         return (q * 0.25).to(q.dtype)
+
+    def indexer_needs_scores(self, layer_id, positions, requests, mode):
+        return True
+
+    def begin_indexer_forward(self):
+        pass
+
+    def end_indexer_forward(self):
+        pass
+
+    def begin_indexer_stage(self):
+        pass
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
@@ -387,15 +412,25 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     assert output.next_token_logits.argmax(-1).item() == expected_token
 
 
-def test_reference_fp8_floor_and_rounding():
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_reference_fp8_floor_and_rounding(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
     levels = [0.0, 1e-7, 1e-4, 448.0 / 64, 449.0 / 64, 448.0, 896.0]
-    x = torch.tensor(levels, dtype=torch.float32).unsqueeze(-1).expand(-1, 32).clone()
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    x = (
+        torch.tensor(levels, dtype=dtype, device=device)
+        .unsqueeze(-1)
+        .expand(-1, 32)
+        .clone()
+    )
     x[:, ::2].neg_()
     codes, scales = v41_quantize_fp8(x)
-    amax = x.abs().amax(-1).clamp_min(1e-4)
+    amax = x.float().abs().amax(-1).clamp_min(1e-4)
     rounded = torch.tensor(
         [2.0 ** math.ceil(math.log2(float(value))) for value in amax * (1.0 / 448.0)],
         dtype=torch.float32,
+        device=device,
     )
     torch.testing.assert_close(
         scales.view(torch.float8_e8m0fnu).float().flatten(), rounded, rtol=0, atol=0
@@ -991,6 +1026,9 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
 
     (expected, expected_aux), expected_ctx = whole()
 
+    stage_refresh = Mock(wraps=backend.begin_indexer_stage)
+    monkeypatch.setattr(backend, "begin_indexer_stage", stage_refresh)
+
     ctx = _ctx(backend, 6, ForwardMode.EXTEND)
     ctx.bs = ctx.num_extends = 2
     ctx.output_layout = ForwardOutputLayout(2, 2, 0, 1)
@@ -1007,6 +1045,7 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
         image_mask=None,
     )
     # The layer-19 tap is taken below the candidate source, on every row.
+    assert stage_refresh.call_count == 1
     assert state.rows == 6 and [tap.shape[0] for tap in state.captured] == [6]
     # An encoder graph output carries a padded tail past the real rows.
     padded = v41.V41RowState(
@@ -1019,6 +1058,7 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
         [torch.cat((tap, torch.zeros_like(tap[:2]))) for tap in state.captured],
     )
     narrowed = model.narrowing_forward(padded, ctx)
+    assert stage_refresh.call_count == 2
     assert narrowed.rows == 3
     assert narrowed.positions.tolist() == [3, 0, 1]
     assert narrowed.hashes is None and narrowed.engram_token_mask is None
@@ -1053,6 +1093,7 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
             DeepseekV41Attention, "forward", landed(DeepseekV41Attention.forward)
         )
         hidden, captured = model.decoder_forward(statics, ctx)
+    assert stage_refresh.call_count == 3
     assert hidden.shape == (8, config.hidden_size)
     assert [tap.shape for tap in captured] == [(8, config.hidden_size)] * 3
     actual, aux = model.finish_forward(hidden[:3], [tap[:3] for tap in captured], ctx)
@@ -1193,6 +1234,8 @@ def test_cuda_exact_fp8_linear_and_engram_method(monkeypatch):
         torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.002)
     else:
         codes, sf = v41_quantize_fp8(x)
+        prequantized, _ = linear(codes, block_scale=sf, output_dtype=x.dtype)
+        torch.testing.assert_close(prequantized, actual, rtol=0, atol=0)
         dequant = (
             codes.float().unflatten(-1, (-1, 32))
             * sf.view(torch.float8_e8m0fnu).float().unsqueeze(-1)
@@ -1210,35 +1253,88 @@ def test_cuda_exact_fp8_linear_and_engram_method(monkeypatch):
     )
 
 
+class _TinyFp8Model(BaseCausalLM):
+    """One V4.1 FP8 projection behind the V4.1 weight-loading hooks."""
+
+    def __init__(self):
+        super().__init__(
+            config=SimpleNamespace(), mapping=SimpleNamespace(), encoder_only=True
+        )
+        self.proj = ReplicatedLinear(
+            input_size=128,
+            output_size=256,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=v41_mxfp8_config(_quant()),
+            prefix="proj",
+        )
+
+    def post_load_weights(self):
+        DeepseekV41ForCausalLM.post_load_weights(self)
+
+    def post_quant_warmup(self):
+        DeepseekV41ForCausalLM.post_quant_warmup(self)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_sharded_state_load_prepares_fp8_scales_from_loaded_state(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
+    with torch.device("cuda"):
+        source = _TinyFp8Model()
+    source.load_weights(
+        [
+            (
+                "proj.weight",
+                torch.randn(256, 128, device="cuda").to(torch.float8_e4m3fn),
+            ),
+            (
+                "proj.weight_scale_inv",
+                torch.full((8, 4), 123, device="cuda", dtype=torch.uint8),
+            ),
+        ]
+    )
+    source.proj.quant_method.process_weights_after_loading(source.proj)
+    save_file(
+        {name: value.contiguous() for name, value in source.state_dict().items()},
+        str(tmp_path / "model-rank-0-part-0.safetensors"),
+    )
+
+    def fresh_model(model_config, load_config):
+        model = _TinyFp8Model()
+        # Post-processing must not keep scales derived from pre-load contents.
+        model.proj.weight_scale_inv.data.fill_(0)
+        return model
+
+    monkeypatch.setattr(loader_module, "_initialize_model", fresh_model)
+    loader = loader_module.ShardedStateLoader(LoadConfig(load_format="sharded_state"))
+    model = loader.load_model(
+        model_config=SimpleNamespace(
+            model_path=str(tmp_path),
+            revision=None,
+            dtype=torch.bfloat16,
+            mapping=SimpleNamespace(rank=0),
+        ),
+        device_config=SimpleNamespace(device="cuda"),
+    )
+    x = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
+    torch.testing.assert_close(model.proj(x)[0], source.proj(x)[0], rtol=0, atol=0)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not current_platform().is_blackwell_plus,
     reason="requires Blackwell MXFP8",
 )
 @torch.inference_mode()
 def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
-    class TinyModel(BaseCausalLM):
-        def __init__(self):
-            super().__init__(
-                config=SimpleNamespace(), mapping=SimpleNamespace(), encoder_only=True
-            )
-            self.proj = ReplicatedLinear(
-                input_size=128,
-                output_size=256,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                quant_config=v41_mxfp8_config(_quant()),
-                prefix="proj",
-            )
-
-        def post_load_weights(self):
-            DeepseekV41ForCausalLM.post_load_weights(self)
-
     monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
     previous_pdl = pdl_enabled()
     pdl_enabled(True)
     try:
         with torch.device("cuda"):
-            model = TinyModel()
+            model = _TinyFp8Model()
         model.load_weights(
             [
                 (
@@ -1257,7 +1353,22 @@ def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
         address = native.data_ptr()
         assert set(model.state_dict()) == {"proj.weight", "proj.weight_scale_inv"}
         x = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
-        layer(x)
+        eager, _ = layer(x)
+        # Attention shares pre-quantized Q codes; they must reuse the prepared
+        # weight scales too, with only the small activation scales swizzled.
+        from tokenspeed_kernel.ops.gemm import flashinfer as gemm_flashinfer
+
+        swizzle = gemm_flashinfer.swizzle_mxfp8_scale
+
+        def activation_only(sf, m, k):
+            assert m == x.shape[0], "shared Q codes repacked the weight scales"
+            return swizzle(sf, m, k)
+
+        codes, scales = v41_quantize_fp8(x)
+        with monkeypatch.context() as patched:
+            patched.setattr(gemm_flashinfer, "swizzle_mxfp8_scale", activation_only)
+            shared = layer.quant_method.apply(layer, codes, None, scales, x.dtype)
+        torch.testing.assert_close(shared, eager, rtol=0, atol=0)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured, _ = layer(x)
@@ -1778,33 +1889,37 @@ def _assert_decode_graph_matches_eager(adapter, backend, tables, device, steps):
             captured = forward()
     torch.cuda.current_stream().wait_stream(stream)
     arena.copy_(before_capture)
-    for step, (length, actual_bs) in enumerate(steps):
-        ids.fill_(7 + step)
-        previous[0] = torch.tensor([6 + step, 4 + step, 3 + step], device=device)
-        mask[0] = bool(actual_bs)
-        hashes.copy_(adapter.model.engram_hash(ids, previous, mask))
-        before = arena.clone()
-        for replay in (False, True):
-            backend.refresh_decode_metadata(
-                2,
-                actual_bs,
-                torch.tensor([0], device=device),
-                torch.tensor([length], device=device),
-                forward_mode=ForwardMode.DECODE,
-                block_tables=tables,
-                num_extends=0,
-                for_graph_replay=replay,
-            )
-            if not replay:
-                expected = forward().clone()
-                expected_cache = arena.clone()
-                arena.copy_(before)
-            else:
-                graph.replay()
-                torch.testing.assert_close(captured, expected, rtol=0, atol=0)
-                torch.testing.assert_close(arena, expected_cache, rtol=0, atol=0)
-                assert captured.dtype == torch.float32
-                assert torch.isfinite(captured).all()
+    try:
+        for step, (length, actual_bs) in enumerate(steps):
+            ids.fill_(7 + step)
+            previous[0] = torch.tensor([6 + step, 4 + step, 3 + step], device=device)
+            mask[0] = bool(actual_bs)
+            hashes.copy_(adapter.model.engram_hash(ids, previous, mask))
+            before = arena.clone()
+            for replay in (False, True):
+                backend.refresh_decode_metadata(
+                    2,
+                    actual_bs,
+                    torch.tensor([0], device=device),
+                    torch.tensor([length], device=device),
+                    forward_mode=ForwardMode.DECODE,
+                    block_tables=tables,
+                    num_extends=0,
+                    for_graph_replay=replay,
+                )
+                if not replay:
+                    expected = forward().clone()
+                    expected_cache = arena.clone()
+                    arena.copy_(before)
+                else:
+                    graph.replay()
+                    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(arena, expected_cache, rtol=0, atol=0)
+                    assert captured.dtype == torch.float32
+                    assert torch.isfinite(captured).all()
+    finally:
+        # Release captured collectives before process-group teardown, even on failure.
+        graph.reset()
 
 
 def test_distributed_attention_tp4(monkeypatch, tmp_path):
@@ -1838,19 +1953,7 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         for name, param in sharded.named_parameters():
             source = full_params[name]
             loader = getattr(param, "weight_loader", v41.default_weight_loader)
-            if name in (
-                "wq_a.weight",
-                "wkv.weight",
-                "compressor.wkv.weight",
-                "compressor.wkv_wgate.weight",
-                "wq_a_wkv.weight",
-                "indexer.wq_b.weight",
-                "indexer.weights_proj.weight",
-                "indexer.wk.weight",
-            ):
-                loader(param, source, shard_id=None, begin_size=None)
-            else:
-                loader(param, source)
+            loader(param, source)
         pos = torch.arange(4, device=device)
         backend = _Backend(pos, torch.zeros_like(pos))
         x = torch.randn(4, 128, dtype=torch.bfloat16, device=device)
@@ -1868,6 +1971,7 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         monkeypatch.setattr(
             expert_module, "get_moe_backend", lambda: MoeBackend.MEGA_MOE
         )
+        monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
         monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
         monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 128)
         monkeypatch.setitem(global_server_args_dict, "max_num_seqs", 8)
@@ -1877,7 +1981,7 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         config.n_routed_experts = 32
         config.head_dim, config.index_head_dim = 512, 128
         config.qk_rope_head_dim, config.q_lora_rank = 64, 128
-        with torch.device(device):
+        with set_default_torch_dtype(torch.bfloat16), torch.device(device):
             adapter = DeepseekV41ForCausalLM(
                 SimpleNamespace(text_config=config),
                 mapping,
@@ -1952,6 +2056,7 @@ def _mock_loader_hardware(monkeypatch, mapping):
             "support_routing": False,
             "supports_precomputed_topk": True,
             "supports_deferred_finalize": False,
+            "topk_weights_dtype": torch.float32,
             "weight_preprocessor": None,
             "warmup": None,
         },
@@ -2538,3 +2643,66 @@ def test_snapshot_full_text_manifest_and_wo_a_dtype(monkeypatch):
                     tensor = handle.get_slice(name)
                     assert tensor.get_dtype() == "F8_E4M3"
                     assert tensor.get_shape() == [8192, 4096]
+
+
+@pytest.mark.parametrize("layer_id", [0, 20])
+def test_ced_q_input_follows_narrowed_rows(layer_id):
+    torch.manual_seed(913)
+    config = _config()
+    attn = DeepseekV41Attention(
+        config,
+        _mapping(0, 1, 1),
+        layer_id,
+        layer_id,
+        None,
+        f"layers.{layer_id}.attn",
+        aux_stream=None,
+    )
+    _initialize(attn)
+    positions = torch.arange(6)
+    requests = torch.zeros(6, dtype=torch.int64)
+    x = torch.randn(6, 128, dtype=torch.bfloat16)
+    full = _Backend(positions, requests)
+    expected = attn(positions, x, _ctx(full, 6, ForwardMode.EXTEND))
+    keep = torch.tensor([1, 3, 5])
+    query = SimpleNamespace(positions=positions[keep], request_indices=requests[keep])
+    view = V41DecoderView(query, None, (), keep, None)
+    narrowed = _Backend(positions, requests, view)
+    actual = attn(positions, x, _ctx(narrowed, 6, ForwardMode.EXTEND))
+    torch.testing.assert_close(actual, expected[keep], rtol=0, atol=0)
+    if layer_id == 20:
+        assert narrowed.global_writes[layer_id][0].shape[0] == 6
+
+
+@pytest.mark.parametrize("layer_id", [2, 20, 24])
+def test_short_history_skips_query_projections_but_preserves_keys(
+    monkeypatch, layer_id
+):
+    config = _config()
+    attention = DeepseekV41Attention(
+        config,
+        _mapping(0, 1, 1),
+        layer_id,
+        v41._ced_decoder_start(config),
+        None,
+        f"layers.{layer_id}.attn",
+        aux_stream=None,
+    )
+    _initialize(attention)
+    positions = torch.arange(4)
+    backend = _Backend(positions, torch.zeros_like(positions))
+    monkeypatch.setattr(_Backend, "indexer_needs_scores", lambda *args: False)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Short history must not project index Q or weights")
+
+    monkeypatch.setattr(attention.indexer, "forward", forbidden)
+    attention(
+        positions,
+        torch.randn(4, 128, dtype=torch.bfloat16),
+        _ctx(backend, 4, ForwardMode.EXTEND),
+    )
+    assert backend.calls[-1][3:5] == (None, None)
+    assert bool(backend.global_writes) == (layer_id in (2, 20))
+    if layer_id in (2, 20):
+        assert backend.global_writes[layer_id][1].numel() > 0

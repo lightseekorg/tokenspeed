@@ -1338,7 +1338,8 @@ def _fp8_group32_ue8m0_quantize(X, Q, S, K: tl.constexpr, X0: tl.constexpr):
     bits = raw.to(tl.int32, bitcast=True)
     exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
     scale = (exponent << 23).to(tl.float32, bitcast=True)
-    quantized = tl.div_rn(values, scale).to(tl.float8e4nv)
+    inverse_scale = 1.0 / scale
+    quantized = (values * inverse_scale).to(tl.float8e4nv)
     tl.store(Q + row * K + column, quantized)
     tl.store(S + group, exponent.to(tl.uint8))
 
@@ -1462,6 +1463,38 @@ def _gated_fp8_quantize_kernel(
     tl.store(scale_ptr + row * groups + group, scale, valid_group)
 
 
+@triton.jit(do_not_specialize=["X0"])
+def _rmsnorm_fp8_group32_ue8m0(
+    X,
+    W,
+    N,
+    Q,
+    S,
+    X0,
+    K: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.arange(0, BLOCK)
+    x = tl.load(X + row * X0 + col, col < K, 0).to(tl.float32)
+    w = tl.load(W + col, col < K, 0).to(tl.float32)
+    inv = tl.rsqrt(tl.sum(x * x, 0) / K + EPS)
+    normalized = (x * inv * w).to(N.dtype.element_ty)
+    tl.store(N + row * K + col, normalized, col < K)
+    values = tl.reshape(normalized.to(tl.float32), (BLOCK // 32, 32))
+    raw = tl.maximum(tl.max(tl.abs(values), 1), 1e-4) * (1.0 / 448.0)
+    bits = raw.to(tl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    quantized = tl.reshape(
+        values * (1.0 / (exponent << 23).to(tl.float32, bitcast=True))[:, None],
+        (BLOCK,),
+    ).to(tl.float8e4nv)
+    tl.store(Q + row * K + col, quantized, col < K)
+    groups = tl.arange(0, BLOCK // 32)
+    tl.store(S + row * (K // 32) + groups, exponent.to(tl.uint8), groups < K // 32)
+
+
 @register_kernel(
     "quantization",
     "gated_fp8",
@@ -1533,6 +1566,57 @@ def triton_gated_fp8_quantize(
             **({"launch_pdl": True} if enable_pdl else {}),
         )
     return values, scales
+
+
+@register_kernel(
+    "quantization",
+    "rmsnorm_fp8_group32_ue8m0",
+    name="triton_rmsnorm_fp8_group32_ue8m0",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def triton_rmsnorm_fp8_group32_ue8m0(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return BF16 normalized rows, E4M3 codes and canonical group-32 scales."""
+    if (
+        x.ndim != 2
+        or not x.is_cuda
+        or x.dtype != torch.bfloat16
+        or x.shape[1] <= 0
+        or x.shape[1] % 32
+        or x.stride(1) != 1
+        or weight.shape != (x.shape[1],)
+        or not weight.is_contiguous()
+        or weight.dtype != x.dtype
+        or weight.device != x.device
+        or eps <= 0
+    ):
+        raise ValueError("Expected BF16 [M,K] input and [K] weight, K divisible by 32")
+    m, k = x.shape
+    normalized = torch.empty_like(x, memory_format=torch.contiguous_format)
+    quantized = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty((m, k // 32), dtype=torch.uint8, device=x.device)
+    if m:
+        _rmsnorm_fp8_group32_ue8m0[(m,)](
+            x,
+            weight,
+            normalized,
+            quantized,
+            scales,
+            x.stride(0),
+            k,
+            eps,
+            triton.next_power_of_2(k),
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return normalized, quantized, scales
 
 
 @triton.jit

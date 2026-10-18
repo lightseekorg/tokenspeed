@@ -56,7 +56,6 @@ import os
 import shutil
 import sys
 import tempfile
-from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -83,7 +82,6 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = get_colorful_logger(__name__)
 
-DEAD_TOKEN_ID = -1
 _ENGRAM_EMBED_SUFFIXES = (".engram.embed.weight", ".engram.embed.scale")
 
 
@@ -203,41 +201,6 @@ class EngramLayout:
             head_dim=config.engram_head_dim,
             primes=tuple(primes),
         )
-
-
-def build_engram_previous_tokens(
-    token_histories: Sequence[Sequence[int]],
-    request_indices: Sequence[int],
-    positions: Sequence[int],
-) -> torch.Tensor:
-    """Return CPU int64 [tokens, 3] raw lookbacks, newest first.
-
-    Histories are existing physical-position request histories (prompt + accepted
-    output), with nonparticipating positions marked -1. For verification, supply
-    the proposed branch as well. Request indices and positions describe each
-    packed forward token, so reordering, prefix hits and chunking need no state.
-    No history is mutated or copied in full. The forward thread transfers this
-    small result; callers must overlay pending GPU-owned overlap/draft IDs there.
-    """
-    if len(request_indices) != len(positions):
-        raise ValueError("Engram request indices and positions must have equal lengths")
-    windows = []
-    for request_index, position in zip(request_indices, positions, strict=True):
-        if not 0 <= request_index < len(token_histories):
-            raise ValueError(f"Invalid Engram history request index {request_index}")
-        history = token_histories[request_index]
-        if not 0 <= position <= len(history):
-            raise ValueError(
-                f"Engram history is missing tokens before position {position}"
-            )
-        window = [
-            history[position - shift] if position >= shift else DEAD_TOKEN_ID
-            for shift in (1, 2, 3)
-        ]
-        if any(token_id < DEAD_TOKEN_ID for token_id in window):
-            raise ValueError("Mark nonparticipating history tokens with -1")
-        windows.append(window)
-    return torch.tensor(windows, dtype=torch.int64, device="cpu").reshape(-1, 3)
 
 
 class EngramHashState(nn.Module):

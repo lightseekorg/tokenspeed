@@ -640,8 +640,11 @@ For orientation, one iteration of `event_loop`:
   it) while the executor's lane fills the pages in prefix order, stopping at
   the first missing object or at the deadline -- which bounds when the next
   batch may start, not a batch in flight: the store's `batch_get_into` has
-  no timeout, so a hung get holds the single-thread lane and every later
-  prefetch, the namespace delete and shutdown behind it. Each round the hooks
+  no timeout, so a hung get holds its active Host pages, namespace deletion
+  and shutdown. The deadline is counted from submission; an expired queued
+  job becomes a zero-page miss only when cancellation proves its worker
+  never started.
+  Active I/O retains its pages until completion. Each round the hooks
   MIN-reduce every in-flight op's landed prefix across the replica; the
   converged op is acknowledged once as `PrefetchDoneEvent(op_id,
   landed_pages)`, the scheduler publishes the landed prefix in the Host

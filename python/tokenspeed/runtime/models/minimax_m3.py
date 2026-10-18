@@ -264,7 +264,7 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
                     router_logits=router_logits,
                 )
 
-            deferred_finalize = self.experts.supports_deferred_finalize
+            deferred_finalize = self.experts.supports_deferred_cuda_finalize
             routed_output = self.experts(
                 hidden_states=hidden_states,
                 topk_output=topk_output,
@@ -286,6 +286,7 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
                 expert_weights,
                 shared_output,
                 top_k=self.topk.topk_config.top_k,
+                hidden_dim=hidden_states.shape[-1],
             )
         else:
             output = (

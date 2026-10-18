@@ -433,3 +433,160 @@ class TestPreparedMxfp8:
                 block_size=[1, 32],
                 prepacked_scales=True,
             )
+
+    @pytest.mark.parametrize("rows", [1, 129])
+    def test_prepacked_mm_takes_quantized_codes_without_weight_repacking(
+        self, monkeypatch, rows
+    ):
+        from tokenspeed_kernel.ops.gemm import flashinfer as gemm_flashinfer
+
+        weight = torch.randn(256, 384, device="cuda").to(torch.float8_e4m3fn)
+        scales = torch.randint(120, 126, (256, 12), device="cuda", dtype=torch.uint8)
+        prepared = prepare_mxfp8_weight_scales(weight, scales)
+        x = torch.randn(rows, 384, device="cuda", dtype=torch.bfloat16)
+        codes, input_scales = _online_quantize_mxfp8(
+            x, [1, 32], "ue8m0", enable_pdl=False, kernel_name=None
+        )
+        expected = mm(
+            codes,
+            weight,
+            A_scales=input_scales,
+            B_scales=scales,
+            out_dtype=x.dtype,
+            quant="mxfp8",
+            block_size=[1, 32],
+            override="flashinfer_mm_mxfp8",
+        )
+        swizzle = gemm_flashinfer.swizzle_mxfp8_scale
+
+        def activation_only(sf, m, k):
+            assert m == rows, "prepacked mm repacked the weight scales"
+            return swizzle(sf, m, k)
+
+        monkeypatch.setattr(gemm_flashinfer, "swizzle_mxfp8_scale", activation_only)
+        actual = mm(
+            codes,
+            weight,
+            A_scales=input_scales,
+            B_scales=prepared,
+            out_dtype=x.dtype,
+            quant="mxfp8",
+            block_size=[1, 32],
+            prepacked_scales=True,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("argument", ["alpha", "solution", "override"])
+    def test_prepacked_mm_rejects_arguments_it_cannot_honor(self, argument):
+        weight = torch.randn(256, 128, device="cuda").to(torch.float8_e4m3fn)
+        scales = torch.full((256, 4), 123, device="cuda", dtype=torch.uint8)
+        x = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
+        extra = {
+            "alpha": {"alpha": torch.ones(1, device="cuda")},
+            "solution": {"solution": "triton"},
+            "override": {"override": "triton_mm_fp8_blockscale"},
+        }[argument]
+        with pytest.raises(ValueError, match="runs only flashinfer_mm_mxfp8"):
+            mm(
+                x,
+                weight,
+                B_scales=prepare_mxfp8_weight_scales(weight, scales),
+                out_dtype=x.dtype,
+                quant="mxfp8",
+                block_size=[1, 32],
+                prepacked_scales=True,
+                **extra,
+            )
+
+
+@pytest.mark.parametrize("rows", [0, 1, 16, 129])
+@pytest.mark.parametrize("hidden", [96, 1280])
+def test_rmsnorm_group32_quantization_replay(rows, hidden):
+    from tokenspeed_kernel.ops.layernorm import rmsnorm
+    from tokenspeed_kernel.ops.quantization.triton import (
+        triton_quantize_fp8_group32_ue8m0,
+        triton_rmsnorm_fp8_group32_ue8m0,
+    )
+
+    x = torch.randn(rows, hidden + 32, device="cuda", dtype=torch.bfloat16)[:, :hidden]
+    weight = torch.ones(hidden, device="cuda", dtype=torch.bfloat16)
+    triton_rmsnorm_fp8_group32_ue8m0(x, weight, 1e-6)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        normalized, codes, scales = triton_rmsnorm_fp8_group32_ue8m0(x, weight, 1e-6)
+    for magnitude in [1.0, 1e-8, 0.0]:
+        x.normal_().mul_(magnitude)
+        graph.replay()
+        if rows:
+            expected = rmsnorm(x, weight, 1e-6, residual=None, out=None)
+            torch.testing.assert_close(normalized, expected, rtol=0.008, atol=1e-7)
+        reference = triton_quantize_fp8_group32_ue8m0(
+            normalized, "token_group", 32, "ue8m0", False
+        )
+        for actual, expected in zip((codes, scales), reference):
+            torch.testing.assert_close(
+                actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+            )
+
+
+def test_rmsnorm_group32_quantization_dynamic_rows():
+    from tokenspeed_kernel.ops.quantization.triton import (
+        _rmsnorm_fp8_group32_ue8m0,
+        triton_rmsnorm_fp8_group32_ue8m0,
+    )
+    from utils import assert_no_triton_compile
+
+    x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    weight = torch.ones(128, device="cuda", dtype=torch.bfloat16)
+    triton_rmsnorm_fp8_group32_ue8m0(x[:17], weight, 1e-6)
+    with assert_no_triton_compile(_rmsnorm_fp8_group32_ue8m0):
+        for rows in (1, 16, 33, 64):
+            triton_rmsnorm_fp8_group32_ue8m0(x[::2][:rows], weight, 1e-6)
+
+
+def test_group32_infinite_amax_keeps_finite_codes_zero():
+    from tokenspeed_kernel.ops.quantization.triton import (
+        triton_quantize_fp8_group32_ue8m0,
+    )
+
+    x = torch.randn(2, 64, device="cuda", dtype=torch.bfloat16)
+    x[0, 3] = torch.inf
+    codes, scales = triton_quantize_fp8_group32_ue8m0(
+        x, "token_group", 32, "ue8m0", False
+    )
+    finite_codes, finite_scales = triton_quantize_fp8_group32_ue8m0(
+        x[1:], "token_group", 32, "ue8m0", False
+    )
+    # An infinite group gets the all-ones exponent and a zero reciprocal, so
+    # its finite values quantize to +-0 rather than saturating with a flipped sign.
+    assert scales[0, 0].item() == 255
+    group = codes[0, :32].float()
+    assert torch.isnan(group[3])
+    assert (group[torch.arange(32, device="cuda") != 3] == 0).all()
+    torch.testing.assert_close(
+        codes[1:].view(torch.uint8), finite_codes.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(scales[1:], finite_scales, rtol=0, atol=0)
+
+
+def test_group32_reciprocal_finite_bf16_constant_blocks():
+    from tokenspeed_kernel.ops.quantization.triton import (
+        triton_quantize_fp8_group32_ue8m0,
+    )
+
+    bits = torch.arange(65536, device="cuda", dtype=torch.int32).to(torch.int16)
+    values = bits.view(torch.bfloat16)
+    values = values[torch.isfinite(values)]
+    x = values[:, None].expand(-1, 32).contiguous()
+    codes, scales = triton_quantize_fp8_group32_ue8m0(
+        x, "token_group", 32, "ue8m0", False
+    )
+    amax = x.float().abs().amax(dim=1).clamp_min(1e-4)
+    scale = torch.exp2(torch.ceil(torch.log2(amax * (1.0 / 448.0))))
+    reference = (x.float() / scale[:, None]).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(
+        codes.view(torch.uint8), reference.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        scales.view(torch.float8_e8m0fnu).float().reshape(-1), scale, rtol=0, atol=0
+    )

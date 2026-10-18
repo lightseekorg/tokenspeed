@@ -234,8 +234,29 @@ if platform.is_amd:
         },
         priority=Priority.SPECIALIZED,
     )
-    def gluon_sqrt_softplus_topk_gfx950(*args, **kwargs):
-        return _topk_impl(*args, **kwargs)
+    def gluon_sqrt_softplus_topk_gfx950(
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        correction_bias: torch.Tensor | None,
+        hash_indices_table: torch.Tensor | None,
+        input_ids: torch.Tensor | None,
+        need_scores: bool,
+        routed_scaling_factor: float,
+        weights_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        weights, ids, scores = _topk_impl(
+            router_logits,
+            top_k,
+            renormalize,
+            correction_bias,
+            hash_indices_table,
+            input_ids,
+            need_scores,
+        )
+        if routed_scaling_factor != 1.0:
+            weights = weights * routed_scaling_factor
+        return weights.to(weights_dtype), ids, scores
 
 
 # ===-----------------------------------------------------------------------===#
@@ -797,7 +818,8 @@ if platform.is_amd:
             validated_ids = (
                 validated_ids - int(getattr(w, "ep_rank", 0)) * num_local_experts
             )
-        expert_route_ids, expert_counts = _routing(validated_ids, num_experts)
+        # The ids above are already relative to this rank, so experts start at 0.
+        expert_route_ids, expert_counts = _routing(validated_ids, num_experts, 0)
         route_output = torch.empty(
             (validated_ids.numel(), x.shape[1]), device=x.device, dtype=x.dtype
         )
