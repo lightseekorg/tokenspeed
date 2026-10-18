@@ -200,53 +200,12 @@ expert ids. With FP32 route weights the routed kernel stops before its
 finalize and `moe_finalize_fuse_shared` combines the per-route outputs with the
 FP32 weights, accumulating in FP32 and rounding once to BF16.
 
-### Portable MXFP4 experts
+## FP8 per-channel experts
 
-`triton_mxfp4_precomputed_moe_apply` accepts only the default precision policy
-and unit `output_scale`. It supports contiguous expert shards and either
-finalized output or separate local routes for deferred combination. GEMM2 stores
-expert outputs in the input dtype. The combine multiplies route weights and
-sums in FP32 before the final store, without rounding each weighted route.
-Any routed scale belongs in the route weights. Dynamic MXFP4 activations
-support FP16/BF16 inputs; weight-only MXFP4 uses BF16 inputs.
-
-### Portable FP8 per-channel experts with fused activation
-
-`triton_fp8_channel_fused_precomputed_moe_apply` implements the existing
-`moe.apply` operation with solution `triton` and the default precision policy.
-It is registered for AMD gfx950. It consumes
-contiguous BF16 inputs, concatenated gate/up FP8 E4M3 weights, FP32
-per-output-channel scales, precomputed global expert IDs and original FP32
-route weights. It accepts
-intermediate widths divisible by 32 and hidden widths divisible by 128, including
-Beam's 320/640/2560 intermediate partitions. No weight shuffle is required.
-Expert-parallel ranks filter IDs to their local contiguous expert interval;
-nonlocal routes contribute zero. The caller owns distributed reduction.
-
-On gfx950, Beam requests the default policy with precomputed routing and
-finalized output for BF16, FP8 and MXFP4 experts. Automatic selection prefers
-the specialized Gluon FP8 implementation for EP1, 256 experts, top-eight
-routing, hidden width 5120 and local intermediate width 320 or 640.
-The planner must receive `num_experts` and `top_k` to establish eligibility;
-unknown or unsupported geometry retains the Triton fallback. Explicit
-`solution="triton"` also retains this implementation on gfx950. NVIDIA
-SM90-SM103 uses the separate Triton variant with BF16-before-activation rounding.
-The Gluon algorithm is documented
-in `tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/README.md`.
-
-The first multiplication accumulates in FP32 and retains gate/up in FP32 through
-SiLU and multiplication, rounding only the resulting intermediate to BF16.
-Input quantization requests the public FP8 token operation's
-`token_fp8_min_scaling` feature, preserving the minimum scale and independently
-rounded reciprocal across implementations. The private route
-quantizer rounds the scaled product to BF16 before saturated E4M3 conversion,
-a boundary the public quantizer does not have. The second multiplication
-accumulates in FP32 and stores BF16 per route; combination retains FP32
-weights and accumulation before BF16 output.
-
-The portable implementation uses native FP8 matrix instructions with FP32
-accumulators. Internal reduction precision follows the hardware; scalar FP32
-summation is not required.
+Per-channel FP8 experts store weights in FP8 E4M3 with FP32 scales per output
+channel and quantize activations per token. FP32 routing weights remain FP32
+during combination. Native FP8 matrix arithmetic uses FP32 accumulators but
+need not match sequential FP32 arithmetic.
 
 ## Shared MoE precision policies
 

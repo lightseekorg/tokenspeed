@@ -1003,20 +1003,9 @@ barriers.
 
 ### gfx950 MHA cached extension
 
-`gluon_mha_extend_gfx950` groups query heads sharing one KV head and reuses
-each paged KV tile across several query positions. Head groups are padded
-to a power of two inside the matrix tile. Query positions advance by this
-padded head span, while global head addresses use the real group width.
-Unused head lanes never load queries or sinks and never store outputs,
-normalization values or split partials. This supports groups such as five
-and six without changing logical token/head ordering or the existing
-full-attention, sliding-window and split-reduction algorithms.
-
-The public operation remains `attention.mha_extend_with_kvcache` with
-`solution="gluon"`. BF16/FP16, 64/128-wide heads, page size 64, optional sinks
-and causal/noncausal masks follow the existing registration. CPU tile tests
-and device tests cover padded groups, speculative query blocks, chunk/tail
-prefills, ragged cached extensions and graph replay after metadata changes.
+Cached attention supports grouped-query attention even when the number of
+query heads per KV head is not a power of two. Multi-token extensions preserve
+the masking semantics of full and sliding-window attention.
 
 ### gfx950 MLA extend
 
@@ -1624,32 +1613,9 @@ the minimum expert id. The weight is the sigmoid captured for that expert.
 
 ### gfx950 channel-FP8 experts with BF16 projection operands
 
-`gluon_fp8_channel_bf16_precomputed_moe_apply` (`moe/fp8/exact_mfma.py` stages)
-serves channel-FP8 expert checkpoints on gfx950 with precomputed top-k: TP4/TP8
-with EP1, 256 local experts, hidden width 5120, local intermediate width
-640/320 respectively and top-eight routing.
-
-#### Contract
-
-- Only `precision_policy="default"` (also when omitted) with unit output
-  scale. FP8 codes and scales stay resident; projection operands are BF16, so
-  this is BF16 compute, not native FP8 MFMA or scaled-BF16 weights.
-- Expert outputs round to unweighted BF16 before the ordered FP32
-  weighted-route accumulation.
-
-#### Algorithm
-
-Grouped gate/up and down stages load FP8 codes into registers, widen them
-exactly to BF16 shared-memory operands, and accumulate matrix products in FP32.
-The gate/up projection uses an N64 output tile for local width 320; width 640
-also admits N128 tiles. The down projection uses K64 tiles for both widths.
-
-Projection epilogues apply token then channel scales with fusion disabled.
-Gate/up stay FP32 through SiLU and multiplication, then round once to BF16.
-The route quantizer rounds the scaled product to BF16 before FP8 conversion.
-Down outputs round to unweighted BF16 before ordered FP32
-weighted combine. No split-K, atomic output or materialized-weight fallback is
-used.
+Channel-scaled FP8 expert weights can remain in their compact checkpoint
+format while projections use BF16 operands and FP32 accumulation. FP8 storage
+does not require native FP8 matrix arithmetic.
 
 ## Residual
 
@@ -1870,30 +1836,6 @@ below 49,152 groups, and 256 groups and eight warps from there.
 
 ### gfx950 QK RMSNorm and SSMax query fusion
 
-`gluon_qk_rmsnorm_ssmax_gfx950` (`gfx950/layernorm/qk_rmsnorm_ssmax.py`)
-fuses the query RMSNorm producer and the SSMax positional scale of the
-`layernorm.qk_rmsnorm_ssmax` operation for six 128-wide BF16 query heads.
-
-#### Contract
-
-- BF16 rank-2 Q/K with six query heads and one KV head, head dimension 128
-  and a positive token count. Q/K rows are disjoint with a unit column
-  stride, including the 1792-column fused projection; weights are contiguous
-  BF16, positions contiguous int32/int64 and epsilon finite and positive.
-- The affine query rounds to BF16 **before** the FP32 positional scale and
-  the final BF16 store. Key normalization remains the existing shared RMSNorm
-  call.
-- Positions and row strides are runtime values, so changing positions in a
-  captured graph does not specialize the kernel.
-- A call with the optional unscaled-FP8 dequantization keeps the portable
-  operation; an explicit Gluon call with that feature raises before launch.
-
-#### Algorithm
-
-Each workgroup handles one token/head with a 128-element FP32
-sum-of-squares reduction, preserving the BF16 affine rounding before
-multiplying by `exp(0.1 * log1p((position + 1) / 2048))` in FP32 and storing
-BF16. HIP libdevice provides `log1p`/`exp`, not an approximate power or an
-`exp2` substitution, and the launch disables reassociation. The producer
-includes no output gating, rotary transform, cache write or residual
-arithmetic.
+Query normalization can be fused with position-dependent SSMax scaling while
+preserving the rounding of the separate operations. The positional scale
+applies only to queries; keys retain ordinary RMS normalization.

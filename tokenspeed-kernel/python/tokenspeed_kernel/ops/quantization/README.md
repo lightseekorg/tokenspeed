@@ -8,21 +8,10 @@ scales. Backend adapters normalize their results at this boundary.
 For a 2-D input, the row count is a selection trait (`m`), so a kernel can
 bound the rows it takes (`m_max`). On NVIDIA SM100 and newer, `token`
 quantization of up to 64 rows runs the one-launch Triton per-token quantizer.
-The portable per-token fallback is registered for AMD gfx950 and serves every
-row count.
-It computes the FP32 scale as `max(amax / 448, 1 / (448 * 512))`, multiplies
-by the independently IEEE-rounded `min(448 / amax, 448 * 512)`, and rounds
-the saturated codes to E4M3 nearest even. Zero rows have zero codes and the
-positive scale floor. This portable entry preserves leading dimensions and
-accepts strided inputs. Dependent launches are unavailable on gfx950.
-Quantizers implementing this token scale floor and independent reciprocal
-declare the `token_fp8_min_scaling` registry feature. Compressed-tensors W8A8
-loading requires this contract and an unbounded row count, so a generic
-token-group quantizer alone does not enable native dense FP8 on other GPUs.
-Callers can pass `required_features={"token_fp8_min_scaling"}` to `quantize_fp8`
-to require that arithmetic, including when overriding the implementation.
-NVIDIA quantizer registrations retain their existing hardware eligibility and
-priority.
+
+Compressed-tensors W8A8 checkpoints require per-token quantization that
+preserves their minimum positive scale and rounding behavior. Token-group
+quantization is not an interchangeable substitute.
 
 Two functions write that quantizer's codes and scales from the kernel that
 produces the activation, so no separate quantize launch follows:

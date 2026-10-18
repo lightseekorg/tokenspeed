@@ -13,19 +13,10 @@ Callers that publish directly into a collective buffer pass that buffer as
 
 ## Per-token/per-channel FP8
 
-`mm(..., quant="fp8")` accepts BF16/FP16 activations with FP8 E4M3 weights
-and FP32 per-output-channel scales. It quantizes activations per token through
-the operation registry, then accumulates the FP8 product in FP32, applies
-token and channel scales, and rounds to the requested output dtype. AMD
-gfx950 uses the portable Triton implementations. Weights stay FP8; hidden
-states and outputs stay BF16 for Beam. Empty batches return empty outputs,
-and masked partial matrix tiles contribute zero. This scale format does not
-accept block sizes or an additional alpha scale.
-
-The Triton GEMM is registered for NVIDIA SM100+ and AMD gfx950+. It uses the
-hardware's ordinary FP8 matrix arithmetic with FP32 accumulators; results need
-not match sequential FP32 arithmetic. Specialized implementations remain
-separate registry choices.
+Per-channel FP8 projections use FP8 E4M3 weights with FP32 scales per output
+channel and dynamically quantize activations per token. This scale format is
+distinct from block scaling. Native FP8 matrix arithmetic uses FP32
+accumulators but need not match sequential FP32 arithmetic.
 
 ## DeepSeek V4 grouped output projection
 

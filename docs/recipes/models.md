@@ -1406,9 +1406,6 @@ Notes:
   attention backend and the `flashinfer_trtllm` MoE backend, apply on NVIDIA
   SM100 to SM103 and were validated on SM100 (GB200) only. Beam serves without
   TF32 on every platform.
-- With `--layer-boundary-norm unfused`, each boundary applies its depth
-  coefficients to both BF16 branches, materializes their BF16 sum, then runs
-  the standalone FP32 RMSNorm and affine operation.
 - `--grammar-backend xgrammar` lets forced tool choice and JSON
   `response_format` work, and `--enable-mixed-batch
   --prefill-graph-max-tokens 8192` runs a prompt chunk in the same step as the
@@ -1440,13 +1437,8 @@ first one or two leaves larger decode batches outside the captured graph list.
 ### AMD gfx950
 
 Beam supports BF16 and compressed-tensors dynamic W8A8 FP8 checkpoints on
-gfx950. Use `mha` for target and draft GQA attention, allowing the kernel
-registry to select compatible Gluon or Triton implementations. Use
-`triton` for BF16 experts. FP8 experts with TP4/TP8 and EP1 select Gluon
-automatically; `--moe-backend triton` forces the Triton implementation.
-NVIDIA's backend defaults and sandwich all-reduce fusion remain separate.
-
-For an eight-GPU FP8 target with a BF16 DFlash2 drafter:
+gfx950. The following configuration runs an eight-GPU FP8 target with a BF16
+DFlash2 drafter, mixed prefill/decode batching, and graph replay:
 
 ```bash
 ts serve --model <beam-fp8-checkpoint-dir> \
@@ -1473,23 +1465,11 @@ arguments for target-only decoding. The context and memory fraction above
 are starting budgets, not a capacity guarantee; check the startup allocation
 for the chosen checkpoint and request lengths.
 
-The FP8 checkpoints retain their per-output-channel weight scales. Dense
-linears use the portable FP8 GEMM. The Gluon expert path keeps FP8 weights
-resident but converts their codes to BF16 projection operands; it is not
-native FP8 MFMA. The alternative `--moe-backend triton` uses the registered
-portable FP8 expert kernel. Both preserve Beam's explicit FP32 routing policy;
-they need separate numerical qualification rather than bitwise equivalence
-being assumed. The MXFP4 expert adapter is a separate path, not qualified by
-BF16 or FP8 results.
-
-The `mha` path supports the target's 6:1 and drafter's 5:1 GQA groups, cached
-extend, mixed batches and graph replay through the registered kernels. The
-existing `gluon` attention name remains MLA-only.
+This recipe covers BF16 and FP8 checkpoints, not other quantization formats.
 
 Use the gateway dependencies pinned by this checkout and the original
-checkpoint chat template. The pinned gateway supports its generation markers;
-no Beam-specific template conversion is needed. Check raw generation, parsed
-chat/tool APIs, numerical parity and performance independently before deployment.
+checkpoint chat template. Check raw generation, parsed chat/tool APIs,
+numerical parity and performance independently before deployment.
 
 ## Tuning order
 
