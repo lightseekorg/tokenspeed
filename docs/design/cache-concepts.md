@@ -1176,6 +1176,23 @@ Qwen3.5's state groups leave segments free, so its conv windows pack into them
 and KV pages carry no padding; Nemotron-3 Super's state groups fill every
 segment, so its KV pages pad by their share of the conv planes, about 1.5%.
 
+Qwen4-Exp's PLE and QSA indexer groups reuse the decoder's planes. Recent raw
+keys use the layer's K plane; recent RoPE positions use its V plane.
+Compressed keys reuse a compatible decoder plane, normally the layer's K plane;
+different target/draft KV dtypes may select another plane, and an incompatible
+index width retains its own exact-stride plane. PLE convolution state and
+context use the consuming layer's SSM/K and conv/V planes respectively. These
+remain independent cache groups: each parent has one group owner, and its
+fields use that group's page ids and strides.
+Compressed keys keep exact payload-sized page strides. PLE and recent fields
+accept explicit strides; the common packer fits their blocks into the existing
+planes, scaling the exact groups together if one flexible block is wider than a
+plane slice. Flexible-group packing counts divide each occupied plane's byte
+size while preserving element alignment.
+Groups using only some planes still leave binding holes. Their null-page
+views also alias, so invalid rows must not publish cache updates and readers
+must mask null state before using it.
+
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
 

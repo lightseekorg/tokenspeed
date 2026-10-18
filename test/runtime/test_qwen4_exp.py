@@ -1854,10 +1854,8 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     assert fields[qsa_raw_key_field(1)].shape == (4, 1, 8)
     assert fields[qsa_compressed_field(1)].shape == (64, 1, 8)
     assert fields[qsa_rope_position_field(1)].shape == (3,)
-    assert (
-        fields[qsa_raw_key_field(1)].plane_id
-        == fields[qsa_rope_position_field(1)].plane_id
-    )
+    assert fields[qsa_raw_key_field(1)].plane_id == fields["layer.1.k"].plane_id
+    assert fields[qsa_rope_position_field(1)].plane_id == fields["layer.1.v"].plane_id
     assert groups[QWEN4_EXP_PLE_CACHE_GROUP].attn_kind == "state"
     assert groups[QWEN4_EXP_QSA_CACHE_GROUP].attn_kind != "state"
     assert fields[qsa_compressed_field(1)].group_id == QWEN4_EXP_QSA_CACHE_GROUP

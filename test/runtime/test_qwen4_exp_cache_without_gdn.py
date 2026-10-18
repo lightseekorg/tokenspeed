@@ -56,9 +56,10 @@ from tokenspeed.runtime.layers.attention.registry import (
 def _recipe(
     *, layer_types: tuple[str, ...], speculative: bool, width: int
 ) -> Qwen4ExpRecipe:
+    ple_layers = tuple(range(min(2, len(layer_types))))
     text_config = SimpleNamespace(
-        ple_layer_ids=(1, 2),
-        short_conv_layer_ids=(0, 1),
+        ple_layer_ids=tuple(layer + 1 for layer in ple_layers),
+        short_conv_layer_ids=ple_layers,
         ngram_context_len=2,
         short_conv_state_shape=(4, 3),
         indexer_n_heads=1,
@@ -111,6 +112,7 @@ def _recipe(
         server_args=SimpleNamespace(
             block_size=64,
             max_total_tokens=None,
+            kv_offload_config=None,
             speculative_num_draft_tokens=width,
             speculative_eagle_topk=1,
             enable_replay_ssm=True,

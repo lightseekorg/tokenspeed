@@ -49,6 +49,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
+    LINEAR_ATTENTION,
     CacheGroupDeclaration,
     CacheGroupSpec,
     apply_pd_transfer_policies,
@@ -85,18 +86,42 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
     @property
     @override
     def max_padding_fraction(self) -> float:
-        """Allow the narrow PLE and QSA side-cache planes."""
+        """Allow groups that use only some of the shared decoder planes."""
         return float("inf")
+
+    @cached_property
+    def _decoder_groups(self) -> tuple[CacheGroupDeclaration, ...]:
+        return super().groups()
+
+    @cached_property
+    def _decoder_fields(self) -> dict[str, CacheFieldSpec]:
+        fields_by_id: dict[str, CacheFieldSpec] = {}
+        for _, fields in self._decoder_groups:
+            fields_by_id.update((field.field_id, field) for field in fields)
+        return fields_by_id
+
+    def _layer_planes(self, layer_id: int) -> tuple[str, str]:
+        """Return the planes declared for a layer's two decoder cache fields."""
+        first, second = (
+            ("ssm", "conv")
+            if self.layer_types[layer_id] == LINEAR_ATTENTION
+            else ("k", "v")
+        )
+        return (
+            self._decoder_fields[f"layer.{layer_id}.{first}"].plane_id,
+            self._decoder_fields[f"layer.{layer_id}.{second}"].plane_id,
+        )
 
     def _ple_fields(self) -> tuple[CacheFieldSpec, ...]:
         if not getattr(self._text_config, "ple_layer_ids", None):
             return ()
         ple_layer_ids = tuple(self._text_config.short_conv_layer_ids)
-        context_field = qwen4_exp_ple_context_field(min(ple_layer_ids))
+        context_layer = min(ple_layer_ids)
+        context_field = qwen4_exp_ple_context_field(context_layer)
         fields = (
             CacheFieldSpec(
                 context_field,
-                context_field,
+                self._layer_planes(context_layer)[1],
                 (int(self._text_config.ngram_context_len),),
                 cache_dtype_name(torch.int64),
                 exact_page_stride=False,
@@ -106,7 +131,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         return fields + tuple(
             CacheFieldSpec(
                 qwen4_exp_ple_conv_field(layer_id),
-                qwen4_exp_ple_conv_field(layer_id),
+                self._layer_planes(layer_id)[0],
                 conv_shape,
                 cache_dtype_name(torch.bfloat16),
                 exact_page_stride=False,
@@ -167,25 +192,52 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
     def _qsa_fields(
         self,
     ) -> tuple[tuple[CacheFieldSpec, ...], tuple[CacheFieldSpec, ...]]:
+        """Reuse decoder planes while keeping compressed pages densely strided."""
         if not self._qsa_layers:
             return (), ()
         ratio = self._qsa_compress_ratio
         compressed_fields = []
         recent_fields = []
+        reference_layer, reference_dim = self._qsa_layers[0]
+        reference_kv_bytes = self._decoder_fields[
+            f"layer.{reference_layer}.k"
+        ].payload_bytes
+        kv_plane_bytes = {
+            field.plane_id: field.payload_bytes
+            for field in self._decoder_fields.values()
+            if field.field_id.endswith((".k", ".v"))
+        }
+        compressed_planes: set[str] = set()
         for unit, (layer_id, index_dim) in enumerate(self._qsa_layers):
-            recent_plane = f"qwen4_exp.qsa.unit.{unit}.recent"
+            first_plane, second_plane = self._layer_planes(layer_id)
+            compatible_planes = tuple(
+                plane_id
+                for plane_id, size in kv_plane_bytes.items()
+                if plane_id not in compressed_planes
+                and size * reference_dim == reference_kv_bytes * index_dim
+            )
+            # One packing keeps compressed pages dense when decoder page sizes
+            # have the same ratios as their index widths. Mixed KV dtypes may
+            # need another plane; incompatible widths retain a dedicated one.
+            if first_plane in compatible_planes:
+                compressed_plane = first_plane
+            elif compatible_planes:
+                compressed_plane = compatible_planes[0]
+            else:
+                compressed_plane = f"qwen4_exp.qsa.unit.{unit}.compressed"
+            compressed_planes.add(compressed_plane)
             recent_fields.extend(
                 (
                     CacheFieldSpec(
                         qsa_raw_key_field(layer_id),
-                        recent_plane,
+                        first_plane,
                         (ratio, 1, index_dim),
                         cache_dtype_name(torch.bfloat16),
                         exact_page_stride=False,
                     ),
                     CacheFieldSpec(
                         qsa_rope_position_field(layer_id),
-                        recent_plane,
+                        second_plane,
                         (3,),
                         cache_dtype_name(torch.int64),
                         exact_page_stride=False,
@@ -195,7 +247,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             compressed_fields.append(
                 CacheFieldSpec(
                     qsa_compressed_field(layer_id),
-                    f"qwen4_exp.qsa.unit.{unit}.compressed",
+                    compressed_plane,
                     (QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE, 1, index_dim),
                     cache_dtype_name(torch.bfloat16),
                 )
@@ -299,7 +351,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                 (spec, fields)
                 for spec, (_, fields) in zip(policies, extras, strict=True)
             )
-        return super().groups() + extras
+        return self._decoder_groups + extras
 
     @override
     def _verify_workspace_field_suffixes(self) -> tuple[str, ...]:

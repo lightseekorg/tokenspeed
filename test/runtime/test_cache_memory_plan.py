@@ -284,6 +284,64 @@ class TestCacheMemoryPlanTest:
         assert (compressed.page_stride_bytes) > (compressed.payload_bytes)
         assert (compressed.page_stride_bytes % 576) == (0)
 
+    def test_wide_flexible_block_preserves_shared_exact_page_strides(self):
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            CacheGroupSpec,
+        )
+
+        field = self.plan_module.CacheFieldSpec
+        layout = self.plan_module.pack(
+            (
+                (
+                    CacheGroupSpec(
+                        group_id="decoder",
+                        attn_kind="full_history",
+                        rows_per_page=1,
+                        entry_stride_tokens=1,
+                        sliding_window_tokens=None,
+                        replayable=False,
+                    ),
+                    (
+                        field("decoder.k", "k", (128,), "bfloat16"),
+                        field("decoder.v", "v", (128,), "bfloat16"),
+                    ),
+                ),
+                (
+                    CacheGroupSpec(
+                        group_id="side",
+                        attn_kind="state",
+                        sliding_window_tokens=None,
+                        replayable=False,
+                    ),
+                    (
+                        field(
+                            "side.conv",
+                            "k",
+                            (300,),
+                            "bfloat16",
+                            exact_page_stride=False,
+                        ),
+                        field(
+                            "side.context",
+                            "v",
+                            (3,),
+                            "int64",
+                            exact_page_stride=False,
+                        ),
+                    ),
+                ),
+            ),
+            prefix_granularity=1,
+            alignment=256,
+            max_padding_fraction=float("inf"),
+        )
+        plan = layout.bind(2)
+        assert dict(layout.group_packing) == {"decoder": 3, "side": 1}
+        assert plan.field("decoder.k").page_stride_bytes == 256
+        assert plan.field("decoder.v").page_stride_bytes == 256
+        assert plan.field("side.conv").page_stride_bytes == 768
+        assert layout.lcm_block_bytes == 1536
+
     def test_layout_constructors_derive_sizes_from_geometry(self):
         group = self.plan_module.CacheGroupLayout(
             group_id="history",

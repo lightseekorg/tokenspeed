@@ -853,6 +853,25 @@ def pack(
                     fixed_alignment,
                 )
 
+        # A flexible block can be wider than the exact pages it shares.
+        # Grow all exact packings together so their page strides stay dense.
+        scale = 1
+        for group_id in flexible_groups:
+            occupied_planes = group_plane_bytes[group_id]
+            if not all(plane_id in fixed_plane_bytes for plane_id in occupied_planes):
+                continue
+            for plane_id, payload_bytes in occupied_planes.items():
+                scale = max(
+                    scale,
+                    (payload_bytes + fixed_plane_bytes[plane_id] - 1)
+                    // fixed_plane_bytes[plane_id],
+                )
+        for group_id in exact_groups:
+            packing[group_id] *= scale
+        fixed_plane_bytes = {
+            plane_id: size * scale for plane_id, size in fixed_plane_bytes.items()
+        }
+
         for group_id in sorted(flexible_groups):
             occupied_planes = group_plane_bytes[group_id]
             if not all(plane_id in fixed_plane_bytes for plane_id in occupied_planes):
