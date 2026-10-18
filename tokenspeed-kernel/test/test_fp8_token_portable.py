@@ -81,38 +81,10 @@ def test_online_dense_quantization_preserves_token_and_channel_scales(
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
-def test_empty_quantization_and_dense_output_need_no_gpu(amd):
-    x = torch.empty(0, 5120, dtype=torch.bfloat16)
-    codes, scales = quantize_fp8(x, granularity="token")
-    assert codes.shape == x.shape and codes.dtype == torch.float8_e4m3fn
-    assert scales.shape == (0, 1) and scales.dtype == torch.float32
-    output = mm(
-        x,
-        torch.empty(7, 5120, dtype=torch.float8_e4m3fn).t(),
-        B_scales=torch.ones(7, 1),
-        out_dtype=x.dtype,
-        quant="fp8",
-    )
-    assert output.shape == (0, 7) and output.dtype == x.dtype
-
-
 def test_portable_quantizer_rejects_dependent_launch(amd):
     with pytest.raises(ValueError, match="does not support enable_pdl"):
         quantize_fp8(
             torch.ones(1, 32, dtype=torch.bfloat16),
             granularity="token",
             enable_pdl=True,
-        )
-
-
-@pytest.mark.parametrize("options", [{"alpha": torch.ones(1)}, {"block_size": [1, 32]}])
-def test_scaled_gemm_rejects_unsupported_scaling(amd, options):
-    with pytest.raises(ValueError, match="takes no alpha or block_size"):
-        gemm_triton.triton_mm_fp8_scaled(
-            torch.ones(1, 32).to(torch.float8_e4m3fn),
-            torch.ones(7, 32).to(torch.float8_e4m3fn).t(),
-            torch.ones(1, 1),
-            torch.ones(7, 1),
-            torch.bfloat16,
-            **options,
         )

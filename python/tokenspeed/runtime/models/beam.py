@@ -59,7 +59,7 @@ from tokenspeed_kernel.ops.quantization import (
     silu_and_mul_quantize_fp8,
 )
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.configs.model_config import beam_default_platform
@@ -935,7 +935,7 @@ class BeamVendorMoE(BeamMoE):
             raise NotImplementedError("Beam's vendor MoE requires normalized routes")
         fmt = None if quant_config is None else beam_checkpoint_format(quant_config)
         platform = current_platform()
-        amd_default = platform.is_amd and platform.arch_version == ArchVersion(9, 5)
+        amd_default = platform.is_cdna4
         if platform.is_amd and fmt == "nvfp4":
             raise ValueError("Beam NVFP4 experts require NVIDIA vendor MoE")
         if amd_default:
@@ -1067,7 +1067,7 @@ def beam_moe_class(quantized_experts: bool = False) -> type[BeamMoE]:
     if get_moe_backend().value == "flashinfer_trtllm":
         return BeamVendorMoE
     platform = current_platform()
-    if platform.is_amd and platform.arch_version == ArchVersion(9, 5):
+    if platform.is_cdna4:
         return BeamVendorMoE
     if quantized_experts:
         raise ValueError(

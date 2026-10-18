@@ -68,42 +68,6 @@ def _plan(platform, **overrides):
         KernelRegistry.get().clear_cache()
 
 
-@pytest.mark.parametrize("intermediate", [320, 640])
-def test_default_plan_keeps_native_fp8(mi350_platform, intermediate):
-    assert (
-        _plan(mi350_platform, ispp=intermediate)["apply_kernel_name"]
-        == "triton_fp8_channel_fused_precomputed_moe_apply"
-    )
-
-
-@pytest.mark.parametrize("intermediate", [320, 640])
-def test_explicit_gluon_plan_uses_channel_candidate(mi350_platform, intermediate):
-    plan = _plan(mi350_platform, solution="gluon", ispp=intermediate)
-    assert plan["apply_kernel_name"] == GLUON_FP8_CHANNEL_APPLY
-    assert plan["weight_preprocessor"] is None
-    assert not plan["supports_deferred_finalize"]
-
-
-@pytest.mark.parametrize(
-    "dtype,width,expected",
-    [
-        ("unquant", 640, "gluon_bf16_precomputed_moe_apply"),
-        ("fp8", 1024, "gluon_fp8_block_precomputed_moe_apply"),
-    ],
-)
-def test_legacy_gluon_plans_keep_existing_implementation(
-    mi350_platform, dtype, width, expected
-):
-    if not is_amd() and KernelRegistry.get().get_by_name(expected) is None:
-        pytest.skip("Legacy Gluon implementations are only registered on AMD")
-    assert (
-        _plan(mi350_platform, weight_dtype=dtype, ispp=width, solution="gluon")[
-            "apply_kernel_name"
-        ]
-        == expected
-    )
-
-
 @pytest.mark.parametrize(
     "override",
     [

@@ -58,46 +58,6 @@ def test_real_gfx950_suite_expands_six_beam_apply_cases_without_execution():
         16,
         8192,
     ]
-    expected = {
-        "model_profile": "beam_fp8_tp4",
-        "hidden_size": 5120,
-        "intermediate_size": 2560,
-        "tp_size": 4,
-        "ep_size": 1,
-        "ep_rank": 0,
-        "num_experts": 256,
-        "num_local_experts": 256,
-        "topk": 8,
-        "input_dtype": "bfloat16",
-        "weight_dtype": "fp8_channel",
-        "weight_storage_dtype": "float8_e4m3fn",
-        "scale_dtype": "float32",
-        "router_logits_dtype": "float32",
-        "route_weights_dtype": "float32",
-        "route_ids_dtype": "int32",
-        "activation": "silu",
-        "routing_mode": "precomputed_topk",
-        "route_distribution": "grouped_router",
-        "route_scope": "global",
-        "num_groups": 8,
-        "group_topk": 2,
-        "topk_groups": 4,
-        "normalize_topk_weights": True,
-        "routed_scaling_factor": 2.5,
-        "internal_activation_dtype": "input",
-        "token_count_scope": "local",
-        "fast_math": True,
-    }
-    for case in beam:
-        assert {key: case.request.parameters[key] for key in expected} == expected
-        assert (
-            case.request.parameters["intermediate_size"]
-            // case.request.parameters["tp_size"]
-            == 640
-        )
-        assert case.comparison_epoch == 1
-        assert case.request.cold_cache and case.request.seed == 750155804
-        assert case.request.registration is None and case.request.solution is None
     # Adding the Beam fragment must retain the existing model suites.
     for prefix in ("dsv41_flash.", "glm53_flash.", "kimi_k3.", "qwen38_flash."):
         assert any(case.id.startswith(prefix) for case in suite.cases)

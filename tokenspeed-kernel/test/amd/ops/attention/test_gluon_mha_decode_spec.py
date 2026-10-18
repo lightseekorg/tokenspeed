@@ -20,28 +20,19 @@
 
 """Paged grouped-query block verification and flattened non-causal drafts.
 
-The optional script entry point measures the same complete registered operation
-as the tests, including split reduction and Python launch overhead. It is not a
-model benchmark. Long histories share physical cache pages across requests to
-keep the isolated operator fixture small; distinct/reordered page tables still
-exercise address translation.
+Long histories share physical cache pages across requests to keep the isolated
+operator fixture small; distinct/reordered page tables still exercise address
+translation.
 """
 
 from __future__ import annotations
 
-import argparse
-import gc
-import json
-import statistics
-import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention.mha import mha_decode_with_kvcache
-from tokenspeed_kernel.platform import current_platform
 from utils import is_cdna4
 
 MAX_CONTEXT = 50176
@@ -55,7 +46,7 @@ class DecodeCase:
 
     @property
     def width(self):
-        return 1 if self.mode in ("draft", "control") else 16
+        return 1 if self.mode == "draft" else 16
 
     @property
     def heads(self):
@@ -63,13 +54,13 @@ class DecodeCase:
 
     @property
     def window(self):
-        return {"full": -1, "window": 511, "draft": 4095, "control": -1}[self.mode]
+        return {"full": -1, "window": 511, "draft": 4095}[self.mode]
 
 
 def make_inputs(case: DecodeCase):
     """Make strided queries like the runtime's projection view and page64 KV."""
     torch.manual_seed(417)
-    width = 1 if case.mode == "control" else 16
+    width = 16
     rows = case.concurrency * width
     pages = (case.context + 63) // 64
     table_pages = (MAX_CONTEXT + 63) // 64
@@ -158,24 +149,6 @@ def check_output(actual, expected):
     torch.testing.assert_close(actual.float(), expected, atol=0.006, rtol=0.006)
 
 
-@pytest.mark.parametrize("raises", [False, True])
-def test_reference_precision_is_restored(raises):
-    previous = torch.get_float32_matmul_precision()
-    try:
-        torch.set_float32_matmul_precision("high")
-        if raises:
-            with pytest.raises(ValueError, match="reference failure"):
-                with reference_precision():
-                    assert torch.get_float32_matmul_precision() == "highest"
-                    raise ValueError("reference failure")
-        else:
-            with reference_precision():
-                assert torch.get_float32_matmul_precision() == "highest"
-        assert torch.get_float32_matmul_precision() == "high"
-    finally:
-        torch.set_float32_matmul_precision(previous)
-
-
 @pytest.mark.parametrize("concurrency", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("mode", ["full", "window", "draft"])
 @pytest.mark.parametrize("context", [17, 63, 64, 65, 8192, 50000])
@@ -213,103 +186,3 @@ def test_spec_decode_graph_replay(concurrency, mode, context):
         graph.replay()
         check_output(actual, expected)
     assert torch.cuda.max_memory_allocated() < 8 * 1024**3
-
-
-def paired_timing(inputs, rounds, iterations, *, graph_mode):
-    """Paired alternating order, synchronized wall and GPU-event timings."""
-    samples = {solution: [] for solution in ("triton", "gluon")}
-    for solution in samples:
-        for _ in range(3):
-            mha_decode_with_kvcache(**inputs, solution=solution)
-    torch.cuda.synchronize()
-    graphs = {}
-    outputs = {}
-    if graph_mode:
-        for solution in samples:
-            graphs[solution] = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graphs[solution]):
-                outputs[solution] = mha_decode_with_kvcache(**inputs, solution=solution)
-    for round_idx in range(rounds):
-        order = ("triton", "gluon") if round_idx % 2 == 0 else ("gluon", "triton")
-        for solution in order:
-            start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-            torch.cuda.synchronize()
-            before = time.perf_counter_ns()
-            start.record()
-            for _ in range(iterations):
-                if graph_mode:
-                    graphs[solution].replay()
-                else:
-                    mha_decode_with_kvcache(**inputs, solution=solution)
-            end.record()
-            end.synchronize()
-            wall_us = (time.perf_counter_ns() - before) / 1000 / iterations
-            samples[solution].append(
-                {
-                    "wall_us": wall_us,
-                    "device_us": start.elapsed_time(end) * 1000 / iterations,
-                }
-            )
-    return {
-        solution: {
-            "samples": values,
-            "median_wall_us": statistics.median(v["wall_us"] for v in values),
-            "median_device_us": statistics.median(v["device_us"] for v in values),
-        }
-        for solution, values in samples.items()
-    }
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--rounds", type=int, required=True)
-    parser.add_argument("--iterations", type=int, required=True)
-    args = parser.parse_args()
-    # Only this isolated benchmark process owns a device allocation ceiling;
-    # input construction must not change the allocator shared by pytest files.
-    torch.cuda.set_per_process_memory_fraction(0.02)
-    results = []
-    cases = [
-        DecodeCase(c, mode, context)
-        for c in (1, 2, 4, 8, 16)
-        for mode in ("full", "window", "draft")
-        for context in (65, 50000)
-    ]
-    cases += [DecodeCase(1, "control", context) for context in (65, 50000)]
-    for case in cases:
-        inputs = make_inputs(case)
-        expected = reference(inputs)
-        for solution in ("triton", "gluon"):
-            check_output(mha_decode_with_kvcache(**inputs, solution=solution), expected)
-        result = {
-            **case.__dict__,
-            "physical_rows": inputs["q"].shape[0],
-            "heads": case.heads,
-            "width": case.width,
-            "window_left": case.window,
-            "timing": {
-                execution: paired_timing(
-                    inputs,
-                    args.rounds,
-                    args.iterations,
-                    graph_mode=execution == "graph",
-                )
-                for execution in ("eager", "graph")
-            },
-        }
-        results.append(result)
-        args.output.write_text(
-            json.dumps({"results": results, "complete": False}, indent=2) + "\n"
-        )
-        print(json.dumps(result), flush=True)
-        del inputs, expected
-        gc.collect()
-        torch.cuda.empty_cache()
-    args.output.write_text(
-        json.dumps({"results": results, "complete": True}, indent=2) + "\n"
-    )
-
-
-if __name__ == "__main__":
-    main()

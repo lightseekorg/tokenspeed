@@ -34,6 +34,7 @@ import importlib
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.layernorm import gluon
 from tokenspeed_kernel.ops.layernorm import qk_rmsnorm_ssmax as qk
 from tokenspeed_kernel.platform import ArchVersion, Platform
 from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
@@ -151,8 +152,7 @@ def test_qk_ranked_selection_runs_triton_exactly_where_its_guard_admits(
                     *call, dequant=dequant, solution=None, override=None
                 )
                 amd_fused = (
-                    platform.is_amd
-                    and platform.arch_version == ArchVersion(9, 5)
+                    platform.is_cdna4
                     and on_cuda
                     and not dequant
                     and case in ("beam_tp8", "int32_positions")
@@ -166,3 +166,25 @@ def test_qk_ranked_selection_runs_triton_exactly_where_its_guard_admits(
                         else qk.TORCH_QK_RMSNORM_SSMAX
                     )
                 ), (platform.device_name, on_cuda, dequant)
+
+
+@pytest.mark.parametrize(
+    "change", ["dtype", "positions", "eps", "rows", "shape", "dequant"]
+)
+def test_qk_by_name_rejects_before_any_device_launch(change):
+    args = list(_qk())
+    extra = {}
+    if change == "dtype":
+        args[0] = args[0].float()
+    elif change == "positions":
+        args[5] = args[5].float()
+    elif change == "eps":
+        args[4] = 0.0
+    elif change == "rows":
+        args = list(_qk(tokens=0))
+    elif change == "shape":
+        args[0] = args[0][:, :640]
+    else:
+        extra["dequant"] = object()
+    with pytest.raises(ValueError):
+        gluon.gluon_qk_rmsnorm_ssmax_gfx950(*args, **extra)

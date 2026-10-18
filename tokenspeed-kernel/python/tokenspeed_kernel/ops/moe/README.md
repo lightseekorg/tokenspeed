@@ -222,54 +222,25 @@ Beam's 320/640/2560 intermediate partitions. No weight shuffle is required.
 Expert-parallel ranks filter IDs to their local contiguous expert interval;
 nonlocal routes contribute zero. The caller owns distributed reduction.
 
-On gfx950, Beam uses `precision_policy="default"` for BF16, FP8 and MXFP4 experts and requests
-precomputed routing, keeping its FP32 route coefficients and applying the routed
-scale exactly once in routing. `--moe-backend auto` uses normal registry
-priorities: Gluon for compatible BF16 and MXFP4 calls; Triton precedes Gluon for FP8.
-Beam requests finalized output from the selected AMD kernel, even when that
-kernel also supports deferred combination for other models.
-Explicit `triton` and `gluon` select within their respective registered backends.
-The Gluon FP8-storage/BF16-compute implementation accepts only the default
-policy; it remains restricted to gfx950, EP1, 256 experts, hidden width 5120,
-intermediate partition 320 or 640, and top-8 routing. Both implementations
-finalize locally. Expert count and top-k are checked by the Gluon launcher
-before GPU execution because the registry plan does not receive those dimensions.
-BF16 and MXFP4 use the selected backend's standard rounding,
-replacing Beam's former opt-in per-weighted-route BF16 rounding and late routed
-scale. NVIDIA retains its existing policies and backend selection.
+On gfx950, Beam requests the default policy with precomputed routing and
+finalized output for BF16, FP8 and MXFP4 experts. Automatic selection keeps
+this kernel ahead of the restricted Gluon FP8 candidate (recorded in
+`tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/README.md`), whose
+launcher checks expert count and top-k before GPU execution. NVIDIA retains
+its existing policies and backend selection.
 
 The first multiplication accumulates in FP32 and retains gate/up in FP32 through
 SiLU and multiplication, rounding only the resulting intermediate to BF16.
-Input quantization uses the public FP8 token operation. The private route
-quantizer uses `max(amax / 448, 1 / (448 * 512))`, with `amax >= 1e-6`, and
-rounds `x * min(448 / amax, 448 * 512)` to BF16 before saturated E4M3 conversion.
-That extra BF16 rounding is why the public input quantizer cannot serve this
-stage unchanged. The second multiplication accumulates in FP32 and stores BF16
-per route; combination retains FP32 weights and accumulation before BF16 output.
-IEEE division and portable sigmoid preserve these boundaries without claiming
-cross-vendor byte identity with native vendor instructions. The NVIDIA Triton
-implementation retains its existing separate gate/up BF16 rounding contract.
+Input quantization uses the public FP8 token operation; the private route
+quantizer rounds the scaled product to BF16 before saturated E4M3 conversion,
+a boundary the public quantizer does not have. The second multiplication
+accumulates in FP32 and stores BF16 per route; combination retains FP32
+weights and accumulation before BF16 output.
 
-On gfx950, native FP8 matrix instructions can lose small products within groups
-of eight reduction positions: even `256 * 256 + 1 * 1` can return 65536 rather
-than the exactly representable FP32 value 65537. The portable expert kernel
-zeros seven positions of each eight and accumulates eight native FP8 partitions
-in FP32, retaining the original reduction positions. Two partitions are
-insufficient. This preserves FP8 resident tensors and FP8 multiplication
-operands, at the cost of eight matrix instructions per original instruction.
-Exact mixed-magnitude cases, an FP32 rounding-error bound and full expert
-comparisons guard this workaround. Performance must be evaluated separately;
-it is a correctness baseline rather than a tuned implementation.
-
-Random Beam-shaped comparisons retain the existing portable FP8 expert test's
-normalized L2 error limit of 0.002 across sixteen deterministic seeds. Requiring
-each finalized element to match more closely than a BF16 rounding step is not
-valid for independent FP32 accumulation orders. A preserved seed demonstrates
-small, bounded FP32 differences straddling BF16 midpoints in the down projection,
-while quantization and combination match their independent stage references.
-The stage regression checks raw FP32 rounding-error bounds and exact rounding
-of the actual accumulator. This lawful midpoint behavior is distinct from the
-native FP8 instruction's loss of an exactly representable product sum.
+On gfx950 the kernel shares the dense FP8 GEMM's workaround for native FP8
+matrix instructions losing small products (`gemm/README.md`): eight masked
+native dots per original instruction with an FP32 accumulator, a correctness
+baseline rather than a tuned implementation.
 
 ## Shared MoE precision policies
 

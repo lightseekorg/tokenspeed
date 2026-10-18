@@ -142,6 +142,7 @@ from tokenspeed_kernel.selection import (
     spec_matches_traits,
 )
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from utils import is_amd
 
 _ATTENTION_GLUON_MODULES = [
     _attention_gluon_dsa,
@@ -3473,6 +3474,74 @@ def test_gfx950_dynamic_mxfp4_moe_selects_gluon_a4w4(
     )
     assert with_bias["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
     assert bf16_activations["apply_kernel_name"] == "gluon_mxfp4_precomputed_moe_apply"
+
+
+def _moe_fp8_channel_plan(platform: PlatformInfo, **overrides) -> dict:
+    kwargs = dict(
+        weight_dtype="fp8_channel",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        routing_mode="precomputed_topk",
+        ep_size=1,
+        ispp=640,
+        hidden=5120,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=False,
+        combine_order="rank",
+    )
+    kwargs.update(overrides)
+    registry = KernelRegistry.get()
+    real_platform = Platform.get()
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        return kernel_moe_plan(**kwargs)
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+
+@pytest.mark.parametrize("intermediate", [320, 640])
+def test_default_plan_keeps_native_fp8(
+    mi350_platform: PlatformInfo,
+    intermediate: int,
+) -> None:
+    plan = _moe_fp8_channel_plan(mi350_platform, ispp=intermediate)
+    assert plan["apply_kernel_name"] == "triton_fp8_channel_fused_precomputed_moe_apply"
+
+
+@pytest.mark.parametrize("intermediate", [320, 640])
+def test_explicit_gluon_plan_uses_channel_candidate(
+    mi350_platform: PlatformInfo,
+    intermediate: int,
+) -> None:
+    plan = _moe_fp8_channel_plan(mi350_platform, solution="gluon", ispp=intermediate)
+    assert plan["apply_kernel_name"] == _moe_gluon.GLUON_FP8_CHANNEL_APPLY
+    assert plan["weight_preprocessor"] is None
+    assert not plan["supports_deferred_finalize"]
+
+
+@pytest.mark.parametrize(
+    "dtype,width,expected",
+    [
+        ("unquant", 640, "gluon_bf16_precomputed_moe_apply"),
+        ("fp8", 1024, "gluon_fp8_block_precomputed_moe_apply"),
+    ],
+)
+def test_legacy_gluon_plans_keep_existing_implementation(
+    mi350_platform: PlatformInfo,
+    dtype: str,
+    width: int,
+    expected: str,
+) -> None:
+    if not is_amd() and KernelRegistry.get().get_by_name(expected) is None:
+        pytest.skip("Legacy Gluon implementations are only registered on AMD")
+    plan = _moe_fp8_channel_plan(
+        mi350_platform, weight_dtype=dtype, ispp=width, solution="gluon"
+    )
+    assert plan["apply_kernel_name"] == expected
 
 
 def _select_on(platform: PlatformInfo, *args, **kwargs) -> str:

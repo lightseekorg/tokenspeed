@@ -379,9 +379,7 @@ def triton_mm_fp8_scaled(
         out_dtype=out_dtype,
         bias=bias,
         out=out,
-        fp8_accumulation_streams=(
-            8 if platform.is_amd and platform.arch_version == ArchVersion(9, 5) else 1
-        ),
+        fp8_accumulation_streams=8 if platform.is_cdna4 else 1,
     )
 
 

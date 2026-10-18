@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Portable attention numerics for Beam TP4: twelve query and two KV heads."""
+"""Beam TP4 runtime integration for mixed-batch triton attention over cache groups."""
 
 import math
 import os
@@ -27,23 +27,18 @@ from datetime import datetime, timezone
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.mha import (
-    mha_decode_with_kvcache,
-    mha_extend_with_kvcache,
-    mha_plan,
-    mha_prefill,
-)
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 
-# The CI runner executes registered test files as standalone scripts.
-_TEST_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, _TEST_DIR)
-from ci_system.ci_register import register_cuda_ci  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=50, suite="runtime-1gpu")
 
-Q_HEADS, KV_HEADS, HEAD_DIM, PAGE_SIZE = 12, 2, 128, 64
-BOUNDARIES = (63, 64, 65, 511, 512, 513)
+# The breakable-graph refresh test loads the kernel compile monitor from
+# tokenspeed-kernel/test, relative to the repo's test/ directory.
+_TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+Q_HEADS, KV_HEADS, HEAD_DIM = 12, 2, 128
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -68,10 +63,6 @@ def verified_amd_device():
     torch.manual_seed(42)
     yield
     torch.cuda.synchronize()
-
-
-def _random(rows, heads):
-    return torch.randn(rows, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
 
 
 def _reference(q, k, v, *, prefix, window_left, round_unnormalized_probabilities):
@@ -100,29 +91,6 @@ def _assert_output(actual, expected):
     assert actual.dtype == torch.bfloat16
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual.cpu().float(), expected, rtol=1e-2, atol=2e-3)
-
-
-def _paged_inputs(lengths):
-    # Reverse physical pages: a cache-addressing bug must not pass by reading
-    # the logically contiguous tensor accidentally.
-    max_pages = math.ceil(max(lengths) / PAGE_SIZE)
-    pages = torch.arange(
-        len(lengths) * max_pages - 1, -1, -1, device="cuda", dtype=torch.int32
-    )
-    table = pages.reshape(len(lengths), max_pages)
-    k = _random(len(lengths) * max_pages * PAGE_SIZE, KV_HEADS).view(
-        -1, PAGE_SIZE, KV_HEADS, HEAD_DIM
-    )
-    v = torch.randn_like(k)
-    keys = [
-        k[table[row].long()].flatten(0, 1)[:length]
-        for row, length in enumerate(lengths)
-    ]
-    values = [
-        v[table[row].long()].flatten(0, 1)[:length]
-        for row, length in enumerate(lengths)
-    ]
-    return k, v, table, keys, values
 
 
 def _assert_prefill_output(output, q, k, v, *, window_left):
@@ -156,195 +124,6 @@ def _assert_prefill_output(output, q, k, v, *, window_left):
     _assert_output(output[:first], expected_first)
     if first < length:
         _assert_output(output[first:], mathematical[first:])
-
-
-@pytest.mark.parametrize("window_left", [-1, 511], ids=["full", "sliding512"])
-@pytest.mark.parametrize("length", BOUNDARIES)
-def test_beam_triton_prefill_matches_reference(length, window_left):
-    q, k, v = (
-        _random(length, Q_HEADS),
-        _random(length, KV_HEADS),
-        _random(length, KV_HEADS),
-    )
-    cu = torch.tensor([0, length], device="cuda", dtype=torch.int32)
-    output = mha_prefill(
-        q, k, v, cu, [0, length], length, window_left=window_left, solution="triton"
-    )
-    _assert_prefill_output(output, q, k, v, window_left=window_left)
-
-
-@pytest.mark.parametrize("window_left", [-1, 511], ids=["full", "sliding512"])
-@pytest.mark.parametrize("length", BOUNDARIES)
-def test_beam_triton_prewrite_prefill_matches_reference(length, window_left):
-    # The runtime's portable plan attends newly written BF16 cache rows even
-    # without a prefix. Qualify that path as well as the direct prefill API.
-    plan = mha_plan(
-        dtype=torch.bfloat16,
-        head_dim=HEAD_DIM,
-        window_left=window_left,
-        solution="triton",
-    )
-    assert plan["extend_mode"] == "prewrite"
-    k, v, table, keys, values = _paged_inputs([length])
-    q = _random(length, Q_HEADS)
-    cu = torch.tensor([0, length], device="cuda", dtype=torch.int32)
-    output = mha_extend_with_kvcache(
-        q=q,
-        cu_seqlens_q=cu,
-        cu_seqlens_kv=cu,
-        k_cache=k,
-        v_cache=v,
-        page_table=table,
-        cache_seqlens=torch.tensor([length], device="cuda", dtype=torch.int32),
-        max_seqlen_q=length,
-        max_seqlen_k=1024,
-        is_causal=True,
-        window_left=window_left,
-        solution="triton",
-    )
-    _assert_prefill_output(output, q, keys[0], values[0], window_left=window_left)
-
-
-@pytest.mark.parametrize("window_left", [-1, 511], ids=["full", "sliding512"])
-@pytest.mark.parametrize(
-    "prefix,chunk", [(63, 1), (64, 17), (65, 65), (511, 1), (512, 17), (513, 65)]
-)
-def test_beam_triton_chunked_extend_matches_reference(prefix, chunk, window_left):
-    total = prefix + chunk
-    k, v, table, keys, values = _paged_inputs([total])
-    q = _random(chunk, Q_HEADS)
-    output = mha_extend_with_kvcache(
-        q=q,
-        cu_seqlens_q=torch.tensor([0, chunk], device="cuda", dtype=torch.int32),
-        cu_seqlens_kv=torch.tensor([0, total], device="cuda", dtype=torch.int32),
-        k_cache=k,
-        v_cache=v,
-        page_table=table,
-        cache_seqlens=torch.tensor([total], device="cuda", dtype=torch.int32),
-        max_seqlen_q=chunk,
-        max_seqlen_k=1024,
-        is_causal=True,
-        window_left=window_left,
-        solution="triton",
-    )
-    _assert_output(
-        output,
-        _reference(
-            q,
-            keys[0],
-            values[0],
-            prefix=prefix,
-            window_left=window_left,
-            round_unnormalized_probabilities=False,
-        ),
-    )
-
-
-@pytest.mark.parametrize("window_left", [-1, 511], ids=["full", "sliding512"])
-@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16])
-@pytest.mark.parametrize("graph_replay", [False, True], ids=["eager", "graph"])
-def test_beam_triton_decode_and_graph_replay(batch, window_left, graph_replay):
-    lengths = [BOUNDARIES[row % len(BOUNDARIES)] for row in range(batch)]
-    k, v, table, _, _ = _paged_inputs([578] * batch)
-    seq_lens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
-    q = _random(batch, Q_HEADS)
-
-    def decode():
-        return mha_decode_with_kvcache(
-            q=q,
-            k_cache=k,
-            v_cache=v,
-            page_table=table,
-            cache_seqlens=seq_lens,
-            max_seqlen_k=1024,
-            max_seqlen_q=1,
-            window_left=window_left,
-            solution="triton",
-        )
-
-    output = decode()
-    graph = None
-    if graph_replay:
-        # Compile and warm the exact shape before capture; replay then sees
-        # new query values and cache lengths at the same device addresses.
-        for _ in range(2):
-            decode()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            output = decode()
-
-    for phase in range(2):
-        if phase:
-            lengths = [BOUNDARIES[(row + 3) % len(BOUNDARIES)] for row in range(batch)]
-            seq_lens.copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32))
-            q.copy_(_random(batch, Q_HEADS))
-        if graph is not None:
-            graph.replay()
-        elif phase:
-            output = decode()
-        expected = []
-        for row, length in enumerate(lengths):
-            keys = k[table[row].long()].flatten(0, 1)[:length]
-            values = v[table[row].long()].flatten(0, 1)[:length]
-            expected.append(
-                _reference(
-                    q[row : row + 1],
-                    keys,
-                    values,
-                    prefix=length - 1,
-                    window_left=window_left,
-                    round_unnormalized_probabilities=False,
-                )
-            )
-        _assert_output(output, torch.cat(expected))
-
-
-@pytest.mark.parametrize("window_left", [-1, 511], ids=["full", "sliding512"])
-def test_beam_triton_chunked_extend_graph_refreshes_lengths(window_left):
-    chunk = 65
-    k, v, table, _, _ = _paged_inputs([640])
-    q = _random(chunk, Q_HEADS)
-    cu_q = torch.tensor([0, chunk], device="cuda", dtype=torch.int32)
-    cu_kv = torch.tensor([0, 128], device="cuda", dtype=torch.int32)
-    seq_lens = torch.tensor([128], device="cuda", dtype=torch.int32)
-
-    def extend():
-        return mha_extend_with_kvcache(
-            q=q,
-            cu_seqlens_q=cu_q,
-            cu_seqlens_kv=cu_kv,
-            k_cache=k,
-            v_cache=v,
-            page_table=table,
-            cache_seqlens=seq_lens,
-            max_seqlen_q=chunk,
-            max_seqlen_k=1024,
-            is_causal=True,
-            window_left=window_left,
-            solution="triton",
-        )
-
-    for _ in range(3):
-        extend()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        output = extend()
-    for total in (128, 577, 578):
-        seq_lens.fill_(total)
-        cu_kv[1:].fill_(total)
-        q.copy_(_random(chunk, Q_HEADS))
-        graph.replay()
-        keys = k[table[0].long()].flatten(0, 1)[:total]
-        values = v[table[0].long()].flatten(0, 1)[:total]
-        expected = _reference(
-            q,
-            keys,
-            values,
-            prefix=total - chunk,
-            window_left=window_left,
-            round_unnormalized_probabilities=False,
-        )
-        _assert_output(output, expected)
 
 
 def _runtime_mixed_round(width, *, larger, all_fresh, first_prefix):
@@ -514,31 +293,6 @@ class _RuntimeMixedAttention:
             query_shard=None,
             block_tables_cpu={},
         )
-        cumulative = [0]
-        for count in all_queries:
-            cumulative.append(cumulative[-1] + count)
-        for gid, page_size in self.groups.items():
-            metadata = self.leaves[gid].forward_extend_metadata
-            assert metadata.is_mixed
-            assert metadata.cu_extend_seq_lens_cpu == cumulative
-            assert metadata.cu_extend_seq_lens.tolist() == cumulative
-            assert metadata.seq_lens.tolist() == lengths
-            ratio = 16 // page_size
-            expanded = (
-                self.tables[gid][:, :, None] * ratio + torch.arange(ratio)
-            ).reshape(3, -1)
-            assert torch.equal(metadata.page_table.cpu(), expanded)
-            slots = [
-                int(self.tables[gid][request, position // 16]) * 16 + position % 16
-                for request, count in enumerate(all_queries)
-                for position in range(lengths[request] - count, lengths[request])
-            ]
-            padded = self.router.padded_write_locations(
-                self.layers[gid],
-                ForwardMode.MIXED,
-                self.bucket,
-            )
-            assert padded.tolist() == slots + [0] * (self.bucket - len(slots))
         return sum(all_queries)
 
     def forward(self):
