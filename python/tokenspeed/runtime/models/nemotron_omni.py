@@ -349,7 +349,10 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
                 continue
             elif name.startswith(_RADIO_PREFIX):
                 self.visual.load_weight(name.removeprefix(_RADIO_PREFIX), loaded)
-            elif name.startswith(_VISION_NORM_PREFIX):
+            elif (
+                name.startswith(_VISION_NORM_PREFIX)
+                and self.vision_final_norm is not None
+            ):
                 suffix = name.removeprefix(_VISION_NORM_PREFIX)
                 default_weight_loader(
                     self.vision_final_norm.get_parameter(suffix), loaded

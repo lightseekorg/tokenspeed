@@ -554,43 +554,8 @@ def test_audio_feature_encodes_every_clip_of_every_item_in_order():
     assert torch.equal(out, expected)
 
 
-def test_mtp_draft_reads_the_language_model_mtp_tensors(monkeypatch):
-    from tokenspeed.runtime.models.nemotron_h_nextn import NemotronHForCausalLMNextN
-
-    seen = []
-    monkeypatch.setattr(
-        NemotronHForCausalLMNextN,
-        "load_weights",
-        lambda self, weights: seen.extend(name for name, _ in weights),
-    )
-    draft_cls = nemotron_omni.NemotronH_Omni_Reasoning_V3NextN
-    draft = draft_cls.__new__(draft_cls)
-    names = [
-        "language_model.mtp.layers.0.mixer.k_proj.k_scale",
-        "language_model.mtp.layers.1.mixer.experts.3.up_proj.weight_scale",
-        "language_model.backbone.layers.0.mixer.in_proj.weight",
-        "vision_model.radio_model.model.blocks.0.attn.qkv.weight",
-    ]
-    draft.load_weights([(name, torch.zeros(1)) for name in names])
-    assert seen == [
-        "mtp.layers.0.mixer.k_proj.k_scale",
-        "mtp.layers.1.mixer.experts.3.up_proj.weight_scale",
-        "backbone.layers.0.mixer.in_proj.weight",
-    ]
-    assert [draft.checkpoint_weight_name_filter(n) for n in names] == [
-        True,
-        True,
-        False,
-        False,
-    ]
-    assert draft_cls.quant_module_name_replacements == (("language_model.", ""),)
-
-
-def test_kv_cache_scales_reach_the_language_model_and_its_mtp_head():
-    from tokenspeed_kernel.ops.attention.prologue import FP8TensorScales
-
-    from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
-
+def _mtp_omni_config() -> NemotronHOmniConfig:
+    """A small Nemotron-H Omni config whose language model has one MTP layer."""
     llm = dict(
         hybrid_override_pattern="M*E",
         hidden_size=256,
@@ -608,7 +573,36 @@ def test_kv_cache_scales_reach_the_language_model_and_its_mtp_head():
         moe_intermediate_size=256,
         moe_shared_expert_intermediate_size=256,
     )
-    config = NemotronHOmniConfig(llm_config=llm)
+    return NemotronHOmniConfig(llm_config=llm)
+
+
+def test_mtp_draft_reads_the_language_model_mtp_tensors():
+    from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
+
+    with torch.device(DEVICE), set_default_torch_dtype(torch.bfloat16):
+        draft = nemotron_omni.NemotronH_Omni_Reasoning_V3NextN(
+            _mtp_omni_config(), Mapping(rank=0, world_size=1)
+        )
+    names = [
+        "language_model.mtp.layers.0.enorm.weight",
+        "language_model.backbone.norm_f.weight",
+        "vision_model.radio_model.model.blocks.0.norm1.weight",
+    ]
+    assert [draft.checkpoint_weight_name_filter(n) for n in names] == [
+        True,
+        False,
+        False,
+    ]
+    draft.load_weights([(name, torch.full((256,), 2.0)) for name in names])
+    assert torch.all(draft.enorm.weight == 2)
+
+
+def test_kv_cache_scales_reach_the_language_model_and_its_mtp_head():
+    from tokenspeed_kernel.ops.attention.prologue import FP8TensorScales
+
+    from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
+
+    config = _mtp_omni_config()
     mapping = Mapping(rank=0, world_size=1)
     with torch.device(DEVICE), set_default_torch_dtype(torch.bfloat16):
         target = nemotron_omni.NemotronH_Omni_Reasoning_V3(
@@ -669,6 +663,10 @@ def test_checkpoint_tensors_route_to_their_modules():
     assert model.vision_final_norm.bias.item() == 2.0
     with pytest.raises(KeyError):
         list(route(model, [("unknown.weight", tensor)]))
+    # Without MTP layers the model builds no vision LayerNorm to load it into.
+    model.vision_final_norm = None
+    with pytest.raises(KeyError):
+        list(route(model, [("vision_projector.vision_final_layernorm.bias", tensor)]))
     # With the encoders disabled their tensors are skipped, not unknown names.
     text_only = SimpleNamespace(visual=None)
     language = [name for name, _ in route(text_only, [(n, tensor) for n in names])]
