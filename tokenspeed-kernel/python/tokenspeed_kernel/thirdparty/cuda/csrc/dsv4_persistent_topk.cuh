@@ -32,8 +32,8 @@
 ///    remain behind `griddepcontrol.wait` and output completion precedes the
 ///    dependent-launch trigger.
 ///
-/// Algorithm: fp16 coarse histogram -> threshold bin -> fp32-boundary collect ->
-/// exact radix tie-break.
+/// Algorithm: fp16 coarse histogram -> threshold bin -> fp32 radix refinement
+/// on overflow -> ordered-key collect -> exact radix tie-break.
 
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -647,21 +647,26 @@ struct TopKRadixBase : TopKConfig {
       return threshold;
 
     uint32_t remaining = topk - smem->threshold_above;
-    uint32_t prefix = 0;
-    uint32_t mask = 0;
+    // Coarse bounds already fix leading bits of most finite buckets. Start at
+    // their first differing bit and reuse the full histogram for fewer scans.
+    const uint32_t differing_bits =
+        32 - __clz(threshold.lo ^ (threshold.hi - 1));
+    uint32_t mask = differing_bits == 32 ? 0 : 0xFFFFFFFFu << differing_bits;
+    uint32_t prefix = threshold.lo & mask;
+    int shift = max(
+        static_cast<int>(differing_bits) - static_cast<int>(kHistBits), 0);
 #pragma unroll 1
-    for (int round = 0; round < 4; ++round) {
+    while (true) {
       typename Smem::kHistVec hist_vec;
       hist_vec.fill(0);
       smem->hist_vecs[threadIdx.x] = hist_vec;
       __syncthreads();
 
-      const uint32_t shift = 24 - round * 8;
       for_each([&](float val, uint32_t) {
         const uint32_t key = extract_exact_bin(val);
         if (key >= threshold.lo && key < threshold.hi &&
             (key & mask) == prefix) {
-          atomicAdd(&smem->histogram[(key >> shift) & 0xFFu], 1);
+          atomicAdd(&smem->histogram[(key >> shift) & (kHistSize - 1)], 1);
         }
       });
       __syncthreads();
@@ -669,10 +674,11 @@ struct TopKRadixBase : TopKConfig {
       find_threshold(remaining, count, smem);
 
       prefix |= smem->threshold_bin << shift;
-      mask |= 0xFFu << shift;
+      mask |= (kHistSize - 1) << shift;
       remaining -= smem->threshold_above;
       count = smem->threshold_count;
-      if (count <= kMaxNumTie) break;
+      if (count <= kMaxNumTie || shift == 0) break;
+      shift = max(shift - static_cast<int>(kHistBits), 0);
     }
 
     threshold.lo = max(threshold.lo, prefix);

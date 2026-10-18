@@ -50,12 +50,14 @@ and pads short rows with `-1`. Equal scores may select any distinct tied indices
 The register, streaming and cluster implementations share a coarse FP16
 histogram followed by exact FP32 selection. If the threshold bucket exceeds
 the 2048-entry candidate buffer, additional FP32 radix passes narrow it before
-collection. Truncation is safe only once all remaining candidates have the same
-exact score. Ordered integer bounds preserve nearest-even FP16 bucket boundaries,
-including negative midpoints, signed zero and infinities. Candidates retain their
-integer keys through tie selection so subnormal scores remain distinct under
-CUDA fast math. Cluster ranks reduce every refinement histogram together before
-collecting candidates.
+collection. Refinement skips the leading bits fixed by the coarse bounds and
+reuses the full existing histogram, without increasing shared memory. It stops
+when candidates fit or all remaining keys are identical. Truncation is safe only
+in the latter case. Ordered integer bounds preserve nearest-even FP16 bucket
+boundaries, including negative midpoints, signed zero and infinities. Candidates
+retain their integer keys through tie selection so subnormal scores remain
+distinct under CUDA fast math. Cluster ranks reduce every refinement histogram
+together before collecting candidates.
 
 ## Index-K plane formats
 

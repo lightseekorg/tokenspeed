@@ -69,14 +69,27 @@ def assert_selection(scores, lengths, output):
 @pytest.mark.parametrize("topk", [512, 1024, 2048])
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize(
-    "distribution", ["positive", "negative", "fp16_overflow", "subnormal"]
+    "distribution",
+    [
+        "positive",
+        "negative",
+        "fp16_overflow",
+        "negative_fp16_overflow",
+        "subnormal",
+        "negative_subnormal",
+    ],
 )
 def test_threshold_bucket_overflow(rows, width, topk, enable_pdl, distribution):
     columns = torch.arange(width, device="cuda", dtype=torch.float32)
-    if distribution == "subnormal":
-        row = (columns.to(torch.int32) * 16 + 1).view(torch.float32)
-    elif distribution == "fp16_overflow":
-        row = 1.0e6 + columns * 0.125
+    if distribution in ("subnormal", "negative_subnormal"):
+        bits = columns.to(torch.int32) * 16 + 1
+        if distribution == "negative_subnormal":
+            bits |= -2147483648
+        row = bits.view(torch.float32)
+    elif distribution in ("fp16_overflow", "negative_fp16_overflow"):
+        row = (-1.0e6 if distribution == "negative_fp16_overflow" else 1.0e6) + (
+            columns * 0.125
+        )
     else:
         row = (1.0 if distribution == "positive" else -1.0) + columns * 2**-23
     scores = row.expand(rows, -1).contiguous()
@@ -97,6 +110,40 @@ def test_threshold_bucket_overflow(rows, width, topk, enable_pdl, distribution):
     assert_selection(scores, lengths, output)
 
 
+@pytest.mark.parametrize("rows,width", SHAPES)
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("candidate_count", [2047, 2048, 2049, 4097])
+@pytest.mark.parametrize("negative", [False, True])
+def test_threshold_capacity_partial_ties(rows, width, topk, candidate_count, negative):
+    # Exercise both sides of the candidate capacity with unequal scores and
+    # repeated cutoff values scattered across lanes and cluster ranks.
+    length = width - 3
+    generator = torch.Generator(device="cuda").manual_seed(81)
+    positions = torch.randperm(length, device="cuda", generator=generator)
+    scores = torch.full((rows, width), -float("inf"), device="cuda")
+    above_count = topk // 2 + 1
+    scores[:, positions[:above_count]] = float("inf")
+    ranks = torch.arange(candidate_count, device="cuda") % 67
+    values = (-1.0 if negative else 1.0) + ranks * 2**-23
+    scores[:, positions[above_count : above_count + candidate_count]] = values
+    scores[:, length:] = float("nan")
+    lengths = torch.full((rows,), length, device="cuda", dtype=torch.int32)
+    storage = torch.full((rows * topk + 16,), -77, device="cuda", dtype=torch.int32)
+    output = storage[8:-8].view(rows, topk)
+    persistent_topk(
+        scores,
+        lengths,
+        output,
+        topk,
+        width,
+        q_len_per_req=1,
+        enable_pdl=True,
+    )
+    assert_selection(scores, lengths, output)
+    assert bool((storage[:8] == -77).all())
+    assert bool((storage[-8:] == -77).all())
+
+
 @pytest.mark.parametrize(
     "rows,width,hist_bits",
     [(1, 8192, 12), (33, 32768, 12), (1, 65536, 9), (1, 131072, 10)],
@@ -112,6 +159,43 @@ def test_negative_coarse_bucket_midpoint(rows, width, hist_bits):
     scores[:, :1024] = midpoint
     scores[:, -topk // 2 :] = -0.5
     lengths = torch.full((rows,), width, device="cuda", dtype=torch.int32)
+    output = torch.full((rows, topk), -77, device="cuda", dtype=torch.int32)
+    persistent_topk(
+        scores,
+        lengths,
+        output,
+        topk,
+        width,
+        q_len_per_req=1,
+        enable_pdl=False,
+    )
+    assert_selection(scores, lengths, output)
+
+
+@pytest.mark.parametrize(
+    "rows,width,hist_bits",
+    [(1, 8192, 12), (33, 32768, 12), (1, 65536, 9), (1, 131072, 10)],
+)
+@pytest.mark.parametrize(
+    "half_key", [0x0400, 0x0480, 0x7F80, 0x8000, 0x8080, 0xBC00, 0xFB80, 0xFC00]
+)
+def test_coarse_bucket_boundary_neighbors(rows, width, hist_bits, half_key):
+    edge = (half_key >> (16 - hist_bits)) << (16 - hist_bits)
+    keys = [edge - 1, edge]
+    bits = [key ^ 0x8000 if key >= 0x8000 else ~key & 0xFFFF for key in keys]
+    neighbors = torch.tensor(bits, dtype=torch.uint16).view(torch.float16).float()
+    # Infinity's ideal finite neighbor gives the FP16 overflow midpoint.
+    neighbors.clamp_(-65536, 65536)
+    midpoint = neighbors.mean()
+    below = torch.nextafter(midpoint, torch.tensor(-float("inf")))
+    above = torch.nextafter(midpoint, torch.tensor(float("inf")))
+    values = torch.stack([below, midpoint, above]).repeat(1024).to("cuda")
+    topk = 512
+    scores = torch.full((rows, width), -float("inf"), device="cuda")
+    scores[:, : topk - 1] = float("inf")
+    scores[:, topk - 1 : topk - 1 + values.numel()] = values
+    lengths = torch.full((rows,), width - 1, device="cuda", dtype=torch.int32)
+    scores[:, -1] = float("nan")
     output = torch.full((rows, topk), -77, device="cuda", dtype=torch.int32)
     persistent_topk(
         scores,
@@ -217,6 +301,52 @@ def test_overflow_graph_refresh(rows, width, enable_pdl):
         select()
     for length in [width, 0, 17, topk, width - 1, 4096, width]:
         lengths.fill_(length)
+        output.fill_(-77)
+        graph.replay()
+        assert_selection(scores, lengths, output)
+
+
+@pytest.mark.parametrize("width", [8192, 131072, 262144])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_graph_refresh_threshold_buckets(width, enable_pdl):
+    rows, topk = 8, 512
+    scores = torch.empty((rows, width), device="cuda")
+    lengths = torch.empty(rows, device="cuda", dtype=torch.int32)
+    output = torch.full((rows, topk), -77, device="cuda", dtype=torch.int32)
+    columns = torch.arange(width, device="cuda")
+
+    def select():
+        persistent_topk(
+            scores,
+            lengths,
+            output,
+            topk,
+            width,
+            q_len_per_req=1,
+            enable_pdl=enable_pdl,
+        )
+
+    scores.normal_()
+    lengths.fill_(width)
+    select()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        select()
+    for iteration in range(6):
+        if iteration % 3 == 0:
+            scores.copy_(1.0 + columns * 2**-23)
+        elif iteration % 3 == 1:
+            scores.normal_()
+        else:
+            scores.fill_(-float("inf"))
+        lengths.copy_(
+            torch.tensor(
+                [width, width - 1, width - 3, 32769, 16383, topk + 1, 17, 0],
+                device="cuda",
+                dtype=torch.int32,
+            ).clamp_max(width)
+        )
+        scores.masked_fill_(columns[None, :] >= lengths[:, None], float("nan"))
         output.fill_(-77)
         graph.replay()
         assert_selection(scores, lengths, output)
