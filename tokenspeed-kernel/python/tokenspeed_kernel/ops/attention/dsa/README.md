@@ -41,6 +41,22 @@ CUDA Graph replay may change the lengths without changing allocation or launch
 capacity. QSA passes its complete compressed-block counts to both CUDA and
 Triton selection, so its scorer writes only valid prefixes.
 
+## Persistent CUDA row top-k
+
+`persistent_topk` selects unsorted indices for `k` of 512, 1024 or 2048.
+It reads only the visible prefix, applies causal lengths for grouped queries,
+and pads short rows with `-1`. Equal scores may select any distinct tied indices.
+
+The register, streaming and cluster implementations share a coarse FP16
+histogram followed by exact FP32 selection. If the threshold bucket exceeds
+the 2048-entry candidate buffer, additional FP32 radix passes narrow it before
+collection. Truncation is safe only once all remaining candidates have the same
+exact score. Ordered integer bounds preserve nearest-even FP16 bucket boundaries,
+including negative midpoints, signed zero and infinities. Candidates retain their
+integer keys through tie selection so subnormal scores remain distinct under
+CUDA fast math. Cluster ranks reduce every refinement histogram together before
+collecting candidates.
+
 ## Index-K plane formats
 
 `dsa_prefill_topk` and `dsa_decode_topk` read the storage of the index-key
