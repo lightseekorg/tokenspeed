@@ -251,7 +251,8 @@ CPU/GPU profiler sessions enable PyTorch's experimental all-thread capture so
 the already-running forward thread is included. The actual model-forward
 closure emits `tokenspeed.forward.v1:` followed by compact JSON with `mode`,
 `num_extends`, ordered `request_ids`, per-request current-step `input_lengths`,
-total-prompt `prefill_lengths`, and prefill-only `extend_prefix_lens`.
+total-prompt `prefill_lengths`, and `extend_prefix_lens` on every forward
+batch (an empty list when the batch has no extends).
 The mode is derived from the immutable submitted batch, including MIXED and
 IDLE, not from result-commit time or a stage-profile filename.
 

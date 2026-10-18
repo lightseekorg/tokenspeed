@@ -171,7 +171,12 @@ def test_qk_ranked_selection_runs_triton_exactly_where_its_guard_admits(
 @pytest.mark.parametrize(
     "change", ["dtype", "positions", "eps", "rows", "shape", "dequant"]
 )
-def test_qk_by_name_rejects_before_any_device_launch(change):
+def test_qk_by_name_rejects_before_any_device_launch(
+    change, mi350_platform, monkeypatch
+):
+    """Each case raises for its own reason: CUDA metadata and the gfx950
+    platform admit the default arguments, so only ``change`` can reject."""
+    monkeypatch.setattr(Platform, "_instance", mi350_platform)
     args = list(_qk())
     extra = {}
     if change == "dtype":
@@ -187,4 +192,4 @@ def test_qk_by_name_rejects_before_any_device_launch(change):
     else:
         extra["dequant"] = object()
     with pytest.raises(ValueError):
-        gluon.gluon_qk_rmsnorm_ssmax_gfx950(*args, **extra)
+        gluon.gluon_qk_rmsnorm_ssmax_gfx950(*_on_cuda(tuple(args)), **extra)
