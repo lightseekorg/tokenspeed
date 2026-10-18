@@ -252,7 +252,7 @@ def test_iris_allreduce_sizes():
     buf = torch.empty(1 << 22, device=DEVICE, dtype=torch.bfloat16)
     flags = torch.zeros(1024, device=DEVICE, dtype=torch.int32)
     heaps = [1 << 40] * 8
-    common = dict(RANK=0, WORLD_SIZE=8, SUBGROUP_SIZE=64, WORDS_PER_LANE=2)
+    common = dict(RANK=0, WORLD_SIZE=8, WORDS_PER_LANE=2)
     common.update(ELEMENT_DTYPE=gl.bfloat16, ELEMENTS_PER_WORD=4)
 
     # Compile only: the allreduce itself needs the symmetric heap of every rank.
@@ -270,6 +270,7 @@ def test_iris_allreduce_sizes():
             NUM_TILES=tiles,
             NUM_WARPS=8,
             EXIT_BARRIER=True,
+            FLAG_ROW_STRIDE=32,
             num_warps=8,
             grid=(1,),
             **common,

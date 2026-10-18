@@ -21,7 +21,7 @@
 """K3 attn all-reduce with an AttnRes epilogue using precomputed history partials."""
 
 import torch
-from tokenspeed_kernel._triton import gl, gluon, triton
+from tokenspeed_kernel._triton import gl, gluon, hip_utils, triton
 from tokenspeed_kernel.ops.communication._iris import IrisGroup, allocation_bytes
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_drain_subgroup_vmem,
@@ -156,7 +156,6 @@ class IrisAttnResState:
             EPS=eps,
             ELEMENTS_PER_THREAD=_ELEMENTS_PER_THREAD,
             NUM_WARPS=_NUM_SUBGROUPS,
-            SUBGROUP_SIZE=64,
             num_warps=_NUM_SUBGROUPS,
         )
         return hidden, residual_out
@@ -276,7 +275,6 @@ def iris_k3attn_push_oneshot(
     EPS: gl.constexpr,
     ELEMENTS_PER_THREAD: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
 ):
     """Push K3 attn rows into two alternating inboxes and reduce in rank order.
 
@@ -284,6 +282,7 @@ def iris_k3attn_push_oneshot(
     and RMS-normalize the BF16 mixture. Per-row generations guard slot reuse.
     """
     row = gl.program_id(0)
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // hip_utils.num_warps()
     layout: gl.constexpr = gl.BlockedLayout(
         [ELEMENTS_PER_THREAD], [SUBGROUP_SIZE], [NUM_WARPS], [0]
     )
@@ -352,7 +351,6 @@ def iris_k3attn_push_oneshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
     )
     local_inbox = inbox_sym_ptr + inbox_slot_offset
 
