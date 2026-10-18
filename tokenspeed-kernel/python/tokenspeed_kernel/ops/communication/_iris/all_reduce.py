@@ -158,9 +158,11 @@ def _launch_pull_twoshot(
     out: torch.Tensor,
     *,
     exit_barrier: bool,
+    hc_post: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     elements_per_word = _PACKED_WORD_BYTES // inputs.element_size()
-    partition_words = out.numel() // peers.world_size // elements_per_word
+    numel = out.numel() if hc_post is None else out.numel() // 4
+    partition_words = numel // peers.world_size // elements_per_word
     block_words = (
         _TWO_SHOT_NUM_SUBGROUPS
         * _SUBGROUP_SIZE
@@ -187,8 +189,25 @@ def _launch_pull_twoshot(
         ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
         ELEMENTS_PER_WORD=elements_per_word,
         EXIT_BARRIER=exit_barrier,
+        **_hc_post_args(hc_post, elements_per_word),
         num_warps=_TWO_SHOT_NUM_SUBGROUPS,
     )
+
+
+def _hc_post_args(
+    hc_post: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    elements_per_word: int,
+) -> dict:
+    if hc_post is None:
+        return {}
+    residual, post, comb = hc_post
+    return {
+        "residual": residual,
+        "post": post,
+        "comb": comb,
+        "HIDDEN_WORDS": residual.shape[-1] // elements_per_word,
+        "HC_POST": True,
+    }
 
 
 class StagedPullTwoShot:
@@ -279,16 +298,32 @@ class ProducerPull:
             data.numel() * data.element_size(),
         )
 
-    def run(self, out: torch.Tensor) -> None:
+    def run(
+        self,
+        out: torch.Tensor,
+        hc_post: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> None:
+        """Reduce the producer outputs into out.
+
+        With hc_post = (residual [T,4,H], post [T,4], comb [T,4,4]), out is the
+        new BF16 residual [T,4,H]: the mHC post of the reduced [T,H] rows.
+        """
         peers = self.producer.peers
         inputs = self.producer.data
-        if _use_two_stage_producer_direct(peers.world_size, out.numel(), inputs.dtype):
+        numel = out.numel() if hc_post is None else out.numel() // 4
+        if _use_two_stage_producer_direct(peers.world_size, numel, inputs.dtype):
             assert self.scratch is not None
             _launch_pull_twoshot(
-                peers, inputs, self.scratch, self.ready_flags, out, exit_barrier=False
+                peers,
+                inputs,
+                self.scratch,
+                self.ready_flags,
+                out,
+                exit_barrier=False,
+                hc_post=hc_post,
             )
             return
-        num_tiles = triton.cdiv(out.numel(), self.BLOCK_SIZE)
+        num_tiles = triton.cdiv(numel, self.BLOCK_SIZE)
         num_programs = min(num_tiles, _PULL_MAX_PROGRAMS)
         iris_pull_oneshot[(num_programs,)](
             inputs,
@@ -297,7 +332,7 @@ class ProducerPull:
             *peers.addresses,
             RANK=peers.rank,
             WORLD_SIZE=peers.world_size,
-            TOTAL_NUMEL=out.numel(),
+            TOTAL_NUMEL=numel,
             BLOCK_SIZE=self.BLOCK_SIZE,
             NUM_PROGRAMS=num_programs,
             NUM_TILES=num_tiles,
@@ -307,6 +342,7 @@ class ProducerPull:
             PUBLISH_READY=False,
             ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
             ELEMENTS_PER_WORD=_PACKED_WORD_BYTES // inputs.element_size(),
+            **_hc_post_args(hc_post, _PACKED_WORD_BYTES // inputs.element_size()),
             num_warps=self.NUM_SUBGROUPS,
         )
 
@@ -914,6 +950,63 @@ def _pack_word(
 
 
 @gluon.jit
+def _mhc_post_words(
+    x_0,
+    x_1,
+    x_2,
+    x_3,
+    word,
+    mask,
+    residual,
+    post,
+    comb,
+    out,
+    HIDDEN_WORDS: gl.constexpr,
+):
+    """Store the hc=4 mHC post of reduced BF16 words into the new residual.
+
+    ``word`` indexes four consecutive hidden values of one token in the
+    reduced [tokens, hidden] output. Residual and output are packed
+    [tokens, 4, hidden] streams; ``post`` is FP32 [tokens, 4] and ``comb``
+    FP32 [tokens, 4 input, 4 output]. The arithmetic follows
+    gluon_mhc_post_gfx950: post * x first, then input streams 0..3.
+    """
+    token = word // HIDDEN_WORDS
+    base = token * (4 * HIDDEN_WORDS) + word % HIDDEN_WORDS
+    words = tl.cast(residual, gl.pointer_type(gl.uint64))
+    r0 = _unpack_16bitx4(gl.load(words + base, mask=mask, other=0), gl.bfloat16)
+    r1 = _unpack_16bitx4(
+        gl.load(words + base + HIDDEN_WORDS, mask=mask, other=0), gl.bfloat16
+    )
+    r2 = _unpack_16bitx4(
+        gl.load(words + base + 2 * HIDDEN_WORDS, mask=mask, other=0), gl.bfloat16
+    )
+    r3 = _unpack_16bitx4(
+        gl.load(words + base + 3 * HIDDEN_WORDS, mask=mask, other=0), gl.bfloat16
+    )
+    x = (x_0, x_1, x_2, x_3)
+    for j in gl.static_range(4):
+        p = gl.load(post + token * 4 + j, mask=mask, other=0.0)
+        c0 = gl.load(comb + token * 16 + j, mask=mask, other=0.0)
+        c1 = gl.load(comb + token * 16 + 4 + j, mask=mask, other=0.0)
+        c2 = gl.load(comb + token * 16 + 8 + j, mask=mask, other=0.0)
+        c3 = gl.load(comb + token * 16 + 12 + j, mask=mask, other=0.0)
+        values = ()
+        for k in gl.static_range(4):
+            value = p * x[k].to(gl.float32)
+            value += c0 * r0[k].to(gl.float32)
+            value += c1 * r1[k].to(gl.float32)
+            value += c2 * r2[k].to(gl.float32)
+            value += c3 * r3[k].to(gl.float32)
+            values = values + (value,)
+        gl.store(
+            tl.cast(out, gl.pointer_type(gl.uint64)) + base + j * HIDDEN_WORDS,
+            _pack_16bitx4(values[0], values[1], values[2], values[3], gl.bfloat16),
+            mask=mask,
+        )
+
+
+@gluon.jit
 def iris_pull_oneshot(
     input_sym_ptr,
     output_ptr,
@@ -940,8 +1033,16 @@ def iris_pull_oneshot(
     PUBLISH_READY: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
+    residual=None,
+    post=None,
+    comb=None,
+    HIDDEN_WORDS: gl.constexpr = 0,
+    HC_POST: gl.constexpr = False,
 ):
     """Pull every rank's contributions and write the full reduced output locally.
+
+    With HC_POST, output_ptr instead receives the BF16 hc=4 mHC post of the
+    reduced rows (see _mhc_post_words).
 
     input_sym_ptr holds consecutive producer outputs; output_ptr receives their
     FP32 sum rounded to ELEMENT_DTYPE. ready_flags coordinate input publication
@@ -1040,12 +1141,28 @@ def iris_pull_oneshot(
             ELEMENT_DTYPE,
             ELEMENTS_PER_WORD,
         )
-        gl.amd.cdna4.buffer_store(
-            packed_output,
-            tl.cast(output_ptr, gl.pointer_type(gl.uint64)),
-            packed_offset.to(gl.int32),
-            mask=mask,
-        )
+        if HC_POST:
+            x_0, x_1, x_2, x_3 = _unpack_16bitx4(packed_output, gl.bfloat16)
+            _mhc_post_words(
+                x_0,
+                x_1,
+                x_2,
+                x_3,
+                packed_offset,
+                mask,
+                residual,
+                post,
+                comb,
+                output_ptr,
+                HIDDEN_WORDS,
+            )
+        else:
+            gl.amd.cdna4.buffer_store(
+                packed_output,
+                tl.cast(output_ptr, gl.pointer_type(gl.uint64)),
+                packed_offset.to(gl.int32),
+                mask=mask,
+            )
         tile_id += NUM_PROGRAMS
 
     # Do not return while a peer program can still be reading this rank's
@@ -1100,8 +1217,16 @@ def iris_pull_twoshot(
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
     EXIT_BARRIER: gl.constexpr,
+    residual=None,
+    post=None,
+    comb=None,
+    HIDDEN_WORDS: gl.constexpr = 0,
+    HC_POST: gl.constexpr = False,
 ):
     """Reduce-scatter producer outputs, then all-gather the rank partitions.
+
+    With HC_POST, output_ptr instead receives the BF16 hc=4 mHC post of the
+    gathered rows (see _mhc_post_words).
 
     Sum this rank's consecutive input partition in FP32 and store it in
     scratch_sym_ptr at the input dtype. Pull all peers' reduced partitions into
@@ -1257,11 +1382,27 @@ def iris_pull_twoshot(
         output_offset = gl.expand_dims(peer_ids * PARTITION_WORDS, 1) + gl.expand_dims(
             partition_offset, 0
         )
-        gl.store(
-            tl.cast(output_ptr, gl.pointer_type(gl.uint64)) + output_offset,
-            values,
-            mask=gl.expand_dims(mask, 0),
-        )
+        if HC_POST:
+            x_0, x_1, x_2, x_3 = _unpack_16bitx4(values, gl.bfloat16)
+            _mhc_post_words(
+                x_0,
+                x_1,
+                x_2,
+                x_3,
+                output_offset,
+                gl.expand_dims(mask, 0) & (output_offset >= 0),
+                residual,
+                post,
+                comb,
+                output_ptr,
+                HIDDEN_WORDS,
+            )
+        else:
+            gl.store(
+                tl.cast(output_ptr, gl.pointer_type(gl.uint64)) + output_offset,
+                values,
+                mask=gl.expand_dims(mask, 0),
+            )
         tile_id += NUM_PROGRAMS
 
     if EXIT_BARRIER:

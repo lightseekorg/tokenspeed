@@ -104,6 +104,7 @@ from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_all_reduce_outputs,
     all_reduce,
+    all_reduce_mhc_post,
     can_acquire_all_reduce_outputs,
 )
 from tokenspeed.runtime.distributed.pp_stage import PPStageState
@@ -668,6 +669,24 @@ def _all_reduce_output(
     return acquire_all_reduce_outputs((shape,), like, group)[0]
 
 
+def _reduce_hc_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    group,
+) -> torch.Tensor:
+    """mHC post of x, all-reduced over group first unless group is None."""
+    if group is not None:
+        fused = (
+            all_reduce_mhc_post(x, residual, post, comb, group) if x.is_cuda else None
+        )
+        if fused is not None:
+            return fused
+        x = all_reduce(x, group=group, backend=None, op=torch.distributed.ReduceOp.SUM)
+    return v41_hc_post(x, residual, post, comb)
+
+
 def _v41_hc_input_fp8(
     x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
@@ -1003,9 +1022,11 @@ class DeepseekV41Attention(nn.Module):
         ctx: ForwardContext,
         hidden_codes: torch.Tensor | None = None,
         hidden_scales: torch.Tensor | None = None,
+        reduce_output: bool = True,
     ) -> torch.Tensor:
         """hidden_codes/hidden_scales optionally carry hidden_states already
-        quantized for wq_a_wkv (group-32 E4M3 codes and UE8M0 scales)."""
+        quantized for wq_a_wkv (group-32 E4M3 codes and UE8M0 scales). With
+        reduce_output False the attention-TP partial is returned unreduced."""
         backend, mode = ctx.attn_backend, ctx.forward_mode
         if mode is None:
             raise ValueError("V4.1 attention requires an explicit forward mode")
@@ -1203,7 +1224,7 @@ class DeepseekV41Attention(nn.Module):
                 (out.shape[0], self.wo_b.output_size), out, self.mapping.attn.tp_group
             )
         out, _ = self.wo_b(out, scale=None, out=target)
-        if self.mapping.attn.has_tp:
+        if self.mapping.attn.has_tp and reduce_output:
             out = all_reduce(
                 out,
                 group=self.mapping.attn.tp_group,
@@ -1396,7 +1417,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                     None,
                     None,
                 )
-            x = self.attn(positions, x, ctx, codes, scales)
+            x = self.attn(positions, x, ctx, codes, scales, False)
         if rows.keep_rows is not None:
             # Keep mHC's original split-K shape before selecting the tail.
             residual, post, comb, attn_pre = (
@@ -1405,7 +1426,13 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
             if image_mask is not None:
                 image_mask = image_mask.index_select(0, rows.keep_rows)
-        hidden_states = v41_hc_post(x, residual, post, comb)
+        hidden_states = _reduce_hc_post(
+            x,
+            residual,
+            post,
+            comb,
+            self.attn.mapping.attn.tp_group if self.attn.mapping.attn.has_tp else None,
+        )
         residual = hidden_states
         if overlap:
             residual.record_stream(self.hc_stream_fork.aux_stream)
@@ -1424,15 +1451,21 @@ class DeepseekV41DecoderLayer(nn.Module):
                 for tensor in (ffn_pre, post, comb):
                     tensor.record_stream(consumer)
             x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
-            x = self._forward_ffn(x, image_mask, ctx)
-        return v41_hc_post(x, residual, post, comb), ffn_pre
+            x, group = self._forward_ffn(x, image_mask, ctx, True)
+        return _reduce_hc_post(x, residual, post, comb, group), ffn_pre
 
-    def _forward_ffn(self, x, image_mask, ctx):
+    def _forward_ffn(self, x, image_mask, ctx, defer_reduce=False):
+        """MoE output after its communication.
+
+        With defer_reduce, return (output, group): a pending plain all-reduce
+        over group is left to the caller, or group is None when the output is
+        final.
+        """
         # Fused EP returns this rank's rows, including an empty tensor on idle
         # ranks. HC residuals therefore stay local across dispatch/combine.
         if self.ffn.owns_ep_communication:
             counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
-            return self.ffn(
+            out = self.ffn(
                 x,
                 image_mask,
                 sum(counts),
@@ -1440,19 +1473,22 @@ class DeepseekV41DecoderLayer(nn.Module):
                 ctx=ctx if self.ffn.use_mega_moe else None,
                 comm_manager=self.comm_manager if self.ffn.use_mega_moe else None,
             )
+            return (out, None) if defer_reduce else out
         x = self.comm_manager.pre_mlp_comm(x, ctx)
         total, maximum = self.comm_manager.get_num_tokens(ctx)
+        all_reduced = self.comm_manager.moe_output_all_reduced(ctx)
+        group = self.comm_manager.mapping.moe.tp_ep_group
         target = None
-        if x.shape[0] and self.comm_manager.moe_output_all_reduced(ctx):
+        if x.shape[0] and all_reduced:
             # The routed + shared sum lands where the all-reduce reads it.
-            target = _all_reduce_output(
-                tuple(x.shape), x, self.comm_manager.mapping.moe.tp_ep_group
-            )
+            target = _all_reduce_output(tuple(x.shape), x, group)
         x = self.ffn(
             x, image_mask, total, maximum, ctx=None, comm_manager=None, out=target
         )
+        if defer_reduce and all_reduced:
+            return x, group
         x, _ = self.comm_manager.post_mlp_comm(x, None, ctx)
-        return x
+        return (x, None) if defer_reduce else x
 
 
 def _ced_decoder_start(config) -> int:

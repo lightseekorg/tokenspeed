@@ -406,6 +406,24 @@ class AutoBackend(CommBackend):
             return self._iris.all_reduce(tensor, group, op=op)
         return self._nccl.all_reduce(tensor, group, op=op)
 
+    def all_reduce_mhc_post(
+        self,
+        tensor: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        group: Group,
+    ) -> torch.Tensor | None:
+        # Same eligibility as the producer-direct all-reduce in _all_reduce_one.
+        if (
+            not current_platform().is_amd
+            or self.route(Collective.ALL_REDUCE, tensor, group) is not Route.TIERED
+            or self._trtllm_ar.has_trtllm_ar(group)
+            or self._group_spans_nodes(group)
+        ):
+            return None
+        return self._iris.all_reduce_mhc_post(tensor, residual, post, comb, group)
+
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         return self._trtllm_ar.ensure_group_lane(group, hidden_dim)
 
