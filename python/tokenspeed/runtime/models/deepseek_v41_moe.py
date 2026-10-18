@@ -506,7 +506,10 @@ class DeepseekV4MoE(nn.Module):
         input_ids: torch.Tensor,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``out`` optionally receives the routed + shared sum (e.g. memory the
+        following all-reduce reads in place)."""
         if hidden_states.shape[0] == 0 and not self.use_gluon_petit:
             return hidden_states
         with nvtx_range("moe_select_experts"):
@@ -530,7 +533,7 @@ class DeepseekV4MoE(nn.Module):
         if deferred_finalize:
             # Reduce routed rows and add the shared expert in one finalize.
             gemm2_out, expert_weights, expanded_idx = routed
-            return moe_finalize_fuse_shared(
+            result = moe_finalize_fuse_shared(
                 gemm2_out,
                 expanded_idx,
                 expert_weights,
@@ -539,7 +542,10 @@ class DeepseekV4MoE(nn.Module):
                 enable_pdl=pdl_enabled(),
                 hidden_dim=hidden_states.shape[-1],
             )
-        return routed + shared if shared is not None else routed
+            return result if out is None else out.copy_(result)
+        if shared is None:
+            return routed if out is None else out.copy_(routed)
+        return torch.add(routed, shared, out=out)
 
     def forward(
         self,
@@ -549,6 +555,7 @@ class DeepseekV4MoE(nn.Module):
         max_num_tokens_per_gpu: int,
         ctx: ForwardContext | None = None,
         comm_manager: CommManager | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.use_mega_moe:
             return self.forward_mega_moe(
@@ -560,5 +567,5 @@ class DeepseekV4MoE(nn.Module):
                 comm_manager,
             )
         return self.forward_normal(
-            hidden_states, input_ids, num_global_tokens, max_num_tokens_per_gpu
+            hidden_states, input_ids, num_global_tokens, max_num_tokens_per_gpu, out
         )

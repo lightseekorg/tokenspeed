@@ -239,8 +239,16 @@ class _DenseFFN(nn.Module):
         self.owns_ep_communication = False
 
     def forward(
-        self, x, input_ids, num_global_tokens, max_num_tokens_per_gpu, ctx, comm_manager
+        self,
+        x,
+        input_ids,
+        num_global_tokens,
+        max_num_tokens_per_gpu,
+        ctx,
+        comm_manager,
+        out=None,
     ):
+        assert out is None
         return F.linear(F.silu(x.float()).to(x.dtype), self.weight)
 
 

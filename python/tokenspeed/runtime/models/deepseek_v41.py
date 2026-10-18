@@ -101,7 +101,11 @@ from torch import nn
 from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
+from tokenspeed.runtime.distributed.comm_ops import (
+    acquire_all_reduce_outputs,
+    all_reduce,
+    can_acquire_all_reduce_outputs,
+)
 from tokenspeed.runtime.distributed.pp_stage import PPStageState
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
@@ -655,6 +659,15 @@ def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Te
     )
 
 
+def _all_reduce_output(
+    shape: tuple[int, int], like: torch.Tensor, group
+) -> torch.Tensor | None:
+    """Memory the all-reduce over ``group`` reads without staging, or None."""
+    if not can_acquire_all_reduce_outputs((shape,), like, group):
+        return None
+    return acquire_all_reduce_outputs((shape,), like, group)[0]
+
+
 def _v41_hc_input_fp8(
     x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
@@ -1184,7 +1197,12 @@ class DeepseekV41Attention(nn.Module):
         grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
         weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
         out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
-        out, _ = self.wo_b(out, scale=None)
+        target = None
+        if self.mapping.attn.has_tp:
+            target = _all_reduce_output(
+                (out.shape[0], self.wo_b.output_size), out, self.mapping.attn.tp_group
+            )
+        out, _ = self.wo_b(out, scale=None, out=target)
         if self.mapping.attn.has_tp:
             out = all_reduce(
                 out,
@@ -1424,7 +1442,15 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
         x = self.comm_manager.pre_mlp_comm(x, ctx)
         total, maximum = self.comm_manager.get_num_tokens(ctx)
-        x = self.ffn(x, image_mask, total, maximum, ctx=None, comm_manager=None)
+        target = None
+        if x.shape[0] and self.comm_manager.moe_output_all_reduced(ctx):
+            # The routed + shared sum lands where the all-reduce reads it.
+            target = _all_reduce_output(
+                tuple(x.shape), x, self.comm_manager.mapping.moe.tp_ep_group
+            )
+        x = self.ffn(
+            x, image_mask, total, maximum, ctx=None, comm_manager=None, out=target
+        )
         x, _ = self.comm_manager.post_mlp_comm(x, None, ctx)
         return x
 
