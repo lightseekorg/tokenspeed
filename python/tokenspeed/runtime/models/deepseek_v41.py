@@ -988,7 +988,7 @@ class DeepseekV41Attention(nn.Module):
         if (
             qr.is_cuda
             and qr.dtype == torch.bfloat16
-            and current_platform().is_nvidia
+            and (current_platform().is_nvidia or current_platform().is_cdna4)
             and isinstance(self.wq_b.quant_method, _ReferenceFp8LinearMethod)
         ):
             qr, q_input, q_scale = rmsnorm_quantize_fp8_group32(

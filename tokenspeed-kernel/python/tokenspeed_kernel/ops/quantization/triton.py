@@ -1515,7 +1515,7 @@ def triton_gated_fp8_quantize(
     "rmsnorm_fp8_group32_ue8m0",
     name="triton_rmsnorm_fp8_group32_ue8m0",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
     signatures=format_signatures("x", "dense", {torch.bfloat16}),
     traits={},
     priority=Priority.PORTABLE,
