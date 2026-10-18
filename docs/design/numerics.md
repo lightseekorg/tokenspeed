@@ -384,6 +384,11 @@ exact conversion) instead of materializing an fp32 copy of the `[rows, vocab]`
 tensor first; because both paths go through the one function, whatever
 rounding the kernel applies is applied to both.
 
+Accepted stop tokens and length limits are applied on the device before
+recurrent-state commit and accepted-frontier updates. Ascend uses the same
+Triton stop-condition kernel during eager and NPUGraph execution; the scalar
+reference is kept off captured device streams.
+
 Top-k alternatives (`top_logprobs_num`, `torch` order only) follow the same
 rule: `top_token_logprobs`, beside it, takes a row's `top_k` largest entries
 of that fp32 log-softmax for the prompt rows and the prefill-sampled rows
