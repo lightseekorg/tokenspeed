@@ -207,6 +207,20 @@ class _EmbedDroppingDraft:
         return self.embedding, "DRAFT_HEAD"
 
 
+class _HeadAliasingDraft(_WeightSharingDraft):
+    """A draft that drafts with the head weight it aliased."""
+
+    def get_embed_and_head(self):
+        return self.embedding, self.shared[1]
+
+
+class _Fp8HeadMethod:
+    """A quantized LM head's method; wiring never runs it."""
+
+    def apply(self, layer, x, bias=None):
+        raise AssertionError("not called while wiring")
+
+
 def test_wire_mtp_shares_complete_lm_head_for_opted_in_draft():
     lm_head = object()
     target = _target_runner(
@@ -243,15 +257,7 @@ def test_wire_mtp_module_sharing_requires_target_lm_head():
 
 
 def test_wire_refuses_a_draft_aliasing_a_quantized_target_head_weight():
-    class Fp8HeadMethod:
-        def apply(self, layer, x, bias=None):
-            raise AssertionError("not called while wiring")
-
-    class HeadAliasingDraft(_WeightSharingDraft):
-        def get_embed_and_head(self):
-            return self.embedding, self.shared[1]
-
-    head = SimpleNamespace(weight="FP8_WEIGHT", quant_method=Fp8HeadMethod())
+    head = SimpleNamespace(weight="FP8_WEIGHT", quant_method=_Fp8HeadMethod())
     target = _target_runner(
         SimpleNamespace(
             lm_head=head,
@@ -262,10 +268,10 @@ def test_wire_refuses_a_draft_aliasing_a_quantized_target_head_weight():
 
     with (
         mock.patch.object(factory, "get_drafter_impl", return_value=Eagle),
-        pytest.raises(ValueError, match="Fp8HeadMethod.*complete module"),
+        pytest.raises(ValueError, match="_Fp8HeadMethod.*complete module"),
     ):
         factory.configure_draft_target(
-            _server_args("MTP"), target, _draft_runner(HeadAliasingDraft())
+            _server_args("MTP"), target, _draft_runner(_HeadAliasingDraft())
         )
     # A draft drafting with its own head (an EAGLE3 draft) is not refused.
     with mock.patch.object(factory, "get_drafter_impl", return_value=Eagle):
