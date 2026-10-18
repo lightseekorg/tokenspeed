@@ -25,6 +25,7 @@ const check = require('./check-commit-attribution.js');
 const head = 'a'.repeat(40);
 const linked = { email: 'contributor@example.invalid', user: { login: 'contributor' } };
 const unlinked = { email: 'unlinked@example.invalid', user: null };
+const bot = { email: 'contributor@example.invalid', user: { login: 'github-actions[bot]' } };
 
 function page(nodes, next) {
   return { nodes, pageInfo: { hasNextPage: next !== null, endCursor: next } };
@@ -57,8 +58,21 @@ async function run(graphql) {
 }
 
 test('accepts linked authors and co-authors without requiring public profile emails', async () => {
-  const result = await run(async () => pr([commit(head, [linked, linked], null)], null, head));
+  const botNamedUser = {
+    email: '243258330+lightseek-bot@users.noreply.github.com',
+    user: { login: 'lightseek-bot' },
+  };
+  const result = await run(async () => pr([commit(head, [botNamedUser, linked], null)], null, head));
   assert.deepEqual(result, { errors: [], failures: [] });
+});
+
+test('rejects a bot author based on its resolved account, not its raw email', async () => {
+  const result = await run(async () => pr([commit(head, [bot], null)], null, head));
+  assert.equal(result.errors.length, 1);
+  assert.match(result.errors[0], /author resolves to GitHub bot github-actions\[bot\]/);
+  assert.equal(result.failures.length, 1);
+  assert.match(result.failures[0], /Replace bot authors/);
+  assert.match(result.failures[0], /remove bot Co-authored-by trailers/);
 });
 
 test('reports unlinked authors and co-authors with repair instructions', async () => {
@@ -77,15 +91,16 @@ test('reports unlinked authors and co-authors with repair instructions', async (
 test('checks later pages of both commits and co-authors', async () => {
   const result = await run(async (_query, variables) => {
     if (variables.oid === head) {
-      return { repository: { object: { authors: page([unlinked], null) } } };
+      return { repository: { object: { authors: page([unlinked, bot], null) } } };
     }
     if (variables.cursor === 'next-commit') {
       return pr([commit(head, [linked], 'next-author')], null, head);
     }
     return pr([commit('b'.repeat(40), [linked], null)], 'next-commit', head);
   });
-  assert.equal(result.errors.length, 1);
+  assert.equal(result.errors.length, 2);
   assert.match(result.errors[0], /Co-authored-by email unlinked@example\.invalid/);
+  assert.match(result.errors[1], /Co-authored-by resolves to GitHub bot github-actions\[bot\]/);
   assert.equal(result.failures.length, 1);
 });
 
