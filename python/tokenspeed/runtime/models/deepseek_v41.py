@@ -1114,6 +1114,12 @@ class DeepseekV41Attention(nn.Module):
             if record.candidates is not None:
                 for tensor in (record.candidates.block_ids, record.candidates.lengths):
                     tensor.record_stream(consumer)
+        # CDNA4 rotates the attention output back inside the attention kernel.
+        out_rope_cache = (
+            self.rotary_emb.inverse_cos_sin_cache
+            if q.is_cuda and current_platform().is_cdna4
+            else None
+        )
         out = backend.forward_v41(
             q,
             swa,
@@ -1129,8 +1135,11 @@ class DeepseekV41Attention(nn.Module):
             swa_rope_cache=swa_rope_cache,
             swa_norm_weight=swa_norm_weight,
             swa_norm_eps=self.kv_norm.variance_epsilon,
+            out_rope_cache=out_rope_cache,
         )
-        out = self.rotary_emb.apply_owned(out[:, : self.n_local_heads], positions, True)
+        out = out[:, : self.n_local_heads]
+        if out_rope_cache is None:
+            out = self.rotary_emb.apply_owned(out, positions, True)
         grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
         weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
         out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
