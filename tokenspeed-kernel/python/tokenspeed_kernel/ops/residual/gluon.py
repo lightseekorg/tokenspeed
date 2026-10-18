@@ -406,7 +406,7 @@ if current_platform().is_amd:
     ) -> torch.Tensor:
         """Collapse four streams with ``pre`` and optional fused RMSNorm."""
         return launch_gluon_mhc_apply_pre_gfx950(
-            residual, pre, norm_weight=norm_weight, norm_eps=norm_eps
+            residual, pre, norm_weight=norm_weight, norm_eps=norm_eps, quantize=False
         )
 
     @register_kernel(

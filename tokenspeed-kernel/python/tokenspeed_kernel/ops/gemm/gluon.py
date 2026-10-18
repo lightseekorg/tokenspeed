@@ -394,7 +394,9 @@ if platform.is_amd:
         counters = zeroed_state(
             _grouped_decode_counters(m, g, n, k), dtype=torch.int32, device=x.device
         )
-        return _grouped_decode_impl(x, weight, counters=counters, out=out)
+        return _grouped_decode_impl(
+            x, weight, counters=counters, quantize=False, out=out
+        )
 
     @register_kernel(
         "gemm",
