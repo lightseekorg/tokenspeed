@@ -649,8 +649,16 @@ def gluon_mm_a16w16_medium_gfx950(
     SPLIT_K: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     PID_OFFSET: gl.constexpr = 0,
+    GROUPS: gl.constexpr = 1,
+    STRIDE_AG: gl.constexpr = 0,
+    STRIDE_BG: gl.constexpr = 0,
+    STRIDE_CG: gl.constexpr = 0,
 ):
     """MFMA/LDS dense16 GEMM for selected M <= 128 decode and middle-M tiles.
+
+    ``GROUPS > 1`` runs that many independent GEMMs in one launch: group g
+    reads A, B and writes C at element offsets g * STRIDE_AG/BG/CG and owns
+    its own split-K partials and counters.
 
     With ``SPLIT_K > 1`` each output tile is computed by ``SPLIT_K`` programs
     over disjoint K slices. Each stores its FP32 partial to ``partial_ptr`` and
@@ -664,6 +672,15 @@ def gluon_mm_a16w16_medium_gfx950(
     pid = gl.program_id(axis=0) - PID_OFFSET
     num_pid_m = gl.cdiv(M, BLOCK_M)
     num_pid_n = gl.cdiv(N, BLOCK_N)
+    if GROUPS > 1:
+        group_programs = num_pid_m * num_pid_n * SPLIT_K
+        group = pid // group_programs
+        pid = pid % group_programs
+        a_ptr += group * STRIDE_AG
+        b_ptr += group * STRIDE_BG
+        c_ptr += group * STRIDE_CG
+        partial_ptr += group * group_programs * (BLOCK_M * BLOCK_N)
+        counter_ptr += group * num_pid_m * num_pid_n
     if NUM_XCDS > 1:
         pid = _remap_xcd(pid, num_pid_m * num_pid_n * SPLIT_K, NUM_XCDS)
     if SPLIT_K == 1:
@@ -1786,6 +1803,150 @@ def launch_gluon_mm_a16w16_decode_gfx950(
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return C
+
+
+_GROUPED_M_BUCKETS = DECODE_M_BUCKETS + (128,)
+# Grouped decode GEMMs keyed by (groups, N, K), then M bucket; same tuple
+# layout as _DECODE_CONFIGS. Swept under graph replay on MI350X.
+_GROUPED_DECODE_CONFIGS: dict[
+    tuple[int, int, int], dict[int, tuple[int, int, int, int, int, int, int, int]]
+] = {
+    # DeepSeek V4.1 wo_a at TP4: two 1024x4096 groups.
+    (2, 1024, 4096): {
+        4: (16, 64, 256, 1, 4, 3, 4, 1),
+        8: (16, 64, 256, 1, 4, 3, 4, 1),
+        16: (16, 64, 256, 1, 4, 3, 4, 1),
+        32: (32, 32, 512, 2, 2, 2, 4, 1),
+        64: (32, 32, 512, 2, 2, 2, 2, 8),
+        128: (32, 32, 64, 2, 2, 3, 4, 8),
+    },
+}
+
+
+def _choose_grouped_decode_config(
+    M: int, G: int, N: int, K: int
+) -> tuple[int, int, int, int, int, int, int, int] | None:
+    if M < 1 or M > _GROUPED_M_BUCKETS[-1]:
+        return None
+    bucket = next(bound for bound in _GROUPED_M_BUCKETS if M <= bound)
+    return _GROUPED_DECODE_CONFIGS.get((G, N, K), {}).get(bucket)
+
+
+def supports_gluon_grouped_mm_a16w16_decode_gfx950(
+    M: int, G: int, N: int, K: int
+) -> bool:
+    """Whether the grouped decode GEMM has a measured config here."""
+    return _choose_grouped_decode_config(M, G, N, K) is not None
+
+
+def gluon_grouped_mm_a16w16_decode_num_counters_gfx950(
+    M: int, G: int, N: int, K: int
+) -> int:
+    """Split-K arrival counters a grouped decode launch needs; 0 without split-K."""
+    config = _choose_grouped_decode_config(M, G, N, K)
+    if config is None or config[6] == 1:
+        return 0
+    return G * triton.cdiv(M, config[0]) * triton.cdiv(N, config[1])
+
+
+def launch_gluon_grouped_mm_a16w16_decode_gfx950(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    counters: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute ``out[:, g] = x[:, g] @ weight[g].T`` for every group in one launch.
+
+    Args:
+        x: BF16/FP16 ``[M, G, K]`` with unit inner stride; token and group
+            strides are free (e.g. a slice of padded attention heads).
+        weight: Contiguous ``[G, N, K]`` weight in ``x``'s dtype.
+        counters: Zeroed int32 split-K counters, at least
+            ``gluon_grouped_mm_a16w16_decode_num_counters_gfx950`` of them; the
+            launch leaves them zeroed.
+        out: Optional contiguous ``[M, G, N]`` destination.
+
+    Returns:
+        ``[M, G, N]`` in ``x``'s dtype.
+    """
+    if x.ndim != 3 or weight.ndim != 3:
+        raise ValueError("grouped decode GEMM expects [M, G, K] and [G, N, K]")
+    M, G, K = x.shape
+    if weight.shape[0] != G or weight.shape[2] != K:
+        raise ValueError("grouped decode GEMM group/K mismatch")
+    N = weight.shape[1]
+    if x.dtype not in _SUPPORTED_DTYPES or weight.dtype != x.dtype:
+        raise TypeError("grouped decode GEMM expects matching fp16/bf16 operands")
+    if not x.is_cuda or weight.device != x.device:
+        raise ValueError("grouped decode GEMM requires colocated GPU tensors")
+    if (
+        x.stride(2) != 1
+        or x.stride(0) % 8
+        or x.stride(1) % 8
+        or x.data_ptr() % 16
+        or not weight.is_contiguous()
+    ):
+        raise ValueError("grouped decode GEMM needs 16-byte aligned rows")
+    config = _choose_grouped_decode_config(M, G, N, K)
+    if config is None:
+        raise ValueError(
+            f"grouped decode GEMM has no config for M={M} G={G} N={N} K={K}"
+        )
+    if out is None:
+        out = torch.empty((M, G, N), dtype=x.dtype, device=x.device)
+    elif out.shape != (M, G, N) or out.dtype != x.dtype or not out.is_contiguous():
+        raise ValueError("grouped decode GEMM out must be contiguous [M, G, N]")
+    block_m, block_n, block_k, warps_m, warps_n, num_buffers, split_k, num_xcds = config
+    num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    if split_k > 1:
+        check_splitk_counters(
+            counters, G * num_tiles, x.device, "gfx950 grouped decode GEMM"
+        )
+        partial = _get_partial_scratch(
+            x.device, G * num_tiles, split_k, block_n, block_m
+        )
+    else:
+        partial = counters = out
+    gluon_mm_a16w16_medium_gfx950[(G * num_tiles * split_k,)](
+        x,
+        weight,
+        out,
+        out,
+        out,
+        partial,
+        counters,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(2),
+        weight.stride(2),
+        weight.stride(1),
+        out.stride(0),
+        out.stride(2),
+        0,
+        0,
+        0,
+        0,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        WARPS_M=warps_m,
+        WARPS_N=warps_n,
+        NUM_BUFFERS=num_buffers,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        ADD3=False,
+        SPLIT_K=split_k,
+        NUM_XCDS=num_xcds,
+        GROUPS=G,
+        STRIDE_AG=x.stride(1),
+        STRIDE_BG=weight.stride(0),
+        STRIDE_CG=out.stride(1),
+        num_warps=warps_m * warps_n,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+    return out
 
 
 def supports_gluon_mm_a16w16_decode_add3_gfx950(M: int, N: int, K: int) -> bool:

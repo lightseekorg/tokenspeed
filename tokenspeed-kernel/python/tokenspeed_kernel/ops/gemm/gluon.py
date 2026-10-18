@@ -84,13 +84,22 @@ if platform.is_amd:
         supports_gluon_mm_a16w16_prefill_gfx950 as _supports_mm_a16w16_prefill,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        gluon_grouped_mm_a16w16_decode_num_counters_gfx950 as _grouped_decode_counters,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         gluon_mm_a16w16_decode_num_counters_gfx950 as _mm_a16w16_decode_counters,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         launch_gluon_bmm_a16w16_gfx950 as _bmm_a16w16_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        launch_gluon_grouped_mm_a16w16_decode_gfx950 as _grouped_decode_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         launch_gluon_mm_a16w16_decode_gfx950 as _mm_a16w16_decode_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        supports_gluon_grouped_mm_a16w16_decode_gfx950 as _supports_grouped_decode,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         supports_gluon_mm_a16w16_decode_gfx950 as _supports_mm_a16w16_decode,
@@ -341,6 +350,46 @@ if platform.is_amd:
         return _mm_a16w16_decode_impl(
             hidden_states, weight, torch.float32, counters=counters
         )
+
+    @register_kernel(
+        "gemm",
+        "grouped_bf16_projection",
+        name="gluon_grouped_bf16_projection_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            # Shapes with measured grouped decode GEMM configs (V4.1 wo_a TP4).
+            "batch": frozenset({2}),
+            "n": frozenset({1024}),
+            "k": frozenset({4096}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_contiguous": frozenset({True}),
+            "is_cuda": frozenset({True}),
+        },
+    )
+    def gluon_grouped_bf16_projection_gfx950(
+        x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
+    ) -> torch.Tensor:
+        """One-launch grouped decode GEMM writing ``[tokens, groups, rows]``
+        directly; torch.einsum for row counts without a measured config."""
+        m, g, k = x.shape
+        n = weight.shape[1]
+        if not _supports_grouped_decode(m, g, n, k):
+            result = torch.einsum("tgd,grd->tgr", x, weight)
+            return result if out is None else out.copy_(result)
+        counters = zeroed_state(
+            _grouped_decode_counters(m, g, n, k), dtype=torch.int32, device=x.device
+        )
+        return _grouped_decode_impl(x, weight, counters=counters, out=out)
 
     def _gemv_a16w16_filter(m: int, n: int, k: int) -> bool:
         return _supports_gemv_a16w16(m, n, k) and _prefers_gemv_a16w16(m, n, k)
