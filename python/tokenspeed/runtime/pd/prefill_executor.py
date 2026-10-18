@@ -106,6 +106,14 @@ class DisaggPrefillExecutor:
                 sender.bootstrap_room, {}
             )
             if not transfer_infos:
+                if self.kv_manager.room_status(sender.bootstrap_room) in (
+                    None,
+                    TransferPoll.Failed,
+                ):
+                    # Aborted by a transfer worker or the bootstrap thread
+                    # after this op was queued; the control plane fails the
+                    # request on its next poll.
+                    continue
                 raise RuntimeError("Cache-transfer destination metadata is unavailable")
             destinations = tuple(
                 info for info in transfer_infos.values() if not info.is_dummy
@@ -236,6 +244,13 @@ class DisaggPrefillExecutor:
                 sender.bootstrap_room, {}
             )
             if not transfer_infos:
+                if self.kv_manager.room_status(sender.bootstrap_room) in (
+                    None,
+                    TransferPoll.Failed,
+                ):
+                    # Aborted after this op was queued, as in
+                    # _prepare_cache_prefill: nothing to send or finish.
+                    continue
                 raise RuntimeError("Cache-transfer destination metadata is unavailable")
             destinations = [
                 info for info in transfer_infos.values() if not info.is_dummy

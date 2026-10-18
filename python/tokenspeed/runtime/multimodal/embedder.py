@@ -52,8 +52,9 @@ recomputing it), and a later request with the same content encodes anew.
 
 Within a single forward batch we still de-duplicate by modality and
 ``item.hash``: if two requests reference the same media content using
-the same modality, only the first item is fed to the encoder; the second
-request's scatter ranges read from the first item's ``encoded`` tensor.
+the same modality, only the first item still holding its raw feature is
+fed to the encoder; the second request's scatter ranges read from the
+first item's ``encoded`` tensor.
 """
 
 from __future__ import annotations
@@ -478,7 +479,10 @@ class MultimodalEmbedder:
                     canonical = canonical_by_key[(item.modality, item.hash)]
                 else:
                     canonical = item
-                    if item.hash is not None:
+                    # An item whose raw feature is gone cannot encode for aliases.
+                    if item.hash is not None and (
+                        item.feature is not None or item.feature_shm is not None
+                    ):
                         canonical_by_key[(item.modality, item.hash)] = item
 
                 if canonical is not item:
