@@ -118,7 +118,7 @@ tokenspeed_kernel/
     ...
 
   numerics/              # Reference impls + tolerance + comparison + CLI
-    reference/           # PyTorch ground truth, laid out like ops/
+    torch/               # PyTorch ground truth, laid out like ops/
   benchmark/             # Unified runner, throughput model, report, CLI
   plugins/               # Out-of-tree backend discovery
   thirdparty/            # Vendored / wrapped third-party kernel sources
