@@ -156,7 +156,11 @@ Consequences:
   backpressured stage off the control plane. The remote submissions' only
   failure surface is a settle at the next round's `execute` (their semantic
   completion arrives through the transfer events; a submission that RAISED
-  produces none, so the settle must not swallow it). The handle's remaining
+  produces none, so the settle must not swallow it). A raise is therefore
+  for broken invariants only: a transfer worker, the bootstrap thread or
+  another Prefill rank can fail a request's transfer while its submission
+  waits on the FIFO, and that submission then does nothing for the request,
+  whose failure arrives as its transfer event. The handle's remaining
   `run_*` methods do block, deliberately — the DP idle forward, the landing of a
   completed remote prefill, the KV repair after a wake, the RL weight sync —
   but each is a low-rate path whose caller cannot proceed without the result

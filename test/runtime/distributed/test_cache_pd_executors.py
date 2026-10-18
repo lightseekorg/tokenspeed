@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import threading
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
@@ -767,6 +768,124 @@ def test_layerwise_final_preserves_speculative_candidates() -> None:
     executor._cache_decode(_op(spec_candidate_ids=[[7, 8]]))
 
     assert metadata_calls == [(9, 42, [7, 8])]
+
+
+@pytest.mark.parametrize(
+    "layerwise", (True, False), ids=("prefill_chunk", "remote_decode")
+)
+def test_submission_skips_a_room_aborted_while_queued(layerwise: bool) -> None:
+    from tokenspeed.runtime.metrics.collector import KVTransferMetrics
+    from tokenspeed.runtime.pd.mooncake.sender import MooncakeKVSender
+    from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
+    from tokenspeed.runtime.pd.utils import DisaggregationMode, FastQueue
+
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.disaggregation_mode = DisaggregationMode.PREFILL
+    manager.request_status, manager.failure_records = {}, {}
+    manager.failure_lock = threading.Lock()
+    manager.kv_transfer_metrics = KVTransferMetrics(
+        {}, reporters=["prometheus"], enabled=False
+    )
+    manager.bootstrap_token_cond = threading.Condition()
+    manager.prefill_metadata, manager.cached_tokens = {}, {}
+    manager.bootstrap_logprobs = {}
+    manager.transfer_queues = [FastQueue()]
+    manager.step_counter = None
+    executor = object.__new__(DisaggPrefillExecutor)
+    executor.cache_layout = _layout()
+    executor.kv_manager = manager
+    executor._layerwise_enabled = layerwise
+    executor._layerwise_interval = 1
+    executor.senders = {
+        f"request-{row}": MooncakeKVSender(manager, "bootstrap", room)
+        for row, room in enumerate((9, 10))
+    }
+    # Room 10 has its Decode destination; a transfer worker or the bootstrap
+    # thread fails room 9 (dropping its destinations) while the op waits on
+    # the FIFO, before the control plane polls the failure.
+    session = "127.0.0.1:9000"
+    manager.transfer_infos = {
+        10: {session: TransferInfo(10, session, _destination_block_manifest())}
+    }
+    manager.abort_room(9, "Decode WRITE failed")
+    op = make_operation(
+        {
+            "history": np.asarray([[1, 2, 3], [4, 5, 6]], dtype=np.int32),
+            "state": np.asarray([[0, 6, -1], [0, 7, -1]], dtype=np.int32),
+        },
+        request_ids=["request-0", "request-1"],
+        num_extends=lambda: 2,
+        # Layerwise: tokens [2, 4) of the 5-token prompts, a non-final chunk.
+        extend_prefix_lens=[2, 2],
+        input_lengths=[2, 2],
+        decode_input_ids=[42, 43],
+        spec_candidate_ids=[[], []],
+    )
+
+    if layerwise:
+        executor.prepare_prefill(op)
+    else:
+        executor._cache_decode(op)
+
+    # Only the live room's chunk is queued.
+    queue = manager.transfer_queues[0]
+    chunk = queue.get_nowait()
+    assert (chunk.room, chunk.is_last) == (10, not layerwise)
+    with pytest.raises(FastQueue.Empty):
+        queue.get_nowait()
+
+
+@pytest.mark.parametrize("discarded", (False, True), ids=("aborted", "discarded"))
+def test_transfer_worker_leaves_an_ended_room_ended(discarded: bool) -> None:
+    from tokenspeed.runtime.metrics.collector import KVTransferMetrics
+    from tokenspeed.runtime.pd.base.status import TransferPoll
+
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.request_status = {9: TransferPoll.Bootstrapped}
+    manager.failure_records, manager.transfer_infos = {}, {}
+    manager.failure_lock = threading.Lock()
+    manager.kv_transfer_metrics = KVTransferMetrics(
+        {}, reporters=["prometheus"], enabled=False
+    )
+    manager.bootstrap_token_cond = threading.Condition()
+    manager.prefill_metadata, manager.cached_tokens = {}, {}
+    manager.bootstrap_logprobs = {}
+    # Room 9 fails after a chunk of it was queued, and the control plane may
+    # also drop it, before a transfer worker picks the chunk up.
+    manager.abort_room(9, "Decode WRITE failed")
+    if discarded:
+        manager.discard_room(9)
+
+    with pytest.raises(_StopWorker):
+        manager.transfer_worker(
+            _OneChunkQueue(TransferKVChunk(room=9, is_last=True)), None
+        )
+
+    # The worker drops the chunk: a dropped room does not come back and the
+    # first failure reason stands.
+    assert manager.request_status == ({} if discarded else {9: TransferPoll.Failed})
+    assert manager.failure_records == {9: "Decode WRITE failed"}
+
+
+@pytest.mark.parametrize(
+    "layerwise", (True, False), ids=("prefill_chunk", "remote_decode")
+)
+def test_submitting_a_live_room_without_destinations_raises(layerwise: bool) -> None:
+    from tokenspeed.runtime.pd.base.status import TransferPoll
+    from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
+
+    # Room 9 is bootstrapped yet has no destinations, which no thread leaves
+    # behind: the submission reports the broken invariant instead of skipping.
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.request_status = {9: TransferPoll.Bootstrapped}
+    manager.transfer_infos = {}
+    executor = object.__new__(DisaggPrefillExecutor)
+    executor._layerwise_enabled = layerwise
+    executor.senders = {"request-0": _RecordingSender([])}
+    executor.kv_manager = manager
+
+    with pytest.raises(RuntimeError, match="destination metadata is unavailable"):
+        (executor.prepare_prefill if layerwise else executor._cache_decode)(_op())
 
 
 @pytest.mark.parametrize("pp_rank", [0, 1])
