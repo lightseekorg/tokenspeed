@@ -22,10 +22,10 @@ states and outputs stay BF16 for Beam. Empty batches return empty outputs,
 and masked partial matrix tiles contribute zero. This scale format does not
 accept block sizes or an additional alpha scale.
 
-The portable Triton implementation supports AMD and NVIDIA GPUs with native
-FP8 matrix instructions. It uses the hardware's ordinary FP8 matrix arithmetic
-with FP32 accumulators; results need not match sequential FP32 arithmetic.
-Specialized implementations remain separate registry choices.
+The Triton GEMM is registered for NVIDIA SM100+ and AMD gfx950+. It uses the
+hardware's ordinary FP8 matrix arithmetic with FP32 accumulators; results need
+not match sequential FP32 arithmetic. Specialized implementations remain
+separate registry choices.
 
 ## DeepSeek V4 grouped output projection
 

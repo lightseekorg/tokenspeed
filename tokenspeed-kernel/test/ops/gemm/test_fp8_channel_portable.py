@@ -29,8 +29,10 @@ from tokenspeed_kernel.selection import kernel_override
 from utils import assert_no_triton_compile, kernel_supported
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not kernel_supported("triton_mm_fp8_scaled"),
-    reason="portable E4M3 tests require native FP8 matrix support",
+    not torch.cuda.is_available()
+    or not kernel_supported("triton_mm_fp8_scaled")
+    or not kernel_supported("triton_quantize_fp8_per_token_portable"),
+    reason="portable E4M3 tests require the scaled GEMM and token quantizer",
 )
 
 

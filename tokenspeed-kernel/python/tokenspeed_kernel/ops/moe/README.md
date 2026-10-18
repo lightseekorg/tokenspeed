@@ -214,7 +214,7 @@ support FP16/BF16 inputs; weight-only MXFP4 uses BF16 inputs.
 
 `triton_fp8_channel_fused_precomputed_moe_apply` implements the existing
 `moe.apply` operation with solution `triton` and the default precision policy.
-It supports AMD and NVIDIA GPUs with FP8 matrix instructions. It consumes
+It is registered for AMD gfx950. It consumes
 contiguous BF16 inputs, concatenated gate/up FP8 E4M3 weights, FP32
 per-output-channel scales, precomputed global expert IDs and original FP32
 route weights. It accepts
@@ -229,10 +229,9 @@ the specialized Gluon FP8 implementation for EP1, 256 experts, top-eight
 routing, hidden width 5120 and local intermediate width 320 or 640.
 The planner must receive `num_experts` and `top_k` to establish eligibility;
 unknown or unsupported geometry retains the Triton fallback. Explicit
-`solution="triton"` also retains this implementation on AMD. On NVIDIA
-SM90-SM103, the existing Triton variant has higher priority and keeps its
-BF16-before-activation rounding. The fused variant is also available there
-by registration override. The Gluon algorithm is documented
+`solution="triton"` also retains this implementation on gfx950. NVIDIA
+SM90-SM103 uses the separate Triton variant with BF16-before-activation rounding.
+The Gluon algorithm is documented
 in `tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/README.md`.
 
 The first multiplication accumulates in FP32 and retains gate/up in FP32 through
@@ -247,7 +246,7 @@ weights and accumulation before BF16 output.
 
 The portable implementation uses native FP8 matrix instructions with FP32
 accumulators. Internal reduction precision follows the hardware; scalar FP32
-summation and cross-vendor bitwise identity are not required.
+summation is not required.
 
 ## Shared MoE precision policies
 

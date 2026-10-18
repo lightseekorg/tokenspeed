@@ -704,8 +704,9 @@ def triton_quantize_fp8_per_token(
     solution="triton",
     features={"token_fp8_min_scaling"},
     capability=CapabilityRequirement(
-        vendors=frozenset({"amd", "nvidia"}),
-        required_features=frozenset({"tensor_core:f8"}),
+        vendors=frozenset({"amd"}),
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
     ),
     signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
     traits={

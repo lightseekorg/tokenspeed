@@ -102,12 +102,12 @@ def test_portable_token_quantizer_forwards_pdl(h100_platform, monkeypatch) -> No
             return launch
 
     monkeypatch.setattr(quant_triton, "_fp8_token_quantize_kernel", Kernel())
-    quantize_fp8(
+    quant_triton.triton_quantize_fp8_per_token_portable(
         torch.ones(128, 32, dtype=torch.bfloat16),
         granularity="token",
-        solution="triton",
+        group_size=None,
+        scale_encoding="float32",
         enable_pdl=True,
-        required_features=frozenset({"token_fp8_min_scaling"}),
     )
     assert len(launches) == 1
     grid, options = launches[0]
@@ -121,7 +121,7 @@ def test_portable_token_quantizer_preserves_layout(device, layout):
     if not torch.cuda.is_available() or not kernel_supported(
         "triton_quantize_fp8_per_token_portable"
     ):
-        pytest.skip("portable E4M3 quantization requires native FP8 support")
+        pytest.skip("portable minimum-scale E4M3 quantization requires gfx950")
     torch.manual_seed(196)
     x = torch.randn(130, 128, device=device, dtype=torch.bfloat16)
     if layout == "strided":

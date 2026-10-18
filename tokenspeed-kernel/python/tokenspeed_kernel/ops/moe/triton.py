@@ -677,8 +677,7 @@ def triton_fp8_block_precomputed_moe_apply(
         "internal_activation_dtype": frozenset({"input"}),
         "supports_bias": frozenset({False}),
     },
-    # Preserve this variant's BF16-before-activation rounding on NVIDIA.
-    priority=Priority.PORTABLE + 1,
+    priority=Priority.PORTABLE,
 )
 def triton_fp8_channel_precomputed_moe_apply(
     plan: dict,
@@ -745,8 +744,9 @@ def triton_fp8_channel_precomputed_moe_apply(
     name="triton_fp8_channel_fused_precomputed_moe_apply",
     solution="triton",
     capability=CapabilityRequirement(
-        vendors=frozenset({"amd", "nvidia"}),
-        required_features=frozenset({"tensor_core:f8"}),
+        vendors=frozenset({"amd"}),
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
     ),
     signatures=format_signatures("x", "dense", {torch.bfloat16}),
     traits={

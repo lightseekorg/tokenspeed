@@ -3479,11 +3479,11 @@ def test_gfx950_dynamic_mxfp4_moe_selects_gluon_a4w4(
 @pytest.mark.parametrize(
     "platform_fixture,rows,expected",
     [
-        ("h100_platform", 129, "triton_quantize_fp8_per_token_portable"),
+        ("h100_platform", 129, None),
         ("b200_platform", 1, "triton_quantize_fp8_per_token"),
-        ("b200_platform", 129, "triton_quantize_fp8_per_token_portable"),
+        ("b200_platform", 129, None),
         ("mi350_platform", 129, "triton_quantize_fp8_per_token_portable"),
-        ("mi450_platform", 129, "triton_quantize_fp8_per_token_portable"),
+        ("mi450_platform", 129, None),
     ],
 )
 def test_token_quantizer_preserves_required_minimum_scale(
@@ -3493,14 +3493,19 @@ def test_token_quantizer_preserves_required_minimum_scale(
         Platform, "_instance", request.getfixturevalue(platform_fixture)
     )
     monkeypatch.setattr(KernelRegistry.get(), "_selection_cache", {})
-    selected = _quantization_pkg.select_fp8_token_quantizer(
+    select = partial(
+        _quantization_pkg.select_fp8_token_quantizer,
         rows,
         torch.bfloat16,
         solution="triton",
         override=None,
         required_features=frozenset({"token_fp8_min_scaling"}),
     )
-    assert selected.name == expected
+    if expected is None:
+        with pytest.raises(kernel_NoKernelFoundError):
+            select()
+    else:
+        assert select().name == expected
 
 
 @pytest.mark.parametrize(
@@ -3512,20 +3517,35 @@ def test_token_quantizer_preserves_required_minimum_scale(
     ],
 )
 @pytest.mark.parametrize(
-    "platform_fixture,vendor,eligible",
+    "platform_fixture,arch_version,dense_eligible,gfx950_eligible",
     [
-        ("mi350_platform", "amd", True),
-        ("h100_platform", "nvidia", True),
-        ("mi350_platform", "ascend", False),
+        ("a100_platform", ArchVersion(8, 0), False, False),
+        ("h100_platform", ArchVersion(9, 0), False, False),
+        ("b200_platform", ArchVersion(10, 0), True, False),
+        ("b300_platform", ArchVersion(10, 3), True, False),
+        ("mi350_platform", ArchVersion(9, 4), False, False),
+        ("mi350_platform", ArchVersion(9, 5), True, True),
+        ("mi350_platform", ArchVersion(12, 0), True, False),
+        ("mi450_platform", ArchVersion(12, 5), True, False),
     ],
 )
-def test_portable_fp8_kernels_require_supported_vendor(
-    request, platform_fixture, vendor, eligible, family, mode, name
+def test_fp8_kernels_select_supported_hardware(
+    request,
+    platform_fixture,
+    arch_version,
+    dense_eligible,
+    gfx950_eligible,
+    family,
+    mode,
+    name,
 ) -> None:
-    platform = replace(request.getfixturevalue(platform_fixture), vendor=vendor)
+    platform = replace(
+        request.getfixturevalue(platform_fixture), arch_version=arch_version
+    )
     candidates = KernelRegistry.get().get_for_operator(
         family, mode, platform=platform, solution="triton"
     )
+    eligible = dense_eligible if family == "gemm" else gfx950_eligible
     assert (name in {candidate.name for candidate in candidates}) == eligible
 
 

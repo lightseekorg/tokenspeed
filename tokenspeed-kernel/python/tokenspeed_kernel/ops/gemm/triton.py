@@ -305,7 +305,7 @@ def triton_mxfp4_swiglu_linear(
 
 
 # ===-----------------------------------------------------------------------===#
-# Scaled FP8: portable Triton
+# Scaled FP8: Triton (NVIDIA SM100+, AMD gfx950+)
 # ===-----------------------------------------------------------------------===#
 
 
@@ -328,8 +328,11 @@ _FP8_SCALED_FORMAT_SIGNATURES = format_signatures(
     name="triton_mm_fp8_scaled",
     solution="triton",
     capability=CapabilityRequirement(
-        vendors=frozenset({"amd", "nvidia"}),
-        required_features=frozenset({"tensor_core:f8"}),
+        vendors=frozenset({"nvidia", "amd"}),
+        vendor_min_arch_versions={
+            "nvidia": ArchVersion(10, 0),
+            "amd": ArchVersion(9, 5),
+        },
     ),
     signatures=_FP8_SCALED_FORMAT_SIGNATURES,
     traits={
