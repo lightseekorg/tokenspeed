@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import bisect
 import gc
-import queue
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager
 from typing import TYPE_CHECKING
@@ -594,9 +593,8 @@ class ForwardStepRunner:
         )
 
         def run_once():
-            # Dummy add_batch keeps the grammar queue 1:1 with replays —
-            # build pops once per forward, so warmup + capture
-            # would otherwise raise queue.Empty.
+            # Dummy add_batch keeps the grammar gate 1:1 with replays: the
+            # hostfunc pops one decision per forward.
             if self.capturable_grammar is not None:
                 self.capturable_grammar.add_batch(
                     grammars=[None] * bs,
@@ -664,15 +662,10 @@ class ForwardStepRunner:
         _is_cuda_graph_phase = False
 
         # Graph capture records the hostfunc launches without invoking
-        # them, so the dummy run_once pushed stays queued — drain it, and
-        # reset prev_batch/current_batch so the first real replay's build
+        # them, so what the dummy run_once pushed stays queued — drop it,
+        # and reset current_batch so the first real replay's build
         # doesn't advance the matcher from a stale warmup entry.
         if self.capturable_grammar is not None:
-            while True:
-                try:
-                    self.capturable_grammar.queue.get_nowait()
-                except queue.Empty:
-                    break
             self.capturable_grammar.reset_state()
 
         global_graph_memory_pool = graph.pool()

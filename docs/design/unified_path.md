@@ -509,7 +509,7 @@ candidate preparation reads only the decode suffix of the live input buffer.
 
 Graph capture uses the captured batch size in its layout. Replay temporarily
 pairs the padded context with a padded layout, then restores the original
-live layout before output/state processing. Queued grammar completions retain
+live layout before output/state processing. Grammar completions retain
 their immutable per-step layout, independently of later context updates.
 Idle graph warmup also supplies an explicit layout.
 
@@ -596,7 +596,7 @@ adding state or parameters to the shared metadata initialization interface.
 Cache advancement still consumes all input lengths for prefill, independently
 of output lengths. Future input writes, NaN/OOV attribution, grammar advances
 and V4.1 DSpark anchors operate only on output-bearing requests. Grammar keeps
-one queue completion per forward, including zero-output rounds; both deferred
+one completion per forward, including zero-output rounds; both deferred
 hostfunc and host fallback consume the frozen layout. A zero-row decoder
 bypasses its graph, normalization, LM head, sampler and draft-context writes;
 the encoder and global KV producer have already executed.

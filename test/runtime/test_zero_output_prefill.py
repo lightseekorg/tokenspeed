@@ -512,7 +512,8 @@ def test_identity_sampling_keeps_backend_buffer_aliases(decode):
     assert tokens.tolist() == [0, 1]
 
 
-def test_idle_graph_grammar_enqueues_an_identity_completion():
+@pytest.mark.parametrize("pending", [False, True])
+def test_idle_graph_grammar_enqueues_an_identity_completion(pending):
     import queue
     from contextlib import nullcontext
 
@@ -520,9 +521,16 @@ def test_idle_graph_grammar_enqueues_an_identity_completion():
         RUNTIME + "grammar/capturable_grammar.py",
         "add_batch",
         owner="CapturableGrammarExecutor",
-        GrammarStepCompletion=SimpleNamespace,
+        GrammarStepCompletion=lambda **kwargs: SimpleNamespace(
+            event=threading.Event(), **kwargs
+        ),
     )
-    grammar = SimpleNamespace(queue=queue.Queue())
+    decisions = []
+    grammar = SimpleNamespace(
+        queue=queue.Queue(),
+        gate=SimpleNamespace(push=decisions.append),
+        pending=pending,
+    )
     grammar.add_batch = lambda **kwargs: add(grammar, **kwargs)
     idle = load_symbol(
         RUNTIME + "execution/model_executor.py",
@@ -570,6 +578,9 @@ def test_idle_graph_grammar_enqueues_an_identity_completion():
             valid_cache_lengths=torch.zeros(1), vocab_size=32
         ),
         device="cpu",
+        default_stream=None,
+        execution_stream=SimpleNamespace(wait_stream=lambda stream: None),
+        device_module=SimpleNamespace(stream=lambda stream: nullcontext()),
         forward_step=step,
         config=SimpleNamespace(output_length=1),
         capturable_grammar=grammar,
@@ -581,8 +592,13 @@ def test_idle_graph_grammar_enqueues_an_identity_completion():
         ),
     )
     assert step.called
-    completion = grammar.queue.get_nowait()["completion"]
-    assert completion.output_layout == ForwardOutputLayout(0, 0, 1, 1)
+    # One gate decision per replay; it runs only to advance a pending batch.
+    assert decisions == [pending]
+    assert not grammar.pending
+    if pending:
+        completion = grammar.queue.get_nowait()["completion"]
+        assert completion.output_layout == ForwardOutputLayout(0, 0, 1, 1)
+        assert completion.event.is_set()
     assert grammar.queue.empty()
 
 
