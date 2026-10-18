@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import pytest
 import torch
-from fused_boundary_reference import (
+from fused_boundary_helpers import (
     armed_mailbox,
     assert_child_keeps_waiting,
     boundary_case,
-    boundary_fp64,
+)
+from tokenspeed_kernel.numerics.torch.residual import (
+    torch_post_norm_residual_pre_norm,
 )
 from tokenspeed_kernel.ops.moe import (
     routed_input_scale_rmsnorm_sum_gathered,
@@ -134,7 +136,11 @@ def test_cluster_boundary_agrees_with_triton_up_to_variance_rounding(
     for got, twin in zip(cluster, pdl, strict=True):
         assert (got is None and twin is None) or torch.equal(got, twin)
     triton = triton_boundary(*args, False, None, 1)
-    for got, twin, ref in zip(cluster[:2], triton[:2], boundary_fp64(*args)):
+    for got, twin, ref in zip(
+        cluster[:2],
+        triton[:2],
+        torch_post_norm_residual_pre_norm(*args, False, None, 1)[:2],
+    ):
         if got is None:
             assert twin is None and ref is None
             continue

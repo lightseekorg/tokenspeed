@@ -24,8 +24,13 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from test_attention_dsv41 import _reference_quantize
 from test_attention_dsv41 import device as device
+from tokenspeed_kernel.numerics.torch.attention.dsv41 import (
+    torch_dsv41_cache_quantize,
+    torch_dsv41_gather_candidates,
+    torch_dsv41_index_cache_gather,
+    torch_dsv41_index_scores,
+)
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
 from tokenspeed_kernel.ops.attention.dsv41._deep_gemm.indexer import gather_index_pages
@@ -64,18 +69,6 @@ def _inputs(device, dtype):
     table.copy_(torch.arange(127, -1, -1, device=device))
     table[:, 2:4] = torch.tensor([-1, 999999], device=device)
     return q, w, keys, cache, table, torch.zeros(3, dtype=torch.int32, device=device)
-
-
-def _oracle(q, weights, keys, shards):
-    _, q_ref = _reference_quantize(q, "index")
-    _, k_ref = _reference_quantize(keys, "index")
-    dots = torch.einsum("thd,nd->thn", q_ref.reshape(q.shape), k_ref).bfloat16()
-    products = dots.relu() * weights.cpu().unsqueeze(-1)
-    scores = torch.zeros((q.shape[0], keys.shape[0]), dtype=torch.float32)
-    # Shard sums round first; the final rank-order FP32 sum is NOT an NCCL oracle.
-    for partial in products.chunk(shards, dim=1):
-        scores += partial.sum(dim=1).float()
-    return scores.to(weights.dtype).float()
 
 
 def _check(ids, lengths, scores, rtol, atol):
@@ -255,7 +248,7 @@ def run_index_scan_graph_oracle(
     graph = None
     try:
         q, w, keys, cache, table, visible = _inputs(device, dtype)
-        physical_scores = _oracle(q, w, keys, shards)
+        physical_scores = torch_dsv41_index_scores(q, w, keys, shards)
         local_q, local_w = q.chunk(shards, dim=1)[rank], w.chunk(shards, dim=1)[rank]
         slots = torch.arange(64, device=device).expand(3, -1)
         scores = dsv41.index_score(local_q, local_w, cache, slots, group, None)
@@ -316,7 +309,7 @@ def run_index_scan_graph_oracle(
         ):
             q.add_(0.125)
             w[0].neg_()
-            physical_scores = _oracle(q, w, keys, shards)
+            physical_scores = torch_dsv41_index_scores(q, w, keys, shards)
             visible.copy_(torch.tensor(lengths, device=device))
             table.copy_(table.flip(1))
             with patch.object(
@@ -428,7 +421,7 @@ def run_index_topk_full_and_reindex(
         for actual, expected in zip(got, want, strict=True):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     else:
-        physical = _oracle(q, w, keys, 1)
+        physical = torch_dsv41_index_scores(q, w, keys, 1)
         logical = torch.arange(pages * 64)
         pages_idx = table.cpu().gather(1, logical.expand(tokens, -1) // 64).long()
         scores = physical.gather(1, pages_idx * 64 + logical % 64)
@@ -468,7 +461,7 @@ def run_index_topk_full_and_reindex(
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         else:
             logical = torch.arange(pages * 64)
-            physical = _oracle(q, w, keys, 1)
+            physical = torch_dsv41_index_scores(q, w, keys, 1)
             pages_idx = table.cpu().gather(1, logical.expand(tokens, -1) // 64).long()
             scores = physical.gather(1, pages_idx * 64 + logical % 64)
             scores.masked_fill_(
@@ -639,7 +632,7 @@ def test_index_pack_matches_independent_fp4_oracle(
     packed = torch.cat(
         (data.cpu().reshape(-1, 64), scales.cpu().view(torch.uint8).reshape(-1, 4)), 1
     )
-    expected, _ = _reference_quantize(q, "index")
+    expected, _ = torch_dsv41_cache_quantize(q, "index")
     torch.testing.assert_close(packed, expected, rtol=0, atol=0)
     torch.testing.assert_close(
         output_weights,
@@ -760,32 +753,6 @@ def test_select_all_tile_slices_reuse_compilation():
     torch.testing.assert_close(out[1], lengths)
 
 
-def _candidate_reference(logits, lengths, candidates, block_size, alignment):
-    logits, lengths, candidates = (x.cpu() for x in (logits, lengths, candidates))
-    count = candidates.shape[1]
-    stride = (count * block_size + alignment - 1) // alignment * alignment
-    scores = torch.full((logits.shape[0], stride), -torch.inf)
-    normalized = torch.full(candidates.shape, -1, dtype=torch.int32)
-    ends = torch.zeros(logits.shape[0], dtype=torch.int32)
-    for row in range(logits.shape[0]):
-        end = max(0, min(int(lengths[row]), logits.shape[1]))
-        ids = sorted(
-            int(c)
-            for c in candidates[row]
-            if 0 <= c < (end + block_size - 1) // block_size
-        )
-        for i, c in enumerate(ids):
-            if i and c == ids[i - 1]:
-                continue
-            normalized[row, i] = c
-            n = min(block_size, end - c * block_size)
-            scores[row, i * block_size : i * block_size + n] = logits[
-                row, c * block_size : c * block_size + n
-            ]
-            ends[row] = i * block_size + n
-    return scores, ends, normalized
-
-
 @pytest.mark.parametrize(
     "count,block_size,alignment,sorted_ids",
     [
@@ -810,7 +777,9 @@ def test_candidate_scores_causal_duplicates_and_strides(
             candidates.masked_fill(candidates < 0, 2**31 - 1).sort().values
         )
         candidates.masked_fill_(candidates == 2**31 - 1, -1)
-    expected = _candidate_reference(logits, lengths, candidates, block_size, alignment)
+    expected = torch_dsv41_gather_candidates(
+        logits, lengths, candidates, block_size, alignment
+    )
     actual = prepare_candidate_scores(
         logits, lengths, candidates, block_size, alignment
     )
@@ -832,7 +801,7 @@ def test_candidate_scores_graph_refresh(device):
         candidates.random_(-5, 512)
         logits.normal_()
         graph.replay()
-        expected = _candidate_reference(logits, lengths, candidates, 8, 64)
+        expected = torch_dsv41_gather_candidates(logits, lengths, candidates, 8, 64)
         for got, want in zip(actual, expected, strict=True):
             torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
 
@@ -855,22 +824,6 @@ def _gather_inputs(capacity, strided, dtype):
         table[1::17] = -1
         table[2::31] = pages + 123
     return cache, table
-
-
-def _gather_reference(cache, table):
-    logical = torch.arange(table.numel() * 64, device=cache.device, dtype=torch.int64)
-    pages = table[logical // 64]
-    valid = (pages >= 0) & (pages < cache.shape[0])
-    page = pages.to(torch.int64).clamp(0, cache.shape[0] - 1)[:, None]
-    row = (logical % 64)[:, None]
-    flat = cache.as_strided((cache.shape[0], 64 * 68), (cache.stride(0), 1))
-    data = flat[page, row * 64 + torch.arange(64, device=cache.device)]
-    data = data.masked_fill(~valid[:, None], 0)
-    sf = flat[page, 64 * 64 + row * 4 + torch.arange(4, device=cache.device)]
-    sf = sf.masked_fill(~valid[:, None], 127).to(torch.int64)
-    word = (sf << torch.tensor([0, 8, 16, 24], device=cache.device)).sum(-1)
-    # Reinterpret the packed little-endian bytes as the kernel's int32 word.
-    return data, ((word + 2**31) % 2**32 - 2**31).to(torch.int32)
 
 
 @pytest.mark.parametrize(
@@ -898,7 +851,9 @@ def test_prefill_gather_matches_slot_materialization(capacity, strided, dtype):
         else:
             cache.random_(0, 256)
         graph.replay()
-        for got, want in zip(actual, _gather_reference(cache, pages), strict=True):
+        for got, want in zip(
+            actual, torch_dsv41_index_cache_gather(cache, pages), strict=True
+        ):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 

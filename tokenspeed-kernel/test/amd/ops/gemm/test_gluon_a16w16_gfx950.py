@@ -24,6 +24,7 @@ import contextlib
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.gemm import torch_mm
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -321,9 +322,8 @@ def _decode(a, b, out_dtype, out=None):
 
 
 def _decode_reference(a, b, out_dtype):
-    if out_dtype == torch.float32:
-        return a.float() @ b.float().T
-    return torch.mm(a, b.T)
+    # The product in the output dtype: FP32 accumulates FP32 copies.
+    return torch_mm(a.to(out_dtype), b.to(out_dtype), None, None, out_dtype)
 
 
 @pytest.mark.parametrize("shape,out_dtype", _DECODE_CASES)

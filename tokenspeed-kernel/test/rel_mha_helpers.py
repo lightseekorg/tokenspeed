@@ -18,13 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Shared shapes and torch references for the rel_mha operator tests.
+"""Shared shapes and the paged-cache builder for the rel_mha operator tests.
 
 Both ``ops/test_attention_rel_mha.py`` and
 ``nvidia/ops/test_attention_rel_bias_fused.py`` pin the relative-attention
-kernels against the same reference and paged-cache builder; keeping them here
-lets the two files live in different vendor subtrees without importing each
-other.
+kernels against ``torch_rel_attention`` on the same paged caches; keeping the
+builder here lets the two files live in different vendor subtrees without
+importing each other.
 """
 
 from __future__ import annotations
@@ -36,49 +36,6 @@ NUM_Q_HEADS = 8
 NUM_KV_HEADS = 2
 HEAD_DIM = 128
 PAGE = 128
-
-
-def ref_rel_logits(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    rel_logits: torch.Tensor | None,
-    rel_extent: int,
-    window_left: int,
-    scale: float,
-) -> torch.Tensor:
-    """Masked fp32 logits [H, Sq, Sk]. q [Sq,H,D], k [Sk,KV,D], rel_logits [Sq,H,E]."""
-    Sq, H, _ = q.shape
-    Sk, KV, _ = k.shape
-    k = k.repeat_interleave(H // KV, dim=1)
-    logits = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * scale
-    q_pos = torch.arange(Sq, device=q.device) + (Sk - Sq)
-    kv_pos = torch.arange(Sk, device=q.device)
-    dist = q_pos[:, None] - kv_pos[None, :]  # [Sq, Sk]
-    if rel_logits is not None:
-        in_range = (dist >= 0) & (dist < rel_extent)
-        idx = dist.clamp(0, rel_extent - 1)
-        bias = rel_logits.float().gather(-1, idx.unsqueeze(1).expand(Sq, H, Sk))
-        bias = torch.where(in_range.unsqueeze(1), bias, 0.0)
-        logits = logits + bias.permute(1, 0, 2)
-    mask = dist < 0  # causal
-    if window_left >= 0:
-        mask |= dist > window_left
-    return logits.masked_fill_(mask.unsqueeze(0), float("-inf"))
-
-
-def ref_rel_attn(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    rel_logits: torch.Tensor | None,
-    rel_extent: int,
-    window_left: int,
-    scale: float,
-) -> torch.Tensor:
-    """Per-sequence torch reference. q [Sq,H,D], k/v [Sk,KV,D], rel_logits [Sq,H,E]."""
-    logits = ref_rel_logits(q, k, rel_logits, rel_extent, window_left, scale)
-    v = v.repeat_interleave(q.shape[1] // v.shape[1], dim=1)
-    return torch.einsum("hqk,khd->qhd", logits.softmax(-1), v.float()).to(q.dtype)
 
 
 def cu_seqlens(lens: list[int], device: str) -> torch.Tensor:

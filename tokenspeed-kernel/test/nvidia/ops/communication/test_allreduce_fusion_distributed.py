@@ -30,6 +30,7 @@ from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.numerics.torch.layernorm import torch_rmsnorm
 from tokenspeed_kernel.ops.communication import (
     AllReduceFusionPattern,
     allreduce_fusion,
@@ -104,12 +105,7 @@ def rank_sum(value, group):
 
 
 def norm_reference(local, gamma, group):
-    reduced = rank_sum(local, group).float()
-    return (
-        reduced
-        * torch.rsqrt(reduced.square().mean(-1, keepdim=True) + EPS)
-        * gamma.float()
-    ).to(torch.bfloat16)
+    return torch_rmsnorm(rank_sum(local, group).float(), gamma, EPS).to(torch.bfloat16)
 
 
 def assert_close_all_ranks(actual, expected, group):

@@ -24,7 +24,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.activation import torch_silu_and_mul
+from tokenspeed_kernel.numerics.torch.moe import torch_moe_experts
 from utils import (
     assert_no_triton_compile,
     int_specialization_class,
@@ -130,25 +131,20 @@ def _reference(
     swiglu_limit: float | None,
     expert_start: int = 0,
 ) -> torch.Tensor:
-    expected = torch.zeros_like(x, dtype=torch.float32)
-    for local_expert in range(w13_dequant.shape[0]):
-        token_ids, slots = torch.where(topk_ids == expert_start + local_expert)
-        gate, up = F.linear(x[token_ids].float(), w13_dequant[local_expert]).chunk(
-            2, dim=-1
-        )
-        if swiglu_limit is not None:
-            gate = gate.clamp(max=swiglu_limit)
-            up = up.clamp(-swiglu_limit, swiglu_limit)
-        intermediate = (F.silu(gate) * up).to(torch.bfloat16)
-        expert_output = F.linear(intermediate.float(), w2_dequant[local_expert]).to(
-            torch.bfloat16
-        )
-        expected.index_add_(
-            0,
-            token_ids,
-            expert_output.float() * topk_weights[token_ids, slots, None],
-        )
-    return expected
+    return torch_moe_experts(
+        x,
+        w13_dequant,
+        w2_dequant,
+        topk_ids,
+        topk_weights,
+        activation=lambda gate_up: torch_silu_and_mul(gate_up, swiglu_limit),
+        w13_bias=None,
+        w2_bias=None,
+        quantize_input=None,
+        quantize_intermediate=torch.Tensor.bfloat16,
+        round_expert_output=torch.Tensor.bfloat16,
+        first_expert=expert_start,
+    )
 
 
 @pytest.mark.parametrize("num_tokens", [1, 33, 2048])

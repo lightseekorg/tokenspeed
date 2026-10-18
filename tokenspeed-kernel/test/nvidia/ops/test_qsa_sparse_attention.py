@@ -27,6 +27,9 @@ from functools import partial
 import pytest
 import tokenspeed_kernel.ops.attention.qsa as qsa_module
 import torch
+from tokenspeed_kernel.numerics.torch.attention.qsa import (
+    torch_qsa_selected_attention,
+)
 from tokenspeed_kernel.ops.attention.qsa import qsa_sparse_attention
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
@@ -53,21 +56,9 @@ def _reference(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
 ) -> torch.Tensor:
-    output = torch.zeros(
-        (q.shape[0], q.shape[1], v_cache.shape[-1]),
-        dtype=torch.float32,
-        device=q.device,
+    return torch_qsa_selected_attention(
+        q, k_cache, v_cache, selected_slots, scale, k_scale, v_scale
     )
-    group_size = q.shape[1] // k_cache.shape[1]
-    for row in range(q.shape[0]):
-        slots = selected_slots[row][selected_slots[row] > 0].long()
-        for head in range(q.shape[1]):
-            kv_head = head // group_size
-            keys = k_cache[slots, kv_head].float() * k_scale
-            values = v_cache[slots, kv_head].float() * v_scale
-            scores = q[row, head].float() @ keys.T
-            output[row, head] = torch.softmax(scores * scale, dim=-1) @ values
-    return output.to(q.dtype)
 
 
 def test_qsa_sparse_attention_requires_dispatch_arguments() -> None:

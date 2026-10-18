@@ -118,7 +118,7 @@ tokenspeed_kernel/
     ...
 
   numerics/              # Reference impls + tolerance + comparison + CLI
-    reference/           # PyTorch ground-truth kernels
+    reference/           # PyTorch ground truth, laid out like ops/
   benchmark/             # Unified runner, throughput model, report, CLI
   plugins/               # Out-of-tree backend discovery
   thirdparty/            # Vendored / wrapped third-party kernel sources
@@ -170,8 +170,11 @@ every graph it captures.
   for decode
 - **Vendor libraries** — wrapped (such as FlashAttention and TRT-LLM);
   no in-tree C++ build
-- **PyTorch reference** — under `numerics/reference/`; never auto-selects
-  over a real backend but always available as ground truth
+- **PyTorch reference** — under `numerics/torch/`, one module per
+  `ops/` family (`attention/<variant>.py` for attention), registered with
+  `solution="torch"`; never auto-selects over a real backend but always
+  available as ground truth. Kernel tests compare against these references
+  instead of writing their own.
 
 TokenSpeed-kernel carefully curates external dependencies and actively
 re-evaluates their inclusion to maintain minimal dependencies and enable

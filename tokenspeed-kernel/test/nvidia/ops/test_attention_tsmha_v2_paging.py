@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.rmha import torch_rel_attention
 
 torch.manual_seed(13)
 
@@ -58,21 +59,10 @@ def _skip_unless_supported() -> None:
 
 def _ref_decode(q, k, v, rel_logits, rel_extent, window_left):
     """Single-request torch reference. q [H,D], k/v [Sk,KV,D], rel [H,E]."""
-    Sk = k.shape[0]
-    H = q.shape[0]
-    k = k.repeat_interleave(H // NUM_KV_HEADS, dim=1)
-    v = v.repeat_interleave(H // NUM_KV_HEADS, dim=1)
-    logits = torch.einsum("hd,khd->hk", q.float(), k.float()) * SCALE
-    dist = (Sk - 1) - torch.arange(Sk, device=q.device)
-    in_range = (dist >= 0) & (dist < rel_extent)
-    idx = dist.clamp(0, rel_extent - 1)
-    bias = rel_logits.float().gather(-1, idx.unsqueeze(0).expand(H, Sk))
-    logits = logits + bias.masked_fill(~in_range[None], 0.0)
-    masked = dist < 0
-    if window_left >= 0:
-        masked = masked | (dist > window_left)
-    logits = logits.masked_fill(masked[None], -torch.inf)
-    return torch.einsum("hk,khd->hd", torch.softmax(logits, dim=-1), v.float())
+    out, _ = torch_rel_attention(
+        q[None], k, v, rel_logits[None], rel_extent, window_left, SCALE
+    )
+    return out[0]
 
 
 def _build_paged(kv_lens, page, device):

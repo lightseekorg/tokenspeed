@@ -335,7 +335,7 @@ def _online_quantize_mxfp8(
 
 def _kernel_handles_online_mxfp8(kernel_name: str) -> bool:
     spec = KernelRegistry.get().get_by_name(kernel_name)
-    return spec is not None and spec.solution == "reference"
+    return spec is not None and spec.solution == "torch"
 
 
 def _validate_gemm_out(
@@ -3604,7 +3604,7 @@ def kimi3_router_projection(
 
 # Backend registration (side-effect imports)
 # isort: off
-import tokenspeed_kernel.numerics.reference.gemm  # noqa: E402,F401
+import tokenspeed_kernel.numerics.torch.gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.deepgemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.cute_dsl  # noqa: E402,F401

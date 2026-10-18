@@ -104,7 +104,8 @@ receives every run's candidate/reference pair for its output along with
 validator-specific options. The built-in `close` validator accepts absolute
 and relative tolerances; `set_output_validator` registers additional
 validators. Generators typically compare against the operation's
-registered `reference` solution.
+registered `torch` solution, the PyTorch references under
+`tokenspeed_kernel/numerics/torch/`.
 
 Correctness runs before timing. A failure prevents the case from producing a
 successful measurement. Correctness remains within the revision-local process,

@@ -25,6 +25,7 @@ from __future__ import annotations
 import pytest
 import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
 import torch
+from tokenspeed_kernel.numerics.torch.gemm import torch_mm
 from tokenspeed_kernel.ops.gemm import _select_mv as _select
 from tokenspeed_kernel.ops.gemm import _use_mv, mv
 from tokenspeed_kernel.platform import current_platform
@@ -411,7 +412,7 @@ _ROUTER_SHAPES = [(256, 7168), (128, 4096)]
 
 
 def _fp64_reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return (x.double() @ weight.double().t()).float()
+    return torch_mm(x.double(), weight.double(), None, None, torch.float32)
 
 
 @_requires_nvidia

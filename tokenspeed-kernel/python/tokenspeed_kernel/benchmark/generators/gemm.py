@@ -249,7 +249,7 @@ def _select_reference_registration(
         spec.mode,
         platform=platform,
         format_signature=signature,
-        solution="reference",
+        solution="torch",
     )
     for reference in references:
         if (

@@ -45,6 +45,7 @@ if __name__ == "__main__":
 import pytest
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.numerics.torch.ple import torch_ple_gate_norm
 from tokenspeed_kernel.ops.ple import (
     ple_conv_sequences,
     ple_gate_norm,
@@ -107,22 +108,7 @@ def _gate_inputs(tokens, d, dtype):
 
 
 def _gate_reference(inputs, d):
-    key, query, value, kg, qg, cg = inputs
-    dtype = key.dtype
-
-    def norm(x, gamma):
-        x = x.float().reshape(-1, 4, d)
-        return (
-            x
-            * torch.rsqrt((x * x).mean(-1, keepdim=True) + 1e-6)
-            * gamma.float().reshape(1, 4, d)
-        ).to(dtype)
-
-    k, q = norm(key, kg), norm(query, qg)
-    dot = (k.float() * q.float()).sum(-1, keepdim=True) / d**0.5
-    gate = torch.sign(dot) * torch.sqrt(torch.clamp(dot.abs(), min=1e-6))
-    gated = (torch.sigmoid(gate) * value.float()[:, None, :]).to(dtype).flatten(1)
-    return gated, norm(gated, cg).flatten(1)
+    return torch_ple_gate_norm(*inputs, d)
 
 
 @pytest.mark.parametrize("tokens,d", [(1, 256), (1, 2560), (4, 2560), (16, 2560)])

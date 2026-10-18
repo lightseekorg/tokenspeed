@@ -22,6 +22,7 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.moe import torch_stable_softmax_topk
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -29,18 +30,6 @@ if not is_cdna4():
 
 from tokenspeed_kernel.ops.moe import moe_topk  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe import softmax_topk  # noqa: E402
-
-
-def _reference(logits, topk, renormalize, scale):
-    values = logits.float()
-    # Lowest expert id first on ties, as the kernel orders them.
-    sorted_values, ids = torch.sort(values, dim=-1, descending=True, stable=True)
-    sorted_values, ids = sorted_values[:, :topk], ids[:, :topk]
-    if renormalize:
-        weights = torch.softmax(sorted_values, dim=-1)
-    else:
-        weights = torch.softmax(values, dim=-1).gather(-1, ids)
-    return weights * scale, ids
 
 
 def _check_against_reference(dtype, tokens, experts, topk, renormalize, ids_dtype):
@@ -60,7 +49,14 @@ def _check_against_reference(dtype, tokens, experts, topk, renormalize, ids_dtyp
         renormalize=renormalize,
         routed_scaling_factor=1.5,
     )
-    expected_weights, expected_ids = _reference(logits, topk, renormalize, 1.5)
+    expected_weights, expected_ids = torch_stable_softmax_topk(
+        router_logits=logits,
+        topk=topk,
+        topk_indices_dtype=torch.int64,
+        renormalize=renormalize,
+        routed_scaling_factor=1.5,
+        enable_pdl=False,
+    )
     assert ids.dtype == ids_dtype
     assert torch.equal(ids.long(), expected_ids)
     torch.testing.assert_close(weights, expected_weights, rtol=1e-5, atol=1e-7)
@@ -97,7 +93,14 @@ def test_moe_topk_softmax_matches_reference():
     # test_kernel_api_selection.py.
     logits = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)
     weights, ids = moe_topk(logits, 10, "softmax", "topk", True, 1.0)
-    expected_weights, expected_ids = _reference(logits, 10, True, 1.0)
+    expected_weights, expected_ids = torch_stable_softmax_topk(
+        router_logits=logits,
+        topk=10,
+        topk_indices_dtype=torch.int64,
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        enable_pdl=False,
+    )
     assert torch.equal(ids.long(), expected_ids)
     assert ids.dtype == torch.int32
     torch.testing.assert_close(weights, expected_weights, rtol=1e-5, atol=1e-7)

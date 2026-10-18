@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsv41 import dsv41_key_norm_rope
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import (
     index_key_norm_rope,
@@ -51,18 +52,9 @@ def _key_inputs(tokens, rotary_dim, strided):
 
 
 def _key_reference(values, weight, positions, cache, eps, round_normalized):
-    x = values.float()
-    normalized = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
-    normalized = normalized * weight.float()
-    if round_normalized:
-        normalized = normalized.to(values.dtype).float()
-    rotary_dim = cache.shape[1]
-    pairs = normalized[:, -rotary_dim:].unflatten(-1, (-1, 2))
-    cosine, sine = cache[positions.clamp_min(0)].chunk(2, dim=-1)
-    even = pairs[..., 0] * cosine - pairs[..., 1] * sine
-    odd = pairs[..., 1] * cosine + pairs[..., 0] * sine
-    rotated = torch.stack((even, odd), dim=-1).flatten(-2)
-    return torch.cat((normalized[:, :-rotary_dim], rotated), dim=-1).to(values.dtype)
+    return dsv41_key_norm_rope(
+        values, weight, positions, cache, eps, round_normalized=round_normalized
+    )
 
 
 @pytest.mark.parametrize(
