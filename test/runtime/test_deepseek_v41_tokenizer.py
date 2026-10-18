@@ -29,6 +29,7 @@ The remaining tests run without a checkpoint or network access.
 import copy
 import importlib.util
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
@@ -37,6 +38,11 @@ from tokenizers import Tokenizer, models, pre_tokenizers, processors
 from transformers import BatchEncoding, PreTrainedTokenizerFast
 
 from tokenspeed.runtime.utils import hf_transformers_utils as hf
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 
 @pytest.fixture

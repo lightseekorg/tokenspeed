@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
@@ -18,6 +20,13 @@ from tokenspeed.runtime.layers.moe.topk import (
 from tokenspeed.runtime.layers.moe.utils import All2AllBackend, MoeBackend
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
+
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 
 @pytest.mark.parametrize(
@@ -401,7 +410,13 @@ def vendor_layer(monkeypatch):
 
     hook = mock.Mock(return_value=True)
     impl = KernelRegistry.get().get_impl(KERNEL_ROUTING_APPLY)
-    if impl is None:
+    platform = current_platform()
+    if (
+        impl is None
+        or not platform.is_nvidia
+        or platform.arch_version.major != 10
+        or platform.arch_version.minor > 3
+    ):
         pytest.skip("FlashInfer's TRT-LLM MoE is registered on NVIDIA SM100 to SM103")
     monkeypatch.setattr(impl, "_tokenspeed_fp32_correction_bias", hook)
 
@@ -417,7 +432,9 @@ def vendor_layer(monkeypatch):
             top_k=2,
             num_experts=4,
             hidden_size=128,
-            intermediate_size=320,
+            # A multiple of both FlashInfer alignments (64 with the ISPP-64
+            # launcher, 128 without), so no padding on any build.
+            intermediate_size=384,
             quant_config=None,
             layer_index=0,
             activation="silu",
@@ -445,7 +462,7 @@ def test_vendor_policy_routes_in_the_kernel_when_the_hook_builds_it(vendor_layer
     assert layer.topk_output_format.is_bypassed()
     # The routed scale stays in routing_config for the kernel; no padding.
     assert layer.routing_config["routed_scaling_factor"] == 2.5
-    assert tuple(layer.w13_weight.shape) == (4, 640, 128)
+    assert tuple(layer.w13_weight.shape) == (4, 768, 128)
 
 
 def test_vendor_policy_runs_on_precomputed_routes_without_the_hook(vendor_layer):
@@ -462,7 +479,7 @@ def test_vendor_policy_runs_on_precomputed_routes_without_the_hook(vendor_layer)
     [
         ({"combine_order": "slot"}, "slot combine"),
         ({"backend": "triton"}, "flashinfer_trtllm"),
-        ({"intermediate_size": 288}, "multiple of 64"),
+        ({"intermediate_size": 288}, "intermediate size per partition"),
     ],
 )
 def test_vendor_policy_rejects_unsupported_contract(vendor_layer, build_kwargs, error):

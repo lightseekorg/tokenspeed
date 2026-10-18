@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from test.runtime.test_deepseek_v41_model import (
     _Backend,
     _config,
@@ -51,6 +53,11 @@ from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41Attention,
     v41_mxfp8_config,
 )
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 requires_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or not current_platform().is_blackwell,

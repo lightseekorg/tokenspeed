@@ -44,6 +44,7 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
@@ -58,6 +59,11 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     build_compressed_token_map,
     compute_hash_multipliers,
 )
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
 def build_engram_previous_tokens(
@@ -536,7 +542,11 @@ def test_cuda_quantized_projection_forward():
     reference.wkv.weight.data.copy_((weight.float() / 64).to(torch.bfloat16))
     expected = reference(hidden, ids, mask)
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
-    assert model.wkv.weight.dtype == torch.float8_e4m3fn
+    # Hopper loads V4.1 FP8 projections as BF16 with the scales folded in.
+    expected_dtype = (
+        torch.bfloat16 if current_platform().is_hopper else torch.float8_e4m3fn
+    )
+    assert model.wkv.weight.dtype == expected_dtype
     for _ in range(2):
         model(hidden, ids, mask)
     torch.cuda.synchronize()
