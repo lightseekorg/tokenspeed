@@ -27,10 +27,13 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _cache,
     _e2m1_encode,
+    _global_e4m3_scale,
     _integers,
+    _mxfp4_index_rows,
     _planar_offset,
     _rotate_interleaved,
     _same_device,
+    _ue8m0_word,
 )
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -356,12 +359,7 @@ def _index_key_norm_rope_scatter(
     amax = tl.max(tl.abs(groups), 2)
     # Match cache_scatter's multiplication and the materialized BF16 RoPE.
     scaled_max = tl.maximum(amax, 6 * 2.0**-126) * (1.0 / 6.0)
-    bits = scaled_max.to(tl.int32, bitcast=True)
-    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
-    scale = (exponent << 23).to(tl.float32, bitcast=True)
-    codes = _e2m1_encode(tl.div_rn(groups, scale[:, :, None]))
-    pairs = tl.reshape(codes.to(tl.int32), (ROWS, 64, 2))
-    packed = tl.sum(pairs << (tl.arange(0, 2)[None, None, :] * 4), 2).to(tl.uint8)
+    packed, exponent = _mxfp4_index_rows(groups, scaled_max, ROWS)
     slots = tl.load(SLOTS + rows * S0, rows < N, -1).to(tl.int64)
     valid = (rows < N) & (slots >= 0) & (slots < CAP)
     base = CACHE + (slots // 64) * CP
@@ -468,20 +466,14 @@ def _index_query_rope_quant(
     rotated = _rotate_interleaved(q, partner, cosine, sine, (d[None, :] & 1) != 0)
     q = tl.where((d >= 64)[None, :], rotated, q).to(tl.bfloat16).to(tl.float32)
     groups = tl.reshape(q, (ROWS, 4, 32))
-    amax = tl.maximum(tl.max(tl.abs(groups), 2), 6.0 * 1.1754943508222875e-38)
-    bits = tl.div_rn(amax, 6.0).to(tl.int32, bitcast=True)
-    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
-    scale = (exponent << 23).to(tl.float32, bitcast=True)
-    codes = _e2m1_encode(tl.div_rn(groups, scale[:, :, None])).to(tl.int32)
-    pairs = tl.reshape(codes, (ROWS, 64, 2))
-    packed = tl.sum(pairs << (tl.arange(0, 2)[None, None, :] * 4), 2).to(tl.uint8)
-    words = tl.sum(exponent.to(tl.uint32) << (tl.arange(0, 4)[None, :] * 8), 1)
+    amax = tl.maximum(tl.max(tl.abs(groups), 2), 6 * 2.0**-126)
+    packed, exponent = _mxfp4_index_rows(groups, tl.div_rn(amax, 6.0), ROWS)
     tl.store(
         DATA + rows[:, None] * 64 + tl.arange(0, 64)[None, :],
         packed,
         (rows < N)[:, None],
     )
-    tl.store(SCALES + rows, words.to(tl.int32), rows < N)
+    tl.store(SCALES + rows, _ue8m0_word(exponent), rows < N)
     weight = tl.load(W + token * W0 + head * W1, rows < N, 0).to(tl.float32)
     scaled = (weight * tl.full((), SCALE, tl.float32)).to(tl.bfloat16)
     tl.store(WEIGHTS + rows, scaled.to(tl.float32), rows < N)
@@ -577,12 +569,7 @@ def _global_rope_scatter(
         ).to(tl.float32)
         grouped = tl.reshape(rotated, (32, 16))
         amax = tl.max(tl.abs(grouped), axis=1)
-        # The global codec uses rounded E4M3 scales, unlike index E8M0 scales.
-        scale = (
-            tl.div_rn(tl.maximum(amax, 6 * 2.0**-9), 6.0)
-            .to(tl.float8e4nv)
-            .to(tl.float32)
-        )
+        scale = _global_e4m3_scale(amax)
         scale_bytes = scale.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
         scaled = tl.reshape(tl.div_rn(grouped, scale[:, None]), (512,))
         lo, hi = tl.split(tl.reshape(_e2m1_encode(scaled), (256, 2)))

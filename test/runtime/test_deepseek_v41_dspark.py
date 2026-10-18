@@ -346,6 +346,32 @@ def test_window_workspace_preserves_deferred_norm():
     torch.testing.assert_close(swa, original, rtol=0, atol=0)
 
 
+def test_window_workspace_refuses_deferred_norm_off_the_fused_path():
+    # The model defers the SWA norm only to the fused 512-wide CUDA rows; any
+    # other path must not drop it.
+    history = torch.tensor([[-1, -1]])
+    backend = _WindowAttention(
+        torch.tensor([0, 1]),
+        torch.zeros(1, 64, 64, dtype=torch.bfloat16),
+        history,
+        2,
+        _WindowSelection(
+            torch.zeros_like(history),
+            torch.zeros_like(history),
+            torch.full((2, 4), -1, dtype=torch.int32),
+        ),
+        torch.zeros(2, dtype=torch.int64),
+    )
+    with pytest.raises(ValueError, match="requires 512-wide CUDA rows"):
+        backend._workspace(
+            torch.randn(2, 64, dtype=torch.bfloat16),
+            torch.tensor([0, 1]),
+            None,
+            torch.ones(64, dtype=torch.bfloat16),
+            1e-6,
+        )
+
+
 def test_window_attention_matches_dense_reference():
     torch.manual_seed(41)
     batch, block, heads, dim, window, rows = 2, 5, 2, 64, 8, 4

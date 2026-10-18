@@ -335,21 +335,23 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
     def apply(
         self,
         layer: nn.Module,
-        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.dtype],
+        x: torch.Tensor,
         bias: torch.Tensor | None,
+        block_scale: torch.Tensor | None = None,
+        output_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
-        if isinstance(x, tuple):
-            codes, scales, output_dtype = x
-            if codes.shape[0] == 0:
-                return codes.new_empty(
-                    (*codes.shape[:-1], layer.weight.shape[0]), dtype=output_dtype
+        if block_scale is not None:
+            # x holds E4M3 codes with canonical group-32 UE8M0 scales, shared by
+            # every projection of one quantized activation.
+            if x.shape[0] == 0:
+                return x.new_empty(
+                    (*x.shape[:-1], layer.weight.shape[0]), dtype=output_dtype
                 )
             if self.prepared_weight_scales is not None:
-                # Shared pre-quantized Q still reuses the prepared weight scales.
                 return mm(
-                    codes,
+                    x,
                     layer.weight,
-                    A_scales=scales,
+                    A_scales=block_scale,
                     B_scales=self.prepared_weight_scales,
                     bias=bias,
                     out_dtype=output_dtype,
@@ -357,7 +359,7 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
                     block_size=[1, 32],
                     prepacked_scales=True,
                 )
-            return super().apply(layer, codes, bias, scales, output_dtype)
+            return super().apply(layer, x, bias, block_scale, output_dtype)
         if x.shape[0] == 0:
             return x.new_empty((*x.shape[:-1], layer.weight.shape[0]))
         if (
@@ -729,11 +731,17 @@ class DeepseekV41Indexer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        qr: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.dtype],
+        qr: torch.Tensor,
+        qr_scale: torch.Tensor | None,
         positions: torch.Tensor,
         rotary: DeepseekV41RotaryEmbedding,
     ) -> tuple[torch.Tensor | IndexQueryInput, torch.Tensor]:
-        q, _ = self.wq_b(qr, block_scale=None, output_dtype=None)
+        """qr is BF16, or E4M3 codes with their group-32 qr_scale."""
+        q, _ = self.wq_b(
+            qr,
+            block_scale=qr_scale,
+            output_dtype=x.dtype if qr_scale is not None else None,
+        )
         q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
         weights, _ = self.weights_proj(x, block_scale=None, output_dtype=None)
         if (
@@ -983,25 +991,25 @@ class DeepseekV41Attention(nn.Module):
             and current_platform().is_nvidia
             and isinstance(self.wq_b.quant_method, _ReferenceFp8LinearMethod)
         ):
-            qr, codes, scales = rmsnorm_quantize_fp8_group32(
+            qr, q_input, q_scale = rmsnorm_quantize_fp8_group32(
                 qr,
                 self.q_norm.weight,
                 self.q_norm.variance_epsilon,
                 override=None,
                 solution="triton",
             )
-            q_input = (codes, scales, qr.dtype)
         else:
             qr = q_input = _attention_norm(qr, self.q_norm)
-        index_q_input = qr
+            q_scale = None
+        index_q_input, index_q_scale = qr, None
         if (
-            isinstance(q_input, tuple)
+            q_scale is not None
             and self.indexer is not None
             and isinstance(self.indexer.wq_b.quant_method, _ReferenceFp8LinearMethod)
         ):
             # Both reference methods consume canonical group-32 UE8M0 scales
             # and reuse their prepared weight scales where the native GEMM runs.
-            index_q_input = q_input
+            index_q_input, index_q_scale = q_input, q_scale
         if hidden_states.is_cuda:
             # Lazy shared constants are produced before the fork event, so both
             # branches observe them even on the first eager decode after loading.
@@ -1018,8 +1026,8 @@ class DeepseekV41Attention(nn.Module):
         if overlap:
             for tensor in (hidden_states, qr, positions, requests):
                 tensor.record_stream(self.stream_fork.aux_stream)
-            if isinstance(index_q_input, tuple):
-                for tensor in index_q_input[:2]:
+            if index_q_scale is not None:
+                for tensor in (index_q_input, index_q_scale):
                     tensor.record_stream(self.stream_fork.aux_stream)
         index_q, index_weights, index_group, prepared = None, None, None, None
         with self.stream_fork.scope(enable=overlap, overlap=True) as fork:
@@ -1037,16 +1045,15 @@ class DeepseekV41Attention(nn.Module):
                     hidden_states, qr, swa = (
                         t.index_select(0, keep) for t in (hidden_states, qr, swa)
                     )
-                    if isinstance(q_input, tuple):
-                        codes, scales, dtype = q_input
-                        q_input = (
-                            codes.index_select(0, keep),
-                            scales.index_select(0, keep),
-                            dtype,
-                        )
+                    if q_scale is not None:
+                        q_input = q_input.index_select(0, keep)
+                        q_scale = q_scale.index_select(0, keep)
                     else:
                         q_input = qr
-                    index_q_input = q_input if shared else qr
+                    if shared:
+                        index_q_input, index_q_scale = q_input, q_scale
+                    else:
+                        index_q_input, index_q_scale = qr, None
                     positions, requests = (
                         rows.query.positions,
                         rows.query.request_indices,
@@ -1056,7 +1063,11 @@ class DeepseekV41Attention(nn.Module):
                         self.layer_id, positions, requests, mode
                     ):
                         index_q, index_weights = self.indexer(
-                            hidden_states, index_q_input, positions, self.rotary_emb
+                            hidden_states,
+                            index_q_input,
+                            index_q_scale,
+                            positions,
+                            self.rotary_emb,
                         )
                     if mode.is_decode():
                         prepared = backend.prepare_global_selection(
@@ -1069,7 +1080,11 @@ class DeepseekV41Attention(nn.Module):
                             index_group,
                         )
                         index_q = index_weights = None
-            q, _ = self.wq_b(q_input, block_scale=None, output_dtype=None)
+            q, _ = self.wq_b(
+                q_input,
+                block_scale=q_scale,
+                output_dtype=qr.dtype if q_scale is not None else None,
+            )
             q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
             if q.is_cuda and mode.is_decode() and self.head_dim == 512:
                 q = rope_pad_query(q, positions, self.rotary_emb.cos_sin_cache, None)
@@ -2419,6 +2434,10 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 module.quant_method.prepare_weight_scales(module)
 
     def post_quant_warmup(self) -> None:
+        # Every loader calls this once the loaded state is final. The sharded
+        # state loader post-processes modules before copying the saved state
+        # in, so scales prepared during post-processing are stale there.
+        self.post_load_weights()
         for module in self.modules():
             if isinstance(module, DeepseekV4MoE):
                 module.warmup()

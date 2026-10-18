@@ -185,7 +185,7 @@ def test_indexer_fused_forward_and_key(monkeypatch, tokens, compress_ratio):
     expected = _reference_packed_indexer(
         indexer, rotary, x, qr, latent, positions, slots
     )
-    q, weights = indexer(x, qr, positions, rotary)
+    q, weights = indexer(x, qr, None, positions, rotary)
     key = indexer.key(latent, positions, rotary)
     assert isinstance(q, dsv41.IndexQueryInput)
     assert isinstance(key, dsv41.IndexKeyInput)
@@ -207,7 +207,7 @@ def test_indexer_fused_graph_refreshes_inputs_and_positions(monkeypatch):
     cache = torch.full((1, 64, 68), 0xA7, device="cuda", dtype=torch.uint8)
 
     def run():
-        q, weights = indexer(x, qr, positions, rotary)
+        q, weights = indexer(x, qr, None, positions, rotary)
         key = indexer.key(latent, positions, rotary)
         return _consume_indexer_inputs(q, weights, key, positions, slots, cache)
 
@@ -246,7 +246,7 @@ def test_indexer_cpu_and_small_geometry_keep_portable_path(
     indexer, rotary = _make_indexer(monkeypatch, device, head_dim, heads, 1)
     x, qr, latent, positions = _indexer_inputs(3, device)
     expected = _reference_indexer(indexer, rotary, x, qr, latent, positions)
-    q, weights = indexer(x, qr, positions, rotary)
+    q, weights = indexer(x, qr, None, positions, rotary)
     key = indexer.key(latent, positions, rotary)
     _assert_indexer_outputs((q, weights, key), expected)
 
@@ -306,10 +306,12 @@ def test_attention_shares_q_quantization_only_with_compatible_indexer(
         index_linear.quant_method = SimpleNamespace(apply=method.apply)
         expected = attention(positions, x, ctx)
         expected_index = backend.calls[-1][3:5]
-        assert not isinstance(received[-1], tuple)
+        assert received[-1].dtype == torch.bfloat16
         index_linear.quant_method = method
         actual = attention(positions, x, ctx)
-        assert isinstance(received[-1], tuple) == (case == "shared")
+        # Narrowed rows select the shared codes after quantization.
+        shared = received[-1].dtype == torch.float8_e4m3fn
+        assert shared == (case in ("shared", "narrowed"))
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         for actual_index, reference_index in zip(
             backend.calls[-1][3:5], expected_index

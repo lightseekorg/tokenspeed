@@ -222,7 +222,11 @@ def _dense_scores(
     name="deep_gemm_dsv41_index_topk",
     solution="deep_gemm",
     signatures=[format_signature(x=dense_tensor_format(torch.bfloat16))],
-    traits={"native_indexer": frozenset({True})},
+    # Fuses RoPE and query quantization when index_q is an IndexQueryInput.
+    traits={
+        "native_indexer": frozenset({True}),
+        "supports_index_query_input": frozenset({True}),
+    },
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
         max_arch_version=ArchVersion(10, 3),

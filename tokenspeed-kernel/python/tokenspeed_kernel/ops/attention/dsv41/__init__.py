@@ -52,6 +52,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.ops.attention.dsv41._inputs import IndexKeyInput, IndexQueryInput
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
+from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -620,12 +621,13 @@ def index_topk(
         solution=solution,
         override=None,
     )
-    if (
-        isinstance(index_q, IndexQueryInput)
-        and kernel.name != "deep_gemm_dsv41_index_topk"
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    if isinstance(index_q, IndexQueryInput) and (
+        spec is None or True not in spec.traits.get("supports_index_query_input", ())
     ):
-        # Explicit portable/backend overrides still consume every supplied
-        # preprocessing input. Preserve projected Q for other query windows.
+        # Kernels that take only post-RoPE Q get it applied here, so every
+        # supplied preprocessing input is still honored. Preserve projected Q
+        # for other query windows.
         index_q, weights = index_query_rope_weights(
             query_values.clone(),
             weights,

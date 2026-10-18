@@ -26,7 +26,7 @@ import torch
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -511,11 +511,9 @@ class DeepseekV4MoE(nn.Module):
             return hidden_states
         with nvtx_range("moe_select_experts"):
             topk_output = self._compute_topk_output(hidden_states, input_ids)
-        # The fused finalizer is a CUDA library; ROCm keeps the kernel's own.
         deferred_finalize = (
             hidden_states.dtype == torch.bfloat16
-            and current_platform().is_nvidia
-            and self.experts.supports_deferred_finalize
+            and self.experts.supports_deferred_cuda_finalize
         )
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
@@ -531,10 +529,7 @@ class DeepseekV4MoE(nn.Module):
                 shared = self._forward_shared_experts(hidden_states)
         if deferred_finalize:
             # Reduce routed rows and add the shared expert in one finalize.
-            # Routing is precomputed, so its weights are the ones the kernel
-            # applied; some kernels (Triton MXFP4) do not return them.
-            gemm2_out, _, expanded_idx = routed
-            expert_weights = topk_output.topk_weights
+            gemm2_out, expert_weights, expanded_idx = routed
             return moe_finalize_fuse_shared(
                 gemm2_out,
                 expanded_idx,

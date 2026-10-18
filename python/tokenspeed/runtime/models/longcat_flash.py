@@ -455,7 +455,7 @@ class _RuntimeLongcatMoE(nn.Module):
                 )
 
             zero_expert_output = self._apply_zero_experts(hidden_states, topk_output)
-            deferred_finalize = self.experts.supports_deferred_finalize
+            deferred_finalize = self.experts.supports_deferred_cuda_finalize
             routed_expert_output = self.experts(
                 hidden_states=hidden_states,
                 topk_output=topk_output,

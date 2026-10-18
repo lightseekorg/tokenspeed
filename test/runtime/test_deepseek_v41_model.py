@@ -49,6 +49,7 @@ from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 
+from tokenspeed.runtime.configs.load_config import LoadConfig
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -68,6 +69,7 @@ from tokenspeed.runtime.layers.moe import expert as expert_module
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.utils import MoeBackend
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
+from tokenspeed.runtime.model_loader import loader as loader_module
 from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
 from tokenspeed.runtime.models import deepseek_v41 as v41
 from tokenspeed.runtime.models import deepseek_v41_moe as v4
@@ -1249,35 +1251,88 @@ def test_cuda_exact_fp8_linear_and_engram_method(monkeypatch):
     )
 
 
+class _TinyFp8Model(BaseCausalLM):
+    """One V4.1 FP8 projection behind the V4.1 weight-loading hooks."""
+
+    def __init__(self):
+        super().__init__(
+            config=SimpleNamespace(), mapping=SimpleNamespace(), encoder_only=True
+        )
+        self.proj = ReplicatedLinear(
+            input_size=128,
+            output_size=256,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=v41_mxfp8_config(_quant()),
+            prefix="proj",
+        )
+
+    def post_load_weights(self):
+        DeepseekV41ForCausalLM.post_load_weights(self)
+
+    def post_quant_warmup(self):
+        DeepseekV41ForCausalLM.post_quant_warmup(self)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_sharded_state_load_prepares_fp8_scales_from_loaded_state(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
+    with torch.device("cuda"):
+        source = _TinyFp8Model()
+    source.load_weights(
+        [
+            (
+                "proj.weight",
+                torch.randn(256, 128, device="cuda").to(torch.float8_e4m3fn),
+            ),
+            (
+                "proj.weight_scale_inv",
+                torch.full((8, 4), 123, device="cuda", dtype=torch.uint8),
+            ),
+        ]
+    )
+    source.proj.quant_method.process_weights_after_loading(source.proj)
+    save_file(
+        {name: value.contiguous() for name, value in source.state_dict().items()},
+        str(tmp_path / "model-rank-0-part-0.safetensors"),
+    )
+
+    def fresh_model(model_config, load_config):
+        model = _TinyFp8Model()
+        # Post-processing must not keep scales derived from pre-load contents.
+        model.proj.weight_scale_inv.data.fill_(0)
+        return model
+
+    monkeypatch.setattr(loader_module, "_initialize_model", fresh_model)
+    loader = loader_module.ShardedStateLoader(LoadConfig(load_format="sharded_state"))
+    model = loader.load_model(
+        model_config=SimpleNamespace(
+            model_path=str(tmp_path),
+            revision=None,
+            dtype=torch.bfloat16,
+            mapping=SimpleNamespace(rank=0),
+        ),
+        device_config=SimpleNamespace(device="cuda"),
+    )
+    x = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
+    torch.testing.assert_close(model.proj(x)[0], source.proj(x)[0], rtol=0, atol=0)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not current_platform().is_blackwell_plus,
     reason="requires Blackwell MXFP8",
 )
 @torch.inference_mode()
 def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
-    class TinyModel(BaseCausalLM):
-        def __init__(self):
-            super().__init__(
-                config=SimpleNamespace(), mapping=SimpleNamespace(), encoder_only=True
-            )
-            self.proj = ReplicatedLinear(
-                input_size=128,
-                output_size=256,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                quant_config=v41_mxfp8_config(_quant()),
-                prefix="proj",
-            )
-
-        def post_load_weights(self):
-            DeepseekV41ForCausalLM.post_load_weights(self)
-
     monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
     previous_pdl = pdl_enabled()
     pdl_enabled(True)
     try:
         with torch.device("cuda"):
-            model = TinyModel()
+            model = _TinyFp8Model()
         model.load_weights(
             [
                 (
@@ -1310,7 +1365,7 @@ def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
         codes, scales = v41_quantize_fp8(x)
         with monkeypatch.context() as patched:
             patched.setattr(gemm_flashinfer, "swizzle_mxfp8_scale", activation_only)
-            shared = layer.quant_method.apply(layer, (codes, scales, x.dtype), None)
+            shared = layer.quant_method.apply(layer, codes, None, scales, x.dtype)
         torch.testing.assert_close(shared, eager, rtol=0, atol=0)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):

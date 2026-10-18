@@ -312,7 +312,7 @@ whenever the selected kernel supports it (TRT-LLM MXFP4 SwiGLU, Triton MXFP4,
 and the other deferred-capable kernels). The kernel returns expert rows and row
 indices, and `moe_finalize_fuse_shared` combines them with the precomputed
 route weights and the shared expert output in FP32, trimming to the original
-hidden width. Some kernels (Triton MXFP4) return no weights, so the model
-always passes its own precomputed routes. FP16 input, ROCm, where the fused
-finalizer is not built, and kernels without deferred finalize keep the
+hidden width. Some kernels (Triton MXFP4) return no weights; `MoELayer` then
+returns the precomputed route weights it passed in. FP16 inputs, ROCm builds
+without the fused finalizer, and kernels without deferred finalize keep the
 kernel's own finalized output.

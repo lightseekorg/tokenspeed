@@ -1823,6 +1823,30 @@ def test_gpu_ratio2_prefill_to_decode_including_empty_compressor_step():
     torch.cuda.synchronize()
 
 
+def test_deferred_swa_norm_without_rope_cache_is_refused():
+    # Only the fused RoPE writers apply a deferred SWA norm; without them the
+    # norm would be silently dropped.
+    backend = _backend("cpu", 2)
+    meta = _extend(backend, _tables("cpu"), [4], [0], [0], _final([4], [0]))
+    with pytest.raises(ValueError, match="requires the SWA RoPE cache"):
+        backend.forward_v41(
+            torch.randn(4, 2, 512, dtype=torch.bfloat16),
+            torch.randn(4, 512, dtype=torch.bfloat16),
+            layer_id=0,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.EXTEND,
+            index_q=None,
+            index_weights=None,
+            attn_sink=torch.zeros(2, dtype=torch.float32),
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=None,
+            swa_norm_weight=torch.ones(512, dtype=torch.bfloat16),
+            swa_norm_eps=1e-6,
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_gpu_swa_prefill_cross_chunk_matches_full_and_null_is_untouched():
     backend = _backend("cuda", 2)
