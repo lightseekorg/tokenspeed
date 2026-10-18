@@ -1296,7 +1296,22 @@ def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
         address = native.data_ptr()
         assert set(model.state_dict()) == {"proj.weight", "proj.weight_scale_inv"}
         x = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
-        layer(x)
+        eager, _ = layer(x)
+        # Attention shares pre-quantized Q codes; they must reuse the prepared
+        # weight scales too, with only the small activation scales swizzled.
+        from tokenspeed_kernel.ops.gemm import flashinfer as gemm_flashinfer
+
+        swizzle = gemm_flashinfer.swizzle_mxfp8_scale
+
+        def activation_only(sf, m, k):
+            assert m == x.shape[0], "shared Q codes repacked the weight scales"
+            return swizzle(sf, m, k)
+
+        codes, scales = v41_quantize_fp8(x)
+        with monkeypatch.context() as patched:
+            patched.setattr(gemm_flashinfer, "swizzle_mxfp8_scale", activation_only)
+            shared = layer.quant_method.apply(layer, (codes, scales, x.dtype), None)
+        torch.testing.assert_close(shared, eager, rtol=0, atol=0)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured, _ = layer(x)
@@ -1984,6 +1999,7 @@ def _mock_loader_hardware(monkeypatch, mapping):
             "support_routing": False,
             "supports_precomputed_topk": True,
             "supports_deferred_finalize": False,
+            "topk_weights_dtype": torch.float32,
             "weight_preprocessor": None,
             "warmup": None,
         },

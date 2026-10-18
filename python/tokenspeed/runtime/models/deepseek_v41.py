@@ -36,7 +36,8 @@ MegaMoE weight preparation.
 Call initialize_engram(tokenizer) once after construction, then pass caller-owned
 ``engram_hash_ids`` [T,layers,hash columns] and bool ``engram_token_mask`` [T] as forward
 kwargs. These are borrowed forward inputs, never request state or ForwardContext
-fields. The runner owns refresh/overlap/rollback and can use stable input views.
+fields. The runner owns refresh, overlap and the accepted-history commit, and can
+use stable input views.
 The model retains no mutable per-forward tensors; hash storage belongs to the runner.
 
 Every scheduled token runs through the encoder layers; the CED decoder (from
@@ -155,7 +156,6 @@ from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalForwardContext,
     MultimodalInputs,
-    substitute_mm_pad_,
 )
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -343,6 +343,19 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
             if codes.shape[0] == 0:
                 return codes.new_empty(
                     (*codes.shape[:-1], layer.weight.shape[0]), dtype=output_dtype
+                )
+            if self.prepared_weight_scales is not None:
+                # Shared pre-quantized Q still reuses the prepared weight scales.
+                return mm(
+                    codes,
+                    layer.weight,
+                    A_scales=scales,
+                    B_scales=self.prepared_weight_scales,
+                    bias=bias,
+                    out_dtype=output_dtype,
+                    quant="mxfp8",
+                    block_size=[1, 32],
+                    prepacked_scales=True,
                 )
             return super().apply(layer, codes, bias, scales, output_dtype)
         if x.shape[0] == 0:
@@ -965,8 +978,7 @@ class DeepseekV41Attention(nn.Module):
         qkv, _ = self.wq_a_wkv(hidden_states, block_scale=None, output_dtype=None)
         qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
         if (
-            rows.keep_rows is None
-            and qr.is_cuda
+            qr.is_cuda
             and qr.dtype == torch.bfloat16
             and current_platform().is_nvidia
             and isinstance(self.wq_b.quant_method, _ReferenceFp8LinearMethod)
@@ -987,8 +999,8 @@ class DeepseekV41Attention(nn.Module):
             and self.indexer is not None
             and isinstance(self.indexer.wq_b.quant_method, _ReferenceFp8LinearMethod)
         ):
-            # Both reference methods consume canonical group-32 UE8M0 scales;
-            # mm owns the selected kernel's layout conversion.
+            # Both reference methods consume canonical group-32 UE8M0 scales
+            # and reuse their prepared weight scales where the native GEMM runs.
             index_q_input = q_input
         if hidden_states.is_cuda:
             # Lazy shared constants are produced before the fork event, so both
@@ -1018,11 +1030,23 @@ class DeepseekV41Attention(nn.Module):
                 if rows.keep_rows is not None:
                     # Preserve the projection batch: narrowing before QKV can
                     # change quantized GEMM arithmetic for the retained rows.
+                    # Norm and group-32 quantization are row-local, so their
+                    # selected rows equal an unnarrowed batch's bit for bit.
+                    keep = rows.keep_rows
+                    shared = index_q_input is q_input
                     hidden_states, qr, swa = (
-                        t.index_select(0, rows.keep_rows)
-                        for t in (hidden_states, qr, swa)
+                        t.index_select(0, keep) for t in (hidden_states, qr, swa)
                     )
-                    q_input = index_q_input = qr
+                    if isinstance(q_input, tuple):
+                        codes, scales, dtype = q_input
+                        q_input = (
+                            codes.index_select(0, keep),
+                            scales.index_select(0, keep),
+                            dtype,
+                        )
+                    else:
+                        q_input = qr
+                    index_q_input = q_input if shared else qr
                     positions, requests = (
                         rows.query.positions,
                         rows.query.request_indices,
@@ -2010,7 +2034,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         ):
             if result["image_mask"] is None:
                 result["image_mask"] = _image_mask_from_spans(input_ids, mm_context)
-            substitute_mm_pad_(input_ids, {Modality.IMAGE: self.config.image_token_id})
+            # InputBuffers already clamped the hashed placeholder ids into the
+            # vocabulary; the embedder overwrites those rows by span.
             embeds, _ = self.vision_embedder.apply(
                 input_ids=input_ids,
                 text_embedding=self.get_input_embeddings(),

@@ -1544,6 +1544,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             )
         if not 0 <= layer_id < len(self.spec.kv_owners):
             raise ValueError("V4.1 layer_id is outside the backbone")
+        if swa_norm_weight is not None and swa_rope_cache is None:
+            # Only the fused RoPE writers apply the deferred SWA norm.
+            raise ValueError("A deferred SWA norm requires the SWA RoPE cache")
         if forward_mode.is_mixed():
             meta = self.query_metadata(forward_mode)
             view = self._decoder_view

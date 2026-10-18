@@ -406,6 +406,7 @@ def prepare_mxfp8_weight_scales(
 def _mm_mxfp8_prepacked(
     A: torch.Tensor,
     B: torch.Tensor,
+    A_scales: torch.Tensor | None,
     B_scales: torch.Tensor | None,
     *,
     bias: torch.Tensor | None,
@@ -413,15 +414,30 @@ def _mm_mxfp8_prepacked(
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     n, k = B.shape
+    if not has_flashinfer_mxfp8():
+        raise ValueError(
+            "mm(prepacked_scales=True) with block_size [1, 32] requires "
+            "FlashInfer's MXFP8 GEMM"
+        )
+    quantized = A.dtype == _fp8_dtype
     if (
         A.ndim != 2
-        or A.dtype not in (torch.bfloat16, torch.float16)
+        or A.dtype not in (torch.bfloat16, torch.float16, _fp8_dtype)
         or A.shape[1] != k
         or A.stride(-1) != 1
+        or quantized != (A_scales is not None)
     ):
         raise ValueError(
             "mm(prepacked_scales=True) with block_size [1, 32] requires 16-bit "
-            "[M, K] activations with unit inner stride"
+            "[M, K] activations, or E4M3 codes with their UE8M0 scales, with "
+            "unit inner stride"
+        )
+    if quantized and (
+        A_scales.dtype != torch.uint8 or tuple(A_scales.shape) != (A.shape[0], k // 32)
+    ):
+        raise ValueError(
+            "mm(prepacked_scales=True) requires canonical [M, K/32] UE8M0 "
+            "activation scales with E4M3 codes"
         )
     if (
         B_scales is None
@@ -432,11 +448,20 @@ def _mm_mxfp8_prepacked(
             "mm(prepacked_scales=True) with block_size [1, 32] requires weight "
             "scales from prepare_mxfp8_weight_scales"
         )
+    if out is not None:
+        _validate_gemm_out(
+            out, shape=(A.shape[0], n), dtype=out_dtype, device=A.device, op="mm"
+        )
     if A.shape[0] == 0:
         return out if out is not None else A.new_empty((0, n), dtype=out_dtype)
-    # Same codes and scales as the reference 1x32 quantizer, written directly
-    # in the layout the native kernel reads.
-    values, activation_scales = _quantize_fp8_group32_swizzled(A)
+    if quantized:
+        # Pre-quantized codes keep their canonical scales; the native kernel
+        # swizzles these per call, which is small next to the weight scales.
+        values, activation_scales = A, A_scales
+    else:
+        # Same codes and scales as the reference 1x32 quantizer, written
+        # directly in the layout the native kernel reads.
+        values, activation_scales = _quantize_fp8_group32_swizzled(A)
     result = flashinfer_mm_mxfp8(
         values,
         B,
@@ -506,7 +531,8 @@ def mm(
             is quantized here into the matching layout. With block_size
             ``[128, 128]`` they come from
             ``prepare_flashinfer_fp8_blockscale_weight_scales``; with
-            ``[1, 32]`` from ``prepare_mxfp8_weight_scales``.
+            ``[1, 32]`` from ``prepare_mxfp8_weight_scales``, and ``A`` may
+            also be E4M3 codes with canonical ``[M, K/32]`` UE8M0 ``A_scales``.
     """
     override = resolve_kernel_override("gemm", "mm", override)
     enable_pdl = pdl_enabled()
@@ -534,8 +560,21 @@ def mm(
                 "mm(prepacked_scales=True) requires quant='mxfp8' with block_size"
             )
         if list(block_size) == [1, 32]:
+            if (
+                alpha is not None
+                or solution is not None
+                or override
+                not in (
+                    None,
+                    "flashinfer_mm_mxfp8",
+                )
+            ):
+                raise ValueError(
+                    "mm(prepacked_scales=True) with block_size [1, 32] runs only "
+                    "flashinfer_mm_mxfp8 and takes no alpha or solution"
+                )
             return _mm_mxfp8_prepacked(
-                A, B, B_scales, bias=bias, out=out, out_dtype=out_dtype
+                A, B, A_scales, B_scales, bias=bias, out=out, out_dtype=out_dtype
             )
         if B_scales is None or tuple(B_scales.shape) != (
             K // block_size[1],

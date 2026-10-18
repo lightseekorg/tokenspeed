@@ -1405,14 +1405,13 @@ def _gated_fp8_quantize_kernel(
     tl.store(scale_ptr + row * groups + group, scale, valid_group)
 
 
-@triton.jit(do_not_specialize=["M", "X0"])
+@triton.jit(do_not_specialize=["X0"])
 def _rmsnorm_fp8_group32_ue8m0(
     X,
     W,
     N,
     Q,
     S,
-    M,
     X0,
     K: tl.constexpr,
     EPS: tl.constexpr,
@@ -1552,7 +1551,6 @@ def triton_rmsnorm_fp8_group32_ue8m0(
             normalized,
             quantized,
             scales,
-            m,
             x.stride(0),
             k,
             eps,

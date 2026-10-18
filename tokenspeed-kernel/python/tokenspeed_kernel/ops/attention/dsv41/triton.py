@@ -2294,52 +2294,6 @@ def clean_logits(values, lengths, table, pages, capacity, page_size):
 
 
 @triton.jit(
-    do_not_specialize=["C0", "S0", "N", "NP"],
-    do_not_specialize_on_alignment=["C0", "S0", "N", "NP"],
-)
-def _gather_index_cache(C, S, V, F, C0, S0, N, NP, P: tl.constexpr, B: tl.constexpr):
-    row = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
-    slot = tl.load(S + row * S0, row < N, other=-1).to(tl.int64)
-    valid = (row < N) & (slot >= 0) & (slot < NP * P)
-    page, offset = slot // P, slot % P
-    d = tl.arange(0, 64)
-    data = tl.load(
-        C + page[:, None] * C0 + offset[:, None] * 64 + d[None, :],
-        valid[:, None],
-        other=0,
-    )
-    tl.store(V + row[:, None] * 64 + d[None, :], data, (row < N)[:, None])
-    b = tl.arange(0, 4)
-    sf = tl.load(
-        C + page[:, None] * C0 + P * 64 + offset[:, None] * 4 + b[None, :],
-        valid[:, None],
-        other=127,
-    ).to(tl.uint32)
-    word = tl.sum(sf << (b[None, :] * 8), 1)
-    tl.store(F + row, word.to(tl.int32), row < N)
-
-
-def gather_index_cache(cache, slots, page_size):
-    data = torch.empty((slots.numel(), 64), dtype=torch.uint8, device=cache.device)
-    scales = torch.empty((slots.numel(),), dtype=torch.int32, device=cache.device)
-    if slots.numel():
-        _gather_index_cache[(triton.cdiv(slots.numel(), 32),)](
-            cache,
-            slots,
-            data,
-            scales,
-            cache.stride(0),
-            slots.stride(0),
-            slots.numel(),
-            cache.shape[0],
-            page_size,
-            32,
-            num_warps=4,
-        )
-    return data, scales
-
-
-@triton.jit(
     do_not_specialize=["L0", "N", "CAP"],
     do_not_specialize_on_alignment=["L0", "N", "CAP"],
 )

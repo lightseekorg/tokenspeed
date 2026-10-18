@@ -30,7 +30,6 @@ from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
 from tokenspeed_kernel.ops.attention.dsv41._deep_gemm.indexer import gather_index_pages
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
-    gather_index_cache,
     pack_index_inputs,
     pack_index_queries,
     prepare_candidate_scores,
@@ -861,10 +860,17 @@ def _gather_inputs(capacity, strided, dtype):
 def _gather_reference(cache, table):
     logical = torch.arange(table.numel() * 64, device=cache.device, dtype=torch.int64)
     pages = table[logical // 64]
-    slots = (pages.to(torch.int64) * 64 + logical % 64).masked_fill(
-        (pages < 0) | (pages >= cache.shape[0]), -1
-    )
-    return gather_index_cache(cache, slots, 64)
+    valid = (pages >= 0) & (pages < cache.shape[0])
+    page = pages.to(torch.int64).clamp(0, cache.shape[0] - 1)[:, None]
+    row = (logical % 64)[:, None]
+    flat = cache.as_strided((cache.shape[0], 64 * 68), (cache.stride(0), 1))
+    data = flat[page, row * 64 + torch.arange(64, device=cache.device)]
+    data = data.masked_fill(~valid[:, None], 0)
+    sf = flat[page, 64 * 64 + row * 4 + torch.arange(4, device=cache.device)]
+    sf = sf.masked_fill(~valid[:, None], 127).to(torch.int64)
+    word = (sf << torch.tensor([0, 8, 16, 24], device=cache.device)).sum(-1)
+    # Reinterpret the packed little-endian bytes as the kernel's int32 word.
+    return data, ((word + 2**31) % 2**32 - 2**31).to(torch.int32)
 
 
 @pytest.mark.parametrize(

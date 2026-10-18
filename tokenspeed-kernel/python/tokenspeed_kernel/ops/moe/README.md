@@ -303,14 +303,16 @@ byte on random rows, tie, edge and NaN corpora and in CUDA-graph replay.
 
 ## Routing weight storage and deferred finalize
 
-`moe_plan` records the selected expert kernel's `topk_weights_dtype` alongside
-its communication and combine-order traits. DeepSeek V4 routing uses that
-storage dtype after FP32 scoring, normalization, and scaling. This does not
-change expert placement: all-to-all plans still route rank-local tokens, while
-replicated-input plans use the shared replica choice described in
-[Expert placement dispatch](#expert-placement-dispatch).
+`moe_plan` records the selected expert kernel's `topk_weights_dtype`. DeepSeek V4
+routing stores its weights in that dtype after FP32 scoring, normalization, and
+scaling.
 
-The BF16 TRT-LLM MXFP4 SwiGLU path can return expert rows, route weights, and
-row indices for `moe_finalize_fuse_shared`. The finalizer combines the shared
-expert output in FP32 and trims to the original hidden width. FP16 input and
-backends without deferred finalize retain their ordinary finalized output.
+On NVIDIA, the DeepSeek V4 MoE defers finalization for BF16 activations
+whenever the selected kernel supports it (TRT-LLM MXFP4 SwiGLU, Triton MXFP4,
+and the other deferred-capable kernels). The kernel returns expert rows and row
+indices, and `moe_finalize_fuse_shared` combines them with the precomputed
+route weights and the shared expert output in FP32, trimming to the original
+hidden width. Some kernels (Triton MXFP4) return no weights, so the model
+always passes its own precomputed routes. FP16 input, ROCm, where the fused
+finalizer is not built, and kernels without deferred finalize keep the
+kernel's own finalized output.

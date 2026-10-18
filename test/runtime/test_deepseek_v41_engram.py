@@ -35,6 +35,7 @@ import importlib.util
 import json
 import os
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -55,9 +56,40 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     EngramLayout,
     RowShardedEngramEmbedding,
     build_compressed_token_map,
-    build_engram_previous_tokens,
     compute_hash_multipliers,
 )
+
+
+def build_engram_previous_tokens(
+    token_histories: Sequence[Sequence[int]],
+    request_indices: Sequence[int],
+    positions: Sequence[int],
+) -> torch.Tensor:
+    """Test oracle: CPU int64 [tokens, 3] raw lookbacks, newest first.
+
+    Histories are physical-position request histories with nonparticipating
+    positions marked -1; request indices and positions describe each packed
+    token, as the runtime's fused preparation resolves them.
+    """
+    if len(request_indices) != len(positions):
+        raise ValueError("Engram request indices and positions must have equal lengths")
+    windows = []
+    for request_index, position in zip(request_indices, positions, strict=True):
+        if not 0 <= request_index < len(token_histories):
+            raise ValueError(f"Invalid Engram history request index {request_index}")
+        history = token_histories[request_index]
+        if not 0 <= position <= len(history):
+            raise ValueError(
+                f"Engram history is missing tokens before position {position}"
+            )
+        window = [
+            history[position - shift] if position >= shift else -1
+            for shift in (1, 2, 3)
+        ]
+        if any(token_id < -1 for token_id in window):
+            raise ValueError("Mark nonparticipating history tokens with -1")
+        windows.append(window)
+    return torch.tensor(windows, dtype=torch.int64, device="cpu").reshape(-1, 3)
 
 
 class _Tokenizer:

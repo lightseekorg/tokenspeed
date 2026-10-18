@@ -549,42 +549,52 @@ class TestDeepseekV4Config:
         assert (topk_config["routed_scaling_factor"]) == (2.5)
         assert (topk_config["weights_dtype"]) == (torch.bfloat16)
 
-    @pytest.mark.parametrize("normalized", [False, True])
-    def test_deepseek_v4_moe_deferred_finalize_keeps_scaled_route_weights(
-        self, normalized
+    @staticmethod
+    def _fake_deferred_moe(
+        make_moe, hidden_states, input_ids, route_weights, kernel_result
     ):
-        hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
-        input_ids = torch.arange(2)
-        moe = self._make_fake_deepseek_v4_moe(
+        moe = make_moe(
             hidden_states,
             input_ids,
             StreamFork(None),
             [],
-            norm_topk_prob=normalized,
+            norm_topk_prob=True,
         )
-        # Routing has already applied the model's scaling factor.
-        gemm = hidden_states + 1
-        weights = torch.full((2, 1), 2.0, dtype=torch.bfloat16)
-        indices = torch.arange(2, dtype=torch.int32)
-        moe.experts = Mock(return_value=(gemm, weights, indices))
+        moe.topk = lambda *args, **kwargs: SimpleNamespace(topk_weights=route_weights)
+        moe.experts = Mock(return_value=kernel_result)
         moe.experts.supports_deferred_finalize = True
+        return moe
 
-        def finalize(
-            gemm2_out,
-            expanded_idx,
-            expert_weights,
-            shared,
-            *,
-            top_k,
-            enable_pdl,
-            hidden_dim,
-        ):
-            assert (gemm2_out) is (gemm)
-            assert (expanded_idx) is (indices)
-            assert (expert_weights) is (weights)
-            assert (top_k) == (1)
-            assert isinstance(enable_pdl, bool)
-            assert (hidden_dim) == (hidden_states.shape[-1])
+    # Some kernels (Triton MXFP4) return no weights; the precomputed routes
+    # are the ones they applied either way.
+    @pytest.mark.parametrize("kernel_returns_weights", [False, True])
+    def test_deepseek_v4_moe_deferred_finalize_uses_routing_weights(
+        self, monkeypatch, kernel_returns_weights
+    ):
+        monkeypatch.setattr(
+            deepseek_v4_model,
+            "current_platform",
+            lambda: SimpleNamespace(is_nvidia=True),
+        )
+        hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
+        input_ids = torch.arange(2)
+        route_weights = torch.full((2, 1), 2.0, dtype=torch.bfloat16)
+        gemm = hidden_states + 1
+        indices = torch.arange(2, dtype=torch.int32)
+        kernel_weights = route_weights.clone() if kernel_returns_weights else None
+        moe = self._fake_deferred_moe(
+            self._make_fake_deepseek_v4_moe,
+            hidden_states,
+            input_ids,
+            route_weights,
+            (gemm, kernel_weights, indices),
+        )
+
+        def finalize(gemm2_out, expanded_idx, expert_weights, shared, **kwargs):
+            assert gemm2_out is gemm and expanded_idx is indices
+            assert expert_weights is route_weights
+            assert kwargs["top_k"] == 1
+            assert kwargs["hidden_dim"] == hidden_states.shape[-1]
             return (
                 gemm2_out.float() * expert_weights.float() + shared.float()
             ).bfloat16()
@@ -593,67 +603,67 @@ class TestDeepseekV4Config:
             deepseek_v4_model, "moe_finalize_fuse_shared", side_effect=finalize
         ):
             actual = moe.forward_normal(hidden_states, input_ids, 2, 2)
-        assert not (moe.experts.call_args.kwargs["do_finalize"])
+        assert not moe.experts.call_args.kwargs["do_finalize"]
         torch.testing.assert_close(
             actual, (hidden_states + 1) * 2 + hidden_states + 3, atol=0, rtol=0
         )
 
-    def test_deepseek_v4_moe_common_finalize_trims_padding_without_shared(self):
+    def test_deepseek_v4_moe_common_finalize_trims_padding_without_shared(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            deepseek_v4_model,
+            "current_platform",
+            lambda: SimpleNamespace(is_nvidia=True),
+        )
         hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
         input_ids = torch.arange(2)
-        moe = self._make_fake_deepseek_v4_moe(
+        weights = torch.full((2, 1), 2.0, dtype=torch.bfloat16)
+        gemm = torch.ones(2, 8, dtype=torch.bfloat16)
+        moe = self._fake_deferred_moe(
+            self._make_fake_deepseek_v4_moe,
             hidden_states,
             input_ids,
-            StreamFork(None),
-            [],
-            norm_topk_prob=True,
+            weights,
+            (gemm, weights, torch.arange(2, dtype=torch.int32)),
         )
         moe.n_shared_experts = None
         moe.shared_experts = None
-        gemm = torch.ones(2, 8, dtype=torch.bfloat16)
-        weights = torch.full((2, 1), 2.0, dtype=torch.bfloat16)
-        indices = torch.arange(2, dtype=torch.int32)
-        moe.experts = Mock(return_value=(gemm, weights, indices))
-        moe.experts.supports_deferred_finalize = True
         with patch.object(
             deepseek_v4_model,
             "moe_finalize_fuse_shared",
             return_value=(gemm * weights)[:, : hidden_states.shape[-1]].contiguous(),
         ) as finalize:
             actual = moe.forward_normal(hidden_states, input_ids, 2, 2)
-        assert (finalize.call_args.args[3]) is None
-        assert (finalize.call_args.kwargs["top_k"]) == (1)
+        assert finalize.call_args.args[3] is None
         assert finalize.call_args.kwargs["hidden_dim"] == hidden_states.shape[-1]
-        assert (actual.shape) == (hidden_states.shape)
+        assert actual.shape == hidden_states.shape
         assert actual.is_contiguous()
         torch.testing.assert_close(actual, hidden_states * 2, atol=0, rtol=0)
 
-    def test_deepseek_v4_moe_deferred_finalize_uses_routes_without_kernel_weights(
-        self,
-    ):
-        # Precomputed-route kernels (Triton MXFP4) return no weights; the
-        # routing pass holds them.
+    def test_deepseek_v4_moe_keeps_kernel_finalize_off_nvidia(self, monkeypatch):
+        # The fused finalizer is a CUDA library.
+        monkeypatch.setattr(
+            deepseek_v4_model,
+            "current_platform",
+            lambda: SimpleNamespace(is_nvidia=False),
+        )
         hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
         input_ids = torch.arange(2)
-        moe = self._make_fake_deepseek_v4_moe(
+        moe = self._fake_deferred_moe(
+            self._make_fake_deepseek_v4_moe,
             hidden_states,
             input_ids,
-            StreamFork(None),
-            [],
-            norm_topk_prob=True,
+            torch.ones(2, 1),
+            hidden_states * 2,
         )
-        route_weights = torch.tensor([[0.25, 0.75], [0.5, 0.5]])
-        moe.topk = lambda *args, **kwargs: SimpleNamespace(topk_weights=route_weights)
-        gemm = torch.ones(4, 3, dtype=torch.bfloat16)
-        indices = torch.arange(4, dtype=torch.int32)
-        moe.experts = Mock(return_value=(gemm, None, indices))
-        moe.experts.supports_deferred_finalize = True
-        with patch.object(
-            deepseek_v4_model, "moe_finalize_fuse_shared", return_value=hidden_states
-        ) as finalize:
-            moe.forward_normal(hidden_states, input_ids, 2, 2)
-        assert finalize.call_args.args[2] is route_weights
-        assert finalize.call_args.kwargs["top_k"] == 2
+        with patch.object(deepseek_v4_model, "moe_finalize_fuse_shared") as finalize:
+            actual = moe.forward_normal(hidden_states, input_ids, 2, 2)
+        assert moe.experts.call_args.kwargs["do_finalize"]
+        finalize.assert_not_called()
+        torch.testing.assert_close(
+            actual, hidden_states * 2 + hidden_states + 3, atol=0, rtol=0
+        )
 
     def test_deepseek_v4_moe_keeps_finalize_for_unsupported_consumer(self):
         hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)

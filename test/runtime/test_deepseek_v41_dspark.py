@@ -127,7 +127,6 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
     target.model.ced_decoder_start = 20
     target.model.decoder_uses_engram = True
     target.model.layers = nn.ModuleList(Layer(i) for i in range(40))
-    target.model.engram_hash = Mock(return_value=torch.tensor([[0, 1, 2], [0, 1, 2]]))
     target.model.norm = SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-6)
     target.set_dspark_layers_to_capture([37, 38, 39])
     assert target.model.dspark_capture_layers == (37, 38, 39)
@@ -308,10 +307,9 @@ def _window_backend(positions, cache, history, block, rows_per_page):
     )
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_window_workspace_preserves_deferred_norm(device):
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_window_workspace_preserves_deferred_norm():
+    device = "cuda"
     torch.manual_seed(418)
     config = _config()
     config.head_dim, config.qk_rope_head_dim = 512, 64
@@ -327,7 +325,7 @@ def test_window_workspace_preserves_deferred_norm(device):
         norm.weight.uniform_(0.5, 1.5)
     rotary = v41.DeepseekV41RotaryEmbedding(config, 0)
     rotary._prepare_cache(torch.device(device))
-    rope_cache = rotary.cos_sin_cache if device == "cuda" else None
+    rope_cache = rotary.cos_sin_cache
     swa = torch.randn(4, 512, dtype=torch.bfloat16, device=device)
     original = swa.clone()
     expected = backend._workspace(

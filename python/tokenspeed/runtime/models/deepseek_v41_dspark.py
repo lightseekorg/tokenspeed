@@ -146,11 +146,8 @@ class _WindowAttention:
             )
         else:
             if swa_norm_weight is not None:
-                values = swa.float()
-                values = values * torch.rsqrt(
-                    values.square().mean(-1, keepdim=True) + swa_norm_eps
-                )
-                swa = (swa_norm_weight.float() * values).to(swa.dtype)
+                # The model defers the SWA norm only to the fused CUDA rows.
+                raise ValueError("A deferred SWA norm requires 512-wide CUDA rows")
             if swa_rope_cache is not None:
                 swa = rope_inplace(swa.clone(), positions, swa_rope_cache, None)
             rows = _quantized_kv(swa)

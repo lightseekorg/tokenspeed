@@ -40,9 +40,6 @@ def cuda_sqrt_softplus_topk(
         dtype=torch.int32,
         device=router_logits.device,
     )
-    if router_logits.shape[0] == 0:
-        scores = logits_f32 if need_scores else router_logits
-        return topk_weights, topk_ids, scores
     if hash_indices_table is not None:
         if input_ids is None:
             raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
