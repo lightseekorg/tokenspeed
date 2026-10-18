@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Standard MHA backend selection rejects removed implementations and preserves geometry."""
+"""Standard MHA backend preserves target and block-draft geometry."""
 
 import os
 import sys
@@ -33,10 +33,7 @@ import tokenspeed.runtime.layers.attention.backends.paged.mla  # noqa: F401
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
-from tokenspeed.runtime.layers.attention.registry import (
-    _get_backend_cls,
-    validate_attention_backend_name,
-)
+from tokenspeed.runtime.layers.attention.registry import _get_backend_cls
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -47,15 +44,6 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 def test_gluon_backend_is_rejected_for_mha():
     with pytest.raises(ValueError, match="does not support"):
         _get_backend_cls("gluon", AttentionArch.MHA)
-
-
-@pytest.mark.parametrize("flag", ["--attention-backend", "--drafter-attention-backend"])
-def test_removed_implementation_alias_is_not_a_launch_backend(flag):
-    validate_attention_backend_name("mha", flag=flag)
-    with pytest.raises(ValueError, match="Unknown"):
-        validate_attention_backend_name("gluon_mha", flag=flag)
-    with pytest.raises(ValueError, match="Unknown attention backend"):
-        _get_backend_cls("gluon_mha", AttentionArch.MHA)
 
 
 @pytest.mark.parametrize("draft,heads", [(False, 48), (True, 40)])

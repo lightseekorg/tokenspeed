@@ -224,7 +224,7 @@ nonlocal routes contribute zero. The caller owns distributed reduction.
 
 On gfx950, Beam requests the default policy with precomputed routing and
 finalized output for BF16, FP8 and MXFP4 experts. Automatic selection keeps
-this kernel ahead of the restricted Gluon FP8 candidate (recorded in
+this kernel ahead of the restricted Gluon FP8 implementation (recorded in
 `tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/README.md`), whose
 launcher checks expert count and top-k before GPU execution. NVIDIA retains
 its existing policies and backend selection.

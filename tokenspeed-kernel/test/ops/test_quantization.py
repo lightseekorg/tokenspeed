@@ -30,6 +30,8 @@ from tokenspeed_kernel.ops.quantization import (
     quantize_nvfp4,
 )
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
+from tokenspeed_kernel.platform import Platform
+from tokenspeed_kernel.registry import KernelRegistry
 
 _FP8_DTYPE = torch.float8_e4m3fn
 _FP8_FINFO = torch.finfo(_FP8_DTYPE)
@@ -69,6 +71,17 @@ def test_fp8_roundtrip_rejects_pdl() -> None:
             group_size=128,
             scale_encoding="ue8m0",
             dequantize=True,
+            enable_pdl=True,
+        )
+
+
+def test_portable_token_quantizer_rejects_pdl(mi350_platform, monkeypatch) -> None:
+    monkeypatch.setattr(Platform, "_instance", mi350_platform)
+    monkeypatch.setattr(KernelRegistry.get(), "_selection_cache", {})
+    with pytest.raises(ValueError, match="does not support enable_pdl"):
+        quantize_fp8(
+            torch.ones(1, 32, dtype=torch.bfloat16),
+            granularity="token",
             enable_pdl=True,
         )
 

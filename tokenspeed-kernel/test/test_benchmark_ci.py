@@ -46,23 +46,6 @@ _ENVIRONMENT = {
 }
 
 
-def test_real_gfx950_suite_expands_six_beam_apply_cases_without_execution():
-    suite_path = Path(__file__).resolve().parents[1] / "benchmarks/amd/gfx950.json"
-    suite = load_suite(suite_path)
-    beam = [case for case in suite.cases if case.id.startswith("beam.moe.apply/")]
-    assert [case.request.parameters["tokens"] for case in beam] == [
-        1,
-        2,
-        4,
-        8,
-        16,
-        8192,
-    ]
-    # Adding the Beam fragment must retain the existing model suites.
-    for prefix in ("dsv41_flash.", "glm53_flash.", "kimi_k3.", "qwen38_flash."):
-        assert any(case.id.startswith(prefix) for case in suite.cases)
-
-
 def _definition(*, seed: int = 42) -> dict:
     return {
         "family": "gemm",

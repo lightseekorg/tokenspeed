@@ -78,12 +78,13 @@ def test_dense_beam_shards_match_fp32_accumulator_then_scale(m, n, k):
     # Integer FP8 products accumulate exactly in FP32 at these K sizes. This
     # isolates the two scale multiplications and final BF16 rounding.
     scales = torch.linspace(0.001, 0.01, n, device="cuda").reshape(n, 1)
-    result = mm(x, weight.t(), B_scales=scales, out_dtype=x.dtype, quant="fp8")
+    out = torch.empty(m, n, device="cuda", dtype=x.dtype)
+    result = mm(x, weight.t(), B_scales=scales, out_dtype=x.dtype, quant="fp8", out=out)
     codes, token_scales = _reference_quantize(x)
     acc = (codes.double() @ weight.double().t()).float()
     expected = ((acc * token_scales) * scales.t()).to(torch.bfloat16)
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
-    assert result.dtype == torch.bfloat16
+    assert result is out
 
 
 def test_token_quantizer_reuses_compilation_for_changing_row_count():

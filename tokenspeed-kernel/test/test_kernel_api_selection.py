@@ -3524,6 +3524,26 @@ def test_explicit_gluon_plan_uses_channel_candidate(
 
 
 @pytest.mark.parametrize(
+    "override",
+    [
+        {"ep_size": 2},
+        {"ispp": 352},
+        {"hidden": 2048},
+        {"activation_clamped": True},
+        {"expert_id_repeats": True},
+        {"requires_deferred_finalize": True},
+        {"with_bias": True},
+    ],
+)
+def test_gluon_fp8_channel_plan_rejects_unsupported_geometry(
+    mi350_platform: PlatformInfo,
+    override: dict,
+) -> None:
+    with pytest.raises(kernel_NoKernelFoundError):
+        _moe_fp8_channel_plan(mi350_platform, solution="gluon", **override)
+
+
+@pytest.mark.parametrize(
     "dtype,width,expected",
     [
         ("unquant", 640, "gluon_bf16_precomputed_moe_apply"),

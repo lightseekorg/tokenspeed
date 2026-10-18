@@ -1636,27 +1636,20 @@ with EP1, 256 local experts, hidden width 5120, local intermediate width
   this is BF16 compute, not native FP8 MFMA or scaled-BF16 weights.
 - Expert outputs round to unweighted BF16 before the ordered FP32
   weighted-route accumulation.
-- Registered below the portable native-FP8 implementation, so automatic plans
-  keep native-FP8 selection; an explicit `gluon` solution selects this
-  implementation.
 
 #### Algorithm
 
-The implementation extends the pre-existing compact-FP8 grouped gate/up and
-down stages: register loads widen raw codes exactly to BF16 shared operands,
-preserving the established grouped MFMA pipeline and FP32 accumulation and
-avoiding the unsupported 64-bit vector that a dtype-only activation
-async-copy change would create. The channel FC1 launcher uses an N64 output
-tile for local width 320, which does not divide N128; width 640 keeps its
-existing tile choices. FC2 retains K64, which divides both widths, so no
-projection tail or new kernel is needed.
+Grouped gate/up and down stages load FP8 codes into registers, widen them
+exactly to BF16 shared-memory operands, and accumulate matrix products in FP32.
+The gate/up projection uses an N64 output tile for local width 320; width 640
+also admits N128 tiles. The down projection uses K64 tiles for both widths.
 
 Projection epilogues apply token then channel scales with fusion disabled.
 Gate/up stay FP32 through SiLU and multiplication, then round once to BF16.
-The existing route quantizer retains scaled-product BF16 rounding before FP8.
-Down outputs round to unweighted BF16 before the unchanged ordered FP32
+The route quantizer rounds the scaled product to BF16 before FP8 conversion.
+Down outputs round to unweighted BF16 before ordered FP32
 weighted combine. No split-K, atomic output or materialized-weight fallback is
-selected. Existing BF16/block-FP8 launchers retain explicit legacy mode.
+used.
 
 ## Residual
 

@@ -20,14 +20,10 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe import moe_plan
 from tokenspeed_kernel.ops.moe.gluon import (
     GLUON_FP8_CHANNEL_APPLY,
     gluon_fp8_channel_bf16_precomputed_moe_apply,
 )
-from tokenspeed_kernel.platform import Platform
-from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import NoKernelFoundError
 from utils import is_amd
 
 
@@ -40,49 +36,6 @@ def require_amd_kernel_package():
         )
     else:
         import tokenspeed_kernel_amd  # noqa: F401
-
-
-def _plan(platform, **overrides):
-    kwargs = {
-        "weight_dtype": "fp8_channel",
-        "input_dtype": torch.bfloat16,
-        "activation": "silu",
-        "routing_mode": "precomputed_topk",
-        "ep_size": 1,
-        "ispp": 640,
-        "hidden": 5120,
-        "swiglu_form": "standard",
-        "activation_clamped": False,
-        "expert_id_repeats": False,
-        "fast_math": False,
-        "combine_order": "rank",
-    }
-    kwargs.update(overrides)
-    original = Platform.get()
-    try:
-        Platform.override(platform)
-        KernelRegistry.get().clear_cache()
-        return moe_plan(**kwargs)
-    finally:
-        Platform.override(original)
-        KernelRegistry.get().clear_cache()
-
-
-@pytest.mark.parametrize(
-    "override",
-    [
-        {"ep_size": 2},
-        {"ispp": 352},
-        {"hidden": 2048},
-        {"activation_clamped": True},
-        {"expert_id_repeats": True},
-        {"requires_deferred_finalize": True},
-        {"with_bias": True},
-    ],
-)
-def test_gluon_plan_rejects_unsupported_geometry(mi350_platform, override):
-    with pytest.raises(NoKernelFoundError):
-        _plan(mi350_platform, solution="gluon", **override)
 
 
 def test_apply_rejects_unknown_policy():
