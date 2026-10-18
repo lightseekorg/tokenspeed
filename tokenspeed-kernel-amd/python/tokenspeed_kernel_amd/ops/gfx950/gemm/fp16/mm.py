@@ -1712,7 +1712,6 @@ _DECODE_CONFIGS: dict[
         32: (32, 32, 64, 2, 2, 8, 5, 1),
         64: (64, 16, 256, 4, 1, 2, 5, 1),
     },
-    # QSA indexer query/key projection.
     # DeepSeek V4.1 MoE router gate (FP32 output), any TP.
     (384, 5120): {
         4: (16, 64, 256, 1, 4, 2, 10, 1),
@@ -1721,6 +1720,7 @@ _DECODE_CONFIGS: dict[
         32: (32, 32, 512, 2, 2, 2, 5, 1),
         64: (32, 32, 512, 2, 2, 2, 5, 8),
     },
+    # QSA indexer query/key projection.
     (640, 2560): {
         4: (16, 64, 128, 1, 4, 4, 5, 8),
         8: (16, 64, 64, 1, 4, 5, 8, 1),

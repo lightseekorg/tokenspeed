@@ -237,11 +237,12 @@ def _attend_tile(
 
 
 @gluon.jit
-def _inverse_rope(values, dims, rows, rope_row, ROPE_DIM: gl.constexpr):
+def _inverse_rope(values, dims, rows, rope_row, dim_base, ROPE_DIM: gl.constexpr):
     """Rotate the interleaved RoPE tail of BF16 [rows, dims] output tiles.
 
-    ``dims`` are absolute head dims; only the last ``ROPE_DIM`` of 512 rotate.
-    ``rope_row`` points at the token's inverse cos/sin table row.
+    dims are absolute head dims; dim_base localizes the gather to the tile.
+    Only the last ROPE_DIM of 512 rotate. rope_row points at the token's
+    inverse cos/sin table row.
     """
     start: gl.constexpr = 512 - ROPE_DIM
     rope = dims >= start
@@ -249,7 +250,9 @@ def _inverse_rope(values, dims, rows, rope_row, ROPE_DIM: gl.constexpr):
     cosine = gl.load(rope_row + pair, mask=rope, other=1.0)
     sine = gl.load(rope_row + ROPE_DIM // 2 + pair, mask=rope, other=0.0)
     value = values.to(gl.float32)
-    partner = gl.gather(value, (dims ^ 1)[None, :] + rows[:, None] * 0, axis=1)
+    partner = gl.gather(
+        value, ((dims - dim_base) ^ 1)[None, :] + rows[:, None] * 0, axis=1
+    )
     first = value * cosine[None, :]
     second = partner * sine[None, :]
     rotated = gl.where(((dims & 1) != 0)[None, :], first + second, first - second)
@@ -664,7 +667,7 @@ def gluon_dsv41_selected_attention_gfx950(
                     )
                     if ROPE_DIM > 0:
                         result = _inverse_rope(
-                            result, q_dims, heads, rope_row, ROPE_DIM
+                            result, q_dims, heads, rope_row, 0, ROPE_DIM
                         )
                     gl.store(
                         out_base + heads[:, None].to(tl.int64) * stride_o_h,
@@ -710,7 +713,7 @@ def gluon_dsv41_selected_attention_gfx950(
                     )
                     if ROPE_DIM > 0:
                         result = _inverse_rope(
-                            result, q_dims, heads, rope_row, ROPE_DIM
+                            result, q_dims, heads, rope_row, 0, ROPE_DIM
                         )
                     gl.store(
                         out_base + heads[:, None].to(tl.int64) * stride_o_h,
@@ -868,7 +871,9 @@ def gluon_dsv41_selected_attention_reduce_gfx950(
                 + gl.maximum(gl.load(rope_positions + token_idx), 0).to(tl.int64)
                 * stride_rope
             )
-            result = _inverse_rope(result, dims, out_heads, rope_row, ROPE_DIM)
+            result = _inverse_rope(
+                result, dims, out_heads, rope_row, dim_base, ROPE_DIM
+            )
     gl.store(
         out
         + token_idx.to(tl.int64) * stride_o_t

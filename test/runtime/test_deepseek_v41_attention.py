@@ -304,11 +304,11 @@ def test_attention_shares_q_quantization_only_with_compatible_indexer(
         )
         method = index_linear.quant_method
         index_linear.quant_method = SimpleNamespace(apply=method.apply)
-        expected = attention(positions, x, ctx)
+        expected = attention(positions, x, ctx, reduce_output=True)
         expected_index = backend.calls[-1][3:5]
         assert received[-1].dtype == torch.bfloat16
         index_linear.quant_method = method
-        actual = attention(positions, x, ctx)
+        actual = attention(positions, x, ctx, reduce_output=True)
         # Narrowed rows select the shared codes after quantization.
         shared = received[-1].dtype == torch.float8_e4m3fn
         assert shared == (case in ("shared", "narrowed"))
@@ -364,17 +364,17 @@ def test_shared_q_decode_graph_replay_with_auxiliary_indexer(monkeypatch):
     ctx = _ctx(backend, 6, ForwardMode.DECODE)
     x = torch.randn(6, config.hidden_size, device="cuda", dtype=torch.bfloat16)
     for _ in range(3):
-        attention(positions, x, ctx)
+        attention(positions, x, ctx, reduce_output=True)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = attention(positions, x, ctx)
+        captured = attention(positions, x, ctx, reduce_output=True)
     captured_index = selected[-1]
     index_linear = attention.indexer.wq_b
     index_linear.quant_method = SimpleNamespace(apply=index_linear.quant_method.apply)
     for factor in (0.0, 0.2, 2.0):
         x.normal_().mul_(factor)
         graph.replay()
-        expected = attention(positions, x, ctx)
+        expected = attention(positions, x, ctx, reduce_output=True)
         torch.testing.assert_close(captured, expected, rtol=0, atol=0)
         for actual_index, expected_index in zip(captured_index, selected[-1]):
             torch.testing.assert_close(actual_index, expected_index, rtol=0, atol=0)

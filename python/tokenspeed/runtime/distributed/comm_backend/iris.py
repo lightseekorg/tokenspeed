@@ -269,6 +269,10 @@ class IrisBackend(CommBackend):
         comb: torch.Tensor,
         group: Group,
     ) -> torch.Tensor | None:
+        """Fuse CDNA4 all-reduce and mHC post when prepared Iris state permits.
+
+        Return None on other platforms, without state, or for ineligible operands.
+        """
         if not current_platform().is_cdna4:
             return None
         state = self.state(group, tensor.dtype)

@@ -324,7 +324,7 @@ def test_residual_family_exports_and_modes():
         "hyperconnection_combine",
         "hyperconnection_mix",
         "mhc_apply_pre",
-        "mhc_apply_pre_fp8_group32",
+        *({"mhc_apply_pre_fp8_group32"} if Platform.get().is_amd else set()),
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",

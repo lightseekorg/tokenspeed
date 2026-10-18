@@ -508,10 +508,12 @@ class DeepseekV4MoE(nn.Module):
         max_num_tokens_per_gpu: int,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """``out`` optionally receives the routed + shared sum (e.g. memory the
-        following all-reduce reads in place)."""
+        """Write the routed + shared sum into out when supplied.
+
+        The following all-reduce can read this memory in place.
+        """
         if hidden_states.shape[0] == 0 and not self.use_gluon_petit:
-            return hidden_states
+            return hidden_states if out is None else out.copy_(hidden_states)
         with nvtx_range("moe_select_experts"):
             topk_output = self._compute_topk_output(hidden_states, input_ids)
         deferred_finalize = (
@@ -558,6 +560,8 @@ class DeepseekV4MoE(nn.Module):
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.use_mega_moe:
+            if out is not None:
+                raise ValueError("DeepSeek V4 MegaMoE does not support out")
             return self.forward_mega_moe(
                 hidden_states,
                 input_ids,

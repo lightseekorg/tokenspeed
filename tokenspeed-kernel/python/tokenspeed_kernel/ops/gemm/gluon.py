@@ -336,8 +336,10 @@ if platform.is_amd:
         weight: torch.Tensor,
         enable_pdl: bool,
     ) -> torch.Tensor:
-        """FP32 ``hidden_states @ weight.T``: the decode GEMM for its measured
-        row buckets, hipBLASLt otherwise."""
+        """FP32 hidden_states @ weight.T for the measured decode row buckets.
+
+        Fall back to hipBLASLt for other row counts.
+        """
         if enable_pdl:
             raise ValueError("gfx950 DSV4 FP32 linear does not support PDL")
         m, n, k = hidden_states.shape[0], weight.shape[0], weight.shape[1]
@@ -380,8 +382,10 @@ if platform.is_amd:
     def gluon_grouped_bf16_projection_gfx950(
         x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
     ) -> torch.Tensor:
-        """One-launch grouped decode GEMM writing ``[tokens, groups, rows]``
-        directly; torch.einsum for row counts without a measured config."""
+        """One-launch grouped decode GEMM writing [tokens, groups, rows] directly.
+
+        Fall back to torch.einsum for row counts without a measured config.
+        """
         m, g, k = x.shape
         n = weight.shape[1]
         if not _supports_grouped_decode(m, g, n, k):

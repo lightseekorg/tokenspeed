@@ -712,7 +712,7 @@ def test_attention_owner_cast_index_and_grouped_output(layer_id):
     backend = _Backend(positions, requests)
     ctx = _ctx(backend, 6, ForwardMode.EXTEND)
     x = torch.randn(6, 128, dtype=torch.bfloat16)
-    actual = attn(positions, x, ctx)
+    actual = attn(positions, x, ctx, reduce_output=True)
     qr = _norm(
         F.linear(x, attn.wq_a_wkv.weight[: config.q_lora_rank]),
         attn.q_norm.weight,
@@ -1082,8 +1082,8 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
     # row-local compute in between covers every row. Emulate the handoff
     # here, where no CUDA graph can run.
     def landed(original):
-        def forward(self, positions, hidden_states, ctx, *quantized):
-            out = original(self, positions, hidden_states, ctx, *quantized)
+        def forward(self, positions, hidden_states, ctx, *args, **kwargs):
+            out = original(self, positions, hidden_states, ctx, *args, **kwargs)
             pad = hidden_states.shape[0] - out.shape[0]
             return (
                 torch.cat((out, out.new_zeros((pad, *out.shape[1:])))) if pad else out
@@ -1964,11 +1964,14 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         pos = torch.arange(4, device=device)
         backend = _Backend(pos, torch.zeros_like(pos))
         x = torch.randn(4, 128, dtype=torch.bfloat16, device=device)
-        out = sharded(pos, x, _ctx(backend, 4, ForwardMode.EXTEND))
+        out = sharded(pos, x, _ctx(backend, 4, ForwardMode.EXTEND), reduce_output=True)
         assert backend.calls[-1][-1] is None
         assert sharded.indexer.n_local_heads == config.index_n_heads
         expected = full(
-            pos, x, _ctx(_Backend(pos, torch.zeros_like(pos)), 4, ForwardMode.EXTEND)
+            pos,
+            x,
+            _ctx(_Backend(pos, torch.zeros_like(pos)), 4, ForwardMode.EXTEND),
+            reduce_output=True,
         )
         torch.testing.assert_close(out, expected, rtol=0.02, atol=0.003)
         # Exercise the real packed-weight MegaMoE lifecycle, not the CPU loader
@@ -2588,6 +2591,15 @@ def test_routing_matches_reference_bias_and_normalization(topk, vision, with_ima
         weight=torch.eye(4), e_score_correction_bias=bias, bias_vl=bias_vl
     )
     moe.hash_indices_dtype = torch.int64
+    moe.use_mega_moe = False
+    moe.use_gluon_petit = False
+    empty = logits[:0]
+    target = torch.empty_like(empty)
+    assert moe(empty, image_mask, 0, 0) is empty
+    assert moe(empty, image_mask, 0, 0, out=target) is target
+    moe.use_mega_moe = True
+    with pytest.raises(ValueError, match="MegaMoE does not support out"):
+        moe(empty, image_mask, 0, 0, out=target)
     router_logits, actual_bias, _, _ = moe._routing_inputs(logits, image_mask)
     weights, ids = moe_topk(
         router_logits,
@@ -2670,12 +2682,14 @@ def test_ced_q_input_follows_narrowed_rows(layer_id):
     requests = torch.zeros(6, dtype=torch.int64)
     x = torch.randn(6, 128, dtype=torch.bfloat16)
     full = _Backend(positions, requests)
-    expected = attn(positions, x, _ctx(full, 6, ForwardMode.EXTEND))
+    expected = attn(positions, x, _ctx(full, 6, ForwardMode.EXTEND), reduce_output=True)
     keep = torch.tensor([1, 3, 5])
     query = SimpleNamespace(positions=positions[keep], request_indices=requests[keep])
     view = V41DecoderView(query, None, (), keep, None)
     narrowed = _Backend(positions, requests, view)
-    actual = attn(positions, x, _ctx(narrowed, 6, ForwardMode.EXTEND))
+    actual = attn(
+        positions, x, _ctx(narrowed, 6, ForwardMode.EXTEND), reduce_output=True
+    )
     torch.testing.assert_close(actual, expected[keep], rtol=0, atol=0)
     if layer_id == 20:
         assert narrowed.global_writes[layer_id][0].shape[0] == 6
@@ -2708,6 +2722,7 @@ def test_short_history_skips_query_projections_but_preserves_keys(
         positions,
         torch.randn(4, 128, dtype=torch.bfloat16),
         _ctx(backend, 4, ForwardMode.EXTEND),
+        reduce_output=True,
     )
     assert backend.calls[-1][3:5] == (None, None)
     assert bool(backend.global_writes) == (layer_id in (2, 20))

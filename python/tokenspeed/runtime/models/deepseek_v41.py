@@ -1021,13 +1021,15 @@ class DeepseekV41Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
+        reduce_output: bool,
         hidden_codes: torch.Tensor | None = None,
         hidden_scales: torch.Tensor | None = None,
-        reduce_output: bool = True,
     ) -> torch.Tensor:
-        """hidden_codes/hidden_scales optionally carry hidden_states already
-        quantized for wq_a_wkv (group-32 E4M3 codes and UE8M0 scales). With
-        reduce_output False the attention-TP partial is returned unreduced."""
+        """Return the attention output, reducing its TP partial when requested.
+
+        hidden_codes/hidden_scales optionally carry hidden_states already
+        quantized for wq_a_wkv (group-32 E4M3 codes and UE8M0 scales).
+        """
         backend, mode = ctx.attn_backend, ctx.forward_mode
         if mode is None:
             raise ValueError("V4.1 attention requires an explicit forward mode")
@@ -1385,7 +1387,7 @@ class DeepseekV41DecoderLayer(nn.Module):
 
     def forward(self, hidden_states, pre_mix, positions, image_mask, ctx):
         if hidden_states.shape[0] == 0:
-            self._forward_ffn(hidden_states[:, 0, :], image_mask, ctx)
+            self._forward_ffn(hidden_states[:, 0, :], image_mask, ctx, False)
             return hidden_states, pre_mix
         rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
         residual = hidden_states
@@ -1393,10 +1395,10 @@ class DeepseekV41DecoderLayer(nn.Module):
             # HC input is needed by the global producer; output mixes and
             # every decoder consumer are unnecessary for an open chunk.
             x = _v41_hc_input(residual, pre_mix, self.attn_norm)
-            self.attn(positions, x, ctx)
+            self.attn(positions, x, ctx, reduce_output=True)
             if self.ffn.owns_ep_communication:
                 self._forward_ffn(
-                    x[:0], None if image_mask is None else image_mask[:0], ctx
+                    x[:0], None if image_mask is None else image_mask[:0], ctx, False
                 )
             return residual[:0], pre_mix[:0]
         overlap = (
@@ -1431,7 +1433,14 @@ class DeepseekV41DecoderLayer(nn.Module):
                     None,
                     None,
                 )
-            x = self.attn(positions, x, ctx, codes, scales, False)
+            x = self.attn(
+                positions,
+                x,
+                ctx,
+                reduce_output=False,
+                hidden_codes=codes,
+                hidden_scales=scales,
+            )
         if rows.keep_rows is not None:
             # Keep mHC's original split-K shape before selecting the tail.
             residual, post, comb, attn_pre = (
@@ -1468,7 +1477,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             x, group = self._forward_ffn(x, image_mask, ctx, True)
         return _reduce_hc_post(x, residual, post, comb, group), ffn_pre
 
-    def _forward_ffn(self, x, image_mask, ctx, defer_reduce=False):
+    def _forward_ffn(self, x, image_mask, ctx, defer_reduce):
         """MoE output after its communication.
 
         With defer_reduce, return (output, group): a pending plain all-reduce

@@ -414,6 +414,10 @@ class AutoBackend(CommBackend):
         comb: torch.Tensor,
         group: Group,
     ) -> torch.Tensor | None:
+        """Delegate fused all-reduce and mHC post to Iris when routing permits.
+
+        Return None unless AMD uses a node-local tiered route without trtllm.
+        """
         # Same eligibility as the producer-direct all-reduce in _all_reduce_one.
         if (
             not current_platform().is_amd
