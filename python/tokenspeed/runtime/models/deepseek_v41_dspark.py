@@ -132,25 +132,24 @@ class _WindowAttention:
         the target writes its own SWA rows.
         """
         batch, block = self.history_slots.shape[0], self.block_size
-        history = self.window[self.selection.page, self.selection.row]
         if swa.is_cuda and swa.shape[-1] == 512:
-            rows = dsv41.dspark_rows(
+            return dsv41.dspark_workspace(
                 swa,
                 swa_norm_weight,
                 swa_norm_eps if swa_norm_weight is not None else None,
                 positions if swa_rope_cache is not None else None,
                 swa_rope_cache,
-                None,
-                None,
-                torch.empty_like(swa),
+                self.window,
+                self.selection.page,
+                self.selection.row,
+                block,
             )
-        else:
-            if swa_norm_weight is not None:
-                # The model defers the SWA norm only to the fused CUDA rows.
-                raise ValueError("A deferred SWA norm requires 512-wide CUDA rows")
-            if swa_rope_cache is not None:
-                swa = rope_inplace(swa.clone(), positions, swa_rope_cache, None)
-            rows = _quantized_kv(swa)
+        if swa_norm_weight is not None:
+            raise ValueError("A deferred SWA norm requires 512-wide CUDA rows")
+        history = self.window[self.selection.page, self.selection.row]
+        if swa_rope_cache is not None:
+            swa = rope_inplace(swa.clone(), positions, swa_rope_cache, None)
+        rows = _quantized_kv(swa)
         return torch.cat((history, rows.reshape(batch, block, -1)), dim=1)
 
     def forward_v41(

@@ -1798,6 +1798,51 @@ def _launch_query(values, positions, cache, output, heads_to_write):
 
 
 @triton.jit
+def _dspark_row_value(
+    X,
+    W,
+    POS,
+    CS,
+    token,
+    X0,
+    POS0,
+    CS0,
+    MAX_POS: tl.constexpr,
+    R: tl.constexpr,
+    EPS: tl.constexpr,
+    HAS_NORM: tl.constexpr,
+    HAS_ROPE: tl.constexpr,
+):
+    d = tl.arange(0, 512)
+    x = tl.load(X + token * X0 + d).to(tl.float32)
+    if HAS_NORM:
+        weight = tl.load(W + d).to(tl.float32)
+        # The reference rounds the normalized row to BF16 before rotating it.
+        x = reference_rmsnorm_row(x, weight, EPS, 512).to(tl.bfloat16).to(tl.float32)
+    if HAS_ROPE:
+        position = tl.maximum(tl.load(POS + token * POS0).to(tl.int64), 0)
+        valid = position < MAX_POS
+        tl.device_assert(valid, "DSpark RoPE position is outside the cosine/sine table")
+        partner = tl.gather(x, d ^ 1, axis=0)
+        tail = d >= 512 - R
+        pair = (d - (512 - R)) // 2
+        cosine = tl.load(CS + position * CS0 + pair, tail & valid, 1.0)
+        sine = tl.load(CS + position * CS0 + R // 2 + pair, tail & valid, 0.0)
+        rotated = _rotate_interleaved(x, partner, cosine, sine, (d & 1) != 0)
+        x = tl.where(tail, rotated.to(tl.bfloat16), x.to(tl.bfloat16)).to(tl.float32)
+    # All-channel 1x32 E4M3/E8M0 round trip, the reference SWA row codec.
+    values = tl.reshape(x, (16, 32))
+    amax = tl.maximum(tl.max(tl.abs(values), 1), 1.0e-4)
+    exponent = _ue8m0_exponent(amax * (1.0 / 448.0))
+    scale = (exponent << 23).to(tl.float32, bitcast=True)
+    quantized = tl.div_rn(values, scale[:, None]).to(tl.float8e4nv)
+    restored = tl.reshape(quantized.to(tl.float32) * scale[:, None], (512,)).to(
+        tl.bfloat16
+    )
+    return restored
+
+
+@triton.jit
 def _dspark_rows_kernel(
     X,
     W,
@@ -1825,30 +1870,20 @@ def _dspark_rows_kernel(
 ):
     token = tl.program_id(0).to(tl.int64)
     d = tl.arange(0, 512)
-    x = tl.load(X + token * X0 + d).to(tl.float32)
-    if HAS_NORM:
-        weight = tl.load(W + d).to(tl.float32)
-        # The reference rounds the normalized row to BF16 before rotating it.
-        x = reference_rmsnorm_row(x, weight, EPS, 512).to(tl.bfloat16).to(tl.float32)
-    if HAS_ROPE:
-        position = tl.maximum(tl.load(POS + token * POS0).to(tl.int64), 0)
-        valid = position < MAX_POS
-        tl.device_assert(valid, "DSpark RoPE position is outside the cosine/sine table")
-        partner = tl.gather(x, d ^ 1, axis=0)
-        tail = d >= 512 - R
-        pair = (d - (512 - R)) // 2
-        cosine = tl.load(CS + position * CS0 + pair, tail & valid, 1.0)
-        sine = tl.load(CS + position * CS0 + R // 2 + pair, tail & valid, 0.0)
-        rotated = _rotate_interleaved(x, partner, cosine, sine, (d & 1) != 0)
-        x = tl.where(tail, rotated.to(tl.bfloat16), x.to(tl.bfloat16)).to(tl.float32)
-    # All-channel 1x32 E4M3/E8M0 round trip, the reference SWA row codec.
-    values = tl.reshape(x, (16, 32))
-    amax = tl.maximum(tl.max(tl.abs(values), 1), 1.0e-4)
-    exponent = _ue8m0_exponent(amax * (1.0 / 448.0))
-    scale = (exponent << 23).to(tl.float32, bitcast=True)
-    quantized = tl.div_rn(values, scale[:, None]).to(tl.float8e4nv)
-    restored = tl.reshape(quantized.to(tl.float32) * scale[:, None], (512,)).to(
-        tl.bfloat16
+    restored = _dspark_row_value(
+        X,
+        W,
+        POS,
+        CS,
+        token,
+        X0,
+        POS0,
+        CS0,
+        MAX_POS,
+        R,
+        EPS,
+        HAS_NORM,
+        HAS_ROPE,
     )
     if HAS_OUT:
         tl.store(OUT + token * O0 + d, restored)
@@ -1949,6 +1984,212 @@ def triton_dsv41_dspark_rows(
         enable_fp_fusion=False,
         debug=True,
     )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "X0",
+        "POS0",
+        "CS0",
+        "W0",
+        "W1",
+        "P0",
+        "P1",
+        "R0",
+        "R1",
+        "O0",
+        "HISTORY",
+        "BLOCK",
+        "PAGES",
+        "PAGE_ROWS",
+    ],
+    do_not_specialize_on_alignment=[
+        "X0",
+        "POS0",
+        "CS0",
+        "W0",
+        "W1",
+        "P0",
+        "P1",
+        "R0",
+        "R1",
+        "O0",
+        "HISTORY",
+        "BLOCK",
+        "PAGES",
+        "PAGE_ROWS",
+    ],
+)
+def _dspark_workspace_kernel(
+    X,
+    NORM,
+    POS,
+    CS,
+    WINDOW,
+    PAGE,
+    ROW,
+    OUT,
+    X0,
+    POS0,
+    CS0,
+    W0,
+    W1,
+    P0,
+    P1,
+    R0,
+    R1,
+    O0,
+    HISTORY,
+    BLOCK,
+    PAGES,
+    PAGE_ROWS,
+    MAX_POS: tl.constexpr,
+    ROTARY: tl.constexpr,
+    EPS: tl.constexpr,
+    HAS_NORM: tl.constexpr,
+    HAS_ROPE: tl.constexpr,
+):
+    request = tl.program_id(0).to(tl.int64)
+    column = tl.program_id(1).to(tl.int64)
+    d = tl.arange(0, 512)
+    # One program writes a final workspace row. History is already decoded;
+    # only current rows pass through normalization, RoPE and the row codec.
+    if column < HISTORY:
+        # Preserve dummy-page contents; selection indices control visibility.
+        page = tl.load(PAGE + request * P0 + column * P1).to(tl.int64)
+        row = tl.load(ROW + request * R0 + column * R1).to(tl.int64)
+        valid = (page >= 0) & (page < PAGES) & (row >= 0) & (row < PAGE_ROWS)
+        tl.device_assert(valid, "DSpark workspace history address is outside its field")
+        value = tl.load(WINDOW + page * W0 + row * W1 + d, valid, 0)
+    else:
+        token = request * BLOCK + column - HISTORY
+        value = _dspark_row_value(
+            X,
+            NORM,
+            POS,
+            CS,
+            token,
+            X0,
+            POS0,
+            CS0,
+            MAX_POS,
+            ROTARY,
+            EPS,
+            HAS_NORM,
+            HAS_ROPE,
+        )
+    tl.store(OUT + request * O0 + column * 512 + d, value)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_dspark_workspace",
+    name="triton_dsv41_dspark_workspace",
+    solution="triton",
+    capability=_CAPABILITY,
+    signatures=frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))}),
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def triton_dsv41_dspark_workspace(
+    values,
+    norm_weight,
+    norm_eps,
+    positions,
+    cos_sin_cache,
+    window,
+    page,
+    row,
+    block_size,
+):
+    if values.ndim != 2 or values.shape[1] != 512 or values.stride(1) != 1:
+        raise ValueError(
+            "DSpark workspace values must be BF16 [tokens,512] with unit column stride"
+        )
+    if page.ndim != 2:
+        raise ValueError("DSpark workspace pages must be [batch,history_width]")
+    batch, history = page.shape
+    _integers(page, (batch, history), "page")
+    _integers(row, (batch, history), "row")
+    if block_size < 1 or values.shape[0] != batch * block_size:
+        raise ValueError("DSpark workspace values must cover batch * block_size rows")
+    if (
+        window.ndim != 3
+        or window.dtype != torch.bfloat16
+        or window.shape[2] != 512
+        or window.stride(2) != 1
+    ):
+        raise ValueError(
+            "DSpark workspace history must be BF16 [pages,page_rows,512] with unit column stride"
+        )
+    if norm_weight is not None:
+        if (
+            norm_weight.shape != (512,)
+            or norm_weight.dtype != torch.bfloat16
+            or norm_weight.stride(0) != 1
+        ):
+            raise ValueError(
+                "DSpark workspace norm weight must be contiguous BF16 [512]"
+            )
+        if norm_eps is None:
+            raise ValueError("DSpark workspace normalization requires epsilon")
+    elif norm_eps is not None:
+        raise ValueError("DSpark workspace epsilon requires a norm weight")
+    has_rope = cos_sin_cache is not None
+    if has_rope:
+        if positions is None:
+            raise ValueError("DSpark workspace RoPE needs positions")
+        _integers(positions, (values.shape[0],), "positions")
+        if (
+            cos_sin_cache.ndim != 2
+            or cos_sin_cache.dtype != torch.float32
+            or cos_sin_cache.shape[1] % 2
+            or not 2 <= cos_sin_cache.shape[1] <= 512
+            or cos_sin_cache.stride(1) != 1
+        ):
+            raise ValueError(
+                "DSpark workspace RoPE table must be FP32 [positions,even rotary_dim]"
+            )
+    elif positions is not None:
+        raise ValueError("DSpark workspace without a RoPE table takes no positions")
+    _same_device(values, (norm_weight, positions, cos_sin_cache, window, page, row))
+    out = torch.empty(
+        (batch, history + block_size, 512), dtype=torch.bfloat16, device=values.device
+    )
+    if batch:
+        _dspark_workspace_kernel[(batch, history + block_size)](
+            values,
+            norm_weight if norm_weight is not None else values,
+            positions if has_rope else values,
+            cos_sin_cache if has_rope else values,
+            window,
+            page,
+            row,
+            out,
+            values.stride(0),
+            positions.stride(0) if has_rope else 0,
+            cos_sin_cache.stride(0) if has_rope else 0,
+            window.stride(0),
+            window.stride(1),
+            page.stride(0),
+            page.stride(1),
+            row.stride(0),
+            row.stride(1),
+            out.stride(0),
+            history,
+            block_size,
+            window.shape[0],
+            window.shape[1],
+            MAX_POS=cos_sin_cache.shape[0] if has_rope else 1,
+            ROTARY=cos_sin_cache.shape[1] if has_rope else 2,
+            EPS=norm_eps if norm_weight is not None else 0.0,
+            HAS_NORM=norm_weight is not None,
+            HAS_ROPE=has_rope,
+            num_warps=4,
+            enable_fp_fusion=False,
+            debug=True,
+        )
+    return out
 
 
 @triton.jit(do_not_specialize=["EXTENDS", "PREFILL_OUTPUTS"])
