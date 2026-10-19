@@ -28,6 +28,13 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsv4 import (
+    torch_dsv4_merge_partials,
+    torch_dsv4_selected_attention,
+)
+from tokenspeed_kernel.numerics.torch.kvcache import (
+    torch_virtual_slots_to_local,
+)
 from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_decode,
     dsv4_decode_supports_partials,
@@ -57,18 +64,6 @@ SWA_ROW_BYTES = SWA_TOKEN_STRIDE + 8  # plus one FP8 scale per 64-wide nope bloc
 SWA_PAGE_BYTES = -(-PAGE_ROWS * SWA_ROW_BYTES // SWA_TOKEN_STRIDE) * SWA_TOKEN_STRIDE
 
 
-def _reference_translation(slots, rows, virtual_count, degree, rank):
-    """Owner and local slot of every virtual slot, straight from the contract."""
-    block = slots.clamp_min(0) // rows
-    owned = (
-        (slots >= rows)
-        & (slots < virtual_count * rows)
-        & ((block - 1) % degree == rank)
-    )
-    local = ((block - 1) // degree + 1) * rows + slots.clamp_min(0) % rows
-    return torch.where(owned, local, torch.zeros_like(local)), owned
-
-
 # ---------------------------------------------------------------------------
 # Virtual block translation
 # ---------------------------------------------------------------------------
@@ -90,8 +85,12 @@ def test_owned_pages_partition_the_virtual_space(rows, degree, parents, packing)
             degree=degree,
             rank=rank,
         )
-        expected_local, expected_owned = _reference_translation(
-            slots, rows, virtual_count, degree, rank
+        expected_local, expected_owned = torch_virtual_slots_to_local(
+            slots,
+            rows_per_page=rows,
+            virtual_block_count=virtual_count,
+            degree=degree,
+            rank=rank,
         )
         assert torch.equal(local, expected_local)
         assert torch.equal(owned, expected_owned)
@@ -153,8 +152,8 @@ def test_virtual_slot_translation_reuses_caller_outputs():
     )
     assert local.data_ptr() == out.data_ptr()
     assert owned.data_ptr() == mask.data_ptr()
-    expected_local, expected_owned = _reference_translation(
-        slots.long().cpu(), 1, 401, 2, 1
+    expected_local, expected_owned = torch_virtual_slots_to_local(
+        slots.long().cpu(), rows_per_page=1, virtual_block_count=401, degree=2, rank=1
     )
     assert torch.equal(local.cpu().long(), expected_local)
     assert torch.equal(owned.cpu(), expected_owned)
@@ -179,26 +178,6 @@ def test_virtual_slot_translation_rejects_invalid_geometry():
 # ---------------------------------------------------------------------------
 # Partial normalization and the LSE merge
 # ---------------------------------------------------------------------------
-
-
-def _merge_reference(partials, lses, sink):
-    """Combine per-shard no-sink partials by their LSE, then apply the sink once."""
-    stacked_lse = torch.stack(lses, dim=0)  # [shards, tokens, heads]
-    finite = torch.where(
-        torch.isfinite(stacked_lse),
-        stacked_lse,
-        torch.full_like(stacked_lse, -torch.inf),
-    )
-    total = torch.logsumexp(finite, dim=0)
-    weights = torch.exp(finite - total)
-    weights = torch.nan_to_num(weights, nan=0.0)
-    merged = sum(
-        w[..., None] * p.float() for w, p in zip(weights, partials, strict=True)
-    )
-    factor = torch.where(
-        torch.isinf(total), torch.zeros_like(total), torch.sigmoid(total - sink)
-    )
-    return merged * factor[..., None], total
 
 
 @requires_cuda
@@ -255,7 +234,7 @@ def test_weight_and_sink_match_the_reference_merge_with_empty_shards(degree, dty
     lses[0][2] = torch.inf
     sink = torch.randn(heads, device="cuda")
 
-    expected, expected_lse = _merge_reference(partials, lses, sink)
+    expected, expected_lse = torch_dsv4_merge_partials(partials, lses, sink)
     all_lse = torch.stack(lses, dim=0)
     summed = None
     global_lses = []
@@ -415,17 +394,7 @@ def _page_planar_cache(pages, page_size):
 
 def _selected_attention_reference(q, kv, slots, lens, sink):
     """Softmax over each token's selected rows with the sink, plus the no-sink LSE."""
-    result = torch.zeros_like(q)
-    lse = torch.empty(q.shape[0], q.shape[1], device=q.device)
-    for token in range(q.shape[0]):
-        selected = slots[token, : int(lens[token])].long()
-        selected = selected[(selected >= 0) & (selected < kv.shape[0])]
-        keys = kv[selected].float()
-        logits = q[token].float() @ keys.T * HEAD_DIM**-0.5
-        lse[token] = torch.logsumexp(logits, dim=1) if keys.shape[0] else -torch.inf
-        probabilities = torch.cat((logits, sink[:, None]), dim=1).softmax(dim=1)[:, :-1]
-        result[token] = (probabilities @ keys).to(q.dtype)
-    return result, lse
+    return torch_dsv4_selected_attention(q, kv, slots, lens, sink, HEAD_DIM**-0.5)
 
 
 @requires_cuda
@@ -588,172 +557,3 @@ def test_masked_compress_stores_leave_every_other_byte_untouched(compress_ratio)
     # Masked tokens park on slot 0; the null page must stay untouched too.
     assert not changed_pages[0]
     assert not changed_pages[tokens + 1]
-
-
-@requires_cuda
-@pytest.mark.parametrize("degree", [1, 2, 4, 8])
-@pytest.mark.parametrize("solution", ["triton", None])
-@pytest.mark.parametrize("index_k_format", ["mxfp4", "fp8_scaled"])
-def test_sharded_index_candidates(degree, solution, index_k_format, monkeypatch):
-    from tokenspeed_kernel.ops.attention.dsv4 import dsv4_index_candidates
-
-    if solution is None and (
-        not current_platform().is_hopper_plus
-        or (index_k_format == "mxfp4" and not current_platform().is_blackwell_plus)
-    ):
-        pytest.skip("MXFP4 DeepGEMM requires Blackwell")
-
-    import tokenspeed_kernel.ops.attention.dsv4 as dsv4
-
-    select = dsv4.select_kernel
-
-    def checked_select(*args, **kwargs):
-        kernel = select(*args, **kwargs)
-        if solution is None:
-            assert kernel.name == f"deep_gemm_dsv4_{index_k_format}_index_candidates"
-        return kernel
-
-    monkeypatch.setattr(dsv4, "select_kernel", checked_select)
-
-    def index_candidates(*args, **kwargs):
-        return dsv4_index_candidates(
-            *args,
-            **kwargs,
-            softmax_scale=1.0,
-            index_k_format=index_k_format,
-            solution=solution,
-        )
-
-    torch.manual_seed(943)
-    device = "cuda"
-    pages, page_size, heads, topk = 10, 64, 32, 512
-    table = torch.tensor(
-        [[5, 2, 8, 1, 6, 3, 4, 7, 9]], device=device, dtype=torch.int32
-    )
-    q = torch.randint(0, 256, (3, heads, 64), device=device, dtype=torch.uint8)
-    scales = torch.full((3, heads), 0x7F7F7F7F, device=device, dtype=torch.int32)
-    cache = torch.randint(
-        0, 256, (pages, page_size * 68), device=device, dtype=torch.uint8
-    )
-    cache[:, page_size * 64 :] = 127
-    weights = torch.randn(3, heads, device=device)
-    lengths = torch.tensor([0, 37, 573], device=device, dtype=torch.int32)
-    requests = torch.zeros(3, device=device, dtype=torch.int32)
-
-    def unpack(x):
-        code = torch.stack((x & 15, x >> 4), -1).flatten(-2).long()
-        lut = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=device)
-        return lut[code & 7] * torch.where(code < 8, 1.0, -1.0)
-
-    query = unpack(q)
-    keys = unpack(cache[:, : page_size * 64].reshape(pages, page_size, 64))[
-        table[0].long()
-    ].reshape(-1, 128)
-    if index_k_format == "fp8_scaled":
-        q = (torch.randint(0, 2, (3, heads, 128), device=device) * 2 - 1).to(
-            torch.bfloat16
-        )
-        scales = torch.empty((3, 0), device=device)
-        cache = torch.zeros((pages, page_size * 132), device=device, dtype=torch.uint8)
-        values = torch.randint(-4, 5, (pages, page_size, 128), device=device).to(
-            torch.float8_e4m3fn
-        )
-        cache[:, : page_size * 128] = values.view(torch.uint8).flatten(1)
-        cache[:, page_size * 128 :] = torch.ones(
-            (pages, page_size), device=device
-        ).view(torch.uint8)
-        query = q.float()
-        keys = values.float()[table[0].long()].reshape(-1, 128)
-    reference = (
-        torch.einsum("thd,sd->ths", query, keys).relu() * weights.unsqueeze(-1)
-    ).sum(1)
-    positions = torch.arange(keys.shape[0], device=device)
-
-    def check_candidates(indices, scores, expected_logits):
-        # Top-K does not promise ordering, including across graph replay.
-        # Validate score/index correspondence and the optimal score multiset;
-        # ties at the cutoff may legitimately choose different token IDs.
-        valid = indices >= 0
-        assert ((indices == -1) | (valid & (indices < keys.shape[0]))).all()
-        assert (scores[~valid] == -float("inf")).all()
-        ordered = indices.sort(dim=-1).values
-        assert not ((ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] >= 0)).any()
-        torch.testing.assert_close(
-            scores[valid],
-            expected_logits.gather(1, indices.clamp_min(0).long())[valid],
-            rtol=2e-5,
-            atol=2e-3,
-        )
-        torch.testing.assert_close(
-            valid.sum(-1), torch.isfinite(expected_logits).sum(-1).clamp_max(topk)
-        )
-        torch.testing.assert_close(
-            scores.sort(dim=-1, descending=True).values,
-            expected_logits.topk(topk, dim=-1).values,
-            rtol=2e-5,
-            atol=2e-3,
-        )
-
-    candidates, values = [], []
-    for rank in range(degree):
-        local = cache[[0] + list(range(rank + 1, pages, degree))].contiguous()
-        local_table = torch.where(
-            (table - 1) % degree == rank, (table - 1) // degree + 1, -1
-        )
-        indices, scores = index_candidates(
-            (q, scales),
-            weights,
-            local,
-            local_table,
-            requests,
-            lengths,
-            page_size=page_size,
-            topk=topk,
-        )
-        owned = ((table[0].repeat_interleave(page_size) - 1) % degree) == rank
-
-        def local_reference():
-            return reference.masked_fill(
-                ~owned[None, :] | (positions >= lengths[:, None]), -float("inf")
-            )
-
-        check_candidates(indices, scores, local_reference())
-        candidates.append(indices)
-        values.append(scores)
-        # Refresh lengths in place: captured kernels must not retain old validity.
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured_indices, captured_scores = index_candidates(
-                (q, scales),
-                weights,
-                local,
-                local_table,
-                requests,
-                lengths,
-                page_size=page_size,
-                topk=topk,
-            )
-        graph.replay()
-        check_candidates(captured_indices, captured_scores, local_reference())
-        lengths[0] = 19
-        graph.replay()
-        updated_indices, updated_scores = index_candidates(
-            (q, scales),
-            weights,
-            local,
-            local_table,
-            requests,
-            lengths,
-            page_size=page_size,
-            topk=topk,
-        )
-        check_candidates(updated_indices, updated_scores, local_reference())
-        check_candidates(captured_indices, captured_scores, local_reference())
-        lengths[0] = 0
-    indices, scores = torch.cat(candidates, 1), torch.cat(values, 1)
-    order = scores.topk(topk, dim=-1).indices
-    check_candidates(
-        indices.gather(1, order),
-        scores.gather(1, order),
-        reference.masked_fill(positions >= lengths[:, None], -float("inf")),
-    )

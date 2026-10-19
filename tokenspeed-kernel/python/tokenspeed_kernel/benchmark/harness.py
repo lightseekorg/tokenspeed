@@ -193,11 +193,11 @@ def _load_builtin_generators() -> None:
         prepare_gdn_decode_step,
     )
     from tokenspeed_kernel.benchmark.generators.gemm import (
-        prepare_decode_gemv,
         prepare_dense_bmm,
         prepare_grouped_bf16_projection,
         prepare_linear_attnres_partials,
         prepare_mm,
+        prepare_mv,
     )
     from tokenspeed_kernel.benchmark.generators.kda import (
         prepare_kda_fused_paged_decode,
@@ -311,7 +311,7 @@ def _load_builtin_generators() -> None:
     )
     _BENCHMARK_GENERATORS.setdefault(("gemm", "bmm"), prepare_dense_bmm)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "mm"), prepare_mm)
-    _BENCHMARK_GENERATORS.setdefault(("gemm", "decode_gemv"), prepare_decode_gemv)
+    _BENCHMARK_GENERATORS.setdefault(("gemm", "mv"), prepare_mv)
     _BENCHMARK_GENERATORS.setdefault(
         ("gemm", "grouped_bf16_projection"), prepare_grouped_bf16_projection
     )

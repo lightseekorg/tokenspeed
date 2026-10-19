@@ -17,6 +17,7 @@ from .primitives import (
     NEG_ZERO_F32_BITS,
     VEC_BF16,
     bf16x8_to_packed_u32x4,
+    fragment_halves_dirty,
     fragment_is_dirty,
     load_global_u32x4,
     packed_u32x4_to_bf16x8,
@@ -44,6 +45,7 @@ class LamportCopy:
         has_residual: bool = False,
         *,
         sentinel: int,
+        poll_halves: bool,
     ):
         # Bind in host Python; the JIT resolves names from self, not module globals.
         self.use_pdl = pdl_enabled()
@@ -52,6 +54,7 @@ class LamportCopy:
         self.threads = threads
         self.has_residual = has_residual
         self.sentinel = sentinel
+        self.poll_halves = poll_halves
 
     @cute.jit
     def __call__(
@@ -79,6 +82,8 @@ class LamportCopy:
     ):
         # Mailbox inspection must not pass the producer GEMM's programmatic completion point.
         cute.arch.griddepcontrol_wait()
+        # Dependents may launch now; their own wait still covers this grid's completion.
+        cute.arch.griddepcontrol_launch_dependents()
 
         tidx, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
@@ -96,8 +101,12 @@ class LamportCopy:
                 assumed_align=16,
             )
             packed = load_global_u32x4(source, volatile=True)
-            while fragment_is_dirty(packed, self.sentinel):
-                packed = load_global_u32x4(source, volatile=True)
+            if cutlass.const_expr(self.poll_halves):
+                while fragment_halves_dirty(packed, self.sentinel):
+                    packed = load_global_u32x4(source, volatile=True)
+            else:
+                while fragment_is_dirty(packed, self.sentinel):
+                    packed = load_global_u32x4(source, volatile=True)
 
             if cutlass.const_expr(self.has_residual):
                 res_ptr = cute.make_ptr(
@@ -121,9 +130,6 @@ class LamportCopy:
             destination = cutlass.Int64((local_output.iterator + element).toint())
             store_global_u32x4(destination, packed, volatile=False)
             fragment = fragment + stride
-
-        # The returned tensor is complete; a same-stream successor may overlap the mailbox cleanup below.
-        cute.arch.griddepcontrol_launch_dependents()
 
         fragment = thread
         while fragment < fragments:
@@ -149,9 +155,12 @@ def compile_kernel(
     has_residual: bool = False,
     *,
     sentinel: int,
+    poll_halves: bool,
 ):
     if hidden_dim <= 0 or hidden_dim % VEC_BF16:
         raise ValueError("hidden_dim must be a positive multiple of 8")
+    if poll_halves and (sentinel & 0xFFFF) != (sentinel >> 16):
+        raise ValueError("poll_halves needs a sentinel whose 16-bit halves match")
     if max_m <= 0:
         raise ValueError("max_m must be positive")
     if ctas <= 0:
@@ -173,7 +182,14 @@ def compile_kernel(
             assumed_align=16,
         )
         return cute.compile(
-            LamportCopy(hidden_dim, ctas, threads, has_residual, sentinel=sentinel),
+            LamportCopy(
+                hidden_dim,
+                ctas,
+                threads,
+                has_residual,
+                sentinel=sentinel,
+                poll_halves=poll_halves,
+            ),
             mailbox,
             output,
             residual,
@@ -193,6 +209,7 @@ def launch(
     threads: int,
     residual: torch.Tensor | None = None,
     sentinel: int,
+    poll_halves: bool,
 ) -> None:
     if not 1 <= m <= max_m:
         raise ValueError(f"runtime M={m} must be in [1, {max_m}]")
@@ -238,6 +255,7 @@ def launch(
         device_index,
         has_residual=residual is not None,
         sentinel=sentinel,
+        poll_halves=poll_halves,
     )(
         to_cute(symmetric_mailbox.flatten(), 16),
         to_cute_dynamic_m(
@@ -266,6 +284,7 @@ class LamportCopyKernel:
         ctas: int,
         threads: int,
         sentinel: int,
+        poll_halves: bool,
     ) -> None:
         """Bind a gather to one mailbox.
 
@@ -277,12 +296,15 @@ class LamportCopyKernel:
             sentinel: The empty word this mailbox is armed with. The arming
                 host code and this kernel must name the same one; the caller
                 that owns the mailbox owns the value.
+            poll_halves: Poll 16-bit halves too, for producers that store
+                single BF16 elements; see ``fragment_halves_dirty``.
         """
         self.hidden_dim = hidden_dim
         self.max_m = max_m
         self.ctas = ctas
         self.threads = threads
         self.sentinel = sentinel
+        self.poll_halves = poll_halves
         device_index = torch.accelerator.current_device_index()
         compile_kernel(
             hidden_dim,
@@ -292,6 +314,7 @@ class LamportCopyKernel:
             device_index,
             has_residual=False,
             sentinel=sentinel,
+            poll_halves=poll_halves,
         )
         compile_kernel(
             hidden_dim,
@@ -301,6 +324,7 @@ class LamportCopyKernel:
             device_index,
             has_residual=True,
             sentinel=sentinel,
+            poll_halves=poll_halves,
         )
 
     def __call__(
@@ -330,5 +354,6 @@ class LamportCopyKernel:
                 threads=self.threads,
                 residual=residual,
                 sentinel=self.sentinel,
+                poll_halves=self.poll_halves,
             )
         return output

@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from tokenspeed.runtime.metrics.collector import KVTransferMetrics
+from tokenspeed.runtime.metrics.service import metrics_service
 from tokenspeed.runtime.pd.base.bootstrap import DisaggBootstrapServerBase
 from tokenspeed.runtime.pd.base.manager import DisaggManagerBase
 from tokenspeed.runtime.pd.base.mooncake_engine import (
@@ -53,14 +54,15 @@ class MooncakeKVManagerBase(DisaggManagerBase):
                 "If dp_attention is not enabled, dp size must be 1 in disaggregation mode."
             )
 
-        if args.enable_metrics:
-            labels = {
+        self.kv_transfer_metrics = KVTransferMetrics(
+            labels={
                 "model_name": args.served_model_name,
-                "app_key": args.app_key,
-            }
-            self.kv_transfer_metrics = KVTransferMetrics(labels, args.metrics_reporters)
-        else:
-            self.kv_transfer_metrics = None
+                "app_key": args.app_key or "",
+            },
+            enabled=args.enable_metrics,
+            reporters=args.metrics_reporters,
+            event_sink=metrics_service.get_event_sink(),
+        )
 
         # Build the Mooncake data-plane engine here and inject it into the
         # transfer manager. self.kv_args is set above so register_buffer_to_engine
@@ -74,10 +76,11 @@ class MooncakeKVManagerBase(DisaggManagerBase):
 
     def register_buffer_to_engine(self):
         layout = self.kv_args.cache_layout
-        self.engine.register(
-            self.kv_args.kv_data_ptr,
-            layout.plan.arena_bytes,
+        regions = self.kv_args.registration_regions or (
+            (self.kv_args.kv_data_ptr, layout.plan.arena_bytes),
         )
+        for pointer, size in regions:
+            self.engine.register(pointer, size)
 
 
 class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):

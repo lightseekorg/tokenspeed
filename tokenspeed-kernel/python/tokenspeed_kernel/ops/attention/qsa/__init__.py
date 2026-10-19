@@ -200,8 +200,9 @@ def qsa_sparse_attention(
     The SM100/SM103 CuTe DSL implementation is preferred when its specialization
     matches a uniform decode. On Blackwell, BF16 prefill with logical metadata
     prefers FlashInfer PrimTS QSA. Other supported NVIDIA inputs retain FA2.
-    AMD GPUs use the portable Triton kernel. Selection preserves prefill versus
-    decode before adapting ragged inputs to independent one-token query rows.
+    GFX950 uses the Gluon kernel and other AMD GPUs the portable Triton kernel.
+    Selection preserves prefill versus decode before adapting ragged inputs to
+    independent one-token query rows.
     """
 
     if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
@@ -252,17 +253,288 @@ def qsa_sparse_attention(
     )
 
 
+# ===-----------------------------------------------------------------------===#
+# QSA Indexer Block Selection
+# ===-----------------------------------------------------------------------===#
+
+
+def qsa_block_scores(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    request_indices: torch.Tensor,
+    complete_blocks: torch.Tensor,
+    *,
+    page_size: int,
+    queries_per_request: int | None,
+    enable_pdl: bool,
+    override: str | None,
+    solution: str | None,
+) -> torch.Tensor:
+    """Score each query row's complete compressed QSA blocks.
+
+    Args:
+        query: Index queries shaped ``[rows, heads, head_dim]`` with a
+            contiguous last dimension.
+        key_cache: Compressed keys shaped ``[slots, 1, head_dim]``.
+        page_table: Compressed-cache page ids shaped ``[requests, pages]``.
+        request_indices: Owning request per query row.
+        complete_blocks: Fully compressed block count per row.
+        page_size: Compressed rows per page.
+        queries_per_request: Uniform consecutive rows per request, or None
+            for ragged layouts; implementations may share key tiles within
+            these runs.
+        enable_pdl: Use programmatic dependent launch where supported.
+        override: Optional registered kernel name.
+        solution: Optional kernel solution.
+
+    Returns:
+        FP32 scores shaped ``[rows, pages * page_size]``: the summed ReLU of
+        the head dot products below each row's ``complete_blocks``. Later
+        columns are unspecified; selectors must receive ``complete_blocks``.
+    """
+
+    kernel = select_kernel(
+        "attention",
+        "qsa_block_scores",
+        format_signature(
+            query=dense_tensor_format(query.dtype),
+            key_cache=dense_tensor_format(key_cache.dtype),
+        ),
+        traits={"num_heads": query.shape[1], "head_dim": query.shape[2]},
+        solution=solution,
+        override=override,
+    )
+    return kernel(
+        query,
+        key_cache,
+        page_table,
+        request_indices,
+        complete_blocks,
+        page_size=page_size,
+        queries_per_request=queries_per_request,
+        enable_pdl=enable_pdl,
+    )
+
+
+def qsa_block_topk_select(
+    logits: torch.Tensor,
+    topk: int,
+    *,
+    lengths: torch.Tensor,
+    enable_pdl: bool,
+    override: str | None,
+    solution: str | None,
+) -> torch.Tensor:
+    """Select each row's ``topk`` highest QSA block scores.
+
+    Args:
+        logits: FP32 scores shaped ``[rows, cols]`` from ``qsa_block_scores``.
+            Scored prefixes must be finite; later columns are ignored.
+        topk: Blocks selected per row.
+        lengths: Per-row count of scored columns in ``[0, cols]``.
+            Later columns may be uninitialized.
+        enable_pdl: Use programmatic dependent launch where supported.
+        override: Optional registered kernel name.
+        solution: Optional kernel solution.
+
+    Returns:
+        Int32 column ids shaped ``[rows, topk]`` in no particular order,
+        padded with ``-1`` when a row has fewer scored columns. Equal scores
+        at the threshold may select different column ids across solutions.
+    """
+
+    kernel = select_kernel(
+        "attention",
+        "qsa_block_topk_select",
+        format_signature(logits=dense_tensor_format(logits.dtype)),
+        traits={"topk": topk},
+        solution=solution,
+        override=override,
+    )
+    return kernel(
+        logits,
+        topk,
+        lengths=lengths,
+        enable_pdl=enable_pdl,
+    )
+
+
+def qsa_block_topk_stream(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    request_indices: torch.Tensor,
+    complete_blocks: torch.Tensor,
+    *,
+    page_size: int,
+    block_topk: int,
+    max_partial_bytes: int,
+    enable_pdl: bool,
+    override: str | None,
+    solution: str | None,
+) -> torch.Tensor:
+    """Score and select each row's top-k QSA blocks without materializing scores.
+
+    Args:
+        query: Index queries shaped ``[rows, heads, head_dim]``.
+        key_cache: Compressed keys shaped ``[slots, 1, head_dim]``.
+        page_table: Compressed-cache page ids shaped ``[requests, pages]``.
+        request_indices: Owning request per query row.
+        complete_blocks: Fully compressed block count per row.
+        page_size: Compressed rows per page.
+        block_topk: Blocks selected per row.
+        max_partial_bytes: Memory budget for partial top-k buffers.
+        enable_pdl: Use programmatic dependent launch where supported.
+        override: Optional registered kernel name.
+        solution: Optional kernel solution.
+
+    Returns:
+        Int32 block ids shaped ``[rows, block_topk]`` in no particular order;
+        invalid entries are ``-1``.
+    """
+
+    kernel = select_kernel(
+        "attention",
+        "qsa_block_topk_stream",
+        format_signature(
+            query=dense_tensor_format(query.dtype),
+            key_cache=dense_tensor_format(key_cache.dtype),
+        ),
+        traits={"num_heads": query.shape[1], "head_dim": query.shape[2]},
+        solution=solution,
+        override=override,
+    )
+    return kernel(
+        query,
+        key_cache,
+        page_table,
+        request_indices,
+        complete_blocks,
+        page_size=page_size,
+        block_topk=block_topk,
+        max_partial_bytes=max_partial_bytes,
+        enable_pdl=enable_pdl,
+    )
+
+
+def qwen4_exp_qsa_block_topk(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    request_indices: torch.Tensor,
+    complete_blocks: torch.Tensor,
+    *,
+    page_size: int,
+    block_topk: int,
+    queries_per_request: int | None,
+    max_partial_bytes: int,
+    algorithm: str,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Select the highest-scoring compressed blocks for each query row.
+
+    Args:
+        query: Query tensor shaped ``[rows, heads, head_dim]``.
+        key_cache: Flattened compressed keys shaped ``[slots, 1, head_dim]``.
+        page_table: Raw compressed-cache block ids shaped ``[requests, max_pages]``,
+            with holes and padding normalized to zero; one entry per logical page.
+        request_indices: Owning request id per query row.
+        complete_blocks: Fully compressed block counts shaped ``[rows]``.
+        page_size: Compressed-cache rows covered by one logical page.
+        block_topk: Blocks selected per row; must be a power of two and at
+            least 64.
+        queries_per_request: Uniform number of consecutive query rows per
+            request, or None for ragged/mixed layouts. A positive width must
+            divide ``rows``; the caller guarantees that each width-sized run
+            has one owning request. Logits scoring shares K tiles within these
+            runs while preserving each row's complete-block frontier.
+        max_partial_bytes: Memory budget for the partial top-k buffers
+            (``stream`` algorithm only).
+        algorithm: ``"stream"`` fuses scoring and selection without
+            materializing scores; ``"logits"`` materializes the
+            ``[rows, num_blocks]`` FP32 scores with ``qsa_block_scores`` and
+            selects them with ``qsa_block_topk_select``.
+        enable_pdl: Wait for query/cache/metadata producers and release
+            successor setup early between scoring and selection on NVIDIA GPUs.
+
+    Returns:
+        Int32 block ids shaped ``[rows, block_topk]``, in no particular order;
+        invalid entries are ``-1``.
+    """
+
+    if query.ndim != 3 or key_cache.ndim != 3:
+        raise ValueError("Qwen4-Exp QSA block top-k expects rank-three tensors")
+    if block_topk < 64 or (block_topk & (block_topk - 1)):
+        raise ValueError("Qwen4-Exp QSA block top-k needs a power-of-two topk >= 64")
+    if algorithm not in ("stream", "logits"):
+        raise ValueError(
+            "Qwen4-Exp QSA block top-k algorithm must be 'stream' or 'logits', "
+            f"got {algorithm!r}"
+        )
+    rows = query.shape[0]
+    if queries_per_request is not None and (
+        queries_per_request < 1 or rows % queries_per_request
+    ):
+        raise ValueError("QSA queries_per_request must be positive and divide rows")
+    num_blocks = page_table.shape[1] * page_size
+    if rows == 0 or num_blocks == 0:
+        return torch.full(
+            (rows, block_topk), -1, dtype=torch.int32, device=query.device
+        )
+    if algorithm == "logits":
+        scores = qsa_block_scores(
+            query,
+            key_cache,
+            page_table,
+            request_indices,
+            complete_blocks,
+            page_size=page_size,
+            queries_per_request=queries_per_request,
+            enable_pdl=enable_pdl,
+            override=None,
+            solution=None,
+        )
+        return qsa_block_topk_select(
+            scores,
+            block_topk,
+            lengths=complete_blocks,
+            enable_pdl=enable_pdl,
+            override=None,
+            solution=None,
+        )
+    return qsa_block_topk_stream(
+        query,
+        key_cache,
+        page_table,
+        request_indices,
+        complete_blocks,
+        page_size=page_size,
+        block_topk=block_topk,
+        max_partial_bytes=max_partial_bytes,
+        enable_pdl=enable_pdl,
+        override=None,
+        solution=None,
+    )
+
+
 # Backend registration (side-effect imports)
 # isort: off
+import tokenspeed_kernel.ops.attention.qsa.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.qsa.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.qsa.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.qsa.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.qsa.flashinfer_prims  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.qsa.gluon  # noqa: E402,F401
 
 # isort: on
 
 
 __all__ = [
+    "qsa_block_scores",
+    "qsa_block_topk_select",
+    "qsa_block_topk_stream",
     "qsa_sparse_attention",
     "QSAPrefillMetadata",
+    "qwen4_exp_qsa_block_topk",
 ]

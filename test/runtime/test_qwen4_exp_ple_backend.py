@@ -76,8 +76,7 @@ def _make_backend(width: int, is_draft: bool, device: str):
                     group_specs=(
                         SimpleNamespace(
                             group_id=QWEN4_EXP_PLE_CACHE_GROUP,
-                            family="state",
-                            checkpoint_granularity=4,
+                            attn_kind="state",
                         ),
                     )
                 ),
@@ -137,6 +136,8 @@ def test_ple_invalid_fields_do_not_publish_a_pool(backend):
 
 
 def _verify(backend):
+    # Both rows verify right after prompt end: the prompt-end checkpoint sits
+    # in slot 0 and the fresh live block in slot 1.
     backend.refresh_decode_metadata(
         4,
         2,
@@ -145,7 +146,7 @@ def _verify(backend):
         forward_mode=ForwardMode.DECODE,
         block_tables={
             QWEN4_EXP_PLE_CACHE_GROUP: torch.tensor(
-                [[1, 2, 3], [4, 5, 6]], dtype=torch.int32, device=backend.device
+                [[1, 2], [4, 5]], dtype=torch.int32, device=backend.device
             )
         },
     )
@@ -182,7 +183,7 @@ def test_ple_capture_and_verify_use_own_stable_metadata(backend, monkeypatch):
     assert len(rows_calls) == 1
     steps, pages, _, _ = rows_calls[0][0]
     assert steps.tolist() == [1, 3]
-    assert pages.tolist() == [1, 5]
+    assert pages.tolist() == [2, 5]
     assert rows_calls[0][1] == {
         "verify_width": 3,
         "num_layers": 2,
@@ -205,9 +206,7 @@ def test_ple_non_verify_metadata_disarms_previous_round(backend, mode, monkeypat
         torch.tensor([7, 9], dtype=torch.int32),
         mode,
         block_tables={
-            QWEN4_EXP_PLE_CACHE_GROUP: torch.tensor(
-                [[1, 2, 3], [4, 5, 6]], dtype=torch.int32
-            )
+            QWEN4_EXP_PLE_CACHE_GROUP: torch.tensor([[1, 2], [5, 6]], dtype=torch.int32)
         },
         extend_seq_lens=lengths,
         extend_seq_lens_cpu=lengths,
@@ -288,19 +287,14 @@ def test_mamba_only_claims_its_recurrent_groups():
                 runtime_contract=SimpleNamespace(
                     prefix_granularity=16,
                     group_specs=(
-                        SimpleNamespace(
-                            group_id="ple", family="state", checkpoint_granularity=4
-                        ),
-                        SimpleNamespace(
-                            group_id="gdn", family="state", checkpoint_granularity=8
-                        ),
+                        SimpleNamespace(group_id="ple", attn_kind="state"),
+                        SimpleNamespace(group_id="gdn", attn_kind="state"),
                     ),
                 )
             ),
         )
     )
     assert backend._state_group_ids == ("gdn",)
-    assert backend._checkpoint_granularity == 8
 
 
 def test_ple_non_spec_decode_uses_checkpoint_blocks_without_workspace():
@@ -313,7 +307,7 @@ def test_ple_non_spec_decode_uses_checkpoint_blocks_without_workspace():
         torch.tensor([5, 6, 1, 1], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
         block_tables={
-            QWEN4_EXP_PLE_CACHE_GROUP: torch.tensor([[1, 2], [4, 5]], dtype=torch.int32)
+            QWEN4_EXP_PLE_CACHE_GROUP: torch.tensor([[1, 2], [0, 5]], dtype=torch.int32)
         },
     )
     metadata = backend.forward_metadata
@@ -338,12 +332,12 @@ def test_draft_view_cannot_claim_target_ple_fields():
 @pytest.mark.parametrize(
     "seq_lens, accepted_lengths, block_rows, copies",
     [
-        ([6, 7], [2, 3], [[1, 2, 3], [4, 5, 6]], [(2, 2), (5, 7)]),
-        ([6, 7], [0, 9], [[1, 2, 3], [4, 5, 6]], [(1, 1), (5, 7)]),
-        ([3, 30], [-3, 9], [[1, 2, 3], [4, 5, 6]], [(1, 1), (6, 7)]),
-        ([6, 7], [0, 9], [[-1, 2, 3], [4, 0, 6]], []),
+        ([6, 7], [2, 3], [[1, 2], [4, 5]], [(2, 2), (5, 7)]),
+        ([6, 7], [0, 9], [[1, 2], [4, 5]], [(2, 1), (5, 7)]),
+        ([6, 7], [0, 9], [[1, 2], [0, 5]], [(2, 1), (5, 7)]),
+        ([6, 7], [0, 9], [[0, -1], [4, 0]], []),
     ],
-    ids=["checkpoint-crossing", "acceptance-clamp", "slot-clamp", "invalid-pages"],
+    ids=["first-verify", "acceptance-clamp", "in-place", "invalid-pages"],
 )
 def test_ple_commit_copies_only_accepted_checkpoints(
     accepted_dtype, seq_lens, accepted_lengths, block_rows, copies

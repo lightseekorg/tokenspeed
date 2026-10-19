@@ -41,7 +41,6 @@ def main() -> None:
         process_group_manager,
     )
     from tokenspeed.runtime.layers.attention.dcp.indexer import (
-        merge_index_candidates,
         select_dsa_topk,
     )
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement

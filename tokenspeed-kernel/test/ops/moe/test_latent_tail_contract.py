@@ -20,7 +20,6 @@
 
 import ast
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -45,7 +44,7 @@ def test_lamport_copy_releases_successors_before_rearming() -> None:
 def test_shared_rs_does_not_run_routed_collective():
     from unittest.mock import Mock
 
-    from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
+    from tokenspeed_kernel.ops.moe._cute_dsl.latent_tail import KimiK3LatentTailOp
 
     shared = torch.ones(2, 4)
     shard = torch.ones(64, 2)
@@ -90,8 +89,19 @@ def test_only_the_down_projection_moved_off_the_upstream_sentinel() -> None:
         for arg, default in _parameters_with_defaults(node.args)
         if arg.arg == "sentinel"
     }
-    assert set(sentinels) == {"store_lamport_sentinel_128", "fragment_is_dirty"}
+    assert set(sentinels) == {
+        "store_lamport_sentinel_128",
+        "fragment_is_dirty",
+        "fragment_halves_dirty",
+    }
     assert all(default is None for default in sentinels.values())
+    # The early exit calls it with the sentinel alone, so no parameter may join it.
+    dirty_check = next(
+        node
+        for node in ast.walk(ast.parse(primitives))
+        if isinstance(node, ast.FunctionDef) and node.name == "fragment_is_dirty"
+    )
+    assert [arg.arg for arg in dirty_check.args.args] == ["packed", "sentinel"]
 
     early_exit = (
         package
@@ -112,7 +122,7 @@ def test_only_the_down_projection_moved_off_the_upstream_sentinel() -> None:
 
     # Each mailbox names its own: the down projection's producers cannot all
     # sanitize -0, so it needs the pattern that takes two coincidences to spell.
-    tail = (package / "ops/moe/latent_tail.py").read_text()
+    tail = (package / "ops/moe/_cute_dsl/latent_tail.py").read_text()
     assert "sentinel=NEG_ZERO_F32_BITS" in tail
     tail_imports = {
         alias.asname or alias.name
@@ -121,9 +131,12 @@ def test_only_the_down_projection_moved_off_the_upstream_sentinel() -> None:
         for alias in node.names
     }
     assert "NEG_ZERO_F32_BITS" in tail_imports
-    down = (package / "ops/moe/latent_down.py").read_text()
-    assert "sentinel=_DOWN_SENTINEL" in down
+    down = (package / "ops/moe/_cute_dsl/latent_down.py").read_text()
+    assert "sentinel: int = _DOWN_SENTINEL" in down
     assert "_DOWN_SENTINEL = 0x80008000" in down
+    # Only the NaN-payload sentinel may poll halves; -0 arming keeps word compares.
+    assert "HALF_POLLED_SENTINEL = 0xFFFFFFFF" in down
+    assert "poll_halves=sentinel == HALF_POLLED_SENTINEL" in down
 
 
 @pytest.mark.parametrize(
@@ -164,7 +177,7 @@ def test_the_probe_is_skipped_only_within_one_host_window(
     from unittest import mock
 
     import tokenspeed_kernel.ops.communication.fabric as fabric
-    import tokenspeed_kernel.ops.moe.latent_tail as tail
+    import tokenspeed_kernel.ops.moe._cute_dsl.latent_tail as tail
 
     seen: list[list[int]] = []
     asked = mock.Mock()
@@ -211,7 +224,7 @@ def test_the_world_group_is_tested_like_any_other(per_host, probed) -> None:
     from unittest import mock
 
     import tokenspeed_kernel.ops.communication.fabric as fabric
-    import tokenspeed_kernel.ops.moe.latent_tail as tail
+    import tokenspeed_kernel.ops.moe._cute_dsl.latent_tail as tail
 
     seen: list[list[int]] = []
     saved = fabric._host_map
@@ -253,7 +266,7 @@ def test_an_ungathered_map_declines_rather_than_guessing_placement() -> None:
     from unittest import mock
 
     import tokenspeed_kernel.ops.communication.fabric as fabric
-    import tokenspeed_kernel.ops.moe.latent_tail as tail
+    import tokenspeed_kernel.ops.moe._cute_dsl.latent_tail as tail
 
     saved = fabric._host_map
     fabric._host_map = None

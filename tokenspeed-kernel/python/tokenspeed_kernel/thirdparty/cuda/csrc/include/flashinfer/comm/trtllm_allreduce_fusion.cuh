@@ -727,6 +727,11 @@ enum class AllReduceFusionPattern : int {
   // Lane AR for the latent MoE: all-reduce [routed latent | shared hidden]
   // and RMS-normalize the latent slice in the epilogue (Kimi-K3).
   kAllReduceLatentNorm = 10,
+  // Pre/post ("sandwich") norm boundary, MNNVL kernels and BF16 only
+  // (trtllm_mnnvl_sandwich_norm.cuh): a = RMSNorm(AR(in); post_norm_gamma),
+  // residual_out = RN(RN(x_scale * a) + RN(residual_scale * residual_in)),
+  // norm_out = RMSNorm(residual_out; rms_gamma); both norms use rms_eps.
+  kARSandwichResidualRMSNorm = 11,
 };
 
 enum class QuantType : int { kNone = 0, kFP8 = 1, kFP4 = 2, kFP8BlockWise = 3 };
@@ -826,6 +831,13 @@ struct AllReduceFusionParams {
   AllReduceFusionPattern pattern;
   bool trigger_completion_at_end = true;
   bool residual_reduce_scattered = false;
+  // kARSandwichResidualRMSNorm: the gamma of the norm the all-reduced sum
+  // goes through before the residual add, and the multipliers of the two
+  // addends. 16 bytes, so the kernel parameters after the struct keep their
+  // 16-byte alignment.
+  void* post_norm_gamma = nullptr;
+  float x_scale = 1.f;
+  float residual_scale = 1.f;
 };
 
 template <int NRanks>

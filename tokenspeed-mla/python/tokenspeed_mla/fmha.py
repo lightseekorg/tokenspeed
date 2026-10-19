@@ -35,7 +35,6 @@ import cutlass.memory
 import cutlass.pipeline as pipeline
 import cutlass.tensor_utils
 import cutlass.torch as cutlass_torch
-import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass.base_dsl.enums import Arch

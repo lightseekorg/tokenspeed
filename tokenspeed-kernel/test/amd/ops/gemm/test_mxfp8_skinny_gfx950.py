@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.gemm import torch_mm_fp8_blockscale
 from utils import (
     assert_no_triton_compile,
     int_specialization_class,
@@ -53,19 +54,16 @@ def _inputs(m: int, n: int, k: int, seed: int = 0):
 
 
 def _reference(a, b, a_scales, b_scales) -> torch.Tensor:
-    def dequantize(values, scales):
-        return values.double() * torch.exp2(scales.double() - 127).repeat_interleave(
-            32, dim=1
-        )
-
-    return dequantize(a, a_scales) @ dequantize(b, b_scales).T
+    return torch_mm_fp8_blockscale(
+        a, b, a_scales, b_scales, torch.float32, block_size=[1, 32]
+    )
 
 
 def _check(actual: torch.Tensor, expected: torch.Tensor) -> None:
     # One output rounding plus fp32 accumulation. FP8 MFMAs miss this: they sum
     # products at reduced precision, off by ~0.05 on these inputs.
     torch.testing.assert_close(
-        actual.double(), expected, rtol=2.0**-8, atol=5e-3, check_dtype=False
+        actual.float(), expected, rtol=2.0**-8, atol=5e-3, check_dtype=False
     )
 
 
@@ -77,7 +75,7 @@ def _launch(a, b, a_scales, b_scales, out_dtype=torch.bfloat16, out=None):
 
 @pytest.mark.parametrize("m", [1, 6, 16, 17, 32, 33, 64])
 @pytest.mark.parametrize("n,k", [(1792, 5120), (300, 1056)])
-def test_skinny_mxfp8_gemm_matches_fp64_reference(m: int, n: int, k: int) -> None:
+def test_skinny_mxfp8_gemm_matches_fp32_reference(m: int, n: int, k: int) -> None:
     a, b, a_scales, b_scales = _inputs(m, n, k)
     _check(_launch(a, b, a_scales, b_scales), _reference(a, b, a_scales, b_scales))
 

@@ -28,6 +28,7 @@ def create_cache_arena(
         cache_group_specs=spec.cache_group_specs,
         token_capacity=spec.token_capacity,
         enable_memory_saver=enable_memory_saver,
+        storage_plan=spec.storage_plan,
     )
 
 
@@ -134,35 +135,6 @@ def _deepseek_v41_pool(
     )
 
 
-def _deepseek_v4_pool(
-    spec: CachePoolSpec,
-    config: AttnConfig,
-    arena: CacheArena,
-    *,
-    num_layers: int,
-    rank: int,
-    field_layer_offset: int,
-) -> CachePool:
-    del config
-    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
-        HybridDeepseekV4TokenToKVPool,
-    )
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
-        DeepseekV4PoolOptions,
-    )
-
-    options = spec.pool_options
-    if not isinstance(options, DeepseekV4PoolOptions):
-        raise TypeError("DeepSeek V4 cache spec is missing pool options")
-    return HybridDeepseekV4TokenToKVPool(
-        arena,
-        layout=options.layout,
-        layer_num=num_layers,
-        rank=rank,
-        field_layer_offset=field_layer_offset,
-    )
-
-
 def _dsa_pool(
     spec: CachePoolSpec,
     config: AttnConfig,
@@ -185,6 +157,34 @@ def _dsa_pool(
         layer_num=num_layers,
         rank=rank,
         index_head_dim=softmax_attn.index_head_dim,
+        field_layer_offset=field_layer_offset,
+    )
+
+
+def _dots3_note_pool(
+    spec: CachePoolSpec,
+    config: AttnConfig,
+    arena: CacheArena,
+    *,
+    num_layers: int,
+    rank: int,
+    field_layer_offset: int,
+) -> CachePool:
+    from tokenspeed.runtime.layers.attention.kv_cache.dots3_note import (
+        Dots3NoteTokenToKVPool,
+    )
+
+    softmax_attn = _softmax_config(config, spec.family, MLAConfig)
+    return Dots3NoteTokenToKVPool(
+        arena,
+        dtype=config.kv_cache_dtype,
+        model_dtype=config.dtype,
+        quant_method=config.kv_cache_quant_method,
+        kv_lora_rank=softmax_attn.kv_lora_rank,
+        qk_rope_head_dim=softmax_attn.qk_rope_head_dim,
+        layer_num=num_layers,
+        rank=rank,
+        index_head_dim=128,
         field_layer_offset=field_layer_offset,
     )
 
@@ -313,9 +313,9 @@ _POOL_FACTORIES: dict[str, Callable[..., CachePool]] = {
     "mla": _mla_pool,
     "kimi_k3": _hybrid_kda_pool,
     "dsa": _dsa_pool,
+    "dots3_note": _dots3_note_pool,
     "msa": _msa_pool,
     "glm53_flash": _glm53_flash_pool,
-    "deepseek_v4": _deepseek_v4_pool,
     "deepseek_v41": _deepseek_v41_pool,
 }
 

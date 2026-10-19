@@ -38,7 +38,7 @@ pytestmark = pytest.mark.skipif(not is_amd(), reason="Iris requires AMD ROCm")
 
 @pytest.fixture(autouse=True)
 def _require_iris():
-    pytest.importorskip("tokenspeed_kernel.ops.communication.iris")
+    pytest.importorskip("tokenspeed_kernel.ops.communication._iris")
 
 
 @pytest.mark.parametrize("rank", (0, 7))
@@ -48,16 +48,12 @@ def _require_iris():
 def test_attention_row_vector_codegen(rank, operation, has_residual, tmp_path):
     """Runtime rows must preserve vector payload traffic, including tail tiles."""
     from tokenspeed_kernel._triton import gluon, triton
-    from tokenspeed_kernel.ops.communication.iris import (
-        iris_attention_push_gather_gluon_kernel,
-        iris_attention_reduce_scatter_gluon_kernel,
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
+        iris_k3attn_pull_scatter,
+        iris_k3attn_push_gather,
     )
 
-    fn = (
-        iris_attention_reduce_scatter_gluon_kernel
-        if operation == "reduce"
-        else iris_attention_push_gather_gluon_kernel
-    )
+    fn = iris_k3attn_pull_scatter if operation == "reduce" else iris_k3attn_push_gather
     constants = {
         "RANK": rank,
         "BLOCK_ELEMENTS": 2048,
@@ -142,38 +138,36 @@ def _attention_worker(rank: int, port: int) -> None:
         timeout=timedelta(seconds=180),
     )
     group = dist.new_group(backend="nccl", timeout=timedelta(seconds=180))
-    from tokenspeed_kernel.ops.communication import triton as comm
-    from tokenspeed_kernel.ops.communication.iris import (
-        iris_attention_mix,
-        iris_attention_mix_push_gluon_kernel,
-        iris_attention_push_gather_gluon_kernel,
-        iris_attention_reduce_scatter_gluon_kernel,
-        iris_kimi3_moe_tail,
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
+        prepare_k3_communication,
+    )
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
+        iris_k3attn_mix_push_gather,
+        iris_k3attn_pull_scatter,
+        iris_k3attn_push_gather,
     )
 
-    backing = comm.TritonCommState(
+    k3_state = prepare_k3_communication(
         group=group,
         rank_in_group=rank,
-        world_size=8,
-        device=device,
+        staged_max_numel=0,
+        producer_direct_max_numel=8192 * 10752,
         attnres_max_numel=0,
+        attnres_max_rows=0,
         enable_lamport=True,
-        moe_tail_max_rows=8192,
-        max_numel=0,
-        max_bytes=8192 * 10752 * 2,
-        max_token_num=0,
-        hidden_dim=0,
-        comm_buff=None,
-        symm_mem_hdl=None,
+        sharded_max_rows=8192,
+        dtype=torch.bfloat16,
+        device=device,
+        all_reduce=None,
     )
-    comm.initialize_all_reduce_state(backing, torch.bfloat16)
-    state = comm._get_or_create_iris_state(backing, torch.bfloat16)
+    state = k3_state.all_reduce
+    sharded = k3_state.sharded
     buffers = (
-        state._input_buf,
-        state._producer_direct_scratch_buf,
-        state._producer_direct_ready_flags,
-        state._moe_tail_output_buf,
-        state._moe_tail_ready_flags,
+        state.producer.data,
+        state.producer_pull.scratch,
+        state.producer_pull.ready_flags,
+        sharded.output,
+        sharded.gather_flags,
     )
     pointers = tuple(t.data_ptr() for t in buffers)
     gen = torch.Generator(device=device)
@@ -195,7 +189,7 @@ def _attention_worker(rank: int, port: int) -> None:
         8144,
         8192,
     ):
-        partial = comm.acquire_symm_outputs(backing, ((m, 7168),), torch.bfloat16)[0]
+        partial = state.acquire_outputs(((m, 7168),))[0]
         gen.manual_seed(31729 + rank)
         source = (
             torch.randn((m, 7168), device=device, dtype=torch.bfloat16, generator=gen)
@@ -224,7 +218,7 @@ def _attention_worker(rank: int, port: int) -> None:
         dist.all_reduce(reduced, group=group)
         reduced = reduced.to(torch.bfloat16)
         partial.copy_(source)
-        ordinary = comm.all_reduce_symmetric(backing, (partial,))[0].clone()
+        ordinary = state.all_reduce_symmetric((partial,))[0].clone()
         # FP32 RCCL may add in another order at BF16 rounding ties. Require
         # agreement with that oracle within a BF16 ulp, and exact preservation
         # of the existing Iris tree below.
@@ -252,12 +246,12 @@ def _attention_worker(rank: int, port: int) -> None:
                 with ExitStack() as stack:
                     if variant in warmed_variants:
                         for kernel in (
-                            iris_attention_reduce_scatter_gluon_kernel,
-                            iris_attention_push_gather_gluon_kernel,
-                            iris_attention_mix_push_gluon_kernel,
+                            iris_k3attn_pull_scatter,
+                            iris_k3attn_push_gather,
+                            iris_k3attn_mix_push_gather,
                         ):
                             stack.enter_context(assert_no_triton_compile(kernel))
-                    mixed = iris_attention_mix(
+                    mixed = k3_state.attention_mix(
                         partial,
                         prefix,
                         history,
@@ -267,14 +261,13 @@ def _attention_worker(rank: int, port: int) -> None:
                         out_norm_weight=norm,
                         out_norm_eps=1e-6,
                         num_valid_blocks=valid_blocks,
-                        group=group,
                     )
                 warmed_variants.add(variant)
                 assert mixed is not None
                 shard, activation = mixed
                 assert shard.shape == (m // 8, 7168)
-                assert activation.data_ptr() == state._moe_tail_output_buf.data_ptr()
-                assert shard.data_ptr() != state._producer_direct_scratch_buf.data_ptr()
+                assert activation.data_ptr() == sharded.output.data_ptr()
+                assert shard.data_ptr() != state.producer_pull.scratch.data_ptr()
                 torch.testing.assert_close(
                     shard, expected[rank * m // 8 : (rank + 1) * m // 8], atol=0, rtol=0
                 )
@@ -296,7 +289,7 @@ def _attention_worker(rank: int, port: int) -> None:
                     small_graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(small_graph):
                         partial.copy_(source)
-                        captured = iris_attention_mix(
+                        captured = k3_state.attention_mix(
                             partial,
                             prefix,
                             history,
@@ -306,7 +299,6 @@ def _attention_worker(rank: int, port: int) -> None:
                             out_norm_weight=norm,
                             out_norm_eps=1e-6,
                             num_valid_blocks=valid_blocks,
-                            group=group,
                         )
                     assert captured is not None
                     for sign in (-1, 1):
@@ -335,9 +327,9 @@ def _attention_worker(rank: int, port: int) -> None:
                 # slower rank is asserting that rejection left flags intact.
                 torch.cuda.synchronize()
                 dist.barrier()
-                flags_before = state._producer_direct_ready_flags.clone()
+                flags_before = state.producer_pull.ready_flags.clone()
                 assert (
-                    iris_attention_mix(
+                    k3_state.attention_mix(
                         partial,
                         prefix,
                         history,
@@ -347,41 +339,39 @@ def _attention_worker(rank: int, port: int) -> None:
                         out_norm_weight=norm,
                         out_norm_eps=1e-6,
                         num_valid_blocks=valid_blocks,
-                        group=group,
                     )
                     is None
                 )
                 torch.testing.assert_close(
-                    flags_before, state._producer_direct_ready_flags
+                    flags_before, state.producer_pull.ready_flags
                 )
                 dist.barrier()
         # The ordinary reduction overwrites both scratch and its result buffer.
         partial.copy_(source)
-        comm.all_reduce_symmetric(backing, (partial,))
+        state.all_reduce_symmetric((partial,))
         if held_mix is not None:
             for tensor, reference in held_mix:
                 torch.testing.assert_close(tensor, reference, atol=0, rtol=0)
 
     m = 512
-    partial = comm.acquire_symm_outputs(backing, ((m, 7168),), torch.bfloat16)[0]
+    partial = state.acquire_outputs(((m, 7168),))[0]
     source = source[:m].contiguous()
     residual = residual[:m].contiguous()
     reduced = reduced[:m].contiguous()
     history = history[:, :m]
     partial.copy_(source)
-    flags_before = state._producer_direct_ready_flags.clone()
-    for operand, prefix, owner in (
-        (partial[:0], None, group),
-        (partial.clone(), residual, group),
-        (partial, residual, dist.group.WORLD),
-        (partial, residual.float(), group),
-        (partial, partial, group),
-        (partial, state._moe_tail_output_buf[1 : m + 1], group),
-        (partial, residual.as_strided(residual.shape, (1, m)), group),
-        (partial.as_strided(partial.shape, (1, m)), None, group),
+    flags_before = state.producer_pull.ready_flags.clone()
+    for operand, prefix in (
+        (partial[:0], None),
+        (partial.clone(), residual),
+        (partial, residual.float()),
+        (partial, partial),
+        (partial, sharded.output[1 : m + 1]),
+        (partial, residual.as_strided(residual.shape, (1, m))),
+        (partial.as_strided(partial.shape, (1, m)), None),
     ):
         assert (
-            iris_attention_mix(
+            k3_state.attention_mix(
                 operand,
                 prefix,
                 history,
@@ -391,18 +381,17 @@ def _attention_worker(rank: int, port: int) -> None:
                 out_norm_weight=norm,
                 out_norm_eps=1e-6,
                 num_valid_blocks=8,
-                group=owner,
             )
             is None
         )
-    torch.testing.assert_close(flags_before, state._producer_direct_ready_flags)
+    torch.testing.assert_close(flags_before, state.producer_pull.ready_flags)
     torch.testing.assert_close(partial, source)
 
     # The projection capacity is wider than the result capacity. Check both
     # before publishing an entry flag, even when there is no history to read.
-    oversized = comm.acquire_symm_outputs(backing, ((8200, 7168),), torch.bfloat16)[0]
+    oversized = state.acquire_outputs(((8200, 7168),))[0]
     assert (
-        iris_attention_mix(
+        k3_state.attention_mix(
             oversized,
             None,
             oversized.new_empty((0, 8200, 7168)),
@@ -412,23 +401,22 @@ def _attention_worker(rank: int, port: int) -> None:
             out_norm_weight=norm,
             out_norm_eps=1e-6,
             num_valid_blocks=0,
-            group=group,
         )
         is None
     )
-    torch.testing.assert_close(flags_before, state._producer_direct_ready_flags)
+    torch.testing.assert_close(flags_before, state.producer_pull.ready_flags)
     torch.testing.assert_close(partial, source)
-    for blocks, scorer, epsilon, owner in (
-        (history.float(), score, 1e-6, group),
-        (history, score[:-1], 1e-6, group),
-        (history, score.float(), 1e-6, group),
-        (history, partial.view(-1)[:7168], 1e-6, group),
-        (partial[None].expand(8, -1, -1), score, 1e-6, group),
-        (history, score, 0.0, group),
-        (history, score, float("nan"), group),
+    for blocks, scorer, epsilon in (
+        (history.float(), score, 1e-6),
+        (history, score[:-1], 1e-6),
+        (history, score.float(), 1e-6),
+        (history, partial.view(-1)[:7168], 1e-6),
+        (partial[None].expand(8, -1, -1), score, 1e-6),
+        (history, score, 0.0),
+        (history, score, float("nan")),
     ):
         assert (
-            iris_attention_mix(
+            k3_state.attention_mix(
                 partial,
                 residual,
                 blocks,
@@ -438,11 +426,10 @@ def _attention_worker(rank: int, port: int) -> None:
                 out_norm_weight=norm,
                 out_norm_eps=1e-6,
                 num_valid_blocks=8,
-                group=owner,
             )
             is None
         )
-    torch.testing.assert_close(flags_before, state._producer_direct_ready_flags)
+    torch.testing.assert_close(flags_before, state.producer_pull.ready_flags)
     torch.testing.assert_close(partial, source)
     # Peers must not enter the MoE tail collective below while a slower rank
     # is still asserting that the rejections left its flags intact.
@@ -458,10 +445,10 @@ def _attention_worker(rank: int, port: int) -> None:
     expected_activation = _reference_mix(moe_prefix, history, score, norm, 8)
     # The previous MoE result is the production residual. Each owner must finish
     # reading its rows before the attention gather overwrites those same rows.
-    stored_residual = state._moe_tail_output_buf[:m]
+    stored_residual = sharded.output[:m]
     stored_residual.copy_(residual)
     partial.copy_(source)
-    alias_result = iris_attention_mix(
+    alias_result = k3_state.attention_mix(
         partial,
         stored_residual,
         history,
@@ -471,7 +458,6 @@ def _attention_worker(rank: int, port: int) -> None:
         out_norm_weight=norm,
         out_norm_eps=1e-6,
         num_valid_blocks=8,
-        group=group,
     )
     assert alias_result is not None
     torch.testing.assert_close(
@@ -484,17 +470,16 @@ def _attention_worker(rank: int, port: int) -> None:
         torch.full((m, width), (rank + 1) / 32, device=device, dtype=torch.bfloat16)
         for width in (3584, 7168)
     )
-    inputs = comm.acquire_symm_outputs(backing, ((m, 3584), (m, 7168)), torch.bfloat16)
+    inputs = state.acquire_outputs(((m, 3584), (m, 7168)))
     for out, value in zip(inputs, moe_sources, strict=True):
         out.copy_(value)
-    expected_moe = iris_kimi3_moe_tail(
+    expected_moe = k3_state.moe_tail(
         *inputs,
         moe_prefix,
         weight,
         prefix_is_sharded=False,
         norm_weight=None,
         eps=None,
-        group=group,
     )
     assert expected_moe is not None
     expected_moe = expected_moe.clone()
@@ -502,9 +487,9 @@ def _attention_worker(rank: int, port: int) -> None:
 
     def sequence():
         partial.copy_(source)
-        first = comm.all_reduce_symmetric(backing, (partial,))[0].clone() + residual
+        first = state.all_reduce_symmetric((partial,))[0].clone() + residual
         partial.copy_(source)
-        mixed = iris_attention_mix(
+        mixed = k3_state.attention_mix(
             partial,
             residual,
             history,
@@ -514,28 +499,24 @@ def _attention_worker(rank: int, port: int) -> None:
             out_norm_weight=norm,
             out_norm_eps=1e-6,
             num_valid_blocks=8,
-            group=group,
         )
         assert mixed is not None
         shard, activation = mixed
         activation = activation.clone()
-        inputs = comm.acquire_symm_outputs(
-            backing, ((m, 3584), (m, 7168)), torch.bfloat16
-        )
+        inputs = state.acquire_outputs(((m, 3584), (m, 7168)))
         for out, value in zip(inputs, moe_sources, strict=True):
             out.copy_(value)
-        moe = iris_kimi3_moe_tail(
+        moe = k3_state.moe_tail(
             *inputs,
             shard,
             weight,
             prefix_is_sharded=True,
             norm_weight=None,
             eps=None,
-            group=group,
         )
         assert moe is not None
         partial.copy_(source)
-        second = comm.all_reduce_symmetric(backing, (partial,))[0].clone()
+        second = state.all_reduce_symmetric((partial,))[0].clone()
         results[:] = [first, second, shard, activation, moe]
 
     sequence()
@@ -560,8 +541,8 @@ def _attention_worker(rank: int, port: int) -> None:
     for initial_epoch in (2**31 - 3, -3):
         torch.cuda.synchronize()
         dist.barrier()
-        state._producer_direct_ready_flags.fill_(initial_epoch)
-        state._moe_tail_ready_flags.fill_(initial_epoch)
+        state.producer_pull.ready_flags.fill_(initial_epoch)
+        sharded.gather_flags.fill_(initial_epoch)
         torch.cuda.synchronize()
         dist.barrier()
         for repeat in range(4):
@@ -573,14 +554,13 @@ def _attention_worker(rank: int, port: int) -> None:
             expected_activation = _reference_mix(moe_prefix, history, score, norm, 8)
             for out, value in zip(inputs, moe_sources, strict=True):
                 out.copy_(value)
-            reference_moe = iris_kimi3_moe_tail(
+            reference_moe = k3_state.moe_tail(
                 *inputs,
                 moe_prefix,
                 weight,
                 prefix_is_sharded=False,
                 norm_weight=None,
                 eps=None,
-                group=group,
             )
             assert reference_moe is not None
             expected_moe = reference_moe.clone()

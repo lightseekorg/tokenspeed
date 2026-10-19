@@ -623,7 +623,6 @@ def _sm107_fp8_out_decode(
     cp_rank: int,
     local_visible_lens: Optional[torch.Tensor],
     min_split_kv: int,
-    enable_packed_q: bool,
     compute_capability: tuple[int, int],
 ):
     """Launch SM107 FP8-input decode with FP8 or BF16 output.
@@ -656,15 +655,13 @@ def _sm107_fp8_out_decode(
         page_size,
         is_var_seq,
         False,
-        enable_packed_q,
+        pack_q=True,
     ):
         raise ValueError(
             f"SM107 M256 decode: unsupported configuration (q_len={q_len}, num_heads={H}, "
             f"kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim}, "
-            f"page_size={page_size}, out_dtype={out.dtype}, enable_packed_q={enable_packed_q}); needs "
-            f"at most 4 {SM107_MLA_M_TILE}-row tiles of num_heads * q_len rows, "
-            f"and without enable_packed_q num_heads * F == {SM107_MLA_M_TILE} "
-            "with q_len a multiple of F"
+            f"page_size={page_size}, out_dtype={out.dtype}); needs "
+            f"at most 4 {SM107_MLA_M_TILE}-row tiles of num_heads * q_len rows"
         )
     # The kernel packs rows q_tok * H + head of adjacent tokens into M tiles.
     if q_latent.stride(1) != H * q_latent.stride(2) or out.stride(1) != H * out.stride(
@@ -758,12 +755,15 @@ def tokenspeed_mla_decode(
     cp_world: int = 1,  # decode-context-parallel world size (1 = no DCP)
     cp_rank: int = 0,  # this rank's index in [0, cp_world)
     cp_interleave_size: int = 1,
-    enable_packed_q: bool = False,
     *,
     min_split_kv: int = 1,
     local_visible_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for SM100, SM103 and SM107.
+
+    M128 kernels pack adjacent query/head rows when this uses fewer tiles than
+    query folding. Equal tile counts, M64 kernels and token-gapped views keep
+    folding. The SM107 FP8-output kernel always uses packed 256-row tiles.
 
     Parameters
     ----------
@@ -779,6 +779,8 @@ def tokenspeed_mla_decode(
           (0 when split_kv == 1, which happens when B >= num_SMs / 2)
         - The TokenSpeed runtime backend grows this buffer from the actual
           q_len before each decode launch.
+        - Packed M128 queries use ``B * 128 * ceil(H*q_len/128) * split_kv *
+          (kv_lora_rank + 1) * 4`` bytes (zero for split_kv=1).
     kv_lora_rank : int
         Latent dimension (e.g. 512).
     qk_rope_head_dim : int
@@ -798,8 +800,7 @@ def tokenspeed_mla_decode(
         write BF16 unless ``out`` is ``torch.float8_e4m3fn``: FP8 output runs
         the SM107 kernel in ``mla_decode_fp8_sm107.py``, which requires SM107,
         ``ceil(H * q_len / 256) <= 4`` and no sliding window, DCP or
-        ``local_visible_lens``. Without ``enable_packed_q`` it also requires
-        ``H * F == 256`` with ``q_len % F == 0``.
+        ``local_visible_lens``.
     is_var_seq : bool
         Whether the sequence length is variable.
         If True, the sequence length is variable.
@@ -848,15 +849,6 @@ def tokenspeed_mla_decode(
         Number of consecutive global KV positions assigned to each DCP rank
         before ownership advances to the next rank. ``1`` is token-striped DCP;
         values greater than one are block-interleaved DCP.
-    enable_packed_q : bool
-        Opt into continuous query/head packing on FP8 and FP16/BF16 M128
-        kernels. Default False preserves the existing folded-query path.
-        The SM107 FP8-output kernel always packs rows into 256-row tiles,
-        which equals folding when ``H`` divides 256 and ``q_len`` fills
-        whole tiles; True also admits other ``H`` and ``q_len``.
-        M64 and token-gapped Q/output views retain that path even when True.
-        Packed split-KV workspace uses ``B * 128 * ceil(H*q_len/128) *
-        split_kv * (kv_lora_rank + 1) * 4`` bytes (zero for split_kv=1).
     min_split_kv : int
         Minimum number of KV splits used by the decode kernel, in [1, 256].
         The effective value is capped to avoid creating empty partitions.
@@ -983,7 +975,6 @@ def tokenspeed_mla_decode(
             cp_rank=cp_rank,
             local_visible_lens=local_visible_lens,
             min_split_kv=min_split_kv,
-            enable_packed_q=enable_packed_q,
             compute_capability=compute_capability,
         )
     mma_qk_tiler_mn, _ = select_mla_decode_tilers(
@@ -993,11 +984,14 @@ def tokenspeed_mla_decode(
         compute_capability=compute_capability,
     )
     mma_m_tile = mma_qk_tiler_mn[0]
+    fold_sq_factor = get_mla_decode_fold_sq_factor(H, q_len, mma_m_tile)
+    H_eff = H * fold_sq_factor
+    q_len_eff = q_len // fold_sq_factor
     # A flat view requires adjacent query tokens to continue the head rows.
-    # Keep the existing path for token-gapped views and M64 kernels.
+    # Keep folding when packing saves no tiles, for gapped views and for M64.
     pack_q = (
-        enable_packed_q
-        and mma_m_tile == 128
+        mma_m_tile == 128
+        and ceil_div(H * q_len, mma_m_tile) < q_len_eff
         and query.stride(1) == H * query.stride(2)
         and (out is None or out.stride(1) == H * out.stride(2))
     )
@@ -1005,10 +999,6 @@ def tokenspeed_mla_decode(
         _, q_len_eff, _ = compute_q_tile_layout(H, q_len, mma_m_tile)
         H_eff = mma_m_tile
         fold_sq_factor = 1
-    else:
-        fold_sq_factor = get_mla_decode_fold_sq_factor(H, q_len, mma_m_tile)
-        H_eff = H * fold_sq_factor
-        q_len_eff = q_len // fold_sq_factor
 
     # Cached split_kv and workspace_size computation
     max_active_blocks = get_num_sm(query.device)

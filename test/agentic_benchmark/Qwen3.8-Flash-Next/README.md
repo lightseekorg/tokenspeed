@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next NVFP4 agentic benchmark
 
 Run [NVIDIA's NVFP4 checkpoint](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
-with attention TP4, MoE EP4, three-step MTP and BF16 KV cache on four Blackwell
+with attention TP4, MoE EP4, three-step MTP, and BF16 KV cache on four Blackwell
 GPUs. TokenSpeed must already be installed in the active environment or the
 repository's `.venv` / `venv`. Port 8000 must be free.
 The launcher requires `ts`, `curl`, and `setsid` in `PATH` and reports missing
@@ -27,13 +27,13 @@ as the Kimi-K3 benchmark (`acd09b44384d53174768bb1063f675420f76fae9`), downloads
 the existing CI SWE-Smith dataset at revision
 `2779acd48a05c211f2f82eee71bdbdf688d984ca`, rebuilds its input budgets with
 the tested Qwen checkpoint's tokenizer, starts the server, waits for
-`/readiness`, warms up, benchmarks and writes `summary.csv`. It stops the server
-and its workers on success, error or interruption. Dataset downloads are cached.
+`/readiness`, warms up, benchmarks, and writes `summary.csv`. It stops the server
+and its workers on success, error, or interruption. Dataset downloads are cached.
 
 `tokenspeed/model_config.sh` pins the checkpoint and tokenizer to the same
 revision. Preparation downloads tokenizer assets into
 `tokenspeed/data/tokenizer/<revision>/`. The engine (`--tokenizer`), gateway
-(`--tokenizer-path`) and both EvalScope phases (`--tokenizer-path`) use that
+(`--tokenizer-path`), and both EvalScope phases (`--tokenizer-path`) use that
 local directory. The model's `--revision` is pinned too.
 
 Conversation order and turn counts match the shared CI dataset. Each source
@@ -47,7 +47,7 @@ local Qwen tokenizer for input/output counting. The original data stays in
 `data/source/`.
 Cached data is rebuilt when the source, tokenizer, or token budgets change.
 
-The workload and metric definitions follow the Kimi-K3 agentic flow:
+The workload follows the Kimi-K3 agentic flow:
 
 | Phase | Concurrency | Conversations | Dataset offset |
 | --- | --- | --- | --- |
@@ -97,19 +97,23 @@ budgets before sending requests. The replay script leaves the service running.
 
 Results persist under `tokenspeed/outputs/<UTC timestamp>_<suffix>/`, including
 `server.log`, `warmup.log`, `benchmark.log`, the hidden `.warmup/` directory,
-per-concurrency EvalScope JSON/SQLite artifacts and `summary.csv`.
+per-concurrency EvalScope JSON/SQLite artifacts, and `summary.csv`.
 
 | CSV column | Definition |
 | --- | --- |
 | `config` | `attn_tp4_moe_ep4` |
 | `Conc.` | Request concurrency |
 | `Latency (tps/user)` | `1000 / TPOT (ms)`; accepts `Avg TPOT (ms)` too |
-| `Throughput (tps/gpu)` | EvalScope **Total Throughput (tok/s)** divided by **4**, including input and output tokens |
+| `Output Throughput (tok/min/gpu)` | EvalScope **Output Throughput (tok/s)** multiplied by **60** and divided by **4**; output tokens only |
 | `Approx Cache Hit` | EvalScope `KV Cache Hit Rate (%)` |
 | `Decoded Tok/Iter` | `sum(completion_tokens - 1) / sum(streaming gaps)` over successful requests; `-1` if unavailable |
 
+Output throughput is `sum(completion_tokens) / test_wall_time_seconds * 60 / 4`.
+The wall time covers the first request's start through the last completion at
+each concurrency level. Input tokens, including cached history, are excluded.
+
 Missing required metrics (including `Failed Requests`), failed requests,
-invalid TPOT or missing concurrency results fail the run.
+invalid TPOT, or missing concurrency results fail the run.
 To collect an existing sweep again:
 
 ```bash
@@ -121,6 +125,11 @@ python3 test/agentic_benchmark/Qwen3.8-Flash-Next/tokenspeed/collect_outputs.py 
 The manual CI task is
 `test/ci/perf/qwen3.8-flash-next-nvfp4-tp4ep4-evalscope-agentic.yaml`.
 It uses the same server config, setup and benchmark scripts, and emits the CSV
-recognized by the CI GitHub step summary. Select it in K8s Dispatch with the
-`gb200` runner pool or in Slurm Dispatch. Performance references can be added
-after measuring a baseline on the selected runner.
+recognized by the CI GitHub step summary. Select this YAML in Slurm Dispatch
+with cluster `gb300`. It uses one node with four GPUs (`slurm-gb300-4gpu`).
+At each of the six concurrency levels,
+both `Latency (tps/user)` and `Output Throughput (tok/min/gpu)` must reach
+90% of their `perf_reference` values (`perf_threshold: 0.9`).
+The initial references use the four-GPU SM103 measurements in
+[#2216](https://github.com/lightseekorg/tokenspeed/pull/2216), converting output
+throughput to tokens per minute per GPU.

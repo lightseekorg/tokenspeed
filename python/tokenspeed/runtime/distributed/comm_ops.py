@@ -146,6 +146,42 @@ def prepare_projection_collectives(
     return backend.prepare_projection(spec, scratch_pool)
 
 
+def try_fused_dp_column_linear(
+    tensor: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor | None,
+    owner_rows: tuple[int, ...],
+    out: torch.Tensor,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
+) -> bool:
+    """Attempt a fused DP column-parallel linear operation on locally owned rows.
+
+    Fuses input all-gather, quantization, GEMM, and inverse all-to-all so each
+    owner receives all output channels for its own input rows.
+
+    Args:
+        tensor: Full input channels for this owner's physical token rows.
+        weight: Local output-channel shard of the linear weight.
+        weight_scales: Block-FP8 weight scales, or None for unsupported formats.
+        owner_rows: Physical counts in subgroup order, including graph padding.
+        out: Caller-owned destination for this owner's complete output channels.
+        workspace: Collectively prepared scratch for this linear operation.
+        backend: Backend used to prepare the workspace; None selects the global
+            backend.
+
+    Returns:
+        True when the fused operation wrote out. False leaves out untouched so
+        the caller can run the ordinary all-gather, GEMM, and all-to-all path.
+        Invalid inputs and execution failures remain visible.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.try_fused_dp_column_linear(
+        tensor, weight, weight_scales, owner_rows, out, workspace
+    )
+
+
 def projection_all_gather(
     tensor: torch.Tensor,
     rows: int,
@@ -221,6 +257,24 @@ def all_reduce(
     return backend.all_reduce(tensor, group, op=op)
 
 
+def all_reduce_mhc_post(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> torch.Tensor | None:
+    """Fused all-reduce + hc=4 mHC post, or None if the backend has none.
+
+    See ``CommBackend.all_reduce_mhc_post``. On None nothing has run, and the
+    caller reduces ``tensor`` and applies the post itself.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.all_reduce_mhc_post(tensor, residual, post, comb, group)
+
+
 def prepare_all_reduce_lane(
     group: Group,
     hidden_dim: int,
@@ -242,10 +296,6 @@ def prepare_all_reduce_buffers(
     *,
     staged_max_numel: int,
     producer_direct_max_numel: int,
-    attnres_max_numel: int,
-    attnres_max_rows: int,
-    enable_lamport: bool,
-    moe_tail_max_rows: int,
     dtype: torch.dtype,
     backend: CommBackend | None,
 ) -> bool:
@@ -255,11 +305,6 @@ def prepare_all_reduce_buffers(
         group: Global ranks participating in the reductions.
         staged_max_numel: Maximum ordinary all-reduce payload in elements.
         producer_direct_max_numel: Maximum producer-direct payload in elements.
-        attnres_max_numel: Maximum fused AttnRes payload in elements.
-        attnres_max_rows: Maximum fused AttnRes payload in rows.
-        enable_lamport: Allow Lamport for eligible producer-direct payloads.
-        moe_tail_max_rows: Maximum rows in the reusable symmetric result buffer;
-            zero skips its allocation.
         dtype: Element type shared by the prepared paths.
         backend: Backend to prepare, or ``None`` to use the global backend.
 
@@ -273,10 +318,6 @@ def prepare_all_reduce_buffers(
         group,
         staged_max_numel=staged_max_numel,
         producer_direct_max_numel=producer_direct_max_numel,
-        attnres_max_numel=attnres_max_numel,
-        attnres_max_rows=attnres_max_rows,
-        enable_lamport=enable_lamport,
-        moe_tail_max_rows=moe_tail_max_rows,
         dtype=dtype,
     )
 

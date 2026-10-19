@@ -23,7 +23,7 @@
 from tokenspeed_kernel.ops.sampling.triton.draft_tree import (
     draft_tree_expand,
     draft_tree_finalize,
-    tree_ancestry,
+    load_tree_ancestry,
 )
 from tokenspeed_kernel.ops.sampling.triton.dspark_block import (
     dspark_block_candidate_tiles,
@@ -80,6 +80,6 @@ __all__ = [
     "draft_tree_expand",
     "draft_tree_finalize",
     "logprob_topk",
-    "tree_ancestry",
+    "load_tree_ancestry",
     "verify_tree",
 ]

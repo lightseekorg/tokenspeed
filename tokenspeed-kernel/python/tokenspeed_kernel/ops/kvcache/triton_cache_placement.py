@@ -115,7 +115,7 @@ def virtual_slots_to_local(
             raise ValueError("virtual slot outputs must match shape, device and dtype")
     if slots.numel() == 0:
         return out, owner_mask
-    if slots.is_cuda:
+    if slots.is_cuda or slots.device.type == "npu":
         source = slots.contiguous()
         _translate_virtual_slots[(triton.cdiv(slots.numel(), 256),)](
             source,
@@ -295,6 +295,40 @@ def _compact_owned_pages(
     tl.store(LocalLens + row, count)
 
 
+def _compact_dcp_pages_ascend(
+    table,
+    lengths,
+    *,
+    page_size,
+    subpages,
+    virtual_block_count,
+    degree,
+    rank,
+    out,
+    local_lengths,
+    page_prefix,
+):
+    # The Ascend Triton launcher for this kernel initializes a lock with
+    # synchronous rtMemcpy. That launcher cannot execute during graph capture.
+    # Sort valid source columns, then gather into contiguous output positions;
+    # native device operations keep this path capture-safe and preserve order.
+    cols = torch.arange(table.shape[1], device=table.device, dtype=torch.int64)
+    blocks = table // subpages
+    valid = (blocks > 0) & (blocks < virtual_block_count)
+    valid &= (blocks - 1) % degree == rank
+    if page_prefix is None:
+        valid &= cols[None, :] * page_size < lengths[:, None]
+    else:
+        page_prefix[:, 0].zero_()
+        page_prefix[:, 1:].copy_(valid.cumsum(1, dtype=torch.int32))
+    order = torch.where(valid, cols[None, :], table.shape[1]).sort(1).values
+    local_pages = ((blocks - 1) // degree + 1) * subpages + table % subpages
+    packed = local_pages.gather(1, order.clamp_max(table.shape[1] - 1))
+    out.copy_(torch.where(order < table.shape[1], packed, 0))
+    visible = (lengths[:, None] - cols[None, :] * page_size).clamp(0, page_size)
+    local_lengths.copy_(torch.where(valid, visible, 0).sum(1))
+
+
 def compact_kvp_pages(
     table: torch.Tensor,
     lengths: torch.Tensor,
@@ -348,6 +382,20 @@ def compact_kvp_pages(
         or local_lengths.shape != lengths.shape
     ):
         raise ValueError("KVP page buffers disagree")
+    if table.device.type == "npu":
+        _compact_dcp_pages_ascend(
+            table,
+            lengths,
+            page_size=page_size,
+            subpages=block_granularity // page_size,
+            virtual_block_count=virtual_block_count,
+            degree=degree,
+            rank=rank,
+            out=out,
+            local_lengths=local_lengths,
+            page_prefix=page_prefix,
+        )
+        return
     out.zero_()
     if table.is_cuda:
         _compact_owned_pages[(table.shape[0],)](

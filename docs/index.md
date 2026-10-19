@@ -7,23 +7,23 @@ hero:
   tagline: Production-oriented docs for launching, tuning, and operating low-latency OpenAI-compatible serving.
   actions:
     - theme: brand
-      text: Get Started
+      text: Get started
       link: /guides/getting-started
     - theme: alt
-      text: Launch Recipes
+      text: Launch recipes
       link: /recipes/models
     - theme: alt
-      text: Server Parameters
+      text: Server parameters
       link: /configuration/server
 
 features:
-  - title: Launch First
+  - title: Launch first
     details: Start with concrete commands, then tune the exact knobs that affect memory, scheduling, parallelism, and kernels.
-  - title: Familiar Parameters
+  - title: Familiar parameters
     details: TokenSpeed keeps familiar parameter names where the runtime semantics match, with TokenSpeed-specific knobs documented separately.
-  - title: Model Recipes
+  - title: Model recipes
     details: Recipes collect the launch patterns used for Kimi and GPT-OSS deployments.
-  - title: Operational Surface
+  - title: Operational surface
     details: Parallelism and configuration guidance stay close to the serving paths operators actually use.
 ---
 
@@ -31,9 +31,9 @@ features:
 
 - [Getting started](./guides/getting-started.md)
 - [Launching a server](./guides/launching.md)
-- [Model Recipes](./recipes/models.md)
-- [Server Parameters](./configuration/server.md)
-- [Compatible Parameters](./configuration/compatible-parameters.md)
+- [Model recipes](./recipes/models.md)
+- [Server parameters](./configuration/server.md)
+- [Compatible parameters](./configuration/compatible-parameters.md)
 - [Parallelism](./serving/parallelism.md)
 
 ## Common workflow
@@ -65,7 +65,7 @@ Large MoE deployments usually make the same decisions:
 - tensor, data, and expert parallelism
 - reasoning, tool-call, and speculative decoding parsers
 
-See [Model Recipes](./recipes/models.md) for concrete examples and
-[Server Parameters](./configuration/server.md) for the parameter reference.
+See [Model recipes](./recipes/models.md) for concrete examples and
+[Server parameters](./configuration/server.md) for the parameter reference.
 
 See [Biweekly releases](./guides/weekly-release.md) for the release sequence and recovery.

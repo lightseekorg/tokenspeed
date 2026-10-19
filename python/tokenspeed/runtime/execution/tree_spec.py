@@ -34,7 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel.ops.sampling.triton import tree_ancestry
+from tokenspeed_kernel.ops.sampling.triton import load_tree_ancestry
 
 from tokenspeed.runtime.utils.triton import tl, triton
 
@@ -109,29 +109,29 @@ class TreeSpec:
         self.mask_buf = torch.tensor(
             chain_mask, dtype=torch.int64, device=device
         ).repeat(max_bs)
-        self._node_offsets = torch.arange(n, dtype=torch.int64, device=device)
 
     @property
     def num_nodes(self) -> int:
         return self.config.num_nodes
 
     def load_step(
-        self, bs: int, req_pool_indices: torch.Tensor, parent_map: torch.Tensor
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        parent_map: torch.Tensor,
+        positions: torch.Tensor,
     ) -> None:
         """Read this step's trees from ``parent_map`` (``[pool, N]``, by pool
-        slot) and derive depth and ancestor masks."""
-        parent = self.parent_buf[:bs]
-        torch.index_select(parent_map, 0, req_pool_indices, out=parent)
-        tree_ancestry(
-            parent,
+        slot), derive depth and ancestor masks, and turn the verify window's
+        ``vc + i`` positions (``[bs * N]``) into ``vc + depth``."""
+        load_tree_ancestry(
+            parent_map,
+            req_pool_indices,
+            self.parent_buf[:bs],
             self.depth_buf[:bs],
             self.mask_buf[: bs * self.num_nodes].view(bs, self.num_nodes),
+            positions,
         )
-
-    def depth_positions(self, bs: int, positions: torch.Tensor) -> None:
-        """Turn the verify window's ``vc + i`` positions into ``vc + depth``."""
-        view = positions.view(bs, self.num_nodes)
-        view.add_(self.depth_buf[:bs] - self._node_offsets.to(view.dtype))
 
     def compact_rows(
         self,

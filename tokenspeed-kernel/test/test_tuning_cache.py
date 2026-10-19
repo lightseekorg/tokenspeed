@@ -494,8 +494,14 @@ def test_partial_rank_cache_hit_profiles_on_every_rank(monkeypatch):
     search.return_value = (True, 0, 7, None)
     with tuning._reuse_autotune_cache():
         assert tuning._autotuner.AutoTuner.search_cache(
-            tuner, "probe", [object()], ((1, 128),), object()
+            tuner,
+            "probe",
+            [object()],
+            ((1, 128),),
+            object(),
+            require_profiling_policy=True,
         ) == (False, 0, -1, None)
+    assert search.call_args.kwargs["require_profiling_policy"] is True
     assert tuner.is_tuning_mode
 
 

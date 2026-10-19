@@ -41,10 +41,10 @@ The NVIDIA B200 Tests and AMD Tests workflows run unit tests before model
 tests. AMD kernel benchmarks run in the separate AMD Kernel Benchmark workflow,
 concurrently with unit tests. Matrix entries within
 each stage run in parallel. The workflow treats a stage with no matching tasks
-as successfully satisfied.
+as satisfied.
 
 On NVIDIA runners, `ut-tokenspeed-kernel-part-i` runs tests outside
-`tokenspeed-kernel/test/ops/`, keeping the numerics, TRT-LLM communication and
+`tokenspeed-kernel/test/ops/`, keeping the numerics, TRT-LLM communication, and
 CUDA suites in separate processes. `ut-tokenspeed-kernel-part-ii` runs
 `tokenspeed-kernel/test/ops/`. Together the two tasks cover the kernel suite
 once. AMD runners run the same commands in the single `ut-tokenspeed-kernel`
@@ -84,6 +84,10 @@ The long-context performance report accepts both current EvalScope metrics
 invalid TPOT fails collection instead of producing a zero-throughput report.
 Unavailable acceptance metrics appear as `N/A` (empty CSV cells). An aggregate
 is unavailable if any run for that prompt length lacks the metric.
+
+Model performance CSVs support `Throughput (tps/gpu)` and
+`Output Throughput (tok/min/gpu)`. The second value in each `perf_reference`
+pair uses the throughput column's units and token-counting definition.
 
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
@@ -150,10 +154,10 @@ workflows map that to GitHub Actions `continue-on-error`.
 # whole task can fail without blocking the workflow
 optional: true
 
-# only the MI35x 1-GPU entry is non-blocking; other entries of the same
+# only the MI355 1-GPU entry is non-blocking; other entries of the same
 # task still block on failure
 optional:
-  amd-mi35x-1gpu-test: true
+  amd-mi355-1gpu: true
 ```
 
 The NVIDIA PR workflow routes `b200-<Ngpu>` task labels to
@@ -276,19 +280,19 @@ files with `test/ci_system/ci_path_filter.py --runner-group <group>` and skips
 its GPU matrix jobs when nothing requires that runner group. The first
 matching rule decides (`ci_path_filter.py` holds the full lists):
 
-* Markdown files require no runner group.
-* Vendor-owned paths (`tokenspeed-kernel-amd/`, `tokenspeed-mla/`, the
+- Markdown files require no runner group.
+- Vendor-owned paths (`tokenspeed-kernel-amd/`, `tokenspeed-mla/`, the
   `tokenspeed-kernel/test/<vendor>/` subtrees, and vendor-specific requirements
   and CI scripts) require only that vendor's runner groups.
-* The scan job classifies kernel sources by solution name: names such as
+- The scan job classifies kernel sources by solution name: names such as
   `cuda`, `cute_dsl`, `flashinfer`, `deep_gemm`, and `trtllm` are NVIDIA;
   `gluon` is AMD. A vendor-named file whose content mentions another vendor
   stays shared.
-* `test/ci` task YAMLs require only the runner groups matching their
+- `test/ci` task YAMLs require only the runner groups matching their
   `runner.labels`.
-* Other paths under `python/`, `test/`, `tokenspeed-kernel/`, and
+- Other paths under `python/`, `test/`, `tokenspeed-kernel/`, and
   `tokenspeed-scheduler/` require every runner group.
-* Each workflow's own YAML requires only its runner group; `workflow_dispatch`
+- Each workflow's own YAML requires only its runner group; `workflow_dispatch`
   always runs.
 
 PR and push diffs containing only `test/ci/**/*.yaml` run only the changed tasks,
@@ -330,7 +334,7 @@ smoke test. For a meaningful manual comparison, use `K8s Dispatch`: selecting a
 pull request uses its target and head revisions, while selecting a commit
 compares it with the latest `main`. Both revisions always execute serially in one task allocation.
 
-The task requests the ci-infra-managed `amd-mi350-1gpu-bench` runner pool and
+The task requests the ci-infra-managed `amd-mi355-1gpu` runner pool and
 exposes logical device 0. Each allocation must provide one `gfx950` GPU,
 working ROCm device permissions, Git, Bash, Python virtual-environment support,
 sufficient temporary storage, and access to the configured package indexes. The normal AMD
@@ -526,7 +530,7 @@ The preflight fails if an out-of-cluster Docker workload is already using the
 GPUs, because Kubernetes cannot account for those allocations.
 
 Pier's restricted egress proxy permits the agent to reach only the runner Pod
-IP on HTTP port 80. Kimi Code receives the local Tokenspeed endpoint through
+IP on HTTP port 80. Kimi Code receives the local TokenSpeed endpoint through
 `KIMI_MODEL_*`. Task containers retain DeepSWE's `no-network` policy. The
 workflow fails on incomplete/error trials and optionally on a binary-reward
 minimum. The default minimum is zero because a 10-task sample is not a stable
@@ -643,10 +647,10 @@ This is a manual launcher, not a GitHub Actions runner. Override its defaults
 with `TS_CI_ARTIFACT_ROOT`, `TS_CI_CACHE_DIR`, or
 `TS_CI_CONTAINER_IMAGE`.
 
-The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.1rc2 by image digest.
+The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.2 by image digest.
 When upgrading, keep the FlashInfer Python requirement, release cubin checksum,
-and runner JIT-cache version aligned. FlashInfer 0.7.1rc2 also requires
-cuDNN frontend 1.30.0 or newer and splits its JIT cache into provider packages.
+and runner JIT-cache version aligned. FlashInfer 0.7.2 also requires
+cuDNN frontend 1.31.0 or newer and splits its JIT cache into provider packages.
 GB200/B200 setup resolves those providers from the matching FlashInfer CUDA
 index and checks their installed versions again after dependency installation.
 
@@ -743,67 +747,16 @@ on the compute node.
 ### Retry unsuccessful Slurm cases
 
 Open **Actions → Retry Failed CI Cases → Run workflow** and enter the run URL
-or ID (for example `34550905154`) in `source_run`. The latest completed attempt
+or ID (for example, `34550905154`) in `source_run`. The latest completed attempt
 of **Slurm Dispatch**, or a previous retry, supplies the failed cases.
 The workflow skips only `COMPLETED` cases with exit code zero and `ok: true`.
 Retries reuse the original submission scripts and source snapshot, preserving
-the tested commit, image, configuration and GPU allocation. The original
+the tested commit, image, configuration, and GPU allocation. The original
 report artifact and coordinator's `scripts/` and `snapshots/` must still exist.
 The existing Slurm Dispatch scheduler defaults and PR installation mode apply.
 On retry, the workflow updates the known PyYAML bootstrap command to use the
 mounted pip cache, a 120-second socket timeout, and at most three installation
 attempts 10 seconds apart. Exhausted attempts stop before evaluation. This
 only changes dependency download handling. Retained files, source commit,
-image and test configuration stay unchanged.
+image, and test configuration stay unchanged.
 For workflows with one case per GitHub job, use **Re-run failed jobs**.
-
-## PR commands
-
-On an open same-repository PR into `main`, a repository writer can comment
-`@lightseek-bot watch` or `@lightseek-bot fix`.
-
-Completion triggers exclude `main`. Its push CI creates no assistance runs.
-`PR CI Assist Dispatch` handles planner and validation dispatches whose controller
-runs on `main`. Closed PRs and PRs without an active authorized watch/fix skip
-the control job. Other PR completions and comments can still create lightweight
-runs, but ordinary comments skip all jobs and inactive callbacks stop at resolve.
-
-- `watch` follows the current CI plan's selected tasks. Failed tasks get one
-  focused reproduction: NVIDIA uses Slurm GB200, then compatible GB300 only if
-  GB200 reports no capacity before submission; AMD uses K8s AMD. A repeated
-  failure or missing result requests human intervention. The watch reuses
-  running native checks. Queued NVIDIA checks can use the selected Slurm route.
-  The watch reuses queued Slurm allocations and AMD checks. A dispatched check
-  remains the watch's source of results even if native CI starts later.
-  Scheduler changes also watch the existing C++ and Python CPU workflows first;
-  NVIDIA library changes include the native GPU library workflow. The watch
-  matches each by its PR path filters, independently of manual dispatch support.
-  Completion requires successful test execution on the current PR head and base.
-  Skipped jobs wait for an eligible run. Failures or skipped test steps request
-  human intervention rather than a dispatch retry. CPU-only plans need no GPU
-  task. In-tree MLA Python changes also require a serving task with an explicit
-  `tokenspeed_mla` target or drafter backend. A kernel UT alone is insufficient.
-- `fix` resolves conflicts first, or attempts a focused source repair for an
-  already failed selected task. A separate branch receives the candidate.
-  Required pre-commit checks and all selected GPU tasks must pass before `fix`
-  cherry-picks the repair back. Conflict repairs also record the validated
-  merge with `main` so the PR becomes mergeable. A changed head or base stops
-  promotion.
-  Native workflow tracking is limited to `watch`. PR results cannot validate a
-  repair candidate, and conflicted PRs cannot start native PR workflows. `fix`
-  retains selected GPU validation before cherry-pick and required CI on the
-  updated PR.
-
-Only explicit writer commands start repairs. The bot does not edit tests,
-workflow/configuration files or task thresholds automatically, and does not
-merge PRs or bypass required checks. Comments contain a short status table.
-Versioned hidden records preserve the selected tasks and immutable source.
-The selected CI tasks must cover selected UT files with a known task mapping.
-The system refreshes older plans missing that coverage once before watching.
-A failed or incomplete refresh requests human intervention.
-For shared serving paths, prioritize the smallest existing model and bounded
-workload with equivalent coverage. When changed flags or callers require them,
-keep larger or model-specific checks.
-You can manually dispatch `PR CI Assist` with a PR number to reconcile an
-existing command. The workflows must be present on `main` for comment and
-completion events to activate them.

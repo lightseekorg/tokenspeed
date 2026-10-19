@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -209,10 +210,8 @@ class MooncakeKvStore:
             raise RuntimeError(f"Failed to setup Mooncake store, error code: {ret}")
         self._register_host_buffer(host_buffer)
         logger.info(
-            "Mooncake Store L3 ready (protocol=%s master=%s segment=%s)",
-            self.config.protocol,
-            self.config.master_server_address,
-            per_rank_segment,
+            f"Mooncake Store L3 ready (protocol={self.config.protocol} "
+            f"master={self.config.master_server_address} segment={per_rank_segment})"
         )
 
     def _register_host_buffer(self, host_buffer: Any) -> None:
@@ -292,16 +291,19 @@ class MooncakeKvStore:
             missing_sizes.append(int(size))
             missing_index.append(index)
             results[index] = False
-        if missing_keys:
+        # Mooncake eviction is asynchronous. Retry only allocation pressure,
+        # on the backup worker, while its Host pages remain pinned.
+        for retry_delay in (0.01, 0.05, 0.2, 0.0):
+            if not missing_keys:
+                break
             put_results = self.store.batch_put_from(
                 missing_keys, missing_ptrs, missing_sizes
             )
             if len(put_results) != len(missing_keys):
                 logger.error(
-                    "Mooncake batch_put_from returned %s results for %s keys; "
-                    "refusing to ACK Host pages that were not uploaded",
-                    len(put_results),
-                    len(missing_keys),
+                    f"Mooncake batch_put_from returned {len(put_results)} results "
+                    f"for {len(missing_keys)} keys; refusing to ACK Host pages "
+                    "that were not uploaded"
                 )
                 return [False] * len(keys)
             for index, ret in zip(missing_index, put_results):
@@ -325,6 +327,23 @@ class MooncakeKvStore:
                 for position, present in zip(failed_positions, raced_exists):
                     if present:
                         results[missing_index[position]] = True
+            retry_positions = [
+                position
+                for position, ret in enumerate(put_results)
+                if int(ret) == -200  # Mooncake NO_AVAILABLE_HANDLE
+                and not results[missing_index[position]]
+            ]
+            if not retry_positions or not retry_delay:
+                break
+            logger.warning(
+                f"Mooncake capacity pressure: retrying {len(retry_positions)} "
+                f"unwritten pages after {retry_delay:.2f}s"
+            )
+            time.sleep(retry_delay)
+            missing_keys = [missing_keys[p] for p in retry_positions]
+            missing_ptrs = [missing_ptrs[p] for p in retry_positions]
+            missing_sizes = [missing_sizes[p] for p in retry_positions]
+            missing_index = [missing_index[p] for p in retry_positions]
         return results
 
     def remove_by_prefix(self, prefix: str) -> bool:
@@ -338,14 +357,12 @@ class MooncakeKvStore:
         try:
             ret = remover(f"^{re.escape(prefix)}.*", True)
         except Exception:
-            logger.exception(
-                "Mooncake remove_by_regex raised while clearing %s", prefix
-            )
+            logger.exception(f"Mooncake remove_by_regex raised while clearing {prefix}")
             return False
         # Mooncake returns the number of removed objects; negative values are
         # error codes.
         if ret < 0:
-            logger.error("Failed to clear Mooncake L3 namespace, error code: %s", ret)
+            logger.error(f"Failed to clear Mooncake L3 namespace, error code: {ret}")
             return False
         return True
 

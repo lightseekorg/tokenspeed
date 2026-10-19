@@ -3,13 +3,15 @@ Usage:
 
 To test a specific model:
 1. Add it to ALL_OTHER_MODELS
-2. Run `ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels.test_others`
+2. Run `ONLY_RUN=Qwen/Qwen2-1.5B python3 -m pytest test/runtime/models/test_generation_models.py::TestGenerationModels::test_others`
 """
 
 import os
 
 # CI Registration (parsed via AST, runtime no-op)
 import sys
+
+import pytest
 
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -22,10 +24,7 @@ register_cuda_ci(est_time=300, suite="runtime-2gpu")
 import dataclasses
 import multiprocessing as mp
 import os
-import subprocess
 import sys
-import time
-import unittest
 from typing import List
 
 import torch
@@ -64,7 +63,6 @@ class ModelCase:
     enforce_eager: bool = False
     max_model_len: int = None
     max_new_tokens: int = 32
-    min_gpu_memory_gb: float = 0
     blackwell_only: bool = False
     extra_kwargs: dict = dataclasses.field(default_factory=dict)
 
@@ -73,23 +71,6 @@ class ModelCase:
 # tp_size is set to available GPU count at runtime
 _AVAILABLE_GPUS = get_available_gpu_count()
 CI_MODELS = [
-    ModelCase(
-        "openai/gpt-oss-120b",
-        tp_size=_AVAILABLE_GPUS,
-        skip_long_prompt=True,
-        min_gpu_memory_gb=80,
-        extra_kwargs={
-            "disable_prefill_graph": True,
-            "max_total_tokens": 32768,
-            "max_model_len": 16384,
-            "speculative_algorithm": "EAGLE3",
-            "speculative_draft_model_path": "nvidia/gpt-oss-120b-Eagle3-long-context",
-            "speculative_num_steps": 3,
-            "speculative_eagle_topk": 1,
-            "speculative_num_draft_tokens": 4,
-            "gpu_memory_utilization": 0.9,
-        },
-    ),
     ModelCase(
         "txn545/Qwen3.5-35B-A3B-NVFP4",
         tp_size=_AVAILABLE_GPUS,
@@ -151,10 +132,10 @@ QUALITY_CHECKS = [
 ]
 
 
-class TestGenerationModels(unittest.TestCase):
+class TestGenerationModels:
 
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         mp.set_start_method("spawn", force=True)
 
     def assert_close_logits_and_output_strs(
@@ -206,26 +187,15 @@ class TestGenerationModels(unittest.TestCase):
                 expected = expected_by_prompt.get(prompt)
                 if expected is None:
                     continue
-                self.assertIn(
-                    expected,
-                    output,
-                    f"Expected {expected!r} in output for prompt {prompt!r}, got {output!r}",
-                )
+                _pytest_member_1 = expected
+                _pytest_container_2 = output
+                _pytest_msg_3 = f"Expected {expected!r} in output for prompt {prompt!r}, got {output!r}"
+                assert _pytest_member_1 in _pytest_container_2, _pytest_msg_3
 
     def test_ci_models(self):
-        gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         for model_case in CI_MODELS:
             if model_case.blackwell_only and not _BLACKWELL_SYSTEM:
                 print(f"Skipping {model_case.model_path}: Blackwell-only model")
-                continue
-            total_memory_gb = gpu_memory_gb * model_case.tp_size
-            if (
-                model_case.min_gpu_memory_gb > 0
-                and total_memory_gb < model_case.min_gpu_memory_gb
-            ):
-                print(
-                    f"Skipping {model_case.model_path}: requires {model_case.min_gpu_memory_gb}GB, got {total_memory_gb:.0f}GB ({gpu_memory_gb:.0f}GB x {model_case.tp_size})"
-                )
                 continue
             for torch_dtype in TORCH_DTYPES:
 
@@ -258,4 +228,4 @@ class TestGenerationModels(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

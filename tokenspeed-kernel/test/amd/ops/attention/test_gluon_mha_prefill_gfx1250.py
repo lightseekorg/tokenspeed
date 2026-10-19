@@ -24,6 +24,7 @@ import math
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.mha import torch_dense_attention
 from utils import is_cdna5
 
 if not is_cdna5():
@@ -48,21 +49,18 @@ def _inputs(seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype):
 
 
 def _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim, window_left=-1):
-    sm_scale = 1.0 / math.sqrt(head_dim)
-    group = n_q_heads // n_kv_heads
     outs = []
     for start, end in zip(cu_cpu[:-1], cu_cpu[1:]):
-        q_i = q[start:end].float()
-        k_exp = k[start:end].float().repeat_interleave(group, dim=1)
-        v_exp = v[start:end].float().repeat_interleave(group, dim=1)
-        n = end - start
-        scores = torch.einsum("qhd,khd->hqk", q_i, k_exp) * sm_scale
-        pos = torch.arange(n, device=q.device)
-        mask = pos[:, None] >= pos[None, :]
-        if window_left >= 0:
-            mask &= (pos[:, None] - pos[None, :]) <= window_left
-        scores = scores.masked_fill(~mask[None, :, :], float("-inf"))
-        outs.append(torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v_exp))
+        out, _ = torch_dense_attention(
+            q[start:end],
+            k[start:end],
+            v[start:end],
+            scale=1.0 / math.sqrt(head_dim),
+            causal_offset=0,
+            window_left=window_left if window_left >= 0 else None,
+            sinks=None,
+        )
+        outs.append(out)
     return torch.cat(outs, dim=0)
 
 

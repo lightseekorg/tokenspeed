@@ -22,6 +22,11 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.sampling import (
+    torch_gather_and_expand_scalars,
+    torch_min_p_renorm_prob,
+    torch_topk_topp_renorm,
+)
 from tokenspeed_kernel.ops.sampling.cuda import (
     fused_topk_topp_renorm,
     fused_topk_topp_workspace_size,
@@ -54,22 +59,6 @@ def _make_pools(pool_rows: int, device: str):
     return temp, top_k, top_p, min_p, seed, offsets
 
 
-def _reference(index, pool, n: int):
-    """index_select + repeat_interleave reference."""
-    idx = index.long()
-    return pool.index_select(0, idx).repeat_interleave(n, dim=0)
-
-
-def _min_p_reference(probs: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
-    max_probs = probs.max(dim=-1, keepdim=True).values
-    out = torch.where(
-        probs >= min_p.to(probs.dtype).view(-1, 1) * max_probs,
-        probs,
-        torch.zeros_like(probs),
-    )
-    return out / out.sum(dim=-1, keepdim=True)
-
-
 @pytest.mark.parametrize("bs", [1, 4, 7])
 @pytest.mark.parametrize("n", [1, 4, 8])
 def test_gather_full(bs: int, n: int, device: str) -> None:
@@ -91,12 +80,20 @@ def test_gather_full(bs: int, n: int, device: str) -> None:
         n=n,
     )
 
-    torch.testing.assert_close(temps, _reference(index, temp_p, n))
-    torch.testing.assert_close(top_ks, _reference(index, top_k_p, n))
-    torch.testing.assert_close(top_ps, _reference(index, top_p_p, n))
-    torch.testing.assert_close(min_ps, _reference(index, min_p_p, n))
-    torch.testing.assert_close(seeds, _reference(index, seed_p, n))
-    torch.testing.assert_close(offsets, _reference(index, offsets_p, n).to(torch.int64))
+    expected = torch_gather_and_expand_scalars(
+        index,
+        temperature=temp_p,
+        top_k=top_k_p,
+        top_p=top_p_p,
+        min_p=min_p_p,
+        seed=seed_p,
+        offsets=offsets_p,
+        n=n,
+    )
+    for got, want in zip(
+        (temps, top_ks, top_ps, min_ps, seeds, offsets), expected, strict=True
+    ):
+        torch.testing.assert_close(got, want)
 
 
 @pytest.mark.parametrize("n", [1, 5])
@@ -117,9 +114,18 @@ def test_gather_no_min_p_no_seed(n: int, device: str) -> None:
     assert min_ps is None
     assert seeds is None
     assert offsets is None
-    torch.testing.assert_close(temps, _reference(index, temp_p, n))
-    torch.testing.assert_close(top_ks, _reference(index, top_k_p, n))
-    torch.testing.assert_close(top_ps, _reference(index, top_p_p, n))
+    expected = torch_gather_and_expand_scalars(
+        index,
+        temperature=temp_p,
+        top_k=top_k_p,
+        top_p=top_p_p,
+        min_p=None,
+        seed=None,
+        offsets=None,
+        n=n,
+    )
+    for got, want in zip((temps, top_ks, top_ps), expected[:3], strict=True):
+        torch.testing.assert_close(got, want)
 
 
 def test_gather_sample_basic(device: str) -> None:
@@ -141,9 +147,19 @@ def test_gather_sample_basic(device: str) -> None:
     assert min_ps is None
     assert seeds is not None
     assert offsets is not None
-    torch.testing.assert_close(temps, _reference(index, temp_p, 1))
-    torch.testing.assert_close(seeds, _reference(index, seed_p, 1))
-    torch.testing.assert_close(offsets, _reference(index, offsets_p, 1).to(torch.int64))
+    expected = torch_gather_and_expand_scalars(
+        index,
+        temperature=temp_p,
+        top_k=top_k_p,
+        top_p=top_p_p,
+        min_p=None,
+        seed=seed_p,
+        offsets=offsets_p,
+        n=1,
+    )
+    torch.testing.assert_close(temps, expected[0])
+    torch.testing.assert_close(seeds, expected[4])
+    torch.testing.assert_close(offsets, expected[5])
     assert offsets.dtype == torch.int64
 
 
@@ -165,40 +181,17 @@ def test_gather_min_p_only(device: str) -> None:
     assert seeds is None
     assert offsets is None
     assert min_ps is not None
-    torch.testing.assert_close(min_ps, _reference(index, min_p_p, 4))
-
-
-def _ref_topk_topp(
-    probs: torch.Tensor, top_ks: torch.Tensor, top_ps: torch.Tensor
-) -> torch.Tensor:
-    """Pure-torch baseline mirroring flashinfer's ``top_k_renorm_prob`` followed
-    by ``top_p_renorm_prob(is_deterministic=True)``. K >= V is treated as no
-    top-k cutoff (matches both the flashinfer clamp and the K = 1<<30 sentinel),
-    and P >= 1 as no top-p cutoff (renormalize only).
-    """
-    bs, V = probs.shape
-    out = probs.clone()
-    for i in range(bs):
-        k = min(int(top_ks[i].item()), V)
-        if k < V:
-            kth = torch.topk(out[i], k, sorted=False).values.min()
-            out[i] = torch.where(out[i] >= kth, out[i], torch.zeros_like(out[i]))
-            s = out[i].sum()
-            if s > 0:
-                out[i] = out[i] / s
-        p = float(top_ps[i].item())
-        if p < 1.0:
-            sorted_vals, _ = torch.sort(out[i], descending=True)
-            cs = torch.cumsum(sorted_vals, 0)
-            # Smallest prefix with cumulative mass >= p. Clamp to V in case
-            # fp32 rounding leaves the row total below p.
-            keep = min((cs < p).sum().item() + 1, V)
-            thresh = sorted_vals[keep - 1]
-            out[i] = torch.where(out[i] >= thresh, out[i], torch.zeros_like(out[i]))
-        s = out[i].sum()
-        if s > 0:
-            out[i] = out[i] / s
-    return out
+    expected = torch_gather_and_expand_scalars(
+        index,
+        temperature=temp_p,
+        top_k=top_k_p,
+        top_p=top_p_p,
+        min_p=min_p_p,
+        seed=None,
+        offsets=None,
+        n=4,
+    )
+    torch.testing.assert_close(min_ps, expected[3])
 
 
 @requires_nvidia
@@ -239,7 +232,7 @@ def test_fused_topk_topp_matches_pipeline(
     top_ks = torch.tensor(ks, dtype=torch.int32, device=device)
     top_ps = torch.tensor(ps, dtype=torch.float32, device=device)
 
-    ref = _ref_topk_topp(probs, top_ks, top_ps)
+    ref = torch_topk_topp_renorm(probs, top_ks, top_ps)
     ours = fused_topk_topp_renorm(probs.clone(), top_ks, top_ps)
 
     # Each kept row should renormalize to 1 within fp32 ulp tolerance.
@@ -315,7 +308,7 @@ def test_fused_topk_topp_unaligned_rows(
     top_ks = torch.full((bs,), _TOP_K_DISABLED, dtype=torch.int32, device=device)
     top_ps = torch.full((bs,), 0.8, dtype=torch.float32, device=device)
 
-    ref = _ref_topk_topp(probs, top_ks, top_ps)
+    ref = torch_topk_topp_renorm(probs, top_ks, top_ps)
 
     probs_in = _offset_view(probs, probs_off) if probs_off else probs
     out = _offset_view(torch.empty_like(probs), out_off) if out_off else None
@@ -421,7 +414,7 @@ def test_fused_topk_topp_keeps_sub_ulp_tail_at_top_p_one(
     top_ks = torch.full((bs,), top_k, dtype=torch.int32, device=device)
     top_ps = torch.ones(bs, dtype=torch.float32, device=device)
 
-    ref = _ref_topk_topp(probs, top_ks, top_ps)
+    ref = torch_topk_topp_renorm(probs, top_ks, top_ps)
     ours = fused_topk_topp_renorm(probs, top_ks, top_ps)
 
     assert int((ours != 0).sum().item()) == bs * kept
@@ -463,7 +456,7 @@ def test_min_p_renorm_prob(rows: int, vocab_size: int, device: str) -> None:
     min_p = torch.linspace(0.0, 0.2, rows, device=device, dtype=torch.float32)
 
     out = min_p_renorm_prob(probs, min_p)
-    ref = _min_p_reference(probs, min_p)
+    ref = torch_min_p_renorm_prob(probs, min_p)
 
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(out.sum(dim=-1), torch.ones(rows, device=device))
@@ -476,7 +469,7 @@ def test_min_p_renorm_prob_bf16_min_p(device: str) -> None:
     min_p = torch.tensor([0.0, 0.01, 0.05, 0.2], device=device, dtype=torch.bfloat16)
 
     out = min_p_renorm_prob(probs, min_p)
-    ref = _min_p_reference(probs, min_p)
+    ref = torch_min_p_renorm_prob(probs, min_p)
 
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-6)
 

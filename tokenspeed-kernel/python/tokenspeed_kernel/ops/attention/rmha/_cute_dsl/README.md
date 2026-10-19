@@ -43,7 +43,7 @@ features that need unavailable standalone helpers by name and raise a focused
 The supported storage contracts are:
 
 | Mode | Q/O | K/V | Length metadata |
-| --- | --- | --- |
+| --- | --- | --- | --- |
 | Fixed | `(B, Sq, Hq, D)` | `(B, Sk, Hkv, Dv)` | none |
 | Packed varlen | `(total_q, Hq, D)` | `(total_k, Hkv, Dv)` | CUDA contiguous `int32` `cu_seqlens_q/k` |
 | Padded varlen | `(B, max_sq, Hq, D)` | `(B, max_sk, Hkv, Dv)` | CUDA contiguous `int32` `seqused_q/k` |
@@ -105,7 +105,7 @@ Like the source interface, the Prefill wrapper selects FP8 V storage when
 `sfv` is provided:
 
 | `sfv` | V storage | PV/GEMM2 |
-| --- | --- | --- | --- |
+| --- | --- | --- |
 | `None` | BF16 or FP16 | BF16/FP16 MMA |
 | UE8M0 tensor | FP8 E4M3 | V is converted to BF16 and scaled before BF16 MMA |
 

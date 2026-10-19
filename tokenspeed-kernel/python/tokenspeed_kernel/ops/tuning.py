@@ -70,12 +70,19 @@ def _reuse_autotune_cache():
     original_search = AutoTuner.search_cache
 
     def search(
-        tuner, custom_op, runners, input_shapes, tuning_config, inputs=None, **kwargs
+        tuner,
+        custom_op,
+        runners,
+        input_shapes,
+        tuning_config,
+        inputs=None,
+        *,
+        require_profiling_policy: bool = False,
     ):
         with tuner._lock:
             # FI 0.7 skips persisted entries for cold-L2 tuning. Use serving
             # lookup rules, then restore tuning so cache misses still profile.
-            # Preserve rc5's explicit require_profiling_policy for managed and
+            # Preserve explicit require_profiling_policy for managed and
             # in-memory entries, even while the implicit tuning flag is off.
             was_tuning = tuner.is_tuning_mode
             tuner.is_tuning_mode = False
@@ -87,7 +94,7 @@ def _reuse_autotune_cache():
                     input_shapes,
                     tuning_config,
                     inputs=inputs,
-                    **kwargs,
+                    require_profiling_policy=require_profiling_policy,
                 )
             finally:
                 tuner.is_tuning_mode = was_tuning

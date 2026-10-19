@@ -25,12 +25,19 @@
 """Base classes for grammar-guided constrained decoding backends."""
 
 import time
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Event, Lock
 from typing import Any
 
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+# Bound on the compiled grammars kept after a request was admitted with them,
+# by their size estimate plus key size, so that a request repeating a
+# recently used schema or tool set is admitted without the compile executor.
+# The least recently used beyond it are dropped.
+RETAINED_GRAMMAR_LIMIT_BYTES = 1 << 30
 
 
 @dataclass
@@ -61,6 +68,13 @@ class BaseGrammarObject:
     def expired(self) -> bool:
 
         return False
+
+    @property
+    def memory_size_bytes(self) -> int:
+        """Host memory held by this grammar object (an estimate), counted
+        against RETAINED_GRAMMAR_LIMIT_BYTES. Every backend must define it:
+        without it the bound would count only the keys."""
+        raise NotImplementedError()
 
 
 class InvalidGrammarObject(BaseGrammarObject):
@@ -123,6 +137,21 @@ class BaseGrammarBackend:
         # Tracks transient-timeout attempts per key. Cleared on a successful
         # compile (in init_value) or on reset().
         self.timeout_history: dict[tuple[str, str], TimeoutHistory] = {}
+
+        # Compiled grammars requests were admitted with and their sizes, least
+        # recently used first, at most RETAINED_GRAMMAR_LIMIT_BYTES in total.
+        # Changed only by ``retain`` and by lookups, both on the scheduler
+        # thread in the order every attention TP rank sees, so every rank
+        # keeps the same keys.
+        self.retained: OrderedDict[tuple[str, str], tuple[BaseGrammarObject, int]] = (
+            OrderedDict()
+        )
+        self.retained_bytes = 0
+
+        # Keys whose compiled grammar the worker put in ``cache``. ``retain``
+        # drops those entries once no queued request waits for them, so a
+        # compiled grammar outlives its requests only in ``retained``.
+        self.compiled_keys: set[tuple[str, str]] = set()
 
     # ------------------------------------------------------------------
     # Subclass hook
@@ -200,6 +229,7 @@ class BaseGrammarBackend:
                         if not value.is_invalid:
                             # Successful compile — clear timeout bookkeeping.
                             self.timeout_history.pop(key, None)
+                            self.compiled_keys.add(key)
 
                 else:
 
@@ -234,6 +264,14 @@ class BaseGrammarBackend:
         transient timeout decays into a retry instead of poisoning the key.
         """
         with self.cache_lock:
+
+            retained = self.retained.get(key)
+
+            if retained is not None:
+
+                self.retained.move_to_end(key)
+
+                return retained[0].copy(), True
 
             entry = self.cache.get(key)
 
@@ -312,9 +350,10 @@ class BaseGrammarBackend:
         broken for this key and there's nothing to gain by retrying.
 
         Spurious-timeout safety: if the cache already holds a valid grammar
-        (the worker just finished compiling, racing this call), this is a
-        no-op — we don't penalize a working key, and we don't clobber a
-        freshly-committed result with a stale timeout.
+        (the worker just finished compiling, racing this call), or the key's
+        grammar is retained, this is a no-op — we don't penalize a working
+        key, and we don't clobber a freshly-committed result with a stale
+        timeout.
 
         Counter reset semantics:
           - cleared on a successful compile (see ``init_value``)
@@ -324,7 +363,7 @@ class BaseGrammarBackend:
 
             entry = self.cache.get(key)
 
-            if (
+            if key in self.retained or (
                 entry is not None
                 and entry.event.is_set()
                 and not entry.value.is_invalid
@@ -392,15 +431,85 @@ class BaseGrammarBackend:
 
                 entry.value = invalid
 
+    def retain(
+        self,
+        admitted: list[tuple[tuple[str, str], BaseGrammarObject]],
+        waiting: set[tuple[str, str]],
+    ) -> None:
+        """Keep the compiled grammars requests were just admitted with.
+
+        ``admitted`` lists (key, grammar) in admission order; each becomes the
+        most recently used retained grammar, and the least recently used ones
+        are dropped while the total exceeds RETAINED_GRAMMAR_LIMIT_BYTES. A
+        grammar larger than the bound by itself is not kept.
+
+        Compiled grammars in ``cache`` leave it unless their key is in
+        ``waiting``, the keys of requests still queued: while a request waits,
+        ``compile_started_at`` still needs the entry.
+
+        Called on the scheduler thread after grammar admission is agreed, so
+        every attention TP rank keeps and drops the same retained keys;
+        ``cache`` itself stays rank-local.
+        """
+        with self.cache_lock:
+
+            for key, grammar in admitted:
+
+                if key in self.retained:
+
+                    self.retained.move_to_end(key)
+
+                    continue
+
+                # CPython stores a str in 1, 2 or 4 bytes per character:
+                # count 4 unless the key is ASCII, the same on every rank.
+                text = key[1]
+                size = len(text) * (1 if text.isascii() else 4)
+                size += grammar.memory_size_bytes
+
+                if size > RETAINED_GRAMMAR_LIMIT_BYTES:
+
+                    # It would push out every other grammar, then itself.
+                    continue
+
+                self.retained[key] = (grammar, size)
+                self.retained_bytes += size
+
+            while self.retained_bytes > RETAINED_GRAMMAR_LIMIT_BYTES:
+
+                _, (_, size) = self.retained.popitem(last=False)
+                self.retained_bytes -= size
+
+            for key in list(self.compiled_keys):
+
+                if key in waiting:
+
+                    continue
+
+                self.compiled_keys.discard(key)
+                entry = self.cache.get(key)
+
+                if (
+                    entry is not None
+                    and entry.event.is_set()
+                    and not entry.value.is_invalid
+                ):
+                    del self.cache[key]
+
     def reset(self):
 
         with self.cache_lock:
 
             self.cache.clear()
             self.timeout_history.clear()
+            self.retained.clear()
+            self.retained_bytes = 0
+            self.compiled_keys.clear()
 
 
-def create_grammar_backend(server_args: ServerArgs, tokenizer, vocab_size):
+def create_grammar_backend(
+    server_args: ServerArgs, tokenizer, vocab_size, stop_token_ids=None
+):
 
     if server_args.grammar_backend == "none":
 
@@ -416,6 +525,7 @@ def create_grammar_backend(server_args: ServerArgs, tokenizer, vocab_size):
             tokenizer,
             vocab_size=vocab_size,
             disable_any_whitespace=server_args.disable_any_whitespace,
+            stop_token_ids=stop_token_ids,
         )
 
     else:

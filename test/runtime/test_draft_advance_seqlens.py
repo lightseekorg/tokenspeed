@@ -145,6 +145,99 @@ def test_trtllm_target_mixed_metadata_keeps_decode_rows():
     assert torch.equal(metadata.page_table, page_table)
 
 
+def _trtllm_leaf(is_draft: bool, width: int) -> TRTLLMMHAAttnBackend:
+    cfg = replace(_cfg(), is_draft=is_draft, speculative_num_draft_tokens=width)
+    return TRTLLMMHAAttnBackend(
+        cfg, cfg.component(SoftmaxAttnConfig), kernel_page_size=64
+    )
+
+
+def _init_round(be, mode, extends, decode_kv_lens, width):
+    """Extend requests ``(prefix, chunk)`` first, then decode requests holding
+    ``decode_kv_lens`` committed tokens plus ``width`` new ones."""
+    seq_lens = torch.tensor(
+        [p + c for p, c in extends] + [kv + width for kv in decode_kv_lens],
+        dtype=torch.int32,
+    )
+    prefix_lens = torch.tensor([p for p, _ in extends], dtype=torch.int32)
+    chunk_lens = torch.tensor([c for _, c in extends], dtype=torch.int32)
+    bs = len(seq_lens)
+    page_table = torch.arange(bs * MAX_NUM_PAGES, dtype=torch.int32).reshape(
+        bs, MAX_NUM_PAGES
+    )
+    be.init_forward_metadata(
+        bs=bs,
+        num_extends=len(extends),
+        seq_lens=seq_lens,
+        page_table=page_table,
+        forward_mode=mode,
+        extend_seq_lens=chunk_lens,
+        extend_seq_lens_cpu=chunk_lens,
+        extend_prefix_lens=prefix_lens,
+        extend_prefix_lens_cpu=prefix_lens,
+        extend_with_prefix=bool(prefix_lens.any()),
+        query_shard=None,
+        page_table_cpu=None,
+    )
+    return seq_lens, page_table
+
+
+@pytest.mark.parametrize("is_draft", [False, True])
+@pytest.mark.parametrize(
+    "extends, decode_kv_lens, width, cu_seqlens_q",
+    [
+        # Two prompt chunks, one continuing a prefix, beside verify rows.
+        ([(100, 7), (0, 5)], [40, 33], 4, [0, 7, 12, 16, 20]),
+        # One chunk continuing a prefix.
+        ([(64, 9)], [40, 33], 4, [0, 9, 13, 17]),
+        # Fresh chunks only.
+        ([(0, 6), (0, 3)], [40], 4, [0, 6, 9, 13]),
+        # A chunk shorter than the verify width.
+        ([(128, 2)], [40], 4, [0, 2, 6]),
+        # A 16-token verify block.
+        ([(2048, 300), (0, 200)], [1200, 900], 16, [0, 300, 500, 516, 532]),
+        # No speculation: one new token per decode request.
+        ([(0, 3), (0, 5)], [6], 1, [0, 3, 8, 9]),
+    ],
+)
+def test_trtllm_mixed_decode_rows_query_only_their_new_tokens(
+    is_draft, extends, decode_kv_lens, width, cu_seqlens_q
+):
+    be = _trtllm_leaf(is_draft, width)
+    seq_lens, page_table = _init_round(
+        be, ForwardMode.MIXED, extends, decode_kv_lens, width
+    )
+    # The target's context kernel runs the whole packed batch: each extend
+    # request's chunk, then each decode request's ``width`` new rows at the
+    # end of its cache, the rows that request verifies in a decode round.
+    # The draft's prefill slot keeps only the extend requests.
+    rows = len(extends) if is_draft else len(seq_lens)
+    metadata = be.forward_prefill_metadata
+    assert metadata.cu_seqlens_q.tolist() == cu_seqlens_q[: rows + 1]
+    assert metadata.cu_seqlens_k.tolist() == [
+        0,
+        *torch.cumsum(seq_lens[:rows], 0).tolist(),
+    ]
+    assert torch.equal(metadata.cache_seqlens_int32, seq_lens[:rows])
+    assert torch.equal(metadata.page_table, page_table[:rows])
+    chunks = [c for _, c in extends]
+    assert metadata.max_seq_len_q == max(chunks if is_draft else chunks + [width])
+
+
+@pytest.mark.parametrize("extends", [[(100, 7), (0, 5)], [(0, 6), (0, 3)]])
+def test_trtllm_target_extend_metadata_has_only_the_chunks(extends):
+    be = _trtllm_leaf(is_draft=False, width=16)
+    _init_round(be, ForwardMode.EXTEND, extends, [], 16)
+    metadata = be.forward_prefill_metadata
+    assert metadata.cu_seqlens_q.tolist() == [
+        0,
+        *torch.cumsum(torch.tensor([c for _, c in extends]), 0).tolist(),
+    ]
+    assert metadata.max_seq_len_q == max(c for _, c in extends)
+    if not any(p for p, _ in extends):
+        assert metadata.cu_seqlens_q is metadata.cu_seqlens_k
+
+
 @pytest.mark.parametrize("backend_cls", [MHAAttnBackend, TRTLLMMHAAttnBackend])
 def test_advance_updates_draft_decode_metadata(backend_cls):
     be = _mha_backend(backend_cls)
@@ -289,10 +382,10 @@ def test_router_fans_advance_out_to_every_leaf():
     router.bind(
         CacheGroupGeometry(
             granularities={"full_attention": 64},
-            families={"full_attention": "history"},
+            attn_kinds={"full_attention": "full_history"},
             full_history_group_id="full_attention",
             row_geometry={"full_attention": (64, 1)},
-            retentions={"full_attention": ("full_history", None)},
+            windows={"full_attention": None},
         ),
         {"full_attention": leaf},
     )

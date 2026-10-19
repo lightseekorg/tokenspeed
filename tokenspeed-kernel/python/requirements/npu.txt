@@ -1,0 +1,7 @@
+packaging
+wheel
+psutil
+numpy
+torch
+apache-tvm-ffi==0.1.13.post3
+triton-ascend==3.2.1

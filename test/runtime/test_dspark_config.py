@@ -36,6 +36,7 @@ from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.base.transformer_model import notify_target_capture
 from tokenspeed.runtime.models.dspark import _get_markov_params
 from tokenspeed.runtime.utils.hf_transformers_utils import get_config
+from tokenspeed.runtime.utils.server_args import ServerArgs
 from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_RULES,
     read_checkpoint_block_size,
@@ -408,7 +409,9 @@ def test_an_explicit_dtype_still_wins_for_the_draft() -> None:
 def _draft_attn_config(algorithm: str, layer_types: tuple[str, ...]):
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 
-    server_args = SimpleNamespace(
+    # attn_tp_size=4 resolves world_size=4 and mapping.attn.tp_size=4.
+    server_args = ServerArgs(
+        model="x",
         speculative_algorithm=algorithm,
         speculative_num_steps=7,
         speculative_num_draft_tokens=8,
@@ -417,28 +420,14 @@ def _draft_attn_config(algorithm: str, layer_types: tuple[str, ...]):
         device="cuda",
         attention_backend="trtllm",
         drafter_attention_backend="trtllm",
-        spec_context_pad=0,
         prefix_granularity=128,
         max_num_seqs=16,
         data_parallel_size=None,
-        max_cudagraph_capture_size=80,
-        chunked_prefill_size=8192,
         skip_softmax_threshold=0.0,
         disaggregation_mode="null",
         attn_tp_size=4,
-        mapping=SimpleNamespace(
-            attn=SimpleNamespace(
-                tp_size=4,
-                dp_size=1,
-                kvp_size=1,
-                kvp_rank=0,
-                kvp_group=(0,),
-                qcp_size=1,
-                qcp_rank=0,
-                qcp_group=(0,),
-            )
-        ),
     )
+    server_args.mapping.rank = 0
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(layer_types=layer_types, sliding_window=1024),
         num_attention_layers=len(layer_types),

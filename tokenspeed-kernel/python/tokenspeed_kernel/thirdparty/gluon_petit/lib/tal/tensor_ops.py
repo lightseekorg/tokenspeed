@@ -23,8 +23,60 @@
 """Tensor register views and explicitly masked native memory instructions."""
 
 import triton.experimental.gluon as g
+import triton.language as tl
 from lib.gemm.rocm.intrinsics import _native_call, _resource_content
 from triton.experimental.gluon import language as l
+
+
+@g.jit
+def group_gather(value, index, width: l.constexpr):
+    """Gather within each contiguous width-element group, preserving its layout."""
+    l.static_assert(width >= 1 and width <= 64 and 64 % width == 0)
+    l.static_assert(value.numel % width == 0)
+    values = value.reshape([value.numel // width, width])
+    indices = (l.full_like(value, 0, dtype=l.int32) + index % width).reshape(
+        [value.numel // width, width]
+    )
+    return l.gather(values, indices, axis=1).reshape(value.shape)
+
+
+@g.jit
+def wave_inclusive_sum(value):
+    """Prefix-sum each 64-element row without communication between waves."""
+    l.static_assert(value.numel % 64 == 0)
+    values = value.reshape([value.numel // 64, 64])
+    return l.associative_scan(values, axis=1, combine_fn=_sum).reshape(value.shape)
+
+
+@g.jit
+def _sum(a, b):
+    return a + b
+
+
+@g.jit
+def group_max(value, width: l.constexpr):
+    """Broadcast each contiguous group's maximum to its original elements."""
+    l.static_assert(width >= 1 and width <= 64 and 64 % width == 0)
+    l.static_assert(value.numel % width == 0)
+    values = value.reshape([value.numel // width, width])
+    maximum = l.reduce(values, axis=1, combine_fn=_maximum)
+    return l.broadcast(maximum[:, None], values)[0].reshape(value.shape)
+
+
+@g.jit
+def _maximum(a, b):
+    return l.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+
+@g.jit
+def transpose_packed_bytes(value):
+    """Transpose the four bytes of each group of four packed uint32 values."""
+    byte = l.arange(0, value.numel, layout=value.type.layout) % 4
+    result = l.full_like(value, 0)
+    for word in l.static_range(4):
+        source = group_gather(value, word, 4)
+        result |= ((source >> (byte * 8)) & 0xFF) << (word * 8)
+    return result
 
 
 @g.jit

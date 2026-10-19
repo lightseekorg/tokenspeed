@@ -690,7 +690,9 @@ def test_ordinary_mla_kvp_capacity_and_token_limit(degree, token_limit):
     )
     setup = prepare_cache_setup(
         family="mla",
-        server_args=SimpleNamespace(max_total_tokens=token_limit),
+        server_args=SimpleNamespace(
+            max_total_tokens=token_limit, kv_offload_config=None
+        ),
         model_config=SimpleNamespace(
             num_attention_layers=2, hf_config=SimpleNamespace(), model_profile=None
         ),
@@ -751,7 +753,7 @@ def test_pure_dsa_kvp_shards_index_and_latent_capacity(degree):
             replace(config, is_draft=True, draft_block_decode=True)
     setup = prepare_cache_setup(
         family="dsa",
-        server_args=SimpleNamespace(max_total_tokens=None),
+        server_args=SimpleNamespace(max_total_tokens=None, kv_offload_config=None),
         model_config=SimpleNamespace(
             num_attention_layers=2, hf_config=SimpleNamespace(), model_profile=None
         ),

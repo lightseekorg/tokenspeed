@@ -7,7 +7,7 @@ exec ts serve \
     --attn-tp-size 8 \
     --moe-tp-size 8 \
     --max-model-len 80000 \
-    --max-num-seqs 16 \
+    --max-num-seqs 64 \
     --gpu-memory-utilization 0.9 \
     --disable-cuda-graph-padding \
     --trust-remote-code \

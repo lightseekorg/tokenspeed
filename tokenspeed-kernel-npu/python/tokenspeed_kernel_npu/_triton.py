@@ -20,10 +20,35 @@
 
 """Single import boundary for the Triton-Ascend distribution."""
 
+from types import SimpleNamespace
+
 import triton
 from triton import language as tl
-from triton import profiler as proton
 from triton.language.extra import libdevice
+
+try:
+    from triton import profiler as proton
+except ImportError:
+    # Triton-Ascend's offline bundle may omit optional Proton profiling.
+    # TokenSpeed's profiling boundary treats None as an unavailable profiler.
+    proton = None
+
+
+# The Ascend Triton release lacks the newer alignment-only specialization hint.
+# Disabling all specialization for those arguments is conservative: it preserves
+# the requested alignment behavior at the cost of fewer compiled variants.
+_ascend_jit = triton.jit
+
+
+def _jit_with_ascend_compatibility(fn=None, **kwargs):
+    alignment = kwargs.pop("do_not_specialize_on_alignment", ())
+    if alignment:
+        unspecialized = kwargs.get("do_not_specialize") or ()
+        kwargs["do_not_specialize"] = tuple(dict.fromkeys((*unspecialized, *alignment)))
+    return _ascend_jit(fn, **kwargs)
+
+
+triton.jit = _jit_with_ascend_compatibility
 
 
 @triton.jit
@@ -32,6 +57,8 @@ def _unsupported_pdl_noop():
     pass
 
 
+if not hasattr(tl.extra, "cuda"):
+    tl.extra.cuda = SimpleNamespace()
 if not hasattr(tl.extra.cuda, "gdc_wait"):
     tl.extra.cuda.gdc_wait = _unsupported_pdl_noop
 if not hasattr(tl.extra.cuda, "gdc_launch_dependents"):

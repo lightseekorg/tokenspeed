@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 
 import torch as _torch
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -289,6 +290,44 @@ def _same_tensor_contract(
         )
 
 
+def pad_gated_residual_projection_weight(
+    projection_weight: _torch.Tensor,
+    *,
+    projection_rows: int,
+) -> _torch.Tensor:
+    """Prepare the down/inject weight once during model loading.
+
+    Args:
+        projection_weight: Down/inject weight shaped
+            ``[stored_rows, hc_count * hidden_size]``, with or without padding.
+        projection_rows: Number of logical down/inject rows before padding.
+
+    Returns:
+        BF16/FP16 storage aligned to a 16-byte GEMM output width, with newly
+        appended rows zeroed. Other dtypes use the original logical extent.
+        Weights already at the desired extent are returned unchanged. Pass
+        the same ``projection_rows`` to :func:`gated_residual_mix`.
+    """
+    if (
+        projection_weight.ndim != 2
+        or not 0 < projection_rows <= projection_weight.shape[0]
+    ):
+        raise ValueError(
+            "projection_rows must fit the two-dimensional projection weight"
+        )
+    alignment = 8 if projection_weight.dtype in (_torch.bfloat16, _torch.float16) else 1
+    padded_rows = (projection_rows + alignment - 1) // alignment * alignment
+    if padded_rows == projection_weight.shape[0]:
+        return projection_weight
+    if padded_rows == projection_rows:
+        return projection_weight[:projection_rows]
+    with _torch.no_grad():
+        return _torch.nn.functional.pad(
+            projection_weight[:projection_rows],
+            (0, 0, 0, padded_rows - projection_rows),
+        )
+
+
 def select_gated_residual_mix_kernel(
     flat: _torch.Tensor,
     projection_weight: _torch.Tensor,
@@ -363,6 +402,7 @@ def gated_residual_mix(
     hidden_size: int,
     lowrank: int,
     *,
+    projection_rows: int,
     weights_independent: bool,
     projection_scale: float = 1.0,
     override: str | None = None,
@@ -371,20 +411,25 @@ def gated_residual_mix(
     """Mix normalized hyperconnection branches and optionally form inject logits.
 
     The first projection is stored as one matrix. Its leading ``lowrank`` rows
-    are the mix-down weight and, when present, its final ``hc_count`` rows are
+    are the mix-down weight and, when present, its next ``hc_count`` rows are
     the block-injection weight. This preserves a single read of the wide input.
+    Loading may append padding rows; forward never copies or pads weights.
 
     Args:
         normalized: Normalized GPU residual streams shaped
             ``[..., hc_count * hidden_size]``.
-        projection_weight: Fused down/inject weight shaped either
-            ``[lowrank, hc_count * hidden_size]`` or
-            ``[lowrank + hc_count, hc_count * hidden_size]``.
+        projection_weight: Fused down/inject weight shaped
+            ``[stored_rows, hc_count * hidden_size]``. ``stored_rows`` is
+            ``projection_rows`` or, for BF16/FP16, rounded up to eight rows
+            by :func:`pad_gated_residual_projection_weight` during loading.
         up_weight: Mix-up weight shaped
             ``[hc_count * hidden_size, lowrank]``.
         hc_count: Number of residual branches.
         hidden_size: Width of one branch.
         lowrank: Rank of the mix gate bottleneck.
+        projection_rows: Logical weight rows, either ``lowrank`` without
+            injection or ``lowrank + hc_count`` with injection. Storage
+            padding does not contribute inject logits.
         weights_independent: Whether both weights are already ready and remain
             unchanged within forward, permitting weight TMA before the activation
             producer completes. Pass False when a preceding PDL kernel may write
@@ -412,11 +457,17 @@ def gated_residual_mix(
             f"[{lowrank} or {lowrank + hc_count}, {wide}], got "
             f"{tuple(projection_weight.shape)}"
         )
-    projection_rows = int(projection_weight.shape[0])
     if projection_rows not in (lowrank, lowrank + hc_count):
         raise ValueError(
-            f"projection_weight has {projection_rows} rows; expected {lowrank} "
+            f"projection_rows is {projection_rows}; expected {lowrank} "
             f"or {lowrank + hc_count}"
+        )
+    alignment = 8 if projection_weight.dtype in (_torch.bfloat16, _torch.float16) else 1
+    padded_rows = (projection_rows + alignment - 1) // alignment * alignment
+    if projection_weight.shape[0] not in (projection_rows, padded_rows):
+        raise ValueError(
+            f"projection_weight has {projection_weight.shape[0]} stored rows; "
+            f"expected {projection_rows} or {padded_rows}"
         )
     if up_weight.shape != (wide, lowrank):
         raise ValueError(
@@ -465,6 +516,7 @@ def gated_residual_mix(
             hc_count,
             hidden_size,
             lowrank,
+            projection_rows,
             projection_scale,
             weights_independent,
         )
@@ -656,6 +708,60 @@ def mhc_apply_pre(
         solution=None,
     )
     return kernel(residual, pre, norm_weight=norm_weight, norm_eps=norm_eps)
+
+
+def mhc_apply_pre_quantize_fp8(
+    residual: _torch.Tensor,
+    pre: _torch.Tensor,
+    norm_weight: _torch.Tensor,
+    norm_eps: float,
+) -> tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor]:
+    """``mhc_apply_pre`` with RMSNorm that also quantizes its output.
+
+    The output is quantized like ``quantize_fp8(granularity="token_group",
+    group_size=32, scale_encoding="ue8m0")``. A fused kernel is used when one
+    is registered; otherwise the two ops run back to back.
+
+    Args:
+        residual: Contiguous BF16 residual streams ``[..., hc_mult, H]``.
+        pre: Contiguous FP32 pre coefficients ``[..., hc_mult]``.
+        norm_weight: RMSNorm weight ``[H]``.
+        norm_eps: RMSNorm epsilon.
+
+    Returns:
+        BF16 layer input ``[..., H]``, E4M3 codes ``[tokens, H]`` and uint8
+        UE8M0 scales ``[tokens, H / 32]``.
+    """
+    if pre.shape != residual.shape[:-1]:
+        raise ValueError("mhc_apply_pre requires pre shaped like residual[..., :, 0]")
+    try:
+        kernel = select_kernel(
+            "residual",
+            "mhc_apply_pre_fp8_group32",
+            format_signature(
+                residual=dense_tensor_format(residual.dtype),
+                pre=dense_tensor_format(pre.dtype),
+            ),
+            traits={
+                "buffer_offsets_fit_int32": residual.numel() < 2**31,
+                "hc_mult": int(residual.shape[-2]),
+            },
+            override=None,
+            solution=None,
+        )
+    except NoKernelFoundError:
+        out = mhc_apply_pre(residual, pre, norm_weight=norm_weight, norm_eps=norm_eps)
+        codes, scales = quantize_fp8(
+            out.reshape(-1, out.shape[-1]),
+            granularity="token_group",
+            group_size=32,
+            scale_encoding="ue8m0",
+            enable_pdl=False,
+            override=None,
+            solution=None,
+        )
+        return out, codes, scales
+    return kernel(residual, pre, norm_weight, norm_eps)
 
 
 def mhc_pre(
@@ -859,11 +965,19 @@ def mhc_fused_hc(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.residual.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.residual._cute_dsl.gated_boundary  # noqa: E402,F401
+import tokenspeed_kernel.ops.residual._triton.gated_boundary  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.cute_fused  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.torch  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.triton  # noqa: E402,F401
+from tokenspeed_kernel.ops.residual.gated_boundary import (  # noqa: E402
+    boundary_gathers_mailbox,
+    post_norm_residual_pre_norm,
+    post_norm_residual_pre_norm_bf16,
+    residual_gate_coefficients,
+)
 
 # isort: on
 
@@ -871,13 +985,19 @@ import tokenspeed_kernel.ops.residual.triton  # noqa: E402,F401
 __all__ = [
     "attn_res_fwd",
     "attn_res_fwd_available",
+    "boundary_gathers_mailbox",
     "gated_residual_combine",
     "gated_residual_mix",
     "mhc_apply_pre",
+    "mhc_apply_pre_quantize_fp8",
     "mhc_fused_hc",
     "mhc_mixes",
     "mhc_post",
     "mhc_pre",
+    "pad_gated_residual_projection_weight",
+    "post_norm_residual_pre_norm",
+    "post_norm_residual_pre_norm_bf16",
+    "residual_gate_coefficients",
 ]
 
 
