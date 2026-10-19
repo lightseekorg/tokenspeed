@@ -654,15 +654,18 @@ def test_pool_staged_verify_scratch_keeps_the_serving_concurrency(monkeypatch) -
 
 
 def test_each_refusal_turns_the_probe_off_and_names_itself() -> None:
-    def refusal(disable=False, eager=False):
+    def refusal(disable=False, eager=False, memory_saver=False):
         args = SimpleNamespace(
-            disable_cudagraph_memory_reserve=disable, enforce_eager=eager
+            disable_cudagraph_memory_reserve=disable,
+            enforce_eager=eager,
+            enable_memory_saver=memory_saver,
         )
         return device._cudagraph_probe_refusal(args)
 
     assert refusal() is None
     assert "--disable-cudagraph-memory-reserve" in refusal(disable=True)
     assert "--enforce-eager" in refusal(eager=True)
+    assert "tagged CUDA-graph probe pool" in refusal(memory_saver=True)
 
 
 if __name__ == "__main__":

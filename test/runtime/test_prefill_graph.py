@@ -161,6 +161,7 @@ class TestPrefillCaptureArgsTest:
             decode_only_attention=False,
             query_shard_size=1,
             query_shard_rank=0,
+            enable_memory_saver=False,
         )
         with pytest.raises((TypeError), match=("prefill_graph_capture_batch_sizes")):
             ModelExecutorConfig(**config_args)
@@ -1383,6 +1384,7 @@ class TestPrefillRoleGraphsTest:
             enable_speculative_sampling=False,
             query_shard_size=1,
             query_shard_rank=0,
+            enable_memory_saver=False,
             prefill_graph_max_tokens=256,
         )
 

@@ -63,6 +63,7 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.drafter.base import BaseDrafter
@@ -223,6 +224,11 @@ class ForwardStepRunner:
         self.enable_cudagraph_gc = config.enable_cudagraph_gc
         self.device = config.device
         self.device_module = torch.get_device_module(self.device)
+        # Decode graphs capture into the memory saver's ``cuda_graph`` region
+        # so a sleep release can free their pool (a no-op adapter otherwise).
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=config.enable_memory_saver
+        )
         self.gpu_id = config.gpu_id
         self.global_rank = config.global_rank
         # Physical extent: capture tables must cover the spec-verify overshoot
@@ -647,14 +653,25 @@ class ForwardStepRunner:
         global _is_capture_mode
         _is_capture_mode = True
         global global_graph_memory_pool
-        graph_kwargs = {"auto_dispatch_capture": True} if self.device == "npu" else {}
+        if self.device == "npu":
+            graph_capture = self.device_module.graph(
+                graph,
+                pool=global_graph_memory_pool,
+                stream=self.stream,
+                auto_dispatch_capture=True,
+            )
+        else:
+            # Only the graph's private pool joins the ``cuda_graph`` region:
+            # capture_session's pre-zeroed kernel state is allocated before
+            # the capture starts and stays resident across a release.
+            graph_capture = self.memory_saver_adapter.cuda_graph(
+                graph,
+                pool=global_graph_memory_pool,
+                stream=self.stream,
+                tag="cuda_graph",
+            )
         # The kernel state captured launches need lives as long as the graph.
-        with observer, capture_session(graph), self.device_module.graph(
-            graph,
-            pool=global_graph_memory_pool,
-            stream=self.stream,
-            **graph_kwargs,
-        ):
+        with observer, capture_session(graph), graph_capture:
             out = run_once()
 
         self.device_module.synchronize()

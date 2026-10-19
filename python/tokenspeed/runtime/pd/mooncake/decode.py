@@ -27,6 +27,7 @@ from dataclasses import dataclass
 import numpy as np
 import requests
 
+from tokenspeed.runtime.pd.base.mooncake_engine import MooncakeTransferEngine
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
     CacheTransferContract,
@@ -124,6 +125,31 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         # The status and heartbeat threads read every field above, so publish
         # their sockets only after the manager is fully initialized.
         self.start_decode_thread()
+
+    def restore_buffer_registration(self) -> None:
+        """Register the arena under a fresh transfer session after a wake.
+
+        Decode memory is the target of the prefill node's RDMA writes, and the
+        prefill engine caches each decode session's memory descriptors,
+        remote keys included. Re-registering under the same session would
+        leave it writing with the keys of the freed pages, so a new engine --
+        a new session -- takes the registration, and the connection pool is
+        cleared so the next request registers that session with the prefill
+        node again.
+        """
+        old_engine = self.engine
+        self.engine = MooncakeTransferEngine(
+            hostname=old_engine.hostname,
+            gpu_id=old_engine.gpu_id,
+            ib_device=old_engine.ib_device,
+        )
+        super().restore_buffer_registration()
+        with self.connection_lock:
+            self.connection_pool.clear()
+        logger.info(
+            "Mooncake decode session refreshed after wake: "
+            f"{old_engine.get_session_id()} -> {self.engine.get_session_id()}"
+        )
 
     def start_decode_thread(self):
         self.bind_server_socket(get_local_ip_by_remote())

@@ -42,7 +42,11 @@ from tokenspeed.runtime.engine.eplb_hooks import (
     make_expert_rebalance_controller,
     rebalance_release_refusal,
 )
-from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
+from tokenspeed.runtime.engine.memory_occupation import (
+    VALID_TAGS,
+    MemoryOccupationController,
+    MemoryRegion,
+)
 from tokenspeed.runtime.engine.pause import PauseController
 from tokenspeed.runtime.moe.eplb_algorithms import EplbAlgorithm
 from tokenspeed.runtime.moe.expert_location import ExpertLoadSnapshot
@@ -350,8 +354,13 @@ class _Adapter:
     def __init__(self):
         self.paused = []
 
-    def pause(self, tag):
-        self.paused.append(tag)
+    def regions(self):
+        return {
+            tag: MemoryRegion(
+                release=lambda tag=tag: self.paused.append(tag), resume=lambda: None
+            )
+            for tag in VALID_TAGS
+        }
 
 
 def _drained_scheduler():
@@ -370,11 +379,11 @@ def test_memory_release_is_refused_mid_rebalance_and_waits_for_chunks():
     memory = MemoryOccupationController(
         send_func=sender,
         pause_controller=pause,
-        adapter=adapter,
+        regions=adapter.regions(),
         enabled=True,
         reset_caches_fn=lambda: True,
-        kv_repair_fn=lambda: None,
-        weights_release_refusal_fn=rebalance_release_refusal(controller),
+        transfers_idle_fn=lambda: True,
+        release_refusal_fn=rebalance_release_refusal(controller),
         weights_busy_fn=lambda: controller.is_applying,
     )
     # Not idle: refused outright, nothing drained.
