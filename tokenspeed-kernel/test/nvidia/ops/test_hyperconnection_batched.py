@@ -24,6 +24,7 @@ from unittest import mock
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.residual import torch_hyperconnection_mix
 from tokenspeed_kernel.ops.residual import cute_fused, gated_residual_mix
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
@@ -63,11 +64,8 @@ def inputs(rows, dtype, has_inject):
 
 
 def reference(values, scale):
-    x, w, u = (value.cpu().double() for value in values)
-    down = (x @ w.T) * scale
-    gates = torch.nn.functional.silu(down[:, :320]) @ u.T
-    mixed = (gates.sigmoid() * x).reshape(-1, 4, 2560).mean(1)
-    return mixed, down[:, 320:] if w.shape[0] == 324 else None
+    x, w, u = (value.cpu() for value in values)
+    return torch_hyperconnection_mix(x, w, u, 4, 2560, 320, w.shape[0], scale, True)
 
 
 def check(result, expected, dtype):

@@ -215,31 +215,26 @@ def kernel_override_env_key(family: str, mode: str) -> str:
 
 
 def validate_context_parallel_roles(
-    *, kvp_size: int, dcp_size: int, qcp_size: int, disaggregation_mode: str
+    *,
+    kvp_size: int,
+    dcp_size: int,
+    qcp_size: int,
+    disaggregation_mode: str,
+    enable_mixed_batch: bool,
 ) -> None:
-    """Pin the three context-parallel sizes to the PD roles that serve them.
+    """Validate KVP/DCP roles and the PD-prefill-only QCP layout.
 
-    KVP (``--kv-parallel-size``) is the storage layout: a PD prefill or decode
-    engine shards its pages (a transfer edge copies only the pages both its
-    ranks own, so the two caches shard independently); an aggregated engine
-    does not, because reading a sharded cache in steady-state decode is the
-    decode role's compute below. DCP (``--decode-context-parallel-size``)
-    names that compute -- attend the owned pages, merge the partials by LSE
-    -- and is the only way a decode engine reads a sharded cache, so on the
-    decode role the two sizes come together and equal. QCP
-    (``--query-context-parallel-size``) names the prefill role's query-row
-    sharding over the same sharded pages; a prefill engine may also shard
-    its pages without it (chunked history gather).
+    Aggregated and PD decode engines require explicit DCP matching KVP.
+    Aggregated DCP requires separate prefill and decode rounds.
     """
     if dcp_size < 1:
         raise ValueError(
             f"--decode-context-parallel-size must be a positive integer, got {dcp_size}"
         )
-    if kvp_size > 1 and disaggregation_mode not in ("prefill", "decode"):
+    if kvp_size > 1 and disaggregation_mode not in ("null", "prefill", "decode"):
         raise ValueError(
-            "--kv-parallel-size > 1 requires --disaggregation-mode prefill or "
-            f"decode (got {disaggregation_mode!r}): decode over sharded pages is "
-            "--decode-context-parallel-size, which serves the decode role only"
+            "--kv-parallel-size > 1 requires --disaggregation-mode null, prefill "
+            f"or decode (got {disaggregation_mode!r})"
         )
     if qcp_size > 1:
         if disaggregation_mode != "prefill":
@@ -257,10 +252,10 @@ def validate_context_parallel_roles(
                 "splits by the page owners of the whole shard group"
             )
     if dcp_size > 1:
-        if disaggregation_mode != "decode":
+        if disaggregation_mode not in ("null", "decode"):
             raise ValueError(
                 "--decode-context-parallel-size > 1 requires --disaggregation-mode "
-                f"decode (got {disaggregation_mode!r})"
+                f"null or decode (got {disaggregation_mode!r})"
             )
         if dcp_size != kvp_size:
             raise ValueError(
@@ -269,9 +264,14 @@ def validate_context_parallel_roles(
                 "group owns pages of every request, so all of them merge the "
                 "partials"
             )
-    elif kvp_size > 1 and disaggregation_mode == "decode":
+        if disaggregation_mode == "null" and enable_mixed_batch:
+            raise ValueError(
+                "Aggregated DCP does not support --enable-mixed-batch; "
+                "remove it to schedule prefill and decode separately"
+            )
+    elif kvp_size > 1 and disaggregation_mode in ("null", "decode"):
         raise ValueError(
-            "--kv-parallel-size > 1 on --disaggregation-mode decode requires "
+            f"--kv-parallel-size > 1 on --disaggregation-mode {disaggregation_mode} requires "
             f"--decode-context-parallel-size {kvp_size}: decode over sharded "
             "pages is DCP, and the launch names it explicitly"
         )
@@ -560,9 +560,9 @@ class ServerArgs:
     use_trtllm_ragged_deepseek_prefill: bool | None = None
 
     # KV parallelism: shard the full-history KV pages page-cyclically over a
-    # consecutive subgroup of attention TP (1 = off; PD roles only).
+    # consecutive subgroup of attention TP (1 = off).
     kv_parallel_size: int = 1
-    # Decode context parallelism on the PD decode role: attend the owned
+    # Decode context parallelism in aggregated or PD decode engines: attend owned
     # pages and merge the partials across the KVP group (1 = off; equals
     # kv_parallel_size when on). Names the compute; the backends key the DCP
     # path on the mapping's kvp_size, which the drafter's steps on a sharded
@@ -1150,6 +1150,7 @@ class ServerArgs:
             dcp_size=self.decode_context_parallel_size,
             qcp_size=self.mapping.attn.qcp_size,
             disaggregation_mode=self.disaggregation_mode,
+            enable_mixed_batch=self.enable_mixed_batch,
         )
         validate_qcp(
             qcp_size=self.mapping.attn.qcp_size,
@@ -2561,7 +2562,8 @@ class ServerArgs:
             action="store_true",
             dest="enable_mixed_batch",
             default=ServerArgs.enable_mixed_batch,
-            help="Allow the scheduler to issue prefill and decode requests in the same iteration.",
+            help="Allow the scheduler to issue prefill and decode requests in the "
+            "same iteration. Not supported with aggregated DCP.",
         )
         parser.add_argument(
             "--prefix-granularity",
@@ -3664,9 +3666,9 @@ class ServerArgs:
             help="KV parallelism (KVP): shard full-history KV pages (MLA/DSA "
             "latent, DeepSeek V4 compressed KV) cyclically over a consecutive "
             "subgroup of attention TP, each rank storing one shard of every "
-            "request's pages. Must divide --attn-tp-size. PD roles only: the "
-            "decode role reads the shards with --decode-context-parallel-size "
-            "(required there, equal to this), the prefill role writes them and "
+            "request's pages. Must divide --attn-tp-size. Aggregated and PD "
+            "decode engines require equal --decode-context-parallel-size; "
+            "the PD prefill role writes the shards and "
             "may split its query rows over them with "
             "--query-context-parallel-size. Works with the Host KVStore and the "
             "retraction snapshot pool; not with L3 storage "
@@ -3676,12 +3678,11 @@ class ServerArgs:
             "--decode-context-parallel-size",
             type=int,
             default=ServerArgs.decode_context_parallel_size,
-            help="Decode context parallelism (DCP) on the PD decode role: every "
+            help="Decode context parallelism (DCP) in aggregated or PD decode engines: every "
             "rank attends the KV pages it owns under --kv-parallel-size and the "
             "partials are merged across the KVP group by their log-sum-exp. "
-            "Requires --disaggregation-mode decode and must equal "
-            "--kv-parallel-size, which requires it in turn on that role (a "
-            "sharded cache has no other decode).",
+            "Requires --disaggregation-mode null or decode and must equal "
+            "--kv-parallel-size. Aggregated DCP does not support --enable-mixed-batch.",
         )
         parser.add_argument(
             "--attn-head-tp-size",

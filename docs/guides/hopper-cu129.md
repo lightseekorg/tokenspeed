@@ -74,7 +74,7 @@ The normal checkout pins remain authoritative, including the updated
 The kernel build uses that adjusted dependency metadata, skips its default
 build-time pip install, and rebuilds the in-tree CUDA kernels for `sm90a`.
 Each kernel group records its successful build's CUDA toolkit, compiler paths,
-architecture/compile flags and library search paths. Returning to a CUDA 13
+architecture/compile flags, and library search paths. Returning to a CUDA 13
 build invalidates CUDA 12 artifacts even when their timestamps are newer than
 the sources. Missing or invalid identities also trigger a rebuild. The kernel
 build removes the old identity before rebuilding and publishes a new one only

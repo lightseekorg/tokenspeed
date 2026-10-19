@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.activation import torch_silu_and_mul
+from tokenspeed_kernel.numerics.torch.moe import torch_moe_experts
+from tokenspeed_kernel.ops.moe.native import torch_softmax_topk
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -48,28 +51,33 @@ REL_TOL = 2e-2
 
 
 def _routing_softmax_topk(logits: torch.Tensor, topk: int):
-    """Reference router: softmax over experts then renormalised top-k."""
-    probs = torch.softmax(logits.float(), dim=-1)
-    weights, ids = torch.topk(probs, topk, dim=-1)
-    weights = weights / weights.sum(dim=-1, keepdim=True)
-    return ids.to(torch.int32), weights.to(torch.float32)
-
-
-def _torch_moe_ref(hidden, w1, w2, topk_ids, topk_weights) -> torch.Tensor:
-    """Golden fp32 MoE FFN: y[t] = sum_s w * (silu(h@wg) * (h@wu)) @ wd."""
-    hf, w1f, w2f = hidden.float(), w1.float(), w2.float()
-    i_r = w2.shape[2]
-    ids, wts = topk_ids.cpu(), topk_weights.float().cpu()
-    out = torch.zeros(
-        hidden.shape[0], w2.shape[1], dtype=torch.float32, device=hidden.device
+    """Softmax router with renormalised top-k weights."""
+    weights, ids = torch_softmax_topk(
+        router_logits=logits,
+        topk=topk,
+        topk_indices_dtype=torch.int32,
+        renormalize=True,
+        routed_scaling_factor=1.0,
     )
-    for t in range(hidden.shape[0]):
-        for s in range(TOPK):
-            e = int(ids[t, s])
-            g = hf[t] @ w1f[e].T
-            inter = torch.nn.functional.silu(g[:i_r]) * g[i_r:]
-            out[t] += float(wts[t, s]) * (inter @ w2f[e].T)
-    return out
+    return ids, weights
+
+
+def _torch_moe_ref(x, w13, w2, topk_ids, topk_weights) -> torch.Tensor:
+    """Golden fp32 MoE FFN: y[t] = sum_s w * (silu(h@wg) * (h@wu)) @ wd."""
+    return torch_moe_experts(
+        x,
+        w13,
+        w2,
+        topk_ids,
+        topk_weights,
+        activation=lambda gate_up: torch_silu_and_mul(gate_up, None),
+        w13_bias=None,
+        w2_bias=None,
+        quantize_input=None,
+        quantize_intermediate=None,
+        round_expert_output=None,
+        first_expert=0,
+    )
 
 
 def _build(num_tokens: int, seed: int = 0, i_r: int = I_R, hidden_size: int = D):

@@ -1884,8 +1884,8 @@ class ModelExecutor:
                     batch_size=padded_bs,
                     total_tokens=padded_bs * self.config.output_length,
                 )
-                # Captured hostfunc pops one entry per replay; push a dummy
-                # for this idle replay, same as run_once.
+                # Captured hostfunc pops one gate decision per replay; add a
+                # dummy for this idle replay, same as run_once.
                 if self.capturable_grammar is not None:
                     self.capturable_grammar.add_batch(
                         grammars=[None] * padded_bs,

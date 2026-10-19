@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.layernorm import (
+    torch_fused_qk_rmsnorm_rope,
+    torch_qk_rmsnorm,
+    torch_rmsnorm,
+    torch_weightless_rmsnorm,
+)
 from tokenspeed_kernel.ops.layernorm import add_rmsnorm, grouped_rmsnorm
 from tokenspeed_kernel.ops.layernorm.triton import (
     _add_rmsnorm_kernel,
@@ -33,9 +39,7 @@ def test_rmsnorm(dtype: torch.dtype, hidden_size: int, device: str) -> None:
 
     out = rmsnorm(x, weight, eps)
 
-    x_float = x.to(torch.float32)
-    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-    ref = (x_float * torch.rsqrt(variance + eps) * weight).to(dtype)
+    ref = torch_rmsnorm(x, weight, eps)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
@@ -52,10 +56,7 @@ def test_rmsnorm_with_residual(
 
     out, residual_out = rmsnorm(x, weight, eps, residual=residual)
 
-    x_float = x.to(torch.float32) + residual.to(torch.float32)
-    ref_residual = x_float.to(dtype)
-    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-    ref = (x_float * torch.rsqrt(variance + eps) * weight).to(dtype)
+    ref, ref_residual = torch_rmsnorm(x, weight, eps, residual)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(residual_out, ref_residual, atol=2e-2, rtol=2e-2)
 
@@ -153,12 +154,9 @@ def test_grouped_rmsnorm_matches_per_head_reference(
 
     actual = grouped_rmsnorm(x, shape[-1], eps, out=x)
 
-    reference_float = reference_input.float()
-    reference = reference_float * torch.rsqrt(
-        reference_float.square().mean(-1, keepdim=True) + eps
-    )
+    reference = torch_weightless_rmsnorm(reference_input, eps, dtype)
     assert actual is x
-    torch.testing.assert_close(actual, reference.to(dtype), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual, reference, atol=2e-2, rtol=2e-2)
 
 
 def test_grouped_rmsnorm_cuda_graph_replays(device: str) -> None:
@@ -176,20 +174,8 @@ def test_grouped_rmsnorm_cuda_graph_replays(device: str) -> None:
     reference_input = x.clone()
     graph.replay()
     torch.cuda.synchronize()
-    reference_float = reference_input.float()
-    reference = reference_float * torch.rsqrt(
-        reference_float.square().mean(-1, keepdim=True) + eps
-    )
-    torch.testing.assert_close(x, reference.to(x.dtype), atol=2e-2, rtol=2e-2)
-
-
-def _gemma_ref(
-    x: torch.Tensor, w: torch.Tensor, head_dim: int, eps: float, dtype: torch.dtype
-) -> torch.Tensor:
-    x_by_head = x.reshape(-1, head_dim).to(torch.float32)
-    variance = x_by_head.pow(2).mean(dim=-1, keepdim=True)
-    out = x_by_head * torch.rsqrt(variance + eps) * (1.0 + w)
-    return out.to(dtype).view(x.shape)
+    reference = torch_weightless_rmsnorm(reference_input, eps, x.dtype)
+    torch.testing.assert_close(x, reference, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -215,12 +201,9 @@ def test_qk_rmsnorm_gemma_weight_matches_two_calls(
 
     q_out, k_out = qk_rmsnorm(q, k, q_weight, k_weight, eps, weight_offset=1.0)
 
-    torch.testing.assert_close(
-        q_out, _gemma_ref(q, q_weight, head_dim, eps, dtype), atol=2e-2, rtol=2e-2
-    )
-    torch.testing.assert_close(
-        k_out, _gemma_ref(k, k_weight, head_dim, eps, dtype), atol=2e-2, rtol=2e-2
-    )
+    q_ref, k_ref = torch_qk_rmsnorm(q, k, q_weight, k_weight, eps, 1.0)
+    torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(k_out, k_ref, atol=2e-2, rtol=2e-2)
 
 
 def test_qk_rmsnorm_gemma_weight_strided_qkv_split(device: str) -> None:
@@ -248,12 +231,9 @@ def test_qk_rmsnorm_gemma_weight_strided_qkv_split(device: str) -> None:
 
     q_out, k_out = qk_rmsnorm(q, k, q_weight, k_weight, eps, weight_offset=1.0)
 
-    torch.testing.assert_close(
-        q_out, _gemma_ref(q, q_weight, head_dim, eps, dtype), atol=2e-2, rtol=2e-2
-    )
-    torch.testing.assert_close(
-        k_out, _gemma_ref(k, k_weight, head_dim, eps, dtype), atol=2e-2, rtol=2e-2
-    )
+    q_ref, k_ref = torch_qk_rmsnorm(q, k, q_weight, k_weight, eps, 1.0)
+    torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(k_out, k_ref, atol=2e-2, rtol=2e-2)
 
 
 def test_rmsnorm_reads_strided_rows_in_place(device: str) -> None:
@@ -279,9 +259,7 @@ def test_rmsnorm_inplace(device: str) -> None:
 
     out = rmsnorm(x, weight, eps, out=x)
 
-    x_float = x_ref.to(torch.float32)
-    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-    ref = (x_float * torch.rsqrt(variance + eps) * weight).to(torch.bfloat16)
+    ref = torch_rmsnorm(x_ref, weight, eps)
     assert out.data_ptr() == x.data_ptr()
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
@@ -318,19 +296,6 @@ def _rope(q, k, q_weight, k_weight, cache, positions):
     )
 
 
-def _rope_statements(x, weight, cache, positions):
-    """Per head: FP32 RMSNorm rounded to the input dtype, then NeoX RoPE in FP32."""
-    head_dim = weight.shape[0]
-    heads = x.reshape(x.shape[0], -1, head_dim).float()
-    normed = heads * torch.rsqrt(heads.square().mean(-1, keepdim=True) + 1e-6)
-    normed = (normed * weight.float()).to(x.dtype).float()
-    table = cache[positions.long()][:, None, :]
-    cos, sin = table[..., : head_dim // 2], table[..., head_dim // 2 :]
-    x1, x2 = normed[..., : head_dim // 2], normed[..., head_dim // 2 :]
-    rotated = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
-    return rotated.to(x.dtype).flatten(1)
-
-
 @pytest.mark.parametrize("q_heads,kv_heads", [(48, 8), (6, 1)])
 def test_fused_qk_rmsnorm_rope_matches_the_statements(
     q_heads: int, kv_heads: int, device: str
@@ -342,8 +307,11 @@ def test_fused_qk_rmsnorm_rope_matches_the_statements(
         13, q_heads, kv_heads, device
     )
     fused = _rope(q, k, q_weight, k_weight, cache, positions)
-    for got, x, weight in zip(fused, (q, k), (q_weight, k_weight), strict=True):
-        want = _rope_statements(x, weight, cache, positions)
+    head_dim = q_weight.shape[0]
+    reference = torch_fused_qk_rmsnorm_rope(
+        q, k, q_weight, k_weight, cache, positions, 1e-6, q_heads, kv_heads, head_dim
+    )
+    for got, want in zip(fused, reference, strict=True):
         torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
     contiguous = _rope(
         q.contiguous(), k.contiguous(), q_weight, k_weight, cache, positions
@@ -371,9 +339,7 @@ def test_reference_rmsnorm_matches_eager_cast_order(
     x[0] *= 1e-3
     x[1] *= 1e3
     weight = (torch.rand(hidden_size, device=device) + 0.5).to(torch.bfloat16)
-    values = x.float()
-    values = values * torch.rsqrt(values.square().mean(-1, keepdim=True) + eps)
-    expected = (weight.float() * values).to(dtype)
+    expected = torch_rmsnorm(x, weight, eps)
     out = reference_rmsnorm(x, weight, eps, None)
     if dtype == torch.float32:
         torch.testing.assert_close(out, expected, rtol=2e-6, atol=0)

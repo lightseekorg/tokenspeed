@@ -21,7 +21,7 @@ pip install "tokenspeed[instanttensor]"
 On aarch64 hosts (GB200, GB300) there is no published wheel, but the sdist
 builds from source in about a minute. The extension reaches CUDA, cuFile, and
 NCCL through `dlopen` and vendors its own Boost, libaio, and liburing, so it
-needs a C++ toolchain and `make` -- not `nvcc`, and not a matching CUDA
+needs a C++ toolchain and `make` — not `nvcc`, and not a matching CUDA
 toolkit:
 
 ```bash
@@ -29,7 +29,7 @@ pip install --no-binary instanttensor "tokenspeed[instanttensor]"
 ```
 
 This is why the dependency is an extra rather than a core one: as a core
-dependency every ARM install would compile it, whether or not anyone ever
+dependency, every ARM install would compile it, whether or not anyone ever
 requests the format.
 
 TokenSpeed imports it lazily, so it loads only when you select
@@ -57,13 +57,13 @@ tokenspeed serve deepseek-ai/DeepSeek-R1 \
 Weight-load phase for Kimi-K3 (1.42 TiB over 96 shards, 497k tensors) on two
 GB300 nodes with `--tensor-parallel-size 8`, checkpoint on shared storage:
 
-| `--load-format` | weight-load phase |
+| `--load-format` | Weight-load phase |
 | --- | --- |
 | `auto` (safetensors) | 869-1106 s |
 | `instanttensor` | 231-234 s |
 
 The ranges are run-to-run variance on the shared filesystem. Both formats
-serve identical output, as the loaders are bit-for-bit equivalent.
+serve identical output, because the loaders are bit-for-bit equivalent.
 
 ## Memory considerations
 
@@ -72,7 +72,7 @@ the default safetensors loader stages the full tensor in host (CPU) memory and
 copies only the current rank's shard to the GPU. InstantTensor's own overhead is
 small: it uses a GPU staging buffer (dynamically sized, configurable) that it
 releases before the KV cache sizing, plus a little fixed runtime overhead, so
-its post-load GPU footprint is close to the default loader.
+its post-load GPU footprint is close to the default loader's.
 
 Because tensors land on the GPU, a model's `load_weights` must **consume the
 weight iterator lazily** — copying each tensor into its (pre-allocated)

@@ -27,6 +27,14 @@ import tokenspeed_kernel.ops.attention.qsa as qsa_api
 import tokenspeed_kernel.ops.attention.qsa.triton as qsa_ops
 import torch
 from tokenspeed_kernel._triton import triton
+from tokenspeed_kernel.numerics.torch.attention.qsa import (
+    qsa_logits_topk_ids,
+    qsa_stream_topk_ids,
+    torch_qsa_paged_block_scores,
+    torch_qwen4_exp_qsa_pool_compress,
+    torch_qwen4_exp_qsa_recent_rows,
+    torch_qwen4_exp_qsa_rope,
+)
 from tokenspeed_kernel.ops.attention.qsa import qwen4_exp_qsa_block_topk
 from tokenspeed_kernel.ops.attention.qsa.triton import (
     _qwen4_exp_qsa_merge_block_topk_kernel,
@@ -140,44 +148,23 @@ def _ref_compress_pool(
     recent_page_size,
     ratio,
 ):
-    rows = logical.shape[0]
-    raw_pages = recent_locs.long().clamp_min(0) // recent_page_size
-    row_ids = torch.arange(rows, device=logical.device)
-    offsets = torch.arange(ratio - 1, -1, -1, device=logical.device)
-    source_rows = row_ids.unsqueeze(1) - offsets
-    safe_source = source_rows.clamp(min=0, max=max(rows - 1, 0))
-    expected = logical.unsqueeze(1) - offsets
-    from_current = source_rows >= 0
-    if rows:
-        from_current &= requests[safe_source] == requests.unsqueeze(1)
-        from_current &= logical[safe_source] == expected
-    raw_slots = torch.remainder(expected, ratio).long()
-    cached = raw[raw_pages.unsqueeze(1), raw_slots]
-    current = token_k[safe_source].to(raw.dtype)
-    group = torch.where(from_current.view(rows, ratio, 1, 1), current, cached)
-    pooled = group.float().mean(dim=1).to(raw.dtype)
-    cached_first = position_cache[raw_pages]
-    current_first = position_values[safe_source[:, 0]]
-    first = torch.where(from_current[:, :1], current_first, cached_first)
-    return pooled, first
+    return torch_qwen4_exp_qsa_pool_compress(
+        token_k,
+        logical,
+        requests,
+        recent_locs,
+        raw,
+        position_values,
+        position_cache,
+        recent_page_size=recent_page_size,
+        ratio=ratio,
+    )
 
 
 def _ref_rope(tensor, positions, cos_sin_cache, rotary_dim, sections=None):
-    if positions.ndim == 2 and sections is None:
-        positions = positions[0]
-    cos, sin = cos_sin_cache[positions.long()].chunk(2, dim=-1)
-    if positions.ndim == 2:
-        cos = torch.cat(
-            [part[axis] for axis, part in enumerate(cos.split(sections, -1))], dim=-1
-        )
-        sin = torch.cat(
-            [part[axis] for axis, part in enumerate(sin.split(sections, -1))], dim=-1
-        )
-    first, second = tensor[..., :rotary_dim].chunk(2, dim=-1)
-    cos = cos.unsqueeze(-2).to(tensor.dtype)
-    sin = sin.unsqueeze(-2).to(tensor.dtype)
-    rotated = torch.cat((first * cos - second * sin, second * cos + first * sin), -1)
-    return torch.cat((rotated, tensor[..., rotary_dim:]), dim=-1)
+    return torch_qwen4_exp_qsa_rope(
+        tensor, positions, cos_sin_cache, rotary_dim, sections
+    )
 
 
 def test_qwen4_exp_qsa_compress_and_store_matches_torch(device: str) -> None:
@@ -548,33 +535,19 @@ def _ref_recent_write(
     write_mask=None,
     request_limit=None,
 ):
-    raw = raw.clone()
-    position_cache = position_cache.clone()
-    rows = logical.shape[0]
-    if write_mask is None:
-        mask = recent_locs > 0
-    else:
-        mask = write_mask.clone()
-    if rows:
-        row_ids = torch.arange(rows, device=logical.device)
-        future = row_ids + ratio
-        has_future = future < rows
-        safe_future = future.clamp(max=rows - 1)
-        has_future &= mask[safe_future]
-        has_future &= requests[safe_future] == requests
-        has_future &= logical[safe_future] == logical + ratio
-        mask = mask & ~has_future
-    if request_limit is not None:
-        mask &= requests < request_limit
-    pages = recent_locs.long().clamp_min(0) // recent_page_size
-    slots = torch.remainder(logical.long(), ratio)
-    for row in range(rows):
-        if not bool(mask[row]):
-            continue
-        raw[pages[row], slots[row]] = token_k[row].to(raw.dtype)
-        if slots[row] == 0:
-            position_cache[pages[row]] = position_values[row]
-    return raw, position_cache
+    return torch_qwen4_exp_qsa_recent_rows(
+        token_k,
+        logical,
+        requests,
+        recent_locs,
+        position_values,
+        raw,
+        position_cache,
+        recent_page_size=recent_page_size,
+        ratio=ratio,
+        write_mask=write_mask,
+        request_limit=request_limit,
+    )
 
 
 def test_qwen4_exp_qsa_recent_write_matches_torch(device: str) -> None:
@@ -881,51 +854,17 @@ def _block_topk_reference_scores(
     num_blocks: int,
 ) -> list[torch.Tensor]:
     """Per-row FP32 block scores with ``-inf`` outside ``complete_blocks``."""
-
-    block_ids = torch.arange(num_blocks, device=query.device)
-    columns = block_ids // page_size
-    offsets = block_ids % page_size
-    scores_per_row = []
-    for row in range(query.shape[0]):
-        pages = page_table[requests[row]][columns].long()
-        slots = pages * page_size + offsets
-        gathered = key_cache[slots, 0]
-        scores = torch.relu(
-            torch.einsum("hd,nd->hn", query[row].float(), gathered.float())
-        ).sum(dim=0)
-        valid = block_ids < complete_blocks[row]
-        scores = torch.where(
-            valid, scores, torch.tensor(float("-inf"), device=query.device)
-        )
-        scores_per_row.append(scores)
-    return scores_per_row
-
-
-def _expected_stream_ids(scores: torch.Tensor, k: int) -> list[int]:
-    """Reference ids under the stream path's tie-breaking.
-
-    Packed keys are ``(score_bits + 1) << 32 | block_id`` with zero reserved
-    for invalid rows, so equal fp32 bits prefer the larger block id.
-    """
-
-    ids = torch.arange(scores.shape[0], device=scores.device)
-    bits = scores.contiguous().view(torch.int32).to(torch.int64)
-    packed = ((bits + 1) << 32) | ids.to(torch.int64)
-    packed = torch.where(torch.isfinite(scores), packed, torch.zeros_like(packed))
-    top = torch.topk(packed, k).values
-    return [int(v & 0xFFFFFFFF) for v in top.tolist() if v != 0]
+    table = page_table[:, : -(-num_blocks // page_size)]
+    scores = torch_qsa_paged_block_scores(
+        query, key_cache, table, requests, complete_blocks, page_size=page_size
+    )
+    return list(scores[:, :num_blocks].unbind(0))
 
 
 def _expected_logits_ids(scores: torch.Tensor, k: int, n_cols_padded: int) -> list[int]:
-    """Reference ids under the DSA selection kernel's tie-breaking.
-
-    The selection kernel packs ``ordered_key << 32 | (n_cols_padded -
-    offset)``, so equal scores prefer the smaller block id and ``-inf``
-    never wins; a stable descending sort is the same ordering.
-    """
-
-    order = torch.argsort(scores, descending=True, stable=True)
-    return [int(i) for i in order[:k].tolist() if torch.isfinite(scores[int(i)])]
+    """Reference ids under the DSA selection kernel's tie-breaking (the
+    padded width only fixes the kernel's packing)."""
+    return qsa_logits_topk_ids(scores, k)
 
 
 @pytest.mark.parametrize("query_group_size", [1, 4])
@@ -1378,7 +1317,7 @@ def test_qwen4_exp_qsa_block_topk_logits_matches_stream(device: str) -> None:
         got_logits = sorted(int(v) for v in logits[row] if v >= 0)
         assert len(got_stream) == expected_len
         assert len(got_logits) == expected_len
-        assert got_stream == sorted(_expected_stream_ids(scores, expected_len))
+        assert got_stream == sorted(qsa_stream_topk_ids(scores, expected_len))
         assert got_logits == sorted(
             _expected_logits_ids(scores, expected_len, n_cols_padded)
         )

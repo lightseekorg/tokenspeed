@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.attention.mha import torch_causal_attention
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -77,18 +77,6 @@ def _qkv(n_heads: int, n_kv_heads: int, total_tokens: int, seed: int = 0):
     return q, k, v
 
 
-def _dense_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Per-sequence causal dense reference in fp32. [S,H,D] layout, one sequence."""
-    n_heads, n_kv_heads = q.shape[1], k.shape[1]
-    qt, kt, vt = (x.transpose(0, 1).float().unsqueeze(0) for x in (q, k, v))
-    if n_kv_heads != n_heads:
-        repeat = n_heads // n_kv_heads
-        kt = kt.repeat_interleave(repeat, dim=1)
-        vt = vt.repeat_interleave(repeat, dim=1)
-    out = F.scaled_dot_product_attention(qt, kt, vt, is_causal=True)
-    return out.squeeze(0).transpose(0, 1).to(q.dtype)
-
-
 def _rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
     return (
         (a.float() - b.float()).abs().mean() / b.float().abs().mean().clamp_min(1e-6)
@@ -117,7 +105,7 @@ def test_dynamic_sched_covers_every_row(n_heads: int, n_kv_heads: int) -> None:
     q, k, v = _qkv(n_heads, n_kv_heads, _SEQLEN)
     out = _run(q, k, v, [_SEQLEN], _TINY_THRESHOLD)
     assert torch.isfinite(out).all()
-    assert _rel_err(out, _dense_ref(q, k, v)) < _NO_REGRESSION_TOL
+    assert _rel_err(out, torch_causal_attention(q, k, v)) < _NO_REGRESSION_TOL
 
 
 @pytest.mark.parametrize("n_heads,n_kv_heads", _GQA_SHAPES)
@@ -145,7 +133,7 @@ def test_dynamic_sched_ragged_batch(threshold: float) -> None:
     start = 0
     for s in seqlens:
         sl = slice(start, start + s)
-        ref = _dense_ref(q[sl], k[sl], v[sl])
+        ref = torch_causal_attention(q[sl], k[sl], v[sl])
         assert _rel_err(out[sl], ref) < _NO_REGRESSION_TOL, f"seqlen {s}"
         start += s
 

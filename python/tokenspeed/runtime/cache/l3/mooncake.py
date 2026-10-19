@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -290,7 +291,11 @@ class MooncakeKvStore:
             missing_sizes.append(int(size))
             missing_index.append(index)
             results[index] = False
-        if missing_keys:
+        # Mooncake eviction is asynchronous. Retry only allocation pressure,
+        # on the backup worker, while its Host pages remain pinned.
+        for retry_delay in (0.01, 0.05, 0.2, 0.0):
+            if not missing_keys:
+                break
             put_results = self.store.batch_put_from(
                 missing_keys, missing_ptrs, missing_sizes
             )
@@ -322,6 +327,23 @@ class MooncakeKvStore:
                 for position, present in zip(failed_positions, raced_exists):
                     if present:
                         results[missing_index[position]] = True
+            retry_positions = [
+                position
+                for position, ret in enumerate(put_results)
+                if int(ret) == -200  # Mooncake NO_AVAILABLE_HANDLE
+                and not results[missing_index[position]]
+            ]
+            if not retry_positions or not retry_delay:
+                break
+            logger.warning(
+                f"Mooncake capacity pressure: retrying {len(retry_positions)} "
+                f"unwritten pages after {retry_delay:.2f}s"
+            )
+            time.sleep(retry_delay)
+            missing_keys = [missing_keys[p] for p in retry_positions]
+            missing_ptrs = [missing_ptrs[p] for p in retry_positions]
+            missing_sizes = [missing_sizes[p] for p in retry_positions]
+            missing_index = [missing_index[p] for p in retry_positions]
         return results
 
     def remove_by_prefix(self, prefix: str) -> bool:

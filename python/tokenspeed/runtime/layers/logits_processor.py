@@ -510,7 +510,8 @@ class LogitsProcessor(nn.Module):
         ):
             return None
 
-        vocab_padded = lm_head.weight.size(0) * self.tp_size
+        # A quantized head may keep its weight transposed, so read the shard width, not its rows.
+        vocab_padded = lm_head.num_embeddings_per_partition * self.tp_size
         if vocab_padded % (self.tp_size * 8) != 0:
             return None
 

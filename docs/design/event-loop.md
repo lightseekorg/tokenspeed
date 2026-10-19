@@ -313,7 +313,7 @@ There are exactly two call sites, each with a documented reason:
 * **Head of the round** — completed Host cache-op events
   (`_cache_hooks.poll_ready_events()`: `WriteBackDone`, `LoadBackDone`,
   `PrefetchDone`, `SnapshotDone`, `RestoreDone`, each replica-intersected).
-  These must advance *before* `next_execution_plan`, otherwise cache-gated
+  These must advance *before* `next_execution_plan`; otherwise, cache-gated
   admissions -- a prefetched request's admission, a suspended request's
   restore, which waits for both of its store ACKs, then its own -- are
   delayed by a full round.

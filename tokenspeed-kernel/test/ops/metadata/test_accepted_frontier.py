@@ -22,23 +22,13 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.metadata import (
+    torch_advance_accepted_frontier,
+)
 from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
-
-
-def _eager_reference(
-    req_pool_indices,
-    input_lengths,
-    accept_lengths,
-    valid_cache_lengths,
-    num_extends,
-    padding_index,
-):
-    deltas = torch.cat([input_lengths[:num_extends], accept_lengths[num_extends:]])
-    deltas = torch.where(req_pool_indices != padding_index, deltas, 0).to(torch.int32)
-    valid_cache_lengths.index_add_(0, req_pool_indices, deltas)
 
 
 def _batch(batch, num_extends, pool, padding_rows, seed):
@@ -72,7 +62,9 @@ def test_fused_advance_matches_eager_chain(batch, num_extends, padding_rows):
         batch, num_extends, pool, padding_rows, seed=batch
     )
     expected = valid.clone()
-    _eager_reference(slots, inputs, accepts, expected, num_extends, pool - 1)
+    torch_advance_accepted_frontier(
+        slots, inputs, accepts, expected, num_extends, pool - 1
+    )
 
     advance_accepted_frontier(slots, inputs, accepts, valid, num_extends, pool - 1)
     torch.cuda.synchronize()
@@ -100,7 +92,9 @@ def test_fused_advance_compiles_once_across_batch_shapes():
     def run(batch, num_extends):
         slots, inputs, accepts, valid = _batch(batch, num_extends, pool, 0, seed=batch)
         expected = valid.clone()
-        _eager_reference(slots, inputs, accepts, expected, num_extends, pool - 1)
+        torch_advance_accepted_frontier(
+            slots, inputs, accepts, expected, num_extends, pool - 1
+        )
         advance_accepted_frontier(slots, inputs, accepts, valid, num_extends, pool - 1)
         assert torch.equal(valid, expected)
 

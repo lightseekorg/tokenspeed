@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.moe.native import torch_sigmoid_bias_topk
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -71,12 +72,14 @@ def _by_expert(weights, ids):
 
 
 def _reference(logits, bias, *, normalize, scale):
-    scores = logits.sigmoid()
-    ids = torch.topk(scores + bias.unsqueeze(0), TOPK, dim=-1, sorted=False).indices
-    weights = scores.gather(1, ids)
-    if normalize:
-        weights = weights / weights.sum(dim=-1, keepdim=True)
-    return weights * scale, ids
+    return torch_sigmoid_bias_topk(
+        router_logits=logits,
+        correction_bias=bias,
+        topk=TOPK,
+        routed_scaling_factor=scale,
+        normalize_topk_weights=normalize,
+        weights_dtype=logits.dtype,
+    )
 
 
 # 128 rows is where the packed path peaks, so pin correctness there too.

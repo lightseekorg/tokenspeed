@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsv4 import (
+    torch_dsv4_selected_attention,
+)
 from tokenspeed_kernel.ops.attention.dsv4 import dsv4_decode, dsv4_prefill
 
 
@@ -43,15 +46,7 @@ def _reference(
     lens: torch.Tensor,
     sink: torch.Tensor,
 ) -> torch.Tensor:
-    result = torch.zeros_like(q)
-    for token in range(q.shape[0]):
-        selected = slots[token, : int(lens[token])].long()
-        selected = selected[(selected >= 0) & (selected < kv.shape[0])]
-        keys = kv[selected].float()
-        logits = q[token].float() @ keys.T / (512**0.5)
-        probabilities = torch.cat((logits, sink[:, None]), dim=1).softmax(dim=1)[:, :-1]
-        result[token] = (probabilities @ keys).to(q.dtype)
-    return result
+    return torch_dsv4_selected_attention(q, kv, slots, lens, sink, 512**-0.5)[0]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")

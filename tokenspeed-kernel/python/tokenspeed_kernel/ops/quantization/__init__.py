@@ -39,6 +39,7 @@ __all__ = [
     "rmsnorm_mxfp4_quant",
     "rmsnorm_nvfp4_quant",
     "rmsnorm_quantize_fp8_group32",
+    "silu_and_mul_quantize_fp8_group32",
 ]
 
 
@@ -103,6 +104,35 @@ def rmsnorm_quantize_fp8_group32(
         solution=solution,
     )
     return kernel(x, weight, eps)
+
+
+def silu_and_mul_quantize_fp8_group32(
+    x: torch.Tensor, limit: float | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SwiGLU of BF16 gate/up rows, quantized with exact group-32 UE8M0 scales.
+
+    The activation is ``silu(min(gate, limit)) * clamp(up, -limit, limit)``
+    rounded to BF16 as ``silu_and_mul`` does, then quantized as
+    ``quantize_fp8(granularity="token_group", group_size=32,
+    scale_encoding="ue8m0")`` does, keeping the 1e-4 amax floor.
+
+    Args:
+        x: BF16 ``[M, 2 * I]`` rows (gate columns, then up columns) with a
+            contiguous last axis; I divisible by 32.
+        limit: Positive SwiGLU clamp, or None for no clamp.
+
+    Returns:
+        E4M3 codes ``[M, I]`` and uint8 UE8M0 scales ``[M, I / 32]``.
+    """
+    kernel = select_kernel(
+        "quantization",
+        "silu_and_mul_fp8_group32_ue8m0",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={},
+        override=None,
+        solution=None,
+    )
+    return kernel(x, limit)
 
 
 def _quantize_fp8_roundtrip(

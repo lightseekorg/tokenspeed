@@ -403,7 +403,7 @@ Prompt logprobs are gathered in position chunks of
 `--input-logprob-chunk-tokens` rows so the transient `[rows, vocab]` logits
 stay bounded. The chunk size is a sizing knob, not a numerics one: the
 reductions involved are row-local (the GEMM's row is independent of its
-neighbours under the per-row GEMM leaves of `invariance.batch`, and
+neighbors under the per-row GEMM leaves of `invariance.batch`, and
 log-softmax reduces within a row), so no value depends on which chunk, or how
 large a chunk, a position landed in. The same holds across prefill chunks:
 positions are scored by the chunk that feeds them and assembled per request

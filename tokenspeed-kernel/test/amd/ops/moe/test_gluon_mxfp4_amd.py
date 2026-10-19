@@ -24,7 +24,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from kimi3_reference import dequantize_mxfp4
+from tokenspeed_kernel.numerics.torch.activation import (
+    deinterleave_gate_up,
+    swiglu,
+)
+from tokenspeed_kernel.numerics.torch.moe import (
+    DequantizedExperts,
+    torch_moe_experts,
+)
+from tokenspeed_kernel.numerics.torch.quantization import dequantize_mxfp4
 from tokenspeed_kernel.ops.quantization import quantize_mxfp4 as kernel_quantize_mxfp4
 from utils import (
     assert_no_triton_compile,
@@ -92,27 +100,25 @@ def _fp8_mxfp4_swiglu_moe_reference(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
 ) -> torch.Tensor:
-    x_fp8 = hidden_states.to(torch.float8_e4m3fn).float()
-    w13 = dequantize_mxfp4(w13_weight, w13_scale)
-    w2 = dequantize_mxfp4(w2_weight, w2_scale)
-    expected = torch.zeros_like(hidden_states, dtype=torch.float32)
+    def to_fp8(values: torch.Tensor) -> torch.Tensor:
+        return values.to(torch.bfloat16).to(torch.float8_e4m3fn)
 
-    for token in range(hidden_states.shape[0]):
-        for slot in range(topk_ids.shape[1]):
-            expert = int(topk_ids[token, slot])
-            gate_up = F.linear(x_fp8[token], w13[expert], w13_bias[expert])
-            gate = gate_up[0::2].clamp(max=7.0)
-            linear = gate_up[1::2].clamp(-7.0, 7.0)
-            intermediate = gate * torch.sigmoid(1.702 * gate) * (linear + 1.0)
-            intermediate_fp8 = (
-                intermediate.to(torch.bfloat16).to(torch.float8_e4m3fn).float()
-            )
-            partial = F.linear(intermediate_fp8, w2[expert], w2_bias[expert]).to(
-                torch.bfloat16
-            )
-            expected[token] += partial.float() * topk_weights[token, slot]
-
-    return expected.to(torch.bfloat16)
+    return torch_moe_experts(
+        hidden_states,
+        dequantize_mxfp4(w13_weight, w13_scale),
+        dequantize_mxfp4(w2_weight, w2_scale),
+        topk_ids,
+        topk_weights,
+        activation=lambda gate_up: swiglu(
+            deinterleave_gate_up(gate_up), alpha=1.702, limit=7.0, beta=1.0
+        ),
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+        quantize_input=to_fp8,
+        quantize_intermediate=to_fp8,
+        round_expert_output=torch.Tensor.bfloat16,
+        first_expert=0,
+    ).to(torch.bfloat16)
 
 
 def _make_mxfp4_moe_module(
@@ -1061,30 +1067,25 @@ def _dynamic_mxfp4_swiglu_moe_reference(
     limit: float,
     beta: float,
 ) -> torch.Tensor:
-    hidden = _dequantize_dynamic_mxfp4(hidden_states).float()
-    expected = torch.zeros_like(hidden_states, dtype=torch.float32)
-    for expert in topk_ids.unique().tolist():
-        token, slot = (topk_ids == expert).nonzero(as_tuple=True)
-        w13 = dequantize_mxfp4(raw["w13_weight"][expert], raw["w13_scale"][expert])
-        w2 = dequantize_mxfp4(raw["w2_weight"][expert], raw["w2_scale"][expert])
-        gate_up = F.linear(
-            hidden[token], w13, None if w13_bias is None else w13_bias[expert]
-        )
-        gate, linear = gate_up[:, 0::2], gate_up[:, 1::2]
-        if limit > 0:
-            gate = gate.clamp(max=limit)
-            linear = linear.clamp(-limit, limit)
-        intermediate = gate * torch.sigmoid(alpha * gate) * (linear + beta)
-        intermediate = _dequantize_dynamic_mxfp4(intermediate.to(torch.bfloat16))
-        partial = F.linear(
-            intermediate.float(), w2, None if w2_bias is None else w2_bias[expert]
-        )
-        expected.index_add_(
-            0,
-            token,
-            partial.to(torch.bfloat16).float() * topk_weights[token, slot, None],
-        )
-    return expected.to(torch.bfloat16)
+    return torch_moe_experts(
+        hidden_states,
+        DequantizedExperts(dequantize_mxfp4, raw["w13_weight"], raw["w13_scale"]),
+        DequantizedExperts(dequantize_mxfp4, raw["w2_weight"], raw["w2_scale"]),
+        topk_ids,
+        topk_weights,
+        activation=lambda gate_up: swiglu(
+            deinterleave_gate_up(gate_up),
+            alpha=alpha,
+            limit=limit if limit > 0 else None,
+            beta=beta,
+        ),
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+        quantize_input=_dequantize_dynamic_mxfp4,
+        quantize_intermediate=lambda t: _dequantize_dynamic_mxfp4(t.bfloat16()),
+        round_expert_output=torch.Tensor.bfloat16,
+        first_expert=0,
+    ).to(torch.bfloat16)
 
 
 @pytest.mark.parametrize("decode,num_tokens", [(False, 4), (True, 1)])
