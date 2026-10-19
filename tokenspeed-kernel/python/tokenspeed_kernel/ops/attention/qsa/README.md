@@ -231,38 +231,46 @@ FP32 score-multiset, valid-count, unique-index and padding checks at
 `atol=1e-4, rtol=1e-5`. Graph tests also refresh unequal producer-half frontiers,
 including empty or trivial halves and ids crossing the 64K offset window.
 
-### Comparison with the latest persistent top-k
+### Comparison after persistent top-k and producer synchronization updates
 
 After merging `main` at `c8b4c742f` (exact overflowing-bucket refinement), the
-CUDA extension was rebuilt for SM103. The stream implementation is unchanged.
-The same 20 layouts were measured before and after the merge, using seeds
-83/89/97, 10 warmups and 65 cold-L2 CUDA Graph samples per seed with PDL enabled.
-Inputs and backend order are paired within each revision. Every run validates
-up to eight rows against FP32 reference scores. Times are medians of the three
-seed medians, in microseconds, and include scoring plus selection.
+CUDA extension was rebuilt for SM103. A subsequent synchronization audit found
+that a faster producer warp could append before slower warps finished reading
+the count snapshot. Delaying one warp reproduced incorrect selection and a
+stalled public-API launch. Synchronizing after the snapshot fixes both cases;
+regressions delay real producer warps with PDL off/on and refreshed graph data.
+
+The same 20 layouts were remeasured after this fix, using seeds 83/89/97,
+10 warmups and 65 cold-L2 CUDA Graph samples per seed with PDL enabled. Inputs
+and backend order are paired within each revision. Every run validates up to
+eight rows against FP32 reference scores. Times are medians of the three seed
+medians, in microseconds, and include scoring plus selection. Previous logits
+measurements predate the main update; updated columns include the latest
+materialized selector and the producer synchronization fix.
 
 Representative trimmed-table, single-request results:
 
 | Query rows / live KV tokens | Previous logits | Updated logits | Stream | Stream time reduction vs updated logits |
 | --- | ---: | ---: | ---: | ---: |
-| 256 / 32768 | 32.16 | 34.21 | 58.88 | -72.1% |
-| 512 / 65536 | 87.39 | 97.31 | 93.25 | 4.2% |
-| 1024 / 131072 | 179.30 | 181.60 | 159.07 | 12.4% |
-| 8192 / 8192 | 124.26 | 144.74 | 113.95 | 21.3% |
-| 8192 / 32768 | 347.55 | 380.35 | 331.10 | 12.9% |
-| 16384 / 16384 | 312.74 | 372.13 | 243.04 | 34.7% |
-| 16384 / 32768 | 603.46 | 664.64 | 599.46 | 9.8% |
-| 16384 / 65536 | 1152.10 | 1340.83 | 1010.78 | 24.6% |
-| 16384 / 262144 | 4104.26 | 4129.22 | 3194.27 | 22.6% |
+| 256 / 32768 | 32.16 | 34.21 | 60.77 | -77.6% |
+| 512 / 65536 | 87.39 | 96.70 | 93.54 | 3.3% |
+| 1024 / 131072 | 179.30 | 181.60 | 159.10 | 12.4% |
+| 8192 / 8192 | 124.26 | 144.74 | 114.02 | 21.2% |
+| 8192 / 32768 | 347.55 | 380.32 | 333.15 | 12.4% |
+| 16384 / 16384 | 312.74 | 372.19 | 243.04 | 34.7% |
+| 16384 / 32768 | 603.46 | 664.96 | 603.55 | 9.2% |
+| 16384 / 65536 | 1152.10 | 1340.86 | 1021.31 | 23.8% |
+| 16384 / 262144 | 4104.26 | 4131.20 | 3252.64 | 21.3% |
 
 Stream has lower latency in 15 of the 20 measured layouts. Logits still wins
 for 256-query chunks, eight independent decode requests and 16 rows grouped
 into eight-query requests. It also narrowly wins for 512 total rows in
-eight-query requests: 105.82 us for logits and 107.62 us for stream.
+eight-query requests: 105.86 us for logits and 107.87 us for stream.
 
 Capacity remains relevant. With 65600-block tables, 16384 queries / 32768 live
-KV tokens takes 601.15 us for stream and 734.94 us for updated logits. For
-16384 queries / 16384 live KV tokens, the same capacity takes 312.70 us and
-386.11 us respectively. Stream timings stay close to their pre-merge values;
-the larger advantage comes from the updated materialized selector's cost.
-Automatic path thresholds remain unchanged.
+KV tokens takes 605.50 us for stream and 734.72 us for updated logits. For
+16384 queries / 16384 live KV tokens, the same capacity takes 314.72 us and
+386.40 us respectively. The synchronization fix adds 4.10 us (0.7%) to the
+trimmed 16384 / 32768 stream case; registers, shared memory and scratch stay
+unchanged. The larger advantage over logits comes from the updated materialized
+selector's cost. Automatic path thresholds remain unchanged.
