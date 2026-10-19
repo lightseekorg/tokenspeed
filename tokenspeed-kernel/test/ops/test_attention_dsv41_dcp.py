@@ -23,6 +23,7 @@ import torch
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import normalize_dcp_partials
 from tokenspeed_kernel.ops.attention.dsv41 import triton as portable
+from tokenspeed_kernel.platform import current_platform
 
 
 @pytest.mark.parametrize("compact", [False, True])
@@ -38,7 +39,16 @@ def test_selected_attention_partial_lse(native, heads, scale, compact):
         if not flash_mla.is_flash_mla_v41_available():
             pytest.skip("native V4.1 FlashMLA unavailable")
         implementation = flash_mla.selected_attention
-        fmt_swa, fmt_global, width_swa, width_global = "swa_v4", "global_v4", 584, 584
+        # Match the serving cache: Hopper uses V4, Blackwell uses V4.1.
+        if current_platform().is_hopper:
+            fmt_swa, fmt_global, width_swa, width_global = (
+                "swa_v4",
+                "global_v4",
+                584,
+                584,
+            )
+        else:
+            fmt_swa, fmt_global, width_swa, width_global = "swa", "global", 528, 288
     else:
         implementation = portable.selected_attention
         fmt_swa, fmt_global, width_swa, width_global = "swa", "global", 528, 288

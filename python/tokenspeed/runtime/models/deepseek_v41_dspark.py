@@ -207,6 +207,7 @@ class _WindowAttention:
             None,
             kv.view(-1, 1, kv.shape[-1]),
             self.selection.indices,
+            lse=None,
         )
 
     def _reference_forward(self, q, kv, attn_sink, softmax_scale):

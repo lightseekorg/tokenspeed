@@ -92,5 +92,6 @@ def selected_prefill_with_head_exchange(
         None,
         workspace,
         indices[start : start + counts[rank]].contiguous(),
+        lse=None,
     )
     return all_to_all_head_scatter(output, group, counts, backend=None)

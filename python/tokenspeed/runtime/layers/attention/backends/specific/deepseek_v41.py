@@ -2069,6 +2069,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 self._decode_schedule(swa_lens, global_lens),
                 None,
                 None,
+                lse=None,
             )
         plan = self._swa_query_plan(positions, request_indices, forward_mode)
         # Quantize current rows exactly as cache storage, without publishing them
@@ -2212,6 +2213,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     None,
                     workspace[:, None, :],
                     indices.contiguous(),
+                    lse=None,
                 )
             if output is None:
                 out[rows] = result

@@ -371,7 +371,7 @@ def selected_attention(
     prefill_kv: torch.Tensor | None,
     prefill_indices: torch.Tensor | None,
     *,
-    lse: torch.Tensor | None = None,
+    lse: torch.Tensor | None,
 ) -> torch.Tensor:
     """Joint SWA/global softmax with one zero-valued sink, returning BF16.
 
@@ -505,6 +505,7 @@ def selected_attention_rope(
             schedule,
             None,
             None,
+            lse=None,
         )
         return rope_inplace(out, positions, cos_sin_cache, None)
     return kernel(
