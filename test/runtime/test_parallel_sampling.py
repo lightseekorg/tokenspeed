@@ -22,7 +22,8 @@
 
 import os
 import sys
-import unittest
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -62,19 +63,19 @@ def _replica_seeds(sampling_params: dict, n: int) -> tuple[int, list[int]]:
     return tokenized.sampling_params.seed, seeds
 
 
-class TestReplicaSeeds(unittest.TestCase):
+class TestReplicaSeeds:
     def test_sampled_replicas_get_distinct_seeds(self) -> None:
         base, seeds = _replica_seeds({"temperature": 1.0}, n=8)
-        self.assertEqual(seeds, [base + i for i in range(8)])
+        assert (seeds) == ([base + i for i in range(8)])
 
     def test_caller_seed_is_offset_per_replica(self) -> None:
         base, seeds = _replica_seeds({"temperature": 1.0, "seed": 7}, n=4)
-        self.assertEqual(base, 7)
-        self.assertEqual(seeds, [7, 8, 9, 10])
+        assert (base) == (7)
+        assert (seeds) == ([7, 8, 9, 10])
 
     def test_greedy_replicas_keep_pinned_seed(self) -> None:
         _, seeds = _replica_seeds({"temperature": 0.0}, n=4)
-        self.assertEqual(seeds, [0, 0, 0, 0])
+        assert (seeds) == ([0, 0, 0, 0])
 
     def test_replicas_do_not_share_parent_sampling_params(self) -> None:
         parent = GenerateReqInput(input_ids=[1, 2, 3], sampling_params={})
@@ -82,11 +83,11 @@ class TestReplicaSeeds(unittest.TestCase):
         tokenized = _tokenize(parent)
         parent_seed = tokenized.sampling_params.seed
         replica = prepare_parallel_sampling_replica(parent, tokenized, 3)
-        self.assertIsNot(replica.sampling_params, tokenized.sampling_params)
-        self.assertEqual(tokenized.sampling_params.seed, parent_seed)
+        assert (replica.sampling_params) is not (tokenized.sampling_params)
+        assert (tokenized.sampling_params.seed) == (parent_seed)
 
     def test_unresolved_seed_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
+        with pytest.raises((ValueError)):
             SamplingParams().for_parallel_sample(1)
 
 
@@ -109,7 +110,8 @@ class _StubAsyncLLM(AsyncLLM):
         yield {"meta_info": {"id": obj.rid}}
 
 
-class TestBatchFanOut(unittest.IsolatedAsyncioTestCase):
+@pytest.mark.asyncio
+class TestBatchFanOut:
     async def test_fan_out_sends_one_seed_per_replica(self) -> None:
         mgr = _StubAsyncLLM()
         obj = GenerateReqInput(
@@ -121,11 +123,11 @@ class TestBatchFanOut(unittest.IsolatedAsyncioTestCase):
             pass
 
         warmup, *replicas = mgr.sent
-        self.assertEqual(warmup.sampling_params.max_new_tokens, 0)
-        self.assertEqual(len(replicas), 4)
-        self.assertEqual(len({r.rid for r in replicas}), 4)
-        self.assertEqual(len({r.sampling_params.seed for r in replicas}), 4)
+        assert (warmup.sampling_params.max_new_tokens) == (0)
+        assert (len(replicas)) == (4)
+        assert (len({r.rid for r in replicas})) == (4)
+        assert (len({r.sampling_params.seed for r in replicas})) == (4)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

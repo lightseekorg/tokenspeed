@@ -142,7 +142,6 @@ def _qsa(rows, solution):
             max_logits_bytes=256 << 20,
             solution=None,
             override=None,
-            persistent_topk_workspace=None,
             enable_pdl=pdl_enabled(),
         )
         slots = qwen4_exp_qsa_selected_slots(

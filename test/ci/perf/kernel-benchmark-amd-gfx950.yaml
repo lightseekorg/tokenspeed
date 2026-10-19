@@ -7,7 +7,7 @@ triggers:
   - manual
 runner:
   labels:
-    - amd-mi350-1gpu-bench
+    - amd-mi355-1gpu
 env:
   CI: "true"
   ROCR_VISIBLE_DEVICES: "0"
@@ -26,6 +26,7 @@ perf:
       --candidate-ref "$CANDIDATE_REF" \
       --suite tokenspeed-kernel/benchmarks/amd/gfx950.json \
       --output-dir "$output_dir" \
+      --measurement-rounds 3 \
       --work-dir "$work_dir" \
       --environment-mode venv \
       --repository "${GITHUB_REPOSITORY:-}"

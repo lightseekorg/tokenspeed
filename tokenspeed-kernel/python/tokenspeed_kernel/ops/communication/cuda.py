@@ -20,7 +20,7 @@
 
 """NVIDIA CUDA communication kernels with caller-managed persistent state.
 
-The Lamport A2A APIs exchange TP4 BF16 channel shards directly, optionally
+The Lamport A2A APIs exchange TP2/4/8 BF16 channel shards directly, optionally
 quantizing received 128-element groups for a prepared FP8 GEMM. Callers must
 construct the state collectively before CUDA-graph capture, serialize calls
 and consumers on one stream, pad empty owners so every peer participates, and

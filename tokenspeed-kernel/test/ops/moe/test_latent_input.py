@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe import latent_moe_input_projections
-from tokenspeed_kernel.ops.moe.latent_input import packed_projection_weight_view
+from tokenspeed_kernel.numerics.torch.moe import torch_latent_input
+from tokenspeed_kernel.ops.moe import (
+    latent_moe_input_projections,
+    packed_projection_weight_view,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 
@@ -23,18 +26,10 @@ UP_CLAMP = 1.0
 def test_amd_latent_moe_registrations_are_platform_scoped() -> None:
     registry = KernelRegistry.get()
     expected_modules = {
-        "gluon_latent_expert_shared_gfx950": (
-            "tokenspeed_kernel.ops.moe.gluon.latent_decode"
-        ),
-        "gluon_latent_input_decode_gfx950": (
-            "tokenspeed_kernel.ops.moe.gluon.latent_input"
-        ),
-        "gluon_latent_input_small_batch_gfx950": (
-            "tokenspeed_kernel.ops.moe.gluon.latent_input"
-        ),
-        "gluon_latent_input_decode_gfx1250": (
-            "tokenspeed_kernel.ops.moe.gluon.latent_input"
-        ),
+        "gluon_latent_expert_shared_gfx950": ("tokenspeed_kernel.ops.moe.gluon"),
+        "gluon_latent_input_decode_gfx950": ("tokenspeed_kernel.ops.moe.gluon"),
+        "gluon_latent_input_small_batch_gfx950": ("tokenspeed_kernel.ops.moe.gluon"),
+        "gluon_latent_input_decode_gfx1250": ("tokenspeed_kernel.ops.moe.gluon"),
     }
     implementations = {name: registry.get_impl(name) for name in expected_modules}
     if current_platform().is_amd:
@@ -62,17 +57,15 @@ def _concatenated_weights(
     return fused, views
 
 
-def _reference(
-    hidden: torch.Tensor, views: list[torch.Tensor]
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    router = torch.nn.functional.linear(hidden.float(), views[0].float())
-    routed = torch.nn.functional.linear(hidden, views[1])
-    gate, up = torch.nn.functional.linear(hidden, views[2]).chunk(2, dim=-1)
-    gated = (
-        GATE_CLAMP * torch.tanh(gate.float() / GATE_CLAMP) * torch.sigmoid(gate.float())
+def _reference(hidden, views):
+    return torch_latent_input(
+        hidden_states=hidden,
+        router_weight=views[0],
+        routed_weight=views[1],
+        shared_gate_up_weight=views[2],
+        gate_clamp=GATE_CLAMP,
+        up_clamp=UP_CLAMP,
     )
-    shared = (gated * UP_CLAMP * torch.tanh(up.float() / UP_CLAMP)).to(hidden.dtype)
-    return router, routed, shared
 
 
 def test_packed_weight_view_requires_consecutive_rows() -> None:

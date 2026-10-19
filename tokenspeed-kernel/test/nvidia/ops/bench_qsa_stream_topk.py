@@ -33,6 +33,7 @@ import statistics
 
 import torch
 from tokenspeed_kernel._triton import triton
+from tokenspeed_kernel.numerics.torch.attention.qsa import torch_qsa_paged_block_scores
 from tokenspeed_kernel.ops.attention.dsa.cuda import has_ragged_decode_topk
 from tokenspeed_kernel.ops.attention.qsa import qwen4_exp_qsa_block_topk
 from tokenspeed_kernel.platform import pdl_enabled
@@ -119,6 +120,50 @@ def _kernel_resources(graph: torch.cuda.CUDAGraph) -> list[dict]:
     return resources
 
 
+def _validate_selection(
+    selected: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    request_indices: torch.Tensor,
+    complete_blocks: torch.Tensor,
+    *,
+    page_size: int,
+    block_topk: int,
+) -> int:
+    sample = torch.linspace(
+        0, query.shape[0] - 1, min(8, query.shape[0]), device=query.device
+    ).long()
+    scores = torch_qsa_paged_block_scores(
+        query[sample],
+        key_cache,
+        page_table,
+        request_indices[sample].long(),
+        complete_blocks[sample],
+        page_size=page_size,
+    )
+    ids = selected[sample]
+    torch.testing.assert_close(
+        (ids >= 0).sum(1), complete_blocks[sample].clamp_max(block_topk).long()
+    )
+    assert ((ids == -1) | ((ids >= 0) & (ids < complete_blocks[sample, None]))).all()
+    ordered = ids.sort(1).values
+    assert ((ordered[:, 1:] != ordered[:, :-1]) | (ordered[:, 1:] == -1)).all()
+    actual = scores.gather(1, ids.clamp_min(0).long())
+    actual.masked_fill_(ids < 0, -float("inf"))
+    if scores.shape[1] < block_topk:
+        scores = torch.nn.functional.pad(
+            scores, (0, block_topk - scores.shape[1]), value=-float("inf")
+        )
+    torch.testing.assert_close(
+        actual.sort(1, descending=True).values,
+        scores.topk(block_topk, dim=1).values,
+        atol=1e-4,
+        rtol=1e-5,
+    )
+    return sample.numel()
+
+
 def main() -> None:
     args = _parse_args()
     if args.rows < 1 or args.pages < 1:
@@ -187,11 +232,8 @@ def main() -> None:
         )
     enable_pdl = args.pdl == "on"
     pdl_enabled(enable_pdl)
-    workspace = None
-    if args.solution in ("auto", "logits"):
-        if not has_ragged_decode_topk():
-            raise RuntimeError("logits comparison requires the persistent CUDA top-k")
-        workspace = torch.empty(1024 * 1024, device=device, dtype=torch.uint8)
+    if args.solution in ("auto", "logits") and not has_ragged_decode_topk():
+        raise RuntimeError("logits comparison requires the persistent CUDA top-k")
 
     def invoke() -> torch.Tensor:
         tensors = query, key_cache, page_table, request_indices, complete_blocks
@@ -207,13 +249,22 @@ def main() -> None:
             path=path,
             solution=backend,
             override=None,
-            persistent_topk_workspace=workspace,
             enable_pdl=enable_pdl,
         )
 
     # Compile before warmup so JIT work is outside timing.
-    invoke()
+    selected = invoke()
     torch.cuda.synchronize()
+    validated_rows = _validate_selection(
+        selected,
+        query,
+        key_cache,
+        page_table,
+        request_indices,
+        complete_blocks,
+        page_size=page_size,
+        block_topk=block_topk,
+    )
     cache_clear_buffer = triton.runtime.driver.active.get_empty_cache_for_benchmark()
     for _ in range(args.warmups):
         triton.runtime.driver.active.clear_cache(cache_clear_buffer)
@@ -282,6 +333,8 @@ def main() -> None:
                 "pdl": enable_pdl,
                 "warmups": args.warmups,
                 "iterations": args.iterations,
+                "seed": args.seed,
+                "validated_rows": validated_rows,
                 "samples_us": samples_us,
                 "median_us": statistics.median(samples_us),
                 "mean_us": statistics.fmean(samples_us),

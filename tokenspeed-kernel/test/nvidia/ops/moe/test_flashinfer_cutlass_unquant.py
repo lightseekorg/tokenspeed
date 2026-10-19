@@ -44,6 +44,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.activation import torch_silu_and_mul
+from tokenspeed_kernel.numerics.torch.moe import torch_moe_experts
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from tokenspeed_kernel.platform import current_platform
 
 
@@ -58,7 +63,7 @@ def _requires_flashinfer_hopper() -> None:
 
 def test_wrapper_never_enables_pdl(monkeypatch) -> None:
     _requires_flashinfer_hopper()
-    from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant
+    import tokenspeed_kernel.ops.moe.flashinfer as cutlass_unquant
 
     seen = {}
 
@@ -88,8 +93,8 @@ def test_wrapper_passes_one_persistent_zeroed_workspace(monkeypatch) -> None:
     allocated, reused while it fits, grown (and re-zeroed) when a larger
     batch arrives."""
     _requires_flashinfer_hopper()
+    import tokenspeed_kernel.ops.moe.flashinfer as cutlass_unquant
     from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
-    from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant
 
     calls = []
 
@@ -160,23 +165,25 @@ def test_wrapper_passes_one_persistent_zeroed_workspace(monkeypatch) -> None:
 
 def _reference(x, ids, weights, w13, w2, first_expert):
     """SwiGLU experts in fp32; the w13 halves are [gate | up] as loaded."""
-    out = torch.zeros(x.shape[0], w2.shape[1], dtype=torch.float32, device=x.device)
-    inter = w2.shape[2]
-    for token in range(x.shape[0]):
-        for slot in range(ids.shape[1]):
-            expert = int(ids[token, slot]) - first_expert
-            if not 0 <= expert < w13.shape[0]:
-                continue
-            gate_up = x[token].float() @ w13[expert].float().T
-            act = torch.nn.functional.silu(gate_up[:inter]) * gate_up[inter:]
-            out[token] += weights[token, slot] * (act @ w2[expert].float().T)
-    return out
+    return torch_moe_experts(
+        x,
+        w13,
+        w2,
+        ids,
+        weights,
+        activation=lambda gate_up: torch_silu_and_mul(gate_up, None),
+        w13_bias=None,
+        w2_bias=None,
+        quantize_input=None,
+        quantize_intermediate=None,
+        round_expert_output=None,
+        first_expert=first_expert,
+    )
 
 
 @pytest.mark.parametrize("ep_rank", [0, 1])
 def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
     _requires_flashinfer_hopper()
-    import tokenspeed_kernel
 
     torch.manual_seed(0)
     device = "cuda"
@@ -194,7 +201,7 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         ids[token, :real] = torch.randperm(num_experts - 1, device=device)[:real] + 1
         weights[token, :real] = torch.rand(real, device=device)
 
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -219,7 +226,7 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         tp_size=1,
         tp_rank=0,
     )
-    tokenspeed_kernel.moe_process_weights(plan, layer)
+    kernel_moe_process_weights(plan, layer)
     expected = _reference(
         x, ids, weights, reference_w13, w2, first_expert=ep_rank * local
     )
@@ -229,7 +236,7 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         # the chain away from it.
         garbage = torch.full((64 << 20,), float("nan"), device=device)
         del garbage
-        out = tokenspeed_kernel.moe_apply(
+        out = kernel_moe_apply(
             plan,
             x,
             layer,

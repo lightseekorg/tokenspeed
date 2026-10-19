@@ -21,6 +21,7 @@
 #include "scheduler/scheduler.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -47,8 +48,17 @@ namespace tokenspeed {
 
 namespace {
 
+// Stalled rounds (Scheduler::trackStalledRounds) before the first warning.
+// Later warnings come at every doubling of the streak, so a stall that never
+// ends still logs only a few dozen lines.
+constexpr std::int64_t kStalledRoundsBeforeWarning = 1024;
+
 std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
     return config.HasHostCache() ? config.host_allocator.NumUsableBlocks() : 0;
+}
+
+std::int32_t snapshotPoolBlocks(const SchedulerConfig& config) {
+    return config.HasSnapshotPool() ? config.snapshot_allocator.NumUsableBlocks() : 0;
 }
 
 std::vector<std::int32_t> slotsPerParentByGroup(const SchedulerConfig& config) {
@@ -82,10 +92,13 @@ CacheKey eventKey(const CacheKey& key) {
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{validated(std::move(config))},
       req_pool_allocator_{config_.max_batch_size},
+      snapshot_slots_{config_.max_retracted_requests},
       block_pool_{config_.device_allocator.NumUsableBlocks(), slotsPerParentByGroup(config_)},
       host_pool_{hostPoolBlocks(config_), slotsPerParentByGroup(config_)},
+      snapshot_pool_{snapshotPoolBlocks(config_), slotsPerParentByGroup(config_)},
       coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.prefix_granularity, block_pool_,
                                    config_.enable_l3_storage, hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
+                                   snapshotPoolBlocks(config_) > 0 ? &snapshot_pool_ : nullptr,
                                    config_.StreamsDeviceCacheToHost())},
       tier_transfers_{coordinator_} {
     // config_.Validate() already ran; the body only derives state from it.
@@ -116,7 +129,9 @@ bool Scheduler::pdTransferInFlight(const Request& request) const {
         case Role::kD:
             return request.Is<fsm::RemotePrefilling>();
         case Role::kP:
-            return request.HoldsPages();
+            // Every page-holding state but Finishing: SucceededEvent moves a
+            // request there once the peer has read its pages.
+            return request.HoldsPages() && !request.Is<fsm::Finishing>();
         case Role::kFused:
             return false;
     }
@@ -151,7 +166,11 @@ std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
                    "KV event boundary marked for reconcile lost its token descriptor");
         KvEventBoundary& event_boundary = it->second;
         event_boundary.needs_reconcile = false;
-        const CacheCoordinator::BoundaryResidency residency = coordinator_.DeviceBoundaryResidency(boundary);
+        // A tail's descriptor carries fewer tokens than a page.
+        const auto descriptor_tokens = static_cast<std::int32_t>(event_boundary.stored.token_ids.size());
+        const std::int32_t tail_tokens = descriptor_tokens < config_.prefix_granularity ? descriptor_tokens : 0;
+        const CacheCoordinator::BoundaryResidency residency =
+            coordinator_.DeviceBoundaryResidency(boundary, tail_tokens);
         const bool complete = residency == CacheCoordinator::BoundaryResidency::kComplete;
         if (complete && !event_boundary.published) {
             stored.emplace_back(event_boundary.depth, event_boundary.stored);
@@ -193,7 +212,7 @@ bool Scheduler::cacheIsClearable(bool include_host) const {
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
-    if (has_pd_transfers || has_tier_transfers) {
+    if (has_pd_transfers || has_tier_transfers || RetractedSize() > 0) {
         return false;
     }
     return coordinator_.CacheIsClearable(include_host);
@@ -204,13 +223,19 @@ bool Scheduler::clearCache(bool include_host) {
     // completes its pin check before mutating anything -- so residency is not
     // this function's business. What IS its business are the writers the pins
     // do not cover: an asynchronous transfer still landing into a cached
-    // block would race a clear that succeeded on the pin check alone.
+    // block would race a clear that succeeded on the pin check alone. And the
+    // images the pins do not show: a request suspended with its KV on Host
+    // continues from those bytes once restored, so a flush (a weight update)
+    // under it would resume old-weight KV under new weights. Its L2 leg is
+    // pinned and would refuse the Host clear by itself; its snapshot-pool leg
+    // is not indexed anywhere, so the suspended set is checked directly.
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
-    if (has_pd_transfers || has_tier_transfers) {
-        spdlog::info("[Scheduler] flush L1 cache rejected: pd_transfers={} tier_transfers={}", has_pd_transfers,
-                     has_tier_transfers);
+    const std::size_t suspended = RetractedSize();
+    if (has_pd_transfers || has_tier_transfers || suspended > 0) {
+        spdlog::info("[Scheduler] flush {}cache rejected: pd_transfers={} tier_transfers={} suspended_requests={}",
+                     include_host ? "" : "L1 ", has_pd_transfers, has_tier_transfers, suspended);
         return false;
     }
     const bool cleared = include_host ? coordinator_.ClearCache() : coordinator_.ClearDeviceCache();
@@ -259,6 +284,34 @@ void Scheduler::registerKvEventPrefixPages(const Request& request, std::span<con
     }
 }
 
+void Scheduler::registerKvEventPublication(const Request& request, std::span<const std::string> prefix_hashes,
+                                           const CompletedPages& completed) {
+    registerKvEventPrefixPages(request, prefix_hashes, completed.first_new_prefix_page);
+    if (!config_.enable_kv_cache_events || !completed.tail) {
+        return;
+    }
+    const auto full_pages = static_cast<std::int32_t>(prefix_hashes.size());
+    const KvEventHashProgress& progress = kv_event_hash_progress_.at(request.Id());
+    _assert(progress.block_hashes.size() == prefix_hashes.size(), "the tail's parent page has its KV event hash");
+    const std::optional<std::uint64_t> parent_hash =
+        full_pages == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes.back()};
+    const std::span<const std::int32_t> tail_tokens =
+        request.TokenSlice(full_pages * config_.prefix_granularity, completed.tail->tail_tokens);
+    const CacheKey key{.content_hash = completed.tail->hash};
+    KvBlockStoredEvent event{
+        .block_hashes = {HashKvBlock(tail_tokens, parent_hash)},
+        .parent_block_hash = parent_hash,
+        .token_ids = std::vector<std::int32_t>(tail_tokens.begin(), tail_tokens.end()),
+        .block_size = config_.prefix_granularity,
+    };
+    const auto [it, inserted] =
+        kv_event_boundaries_.try_emplace(key, KvEventBoundary{.stored = std::move(event), .depth = full_pages});
+    FatalCheck(inserted || (it->second.stored.block_hashes.front() == HashKvBlock(tail_tokens, parent_hash) &&
+                            it->second.depth == full_pages),
+               "one cache content hash mapped to different KV event blocks");
+    markKvEventBoundaryForReconcile(key);
+}
+
 void Scheduler::markKvEventBoundaryForReconcile(const CacheKey& boundary) {
     // Descriptors are erased only by DrainKvEvents, so every cache mutation of
     // a registered boundary finds one here.
@@ -295,7 +348,8 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
             throw std::invalid_argument("Scheduler: request token limit exceeds int32 range");
         }
         if (token_limit > max_single_request_tokens_) {
-            throw std::invalid_argument("Scheduler: request token limit exceeds cache capacity");
+            throw std::invalid_argument("Scheduler: request token limit " + std::to_string(token_limit) +
+                                        " exceeds cache capacity " + std::to_string(max_single_request_tokens_));
         }
         pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, config_.role));
     }
@@ -315,7 +369,13 @@ std::size_t Scheduler::BootstrappingSize() const {
 
 std::size_t Scheduler::WaitingSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
-        return request->IsAnyOf<fsm::Submitted, fsm::Retracted>();
+        return request->IsAnyOf<fsm::Submitted, fsm::Prefetching, fsm::Retracted, fsm::Restoring>();
+    }));
+}
+
+std::size_t Scheduler::RetractedSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::Retracted, fsm::Restoring>();
     }));
 }
 
@@ -372,72 +432,6 @@ std::vector<std::string> Scheduler::PrefixHashesForTokens(const std::vector<std:
     return ComputePrefixHashes(prefix_pages, "");
 }
 
-std::vector<std::string> Scheduler::WaitingPrefixHashes() const {
-    std::vector<Request*> candidates;
-    candidates.reserve(requests_.size());
-    for (const auto& request : requests_) {
-        candidates.push_back(request.get());
-    }
-    Request* readmission = nextReadmission(candidates);
-
-    bool hol_blocks_new_prompts = false;
-    for (const auto& request : requests_) {
-        const auto* prefilling = request->GetIf<fsm::Prefilling>();
-        if (prefilling != nullptr) {
-            hol_blocks_new_prompts = true;
-            break;
-        }
-    }
-    const std::int32_t occupied = static_cast<std::int32_t>(PrefillSize() + DecodingSize());
-    const std::int32_t free_slots = config_.max_batch_size - occupied;
-    if (free_slots <= 0 && readmission == nullptr) {
-        return {};
-    }
-
-    std::vector<std::string> hashes;
-    std::unordered_set<std::string> seen;
-    const auto append_hashes = [&](const Request& request) {
-        std::vector<std::span<const std::int32_t>> prefix_pages = request.FullPrefixPages(/*except_last=*/false);
-        const std::int32_t candidate_prefix_pages =
-            std::max((request.PrefillSize() - 1) / config_.prefix_granularity, 0);
-        prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
-        for (std::string& content_hash : ComputePrefixHashes(prefix_pages, "")) {
-            if (seen.insert(content_hash).second) {
-                hashes.push_back(std::move(content_hash));
-            }
-        }
-    };
-    if (readmission != nullptr) {
-        append_hashes(*readmission);
-    }
-    if (free_slots <= 0 || hol_blocks_new_prompts || AvailableLcmBlocks() <= 0) {
-        return hashes;
-    }
-    std::int32_t remaining = free_slots;
-    if (readmission != nullptr) {
-        remaining = std::max(remaining - 1, 0);
-    }
-    for (Request* request : candidates) {
-        if (remaining <= 0) {
-            break;
-        }
-        if (request == readmission) {
-            continue;
-        }
-        if (request->Is<fsm::Submitted>()) {
-            append_hashes(*request);
-            --remaining;
-            continue;
-        }
-        const auto* retracted = request->GetIf<fsm::Retracted>();
-        if (retracted != nullptr && !retracted->HasRecoverableSnapshot()) {
-            append_hashes(*request);
-            --remaining;
-        }
-    }
-    return hashes;
-}
-
 std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {
     const auto it = requests_by_id_.find(id);
     return it == requests_by_id_.end() ? -1 : it->second->TokenSize();
@@ -462,11 +456,20 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             candidates.push_back(request.get());
         }
     }
+    ++plan_calls_;
+    const std::size_t num_live_requests = candidates.size();
     ExecutionPlan plan;
-    auto [forward_operations, load_back_operations] =
-        buildForwardOperations(plan, std::move(candidates), write_back_operations);
+    // Every group is listed, empty or not, so the runtime indexes the maps
+    // without guarding for absent groups.
+    for (const std::string& group_id : cache_group_ids_) {
+        plan.pages_to_zero[group_id];
+        plan.pages_to_copy[group_id];
+    }
+    BuiltOperations built = buildForwardOperations(plan, std::move(candidates), write_back_operations);
+    const bool builds_work =
+        !built.forward.empty() || plan.remote_decode.has_value() || plan.remote_prefill.has_value();
 
-    plan.With(ForwardBatch{std::move(forward_operations)});
+    plan.With(ForwardBatch{std::move(built.forward)});
 
     if (config_.StreamsDeviceCacheToHost()) {
         // Boundary publications of live requests: their owners hold the pages,
@@ -477,19 +480,65 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         }
     }
 
+    // Store legs first (the runtime fences the forward thread's stream on the
+    // stream-ordered ones before the plan's page reuse), then the L3
+    // prefetches (no stream dependency: nothing in the round reads them),
+    // then the loads.
     if (!write_back_operations.empty()) {
         plan.With(CacheOperation{WriteBackBatch{write_back_operations}});
     }
-    if (!load_back_operations.empty()) {
-        plan.With(CacheOperation{LoadBackBatch{load_back_operations}});
+    if (!built.snapshot_stores.empty()) {
+        plan.With(CacheOperation{SnapshotStoreBatch{built.snapshot_stores}});
     }
+    if (!built.prefetches.empty()) {
+        plan.With(CacheOperation{PrefetchBatch{built.prefetches}});
+    }
+    if (!built.load_backs.empty()) {
+        plan.With(CacheOperation{LoadBackBatch{built.load_backs}});
+    }
+    if (!built.snapshot_restores.empty()) {
+        plan.With(CacheOperation{SnapshotRestoreBatch{built.snapshot_restores}});
+    }
+    trackStalledRounds(num_live_requests,
+                       /*plan_is_empty=*/!builds_work && write_back_operations.empty() &&
+                           built.snapshot_stores.empty() && built.prefetches.empty() && built.load_backs.empty() &&
+                           built.snapshot_restores.empty() && plan.aborts.empty());
     return plan;
+}
+
+void Scheduler::trackStalledRounds(std::size_t num_live_requests, bool plan_is_empty) {
+    // With nothing out, only a new submission or an abort can change the next
+    // plan.
+    const bool stalled = num_live_requests > 0 && plan_is_empty && !tier_transfers_.HasAnyInFlight() &&
+                         std::ranges::none_of(requests_, [this](const std::unique_ptr<Request>& request) {
+                             return request->ResultsInFlight() > 0 || pdTransferInFlight(*request);
+                         });
+    if (!stalled) {
+        if (stalled_rounds_ >= kStalledRoundsBeforeWarning) {
+            spdlog::info("[Scheduler] scheduling resumed after {} stalled rounds", stalled_rounds_);
+        }
+        stalled_rounds_ = 0;
+        return;
+    }
+    ++stalled_rounds_;
+    if (stalled_rounds_ >= kStalledRoundsBeforeWarning &&
+        std::has_single_bit(static_cast<std::uint64_t>(stalled_rounds_))) {
+        spdlog::warn(
+            "[Scheduler] no work scheduled for {} consecutive rounds with {} live requests and nothing in flight "
+            "(waiting={}, prefilling={}, decoding={}; device LCM blocks active={}, empty={}, total={}); "
+            "they cannot progress until a request is aborted",
+            stalled_rounds_, num_live_requests, WaitingSize(), PrefillSize(), DecodingSize(), ActiveLcmBlocks(),
+            EmptyLcmBlocks(), coordinator_.TotalLcmBlocks());
+    }
 }
 
 void Scheduler::Advance(const ExecutionEvent& event) {
     for (const auto& item : event.Events()) {
         std::visit([this](const auto& inner) { handleEvent(inner); }, item);
     }
+    // Finishing is entered and forwards land only here, so this is the one
+    // place a finished request can become settleable.
+    settleFinishedRequests();
 }
 
 }  // namespace tokenspeed

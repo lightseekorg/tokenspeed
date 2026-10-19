@@ -53,12 +53,12 @@ def test_forced_initial_and_local_candidates_survive_topk() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_combine_topk_weights_tolerates_padded_scales() -> None:
     from tokenspeed_kernel.ops.attention.dsa._triton.topk import combine_topk_weights
-    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
 
     # Quantizers pad scale rows on some backends but not others. Add trailing
     # NaNs explicitly so only the 16 real rows may be read on every backend.
     q = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
-    _, scale = quantize_fp8_with_scale(
+    _, scale = quantize_fp8(
         q, granularity="token_group", group_size=128, scale_encoding="float32"
     )
     real_scale = scale.reshape(-1)[:16]

@@ -3,15 +3,16 @@
 QSA scores compressed index keys, selects logical blocks, expands them to
 full-cache slots, and attends to those slots. The public block selector in
 `ops.attention.qsa` takes an explicit `auto`, `stream` or `logits` path and
-dispatches registered implementations through `select_kernel`. Backend
-selection (`solution`) and kernel overrides preserve the requested path.
+dispatches registered scoring, selection and streaming implementations through
+`select_kernel`. Backend selection (`solution`) and kernel overrides preserve
+the requested path.
 Slot expansion and attention share the same contracts for all paths.
 
 ## Automatic selection
 
 Automatic selection uses query rows, compressed block-table capacity and
-supported layouts, independently of prefill/decode. B300 cold-L2 CUDA-graph
-measurements favor grouped CuTe streaming from 512 rows for tables of at least
+supported layouts, independently of prefill/decode. The current policy selects
+grouped CuTe streaming from 512 rows for tables of at least
 16384 compressed blocks (64K tokens at ratio four), and from 8192 rows for
 shorter tables. Smaller batches use logits. Uniform runs must satisfy the
 CuTe grouping contract; ragged runs and unsupported layouts use logits while
@@ -22,9 +23,9 @@ The runtime passes `TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH` and
 `TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB` to this shared entry. Explicit `stream`
 and `logits` paths bypass the automatic choice and its score-matrix budget.
 `solution="cute_dsl"` or `solution="triton"` restricts the backend within the
-chosen path, with normal capability and layout filtering. A kernel override
-cannot change its required path feature; the CuTe entry rejects unsupported
-layouts when called directly or through an override.
+chosen path, with normal capability and layout filtering. Required path
+features also reject forced kernel names from the other algorithm; the CuTe entry
+rejects unsupported layouts when called directly or through an override.
 
 ## Streaming block selection
 
@@ -87,11 +88,15 @@ and producer-owned metadata reads; captured graphs retain the supplied flag.
 
 ## Materialized block selection
 
-The `logits` path materializes FP32 scores and then radix-selects. A
-caller-owned workspace enables the length-aware persistent CUDA selector;
-other callers use portable Triton top-k. Both scoring paths are registered
-under `attention.qsa_block_topk`; required `stream`/`logits` features keep
-selection and overrides within the requested algorithm.
+The `logits` path composes `qsa_block_scores` and `qsa_block_topk_select`.
+Scoring uses the bounded, occupancy-aware grid from the shared QSA scorer;
+selection chooses the length-aware CUDA, Gluon or portable Triton solution.
+CUDA manages its scratch inside its own solution. Score tails remain
+uninitialized and every selector receives each row's complete-block frontier.
+The fused path uses `qsa_block_topk_stream`, with explicit uniform query widths
+for both CuTe and Triton. The stages declare required `logits` or `stream`
+features, keeping overrides within the requested algorithm; explicitly selected
+backends also apply to both materialized stages.
 
 ## Measurement
 
@@ -121,44 +126,57 @@ for zero queries that stress equal-score selection. Cold-cache isolated
 measurements establish kernel costs; end-to-end model measurements must also
 include slot expansion, sparse attention and interference from other layers.
 
-B300 cold-L2 graph measurements below use trimmed tables, BF16 four-head
-queries of width 128, top-k 512, PDL enabled, causal frontiers and one uniform
-request. Each value is the median of three seed medians with 45 samples per
-seed. Times cover scoring and selection only, in microseconds.
+Measurements after merging `main` at `26fffca5` use NVIDIA L20B (SM103),
+CUDA 13.0, PyTorch 2.14.0+cu130, CuTe DSL 4.8.0 and tokenspeed-triton
+3.8.10.post20260920. BF16 queries have four 128-wide heads and top-k 512,
+with PDL enabled, causal frontiers and cold L2. The matrix covers 20 layouts,
+three seeds and three paths (CuTe, logits and auto), with 10 warmups and
+45 samples per run. Backends use paired inputs on the same GPU in randomized
+order. Every run validates up to eight rows against FP32 reference scores,
+including counts, unique ids and padding. Times below are medians of the three
+seed medians, in microseconds, and cover scoring plus selection.
 
-| Query rows / live KV tokens | Logits | CuTe stream | Auto |
+| Query rows / live KV tokens | Logits | CuTe stream | Stream time change |
 | --- | ---: | ---: | ---: |
-| 256 / 32768 | 36.9 | 67.6 | 36.9 |
-| 512 / 65536 | 112.6 | 100.4 | 100.4 |
-| 8192 / 8192 | 135.2 | 116.9 | 118.4 |
-| 16384 / 16384 | 405.5 | 262.1 | 262.1 |
-| 16384 / 32768 | 798.8 | 700.4 | 700.4 |
-| 16384 / 65536 | 1538.0 | 1198.1 | 1198.1 |
+| 1 / 32768 | 13.73 | 11.68 | -14.9% |
+| 256 / 32768 | 32.10 | 66.62 | +107.6% |
+| 512 / 65536 | 87.49 | 99.39 | +13.6% |
+| 1024 / 131072 | 179.65 | 165.22 | -8.0% |
+| 8192 / 8192 | 124.29 | 114.02 | -8.3% |
+| 8192 / 32768 | 347.58 | 376.16 | +8.2% |
+| 16384 / 16384 | 312.77 | 243.04 | -22.3% |
+| 16384 / 32768 | 603.55 | 681.31 | +12.9% |
+| 16384 / 65536 | 1150.37 | 1164.67 | +1.2% |
+| 16384 / 262144 | 4103.52 | 3707.17 | -9.7% |
 
-Table capacity also matters: at 512 query rows and 65536 live KV tokens,
-reserving 65600 compressed blocks raises logits to 163.8 us while CuTe
-streaming remains 100.4 us. The row thresholds are conservative: some tiny
-trimmed grids favor CuTe by a few microseconds, and individual short-context
-layouts can favor logits beyond the threshold. Explicit paths remain available
-for those workloads.
+These rows use trimmed tables and one uniform request. The matrix also covers
+multiple requests, eight-row request runs, and tables padded to 65600 compressed
+blocks. Capacity can change the chosen CuTe specialization: 16384 rows / 16384
+live KV tokens with that padded table takes 349.60 us for stream and 318.88 us
+for logits, reversing the trimmed-table result.
 
-The portable Triton optimization uses the same measurement method with 50
-samples per seed, pairing both versions and the other backends on each GPU.
-Across 149 shapes, including multiple requests, small request-run widths,
-padded capacities and full frontiers, it improves by 1.71–9.95x with a 3.60x
-median and no measured regression. All Triton cases allocate only their output.
-For the model's grouped layout, shared memory drops from 133 KiB to 33 KiB,
-registers from 255 to 210 per thread, and local-memory spills disappear.
+The latest bounded scorer and CUDA selector make logits faster than the PR's
+original baseline. CuTe still wins on fresh 8K/16K prefills and some long-context
+cases, while logits wins on several intermediate contexts. Existing automatic
+shape thresholds are preserved in this merge; they do not always choose the
+lowest latency with the new scorer. The score-matrix budget can also force
+streaming even when explicitly requested logits would be faster. These
+operator measurements do not imply whole-model throughput improvements.
 
-| Query rows / live KV tokens | Triton before | Triton | CuTe stream | Logits |
-| --- | ---: | ---: | ---: | ---: |
-| 1 / 32768 | 415.7 | 141.3 | 10.2 | 12.3 |
-| 512 / 65536 | 3142.7 | 444.4 | 100.4 | 112.6 |
-| 1024 / 131072 | 11097.6 | 1736.7 | 167.9 | 221.2 |
-| 8192 / 8192 | 3661.8 | 454.7 | 118.8 | 135.2 |
-| 16384 / 32768 | 34591.8 | 4739.7 | 700.4 | 798.7 |
-| 16384 / 262144 | 350049.3 | 46774.8 | 3816.4 | 5894.2 |
+The portable Triton stream retains the PR's output-only optimization and its
+zero-scratch contract; the comparison above uses CuTe streaming and the latest
+registered materialized scoring/selection path.
 
-Times are microseconds. CuTe or logits remains fastest in every measured shape;
-automatic path thresholds are unchanged. Triton provides a faster portable
-zero-scratch fallback, while tiny grids still lack key-range parallelism.
+Nsight Systems captures of the same graph nodes, with seed 83 and 20 replays
+per case, confirm the direction of the event measurements. The following
+min/mean/max GPU spans run from the first scoring kernel's start to the final
+selector's end, excluding cache clearing and CPU launch gaps, in microseconds.
+Scoring and CUDA selection overlap through PDL, so their individual kernel
+durations must not be added to estimate latency.
+
+| Query rows / live KV tokens | CuTe stream min/mean/max | Logits min/mean/max |
+| --- | ---: | ---: |
+| 8192 / 8192 | 108.77 / 109.56 / 110.31 | 117.67 / 118.64 / 122.27 |
+| 16384 / 16384 | 236.90 / 238.11 / 239.01 | 306.50 / 308.07 / 309.57 |
+| 8192 / 32768 | 370.31 / 371.19 / 372.77 | 341.48 / 345.95 / 355.27 |
+| 16384 / 32768 | 675.46 / 676.30 / 679.17 | 594.60 / 602.21 / 612.45 |

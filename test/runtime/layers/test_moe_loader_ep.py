@@ -6,9 +6,12 @@ import torch
 from tokenspeed.runtime.layers.moe import expert as expert_module
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import (
+    CheckpointPlanEntry,
+    ExpertWeightPlanEntry,
     FusedExpertWeightPlanEntry,
     MoECheckpointLoader,
     _build_default_expert_plan,
+    _ExpertPlanIndex,
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
@@ -80,7 +83,7 @@ def test_mtp_fp8_block_scales_load_into_local_ep_expert(
 
     trtllm_backend = type("TrtllmBackend", (), {"value": "flashinfer_trtllm"})()
     monkeypatch.setattr(expert_module, "get_moe_backend", lambda: trtllm_backend)
-    monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_plan", fake_moe_plan)
+    monkeypatch.setattr(expert_module, "kernel_moe_plan", fake_moe_plan)
     quant_config = ModelOptMixedConfig(
         quantized_layers={
             "mtp.layers.0.mlp.experts": "FP8_BLOCK_SCALES",
@@ -217,3 +220,57 @@ def test_activation_scales_use_all_checkpoint_experts(ep_rank, quant_kind, fused
     torch.testing.assert_close(
         layer.w2_input_scale, torch.full_like(layer.w2_input_scale, 9.0)
     )
+
+
+def test_expert_index_preserves_substring_matches_and_replica_order():
+    plan = [
+        CheckpointPlanEntry("fallback", "proj.", "w1"),
+        ExpertWeightPlanEntry("a", "experts.1.proj.", "w1", 0, None),
+        ExpertWeightPlanEntry("b", "experts.11.proj.", "w1", 1, 2),
+        ExpertWeightPlanEntry("c", "experts.1.proj.", "w1", 2, None),
+        CheckpointPlanEntry("other", "custom", "w2"),
+    ]
+    index = _ExpertPlanIndex(plan)
+    for name in (
+        "model.layers.2.experts.1.proj.weight",
+        "model.layers.2.experts.11.proj.weight",
+        "model.layers.3.experts.11.proj.weight",
+        "experts.1.proj.experts.11.proj.weight",
+        "custom.weight",
+        "unrelated.weight",
+    ):
+        assert [e for e in index.candidates(name) if e.matches(name)] == [
+            e for e in plan if e.matches(name)
+        ]
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        ExpertCheckpointSchema(),
+        _KIMI3_SCHEMA,
+        ExpertCheckpointSchema(gate_proj_name=None),
+    ],
+)
+@pytest.mark.parametrize("ep_rank", [0, 1])
+def test_expert_index_preserves_schema_and_ep_matches(schema, ep_rank):
+    plan = _build_default_expert_plan(
+        schema,
+        num_experts=16,
+        ep_rank=ep_rank,
+        ep_size=2,
+    )
+    index = _ExpertPlanIndex(plan)
+    for expert_id in range(17):
+        for projection in ("gate_proj", "up_proj", "down_proj", "w1", "w2", "w3"):
+            for suffix in ("weight", "weight_scale_inv", "input_scale", "bias"):
+                name = f"model.layers.3.mlp.experts.{expert_id}.{projection}.{suffix}"
+                assert [
+                    entry for entry in index.candidates(name) if entry.matches(name)
+                ] == [entry for entry in plan if entry.matches(name)]
+    # The common indexed case keeps only this expert's projection entries.
+    local_expert = ep_rank * 8
+    candidates = index.candidates(
+        f"model.layers.3.mlp.experts.{local_expert}.w1.weight"
+    )
+    assert len(candidates) == (2 if schema.gate_proj_name is None else 3)

@@ -780,11 +780,6 @@ def gluon_mxfp4_moe_stage1_e4m3_async_kernel(
             b_format="e2m1",
             acc=acc,
         )
-        # All N-partitioned waves must finish reading the current A slot
-        # before the next iteration reuses it as the async-copy destination.
-        # load_shared_relaxed opts out of the compiler's async-copy hazard
-        # tracking, so this write-after-read barrier stays explicit.
-        gl.barrier()
 
     last_tile: gl.constexpr = NUM_K_TILES - 1
     last_slot: gl.constexpr = last_tile % NUM_BUFFERS
@@ -943,8 +938,10 @@ def gluon_mxfp4_moe_stage1_kernel(
     gl.static_assert(BLOCK_N == 128, "stage1 kernel requires BLOCK_N=128")
     gl.static_assert(BLOCK_K == 256, "stage1 kernel requires BLOCK_K=256")
     gl.static_assert(
-        NUM_WARPS == max(1, BLOCK_M // 32) or (A_FORMAT == "e4m3" and NUM_WARPS == 8),
-        "stage1 kernel requires the native E2M1 wave count or eight E4M3 waves",
+        NUM_WARPS == max(1, BLOCK_M // 32)
+        or (A_FORMAT == "e4m3" and NUM_WARPS == 8)
+        or (A_FORMAT == "e2m1" and BLOCK_M == 32 and NUM_WARPS == 4),
+        "stage1 requires native E2M1 subgroups, four for BM32, or eight for E4M3",
     )
     gl.static_assert(not OUTPUT_QUANTIZED or OUTPUT_SORTED)
 
@@ -2190,8 +2187,12 @@ def invoke_gluon_mxfp4_moe_stage1(
     output_format: str = "e2m1",
     input_sorted: bool = False,
     source_tokens: int | None = None,
+    *,
+    num_warps: int,
 ):
     """Host-side launcher for Gluon MXFP4 MoE stage 1.
+
+    ``num_warps`` explicitly selects the stage's subgroup geometry.
 
     Computes, for each expert ``e``, the default SwiGLU expression::
 
@@ -2416,7 +2417,7 @@ def invoke_gluon_mxfp4_moe_stage1(
     BLOCK_N = 128
     BLOCK_K = 256
     GROUP_SIZE_M = 1
-    NUM_WARPS = 8 if a_format == "e4m3" else max(1, BLOCK_M // 32)
+    NUM_WARPS = num_warps
     num_pid_m = triton.cdiv(EM, BLOCK_M)
     output_block_n = BLOCK_N // 2 if b_gdot128 else BLOCK_N
     num_pid_n = triton.cdiv(I_r, output_block_n)

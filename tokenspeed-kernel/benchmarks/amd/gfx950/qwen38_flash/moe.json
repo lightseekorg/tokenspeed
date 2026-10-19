@@ -1,0 +1,211 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "model_profile": "qwen38_flash_tp2",
+    "num_experts": 512
+  },
+  "cases": [
+    {
+      "id": "qwen38_flash.moe.softmax_topk/decode-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "moe",
+        "mode": "softmax_topk",
+        "parameters": {
+          "tokens": [
+            16,
+            64
+          ],
+          "topk": 10,
+          "router_logits_dtype": "bfloat16",
+          "normalize_topk_weights": true
+        },
+        "cold_cache": true,
+        "seed": 5101
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.moe.softmax_topk/prefill-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "moe",
+        "mode": "softmax_topk",
+        "parameters": {
+          "tokens": [
+            8192
+          ],
+          "topk": 10,
+          "router_logits_dtype": "bfloat16",
+          "normalize_topk_weights": true
+        },
+        "cold_cache": true,
+        "seed": 5102
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "qwen38_flash.moe.apply/tp2-decode-mxfp4",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "moe",
+        "mode": "apply",
+        "parameters": {
+          "tokens": [
+            16,
+            64
+          ],
+          "hidden_size": 2560,
+          "intermediate_size": 640,
+          "num_local_experts": 512,
+          "topk": 10,
+          "tp_size": 2,
+          "ep_size": 1,
+          "ep_rank": 0,
+          "input_dtype": "bfloat16",
+          "router_logits_dtype": "bfloat16",
+          "weight_dtype": "mxfp4",
+          "activation": "silu",
+          "routing_mode": "precomputed_topk",
+          "route_scope": "global",
+          "route_distribution": "router",
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true,
+          "internal_activation_dtype": "mxfp4",
+          "token_count_scope": "global"
+        },
+        "cold_cache": true,
+        "seed": 5103
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 3.0
+      }
+    },
+    {
+      "id": "qwen38_flash.moe.apply/tp2-prefill-mxfp4",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "moe",
+        "mode": "apply",
+        "parameters": {
+          "tokens": [
+            512,
+            2048,
+            8192
+          ],
+          "hidden_size": 2560,
+          "intermediate_size": 640,
+          "num_local_experts": 512,
+          "topk": 10,
+          "tp_size": 2,
+          "ep_size": 1,
+          "ep_rank": 0,
+          "input_dtype": "bfloat16",
+          "router_logits_dtype": "bfloat16",
+          "weight_dtype": "mxfp4",
+          "activation": "silu",
+          "routing_mode": "precomputed_topk",
+          "route_scope": "global",
+          "route_distribution": "router",
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true,
+          "internal_activation_dtype": "mxfp4",
+          "token_count_scope": "global"
+        },
+        "cold_cache": true,
+        "seed": 5104
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 10.0
+      }
+    },
+    {
+      "id": "qwen38_flash.moe.apply/mtp-tp2-decode-unquant",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "moe",
+        "mode": "apply",
+        "parameters": {
+          "tokens": [
+            16,
+            64
+          ],
+          "hidden_size": 2560,
+          "intermediate_size": 640,
+          "num_local_experts": 512,
+          "topk": 10,
+          "tp_size": 2,
+          "ep_size": 1,
+          "ep_rank": 0,
+          "input_dtype": "bfloat16",
+          "router_logits_dtype": "bfloat16",
+          "weight_dtype": "unquant",
+          "activation": "silu",
+          "routing_mode": "precomputed_topk",
+          "route_scope": "global",
+          "route_distribution": "router",
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true,
+          "internal_activation_dtype": "input",
+          "token_count_scope": "global"
+        },
+        "cold_cache": true,
+        "seed": 5105
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 3.0
+      }
+    },
+    {
+      "id": "qwen38_flash.moe.apply/mtp-tp2-prefill-unquant",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "moe",
+        "mode": "apply",
+        "parameters": {
+          "tokens": [
+            512,
+            2048,
+            8192
+          ],
+          "hidden_size": 2560,
+          "intermediate_size": 640,
+          "num_local_experts": 512,
+          "topk": 10,
+          "tp_size": 2,
+          "ep_size": 1,
+          "ep_rank": 0,
+          "input_dtype": "bfloat16",
+          "router_logits_dtype": "bfloat16",
+          "weight_dtype": "unquant",
+          "activation": "silu",
+          "routing_mode": "precomputed_topk",
+          "route_scope": "global",
+          "route_distribution": "router",
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true,
+          "internal_activation_dtype": "input",
+          "token_count_scope": "global"
+        },
+        "cold_cache": true,
+        "seed": 5106
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 10.0
+      }
+    }
+  ]
+}

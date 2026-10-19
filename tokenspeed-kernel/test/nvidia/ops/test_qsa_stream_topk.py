@@ -349,7 +349,6 @@ def test_cute_dsl_qsa_stream_topk_matches_reference(
             max_logits_bytes=256 << 20,
             solution="cute_dsl",
             override=None,
-            persistent_topk_workspace=None,
             enable_pdl=enable_pdl,
         )
     _assert_matches_reference(
@@ -417,7 +416,6 @@ def test_cute_dsl_qsa_stream_topk_keeps_groups_within_requests(
         max_logits_bytes=256 << 20,
         solution="cute_dsl",
         override=None,
-        persistent_topk_workspace=None,
         enable_pdl=False,
     )
     _assert_matches_reference(
@@ -609,7 +607,6 @@ def test_cute_dsl_qsa_stream_topk_prefill_graph_without_global_partial(
             max_logits_bytes=256 << 20,
             solution="cute_dsl",
             override=None,
-            persistent_topk_workspace=None,
             enable_pdl=enable_pdl,
         )
 
@@ -708,7 +705,6 @@ def test_stream_topk_graph_refreshes_pruning_and_full_refinement(
             max_logits_bytes=256 << 20,
             solution="cute_dsl",
             override=None,
-            persistent_topk_workspace=None,
             enable_pdl=enable_pdl,
         )
 
@@ -861,7 +857,6 @@ def test_stream_topk_graph_preserves_ids_above_65535(
             max_logits_bytes=256 << 20,
             solution="triton" if pages > 2048 else "cute_dsl",
             override=None,
-            persistent_topk_workspace=None,
             enable_pdl=enable_pdl,
         )
 

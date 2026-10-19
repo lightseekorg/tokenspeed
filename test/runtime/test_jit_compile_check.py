@@ -23,8 +23,8 @@
 from __future__ import annotations
 
 import pytest
+import tokenspeed_kernel.compile_monitor as compile_monitor
 from prometheus_client import CollectorRegistry
-from tokenspeed_kernel import compile_monitor
 from tokenspeed_kernel.compile_monitor import CompileStats
 
 from tokenspeed.runtime.metrics.collector import EngineMetrics
@@ -67,7 +67,9 @@ def test_install_rejects_unknown_modes(monkeypatch, uninstall):
 
 def test_metrics_export_serving_compiles_as_deltas():
     registry = CollectorRegistry()
-    metrics = EngineMetrics({"model_name": "m"}, enabled=True, registry=registry)
+    metrics = EngineMetrics(
+        {"model_name": "m"}, reporters=["prometheus"], enabled=True, registry=registry
+    )
 
     def exported():
         return (

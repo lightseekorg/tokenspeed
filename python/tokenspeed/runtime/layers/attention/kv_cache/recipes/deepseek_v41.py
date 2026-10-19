@@ -147,10 +147,18 @@ class DeepseekV41Recipe(CacheRecipe):
         fields: dict[str, list[CacheFieldSpec]] = {
             gid: [] for gid in V41_GROUP_GEOMETRY
         }
+        rows = self._row_layout()
 
         def add(
             gid: str, layer: int, name: str, shape: tuple[int, ...], dtype: str
         ) -> None:
+            # Native sparse scoring reads FP4 index pages in place and requires
+            # a 512-byte page stride, including when DSpark shares the arena.
+            stride_alignment = 256
+            if name == "swa" or (
+                name == "index_k" and rows.index_kernel_format == "index"
+            ):
+                stride_alignment = 512
             fields[gid].append(
                 CacheFieldSpec(
                     field_id=f"layer.{layer}.{name}",
@@ -158,11 +166,10 @@ class DeepseekV41Recipe(CacheRecipe):
                     shape=shape,
                     dtype=dtype,
                     exact_page_stride=False,
-                    page_stride_alignment_bytes=512 if name == "swa" else 256,
+                    page_stride_alignment_bytes=stride_alignment,
                 )
             )
 
-        rows = self._row_layout()
         for layer in range(self.num_target_layers):
             add(V41_SWA_GROUP_ID, layer, "swa", (64, rows.swa_row_bytes), "uint8")
         # The draft reads each stage's window with the target's SWA slots, so
@@ -214,16 +221,14 @@ class DeepseekV41Recipe(CacheRecipe):
         specs = [
             CacheGroupSpec(
                 group_id=gid,
-                retention=(
+                attn_kind=(
                     "full_history" if windows[gid] is None else "sliding_window"
                 ),
                 rows_per_page=rows,
                 entry_stride_tokens=stride,
                 sliding_window_tokens=windows[gid],
                 replayable=windows[gid] is not None,
-                family="history",
                 transfer_policy=None,
-                checkpoint_granularity=None,
             )
             for gid, (rows, stride) in V41_GROUP_GEOMETRY.items()
         ]

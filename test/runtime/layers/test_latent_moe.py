@@ -635,16 +635,14 @@ def _shard_projection(monkeypatch, world: int, rank: int, out: int, k: int):
     offsets, gather layout) is what the test exercises.
     """
     monkeypatch.setattr(
-        latent_module.tokenspeed_kernel,
-        "kimi3_latent_projection",
+        latent_module,
+        "kernel_kimi3_latent_projection",
         lambda x, w, solution=None: x @ w.T,
-        raising=False,
     )
     monkeypatch.setattr(
-        latent_module.tokenspeed_kernel,
-        "kimi3_latent_projection_add3",
+        latent_module,
+        "kernel_kimi3_latent_projection_add3",
         lambda x, w, a, c, norm_weight=None, eps=None: a + x @ w.T + c,
-        raising=False,
     )
     return latent_module.Kimi3LatentProjection(
         k,
@@ -744,10 +742,9 @@ def test_kimi3_latent_projection_replicated_forward_never_reduces(
     out, k = 16, 64
     seen: list[tuple[torch.Tensor, object]] = []
     monkeypatch.setattr(
-        latent_module.tokenspeed_kernel,
-        "kimi3_latent_projection",
+        latent_module,
+        "kernel_kimi3_latent_projection",
         lambda x, w, solution=None: x @ w.T,
-        raising=False,
     )
     monkeypatch.setattr(
         latent_module,
@@ -833,8 +830,8 @@ def test_latent_projection_nvfp4_dispatch_and_bf16_fallback(
 
     mailbox.side_effect = multicast
     monkeypatch.setattr(
-        latent_module.tokenspeed_kernel,
-        "kimi3_latent_projection",
+        latent_module,
+        "kernel_kimi3_latent_projection",
         lambda x, w, solution: x @ w.T,
     )
     gathers = []
@@ -882,8 +879,8 @@ def test_latent_projection_nvfp4_without_mailbox_stays_dense(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        latent_module.tokenspeed_kernel,
-        "kimi3_latent_projection",
+        latent_module,
+        "kernel_kimi3_latent_projection",
         lambda x, w, solution: x @ w.T,
     )
     proj = latent_module.Kimi3LatentProjection(8, 16, params_dtype=torch.float32)
@@ -920,10 +917,9 @@ class _FakeMulticastDown:
 
 def _multicast_projection(monkeypatch, world, rank, out, k, calls, max_m=8):
     monkeypatch.setattr(
-        latent_module.tokenspeed_kernel,
-        "kimi3_latent_projection",
+        latent_module,
+        "kernel_kimi3_latent_projection",
         lambda x, w, solution=None: x @ w.T,
-        raising=False,
     )
     monkeypatch.setattr(
         latent_module,
@@ -947,10 +943,9 @@ def test_the_multicast_path_needs_no_group_of_its_own(
     """The op carries its own group, so the projection needs none wired in."""
     out, k = 16, 64
     monkeypatch.setattr(
-        latent_module.tokenspeed_kernel,
-        "kimi3_latent_projection",
+        latent_module,
+        "kernel_kimi3_latent_projection",
         lambda x, w, solution=None: pytest.fail("the multicast op must be dispatched"),
-        raising=False,
     )
     calls: list = []
     proj = latent_module.Kimi3LatentProjection(
@@ -1001,10 +996,9 @@ def test_kimi3_latent_projection_hands_wide_batches_back_to_the_replicated_route
     proj.weight_loader(proj.weight, weight)
     # After the fixture, whose own stub would otherwise shadow this one.
     monkeypatch.setattr(
-        latent_module.tokenspeed_kernel,
-        "kimi3_latent_projection",
+        latent_module,
+        "kernel_kimi3_latent_projection",
         lambda x, w, solution=None: replicated.append(x.shape[0]) or x @ w.T,
-        raising=False,
     )
     hidden = torch.randn(9, k)
     output, _ = proj(hidden)
@@ -1049,10 +1043,9 @@ def _column_projection(monkeypatch, world, rank, out, k, calls=None, max_m=0):
     dispatch can be exercised on one object.
     """
     monkeypatch.setattr(
-        latent_module.tokenspeed_kernel,
-        "kimi3_latent_projection",
+        latent_module,
+        "kernel_kimi3_latent_projection",
         lambda x, w, solution=None: x @ w.T,
-        raising=False,
     )
     monkeypatch.setattr(
         latent_module,

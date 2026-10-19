@@ -58,7 +58,7 @@ def test_gb300_slurm_path_filter_ignores_other_vendor_workflows():
         f"{KERNEL}/ops/attention/mha/__init__.py",
         f"{KERNEL}/ops/attention/mha/triton.py",
         f"{KERNEL}/ops/attention/mha/_triton/decode.py",
-        f"{KERNEL}/ops/gemm/triton_gemv.py",
+        f"{KERNEL}/ops/gemm/triton.py",
         f"{KERNEL}/thirdparty/__init__.py",
         "python/tokenspeed/runtime/sampling/backends/flashinfer.py",
     ],
@@ -79,7 +79,7 @@ def test_shared_paths_require_every_group(path):
         "test/ci_system/install_deps_rocm.sh",
         f"{KERNEL}/ops/attention/mha/gluon.py",
         f"{KERNEL}/ops/attention/dsv41/_gluon/indexer.py",
-        f"{KERNEL}/ops/moe/gluon/mxfp4.py",
+        f"{KERNEL}/ops/moe/gluon.py",
         f"{KERNEL}/ops/communication/iris.py",
     ],
 )
@@ -100,8 +100,8 @@ def test_amd_owned_paths_require_only_amd(path):
         f"{KERNEL}/ops/attention/mha/flashinfer.py",
         f"{KERNEL}/ops/attention/rmha/_cute_dsl/rel_decode.py",
         f"{KERNEL}/ops/attention/gdn/_flashinfer/adapter.py",
-        f"{KERNEL}/ops/moe/deep_gemm/_triton/mega_moe_stage.py",
-        f"{KERNEL}/ops/moe/flashinfer/trtllm_mxfp4.py",
+        f"{KERNEL}/ops/moe/_deep_gemm/mega_moe_stage.py",
+        f"{KERNEL}/ops/moe/flashinfer.py",
         f"{KERNEL}/ops/communication/_cuda/a2a_fp8.cuh",
         f"{KERNEL}/ops/communication/_cuda/lamport_a2a.py",
         f"{KERNEL}/ops/communication/_cuda/lamport_a2a.cu",
@@ -257,9 +257,23 @@ def test_unrelated_paths_run_nothing():
         assert not should_run({"assets/logo.png"}, group, "pull_request", REPO_ROOT)
 
 
-@pytest.mark.parametrize("runner_group", RUNNER_GROUPS)
-def test_workflow_classifies_the_checkout_after_installing_pyyaml(runner_group):
-    workflow = load_yaml(REPO_ROOT / VENDOR_WORKFLOWS[runner_group])
+VENDOR_WORKFLOW_CASES = [
+    (group, workflow)
+    for group, workflows in VENDOR_WORKFLOWS.items()
+    for workflow in workflows
+]
+
+
+@pytest.mark.parametrize(("runner_group", "workflow_path"), VENDOR_WORKFLOW_CASES)
+def test_workflow_yaml_requires_only_its_runner_group(runner_group, workflow_path):
+    assert required_groups(workflow_path) == {runner_group}
+
+
+@pytest.mark.parametrize(("runner_group", "workflow_path"), VENDOR_WORKFLOW_CASES)
+def test_workflow_classifies_the_checkout_after_installing_pyyaml(
+    runner_group, workflow_path
+):
+    workflow = load_yaml(REPO_ROOT / workflow_path)
     steps = next(
         job["steps"]
         for job in workflow["jobs"].values()

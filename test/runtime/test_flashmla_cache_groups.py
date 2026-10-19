@@ -20,18 +20,22 @@
 
 """FlashMLABackend decode metadata behind the cache-group router.
 
-The router's ``GroupTableStacks`` is now the one place scheduler (logical)
+The router's GroupTableStacks is now the one place scheduler (logical)
 blocks become kernel pages; the FlashMLA leaf consumes the pre-expanded
-``[bs, max_num_pages]`` table and copies it into its persistent buffers.
-Exercises the metadata math only (no FlashMLA CUDA kernel), so it runs on
-any CUDA device.
+[bs, max_num_pages] table and copies it into its persistent buffers.
+Exercises the metadata math only, with optional vendor kernels and prefill
+wrappers mocked at the import boundary. Runs on CPU and any CUDA/ROCm device.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+from importlib import util
+from types import ModuleType
+from unittest.mock import Mock
 
+import pytest
 import torch
 
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -48,18 +52,61 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
+from tokenspeed.runtime.layers.attention import registry
 from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
     GroupTableSpec,
     GroupTableStacks,
 )
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 
 _KERNEL_PAGE = 64
 _FULL = "full_attention"
 
 
-def _flashmla_spec():
-    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+@pytest.fixture(params=["cpu", pytest.param("cuda", marks=requires_cuda)])
+def device(request):
+    return request.param
 
+
+@pytest.fixture
+def flashmla(monkeypatch):
+    kernel = Mock(
+        side_effect=AssertionError("metadata tests must not run attention kernels")
+    )
+    wrappers = Mock(side_effect=lambda *args, **kwargs: Mock(spec=[]))
+    vendor_exports = {
+        "tokenspeed_kernel.ops.attention.mha.cuda": {
+            "flash_attn_varlen_func": kernel,
+        },
+        "tokenspeed_kernel.ops.attention.mha.flashinfer": {
+            "BatchMLAPagedAttentionWrapper": wrappers,
+            "BatchPrefillWithRaggedKVCacheWrapper": wrappers,
+        },
+        "tokenspeed_kernel.ops.attention.mla.cuda": {
+            "flash_mla_with_kvcache": kernel,
+            "get_mla_metadata": Mock(side_effect=lambda: (object(), None)),
+        },
+    }
+    path = os.path.join(
+        os.path.dirname(_TEST_DIR),
+        "python/tokenspeed/runtime/layers/attention/backends/paged/flashmla.py",
+    )
+    spec = util.spec_from_file_location("_flashmla_cache_groups", path)
+    module = util.module_from_spec(spec)
+    with monkeypatch.context() as isolated:
+        for name, exports in vendor_exports.items():
+            vendor = ModuleType(name)
+            vendor.__dict__.update(exports)
+            isolated.setitem(sys.modules, name, vendor)
+        isolated.setitem(sys.modules, spec.name, module)
+        isolated.setattr(registry, "register_backend", Mock())
+        spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "get_flashinfer_workspace_size", Mock(return_value=1))
+    return module
+
+
+def _flashmla_spec():
     return MLAConfig(
         backend_name="flashmla",
         num_attention_heads=16,
@@ -76,16 +123,11 @@ def _flashmla_spec():
 
 
 def _make_flashmla_backend(
-    pool, speculative_num_draft_tokens: int = 1, *, is_draft: bool = False
+    flashmla, pool, speculative_num_draft_tokens: int, is_draft: bool
 ):
-    from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
-        FlashMLABackend,
-    )
-    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
-
     spec = _flashmla_spec()
     config = AttnConfig(
-        device="cuda",
+        device=pool.arena.device,
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         prefix_granularity=_KERNEL_PAGE,
@@ -97,7 +139,7 @@ def _make_flashmla_backend(
         is_draft=is_draft,
         components=(spec,),
     )
-    backend = FlashMLABackend(config, spec, kernel_page_size=_KERNEL_PAGE)
+    backend = flashmla.FlashMLABackend(config, spec, kernel_page_size=_KERNEL_PAGE)
     backend.set_cache_pool(pool)
     return backend
 
@@ -116,7 +158,7 @@ def _stacks_for(backend, pool, max_bs: int = 4) -> GroupTableStacks:
         max_bs=max_bs,
         max_tokens_per_req=backend.spec_num_tokens,
         max_extend_tokens=0,
-        device="cuda",
+        device=backend.device,
     )
 
 
@@ -125,17 +167,18 @@ def _refresh_from_logical(backend, pool, logical_rows, seq_lens_cpu):
     refresh the leaf from the resulting kernel-page view (the unified path)."""
     bs = len(logical_rows)
     stacks = _stacks_for(backend, pool, max_bs=max(bs, 4))
-    raw = torch.tensor(logical_rows, dtype=torch.int32, device="cuda")
+    raw = torch.tensor(logical_rows, dtype=torch.int32, device=backend.device)
     stacks.fill(bs, bs, {_FULL: raw})
-    seq_lens = torch.tensor(seq_lens_cpu, device="cuda", dtype=torch.int32)
+    seq_lens = torch.tensor(seq_lens_cpu, device=backend.device, dtype=torch.int32)
     backend.init_cuda_graph_state(max_bs=max(bs, 4))
     backend.refresh_decode_metadata(bs, bs, seq_lens, stacks.table(_FULL, bs))
     return stacks
 
 
-@requires_cuda
-def test_flashmla_grouped_decode_block_table_follows_the_stack_expansion() -> None:
-    pool = _make_pool("cuda", usable_pages=6)
+def test_flashmla_grouped_decode_block_table_follows_the_stack_expansion(
+    flashmla, device
+) -> None:
+    pool = _make_pool(device, usable_pages=6)
     page_size = pool.arena.prefix_granularity  # logical (scheduler) page size
     ratio = page_size // _KERNEL_PAGE
 
@@ -143,7 +186,7 @@ def test_flashmla_grouped_decode_block_table_follows_the_stack_expansion() -> No
     logical_rows = [[3, 5], [1, 4]]
     seq_lens_cpu = [page_size + 41, page_size + 7]
 
-    backend = _make_flashmla_backend(pool)
+    backend = _make_flashmla_backend(flashmla, pool, 1, False)
     _refresh_from_logical(backend, pool, logical_rows, seq_lens_cpu)
 
     meta = backend.forward_decode_metadata
@@ -156,8 +199,7 @@ def test_flashmla_grouped_decode_block_table_follows_the_stack_expansion() -> No
     assert got_row0 == expected_row0, (got_row0, expected_row0)
 
 
-@requires_cuda
-def test_flashmla_grouped_prefill_index_math() -> None:
+def test_flashmla_grouped_prefill_index_math(flashmla, device) -> None:
     """The per-token slot table built from the expanded kernel-page table
     (flashinfer paged prefill, plan page_size=1).
 
@@ -165,16 +207,12 @@ def test_flashmla_grouped_prefill_index_math() -> None:
     flashinfer paged-prefill READ (wrapper.plan) needs a live serving wrapper
     state and is validated end-to-end on a real model, not here.
     """
-    from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
-        _per_token_slot_table,
-    )
-
-    pool = _make_pool("cuda", usable_pages=6)
+    pool = _make_pool(device, usable_pages=6)
     page_size = pool.arena.prefix_granularity
-    backend = _make_flashmla_backend(pool)
+    backend = _make_flashmla_backend(flashmla, pool, 1, False)
 
     # The leaf consumes the KERNEL-page table the router's stacks expand.
-    logical_table = torch.tensor([[3, 5]], device="cuda", dtype=torch.int32)
+    logical_table = torch.tensor([[3, 5]], device=device, dtype=torch.int32)
     stacks = _stacks_for(backend, pool)
     stacks.fill(1, 1, {_FULL: logical_table})
     table = stacks.table(_FULL, 1)
@@ -182,7 +220,7 @@ def test_flashmla_grouped_prefill_index_math() -> None:
     # Per-token slot table: token t -> table[0, t // p] * p + t % p, which by
     # the expansion invariant equals the logical-table slot. Position
     # page_size+2 -> logical index 1 -> page 5, offset 2.
-    slots = _per_token_slot_table(
+    slots = flashmla._per_token_slot_table(
         table,
         batch_size=1,
         page_size=_KERNEL_PAGE,
@@ -194,18 +232,17 @@ def test_flashmla_grouped_prefill_index_math() -> None:
     assert slots[0, page_size + 2].item() == 5 * page_size + 2
 
 
-@requires_cuda
-def test_flashmla_grouped_target_verify_uses_the_whole_window() -> None:
+def test_flashmla_grouped_target_verify_uses_the_whole_window(flashmla, device) -> None:
     """Target verify (spec_num_tokens>1, non-draft decode) bakes the whole
     window width into the decode views and clamps short rows to it."""
-    pool = _make_pool("cuda", usable_pages=6)
+    pool = _make_pool(device, usable_pages=6)
     page_size = pool.arena.prefix_granularity
     spec = 4
-    backend = _make_flashmla_backend(pool, speculative_num_draft_tokens=spec)
+    backend = _make_flashmla_backend(flashmla, pool, spec, False)
 
     # Verify-window widths: target -> spec, draft -> 1 (the leaf property).
     assert backend.verify_floor == spec
-    draft = _make_flashmla_backend(pool, spec, is_draft=True)
+    draft = _make_flashmla_backend(flashmla, pool, spec, True)
     assert draft.verify_floor == 1
 
     logical_rows = [[3, 5]]
@@ -219,14 +256,13 @@ def test_flashmla_grouped_target_verify_uses_the_whole_window() -> None:
     assert backend.forward_decode_metadata.seq_lens_k.tolist()[0] == spec
 
 
-@requires_cuda
-def test_flashmla_draft_consumes_staged_page_table() -> None:
+def test_flashmla_draft_consumes_staged_page_table(flashmla, device) -> None:
     """A draft leaf reads the batch-ordered draft page table (the staging
     already expanded it into this leaf's kernel pages) as-is."""
-    pool = _make_pool("cuda", usable_pages=6)
+    pool = _make_pool(device, usable_pages=6)
     page_size = pool.arena.prefix_granularity
     ratio = page_size // _KERNEL_PAGE
-    backend = _make_flashmla_backend(pool, is_draft=True)
+    backend = _make_flashmla_backend(flashmla, pool, 1, True)
 
     # The staged table holds KERNEL page ids (already expanded at publish).
     logical_rows = [[3, 5], [1, 4]]
@@ -234,9 +270,9 @@ def test_flashmla_draft_consumes_staged_page_table() -> None:
         [lpage * ratio + k for lpage in row for k in range(ratio)]
         for row in logical_rows
     ]
-    staged = torch.tensor(staged_rows, device="cuda", dtype=torch.int32)
+    staged = torch.tensor(staged_rows, device=device, dtype=torch.int32)
     seq_lens = torch.tensor(
-        [page_size + 41, page_size + 7], device="cuda", dtype=torch.int32
+        [page_size + 41, page_size + 7], device=device, dtype=torch.int32
     )
     backend.init_cuda_graph_state(max_bs=4)
     backend.refresh_decode_metadata(2, 2, seq_lens, staged)

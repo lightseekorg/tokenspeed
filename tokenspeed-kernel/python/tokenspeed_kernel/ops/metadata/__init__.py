@@ -21,7 +21,12 @@
 """Generic CUDA-graph replay metadata prep (the "prep tape")."""
 
 from tokenspeed_kernel.ops.metadata.accepted_frontier import advance_accepted_frontier
-from tokenspeed_kernel.ops.metadata.ngram_history import fill_ngram_history
 from tokenspeed_kernel.ops.metadata.prep_tape import PrepTape, Reg
+from tokenspeed_kernel.ops.metadata.stop_conditions import apply_stop_conditions
 
-__all__ = ["PrepTape", "Reg", "advance_accepted_frontier", "fill_ngram_history"]
+__all__ = [
+    "PrepTape",
+    "Reg",
+    "advance_accepted_frontier",
+    "apply_stop_conditions",
+]

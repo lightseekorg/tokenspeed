@@ -60,6 +60,7 @@ class KVArgs:
     gpu_id: int
     cache_layout: CacheTransferContract
     cache_fields_by_stage: tuple[tuple[str, ...], ...]
+    registration_regions: tuple[tuple[int, int], ...] = ()
     cache_producer_schedule: CacheProducerSchedule | None = None
     # Full-model logical contract for the PD wire when the local arena/plan
     # is narrowed to a stage window; None means cache_layout is already it.
@@ -67,11 +68,14 @@ class KVArgs:
 
     @property
     def wire_layout(self) -> CacheTransferContract:
-        return (
+        layout = (
             self.wire_cache_layout
             if self.wire_cache_layout is not None
             else self.cache_layout
         )
+        # Bootstrap compares the logical layout across ranks. Physical bindings
+        # are rank-local and belong only to the transfer endpoint contract.
+        return dataclasses.replace(layout, field_addresses=None)
 
 
 class KVTransferError(Exception):
@@ -157,7 +161,7 @@ class KVArgsRegisterInfo:
     decode_tp_rank: int
     # Computed once by the receiving Prefill rank from the typed registration.
     transfer_fragments: tuple[CacheTransferFragment, ...] = ()
-    # The route's decision for every DCP-sharded group: the blocks this
+    # The route's decision for every KVP-sharded group: the blocks this
     # Prefill rank owns and sends, or None for a group its route carries no
     # fragment of. None as a whole until the route has been planned.
     transfer_owner_filters: Mapping[str, CachePageOwnerFilter | None] | None = None
@@ -223,5 +227,5 @@ class KVManagerArgs:
     enable_dp_attention: bool
 
     served_model_name: str
-    app_key: str
-    metrics_reporters: str
+    app_key: str | None
+    metrics_reporters: list[str] | None

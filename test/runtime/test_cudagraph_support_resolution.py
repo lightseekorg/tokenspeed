@@ -28,9 +28,12 @@ subsystems (docs/design/unified_path.md, "Graded CUDA-graph support").
 
 from __future__ import annotations
 
+import importlib
+import logging
 import os
 import sys
-import unittest
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -38,15 +41,15 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 
-class _CudaGraphSupportCase(unittest.TestCase):
-    def setUp(self):
+class _CudaGraphSupportCase:
+    def setup_method(self):
         try:
             from tokenspeed.runtime.layers.attention.backends.base import (
                 CudaGraphSupport,
                 resolve_cuda_graph_support,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch: {exc}")
+            pytest.skip(f"needs torch: {exc}")
         self.support_cls = CudaGraphSupport
         self.resolve = resolve_cuda_graph_support
 
@@ -62,11 +65,11 @@ class _CudaGraphSupportCase(unittest.TestCase):
         return _Stub()
 
 
-class ResolutionTest(_CudaGraphSupportCase):
+class TestResolutionTest(_CudaGraphSupportCase):
     def test_default_is_fully_supported(self):
         support = self.resolve(self._stub())
-        self.assertTrue(support.decode_graph)
-        self.assertTrue(support.prefill_graph)
+        assert support.decode_graph
+        assert support.prefill_graph
 
     def test_axes_compose_by_and_and_none_roots_are_skipped(self):
         support = self.resolve(
@@ -74,29 +77,35 @@ class ResolutionTest(_CudaGraphSupportCase):
             None,
             self._stub(self.support_cls(decode_graph=False)),
         )
-        self.assertFalse(support.decode_graph)
-        self.assertFalse(support.prefill_graph)
+        assert not (support.decode_graph)
+        assert not (support.prefill_graph)
 
     def test_a_child_declaration_lowers_the_wrapper(self):
         child = self._stub(self.support_cls(prefill_graph=False))
         wrapper = self._stub(children=(child,))
         support = self.resolve(wrapper)
-        self.assertTrue(support.decode_graph)
-        self.assertFalse(support.prefill_graph)
+        assert support.decode_graph
+        assert not (support.prefill_graph)
 
-    def test_each_culprit_is_logged_by_class_name(self):
+    def test_each_culprit_is_logged_by_class_name(self, caplog, monkeypatch):
         child = self._stub(self.support_cls(prefill_graph=False))
         wrapper = self._stub(children=(child,))
-        with self.assertLogs(
-            "tokenspeed.runtime.layers.attention.backends.support", level="INFO"
-        ) as logs:
+        logger_name = "tokenspeed.runtime.layers.attention.backends.support"
+        monkeypatch.setattr(logging.getLogger(logger_name), "propagate", True)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=logger_name):
             self.resolve(wrapper)
-        self.assertTrue(any("_Stub" in line for line in logs.output))
-        self.assertTrue(any("Prefill" in line for line in logs.output))
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == logger_name and record.levelno >= logging.INFO
+        ]
+        assert any("_Stub" in line for line in messages)
+        assert any("Prefill" in line for line in messages)
 
 
-class BackendDeclarationTest(_CudaGraphSupportCase):
-    """The two backend-imposed restrictions the executor used to hardcode."""
+class TestBackendDeclarationTest(_CudaGraphSupportCase):
+    """Backend graph capabilities are declared on their classes."""
 
     def test_dsa_declares_no_prefill_graph(self):
         try:
@@ -104,25 +113,27 @@ class BackendDeclarationTest(_CudaGraphSupportCase):
                 DSABackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs tokenspeed_kernel: {exc}")
-        self.assertFalse(DSABackend.cuda_graph_support.prefill_graph)
-        self.assertTrue(DSABackend.cuda_graph_support.decode_graph)
+            pytest.skip(f"needs tokenspeed_kernel: {exc}")
+        assert not (DSABackend.cuda_graph_support.prefill_graph)
+        assert DSABackend.cuda_graph_support.decode_graph
 
-    def test_qwen4_exp_declares_no_prefill_graph(self):
+    def test_qwen4_exp_request_state_supports_breakable_prefill_graph(self):
         try:
+            from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
+                QSAIndexerBackend,
+            )
             from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import (
                 Qwen4ExpPLEBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs tokenspeed_kernel: {exc}")
-        self.assertFalse(Qwen4ExpPLEBackend.cuda_graph_support.prefill_graph)
-        self.assertTrue(Qwen4ExpPLEBackend.cuda_graph_support.decode_graph)
+            pytest.skip(f"needs tokenspeed_kernel: {exc}")
+        for backend in (Qwen4ExpPLEBackend, QSAIndexerBackend):
+            assert backend.cuda_graph_support.prefill_graph
+            assert backend.cuda_graph_support.decode_graph
 
     def test_declarations_are_class_attributes(self):
         # Rank-uniformity gate: support must not depend on per-rank instance
         # state — every declaration lives on the class.
-        import importlib
-
         for module_name, cls_name in (
             ("tokenspeed.runtime.layers.attention.backends.paged.dsa", "DSABackend"),
             (
@@ -137,13 +148,12 @@ class BackendDeclarationTest(_CudaGraphSupportCase):
             try:
                 cls = getattr(importlib.import_module(module_name), cls_name)
             except (ImportError, ModuleNotFoundError) as exc:
-                self.skipTest(f"needs optional deps: {exc}")
-            self.assertIn(
-                "cuda_graph_support",
-                vars(cls),
-                f"{cls_name} must declare cuda_graph_support on the class",
-            )
+                pytest.skip(f"needs optional deps: {exc}")
+            _pytest_member_1 = "cuda_graph_support"
+            _pytest_container_2 = vars(cls)
+            _pytest_msg_3 = f"{cls_name} must declare cuda_graph_support on the class"
+            assert _pytest_member_1 in _pytest_container_2, _pytest_msg_3
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

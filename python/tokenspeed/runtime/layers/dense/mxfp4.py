@@ -15,12 +15,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""MXFP4 dense linear bridge for checkpoint-serialized Kimi MLP weights."""
+"""MXFP4 dense linear bridge for checkpoint-serialized MXFP4 MLP weights."""
 
 from __future__ import annotations
 
-import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.gemm import (
+    mxfp4_linear,
+    mxfp4_swiglu_linear,
+    prepare_mxfp4_linear,
+)
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.quantization.base_config import QuantizeMethodBase
@@ -31,10 +35,12 @@ MXFP4_BLOCK = 32
 class Mxfp4LinearMethod(QuantizeMethodBase):
     """Packed MXFP4 dense weights.
 
-    Kimi-K2.5 MXFP4 stores dense layer-0 MLP and MoE shared-expert MLP tensors
-    in the same packed FP4/e8m0 format as routed experts. Runtime activations
-    are quantized to packed MXFP4 before the dense GEMM so checkpoint weights
-    can stay packed in VRAM.
+    Kimi-K2.5 and Quark MXFP4 checkpoints store dense MLP and MoE
+    shared-expert MLP tensors in the same packed FP4/e8m0 format as routed
+    experts. Runtime activations are quantized to MXFP4 (dynamic per-32
+    scales) by the ``mxfp4_linear`` kernels so checkpoint weights stay packed
+    in VRAM. After loading, the weight is reordered once into the layout the
+    selected kernel reads.
     """
 
     def __init__(self, quant_config):
@@ -62,6 +68,11 @@ class Mxfp4LinearMethod(QuantizeMethodBase):
         layer.output_size_per_partition = output_size_per_partition
         layer.params_dtype = params_dtype
         layer.orig_dtype = params_dtype
+        # The gated MLP owning a gate_up projection sets this (see
+        # enable_swiglu) before loading, so the weight is prepared for the
+        # fused SwiGLU kernel.
+        layer.mxfp4_swiglu = False
+        layer.mxfp4_linear_weight = None
 
         weight = Parameter(
             torch.empty(
@@ -91,31 +102,52 @@ class Mxfp4LinearMethod(QuantizeMethodBase):
             weight_scale.weight_loader = scale_loader
         layer.register_parameter("weight_scale", weight_scale)
 
+    def enable_swiglu(self, layer: torch.nn.Module) -> None:
+        """Mark ``layer`` as a stacked [gate; up] projection run by apply_swiglu."""
+        if layer.mxfp4_linear_weight is not None:
+            raise RuntimeError("enable_swiglu must precede weight processing")
+        layer.mxfp4_swiglu = True
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if getattr(layer, "_mxfp4_dense_processed", False):
+        if layer.mxfp4_linear_weight is not None:
             return
-        layer.weight_triton_tensor = layer.weight.data
-        layer.weight_scale_triton_tensor = layer.weight_scale.data
-        layer._mxfp4_dense_processed = True
+        prepared = prepare_mxfp4_linear(
+            layer.weight.data,
+            layer.weight_scale.data,
+            swiglu=layer.mxfp4_swiglu,
+        )
+        # Same shape and dtype in the kernel's layout; replacing the data
+        # releases the checkpoint-order copy.
+        layer.weight.data = prepared.weight
+        layer.mxfp4_linear_weight = prepared
 
     def apply(self, layer, x, bias=None):
-        if not getattr(layer, "_mxfp4_dense_processed", False):
+        if layer.mxfp4_linear_weight is None:
             self.process_weights_after_loading(layer)
         input_2d = x.reshape(-1, x.shape[-1])
         output_shape = (*x.shape[:-1], layer.output_size_per_partition)
-        input_quant, input_scale = tokenspeed_kernel.quantize_mxfp4(
-            input_2d, scale_layout="linear"
-        )
-        output = tokenspeed_kernel.mm(
-            input_quant,
-            layer.weight_triton_tensor,
-            A_scales=input_scale,
-            B_scales=layer.weight_scale_triton_tensor,
-            bias=bias,
-            out_dtype=x.dtype,
-            quant="mxfp4",
-        )
+        output = mxfp4_linear(input_2d, layer.mxfp4_linear_weight)
+        if bias is not None:
+            output = output + bias
         return output.reshape(*output_shape)
+
+    def apply_swiglu(self, layer, x: torch.Tensor) -> torch.Tensor:
+        """``silu(gate) * up`` of a stacked [gate; up] projection, fused.
+
+        Args:
+            layer: Projection marked with ``enable_swiglu``.
+            x: BF16 input ``[..., K]``.
+
+        Returns:
+            BF16 ``[..., N/2]``.
+        """
+        if not layer.mxfp4_swiglu:
+            raise RuntimeError("apply_swiglu needs a layer marked by enable_swiglu")
+        if layer.mxfp4_linear_weight is None:
+            self.process_weights_after_loading(layer)
+        input_2d = x.reshape(-1, x.shape[-1])
+        output = mxfp4_swiglu_linear(input_2d, layer.mxfp4_linear_weight)
+        return output.reshape(*x.shape[:-1], layer.output_size_per_partition // 2)
 
 
 def _validate_mxfp4_partition(input_size_per_partition: int) -> None:

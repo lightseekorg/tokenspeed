@@ -35,9 +35,9 @@ The `tokenspeed-mla` package acknowledges and thanks:
 - `NVIDIA/cutlass`
 - `flashinfer-ai/flashinfer`
 
-## License Notices
+## License notices
 
-We follow open source license requirements by keeping package-level
+TokenSpeed follows open source license requirements by keeping package-level
 `THIRDPARTYNOTICES` files with the relevant third-party notices and license
 texts. For Python packages built with setuptools, these files are included in
 the package metadata with:

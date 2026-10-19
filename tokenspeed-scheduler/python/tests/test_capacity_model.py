@@ -34,6 +34,7 @@ def _sizing_config(
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_l2_cache = True
+    cfg.num_snapshot_pages = 1  # never retracts
     cfg.cache_groups = groups
     return cfg
 
@@ -43,8 +44,7 @@ def _full(group_id: str, block_granularity: int, packing: int) -> "ts.CacheGroup
         group_id=group_id,
         block_granularity=block_granularity,
         total_pages=0,
-        retention=ts.CacheRetention.FullHistory,
-        family=ts.CacheGroupFamily.History,
+        attn_kind=ts.AttnKind.Full,
         cache_blocks_per_lcm_block=packing,
     )
 
@@ -56,22 +56,19 @@ def _sliding(
         group_id=group_id,
         block_granularity=block_granularity,
         total_pages=0,
-        retention=ts.CacheRetention.SlidingWindow,
+        attn_kind=ts.AttnKind.SlidingWindow,
         sliding_window_tokens=window,
-        family=ts.CacheGroupFamily.History,
         cache_blocks_per_lcm_block=packing,
     )
 
 
-def _state(
-    group_id: str, block_granularity: int, packing: int
-) -> "ts.CacheGroupConfig":
+def _state(group_id: str, packing: int) -> "ts.CacheGroupConfig":
+    """A State group has no token span: two slots per live request."""
     return ts.CacheGroupConfig(
         group_id=group_id,
-        block_granularity=block_granularity,
+        block_granularity=0,
         total_pages=0,
-        retention=ts.CacheRetention.FullHistory,
-        family=ts.CacheGroupFamily.State,
+        attn_kind=ts.AttnKind.State,
         cache_blocks_per_lcm_block=packing,
     )
 
@@ -94,20 +91,55 @@ def test_reports_group_pages_in_config_order() -> None:
         overlap_schedule_depth=1,
         groups=[
             _full("full", 64, 12),
-            _state("state", 64, 1),
+            _state("state", 1),
             _sliding("swa", 64, 128, 3),
         ],
     )
     model = ts.CapacityModel(cfg)
     assert model.num_groups == 3
     pages = model.concurrent_group_pages(max_total_tokens=65536, max_context_len=4096)
-    assert pages == [1024 + 16 * 2, 16 * 4, 16 * 4 + 2 + 128]
-    assert model.single_request_group_pages(token_limit=4096)[1] == 4
-    # ceil(1056 / 12) + ceil(64 / 1) + ceil(194 / 3)
-    assert model.lcm_blocks_needed_for(pages) == 88 + 64 + 65
+    # Dense history plus, per request, the unaligned tail page and the block a
+    # tail handover holds; a State group holds two slots per live request,
+    # whatever the history; a sliding group its window pages plus the handover
+    # block, and one in-flight chunk behind the three blocks a 128-token
+    # window can span behind an unaligned boundary.
+    assert pages == [1024 + 16 * (2 + 1), 16 * 2, 16 * (4 + 1) + 3 + 128]
+    assert model.single_request_group_pages(token_limit=4096)[1] == 2
+    # ceil(1072 / 12) + ceil(32 / 1) + ceil(211 / 3)
+    assert model.lcm_blocks_needed_for(pages) == 90 + 32 + 71
     # A model outlives the config it was built from.
     del cfg
     assert model.max_single_request_tokens(usable_lcm_blocks=100) > 0
+
+
+@pytest.mark.parametrize("overlap_schedule_depth", [0, 1])
+def test_speculative_requests_hold_the_next_verify_window(
+    overlap_schedule_depth: int,
+) -> None:
+    """A speculative decode also holds the next verify window its draft steps
+    write, on every role that decodes; the prefill role never decodes."""
+
+    def pages(role, decode_input_tokens: int) -> int:
+        cfg = _sizing_config(
+            role=role,
+            prefix_granularity=1,
+            max_scheduled_tokens=64,
+            max_batch_size=2,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
+            groups=[_full("full", 1, 1)],
+        )
+        # The PD roles transfer the full suffix.
+        cfg.cache_groups[0].transfer_policy = ts.CacheTransferPolicy.FullSuffix
+        model = ts.CapacityModel(cfg)
+        return model.concurrent_group_pages(max_total_tokens=100, max_context_len=50)[0]
+
+    roles = ts.SchedulerConfig.Role
+    # Dense history plus, per live request, the protected in-flight window and the next one.
+    assert pages(roles.Fused, 4) == 100 + 2 * (overlap_schedule_depth + 1) * 4
+    assert pages(roles.D, 4) == 100 + 2 * (overlap_schedule_depth + 1) * 4
+    assert pages(roles.Fused, 1) == 100 + 2 * overlap_schedule_depth
+    assert pages(roles.P, 4) == 100
 
 
 def test_rejects_unsized_pool_only_in_the_scheduler() -> None:
@@ -135,7 +167,7 @@ def test_rejects_unsized_pool_only_in_the_scheduler() -> None:
     "groups",
     [
         [_full("full", 4, 1)],
-        [_full("full", 4, 2), _state("state", 2, 1)],
+        [_full("full", 4, 2), _state("state", 1)],
         [_full("full", 4, 3), _sliding("swa", 4, 5, 1), _sliding("tail", 2, 9, 2)],
     ],
     ids=["full", "full+state", "full+two-windows"],

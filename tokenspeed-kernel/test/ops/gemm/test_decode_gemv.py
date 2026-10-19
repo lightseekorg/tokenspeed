@@ -25,7 +25,9 @@ from __future__ import annotations
 import pytest
 import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
 import torch
-from tokenspeed_kernel.ops.gemm.triton_gemv import _select, decode_gemv, use_decode_gemv
+from tokenspeed_kernel.numerics.torch.gemm import torch_mm
+from tokenspeed_kernel.ops.gemm import _select_mv as _select
+from tokenspeed_kernel.ops.gemm import _use_mv, mv
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -41,30 +43,31 @@ def _is_joint_fi_arch() -> bool:
 
 def test_registry_fallback_selection():
     _select.cache_clear()
-    impl = _select(1, 999, 4096, True)
+    bf16 = (torch.bfloat16, torch.bfloat16, False)
+    impl = _select(1, 999, 4096, True, *bf16)
     assert "rowcta" in getattr(impl, "__name__", "")
-    impl = _select(4, 3217, 7168, True)
+    impl = _select(4, 3217, 7168, True, *bf16)
     assert "torch" in getattr(impl, "__name__", "")
     # A width no call site produces.
-    impl = _select(3, 6289, 7168, True)
+    impl = _select(3, 6289, 7168, True, *bf16)
     assert "torch" in getattr(impl, "__name__", "")
-    impl = _select(1, 2305, 1536, True)
+    impl = _select(1, 2305, 1536, True, *bf16)
     assert "rowcta" in getattr(impl, "__name__", "")
 
 
 @pytest.mark.parametrize("projection,n", [("kda", 3216), ("mla", 3648)])
 def test_kimi_projections_honor_small_m_joint_route(monkeypatch, projection, n):
-    from tokenspeed_kernel.ops.gemm import kimi3, triton_gemv
+    import tokenspeed_kernel.ops.gemm as gemm_api
 
     x = torch.empty(32, 7168, device="meta", dtype=torch.bfloat16)
     weight = torch.empty(n, 7168, device="meta", dtype=torch.bfloat16)
     output = torch.empty(32, n, device="meta", dtype=torch.bfloat16)
-    monkeypatch.setattr(kimi3, "use_decode_gemv", lambda *_: True)
-    monkeypatch.setattr(triton_gemv, "decode_gemv", lambda *_: output)
+    monkeypatch.setattr(gemm_api, "_use_mv", lambda *_: True)
+    monkeypatch.setattr(gemm_api, "mv", lambda *_: output)
     if projection == "kda":
-        assert kimi3.kimi3_qkvfab_projection(x, weight) is output
+        assert gemm_api.kimi3_qkvfab_projection(x, weight) is output
     else:
-        result = kimi3.kimi3_mla_qkv_gate_projection(x, weight, 2112)
+        result = gemm_api.kimi3_mla_qkv_gate_projection(x, weight, 2112)
         assert result.packed is output
         assert result.qkv.shape == (32, 2112)
         assert result.gate.shape == (32, 1536)
@@ -74,7 +77,7 @@ def test_kimi_projections_honor_small_m_joint_route(monkeypatch, projection, n):
 def test_shared_projections_route_and_match_torch(m):
     """The K3 shared gate_up/down call sites use the joint path and
     agree with the Torch composition within BF16 tolerances."""
-    from tokenspeed_kernel.ops.gemm.kimi3 import (
+    from tokenspeed_kernel.ops.gemm import (
         kimi3_shared_down_projection,
         kimi3_shared_situ_projection,
     )
@@ -100,7 +103,7 @@ def test_forced_torch_solution_is_not_routed():
     joint FI path supports, or A/B comparisons silently measure the route."""
     from unittest.mock import patch
 
-    from tokenspeed_kernel.ops.gemm import kimi3
+    import tokenspeed_kernel.ops.gemm as gemm_api
 
     x = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
     latent_w = torch.randn(3584, 7168, device="cuda", dtype=torch.bfloat16)
@@ -108,11 +111,11 @@ def test_forced_torch_solution_is_not_routed():
     y = torch.randn(1, 768, device="cuda", dtype=torch.bfloat16)
 
     with patch(
-        "tokenspeed_kernel.ops.gemm.triton_gemv.decode_gemv",
+        "tokenspeed_kernel.ops.gemm.mv",
         side_effect=AssertionError("forced torch path must not route"),
     ):
-        kimi3.kimi3_latent_projection(x, latent_w, solution="torch")
-        kimi3.kimi3_shared_down_projection(y, down_w, solution="torch")
+        gemm_api.kimi3_latent_projection(x, latent_w, solution="torch")
+        gemm_api.kimi3_shared_down_projection(y, down_w, solution="torch")
     # Drain the queued vendor-BLAS work here: under emulation it otherwise keeps
     # executing into the next test and charges its runtime against that test.
     torch.cuda.synchronize()
@@ -128,17 +131,17 @@ def test_cdna5_route_admits_decode_shapes(m, n, k):
     """K3 decode shapes must route on CDNA5 through its registered kernels.
 
     The unquantized Linear path relies on this: o_proj is 93 calls a forward
-    and reached the vendor GEMM. M == 1 lands on row-CTA and the rest on the
-    dense16 WMMA kernel; 17 and 32 cross into a second 16-row chunk, where
-    the launcher masks the tail.
+    and reached the vendor GEMM. M == 1 lands on row-CTA, 2 and 16 rows on
+    one 16-row WMMA tile, and 17 and 32 on the 64-row tile, which masks the
+    rows past M.
     """
     torch.manual_seed(0)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
 
-    assert use_decode_gemv(x, w)
+    assert _use_mv(x, w)
 
-    got = decode_gemv(x, w).float()
+    got = mv(x, w).float()
     ref = (x @ w.t()).float()
     assert torch.allclose(
         got, ref, atol=0.5, rtol=2e-2
@@ -154,28 +157,36 @@ def test_cdna5_route_declines_unregistered_calls():
     w_bf16 = torch.randn(7168, 1536, device="cuda", dtype=torch.bfloat16)
 
     x_fp16 = torch.randn(1, 1536, device="cuda", dtype=torch.float16)
-    assert not use_decode_gemv(x_fp16, w_bf16.half())
+    assert not _use_mv(x_fp16, w_bf16.half())
 
     strided = torch.randn(1, 3072, device="cuda", dtype=torch.bfloat16)[:, ::2]
-    assert not use_decode_gemv(strided, w_bf16)
+    assert not _use_mv(strided, w_bf16)
 
     # K=128 is registered but measured slower than the vendor GEMM at wide N.
     thin = torch.randn(1, 128, device="cuda", dtype=torch.bfloat16)
     thin_w = torch.randn(8448, 128, device="cuda", dtype=torch.bfloat16)
-    assert not use_decode_gemv(thin, thin_w)
+    assert not _use_mv(thin, thin_w)
 
-    # Past the WMMA band nothing is registered: each 16-row chunk re-reads the
-    # whole weight, and by this M rocBLAS is measured faster.
-    wide = torch.randn(64, 1536, device="cuda", dtype=torch.bfloat16)
-    assert not use_decode_gemv(wide, w_bf16)
+    # Past the WMMA band nothing is registered: the widest WMMA tile holds
+    # 64 rows, and every further tile would re-read the whole weight.
+    wide = torch.randn(65, 1536, device="cuda", dtype=torch.bfloat16)
+    assert not _use_mv(wide, w_bf16)
+
+    # From 17 rows the 64-row tile takes a shape only while its 32-column
+    # blocks fit the CUs in one round; 16 rows stay on one 16-row tile.
+    wide_n_w = torch.randn(8208, 1536, device="cuda", dtype=torch.bfloat16)
+    assert not _use_mv(
+        torch.randn(17, 1536, device="cuda", dtype=torch.bfloat16), wide_n_w
+    )
+    assert _use_mv(torch.randn(16, 1536, device="cuda", dtype=torch.bfloat16), wide_n_w)
 
     # In-band M, but the WMMA kernel tiles K by 128 and N by its output tile.
     unaligned_k = torch.randn(16, 1600, device="cuda", dtype=torch.bfloat16)
-    assert not use_decode_gemv(
+    assert not _use_mv(
         unaligned_k, torch.randn(7168, 1600, device="cuda", dtype=torch.bfloat16)
     )
     unaligned_n = torch.randn(16, 1536, device="cuda", dtype=torch.bfloat16)
-    assert not use_decode_gemv(
+    assert not _use_mv(
         unaligned_n, torch.randn(7000, 1536, device="cuda", dtype=torch.bfloat16)
     )
 
@@ -333,7 +344,7 @@ def test_joint_fi_tuning_roundtrip_and_changed_input_replay(
     monkeypatch.setattr(tuner, "_profile_single_kernel", unexpected_profile)
     with torch.no_grad(), autotune(tune_mode=False, tuning_buckets=None, round_up=None):
         for m in range(1, 33):
-            assert use_decode_gemv(x[:m], weight)
+            assert _use_mv(x[:m], weight)
             buffer = torch.full((m * n + 32,), 42, dtype=torch.bfloat16, device="cuda")
             out = buffer[: m * n].view(m, n)
             out.fill_(float("nan"))
@@ -373,12 +384,12 @@ def test_joint_fi_tuning_roundtrip_and_changed_input_replay(
 
         monkeypatch.setattr(fi_adapter._fi_gemm, "bf16_gemm_sm100", reject_fi)
         for m in (33, 48, 64, 128):
-            assert not use_decode_gemv(x[:m], weight)
+            assert not _use_mv(x[:m], weight)
             out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
             assert mm(x[:m], weight, out=out).data_ptr() == out.data_ptr()
             torch.testing.assert_close(out, x[:m] @ weight.T, rtol=0, atol=0)
             torch.testing.assert_close(
-                decode_gemv(x[:m], weight), x[:m] @ weight.T, rtol=0, atol=0
+                mv(x[:m], weight), x[:m] @ weight.T, rtol=0, atol=0
             )
     assert not attempts
     assert AutoTuner.__dict__["_get_cache_key"] is native_key
@@ -389,3 +400,195 @@ def test_joint_fi_tuning_roundtrip_and_changed_input_replay(
         "32 sizes; 6 changed-input graphs; 4 large-M fallbacks; 0 inference profiles",
         flush=True,
     )
+
+
+_requires_nvidia = pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_nvidia,
+    reason="the FP32 row-CTA kernels are registered for NVIDIA",
+)
+# Expert-router projections of public MoE models, (experts, hidden):
+# DeepSeek-V3 and Qwen3-235B-A22B.
+_ROUTER_SHAPES = [(256, 7168), (128, 4096)]
+
+
+def _fp64_reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch_mm(x.double(), weight.double(), None, None, torch.float32)
+
+
+@_requires_nvidia
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+def test_fp32_selection_follows_dtype_and_rows(x_dtype):
+    from tokenspeed_kernel.ops.gemm._triton.gemv import triton_rowcta_gemm_fp32
+    from tokenspeed_kernel.ops.gemm.native import torch_decode_gemv
+
+    fp32 = (x_dtype, torch.float32, False)
+    _select.cache_clear()
+    for n, k in _ROUTER_SHAPES:
+        for m in (1, 2, 9, 16):
+            assert _select(m, n, k, True, *fp32) is triton_rowcta_gemm_fp32
+        for m in (17, 32):
+            assert _select(m, n, k, True, *fp32) is not triton_rowcta_gemm_fp32
+        assert _select(1, n, k, False, *fp32) is torch_decode_gemv
+    # The multi-row kernel is FP32 only, and FP16 has no registered leaf.
+    bf16 = (torch.bfloat16, torch.bfloat16, False)
+    assert _select(8, 256, 4096, True, *bf16) is not triton_rowcta_gemm_fp32
+    fp16 = (torch.float16, torch.float16, False)
+    assert _select(1, 999, 4096, True, *fp16) is torch_decode_gemv
+
+
+@_requires_nvidia
+@pytest.mark.parametrize(
+    "m,n,k,expected",
+    [
+        (1, 256, 16384, True),
+        (1, 1024, 65536, True),
+        (1, 256, 65540, False),  # a second 64K block
+        (2, 256, 7680, True),
+        (2, 256, 8192, False),  # past 15 unrolled blocks of 512
+        (8, 256, 16384, False),
+        (16, 1024, 7680, True),
+        (16, 1025, 4096, False),  # more than 1024 outputs
+        (1, 256, 4097, False),  # rows not a multiple of four elements
+        (8, 256, 7679, False),
+    ],
+)
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+def test_fp32_selection_keeps_the_measured_envelope(m, n, k, expected, x_dtype):
+    from tokenspeed_kernel.ops.gemm._triton.gemv import triton_rowcta_gemm_fp32
+    from tokenspeed_kernel.ops.gemm.native import torch_decode_gemv
+
+    _select.cache_clear()
+    selected = _select(m, n, k, True, x_dtype, torch.float32, False)
+    assert selected is (triton_rowcta_gemm_fp32 if expected else torch_decode_gemv)
+
+
+@_requires_nvidia
+@pytest.mark.parametrize("m", [1, 2, 8, 16, 17])
+@pytest.mark.parametrize("n,k", _ROUTER_SHAPES + [(19, 132), (3, 4100)])
+def test_fp32_decode_gemv_matches_fp64(m, n, k):
+    torch.manual_seed(m + n + k)
+    x = torch.randn(m, k, device="cuda")
+    weight = torch.randn(n, k, device="cuda")
+    out = torch.full((m, n), float("nan"), device="cuda")
+    assert mv(x, weight, out) is out
+    torch.testing.assert_close(out, _fp64_reference(x, weight), rtol=2e-5, atol=2e-4)
+    # One fixed reduction order: an allocating call agrees bit for bit.
+    assert torch.equal(mv(x, weight), out)
+
+
+@_requires_nvidia
+@pytest.mark.parametrize("m", [1, 2, 8, 16, 17])
+@pytest.mark.parametrize("n,k", _ROUTER_SHAPES + [(19, 132), (3, 4100)])
+def test_bf16_rows_with_fp32_weight_skip_the_widening_copy(m, n, k):
+    torch.manual_seed(m + n + k)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="cuda")
+    out = torch.full((m, n), float("nan"), device="cuda")
+    assert mv(x, weight, out) is out
+    # BF16 to FP32 is exact, so the mixed call is its kernel's call on
+    # x.float(), and the FP32 call wherever one kernel serves both activation
+    # dtypes. From 17 rows BF16 activations may take a kernel that FP32
+    # activations do not; then the two calls share only the FP32 error bound.
+    bf16_kernel = _select(m, n, k, True, torch.bfloat16, torch.float32, False)
+    assert torch.equal(out, bf16_kernel(x.float(), weight))
+    widened = mv(x.float(), weight)
+    if bf16_kernel is _select(m, n, k, True, torch.float32, torch.float32, False):
+        assert torch.equal(out, widened)
+    reference = _fp64_reference(x, weight)
+    torch.testing.assert_close(out, reference, rtol=2e-5, atol=2e-4)
+    torch.testing.assert_close(widened, reference, rtol=2e-5, atol=2e-4)
+    with pytest.raises(ValueError):
+        mv(x, weight, torch.empty(m, n, device="cuda", dtype=x.dtype))
+
+
+@_requires_nvidia
+@pytest.mark.parametrize("m", [1, 4, 16])
+@pytest.mark.parametrize("n,k", [(0, 17), (3, 0), (19, 127), (3, 65537)])
+def test_fp32_rowcta_empty_odd_and_wide_rows(m, n, k):
+    from tokenspeed_kernel.ops.gemm._triton.gemv import triton_rowcta_gemm_fp32
+
+    # The registry only routes the measured envelope to the kernel, but a
+    # direct call computes any shape. Sums of ones are exact, so any lost or
+    # repeated K block shows up.
+    x = torch.ones(m, k, device="cuda")
+    weight = torch.ones(n, k, device="cuda")
+    out = torch.full((m, n), float("nan"), device="cuda")
+    assert triton_rowcta_gemm_fp32(x, weight, out) is out
+    torch.testing.assert_close(out, torch.full_like(out, float(k)), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "m,k,launch",
+    [
+        (1, 7168, dict(BM=1, BK=8192, UNROLL=True, num_warps=8)),
+        (1, 2048, dict(BM=1, BK=2048, UNROLL=True, num_warps=4)),
+        (1, 16384, dict(BM=1, BK=16384, UNROLL=True, num_warps=8)),
+        (1, 65537, dict(BM=1, BK=65536, UNROLL=True, num_warps=8)),
+        (8, 7168, dict(BM=8, BK=512, UNROLL=True, num_warps=4)),
+        (8, 8192, dict(BM=8, BK=512, UNROLL=True, num_warps=4)),
+        (12, 4096, dict(BM=16, BK=512, UNROLL=False, num_warps=8)),
+        (16, 16384, dict(BM=16, BK=512, UNROLL=False, num_warps=8)),
+    ],
+)
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+def test_fp32_rowcta_launch_configuration(monkeypatch, m, k, launch, x_dtype):
+    from tokenspeed_kernel.ops.gemm._triton import gemv as triton_gemv
+
+    launches = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: launches.append((grid, kwargs))
+
+    # Record the launch instead of compiling it. A direct call launches any
+    # width, including the ones the registry keeps on Torch.
+    monkeypatch.setattr(triton_gemv, "_rowcta_multirow_kernel", Kernel())
+    x = torch.empty(m, k, dtype=x_dtype, device="meta")
+    weight = torch.empty(256, k, device="meta")
+    result = triton_gemv.triton_rowcta_gemm_fp32(x, weight)
+    assert result.shape == (m, 256) and result.dtype == torch.float32
+    assert launches == [
+        ((256,), dict(M=m, N=256, K=k, enable_fp_fusion=False, **launch))
+    ]
+
+
+@_requires_nvidia
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("m", [1, 8, 16])
+def test_fp32_decode_gemv_graph_replay(m, x_dtype):
+    n, k = _ROUTER_SHAPES[1]
+    x = torch.randn(m, k, device="cuda", dtype=x_dtype)
+    weight = torch.randn(n, k, device="cuda")
+    out = torch.empty(m, n, device="cuda")
+    mv(x, weight, out)  # compile before capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mv(x, weight, out)
+    for _ in range(2):
+        x.normal_()
+        weight.normal_()
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            out, _fp64_reference(x, weight), rtol=2e-5, atol=2e-4
+        )
+
+
+@_requires_nvidia
+def test_fp32_decode_gemv_ignores_reduced_matmul_precision():
+    previous = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision("high")
+        for m in (1, 4):
+            x = torch.randn(m, 4096, device="cuda")
+            weight = torch.randn(128, 4096, device="cuda")
+            torch.testing.assert_close(
+                mv(x, weight),
+                _fp64_reference(x, weight),
+                rtol=2e-5,
+                atol=2e-4,
+            )
+    finally:
+        torch.set_float32_matmul_precision(previous)

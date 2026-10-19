@@ -36,47 +36,40 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize(
-    ("rows", "pages", "width", "path", "budget", "expected"),
+    ("rows", "pages", "width", "path", "budget"),
     [
-        (256, 256, 256, "auto", 256 << 20, "triton_qwen4_exp_qsa_block_topk_logits"),
-        (512, 255, 512, "auto", 256 << 20, "triton_qwen4_exp_qsa_block_topk_logits"),
-        (512, 256, 512, "auto", 256 << 20, "cute_dsl_qwen4_exp_qsa_block_topk"),
-        (512, 256, 8, "auto", 256 << 20, "cute_dsl_qwen4_exp_qsa_block_topk"),
-        (8184, 128, 8, "auto", 256 << 20, "triton_qwen4_exp_qsa_block_topk_logits"),
-        (8192, 128, 8192, "auto", 256 << 20, "cute_dsl_qwen4_exp_qsa_block_topk"),
-        (8192, 128, 4, "auto", 256 << 20, "triton_qwen4_exp_qsa_block_topk_logits"),
-        (8192, 128, None, "auto", 256 << 20, "triton_qwen4_exp_qsa_block_topk_logits"),
-        (256, 128, 256, "stream", 256 << 20, "cute_dsl_qwen4_exp_qsa_block_topk"),
-        (8192, 128, 8192, "logits", 0, "triton_qwen4_exp_qsa_block_topk_logits"),
-        (8, 128, 1, "auto", 0, "cute_dsl_qwen4_exp_qsa_block_topk"),
-        (512, 2049, 512, "auto", 1 << 30, "triton_qwen4_exp_qsa_block_topk_logits"),
+        (256, 256, 256, "auto", 256 << 20),
+        (512, 255, 512, "auto", 256 << 20),
+        (512, 256, 512, "auto", 256 << 20),
+        (512, 256, 8, "auto", 256 << 20),
+        (8184, 128, 8, "auto", 256 << 20),
+        (8192, 128, 8192, "auto", 256 << 20),
+        (8192, 128, 4, "auto", 256 << 20),
+        (8192, 128, None, "auto", 256 << 20),
+        (256, 128, 256, "stream", 256 << 20),
+        (8192, 128, 8192, "logits", 0),
+        (8, 128, 1, "auto", 0),
+        (512, 2049, 512, "auto", 1 << 30),
     ],
 )
-def test_block_topk_selects_registered_kernel(
-    monkeypatch, device, rows, pages, width, path, budget, expected
+def test_block_topk_policy_matches_fp32_reference(
+    device, rows, pages, width, path, budget
 ) -> None:
-    query = torch.empty(rows, 4, 128, device=device, dtype=torch.bfloat16)
-    keys = torch.empty(64, 1, 128, device=device, dtype=query.dtype)
-    table = torch.zeros(rows // (width or 1), pages, device=device, dtype=torch.int32)
-    requests = torch.zeros(rows, device=device, dtype=torch.int32)
-    complete = torch.zeros_like(requests)
-    workspace = torch.empty(1 << 20, device=device, dtype=torch.uint8)
-    selected = torch.empty(rows, 512, device=device, dtype=torch.int32)
-    names = []
-    forwarded = []
-    select = qsa.select_kernel
-
-    def record_selection(*args, **kwargs):
-        kernel = select(*args, **kwargs)
-        names.append(kernel.name)
-
-        def invoke(*args, **kwargs):
-            forwarded.append(kwargs)
-            return selected
-
-        return invoke
-
-    monkeypatch.setattr(qsa, "select_kernel", record_selection)
+    torch.manual_seed(307)
+    capacity = pages * 64
+    query = torch.randn(rows, 4, 128, device=device, dtype=torch.bfloat16)
+    keys = torch.randn((pages + 1) * 64, 1, 128, device=device, dtype=query.dtype)
+    requests = torch.arange(rows // (width or 1), device=device, dtype=torch.int32)
+    table = torch.arange(1, pages + 1, device=device, dtype=torch.int32).repeat(
+        requests.numel(), 1
+    )
+    requests = requests.repeat_interleave(width or 1)
+    frontiers = torch.tensor(
+        [0, 1, 511, 512, 513, capacity // 2, capacity - 1, capacity],
+        device=device,
+        dtype=torch.int32,
+    )
+    complete = frontiers[torch.arange(rows, device=device) % frontiers.numel()]
     actual = qsa.qwen4_exp_qsa_block_topk(
         query,
         keys,
@@ -89,18 +82,32 @@ def test_block_topk_selects_registered_kernel(
         max_partial_bytes=32 << 20,
         max_logits_bytes=budget,
         path=path,
-        persistent_topk_workspace=workspace,
         enable_pdl=False,
         solution=None,
         override=None,
     )
-    assert actual is selected
-    assert names == [expected]
-    assert forwarded[0]["queries_per_request"] == width
-    if expected.endswith("logits"):
-        assert forwarded[0]["persistent_topk_workspace"] is workspace
-    else:
-        assert forwarded[0]["max_partial_bytes"] == 32 << 20
+    sample = torch.arange(8, device=device) * (rows // 8) + torch.arange(
+        8, device=device
+    )
+    sample.clamp_max_(rows - 1)
+    scores = torch.einsum("rhd,nd->rhn", query[sample].float(), keys[64:, 0].float())
+    scores = scores.clamp_min_(0).sum(1)
+    scores.masked_fill_(
+        torch.arange(capacity, device=device)[None] >= complete[sample, None],
+        -float("inf"),
+    )
+    selected = actual[sample]
+    selected_scores = scores.gather(1, selected.clamp_min(0).long())
+    selected_scores.masked_fill_(selected < 0, -float("inf"))
+    torch.testing.assert_close(
+        selected_scores.sort(1, descending=True).values,
+        scores.topk(512, dim=1).values,
+        atol=1e-4,
+        rtol=1e-5,
+    )
+    torch.testing.assert_close((actual >= 0).sum(1), complete.clamp_max(512).long())
+    ordered = actual.sort(1).values
+    assert ((ordered[:, 1:] != ordered[:, :-1]) | (ordered[:, 1:] == -1)).all()
 
 
 @pytest.mark.parametrize(
@@ -129,7 +136,7 @@ def test_block_topk_respects_backend_selection(monkeypatch, device, control) -> 
         monkeypatch.setattr(cute_ops, "_IS_NVIDIA_BLACKWELL", False)
     if control == "env":
         monkeypatch.setenv(
-            "TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_QSA_BLOCK_TOPK", "triton"
+            "TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_QSA_BLOCK_TOPK_STREAM", "triton"
         )
 
     def invoke():
@@ -145,24 +152,30 @@ def test_block_topk_respects_backend_selection(monkeypatch, device, control) -> 
             max_partial_bytes=32 << 20,
             max_logits_bytes=256 << 20,
             path="stream",
-            persistent_topk_workspace=None,
             enable_pdl=False,
             solution="triton" if control == "solution" else None,
             override="triton" if control == "override" else None,
         )
 
     if control == "context":
-        with kernel_override("attention", "qsa_block_topk", "triton"):
+        with kernel_override("attention", "qsa_block_topk_stream", "triton"):
             selected = invoke()
     else:
         selected = invoke()
-    assert names == ["triton_qwen4_exp_qsa_block_topk_stream"]
+    assert names == ["triton_qsa_block_topk_stream"]
     torch.testing.assert_close(
         (selected >= 0).sum(1), torch.full_like(requests, 64).long()
     )
 
 
-def test_block_topk_override_cannot_change_path(device) -> None:
+@pytest.mark.parametrize(
+    ("path", "override"),
+    [
+        ("logits", "cute_dsl_qwen4_exp_qsa_block_topk"),
+        ("stream", "triton_qsa_block_scores"),
+    ],
+)
+def test_block_topk_override_cannot_change_path(device, path, override) -> None:
     query = torch.empty(8, 4, 128, device=device, dtype=torch.bfloat16)
     keys = torch.empty(64, 1, 128, device=device, dtype=query.dtype)
     table = torch.zeros(1, 1, device=device, dtype=torch.int32)
@@ -179,11 +192,10 @@ def test_block_topk_override_cannot_change_path(device) -> None:
             queries_per_request=8,
             max_partial_bytes=32 << 20,
             max_logits_bytes=256 << 20,
-            path="logits",
-            persistent_topk_workspace=None,
+            path=path,
             enable_pdl=False,
             solution=None,
-            override="cute_dsl_qwen4_exp_qsa_block_topk",
+            override=override,
         )
 
 
@@ -197,7 +209,6 @@ def test_auto_block_topk_graph_refreshes_frontiers(device, rows) -> None:
     table = torch.arange(pages, device=device, dtype=torch.int32)[None]
     requests = torch.zeros(rows, device=device, dtype=torch.int32)
     complete = torch.full_like(requests, capacity)
-    workspace = torch.empty(1 << 20, device=device, dtype=torch.uint8)
 
     def invoke():
         return qsa.qwen4_exp_qsa_block_topk(
@@ -212,7 +223,6 @@ def test_auto_block_topk_graph_refreshes_frontiers(device, rows) -> None:
             max_partial_bytes=32 << 20,
             max_logits_bytes=256 << 20,
             path="auto",
-            persistent_topk_workspace=workspace,
             enable_pdl=False,
             solution=None,
             override=None,

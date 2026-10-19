@@ -58,7 +58,6 @@ from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.env import envs
 
 _DRAFT_INVALID_POSITION = torch.iinfo(torch.int64).min
-_PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 
 class QSAIndexer(nn.Module):
@@ -129,13 +128,6 @@ class QSAIndexer(nn.Module):
             tuple[int, torch.device],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
-        # Stable caller-owned scratch lets the materialized score path use the
-        # persistent radix top-k without allocating workspace per layer call.
-        self.register_buffer(
-            "_persistent_topk_workspace",
-            torch.empty((_PERSISTENT_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8),
-            persistent=False,
-        )
 
     def _fields(self, pool):
         layer_id = pool._field_layer_id(self.layer_id)
@@ -338,7 +330,6 @@ class QSAIndexer(nn.Module):
             max_logits_bytes=envs.TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB.get() << 20,
             solution=None,
             override=None,
-            persistent_topk_workspace=self._persistent_topk_workspace,
             enable_pdl=enable_pdl,
         )
         return qwen4_exp_qsa_selected_slots(

@@ -1,9 +1,10 @@
 """Cheap LongCat-Flash model wiring tests."""
 
-import unittest
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopKOutputFormat
@@ -15,25 +16,24 @@ from tokenspeed.runtime.models.longcat_flash import (
 )
 
 
-class TestLongcatFlashRegistry(unittest.TestCase):
+class TestLongcatFlashRegistry:
     def test_registered(self):
         from tokenspeed.runtime.models.registry import ModelRegistry
 
         cls, arch = ModelRegistry.resolve_model_cls(["LongcatFlashForCausalLM"])
-        self.assertIs(cls, LongcatFlashForCausalLM)
-        self.assertEqual(arch, "LongcatFlashForCausalLM")
+        assert (cls) is (LongcatFlashForCausalLM)
+        assert (arch) == ("LongcatFlashForCausalLM")
 
     def test_mla_and_double_attention_metadata_registered(self):
         from tokenspeed.runtime.configs import model_config
 
-        self.assertIn("LongcatFlashForCausalLM", model_config._MLA_ARCHITECTURES)
-        self.assertIn(
-            "LongcatFlashForCausalLM",
-            model_config._DOUBLE_ATTENTION_LAYER_ARCHITECTURES,
+        assert ("LongcatFlashForCausalLM") in (model_config._MLA_ARCHITECTURES)
+        assert ("LongcatFlashForCausalLM") in (
+            model_config._DOUBLE_ATTENTION_LAYER_ARCHITECTURES
         )
 
 
-class TestLongcatFlashConfig(unittest.TestCase):
+class TestLongcatFlashConfig:
     def test_config_aliases_are_normalized(self):
         config = SimpleNamespace(
             num_layers=28,
@@ -46,16 +46,16 @@ class TestLongcatFlashConfig(unittest.TestCase):
 
         _ensure_longcat_config(config)
 
-        self.assertEqual(config.num_hidden_layers, 28)
-        self.assertEqual(config.intermediate_size, 14336)
-        self.assertEqual(config.moe_intermediate_size, 2048)
-        self.assertEqual(config.num_experts_per_tok, 8)
-        self.assertEqual(config.hidden_act, "silu")
-        self.assertEqual(config.zero_expert_num, 0)
-        self.assertFalse(config.router_bias)
+        assert (config.num_hidden_layers) == (28)
+        assert (config.intermediate_size) == (14336)
+        assert (config.moe_intermediate_size) == (2048)
+        assert (config.num_experts_per_tok) == (8)
+        assert (config.hidden_act) == ("silu")
+        assert (config.zero_expert_num) == (0)
+        assert not (config.router_bias)
 
 
-class TestLongcatMixedFp8Config(unittest.TestCase):
+class TestLongcatMixedFp8Config:
     def test_moe_layer_uses_unquantized_backend_when_all_experts_are_ignored(self):
         config = SimpleNamespace(n_routed_experts=2)
         quant_config = SimpleNamespace(
@@ -66,26 +66,25 @@ class TestLongcatMixedFp8Config(unittest.TestCase):
             ]
         )
 
-        self.assertIsNone(
+        assert (
             _get_longcat_moe_quant_config(
                 config,
                 quant_config,
                 "model.layers.0.mlp",
             )
-        )
+        ) is None
 
     def test_moe_layer_keeps_quantization_when_no_experts_are_ignored(self):
         config = SimpleNamespace(n_routed_experts=2)
         quant_config = SimpleNamespace(ignored_layers=[])
 
-        self.assertIs(
+        assert (
             _get_longcat_moe_quant_config(
                 config,
                 quant_config,
                 "model.layers.0.mlp",
-            ),
-            quant_config,
-        )
+            )
+        ) is (quant_config)
 
     def test_moe_layer_rejects_partially_ignored_experts(self):
         config = SimpleNamespace(n_routed_experts=2)
@@ -95,7 +94,7 @@ class TestLongcatMixedFp8Config(unittest.TestCase):
             ]
         )
 
-        with self.assertRaisesRegex(ValueError, "partially ignored"):
+        with pytest.raises((ValueError), match=("partially ignored")):
             _get_longcat_moe_quant_config(
                 config,
                 quant_config,
@@ -103,7 +102,7 @@ class TestLongcatMixedFp8Config(unittest.TestCase):
             )
 
 
-class TestLongcatZeroExpert(unittest.TestCase):
+class TestLongcatZeroExpert:
     """The router's contract: zero experts are -1, every other id is a slot < P."""
 
     @staticmethod
@@ -178,7 +177,7 @@ class TestLongcatZeroExpert(unittest.TestCase):
             topk_ids=torch.tensor([[0, 3]]),
             router_logits=torch.zeros(1, 4),
         )
-        with self.assertRaisesRegex(RuntimeError, "zero experts must be -1"):
+        with pytest.raises((RuntimeError), match=("zero experts must be -1")):
             _RuntimeLongcatMoE._apply_zero_experts(moe, torch.ones(1, 2), topk_output)
 
     def test_residual_enters_one_partial_of_the_moe_group(self):
@@ -196,7 +195,7 @@ class TestLongcatZeroExpert(unittest.TestCase):
             moe, torch.ones(2, 2), topk_output
         )
 
-        self.assertIsNone(zero_output)
+        assert (zero_output) is None
         torch.testing.assert_close(
             topk_output.topk_weights,
             torch.tensor([[0.25, 0.0], [0.0, 0.5]]),
@@ -223,7 +222,7 @@ class TestLongcatZeroExpert(unittest.TestCase):
             moe, torch.ones(2, 2), topk_output
         )
 
-        self.assertIsNone(zero_output)
+        assert (zero_output) is None
         torch.testing.assert_close(
             topk_output.topk_weights, torch.tensor([[0.25, 0.75], [0.5, 0.5]])
         )
@@ -248,10 +247,10 @@ def _longcat_moe_config(n_routed_experts: int = 4) -> SimpleNamespace:
     )
 
 
-class TestLongcatExpertPlacementWiring(unittest.TestCase):
+class TestLongcatExpertPlacementWiring:
     """The MoE sizes its slots from the placement and routes through its view."""
 
-    def _build(self, placement, *, all_to_all_ep: bool, algorithm: str):
+    def _build(self, placement, request, all_to_all_ep: bool, algorithm: str):
         from tokenspeed.runtime.distributed.mapping import Mapping
         from tokenspeed.runtime.layers.moe import expert as expert_module
         from tokenspeed.runtime.moe import expert_location
@@ -271,13 +270,13 @@ class TestLongcatExpertPlacementWiring(unittest.TestCase):
             rank=1, world_size=2, attn_tp_size=2, moe_tp_size=1, moe_ep_size=2
         )
         expert_location.set_global_expert_location_metadata(placement)
-        self.addCleanup(expert_location.set_global_expert_location_metadata, None)
+        request.addfinalizer(
+            lambda: expert_location.set_global_expert_location_metadata(None)
+        )
         with (
             torch.device("cpu"),
             mock.patch.object(expert_module, "get_moe_backend", lambda: trtllm),
-            mock.patch.object(
-                expert_module.tokenspeed_kernel, "moe_plan", fake_moe_plan
-            ),
+            mock.patch.object(expert_module, "kernel_moe_plan", fake_moe_plan),
             mock.patch.dict(
                 global_server_args_dict,
                 {
@@ -307,42 +306,41 @@ class TestLongcatExpertPlacementWiring(unittest.TestCase):
             ep_rank_nodes=(0, 0),
         )
 
-    def test_without_a_placement_the_layer_keeps_its_routed_experts(self):
-        moe = self._build(None, all_to_all_ep=False, algorithm=None)
-        self.assertIsNone(moe.expert_placement)
-        self.assertIsNone(moe.expert_dispatch_info)
-        self.assertEqual(moe.experts.num_experts, 4)
-        self.assertEqual(moe.topk.topk_config.layer_id, 1)
+    def test_without_a_placement_the_layer_keeps_its_routed_experts(self, request):
+        moe = self._build(None, request, all_to_all_ep=False, algorithm=None)
+        assert (moe.expert_placement) is None
+        assert (moe.expert_dispatch_info) is None
+        assert (moe.experts.num_experts) == (4)
+        assert (moe.topk.topk_config.layer_id) == (1)
 
-    def test_placement_sizes_slots_and_picks_the_dispatch_flavour(self):
+    def test_placement_sizes_slots_and_picks_the_dispatch_flavour(self, request):
         placement = self._placement()
         moe = self._build(
-            placement, all_to_all_ep=False, algorithm="static_with_zero_expert"
+            placement, request, all_to_all_ep=False, algorithm="static_with_zero_expert"
         )
-        self.assertIs(moe.expert_placement, placement)
-        self.assertEqual(moe.experts.num_experts, 6)
-        self.assertEqual(moe.experts.num_local_experts, 3)
+        assert (moe.expert_placement) is (placement)
+        assert (moe.experts.num_experts) == (6)
+        assert (moe.experts.num_local_experts) == (3)
         info = moe.expert_dispatch_info
-        self.assertEqual(info.layer_id, 1)
+        assert (info.layer_id) == (1)
         # Replicated-input EP: rank-agnostic replica tables, views of layer 1,
         # and no static per-rank map is ever built.
-        self.assertIsNotNone(info.replica_dispatch)
-        self.assertTrue(
+        assert (info.replica_dispatch) is not None
+        assert (
             info.replica_dispatch.replicas.data_ptr()
             == placement.logical_to_all_physical_map[1].data_ptr()
         )
-        self.assertIsNone(placement._rank_dispatch_map)
+        assert (placement._rank_dispatch_map) is None
         moe = self._build(
-            placement, all_to_all_ep=True, algorithm="static_with_zero_expert"
+            placement, request, all_to_all_ep=True, algorithm="static_with_zero_expert"
         )
         # All-to-all EP: this rank's static nearest-replica map.
-        self.assertIsNone(moe.expert_dispatch_info.replica_dispatch)
-        self.assertEqual(
-            moe.expert_dispatch_info.partial_logical_to_rank_dispatch_physical_map.tolist(),
-            placement.rank_dispatch_map()[1].tolist(),
-        )
+        assert (moe.expert_dispatch_info.replica_dispatch) is None
+        assert (
+            moe.expert_dispatch_info.partial_logical_to_rank_dispatch_physical_map.tolist()
+        ) == (placement.rank_dispatch_map()[1].tolist())
 
-    def test_placement_geometry_must_match_the_model(self):
+    def test_placement_geometry_must_match_the_model(self, request):
         from tokenspeed.runtime.moe.expert_location import ExpertLocationMetadata
 
         wrong_experts = ExpertLocationMetadata.from_physical_to_logical_map(
@@ -352,18 +350,23 @@ class TestLongcatExpertPlacementWiring(unittest.TestCase):
             ep_rank=1,
             ep_rank_nodes=(0, 0),
         )
-        with self.assertRaisesRegex(ValueError, "logical experts"):
+        with pytest.raises((ValueError), match=("logical experts")):
             self._build(
-                wrong_experts, all_to_all_ep=False, algorithm="static_with_zero_expert"
+                wrong_experts,
+                request,
+                all_to_all_ep=False,
+                algorithm="static_with_zero_expert",
             )
-        with self.assertRaisesRegex(ValueError, "zero experts"):
-            self._build(self._placement(), all_to_all_ep=False, algorithm="static")
+        with pytest.raises((ValueError), match=("zero experts")):
+            self._build(
+                self._placement(), request, all_to_all_ep=False, algorithm="static"
+            )
 
     def test_longcat_opts_in_to_expert_placement(self):
-        self.assertTrue(LongcatFlashForCausalLM.supports_expert_placement)
+        assert LongcatFlashForCausalLM.supports_expert_placement
 
 
-class TestLongcatMoePlan(unittest.TestCase):
+class TestLongcatMoePlan:
     def test_deepep_all2all_is_refused(self):
         # The decoder layer reduces the routed output through the host's MoE
         # all-reduce / reduce-scatter (and counts the zero-expert residual on
@@ -389,7 +392,7 @@ class TestLongcatMoePlan(unittest.TestCase):
             mock.patch.object(
                 moe_utils, "ALL2ALL_BACKEND", moe_utils.All2AllBackend.DEEPEP
             ),
-            self.assertRaisesRegex(ValueError, "--all2all-backend deepep"),
+            pytest.raises((ValueError), match=("--all2all-backend deepep")),
         ):
             _RuntimeLongcatMoE(
                 config=config,
@@ -400,7 +403,7 @@ class TestLongcatMoePlan(unittest.TestCase):
                 alt_stream=None,
             )
 
-    def test_blackwell_ep4_plans_accept_zero_expert_routing(self):
+    def test_blackwell_ep4_plans_accept_zero_expert_routing(self, request, subtests):
         from tokenspeed_kernel.platform import current_platform
 
         from tokenspeed.runtime.distributed.mapping import Mapping
@@ -409,7 +412,7 @@ class TestLongcatMoePlan(unittest.TestCase):
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
         if not torch.cuda.is_available() or not current_platform().is_blackwell:
-            self.skipTest("Native TRT-LLM MoE plans require NVIDIA Blackwell")
+            pytest.skip("Native TRT-LLM MoE plans require NVIDIA Blackwell")
 
         config = SimpleNamespace(
             hidden_size=128,
@@ -438,7 +441,8 @@ class TestLongcatMoePlan(unittest.TestCase):
             weight_block_size=[128, 128],
             scale_fmt=None,
         )
-        self.addCleanup(torch.set_default_dtype, torch.get_default_dtype())
+        original_dtype = torch.get_default_dtype()
+        request.addfinalizer(lambda: torch.set_default_dtype(original_dtype))
         torch.set_default_dtype(torch.bfloat16)
 
         # Exercise the real planner and constructor, without loading a model or
@@ -455,7 +459,7 @@ class TestLongcatMoePlan(unittest.TestCase):
             mock.patch.dict(global_server_args_dict, {"ep_num_redundant_experts": 0}),
         ):
             for quant_config in (None, fp8_config):
-                with self.subTest(quantized=quant_config is not None):
+                with subtests.test(quantized=quant_config is not None):
                     moe = _RuntimeLongcatMoE(
                         config=config,
                         mapping=mapping,
@@ -464,12 +468,12 @@ class TestLongcatMoePlan(unittest.TestCase):
                         prefix="model.layers.0.mlp",
                         alt_stream=None,
                     )
-                    self.assertEqual(moe.experts.plan["solution"], "flashinfer_trtllm")
-                    self.assertEqual(
-                        moe.experts.topk_output_format, TopKOutputFormat.STANDARD
+                    assert (moe.experts.plan["solution"]) == ("flashinfer_trtllm")
+                    assert (moe.experts.topk_output_format) == (
+                        TopKOutputFormat.STANDARD
                     )
-                    self.assertTrue(moe.experts.supports_precomputed_topk)
-                    self.assertFalse(moe.experts.support_routing)
+                    assert moe.experts.supports_precomputed_topk
+                    assert not (moe.experts.support_routing)
 
 
 def _fake_comm_ops(rank: int, gathers: list | None = None) -> dict:
@@ -504,7 +508,7 @@ def _fake_comm_ops(rank: int, gathers: list | None = None) -> dict:
     }
 
 
-class TestLongcatRowLayout(unittest.TestCase):
+class TestLongcatRowLayout:
     """Both attention branches see one row layout; the MoE is bridged into it."""
 
     HIDDEN = 4
@@ -598,13 +602,13 @@ class TestLongcatRowLayout(unittest.TestCase):
         )
         layer, rows_seen, out, residual = self._run(mapping=mapping, local_tokens=4)
 
-        self.assertTrue(layer.moe_rows_differ)
-        self.assertEqual(rows_seen["attn0"], 4)
-        self.assertEqual(rows_seen["attn1"], 4)
+        assert layer.moe_rows_differ
+        assert (rows_seen["attn0"]) == (4)
+        assert (rows_seen["attn1"]) == (4)
         # The MoE gathers its TP-EP group's scattered shares: 2 per rank.
-        self.assertEqual(rows_seen["moe"], 8)
-        self.assertEqual(out.shape[0], 4)
-        self.assertEqual(residual.shape[0], 4)
+        assert (rows_seen["moe"]) == (8)
+        assert (out.shape[0]) == (4)
+        assert (residual.shape[0]) == (4)
 
     def test_rsag_everywhere_keeps_scattered_rows(self):
         from tokenspeed.runtime.distributed.mapping import Mapping
@@ -620,12 +624,12 @@ class TestLongcatRowLayout(unittest.TestCase):
         )
         layer, rows_seen, out, residual = self._run(mapping=mapping, local_tokens=4)
 
-        self.assertFalse(layer.moe_rows_differ)
-        self.assertEqual(rows_seen["attn0"], 4)
-        self.assertEqual(rows_seen["attn1"], 4)
-        self.assertEqual(rows_seen["moe"], 8)
-        self.assertEqual(out.shape[0], 2)
-        self.assertEqual(residual.shape[0], 2)
+        assert not (layer.moe_rows_differ)
+        assert (rows_seen["attn0"]) == (4)
+        assert (rows_seen["attn1"]) == (4)
+        assert (rows_seen["moe"]) == (8)
+        assert (out.shape[0]) == (2)
+        assert (residual.shape[0]) == (2)
 
     def test_tensor_parallel_only_keeps_full_rows(self):
         from tokenspeed.runtime.distributed.mapping import Mapping
@@ -635,10 +639,10 @@ class TestLongcatRowLayout(unittest.TestCase):
         )
         layer, rows_seen, out, _ = self._run(mapping=mapping, local_tokens=4)
 
-        self.assertFalse(layer.moe_rows_differ)
-        self.assertEqual((rows_seen["attn0"], rows_seen["attn1"]), (4, 4))
-        self.assertEqual(rows_seen["moe"], 4)
-        self.assertEqual(out.shape[0], 4)
+        assert not (layer.moe_rows_differ)
+        assert ((rows_seen["attn0"], rows_seen["attn1"])) == ((4, 4))
+        assert (rows_seen["moe"]) == (4)
+        assert (out.shape[0]) == (4)
 
     def test_pure_attention_dp_with_ep_needs_no_bridge(self):
         from tokenspeed.runtime.distributed import comm_manager as comm_module
@@ -662,7 +666,7 @@ class TestLongcatRowLayout(unittest.TestCase):
             global_server_args_dict, {"enable_allreduce_fusion": True}
         ):
             layer = self._layer(mapping, rows_seen)
-        self.assertFalse(layer.moe_rows_differ)
+        assert not (layer.moe_rows_differ)
 
         ctx = SimpleNamespace(
             forward_mode=SimpleNamespace(is_idle=lambda: False),
@@ -678,11 +682,11 @@ class TestLongcatRowLayout(unittest.TestCase):
                 torch.arange(4), torch.randn(4, self.HIDDEN), ctx, None
             )
 
-        self.assertEqual(gathers, [mapping.moe.tp_ep_group])
-        self.assertNotIn(mapping.attn.tp_group, gathers)
-        self.assertEqual((rows_seen["attn0"], rows_seen["attn1"]), (4, 4))
-        self.assertEqual(rows_seen["moe"], 16)
-        self.assertEqual((out.shape[0], residual.shape[0]), (4, 4))
+        assert (gathers) == ([mapping.moe.tp_ep_group])
+        assert (mapping.attn.tp_group) not in (gathers)
+        assert ((rows_seen["attn0"], rows_seen["attn1"])) == ((4, 4))
+        assert (rows_seen["moe"]) == (16)
+        assert ((out.shape[0], residual.shape[0])) == ((4, 4))
 
     def test_row_bridges_reject_the_wrong_input_layout(self):
         from tokenspeed.runtime.distributed.mapping import Mapping
@@ -704,10 +708,10 @@ class TestLongcatRowLayout(unittest.TestCase):
             query_shard=None,
         )
         # Full rows (4) where this rank's scattered share (2) is expected.
-        with self.assertRaisesRegex(RuntimeError, "scattered share"):
+        with pytest.raises((RuntimeError), match=("scattered share")):
             layer.moe_comm.gather_scattered_rows(torch.randn(4, self.HIDDEN), ctx)
         # A scattered share where the full rows are expected.
-        with self.assertRaisesRegex(RuntimeError, "full rows"):
+        with pytest.raises((RuntimeError), match=("full rows")):
             layer.moe_comm.slice_scattered_rows(torch.randn(2, self.HIDDEN), ctx)
 
     def test_idle_rank_joins_the_cross_dp_dense_collectives(self):
@@ -743,11 +747,11 @@ class TestLongcatRowLayout(unittest.TestCase):
                 None,
             )
 
-        self.assertEqual(gathers, [(0, 1, 2, 3)] * 3)
-        self.assertEqual(rows_seen["moe"], 4)
-        self.assertNotIn("attn0", rows_seen)
-        self.assertEqual(out.shape[0], 0)
-        self.assertIsNone(residual)
+        assert (gathers) == ([(0, 1, 2, 3)] * 3)
+        assert (rows_seen["moe"]) == (4)
+        assert ("attn0") not in (rows_seen)
+        assert (out.shape[0]) == (0)
+        assert (residual) is None
 
     def test_mixed_patterns_reject_allreduce_fusion(self):
         from tokenspeed.runtime.distributed.mapping import Mapping
@@ -763,19 +767,19 @@ class TestLongcatRowLayout(unittest.TestCase):
         )
         with (
             mock.patch.dict(global_server_args_dict, {"enable_allreduce_fusion": True}),
-            self.assertRaisesRegex(ValueError, "one comm pattern"),
+            pytest.raises((ValueError), match=("one comm pattern")),
         ):
             self._layer(mapping, {})
 
 
-class TestLongcatCheckpointLoading(unittest.TestCase):
+class TestLongcatCheckpointLoading:
     def test_missing_kv_scale_params_are_silent(self):
         model = object.__new__(LongcatFlashForCausalLM)
         with mock.patch(
             "tokenspeed.runtime.models.longcat_flash._longcat_logger.warning"
         ) as warning:
-            self.assertIsNone(model.get_param({}, "model.layers.0.self_attn.0.k_scale"))
-            self.assertIsNone(model.get_param({}, "model.layers.0.self_attn.1.v_scale"))
+            assert (model.get_param({}, "model.layers.0.self_attn.0.k_scale")) is None
+            assert (model.get_param({}, "model.layers.0.self_attn.1.v_scale")) is None
         warning.assert_not_called()
 
     def test_missing_mtp_params_are_silent(self):
@@ -783,11 +787,11 @@ class TestLongcatCheckpointLoading(unittest.TestCase):
         with mock.patch(
             "tokenspeed.runtime.models.longcat_flash._longcat_logger.warning"
         ) as warning:
-            self.assertIsNone(
+            assert (
                 model.get_param({}, "model.mtp.layers.0.self_attn.q_proj.weight")
-            )
+            ) is None
         warning.assert_not_called()
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

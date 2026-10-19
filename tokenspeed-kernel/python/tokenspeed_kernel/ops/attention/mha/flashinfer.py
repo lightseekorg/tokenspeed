@@ -25,6 +25,7 @@ from functools import wraps
 from inspect import signature
 
 import torch
+from tokenspeed_kernel.ops.tuning import untuned
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -32,7 +33,13 @@ from tokenspeed_kernel.platform import (
     pdl_enabled,
 )
 from tokenspeed_kernel.registry import ErrorClass, Priority, error_fn, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+    tensor_format,
+)
 
 platform = current_platform()
 
@@ -70,6 +77,26 @@ def _with_pdl_default(function):
     return wrapper
 
 
+def _untuned_with_lse(function):
+    """MLA decode tunes batches up to 8192, and with ``return_lse`` each one
+    reserves 256 rows of softmax stats per request and head from the workspace,
+    more than it holds: a log-sum-exp call takes the cached or heuristic tactic."""
+    return_lse_index = tuple(signature(function).parameters).index("return_lse")
+
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        if len(args) > return_lse_index:
+            return_lse = args[return_lse_index]
+        else:
+            return_lse = kwargs.get("return_lse", False)
+        if not return_lse:
+            return function(*args, **kwargs)
+        with untuned("trtllm_batch_decode_mla"):
+            return function(*args, **kwargs)
+
+    return wrapper
+
+
 if platform.is_nvidia:
     from flashinfer.decode import (
         BatchDecodeWithPagedKVCacheWrapper,
@@ -99,12 +126,13 @@ if platform.is_nvidia:
     trtllm_batch_decode_with_kv_cache = _with_pdl_default(
         _trtllm_batch_decode_with_kv_cache
     )
-    trtllm_batch_decode_with_kv_cache_mla = _with_pdl_default(
-        _trtllm_batch_decode_with_kv_cache_mla
+    trtllm_batch_decode_with_kv_cache_mla = _untuned_with_lse(
+        _with_pdl_default(_trtllm_batch_decode_with_kv_cache_mla)
     )
     trtllm_ragged_attention_deepseek = _with_pdl_default(
         _trtllm_ragged_attention_deepseek
     )
+
 
 if platform.is_blackwell or platform.is_hopper:
     from flashinfer.mla import BatchMLAPagedAttentionWrapper
@@ -118,6 +146,23 @@ _workspace_buffer: torch.Tensor | None = None
 
 
 if platform.is_nvidia and platform.is_hopper_plus:
+    # Dense caches, plus an FP8 cache at per-tensor scales (``fp8_kv_scales``).
+    _SCALED_FP8_CACHE = tensor_format(
+        "scaled-fp8",
+        torch.float8_e4m3fn,
+        scale=ScaleFormat(storage_dtype=torch.float32, granularity="tensor"),
+    )
+    _TRTLLM_GEN_SIGNATURES = format_signatures(
+        ("q", "k_cache", "v_cache"),
+        "dense",
+        {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
+    ) | {
+        format_signature(
+            q=dense_tensor_format(torch.float8_e4m3fn),
+            k_cache=_SCALED_FP8_CACHE,
+            v_cache=_SCALED_FP8_CACHE,
+        )
+    }
 
     @register_kernel(
         "attention",
@@ -128,11 +173,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             min_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        signatures=format_signatures(
-            ("q", "k_cache", "v_cache"),
-            "dense",
-            {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
-        ),
+        signatures=_TRTLLM_GEN_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({64, 128, 256}),
@@ -162,10 +203,13 @@ if platform.is_nvidia and platform.is_hopper_plus:
         q_scale: torch.Tensor | None = None,
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
+        fp8_kv_scales: tuple[float, float] | None = None,
         enable_pdl: bool | None = None,
     ) -> torch.Tensor:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        # A scaled cache's rows are K / k and V / v: k joins the logit scale, v the output's.
+        k_descale, v_descale = (1.0, 1.0) if fp8_kv_scales is None else fp8_kv_scales
         global _workspace_buffer
         if _workspace_buffer is None:
             _workspace_buffer = torch.zeros(
@@ -188,8 +232,8 @@ if platform.is_nvidia and platform.is_hopper_plus:
             seq_lens=cache_seqlens,
             max_q_len=max_seqlen_q,
             max_kv_len=max_seqlen_k,
-            bmm1_scale=softmax_scale,
-            bmm2_scale=1.0,
+            bmm1_scale=softmax_scale * k_descale,
+            bmm2_scale=v_descale,
             batch_size=cache_seqlens.shape[0],
             cum_seq_lens_q=cu_seqlens_q,
             cum_seq_lens_kv=cu_seqlens_kv,
@@ -209,11 +253,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             min_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        signatures=format_signatures(
-            ("q", "k_cache", "v_cache"),
-            "dense",
-            {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
-        ),
+        signatures=_TRTLLM_GEN_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
             "logit_cap": frozenset({False}),
@@ -238,10 +278,13 @@ if platform.is_nvidia and platform.is_hopper_plus:
         q_scale: torch.Tensor | None = None,
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
+        fp8_kv_scales: tuple[float, float] | None = None,
         enable_pdl: bool | None = None,
     ) -> torch.Tensor:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        # A scaled cache's rows are K / k and V / v: k joins the logit scale, v the output's.
+        k_descale, v_descale = (1.0, 1.0) if fp8_kv_scales is None else fp8_kv_scales
         global _workspace_buffer
         if _workspace_buffer is None:
             _workspace_buffer = torch.zeros(
@@ -264,8 +307,8 @@ if platform.is_nvidia and platform.is_hopper_plus:
             block_tables=page_table,
             seq_lens=cache_seqlens,
             max_seq_len=max_seqlen_k,
-            bmm1_scale=softmax_scale,
-            bmm2_scale=1.0,
+            bmm1_scale=softmax_scale * k_descale,
+            bmm2_scale=v_descale,
             window_left=window_left,
             sinks=sinks,
             out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),

@@ -24,6 +24,10 @@ import math
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsa import (
+    torch_dsa_logits_topk,
+    torch_dsa_sparse_attention,
+)
 from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode,
     dsa_decode_topk,
@@ -34,7 +38,7 @@ from tokenspeed_kernel.ops.attention.dsa import (
 from tokenspeed_kernel.ops.attention.dsa.triton import (
     workspace_topk_to_global_slots as dsa_workspace_topk_to_global_slots,
 )
-from tokenspeed_kernel.ops.attention.dsv4 import dsv4_plan
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 torch.manual_seed(42)
 
@@ -276,12 +280,6 @@ def test_dsa_plan_returns_none_without_kernel(device: str) -> None:
     assert dsa_plan(seq_lens_2d=seq_lens_2d, page_size=64, solution="missing") is None
 
 
-def test_dsv4_plan_returns_none_without_kernel(device: str) -> None:
-    seq_lens_2d = torch.tensor([[1]], device=device, dtype=torch.int32)
-
-    assert dsv4_plan(seq_lens_2d=seq_lens_2d, page_size=64, solution="missing") is None
-
-
 def test_dsa_workspace_topk_to_global_slots(device: str) -> None:
     workspace_indices = torch.tensor(
         [[2, -1, 0], [1, 3, -1]],
@@ -424,29 +422,6 @@ def _pack_sparse_kv(
     return sparse, latent_fp8.float() * scale
 
 
-def _dsa_reference(
-    q: torch.Tensor,
-    latent: torch.Tensor,
-    rope: torch.Tensor,
-    topk_slots: torch.Tensor,
-    topk_lens: torch.Tensor,
-    softmax_scale: float,
-) -> torch.Tensor:
-    refs = []
-    kv_lora_rank = latent.shape[1]
-    for token in range(q.shape[0]):
-        valid_slots = topk_slots[token, : int(topk_lens[token].item())].long()
-        q_nope = q[token, :, :kv_lora_rank].float()
-        q_rope = q[token, :, kv_lora_rank:].float()
-        k_nope = latent.index_select(0, valid_slots).float()
-        k_rope = rope.index_select(0, valid_slots).float()
-        scores = torch.einsum("hd,kd->hk", q_nope, k_nope)
-        scores += torch.einsum("hd,kd->hk", q_rope, k_rope)
-        probs = torch.softmax(scores * softmax_scale, dim=-1)
-        refs.append(torch.matmul(probs, k_nope))
-    return torch.stack(refs, dim=0).to(torch.bfloat16)
-
-
 @pytest.mark.parametrize(
     "mode,api_name",
     [
@@ -514,7 +489,7 @@ def test_dsa_with_kvcache(
         slot_order="selection",
     )
 
-    ref = _dsa_reference(
+    ref = torch_dsa_sparse_attention(
         q,
         dequant_latent,
         rope,
@@ -580,7 +555,7 @@ def test_dsa_decode_dense_kvcache(device: str, q_dtype: torch.dtype, require) ->
         slot_order="selection",
     )
 
-    ref = _dsa_reference(
+    ref = torch_dsa_sparse_attention(
         q,
         dequant_latent,
         dequant_rope,
@@ -741,10 +716,121 @@ def test_dsa_sharded_index_candidates_global_windows(device, degree):
         assert actual == expected
 
 
+@pytest.mark.parametrize("explicit_rows", [False, True])
+@pytest.mark.parametrize("page_size", [32, 128])
+def test_dsa_fp8_logits_empty_tiles_graph_replay(device, explicit_rows, page_size):
+    from tokenspeed_kernel.ops.attention.dsa._triton.topk import (
+        _dsa_decode_logits_fp8_kernel,
+    )
+
+    # A 32-token page shares a tile with its neighbour; a 128-token page spans
+    # two tiles. Both must retain partial tiles and skip wholly absent ones.
+    rows, heads, dim, columns = 4, 2, 128, 8
+    width = columns * page_size
+    q = torch.randn(rows, heads, dim, device=device, dtype=torch.bfloat16)
+    weights = torch.randn(rows, heads, device=device)
+    packed, dequant = _pack_index_k_cache(
+        torch.randn(5 * page_size, dim, device=device), page_size
+    )
+    table = torch.tensor(
+        [
+            [3, -1, 0, 2, -1, 1, 4, -1],
+            [-1] * columns,
+            [1, 2, 3, 4, 0, 1, 2, 3],
+            [4, -1, 3, -1, 2, -1, 1, -1],
+        ],
+        device=device,
+        dtype=torch.int32,
+    )
+    requests = torch.tensor([3, 0, 1, 2], device=device, dtype=torch.int32)
+    lengths = torch.tensor(
+        (
+            [page_size * 5 + 9, page_size * 3 + 13, width, 0]
+            if explicit_rows
+            else [page_size * 3 + 13, 0]
+        ),
+        device=device,
+        dtype=torch.int32,
+    )
+    initial, local = (4, 8) if explicit_rows else (0, 0)
+    logits = torch.empty(rows, width, device=device)
+
+    def launch():
+        _dsa_decode_logits_fp8_kernel[(rows, (width + 63) // 64)](
+            q,
+            packed.view(torch.float8_e4m3fn),
+            packed.view(torch.float32),
+            weights,
+            lengths,
+            table,
+            logits,
+            table.stride(0),
+            logits.stride(0),
+            requests if explicit_rows else None,
+            EXPLICIT_ROWS=explicit_rows,
+            INITIAL_TOKENS=initial,
+            LOCAL_TOKENS=local,
+            page_size=page_size,
+            row_bytes=dim + 4,
+            page_stride_bytes=page_size * (dim + 4),
+            max_seq_len=width,
+            num_heads=heads,
+            head_dim=dim,
+            num_groups=1,
+            softmax_scale=0.1,
+            q_len_per_req=2,
+            BLOCK_N=64,
+            BLOCK_D=64,
+            num_warps=4,
+            num_stages=1,
+        )
+
+    def check():
+        positions = torch.arange(width, device=device)
+        for row in range(rows):
+            req = int(requests[row]) if explicit_rows else row // 2
+            length = (
+                int(lengths[row])
+                if explicit_rows
+                else max(int(lengths[req]) - 1 + row % 2, 0)
+            )
+            pages = table[req, positions // page_size]
+            slots = pages.clamp_min(0).long() * page_size + positions % page_size
+            expected = torch.einsum("hd,sd->hs", q[row].float(), dequant[slots]).relu()
+            expected = (expected * weights[row, :, None]).sum(0) * 0.1
+            expected.masked_fill_(
+                (positions < initial) | (positions >= length - local), float("inf")
+            )
+            expected.masked_fill_(
+                (pages < 0) | (positions >= length) | torch.isnan(expected),
+                -float("inf"),
+            )
+            torch.testing.assert_close(logits[row], expected, rtol=2e-4, atol=2e-4)
+
+    launch()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for state in ("empty", "refill"):
+        if state == "empty":
+            table.fill_(-1)
+        else:
+            table.fill_(0)
+            lengths.fill_(width - 7)
+            requests.copy_(requests.roll(1))
+            q.normal_()
+            q[0, 0, 0] = float("nan")
+        # Poison every output so a skipped store cannot pass by retaining a
+        # previous replay's padding. Empty forced windows must stay -inf.
+        logits.fill_(123.0)
+        graph.replay()
+        check()
+
+
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 def test_deep_gemm_sharded_index_candidates_global_windows(device, degree):
     from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates
-    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
     from tokenspeed_kernel.platform import current_platform
 
     if not current_platform().is_hopper_plus:
@@ -764,7 +850,7 @@ def test_deep_gemm_sharded_index_candidates_global_windows(device, degree):
         torch.randn(10 * page_size, dim, device=device), page_size
     )
     logical_k = dequant.reshape(10, page_size, dim)[table[0].long()].reshape(-1, dim)
-    quantized, scales = quantize_fp8_with_scale(
+    quantized, scales = quantize_fp8(
         q.reshape(-1, dim),
         granularity="token_group",
         group_size=128,
@@ -970,3 +1056,198 @@ def test_gather_index_candidates_matches_tensor_reference(device):
     torch.testing.assert_close(
         scores, torch.where(valid, expected_scores, -float("inf"))
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("channel_stride", [1, 2])
+def test_dsa_strided_pages_are_read_in_place(dtype, channel_stride, monkeypatch):
+    import tokenspeed_kernel.ops.attention.dsa.triton as dsa_triton
+    from utils import assert_no_triton_compile
+
+    torch.manual_seed(193)
+    page_size, rank, rope = 64, 512, 64
+    storage = torch.randn(
+        4, page_size + 7, 1, (rank + rope) * channel_stride, device="cuda"
+    ).to(dtype)
+    cache = storage[:, :page_size, :, ::channel_stride]
+    q = torch.randn(3, 2, rank + rope, device="cuda").to(dtype)
+    slots = torch.tensor(
+        [[0, 63, 64, 129, 250, -1], [130, 195, 66, -1, -1, -1], [-1] * 6],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    slots = torch.nn.functional.pad(slots, (0, 512 - slots.shape[1]), value=-1)
+    lens = torch.tensor([5, 3, 0], device="cuda", dtype=torch.int32)
+    run_dense = dsa_triton._run_dense_kv
+
+    def require_original_storage(q, kv_cache, *args, **kwargs):
+        assert kv_cache.data_ptr() == cache.data_ptr()
+        return run_dense(q, kv_cache, *args, **kwargs)
+
+    monkeypatch.setattr(dsa_triton, "_run_dense_kv", require_original_storage)
+
+    def run():
+        return dsa_decode(
+            q=q,
+            kv_cache=cache,
+            sparse_kv_cache=None,
+            topk_slots=slots,
+            topk_lens=lens,
+            max_seqlen_k=256,
+            qk_nope_head_dim=128,
+            kv_lora_rank=rank,
+            qk_rope_head_dim=rope,
+            softmax_scale=192**-0.5,
+            page_size=page_size,
+            solution="triton",
+            slot_order="selection",
+            return_lse=True,
+        )
+
+    out, lse = run()
+    with assert_no_triton_compile(dsa_triton._dsa_dense_kv_kernel):
+        out2, lse2 = run()
+    flat = cache.float().reshape(-1, rank + rope)
+    for row, count in enumerate(lens.tolist()):
+        if not count:
+            assert torch.count_nonzero(out[row]) == 0
+            assert torch.isneginf(lse[row]).all()
+            continue
+        selected = flat[slots[row, :count]]
+        logits = q[row].float() @ selected.T * (192**-0.5)
+        ref = logits.softmax(-1) @ selected[:, :rank]
+        torch.testing.assert_close(out[row].float(), ref, atol=0.03, rtol=0.03)
+        torch.testing.assert_close(lse[row], logits.logsumexp(-1), atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(out, out2)
+    torch.testing.assert_close(lse, lse2)
+
+
+@pytest.mark.parametrize("cols", [32759, 32763, 32768, 32768 + 64])
+def test_large_padded_topk_uses_bounded_compilation(monkeypatch, cols):
+    from tokenspeed_kernel.ops.attention.dsa._triton import topk as impl
+
+    logits = torch.empty(1, cols)
+    result = torch.empty(1, 2048, dtype=torch.int32)
+
+    class RejectUnrolledKernel:
+        def __getitem__(self, grid):
+            raise AssertionError("large padded top-k must not unroll the full sort")
+
+    monkeypatch.setattr(impl, "_dsa_logits_topk_kernel", RejectUnrolledKernel())
+    monkeypatch.setattr(
+        impl, "_radix_topk", lambda x, k, *, seq_lens, enable_pdl: result
+    )
+    assert (
+        impl._topk_with_padding(logits, 2048, seq_lens=None, enable_pdl=False) is result
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("cols", [32759, 32763, 32768, 32768 + 64, 32768 + 128])
+def test_topk_with_speculative_context_padding(cols):
+    from tokenspeed_kernel.ops.attention.dsa._triton.topk import triton_topk_from_logits
+
+    torch.manual_seed(7)
+    logits = torch.randint(-100, 100, (2, cols), device="cuda").float()
+    actual = triton_topk_from_logits(logits, 2048, seq_lens=None, enable_pdl=False)
+    expected = torch.argsort(logits, dim=-1, descending=True, stable=True)[:, :2048]
+    torch.testing.assert_close(actual, expected.to(torch.int32), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize(
+    ("cols", "topk"), [(73, 128), (4099, 64), (32759, 2048), (65537, 512)]
+)
+@pytest.mark.parametrize("length_dtype", [torch.int32, torch.int64])
+def test_triton_topk_reads_only_valid_prefixes(device, cols, topk, length_dtype):
+    from tokenspeed_kernel.ops.attention.dsa._triton.topk import triton_topk_from_logits
+
+    lengths = [-3, 0, 1, topk - 1, topk, topk + 1, cols - 3, cols, cols + 7]
+    rows = len(lengths)
+    seq_lens = torch.empty(rows * 2, device=device, dtype=length_dtype)[::2]
+    seq_lens.copy_(torch.tensor(lengths, device=device, dtype=length_dtype))
+    logits = torch.empty(rows, cols * 2, device=device)[:, ::2]
+    values = torch.randint(-4, 5, logits.shape, device=device).float()
+    values[2].fill_(-float("inf"))
+    valid = (
+        torch.arange(cols, device=device)[None, :] < seq_lens.clamp(0, cols)[:, None]
+    )
+    # Poison the unwritten tail with values that would win an unmasked top-k.
+    poison = torch.where(
+        torch.arange(rows, device=device)[:, None] % 2 == 0,
+        float("nan"),
+        float("inf"),
+    )
+    logits.copy_(torch.where(valid, values, poison))
+    expected = torch_dsa_logits_topk(logits, seq_lens, topk, 1)
+    actual = triton_topk_from_logits(logits, topk, seq_lens=seq_lens, enable_pdl=False)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    masked = logits.masked_fill(~valid, -float("inf"))
+    full_width = triton_topk_from_logits(masked, topk, seq_lens=None, enable_pdl=False)
+    torch.testing.assert_close(full_width, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("cols", [4099, 65537])
+def test_triton_topk_seq_lens_refresh_during_graph_replay(device, cols):
+    from tokenspeed_kernel.ops.attention.dsa._triton.topk import triton_topk_from_logits
+
+    rows, topk = 4, 64
+    logits = torch.randn(rows, cols, device=device)
+    seq_lens = torch.full((rows,), cols, device=device, dtype=torch.int32)
+
+    def forward():
+        return triton_topk_from_logits(
+            logits, topk, seq_lens=seq_lens, enable_pdl=False
+        )
+
+    forward()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = forward()
+    for lengths in ([0, 1, topk - 1, topk + 1], [cols, 0, 8193, 17], [0] * rows):
+        seq_lens.copy_(torch.tensor(lengths, device=device, dtype=torch.int32))
+        values = torch.randint(-4, 5, logits.shape, device=device).float()
+        valid = torch.arange(cols, device=device)[None, :] < seq_lens[:, None]
+        logits.copy_(torch.where(valid, values, float("nan")))
+        graph.replay()
+        expected = torch_dsa_logits_topk(logits, seq_lens, topk, 1)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("cols", [4099, 65537])
+def test_triton_topk_lengths_and_strides_do_not_recompile(device, cols):
+    from tokenspeed_kernel.ops.attention.dsa._triton import topk as impl
+    from utils import assert_no_triton_compile
+
+    topk = 64
+
+    def run(width, rows, column_stride, length_stride):
+        logits = torch.randn(rows, width * column_stride, device=device)[
+            :, ::column_stride
+        ]
+        seq_lens = torch.empty(rows * length_stride, device=device, dtype=torch.int32)[
+            ::length_stride
+        ]
+        seq_lens.copy_(
+            torch.arange(rows, device=device, dtype=torch.int32) * (width // rows)
+        )
+        actual = impl.triton_topk_from_logits(
+            logits, topk, seq_lens=seq_lens, enable_pdl=False
+        )
+        expected = torch_dsa_logits_topk(logits, seq_lens, topk, 1)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    run(cols, 2, 1, 1)
+    widths = [5003, 6151, 8173] if cols == 4099 else [66003, 69635, 73711]
+    with assert_no_triton_compile(
+        impl._dsa_logits_topk_kernel,
+        impl._dsa_radix_hist_kernel,
+        impl._dsa_radix_update_kernel,
+        impl._dsa_radix_scatter_kernel,
+        impl._dsa_radix_sort_selected_kernel,
+    ):
+        for width, rows in zip(widths, (5, 3, 7), strict=True):
+            run(width, rows, 2, 2)

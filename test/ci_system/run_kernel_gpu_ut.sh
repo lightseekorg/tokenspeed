@@ -37,9 +37,10 @@ run_distributed() {
 python3 -m pytest tokenspeed-kernel/test/ops/test_communcation.py -v \
     -k 'not world8' --junitxml=/tmp/kernel-multi-gpu.xml
 check_reports /tmp/kernel-multi-gpu.xml
+# Deselect TP8 here as well: this job has four GPUs and rejects skipped tests.
 python3 -m pytest \
     tokenspeed-kernel/test/nvidia/ops/communication/test_projection_tp.py \
-    -v --junitxml=/tmp/kernel-projection-tp.xml
+    -k 'not tp8' -v --junitxml=/tmp/kernel-projection-tp.xml
 check_reports /tmp/kernel-projection-tp.xml
 python3 -m pytest tokenspeed-kernel/test/ops/test_attention_dsv41_index_scan.py \
     -k 'not tp4' -v --junitxml=/tmp/kernel-index-scan.xml
@@ -53,6 +54,8 @@ run_distributed mnnvl \
     tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_mnnvl_comm.py
 run_distributed mnnvl-twoshot \
     tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_mnnvl_twoshot.py
+run_distributed mnnvl-sandwich \
+    tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_mnnvl_sandwich_norm.py
 
 ignores=(
     --ignore=tokenspeed-kernel/test/amd
@@ -64,6 +67,7 @@ ignores=(
     --ignore=tokenspeed-kernel/test/nvidia/ops/moe/test_marlin_deepep_distributed.py
     --ignore=tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_mnnvl_comm.py
     --ignore=tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_mnnvl_twoshot.py
+    --ignore=tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_mnnvl_sandwich_norm.py
     --ignore=tokenspeed-kernel/test/nvidia/ops/communication/test_projection_tp.py
     # These suites require eight or sixteen ranks; this allocation has four GPUs.
     --ignore=tokenspeed-kernel/test/nvidia/ops/communication/test_multimem_distributed.py

@@ -80,6 +80,8 @@ def _bare_mla_backend(
     backend.page_table_buf = None
     backend.seq_lens_buf = None
     backend._decode_views_by_bs = {}
+    backend.tree_verify = None
+    backend.tree_draft = None
     return backend
 
 

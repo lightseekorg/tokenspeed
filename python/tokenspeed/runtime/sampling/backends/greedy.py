@@ -131,6 +131,7 @@ class GreedySamplingBackend(SamplingBackend):
     supported. Intended as the default backend and as a fallback when
     flashinfer is unavailable."""
 
+    _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
     supports_tree_verify = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
@@ -148,6 +149,10 @@ class GreedySamplingBackend(SamplingBackend):
             (config.max_bs,), dtype=torch.int32, device=config.device
         )
 
+    def reads_only_argmax(self) -> bool:
+        # Logprobs read the full distribution.
+        return not self.config.enable_output_logprobs
+
     @nvtx_range("sampling:sample", color="yellow")
     def sample(
         self,
@@ -164,7 +169,10 @@ class GreedySamplingBackend(SamplingBackend):
                 logits=logits, vocab_mask=sampling_info.vocab_mask
             )
         bs = logits.shape[0]
-        tokens = sampling_argmax(logits, out=self._sample_token_buf[:bs])
+        if logits_output.next_token_ids is not None:
+            tokens = self._sample_token_buf[:bs].copy_(logits_output.next_token_ids)
+        else:
+            tokens = sampling_argmax(logits, out=self._sample_token_buf[:bs])
 
         # TP-rank sync (rank 0 wins), mirrors FlashInferSamplingBackend.sample.
         # All-gathered logits are not bit-identical across ranks, so per-rank
@@ -209,7 +217,11 @@ class GreedySamplingBackend(SamplingBackend):
                 logits=logits,
                 vocab_mask=sampling_info.vocab_mask,
             )
-        target_predict = sampling_argmax(logits).reshape(bs, num_tokens_per_req)
+        target_predict = (
+            logits_output.next_token_ids
+            if logits_output.next_token_ids is not None
+            else sampling_argmax(logits)
+        ).reshape(bs, num_tokens_per_req)
 
         if tree is not None:
             # The accepted path rides in accept_index so the TP broadcast below carries it.
@@ -231,6 +243,23 @@ class GreedySamplingBackend(SamplingBackend):
                 batch_size=bs,
                 num_draft_tokens=num_tokens_per_req,
             )
+            # Retain normal verification cost before forcing benchmark acceptance.
+            if self.config.synthetic_acceptance_length is not None:
+                lengths = self.synthetic_lengths(
+                    candidates, sampling_info.batch_row_offset
+                )
+                target_tokens = target_predict.gather(
+                    1, (lengths - 1).long()[:, None]
+                ).squeeze(1)
+                self.write_synthetic_outputs(
+                    candidates,
+                    target_tokens,
+                    lengths,
+                    predict,
+                    accept_index,
+                    accept_length,
+                )
+
             accept_length += 1
 
         # TP-rank sync on the full verify-output triple, mirrors

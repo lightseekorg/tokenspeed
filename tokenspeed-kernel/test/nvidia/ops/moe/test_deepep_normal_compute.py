@@ -31,8 +31,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.quantization import dequantize_fp8_groups
 from tokenspeed_kernel.ops.activation.triton import fused_swiglu_fp8_ue8m0
-from tokenspeed_kernel.ops.moe.triton.deepep_permute import (
+from tokenspeed_kernel.ops.moe._deep_ep.permute import (
     deepep_gather,
     deepep_scatter,
 )
@@ -104,8 +105,7 @@ def _dequantize_packed(q: torch.Tensor, packed: torch.Tensor) -> torch.Tensor:
     bytes_ = torch.stack(
         [(packed >> (8 * i)) & 0xFF for i in range(4)], dim=-1
     ).flatten(-2)[:, :num_groups]
-    scales = torch.exp2(bytes_.float() - 127.0)
-    return q.float() * scales.repeat_interleave(_BLOCK, dim=1)
+    return dequantize_fp8_groups(q, bytes_.to(torch.uint8), _BLOCK)
 
 
 def test_fused_silu_block_quant_fills_mn_major_scales():
@@ -249,7 +249,7 @@ def test_requantization_makes_scales_ue8m0_and_preserves_values():
     2x, throwing away a bit of their mantissa. Re-quantizing keeps the
     dequantized weight close to what the checkpoint encoded.
     """
-    from tokenspeed_kernel.ops.moe.deep_gemm.ue8m0 import (
+    from tokenspeed_kernel.ops.moe._deep_gemm.ue8m0 import (
         is_ue8m0,
         requantize_to_ue8m0_,
     )
@@ -284,7 +284,7 @@ def test_requantization_makes_scales_ue8m0_and_preserves_values():
 
 def test_deepep_weight_preprocessor_packs_scales_once_for_both_modes():
     """The per-forward GEMMs should receive ready-to-use B scale layouts."""
-    from tokenspeed_kernel.ops.moe.deep_gemm import deepep_fp8
+    import tokenspeed_kernel.ops.moe.deep_ep as deepep_fp8
 
     torch.manual_seed(0)
     experts, hidden, ispp = 3, 512, 256
@@ -312,7 +312,7 @@ def test_ue8m0_quantized_activations_round_trip_through_the_grouped_gemm():
     Non-power-of-two scales are misread by the sm100 1d1d kernel, so this pins
     the format the DeepEP normal path relies on.
     """
-    from tokenspeed_kernel.ops.moe.deep_gemm.ue8m0 import (
+    from tokenspeed_kernel.ops.moe._deep_gemm.ue8m0 import (
         is_ue8m0,
         per_token_group_quant_fp8_ue8m0,
     )

@@ -23,7 +23,7 @@
 flashinfer's ``*_sampling_from_probs`` kernels seed curand with the batch
 row, so a request's T>0 draw depends on its co-batch. Under ``per-request``
 the backends route sampled rows through the Gumbel-max pool kernel keyed by
-``(seed_pool[pool_idx], valid_cache_lengths[pool_idx])``. The CPU tests pin
+``(seed_pool[pool_idx], absolute_target_position)``. The CPU tests pin
 the route selection and the pool plumbing with the kernels mocked; the CUDA
 test is the contract itself: the same request samples the same token alone
 and inside a batch.
@@ -52,6 +52,7 @@ MAX_BS = 4
 
 def _config(sampling_stream: str, device: str) -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         enable_speculative_sampling=False,
         sampling_stream=sampling_stream,
         logprob_order="torch",
@@ -177,7 +178,7 @@ def test_per_request_route_reads_the_request_pools(cpu_kernels):
     assert cpu_kernels["gather"] == []
     (call,) = cpu_kernels["gumbel"]
     # Pool indices reach the kernel as int32, the pools as the backend's own
-    # buffers, and the offsets as the step's pool-indexed cache lengths.
+    # buffers, and offsets as the target positions derived from the frontier.
     assert call["req_pool_indices"].dtype == torch.int32
     assert call["req_pool_indices"].tolist() == [3, 5]
     assert call["seed_pool"] is backend._seed_pool
@@ -185,22 +186,28 @@ def test_per_request_route_reads_the_request_pools(cpu_kernels):
     assert call["temperature_pool"][3].item() == pytest.approx(0.7)
     assert call["top_k_pool"][3].item() == 40
     assert call["top_p_pool"][3].item() == pytest.approx(0.9)
-    assert call["offsets_pool"] is info.valid_cache_lengths
+    assert torch.equal(
+        call["offsets_pool"][info.req_pool_indices],
+        info.valid_cache_lengths[info.req_pool_indices] + 1,
+    )
     assert call["min_p_pool"] is None
     assert call["logits"] is logits
     assert sampled.tolist() == [0, 1]
     assert lengths.tolist() == [1, 1]
 
 
-def test_per_request_route_without_cache_lengths_uses_zero_offsets(cpu_kernels):
-    backend = FlashInferSamplingBackend(_config("per-request", "cpu"))
-    backend.prepare_step(["a"], [1], [_sp("a")])
+@pytest.mark.parametrize("sampling_stream", ["per-request", "batch"])
+def test_sampling_without_frontier_fails(sampling_stream):
+    backend = FlashInferSamplingBackend(_config(sampling_stream, "cpu"))
     info = SamplingBatchInfo(
         req_pool_indices=torch.tensor([1]), vocab_size=VOCAB, device="cpu"
     )
-    backend.sample(LogitsProcessorOutput(next_token_logits=torch.randn(1, VOCAB)), info)
-    (call,) = cpu_kernels["gumbel"]
-    assert call["offsets_pool"] is backend._zero_offsets_pool
+    # Exercise the real backend entry; no numerical kernel is mocked. Missing
+    # execution metadata must fail instead of selecting an arbitrary RNG offset.
+    with pytest.raises(ValueError, match="require valid_cache_lengths"):
+        backend.sample(
+            LogitsProcessorOutput(next_token_logits=torch.randn(1, VOCAB)), info
+        )
 
 
 def test_per_request_route_feeds_the_greedy_overlay_each_rows_top_k(

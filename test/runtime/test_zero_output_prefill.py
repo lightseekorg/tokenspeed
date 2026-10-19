@@ -37,6 +37,9 @@ import torch
 
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.sampling.sampling_batch_info import (
+    SamplingBatchInfo,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME = "python/tokenspeed/runtime/"
@@ -82,6 +85,10 @@ class Output:
     hidden_states: torch.Tensor | None = None
     logits_layout_plan: object = None
     input_token_logprobs: torch.Tensor | None = None
+    input_top_logprobs_val: torch.Tensor | None = None
+    input_top_logprobs_idx: torch.Tensor | None = None
+    sampled_top_logprobs_val: torch.Tensor | None = None
+    sampled_top_logprobs_idx: torch.Tensor | None = None
 
 
 class SharedBufferSampler:
@@ -129,12 +136,9 @@ class SharedBufferSampler:
 def test_sampling_preserves_request_parameters_and_shared_outputs(
     p, e, d, width, with_mask
 ):
-    info_cls = load_symbol(
-        RUNTIME + "sampling/sampling_batch_info.py", "SamplingBatchInfo"
-    )
     sample = load_symbol(
         RUNTIME + "execution/model_executor.py",
-        "_run_sampling",
+        "_sample_and_verify",
         owner="ModelExecutor",
         LogitsProcessorOutput=Output,
         _sampling_info_for_requests=load_symbol(
@@ -142,24 +146,28 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
         ),
     )
     backend = SharedBufferSampler()
+    input_lengths = torch.tensor([5, 9, 2, 7, 3], dtype=torch.int32)[: e + d]
     executor = SimpleNamespace(
         tree_spec=None,
         sampling_backend=backend,
         _finish_decode_verify=lambda tokens, lengths, *args: lengths,
+        input_buffers=SimpleNamespace(input_lengths_buf=input_lengths),
     )
     ctx = SimpleNamespace(
         bs=e + d,
         num_extends=e,
         decode_input_ids=None,
         output_layout=ForwardOutputLayout(e, p, d, width),
+        sampled_top_k=0,
     )
     pool_indices = torch.tensor([17, 3, 11, 5, 13])[: e + d]
     cache_lengths = torch.arange(32)
-    info = info_cls(
+    info = SamplingBatchInfo(
         req_pool_indices=pool_indices,
         temperatures=torch.arange(e + d).float() + 0.5,
         top_ks=torch.arange(e + d) + 10,
         valid_cache_lengths=cache_lengths,
+        extend_lengths=input_lengths[:e],
         batch_row_offset=7,
         vocab_mask=torch.arange((e + d) * width)[:, None] if with_mask else None,
     )
@@ -194,7 +202,13 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
                 assert subset.vocab_mask[:, 0].tolist() == list(
                     range(mask_start, (e + d) * width)
                 )
+        # Both slices retain the original frontier, including across open
+        # prefill rows that emit no logits. The sampler derives offsets later.
         assert subset.valid_cache_lengths is cache_lengths
+        if kind == "sample":
+            assert torch.equal(subset.extend_lengths, input_lengths[:p])
+        else:
+            assert subset.extend_lengths is None
         if not with_mask:
             assert subset.vocab_mask is None
     if p or d:
@@ -247,11 +261,11 @@ def test_grammar_consumers_share_compact_token_offsets(hostfunc):
     if hostfunc:
         method = load_symbol(
             RUNTIME + "grammar/capturable_grammar.py",
-            "_advance_prev",
-            owner="CapturableGrammarExecutor",
+            "advance",
+            owner="GrammarHostBuffers",
         )
         method(
-            SimpleNamespace(output_tokens_host=tokens, accept_lengths_host=lengths),
+            SimpleNamespace(output_tokens=tokens, accept_lengths=lengths),
             dict(
                 completion=completion,
                 grammars=grammars,
@@ -368,7 +382,11 @@ def test_zero_rows_return_before_lm_head_and_retain_empty_taps():
     # (A replicated head: LM-head TP peers under attention DP would still
     # join the row exchange with no rows.)
     output = forward(
-        SimpleNamespace(config=SimpleNamespace(vocab_size=32), dp_lm_head_tp=False),
+        SimpleNamespace(
+            config=SimpleNamespace(vocab_size=32),
+            dp_lm_head_tp=False,
+            _query_shard=lambda metadata: None,
+        ),
         torch.arange(4),
         torch.empty(0, 8),
         None,
@@ -394,6 +412,7 @@ def test_selected_logits_do_not_gather_original_input_indices():
     )
     hidden = torch.arange(16).view(2, 8).float()
     processor = SimpleNamespace(
+        _query_shard=lambda metadata: None,
         _resolve_logits_layout_plan=lambda *args: None,
         _get_logits=lambda h, *args, **kwargs: h,
         do_argmax=False,
@@ -439,7 +458,11 @@ def test_zero_decoder_skips_layers_and_normalization():
     forward = load_symbol(
         RUNTIME + "models/deepseek_v41.py", "decoder_forward", owner="DeepseekV41Model"
     )
-    model = SimpleNamespace(ced_decoder_start=20, dspark_capture_layers=(19, 20, 39))
+    model = SimpleNamespace(
+        ced_decoder_start=20,
+        dspark_capture_layers=(19, 20, 39),
+        mapping=SimpleNamespace(attn=SimpleNamespace(has_dp=False)),
+    )
     state = SimpleNamespace(
         rows=0,
         hidden=torch.empty(0, 4, 8),
@@ -453,12 +476,9 @@ def test_zero_decoder_skips_layers_and_normalization():
 
 @pytest.mark.parametrize("decode", [False, True])
 def test_identity_sampling_keeps_backend_buffer_aliases(decode):
-    info_cls = load_symbol(
-        RUNTIME + "sampling/sampling_batch_info.py", "SamplingBatchInfo"
-    )
     sample = load_symbol(
         RUNTIME + "execution/model_executor.py",
-        "_run_sampling",
+        "_sample_and_verify",
         owner="ModelExecutor",
         LogitsProcessorOutput=Output,
     )
@@ -467,8 +487,11 @@ def test_identity_sampling_keeps_backend_buffer_aliases(decode):
         tree_spec=None,
         sampling_backend=backend,
         _finish_decode_verify=lambda tokens, lengths, *args: lengths,
+        input_buffers=SimpleNamespace(
+            input_lengths_buf=torch.ones(2, dtype=torch.int32)
+        ),
     )
-    info = info_cls(req_pool_indices=torch.tensor([3, 7]))
+    info = SamplingBatchInfo(req_pool_indices=torch.tensor([3, 7]))
     ctx = SimpleNamespace(
         bs=2,
         num_extends=0 if decode else 2,
@@ -478,6 +501,7 @@ def test_identity_sampling_keeps_backend_buffer_aliases(decode):
             if decode
             else ForwardOutputLayout(2, 2, 0, 1)
         ),
+        sampled_top_k=0,
     )
     tokens, lengths = sample(
         executor, Output(torch.eye(2)), info, ctx, torch.zeros(2, 1, dtype=torch.int32)
@@ -488,7 +512,8 @@ def test_identity_sampling_keeps_backend_buffer_aliases(decode):
     assert tokens.tolist() == [0, 1]
 
 
-def test_idle_graph_grammar_enqueues_an_identity_completion():
+@pytest.mark.parametrize("pending", [False, True])
+def test_idle_graph_grammar_enqueues_an_identity_completion(pending):
     import queue
     from contextlib import nullcontext
 
@@ -496,9 +521,16 @@ def test_idle_graph_grammar_enqueues_an_identity_completion():
         RUNTIME + "grammar/capturable_grammar.py",
         "add_batch",
         owner="CapturableGrammarExecutor",
-        GrammarStepCompletion=SimpleNamespace,
+        GrammarStepCompletion=lambda **kwargs: SimpleNamespace(
+            event=threading.Event(), **kwargs
+        ),
     )
-    grammar = SimpleNamespace(queue=queue.Queue())
+    decisions = []
+    grammar = SimpleNamespace(
+        queue=queue.Queue(),
+        gate=SimpleNamespace(push=decisions.append),
+        pending=pending,
+    )
     grammar.add_batch = lambda **kwargs: add(grammar, **kwargs)
     idle = load_symbol(
         RUNTIME + "execution/model_executor.py",
@@ -546,6 +578,9 @@ def test_idle_graph_grammar_enqueues_an_identity_completion():
             valid_cache_lengths=torch.zeros(1), vocab_size=32
         ),
         device="cpu",
+        default_stream=None,
+        execution_stream=SimpleNamespace(wait_stream=lambda stream: None),
+        device_module=SimpleNamespace(stream=lambda stream: nullcontext()),
         forward_step=step,
         config=SimpleNamespace(output_length=1),
         capturable_grammar=grammar,
@@ -557,15 +592,19 @@ def test_idle_graph_grammar_enqueues_an_identity_completion():
         ),
     )
     assert step.called
-    completion = grammar.queue.get_nowait()["completion"]
-    assert completion.output_layout == ForwardOutputLayout(0, 0, 1, 1)
+    # One gate decision per replay; it runs only to advance a pending batch.
+    assert decisions == [pending]
+    assert not grammar.pending
+    if pending:
+        completion = grammar.queue.get_nowait()["completion"]
+        assert completion.output_layout == ForwardOutputLayout(0, 0, 1, 1)
+        assert completion.event.is_set()
     assert grammar.queue.empty()
 
 
-@pytest.mark.parametrize("capturable", [True, False])
 @pytest.mark.parametrize("prefill_outputs", [1, 2])
-def test_grammar_mask_producers_walk_only_original_decode_candidates(
-    capturable, prefill_outputs, monkeypatch
+def test_grammar_mask_producer_walks_only_original_decode_candidates(
+    prefill_outputs, monkeypatch
 ):
     class MaskMatcher(Matcher):
         def __init__(self, tag):
@@ -586,53 +625,28 @@ def test_grammar_mask_producers_walk_only_original_decode_candidates(
     layout = ForwardOutputLayout(2, prefill_outputs, 1, 3)
     masks = torch.empty(9, 1, dtype=torch.int32)
     candidates = torch.full((3, 3), -99, dtype=torch.int32)
-    if capturable:
-        candidates[2] = torch.tensor([20, 21, 22])
-        fill = load_symbol(
-            RUNTIME + "grammar/capturable_grammar.py",
-            "_fill_current",
-            owner="CapturableGrammarExecutor",
-        )
-        executor = SimpleNamespace(
-            tree_spec=None,
-            max_tokens_per_req=3,
-            bitmask_host=masks,
-            candidates_host=candidates,
-        )
-        fill(
-            executor,
-            dict(
-                grammars=grammars,
-                bs=3,
-                has_candidates=True,
-                completion=SimpleNamespace(output_layout=layout),
-            ),
-        )
-    else:
-        fill = load_symbol(
-            RUNTIME + "grammar/capturable_grammar.py", "_fill_eager_bitmask"
-        )
-        monkeypatch.setattr(
-            torch.cuda,
-            "Event",
-            lambda: SimpleNamespace(record=lambda: None, synchronize=lambda: None),
-        )
-        buffers = SimpleNamespace(
-            candidates_cpu_buf=candidates,
-            vocab_mask_spec_cpu_buf=masks,
-            vocab_mask_spec_buf=torch.empty_like(masks),
-        )
-        fill(
-            grammars,
-            3,
-            buffers,
-            3,
-            True,
-            torch.tensor([1, 2, 3, 4, 5, 20, 21, 22]),
-            layout,
-        )
-        torch.testing.assert_close(buffers.vocab_mask_spec_buf, masks)
-        assert candidates[2].tolist() == [20, 21, 22]
+    fill = load_symbol(RUNTIME + "grammar/capturable_grammar.py", "_fill_eager_bitmask")
+    monkeypatch.setattr(
+        torch.cuda,
+        "Event",
+        lambda: SimpleNamespace(record=lambda: None, synchronize=lambda: None),
+    )
+    buffers = SimpleNamespace(
+        candidates_cpu_buf=candidates,
+        vocab_mask_spec_cpu_buf=masks,
+        vocab_mask_spec_buf=torch.empty_like(masks),
+    )
+    fill(
+        grammars,
+        3,
+        buffers,
+        3,
+        True,
+        torch.tensor([1, 2, 3, 4, 5, 20, 21, 22]),
+        layout,
+    )
+    torch.testing.assert_close(buffers.vocab_mask_spec_buf, masks)
+    assert candidates[2].tolist() == [20, 21, 22]
     assert masks[:, 0].tolist() == [
         100,
         -1,
@@ -648,8 +662,13 @@ def test_grammar_mask_producers_walk_only_original_decode_candidates(
 
 
 def test_drafter_future_inputs_keep_original_request_rows():
+    from tokenspeed.runtime.execution.types import ForwardLogprobs
+
     forward = load_symbol(
-        RUNTIME + "execution/model_executor.py", "_forward_step", owner="ModelExecutor"
+        RUNTIME + "execution/model_executor.py",
+        "_forward_step",
+        owner="ModelExecutor",
+        ForwardLogprobs=ForwardLogprobs,
     )
     future_inputs = torch.full((6, 3), 77, dtype=torch.int32)
     draft_tokens = torch.tensor(
@@ -657,6 +676,7 @@ def test_drafter_future_inputs_keep_original_request_rows():
     )
     tokens = torch.tensor([11, 21, 22, 23, 31, 32, 33])
     lengths = torch.tensor([1, 0, 2, 1])
+    drafted: list[int] = []
     executor = SimpleNamespace(
         tree_spec=None,
         capturable_grammar=None,
@@ -666,9 +686,16 @@ def test_drafter_future_inputs_keep_original_request_rows():
         ),
         config=SimpleNamespace(pp_size=1),
         nan_guard=NanGuard(4, "cpu"),
-        runtime_states=SimpleNamespace(future_input_map=future_inputs, vocab_size=64),
+        runtime_states=SimpleNamespace(
+            future_input_map=future_inputs,
+            valid_cache_lengths=torch.zeros(6, dtype=torch.int32),
+            mark_spec_candidates_drafted=lambda rows: drafted.extend(rows.tolist()),
+            vocab_size=64,
+        ),
         input_buffers=SimpleNamespace(
-            state_write_req_pool_indices_buf=torch.tensor([4, 2, 5, 1])
+            state_write_req_pool_indices_buf=torch.tensor([4, 2, 5, 1]),
+            req_pool_indices_buf=torch.tensor([4, 2, 5, 1]),
+            input_lengths_buf=torch.tensor([1, 1, 3, 3], dtype=torch.int32),
         ),
         _run_target_forward=lambda ctx: Output(torch.zeros(7, 64)),
         _decode_candidates=lambda ctx: None,
@@ -687,6 +714,9 @@ def test_drafter_future_inputs_keep_original_request_rows():
         [11, 12, 13],
         [21, 22, 23],
     ]
+    # The rows the drafter wrote now hold real candidates; the skipped row
+    # (its request produced no output) is not marked.
+    assert sorted(drafted) == [1, 4, 5]
 
 
 @pytest.mark.parametrize(
@@ -732,6 +762,7 @@ def test_layout_and_decoder_metadata_agree_on_current_prefill_target(
         _swa_plans={},
         _prepared_selections={},
         _decode_schedules={},
+        _index_geometry={},
         sparse_topk={},
         _check_tables=lambda *args: None,
         _upload_int64=lambda values: torch.tensor(values, dtype=torch.int64),

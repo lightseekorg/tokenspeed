@@ -22,6 +22,11 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.sampling import (
+    torch_dflash2_greedy_path,
+    torch_dspark_block_greedy,
+    torch_top_k_top_p_support,
+)
 from tokenspeed_kernel.ops.sampling.triton import (
     _QRITA_PERCENTILE_TO_STD_TABLE,
     dflash2_greedy_path,
@@ -125,26 +130,13 @@ def _qrita_gumbel_scratch(rows: int, vocab_size: int, device: str):
 def _top_k_topp_allowed_ids(
     logits: torch.Tensor, temperature: float, top_k: int, top_p: float
 ) -> set[int]:
-    top_k = min(top_k, logits.numel())
-    top_vals, top_ids = torch.topk(logits.float(), top_k, sorted=True)
-    probs = torch.softmax(top_vals / temperature, dim=-1)
-    cumulative_before = torch.cumsum(probs, dim=-1) - probs
-    keep = cumulative_before < top_p
-    return set(top_ids[keep].int().cpu().tolist())
+    return torch_top_k_top_p_support(logits, temperature, top_k, top_p, None)
 
 
 def _top_k_topp_minp_allowed_ids(
     logits: torch.Tensor, temperature: float, top_k: int, top_p: float, min_p: float
 ) -> set[int]:
-    top_k = min(top_k, logits.numel())
-    top_vals, top_ids = torch.topk(logits.float(), top_k, sorted=True)
-    scaled = top_vals / temperature
-    probs = torch.softmax(scaled, dim=-1)
-    cumulative_before = torch.cumsum(probs, dim=-1) - probs
-    keep = (cumulative_before < top_p) & (
-        scaled >= scaled.max() + torch.log(torch.tensor(min_p, device=logits.device))
-    )
-    return set(top_ids[keep].int().cpu().tolist())
+    return torch_top_k_top_p_support(logits, temperature, top_k, top_p, min_p)
 
 
 def test_gumbel_sample_from_pools_takes_tail_token(device: str) -> None:
@@ -794,14 +786,6 @@ def _lattice(batch: int, steps: int, top_k: int, device: str, seed: int = 0):
     return candidate_ids, scores, anchors, out
 
 
-def _greedy_lattice_reference(scores: torch.Tensor) -> tuple[int, ...]:
-    path, previous = [], 0
-    for step in range(scores.shape[0]):
-        previous = int(torch.argmax(scores[step, previous]))
-        path.append(previous)
-    return tuple(path)
-
-
 @pytest.mark.parametrize(("steps", "top_k"), ((1, 4), (7, 16), (5, 6)))
 def test_dflash2_greedy_path_matches_the_step_local_walk(
     steps: int, top_k: int, device: str
@@ -811,13 +795,8 @@ def test_dflash2_greedy_path_matches_the_step_local_walk(
     dflash2_greedy_path(candidate_ids, scores, anchors, out)
 
     assert out[:, 0].tolist() == anchors.to(torch.int32).tolist()
-    for request in range(candidate_ids.shape[0]):
-        expected = _greedy_lattice_reference(scores[request])
-        tokens = [
-            int(candidate_ids[request, step, lane])
-            for step, lane in enumerate(expected)
-        ]
-        assert out[request, 1:].tolist() == tokens
+    expected = torch_dflash2_greedy_path(candidate_ids, scores, anchors)
+    assert out.tolist() == expected.tolist()
 
 
 def test_dflash2_greedy_path_follows_the_selected_predecessor(device: str) -> None:
@@ -842,17 +821,6 @@ def test_dflash2_greedy_path_rejects_a_lattice_it_cannot_read(device: str) -> No
         dflash2_greedy_path(candidate_ids, scores[:, :, :, :2], anchors, out)
     with pytest.raises(ValueError, match="out must be int32"):
         dflash2_greedy_path(candidate_ids, scores, anchors, out.long())
-
-
-def _dspark_block_reference(base, anchors, embedding, projection):
-    """FP32 bias GEMM plus ``torch.argmax`` over the whole vocabulary."""
-    previous = anchors.long()
-    expected = torch.empty(base.shape[:2], dtype=torch.int64, device=base.device)
-    for step in range(base.shape[1]):
-        bias = embedding[previous].float() @ projection.float().T
-        previous = torch.argmax(base[:, step] + bias, dim=-1)
-        expected[:, step] = previous
-    return expected
 
 
 def _dspark_block_on_shards(base, anchors, embedding, projection, tp):
@@ -898,7 +866,7 @@ def test_dspark_block_greedy_matches_the_full_vocabulary_argmax(
 
     out = _dspark_block_on_shards(base, anchors, embedding, projection, tp)
 
-    expected = _dspark_block_reference(base, anchors, embedding, projection)
+    expected = torch_dspark_block_greedy(base, anchors, embedding, projection)
     assert torch.equal(out.long(), expected)
 
 
@@ -922,7 +890,7 @@ def test_dspark_block_greedy_reads_strided_anchors(device: str) -> None:
 
     out = _dspark_block_on_shards(base, anchors, embedding, projection, 2)
 
-    expected = _dspark_block_reference(
+    expected = torch_dspark_block_greedy(
         base, anchors.contiguous(), embedding, projection
     )
     assert torch.equal(out.long(), expected)
@@ -971,7 +939,7 @@ def test_dspark_block_greedy_clamps_out_of_range_anchors(device: str) -> None:
 
     out = _dspark_block_on_shards(base, anchors, embedding, projection, 1)
 
-    expected = _dspark_block_reference(
+    expected = torch_dspark_block_greedy(
         base, anchors.clamp(0, vocab - 1), embedding, projection
     )
     assert torch.equal(out.long(), expected)

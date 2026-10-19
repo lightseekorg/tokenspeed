@@ -22,6 +22,9 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.gdn import (
+    torch_causal_conv1d_prefill_metadata,
+)
 from tokenspeed_kernel.ops.attention.gdn._triton.causal_conv1d_metadata import (
     build_causal_conv1d_prefill_metadata,
 )
@@ -37,14 +40,6 @@ def device(request):
 def _boundaries(lengths, device, dtype):
     values = [0, *torch.tensor(lengths).cumsum(0).tolist()]
     return torch.tensor(values, device=device, dtype=dtype)
-
-
-def _reference(lengths, block_m):
-    counts = [(length + block_m - 1) // block_m for length in lengths]
-    return (
-        [row for row, count in enumerate(counts) for _ in range(count)],
-        [chunk for count in counts for chunk in range(count)],
-    )
 
 
 @pytest.mark.parametrize(
@@ -67,12 +62,16 @@ def test_metadata_matches_reference(device, lengths, block_m, dtype):
     metadata = build_causal_conv1d_prefill_metadata(
         _boundaries(lengths, device, dtype), torch.tensor(lengths, dtype=dtype), block_m
     )
-    rows, chunks = _reference(lengths, block_m)
+    rows, chunks = torch_causal_conv1d_prefill_metadata(lengths, block_m)
     assert metadata.batch_indices.tolist() == rows
     assert metadata.chunk_offsets.tolist() == chunks
     assert metadata.batch_indices.dtype == metadata.chunk_offsets.dtype == torch.int32
     assert metadata.block_m == block_m
     assert metadata.batch_indices.device.type == device
+    assert metadata.cu_seqlens_cpu.tolist() == [
+        0,
+        *torch.tensor(lengths, dtype=torch.int64).cumsum(0).tolist(),
+    ]
 
 
 def test_metadata_compiles_once_across_request_counts():
@@ -88,7 +87,7 @@ def test_metadata_compiles_once_across_request_counts():
         metadata = build_causal_conv1d_prefill_metadata(
             _boundaries(lengths, "cuda", torch.int32), torch.tensor(lengths), 8
         )
-        rows, chunks = _reference(lengths, 8)
+        rows, chunks = torch_causal_conv1d_prefill_metadata(lengths, 8)
         assert metadata.batch_indices.tolist() == rows
         assert metadata.chunk_offsets.tolist() == chunks
 
@@ -151,7 +150,7 @@ def test_metadata_cuda_graph_refresh():
         lengths.copy_(torch.tensor(values, dtype=torch.int32))
         boundaries.copy_(_boundaries(values, "cuda", torch.int32))
         graph.replay()
-        rows, chunks = _reference(values, 8)
+        rows, chunks = torch_causal_conv1d_prefill_metadata(values, 8)
         assert metadata.batch_indices.tolist() == rows
         assert metadata.chunk_offsets.tolist() == chunks
         assert metadata.batch_indices.data_ptr() == pointer

@@ -3,9 +3,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-import tokenspeed_kernel
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from utils import (
     assert_no_triton_compile,
@@ -80,7 +82,7 @@ def _plan(
     hidden_size: int,
     intermediate_size: int,
 ) -> dict:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "fp8",
         input_dtype=torch.bfloat16,
         activation=activation,
@@ -124,6 +126,7 @@ def test_triton_fp8_moe_matches_torch(
     )
     topk_ids = _topk_ids(num_tokens, num_experts, top_k, generator)
     topk_ids[0, 1] = -1
+    topk_ids[1, 0] = num_experts
     topk_weights = torch.rand(
         num_tokens, top_k, device="cuda", dtype=torch.float32, generator=generator
     )
@@ -131,8 +134,8 @@ def test_triton_fp8_moe_matches_torch(
     if swiglu_limit is not None:
         weights.swiglu_arg = SimpleNamespace(alpha=None, limit=swiglu_limit)
     plan = _plan(activation, swiglu_limit, hidden_size, intermediate_size)
-    tokenspeed_kernel.moe_process_weights(plan, weights)
-    actual = tokenspeed_kernel.moe_apply(
+    kernel_moe_process_weights(plan, weights)
+    actual = kernel_moe_apply(
         plan,
         x,
         weights,
@@ -167,7 +170,8 @@ def test_triton_fp8_moe_matches_torch(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_triton_fp8_moe_token_count():
     _skip_unless_supported()
-    from tokenspeed_kernel.ops.moe.triton import _common, fp8
+    from tokenspeed_kernel.ops.moe._triton import common as _common
+    from tokenspeed_kernel.ops.moe._triton import fp8
 
     num_experts, top_k, hidden_size, intermediate_size = 4, 2, 256, 128
     max_tokens = 1500
@@ -176,7 +180,7 @@ def test_triton_fp8_moe_token_count():
         num_experts, top_k, hidden_size, intermediate_size, generator
     )
     plan = _plan("silu", None, hidden_size, intermediate_size)
-    tokenspeed_kernel.moe_process_weights(plan, weights)
+    kernel_moe_process_weights(plan, weights)
     x = torch.randn(
         max_tokens,
         hidden_size,
@@ -190,7 +194,7 @@ def test_triton_fp8_moe_token_count():
     )
 
     def run(tokens):
-        return tokenspeed_kernel.moe_apply(
+        return kernel_moe_apply(
             plan,
             x[:tokens],
             weights,

@@ -23,6 +23,12 @@ from functools import cached_property
 
 Group = tuple[int, ...]
 
+# The named copy of the attention KVP group that page-sharded MLA prefill
+# all-gathers its cached history on (``ProcessGroupManager.init_process_group``):
+# its own communicators let the transfers overlap the attention TP collectives
+# over the same ranks instead of queueing with them.
+KVP_HISTORY_GROUP_NAME = "kvp_history"
+
 
 def _resolve_parallelism_sizes(world_size: int, *sizes: int | None) -> tuple[int, ...]:
     """Resolve the parallelism sizes given world_size.
@@ -48,13 +54,17 @@ def _resolve_parallelism_sizes(world_size: int, *sizes: int | None) -> tuple[int
     return tuple(resolved)
 
 
-def _resolve_dcp_size(tp_size: int, dcp_size: int) -> int:
-    """Validate DCP within resolved attention TP; DCP adds no world-size dimension."""
-    if isinstance(dcp_size, bool) or not isinstance(dcp_size, int) or dcp_size < 1:
-        raise ValueError("dcp_size must be a positive integer")
-    if tp_size % dcp_size:
-        raise ValueError("attention TP size must be divisible by DCP size")
-    return dcp_size
+def _resolve_kvp_size(tp_size: int, kvp_size: int) -> int:
+    """Validate KV parallelism within resolved attention TP.
+
+    KVP shards the KV cache pages page-cyclically over a consecutive subgroup
+    of attention TP; it adds no world-size dimension.
+    """
+    if isinstance(kvp_size, bool) or not isinstance(kvp_size, int) or kvp_size < 1:
+        raise ValueError("kvp_size must be a positive integer")
+    if tp_size % kvp_size:
+        raise ValueError("attention TP size must be divisible by KVP size")
+    return kvp_size
 
 
 def _resolve_qcp_size(tp_size: int, qcp_size: int) -> int:
@@ -63,8 +73,10 @@ def _resolve_qcp_size(tp_size: int, qcp_size: int) -> int:
     QCP shards an extend forward's query rows over the attention TP group;
     it adds no world-size dimension. The shard spans the whole group (1 is
     off): a partial shard would leave the ranks holding the same rows strided
-    by the shard width, which no group here (the head group, the DCP group)
-    is built with, and ``validate_qcp`` pins the server to the same rule.
+    by the shard width, which no group here (the head group, the KVP group)
+    is built with. This is the one place the rule lives; the server's
+    ``validate_qcp`` and ``validate_context_parallel_roles`` cover what the
+    mapping cannot see (the engine role, the other parallel groups).
     """
     if isinstance(qcp_size, bool) or not isinstance(qcp_size, int) or qcp_size < 1:
         raise ValueError("qcp_size must be a positive integer")
@@ -228,7 +240,7 @@ class AttentionLayerMapping(MappingBase):
         world_size: int = 1,
         tp_size: int | None = None,
         dp_size: int | None = None,
-        dcp_size: int = 1,
+        kvp_size: int = 1,
         head_tp_size: int | None = None,
         qcp_size: int = 1,
     ):
@@ -236,7 +248,7 @@ class AttentionLayerMapping(MappingBase):
         self.tp_size, self.dp_size = _resolve_parallelism_sizes(
             self.world_size, tp_size, dp_size
         )
-        self.dcp_size = _resolve_dcp_size(self.tp_size, dcp_size)
+        self.kvp_size = _resolve_kvp_size(self.tp_size, kvp_size)
         self.qcp_size = _resolve_qcp_size(self.tp_size, qcp_size)
         # Width of the group the head projections (q_b/kv_b/o_proj) shard
         # over. Equal to the ranks holding the same rows (tp_size, or 1 under
@@ -260,9 +272,12 @@ class AttentionLayerMapping(MappingBase):
     def head_tp_serves_decode_only(self) -> bool:
         """Head TP over attention-DP ranks serves decode rows only: an expanded
         prefill needs every head's K/V for the cached prefix, which the
-        head-sharded ``kv_b_proj`` cannot produce. Over the query shards of a
-        QCP group the sparse prefill is absorbed and the extend rows take the
-        exchange, so that layout serves the prefill role."""
+        head-sharded ``kv_b_proj`` cannot produce. The engine therefore tunes
+        on a decode step and runs no prefill graph; it needs no admission
+        rule for it, because a retracted request resumes by restore, not by
+        a recovery prefill. Over the query shards of a QCP group the sparse
+        prefill is absorbed and the extend rows take the exchange, so that
+        layout serves the prefill role."""
         return self.has_head_tp and not self.has_qcp
 
     @cached_property
@@ -278,8 +293,8 @@ class AttentionLayerMapping(MappingBase):
         return _make_parallelism_group(self.rank, self.head_tp_size, stride=1)
 
     @property
-    def has_dcp(self) -> bool:
-        return self.dcp_size > 1
+    def has_kvp(self) -> bool:
+        return self.kvp_size > 1
 
     @property
     def has_qcp(self) -> bool:
@@ -296,19 +311,21 @@ class AttentionLayerMapping(MappingBase):
         return _make_parallelism_group(self.rank, self.qcp_size, stride=1)
 
     @cached_property
-    def dcp_rank(self) -> int:
-        """Rank within the consecutive DCP subgroup of attention TP."""
-        return _make_parallelism_rank(self.rank, self.dcp_size, stride=1)
+    def kvp_rank(self) -> int:
+        """Rank within the consecutive KVP subgroup of attention TP; it selects
+        the KV pages this rank stores."""
+        return _make_parallelism_rank(self.rank, self.kvp_size, stride=1)
 
     @cached_property
-    def dcp_replica_rank(self) -> int:
+    def kvp_replica_rank(self) -> int:
         return _make_parallelism_rank(
-            self.rank, self.tp_size // self.dcp_size, stride=self.dcp_size
+            self.rank, self.tp_size // self.kvp_size, stride=self.kvp_size
         )
 
     @cached_property
-    def dcp_group(self) -> Group:
-        return _make_parallelism_group(self.rank, self.dcp_size, stride=1)
+    def kvp_group(self) -> Group:
+        """The ranks that together hold one copy of the KV pages."""
+        return _make_parallelism_group(self.rank, self.kvp_size, stride=1)
 
     @cached_property
     def has_tp(self) -> bool:
@@ -595,7 +612,7 @@ class Mapping(MappingBase):
         *,
         attn_tp_size: int | None = None,
         attn_dp_size: int | None = None,
-        attn_dcp_size: int = 1,
+        attn_kvp_size: int = 1,
         attn_head_tp_size: int | None = None,
         lm_head_tp_size: int | None = None,
         attn_qcp_size: int = 1,
@@ -639,7 +656,7 @@ class Mapping(MappingBase):
             world_size=stage_world_size,
             tp_size=attn_tp_size,
             dp_size=attn_dp_size,
-            dcp_size=attn_dcp_size,
+            kvp_size=attn_kvp_size,
             head_tp_size=attn_head_tp_size,
             qcp_size=attn_qcp_size,
         )
@@ -763,7 +780,7 @@ class Mapping(MappingBase):
             f"Mapping(rank={rank_str}, world_size={self.world_size})",
             f"  Cluster : {self.nnodes} node(s) x {self.nprocs_per_node} proc(s)",
             f"  Pipeline: pp={self.pp_size}",
-            f"  Attention: tp={self.attn.tp_size}  dcp={self.attn.dcp_size}  "
+            f"  Attention: tp={self.attn.tp_size}  kvp={self.attn.kvp_size}  "
             f"qcp={self.attn.qcp_size}  dp={self.attn.dp_size}  "
             f"head_tp={self.attn.head_tp_size}",
             f"    Vision: tp={self.vision.tp_size}  item_dp={self.vision.dp_size}",

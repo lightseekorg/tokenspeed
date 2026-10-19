@@ -24,12 +24,13 @@ import importlib
 from unittest.mock import Mock
 
 import pytest
-import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.gemm import bmm as kernel_bmm
 from tokenspeed_kernel.ops.gemm import (
     linear_attnres_partials,
     linear_attnres_partials_available,
 )
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from utils import kernel_supported, make_fp8_per_channel_gemm_operands
 
 
@@ -39,7 +40,7 @@ def test_mm_rejects_bad_out_layout() -> None:
     out = torch.empty((16, 4), dtype=torch.bfloat16).transpose(0, 1)
 
     with pytest.raises(ValueError, match=r"stride\(-1\) == 1"):
-        tokenspeed_kernel.mm(a, b, out=out)
+        kernel_mm(a, b, out=out)
 
 
 def test_mm_reference_rejects_out_dtype_mismatch() -> None:
@@ -48,7 +49,7 @@ def test_mm_reference_rejects_out_dtype_mismatch() -> None:
     out = torch.empty((4, 16), dtype=torch.bfloat16)
 
     with pytest.raises(ValueError, match="torch_mm out= requires out_dtype"):
-        tokenspeed_kernel.mm(a, b, out=out, override="torch_mm")
+        kernel_mm(a, b, out=out, override="torch_mm")
 
 
 @pytest.mark.parametrize(
@@ -66,7 +67,7 @@ def test_mm_reference_rejects_out_dtype_mismatch() -> None:
 def test_mi350_glm53_dense_fp8_decode_config(
     monkeypatch: pytest.MonkeyPatch, n: int, k: int
 ) -> None:
-    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm.triton")
+    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm._triton.fp8")
     monkeypatch.setattr(
         triton_gemm.Platform, "get", Mock(return_value=Mock(is_cdna4=True))
     )
@@ -91,7 +92,7 @@ def test_mi350_glm53_dense_fp8_decode_config(
 def test_mi350_narrow_dense_fp8_group_boundary(
     monkeypatch: pytest.MonkeyPatch, m: int, expected_group_size: int
 ) -> None:
-    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm.triton")
+    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm._triton.fp8")
     monkeypatch.setattr(
         triton_gemm.Platform, "get", Mock(return_value=Mock(is_cdna4=True))
     )
@@ -105,7 +106,7 @@ def test_mi350_narrow_dense_fp8_group_boundary(
 def test_mi350_short_k_dense_fp8_group_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm.triton")
+    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm._triton.fp8")
     monkeypatch.setattr(
         triton_gemm.Platform, "get", Mock(return_value=Mock(is_cdna4=True))
     )
@@ -136,7 +137,7 @@ def test_dense_fp8_tuning_falls_back_outside_gfx950_sweep(
     block_n: int,
     block_k: int,
 ) -> None:
-    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm.triton")
+    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm._triton.fp8")
     monkeypatch.setattr(
         triton_gemm.Platform, "get", Mock(return_value=Mock(is_cdna4=is_cdna4))
     )
@@ -149,7 +150,7 @@ def test_bmm_rejects_batch_mismatch() -> None:
     b = torch.empty((3, 16, 8), dtype=torch.bfloat16)
 
     with pytest.raises(ValueError, match="batch mismatch"):
-        tokenspeed_kernel.bmm(a, b)
+        kernel_bmm(a, b)
 
 
 def test_bmm_rejects_rank2_weights() -> None:
@@ -157,7 +158,7 @@ def test_bmm_rejects_rank2_weights() -> None:
     b = torch.empty((16, 8), dtype=torch.bfloat16)
 
     with pytest.raises(ValueError, match=r"B with shape \[B, N, K\]"):
-        tokenspeed_kernel.bmm(a, b)
+        kernel_bmm(a, b)
 
 
 def test_bmm_rejects_bad_out_layout() -> None:
@@ -166,7 +167,7 @@ def test_bmm_rejects_bad_out_layout() -> None:
     out = torch.empty((2, 16, 4), dtype=torch.bfloat16).transpose(1, 2)
 
     with pytest.raises(ValueError, match=r"stride\(-1\) == 1"):
-        tokenspeed_kernel.bmm(a, b, out=out)
+        kernel_bmm(a, b, out=out)
 
 
 def test_bmm_reference_rejects_out_dtype_mismatch() -> None:
@@ -175,7 +176,7 @@ def test_bmm_reference_rejects_out_dtype_mismatch() -> None:
     out = torch.empty((2, 4, 16), dtype=torch.bfloat16)
 
     with pytest.raises(ValueError, match="torch_bmm out= requires out_dtype"):
-        tokenspeed_kernel.bmm(a, b, out=out, override="torch_bmm")
+        kernel_bmm(a, b, out=out, override="torch_bmm")
 
 
 def test_bmm_writes_head_major_strided_output(device: str) -> None:
@@ -185,7 +186,7 @@ def test_bmm_writes_head_major_strided_output(device: str) -> None:
     backing = torch.empty(tokens, heads, n + 4, device=device, dtype=torch.bfloat16)
     out = backing[..., :n].transpose(0, 1)
 
-    returned = tokenspeed_kernel.bmm(
+    returned = kernel_bmm(
         a,
         weight.transpose(1, 2),
         out=out,
@@ -205,7 +206,7 @@ def test_gluon_bmm_writes_head_major_strided_output(device: str, require) -> Non
     backing = torch.empty(tokens, heads, n + 64, device=device, dtype=torch.bfloat16)
     out = backing[..., :n].transpose(0, 1)
 
-    returned = tokenspeed_kernel.bmm(
+    returned = kernel_bmm(
         a,
         weight.transpose(1, 2),
         out=out,
@@ -221,7 +222,7 @@ def test_gluon_bmm_allocates_output(device: str, require) -> None:
     a = torch.randn(12, 1, 128, device=device, dtype=torch.bfloat16)
     weight = torch.randn(12, 128, 512, device=device, dtype=torch.bfloat16)
 
-    output = tokenspeed_kernel.bmm(
+    output = kernel_bmm(
         a,
         weight.transpose(1, 2),
         override="gluon_bmm_a16w16_gfx950",
@@ -235,19 +236,19 @@ def test_gluon_bmm_falls_back_for_fp32_output(device: str, require) -> None:
     a = torch.randn(12, 1, 128, device=device, dtype=torch.bfloat16)
     weight = torch.randn(12, 128, 512, device=device, dtype=torch.bfloat16)
 
-    output = tokenspeed_kernel.bmm(a, weight.transpose(1, 2), out_dtype=torch.float32)
+    output = kernel_bmm(a, weight.transpose(1, 2), out_dtype=torch.float32)
 
     assert output.dtype == torch.float32
 
 
 def test_decode_gemv_writes_preallocated_output() -> None:
-    from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+    from tokenspeed_kernel.ops.gemm import mv
 
     x = torch.randn(2, 8)
     weight = torch.randn(4, 8)
     out = torch.empty(2, 4)
 
-    returned = decode_gemv(x, weight, out=out)
+    returned = mv(x, weight, out=out)
 
     assert returned.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out, x @ weight.t())
@@ -296,7 +297,7 @@ def test_linear_attnres_partials_portable_composition() -> None:
 
 
 def test_linear_attnres_partials_decode_fallback_uses_gemv(monkeypatch) -> None:
-    from tokenspeed_kernel.ops.gemm import triton_gemv
+    import tokenspeed_kernel.ops.gemm as gemm_api
 
     hidden = torch.randn(1, 6, dtype=torch.bfloat16)
     weight = torch.randn(9, 6, dtype=torch.bfloat16)
@@ -312,7 +313,7 @@ def test_linear_attnres_partials_decode_fallback_uses_gemv(monkeypatch) -> None:
     )
     expected = torch.empty(1, 9, dtype=torch.bfloat16)
     gemv = Mock(return_value=expected)
-    monkeypatch.setattr(triton_gemv, "decode_gemv", gemv)
+    monkeypatch.setattr(gemm_api, "mv", gemv)
 
     assert not linear_attnres_partials_available(
         hidden,
@@ -339,9 +340,7 @@ def test_linear_attnres_partials_decode_fallback_uses_gemv(monkeypatch) -> None:
 def test_linear_attnres_partials_cpu_skips_device_kernel_selection(
     monkeypatch,
 ) -> None:
-    module = importlib.import_module(
-        "tokenspeed_kernel.ops.gemm.linear_attnres_partials"
-    )
+    module = importlib.import_module("tokenspeed_kernel.ops.gemm")
     selector = Mock()
     monkeypatch.setattr(module, "select_kernel", selector)
     hidden = torch.randn(1, 6, dtype=torch.bfloat16)
@@ -677,7 +676,7 @@ def test_mm_fp8_per_tensor_scale_any_rank(scale_shape) -> None:
     b_scale = (b.abs().max() / 448.0).float()
     a_q = (a / a_scale).to(fp8)
     b_q = (b / b_scale).to(fp8)
-    out = tokenspeed_kernel.mm(
+    out = kernel_mm(
         a_q,
         b_q,
         A_scales=a_scale.reshape(scale_shape),
@@ -699,7 +698,7 @@ def test_triton_fp8_scaled_mm_per_channel_matches_reference(
         pytest.skip("triton_mm_fp8_scaled is not supported on this device")
     a, a_scales, b, b_scales = make_fp8_per_channel_gemm_operands(m, n, k, seed=m)
 
-    out = tokenspeed_kernel.mm(
+    out = kernel_mm(
         a,
         b.t(),
         A_scales=a_scales,

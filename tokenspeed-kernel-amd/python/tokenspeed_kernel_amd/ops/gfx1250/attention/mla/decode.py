@@ -31,8 +31,6 @@ from tokenspeed_kernel_amd.ops.gfx1250.attention._common import _INV_LN2_VALUE
 from tokenspeed_kernel_amd.ops.gfx1250.attention.mla._common import (
     absorbed_mla_layouts,
     cdiv_fn,
-    e4m3_info,
-    e5m2_info,
     make_kernel_repr,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.reduce_project_value import (
@@ -56,6 +54,9 @@ class AttentionConfig:
     Q_ROPE_SHARED_LAYOUT: gl.constexpr
     KV_LORA_SHARED_LAYOUT: gl.constexpr
     K_ROPE_SHARED_LAYOUT: gl.constexpr
+    P_SHARED_LAYOUT: gl.constexpr
+    ALPHA_SHARED_LAYOUT: gl.constexpr
+    ROWS_SPLIT_ACROSS_WARPS: gl.constexpr
     kv_cache_modifier: gl.constexpr
 
     @gluon.constexpr_function
@@ -108,6 +109,16 @@ class AttentionConfig:
         self.Q_ROPE_SHARED_LAYOUT = gl.constexpr(q_rope_shared_layout)
         self.KV_LORA_SHARED_LAYOUT = gl.constexpr(kv_lora_shared_layout)
         self.K_ROPE_SHARED_LAYOUT = gl.constexpr(k_rope_shared_layout)
+        self.P_SHARED_LAYOUT = gl.constexpr(
+            gl.PaddedSharedLayout.with_identity_for(
+                [[BLOCK_SIZE, 16]], [BLOCK_M, BLOCK_SIZE], [1, 0]
+            )
+        )
+        self.ALPHA_SHARED_LAYOUT = gl.constexpr(
+            gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0])
+        )
+        # The QK layout puts warps along rows in 16-row WMMA tiles.
+        self.ROWS_SPLIT_ACROSS_WARPS = gl.constexpr(BLOCK_M > 16 and NUM_WARPS > 1)
         self.kv_cache_modifier = gl.constexpr(".cg")
 
 
@@ -169,6 +180,8 @@ def _issue_kv_tile(
 def _attend_kv_tile(
     kv_lora_shared,
     k_rope_shared,
+    p_shared,
+    alpha_shared,
     Q_lora,
     Q_rope,
     qk_factor,
@@ -217,45 +230,55 @@ def _attend_kv_tile(
     # alpha : (BLOCK_M, )
     alpha = gl.exp2(M - m_j)
 
-    # acc : (BLOCK_M, KV_LORA_RANK)
-    acc = acc * gl.convert_layout(alpha[:, None], layout=cfg.PV_WMMA_LAYOUT)
-
     # update constants
     L = L * alpha + l_j
     M = m_j
 
-    # acc : (BLOCK_M, KV_LORA_RANK)
+    # The QK product splits rows across warps while the PV product splits
+    # latent columns, so every warp needs all rows' probabilities and rescale
+    # factors. When the rows really are spread over warps, exchanging both
+    # through dedicated LDS buffers costs one barrier per tile instead of the
+    # several a layout conversion adds. V is read before that barrier, so
+    # passing it also means every warp is done with this KV slot before the
+    # next TDM load may overwrite it.
     KV_lora_trans = kv_lora_shared.load(layout=cfg.V_DOT_LAYOUT)
     if IS_FP8:
         P = P.to(KV_lora_trans.dtype)
     else:
         P = P.to(KV_lora_trans.dtype, fp_downcast_rounding="rtz")
-    P = gl.convert_layout(P, layout=cfg.P_DOT_LAYOUT)
+    if cfg.ROWS_SPLIT_ACROSS_WARPS:
+        p_shared.store(P)
+        alpha_shared.store(alpha)
+        P = p_shared.load(layout=cfg.P_DOT_LAYOUT)
+        alpha_pv = alpha_shared.load(layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT))
+    else:
+        # Every warp already holds all rows; the conversions stay in registers.
+        P = gl.convert_layout(P, layout=cfg.P_DOT_LAYOUT)
+        alpha_pv = gl.convert_layout(alpha, gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT))
+
+    # acc : (BLOCK_M, KV_LORA_RANK)
+    acc = acc * alpha_pv[:, None]
     acc = gl.amd.cdna5.wmma(P, KV_lora_trans, acc)
     return M, L, acc
 
 
-@gluon.jit(repr=_mla_decode_fwd_kernel_repr)
+@gluon.jit(repr=_mla_decode_fwd_kernel_repr, do_not_specialize=["block_tables_stride"])
 def _mla_decode_fwd_kernel(
-    split_output_ptr,  # [total_num_tokens, num_query_heads, KV_LORA_RANK + qk_rope_head_dim]
+    split_output_ptr,  # FP32 or BF16 [tokens, query heads, NUM_KV_SPLITS, KV_LORA_RANK]
     split_max_ptr,  # [total_num_tokens, num_query_heads, num_kv_splits]
     split_expsum_ptr,  # [total_num_tokens, num_query_heads, num_kv_splits]
     query_ptr,  # [total_num_tokens, num_query_heads, head_size]
-    query_scales_ptr,  # unused by the BF16 kernel
     kv_buffer_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     seq_lens_ptr,  # [num_seqs]
     SCALE: gl.constexpr,  # float32
     q_scale_ptr,  # float32
     kv_scale_ptr,  # float32
-    out_scale_ptr,  # float32 (only set when NUM_KV_SPLITS == 1)
     num_query_heads: gl.constexpr,  # int
     num_kv_heads: gl.constexpr,  # int
     block_tables_stride: gl.int64,  # int
     query_stride_0: gl.int64,  # int
     query_stride_1: gl.int64,  # int, should be equal to head_size
-    query_scales_stride_0: gl.int64,  # int
-    query_scales_stride_1: gl.int64,  # int
     KV_LORA_RANK: gl.constexpr,  # int
     QK_ROPE_HEAD_DIM: gl.constexpr,  # int
     stride_kv_buffer_0: gl.int64,  # int
@@ -264,7 +287,6 @@ def _mla_decode_fwd_kernel(
     stride_kv_buffer_3: gl.constexpr,  # int
     query_start_len_ptr,  # [num_seqs+1]
     num_tokens_per_seq: gl.int32,
-    num_blocks: gl.int32,
     TILE_SIZE: gl.constexpr,  # int
     BLOCK_Q: gl.constexpr,  # int
     BLOCK_M: gl.constexpr,  # int
@@ -277,10 +299,7 @@ def _mla_decode_fwd_kernel(
     SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
     ALL_DECODE: gl.constexpr = False,  # bool
     K_WIDTH: gl.constexpr = 0,  # int
-    SCALE_K_WIDTH_LORA: gl.constexpr = 16,  # int
-    SCALE_K_WIDTH_ROPE: gl.constexpr = 16,  # int
     IS_FP8: gl.constexpr = False,
-    BLOCK_SCALES_SIZE: gl.constexpr = 4,  # int
 ):
     assert not SHUFFLED_KV_CACHE
     assert NUM_BUFFERS == 1 or NUM_BUFFERS == 2
@@ -309,7 +328,11 @@ def _mla_decode_fwd_kernel(
         q_start_idx = seq_idx
     else:
         seq_idx = q_block_global_idx // num_q_blocks_per_seq
-        q_start_idx = gl.load(query_start_len_ptr + seq_idx)
+        if query_start_len_ptr is None:
+            # Every sequence carries num_tokens_per_seq consecutive queries.
+            q_start_idx = seq_idx * num_tokens_per_seq
+        else:
+            q_start_idx = gl.load(query_start_len_ptr + seq_idx)
 
     q_block_local_idx = q_block_global_idx - seq_idx * num_q_blocks_per_seq
 
@@ -346,6 +369,14 @@ def _mla_decode_fwd_kernel(
         kv_buffer_ptr.type.element_ty,
         [NUM_BUFFERS, TILE_SIZE, QK_ROPE_HEAD_DIM],
         layout=cfg.K_ROPE_SHARED_LAYOUT,
+    )
+    p_shared = gl.allocate_shared_memory(
+        kv_buffer_ptr.type.element_ty,
+        [BLOCK_M, TILE_SIZE],
+        layout=cfg.P_SHARED_LAYOUT,
+    )
+    alpha_shared = gl.allocate_shared_memory(
+        gl.float32, [BLOCK_M], layout=cfg.ALPHA_SHARED_LAYOUT
     )
     kv_row = kv_head_idx * stride_kv_buffer_2
     tile_start = split_kv_id * tiles_per_split
@@ -529,6 +560,8 @@ def _mla_decode_fwd_kernel(
                     M, L, acc = _attend_kv_tile(
                         kv_lora_shared.index(slot),
                         k_rope_shared.index(slot),
+                        p_shared,
+                        alpha_shared,
                         Q_lora,
                         Q_rope,
                         qk_factor,
@@ -565,6 +598,8 @@ def _mla_decode_fwd_kernel(
             M, L, acc = _attend_kv_tile(
                 kv_lora_shared.index(0),
                 k_rope_shared.index(0),
+                p_shared,
+                alpha_shared,
                 Q_lora,
                 Q_rope,
                 qk_factor,
@@ -611,7 +646,7 @@ def _mla_decode_fwd_kernel(
     )
     gl.store(
         split_output_ptr + split_output_offset,
-        acc,
+        acc.to(split_output_ptr.type.element_ty),
         mask=query_mask_0_pv[:, None] & query_mask_1_pv[:, None],
     )
     split_offset = (
@@ -619,6 +654,9 @@ def _mla_decode_fwd_kernel(
         + query_offset_1_qk * NUM_KV_SPLITS
         + split_kv_id
     )
+    # A query that sees no key of this split leaves M at the 0 that the
+    # all-masked tile substitutes; -inf keeps it out of the split maximum.
+    M = gl.where(L > 0.0, M, float("-inf"))
     gl.store(split_max_ptr + split_offset, M, mask=query_mask_0_qk & query_mask_1_qk)
     gl.store(split_expsum_ptr + split_offset, L, mask=query_mask_0_qk & query_mask_1_qk)
 
@@ -630,6 +668,8 @@ _mla_decode_fwd_reduce_kernel_repr = make_kernel_repr(
         "TILE_SIZE",
         "KV_LORA_RANK",
         "NUM_KV_SPLITS",
+        "SPLIT_CHUNK",
+        "BLOCK_D",
         "ALL_DECODE",
         "HAS_LSE",
         "num_warps",
@@ -639,183 +679,157 @@ _mla_decode_fwd_reduce_kernel_repr = make_kernel_repr(
 
 @gluon.jit(repr=_mla_decode_fwd_reduce_kernel_repr)
 def _mla_decode_fwd_reduce_kernel(
-    output_ptr,  # [num_tokens, num_query_heads, head_size]
+    output_ptr,  # [num_tokens, num_query_heads, KV_LORA_RANK]
     lse_ptr,  # [num_tokens, num_query_heads] or None
-    split_output_ptr,
-    # [num_tokens, num_query_heads, max_num_kv_splits, head_size]
-    split_max_ptr,  # [num_tokens, num_query_heads, max_num_kv_splits]
-    split_expsum_ptr,  # [num_tokens, num_query_heads, max_num_kv_splits]
+    split_output_ptr,  # FP32 or BF16 [tokens, query heads, NUM_KV_SPLITS, KV_LORA_RANK]
+    split_max_ptr,  # [num_tokens, num_query_heads, NUM_KV_SPLITS]
+    split_expsum_ptr,  # [num_tokens, num_query_heads, NUM_KV_SPLITS]
     seq_lens_ptr,  # [num_seqs]
-    out_scale_ptr,  # float32
-    num_seqs,  # int
-    num_query_heads: gl.constexpr,  # int
-    output_stride_0: gl.int64,  # int
-    output_stride_1: gl.int64,  # int, should be equal to head_size
+    num_query_heads: gl.constexpr,
+    output_stride_0: gl.int64,
+    output_stride_1: gl.int64,
     lse_stride_0: gl.int64,
     lse_stride_1: gl.int64,
-    block_tables_stride: gl.int64,  # int
     num_tokens_per_seq: gl.int32,
-    total_num_tokens: gl.int32,
-    TILE_SIZE: gl.constexpr,  # int
-    KV_LORA_RANK: gl.constexpr,  # int
-    query_start_len_ptr,  # [num_seqs+1]
-    BLOCK_Q: gl.constexpr,  # int
-    NUM_KV_SPLITS: gl.constexpr,  # int
-    num_warps: gl.constexpr = 2,
-    waves_per_eu: gl.constexpr = 2,
-    num_stages: gl.constexpr = 1,
-    ALL_DECODE: gl.constexpr = False,  # int
-    HAS_LSE: gl.constexpr = False,
-    E4M3_MIN: gl.constexpr = e4m3_info.min,
-    E4M3_MAX: gl.constexpr = e4m3_info.max,
-    E5M2_MIN: gl.constexpr = e5m2_info.min,
-    E5M2_MAX: gl.constexpr = e5m2_info.max,
+    TILE_SIZE: gl.constexpr,
+    KV_LORA_RANK: gl.constexpr,
+    NUM_KV_SPLITS: gl.constexpr,
+    SPLIT_CHUNK: gl.constexpr,
+    BLOCK_D: gl.constexpr,
+    ALL_DECODE: gl.constexpr,
+    HAS_LSE: gl.constexpr,
+    num_warps: gl.constexpr,
 ):
-    WARP_SIZE: gl.constexpr = 32
+    # One program merges BLOCK_D latent columns of one (token, head) row, so
+    # a small batch still spreads its merge over KV_LORA_RANK / BLOCK_D times
+    # as many programs. Warps split the SPLIT_CHUNK splits of each step and
+    # keep their own running sums; the one cross-warp reduction happens after
+    # the last live split, which bounds the loop.
+    VEC: gl.constexpr = BLOCK_D // 32
+    TILE_LAYOUT: gl.constexpr = gl.BlockedLayout(
+        [1, VEC], [1, 32], [num_warps, 1], [1, 0]
+    )
+    CHUNK_LAYOUT: gl.constexpr = gl.SliceLayout(1, TILE_LAYOUT)
+    D_LAYOUT: gl.constexpr = gl.SliceLayout(0, TILE_LAYOUT)
+    STAT_LAYOUT: gl.constexpr = gl.BlockedLayout([1], [32], [num_warps], [0])
 
-    # All parallelism along KV_LORA_RANK; KV splits are per-thread so
-    # gl.max / gl.sum along axis=0 are thread-local reductions.
-    tpw_d: gl.constexpr = gl.constexpr(min(WARP_SIZE, KV_LORA_RANK))
-    wpc_d: gl.constexpr = gl.constexpr(
-        min(num_warps, KV_LORA_RANK // min(WARP_SIZE, KV_LORA_RANK))
-    )
-    spt_d: gl.constexpr = gl.constexpr(
-        KV_LORA_RANK
-        // (
-            min(WARP_SIZE, KV_LORA_RANK)
-            * min(num_warps, KV_LORA_RANK // min(WARP_SIZE, KV_LORA_RANK))
-        )
-    )
-    REDUCE_LAYOUT: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[NUM_KV_SPLITS, spt_d],
-        threads_per_warp=[1, tpw_d],
-        warps_per_cta=[1, wpc_d],
-        order=[1, 0],
-    )
-    SPLIT_LAYOUT: gl.constexpr = gl.SliceLayout(1, REDUCE_LAYOUT)
-    OUTPUT_LAYOUT: gl.constexpr = gl.SliceLayout(0, REDUCE_LAYOUT)
-
-    SPLIT_OUTPUT_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1,
-        per_phase=1,
-        max_phase=1,
-        order=[1, 0],
-    )
-
-    query_token_idx = gl.program_id(0)
-    query_head_idx = gl.program_id(1)
-
-    # TDM async load split output into shared memory.
-    SPLIT_OUTPUT_COLS: gl.constexpr = gl.constexpr(NUM_KV_SPLITS * KV_LORA_RANK)
-    total_rows = total_num_tokens * num_query_heads
-    split_output_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
-        base=split_output_ptr,
-        shape=(total_rows, SPLIT_OUTPUT_COLS),
-        strides=(SPLIT_OUTPUT_COLS, gl.constexpr(1)),
-        block_shape=(gl.constexpr(1), SPLIT_OUTPUT_COLS),
-        layout=SPLIT_OUTPUT_SHARED_LAYOUT,
-    )
-    split_output_shared = gl.allocate_shared_memory(
-        split_output_ptr.type.element_ty,
-        [gl.constexpr(1), SPLIT_OUTPUT_COLS],
-        layout=SPLIT_OUTPUT_SHARED_LAYOUT,
-    )
-
-    # row offset: query_token_idx * num_query_heads + query_head_idx
-    row_idx = (query_token_idx * num_query_heads + query_head_idx).to(gl.int32)
-    gl.amd.cdna5.tdm.async_load(
-        split_output_desc,
-        [row_idx, 0],
-        split_output_shared,
-    )
-
+    token = gl.program_id(0)
+    head = gl.program_id(1)
+    d_block = gl.program_id(2)
     if ALL_DECODE:
-        seq_idx = query_token_idx
+        seq_idx = token
     else:
-        seq_idx = query_token_idx // num_tokens_per_seq
-
+        seq_idx = token // num_tokens_per_seq
     seq_len = gl.load(seq_lens_ptr + seq_idx)
+    tiles_per_split = cdiv_fn(seq_len, NUM_KV_SPLITS * TILE_SIZE)
+    active_splits = cdiv_fn(seq_len, tiles_per_split * TILE_SIZE)
+    stat_base = (token.to(gl.int64) * num_query_heads + head) * NUM_KV_SPLITS
 
-    out_scale = None
-    if out_scale_ptr is not None:
-        out_scale = 1 / gl.load(out_scale_ptr)
-
-    num_kv_splits = NUM_KV_SPLITS
-    tiles_per_split = cdiv_fn(seq_len, num_kv_splits * TILE_SIZE)
-
-    active_num_kv_splits = cdiv_fn(seq_len, tiles_per_split * TILE_SIZE)
-    offs_split = gl.arange(0, NUM_KV_SPLITS, layout=SPLIT_LAYOUT)
-    split_mask = offs_split < gl.full(
-        [NUM_KV_SPLITS], active_num_kv_splits, dtype=gl.int32, layout=SPLIT_LAYOUT
-    )
-
-    # Load per-split maxima.
-    split_offset = (
-        query_token_idx.to(gl.int64) * (num_query_heads * NUM_KV_SPLITS)
-        + query_head_idx * NUM_KV_SPLITS
-        + offs_split
-    )
+    offs_all = gl.arange(0, NUM_KV_SPLITS, layout=STAT_LAYOUT)
     split_max = gl.load(
-        split_max_ptr + split_offset, mask=split_mask, other=float("-inf")
+        split_max_ptr + stat_base + offs_all,
+        mask=offs_all < active_splits,
+        other=float("-inf"),
     )
-    overall_max = gl.max(split_max)
-
-    # Load and rescale per-split exponent sums.
-    split_expsum = gl.load(split_expsum_ptr + split_offset, mask=split_mask, other=0.0)
-    split_expsum = split_expsum * gl.exp2(split_max - overall_max)
-    overall_expsum = gl.sum(split_expsum)
-
-    # Wait for the async load and read from shared memory
-    gl.amd.cdna5.tdm.async_wait(0)
-    split_output = split_output_shared.reshape((NUM_KV_SPLITS, KV_LORA_RANK)).load(
-        layout=REDUCE_LAYOUT
+    overall_max = gl.max(split_max, axis=0)
+    # A causal query with no visible key has no finite split maximum.
+    overall_max = gl.where(overall_max > float("-inf"), overall_max, 0.0)
+    split_expsum = gl.load(
+        split_expsum_ptr + stat_base + offs_all,
+        mask=offs_all < active_splits,
+        other=0.0,
     )
+    overall_expsum = gl.sum(split_expsum * gl.exp2(split_max - overall_max), axis=0)
 
-    split_output = gl.where(split_mask[:, None], split_output, 0.0)
-    split_output *= gl.exp2(split_max - overall_max)[:, None]
-    acc_sum = gl.sum(split_output, axis=0)
-    acc = gl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
-
-    if out_scale_ptr is not None:
-        acc = acc * out_scale
-
-    if output_ptr.type.element_ty == gl.float8e4nv:
-        acc = tl.clamp(acc, E4M3_MIN, E4M3_MAX)
-    elif output_ptr.type.element_ty == gl.float8e5:
-        acc = tl.clamp(acc, E5M2_MIN, E5M2_MAX)
-
-    offs_d = gl.arange(0, KV_LORA_RANK, layout=OUTPUT_LAYOUT)
-    output_offset = (
-        query_token_idx * output_stride_0 + query_head_idx * output_stride_1 + offs_d
+    offs_d = d_block * BLOCK_D + gl.arange(0, BLOCK_D, layout=D_LAYOUT)
+    acc = gl.zeros([SPLIT_CHUNK, BLOCK_D], gl.float32, layout=TILE_LAYOUT)
+    for chunk in range(0, cdiv_fn(active_splits, SPLIT_CHUNK)):
+        offs_split = chunk * SPLIT_CHUNK + gl.arange(
+            0, SPLIT_CHUNK, layout=CHUNK_LAYOUT
+        )
+        live = offs_split < active_splits
+        weight = gl.exp2(
+            gl.load(
+                split_max_ptr + stat_base + offs_split, mask=live, other=float("-inf")
+            )
+            - overall_max
+        )
+        partial = gl.load(
+            split_output_ptr
+            + (stat_base + offs_split)[:, None] * KV_LORA_RANK
+            + offs_d[None, :],
+            mask=live[:, None],
+            other=0.0,
+        ).to(gl.float32)
+        acc += partial * weight[:, None]
+    merged = gl.sum(acc, axis=0)
+    merged = gl.where(overall_expsum == 0.0, 0.0, merged / overall_expsum)
+    gl.store(
+        output_ptr + token * output_stride_0 + head * output_stride_1 + offs_d,
+        merged.to(output_ptr.type.element_ty),
     )
-    gl.store(output_ptr + output_offset, acc.to(output_ptr.type.element_ty))
 
     if HAS_LSE:
-        # Split maxima are maintained in log2 space. TokenSpeed's attention
-        # API returns natural-log LSE, so convert after the final merge.
-        lse = (overall_max + gl.log2(overall_expsum)) * 0.6931471805599453
-        gl.store(
-            lse_ptr + query_token_idx * lse_stride_0 + query_head_idx * lse_stride_1,
-            lse,
-        )
+        if d_block == 0:
+            # Split maxima are maintained in log2 space. TokenSpeed's
+            # attention API returns natural-log LSE, so convert after the
+            # final merge.
+            lse = (overall_max + gl.log2(overall_expsum)) * 0.6931471805599453
+            gl.store(lse_ptr + token * lse_stride_0 + head * lse_stride_1, lse)
 
 
-def _select_num_kv_splits(
+# Latent columns merged per reduce program; 512-wide rows give four programs.
+_REDUCE_BLOCK_D = 128
+
+
+def _launch_split_reduce(
+    out: torch.Tensor,
+    lse: torch.Tensor | None,
+    split_output: torch.Tensor,
+    split_max: torch.Tensor,
+    split_expsum: torch.Tensor,
+    cache_seqlens: torch.Tensor,
     *,
-    num_sms: int,
-    num_q_programs: int,
-    max_seqlen_k: int,
-    tile_size: int,
-    split_cap: int = 64,
-) -> int:
-    """Choose enough split-K partitions to occupy the GFX1250 compute units."""
-    max_kv_splits = max(1, math.ceil(max_seqlen_k / tile_size))
-    # The reduction loads [splits, 512] through one TDM descriptor. Keep its
-    # flattened block below the 65,535-element hardware dimension limit.
-    max_kv_splits = min(max_kv_splits, split_cap)
-    # A two-wave attention workgroup permits two resident workgroups per CU.
-    target = max(1, (num_sms * 4 // 4) * 2 // max(1, num_q_programs))
-    return triton.next_power_of_2(min(max_kv_splits, target))
+    queries_per_seq: int,
+    all_decode: bool,
+    page_size: int,
+) -> None:
+    """Merge FP32 or BF16 split partials ``[tokens, heads, splits, rank]`` into ``out``."""
+    num_tokens, num_query_heads, num_kv_splits, kv_lora_rank = split_output.shape
+    # The merge builds aranges over the split count and its chunk, and those
+    # extents must be powers of two.
+    if num_kv_splits & (num_kv_splits - 1):
+        raise ValueError(f"split count must be a power of two, got {num_kv_splits}")
+    # Each program merges BLOCK_D latent columns; a remainder would go unwritten.
+    if kv_lora_rank % _REDUCE_BLOCK_D:
+        raise ValueError(
+            f"latent rank must be a multiple of {_REDUCE_BLOCK_D}, got {kv_lora_rank}"
+        )
+    split_chunk = min(num_kv_splits, 64)
+    grid = (num_tokens, num_query_heads, kv_lora_rank // _REDUCE_BLOCK_D)
+    _mla_decode_fwd_reduce_kernel[grid](
+        output_ptr=out,
+        lse_ptr=lse,
+        split_output_ptr=split_output,
+        split_max_ptr=split_max,
+        split_expsum_ptr=split_expsum,
+        seq_lens_ptr=cache_seqlens,
+        num_query_heads=num_query_heads,
+        output_stride_0=out.stride(0),
+        output_stride_1=out.stride(1),
+        lse_stride_0=lse.stride(0) if lse is not None else 0,
+        lse_stride_1=lse.stride(1) if lse is not None else 0,
+        num_tokens_per_seq=queries_per_seq,
+        TILE_SIZE=page_size,
+        KV_LORA_RANK=kv_lora_rank,
+        NUM_KV_SPLITS=num_kv_splits,
+        SPLIT_CHUNK=split_chunk,
+        BLOCK_D=_REDUCE_BLOCK_D,
+        ALL_DECODE=all_decode,
+        HAS_LSE=lse is not None,
+        # Warps split each chunk's splits, so a chunk needs one per warp.
+        num_warps=min(4, split_chunk),
+    )
 
 
 def _select_projected_value_num_kv_splits(
@@ -960,21 +974,17 @@ def launch_gluon_mla_decode_gfx1250(
         split_max_ptr=split_max,
         split_expsum_ptr=split_expsum,
         query_ptr=q_flat,
-        query_scales_ptr=None,
         kv_buffer_ptr=kv_cache,
         block_tables_ptr=page_table,
         seq_lens_ptr=cache_seqlens,
         SCALE=softmax_scale,
         q_scale_ptr=None,
         kv_scale_ptr=None,
-        out_scale_ptr=None,
         num_query_heads=num_query_heads,
         num_kv_heads=num_kv_heads,
         block_tables_stride=page_table.stride(0),
         query_stride_0=q_flat.stride(0),
         query_stride_1=q_flat.stride(1),
-        query_scales_stride_0=0,
-        query_scales_stride_1=0,
         KV_LORA_RANK=kv_lora_rank,
         QK_ROPE_HEAD_DIM=qk_rope_head_dim,
         stride_kv_buffer_0=kv_cache.stride(0),
@@ -985,7 +995,6 @@ def launch_gluon_mla_decode_gfx1250(
         # pointer is intentionally unused.
         query_start_len_ptr=cache_seqlens,
         num_tokens_per_seq=1,
-        num_blocks=kv_cache.shape[0],
         TILE_SIZE=page_size,
         BLOCK_Q=block_q,
         BLOCK_M=block_m,
@@ -995,10 +1004,7 @@ def launch_gluon_mla_decode_gfx1250(
         SHUFFLED_KV_CACHE=False,
         ALL_DECODE=True,
         K_WIDTH=16 if is_fp8 else 8,
-        SCALE_K_WIDTH_LORA=0,
-        SCALE_K_WIDTH_ROPE=0,
         IS_FP8=is_fp8,
-        BLOCK_SCALES_SIZE=16,
         # Two FP8 tiles fit in LDS beside a second resident wave; 16-bit
         # tiles are twice the size, so they keep one slot and one wave.
         NUM_BUFFERS=2 if is_fp8 else 1,
@@ -1029,35 +1035,293 @@ def launch_gluon_mla_decode_gfx1250(
             out=out,
         )
     else:
-        _mla_decode_fwd_reduce_kernel[(batch_size, num_query_heads)](
-            output_ptr=out_flat,
-            lse_ptr=lse_flat,
-            split_output_ptr=split_output,
-            split_max_ptr=split_max,
-            split_expsum_ptr=split_expsum,
-            seq_lens_ptr=cache_seqlens,
-            out_scale_ptr=None,
-            num_seqs=batch_size,
-            num_query_heads=num_query_heads,
-            output_stride_0=out_flat.stride(0),
-            output_stride_1=out_flat.stride(1),
-            lse_stride_0=lse_flat.stride(0) if lse_flat is not None else 0,
-            lse_stride_1=lse_flat.stride(1) if lse_flat is not None else 0,
-            block_tables_stride=page_table.stride(0),
-            num_tokens_per_seq=1,
-            total_num_tokens=batch_size,
-            TILE_SIZE=page_size,
-            KV_LORA_RANK=kv_lora_rank,
-            query_start_len_ptr=cache_seqlens,
-            BLOCK_Q=block_q,
-            NUM_KV_SPLITS=num_kv_splits,
-            ALL_DECODE=True,
-            HAS_LSE=return_lse,
-            num_warps=4,
-            waves_per_eu=1,
-            num_stages=1,
+        _launch_split_reduce(
+            out_flat,
+            lse_flat,
+            split_output,
+            split_max,
+            split_expsum,
+            cache_seqlens,
+            queries_per_seq=1,
+            all_decode=True,
+            page_size=page_size,
         )
 
+    return (out, lse) if return_lse else out
+
+
+def _select_num_kv_splits(
+    *,
+    num_sms: int,
+    num_q_programs: int,
+    max_seqlen_k: int,
+    tile_size: int,
+) -> int:
+    """Choose the KV split count for decode and query-block programs.
+
+    Splits first spread the programs over every CU. An FP8 program fits in
+    half a CU, and a second resident one hides the first one's TDM and LDS
+    waits, so splits keep doubling toward two programs per CU while each
+    split still walks at least 12 pages; shorter splits spend more on their
+    prologue and FP32 partials than they save. At most 128 splits.
+    """
+    pages = max(1, math.ceil(max_seqlen_k / tile_size))
+    programs = max(1, num_q_programs)
+    one_per_cu = min(128, pages, max(1, num_sms // programs))
+    two_per_cu = min(128, max(1, pages // 12), max(1, 2 * num_sms // programs))
+    splits = max(one_per_cu, two_per_cu)
+    return 1 << (splits.bit_length() - 1)
+
+
+def _query_block_shape(num_query_heads: int, queries: int) -> tuple[int, int, int]:
+    """Return BLOCK_M, BLOCK_Q and head blocks for one request's query block.
+
+    A program holds BLOCK_Q whole queries of every head, so each KV tile it
+    loads serves all of them. Past 64 rows the block splits by query, and a
+    query with more than 64 heads splits by head.
+    """
+    rows = queries * num_query_heads
+    block_m = 16 if rows <= 16 else 32 if rows <= 32 else 64
+    if num_query_heads <= block_m:
+        return block_m, block_m // num_query_heads, 1
+    return block_m, 1, math.ceil(num_query_heads / block_m)
+
+
+def _launch_query_block_decode(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    softmax_scale: float,
+    out: torch.Tensor,
+    lse: torch.Tensor | None,
+    *,
+    num_kv_splits: int,
+    num_warps: int,
+    num_buffers: int,
+    waves_per_eu: int,
+) -> None:
+    batch_size, queries, num_query_heads, _ = q.shape
+    kv_lora_rank = out.shape[-1]
+    qk_rope_head_dim = q.shape[-1] - kv_lora_rank
+    page_size = kv_cache.shape[1]
+    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    block_m, block_q, num_head_blocks = _query_block_shape(num_query_heads, queries)
+    total_num_q_blocks = batch_size * triton.cdiv(queries, block_q) * num_head_blocks
+    num_tokens = batch_size * queries
+    q_flat = q.reshape(num_tokens, num_query_heads, q.shape[-1])
+    out_flat = out.view(num_tokens, num_query_heads, kv_lora_rank)
+    lse_flat = lse.view(num_tokens, num_query_heads) if lse is not None else None
+
+    # FP32 partials written and merged at 32 or more splits move a fifth of
+    # the KV bytes or more. These are unnormalized latent sums, so BF16 keeps
+    # the output's precision while halving that traffic.
+    split_output = torch.empty(
+        (num_tokens, num_query_heads, num_kv_splits, kv_lora_rank),
+        dtype=torch.bfloat16,
+        device=q.device,
+    )
+    split_max = torch.empty(
+        (num_tokens, num_query_heads, num_kv_splits),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    split_expsum = torch.empty_like(split_max)
+    _mla_decode_fwd_kernel[(total_num_q_blocks, 1, num_kv_splits)](
+        split_output_ptr=split_output,
+        split_max_ptr=split_max,
+        split_expsum_ptr=split_expsum,
+        query_ptr=q_flat,
+        kv_buffer_ptr=kv_cache,
+        block_tables_ptr=page_table,
+        seq_lens_ptr=cache_seqlens,
+        SCALE=softmax_scale,
+        q_scale_ptr=None,
+        kv_scale_ptr=None,
+        num_query_heads=num_query_heads,
+        num_kv_heads=1,
+        block_tables_stride=page_table.stride(0),
+        query_stride_0=q_flat.stride(0),
+        query_stride_1=q_flat.stride(1),
+        KV_LORA_RANK=kv_lora_rank,
+        QK_ROPE_HEAD_DIM=qk_rope_head_dim,
+        stride_kv_buffer_0=kv_cache.stride(0),
+        stride_kv_buffer_1=kv_cache.stride(1),
+        stride_kv_buffer_2=kv_cache.stride(2),
+        stride_kv_buffer_3=kv_cache.stride(3),
+        query_start_len_ptr=None,
+        num_tokens_per_seq=queries,
+        TILE_SIZE=page_size,
+        BLOCK_Q=block_q,
+        BLOCK_M=block_m,
+        NUM_KV_SPLITS=num_kv_splits,
+        WARP_SIZE=32,
+        NUM_HEAD_BLOCKS=num_head_blocks,
+        SHUFFLED_KV_CACHE=False,
+        ALL_DECODE=False,
+        K_WIDTH=16 if is_fp8 else 8,
+        IS_FP8=is_fp8,
+        NUM_BUFFERS=num_buffers,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
+        num_stages=2,
+    )
+    _launch_split_reduce(
+        out_flat,
+        lse_flat,
+        split_output,
+        split_max,
+        split_expsum,
+        cache_seqlens,
+        queries_per_seq=queries,
+        all_decode=False,
+        page_size=page_size,
+    )
+
+
+def launch_gluon_mla_decode_query_blocks_gfx1250(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    *,
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Decode causal query blocks with one page-table row per request.
+
+    Each KV tile is read once for all of a request's queries rather than once
+    per query, which is what a speculative verify step needs.
+
+    Args:
+        q: Queries shaped ``[requests, queries, heads, 576]`` with 2 to 16
+            queries per request, in FP16, BF16 or FP8 matching ``kv_cache``.
+        kv_cache: Contiguous paged cache shaped ``[pages, 64, 1, 576]``.
+        page_table: Int32 physical page indices shaped ``[requests, pages]``.
+        cache_seqlens: Int32 final KV lengths shaped ``[requests]``, at least
+            ``queries`` each. Query ``j`` sees ``cache_seqlens[i] - queries +
+            j + 1`` tokens.
+        max_seqlen_k: KV-length upper bound used to choose the split count.
+        qk_nope_head_dim: Original non-RoPE query width; unused because ``q``
+            is already in the latent space.
+        kv_lora_rank: Latent width; must be 512.
+        qk_rope_head_dim: Positional width; must be 64.
+        softmax_scale: Scale applied to QK logits before softmax.
+        logit_cap: Soft cap on attention logits; only ``0.0`` is supported.
+        return_lse: Whether to also return natural-log log-sum-exp values.
+        out: Optional contiguous BF16 destination shaped
+            ``[requests, queries, heads, 512]``.
+
+    Returns:
+        BF16 latent output shaped ``[requests, queries, heads, 512]``, or
+        ``(output, lse)`` with FP32 LSE shaped ``[requests, queries, heads]``.
+    """
+    if logit_cap != 0.0:
+        raise NotImplementedError("gluon MLA decode gfx1250 does not support logit_cap")
+    if q.ndim != 4 or not 2 <= q.shape[1] <= 16 or q.shape[2] < 1:
+        raise ValueError(
+            "query-block MLA requires q [requests, 2..16 queries, heads, "
+            f"kv_lora_rank + qk_rope_head_dim], got {tuple(q.shape)}"
+        )
+    supported_dtypes = (
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    )
+    if q.dtype not in supported_dtypes or kv_cache.dtype != q.dtype:
+        raise TypeError(
+            "query-block MLA requires matching FP16, BF16 or FP8 q and KV, "
+            f"got {q.dtype} and {kv_cache.dtype}"
+        )
+    if (kv_lora_rank, qk_rope_head_dim) != (512, 64):
+        raise NotImplementedError(
+            "query-block MLA requires kv_lora_rank=512 and qk_rope_head_dim=64, "
+            f"got {kv_lora_rank} and {qk_rope_head_dim}"
+        )
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    if q.shape[-1] != qk_head_dim or q.stride(-1) != 1:
+        raise ValueError(
+            f"q must have a contiguous {qk_head_dim}-wide head dimension, "
+            f"got shape {tuple(q.shape)} and strides {q.stride()}"
+        )
+    if kv_cache.ndim != 4 or kv_cache.shape[1:] != (64, 1, qk_head_dim):
+        raise ValueError(
+            f"kv_cache must be [num_pages, 64, 1, {qk_head_dim}], "
+            f"got {tuple(kv_cache.shape)}"
+        )
+    if not kv_cache.is_contiguous():
+        raise ValueError("kv_cache must be contiguous")
+    batch_size, queries, num_query_heads, _ = q.shape
+    if (
+        page_table.ndim != 2
+        or page_table.dtype != torch.int32
+        or page_table.shape[0] != batch_size
+        or page_table.stride(1) != 1
+    ):
+        raise ValueError(
+            "page_table must be an int32 [requests, pages] tensor with unit "
+            f"inner stride, got {page_table.dtype} {tuple(page_table.shape)}"
+        )
+    if (
+        cache_seqlens.dtype != torch.int32
+        or cache_seqlens.shape != (batch_size,)
+        or not cache_seqlens.is_contiguous()
+    ):
+        raise ValueError(
+            "cache_seqlens must be a contiguous int32 [requests] tensor, "
+            f"got {cache_seqlens.dtype} {tuple(cache_seqlens.shape)}"
+        )
+
+    shape = (batch_size, queries, num_query_heads, kv_lora_rank)
+    if out is None:
+        out = torch.empty(shape, dtype=torch.bfloat16, device=q.device)
+    elif (
+        out.shape != shape
+        or out.dtype != torch.bfloat16
+        or out.device != q.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            f"out must be contiguous BF16 {shape} on {q.device}, got "
+            f"{out.dtype} {tuple(out.shape)}"
+        )
+    lse = (
+        torch.empty(shape[:-1], dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
+
+    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    block_m, block_q, num_head_blocks = _query_block_shape(num_query_heads, queries)
+    num_q_programs = batch_size * triton.cdiv(queries, block_q) * num_head_blocks
+    num_kv_splits = _select_num_kv_splits(
+        num_sms=torch.cuda.get_device_properties(q.device).multi_processor_count,
+        num_q_programs=num_q_programs,
+        max_seqlen_k=max_seqlen_k,
+        tile_size=kv_cache.shape[1],
+    )
+    _launch_query_block_decode(
+        q,
+        kv_cache,
+        page_table,
+        cache_seqlens,
+        softmax_scale,
+        out,
+        lse,
+        num_kv_splits=num_kv_splits,
+        num_warps=2 if block_m == 16 else 4,
+        num_buffers=2 if is_fp8 else 1,
+        # FP8 programs fit two per CU (see the split selection); 16-bit
+        # operands need the whole register file of one.
+        waves_per_eu=2 if is_fp8 else 1,
+    )
     return (out, lse) if return_lse else out
 
 
@@ -1146,5 +1410,6 @@ def launch_gluon_mla_decode_projected_value_gfx1250(
 
 __all__ = [
     "launch_gluon_mla_decode_gfx1250",
+    "launch_gluon_mla_decode_query_blocks_gfx1250",
     "launch_gluon_mla_decode_projected_value_gfx1250",
 ]

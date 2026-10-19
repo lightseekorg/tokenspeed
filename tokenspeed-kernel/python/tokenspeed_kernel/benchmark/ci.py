@@ -132,24 +132,38 @@ def _parse_environment(raw: object) -> dict[str, str]:
     }
 
 
-def _parse_policy(raw: object, location: str) -> dict[str, float]:
+def _parse_min_regression_absolute_us(raw: object) -> float:
+    minimum = _number(raw, "min_regression_absolute_us")
+    if minimum < 0.0:
+        raise SuiteConfigError("min_regression_absolute_us must be nonnegative")
+    return minimum
+
+
+def _parse_policy(
+    raw: object,
+    location: str,
+    min_regression_absolute_us: float,
+) -> dict[str, float]:
     policy = _object(raw, location)
+    if "max_relative_mad" in policy:
+        raise SuiteConfigError(
+            f"{location}.max_relative_mad was removed; the comparison checks "
+            "the spread between measurement rounds instead"
+        )
     parsed = {
         field: _number(policy[field], f"{location}.{field}")
         for field in (
             "max_regression_relative",
             "max_regression_absolute_us",
-            "max_relative_mad",
         )
     }
     if not 0.0 <= parsed["max_regression_relative"] < 1.0:
         raise SuiteConfigError(f"{location}.max_regression_relative must be in [0, 1)")
-    if parsed["max_regression_absolute_us"] < 0.0:
+    if parsed["max_regression_absolute_us"] < min_regression_absolute_us:
         raise SuiteConfigError(
-            f"{location}.max_regression_absolute_us must be nonnegative"
+            f"{location}.max_regression_absolute_us must be at least the suite's "
+            f"min_regression_absolute_us ({min_regression_absolute_us:g})"
         )
-    if not 0.0 < parsed["max_relative_mad"] < 1.0:
-        raise SuiteConfigError(f"{location}.max_relative_mad must be in (0, 1)")
     return parsed
 
 
@@ -186,6 +200,7 @@ def _parse_case(
     raw: object,
     index: int,
     suite_measurement_blocks: int,
+    min_regression_absolute_us: float,
 ) -> SuiteCase:
     location = f"cases[{index}]"
     case = _object(raw, location)
@@ -198,7 +213,9 @@ def _parse_case(
     definition, request = _parse_definition(
         case["definition"], f"{location}.definition"
     )
-    policy = _parse_policy(case["policy"], f"{location}.policy")
+    policy = _parse_policy(
+        case["policy"], f"{location}.policy", min_regression_absolute_us
+    )
     measurement_blocks = case.get("measurement_blocks", suite_measurement_blocks)
     if not isinstance(measurement_blocks, int) or measurement_blocks < 5:
         raise SuiteConfigError(f"{location}.measurement_blocks must be at least 5")
@@ -286,6 +303,9 @@ def load_suite(
         suite_id = _nonempty_string(suite["suite_id"], "suite_id")
         required_environment = _parse_environment(suite["environment"])
         timer, default_measurement_blocks = _parse_timer(suite["timer"])
+        min_regression_absolute_us = _parse_min_regression_absolute_us(
+            suite["min_regression_absolute_us"]
+        )
         root_cases = suite["cases"]
         if not isinstance(root_cases, list):
             raise SuiteConfigError("cases must be a JSON array")
@@ -328,7 +348,12 @@ def load_suite(
             for expanded in _expand_case(case, index)
         ]
         cases = tuple(
-            _parse_case(case, index, default_measurement_blocks)
+            _parse_case(
+                case,
+                index,
+                default_measurement_blocks,
+                min_regression_absolute_us,
+            )
             for index, case in enumerate(expanded_cases)
         )
     except SuiteConfigError:

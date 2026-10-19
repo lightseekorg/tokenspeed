@@ -43,8 +43,14 @@ from tokenspeed.runtime.layers.attention.backends.paged.mha import (  # noqa: E4
 from tokenspeed.runtime.layers.attention.backends.paged.router import (  # noqa: E402
     CacheGroupRouter,
 )
+from tokenspeed.runtime.layers.attention.backends.paged.tokenspeed_mla import (  # noqa: E402
+    CuteDSLMLABackend,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.trtllm import (  # noqa: E402
     TRTLLMMHAAttnBackend,
+)
+from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (  # noqa: E402
+    TRTLLMMLABackend,
 )
 from tokenspeed.runtime.layers.attention.backends.state.kda import (  # noqa: E402
     KdaAttnBackend,
@@ -69,12 +75,21 @@ def _trtllm(kv_cache_dtype=torch.bfloat16):
     return leaf
 
 
-def _router(*leaves, retention="full_history", entry_stride=1):
+def _mla(cls, kv_cache_dtype=torch.bfloat16, kvp_size=1):
+    leaf = object.__new__(cls)
+    leaf.data_type = kv_cache_dtype
+    leaf.q_data_type = torch.bfloat16
+    leaf.kvp_group = tuple(range(kvp_size))
+    return leaf
+
+
+def _router(*leaves, attn_kind="full_history", entry_stride=1):
     router = object.__new__(CacheGroupRouter)
     router.leaves = {str(gid): leaf for gid, leaf in enumerate(leaves)}
     router._geometry = CacheGroupGeometry(
+        attn_kinds={gid: attn_kind for gid in router.leaves},
         row_geometry={gid: (64, entry_stride) for gid in router.leaves},
-        retentions={gid: (retention, None) for gid in router.leaves},
+        windows={gid: None for gid in router.leaves},
     )
     return router
 
@@ -96,6 +111,14 @@ def _hybrid(full, linear):
 def test_trtllm_router_supports_verify_and_lanes(kv_cache_dtype):
     resolve_tree_support(
         _router(_trtllm(kv_cache_dtype)), _router(_trtllm(kv_cache_dtype))
+    )
+
+
+@pytest.mark.parametrize("cls", [TRTLLMMLABackend, CuteDSLMLABackend])
+@pytest.mark.parametrize("kv_cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_mla_routers_support_verify_and_lanes(cls, kv_cache_dtype):
+    resolve_tree_support(
+        _router(_mla(cls, kv_cache_dtype)), _router(_mla(cls, kv_cache_dtype))
     )
 
 
@@ -132,7 +155,7 @@ def test_draft_with_linear_layers_is_refused():
         (lambda: _router(MHAAttnBackend.__new__(MHAAttnBackend)), "MHAAttnBackend"),
         (lambda: _router(_trtllm(torch.float8_e5m2)), "kv_cache_dtype"),
         (
-            lambda: _router(_trtllm(), _trtllm(), retention="sliding_window"),
+            lambda: _router(_trtllm(), _trtllm(), attn_kind="sliding_window"),
             "one row per token; 0, 1 slide",
         ),
         (
@@ -140,6 +163,14 @@ def test_draft_with_linear_layers_is_refused():
             "one row per token; 0 slide or pack",
         ),
         (lambda: _hybrid(_router(_trtllm()), _mamba(KdaAttnBackend)), "KDA"),
+        (
+            lambda: _router(_mla(TRTLLMMLABackend, torch.float8_e5m2)),
+            "latent rows .* kv_cache_dtype",
+        ),
+        (
+            lambda: _router(_mla(CuteDSLMLABackend, kvp_size=2)),
+            "KV parallelism",
+        ),
     ],
 )
 def test_unsupported_target_nodes_are_named(target, blocker):

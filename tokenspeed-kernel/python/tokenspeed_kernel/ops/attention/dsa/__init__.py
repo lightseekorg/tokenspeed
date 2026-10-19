@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -44,6 +44,28 @@ MXFP8_ATTENTION_BLOCK_SCALE = MXFP8_BLOCK_SCALE
 def _attention_format_signature(**roles: torch.Tensor):
     return format_signature(
         **{role: dense_tensor_format(tensor.dtype) for role, tensor in roles.items()}
+    )
+
+
+def dsa_interleave_rope(
+    tensor: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    *,
+    rope_dim: int,
+) -> torch.Tensor:
+    """Apply the indexer's interleaved RoPE through its selected device kernel."""
+    kernel = select_kernel(
+        "attention",
+        "dsa_interleave_rope",
+        _attention_format_signature(tensor=tensor),
+        traits={"rope_dim": int(rope_dim)},
+    )
+    return kernel(
+        tensor=tensor,
+        positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        rope_dim=rope_dim,
     )
 
 
@@ -266,13 +288,6 @@ def _index_k_rows_kwargs(
     """
     if index_k_fp8 is None and index_k_bf16 is None:
         return {}
-    spec = KernelRegistry.get().get_by_name(kernel.name)
-    if spec is None or INDEX_K_WORKSPACE_ROWS_FEATURE not in spec.features:
-        raise ValueError(
-            f"DSA kernel {kernel.name!r} does not declare the "
-            f"{INDEX_K_WORKSPACE_ROWS_FEATURE!r} feature: it resolves index keys "
-            "from a plane and cannot score rows in workspace-row order"
-        )
     if index_k_bf16 is not None:
         return {"index_k_bf16": index_k_bf16}
     return {"index_k_fp8": index_k_fp8, "index_k_scale": index_k_scale}
@@ -444,10 +459,6 @@ def dsa_decode(
         Partials come back in the query dtype (each context shard is rounded
         before aggregation); only the LSE stays FP32 for the cross-shard merge.
     """
-    if slot_order not in SLOT_ORDERS:
-        raise ValueError(
-            f"slot_order must be one of {list(SLOT_ORDERS)}, got {slot_order!r}"
-        )
     if q.dim() == 4:
         batch_size, q_len, num_heads, head_dim = q.shape
         tokens = batch_size * q_len
@@ -573,10 +584,6 @@ def dsa_prefill(
     Returns:
         Latent DSA attention output, or ``(out, lse)`` when ``return_lse=True``.
     """
-    if slot_order not in SLOT_ORDERS:
-        raise ValueError(
-            f"slot_order must be one of {list(SLOT_ORDERS)}, got {slot_order!r}"
-        )
     if q.dim() == 4:
         batch_size, q_len, num_heads, head_dim = q.shape
         tokens = batch_size * q_len
@@ -670,9 +677,8 @@ def dsa_index_candidates(
     global token positions. Returns global logical offsets and FP32 scores;
     invalid candidates use (-1, -inf), mandatory candidates use +inf scores.
     ``solution=None`` selects the best supported kernel, or force a solution.
+    The caller validates that topk is a positive power of two during setup.
     """
-    if topk <= 0 or topk & (topk - 1):
-        raise ValueError("Index candidate topk must be a positive power of two")
     if q.ndim != 3 or weights.shape != q.shape[:2]:
         raise ValueError("Index queries and per-head weights must match")
     query_requests = query_requests.contiguous()
@@ -890,13 +896,6 @@ def dsa_prefill_topk(
         )
     initial_tokens = int(initial_tokens)
     local_tokens = int(local_tokens)
-    if initial_tokens < 0 or local_tokens < 0:
-        raise ValueError("initial_tokens and local_tokens must be non-negative")
-    if initial_tokens + local_tokens > int(topk):
-        raise ValueError(
-            "initial_tokens + local_tokens must not exceed topk; got "
-            f"{initial_tokens} + {local_tokens} > {int(topk)}"
-        )
     required_features = set()
     if initial_tokens or local_tokens:
         required_features.add("forced_initial_local")
@@ -1106,13 +1105,6 @@ def dsa_decode_topk(
         traits.update(_index_k_plane_traits(index_k_cache, q.shape[-1]))
     initial_tokens = int(initial_tokens)
     local_tokens = int(local_tokens)
-    if initial_tokens < 0 or local_tokens < 0:
-        raise ValueError("initial_tokens and local_tokens must be non-negative")
-    if initial_tokens + local_tokens > int(topk):
-        raise ValueError(
-            "initial_tokens + local_tokens must not exceed topk; got "
-            f"{initial_tokens} + {local_tokens} > {int(topk)}"
-        )
     required_features = set()
     if topk_layout == "logical_offsets":
         required_features.add("logical_offsets")
@@ -1247,6 +1239,9 @@ import tokenspeed_kernel.ops.attention.dsa.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsa.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsa.gluon  # noqa: E402,F401
 
+if current_platform().is_npu:
+    import tokenspeed_kernel.ops.attention.dsa.ascend  # noqa: E402,F401
+
 # isort: on
 
 __all__ = [
@@ -1254,6 +1249,7 @@ __all__ = [
     "INDEX_K_WORKSPACE_ROWS_FEATURE",
     "SLOT_ORDERS",
     "dsa_decode",
+    "dsa_interleave_rope",
     "dsa_prefill",
     "dsa_prefill_topk",
     "dsa_decode_topk",

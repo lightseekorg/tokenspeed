@@ -28,7 +28,6 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 __all__ = [
-    "argmax",
     "launch_gluon_argmax_gfx1250",
 ]
 
@@ -371,6 +370,3 @@ def launch_gluon_argmax_gfx1250(
             num_warps=num_warps,
         )
     return out
-
-
-argmax = launch_gluon_argmax_gfx1250

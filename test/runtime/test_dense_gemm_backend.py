@@ -36,7 +36,7 @@ def test_dense_gemm_backend_choices_and_worker_config():
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     assert parser.parse_args(["--model", "x"]).dense_gemm_backend == "auto"
-    for backend in ("auto", "trtllm_cutedsl"):
+    for backend in ("auto", "trtllm_cutedsl", "deepgemm"):
         parsed = parser.parse_args(["--model", "x", "--dense-gemm-backend", backend])
         assert parsed.dense_gemm_backend == backend
         assert parsed.moe_backend == "auto"

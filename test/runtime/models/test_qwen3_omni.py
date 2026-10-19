@@ -1,7 +1,8 @@
-import unittest
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 from torch import nn
 
@@ -14,6 +15,7 @@ from tokenspeed.runtime.configs.model_config import (
 from tokenspeed.runtime.models.qwen3_omni import (
     Qwen3OmniMoeForConditionalGeneration,
     Qwen3OmniMoeTextModel,
+    _ensure_layer_types,
     _shared_vision_config,
 )
 from tokenspeed.runtime.multimodal.embedder import (
@@ -46,23 +48,23 @@ def _omni_config():
     )
 
 
-class TestQwen3OmniConfig(unittest.TestCase):
-    def test_architecture_flags_cover_asr_and_omni(self):
+class TestQwen3OmniConfig:
+    def test_architecture_flags_cover_asr_and_omni(self, subtests):
         for architecture in (
             "Qwen3ASRForConditionalGeneration",
             "Qwen3OmniMoeForConditionalGeneration",
         ):
-            with self.subTest(architecture=architecture):
-                self.assertTrue(is_multimodal_model([architecture]))
-                self.assertTrue(is_audio_model([architecture]))
+            with subtests.test(architecture=architecture):
+                assert is_multimodal_model([architecture])
+                assert is_audio_model([architecture])
 
         direct_thinker = "Qwen3OmniMoeThinkerForConditionalGeneration"
-        self.assertFalse(is_multimodal_model([direct_thinker]))
-        self.assertFalse(is_audio_model([direct_thinker]))
+        assert not (is_multimodal_model([direct_thinker]))
+        assert not (is_audio_model([direct_thinker]))
 
     def test_model_config_unwraps_omni_thinker_text(self):
         config = _omni_config()
-        self.assertIs(get_hf_text_config(config), config.thinker_config.text_config)
+        assert (get_hf_text_config(config)) is (config.thinker_config.text_config)
 
     def test_encode_disaggregation_rejects_audio_models(self):
         hf_config = SimpleNamespace(architectures=["Qwen3ASRForConditionalGeneration"])
@@ -85,7 +87,7 @@ class TestQwen3OmniConfig(unittest.TestCase):
                 "tokenspeed.runtime.configs.model_config.get_hf_text_config",
                 return_value=SimpleNamespace(),
             ),
-            self.assertRaisesRegex(ValueError, "does not support audio models"),
+            pytest.raises((ValueError), match=("does not support audio models")),
         ):
             ModelConfig(
                 "stub",
@@ -94,7 +96,7 @@ class TestQwen3OmniConfig(unittest.TestCase):
             )
 
 
-class TestQwen3OmniMultimodalEmbedder(unittest.TestCase):
+class TestQwen3OmniMultimodalEmbedder:
     @staticmethod
     def _plan_for(item: MultimodalDataItem) -> EncodePlan:
         return EncodePlan(
@@ -129,10 +131,10 @@ class TestQwen3OmniMultimodalEmbedder(unittest.TestCase):
 
         plan = MultimodalEmbedder()._plan(ctx)
 
-        self.assertEqual(plan.misses_by_modality[Modality.AUDIO], [audio])
-        self.assertEqual(plan.misses_by_modality[Modality.VIDEO], [video])
-        self.assertEqual([r.item for r in plan.scatter_ranges], [audio, video])
-        self.assertFalse(plan.aliases_by_canonical)
+        assert (plan.misses_by_modality[Modality.AUDIO]) == ([audio])
+        assert (plan.misses_by_modality[Modality.VIDEO]) == ([video])
+        assert ([r.item for r in plan.scatter_ranges]) == ([audio, video])
+        assert not (plan.aliases_by_canonical)
 
     def test_deepstack_buffer_only_for_active_deepstack_modality(self):
         embedder = MultimodalEmbedder()
@@ -155,7 +157,7 @@ class TestQwen3OmniMultimodalEmbedder(unittest.TestCase):
             encoders,
             model,
         )
-        self.assertNotIn("input_deepstack_embeds", audio_kwargs)
+        assert ("input_deepstack_embeds") not in (audio_kwargs)
 
         image = MultimodalDataItem(
             modality=Modality.IMAGE,
@@ -175,7 +177,7 @@ class TestQwen3OmniMultimodalEmbedder(unittest.TestCase):
         )
 
 
-class TestQwen3OmniMrope(unittest.TestCase):
+class TestQwen3OmniMrope:
     def test_mixed_modalities_follow_authored_offsets(self):
         audio = MultimodalDataItem(
             modality=Modality.AUDIO,
@@ -201,26 +203,21 @@ class TestQwen3OmniMrope(unittest.TestCase):
             _omni_config(), list(range(25)), [video, audio, image]
         )
 
-        self.assertEqual(positions.shape, (3, 25))
-        self.assertTrue(torch.equal(positions[:, :8], torch.arange(8).expand(3, -1)))
-        self.assertEqual(
-            positions[:, 8:12].tolist(),
+        assert (positions.shape) == ((3, 25))
+        assert torch.equal(positions[:, :8], torch.arange(8).expand(3, -1))
+        assert (positions[:, 8:12].tolist()) == (
             [
                 [8, 8, 8, 8],
                 [8, 8, 9, 9],
                 [8, 9, 8, 9],
-            ],
+            ]
         )
-        self.assertTrue(
-            torch.equal(positions[:, 12:15], torch.arange(10, 13).expand(3, -1))
-        )
-        self.assertEqual(positions[0, 15:23].tolist(), [13] * 4 + [26] * 4)
-        self.assertEqual(positions[1, 15:23].tolist(), [13, 13, 14, 14] * 2)
-        self.assertEqual(positions[2, 15:23].tolist(), [13, 14, 13, 14] * 2)
-        self.assertTrue(
-            torch.equal(positions[:, 23:], torch.arange(27, 29).expand(3, -1))
-        )
-        self.assertEqual(delta.tolist(), [[4]])
+        assert torch.equal(positions[:, 12:15], torch.arange(10, 13).expand(3, -1))
+        assert (positions[0, 15:23].tolist()) == ([13] * 4 + [26] * 4)
+        assert (positions[1, 15:23].tolist()) == ([13, 13, 14, 14] * 2)
+        assert (positions[2, 15:23].tolist()) == ([13, 14, 13, 14] * 2)
+        assert torch.equal(positions[:, 23:], torch.arange(27, 29).expand(3, -1))
+        assert (delta.tolist()) == ([[4]])
 
     def test_multiple_videos_support_fractional_seconds_per_grid(self):
         first = MultimodalDataItem(
@@ -243,9 +240,9 @@ class TestQwen3OmniMrope(unittest.TestCase):
             _omni_config(), list(range(22)), [second, first]
         )
 
-        self.assertEqual(positions[0, 2:10].tolist(), [2] * 4 + [8] * 4)
-        self.assertEqual(positions[0, 12:20].tolist(), [11] * 4 + [30] * 4)
-        self.assertEqual(delta.tolist(), [[11]])
+        assert (positions[0, 2:10].tolist()) == ([2] * 4 + [8] * 4)
+        assert (positions[0, 12:20].tolist()) == ([11] * 4 + [30] * 4)
+        assert (delta.tolist()) == ([[11]])
 
     def test_rejects_audio_in_video_interleaving(self):
         video = MultimodalDataItem(
@@ -256,7 +253,7 @@ class TestQwen3OmniMrope(unittest.TestCase):
                 "use_audio_in_video": torch.tensor([True]),
             },
         )
-        with self.assertRaisesRegex(ValueError, "use_audio_in_video=true"):
+        with pytest.raises((ValueError), match=("use_audio_in_video=true")):
             compute_mrope_positions(_omni_config(), list(range(6)), [video])
 
     def test_rejects_placeholder_grid_mismatch(self):
@@ -265,13 +262,13 @@ class TestQwen3OmniMrope(unittest.TestCase):
             offsets=[(1, 3)],
             model_specific_data={"image_grid_thw": torch.tensor([[1, 4, 4]])},
         )
-        with self.assertRaisesRegex(ValueError, "grid requires 4"):
+        with pytest.raises((ValueError), match=("grid requires 4")):
             compute_mrope_positions(_omni_config(), list(range(5)), [image])
 
 
 class _FakeCommManager:
     def final_norm(self, hidden_states, residual, ctx, norm):
-        return hidden_states, None
+        return hidden_states + residual, None
 
 
 class _IdentityDecoderLayer(nn.Module):
@@ -287,10 +284,32 @@ class _IdentityDecoderLayer(nn.Module):
         residual,
         cos_sin=None,
     ):
-        return hidden_states, residual
+        # The layer contributes nothing; the residual stream carries its input.
+        stream = hidden_states if residual is None else hidden_states + residual
+        return torch.zeros_like(stream), stream
 
 
-class TestQwen3OmniModelHelpers(unittest.TestCase):
+class TestQwen3OmniModelHelpers:
+    def test_thinker_text_config_gets_layer_types(self):
+        full = SimpleNamespace(num_hidden_layers=3, sliding_window=None)
+        _ensure_layer_types(full)
+        assert (full.layer_types) == (["full_attention"] * 3)
+
+        windowed = SimpleNamespace(
+            num_hidden_layers=3,
+            use_sliding_window=True,
+            sliding_window=128,
+            max_window_layers=1,
+        )
+        _ensure_layer_types(windowed)
+        assert (windowed.layer_types) == (
+            ["full_attention", "sliding_attention", "sliding_attention"]
+        )
+
+        declared = SimpleNamespace(num_hidden_layers=2, layer_types=["a", "b"])
+        _ensure_layer_types(declared)
+        assert (declared.layer_types) == (["a", "b"])
+
     def test_language_only_mode_rejects_multimodal_context(self):
         model = Qwen3OmniMoeForConditionalGeneration.__new__(
             Qwen3OmniMoeForConditionalGeneration
@@ -302,7 +321,7 @@ class TestQwen3OmniModelHelpers(unittest.TestCase):
             forward_mode=SimpleNamespace(is_decode_or_idle=lambda: False)
         )
 
-        with self.assertRaisesRegex(RuntimeError, "encoders are disabled"):
+        with pytest.raises((RuntimeError), match=("encoders are disabled")):
             model.forward(
                 ctx,
                 torch.tensor([0]),
@@ -326,26 +345,23 @@ class TestQwen3OmniModelHelpers(unittest.TestCase):
             input_embeds=torch.zeros(1, 2),
             input_deepstack_embeds=torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
         )
-        self.assertTrue(torch.equal(hidden_states, torch.tensor([[4.0, 6.0]])))
+        assert torch.equal(hidden_states, torch.tensor([[4.0, 6.0]]))
 
     def test_visual_checkpoint_names_map_to_shared_qwen3_tower(self):
         map_weight = Qwen3OmniMoeForConditionalGeneration._map_visual_weight
-        self.assertEqual(
-            map_weight("visual.blocks.0.attn.qkv.weight"),
-            "visual.blocks.0.attn.qkv_proj.weight",
+        assert (map_weight("visual.blocks.0.attn.qkv.weight")) == (
+            "visual.blocks.0.attn.qkv_proj.weight"
         )
-        self.assertEqual(
-            map_weight("visual.merger_list.2.ln_q.weight"),
-            "visual.deepstack_merger_list.2.norm.weight",
+        assert (map_weight("visual.merger_list.2.ln_q.weight")) == (
+            "visual.deepstack_merger_list.2.norm.weight"
         )
-        self.assertEqual(
-            map_weight("visual.merger.mlp.2.bias"),
-            "visual.merger.linear_fc2.bias",
+        assert (map_weight("visual.merger.mlp.2.bias")) == (
+            "visual.merger.linear_fc2.bias"
         )
 
-    @unittest.skipUnless(
-        torch.cuda.is_available() and torch.version.cuda is not None,
-        "Qwen3 vision parity requires an NVIDIA GPU",
+    @pytest.mark.skipif(
+        not (torch.cuda.is_available() and torch.version.cuda is not None),
+        reason=("Qwen3 vision parity requires an NVIDIA GPU"),
     )
     def test_shared_vision_tower_matches_transformers_omni(self):
         from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
@@ -388,7 +404,7 @@ class TestQwen3OmniModelHelpers(unittest.TestCase):
             mapped = Qwen3OmniMoeForConditionalGeneration._map_visual_weight(
                 f"visual.{name}"
             ).removeprefix("visual.")
-            self.assertIn(mapped, params)
+            assert (mapped) in (params)
             param = params[mapped]
             loader = getattr(param, "weight_loader", default_weight_loader)
             loader(param, weight)
@@ -410,4 +426,4 @@ class TestQwen3OmniModelHelpers(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

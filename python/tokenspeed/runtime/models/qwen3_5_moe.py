@@ -30,7 +30,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
     fused_swiglu_fp8_ue8m0,
 )
-from tokenspeed_kernel.ops.gemm.cute_dsl import (
+from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
@@ -46,6 +46,7 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.dense.mxfp4 import Mxfp4LinearMethod
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
@@ -206,6 +207,13 @@ class Qwen3_5MoeMLP(nn.Module):
         self.gate_up_proj.interleave_linear_and_gate = (
             self._use_nvfp4_gemm_swiglu_nvfp4_quant
         )
+        # Dynamic-activation MXFP4 projections fuse SiLU-and-mul into the
+        # gate_up GEMM epilogue; down_proj quantizes that output on load.
+        self._use_mxfp4_swiglu = isinstance(
+            self.gate_up_proj.quant_method, Mxfp4LinearMethod
+        ) and isinstance(self.down_proj.quant_method, Mxfp4LinearMethod)
+        if self._use_mxfp4_swiglu:
+            self.gate_up_proj.quant_method.enable_swiglu(self.gate_up_proj)
 
     def _uses_deep_gemm_fp8_mlp(self) -> bool:
         """Whether both projections can consume packed UE8M0 activations."""
@@ -215,13 +223,24 @@ class Qwen3_5MoeMLP(nn.Module):
             and getattr(self.down_proj, "_use_deep_gemm_fp8", False)
         )
 
+    def nvfp4_global_scale(self) -> torch.Tensor | None:
+        """The global scale gate_up_proj quantizes its input to NVFP4 with, if it does."""
+        return self.gate_up_proj.quant_method.nvfp4_global_scale(self.gate_up_proj)
+
     def forward(self, x):
+        return self.forward_prequantized(x, None)
+
+    def forward_prequantized(
+        self, x: torch.Tensor, x_nvfp4: tuple[torch.Tensor, torch.Tensor] | None
+    ) -> torch.Tensor:
+        """``forward(x)``, taking gate_up_proj's NVFP4 input from its producer when given."""
         if x.shape[0] == 0:
             return x
         if self._use_nvfp4_gemm_swiglu_nvfp4_quant:
-            x_fc1_fp4, x_fc1_scale = fp4_quantize(
-                x,
-                self.gate_up_proj.input_scale_inv,
+            x_fc1_fp4, x_fc1_scale = (
+                fp4_quantize(x, self.gate_up_proj.input_scale_inv)
+                if x_nvfp4 is None
+                else x_nvfp4
             )
             x_fp4, x_scale = nvfp4_gemm_swiglu_nvfp4_quant(
                 x_fc1_fp4,
@@ -233,7 +252,11 @@ class Qwen3_5MoeMLP(nn.Module):
             )
             x, _ = self.down_proj((x_fp4, x_scale))
             return x
-        gate_up, _ = self.gate_up_proj(x)
+        if self._use_mxfp4_swiglu:
+            x = self.gate_up_proj.quant_method.apply_swiglu(self.gate_up_proj, x)
+            x, _ = self.down_proj(x)
+            return x
+        gate_up, _ = self.gate_up_proj(x if x_nvfp4 is None else x_nvfp4)
         if self._uses_deep_gemm_fp8_mlp():
             x_fp8, x_scale = fused_swiglu_fp8_ue8m0(gate_up)
             if isinstance(self.down_proj, RowParallelLinear):
@@ -345,6 +368,10 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         else:
             self.shared_expert = None
             self.shared_expert_gate = None
+
+    def nvfp4_global_scale(self) -> torch.Tensor | None:
+        """None: the experts quantize their own inputs, so no producer applies a scale."""
+        return None
 
     def get_moe_routed_weights(self):
         """Return routed expert weights excluding auxiliary shared parameters."""

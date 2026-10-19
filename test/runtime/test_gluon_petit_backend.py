@@ -201,7 +201,7 @@ def test_gluon_petit_rejects_decode_capacity_above_workspace_limit() -> None:
 
 
 def test_dsv4_gluon_petit_zero_token_routing_shapes() -> None:
-    from tokenspeed.runtime.models.deepseek_v4 import DeepseekV4MoE
+    from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
 
     layer = DeepseekV4MoE.__new__(DeepseekV4MoE)
     layer.config = SimpleNamespace(num_experts_per_tok=6, n_routed_experts=384)
@@ -419,8 +419,8 @@ def test_petit_layer_constraints(
             expert_module, "get_moe_backend", return_value=MoeBackend.GLUON_PETIT
         ),
         mock.patch.object(
-            expert_module.tokenspeed_kernel,
-            "moe_plan",
+            expert_module,
+            "kernel_moe_plan",
             return_value={"solution": "gluon"},
         ) as plan,
         mock.patch.object(expert_module, "create_layer_weights") as weights,

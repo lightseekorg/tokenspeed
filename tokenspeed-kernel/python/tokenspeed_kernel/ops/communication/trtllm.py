@@ -19,19 +19,56 @@
 # SOFTWARE.
 
 import logging
+import math
 import os
 from ctypes import c_void_p
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.gemm.fp8_utils import (
-    create_per_token_group_quant_fp8_output_scale,
-)
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import ErrorClass, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 logger = logging.getLogger(__name__)
+
+
+def _create_per_token_group_quant_fp8_output_scale(
+    x_shape,
+    device,
+    group_size: int,
+    column_major_scales: bool,
+    scale_tma_aligned: bool,
+    scale_ue8m0: bool,
+):
+    if scale_ue8m0:
+        if len(x_shape) != 2 or group_size != 128:
+            raise ValueError("packed E8M0 scales require 2-D 1x128 input groups")
+        rows, columns = x_shape
+        aligned_rows = (rows + 3) // 4 * 4
+        packed_columns = (columns // group_size + 3) // 4
+        base = torch.zeros(
+            (packed_columns, aligned_rows), device=device, dtype=torch.int32
+        )
+        return base.transpose(-1, -2)[:rows, :]
+    if column_major_scales:
+        if scale_tma_aligned:
+            aligned_rows = (x_shape[-2] + 3) // 4 * 4
+            return torch.empty(
+                x_shape[:-2] + (x_shape[-1] // group_size, aligned_rows),
+                device=device,
+                dtype=torch.float32,
+            ).permute(-1, -2)[: x_shape[-2], :]
+        return torch.empty(
+            (x_shape[-1] // group_size,) + x_shape[:-1],
+            device=device,
+            dtype=torch.float32,
+        ).permute(-1, -2)
+    return torch.empty(
+        x_shape[:-1] + (x_shape[-1] // group_size,),
+        device=device,
+        dtype=torch.float32,
+    )
 
 
 __all__ = [
@@ -44,9 +81,11 @@ __all__ = [
     "AllReduceFusionPattern",
     "allgather_dual_rmsnorm",
     "allreduce_residual_rmsnorm",
+    "allreduce_sandwich_rmsnorm",
     "reducescatter_residual_rmsnorm",
     "trtllm_allreduce_fusion",
     "trtllm_create_ipc_workspace_for_all_reduce_fusion",
+    "trtllm_workspace_all_gather",
     "trtllm_workspace_allreduce",
     "group_spans_nodes",
     "armed_workspace_hidden_dim",
@@ -67,6 +106,8 @@ trtllm_reduce_scatter = error_fn
 MNNVL_TWOSHOT_MAX_TOKEN = 0
 allgather_dual_rmsnorm = error_fn
 allreduce_residual_rmsnorm = error_fn
+allreduce_sandwich_rmsnorm = error_fn
+trtllm_workspace_all_gather = error_fn
 trtllm_workspace_allreduce = error_fn
 armed_workspace_hidden_dim = error_fn
 ensure_workspace_initialized = error_fn
@@ -93,6 +134,8 @@ if current_platform().is_nvidia:
         trtllm_create_ipc_workspace_for_all_reduce_fusion,
         trtllm_create_mnnvl_workspace_for_all_reduce_fusion,
         trtllm_destroy_ipc_workspace_for_all_reduce_fusion,
+        trtllm_mnnvl_allgather,
+        trtllm_mnnvl_sandwich_norm_allreduce,
         trtllm_reducescatter_fusion,
     )
 
@@ -614,14 +657,10 @@ if current_platform().is_nvidia:
             partial_norm_out = norm_out[start : start + counts[rank]].contiguous()
 
         if block_quant_fp8:
-            from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
-
-            quant_out, scale_out = per_token_group_quant_fp8(
+            quant_out, scale_out = quantize_fp8(
                 norm_out,
+                granularity="token_group",
                 group_size=128,
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=False,
             )
             return quant_out, residual_out, scale_out, partial_norm_out
         return norm_out, residual_out, None, partial_norm_out
@@ -733,6 +772,30 @@ if current_platform().is_nvidia:
         )
         return allreduce_out.view(input_tensor.shape)
 
+    def trtllm_workspace_all_gather(
+        input_tensor: torch.Tensor,
+        group: dist.ProcessGroup,
+    ) -> torch.Tensor | None:
+        """All-gather of 16-bit rows along the last dim through the group's
+        mnnvl workspace: one lamport exchange, no barrier.
+
+        Args:
+            input_tensor: ``[T, W]`` rows of this rank.
+            group: process group whose armed workspace to use.
+
+        Returns:
+            ``[T, world * W]`` (rank-major columns, bit for bit), or None when
+            no mnnvl workspace serves the shape.
+        """
+        manager = _manager_for_group(group)
+        mnnvl = manager.mnnvl_workspace
+        if mnnvl is None or input_tensor.dim() != 2:
+            return None
+        gathered = trtllm_mnnvl_allgather(input_tensor, mnnvl, pdl_enabled())
+        if gathered is not None:
+            _mark_captured(manager, mnnvl)
+        return gathered
+
     def allreduce_residual_rmsnorm(
         input_tensor: torch.Tensor,
         residual: torch.Tensor,
@@ -800,7 +863,7 @@ if current_platform().is_nvidia:
                 device=input_tensor.device,
             )
             out_shape = (*quant_out.shape[:-1], quant_out.shape[-1])
-            scale_out = create_per_token_group_quant_fp8_output_scale(
+            scale_out = _create_per_token_group_quant_fp8_output_scale(
                 x_shape=out_shape,
                 device=quant_out.device,
                 group_size=128,
@@ -895,6 +958,145 @@ if current_platform().is_nvidia:
             return quant_out, residual_out, scale_out, partial_norm_out
         else:
             return norm_out, residual_out, None, partial_norm_out
+
+    def _sandwich_scale_pair(
+        x_scale: float | None, residual_scale: float | None
+    ) -> tuple[float, float]:
+        """The multipliers of the two addends. A missing one is 1.0, as in the
+        unfused ``rmsnorm()``: its product is exact, so that addend enters the
+        add unscaled (a missing pair is the plain sum)."""
+        x_scale = 1.0 if x_scale is None else x_scale
+        residual_scale = 1.0 if residual_scale is None else residual_scale
+        for name, value in (("x_scale", x_scale), ("residual_scale", residual_scale)):
+            # What the unfused rmsnorm() takes, so a declined call runs too.
+            if not isinstance(value, float) or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite float, got {value!r}")
+        return x_scale, residual_scale
+
+    def allreduce_sandwich_rmsnorm(
+        input_tensor: torch.Tensor,
+        residual: torch.Tensor,
+        post_weight: torch.Tensor,
+        weight: torch.Tensor,
+        rank: int,
+        group: dist.ProcessGroup,
+        *,
+        eps: float,
+        x_scale: float | None = None,
+        residual_scale: float | None = None,
+        max_token_num: int = 2048,
+        trigger_completion_at_end: bool = True,
+        launch_with_pdl: bool | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """All-reduce a sublayer partial and run the pre/post norm boundary on
+        the sum in one MNNVL launch.
+
+        The result is the unfused chain's::
+
+            s = all_reduce(input_tensor)
+            a = rmsnorm(s, post_weight, eps)
+            norm_out, residual_out = rmsnorm(
+                a, weight, eps, residual=residual, round_residual_sum_bf16=True,
+                x_scale=x_scale, residual_scale=residual_scale)
+
+        (``ops/layernorm/triton.py``) with the same operations and BF16
+        rounding points; only the order of the two sum-of-squares reductions
+        differs. That order does not depend on the token count, the strategy
+        or the launch geometry.
+
+        Args:
+            input_tensor: This rank's contiguous BF16 ``[T, H]`` partial.
+            residual: Contiguous BF16 ``[T, H]`` residual stream.
+            post_weight: BF16 ``[H]`` weight of the norm of the sum.
+            weight: BF16 ``[H]`` weight of the norm of the new residual.
+            rank: This rank's index in ``group``.
+            group: The device process group of the all-reduce.
+            eps: Epsilon of both norms.
+            x_scale, residual_scale: Optional multipliers of the normalized sum
+                and the residual (a missing one is 1.0); each product is
+                rounded to BF16 before the add.
+            max_token_num: Token capacity to arm the group's workspace for.
+            trigger_completion_at_end: Release PDL dependents after the last
+                store (otherwise after the inputs are loaded).
+            launch_with_pdl: Programmatic dependent launch; None follows
+                ``pdl_enabled()``.
+
+        Returns:
+            ``(norm_out, residual_out)``, or None when no fused kernel serves
+            the call (one rank, a token count outside ``[1, max_token_num]``,
+            no MNNVL workspace for the group, or a shape its partition cannot
+            split). Nothing is launched then and the caller runs the unfused
+            chain; the answer depends only on state every rank shares.
+
+        Raises:
+            ValueError: the tensors or the scale pair do not form a valid call.
+        """
+        if input_tensor.ndim != 2:
+            raise ValueError("input_tensor must be [tokens, hidden]")
+        tokens, hidden = input_tensor.shape
+        for name, tensor, shape in (
+            ("input_tensor", input_tensor, (tokens, hidden)),
+            ("residual", residual, (tokens, hidden)),
+            ("post_weight", post_weight, (hidden,)),
+            ("weight", weight, (hidden,)),
+        ):
+            if (
+                tensor.dtype != torch.bfloat16
+                or tuple(tensor.shape) != shape
+                or not tensor.is_contiguous()
+                or tensor.device != input_tensor.device
+            ):
+                raise ValueError(
+                    f"{name} must be a contiguous BF16 {shape} tensor on "
+                    f"{input_tensor.device}, got {tensor.dtype} "
+                    f"{tuple(tensor.shape)} on {tensor.device}"
+                )
+        x_scale, residual_scale = _sandwich_scale_pair(x_scale, residual_scale)
+        world_size = group.size()
+        if world_size <= 1 or not 1 <= tokens <= max_token_num:
+            return None
+        if not ensure_workspace_initialized(
+            rank=rank,
+            group=group,
+            max_token_num=max_token_num,
+            hidden_dim=hidden,
+            use_fp32_lamport=False,
+        ):
+            return None
+        manager = _manager_for_group(group)
+        mnnvl = manager.mnnvl_workspace
+        if mnnvl is None:
+            return None
+        use_oneshot = mnnvl.resolve_use_oneshot(tokens, None, hidden)
+        if not mnnvl.supports(
+            tokens,
+            hidden,
+            torch.bfloat16,
+            world_size,
+            AllReduceFusionPattern.kARSandwichResidualRMSNorm,
+            use_oneshot=use_oneshot,
+        ):
+            return None
+        _mark_captured(manager, mnnvl)
+        norm_out = torch.empty_like(input_tensor)
+        residual_out = torch.empty_like(residual)
+        trtllm_mnnvl_sandwich_norm_allreduce(
+            mnnvl,
+            input_tensor,
+            residual,
+            post_weight,
+            weight,
+            norm_out,
+            residual_out,
+            world_rank=rank,
+            use_oneshot=use_oneshot,
+            rms_eps=eps,
+            x_scale=x_scale,
+            residual_scale=residual_scale,
+            trigger_completion_at_end=trigger_completion_at_end,
+            launch_with_pdl=launch_with_pdl,
+        )
+        return norm_out, residual_out
 
     def allreduce_residual_attnres_combine(
         input_tensor: torch.Tensor,
@@ -1132,7 +1334,7 @@ if current_platform().is_nvidia:
                 device=input_tensor.device,
             )
             out_shape = (*quant_out.shape[:-1], quant_out.shape[-1])
-            scale_out = create_per_token_group_quant_fp8_output_scale(
+            scale_out = _create_per_token_group_quant_fp8_output_scale(
                 x_shape=out_shape,
                 device=quant_out.device,
                 group_size=128,
@@ -1259,7 +1461,7 @@ if current_platform().is_nvidia:
                 device=qkv.device,
             )
             out_shape = (*quant_out.shape[:-1], quant_out.shape[-1])
-            scale_out = create_per_token_group_quant_fp8_output_scale(
+            scale_out = _create_per_token_group_quant_fp8_output_scale(
                 x_shape=out_shape,
                 device=quant_out.device,
                 group_size=block_size,

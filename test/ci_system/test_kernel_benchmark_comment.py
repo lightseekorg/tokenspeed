@@ -110,7 +110,7 @@ class FakeGitHub:
         self,
         *,
         report_archive: bytes | None = None,
-        artifact_runner_label: str = "amd-mi350-1gpu-bench",
+        artifact_runner_label: str = "amd-mi355-1gpu",
         pull_state: str = "open",
         merged: bool = False,
         head_sha: str = CANDIDATE_SHA,
@@ -321,7 +321,12 @@ def test_download_report_treats_a_missing_artifact_as_a_normal_skip():
 
 @pytest.mark.parametrize(
     "artifact_runner_label",
-    ["amd-mi350-1gpu-bench", "amd-mi35x-1gpu-test", "amd-mi355-1gpu-bench"],
+    [
+        "amd-mi350-1gpu-bench",
+        "amd-mi35x-1gpu-test",
+        "amd-mi355-1gpu-bench",
+        "amd-mi355-1gpu",
+    ],
 )
 def test_download_report_treats_an_artifact_without_a_report_as_a_normal_skip(
     artifact_runner_label: str,
@@ -586,9 +591,16 @@ def test_comment_workflow_has_a_minimal_trusted_contract():
     workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
     triggers = workflow.get("on") or workflow.get(True)
 
+    # Trigger on the benchmark's own workflow so the comment does not wait for
+    # unrelated test stages.
+    benchmark = yaml.safe_load(
+        (REPO_ROOT / ".github/workflows/amd-kernel-benchmark.yml").read_text(
+            encoding="utf-8"
+        )
+    )
     assert triggers == {
         "workflow_run": {
-            "workflows": ["AMD Tests"],
+            "workflows": [benchmark["name"]],
             "types": ["completed"],
         }
     }

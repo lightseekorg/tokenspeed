@@ -22,15 +22,44 @@
 from __future__ import annotations
 
 import itertools
+from collections.abc import Mapping, Sequence
 
 import torch
+from tokenspeed_kernel.ops.metadata import apply_stop_conditions
 
 from tokenspeed.runtime.execution.request_token_history import RequestTokenHistoryView
-from tokenspeed.runtime.execution.types import RequestHistorySeeds
+from tokenspeed.runtime.execution.slot_state import (
+    pack_slot_rows,
+    slot_state_image_bytes,
+    unpack_slot_rows,
+)
+from tokenspeed.runtime.execution.types import (
+    MAX_STOP_TOKEN_IDS,
+    RequestHistorySeeds,
+    StopCriteria,
+)
 
 
 class RuntimeStates:
-    """Own runtime state tensors keyed by request-pool index."""
+    """Own runtime state tensors keyed by request-pool index.
+
+    A retraction snapshot images each slot's rows (``slot_state_rows``); the
+    token-derived rows below are reseeded from the control plane's token list
+    instead and stay out of the image (``docs/design/cache-concepts.md``,
+    "Retraction snapshot").
+    """
+
+    #: Per-slot rows a restore does not copy: the history rows are reseeded
+    #: by ``seed_request_token_history`` and the n-gram tail by the per-round
+    #: snapshot in ``InputBuffers.fill_ngram_inputs`` followed by the accepted
+    #: history commit. An explicit restore token also reseeds an unchanged slot.
+    token_derived_slot_state: tuple[str, ...] = (
+        "request_token_history_ids",
+        "draft_request_token_history_ids",
+        "ngram_accepted_tokens",
+        "ngram_needs_seed",
+    )
+    constant_slot_state: tuple[str, ...] = ()
 
     def __init__(
         self,
@@ -54,7 +83,15 @@ class RuntimeStates:
         self.future_input_map = torch.empty(
             (req_pool_size + 1, output_length), dtype=torch.int32, device=device
         )
-        self.remote_spec_candidate_ready = torch.zeros(
+        # True while ``future_input_map[slot, 1:]`` holds real draft candidates
+        # for the slot's next step: set by the drafter's epilogue after every
+        # forward and by a landed remote prefill's candidates, cleared when an
+        # explicit decode id consumes the row (``write_decode_input_ids``) and
+        # at admission (``reset_states``). The prologue verifies an explicit
+        # id single-token unless this says the candidates beside it are real;
+        # a retraction images it with the row, so a restored request's first
+        # decode is exactly the unretracted step.
+        self.spec_candidates_ready = torch.zeros(
             req_pool_size + 1, dtype=torch.bool, device=device
         )
         # The drafter's recorded proposal distributions
@@ -64,6 +101,28 @@ class RuntimeStates:
         # Draft trees (init_draft_trees): next round's parents next to its tokens.
         self.chain_parents: torch.Tensor | None = None
         self.future_parent_map: torch.Tensor | None = None
+        # Each slot's StopCriteria (bind_stop_criteria), read by the sampling
+        # epilogue that cuts verify rounds where the request ends
+        # (apply_stop_conditions), and the request that last bound them.
+        self.stop_token_ids = torch.full(
+            (req_pool_size + 1, MAX_STOP_TOKEN_IDS),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.token_limits = torch.full(
+            (req_pool_size + 1,),
+            torch.iinfo(torch.int32).max,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._stop_criteria_owners: list[str | None] = [None] * (req_pool_size + 1)
+        # True once a slot's request ended on the device. A forward dispatched
+        # behind the one that ended it (the overlap schedule) runs the slot as
+        # a padding row: its state rows read nothing and write nothing
+        # (masked_state_tables) and it keeps no tokens, so the finish
+        # publishes the state and KV of the request's last kept token.
+        self.stopped = torch.zeros(req_pool_size + 1, dtype=torch.bool, device=device)
 
     def init_draft_probs(
         self, *, spec_num_tokens: int, reject_threshold: float
@@ -130,8 +189,10 @@ class RuntimeStates:
 
         ``context_len`` is zero without Engram, three for V4.1. This executor
         state follows valid_cache_lengths, not sampled output or model KV. It
-        is reseeded from host snapshots on admission/recovery, never transferred
-        or prefix-matched as a backend cache. Returns None.
+        is reseeded from the control plane's token list on admission and on a
+        slot handoff (it is token-derived, so a retraction image leaves it
+        out), never transferred or prefix-matched as a backend cache. Returns
+        None.
         """
         if context_len == 0:
             return
@@ -290,6 +351,57 @@ class RuntimeStates:
                 )
             offset += prefix_length
 
+    # ------------------------------------------------------------------
+    # Slot-state image (SlotStateExporter)
+    # ------------------------------------------------------------------
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        """The per-slot rows a retraction snapshot images, in a fixed order.
+
+        The next step's inputs (``future_input_map``, the tree parents),
+        whether their candidate columns are real, the committed frontier and
+        the verifier's recorded proposal distributions: re-deriving any of
+        them needs a forward, so a restore copies them byte for byte.
+        """
+        rows = [
+            self.valid_cache_lengths[slot],
+            self.future_input_map[slot],
+            self.spec_candidates_ready[slot],
+            self.stop_token_ids[slot],
+            self.token_limits[slot],
+            # Always False for a victim (only a quiescent, unfinished request
+            # is retracted); imaging it clears a previous occupant's flag.
+            self.stopped[slot],
+        ]
+        if self.draft_probs is not None:
+            rows.append(self.draft_probs[slot])
+        if self.future_parent_map is not None:
+            rows.append(self.future_parent_map[slot])
+        return rows
+
+    def slot_state_bytes(self) -> int:
+        return slot_state_image_bytes(self.slot_state_rows(0))
+
+    def export_slot_state(
+        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        del request_id
+        pack_slot_rows(self.slot_state_rows(slot), out, stream)
+
+    def import_slot_state(
+        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        # The restored row is the request's next-step input in full, and the
+        # imaged ``spec_candidates_ready`` says whether its candidate columns
+        # are real: True after a drafter forward or a landing that shipped
+        # candidates, False for a victim landed without them. The scheduler
+        # hands a restored request its first decode with an explicit
+        # ``decode_input_id`` (no forward of its own is in flight), and the
+        # prologue verifies that id single-token exactly when the bit is
+        # False -- the unretracted step would have done the same.
+        del request_id
+        unpack_slot_rows(self.slot_state_rows(slot), src, stream)
+
     def reset_states(
         self,
         extend_request_pool_indices: torch.Tensor,
@@ -298,9 +410,8 @@ class RuntimeStates:
         self.valid_cache_lengths[extend_request_pool_indices] = extend_prefix_lens
         # Scalar indexed assignment stages a CPU tensor and synchronizes CUDA.
         # Keep the reset ordered on the execution stream without a host wait.
-        self.remote_spec_candidate_ready.index_fill_(
-            0, extend_request_pool_indices, False
-        )
+        self.spec_candidates_ready.index_fill_(0, extend_request_pool_indices, False)
+        self.stopped.index_fill_(0, extend_request_pool_indices, False)
         # Runs in the forward's prologue, before this round's drafter records
         # the rows, so a (re)admitted request verifies its first chain against
         # the sentinel and never a previous occupant's distributions.
@@ -309,6 +420,116 @@ class RuntimeStates:
             assert self.ngram_needs_seed is not None
             self.ngram_accepted_tokens.index_fill_(0, extend_request_pool_indices, -1)
             self.ngram_needs_seed.index_fill_(0, extend_request_pool_indices, True)
+
+    def bind_stop_criteria(
+        self,
+        request_ids: Sequence[str],
+        request_pool_indices: Sequence[int],
+        stop_criteria: Sequence[StopCriteria],
+    ) -> None:
+        """Write the stop criteria of every slot whose request changed.
+
+        Runs on the stream the forward runs on, ahead of it; a slot keeps its
+        rows while the same request holds it (a restore images them).
+        """
+        if len(stop_criteria) != len(request_ids):
+            raise ValueError(
+                f"{len(stop_criteria)} stop criteria for {len(request_ids)} requests"
+            )
+        changed = [
+            i
+            for i, (request_id, slot) in enumerate(
+                zip(request_ids, request_pool_indices, strict=True)
+            )
+            if self._stop_criteria_owners[slot] != request_id
+        ]
+        if not changed:
+            return
+        pin = torch.device(self.device).type == "cuda"
+        slots = torch.tensor(
+            [request_pool_indices[i] for i in changed],
+            dtype=torch.int64,
+            pin_memory=pin,
+        )
+        token_ids = torch.full(
+            (len(changed), MAX_STOP_TOKEN_IDS), -1, dtype=torch.int32, pin_memory=pin
+        )
+        limits = torch.empty(len(changed), dtype=torch.int32, pin_memory=pin)
+        for row, i in enumerate(changed):
+            criteria = stop_criteria[i]
+            ids = criteria.stop_token_ids
+            token_ids[row, : len(ids)] = torch.tensor(ids, dtype=torch.int32)
+            limits[row] = criteria.token_limit
+            self._stop_criteria_owners[request_pool_indices[i]] = request_ids[i]
+        slots = slots.to(self.device, non_blocking=True)
+        self.stop_token_ids.index_copy_(
+            0, slots, token_ids.to(self.device, non_blocking=True)
+        )
+        self.token_limits.index_copy_(
+            0, slots, limits.to(self.device, non_blocking=True)
+        )
+
+    def apply_stop_conditions(
+        self,
+        req_pool_indices: torch.Tensor,
+        output_tokens: torch.Tensor,
+        accept_lengths: torch.Tensor,
+        input_lengths: torch.Tensor,
+        prompt_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+        num_prefill_outputs: int,
+        decode_width: int,
+        padding_index: int,
+    ) -> None:
+        """Cut this forward's accepted widths at each request's stop
+        conditions and record which requests ended (``stopped``).
+
+        Must run before anything reads ``accept_lengths``; see
+        ``tokenspeed_kernel.ops.metadata.apply_stop_conditions``.
+        """
+        apply_stop_conditions(
+            req_pool_indices,
+            output_tokens,
+            accept_lengths,
+            input_lengths,
+            prompt_lengths,
+            self.valid_cache_lengths,
+            self.stop_token_ids,
+            self.token_limits,
+            self.stopped,
+            num_extends=num_extends,
+            num_prefill_outputs=num_prefill_outputs,
+            decode_width=decode_width,
+            padding_index=padding_index,
+        )
+
+    def masked_state_tables(
+        self,
+        block_tables: Mapping[str, torch.Tensor],
+        req_pool_indices: torch.Tensor,
+        state_group_ids: Sequence[str],
+    ) -> dict[str, torch.Tensor]:
+        """The batch's block tables with stopped requests' state rows padded.
+
+        A padding row (both slots ``-1``) reads the zero state and writes
+        nothing, the contract graph padding rows already follow, so a
+        forward dispatched behind the one that ended a request leaves the
+        request's live state block as that forward found it.
+        """
+        stopped_rows = self.stopped.index_select(0, req_pool_indices)[:, None]
+        tables = dict(block_tables)
+        for group_id in state_group_ids:
+            tables[group_id] = tables[group_id].masked_fill(stopped_rows, -1)
+        return tables
+
+    def mark_spec_candidates_drafted(self, req_pool_indices: torch.Tensor) -> None:
+        """The drafter wrote these slots' next-step rows: their candidates are real.
+
+        Tensor-only (``index_fill_``), so it records into a decode graph with
+        the row writes it follows.
+        """
+        self.spec_candidates_ready.index_fill_(0, req_pool_indices, True)
 
     def write_remote_spec_candidate_ids(
         self, req_pool_idx: int, candidate_ids: list[int]
@@ -325,7 +546,7 @@ class RuntimeStates:
             pin_memory=True,
         ).to(self.device, non_blocking=True)
         self.future_input_map[req_pool_idx, :width] = ids
-        self.remote_spec_candidate_ready[req_pool_idx] = True
+        self.spec_candidates_ready[req_pool_idx] = True
         # The candidates come without their draft distribution; the row's
         # draft_probs still hold the sentinel reset_states wrote when the
         # remote cache length was seeded, so the first local verify rejects

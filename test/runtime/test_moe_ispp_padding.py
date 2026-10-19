@@ -166,7 +166,7 @@ def test_unquant_padding_keeps_128_when_flashinfer_cannot_build_the_launcher(
 
 
 def test_unquant_padding_uses_the_registered_trtllm_alignment():
-    unquant = pytest.importorskip("tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant")
+    unquant = pytest.importorskip("tokenspeed_kernel.ops.moe.flashinfer")
     from tokenspeed_kernel.registry import KernelRegistry
 
     alignment = expert_mod.TRTLLM_UNQUANT_ISPP_ALIGNMENT
@@ -189,8 +189,8 @@ def _planned_unquant_ispp(monkeypatch, activation: str, ispp: int) -> int:
         lambda: SimpleNamespace(value="flashinfer_trtllm"),
     )
     monkeypatch.setattr(
-        expert_mod.tokenspeed_kernel,
-        "moe_plan",
+        expert_mod,
+        "kernel_moe_plan",
         lambda weight_dtype, **kwargs: plans.append(kwargs) or {"solution": "fake"},
     )
     monkeypatch.setattr(expert_mod, "create_layer_weights", lambda *a, **k: None)

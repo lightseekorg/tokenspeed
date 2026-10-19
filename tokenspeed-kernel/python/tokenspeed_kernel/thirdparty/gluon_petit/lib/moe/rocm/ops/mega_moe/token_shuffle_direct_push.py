@@ -6,8 +6,6 @@ import triton.language as tl
 from lib.gemm.rocm.intrinsics import (
     BufferResource,
     _native_call,
-    amdgcn_shuffle,
-    amdgcn_wave_inclusive_add,
 )
 from lib.moe.rocm.comm.barrier import (
     compiler_memory_barrier,
@@ -24,10 +22,12 @@ from lib.tal.tensor_ops import (
     atomic_add,
     atomic_or,
     first,
+    group_gather,
     load_words,
     prevent_loop_unroll,
     store_words,
     wave_id,
+    wave_inclusive_sum,
 )
 from triton.experimental.gluon import language as l
 
@@ -178,7 +178,7 @@ class DirectPushTokenShuffle(DeviceTemplate):
             )
         # HIP __reduce_add_sync on a full wave uses the same shuffle reduction.
         for step in l.static_range(6):
-            routes += amdgcn_shuffle(routes, lane ^ (1 << step))
+            routes += group_gather(routes, lane ^ (1 << step), 64)
         return routes // self.kTopK
 
     @device_method
@@ -503,7 +503,7 @@ class DirectPushTokenShuffle(DeviceTemplate):
                     )
                     total += count
                 padded = l.where(plan_valid, (total + 31) // 32 * 32, 0)
-                inclusive = amdgcn_wave_inclusive_add(padded, plan_lane)
+                inclusive = wave_inclusive_sum(padded)
                 pool_base = pool_rows + inclusive - padded
                 store_words(
                     state.workspace_.br_,
@@ -536,7 +536,7 @@ class DirectPushTokenShuffle(DeviceTemplate):
                         mask=plan_valid,
                         other=0,
                     )
-                pool_rows += amdgcn_shuffle(inclusive, 63)
+                pool_rows += group_gather(inclusive, 63, 64)
             pool_rows = first(pool_rows)
             for block_base in range(0, pool_rows // self.kSortedTokenBlock, 64):
                 block = block_base + plan_lane

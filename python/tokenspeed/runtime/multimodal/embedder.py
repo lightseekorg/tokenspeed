@@ -46,14 +46,15 @@ the request finishes and its ``RequestState`` is dropped, the tensors are
 released by GC. Across chunked-prefill iterations of the same request the
 item is identical Python object, so the second chunk sees ``item.encoded``
 already set and skips re-encoding. Once the item's last encoder token is
-prefilled, its encoding moves to pinned host memory; only a retracted
-request's recompute reads it again, through ``_assemble``'s per-slice
-device copy.
+prefilled, its encoding is dropped: no later forward reads it -- a request
+never re-prefills (a capacity retraction restores its KV image rather than
+recomputing it), and a later request with the same content encodes anew.
 
 Within a single forward batch we still de-duplicate by modality and
 ``item.hash``: if two requests reference the same media content using
-the same modality, only the first item is fed to the encoder; the second
-request's scatter ranges read from the first item's ``encoded`` tensor.
+the same modality, only the first item still holding its raw feature is
+fed to the encoder; the second request's scatter ranges read from the
+first item's ``encoded`` tensor.
 """
 
 from __future__ import annotations
@@ -93,32 +94,26 @@ logger = logging.getLogger(__name__)
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 
 
-def _offload_prefilled_encodings(items: list[MultimodalDataItem]) -> None:
-    """Move fully prefilled items' encodings to pinned host memory.
+def _drop_prefilled_encodings(items: list[MultimodalDataItem]) -> None:
+    """Drop fully prefilled items' encodings.
 
     Runs after ``_assemble``, so this forward still scatters from the
-    device; a retracted request's recompute reads the host copy back
-    through ``_assemble``'s non-blocking per-slice device copy. An
-    encoding published by EPD admission was allocated on another stream,
-    so its block is pinned to the current stream before the last device
-    reference is dropped.
+    device; nothing reads the encoding afterwards. An alias still in
+    prefill holds the same tensor and keeps it alive. An encoding published
+    by EPD admission was allocated on another stream, so its block is
+    pinned to the current stream before the last device reference is
+    dropped.
     """
-    # Keyed by identity: aliases of one device tensor share one host copy.
-    host: dict[torch.Tensor, torch.Tensor] = {}
 
-    def offload(tensor: torch.Tensor | None) -> torch.Tensor | None:
-        if tensor is None or tensor.device.type == "cpu":
-            return tensor
-        if tensor not in host:
+    def drop(tensor: torch.Tensor | None) -> None:
+        if tensor is not None and tensor.device.type != "cpu":
             tensor.record_stream(torch.cuda.current_stream(tensor.device))
-            host[tensor] = torch.empty(
-                tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True
-            ).copy_(tensor, non_blocking=True)
-        return host[tensor]
 
     for item in items:
-        item.encoded = offload(item.encoded)
-        item.encoded_deepstack = offload(item.encoded_deepstack)
+        drop(item.encoded)
+        drop(item.encoded_deepstack)
+        item.encoded = None
+        item.encoded_deepstack = None
 
 
 @dataclass
@@ -359,7 +354,7 @@ class MultimodalEmbedder:
         )
         if not plan:
             # A prefix hit may skip past an item; its encoding still leaves the GPU.
-            _offload_prefilled_encodings(plan.prefilled)
+            _drop_prefilled_encodings(plan.prefilled)
             return None, {}
 
         encode_started: float | None = None
@@ -411,7 +406,7 @@ class MultimodalEmbedder:
 
         cleanup_started = time.perf_counter() if LOG_MM_TIMING else None
         released_encoded_features = self._drop_encoded_features(ctx)
-        _offload_prefilled_encodings(plan.prefilled)
+        _drop_prefilled_encodings(plan.prefilled)
         cleanup_elapsed_ms = (
             (time.perf_counter() - cleanup_started) * 1000
             if cleanup_started is not None
@@ -453,7 +448,9 @@ class MultimodalEmbedder:
         # Walk the FULL batch (including text-only / decode requests)
         # so base offsets line up with the flat input_ids tensor that
         # the caller hands us. Requests without mm input contribute
-        # nothing but still advance ``base``.
+        # nothing but still advance ``base``. DeepSeek V4.1 derives its
+        # image routing mask from the same walk (_image_mask_from_spans);
+        # change the two together.
         base = 0
         for req_idx, mm_inputs in enumerate(ctx.mm_inputs):
             if req_idx >= len(ctx.extend_seq_lens) or req_idx >= len(
@@ -482,7 +479,10 @@ class MultimodalEmbedder:
                     canonical = canonical_by_key[(item.modality, item.hash)]
                 else:
                     canonical = item
-                    if item.hash is not None:
+                    # An item whose raw feature is gone cannot encode for aliases.
+                    if item.hash is not None and (
+                        item.feature is not None or item.feature_shm is not None
+                    ):
                         canonical_by_key[(item.modality, item.hash)] = item
 
                 if canonical is not item:

@@ -26,7 +26,8 @@ from functools import partial
 
 import pytest
 import torch
-from utils import is_cdna4, is_cdna5
+from tokenspeed_kernel.numerics.torch.attention.kpool import kpool_scores
+from utils import assert_no_triton_compile, is_cdna4, is_cdna5
 
 if not (is_cdna4() or is_cdna5()):
     pytest.skip(
@@ -190,14 +191,13 @@ def _reference(
     )
     expected = []
     for row, end_tensor in enumerate(row_ends):
-        end = int(end_tensor.item())
-        pools = pool_offset + torch.arange(end, device=_DEVICE)
-        request = int(req_ids[row].item())
-        pages = block_table[request, pools // _PAGE_SIZE].long()
+        pools = pool_offset + torch.arange(int(end_tensor), device=_DEVICE)
+        pages = block_table[int(req_ids[row]), pools // _PAGE_SIZE].long()
         selected_keys = keys[pages, pools.remainder(_PAGE_SIZE)]
-        head_scores = torch.einsum("hd,pd->hp", q[row].float(), selected_keys.float())
         expected.append(
-            (head_scores.relu() * weights[row, :, None]).sum(dim=0) * _SOFTMAX_SCALE
+            kpool_scores(
+                q[row], selected_keys, weights[row], _SOFTMAX_SCALE, apply_relu=True
+            )
         )
     return expected, row_ends
 
@@ -277,8 +277,10 @@ def test_kpool_prefill_logits_match_weighted_relu_and_local_window(
 
 
 @pytest.mark.parametrize("weight_dtype", (torch.bfloat16, torch.float32))
+@pytest.mark.parametrize("ordered_head_fold", (False, True))
 def test_kpool_plan_logits_match_ragged_physical_slots_and_padded_stride(
     weight_dtype: torch.dtype,
+    ordered_head_fold: bool,
 ) -> None:
     generator = _generator(911)
     requests = 2
@@ -341,6 +343,7 @@ def test_kpool_plan_logits_match_ragged_physical_slots_and_padded_stride(
         softmax_scale=_SOFTMAX_SCALE,
         out=out,
         row_ends_out=local_ends,
+        ordered_head_fold=ordered_head_fold,
     )
     expected, expected_ends = _reference(
         q,
@@ -364,7 +367,13 @@ def test_kpool_plan_logits_match_ragged_physical_slots_and_padded_stride(
         assert actual[row, end:].isnan().all()
 
 
-def test_kpool_ordered_head_fold_matches_sequential_signed_reference() -> None:
+# GFX1250 folds heads in logical order regardless of the flag.
+@pytest.mark.parametrize("ordered_head_fold", (True, False) if is_cdna5() else (True,))
+@pytest.mark.parametrize("planned", (False, True))
+def test_kpool_ordered_head_fold_matches_sequential_signed_reference(
+    planned: bool,
+    ordered_head_fold: bool,
+) -> None:
     q = torch.zeros((1, _HEADS, _HEAD_DIM), device=_DEVICE, dtype=torch.bfloat16)
     q[:, :, 0] = 1.0
     weights = torch.zeros((1, _HEADS), device=_DEVICE, dtype=torch.float32)
@@ -387,19 +396,27 @@ def test_kpool_ordered_head_fold_matches_sequential_signed_reference() -> None:
     req_ids = torch.zeros((1,), device=_DEVICE, dtype=torch.int32)
     block_table = torch.zeros((1, 1), device=_DEVICE, dtype=torch.int32)
 
-    actual, row_ends = _kpool_prefill_logits(
+    if planned:
+        metadata = (
+            torch.arange(_PAGE_SIZE, device=_DEVICE, dtype=torch.int64),
+            torch.zeros((1,), device=_DEVICE, dtype=torch.int32),
+            causal_lens // _POOL_SIZE,
+        )
+        launcher = _kpool_prefill_plan_logits
+    else:
+        metadata = (causal_lens, req_ids, block_table)
+        launcher = _kpool_prefill_logits
+    actual, row_ends = launcher(
         q,
         cache,
         weights,
-        causal_lens,
-        req_ids,
-        block_table,
+        *metadata,
         pool_size=_POOL_SIZE,
         page_size=_PAGE_SIZE,
         pool_offset=0,
         window_cols=_PAGE_SIZE,
         softmax_scale=1.0,
-        ordered_head_fold=True,
+        ordered_head_fold=ordered_head_fold,
     )
     expected = torch.zeros((_PAGE_SIZE,), device=_DEVICE, dtype=torch.float32)
     for head in range(_HEADS):
@@ -481,3 +498,137 @@ def test_kpool_prefill_logits_preserve_nonfinite_visible_scores(
         assert actual.isnan().all()
     else:
         assert torch.isposinf(actual).all()
+
+
+# The flag selects a different head reduction only on GFX950. The top-level op
+# captures only the planned scorer; the page-table path is eager-only.
+@pytest.mark.parametrize("ordered_head_fold", (False, True) if is_cdna4() else (True,))
+def test_kpool_plan_graph_replay_reads_refreshed_inputs(
+    ordered_head_fold: bool,
+) -> None:
+    generator = _generator(2201)
+    pages, tokens, width, pool_offset = 14, 4, 173, 13
+    cache, _ = _packed_cache(
+        pages, padding_bytes=192, as_rows=False, generator=generator
+    )
+    q, weights = _strided_inputs(tokens, torch.float32, generator)
+    table = torch.arange(pages - 1, -1, -1, device=_DEVICE)
+    logical = torch.arange(pages * _PAGE_SIZE, device=_DEVICE)
+    slots = table[logical // _PAGE_SIZE] * _PAGE_SIZE + logical % _PAGE_SIZE
+    starts = torch.zeros((tokens,), device=_DEVICE, dtype=torch.int32)
+    ends = torch.tensor((0, 65, 160, 200), device=_DEVICE, dtype=torch.int32)
+    out = torch.empty((tokens, width), device=_DEVICE)
+    local_ends = torch.empty_like(starts)
+
+    def invoke() -> None:
+        _kpool_prefill_plan_logits(
+            q,
+            cache,
+            weights,
+            slots,
+            starts,
+            ends,
+            pool_size=_POOL_SIZE,
+            page_size=_PAGE_SIZE,
+            pool_offset=pool_offset,
+            window_cols=width,
+            softmax_scale=_SOFTMAX_SCALE,
+            ordered_head_fold=ordered_head_fold,
+            out=out,
+            row_ends_out=local_ends,
+        )
+
+    invoke()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        invoke()
+    # Refresh every input in place. The replay must read the new values, so it
+    # matches an eager run on them bit for bit. Eager accuracy is covered above.
+    replacement_q, replacement_weights = _strided_inputs(
+        tokens, torch.float32, _generator(2202)
+    )
+    q.copy_(replacement_q)
+    weights.copy_(replacement_weights)
+    cache.copy_(
+        _packed_cache(
+            pages, padding_bytes=192, as_rows=False, generator=_generator(2203)
+        )[0]
+    )
+    slots.copy_(slots.flip(0))
+    ends.sub_(2).clamp_min_(0)
+    out.fill_(float("nan"))
+    local_ends.fill_(-1)
+    graph.replay()
+    observed, observed_ends = out.clone(), local_ends.clone()
+    invoke()
+
+    assert torch.equal(observed_ends, local_ends)
+    for row, end in enumerate(observed_ends.tolist()):
+        assert torch.equal(observed[row, :end], out[row, :end])
+        assert observed[row, end:].isnan().all()
+
+
+@pytest.mark.skipif(not is_cdna5(), reason="GFX1250 column splits")
+@pytest.mark.parametrize("planned", (False, True))
+def test_kpool_column_splits_follow_tokens_without_recompiling(
+    planned: bool,
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.standard_cache_logits import (
+        gluon_kpool_prefill_topk_fp8_gfx1250,
+        gluon_kpool_prefill_topk_fp8_plan_gfx1250,
+    )
+
+    generator = _generator(1409)
+    pages, width, max_tokens = 32, 512, 2048
+    cache, keys = _packed_cache(
+        pages, padding_bytes=0, as_rows=False, generator=generator
+    )
+    q, weights = _strided_inputs(max_tokens, torch.float32, generator)
+    # Both addressing modes read the same physical slots: the planned scorer
+    # takes them directly, the unplanned one through the page table.
+    table = torch.randperm(pages, device=_DEVICE, generator=generator).int()[None]
+    logical = torch.arange(pages * _PAGE_SIZE, device=_DEVICE)
+    slots = table[0, logical // _PAGE_SIZE].long() * _PAGE_SIZE + logical % _PAGE_SIZE
+    ends = torch.randint(
+        1, width + 1, (max_tokens,), device=_DEVICE, generator=generator
+    ).int()
+    zeros = torch.zeros((max_tokens,), device=_DEVICE, dtype=torch.int32)
+    kernel = (
+        gluon_kpool_prefill_topk_fp8_plan_gfx1250
+        if planned
+        else gluon_kpool_prefill_topk_fp8_gfx1250
+    )
+
+    def run(tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if planned:
+            launcher = _kpool_prefill_plan_logits
+            metadata = (slots, zeros[:tokens], ends[:tokens])
+        else:
+            launcher = _kpool_prefill_logits
+            metadata = (ends[:tokens] * _POOL_SIZE, zeros[:tokens], table)
+        return launcher(
+            q[:tokens],
+            cache,
+            weights[:tokens],
+            *metadata,
+            pool_size=_POOL_SIZE,
+            page_size=_PAGE_SIZE,
+            pool_offset=0,
+            window_cols=width,
+            softmax_scale=_SOFTMAX_SCALE,
+        )
+
+    run(1)
+    # Few tokens split each window over more programs; the split span is a
+    # runtime argument, so it must not add kernel specializations.
+    with assert_no_triton_compile(kernel):
+        for tokens in (3, 64, max_tokens):
+            actual, row_ends = run(tokens)
+    torch.testing.assert_close(row_ends, ends, atol=0, rtol=0)
+    for row in (0, max_tokens - 1):
+        end = int(ends[row])
+        selected_keys = keys.reshape(-1, _HEAD_DIM)[slots[:end]]
+        head_scores = q[row].float() @ selected_keys.T
+        expected = (head_scores.relu() * weights[row, :, None]).sum(dim=0)
+        expected = expected * _SOFTMAX_SCALE
+        torch.testing.assert_close(actual[row, :end], expected, atol=0.02, rtol=0.02)

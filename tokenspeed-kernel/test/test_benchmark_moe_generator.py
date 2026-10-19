@@ -121,6 +121,76 @@ def test_moe_generator_rejects_unimplemented_model_profile() -> None:
         prepare_moe_apply(request, None)
 
 
+def test_topk_generator_selects_and_calls_biased_sqrt_softplus_routing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    spec = KernelSpec(name="unit_topk", family="moe", mode="topk", solution="unit")
+
+    def capture_selection(_request, _platform, _signature, traits):
+        captured["traits"] = traits
+        return spec
+
+    def capture_topk(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    _use_cpu_allocations(monkeypatch)
+    monkeypatch.setattr(moe_generator, "load_builtin_kernels", lambda: None)
+    monkeypatch.setattr(moe_generator, "_selected_spec", capture_selection)
+    monkeypatch.setattr(
+        moe_generator,
+        "_generator",
+        lambda seed: torch.Generator().manual_seed(seed),
+    )
+    monkeypatch.setattr(
+        moe_generator,
+        "_randn",
+        lambda shape, *, generator, dtype: torch.randn(
+            shape, generator=generator, dtype=dtype
+        ),
+    )
+    monkeypatch.setattr(moe_ops, "moe_topk", capture_topk)
+    request = BenchmarkRequest(
+        family="moe",
+        mode="topk",
+        parameters={
+            "model_profile": "dsv41_flash_tp4",
+            "score_function": "sqrt_softplus",
+            "tokens": 6,
+            "num_experts": 384,
+            "topk": 6,
+            "router_logits_dtype": "float32",
+            "routed_scaling_factor": 1.5,
+            "normalize_topk_weights": True,
+        },
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+
+    prepared = moe_generator.prepare_topk(request, None)
+    prepared.invocation.invoke()
+
+    assert prepared.registration is spec
+    assert captured["traits"] == {
+        "tokens": 6,
+        "experts": 384,
+        "top_k": 6,
+        "renormalize": True,
+        "routing_kind": "bias",
+        "score_function": "sqrt_softplus",
+    }
+    router_logits, topk, score_function, selection, renormalize, scaling = captured[
+        "args"
+    ]
+    assert router_logits.shape == (6, 384) and router_logits.dtype is torch.float32
+    assert (topk, score_function, selection) == (6, "sqrt_softplus", "topk")
+    assert renormalize is True and scaling == 1.5
+    assert captured["kwargs"]["correction_bias"].shape == (384,)
+
+
 def test_moe_apply_generator_precomputes_local_ep_routes(
     fresh_registry,
     monkeypatch,
@@ -423,7 +493,7 @@ def test_latent_input_generator_matches_runtime_packed_projection_contract(
     )
     seen = {}
     _use_cpu_allocations(monkeypatch)
-    latent_input_ops = importlib.import_module("tokenspeed_kernel.ops.moe.latent_input")
+    latent_input_ops = importlib.import_module("tokenspeed_kernel.ops.moe")
     monkeypatch.setattr(moe_generator, "load_builtin_kernels", lambda: None)
     monkeypatch.setattr(moe_generator, "_selected_spec", lambda *_args: spec)
     monkeypatch.setattr(
@@ -524,9 +594,7 @@ def test_latent_expert_shared_generator_uses_global_ep_routes_and_reset(
     )
     seen = {}
     _use_cpu_allocations(monkeypatch)
-    latent_decode_ops = importlib.import_module(
-        "tokenspeed_kernel.ops.moe.latent_decode"
-    )
+    latent_decode_ops = importlib.import_module("tokenspeed_kernel.ops.moe")
     monkeypatch.setattr(moe_generator, "load_builtin_kernels", lambda: None)
     monkeypatch.setattr(
         moe_generator,
@@ -640,3 +708,96 @@ def test_latent_expert_shared_skips_incompatible_weight_representation() -> None
 
     assert error.value.status is BenchmarkStatus.NOT_APPLICABLE
     assert "not compatible with the joint" in str(error.value)
+
+
+def _qwen38_request(mode: str, **parameters: object) -> BenchmarkRequest:
+    return BenchmarkRequest(
+        family="moe",
+        mode=mode,
+        parameters={"model_profile": "qwen38_flash_tp2", **parameters},
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_softmax_topk_generator_selection_matches_operation_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tokenspeed_kernel.ops.moe as softmax_topk_ops
+
+    captured: list[tuple] = []
+
+    def select(family, mode, signature, **kwargs):
+        captured.append((family, mode, signature, kwargs["traits"]))
+        raise RuntimeError("selection captured")
+
+    monkeypatch.setattr(softmax_topk_ops, "select_kernel", select)
+    monkeypatch.setattr(moe_generator, "select_kernel", select)
+    monkeypatch.setattr(moe_generator, "load_builtin_kernels", lambda: None)
+
+    with pytest.raises(RuntimeError, match="selection captured"):
+        moe_ops.moe_topk(
+            torch.zeros((64, 512), dtype=torch.bfloat16, device="cuda"),
+            10,
+            "softmax",
+            "topk",
+            True,
+            1.0,
+        )
+    request = _qwen38_request(
+        "softmax_topk",
+        tokens=64,
+        num_experts=512,
+        topk=10,
+        router_logits_dtype="bfloat16",
+        normalize_topk_weights=True,
+    )
+    with pytest.raises(RuntimeError, match="selection captured"):
+        moe_generator.prepare_softmax_topk(request, None)
+
+    assert captured[0] == captured[1]
+
+
+def test_moe_apply_generator_plans_dynamic_mxfp4_activations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def capture_plan(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("plan captured")
+
+    monkeypatch.setattr(moe_generator, "load_builtin_kernels", lambda: None)
+    monkeypatch.setattr(moe_ops, "moe_plan", capture_plan)
+    request = _qwen38_request(
+        "apply",
+        tokens=64,
+        hidden_size=2560,
+        intermediate_size=640,
+        num_experts=512,
+        num_local_experts=512,
+        topk=10,
+        tp_size=2,
+        ep_size=1,
+        ep_rank=0,
+        input_dtype="bfloat16",
+        router_logits_dtype="bfloat16",
+        weight_dtype="mxfp4",
+        activation="silu",
+        routing_mode="precomputed_topk",
+        route_scope="global",
+        route_distribution="router",
+        routed_scaling_factor=1.0,
+        normalize_topk_weights=True,
+        internal_activation_dtype="mxfp4",
+        token_count_scope="global",
+    )
+    with pytest.raises(RuntimeError, match="plan captured"):
+        prepare_moe_apply(request, None)
+
+    assert captured["weight_dtype"] == "mxfp4"
+    assert captured["internal_activation_dtype"] == "mxfp4"
+    assert captured["ispp"] == 320

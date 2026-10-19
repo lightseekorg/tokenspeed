@@ -74,9 +74,9 @@ def _quantized_head(shard, device, logits):
     the real all-gather on every GPU vendor without requiring an NVFP4 GEMM
     or modeling its rounding in the reference.
     """
-    import tokenspeed_kernel
     from torch import nn
 
+    import tokenspeed.runtime.layers.dense.nvfp4 as nvfp4_module
     from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4W4A16LinearMethod
 
     head = nn.Module()
@@ -97,7 +97,7 @@ def _quantized_head(shard, device, logits):
     head.input_size_per_partition = HIDDEN
     head.output_size_per_partition = shard
     with mock.patch.object(
-        tokenspeed_kernel, "has_flashinfer_cute_dsl_nvfp4_a16", return_value=True
+        nvfp4_module, "kernel_has_flashinfer_cute_dsl_nvfp4_a16", return_value=True
     ):
         head.quant_method = Nvfp4W4A16LinearMethod(SimpleNamespace(group_size=16))
     head.quant_method.apply = lambda layer, x, bias: logits

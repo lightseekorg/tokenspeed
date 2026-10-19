@@ -31,8 +31,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from kimi3_reference import _mxfp4_linear, mxfp4_moe_reference
-from tokenspeed_kernel.ops.moe.marlin.mxfp4 import (
+from tokenspeed_kernel.numerics.torch.activation import torch_silu_and_mul
+from tokenspeed_kernel.numerics.torch.moe import (
+    DequantizedExperts,
+    mxfp4_situ_moe_experts,
+    torch_moe_experts,
+)
+from tokenspeed_kernel.numerics.torch.quantization import dequantize_mxfp4
+from tokenspeed_kernel.ops.moe.marlin import (
     _swiglu_limit,
     marlin_mxfp4_moe_weights,
     marlin_mxfp4_precomputed_moe_apply,
@@ -93,7 +99,7 @@ def test_marlin_mxfp4_situ_matches_reference(num_tokens: int) -> None:
     )
     topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
 
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         x,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -150,7 +156,7 @@ def test_marlin_mxfp4_ep_masks_nonlocal_experts() -> None:
     )
     topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
 
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         x,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -214,7 +220,7 @@ def test_marlin_mxfp4_silu_without_situ_beta() -> None:
         num_tokens, top_k, generator=generator, device="cuda", dtype=torch.float32
     )
     topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         x,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -248,34 +254,20 @@ def _clamped_swiglu_moe_reference(
     """Routed MXFP4 experts with the checkpoint's SwiGLU clamp: ``gate`` is
     clipped from above only, ``up`` on both sides, before ``silu(gate) * up``
     (DeepSeek-V4.1 ``inference/model.py`` ``Expert.forward``)."""
-    combined = torch.zeros_like(x, dtype=torch.float32)
-    for expert_id in range(raw["w13_weight"].shape[0]):
-        token_ids, slot_ids = (topk_ids == expert_id).nonzero(as_tuple=True)
-        if not token_ids.numel():
-            continue
-        gate_up = _mxfp4_linear(
-            x.index_select(0, token_ids),
-            raw["w13_weight"][expert_id],
-            raw["w13_scale"][expert_id],
-            activation_dtype=torch.bfloat16,
-            output_dtype=torch.bfloat16,
-        )
-        gate, up = gate_up.float().chunk(2, dim=-1)
-        if limit is not None:
-            gate = gate.clamp(max=limit)
-            up = up.clamp(-limit, limit)
-        hidden = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
-        out = _mxfp4_linear(
-            hidden,
-            raw["w2_weight"][expert_id],
-            raw["w2_scale"][expert_id],
-            activation_dtype=torch.bfloat16,
-            output_dtype=torch.bfloat16,
-        )
-        combined.index_add_(
-            0, token_ids, out.float() * topk_weights[token_ids, slot_ids][:, None]
-        )
-    return combined.to(x.dtype)
+    return torch_moe_experts(
+        x,
+        DequantizedExperts(dequantize_mxfp4, raw["w13_weight"], raw["w13_scale"]),
+        DequantizedExperts(dequantize_mxfp4, raw["w2_weight"], raw["w2_scale"]),
+        topk_ids,
+        topk_weights,
+        activation=lambda gate_up: torch_silu_and_mul(gate_up.bfloat16(), limit),
+        w13_bias=None,
+        w2_bias=None,
+        quantize_input=None,
+        quantize_intermediate=None,
+        round_expert_output=torch.Tensor.bfloat16,
+        first_expert=0,
+    ).to(x.dtype)
 
 
 @pytest.mark.parametrize("ep_size", [1, 2])

@@ -33,10 +33,10 @@ prefill graph: vLLM's ``BreakableCUDAGraphWrapper`` (the homogeneous segment-lis
 structure + the ``set_forward_context``/``get_forward_context`` ambient pattern we
 mirror in :func:`active_forward`/:func:`current_forward_ctx`) and SGLang's
 breakable prefill graph (the eager-copy output handoff at each break). Unlike a
-full prefill graph, attention -- the only batch/length-aware op and the source of
-the host-side ``max_seq_len_q`` scalar -- stays eager, so it never enters a graph.
-Keeping all KV-cache reads/writes in the eager breaks also makes them honor the
-per-layer transfer consumer index naturally.
+full prefill graph, attention and request-shaped state updates stay eager, so
+live lengths and cache addresses never enter a captured segment. Keeping all
+KV-cache reads/writes in eager breaks also makes them honor the per-layer
+transfer consumer index naturally.
 
 Address-stability contract (the load-bearing invariant):
 
@@ -55,11 +55,12 @@ import functools
 import gc
 from collections import deque
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from typing import Any
 
 import torch
 from tokenspeed_kernel.ops.transform.weak_ref import weak_ref_tensor as _kernel_weak_ref
+from tokenspeed_kernel.workspace import capture_session
 
 __all__ = [
     "BreakableCapture",
@@ -197,11 +198,19 @@ class BreakableCapture:
             stream = BreakableCapture._default_capture_stream
         self._stream = stream
         self._stream_ctx: Any | None = None
+        # Kernel state the segments' launches need zeroed; it lives as long as
+        # this capture, which holds the segments.
+        self._capture_session: AbstractContextManager[None] | None = None
         # Break-output handoff buffers keyed by (shape, dtype, device); see break_point.
         self._handoff: dict[HandoffKey, torch.Tensor] = {}
         self._handoff_storage: dict[HandoffSlot, torch.Tensor] = (
             {} if handoff_storage is None else handoff_storage
         )
+
+    @property
+    def stream(self) -> torch.cuda.Stream:
+        """The stream used for warmup and capture."""
+        return self._stream
 
     @classmethod
     def current(cls) -> BreakableCapture | None:
@@ -224,6 +233,8 @@ class BreakableCapture:
         self._stream_ctx = torch.cuda.stream(self._stream)
         self._stream_ctx.__enter__()
         BreakableCapture._active = self
+        self._capture_session = capture_session(self)
+        self._capture_session.__enter__()
         self._begin_segment()
         return self
 
@@ -231,6 +242,9 @@ class BreakableCapture:
         try:
             self._end_segment()
         finally:
+            if self._capture_session is not None:
+                self._capture_session.__exit__(*exc)
+                self._capture_session = None
             BreakableCapture._active = None
             if self._stream_ctx is not None:
                 self._stream_ctx.__exit__(*exc)

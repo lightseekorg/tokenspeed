@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.rmha import torch_rel_attention
 
 torch.manual_seed(29)
 
@@ -56,21 +57,11 @@ def _skip_unless_supported() -> None:
 def _ref_row(q_row, k, v, rel_row, rel_extent, window_left, pos):
     """One query row at absolute position ``pos``. q_row [H,D]; k/v [Sk,KV,D];
     rel_row [H,E]."""
-    Sk = k.shape[0]
-    H = q_row.shape[0]
-    kx = k.repeat_interleave(H // NUM_KV_HEADS, dim=1)
-    vx = v.repeat_interleave(H // NUM_KV_HEADS, dim=1)
-    logits = torch.einsum("hd,khd->hk", q_row.float(), kx.float()) * SCALE
-    dist = pos - torch.arange(Sk, device=q_row.device)
-    in_range = (dist >= 0) & (dist < rel_extent)
-    idx = dist.clamp(0, rel_extent - 1)
-    bias = rel_row.float().gather(-1, idx.unsqueeze(0).expand(H, Sk))
-    logits = logits + bias.masked_fill(~in_range[None], 0.0)
-    masked = dist < 0
-    if window_left >= 0:
-        masked = masked | (dist > window_left)
-    logits = logits.masked_fill(masked[None], -torch.inf)
-    return torch.einsum("hk,khd->hd", torch.softmax(logits, dim=-1), vx.float())
+    assert k.shape[0] == pos + 1
+    out, _ = torch_rel_attention(
+        q_row[None], k, v, rel_row[None], rel_extent, window_left, SCALE
+    )
+    return out[0]
 
 
 def _build_paged(kv_lens, page, device):
@@ -339,11 +330,11 @@ def test_v1_native_prediction_mxfp8(window_left) -> None:
     _skip_unless_supported()
     import math as _math
 
-    from tokenspeed_kernel import quantize_mxfp8
     from tokenspeed_kernel.ops.attention.rmha._cute_dsl.rel_decode import (
         rel_mha_decode_tsmha,
     )
     from tokenspeed_kernel.ops.kvcache.triton import store_sf_interleaved
+    from tokenspeed_kernel.ops.quantization import quantize_mxfp8
 
     device = torch.device("cuda")
     page, extent, k_new = 128, 512, 4

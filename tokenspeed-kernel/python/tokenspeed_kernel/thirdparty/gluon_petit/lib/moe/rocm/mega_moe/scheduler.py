@@ -13,12 +13,10 @@ from lib.gemm.rocm.intrinsics import (
     BufferResource,
     amdgcn_ballot,
     amdgcn_ctz64,
-    amdgcn_shuffle,
-    amdgcn_wave_inclusive_add,
 )
 from lib.moe.rocm.mega_moe.workspace import MegaMoEWorkspace
 from lib.tal.device import DeviceTemplate, device_method
-from lib.tal.tensor_ops import first, load_words
+from lib.tal.tensor_ops import first, group_gather, load_words, wave_inclusive_sum
 from triton.experimental.gluon import language as l
 
 
@@ -91,9 +89,9 @@ class MegaMoETwoStageScheduler(DeviceTemplate):
                 )
                 pending = active & (value[1] != self.kNumSMs * self.kNumRanks)
             blocks = (value[0] + self.kSortedTokenBlock - 1) // self.kSortedTokenBlock
-            inclusive = amdgcn_wave_inclusive_add(blocks, wtid)
+            inclusive = wave_inclusive_sum(blocks)
             block_base = preceding_blocks + inclusive - blocks
-            preceding_blocks += amdgcn_shuffle(inclusive, 63)
+            preceding_blocks += group_gather(inclusive, 63, 64)
             expert_metadata += (value[0] | (block_base << self.kTokenCountBits),)
         return SchedulerState(state.workspace_, expert_metadata)
 
@@ -108,9 +106,10 @@ class MegaMoETwoStageScheduler(DeviceTemplate):
         wtid = l.arange(
             0, 64, layout=l.BlockedLayout([1], [64], [l.num_warps()], [0])
         ).to(l.uint32)
-        last_metadata = amdgcn_shuffle(
+        last_metadata = group_gather(
             state.expert_metadata_[(self.kNumExpertsPerRank - 1) // 64],
             (self.kNumExpertsPerRank - 1) % 64,
+            64,
         )
         last_metadata = first(last_metadata)
         last_tokens = last_metadata & self.kTokenCountMask
@@ -148,7 +147,7 @@ class MegaMoETwoStageScheduler(DeviceTemplate):
             matches = first(matches)
             if matches != 0:
                 expert = amdgcn_ctz64(matches)
-                metadata = first(amdgcn_shuffle(lane_metadata, expert))
+                metadata = first(group_gather(lane_metadata, expert, 64))
                 tokens = metadata & self.kTokenCountMask
                 block_base = metadata >> self.kTokenCountBits
                 block_in_expert = target_block - block_base
@@ -193,7 +192,7 @@ class MegaMoETwoStageScheduler(DeviceTemplate):
                 matches = first(matches)
                 if matches != 0:
                     expert = amdgcn_ctz64(matches)
-                    metadata = first(amdgcn_shuffle(lane_metadata, expert))
+                    metadata = first(group_gather(lane_metadata, expert, 64))
                     tokens = metadata & self.kTokenCountMask
                     block_base = metadata >> self.kTokenCountBits
                     block_in_expert = target_stage1_block - block_base
@@ -219,7 +218,7 @@ class MegaMoETwoStageScheduler(DeviceTemplate):
                 lane_metadata = l.where(
                     expert < 64, state.expert_metadata_[0], state.expert_metadata_[1]
                 )
-            metadata = first(amdgcn_shuffle(lane_metadata, expert % 64))
+            metadata = first(group_gather(lane_metadata, expert % 64, 64))
             tokens = metadata & self.kTokenCountMask
             stage1_blocks = (tokens + self.kStage1M - 1) // self.kStage1M
             physical_blocks = (
@@ -249,9 +248,10 @@ class MegaMoETwoStageScheduler(DeviceTemplate):
 
     @device_method
     def GetStage2Work(self, state, wtid, stage2_id):
-        last_metadata = amdgcn_shuffle(
+        last_metadata = group_gather(
             state.expert_metadata_[(self.kNumExpertsPerRank - 1) // 64],
             (self.kNumExpertsPerRank - 1) % 64,
+            64,
         )
         last_metadata = first(last_metadata)
         last_tokens = last_metadata & self.kTokenCountMask

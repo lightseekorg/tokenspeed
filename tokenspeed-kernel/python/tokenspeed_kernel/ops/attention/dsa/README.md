@@ -24,13 +24,30 @@ the online softmax; unused entries remain `-1`.
 Portable Triton implementations remain the fallback for trait combinations
 without a matching native registration.
 
+## Materialized Triton row top-k
+
+`triton_topk_from_logits(logits, topk, seq_lens=..., enable_pdl=...)` selects
+FP32 rows with descending scores and smaller column ids first on ties.
+`seq_lens` is an int32 or int64 vector on the scores' device, clamped per row
+to `[0, width]`; explicit `None` selects the full row. Scores and lengths may
+be strided. Invalid scores inside the visible prefix still use `-inf` and
+produce `-1` output padding. Entries beyond the prefix are never read and may
+be uninitialized.
+
+The sorting and radix implementations both bound input reads by these device
+lengths. Radix histogram reduction excludes unwritten tiles and selects at
+most `min(topk, seq_lens[row])` entries, including empty and short rows.
+CUDA Graph replay may change the lengths without changing allocation or launch
+capacity. QSA passes its complete compressed-block counts to both CUDA and
+Triton selection, so its scorer writes only valid prefixes.
+
 ## Index-K plane formats
 
 `dsa_prefill_topk` and `dsa_decode_topk` read the storage of the index-key
 plane off its dtype and pass it to selection as the `index_k_format` and
-`index_k_layout` traits; a top-k leaf declares the planes it scores and is
-never handed another one. One layout per dtype, and the facades never
-convert a plane:
+`index_k_layout` traits; a top-k leaf declares the planes it scores and
+selection never hands it another one. One layout per dtype, and the facades
+never convert a plane:
 
 | dtype | `index_k_format` | `index_k_layout` | row |
 | --- | --- | --- | --- |
@@ -61,7 +78,7 @@ facade hands the keywords to declaring leaves only, and a leaf that only
 reads planes -- the portable Triton leaf, the Gluon wrappers -- is never
 selected for rows, not by ranking and not by a kernel override (an override
 skips traits but not required features). The failure is a
-`NoKernelFoundError` at selection; a host whose sharded prefill will hand
+`NoKernelFoundError` at selection; a host whose sharded prefill hands
 rows probes that selection at construction with
 `dsa.select_dsa_prefill_topk_for_rows(index_k_format=, ...)`, which makes a
 platform without a declaring leaf a startup error.
@@ -123,11 +140,11 @@ Contract:
   of the SMs for 4- and 8-CTA clusters, 80% for pairs). Every configuration
   a call may pick must be compiled with `warmup` before CUDA-graph capture.
 
-Algorithm per CTA: the first 8192 entries (the row's in-order tail of up to
-4096 entries plus the first pseudo-randomly ordered 512-entry segments) are
-selected exactly with an 8-bit radix select over order-preserving keys and
-set the running threshold; the remaining segments stream through a three
-stage `cp.async.bulk` ring and only entries above the threshold are appended
+Algorithm per CTA: an 8-bit radix select over order-preserving keys selects
+the first 8192 entries (the row's in-order tail of up to 4096 entries plus
+the first pseudo-randomly ordered 512-entry segments) exactly and sets the
+running threshold; the remaining segments stream through a three-stage
+`cp.async.bulk` ring, and the CTA appends only entries above the threshold
 as `(index, value)` pairs; once 4032 candidates accumulate, and once more at
 the end, a radix select over survivors plus candidates re-selects `k` pairs
 and raises the threshold. Per-pass histograms send non-matching keys to a
@@ -142,10 +159,10 @@ context-partitioned sparse attention. Supplying `out` preserves the supplied
 output buffer even when returning LSE. Omitting `topk_lens` uses the full padded
 slot width, with negative slots still excluded.
 
-DeepGEMM index scoring is registered for 16, 32, or 64 index heads. The
+DeepGEMM index scoring registers for 16, 32, or 64 index heads. The
 16-head case pads queries and weights to its native 32-head ABI with zeros;
 caller-provided scoring scales and forced initial/local candidate policies
-remain unchanged. Other head counts are excluded by kernel traits.
+remain unchanged. Kernel traits exclude other head counts.
 
 FlashMLA sparse prefill (regular BF16 KV) and sparse decode (packed FP8 KV)
 also support `return_lse=True`. Both return natural-log LSE `[tokens, heads]`
@@ -155,6 +172,17 @@ output buffers retain their identity. Decode transposes the vendor's
 `[batch, heads, query]` LSE to token-major order. This does not reinterpret
 regular BF16 KV as packed FP8 or change its Triton decode selection.
 
+## Runtime backend selection
+
+The runtime selects DSA with `--attention-backend dsa`, or automatically from
+the DSA architecture. The same name resolves to `AscendDSABackend` on Ascend
+and `DSABackend` on GPU platforms. The Ascend implementation owns its device
+metadata and operator adaptation; model projections and indexer selection
+parameters remain model-owned. Its current constraints are BF16 KV and index
+keys, 128-token kernel pages, target verification of at most eight tokens,
+and no draft-model attention. Target verification can still consume draft
+candidates. These constraints are checked by the Ascend backend.
+
 ## Sharded Index-K candidates
 
 `dsa_index_candidates` scores a bounded query tile against rank-local Index-K
@@ -162,9 +190,29 @@ for prefill and decode. Inputs are a position-preserving page table (`-1` for
 absent pages), request IDs and global causal lengths. Outputs are global logical
 offsets and FP32 scores: invalid candidates use `-1`/`-inf`, and forced
 initial/local candidates use `+inf`. Cross-rank merging belongs to runtime DCP.
+Runtime setup validates a positive power-of-two candidate count when the KVP
+group has multiple ranks, using the cache-parallel topology (`kvp_group` /
+`kvp_size`). Single-rank selection keeps its existing top-k choices.
 
 DeepGEMM compacts owned, causally visible pages and maps results back to global
 offsets, masking padding and handling partial tails and empty shards. Query
 quantization and head padding match the unsharded path; portable Triton provides
 the same interface. Query tiling bounds scratch memory, and fixed-shape GPU
 metadata supports CUDA graph replay without host reads.
+
+The Triton FP8 indexer skips Q/K scoring for tiles with no causally visible,
+owned entries. Empty tiles still write negative-infinite logits, including
+when lengths or ownership change during graph replay. Partially valid tiles
+keep the per-entry mask and global forced-window policy. This avoids redundant
+arithmetic without changing the launch grid, logits capacity or Top-K scan.
+
+### Persistent CUDA top-k dependencies
+
+`ragged_decode_topk` needs no workspace and requires an explicit `enable_pdl`.
+With PDL, selection waits before reading lengths or scores, including empty and
+short rows. Cluster and single-CTA launches both honor the PDL flag.
+
+For non-cluster PDL grids with no more rows than SMs, the launcher selects a
+one-block register budget to reduce packing of waiting CTAs. Larger grids keep
+the two-block budget. Launch bounds guide register allocation; they are not a
+hard limit on resident CTAs. Both variants use the same radix algorithm.

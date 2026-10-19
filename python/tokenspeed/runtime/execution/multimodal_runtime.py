@@ -95,16 +95,6 @@ class MultimodalRuntime:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _expand_mrope_from_input(mm_input, seq_len: int) -> torch.Tensor:
-        # Reached only by the chunked/retracted fallback below, where the
-        # positions table has no row for this chunk. Computed fresh rather
-        # than memoized on ``mm_input``: that struct belongs to the control
-        # plane, and a forward must not write into what it was handed.
-        return (mm_input.mrope_position_delta - 1).flatten().unsqueeze(0).repeat(
-            3, 1
-        ) + seq_len
-
-    @staticmethod
     def _mrope_delta_scalar(mm_input) -> int:
         """Read the request's decode position delta.
 
@@ -235,19 +225,15 @@ class MultimodalRuntime:
                 start = int(forward_op.extend_prefix_lens[batch_idx])
                 end = start + int(forward_op.input_lengths[batch_idx])
                 positions = mm_input.mrope_positions[:, start:end]
-                if positions.numel() != 0:
-                    mrope_chunks.append(
-                        positions.to(device=self.device, dtype=torch.int64)
+                if positions.numel() == 0:
+                    # The table covers the whole prompt and no prefill chunk
+                    # reaches past it (nothing re-prefills generated tokens).
+                    raise RuntimeError(
+                        "M-RoPE positions table has no rows for prefill chunk "
+                        f"[{start}, {end}) of request {forward_op.request_ids[batch_idx]}"
                     )
-                    continue
-                if base_chunk.numel() == 1:
-                    seq_len = int(base_chunk[-1].item()) + 1
-                    mrope_chunks.append(
-                        self._expand_mrope_from_input(mm_input, seq_len).to(
-                            device=self.device, dtype=torch.int64
-                        )
-                    )
-                    continue
+                mrope_chunks.append(positions.to(device=self.device, dtype=torch.int64))
+                continue
 
             delta = mm_input.mrope_position_delta
             if delta is None:

@@ -9,6 +9,7 @@ runner:
     - b200-4gpu
 env:
   CI: "true"
+  MODEL: deepseek-ai/DeepSeek-V4.1-Flash-1017
   # P and D each take two GPUs of the four-GPU runner.
   WORLD_SIZE: "2"
   PREFILL_GPUS: "0,1"

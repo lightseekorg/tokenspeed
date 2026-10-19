@@ -142,24 +142,26 @@ class _Qwen4ExpRMSNormGated(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
     def forward(self, x: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
+        """Normalize each head (``weight``'s width) of ``x``'s rows on its own."""
+        head_dim = self.weight.shape[0]
         if x.is_cuda:
             return rmsnorm_fn(
                 x,
                 self.weight,
                 z=z,
                 eps=self.eps,
-                group_size=None,
+                group_size=head_dim,
                 norm_before_gate=True,
                 sigmoid_gate=True,
                 weights_independent=True,
             )
         input_dtype = x.dtype
-        value = x.float()
+        value = x.float().unflatten(-1, (-1, head_dim))
         variance = value.square().mean(dim=-1, keepdim=True)
         value = value * torch.rsqrt(variance + self.eps)
         if z is not None:
-            value = value * torch.sigmoid(z.float())
-        return (value * self.weight.float()).to(input_dtype)
+            value = value * torch.sigmoid(z.float()).unflatten(-1, (-1, head_dim))
+        return (value * self.weight.float()).flatten(-2).to(input_dtype)
 
 
 class _Qwen4ExpDecoderMixin:
@@ -331,7 +333,7 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
             hidden_states, residual, input_ids, ctx
         )
         attention_output = (
-            mixed if ctx.forward_mode.is_idle() else self.linear_attn(mixed, ctx)
+            mixed if ctx.forward_mode.is_idle() else self.linear_attn(mixed, None, ctx)
         )
         mixed, residuals = self._finish_attention(attention_output, residuals, ctx)
         return self._run_mlp(mixed, residuals, ctx)

@@ -23,14 +23,12 @@
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.moe.sigmoid_topk import (
+from tokenspeed_kernel.ops.moe import (
     _gluon_eligible,
 )
-from tokenspeed_kernel.ops.moe.sigmoid_topk import (
-    _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk,
-)
+from tokenspeed_kernel.ops.moe import _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk
+from tokenspeed_kernel.ops.moe import moe_topk as kernel_moe_topk
 from utils import is_cdna4, is_cdna5
 
 
@@ -43,7 +41,7 @@ def _sigmoid_topk(
     logical_to_physical_map: torch.Tensor | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return tokenspeed_kernel.moe_topk(
+    return kernel_moe_topk(
         router_logits,
         topk,
         score_function="sigmoid",

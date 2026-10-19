@@ -83,6 +83,8 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
     data_parallel_size: int = 1
     tensor_parallel_size: int = 1
     pipeline_parallel_size: int = 1
+    # The frontend's key for KV parallelism (``--kv-parallel-size``); the
+    # wire name is the frontend's contract, not this project's vocabulary.
     decode_context_parallel_size: int = 1
     data_parallel_rank: int = 0
     max_num_seqs: int = 0

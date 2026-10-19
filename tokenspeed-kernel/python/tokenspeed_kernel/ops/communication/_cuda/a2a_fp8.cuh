@@ -27,7 +27,7 @@
 // BF16 values per lane. Packet and chunk consumers establish readiness first.
 __device__ __forceinline__ void
 quantize_a2a_group(const uint32_t (&words)[4], uint32_t *output, float *scales,
-                   int word_index, int rows, int channels) {
+                   int word_index, int rows, int channels, bool padded) {
   constexpr int Words = 4, lanes = 16;
   const unsigned mask = 0xffffu << (threadIdx.x & 16);
   float values[2 * Words];
@@ -39,15 +39,17 @@ quantize_a2a_group(const uint32_t (&words)[4], uint32_t *output, float *scales,
     amax = fmaxf(amax, fabsf(values[j]));
   }
   amax = __uint_as_float(__reduce_max_sync(mask, __float_as_uint(amax)));
-  // Match the prepared FlashInfer 1x128 quantizer exactly, including the BF16
-  // epsilon and round-to-nearest divisions despite the JIT's fast-math flags.
+  // The prepared quantizer uses Triton for padded M (approximate reciprocals,
+  // unit scale for zero groups), and TRT-LLM otherwise (BF16 epsilon and RN
+  // divisions). Match both contracts, as the fused AllGather quantizer does.
   const float multiplier =
-      __fdiv_rn(448.f, fmaxf(amax, float(__nv_bfloat16(1e-10f))));
+      padded ? (amax != 0.f ? 448.f / amax : 1.f)
+             : __fdiv_rn(448.f, fmaxf(amax, float(__nv_bfloat16(1e-10f))));
   if ((threadIdx.x & (lanes - 1)) == 0) {
     const int group = word_index / 64;
     const int groups_per_row = channels / 128;
     scales[(group % groups_per_row) * rows + group / groups_per_row] =
-        __fdiv_rn(1.f, multiplier);
+        padded ? 1.f / multiplier : __fdiv_rn(1.f, multiplier);
   }
 #pragma unroll
   for (int j = 0; j < Words / 2; ++j) {
@@ -57,5 +59,26 @@ quantize_a2a_group(const uint32_t (&words)[4], uint32_t *output, float *scales,
       packed |= uint32_t(__nv_fp8_e4m3(values[j * 4 + v] * multiplier).__x)
                 << (8 * v);
     output[word_index / 2 + j] = packed;
+  }
+}
+
+// Prepared FP8 GEMMs require the gathered row count divisible by four. Tail
+// rows are local padding, never part of the exchange protocol.
+template <int NRanks>
+__device__ __forceinline__ void pad_a2a_fp8(uint32_t *output, float *scales,
+                                            int rows, int channels) {
+  const int valid_rows = NRanks * rows;
+  const int padded_rows = (valid_rows + 3) / 4 * 4;
+  if (valid_rows != padded_rows) {
+    const int shard = channels / NRanks;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    for (int i = tid; i < (padded_rows - valid_rows) * shard / 4; i += stride)
+      output[valid_rows * shard / 4 + i] = 0;
+    for (int i = tid; i < (padded_rows - valid_rows) * (shard / 128);
+         i += stride) {
+      const int tail = padded_rows - valid_rows;
+      scales[(i / tail) * padded_rows + valid_rows + i % tail] = 1.f;
+    }
   }
 }

@@ -21,7 +21,8 @@
 """Host-function CUDA graph node.
 
 Wraps ``cudaLaunchHostFunc`` so Python callables can be recorded as nodes
-inside a CUDA graph. The C++ stub is JIT-compiled on first use via
+inside a CUDA graph. A gated launch lets each execution be skipped without
+taking the GIL. The C++ stub is JIT-compiled on first use via
 ``torch.utils.cpp_extension.load_inline``.
 """
 
@@ -42,27 +43,72 @@ _CPP_SRC = r"""
 #include <cuda_runtime.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 
 namespace py = pybind11;
 
+// Run/skip decisions for the executions of a gated hostfunc, one per
+// execution in launch order. The callback thread pops them without the GIL.
+struct HostFuncGate {
+    std::mutex mutex;
+    std::deque<bool> runs;
+
+    void push(bool run) {
+        std::lock_guard<std::mutex> lock(mutex);
+        runs.push_back(run);
+    }
+
+    // An execution with no decision runs, so the callable reports it.
+    bool pop() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (runs.empty()) {
+            return true;
+        }
+        bool run = runs.front();
+        runs.pop_front();
+        return run;
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex);
+        runs.clear();
+    }
+
+    size_t size() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return runs.size();
+    }
+};
+
 struct HostFuncUserData {
     bool free_user_data;  // trampoline deletes self when true
+    std::shared_ptr<HostFuncGate> gate;  // null: every execution runs
     py::function fn;
     py::tuple args;
     py::dict kwargs;
 
-    HostFuncUserData(bool fud, py::function f, py::tuple a, py::dict k)
-        : free_user_data(fud), fn(std::move(f)),
+    HostFuncUserData(bool fud, std::shared_ptr<HostFuncGate> g, py::function f,
+                     py::tuple a, py::dict k)
+        : free_user_data(fud), gate(std::move(g)), fn(std::move(f)),
           args(std::move(a)), kwargs(std::move(k)) {}
 };
 
 static void CUDART_CB host_func_trampoline(void* user_data) {
     // cudaLaunchHostFunc runs on a driver thread without the GIL.
-    py::gil_scoped_acquire gil;
     auto* data = static_cast<HostFuncUserData*>(user_data);
+    // A skip returns before taking the GIL, which alone costs a decode step ~3%.
+    if (data->gate && !data->gate->pop()) {
+        if (data->free_user_data) {
+            py::gil_scoped_acquire gil;
+            delete data;
+        }
+        return;
+    }
+    py::gil_scoped_acquire gil;
     try {
         data->fn(*data->args, **data->kwargs);
     } catch (const py::error_already_set& e) {
@@ -82,18 +128,21 @@ static void CUDART_CB host_func_trampoline(void* user_data) {
 // free_user_data: True for non-capturing stream (safe to free after call);
 //                 False during capture (callback replays from the same
 //                 HostFuncUserData, so caller must keep it alive).
+// gate: None, or the HostFuncGate each execution pops first.
 // Returns the user-data pointer as int when free_user_data=False, else None.
 // Called with the GIL held (pybind11 default). We only release GIL for
 // the actual cudaLaunchHostFunc call.
 static std::optional<uintptr_t> launch_hostfunc(
     uintptr_t stream_ptr,
     bool free_user_data,
+    std::shared_ptr<HostFuncGate> gate,
     py::function fn,
     py::args args,
     py::kwargs kwargs)
 {
     auto* data = new HostFuncUserData(
-        free_user_data, std::move(fn), py::tuple(args), py::dict(kwargs));
+        free_user_data, std::move(gate), std::move(fn), py::tuple(args),
+        py::dict(kwargs));
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     cudaError_t err;
     {
@@ -117,6 +166,11 @@ static void free_hostfunc_user_data(uintptr_t handle) {
 }
 
 PYBIND11_MODULE(tokenspeed_hostfunc_ext, m) {
+    py::class_<HostFuncGate, std::shared_ptr<HostFuncGate>>(m, "HostFuncGate")
+        .def(py::init<>())
+        .def("push", &HostFuncGate::push)
+        .def("clear", &HostFuncGate::clear)
+        .def("__len__", &HostFuncGate::size);
     m.def("launch_hostfunc", &launch_hostfunc,
           "Schedule a Python callable on a CUDA stream via cudaLaunchHostFunc.");
     m.def("free_hostfunc_user_data", &free_hostfunc_user_data,
@@ -170,8 +224,26 @@ def _load_ext():
 _USER_DATA_HANDLES: set[int] = set()
 
 
-def launch_hostfunc(fn: Callable, *args: Any, **kwargs: Any) -> int | None:
+def make_hostfunc_gate() -> Any:
+    """A gate for ``launch_hostfunc``: a FIFO of run/skip decisions.
+
+    ``push(run)`` appends the decision for the gated hostfunc's next
+    execution (one per eager launch or graph replay, in launch order);
+    ``clear()`` drops decisions no execution will consume, such as those
+    pushed for a capture; ``len()`` counts the unconsumed ones.
+    """
+    return _load_ext().HostFuncGate()
+
+
+def launch_hostfunc(
+    fn: Callable, *args: Any, gate: Any | None, **kwargs: Any
+) -> int | None:
     """Run ``fn(*args, **kwargs)`` on the current CUDA stream.
+
+    With a ``gate`` (from ``make_hostfunc_gate``), each execution first pops
+    the gate's next decision on the CUDA callback thread and, on a skip,
+    returns without taking the GIL or calling ``fn``. An execution that
+    finds the gate empty runs ``fn``. ``None`` runs every execution.
 
     When capturing, returns a handle to the user-data the caller must keep
     alive; otherwise executes eagerly and returns None.
@@ -180,7 +252,7 @@ def launch_hostfunc(fn: Callable, *args: Any, **kwargs: Any) -> int | None:
     is_capturing = torch.cuda.is_current_stream_capturing()
     ext = _load_ext()
     handle = ext.launch_hostfunc(
-        stream.cuda_stream, not is_capturing, fn, *args, **kwargs
+        stream.cuda_stream, not is_capturing, gate, fn, *args, **kwargs
     )
     if is_capturing:
         if handle is None:
@@ -196,7 +268,7 @@ def hostfunc(fn: Callable) -> Callable:
     """Decorator: turn ``fn`` into a host-function graph node when called."""
 
     def wrapper(*args: Any, **kwargs: Any):
-        return launch_hostfunc(fn, *args, **kwargs)
+        return launch_hostfunc(fn, *args, gate=None, **kwargs)
 
     wrapper.__wrapped__ = fn  # type: ignore[attr-defined]
     return wrapper

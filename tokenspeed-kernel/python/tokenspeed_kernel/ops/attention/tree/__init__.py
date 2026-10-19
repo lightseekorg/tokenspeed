@@ -59,10 +59,13 @@ def tree_window_attention(
     no key ignores it.
 
     Args:
-        q: ``[bs * rows_per_req, num_q_heads, head_dim]`` queries.
-        k_cache: ``[slots, num_kv_heads, head_dim]`` token rows of the cache, in
+        q: ``[bs * rows_per_req, num_q_heads, key_dim]`` queries.
+        k_cache: ``[slots, num_kv_heads, key_dim]`` token rows of the cache, in
             ``q.dtype`` or unscaled FP8 E4M3.
-        v_cache: laid out like ``k_cache``.
+        v_cache: ``[slots, num_kv_heads, head_dim]`` value rows, in ``k_cache``'s
+            dtype. ``head_dim`` equals ``key_dim`` (GQA), or is narrower (MLA:
+            the value is the key row's leading latent and the remaining
+            ``key_dim - head_dim`` key channels are its rotary part).
         page_table: ``[bs, max_pages]`` int32 page ids; slot = page * page_size + offset.
         seq_lens: ``[bs]`` int32 keys per request, the window included (>= window).
         mask: ``[bs * rows_per_req]`` int64 window visibility per query row.
@@ -75,7 +78,7 @@ def tree_window_attention(
         sm_scale: softmax scale applied to ``q . k``.
 
     Returns:
-        The attention output in ``q.dtype``.
+        ``[bs * rows_per_req, num_q_heads, head_dim]`` attention output in ``q.dtype``.
     """
     if rows_per_req > MAX_TREE_SLOTS or window > MAX_TREE_SLOTS:
         raise ValueError(

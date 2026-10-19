@@ -2,7 +2,8 @@
 
 import os
 import sys
-import unittest
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,7 +36,7 @@ def _mxfp4_spec(num_local_experts: int, hidden_size: int, intermediate_size: int
     )
 
 
-class TestMxfp4Weights(unittest.TestCase):
+class TestMxfp4Weights:
     def test_scale_weights_store_checkpoint_bytes(self):
         layer = nn.Module()
         create_mxfp4_weight_pair(
@@ -47,13 +48,13 @@ class TestMxfp4Weights(unittest.TestCase):
             layer,
         )
 
-        self.assertEqual(layer.w13_weight_scale.dtype, torch.uint8)
-        self.assertEqual(layer.w2_weight_scale.dtype, torch.uint8)
+        assert (layer.w13_weight_scale.dtype) == (torch.uint8)
+        assert (layer.w2_weight_scale.dtype) == (torch.uint8)
 
     def test_e8m0_scale_load_preserves_checkpoint_bytes(self):
         e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
         if e8m0_dtype is None:
-            self.skipTest("torch.float8_e8m0fnu is unavailable")
+            pytest.skip("torch.float8_e8m0fnu is unavailable")
 
         layer = nn.Module()
         create_mxfp4_weight_pair(
@@ -78,7 +79,7 @@ class TestMxfp4Weights(unittest.TestCase):
             use_presharded_weights=False,
             do_transpose=False,
         )
-        self.assertTrue(torch.equal(layer.w13_weight_scale.data[0, :64], raw_w1_scale))
+        assert torch.equal(layer.w13_weight_scale.data[0, :64], raw_w1_scale)
 
         raw_w2_scale = (
             torch.tensor([122, 123], dtype=torch.uint8).repeat(64).reshape(64, 2)
@@ -93,8 +94,8 @@ class TestMxfp4Weights(unittest.TestCase):
             use_presharded_weights=False,
             do_transpose=False,
         )
-        self.assertTrue(torch.equal(layer.w2_weight_scale.data[0], raw_w2_scale))
+        assert torch.equal(layer.w2_weight_scale.data[0], raw_w2_scale)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

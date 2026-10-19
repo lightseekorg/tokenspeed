@@ -117,7 +117,8 @@ def prepared_latent_experts():
     # The loader invokes this real method on the already-constructed module.
     experts.process_weights_after_loading(experts)
     bank = tuple(getattr(experts, name) for name in names)
-    assert all(t.ndim == 6 for t in bank)
+    # N16 cells; W2 keeps flat rows of chunks.
+    assert tuple(t.ndim for t in bank) == (6, 6, 3, 6)
     experts.process_weights_after_loading(experts)
     assert all(getattr(experts, name) is t for name, t in zip(names, bank, strict=True))
     assert latent_moe_decode_pipeline_available(

@@ -14,7 +14,8 @@ bring-up — the same pattern as
 
 import os
 import sys
-import unittest
+
+import pytest
 
 # CI registration (AST-parsed, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -86,7 +87,8 @@ def _fresh_state(obj: _StubReqObj) -> ReqState:
     )
 
 
-class TestWaitOneResponseCancellation(unittest.IsolatedAsyncioTestCase):
+class TestWaitOneResponseCancellation:
+    @pytest.mark.asyncio(loop_scope="function")
     async def test_cancelled_before_first_output_cleans_up(self) -> None:
         """Cancel while ``_wait_one_response`` is blocked on the first
         event. Expect: rid dropped from ``rid_to_state``; one ``AbortReq``
@@ -111,20 +113,20 @@ class TestWaitOneResponseCancellation(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
 
         task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
+        with pytest.raises((asyncio.CancelledError)):
             await task
 
         # Finally block cleanup.
-        self.assertNotIn(obj.rid, mgr.rid_to_state)
+        assert (obj.rid) not in (mgr.rid_to_state)
         aborts = mgr.engine_core_client.send_to_scheduler.aborts
-        self.assertEqual(
-            len(aborts),
-            1,
-            f"expected exactly one AbortReq on cancel, got {len(aborts)}",
-        )
+        _pytest_first_1 = len(aborts)
+        _pytest_second_2 = 1
+        _pytest_msg_3 = f"expected exactly one AbortReq on cancel, got {len(aborts)}"
+        assert _pytest_first_1 == _pytest_second_2, _pytest_msg_3
         # The AbortReq should carry the right rid.
-        self.assertEqual(getattr(aborts[0], "rid", None), obj.rid)
+        assert (getattr(aborts[0], "rid", None)) == (obj.rid)
 
+    @pytest.mark.asyncio(loop_scope="function")
     async def test_normal_finish_does_not_fire_abort(self) -> None:
         """When the generator exits on ``state.finished`` (scheduler's
         terminal frame), no ``AbortReq`` should fire — the scheduler
@@ -156,21 +158,20 @@ class TestWaitOneResponseCancellation(unittest.IsolatedAsyncioTestCase):
                 "meta_info": {"id": obj.rid, "finish_reason": None},
             },
             stream=True,
+            cumulative=False,
         )
         state.event.set()
 
         results = await task
 
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["text"], "hello")
-        self.assertNotIn(obj.rid, mgr.rid_to_state)
+        assert (len(results)) == (1)
+        assert (results[0]["text"]) == ("hello")
+        assert (obj.rid) not in (mgr.rid_to_state)
         # Normal finish ⇒ no abort.
-        self.assertEqual(
-            len(mgr.engine_core_client.send_to_scheduler.aborts),
-            0,
-            "normal finish should not schedule an AbortReq",
-        )
+        assert (len(mgr.engine_core_client.send_to_scheduler.aborts)) == (
+            0
+        ), "normal finish should not schedule an AbortReq"
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    raise SystemExit(pytest.main([__file__, "-v", *sys.argv[1:]]))

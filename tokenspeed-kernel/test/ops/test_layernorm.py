@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.gemm.fp8_utils import static_quant_fp8
+from tokenspeed_kernel.numerics.torch.layernorm import (
+    torch_fused_qk_rmsnorm_rope,
+    torch_qk_rmsnorm,
+    torch_rmsnorm,
+    torch_weightless_rmsnorm,
+)
 from tokenspeed_kernel.ops.layernorm import add_rmsnorm, grouped_rmsnorm
 from tokenspeed_kernel.ops.layernorm.triton import (
     _add_rmsnorm_kernel,
     _rmsnorm_kernel,
+    fused_qk_rmsnorm_rope,
     qk_rmsnorm,
     rmsnorm,
 )
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from utils import assert_no_triton_compile
 
@@ -32,9 +39,7 @@ def test_rmsnorm(dtype: torch.dtype, hidden_size: int, device: str) -> None:
 
     out = rmsnorm(x, weight, eps)
 
-    x_float = x.to(torch.float32)
-    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-    ref = (x_float * torch.rsqrt(variance + eps) * weight).to(dtype)
+    ref = torch_rmsnorm(x, weight, eps)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
@@ -51,10 +56,7 @@ def test_rmsnorm_with_residual(
 
     out, residual_out = rmsnorm(x, weight, eps, residual=residual)
 
-    x_float = x.to(torch.float32) + residual.to(torch.float32)
-    ref_residual = x_float.to(dtype)
-    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-    ref = (x_float * torch.rsqrt(variance + eps) * weight).to(dtype)
+    ref, ref_residual = torch_rmsnorm(x, weight, eps, residual)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(residual_out, ref_residual, atol=2e-2, rtol=2e-2)
 
@@ -152,12 +154,9 @@ def test_grouped_rmsnorm_matches_per_head_reference(
 
     actual = grouped_rmsnorm(x, shape[-1], eps, out=x)
 
-    reference_float = reference_input.float()
-    reference = reference_float * torch.rsqrt(
-        reference_float.square().mean(-1, keepdim=True) + eps
-    )
+    reference = torch_weightless_rmsnorm(reference_input, eps, dtype)
     assert actual is x
-    torch.testing.assert_close(actual, reference.to(dtype), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual, reference, atol=2e-2, rtol=2e-2)
 
 
 def test_grouped_rmsnorm_cuda_graph_replays(device: str) -> None:
@@ -175,20 +174,8 @@ def test_grouped_rmsnorm_cuda_graph_replays(device: str) -> None:
     reference_input = x.clone()
     graph.replay()
     torch.cuda.synchronize()
-    reference_float = reference_input.float()
-    reference = reference_float * torch.rsqrt(
-        reference_float.square().mean(-1, keepdim=True) + eps
-    )
-    torch.testing.assert_close(x, reference.to(x.dtype), atol=2e-2, rtol=2e-2)
-
-
-def _gemma_ref(
-    x: torch.Tensor, w: torch.Tensor, head_dim: int, eps: float, dtype: torch.dtype
-) -> torch.Tensor:
-    x_by_head = x.reshape(-1, head_dim).to(torch.float32)
-    variance = x_by_head.pow(2).mean(dim=-1, keepdim=True)
-    out = x_by_head * torch.rsqrt(variance + eps) * (1.0 + w)
-    return out.to(dtype).view(x.shape)
+    reference = torch_weightless_rmsnorm(reference_input, eps, x.dtype)
+    torch.testing.assert_close(x, reference, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -214,12 +201,9 @@ def test_qk_rmsnorm_gemma_weight_matches_two_calls(
 
     q_out, k_out = qk_rmsnorm(q, k, q_weight, k_weight, eps, weight_offset=1.0)
 
-    torch.testing.assert_close(
-        q_out, _gemma_ref(q, q_weight, head_dim, eps, dtype), atol=2e-2, rtol=2e-2
-    )
-    torch.testing.assert_close(
-        k_out, _gemma_ref(k, k_weight, head_dim, eps, dtype), atol=2e-2, rtol=2e-2
-    )
+    q_ref, k_ref = torch_qk_rmsnorm(q, k, q_weight, k_weight, eps, 1.0)
+    torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(k_out, k_ref, atol=2e-2, rtol=2e-2)
 
 
 def test_qk_rmsnorm_gemma_weight_strided_qkv_split(device: str) -> None:
@@ -247,11 +231,21 @@ def test_qk_rmsnorm_gemma_weight_strided_qkv_split(device: str) -> None:
 
     q_out, k_out = qk_rmsnorm(q, k, q_weight, k_weight, eps, weight_offset=1.0)
 
+    q_ref, k_ref = torch_qk_rmsnorm(q, k, q_weight, k_weight, eps, 1.0)
+    torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(k_out, k_ref, atol=2e-2, rtol=2e-2)
+
+
+def test_rmsnorm_reads_strided_rows_in_place(device: str) -> None:
+    # A column slice of a fused projection, as V4.1 attention norms its
+    # q/kv parts, must match the contiguous copy bit for bit.
+    fused = torch.randn(9, 1792, device=device, dtype=torch.bfloat16)
+    part = fused[:, 1280:]
+    weight = torch.randn(512, device=device, dtype=torch.float32)
+    out = rmsnorm(part, weight, 1e-6)
+    assert out.is_contiguous()
     torch.testing.assert_close(
-        q_out, _gemma_ref(q, q_weight, head_dim, eps, dtype), atol=2e-2, rtol=2e-2
-    )
-    torch.testing.assert_close(
-        k_out, _gemma_ref(k, k_weight, head_dim, eps, dtype), atol=2e-2, rtol=2e-2
+        out, rmsnorm(part.contiguous(), weight, 1e-6), rtol=0, atol=0
     )
 
 
@@ -265,11 +259,65 @@ def test_rmsnorm_inplace(device: str) -> None:
 
     out = rmsnorm(x, weight, eps, out=x)
 
-    x_float = x_ref.to(torch.float32)
-    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-    ref = (x_float * torch.rsqrt(variance + eps) * weight).to(torch.bfloat16)
+    ref = torch_rmsnorm(x_ref, weight, eps)
     assert out.data_ptr() == x.data_ptr()
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# fused_qk_rmsnorm_rope -- Beam's sliding-window layers
+# ---------------------------------------------------------------------------
+
+
+def _rope_inputs(tokens: int, q_heads: int, kv_heads: int, device: str) -> tuple:
+    """``qkv.split`` views, BF16 weights, an FP32 ``[cos | sin]`` table and int32
+    positions."""
+    head_dim, max_pos = 128, 4096
+    q_size, kv_size = q_heads * head_dim, kv_heads * head_dim
+    qkv = torch.randn(tokens, q_size + 2 * kv_size, device=device, dtype=torch.bfloat16)
+    q, k, _ = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    weights = [
+        (1 + 0.1 * torch.randn(head_dim, device=device)).to(torch.bfloat16)
+        for _ in range(2)
+    ]
+    half = head_dim // 2
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, half, dtype=torch.float32) / half))
+    freqs = torch.outer(torch.arange(max_pos, dtype=torch.float32), inv_freq)
+    cache = torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(device)
+    positions = torch.randint(0, max_pos, (tokens,), device=device, dtype=torch.int32)
+    return q, k, *weights, cache, positions
+
+
+def _rope(q, k, q_weight, k_weight, cache, positions):
+    head_dim = q_weight.shape[0]
+    heads = (q.shape[-1] // head_dim, k.shape[-1] // head_dim, head_dim)
+    return fused_qk_rmsnorm_rope(
+        q, k, q_weight, k_weight, cache, positions, 1e-6, *heads
+    )
+
+
+@pytest.mark.parametrize("q_heads,kv_heads", [(48, 8), (6, 1)])
+def test_fused_qk_rmsnorm_rope_matches_the_statements(
+    q_heads: int, kv_heads: int, device: str
+) -> None:
+    """Beam's per-rank head pairs on ``qkv.split`` views: within one BF16 rounding of
+    the statements (the squares are reduced in another order), and bit for bit
+    itself on contiguous copies."""
+    q, k, q_weight, k_weight, cache, positions = _rope_inputs(
+        13, q_heads, kv_heads, device
+    )
+    fused = _rope(q, k, q_weight, k_weight, cache, positions)
+    head_dim = q_weight.shape[0]
+    reference = torch_fused_qk_rmsnorm_rope(
+        q, k, q_weight, k_weight, cache, positions, 1e-6, q_heads, kv_heads, head_dim
+    )
+    for got, want in zip(fused, reference, strict=True):
+        torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2)
+    contiguous = _rope(
+        q.contiguous(), k.contiguous(), q_weight, k_weight, cache, positions
+    )
+    for got, want in zip(fused, contiguous, strict=True):
+        assert torch.equal(got, want)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -291,9 +339,7 @@ def test_reference_rmsnorm_matches_eager_cast_order(
     x[0] *= 1e-3
     x[1] *= 1e3
     weight = (torch.rand(hidden_size, device=device) + 0.5).to(torch.bfloat16)
-    values = x.float()
-    values = values * torch.rsqrt(values.square().mean(-1, keepdim=True) + eps)
-    expected = (weight.float() * values).to(dtype)
+    expected = torch_rmsnorm(x, weight, eps)
     out = reference_rmsnorm(x, weight, eps, None)
     if dtype == torch.float32:
         torch.testing.assert_close(out, expected, rtol=2e-6, atol=0)
@@ -324,12 +370,13 @@ def test_reference_rmsnorm_matches_eager_cast_order(
         reference_rmsnorm(x, weight[:-1], eps, None)
 
 
-@pytest.mark.parametrize("hidden_size", [128, 4096])
+@pytest.mark.parametrize("hidden_size", [128, 2560, 4096, 5120])
 @pytest.mark.parametrize("with_x2", [False, True])
 @pytest.mark.parametrize("with_fp8", [False, True])
 @pytest.mark.parametrize("pdl", [False, True])
+@pytest.mark.parametrize("gemma", [False, True])
 def test_add_rmsnorm_matches_unfused_reference(
-    hidden_size: int, with_x2: bool, with_fp8: bool, pdl: bool, device: str
+    hidden_size: int, with_x2: bool, with_fp8: bool, pdl: bool, gemma: bool, device: str
 ) -> None:
     if with_fp8 and not platform.is_nvidia:
         pytest.skip("requires float8_e4m3fn CUDA")
@@ -346,9 +393,8 @@ def test_add_rmsnorm_matches_unfused_reference(
     scale = torch.tensor([4.0 / 448.0], device=device)
     # The two addends meet in BF16, as an all-reduce input would.
     total = (x + x2 if with_x2 else x).float() + residual.float()
-    ref = (
-        total * torch.rsqrt(total.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
-    )
+    scale_by = 1.0 + weight.float() if gemma else weight.float()
+    ref = total * torch.rsqrt(total.pow(2).mean(-1, keepdim=True) + eps) * scale_by
 
     out = torch.empty_like(x)
     out_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn) if with_fp8 else None
@@ -362,6 +408,9 @@ def test_add_rmsnorm_matches_unfused_reference(
             out=out,
             out_fp8=out_fp8,
             fp8_scale=scale if with_fp8 else None,
+            out_fp4=None,
+            fp4_scale=None,
+            gemma=gemma,
         )
         torch.cuda.synchronize()
     finally:
@@ -369,9 +418,41 @@ def test_add_rmsnorm_matches_unfused_reference(
 
     assert torch.equal(residual, total.to(torch.bfloat16))
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+    # Another summation order may flip only the rare value next to a rounding boundary.
+    assert (out != ref.to(torch.bfloat16)).sum().item() <= out.numel() // 1000
     if with_fp8:
-        expected, _ = static_quant_fp8(out, scale)
+        expected, _ = quantize_fp8(out, scale=scale)
         assert torch.equal(out_fp8.view(torch.uint8), expected.view(torch.uint8))
+
+
+def test_add_rmsnorm_fp8_copy_of_nan_rows_matches_quantize_fp8(device: str) -> None:
+    if not platform.is_nvidia:
+        pytest.skip("requires float8_e4m3fn CUDA")
+    x = torch.randn(3, 4096, device=device, dtype=torch.bfloat16)
+    x[0] = float("nan")
+    x[1, 7] = float("inf")
+    residual = torch.zeros_like(x)
+    weight = torch.ones(4096, device=device, dtype=torch.bfloat16)
+    scale = torch.tensor([0.02], device=device)
+    out = torch.empty_like(x)
+    out_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+
+    add_rmsnorm(
+        x,
+        residual,
+        weight,
+        1e-6,
+        x2=None,
+        out=out,
+        out_fp8=out_fp8,
+        fp8_scale=scale,
+        out_fp4=None,
+        fp4_scale=None,
+        gemma=False,
+    )
+
+    expected, _ = quantize_fp8(out, scale=scale)
+    assert torch.equal(out_fp8.view(torch.uint8), expected.view(torch.uint8))
 
 
 def test_add_rmsnorm_writes_in_place_from_strided_rows(device: str) -> None:
@@ -386,7 +467,19 @@ def test_add_rmsnorm_writes_in_place_from_strided_rows(device: str) -> None:
     )
     untouched = wide[:, 256:].clone()
 
-    add_rmsnorm(x, residual, weight, eps, x2=None, out=x, out_fp8=None, fp8_scale=None)
+    add_rmsnorm(
+        x,
+        residual,
+        weight,
+        eps,
+        x2=None,
+        out=x,
+        out_fp8=None,
+        fp8_scale=None,
+        out_fp4=None,
+        fp4_scale=None,
+        gemma=False,
+    )
 
     torch.testing.assert_close(x.float(), ref, atol=2e-2, rtol=2e-2)
     assert torch.equal(wide[:, 256:], untouched)
@@ -406,6 +499,9 @@ def test_add_rmsnorm_compiles_once_across_batch_sizes(device: str) -> None:
             out=torch.empty_like(x[:rows]),
             out_fp8=None,
             fp8_scale=None,
+            out_fp4=None,
+            fp4_scale=None,
+            gemma=False,
         )
 
     run(3)
@@ -427,6 +523,9 @@ def test_add_rmsnorm_contract(device: str) -> None:
         out=empty,
         out_fp8=None,
         fp8_scale=None,
+        out_fp4=None,
+        fp4_scale=None,
+        gemma=False,
     )
     with pytest.raises(ValueError, match="together"):
         add_rmsnorm(
@@ -438,6 +537,9 @@ def test_add_rmsnorm_contract(device: str) -> None:
             out=x,
             out_fp8=torch.empty_like(x, dtype=torch.float8_e4m3fn),
             fp8_scale=None,
+            out_fp4=None,
+            fp4_scale=None,
+            gemma=False,
         )
     with pytest.raises(ValueError, match="dense columns"):
         add_rmsnorm(
@@ -449,4 +551,7 @@ def test_add_rmsnorm_contract(device: str) -> None:
             out=x.t(),
             out_fp8=None,
             fp8_scale=None,
+            out_fp4=None,
+            fp4_scale=None,
+            gemma=False,
         )
