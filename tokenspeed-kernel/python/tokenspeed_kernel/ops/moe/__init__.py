@@ -27,7 +27,6 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import torch
-from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -931,8 +930,8 @@ def moe_topk(
     """Produce expert weights and ids using a registered MoE TopK kernel.
 
     Sqrt-softplus routing may pass `hidden_states` and `gate_weight` instead of
-    `router_logits`. A fused router GEMM and top-k kernel is selected when one
-    serves the inputs; otherwise the FP32 logits are computed first.
+    `router_logits`. A fused router GEMM and top-k kernel is then selected, and
+    NoKernelFoundError is raised when none serves the inputs.
 
     Correction bias affects selection only; returned weights are gathered from
     the unbiased scores. Hash routing uses the checkpoint table for expert ids.
@@ -1075,41 +1074,32 @@ def moe_topk(
     routing_kind = _routing_kind(correction_bias, hash_indices_table)
     per_token_bias = correction_bias is not None and correction_bias.ndim == 2
     if fused:
-        if not per_token_bias and solution in {None, "gluon"} and tokens > 0:
-            try:
-                kernel, fused_traits = _router_topk_kernel(
-                    hidden_states, gate_weight, top_k, routing_kind, override, solution
-                )
-            except NoKernelFoundError:
-                kernel = None
-            if kernel is not None:
-                ShapeCapture.get().record(
-                    "moe", "router_topk", kernel.name, hidden_states.dtype, fused_traits
-                )
-                with kernel_scope(
-                    "moe",
-                    "router_topk",
-                    hidden_states.dtype,
-                    kernel_name=kernel.name,
-                    **fused_traits,
-                ):
-                    topk_weights, topk_ids = kernel(
-                        hidden_states,
-                        gate_weight,
-                        top_k,
-                        renormalize,
-                        correction_bias,
-                        hash_indices_table,
-                        input_ids,
-                        scaling_factor,
-                    )
-                    return topk_weights.to(topk_weights_dtype), topk_ids.to(
-                        topk_indices_dtype
-                    )
-        if tokens == 0:
-            router_logits = hidden_states.new_empty((0, experts), dtype=torch.float32)
-        else:
-            router_logits = dsv4_linear_fp32(hidden_states, gate_weight)
+        if per_token_bias:
+            raise ValueError("fused router top-k does not accept per-token bias")
+        kernel, fused_traits = _router_topk_kernel(
+            hidden_states, gate_weight, top_k, routing_kind, override, solution
+        )
+        ShapeCapture.get().record(
+            "moe", "router_topk", kernel.name, hidden_states.dtype, fused_traits
+        )
+        with kernel_scope(
+            "moe",
+            "router_topk",
+            hidden_states.dtype,
+            kernel_name=kernel.name,
+            **fused_traits,
+        ):
+            topk_weights, topk_ids = kernel(
+                hidden_states,
+                gate_weight,
+                top_k,
+                renormalize,
+                correction_bias,
+                hash_indices_table,
+                input_ids,
+                scaling_factor,
+            )
+            return topk_weights.to(topk_weights_dtype), topk_ids.to(topk_indices_dtype)
     traits = {
         "tokens": int(tokens),
         "experts": experts,

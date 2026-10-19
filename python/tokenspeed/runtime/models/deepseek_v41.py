@@ -98,6 +98,7 @@ from tokenspeed_kernel.ops.quantization import (
 )
 from tokenspeed_kernel.ops.residual import mhc_apply_pre_quantize_fp8
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.selection import NoKernelFoundError
 from torch import nn
 
 from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
@@ -1311,19 +1312,23 @@ class DeepseekV41MoE(DeepseekV4MoE):
             and self.experts.supports_precomputed_topk
         ):
             # moe_topk fuses the router GEMM when a kernel supports it.
-            topk_weights, topk_ids = moe_topk(
-                None,
-                config.top_k,
-                "sqrt_softplus",
-                "topk",
-                config.renormalize,
-                config.routed_scaling_factor,
-                correction_bias=gate.e_score_correction_bias,
-                topk_weights_dtype=self.topk.weights_dtype,
-                hidden_states=hidden_states,
-                gate_weight=gate.weight,
-            )
-            return StandardTopKOutput(topk_weights, topk_ids, None)
+            try:
+                topk_weights, topk_ids = moe_topk(
+                    None,
+                    config.top_k,
+                    "sqrt_softplus",
+                    "topk",
+                    config.renormalize,
+                    config.routed_scaling_factor,
+                    correction_bias=gate.e_score_correction_bias,
+                    topk_weights_dtype=self.topk.weights_dtype,
+                    hidden_states=hidden_states,
+                    gate_weight=gate.weight,
+                )
+            except NoKernelFoundError:
+                pass
+            else:
+                return StandardTopKOutput(topk_weights, topk_ids, None)
         return super()._compute_topk_output(hidden_states, image_mask)
 
 
