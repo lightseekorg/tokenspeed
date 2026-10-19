@@ -180,6 +180,11 @@ class RadioVisionConfig(PretrainedConfig):
         return self.args["max_num_patches"]
 
     @property
+    def image_patch_floor(self) -> int:
+        """The dynamic-resolution planner's per-image patch minimum."""
+        return self.args["min_num_patches"]
+
+    @property
     def final_norm(self) -> bool:
         # A transformers-format config has no ``model_norm``: its ViT ends without a norm.
         return self.args.get("model_norm", False)
