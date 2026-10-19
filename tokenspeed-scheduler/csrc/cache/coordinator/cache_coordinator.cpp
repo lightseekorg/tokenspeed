@@ -341,8 +341,8 @@ const BlockPool& CacheCoordinator::tierPool() const {
 // per_group blocks are relative to the floor, num_common_tokens is the
 // absolute converged page boundary in TOKENS. num_prefix_pages bounds the walk
 // in prefix pages; each group key vector is expanded to that group's
-// block_granularity. State groups take no part here: their boundaries are
-// candidates of probeTier's candidate phase.
+// block_granularity. State groups take no part in this phase; probeTier
+// checks State and sliding-window requirements at each candidate boundary.
 template <CacheTier Tier>
 CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTierWithKeys(
     std::span<const std::vector<CacheKey>> group_keys, std::span<const std::size_t> match_order,
@@ -673,6 +673,48 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPref
     return out;
 }
 
+// L3 fetch coverage is not an admissible boundary: carry available checkpoints
+// and their windows, then let the ordinary Host candidate phase judge what lands.
+CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeStorageForPrefetch(
+    std::span<const std::vector<CacheKey>> group_keys, std::span<const std::size_t> match_order,
+    std::int32_t num_prefix_pages, std::int32_t floor_tokens) const {
+    PrefixProbe::Tier out = probeTierWithKeys<CacheTier::kHost>(group_keys, match_order, num_prefix_pages, floor_tokens,
+                                                                /*with_storage_keys=*/true);
+    const BlockPool& pool = tierPool<CacheTier::kHost>();
+    const auto first_page = static_cast<std::size_t>(floor_tokens / prefix_granularity_);
+    const auto end_page = static_cast<std::size_t>(out.num_common_tokens / prefix_granularity_);
+    for (const std::size_t i : match_order) {
+        if (!GroupIsState(i)) {
+            continue;
+        }
+        auto& hits = out.per_group[i].hits;
+        hits.assign(end_page - first_page, 0);
+        // Sparse checkpoints must travel with KV without truncating it at a missing checkpoint.
+        for (std::size_t page = first_page; page < end_page; ++page) {
+            const CacheKey& key = group_keys[i][page];
+            hits[page - first_page] = groups_[i].Index().Contains(pool, key) || storage_keys_.contains(key);
+            if (hits[page - first_page] == 0) {
+                continue;
+            }
+            // An older checkpoint needs its own window, even when KV extends beyond it.
+            for (const std::size_t j : match_order) {
+                if (GroupIsState(j) || groups_[j].Matcher().IsPrefixClosed()) {
+                    continue;
+                }
+                const std::int32_t floor_blocks = floor_tokens / geometry_[j].BlockGranularity();
+                const BlockRange window = SlidingWindowBlocks(
+                    static_cast<std::int32_t>(j), static_cast<std::int32_t>(page + 1) * prefix_granularity_);
+                for (std::int32_t block = std::max(window.first, floor_blocks); block < window.past_end; ++block) {
+                    const CacheKey& window_key = group_keys[j][static_cast<std::size_t>(block)];
+                    out.per_group[j].hits[static_cast<std::size_t>(block - floor_blocks)] =
+                        PrefixKeyIsHit(groups_[j].Index(), pool, window_key, &storage_keys_);
+                }
+            }
+        }
+    }
+    return out;
+}
+
 CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const PromptPrefix& prompt,
                                                                      std::span<const std::size_t> match_order,
                                                                      bool claim_partial) const {
@@ -709,10 +751,10 @@ CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const Promp
         out.host.kv_tokens = out.device.kv_tokens;
     }
     if (enable_l3_storage_) {
-        out.storage = probeTierWithKeys<CacheTier::kHost>(
+        out.storage = probeStorageForPrefetch(
             out.group_keys, match_order,
             std::min(static_cast<std::int32_t>(prompt.prefix_hashes.size()), prompt.max_tokens / prefix_granularity_),
-            /*floor_tokens=*/out.host.full_page_tokens, /*with_storage_keys=*/true);
+            /*floor_tokens=*/out.host.full_page_tokens);
     }
     return out;
 }
@@ -1826,7 +1868,7 @@ void CacheCoordinator::rememberStorageKey(const CacheKey& key) {
 }
 
 void CacheCoordinator::evictStorageKeysToLimit() {
-    compactStorageKeyOrder();
+    // Bulk removals compact the order themselves; a Host publication only appends.
     while (storage_keys_.size() > storage_key_limit_) {
         if (storage_key_order_.empty()) {
             break;
