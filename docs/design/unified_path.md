@@ -110,6 +110,18 @@ verify still needs one causal length and page-table row per candidate. Its
 Indexer and attention receive matching per-query batch axes, even without a
 collective; ordinary single-rank prefill retains its request-span layout.
 
+### Ascend vocabulary-parallel greedy selection
+
+Greedy selection keeps each row's logit ordering and token-id tie break in
+one INT64 key. The HCCL backend handles INT64 MAX payloads up to
+4 KiB with AllGather over an INT32 bit view followed by an exact local MAX.
+This preserves every key bit while allowing AIV communication, whose
+AllReduce does not support INT64. Larger payloads and other reductions retain
+their ordinary HCCL implementation. Eager and graph capture use the same
+collective path and return the original in-place output buffer.
+Ranks choose the collective from the shared dtype, operation and element
+count; local layout differences only require packing and copying back.
+
 ### Rebinding a cache pool
 
 Prefill autotune and graph capture use distinct writable pages per fabricated
