@@ -28,7 +28,7 @@ if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32  # noqa: E402
-from tokenspeed_kernel.ops.moe import moe_router_topk, moe_topk  # noqa: E402
+from tokenspeed_kernel.ops.moe import moe_topk  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.router_gemv import (  # noqa: E402
     launch_gluon_router_gemv_splitk_gfx950,
 )
@@ -73,17 +73,20 @@ def _inputs(tokens, experts, routing_kind):
 @pytest.mark.parametrize("routing_kind", ["plain", "bias", "hash"])
 @pytest.mark.parametrize("experts", [256, 384])
 @pytest.mark.parametrize("tokens", [1, 15, 16, 17, 128])
-def test_router_topk_matches_gemm_then_topk(tokens, experts, routing_kind):
+def test_fused_router_topk_matches_gemm_then_topk(tokens, experts, routing_kind):
     x, weight, bias, hash_table, input_ids = _inputs(tokens, experts, routing_kind)
-    weights, ids = moe_router_topk(
-        x,
-        weight,
+    weights, ids = moe_topk(
+        None,
         TOP_K,
+        "sqrt_softplus",
+        "hash" if routing_kind == "hash" else "topk",
         True,
         1.5,
         correction_bias=bias,
         hash_indices_table=hash_table,
         input_ids=input_ids,
+        hidden_states=x,
+        gate_weight=weight,
         solution="gluon",
     )
     logits = dsv4_linear_fp32(x, weight)

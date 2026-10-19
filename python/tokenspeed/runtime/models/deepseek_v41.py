@@ -90,7 +90,7 @@ from tokenspeed_kernel.ops.gemm import (
     mm,
     prepare_mxfp8_weight_scales,
 )
-from tokenspeed_kernel.ops.moe import moe_router_topk, moe_router_topk_supported
+from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     rmsnorm_quantize_fp8_group32,
@@ -1309,23 +1309,19 @@ class DeepseekV41MoE(DeepseekV4MoE):
             and gate.tid2eid is None
             and not self.topk.simulate_routing
             and self.experts.supports_precomputed_topk
-            and moe_router_topk_supported(
-                hidden_states, gate.weight, config.top_k, gate.e_score_correction_bias
-            )
         ):
-            # The router GEMM and top-k selection run without FP32 logits.
-            topk_weights, topk_ids = moe_router_topk(
-                hidden_states,
-                gate.weight,
+            # moe_topk fuses the router GEMM when a kernel supports it.
+            topk_weights, topk_ids = moe_topk(
+                None,
                 config.top_k,
+                "sqrt_softplus",
+                "topk",
                 config.renormalize,
-                (
-                    1.0
-                    if config.routed_scaling_factor is None
-                    else config.routed_scaling_factor
-                ),
+                config.routed_scaling_factor,
                 correction_bias=gate.e_score_correction_bias,
                 topk_weights_dtype=self.topk.weights_dtype,
+                hidden_states=hidden_states,
+                gate_weight=gate.weight,
             )
             return StandardTopKOutput(topk_weights, topk_ids, None)
         return super()._compute_topk_output(hidden_states, image_mask)
