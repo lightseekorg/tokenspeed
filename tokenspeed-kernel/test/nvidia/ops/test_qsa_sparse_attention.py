@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import gc
-import inspect
 import weakref
 from dataclasses import replace
 from functools import partial
@@ -668,17 +667,40 @@ def test_prims_qsa_captures_many_layers_and_releases_cache_storage(device):
     assert cache_ref() is None
 
 
-def test_qsa_sparse_attention_requires_dispatch_arguments() -> None:
-    parameters = inspect.signature(qsa_sparse_attention).parameters
-    for name in (
+@pytest.mark.parametrize(
+    "missing_argument",
+    [
         "max_seqlen_q",
         "metadata_capacity_rows",
         "k_scale",
         "v_scale",
         "override",
         "solution",
-    ):
-        assert parameters[name].default is inspect.Parameter.empty
+        "sparse_metadata",
+    ],
+)
+def test_qsa_sparse_attention_requires_dispatch_arguments(
+    missing_argument: str,
+) -> None:
+    q = torch.empty((0, 6, 256), dtype=torch.bfloat16)
+    cache = torch.zeros((2, 1, 256), dtype=q.dtype)
+    slots = torch.empty((0, 2051), dtype=torch.int32)
+    kwargs = dict(
+        scale=1 / 16,
+        max_seqlen_q=None,
+        metadata_capacity_rows=None,
+        k_scale=None,
+        v_scale=None,
+        override=None,
+        solution=None,
+        sparse_metadata=None,
+    )
+    output = qsa_sparse_attention(q, cache, cache, slots, **kwargs)
+    torch.testing.assert_close(output, q)
+
+    del kwargs[missing_argument]
+    with pytest.raises(TypeError, match=missing_argument):
+        qsa_sparse_attention(q, cache, cache, slots, **kwargs)
 
 
 def test_qsa_sparse_attention_selects_fa2_fallback(
