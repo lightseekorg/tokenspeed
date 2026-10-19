@@ -32,6 +32,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
+    PauseSchedulerReqInput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -95,7 +96,7 @@ def _controller(
         enabled=True,
         reset_caches_fn=reset_caches_fn,
         transfers_idle_fn=transfers_idle_fn,
-        weights_release_refusal_fn=lambda: None,
+        release_refusal_fn=lambda: None,
         weights_busy_fn=lambda: False,
     )
 
@@ -243,7 +244,7 @@ def test_regions_must_name_known_tags():
             enabled=True,
             reset_caches_fn=lambda: True,
             transfers_idle_fn=lambda: True,
-            weights_release_refusal_fn=lambda: None,
+            release_refusal_fn=lambda: None,
             weights_busy_fn=lambda: False,
         )
 
@@ -261,7 +262,7 @@ def test_an_engine_without_nccl_suspend_releases_the_rest_and_refuses_nccl():
         enabled=True,
         reset_caches_fn=lambda: True,
         transfers_idle_fn=lambda: True,
-        weights_release_refusal_fn=lambda: None,
+        release_refusal_fn=lambda: None,
         weights_busy_fn=lambda: False,
     )
 
@@ -282,3 +283,31 @@ def test_an_engine_without_nccl_suspend_releases_the_rest_and_refuses_nccl():
     # are back.
     controller.handle_resume(ResumeMemoryOccupationReqInput(tags=["weights"]))
     assert controller.refuse_weight_load() is None
+
+
+def test_pause_is_refused_until_every_released_region_is_resumed():
+    sender = _Sender()
+    pause = PauseController(sender)
+    controller = _controller(sender, pause, _Regions())
+    controller.handle_release(
+        ReleaseMemoryOccupationReqInput(tags=["kv_cache", "weights"])
+    )
+    pause.maybe_finish_drain(_Scheduler())
+    assert sender.items[-1].success
+
+    # A wait/abort pause would let forwards run before the memory is back, and
+    # the wake would undo a keep pause. The RL order wakes kv_cache last, so a
+    # partial wake must still refuse.
+    for resumed in (["weights"], None):
+        for mode in ("wait", "abort", "keep"):
+            pause.handle_pause(PauseSchedulerReqInput(mode=mode))
+            assert not sender.items[-1].success
+            assert "resume_memory_occupation" in sender.items[-1].message
+            assert pause.state == PauseState.PAUSED_ALL
+            assert not pause.is_drain_pending
+        controller.handle_resume(ResumeMemoryOccupationReqInput(tags=resumed))
+        assert sender.items[-1].success
+
+    pause.handle_pause(PauseSchedulerReqInput(mode="keep"))
+    assert sender.items[-1].success
+    assert pause.state == PauseState.PAUSED_ALL

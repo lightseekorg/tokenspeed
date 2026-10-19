@@ -383,7 +383,7 @@ def test_memory_release_is_refused_mid_rebalance_and_waits_for_chunks():
         enabled=True,
         reset_caches_fn=lambda: True,
         transfers_idle_fn=lambda: True,
-        weights_release_refusal_fn=rebalance_release_refusal(controller),
+        release_refusal_fn=rebalance_release_refusal(controller),
         weights_busy_fn=lambda: controller.is_applying,
     )
     # Not idle: refused outright, nothing drained.

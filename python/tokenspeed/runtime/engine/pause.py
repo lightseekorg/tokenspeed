@@ -61,6 +61,7 @@ from tokenspeed.runtime.engine.io_struct import (
     ResumeSchedulerReqOutput,
 )
 from tokenspeed.runtime.engine.memory_occupation import MemoryRegion
+from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,8 @@ class PauseController:
         self.state = PauseState.UNPAUSED
         # RequestSpecs withheld from the scheduler while paused; flushed on resume.
         self.buffered_specs: list = []
+        # A PD handshake must not finish before its scheduler request exists.
+        self.buffered_pd_bootstraps: dict[str, BootstrapInfo] = {}
         # Deferred post-drain action for abort/wait pause OR memory release; held
         # until the scheduler drains. Single-consumer: only one may be armed.
         self._pending_drain: _PendingDrain | None = None
@@ -241,6 +244,18 @@ class PauseController:
             self._send.send_pyobj(
                 PauseSchedulerReqOutput(
                     success=False, message=f"invalid pause mode: {req.mode!r}"
+                )
+            )
+            return
+
+        if self.released:
+            # A wait/abort pause would enable forwards again before the memory
+            # is restored, and the wake would silently undo a keep pause. The
+            # caller must wake via ``resume_memory_occupation`` first.
+            self._send.send_pyobj(
+                PauseSchedulerReqOutput(
+                    success=False,
+                    message="memory is unavailable; use resume_memory_occupation",
                 )
             )
             return
@@ -397,13 +412,25 @@ class PauseHooks:
                 state.set_finish_with_abort("Aborted by pause", notify_client=True)
 
         if not self._pause.admit_blocked and self._pause.buffered_specs:
-            specs = [
-                spec
-                for spec in self._pause.take_buffered_specs()
-                if self._reap_or_keep_buffered_spec(spec)
-            ]
+            specs = []
+            for spec in self._pause.take_buffered_specs():
+                bootstrap = self._pause.buffered_pd_bootstraps.pop(
+                    spec.request_id, None
+                )
+                if not self._reap_or_keep_buffered_spec(spec):
+                    continue
+                if bootstrap is not None:
+                    self._loop.kv_transfer.register(spec.request_id, bootstrap)
+                specs.append(spec)
             if specs:
                 loop._submit_scheduler_requests(specs)
+
+    def register_pd_admission(self, request_id: str, bootstrap: BootstrapInfo) -> None:
+        """Start the handshake only when this request can enter the scheduler."""
+        if self._pause.admit_blocked:
+            self._pause.buffered_pd_bootstraps[request_id] = bootstrap
+        else:
+            self._loop.kv_transfer.register(request_id, bootstrap)
 
     def _reap_or_keep_buffered_spec(self, spec) -> bool:
         """Resolve a buffered spec on resume; return True if it should be admitted.
@@ -481,6 +508,22 @@ class PauseHooks:
         time.sleep(_PAUSED_IDLE_SLEEP_S)
 
     # -- memory release/wake data plane (wired into MemoryOccupationController) -
+
+    def memory_release_refusal(self) -> str | None:
+        """Refuse a PD release whose buffered requests cannot make progress."""
+        if self._loop.kv_transfer is not None and self._pause.buffered_specs:
+            return (
+                "PD requests are buffered by a scheduler pause; resume_scheduler "
+                "and drain them before releasing memory"
+            )
+        return None
+
+    def weights_busy_for_release(self) -> bool:
+        """Queued weight ops keep their same-round gate ahead of the release."""
+        loop = self._loop
+        return loop.request_handler.has_pending_weight_ops or (
+            loop._eplb is not None and loop._eplb.is_applying
+        )
 
     def reset_caches_for_release(self) -> bool:
         """Invalidate the prefix/single-table cache before KV is discarded on release.

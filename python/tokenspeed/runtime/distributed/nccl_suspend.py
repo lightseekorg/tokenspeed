@@ -51,6 +51,8 @@ def nccl_suspend_supported() -> bool:
         dist.is_available()
         and dist.is_nccl_available()
         and torch.cuda.is_available()
+        and callable(getattr(dist.ProcessGroupNCCL, "suspend", None))
+        and callable(getattr(dist.ProcessGroupNCCL, "resume", None))
         and tuple(torch.cuda.nccl.version()) >= _MIN_NCCL_VERSION
     )
 

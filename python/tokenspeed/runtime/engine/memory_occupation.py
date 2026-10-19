@@ -113,7 +113,7 @@ class MemoryOccupationController:
         enabled: bool,
         reset_caches_fn: Callable[[], bool],
         transfers_idle_fn: Callable[[], bool],
-        weights_release_refusal_fn: Callable[[], str | None],
+        release_refusal_fn: Callable[[], str | None],
         weights_busy_fn: Callable[[], bool],
         kv_cache_release_allowed: bool = True,
     ) -> None:
@@ -131,12 +131,10 @@ class MemoryOccupationController:
         # still read or write it: the release waits until no request is
         # bootstrapping or holds pages pinned for a transfer.
         self._transfers_idle = transfers_idle_fn
-        # The online expert rebalance writes the weights from the control
-        # plane's gated ops: a release is refused while one is in progress
-        # (``weights_release_refusal_fn`` names why), and a drained release
-        # waits while chunk ops still write the weights (``weights_busy_fn``),
-        # which complete through the gate without further forwards.
-        self._weights_release_refusal = weights_release_refusal_fn
+        # Refuse releases that cannot drain (buffered PD requests or an active
+        # rebalance). Already queued weight ops must finish through the normal
+        # same-round gate before any region is released.
+        self._release_refusal = release_refusal_fn
         self._weights_busy = weights_busy_fn
         # Whether releasing the ``kv_cache`` region is safe in this engine. False
         # when prefix caching is on but the scheduler exposes no prefix-cache
@@ -203,7 +201,7 @@ class MemoryOccupationController:
         if self._pause.is_drain_pending:
             self._fail_release("a pause or release is already in progress")
             return
-        refusal = self._weights_release_refusal()
+        refusal = self._release_refusal()
         if refusal is not None:
             self._fail_release(f"cannot release memory: {refusal}")
             return

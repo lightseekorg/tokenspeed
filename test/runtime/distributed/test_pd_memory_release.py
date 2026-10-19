@@ -34,6 +34,9 @@ import sys
 import threading
 
 import pytest
+import torch
+
+from tokenspeed.runtime.distributed import nccl_suspend
 
 # CPU-only tests scheduled in runtime-1gpu because they import the full runtime.
 sys.path.insert(
@@ -57,6 +60,30 @@ from tokenspeed.runtime.pd.mooncake.prefill import (  # noqa: E402
 )
 
 _REGIONS = ((0x1000, 4096), (0x9000, 1024))
+
+
+@pytest.mark.parametrize(
+    "version, bindings, supported",
+    [
+        ((2, 29, 6), ("suspend", "resume"), False),
+        ((2, 29, 7), (), False),
+        ((2, 30, 4), ("suspend",), False),
+        ((2, 30, 4), ("resume",), False),
+        ((2, 29, 7), ("suspend", "resume"), True),
+    ],
+)
+def test_nccl_region_requires_both_bindings_and_a_supported_version(
+    monkeypatch, version, bindings, supported
+):
+    # Stand in for a torch build's bindings and CUDA runtime, without GPUs.
+    backend = type("NcclBackend", (), {name: lambda self: None for name in bindings})
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_nccl_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "ProcessGroupNCCL", backend)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda.nccl, "version", lambda: version)
+
+    assert nccl_suspend.nccl_suspend_supported() is supported
 
 
 class _Engine:

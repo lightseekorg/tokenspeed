@@ -472,6 +472,11 @@ class RequestHandler:
     # Internal control ops (online expert rebalance)
     # ------------------------------------------------------------------
 
+    @property
+    def has_pending_weight_ops(self) -> bool:
+        """Whether a queued frontend/internal op can still touch model memory."""
+        return bool(self._pending_weight_ops or self._pending_internal_ops)
+
     def set_internal_op_completer(self, completer: InternalOpCompleter) -> None:
         """Install the owner of the internal ops (once, at startup)."""
         if self._internal_op_completer is not None:

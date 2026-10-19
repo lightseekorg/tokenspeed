@@ -41,12 +41,22 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.engine.event_loop import EventLoop  # noqa: E402
-from tokenspeed.runtime.engine.io_struct import NullSender  # noqa: E402
+from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
+    NullSender,
+    PauseSchedulerReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeSchedulerReqInput,
+)
+from tokenspeed.runtime.engine.memory_occupation import (  # noqa: E402
+    MemoryOccupationController,
+    MemoryRegion,
+)
 from tokenspeed.runtime.engine.pause import (  # noqa: E402
     PauseController,
     PauseHooks,
     PauseState,
 )
+from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo  # noqa: E402
 
 
 class _State:
@@ -229,6 +239,48 @@ def test_admission_gate_warns_when_pause_coalesced_with_requests(
     assert "TODO(pause-fifo)" in caplog.text
 
 
+class _Transfer:
+    def __init__(self) -> None:
+        self.registered: list[tuple[str, BootstrapInfo]] = []
+
+    def register(self, request_id: str, bootstrap: BootstrapInfo) -> None:
+        self.registered.append((request_id, bootstrap))
+
+
+@pytest.mark.parametrize("state", [PauseState.PAUSED_NEW, PauseState.PAUSED_ALL])
+def test_buffered_pd_handshake_starts_only_when_live_request_is_admitted(state):
+    hooks, loop = _hooks(
+        rid_to_state={"live": _State(), "aborted": _State(finished=True)}
+    )
+    transfer = _Transfer()
+    loop.kv_transfer = transfer
+    hooks._pause.state = state
+    specs = [_spec("live"), _spec("aborted"), _spec("gone")]
+    infos = [BootstrapInfo("127.0.0.1", 1234, i) for i in range(3)]
+    for spec, info in zip(specs, infos, strict=True):
+        hooks.register_pd_admission(spec.request_id, info)
+    assert hooks.withhold_admissions(specs, True)
+    hooks.apply_transitions(_GrammarManager())
+    assert transfer.registered == []
+
+    hooks._pause.handle_resume(ResumeSchedulerReqInput())
+    hooks.apply_transitions(_GrammarManager())
+    assert transfer.registered == [("live", infos[0])]
+    assert loop.scheduler.submitted == [[specs[0]]]
+    assert hooks._pause.buffered_pd_bootstraps == {}
+    hooks.apply_transitions(_GrammarManager())
+    assert transfer.registered == [("live", infos[0])]
+
+
+def test_unpaused_pd_handshake_starts_immediately():
+    hooks, loop = _hooks()
+    transfer = _Transfer()
+    loop.kv_transfer = transfer
+    info = BootstrapInfo("127.0.0.1", 1234, 42)
+    hooks.register_pd_admission("live", info)
+    assert transfer.registered == [("live", info)]
+
+
 # --- paused_idle_step ---------------------------------------------------------
 
 
@@ -369,6 +421,60 @@ def test_transfers_idle_needs_no_bootstrap_no_pinned_pages_and_an_idle_peer() ->
     # The request is gone, but its sender/receiver is still registered.
     peer.inflight = True
     assert not hooks.transfers_idle_for_release()
+
+
+@pytest.mark.parametrize("mode", ["wait", "keep"])
+@pytest.mark.parametrize("pd", [False, True])
+def test_release_with_buffered_specs_refuses_only_pd_without_changing_pause(mode, pd):
+    class Sender:
+        def __init__(self):
+            self.items = []
+
+        def send_pyobj(self, reply):
+            self.items.append(reply)
+
+    sender = Sender()
+    pause = PauseController(sender)
+    loop = _FakeLoop()
+    if pd:
+        loop.kv_transfer = _TransferPeer()
+        loop.kv_transfer.inflight = True
+    hooks = PauseHooks(loop, pause, None)
+    calls = []
+    memory = MemoryOccupationController(
+        send_func=sender,
+        pause_controller=pause,
+        regions={
+            "weights": MemoryRegion(
+                release=lambda: calls.append("release"), resume=lambda: None
+            )
+        },
+        enabled=True,
+        reset_caches_fn=lambda: True,
+        transfers_idle_fn=hooks.transfers_idle_for_release,
+        release_refusal_fn=hooks.memory_release_refusal,
+        weights_busy_fn=lambda: False,
+    )
+    pause.handle_pause(PauseSchedulerReqInput(mode=mode))
+    pause.maybe_finish_drain(loop.scheduler)
+    pause.buffer_specs([_spec("buffered")])
+    prior_state = pause.state
+
+    memory.handle_release(ReleaseMemoryOccupationReqInput(tags=["weights"]))
+
+    if pd:
+        assert not sender.items[-1].success
+        assert "buffered" in sender.items[-1].message
+        assert pause.state == prior_state and not pause.is_drain_pending
+        assert not memory.is_releasing_or_released and calls == []
+        # Follow the refusal's recovery instruction: resume, admit and drain
+        # the buffered request before asking for a release again.
+        pause.handle_resume(ResumeSchedulerReqInput())
+        assert len(pause.take_buffered_specs()) == 1
+        loop.kv_transfer.inflight = False
+        memory.handle_release(ReleaseMemoryOccupationReqInput(tags=["weights"]))
+    pause.maybe_finish_drain(loop.scheduler)
+    assert sender.items[-1].success and calls == ["release"]
 
 
 if __name__ == "__main__":

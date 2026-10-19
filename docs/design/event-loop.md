@@ -428,6 +428,12 @@ Those are not loop entry points — they fire on release/wake. A disaggregated
 engine refuses new requests while a release is draining or memory is
 released: their transfer registration would name memory the release unmaps
 (and a decode node re-registers it under a new transfer session on wake).
+Release also waits for both weight-op FIFOs to empty through their usual
+same-round gate. It refuses a paused PD engine with buffered requests, whose
+transfers cannot drain until those requests are admitted. Their handshake
+registration is deferred until resume admits them: polling a handshake before
+its scheduler request exists would lose its completion event and strand the
+request after resume. Aborted buffered requests never register a transfer.
 
 `EplbHooks` is the online expert rebalance (`--enable-eplb`). The
 controller counts the forwards this rank submitted — real or DP-idle, so the

@@ -529,6 +529,7 @@ class EventLoop:
             not self.server_args.enable_prefix_caching
             or callable(getattr(self.scheduler, "clear_l1_cache", None))
         )
+        rebalance_refusal = rebalance_release_refusal(self._eplb)
         self._memory = MemoryOccupationController(
             send_func=self.send_to_tokenizer,
             pause_controller=self._pause,
@@ -542,12 +543,11 @@ class EventLoop:
             reset_caches_fn=self._pause_hooks.reset_caches_for_release,
             transfers_idle_fn=self._pause_hooks.transfers_idle_for_release,
             kv_cache_release_allowed=kv_cache_release_allowed,
-            weights_release_refusal_fn=rebalance_release_refusal(self._eplb),
-            weights_busy_fn=(
-                (lambda: False)
-                if self._eplb is None
-                else (lambda: self._eplb.is_applying)
+            release_refusal_fn=(
+                lambda: self._pause_hooks.memory_release_refusal()
+                or rebalance_refusal()
             ),
+            weights_busy_fn=self._pause_hooks.weights_busy_for_release,
         )
 
         self.metrics = EngineMetrics(
@@ -908,7 +908,7 @@ class EventLoop:
             if self._epd_hooks.try_stage(spec, state, bootstrap):
                 continue
             if self.kv_transfer is not None:
-                self.kv_transfer.register(spec.request_id, bootstrap)
+                self._pause_hooks.register_pd_admission(spec.request_id, bootstrap)
             admitted_specs.append(spec)
 
         if self._pause_hooks.withhold_admissions(admitted_specs, pause_blocked_before):

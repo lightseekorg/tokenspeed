@@ -284,6 +284,11 @@ offload keeps its pinned Host history mapped across a release and zeroes it on
 resume. Other device memory (input buffers, communication workspaces such as
 symmetric memory or DeepEP buffers, the prefill CUDA graphs) stays resident.
 
+Queued weight operations finish before a release frees memory. If a PD engine
+is paused with buffered requests, release is refused: resume and drain those
+requests first. While any region is released, `pause_generation` is refused;
+wake with `resume_memory_occupation` first.
+
 With memory saver enabled, startup skips the disposable CUDA-graph memory
 probe and captures the serving graphs once. The installed memory saver cannot
 destroy a tagged probe pool and then capture again. Graph memory is therefore
