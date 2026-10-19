@@ -94,6 +94,7 @@ def test_newest_smg_nightly_comes_from_one_build_on_or_before_the_date():
         ],
         "tokenspeed-smg-grpc-servicer": [
             "0.13.0.post1",
+            "0.14.1.post20260930.dev0",
             "0.13.6.post20260929",
             "0.14.0.post20260930",
             "0.14.0.post20261003",
@@ -115,6 +116,7 @@ def test_newest_smg_nightly_comes_from_one_build_on_or_before_the_date():
         {**SMG_0930, "tokenspeed-smg": "1.13.0.post20261001"},
         {**SMG_0930, "tokenspeed-smg-grpc-proto": "0.4.27.post20260929"},
         {**SMG_0930, "tokenspeed-smg-grpc-servicer": "0.14.0"},
+        {name: v.replace("20260930", "20261001") for name, v in SMG_0930.items()},
     ],
 )
 def test_future_or_mixed_smg_nightly_does_not_change_metadata(project, smg):

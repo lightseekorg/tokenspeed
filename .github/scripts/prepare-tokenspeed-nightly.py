@@ -41,7 +41,12 @@ SMG_PACKAGES = (
 
 def nightly_date(version: Version) -> int | None:
     """The YYYYMMDD date of a dated nightly version, else None."""
-    if version.post is None or version.pre or version.dev or version.local:
+    if (
+        version.post is None
+        or version.pre is not None
+        or version.dev is not None
+        or version.local is not None
+    ):
         return None
     try:
         datetime.strptime(str(version.post), "%Y%m%d")

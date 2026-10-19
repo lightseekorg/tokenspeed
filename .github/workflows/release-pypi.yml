@@ -75,6 +75,11 @@ jobs:
           fi
           python -m pip install --upgrade "setuptools<82" wheel packaging
           version_date="${VERSION_DATE:-$(date -u +%Y%m%d)}"
+          # Run the prepare script from this workflow's commit, which matches the
+          # arguments passed to it below, even when the checkout later moves to the
+          # kernel nightly's source commit.
+          prepare_nightly="$RUNNER_TEMP/prepare-tokenspeed-nightly.py"
+          cp .github/scripts/prepare-tokenspeed-nightly.py "$prepare_nightly"
           kernel_version_here() {
             (
               cd tokenspeed-kernel/python
@@ -128,7 +133,7 @@ jobs:
               fi
             fi
           fi
-          version=$(python .github/scripts/prepare-tokenspeed-nightly.py \
+          version=$(python "$prepare_nightly" \
             . "$version_date" "$kernel_version" --smg-pypi-json https://pypi.org/pypi)
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "kernel_version=${kernel_version}" >> "$GITHUB_OUTPUT"
