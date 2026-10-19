@@ -1043,7 +1043,7 @@ class TestDSparkBaseLogits:
 
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("mode", ["prefill", "decode", "null"])
-def test_tp1_ep2_pd_draft_checkpoint_and_idle_schedule(monkeypatch, rank, mode):
+def test_tp1_ep2_draft_checkpoint_and_idle_schedule(monkeypatch, rank, mode):
     from test.runtime.test_deepseek_v41_model import _mock_loader_hardware
 
     from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
@@ -1087,14 +1087,23 @@ def test_tp1_ep2_pd_draft_checkpoint_and_idle_schedule(monkeypatch, rank, mode):
         input_buffers=InputBuffers(3, 1024, 8, device="cpu"),
         vocab_size=adapter.model.config.vocab_size,
     )
-    if mode == "null":
-        with pytest.raises(ValueError, match="requires PD disaggregation"):
-            DeepseekV41DSpark(**kwargs)
-        return
     drafter = DeepseekV41DSpark(**kwargs)
     # Idle and active ranks must perform the same number of block forwards.
-    expected = [] if mode == "prefill" else [[0, 15]]
-    assert drafter.idle_forward_global_num_tokens([0, 18], [0, 3]) == expected
+    assert drafter.idle_forward_global_num_tokens(
+        [0, 18], [0, 3], global_num_decodes=[0, 3]
+    ) == [[0, 15]]
+    assert drafter.idle_forward_global_num_tokens(
+        [128, 18], [1, 3], global_num_decodes=[0, 3]
+    ) == [[0, 15]]
+    assert drafter.idle_forward_global_num_tokens(
+        [140, 18], [3, 3], global_num_decodes=[2, 3]
+    ) == [[10, 15]]
+    assert (
+        drafter.idle_forward_global_num_tokens(
+            [128, 128], [1, 1], global_num_decodes=[0, 0]
+        )
+        == []
+    )
     assert (
         adapter.lm_head.weight.shape[0]
         == adapter.model.markov_projection.weight.shape[0]

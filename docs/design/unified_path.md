@@ -559,12 +559,13 @@ collective shapes its graph bakes would differ across ranks, and the stages
 size their collectives from their own rows, which the DP metadata gather
 does not carry. Eager TP1 attention/dense with fused EP may narrow: the
 fused dispatch exchanges the actual local row counts, while the original
-DP counts remain capacity bounds. V4.1 DSpark supports this layout on PD
-roles: prefill only writes context KV and performs no draft collectives;
-decode sizes its one draft forward at block width times each rank's batch.
-An idle decode rank participates in that same forward. Aggregated attention
-DP with V4.1 DSpark remains unsupported because mixed ranks need separate
-prefill and decode counts.
+DP counts remain capacity bounds. The CPU metadata gather also carries
+per-rank decode request counts. V4.1 DSpark sizes its one draft forward at
+block width times these counts, including in aggregated mixed batches.
+Prefill writes context KV; if another rank has decodes, prefill-only and
+idle ranks join its draft collectives with empty rows. A round with no
+decodes performs no draft forward. Decode graph warmup and capture use the
+same uniform padded decode counts as their target batches.
 
 ### Prefill requests without generated outputs
 

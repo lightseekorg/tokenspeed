@@ -1870,6 +1870,7 @@ class ModelExecutor:
                 forward_mode=graph_forward_mode,
                 global_num_tokens=dp_metadata.global_num_tokens,
                 global_bs=dp_metadata.global_batch_size,
+                global_num_decodes=dp_metadata.global_num_decodes,
                 all_decode_or_idle=dp_metadata.all_decode_or_idle,
             )
             sampling_info = SamplingBatchInfo(
@@ -1954,7 +1955,9 @@ class ModelExecutor:
                         )
                     )
                 step_global_num_tokens = self.drafter.idle_forward_global_num_tokens(
-                    dp_metadata.global_num_tokens, dp_metadata.global_batch_size
+                    dp_metadata.global_num_tokens,
+                    dp_metadata.global_batch_size,
+                    global_num_decodes=dp_metadata.global_num_decodes,
                 )
                 for step_idx, draft_global_num_tokens in enumerate(
                     step_global_num_tokens
@@ -1969,6 +1972,7 @@ class ModelExecutor:
                         forward_mode=ForwardMode.IDLE,
                         global_num_tokens=draft_global_num_tokens,
                         global_bs=dp_metadata.global_batch_size,
+                        global_num_decodes=dp_metadata.global_num_decodes,
                         all_decode_or_idle=dp_metadata.all_decode_or_idle,
                     )
                     self.drafter.draft_model_runner.forward(
@@ -2403,6 +2407,7 @@ class ModelExecutor:
                         )
                     ctx.global_num_tokens = dp_metadata.global_num_tokens
                     ctx.global_bs = dp_metadata.global_batch_size
+                    ctx.global_num_decodes = dp_metadata.global_num_decodes
                     ctx.all_decode_or_idle = dp_metadata.all_decode_or_idle
                     ctx.all_extend = dp_metadata.all_extend
                 with nvtx_range("sampling_prep", color="yellow"):

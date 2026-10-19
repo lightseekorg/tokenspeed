@@ -554,6 +554,7 @@ class ForwardStepRunner:
             # symm-mem -> NaN draft logits -> accept_rate 0. Set the matching
             # uniform dummy.
             ctx.global_bs = [bs] * self.world_size
+            ctx.global_num_decodes = [bs] * self.world_size
 
         # The sampler has a single pool-indexed route: greedy requests are
         # served by top_k=1 in the pool buffers, so capture and every replay
@@ -720,6 +721,7 @@ class ForwardStepRunner:
                         bs * self.max_tokens_per_req
                     ] * self.world_size
                     ctx.global_bs = [bs] * self.world_size
+                    ctx.global_num_decodes = [bs] * self.world_size
 
                 sampling_info = SamplingBatchInfo(
                     req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
