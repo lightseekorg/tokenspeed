@@ -245,6 +245,9 @@ allowing the preceding RMSNorm/gate operation to quantize once. Fusion forwards
 those values and scales without requantizing; the ordinary path exchanges both
 before GEMM. BF16 input keeps quantization inside the projection. Both formats
 return BF16, share workspace ownership, and are prepared before graph capture.
+All ranks in a projection call supply the same activation format. When active
+owners prequantize, empty owners also supply empty E4M3 values and FP32 scales
+so the ordinary fallback executes matching collectives on every rank.
 
 Both directions follow the existing workspace ownership contract: the backend
 prepares shared communication storage, each Linear supplies its weights, and
