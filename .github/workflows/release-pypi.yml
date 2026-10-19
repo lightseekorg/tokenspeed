@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       nightly:
-        description: "Build a dated nightly with the same-date tokenspeed-kernel dependency."
+        description: "Build a dated nightly with the same-date tokenspeed-kernel and the newest SMG nightly dependencies."
         type: boolean
         default: false
       replace_nightly:
@@ -129,7 +129,7 @@ jobs:
             fi
           fi
           version=$(python .github/scripts/prepare-tokenspeed-nightly.py \
-            . "$version_date" "$kernel_version")
+            . "$version_date" "$kernel_version" --smg-pypi-json https://pypi.org/pypi)
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "kernel_version=${kernel_version}" >> "$GITHUB_OUTPUT"
           echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"

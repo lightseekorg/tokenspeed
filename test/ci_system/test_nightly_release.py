@@ -26,9 +26,14 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).parents[2]
-PREPARE = runpy.run_path(str(ROOT / ".github/scripts/prepare-tokenspeed-nightly.py"))[
-    "prepare_nightly"
-]
+_NIGHTLY = runpy.run_path(str(ROOT / ".github/scripts/prepare-tokenspeed-nightly.py"))
+PREPARE = _NIGHTLY["prepare_nightly"]
+NEWEST_SMG = _NIGHTLY["newest_smg_nightly"]
+SMG_0930 = {
+    "tokenspeed-smg": "1.13.0.post20260930",
+    "tokenspeed-smg-grpc-proto": "0.4.27.post20260930",
+    "tokenspeed-smg-grpc-servicer": "0.14.0.post20260930",
+}
 UPDATE = runpy.run_path(str(ROOT / ".github/scripts/update-nightly-index.py"))[
     "update_index"
 ]
@@ -46,11 +51,13 @@ def test_nightly_versions_and_kernel_dependency_share_date(project):
     base_version = tomllib.loads((project / "python/pyproject.toml").read_text())[
         "project"
     ]["version"]
-    version = PREPARE(project, "20260930", "0.1.3.post20260930")
+    version = PREPARE(project, "20260930", "0.1.3.post20260930", SMG_0930)
     metadata = tomllib.loads((project / "python/pyproject.toml").read_text())["project"]
     assert metadata["version"] == version == f"{base_version}.post20260930"
     kernel = [d for d in metadata["dependencies"] if d.startswith("tokenspeed-kernel")]
     assert kernel == ["tokenspeed-kernel==0.1.3.post20260930"]
+    smg = sorted(d for d in metadata["dependencies"] if d.startswith("tokenspeed-smg"))
+    assert smg == sorted(f"{name}=={v}" for name, v in SMG_0930.items())
     assert (
         runpy.run_path(str(project / "python/tokenspeed/version.py"))["__version__"]
         == version
@@ -65,7 +72,56 @@ def test_invalid_or_mismatched_date_does_not_change_metadata(project, date, kern
     path = project / "python/pyproject.toml"
     original = path.read_bytes()
     with pytest.raises(ValueError):
-        PREPARE(project, date, kernel)
+        PREPARE(project, date, kernel, SMG_0930)
+    assert path.read_bytes() == original
+
+
+def test_newest_smg_nightly_comes_from_one_build_on_or_before_the_date():
+    releases = {
+        # 20261001 lacks the servicer; 20261003 is after the nightly date.
+        "tokenspeed-smg": [
+            "1.12.0",
+            "1.12.0.post20260929",
+            "1.13.0.post20260930",
+            "1.13.0.post20261001",
+            "1.13.0.post20261003",
+        ],
+        "tokenspeed-smg-grpc-proto": [
+            "0.4.26.post20260929",
+            "0.4.27.post20260930",
+            "0.4.27.post20261001",
+            "0.4.27.post20261003",
+        ],
+        "tokenspeed-smg-grpc-servicer": [
+            "0.13.0.post1",
+            "0.13.6.post20260929",
+            "0.14.0.post20260930",
+            "0.14.0.post20261003",
+        ],
+    }
+    assert NEWEST_SMG(releases, "20261002") == SMG_0930
+    assert NEWEST_SMG(releases, "20260929") == {
+        "tokenspeed-smg": "1.12.0.post20260929",
+        "tokenspeed-smg-grpc-proto": "0.4.26.post20260929",
+        "tokenspeed-smg-grpc-servicer": "0.13.6.post20260929",
+    }
+    with pytest.raises(ValueError):
+        NEWEST_SMG(releases, "20260928")
+
+
+@pytest.mark.parametrize(
+    "smg",
+    [
+        {**SMG_0930, "tokenspeed-smg": "1.13.0.post20261001"},
+        {**SMG_0930, "tokenspeed-smg-grpc-proto": "0.4.27.post20260929"},
+        {**SMG_0930, "tokenspeed-smg-grpc-servicer": "0.14.0"},
+    ],
+)
+def test_future_or_mixed_smg_nightly_does_not_change_metadata(project, smg):
+    path = project / "python/pyproject.toml"
+    original = path.read_bytes()
+    with pytest.raises(ValueError):
+        PREPARE(project, "20260930", "0.1.3.post20260930", smg)
     assert path.read_bytes() == original
 
 

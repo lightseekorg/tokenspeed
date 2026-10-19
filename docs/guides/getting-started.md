@@ -46,7 +46,11 @@ python -m pip install --upgrade tokenspeed --extra-index-url https://lightseek.o
 ```
 
 Each TokenSpeed nightly uses a `.postYYYYMMDD` version and depends on the exact
-same-date `tokenspeed-kernel` nightly. To select a particular date, for example:
+same-date `tokenspeed-kernel` nightly and on the newest SMG nightly
+(`tokenspeed-smg`, `tokenspeed-smg-grpc-proto` and `tokenspeed-smg-grpc-servicer`
+from one SMG build) published on PyPI on or before that date. Release builds
+keep the SMG pins in `python/pyproject.toml`. To select a particular date, for
+example:
 
 ```bash
 python -m pip install "tokenspeed==0.1.0.post20260930" --extra-index-url https://lightseek.org/whl/nightly
