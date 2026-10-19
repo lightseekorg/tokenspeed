@@ -1496,6 +1496,11 @@ class OverlapPrefillTopK(PrefillTopK):
                         ]
                         if count > max_count:
                             max_count = count
+                    # All warps must finish this snapshot before another append
+                    # can change the counts and disagree on when to flush.
+                    pipeline.NamedBarrier(
+                        barrier_id=11 + query_half, num_threads=128
+                    ).arrive_and_wait()
                     flush = (
                         max_count > self.stream_tile - _MMA_M
                         or subtile % (65536 // _MMA_M) == 0

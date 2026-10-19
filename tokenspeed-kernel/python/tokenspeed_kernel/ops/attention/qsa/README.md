@@ -57,6 +57,10 @@ other four rows; the shared MMA accumulator still waits for both producer
 warpgroups to finish reading. Producers load their fixed row frontiers into
 registers once after CTA initialization, avoiding shared-memory reloads for
 every 128-key subtile. Graph replay reads the refreshed frontiers each time.
+After every append, the producer warpgroup synchronizes both before and after
+reading its candidate-count snapshot. The second synchronization keeps a fast
+warp's next append from changing the counts before slower warps decide whether
+to flush. Every warp must make the same decision to preserve queue progress.
 
 Once 512 candidates exist, their monotone score cutoff filters later scores
 before histogram updates and compaction. An older cutoff can admit extra
