@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from kimi3_reference import mxfp4_moe_reference
+from tokenspeed_kernel.numerics.torch.moe import mxfp4_situ_moe_experts
 from utils import is_cdna5, make_mxfp4_moe_weights, make_round_robin_topk
 
 if not is_cdna5():
@@ -154,7 +154,7 @@ def test_kimi_k3_tp_situ_matches_a8w4_reference_gfx1250(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],

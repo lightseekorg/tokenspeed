@@ -53,7 +53,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 
 def _encoders(calls: list[int], deepstack: bool) -> dict[Modality, EncoderSpec]:
-    """Row r of item h encodes to [h, r, h, r], then its negation for deepstack."""
+    """Raw feature h encodes row r to [h, r, h, r], then its negation for deepstack."""
 
     def fn(items: list[MultimodalDataItem]) -> torch.Tensor:
         calls.append(len(items))
@@ -61,7 +61,7 @@ def _encoders(calls: list[int], deepstack: bool) -> dict[Modality, EncoderSpec]:
         for item in items:
             n = sum(end - start + 1 for start, end in item.offsets)
             r = torch.arange(n, dtype=torch.float32, device="cuda")
-            h = torch.full_like(r, float(item.hash))
+            h = torch.full_like(r, float(item.feature.item()))
             main = torch.stack([h, r, h, r], dim=1)
             rows.append(torch.cat([main, -main], dim=1) if deepstack else main)
         return torch.cat(rows)
@@ -226,6 +226,31 @@ def test_aliases_finishing_together_are_both_dropped() -> None:
     _apply(embedder, [[first], [second]], [0, 0], [4, 4], [PLACEHOLDER] * 8, calls)
     assert calls == [1]
     assert first.encoded is None and second.encoded is None
+
+
+def test_an_item_whose_raw_feature_is_gone_is_not_encoded_for_an_alias() -> None:
+    """A prefix hit covers request A's image while B, then C, bring the same one.
+
+    B's forward encodes A's item for B and releases its raw feature; A is still
+    in prefill when C arrives, so C must encode its own item."""
+    embedder, calls = MultimodalEmbedder(), []
+    covered, fresh, late = _image(7, 0, 3), _image(7, 0, 3), _image(7, 0, 3)
+
+    _apply(
+        embedder,
+        [[covered], [fresh]],
+        [4, 0],
+        [2, 4],
+        [1, 1] + [PLACEHOLDER] * 4,
+        calls,
+    )
+    assert covered.feature is None and covered.encoded is None
+
+    embeds, _ = _apply(
+        embedder, [[covered], [late]], [6, 0], [2, 4], [1, 1] + [PLACEHOLDER] * 4, calls
+    )
+    assert calls == [1, 1]
+    torch.testing.assert_close(embeds[2:, 0].cpu(), torch.full((4,), 7.0))
 
 
 def test_prefix_hit_past_the_image_still_drops_a_published_encoding() -> None:

@@ -22,6 +22,7 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.residual.torch import torch_attn_res_fwd
 from utils import assert_no_triton_compile, is_cdna5
 
 if not is_cdna5():
@@ -58,20 +59,19 @@ def _inputs(tokens, valid_blocks, *, delta, write_block, seed):
 def _reference(inputs, valid_blocks, write_block):
     layer = inputs["layer"].clone()
     blocks = inputs["blocks"].clone()
-    if inputs["delta"] is not None:
-        layer = (layer.float() + inputs["delta"].float()).to(torch.bfloat16)
-    if write_block:
-        blocks[valid_blocks].copy_(layer)
-    values = torch.cat((blocks[:valid_blocks], layer.unsqueeze(0))).float()
-    scores = (
-        values
-        * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-5)
-        * (inputs["score_weight"].float() * inputs["res_weight"].float())
-    ).sum(-1)
-    mixed = (scores.softmax(0).unsqueeze(-1) * values).sum(0)
-    mixed = mixed.to(torch.bfloat16).float()
-    output = mixed * torch.rsqrt(mixed.square().mean(-1, keepdim=True) + 1e-5)
-    return (output * inputs["output_weight"].float()).to(torch.bfloat16), layer, blocks
+    output = torch_attn_res_fwd(
+        layer_residual=layer,
+        block_residual=blocks,
+        res_weight=inputs["res_weight"],
+        rms_weight=inputs["score_weight"],
+        eps=1e-5,
+        out_norm_weight=inputs["output_weight"],
+        out_norm_eps=1e-5,
+        delta=inputs["delta"],
+        num_valid_blocks=valid_blocks,
+        block_write_idx=valid_blocks if write_block else -1,
+    )
+    return output, layer, blocks
 
 
 def _run(inputs, valid_blocks, write_block):

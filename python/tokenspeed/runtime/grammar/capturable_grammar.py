@@ -39,7 +39,13 @@ per-step CPU tensor produced by ``.to('cpu')`` in execute_forward_op,
 so step N+1 overwriting pinned does not race with commit(N).
 
 The host work runs in one hostfunc per step and never releases the GIL
-(see ``GrammarHostBuffers``).
+(see ``GrammarHostBuffers``). The hostfunc is gated: ``add_batch`` pushes
+one run/skip decision per replay, and a step runs ``build`` only when its
+batch has a grammar or the previous run batch had one (those matchers still
+advance and their mask rows still reset). A skipped execution returns on
+the callback thread without taking the GIL; taking it, even for a callback
+that does nothing, measured ~3% of a decode step. Batches without grammar
+replay the same graph at the cost they have with grammar disabled.
 """
 
 from __future__ import annotations
@@ -52,7 +58,7 @@ import torch
 
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.hostfunc import hostfunc
+from tokenspeed.runtime.utils.hostfunc import launch_hostfunc, make_hostfunc_gate
 
 logger = get_colorful_logger(__name__)
 
@@ -82,7 +88,8 @@ class GrammarStepCompletion:
     The next step's ``build`` normally sets ``event`` after advancing
     the matcher and recording ``terminated_at[i]`` — the index of the
     token (within this step's accepted-token chain) that terminated
-    request ``i``'s matcher, or -1. If no next step is dispatched
+    request ``i``'s matcher, or -1; ``add_batch`` sets it at once for a
+    batch without grammars. If no next step is dispatched
     (request was the last live one), post_process advances on the
     host instead; ``lock`` ensures exactly one path wins.
 
@@ -180,11 +187,14 @@ class CapturableGrammarExecutor:
             pin_memory=True,
         )
 
-        # One queue entry per replay: CPU pushes via add_batch, the
-        # build hostfunc pops + shifts current into prev.
+        # One gate decision per replay, and one queue entry per run: CPU
+        # pushes via add_batch, the build hostfunc pops and advances the
+        # batch it popped last.
+        self.gate = make_hostfunc_gate()
         self.queue = queue.Queue()
         self.current_batch: dict | None = None
-        self.prev_batch: dict | None = None
+        # Whether the last run batch had a grammar, so the next replay runs.
+        self.pending: bool = False
 
         self.stream = torch.cuda.Stream()
         self.fork_event = torch.cuda.Event()
@@ -202,7 +212,7 @@ class CapturableGrammarExecutor:
         """Push request state for the next captured iteration.
 
         Must be called exactly once before each replay (including
-        capture warmup); ``build`` raises on an empty queue.
+        capture warmup): the gate takes one decision per replay.
 
         ``advance_mask[i] == False`` disables matcher advance for slot
         i at this step — set it for intermediate chunked-prefill chunks
@@ -229,6 +239,19 @@ class CapturableGrammarExecutor:
             output_layout=output_layout,
         )
 
+        live = any(grammar is not None for grammar in grammars_list)
+
+        if not live:
+            completion.terminated_at = [-1] * bs
+            completion.event.set()
+
+        run = live or self.pending
+        self.pending = live
+        self.gate.push(run)
+
+        if not run:
+            return completion
+
         self.queue.put(
             {
                 "grammars": grammars_list,
@@ -242,18 +265,24 @@ class CapturableGrammarExecutor:
         return completion
 
     def reset_state(self) -> None:
-        """Drop any warmup-run state held by prev/current pointers."""
-        self.prev_batch = None
+        """Drop the decisions and entries a capture pushed but never ran,
+        and the batch a warmup run left as current."""
+        self.gate.clear()
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
         self.current_batch = None
+        self.pending = False
 
-    @hostfunc
     def build(self) -> None:
         """Pop this step's batch (prev := current), advance the matchers by
         the prev step's outputs, then fill this step's bitmask."""
-        self.prev_batch = self.current_batch
+        prev_batch = self.current_batch
         self.current_batch = self.queue.get_nowait()
-        if self.prev_batch is not None:
-            self.host.advance(self.prev_batch)
+        if prev_batch is not None:
+            self.host.advance(prev_batch)
         self.host.fill(self.current_batch)
 
     def schedule_fill(
@@ -284,7 +313,7 @@ class CapturableGrammarExecutor:
                     non_blocking=True,
                 )
 
-            self.build()
+            launch_hostfunc(self.build, gate=self.gate)
 
             self.bitmask.copy_(self.host.bitmask, non_blocking=True)
             self.bitmask_event.record()
@@ -715,8 +744,7 @@ def setup_grammar_step(
     advance_mask = grammar_inputs.advance_mask if grammar_inputs is not None else None
 
     if capturable is not None:
-        # Always push (even all-None) to keep the captured hostfunc queue
-        # 1:1 with replays.
+        # Always add (even all-None): the gate takes one decision per replay.
         return capturable.add_batch(
             grammars=grammars,
             bs=bs,

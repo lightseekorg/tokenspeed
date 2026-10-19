@@ -470,7 +470,7 @@ class DeepseekV3MoE(nn.Module):
                     router_logits=router_logits,
                 )
 
-            deferred_finalize = self.experts.supports_deferred_finalize
+            deferred_finalize = self.experts.supports_deferred_cuda_finalize
             routed_expert_output = self.experts(
                 hidden_states=hidden_states,
                 topk_output=topk_output,

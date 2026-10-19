@@ -30,6 +30,9 @@ the results against a reference or against an equivalent narrower launch.
 import pytest
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.attention.dsa import (
+    torch_dsa_compact_index_pages,
+)
 from utils import (
     assert_no_triton_compile,
     int_specialization_class,
@@ -223,25 +226,6 @@ def test_mxfp4_mm_row_count():
             torch.testing.assert_close(run(rows), full[:rows], rtol=0, atol=0)
 
 
-def _compact_reference(table, requests, causal, page):
-    rows, cols = requests.numel(), table.shape[1]
-    pages = torch.zeros(rows, cols, dtype=torch.int32)
-    positions = torch.zeros_like(pages)
-    lengths = torch.zeros(rows, 1, dtype=torch.int32)
-    for row, (req, length) in enumerate(zip(requests.tolist(), causal.tolist())):
-        if not 0 <= req < table.shape[0]:
-            continue
-        valid = [
-            col
-            for col, value in enumerate(table[req].tolist())
-            if value > 0 and col * page < length
-        ]
-        pages[row, : len(valid)] = table[req, valid].cpu()
-        positions[row, : len(valid)] = torch.tensor(valid, dtype=torch.int32)
-        lengths[row] = sum(min(page, length - col * page) for col in valid)
-    return pages, positions, lengths
-
-
 def test_dsa_index_candidates_table_width():
     from tokenspeed_kernel.ops.attention.dsa._triton import index_candidates as ic
 
@@ -260,7 +244,9 @@ def test_dsa_index_candidates_table_width():
         pages, positions, lengths = ic.compact_index_pages(
             table, requests, causal, page
         )
-        want = _compact_reference(table.cpu(), requests.cpu(), causal.cpu(), page)
+        want = torch_dsa_compact_index_pages(
+            table.cpu(), requests.cpu(), causal.cpu(), page
+        )
         for got, expected in zip((pages, positions, lengths), want, strict=True):
             torch.testing.assert_close(got.cpu(), expected, rtol=0, atol=0)
 
@@ -760,7 +746,7 @@ def test_mha_decode_and_extend_table_width():
 
 
 def test_rel_mha_decode_table_width_and_split_count():
-    from rel_mha_reference import HEAD_DIM, NUM_KV_HEADS, NUM_Q_HEADS, build_paged
+    from rel_mha_helpers import HEAD_DIM, NUM_KV_HEADS, NUM_Q_HEADS, build_paged
     from tokenspeed_kernel.ops.attention.rmha import (
         rel_mha_decode_with_kvcache,
     )
@@ -807,7 +793,7 @@ def test_rel_mha_decode_table_width_and_split_count():
 
 
 def test_rel_mha_extend_table_width():
-    from rel_mha_reference import HEAD_DIM, NUM_Q_HEADS, build_paged
+    from rel_mha_helpers import HEAD_DIM, NUM_Q_HEADS, build_paged
     from tokenspeed_kernel.ops.attention.rmha import rel_mha_extend_with_kvcache
     from tokenspeed_kernel.ops.attention.rmha import triton as rmha
 
@@ -954,7 +940,7 @@ def test_compact_kvp_pages_table_width():
 
 
 def test_mhc_mixes_split_count():
-    from test_mhc_prefill import _reference
+    from tokenspeed_kernel.numerics.torch.residual import torch_mhc_pre
     from tokenspeed_kernel.ops.residual import triton as residual
 
     hidden = 4096
@@ -968,7 +954,7 @@ def test_mhc_mixes_split_count():
     def run(tokens):
         args = (x[:tokens], fn, scale, base, 1e-6, 1e-5, 3)
         pre, post, comb = residual.triton_mhc_mixes(*args)
-        _, post_ref, comb_ref = _reference(*args)
+        _, post_ref, comb_ref = torch_mhc_pre(*args, None, None)
         torch.testing.assert_close(post, post_ref.squeeze(-1), rtol=1e-3, atol=1e-3)
         torch.testing.assert_close(comb, comb_ref, rtol=1e-3, atol=1e-3)
         return pre
@@ -1027,7 +1013,7 @@ def test_mhc_split_count_rounds_the_sm_fill_before_the_k_cap(
 
 
 def test_mhc_pre_split_count():
-    from test_mhc_prefill import _reference
+    from tokenspeed_kernel.numerics.torch.residual import torch_mhc_pre
     from tokenspeed_kernel.ops.residual import triton as residual
 
     hidden = 4096
@@ -1041,7 +1027,7 @@ def test_mhc_pre_split_count():
         # Up to 256 tokens take the split-K GEMM and the four-stream mix kernel.
         args = (x[:tokens], fn, scale, base, 1e-6, 1e-5, 3)
         actual = residual.triton_mhc_pre(*args, norm_weight=None, norm_eps=None)
-        for got, want in zip(actual, _reference(*args), strict=True):
+        for got, want in zip(actual, torch_mhc_pre(*args, None, None), strict=True):
             torch.testing.assert_close(got.float(), want.float(), rtol=2e-2, atol=2e-2)
 
     def key(tokens):

@@ -23,7 +23,7 @@ TokenSpeed takes a fundamentally different architectural approach from existing 
 >
 > TokenSpeed also treats kernels as a first-class, modular subsystem, separating them from the core engine through a portable public API, centralized registry and selection model, and an extensible plugin mechanism for heterogeneous accelerators.
 
-More importantly, TokenSpeed is the **Switzerland** of open-source LLM inference engines: neutral because it's backed by the non-profit [LightSeek Foundation](https://lightseek.org/) rather than a commercial company, with **serious hardware and engineering support** from vendors like NVIDIA and AMD.
+More importantly, TokenSpeed is the **Switzerland** of open-source LLM inference engines: neutral because it's backed by the non-profit [LightSeek Foundation](https://lightseek.org/) rather than a commercial company, with **serious hardware and engineering support** from vendors such as NVIDIA and AMD.
 
 ## News
 
@@ -39,12 +39,12 @@ More importantly, TokenSpeed is the **Switzerland** of open-source LLM inference
 - [2026/07] [TML Inkling](https://thinkingmachines.ai/news/introducing-inkling/) at Day 0: FP4 Inference on NVIDIA and [AMD](https://huggingface.co/lightseekorg/Inkling-MXFP4) with [TokenSpeed](https://thinkingmachines.ai/news/introducing-inkling/#inkling-availability). [[blog](https://lightseek.org/blog/tokenspeed-inkling.html)]
 - [2026/06] Deep dive into the design and optimization of TokenSpeed-Kernel. [[PyTorch blog](https://pytorch.org/blog/lightseek-tokenspeed-kernel/)]
 - [2026/05] 🚀 TokenSpeed hits 580 TPS on Qwen3.5-397B-A17B for agentic workloads. [[PyTorch blog](https://pytorch.org/blog/up-to-580tps-new-speed-record-of-qwen3-5-397b-a17b-on-gpu-for-agentic-workloads-with-tokenspeed/)]
-- [2026/05] 🚀 TokenSpeed is a **brand new** inference engine purpose built for speed-of-light agentic workloads. [[NVIDIA AI X](https://x.com/NVIDIAAI/status/2052061195381911806)]
+- [2026/05] 🚀 TokenSpeed is a **brand new** inference engine purpose-built for speed-of-light agentic workloads. [[NVIDIA AI X](https://x.com/NVIDIAAI/status/2052061195381911806)]
 - [2026/05] TokenSpeed announced — a speed-of-light LLM inference engine for agentic workloads. [[blog](https://lightseek.org/blog/lightseek-tokenspeed.html)]
 
 ## Blogs and talks
 
-For technical blogs, conference talks, and engineering articles from LightSeek Foundation, visit the [LightSeek Blog](https://lightseek.org/blog/).
+For technical blogs, conference talks, and engineering articles from the LightSeek Foundation, visit the [LightSeek Blog](https://lightseek.org/blog/).
 
 ## Sponsors and partners
 

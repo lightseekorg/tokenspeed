@@ -9,6 +9,10 @@ import math
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.msa import (
+    torch_msa_block_attention,
+    torch_msa_select_blocks,
+)
 from tokenspeed_kernel.ops.attention.msa import (
     msa_decode_with_kvcache,
     msa_extend_with_kvcache,
@@ -33,18 +37,9 @@ def _reference_selected_blocks(
     keys: torch.Tensor,
     query_position: int,
 ) -> torch.Tensor:
-    visible_keys = keys[: query_position + 1]
-    scores = query.float() @ visible_keys.float().T
-    scores *= _HEAD_DIM**-0.5
-    num_blocks = math.ceil((query_position + 1) / _BLOCK_SIZE)
-    scores = torch.nn.functional.pad(
-        scores,
-        (0, num_blocks * _BLOCK_SIZE - scores.numel()),
-        value=-torch.inf,
+    return torch_msa_select_blocks(
+        query, keys, query_position, block_size=_BLOCK_SIZE, topk=_TOPK
     )
-    block_scores = scores.view(num_blocks, _BLOCK_SIZE).amax(dim=-1)
-    block_scores[query_position // _BLOCK_SIZE] = torch.inf
-    return block_scores.topk(min(_TOPK, num_blocks)).indices
 
 
 def _reference_sparse_attention(
@@ -55,23 +50,15 @@ def _reference_sparse_attention(
     block_table: torch.Tensor,
     query_position: int,
 ) -> torch.Tensor:
-    blocks = selected_blocks.long()
-    keys = torch.cat(
-        [key_cache[block_table[block].long(), 0] for block in blocks], dim=0
+    return torch_msa_block_attention(
+        query,
+        key_cache,
+        value_cache,
+        selected_blocks,
+        block_table,
+        query_position,
+        block_size=_BLOCK_SIZE,
     )
-    values = torch.cat(
-        [value_cache[block_table[block].long(), 0] for block in blocks], dim=0
-    )
-    key_positions = (
-        blocks[:, None] * _BLOCK_SIZE
-        + torch.arange(_BLOCK_SIZE, device=query.device)[None]
-    ).flatten()
-    visible = key_positions <= query_position
-    probabilities = torch.softmax(
-        query.float() @ keys[visible].float().T * (_HEAD_DIM**-0.5),
-        dim=-1,
-    )
-    return probabilities @ values[visible].float()
 
 
 @requires_cuda

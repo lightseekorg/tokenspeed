@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import os
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.layers.moe import expert as expert_module
 from tokenspeed.runtime.layers.moe.expert import MoELayer
@@ -15,6 +19,14 @@ from tokenspeed.runtime.layers.moe.topk import (
 )
 from tokenspeed.runtime.layers.moe.utils import All2AllBackend, MoeBackend
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
+from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
+
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 
 @pytest.mark.parametrize(
@@ -398,7 +410,13 @@ def vendor_layer(monkeypatch):
 
     hook = mock.Mock(return_value=True)
     impl = KernelRegistry.get().get_impl(KERNEL_ROUTING_APPLY)
-    if impl is None:
+    platform = current_platform()
+    if (
+        impl is None
+        or not platform.is_nvidia
+        or platform.arch_version.major != 10
+        or platform.arch_version.minor > 3
+    ):
         pytest.skip("FlashInfer's TRT-LLM MoE is registered on NVIDIA SM100 to SM103")
     monkeypatch.setattr(impl, "_tokenspeed_fp32_correction_bias", hook)
 
@@ -414,7 +432,9 @@ def vendor_layer(monkeypatch):
             top_k=2,
             num_experts=4,
             hidden_size=128,
-            intermediate_size=320,
+            # A multiple of both FlashInfer alignments (64 with the ISPP-64
+            # launcher, 128 without), so no padding on any build.
+            intermediate_size=384,
             quant_config=None,
             layer_index=0,
             activation="silu",
@@ -442,7 +462,7 @@ def test_vendor_policy_routes_in_the_kernel_when_the_hook_builds_it(vendor_layer
     assert layer.topk_output_format.is_bypassed()
     # The routed scale stays in routing_config for the kernel; no padding.
     assert layer.routing_config["routed_scaling_factor"] == 2.5
-    assert tuple(layer.w13_weight.shape) == (4, 640, 128)
+    assert tuple(layer.w13_weight.shape) == (4, 768, 128)
 
 
 def test_vendor_policy_runs_on_precomputed_routes_without_the_hook(vendor_layer):
@@ -459,9 +479,82 @@ def test_vendor_policy_runs_on_precomputed_routes_without_the_hook(vendor_layer)
     [
         ({"combine_order": "slot"}, "slot combine"),
         ({"backend": "triton"}, "flashinfer_trtllm"),
-        ({"intermediate_size": 288}, "multiple of 64"),
+        ({"intermediate_size": 288}, "intermediate size per partition"),
     ],
 )
 def test_vendor_policy_rejects_unsupported_contract(vendor_layer, build_kwargs, error):
     with pytest.raises(ValueError, match=error):
         vendor_layer(**build_kwargs)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_nvidia,
+    reason="the deferred finalizer is a CUDA library",
+)
+@torch.inference_mode()
+def test_deferred_routes_carry_the_precomputed_weights(monkeypatch) -> None:
+    # Triton MXFP4 returns no route weights from a deferred launch; the layer
+    # hands back the ones it was given so callers can always finalize.
+    monkeypatch.setattr(expert_module, "get_moe_backend", lambda: MoeBackend("triton"))
+    monkeypatch.setitem(
+        expert_module.global_server_args_dict, "moe_mxfp4_fp8_activation", False
+    )
+    monkeypatch.setitem(
+        expert_module.global_server_args_dict, "ep_num_redundant_experts", 0
+    )
+    torch.manual_seed(0)
+    original_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        with torch.device("cuda"):
+            layer = MoELayer(
+                top_k=2,
+                num_experts=4,
+                hidden_size=256,
+                intermediate_size=256,
+                quant_config=Mxfp4Config(
+                    ignored_layers=[], is_checkpoint_mxfp4_serialized=True
+                ),
+                layer_index=0,
+                prefix="mlp",
+                activation="swiglu",
+                routing_mode="precomputed_topk",
+            )
+    finally:
+        torch.set_default_dtype(original_dtype)
+    assert layer.supports_deferred_finalize
+    for name, param in layer.named_parameters():
+        if name.endswith("_scale"):
+            param.data.random_(118, 122)
+        else:
+            param.data.random_(0, 256)
+    layer.process_weights_after_loading(layer)
+    x = torch.randn(5, 256, device="cuda", dtype=torch.bfloat16)
+    routes = StandardTopKOutput(
+        torch.rand(5, 2, device="cuda"),
+        torch.randint(0, 4, (5, 2), device="cuda", dtype=torch.int32),
+        None,
+    )
+    expected = layer(
+        x, routes, num_global_tokens=5, max_num_tokens_per_gpu=5, do_finalize=True
+    )
+    gemm2_out, weights, expanded_idx = layer(
+        x, routes, num_global_tokens=5, max_num_tokens_per_gpu=5, do_finalize=False
+    )
+    assert weights is routes.topk_weights
+    actual = moe_finalize_fuse_shared(
+        gemm2_out, expanded_idx, weights, None, top_k=2, hidden_dim=256
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("nvidia", [True, False])
+def test_only_nvidia_defers_to_the_cuda_finalizer(monkeypatch, nvidia) -> None:
+    layer = MoELayer.__new__(MoELayer)
+    torch.nn.Module.__init__(layer)
+    layer.plan = {"supports_deferred_finalize": True}
+    monkeypatch.setattr(
+        expert_module, "current_platform", lambda: SimpleNamespace(is_nvidia=nvidia)
+    )
+    assert layer.supports_deferred_finalize
+    assert layer.supports_deferred_cuda_finalize == nvidia

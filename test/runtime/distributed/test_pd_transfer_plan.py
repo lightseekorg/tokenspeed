@@ -536,7 +536,7 @@ def test_equal_tp_sharded_route_sends_through_the_pages_api():
     )
 
     def grids(rank):
-        items = list(
+        items = next(
             _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
                 dst_tp_rank=0,
                 dst_ptr=dst_ptr,
@@ -545,6 +545,7 @@ def test_equal_tp_sharded_route_sends_through_the_pages_api():
                 transfer_fragments=plan.fragments_by_prefill_rank[rank],
                 owner_filters=plan.owner_filters_by_prefill_rank[rank],
                 dst_cache_layout=decode_layout,
+                step_field_ids=(None,),
             )
         )
         assert all(isinstance(item, PageFieldCopies) for item in items)
@@ -762,14 +763,17 @@ def test_every_target_rank_of_a_hybrid_route_can_send_with_its_own_decisions():
             else:
                 assert decisions["history"] is None
             copies = _copies(
-                _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
-                    dst_tp_rank=0,
-                    dst_ptr=dst_ptr,
-                    src_block_manifest=source_manifest,
-                    dst_block_manifest=destination_manifest,
-                    transfer_fragments=plan.fragments_by_prefill_rank[rank],
-                    owner_filters=decisions,
-                    dst_cache_layout=decode_layout,
+                next(
+                    _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
+                        dst_tp_rank=0,
+                        dst_ptr=dst_ptr,
+                        src_block_manifest=source_manifest,
+                        dst_block_manifest=destination_manifest,
+                        transfer_fragments=plan.fragments_by_prefill_rank[rank],
+                        owner_filters=decisions,
+                        dst_cache_layout=decode_layout,
+                        step_field_ids=(None,),
+                    )
                 )
             )
             history_copies = [copy for copy in copies if copy[1] < kda_dst_base]
@@ -833,14 +837,21 @@ def test_pipeline_stage_without_a_sharded_group_decides_none_and_sends_rest():
 
     src_ptr, dst_ptr = 0x10000, 0x20000
     copies = _copies(
-        _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
-            dst_tp_rank=0,
-            dst_ptr=dst_ptr,
-            src_block_manifest=block_manifest(("history", (1, 2)), ("index", (3, 4))),
-            dst_block_manifest=block_manifest(("history", (5, 6)), ("index", (7, 8))),
-            transfer_fragments=plan.fragments_by_prefill_rank[1],
-            owner_filters=plan.owner_filters_by_prefill_rank[1],
-            dst_cache_layout=decode_layout,
+        next(
+            _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
+                dst_tp_rank=0,
+                dst_ptr=dst_ptr,
+                src_block_manifest=block_manifest(
+                    ("history", (1, 2)), ("index", (3, 4))
+                ),
+                dst_block_manifest=block_manifest(
+                    ("history", (5, 6)), ("index", (7, 8))
+                ),
+                transfer_fragments=plan.fragments_by_prefill_rank[1],
+                owner_filters=plan.owner_filters_by_prefill_rank[1],
+                dst_cache_layout=decode_layout,
+                step_field_ids=(None,),
+            )
         )
     )
     # Stage-0 rank 1 owns virtual block 2 (local page 1) of 'history' only.

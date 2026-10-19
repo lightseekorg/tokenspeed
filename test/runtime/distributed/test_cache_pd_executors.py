@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import threading
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
@@ -227,14 +228,17 @@ def _transfer_cache(
 ) -> int:
     return manager._transfer_data(
         session,
-        manager._cache_transfer_blocks(
-            dst_tp_rank=0,
-            dst_ptr=dst_ptr,
-            src_block_manifest=src_block_manifest,
-            dst_block_manifest=dst_block_manifest,
-            transfer_fragments=transfer_fragments,
-            owner_filters={},
-            dst_cache_layout=dst_cache_layout,
+        next(
+            manager._cache_transfer_blocks(
+                dst_tp_rank=0,
+                dst_ptr=dst_ptr,
+                src_block_manifest=src_block_manifest,
+                dst_block_manifest=dst_block_manifest,
+                transfer_fragments=transfer_fragments,
+                owner_filters={},
+                dst_cache_layout=dst_cache_layout,
+                step_field_ids=(None,),
+            )
         ),
         packer,
     )
@@ -769,6 +773,124 @@ def test_layerwise_final_preserves_speculative_candidates() -> None:
     assert metadata_calls == [(9, 42, [7, 8])]
 
 
+@pytest.mark.parametrize(
+    "layerwise", (True, False), ids=("prefill_chunk", "remote_decode")
+)
+def test_submission_skips_a_room_aborted_while_queued(layerwise: bool) -> None:
+    from tokenspeed.runtime.metrics.collector import KVTransferMetrics
+    from tokenspeed.runtime.pd.mooncake.sender import MooncakeKVSender
+    from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
+    from tokenspeed.runtime.pd.utils import DisaggregationMode, FastQueue
+
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.disaggregation_mode = DisaggregationMode.PREFILL
+    manager.request_status, manager.failure_records = {}, {}
+    manager.failure_lock = threading.Lock()
+    manager.kv_transfer_metrics = KVTransferMetrics(
+        {}, reporters=["prometheus"], enabled=False
+    )
+    manager.bootstrap_token_cond = threading.Condition()
+    manager.prefill_metadata, manager.cached_tokens = {}, {}
+    manager.bootstrap_logprobs = {}
+    manager.transfer_queues = [FastQueue()]
+    manager.step_counter = None
+    executor = object.__new__(DisaggPrefillExecutor)
+    executor.cache_layout = _layout()
+    executor.kv_manager = manager
+    executor._layerwise_enabled = layerwise
+    executor._layerwise_interval = 1
+    executor.senders = {
+        f"request-{row}": MooncakeKVSender(manager, "bootstrap", room)
+        for row, room in enumerate((9, 10))
+    }
+    # Room 10 has its Decode destination; a transfer worker or the bootstrap
+    # thread fails room 9 (dropping its destinations) while the op waits on
+    # the FIFO, before the control plane polls the failure.
+    session = "127.0.0.1:9000"
+    manager.transfer_infos = {
+        10: {session: TransferInfo(10, session, _destination_block_manifest())}
+    }
+    manager.abort_room(9, "Decode WRITE failed")
+    op = make_operation(
+        {
+            "history": np.asarray([[1, 2, 3], [4, 5, 6]], dtype=np.int32),
+            "state": np.asarray([[0, 6, -1], [0, 7, -1]], dtype=np.int32),
+        },
+        request_ids=["request-0", "request-1"],
+        num_extends=lambda: 2,
+        # Layerwise: tokens [2, 4) of the 5-token prompts, a non-final chunk.
+        extend_prefix_lens=[2, 2],
+        input_lengths=[2, 2],
+        decode_input_ids=[42, 43],
+        spec_candidate_ids=[[], []],
+    )
+
+    if layerwise:
+        executor.prepare_prefill(op)
+    else:
+        executor._cache_decode(op)
+
+    # Only the live room's chunk is queued.
+    queue = manager.transfer_queues[0]
+    chunk = queue.get_nowait()
+    assert (chunk.room, chunk.is_last) == (10, not layerwise)
+    with pytest.raises(FastQueue.Empty):
+        queue.get_nowait()
+
+
+@pytest.mark.parametrize("discarded", (False, True), ids=("aborted", "discarded"))
+def test_transfer_worker_leaves_an_ended_room_ended(discarded: bool) -> None:
+    from tokenspeed.runtime.metrics.collector import KVTransferMetrics
+    from tokenspeed.runtime.pd.base.status import TransferPoll
+
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.request_status = {9: TransferPoll.Bootstrapped}
+    manager.failure_records, manager.transfer_infos = {}, {}
+    manager.failure_lock = threading.Lock()
+    manager.kv_transfer_metrics = KVTransferMetrics(
+        {}, reporters=["prometheus"], enabled=False
+    )
+    manager.bootstrap_token_cond = threading.Condition()
+    manager.prefill_metadata, manager.cached_tokens = {}, {}
+    manager.bootstrap_logprobs = {}
+    # Room 9 fails after a chunk of it was queued, and the control plane may
+    # also drop it, before a transfer worker picks the chunk up.
+    manager.abort_room(9, "Decode WRITE failed")
+    if discarded:
+        manager.discard_room(9)
+
+    with pytest.raises(_StopWorker):
+        manager.transfer_worker(
+            _OneChunkQueue(TransferKVChunk(room=9, is_last=True)), None
+        )
+
+    # The worker drops the chunk: a dropped room does not come back and the
+    # first failure reason stands.
+    assert manager.request_status == ({} if discarded else {9: TransferPoll.Failed})
+    assert manager.failure_records == {9: "Decode WRITE failed"}
+
+
+@pytest.mark.parametrize(
+    "layerwise", (True, False), ids=("prefill_chunk", "remote_decode")
+)
+def test_submitting_a_live_room_without_destinations_raises(layerwise: bool) -> None:
+    from tokenspeed.runtime.pd.base.status import TransferPoll
+    from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
+
+    # Room 9 is bootstrapped yet has no destinations, which no thread leaves
+    # behind: the submission reports the broken invariant instead of skipping.
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.request_status = {9: TransferPoll.Bootstrapped}
+    manager.transfer_infos = {}
+    executor = object.__new__(DisaggPrefillExecutor)
+    executor._layerwise_enabled = layerwise
+    executor.senders = {"request-0": _RecordingSender([])}
+    executor.kv_manager = manager
+
+    with pytest.raises(RuntimeError, match="destination metadata is unavailable"):
+        (executor.prepare_prefill if layerwise else executor._cache_decode)(_op())
+
+
 @pytest.mark.parametrize("pp_rank", [0, 1])
 def test_every_pipeline_stage_reports_under_its_stage_major_rank(pp_rank) -> None:
     """On a prefill pipeline every stage publishes the same broadcast bootstrap
@@ -906,7 +1028,7 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry(
         src, size = field_pages(source_layout, 0x1000, field_id, src_pages)
         dst, _ = field_pages(destination_layout, 0x2000, field_id, dst_pages)
         expected.extend(zip(src, dst, [size] * pages, strict=True))
-    blocks = list(
+    blocks = next(
         manager._cache_transfer_blocks(
             dst_tp_rank=0,
             dst_ptr=0x2000,
@@ -914,6 +1036,7 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry(
             dst_block_manifest=destination_manifest,
             owner_filters={},
             dst_cache_layout=destination_layout,
+            step_field_ids=(None,),
         )
     )
     # One pages x fields item for the group, no per-page Python objects.
@@ -923,6 +1046,21 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry(
     assert _expand_page_fields(item.src_pages, item.dst_pages, item.fields) == expected
     with pytest.raises(TypeError):
         list(flatten_transfer_blocks(blocks))
+
+    # One request, two steps: each step moves only its own field.
+    steps = manager._cache_transfer_blocks(
+        dst_tp_rank=0,
+        dst_ptr=0x2000,
+        src_block_manifest=source_manifest,
+        dst_block_manifest=destination_manifest,
+        owner_filters={},
+        dst_cache_layout=destination_layout,
+        step_field_ids=(frozenset(fields[:1]), frozenset(fields[1:])),
+    )
+    assert [
+        _expand_page_fields(item.src_pages, item.dst_pages, item.fields)
+        for (item,) in steps
+    ] == [expected[:pages], expected[pages:]]
 
     fragment = CacheTransferFragment(
         group_id="history",
@@ -937,14 +1075,17 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry(
     src, _ = field_pages(source_layout, 0x1000, fields[1], src_pages)
     dst, _ = field_pages(destination_layout, 0x2000, fields[1], dst_pages)
     fragment_blocks = list(
-        manager._cache_transfer_blocks(
-            dst_tp_rank=0,
-            dst_ptr=0x2000,
-            src_block_manifest=source_manifest,
-            dst_block_manifest=destination_manifest,
-            transfer_fragments=(fragment,),
-            owner_filters={},
-            dst_cache_layout=destination_layout,
+        next(
+            manager._cache_transfer_blocks(
+                dst_tp_rank=0,
+                dst_ptr=0x2000,
+                src_block_manifest=source_manifest,
+                dst_block_manifest=destination_manifest,
+                transfer_fragments=(fragment,),
+                owner_filters={},
+                dst_cache_layout=destination_layout,
+                step_field_ids=(None,),
+            )
         )
     )
     assert fragment_blocks == [
@@ -1864,7 +2005,7 @@ def test_kvp_pd_copies_logical_history_between_independently_allocated_pages(
                         state_prefix_cached=False,
                     )
                 )
-                copies = manager._cache_transfer_blocks(
+                (copies,) = manager._cache_transfer_blocks(
                     dst_ptr=buffer.ctypes.data,
                     dst_tp_rank=destination_rank,
                     src_block_manifest=src_manifest if selection is None else None,
@@ -1873,6 +2014,7 @@ def test_kvp_pd_copies_logical_history_between_independently_allocated_pages(
                     owner_filters=route.owner_filters_by_prefill_rank[source_rank],
                     dst_cache_layout=destination,
                     block_selection=selection,
+                    step_field_ids=(None,),
                 )
                 copies = coalesce_transfer_blocks(
                     block
@@ -1996,13 +2138,14 @@ def test_transfer_blocks_keep_only_owned_pages_translated_to_local() -> None:
     owner_filters = {"history": CachePageOwnerFilter(1, 2)}
     manager, _ = _recording_transfer_manager(source_layout, 0x1000)
 
-    (item,) = manager._cache_transfer_blocks(
+    ((item,),) = manager._cache_transfer_blocks(
         dst_tp_rank=0,
         dst_ptr=0x2000,
         src_block_manifest=source_manifest,
         dst_block_manifest=destination_manifest,
         owner_filters=owner_filters,
         dst_cache_layout=destination_layout,
+        step_field_ids=(None,),
     )
     assert isinstance(item, PageFieldCopies)
     assert item.src_pages.tolist() == [1, 2, 3]
@@ -2021,7 +2164,7 @@ def test_transfer_blocks_keep_only_owned_pages_translated_to_local() -> None:
         bytes_per_row=16,
         rows_per_page=1,
     )
-    (item,) = manager._cache_transfer_blocks(
+    ((item,),) = manager._cache_transfer_blocks(
         dst_tp_rank=0,
         dst_ptr=0x2000,
         src_block_manifest=source_manifest,
@@ -2029,6 +2172,7 @@ def test_transfer_blocks_keep_only_owned_pages_translated_to_local() -> None:
         transfer_fragments=(fragment,),
         owner_filters=owner_filters,
         dst_cache_layout=destination_layout,
+        step_field_ids=(None,),
     )
     assert isinstance(item, PageFieldCopies)
     assert _expand_page_fields(item.src_pages, item.dst_pages, item.fields) == [
@@ -2037,13 +2181,14 @@ def test_transfer_blocks_keep_only_owned_pages_translated_to_local() -> None:
     ]
 
     # The other owner sends the complementary subsequence.
-    (item,) = manager._cache_transfer_blocks(
+    ((item,),) = manager._cache_transfer_blocks(
         dst_tp_rank=0,
         dst_ptr=0x2000,
         src_block_manifest=source_manifest,
         dst_block_manifest=destination_manifest,
         owner_filters={"history": CachePageOwnerFilter(0, 2)},
         dst_cache_layout=destination_layout,
+        step_field_ids=(None,),
     )
     assert item.src_pages.tolist() == [1, 2, 3]
     assert item.dst_pages.tolist() == [10, 12, 14]
@@ -2063,7 +2208,7 @@ def test_transfer_blocks_apply_owner_filter_to_layerwise_selection() -> None:
     )
 
     def blocks(owner_rank):
-        return list(
+        return next(
             manager._cache_transfer_blocks(
                 dst_tp_rank=0,
                 dst_ptr=0x2000,
@@ -2072,6 +2217,7 @@ def test_transfer_blocks_apply_owner_filter_to_layerwise_selection() -> None:
                 owner_filters={"history": CachePageOwnerFilter(owner_rank, 2)},
                 dst_cache_layout=_sharded_history_layout(1),
                 block_selection=selection,
+                step_field_ids=(None,),
             )
         )
 
@@ -2087,7 +2233,7 @@ def test_transfer_blocks_send_nothing_for_a_sharded_group_decided_none() -> None
     manifest = _single_group_block_manifest("history", (1, 2))
 
     assert (
-        list(
+        next(
             manager._cache_transfer_blocks(
                 dst_tp_rank=0,
                 dst_ptr=0x2000,
@@ -2095,12 +2241,13 @@ def test_transfer_blocks_send_nothing_for_a_sharded_group_decided_none() -> None
                 dst_block_manifest=manifest,
                 owner_filters={"history": None},
                 dst_cache_layout=_sharded_history_layout(1),
+                step_field_ids=(None,),
             )
         )
         == []
     )
     with pytest.raises(KeyError):
-        list(
+        next(
             manager._cache_transfer_blocks(
                 dst_tp_rank=0,
                 dst_ptr=0x2000,
@@ -2108,6 +2255,7 @@ def test_transfer_blocks_send_nothing_for_a_sharded_group_decided_none() -> None
                 dst_block_manifest=manifest,
                 owner_filters={},
                 dst_cache_layout=_sharded_history_layout(1),
+                step_field_ids=(None,),
             )
         )
 
@@ -2118,7 +2266,7 @@ def test_transfer_blocks_reject_an_out_of_range_virtual_block() -> None:
     manager, _ = _recording_transfer_manager(_sharded_history_layout(2), 0x1000)
     # A virtual ID past the group's virtual count never reaches the wire.
     with pytest.raises(UnsupportedPDLayoutError, match="virtual address space"):
-        list(
+        next(
             manager._cache_transfer_blocks(
                 dst_tp_rank=0,
                 dst_ptr=0x2000,
@@ -2126,6 +2274,7 @@ def test_transfer_blocks_reject_an_out_of_range_virtual_block() -> None:
                 dst_block_manifest=_single_group_block_manifest("history", (1,)),
                 owner_filters={"history": CachePageOwnerFilter(0, 2)},
                 dst_cache_layout=_sharded_history_layout(1),
+                step_field_ids=(None,),
             )
         )
 

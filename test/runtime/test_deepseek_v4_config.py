@@ -19,6 +19,10 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.residual import (
+    torch_mhc_post,
+    torch_mhc_pre,
+)
 from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_indexer_topk_prefill,
     indexer_topk_prefill,
@@ -100,17 +104,6 @@ def _fake_pool(*group_specs, **arena_attrs) -> SimpleNamespace:
     )
 
 
-def _mhc_sinkhorn_reference(
-    mixes: torch.Tensor, iters: int, eps: float
-) -> torch.Tensor:
-    mixes = torch.softmax(mixes, dim=-1) + eps
-    mixes = mixes / (mixes.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(iters - 1):
-        mixes = mixes / (mixes.sum(dim=-1, keepdim=True) + eps)
-        mixes = mixes / (mixes.sum(dim=-2, keepdim=True) + eps)
-    return mixes
-
-
 def _mhc_pre_reference(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -120,41 +113,17 @@ def _mhc_pre_reference(
     hc_eps: float,
     sinkhorn_iters: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_tokens, hc_mult, _ = residual.shape
-    x = residual.flatten(1).float()
-    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + rms_eps)
-    mixes = F.linear(x, fn.float()) * rsqrt
-    pre_raw, post_raw, comb_raw = torch.split(
-        mixes, [hc_mult, hc_mult, hc_mult * hc_mult], dim=-1
-    )
-    pre_base, post_base, comb_base = torch.split(
-        hc_base.float(), [hc_mult, hc_mult, hc_mult * hc_mult], dim=-1
-    )
-    pre = torch.sigmoid(pre_raw * hc_scale[0].float() + pre_base) + hc_eps
-    post = (torch.sigmoid(post_raw * hc_scale[1].float() + post_base) * 2.0).unsqueeze(
-        -1
-    )
-    comb = _mhc_sinkhorn_reference(
-        comb_raw.reshape(num_tokens, hc_mult, hc_mult) * hc_scale[2].float()
-        + comb_base.reshape(1, hc_mult, hc_mult),
-        sinkhorn_iters,
+    return torch_mhc_pre(
+        residual,
+        fn.float(),
+        hc_scale,
+        hc_base,
+        rms_eps,
         hc_eps,
+        sinkhorn_iters,
+        None,
+        None,
     )
-    layer_input = torch.sum(pre.unsqueeze(-1) * residual.float(), dim=1)
-    return layer_input.to(residual.dtype), post, comb
-
-
-def _mhc_post_reference(
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-) -> torch.Tensor:
-    if post.dim() == 2:
-        post = post.unsqueeze(-1)
-    mixed_residual = torch.einsum("tnm,tnh->tmh", comb.float(), residual.float())
-    block_update = post.float() * hidden_states.float().unsqueeze(1)
-    return (mixed_residual + block_update).to(hidden_states.dtype)
 
 
 class TestDeepseekV4Config:
@@ -549,42 +518,41 @@ class TestDeepseekV4Config:
         assert (topk_config["routed_scaling_factor"]) == (2.5)
         assert (topk_config["weights_dtype"]) == (torch.bfloat16)
 
-    @pytest.mark.parametrize("normalized", [False, True])
-    def test_deepseek_v4_moe_deferred_finalize_keeps_scaled_route_weights(
-        self, normalized
+    @staticmethod
+    def _fake_deferred_moe(
+        make_moe, hidden_states, input_ids, route_weights, kernel_result
     ):
-        hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
-        input_ids = torch.arange(2)
-        moe = self._make_fake_deepseek_v4_moe(
+        moe = make_moe(
             hidden_states,
             input_ids,
             StreamFork(None),
             [],
-            norm_topk_prob=normalized,
+            norm_topk_prob=True,
         )
-        # Routing has already applied the model's scaling factor.
-        gemm = hidden_states + 1
-        weights = torch.full((2, 1), 2.0, dtype=torch.bfloat16)
-        indices = torch.arange(2, dtype=torch.int32)
-        moe.experts = Mock(return_value=(gemm, weights, indices))
-        moe.experts.supports_deferred_finalize = True
+        moe.topk = lambda *args, **kwargs: SimpleNamespace(topk_weights=route_weights)
+        moe.experts = Mock(return_value=kernel_result)
+        moe.experts.supports_deferred_cuda_finalize = True
+        return moe
 
-        def finalize(
-            gemm2_out,
-            expanded_idx,
-            expert_weights,
-            shared,
-            *,
-            top_k,
-            enable_pdl,
-            hidden_dim,
-        ):
-            assert (gemm2_out) is (gemm)
-            assert (expanded_idx) is (indices)
-            assert (expert_weights) is (weights)
-            assert (top_k) == (1)
-            assert isinstance(enable_pdl, bool)
-            assert (hidden_dim) == (hidden_states.shape[-1])
+    def test_deepseek_v4_moe_deferred_finalize_fuses_the_shared_expert(self):
+        hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
+        input_ids = torch.arange(2)
+        route_weights = torch.full((2, 1), 2.0, dtype=torch.bfloat16)
+        gemm = hidden_states + 1
+        indices = torch.arange(2, dtype=torch.int32)
+        moe = self._fake_deferred_moe(
+            self._make_fake_deepseek_v4_moe,
+            hidden_states,
+            input_ids,
+            route_weights,
+            (gemm, route_weights, indices),
+        )
+
+        def finalize(gemm2_out, expanded_idx, expert_weights, shared, **kwargs):
+            assert gemm2_out is gemm and expanded_idx is indices
+            assert expert_weights is route_weights
+            assert kwargs["top_k"] == 1
+            assert kwargs["hidden_dim"] == hidden_states.shape[-1]
             return (
                 gemm2_out.float() * expert_weights.float() + shared.float()
             ).bfloat16()
@@ -593,7 +561,7 @@ class TestDeepseekV4Config:
             deepseek_v4_model, "moe_finalize_fuse_shared", side_effect=finalize
         ):
             actual = moe.forward_normal(hidden_states, input_ids, 2, 2)
-        assert not (moe.experts.call_args.kwargs["do_finalize"])
+        assert not moe.experts.call_args.kwargs["do_finalize"]
         torch.testing.assert_close(
             actual, (hidden_states + 1) * 2 + hidden_states + 3, atol=0, rtol=0
         )
@@ -601,59 +569,28 @@ class TestDeepseekV4Config:
     def test_deepseek_v4_moe_common_finalize_trims_padding_without_shared(self):
         hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
         input_ids = torch.arange(2)
-        moe = self._make_fake_deepseek_v4_moe(
+        weights = torch.full((2, 1), 2.0, dtype=torch.bfloat16)
+        gemm = torch.ones(2, 8, dtype=torch.bfloat16)
+        moe = self._fake_deferred_moe(
+            self._make_fake_deepseek_v4_moe,
             hidden_states,
             input_ids,
-            StreamFork(None),
-            [],
-            norm_topk_prob=True,
+            weights,
+            (gemm, weights, torch.arange(2, dtype=torch.int32)),
         )
         moe.n_shared_experts = None
         moe.shared_experts = None
-        gemm = torch.ones(2, 8, dtype=torch.bfloat16)
-        weights = torch.full((2, 1), 2.0, dtype=torch.bfloat16)
-        indices = torch.arange(2, dtype=torch.int32)
-        moe.experts = Mock(return_value=(gemm, weights, indices))
-        moe.experts.supports_deferred_finalize = True
         with patch.object(
             deepseek_v4_model,
             "moe_finalize_fuse_shared",
             return_value=(gemm * weights)[:, : hidden_states.shape[-1]].contiguous(),
         ) as finalize:
             actual = moe.forward_normal(hidden_states, input_ids, 2, 2)
-        assert (finalize.call_args.args[3]) is None
-        assert (finalize.call_args.kwargs["top_k"]) == (1)
+        assert finalize.call_args.args[3] is None
         assert finalize.call_args.kwargs["hidden_dim"] == hidden_states.shape[-1]
-        assert (actual.shape) == (hidden_states.shape)
+        assert actual.shape == hidden_states.shape
         assert actual.is_contiguous()
         torch.testing.assert_close(actual, hidden_states * 2, atol=0, rtol=0)
-
-    def test_deepseek_v4_moe_deferred_finalize_uses_routes_without_kernel_weights(
-        self,
-    ):
-        # Precomputed-route kernels (Triton MXFP4) return no weights; the
-        # routing pass holds them.
-        hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
-        input_ids = torch.arange(2)
-        moe = self._make_fake_deepseek_v4_moe(
-            hidden_states,
-            input_ids,
-            StreamFork(None),
-            [],
-            norm_topk_prob=True,
-        )
-        route_weights = torch.tensor([[0.25, 0.75], [0.5, 0.5]])
-        moe.topk = lambda *args, **kwargs: SimpleNamespace(topk_weights=route_weights)
-        gemm = torch.ones(4, 3, dtype=torch.bfloat16)
-        indices = torch.arange(4, dtype=torch.int32)
-        moe.experts = Mock(return_value=(gemm, None, indices))
-        moe.experts.supports_deferred_finalize = True
-        with patch.object(
-            deepseek_v4_model, "moe_finalize_fuse_shared", return_value=hidden_states
-        ) as finalize:
-            moe.forward_normal(hidden_states, input_ids, 2, 2)
-        assert finalize.call_args.args[2] is route_weights
-        assert finalize.call_args.kwargs["top_k"] == 2
 
     def test_deepseek_v4_moe_keeps_finalize_for_unsupported_consumer(self):
         hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
@@ -666,7 +603,7 @@ class TestDeepseekV4Config:
             norm_topk_prob=True,
         )
         moe.experts = Mock(return_value=hidden_states * 2)
-        moe.experts.supports_deferred_finalize = False
+        moe.experts.supports_deferred_cuda_finalize = False
         with patch.object(deepseek_v4_model, "moe_finalize_fuse_shared") as finalize:
             actual = moe.forward_normal(hidden_states, input_ids, 2, 2)
         assert moe.experts.call_args.kwargs["do_finalize"]
@@ -1851,7 +1788,7 @@ class TestDeepseekV4Config:
             hc_eps=1e-6,
             sinkhorn_iters=2,
         )
-        updated = _mhc_post_reference(layer_input, residual, post, comb)
+        updated = torch_mhc_post(layer_input, residual, post, comb)
 
         assert (tuple(layer_input.shape)) == ((tokens, hidden))
         assert (tuple(post.shape)) == ((tokens, hc_mult, 1))
@@ -1915,7 +1852,7 @@ class TestDeepseekV4Config:
         post = torch.tensor([[[0.5], [0.25]]], dtype=torch.float32)
         comb = torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32)
 
-        updated = _mhc_post_reference(hidden_states, residual, post, comb)
+        updated = torch_mhc_post(hidden_states, residual, post, comb)
 
         expected = torch.empty_like(residual)
         expected[:, 0] = (

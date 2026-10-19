@@ -35,6 +35,7 @@ import importlib.util
 import json
 import os
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,6 +44,7 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
@@ -55,9 +57,45 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     EngramLayout,
     RowShardedEngramEmbedding,
     build_compressed_token_map,
-    build_engram_previous_tokens,
     compute_hash_multipliers,
 )
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
+
+
+def build_engram_previous_tokens(
+    token_histories: Sequence[Sequence[int]],
+    request_indices: Sequence[int],
+    positions: Sequence[int],
+) -> torch.Tensor:
+    """Test oracle: CPU int64 [tokens, 3] raw lookbacks, newest first.
+
+    Histories are physical-position request histories with nonparticipating
+    positions marked -1; request indices and positions describe each packed
+    token, as the runtime's fused preparation resolves them.
+    """
+    if len(request_indices) != len(positions):
+        raise ValueError("Engram request indices and positions must have equal lengths")
+    windows = []
+    for request_index, position in zip(request_indices, positions, strict=True):
+        if not 0 <= request_index < len(token_histories):
+            raise ValueError(f"Invalid Engram history request index {request_index}")
+        history = token_histories[request_index]
+        if not 0 <= position <= len(history):
+            raise ValueError(
+                f"Engram history is missing tokens before position {position}"
+            )
+        window = [
+            history[position - shift] if position >= shift else -1
+            for shift in (1, 2, 3)
+        ]
+        if any(token_id < -1 for token_id in window):
+            raise ValueError("Mark nonparticipating history tokens with -1")
+        windows.append(window)
+    return torch.tensor(windows, dtype=torch.int64, device="cpu").reshape(-1, 3)
 
 
 class _Tokenizer:
@@ -504,7 +542,11 @@ def test_cuda_quantized_projection_forward():
     reference.wkv.weight.data.copy_((weight.float() / 64).to(torch.bfloat16))
     expected = reference(hidden, ids, mask)
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
-    assert model.wkv.weight.dtype == torch.float8_e4m3fn
+    # Hopper loads V4.1 FP8 projections as BF16 with the scales folded in.
+    expected_dtype = (
+        torch.bfloat16 if current_platform().is_hopper else torch.float8_e4m3fn
+    )
+    assert model.wkv.weight.dtype == expected_dtype
     for _ in range(2):
         model(hidden, ids, mask)
     torch.cuda.synchronize()

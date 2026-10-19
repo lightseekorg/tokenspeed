@@ -105,6 +105,46 @@ def _e2m1_decode(code):
 
 
 @triton.jit
+def _ue8m0_exponent(scaled_max):
+    # Biased exponent of 2**ceil(log2(x)); matches the reference IEEE-754
+    # ceil(log2) exactly, unlike an approximate log2.
+    bits = scaled_max.to(tl.int32, bitcast=True)
+    return ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+
+
+@triton.jit
+def _mxfp4_index_rows(groups, scaled_max, ROWS: tl.constexpr):
+    """Encode FP32 [ROWS, 4, 32] index groups as MXFP4 rows.
+
+    scaled_max is each group's floored amax / 6; callers keep the division
+    their reference uses. Returns nibble-packed E2M1 codes uint8 [ROWS, 64]
+    (even element in the low nibble) and the biased UE8M0 exponents
+    int32 [ROWS, 4].
+    """
+    exponent = _ue8m0_exponent(scaled_max)
+    scale = (exponent << 23).to(tl.float32, bitcast=True)
+    codes = _e2m1_encode(tl.div_rn(groups, scale[:, :, None])).to(tl.int32)
+    pairs = tl.reshape(codes, (ROWS, 64, 2))
+    packed = tl.sum(pairs << (tl.arange(0, 2)[None, None, :] * 4), 2).to(tl.uint8)
+    return packed, exponent
+
+
+@triton.jit
+def _ue8m0_word(exponent):
+    # Four [ROWS, 4] exponent bytes as one little-endian int32 per row.
+    word = tl.sum(exponent.to(tl.uint32) << (tl.arange(0, 4)[None, :] * 8), 1)
+    return word.to(tl.int32)
+
+
+@triton.jit
+def _global_e4m3_scale(amax):
+    # The global codec rounds its group scales to E4M3, unlike index scales.
+    return (
+        tl.div_rn(tl.maximum(amax, 6 * 2.0**-9), 6.0).to(tl.float8e4nv).to(tl.float32)
+    )
+
+
+@triton.jit
 def _planar_offset(byte, CR: tl.constexpr, CB: tl.constexpr, ROW_BYTES: tl.constexpr):
     # Byte offsets are page-planar, while the external field retains its LCM
     # [pages, rows, row_bytes] shape. Honor even noncontiguous portable views.
@@ -150,24 +190,16 @@ def _pack_kernel(
             # One plain FP32 scale for the whole row; no exponent rounding.
             scale = tl.maximum(amax, 1.0e-6) * (1.0 / 448.0)
         elif FORMAT == "global":
-            scale = (
-                tl.div_rn(tl.maximum(amax, 6 * 2.0**-9), 6.0)
-                .to(tl.float8e4nv)
-                .to(tl.float32)
-            )
+            scale = _global_e4m3_scale(amax)
             scale_byte = scale.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
         else:
             if FORMAT == "index":
                 scaled_max = tl.maximum(amax, 6 * 2.0**-126) * (1.0 / 6.0)
             else:
                 scaled_max = tl.maximum(amax, 1.0e-4) * (1.0 / 448.0)
-            # Match reference IEEE-754 ceil(log2), not an approximate log2.
-            bits = scaled_max.to(tl.int32, bitcast=True)
-            exponent = (
-                ((bits >> 23) & 255) - 127 + ((bits & 0x7FFFFF) != 0).to(tl.int32)
-            )
-            scale = ((exponent + 127) << 23).to(tl.float32, bitcast=True)
-            scale_byte = (exponent + 127).to(tl.uint8)
+            exponent = _ue8m0_exponent(scaled_max)
+            scale = (exponent << 23).to(tl.float32, bitcast=True)
+            scale_byte = exponent.to(tl.uint8)
         y = tl.div_rn(x, scale[:, None]).reshape(D)
         base = C + (slot // PAGE_ROWS) * CP
         page_row = slot % PAGE_ROWS
@@ -1501,9 +1533,7 @@ def _swa_rope_insert(
     values = tl.reshape(rotated.to(tl.float32), (GROUPS, GROUP))
     amax = tl.maximum(tl.max(tl.abs(values), 1), 1.0e-4)
     # Use the same IEEE exponent rule as the portable cache codec.
-    raw_scale = amax * (1.0 / 448.0)
-    bits = raw_scale.to(tl.int32, bitcast=True)
-    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    exponent = _ue8m0_exponent(amax * (1.0 / 448.0))
     scale = (exponent << 23).to(tl.float32, bitcast=True)
     quantized = tl.reshape(tl.div_rn(values, scale[:, None]), (512,)).to(tl.float8e4nv)
     if HAS_OUT:
@@ -1805,8 +1835,7 @@ def _dspark_rows_kernel(
     # All-channel 1x32 E4M3/E8M0 round trip, the reference SWA row codec.
     values = tl.reshape(x, (16, 32))
     amax = tl.maximum(tl.max(tl.abs(values), 1), 1.0e-4)
-    bits = (amax * (1.0 / 448.0)).to(tl.int32, bitcast=True)
-    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    exponent = _ue8m0_exponent(amax * (1.0 / 448.0))
     scale = (exponent << 23).to(tl.float32, bitcast=True)
     quantized = tl.div_rn(values, scale[:, None]).to(tl.float8e4nv)
     restored = tl.reshape(quantized.to(tl.float32) * scale[:, None], (512,)).to(
@@ -2109,19 +2138,11 @@ def _pack_index_queries(X, V, S, X0, X1):
     row = tl.program_id(0).to(tl.int64)
     d = tl.arange(0, 128)
     x = tl.load(X + row * X0 + d * X1).to(tl.float32)
-    grouped = tl.reshape(x, (4, 32))
-    amax = tl.maximum(tl.max(tl.abs(grouped), 1), 6.0 * 1.1754943508222875e-38)
-    raw = tl.div_rn(amax, 6.0)
-    bits = raw.to(tl.int32, bitcast=True)
-    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
-    scale = (exponent << 23).to(tl.float32, bitcast=True)
-    normalized = tl.reshape(tl.div_rn(grouped, scale[:, None]), (128,))
-    code = _e2m1_encode(normalized).to(tl.int32)
-    pairs = tl.reshape(code, (64, 2))
-    packed = tl.sum(pairs << (tl.arange(0, 2)[None, :] * 4), 1).to(tl.uint8)
-    word = tl.sum(exponent.to(tl.uint32) << (tl.arange(0, 4) * 8), 0)
-    tl.store(V + row * 64 + tl.arange(0, 64), packed)
-    tl.store(S + row, word.to(tl.int32))
+    grouped = tl.reshape(x, (1, 4, 32))
+    amax = tl.maximum(tl.max(tl.abs(grouped), 2), 6 * 2.0**-126)
+    packed, exponent = _mxfp4_index_rows(grouped, tl.div_rn(amax, 6.0), 1)
+    tl.store(V + row * 64 + tl.arange(0, 64), tl.reshape(packed, (64,)))
+    tl.store(S + row + tl.arange(0, 1), _ue8m0_word(exponent))
 
 
 @triton.jit
@@ -2291,52 +2312,6 @@ def clean_logits(values, lengths, table, pages, capacity, page_size):
     return _clean_logits_output(
         values, lengths, table, pages, capacity, page_size, False
     )
-
-
-@triton.jit(
-    do_not_specialize=["C0", "S0", "N", "NP"],
-    do_not_specialize_on_alignment=["C0", "S0", "N", "NP"],
-)
-def _gather_index_cache(C, S, V, F, C0, S0, N, NP, P: tl.constexpr, B: tl.constexpr):
-    row = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
-    slot = tl.load(S + row * S0, row < N, other=-1).to(tl.int64)
-    valid = (row < N) & (slot >= 0) & (slot < NP * P)
-    page, offset = slot // P, slot % P
-    d = tl.arange(0, 64)
-    data = tl.load(
-        C + page[:, None] * C0 + offset[:, None] * 64 + d[None, :],
-        valid[:, None],
-        other=0,
-    )
-    tl.store(V + row[:, None] * 64 + d[None, :], data, (row < N)[:, None])
-    b = tl.arange(0, 4)
-    sf = tl.load(
-        C + page[:, None] * C0 + P * 64 + offset[:, None] * 4 + b[None, :],
-        valid[:, None],
-        other=127,
-    ).to(tl.uint32)
-    word = tl.sum(sf << (b[None, :] * 8), 1)
-    tl.store(F + row, word.to(tl.int32), row < N)
-
-
-def gather_index_cache(cache, slots, page_size):
-    data = torch.empty((slots.numel(), 64), dtype=torch.uint8, device=cache.device)
-    scales = torch.empty((slots.numel(),), dtype=torch.int32, device=cache.device)
-    if slots.numel():
-        _gather_index_cache[(triton.cdiv(slots.numel(), 32),)](
-            cache,
-            slots,
-            data,
-            scales,
-            cache.stride(0),
-            slots.stride(0),
-            slots.numel(),
-            cache.shape[0],
-            page_size,
-            32,
-            num_warps=4,
-        )
-    return data, scales
 
 
 @triton.jit(
@@ -3430,20 +3405,12 @@ def _pack_index_inputs(
         other=0,
     ).to(tl.float32)
     grouped = tl.reshape(x, (ROWS, 4, 32))
-    amax = tl.maximum(tl.max(tl.abs(grouped), 2), 6.0 * 1.1754943508222875e-38)
-    raw = tl.div_rn(amax, 6.0)
-    bits = raw.to(tl.int32, bitcast=True)
-    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
-    scale = (exponent << 23).to(tl.float32, bitcast=True)
-    normalized = tl.reshape(tl.div_rn(grouped, scale[:, :, None]), (ROWS, 128))
-    code = _e2m1_encode(normalized).to(tl.int32)
-    pairs = tl.reshape(code, (ROWS, 64, 2))
-    packed = tl.sum(pairs << (tl.arange(0, 2)[None, None, :] * 4), 2).to(tl.uint8)
-    word = tl.sum(exponent.to(tl.uint32) << (tl.arange(0, 4)[None, :] * 8), 1)
+    amax = tl.maximum(tl.max(tl.abs(grouped), 2), 6 * 2.0**-126)
+    packed, exponent = _mxfp4_index_rows(grouped, tl.div_rn(amax, 6.0), ROWS)
     tl.store(
         V + row[:, None] * 64 + tl.arange(0, 64)[None, :], packed, (row < N)[:, None]
     )
-    tl.store(S + row, word.to(tl.int32), row < N)
+    tl.store(S + row, _ue8m0_word(exponent), row < N)
     if CONVERT_WEIGHTS:
         weight = tl.load(W + token * W0 + head * W1, row < N, other=0).to(tl.float32)
         tl.store(OW + row, weight, row < N)

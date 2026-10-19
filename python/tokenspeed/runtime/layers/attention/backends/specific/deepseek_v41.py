@@ -1517,8 +1517,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         swa_rope_cache,
         swa_norm_weight,
         swa_norm_eps,
+        out_rope_cache=None,
     ) -> torch.Tensor:
-        """Joint SWA/global attention; returns BF16 [T,Hlocal,512], BEFORE inverse RoPE.
+        """Joint SWA/global attention; returns BF16 [T,Hlocal,512].
+
+        The output is BEFORE inverse RoPE unless out_rope_cache (the inverse
+        FP32 [positions,64] table) is given; then it is rotated with it.
 
         q and swa_kv are [T,Hlocal,512] / [T,512]. q is post-RoPE; SWA can
         defer RMSNorm and RoPE using swa_norm_weight/eps and swa_rope_cache.
@@ -1544,6 +1548,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             )
         if not 0 <= layer_id < len(self.spec.kv_owners):
             raise ValueError("V4.1 layer_id is outside the backbone")
+        if swa_norm_weight is not None and swa_rope_cache is None:
+            # Only the fused RoPE writers apply the deferred SWA norm.
+            raise ValueError("A deferred SWA norm requires the SWA RoPE cache")
         if forward_mode.is_mixed():
             meta = self.query_metadata(forward_mode)
             view = self._decoder_view
@@ -1604,6 +1611,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     swa_rope_cache=swa_rope_cache,
                     swa_norm_weight=swa_norm_weight,
                     swa_norm_eps=swa_norm_eps,
+                    out_rope_cache=out_rope_cache,
                 )
             return out
         if n == 0:
@@ -1658,6 +1666,21 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 if canonical
                 else self.window_slots(V41_SWA_GROUP_ID, positions, request_indices)
             )
+            if out_rope_cache is not None:
+                return dsv41.selected_attention_rope(
+                    q,
+                    cache,
+                    swa_slots,
+                    swa_lens,
+                    global_cache,
+                    global_slots,
+                    global_lens,
+                    attn_sink,
+                    softmax_scale,
+                    self._decode_schedule(swa_lens, global_lens),
+                    positions,
+                    out_rope_cache,
+                )
             return dsv41.selected_attention(
                 q,
                 cache,
@@ -1767,6 +1790,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             del workspace, current_rows, indices
         if swa_rope_cache is None:
             dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
+        if out_rope_cache is not None:
+            dsv41.rope_inplace(out, positions, out_rope_cache, None)
         return out
 
     def forward_decode(self, *args, **kwargs):

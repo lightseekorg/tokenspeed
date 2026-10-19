@@ -32,6 +32,10 @@ import math
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.mha import (
+    gather_pages,
+    torch_dense_attention,
+)
 from tokenspeed_kernel.ops.attention.mla import mla_extend_with_kvcache
 from utils import assert_no_triton_compile, is_cdna4
 
@@ -125,17 +129,19 @@ def _reference(case):
     refs = []
     cu_q = case["cu_seqlens_q"].tolist()
     for b, cache_len in enumerate(case["cache_seqlens"].tolist()):
-        n = math.ceil(cache_len / _PAGE_SIZE)
-        k = kv[case["page_table"][b, :n].long()].reshape(-1, _HEAD_DIM)[:cache_len]
+        k = gather_pages(kv, case["page_table"][b], cache_len)
+        k = k.reshape(cache_len, 1, _HEAD_DIM)
         q_b = q[cu_q[b] : cu_q[b + 1]]
-        q_len = q_b.shape[0]
-        scores = torch.einsum("qhd,kd->qhk", q_b, k) * _SCALE
-        last = cache_len - q_len + torch.arange(q_len, device=q.device)
-        visible = torch.arange(cache_len, device=q.device)[None, :] <= last[:, None]
-        scores = scores.masked_fill(~visible[:, None, :], -float("inf"))
-        refs.append(
-            torch.einsum("qhk,kd->qhd", scores.softmax(-1), k[:, :_KV_LORA_RANK])
+        out, _ = torch_dense_attention(
+            q_b,
+            k,
+            k[..., :_KV_LORA_RANK],
+            scale=_SCALE,
+            causal_offset=cache_len - q_b.shape[0],
+            window_left=None,
+            sinks=None,
         )
+        refs.append(out)
     return torch.cat(refs)
 
 

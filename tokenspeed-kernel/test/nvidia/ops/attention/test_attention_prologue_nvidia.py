@@ -34,7 +34,7 @@ if not is_nvidia():
     pytest.skip("NVIDIA GPU required", allow_module_level=True)
 
 import tokenspeed_kernel.ops.attention.prologue as prologue  # noqa: E402
-from attention_prologue_reference import (  # noqa: E402
+from attention_prologue_helpers import (  # noqa: E402
     BF16,
     FP8,
     bytes_equal,

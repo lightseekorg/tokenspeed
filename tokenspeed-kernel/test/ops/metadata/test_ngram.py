@@ -502,3 +502,85 @@ def test_ngram_kernels_fit_the_default_stack(ids_dtype, lengths_dtype):
         if 4 * kernel.n_spills > limit
     ]
     assert compiled and not over_limit, over_limit
+
+
+def _is_prime(n: int) -> bool:
+    if n < 2:
+        return False
+    for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if n % p == 0:
+            return n == p
+    d, s = n - 1, 0
+    while d % 2 == 0:
+        d, s = d // 2, s + 1
+    for a in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        x = pow(a, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(s - 1):
+            x = x * x % n
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm")
+def test_ngram_hash_matches_reference_at_production_scale():
+    """Production constants use most of int64; small fixtures would hide high-bit bugs."""
+    from tokenspeed_kernel.ops.metadata.ngram import engram_hash_reciprocals
+
+    generator = torch.Generator().manual_seed(20261018)
+    vocab, compressed, layers, heads = 129280, 99092, 2, 8
+    token_map = torch.randint(0, compressed, (vocab,), generator=generator)
+    # Like the model's multipliers: odd values whose product with any token fits int64.
+    bound = (2**63 - 1) // compressed // 2
+    multipliers = torch.randint(0, bound, (layers, 4), generator=generator) * 2 + 1
+    primes, candidate = [], 16_000_000
+    while len(primes) < layers * 3 * heads:
+        candidate += 1
+        if _is_prime(candidate):
+            primes.append(candidate)
+    primes = torch.tensor(primes).reshape(layers, 3, heads)
+    flat = primes.flatten(1)
+    params = NGramHashParams(
+        token_map,
+        primes,
+        engram_hash_reciprocals(primes),
+        flat.cumsum(-1) - flat,
+        multipliers,
+        int(token_map[2]),
+    )
+    gpu_params = NGramHashParams(
+        *(t.cuda() for t in (token_map, primes, params.reciprocals)),
+        params.offsets.cuda(),
+        multipliers.cuda(),
+        params.pad_id,
+    )
+    tokens = 4096
+    ids = torch.randint(0, vocab, (tokens,), generator=generator, dtype=torch.int32)
+    snapshots = torch.randint(0, vocab, (1, 4), generator=generator)
+    previous = torch.empty((tokens, 3), dtype=torch.int64)
+    mask = torch.empty(tokens, dtype=torch.bool)
+    gpu = [
+        t.cuda()
+        for t in (
+            snapshots,
+            torch.zeros(1, dtype=torch.int64),
+            torch.ones(1, dtype=torch.int64),
+            torch.zeros(1, dtype=torch.int64),
+            torch.zeros(2, dtype=torch.int32),
+            torch.tensor([tokens]),
+            torch.full((2, 3), -1, dtype=torch.int64),
+            torch.ones(2, dtype=torch.bool),
+            ids,
+            previous,
+            mask,
+        )
+    ]
+    prefix = torch.empty((1, 3), dtype=torch.int64, device="cuda")
+    hashes = torch.empty((tokens, layers, 3 * heads), dtype=torch.int64, device="cuda")
+    prepare_ngram_inputs(*gpu, prefix, hashes, tokens, vocab, tokens, gpu_params)
+    expected = params.hash(ids, gpu[9].cpu(), gpu[10].cpu())
+    torch.testing.assert_close(hashes.cpu(), expected, rtol=0, atol=0)

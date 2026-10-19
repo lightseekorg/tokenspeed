@@ -180,7 +180,7 @@ lanes and nodes are always fully written.
 
 ### Sampled verify keys noise by position
 
-The triton sampling backend draws a verify row's target token by Gumbel-max
+The `triton` sampling backend draws a verify row's target token by Gumbel-max
 keyed by `(seed, position)`. For a tree the key is the position predicted by the node
 (`vc + depth + 1`, with `vc` the pre-forward input frontier), never its row: each node row samples with its request's
 parameters and its offset advanced by its depth, so the token accepted at every
@@ -207,8 +207,8 @@ Each attention backend node declares its own part through `tree_support()`
 through `child_backends()` once at startup, before any bind, and reports every
 blocker together. Composites never forward the question, so a new composite
 cannot silently skip a child. Sliding window and attention sinks are the named
-exception: they are per layer and per call, so the trtllm and tokenspeed_mla
-forwards refuse them (trtllm_mla takes no sliding window at all).
+exception: they are per layer and per call, so the `trtllm` and `tokenspeed_mla`
+forwards refuse them (`trtllm_mla` takes no sliding window at all).
 
 ## Not scheduler or cache state
 
@@ -216,7 +216,7 @@ The only per-request fact that crosses steps is the next round's `parent[N]`,
 an attribute of the candidate block `future_input_map` already carries on the
 executor side. Lane K/V are round-local: they live in the request's draft
 window until the next verify overwrites it (never prefix-matched,
-transferred or freed with blocks), and the per-node GDN states live in
+transferred, or freed with blocks), and the per-node GDN states live in
 verify-time workspaces (the verify scratch, or the ReplaySSM node-state
 workspace), so nothing here is a cache group for the C++ scheduler to own.
 
@@ -234,7 +234,7 @@ workspace), so nothing here is a cache group for the C++ scheduler to own.
   64 nodes, short prefixes, non-finite unseen slots), tree verify and KV-row
   compaction (`test_compact_window_rows_moves_every_buffer`, bf16 and fp8).
 * `test/runtime/test_tree_attention_cascade.py` — verify and lanes through the
-  trtllm, trtllm_mla and tokenspeed_mla leaves (each leaf's prefix decode plus
+  `trtllm`, `trtllm_mla`, and `tokenspeed_mla` leaves (each leaf's prefix decode plus
   the window kernel) against fp32.
 * `test/runtime/test_draft_tree.py` — tree construction against a per-request
   EAGLE-2 reference, depth-first order, strided roots, NaN scores.

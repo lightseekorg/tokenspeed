@@ -29,6 +29,10 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.kda import (
+    torch_commit_state_pages,
+    torch_verify_state_blocks,
+)
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -47,11 +51,6 @@ def _two_slot_table(bs, *, generator, null_input_rows):
     return table
 
 
-def _reference(table, *, batch_size):
-    rows = table[:batch_size]
-    return torch.where(rows[:, 0] > 0, rows[:, 0], rows[:, 1]).to(torch.int32)
-
-
 def _run(table, *, batch_size):
     pages = torch.empty(batch_size, dtype=torch.int32, device="cuda")
     verify_state_blocks(table, batch_size=batch_size, pages_out=pages)
@@ -65,7 +64,8 @@ def test_verify_reads_the_input_slot_when_present_else_the_live_slot(batch_size)
         batch_size, generator=g, null_input_rows=slice(0, batch_size, 2)
     )
     assert torch.equal(
-        _run(table, batch_size=batch_size), _reference(table, batch_size=batch_size)
+        _run(table, batch_size=batch_size),
+        torch_verify_state_blocks(table, batch_size=batch_size),
     )
 
 
@@ -100,11 +100,6 @@ def test_layouts_and_arguments_the_kernel_cannot_serve_are_rejected():
         )
 
 
-def _commit_reference(accepted, table, *, bs, draft_tokens):
-    steps = accepted[:bs].to(torch.int64).clamp(min=1, max=draft_tokens)
-    return table[:bs, 1].to(torch.int32), steps.to(torch.int32)
-
-
 @pytest.mark.parametrize("bs", [1, 3, 8, 512])
 @pytest.mark.parametrize("draft_tokens", [1, 4])
 def test_commit_targets_the_live_slot(bs, draft_tokens):
@@ -124,7 +119,7 @@ def test_commit_targets_the_live_slot(bs, draft_tokens):
         out_row=1,
         steps_out=steps,
     )
-    want_p, want_s = _commit_reference(
+    want_p, want_s = torch_commit_state_pages(
         accepted, table, bs=bs, draft_tokens=draft_tokens
     )
     assert torch.equal(pages[1], want_p)
@@ -213,7 +208,7 @@ def test_commit_honours_a_destination_row_stride_wider_than_the_batch():
         out_row=1,
         steps_out=steps,
     )
-    want_p, want_s = _commit_reference(accepted, table, bs=bs, draft_tokens=4)
+    want_p, want_s = torch_commit_state_pages(accepted, table, bs=bs, draft_tokens=4)
     assert torch.equal(wide[1, :bs], want_p)
     assert torch.equal(steps, want_s)
     assert (wide[0] == -9).all() and (wide[2] == -9).all()

@@ -434,6 +434,70 @@ class TestPreparedMxfp8:
                 prepacked_scales=True,
             )
 
+    @pytest.mark.parametrize("rows", [1, 129])
+    def test_prepacked_mm_takes_quantized_codes_without_weight_repacking(
+        self, monkeypatch, rows
+    ):
+        from tokenspeed_kernel.ops.gemm import flashinfer as gemm_flashinfer
+
+        weight = torch.randn(256, 384, device="cuda").to(torch.float8_e4m3fn)
+        scales = torch.randint(120, 126, (256, 12), device="cuda", dtype=torch.uint8)
+        prepared = prepare_mxfp8_weight_scales(weight, scales)
+        x = torch.randn(rows, 384, device="cuda", dtype=torch.bfloat16)
+        codes, input_scales = _online_quantize_mxfp8(
+            x, [1, 32], "ue8m0", enable_pdl=False, kernel_name=None
+        )
+        expected = mm(
+            codes,
+            weight,
+            A_scales=input_scales,
+            B_scales=scales,
+            out_dtype=x.dtype,
+            quant="mxfp8",
+            block_size=[1, 32],
+            override="flashinfer_mm_mxfp8",
+        )
+        swizzle = gemm_flashinfer.swizzle_mxfp8_scale
+
+        def activation_only(sf, m, k):
+            assert m == rows, "prepacked mm repacked the weight scales"
+            return swizzle(sf, m, k)
+
+        monkeypatch.setattr(gemm_flashinfer, "swizzle_mxfp8_scale", activation_only)
+        actual = mm(
+            codes,
+            weight,
+            A_scales=input_scales,
+            B_scales=prepared,
+            out_dtype=x.dtype,
+            quant="mxfp8",
+            block_size=[1, 32],
+            prepacked_scales=True,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("argument", ["alpha", "solution", "override"])
+    def test_prepacked_mm_rejects_arguments_it_cannot_honor(self, argument):
+        weight = torch.randn(256, 128, device="cuda").to(torch.float8_e4m3fn)
+        scales = torch.full((256, 4), 123, device="cuda", dtype=torch.uint8)
+        x = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
+        extra = {
+            "alpha": {"alpha": torch.ones(1, device="cuda")},
+            "solution": {"solution": "triton"},
+            "override": {"override": "triton_mm_fp8_blockscale"},
+        }[argument]
+        with pytest.raises(ValueError, match="runs only flashinfer_mm_mxfp8"):
+            mm(
+                x,
+                weight,
+                B_scales=prepare_mxfp8_weight_scales(weight, scales),
+                out_dtype=x.dtype,
+                quant="mxfp8",
+                block_size=[1, 32],
+                prepacked_scales=True,
+                **extra,
+            )
+
 
 @pytest.mark.parametrize("rows", [0, 1, 16, 129])
 @pytest.mark.parametrize("hidden", [96, 1280])

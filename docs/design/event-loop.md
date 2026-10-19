@@ -156,7 +156,11 @@ Consequences:
   backpressured stage off the control plane. The remote submissions' only
   failure surface is a settle at the next round's `execute` (their semantic
   completion arrives through the transfer events; a submission that RAISED
-  produces none, so the settle must not swallow it). The handle's remaining
+  produces none, so the settle must not swallow it). A raise is therefore
+  for broken invariants only: a transfer worker, the bootstrap thread or
+  another Prefill rank can fail a request's transfer while its submission
+  waits on the FIFO, and that submission then does nothing for the request,
+  whose failure arrives as its transfer event. The handle's remaining
   `run_*` methods do block, deliberately — the DP idle forward, the landing of a
   completed remote prefill, the KV repair after a wake, the RL weight sync —
   but each is a low-rate path whose caller cannot proceed without the result
@@ -297,7 +301,7 @@ There are exactly two call sites, each with a documented reason:
 * **Head of the round** — completed Host cache-op events
   (`_cache_hooks.poll_ready_events()`: `WriteBackDone`, `LoadBackDone`,
   `PrefetchDone`, `SnapshotDone`, `RestoreDone`, each replica-intersected).
-  These must advance *before* `next_execution_plan`, otherwise cache-gated
+  These must advance *before* `next_execution_plan`; otherwise, cache-gated
   admissions -- a prefetched request's admission, a suspended request's
   restore, which waits for both of its store ACKs, then its own -- are
   delayed by a full round.
@@ -628,8 +632,11 @@ For orientation, one iteration of `event_loop`:
   it) while the executor's lane fills the pages in prefix order, stopping at
   the first missing object or at the deadline -- which bounds when the next
   batch may start, not a batch in flight: the store's `batch_get_into` has
-  no timeout, so a hung get holds the single-thread lane and every later
-  prefetch, the namespace delete and shutdown behind it. Each round the hooks
+  no timeout, so a hung get holds its active Host pages, namespace deletion
+  and shutdown. The deadline is counted from submission; an expired queued
+  job becomes a zero-page miss only when cancellation proves its worker
+  never started.
+  Active I/O retains its pages until completion. Each round the hooks
   MIN-reduce every in-flight op's landed prefix across the replica; the
   converged op is acknowledged once as `PrefetchDoneEvent(op_id,
   landed_pages)`, the scheduler publishes the landed prefix in the Host

@@ -171,7 +171,7 @@ def test_sparse_index_scores_match_the_dense_scorer(blocks, pages, table_width):
 
     def dense():
         logits = deep_gemm._hopper_paged_scores(
-            (queries,), cache, folded, table, visible, capacity
+            (queries,), cache, folded, table, visible, capacity, clean=True
         )
         return candidate_scores(logits, candidates)
 
@@ -261,7 +261,7 @@ def test_sparse_index_scores_compile_once_across_table_and_pool_widths():
                 len(cute_dsl._COMPILED) == compiled_before
             ), f"table width {table_width} / {blocks} blocks recompiled"
         logits = deep_gemm._hopper_paged_scores(
-            (queries,), cache, folded, table, visible, capacity
+            (queries,), cache, folded, table, visible, capacity, clean=True
         )
         expected = candidate_scores(logits, candidates)
         torch.testing.assert_close(
@@ -386,7 +386,7 @@ def test_sparse_reindex_selects_what_the_dense_score_selects(blocks, pages):
     # Row ``r`` of a query is worth ``logits[query, r]`` to the dense scorer,
     # which is the selection the pass reproduces.
     logits = deep_gemm._hopper_paged_scores(
-        (queries,), cache, folded, table, visible, capacity
+        (queries,), cache, folded, table, visible, capacity, clean=True
     )
     for query in range(tokens):
         kept = int(dense_lengths[query])
@@ -464,7 +464,7 @@ def test_sparse_index_scores_address_a_cache_whose_scale_plane_passes_four_gigae
     queries, folded = quantize_index_queries(q, weights)
     expected = candidate_scores(
         deep_gemm._hopper_paged_scores(
-            (queries,), view, folded, table, visible, capacity
+            (queries,), view, folded, table, visible, capacity, clean=True
         ),
         candidates,
     )

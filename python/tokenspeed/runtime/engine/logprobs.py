@@ -32,6 +32,10 @@ processor renders them into the ``logprobs_info`` payload the per-request
 - ``"both"`` -> emit both (opt-in; doubles the payload).
 
 Only the renderers differ; the underlying wire arrays are computed once.
+
+For streaming, ``OutputProcessor`` retains only ``cumulative_logprob`` across
+frames; lists contain the current frame's positions. The collector appends
+those lists and keeps the latest cumulative scalar when coalescing frames.
 """
 
 from __future__ import annotations

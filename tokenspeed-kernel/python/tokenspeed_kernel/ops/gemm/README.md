@@ -34,7 +34,7 @@ not device-side replay.
 default `auto` route remains unchanged; routed experts use their own backend.
 
 This optional DeepGEMM integration requires Hopper, contiguous E4M3 operands
-A[M,K]/B[N,K], BF16 output, N divisible by 64 and K divisible by 128. It
+A[M,K]/B[N,K], BF16 output, N divisible by 64, and K divisible by 128. It
 converts canonical FP32 1x128 activation and 128x128 weight scales to the
 required layout without UE8M0 rounding. Conversion is part of each call,
 including graph capture; no persistent weight cache is created. Unsupported

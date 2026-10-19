@@ -26,7 +26,12 @@ from tokenspeed_kernel._triton import tl, triton
 
 @dataclass(frozen=True)
 class NGramHashParams:
-    """Borrowed immutable hash constants; no request state or owned buffers."""
+    """Borrowed immutable hash constants; no request state or owned buffers.
+
+    Every ``token_map`` value times every multiplier must fit in int64. The
+    rolling XOR then stays non-negative, so this reference's signed remainder
+    equals the kernels' unsigned one.
+    """
 
     token_map: torch.Tensor
     primes: torch.Tensor

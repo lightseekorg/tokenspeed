@@ -26,6 +26,7 @@ import math
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.mla import torch_mla_paged_attention
 from utils import assert_no_triton_compile, is_cdna5
 
 if not is_cdna5():
@@ -79,18 +80,14 @@ def _make_inputs(cache_lengths, heads, queries, dtype=torch.float8_e4m3fn, seed=
 
 
 def _reference(q, cache, table, lengths, softmax_scale=_SOFTMAX_SCALE):
-    output = torch.zeros((*q.shape[:-1], _KV_LORA_RANK), device=q.device)
-    lse = torch.full(q.shape[:-1], -float("inf"), device=q.device)
-    for request, length in enumerate(lengths.tolist()):
-        pages = table[request, : math.ceil(length / cache.shape[1])].long()
-        kv = cache[pages].reshape(-1, _QK_DIM)
-        for position in range(q.shape[1]):
-            visible = length - q.shape[1] + position + 1
-            values = kv[:visible].float()
-            scores = q[request, position].float() @ values.T * softmax_scale
-            output[request, position] = scores.softmax(-1) @ values[:, :_KV_LORA_RANK]
-            lse[request, position] = torch.logsumexp(scores, -1)
-    return output, lse
+    return torch_mla_paged_attention(
+        q,
+        cache,
+        table,
+        lengths,
+        kv_lora_rank=_KV_LORA_RANK,
+        softmax_scale=softmax_scale,
+    )
 
 
 def _decode(q, cache, table, lengths, **kwargs):

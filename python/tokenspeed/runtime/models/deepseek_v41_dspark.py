@@ -146,11 +146,8 @@ class _WindowAttention:
             )
         else:
             if swa_norm_weight is not None:
-                values = swa.float()
-                values = values * torch.rsqrt(
-                    values.square().mean(-1, keepdim=True) + swa_norm_eps
-                )
-                swa = (swa_norm_weight.float() * values).to(swa.dtype)
+                # The model defers the SWA norm only to the fused CUDA rows.
+                raise ValueError("A deferred SWA norm requires 512-wide CUDA rows")
             if swa_rope_cache is not None:
                 swa = rope_inplace(swa.clone(), positions, swa_rope_cache, None)
             rows = _quantized_kv(swa)
@@ -173,6 +170,7 @@ class _WindowAttention:
         swa_rope_cache,
         swa_norm_weight,
         swa_norm_eps,
+        out_rope_cache=None,
     ):
         if index_q is not None or index_weights is not None:
             raise ValueError("DSpark window attention has no indexer")
@@ -180,8 +178,12 @@ class _WindowAttention:
             swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps
         )
         if q.is_cuda and q.shape[-1] == 512:
-            return self._kernel_forward(q, kv, attn_sink, softmax_scale)
-        return self._reference_forward(q, kv, attn_sink, softmax_scale)
+            out = self._kernel_forward(q, kv, attn_sink, softmax_scale)
+        else:
+            out = self._reference_forward(q, kv, attn_sink, softmax_scale)
+        if out_rope_cache is not None:
+            rope_inplace(out, positions, out_rope_cache, None)
+        return out
 
     def _kernel_forward(self, q, kv, attn_sink, softmax_scale):
         """The target's prefill workspace kernel over ``[history, block]`` rows.

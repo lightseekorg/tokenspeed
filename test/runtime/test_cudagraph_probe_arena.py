@@ -129,8 +129,20 @@ def test_every_family_binds_a_probe_arena_and_reports_its_cost(family, rows) -> 
     # A floor, not a size: the arena also has to admit one token per group.
     assert plan.num_lcm_blocks >= rows
     assert built.cache_budget_bytes == recipe.workspace_bytes() + plan.arena_bytes
-    if family == "kimi_k3" and rows == 1024:
-        assert plan.num_lcm_blocks == 1024
+
+
+@pytest.mark.parametrize("family", sorted(_RECIPES))
+def test_probe_holds_disjoint_parents_for_every_capture_group(family) -> None:
+    recipe = _RECIPES[family]()
+    recipe.cache_budget_bytes = 0
+    recipe.probe_batch_rows = 64
+    built = recipe.setup()
+    shards = {spec.group_id: spec.shard_count for spec in built.spec.cache_group_specs}
+    parents = sum(
+        -(-64 // (group.cache_blocks_per_lcm_block * shards[group.group_id]))
+        for group in built.spec.memory_plan.groups
+    )
+    assert built.spec.memory_plan.num_lcm_blocks >= parents
 
 
 def test_the_probe_arena_does_not_grow_with_max_num_seqs() -> None:

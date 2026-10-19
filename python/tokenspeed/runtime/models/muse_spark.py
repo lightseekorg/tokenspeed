@@ -243,8 +243,8 @@ class _MuseGatheredLinear(ColumnParallelLinear):
                 layer_count=layer_count,
                 model_scope=f"{prefix.split('.layers.')[0]}.{prefix.rsplit('.', 1)[-1]}",
                 max_m=_GATHER_WORKSPACE_ROWS,
-                # The pooled mailbox receives this invocation's weight view.
-                publish_gemm=self._project,
+                # Takes this call's weight view; the mailbox publishes wider blocks.
+                publish_gemm=partial(_block_gemm, self),
             )
         self.iris_state: MuseIrisState | None = None
 

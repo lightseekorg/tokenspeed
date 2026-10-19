@@ -257,6 +257,24 @@ def all_reduce(
     return backend.all_reduce(tensor, group, op=op)
 
 
+def all_reduce_mhc_post(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> torch.Tensor | None:
+    """Fused all-reduce + hc=4 mHC post, or None if the backend has none.
+
+    See ``CommBackend.all_reduce_mhc_post``. On None nothing has run, and the
+    caller reduces ``tensor`` and applies the post itself.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.all_reduce_mhc_post(tensor, residual, post, comb, group)
+
+
 def prepare_all_reduce_lane(
     group: Group,
     hidden_dim: int,

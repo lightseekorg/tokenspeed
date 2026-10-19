@@ -24,7 +24,16 @@ import itertools
 
 import pytest
 import torch
-from fused_boundary_reference import boundary_case, boundary_fp64
+from fused_boundary_helpers import boundary_case
+from tokenspeed_kernel.numerics.torch.layernorm import (
+    torch_affine_rmsnorm,
+    torch_weightless_qk_rmsnorm,
+    torch_weightless_rmsnorm,
+    torch_weightless_rmsnorm_gated_sigmoid,
+)
+from tokenspeed_kernel.numerics.torch.residual import (
+    torch_post_norm_residual_pre_norm,
+)
 from tokenspeed_kernel.ops.layernorm import (
     affine_rmsnorm,
     weightless_qk_rmsnorm,
@@ -57,13 +66,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _weightless_rmsnorm_reference(x: torch.Tensor, eps: float) -> torch.Tensor:
-    values = x.float()
-    return (values * torch.rsqrt(values.square().mean(dim=-1, keepdim=True) + eps)).to(
-        x.dtype
-    )
-
-
 def test_head_norms_match_reference(device: str) -> None:
     torch.manual_seed(11)
     tokens, query_heads, kv_heads, head_dim = 13, 7, 3, 48
@@ -74,15 +76,14 @@ def test_head_norms_match_reference(device: str) -> None:
     q, k, _ = packed.split((q_width, kv_width, kv_width), dim=-1)
     eps, q_scale = 1e-5, 43.7840518911 / head_dim**0.5
     q_out, k_out = weightless_qk_rmsnorm(q, k, head_dim, eps, q_scale, True)
-    q_ref = _weightless_rmsnorm_reference(q.reshape(-1, head_dim), eps).view_as(q)
-    q_ref = (q_ref.float() * q_scale).to(q.dtype)
-    k_ref = _weightless_rmsnorm_reference(k.reshape(-1, head_dim), eps).view_as(k)
+    q_ref, k_ref = torch_weightless_qk_rmsnorm(q, k, head_dim, eps, q_scale, True)
     torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(k_out, k_ref, atol=2e-2, rtol=2e-2)
     x, gate = q.contiguous(), torch.randn_like(q)
     output = weightless_rmsnorm_gated_sigmoid(x, gate, query_heads, head_dim, eps, True)
-    normalized = _weightless_rmsnorm_reference(x.view(-1, head_dim), eps).view_as(x)
-    reference = (normalized.float() * gate.float().sigmoid()).to(x.dtype)
+    reference = torch_weightless_rmsnorm_gated_sigmoid(
+        x, gate, query_heads, head_dim, eps, True
+    )
     torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
 
 
@@ -96,13 +97,13 @@ def test_rmsnorm_variants_match_reference(device: str) -> None:
     affine = affine_rmsnorm(x, weight, eps, 1.0, x.dtype)
     fp32_affine = affine_rmsnorm(x.float(), weight, eps, 1.0, torch.float32)
 
-    plain_ref = _weightless_rmsnorm_reference(x, eps)
-    affine_ref = (_weightless_rmsnorm_reference(x, eps) * (weight + 1.0)).to(x.dtype)
+    plain_ref = torch_weightless_rmsnorm(x, eps, x.dtype)
+    affine_ref = torch_affine_rmsnorm(x, weight, eps, 1.0, x.dtype)
     torch.testing.assert_close(plain, plain_ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(affine, affine_ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(
         fp32_affine,
-        _weightless_rmsnorm_reference(x.float(), eps) * (weight + 1.0).float(),
+        torch_affine_rmsnorm(x.float(), weight, eps, 1.0, torch.float32),
         atol=1e-5,
         rtol=1e-5,
     )
@@ -320,7 +321,7 @@ def test_fused_boundary_keeps_the_post_norm_in_fp32(
     ):
         assert (got is None and plain is None) or torch.equal(got, plain)
     new_stream, pre_fp32, pre_bf16 = outputs
-    stream_ref, pre_ref = boundary_fp64(*args)
+    stream_ref, pre_ref, _ = torch_post_norm_residual_pre_norm(*args, False, None, 1)
     ulps = 2.0**-20
     torch.testing.assert_close(new_stream.double(), stream_ref, atol=1e-6, rtol=ulps)
     if pre_ref is None:

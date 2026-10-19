@@ -26,6 +26,11 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsa import (
+    dsa_index_scores,
+    torch_dsa_paged_index_topk,
+    torch_dsa_workspace_index_topk,
+)
 from utils import assert_no_triton_compile, is_cdna4, is_cdna5
 
 if not (is_cdna4() or is_cdna5()):
@@ -171,9 +176,7 @@ def _weighted_relu_scores(
     weights: torch.Tensor,
     keys: torch.Tensor,
 ) -> torch.Tensor:
-    """Independent FP32 oracle for the kernel's weighted per-head ReLU."""
-    per_head = keys.float() @ query.float().transpose(0, 1)
-    return (per_head.relu() * weights.float()).sum(dim=1) * _SOFTMAX_SCALE
+    return dsa_index_scores(query, weights, keys, _SOFTMAX_SCALE)
 
 
 def _expected_decode(
@@ -184,23 +187,17 @@ def _expected_decode(
     block_table: torch.Tensor,
     q_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    expected = torch.full(
-        (query.shape[0], _TOPK), -1, device=_DEVICE, dtype=torch.int32
+    expected, expected_lens, _ = torch_dsa_paged_index_topk(
+        query,
+        weights,
+        keys,
+        seq_lens,
+        block_table,
+        page_size=_PAGE_SIZE,
+        topk=_TOPK,
+        softmax_scale=_SOFTMAX_SCALE,
+        q_len_per_req=q_len,
     )
-    expected_lens = torch.empty(query.shape[0], device=_DEVICE, dtype=torch.int32)
-    for row in range(query.shape[0]):
-        request, q_offset = divmod(row, q_len)
-        valid = int(seq_lens[request].item()) - (q_len - 1) + q_offset
-        count = min(max(valid, 0), _TOPK)
-        expected_lens[row] = count
-        if count == 0:
-            continue
-        positions = torch.arange(valid, device=_DEVICE)
-        pages = block_table[request, positions // _PAGE_SIZE].long()
-        slots = pages * _PAGE_SIZE + positions.remainder(_PAGE_SIZE)
-        scores = _weighted_relu_scores(query[row], weights[row], keys[slots])
-        selected = torch.topk(scores, count).indices
-        expected[row, :count] = slots[selected].to(torch.int32)
     return expected, expected_lens
 
 
@@ -212,22 +209,16 @@ def _expected_prefill(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    expected = torch.full(
-        (query.shape[0], _TOPK), -1, device=_DEVICE, dtype=torch.int32
+    expected, expected_lens, _ = torch_dsa_workspace_index_topk(
+        query,
+        weights,
+        keys,
+        workspace_slots,
+        row_starts,
+        row_ends,
+        topk=_TOPK,
+        softmax_scale=_SOFTMAX_SCALE,
     )
-    expected_lens = torch.empty(query.shape[0], device=_DEVICE, dtype=torch.int32)
-    for row in range(query.shape[0]):
-        start = max(int(row_starts[row].item()), 0)
-        end = min(int(row_ends[row].item()), workspace_slots.numel())
-        count = min(max(end - start, 0), _TOPK)
-        expected_lens[row] = count
-        if count == 0:
-            continue
-        workspace_rows = torch.arange(start, end, device=_DEVICE)
-        slots = workspace_slots[workspace_rows].long()
-        scores = _weighted_relu_scores(query[row], weights[row], keys[slots])
-        selected = torch.topk(scores, count).indices
-        expected[row, :count] = workspace_rows[selected].to(torch.int32)
     return expected, expected_lens
 
 

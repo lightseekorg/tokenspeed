@@ -24,6 +24,10 @@ import math
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.embedding import rotate
+from tokenspeed_kernel.numerics.torch.quantization import (
+    quantize_fp8_groups,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
@@ -115,7 +119,7 @@ def _reference_mxfp8_quantize(
     "gemm",
     "mm",
     name="torch_mm_fp8_blockscale",
-    solution="reference",
+    solution="torch",
     signatures=_MXFP8_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE + 2,
@@ -176,7 +180,7 @@ def torch_mm_fp8_blockscale(
     "gemm",
     "mm",
     name="torch_mm_fp8_scaled_mnk",
-    solution="reference",
+    solution="torch",
     signatures=_FP8_TENSOR_FORMAT_SIGNATURES,
     traits={
         "b_layout": frozenset({"NK"}),
@@ -224,7 +228,7 @@ def torch_mm_fp8_scaled_mnk(
     "gemm",
     "mm",
     name="torch_mm_fp8_scaled_nkm",
-    solution="reference",
+    solution="torch",
     signatures=_FP8_TENSOR_FORMAT_SIGNATURES,
     traits={
         "b_layout": frozenset({"KN"}),
@@ -270,7 +274,7 @@ def torch_mm_fp8_scaled_nkm(
     "gemm",
     "mm",
     name="torch_mm",
-    solution="reference",
+    solution="torch",
     signatures=_DENSE_GEMM_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE + 3,
@@ -316,7 +320,7 @@ def torch_mm(
     "gemm",
     "bmm",
     name="torch_bmm_fp8_blockscale",
-    solution="reference",
+    solution="torch",
     signatures=_MXFP8_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE + 2,
@@ -396,7 +400,7 @@ def _bmm_scaled_fp8_scale(
     "gemm",
     "bmm",
     name="torch_bmm_fp8_scaled",
-    solution="reference",
+    solution="torch",
     signatures=_FP8_SCALED_BMM_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE,
@@ -439,7 +443,7 @@ def torch_bmm_fp8_scaled(
     "gemm",
     "bmm",
     name="torch_bmm",
-    solution="reference",
+    solution="torch",
     signatures=_DENSE_GEMM_FORMAT_SIGNATURES,
     priority=Priority.PORTABLE + 3,
 )
@@ -526,7 +530,7 @@ def torch_bmm(
 @register_kernel(
     "gemm",
     "grouped_bf16_projection",
-    name="grouped_bf16_projection_torch",
+    name="torch_grouped_bf16_projection",
     solution="torch",
     signatures=frozenset(
         {
@@ -539,7 +543,7 @@ def torch_bmm(
     traits={},
     priority=Priority.PORTABLE,
 )
-def grouped_bf16_projection_torch(
+def torch_grouped_bf16_projection(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
 ) -> torch.Tensor:
     """Preserve the original batched projection and its BF16 rounding."""
@@ -548,3 +552,141 @@ def grouped_bf16_projection_torch(
         return result
     out.copy_(result)
     return out
+
+
+def fma32(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """FP32 ``fma(a, b, c)`` exactly.
+
+    ``a * b`` of two FP32 values is exact in FP64; TwoSum gives the tail of
+    ``p + c``, and the FP32 rounding of the FP64 sum is the exact sum's
+    except on an FP32 midpoint, where the tail's sign decides.
+    """
+    p = a.double() * b.double()
+    c64 = c.double()
+    s = p + c64
+    bb = s - p
+    tail = (p - (s - bb)) + (c64 - bb)
+    r = s.float()
+    up = torch.nextafter(r, torch.full_like(r, float("inf")))
+    down = torch.nextafter(r, torch.full_like(r, float("-inf")))
+    above = (s == (r.double() + up.double()) * 0.5) & (tail > 0)
+    below = (s == (r.double() + down.double()) * 0.5) & (tail < 0)
+    return torch.where(above, up, torch.where(below, down, r))
+
+
+@register_kernel(
+    "gemm",
+    "mv",
+    name="torch_simt_gemm_fp32",
+    solution="torch",
+    signatures=frozenset(
+        {
+            format_signature(
+                x=dense_tensor_format(torch.bfloat16),
+                weight=dense_tensor_format(torch.float32),
+            )
+        }
+    ),
+    traits={},
+    priority=Priority.REFERENCE,
+)
+def torch_simt_gemm_fp32(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """``x @ weight.T`` in the exact FP32 summation order of
+    ``gluon_simt_gemm_fp32`` (see ``ops/gemm/_gluon/gemv.py``).
+
+    Four K quarters each run 128 FMA chains of 128-column steps; a warp lane
+    adds its four chains in order, the warp reduces with an xor butterfly,
+    and the quarters add in order. Emulated on the CPU, so slow; K must be a
+    multiple of 512.
+    """
+    device = x.device
+    x, weight = x.float().cpu(), weight.float().cpu()
+    (m, k), n = x.shape, weight.shape[0]
+    assert k % 512 == 0, f"K={k} must be a multiple of 512"
+    chunk = k // 4
+    total = torch.zeros(m, n)
+    for s in range(4):
+        acc = torch.zeros(m, n, 128)
+        for i in range(chunk // 128):
+            k0 = s * chunk + 128 * i
+            acc = fma32(
+                x[:, None, k0 : k0 + 128].expand(m, n, 128),
+                weight[None, :, k0 : k0 + 128].expand(m, n, 128),
+                acc,
+            )
+        # Lane 4 t + v: each warp lane t adds its four chains in order, then
+        # the warp runs the xor butterfly.
+        lanes = acc.view(m, n, 32, 4)
+        u = ((lanes[..., 0] + lanes[..., 1]) + lanes[..., 2]) + lanes[..., 3]
+        for offset in (16, 8, 4, 2, 1):
+            u = u + u[..., torch.arange(32) ^ offset]
+        total = total + u[..., 0]
+    if out is not None:
+        out.copy_(total)
+        return out
+    return total.to(device)
+
+
+@register_kernel(
+    "gemm",
+    "dsv4_grouped_output_projection",
+    name="torch_dsv4_grouped_output_projection",
+    solution="torch",
+    signatures=frozenset(
+        format_signature(
+            attention=dense_tensor_format(input_dtype),
+            weight=dense_tensor_format(fp8_dtype),
+        )
+        for input_dtype in (torch.float16, torch.bfloat16)
+    ),
+    traits={},
+    priority=Priority.REFERENCE,
+)
+def torch_dsv4_grouped_output_projection(
+    *,
+    attention: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    num_groups: int,
+    heads_per_group: int,
+    output_dim: int,
+    nope_dim: int,
+    rope_dim: int,
+    block_size: tuple[int, int],
+) -> torch.Tensor:
+    """DeepSeek-V4 grouped output projection of the attention output.
+
+    Inverse-rotates the last ``rope_dim`` features of each head (GPT-J pairs),
+    quantizes each group's FP32 row to FP8 with power-of-two scales per
+    ``block_size[1]`` columns (no intermediate BF16 rounding), and multiplies
+    by the canonical ``[num_groups * output_dim, heads_per_group * head_dim]``
+    FP8 weight dequantized with its ``block_size`` FP32 scales.
+
+    Returns:
+        ``[tokens, num_groups, output_dim]`` in FP32, unrounded.
+    """
+    tokens = attention.shape[0]
+    values = attention.float().clone()
+    cos, sin = cos_sin_cache[positions].float().unsqueeze(1).chunk(2, dim=-1)
+    values[..., nope_dim : nope_dim + rope_dim] = rotate(
+        values[..., nope_dim : nope_dim + rope_dim], cos, -sin, is_neox=False
+    )
+    block_n, block_k = block_size
+    codes, scales = quantize_fp8_groups(
+        values.reshape(tokens, num_groups, -1),
+        block_k,
+        power_of_two_scale=True,
+        min_scale=1e-10 / 448.0,
+    )
+    dequantized = codes.float() * scales.repeat_interleave(block_k, dim=-1)
+    dequantized_weight = weight.float() * weight_scale.repeat_interleave(
+        block_n, dim=0
+    ).repeat_interleave(block_k, dim=1)
+    grouped_weight = dequantized_weight.reshape(num_groups, output_dim, -1)
+    return torch.bmm(
+        dequantized.transpose(0, 1), grouped_weight.transpose(1, 2)
+    ).transpose(0, 1)

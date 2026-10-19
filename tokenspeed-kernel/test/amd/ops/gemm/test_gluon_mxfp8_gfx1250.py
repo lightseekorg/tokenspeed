@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.gemm import torch_mm_fp8_blockscale
 from utils import assert_no_triton_compile, is_cdna5
 
 if not is_cdna5():
@@ -51,21 +52,6 @@ def _random_fp8(shape: tuple[int, ...]) -> torch.Tensor:
     return (torch.randn(shape, device="cuda") * 0.25).to(torch.float8_e4m3fn)
 
 
-def _ue8m0_dequantize(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    decoded = scales.view(torch.float8_e8m0fnu).float().repeat_interleave(32, dim=1)
-    return values.float() * decoded[:, : values.shape[1]]
-
-
-def _fp32_block_dequantize(
-    values: torch.Tensor,
-    scales: torch.Tensor,
-    row_block: int,
-) -> torch.Tensor:
-    rows = scales.repeat_interleave(row_block, dim=0)
-    expanded = rows.repeat_interleave(128, dim=1)
-    return values.float() * expanded[: values.shape[0], : values.shape[1]]
-
-
 @pytest.mark.parametrize("m,n,k", [(1, 128, 256), (16, 256, 288)])
 def test_mxfp8_ue8m0_gemv_matches_dequantized_reference(
     m: int,
@@ -86,12 +72,8 @@ def test_mxfp8_ue8m0_gemv_matches_dequantized_reference(
         torch.bfloat16,
         block_size=[1, 32],
     )
-    expected = (
-        _ue8m0_dequantize(a, a_scales)
-        @ _ue8m0_dequantize(
-            b,
-            b_scales,
-        ).T
+    expected = torch_mm_fp8_blockscale(
+        a, b, a_scales, b_scales, torch.float32, block_size=[1, 32]
     )
 
     torch.testing.assert_close(
@@ -133,9 +115,8 @@ def test_fp8_blockscale_gemv_matches_dequantized_reference(
         torch.bfloat16,
         block_size=[128, 128],
     )
-    expected = (
-        _fp32_block_dequantize(a, a_scales, 1)
-        @ _fp32_block_dequantize(b, b_scales, 128).T
+    expected = torch_mm_fp8_blockscale(
+        a, b, a_scales, b_scales, torch.float32, block_size=[128, 128]
     )
 
     torch.testing.assert_close(
@@ -269,9 +250,8 @@ def test_fp8_blockscale_wide_tile_preserves_strided_out() -> None:
         block_size=[128, 128],
         out=out,
     )
-    expected = (
-        _fp32_block_dequantize(a, a_scales, 1)
-        @ _fp32_block_dequantize(b, b_scales, 128).T
+    expected = torch_mm_fp8_blockscale(
+        a, b, a_scales, b_scales, torch.float32, block_size=[128, 128]
     )
 
     assert actual is out

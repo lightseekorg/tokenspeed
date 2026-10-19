@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Gated-boundary references, mailbox arming, and the sentinel-wait child."""
+"""Gated-boundary test cases, mailbox arming, and the sentinel-wait child."""
 
 from __future__ import annotations
 
@@ -53,35 +53,6 @@ consume()
 torch.cuda.synchronize(device)
 print("COMPLETED", flush=True)
 """
-
-
-def boundary_fp64(
-    stream: torch.Tensor,
-    branch: torch.Tensor,
-    post_weight: torch.Tensor | None,
-    eps_post: float,
-    post_offset: float,
-    alpha: torch.Tensor,
-    beta: torch.Tensor,
-    pre_weight: torch.Tensor | None,
-    eps_pre: float,
-    pre_offset: float,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """The boundary in FP64 from the kernel's FP32 gate coefficients, no BF16 rounding."""
-    values = branch.double()
-    if post_weight is not None:
-        values = (
-            values * (post_weight.float() + post_offset).to(torch.bfloat16).double()
-        )
-    values = values * torch.rsqrt(values.square().mean(-1, keepdim=True) + eps_post)
-    new_stream = alpha.double() * stream.double() + beta.double() * values
-    if pre_weight is None:
-        return new_stream, None
-    pre = new_stream * torch.rsqrt(new_stream.square().mean(-1, keepdim=True) + eps_pre)
-    return (
-        new_stream,
-        pre * (pre_weight.float() + pre_offset).to(torch.bfloat16).double(),
-    )
 
 
 def boundary_case(boundary: str, rows: int, device: str) -> tuple:

@@ -22,14 +22,14 @@
 
 Exercises the full in-repo chain -- the weight preprocessor (concatenated
 [gate|up] loader layout -> shuffled TRTLLM [up|gate]) and the registered
-apply -- against ``mxfp4_moe_reference`` on the same MXFP4 weights.
+apply -- against ``mxfp4_situ_moe_experts`` on the same MXFP4 weights.
 """
 
 from __future__ import annotations
 
 import pytest
 import torch
-from kimi3_reference import mxfp4_moe_reference
+from tokenspeed_kernel.numerics.torch.moe import mxfp4_situ_moe_experts
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
@@ -126,7 +126,7 @@ def test_flashinfer_situ_kernel_routing_matches_portable_reference() -> None:
     raw, hidden_states, router_logits, bias, topk_ids, topk_weights = (
         _kernel_routing_case(20260825, num_tokens)
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -158,7 +158,7 @@ def test_flashinfer_situ_precomputed_routing_matches_portable_reference() -> Non
     raw, hidden_states, router_logits, bias, topk_ids, topk_weights = (
         _kernel_routing_case(20260827, 16)
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],

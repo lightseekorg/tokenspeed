@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from rel_mha_reference import (
+from rel_mha_helpers import (
     DTYPE,
     HEAD_DIM,
     NUM_KV_HEADS,
@@ -44,9 +44,11 @@ from rel_mha_reference import (
     PAGE,
     build_paged,
     cu_seqlens,
-    ref_rel_attn,
-    ref_rel_logits,
     require_fa4,
+)
+from tokenspeed_kernel.numerics.torch.attention.rmha import (
+    rel_attention_logits,
+    torch_rel_attention,
 )
 from tokenspeed_kernel.ops.attention.mha import (
     mha_decode_with_kvcache,
@@ -114,7 +116,7 @@ def test_rel_mha_prefill(
 
     for i, length in enumerate(q_lens):
         s = cu_cpu[i]
-        ref = ref_rel_attn(
+        ref = torch_rel_attention(
             q[s : s + length],
             k[s : s + length],
             v[s : s + length],
@@ -122,7 +124,7 @@ def test_rel_mha_prefill(
             rel_extent,
             window_left,
             scale,
-        )
+        )[0].to(DTYPE)
         err = (out[s : s + length].float() - ref.float()).abs().max().item()
         assert err < TOL, f"seq {i}: max_err={err:.4e}"
 
@@ -181,7 +183,7 @@ def test_rel_mha_extend_with_kvcache(
 
     for i, (ql, _) in enumerate(zip(q_lens, kv_lens)):
         s = int(cu_q[i].item())
-        ref = ref_rel_attn(
+        ref = torch_rel_attention(
             q[s : s + ql],
             ks[i],
             vs[i],
@@ -189,7 +191,7 @@ def test_rel_mha_extend_with_kvcache(
             rel_extent,
             window_left,
             scale,
-        )
+        )[0].to(DTYPE)
         err = (out[s : s + ql].float() - ref.float()).abs().max().item()
         assert err < TOL, f"seq {i}: max_err={err:.4e}"
 
@@ -246,7 +248,7 @@ def test_rel_mha_decode_with_kvcache(
 
     assert out.shape == q.shape
     for i in range(batch):
-        ref = ref_rel_attn(
+        ref = torch_rel_attention(
             q[i : i + 1],
             ks[i],
             vs[i],
@@ -254,7 +256,7 @@ def test_rel_mha_decode_with_kvcache(
             rel_extent,
             window_left,
             scale,
-        )
+        )[0].to(DTYPE)
         err = (out[i : i + 1].float() - ref.float()).abs().max().item()
         assert err < TOL, f"request {i}: max_err={err:.4e}"
 
@@ -351,9 +353,9 @@ def test_triton_rel_mha_prefill_lse(
     )
     for s, e in zip(cu.tolist()[:-1], cu.tolist()[1:]):
         args = (q[s:e], k[s:e], rel_logits[s:e], rel_extent, window_left, scale)
-        ref_lse = ref_rel_logits(*args).logsumexp(-1).transpose(0, 1)
+        ref_lse = rel_attention_logits(*args).logsumexp(-1).transpose(0, 1)
         torch.testing.assert_close(lse[s:e], ref_lse, atol=1e-4, rtol=1e-4)
-        ref = ref_rel_attn(q[s:e], k[s:e], v[s:e], *args[2:])
+        ref = torch_rel_attention(q[s:e], k[s:e], v[s:e], *args[2:])[0].to(DTYPE)
         torch.testing.assert_close(out[s:e], ref, atol=TOL, rtol=0)
 
 
@@ -389,7 +391,9 @@ def test_triton_rel_mha_extend_lse_ignores_page_padding(device: str, require) ->
     )
     for i, (s, e) in enumerate(zip(cu.tolist()[:-1], cu.tolist()[1:])):
         args = (rel_logits[s:e], rel_extent, window_left, scale)
-        ref_lse = ref_rel_logits(q[s:e], ks[i], *args).logsumexp(-1).transpose(0, 1)
+        ref_lse = (
+            rel_attention_logits(q[s:e], ks[i], *args).logsumexp(-1).transpose(0, 1)
+        )
         torch.testing.assert_close(lse[s:e], ref_lse, atol=1e-4, rtol=1e-4)
-        ref = ref_rel_attn(q[s:e], ks[i], vs[i], *args)
+        ref = torch_rel_attention(q[s:e], ks[i], vs[i], *args)[0].to(DTYPE)
         torch.testing.assert_close(out[s:e], ref, atol=TOL, rtol=0)

@@ -26,6 +26,8 @@ accepted tail per pool slot is retained, never a checkpoint-sized model/history
 cache. Run with CUDA_VISIBLE_DEVICES selecting an available GPU.
 """
 
+import os
+import sys
 from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
@@ -64,6 +66,11 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalForwardContext,
     MultimodalInputs,
 )
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 VOCAB_SIZE = 128
 
@@ -143,7 +150,7 @@ def buffers(request, monkeypatch):
     ib = InputBuffers(
         max_bs=4, max_num_tokens=32, state_write_padding_pool_index=5, device=device
     )
-    ib.init_ngram_buffers(3, _hash_params(ib.device))
+    ib.init_ngram_buffers(3, _hash_params(ib.device), VOCAB_SIZE)
     runtime = RuntimeStates(
         req_pool_size=5, vocab_size=VOCAB_SIZE, output_length=1, device=device
     )
@@ -411,7 +418,7 @@ def test_large_prefill_to_small_decode_keeps_graph_padding_dead(buffers):
         state_write_padding_pool_index=5,
         device=original.device,
     )
-    ib.init_ngram_buffers(3, _hash_params(ib.device))
+    ib.init_ngram_buffers(3, _hash_params(ib.device), VOCAB_SIZE)
     prompt = [i % 80 + 1 for i in range(1024)]
     states = {"a": _state(prompt, [])}
     op = _op(states, ["a"], [1], [1024], [0], [0], [])
@@ -1343,3 +1350,11 @@ def test_image_mask_survives_input_clamp(buffers, prefix, length, image_rows):
         ctx, ids, {"multimodal_context": context, "image_mask": explicit}
     )
     assert result["image_mask"] is explicit
+
+
+def test_engram_token_map_must_cover_the_vocabulary():
+    ib = InputBuffers(
+        max_bs=1, max_num_tokens=4, state_write_padding_pool_index=1, device="cpu"
+    )
+    with pytest.raises(ValueError, match="fewer than the vocabulary"):
+        ib.init_ngram_buffers(3, _hash_params("cpu"), VOCAB_SIZE + 1)

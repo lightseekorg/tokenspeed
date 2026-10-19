@@ -22,9 +22,9 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from kimi3_reference import dequantize_mxfp4 as dequantize_mxfp4_reference
-from kimi3_reference import (
-    mxfp4_moe_reference,
+from tokenspeed_kernel.numerics.torch.moe import mxfp4_situ_moe_experts
+from tokenspeed_kernel.numerics.torch.quantization import (
+    dequantize_mxfp4 as dequantize_mxfp4_reference,
 )
 from utils import make_mxfp4_moe_weights
 
@@ -55,7 +55,7 @@ def test_a16w4_moe_matches_explicit_token_slot_reference() -> None:
     beta = 2.0
     linear_beta = 3.0
 
-    actual = mxfp4_moe_reference(
+    actual = mxfp4_situ_moe_experts(
         hidden_states,
         w13_packed,
         w13_scales,

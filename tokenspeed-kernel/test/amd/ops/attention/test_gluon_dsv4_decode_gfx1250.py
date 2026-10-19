@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsv4 import dsv4_attend_rows
 from utils import is_cdna5
 
 if not is_cdna5():
@@ -90,13 +91,14 @@ def reference(args, kv, extra_kv):
             length = max(0, min(int(args[f"{prefix}_lens"][token]), slots.shape[1]))
             indices = slots[token, :length].long()
             indices = indices[(indices >= 0) & (indices < values.shape[0])]
-            selected.append(values[indices].float())
-        keys = torch.cat(selected)
-        scores = args["q"][token].float() @ keys.T * args["softmax_scale"]
-        probabilities = torch.cat(
-            (scores, args["attn_sink"].float()[:, None]), dim=-1
-        ).softmax(-1)[:, :-1]
-        result[token] = probabilities @ keys
+            selected.append(values[indices])
+        out, _ = dsv4_attend_rows(
+            args["q"][token],
+            torch.cat(selected),
+            args["attn_sink"],
+            args["softmax_scale"],
+        )
+        result[token] = out
     return result
 
 

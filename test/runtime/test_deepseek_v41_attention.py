@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from test.runtime.test_deepseek_v41_model import (
     _Backend,
     _config,
@@ -51,6 +53,11 @@ from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41Attention,
     v41_mxfp8_config,
 )
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 requires_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or not current_platform().is_blackwell,
@@ -185,7 +192,7 @@ def test_indexer_fused_forward_and_key(monkeypatch, tokens, compress_ratio):
     expected = _reference_packed_indexer(
         indexer, rotary, x, qr, latent, positions, slots
     )
-    q, weights = indexer(x, qr, positions, rotary)
+    q, weights = indexer(x, qr, None, positions, rotary)
     key = indexer.key(latent, positions, rotary)
     assert isinstance(q, dsv41.IndexQueryInput)
     assert isinstance(key, dsv41.IndexKeyInput)
@@ -207,7 +214,7 @@ def test_indexer_fused_graph_refreshes_inputs_and_positions(monkeypatch):
     cache = torch.full((1, 64, 68), 0xA7, device="cuda", dtype=torch.uint8)
 
     def run():
-        q, weights = indexer(x, qr, positions, rotary)
+        q, weights = indexer(x, qr, None, positions, rotary)
         key = indexer.key(latent, positions, rotary)
         return _consume_indexer_inputs(q, weights, key, positions, slots, cache)
 
@@ -246,7 +253,7 @@ def test_indexer_cpu_and_small_geometry_keep_portable_path(
     indexer, rotary = _make_indexer(monkeypatch, device, head_dim, heads, 1)
     x, qr, latent, positions = _indexer_inputs(3, device)
     expected = _reference_indexer(indexer, rotary, x, qr, latent, positions)
-    q, weights = indexer(x, qr, positions, rotary)
+    q, weights = indexer(x, qr, None, positions, rotary)
     key = indexer.key(latent, positions, rotary)
     _assert_indexer_outputs((q, weights, key), expected)
 
@@ -304,12 +311,14 @@ def test_attention_shares_q_quantization_only_with_compatible_indexer(
         )
         method = index_linear.quant_method
         index_linear.quant_method = SimpleNamespace(apply=method.apply)
-        expected = attention(positions, x, ctx)
+        expected = attention(positions, x, ctx, reduce_output=True)
         expected_index = backend.calls[-1][3:5]
-        assert not isinstance(received[-1], tuple)
+        assert received[-1].dtype == torch.bfloat16
         index_linear.quant_method = method
-        actual = attention(positions, x, ctx)
-        assert isinstance(received[-1], tuple) == (case == "shared")
+        actual = attention(positions, x, ctx, reduce_output=True)
+        # Narrowed rows select the shared codes after quantization.
+        shared = received[-1].dtype == torch.float8_e4m3fn
+        assert shared == (case in ("shared", "narrowed"))
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         for actual_index, reference_index in zip(
             backend.calls[-1][3:5], expected_index
@@ -362,17 +371,17 @@ def test_shared_q_decode_graph_replay_with_auxiliary_indexer(monkeypatch):
     ctx = _ctx(backend, 6, ForwardMode.DECODE)
     x = torch.randn(6, config.hidden_size, device="cuda", dtype=torch.bfloat16)
     for _ in range(3):
-        attention(positions, x, ctx)
+        attention(positions, x, ctx, reduce_output=True)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = attention(positions, x, ctx)
+        captured = attention(positions, x, ctx, reduce_output=True)
     captured_index = selected[-1]
     index_linear = attention.indexer.wq_b
     index_linear.quant_method = SimpleNamespace(apply=index_linear.quant_method.apply)
     for factor in (0.0, 0.2, 2.0):
         x.normal_().mul_(factor)
         graph.replay()
-        expected = attention(positions, x, ctx)
+        expected = attention(positions, x, ctx, reduce_output=True)
         torch.testing.assert_close(captured, expected, rtol=0, atol=0)
         for actual_index, expected_index in zip(captured_index, selected[-1]):
             torch.testing.assert_close(actual_index, expected_index, rtol=0, atol=0)

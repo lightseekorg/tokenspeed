@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
+import sys
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -69,6 +71,11 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v41 import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 RATIOS = (0, 0) + (2,) * 18 + (1,) * 20
 OWNERS = (2, 8, 14, 20)
@@ -1540,7 +1547,9 @@ def test_packed_compressor_rejected_suffix_every_acceptance(prefix, accepted):
     live = positions >= 0
     pair = positions[live, None] + torch.arange(2)
     expected = (full_content[pair] * full_scores[pair].softmax(1)).sum(1)
-    torch.testing.assert_close(pooled[live], expected, rtol=0, atol=0)
+    # CPU float32 kernels round differently across vector widths (one ulp on
+    # some hosts), so compare at float32 precision rather than bit for bit.
+    torch.testing.assert_close(pooled[live], expected, rtol=1.3e-6, atol=1e-6)
     assert not pooled[~live].any()
     assert not backend.cache_pool.compressor_tail(2)[0].any()
 
@@ -1821,6 +1830,30 @@ def test_gpu_ratio2_prefill_to_decode_including_empty_compressor_step():
     # row's largest entries, which near-zero entries see as an absolute error.
     torch.testing.assert_close(torch.cat(parts), full, rtol=2**-7, atol=2**-8)
     torch.cuda.synchronize()
+
+
+def test_deferred_swa_norm_without_rope_cache_is_refused():
+    # Only the fused RoPE writers apply a deferred SWA norm; without them the
+    # norm would be silently dropped.
+    backend = _backend("cpu", 2)
+    meta = _extend(backend, _tables("cpu"), [4], [0], [0], _final([4], [0]))
+    with pytest.raises(ValueError, match="requires the SWA RoPE cache"):
+        backend.forward_v41(
+            torch.randn(4, 2, 512, dtype=torch.bfloat16),
+            torch.randn(4, 512, dtype=torch.bfloat16),
+            layer_id=0,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.EXTEND,
+            index_q=None,
+            index_weights=None,
+            attn_sink=torch.zeros(2, dtype=torch.float32),
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=None,
+            swa_norm_weight=torch.ones(512, dtype=torch.bfloat16),
+            swa_norm_eps=1e-6,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

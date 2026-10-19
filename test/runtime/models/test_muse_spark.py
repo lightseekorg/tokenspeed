@@ -1439,6 +1439,72 @@ def test_replicated_pool_preserves_column_projection_after_reload(
             assert actual.data_ptr() == output.data_ptr()
 
 
+@requires_gpu
+@pytest.mark.skipif(
+    not current_platform().is_nvidia, reason="requires a NVIDIA CUDA pointer view"
+)
+def test_gathered_projection_hands_wider_batches_to_the_mailbox_publish(
+    monkeypatch: pytest.MonkeyPatch, bf16_default_dtype
+) -> None:
+    """Wider rows reach the mailbox through its word publish, bit for bit; a GEMV row lands in place."""
+    from tokenspeed_kernel.ops.moe._cute_dsl import latent_down
+
+    bound = {}
+    monkeypatch.setattr(
+        module.process_group_manager, "get_device_process_group", lambda group: group
+    )
+    monkeypatch.setattr(
+        module.KimiK3LatentDownOp, "initialize", lambda **kwargs: bound.update(kwargs)
+    )
+    hidden, latent, ranks, rank = 256, 128, 4, 1
+    with torch.device("cuda"):
+        linear = module._MuseGatheredLinear(
+            input_size=hidden,
+            output_size=latent,
+            prefix="model.layers.0.mlp.pre_expert_proj",
+            tp_rank=rank,
+            tp_size=ranks,
+            tp_group=tuple(range(ranks)),
+            layer_id=0,
+            layer_count=2,
+            replicate_for_owned_rows=True,
+        )
+    with torch.no_grad():
+        linear.weight.normal_(std=hidden**-0.5)
+    weight = linear._local_weight()
+    shard = weight.shape[0]
+    mailbox = torch.zeros(4, latent, dtype=torch.bfloat16, device="cuda")
+    latent_down.arm_mailbox(mailbox, latent_down.HALF_POLLED_SENTINEL)
+    producer = latent_down._MulticastVaGemm(
+        multicast_ptr=mailbox.data_ptr(),
+        rank=rank,
+        shard_dim=shard,
+        latent_size=latent,
+        max_m=4,
+        device=mailbox.device,
+        publish_gemm=bound["publish_gemm"],
+    )
+    published_rows, expected_rows = [], []
+    publish = latent_down.multicast_publish
+
+    def record_publish(block, destination):
+        published_rows.append(block.shape[0])
+        publish(block, destination)
+
+    monkeypatch.setattr(latent_down, "multicast_publish", record_publish)
+    for tokens in (1, 3):
+        x = torch.randn(tokens, hidden, device="cuda")
+        if tokens > 1 or not module._use_mv(x, weight):
+            expected_rows.append(tokens)
+        producer(x, weight, mailbox, mailbox.data_ptr())
+        torch.cuda.synchronize()
+        assert torch.equal(
+            mailbox[:tokens, rank * shard : (rank + 1) * shard].view(torch.int16),
+            linear._project(x, weight, None).view(torch.int16),
+        )
+    assert published_rows == expected_rows
+
+
 class _FakeMailbox:
     sentinel = 0xFFFFFFFF
 

@@ -153,7 +153,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             raise ValueError(
                 "presence_penalty must be in [-2, 2], got " f"{self.presence_penalty}."
             )
-        if not 0.0 <= self.repetition_penalty <= 2.0:
+        if not 0.0 < self.repetition_penalty <= 2.0:
             raise ValueError(
                 "repetition_penalty must be in (0, 2], got "
                 f"{self.repetition_penalty}."

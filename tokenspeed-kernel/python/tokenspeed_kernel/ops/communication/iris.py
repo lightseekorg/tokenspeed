@@ -258,6 +258,55 @@ class IrisAllReduce:
         self.producer_pull.run(output)
         return self.producer.views(output, shapes)
 
+    def can_reduce_mhc_post(
+        self,
+        tensor: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ) -> bool:
+        """Whether all_reduce_symmetric_mhc_post serves these operands."""
+        hidden = tensor.shape[-1] if tensor.ndim == 2 else 0
+        return (
+            self.owns_outputs((tensor,))
+            and self.producer_pull is not None
+            and self.producer_pull.can_run((tuple(tensor.shape),))
+            and tensor.dtype == residual.dtype == torch.bfloat16
+            and hidden % (_PACKED_WORD_BYTES // tensor.element_size()) == 0
+            and residual.shape == (tensor.shape[0], 4, hidden)
+            and residual.is_contiguous()
+            and post.dtype == comb.dtype == torch.float32
+            and post.shape == (tensor.shape[0], 4)
+            and post.is_contiguous()
+            and comb.shape == (tensor.shape[0], 4, 4)
+            and comb.is_contiguous()
+        )
+
+    def all_reduce_symmetric_mhc_post(
+        self,
+        tensor: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reduce a producer output and apply the hc=4 mHC post in one kernel.
+
+        Args:
+            tensor: Acquired BF16 producer output [T, H].
+            residual: BF16 residual streams [T, 4, H].
+            post: FP32 post coefficients [T, 4].
+            comb: FP32 combination [T, 4 input, 4 output].
+
+        Returns:
+            The new BF16 residual streams [T, 4, H], as gluon_mhc_post_gfx950
+            computes them from the reduced rows.
+        """
+        if not self.can_reduce_mhc_post(tensor, residual, post, comb):
+            raise RuntimeError("Iris producer reduction cannot fuse these operands")
+        out = torch.empty_like(residual)
+        self.producer_pull.run(out, (residual, post, comb))
+        return out
+
 
 def create_iris_state(
     group: dist.ProcessGroup,

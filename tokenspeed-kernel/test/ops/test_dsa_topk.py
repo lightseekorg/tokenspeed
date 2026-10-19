@@ -41,6 +41,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsa import torch_dsa_logits_topk
 from tokenspeed_kernel.ops.attention.dsa import cuda as cuda_dsa_topk
 from tokenspeed_kernel.ops.attention.dsa import flashinfer as fi_dsa_topk
 from tokenspeed_kernel.ops.attention.dsa.cute_dsl import (
@@ -124,14 +125,11 @@ def _reference_topk_values(
     logits: torch.Tensor, seq_lens: torch.Tensor, topk: int, next_n: int
 ) -> torch.Tensor:
     """Per-row causal-window top-k values, sorted ascending, ``-inf`` padded."""
-    num_rows, num_cols = logits.shape
-    out = torch.full((num_rows, topk), float("-inf"))
-    for r in range(num_rows):
-        win = _row_window(seq_lens, r, next_n, num_cols)
-        k = min(topk, win)
-        if k > 0:
-            vals = logits[r, :win].topk(k).values.sort().values
-            out[r, :k] = vals.cpu()
+    columns = torch_dsa_logits_topk(logits, seq_lens, topk, next_n).long()
+    out = torch.full(columns.shape, float("-inf"))
+    for row, picked in enumerate(columns):
+        picked = picked[picked >= 0]
+        out[row, : picked.numel()] = logits[row, picked].sort().values.cpu()
     return out
 
 

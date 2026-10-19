@@ -41,7 +41,7 @@ from functools import partial
 from types import SimpleNamespace
 
 import pytest
-import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
+import tokenspeed_kernel.numerics.torch.gemm as _gemm_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
 import tokenspeed_kernel.ops.attention.dsa as _attention_dsa_pkg
@@ -303,6 +303,7 @@ def test_residual_family_exports_and_modes():
         "gated_residual_combine",
         "gated_residual_mix",
         "mhc_apply_pre",
+        "mhc_apply_pre_quantize_fp8",
         "mhc_fused_hc",
         "mhc_mixes",
         "mhc_post",
@@ -323,6 +324,7 @@ def test_residual_family_exports_and_modes():
         "hyperconnection_combine",
         "hyperconnection_mix",
         "mhc_apply_pre",
+        *({"mhc_apply_pre_fp8_group32"} if Platform.get().is_amd else set()),
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
@@ -934,7 +936,7 @@ def test_mm_fp8_reference_selection_follows_b_layout(b_layout) -> None:
         B_scales=scale,
         out_dtype=torch.float32,
         quant="fp8",
-        solution="reference",
+        solution="torch",
     )
 
     torch.testing.assert_close(out, a.float() @ b_kn.float())
