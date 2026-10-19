@@ -1036,9 +1036,10 @@ returns physical slots across graph breaks and keeps logical candidates
 in the existing per-forward share for both stages. Draft steps carrying
 only physical slots use the direct-slot kernels.
 
-PrimTS plans share one workspace per stream and retain K/V storage bindings.
-Each run regenerates the workspace data it reads, so geometries can interleave.
-Captured plans pin the workspace; warm its largest size before capture.
+The QSA leaf owns PrimTS plans and per-stream scratch for its current KV pool;
+rebinding drops eager plans. Capture sessions retain graph plans and their
+allocations until graph release. Scratch may grow without moving graph inputs.
+Each run regenerates its workspace data, so geometries can interleave.
 
 QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and CuTe read invalid
 candidates from the zero-initialized slot 1 of the reserved null page.

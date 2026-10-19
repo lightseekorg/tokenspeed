@@ -26,7 +26,11 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention.qsa import QSASparseMetadata, qsa_sparse_attention
+from tokenspeed_kernel.ops.attention.qsa import (
+    QSASparseMetadata,
+    QSAWorkspace,
+    qsa_sparse_attention,
+)
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -65,6 +69,11 @@ class QSAAttnBackend(MHAAttnBackend):
             kernel_page_size=kernel_page_size,
         )
         self._metadata_capacity_rows = 0
+        self._qsa_workspace = QSAWorkspace()
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self._qsa_workspace.clear()
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
         super().init_cuda_graph_state(max_bs)
@@ -125,6 +134,7 @@ class QSAAttnBackend(MHAAttnBackend):
                     query_start_loc=offsets,
                     page_size=layout.full_kernel_page_size,
                     block_size=selection.block_size,
+                    workspace=self._qsa_workspace,
                 )
             elif ctx.draft_narrowing is None:
                 raise RuntimeError("QSA selection must have one row per query")

@@ -158,6 +158,8 @@ stream. A graph captured inside `capture_session` gets buffers of its own,
 zeroed once after capture outside the graph and kept alive as long as the
 graph, so replays carry no zeroing node. The runtime opens a session around
 every graph it captures.
+Prepared plans can use `retain_for_capture` in that session to keep their
+allocations alive until the graph owner is released.
 
 ### Solution choices
 

@@ -21,8 +21,24 @@
 """Logical selection metadata for grouped QSA attention implementations."""
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
+
+
+class QSAWorkspace:
+    """Caller-owned attention plans and scratch, shared across query layouts.
+
+    Keep one workspace per KV pool. ``clear`` releases eager plans when the
+    pool is rebound; graph-owned plans live until their capture is released.
+    """
+
+    def __init__(self) -> None:
+        self.runners: dict[tuple[torch.device, int], Any] = {}
+
+    def clear(self) -> None:
+        """Release cached eager plans and scratch without invalidating graphs."""
+        self.runners.clear()
 
 
 @dataclass(frozen=True)
@@ -38,6 +54,8 @@ class QSASparseMetadata:
     query length tuple, including both endpoints, so groups never cross requests.
     ``page_size`` is the physical cache page size; ``block_size`` is the
     indexer's compression ratio. Cache padding must contain finite values.
+    ``workspace`` owns reusable plans for this KV pool. Direct CUDA Graph
+    capture must run inside ``tokenspeed_kernel.workspace.capture_session``.
     """
 
     selected_blocks: torch.Tensor
@@ -47,6 +65,7 @@ class QSASparseMetadata:
     query_start_loc: tuple[int, ...]
     page_size: int
     block_size: int
+    workspace: QSAWorkspace
 
     def validate(
         self, rows: int, selected_width: int, *, query_width: int | None

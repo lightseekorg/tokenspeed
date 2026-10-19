@@ -20,7 +20,9 @@
 
 from __future__ import annotations
 
+import gc
 import logging
+import weakref
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -1893,6 +1895,23 @@ def test_qsa_passes_logical_selection_to_kernel(query_width: int | None) -> None
                 q.flatten(1), layer, pool, physical_slots, ctx
             )
             torch.testing.assert_close(actual, expected, atol=2e-3, rtol=1e-2)
+
+    old_storage = weakref.ref(k if k._base is None else k._base)
+    _, replacement = make_pool(
+        MHATokenToKVPool,
+        plan,
+        device="cuda",
+        dtype=torch.bfloat16,
+        head_num=1,
+        head_dim=256,
+        layer_num=1,
+        rank=0,
+    )
+    router.set_cache_pool(replacement)
+    ctx.token_to_kv_pool = replacement
+    del k, v, pool
+    gc.collect()
+    assert old_storage() is None
 
 
 def test_qwen4_exp_ple_lengths_accept_a_padded_row_count() -> None:

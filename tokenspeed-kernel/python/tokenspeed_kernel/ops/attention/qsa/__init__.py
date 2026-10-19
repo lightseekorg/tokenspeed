@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel.ops.attention.qsa.metadata import QSASparseMetadata
+from tokenspeed_kernel.ops.attention.qsa.metadata import QSASparseMetadata, QSAWorkspace
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import (
@@ -536,5 +536,6 @@ __all__ = [
     "qsa_block_topk_stream",
     "qsa_sparse_attention",
     "QSASparseMetadata",
+    "QSAWorkspace",
     "qwen4_exp_qsa_block_topk",
 ]

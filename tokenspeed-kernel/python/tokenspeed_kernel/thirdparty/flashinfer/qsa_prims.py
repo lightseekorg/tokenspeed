@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from functools import cache
+from weakref import WeakValueDictionary
 
 import torch
 from flashinfer.attention.prims_ts.decode import (
@@ -34,7 +34,8 @@ from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
     QTokenKvBlockSparsePagedTSWrapper,
     get_q_token_kv_block_sparse_workspace_size,
 )
-from tokenspeed_kernel.ops.attention.qsa.metadata import QSASparseMetadata
+from tokenspeed_kernel.ops.attention.qsa.metadata import QSASparseMetadata, QSAWorkspace
+from tokenspeed_kernel.workspace import retain_for_capture
 
 
 def _tensor_layout(tensor: torch.Tensor) -> tuple:
@@ -54,11 +55,10 @@ def _group_offsets(offsets: tuple[int, ...], group_size: int) -> tuple[int, ...]
 class _PrimTSQSAPlan:
     wrapper: QTokenKvBlockSparsePagedTSWrapper
     qo_indptr: torch.Tensor
-    captured: bool = False
 
 
 class _PrimTSQSARunner:
-    """Bounded plans sharing one high-water workspace on one CUDA stream.
+    """Per-pool plans sharing a growable workspace on one CUDA stream.
 
     Plans retain cache views and route offsets, but no request-owned history.
     Packed queries supply their offsets separately. With split_kv=False,
@@ -71,7 +71,10 @@ class _PrimTSQSARunner:
         self._device = device
         self._sm_count = torch.cuda.get_device_properties(device).multi_processor_count
         self._workspace = torch.empty(0, dtype=torch.uint8, device=device)
-        self._plans: OrderedDict[tuple, _PrimTSQSAPlan] = OrderedDict()
+        self._plans: dict[tuple[int, int], OrderedDict[tuple, _PrimTSQSAPlan]] = {}
+        self._captured_plans: WeakValueDictionary[tuple, _PrimTSQSAPlan] = (
+            WeakValueDictionary()
+        )
 
     def run(
         self,
@@ -124,7 +127,11 @@ class _PrimTSQSARunner:
             metadata.block_size,
             group_size,
         )
-        plan = self._plans.get(key)
+        binding = (k.data_ptr(), v.data_ptr())
+        plans = self._plans.setdefault(binding, OrderedDict())
+        plan = self._captured_plans.get(key)
+        if plan is None:
+            plan = plans.get(key)
         if plan is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("warm up the PrimTS QSA geometry before capture")
@@ -145,13 +152,10 @@ class _PrimTSQSARunner:
                 share_pattern_across_kv_heads=True,
             )
             if size > self._workspace.numel():
-                if any(cached.captured for cached in self._plans.values()):
-                    raise RuntimeError(
-                        "warm the largest PrimTS QSA workspace before capture"
-                    )
-                self._plans.clear()
+                # Older plans retain their allocation, including plans owned
+                # by graphs. Growing eager scratch never changes their addresses.
                 self._workspace = torch.zeros(
-                    size, dtype=torch.uint8, device=self._device
+                    1 << (size - 1).bit_length(), dtype=torch.uint8, device=self._device
                 )
             else:
                 # Initialize the new geometry's sections. Cached nonsplit
@@ -179,20 +183,20 @@ class _PrimTSQSARunner:
                 kv_data_type=k.dtype,
                 o_data_type=q.dtype,
             )
-            if len(self._plans) >= 64:
-                evictable = next(
-                    (key for key, cached in self._plans.items() if not cached.captured),
-                    None,
-                )
-                if evictable is None:
-                    raise RuntimeError("all 64 PrimTS QSA plans are CUDA Graph pinned")
-                del self._plans[evictable]
+            # Bound eager geometries per layer, not across every layer and
+            # graph batch. Captures own their plans outside this LRU.
+            if len(plans) >= 64:
+                plans.popitem(last=False)
             plan = _PrimTSQSAPlan(wrapper, qo_indptr)
-            self._plans[key] = plan
-        else:
-            self._plans.move_to_end(key)
+            plans[key] = plan
+        elif key in plans:
+            plans.move_to_end(key)
         if torch.cuda.is_current_stream_capturing():
-            plan.captured = True
+            retain_for_capture(plan)
+            self._captured_plans[key] = plan
+            plans.pop(key, None)
+            if not plans:
+                del self._plans[binding]
         return plan.wrapper.run(
             q,
             (k, v),
@@ -207,10 +211,16 @@ class _PrimTSQSARunner:
         )
 
 
-@cache
-def _get_runner(device: torch.device, stream: int) -> _PrimTSQSARunner:
+def _get_runner(
+    workspace: QSAWorkspace, device: torch.device, stream: int
+) -> _PrimTSQSARunner:
     # Stream identity separates mutable workspaces used concurrently.
-    return _PrimTSQSARunner(device)
+    key = (device, stream)
+    runner = workspace.runners.get(key)
+    if runner is None:
+        runner = _PrimTSQSARunner(device)
+        workspace.runners[key] = runner
+    return runner
 
 
 def qsa_attention(
@@ -235,6 +245,6 @@ def qsa_attention(
     Returns:
         A new BF16 output tensor with the query shape.
     """
-    return _get_runner(q.device, torch.cuda.current_stream(q.device).cuda_stream).run(
-        q, k_cache, v_cache, metadata, scale=scale, v_scale=v_scale
-    )
+    return _get_runner(
+        metadata.workspace, q.device, torch.cuda.current_stream(q.device).cuda_stream
+    ).run(q, k_cache, v_cache, metadata, scale=scale, v_scale=v_scale)
