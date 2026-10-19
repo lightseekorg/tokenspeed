@@ -306,7 +306,9 @@ def test_tp_logits_custom_collectives_serve_host_spread_group_with_fabric(monkey
         tp_group=tuple(range(8)),
         dp_lm_head_tp=False,
     )
-    lm_head = SimpleNamespace(weight=torch.ones((8, 2), dtype=torch.float32))
+    lm_head = SimpleNamespace(
+        weight=torch.ones((8, 2), dtype=torch.float32), num_embeddings_per_partition=8
+    )
     created = {}
 
     def _create_state(**kwargs):
@@ -326,6 +328,42 @@ def test_tp_logits_custom_collectives_serve_host_spread_group_with_fabric(monkey
     finally:
         # The cache is class-level; drop the stub so it cannot leak.
         LogitsProcessor._LOGITS_AG_STATES.pop((tuple(range(8)), 64), None)
+
+
+def test_logits_gather_state_spans_the_vocab_of_a_transposed_quantized_head(
+    monkeypatch,
+):
+    # An FP8 head keeps its weight as [hidden, vocab shard] after loading.
+    _set_fabric(monkeypatch, True)
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=64),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+        dp_lm_head_tp=False,
+    )
+    lm_head = SimpleNamespace(
+        weight=torch.ones((4, 32), dtype=torch.float8_e4m3fn),
+        num_embeddings_per_partition=32,
+    )
+    created = {}
+
+    def _create_state(**kwargs):
+        created.update(kwargs)
+        return "ag-state"
+
+    monkeypatch.setattr(logits_processor_module, "create_state", _create_state)
+    monkeypatch.setattr(
+        logits_processor_module.pg_manager,
+        "get_process_group",
+        lambda backend, group: "pg",
+    )
+
+    try:
+        assert processor._init_all_gather_state(lm_head) == "ag-state"
+        assert created["hidden_size"] == 64
+    finally:
+        LogitsProcessor._LOGITS_AG_STATES.pop(((0, 1), 64), None)
 
 
 def test_dist_argmax_probe_failure_falls_back_and_latches(monkeypatch):
