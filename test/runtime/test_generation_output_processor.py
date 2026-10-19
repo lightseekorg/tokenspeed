@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from http import HTTPStatus
 
 import pytest
@@ -35,8 +37,17 @@ from tokenspeed.runtime.engine.request_stats import (
     RequestStats,
     RequestStatsTracker,
 )
-from tokenspeed.runtime.execution.types import MAX_STOP_TOKEN_IDS
+from tokenspeed.runtime.execution.types import (
+    MAX_STOP_TOKEN_IDS,
+    ModelExecutionResult,
+)
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+# CI registration (AST-parsed, runtime no-op).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=15, suite="runtime-1gpu")
 
 
 class _Sender:
@@ -172,6 +183,30 @@ def test_a_landed_forward_of_a_finished_request_still_reports_to_the_scheduler()
     (extend,) = [event for event in events if type(event).__name__ == "ExtendResult"]
     assert extend.request_id == "gone"
     assert list(extend.tokens) == []
+
+
+def test_an_extend_sets_its_computed_length_and_a_decode_adds_to_it():
+    """An extend computed its prompt up to prefix plus input, whatever the
+    length was before (a prefix hit starts past zero), so a prefix hit that
+    completes the prompt commits its first token; a decode adds its input."""
+
+    class _PrefixHitOp(_ForwardOp):
+        input_lengths = [4, 1]
+        prefill_lengths = [8]
+        extend_prefix_lens = [4]
+
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    hit = _state([1, 2, 3, 4, 5, 6, 7, 8])
+    decode = _state([5, 6, 7], computed_length=3)
+    processor.rid_to_state["prefill"] = hit
+    processor.rid_to_state["decode"] = decode
+
+    processor.post_process_forward_op(
+        _PrefixHitOp(), _ExecutionResult(), is_prefill_instance=False
+    )
+
+    assert (hit.computed_length, hit.output_ids) == (8, [11])
+    assert (decode.computed_length, decode.output_ids) == (4, [22])
 
 
 def test_cached_tokens_count_the_replayed_window_as_a_hit():
@@ -1126,3 +1161,90 @@ def test_a_row_behind_a_stopped_request_reads_its_own_token():
     }
     assert extends == {"stopped": [], "live": [22]}
     assert live.output_ids == [22]
+
+
+class _LetterTokenizer:
+    """A tokenizer with an EOS id and an extra stop id; decodes to letters."""
+
+    eos_token_id = 900
+    additional_stop_token_ids = [901]
+
+    def decode(self, ids):
+        return "".join(chr(ord("a") + i % 26) for i in ids)
+
+
+_MODEL_EOS = 902
+
+
+def _stop_state(prompt: list[int], **params) -> RequestState:
+    stream = params.pop("stream", False)
+    return_logprob = params.pop("return_logprob", False)
+    sampling = SamplingParams(**{"max_new_tokens": 30, "stop": [], **params})
+    sampling.normalize(None)
+    state = RequestState(
+        prompt_input_ids=prompt,
+        sampling_params=sampling,
+        stream=stream,
+        tokenizer=_LetterTokenizer(),
+        computes_prompt_logprobs=True,
+        eos_token_ids=[_MODEL_EOS],
+        return_logprob=return_logprob,
+    )
+    state.computed_length = len(prompt)
+    return state
+
+
+class _DecodeRound:
+    """One decode round over ``request_ids`` (the scheduler op's surface)."""
+
+    def __init__(self, request_ids: list[str], width: int) -> None:
+        self.request_ids = list(request_ids)
+        self.request_pool_indices = list(range(len(request_ids)))
+        self.input_lengths = [width] * len(request_ids)
+        self.prefill_lengths = []
+        self.extend_prefix_lens = []
+        self.extend_replay_lens = []
+
+    def num_extends(self) -> int:
+        return 0
+
+
+def test_streamed_frames_carry_the_detokenizer_ids_once():
+    """Across a streaming request's frames the decode ids are the prompt's
+    surrounding tail and then each output token exactly once, against a
+    fixed read offset."""
+    processor = OutputProcesser(
+        _Sender(),
+        attn_tp_rank=0,
+        spec_algorithm="EAGLE",
+        spec_num_tokens=3,
+        metrics=_Metrics(),
+    )
+    prompt = [10, 11, 12, 13, 14, 15, 16, 17]
+    state = _stop_state(prompt, stream=True)
+    processor.rid_to_state["s"] = state
+
+    for rows, accepted in (
+        [[101, 102, 103], 2],
+        [[104, 105, 106], 3],
+        [[107, 0, 0], 1],
+    ):
+        processor.post_process_forward_op(
+            _DecodeRound(["s"], 3),
+            ModelExecutionResult(
+                output_tokens=torch.tensor(rows, dtype=torch.int32),
+                output_lengths=torch.tensor([accepted], dtype=torch.int32),
+            ),
+            is_prefill_instance=False,
+        )
+
+    frames = processor.send_to_tokenizer.items
+    assert len(frames) == 3
+    sent = [i for frame in frames for i in frame.decode_ids[0]]
+    assert sent == prompt[3:] + [101, 102, 104, 105, 106, 107]
+    assert [frame.read_offsets[0] for frame in frames] == [5, 5, 5]
+    assert [frame.output_ids[0] for frame in frames] == [
+        [101, 102],
+        [104, 105, 106],
+        [107],
+    ]
