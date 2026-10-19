@@ -967,9 +967,9 @@ class RaggedTensorMetadata:
     # slice_offs = [0] + cumsum(slice_sizes)
     # i.e., slice_offs[i] is the offset of the first element in slice `i`
     slice_offs: torch.Tensor
-    # block_offs_data[k] = [0] + cumsum(ceil_div(slice_sizes, 16 * k))
+    # block_offs_data[k] = [0] + cumsum(ceil_div(slice_sizes, 16 << k))
     # i.e., `block_offs_data[k][i]` is the offset of the first block of
-    # `16*k` tokens for batch `i` in a `slice_sizes`-shaped ragged tensor
+    # `16 << k` tokens for batch `i` in a `slice_sizes`-shaped ragged tensor
     block_offs_data: torch.Tensor
     # let `num_blocks[k] = block_offs_data[k, 1:] - block_offs_data[k, :-1]
     # block_schedule_data[k] = cat(*[[(batch, blk) for blk in range(blks)] for batch, blks in enumerate(num_blocks)])
