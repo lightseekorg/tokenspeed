@@ -51,6 +51,13 @@ base. Compact split candidates similarly store tile-local offsets. Neither
 representation truncates ids beyond 65535. Dedicated compaction scratch protects
 both K stages.
 
+Each 128-thread producer warpgroup owns an independent two-slot score queue
+for four query rows. Its selectors release those slots independently of the
+other four rows; the shared MMA accumulator still waits for both producer
+warpgroups to finish reading. Producers load their fixed row frontiers into
+registers once after CTA initialization, avoiding shared-memory reloads for
+every 128-key subtile. Graph replay reads the refreshed frontiers each time.
+
 Once 512 candidates exist, their monotone score cutoff filters later scores
 before histogram updates and compaction. An older cutoff can admit extra
 candidates but cannot discard a winner. Coarse histograms locate a threshold
@@ -130,7 +137,8 @@ for zero queries that stress equal-score selection. Cold-cache isolated
 measurements establish kernel costs; end-to-end model measurements must also
 include slot expansion, sparse attention and interference from other layers.
 
-Measurements after merging `main` at `26fffca5` use NVIDIA L20B (SM103),
+The baseline matrix before the stream tuning below, after merging `main` at
+`26fffca5`, uses NVIDIA L20B (SM103),
 CUDA 13.0, PyTorch 2.14.0+cu130, CuTe DSL 4.8.0 and tokenspeed-triton
 3.8.10.post20260920. BF16 queries have four 128-wide heads and top-k 512,
 with PDL enabled, causal frontiers and cold L2. The matrix covers 20 layouts,
@@ -185,32 +193,36 @@ durations must not be added to estimate latency.
 | 8192 / 32768 | 370.31 / 371.19 / 372.77 | 341.48 / 345.95 / 355.27 |
 | 16384 / 32768 | 675.46 / 676.30 / 679.17 | 594.60 / 602.21 / 612.45 |
 
-### Bounded selector scan
+### Grouped stream tuning
 
-Unrolling the compact scan removes dynamic searches through each thread's
-eight running entries. A paired public-API comparison on the same L20B,
-using seeds 83/89/97, 10 warmups and 45 cold-L2 CUDA Graph samples per seed,
-measures the following medians of seed medians for 16384 query rows and
-32768 live KV tokens, with an 8192-block table and PDL enabled:
+The bounded register scan, independent producer score queues and register-held
+frontiers reduce selector indexing, cross-row waits and repeated shared loads.
+A paired public-API comparison on the same L20B uses seeds 83/89/97, 10 warmups
+and 65 cold-L2 CUDA Graph samples per seed. For 16384 query rows and 32768 live
+KV tokens, an 8192-block table and PDL enabled, the medians of seed medians are:
 
 | Implementation | Score plus selection (us) |
 | --- | ---: |
-| Stream before unrolling | 681.34 |
-| Stream with fixed register indices | 632.22 |
-| Logits with persistent CUDA top-k | 605.22 |
+| Stream before tuning | 681.28 |
+| Stream with fixed register indices | 632.19 |
+| Stream with independent queues and register frontiers | 599.55 |
+| Logits with persistent CUDA top-k | 603.84 |
 
-Stream latency decreases by 7.2%. The kernel retains 64 registers per thread,
-231808 dynamic shared-memory bytes, 832 threads per CTA and one resident
-CTA per SM, with no spills. Nsight Compute records about 401.7 million
-executed instructions, down from 444.1 million. Profiler replay timings are
-not used for the latency comparison.
+Stream is 12.0% faster than the initial version, 5.2% faster than the register
+scan alone and 0.7% faster than logits for this case. All three paired seeds
+favor stream. The kernel retains 64 registers per thread, 231808 dynamic
+shared-memory bytes, 832 threads per CTA and one resident CTA per SM, with no
+spills. Accumulation and exact boundary refinement remain FP32. Profiler
+replay timings are not used for the latency comparison.
 
-Nsight Systems measures the single fused kernel over 20 graph replays at
-675.37 / 676.16 / 678.98 us before unrolling and
-627.40 / 628.22 / 629.89 us afterward (min/mean/max).
+Nsight Systems isolates 20 graph launches per implementation using NVTX ranges.
+The fused-kernel min/mean/max durations are 675.62 / 676.09 / 676.71 us
+initially, 626.95 / 628.11 / 629.12 us after the register scan, and
+595.24 / 595.86 / 596.74 us with the independent queues and register frontiers.
 
 Full-row validation covers the three target seeds, 8192 queries / 32768 KV,
 16384 queries / 65536 KV, a padded 16384 / 16384 table, zero-score ties and
 quantized inputs with boundary frontiers. All 90624 rows pass independent
 FP32 score-multiset, valid-count, unique-index and padding checks at
-`atol=1e-4, rtol=1e-5`.
+`atol=1e-4, rtol=1e-5`. Graph tests also refresh unequal producer-half frontiers,
+including empty or trivial halves and ids crossing the 64K offset window.

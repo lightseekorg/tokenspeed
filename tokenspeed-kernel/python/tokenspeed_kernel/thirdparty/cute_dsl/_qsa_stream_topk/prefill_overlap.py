@@ -1085,7 +1085,7 @@ class OverlapPrefillTopK(PrefillTopK):
         tmem_ptr_smem = smem.allocate_array(cutlass.Int32)
         k_pipeline_ptr = smem.allocate_array(cutlass.Int64, _K_STAGES * 2)
         acc_pipeline_ptr = smem.allocate_array(cutlass.Int64, _ACC_STAGES * 2)
-        score_pipeline_ptr = smem.allocate_array(cutlass.Int64, _SCORE_STAGES * 2)
+        score_pipeline_ptr = smem.allocate_array(cutlass.Int64, _SCORE_STAGES * 4)
         sK = smem.allocate_tensor(
             cutlass.BFloat16, smem_layout_k.outer, 1024, smem_layout_k.inner
         )
@@ -1120,7 +1120,9 @@ class OverlapPrefillTopK(PrefillTopK):
             16,
         )
         score_last = smem.allocate_tensor(
-            cutlass.Int32, cute.make_layout((_SCORE_STAGES,), stride=(1,)), 16
+            cutlass.Int32,
+            cute.make_layout((2, _SCORE_STAGES), stride=(_SCORE_STAGES, 1)),
+            16,
         )
         coarse_histograms = smem.allocate_tensor(
             cutlass.Int32,
@@ -1173,16 +1175,38 @@ class OverlapPrefillTopK(PrefillTopK):
             barrier_storage=acc_pipeline_ptr,
             defer_sync=True,
         ).make_participants()
+        # Each producer warpgroup and its four query rows share one queue.
+        # Copy and MMA warps do not participate in either score queue.
+        score_half = cutlass.Int32(0)
+        if warp_idx < _K_COPY_FIRST_WARP:
+            score_half = warpgroup_idx
+        elif warp_idx >= self.topk_first_warp:
+            score_half = (warp_idx - self.topk_first_warp) // (
+                (_QUERY_GROUP // 2) * self.selector_warps_per_row
+            )
         score_producer, score_consumer = pipeline.PipelineAsync.create(
             num_stages=_SCORE_STAGES,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 256),
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
-                self.query_group * self.selector_threads_per_row,
+                (self.query_group // 2) * self.selector_threads_per_row,
             ),
-            barrier_storage=score_pipeline_ptr,
+            barrier_storage=score_pipeline_ptr + score_half * (_SCORE_STAGES * 2),
             defer_sync=True,
         ).make_participants()
+
+        # PipelineAsync initializes only the half selected by warp 0.
+        # Initialize the other half before the common fence and CTA sync.
+        if warp_idx == 0:
+            with cute.arch.elect_one():
+                for stage in cutlass.range_constexpr(_SCORE_STAGES):
+                    cute.arch.mbarrier_init(
+                        score_pipeline_ptr + _SCORE_STAGES * 2 + stage, 128
+                    )
+                    cute.arch.mbarrier_init(
+                        score_pipeline_ptr + _SCORE_STAGES * 3 + stage,
+                        (self.query_group // 2) * self.selector_threads_per_row,
+                    )
 
         cute.arch.mbarrier_init_fence()
 
@@ -1358,6 +1382,15 @@ class OverlapPrefillTopK(PrefillTopK):
             identity = cute.make_identity_tensor((_MMA_M, self.mma_n // 2))
             tCoord = thread_copy.partition_D(load_slice.partition_C(identity))
             register_scores = cute.make_rmem_tensor(tCoord.shape, cutlass.Float32)
+            # Frontiers are fixed for this invocation after the common CTA
+            # initialization; histogram/count atomics do not change them.
+            producer_frontiers = cute.make_rmem_tensor(
+                (_QUERY_GROUP // 2,), cutlass.Int32
+            )
+            for query_row in cutlass.range_constexpr(_QUERY_GROUP // 2):
+                producer_frontiers[query_row] = row_completes[
+                    query_half * 4 + query_row
+                ]
             subtile = cutlass.Int32(0)
             while subtile < num_subtiles:
                 score_handle = score_producer.acquire_and_advance()
@@ -1379,7 +1412,9 @@ class OverlapPrefillTopK(PrefillTopK):
                         score_counts[score_handle.index, query_half * 4 + query_row] = (
                             cutlass.Int32(0)
                         )
-                pipeline.NamedBarrier(barrier_id=11, num_threads=256).arrive_and_wait()
+                pipeline.NamedBarrier(
+                    barrier_id=11 + query_half, num_threads=128
+                ).arrive_and_wait()
                 stage_subtiles = cutlass.Int32(0)
                 flush = cutlass.Boolean(False)
                 while subtile < num_subtiles and not flush:
@@ -1413,7 +1448,7 @@ class OverlapPrefillTopK(PrefillTopK):
                         logical_offset = subtile * _MMA_M + key_row
                         logical_block = logical_offset
                         keep = (
-                            logical_block < row_completes[query_half * 4 + query_row]
+                            logical_block < producer_frontiers[query_row]
                             and cutlass.Int32(self._float_bits(score)) + 1
                             > cutoff_bits[query_row]
                         )
@@ -1452,21 +1487,23 @@ class OverlapPrefillTopK(PrefillTopK):
                     # Reserve space for a full 128-key append before advancing.
                     # Flushing above stream_tile - 128 keeps both buffers bounded.
                     pipeline.NamedBarrier(
-                        barrier_id=11, num_threads=256
+                        barrier_id=11 + query_half, num_threads=128
                     ).arrive_and_wait()
                     max_count = cutlass.Int32(0)
-                    for query_row in cutlass.range_constexpr(_QUERY_GROUP):
-                        count = score_counts[score_handle.index, query_row]
+                    for query_row in cutlass.range_constexpr(_QUERY_GROUP // 2):
+                        count = score_counts[
+                            score_handle.index, query_half * 4 + query_row
+                        ]
                         if count > max_count:
                             max_count = count
                     flush = (
                         max_count > self.stream_tile - _MMA_M
                         or subtile % (65536 // _MMA_M) == 0
                     )
-                if warpgroup_idx == 0 and warpgroup_tidx == 0:
+                if warpgroup_tidx == 0:
                     # Low bit marks the last stage; remaining bits hold its base.
-                    score_last[score_handle.index] = stage_base | cutlass.Int32(
-                        subtile >= num_subtiles
+                    score_last[score_half, score_handle.index] = (
+                        stage_base | cutlass.Int32(subtile >= num_subtiles)
                     )
                 score_handle.commit()
             score_producer.tail()
@@ -1505,7 +1542,7 @@ class OverlapPrefillTopK(PrefillTopK):
                             (self.query_group, 256), stride=(self.stream_tile, 1)
                         ),
                     )
-                    stage_info = score_last[score_handle.index]
+                    stage_info = score_last[score_half, score_handle.index]
                     tile_base = stage_info & cutlass.Int32(-2)
                     is_last = (stage_info & cutlass.Int32(1)) != 0
                     tile_valid = score_counts[score_handle.index, row_in_group]

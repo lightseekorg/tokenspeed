@@ -570,7 +570,7 @@ def test_cute_dsl_qsa_stream_topk_overlap_graph_refreshes_candidates(
     device: str,
     enable_pdl: bool,
 ) -> None:
-    """Exercise initial and running selections with partial candidate buffers."""
+    """Refresh frontiers while the two producer halves progress independently."""
 
     torch.manual_seed(131)
     rows, width, pages = 136, 8, 129
@@ -617,7 +617,15 @@ def test_cute_dsl_qsa_stream_topk_overlap_graph_refreshes_candidates(
         selected = invoke()
 
     frontiers = [511, 512, 513, 1023, 1024, 1025, 6143, 8192]
-    for counts in (frontiers, list(reversed(frontiers)), [0] * width):
+    for counts in (
+        frontiers,
+        list(reversed(frontiers)),
+        [0] * 4 + [8192] * 4,
+        [8192] * 4 + [0] * 4,
+        [512] * 4 + [8192] * 4,
+        [8192] * 4 + [512] * 4,
+        [0] * width,
+    ):
         complete.copy_(
             torch.tensor(counts * requests_count, device=device, dtype=torch.int32)
         )
@@ -939,6 +947,30 @@ def test_stream_topk_graph_preserves_ids_above_65535(
             torch.testing.assert_close(
                 selected.sort(1).values, winners.int()[None].expand(rows, -1)
             )
+    if rows == 136:
+        # One producer half crosses the offset window while the other finishes
+        # earlier; replay must refresh both queues' independent stage counts.
+        counts = [capacity] * 4 + [65537] * 4
+        complete.copy_(
+            torch.tensor(counts * (rows // 8), device=device, dtype=torch.int32)
+        )
+        graph.replay()
+        sampled_rows = torch.tensor([0, 3, 4, 7, rows - 4, rows - 1], device=device)
+        _assert_matches_reference(
+            query[sampled_rows],
+            keys,
+            table,
+            requests[sampled_rows],
+            complete[sampled_rows],
+            selected[sampled_rows],
+            64,
+            512,
+        )
+        torch.testing.assert_close(
+            (selected >= 0).sum(1), complete.clamp(0, 512).long()
+        )
+        complete.fill_(capacity)
+
     # Sparse winners across every split let guarded decode accept its compact
     # pool, while the concentrated tail above exercises its full-score fallback.
     keys.zero_()
