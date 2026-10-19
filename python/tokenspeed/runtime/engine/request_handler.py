@@ -429,7 +429,14 @@ class RequestHandler:
                 # rendezvous blocks this thread too.
                 self._pending_weight_ops.append(recv_req)
             elif isinstance(recv_req, _WEIGHT_LOAD_OPS):
-                ok, msg = self._require_weight_version_for_l3_flush(recv_req)
+                refusal = (
+                    self.memory_controller.refuse_weight_load()
+                    if self.memory_controller is not None
+                    else None
+                )
+                ok, msg = (False, refusal) if refusal is not None else (True, "")
+                if ok:
+                    ok, msg = self._require_weight_version_for_l3_flush(recv_req)
                 if ok:
                     ok, msg = self._require_flush_for_l3_version_switch(recv_req)
                 if not ok:

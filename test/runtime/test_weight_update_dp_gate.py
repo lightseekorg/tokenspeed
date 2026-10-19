@@ -155,6 +155,7 @@ def _handler(*, dp_size: int = 1):
     handler._device = mock.Mock()
     handler._device.delete_l3_namespace.return_value = True
     handler._device.update_weights.return_value = (True, "ok")
+    handler.memory_controller = None
     return handler
 
 
@@ -604,6 +605,78 @@ class TestMooncakeOp:
         reply = _replies(handler)[0]
         assert not (reply.success)
         assert ("cache flush failed") in (reply.message)
+
+
+class TestReleasedMemory:
+    """A load must not write unmapped weights or run on suspended NCCL."""
+
+    @staticmethod
+    def _released(tags):
+        from tokenspeed.runtime.engine.io_struct import (
+            ReleaseMemoryOccupationReqInput,
+            ResumeMemoryOccupationReqInput,
+        )
+        from tokenspeed.runtime.engine.memory_occupation import (
+            VALID_TAGS,
+            MemoryOccupationController,
+            MemoryRegion,
+        )
+        from tokenspeed.runtime.engine.pause import PauseController
+
+        class _Drained:
+            def waiting_size(self):
+                return 0
+
+            def decoding_size(self):
+                return 0
+
+            def prefilling_size(self):
+                return 0
+
+        sender = mock.Mock()
+        pause = PauseController(sender)
+        controller = MemoryOccupationController(
+            send_func=sender,
+            pause_controller=pause,
+            regions={
+                tag: MemoryRegion(release=lambda: None, resume=lambda: None)
+                for tag in VALID_TAGS
+            },
+            enabled=True,
+            reset_caches_fn=lambda: True,
+            transfers_idle_fn=lambda: True,
+            weights_release_refusal_fn=lambda: None,
+            weights_busy_fn=lambda: False,
+        )
+        controller.handle_release(ReleaseMemoryOccupationReqInput(tags=None))
+        pause.maybe_finish_drain(_Drained())
+        resumed = [tag for tag in VALID_TAGS if tag not in tags]
+        controller.handle_resume(ResumeMemoryOccupationReqInput(tags=resumed))
+        return controller
+
+    @pytest.mark.parametrize("released", [["weights"], ["nccl"]])
+    def test_load_is_refused_before_the_gate(self, released):
+        handler = _handler()
+        handler.memory_controller = self._released(released)
+
+        handler.process_requests([_mooncake(version=12)])
+
+        handler._device.update_weights.assert_not_called()
+        handler.clear_cache_fn.assert_not_called()
+        reply = _replies(handler)[0]
+        assert isinstance(reply, UpdateWeightsFromMooncakeReqOutput)
+        assert not reply.success
+        assert released[0] in reply.message
+
+    def test_load_runs_while_only_the_cache_and_graphs_are_released(self):
+        handler = _handler()
+        handler.memory_controller = self._released(["kv_cache", "cuda_graph"])
+        handler._device.update_weights.return_value = (True, "applied")
+
+        handler.process_requests([_mooncake(version=12)])
+
+        handler._device.update_weights.assert_called_once()
+        assert _replies(handler)[0].success
 
 
 class TestCombinedWeightUpdateOutput:

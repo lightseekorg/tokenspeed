@@ -256,6 +256,39 @@ Use TokenSpeed's control-server address, not its OpenAI gateway address, as the
 external rollout-engine address. Real rollout log probabilities require
 `--enable-output-logprobs`.
 
+#### Releasing GPU memory (`--enable-memory-saver`)
+
+`POST /release_memory_occupation` frees GPU memory between rollouts so a
+trainer colocated on the same GPUs can use it; `POST
+/resume_memory_occupation` maps it back. Both take optional `tags`; a release
+without tags frees every region the engine has, a resume without tags restores
+whatever is released:
+
+| Tag | Memory | On resume |
+| --- | --- | --- |
+| `kv_cache` | the cache arena's device regions | zeroed; a PD engine registers it with the transfer engine again |
+| `weights` | model and draft parameters | restored from their CPU backup |
+| `cuda_graph` | the decode CUDA graphs' memory pool | discarded; replays rewrite it |
+| `nccl` | NCCL communicator buffers (`ProcessGroupNCCL.suspend`); requires a PyTorch build with suspend support and NCCL 2.29.7 or later | resumed in place |
+
+A release waits until the scheduler is drained, and on a disaggregated
+(`--disaggregation-mode prefill|decode`) engine also until no request is
+bootstrapping, no pages are pinned for a transfer and the transfer peer holds
+no sender or receiver. While a release is draining or memory is released, a
+disaggregated engine finishes new requests with an abort. Weight updates are
+refused while `weights` or `nccl` is released, so the RL order is: release
+everything, train, resume `["nccl", "cuda_graph", "weights"]` (without `nccl`
+on an older NCCL), push the new
+weights (`update_weights_from_mooncake`), resume `["kv_cache"]`. Sparse KV
+offload keeps its pinned Host history mapped across a release and zeroes it on
+resume. Other device memory (input buffers, communication workspaces such as
+symmetric memory or DeepEP buffers, the prefill CUDA graphs) stays resident.
+
+With memory saver enabled, startup skips the disposable CUDA-graph memory
+probe and captures the serving graphs once. The installed memory saver cannot
+destroy a tagged probe pool and then capture again. Graph memory is therefore
+not reserved by that probe; leave headroom in `--gpu-memory-utilization`.
+
 These slime paths are not yet supported end to end:
 
 - colocated CUDA-IPC updates through `update_weights_from_tensor`;

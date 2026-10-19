@@ -60,6 +60,7 @@ from tokenspeed.runtime.engine.io_struct import (
     ResumeSchedulerReqInput,
     ResumeSchedulerReqOutput,
 )
+from tokenspeed.runtime.engine.memory_occupation import MemoryRegion
 
 logger = logging.getLogger(__name__)
 
@@ -495,11 +496,60 @@ class PauseHooks:
         clear = getattr(self._loop.scheduler, "clear_l1_cache", None)
         return not callable(clear) or clear()
 
-    def kv_repair_after_wake(self) -> None:
-        """Zero re-mapped KV buffers (garbage after re-map) for every KV pool.
+    def transfers_idle_for_release(self) -> bool:
+        """True when no PD transfer can still read or write the cache.
 
-        The pools live behind the data plane and the zeroing is device work,
-        so the handle owns which pools are walked and does the walking; this
-        side only says when.
+        A drained scheduler can still hold requests waiting for their PD
+        bootstrap and pages pinned for an in-flight transfer (a finished
+        prefill whose KV is still being written to the decode node), and the
+        transfer peer can still hold a sender/receiver whose request is gone.
+        All are empty outside PD.
         """
-        self._device.run_kv_repair()
+        loop = self._loop
+        scheduler = loop.scheduler
+        if scheduler.bootstrapping_size() != 0 or scheduler.pd_transfer_size() != 0:
+            return False
+        return loop.kv_transfer is None or not loop.kv_transfer.has_inflight_transfers()
+
+    def memory_regions(
+        self, adapter, *, nccl_suspendable: bool
+    ) -> dict[str, MemoryRegion]:
+        """The releasable GPU-memory regions of this engine, keyed by tag.
+
+        The memory-saver ``adapter`` unmaps and re-maps the allocator regions;
+        the device handle does the data-plane work that must surround them.
+        Which pools and peers that work touches is the handle's business; this
+        side only says when. ``nccl_suspendable`` says whether the process's
+        NCCL can suspend communicators; without it there is no ``nccl`` region.
+        """
+        device = self._device
+
+        def release_kv_cache() -> None:
+            # Wait for in-flight copies and deregister the arena from the PD
+            # transfer engine before its memory goes away.
+            device.prepare_kv_release()
+            adapter.pause(tag="kv_cache")
+
+        def resume_kv_cache() -> None:
+            adapter.resume(tag="kv_cache")
+            # Re-mapped memory holds garbage: zero it, then register it with
+            # the PD transfer engine again.
+            device.finish_kv_resume()
+
+        def allocator_region(tag: str) -> MemoryRegion:
+            def release() -> None:
+                device.synchronize()
+                adapter.pause(tag=tag)
+
+            return MemoryRegion(release=release, resume=lambda: adapter.resume(tag=tag))
+
+        regions = {
+            "kv_cache": MemoryRegion(release=release_kv_cache, resume=resume_kv_cache),
+            "weights": allocator_region("weights"),
+            "cuda_graph": allocator_region("cuda_graph"),
+        }
+        if nccl_suspendable:
+            regions["nccl"] = MemoryRegion(
+                release=device.suspend_nccl, resume=device.resume_nccl
+            )
+        return regions
