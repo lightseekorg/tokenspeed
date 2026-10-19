@@ -730,6 +730,11 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
     # The requests differ, so identical drafts would mean the rows collapsed.
     assert not torch.equal(forward[0], forward[1])
     assert not torch.equal(forward[1], forward[2])
+    # A target head whose local vocabulary diverges from the Markov
+    # projection's must fail instead of drafting with wrong shard offsets.
+    drafter.lm_head = SimpleNamespace(weight=adapter.lm_head.weight[:-1])
+    with pytest.raises(ValueError, match="local vocabulary"):
+        run([0, 1, 2])
 
 
 def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):

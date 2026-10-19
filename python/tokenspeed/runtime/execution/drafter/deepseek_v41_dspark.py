@@ -173,7 +173,10 @@ class DeepseekV41DSpark(BaseDrafter):
                 if global_num_decodes is not None
                 else None
             ),
-            global_bs=global_num_decodes,
+            # global_bs keeps the round's total request counts, as in the idle
+            # ranks' draft context; the decode-only counts the draft sizes by
+            # ride in global_num_decodes and global_num_tokens.
+            global_bs=base_ctx.global_bs,
             global_num_decodes=global_num_decodes,
             all_decode_or_idle=base_ctx.all_decode_or_idle,
         )
@@ -197,6 +200,14 @@ class DeepseekV41DSpark(BaseDrafter):
             bonus, start_pos, history_slots, pool, draft_ctx
         )
         local_logits = self.model.local_base_logits(draft_hidden, self.lm_head.weight)
+        # The greedy step's shard offsets come from the Markov projection, so
+        # the target head's logits must span its local vocabulary.
+        markov_vocab = int(self.model.markov_projection.num_embeddings_per_partition)
+        if local_logits.shape[-1] != markov_vocab:
+            raise ValueError(
+                "DSpark base logits do not span the Markov projection's local "
+                f"vocabulary: {local_logits.shape[-1]} != {markov_vocab}"
+            )
         sample_dspark_block_greedy(
             local_logits,
             bonus,
