@@ -581,6 +581,7 @@ class AutoBackend(CommBackend):
     def try_fused_dp_row_linear(
         self,
         tensor: torch.Tensor,
+        input_scales: torch.Tensor | None,
         weight: torch.Tensor,
         weight_scales: torch.Tensor | None,
         owner_rows: tuple[int, ...],
@@ -588,7 +589,7 @@ class AutoBackend(CommBackend):
         workspace: ProjectionWorkspace,
     ) -> bool:
         return self._projection.try_fused_dp_row_linear(
-            tensor, weight, weight_scales, owner_rows, out, workspace
+            tensor, input_scales, weight, weight_scales, owner_rows, out, workspace
         )
 
     def projection_all_gather(
@@ -608,9 +609,11 @@ class AutoBackend(CommBackend):
         quantize: bool,
         out: torch.Tensor | None,
         workspace: ProjectionWorkspace,
+        *,
+        input_scales: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         return self._projection.all_to_all(
-            tensor, rows, inverse, quantize, out, workspace
+            tensor, rows, inverse, quantize, out, workspace, input_scales=input_scales
         )
 
     def acquire_projection_output(

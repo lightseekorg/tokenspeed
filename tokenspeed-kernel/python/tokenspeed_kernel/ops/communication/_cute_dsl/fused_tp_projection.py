@@ -291,23 +291,41 @@ class FusedTPProjectionState:
                 accumulator_groups=2 if row_parallel and rows >= 128 else 1,
                 use_input_multicast=bool(self.input_multicast_ptr),
             )
-            args = self._arguments(inputs, weight, scales, rows, out, rows)
-            self.compiled[rows] = cute.compile(
-                kernel,
-                *args[:5],
-                resident_ctas,
-                *args[5:],
-                lambda v: v,
-                options="--opt-level=2",
+            input_dtypes = (
+                (torch.bfloat16, torch.float8_e4m3fn)
+                if row_parallel
+                else (torch.bfloat16,)
             )
-            # Warm every supported bucket before capture; they share device epochs.
-            self.compiled[rows](*args)
+            for input_dtype in input_dtypes:
+                inputs = inputs.to(input_dtype)
+                input_scales = (
+                    torch.ones(
+                        (rows, input_size // 128), dtype=torch.float32, device=device
+                    )
+                    if input_dtype == torch.float8_e4m3fn
+                    else None
+                )
+                args = self._arguments(
+                    inputs, input_scales, weight, scales, rows, out, rows
+                )
+                key = (rows, input_dtype)
+                self.compiled[key] = cute.compile(
+                    kernel,
+                    *args[:5],
+                    resident_ctas,
+                    *args[5:],
+                    lambda v: v,
+                    options="--opt-level=2",
+                )
+                # Warm both input formats before capture; they share device epochs.
+                self.compiled[key](*args)
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
 
     def _arguments(
         self,
         inputs: torch.Tensor,
+        input_scales: torch.Tensor | None,
         weight: torch.Tensor,
         scales: torch.Tensor,
         bucket: int,
@@ -334,6 +352,13 @@ class FusedTPProjectionState:
             from_dlpack(inputs, assumed_align=16).mark_compact_shape_dynamic(
                 mode=0, stride_order=inputs.dim_order()
             ),
+            (
+                from_dlpack(input_scales, assumed_align=16).mark_compact_shape_dynamic(
+                    mode=0, stride_order=input_scales.dim_order()
+                )
+                if input_scales is not None
+                else None
+            ),
             self.input_peers,
             self.scale_peers,
             self.input_flags_cute,
@@ -353,8 +378,10 @@ class FusedTPProjectionState:
         weight_scales: torch.Tensor,
         owner_rows: tuple[int, ...],
         out: torch.Tensor,
+        *,
+        input_scales: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Launch with this layer's tensors and return its owned destination."""
+        """Launch BF16 quantization or directly exchange supplied E4M3/scales."""
         if self.closed:
             raise RuntimeError("Fused TP projection workspace is closed")
         if (
@@ -366,8 +393,14 @@ class FusedTPProjectionState:
         rows = owner_rows[self.rank]
         live_rows = max(owner_rows)
         bucket = _row_bucket(live_rows, self.row_parallel, self.world_size)
-        for tensor, shape, dtype in (
-            (inputs, (rows, self.input_size), torch.bfloat16),
+        if input_scales is not None and not self.row_parallel:
+            raise ValueError("Prequantized input is supported for row projection")
+        tensors = [
+            (
+                inputs,
+                (rows, self.input_size),
+                torch.float8_e4m3fn if input_scales is not None else torch.bfloat16,
+            ),
             (weight, (self.shard_size, self.gemm_input_size), torch.float8_e4m3fn),
             (
                 weight_scales,
@@ -375,7 +408,12 @@ class FusedTPProjectionState:
                 torch.float32,
             ),
             (out, (rows, self.output_size), torch.bfloat16),
-        ):
+        ]
+        if input_scales is not None:
+            tensors.append(
+                (input_scales, (rows, self.input_size // 128), torch.float32)
+            )
+        for tensor, shape, dtype in tensors:
             if (
                 tensor.shape != shape
                 or tensor.dtype != dtype
@@ -384,8 +422,10 @@ class FusedTPProjectionState:
                 or tensor.data_ptr() % 16
             ):
                 raise ValueError("Incompatible fused TP projection tensor")
-        self.compiled[bucket](
-            *self._arguments(inputs, weight, weight_scales, bucket, out, live_rows)
+        self.compiled[bucket, inputs.dtype](
+            *self._arguments(
+                inputs, input_scales, weight, weight_scales, bucket, out, live_rows
+            )
         )
         return out
 

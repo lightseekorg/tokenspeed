@@ -240,6 +240,12 @@ all-gather, FP8 GEMM, and all-to-all; row projection fuses all-to-all, FP8 GEMM,
 and reduce-scatter. The goal is to reduce launch overhead and let computation
 consume peer data as it becomes available.
 
+Row projection also accepts E4M3 inputs with FP32 scales per 128 channels,
+allowing the preceding RMSNorm/gate operation to quantize once. Fusion forwards
+those values and scales without requantizing; the ordinary path exchanges both
+before GEMM. BF16 input keeps quantization inside the projection. Both formats
+return BF16, share workspace ownership, and are prepared before graph capture.
+
 Both directions follow the existing workspace ownership contract: the backend
 prepares shared communication storage, each Linear supplies its weights, and
 the caller owns the final output. All ranks select the same path using their

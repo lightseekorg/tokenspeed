@@ -193,6 +193,22 @@ def _warmup_projection(workspace: ProjectionWorkspace) -> None:
     else:
         backend.projection_all_to_all(probe, 1, False, False, None, workspace)
         backend.projection_all_to_all(probe, 1, False, True, None, workspace)
+        if (
+            spec.dtype == torch.bfloat16
+            and spec.input_size % (128 * len(spec.group)) == 0
+        ):
+            # Empty input warms masked byte/scale packing, even at capacity one.
+            backend.projection_all_to_all(
+                probe[:0].to(torch.float8_e4m3fn),
+                1,
+                False,
+                False,
+                None,
+                workspace,
+                input_scales=torch.ones(
+                    (0, spec.input_size // 128), dtype=torch.float32, device=spec.device
+                ),
+            )
         partial = backend.acquire_projection_output(1, workspace)
         partial.zero_()
         backend.projection_reduce_scatter(partial, 1, workspace)
@@ -253,10 +269,13 @@ def projection_all_to_all(
     out: torch.Tensor | None,
     workspace: ProjectionWorkspace,
     backend: "CommBackend",
-) -> tuple[torch.Tensor, None]:
+    *,
+    input_scales: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Exchange token/channel axes using backend's ordinary AllToAll.
 
-    Forward returns borrowed padded channel shards without fused quantization.
+    Forward returns borrowed padded channel shards, preserving prequantized
+    values and their per-128 scales when supplied. No quantization is repeated.
     Inverse restores complete owner rows into the caller-provided out tensor.
     """
     from tokenspeed_kernel.ops.communication.triton import (
@@ -269,25 +288,81 @@ def projection_all_to_all(
     size = len(spec.group)
     width = spec.output_size if inverse else spec.input_size
     shard = width // size
-    received = workspace.received[: rows * width].view(size * rows, shard)
-    if inverse:
-        sent = inputs.contiguous()
-    else:
-        scratch = workspace.send[: rows * width].view(size, rows, shard)
-        sent = triton_pack_channel_shards_for_a2a(inputs, scratch)
-    backend.all_to_all_single(
-        received,
-        sent,
-        spec.group,
-        output_split_sizes=None,
-        input_split_sizes=None,
-    )
-    if inverse:
-        out.view(rows, size, shard).copy_(
-            received.view(size, rows, shard).transpose(0, 1)
+    if input_scales is not None:
+        # FP8 row-input workload: exchange prequantized values and their scales.
+        if (
+            inverse
+            or quantize
+            or spec.kind != "row"
+            or spec.dtype != torch.bfloat16
+            or shard % 128
+            or inputs.dtype != torch.float8_e4m3fn
+            or input_scales.shape != (inputs.shape[0], width // 128)
+            or input_scales.dtype != torch.float32
+            or input_scales.device != inputs.device
+        ):
+            raise ValueError(
+                "Prequantized A2A requires FP8 row inputs and per-128 scales"
+            )
+        # FP8 values plus FP32 per-128 scales fit in the prepared BF16 storage.
+        # Keep both alive until GEMM consumes them, without growing the workspace.
+        count = rows * width
+        scale_bytes = count // 128 * 4
+        send_bytes = workspace.send.view(torch.uint8)
+        receive_bytes = workspace.received.view(torch.uint8)
+        # Pack raw bytes so padding never converts integers to FP8.
+        sent = triton_pack_channel_shards_for_a2a(
+            inputs.view(torch.uint8), send_bytes[:count].view(size, rows, shard)
         )
-        return out, None
-    return received, None
+        received = receive_bytes[:count].view(inputs.dtype).view(size * rows, shard)
+        backend.all_to_all_single(
+            received.view(torch.uint8),
+            sent.view(torch.uint8),
+            spec.group,
+            output_split_sizes=None,
+            input_split_sizes=None,
+        )
+        sent_scales = triton_pack_channel_shards_for_a2a(
+            input_scales,
+            send_bytes[count : count + scale_bytes]
+            .view(torch.float32)
+            .view(size, rows, shard // 128),
+        )
+        scales = (
+            receive_bytes[count : count + scale_bytes]
+            .view(torch.float32)
+            .view(size * rows, shard // 128)
+        )
+        backend.all_to_all_single(
+            scales,
+            sent_scales,
+            spec.group,
+            output_split_sizes=None,
+            input_split_sizes=None,
+        )
+    else:
+        # Unquantized workload: shard row-projection inputs before GEMM, or
+        # return column-projection outputs to their token owners after GEMM.
+        scales = None
+        received = workspace.received[: rows * width].view(size * rows, shard)
+        if inverse:
+            sent = inputs.contiguous()
+        else:
+            scratch = workspace.send[: rows * width].view(size, rows, shard)
+            sent = triton_pack_channel_shards_for_a2a(inputs, scratch)
+        backend.all_to_all_single(
+            received,
+            sent,
+            spec.group,
+            output_split_sizes=None,
+            input_split_sizes=None,
+        )
+        if inverse:
+            out.view(rows, size, shard).copy_(
+                received.view(size, rows, shard).transpose(0, 1)
+            )
+            received = out
+    return received, scales
 
 
 def acquire_projection_output(
@@ -482,6 +557,7 @@ class ProjectionBackend:
     def try_fused_dp_row_linear(
         self,
         inputs: torch.Tensor,
+        input_scales: torch.Tensor | None,
         weight: torch.Tensor,
         weight_scales: torch.Tensor | None,
         owner_rows: tuple[int, ...],
@@ -516,6 +592,9 @@ class ProjectionBackend:
             weight_scales,
             owner_rows,
             out[: inputs.shape[0]],
+            input_scales=(
+                input_scales.contiguous() if input_scales is not None else None
+            ),
         )
         return True
 
@@ -597,10 +676,23 @@ class ProjectionBackend:
         quantize: bool,
         out: torch.Tensor | None,
         workspace: ProjectionWorkspace,
+        *,
+        input_scales: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if workspace.a2a is None or rows > workspace.a2a.max_rows:
+        if (
+            input_scales is not None
+            or workspace.a2a is None
+            or rows > workspace.a2a.max_rows
+        ):
             return projection_all_to_all(
-                inputs, rows, inverse, quantize, out, workspace, self._fallback
+                inputs,
+                rows,
+                inverse,
+                quantize,
+                out,
+                workspace,
+                self._fallback,
+                input_scales=input_scales,
             )
         from tokenspeed_kernel.ops.communication.cuda import (
             tokenspeed_a2a_lamport,

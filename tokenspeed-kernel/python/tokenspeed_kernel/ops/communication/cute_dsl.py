@@ -243,7 +243,7 @@ if current_platform().is_nvidia:
         ),
         signatures={
             format_signature(
-                inputs=dense_tensor_format(torch.bfloat16),
+                inputs=inputs_format,
                 weight=tensor_format(
                     "mxfp8",
                     torch.float8_e4m3fn,
@@ -255,6 +255,18 @@ if current_platform().is_nvidia:
                 ),
                 out=dense_tensor_format(torch.bfloat16),
             )
+            for inputs_format in (
+                dense_tensor_format(torch.bfloat16),
+                tensor_format(
+                    "mxfp8",
+                    torch.float8_e4m3fn,
+                    scale=ScaleFormat(
+                        storage_dtype=torch.float32,
+                        granularity="block",
+                        block_shape=(1, 128),
+                    ),
+                ),
+            )
         },
         priority=Priority.SPECIALIZED,
     )
@@ -265,6 +277,8 @@ if current_platform().is_nvidia:
         weight_scales: torch.Tensor,
         owner_rows: tuple[int, ...],
         out: torch.Tensor,
+        *,
+        input_scales: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run fused block-FP8 DP row-parallel linear on locally owned rows.
 
@@ -273,7 +287,9 @@ if current_platform().is_nvidia:
 
         Args:
             state: Collectively prepared workspace, shared only by serial calls.
-            inputs: Contiguous BF16 [R, K] containing this owner's actual rows.
+            inputs: Contiguous BF16 or E4M3 [R, K] containing this owner's rows.
+            input_scales: Contiguous FP32 [R, K/128] for E4M3 input; None for BF16.
+                Supplied FP8 values and scales bypass quantization.
             weight: Contiguous FP8 E4M3 [N, K/P] local input-channel shard,
                 where P is the prepared group size and N the padded output width.
             weight_scales: Contiguous FP32 [N/128, K/(P*128)] block scales.
@@ -285,4 +301,6 @@ if current_platform().is_nvidia:
             out, valid across subsequent calls. All peers must participate
             in the same order. Destroy referencing graphs before closing state.
         """
-        return state.run(inputs, weight, weight_scales, owner_rows, out)
+        return state.run(
+            inputs, weight, weight_scales, owner_rows, out, input_scales=input_scales
+        )

@@ -466,7 +466,7 @@ def _check_row_projection(rank, world_size, device, parallel, config):
         cute_dsl_fused_fp8_dp_row_linear,
     )
 
-    def fused(x, ctx):
+    def fused(x, ctx, scale=None):
         out = torch.empty((x.shape[0], 7168), device=device, dtype=torch.bfloat16)
         return cute_dsl_fused_fp8_dp_row_linear(
             candidate.projection_workspace.fused_row,
@@ -475,11 +475,14 @@ def _check_row_projection(rank, world_size, device, parallel, config):
             candidate.weight_scale_inv,
             tuple(ctx.collective_global_num_tokens),
             out,
+            input_scales=scale,
         )
 
-    def reference(x, ctx):
+    def reference(x, ctx, scale=None):
         rows = max(ctx.collective_global_num_tokens)
-        if rows <= 128:
+        if rows == 0:
+            return x.new_empty((0, 7168), dtype=torch.bfloat16)
+        if rows <= 128 and scale is None:
             return baseline(x, ctx=ctx)[0].clone()
         # Above 128 rows, the ordinary path uses NCCL's BF16 reduction.
         # Verify the fused contract with ordinary GEMM partials and an FP32 sum.
@@ -487,7 +490,7 @@ def _check_row_projection(rank, world_size, device, parallel, config):
             projection_all_to_all,
         )
 
-        values, _ = projection_all_to_all(
+        values, scales = projection_all_to_all(
             x,
             rows,
             False,
@@ -495,8 +498,26 @@ def _check_row_projection(rank, world_size, device, parallel, config):
             None,
             baseline.projection_workspace,
             baseline.comm_backend,
+            input_scales=scale,
         )
-        partial = RowParallelLinear.forward(baseline, values, scale=None, out=None)[0]
+        if scale is not None:
+            # Independently gather owner rows, then take this producer's channel
+            # shard. Check the real fallback exchanges FP8 bytes and scales.
+            gathered = []
+            for source in (x.view(torch.uint8), scale):
+                padded = source.new_zeros((rows, source.shape[1]))
+                padded[: source.shape[0]].copy_(source)
+                parts = [torch.empty_like(padded) for _ in range(world_size)]
+                dist.all_gather(parts, padded)
+                full = torch.cat(parts)
+                shard = source.shape[1] // world_size
+                gathered.append(full[:, rank * shard : (rank + 1) * shard].contiguous())
+            torch.testing.assert_close(
+                values.view(torch.uint8), gathered[0], rtol=0, atol=0
+            )
+            torch.testing.assert_close(scales, gathered[1], rtol=0, atol=0)
+            values, scales = gathered[0].view(x.dtype), gathered[1]
+        partial = RowParallelLinear.forward(baseline, values, scale=scales, out=None)[0]
         parts = [torch.empty_like(partial) for _ in range(world_size)]
         dist.all_gather(parts, partial)
         total = torch.zeros_like(partial, dtype=torch.float32)
@@ -555,7 +576,7 @@ def _check_row_projection(rank, world_size, device, parallel, config):
         model.weight_scale_inv.copy_(tiny_scales)
     # Small stores, split accumulators, cross-owner vector stores, and both
     # clustered and non-clustered reduction must preserve the zero sentinel.
-    for rows in (32, 128, 960, 4608, 5120):
+    for rows in (32, 128, 256, 4608, 5120):
         counts = (rows,) * world_size
         x = torch.zeros((rows, 12288), device=device, dtype=torch.bfloat16)
         x[:, :: 12288 // world_size] = 448
@@ -635,6 +656,77 @@ def _check_row_projection(rank, world_size, device, parallel, config):
         for pair, ref in zip(outputs, expected):
             for actual in pair:
                 torch.testing.assert_close(actual, ref, rtol=0, atol=0)
+    graph.reset()
+
+    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_gate
+
+    # Real KDA norm/gate/quant outputs: fallback, small fusion, vector stores,
+    # pipelined input exchange with an empty owner, and clustered GEMM.
+    fp8_counts = [
+        tuple(counts[:world_size])
+        for counts in (
+            (32, 17, 1, 0),
+            (128, 65, 1, 0),
+            (256, 241, 1, 0),
+            (0, 513, 576, 1),
+            (4608, 4608, 4608, 4608),
+        )
+    ]
+    norm_weight = torch.randn(128, dtype=torch.bfloat16, device=device)
+
+    def quantized(counts):
+        x = torch.randn((counts[rank], 12288), dtype=torch.bfloat16, device=device)
+        gate = torch.randn_like(x)
+        return quantize_fp8_with_gate(
+            x, gate, norm_weight=norm_weight, eps=1e-6, enable_pdl=False
+        )
+
+    empty = torch.empty((0, 12288), dtype=torch.float8_e4m3fn, device=device)
+    empty_scales = torch.empty((0, 96), dtype=torch.float32, device=device)
+    empty_counts = (0,) * world_size
+    empty_output = candidate(
+        empty, scale=empty_scales, ctx=_context(rank, empty_counts, empty_counts)
+    )[0]
+    torch.testing.assert_close(
+        empty_output, empty.new_empty((0, 7168), dtype=torch.bfloat16), rtol=0, atol=0
+    )
+    pairs = [quantized(counts) for counts in fp8_counts]
+    contexts = [_context(rank, counts, counts) for counts in fp8_counts]
+    for (x, scale), ctx in zip(pairs, contexts):
+        expected = reference(x, ctx, scale)
+        destination = torch.full_like(expected, float("nan"))
+        actual = candidate(x, scale=scale, ctx=ctx, out=destination)[0]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(destination, expected, rtol=0, atol=0)
+        torch.testing.assert_close(fused(x, ctx, scale), expected, rtol=0, atol=0)
+
+    # Reuse FP8 input and scale pointers while their contents and peer timing
+    # change. Interleave BF16 to check both compiled variants share epochs safely.
+    bf16_x = torch.randn(
+        (fp8_counts[2][rank], 12288), dtype=torch.bfloat16, device=device
+    )
+    bf16_ctx = contexts[2]
+    torch.cuda.synchronize()
+    with _capture_graph(graph, stream):
+        fp8_outputs = [
+            candidate(x, scale=scale, ctx=ctx)[0]
+            for (x, scale), ctx in zip(pairs[:4], contexts[:4])
+        ]
+        bf16_output = candidate(bf16_x, ctx=bf16_ctx)[0]
+    for replay in range(3):
+        for counts, (x, scale) in zip(fp8_counts[:4], pairs[:4]):
+            new_x, new_scale = quantized(counts)
+            x.copy_(new_x)
+            scale.copy_(new_scale)
+        expected = [
+            reference(x, ctx, scale) for (x, scale), ctx in zip(pairs[:4], contexts[:4])
+        ]
+        bf16_expected = reference(bf16_x, bf16_ctx)
+        torch.cuda._sleep(100000 * ((rank + replay) % world_size))
+        graph.replay()
+        for actual, ref in zip(fp8_outputs, expected):
+            torch.testing.assert_close(actual, ref, rtol=0, atol=0)
+        torch.testing.assert_close(bf16_output, bf16_expected, rtol=0, atol=0)
     graph.reset()
     for model in models:
         release_dp_linear_communication(model)

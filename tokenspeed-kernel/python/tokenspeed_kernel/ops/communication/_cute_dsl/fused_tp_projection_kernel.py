@@ -536,6 +536,7 @@ class FusedTPProjectionKernel:
         peer_ack: tuple,
         rank: cutlass.Int32,
         input_source: cute.Tensor,
+        input_scales: Union[cute.Tensor, None],
         input_peers: tuple,
         scale_peers: tuple,
         input_flags: cute.Tensor,
@@ -632,7 +633,9 @@ class FusedTPProjectionKernel:
             self.num_regs_epilogue_warps = 64
             self.num_regs_uniform_warps = 64
             self.num_regs_sched_warps = 64
-        self.vector_output = self.input_phase_clear and peers[1].shape[0] >= 640
+        self.vector_output = self.input_phase_clear and (
+            peers[1].shape[0] == 256 or peers[1].shape[0] >= 640
+        )
         self.skip_padded_tiles = self.input_phase_clear and peers[1].shape[0] > 2048
         self.cache_group_m = (
             min(4, peers[1].shape[0] // self.mma_tiler[0])
@@ -958,6 +961,7 @@ class FusedTPProjectionKernel:
             peer_ack,
             rank,
             input_source,
+            input_scales,
             input_peers,
             scale_peers,
             input_flags,
@@ -1009,6 +1013,7 @@ class FusedTPProjectionKernel:
         peer_ack: tuple,
         rank: cutlass.Int32,
         input_source: cute.Tensor,
+        input_scales: Union[cute.Tensor, None],
         input_peers: tuple,
         scale_peers: tuple,
         input_flags: cute.Tensor,
@@ -1053,6 +1058,7 @@ class FusedTPProjectionKernel:
         if cutlass.const_expr(not (self.large_row_bucket and len(peer_ready) == 2)):
             self.stage_input(
                 input_source,
+                input_scales,
                 peers[1].shape[0],
                 input_peers,
                 scale_peers,
@@ -1079,6 +1085,7 @@ class FusedTPProjectionKernel:
         if cutlass.const_expr(self.large_row_bucket and len(peer_ready) == 2):
             self.stage_input(
                 input_source,
+                input_scales,
                 peers[1].shape[0],
                 input_peers,
                 scale_peers,
@@ -3371,6 +3378,7 @@ class FusedTPProjectionKernel:
     def stage_input(
         self,
         source: cute.Tensor,
+        source_scales: Union[cute.Tensor, None],
         rows: cutlass.Constexpr,
         input_peers: tuple,
         scale_peers: tuple,
@@ -3381,9 +3389,8 @@ class FusedTPProjectionKernel:
         notify_address: cutlass.Int64,
         receive: cute.Tensor,
     ):
-        # Each source group is quantized exactly once, then pushed to all
-        # consumers. Match the aligned TRT-LLM path's BF16-rounded epsilon
-        # clamp and rounded divisions, including for zero and tiny groups.
+        # Quantize BF16 once, or forward the supplied FP8 values and scales.
+        # Both formats use the same publication and workspace-reuse protocol.
         tid = cute.arch.thread_idx()[0]
         block = self.cta_index()
         blocks = self.num_ctas
@@ -3440,7 +3447,7 @@ class FusedTPProjectionKernel:
         input_copy = cute.make_copy_atom(
             cute.nvgpu.CopyG2ROp(),
             source.element_type,
-            num_bits_per_copy=min(128, values_per_lane * 16),
+            num_bits_per_copy=min(128, values_per_lane * source.element_type.width),
         )
         fragment = cute.make_rmem_tensor((values_per_lane,), cutlass.Float32)
         quantized = cute.make_rmem_tensor((values_per_lane,), self.a_dtype)
@@ -3455,8 +3462,16 @@ class FusedTPProjectionKernel:
             + lane // lanes_per_group
         )
         group_stride = blocks * (self.threads_per_cta // lanes_per_group)
+        # Direct FP8 copies avoid lookahead bookkeeping at this bucket.
+        prefetch_input = (
+            self.row_parallel
+            and rows >= 160
+            and not (
+                self.input_phase_clear and rows == 256 and source_scales is not None
+            )
+        )
         pending_input = cute.make_rmem_tensor((values_per_lane,), source.element_type)
-        if cutlass.const_expr(self.row_parallel and rows >= 160):
+        if cutlass.const_expr(prefetch_input):
             pending_input.fill(0)
             if first_group < rows * groups_per_row:
                 if first_group // groups_per_row < valid_rows:
@@ -3484,9 +3499,9 @@ class FusedTPProjectionKernel:
                 cute.make_layout((values_per_lane,), stride=(1,)),
             )
             input_values.fill(0)
-            if cutlass.const_expr(self.row_parallel and rows >= 160):
+            if cutlass.const_expr(prefetch_input):
                 input_values.store(pending_input.load())
-                # Start the next independent BF16 read before quantizing this group.
+                # Start the next independent read before processing this group.
                 pending_input.fill(0)
                 next_group = group + group_stride
                 if next_group < rows * groups_per_row:
@@ -3527,35 +3542,46 @@ class FusedTPProjectionKernel:
                         _clear_payload_streaming(
                             receive.iterator.toint() + cutlass.Int64(clear_vector) * 16
                         )
-            values = input_values.load().to(cutlass.Float32)
-            # The reference one-shot AllGather removes its BF16 -0 sentinel
-            # up to 128 rows. Larger NCCL gathers preserve source signed zeros.
-            if cutlass.const_expr(rows <= 128):
-                zeros = cute.zeros_like(values)
-                fragment.store(cute.where(values == zeros, zeros, values))
+            if cutlass.const_expr(source_scales is not None):
+                # Preserve FP8 bytes and scales; do not dequantize or requantize.
+                quantized.store(input_values.load())
+                inverse = cutlass.Float32(1.0)
+                if row < valid_rows:
+                    inverse = source_scales[row, k_group]
             else:
-                fragment.store(values)
-            amax = cutlass.Float32(0.0)
-            for i in cutlass.range_constexpr(values_per_lane):
-                value = fragment[i]
-                amax = cute.arch.fmax(amax, cute.arch.fmax(value, -value))
-            if cutlass.const_expr(self.large_row_bucket):
-                # XOR distances below eight keep each group's maximum separate.
-                for delta in cutlass.range_constexpr(3):
-                    amax = cute.arch.fmax(
-                        amax, cute.arch.shuffle_sync_bfly(amax, 1 << delta)
+                values = input_values.load().to(cutlass.Float32)
+                # The reference one-shot AllGather removes its BF16 -0 sentinel
+                # up to 128 rows. Larger NCCL gathers preserve source signed zeros.
+                if cutlass.const_expr(rows <= 128):
+                    zeros = cute.zeros_like(values)
+                    fragment.store(cute.where(values == zeros, zeros, values))
+                else:
+                    fragment.store(values)
+                amax = cutlass.Float32(0.0)
+                for i in cutlass.range_constexpr(values_per_lane):
+                    value = fragment[i]
+                    amax = cute.arch.fmax(amax, cute.arch.fmax(value, -value))
+                if cutlass.const_expr(self.large_row_bucket):
+                    # XOR distances below eight keep each group's maximum separate.
+                    for delta in cutlass.range_constexpr(3):
+                        amax = cute.arch.fmax(
+                            amax, cute.arch.shuffle_sync_bfly(amax, 1 << delta)
+                        )
+                else:
+                    amax = cute.arch.warp_redux_sync(
+                        amax,
+                        kind="fmax",
+                        mask_and_clamp=0xFFFFFFFF,
+                        abs=False,
+                        nan=False,
                     )
-            else:
-                amax = cute.arch.warp_redux_sync(
-                    amax, kind="fmax", mask_and_clamp=0xFFFFFFFF, abs=False, nan=False
-                )
-            # Exact FP32 representation of BF16(1e-10), bits 0x2edc0000.
-            # A compile-time BF16 literal followed by .to(Float32) preserves
-            # the Python literal in this DSL and does not round it to BF16.
-            amax = cute.arch.fmax(amax, cutlass.Float32(1.000444171950221e-10))
-            multiplier = cutlass.Float32(448.0) / amax
-            inverse = cutlass.Float32(1.0) / multiplier
-            quantized.store((fragment.load() * multiplier).to(self.a_dtype))
+                # Exact FP32 representation of BF16(1e-10), bits 0x2edc0000.
+                # A compile-time BF16 literal followed by .to(Float32) preserves
+                # the Python literal in this DSL and does not round it to BF16.
+                amax = cute.arch.fmax(amax, cutlass.Float32(1.000444171950221e-10))
+                multiplier = cutlass.Float32(448.0) / amax
+                inverse = cutlass.Float32(1.0) / multiplier
+                quantized.store((fragment.load() * multiplier).to(self.a_dtype))
             for peer in cutlass.range_constexpr(len(input_peers)):
                 peer_width = width
                 peer_group = k_group
