@@ -66,6 +66,10 @@ KEY = ("json", SCHEMA)
 
 
 class _Grammar(BaseGrammarObject):
+    @property
+    def memory_size_bytes(self) -> int:
+        return 0
+
     def copy(self):
         return _Grammar()
 
@@ -191,10 +195,10 @@ class TestGrammarTpLockstep:
         assert len(manager.get_ready_grammar_requests()) == 1
         assert state.grammar is None
         assert "timed out" in state.finished_reason.to_json()["message"]
-        # This rank's compiled grammar stays cached.
-        value, hit = manager.grammar_backend.get_cached_or_future_value(KEY)
-        assert hit
-        assert not value.is_invalid
+        # No request was admitted with this rank's compiled grammar, so it is
+        # not kept.
+        _, hit = manager.grammar_backend.get_cached_or_future_value(KEY)
+        assert not hit
 
 
 class TestGrammarTpOutcome:

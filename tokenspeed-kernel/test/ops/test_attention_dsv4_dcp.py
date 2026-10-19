@@ -28,6 +28,13 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsv4 import (
+    torch_dsv4_merge_partials,
+    torch_dsv4_selected_attention,
+)
+from tokenspeed_kernel.numerics.torch.kvcache import (
+    torch_virtual_slots_to_local,
+)
 from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_decode,
     dsv4_decode_supports_partials,
@@ -57,18 +64,6 @@ SWA_ROW_BYTES = SWA_TOKEN_STRIDE + 8  # plus one FP8 scale per 64-wide nope bloc
 SWA_PAGE_BYTES = -(-PAGE_ROWS * SWA_ROW_BYTES // SWA_TOKEN_STRIDE) * SWA_TOKEN_STRIDE
 
 
-def _reference_translation(slots, rows, virtual_count, degree, rank):
-    """Owner and local slot of every virtual slot, straight from the contract."""
-    block = slots.clamp_min(0) // rows
-    owned = (
-        (slots >= rows)
-        & (slots < virtual_count * rows)
-        & ((block - 1) % degree == rank)
-    )
-    local = ((block - 1) // degree + 1) * rows + slots.clamp_min(0) % rows
-    return torch.where(owned, local, torch.zeros_like(local)), owned
-
-
 # ---------------------------------------------------------------------------
 # Virtual block translation
 # ---------------------------------------------------------------------------
@@ -90,8 +85,12 @@ def test_owned_pages_partition_the_virtual_space(rows, degree, parents, packing)
             degree=degree,
             rank=rank,
         )
-        expected_local, expected_owned = _reference_translation(
-            slots, rows, virtual_count, degree, rank
+        expected_local, expected_owned = torch_virtual_slots_to_local(
+            slots,
+            rows_per_page=rows,
+            virtual_block_count=virtual_count,
+            degree=degree,
+            rank=rank,
         )
         assert torch.equal(local, expected_local)
         assert torch.equal(owned, expected_owned)
@@ -153,8 +152,8 @@ def test_virtual_slot_translation_reuses_caller_outputs():
     )
     assert local.data_ptr() == out.data_ptr()
     assert owned.data_ptr() == mask.data_ptr()
-    expected_local, expected_owned = _reference_translation(
-        slots.long().cpu(), 1, 401, 2, 1
+    expected_local, expected_owned = torch_virtual_slots_to_local(
+        slots.long().cpu(), rows_per_page=1, virtual_block_count=401, degree=2, rank=1
     )
     assert torch.equal(local.cpu().long(), expected_local)
     assert torch.equal(owned.cpu(), expected_owned)
@@ -179,26 +178,6 @@ def test_virtual_slot_translation_rejects_invalid_geometry():
 # ---------------------------------------------------------------------------
 # Partial normalization and the LSE merge
 # ---------------------------------------------------------------------------
-
-
-def _merge_reference(partials, lses, sink):
-    """Combine per-shard no-sink partials by their LSE, then apply the sink once."""
-    stacked_lse = torch.stack(lses, dim=0)  # [shards, tokens, heads]
-    finite = torch.where(
-        torch.isfinite(stacked_lse),
-        stacked_lse,
-        torch.full_like(stacked_lse, -torch.inf),
-    )
-    total = torch.logsumexp(finite, dim=0)
-    weights = torch.exp(finite - total)
-    weights = torch.nan_to_num(weights, nan=0.0)
-    merged = sum(
-        w[..., None] * p.float() for w, p in zip(weights, partials, strict=True)
-    )
-    factor = torch.where(
-        torch.isinf(total), torch.zeros_like(total), torch.sigmoid(total - sink)
-    )
-    return merged * factor[..., None], total
 
 
 @requires_cuda
@@ -255,7 +234,7 @@ def test_weight_and_sink_match_the_reference_merge_with_empty_shards(degree, dty
     lses[0][2] = torch.inf
     sink = torch.randn(heads, device="cuda")
 
-    expected, expected_lse = _merge_reference(partials, lses, sink)
+    expected, expected_lse = torch_dsv4_merge_partials(partials, lses, sink)
     all_lse = torch.stack(lses, dim=0)
     summed = None
     global_lses = []
@@ -415,17 +394,7 @@ def _page_planar_cache(pages, page_size):
 
 def _selected_attention_reference(q, kv, slots, lens, sink):
     """Softmax over each token's selected rows with the sink, plus the no-sink LSE."""
-    result = torch.zeros_like(q)
-    lse = torch.empty(q.shape[0], q.shape[1], device=q.device)
-    for token in range(q.shape[0]):
-        selected = slots[token, : int(lens[token])].long()
-        selected = selected[(selected >= 0) & (selected < kv.shape[0])]
-        keys = kv[selected].float()
-        logits = q[token].float() @ keys.T * HEAD_DIM**-0.5
-        lse[token] = torch.logsumexp(logits, dim=1) if keys.shape[0] else -torch.inf
-        probabilities = torch.cat((logits, sink[:, None]), dim=1).softmax(dim=1)[:, :-1]
-        result[token] = (probabilities @ keys).to(q.dtype)
-    return result, lse
+    return torch_dsv4_selected_attention(q, kv, slots, lens, sink, HEAD_DIM**-0.5)
 
 
 @requires_cuda

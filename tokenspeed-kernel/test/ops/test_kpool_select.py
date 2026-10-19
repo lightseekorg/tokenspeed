@@ -24,6 +24,10 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.kpool import (
+    torch_kpool_expand,
+    torch_kpool_select,
+)
 from tokenspeed_kernel.ops.attention.kpool import (
     kpool_decode_topk,
     kpool_prefill_topk,
@@ -108,39 +112,21 @@ def _reference(
     *,
     apply_relu: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    width = topk * _POOL + _POOL - 1
-    slots = torch.full((q.shape[0], width), -1, dtype=torch.int32, device="cuda")
-    lens = torch.empty(q.shape[0], dtype=torch.int32, device="cuda")
-    pooled_k = pooled_k.view(-1, _PAGE, _DIM)
-
-    for token in range(q.shape[0]):
-        req = int(req_ids[token])
-        causal = max(int(causal_lens[token]), 0)
-        num_pools = causal // _POOL
-        if num_pools <= topk:
-            selected = torch.arange(num_pools, device="cuda")
-        else:
-            pool_ids = torch.arange(num_pools, device="cuda")
-            pages = index_table[req, pool_ids // _PAGE].long()
-            keys = pooled_k[pages, pool_ids % _PAGE]
-            head_scores = torch.einsum("hd,pd->hp", q[token].float(), keys).mul(
-                _DIM**-0.5
-            )
-            if apply_relu:
-                head_scores.relu_()
-            scores = (head_scores * weights[token, :, None]).sum(0)
-            selected = torch.topk(scores, k=topk, sorted=False).indices
-        raw_slots = (
-            selected[:, None] * _POOL + torch.arange(_POOL, device="cuda")
-        ).flatten()
-        raw_slots = torch.cat(
-            (raw_slots, torch.arange(num_pools * _POOL, causal, device="cuda"))
-        ).long()
-        pages = kv_table[req, raw_slots // _KV_PAGE].long()
-        global_slots = pages * _KV_PAGE + raw_slots % _KV_PAGE
-        slots[token, : raw_slots.numel()] = global_slots.to(torch.int32)
-        lens[token] = raw_slots.numel()
-    return slots, lens
+    return torch_kpool_select(
+        q,
+        pooled_k,
+        weights,
+        causal_lens,
+        req_ids,
+        index_table,
+        kv_table,
+        topk=topk,
+        pool_size=_POOL,
+        index_page_size=_PAGE,
+        kv_page_size=_KV_PAGE,
+        scale=_DIM**-0.5,
+        apply_relu=apply_relu,
+    )
 
 
 def _assert_selection(
@@ -152,58 +138,6 @@ def _assert_selection(
         assert sorted(actual[0][row, :length].tolist()) == sorted(
             expected[0][row, :length].tolist()
         )
-
-
-def _reference_expand_kpool(
-    pool_indices: torch.Tensor,
-    causal_lens: torch.Tensor,
-    req_ids: torch.Tensor,
-    block_table: torch.Tensor,
-    *,
-    pool_size: int,
-    block_size: int,
-    append_tail: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    num_tokens, topk_pools = pool_indices.shape
-    width = topk_pools * pool_size + (pool_size - 1 if append_tail else 0)
-    slots = torch.full(
-        (num_tokens, width), -1, dtype=torch.int32, device=pool_indices.device
-    )
-    lens = torch.zeros(num_tokens, dtype=torch.int32, device=pool_indices.device)
-
-    for token in range(num_tokens):
-        seq_len = max(int(causal_lens[token]), 0)
-        num_pools = seq_len // pool_size
-        history_len = min(num_pools * pool_size, topk_pools * pool_size)
-        selected = (
-            list(range(num_pools))
-            if num_pools <= topk_pools
-            else pool_indices[token].tolist()
-        )
-        raw_slots = []
-        for pool in selected[:topk_pools]:
-            if len(raw_slots) >= history_len:
-                break
-            if 0 <= pool < num_pools:
-                raw_slots.extend(range(pool * pool_size, (pool + 1) * pool_size))
-            else:
-                raw_slots.extend([-1] * pool_size)
-        if append_tail:
-            raw_slots.extend(range(num_pools * pool_size, seq_len))
-
-        count = 0
-        req = int(req_ids[token])
-        for column, raw_slot in enumerate(raw_slots[:width]):
-            if not 0 <= raw_slot < seq_len:
-                continue
-            page_idx = raw_slot // block_size
-            if page_idx >= block_table.shape[1]:
-                continue
-            page = int(block_table[req, page_idx])
-            slots[token, column] = page * block_size + raw_slot % block_size
-            count += 1
-        lens[token] = count
-    return slots, lens
 
 
 @pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16])
@@ -314,7 +248,7 @@ def test_expand_kpool_tracks_runtime_page_table_width(table_cols: int) -> None:
     assert not block_table.is_contiguous()
     assert not out.is_contiguous()
 
-    expected = _reference_expand_kpool(
+    expected = torch_kpool_expand(
         pool_indices,
         causal_lens,
         req_ids,

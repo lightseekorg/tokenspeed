@@ -49,7 +49,6 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import DSparkVanillaMarkov
 from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41ForCausalLM,
     DeepseekV41Model,
@@ -60,6 +59,7 @@ from tokenspeed.runtime.models.deepseek_v41 import (
     v41_mxfp8_config,
     v41_quantize_fp8,
 )
+from tokenspeed.runtime.models.deepseek_v41_dspark_heads import DSparkVanillaMarkov
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.utils import add_prefix
 
@@ -124,7 +124,7 @@ class _WindowAttention:
     def query_metadata(self, mode):
         return self.meta
 
-    def _workspace(self, swa, positions, swa_rope_cache):
+    def _workspace(self, swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps):
         """Per-request ``[batch, window + block, head_dim]`` BF16 rows.
 
         History rows are gathered straight from the strided paged field; the
@@ -136,8 +136,8 @@ class _WindowAttention:
         if swa.is_cuda and swa.shape[-1] == 512:
             rows = dsv41.dspark_rows(
                 swa,
-                None,
-                None,
+                swa_norm_weight,
+                swa_norm_eps if swa_norm_weight is not None else None,
                 positions if swa_rope_cache is not None else None,
                 swa_rope_cache,
                 None,
@@ -145,6 +145,9 @@ class _WindowAttention:
                 torch.empty_like(swa),
             )
         else:
+            if swa_norm_weight is not None:
+                # The model defers the SWA norm only to the fused CUDA rows.
+                raise ValueError("A deferred SWA norm requires 512-wide CUDA rows")
             if swa_rope_cache is not None:
                 swa = rope_inplace(swa.clone(), positions, swa_rope_cache, None)
             rows = _quantized_kv(swa)
@@ -165,10 +168,14 @@ class _WindowAttention:
         softmax_scale,
         index_process_group,
         swa_rope_cache,
+        swa_norm_weight,
+        swa_norm_eps,
     ):
         if index_q is not None or index_weights is not None:
             raise ValueError("DSpark window attention has no indexer")
-        kv = self._workspace(swa, positions, swa_rope_cache)
+        kv = self._workspace(
+            swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps
+        )
         if q.is_cuda and q.shape[-1] == 512:
             return self._kernel_forward(q, kv, attn_sink, softmax_scale)
         return self._reference_forward(q, kv, attn_sink, softmax_scale)

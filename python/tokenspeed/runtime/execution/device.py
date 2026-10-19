@@ -575,6 +575,8 @@ class DeviceHandle:
                 ngram_inputs=planned.ngram_inputs,
                 request_history_seeds=planned.request_history_seeds,
                 input_logprob_plan=planned.input_logprob_plan,
+                sampled_top_k=planned.sampled_top_k,
+                stop_criteria=planned.stop_criteria,
             )
 
         return PendingExecution(self._thread.submit(_forward))
@@ -1320,9 +1322,16 @@ def build_device_side(
     target, draft = create_model_runner(
         server_args, model_config, draft_model_config, gpu_id, global_rank
     )
-    with startup_phase("multimodal.init"):
-        if server_args.disaggregation_mode in ("null", "prefill"):
-            target.prepare_multimodal_runtime()
+
+    def prepare_multimodal():
+        with startup_phase("multimodal.init"):
+            if server_args.disaggregation_mode in ("null", "prefill"):
+                target.prepare_multimodal_runtime()
+
+    # CDNA4 encoders share the fixed Iris heap with the language model.
+    communication_first = current_platform().is_cdna4
+    if not communication_first:
+        prepare_multimodal()
     max_forward_tokens = (
         server_args.chunked_prefill_size
         if server_args.chunked_prefill_size > 0
@@ -1336,6 +1345,8 @@ def build_device_side(
         target.prepare_communication_runtime(max_forward_tokens)
         if draft is not None:
             draft.prepare_communication_runtime(max_forward_tokens)
+    if communication_first:
+        prepare_multimodal()
 
     post_profile_bytes = recv_pool_bytes(server_args, model_config.is_multimodal_active)
     if post_profile_bytes:
@@ -1417,6 +1428,7 @@ def build_device_side(
             config=ModelExecutorConfig.from_server_args(
                 server_args=server_args,
                 model_config=model_config,
+                model=target.model,
                 max_req_pool_size=RequestSlotLayout(max_batch_size).padding,
                 gpu_id=gpu_id,
                 global_rank=global_rank,

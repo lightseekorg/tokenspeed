@@ -24,7 +24,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from utils import is_cdna5
+from tokenspeed_kernel.numerics.torch.gemm import torch_mm_fp8_blockscale
+from utils import assert_no_triton_compile, is_cdna5
 
 if not is_cdna5():
     pytest.skip(
@@ -51,21 +52,6 @@ def _random_fp8(shape: tuple[int, ...]) -> torch.Tensor:
     return (torch.randn(shape, device="cuda") * 0.25).to(torch.float8_e4m3fn)
 
 
-def _ue8m0_dequantize(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    decoded = scales.view(torch.float8_e8m0fnu).float().repeat_interleave(32, dim=1)
-    return values.float() * decoded[:, : values.shape[1]]
-
-
-def _fp32_block_dequantize(
-    values: torch.Tensor,
-    scales: torch.Tensor,
-    row_block: int,
-) -> torch.Tensor:
-    rows = scales.repeat_interleave(row_block, dim=0)
-    expanded = rows.repeat_interleave(128, dim=1)
-    return values.float() * expanded[: values.shape[0], : values.shape[1]]
-
-
 @pytest.mark.parametrize("m,n,k", [(1, 128, 256), (16, 256, 288)])
 def test_mxfp8_ue8m0_gemv_matches_dequantized_reference(
     m: int,
@@ -86,12 +72,8 @@ def test_mxfp8_ue8m0_gemv_matches_dequantized_reference(
         torch.bfloat16,
         block_size=[1, 32],
     )
-    expected = (
-        _ue8m0_dequantize(a, a_scales)
-        @ _ue8m0_dequantize(
-            b,
-            b_scales,
-        ).T
+    expected = torch_mm_fp8_blockscale(
+        a, b, a_scales, b_scales, torch.float32, block_size=[1, 32]
     )
 
     torch.testing.assert_close(
@@ -101,7 +83,18 @@ def test_mxfp8_ue8m0_gemv_matches_dequantized_reference(
 
 @pytest.mark.parametrize(
     "m,n,k",
-    [(1, 128, 128), (1, 128, 256), (16, 256, 512), (1, 128, 4096)],
+    [
+        (1, 128, 128),
+        (1, 128, 256),
+        (16, 256, 512),
+        (1, 128, 4096),
+        # 64-row tiles: a 17-row tail with split K, GLM-5.3's padded fused
+        # QKV-A, a K=256 shared-expert down, and 32-column tiles.
+        (17, 128, 6144),
+        (64, 2688, 6144),
+        (48, 6144, 256),
+        (64, 4096, 2048),
+    ],
 )
 def test_fp8_blockscale_gemv_matches_dequantized_reference(
     m: int,
@@ -122,9 +115,8 @@ def test_fp8_blockscale_gemv_matches_dequantized_reference(
         torch.bfloat16,
         block_size=[128, 128],
     )
-    expected = (
-        _fp32_block_dequantize(a, a_scales, 1)
-        @ _fp32_block_dequantize(b, b_scales, 128).T
+    expected = torch_mm_fp8_blockscale(
+        a, b, a_scales, b_scales, torch.float32, block_size=[128, 128]
     )
 
     torch.testing.assert_close(
@@ -219,6 +211,89 @@ def test_mxfp8_split_k_selection(
     expected: int,
 ) -> None:
     assert mxfp8_mm._select_split_k(contract, m, n, k) == expected
+
+
+@pytest.mark.parametrize(
+    "n,k,expected",
+    [
+        (128, 6144, (16, 4, 512)),
+        (512, 6144, (16, 4, 512)),
+        (2688, 6144, (16, 1, 1024)),
+        (2048, 2048, (16, 1, 1024)),
+        (6144, 2048, (32, 1, 1024)),
+        (6144, 1536, (32, 1, 512)),
+        (6144, 256, (32, 1, 256)),
+    ],
+)
+def test_fp8_blockscale_wide_tile_selection(
+    n: int, k: int, expected: tuple[int, int, int]
+) -> None:
+    assert mxfp8_mm._select_fp32_wide_tile(n, k) == expected
+
+
+def test_fp8_blockscale_wide_tile_preserves_strided_out() -> None:
+    torch.manual_seed(4)
+    m, n, k = 40, 256, 2048
+    a = _random_fp8((m, k))
+    b = _random_fp8((n, k))
+    a_scales = torch.rand((m, k // 128), device="cuda") + 0.5
+    b_scales = torch.rand((n // 128, k // 128), device="cuda") + 0.5
+    backing = torch.full((m, n + 17), -1.0, device="cuda", dtype=torch.bfloat16)
+    out = backing[:, :n]
+
+    actual = launch_gluon_mm_fp8_blockscale_gfx1250(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        torch.bfloat16,
+        block_size=[128, 128],
+        out=out,
+    )
+    expected = torch_mm_fp8_blockscale(
+        a, b, a_scales, b_scales, torch.float32, block_size=[128, 128]
+    )
+
+    assert actual is out
+    torch.testing.assert_close(
+        actual.float(), expected, atol=_BF16_ATOL, rtol=_BF16_RTOL
+    )
+    assert torch.all(backing[:, n:] == -1.0)
+
+
+def test_fp8_blockscale_reuses_kernels_across_row_counts() -> None:
+    torch.manual_seed(5)
+    operands = [
+        (
+            _random_fp8((64, k)),
+            _random_fp8((n, k)),
+            torch.rand((64, k // 128), device="cuda") + 0.5,
+            torch.rand((n // 128, k // 128), device="cuda") + 0.5,
+        )
+        for n, k in ((1536, 4096), (256, 2048))
+    ]
+
+    def run(m: int) -> None:
+        for a, b, a_scales, b_scales in operands:
+            launch_gluon_mm_fp8_blockscale_gfx1250(
+                a[:m],
+                b,
+                a_scales[:m],
+                b_scales,
+                torch.bfloat16,
+                block_size=[128, 128],
+            )
+
+    # Below 16 rows the first shape splits K, 16 rows run direct, and above 16
+    # rows both take the 64-row tile, which splits K for the second shape.
+    for m in (2, 16, 17, 64):
+        run(m)
+    with assert_no_triton_compile(
+        mxfp8_mm.gluon_mm_fp8_blockscale_gfx1250,
+        mxfp8_mm._mxfp8_split_reduce_gfx1250,
+    ):
+        for m in (3, 15, 18, 40, 63):
+            run(m)
 
 
 @pytest.mark.parametrize(

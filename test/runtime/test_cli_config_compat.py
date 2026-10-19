@@ -73,6 +73,53 @@ class TestCLIConfigCompat:
             mapping.moe.dp_size,
         )
 
+    @pytest.mark.parametrize(
+        "contents, expected",
+        [
+            ('{"org/model": "/local/model"}', "/local/model"),
+            ('{"org/model": ""}', "org/model"),
+            ("org/model /local/model\ninvalid\nother /other\n", "/local/model"),
+            ("", "org/model"),
+            (" \n\t", "org/model"),
+            ("{}", "org/model"),
+            ("[]", "org/model"),
+            ('["org/model", "/local/model"]', "org/model"),
+            ('"org/model"', "org/model"),
+            ("1", "org/model"),
+            ("0", "org/model"),
+            ("true", "org/model"),
+            ("false", "org/model"),
+            ("null", "org/model"),
+            ('{"org/model": 1}', "org/model"),
+            ('{"org/model": true}', "org/model"),
+            ('{"org/model": ["/local/model"]}', "org/model"),
+            ('{"org/model": {"path": "/local/model"}}', "org/model"),
+            ('{"org/model": "/local/model", "other": null}', "org/model"),
+        ],
+    )
+    def test_model_redirect_file(self, tmp_path, monkeypatch, contents, expected):
+        redirect_path = tmp_path / "redirect"
+        redirect_path.write_text(contents)
+        monkeypatch.setenv("TOKENSPEED_MODEL_REDIRECT_PATH", str(redirect_path))
+        server_args = self._from_cli_args_no_init(
+            self._parse_args(["--model", "org/model"])
+        )
+
+        server_args.resolve_basic_defaults()
+
+        assert server_args.model == expected
+        assert server_args.tokenizer == expected
+        assert server_args.served_model_name == expected
+
+    def test_model_redirect_file_io_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TOKENSPEED_MODEL_REDIRECT_PATH", str(tmp_path))
+        server_args = self._from_cli_args_no_init(
+            self._parse_args(["--model", "org/model"])
+        )
+
+        with pytest.raises(IsADirectoryError):
+            server_args.resolve_basic_defaults()
+
     # ---- Positional model arg ----
 
     def test_positional_model_arg(self):
@@ -309,6 +356,14 @@ class TestCLIConfigCompat:
     def test_mixed_batch_can_be_enabled(self):
         args = self._parse_args(["--model", "test/model", "--enable-mixed-batch"])
         assert args.enable_mixed_batch
+
+    def test_constrained_decoding_is_internal_and_defaults_to_none(self):
+        args = self._parse_args(["--model", "test/model"])
+        assert self._from_cli_args_no_init(args).constrained_decoding is None
+        with pytest.raises(SystemExit):
+            self._parse_args(
+                ["--model", "test/model", "--constrained-decoding", "always"]
+            )
 
     def test_distributed_timeout_seconds_arg(self):
         args = self._parse_args(
@@ -801,21 +856,17 @@ class TestCLIConfigCompat:
         assert (server_args.speculative_num_steps) == (5)
         assert (server_args.speculative_num_draft_tokens) == (6)
 
-    def test_dspark_redirected_same_checkpoint_uses_block_plus_bonus_width(self):
-        with patch(
-            "tokenspeed.runtime.utils.server_args.maybe_model_redirect",
-            side_effect=lambda model: (
-                "resolved-checkpoint" if model == "model-alias" else model
-            ),
-        ):
-            server_args = self._resolve_speculative_config(
-                "model-alias",
-                (
-                    '{"method":"dspark","model":"model-alias",'
-                    '"num_speculative_tokens":5}'
-                ),
-                enable_prefix_caching=False,
-            )
+    def test_dspark_redirected_same_checkpoint_uses_block_plus_bonus_width(
+        self, tmp_path, monkeypatch
+    ):
+        redirect_path = tmp_path / "redirect.json"
+        redirect_path.write_text('{"model-alias": "resolved-checkpoint"}')
+        monkeypatch.setenv("TOKENSPEED_MODEL_REDIRECT_PATH", str(redirect_path))
+        server_args = self._resolve_speculative_config(
+            "model-alias",
+            ('{"method":"dspark","model":"model-alias",' '"num_speculative_tokens":5}'),
+            enable_prefix_caching=False,
+        )
 
         assert server_args.draft_model_path_use_base
         assert (server_args.speculative_draft_model_path) == ("resolved-checkpoint")

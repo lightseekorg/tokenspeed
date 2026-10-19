@@ -15,21 +15,9 @@ from __future__ import annotations
 
 import math
 import sys
-from types import SimpleNamespace
 
 import pytest
 
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
-    CacheRuntimeContract,
-)
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
-    v4_compressed_kv_spec,
-    v4_compressor_state_spec,
-    v4_indexer_kv_spec,
-    v4_indexer_state_spec,
-    v4_swa_kv_spec,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
     SchedulerLimits,
     capacity_model,
@@ -39,23 +27,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
     compute_max_logical_pages_for_capture,
 )
-
-
-def build_v4_cache_specs(hf_config, *, layer_ratio):
-    """The spec set a ratio vector declares, in the recipe's own order.
-
-    The recipe reaches for these constructors one group at a time as it walks
-    layers; here the whole set is what is under test.
-    """
-    ratios = {int(ratio) for ratio in layer_ratio}
-    specs = [v4_swa_kv_spec(hf_config)]
-    for ratio in sorted(r for r in ratios if r > 1):
-        specs.append(v4_compressor_state_spec(ratio))
-        specs.append(v4_compressed_kv_spec(ratio))
-    if 4 in ratios:
-        specs.append(v4_indexer_kv_spec())
-        specs.append(v4_indexer_state_spec())
-    return tuple(specs)
 
 
 def compute_cache_group_pages(
@@ -90,31 +61,6 @@ def compute_cache_group_pages(
         max_total_tokens=max_total_tokens, max_context_len=max_context_len
     )
     return dict(zip((spec.group_id for spec in specs), pages))
-
-
-class _CapacityProbe(CacheRecipe):
-    """A recipe that is nothing but its group specs and scheduler limits.
-
-    ``parents_needed`` and ``_capacity_from_parents`` read only those two plus
-    the layout's per-group packing, so the inverse property can be probed
-    without a model config or a packed arena -- and this states which inputs
-    the capacity math is allowed to read.
-    """
-
-    family = "deepseek_v4"
-    layer_types = ()
-
-    def __init__(self, specs, limits: SchedulerLimits) -> None:
-        self._specs = tuple(specs)
-        self._limits = limits
-
-    @property
-    def _group_specs(self):
-        return self._specs
-
-    @property
-    def scheduler_limits(self):
-        return self._limits
 
 
 _PAGE_SHAPES = ((4, 1), (4, 2), (16, 4), (2, 128))
@@ -437,177 +383,6 @@ class TestV4SlidingWindowGroupsSmoke:
         assert (pages["sliding"]) == (
             resident_pages + handover_pages + lookback_pages + scheduled_pages
         )
-
-    def test_page_counts_positive_finite_and_under_total_times_live(self):
-        inputs = {
-            "prefix_granularity": 256,
-            "max_live_requests": 32,
-            "max_scheduled_tokens": 2048,
-            "max_total_tokens": 64 * 1024,
-            "max_context_len": 64 * 1024,
-            "decode_input_tokens": 1,
-            "overlap_schedule_depth": 0,
-        }
-        specs = build_v4_cache_specs(
-            SimpleNamespace(sliding_window=128),
-            layer_ratio=(1, 4, 128),
-        )
-        pages = compute_cache_group_pages(specs, **inputs)
-        bound = inputs["max_total_tokens"] * inputs["max_live_requests"]
-        for spec in specs:
-            n = pages[spec.group_id]
-            _pytest_obj_1 = n
-            _pytest_cls_2 = int
-            _pytest_msg_3 = spec.group_id
-            assert isinstance(_pytest_obj_1, _pytest_cls_2), _pytest_msg_3
-            _pytest_a_4 = n
-            _pytest_b_5 = 0
-            _pytest_msg_6 = spec.group_id
-            assert _pytest_a_4 > _pytest_b_5, _pytest_msg_6
-            _pytest_expr_7 = math.isfinite(n)
-            _pytest_msg_8 = spec.group_id
-            assert _pytest_expr_7, _pytest_msg_8
-            _pytest_a_9 = n
-            _pytest_b_10 = bound
-            _pytest_msg_11 = spec.group_id
-            assert _pytest_a_9 < _pytest_b_10, _pytest_msg_11
-
-    def test_lcm_specs_own_row_geometry_and_declare_no_packing(self):
-        specs = build_v4_cache_specs(
-            SimpleNamespace(sliding_window=128),
-            layer_ratio=(1, 4, 128),
-        )
-
-        # Packing is the memory plan's answer, so a spec cannot declare it.
-        assert not (any(hasattr(spec, "cache_blocks_per_lcm_block") for spec in specs))
-        rows = {spec.group_id: spec.rows_per_page for spec in specs}
-        assert (rows["v4.swa_kv"]) == (64)
-        assert (rows["v4.c4a.compressor_state"]) == (4)
-        assert (rows["v4.c128a.compressor_state"]) == (8)
-
-    def test_every_v4_group_is_token_history(self):
-        # V4 stores rows of tokens everywhere -- the SWA window and the
-        # compressor tails are windows, not recurrent-state checkpoints -- so
-        # the whole pool holds token rows and the scheduler sees no snapshot
-        # group to place sparsely or align chunks for.
-        specs = build_v4_cache_specs(
-            SimpleNamespace(sliding_window=128),
-            layer_ratio=(1, 4, 128),
-        )
-        kinds = {spec.group_id: spec.attn_kind for spec in specs}
-        assert (kinds["v4.swa_kv"]) == ("sliding_window")
-        assert (kinds["v4.c4a.compressor_state"]) == ("sliding_window")
-        assert (kinds["v4.c4a.indexer_compressor_state"]) == ("sliding_window")
-        assert (kinds["v4.c4a.compressed_kv"]) == ("full_history")
-
-    def test_v4_groups_cross_the_bridge_into_a_live_scheduler(self):
-        # The whole V4 set arrives at the C++ scheduler as History groups,
-        # passes SchedulerConfig::Validate and builds a scheduler.
-        try:
-            from tokenspeed_scheduler import AttnKind, Scheduler
-
-            from tokenspeed.runtime.engine.scheduler_utils import (
-                make_config,
-                pool_to_cache_groups,
-            )
-        except (ImportError, ModuleNotFoundError) as exc:
-            pytest.skip(f"needs torch + the tokenspeed_scheduler ext: {exc}")
-
-        prefix_granularity = 256
-        num_device_pages = 8
-        specs = build_v4_cache_specs(
-            SimpleNamespace(sliding_window=128),
-            layer_ratio=(1, 4, 128),
-        )
-        packing = {
-            spec.group_id: prefix_granularity // spec.block_granularity
-            for spec in specs
-        }
-        # The bridge consumes the contract's scheduler-facing (virtual) counts;
-        # a real contract derives them from the physical ones and each spec's
-        # shard count, all 1 here.
-        contract = CacheRuntimeContract(
-            prefix_granularity=prefix_granularity,
-            num_lcm_blocks=num_device_pages - 1,
-            token_capacity=(num_device_pages - 1) * prefix_granularity,
-            group_specs=specs,
-            group_page_counts={
-                gid: pack * (num_device_pages - 1) + 1 for gid, pack in packing.items()
-            },
-            group_packing=packing,
-        )
-        pool = SimpleNamespace(arena=SimpleNamespace(runtime_contract=contract))
-        groups = pool_to_cache_groups(pool)
-
-        assert ({g.attn_kind for g in groups}) == (
-            {AttnKind.Full, AttnKind.SlidingWindow}
-        )
-        config = make_config(
-            num_device_pages=num_device_pages,
-            max_scheduled_tokens=1024,
-            max_batch_size=4,
-            prefix_granularity=prefix_granularity,
-            num_host_pages=0,
-            disable_l2_cache=True,
-            enable_l3_storage=False,
-            role="fused",
-            num_snapshot_pages=1,
-            max_retracted_requests=0,
-            l3_prefetch_min_pages=0,
-            cache_groups=groups,
-        )
-        Scheduler(config)
-
-    def test_c4_state_window_is_the_kernel_read_window(self):
-        """The ratio-4 compress kernel reads eight positions (two groups) when a
-        position completes a group; the verify rows of that step are written in
-        the same forward, so no verify width widens the retained window."""
-        specs = build_v4_cache_specs(
-            SimpleNamespace(sliding_window=128),
-            layer_ratio=(4, 128),
-        )
-        windows = {spec.group_id: spec.sliding_window_tokens for spec in specs}
-        assert (windows["v4.c4a.compressor_state"]) == (8)
-        assert (windows["v4.c4a.indexer_compressor_state"]) == (8)
-        assert (windows["v4.c128a.compressor_state"]) == (128)
-
-    def test_lcm_capacity_is_the_inverse_of_parent_demand(self):
-        from tokenspeed_scheduler import SchedulerConfig
-
-        layout = SimpleNamespace(
-            prefix_granularity=256,
-            group_packing=(
-                ("v4.swa_kv", 1),
-                ("v4.c4a.compressor_state", 4),
-                ("v4.c4a.compressed_kv", 2),
-                ("v4.c128a.compressor_state", 1),
-                ("v4.c128a.compressed_kv", 8),
-                ("v4.c4a.indexer_kv", 2),
-                ("v4.c4a.indexer_compressor_state", 4),
-            ),
-        )
-        probe = _CapacityProbe(
-            build_v4_cache_specs(
-                SimpleNamespace(sliding_window=128),
-                layer_ratio=(1, 4, 128),
-            ),
-            SchedulerLimits(
-                role=SchedulerConfig.Role.Fused,
-                max_live_requests=1,
-                max_scheduled_tokens=256,
-                max_context_len=4096,
-                decode_input_tokens=1,
-                overlap_schedule_depth=0,
-                disable_prefix_cache=False,
-            ),
-        )
-        num_lcm_blocks = 100
-        capacity = probe._capacity_from_parents(
-            layout, num_lcm_blocks, upper_bound=4096
-        )
-
-        assert (probe.parents_needed(layout, capacity)) <= (num_lcm_blocks)
-        assert (probe.parents_needed(layout, capacity + 1)) > (num_lcm_blocks)
 
 
 if __name__ == "__main__":

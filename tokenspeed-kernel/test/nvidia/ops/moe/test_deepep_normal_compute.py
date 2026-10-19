@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.quantization import dequantize_fp8_groups
 from tokenspeed_kernel.ops.activation.triton import fused_swiglu_fp8_ue8m0
 from tokenspeed_kernel.ops.moe._deep_ep.permute import (
     deepep_gather,
@@ -104,8 +105,7 @@ def _dequantize_packed(q: torch.Tensor, packed: torch.Tensor) -> torch.Tensor:
     bytes_ = torch.stack(
         [(packed >> (8 * i)) & 0xFF for i in range(4)], dim=-1
     ).flatten(-2)[:, :num_groups]
-    scales = torch.exp2(bytes_.float() - 127.0)
-    return q.float() * scales.repeat_interleave(_BLOCK, dim=1)
+    return dequantize_fp8_groups(q, bytes_.to(torch.uint8), _BLOCK)
 
 
 def test_fused_silu_block_quant_fills_mn_major_scales():

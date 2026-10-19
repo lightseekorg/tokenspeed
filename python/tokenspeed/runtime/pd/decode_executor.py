@@ -28,6 +28,7 @@ from tokenspeed.runtime.pd.mooncake.decode import MooncakeKVManagerDecode
 from tokenspeed.runtime.pd.mooncake.receiver import MooncakeKVReceiver
 from tokenspeed.runtime.pd.utils import poll_and_all_reduce
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.network import join_host_port
 
 logger = get_colorful_logger(__name__)
 
@@ -48,7 +49,7 @@ class DisaggDecodeExecutor:
     def _bootstrap(self, request_id, info):
         self.receivers[request_id] = MooncakeKVReceiver(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{info.bootstrap_host}:{info.bootstrap_port}",
+            bootstrap_addr=join_host_port(info.bootstrap_host, info.bootstrap_port),
             bootstrap_room=info.bootstrap_room,
         )
 

@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import bisect
 import gc
-import queue
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager
 from typing import TYPE_CHECKING
@@ -594,9 +593,8 @@ class ForwardStepRunner:
         )
 
         def run_once():
-            # Dummy add_batch keeps the grammar queue 1:1 with replays —
-            # fetch_batch pops once per forward, so warmup + capture
-            # would otherwise raise queue.Empty.
+            # Dummy add_batch keeps the grammar gate 1:1 with replays: the
+            # hostfunc pops one decision per forward.
             if self.capturable_grammar is not None:
                 self.capturable_grammar.add_batch(
                     grammars=[None] * bs,
@@ -663,16 +661,8 @@ class ForwardStepRunner:
         _is_capture_mode = False
         _is_cuda_graph_phase = False
 
-        # Graph capture records the hostfunc launches without invoking
-        # them, so the dummy run_once pushed stays queued — drain it, and
-        # reset prev_batch/current_batch so the first real replay's build
-        # doesn't advance the matcher from a stale warmup entry.
+        # Drop the capture's unconsumed gate decision; the first replay would pop it.
         if self.capturable_grammar is not None:
-            while True:
-                try:
-                    self.capturable_grammar.queue.get_nowait()
-                except queue.Empty:
-                    break
             self.capturable_grammar.reset_state()
 
         global_graph_memory_pool = graph.pool()
@@ -1048,8 +1038,10 @@ class ForwardStepRunner:
         device.
 
         Returns ``(output_tokens, output_lengths, output_logprobs,
-        input_token_logprobs)``; the last is the prompt-logprob gather of an
-        extend/mixed forward (``ctx.input_logprob_rows``) and None otherwise.
+        forward_logprobs)``; the last is an extend/mixed forward's
+        ``ForwardLogprobs`` (the prompt-logprob gather of
+        ``ctx.input_logprob_rows`` and the top-k alternatives
+        ``ctx.sampled_top_k`` asks for) and None otherwise.
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
@@ -1169,13 +1161,13 @@ class ForwardStepRunner:
             if self._expert_load_rows is not None:
                 self._expert_load_rows.clear()
 
-            # A decode graph never gathers prompt logprobs (its captured
-            # fourth output is None).
+            # A decode graph never gathers prompt logprobs or top-k
+            # alternatives (its captured fourth output is None).
             (
                 output_tokens,
                 output_lengths,
                 output_logprobs,
-                _input_token_logprobs,
+                _forward_logprobs,
             ) = self.output_buffers[graph_key]
 
             result = (

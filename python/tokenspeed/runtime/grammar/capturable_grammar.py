@@ -37,6 +37,15 @@ advance and this step's mask fill. The shared pinned buffer is
 read-only for the next step's build; ``post_process`` reads its own
 per-step CPU tensor produced by ``.to('cpu')`` in execute_forward_op,
 so step N+1 overwriting pinned does not race with commit(N).
+
+The host work runs in one hostfunc per step and never releases the GIL
+(see ``GrammarHostBuffers``). The hostfunc is gated: ``add_batch`` pushes
+one run/skip decision per replay, and a step runs ``build`` only when its
+batch has a grammar or the previous run batch had one (those matchers still
+advance and their mask rows still reset). A skipped execution returns on
+the callback thread without taking the GIL; taking it, even for a callback
+that does nothing, measured ~3% of a decode step. Batches without grammar
+replay the same graph at the cost they have with grammar disabled.
 """
 
 from __future__ import annotations
@@ -49,7 +58,7 @@ import torch
 
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.hostfunc import hostfunc
+from tokenspeed.runtime.utils.hostfunc import launch_hostfunc, make_hostfunc_gate
 
 logger = get_colorful_logger(__name__)
 
@@ -79,7 +88,8 @@ class GrammarStepCompletion:
     The next step's ``build`` normally sets ``event`` after advancing
     the matcher and recording ``terminated_at[i]`` — the index of the
     token (within this step's accepted-token chain) that terminated
-    request ``i``'s matcher, or -1. If no next step is dispatched
+    request ``i``'s matcher, or -1; ``add_batch`` sets it at once for a
+    batch without grammars. If no next step is dispatched
     (request was the last live one), post_process advances on the
     host instead; ``lock`` ensures exactly one path wins.
 
@@ -170,35 +180,21 @@ class CapturableGrammarExecutor:
                 (n_rows, self.bitmask_width), -1, dtype=torch.int32
             )
 
-        self.bitmask_host = torch.full(
-            (n_rows, self.bitmask_width),
-            -1,
-            dtype=torch.int32,
+        self.host = GrammarHostBuffers(
+            max_bs=max_bs,
+            vocab_size=vocab_size,
+            max_tokens_per_req=self.max_tokens_per_req,
             pin_memory=True,
         )
 
-        # Draft tokens for spec verify; col 0 is unused for non-spec.
-        self.candidates_host = torch.zeros(
-            (max_bs, self.max_tokens_per_req), dtype=torch.int32, pin_memory=True
-        )
-
-        # Sampler output copied to pinned memory at the tail of each step.
-        # Read by the NEXT step's build (via fork_event ordering); overwritten
-        # at the next step's tail (strictly after that step's bitmask_event,
-        # hence after build's read).
-        self.output_tokens_host = torch.zeros(
-            (max_bs * self.max_tokens_per_req,), dtype=torch.int32, pin_memory=True
-        )
-
-        self.accept_lengths_host = torch.zeros(
-            (max_bs,), dtype=torch.int32, pin_memory=True
-        )
-
-        # One queue entry per replay: CPU pushes via add_batch, the
-        # fetch_batch hostfunc pops + shifts current into prev.
+        # One gate decision per replay, and one queue entry per run: CPU
+        # pushes via add_batch, the build hostfunc pops and advances the
+        # batch it popped last.
+        self.gate = make_hostfunc_gate()
         self.queue = queue.Queue()
         self.current_batch: dict | None = None
-        self.prev_batch: dict | None = None
+        # Whether the last run batch had a grammar, so the next replay runs.
+        self.pending: bool = False
 
         self.stream = torch.cuda.Stream()
         self.fork_event = torch.cuda.Event()
@@ -216,7 +212,7 @@ class CapturableGrammarExecutor:
         """Push request state for the next captured iteration.
 
         Must be called exactly once before each replay (including
-        capture warmup); ``fetch_batch`` raises on an empty queue.
+        capture warmup): the gate takes one decision per replay.
 
         ``advance_mask[i] == False`` disables matcher advance for slot
         i at this step — set it for intermediate chunked-prefill chunks
@@ -243,6 +239,19 @@ class CapturableGrammarExecutor:
             output_layout=output_layout,
         )
 
+        live = any(grammar is not None for grammar in grammars_list)
+
+        if not live:
+            completion.terminated_at = [-1] * bs
+            completion.event.set()
+
+        run = live or self.pending
+        self.pending = live
+        self.gate.push(run)
+
+        if not run:
+            return completion
+
         self.queue.put(
             {
                 "grammars": grammars_list,
@@ -256,128 +265,25 @@ class CapturableGrammarExecutor:
         return completion
 
     def reset_state(self) -> None:
-        """Drop any warmup-run state held by prev/current pointers."""
-        self.prev_batch = None
+        """Drop the decisions and entries a capture pushed but never ran,
+        and the batch a warmup run left as current."""
+        self.gate.clear()
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
         self.current_batch = None
+        self.pending = False
 
-    @hostfunc
-    def fetch_batch(self) -> None:
-        """Pop batch from queue, setting prev to current and current to the new batch."""
-        self.prev_batch = self.current_batch
-        self.current_batch = self.queue.get_nowait()
-
-    @hostfunc
     def build(self) -> None:
-        """Advance matcher by prev step's outputs, then fill this step's bitmask."""
-        self.prev_batch and self._advance_prev(self.prev_batch)
-        self._fill_current(self.current_batch)
-
-    def _advance_prev(self, prev: dict) -> None:
-        """Advance each prev-step grammar by its accepted tokens and record
-        which (if any) terminated in this step."""
-        completion: GrammarStepCompletion = prev["completion"]
-
-        # Lock serializes with post_process's host-side fallback:
-        # exactly one path advances the matcher and fires the event.
-        with completion.lock:
-
-            if completion.event.is_set():
-                return
-
-            grammars = prev["grammars"]
-            bs = prev["bs"]
-            advance_mask = prev["advance_mask"]
-            terminated_at = [-1] * bs
-
-            for i, grammar in enumerate(grammars):
-
-                if (
-                    grammar is None
-                    or grammar.finished
-                    or grammar.is_terminated()
-                    or not advance_mask[i]
-                ):
-                    continue
-
-                n_accepted = int(self.accept_lengths_host[i].item())
-                offset = completion.output_layout.token_offset(i)
-
-                for j in range(n_accepted):
-
-                    tok = int(self.output_tokens_host[offset + j].item())
-
-                    try:
-
-                        grammar.accept_token(tok)
-
-                    except Exception:
-
-                        break
-
-                    if grammar.is_terminated():
-
-                        terminated_at[i] = j
-                        break
-
-            completion.terminated_at = terminated_at
-            completion.event.set()
-
-    def _fill_current(self, batch: dict | None) -> None:
-        """Fill bitmask_host for this step's grammars."""
-        if batch is None:
-
-            self.bitmask_host.fill_(-1)
-
-            return
-
-        grammars = batch["grammars"]
-        bs = batch["bs"]
-        n = self.max_tokens_per_req
-        has_candidates = batch["has_candidates"]
-        layout = batch["completion"].output_layout
-
-        # Spec verify binds bitmask[:bs*n] for rejection_sampling;
-        # non-spec binds bitmask[:bs] for Sampler.sample.
-        per_req_rows = n if has_candidates else 1
-        self.bitmask_host[: bs * n].fill_(-1)
-
-        for i, grammar in enumerate(grammars):
-
-            if grammar is None or grammar.finished or grammar.is_terminated():
-
-                continue
-
-            row_base = i * per_req_rows
-            advanced = 0
-            positions = layout.output_width(i)
-
-            for pos in range(positions):
-
-                if grammar.is_terminated():
-
-                    break
-
-                grammar.fill_vocab_mask(self.bitmask_host, row_base + pos)
-
-                if pos + 1 == positions or not has_candidates:
-
-                    break
-
-                # col 0 was consumed by a previous step's advance;
-                # walk cols 1..n-1 to produce per-position masks.
-                next_tok = int(self.candidates_host[i, pos + 1].item())
-
-                if not grammar.try_accept_token(next_tok):
-
-                    break
-
-                advanced += 1
-
-            # Undo the draft walk — the real advance happens in the
-            # NEXT step's build based on the sampler's accepted count.
-            if advanced:
-
-                grammar.rollback(advanced)
+        """Pop this step's batch (prev := current), advance the matchers by
+        the prev step's outputs, then fill this step's bitmask."""
+        prev_batch = self.current_batch
+        self.current_batch = self.queue.get_nowait()
+        if prev_batch is not None:
+            self.host.advance(prev_batch)
+        self.host.fill(self.current_batch)
 
     def schedule_fill(
         self,
@@ -388,7 +294,7 @@ class CapturableGrammarExecutor:
         """Fork grammar work onto the side stream for this step.
 
         Side stream: wait(fork_event) → D2H candidates (spec) →
-        fetch_batch → build → H2D bitmask → bitmask_event. Main rejoins
+        build → H2D bitmask → bitmask_event. Main rejoins
         via wait_bitmask before apply_mask; forward on main overlaps
         with the advance + fill on the side stream.
         """
@@ -402,15 +308,14 @@ class CapturableGrammarExecutor:
 
                 bs = input_ids_buf_slice.shape[0] // self.max_tokens_per_req
 
-                self.candidates_host[candidate_start : candidate_start + bs].copy_(
+                self.host.candidates[candidate_start : candidate_start + bs].copy_(
                     input_ids_buf_slice.view(bs, self.max_tokens_per_req),
                     non_blocking=True,
                 )
 
-            self.fetch_batch()
-            self.build()
+            launch_hostfunc(self.build, gate=self.gate)
 
-            self.bitmask.copy_(self.bitmask_host, non_blocking=True)
+            self.bitmask.copy_(self.host.bitmask, non_blocking=True)
             self.bitmask_event.record()
 
     def wait_bitmask(self) -> None:
@@ -425,10 +330,219 @@ class CapturableGrammarExecutor:
         """Main-stream D2H of sampler output into the pinned buffer."""
 
         n = output_tokens.numel()
-        self.output_tokens_host[:n].copy_(output_tokens.flatten(), non_blocking=True)
+        self.host.output_tokens[:n].copy_(output_tokens.flatten(), non_blocking=True)
 
         m = accept_lengths.numel()
-        self.accept_lengths_host[:m].copy_(accept_lengths, non_blocking=True)
+        self.host.accept_lengths[:m].copy_(accept_lengths, non_blocking=True)
+
+
+class GrammarHostBuffers:
+    """Host buffers of the in-graph grammar pipeline, and the matcher work
+    the build hostfunc does on them.
+
+    Nothing here releases the GIL. The hostfunc runs on the CUDA callback
+    thread; each release lets the scheduler thread take the GIL, and getting
+    it back can take a switch interval (5 ms). Releasing it once per matcher
+    call, ``.item()`` or bulk fill made the fill finish only after the
+    scheduler's Python, with sampling waiting on it. So the matcher methods
+    keep the GIL (``keep_gil_in_matcher_calls``), inputs are read with
+    ``tolist()``, the masks along a draft chain come from one matcher call,
+    and rows are reset by memoryview copies, not by a torch or numpy fill.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_bs: int,
+        vocab_size: int,
+        max_tokens_per_req: int,
+        pin_memory: bool,
+    ) -> None:
+
+        n = max_tokens_per_req
+        self.max_tokens_per_req = n
+        self.vocab_size = vocab_size
+        self.bitmask_width = (vocab_size + 31) // 32
+
+        self.bitmask = torch.full(
+            (max_bs * n, self.bitmask_width),
+            -1,
+            dtype=torch.int32,
+            pin_memory=pin_memory,
+        )
+
+        # Draft tokens for spec verify; col 0 is unused for non-spec.
+        self.candidates = torch.zeros(
+            (max_bs, n), dtype=torch.int32, pin_memory=pin_memory
+        )
+
+        # Sampler output copied to pinned memory at the tail of each step.
+        # Read by the NEXT step's build (via fork_event ordering); overwritten
+        # at the next step's tail (strictly after that step's bitmask_event,
+        # hence after build's read).
+        self.output_tokens = torch.zeros(
+            (max_bs * n,), dtype=torch.int32, pin_memory=pin_memory
+        )
+
+        self.accept_lengths = torch.zeros(
+            (max_bs,), dtype=torch.int32, pin_memory=pin_memory
+        )
+
+        # Byte and int32 views of ``bitmask`` for row resets and mask-bit
+        # reads that keep the GIL.
+        self.bitmask_bytes = memoryview(self.bitmask.numpy()).cast("B")
+        self.bitmask_words = self.bitmask_bytes.cast("i")
+        self.allow_all_row = b"\xff" * (self.bitmask_width * 4)
+
+        # Rows of ``bitmask`` that may hold anything but -1 (allow all).
+        self.dirty_rows: set[int] = set()
+
+        # traverse_draft_tree inputs: the verify drafts form a chain (node
+        # k's child is node k + 1). The per-request views are made once here.
+        self.chain_next = torch.tensor([*range(1, n), -1], dtype=torch.int64)
+        self.chain_sibling = torch.full((n,), -1, dtype=torch.int64)
+        self.draft_tokens = torch.zeros((max_bs, n), dtype=torch.int64)
+        self.draft_tokens_np = self.draft_tokens.numpy()
+        self.request_draft_tokens = list(self.draft_tokens.unbind(0))
+        self.request_bitmasks = list(self.bitmask.view(max_bs, n, -1).unbind(0))
+
+    def advance(self, prev: dict) -> None:
+        """Advance each prev-step grammar by its accepted tokens and record
+        which (if any) terminated in this step."""
+        completion: GrammarStepCompletion = prev["completion"]
+
+        # Lock serializes with post_process's host-side fallback:
+        # exactly one path advances the matcher and fires the event.
+        with completion.lock:
+
+            if completion.event.is_set():
+                return
+
+            grammars = prev["grammars"]
+            bs = prev["bs"]
+            advance_mask = prev["advance_mask"]
+            layout = completion.output_layout
+            terminated_at = [-1] * bs
+            accept_lengths = self.accept_lengths[:bs].tolist()
+            output_tokens = self.output_tokens[: layout.num_output_tokens].tolist()
+
+            for i, grammar in enumerate(grammars):
+
+                if (
+                    grammar is None
+                    or grammar.finished
+                    or grammar.is_terminated()
+                    or not advance_mask[i]
+                ):
+                    continue
+
+                offset = layout.token_offset(i)
+
+                for j in range(accept_lengths[i]):
+
+                    try:
+
+                        grammar.accept_token(output_tokens[offset + j])
+
+                    except Exception:
+
+                        break
+
+                    if grammar.is_terminated():
+
+                        terminated_at[i] = j
+                        break
+
+            completion.terminated_at = terminated_at
+            completion.event.set()
+
+    def fill(self, batch: dict) -> None:
+        """Fill ``bitmask`` for this step's grammars; rows without a mask
+        read -1. Only rows written since their last reset are reset."""
+        grammars = batch["grammars"]
+        n = self.max_tokens_per_req
+        has_candidates = batch["has_candidates"]
+        layout = batch["completion"].output_layout
+
+        # Spec verify binds bitmask[:bs*n] for rejection_sampling;
+        # non-spec binds bitmask[:bs] for Sampler.sample.
+        per_req_rows = n if has_candidates else 1
+        candidates = self.candidates[: batch["bs"]].tolist()
+        filled: set[int] = set()
+
+        for i, grammar in enumerate(grammars):
+
+            if grammar is None or grammar.finished or grammar.is_terminated():
+
+                continue
+
+            row = i * per_req_rows
+            positions = layout.output_width(i)
+
+            # Rows are marked dirty before the matcher writes them, so they
+            # are reset later even if the call raises.
+            if positions == 1 or (positions and not has_candidates):
+
+                self.dirty_rows.add(row)
+                grammar.fill_vocab_mask(self.bitmask, row)
+                filled.add(row)
+
+            elif positions:
+
+                # col 0 was consumed by a previous step's advance; walk
+                # cols 1..n-1 for per-position masks. The matcher is left
+                # as it was: the real advance happens in the NEXT step's
+                # build based on the sampler's accepted count.
+                drafts = candidates[i]
+                self.draft_tokens_np[i] = drafts
+                self.dirty_rows.update(range(row, row + n))
+                grammar.fill_vocab_masks_along_drafts(
+                    self.request_bitmasks[i],
+                    self.request_draft_tokens[i],
+                    self.chain_next,
+                    self.chain_sibling,
+                )
+                masked = self._masked_positions(
+                    row, drafts, positions, grammar.stop_token_ids
+                )
+                filled.update(range(row, row + masked))
+
+        row_bytes = len(self.allow_all_row)
+
+        for row in self.dirty_rows - filled:
+
+            start = row * row_bytes
+            self.bitmask_bytes[start : start + row_bytes] = self.allow_all_row
+
+        self.dirty_rows = filled
+
+    def _masked_positions(
+        self, row: int, drafts: list[int], positions: int, stop_token_ids
+    ) -> int:
+        """How many leading positions of a draft walk get a mask: position
+        k does when draft k is in the vocabulary, position k-1's mask allows
+        it and it does not end the grammar. The vocabulary check comes first:
+        a mask can set the bits past the vocabulary in its last word."""
+        width = self.bitmask_width
+        k = 1
+
+        while k < positions:
+
+            token = drafts[k]
+
+            if token in stop_token_ids or not 0 <= token < self.vocab_size:
+
+                break
+
+            word = self.bitmask_words[(row + k - 1) * width + (token >> 5)]
+
+            if not word >> (token & 31) & 1:
+
+                break
+
+            k += 1
+
+        return k
 
 
 class EagerGrammarBuffers:
@@ -630,8 +744,7 @@ def setup_grammar_step(
     advance_mask = grammar_inputs.advance_mask if grammar_inputs is not None else None
 
     if capturable is not None:
-        # Always push (even all-None) to keep the captured hostfunc queue
-        # 1:1 with replays.
+        # Always add (even all-None): the gate takes one decision per replay.
         return capturable.add_batch(
             grammars=grammars,
             bs=bs,

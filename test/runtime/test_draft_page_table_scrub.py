@@ -47,6 +47,9 @@ class _Leaf:
     def refresh_decode_metadata(self, *args, **kwargs):
         pass
 
+    def decode_buffer_targets(self, bs):
+        return None
+
     def set_request_slots(self, req_pool_indices):
         pass
 

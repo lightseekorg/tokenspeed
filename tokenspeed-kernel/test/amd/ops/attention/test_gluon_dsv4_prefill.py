@@ -24,6 +24,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsv4 import (
+    torch_dsv4_selected_attention,
+)
 from tokenspeed_kernel.ops.attention import dsv4
 
 pytest.importorskip("tokenspeed_triton")
@@ -40,16 +43,7 @@ def _reference(
     sink: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    result = torch.zeros_like(q)
-    kv_rows = kv.reshape(-1, 512).float()
-    for token in range(q.shape[0]):
-        selected = indices[token, : int(lens[token])].long()
-        selected = selected[(selected >= 0) & (selected < kv_rows.shape[0])]
-        keys = kv_rows[selected]
-        logits = q[token].float() @ keys.T * scale
-        probabilities = torch.cat((logits, sink[:, None]), dim=1).softmax(dim=1)[:, :-1]
-        result[token] = (probabilities @ keys).to(q.dtype)
-    return result
+    return torch_dsv4_selected_attention(q, kv, indices, lens, sink, scale)[0]
 
 
 @pytest.mark.skipif(

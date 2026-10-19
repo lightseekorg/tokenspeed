@@ -21,6 +21,9 @@
 from __future__ import annotations
 
 import pickle
+import subprocess
+import sys
+import textwrap
 from dataclasses import replace
 
 import pytest
@@ -34,6 +37,7 @@ from tokenspeed_kernel.registry import (
 )
 from tokenspeed_kernel.signature import (
     ScaleFormat,
+    dense_format_signature,
     dense_tensor_format,
     format_signature,
     format_signatures,
@@ -303,7 +307,7 @@ class TestRegistryQueries:
         )
         fp32 = reg.get_for_operator("attention", "decode", format_signature=signature)
         names = {s.name for s in fp32}
-        assert "reference_decode" in names
+        assert "torch_decode" in names
         assert "flashinfer_decode" not in names
 
     def test_filter_by_solution(self, sample_specs):
@@ -358,7 +362,7 @@ class TestRegistryQueries:
         solutions = reg.list_solutions("attention", "decode")
         assert "flashinfer" in solutions
         assert "triton" in solutions
-        assert "reference" in solutions
+        assert "torch" in solutions
 
 
 class TestRegistryCache:
@@ -408,7 +412,7 @@ class TestRegisterKernelDecorator:
         @register_kernel(
             "gemm",
             "mm",
-            solution="reference",
+            solution="torch",
             signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
             priority=12,
         )
@@ -416,16 +420,16 @@ class TestRegisterKernelDecorator:
             return a @ b
 
         reg = KernelRegistry.get()
-        spec = reg.get_by_name("reference_gemm_mm")
+        spec = reg.get_by_name("torch_gemm_mm")
         assert spec is not None
-        assert spec.solution == "reference"
+        assert spec.solution == "torch"
         assert spec.priority == 12
         assert (
             next(iter(format_signatures(("a", "b"), "dense", {torch.bfloat16})))
             in spec.format_signatures
         )
 
-        impl = reg.get_impl("reference_gemm_mm")
+        impl = reg.get_impl("torch_gemm_mm")
         assert impl is my_torch_gemm
 
     def test_custom_name(self):
@@ -529,6 +533,19 @@ class TestUnregister:
         reg._unregister("does_not_exist")
 
 
+def test_dense_format_signature_is_cached_and_matches_format_signature():
+    signature = dense_format_signature(("x", "gate"), (torch.float32, torch.bfloat16))
+    assert signature == format_signature(
+        x=dense_tensor_format(torch.float32), gate=dense_tensor_format(torch.bfloat16)
+    )
+    assert (
+        dense_format_signature(("x", "gate"), (torch.float32, torch.bfloat16))
+        is signature
+    )
+    with pytest.raises(ValueError):
+        dense_format_signature(("x",), (torch.float32, torch.bfloat16))
+
+
 def test_vendor_min_arch_versions_apply_per_vendor(
     h100_platform, b200_platform, mi350_platform
 ) -> None:
@@ -567,3 +584,24 @@ def test_vendor_min_arch_versions_reject_ambiguous_requirements() -> None:
             vendors=frozenset({"nvidia", "amd"}),
             vendor_min_arch_versions={"nvidia": ArchVersion(10, 0)},
         )
+
+
+def test_load_builtin_kernels_reregisters_every_reference_after_a_reset():
+    """A reset registry gets the PyTorch references back, not only the GEMM ones
+    the ops packages import themselves."""
+    # A subprocess: the reload replaces module objects other tests hold.
+    script = textwrap.dedent("""
+        from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
+
+        load_builtin_kernels()
+        KernelRegistry.reset()
+        load_builtin_kernels()
+        registry = KernelRegistry.get()
+        for name in ("torch_mm", "torch_dense_attention", "torch_moe_experts"):
+            spec = registry.get_by_name(name)
+            assert spec is not None and spec.solution == "torch", name
+        """)
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=600
+    )
+    assert result.returncode == 0, result.stderr[-2000:]

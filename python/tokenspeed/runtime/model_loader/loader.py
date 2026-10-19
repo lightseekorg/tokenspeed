@@ -31,7 +31,7 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
-from typing import Any, cast
+from typing import Any, Protocol, cast, runtime_checkable
 
 import huggingface_hub
 import torch
@@ -62,11 +62,12 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     initialize_dummy_integer_weights,
     initialize_dummy_weights,
     instanttensor_weights_iterator,
+    non_unit_kv_scale_message,
     np_cache_weights_iterator,
     pt_weights_iterator,
-    require_unit_kv_scales,
     safetensors_filtered_weights_iterator,
     safetensors_weights_iterator,
+    split_kv_cache_scales,
 )
 from tokenspeed.runtime.models.extensible import ExtensibleLM
 from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_available
@@ -170,6 +171,28 @@ def _initialize_model(
         quant_config=quant_config,
         **extra_kwargs,
     )
+
+
+@runtime_checkable
+class KVCacheScaleLoader(Protocol):
+    """A model that puts its checkpoint's KV-cache scales on its attention layers."""
+
+    def load_kv_cache_scales(self, scales: dict[str, torch.Tensor]) -> None:
+        """Hand each scale (keyed by checkpoint name) to its layer, skipping
+        only names that belong to another model; raise on any other name."""
+
+
+def _load_kv_cache_scales(model: nn.Module, scales: dict[str, torch.Tensor]) -> None:
+    """Startup is the only time a model takes KV-cache scales other than one;
+    weight updates drop them (``record_non_unit_kv_scales``)."""
+    if not isinstance(model, KVCacheScaleLoader):
+        raise ValueError(
+            f"{type(model).__name__}: "
+            + non_unit_kv_scale_message(
+                [f"{name}={t.flatten()[:4].tolist()}" for name, t in scales.items()]
+            )
+        )
+    model.load_kv_cache_scales(scales)
 
 
 class BaseModelLoader(ABC):
@@ -420,9 +443,7 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files)
 
-        return require_unit_kv_scales(
-            (source.prefix + name, tensor) for (name, tensor) in weights_iterator
-        )
+        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
     def _get_all_weights(
         self,
@@ -506,7 +527,14 @@ class DefaultModelLoader(BaseModelLoader):
                     )
 
             with startup_phase("weights.read_copy"):
-                model.load_weights(self._get_all_weights(model_config, model))
+                kv_cache_scales: dict[str, torch.Tensor] = {}
+                model.load_weights(
+                    split_kv_cache_scales(
+                        self._get_all_weights(model_config, model), kv_cache_scales
+                    )
+                )
+                if kv_cache_scales:
+                    _load_kv_cache_scales(model, kv_cache_scales)
 
             with startup_phase("weights.postprocess"):
                 # post_load_transformed_modules must recognise every hook run here.
@@ -645,7 +673,8 @@ class DummyModelLoader(BaseModelLoader):
                     self.load_config,
                 )
             # Post-processing can read integer weights, such as index tables,
-            # so they need valid values before it runs.
+            # and check scales that start as NaN, so they need valid values
+            # before it runs.
             initialize_dummy_integer_weights(model)
             # An EAGLE3 draft cannot share a vocab-sharded target embedding,
             # and its own dummy embedding is as valid as a loaded one.

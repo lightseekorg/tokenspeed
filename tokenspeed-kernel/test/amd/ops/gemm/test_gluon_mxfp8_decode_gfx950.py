@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.gemm import torch_mm_fp8_blockscale
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -52,13 +53,10 @@ def _operands(m: int, n: int, k: int):
     return a, b, a_scales, b_scales
 
 
-def _dequantize(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    decoded = scales.view(torch.float8_e8m0fnu).float().repeat_interleave(32, dim=1)
-    return values.float() * decoded
-
-
 def _reference(a, b, a_scales, b_scales) -> torch.Tensor:
-    return _dequantize(a, a_scales) @ _dequantize(b, b_scales).T
+    return torch_mm_fp8_blockscale(
+        a, b, a_scales, b_scales, torch.float32, block_size=[1, 32]
+    )
 
 
 def _run(a, b, a_scales, b_scales, out=None) -> torch.Tensor:

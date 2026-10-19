@@ -25,7 +25,6 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp4.mm import (
     launch_gluon_mxfp4_linear_gfx950,
     launch_gluon_mxfp4_swiglu_linear_gfx950,
     preshuffle_mxfp4_weight,
-    supports_gluon_mxfp4_linear_gfx950,
 )
 
 __all__ = [
@@ -33,5 +32,4 @@ __all__ = [
     "launch_gluon_mxfp4_linear_gfx950",
     "launch_gluon_mxfp4_swiglu_linear_gfx950",
     "preshuffle_mxfp4_weight",
-    "supports_gluon_mxfp4_linear_gfx950",
 ]

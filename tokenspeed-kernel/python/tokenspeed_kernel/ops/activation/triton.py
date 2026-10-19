@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.platform import pdl_enabled
@@ -38,6 +40,8 @@ __all__ = [
     "silu_and_mul",
     "situ_and_mul",
     "swiglu_oai",
+    "tanh_softcap",
+    "tanh_softcap_rejection",
 ]
 
 
@@ -1592,5 +1596,136 @@ def relu2(
         ENABLE_PDL=enable_pdl,
         num_warps=4,
         **({"launch_pdl": True} if enable_pdl else {}),
+    )
+    return out
+
+
+# Launch options of the softcap pass: FP contraction off and libdevice's non-FTZ
+# path, as Torch's CUDA kernels compute (no fast math, denormals kept).
+_TANH_SOFTCAP_BLOCK = 2048
+_TANH_SOFTCAP_LAUNCH_OPTIONS = dict(
+    num_warps=4,
+    enable_fp_fusion=False,
+    enable_reflect_ftz=False,
+)
+
+
+@triton.jit
+def _mul_rn_f32(left, right):
+    """One correctly rounded FP32 multiply (``mul.rn.f32``, non-FTZ) that the
+    compiler cannot fuse."""
+    return tl.inline_asm_elementwise(
+        "mul.rn.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[left, right],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _tanh_softcap_kernel(
+    x_ptr,
+    out_ptr,
+    stride_x,
+    n_cols,
+    inv_cap,
+    cap,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    x = tl.load(x_ptr + row * stride_x + cols, mask=mask).to(tl.float32)
+    # Torch's three FP32 kernels in their order: ``x / cap`` is ``x * fl32(1 /
+    # cap)`` (a CPU-scalar divisor), then ``tanhf``, then ``* cap``.
+    y = _mul_rn_f32(x, inv_cap)
+    y = libdevice.tanh(y)
+    y = _mul_rn_f32(y, cap)
+    tl.store(out_ptr + row * n_cols + cols, y, mask=mask)
+
+
+@functools.lru_cache(maxsize=16)
+def tanh_softcap_scalars(cap: float) -> tuple[float, float]:
+    """``(fl32(1 / fl32(cap)), fl32(cap))``: the FP32 operands Torch multiplies by
+    in ``x / cap`` and ``* cap`` when ``cap`` is a Python scalar.
+
+    Torch divides an FP32 tensor by a CPU scalar as a multiply by the scalar's FP32
+    reciprocal, computed on the host in FP32 (``div_true_kernel_cuda``); the
+    multiply takes the scalar rounded to FP32.
+    """
+    cap32 = torch.tensor(cap, dtype=torch.float32)
+    return (torch.ones((), dtype=torch.float32) / cap32).item(), cap32.item()
+
+
+def tanh_softcap_cap_normal(cap: object) -> bool:
+    """Whether ``cap`` is a real number whose FP32 rounding and FP32 reciprocal
+    are positive normal numbers (the kernel takes both as FP32 operands)."""
+    if isinstance(cap, bool) or not isinstance(cap, (int, float)):
+        return False
+    inv_cap, cap32 = tanh_softcap_scalars(cap)
+    normal = 2.0**-126
+    return normal <= cap32 < float("inf") and normal <= inv_cap < float("inf")
+
+
+def tanh_softcap_rejection(x: torch.Tensor, cap: float) -> str:
+    """Why :func:`tanh_softcap` cannot serve this call; empty when admitted.
+
+    Metadata only: ``cap`` as :func:`tanh_softcap_cap_normal` admits it, ``x`` a
+    2-D BF16, FP16 or FP32 CUDA tensor with dense columns.
+    """
+    if not tanh_softcap_cap_normal(cap):
+        return (
+            "cap must be a real number that rounds to a positive normal FP32 "
+            f"with a normal reciprocal, got {cap!r}"
+        )
+    if x.dim() != 2:
+        return f"x must be 2-D, got {x.dim()}-D"
+    if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return f"x must be BF16, FP16 or FP32, got {x.dtype}"
+    if x.stride(1) != 1:
+        return f"x must have dense columns, got strides {tuple(x.stride())}"
+    if not x.is_cuda:
+        return f"x must be a CUDA tensor, got device {x.device}"
+    return ""
+
+
+def tanh_softcap(x: torch.Tensor, cap: float) -> torch.Tensor:
+    """``(x.float() / cap).tanh() * cap`` in one pass, byte for byte.
+
+    The FP32 statement is three elementwise kernels after the cast; this kernel
+    reads ``x`` once and writes the FP32 result once, with the same operations in
+    the same order: ``x * fl32(1 / cap)`` and ``* cap`` as single ``mul.rn.f32``
+    and libdevice ``tanhf`` (non-FTZ), the function Torch's CUDA ``tanh`` calls.
+
+    Args:
+        x: ``[rows, cols]`` BF16, FP16 or FP32 CUDA logits with dense columns
+            (rows may be strided).
+        cap: The soft cap (see :func:`tanh_softcap_rejection`).
+
+    Returns:
+        A fresh contiguous FP32 ``[rows, cols]`` tensor.
+
+    Raises:
+        ValueError: :func:`tanh_softcap_rejection` rejects the call.
+    """
+    rejection = tanh_softcap_rejection(x, cap)
+    if rejection:
+        raise ValueError(f"tanh_softcap cannot serve this call: {rejection}")
+    inv_cap, cap32 = tanh_softcap_scalars(cap)
+    rows, cols = x.shape
+    out = torch.empty((rows, cols), dtype=torch.float32, device=x.device)
+    if out.numel() == 0:
+        return out
+    _tanh_softcap_kernel[(rows, triton.cdiv(cols, _TANH_SOFTCAP_BLOCK))](
+        x,
+        out,
+        x.stride(0),
+        cols,
+        inv_cap,
+        cap32,
+        BLOCK=_TANH_SOFTCAP_BLOCK,
+        **_TANH_SOFTCAP_LAUNCH_OPTIONS,
     )
     return out

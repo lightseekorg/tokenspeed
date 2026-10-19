@@ -24,6 +24,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.gemm import (
+    torch_dsv4_grouped_output_projection,
+)
 from tokenspeed_kernel.ops.gemm import (
     dsv4_grouped_output_projection,
     dsv4_grouped_output_projection_plan,
@@ -33,41 +36,6 @@ from tokenspeed_kernel.ops.gemm import (
 from tokenspeed_kernel.weights import get_weight_broker
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-
-
-def _reference(
-    attention: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    *,
-    num_groups: int,
-    nope_dim: int,
-    block_size: tuple[int, int],
-) -> torch.Tensor:
-    values = attention.float().clone()
-    cos, sin = cos_sin[positions].unsqueeze(1).chunk(2, dim=-1)
-    even = values[..., nope_dim::2].clone()
-    odd = values[..., nope_dim + 1 :: 2].clone()
-    values[..., nope_dim::2] = even * cos + odd * sin
-    values[..., nope_dim + 1 :: 2] = odd * cos - even * sin
-
-    block_n, block_k = block_size
-    tokens = attention.shape[0]
-    blocks = values.reshape(tokens, num_groups, -1, block_k)
-    # Quantize the FP32 rotation directly: there is no intermediate BF16 cast.
-    absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
-    scales = torch.exp2(torch.ceil(torch.log2(absmax * (1.0 / 448.0))))
-    quantized = (blocks / scales).clamp(-448, 448).to(torch.float8_e4m3fn)
-    dequantized = (quantized.float() * scales).reshape(tokens, num_groups, -1)
-    dequantized_weight = weight.float() * weight_scale.repeat_interleave(
-        block_n, dim=0
-    ).repeat_interleave(block_k, dim=1)
-    grouped_weight = dequantized_weight.reshape(num_groups, -1, dequantized.shape[-1])
-    return torch.bmm(
-        dequantized.transpose(0, 1), grouped_weight.transpose(1, 2)
-    ).transpose(0, 1)
 
 
 @pytest.mark.parametrize("tokens", [1, 7])
@@ -156,14 +124,17 @@ def test_grouped_output_projection_preparation_and_graph_replay(
         )
 
     def check(actual: torch.Tensor) -> None:
-        expected = _reference(
-            attention,
-            positions,
-            cos_sin,
-            checkpoint_weight,
-            checkpoint_scale,
+        expected = torch_dsv4_grouped_output_projection(
+            attention=attention,
+            positions=positions,
+            cos_sin_cache=cos_sin,
+            weight=checkpoint_weight,
+            weight_scale=checkpoint_scale,
             num_groups=groups,
+            heads_per_group=heads_per_group,
+            output_dim=output_dim,
             nope_dim=nope_dim,
+            rope_dim=rope_dim,
             block_size=block_size,
         )
         assert actual.dtype == torch.bfloat16

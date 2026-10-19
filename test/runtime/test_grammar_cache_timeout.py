@@ -66,6 +66,10 @@ from tokenspeed.runtime.grammar.base_grammar_backend import (  # noqa: E402
 class _FakeGrammar(BaseGrammarObject):
     """Trivial successful compile result; copy() returns self for cheap equality."""
 
+    @property
+    def memory_size_bytes(self) -> int:
+        return 0
+
     def copy(self):
         return self
 

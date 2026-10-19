@@ -22,15 +22,13 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from tokenspeed_kernel.compile_monitor import CompileStats
-
 from tokenspeed.runtime.engine.request_types import ABORT_CODE, BaseFinishReason
+from tokenspeed.runtime.metrics.events import MetricEventSink
+from tokenspeed.runtime.metrics.reporter import MetricFactory
 from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
-    # Imported lazily at runtime; see _init_prometheus for the ordering
-    # requirement with PROMETHEUS_MULTIPROC_DIR.
-    from prometheus_client import Histogram
+    from tokenspeed_kernel.compile_monitor import CompileStats
 
 TOKENSPEED_TEST_REQUEST_TIME_STATS = envs.TOKENSPEED_TEST_REQUEST_TIME_STATS.get()
 
@@ -285,6 +283,8 @@ class EngineMetrics:
         labels: dict[str, str],
         *,
         enabled: bool,
+        reporters: list[str],
+        event_sink: MetricEventSink | None = None,
         registry=None,
     ) -> None:
         self.enabled = enabled
@@ -294,38 +294,34 @@ class EngineMetrics:
         self._exported_serving_compiles = 0
         self._exported_serving_compile_seconds = 0.0
 
-        if self.enabled:
-            self._init_prometheus(labels, registry=registry)
-
-    def _init_prometheus(self, labels: dict[str, str], *, registry=None) -> None:
-        from prometheus_client import Counter, Gauge, Histogram
-
+        factory = MetricFactory(
+            enabled=enabled,
+            reporters=reporters,
+            event_sink=event_sink,
+            registry=registry,
+        )
         labelnames = list(labels.keys())
-        kw = {"registry": registry} if registry is not None else {}
-        self.num_requests_running = Gauge(
+        self.num_requests_running = factory.gauge(
             name="tokenspeed:num_requests_running",
             documentation="Requests with scheduler-side generation state (decode path).",
             labelnames=labelnames,
             multiprocess_mode="livemax",
-            **kw,
         )
-        self.num_requests_waiting = Gauge(
+        self.num_requests_waiting = factory.gauge(
             name="tokenspeed:num_requests_waiting",
             documentation="Requests waiting in the C++ scheduler queue.",
             labelnames=labelnames,
             multiprocess_mode="livemax",
-            **kw,
         )
         # Wire name follows vLLM's `vllm:kv_cache_usage_perc` for s/vllm:/tokenspeed:/g
         # parity even though the value is a 0-1 ratio, not a percentage.
-        self.kv_cache_usage_ratio = Gauge(
+        self.kv_cache_usage_ratio = factory.gauge(
             name="tokenspeed:kv_cache_usage_perc",
             documentation="Fraction of device KV pages in use (0-1).",
             labelnames=labelnames,
             multiprocess_mode="livemax",
-            **kw,
         )
-        self.iteration_tokens_total = Histogram(
+        self.iteration_tokens_total = factory.histogram(
             name="tokenspeed:iteration_tokens_total",
             documentation="Tokens scheduled in one scheduler forward step.",
             labelnames=labelnames,
@@ -346,54 +342,47 @@ class EngineMetrics:
                 4096.0,
                 8192.0,
             ],
-            **kw,
         )
-        self.spec_decode_num_accepted_tokens = Counter(
+        self.spec_decode_num_accepted_tokens = factory.counter(
             name="tokenspeed:spec_decode_num_accepted_tokens",
             documentation=(
                 "Accepted speculative draft tokens (excludes the bonus token sampled "
                 "after verify)."
             ),
             labelnames=labelnames,
-            **kw,
         )
-        self.spec_decode_num_draft_tokens = Counter(
+        self.spec_decode_num_draft_tokens = factory.counter(
             name="tokenspeed:spec_decode_num_draft_tokens",
             documentation="Draft tokens proposed across verify steps.",
             labelnames=labelnames,
-            **kw,
         )
-        self.spec_decode_num_drafts = Counter(
+        self.spec_decode_num_drafts = factory.counter(
             name="tokenspeed:spec_decode_num_drafts",
             documentation="Number of speculative verify rounds (per request-slot).",
             labelnames=labelnames,
-            **kw,
         )
-        self.jit_serving_compiles = Counter(
+        self.jit_serving_compiles = factory.counter(
             name="tokenspeed:jit_serving_compiles",
             documentation=(
                 "Triton kernel compilations after startup; each one stalls the "
                 "forward thread."
             ),
             labelnames=labelnames,
-            **kw,
         )
-        self.jit_serving_compile_seconds = Counter(
+        self.jit_serving_compile_seconds = factory.counter(
             name="tokenspeed:jit_serving_compile_seconds",
             documentation="Wall time spent in Triton kernel compilations after startup.",
             labelnames=labelnames,
-            **kw,
         )
-        self.num_nan_aborted_requests = Counter(
+        self.num_nan_aborted_requests = factory.counter(
             name="tokenspeed:num_nan_aborted_requests",
             documentation=(
                 "Requests terminated by the NaN guard (NaN in logits or an "
                 "out-of-vocab sampled token id)."
             ),
             labelnames=labelnames,
-            **kw,
         )
-        self.num_capacity_aborted_requests = Counter(
+        self.num_capacity_aborted_requests = factory.counter(
             name="tokenspeed:num_capacity_aborted_requests",
             documentation=(
                 "Requests the scheduler aborted because a capacity retraction "
@@ -401,10 +390,9 @@ class EngineMetrics:
                 "rows exhausted); clients may resubmit them."
             ),
             labelnames=labelnames,
-            **kw,
         )
         # Exported as tokenspeed:num_preemptions_total.
-        self.num_preemptions = Counter(
+        self.num_preemptions = factory.counter(
             name="tokenspeed:num_preemptions",
             documentation=(
                 "Requests preempted by a capacity retraction: the scheduler "
@@ -418,10 +406,9 @@ class EngineMetrics:
                 "tokenspeed:num_capacity_aborted_requests."
             ),
             labelnames=labelnames,
-            **kw,
         )
         # Request-latency bucket grid: 0.3 s to 7680 s.
-        self.request_queue_time_seconds = Histogram(
+        self.request_queue_time_seconds = factory.histogram(
             name="tokenspeed:request_queue_time_seconds",
             documentation=(
                 "Wall time from submission to the scheduler's waiting queue "
@@ -454,7 +441,6 @@ class EngineMetrics:
                 1920.0,
                 7680.0,
             ],
-            **kw,
         )
 
     def set_scheduler_snapshot(
@@ -507,7 +493,7 @@ class EngineMetrics:
             max(0, accepted_draft_tokens)
         )
 
-    def record_jit_compiles(self, stats: CompileStats | None) -> None:
+    def record_jit_compiles(self, stats: "CompileStats | None") -> None:
         """Export serving-time compilations; ``None`` when not monitored."""
         if not self.enabled or stats is None:
             return
@@ -550,60 +536,52 @@ class RequestMetrics:
         *,
         enabled: bool,
         max_model_len: int,
+        reporters: list[str],
+        event_sink: MetricEventSink | None = None,
         registry=None,
     ) -> None:
         self.enabled = enabled
         self.labels = labels
 
-        if self.enabled:
-            self._init_prometheus(
-                labels, max_model_len=max_model_len, registry=registry
-            )
-
-    def _init_prometheus(
-        self, labels: dict[str, str], *, max_model_len: int, registry=None
-    ) -> None:
-        # We need to import prometheus_client after setting the env variable PROMETHEUS_MULTIPROC_DIR
-        from prometheus_client import Counter, Histogram
-
+        factory = MetricFactory(
+            enabled=enabled,
+            reporters=reporters,
+            event_sink=event_sink,
+            registry=registry,
+        )
         labelnames = list(labels.keys())
         # Per-request enrichment: counters additionally carry finish_reason
         # and stream; histograms carry stream only.
         finish_labelnames = [*labelnames, "finish_reason", "stream"]
         stream_labelnames = [*labelnames, "stream"]
-        kw = {"registry": registry} if registry is not None else {}
 
-        self.prompt_tokens_total = Counter(
+        self.prompt_tokens_total = factory.counter(
             name="tokenspeed:prompt_tokens",
             documentation="Number of prefill tokens processed.",
             labelnames=labelnames,
-            **kw,
         )
 
-        self.generation_tokens_total = Counter(
+        self.generation_tokens_total = factory.counter(
             name="tokenspeed:generation_tokens",
             documentation="Number of generation tokens processed.",
             labelnames=labelnames,
-            **kw,
         )
 
         # tokenspeed-only Counter that tracks every finished request
         # regardless of finish reason.
-        self.num_requests_total = Counter(
+        self.num_requests_total = factory.counter(
             name="tokenspeed:num_requests",
             documentation="Number of requests processed.",
             labelnames=finish_labelnames,
-            **kw,
         )
 
-        self.request_success_total = Counter(
+        self.request_success_total = factory.counter(
             name="tokenspeed:request_success",
             documentation="Requests that finished without an abort-style finish.",
             labelnames=finish_labelnames,
-            **kw,
         )
 
-        self.prefix_cache_hits_total = Counter(
+        self.prefix_cache_hits_total = factory.counter(
             name="tokenspeed:prefix_cache_hits",
             documentation=(
                 "Prompt tokens served from prefix cache. Hit ratio = "
@@ -614,10 +592,9 @@ class RequestMetrics:
                 "tokenspeed:prefix_cache_hits_total."
             ),
             labelnames=labelnames,
-            **kw,
         )
 
-        self.histogram_time_to_first_token = Histogram(
+        self.histogram_time_to_first_token = factory.histogram(
             name="tokenspeed:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
             labelnames=stream_labelnames,
@@ -640,10 +617,9 @@ class RequestMetrics:
                 120,
                 160,
             ],
-            **kw,
         )
 
-        self.histogram_time_per_output_token = Histogram(
+        self.histogram_time_per_output_token = factory.histogram(
             name="tokenspeed:request_time_per_output_token_seconds",
             documentation=(
                 "Histogram of end-to-end request latency divided by output "
@@ -651,10 +627,9 @@ class RequestMetrics:
             ),
             labelnames=labelnames,
             buckets=_TIME_PER_OUTPUT_TOKEN_BUCKETS,
-            **kw,
         )
 
-        self.histogram_decode_time_per_output_token = Histogram(
+        self.histogram_decode_time_per_output_token = factory.histogram(
             name="tokenspeed:decode_time_per_output_token_seconds",
             documentation=(
                 "Histogram of decode time per output token after the first "
@@ -662,26 +637,23 @@ class RequestMetrics:
             ),
             labelnames=labelnames,
             buckets=_TIME_PER_OUTPUT_TOKEN_BUCKETS,
-            **kw,
         )
 
-        self.histogram_inter_token_latency_seconds = Histogram(
+        self.histogram_inter_token_latency_seconds = factory.histogram(
             name="tokenspeed:inter_token_latency_seconds",
             documentation="Histogram of frontend wall-clock inter-token latency in seconds.",
             labelnames=labelnames,
             buckets=_INTER_TOKEN_LATENCY_BUCKETS,
-            **kw,
         )
 
-        self.histogram_scheduler_inter_token_latency_seconds = Histogram(
+        self.histogram_scheduler_inter_token_latency_seconds = factory.histogram(
             name="tokenspeed:scheduler_inter_token_latency_seconds",
             documentation="Histogram of scheduler-side inter-token latency in seconds.",
             labelnames=labelnames,
             buckets=_INTER_TOKEN_LATENCY_BUCKETS,
-            **kw,
         )
 
-        self.histogram_e2e_request_latency = Histogram(
+        self.histogram_e2e_request_latency = factory.histogram(
             name="tokenspeed:e2e_request_latency_seconds",
             documentation="Histogram of End-to-end request latency in seconds",
             labelnames=stream_labelnames,
@@ -707,13 +679,12 @@ class RequestMetrics:
                 500,
                 1000,
             ],
-            **kw,
         )
 
         # Per-request token distributions at request finish, on a 1-2-5
         # bucket grid capped at the model's max length.
         request_token_buckets = build_1_2_5_buckets(max_model_len)
-        self.histogram_request_prompt_tokens = Histogram(
+        self.histogram_request_prompt_tokens = factory.histogram(
             name="tokenspeed:request_prompt_tokens",
             documentation=(
                 "Histogram of per-request prompt token counts at request "
@@ -721,9 +692,8 @@ class RequestMetrics:
             ),
             labelnames=stream_labelnames,
             buckets=request_token_buckets,
-            **kw,
         )
-        self.histogram_request_generation_tokens = Histogram(
+        self.histogram_request_generation_tokens = factory.histogram(
             name="tokenspeed:request_generation_tokens",
             documentation=(
                 "Histogram of per-request generation token counts at request "
@@ -731,7 +701,6 @@ class RequestMetrics:
             ),
             labelnames=stream_labelnames,
             buckets=request_token_buckets,
-            **kw,
         )
 
     def record_request_finish(self, stats: RequestFinishStats) -> None:
@@ -780,33 +749,18 @@ class RequestMetrics:
     def observe_inter_token_latency(self, interval: float, num_new_tokens: int) -> None:
         if not self.enabled or num_new_tokens <= 0:
             return
-        self._observe_batched(
-            self.histogram_inter_token_latency_seconds, interval, num_new_tokens
-        )
+        self.histogram_inter_token_latency_seconds.labels(
+            **self.labels
+        ).observe_batched(interval, num_new_tokens)
 
     def observe_scheduler_inter_token_latency(
         self, interval: float, num_new_tokens: int
     ) -> None:
         if not self.enabled or num_new_tokens <= 0:
             return
-        self._observe_batched(
-            self.histogram_scheduler_inter_token_latency_seconds,
-            interval,
-            num_new_tokens,
-        )
-
-    def _observe_batched(
-        self, histogram: "Histogram", interval: float, num_new_tokens: int
-    ) -> None:
-        # A faster version of the Histogram::observe which observes multiple values at the same time.
-        # reference: https://github.com/prometheus/client_python/blob/v0.21.1/prometheus_client/metrics.py#L639
-        his = histogram.labels(**self.labels)
-        his._sum.inc(interval)
-        adjusted_interval = interval / num_new_tokens
-        for i, bound in enumerate(his._upper_bounds):
-            if adjusted_interval <= bound:
-                his._buckets[i].inc(num_new_tokens)
-                break
+        self.histogram_scheduler_inter_token_latency_seconds.labels(
+            **self.labels
+        ).observe_batched(interval, num_new_tokens)
 
 
 class KVTransferMetrics:
@@ -822,20 +776,21 @@ class KVTransferMetrics:
         labels: dict[str, str],
         *,
         enabled: bool,
+        reporters: list[str],
+        event_sink: MetricEventSink | None = None,
         registry=None,
     ) -> None:
         self.enabled = enabled
         self.labels = labels
 
-        if self.enabled:
-            self._init_prometheus(labels, registry=registry)
-
-    def _init_prometheus(self, labels: dict[str, str], *, registry=None) -> None:
-        from prometheus_client import Counter, Histogram
-
+        factory = MetricFactory(
+            enabled=enabled,
+            reporters=reporters,
+            event_sink=event_sink,
+            registry=registry,
+        )
         labelnames = list(labels.keys())
-        kw = {"registry": registry} if registry is not None else {}
-        self.kv_transfer_latency_seconds = Histogram(
+        self.kv_transfer_latency_seconds = factory.histogram(
             name="tokenspeed:kv_transfer_latency_seconds",
             documentation="Wall time of one KV cache transfer send to a peer.",
             labelnames=labelnames,
@@ -856,18 +811,16 @@ class KVTransferMetrics:
                 30.0,
                 60.0,
             ],
-            **kw,
         )
         # `stage` is the bounded TransferPoll state the request was stuck in:
         # "bootstrapping" (prefill never received the cache manifest) or
         # "waiting_for_input" (decode never received the transfer-done signal).
-        self.kv_transfer_timeouts = Counter(
+        self.kv_transfer_timeouts = factory.counter(
             name="tokenspeed:kv_transfer_timeouts",
             documentation="KV transfers that timed out, by transfer stage.",
             labelnames=[*labelnames, "stage"],
-            **kw,
         )
-        self.kv_transfer_failures = Counter(
+        self.kv_transfer_failures = factory.counter(
             name="tokenspeed:kv_transfer_failures",
             documentation=(
                 "KV transfers aborted on failure: send failures on the prefill "
@@ -875,7 +828,6 @@ class KVTransferMetrics:
                 "Timeouts are counted separately."
             ),
             labelnames=labelnames,
-            **kw,
         )
 
     def record_kv_transfer_timeout(self, stage: str) -> None:

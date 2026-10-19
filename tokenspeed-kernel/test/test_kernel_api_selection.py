@@ -41,7 +41,7 @@ from functools import partial
 from types import SimpleNamespace
 
 import pytest
-import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
+import tokenspeed_kernel.numerics.torch.gemm as _gemm_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
 import tokenspeed_kernel.ops.attention.dsa as _attention_dsa_pkg
@@ -79,6 +79,7 @@ import tokenspeed_kernel.ops.attention.rmha.gluon as _attention_gluon_rmha
 import tokenspeed_kernel.ops.attention.triton as _attention_triton_merge_state
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.cuda as _gemm_cuda
+import tokenspeed_kernel.ops.gemm.cute_dsl as _gemm_cute_dsl
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
@@ -186,6 +187,7 @@ _RELOAD_MODULES = [
     # GEMM registration modules.
     _gemm_reference,
     _gemm_cuda,
+    _gemm_cute_dsl,
     _gemm_flashinfer,
     _gemm_gluon,
     _gemm_triton,
@@ -261,6 +263,10 @@ def test_hadamard_gluon_registration_uses_amd_backend_only(
             imports.append(name)
             assert platform.is_amd
             return SimpleNamespace(launch_gluon_hadamard_transform_128_gfx950=launch)
+        if name == "tokenspeed_kernel_amd.ops.gfx1250.transform":
+            imports.append(name)
+            assert platform.is_amd
+            return SimpleNamespace(launch_gluon_hadamard_transform_128_gfx1250=launch)
         return real_import(name, *args, **kwargs)
 
     try:
@@ -277,7 +283,8 @@ def test_hadamard_gluon_registration_uses_amd_backend_only(
                 assert implementation(x, scale=0.25) is x
                 assert calls == [(x, 0.25)]
                 assert imports == [
-                    "tokenspeed_kernel_amd.ops.gfx950.transform.hadamard"
+                    "tokenspeed_kernel_amd.ops.gfx950.transform.hadamard",
+                    "tokenspeed_kernel_amd.ops.gfx1250.transform",
                 ]
             else:
                 assert implementation is None
@@ -292,6 +299,7 @@ def test_residual_family_exports_and_modes():
     expected_exports = {
         "attn_res_fwd",
         "attn_res_fwd_available",
+        "boundary_gathers_mailbox",
         "gated_residual_combine",
         "gated_residual_mix",
         "mhc_apply_pre",
@@ -300,6 +308,9 @@ def test_residual_family_exports_and_modes():
         "mhc_post",
         "mhc_pre",
         "pad_gated_residual_projection_weight",
+        "post_norm_residual_pre_norm",
+        "post_norm_residual_pre_norm_bf16",
+        "residual_gate_coefficients",
     }
     assert set(_residual_pkg.__all__) == expected_exports
     residual_modes = {
@@ -337,6 +348,7 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
     """Only proven same-band overlaps may use specialized priority offsets."""
     registry = KernelRegistry.get()
     expected_offsets = {
+        "gluon_mxfp4_a4w4_ep_deferred_precomputed_moe_apply": Priority.SPECIALIZED + 1,
         "gluon_mxfp4_dynamic_moe_apply": Priority.SPECIALIZED + 1,
         # Prefer the coupled MXFP8 bank over the overlapping A16 EP8 plan.
         "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply": Priority.SPECIALIZED + 1,
@@ -588,17 +600,21 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
 
 
 @pytest.mark.parametrize(
-    "contract,online,expected_name",
+    "contract,online,m,expected_name",
     [
-        ("ue8m0", False, "gluon_mm_mxfp8_ue8m0_gfx1250"),
-        ("ue8m0", True, "gluon_mm_mxfp8_ue8m0_gfx1250"),
-        ("fp32", False, "gluon_mm_fp8_blockscale_gfx1250"),
-        ("fp32", True, "gluon_mm_fp8_blockscale_gfx1250"),
+        ("ue8m0", False, 1, "gluon_mm_mxfp8_ue8m0_gfx1250"),
+        ("ue8m0", True, 1, "gluon_mm_mxfp8_ue8m0_gfx1250"),
+        ("ue8m0", False, 32, "gluon_mm_mxfp8_ue8m0_largem_gfx1250"),
+        ("ue8m0", True, 32, "gluon_mm_mxfp8_ue8m0_largem_gfx1250"),
+        ("fp32", False, 1, "gluon_mm_fp8_blockscale_gfx1250"),
+        ("fp32", True, 1, "gluon_mm_fp8_blockscale_gfx1250"),
+        ("fp32", False, 64, "gluon_mm_fp8_blockscale_gfx1250"),
     ],
 )
 def test_public_mm_selects_gfx1250_decode_kernel(
     contract: str,
     online: bool,
+    m: int,
     expected_name: str,
     mi450_platform: PlatformInfo,
     monkeypatch,
@@ -612,7 +628,7 @@ def test_public_mm_selects_gfx1250_decode_kernel(
         pytest.skip(f"{expected_name!r} is not registered (optional backend missing)")
     assert expected_spec.capability.satisfied_by(mi450_platform)
 
-    m, n, k = 1, 128, 256
+    n, k = 128, 256
     a_dtype = torch.bfloat16 if online else _fp8_dtype()
     a = torch.empty((m, k), dtype=a_dtype)
     b = torch.empty((n, k), dtype=_fp8_dtype())
@@ -634,6 +650,7 @@ def test_public_mm_selects_gfx1250_decode_kernel(
             selected_block_size: list[int],
             scale_encoding: str,
             enable_pdl: bool,
+            kernel_name: str,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             assert selected_block_size == block_size
             assert scale_encoding == ("ue8m0" if contract == "ue8m0" else "float32")
@@ -660,7 +677,7 @@ def test_public_mm_selects_gfx1250_decode_kernel(
         "mm",
         expected_name,
         lambda: None,
-        id_suffix=f"{contract}-{'online' if online else 'prequantized'}",
+        id_suffix=f"{contract}-{'online' if online else 'prequantized'}-m{m}",
     )
     active_case, calls = selected_kernel_spy
     active_case["case"] = case
@@ -917,7 +934,7 @@ def test_mm_fp8_reference_selection_follows_b_layout(b_layout) -> None:
         B_scales=scale,
         out_dtype=torch.float32,
         quant="fp8",
-        solution="reference",
+        solution="torch",
     )
 
     torch.testing.assert_close(out, a.float() @ b_kn.float())
@@ -1188,7 +1205,7 @@ def _mm_mxfp4() -> torch.Tensor:
     )
 
 
-def _attention_prefill() -> object:
+def _attention_prefill(solution: str | None = None) -> object:
     q = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     k = torch.empty((4, 8, 64), dtype=torch.bfloat16)
     v = torch.empty((4, 8, 64), dtype=torch.bfloat16)
@@ -1200,15 +1217,18 @@ def _attention_prefill() -> object:
         cu_seqlens,
         cu_seqlens_cpu=[0, 4],
         max_seqlen=4,
+        solution=solution,
     )
 
 
-def _attention_extend() -> object:
-    q = torch.empty((4, 16, 64), dtype=torch.bfloat16)
+def _attention_extend(
+    solution: str | None = None, dtype: torch.dtype = torch.bfloat16
+) -> object:
+    q = torch.empty((4, 16, 64), dtype=dtype)
     cu_seqlens_q = torch.tensor([0, 2, 4], dtype=torch.int32)
     cu_seqlens_kv = torch.tensor([0, 64, 192], dtype=torch.int32)
-    k_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
-    v_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
+    k_cache = torch.empty((8, 64, 8, 64), dtype=dtype)
+    v_cache = torch.empty((8, 64, 8, 64), dtype=dtype)
     page_table = torch.empty((2, 4), dtype=torch.int32)
     cache_seqlens = torch.tensor([64, 128], dtype=torch.int32)
     return _attention_mha_pkg.mha_extend_with_kvcache(
@@ -1221,13 +1241,16 @@ def _attention_extend() -> object:
         cache_seqlens,
         max_seqlen_q=2,
         max_seqlen_k=128,
+        solution=solution,
     )
 
 
-def _attention_decode() -> object:
-    q = torch.empty((2, 16, 64), dtype=torch.bfloat16)
-    k_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
-    v_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
+def _attention_decode(
+    solution: str | None = None, dtype: torch.dtype = torch.bfloat16
+) -> object:
+    q = torch.empty((2, 16, 64), dtype=dtype)
+    k_cache = torch.empty((8, 64, 8, 64), dtype=dtype)
+    v_cache = torch.empty((8, 64, 8, 64), dtype=dtype)
     page_table = torch.empty((2, 4), dtype=torch.int32)
     cache_seqlens = torch.tensor([64, 128], dtype=torch.int32)
     return _attention_mha_pkg.mha_decode_with_kvcache(
@@ -1238,6 +1261,7 @@ def _attention_decode() -> object:
         cache_seqlens,
         max_seqlen_k=128,
         max_seqlen_q=1,
+        solution=solution,
     )
 
 
@@ -3302,6 +3326,20 @@ def test_gfx1250_sigmoid_topk_selects_by_token_count(
             ),
             traits={"tokens": 16, "experts": 896, "topk": 16},
         )
+        reduced_precision_decode = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            format_signature(
+                router_logits=dense_tensor_format(torch.bfloat16),
+            ),
+            traits={"tokens": 1, "experts": 256, "topk": 8},
+        )
+        too_many_experts = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 16, "experts": 2048, "topk": 8},
+        )
     finally:
         Platform.override(real_platform)
         registry.clear_cache()
@@ -3310,8 +3348,10 @@ def test_gfx1250_sigmoid_topk_selects_by_token_count(
     assert batched.name == "triton_kimi3_packed_sigmoid_bias_topk_gfx1250"
     assert forced_gluon.name == "gluon_sigmoid_bias_topk_gfx1250"
     assert past_packed.name == "gluon_sigmoid_bias_topk_gfx1250"
-    assert other_shape.name == "torch_sigmoid_bias_topk"
-    assert reduced_precision.name == "torch_sigmoid_bias_topk"
+    assert other_shape.name == "gluon_sigmoid_bias_topk_route_gfx1250"
+    assert reduced_precision.name == "gluon_sigmoid_bias_topk_route_gfx1250"
+    assert reduced_precision_decode.name == "gluon_sigmoid_bias_topk_route_gfx1250"
+    assert too_many_experts.name == "torch_sigmoid_bias_topk"
 
 
 def test_amd_softmax_topk_selects_triton_on_gfx1250(
@@ -3773,6 +3813,46 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
     assert plan["apply_kernel_name"] == kernel_name
 
 
+def test_gluon_mxfp4_a4w4_deferred_ep4_traits_select_matching_kernel(
+    mi350_platform: PlatformInfo,
+) -> None:
+    """The deferred A4W4 route path is selected for EP4."""
+    registry = KernelRegistry.get()
+    kernel_name = "gluon_mxfp4_a4w4_ep_deferred_precomputed_moe_apply"
+    if registry.get_by_name(kernel_name) is None:
+        pytest.skip(f"{kernel_name} is unavailable")
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        plan = kernel_moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="silu",
+            requires_deferred_finalize=True,
+            routing_mode="precomputed_topk",
+            a2a_backend="none",
+            ep_size=4,
+            ispp=4096,
+            internal_activation_dtype="mxfp4",
+            with_bias=False,
+            solution="gluon",
+            hidden=8192,
+            swiglu_form="standard",
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=False,
+            combine_order="rank",
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert plan["apply_kernel_name"] == kernel_name
+    assert plan["supports_prequantized_input"] is True
+
+
 def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
     mi350_platform: PlatformInfo,
 ) -> None:
@@ -3904,6 +3984,43 @@ def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(
     )
     assert plan["activation"] == "situ"
     assert plan["support_routing"] is False
+
+
+def test_dsv41_mxfp4_swiglu_tp_selection_on_cdna5(
+    mi450_platform: PlatformInfo,
+) -> None:
+    kernel_name = "gluon_mxfp4_gfx1250_precomputed_moe_apply"
+    registry = KernelRegistry.get()
+    if registry.get_by_name(kernel_name) is None:
+        pytest.skip(f"{kernel_name} is unavailable")
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi450_platform)
+        registry.clear_cache()
+        plan = kernel_moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="swiglu",
+            routing_mode="precomputed_topk",
+            ep_size=1,
+            ispp=576,
+            internal_activation_dtype="input",
+            hidden=5120,
+            swiglu_form="standard",
+            activation_clamped=True,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    _assert_moe_plan(
+        plan,
+        apply=kernel_name,
+        preprocessor="gluon_mxfp4_gfx1250_moe_weights",
+    )
 
 
 def _make_fake_gluon_mxfp4_layer(top_k: int) -> torch.nn.Module:
@@ -4039,6 +4156,51 @@ def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
 
     assert out == "sentinel"
     assert captured["decode"] is expected_decode
+
+
+@pytest.mark.parametrize(
+    "internal_activation_dtype,expected",
+    [("fp8", "fp8"), ("input", "mxfp4"), ("mxfp4", "mxfp4")],
+)
+def test_gluon_mxfp4_gfx1250_apply_forwards_activation_dtype(
+    internal_activation_dtype: str,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not hasattr(_moe_gluon, "gluon_mxfp4_gfx1250_precomputed_moe_apply"):
+        pytest.skip("gfx1250 Gluon MXFP4 apply is AMD-only")
+
+    captured: dict[str, object] = {}
+
+    def fake_fused_moe(*args, **kwargs):
+        captured["activation_dtype"] = kwargs.get("activation_dtype")
+        return "sentinel"
+
+    monkeypatch.setattr(
+        _moe_gluon.fused_mxfp_gfx1250,
+        "gluon_mxfp_precomputed_mxfp4_fused_moe",
+        fake_fused_moe,
+    )
+
+    w = torch.nn.Module()
+    w.w13_weight_triton_tensor = torch.empty((4, 0, 0))
+    w.w2_weight_triton_tensor = object()
+    w.w13_precision_config = type("PC", (), {"b_mx_scale": object()})()
+    w.w2_precision_config = type(
+        "PC", (), {"b_mx_scale": object(), "out_dtype": torch.bfloat16}
+    )()
+
+    out = _moe_gluon.gluon_mxfp4_gfx1250_precomputed_moe_apply(
+        {"internal_activation_dtype": internal_activation_dtype},
+        torch.empty((2, 16), dtype=torch.bfloat16),
+        w,
+        torch.empty((2, 4), dtype=torch.float32),
+        topk_weights=torch.ones((2, 2), dtype=torch.float32),
+        topk_ids=torch.zeros((2, 2), dtype=torch.int32),
+    )
+
+    assert out == "sentinel"
+    assert captured["activation_dtype"] == expected
 
 
 def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
@@ -4382,6 +4544,33 @@ def test_mxfp4_w4a8_needs_the_swiglu_clamp() -> None:
         activation_clamped=True,
     )
     assert plan["apply_kernel_name"] == "flashinfer_cutlass_mxfp4_w4a8_moe_apply"
+
+
+@pytest.mark.parametrize(
+    "platform_fixture,solution,weights_dtype,deferred",
+    [
+        ("b200_platform", "flashinfer_trtllm", torch.bfloat16, True),
+        ("h100_platform", "flashinfer_cutlass", torch.float32, False),
+    ],
+)
+def test_mxfp4_plan_preserves_consumer_weight_precision(
+    request, platform_fixture, solution, weights_dtype, deferred
+) -> None:
+    if not Platform.get().is_nvidia:
+        pytest.skip("FlashInfer registrations require NVIDIA")
+    host_platform = Platform.get()
+    try:
+        Platform.override(request.getfixturevalue(platform_fixture))
+        plan = _moe_apply_mxfp4_plan(
+            activation="swiglu",
+            ispp=2304,
+            internal_activation_dtype="input",
+            solution=solution,
+        )
+        assert plan["topk_weights_dtype"] == weights_dtype
+        assert plan["supports_deferred_finalize"] == deferred
+    finally:
+        Platform.override(host_platform)
 
 
 def test_mxfp4_fp8_activation_fails_closed_on_backends_without_a_w4a8_kernel() -> None:
@@ -4913,7 +5102,7 @@ def _case(
 
 
 _CASES = [
-    # Only contiguous BF16 on GFX950 uses Gluon; other AMD inputs retain Triton.
+    # GFX950 Gluon takes only contiguous BF16; GFX1250 Gluon takes every input.
     _case(
         _is_cdna4,
         "cdna4",
@@ -4949,9 +5138,9 @@ _CASES = [
         "cdna5",
         "transform",
         "hadamard_transform",
-        "triton_hadamard_transform_128",
-        partial(_hadamard_transform, contiguous=True, dtype=torch.bfloat16),
-        id_suffix="bf16-architecture-fallback",
+        "gluon_hadamard_transform_128_gfx1250",
+        partial(_hadamard_transform, contiguous=False, dtype=torch.float32),
+        id_suffix="fp32-strided",
     ),
     *[
         _case(
@@ -5134,6 +5323,77 @@ _CASES = [
         "mha_decode_with_kvcache",
         "flashinfer_trtllm_mha_decode_with_kvcache",
         _attention_decode,
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
+        "mha_prefill",
+        "triton_mha_prefill",
+        _attention_prefill,
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
+        "mha_prefill",
+        "fa4_mha_prefill_sm103",
+        partial(_attention_prefill, solution="fa4"),
+        id_suffix="explicit-fa4",
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
+        "mha_extend_with_kvcache",
+        "fa4_mha_extend_with_kvcache_sm103",
+        partial(_attention_extend, solution="fa4"),
+        id_suffix="explicit-fa4",
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
+        "mha_decode_with_kvcache",
+        "fa4_mha_decode_with_kvcache_sm103",
+        partial(_attention_decode, solution="fa4"),
+        id_suffix="explicit-fa4",
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
+        "mha_extend_with_kvcache",
+        "flashinfer_trtllm_mha_extend_with_kvcache",
+        partial(_attention_extend, dtype=torch.float8_e4m3fn),
+        id_suffix="fp8",
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
+        "mha_extend_with_kvcache",
+        "fa4_mha_extend_with_kvcache_fp8_sm103",
+        partial(_attention_extend, solution="fa4", dtype=torch.float8_e4m3fn),
+        id_suffix="explicit-fa4-fp8",
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
+        "mha_decode_with_kvcache",
+        "flashinfer_trtllm_mha_decode_with_kvcache",
+        partial(_attention_decode, dtype=torch.float8_e4m3fn),
+        id_suffix="fp8",
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
+        "mha_decode_with_kvcache",
+        "fa4_mha_decode_with_kvcache_fp8_sm103",
+        partial(_attention_decode, solution="fa4", dtype=torch.float8_e4m3fn),
+        id_suffix="explicit-fa4-fp8",
     ),
     _case(
         _is_blackwell_sm103,
@@ -6040,6 +6300,14 @@ _CASES = [
         "cuda_dsv3_dsv4_linear_fp32",
         _dsv4_linear_fp32,
     ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "gemm",
+        "dsv4_linear_fp32",
+        "gluon_dsv4_linear_fp32_gfx1250",
+        _dsv4_linear_fp32,
+    ),
     # Quantization API x architecture golden cases.
     _case(
         _is_supported_gpu,
@@ -6400,6 +6668,19 @@ _CASES = [
         "triton_fp8_block_precomputed_moe_apply",
         partial(
             _moe_apply_fp8_block, 256, "triton_fp8_block_precomputed_moe_apply", None
+        ),
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "moe",
+        "apply",
+        "gluon_fp8_block_precomputed_moe_apply_gfx1250",
+        partial(
+            _moe_apply_fp8_block,
+            512,
+            "gluon_fp8_block_precomputed_moe_apply_gfx1250",
+            None,
         ),
     ),
     _case(
@@ -7212,6 +7493,20 @@ def test_dsv41_index_topk_fp8_rows_select_triton(
         registry.clear_cache()
         case.invoke()
         assert calls == [case.expected]
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+
+def test_mha_plan_keeps_b300_prefill_prewrite(b300_platform):
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    try:
+        Platform.override(b300_platform)
+        registry.clear_cache()
+        for solution in (None, "fa4"):
+            plan = _attention_mha_pkg.mha_plan(torch.bfloat16, 64, solution=solution)
+            assert plan["extend_mode"] == "prewrite"
     finally:
         Platform.override(host_platform)
         registry.clear_cache()

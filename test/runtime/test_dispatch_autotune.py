@@ -203,7 +203,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
 ):
     events = []
     metadata = []
-    ngram_history = torch.ones(32, 3, dtype=torch.int64)
+    ngram_history = torch.ones(32, 2, 6, dtype=torch.int64)
     ngram_mask = torch.ones(32, dtype=torch.bool)
 
     def scrub(*, batch_size, total_tokens):
@@ -214,7 +214,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
 
     def forward(**kwargs):
         n = kwargs["input_ids"].numel()
-        assert torch.equal(kwargs["engram_previous_tokens"], ngram_history[:n])
+        assert torch.equal(kwargs["engram_hash_ids"], ngram_history[:n])
         assert torch.equal(kwargs["engram_token_mask"], ngram_mask[:n])
         assert not ngram_history.any() and not ngram_mask.any()
         assert not torch.is_grad_enabled()
@@ -254,7 +254,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
         forward_step=_ForwardStepDouble(warmup_decode_path=draft),
         drafter=object() if speculative else None,
         model_input_kwargs=lambda n, bs, rows: {
-            "engram_previous_tokens": ngram_history[rows],
+            "engram_hash_ids": ngram_history[rows],
             "engram_token_mask": ngram_mask[rows],
         },
         events=events,

@@ -929,7 +929,9 @@ class InklingSparseMoeBlock(nn.Module):
     def forward(self, x: torch.Tensor, ctx: ForwardContext) -> torch.Tensor:
         # weights: [T, k + S] — selected-routed weights then shared sink gammas (joint normalization).
         top_k = self.gate.top_k
-        deferred = not self.use_torch_moe and self.experts.supports_deferred_finalize
+        deferred = (
+            not self.use_torch_moe and self.experts.supports_deferred_cuda_finalize
+        )
         if deferred:
             num_global_tokens, max_tokens_per_gpu = self.comm_manager.get_num_tokens(
                 ctx
@@ -962,6 +964,7 @@ class InklingSparseMoeBlock(nn.Module):
                 weights,
                 shared_out,
                 top_k=top_k,
+                hidden_dim=x.shape[-1],
             )
         else:
             weights, topk_ids, router_logits = self.gate(x)
@@ -1505,6 +1508,14 @@ class InklingTextModel(nn.Module):
         return hidden_states, None
 
 
+class _InklingLogitsProcessor(LogitsProcessor):
+    """Keeps full-vocabulary logits: the model masks its padded vocabulary
+    columns after this processor runs, so a fused argmax could pick one."""
+
+    def fuse_argmax(self) -> None:
+        return None
+
+
 class InklingForConditionalGeneration(nn.Module):
     """Inkling top-level model (text decoder + optional audio/vision towers)."""
 
@@ -1589,7 +1600,7 @@ class InklingForConditionalGeneration(nn.Module):
             prefix=add_prefix("lm_head", prefix),
         )
         # All-gather vocab-sharded logits before sampling; do_argmax would bypass the pad masking below.
-        self.logits_processor = LogitsProcessor(
+        self.logits_processor = _InklingLogitsProcessor(
             text_config,
             skip_all_gather=mapping.attn.has_dp,
             tp_rank=mapping.attn.tp_rank,

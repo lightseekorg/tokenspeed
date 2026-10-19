@@ -22,6 +22,11 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.gdn import (
+    gdn_gate,
+    gdn_l2norm,
+    torch_gdn_recurrence,
+)
 from tokenspeed_kernel.ops.attention.gdn import (
     gdn_decode_mtp,
     gdn_replay_commit,
@@ -55,27 +60,24 @@ def _reference_states(
     initial: torch.Tensor,
     accepted: torch.Tensor,
 ) -> torch.Tensor:
-    """Token-by-token GDN state oracle; all arithmetic is FP32."""
-    batch, draft_tokens, num_k_heads, _ = k.shape
-    num_v_heads = v.shape[2]
-    group = num_v_heads // num_k_heads
-    state = initial.float().transpose(-2, -1).clone()  # [B, HV, K, V]
-    head_map = torch.arange(num_v_heads, device=k.device) // group
-    for step in range(draft_tokens):
-        key = k[:, step].float()
-        key = key / torch.sqrt(key.square().sum(-1, keepdim=True) + 1e-6)
-        key = key.index_select(1, head_map)
-        x = a[:, step].float() + dt_bias.float()
-        softplus = torch.where(x <= 20.0, torch.log1p(torch.exp(x)), x)
-        decay = torch.exp(-torch.exp(A_log.float()) * softplus)
-        beta = torch.sigmoid(b[:, step].float())
-        next_state = state * decay[..., None, None]
-        predicted = torch.einsum("bhk,bhkv->bhv", key, next_state)
-        delta = beta[..., None] * (v[:, step].float() - predicted)
-        next_state = next_state + key[..., None] * delta[..., None, :]
-        active = (accepted > step).view(batch, 1, 1, 1)
-        state = torch.where(active, next_state, state)
-    return state.transpose(-2, -1)
+    """The K-last state after each request's accepted prefix; FP32 arithmetic."""
+    key = gdn_l2norm(k.float(), 1e-6)
+    _, states = torch_gdn_recurrence(
+        key,
+        key,
+        v,
+        gdn_gate(a.float(), dt_bias.float(), A_log.float()),
+        torch.sigmoid(b.float()),
+        initial,
+        scale=1.0,
+        parents=None,
+        compute_dtype=torch.float32,
+    )
+    final = initial.float().clone()
+    for batch, count in enumerate(accepted.clamp(max=k.shape[1]).tolist()):
+        if count > 0:
+            final[batch] = states[batch, count - 1]
+    return final
 
 
 def _inputs(

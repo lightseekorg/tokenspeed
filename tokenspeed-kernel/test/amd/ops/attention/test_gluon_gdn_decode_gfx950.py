@@ -23,6 +23,10 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.attention.gdn import (
+    gdn_gate,
+    torch_gdn_recurrence,
+)
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -62,23 +66,18 @@ def _packed_inputs(batch: int, tokens: int, seed: int = 0):
 
 def _reference(q, k, v, a, b, A_log, dt_bias, state):
     """fp64 recurrence; returns outputs [B, T, HV, V] and states [T, B, HV, V, K]."""
-    q, k, v = (x.double() for x in (q, k, v))
-    q = F.normalize(q, dim=-1, eps=1e-6) * D**-0.5
-    k = F.normalize(k, dim=-1, eps=1e-6)
-    q = q.repeat_interleave(HV // H, dim=2)
-    k = k.repeat_interleave(HV // H, dim=2)
-    decay = torch.exp(-A_log.double().exp() * F.softplus(a.double() + dt_bias.double()))
-    beta = torch.sigmoid(b.double())
-    state = state.double()
-    outs, states = [], []
-    for t in range(q.shape[1]):
-        state = state * decay[:, t, :, None, None]
-        prediction = (state * k[:, t, :, None, :]).sum(-1)
-        delta = beta[:, t, :, None] * (v[:, t] - prediction)
-        state = state + delta[..., None] * k[:, t, :, None, :]
-        outs.append((state * q[:, t, :, None, :]).sum(-1))
-        states.append(state)
-    return torch.stack(outs, dim=1), torch.stack(states)
+    out, states = torch_gdn_recurrence(
+        F.normalize(q.double(), dim=-1, eps=1e-6),
+        F.normalize(k.double(), dim=-1, eps=1e-6),
+        v,
+        gdn_gate(a.double(), dt_bias.double(), A_log.double()),
+        torch.sigmoid(b.double()),
+        state,
+        scale=D**-0.5,
+        parents=None,
+        compute_dtype=torch.float64,
+    )
+    return out, states.transpose(0, 1)
 
 
 def test_verify_reads_committed_pool_and_stages_scratch():

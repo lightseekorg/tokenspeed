@@ -89,8 +89,18 @@ class TestGrammarManagerHeadless:
         ) as factory:
             manager = GrammarManager(args, tokenizer, vocab_size=32)
 
-        factory.assert_called_once_with(args, tokenizer, 32)
+        factory.assert_called_once_with(args, tokenizer, 32, stop_token_ids=None)
         assert (manager.grammar_backend) is (backend)
+
+    def test_the_backend_gets_the_engines_stop_ids(self):
+        """The ids the engine stops on reach the backend's tokenizer info."""
+        args = _server_args()
+        with mock.patch.object(
+            grammar_manager_mod, "create_grammar_backend", return_value=object()
+        ) as factory:
+            GrammarManager(args, None, vocab_size=32, stop_token_ids={2, 7})
+
+        factory.assert_called_once_with(args, None, 32, stop_token_ids={2, 7})
 
     def test_backend_none_only_from_explicit_none(self):
         """--grammar-backend none is the sole path to a missing backend."""

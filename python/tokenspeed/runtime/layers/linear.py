@@ -207,12 +207,10 @@ class LinearBase(torch.nn.Module):
                 # remain unquantized unless the checkpoint stores dense MXFP4.
                 self.quant_method = UnquantizedLinearMethod()
         elif isinstance(quant_config, CompressedTensorsConfig):
-            self.scheme = quant_config.get_scheme(self, prefix)
-            self.quant_method = (
-                quant_config.get_linear_method()
-                if self.scheme is not None
-                else UnquantizedLinearMethod()
-            )
+            # get_quant_method resolves the scheme (setting layer.scheme),
+            # honors the checkpoint's ignored layers, and refuses unsupported
+            # combinations such as a quantized MLA kv_b_proj.
+            self.quant_method = quant_config.get_quant_method(self, prefix)
         elif isinstance(quant_config, ModelOptMixedConfig):
             self.quant_method = quant_config.get_quant_method(self, prefix)
         else:
@@ -1162,6 +1160,10 @@ class RowParallelLinear(LinearBase):
                        We skip adding bias but instead return it.
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
+
+    Attributes:
+        supports_fp8_group128_input: Accepts prequantized E4M3 activations with
+            per-128 FP32 scales and produces BF16 output.
     """
 
     def __init__(
@@ -1205,6 +1207,16 @@ class RowParallelLinear(LinearBase):
         assert 0 <= tp_rank < tp_size
         assert tp_size == 1 or tp_group is not None
         self.tp_rank, self.tp_size, self.tp_group = tp_rank, tp_size, tp_group
+
+        method = self.quant_method
+        self.supports_fp8_group128_input = (
+            self.params_dtype == torch.bfloat16
+            and (self.input_is_parallel or self.tp_size == 1)
+            and isinstance(method, Fp8LinearMethod)
+            and method.block_quant
+            and method.quant_config.weight_block_size[1] == 128
+            and method.quant_config.weight_scale_dtype == torch.float32
+        )
 
         self.input_size_per_partition = divide(input_size, self.tp_size)
 
@@ -1538,6 +1550,8 @@ class DPRowParallelLinear(RowParallelLinear):
             override_kernel_name=None,
             interleave_linear_and_gate=False,
         )
+        # Its collectives exchange activation rows, without quantization scales.
+        self.supports_fp8_group128_input = False
         self.parallel = parallel
         self.projection_workspace: ProjectionWorkspace | None = None
         self.comm_backend: CommBackend | None = None

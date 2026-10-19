@@ -26,41 +26,15 @@ Run: pytest tokenspeed-kernel/test/nvidia/thirdparty/test_cuda.py -v
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.activation import torch_silu_and_mul
+from tokenspeed_kernel.numerics.torch.layernorm import torch_rmsnorm
+from tokenspeed_kernel.ops.embedding import apply_rope
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and current_platform().is_nvidia),
     reason="NVIDIA CUDA required",
 )
-
-
-# ─── Helpers ───
-
-
-def _torch_rope_neox(query, key, positions, cos_sin_cache, head_size):
-    """Pure-torch NeoX-style RoPE reference (slow but correct)."""
-    nnz = query.shape[0]
-    q = query.view(nnz, -1, head_size).float()
-    k = key.view(nnz, -1, head_size).float()
-    rotary_dim = cos_sin_cache.shape[1]
-    half = rotary_dim // 2
-
-    for i in range(nnz):
-        pos = positions[i].item()
-        cos_vals = cos_sin_cache[pos, :half]
-        sin_vals = cos_sin_cache[pos, half:]
-        for h in range(q.shape[1]):
-            x1 = q[i, h, :half].clone()
-            x2 = q[i, h, half:rotary_dim].clone()
-            q[i, h, :half] = x1 * cos_vals - x2 * sin_vals
-            q[i, h, half:rotary_dim] = x2 * cos_vals + x1 * sin_vals
-        for h in range(k.shape[1]):
-            x1 = k[i, h, :half].clone()
-            x2 = k[i, h, half:rotary_dim].clone()
-            k[i, h, :half] = x1 * cos_vals - x2 * sin_vals
-            k[i, h, half:rotary_dim] = x2 * cos_vals + x1 * sin_vals
-
-    return q.to(query.dtype).view(nnz, -1), k.to(key.dtype).view(nnz, -1)
 
 
 # ─── apply_rope_with_cos_sin_cache_inplace ───
@@ -112,8 +86,13 @@ class TestApplyRopeWithCosSinCacheInplace:
         )
 
         positions, query, key, cos_sin_cache = self._make_inputs()
-        q_ref, k_ref = _torch_rope_neox(
-            query.clone(), key.clone(), positions, cos_sin_cache, self.HEAD_SIZE
+        q_ref, k_ref = apply_rope(
+            positions,
+            query.clone(),
+            key.clone(),
+            self.HEAD_SIZE,
+            cos_sin_cache,
+            solution="torch",
         )
 
         output_q = torch.empty_like(query)
@@ -202,8 +181,13 @@ class TestApplyRopeWithCosSinCacheInplace:
         )
 
         positions, query, key, cos_sin_cache = self._make_inputs()
-        q_ref, k_ref = _torch_rope_neox(
-            query.clone(), key.clone(), positions, cos_sin_cache, self.HEAD_SIZE
+        q_ref, k_ref = apply_rope(
+            positions,
+            query.clone(),
+            key.clone(),
+            self.HEAD_SIZE,
+            cos_sin_cache,
+            solution="torch",
         )
 
         q_tk = query.clone()
@@ -243,7 +227,7 @@ class TestApplyRopeWithCosSinCacheInplace:
 class TestDsv3RouterGemm:
     """dsv3_router_gemm
 
-    Supports num_tokens > 16 via cuBLAS fallback.
+    Supports num_tokens > 32 via cuBLAS fallback.
 
     Signature:
       dsv3_router_gemm(hidden_states, router_weights, out_dtype=torch.float32)
@@ -252,6 +236,33 @@ class TestDsv3RouterGemm:
 
     NUM_EXPERTS = 256
     HIDDEN_DIM = 7168
+
+    @pytest.mark.parametrize(
+        "hidden_dim,num_tokens",
+        [
+            (3072, 8),
+            (5120, 1),
+            (5120, 32),
+            (5120, 33),
+            (6144, 8),
+            (7168, 8),
+        ],
+    )
+    @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize("num_experts", [128, 384])
+    def test_small_batch_shapes(
+        self, hidden_dim, num_tokens, weight_dtype, num_experts
+    ):
+        from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm
+
+        torch.manual_seed(42)
+        x = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)
+        weight = (
+            torch.randn(num_experts, hidden_dim, device="cuda") / hidden_dim**0.5
+        ).to(weight_dtype)
+        expected = (x.double() @ weight.double().T).float()
+        actual = dsv3_router_gemm(x, weight, out_dtype=torch.float32, enable_pdl=True)
+        torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-5)
 
     def _make_inputs(self, num_tokens=8, seed=42):
         torch.manual_seed(seed)
@@ -286,7 +297,7 @@ class TestDsv3RouterGemm:
         assert torch.allclose(out, ref, atol=1e-1, rtol=1e-2)
 
     def test_large_batch(self):
-        """Supports num_tokens > 16 (cuBLAS fallback)."""
+        """Supports num_tokens > 32 (cuBLAS fallback)."""
         from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as tk_gemm
 
         hidden, weights = self._make_inputs(num_tokens=64)
@@ -1322,13 +1333,6 @@ class TestChainSpeculativeSamplingDraftProb:
 # ───────────────────────────────────────────────────────────────────────────────
 
 
-def _rmsnorm_ref(x, weight, eps):
-    """Reference RMSNorm implementation in PyTorch."""
-    variance = x.float().pow(2).mean(-1, keepdim=True)
-    x_normed = x.float() * torch.rsqrt(variance + eps)
-    return (x_normed * weight.float()).to(x.dtype)
-
-
 class TestRMSNormFusedParallel:
     """rmsnorm_fused_parallel"""
 
@@ -1349,8 +1353,8 @@ class TestRMSNormFusedParallel:
 
         rmsnorm_fused_parallel(input1, weight1, output1, input2, weight2, output2, eps)
 
-        ref1 = _rmsnorm_ref(input1, weight1, eps)
-        ref2 = _rmsnorm_ref(input2, weight2, eps)
+        ref1 = torch_rmsnorm(input1, weight1, eps)
+        ref2 = torch_rmsnorm(input2, weight2, eps)
         torch.testing.assert_close(output1, ref1, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(output2, ref2, atol=1e-2, rtol=1e-2)
 
@@ -1369,8 +1373,8 @@ class TestRMSNormFusedParallel:
 
         rmsnorm_fused_parallel(input1, weight1, output1, input2, weight2, output2, eps)
 
-        ref1 = _rmsnorm_ref(input1, weight1, eps)
-        ref2 = _rmsnorm_ref(input2, weight2, eps)
+        ref1 = torch_rmsnorm(input1, weight1, eps)
+        ref2 = torch_rmsnorm(input2, weight2, eps)
         torch.testing.assert_close(output1, ref1, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(output2, ref2, atol=1e-2, rtol=1e-2)
 
@@ -1385,8 +1389,8 @@ class TestRMSNormFusedParallel:
         weight1 = torch.randn(dim1, device=self.DEVICE, dtype=torch.bfloat16)
         weight2 = torch.randn(dim2, device=self.DEVICE, dtype=torch.bfloat16)
 
-        ref1 = _rmsnorm_ref(input1, weight1, eps)
-        ref2 = _rmsnorm_ref(input2, weight2, eps)
+        ref1 = torch_rmsnorm(input1, weight1, eps)
+        ref2 = torch_rmsnorm(input2, weight2, eps)
 
         # In-place: output is the same tensor as input
         rmsnorm_fused_parallel(input1, weight1, input1, input2, weight2, input2, eps)
@@ -1410,8 +1414,8 @@ class TestRMSNormFusedParallel:
 
         rmsnorm_fused_parallel(input1, weight1, output1, input2, weight2, output2, eps)
 
-        ref1 = _rmsnorm_ref(input1, weight1, eps)
-        ref2 = _rmsnorm_ref(input2, weight2, eps)
+        ref1 = torch_rmsnorm(input1, weight1, eps)
+        ref2 = torch_rmsnorm(input2, weight2, eps)
         torch.testing.assert_close(output1, ref1, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(output2, ref2, atol=1e-2, rtol=1e-2)
 
@@ -1433,8 +1437,8 @@ class TestRMSNormFusedParallel:
             input_q_a, weight_q_a, output_q_a, input_kv_a, weight_kv_a, output_kv_a, eps
         )
 
-        ref_q = _rmsnorm_ref(input_q_a, weight_q_a, eps)
-        ref_kv = _rmsnorm_ref(input_kv_a, weight_kv_a, eps)
+        ref_q = torch_rmsnorm(input_q_a, weight_q_a, eps)
+        ref_kv = torch_rmsnorm(input_kv_a, weight_kv_a, eps)
         torch.testing.assert_close(output_q_a, ref_q, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(output_kv_a, ref_kv, atol=1e-2, rtol=1e-2)
 
@@ -1442,11 +1446,6 @@ class TestRMSNormFusedParallel:
 # ───────────────────────────────────────────────────────────────────────────────
 # silu_and_mul_fuse_block_quant
 # ───────────────────────────────────────────────────────────────────────────────
-
-
-def _silu_ref(x):
-    """Reference SiLU activation."""
-    return x * torch.sigmoid(x)
 
 
 class TestSiluAndMulFuseBlockQuant:
@@ -1574,9 +1573,7 @@ class TestSiluAndMulFuseBlockQuant:
         silu_and_mul_fuse_block_quant(x, scale_out, out, enable_pdl=False)
 
         # Reference
-        gate = x[..., :hidden_size].float()
-        up = x[..., hidden_size:].float()
-        ref = _silu_ref(gate) * up
+        ref = torch_silu_and_mul(x.float(), None)
 
         # Dequantize block-quantized FP8: scale_out is (num_tokens, num_blocks) col-major
         # Each block of 128 elements in the output row has its own scale

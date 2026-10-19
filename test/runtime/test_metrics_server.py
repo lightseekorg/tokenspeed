@@ -76,10 +76,12 @@ def sample_multiproc_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_metrics_endpoint_serves_aggregated_metrics(sample_multiproc_dir):
+@pytest.mark.parametrize("reporters", [None, ["prometheus"]])
+def test_metrics_endpoint_serves_aggregated_metrics(sample_multiproc_dir, reporters):
     port = get_free_port()
     args = SimpleNamespace(
         enable_metrics=True,
+        metrics_reporters=reporters,
         metrics_host=None,
         metrics_port=port,
         host="127.0.0.1",
@@ -111,6 +113,7 @@ def test_metrics_server_bind_failure_degrades_to_none(sample_multiproc_dir):
     port = blocker.getsockname()[1]
     args = SimpleNamespace(
         enable_metrics=True,
+        metrics_reporters=["prometheus"],
         metrics_host=None,
         metrics_port=port,
         host="127.0.0.1",
@@ -121,3 +124,8 @@ def test_metrics_server_bind_failure_degrades_to_none(sample_multiproc_dir):
         assert launch_metrics_server(args) is None
     finally:
         blocker.close()
+
+
+def test_plugin_only_does_not_start_prometheus_endpoint():
+    args = SimpleNamespace(enable_metrics=True, metrics_reporters=["test_reporter"])
+    assert launch_metrics_server(args) is None
