@@ -1138,11 +1138,12 @@ class LogitsProcessor(nn.Module):
                     device=logits.device,
                 )
                 all_gather_single(gathered_logits, logits, self.tp_group)
-                logits = (
-                    gathered_logits.view(self.tp_size, num_rows, local_vocab_size)
-                    .transpose(0, 1)
-                    .contiguous()
-                    .view(num_rows, local_vocab_size * self.tp_size)
+                # Copies whole shard rows, several times faster than a transpose copy.
+                logits = torch.cat(
+                    gathered_logits.view(
+                        self.tp_size, num_rows, local_vocab_size
+                    ).unbind(0),
+                    dim=1,
                 )
 
         logits = logits[:, : self.config.vocab_size].contiguous()

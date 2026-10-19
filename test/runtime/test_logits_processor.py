@@ -170,6 +170,46 @@ def test_tp_logits_gather_preserves_dtype(monkeypatch, dtype, cached):
         assert output.argmax(-1).item() == 1
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_tp_logits_collective_gather_lays_rank_shards_side_by_side(monkeypatch, dtype):
+    """Row r of the gathered logits holds every rank's vocab shard of row r, in
+    rank order, bit for bit (NaN payloads and signed zeros included)."""
+    tp, rows, shard = 3, 5, 8
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=tp * shard),
+        skip_all_gather=False,
+        do_argmax=False,
+        logit_scale=None,
+        tp_rank=0,
+        tp_size=tp,
+        tp_group=(0, 1, 2),
+        dp_lm_head_tp=False,
+    )
+    processor._all_gather_state = None  # no multicast gather: the collective path
+    words = torch.int16 if dtype.itemsize == 2 else torch.int32
+    bound = 2 ** (8 * dtype.itemsize - 1)
+    torch.manual_seed(0)
+    bits = torch.randint(-bound, bound, (tp, rows, shard), dtype=words)
+
+    def collective(output, logits, group):
+        assert tuple(output.shape) == (tp * rows, shard)
+        output.view(words).copy_(bits.reshape(tp * rows, shard))
+
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", collective)
+    output = processor._get_logits(
+        torch.ones((rows, 2), dtype=dtype),
+        SimpleNamespace(weight=torch.ones((shard, 2), dtype=dtype)),
+        logits_metadata=None,
+        embedding_bias=None,
+        plan=None,
+        require_full_vocab=False,
+    )
+    assert output.dtype == dtype
+    assert torch.equal(
+        output.view(words), bits.transpose(0, 1).reshape(rows, tp * shard)
+    )
+
+
 @pytest.mark.parametrize(
     "initializer_name",
     ["_init_all_gather_state", "_init_dist_argmax_state"],
