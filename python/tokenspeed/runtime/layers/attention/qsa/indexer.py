@@ -514,8 +514,7 @@ class QSAIndexer(nn.Module):
                 else decode_query_lengths(ctx, q.shape[0], force_uniform=False)
             ),
         )
-        if ctx.forward_mode.is_extend_or_mixed():
-            ctx.attn_backend.sparse_topk.prefill = selection
+        ctx.attn_backend.sparse_topk.qsa_selection = selection
         selected_slots = selection.selected_slots
         if self.share_topk_for_mtp_iteration:
             ctx.attn_backend.sparse_topk.decode = selected_slots

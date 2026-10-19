@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Logical selection metadata for grouped QSA prefill implementations."""
+"""Logical selection metadata for grouped QSA attention implementations."""
 
 from dataclasses import dataclass
 
@@ -26,7 +26,7 @@ import torch
 
 
 @dataclass(frozen=True)
-class QSAPrefillMetadata:
+class QSASparseMetadata:
     """Logical representation of the same candidates as ``selected_slots``.
 
     ``selected_blocks`` is int32 [tokens, block_topk]. Each row starts with
@@ -48,7 +48,9 @@ class QSAPrefillMetadata:
     page_size: int
     block_size: int
 
-    def validate(self, rows: int, selected_width: int) -> None:
+    def validate(
+        self, rows: int, selected_width: int, *, query_width: int | None
+    ) -> None:
         """Check metadata geometry without reading GPU tensor values."""
         if self.selected_blocks.ndim != 2 or self.selected_blocks.shape[0] != rows:
             raise ValueError("QSA logical blocks must have one row per query")
@@ -78,3 +80,7 @@ class QSAPrefillMetadata:
             or any(end < begin for begin, end in zip(offsets, offsets[1:]))
         ):
             raise ValueError("QSA query offsets must cover the requests and query rows")
+        if query_width is not None and any(
+            end - begin != query_width for begin, end in zip(offsets, offsets[1:])
+        ):
+            raise ValueError("QSA query offsets must match the uniform decode width")

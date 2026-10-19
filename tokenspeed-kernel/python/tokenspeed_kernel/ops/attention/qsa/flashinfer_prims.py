@@ -18,10 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Blackwell FlashInfer PrimTS registration for grouped QSA prefill."""
+"""Blackwell FlashInfer PrimTS registration for grouped QSA attention."""
 
 import torch
-from tokenspeed_kernel.ops.attention.qsa.metadata import QSAPrefillMetadata
+from tokenspeed_kernel.ops.attention.qsa.metadata import QSASparseMetadata
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -42,7 +42,7 @@ def flashinfer_prims_qsa_sparse_attention(
     metadata_capacity_rows: int | None,
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
-    prefill_metadata: QSAPrefillMetadata,
+    sparse_metadata: QSASparseMetadata,
 ) -> torch.Tensor:
     """Use logical candidates to reuse KV within request-local query groups.
 
@@ -52,30 +52,30 @@ def flashinfer_prims_qsa_sparse_attention(
         v_cache: Flattened BF16 values with the same geometry as the keys.
         selected_slots: Equivalent physical candidates used by fallback kernels.
         scale: QK softmax scale.
-        max_seqlen_q: ``None`` for prefill; logical metadata describes the
-            actual ragged query lengths.
+        max_seqlen_q: Uniform decode query width, or ``None`` for ragged queries.
+            Logical metadata describes each request's actual query rows.
         metadata_capacity_rows: Fallback reservation; PrimTS sizes its shared
             workspace from the logical metadata's actual geometry.
         k_scale: Optional Python scalar key descale.
         v_scale: Optional Python scalar value descale.
-        prefill_metadata: Logical candidates, positions and request boundaries.
+        sparse_metadata: Logical candidates, positions and request boundaries.
 
     Returns:
         BF16 output with the query shape.
     """
-    from tokenspeed_kernel.thirdparty.flashinfer.qsa_prims import qsa_prefill
+    from tokenspeed_kernel.thirdparty.flashinfer.qsa_prims import qsa_attention
 
-    if prefill_metadata is None:
-        raise ValueError("PrimTS QSA requires logical prefill metadata")
+    if sparse_metadata is None:
+        raise ValueError("PrimTS QSA requires logical selection metadata")
     if isinstance(k_scale, torch.Tensor) or isinstance(v_scale, torch.Tensor):
         raise TypeError("PrimTS QSA requires Python scalar K/V scales")
     # Logical metadata supplies the candidates and actual ragged row geometry.
     del selected_slots, max_seqlen_q, metadata_capacity_rows
-    return qsa_prefill(
+    return qsa_attention(
         q,
         k_cache,
         v_cache,
-        prefill_metadata,
+        sparse_metadata,
         scale=scale * (1.0 if k_scale is None else k_scale),
         v_scale=1.0 if v_scale is None else v_scale,
     )
@@ -101,10 +101,9 @@ if current_platform().is_nvidia:
                 )
             }
         ),
-        features=frozenset({"qsa_prefill_metadata"}),
+        features=frozenset({"qsa_sparse_metadata"}),
         traits={
-            "is_decode": frozenset({False}),
-            "has_prefill_metadata": frozenset({True}),
+            "has_sparse_metadata": frozenset({True}),
             "scalar_scales": frozenset({True}),
             "head_dim": frozenset({64, 128, 256}),
             "value_head_dim": frozenset({64, 128, 256}),

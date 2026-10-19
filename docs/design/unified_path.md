@@ -1028,12 +1028,13 @@ the selected top-k rows with the queries.
 
 QSA uses positive `decode_query_lengths` for uniform decode/verification and
 `None` for prefill or mixed/ragged queries, including one-token prefill.
-Only decode may use CuTe. Supported BF16 prefill on SM100/SM103 uses FlashInfer
-PrimTS with logical block candidates; query groups stay within each request.
+Only decode may use CuTe. PrimTS accepts supported BF16 prefill and decode
+with logical block candidates on SM100/SM103; groups stay within each request.
 Other supported NVIDIA inputs use FA2 over equivalent physical slots.
 All kernels share the cache writer and sparse-attention call. The indexer
 returns physical slots across graph breaks and keeps logical candidates
-in the existing per-forward share.
+in the existing per-forward share for both stages. Draft steps carrying
+only physical slots use the direct-slot kernels.
 
 PrimTS plans share one workspace per stream and retain K/V storage bindings.
 Each run regenerates the workspace data it reads, so geometries can interleave.

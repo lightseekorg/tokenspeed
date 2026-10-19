@@ -26,7 +26,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention.qsa import QSAPrefillMetadata, qsa_sparse_attention
+from tokenspeed_kernel.ops.attention.qsa import QSASparseMetadata, qsa_sparse_attention
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -96,32 +96,38 @@ class QSAAttnBackend(MHAAttnBackend):
             q.shape[0],
             force_uniform=ctx.draft_narrowing is not None,
         )
-        prefill_metadata = None
-        if max_seqlen_q is None:
-            selection = ctx.attn_backend.sparse_topk.prefill
-            if selection is not None:
+        sparse_metadata = None
+        selection = ctx.attn_backend.sparse_topk.qsa_selection
+        if selection is not None:
+            if not isinstance(selection, QSASelection):
+                raise RuntimeError("invalid QSA logical selection memo")
+            rows = q.shape[0]
+            # Draft step zero may narrow target-aligned physical slots without
+            # carrying their logical rows. Direct-slot kernels handle that case.
+            if selection.selected_slots.shape[0] == rows:
                 layout = ctx.attn_backend.sparse_topk.qsa_metadata
-                metadata = self.forward_extend_metadata
-                if (
-                    not isinstance(selection, QSASelection)
-                    or not isinstance(layout, QSALayout)
-                    or metadata is None
-                ):
-                    raise RuntimeError(
-                        "QSA prefill requires the current indexer and extend metadata"
-                    )
-                # Graph breaks may copy physical slots into a stable handoff
-                # buffer. The per-forward memo owns the logical selection.
-                rows = q.shape[0]
-                prefill_metadata = QSAPrefillMetadata(
+                if not isinstance(layout, QSALayout):
+                    raise RuntimeError("QSA selection requires the current row layout")
+                if max_seqlen_q is None:
+                    metadata = self.forward_extend_metadata
+                    if metadata is None:
+                        raise RuntimeError("QSA ragged queries require extend metadata")
+                    offsets = tuple(metadata.cu_extend_seq_lens_cpu)
+                else:
+                    offsets = tuple(range(0, rows + 1, max_seqlen_q))
+                # Graph breaks may copy physical slots into a stable buffer;
+                # logical candidates stay in the same per-forward memo.
+                sparse_metadata = QSASparseMetadata(
                     selected_blocks=selection.selected_blocks[:rows],
                     block_table=layout.full_page_table,
                     token_to_request=layout.request_indices[:rows].to(torch.int32),
                     query_positions=layout.logical_positions[:rows],
-                    query_start_loc=tuple(metadata.cu_extend_seq_lens_cpu),
+                    query_start_loc=offsets,
                     page_size=layout.full_kernel_page_size,
                     block_size=selection.block_size,
                 )
+            elif ctx.draft_narrowing is None:
+                raise RuntimeError("QSA selection must have one row per query")
         output = qsa_sparse_attention(
             q,
             k_cache,
@@ -134,7 +140,7 @@ class QSAAttnBackend(MHAAttnBackend):
             v_scale=1.0 if v_cache.dtype == torch.float8_e4m3fn else None,
             override=None,
             solution=None,
-            prefill_metadata=prefill_metadata,
+            sparse_metadata=sparse_metadata,
         )
         return output.reshape(q.shape[0], -1)
 

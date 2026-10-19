@@ -336,7 +336,7 @@ def test_qsa_attention_waits_for_slots_and_kv(
             v_scale=1.0,
             override=None,
             solution=solution,
-            prefill_metadata=None,
+            sparse_metadata=None,
         )
         return (output,)
 

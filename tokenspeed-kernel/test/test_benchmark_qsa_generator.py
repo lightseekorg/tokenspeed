@@ -106,7 +106,7 @@ def test_qsa_generator_selection_matches_operation_api(
             v_scale=None,
             override=None,
             solution=None,
-            prefill_metadata=None,
+            sparse_metadata=None,
         )
     assert captured[0] == captured[1]
     assert captured[0]["is_decode"] is is_decode

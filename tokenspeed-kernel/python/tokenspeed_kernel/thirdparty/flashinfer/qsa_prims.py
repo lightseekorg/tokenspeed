@@ -34,7 +34,7 @@ from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
     QTokenKvBlockSparsePagedTSWrapper,
     get_q_token_kv_block_sparse_workspace_size,
 )
-from tokenspeed_kernel.ops.attention.qsa.metadata import QSAPrefillMetadata
+from tokenspeed_kernel.ops.attention.qsa.metadata import QSASparseMetadata
 
 
 def _tensor_layout(tensor: torch.Tensor) -> tuple:
@@ -78,7 +78,7 @@ class _PrimTSQSARunner:
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        metadata: QSAPrefillMetadata,
+        metadata: QSASparseMetadata,
         *,
         scale: float,
         v_scale: float,
@@ -127,9 +127,7 @@ class _PrimTSQSARunner:
         plan = self._plans.get(key)
         if plan is None:
             if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "warm up the PrimTS QSA prefill geometry before capture"
-                )
+                raise RuntimeError("warm up the PrimTS QSA geometry before capture")
             offsets = _group_offsets(metadata.query_start_loc, group_size)
             qo_indptr = torch.tensor(offsets, dtype=torch.int32, device=self._device)
             max_kv = metadata.block_table.shape[1] * page_size
@@ -215,16 +213,16 @@ def _get_runner(device: torch.device, stream: int) -> _PrimTSQSARunner:
     return _PrimTSQSARunner(device)
 
 
-def qsa_prefill(
+def qsa_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    metadata: QSAPrefillMetadata,
+    metadata: QSASparseMetadata,
     *,
     scale: float,
     v_scale: float,
 ) -> torch.Tensor:
-    """Run grouped causal QSA prefill with existing paged K/V and logical IDs.
+    """Run grouped causal QSA attention with paged K/V and logical IDs.
 
     Args:
         q: Packed BF16 query tensor [tokens, heads, head_dim].

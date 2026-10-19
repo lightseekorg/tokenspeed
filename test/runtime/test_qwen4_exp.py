@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -831,7 +832,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     torch.testing.assert_close(actual, rows)
     # The MTP-shared selection is published on the router, not the context.
     torch.testing.assert_close(router.sparse_topk.decode, rows)
-    assert router.sparse_topk.prefill.selected_blocks is blocks
+    assert router.sparse_topk.qsa_selection.selected_blocks is blocks
     assert cache_accesses == [("wait", 3), ("fields", 3)]
     assert len(updates) == 1
     assert updates[0][1]["query"] is not None
@@ -1699,7 +1700,7 @@ def test_qwen4_exp_qsa_sparse_attention_reads_the_cache(
     v_cache = torch.empty_like(k_cache)
     pool = SimpleNamespace(get_kv_buffer=lambda layer_id: (k_cache, v_cache))
     ctx = SimpleNamespace(
-        attn_backend=backend,
+        attn_backend=_qsa_router(kernel_page_size=64, max_bs=1, spec=1),
         bs=1,
         forward_mode=ForwardMode.DECODE,
         draft_narrowing=None,
@@ -1732,59 +1733,166 @@ def test_qwen4_exp_qsa_sparse_attention_reads_the_cache(
     assert kwargs["k_scale"] == unit and kwargs["v_scale"] == unit
 
 
-def test_qsa_prefill_passes_logical_selection_to_kernel(monkeypatch):
-    backend = object.__new__(QSAAttnBackend)
-    backend._metadata_capacity_rows = 0
-    backend.is_mxfp8 = False
-    backend.forward_extend_metadata = SimpleNamespace(cu_extend_seq_lens_cpu=[0, 3, 5])
-    slots = torch.ones((5, 2051), dtype=torch.int32)
-    blocks = torch.zeros((5, 512), dtype=torch.int32)
-    layout = QSALayout(
-        seq_lens=torch.tensor([19, 34], dtype=torch.int32),
-        logical_positions=torch.tensor([16, 17, 18, 32, 33]),
-        request_indices=torch.tensor([0, 0, 0, 1, 1], dtype=torch.int64),
-        qsa_locs=torch.empty(5, dtype=torch.int32),
-        recent_locs=torch.empty(5, dtype=torch.int32),
-        complete_blocks=torch.empty(5, dtype=torch.int32),
-        qsa_page_table=torch.ones((2, 1), dtype=torch.int32),
-        full_page_table=torch.tensor([[1], [2]], dtype=torch.int32),
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("query_width", [None, 1, 4])
+def test_qsa_passes_logical_selection_to_kernel(query_width: int | None) -> None:
+    from test.runtime.cache_pool_test_utils import make_mha_memory_plan, make_pool
+
+    from tokenspeed_kernel.numerics.torch.attention.qsa import (
+        torch_qsa_selected_attention,
+    )
+    from tokenspeed_kernel.ops.attention.qsa.triton import qwen4_exp_qsa_selected_slots
+    from tokenspeed_kernel.platform import ArchVersion, current_platform
+    from tokenspeed_kernel.selection import kernel_override
+
+    from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
+
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("PrimTS QSA requires SM100 or SM103")
+    plan = make_mha_memory_plan(
+        size=512,
+        prefix_granularity=64,
+        layer_num=1,
+        kv_heads=1,
+        head_dim=256,
+        dtype=torch.bfloat16,
+    )
+    _, pool = make_pool(
+        MHATokenToKVPool,
+        plan,
+        device="cuda",
+        dtype=torch.bfloat16,
+        head_num=1,
+        head_dim=256,
+        layer_num=1,
+        rank=0,
+    )
+    spec = MHAConfig(
+        backend_name="mha",
+        num_attention_heads=8,
+        num_kv_heads=1,
+        head_dim=256,
+        attn_tp_size=1,
+    )
+    config = replace(
+        _qsa_config(kernel_page_size=64, max_bs=2, spec=4),
+        device="cuda",
+        prefix_granularity=64,
+        context_len=512,
+        components=(spec,),
+    )
+    router = attention_registry.create_paged_router(
+        config, AttentionArch.MHA, backend_name="qsa"
+    )
+    router.set_cache_pool(pool)
+    router.init_cuda_graph_state(2)
+    backend = router.leaves[FULL_ATTENTION]
+    lengths = (3, 2) if query_width is None else (query_width, query_width)
+    rows = sum(lengths)
+    mode = ForwardMode.EXTEND if query_width is None else ForwardMode.DECODE
+    seq_lens = torch.tensor(
+        [16 + lengths[0], 32 + lengths[1]], device="cuda", dtype=torch.int32
+    )
+    table = torch.tensor([[1], [2]], dtype=torch.int32, device="cuda")
+    requests = torch.arange(1, 3, dtype=torch.int32, device="cuda")
+    if query_width is None:
+        prefix = torch.tensor([16, 32], dtype=torch.int32)
+        cpu_lengths = torch.tensor(lengths, dtype=torch.int32)
+        router.init_forward_metadata(
+            2,
+            2,
+            requests,
+            seq_lens,
+            mode,
+            block_tables={FULL_ATTENTION: table},
+            extend_seq_lens=cpu_lengths.cuda(),
+            extend_seq_lens_cpu=cpu_lengths,
+            extend_prefix_lens=prefix.cuda(),
+            extend_prefix_lens_cpu=prefix,
+            extend_replay_lens_cpu=torch.zeros(2, dtype=torch.int32),
+            extend_prompt_lens_cpu=prefix + cpu_lengths,
+            extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
+        )
+    else:
+        router.refresh_decode_metadata(
+            2,
+            2,
+            requests,
+            seq_lens,
+            forward_mode=mode,
+            block_tables={FULL_ATTENTION: table},
+            num_extends=0,
+            for_graph_replay=False,
+        )
+    positions = [
+        position
+        for prefix, length in zip((16, 32), lengths)
+        for position in range(prefix, prefix + length)
+    ]
+    logical = torch.tensor(positions, device="cuda")
+    owners = torch.repeat_interleave(
+        torch.arange(2, device="cuda", dtype=torch.int32),
+        torch.tensor(lengths, device="cuda"),
+    )
+    complete = ((logical + 1) // 4).to(torch.int32)
+    blocks = torch.full((rows, 512), -1, dtype=torch.int32, device="cuda")
+    for row, position in enumerate(positions):
+        count = (position + 1) // 4
+        blocks[row, :count] = torch.arange(count, device="cuda")
+    slots = qwen4_exp_qsa_selected_slots(
+        blocks, complete, logical, owners, table, 64, 4, 2048, enable_pdl=False
+    )
+    router.sparse_topk.qsa_selection = QSASelection(slots, blocks, 4)
+    router.sparse_topk.qsa_metadata = QSALayout(
+        seq_lens=seq_lens,
+        logical_positions=logical,
+        request_indices=owners,
+        qsa_locs=torch.empty_like(logical),
+        recent_locs=torch.empty_like(logical),
+        complete_blocks=complete,
+        qsa_page_table=table,
+        full_page_table=table,
         full_kernel_page_size=64,
         reset_draft_tags=None,
     )
-    shared = SimpleNamespace(
-        prefill=QSASelection(slots, blocks, 4), qsa_metadata=layout
-    )
-    ctx = SimpleNamespace(
-        attn_backend=SimpleNamespace(sparse_topk=shared),
+    ctx = ForwardContext(
+        attn_backend=router,
+        token_to_kv_pool=pool,
         bs=2,
-        forward_mode=ForwardMode.EXTEND,
-        draft_narrowing=None,
+        num_extends=2 if query_width is None else 0,
+        input_num_tokens=rows,
+        forward_mode=mode,
+        output_layout=(
+            ForwardOutputLayout(2, 2, 0, 1)
+            if query_width is None
+            else ForwardOutputLayout(0, 0, 2, query_width)
+        ),
     )
-    cache = torch.empty((192, 1, 256), dtype=torch.bfloat16)
-    pool = SimpleNamespace(get_kv_buffer=lambda layer_id: (cache, cache))
-    layer = SimpleNamespace(layer_id=0, tp_q_head_num=6, head_dim=256, scaling=1 / 16)
-
-    def attention(q, k, v, selected, **kwargs):
-        metadata = kwargs["prefill_metadata"]
-        assert kwargs["max_seqlen_q"] is None
-        assert metadata.query_start_loc == (0, 3, 5)
-        assert metadata.block_table is layout.full_page_table
-        assert metadata.selected_blocks.data_ptr() == blocks.data_ptr()
-        assert (
-            metadata.query_positions.data_ptr() == layout.logical_positions.data_ptr()
-        )
-        assert metadata.page_size == 64 and metadata.block_size == 4
-        assert metadata.token_to_request.dtype == torch.int32
-        assert metadata.token_to_request.tolist() == [0, 0, 0, 1, 1]
-        return torch.zeros_like(q)
-
-    monkeypatch.setattr(qsa_backend_module, "qsa_sparse_attention", attention)
-    q = torch.empty((5, 6 * 256), dtype=torch.bfloat16)
-    assert backend._sparse_attention(q, layer, pool, slots, ctx).shape == q.shape
-    # A breakable-graph handoff may copy the indexer's output to stable storage.
-    assert (
-        backend._sparse_attention(q, layer, pool, slots.clone(), ctx).shape == q.shape
+    layer = PagedAttention(
+        num_heads=8,
+        head_dim=256,
+        scaling=1 / 16,
+        num_kv_heads=1,
+        layer_id=0,
+        rotary_emb=None,
+        qk_norm=None,
     )
+    k, v = pool.get_kv_buffer(0)
+    torch.manual_seed(91)
+    k.copy_(torch.randn_like(k) * 0.25)
+    v.copy_(torch.randn_like(v) * 0.25)
+    q = torch.randn(rows, 8, 256, dtype=torch.bfloat16, device="cuda")
+    expected = torch_qsa_selected_attention(q, k, v, slots, 1 / 16, 1.0, 1.0).flatten(1)
+    with kernel_override(
+        "attention", "qsa_sparse_attention", "flashinfer_prims_qsa_sparse_attention"
+    ):
+        for physical_slots in (slots, slots.clone()):
+            actual = backend._sparse_attention(
+                q.flatten(1), layer, pool, physical_slots, ctx
+            )
+            torch.testing.assert_close(actual, expected, atol=2e-3, rtol=1e-2)
 
 
 def test_qwen4_exp_ple_lengths_accept_a_padded_row_count() -> None:
