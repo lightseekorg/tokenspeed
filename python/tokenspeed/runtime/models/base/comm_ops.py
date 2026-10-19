@@ -41,10 +41,6 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.query_shard import scatter_count
 from tokenspeed.runtime.models.base.placement import ParallelGroup
 
-# ---------------------------------------------------------------------------
-# Helpers for computing scattered token counts from ForwardContext
-# ---------------------------------------------------------------------------
-
 
 def _scattered_num_tokens_all(ctx: ForwardContext, mapping: Mapping) -> list[int]:
     if ctx.global_num_tokens is not None:
@@ -93,11 +89,6 @@ def _group_scattered_num_tokens(
         raise ValueError(f"Unknown parallel group type: {group_type}")
 
 
-# ---------------------------------------------------------------------------
-# Group info
-# ---------------------------------------------------------------------------
-
-
 def _get_group_info(
     mapping: Mapping, group_type: ParallelGroup
 ) -> tuple[int, tuple[int, ...], bool]:
@@ -127,11 +118,6 @@ def _should_fuse_allreduce_norm(
         and num_tokens > 0
         and num_tokens <= global_server_args_dict["comm_fusion_max_num_tokens"]
     )
-
-
-# ---------------------------------------------------------------------------
-# Communication Operations
-# ---------------------------------------------------------------------------
 
 
 class CommOp(nn.Module):
@@ -322,7 +308,6 @@ class DeferredReduceOp(CommOp):
         residual: torch.Tensor | None,
         ctx: ForwardContext,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # Always defer — the downstream norm op handles the reduce.
         return hidden_states, residual
 
 

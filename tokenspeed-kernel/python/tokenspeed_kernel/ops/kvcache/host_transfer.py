@@ -890,7 +890,8 @@ def transfer_cache_blocks(
         if layer_ready_flags is not None:
             if geometry.device_layer_slices is None:
                 raise ValueError(
-                    "geometry layer slices must be bound before a flagged Triton transfer"
+                    "geometry layer slices must be bound before a flagged Triton "
+                    "transfer"
                 )
             triton_kwargs["layer_ready_flags"] = layer_ready_flags
             triton_kwargs["layer_slices"] = geometry.device_layer_slices

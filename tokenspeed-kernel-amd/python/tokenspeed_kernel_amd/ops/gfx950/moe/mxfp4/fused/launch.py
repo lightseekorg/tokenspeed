@@ -77,11 +77,6 @@ def _preprocess_scale(data: torch.Tensor | None, mode: str) -> torch.Tensor | No
     return data
 
 
-# ---------------------------------------------------------------------------
-# Public launcher: software-pipelined ragged matmul (scaled-MFMA only)
-# ---------------------------------------------------------------------------
-
-
 def _scale_strides(scale: torch.Tensor | None, mode: str = "bypass") -> tuple[int, int]:
     if scale is None:
         return 0, 0
@@ -185,9 +180,10 @@ def _launch_kernel(
         # Host pre-shuffle zero-pads K_pk to a multiple of 128 and W
         # scale to padded N (combine launcher trims output back).
         original_k_pk = getattr(w, "original_k_pk", K_w_phys)
-        assert (
-            K == original_k_pk * div_w
-        ), f"K mismatch: A logical K={K} vs W original logical K={original_k_pk * div_w}"
+        assert K == original_k_pk * div_w, (
+            f"K mismatch: A logical K={K} vs W original logical "
+            f"K={original_k_pk * div_w}"
+        )
         assert (
             K_w_phys >= original_k_pk and K_w_phys % 128 == 0
         ), f"shuffled W K_pk ({K_w_phys}) must be K_pk_padded (multiple of 128)"

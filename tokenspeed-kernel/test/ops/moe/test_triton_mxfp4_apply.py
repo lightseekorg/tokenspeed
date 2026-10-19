@@ -10,8 +10,6 @@ from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_
 from tokenspeed_kernel.ops.quantization import quantize_mxfp4 as kernel_quantize_mxfp4
 from tokenspeed_kernel.platform import current_platform
 
-# E2M1 code points, in the packed nibble order.
-
 
 def _dequantize(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return dequantize_mxfp4(packed, scale).to(torch.bfloat16)

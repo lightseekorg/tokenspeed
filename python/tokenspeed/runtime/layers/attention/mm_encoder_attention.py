@@ -20,14 +20,9 @@
 
 """Cache-less multi-headed attention used by multimodal encoders.
 
-Encode-only attention layer used by vision and audio towers, plus its backend
-dispatch table. Backends are free functions (not
-``AttentionBackend`` subclasses) because the vision encoder is single-shot
-with no KV cache, no decode/extend split, and no graph capture protocol --
-the ``AttentionBackend`` ABC's prefill/decode/extend lifecycle does not
-apply. This file is therefore kept out of ``backends/`` (the home of
-``AttentionBackend`` subclasses) and lives at the ``layers/attention/`` top
-level alongside ``registry.py`` / ``utils.py``.
+Backends are free functions, not ``AttentionBackend`` subclasses, because the
+encoder is single-shot with no KV cache, no decode/extend split, and no graph
+capture protocol; hence this file lives outside ``backends/``.
 """
 
 from __future__ import annotations
@@ -92,7 +87,6 @@ def round_up_to_bucket(value: int, buckets: tuple[int, ...]) -> int:
     return round_up(value, buckets[-1])
 
 
-# === Backend dispatch ===
 # The dispatcher always passes the full kwarg set (cu_seqlens / bsz / seq_len /
 # softmax_scale / max_seqlen / sequence_lengths / workspace_buffer); each
 # backend declares the subset it uses and absorbs the rest via ``**_``.
@@ -240,12 +234,10 @@ def vision_attn_flashinfer_cudnn(
             "flashinfer_cudnn needs sequence_lengths, max_seqlen, and packed indptrs"
         )
 
-    # cuDNN wants a python int for the seq budget.
     max_seqlen = int(
         max_seqlen.item() if isinstance(max_seqlen, torch.Tensor) else max_seqlen
     )
 
-    # Flatten (b, s, h, d) -> (b*s, h, d) when the caller hands us 4-D.
     in_4d = q.dim() == 4
     if in_4d:
         b4 = q.shape[0]
@@ -300,7 +292,6 @@ _BACKENDS: dict[str, Callable[..., torch.Tensor]] = {
 
 
 def _default_multimodal_encoder_attn_backend() -> str:
-    """Platform default backend name."""
     if _is_nvidia:
         if _platform.arch_version.major == 9:  # Hopper SM90
             return "fa3"
@@ -444,10 +435,10 @@ class MultimodalEncoderAttention(nn.Module):
     ) -> torch.Tensor:
         r"""
         Args:
-            x: [b, s, embed_dim]
-            cu_seqlens: [b]
+            x: [b, s, embed_dim] or [s, embed_dim]
+            cu_seqlens: [b + 1] cumulative offsets (packed for flashinfer_cudnn)
         Returns:
-             [b, s, head * head_size]
+            [b, s, embed_dim]
         """
         if x.dim() == 2:
             x = x.unsqueeze(0)

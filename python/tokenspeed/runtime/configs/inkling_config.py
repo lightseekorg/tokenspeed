@@ -478,13 +478,13 @@ class InklingMMConfig(PretrainedConfig):
         self.image_placeholder_token_id = image_placeholder_token_id
         self.audio_placeholder_token_id = audio_placeholder_token_id
         # Coerce dict/None sub-configs to their classes per the declared mapping.
-        _given = {
+        given = {
             "text_config": text_config,
             "audio_config": audio_config,
             "vision_config": vision_config,
         }
         for name, cls in self.sub_configs.items():
-            cfg = _given[name]
+            cfg = given[name]
             setattr(self, name, cfg if isinstance(cfg, cls) else cls(**(cfg or {})))
         if eos_token_id is None:
             eos_token_id = self.text_config.eos_token_id

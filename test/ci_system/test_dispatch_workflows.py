@@ -65,7 +65,8 @@ printf 'image=%s\\n' "${TS_CI_CONTAINER_IMAGE-}"
     )
     script = script.replace(
         "repo = Path.cwd()",
-        'repo = Path(__import__("os").environ.get("TOKENSPEED_TEST_REPO_ROOT", Path.cwd()))',
+        'repo = Path(__import__("os").environ.get('
+        '"TOKENSPEED_TEST_REPO_ROOT", Path.cwd()))',
     )
     assert script != original_script
     env = {

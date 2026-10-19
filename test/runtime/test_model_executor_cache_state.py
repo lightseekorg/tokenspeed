@@ -231,10 +231,8 @@ def test_cudagraph_gc_flag_reaches_the_capture_context():
     """The operator flag must survive ServerArgs -> config -> capture.
 
     Freezing the collector for the duration of capture is the default; the
-    flag is the escape hatch. It previously never arrived -- the wrapper read
-    it off a config that never carried it -- so capture never froze and the
-    flag moved nothing in either direction. Pin the whole path, not the
-    default: read the value the capture context would actually see.
+    flag is the escape hatch. Pin the whole path, not the default: read the
+    value the capture context would actually see.
     """
     import dataclasses
     import gc

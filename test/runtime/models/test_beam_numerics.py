@@ -91,7 +91,6 @@ def _bf16(*shape, seed=0, scale=1.0):
     return (torch.randn(*shape, generator=generator) * scale).to(torch.bfloat16)
 
 
-# ---------------------------------------------------------------- residual and fold
 def test_the_depth_scale_pairs():
     """Depth 2 .. 105 for Beam's 52 layers, (0, attention), (0, MLP), (1, ...)."""
     pairs = [
@@ -149,7 +148,6 @@ def test_a_fold_norm_adds_the_previous_layers_pair(cpu_rmsnorm):
         BeamResidualFoldRMSNorm(5120, EPS, torch.bfloat16, residual_fold=(pair[0], 1))
 
 
-# ---------------------------------------------------------------- attention
 @pytest.mark.parametrize(
     "dtype, floor, temperature",
     [(torch.bfloat16, 0.0, 1.0), (torch.float32, 0.125, 0.7)],
@@ -195,7 +193,6 @@ def test_the_nope_qk_norm_scales_q_by_ssmax(cpu_rmsnorm):
     assert torch.equal(actual_k.reshape(3, 4, 128), k_norm)
 
 
-# ---------------------------------------------------------------- router
 def test_the_router_projects_bf16_rows_onto_its_fp32_weight():
     router = _tiny_model().model.layers[1].mlp.gate
     generator = torch.Generator().manual_seed(9)
@@ -226,7 +223,6 @@ def test_the_route_weights_are_fp32_and_take_the_routed_scale_once():
     assert torch.equal(scaled, unscaled * torch.tensor(2.5, dtype=torch.float32))
 
 
-# ---------------------------------------------------------------- loader
 def test_the_loader_maps_beams_norm_names_and_checks_the_checkpoint():
     """Each canonical norm tensor lands in the module that plays its role, and
     the strict loader refuses the module names as checkpoint names, a padded
@@ -251,7 +247,6 @@ def test_the_loader_maps_beams_norm_names_and_checks_the_checkpoint():
         _tiny_model().load_weights(missing.items())
 
 
-# ---------------------------------------------------------------- one CUDA GPU
 @pytest.fixture
 def loaded(monkeypatch):
     if not torch.cuda.is_available():

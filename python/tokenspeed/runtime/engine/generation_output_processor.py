@@ -220,7 +220,6 @@ class RequestState:
         self.send_decode_id_offset: int = 0
         self.finished_output: bool = False
 
-        # abort related
         self.to_abort = False
         self.to_abort_message = None
         # Client-initiated aborts skip streaming a finish (the TM already tore
@@ -470,7 +469,6 @@ class RequestState:
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
             return
 
-        # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
             tail_str = self.tokenizer.decode(
                 self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
@@ -483,10 +481,7 @@ class RequestState:
 
 
 class OutputProcesser:
-    """Streams generation output to the detokenizer.
-
-    Logprob support is intentionally omitted.
-    """
+    """Streams generation output to the detokenizer."""
 
     # Upper bound on how long a pending abort stays buffered waiting for
     # its matching register(). Generous — a client reorder of more than
@@ -1385,7 +1380,7 @@ class OutputProcesser:
         self, stream_out_rids: list[str], output_states: list[RequestState]
     ) -> None:
         """Collect per-step results and forward them to the detokenizer."""
-        if len(output_states) == 0:
+        if not output_states:
             return
 
         rids_to_send = []
@@ -1421,7 +1416,6 @@ class OutputProcesser:
         )
 
         for i, rs in enumerate(output_states):
-            # For finished requests, always output (unless already output)
             if rs.finished:
                 if rs.finished_output:
                     # With the overlap schedule, a request will try to output twice and hit this line twice
@@ -1430,7 +1424,6 @@ class OutputProcesser:
                 rs.finished_output = True
                 should_output = True
             else:
-                # For ongoing requests, use stream interval logic
                 if rs.stream:
                     stream_interval = getattr(
                         rs.sampling_params, "stream_interval", None
@@ -1532,8 +1525,7 @@ class OutputProcesser:
                     output_top_logprobs_val.append([])
                     output_top_logprobs_idx.append([])
 
-        # Don't send empty batch to detokenizer
-        if len(rids_to_send) == 0:
+        if not rids_to_send:
             return
 
         batch_id_out = BatchTokenIDOut(

@@ -78,10 +78,7 @@ class LLM:
 
         This is the single sync entry point used by ``Engine`` for every
         blocking coroutine call (``flush_cache``, ``start_profile``,
-        weight sync, internal-state queries, …). It replaces the
-        deprecated ``asyncio.get_event_loop()`` +
-        ``run_until_complete(coro)`` idiom that previously lived inline
-        at every call site.
+        weight sync, internal-state queries, …).
         """
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
 

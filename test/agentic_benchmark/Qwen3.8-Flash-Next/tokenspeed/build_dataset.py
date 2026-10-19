@@ -163,7 +163,7 @@ def main() -> None:
         "subsequent_turn_length": args.subsequent_turn_length,
     }
     if args.output_path.exists():
-        metadata = json.loads(args.output_path.read_text())["metadata"]
+        metadata = json.loads(args.output_path.read_text(encoding="utf-8"))["metadata"]
         if all(metadata.get(key) == value for key, value in fingerprint.items()):
             print(f"Using cached Qwen dataset: {args.output_path}")
             return

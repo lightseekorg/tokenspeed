@@ -573,7 +573,8 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
         global_num_tokens=None,
     )
     with patch(
-        "tokenspeed.runtime.execution.prefill_graph.LogitsMetadata.from_forward_context",
+        "tokenspeed.runtime.execution.prefill_graph."
+        "LogitsMetadata.from_forward_context",
         return_value=None,
     ):
         result = owner.replay(ctx, torch.zeros(num_tokens, dtype=torch.int64), None)

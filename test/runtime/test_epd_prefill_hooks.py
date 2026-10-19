@@ -117,9 +117,6 @@ def _spec(rid: str):
     return SimpleNamespace(request_id=rid)
 
 
-# --- try_stage ------------------------------------------------------------------
-
-
 def test_try_stage_is_a_no_op_on_non_epd_nodes() -> None:
     hooks = EpdPrefillHooks(_FakeLoop(), None)
     state = _State(mm_items=[_handshaked_item()])
@@ -148,9 +145,6 @@ def test_try_stage_stages_encode_routed_requests() -> None:
 
     assert admission.staged == ["r0"]
     assert hooks._staged == {"r0": (spec, state, "bootstrap")}
-
-
-# --- drain_ready_embeddings -----------------------------------------------------
 
 
 def test_drain_submits_admitted_and_registers_deferred_sender() -> None:
@@ -218,9 +212,6 @@ def test_drain_withholds_admission_while_paused() -> None:
 
     assert loop.submitted == []
     assert "r0" in hooks._staged
-
-
-# --- assert_embeddings_received --------------------------------------------------
 
 
 def test_assert_embeddings_received_raises_on_unreceived_handshaked_item() -> None:

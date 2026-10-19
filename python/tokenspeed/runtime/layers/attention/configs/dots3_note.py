@@ -48,7 +48,9 @@ class Dots3NoteAttentionConfig(DSAConfig):
                 components=(
                     MLAConfig(
                         **MLAConfig._spec_kwargs(server_args, model_config, is_draft),
-                        sliding_window_tokens=model_config.hf_text_config.sliding_window_size,
+                        sliding_window_tokens=(
+                            model_config.hf_text_config.sliding_window_size
+                        ),
                     ),
                 ),
                 kernel_page_size=32,

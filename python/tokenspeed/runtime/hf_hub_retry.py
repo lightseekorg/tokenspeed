@@ -101,7 +101,8 @@ def call_with_hf_rate_limit_retry(description: str, call: Callable[[], _T]) -> _
             logger.warning(
                 f"Hugging Face rate limit (429) while {description}; "
                 f"retrying in {delay_s:.1f}s "
-                f"({HF_RATE_LIMIT_RETRY_BUDGET_S - waited_s:.0f}s of retry budget left)",
+                f"({HF_RATE_LIMIT_RETRY_BUDGET_S - waited_s:.0f}s of retry budget "
+                "left)",
             )
             time.sleep(delay_s)
 

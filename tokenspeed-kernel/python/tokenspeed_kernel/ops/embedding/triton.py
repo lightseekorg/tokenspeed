@@ -157,7 +157,10 @@ def _rope_apply_kernel(
 
 @triton.jit
 def _sanitize_for_store(x, MAX_FINITE: tl.constexpr):
-    """NaN -> 0 and clamp to +-MAX_FINITE: set_mla_kv_buffer_triton on the rounded value."""
+    """Maps NaN to 0 and clamps to +-MAX_FINITE.
+
+    Matches set_mla_kv_buffer_triton on the rounded value.
+    """
     x = x.to(tl.float32)
     x = tl.where(x != x, 0.0, x)
     return tl.minimum(tl.maximum(x, -MAX_FINITE), MAX_FINITE)
@@ -334,7 +337,8 @@ def _mla_rope_set_kv_buffer_kernel(
                     k1_out = k1
                     k2_out = k2
                 if SANITIZE:
-                    # After the rotation, which would carry a partner's NaN or inf back in.
+                    # After the rotation, which would carry a partner's NaN or
+                    # inf back in.
                     k1_out = _sanitize_for_store(k1_out, MAX_FINITE)
                     k2_out = _sanitize_for_store(k2_out, MAX_FINITE)
                 tl.store(kv_base + nope_dim + pair_lo, k1_out, mask=half_store)
@@ -510,7 +514,9 @@ def apply_rope_triton(
     output_k_rope: torch.Tensor | None = None,
     enable_pdl: bool = False,
 ) -> None:
-    """Apply rotary positional embedding to query and key in-place.
+    """Applies rotary positional embedding to query and key.
+
+    Query and key are rotated in place unless output buffers are given.
 
     Args:
         positions: Token positions, 1D [num_tokens]. int32 or int64.
@@ -846,7 +852,8 @@ def mla_nope_quantize_fp8_triton(
     for name, output, expected_shape, expected_device in expected_outputs:
         if output.shape != expected_shape:
             raise ValueError(
-                f"{name} must have shape {tuple(expected_shape)}, got {tuple(output.shape)}"
+                f"{name} must have shape {tuple(expected_shape)}, "
+                f"got {tuple(output.shape)}"
             )
         if output.dtype != torch.float8_e4m3fn:
             raise ValueError(

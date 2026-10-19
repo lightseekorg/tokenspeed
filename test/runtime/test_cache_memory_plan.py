@@ -154,13 +154,13 @@ class TestCacheMemoryPlanTest:
                 if isinstance(node, ast.Import)
                 for alias in node.names
             }
-            _pytest_expr_6 = any(
+            imports_pd = any(
                 imported.startswith("tokenspeed.runtime.pd")
                 or imported.startswith("tokenspeed.runtime.cache.transfer")
                 for imported in imports
             )
-            _pytest_msg_7 = path.name
-            assert not _pytest_expr_6, _pytest_msg_7
+            msg = path.name
+            assert not imports_pd, msg
 
     def test_cache_pool_factory_is_separate_from_setup(self):
         setup_module = ast.parse((_RECIPE_DIR / "setup.py").read_text())
@@ -585,16 +585,10 @@ class TestBindingUtilizationTest(TestCacheMemoryPlanTest):
             max_padding_fraction=2.0,
         )
         report = plan.capacity_report()
-        _pytest_first_1 = report["wide"]["binding_utilization"]
-        _pytest_second_2 = 1.0
-        assert (
-            _pytest_first_1 == _pytest_second_2
-            or round(abs(_pytest_first_1 - _pytest_second_2), 7) == 0
-        )
-        _pytest_first_3 = report["narrow"]["binding_utilization"]
-        _pytest_second_4 = 100 / 256
-        _pytest_places_5 = 3
-        assert (
-            _pytest_first_3 == _pytest_second_4
-            or round(abs(_pytest_first_3 - _pytest_second_4), _pytest_places_5) == 0
-        )
+        first = report["wide"]["binding_utilization"]
+        second = 1.0
+        assert first == second or round(abs(first - second), 7) == 0
+        first = report["narrow"]["binding_utilization"]
+        second = 100 / 256
+        places = 3
+        assert first == second or round(abs(first - second), places) == 0

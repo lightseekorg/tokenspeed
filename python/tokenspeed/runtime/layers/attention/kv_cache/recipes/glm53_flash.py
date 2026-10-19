@@ -356,7 +356,6 @@ class Glm53FlashRecipe(CacheRecipe):
 
     @cached_property
     def replay_kda(self) -> bool:
-        """Cache the replay capability for this recipe's fixed configuration."""
         return kda_replay_supported(self.attn_config)
 
     @override

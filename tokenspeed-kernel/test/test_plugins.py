@@ -40,10 +40,6 @@ from tokenspeed_kernel.plugins.cli import main as cli_main
 from tokenspeed_kernel.registry import KernelRegistry, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-# ---------------------------------------------------------------------------
-# Fixtures and helpers
-# ---------------------------------------------------------------------------
-
 
 @pytest.fixture
 def fresh_plugins(monkeypatch: pytest.MonkeyPatch):
@@ -132,11 +128,6 @@ def _make_register(
     return register
 
 
-# ---------------------------------------------------------------------------
-# Public API surface
-# ---------------------------------------------------------------------------
-
-
 class TestPluginInfo:
     def test_frozen(self):
         info = PluginInfo(name="x", package="pkg", version="1.0", num_kernels=0)
@@ -165,11 +156,6 @@ class TestExplicitRegistration:
         assert spec is not None
         assert spec.priority == 10  # default
         assert KernelRegistry.get().get_impl("manual_gemm_mm") is impl
-
-
-# ---------------------------------------------------------------------------
-# Discovery
-# ---------------------------------------------------------------------------
 
 
 class TestDiscovery:
@@ -270,7 +256,7 @@ class TestDiscovery:
 
         patch_entry_points([_FakeEntryPoint("force", register)])
         discover_plugins()
-        KernelRegistry.reset()  # simulate registry reset
+        KernelRegistry.reset()
         discover_plugins(force=True)
         assert calls["n"] == 2
         assert KernelRegistry.get().get_by_name("force_kernel") is not None
@@ -304,11 +290,6 @@ class TestOverride:
         # Priority-sorted descending: vendor first.
         assert specs[0].name == "vendor_gemm"
         assert specs[0].priority == 19
-
-
-# ---------------------------------------------------------------------------
-# Isolation, disabling
-# ---------------------------------------------------------------------------
 
 
 class TestIsolation:
@@ -360,11 +341,6 @@ class TestDisable:
         assert {info.name for info in loaded} == {"b"}
 
 
-# ---------------------------------------------------------------------------
-# Priority collision warning
-# ---------------------------------------------------------------------------
-
-
 class TestCollision:
     def test_equal_priority_emits_warning(self, fresh_plugins, patch_entry_points):
         # Pre-existing kernel (built-in style) at priority 14.
@@ -389,11 +365,6 @@ class TestCollision:
         )
         with pytest.warns(UserWarning, match="equal priority"):
             discover_plugins()
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 class TestCli:

@@ -305,7 +305,8 @@ def _deep_pipeline(device: torch.device, block_m: int) -> bool:
 
     if device.type != "cuda" or not current_platform().is_nvidia:
         return False
-    # Four stages of block_m x 128 activations plus 2x64x128 gate/up (or 128x128 w2) BF16 tiles, and barriers.
+    # Four stages of block_m x 128 activations plus 2x64x128 gate/up (or 128x128
+    # w2) BF16 tiles, and barriers.
     smem_bytes = 4 * (block_m * 128 * 2 + 2 * 64 * 128 * 2) + 1024
     properties = torch.cuda.get_device_properties(device)
     return properties.shared_memory_per_block_optin >= smem_bytes
@@ -339,7 +340,8 @@ def _route_outputs(
         (route_count, hidden_size), device=x.device, dtype=x.dtype
     )
     if intermediate_size % 128 == 0 and _deep_pipeline(x.device, 16):
-        # Cold B300: deep 16-row tiles win up to 32 routes (counted over every rank) per local expert.
+        # Cold B300: deep 16-row tiles win up to 32 routes (counted over every
+        # rank) per local expert.
         block_m = 16 if route_count <= 32 * num_experts else 64
     else:
         block_m = 16 if num_tokens <= 16 else 64
@@ -348,7 +350,8 @@ def _route_outputs(
     block_k = 64 if intermediate_size % 64 == 0 else 32
     num_stages, num_warps, programs_per_sm = 3, 4 if block_m == 16 else 8, 1
     if intermediate_size % 128 == 0 and _deep_pipeline(x.device, block_m):
-        # Wider K slabs keep cold decode weights in flight; K accumulation order is unchanged.
+        # Wider K slabs keep cold decode weights in flight; K accumulation order
+        # is unchanged.
         block_k, num_stages, num_warps, programs_per_sm = 128, 4, 8, 4
     num_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
     stage1_programs = min(

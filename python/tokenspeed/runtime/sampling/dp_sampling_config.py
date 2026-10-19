@@ -237,6 +237,7 @@ def slice_dp_vocab_mask(
     num_tokens_per_req: int,
     shard: slice,
 ) -> torch.Tensor | None:
+    """Padding rows are filled with -1 (all tokens allowed)."""
     if vocab_mask is None:
         return None
     n = num_tokens_per_req

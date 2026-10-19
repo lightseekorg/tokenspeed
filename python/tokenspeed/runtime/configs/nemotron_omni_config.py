@@ -42,7 +42,8 @@ _VIT_DIMS = {
     "vit_huge_patch16_224": (1280, 32, 16, 5120),
 }
 
-# RADIO ``args`` layer settings the encoder implements; a checkpoint may only repeat these values.
+# RADIO ``args`` layer settings the encoder implements; a checkpoint may only repeat
+# these values.
 _RADIO_FIXED_ARGS = {
     "hidden_act": "gelu",
     "qkv_bias": True,
@@ -112,7 +113,7 @@ class RadioVisionConfig(PretrainedConfig):
                 )
 
     def shape_from_args(self) -> dict[str, Any]:
-        """The ViT shape ``args`` describes, in the transformers RADIO config's fields."""
+        """The ViT shape ``args`` describes, as transformers RADIO config fields."""
         hidden_size, num_layers, num_heads, mlp_size = self.vit_dims
         return {
             "hidden_size": hidden_size,
@@ -166,7 +167,7 @@ class RadioVisionConfig(PretrainedConfig):
     @property
     def num_registers(self) -> int:
         multiple = self.args["register_multiple"]
-        # C-RADIO pads to the next multiple, adding a full multiple when already aligned.
+        # C-RADIO pads to the next multiple, adding a full one when already aligned.
         return multiple - self.num_cls_tokens % multiple if multiple else 0
 
     @property
@@ -181,12 +182,12 @@ class RadioVisionConfig(PretrainedConfig):
 
     @property
     def final_norm(self) -> bool:
-        # A transformers-format config has no ``model_norm``: its ViT ends without a norm.
+        # A transformers-format config has no ``model_norm``: its ViT has no final norm.
         return self.args.get("model_norm", False)
 
     @property
     def layer_norm_eps(self) -> float:
-        """LayerNorm epsilon of the blocks and the final norm; RADIO's 1e-6 unless ``args`` sets it."""
+        """Block and final-norm LayerNorm epsilon; 1e-6 unless ``args`` sets it."""
         return self.args.get("layer_norm_eps", 1e-6)
 
 
@@ -219,7 +220,8 @@ class ParakeetAudioConfig(PretrainedConfig):
     ) -> None:
         if hidden_act != "silu":
             raise ValueError(
-                f"Parakeet hidden_act {hidden_act!r} is not supported; the encoder implements silu"
+                f"Parakeet hidden_act {hidden_act!r} is not supported; "
+                "the encoder implements silu"
             )
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
@@ -303,7 +305,8 @@ class NemotronHOmniConfig(PretrainedConfig):
             sound_config = ParakeetAudioConfig(**sound_config)
         self.sound_config = sound_config
         self.image_token_id = img_context_token_id
-        # Video tubelets embed on the image placeholder; the checkpoint's video id is unused.
+        # Video tubelets embed on the image placeholder; the checkpoint's video id is
+        # unused.
         self.video_token_id = img_context_token_id
         self.audio_token_id = sound_context_token_id
         self.downsample_ratio = downsample_ratio

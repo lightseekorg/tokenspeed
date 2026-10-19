@@ -267,7 +267,8 @@ class DeepseekV3MLP(nn.Module):
                 intermediate_size,
                 hidden_size,
                 bias=False,
-                reduce_results=False,  # Communication is handled externally and manually controlled
+                # Communication is handled externally and manually controlled
+                reduce_results=False,
                 tp_size=tp_size,
                 tp_rank=tp_rank,
                 tp_group=tp_group,
@@ -276,7 +277,8 @@ class DeepseekV3MLP(nn.Module):
             )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. "
+                "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
         self._use_nvfp4_gemm_swiglu_nvfp4_quant = (
@@ -331,6 +333,7 @@ class MoEGate(nn.Module):
     _DSV3_ROUTER_GEMM_HIDDEN = (3072, 6144, 7168)
 
     def __init__(self, config, prefix: str = ""):
+        del prefix
         super().__init__()
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
@@ -381,11 +384,13 @@ class DeepseekV3MoE(nn.Module):
 
         if self.mapping.moe.ep_size > config.n_routed_experts:
             raise ValueError(
-                f"EP size {self.mapping.moe.ep_size} is greater than the number of experts {config.n_routed_experts}."
+                f"EP size {self.mapping.moe.ep_size} is greater than the number "
+                f"of experts {config.n_routed_experts}."
             )
         if config.hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {config.hidden_act}. Only silu is supported for now."
+                f"Unsupported activation: {config.hidden_act}. "
+                "Only silu is supported for now."
             )
 
         self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
@@ -753,7 +758,6 @@ class DeepseekV3AttentionMLA(nn.Module):
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
-        # Fusion layer
         if self.q_lora_rank is not None:
             self.fused_qk_layernorm = FusedRMSNorm(
                 self.q_a_layernorm,
@@ -1679,10 +1683,8 @@ class DeepseekV3AttentionMLA(nn.Module):
             k_nope = kv[..., : self.qk_nope_head_dim]
 
             if q.dtype == torch.float8_e4m3fn:
-                # FP8 Attention
                 k, v = mla_kv_pack_quantize_fp8(k_nope, k_pe, v)
             else:
-                # BF16 Attention
                 k = torch.cat(
                     [k_nope, k_pe.expand(-1, self.num_local_heads, -1)], dim=-1
                 )
@@ -2012,7 +2014,6 @@ class DeepseekV3Model(nn.Module):
             config.hidden_size,
         )
         self.alt_stream = torch.cuda.Stream()
-        # config.num_hidden_layers = 5; self.start_layer,self.end_layer = 0, 5
         self.layers = nn.ModuleList(
             [
                 DeepseekV3DecoderLayer(
@@ -2192,8 +2193,6 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
                     param_name.replace("model.", "language_model.model.", 1),
                     param,
                 )
-        # MoE expert weights, scales, and activation scales are handled
-        # by the checkpoint loader.
         moe_loader = build_moe_checkpoint_loader(
             params_dict=moe_params_dict,
             expert_schema=ExpertCheckpointSchema(
@@ -2297,7 +2296,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
                     loaded.add(param_names[id(param)])
                 else:
                     # Owned-expert weights were already consumed by ``moe_loader.load(...)`` above (matches() == True branch).
-                    # Anything reaching here that still looks like an expert weight is for an expert this rank does ot own under ep_size > 1.
+                    # Anything reaching here that still looks like an expert weight is for an expert this rank does not own under ep_size > 1.
                     if ".mlp.experts." in name:
                         continue
                     if "q_a_proj" in name and name not in params_dict:
@@ -2328,7 +2327,8 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
                 if weight_block_size is not None:
                     if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
                         raise RuntimeError(
-                            "kv_b_proj.weight_scale_inv is required for block FP8 dequant."
+                            "kv_b_proj.weight_scale_inv is required for block FP8 "
+                            "dequant."
                         )
                     dtype = torch.get_default_dtype()
                     w = block_dequant(
@@ -2361,11 +2361,6 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
             num_logical_experts=config.n_routed_experts,
             num_groups=config.n_group,
         )
-
-
-# ---------------------------------------------------------------------------
-# Eagle3 MLA draft model
-# ---------------------------------------------------------------------------
 
 
 def _draft_rope_scaling(rope_scaling: dict | None) -> dict | None:
@@ -2823,7 +2818,8 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
             if weight_block_size is not None:
                 if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
                     raise RuntimeError(
-                        "kv_b_proj.weight_scale_inv is required for block FP8 dequant."
+                        "kv_b_proj.weight_scale_inv is required for block FP8 "
+                        "dequant."
                     )
                 dtype = torch.get_default_dtype()
                 w = block_dequant(

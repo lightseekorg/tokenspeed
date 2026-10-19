@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 
 def is_port_available(port):
-    """Return whether a port is available."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -98,8 +97,8 @@ def get_local_ip_by_remote() -> str | None:
         s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
         s.connect(("2001:4860:4860::8888", 80))
         return s.getsockname()[0]
-    except Exception:
-        raise ValueError("Can not get local ip")
+    except Exception as e:
+        raise ValueError("Can not get local ip") from e
 
 
 def get_ip() -> str:

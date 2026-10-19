@@ -176,7 +176,6 @@ def _fp8_checkpoint(rows, cols, *, scale_dtype=torch.bfloat16, per_tensor=False)
     return codes, scale
 
 
-# ---------------------------------------------------------------- schemes
 @pytest.mark.parametrize(
     "raw,strategy,static",
     [
@@ -387,7 +386,6 @@ def test_float_weights_of_other_widths_are_not_fp8(platform):
         )
 
 
-# ---------------------------------------------------------------- parameters and loading
 @pytest.mark.parametrize("scale_dtype", [torch.bfloat16, torch.float32, FP8])
 @pytest.mark.parametrize("tp_rank", [0, 1])
 def test_channel_scales_follow_their_rows(platform, scale_dtype, tp_rank):
@@ -487,7 +485,6 @@ def test_fused_linears_load_each_shard(platform):
     assert merged.weight_scale.tolist() == values
 
 
-# ---------------------------------------------------------------- run: FP8 GEMM or BF16
 def _loaded(config, rows=8, cols=16, scale_dtype=torch.bfloat16):
     layer = ColumnParallelLinear(
         cols,
@@ -796,11 +793,12 @@ def test_fp16_dequantization_rounds_once_too():
 
 @pytest.mark.parametrize("value", [float("nan"), 0.0, -1.0])
 def test_scales_must_be_present_finite_and_positive(platform, value):
-    layer, _, scale = _loaded(_parse(CHANNEL_DYNAMIC))
+    layer, _, _ = _loaded(_parse(CHANNEL_DYNAMIC))
     layer.weight_scale.data[3] = value
     with pytest.raises(
         ValueError,
-        match="m.up_proj.weight_scale: compressed-tensors FP8 scales must be finite and positive",
+        match="m.up_proj.weight_scale: compressed-tensors FP8 scales must be "
+        "finite and positive",
     ):
         layer.quant_method.process_weights_after_loading(layer)
 

@@ -96,6 +96,7 @@ class KimiCodeAgent(BaseInstalledAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
+        del context  # Unused.
         if not self.model_name:
             raise ValueError("model_name is required")
 

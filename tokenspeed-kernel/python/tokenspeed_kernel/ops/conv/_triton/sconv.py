@@ -186,7 +186,8 @@ def _inkling_ring_sconv_decode_kernel(
     acc = tl.zeros([BLOCK_T, BLOCK_D], dtype=tl.float32)
     t64 = t_off.to(tl.int64)
 
-    # Keep tap W-1 in-loop: a split unconditional load miscompiles tokenspeed_triton (num_warps>1).
+    # Keep tap W-1 in-loop: a split unconditional load miscompiles
+    # tokenspeed_triton (num_warps>1).
     for iw in tl.static_range(W):
         shifted_t = t64 - (W - 1) + iw
         in_x = (shifted_t >= bos) & t_mask
@@ -387,7 +388,8 @@ def _inkling_ring_sconv_prefill_kernel(
     # every other tile takes the pure-x fast path (tile-uniform branch, so
     # the checkpoint machinery costs interior tiles nothing).
     has_prechunk = tl.max((t_mask & ((t64 - bos) < (W - 1))).to(tl.int32), axis=0) > 0
-    # Keep tap W-1 in-loop: a split unconditional load miscompiles tokenspeed_triton (num_warps>1).
+    # Keep tap W-1 in-loop: a split unconditional load miscompiles
+    # tokenspeed_triton (num_warps>1).
     if has_prechunk:
         for iw in tl.static_range(W):
             shifted_t = t64 - (W - 1) + iw

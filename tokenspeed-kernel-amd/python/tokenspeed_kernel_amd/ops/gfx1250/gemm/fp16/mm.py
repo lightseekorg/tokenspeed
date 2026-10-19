@@ -698,7 +698,7 @@ def gluon_wmma_tdm_kda_qkvfab_gfx1250(
         or out.device != A.device
     ):
         raise ValueError(
-            f"out must be contiguous GPU BF16 ({A.shape[0]}, 6288) " "colocated with A"
+            f"out must be contiguous GPU BF16 ({A.shape[0]}, 6288) colocated with A"
         )
     if _use_dense_m64_tile(A.shape[0]):
         # 6288 columns leave a 16-column tail in the last 32-column tile.

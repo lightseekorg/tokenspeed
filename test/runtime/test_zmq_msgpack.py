@@ -109,11 +109,6 @@ def _encode_payload(obj) -> bytes:
     return frames[0]
 
 
-# --------------------------------------------------------------------------
-# Codec
-# --------------------------------------------------------------------------
-
-
 def test_generate_request_roundtrip():
     sp = SamplingParams(
         temperature=0.7, max_new_tokens=16, stop_token_ids=[2], seed=1234
@@ -680,11 +675,6 @@ def test_init_decode_ignores_unknown_fields():
     )
     decoded = zmq_wire.decode_init(payload)
     assert decoded.addresses.inputs == ["ipc://in"]
-
-
-# --------------------------------------------------------------------------
-# Transport loopback (engine CONNECTs; frontend BINDs)
-# --------------------------------------------------------------------------
 
 
 class _FakeSmgFrontend:

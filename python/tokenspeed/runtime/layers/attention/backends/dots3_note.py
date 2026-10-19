@@ -47,6 +47,7 @@ class Dots3NoteCacheGroupRouter(CacheGroupRouter):
 class Dots3NoteDSABackend(DSABackend):
     @staticmethod
     def _make_dense_leaf(config, spec, platform, kernel_page_size):
+        del platform
         # The default TRTLLM dense delegate cannot run on Hopper.
         leaf = MLAAttnBackend(
             config,

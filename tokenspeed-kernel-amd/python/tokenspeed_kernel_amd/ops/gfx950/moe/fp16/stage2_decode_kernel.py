@@ -201,7 +201,7 @@ def invoke_stage2_decode(
     """Atomic-accumulate stage 2 (decode): no partials scratch, no reduce."""
     assert inter_states.dtype == torch.bfloat16 and w2.dtype == torch.bfloat16
     assert out.dtype == torch.bfloat16 and sorted_weights.dtype == torch.float32
-    E, D, I_r = w2.shape
+    _, D, I_r = w2.shape
     num_tokens = out.shape[0]
     assert out.shape == (num_tokens, D)
     assert inter_states.shape == (num_tokens * topk, I_r)

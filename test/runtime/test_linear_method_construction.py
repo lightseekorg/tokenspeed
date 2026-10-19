@@ -21,8 +21,6 @@
 
 from __future__ import annotations
 
-"""Construction hooks and existing TP and fused-shard checkpoint loading."""
-
 import pytest
 import torch
 

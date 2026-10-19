@@ -21,7 +21,7 @@
 """Python API for the TokenSpeed scheduler."""
 
 import tokenspeed_scheduler.tokenspeed_scheduler_ext as _ext
-from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution plan; Events
+from tokenspeed_scheduler.tokenspeed_scheduler_ext import (
     AbortReason,
     AttnKind,
     CacheGroupConfig,
@@ -60,7 +60,6 @@ def _forward_batch_repr(self):
 Forward.Batch.__repr__ = _forward_batch_repr
 
 __all__ = [
-    # Core
     "Scheduler",
     "SchedulerConfig",
     "RequestSpec",
@@ -68,7 +67,6 @@ __all__ = [
     "CacheGroupConfig",
     "CacheTransferPolicy",
     "CapacityModel",
-    # Execution plan & operations
     "ExecutionPlan",
     "SchedulerAbort",
     "AbortReason",
@@ -76,7 +74,6 @@ __all__ = [
     "PD",
     "Cache",
     "KVEvent",
-    # Events
     "ExecutionEvent",
     "ForwardEvent",
 ]

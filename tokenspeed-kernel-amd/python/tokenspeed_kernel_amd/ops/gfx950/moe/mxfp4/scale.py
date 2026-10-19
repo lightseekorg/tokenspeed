@@ -37,8 +37,7 @@ import torch
 from tokenspeed_kernel_amd._triton import tl, triton
 
 # MXFP4 microblock size and the CDNA4 scale-swizzle alignment are defined once in
-# mxfp4_cdna4_scale_layout, shared with the weight-scale (B) preshuffle in the
-# preprocessor. Local aliases preserve the names used throughout this module.
+# scale_layout, shared with the weight-scale (B) preshuffle in the preprocessor.
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     CDNA4_SCALE_K_BLOCK as _ALIGN_K_SCALE_SWIZZLE,
 )
@@ -113,16 +112,10 @@ def gather_package_cdna4_scale(
 ) -> torch.Tensor:
     """Remap a CDNA4-swizzled activation scale into sorted-route row order.
 
-    Args:
-        scale: rank-2 uint8 CDNA4-swizzled activation scale.
-        sorted_ids: sorted-route slots (``(topk_id << 24) | token_id``).
-        source_rows: number of valid source rows (token or token*topk extent).
-        cols: activation column count (K), must divide 32.
-        top_k: experts per token.
-        flatten_topk: if True, source rows are flattened ``token * TOPK + slot``.
-
-    Returns:
-        ``(rows_pad, K // 32)`` uint8 scale in sorted-route order.
+    ``scale`` is a rank-2 uint8 CDNA4-swizzled activation scale; ``cols`` (K)
+    must be divisible by 32. ``sorted_ids`` packs ``(topk_id << 24) | token_id``;
+    with ``flatten_topk`` source rows are ``token * top_k + slot``. Returns a
+    ``(rows_pad, K // 32)`` uint8 scale in sorted-route order.
     """
     if scale.dtype != torch.uint8 or scale.ndim != 2:
         raise ValueError(

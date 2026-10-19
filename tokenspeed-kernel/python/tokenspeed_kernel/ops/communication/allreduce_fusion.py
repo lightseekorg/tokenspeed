@@ -188,7 +188,8 @@ def allreduce_fusion(
             or tensor.data_ptr() % 16
         ):
             raise ValueError(
-                "allreduce fusion requires aligned contiguous BF16 inputs on its workspace device"
+                "allreduce fusion requires aligned contiguous BF16 inputs on its "
+                "workspace device"
             )
     finalize = pattern is AllReduceFusionPattern.MOE_FINALIZE_ALLREDUCE_RMSNORM
     if finalize:
@@ -204,7 +205,8 @@ def allreduce_fusion(
                 or not tensor.is_contiguous()
             ):
                 raise ValueError(
-                    "deferred inputs require contiguous BF16 weights and int32 indices for every token and expert"
+                    "deferred inputs require contiguous BF16 weights and int32 "
+                    "indices for every token and expert"
                 )
         expert_weights = expert_weights.view(num_tokens, k)
         expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.view(num_tokens, k)

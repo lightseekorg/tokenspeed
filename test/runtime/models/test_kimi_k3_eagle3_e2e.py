@@ -55,7 +55,7 @@ class TestKimiK3Eagle3E2E:
     def test_k3_eagle3_accepts_nonzero_drafts(self):
         with tempfile.TemporaryDirectory(prefix="tokenspeed-k3-eagle3-") as temp_dir:
             log_path = Path(temp_dir) / "server.log"
-            with log_path.open("w") as log_file:
+            with log_path.open("w", encoding="utf-8") as log_file:
                 command = [
                     sys.executable,
                     "-m",
@@ -161,7 +161,7 @@ class TestKimiK3Eagle3E2E:
                             float(rate)
                             for rate in re.findall(
                                 r"acc_rate=([0-9]+(?:\.[0-9]+)?)",
-                                log_path.read_text(errors="replace"),
+                                log_path.read_text(encoding="utf-8", errors="replace"),
                             )
                         ]
                         if rates:

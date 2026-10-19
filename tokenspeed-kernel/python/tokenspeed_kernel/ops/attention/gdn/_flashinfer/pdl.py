@@ -71,6 +71,12 @@ class _PdlLaunch:
 
 
 class _PdlKernel:
+    """Replaces an upstream CuTe kernel with a PDL-synchronized wrapper kernel.
+
+    Constexpr-annotated parameters (and an instance method's ``self``) are
+    passed as compile-time constants; all others become runtime arguments.
+    """
+
     def __init__(self, kernel):
         original = inspect.unwrap(kernel)
         raw = _clone_function(original, dict(original.__globals__))

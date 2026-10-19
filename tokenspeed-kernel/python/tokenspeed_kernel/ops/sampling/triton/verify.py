@@ -85,7 +85,8 @@ def verify_chain_target_sampled(
         raise ValueError(f"candidates must be 2D, got {candidates.ndim}D")
     if accept_index.shape != candidates.shape:
         raise ValueError(
-            f"accept_index shape {accept_index.shape} must match candidates {candidates.shape}"
+            f"accept_index shape {accept_index.shape} must match candidates "
+            f"{candidates.shape}"
         )
     bs, num_draft_tokens = candidates.shape
     total = bs * num_draft_tokens

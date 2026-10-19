@@ -1,5 +1,3 @@
-"""Model-owned constrained decoding policy tests."""
-
 from types import SimpleNamespace
 
 import pytest

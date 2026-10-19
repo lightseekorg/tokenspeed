@@ -75,11 +75,13 @@ class Fp8Config(QuantizationConfig):
         if weight_block_size is not None:
             if len(weight_block_size) != 2:
                 raise ValueError(
-                    f"The quantization block size of weight must have 2 dimensions, but got {len(weight_block_size)} dimensions."
+                    "The quantization block size of weight must have 2 dimensions, "
+                    f"but got {len(weight_block_size)} dimensions."
                 )
             if activation_scheme != "dynamic":
                 raise ValueError(
-                    f"The block-wise quantization only supports dynamic activation scheme for now, but got {activation_scheme} activation scheme."
+                    "The block-wise quantization only supports dynamic activation "
+                    f"scheme for now, but got {activation_scheme} activation scheme."
                 )
         self.weight_block_size = weight_block_size
         self.scale_fmt = scale_fmt.lower() if scale_fmt is not None else None

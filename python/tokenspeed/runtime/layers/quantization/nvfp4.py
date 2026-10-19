@@ -80,10 +80,10 @@ class Nvfp4Config(QuantizationConfig):
                 kv_cache_quant_algo = quant_config.get("kv_cache_quant_algo", "auto")
                 group_size = quant_config.get("group_size", 16)
                 exclude_modules = quant_config.get("exclude_modules", [])
-            except (ValueError, KeyError):
+            except (ValueError, KeyError) as e:
                 raise ValueError(
                     "Cannot find quant_algo in the model quantization config."
-                )
+                ) from e
 
         if quant_method != "NVFP4":
             raise ValueError(f"Nvfp4Config only supports NVFP4, got {quant_method}")

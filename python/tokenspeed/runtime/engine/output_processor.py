@@ -64,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class ReqState:
-    """Store the state a request."""
+    """Store the state of a request."""
 
     collector: RequestOutputCollector
     finished: bool
@@ -128,7 +128,6 @@ class OutputProcessor:
             # a non-streamed output replaces the pending one anyway.
             cumulative_ids = False
 
-            # Build meta_info and return value
             meta_info = {
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
@@ -332,7 +331,6 @@ class OutputProcessor:
             )
             state.event.set()
 
-            # Log metrics and dump
             if self.engine.enable_metrics and not isinstance(
                 recv_obj, BatchEmbeddingOut
             ):
@@ -431,5 +429,4 @@ class OutputProcessor:
                 with filename.open("wb") as dump_file:
                     _pickle.dump(to_dump, dump_file)
 
-            # Schedule the task to run in the background without awaiting it
             asyncio.create_task(asyncio.to_thread(background_task))

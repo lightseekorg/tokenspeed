@@ -18,7 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Triton Mamba2 scans: chunked SSD prefill, paged decode, speculative verify and replay."""
+"""Triton Mamba2 scans.
+
+Covers chunked SSD prefill, paged decode, speculative verify, and replay.
+"""
 
 from __future__ import annotations
 
@@ -30,11 +33,14 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 _SIGNATURES = format_signatures(("x",), "dense", {torch.bfloat16})
-# Small tiles keep more states in flight in the latency-bound verify and replay loops.
+# Small tiles keep more states in flight in the latency-bound verify and replay
+# loops.
 _SPEC_BLOCK_M, _SPEC_NUM_WARPS = 16, 2
-# Verify alone runs one warp per 8-row tile: fastest on GB300 for chains and trees at 1-64 requests.
+# Verify alone runs one warp per 8-row tile: fastest on GB300 for chains and
+# trees at 1-64 requests.
 _VERIFY_BLOCK_M, _VERIFY_NUM_WARPS = 8, 1
-# Trees fit 96 registers without spilling; uncapped, ptxas takes 146 and fewer warps fit per SM.
+# Trees fit 96 registers without spilling; uncapped, ptxas takes 146 and fewer
+# warps fit per SM.
 _VERIFY_TREE_MAX_REGISTERS = 96
 _LOG2E = tl.constexpr(1.4426950408889634)
 # Prefill launch shapes, tuned on GB300 at Nemotron-3 Super geometry.
@@ -42,7 +48,8 @@ _STATE_PASS_BLOCK = 1024
 _SSD_BLOCK_M, _SSD_BLOCK_K = 64, 32
 _SSD_STATE_WARPS, _SSD_SCAN_WARPS = 4, 4
 _SSD_STATE_STAGES, _SSD_SCAN_STAGES = 3, 1
-# CUDA caps grid axis 1; scan chunks and verify requests sit there, the fastest order.
+# CUDA caps grid axis 1; scan chunks and verify requests sit there, the fastest
+# order.
 _MAX_GRID_Y = 65535
 
 
@@ -63,7 +70,8 @@ def _exp(x):
 
 @triton.jit
 def _ssm_step(h, dA, dB, x):
-    # One fused multiply-add, spelled out: verify, decode and replay must round alike at any tile shape.
+    # One fused multiply-add, spelled out: verify, decode and replay must round
+    # alike at any tile shape.
     return tl.fma(h, dA, dB * x[:, None])
 
 
@@ -81,7 +89,8 @@ def _lane_xor(v, LANE_BIT: tl.constexpr):
 
 @triton.jit
 def _trade_halves(q, lane, LANE_BIT: tl.constexpr):
-    # Lanes with LANE_BIT set keep the upper half of the rows and send the lower half across it.
+    # Lanes with LANE_BIT set keep the upper half of the rows and send the lower
+    # half across it.
     lo, hi = tl.split(tl.permute(tl.reshape(q, (2, q.shape[0] // 2, 32)), (1, 2, 0)))
     up = (lane & LANE_BIT) != 0
     return tl.where(up, hi, lo) + _lane_xor(tl.where(up, lo, hi), LANE_BIT)
@@ -89,7 +98,8 @@ def _trade_halves(q, lane, LANE_BIT: tl.constexpr):
 
 @triton.jit
 def _warp_row_sums(q):
-    # q[r, l] is lane l's share of row r; lane l ends with row l // 4 in 9 shuffles instead of 40.
+    # q[r, l] is lane l's share of row r; lane l ends with row l // 4 in 9
+    # shuffles instead of 40.
     tl.static_assert(q.shape[0] == 8 and q.shape[1] == 32)
     lane = tl.arange(0, 32)[None, :]
     q = _trade_halves(_trade_halves(q, lane, 16), lane, 8)
@@ -183,7 +193,8 @@ def _ssd_chunk_state_kernel(
             mask=mask_k[:, None] & (offs_n[None, :] < D_STATE),
             other=0.0,
         )
-        # The weighted operand is split into two BF16 halves to keep FP32-like precision.
+        # The weighted operand is split into two BF16 halves to keep FP32-like
+        # precision.
         weighted = bs.to(tl.float32) * weight[:, None]
         upper = weighted.to(xs_t.dtype)
         lower = (weighted - upper.to(tl.float32)).to(xs_t.dtype)
@@ -213,7 +224,10 @@ def _ssd_state_passing_kernel(
     STATE_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Carry each sequence's state across its chunks, recording each chunk's incoming state."""
+    """Carries each sequence's state across its chunks.
+
+    Records each chunk's incoming state and writes the sequence's final state.
+    """
     seq = tl.program_id(0)
     head = tl.program_id(1)
     num_heads = tl.num_programs(1)
@@ -268,7 +282,10 @@ def _ssd_chunk_cb_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """``C_t . B_s`` for one row block of a chunk's token pairs, shared by a group's heads."""
+    """Computes ``C_t . B_s`` for one row block of a chunk's token pairs.
+
+    The result is shared by all heads of a group.
+    """
     chunk = tl.program_id(0)
     m0 = tl.program_id(1) * BLOCK_M
     group = tl.program_id(2)
@@ -325,7 +342,10 @@ def _ssd_chunk_scan_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """Outputs of one row block of a chunk: causal in-chunk part plus the incoming state's."""
+    """Computes the outputs of one row block of a chunk.
+
+    Each output is the causal in-chunk part plus the incoming state's part.
+    """
     m0 = tl.program_id(0) * BLOCK_M
     chunk = tl.program_id(1)
     head = tl.program_id(2)
@@ -425,7 +445,8 @@ def triton_mamba2_chunk_scan(
     num_chunks = chunk_metadata.seq_idx.shape[0]
     if num_chunks > _MAX_GRID_Y:
         raise ValueError(
-            f"{num_chunks} chunks exceed the {_MAX_GRID_Y} the scan grid holds per launch"
+            f"{num_chunks} chunks exceed the {_MAX_GRID_Y} the scan grid holds "
+            "per launch"
         )
     final_states = torch.empty_like(initial_states)
     if num_chunks == 0:
@@ -625,7 +646,8 @@ def _mamba2_verify_scan_kernel(
     LANE_ROW_SUMS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    # has_dst is a runtime flag: one binary for both modes keeps their arithmetic identical.
+    # has_dst is a runtime flag: one binary for both modes keeps their
+    # arithmetic identical.
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1).to(tl.int64)
     pid_h = tl.program_id(2)
@@ -682,7 +704,8 @@ def _mamba2_verify_scan_kernel(
                 parent_next = tl.load(parents_row + t + 1)
         if HAS_PARENT_INDICES and t > 0:
             if parent != t - 1:
-                # Rebuild the parent's state: its staged row, else replay its ancestors over the read state.
+                # Rebuild the parent's state: its staged row, else replay its
+                # ancestors over the read state.
                 staged = tl.zeros((), tl.int64) + null_slot
                 if has_dst != 0 and parent >= 0:
                     staged = tl.load(
@@ -695,7 +718,8 @@ def _mamba2_verify_scan_kernel(
                 else:
                     node = parent
                     walked = tl.full((), 0, tl.int32)
-                    # Bounded by t so a malformed (cyclic) parent table cannot hang the kernel.
+                    # Bounded by t so a malformed (cyclic) parent table cannot
+                    # hang the kernel.
                     while (node >= 0) & (walked < t):
                         ancestors |= tl.full((), 1, tl.int64) << node.to(tl.int64)
                         node = tl.load(parents_row + node)
@@ -705,7 +729,8 @@ def _mamba2_verify_scan_kernel(
                     mask=mask & (row != null_slot),
                     other=0.0,
                 ).to(tl.float32)
-                # A tree numbers ancestors in order, so the set bits replay root first.
+                # A tree numbers ancestors in order, so the set bits replay root
+                # first.
                 while ancestors != 0:
                     j = libdevice.ffs(ancestors) - 1
                     ancestors &= ancestors - 1
@@ -730,7 +755,8 @@ def _mamba2_verify_scan_kernel(
                     mask=mask,
                 )
         if LANE_ROW_SUMS:
-            # Each lane holds every row's 4-column share; lanes trade rows instead of reducing each row.
+            # Each lane holds every row's 4-column share; lanes trade rows
+            # instead of reducing each row.
             share = tl.sum(tl.reshape(h * Cv[None, :], (BLOCK_M, 32, 4)), axis=2)
             x_t = tl.load(x_lane + t * stride_x_t, mask=lane_mask, other=0.0)
             y = _warp_row_sums(share) + x_t.to(tl.float32) * skip
@@ -771,12 +797,14 @@ def triton_mamba2_verify_scan(
     batch, T, num_heads, head_dim = x.shape
     if batch > _MAX_GRID_Y:
         raise ValueError(
-            f"{batch} requests exceed the {_MAX_GRID_Y} the verify grid holds per launch"
+            f"{batch} requests exceed the {_MAX_GRID_Y} the verify grid holds "
+            "per launch"
         )
     d_state = state.shape[-1]
     block_m, num_warps = _VERIFY_BLOCK_M, _VERIFY_NUM_WARPS
     block_n = triton.next_power_of_2(d_state)
-    # Lanes trade rows only where Triton gives each lane 4 consecutive columns: 16-aligned fp32 rows of 128.
+    # Lanes trade rows only where Triton gives each lane 4 consecutive columns:
+    # 16-aligned fp32 rows of 128.
     lane_row_sums = (
         (block_m, block_n, num_warps) == (8, 128, 1)
         and state.dtype == torch.float32
@@ -904,7 +932,8 @@ def _mamba2_replay_commit_kernel(
             state_pool + read_idx * state_row_stride + tile, mask=mask, other=0.0
         ).to(tl.float32)
 
-    # All accepted tokens' inputs load at once; the sequential steps then wait on no memory.
+    # All accepted tokens' inputs load at once; the sequential steps then wait
+    # on no memory.
     offs_t = tl.arange(0, T_PAD)
     mask_t = offs_t < steps
     xs = tl.load(

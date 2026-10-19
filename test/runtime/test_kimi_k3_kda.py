@@ -254,7 +254,7 @@ def _naive_kda_scan(q, k, v, g_raw, beta_raw, A_log, dt_bias, lower_bound, S0):
     eps 1e-6, gate = lower_bound * sigmoid(exp(A_log) * (g + dt_bias)),
     beta = sigmoid(beta_raw), scale = D ** -0.5.
     """
-    T, H, D = q.shape
+    _, H, D = q.shape
     qf, kf = q.float(), k.float()
     qf = qf / (qf.pow(2).sum(-1, keepdim=True) + 1e-6).sqrt()
     kf = kf / (kf.pow(2).sum(-1, keepdim=True) + 1e-6).sqrt()
@@ -267,11 +267,6 @@ def _naive_kda_scan(q, k, v, g_raw, beta_raw, A_log, dt_bias, lower_bound, S0):
         S0.transpose(-1, -2),
     )
     return outputs, state.transpose(-1, -2)
-
-
-# ---------------------------------------------------------------------------
-# Contract binding (set_kv_pool)
-# ---------------------------------------------------------------------------
 
 
 def test_set_kv_pool_binds_contract_state_groups(monkeypatch) -> None:
@@ -331,11 +326,6 @@ def test_kda_verify_seed_omits_only_the_recurrent_state(monkeypatch) -> None:
     gdn.forward_metadata = SimpleNamespace(state_in_blocks_by_group=state_pages)
     gdn._seed_verify_scratch_batched(2, 4)
     assert calls == [conv_bytes, state_bytes]
-
-
-# ---------------------------------------------------------------------------
-# Per-group two-slot metadata
-# ---------------------------------------------------------------------------
 
 
 def _kimi_tables(bs: int, width: int, *, base: int = 1) -> dict[str, np.ndarray]:
@@ -454,11 +444,6 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
         )
         assert buf[0].item() == expected_in[0].item()
         assert buf[1].item() == backend.pad_slot_id
-
-
-# ---------------------------------------------------------------------------
-# GPU: KDA prefill/decode over two-slot state tables vs naive + FLA
-# ---------------------------------------------------------------------------
 
 
 class _KDAHarness:

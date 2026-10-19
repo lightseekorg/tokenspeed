@@ -245,7 +245,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
 
     def get_hot_token_id(self):
         # MTP drafts every vocab token; the hot-token-id mechanism is an
-        # EAGLE3-only optimization (see deepseek_v3.py:2063, llama_eagle3.py).
+        # EAGLE3-only optimization (see deepseek_v3.py, llama_eagle3.py).
         return None
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
@@ -276,7 +276,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
             self.config.q_lora_rank is not None
         )
@@ -329,20 +328,17 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 continue
 
             is_decoder = True
-            # For nextn specific weights
             for weight_name in nextn_spec_weight_names:
                 if weight_name in name:
                     name = name.replace(nextn_layer_prefix, "model")
                     is_decoder = False
                     break
-            # For decoder layer weights
             if is_decoder:
                 name = name.replace(nextn_layer_prefix, "model.decoder")
 
             if "rotary_emb.inv_freq" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
                 # We have mlp.experts[0].gate_proj in the checkpoint.
@@ -384,7 +380,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                         else name.replace("q_a_proj", "kv_a_proj_with_mqa")
                     )
 
-                    # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
                     if (
                         q_a_proj_name in cached_a_proj
                         and kv_a_proj_name in cached_a_proj

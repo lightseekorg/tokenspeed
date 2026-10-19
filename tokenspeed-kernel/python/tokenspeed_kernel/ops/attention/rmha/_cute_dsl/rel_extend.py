@@ -422,11 +422,17 @@ def rel_mha_varlen_tsmha(
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(D)
     o = torch.empty(q.shape, device=dev, dtype=out_dtype)
     if blockscaled:
-        # fp8 goes as uint8 via TVM-FFI; SFQ stays flat (interleaved SFQ forbidden with varlen q).
-        data = lambda t: t.view(torch.uint8)
+        # fp8 goes as uint8 via TVM-FFI; SFQ stays flat (interleaved SFQ forbidden
+        # with varlen q).
+        def data(t):
+            return t.view(torch.uint8)
+
         sf_args = (q_scale, k_scale, v_scale)
     else:
-        data = lambda t: t
+
+        def data(t):
+            return t
+
         sf_args = (None, None, None)
     fwd(
         data(q),

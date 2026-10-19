@@ -70,6 +70,7 @@ class KimiK25ForConditionalGeneration(torch.nn.Module):
         mm_attention_backend: str | None = None,
         **kwargs,
     ) -> None:
+        del prefix, kwargs  # Unused.
         super().__init__()
         self.config = config
         self.mapping = mapping

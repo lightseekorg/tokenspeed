@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# -*- coding: utf-8 -*-
-
 import torch
 from tokenspeed_kernel.ops.attention.gdn._triton.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
@@ -113,7 +111,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             q = l2norm_fwd(q)
             k = l2norm_fwd(k)
 
-        g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(
+        g, o, _, final_state, _, _, _ = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
             v=v,
@@ -154,7 +152,7 @@ def chunk_gated_delta_rule(
             (forget) gating tensor (in log space!) of shape `[B, T, H]` if `head_first=False` else `[B, H, T]`.
         beta (torch.Tensor):
             betas of shape `[B, T, H]` if `head_first=False` else `[B, H, T]`.
-        scale (Optional[int]):
+        scale (Optional[float]):
             Scale factor for the RetNet attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
         initial_state (Optional[torch.Tensor]):
@@ -220,12 +218,14 @@ def chunk_gated_delta_rule(
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(
-                f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
+                f"The batch size is expected to be 1 rather than {q.shape[0]} "
+                f"when using `cu_seqlens`."
                 f"Please flatten variable-length inputs before processing."
             )
         if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
             raise ValueError(
-                f"The number of initial states is expected to be equal to the number of input sequences, "
+                f"The number of initial states is expected to be equal to the "
+                f"number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
             )
     if scale is None:
@@ -237,7 +237,7 @@ def chunk_gated_delta_rule(
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
             k = l2norm_fwd(k)
-        g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(
+        g, o, _, final_state, _, h, _ = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
             v=v,

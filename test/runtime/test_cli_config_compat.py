@@ -120,8 +120,6 @@ class TestCLIConfigCompat:
         with pytest.raises(IsADirectoryError):
             server_args.resolve_basic_defaults()
 
-    # ---- Positional model arg ----
-
     def test_positional_model_arg(self):
         args = self._parse_args(["deepseek-ai/DeepSeek-V3"])
         assert (args.model_path) == ("deepseek-ai/DeepSeek-V3")
@@ -146,8 +144,6 @@ class TestCLIConfigCompat:
         args = self._parse_args([])
         with pytest.raises((ValueError)):
             self._from_cli_args_no_init(args)
-
-    # ---- Tensor parallel size ----
 
     def test_tensor_parallel_size_maps_to_attn_tp_size(self):
         args = self._parse_args(
@@ -206,8 +202,6 @@ class TestCLIConfigCompat:
         with pytest.raises((ValueError)):
             self._from_cli_args_no_init(args)
 
-    # ---- Enable expert parallel ----
-
     def test_enable_expert_parallel_flag(self):
         args = self._parse_args(["--model", "test/model", "--enable-expert-parallel"])
         sa = self._from_cli_args_no_init(args)
@@ -218,11 +212,8 @@ class TestCLIConfigCompat:
         sa = self._from_cli_args_no_init(args)
         assert not (sa.enable_expert_parallel)
 
-    # ---- Dense TP default ----
-
     def test_dense_tp_defaults_to_full_world_without_dp(self):
-        # No DP attention: attn_tp == world, so the dense default is unchanged
-        # (still the full world). This is the no-op case for the new default.
+        # No DP attention: attn_tp == world, so the dense default is the full world.
         world, attn_tp = self._parallelism_snapshot(
             ["--model", "test/model", "--attn-tp-size", "8"]
         )[:2]
@@ -265,8 +256,6 @@ class TestCLIConfigCompat:
         )[3]
         assert (dense_tp) == (8)
 
-    # ---- vLLM config names ----
-
     def test_tokenizer_arg(self):
         args = self._parse_args(
             ["--model", "test/model", "--tokenizer", "my/tokenizer"]
@@ -293,10 +282,10 @@ class TestCLIConfigCompat:
             sa.resolve_basic_defaults()
             sa.resolve_parallelism()
             sa.resolve_memory_and_scheduling()
-            _pytest_first_1 = sa.gpu_memory_utilization
-            _pytest_second_2 = 0.95
-            _pytest_msg_3 = tp
-            assert _pytest_first_1 == _pytest_second_2, _pytest_msg_3
+            first = sa.gpu_memory_utilization
+            second = 0.95
+            msg = tp
+            assert first == second, msg
         sa = self._from_cli_args_no_init(
             self._parse_args(
                 [
@@ -554,7 +543,8 @@ class TestCLIConfigCompat:
                 "--model",
                 "test/model",
                 "--speculative-config",
-                '{"method": "mtp", "model": "draft/model", "num_speculative_tokens": 3}',
+                '{"method": "mtp", "model": "draft/model", '
+                '"num_speculative_tokens": 3}',
             ]
         )
         sa = self._from_cli_args_no_init(args)
@@ -1006,7 +996,8 @@ class TestCLIConfigCompat:
                 {"world_size": 2, "data_parallel_size": 2},
                 "attention data parallelism",
             ),
-            # Attention DP derived from the world and attention TP sizes, not set explicitly.
+            # Attention DP derived from the world and attention TP sizes, not set
+            # explicitly.
             (
                 ("EAGLE3", 4, 5, 16),
                 {"world_size": 4, "attn_tp_size": 2},
@@ -1060,8 +1051,6 @@ class TestCLIConfigCompat:
         args = self._parse_args(["--model", "test/model", "--dp-sampling-min-bs", "16"])
         sa = self._from_cli_args_no_init(args)
         assert (sa.dp_sampling_min_bs) == (16)
-
-    # ---- Full server command example ----
 
     def test_full_server_command(self):
         """Test a full server command example:

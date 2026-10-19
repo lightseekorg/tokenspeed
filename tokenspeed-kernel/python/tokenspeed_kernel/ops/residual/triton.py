@@ -1173,11 +1173,6 @@ def triton_mhc_post(
     return out
 
 
-# ===-----------------------------------------------------------------------===#
-# DeepSeek V4 mHC prefill helpers
-# ===-----------------------------------------------------------------------===#
-
-
 @triton.jit
 def _mhc_prefill_project_hc4_kernel(
     residual,

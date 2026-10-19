@@ -50,7 +50,9 @@ def _fake_torch(monkeypatch):
 
 
 def _layout():
-    field = lambda name, size: CacheField(name, 0, 0, size, size)
+    def field(name, size):
+        return CacheField(name, 0, 0, size, size)
+
     return CacheTransferLayout(
         num_lcm_blocks=2,
         groups=(
@@ -83,7 +85,9 @@ def test_null_and_out_of_range_blocks_are_rejected(group_index, block_id):
 
 
 def test_host_fields_are_packed_without_padding():
-    field = lambda name, stride, payload: CacheField(name, 0, 0, stride, payload)
+    def field(name, stride, payload):
+        return CacheField(name, 0, 0, stride, payload)
+
     layout = CacheTransferLayout(
         num_lcm_blocks=10,
         groups=(

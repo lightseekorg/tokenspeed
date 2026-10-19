@@ -242,6 +242,8 @@ class _V41Fp8Config(Mxfp8Config):
 
 
 class _ReferenceFp8LinearMethod(Fp8LinearMethod):
+    """On Hopper, weights load as BF16 with the E8M0 scales folded in."""
+
     def __init__(self, quant_config: Mxfp8Config):
         super().__init__(quant_config)
         # 1x32 weight scales in the native GEMM's layout, or None for the
@@ -698,6 +700,10 @@ def _v41_hc_input_fp8(
 
 
 class DeepseekV41Compressor(nn.Module):
+    """Ratio 1 projects every row; ratio 2 projects content and gate scores and
+    lets the attention backend compress them.
+    """
+
     def __init__(self, config, layer_id: int, prefix: str):
         super().__init__()
         self.ratio = config.compress_ratios[layer_id]
@@ -753,6 +759,7 @@ class DeepseekV41Indexer(nn.Module):
     def __init__(
         self, config, mapping: Mapping, owns_k: bool, quant_config, prefix: str
     ):
+        del mapping
         super().__init__()
         self.n_local_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
@@ -1629,7 +1636,8 @@ class DeepseekV41Model(nn.Module):
         )
         if mapping.attn.tp_size != mapping.moe.tp_ep_size and not local_petit:
             raise NotImplementedError(
-                "V4.1 requires attention TP == MoE TPxEP or Gluon Petit with attention/dense/MoE TP1"
+                "V4.1 requires attention TP == MoE TPxEP or Gluon Petit with "
+                "attention/dense/MoE TP1"
             )
         if config.hc_mult != 4 or config.hc_sinkhorn_iters < 1:
             raise ValueError(
@@ -1649,7 +1657,8 @@ class DeepseekV41Model(nn.Module):
             or config.num_attention_heads % config.o_groups
         ):
             raise ValueError(
-                "Attention/index heads and output groups must divide across attention TP"
+                "Attention/index heads and output groups must divide across "
+                "attention TP"
             )
         if (
             config.num_hidden_layers < 1
@@ -2293,6 +2302,9 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         return None
 
     def _load_wo_a(self, name, tensor, pending) -> None:
+        """Weight and scale may arrive separately; ``pending`` holds the first
+        until its partner arrives.
+        """
         layer_id = int(name.split(".")[1])
         linear = self.model.layers[layer_id].attn.wo_a
         field = name.rsplit(".", 1)[1]
@@ -2513,7 +2525,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 missing.add(key + ".scale")
         if missing:
             raise ValueError(
-                f"Missing {len(missing)} V4.1 checkpoint tensors: {', '.join(sorted(missing)[:16])}"
+                f"Missing {len(missing)} V4.1 checkpoint tensors: "
+                f"{', '.join(sorted(missing)[:16])}"
             )
         self.checkpoint_load_report = {"loaded": len(loaded), "skipped": dict(skipped)}
         logger.info(f"V4.1 checkpoint coverage: {self.checkpoint_load_report!s}")
@@ -2540,7 +2553,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 f"Engram slice load requires {SAFE_WEIGHTS_INDEX_NAME} in "
                 f"{checkpoint_dir}"
             )
-        with open(index_path) as handle:
+        with open(index_path, encoding="utf-8") as handle:
             weight_map = json.load(handle)["weight_map"]
         targets = self._checkpoint_targets()
         for raw in pending:

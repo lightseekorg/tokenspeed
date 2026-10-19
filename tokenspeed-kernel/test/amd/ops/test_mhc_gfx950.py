@@ -36,7 +36,6 @@ if not is_cdna4():
 def test_gluon_mhc_pre_multitoken_matches_reference(
     num_tokens: int, hidden_size: int
 ) -> None:
-    """The GFX950 fused reduction remains accurate through graph batch 32."""
     generator = torch.Generator(device="cuda").manual_seed(123 + num_tokens)
     residual = torch.randn(
         num_tokens,

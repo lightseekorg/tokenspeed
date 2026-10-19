@@ -78,7 +78,6 @@ def device_loading_context(
     module: torch.nn.Module, target_device: torch.device
 ) -> Generator[torch.nn.Module]:
     if target_device.type == "cpu":
-        # If target is CPU, no need to move anything
         yield module
         return
 
@@ -89,7 +88,6 @@ def device_loading_context(
         if p.device.type == "cpu":
             original_device_states[name] = p.device
             p.data = p.data.to(target_device)
-        # Parameters already on target device are not touched
 
     try:
         yield module
@@ -114,7 +112,6 @@ def device_loading_context(
                     p.data = cpu_data
                 else:
                     p.data = p.data.to(original_device)
-        # New parameters or parameters already on target device are untouched
 
 
 from tokenspeed.runtime.utils.startup_timing import startup_phase
@@ -125,7 +122,6 @@ logger = get_colorful_logger(__name__)
 def _get_quantization_config(
     model_config: ModelConfig, load_config: LoadConfig
 ) -> QuantizationConfig | None:
-    """Get the quantization config."""
     if model_config.quantization is not None:
         quant_config = get_quant_config(model_config, load_config)
         platform = current_platform()
@@ -152,7 +148,6 @@ def _initialize_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
 ) -> nn.Module:
-    """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
     quant_config = _get_quantization_config(model_config, load_config)
     if quant_config is not None:
@@ -196,8 +191,6 @@ def _load_kv_cache_scales(model: nn.Module, scales: dict[str, torch.Tensor]) -> 
 
 
 class BaseModelLoader(ABC):
-    """Base class for model loaders."""
-
     def __init__(self, load_config: LoadConfig) -> None:
         self.load_config = load_config
 
@@ -222,8 +215,6 @@ class DefaultModelLoader(BaseModelLoader):
 
     @dataclasses.dataclass
     class Source:
-        """A source for weights."""
-
         model_or_path: str
         """The model ID or path."""
 
@@ -396,7 +387,7 @@ class DefaultModelLoader(BaseModelLoader):
                 lambda name: weight_name_filter(source.prefix + name),
             )
         if self.load_config.load_format == LoadFormat.NPCACHE:
-            # Currently np_cache only support *.bin checkpoints
+            # Currently np_cache only supports *.bin checkpoints.
             if use_safetensors:
                 raise ValueError("np_cache only supports PyTorch checkpoint shards.")
             weights_iterator = np_cache_weights_iterator(
@@ -637,7 +628,7 @@ class ExtensibleModelLoader:
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-        with open(self.ext_yaml) as f:
+        with open(self.ext_yaml, encoding="utf-8") as f:
             ext_config = yaml.safe_load(f)
         base_lm = self.base_lm_loader.load_model(
             model_config=model_config, device_config=device_config
@@ -696,7 +687,7 @@ class DummyModelLoader(BaseModelLoader):
             if callable(post_quant_warmup):
                 post_quant_warmup()
 
-            #  For accurate performance evaluation, we assign
+            # For accurate performance evaluation, we assign
             # random values to the weights.
             initialize_dummy_weights(model)
         return model.eval()
@@ -846,8 +837,6 @@ class ShardedStateLoader(BaseModelLoader):
 
 
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
-    """Get a model loader based on the load format."""
-
     if isinstance(load_config.load_format, type):
         return load_config.load_format(load_config)
 

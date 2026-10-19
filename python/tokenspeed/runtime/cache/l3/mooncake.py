@@ -104,9 +104,9 @@ class MooncakeStoreConfig:
             master = client
         if not master:
             raise ValueError(
-                "Mooncake Store requires master_server_address or client_server_address "
-                "in --kvstore-storage-backend-extra-config, or MOONCAKE_MASTER / "
-                "MOONCAKE_CLIENT in the environment"
+                "Mooncake Store requires master_server_address or "
+                "client_server_address in --kvstore-storage-backend-extra-config, "
+                "or MOONCAKE_MASTER / MOONCAKE_CLIENT in the environment"
             )
         local_hostname = (
             extra_config.get("local_hostname")
@@ -145,7 +145,7 @@ class MooncakeStoreConfig:
 class MooncakeKvStore:
     """Zero-copy Mooncake Store adapter for one compact Host buffer.
 
-    ``extra_config`` is required. Pass ``None`` to fall back to
+    ``extra_config`` has no default; pass ``None`` to fall back to
     ``MOONCAKE_MASTER`` / ``MOONCAKE_CLIENT`` and the other env defaults.
     """
 
@@ -228,7 +228,8 @@ class MooncakeKvStore:
         ret = self.store.register_buffer(ptr, size)
         if ret != 0:
             raise RuntimeError(
-                f"Failed to register Host L2 buffer with Mooncake Store, error code: {ret}"
+                "Failed to register Host L2 buffer with Mooncake Store, "
+                f"error code: {ret}"
             )
 
     def batch_exists(self, keys: Sequence[str]) -> list[bool]:
@@ -263,6 +264,13 @@ class MooncakeKvStore:
         offsets: Sequence[int],
         sizes: Sequence[int],
     ) -> list[bool]:
+        """Returns one flag per key, True when the object is in the store.
+
+        Keys that already exist are reported as written without a PUT. A
+        failed PUT whose key exists on recheck (a concurrent writer won) is
+        also reported as written. PUTs rejected for capacity pressure are
+        retried with a short backoff.
+        """
         if not keys:
             return []
         if not (len(keys) == len(offsets) == len(sizes)):

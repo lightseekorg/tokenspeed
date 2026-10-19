@@ -40,6 +40,8 @@ from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 
 class TopKOutputFormat(Enum):
+    """Whether routing is precomputed (standard) or left to the MoE kernel."""
+
     STANDARD = auto()
     BYPASSED = auto()
 
@@ -282,9 +284,10 @@ def torch_native_fused_topk(
         topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=False)[1]
         topk_weights = scores.gather(1, topk_ids)
     else:
-        assert (
-            hidden_states.shape[0] == gating_output.shape[0]
-        ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
+        assert hidden_states.shape[0] == gating_output.shape[0], (
+            f"Number of tokens mismatch, {hidden_states.shape=} vs "
+            f"{gating_output.shape=}"
+        )
         topk_weights = F.softmax(gating_output.float(), dim=-1)
         topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
 
@@ -426,8 +429,6 @@ class StandardTopKOutput(NamedTuple):
 
 
 class BypassedTopKOutput(NamedTuple):
-    """Bypassed top-k output format."""
-
     hidden_states: torch.Tensor
     router_logits: torch.Tensor
     topk_config: TopKConfig
@@ -450,9 +451,7 @@ class TopKOutput(Protocol):
         ...
 
     @property
-    def format(self) -> TopKOutputFormat:
-        """The format of the output."""
-        ...
+    def format(self) -> TopKOutputFormat: ...
 
 
 _SIMULATED_ROUTING_MIN_ROWS = 16384
@@ -687,7 +686,6 @@ def select_experts(
         info=expert_location_dispatch_info,
     )
 
-    # Shared-expert-sink routing (Inkling)
     if topk_config.num_sink_experts > 0:
         assert num_token_non_padded is None
         assert expert_location_dispatch_info is None
@@ -699,7 +697,6 @@ def select_experts(
             n_routed=router_logits.shape[1] - topk_config.num_sink_experts,
             route_scale=routed_scaling_factor,
         )
-    # DeepSeek V2/V3/R1 series models use grouped_top_k
     elif use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None
@@ -803,7 +800,6 @@ def select_experts(
                 topk_config.topk_indices_dtype,
             )
         else:
-            # Bias-corrected top-k uses the CUDA fused_topk_bias kernel.
             num_tokens = router_logits.shape[0]
             topk_ids = torch.empty(
                 num_tokens,
@@ -829,9 +825,10 @@ def select_experts(
                 topk_ids, expert_location_dispatch_info, num_real_experts
             )
     elif custom_routing_function is None:
-        assert (
-            hidden_states.shape[0] == router_logits.shape[0]
-        ), f"Number of tokens mismatch, {hidden_states.shape=} vs {router_logits.shape=}"
+        assert hidden_states.shape[0] == router_logits.shape[0], (
+            f"Number of tokens mismatch, {hidden_states.shape=} vs "
+            f"{router_logits.shape=}"
+        )
         topk_weights, topk_ids = moe_topk(
             router_logits,
             top_k,

@@ -119,7 +119,7 @@ def invoke_stage1_warp_decode_gluon(
     assert hidden_states.dtype == torch.bfloat16 and w1.dtype == torch.bfloat16
     assert out.dtype == torch.bfloat16
     num_tokens, D = hidden_states.shape
-    E, two_I, Dw = w1.shape
+    _, two_I, Dw = w1.shape
     assert Dw == D and two_I % 2 == 0 and D % BLOCK_K == 0
     I_r = two_I // 2
     assert out.shape == (num_tokens * topk, I_r)
@@ -241,7 +241,7 @@ def invoke_stage2_warp_decode_gluon(
 ):
     assert inter_states.dtype == torch.bfloat16 and w2.dtype == torch.bfloat16
     assert out.dtype == torch.bfloat16
-    E, D, I_r = w2.shape
+    _, D, I_r = w2.shape
     if BLOCK_K is None:
         BLOCK_K = min(1024, triton.next_power_of_2(I_r))
         while I_r % BLOCK_K != 0:

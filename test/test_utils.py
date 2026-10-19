@@ -6,7 +6,6 @@ from tokenspeed.runtime.utils import get_bool_env_var
 
 
 def is_in_ci():
-    """Return whether it is in CI runner."""
     return get_bool_env_var("CI") or get_bool_env_var("GITHUB_ACTIONS")
 
 

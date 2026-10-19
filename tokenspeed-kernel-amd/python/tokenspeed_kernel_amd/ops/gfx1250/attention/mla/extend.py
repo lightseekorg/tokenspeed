@@ -121,30 +121,30 @@ def gluon_mla_extend_gfx1250(
     q_scale_ptr,  # float32
     kv_scale_ptr,  # float32
     out_scale_ptr,  # float32
-    num_query_heads: gl.constexpr,  # int
-    num_kv_heads: gl.constexpr,  # int
-    block_tables_stride: gl.int64,  # int
-    query_stride_0: gl.int64,  # int
-    query_stride_1: gl.int64,  # int, should be equal to head_size
-    output_stride_0: gl.int64,  # int
-    output_stride_1: gl.int64,  # int, should be equal to head_size
-    KV_LORA_RANK: gl.constexpr,  # int
-    QK_ROPE_HEAD_DIM: gl.constexpr,  # int
-    stride_kv_buffer_0: gl.int64,  # int
-    stride_kv_buffer_1: gl.int64,  # int
-    stride_kv_buffer_2: gl.int64,  # int
-    stride_kv_buffer_3: gl.constexpr,  # int
+    num_query_heads: gl.constexpr,
+    num_kv_heads: gl.constexpr,
+    block_tables_stride: gl.int64,
+    query_stride_0: gl.int64,
+    query_stride_1: gl.int64,  # should equal head_size
+    output_stride_0: gl.int64,
+    output_stride_1: gl.int64,  # should equal head_size
+    KV_LORA_RANK: gl.constexpr,
+    QK_ROPE_HEAD_DIM: gl.constexpr,
+    stride_kv_buffer_0: gl.int64,
+    stride_kv_buffer_1: gl.int64,
+    stride_kv_buffer_2: gl.int64,
+    stride_kv_buffer_3: gl.constexpr,
     query_start_len_ptr,  # [num_seqs+1]
     num_seqs: gl.int32,
-    TILE_SIZE: gl.constexpr,  # int
-    BLOCK_Q: gl.constexpr,  # int
-    BLOCK_M: gl.constexpr,  # int
-    WARP_SIZE: gl.constexpr,  # int
-    num_warps: gl.constexpr,  # int
-    num_stages: gl.constexpr,  # int
-    NUM_HEAD_BLOCKS: gl.constexpr = 1,  # int
+    TILE_SIZE: gl.constexpr,
+    BLOCK_Q: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    WARP_SIZE: gl.constexpr,
+    num_warps: gl.constexpr,
+    num_stages: gl.constexpr,
+    NUM_HEAD_BLOCKS: gl.constexpr = 1,
     IS_FP8: gl.constexpr = False,
-    K_WIDTH: gl.constexpr = 0,  # int
+    K_WIDTH: gl.constexpr = 0,
     E4M3_MIN: gl.constexpr = e4m3_info.min,
     E4M3_MAX: gl.constexpr = e4m3_info.max,
     E5M2_MIN: gl.constexpr = e5m2_info.min,
@@ -316,16 +316,11 @@ def gluon_mla_extend_gfx1250(
 
     offs_q_m_qk = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.QK_WMMA_LAYOUT))
     query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // cfg.NUM_QUERIES_PER_KV
-    # query_offset_0_qk = cur_batch_in_all_start_index + query_pos_qk
     query_offset_1_qk = (
         kv_head_idx * cfg.NUM_QUERIES_PER_KV
         + head_offset
         + offs_q_m_qk % cfg.NUM_QUERIES_PER_KV
     )
-    # query_offset_qk = (
-    #     query_offset_0_qk[:, None] * query_stride_0
-    #     + query_offset_1_qk[:, None] * query_stride_1
-    # )
     query_mask_0_qk = query_pos_qk < cur_batch_query_len
     query_mask_1_qk = query_offset_1_qk < num_query_heads
     offs_seq_t = gl.arange(0, TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT))
@@ -343,10 +338,8 @@ def gluon_mla_extend_gfx1250(
     )
     acc = gl.zeros([BLOCK_M, KV_LORA_RANK], dtype=gl.float32, layout=cfg.PV_WMMA_LAYOUT)
 
-    # sequence len for this particular sequence
     seq_len = gl.load(seq_lens_ptr + seq_idx)
 
-    # context length for this particular sequences
     context_len = seq_len - cur_batch_query_len
 
     # compute the length of the longest sequence prefix spanned by any
@@ -367,13 +360,10 @@ def gluon_mla_extend_gfx1250(
     # this prefix can be skipped)
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
-    # ---- Sliding-window tile pruning --------------------
-    # Default: keep previous global behavior
     tile_start = 0
     tile_end = num_tiles
     seq_offset = offs_seq_t
 
-    # iterate through tiles (now limited to the sliding window range)
     for j in range(tile_start, tile_end):
         physical_block_idx = gl.load(block_tables_ptr_shifted + j).to(gl.int64)
 
@@ -439,7 +429,6 @@ def gluon_mla_extend_gfx1250(
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc = acc * gl.convert_layout(alpha[:, None], layout=cfg.PV_WMMA_LAYOUT)
 
-        # update constants
         L = L * alpha + l_j
         M = m_j
 
@@ -453,7 +442,6 @@ def gluon_mla_extend_gfx1250(
         acc = gl.amd.cdna5.wmma(P, KV_lora_trans, acc)
         seq_offset += TILE_SIZE
 
-    # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
     if kv_scale_ptr is not None:
         one_over_L = kv_scale / L[:, None]

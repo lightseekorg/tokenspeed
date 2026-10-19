@@ -86,29 +86,6 @@ class FusedTPProjectionKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
     ):
-        """Initializes the configuration for a Blackwell blockwise dense GEMM kernel.
-
-        This configuration includes several key aspects:
-
-        1.  MMA Instruction Settings (tcgen05):
-            - acc_dtype: Data types for MMA accumulator.
-            - mma_tiler_mn: The (M, N) shape of the MMA instruction tiler.
-            - use_2cta_instrs: Boolean indicating if the tcgen05 MMA variant
-              with cta_group=2 should be used.
-
-        2.  Cluster Shape:
-            - cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster.
-
-        :param acc_dtype: Data type of the accumulator.
-        :type acc_dtype: type[cutlass.Numeric]
-        :param mma_tiler_mn: Tuple (M, N) shape of the MMA instruction.
-        :type mma_tiler_mn: Tuple[int, int]
-        :param use_2cta_instrs: Boolean, True to use cta_group=2 MMA variant.
-        :type use_2cta_instrs: bool
-        :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
-        :type cluster_shape_mn: Tuple[int, int]
-        """
-
         if mma_tiler_mn != (128, 128) or cluster_shape_mn != (1, 1) or use_2cta_instrs:
             raise ValueError(
                 "Fused TP projection requires 128x128 tiles and one-CTA clusters"
@@ -125,7 +102,6 @@ class FusedTPProjectionKernel:
         )
 
         self.occupancy = 1
-        # Set specialized warp ids
         self.acc_update_warp_id = (0, 1, 2, 3)
         self.epilog_warp_id = (4, 5, 6, 7)
         self.mma_warp_id = 8
@@ -157,7 +133,6 @@ class FusedTPProjectionKernel:
         self.num_regs_epilogue_warps = 128
         self.num_regs_acc_update_warps = 256
 
-        # Set barrier for epilogue sync and tmem ptr sync
         self.epilog_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1,
             num_threads=32 * len(self.epilog_warp_id),
@@ -189,7 +164,6 @@ class FusedTPProjectionKernel:
         - Computing A/B/C shared memory layout
         - Computing tensor memory allocation columns
         """
-        # Configure tiled mma
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.a_dtype,
             self.b_dtype,
@@ -200,7 +174,6 @@ class FusedTPProjectionKernel:
             self.mma_tiler[:2],
         )
 
-        # Compute mma/cluster/tile shapes
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
         mma_inst_tile_k = 4
         self.mma_tiler = (
@@ -214,7 +187,6 @@ class FusedTPProjectionKernel:
             self.mma_tiler[2],
         )
 
-        # Compute cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)),
             (tiled_mma.thr_id.shape,),
@@ -234,13 +206,11 @@ class FusedTPProjectionKernel:
         if self.scale_n_per_tile != 1:
             raise ValueError("scale_n_per_tile must be 1")
 
-        # Compute number of multicast CTAs for A/B
         self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
         self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
-        # Compute epilogue subtile
         self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
             self.cta_tile_shape_mnk,
             self.use_2cta_instrs,
@@ -250,7 +220,6 @@ class FusedTPProjectionKernel:
 
         self.epi_tile = (128, 64)
 
-        # Setup A/B/C/Scale stage count in shared memory and ACC stage count in tensor memory
         (
             self.num_acc_stage,
             self.num_ab_stage,
@@ -273,7 +242,6 @@ class FusedTPProjectionKernel:
             self.occupancy,
         )
 
-        # Compute A/B/C/Scale shared memory layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
             self.mma_tiler,
@@ -317,7 +285,6 @@ class FusedTPProjectionKernel:
             ),
         )
 
-        # Compute the number of tensor memory allocation columns
         self.num_tmem_alloc_cols = 512
 
     @cute.jit
@@ -344,32 +311,7 @@ class FusedTPProjectionKernel:
         peer_input_flags: tuple,
         epilogue_op: cutlass.Constexpr,
     ):
-        """Execute the GEMM operation in steps:
-        - Setup static attributes before smem/grid/tma computation
-        - Setup TMA load/store atoms and tensors
-        - Compute grid size with regard to hardware constraints
-        - Define shared storage for kernel
-        - Launch the kernel synchronously
-
-        :param a: Input tensor A
-        :type a: cute.Tensor
-        :param b: Input tensor B
-        :type b: cute.Tensor
-        :param c: Output tensor C
-        :type c: cute.Tensor
-        :param sfa: Scale factor tensor A
-        :type sfa: cute.Tensor
-        :param sfb: Scale factor tensor B
-        :type sfb: cute.Tensor
-        :param max_active_clusters: Maximum number of active clusters
-        :type max_active_clusters: cutlass.Constexpr
-        :param stream: CUDA stream for asynchronous execution
-        :type stream: cuda.CUstream
-        :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
-        :type epilogue_op: cutlass.Constexpr
-        :raises TypeError: If input data types are incompatible with the MMA instruction.
-        """
-        # Setup static attributes before smem/grid/tma computation
+        """Set up TMA atoms, the grid and shared storage, then launch the kernel."""
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = b.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
@@ -383,11 +325,9 @@ class FusedTPProjectionKernel:
         ).mma_major_mode()
         self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
 
-        # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
             raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
 
-        # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
 
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -401,7 +341,6 @@ class FusedTPProjectionKernel:
         )
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
-        # Setup TMA load for A
         a_op = self._get_tma_atom_kind(atom_thr_size, self.is_a_mcast)
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
         tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
@@ -416,7 +355,6 @@ class FusedTPProjectionKernel:
             ),
         )
 
-        # Setup TMA load for B
         b_op = self._get_tma_atom_kind(atom_thr_size, self.is_b_mcast)
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
@@ -435,7 +373,6 @@ class FusedTPProjectionKernel:
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
 
-        # Setup TMA store for C
         tma_atom_c = None
         tma_tensor_c = None
         c_cta_v_layout = cute.composition(
@@ -499,7 +436,6 @@ class FusedTPProjectionKernel:
             ),
         )
 
-        # Compute grid size
         self.num_ctas = max_active_clusters
         self.tile_sched_params, grid = self._compute_grid(
             c, self.cta_tile_shape_mnk, self.cluster_shape_mn, max_active_clusters
@@ -509,7 +445,6 @@ class FusedTPProjectionKernel:
 
         c_smem_size = cute.cosize(self.c_smem_layout_staged.outer)
 
-        # Define shared storage for kernel
         @cute.struct
         class SharedStorage:
             # (bidx, bidy, bidz, valid)
@@ -568,7 +503,6 @@ class FusedTPProjectionKernel:
 
         self.shared_storage = SharedStorage
 
-        # Launch the kernel synchronously
         self.kernel(
             tiled_mma,
             tma_atom_a,
@@ -611,7 +545,6 @@ class FusedTPProjectionKernel:
         )
         return
 
-    # GPU device kernel
     @cute.kernel
     def kernel(
         self,
@@ -648,9 +581,6 @@ class FusedTPProjectionKernel:
         remote_atoms: tuple,
         remote_tensors: tuple,
     ):
-        """
-        GPU device kernel performing the Persistent batched GEMM computation.
-        """
         self.stage_input(
             input_source,
             peers[1].shape[0],
@@ -664,9 +594,6 @@ class FusedTPProjectionKernel:
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
         lane_idx = cute.arch.lane_idx()
 
-        #
-        # Prefetch tma desc
-        #
         if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
@@ -674,10 +601,6 @@ class FusedTPProjectionKernel:
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
-        #
-        # Setup cta/thread coordinates
-        #
-        # Coords inside cluster
         bidx, bidy, bidz = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
@@ -687,16 +610,11 @@ class FusedTPProjectionKernel:
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
             cta_rank_in_cluster
         )
-        # Coord inside cta
         tidx, _, _ = cute.arch.thread_idx()
 
-        #
-        # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
-        #
         smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        # Initialize mainloop ab_pipeline (barrier) and states
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Warp)
         ab_pipeline = pipeline.PipelineTmaUmma.create(
@@ -710,7 +628,6 @@ class FusedTPProjectionKernel:
             defer_sync=True,
         )
 
-        # Initialize mainloop scale_pipeline (barrier) and states
         scale_pipeline_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
             self.threads_per_warp * 1,
@@ -727,7 +644,6 @@ class FusedTPProjectionKernel:
             defer_sync=True,
         )
 
-        # Initialize acc_pipeline (barrier) and states
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_acc_consumer_threads = len(self.epilog_warp_id) * (
             2 if use_2cta_instrs else 1
@@ -744,7 +660,6 @@ class FusedTPProjectionKernel:
             defer_sync=True,
         )
 
-        # Initialize epilogue pipeline (barrier) and states
         epi_pipeline_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
             self.threads_per_warp * len(self.acc_update_warp_id),
@@ -761,7 +676,6 @@ class FusedTPProjectionKernel:
             defer_sync=True,
         )
 
-        # Initialize tile info pipeline (barrier) and states
         tile_info_pipeline_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
             self.threads_per_warp * 1,
@@ -778,7 +692,6 @@ class FusedTPProjectionKernel:
             defer_sync=True,
         )
 
-        # Tensor memory dealloc barrier init
         tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
@@ -787,12 +700,8 @@ class FusedTPProjectionKernel:
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
 
-        # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
-        #
-        # Setup smem tensor A/B/C/Scale
-        #
         # (EPI_TILE_M, EPI_TILE_N, STAGE)
         sC = storage.sC.get_tensor(
             c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner
@@ -813,9 +722,6 @@ class FusedTPProjectionKernel:
         info_layout = cute.make_layout((4, self.num_tile_stage), stride=(1, 4))
         sInfo = storage.sInfo.get_tensor(info_layout)
 
-        #
-        # Compute multicast mask for A/B buffer full
-        #
         a_full_mcast_mask = None
         b_full_mcast_mask = None
         if cutlass.const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
@@ -826,9 +732,6 @@ class FusedTPProjectionKernel:
                 cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
             )
 
-        #
-        # Local_tile partition global tensors
-        #
         # (bM, bK, loopM, loopK, loopL)
         gA_mkl = cute.local_tile(
             mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
@@ -853,7 +756,6 @@ class FusedTPProjectionKernel:
             cute.slice_(self.cta_tile_shape_mnk, (0, None, None)),
             (None, None, None),
         )
-        # coordinate
         cSFA_mkl = cute.make_identity_tensor(cute.shape(mSFA_mkl))
         cSFB_nkl = cute.make_identity_tensor(cute.shape(mSFB_nkl))
         # (bM, bK, loopM, loopK, loopL)
@@ -870,9 +772,6 @@ class FusedTPProjectionKernel:
         )
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
 
-        #
-        # Partition global tensor for TiledMMA_A/B/C
-        #
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
         # (MMA, MMA_M, MMA_K, loopM, loopK, loopL)
         tCgA = thr_mma.partition_A(gA_mkl)
@@ -901,10 +800,6 @@ class FusedTPProjectionKernel:
         sSFA_view_as_C = cute.make_tensor(sSFA.iterator, sSFA_view_as_C_layout)
         sSFB_view_as_C = cute.make_tensor(sSFB.iterator, sSFB_view_as_C_layout)
 
-        #
-        # Partition global/shared tensor for TMA load A/B
-        #
-        # TMA load A partition_S/D
         a_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
         )
@@ -917,7 +812,6 @@ class FusedTPProjectionKernel:
             cute.group_modes(sA, 0, 3),
             cute.group_modes(tCgA, 0, 3),
         )
-        # TMA load B partition_S/D
         b_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
         )
@@ -931,10 +825,6 @@ class FusedTPProjectionKernel:
             cute.group_modes(tCgB, 0, 3),
         )
 
-        #
-        # Partition global/shared tensor for TMA load A/B
-        #
-        # load scaleA/scaleB
         atom_copy = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(),
             mSFA_mkl.element_type,
@@ -959,9 +849,6 @@ class FusedTPProjectionKernel:
         tBsSFB = thr_copy_sfb.partition_D(sSFB)
         tBcSFB = thr_copy_sfb.partition_S(cSFB)
 
-        #
-        # Partition shared/tensor memory tensor for TiledMMA_A/B/C
-        #
         # (MMA, MMA_M, MMA_K, STAGE)
         tCrA = tiled_mma.make_fragment_A(sA)
         # (MMA, MMA_N, MMA_K, STAGE)
@@ -973,23 +860,13 @@ class FusedTPProjectionKernel:
             cute.append(acc_shape, self.num_acc_stage)
         )
 
-        #
-        # Cluster wait before tensor memory alloc
-        #
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
-        #
-        # Specialized Schedule warp
-        #
         if warp_idx == self.sched_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_sched_warps)
-            #
-            # Persistent tile scheduling loop
-            #
             tile_sched = utils.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
-            # First tile
             work_tile = tile_sched.initial_work_tile_info()
 
             tile_info_producer_state = pipeline.make_pipeline_state(
@@ -997,14 +874,11 @@ class FusedTPProjectionKernel:
             )
 
             while work_tile.is_valid_tile:
-                # query next tile
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
-                # acquire tile info pipeline
                 tile_info_pipeline.producer_acquire(tile_info_producer_state)
 
-                # store the tile info
                 cur_tile_coord = work_tile.tile_idx
                 with cute.arch.elect_one():
                     sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
@@ -1014,30 +888,21 @@ class FusedTPProjectionKernel:
                         work_tile.is_valid_tile
                     )
 
-                # fence view async shared
                 cute.arch.fence_proxy(
                     "async.shared",
                     space="cta",
                 )
                 self.sched_sync_barrier.arrive_and_wait()
-                # commit tile info pipeline
                 tile_info_pipeline.producer_commit(tile_info_producer_state)
                 tile_info_producer_state.advance()
 
             tile_info_pipeline.producer_tail(tile_info_producer_state)
 
-        #
-        # Specialized TMA load warp
-        #
         if warp_idx == self.tma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_uniform_warps)
-            #
-            # Persistent tile scheduling loop
-            #
             tile_sched = utils.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
-            # First tile
             work_tile = tile_sched.initial_work_tile_info()
 
             ab_producer_state = pipeline.make_pipeline_state(
@@ -1048,11 +913,8 @@ class FusedTPProjectionKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
 
-            # get the first tile info
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
-            # Get tile coord from tile scheduler
             cur_tile_coord = work_tile.tile_idx
-            # initialize the tile info
             tile_info[0] = cur_tile_coord[0]
             tile_info[1] = cur_tile_coord[1]
             tile_info[2] = cur_tile_coord[2]
@@ -1072,9 +934,6 @@ class FusedTPProjectionKernel:
                     tile_info[1],
                     tile_info[2],
                 )
-                #
-                # Slice to per mma tile index
-                #
                 # ((atom_v, rest_v), loopK)
                 tAgA_slice = tAgA[
                     (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
@@ -1091,9 +950,6 @@ class FusedTPProjectionKernel:
                     peek_ab_empty_status = ab_pipeline.producer_try_acquire(
                         ab_producer_state
                     )
-                #
-                # Tma load loop
-                #
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     tAgA_k = tAgA_slice[(None, ab_producer_state.count)]
                     tBgB_k = tBgB_slice[(None, ab_producer_state.count)]
@@ -1102,7 +958,6 @@ class FusedTPProjectionKernel:
 
                     tma_bar = ab_pipeline.producer_get_barrier(ab_producer_state)
 
-                    # Conditionally wait for AB buffer empty
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
                     )
@@ -1115,7 +970,6 @@ class FusedTPProjectionKernel:
                             ab_producer_state
                         )
 
-                    # TMA load A/B
                     cute.copy(
                         tma_atom_a,
                         tAgA_k,
@@ -1131,9 +985,6 @@ class FusedTPProjectionKernel:
                         mcast_mask=b_full_mcast_mask,
                     )
 
-                #
-                # Advance to next tile
-                #
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 for idx in cutlass.range(4, unroll_full=True):
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
@@ -1145,23 +996,13 @@ class FusedTPProjectionKernel:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
 
-            #
-            # Wait A/B buffer empty
-            #
             ab_pipeline.producer_tail(ab_producer_state)
 
-        #
-        # Specialized Scale load warp
-        #
         if warp_idx == self.scale_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_uniform_warps)
-            #
-            # Persistent tile scheduling loop
-            #
             tile_sched = utils.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
-            # First tile
             work_tile = tile_sched.initial_work_tile_info()
 
             scale_producer_state = pipeline.make_pipeline_state(
@@ -1172,11 +1013,8 @@ class FusedTPProjectionKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
 
-            # get the first tile info
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
-            # Get tile coord from tile scheduler
             cur_tile_coord = work_tile.tile_idx
-            # initialize the tile info
             tile_info[0] = cur_tile_coord[0]
             tile_info[1] = cur_tile_coord[1]
             tile_info[2] = cur_tile_coord[2]
@@ -1191,9 +1029,6 @@ class FusedTPProjectionKernel:
             )
 
             while is_valid_tile:
-                #
-                # Prepare the mask for scaleA/scaleB
-                #
                 tApSFA = cute.make_rmem_tensor(
                     cute.make_layout(
                         cute.filter_zeros(
@@ -1219,13 +1054,7 @@ class FusedTPProjectionKernel:
                         scale_producer_state
                     )
 
-                #
-                # load loop
-                #
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    #
-                    # Slice to per mma tile index
-                    #
                     tAsSFA_pipe = cute.filter_zeros(
                         tAsSFA[(None, None, None, scale_producer_state.index)]
                     )
@@ -1292,12 +1121,10 @@ class FusedTPProjectionKernel:
                             tBcSFB_compact[(i)][0], mSFB_nkl.shape[0]
                         )
 
-                    # Conditionally wait for Scale buffer empty
                     scale_pipeline.producer_acquire(
                         scale_producer_state, peek_scale_empty_status
                     )
 
-                    # load scaleA/scaleB
                     cute.copy(tiled_copy_sfa, tAgSFA_k, tAsSFA_pipe, pred=tApSFA)
                     cute.copy(tiled_copy_sfb, tBgSFB_k, tBsSFB_pipe, pred=tBpSFB)
 
@@ -1311,9 +1138,6 @@ class FusedTPProjectionKernel:
                             scale_producer_state
                         )
 
-                #
-                # Advance to next tile
-                #
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 for idx in cutlass.range(4, unroll_full=True):
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
@@ -1325,31 +1149,16 @@ class FusedTPProjectionKernel:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
 
-            #
-            # Wait Scale buffer empty
-            #
             scale_pipeline.producer_tail(scale_producer_state)
 
-        #
-        # Specialized MMA warp
-        #
         if warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_uniform_warps)
-            #
-            # Bar sync for retrieve tensor memory ptr from shared mem
-            #
             tmem.wait_for_alloc()
 
-            #
-            # Retrieving tensor memory ptr and make accumulator tensor
-            #
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             # (MMA, MMA_M, MMA_N, STAGE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
 
-            #
-            # Persistent tile scheduling loop
-            #
             tile_sched = utils.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
@@ -1366,11 +1175,8 @@ class FusedTPProjectionKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
 
-            # get the first tile info
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
-            # Get tile coord from tile scheduler
             cur_tile_coord = work_tile.tile_idx
-            # initialize the tile info
             tile_info[0] = cur_tile_coord[0]
             tile_info[1] = cur_tile_coord[1]
             tile_info[2] = cur_tile_coord[2]
@@ -1396,29 +1202,18 @@ class FusedTPProjectionKernel:
                         acc_producer_state
                     )
 
-                #
-                # Mma mainloop
-                #
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    # Set tensor memory buffer for current tile
                     # (MMA, MMA_M, MMA_N)
                     tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
 
-                    #
-                    # Wait for accumulator buffer empty
-                    #
                     if is_leader_cta:
                         acc_pipeline.producer_acquire(
                             acc_producer_state, peek_acc_empty_status
                         )
 
-                    #
-                    # Reset the ACCUMULATE field for each tile
-                    #
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
                     if is_leader_cta:
-                        # Conditionally wait for AB buffer full
                         ab_pipeline.consumer_wait(
                             ab_consumer_state, peek_ab_full_status
                         )
@@ -1429,7 +1224,6 @@ class FusedTPProjectionKernel:
                             tiled_mma, tCtAcc, tCrA[tile_crd], tCrB[tile_crd], tCtAcc
                         )
 
-                        # Async arrive AB buffer empty
                         ab_pipeline.consumer_release(ab_consumer_state)
 
                     # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
@@ -1441,9 +1235,6 @@ class FusedTPProjectionKernel:
                                 ab_consumer_state
                             )
 
-                    #
-                    # Async arrive accumulator buffer full(each kblock)
-                    #
                     if is_leader_cta:
                         acc_pipeline.producer_commit(acc_producer_state)
 
@@ -1455,9 +1246,6 @@ class FusedTPProjectionKernel:
                                 acc_producer_state
                             )
 
-                #
-                # Advance to next tile
-                #
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 for idx in cutlass.range(4, unroll_full=True):
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
@@ -1469,24 +1257,12 @@ class FusedTPProjectionKernel:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
 
-            #
-            # Wait for accumulator buffer empty
-            #
             acc_pipeline.producer_tail(acc_producer_state)
 
-        #
-        # Specialized acc update warps
-        #
         if warp_idx <= self.acc_update_warp_id[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_acc_update_warps)
-            #
-            # Bar sync for retrieve tensor memory ptr from shared memory
-            #
             tmem.wait_for_alloc()
 
-            #
-            # Retrieving tensor memory ptr and make accumulator tensor
-            #
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             # (MMA, MMA_M, MMA_N, STAGE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
@@ -1494,9 +1270,6 @@ class FusedTPProjectionKernel:
                 tCtAcc_base.iterator + self.tmem_final_offset, tCtAcc_base.layout
             )
 
-            #
-            # Partition for epilogue
-            #
             epi_tidx = tidx % 128
             (
                 tiled_copy_t2r,
@@ -1518,9 +1291,6 @@ class FusedTPProjectionKernel:
                 (128, 32),
             )
 
-            #
-            # Persistent tile scheduling loop
-            #
             tile_sched = utils.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
@@ -1542,11 +1312,8 @@ class FusedTPProjectionKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
 
-            # get the first tile info
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
-            # Get tile coord from tile scheduler
             cur_tile_coord = work_tile.tile_idx
-            # initialize the tile info
             tile_info[0] = cur_tile_coord[0]
             tile_info[1] = cur_tile_coord[1]
             tile_info[2] = cur_tile_coord[2]
@@ -1556,7 +1323,6 @@ class FusedTPProjectionKernel:
             is_valid_tile = tile_info[3] == 1
 
             while is_valid_tile:
-                # initialize the final accumulator
                 tTR_rAcc_final.fill(0.0)
 
                 tTR_rSFA = cute.make_rmem_tensor(
@@ -1583,15 +1349,11 @@ class FusedTPProjectionKernel:
                     )
 
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    # Set tensor memory buffer for current tile
                     # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
                     tTR_tAcc = tTR_tAcc_base[
                         (None, None, None, None, None, acc_consumer_state.index)
                     ]
 
-                    #
-                    # Wait for scale buffer full
-                    #
                     scale_pipeline.consumer_wait(
                         scale_consumer_state, peek_scale_full_status
                     )
@@ -1615,17 +1377,10 @@ class FusedTPProjectionKernel:
                     cute.copy(scale_atom_copy, tTR_sSFB_slice, tTR_rSFB)
                     scale_pipeline.consumer_release(scale_consumer_state)
 
-                    #
-                    # Wait for accumulator buffer full
-                    #
-
                     acc_pipeline.consumer_wait(acc_consumer_state, peek_acc_full_status)
 
                     tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
 
-                    #
-                    # Update accumulator by scale factor in subtiles
-                    #
                     subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                     # Static 32-column subtiles reduce live temporaries while
                     # retaining all 128 final accumulator values per thread.
@@ -1640,9 +1395,6 @@ class FusedTPProjectionKernel:
                             with cute.arch.elect_one():
                                 acc_pipeline.consumer_release(acc_consumer_state)
 
-                        #
-                        # Update accumulator by scale factor
-                        #
                         tTR_rAcc_subtile = tTR_rAcc_final[
                             (None, None, None, subtile_idx)
                         ]
@@ -1657,9 +1409,6 @@ class FusedTPProjectionKernel:
                         final_vec = acc_vec * scale + final_vec
                         tTR_rAcc_subtile.store(final_vec.to(self.acc_dtype))
 
-                    #
-                    # Async arrive accumulator buffer empty
-                    #
                     scale_consumer_state.advance()
 
                     peek_scale_full_status = cutlass.Boolean(1)
@@ -1667,9 +1416,6 @@ class FusedTPProjectionKernel:
                         peek_scale_full_status = scale_pipeline.consumer_try_wait(
                             scale_consumer_state
                         )
-                    #
-                    # Async arrive accumulator buffer empty
-                    #
                     acc_consumer_state.advance()
 
                     peek_acc_full_status = cutlass.Boolean(1)
@@ -1681,24 +1427,14 @@ class FusedTPProjectionKernel:
                 tRT_tAcc = tRT_tAcc_base[(None, None, None, None, None, 0)]
                 tRT_tAcc = cute.group_modes(tRT_tAcc, 3, cute.rank(tRT_tAcc))
 
-                #
-                # Wait for epilogue buffer empty
-                #
                 epi_pipeline.producer_acquire(epi_producer_state)
 
-                # copy the accumulator to tensor memory buffer
                 cute.copy(tiled_copy_r2t, tTR_rAcc_final, tRT_tAcc)
                 cute.arch.fence_view_async_tmem_store()
 
-                #
-                # Async arrive epilogue buffer full
-                #
                 epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
 
-                #
-                # Advance to next tile
-                #
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 for idx in cutlass.range(4, unroll_full=True):
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
@@ -1710,24 +1446,12 @@ class FusedTPProjectionKernel:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
 
-        #
-        # Specialized epilogue warps
-        #
         if warp_idx <= self.epilog_warp_id[-1] and warp_idx >= self.epilog_warp_id[0]:
             cute.arch.setmaxregister_decrease(self.num_regs_epilogue_warps)
-            #
-            # Alloc tensor memory buffer
-            #
             tmem.allocate(self.num_tmem_alloc_cols)
 
-            #
-            # Bar sync for retrieve tensor memory ptr from shared memory
-            #
             tmem.wait_for_alloc()
 
-            #
-            # Retrieving tensor memory ptr and make accumulator tensor
-            #
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             # (MMA, MMA_M, MMA_N, STAGE)
             tCtAcc_base_ = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
@@ -1735,9 +1459,6 @@ class FusedTPProjectionKernel:
                 tCtAcc_base_.iterator + self.tmem_final_offset, tCtAcc_base_.layout
             )
 
-            #
-            # Partition for epilogue
-            #
             epi_tidx = tidx % 128
             (
                 tiled_copy_t2r,
@@ -1781,9 +1502,6 @@ class FusedTPProjectionKernel:
                 )
                 remote_partitions = (*remote_partitions, remote_partition)
 
-            #
-            # Persistent tile scheduling loop
-            #
             tile_sched = utils.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
@@ -1794,7 +1512,6 @@ class FusedTPProjectionKernel:
             )
 
             c_pipeline = None
-            # Threads/warps participating in tma store pipeline
             c_producer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
                 32 * len(self.epilog_warp_id),
@@ -1808,11 +1525,8 @@ class FusedTPProjectionKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
 
-            # get the first tile info
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
-            # Get tile coord from tile scheduler
             cur_tile_coord = work_tile.tile_idx
-            # initialize the tile info
             tile_info[0] = cur_tile_coord[0]
             tile_info[1] = cur_tile_coord[1]
             tile_info[2] = cur_tile_coord[2]
@@ -1829,9 +1543,6 @@ class FusedTPProjectionKernel:
                     tile_info[1],
                     tile_info[2],
                 )
-                #
-                # Slice to per mma tile index
-                #
                 bSG_gC = None
                 # ((ATOM_V, REST_V), EPI_M, EPI_N)
                 bSG_gC = bSG_gC_partitioned[
@@ -1845,28 +1556,18 @@ class FusedTPProjectionKernel:
                     )
                 ]
 
-                # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
                 tTR_tAcc = tTR_tAcc_base[
                     (None, None, None, None, None, epi_consumer_state.index)
                 ]
 
-                #
-                # Wait for accumulator buffer full
-                #
                 epi_pipeline.consumer_wait(epi_consumer_state)
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
 
-                #
-                # Store accumulator to global memory in subtiles
-                #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 for subtile_idx in cutlass.range(subtile_cnt):
-                    #
-                    # Load accumulator from tensor memory buffer to register
-                    #
                     tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
                     # Return the TMEM stage immediately after its last read.
@@ -1874,16 +1575,10 @@ class FusedTPProjectionKernel:
                         cute.arch.fence_view_async_tmem_load()
                         epi_pipeline.consumer_release(epi_consumer_state)
 
-                    #
-                    # Convert to C type
-                    #
                     acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                     acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
                     tRS_rC.store(acc_vec)
 
-                    #
-                    # Store C to shared memory
-                    #
                     num_prev_subtiles = num_prev_subtiles + 1
                     c_buffer = num_prev_subtiles % self.num_c_stage
                     cute.copy(
@@ -1891,16 +1586,13 @@ class FusedTPProjectionKernel:
                         tRS_rC,
                         tRS_sC[(None, None, None, c_buffer)],
                     )
-                    # Fence and barrier to make sure shared memory store is visible to TMA store
+                    # Make the shared-memory store visible to the TMA store.
                     cute.arch.fence_proxy(
                         "async.shared",
                         space="cta",
                     )
                     self.epilog_sync_barrier.arrive_and_wait()
 
-                    #
-                    # TMA store C to global memory
-                    #
                     if warp_idx == self.epilog_warp_id[0]:
                         owner_rows = peers[1].shape[0]
                         owners_per_tile = max(1, 128 // owner_rows)
@@ -1926,19 +1618,12 @@ class FusedTPProjectionKernel:
                                         remote_shared[(None, owner_slice, 0, c_buffer)],
                                         remote_dest,
                                     )
-                        # Fence and barrier to make sure shared memory store is visible to TMA store
                         c_pipeline.producer_commit()
                         c_pipeline.producer_acquire()
                     self.epilog_sync_barrier.arrive_and_wait()
 
-                #
-                # Async arrive accumulator buffer empty
-                #
                 epi_consumer_state.advance()
 
-                #
-                # Advance to next tile
-                #
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 for idx in cutlass.range(4, unroll_full=True):
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
@@ -1950,15 +1635,9 @@ class FusedTPProjectionKernel:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
 
-            #
-            # Dealloc the tensor memory buffer
-            #
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
-            #
-            # Wait for C store complete
-            #
             c_pipeline.producer_tail()
             if warp_idx == self.epilog_warp_id[0]:
                 cute.arch.cp_async_bulk_wait_group(0, read=False)
@@ -2316,39 +1995,7 @@ class FusedTPProjectionKernel:
         cute.Tensor,
         cute.Tensor,
     ]:
-        """
-        Make tiledCopy for tensor memory load, then use it to partition tensor memory (source) and register array (destination).
-        Make tiledCopy for tensor memory store, then use it to partition register array (source) and tensor memory (destination).
-        Partition the scale factor tensor for related copy operations.
-
-        :param tidx: The thread index in epilogue warp groups
-        :type tidx: cutlass.Int32
-        :param tAcc: The accumulator tensor to be copied and partitioned
-        :type tAcc: cute.Tensor
-        :param tAcc_final: The final accumulator tensor to be copied and partitioned
-        :type tAcc_final: cute.Tensor
-        :param gC_mnl: The global tensor C
-        :type gC_mnl: cute.Tensor
-        :param sSFA: The scale factor tensor for A
-        :type sSFA: cute.Tensor
-        :param sSFB: The scale factor tensor for B
-        :type sSFB: cute.Tensor
-        :param epi_tile: The epilogue tiler
-        :type epi_tile: cute.Tile
-
-        :return: A tuple containing (tiled_copy_t2r, tTR_tAcc, tTR_rAcc) where:
-            - tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
-            - tiled_copy_r2t: The tiled copy operation for register to tmem copy(r2t)
-            - tTR_tAcc: The partitioned accumulator tensor
-            - tTR_rAcc: The accumulated tensor in register used to hold t2r results
-            - tTR_rAcc_final: The accumulated tensor in register used to hold all t2r results
-            - tTR_sSFA: The partitioned tensor SFA by tiled_copy_t2r
-            - tTR_sSFB: The partitioned tensor SFB by tiled_copy_t2r
-            - tRT_rAcc_final: The accumulated tensor in register used to hold all r2t results
-            - tRT_tAcc_final: The partitioned accumulator tensor by tiled_copy_r2t
-        :rtype: Tuple[cute.TiledCopy, cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor]
-        """
-        # Make tiledCopy for tensor memory load
+        """Partition TMEM, registers and scales for the accumulator update."""
         tmem_load_atom = None
         tmem_store_atom = None
         if cutlass.const_expr(self.mma_tiler[0] == 64):
@@ -2441,27 +2088,7 @@ class FusedTPProjectionKernel:
         epi_tile: cute.Tile,
         use_2cta_instrs: Union[cutlass.Boolean, bool],
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
-        """
-        Make tiledCopy for tensor memory load, then use it to partition tensor memory (source) and register array (destination).
-
-        :param tidx: The thread index in epilogue warp groups
-        :type tidx: cutlass.Int32
-        :param tAcc: The accumulator tensor to be copied and partitioned
-        :type tAcc: cute.Tensor
-        :param gC_mnl: The global tensor C
-        :type gC_mnl: cute.Tensor
-        :param epi_tile: The epilogue tiler
-        :type epi_tile: cute.Tile
-        :param use_2cta_instrs: Whether use_2cta_instrs is enabled
-        :type use_2cta_instrs: bool
-
-        :return: A tuple containing (tiled_copy_t2r, tTR_tAcc, tTR_rAcc) where:
-            - tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
-            - tTR_tAcc: The partitioned accumulator tensor
-            - tTR_rAcc: The accumulated tensor in register used to hold t2r results
-        :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
-        """
-        # Make tiledCopy for tensor memory load
+        """Make the TMEM-to-register copy and partition the accumulator for it."""
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
             self.cta_tile_shape_mnk,
             self.c_layout,
@@ -2505,25 +2132,7 @@ class FusedTPProjectionKernel:
         tidx: cutlass.Int32,
         sC: cute.Tensor,
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
-        """
-        Make tiledCopy for shared memory store, then use it to partition register array (source) and shared memory (destination).
-
-        :param tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
-        :type tiled_copy_t2r: cute.TiledCopy
-        :param tTR_rC: The partitioned accumulator tensor
-        :type tTR_rC: cute.Tensor
-        :param tidx: The thread index in epilogue warp groups
-        :type tidx: cutlass.Int32
-        :param sC: The shared memory tensor to be copied and partitioned
-        :type sC: cute.Tensor
-        :type sepi: cute.Tensor
-
-        :return: A tuple containing (tiled_copy_r2s, tRS_rC, tRS_sC) where:
-            - tiled_copy_r2s: The tiled copy operation for register to smem copy(r2s)
-            - tRS_rC: The partitioned tensor C (register source)
-            - tRS_sC: The partitioned tensor C (smem destination)
-        :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
-        """
+        """Make the register-to-shared-memory copy and partition C for it."""
         copy_atom_r2s = sm100_utils.get_smem_store_op(
             self.c_layout, self.c_dtype, self.acc_dtype, tiled_copy_t2r
         )
@@ -2543,28 +2152,7 @@ class FusedTPProjectionKernel:
         epi_tile: cute.Tile,
         sC: cute.Tensor,
     ) -> Tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]:
-        """Make tiledCopy for global memory store, then use it to:
-        - partition register array (source) and global memory (destination) for none TMA store version;
-        - partition shared memory (source) and global memory (destination) for TMA store version.
-
-        :param tidx: The thread index in epilogue warp groups
-        :type tidx: cutlass.Int32
-        :param atom: The copy_atom_c to be used for TMA store version, or tiled_copy_t2r for none TMA store version
-        :type atom: cute.CopyAtom or cute.TiledCopy
-        :param gC_mnl: The global tensor C
-        :type gC_mnl: cute.Tensor
-        :param epi_tile: The epilogue tiler
-        :type epi_tile: cute.Tile
-        :param sC: The shared memory tensor to be copied and partitioned
-        :type sC: cute.Tensor
-
-        :return: A tuple containing :
-            - For TMA store: (tma_atom_c, bSG_sC, bSG_gC) where:
-                - tma_atom_c: The TMA copy atom
-                - bSG_sC: The partitioned shared memory tensor C
-                - bSG_gC: The partitioned global tensor C
-        :rtype: Tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]
-        """
+        """Partition shared memory (source) and global memory (destination) for TMA."""
         # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, loopM, loopN, loopL)
         gC_epi = cute.flat_divide(
             gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile
@@ -2599,44 +2187,15 @@ class FusedTPProjectionKernel:
         num_smem_capacity: int,
         occupancy: int,
     ) -> Tuple[int, int, int]:
-        """Computes the number of stages for A/B/C operands based on heuristics.
-
-        :param tiled_mma: The tiled MMA object defining the core computation.
-        :type tiled_mma: cute.TiledMma
-        :param mma_tiler_mnk: The shape (M, N, K) of the MMA tiler.
-        :type mma_tiler_mnk: tuple[int, int, int]
-        :param a_dtype: Data type of operand A.
-        :type a_dtype: type[cutlass.Numeric]
-        :param b_dtype: Data type of operand B.
-        :type b_dtype: type[cutlass.Numeric]
-        :param epi_tile: The epilogue tile shape.
-        :type epi_tile: cute.Tile
-        :param c_dtype: Data type of operand C (output).
-        :type c_dtype: type[cutlass.Numeric]
-        :param c_layout: Layout of operand C.
-        :type c_layout: cutlass.tensor_utils.LayoutEnum
-        :param num_smem_capacity: Total available shared memory capacity in bytes.
-        :type num_smem_capacity: int
-        :param occupancy: Target number of CTAs per SM (occupancy).
-        :type occupancy: int
-
-        :return: A tuple containing the computed number of stages for:
-                 (ACC stages, A/B operand stages, C stages)
-        :rtype: tuple[int, int, int]
-        """
-        # Default ACC stages
+        """Compute the (ACC, A/B, C, scale, tile info) stage counts."""
         num_acc_stage = 3 if mma_tiler_mnk[0] / tiled_mma.thr_id.shape == 128 else 6
 
-        # Default C stages
         num_c_stage = 2
 
-        # Default ScaleA/B stages
         num_scale_stage = 2
 
-        # Default Tile info stages
         num_tile_stage = 2
 
-        # Calculate smem layout and size for one stage of A, B, and C
         a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
             tiled_mma,
             mma_tiler_mnk,
@@ -2693,22 +2252,7 @@ class FusedTPProjectionKernel:
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
-        """Use persistent tile scheduler to compute the grid size for the output tensor C.
-
-        :param c: The output tensor C
-        :type c: cute.Tensor
-        :param cta_tile_shape_mnk: The shape (M, N, K) of the CTA tile.
-        :type cta_tile_shape_mnk: tuple[int, int, int]
-        :param cluster_shape_mn: Shape of each cluster in M, N dimensions.
-        :type cluster_shape_mn: tuple[int, int]
-        :param max_active_clusters: Maximum number of active clusters.
-        :type max_active_clusters: cutlass.Constexpr
-
-        :return: A tuple containing:
-            - tile_sched_params: Parameters for the persistent tile scheduler.
-            - grid: Grid shape for kernel launch.
-        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
-        """
+        """Use the persistent tile scheduler to compute the grid for C."""
         c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
@@ -2729,19 +2273,7 @@ class FusedTPProjectionKernel:
     ) -> Union[
         cpasync.CopyBulkTensorTileG2SMulticastOp, cpasync.CopyBulkTensorTileG2SOp
     ]:
-        """
-        Select the appropriate TMA copy atom based on the number of SMs and the multicast flag.
-
-        :param atom_sm_cnt: The number of SMs
-        :type atom_sm_cnt: cutlass.Int32
-        :param mcast: The multicast flag
-        :type mcast: cutlass.Boolean
-
-        :return: The appropriate TMA copy atom kind
-        :rtype: cpasync.CopyBulkTensorTileG2SMulticastOp or cpasync.CopyBulkTensorTileG2SOp
-
-        :raise ValueError: If the atom_sm_cnt is invalid
-        """
+        """Select the TMA copy atom for the SM count and multicast flag."""
         if atom_sm_cnt == 2 and mcast:
             return cpasync.CopyBulkTensorTileG2SMulticastOp(tcgen05.CtaGroup.TWO)
         elif atom_sm_cnt == 2 and not mcast:

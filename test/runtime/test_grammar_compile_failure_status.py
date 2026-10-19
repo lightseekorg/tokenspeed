@@ -23,8 +23,7 @@
 A request whose json_schema, regex, ebnf or structural_tag fails to compile
 is aborted with HTTP 400, whether the failure is cached or arrives with the
 compile future, and so is a key whose compile kept timing out until it was
-given up. A timeout that a later request may still compile keeps no status,
-as before.
+given up. A timeout that a later request may still compile keeps no status.
 
 Pure CPU; no model, tokenizer, or GPU required.
 """

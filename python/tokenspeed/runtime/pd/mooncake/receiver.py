@@ -56,7 +56,6 @@ from tokenspeed.runtime.pd.mooncake.decode import (
 def _get_prefill_parallel_info_from_server(
     bootstrap_addr,
 ) -> PrefillParallelInfo | None:
-    """Fetch the prefill parallel info from the bootstrap server."""
     try:
         url = f"http://{bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}"
         response = requests.get(url)
@@ -90,9 +89,11 @@ def _get_prefill_parallel_info_from_server(
 
 
 def _get_bootstrap_info_from_server(bootstrap_addr, engine_rank, target_dp_group):
-    """Fetch the bootstrap info from the bootstrap server."""
     try:
-        url = f"http://{bootstrap_addr}/route?engine_rank={engine_rank}&target_dp_group={target_dp_group}"
+        url = (
+            f"http://{bootstrap_addr}/route?engine_rank={engine_rank}"
+            f"&target_dp_group={target_dp_group}"
+        )
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
             bootstrap_info = response.json()
@@ -168,7 +169,8 @@ class MooncakeKVReceiver:
         if prefill_parallel_info is None:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
-                f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
+                "Could not fetch prefill parallel info from bootstrap_addr: "
+                f"{self.bootstrap_addr}",
             )
             self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.Failed)
             return
@@ -186,14 +188,17 @@ class MooncakeKVReceiver:
             if not bootstrap_infos:
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
-                    f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {target_dp_group}",
+                    "Could not fetch bootstrap info for engine rank: "
+                    f"{self.kv_mgr.kv_args.engine_rank} and target_dp_group: "
+                    f"{target_dp_group}",
                 )
                 self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.Failed)
                 return
             else:
                 self.bootstrap_infos = bootstrap_infos
                 self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
-                # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
+                # Register kv_args only once to prefill KVManager according to
+                # the info fetched from the bootstrap server.
                 self._register_kv_args()
         else:
             self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
@@ -228,21 +233,19 @@ class MooncakeKVReceiver:
 
     def _get_bootstrap_infos(self, target_dp_group, route_plan: ReceiverRoutePlan):
         bootstrap_infos = []
-        for _target_tp_rank in route_plan.target_tp_ranks:
+        for target_tp_rank in route_plan.target_tp_ranks:
             bootstrap_info = _get_bootstrap_info_from_server(
                 self.bootstrap_addr,
-                _target_tp_rank,
+                target_tp_rank,
                 target_dp_group,
             )
             if bootstrap_info is not None:
                 # Control-only rendezvous ranks participate in Prefill TP
                 # status collectives but do not receive cache data.
-                bootstrap_info["is_dummy"] = route_plan.is_dummy_tp_rank(
-                    _target_tp_rank
-                )
+                bootstrap_info["is_dummy"] = route_plan.is_dummy_tp_rank(target_tp_rank)
                 logger.debug(
                     f"Fetched bootstrap info: {bootstrap_info!s} for DP "
-                    f"{target_dp_group!s} TP {_target_tp_rank!s}",
+                    f"{target_dp_group!s} TP {target_tp_rank!s}",
                 )
                 bootstrap_infos.append(bootstrap_info)
             else:
@@ -326,15 +329,19 @@ class MooncakeKVReceiver:
                     elapsed = now - self.init_time
                     if elapsed >= self.kv_mgr.waiting_timeout:
                         logger.warning_once(
-                            "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
-                            "If a greater mean TTFT is acceptable, you can 'export TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
+                            "Some requests fail to receive KV Cache transfer done "
+                            "signal after bootstrapping. If a greater mean TTFT is "
+                            "acceptable, you can "
+                            "'export TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT=600' "
+                            "(10 minutes) to relax the timeout condition. "
                         )
                         self.kv_mgr.kv_transfer_metrics.record_kv_transfer_timeout(
                             "waiting_for_input"
                         )
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,
-                            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in TransferPoll.WaitingForInput",
+                            f"Request {self.bootstrap_room} timed out after "
+                            f"{elapsed:.1f}s in TransferPoll.WaitingForInput",
                         )
                         self.conclude_state = TransferPoll.Failed
                         return TransferPoll.Failed
@@ -365,7 +372,8 @@ class MooncakeKVReceiver:
             )
 
     def failure_exception(self):
-        # Explicitly set the status to failure since this request has failed in another rank
+        # Explicitly set the status to failure since this request has failed in
+        # another rank
         if self.conclude_state is None:
             self.conclude_state = TransferPoll.Failed
 

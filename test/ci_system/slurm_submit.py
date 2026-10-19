@@ -334,11 +334,13 @@ def snapshot(repo: Path, artifact_root: Path, commit: str) -> Path:
         try:
             # Never replace an inode that another NFS client may be reading.
             os.link(temporary, target)
-        except FileExistsError:
+        except FileExistsError as exc:
             if not stat.S_ISREG(target.lstat().st_mode) or not filecmp.cmp(
                 temporary, target, shallow=False
             ):
-                raise ValueError(f"Existing snapshot does not match {commit}: {target}")
+                raise ValueError(
+                    f"Existing snapshot does not match {commit}: {target}"
+                ) from exc
     finally:
         temporary.unlink(missing_ok=True)
     return target
@@ -1228,11 +1230,14 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
                 head=git(repo, "rev-parse", "HEAD^2"),
                 base=git(repo, "rev-parse", "HEAD^1"),
             )
-        report_dir.joinpath("source.json").write_text(json.dumps(provenance))
+        report_dir.joinpath("source.json").write_text(
+            json.dumps(provenance), encoding="utf-8"
+        )
     if args.require_idle and not capacity_available(tasks, args):
         if report_dir:
             report_dir.joinpath("availability.json").write_text(
-                json.dumps({"source_sha": commit, "availability": "unavailable"})
+                json.dumps({"source_sha": commit, "availability": "unavailable"}),
+                encoding="utf-8",
             )
         return 0
     print_target(repo, source_pr, commit)

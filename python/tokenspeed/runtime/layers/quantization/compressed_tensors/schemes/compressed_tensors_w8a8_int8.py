@@ -46,6 +46,7 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
         weight_loader,
         **kwargs,
     ):
+        del params_dtype, kwargs
         layer.register_parameter(
             "weight",
             ModelWeightParameter(

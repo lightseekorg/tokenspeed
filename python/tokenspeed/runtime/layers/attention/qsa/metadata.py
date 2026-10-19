@@ -89,7 +89,11 @@ def qsa_forward_layout(
     compress_ratio: int,
     reset_draft_tags: torch.Tensor | None,
 ) -> QSALayout:
-    """Build or reuse the QSA row layout shared by every local QSA layer."""
+    """Build or reuse the QSA row layout shared by every local QSA layer.
+
+    The layout is memoized on the backend's sparse top-k state for the rest of
+    the forward.
+    """
 
     cached = ctx.attn_backend.sparse_topk.qsa_metadata
     if cached is not None:

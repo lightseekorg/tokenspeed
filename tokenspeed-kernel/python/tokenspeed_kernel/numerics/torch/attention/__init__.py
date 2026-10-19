@@ -18,4 +18,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""PyTorch references for ``tokenspeed_kernel.ops.attention``, one module per variant."""
+"""PyTorch references for ``tokenspeed_kernel.ops.attention``, one per variant."""

@@ -157,11 +157,6 @@ def _assert_fresh(result, inputs) -> None:
         assert tensor.untyped_storage().data_ptr() not in input_ptrs
 
 
-# ---------------------------------------------------------------------------------------
-# The residual boundary: the corpus
-# ---------------------------------------------------------------------------------------
-
-
 def random_inputs(rows: int, seed: int) -> dict[str, torch.Tensor]:
     """``randn * 4`` BF16 ``rows`` x 5120 with a ``1e-3`` and a ``1e3`` row, a
     ``rand + 0.5`` weight, on the device."""
@@ -298,11 +293,6 @@ def _statements(inputs, scales=(None, None)):
     return out, combined
 
 
-# ---------------------------------------------------------------------------------------
-# The residual boundary: tests
-# ---------------------------------------------------------------------------------------
-
-
 def test_residual_fused_equals_the_statements():
     """Without the depth-scale pair on random rows of decode, odd and prefill counts
     and the edge and tie corpora; with it on all 104 pairs at 8 rows, a 1024-row
@@ -343,11 +333,6 @@ def test_residual_fused_equals_the_statements():
             failures.append((name, mismatches))
         _assert_untouched(inputs, saved)
     assert failures == []
-
-
-# ---------------------------------------------------------------------------------------
-# layernorm.qk_rmsnorm_ssmax
-# ---------------------------------------------------------------------------------------
 
 
 def edge_rows() -> torch.Tensor:

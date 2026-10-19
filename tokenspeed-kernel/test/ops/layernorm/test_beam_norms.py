@@ -84,11 +84,6 @@ def platforms(b200_platform, b300_platform, h100_platform, mi350_platform):
     )
 
 
-# ---------------------------------------------------------------------------------------
-# layernorm.qk_rmsnorm_ssmax
-# ---------------------------------------------------------------------------------------
-
-
 def _qk(tokens=8, heads=(6, 1), head_dim=128, eps=EPS, change=None):
     """Beam's ``qkv.split`` views and ``[head_dim]`` weights, with one ``change``."""
     q_size, kv_size = heads[0] * head_dim, heads[1] * head_dim

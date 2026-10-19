@@ -238,7 +238,7 @@ def _autotune_block(
     del ragged
     is_fp8 = x_format == "e4m3"
     if slice_size is not None and slice_size <= 16:
-        # tinny ragged decode
+        # tiny ragged decode
         bm, bn, bk, nw = 64, 128, 256, 4
     elif slice_size is not None and slice_size <= 64 and M <= 8192:
         # mid ragged decode

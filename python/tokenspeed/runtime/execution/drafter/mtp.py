@@ -179,7 +179,7 @@ def _frontier_shifted_ids(
     Returns:
         [bs * k] input ids.
     """
-    bs, k = v.shape
+    _, k = v.shape
     col = torch.arange(k, dtype=torch.int64, device=v.device).view(1, k)
     src = accept.unsqueeze(-1) - k + col
     ids = torch.gather(v, 1, src.clamp_min(0))
@@ -442,10 +442,6 @@ class Mtp(BaseDrafter):
         # behind the last k-1 committed ids); recomputing it needs an extend.
         return [self._stash_tokens_buf[slot], self._stash_hidden_buf[slot]]
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     @nvtx_range("run_decode_depths", color="purple")
     def _run_decode_depths(
         self,
@@ -573,7 +569,7 @@ class Mtp(BaseDrafter):
                 draft_input.base_out_hidden_states, lengths, hidden[slot], width
             )
             return
-        offs, _rows = _tail_row_offsets(lengths, width)
+        offs, _ = _tail_row_offsets(lengths, width)
         contribution = _sharded_tail_contribution(
             draft_input.base_out_hidden_states, lengths, width, plan
         )
@@ -685,10 +681,6 @@ class Mtp(BaseDrafter):
 
             with nvtx_range("draft_sample", color="yellow"):
                 next_tokens[:, d + 1] = self.sample_draft_step(logits_output, step=d)
-
-    # ------------------------------------------------------------------
-    # Public entry point (type-based dispatch from ModelExecutor)
-    # ------------------------------------------------------------------
 
     @override
     def draft(

@@ -19,7 +19,7 @@ def main() -> None:
         for path in root.rglob("*"):
             if path.suffix not in {".h", ".cpp"}:
                 continue
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
             if any(symbol in text for symbol in FORBIDDEN_SYMBOLS):
                 failures.append(str(path.relative_to(ROOT)))
 

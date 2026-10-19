@@ -77,7 +77,6 @@ from bench_sm107_pr6177 import prepare_tokenspeed, unsupported_reason  # noqa: E
 
 BACKENDS = {"v1": "tokenspeed-m128", "v2": "tokenspeed-sm107"}
 HEADS = 96
-# (batch, kv_len, q_len) of k3-problem.txt.
 K3_CASES = [
     Case(batch, kv_k * 1024, HEADS, q_len)
     for batch, kv_k, q_len in (
@@ -167,7 +166,10 @@ def main():
     if capability not in ((10, 0), (10, 3), (10, 7)):
         parser.error("This benchmark requires SM100, SM103 or SM107")
     props = torch.cuda.get_device_properties(0)
-    gpu = f"{props.name} (sm_{capability[0]}{capability[1]}, {props.multi_processor_count} SMs)"
+    gpu = (
+        f"{props.name} (sm_{capability[0]}{capability[1]}, "
+        f"{props.multi_processor_count} SMs)"
+    )
     settings = Settings(
         dtype="fp8-out",
         cache=args.cache,
@@ -203,7 +205,11 @@ def main():
         records.append(dict(case=asdict(case), results=results))
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(
-            f"{json.dumps(dict(gpu=gpu, settings=asdict(settings), records=records), indent=2)}\n"
+            json.dumps(
+                dict(gpu=gpu, settings=asdict(settings), records=records), indent=2
+            )
+            + "\n",
+            encoding="utf-8",
         )
 
 

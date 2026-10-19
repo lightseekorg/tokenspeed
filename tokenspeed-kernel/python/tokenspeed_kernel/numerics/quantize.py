@@ -31,14 +31,10 @@ from tokenspeed_kernel.numerics.inputs import (
 )
 from tokenspeed_kernel.numerics.tolerance import Tolerance, set_family_tolerance
 
-# ---------------------------------------------------------------------------
-# Tolerance
-# ---------------------------------------------------------------------------
-#
 # Quantize kernels under test return ``qweight.float()`` — the fp8 values cast
 # to fp32. Two correct implementations following the same round-to-nearest-even
 # rule on the same group statistics produce *bit-identical* fp8 values, so the
-# tolerance only needs to absorb a single fp8 ulp (~ 1/16 at magnitude 1) for
+# tolerance only needs to absorb a single fp8 ulp (~ 1/8 at magnitude 1) for
 # values near the quantization boundary, where different scale-rounding paths
 # could land one ulp apart.
 
@@ -57,10 +53,6 @@ def tolerance(
 
 set_family_tolerance("quantize", tolerance)
 
-# ---------------------------------------------------------------------------
-# Input Generator
-# ---------------------------------------------------------------------------
-
 
 class QuantizeInputGenerator(InputGenerator):
     """Generates a 2D activation tensor [M, K] for fp8 quantize kernels."""
@@ -76,10 +68,6 @@ set_input_generator("quantize", "fp8_token_group_128", QuantizeInputGenerator)
 set_input_generator("quantize", "fp8_token", QuantizeInputGenerator)
 set_input_generator("quantize", "fp8_tensor", QuantizeInputGenerator)
 
-# ---------------------------------------------------------------------------
-# Shape Presets
-# ---------------------------------------------------------------------------
-#
 # K must be divisible by the group size (128). Cover (a) prefill batches, (b)
 # decode (M = 1), and (c) DSv3 hidden / fused-A widths.
 

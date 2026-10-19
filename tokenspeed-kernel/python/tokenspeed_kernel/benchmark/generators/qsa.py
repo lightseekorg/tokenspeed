@@ -129,7 +129,8 @@ def prepare_qsa_sparse_attention(
     model_profile = parameters["model_profile"]
     if model_profile not in _MODEL_PROFILES:
         raise _invalid(
-            f"Implemented QSA model_profile values: {', '.join(sorted(_MODEL_PROFILES))}"
+            "Implemented QSA model_profile values: "
+            f"{', '.join(sorted(_MODEL_PROFILES))}"
         )
     profile = _MODEL_PROFILES[model_profile]
     if parameters["dtype"] != "bfloat16":

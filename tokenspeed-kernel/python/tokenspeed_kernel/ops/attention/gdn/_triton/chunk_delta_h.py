@@ -103,7 +103,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     if K > 192:
         b_h4 = tl.zeros([64, BV], dtype=tl.float32)
 
-    # calculate offset
     h += ((boh * H + i_h) * K * V).to(tl.int64)
     v += ((bos * H + i_h) * V).to(tl.int64)
     k += ((bos * Hg + i_h // (H // Hg)) * K).to(tl.int64)
@@ -119,7 +118,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     if STORE_FINAL_STATE:
         ht = ht + i_nh * K * V
 
-    # load initial state
     if USE_INITIAL_STATE:
         p_h0_1 = tl.make_block_ptr(h0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
         b_h1 += tl.load(p_h0_1, boundary_check=(0, 1), padding_option="zero").to(

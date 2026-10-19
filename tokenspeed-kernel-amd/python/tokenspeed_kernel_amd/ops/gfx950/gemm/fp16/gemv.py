@@ -117,7 +117,7 @@ def _fma_weight_offsets(
     BLOCK_N: gl.constexpr,
     KC: gl.constexpr,
 ):
-    """Offsets and mask of chunk 0 of the tile's weight rows."""
+    """Offsets, mask and K indices of chunk 0 of the tile's weight rows."""
     L3: gl.constexpr = _fma_layout(BLOCK_N, KC, gl.num_warps())
     LW: gl.constexpr = gl.SliceLayout(2, L3)
     rn = gl.arange(0, BLOCK_N, gl.SliceLayout(1, LW))
@@ -327,8 +327,8 @@ def _mfma_weight_offsets(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
 ):
-    """Offsets and mask of iteration 0 of the tile's weight rows; wave ``s``
-    takes ``BLOCK_K`` elements at ``s * BLOCK_K`` of an iteration."""
+    """Offsets, mask and K indices of iteration 0 of the tile's weight rows;
+    wave ``s`` takes ``BLOCK_K`` elements at ``s * BLOCK_K`` of an iteration."""
     WL: gl.constexpr = _mfma_weight_layout(BLOCK_K, gl.num_warps())
     s = gl.arange(0, gl.num_warps(), gl.SliceLayout(1, gl.SliceLayout(2, WL)))
     kk = gl.arange(0, BLOCK_K, gl.SliceLayout(0, gl.SliceLayout(2, WL)))
@@ -496,7 +496,7 @@ def _config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int]:
 
 
 def supports_gluon_gemv_a16w16_gfx950(m: int, n: int, k: int) -> bool:
-    """Shapes the GEMV handles: ``1 <= M <= 16`` and K a multiple of 16."""
+    """Shapes the GEMV handles: ``1 <= M <= 16`` and K >= 64, a multiple of 16."""
     return 1 <= m <= MAX_M and n >= 1 and k % 16 == 0 and k >= 64
 
 

@@ -335,7 +335,7 @@ def test_init_expert_location_form_is_decided_by_shape_not_by_glob_characters(
             compute(str(tmp_path / "nothing-here-*"))
         with pytest.raises(ValueError, match="matches no expert load record"):
             compute(str(tmp_path / "not-a-record.txt"))
-        (tmp_path / "not-a-record.txt").write_text("x")
+        (tmp_path / "not-a-record.txt").write_text("x", encoding="utf-8")
         with pytest.raises(ValueError, match="must be a .pt or .json"):
             compute(str(tmp_path / "not-a-record.txt"))
 

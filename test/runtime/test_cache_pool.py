@@ -141,9 +141,9 @@ class TestCachePoolViewTest:
             "runtime_contract",
             "cache_group_specs",
         ):
-            _pytest_expr_1 = hasattr(pool, owned_by_arena)
-            _pytest_msg_2 = f"{owned_by_arena} must be read off the arena, not the view"
-            assert not _pytest_expr_1, _pytest_msg_2
+            has_attr = hasattr(pool, owned_by_arena)
+            msg = f"{owned_by_arena} must be read off the arena, not the view"
+            assert not has_attr, msg
 
     def test_two_views_of_one_arena_share_field_views(self):
         arena = _arena()

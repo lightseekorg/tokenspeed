@@ -35,10 +35,7 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 
-# Used for Input/Output Processor sharing
 class ContextBase:
-    """Base shared context for extensible input and output processors."""
-
     def __init__(self, base_lm, config_dict: dict[str, Any]):
         pass
 
@@ -171,10 +168,8 @@ class ExtensibleLM(nn.Module):
         positions: Tensor,
         input_embeds: Tensor = None,
     ) -> LogitsProcessorOutput:
-        # input processor: get input hidden states
         input_embeds = self.input_processor(input_ids, positions, ctx, input_embeds)
 
-        # base model forward
         out_hidden_states, _ = self.base_lm.model(
             input_ids=None,
             positions=positions,
@@ -182,7 +177,6 @@ class ExtensibleLM(nn.Module):
             input_embeds=input_embeds,
         )
 
-        # output processor: lm hidden states to logits
         logits_output: LogitsProcessorOutput = self.output_processor(
             input_ids, positions, ctx, out_hidden_states
         )

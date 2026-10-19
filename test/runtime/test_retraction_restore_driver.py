@@ -60,7 +60,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
 
 PAGE = 16
-PROMPT = list(range(40))  # 2 hash-complete pages and a 8-token tail
+PROMPT = list(range(40))  # 2 hash-complete pages and an 8-token tail
 POOL_LCM_BLOCKS = 8
 
 

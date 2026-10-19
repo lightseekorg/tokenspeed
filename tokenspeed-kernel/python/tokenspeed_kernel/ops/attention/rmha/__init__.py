@@ -432,7 +432,6 @@ def rel_mha_decode_with_kvcache(
     dimension — unexpanded ``[batch]`` seqlens and ``[batch, W]`` table, one
     KV load per request. Non-uniform multi-query takes the fork varlen path.
     """
-    blockscaled = q_scale is not None
     signature, scale_kwargs = _blockscaled_signature_and_scales(
         q, k_cache, v_cache, q_scale, k_scale, v_scale
     )

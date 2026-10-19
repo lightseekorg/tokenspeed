@@ -18,52 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Beam's NoPE-layer Q/K RMSNorm plus the SSMax query scale: the ``layernorm.qk_rmsnorm_ssmax`` operator.
+"""Beam's NoPE-layer Q/K RMSNorm plus SSMax query scale operator.
 
-``BeamAttention.prepare_qkv`` (``tokenspeed/runtime/models/beam.py``) on a layer
-without rotary embedding normalizes the query and key heads with
-``BeamRMSNorm`` -- the shared kernel ``rmsnorm(x, weight, eps,
-residual=None, out=None, enable_pdl=None)`` of
-:mod:`tokenspeed_kernel.ops.layernorm.triton` on ``[tokens, heads, 128]`` views,
-FP32 ``x * rsqrt(mean(x^2) + eps) * w`` stored once as BF16 -- and then scales
-the query with ``apply_ssmax_root10(q, positions, 1, 2048.0)``: the FP32 scale
-``exp(0.1 * log1p((p + 1) / 2048))`` per token, one FP32 multiply of the widened
-BF16 query, one BF16 rounding. Those statements are the operator
-``("layernorm", "qk_rmsnorm_ssmax")``: :func:`qk_rmsnorm_ssmax` takes ``q``,
-``k``, the two ``[128]`` weights, ``eps`` and the ``[tokens]`` positions and
-returns ``(q_out, k_out)``, fresh contiguous BF16 ``[tokens, heads * 128]``
-tensors. Two kernels are registered:
-
-* ``torch_qk_rmsnorm_ssmax`` (solution ``torch``, PORTABLE, any device the shared
-  kernel runs on): the NoPE branch transcribed -- ``BeamRMSNorm.forward``
-  evaluated for ``residual=None, out=None`` on the q heads and on the k heads
-  (the same ``rmsnorm`` call with the module's weight and eps), then the three
-  statements of ``apply_ssmax_root10`` with Beam's constants. Admits every shape
-  the statements admit.
-* ``triton_fused_qk_rmsnorm_ssmax`` (solution ``triton``, SPECIALIZED, NVIDIA
-  SM100 to SM103, checked on SM100): one launch of the shared
-  ``_fused_qk_rmsnorm_kernel`` through
-  ``qk_rmsnorm(..., ssmax_positions=positions)`` with the constexprs
-  ``ROUND_AFTER_AFFINE`` (the affine output rounded once to BF16, the value the
-  eager norm stores) and ``SSMAX_INKERNEL`` (the FP32 scale computed in the
-  kernel from the token's position with the CUDA math library, the multiply by
-  ``2^-11`` in place of the division by 2048, one IEEE round-to-nearest
-  multiply, one BF16 store; no table). It admits BF16 rank-2 ``q``/``k`` with a
-  contiguous last axis and token strides covering the row (Beam's ``qkv.split``
-  column views or contiguous tensors), the head pairs ``(48, 8)`` and ``(6, 1)``
-  of head dimension 128, contiguous BF16 ``[128]`` weights, a contiguous int32 /
-  int64 ``[tokens]`` positions vector, a finite positive ``eps``, ``tokens > 0``
-  and one CUDA device. Ranked selection picks it wherever its traits admit the
-  call and keeps ``torch_qk_rmsnorm_ssmax`` everywhere else; reached by name it
-  raises on any other call (:func:`qk_rmsnorm_ssmax_rejection`), an empty batch
-  included: no in-function fallback. ``positions >= 0`` is the caller's
-  contract on both kernels, as it is for ``apply_ssmax_root10`` (never read on
-  the host: the product path runs under CUDA-graph capture).
-
-The fused kernel's scale equals Torch's bit for bit on every position of
-``[0, 2^20]`` for int32 and int64 (measured, zero mismatches), and the two kernels
-agree byte for byte on ``q_out`` and ``k_out``, which
-``test/nvidia/ops/layernorm/test_beam_norms_cuda.py`` checks.
+The ``("layernorm", "qk_rmsnorm_ssmax")`` operator applies ``BeamRMSNorm`` to the
+q and k heads, then ``apply_ssmax_root10(q, positions, 1, 2048.0)`` to q. Two
+kernels are registered: ``torch_qk_rmsnorm_ssmax`` (portable, any shape) and
+``triton_fused_qk_rmsnorm_ssmax`` (one fused launch on NVIDIA SM100 to SM103 for
+Beam's head geometry; see :func:`qk_rmsnorm_ssmax_rejection`). Their outputs are
+byte-identical. ``positions >= 0`` is the caller's contract and is never read on
+the host because the product path runs under CUDA-graph capture.
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 """Regression: trtllm decode metadata must clamp KV seqlens to >=
 spec_num_tokens on the multi-token (MTP target-verify) path.
 
-Root cause analyzed in dashllm1.log (DP4+EP4 Qwen3.5-397B, MTP, CUDA graph ON):
+Root cause (DP4+EP4 Qwen3.5-397B, MTP, CUDA graph ON):
 
     accept_rate decays to 0 over multiple rounds. Localized end-to-end:
       * CUDA-graph padded / idle decode rows are filled with seq_len=1
@@ -90,7 +90,6 @@ def test_verify_refresh_clamps_padded_seqlen_runtime():
     # Real rows must be left untouched (clamp is a no-op for them).
     assert int(cache_seqlens[0]) == 512
     assert int(cache_seqlens[1]) == 300
-    # Padded rows get raised to spec_num_tokens.
     assert int(cache_seqlens[2]) == SPEC_NUM_TOKENS
     assert int(cache_seqlens[3]) == SPEC_NUM_TOKENS
 
@@ -176,12 +175,11 @@ def test_draft_replay_refreshes_spec_cache_seqlens_buf():
 
     # spec_cache_seqlens_buf must now reflect the clamped real values.
     replay_vals = be.spec_cache_seqlens_buf[:bs]
-    assert int(replay_vals[0]) == 512  # real, no clamp needed
-    assert int(replay_vals[1]) == 300  # real, no clamp needed
+    assert int(replay_vals[0]) == 512
+    assert int(replay_vals[1]) == 300
     assert int(replay_vals[2]) == SPEC_NUM_TOKENS  # 1 -> clamped to 4
     assert int(replay_vals[3]) == SPEC_NUM_TOKENS  # 1 -> clamped to 4
 
-    # forward_prefill_metadata must point at spec_cache_seqlens_buf.
     prefill_cache_seqlens = be.forward_prefill_metadata.cache_seqlens_int32
     assert prefill_cache_seqlens.data_ptr() == be.spec_cache_seqlens_buf.data_ptr()
 

@@ -36,7 +36,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
     _extract_gluon_raw_w_unshuffled,
 )
 
-# CDNA4 MXFP4 scale layout is defined once in mxfp4_cdna4_scale_layout so the
+# CDNA4 MXFP4 scale layout is defined once in scale_layout so the
 # weight-scale (B) preshuffle here and the activation-scale (A) gather in
 # mxfp4.scale stays in lock-step. Local aliases preserve the
 # historical private names used throughout this module.
@@ -311,6 +311,10 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
     *,
     preshuffle: bool = True,
 ) -> None:
+    """Replaces ``w``'s raw weight/scale parameters in place with
+    ``w13_weight_triton_tensor`` / ``w2_weight_triton_tensor`` and
+    ``w13_precision_config`` / ``w2_precision_config``."""
+    del plan
     _pad_w2_to_block_n(w, _GLUON_COMBINE_BLOCK_N)
 
     w13_layout = getattr(w, "w13_input_layout", "concatenated")

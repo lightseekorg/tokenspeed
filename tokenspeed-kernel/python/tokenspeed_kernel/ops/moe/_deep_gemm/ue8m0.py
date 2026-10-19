@@ -76,7 +76,7 @@ def deep_gemm_requires_ue8m0() -> bool:
 
 
 def is_ue8m0(scale: torch.Tensor) -> bool:
-    """Whether every non-zero entry of ``scale`` is an exact power of two."""
+    """Whether every positive entry of ``scale`` is an exact power of two."""
     values = scale.detach().float().flatten()
     values = values[values > 0]
     if values.numel() == 0:

@@ -39,11 +39,6 @@ cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
 
 
-# ===-----------------------------------------------------------------------===#
-# Kernel Config
-# ===-----------------------------------------------------------------------===#
-
-
 @gluon.aggregate
 class AttentionConfig:
     N_HEADS: gl.constexpr
@@ -113,21 +108,22 @@ class AttentionConfig:
             transposed=True,
             warps_per_cta=[NUM_WARPS, 1],
         )
-        # load_vec is the number of elements per lane, depends on the input dtype, same as qk_kw.
+        # load_vec is the number of elements per lane, depends on the input dtype,
+        # same as qk_kw.
         # load_threads is how many lanes span HEAD_DIM.
         load_vec = 16 if IS_FP8 else 8
         load_threads = HEAD_DIM // load_vec
         load_layout = gl.BlockedLayout(
             [1, load_vec], [64 // load_threads, load_threads], [4, 1], [1, 0]
         )
-        # store_vec depends on the output dtype, always 16-bit regardless of input dtype, so 128 / 16 = 8.
+        # store_vec depends on the output dtype, always 16-bit regardless of input
+        # dtype, so 128 / 16 = 8.
         # store_threads is how many lanes span HEAD_DIM.
         store_vec = 8
         store_threads = HEAD_DIM // store_vec
         store_layout = gl.BlockedLayout(
             [1, store_vec], [64 // store_threads, store_threads], [4, 1], [1, 0]
         )
-        # Padding interval is 64 lanes * load_vec elems.
         pad_interval = 64 * load_vec
         # Empirically tuned.
         pad_k = 16 if IS_FP8 else 8
@@ -175,11 +171,6 @@ class AttentionConfig:
         self.store_layout = gl.constexpr(store_layout)
         self.k_smem_layout = gl.constexpr(k_smem_layout)
         self.v_smem_layout = gl.constexpr(v_smem_layout)
-
-
-# ===-----------------------------------------------------------------------===#
-# Kernel Program
-# ===-----------------------------------------------------------------------===#
 
 
 @gluon.aggregate
@@ -857,11 +848,6 @@ def process_sliding_attention_tile(
     output = acc * recip_denom[:, None]
     output = gl.convert_layout(output, cfg.store_layout)
     program.store_output(output)
-
-
-# ===-----------------------------------------------------------------------===#
-# Entry Point
-# ===-----------------------------------------------------------------------===#
 
 
 @gluon.jit

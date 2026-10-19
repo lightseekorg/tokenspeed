@@ -14,6 +14,8 @@ from .fmha_bias_helper import get_batch_from_cu_tensor
 
 
 class CuSeqlensToBlocksKernel:
+    """One CTA, one thread per batch entry: batch size must be <= num_threads."""
+
     def __init__(
         self,
         tile: int = 128,
@@ -31,7 +33,8 @@ class CuSeqlensToBlocksKernel:
         self,
         mCuBlocks: cute.Tensor,
         mCuSeqlens: cute.Tensor,
-        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+        # Always keep stream as the last parameter (EnvStream: obtained
+        # implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
         @cute.struct
@@ -107,7 +110,8 @@ class CuBlocksToBatchKernel:
         self,
         mCuTotalBlocks: cute.Tensor,
         mBlocksToBatchIdx: cute.Tensor,
-        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+        # Always keep stream as the last parameter (EnvStream: obtained
+        # implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
         num_blocks = mBlocksToBatchIdx.shape[0]

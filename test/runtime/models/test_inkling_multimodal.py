@@ -377,8 +377,6 @@ class TestInklingMultimodalE2E:
     def teardown_class(cls):
         cls.engine.shutdown()
 
-    # -- helpers ----------------------------------------------------------
-
     # The placeholder run ends the prompt on purpose: the first sampled
     # token's logits come from the LAST prompt position's hidden state, so a
     # trailing mm position makes the spliced embedding directly observable.
@@ -461,8 +459,6 @@ class TestInklingMultimodalE2E:
             feature=feature,
             offsets=[(run_start, run_start + num_tokens - 1)],
         )
-
-    # -- tests --------------------------------------------------------------
 
     def test_image_feature_replaces_placeholder_embeddings(self):
         ids, start = self._image_prompt(self.IMAGE_TOKENS)

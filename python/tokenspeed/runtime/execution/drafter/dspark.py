@@ -100,8 +100,8 @@ class DSpark(DFlash):
         weight = head.weight
         flat = draft_hidden.reshape(rows * positions, -1).to(weight.dtype)
         logits = torch.matmul(flat, weight[:num_org].T)
-        # draft_hidden is [rows, positions, H]; the walk indexes by position.
-        # The walk slices one position at a time; transpose alone would hand
+        # draft_hidden is [rows, positions, H] and the walk slices one position
+        # at a time; transpose alone would hand
         # each slice a positions-strided row layout, which the distributed
         # argmax's compact-row kernel must not see.
         return logits.view(rows, positions, num_org).transpose(0, 1).contiguous()

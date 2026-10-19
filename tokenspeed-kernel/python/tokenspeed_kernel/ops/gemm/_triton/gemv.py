@@ -166,7 +166,8 @@ def triton_rowcta_gemv(
     n, k = weight.shape
     if out is None:
         out = torch.empty(1, n, dtype=x.dtype, device=x.device)
-    # BK=512 (4 fp32 accumulator regs/thread): standalone parity, and aux-stream kernels co-reside instead of stalling behind the GEMV wave.
+    # BK=512 (4 fp32 accumulator regs/thread): standalone parity, and aux-stream
+    # kernels co-reside instead of stalling behind the GEMV wave.
     _rowcta_gemv_kernel[(n,)](
         x.view(-1),
         weight,

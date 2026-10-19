@@ -91,7 +91,9 @@ def test_attention_row_vector_codegen(rank, operation, has_residual, tmp_path):
         options={"num_warps": 4},
     )
     assembly = kernel.asm["amdgcn"]
-    (tmp_path / f"attention-{operation}-rank{rank}.amdgcn").write_text(assembly)
+    (tmp_path / f"attention-{operation}-rank{rank}.amdgcn").write_text(
+        assembly, encoding="utf-8"
+    )
     lines = assembly.splitlines()
     loads = 8 + int(has_residual) if operation == "reduce" else 1
     stores = 1 if operation == "reduce" else 8
@@ -279,7 +281,8 @@ def _attention_worker(rank: int, port: int) -> None:
                     atol=1 / 512,
                     rtol=1 / 64,
                     msg=lambda message: (
-                        f"M={m}, history={valid_blocks}, residual={prefix is not None}: {message}"
+                        f"M={m}, history={valid_blocks}, "
+                        f"residual={prefix is not None}: {message}"
                     ),
                 )
                 if m in (56, 64) and valid_blocks in (4, 11):

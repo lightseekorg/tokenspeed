@@ -172,7 +172,6 @@ class GatedResidualSimple(nn.Module):
             module.mix_inject_proj.out_features = weight.shape[0]
 
     def _load_up_weight(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        """Load the fixed-shape up projection."""
         if param.shape != loaded_weight.shape:
             raise ValueError(
                 f"hyper-connection up weight shape mismatch: param "

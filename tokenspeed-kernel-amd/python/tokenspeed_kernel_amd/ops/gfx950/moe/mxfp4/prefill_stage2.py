@@ -133,11 +133,6 @@ def _load_a_to_shared(
         destination.store(values)
 
 
-# ---------------------------------------------------------------------------
-# Kernel
-# ---------------------------------------------------------------------------
-
-
 @gluon.jit
 def gluon_mxfp4_moe_stage2_1x2_kernel(
     a_ptr,
@@ -180,7 +175,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     INPUT_SORTED: gl.constexpr = False,
     A_FORMAT: gl.constexpr = "e2m1",
 ):
-    """Stage 2 1x2 kernel: 2 waves/CTA, BLOCK_N=256, 2-stage v3 pipeline.
+    """Stage 2 1x2 kernel: 4 waves/CTA, BLOCK_N=256, 2-stage v3 pipeline.
 
     When ``USE_REDUCE`` is True, the epilogue writes per-(token, slot)
     partials with plain stores instead of contending atomic_adds; the
@@ -231,16 +226,15 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     gl.static_assert(K_PACKED_TOTAL % 128 == 0)
     NUM_BUFFERS: gl.constexpr = 2
     # 4 N-chunks of 64 cols each at BLOCK_N = 256. With warps_per_cta=[1, 4]
-    # each wave owns 1/4 of a chunk = 16 cols, so per wave [128, 16] per chunk.
+    # each wave owns 1/4 of a chunk = 16 cols, so [BLOCK_M, 16] per wave per chunk.
     NUM_N_CHUNKS: gl.constexpr = 4
     BLOCK_N_CHUNK: gl.constexpr = BLOCK_N // NUM_N_CHUNKS  # 64
 
     # MFMA + dot operand + scale layouts. warps_per_cta=[1, 4] splits the N
     # axis across 4 waves; each wave's portion of acc[BLOCK_M, BLOCK_N=256]
-    # is [128, 64], and each per-chunk [BLOCK_M, BLOCK_N_CHUNK=64] tile is
-    # [128, 16] per wave. Halves per-wave accumulator and B operand vs the
-    # earlier 2-wave layout -- the change targets register pressure to fit
-    # more than one wave per SIMD on MI350.
+    # is [BLOCK_M, 64], and each per-chunk [BLOCK_M, BLOCK_N_CHUNK=64] tile is
+    # [BLOCK_M, 16] per wave. The narrow per-wave accumulator and B operand
+    # keep register pressure low enough to fit more than one wave per SIMD.
     # COALESCE_SCALES does not change this layout; it only changes how the
     # scale operands are loaded (address-ordered coalesced load + convert to
     # the operand layout). Supported for BLOCK_M == 64, BLOCK_N == 256 only;
@@ -419,7 +413,8 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
             & (pid_m * BLOCK_M < num_tokens_post_padded)
         )
         if tile_ok:
-            # A row gather (topk-aware): sorted_token_ids packs (topk_id << 24 | token_id)
+            # A row gather (topk-aware): sorted_token_ids packs
+            # (topk_id << 24 | token_id).
             m_layout: gl.constexpr = gl.SliceLayout(1, gload_a_layout)
             k_layout: gl.constexpr = gl.SliceLayout(0, gload_a_layout)
             offs_sorted_slot = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=m_layout)
@@ -603,9 +598,8 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                     a_scale1 = gl.convert_layout(a_scale1_raw, a_scale_layout)
 
                 # B data offsets (preshuffled B, direct-to-VGPR).
-                # NOTE: dot_b_layout is shape-agnostic, so we reuse it for the [K, 32]
-                # per-chunk tile. SliceLayout(0,dot_b_layout) over arange(0,32) yields the
-                # natural N-axis sublayout for each 32-col chunk.
+                # NOTE: dot_b_layout is shape-agnostic, so we reuse it for the
+                # [K, BLOCK_N_CHUNK] per-chunk tile.
                 offs_bk = gl.arange(
                     0, BLOCK_K_B, layout=gl.SliceLayout(1, dot_b_layout)
                 )
@@ -747,9 +741,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                 else:
                     B_DATA_K_STEP1: gl.constexpr = (BLOCK_K_B // 32) * 512
 
-                # 4 independent accumulators of shape [BLOCK_M, BLOCK_N_CHUNK=32].
-                # mfma_layout is shape-agnostic; each acc covers 8 (M) x 2 (N) x 2 (K) =
-                # 32 v_mfma_scale_f32_16x16x128_f8f6f4 instructions total, summing to 128.
+                # 4 independent accumulators of shape [BLOCK_M, BLOCK_N_CHUNK].
                 acc0 = gl.zeros(
                     (BLOCK_M, BLOCK_N_CHUNK), dtype=gl.float32, layout=mfma_layout
                 )
@@ -1580,11 +1572,6 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                         gl.atomic_add(p3, c3_co, mask=m3, sem="relaxed")
 
 
-# ---------------------------------------------------------------------------
-# Reduce kernel (sums [token, topk, N] -> [token, N], fp32 accumulate)
-# ---------------------------------------------------------------------------
-
-
 @gluon.jit
 def gluon_mxfp4_moe_stage2_reduce_kernel(
     partials_ptr,  # shape [token_num, topk, N]
@@ -1663,11 +1650,6 @@ def gluon_mxfp4_moe_stage2_reduce_kernel(
         + offs_n[None, :].to(gl.int64) * stride_on
     )
     gl.store(out_ptrs, acc.to(out_ptr.type.element_ty), mask=m_mask)
-
-
-# ---------------------------------------------------------------------------
-# Wrapper
-# ---------------------------------------------------------------------------
 
 
 def _record_atomic_lowering() -> None:

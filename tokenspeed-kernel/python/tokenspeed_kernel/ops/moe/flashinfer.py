@@ -412,11 +412,14 @@ if platform.is_nvidia:
             routing_config = getattr(w, "routing_config", {})
             if not isinstance(routing_config, dict):
                 routing_config = {}
-            routing_value = lambda name, default: (
-                routing_config[name]
-                if name in routing_config
-                else getattr(w, name, default)
-            )
+
+            def routing_value(name, default):
+                return (
+                    routing_config[name]
+                    if name in routing_config
+                    else getattr(w, name, default)
+                )
+
             routing_method_type = routing_value("routing_method_type", 1)
             routing_logits_dtype = (
                 torch.float32 if int(routing_method_type) in {2, 7} else torch.bfloat16
@@ -3278,7 +3281,7 @@ if platform.is_nvidia:
         padded_hidden = hidden_size + hidden_pad
 
         if gated:
-            # Fix 1: Swap [W1(Gate), W3(Up)] -> [W3(Up), W1(Gate)].
+            # Swap [W1(Gate), W3(Up)] -> [W3(Up), W1(Gate)].
             # The fused gated-act reorder interleaves [first_half, second_half] as
             # [row0_first, row0_second, row1_first, row1_second, ...].
             # It expects [W3(Up), W1(Gate)] so that the interleaved result pairs
@@ -3327,7 +3330,6 @@ if platform.is_nvidia:
         w2_scales_shuffled = []
 
         for idx in range(num_experts):
-            # W1/W3 (gemm1) weight permutation
             perm = maybe_get_cached_w3_w1_permute_indices(
                 cache,
                 w13_fp4[idx].view(torch.uint8),
@@ -3337,7 +3339,6 @@ if platform.is_nvidia:
             w13_weights_shuffled.append(
                 w13_fp4[idx].view(torch.uint8)[perm.to(w13_fp4.device)].contiguous()
             )
-            # W1/W3 scale permutation + interleave
             perm_sf = maybe_get_cached_w3_w1_permute_indices(
                 cache,
                 w13_scales[idx].view(torch.uint8),
@@ -3352,14 +3353,12 @@ if platform.is_nvidia:
                     .contiguous()
                 )
             )
-            # W2 (gemm2) weight permutation
             perm2 = get_w2_permute_indices_with_cache(
                 cache, w2_fp4[idx].view(torch.uint8), epilogue_tile_m
             )
             w2_weights_shuffled.append(
                 w2_fp4[idx].view(torch.uint8)[perm2.to(w2_fp4.device)].contiguous()
             )
-            # W2 scale permutation + interleave
             perm2_sf = get_w2_permute_indices_with_cache(
                 cache,
                 w2_scales[idx].view(torch.uint8),
@@ -3374,7 +3373,6 @@ if platform.is_nvidia:
                 )
             )
 
-        # Stack and store shuffled weights (uint8)
         w.gemm1_weights_fp4_shuffled = torch.nn.Parameter(
             torch.stack(w13_weights_shuffled), requires_grad=False
         )
@@ -3394,7 +3392,6 @@ if platform.is_nvidia:
             requires_grad=False,
         )
 
-        # Free original weights (replaced by shuffled versions)
         del w.w13_weight
         del w.w2_weight
         del w.w13_weight_scale
@@ -3412,7 +3409,6 @@ if platform.is_nvidia:
         w13_input_scale = w.w13_input_scale.to(torch.float32)
         w2_input_scale = w.w2_input_scale.to(torch.float32)
 
-        # Store input_scale_quant for runtime fp4_quantize
         w13_input_scale_quant = (1.0 / w13_input_scale).to(torch.float32)
         w2_input_scale_quant = (1.0 / w2_input_scale).to(torch.float32)
 
@@ -3498,10 +3494,8 @@ if platform.is_nvidia:
                         requires_grad=False,
                     )
 
-        # Store intermediate_size_per_partition for the executor
         w.intermediate_size_per_partition = intermediate_size
 
-        # Free per-shard scales that are no longer needed
         del w.w13_weight_scale_2
         del w.w2_weight_scale_2
         del w.w13_input_scale
@@ -3596,7 +3590,7 @@ if platform.is_nvidia:
 
         Resolves the same tactic the fused launch would take, then allocates the
         routing metadata and the expert-GEMM workspace for it, so a later
-        the top-k kernel fills ``routing`` and the apply launches nothing but the
+        top-k kernel fills ``routing`` and the apply launches nothing but the
         GEMMs. Call outside graph capture, once per token count and per
         layer: the top-k of one layer fills its slot while another layer's
         GEMMs may still be reading theirs.
@@ -3605,7 +3599,7 @@ if platform.is_nvidia:
             w: Processed NVFP4 expert weights, as the apply kernel receives them.
             x_quantized: The apply's ``x_quantized`` pair at this token count.
             topk_ids: Selected expert ids ``[tokens, top_k]``.
-            topk_weights: FP32 or BF16 route weights ``[tokens, top_k]``.
+            topk_weights: FP32 route weights ``[tokens, top_k]``.
             activation_type: flashinfer activation, or None for SwiGLU.
             enable_pdl: Enable NVIDIA programmatic dependent launch.
 
@@ -3707,7 +3701,8 @@ if platform.is_nvidia:
         num_tokens = hs_fp4.shape[0]
         if prepared.num_tokens != num_tokens:
             raise ValueError(
-                f"prepared routing serves {prepared.num_tokens} tokens, got {num_tokens}"
+                f"prepared routing serves {prepared.num_tokens} tokens, "
+                f"got {num_tokens}"
             )
         prepared.body_runner.forward_from_metadata(
             _nvfp4_runner_inputs(
@@ -3830,7 +3825,8 @@ if platform.is_nvidia:
         if routing_prepared is not None:
             if not routed or do_finalize:
                 raise ValueError(
-                    "prepared routing serves the precomputed-top-k kernel with a deferred finalize"
+                    "prepared routing serves the precomputed-top-k kernel with a "
+                    "deferred finalize"
                 )
             return _apply_prepared_routing(
                 routing_prepared,

@@ -539,10 +539,6 @@ class FlashAttentionDecodeSm100Bias:
         assert page_size is None or sequence_tile % page_size == 0
         assert page_size is None or 128 % page_size == 0 or page_size % 128 == 0
 
-    ##############################
-    # Launch helpers
-    ##############################
-    # Runtime implementable check
     def can_implement(
         self,
         kv_splits,
@@ -595,7 +591,8 @@ class FlashAttentionDecodeSm100Bias:
                 raise ValueError("paged KV requires at least one physical page")
             if page_size != self.page_size:
                 raise ValueError(
-                    f"K/V page dimension({page_size}) must match page_size({self.page_size})"
+                    f"K/V page dimension({page_size}) must match "
+                    f"page_size({self.page_size})"
                 )
             s_k = None
         else:
@@ -703,7 +700,6 @@ class FlashAttentionDecodeSm100Bias:
                 f"non-zero seqlen({s_k}) must be at least prediction({s_q})"
             )
 
-        # Not sure why this case fails {$nv-internal-release}
         if s_k is not None and 0 < s_k < 8:
             raise ValueError(
                 f"non-zero seqlen({s_k}) with TMA masking must be at least 8"
@@ -739,7 +735,8 @@ class FlashAttentionDecodeSm100Bias:
             rel_extent = bias_storage_extent
             if (b_bias, s_bias, h_bias) != (b_q, s_q, h_q):
                 raise ValueError(
-                    "compact bias shape must be (batch, prediction, heads_q, relative_extent); "
+                    "compact bias shape must be "
+                    "(batch, prediction, heads_q, relative_extent); "
                     f"got {bias_shape_bshr} for Q shape {qo_shape_bshd}"
                 )
             if rel_extent <= 0:
@@ -756,7 +753,8 @@ class FlashAttentionDecodeSm100Bias:
 
             if o_dtype not in (Float32, BFloat16, Float16):
                 raise TypeError(
-                    f"atomic reduction requires (Float32, BFloat16, Float16) o_dtype, got {o_dtype}"
+                    "atomic reduction requires (Float32, BFloat16, Float16) "
+                    f"o_dtype, got {o_dtype}"
                 )
 
     # Pack grouped heads with predicted tokens (s_q)
@@ -846,9 +844,6 @@ class FlashAttentionDecodeSm100Bias:
         mT_layout = cute.make_layout(mT_shape, stride=mT_stride)
         return cute.make_tensor(t_bsh.iterator, mT_layout)
 
-    ##############################
-    # Decode Kernel launch
-    ##############################
     @cute.jit
     def dense_bf16_bias(
         self,
@@ -1092,9 +1087,6 @@ class FlashAttentionDecodeSm100Bias:
             None. Results are written to ``o_bshd`` and, for non-direct fixed
             modes, the supplied reduction workspaces.
         """
-        ##############################
-        # TiledMma creation
-        ##############################
         qk_dtype = q_bshd.dtype
         v_dtype = v_bshd.dtype
         v_mma_dtype = (
@@ -1293,9 +1285,6 @@ class FlashAttentionDecodeSm100Bias:
             vsf_mma_tile_mnk = pv_mma_tile_mnk
             tiled_mma_vq = tiled_mma_vsf = tiled_mma_vp
 
-        ##############################
-        # Calculate stage counts
-        ##############################
         # Fixed stage counts
         self.p_stages = p_stages = 4  # smem P (BMM2 B)
         self.o_stages = o_stages = 2  # tmem O (BMM2 C)
@@ -1395,9 +1384,6 @@ class FlashAttentionDecodeSm100Bias:
 
         print(f"\ts stages: {s_stages}\tkv stages: {kv_stages}")
 
-        ##############################
-        # TMA creation
-        ##############################
         o_bshd_ = o_bshd if self.do_cluster_red else o_partial_bshd
         if cutlass.const_expr(is_varlen_q):
             h_k = k_bshd.shape[1]
@@ -1727,9 +1713,6 @@ class FlashAttentionDecodeSm100Bias:
             mM_partial_nl = self.gemm_view_bsh(m_partial_bsh, h_k)
             mL_partial_nl = self.gemm_view_bsh(l_partial_bsh, h_k)
 
-        ##############################
-        # Launch kernel(s)
-        ##############################
         scale_s_log2_e = scale_s * log2_e
 
         if cutlass.const_expr(is_varlen_q):
@@ -2183,9 +2166,6 @@ class FlashAttentionDecodeSm100Bias:
         # Optional fp32 per-query-row scale on the total pre-softmax logits
         mTau: Optional[cute.Tensor] = None,
     ):
-        ##############################
-        # Static variables
-        ##############################
         # Smem alloc helper
         svector_align = 16
         stensor_align = 128
@@ -2236,9 +2216,6 @@ class FlashAttentionDecodeSm100Bias:
             is_varlen_q = False
             is_varlen_k = False
 
-        ##############################
-        # Warp specialization
-        ##############################
         # Warp assignments
         warpgroup_id = 0
         mma_kq_warp_id = warpgroup_id * warpgroup_warps + 0
@@ -2356,9 +2333,6 @@ class FlashAttentionDecodeSm100Bias:
         )
         lane_store_max = blk_tile_n == warp_threads or lane_idx < blk_tile_n
 
-        ##############################
-        # Prefetch TMA descriptor
-        ##############################
         if warp_idx == init_warp and not exit_early:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_q)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k)
@@ -2371,18 +2345,12 @@ class FlashAttentionDecodeSm100Bias:
                 cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_ksf)
         init_warp += 1
 
-        ##############################
-        # Tmem Allocation
-        ##############################
         tmem_alloc_cols = self.tmem_alloc_cols
         tmem_ptr_smem_ptr = smem.allocate_array(Int32)
         if warp_idx == init_warp and not exit_early:
             cute.arch.alloc_tmem(tmem_alloc_cols, tmem_ptr_smem_ptr)
         init_warp += 1
 
-        ##############################
-        # Pipeline Allocation + Init
-        ##############################
         # Initialize named barriers
         softmax_threads = warpgroup_threads
         correction_threads = warpgroup_threads
@@ -2526,9 +2494,6 @@ class FlashAttentionDecodeSm100Bias:
             defer_sync=True,
         ).make_participants()
 
-        ##############################
-        # Smem Tensor Allocation
-        ##############################
         # Threadblock slice
         thrblk_mma_kq = tiled_mma_kq.get_slice(0)
         thrblk_mma_qsf = tiled_mma_qsf.get_slice(0)
@@ -2558,7 +2523,7 @@ class FlashAttentionDecodeSm100Bias:
             )
             tAsVq = tAsV
             sVSF = None
-        # Place Q, P, M, L on the second sub-bank (128-227KiB) {$nv-internal-release}
+        # Place Q, P, M, L on the second sub-bank (128-227KiB)
         tBsQ = smem.allocate_tensor(
             q_dtype, smem_layout_q.outer, stensor_align, smem_layout_q.inner
         )  # (MMA, #MMA_N, #MMA_K, q_stages)
@@ -2594,9 +2559,9 @@ class FlashAttentionDecodeSm100Bias:
         )
 
         # Tile for NK B tile iteration
-        tBsP_nk_tile = thrblk_mma_vp.partition_shape_B(
-            (mma_tile_n, pv_mma_tile_k)
-        )  # (MMA_NK, #MMA_N=1, #MMA_K=MMA_TILE_K/MMA_K, #TILE_SK=TILE_S/MMA_TILE_K, p_stages)
+        # (MMA_NK, #MMA_N=1, #MMA_K=MMA_TILE_K/MMA_K, #TILE_SK=TILE_S/MMA_TILE_K,
+        #  p_stages)
+        tBsP_nk_tile = thrblk_mma_vp.partition_shape_B((mma_tile_n, pv_mma_tile_k))
         tBsP_nk = cute.local_tile(tBsP_nm, tBsP_nk_tile, (0, 0, None, None))
 
         # Reshape NM B tile of BMM1 to become MN C tile of BMM0
@@ -2641,9 +2606,6 @@ class FlashAttentionDecodeSm100Bias:
             sR_layout = cute.make_layout((blk_tile_n, max_reduction_iters, 2))
             sR = smem.allocate_tensor(acc_dtype, sR_layout, svector_align)
 
-        ##############################
-        # Sync
-        ##############################
         # Ensure visibility of cluster mbarriers
         if cutlass.const_expr(do_cluster_red):
             cute.arch.cluster_wait()
@@ -2654,9 +2616,6 @@ class FlashAttentionDecodeSm100Bias:
             self.threads_per_cta // warp_threads
         ), f"used {init_warp + 1} init warps, {self.threads_per_cta // warp_threads} warps available"
 
-        ##############################
-        # Tmem tensor allocation
-        ##############################
         tmem_ptr = cute.arch.retrieve_tmem_ptr(Int32, 16, tmem_ptr_smem_ptr)
         tmem_offset = 0
 
@@ -2732,17 +2691,11 @@ class FlashAttentionDecodeSm100Bias:
             tmem_offset <= tmem_alloc_cols
         ), f"\t{tmem_offset} tmem cols used, {tmem_alloc_cols} tmem cols allocated"
 
-        ##############################
-        # Exit early
-        ##############################
         if exit_early:
             if warpgroup_idx == correction_warpgroup_id:
                 sM_final_nbar.arrive()
                 sL_final_nbar.arrive()
 
-        ##############################
-        # TMA KV Dispatch
-        ##############################
         elif warp_idx == tma_kv_warp_id:
             # Free registers
             if cutlass.const_expr(use_reg_reconfig):
@@ -3055,9 +3008,6 @@ class FlashAttentionDecodeSm100Bias:
                                         tma_bar_ptr=v_load_handle.barrier,
                                     )
 
-        ##############################
-        # TMA QO Dispatch
-        ##############################
         elif warp_idx == tma_qo_warp_id:
             # Free registers
             if cutlass.const_expr(use_reg_reconfig):
@@ -3161,13 +3111,9 @@ class FlashAttentionDecodeSm100Bias:
             )
 
             # Store O to gmem
-            # TODO: Prefetch O for L2 reduction {$nv-internal-release}
             sO_final_nbar.arrive_and_wait()
             cute.copy(tma_atom_o, sO_tma, gO_tma)
 
-        ##############################
-        # MMA KQ (BMM1) Dispatch
-        ##############################
         elif warp_idx == mma_kq_warp_id:
             # Free registers
             if cutlass.const_expr(use_reg_reconfig):
@@ -3185,7 +3131,6 @@ class FlashAttentionDecodeSm100Bias:
                 s_token = s_producer.try_acquire()
 
                 # Advance for MMA VP
-                # Could relax the wait under certain tile + stage counts {$nv-internal-release}
                 if cutlass.const_expr(not parallel_v_dequant):
                     if s >= prefetch_iters + 1:
                         for _ in cutlass.range_constexpr(tiles_dm * tiles_sk):
@@ -3257,9 +3202,6 @@ class FlashAttentionDecodeSm100Bias:
                 mma_order_vp_nbar.arrive_and_wait()
                 mma_order_kq_nbar.arrive()
 
-        ##############################
-        # MMA VP (BMM2) Dispatch
-        ##############################
         elif warp_idx == mma_vp_warp_id:
             # Free registers
             if cutlass.const_expr(use_reg_reconfig):
@@ -3350,9 +3292,6 @@ class FlashAttentionDecodeSm100Bias:
             cute.arch.relinquish_tmem_alloc_permit()
             cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
 
-        ##############################
-        # Softmax Dispatch
-        ##############################
         elif warpgroup_idx in softmax_warpgroup_ids:
             # Free registers
             if cutlass.const_expr(use_reg_reconfig):
@@ -3652,7 +3591,7 @@ class FlashAttentionDecodeSm100Bias:
                 p_handle.commit()
 
                 # Accumulate per-thread colsum
-                # TensorSSA.reduce doesn't elide the zero add {$nv-internal-release}
+                # TensorSSA.reduce doesn't elide the zero add
                 colsum = probs[None, 0]
                 for sm in cutlass.range_constexpr(1, tiles_sm, 1):
                     colsum += probs[None, sm]
@@ -3669,9 +3608,6 @@ class FlashAttentionDecodeSm100Bias:
                 s_consumer.advance()
                 p_producer.advance()
 
-        ##############################
-        # Correction Dispatch
-        ##############################
         elif warpgroup_idx == correction_warpgroup_id:
             # Alloc registers
             if cutlass.const_expr(use_reg_reconfig):
@@ -3901,14 +3837,10 @@ class FlashAttentionDecodeSm100Bias:
                 output_final *= correction
 
             # Store O to smem and notify
-            # TODO: shuffle in tmem, transpose to smem {$nv-internal-release}
             tOsO.store(output_final.to(o_dtype).reshape(tOsO.shape))
             cute.arch.fence_view_async_shared()
             sO_final_nbar.arrive()
 
-        ##############################
-        # Reduction Dispatch
-        ##############################
         if warp_idx == reduction_warp_id:
             if cutlass.const_expr(do_kernel_red):
                 self.reduction_epilogue(
@@ -4104,9 +4036,6 @@ class FlashAttentionDecodeSm100Bias:
         # Notify for final correction
         sM_final_nbar.arrive()
 
-    ##############################
-    # Reduction Kernel launch
-    ##############################
     @staticmethod
     @cute.jit
     def launch_reduction(
@@ -4225,7 +4154,8 @@ class FlashAttentionDecodeSm100Bias:
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
-        # Fold the final colmax from the per-split partials (inactive splits publish -inf, the fmax identity).
+        # Fold the final colmax from the per-split partials (inactive splits
+        # publish -inf, the fmax identity).
         max_final = -Float32.inf
         for max_split_idx in cutlass.range(splits, unroll=8):
             max_final = cute.arch.fmax(max_final, sM_partial[0, max_split_idx])
@@ -4337,13 +4267,14 @@ def run(
         and qkv_dtype == pv_dtype == o_dtype == BFloat16
     )
 
-    npo2 = lambda x: 2 ** math.ceil(math.log2(x))
+    def npo2(x):
+        return 2 ** math.ceil(math.log2(x))
 
     grouped_heads = heads_q // heads_k
     grouped_head_tile = npo2(grouped_heads)
     grouped_head_tile = min(32, grouped_head_tile)
 
-    # Crashes when converting single f32 to f8 {$nv-internal-release}
+    # Crashes when converting single f32 to f8
     if grouped_head_tile == 1 and prediction == 1 and qkv_dtype.width == 8:
         grouped_head_tile = 2
 
@@ -4445,7 +4376,8 @@ def run(
         f" --atol {tolerance}{' --skip_ref_check' if skip_ref_check else ''}"
         f" --scale {scale_s}"
         f" --sequence_tile {sequence_tile}"
-        f" --iterations {iterations} --warmups {warmup_iterations}{' --use_warm_l2' if use_warm_l2 else ''}"
+        f" --iterations {iterations} --warmups {warmup_iterations}"
+        f"{' --use_warm_l2' if use_warm_l2 else ''}"
         f"{' --no_cuda_graphs' if not use_cuda_graphs else ''}"
         f"{' --quiet' if quiet else ''}"
     )
@@ -4474,7 +4406,8 @@ def run(
             f"pv: {pv_dtype}\to: {o_dtype}\t\n"
             f"\tatol: {tolerance if not skip_ref_check else 'skip'}"
             f"\tscale_s: {f'1 / sqrt({headdim})' if scale_s == 0 else scale_s}\n"
-            f"\titerations: {iterations}\twarmups: {warmup_iterations}\tL2 warm: {use_warm_l2}\n"
+            f"\titerations: {iterations}\twarmups: {warmup_iterations}"
+            f"\tL2 warm: {use_warm_l2}\n"
             f"\tCUDA graph timing: {use_cuda_graphs}"
         )
 
@@ -4482,9 +4415,6 @@ def run(
     if scale_s == 0:
         scale_s = headdim**-0.5
 
-    #
-    # Config Kernel
-    #
     fmha = FlashAttentionDecodeSm100Bias(
         headdim,
         grouped_head_tile,
@@ -4558,9 +4488,6 @@ def run(
         k_sf_stride=k_sf_stride,
     )
 
-    #
-    # Allocate Tensors
-    #
     torch_ref_dtype = torch.float16
     torch_device = torch.device("cuda")
     torch.manual_seed(seed)
@@ -4830,9 +4757,6 @@ def run(
         _, m_partial_cute, m_partial_torch = create_tensor(qo_shape[:-1], acc_dtype)
         _, l_partial_cute, l_partial_torch = create_tensor(qo_shape[:-1], acc_dtype)
 
-    #
-    # Compile
-    #
     current_stream = cutlass_torch.default_stream()
     compiled_fmha = cute.compile(
         fmha,
@@ -4862,9 +4786,6 @@ def run(
     )
     print("Finished Compiling")
 
-    #
-    # Refcheck
-    #
     def run_torch_fmha(q_bshd, k_bshd, v_bshd, bias_bshr, scale_s):
         """Bottom-right causal/SWA GQA reference with compact relative bias."""
         qf = q_bshd.float().transpose(1, 2)
@@ -5008,9 +4929,6 @@ def run(
             "v_scale_effect": v_scale_effect,
         }
 
-    #
-    # Profile
-    #
     if iterations <= 0:
         return 0.0
 
@@ -5216,7 +5134,10 @@ if __name__ == "__main__":
         "--window-left",
         type=int,
         default=None,
-        help="causal sliding-window left extent; L includes keys center-L through center",
+        help=(
+            "causal sliding-window left extent; L includes keys center-L "
+            "through center"
+        ),
     )
 
     parser.add_argument(

@@ -175,7 +175,7 @@ class VocabParallelArgmax:
 
 @dataclasses.dataclass
 class LogitsProcessorOutput:
-    ## Part 1: This part will be assigned in python/tokenspeed/runtime/layers/logits_processor.py::LogitsProcessor
+    ## Part 1: This part will be assigned in LogitsProcessor (this module).
     # The logits of the next tokens.       shape: [#seq, vocab_size]
     next_token_logits: torch.Tensor
     # Used when ``do_argmax=True``.   shape: [#seq]
@@ -191,7 +191,8 @@ class LogitsProcessorOutput:
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
     next_token_top_logprobs_val: list | None = None
     next_token_top_logprobs_idx: list | None = None
-    # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
+    # The logprobs and ids of the requested token ids in output positions.
+    # shape: [#seq, n] (n is the number of requested token ids)
     next_token_token_ids_logprobs_val: list | None = None
     next_token_token_ids_logprobs_idx: list | None = None
     # Eager prefills only (``ForwardContext.sampled_top_k``): the most likely
@@ -200,7 +201,8 @@ class LogitsProcessorOutput:
     sampled_top_logprobs_val: torch.Tensor | None = None
     sampled_top_logprobs_idx: torch.Tensor | None = None
 
-    ## Part 3: Prefill-only. This part will be assigned in python/tokenspeed/runtime/layers/logits_processor.py::LogitsProcessor
+    ## Part 3: Prefill-only. This part will be assigned in LogitsProcessor
+    ## (this module).
     # The logprobs of the prompt rows the forward's ``InputLogprobPlan``
     # named, fp32 in plan order, whole on every rank.  shape: [#rows]
     input_token_logprobs: torch.Tensor | None = None
@@ -231,7 +233,7 @@ class LogitsMetadata:
     collective_global_num_tokens: list[int] | None = None
 
     # DP attention metadata. Not needed when DP attention is not used.
-    # Number of tokens in the request.
+    # Token count of each DP rank.
     global_num_tokens_gpu: torch.Tensor | None = None
     # The start position of local hidden states.
     dp_local_start_pos: torch.Tensor | None = None
@@ -405,7 +407,6 @@ class LogitsProcessor(nn.Module):
         on every draft step. Under attention DP the logits are full-vocab
         either way: the head is replicated (``skip_all_gather``), or
         ``dp_lm_head_tp`` transposes the vocab shards back to each rank's rows.
-        Returns None.
         """
         self.do_argmax = False
 
@@ -417,7 +418,6 @@ class LogitsProcessor(nn.Module):
         the argmax is then reduced across the vocabulary shards, and
         ``next_token_logits`` stays this rank's shard instead of the gathered
         vocabulary. Call once after construction and before the first forward.
-        Returns None.
         """
         self.do_argmax = True
 
@@ -510,7 +510,8 @@ class LogitsProcessor(nn.Module):
         ):
             return None
 
-        # A quantized head may keep its weight transposed, so read the shard width, not its rows.
+        # A quantized head may keep its weight transposed, so read the shard
+        # width, not its rows.
         vocab_padded = lm_head.num_embeddings_per_partition * self.tp_size
         if vocab_padded % (self.tp_size * 8) != 0:
             return None
@@ -677,7 +678,6 @@ class LogitsProcessor(nn.Module):
                 hidden_states, lm_head, logits_metadata, shard
             )
 
-        # Get the last hidden states and last logits for the next token prediction
         gather_ids = logits_metadata.gather_ids
         # Only a LAST capture stores the sampled rows of the aux hidden states
         # (Eagle3's layer taps), so only then are they selected -- on a shard,
@@ -721,7 +721,6 @@ class LogitsProcessor(nn.Module):
             if select_aux:
                 aux_pruned_states = list(aux_hidden_states)
 
-        # Compute logits for the sampled tokens.
         logits_layout_plan = self._resolve_logits_layout_plan(
             pruned_states, logits_metadata
         )
@@ -1108,7 +1107,8 @@ class LogitsProcessor(nn.Module):
                     )
 
             if state is not None and logits.size(0) <= self._LOGITS_AG_MAX_TOKENS:
-                # skip_entry_sync=True assumes other sync points existing between two all_gather_inner calls.
+                # skip_entry_sync=True assumes other sync points existing between
+                # two all_gather_inner calls.
                 logits = all_gather_inner(
                     state,
                     logits,
@@ -1179,10 +1179,8 @@ def fused_softcap_kernel(
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # Load values
     x = tl.load(full_logits_ptr + offsets, mask=mask).to(tl.float32)
 
-    # Perform operations in-place
     x = x / softcapping_value
 
     # Stable tanh form; the exp ratio overflows to inf/inf for large logits.
@@ -1190,7 +1188,6 @@ def fused_softcap_kernel(
 
     x = x * softcapping_value
 
-    # Store result
     tl.store(full_logits_ptr + offsets, x, mask=mask)
 
 

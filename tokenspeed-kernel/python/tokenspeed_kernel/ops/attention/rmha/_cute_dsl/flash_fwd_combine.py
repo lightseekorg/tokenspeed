@@ -43,7 +43,6 @@ class FlashAttentionForwardCombine:
         :param k_block_size: k block size
         :param log_max_splits: log2 of maximum splits
         :param num_threads: number of threads
-        :param varlen: whether using variable length sequences
         :param stages: number of pipeline stages
         :param use_pdl: launch with Programmatic Dependent Launch
         """
@@ -69,6 +68,7 @@ class FlashAttentionForwardCombine:
         num_threads,
     ) -> bool:
         """Check if the kernel can be implemented with the given parameters."""
+        del k_block_size
         if dtype not in [cutlass.Float16, cutlass.BFloat16, cutlass.Float32]:
             return False
         if dtype_partial not in [cutlass.Float16, cutlass.BFloat16, Float32]:
@@ -511,7 +511,6 @@ class FlashAttentionForwardCombine:
                         tOcO[0, 0, k][1]
                         < mO_partial.shape[1] - k_block * self.k_block_size
                     )
-                # if cute.arch.thread_idx()[0] == 0 and k_block == 1: cute.print_tensor(tOpO)
 
             load_O_partial = partial(
                 self.load_O_partial,
@@ -537,11 +536,6 @@ class FlashAttentionForwardCombine:
             # Wait for LSE and initial O partial stages to complete
             cute.arch.cp_async_wait_group(self.stages - 1)
             cute.arch.sync_threads()
-            # if cute.arch.thread_idx()[0] == 0:
-            #     # cute.print_tensor(sLSE)
-            #     for i in range(64):
-            #         cute.printf("sLSE[%d, 0] = %f", i, sLSE[i, 0])
-            # cute.arch.sync_threads()
 
             s2r_thr_copy_LSE = s2r_tiled_copy_LSE.get_slice(tidx)
             ts2rsLSE = s2r_thr_copy_LSE.partition_S(sLSE)
@@ -571,13 +565,11 @@ class FlashAttentionForwardCombine:
                     ),
                     threads_in_group=threads_per_col,
                 )
-                # if cute.arch.thread_idx()[0] == 0: cute.printf(lse_max)
                 # Find max valid split index
                 max_valid_idx = -1
                 for s in cutlass.range(cute.size(ts2rrLSE, mode=[1]), unroll_full=True):
                     if ts2rrLSE[0, s, m] != -Float32.inf:
                         max_valid_idx = ts2rcLSE[0, s, 0][0]  # Get split coordinate
-                # if cute.arch.thread_idx()[0] < 32: cute.printf(max_valid_idx)
                 max_valid_split[m] = cute.arch.warp_reduction_max(
                     max_valid_idx, threads_in_group=threads_per_col
                 )
@@ -711,7 +703,6 @@ class FlashAttentionForwardCombine:
             elems_per_store = const_expr(
                 cute.size(gmem_tiled_copy_O.layout_tv_tiled[1])
             )
-            # mO_cur_copy = cute.tiled_divide(mO_cur, (1, elems_per_store,))
             gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
             # Write final results
             for m in cutlass.range(num_rows, unroll_full=True):

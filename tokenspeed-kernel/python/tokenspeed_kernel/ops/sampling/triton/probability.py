@@ -101,7 +101,8 @@ def min_p_renorm_prob(
         raise ValueError("min_p_renorm_prob requires CUDA tensors")
     if probs.stride(-1) != 1:
         raise ValueError(
-            f"min_p_renorm_prob requires stride-1 vocab dimension, got stride={probs.stride()}"
+            "min_p_renorm_prob requires stride-1 vocab dimension, "
+            f"got stride={probs.stride()}"
         )
     if not min_p.is_contiguous():
         min_p = min_p.contiguous()

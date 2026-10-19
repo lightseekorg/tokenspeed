@@ -87,7 +87,6 @@ class MooncakeTransferEngine:
         try:
             ret_value = self.engine.register_memory(ptr, length)
         except Exception:
-            # Mark register as failed
             ret_value = -1
 
         if ret_value != 0:
@@ -98,7 +97,6 @@ class MooncakeTransferEngine:
         try:
             ret_value = self.engine.unregister_memory(ptr)
         except Exception:
-            # Mark deregister as failed
             ret_value = -1
 
         if ret_value != 0:
@@ -109,7 +107,6 @@ class MooncakeTransferEngine:
         hostname: str,
         device_name: str | None,
     ) -> None:
-        """Initialize the mooncake instance."""
         ret_value = self.engine.initialize(
             hostname,
             "P2PHANDSHAKE",
@@ -131,7 +128,6 @@ class MooncakeTransferEngine:
                 session_id, buffer, peer_buffer_address, length
             )
         except Exception:
-            # Mark transfer request as failed
             ret = -1
 
         if ret < 0:
@@ -155,14 +151,14 @@ class MooncakeTransferEngine:
             ret = self.engine.batch_transfer_sync_write(
                 session_id, buffers, peer_buffer_addresses, lengths
             )
-        except Exception:
+        except Exception as exc:
             ret = -1
-            # Inform user to upgrade mooncake-transfer-engine >= 0.3.4.post2
             if not hasattr(self.engine, "batch_transfer_sync_write"):
                 raise RuntimeError(
-                    "Mooncake's batch transfer requires mooncake-transfer-engine >= 0.3.4.post2. "
-                    "Please upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'"
-                )
+                    "Mooncake's batch transfer requires mooncake-transfer-engine "
+                    ">= 0.3.4.post2. Please upgrade Mooncake by "
+                    "'pip install mooncake-transfer-engine --upgrade'"
+                ) from exc
 
         if ret < 0:
             logger.debug(
@@ -199,7 +195,7 @@ class MooncakeTransferEngine:
     def transfer_submit_write(
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int
     ) -> int:
-        """ASynchronously transfer data to the specified address."""
+        """Asynchronously transfer data to the specified address."""
 
         batch_id = self.engine.transfer_submit_write(
             session_id, buffer, peer_buffer_address, length

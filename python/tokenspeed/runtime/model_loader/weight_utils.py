@@ -122,7 +122,6 @@ def _json_folder(model_config: ModelConfig, load_config: LoadConfig) -> str:
             tqdm_class=DisabledTqdm,
         )
 
-    # Download the config files.
     with get_lock(model_name_or_path, load_config.download_dir):
         return call_with_hf_rate_limit_retry(
             f"downloading config files of {model_name_or_path}",
@@ -166,14 +165,13 @@ def get_quant_config(
 ) -> QuantizationConfig:
     quant_cls = get_quantization_config(model_config.quantization)
 
-    # Read the quantization config from the HF model config, if available.
     hf_quant_config = getattr(model_config.hf_config, "quantization_config", None)
     # some vision model may keep quantization_config in their text_config
     hf_text_config = getattr(model_config.hf_config, "text_config", None)
     if hf_quant_config is None and hf_text_config is not None:
         hf_quant_config = getattr(hf_text_config, "quantization_config", None)
     if hf_quant_config is None:
-        # compressed-tensors uses a compressions_config
+        # compressed-tensors uses a compression_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
     if hf_quant_config is not None:
         if "quantized_layers" in hf_quant_config:
@@ -198,7 +196,7 @@ def get_quant_config(
     quant_config_files = [
         f for f in config_files if any(f.endswith(x) for x in possible_config_filenames)
     ]
-    if len(quant_config_files) == 0:
+    if not quant_config_files:
         raise ValueError(f"Cannot find the config file for {model_config.quantization}")
     if len(quant_config_files) > 1:
         raise ValueError(
@@ -207,7 +205,7 @@ def get_quant_config(
         )
 
     quant_config_file = quant_config_files[0]
-    with open(quant_config_file) as f:
+    with open(quant_config_file, encoding="utf-8") as f:
         config = json.load(f)
 
         if model_config.quantization == "nvfp4":
@@ -249,17 +247,15 @@ def download_weights_from_hf(
         str: The path to the downloaded model weights.
     """
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
-        # Before we download we look at that is available:
         fs = HfFileSystem()
         file_list = call_with_hf_rate_limit_retry(
             f"listing weight files of {model_name_or_path}",
             lambda: fs.ls(model_name_or_path, detail=False, revision=revision),
         )
 
-        # depending on what is available we download different things
         for pattern in allow_patterns:
             matching = fnmatch.filter(file_list, pattern)
-            if len(matching) > 0:
+            if matching:
                 allow_patterns = [pattern]
                 break
 
@@ -314,7 +310,6 @@ def download_safetensors_index_file_from_hf(
     # downloading the same model weights at the same time.
     with get_lock(model_name_or_path, cache_dir):
         try:
-            # Download the safetensors index file.
             call_with_hf_rate_limit_retry(
                 f"downloading {index_file} of {model_name_or_path}",
                 download_index_file,
@@ -341,9 +336,7 @@ def filter_duplicate_safetensors_files(
     if not os.path.isfile(index_file_name):
         return hf_weights_files
 
-    # Iterate through the weight_map (weight_name: safetensors files)
-    # to identify weights that we should use.
-    with open(index_file_name) as f:
+    with open(index_file_name, encoding="utf-8") as f:
         weight_map = json.load(f)["weight_map"]
     weight_files_in_index = set()
     for weight_name in weight_map:
@@ -391,7 +384,7 @@ def filter_safetensors_files_by_weight_names(
     if not os.path.isfile(index_file_name):
         return hf_weights_files
 
-    with open(index_file_name) as f:
+    with open(index_file_name, encoding="utf-8") as f:
         weight_map = json.load(f)["weight_map"]
     needed_files = set()
     for weight_name, shard_name in weight_map.items():
@@ -478,10 +471,10 @@ def np_cache_weights_iterator(
                     with open(param_path, "wb") as f:
                         np.save(f, param.cpu().detach().numpy())
                     weight_names.append(name)
-            with open(weight_names_file, "w") as f:
+            with open(weight_names_file, "w", encoding="utf-8") as f:
                 json.dump(weight_names, f)
 
-    with open(weight_names_file) as f:
+    with open(weight_names_file, encoding="utf-8") as f:
         weight_names = json.load(f)
 
     for name in weight_names:
@@ -592,8 +585,8 @@ class CheckpointPrefetcher:
     def start(self) -> None:
         logger.info(
             f"Prefetching {self._owned_files}/{len(self._files)} checkpoint shards "
-            f"as local reader {self._local_rank}/{self._local_world_size} into the OS page "
-            f"cache (window {self._window_bytes / 1024**3:.1f} GiB, "
+            f"as local reader {self._local_rank}/{self._local_world_size} "
+            f"into the OS page cache (window {self._window_bytes / 1024**3:.1f} GiB, "
             f"up to {self._num_threads} range-reader threads)."
         )
         self._start_time = time.perf_counter()
@@ -700,7 +693,8 @@ def _madvise_sequential(tensors: Iterable[torch.Tensor]) -> None:
     for start, end in merged:
         if madvise(start, end - start, mmap.MADV_SEQUENTIAL):
             logger.debug(
-                f"Could not advise checkpoint mapping: {os.strerror(ctypes.get_errno())}"
+                "Could not advise checkpoint mapping: "
+                f"{os.strerror(ctypes.get_errno())}"
             )
 
 
@@ -1132,7 +1126,7 @@ def non_unit_kv_scale_message(rejected: list[str]) -> str:
 def require_unit_kv_scale_file(path: str) -> None:
     """Reject a ``--quantization-param-path`` file with a KV scale other than one."""
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             scaling_factor = json.load(f)["kv_cache"]["scaling_factor"]
         scales = [
             (tp_rank, layer, float(scale))
@@ -1168,16 +1162,11 @@ def mamba_v2_sharded_weight_loader(
         # - track boundary of (sharded) param, and loaded_weight, respectively
         boundary, loaded_boundary = 0, 0
 
-        # - iterate over the shard specs
         for full_dim, extra, duplicate_groups in shard_spec:
             # - full dim is the model dim (before TP).
             # - extra > 0, means there is expected overall increase
             #   of dimensions. This is so because of replication.
-            # - ratio is used map the tp_rank to the actual shard
-            #   rank. This is useful when there is replication of
-            #   groups to accompany head shards.
 
-            # - size of the loaded shard
             shard_size = full_dim // tp_size
 
             # - compute the rank into the loaded shard.
@@ -1204,7 +1193,6 @@ def mamba_v2_sharded_weight_loader(
                 loaded_start_idx : (loaded_start_idx + take)  # type: ignore[misc]
             ]  # type: ignore[misc]
 
-            # move indexing boundaries
             boundary += shard_size
             loaded_boundary += full_dim - extra
 

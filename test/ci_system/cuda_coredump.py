@@ -87,7 +87,6 @@ def report():
     print(f"{separator}\n")
 
 
-# Auto-inject CUDA coredump env vars at import time.
 # The sentinel env var is inherited by child processes, so injection only
 # happens once in the top-level process.
 _SENTINEL = "_TOKENSPEED_CUDA_COREDUMP_INJECTED"

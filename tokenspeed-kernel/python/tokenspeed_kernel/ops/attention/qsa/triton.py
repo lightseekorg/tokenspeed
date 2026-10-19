@@ -1113,9 +1113,6 @@ def qwen4_exp_qsa_recent_write(
             launch on NVIDIA GPUs. Compression must have waited for the producer
             of token keys and metadata before triggering this writer, allowing
             those inputs to preload while compression finishes its ring reads.
-
-    Returns:
-        None.
     """
 
     rows = logical_positions.shape[0]
@@ -1285,9 +1282,6 @@ def qwen4_exp_qsa_commit_verify_layers(
         recent_page_size: Rows covered by one recent-cache page.
         compress_ratio: Tokens grouped into one compressed entry.
         verify_width: Candidate width per request.
-
-    Returns:
-        None.
     """
 
     num_layers = raw_addresses.numel()
@@ -1743,8 +1737,7 @@ def triton_qsa_block_topk_stream(
     # ``-1`` sentinels for empty slots, so skip the fill and leave the
     # buffer uninitialized.
     selected = torch.empty((rows, block_topk), dtype=torch.int32, device=query.device)
-    # Wide tiles amortize the running top-k merge for large block_topk;
-    # small topk keeps the original 64-block tiles.
+    # Wide tiles amortize the running top-k merge for large block_topk.
     block_n = min(512, block_topk)
     splits = max(1, max_partial_bytes // max(rows * block_topk * 8, 1))
     # Target roughly 256 streaming programs so single-row decode batches

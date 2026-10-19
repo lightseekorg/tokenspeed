@@ -205,9 +205,10 @@ def torch_mm_fp8_scaled_mnk(
     assert A_scales.numel() == 1, "A_scales must be a single per-tensor scale"
     assert B_scales.numel() == 1, "B_scales must be a single per-tensor scale"
 
-    assert (
-        A.shape[1] == B.shape[1]
-    ), f"Expected A and B to have the same K dimension, got {tuple(A.shape)} and {tuple(B.shape)}"
+    assert A.shape[1] == B.shape[1], (
+        "Expected A and B to have the same K dimension, "
+        f"got {tuple(A.shape)} and {tuple(B.shape)}"
+    )
 
     A_scales = float(A_scales.item())
     B_scales = float(B_scales.item())
@@ -253,9 +254,10 @@ def torch_mm_fp8_scaled_nkm(
     assert A_scales.numel() == 1, "A_scales must be a single per-tensor scale"
     assert B_scales.numel() == 1, "B_scales must be a single per-tensor scale"
 
-    assert (
-        A.shape[1] == B.shape[0]
-    ), f"Expected A and B to have the same K dimension, got {tuple(A.shape)} and {tuple(B.shape)}"
+    assert A.shape[1] == B.shape[0], (
+        "Expected A and B to have the same K dimension, "
+        f"got {tuple(A.shape)} and {tuple(B.shape)}"
+    )
 
     output = (A.float() * float(A_scales.item())) @ (B.float() * float(B_scales.item()))
 
@@ -669,6 +671,7 @@ def torch_dsv4_grouped_output_projection(
     Returns:
         ``[tokens, num_groups, output_dim]`` in FP32, unrounded.
     """
+    del heads_per_group
     tokens = attention.shape[0]
     values = attention.float().clone()
     cos, sin = cos_sin_cache[positions].float().unsqueeze(1).chunk(2, dim=-1)

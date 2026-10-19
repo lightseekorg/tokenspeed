@@ -199,7 +199,7 @@ class TestFusedStateTwoSlots:
         prompt extending the same tokens claims it as slot 0 and skips the prefix."""
         scheduler = ts.Scheduler(_fused_config(decode_input_tokens=1))
         scheduler.submit_requests([_spec("seed", [1, 2, 3, 4], MAX_NEW_TOKENS)])
-        [prefill] = _dispatched(scheduler.next_execution_plan())
+        [_] = _dispatched(scheduler.next_execution_plan())
         _advance(scheduler, "seed", [201])
         [decode1] = _dispatched(scheduler.next_execution_plan())
         checkpoints = {g: row[0] for g, row in _state_rows(decode1, "seed").items()}

@@ -72,7 +72,6 @@ _is_blackwell = current_platform().is_blackwell
 
 
 def _is_moe_layer(layer_id: int, config) -> bool:
-    """Return whether the given decoder layer should use the MoE block."""
     if layer_id < 0:
         return False
     mlp_only_layers = getattr(config, "mlp_only_layers", [])
@@ -126,7 +125,8 @@ class Qwen3_5MoeMLP(nn.Module):
             hidden_size: Model hidden dimension.
             intermediate_size: Per-expert intermediate dimension (unsharded).
             hidden_act: Activation name; only "silu" is supported.
-            mapping: Parallelism mapping; the dense TP group shards the weights.
+            mapping: Parallelism mapping; ``parallelism`` picks the group that
+                shards the weights.
             quant_config: Optional quantization config.
             reduce_results: Whether the row-parallel projection reduces across
                 the dense TP group. Ignored when weights are replicated.
@@ -137,6 +137,8 @@ class Qwen3_5MoeMLP(nn.Module):
                 distinct token shard per rank (the DeepEP layout), where a
                 tensor-parallel reduction would sum partial products computed
                 from different tokens.
+            parallelism: "dense" shards over the dense TP group, "moe_shared"
+                over the MoE TP*EP group.
         """
         super().__init__()
         self.mapping = mapping
@@ -224,7 +226,7 @@ class Qwen3_5MoeMLP(nn.Module):
         )
 
     def nvfp4_global_scale(self) -> torch.Tensor | None:
-        """The global scale gate_up_proj quantizes its input to NVFP4 with, if it does."""
+        """The global scale gate_up_proj quantizes its input to NVFP4 with, if any."""
         return self.gate_up_proj.quant_method.nvfp4_global_scale(self.gate_up_proj)
 
     def forward(self, x):
@@ -233,7 +235,7 @@ class Qwen3_5MoeMLP(nn.Module):
     def forward_prequantized(
         self, x: torch.Tensor, x_nvfp4: tuple[torch.Tensor, torch.Tensor] | None
     ) -> torch.Tensor:
-        """``forward(x)``, taking gate_up_proj's NVFP4 input from its producer when given."""
+        """``forward(x)``, with ``x_nvfp4`` as gate_up_proj's NVFP4 input if given."""
         if x.shape[0] == 0:
             return x
         if self._use_nvfp4_gemm_swiglu_nvfp4_quant:
@@ -370,7 +372,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             self.shared_expert_gate = None
 
     def nvfp4_global_scale(self) -> torch.Tensor | None:
-        """None: the experts quantize their own inputs, so no producer applies a scale."""
+        """None: the experts quantize their own inputs."""
         return None
 
     def get_moe_routed_weights(self):
@@ -467,7 +469,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         max_num_tokens_per_gpu: int,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        """DeepEP path: routing on local tokens, dispatch/combine handled by executor."""
+        """DeepEP path: route local tokens; the executor dispatches and combines."""
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -487,7 +489,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                 nonlocal shared_output
                 shared_output = self.shared_expert(hidden_states)
 
-        # TopK on local tokens
         if hidden_states.shape[0] > 0:
             topk_output = self.topk(hidden_states, router_logits)
         else:

@@ -102,12 +102,10 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         self.session_pool_lock = threading.Lock()
         self.addr_to_rooms_tracker = defaultdict(set)
         self.connection_lock = threading.Lock()
-        # Heartbeat interval should be at least 2 seconds
         self.heartbeat_interval = max(
             envs.TOKENSPEED_DISAGGREGATION_HEARTBEAT_INTERVAL.get(),
             2.0,
         )
-        # Heartbeat failure should be at least 1
         self.max_failures = max(
             envs.TOKENSPEED_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.get(), 1
         )
@@ -129,7 +127,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         self.bind_server_socket(get_local_ip_by_remote())
         # Maps bootstrap_room -> bootstrap_token (first output token from prefill).
         # Populated by decode_thread when a Success message carries a valid token,
-        # consumed by DisaggDecodeExecutor.generate_events() via pop_bootstrap_token().
+        # consumed by DisaggDecodeExecutor.generate_events() via pop_prefill_metadata().
         self.bootstrap_token_table: dict[int, int] = {}
         self.spec_candidate_ids_table: dict[int, list[int]] = {}
         self.cached_tokens_table: dict[int, int] = {}
@@ -341,7 +339,8 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                 continue
             self.record_failure(
                 room,
-                f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
+                "Losing connection with prefill instance "
+                f"(bootstrap_addr: {failed_bootstrap_addr})",
             )
             self.kv_transfer_metrics.record_kv_transfer_failure()
             self.update_status(room, TransferPoll.Failed)

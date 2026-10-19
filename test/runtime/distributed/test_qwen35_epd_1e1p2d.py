@@ -173,7 +173,7 @@ def _tail_file(path: str, stop_event: threading.Event, prefix: str = "[encode] "
     while not os.path.exists(path):
         if stop_event.wait(1):
             return
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         while not stop_event.is_set():
             line = f.readline()
             if line:

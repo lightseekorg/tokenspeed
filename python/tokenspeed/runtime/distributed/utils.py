@@ -66,12 +66,10 @@ def split_tensor_along_last_dim(
                                  in memory.
 
     Returns:
-        A list of Tensors
+        A tuple of Tensors
     """
-    # Get the size and dimension.
     last_dim = tensor.dim() - 1
     last_dim_size = divide(tensor.size()[last_dim], num_partitions)
-    # Split.
     tensor_list = torch.split(tensor, last_dim_size, dim=last_dim)
     #  torch.split does not create contiguous tensors by default.
     if contiguous_split_chunks:
@@ -108,7 +106,6 @@ class StatelessProcessGroup:
     def expire_data(self) -> None:
         """Expire data that is older than `data_expiration_seconds` seconds."""
         while self.entries:
-            # check the oldest entry
             key, timestamp = self.entries[0]
             if time.time() - timestamp > self.data_expiration_seconds:
                 self.store.delete_key(key)

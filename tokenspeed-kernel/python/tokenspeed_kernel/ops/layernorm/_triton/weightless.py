@@ -26,11 +26,7 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import (
-    dense_tensor_format,
-    format_signature,
-    format_signatures,
-)
+from tokenspeed_kernel.signature import format_signatures
 
 _FLOAT_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 

@@ -128,7 +128,8 @@ def test_mla_prefill(
 
 
 @pytest.mark.parametrize(
-    "solution,q_dtype,kv_dtype,num_heads,kv_lora_rank,qk_rope_head_dim,batch_size,page_size",
+    "solution,q_dtype,kv_dtype,num_heads,kv_lora_rank,"
+    "qk_rope_head_dim,batch_size,page_size",
     [
         pytest.param(
             "triton",

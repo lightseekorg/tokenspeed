@@ -50,12 +50,12 @@ class AscendDCPContext:
         self.primary_process_group = self.auxiliary_process_group = None
         self.stream_fork = None
         if degree > 1 and dist.is_initialized():
+            # Imported lazily so the standalone address/reference tests do not
+            # pull in runtime modules.
             from tokenspeed.runtime.distributed.process_group_manager import (
                 process_group_manager as pg_manager,
             )
 
-            # Import the manager used by the host, without imposing runtime
-            # imports on the standalone address/reference tests.
             self.primary_process_group = pg_manager.get_device_process_group(ranks)
             self.auxiliary_process_group = pg_manager.get_dedicated_device_group(
                 ranks, auxiliary_namespace

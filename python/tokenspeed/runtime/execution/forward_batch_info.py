@@ -107,7 +107,6 @@ def compute_position_triton(
         batch_size, dtype=torch.int32, device=extend_seq_lens.device
     )
     has_prefix = extend_prefix_lens.shape[0] == batch_size
-    # Launch kernel
     compute_position_kernel[(batch_size,)](
         positions, extend_start_loc, extend_prefix_lens, extend_seq_lens, has_prefix
     )

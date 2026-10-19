@@ -25,7 +25,6 @@
 
 from contextlib import contextmanager
 
-# ===================== import region =====================
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.nccl import (
@@ -55,14 +54,12 @@ class PyNcclCommunicator:
     ):
         """
         Args:
-            group: the process group to work on. If None, it will use the
-                default process group.
-            device: the device to bind the PyNcclCommunicator to. If None,
-                it will be bind to f"cuda:{local_rank}".
+            group: the process group to work on; must not be an NCCL group.
+            device: the device to bind the PyNcclCommunicator to.
             library_path: the path to the NCCL library. If None, it will
                 use the default library path.
         It is the caller's responsibility to make sure each communicator
-        is bind to a unique device.
+        is bound to a unique device.
         """
         if not isinstance(group, StatelessProcessGroup):
             if not dist.is_initialized():
@@ -80,7 +77,6 @@ class PyNcclCommunicator:
 
         self.group = group
 
-        # if world_size == 1, no need to create communicator
         if self.world_size == 1:
             self.available = False
             self.disabled = True
@@ -102,10 +98,8 @@ class PyNcclCommunicator:
         logger.info(f"Epsilon is using nccl=={self.nccl.ncclGetVersion()!s}")
 
         if self.rank == 0:
-            # get the unique id from NCCL
             self.unique_id = self.nccl.ncclGetUniqueId()
         else:
-            # construct an empty unique id
             self.unique_id = ncclUniqueId()
 
         if not isinstance(group, StatelessProcessGroup):
@@ -122,15 +116,12 @@ class PyNcclCommunicator:
             device = torch.device(f"cuda:{device}")
         elif isinstance(device, str):
             device = torch.device(device)
-        # now `device` is a `torch.device` object
         if not isinstance(device, torch.device):
             raise TypeError(
                 f"device must be a torch.device, got {type(device).__name__}"
             )
         self.device = device
         # nccl communicator and stream will use this device
-        # `torch.cuda.device` is a context manager that changes the
-        # current cuda device to the specified one
         with torch.cuda.device(device):
             self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
                 self.world_size, self.unique_id, self.rank
@@ -278,11 +269,7 @@ class PyNcclCommunicator:
     def change_state(
         self, enable: bool | None = None, stream: torch.cuda.Stream | None = None
     ):
-        """
-        A context manager to change the state of the communicator.
-        """
         if enable is None:
-            # guess a default value when not specified
             enable = self.available
 
         if stream is None:

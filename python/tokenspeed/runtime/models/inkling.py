@@ -156,7 +156,8 @@ _KV_REPLICATED_SUFFIXES = (
 )
 
 
-# ModelOpt NVFP4: input_scale = amax/(448*6) (E4M3 max * E2M1 max); ckpt stores raw amax.
+# ModelOpt NVFP4: input_scale = amax/(448*6) (E4M3 max * E2M1 max); ckpt stores
+# raw amax.
 _NVFP4_AMAX_TO_SCALE = 448.0 * 6.0
 
 
@@ -311,7 +312,8 @@ class InklingShortConvolution(nn.Module):
         self.channel_offset = channel_offset
         self.tp_rank = tp_rank
         self._on_load = on_load
-        # Checkpoint Conv1d depthwise shape [dim, 1, W]; the last tap multiplies the current token.
+        # Checkpoint Conv1d depthwise shape [dim, 1, W]; the last tap multiplies
+        # the current token.
         self.weight = nn.Parameter(
             torch.empty(dim, 1, kernel_size), requires_grad=False
         )
@@ -540,7 +542,8 @@ class InklingAttention(nn.Module):
         else:
             self.k_sconv = None
             self.v_sconv = None
-        # Fused K+V sconv: adjacent pool regions + lazily cached concat of the frozen tap weights.
+        # Fused K+V sconv: adjacent pool regions + lazily cached concat of the
+        # frozen tap weights.
         self._kv_channel_offset = layout[InklingConvStream.K][0]
         self._kv_sconv_w_cache: torch.Tensor | None = None
 
@@ -615,7 +618,8 @@ class InklingAttention(nn.Module):
                 )
             k = kv[:, : self.kv_size]
             v = kv[:, self.kv_size :]
-            # Norm and KV store hide under the rel_logits branch; only attention waits for the join.
+            # Norm and KV store hide under the rel_logits branch; only attention
+            # waits for the join.
             prepared = self.attn.prologue(q, k, v, None, ctx)
 
         attn_output = self.attn.attend(
@@ -722,7 +726,8 @@ class InklingGate(nn.Module):
             torch.empty(1, dtype=torch.float32), requires_grad=False
         )
 
-        # Router-gemm eligibility as deepseek_v3.MoEGate; n_routed <= 256 asserted below.
+        # Router-gemm eligibility as deepseek_v3.MoEGate; n_routed <= 256
+        # asserted below.
         self.use_dsv3_router_gemm = (
             _is_hopper_plus
             and self.weight.dtype in (torch.bfloat16, torch.float32)
@@ -753,7 +758,8 @@ class InklingGate(nn.Module):
         else:
             logits = F.linear(x, self.weight, None)
 
-        # Full logits (routed + shared sink) pass as router_logits; the routing fn consumes the tail.
+        # Full logits (routed + shared sink) pass as router_logits; the routing
+        # fn consumes the tail.
         topk_output = self.topk(x, logits)
         return topk_output.topk_weights, topk_output.topk_ids, logits
 
@@ -772,6 +778,7 @@ class InklingSharedExperts(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
+        del quant_config, prefix
         super().__init__()
         tp_size = mapping.attn.tp_size
         assert config.intermediate_size % tp_size == 0
@@ -815,17 +822,20 @@ class InklingSharedExperts(nn.Module):
         gammas: torch.Tensor | None = None,
         do_finalize: bool = True,
     ) -> torch.Tensor:
-        # Batched GEMM over S shared experts, batch stride 0 on x: [S,T,H] @ [S,H,2I] -> [S,T,2I].
+        # Batched GEMM over S shared experts, batch stride 0 on x:
+        # [S,T,H] @ [S,H,2I] -> [S,T,2I].
         h = torch.bmm(
             x.unsqueeze(0).expand(self.n_shared, -1, -1),
             self.w13_weight.transpose(1, 2),
         )
         h = self.act_fn(h)
         if not do_finalize:
-            # Un-weighted [S, T, H] per-expert outputs; caller applies sink gammas in the fused finalize.
+            # Un-weighted [S, T, H] per-expert outputs; caller applies sink gammas
+            # in the fused finalize.
             return torch.bmm(h, self.w2_weight.transpose(1, 2))
         assert gammas is not None
-        # Fold gammas before down-proj (linear, so equivalent); scaling [S,T,I] beats weighting [S,T,H].
+        # Fold gammas before down-proj (linear, so equivalent); scaling [S,T,I]
+        # beats weighting [S,T,H].
         h = h * gammas.to(h.dtype).t().unsqueeze(-1)
         return torch.bmm(h, self.w2_weight.transpose(1, 2)).sum(dim=0)
 
@@ -902,13 +912,15 @@ class InklingSparseMoeBlock(nn.Module):
                 intermediate_size=config.intermediate_size,
                 quant_config=quant_config,
                 layer_index=layer_id,
-                # Deepseek-convention MLP prefix: MoELayer probes quant exclusion via "<prefix>.experts".
+                # Deepseek-convention MLP prefix: MoELayer probes quant exclusion
+                # via "<prefix>.experts".
                 prefix=prefix,
                 tp_rank=mapping.moe.tp_rank,
                 tp_size=mapping.moe.tp_size,
                 ep_rank=mapping.moe.ep_rank,
                 ep_size=mapping.moe.ep_size,
-                # Inkling routing is computed in InklingGate; the MoE kernel consumes the precomputed top-k plan.
+                # Inkling routing is computed in InklingGate; the MoE kernel
+                # consumes the precomputed top-k plan.
                 routing_mode="precomputed_topk",
             )
             assert not self.experts.support_routing
@@ -920,14 +932,16 @@ class InklingSparseMoeBlock(nn.Module):
             dense_batch_invariant=False,
             query_sharded=False,
         )
-        # sconv shifts along the token dim, so this block must return full token rows (no reduce-scatter).
+        # Sconv shifts along the token dim, so this block must return full token
+        # rows (no reduce-scatter).
         assert self.comm_manager.use_all_reduce(is_moe=True), (
             "Inkling requires attn_tp_size == moe tp_size * ep_size "
             "(all-reduce MoE communication pattern)"
         )
 
     def forward(self, x: torch.Tensor, ctx: ForwardContext) -> torch.Tensor:
-        # weights: [T, k + S] — selected-routed weights then shared sink gammas (joint normalization).
+        # weights: [T, k + S] — selected-routed weights then shared sink gammas
+        # (joint normalization).
         top_k = self.gate.top_k
         deferred = (
             not self.use_torch_moe and self.experts.supports_deferred_cuda_finalize
@@ -945,7 +959,8 @@ class InklingSparseMoeBlock(nn.Module):
                     shared_out = self.shared_experts(x, do_finalize=False)
                 weights, topk_ids, router_logits = self.gate(x)
                 topk_output = StandardTopKOutput(
-                    # Non-contiguous view is fine: the routed kernel repacks the weights.
+                    # Non-contiguous view is fine: the routed kernel repacks the
+                    # weights.
                     topk_weights=weights[:, :top_k],
                     topk_ids=topk_ids,
                     router_logits=router_logits,
@@ -957,7 +972,8 @@ class InklingSparseMoeBlock(nn.Module):
                     max_num_tokens_per_gpu=max_tokens_per_gpu,
                     do_finalize=False,
                 )
-            # One fused epilogue applies routed weights + shared sink gammas (full [T, k+S]) and sums.
+            # One fused epilogue applies routed weights + shared sink gammas
+            # (full [T, k+S]) and sums.
             out = moe_finalize_fuse_shared(
                 gemm2_out,
                 expanded_idx,
@@ -994,7 +1010,8 @@ class InklingSparseMoeBlock(nn.Module):
                     with fork.branch():
                         shared_out = self.shared_experts(x, shared_gammas)
             out = routed_out + shared_out
-        # Rank-local partial sum (TP/EP sharded); combine across the MoE group in one collective.
+        # Rank-local partial sum (TP/EP sharded); combine across the MoE group in
+        # one collective.
         out, _ = self.comm_manager.post_moe_comm(out, None, ctx)
         return out
 
@@ -1311,7 +1328,8 @@ class InklingHMLPPatchEncoder(nn.Module):
             x = self.layers[f"linear_{i}"](x)
             if i < self.n_layers - 1:
                 norm = self.layers[f"norm_{i}"]
-                # The RMSNorm kernel expects 2-D input; fold the spatial axes and restore after.
+                # The RMSNorm kernel expects 2-D input; fold the spatial axes and
+                # restore after.
                 x = norm(x.reshape(-1, x.shape[-1])).reshape(x.shape)
                 x = F.gelu(x)
         if self.final_norm is not None:
@@ -1482,7 +1500,8 @@ class InklingTextModel(nn.Module):
             if self.embed_norm is not None:
                 hidden_states = self.embed_norm(hidden_states)
         else:
-            # embed_norm is already folded into mm_text_embedding; tower features carry their own norm.
+            # embed_norm is already folded into mm_text_embedding; tower features
+            # carry their own norm.
             hidden_states = input_embeds
 
         log_scaling_tau = None
@@ -1528,7 +1547,8 @@ class InklingForConditionalGeneration(nn.Module):
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
     ):
-        # Towers are attention-free; the knob is just a VLM-wrapper interface requirement.
+        # Towers are attention-free; the knob is just a VLM-wrapper interface
+        # requirement.
         del mm_attention_backend
         super().__init__()
 
@@ -1553,7 +1573,8 @@ class InklingForConditionalGeneration(nn.Module):
             prefix=add_prefix("model", prefix),
         )
 
-        # Tower presence is a checkpoint fact; --language-model-only turns them off at runtime.
+        # Tower presence is a checkpoint fact; --language-model-only turns them off
+        # at runtime.
         self.is_multimodal_active = is_multimodal_active
         audio_enabled = (
             is_multimodal_active and config.audio_config.decoder_dmodel is not None
@@ -1599,7 +1620,8 @@ class InklingForConditionalGeneration(nn.Module):
             tp_group=mapping.attn.tp_group,
             prefix=add_prefix("lm_head", prefix),
         )
-        # All-gather vocab-sharded logits before sampling; do_argmax would bypass the pad masking below.
+        # All-gather vocab-sharded logits before sampling; do_argmax would bypass
+        # the pad masking below.
         self.logits_processor = _InklingLogitsProcessor(
             text_config,
             skip_all_gather=mapping.attn.has_dp,
@@ -1673,7 +1695,8 @@ class InklingForConditionalGeneration(nn.Module):
         ):
             return None
         if self.vision_embedder is None:
-            # Out-of-vocab MM pad ids would otherwise die as a cryptic CUDA indexing assert below.
+            # Out-of-vocab MM pad ids would otherwise die as a cryptic CUDA
+            # indexing assert below.
             raise RuntimeError(
                 "Multimodal inputs were provided but this Inkling checkpoint has "
                 "no audio/vision towers (audio_config/vision_config "
@@ -1808,7 +1831,8 @@ class InklingForConditionalGeneration(nn.Module):
             if not 0 <= local_id < num_local:
                 continue
             if kind == "nvfp4_input_amax":
-                # One scalar per layer/tensor; convert amax to the input_scale the NVFP4 kernels consume.
+                # One scalar per layer/tensor; convert amax to the input_scale the
+                # NVFP4 kernels consume.
                 scale = (loaded_weight.detach().float() / _NVFP4_AMAX_TO_SCALE).reshape(
                     ()
                 )
@@ -1820,7 +1844,8 @@ class InklingForConditionalGeneration(nn.Module):
                 for sid in shard_ids:
                     loader(param, expert_weight, shard_id=sid, local_expert_id=local_id)
                 continue
-            # Block scales share the w13 row layout (per-16-group scales follow weight rows 1:1).
+            # Block scales share the w13 row layout (per-16-group scales follow
+            # weight rows 1:1).
             if is_w13 and interleaved:
                 expert_weight = _deinterleave_w13(expert_weight)
             if loader is None:  # torch-native fallback experts: plain params
@@ -1943,7 +1968,8 @@ class InklingForConditionalGeneration(nn.Module):
                 "scale": (f"{module_name}.{weight_name}_scale", "weight"),
                 "scale2": (f"{module_name}.{weight_name}_scale_2", "nvfp4_scale2"),
                 "input_amax": (
-                    f"{module_name}.{'w13' if weight_name == 'w13_weight' else 'w2'}_input_scale",
+                    f"{module_name}."
+                    f"{'w13' if weight_name == 'w13_weight' else 'w2'}_input_scale",
                     "nvfp4_input_amax",
                 ),
             }
@@ -2033,7 +2059,7 @@ class InklingForConditionalGeneration(nn.Module):
         for name, w in weights:
             name = name.removeprefix("model.")
             if name.startswith("mtp."):
-                continue  # MTP chain lands with speculative decoding
+                continue
             if name.startswith("audio."):
                 if self.audio is not None:
                     load_param(name, w)

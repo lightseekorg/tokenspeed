@@ -373,10 +373,10 @@ class _DetokenizerParityBase:
 
         assert ("".join(pieces)) == (source)
         for i, piece in enumerate(pieces):
-            _pytest_member_1 = "\ufffd"
-            _pytest_container_2 = piece
-            _pytest_msg_3 = f"frame {i} leaked replacement char: {piece!r}"
-            assert _pytest_member_1 not in _pytest_container_2, _pytest_msg_3
+            replacement_char = "\ufffd"
+            frame_text = piece
+            message = f"frame {i} leaked replacement char: {piece!r}"
+            assert replacement_char not in frame_text, message
 
     def test_cjk_two_frame_split_reconstructs_source(self):
         source = "你好世界"
@@ -404,10 +404,10 @@ class _DetokenizerParityBase:
 
         assert ("".join(pieces)) == (source)
         for i, piece in enumerate(pieces):
-            _pytest_member_4 = "\ufffd"
-            _pytest_container_5 = piece
-            _pytest_msg_6 = f"frame {i} leaked replacement char: {piece!r}"
-            assert _pytest_member_4 not in _pytest_container_5, _pytest_msg_6
+            replacement_char = "\ufffd"
+            frame_text = piece
+            message = f"frame {i} leaked replacement char: {piece!r}"
+            assert replacement_char not in frame_text, message
 
     def test_zwj_emoji_sequence_round_trips_through_streaming(self):
         # A ZWJ emoji sequence ("family": man + ZWJ + woman + ZWJ + girl)
@@ -449,10 +449,10 @@ class _DetokenizerParityBase:
 
         assert ("".join(pieces)) == (source)
         for i, piece in enumerate(pieces):
-            _pytest_member_7 = "\ufffd"
-            _pytest_container_8 = piece
-            _pytest_msg_9 = f"frame {i} leaked replacement char: {piece!r}"
-            assert _pytest_member_7 not in _pytest_container_8, _pytest_msg_9
+            replacement_char = "\ufffd"
+            frame_text = piece
+            message = f"frame {i} leaked replacement char: {piece!r}"
+            assert replacement_char not in frame_text, message
 
     # ---- gate 2: output_ids pass-through --------------------------------
 
@@ -733,11 +733,11 @@ class _DetokenizerParityBase:
 
             assert (s.read_offset) >= (prev_read_offset)
             assert (s.sent_offset) >= (prev_sent_offset)
-            _pytest_expr_10 = source.startswith(s.decoded_text)
-            _pytest_msg_11 = (
+            is_prefix = source.startswith(s.decoded_text)
+            message = (
                 f"decoded_text={s.decoded_text!r} not a prefix of " f"source={source!r}"
             )
-            assert _pytest_expr_10, _pytest_msg_11
+            assert is_prefix, message
 
             prev_read_offset = s.read_offset
             prev_sent_offset = s.sent_offset
@@ -1031,11 +1031,9 @@ class TestDetokenizerStopEdgeCases:
         assert (out.output_strs) == ([expected])
 
     def test_multiple_stop_strings_in_text_only_trims_the_matched_one(self):
-        # Gap 8. trim_matched_stop has a literal
-        # "Current limitation: handle the case where multiple stop strs are
-        # hit" — lock in the current single-stop behavior so this gap
-        # cannot be silently regressed. Only the matched stop string is
-        # trimmed; every other stop-looking substring is preserved.
+        # Gap 8. trim_matched_stop handles a single matched stop; lock in
+        # that behavior so it cannot be silently regressed. Only the matched
+        # stop string is trimmed; every other stop-looking substring is kept.
         source = "answer STOP1 middle STOP2 tail"
         ids = self.tokenizer.encode(source, add_special_tokens=False)
         out = self.manager.handle_batch_token_id_out(
@@ -1275,10 +1273,8 @@ class TestDetokenizerLifecycle:
         assert (len(d)) == (2)
         assert ("c") in (d)
         assert (d["c"]) == (3)
-        # "a" was the oldest (after the update above moved "b" to end?
-        # No — update of an existing key in OrderedDict does NOT move
-        # it to the end. Insertion order is ["a", "b"] throughout, so
-        # "a" is still the oldest and gets evicted when "c" is added).
+        # Updating an existing OrderedDict key does not move it, so "a" is
+        # still the oldest and is evicted.
         assert ("a") not in (d)
         assert ("b") in (d)
 

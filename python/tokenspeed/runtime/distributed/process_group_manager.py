@@ -115,7 +115,8 @@ class ProcessGroupManager:
         if not dist.is_initialized():
             if distributed_init_method is None:
                 raise ValueError(
-                    "distributed_init_method must be provided when initializing distributed environment"
+                    "distributed_init_method must be provided when initializing "
+                    "distributed environment"
                 )
 
             if timeout is not None:

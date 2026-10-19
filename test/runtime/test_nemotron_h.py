@@ -420,7 +420,7 @@ def _super_cache_layer_types() -> tuple[str, ...]:
 
 
 def _super_attn_config(tp: int, kv_dtype: torch.dtype, *, is_draft: bool, device: str):
-    """Nemotron-3 Super's per-rank attention config; a draft has one MTP attention layer."""
+    """Nemotron-3 Super's per-rank attention config; a draft has one MTP layer."""
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 
@@ -547,7 +547,7 @@ def test_mamba2_cache_plan_packs_state_and_kv_without_state_padding(tp, kv_dtype
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mamba2_tree_plans_no_node_state_workspace():
-    """A Mamba2 tree verify replays a branch's ancestors, so no node states are planned."""
+    """A Mamba2 tree verify replays a branch's ancestors, so plans no node states."""
     chain = _super_cache_recipe(1, torch.float8_e4m3fn, draft_tokens=8)
     tree = _super_cache_recipe(1, torch.float8_e4m3fn, draft_tokens=8, topk=2)
     assert tree.draft_tree and tree.replay_ssm
@@ -556,7 +556,7 @@ def test_mamba2_tree_plans_no_node_state_workspace():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mamba2_cache_plan_places_the_mtp_layer_and_replays_ssm():
-    """The MTP attention layer joins the first KV group; verify stages only conv windows."""
+    """The MTP layer joins the first KV group; verify stages only conv windows."""
     recipe = _super_cache_recipe(1, torch.float8_e4m3fn, draft_tokens=4)
     setup = recipe.setup()
     plan = setup.spec.memory_plan
@@ -564,7 +564,8 @@ def test_mamba2_cache_plan_places_the_mtp_layer_and_replays_ssm():
     assert sorted(draft) == ["layer.48.k", "layer.48.v"]
     assert {f.group_id for f in draft.values()} == {"full_attention_0"}
     assert recipe.replay_ssm and setup.num_draft_layers == 1
-    # Replay keeps the five staged SSM states per layer and request out of the workspace.
+    # Replay keeps the five staged SSM states per layer and request out of the
+    # workspace.
     ssm_bytes = 128 * 64 * 128 * 4
     assert setup.fixed_workspace_bytes < 2 * 5 * 40 * ssm_bytes
 
@@ -650,7 +651,8 @@ def test_add_norm_folds_both_moe_halves_into_the_residual(with_fp8: bool):
 def test_add_norm_follows_the_shared_fusion_policy_under_tp(
     monkeypatch: pytest.MonkeyPatch, enabled: bool, tokens: int, fused: bool
 ):
-    """At TP2 the summed MoE halves take the fused all-reduce only when the server allows it."""
+    """At TP2 the summed MoE halves take the fused all-reduce only when the server
+    allows it."""
     from tokenspeed.runtime.distributed import comm_manager
     from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.models.nemotron_h import NemotronHNorm
@@ -730,7 +732,7 @@ def test_quantized_fc2_sees_the_reduced_latent_and_counts_once(
 
 
 def test_moe_without_a_latent_runs_the_experts_on_the_input():
-    """Without ``moe_latent_size`` the routed experts take and return full-width rows."""
+    """Without ``moe_latent_size`` the routed experts take and return full rows."""
     from tokenspeed.runtime.models import nemotron_h
     from tokenspeed.runtime.utils.cuda_stream import StreamFork
 

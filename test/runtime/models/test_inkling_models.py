@@ -149,6 +149,7 @@ class TestInklingConfigRegistry:
 
 def _reference_gate(x, weight, bias, n_routed, n_shared, top_k, route_scale):
     """Independent port of the reference InklingGate math (sigmoid path)."""
+    del n_shared
     import torch
     import torch.nn.functional as F
 
@@ -191,7 +192,7 @@ class TestInklingGate:
             gate.global_scale.fill_(1.0)
         x = torch.randn(64, text.hidden_size, dtype=torch.bfloat16, device="cuda")
 
-        full_weights, ids, logits = gate(x)
+        full_weights, ids, _ = gate(x)
         weights, gammas = full_weights[:, : gate.top_k], full_weights[:, gate.top_k :]
         ref_w, ref_ids, ref_g = _reference_gate(
             x.cpu(),

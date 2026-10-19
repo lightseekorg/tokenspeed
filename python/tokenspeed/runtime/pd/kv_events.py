@@ -201,12 +201,10 @@ class ZmqEventPublisher(EventPublisher):
         max_queue_size: int = 100_000,
         topic: str = "",
     ) -> None:
-        # Storage
         super().__init__(attn_dp_rank)
         self._event_queue = Queue[EventBatch | None](maxsize=max_queue_size)
         self._buffer = deque[tuple[int, bytes]](maxlen=buffer_steps)
 
-        # ZMQ sockets
         self._ctx = zmq.Context.instance()
         self._pub: zmq.Socket | None = None
         self._replay: zmq.Socket | None = None
@@ -218,11 +216,9 @@ class ZmqEventPublisher(EventPublisher):
         self._hwm = hwm
         self._socket_setup()
 
-        # Payload
         self._seq_gen = count()
         self._topic_bytes = topic.encode("utf-8")
 
-        # Thread
         self._running = True
         logger.info("Starting ZMQ publisher thread")
 
@@ -261,7 +257,6 @@ class ZmqEventPublisher(EventPublisher):
         if self._thread.is_alive():
             self._thread.join(timeout=self.SHUTDOWN_TIMEOUT)
 
-        # Clean up ZMQ resources
         try:
             if self._pub is not None:
                 self._pub.close(linger=0)
@@ -356,8 +351,7 @@ class ZmqEventPublisher(EventPublisher):
                 self._replay.send_multipart(
                     (client_id, b"", seq.to_bytes(8, "big"), buf)
                 )
-        # Send end of sequence marker
-        # receiving payload is (-1, b""")
+        # Send end of sequence marker; the receiving payload is (-1, b"").
         self._replay.send_multipart((client_id, b"", self.END_SEQ, b""))
 
     @staticmethod
@@ -375,7 +369,6 @@ class ZmqEventPublisher(EventPublisher):
             The endpoint with the port offset by ``data_parallel_rank`` or a
             suffix appended.
         """
-        # Do nothing if input is None or data_parallel_rank is 0
         if not endpoint or data_parallel_rank == 0:
             return endpoint
 
@@ -383,7 +376,6 @@ class ZmqEventPublisher(EventPublisher):
             return f"{endpoint}_dp{data_parallel_rank}"
         if "tcp" in endpoint:
             if endpoint and ":" in endpoint:
-                # Get everything after the last colon (the port)
                 last_colon_idx = endpoint.rfind(":")
                 base_addr = endpoint[:last_colon_idx]
                 base_port = int(endpoint[last_colon_idx + 1 :])
@@ -451,7 +443,7 @@ class EventPublisherFactory:
 
     @classmethod
     def create(cls, config: str | None, attn_dp_rank: int = 0) -> EventPublisher:
-        """Create publisher from a config mapping."""
+        """Create publisher from a JSON config string."""
         if not config:
             return NullEventPublisher(attn_dp_rank=attn_dp_rank)
         config = KVEventsConfig.from_cli(config)

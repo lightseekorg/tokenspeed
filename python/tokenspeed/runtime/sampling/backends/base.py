@@ -559,10 +559,6 @@ class SamplingBackend(ABC):
         pool row 0 (see ForwardStepRunner capture path); stateful backends
         override this to zero whatever row 0 accumulates. Default: no-op."""
 
-    # ------------------------------------------------------------------
-    # Slot-state image (SlotStateExporter)
-    # ------------------------------------------------------------------
-
     def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
         """The per-slot Device rows a retraction snapshot images, in a fixed order.
 
@@ -639,7 +635,8 @@ class SamplingBackend(ABC):
         self,
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns ``(output_tokens, accept_lengths)``; accept_lengths is all ones."""
 
     @abstractmethod
     def verify(

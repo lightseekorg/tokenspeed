@@ -44,10 +44,6 @@ from tokenspeed_scheduler import (
     SchedulerConfig,
 )
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def make_config(
     max_scheduled_tokens: int = 512,
@@ -112,11 +108,6 @@ def first_group_page_count(op, request_id: str) -> int:
     return len([page for page in table[row] if page >= 0])
 
 
-# ---------------------------------------------------------------------------
-# FSM: Submitted → Prefilling → Decoding → Finished
-# ---------------------------------------------------------------------------
-
-
 class TestFSMTransitions:
     def test_invalid_transition_reports_event_and_state(self):
         s = Scheduler(make_config())
@@ -124,7 +115,10 @@ class TestFSMTransitions:
 
         with pytest.raises(
             RuntimeError,
-            match=r"FSM transition invalid: event=tokenspeed::fsm::FinishEvent; state=tokenspeed::fsm::Submitted",
+            match=(
+                r"FSM transition invalid: event=tokenspeed::fsm::FinishEvent; "
+                r"state=tokenspeed::fsm::Submitted"
+            ),
         ):
             ev = ForwardEvent.Finish()
             ev.request_id = "r0"
@@ -157,9 +151,8 @@ class TestFSMTransitions:
         s = Scheduler(make_config(max_scheduled_tokens=512))
         submit(s, "r0", list(range(8)))
 
-        prefill_plan = (
-            s.next_execution_plan()
-        )  # Submitted → PrefillDone (8 tokens, all fit)
+        # Submitted → PrefillDone (8 tokens, all fit).
+        prefill_plan = s.next_execution_plan()
         assert s.decoding_size() == 0
         assert s.prefilling_size() == 1
         assert len(prefill_plan.forward) == 1
@@ -213,11 +206,6 @@ class TestFSMTransitions:
         assert s.request_token_size("r0") == 5  # 4 input + 1 output
 
 
-# ---------------------------------------------------------------------------
-# Chunked prefill
-# ---------------------------------------------------------------------------
-
-
 class TestChunkedPrefill:
     def test_large_request_split_across_plans(self):
         """budget=10, request=30 tokens: takes 3 Prefilling steps to finish prefill."""
@@ -263,11 +251,6 @@ class TestChunkedPrefill:
         plan = s.next_execution_plan()
         assert plan.forward[0].num_extends() > 0
         assert s.request_token_size("r0") == 20
-
-
-# ---------------------------------------------------------------------------
-# PrefillFirst: prefilling requests take priority
-# ---------------------------------------------------------------------------
 
 
 class TestPrefillFirst:
@@ -416,11 +399,6 @@ class TestPrefillFirst:
         assert len(plan.forward[0].request_ids) <= 2
 
 
-# ---------------------------------------------------------------------------
-# Decode batch
-# ---------------------------------------------------------------------------
-
-
 class TestDecodeBatch:
     def _get_to_decoding(
         self,
@@ -494,11 +472,6 @@ class TestDecodeBatch:
             assert plan.forward[0].num_extends() == 0
             advance_forward(s, "r0", tokens=[100 + step])
             assert s.request_token_size("r0") == 6 + step + 1
-
-
-# ---------------------------------------------------------------------------
-# Prefill input_ids content
-# ---------------------------------------------------------------------------
 
 
 class TestPrefillInputIds:
@@ -581,11 +554,6 @@ class TestPrefillInputIds:
         assert plan3.forward[0].input_ids == tokens[16:20]
 
 
-# ---------------------------------------------------------------------------
-# UpdateReserveNumTokens
-# ---------------------------------------------------------------------------
-
-
 def make_update_reserve_event(
     request_id: str, reserve_num_tokens_in_next_schedule_event: int
 ) -> ExecutionEvent:
@@ -632,9 +600,8 @@ class TestUpdateReserveNumTokens:
         # Now r0 is Decoding. Set reserve=16 before next decode plan.
         s.advance(make_update_reserve_event("r0", 16))
 
-        decode_plan = (
-            s.next_execution_plan()
-        )  # Decoding: allocates 1 extra page for reserve=16
+        # Decoding: allocates 1 extra page for reserve=16.
+        decode_plan = s.next_execution_plan()
         op = decode_plan.forward[0]
         assert op.num_extends() == 0
         assert first_group_page_count(op, "r0") == 2
@@ -741,11 +708,6 @@ class TestUpdateReserveNumTokens:
         first_table = next(iter(dict(op.block_tables).values()))
         assert len([page for page in first_table[r0_idx] if page >= 0]) == 2
         assert len([page for page in first_table[r1_idx] if page >= 0]) == 1
-
-
-# ---------------------------------------------------------------------------
-# DecodeInputIds
-# ---------------------------------------------------------------------------
 
 
 class TestDecodeInputIds:

@@ -80,73 +80,6 @@ except ImportError:
         get_mla_decode_fold_sq_factor,
     )
 
-"""
-A Multi-Head Latent Attention (MLA) example with FP16/BF16 inputs for SM100, SM103 and SM107 using CuTe DSL.
-
-This example implements multi-head latent attention using a TMA + TensorCore
-warp-specialized persistent kernel. The implementation integrates the (Qc + Qr)*(Kc + Kr)^T
-matrix multiplication, softmax normalization, and softmax((Qc + Qr)*(Kc + Kr)^T)*Vc into a single kernel.
-The kernel provides support for page table storage and variable-length KV cache sequences. It implements KV splitting
-functionality to minimize latency when processing long KV sequences.
-
-The kernel implements key optimizations including:
-- Warp specialization for different computation phases (load, MMA, softmax, correction, epilogue)
-- Pipeline stages between different warps for overlapping computation and memory access
-- Support for different precision data types
-- Two sub-kernels (split KV kernel and reduction kernel) that enable split KV processing
-
-To run this example:
-
-.. code-block:: bash
-
-    python examples/blackwell/mla_fp16.py                                \
-      --batch_size 4 --latent_dim 512 --rope_dim 64                      \
-      --num_heads 128 --seq_len_q 1 --seq_len_k 1024                     \
-      --in_dtype Float16 --out_dtype Float16                             \
-      --acc_dtype Float32 --lse_dtype Float32                            \
-      --is_var_seq --is_var_split_kv                                     \
-      --is_persistent
-
-The above example runs Multi-Head Latent Attention (MLA) with the following configuration:
-- Batch size: 4
-- Sequence length of Q: 1
-- Sequence length of K: 1024
-- Latent dimension: 512
-- RoPE dimension: 64
-- Number of heads: up to 128
-- Data types: Float16 (input), Float16 (output), Float32 (accumulation and LSE)
-
-It utilizes page table storage for the KV cache and enables both variable-length KV cache sequences
-and variable split KV processing with persistent scheduling.
-
-To collect performance with NCU profiler:
-
-.. code-block:: bash
-
-    ncu python examples/blackwell/mla_fp16.py                            \
-      --batch_size 4 --latent_dim 512 --rope_dim 64                      \
-      --num_heads 128 --seq_len_q 1 --seq_len_k 1024                     \
-      --in_dtype Float16 --out_dtype Float16                             \
-      --acc_dtype Float32 --lse_dtype Float32                            \
-      --is_var_seq --is_var_split_kv                                     \
-      --is_persistent --warmup_iterations 3                              \
-      --iterations 10 --skip_ref_check
-
-Constraints for this example:
-* Data type requirements:
-  - Input/output: Float16
-  - Accumulation and LSE: Float32
-* Fixed architecture parameters:
-  - Number of attention heads: up to 128
-  - Latent dimension: 512
-  - RoPE dimension: 64
-* Input query modes should be (NumHeads, LatentDim/RopeDim, SeqLenQ, BatchSize)
-* Input kv latent/rope modes should be (SeqLenK, LatentDim/RopeDim, BatchSize)
-* Query sequence length must be positive
-* Only supports 2-CTA instructions
-* Variable sequence length requires page table storage enabled
-"""
-
 
 class BlackwellMultiHeadLatentAttentionForwardFP16:
     def __init__(
@@ -4092,6 +4025,7 @@ def run(
     :raises RuntimeError: If GPU is unavailable for computation
     """
 
+    del kwargs  # Unused.
     print("Running MLA decode test with:")
     print(f"  batch_size: {batch_size}")
     print(f"  seq_len_q: {seq_len_q}")
@@ -4142,7 +4076,11 @@ def run(
         page_size,
     ):
         raise TypeError(
-            f"Unsupported testcase {batch_size}, {seq_len_q}, {seq_len_k}, {num_heads}, {latent_dim}, {rope_dim}, {in_dtype}, {out_dtype}, {acc_dtype}, {lse_dtype}, {mma_qk_tiler_mn}, {mma_pv_tiler_mn}, {split_kv}, {is_persistent}, {is_var_seq}, {is_var_split_kv}, {page_size}"
+            f"Unsupported testcase {batch_size}, {seq_len_q}, {seq_len_k}, "
+            f"{num_heads}, {latent_dim}, {rope_dim}, {in_dtype}, {out_dtype}, "
+            f"{acc_dtype}, {lse_dtype}, {mma_qk_tiler_mn}, {mma_pv_tiler_mn}, "
+            f"{split_kv}, {is_persistent}, {is_var_seq}, {is_var_split_kv}, "
+            f"{page_size}"
         )
 
     torch.manual_seed(1111)
@@ -4334,16 +4272,14 @@ def run(
         num_heads, seq_len_q, mma_qk_tiler_mn[0]
     )
     seq_len_q_for_split = seq_len_q // fold_sq_factor
-    split_kv, block_split_kvs_ref, block_split_kvs, block_split_kvs_torch = (
-        create_block_split_kvs(
-            batch_size,
-            split_kv,
-            cache_seqs_ref,
-            is_var_split_kv,
-            mma_qk_tiler_mn,
-            cluster_shape_mnk,
-            max_active_clusters,
-        )
+    split_kv, _, block_split_kvs, block_split_kvs_torch = create_block_split_kvs(
+        batch_size,
+        split_kv,
+        cache_seqs_ref,
+        is_var_split_kv,
+        mma_qk_tiler_mn,
+        cluster_shape_mnk,
+        max_active_clusters,
     )
 
     q_latent_ref, q_latent, q_latent_torch = create_data_tensor(
@@ -4495,7 +4431,7 @@ def run(
             is_causal=False,
         )
         s_ref = torch.einsum("bhld,bhsd->bhls", q_ref, k_ref)
-        s_ref_max, s_ref_max_pos = torch.max(s_ref, dim=-1, keepdim=True)
+        s_ref_max, _ = torch.max(s_ref, dim=-1, keepdim=True)
         softmax_scale_log2 = LOG2_E * softmax_scale
         s_ref_sum = torch.sum(
             torch.exp2((s_ref - s_ref_max) * softmax_scale_log2), dim=-1, keepdim=True
@@ -4510,7 +4446,8 @@ def run(
 
     if skip_correction_threshold > 0.0:
         print(
-            "Skipping correction verification since skip_correction_threshold is greater than 0.0..."
+            "Skipping correction verification since skip_correction_threshold "
+            "is greater than 0.0..."
         )
         skip_ref_check = True
     if not skip_ref_check:
@@ -4650,7 +4587,7 @@ def run(
             is_lse=True,
             seq_len_q=seq_len_q,
         )
-        workspace, workspace_torch = create_workspace(
+        workspace, _ = create_workspace(
             num_heads_eff,
             seq_len_q_eff,
             latent_dim,
@@ -4718,10 +4655,10 @@ if __name__ == "__main__":
     def parse_comma_separated_ints(s: str) -> Tuple[int, ...]:
         try:
             return tuple(int(x.strip()) for x in s.split(","))
-        except ValueError:
-            raise argparse.ArgumentTypeError(  # noqa: B904
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(
                 "Invalid format. Expected comma-separated integers."
-            )
+            ) from e
 
     def parse_mma_tiler(s: str) -> Tuple[int, int, Tuple[int, int]]:
         ret = parse_comma_separated_ints(s)

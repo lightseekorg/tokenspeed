@@ -140,9 +140,6 @@ def _rotate_rope_reference(
     return out.to(x.dtype)
 
 
-# ─── set ─────────────────────────────────────────────────────────────
-
-
 @pytest.mark.parametrize("n_loc", N_LOC_ALL)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("pattern", ["seq", "rand"])
@@ -300,9 +297,6 @@ def test_set_pdl_invariant(n_loc, dtype):
     assert _bitwise_equal(kv_off, kv_on)
 
 
-# ─── get ─────────────────────────────────────────────────────────────
-
-
 @pytest.mark.parametrize("n_loc", N_LOC_ALL)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("pattern", ["seq", "rand"])
@@ -354,9 +348,6 @@ def test_get_pdl_invariant(n_loc, dtype):
 
     assert _bitwise_equal(k_nope_off, k_nope_on)
     assert _bitwise_equal(k_rope_off, k_rope_on)
-
-
-# ─── round trip ─────────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize("n_loc", [128, 4096])

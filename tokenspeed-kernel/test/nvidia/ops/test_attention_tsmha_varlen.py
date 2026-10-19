@@ -208,7 +208,7 @@ def test_tsmha_varlen_extend_paged(
     route_err = (out.float() - out_fallback.float()).abs().max().item()
     assert route_err < ROUTE_TOL, f"tsmha vs score_mod: {route_err:.4e}"
 
-    for i, (ql, kl) in enumerate(zip(q_lens, kv_lens)):
+    for i, (ql, _) in enumerate(zip(q_lens, kv_lens)):
         s = cu_cpu[i]
         ref, _ = torch_rel_attention(
             q[s : s + ql],

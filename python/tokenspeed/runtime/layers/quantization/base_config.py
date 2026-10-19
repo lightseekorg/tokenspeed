@@ -27,8 +27,6 @@ from torch import nn
 
 
 class QuantizeMethodBase(ABC):
-    """Base class for different quantized methods."""
-
     @abstractmethod
     def create_weights(
         self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs
@@ -46,11 +44,17 @@ class QuantizeMethodBase(ABC):
         raise NotImplementedError
 
     def static_fp8_input_scale(self, layer: nn.Module) -> torch.Tensor | None:
-        """The per-tensor FP8 scale ``apply`` quantizes its input with, which a producer may apply instead."""
+        """Returns the per-tensor FP8 scale ``apply`` quantizes its input with.
+
+        A producer may apply this scale instead.
+        """
         return None
 
     def nvfp4_global_scale(self, layer: nn.Module) -> torch.Tensor | None:
-        """The global scale ``apply`` hands ``fp4_quantize`` for its input, which a producer may apply instead."""
+        """Returns the global scale ``apply`` hands ``fp4_quantize`` for its input.
+
+        A producer may apply this scale instead.
+        """
         return None
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
@@ -62,8 +66,6 @@ class QuantizeMethodBase(ABC):
 
 
 class QuantizationConfig(ABC):
-    """Base class for quantization configs."""
-
     def __init__(
         self,
         ignored_layers: list[str] | None = None,
@@ -177,8 +179,6 @@ class QuantizationConfig(ABC):
 
 
 class LinearMethodBase(QuantizeMethodBase):
-    """Base class for different (maybe quantized) linear methods."""
-
     @abstractmethod
     def create_weights(
         self,

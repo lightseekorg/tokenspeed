@@ -187,11 +187,8 @@ def get_hf_text_config(config: PretrainedConfig):
     """
     class_name = resolve_architecture(config)
     if class_name.startswith("Llava") and class_name.endswith("ForCausalLM"):
-        # We support non-hf version of llava models, so we do not want to
-        # read the wrong values from the unused default text_config.
-        # We set `dtype` of config to `torch.float16` for the weights, as
-        # `torch.float16` is default used for image features in
-        # `python/tokenspeed/runtime/models/llava.py`.
+        # Non-HF llava configs carry an unused default text_config, so do not
+        # read it. float16 matches the dtype of the image features.
         config.dtype = torch.float16
         return config
 
@@ -356,17 +353,19 @@ def get_config(
 
     def load_raw_config(model_path: str) -> dict[str, Any]:
         try:
-            with open(os.path.join(model_path, "config.json")) as file:
+            with open(
+                os.path.join(model_path, "config.json"), encoding="utf-8"
+            ) as file:
                 return json.load(file)
-        except FileNotFoundError:
+        except FileNotFoundError as e:
             raise RuntimeError(
                 f"Config file not found in {model}. Please check the path."
-            )
-        except json.JSONDecodeError:
+            ) from e
+        except json.JSONDecodeError as e:
             raise RuntimeError(
                 f"Failed to decode JSON from config file in {model}. "
                 "Please ensure the file is valid JSON."
-            )
+            ) from e
 
     config = None
     raw_config = None
@@ -451,7 +450,6 @@ def get_config(
     _restore_raw_glm_dsa_fields(config, raw_config)
     _restore_raw_dflash_fields(config, raw_config)
 
-    # extract 'text_config'
     text_config = get_hf_text_config(config)
 
     # quantization config will copy to text_config
@@ -465,10 +463,6 @@ def get_config(
     # If the draft head ships in the same checkpoint as the base model,
     # rewrite the architecture in place so the model loader dispatches
     # to the *NextN / *Eagle3 entry class instead of the base one.
-    # ``architectures`` is guaranteed non-None here when the on-disk
-    # config.json declared it (see the source-of-truth pin above);
-    # the truthiness check stays for configs that genuinely lack the
-    # field.
     if (
         is_draft_worker
         and config.architectures
@@ -721,7 +715,10 @@ def _wrap_deepseek_v4_tokenizer(
 
 def _validate_deepseek_v41_text_content(content: Any) -> None:
     """Reject media, including nested tool-result blocks, before prompt encoding."""
-    error = "DeepSeek V4.1 tokenizer supports text-only messages; media content is not supported."
+    error = (
+        "DeepSeek V4.1 tokenizer supports text-only messages; "
+        "media content is not supported."
+    )
     if content is None:
         return
     if isinstance(content, str):

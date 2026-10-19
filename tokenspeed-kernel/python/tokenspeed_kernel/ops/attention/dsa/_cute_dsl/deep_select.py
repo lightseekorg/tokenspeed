@@ -481,7 +481,8 @@ class DeepSelectTopK:
             raise ValueError(f"cluster_size must be one of {SUPPORTED_CLUSTER_SIZES}")
         if (cluster_size - 1) * max_topk > INCOMING_SLOTS:
             raise ValueError(
-                f"cluster_size {cluster_size} cannot gather {max_topk} survivors per CTA"
+                f"cluster_size {cluster_size} cannot gather {max_topk} "
+                "survivors per CTA"
             )
         # A CTA only drops candidates once it has run a main round, and every
         # such CTA had a full init window of at least TAIL_ELEMS + 1 real
@@ -725,9 +726,6 @@ class DeepSelectTopK:
             else:
                 cute.arch.mbarrier_arrive(bar)
 
-    # ------------------------------------------------------------------
-    # The kernel
-    # ------------------------------------------------------------------
     @cute.kernel
     def kernel(
         self,
@@ -1075,9 +1073,6 @@ class DeepSelectTopK:
                 out[row, i] = _pair_index(pair)
                 values[row, i] = _pair_value(pair)
 
-    # ------------------------------------------------------------------
-    # Host launcher
-    # ------------------------------------------------------------------
     @cute.jit
     def __call__(
         self,
@@ -1261,8 +1256,8 @@ def deepselect_topk(
         or scores.data_ptr() % (SCORE_ALIGNMENT * 4)
     ):
         raise ValueError(
-            f"scores rows must be unit-stride with a stride multiple of {SCORE_ALIGNMENT} "
-            "elements from a 16-byte aligned base"
+            "scores rows must be unit-stride with a stride multiple of "
+            f"{SCORE_ALIGNMENT} elements from a 16-byte aligned base"
         )
     rows = scores.shape[0]
     if ends.shape != (rows,) or ends.dtype != torch.int32 or not ends.is_contiguous():
@@ -1294,7 +1289,8 @@ def deepselect_topk(
             or tensor.device != scores.device
         ):
             raise ValueError(
-                f"{name} must be a contiguous {dtype} [rows, topk] tensor on the scores device"
+                f"{name} must be a contiguous {dtype} [rows, topk] tensor on the "
+                "scores device"
             )
     if rows == 0:
         return indices, values

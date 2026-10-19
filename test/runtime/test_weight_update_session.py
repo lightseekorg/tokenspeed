@@ -206,7 +206,7 @@ def test_a_non_unit_kv_scale_is_loaded_derived_and_then_rejected(model):
     assert model.post_load_calls == 2
     assert not model._weight_update_active
     for attn in model.layers:
-        w_kc, w_vc = _expected_pair(attn.kv_b_proj.weight.detach())
+        w_kc, _ = _expected_pair(attn.kv_b_proj.weight.detach())
         assert torch.equal(attn.w_kc, w_kc)
     # The next session starts clean and a unit scale passes.
     with weight_update_session([model]):

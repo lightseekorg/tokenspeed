@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Qwen3 MoE model configuration definitions."""
-
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
 
 

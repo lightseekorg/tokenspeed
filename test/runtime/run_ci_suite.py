@@ -8,7 +8,8 @@ functions like `register_cuda_ci(est_time=300, suite="runtime-1gpu")`.
 
 Usage:
     python run_ci_suite.py --device cuda --suite runtime-1gpu
-    python run_ci_suite.py --device cuda --suite runtime-1gpu --auto-partition-id 0 --auto-partition-size 2
+
+Add `--auto-partition-id 0 --auto-partition-size 2` to run one partition.
 """
 
 import argparse
@@ -104,7 +105,6 @@ def filter_tests(
 def pretty_print_tests(
     args, ci_tests: List[CIRegistry], skipped_tests: List[CIRegistry]
 ):
-    """Print test information."""
     device = DEVICE_MAPPING[args.device]
     suite = args.suite
     if args.auto_partition_size:
@@ -169,7 +169,6 @@ def run_a_suite(args):
         print("No tests to run. Exiting with success.", flush=True)
         return 0
 
-    # Add extra timeout when retry is enabled
     timeout = args.timeout_per_file
     if args.enable_retry:
         timeout += args.retry_timeout_increase
@@ -247,7 +246,6 @@ def main():
     )
     args = parser.parse_args()
 
-    # Validate auto-partition arguments
     if (args.auto_partition_id is not None) != (args.auto_partition_size is not None):
         parser.error(
             "--auto-partition-id and --auto-partition-size must be specified together."
@@ -257,7 +255,8 @@ def main():
             parser.error("--auto-partition-size must be positive.")
         if not 0 <= args.auto_partition_id < args.auto_partition_size:
             parser.error(
-                f"--auto-partition-id must be in range [0, {args.auto_partition_size}), "
+                "--auto-partition-id must be in range "
+                f"[0, {args.auto_partition_size}), "
                 f"but got {args.auto_partition_id}"
             )
 

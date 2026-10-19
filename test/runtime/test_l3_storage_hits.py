@@ -93,8 +93,6 @@ class _Device:
 
 
 class _Harness:
-    """Construct the real hooks with explicit scheduler/device dependencies."""
-
     def __init__(self, exists_flags) -> None:
         self.device = _Device(exists_flags)
         self.scheduler = _Scheduler()
@@ -114,7 +112,7 @@ def test_hooks_require_explicit_configuration() -> None:
 
 
 def test_l3_exists_reduce_doubles_require_op_and_group() -> None:
-    tree = ast.parse(Path(__file__).read_text())
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
     found = False
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef) or node.name != "fake_all_reduce":
@@ -268,11 +266,6 @@ def test_empty_submit_does_not_probe() -> None:
     assert ctx.device.pages is None
 
 
-# ----------------------------------------------------------------------
-# Per-round convergence of in-flight prefetches
-# ----------------------------------------------------------------------
-
-
 def test_converge_completes_only_ops_every_rank_finished(monkeypatch) -> None:
     """The replica MIN of (done, landed): a rank still fetching holds the op
     (its landed count is the sentinel), a finished one is completed with the
@@ -356,7 +349,7 @@ def loop_methods():
     )
     cls = next(
         node
-        for node in ast.parse(path.read_text()).body
+        for node in ast.parse(path.read_text(encoding="utf-8")).body
         if isinstance(node, ast.ClassDef) and node.name == "EventLoop"
     )
     names = {"event_loop", "_drain_in_flight", "_get_forward_op"}

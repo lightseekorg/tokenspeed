@@ -230,7 +230,7 @@ def _autotune_cache_key(
         "dense": (mapping.dense.tp_size, mapping.dense.dp_size),
         "moe": (mapping.moe.tp_size, mapping.moe.ep_size, mapping.moe.dp_size),
         "linear_attention_tp": mapping.linear_attn.tp_size,
-        # Pipeline stages can reuse shape-keyed tactics from a full-model run.
+        # No pp_size: stages reuse shape-keyed tactics from a full-model run.
         "speculative_algorithm": server_args.speculative_algorithm,
         "speculative_num_draft_tokens": server_args.speculative_num_draft_tokens,
     }
@@ -638,11 +638,11 @@ class ModelExecutor:
                 raise ValueError(
                     f"{config.spec_algo} speculative decoding requires a draft model"
                 )
-            DrafterImpl = get_drafter_impl(
+            drafter_cls = get_drafter_impl(
                 config.spec_algo,
                 None if draft_model_runner is None else draft_model_runner.model,
             )
-            self.drafter = DrafterImpl(
+            self.drafter = drafter_cls(
                 spec_num_tokens=config.spec_num_tokens,
                 spec_num_steps=config.spec_num_steps,
                 draft_model_runner=draft_model_runner,
@@ -775,7 +775,8 @@ class ModelExecutor:
         ):
             raise NotImplementedError(
                 "draft trees write verify-window tokens in node order; a target that "
-                "reads request token or n-gram history needs them along the accepted path"
+                "reads request token or n-gram history needs them along the "
+                "accepted path"
             )
         if not self.sampling_backend.supports_tree_verify:
             raise NotImplementedError(
@@ -784,7 +785,8 @@ class ModelExecutor:
             )
         if self.draft_attn_backend is self.attn_backend:
             raise NotImplementedError(
-                "draft trees bind verify and lanes on distinct target and draft backends"
+                "draft trees bind verify and lanes on distinct target and draft "
+                "backends"
             )
         resolve_tree_support(self.attn_backend, self.draft_attn_backend)
         config = self.config
@@ -2423,10 +2425,7 @@ class ModelExecutor:
                         forward_op.extend_prefix_lens
                     )
                     # Flip detection + per-slot scalar scatter + backend-owned
-                    # RNG state refill. Runs OUTSIDE the CUDA graph. Generators
-                    # are now backend-internal (pool-indexed, seeded on flip
-                    # from sp.seed), so the event loop no longer threads them
-                    # through.
+                    # RNG state refill. Runs OUTSIDE the CUDA graph.
                     self.sampling_backend.prepare_step(
                         request_ids=forward_op.request_ids,
                         request_pool_indices=forward_op.request_pool_indices,
@@ -2714,7 +2713,8 @@ class ModelExecutor:
             raise RuntimeError("draft-final CachePD readiness requires a draft backend")
         if self.draft_attn_backend is self.attn_backend:
             raise RuntimeError(
-                "draft-final CachePD readiness requires distinct target and draft backends"
+                "draft-final CachePD readiness requires distinct target and draft "
+                "backends"
             )
         self._draft_final_step_counter = step_counter
 

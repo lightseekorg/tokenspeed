@@ -162,8 +162,6 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
 
     # Current GPT-OSS path uses FP8 E4M3 activations with per-tensor scale.
     x_fp8 = hidden_states
-    # Pass the FP8 tensor straight to Gluon.  ``view(torch.uint8)`` materializes a
-    # copy for float8 tensors on this stack and dominates small-M latency.
 
     out = torch.empty((n_tokens, N), dtype=out_dtype, device=hidden_states.device)
 
@@ -524,7 +522,6 @@ def _warp_decode_stage1_coop_compute(
     # prefill GEMM pipeline above.
     acc = pgm.decode_pipeline(D)
 
-    # Per-tensor activation scale.
     x_scale = gl.load(x_global_scale_ptr).to(gl.float32)
     acc = acc * x_scale
 
@@ -1145,9 +1142,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
         rem = pid % per_k
         pid_token = rem // num_n
         pid_n = rem % num_n
-    # Full + partial K-tile coverage (K = intermediate dim I). The old
-    # `num_kt = I // BLOCK_K` dropped the partial final tile, miscomputing any
-    # I not a multiple of BLOCK_K (GPT-OSS I=2880 lost K=2816..2879).
+    # Full + partial K-tile coverage (K = intermediate dim I).
     num_full = i_dim // BLOCK_K
     total_kt = (i_dim + BLOCK_K - 1) // BLOCK_K
     kt_per = (total_kt + SPLIT_K - 1) // SPLIT_K

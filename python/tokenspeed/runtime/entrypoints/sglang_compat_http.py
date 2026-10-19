@@ -68,11 +68,6 @@ logger = get_colorful_logger(__name__)
 router = APIRouter()
 
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
-
-
 def _llm(request: Request) -> "AsyncLLM":
     async_llm = getattr(request.app.state, "async_llm", None)
     if async_llm is None:
@@ -165,11 +160,6 @@ def _unsupported_source(source: str) -> JSONResponse | None:
     )
 
 
-# --------------------------------------------------------------------------- #
-# Process group setup
-# --------------------------------------------------------------------------- #
-
-
 @router.post("/init_weights_update_group")
 async def init_weights_update_group(request: Request) -> JSONResponse:
     async def _do() -> dict[str, Any]:
@@ -201,11 +191,6 @@ async def destroy_weights_update_group(request: Request) -> JSONResponse:
         return {"success": success, "message": message}
 
     return await _guarded(_do)
-
-
-# --------------------------------------------------------------------------- #
-# Weight updates
-# --------------------------------------------------------------------------- #
 
 
 @router.post("/update_weights_from_distributed")
@@ -361,11 +346,6 @@ async def update_weights_from_disk(request: Request) -> JSONResponse:
     return await _guarded(_do)
 
 
-# --------------------------------------------------------------------------- #
-# Pause / resume (admission gate)
-# --------------------------------------------------------------------------- #
-
-
 @router.post("/pause_generation")
 async def pause_generation(request: Request) -> JSONResponse:
     async def _do() -> dict[str, Any]:
@@ -402,11 +382,6 @@ async def continue_generation(request: Request) -> JSONResponse:
     return await _guarded(_do)
 
 
-# --------------------------------------------------------------------------- #
-# Cache / memory
-# --------------------------------------------------------------------------- #
-
-
 @router.api_route("/flush_cache", methods=["GET", "POST"])
 async def flush_cache(request: Request) -> JSONResponse:
     async def _do() -> dict[str, Any]:
@@ -438,11 +413,6 @@ async def resume_memory_occupation(request: Request) -> JSONResponse:
         return {"success": result.success, "message": result.message}
 
     return await _guarded(_do)
-
-
-# --------------------------------------------------------------------------- #
-# Misc / health
-# --------------------------------------------------------------------------- #
 
 
 @router.post("/abort_request")
@@ -533,11 +503,6 @@ async def model_info(request: Request) -> JSONResponse:
             "weight_version": llm.server_args.weight_version,
         }
     )
-
-
-# --------------------------------------------------------------------------- #
-# App construction
-# --------------------------------------------------------------------------- #
 
 
 def build_sglang_compat_app(async_llm: "AsyncLLM") -> FastAPI:

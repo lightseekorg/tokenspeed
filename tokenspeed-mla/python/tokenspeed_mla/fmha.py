@@ -50,55 +50,8 @@ if __name__ == "__main__":
 
 from tokenspeed_mla import fmha_helpers as fmha_utils
 
-"""
-A fused multi-head attention (FMHA) example for the NVIDIA Blackwell SM100 architecture using CUTE DSL
-
-This example demonstrates an implementation of fused multi-head attention using a TMA + Blackwell SM100
-TensorCore warp-specialized persistent kernel. The implementation integrates the Q*K^T matrix multiplication,
-softmax normalization, and softmax(Q*K^T)*V into a single kernel, avoiding intermediate data movement between
-global memory and shared memory, thus improving computational efficiency.
-
-The kernel implements key optimizations including:
-- Warp specialization for different computation phases (load, MMA, softmax, correction, epilogue)
-- Pipeline stages between different warps for overlapping computation and memory access
-- Support for different precision data types
-- Optional causal masking for autoregressive models
-
-To run this example:
-
-.. code-block:: bash
-
-    python examples/blackwell/fmha.py                                     \
-      --qk_acc_dtype Float32 --pv_acc_dtype Float32                       \
-      --mma_tiler_mn 128,128                                              \
-      --q_shape 4,1024,8,64 --k_shape 4,1024,8,64                         \
-      --is_persistent
-
-The above example runs FMHA with batch size 4, sequence length 1024, 8 attention heads, and head
-dimension 64. The Blackwell tcgen05 MMA tile shape is (128, 128), and the kernel uses fp16 for input/output
-with fp32 for accumulation.
-
-To collect performance with NCU profiler:
-
-.. code-block:: bash
-
-    ncu python examples/blackwell/fmha.py                                 \
-      --qk_acc_dtype Float32 --pv_acc_dtype Float32                       \
-      --mma_tiler_mn 128,128                                              \
-      --q_shape 4,1024,8,64 --k_shape 4,1024,8,64                         \
-      --is_persistent --warmup_iterations 10                              \
-      --iterations 10 --skip_ref_check
-
-Constraints for this example:
-* Supported head dimensions: 32, 64, and 128
-* Number of heads in Q must be divisible by number of heads in K
-* mma_tiler_mn must be 128,128
-* Batch size must be the same for Q, K, and V tensors
-* For causal masking, use --is_causal (note: specify without =True/False)
-* For persistent scheduling, use --is_persistent (note: specify without =True/False)
-
-For details on the skip softmax algorithm, please refer to the paper: https://arxiv.org/abs/2512.12087.
-"""
+# Blackwell SM100 FMHA forward (CuTe DSL, warp-specialized persistent kernel).
+# Skip-softmax algorithm: https://arxiv.org/abs/2512.12087
 
 
 def make_thread_cooperative_group(size: int):
@@ -137,7 +90,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         3.  Kernel Execution Mode:
             - is_persistent: Boolean indicating whether to use persistent kernel mode
             - mask_type: Specifies the type of mask to use (no mask, residual mask, or causal mask)
-            - window_size_left/right: Sliding window size for attention masking
             - enable_ex2_emulation: Whether to enable exp2 emulation
             - enable_skip_correction: Whether to skip the correction when rowmax is not updated larger than a threshold
 
@@ -153,10 +105,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         :type is_persistent: bool
         :param mask_type: Type of mask to use
         :type mask_type: fmha_utils.MaskEnum
-        :param window_size_left: Left-side sliding window size for attention masking
-        :type window_size_left: int
-        :param window_size_right: Right-side sliding window size for attention masking
-        :type window_size_right: int
         """
 
         self.qk_acc_dtype = qk_acc_dtype
@@ -164,9 +112,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         if isinstance(head_dim, tuple):
             self.head_dim = head_dim[0]
             self.head_dim_v = head_dim[1]
-            assert (
-                self.head_dim == 192 and self.head_dim_v == 128
-            ), f"When Headdim is a tuple, it's for MLA. Must be (192, 128), but got {head_dim}"
+            assert self.head_dim == 192 and self.head_dim_v == 128, (
+                "When Headdim is a tuple, it's for MLA. Must be (192, 128), but got "
+                f"{head_dim}"
+            )
         else:
             self.head_dim = head_dim
             self.head_dim_v = head_dim
@@ -271,9 +220,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.arch = BaseDSL._get_dsl().get_arch_enum()
 
         if self.arch >= Arch.sm_103:
-            assert (
-                self.enable_ex2_emulation == False
-            ), f"Don't enable exp2 emulation for {self.arch}, it doesn't help performance"
+            assert self.enable_ex2_emulation == False, (
+                f"Don't enable exp2 emulation for {self.arch}, it doesn't help "
+                "performance"
+            )
 
         num_warps_per_warpgroup = 4
         self.softmax_warpgroup_count = (
@@ -303,7 +253,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.mma_softmax_stage = 1
         self.epi_stage = 2
 
-        # Tunable parameters
         self.rescale_threshold = 8.0 if self.enable_skip_correction else 0.0
         # FP8 P pre-scale: offset added to exp2 exponent so that P*2^offset fills
         # more of E4M3's [0, 448] range, improving quantization precision.
@@ -463,7 +412,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.v_major_mode != OperandMajorMode.MN):
             raise RuntimeError("The layout of v is not supported")
 
-        # check type consistency
         if cutlass.const_expr(self.q_dtype != self.k_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
         if cutlass.const_expr(self.q_dtype != self.v_dtype):
@@ -576,7 +524,6 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         @cute.struct
         class SharedStorage:
-            # Pipeline barriers
             load_q_mbar_ptr: cute.struct.MemRange[Int64, self.q_stage * 2]
             load_kv_mbar_ptr: cute.struct.MemRange[Int64, self.kv_stage * 2]
             mma_s0_mbar_ptr: cute.struct.MemRange[Int64, self.mma_softmax_stage * 2]
@@ -588,9 +535,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             mma_corr_mbar_ptr: cute.struct.MemRange[Int64, self.mma_corr_stage * 2]
             s0_p1_inplace_barrier_ptr: cute.struct.MemRange[Int64, self.p_mma_stage * 2]
             s1_p0_inplace_barrier_ptr: cute.struct.MemRange[Int64, self.p_mma_stage * 2]
-            # Tmem holding buffer
             tmem_holding_buf: Int32
-            # Smem tensors
             sQ: cute.struct.Align[
                 cute.struct.MemRange[self.q_dtype, cute.cosize(q_smem_layout_staged)],
                 self.buffer_align_bytes,
@@ -605,7 +550,6 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         self.shared_storage = SharedStorage
 
-        # Launch the kernel synchronously
         self.kernel(
             qk_tiled_mma,
             pv_tiled_mma,
@@ -641,7 +585,6 @@ class BlackwellFusedMultiHeadAttentionForward:
             use_pdl=use_pdl,
         )
 
-    #  GPU device kernel
     @cute.kernel
     def kernel(
         self,
@@ -677,8 +620,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         1. Load warp: Loads Q, K, V data from global memory to shared memory using TMA
         2. MMA warp: Performs matrix multiplications (Q*K^T and P*V)
         3. Softmax warps: Compute softmax normalization on attention scores
-        4. Correction warps: Apply adjustments to intermediate results
-        5. Epilogue warp: Handles final output transformation and storage
+        4. Correction warps: Rescale partial O, then normalize and store O (and LSE)
 
         The kernel implements a complex pipeline with overlapping computation and memory operations,
         using tensor memory access (TMA) for efficient data loading, warp specialization for different
@@ -700,10 +642,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         :type tma_atom_v: cute.CopyAtom
         :param mV_dkl: Partitioned value tensor
         :type mV_dkl: cute.Tensor
-        :param tma_atom_o: TMA copy atom for output tensor
-        :type tma_atom_o: cute.CopyAtom
-        :param mO_qdl: Partitioned output tensor
-        :type mO_qdl: cute.Tensor
+        :param mO: Output tensor, stored directly from registers
+        :type mO: cute.Tensor
         :param scale_softmax_log2: The log2 scale factor for softmax
         :type scale_softmax_log2: Float32
         :param scale_output: The scale factor for the output
@@ -720,24 +660,17 @@ class BlackwellFusedMultiHeadAttentionForward:
         :type p_tmem_layout_staged: cute.ComposedLayout
         :param v_smem_layout_staged: Shared memory layout for value tensor
         :type v_smem_layout_staged: cute.ComposedLayout
-        :param o_smem_layout_staged: Shared memory layout for output tensor
-        :type o_smem_layout_staged: cute.ComposedLayout
         :param tile_sched_params: Scheduling parameters for work distribution
         :type tile_sched_params: fmha_utils.FmhaStaticTileSchedulerParams
         """
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        # coord inside cta
         tidx, _, _ = cute.arch.thread_idx()
 
-        #
-        # Prefetch tma desc
-        #
         if warp_idx == self.load_warp_id:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_q)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v)
 
-        # Alloc
         smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
@@ -1085,7 +1018,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tma_bar_ptr=load_kv_full_mbar_ptr + v_handle.index,
                         )
                         kv_coord += 1
-                    # End of seqlen_kv loop
                     # Vi_end
                     v_handle, load_kv_producer = (
                         self.kv_producer_update_tx_acquire_and_advance(
@@ -1101,10 +1033,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tVsV[None, v_handle.index],
                         tma_bar_ptr=load_kv_full_mbar_ptr + v_handle.index,
                     )
-                # End of if not continue_cond
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
-                # End of persistent scheduler loop
         # ///////////////////////////////////////////////////////////////////////////////
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1193,7 +1123,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                         (tSrQ1, tSrK0, tStS1),
                         (mma_s1_producer, s1_corr_producer),
                     )
-                    # Release K0
                     k_handle.release()
                     # Note: Q0 & Q1 are still needed in the seqlen_kv loop
                     # so we need to release them after the seqlen_kv loop
@@ -1240,7 +1169,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                             (tSrQ1, tSrKi, tStS1),
                             (mma_s1_producer, s1_corr_producer),
                         )
-                        # Release Ki
                         k_handle.release()
                         # GEMM_PV1(i-1) (P1 * Vi-1 -> O1_partial)
                         mma_corr_producer, p1_mma_consumer = self.mma_pv(
@@ -1256,10 +1184,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             ),
                         )
                         pv_whether_acc = True
-                        # Release Vi-1
                         v_handle.release()
-                    # End of seqlen_kv loop
-                    # release Q0 & Q1
                     q0_handle.release()
                     q1_handle.release()
                     # Wait for Vi_end
@@ -1291,18 +1216,14 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tTMEM_LOADrS_v1,
                         ),
                     )
-                    # Release Vi_end
                     v_handle.release()
                     # Empty step for correction epilog
                     vec0_handle = s0_corr_producer.acquire_and_advance()
                     vec0_handle.commit()
                     vec1_handle = s1_corr_producer.acquire_and_advance()
                     vec1_handle.commit()
-                # End of if not continue_cond
-                # Advance to next tile
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
-            # End of persistent scheduler loop
         # ///////////////////////////////////////////////////////////////////////////////
         #  Softmax0
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1479,7 +1400,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                                     (s1_corr_consumer, mma_corr_consumer),
                                 )
                             )
-                        # End of seqlen_corr_loop_steps
                         value_args = (
                             cuseqlen_q,
                             seqlen_q,
@@ -1516,17 +1436,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                             (s1_corr_consumer, mma_corr_consumer),
                             (row_idx, *value_args),
                         )
-                # End of if not continue_cond
-                # Advance to next tile
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
             # PDL: hint the runtime that dependent kernels can be early-launched.
-            # Placed after barrier init; per-warp work (TMA load, MMA) starts below.
             cute.arch.griddepcontrol_launch_dependents()
-            # End of persistent scheduler loop
             tmem.relinquish_alloc_permit()
-            # Synchronize before TMEM dealloc (done by the caller)
             self.tmem_dealloc_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
         return
@@ -1576,7 +1491,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         tSrQi, tSrK, tStSi = tensor_args
         mma_si_producer, si_corr_producer = pipeline_args
         # 0. Make sure Qi & K are ready when calling mma_qk
-        # 1. acquire S0
+        # 1. acquire Si
         si_handle = mma_si_producer.acquire_and_advance()
         # 2. make sure vec is already released in corr
         veci_handle = si_corr_producer.acquire_and_advance()
@@ -1593,7 +1508,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 tSrK[kphase_coord],
                 tStSi,
             )
-        # 4. release S0
+        # 4. release Si
         si_handle.commit()
         return mma_si_producer, si_corr_producer
 
@@ -1664,7 +1579,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     tOrVi[kphase_coord],
                     tOtOi,
                 )
-        # 4. commit Pi
+        # 4. release Pi
         pi_handle.release()
         # 5. commit Oi
         oi_handle.commit()
@@ -1685,33 +1600,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         skip_softmax_count,
         total_softmax_count,
     ) -> Tuple[bool, float]:
-        """Calculate the skip softmax flag and the row maximum.
-
-        :param row_max: The row maximum.
-        :type row_max: float
-        :param tile_row_max: The tile row maximum.
-        :type tile_row_max: float
-        :param scale_softmax_log2: The scale softmax log2.
-        :type scale_softmax_log2: float
-        :param skip_softmax_threshold_log2: The skip softmax threshold log2.
-        :type skip_softmax_threshold_log2: float
-        :param seqlen_q: The sequence length q.
-        :type seqlen_q: int
-        :param thread_idx: The thread index.
-        :type thread_idx: int
-        :param logical_offset: The logical offset.
-        :type logical_offset: Tuple[int, int]
-        :param warp_wants_skip_softmax_exchange: The warp wants skip softmax exchange.
-        :type warp_wants_skip_softmax_exchange: cute.Tensor
-        :param stage: The stage.
-        :type stage: int
-        :param skip_softmax_count: The skip softmax count.
-        :type skip_softmax_count: cute.Tensor
-        :param total_softmax_count: The total softmax count.
-        :type total_softmax_count: cute.Tensor
-        :return: Tuple containing the skip softmax flag and the row maximum.
-        :rtype: Tuple[bool, float]
-        """
+        """Return whether the warpgroup skips this tile, and the updated row max."""
         thread_wants_skip = (
             tile_row_max * scale_softmax_log2 - row_max * scale_softmax_log2
         ) < skip_softmax_threshold_log2
@@ -1901,7 +1790,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         This method processes one block of the attention matrix, computing numerically stable
         softmax by first finding the row maximum, subtracting it from all elements, applying
-        exponential function, and then normalizing by the sum of exponentials. It also handles
+        exponential function, and accumulating the sum of exponentials. It also handles
         optional masking of attention scores.
 
         The method involves several key operations:
@@ -1916,20 +1805,19 @@ class BlackwellFusedMultiHeadAttentionForward:
         :type stage: int
         :param whether_apply_mask: Whether to apply attention masking
         :type whether_apply_mask: bool
-        :param iter_args: Tuple containing the counting tensor, row_max, row_sum, and vector buffer's handle for current iteration
+        :param iter_args: Tuple of the coordinate tensor and an is-last-iteration flag
         :type iter_args: Tuple
         :param stats_args: Tuple containing row_sum and row_max
         :type stats_args: Tuple
         :param pipeline_args: Tuple containing pipeline related arguments for MMA, correction, and sequence synchronization
         :type pipeline_args: Tuple
-        :param value_args: Tuple containing seqlen_k, seqlen_q, and scale_softmax_log2
+        :param value_args: Tuple of seqlen_k, seqlen_q, scale_softmax_log2, window
+            sizes, skip_softmax_threshold_log2, thread_idx, and logical_offset
         :type value_args: Tuple
         :param atom_args: Tuple containing mma & copy atoms
         :type atom_args: Tuple
         :param tensor_args: Tuple containing softmax related tensors
         :type tensor_args: Tuple
-        :param fused_mask: Compute trip counts and apply masking for attention blocks
-        :type fused_mask: fmha_utils.FusedMask
         :return: Updated stats_args and pipeline_args
         :rtype: Tuple[Tuple, Tuple]
         """
@@ -2383,36 +2271,22 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         :param stage: Processing stage (0 for first half, 1 for second half of attention matrix)
         :type stage: int
-        :param seqlen_k: Length of the key sequence
-        :type seqlen_k: Int32
-        :param seqlen_q: Length of the query sequence
-        :type seqlen_q: Int32
-        :param cum_seqlen_q: Cumulative sequence lengths for queries
-        :type cum_seqlen_q: cute.Tensor | None
-        :param cum_seqlen_k: Cumulative sequence lengths for keys
-        :type cum_seqlen_k: cute.Tensor | None
-        :param scale_softmax_log2: Log2 scale factor for softmax operation
-        :type scale_softmax_log2: Float32
+        :param tensor_args: Tuple of tStS, tStSi, cum_seqlen_k, cum_seqlen_q, and the
+            skip-softmax exchange and counter tensors
+        :type tensor_args: Tuple
+        :param pipeline_args: Tuple of the mma_si, si_corr and pi_mma pipelines
+        :type pipeline_args: Tuple
+        :param inplace_args: Tuple of the S/P in-place producer and consumer
+        :type inplace_args: Tuple
         :param qk_thr_mma: Thread MMA operation for QK matrix multiplication
         :type qk_thr_mma: cute.ThrMma
-        :param tStS: Shared tensor for softmax input/output
-        :type tStS: cute.Tensor
-        :param tStSi: Input tensor containing attention scores
-        :type tStSi: cute.Tensor
-        :param window_size_left: Left-side sliding window size for attention masking.
-        :type window_size_left: Optional[Int32]
-        :param window_size_right: Right-side sliding window size for attention masking.
-        :type window_size_right: Optional[Int32]
-        :param mma_si_consumer: Pipeline for synchronizing with Si tensors
-        :type mma_si_consumer: pipeline.PipelineConsumer
-        :param si_corr_producer: Pipeline for synchronizing with correction operations
-        :type si_corr_producer: pipeline.PipelineProducer
-        :param pi_mma_producer: Pipeline for synchronizing with Pi tensors
-        :type pi_mma_producer: pipeline.PipelineProducer
-        :param tile_sched_params: Parameters for tile scheduling
-        :type tile_sched_params: fmha_utils.FmhaStaticTileSchedulerParams
-        :param fused_mask: Compute trip counts and apply masking for attention blocks
-        :type fused_mask: fmha_utils.FusedMask
+        :param value_args: Tuple of seqlen_k, seqlen_q, scale_softmax_log2, and
+            skip_softmax_threshold_log2
+        :type value_args: Tuple
+        :param mask_args: Tuple of window_size_left and window_size_right
+        :type mask_args: Tuple
+        :param sched_args: Tuple of the tile scheduler and its current work tile
+        :type sched_args: Tuple
         """
         (
             tStS,
@@ -2628,7 +2502,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                     True, loop_args, stats_args, pipeline_args_
                 )
 
-                # Unpack pipeline_args
                 (
                     _,
                     mma_si_consumer,
@@ -2650,11 +2523,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cute.copy(tiled_tmem_store_vec, tTMEM_STORE_VECrS, tTMEM_STORE_VECtS)
                 cute.arch.fence_view_async_tmem_store()
                 vec_i_handle.commit()
-            # End of if not continue_cond
-            # Advance to next tile
             tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
-        # End of persistent scheduler loop
 
     @cute.jit
     def correction_rescale(
@@ -2763,7 +2633,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                         (scale, scale),
                     )
                 cute.copy(tiled_tmem_store, tTMrO_i, tTMEM_STOREtO_i)
-        # Release Oi
         cute.arch.fence_view_async_tmem_store()
         oi_handle.release()
         return (si_corr_consumer, mma_corr_consumer)
@@ -3143,11 +3012,12 @@ def run(
     :type use_cold_l2: bool
     :param stats_skip_softmax_ratio: Whether to calculate the ratio of skipped softmax tiles
     :type stats_skip_softmax_ratio: bool
-    :raises ValueError: If input shapes are incompatible or head dimension is unsupported
+    :raises ValueError: If iterations is less than 1
     :raises RuntimeError: If GPU is unavailable for computation
     :return: Execution time of the FMHA kernel in microseconds
     :rtype: float
     """
+    del kwargs
     if in_dtype == cutlass.Float8E4M3FN or (
         out_dtype.is_float and out_dtype.width <= 8
     ):
@@ -3182,9 +3052,8 @@ def run(
     print(f"  skip_ref_check: {skip_ref_check}")
     print(f"  use_cold_l2: {use_cold_l2}")
     print(f"  stats_skip_softmax_ratio: {stats_skip_softmax_ratio}")
-    # Unpack parameters
     b, s_q, h_q, d = q_shape
-    b_, s_k, h_k, d_ = k_shape
+    _, s_k, h_k, _ = k_shape
     window_size_left, window_size_right = window_size
     if window_size_left == -1:
         window_size_left = None
@@ -3197,7 +3066,6 @@ def run(
     h_r = h_q // h_k
     dv = d if d != 192 else 128
 
-    # Prepare pytorch tensors: Q, K, V (random from 0 to 2) and O (all zero)
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
 
@@ -3261,7 +3129,6 @@ def run(
         if zero_out:
             f32_torch_tensor = torch.zeros(*shape, dtype=torch.float32)
         else:
-            # Create f32 torch tensor (cpu)
             f32_torch_tensor = cutlass_torch.create_and_permute_torch_tensor(
                 shape,
                 torch.float32,
@@ -3269,7 +3136,6 @@ def run(
                 init_type=init_type,
                 init_config=init_config,
             )
-        # Create dtype cute & torch tensor (gpu)
         _, torch_tensor = cutlass_torch.cute_tensor_like(
             f32_torch_tensor,
             dtype,
@@ -3428,18 +3294,17 @@ def run(
     if not can_implement:
         raise testing.CantImplementError(
             f"The current config which is invalid/unsupported: "
-            f"q_shape = {q_shape}, k_shape = {k_shape}, in_dtype = {in_dtype}, out_dtype = {out_dtype}, "
+            f"q_shape = {q_shape}, k_shape = {k_shape}, in_dtype = {in_dtype}, "
+            f"out_dtype = {out_dtype}, "
             f"qk_acc_dtype = {qk_acc_dtype}, pv_acc_dtype = {pv_acc_dtype}"
         )
 
-    # Initialize Stream
     current_stream = cutlass_torch.default_stream()
 
     if scale_softmax == 0.0:  # default to 1/sqrt(d)
         scale_softmax = 1.0 / math.sqrt(d)
-    log2_e = math.log2(
-        math.exp(1.0)
-    )  # gpu uses exp2 for perf concerns, we need an extra factor 'log2_e' here
+    # GPU uses exp2 for perf concerns, so we need an extra factor 'log2_e' here.
+    log2_e = math.log2(math.exp(1.0))
 
     scale_softmax = scale_q * scale_k * scale_softmax
     scale_softmax_log2 = scale_softmax * log2_e
@@ -3467,7 +3332,6 @@ def run(
 
     print("Compiling kernel with cute.compile ...")
     start_time = time.time()
-    # compile fmha kernel
     compiled_fmha = cute.compile(
         fmha,
         q_tensor,
@@ -3508,7 +3372,7 @@ def run(
         cum_seqlen_k=None,
     ):
         # q: (b, s_q, h_k, h_r, d), k: (b, s_k, h_k, 1, d), v: (b, s_k, h_k, 1, dv)
-        batch, s_q_max, s_lse_max, s_k_max, h_q, h_k, d_ps, dv_ps = problem_size
+        batch, s_q_max, _, s_k_max, h_q, h_k, _, _ = problem_size
         h_r = h_q // h_k
 
         ref_o_shape = list(q.shape[:-1]) + [v.shape[-1]]  # same as q but with dv
@@ -3658,10 +3522,11 @@ def run(
     )
     if stats_skip_softmax_ratio:
         print(
-            f"Skip softmax ratio: {skip_softmax_count_torch.cpu()[0]}/{total_softmax_count_torch.cpu()[0]}={skip_softmax_count_torch.cpu()[0] / total_softmax_count_torch.cpu()[0]}"
+            "Skip softmax ratio: "
+            f"{skip_softmax_count_torch.cpu()[0]}/{total_softmax_count_torch.cpu()[0]}"
+            f"={skip_softmax_count_torch.cpu()[0] / total_softmax_count_torch.cpu()[0]}"
         )
     if not skip_ref_check:
-        # Execute kernel once for reference checking
         print("Verifying results...")
         # Create cum_seqlen lists for reference computation
         cum_seqlen_q_list = None
@@ -3719,7 +3584,6 @@ def run(
 
             o_ref = ref_o_f32_torch.cpu()
 
-        # Assert close results
         torch.testing.assert_close(o_result, o_ref, atol=tolerance, rtol=1e-05)
         if lse_calculation:
             torch.testing.assert_close(
@@ -3754,7 +3618,7 @@ def run(
             zero_out=True,
         )
         if lse_calculation:
-            _, lse_tensor, lse_torch = create_and_permute_tensor(
+            _, lse_tensor, _ = create_and_permute_tensor(
                 lse_shape,
                 cutlass.Float32,
                 is_dynamic_layout=True,
@@ -3826,7 +3690,7 @@ def run(
         iterations=iterations,
     )
 
-    return exec_time  # Return execution time in microseconds
+    return exec_time
 
 
 if __name__ == "__main__":
@@ -3834,10 +3698,10 @@ if __name__ == "__main__":
     def parse_comma_separated_ints(s: str):
         try:
             return tuple(int(x.strip()) for x in s.split(","))
-        except ValueError:
+        except ValueError as e:
             raise argparse.ArgumentTypeError(
                 "Invalid format. Expected comma-separated integers."
-            )
+            ) from e
 
     def parse_nested_comma_separated_ints(s: str):
         try:
@@ -3869,11 +3733,14 @@ if __name__ == "__main__":
 
         except ValueError as e:
             if str(e) == "Mismatched parentheses":
-                raise argparse.ArgumentTypeError("Mismatched parentheses in input")
+                raise argparse.ArgumentTypeError(
+                    "Mismatched parentheses in input"
+                ) from e
             else:
                 raise argparse.ArgumentTypeError(
-                    "Invalid format. Expected comma-separated integers with optional parentheses for nested tuple."
-                )
+                    "Invalid format. Expected comma-separated integers with optional "
+                    "parentheses for nested tuple."
+                ) from e
 
     parser = argparse.ArgumentParser(description="Example of FMHA on Blackwell.")
 
@@ -3941,7 +3808,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--bottom_right_align",
         action="store_true",
-        help="Whether to use bottom right align, under this settion, the end of q is aligned with the end of k.",
+        help=(
+            "Whether to use bottom right align, under this settion, the end of q is "
+            "aligned with the end of k."
+        ),
     )
 
     parser.add_argument(
@@ -4010,7 +3880,10 @@ if __name__ == "__main__":
         "--skip_softmax_threshold",
         type=float,
         default=None,
-        help="Skip softmax and PV on a tile if e^(max(S tile) - old_max(S tile)) <= threshold",
+        help=(
+            "Skip softmax and PV on a tile if e^(max(S tile) - old_max(S tile)) <= "
+            "threshold"
+        ),
     )
 
     parser.add_argument(
@@ -4048,7 +3921,10 @@ if __name__ == "__main__":
         "--stats_skip_softmax_ratio",
         action="store_true",
         default=False,
-        help="Stats skip softmax ratio, used to print the skip softmax ratio, used for debugging.",
+        help=(
+            "Stats skip softmax ratio, used to print the skip softmax ratio, used "
+            "for debugging."
+        ),
     )
 
     args = parser.parse_args()

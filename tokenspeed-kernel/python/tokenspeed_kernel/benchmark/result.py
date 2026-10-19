@@ -72,17 +72,17 @@ def export_results(
     results: list[BenchmarkResult],
     path: str | Path,
 ) -> None:
-    """Export benchmark results as JSON."""
     payload = [result.to_dict() for result in results]
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    output_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+    )
 
 
 def import_results(path: str | Path) -> list[BenchmarkResult]:
-    """Import benchmark results from JSON."""
     input_path = Path(path)
-    raw = json.loads(input_path.read_text())
+    raw = json.loads(input_path.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
         raise ValueError(f"Expected a list of benchmark results in {input_path}")
     return [BenchmarkResult.from_dict(item) for item in raw]

@@ -21,8 +21,7 @@
 """NCCL communication backend.
 
 Looks up pre-created process groups from pg_manager. Optionally uses
-PyNccl communicators for better performance. Supports torch.compile
-via custom ops.
+PyNccl communicators for better performance.
 """
 
 import torch
@@ -94,8 +93,6 @@ class NcclBackend(CommBackend):
             "world_size": world_size,
         }
         return self._resources[group]
-
-    # ---- Public CommBackend interface ----
 
     def all_reduce(
         self,
@@ -309,7 +306,8 @@ class NcclBackend(CommBackend):
     ) -> torch.Tensor:
         """NCCL token_reduce_scatter with padding for uneven token distribution.
 
-        Pads the gathered tensor to a uniform layout, reduce-scatters, then strips padding.
+        Pads the gathered tensor to a uniform layout, reduce-scatters, then
+        strips padding.
         """
         tp_size = len(scattered_num_tokens)
         max_tokens = max(scattered_num_tokens)

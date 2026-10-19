@@ -91,7 +91,7 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     FP8 retains its gather/conversion and split-cluster path.
     """
 
-    del metadata_capacity_rows  # This backend does not use fallback plan storage.
+    del metadata_capacity_rows
     return _cute_dsl_qsa_sparse_attention(
         q,
         k_cache,

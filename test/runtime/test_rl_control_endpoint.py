@@ -179,7 +179,7 @@ class TestRouteSemantics:
         return llm, TestClient(build_sglang_compat_app(llm))
 
     def test_empty_body_is_400_on_body_routes(self):
-        _llm, client = self._client()
+        _, client = self._client()
         for route in (
             "/init_weights_update_group",
             "/update_weights_from_distributed",
@@ -246,7 +246,7 @@ class TestRouteSemantics:
         assert (llm.admission_calls) == ([])
 
     def test_flush_cache_accepts_get_and_post(self):
-        _llm, client = self._client()
+        _, client = self._client()
         assert (client.get("/flush_cache").status_code) == (200)
         assert (client.post("/flush_cache").status_code) == (200)
 

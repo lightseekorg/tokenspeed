@@ -254,7 +254,7 @@ def gumbel_sample_from_pools_generic(
 ) -> torch.Tensor:
     """Graph-safe Gumbel sampler for mixed top-k/top-p rows."""
     if logits.ndim != 2:
-        raise ValueError(f"gumbel_sample_from_pools_generic expects 2D logits")
+        raise ValueError("gumbel_sample_from_pools_generic expects 2D logits")
     if logits.device.type != "cuda":
         raise ValueError("gumbel_sample_from_pools_generic requires CUDA logits")
     if logits.stride(-1) != 1:

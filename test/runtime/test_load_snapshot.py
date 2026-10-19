@@ -468,7 +468,9 @@ def test_reporter_factory_selects_the_sink_for_each_mode(
 
     monkeypatch.setattr(load_snapshot_module, "LoadSnapshotPublisher", FakePublisher)
     monkeypatch.setattr(load_snapshot_module, "DirectLoadSnapshotSink", FakeDirectSink)
-    set_load_snapshot = lambda *values: None
+
+    def set_load_snapshot(*values):
+        del values
 
     reporter = load_snapshot_module.create_load_reporter(
         enabled=enabled,

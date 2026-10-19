@@ -152,10 +152,9 @@ def test_the_quantizer_follows_trtllms_per_token_rule():
 
 
 def test_the_quantizer_agrees_with_trtllm():
-    """TRT-LLM's quantize_e4m3_activation (quantize_fp8's token quantizer, the
-    path above 64 rows) on the same rows. Its scales come back in the input dtype (BF16
-    here): within one BF16 rounding (2^-8 relative) of the FP32 scales, which
-    a GB200 run found 60 of 64 rows off by up to 0.33%. Both
+    """TRT-LLM's quantize_e4m3_activation (quantize_fp8's token quantizer above
+    64 rows) on the same rows. Its scales come back in the input dtype (BF16
+    here), within one BF16 rounding (2^-8 relative) of the FP32 scales. Both
     dequantize the rows within half an E4M3 step (2^-4 relative to amax),
     TRT-LLM's plus its scale's BF16 rounding."""
     x = _rows(64, 4096, seed=6)

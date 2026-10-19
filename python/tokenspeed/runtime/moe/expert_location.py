@@ -186,8 +186,6 @@ class ExpertLocationMetadata:
         init=False, default=None, repr=False
     )
 
-    # -------------------------------- properties ------------------------------------
-
     @property
     def num_layers(self) -> int:
         return self.physical_to_logical_map.shape[0]
@@ -247,8 +245,6 @@ class ExpertLocationMetadata:
         self.logical_to_all_physical_map_num_valid = num_valid.to(
             torch.int32
         ).contiguous()
-
-    # -------------------------------- in-place updates ------------------------------
 
     def prepare_layers(
         self, layer_ids: Sequence[int], new_rows: torch.Tensor
@@ -369,8 +365,6 @@ class ExpertLocationMetadata:
             physical_to_logical_map=self.physical_to_logical_map_cpu.clone(),
         )
 
-    # -------------------------------- placement queries ------------------------------
-
     def local_slot_logical_experts(self, layer_id: int, ep_rank: int) -> list[int]:
         """Return the logical expert held by each of ``ep_rank``'s slots, in slot order."""
         local = self.num_local_physical_experts
@@ -406,8 +400,6 @@ class ExpertLocationMetadata:
                 ep_rank=self.ep_rank,
             )
         return self._rank_dispatch_map
-
-    # -------------------------------- load recording ---------------------------------
 
     def enable_load_recording(self, mapping: Mapping) -> None:
         """Allocate the per-physical-expert route counters the router bumps.
@@ -462,11 +454,9 @@ class ExpertLocationMetadata:
             "ep_size": self.ep_size,
         }
 
-    # -------------------------------- construction ------------------------------------
-
     @staticmethod
     def init_trivial(server_args: ServerArgs, model_config: ModelConfig):
-        """Trivial location - logical expert i corresponds to physical expert i"""
+        """Trivial location - physical expert i holds logical expert i % E"""
         common = ExpertLocationMetadata._init_common(server_args, model_config)
         num_physical_experts = common["num_physical_experts"]
         model_config_for_expert_location = common["model_config_for_expert_location"]
@@ -699,7 +689,7 @@ def _compute_logical_to_all_physical_map(
     """Invert a host ``[layers, physical]`` map into ``[layers, logical, X]`` (-1 padded)."""
     if physical_to_logical_map.device.type != "cpu":
         raise ValueError("the inverse map is built from a host tensor")
-    num_layers, num_physical_experts = physical_to_logical_map.shape
+    num_layers, _ = physical_to_logical_map.shape
     rows = physical_to_logical_map.tolist()
 
     logical_to_all_physical_map = [
@@ -1058,7 +1048,7 @@ def compute_initial_expert_location_metadata(
     elif data.endswith(".pt"):
         data_dict = torch.load(data, weights_only=True)
     elif data.endswith(".json"):
-        data_dict = json.loads(Path(data).read_text())
+        data_dict = json.loads(Path(data).read_text(encoding="utf-8"))
     else:
         raise ValueError(
             f"--init-expert-location file {data!r} must be a .pt or .json "

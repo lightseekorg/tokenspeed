@@ -62,14 +62,6 @@ class FmhaStaticTileSchedulerParams:
         loc=None,
         ip=None,
     ):
-        """
-        Initializes the FmhaStaticTileSchedulerParams with the given parameters.
-
-        :param is_persistent: Whether to use persistent kernel mode.
-        :type is_persistent: bool
-        :param problem_shape_mbh: Problem shape in (M, B, H) format.
-        :type problem_shape_mbh: cute.Shape
-        """
         self.is_persistent = is_persistent
         self.problem_shape_mbh = problem_shape_mbh
         self._loc = loc
@@ -130,18 +122,6 @@ class FmhaStaticTileScheduler:
         loc=None,
         ip=None,
     ):
-        """
-        Initializes the FmhaStaticTileScheduler with the given parameters.
-
-        :param params: Scheduler parameters.
-        :type params: FmhaStaticTileSchedulerParams
-        :param current_work_linear_idx: Current linear work index.
-        :type current_work_linear_idx: Int32
-        :param blk_coord: Block coordinates.
-        :type blk_coord: cute.Coord
-        :param grid_shape: Grid shape for the kernel.
-        :type grid_shape: cute.Shape
-        """
         self._params = params
         self._blk_coord = blk_coord
         self._grid_shape = grid_shape
@@ -246,12 +226,6 @@ class FmhaStaticTileScheduler:
         return WorkTileInfo(cur_tile_coord, is_valid)
 
     def initial_work_tile_info(self, *, loc=None, ip=None):
-        """
-        Get the initial work tile information.
-
-        :return: Initial WorkTileInfo.
-        :rtype: WorkTileInfo
-        """
         return self.get_current_work(loc=loc, ip=ip)
 
     def advance_to_next_work(self, *, advance_count=1, loc=None, ip=None):
@@ -925,31 +899,7 @@ class FusedMask:
         window_size_right: Optional[Int32] = None,
         rem_count: Optional[Int32] = 0,
     ) -> Tuple[Int32, Int32, Int32, Int32, Int32]:
-        """
-        Calculate the number of masked trips for the trailing mask.
-
-        This is used for blocks that need special handling due to masking.
-
-        :param mask_type: Type of mask to use
-        :type mask_type: utils.MaskEnum
-        :param blk_coord: Block coordinates.
-        :type blk_coord: cute.Coord
-        :param tile_shape: Shape of the tile.
-        :type tile_shape: cute.Shape
-        :param seqlen_q: Query sequence length for attention computation.
-        :type seqlen_q: Int32
-        :param seqlen_k: Key sequence length for attention computation.
-        :type seqlen_k: Int32
-        :param window_size_left: Left-side sliding window size for attention masking.
-        :type window_size_left: Optional[Int32]
-        :param window_size_right: Right-side sliding window size for attention masking.
-        :type window_size_right: Optional[Int32]
-        :param rem_count: Remaining count from previous calculations.
-        :type rem_count: Int32
-
-        :return: Number of masked info.
-        :rtype: Tuple[Int32, Int32, Int32, Int32, Int32]
-        """
+        """Return the (start, end, leading, unmasked, trailing) trip counts."""
         start_count = FusedMask.get_trip_start(
             mask_type,
             blk_coord,
@@ -1113,12 +1063,12 @@ def ex2_emulation_packed_f32x2(
     def polynomial_deg3_packed_f32x2(
         x: Float32, y: Float32, *, loc=None, ip=None
     ) -> Tuple[Float32, Float32]:
-        # 2^x ~= (0.077 * x + 0.228) * x + 0.695) * x + 1, for x in [0, 1)
+        # 2^x ~= ((0.077 * x + 0.228) * x + 0.695) * x + 1, for x in [0, 1)
         coeff = (
-            1.0,  # coeff of deg0
-            0.695146143436431884765625,  # coeff of deg1
-            0.227564394474029541015625,  # coeff of deg2
-            0.077119089663028717041015625,  # coeff of deg3
+            1.0,
+            0.695146143436431884765625,
+            0.227564394474029541015625,
+            0.077119089663028717041015625,
         )
         deg = len(coeff) - 1  # started with highest degree
         out = (coeff[deg], coeff[deg])
@@ -1181,9 +1131,7 @@ def ex2_emulation_packed_f32x2(
     return x_out, y_out
 
 
-# {$nv-internal-release begin}
 # NVVM helper for converting float32x4 to float8x4 without extra PRMTs.
-# {$nv-internal-release end}
 @cute.jit
 def cvt_f32x4_to_f8x4_pack_i32(fp32x4, fp8_type, *, loc=None, ip=None):
     fp32x4 = fp32x4.load()
@@ -1224,9 +1172,7 @@ def cvt_f32x4_to_f8x4_pack_i32(fp32x4, fp8_type, *, loc=None, ip=None):
     return packed_i32
 
 
-# {$nv-internal-release begin}
 # NVVM helper for converting float32x4 to float8x4 without extra PRMTs.
-# {$nv-internal-release end}
 @cute.jit
 def cvt_f32x4_to_f8x4(fp32x4, fp8x4, *, loc=None, ip=None):
     packed_i32 = cvt_f32x4_to_f8x4_pack_i32(fp32x4, fp8x4.element_type)

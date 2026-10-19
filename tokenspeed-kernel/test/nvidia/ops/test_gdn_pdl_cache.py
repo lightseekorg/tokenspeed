@@ -82,7 +82,10 @@ def test_pdl_persistent_cache_isolation(pdl_first, tmp_path, monkeypatch):
     # installed code or any shared cache directory.
     adapter_sources = [tmp_path / name for name in ("pdl.py", "adapter.py")]
     for target in adapter_sources:
-        target.write_text(Path(pdl.__file__).with_name(target.name).read_text())
+        target.write_text(
+            Path(pdl.__file__).with_name(target.name).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
     monkeypatch.setattr(pdl, "__file__", str(adapter_sources[0]))
     upstream_source = tmp_path / "upstream.py"
     upstream_source.write_text("upstream version 1")

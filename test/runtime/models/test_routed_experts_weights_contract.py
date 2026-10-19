@@ -73,7 +73,7 @@ def test_no_model_assigns_the_accessor_and_every_definition_is_a_property():
     offenders = {}
     non_properties = {}
     for path in sorted(MODELS_DIR.rglob("*.py")):
-        tree = ast.parse(path.read_text())
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         stores = _stores_to_self_accessor(tree)
         if stores:
             offenders[path.name] = stores

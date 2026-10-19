@@ -245,7 +245,8 @@ class InklingForConditionalGenerationNextN(nn.Module):
             tp_group=mapping.attn.tp_group,
             prefix=add_prefix("lm_head", prefix),
         )
-        # do_argmax off (as base model): the distributed-argmax path skips the padded-vocab masking below.
+        # do_argmax off (as base model): the distributed-argmax path skips the
+        # padded-vocab masking below.
         self.logits_processor = LogitsProcessor(
             self.text_config,
             skip_all_gather=mapping.attn.has_dp,
@@ -304,7 +305,8 @@ class InklingForConditionalGenerationNextN(nn.Module):
             input_embeds=input_embeds,
             spec_step_idx=spec_step_idx,
         )
-        # Base-model muP convention: lm_head consumes hidden/mup; next depth's RMSNorm is invariant to it.
+        # Base-model muP convention: lm_head consumes hidden/mup; next depth's
+        # RMSNorm is invariant to it.
         return self._compute_logits(input_ids, hidden_states, ctx)
 
     _compute_logits = InklingForConditionalGeneration._compute_logits
@@ -375,7 +377,8 @@ class InklingForConditionalGenerationNextN(nn.Module):
             )
         if dropped:
             logger.warning(
-                f"Inkling NextN load_weights dropped {len(dropped)} tensors (first: {dropped[:8]})"
+                f"Inkling NextN load_weights dropped {len(dropped)} tensors "
+                f"(first: {dropped[:8]})"
             )
         return loaded
 

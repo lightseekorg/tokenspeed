@@ -410,7 +410,8 @@ def _cache(cache, cache_format):
         or cache.shape[1:] != (64, _layout(cache_format)[3])
     ):
         raise ValueError(
-            f"{cache_format} cache must be uint8 [pages, 64, {_layout(cache_format)[3]}]"
+            f"{cache_format} cache must be uint8 "
+            f"[pages, 64, {_layout(cache_format)[3]}]"
         )
 
 
@@ -1166,7 +1167,8 @@ def _index_topk_outputs(
         or score_chunk_size % 8
     ):
         raise ValueError(
-            "require 1 <= topk <= 512, 0 <= candidate_topk <= 2048, block_size = 8, positive query chunk and score chunk divisible by 8"
+            "require 1 <= topk <= 512, 0 <= candidate_topk <= 2048, "
+            "block_size = 8, positive query chunk and score chunk divisible by 8"
         )
     if candidate_blocks is not None:
         if (
@@ -1421,7 +1423,8 @@ def compressor_pool(
         or norm_eps <= 0
     ):
         raise ValueError(
-            "Compressor normalization requires a device [512] weight and positive epsilon"
+            "Compressor normalization requires a device [512] weight and "
+            "positive epsilon"
         )
     if out is None:
         out = torch.empty(content.shape, device=content.device, dtype=dtype)
@@ -1586,7 +1589,7 @@ def triton_dsv41_swa_rope_scatter(
 ):
     if cache_format not in _PAGED_FORMATS["swa"].values():
         raise ValueError(f"{cache_format!r} is not a SWA row format")
-    dim, group, value_bytes, row_bytes, quantized = _layout(cache_format)
+    _, group, value_bytes, row_bytes, _ = _layout(cache_format)
     _cache(cache, cache_format)
     _same_device(values, (positions, cos_sin_cache, cache, slots, out, norm_weight))
     if norm_weight is not None and (
@@ -2211,6 +2214,7 @@ def quantize_index_queries(index_q, weights):
 
 
 def pack_index_queries(values):
+    """Returns uint8 [..., 64] packed E2M1 codes and int32 [...] UE8M0 scale words."""
     flat = values.reshape(-1, 128)
     data = torch.empty(
         (*values.shape[:-1], 64), dtype=torch.uint8, device=values.device
@@ -2249,6 +2253,8 @@ def _safe_metadata(
 
 
 def safe_metadata(table, lengths, pages, capacity, page_size):
+    """Returns an int32 table with ids outside `[0, pages)` set to 0, and lengths
+    clamped to `[0, min(capacity, columns * page_size)]`."""
     safe_table = torch.empty(table.shape, dtype=torch.int32, device=table.device)
     safe_lengths = torch.empty(lengths.shape, dtype=torch.int32, device=lengths.device)
     if lengths.numel():
@@ -3925,9 +3931,6 @@ def index_block_select(logits, visible, candidate_topk, block_out, block_lens):
             holding row ``visible[q] - 1`` is forced in when it has a finite
             score; equal-score boundary ties keep the lowest blocks.
         block_lens: Int32 [Q] destination for the number of ids written.
-
-    Returns:
-        None.
     """
     queries, width = logits.shape
     if not queries:

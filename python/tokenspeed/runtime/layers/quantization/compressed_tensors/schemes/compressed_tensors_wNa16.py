@@ -70,7 +70,6 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
                  group_size: int | None = None,
                  symmetric: bool | None = True,
                  actorder: ActivationOrdering | None = None):
-
         self.pack_factor = 32 // num_bits
         self.strategy = strategy
         self.symmetric = symmetric
@@ -227,7 +226,6 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
         self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
 
-        # Allocate marlin workspace.
         self.workspace = marlin_make_workspace(device)
 
         def _transform_param(

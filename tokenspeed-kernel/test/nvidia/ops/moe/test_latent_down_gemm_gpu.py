@@ -413,9 +413,11 @@ def test_the_two_mailboxes_hold_their_own_sentinels_at_once() -> None:
         # Four kernels compile here; the bound is against a gather that spins on
         # the wrong word forever, not against a slow build.
         out, err = child.communicate(timeout=900)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         child.kill()
-        raise AssertionError("a gather never stopped waiting on the other sentinel")
+        raise AssertionError(
+            "a gather never stopped waiting on the other sentinel"
+        ) from exc
     assert child.returncode == 0, f"{out[-2000:]}\n{err[-2000:]}"
     assert "COMPLETED" in out
 

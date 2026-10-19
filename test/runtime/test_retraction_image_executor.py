@@ -86,10 +86,6 @@ from tokenspeed.runtime.execution.slot_state import (  # noqa: E402
     unpack_slot_rows,
 )
 
-# ----------------------------------------------------------------------
-# Fakes
-# ----------------------------------------------------------------------
-
 
 def _acks(events) -> list[tuple[str, int]]:
     """The binding ACK events as comparable ``(kind, op_id)`` pairs."""
@@ -325,11 +321,6 @@ def _build(
     return executor, slot_state, lanes
 
 
-# ----------------------------------------------------------------------
-# Wire types and sizing
-# ----------------------------------------------------------------------
-
-
 def test_op_dataclasses_carry_the_wire_fields():
     wire = ("op_id", "request_id", "request_pool_index", "snapshot_slot", "transfers")
     assert tuple(f.name for f in fields(SnapshotOp)) == wire
@@ -450,11 +441,6 @@ def test_count_plan_ops_counts_each_request_of_a_snapshot_or_restore_batch():
     assert num_retracted == 2
 
 
-# ----------------------------------------------------------------------
-# Owner translation
-# ----------------------------------------------------------------------
-
-
 def test_replicated_groups_translate_to_the_identity_and_reject_null():
     owners = BlockOwnerTranslation(
         shard_counts=[1, 1],
@@ -496,11 +482,6 @@ def test_sharded_group_keeps_each_ranks_rows_on_both_ends():
     assert owners[1].owned_positions(rows) == [(1, (0, 1, 3)), (3, (0, 4, 6))]
     with pytest.raises(ValueError, match="residue class"):
         owners[0].owned_positions([(0, 1, 2)])
-
-
-# ----------------------------------------------------------------------
-# The executor over fakes
-# ----------------------------------------------------------------------
 
 
 def test_both_store_legs_ride_the_write_stream_under_one_fence():

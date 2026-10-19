@@ -22,8 +22,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# Computes selected-token logprobs without full-vocabulary materialization.
-
 from __future__ import annotations
 
 import torch

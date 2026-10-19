@@ -71,8 +71,10 @@ class ShearingBias:
     @cute.jit
     def __call__(
         self,
-        mPreBias: cute.Tensor,  # (b, s_q, h, rel_extent) or (total_q, h, rel_extent)
-        mBias: cute.Tensor,  # (b, s_q, h, rel_extent_padded) or (total_q, h, rel_extent_padded)
+        # (b, s_q, h, rel_extent) or (total_q, h, rel_extent)
+        mPreBias: cute.Tensor,
+        # (b, s_q, h, rel_extent_padded) or (total_q, h, rel_extent_padded)
+        mBias: cute.Tensor,
         max_seqlen_q: Int32 | int,
         max_seqlen_k: Int32 | int,
         mCuSeqlensQ: Optional[cute.Tensor] = None,

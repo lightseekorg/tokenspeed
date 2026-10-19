@@ -350,7 +350,6 @@ def _dsa_persistent_radix_topk_kernel(
         [2],
         output_counter_shared_layout,
     )
-    # Initialize local state before this row's radix passes.
     shared_histogram.store(histogram_zeros)
     shared_output_counters.store(output_counter_zeros)
 

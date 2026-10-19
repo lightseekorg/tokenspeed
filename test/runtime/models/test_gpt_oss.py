@@ -47,9 +47,6 @@ def _next_dist_port() -> int:
     return port
 
 
-# ── Server lifecycle ─────────────────────────────────────────────────
-
-
 def _serve_server(port: int, extra_args=()) -> subprocess.Popen:
     cmd = [
         sys.executable,
@@ -99,8 +96,6 @@ def _chat(port: int, messages, max_tokens=32, temperature=0):
     return resp.json()
 
 
-# ── Quality prompts ──────────────────────────────────────────────────
-
 QUALITY_CHECKS = [
     {
         "messages": [
@@ -130,9 +125,6 @@ QUALITY_CHECKS = [
         "max_tokens": 64,
     },
 ]
-
-
-# ── Mesh configs ─────────────────────────────────────────────────────
 
 
 @dataclasses.dataclass
@@ -188,9 +180,6 @@ MESH_CASES = {
         ),
     ),
 }
-
-
-# ── Tests ────────────────────────────────────────────────────────────
 
 
 class TestGptOss:

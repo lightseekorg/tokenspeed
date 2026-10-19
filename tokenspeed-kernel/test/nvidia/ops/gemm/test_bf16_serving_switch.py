@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Once serving, the joint BF16 GEMM yields to the caller's other GEMM instead of compiling."""
+"""Once serving, the joint BF16 GEMM yields to the caller's other GEMM instead of
+compiling."""
 
 from dataclasses import astuple
 
@@ -56,7 +57,8 @@ def warp_splitk(monkeypatch):
             pytest.skip("this FlashInfer build omits the warp split-K runner")
         return runner, tactic
 
-    # On the singleton: undoing an earlier instance patch leaves a bound method that shadows the class.
+    # On the singleton: undoing an earlier instance patch leaves a bound method
+    # that shadows the class.
     monkeypatch.setattr(fi._fi_gemm.AutoTuner.get(), "choose_one", choose_one)
     monkeypatch.setattr(compile_monitor, "_hooks", None)
     monkeypatch.setattr(compile_monitor, "_serving", False)

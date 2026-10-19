@@ -33,8 +33,6 @@ import torch
 from tokenspeed_kernel_amd._triton import tl, triton
 
 
-# activation metadata
-# ---------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class FnSpecs:
     name: str
@@ -54,8 +52,6 @@ class FusedActivation:
     fn_args: tuple[object, ...] = tuple()
 
 
-# swiglu
-# ---------------------------------------------------------------------------- #
 @triton.jit
 def _swiglu_clip(x, limit, clip_lower: tl.constexpr):
     res = tl.minimum(x, limit)
@@ -82,8 +78,6 @@ def swiglu_fn(input, alpha, limit):
     return _compute_swiglu(gelu, linear, 1.0, alpha, limit)
 
 
-# data types
-# ---------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class IntegerType:
     bitwidth: int
@@ -120,8 +114,6 @@ INT64 = IntegerType(64, is_signed=True)
 DataType: TypeAlias = IntegerType | FloatType
 
 
-# layout utilities
-# ---------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class StridedLayout:
     major_dim: int = -1
@@ -129,7 +121,8 @@ class StridedLayout:
     def __post_init__(self):
         if not isinstance(self.major_dim, int):
             raise TypeError(
-                f"StridedLayout(major_dim=...) must be an int, got {type(self.major_dim)}"
+                "StridedLayout(major_dim=...) must be an int, "
+                f"got {type(self.major_dim)}"
             )
 
     @property
@@ -158,8 +151,6 @@ class StridedLayout:
         return base
 
 
-# storage
-# ---------------------------------------------------------------------------- #
 @dataclass
 class Storage:
     data: torch.Tensor
@@ -170,8 +161,6 @@ class Storage:
         return self.data.device
 
 
-# main tensor class
-# ---------------------------------------------------------------------------- #
 @dataclass
 class Tensor:
     storage: Storage
@@ -181,18 +170,19 @@ class Tensor:
 
     def __post_init__(self):
         assert isinstance(self.storage, Storage)
-        # initialize dtype
         if self.dtype.bitwidth < 8 and self.shape is None:
             raise ValueError("shape must be provided for sub-byte types")
-        # initialize shape
         if self.shape is None:
             self.shape = list(self.storage.data.shape)
         self.shape = list(self.shape)
         # validate shape: all elements must be `int` or numel-1 `torch.Tensor`
-        is_int = lambda s: isinstance(s, int)
-        is_item = lambda s: hasattr(s, "numel") and s.numel() == 1
+        def is_int(s):
+            return isinstance(s, int)
+
+        def is_item(s):
+            return hasattr(s, "numel") and s.numel() == 1
+
         assert all(map(lambda s: is_int(s) or is_item(s), self.shape))
-        # initialize shape_max
         if self.shape_max is None:
             self.shape_max = [None] * len(self.shape)
         for i, (s, smax) in enumerate(zip(self.shape, self.shape_max)):
@@ -202,10 +192,8 @@ class Tensor:
                 )
             if smax is None:
                 self.shape_max[i] = s
-        # validate shape_max: all elements must be `int`
         assert all(map(is_int, self.shape_max))
 
-    # torch compatibility layer
     @property
     def ndim(self):
         return len(self.shape)
@@ -243,7 +231,7 @@ class Tensor:
 def torch_dtype_to_dtype(dtype: torch.dtype) -> DataType:
     if isinstance(dtype, DataType):
         return dtype
-    id = str(dtype).split(".")[-1]
+    dtype_name = str(dtype).split(".")[-1]
     vals = {
         "uint8": UINT8,
         "float8_e4m3fn": FP8_E4M3FN,
@@ -257,11 +245,11 @@ def torch_dtype_to_dtype(dtype: torch.dtype) -> DataType:
         "int32": INT32,
         "int64": INT64,
     }
-    if id in vals:
-        return vals[id]
-    if "float8" in id:
+    if dtype_name in vals:
+        return vals[dtype_name]
+    if "float8" in dtype_name:
         return FP8_E4M3FN
-    assert False, f"Unknown dtype: {id}"
+    assert False, f"Unknown dtype: {dtype_name}"
 
 
 def wrap_torch_tensor(
@@ -288,14 +276,12 @@ def wrap_torch_tensor(
     )
 
 
-# ragged tensor metadata
-# ---------------------------------------------------------------------------- #
 @dataclass
 class RaggedTensorMetadata:
     """
     Example:
     `slice_sizes`= [15 17 0 127]
-    `slice_offs`= [0 15 32 32 332]
+    `slice_offs`= [0 15 32 32 159]
     `block_offs_data` = {
         16: [0 1 3 3 11]
         32: [0 1 2 2 6]
@@ -303,10 +289,10 @@ class RaggedTensorMetadata:
         128: [0 1 2 2 3]
     }
     `block_schedule_data` = {
-        16:  [(0, 0) (0, 1) (0, 3) (1, 3) (2, 3) ... (7, 3) -1 ... -1]
+        16:  [(0, 0) (0, 1) (1, 1) (0, 3) (1, 3) ... (7, 3) -1 ... -1]
         32:  [(0, 0) (0, 1) (0, 3) (1, 3) (2, 3) (3, 3) -1 ...     -1]
-        64:  [(0, 0) (0, 1) (0, 3) (1, 3) (2, 3) -1 ...            -1]
-        128: [(0, 0) (0, 1) (0, 3) (1, 3) -1 ...                   -1]
+        64:  [(0, 0) (0, 1) (0, 3) (1, 3) -1 ...                   -1]
+        128: [(0, 0) (0, 1) (0, 3) -1 ...                          -1]
     }
     """
 
@@ -315,17 +301,20 @@ class RaggedTensorMetadata:
     # slice_offs = [0] + cumsum(slice_sizes)
     # i.e., slice_offs[i] is the offset of the first element in slice `i`
     slice_offs: torch.Tensor
-    # block_offs_data[k] = [0] + cumsum(ceil_div(slice_sizes, 16 * k))
-    # i.e., `block_offs_data[k][i]` is the offset of the first block of
-    # `16*k`` token for batch `i` in a `bath_sizes`-shaped ragged tensor
+    # block_offs_data[k] = [0] + cumsum(ceil_div(slice_sizes, 16 << k)), i.e.,
+    # `block_offs_data[k][i]` is the offset of the first block of `16 << k`
+    # tokens for slice `i`.
     block_offs_data: torch.Tensor
-    # let `num_blocks[k] = block_offs_data[k, 1:] - block_offs_data[k, :-1]
-    # block_schedule_data[k] = cat(*[[(batch, blk) for blk in range(blks)] for batch, blks in enumerate(num_blocks)])
-    # i.e., if the schedule of batch `i` is [(i, 0), (i, 1), ..., (i, num_blocks[k][i] - 1)]
-    # then `block_schedule_data[k]` is the concatenation of the schedules for all batches
-    # NOTE 1: `block_schedule_data[k][j]` is a packed 32-bit integer
-    # NOTE 2: because the size of `block_schedule_data[k]` is data-dependent, we pad it with -1s
-    # up to an user-provided upper bound
+    # Let `num_blocks[k] = block_offs_data[k, 1:] - block_offs_data[k, :-1]`.
+    # block_schedule_data[k] = cat(*[[(batch, blk) for blk in range(blks)]
+    #                                for batch, blks in enumerate(num_blocks)])
+    # I.e., if the schedule of batch `i` is
+    # [(i, 0), (i, 1), ..., (i, num_blocks[k][i] - 1)], then
+    # `block_schedule_data[k]` is the concatenation of the schedules for all
+    # batches.
+    # NOTE 1: `block_schedule_data[k][j]` is a packed 32-bit integer.
+    # NOTE 2: Because the size of `block_schedule_data[k]` is data-dependent,
+    # it is padded with -1s up to a user-provided upper bound.
     block_schedule_data: torch.Tensor
     # expected slice size (for heuristics)
     expected_slice_size: int | None = None
@@ -389,7 +378,9 @@ def exact_div(x, y):
 
 
 def empty_aligned(shape, dtype, device, pad_size):
-    pad = lambda x: cdiv(x, pad_size) * pad_size
+    def pad(x):
+        return cdiv(x, pad_size) * pad_size
+
     ret = torch.empty((*shape[:-1], pad(shape[-1])), dtype=dtype, device=device)
     ret_slices = (*[slice(None)] * (len(shape) - 1), slice(0, shape[-1]))
     return ret[ret_slices], ret.numel()
@@ -420,7 +411,6 @@ def _ragged_tensor_metadata_memset(
         # total number of blocks in slice processed as the loop iterates
         n_blocks_tot = tl.zeros([BLOCK], dtype=BlockOffs.dtype.element_ty)
         for i in range(0, n_slices + 1, BLOCK):
-            # load slice sizes
             offs = tl.arange(0, BLOCK) + i
             mask = offs < n_slices
             slice_sizes = tl.load(SliceSizes + offs, mask=mask, other=0)
@@ -440,27 +430,23 @@ def _ragged_tensor_metadata_memset(
 
 @triton.jit
 def _ragged_tensor_metadata_compute(
-    SliceSizes,  #
+    SliceSizes,
     BlockOffs,
-    block_offs_stride_m,  #
+    block_offs_stride_m,
     BlockSchedule,
-    block_schedule_stride_m,  #
-    first_block_size_log2,  #
+    block_schedule_stride_m,
+    first_block_size_log2,
     SIZES: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
     slice_id = pid // SIZES
     block_size_id = pid % SIZES
-    # offset pointers
     BlockOffs += block_size_id * block_offs_stride_m
     BlockSchedule += block_size_id * block_schedule_stride_m
-    # load slice sizes
     slice_sizes = tl.load(SliceSizes + slice_id)
-    # number of blocks in the slices loaded
     block_size_log2 = first_block_size_log2 + block_size_id
     n_blocks = _cdiv_pow2(slice_sizes, block_size_log2)
-    # compute block schedule
     block_off = tl.load(BlockOffs + slice_id)
     BlockSchedule += block_off
     for block_off in range(0, n_blocks, BLOCK):
@@ -489,13 +475,13 @@ def make_ragged_tensor_metadata(slice_sizes, n_total_rows):
 
     _ragged_tensor_metadata_memset[(slice_offs_combined.shape[0] + n_memset_blocks,)](
         slice_sizes,
-        n_slices,  #
+        n_slices,
         slice_offs_combined,
-        slice_offs_combined.stride(0),  #
-        block_schedule_data,  #
+        slice_offs_combined.stride(0),
+        block_schedule_data,
         block_sizes_log2[0],
         SIZES=len(block_sizes_log2),
-        BLOCK=MEMSET_BLOCK,  # optimization parameters
+        BLOCK=MEMSET_BLOCK,
         num_warps=4,
     )
 
@@ -504,10 +490,10 @@ def make_ragged_tensor_metadata(slice_sizes, n_total_rows):
         block_offs_data,
         block_offs_data.stride(0),
         block_schedule_data,
-        block_schedule_data.stride(0),  # outputs
+        block_schedule_data.stride(0),
         block_sizes_log2[0],
         SIZES=len(block_sizes_log2),
-        BLOCK=512,  # optimization parameters
+        BLOCK=512,
         num_warps=4,
     )
 

@@ -252,8 +252,6 @@ def _recording_transfer_manager(layout: CacheTransferContract, src_ptr: int):
     manager.topology = SimpleNamespace(tp_rank=0)
     manager.kv_args = SimpleNamespace(cache_layout=layout, kv_data_ptr=src_ptr)
 
-    # Whole-field descriptors arrive as int64 array columns, fragment rows as
-    # lists; record both as plain lists so the geometry asserts read the same.
     # The fake engine records per-descriptor WRITEs as lists and expands the
     # page-gathered WRITE the way Mooncake does (field-major, batched), so the
     # geometry asserts read the same for both.
@@ -2103,10 +2101,6 @@ def test_kvp_pd_manifest_preserves_virtual_ids_and_checks_virtual_bounds():
         )
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
-
-
 # ---- KVP page-sharded prefill: owner filtering in the sender ----
 
 
@@ -2407,3 +2401,7 @@ def test_bootstrap_layout_excludes_rank_local_field_addresses():
         assert args.cache_layout.field_addresses == bound.field_addresses
         assert args.wire_layout.field_addresses is None
     assert wires[0] == wires[1]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

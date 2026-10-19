@@ -96,7 +96,6 @@ __all__ = [
 
 
 def get_hip_runtime_path() -> str:
-    """Return the HIP runtime library path used by the Triton driver."""
     from tokenspeed_triton.backends.amd.driver import _get_path_to_hip_runtime_dylib
 
     return _get_path_to_hip_runtime_dylib()

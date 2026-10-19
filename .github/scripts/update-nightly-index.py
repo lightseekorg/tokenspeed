@@ -68,7 +68,8 @@ def update_index(
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest or ""):
             raise ValueError(f"Missing SHA256 digest for {name}")
         existing = re.search(
-            rf'<a href="[^"]+#sha256=([0-9a-f]{{64}})">{re.escape(escape(name))}</a><br>\n',
+            rf'<a href="[^"]+#sha256=([0-9a-f]{{64}})">'
+            rf"{re.escape(escape(name))}</a><br>\n",
             previous,
         )
         if existing is not None:

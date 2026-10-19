@@ -48,18 +48,15 @@ class FusedMLASetKVBufferArg:
 
 
 def apply_rope(
-    # embedding inputs
     positions: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
     head_size: int,
     cos_sin_cache: torch.Tensor,
-    # embedding options
     is_neox: bool = True,
     fused_set_kv_buffer_arg: FusedSetKVBufferArg | None = None,
     q_rope_out: torch.Tensor | None = None,
     k_rope_out: torch.Tensor | None = None,
-    # dispatch options
     solution: str | None = None,
     override: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -214,14 +211,12 @@ def apply_k_rope(
 
 
 def apply_rope_mla(
-    # embedding inputs
     positions: torch.Tensor,
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
     q_nope: torch.Tensor,
     k_nope: torch.Tensor,
     cos_sin_cache: torch.Tensor | None,
-    # embedding options
     is_neox: bool = True,
     quantize_dtype: torch.dtype = torch.float8_e4m3fn,
     quant_scale_q: float | torch.Tensor = 1.0,
@@ -230,7 +225,6 @@ def apply_rope_mla(
     k_rope_out: torch.Tensor | None = None,
     q_nope_out: torch.Tensor | None = None,
     k_nope_out: torch.Tensor | None = None,
-    # dispatch options
     solution: str | None = None,
     override: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -414,8 +408,6 @@ __all__ = [
 
 
 import tokenspeed_kernel.ops.embedding.ascend  # noqa: E402,F401
-
-# Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.embedding.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.triton  # noqa: E402,F401

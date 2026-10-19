@@ -112,11 +112,6 @@ def make_config(**overrides) -> KimiK3DSparkConfig:
     return KimiK3DSparkConfig(**fields)
 
 
-# --------------------------------------------------------------------------
-# The published checkpoint must validate as-is
-# --------------------------------------------------------------------------
-
-
 def test_published_checkpoint_config_validates() -> None:
     validate_k3_dspark_config(make_config())
 
@@ -149,11 +144,6 @@ def test_non_yarn_rope_yields_no_scaling() -> None:
     )
     assert config.rope_scaling_dict() is None
     assert config.resolved_rope_theta() == 10000.0
-
-
-# --------------------------------------------------------------------------
-# Validation rejects the corruptions that would otherwise be silent
-# --------------------------------------------------------------------------
 
 
 def test_tap_count_must_match_num_target_layers() -> None:
@@ -212,11 +202,6 @@ def test_output_gate_is_rejected() -> None:
         validate_k3_dspark_config(make_config(mla_use_output_gate=True))
 
 
-# --------------------------------------------------------------------------
-# Cross-checks against the loaded target
-# --------------------------------------------------------------------------
-
-
 class _Target:
     def __init__(self, hidden_size=7168, num_hidden_layers=93, vocab_size=163840):
         self.hidden_size = hidden_size
@@ -248,11 +233,6 @@ def test_vocab_mismatch_is_rejected() -> None:
         validate_k3_dspark_config(
             make_config(), target_config=_Target(vocab_size=152064)
         )
-
-
-# --------------------------------------------------------------------------
-# Weight contract
-# --------------------------------------------------------------------------
 
 
 def test_skipped_prefixes_cover_exactly_the_shared_and_training_only_weights() -> None:

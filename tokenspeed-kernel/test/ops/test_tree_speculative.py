@@ -177,7 +177,6 @@ def test_tree_window_attention_matches_reference(n, prefix_lens, require):
 )
 def test_tree_window_attention_large_query_tiles(hq, hkv, d, n, require):
     require("attention", "tree_window", "triton", torch.bfloat16, "q")
-    """N x GQA group beyond one row tile (e.g. GQA 8 at head_dim 256) still matches."""
     gen = torch.Generator().manual_seed(hq * n + d)
     _check_tree_window(2, n, [40, 97], hq, hkv, d, 64, gen)
 
@@ -185,7 +184,6 @@ def test_tree_window_attention_large_query_tiles(hq, hkv, d, n, require):
 @pytest.mark.parametrize("lanes,window", [(2, 12), (4, 12), (8, 32), (16, 64), (1, 6)])
 def test_tree_window_attention_lane_rows(lanes, window, require):
     require("attention", "tree_window", "triton", torch.bfloat16, "q")
-    """Draft lanes: K rows per request over a wider (S - 1) * K lane window."""
     gen = torch.Generator().manual_seed(lanes * 100 + window)
     _check_tree_window(3, window, [5, 70, 1], 32, 8, 128, 32, gen, rows=lanes)
 
@@ -199,7 +197,6 @@ def test_tree_window_attention_last_dim_strided(require):
 @pytest.mark.parametrize("poison", [float("nan"), float("inf")])
 def test_tree_window_attention_ignores_nonfinite_v_in_unseen_slots(poison, require):
     require("attention", "tree_window", "triton", torch.bfloat16, "q")
-    """Lane window slots no row sees (later steps, padding) stay out of P.V."""
     gen = torch.Generator().manual_seed(7)
     _check_tree_window(3, 12, [100, 3, 1], 16, 2, 128, 16, gen, rows=4, poison=poison)
 

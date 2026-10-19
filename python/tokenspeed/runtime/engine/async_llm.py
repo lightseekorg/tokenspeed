@@ -128,7 +128,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
-        # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
         self.log_requests = server_args.enable_log_requests
@@ -138,7 +137,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         # Init inter-process communication (scheduler IPC owned by EngineCoreClient).
         self.engine_core_client = EngineCoreClient(port_args)
 
-        # Read model args
         self.model_path = server_args.model
         self.served_model_name = server_args.served_model_name
         self.model_config = ModelConfig(
@@ -172,18 +170,16 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             )
             if self.model_config.is_multimodal:
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        # Store states
         self.no_create_loop = False
         self.rid_to_state: dict[str, ReqState] = {}
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
-        self.dump_requests_folder = ""  # By default do not dump
+        self.dump_requests_folder = ""
         self.dump_requests_threshold = 1000
         self.dump_request_list: list[tuple] = []
         self.log_request_metadata = self.get_log_request_metadata()
         self.server_status = ServerStatus.Starting
 
-        # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
         self.model_update_result: Awaitable[UpdateWeightFromDiskReqOutput] | None = None
         self.asyncio_tasks = set()
@@ -199,7 +195,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         # object's event loop (see auto_create_handle_loop).
         self._rl_control_task = None
 
-        # For session info
         self.session_futures = {}  # session_id -> asyncio event
 
         # Set after scheduler is initialized
@@ -248,9 +243,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
-        # for disaggregation, start kv bootstrap server on prefill
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # only start bootstrap server on prefill tm
             kv_bootstrap_server_class = get_kv_class(
                 self.transfer_backend, KVClassType.BOOTSTRAP_SERVER
             )
@@ -445,7 +438,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         generators = []
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
-            # Send all requests
             for i in range(batch_size):
                 tmp_obj = obj[i]
                 tokenized_obj = await self._tokenize_one_request(tmp_obj)
@@ -457,12 +449,12 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             # can be slower than duplicating requests explicitly.
             if batch_size > 128:
                 logger.warning(
-                    "Sending a single large batch with parallel sampling (n > 1) has not been well optimized. "
-                    "The performance might be better if you just duplicate the requests n times or use "
-                    "many threads to send them one by one with parallel sampling (n > 1)."
+                    "Sending a single large batch with parallel sampling (n > 1) has "
+                    "not been well optimized. The performance might be better if you "
+                    "just duplicate the requests n times or use many threads to send "
+                    "them one by one with parallel sampling (n > 1)."
                 )
 
-            # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
             tokenized_objs = await self.input_processor.tokenize_batch(objs)
 
@@ -484,7 +476,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                     generators.append(self._wait_one_response(tmp_obj))
                     rids.append(tmp_obj.rid)
 
-        # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
         if not is_stream:
             outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
@@ -529,7 +520,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
     ) -> tuple[bool, str, Any]:
         self.auto_create_handle_loop()
 
-        # default the load format to the server_args
         if obj.load_format is None:
             obj.load_format = self.server_args.load_format
         logger.info(f"Start update_weights. Load format={obj.load_format!s}")
@@ -729,11 +719,11 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         while not self.gracefully_exit:
             await asyncio.sleep(5)
 
-        # Drain requests
         while True:
             remain_num_req = len(self.rid_to_state)
             logger.info(
-                f"Gracefully exiting... remaining number of requests {remain_num_req!s}",
+                "Gracefully exiting... remaining number of requests "
+                f"{remain_num_req!s}",
             )
             if remain_num_req > 0:
                 await asyncio.sleep(5)
@@ -747,7 +737,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         sys.exit(0)
 
     async def handle_loop(self):
-        """The event loop that handles requests"""
 
         while True:
             recv_obj = await self.engine_core_client.recv_from_detokenizer.recv_pyobj()
@@ -764,7 +753,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             self.model_update_result.set_result(recv_obj)
         else:  # self.server_args.mapping.has_attn_dp
             self.model_update_tmp.append(recv_obj)
-            # set future if the all results are received
+            # set future if all the results are received
             if len(self.model_update_tmp) == self.server_args.mapping.attn.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
 
@@ -799,7 +788,7 @@ T = TypeVar("T")
 
 
 class _Communicator(Generic[T]):
-    """Note: The communicator now only run up to 1 in-flight request at any time."""
+    """Note: The communicator now only runs up to 1 in-flight request at any time."""
 
     def __init__(self, sender, fan_out: int):
         self._sender = sender

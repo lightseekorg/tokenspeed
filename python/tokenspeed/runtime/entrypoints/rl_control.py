@@ -18,12 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Control-endpoint helpers for the in-engine RL control app (the HTTP surface slime drives).
+"""Control-endpoint helpers for the in-engine RL control app.
 
-The engine advertises where its control app listens and what it can do so a
-fronting gateway (SMG, ``crates/rl``) can drive it without guessing. The
-label keys are SMG's ``rl.*`` capability-override keys; SMG's discovery turns
-every key here into a worker label. The one engine import is the scheduler's
+The control app is the HTTP surface slime drives. The engine advertises where
+its control app listens and what it can do so a fronting gateway (SMG,
+``crates/rl``) can drive it without guessing. The label keys are SMG's
+``rl.*`` capability-override keys; SMG's discovery turns every key here into a
+worker label. The one engine import is the scheduler's
 ``SUPPORTED_WEIGHT_UPDATE_SOURCES``, so the advertisement cannot drift from what
 the dispatcher implements; the module still needs no model to import.
 """
@@ -59,7 +60,7 @@ def control_bind_host(server_args: ServerArgs) -> str:
 
 
 def control_url(server_args: ServerArgs) -> str | None:
-    """Base URL of the control app, or ``None`` when ``--rl-control-port`` is unset."""
+    """Base URL of the control app; ``None`` when unset or bound to a wildcard."""
     port = server_args.rl_control_port
     if not port:
         return None

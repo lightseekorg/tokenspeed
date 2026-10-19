@@ -537,10 +537,7 @@ def create_grammar_backend(
     # trigger covers the post-reasoning preamble. gpt-oss is wired today
     # (``<|start|>assistant<|channel|>final<|message|>``); other reasoning
     # parsers (qwen3-thinking, deepseek-r1, ...) can be added the same
-    # way as needed. The previous token-id-based ``ReasonerGrammarBackend``
-    # wrapper has been removed: it couldn't handle multi-token channel
-    # preambles and carried known P1 bugs around state cloning + reasoning
-    # initialization.
+    # way as needed.
     return grammar_backend
 
 

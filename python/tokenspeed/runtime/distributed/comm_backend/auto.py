@@ -277,8 +277,6 @@ class AutoBackend(CommBackend):
             return Route.NCCL
         return Route.MULTIMEM if self._multicast_reachable(group) else Route.NCCL
 
-    # ---- Token-aware ops ----
-
     def token_all_gather(
         self,
         tensor: torch.Tensor,
@@ -303,8 +301,6 @@ class AutoBackend(CommBackend):
         if route is Route.MULTIMEM:
             return self._rsag.token_reduce_scatter(tensor, group, scattered_num_tokens)
         return self._nccl.token_reduce_scatter(tensor, group, scattered_num_tokens)
-
-    # ---- Public CommBackend interface ----
 
     def get_prepared_all_gather(self, group: Group, dtype: torch.dtype):
         if (

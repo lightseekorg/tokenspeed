@@ -155,7 +155,8 @@ def main():
         parser.error("Create the output directory before running this harness")
     if any(output.iterdir()):
         parser.error(
-            "Output directory must be empty; use a new directory to preserve previous logs"
+            "Output directory must be empty; "
+            "use a new directory to preserve previous logs"
         )
     port = int(args.port)
     with socket.socket() as probe:
@@ -206,7 +207,7 @@ def main():
     (output / "server-command.json").write_text(json.dumps(public_command, indent=2))
     base = f"http://127.0.0.1:{port}"
     started = time.monotonic()
-    with (output / "server.log").open("w") as log:
+    with (output / "server.log").open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
         )
@@ -214,7 +215,8 @@ def main():
             while time.monotonic() - started < int(args.server_timeout):
                 if process.poll() is not None:
                     raise RuntimeError(
-                        f"Server exited {process.returncode}; see {output / 'server.log'}"
+                        f"Server exited {process.returncode}; "
+                        f"see {output / 'server.log'}"
                     )
                 try:
                     with urlopen(base + "/readiness", timeout=3) as response:
@@ -282,7 +284,7 @@ def main():
                 (output / "eval-command.json").write_text(
                     json.dumps(evaluation, indent=2)
                 )
-                with (output / "evalscope.log").open("w") as eval_log:
+                with (output / "evalscope.log").open("w", encoding="utf-8") as eval_log:
                     subprocess.run(
                         evaluation,
                         stdout=eval_log,
@@ -292,7 +294,8 @@ def main():
                     )
                 if process.poll() is not None:
                     raise RuntimeError(
-                        f"Server exited {process.returncode} during evaluation; see server.log"
+                        f"Server exited {process.returncode} during evaluation; "
+                        "see server.log"
                     )
                 result = read_gsm8k_result(output / "evalscope", version("evalscope"))
                 result["execution_mode"] = args.execution_mode

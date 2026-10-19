@@ -44,7 +44,10 @@ _EXCLUDED_FUSED_MEMBERS: Mapping[str, tuple[str, ...]] = MappingProxyType(
 
 
 def should_exclude_quant_module(prefix: str, exclude_modules: list[str]) -> bool:
-    """Whether ``prefix`` matches a ModelOpt-style glob in ``exclude_modules``."""
+    """Whether ``prefix`` matches a ModelOpt-style glob in ``exclude_modules``.
+
+    A fused projection is excluded only when all of its members are excluded.
+    """
     if prefix is None or not exclude_modules:
         return False
     for pattern in exclude_modules:
@@ -70,8 +73,6 @@ def should_ignore_quant_layer(
     if prefix is None or ignored_layers is None:
         return False
 
-    # layer_name = model.layers.0.self_attn.qkv_proj
-    # proj_name = qkv_proj
     proj_name = prefix.split(".")[-1]
 
     # Fused layers like gate_up_proj or qkv_proj will not be fused
@@ -81,7 +82,6 @@ def should_ignore_quant_layer(
     if proj_name in fused_mapping and prefix not in ignored_layers:
         shard_proj_names = fused_mapping[proj_name]
 
-        # Convert fused_name --> [shard_names]
         shard_names = [
             prefix.replace(proj_name, shard_proj_name)
             for shard_proj_name in shard_proj_names
@@ -176,10 +176,7 @@ def should_ignore_quant_layer(
 
 
 def check_equal_or_regex_match(layer_name: str, targets: Iterable[str]) -> bool:
-    """
-    Checks whether a layer_name is exactly equal or a regex match for
-    if target starts with 're:' to any target in list.
-    """
+    """Whether ``layer_name`` equals any target or regex-matches a ``re:`` target."""
     for target in targets:
         if _is_equal_or_regex_match(layer_name, target):
             return True
@@ -197,26 +194,20 @@ def find_matched_target(
     config that a layer corresponds to.
 
     Recall that a compressed-tensors configs has a concept of
-    config_groups, where each layer can be quantized with with a different
+    config_groups, where each layer can be quantized with a different
     scheme.
 
     targets in each config_group will be a list of either layer names
     (or regexes corresponding to layer names) or names of torch Modules.
 
     First, we try to match the layer_name with a target
-    Second, we try to match the module's name with a target
+    Second, we try to match the module's class name with a target
+        (case-insensitive substring match)
     Third, we try to map the layer_name to a list of fused module names.
         *All* component module names must match in order for a match to be
         successful. A successful match returns the first component target
     Last, a target naming a class of the module (compressed-tensors' class
         match: any class in its MRO, ``Linear`` for every ``LinearBase``)
-
-    :param layer_name: layer name
-    :param module: torch.nn.Module
-    :param targets: list of targets to match the layer against
-    :param fused_mapping: map from fused layer names to its components
-    :param fused_strategy: either "all" or "any". If using "all", fused
-        layers match if "all" of its components match
     """
 
     if layer_name is None:
@@ -254,11 +245,8 @@ def _find_first_match(
     """
     Returns first element of target that matches value either
     exactly or as a regex after 're:'. If check_contains is set to True,
-    additionally checks if the target string is contained within the value.
-
-    :param value: string to compare the list of targets against
-    :param targets: list of targets to match the layer against
-    :param check_contains: whether or not to do a substring match
+    additionally checks case-insensitively if the target string is contained
+    within the value.
     """
 
     for target in targets:
@@ -273,7 +261,8 @@ def _is_equal_or_regex_match(
     """
     Checks whether a value is exactly equal or a regex match for target
     if target starts with 're:'. If check_contains is set to True,
-    additionally checks if the target string is contained within the value.
+    additionally checks case-insensitively if the target string is contained
+    within the value.
     """
 
     if target.startswith("re:"):
@@ -300,22 +289,16 @@ def _match_fused_layer(
     Implements an "all" matching strategy where a fused layer matches iff
     "all" of its components match
 
-    :param layer_name: layer name
-    :param target_layers: list of targets to match the layer against
-    :param fused_mapping: map from fused layer names to its components
-
     Examples:
         layer_name = "model.layers.0.self_attn.qkv_proj"
         target_layers = ["model.layers.0.self_attn.q_proj",
                         "model.layers.0.self_attn.k_proj",
                         "model.layers.0.self_attn.v_proj"]
     """
-    # find layer_name in mapping
     fused = next((key for key in fused_mapping if layer_name.endswith(key)), None)
     if fused is None:
         return None
 
-    # expand path of unfused components
     unfused_paths = [
         layer_name.replace(fused, unfused) for unfused in fused_mapping[fused]
     ]
@@ -336,7 +319,6 @@ def _match_fused_layer(
 def convert_to_channelwise(
     weight_scale: torch.Tensor, logical_widths: list[int]
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Create channelwise buffer
     weight_scale_channel = torch.empty(
         (sum(logical_widths), 1), dtype=torch.float32, device=weight_scale.device
     )

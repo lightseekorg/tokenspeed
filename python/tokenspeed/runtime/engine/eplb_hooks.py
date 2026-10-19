@@ -99,7 +99,7 @@ def make_expert_rebalance_controller(
 
 
 def rebalance_release_refusal(controller: ExpertRebalanceController | None):
-    """Why a memory-saver release must be refused right now, or None.
+    """A callable: why a memory-saver release must be refused now, or None.
 
     Internal ops must not run against unmapped weights: a release is refused
     while a rebalance is in progress (its chunk ops would land after the
@@ -151,8 +151,6 @@ class EplbHooks:
         if controller is not None:
             request_handler.set_internal_op_completer(self)
 
-    # -------------------------------- loop entry point ----------------------------
-
     def note_round(self, *, forwarded: bool) -> None:
         """Count this round's forward; enqueue the ops the controller makes due."""
         if self._controller is None:
@@ -164,8 +162,6 @@ class EplbHooks:
         """Stop the controller's compute worker at engine shutdown."""
         if self._controller is not None:
             self._controller.shutdown()
-
-    # -------------------------------- request handler entry points ---------------
 
     def complete(self, op) -> None:
         """Complete a gate-agreed internal op through the handle's named operations."""
@@ -201,8 +197,6 @@ class EplbHooks:
             f"expert load snapshot taken; the placement commits after "
             f"{controller.commit_delay_forwards} forwards"
         )
-
-    # -------------------------------- the ops -------------------------------------
 
     def _snapshot(self, controller: ExpertRebalanceController) -> None:
         snapshot = self._device.snapshot_expert_load()

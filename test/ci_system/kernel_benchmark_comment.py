@@ -459,7 +459,8 @@ def render_comment(report: dict[str, Any], run_id: int, run_attempt: int) -> str
     lines.extend(
         [
             "",
-            f"[Measurement run](https://github.com/{repository}/actions/runs/{run_id}/attempts/{run_attempt})",
+            f"[Measurement run](https://github.com/{repository}/actions/runs/"
+            f"{run_id}/attempts/{run_attempt})",
         ]
     )
     body = "\n".join(lines)
@@ -682,12 +683,23 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     messages = {
-        "artifact_missing": "No benchmark report artifact was produced; nothing to publish.",
-        "task_missing": "The benchmark task did not run; leaving its previous comment unchanged.",
-        "pull_request_closed": "The pull request was closed without merging; skipping benchmark comment.",
-        "candidate_stale": "The pull request has a newer head commit; skipping stale results.",
+        "artifact_missing": (
+            "No benchmark report artifact was produced; nothing to publish."
+        ),
+        "task_missing": (
+            "The benchmark task did not run; leaving its previous comment unchanged."
+        ),
+        "pull_request_closed": (
+            "The pull request was closed without merging; "
+            "skipping benchmark comment."
+        ),
+        "candidate_stale": (
+            "The pull request has a newer head commit; skipping stale results."
+        ),
         "target_stale": "The target branch has advanced; skipping stale results.",
-        "newer_result_present": "A newer benchmark result is already published; skipping.",
+        "newer_result_present": (
+            "A newer benchmark result is already published; skipping."
+        ),
         "created": "Created the kernel benchmark pull request comment.",
         "updated": "Updated the kernel benchmark pull request comment.",
     }

@@ -1088,11 +1088,13 @@ class TestDeepseekV4Config:
                 return_value="/nonexistent/tokenizer-snapshot",
             ),
             patch(
-                "tokenspeed.runtime.utils.hf_transformers_utils.AutoTokenizer.from_pretrained",
+                "tokenspeed.runtime.utils.hf_transformers_utils."
+                "AutoTokenizer.from_pretrained",
                 return_value=DummyTokenizer(),
             ),
             patch(
-                "tokenspeed.runtime.utils.hf_transformers_utils._load_deepseek_v4_encode_messages",
+                "tokenspeed.runtime.utils.hf_transformers_utils."
+                "_load_deepseek_v4_encode_messages",
                 return_value=encode_messages,
             ),
         ):
@@ -1380,11 +1382,11 @@ class TestDeepseekV4Config:
         assert (model_config.qk_nope_head_dim) == (448)
         assert (model_config.v_head_dim) == (512)
         assert (model_config.index_head_dim) == (128)
-        _pytest_first_1 = model_config.scaling
-        _pytest_second_2 = 512**-0.5
+        scaling = model_config.scaling
+        expected_scaling = 512**-0.5
         assert (
-            _pytest_first_1 == _pytest_second_2
-            or round(abs(_pytest_first_1 - _pytest_second_2), 7) == 0
+            scaling == expected_scaling
+            or round(abs(scaling - expected_scaling), 7) == 0
         )
 
     def test_deepseek_v4_nextn_architecture_uses_v4_runtime_metadata(self):
@@ -1491,7 +1493,7 @@ class TestDeepseekV4Config:
 
     @staticmethod
     def _greedy_fixture(vocab, rank, rows, block, tp_size, device):
-        """A single vocabulary shard plus the reference argmax over it."""
+        """A single vocabulary shard plus the reference greedy chain over it."""
         torch.manual_seed(0)
         shard = SimpleNamespace(
             num_org_elements=vocab,

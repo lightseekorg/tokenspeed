@@ -170,7 +170,8 @@ class ShapeCapture:
         output_path = Path(path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True, default=str)
+            json.dumps(payload, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
         )
 
     def clear(self) -> None:

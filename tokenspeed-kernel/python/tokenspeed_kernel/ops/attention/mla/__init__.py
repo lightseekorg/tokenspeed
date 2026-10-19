@@ -109,11 +109,6 @@ def _blockscaled_signature_and_scales(
 LSE_LN = math.log2(math.e)
 
 
-# ===-----------------------------------------------------------------------===#
-# MLA Kernels
-# ===-----------------------------------------------------------------------===#
-
-
 def mla_project_value_prefers_contiguous_weight(
     *,
     dtype: torch.dtype,

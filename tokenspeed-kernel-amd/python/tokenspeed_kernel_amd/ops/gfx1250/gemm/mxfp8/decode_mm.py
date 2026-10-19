@@ -39,8 +39,8 @@ _NUM_BUFFERS = 3
 _TDM_FUSION_NONE = 0
 _TDM_FUSION_PAIR_2W = 1
 # LLVM uses this target to encode the register budget, occupancy, and scheduling.
-# We struggle to fill all WGPs for these projects and these triple-buffered
-# producers are also LDS-heavy: 2 waves/EU changed AMDGCN but measured neutral.
+# We struggle to fill all WGPs for these projections and these triple-buffered
+# producers are also LDS-heavy: 2 waves/EU changed AMDGCN but measured neutral,
 # while 4 forced spills in high-register M=16 FP32 paths. The lightweight
 # reducer likewise showed no gain, so use 1 for every kernel.
 _WAVES_PER_EU = 1
@@ -1128,7 +1128,8 @@ def launch_gluon_mm_fp8_blockscale_gfx1250(
     )
     if n % 128 != 0 or k < _FP32_SCALE_MIN_K or k % 128 != 0:
         raise ValueError(
-            f"gfx1250 FP8 block-scale GEMV requires N and K divisible by 128, got N={n}, K={k}"
+            "gfx1250 FP8 block-scale GEMV requires N and K divisible by 128, "
+            f"got N={n}, K={k}"
         )
     for name, scales, shape in (
         ("A_scales", A_scales, (m, k // 128)),

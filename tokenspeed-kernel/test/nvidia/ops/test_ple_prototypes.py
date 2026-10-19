@@ -348,7 +348,8 @@ def test_performance(tokens, pdl):
     old = _measure(lambda: ple_ngram_ids(*args, **opts, mod_reciprocals=None))
     new = _measure(lambda: ple_ngram_ids(*args, **opts, mod_reciprocals=reciprocal))
     print(
-        f"NGRAM tokens={tokens} pdl={pdl} div_us={old:.3f} reciprocal_us={new:.3f} speedup={old/new:.3f}"
+        f"NGRAM tokens={tokens} pdl={pdl} div_us={old:.3f} "
+        f"reciprocal_us={new:.3f} speedup={old/new:.3f}"
     )
 
 

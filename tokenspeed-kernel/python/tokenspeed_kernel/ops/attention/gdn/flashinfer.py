@@ -152,18 +152,16 @@ if is_available():
         K-last [N, H, V, K] recurrent state (flashinfer-native; matches the
         runtime's SSM state pool layout, so no transpose is needed here).
 
-        Default returns ``(out, final_state)``: out [B, T, Hv, D] in q.dtype,
+        Returns a ``GdnChunkPrefillResult``: out [B, T, Hv, D] in q.dtype,
         final_state [N, H, V, K] (K-last, same layout as initial_state).
 
-        When ``output_h=True`` returns
-        ``(out, final_state, fi_checkpoints, checkpoint_cu_starts)`` where:
-        - ``fi_checkpoints``: raw flashinfer checkpoint buffer, K-last
+        When ``output_h=True`` it also carries (``FLASHINFER`` layout):
+        - ``h``: raw flashinfer checkpoint buffer, K-last
           ``[total_fi_ckpts, H, V, K]`` (float32). Checkpoint ``k`` within a
           sequence is the state *after* processing chunk ``k`` (= FLA ``h[k+1]``).
           Per-sequence count is ``L_i // CHUNK_SIZE``.
-        - ``checkpoint_cu_starts``: int64 tensor of length ``N+1`` giving the
-          cumulative start offset of each sequence's checkpoints in
-          ``fi_checkpoints``.
+        - ``h_cu_starts``: int64 tensor of length ``N+1`` giving the
+          cumulative start offset of each sequence's checkpoints in ``h``.
 
         The caller indexes directly with flashinfer-native offsets rather than
         rebuilding the FLA h tensor.
@@ -183,8 +181,6 @@ if is_available():
         if scale is None:
             scale = head_dim**-0.5
 
-        # initial_state is already K-last [N, H, V, K] (flashinfer-native);
-        # only a dtype cast + contiguity are needed, no transpose.
         fi_initial_state = initial_state.float().contiguous()
 
         state_checkpoints = None
@@ -240,13 +236,10 @@ if is_available():
         out = out.to(q.dtype)
         if batched:
             out = out.unsqueeze(0)
-        # final_state is already K-last [N, H, V, K]; no transpose needed.
 
         if not output_h:
             return GdnChunkPrefillResult(out=out, final_state=final_state)
 
-        # Return raw flashinfer checkpoints, K-last [total_fi, H, V, K]. The
-        # caller indexes directly using flashinfer-native offsets.
         return GdnChunkPrefillResult(
             out=out,
             final_state=final_state,
@@ -255,10 +248,6 @@ if is_available():
             h_layout=GdnCheckpointLayout.FLASHINFER,
         )
 
-
-# ===-----------------------------------------------------------------------===#
-# GDN decode / MTP (K-last, SM90+)
-# ===-----------------------------------------------------------------------===#
 
 flashinfer_gdn_decode_step = error_fn
 flashinfer_gdn_decode_mtp = error_fn
@@ -411,7 +400,8 @@ if is_decode_available():
         """
         if tree_ancestors is not None or replay_payload is not None:
             raise NotImplementedError(
-                "FlashInfer GDN MTP kernels follow a chain; draft trees run the Triton kernel"
+                "FlashInfer GDN MTP kernels follow a chain; draft trees run the "
+                "Triton kernel"
             )
         if output_state is not None:
             raise NotImplementedError(

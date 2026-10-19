@@ -73,7 +73,8 @@ class ScaleFormat:
                 )
             if self.block_shape is None and not self.dynamic_block_shape:
                 raise ValueError(
-                    "block scale format requires block_shape or dynamic_block_shape=True"
+                    "block scale format requires block_shape or "
+                    "dynamic_block_shape=True"
                 )
             return
 

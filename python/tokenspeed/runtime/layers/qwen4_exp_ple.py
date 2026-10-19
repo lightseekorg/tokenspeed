@@ -256,10 +256,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     def _ngram_ids_torch(self, contexts: torch.Tensor) -> torch.Tensor:
         """Anchor-only n-gram hash ids (CPU / fallback path).
 
-        The legacy implementation shifted and hashed every window column via
-        ``_shift_right_ignore_eos`` even though only the anchor (last) column
-        was consumed. Walking left from the anchor with a running EOS-boundary
-        flag produces the identical ids in a handful of elementwise ops.
+        Walks left from the anchor (last) column with a running EOS-boundary
+        flag instead of shifting and hashing every window column.
         """
 
         eos = self.eos_token_id
@@ -1033,7 +1031,7 @@ class Qwen4ExpPLELayer(nn.Module):
         if plan is None:
             return hidden_states
         (hidden_states,) = slice_to_real_tokens(plan.num_real_tokens, hidden_states)
-        req, col, lengths_t, starts, _, total, _ = plan.index
+        req, col, _, _, _, total, _ = plan.index
         lengths = plan.lengths
         flat_ids = plan.flat_ids
         initial_context = plan.initial_context

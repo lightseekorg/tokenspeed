@@ -53,6 +53,9 @@ def _head_rows_are_never_masked(write_mask: torch.Tensor | None) -> None:
 
 
 class MHATokenToKVPool(CachePool):
+    """Layers serving fewer KV heads than the planned width reinterpret the same
+    bytes as proportionally more token rows."""
+
     def __init__(
         self,
         arena: CacheArena,
@@ -145,7 +148,7 @@ class MHATokenToKVPool(CachePool):
         return max(1, self.head_num * served // alloc)
 
     def _get_key_buffer(self, layer_id: int):
-        # for internal use of referencing
+        # Internal reference that skips the layer-wise load wait.
         buf = self.k_buffer[layer_id]
         if buf is None:
             raise ValueError(f"layer {layer_id} is a state layer; it has no KV buffer")
@@ -162,7 +165,7 @@ class MHATokenToKVPool(CachePool):
         return self._get_key_buffer(layer_id)
 
     def _get_value_buffer(self, layer_id: int):
-        # for internal use of referencing
+        # Internal reference that skips the layer-wise load wait.
         buf = self.v_buffer[layer_id]
         if buf is None:
             raise ValueError(f"layer {layer_id} is a state layer; it has no KV buffer")

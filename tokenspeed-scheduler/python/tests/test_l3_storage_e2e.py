@@ -259,7 +259,7 @@ def test_l3_partial_landing_admits_on_the_landed_prefix() -> None:
         )
     )
     tokens = list(range(1, 9))
-    hashes, _ = _register_prompt(scheduler, tokens)
+    _register_prompt(scheduler, tokens)
     scheduler.submit_requests([_spec("r1", tokens)])
     prefetch = _find_op(scheduler.next_execution_plan(), ts.Cache.PrefetchOp)
     assert prefetch is not None

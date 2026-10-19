@@ -28,15 +28,7 @@ def has_blackwell() -> bool:
 
 
 def truncate_text_config(text, num_layers: int = NUM_TEST_LAYERS):
-    """Truncate a loaded Inkling text config to its first ``num_layers`` layers.
-
-    Args:
-        text: The Inkling text config to modify in place.
-        num_layers: Number of leading decoder layers to keep.
-
-    Returns:
-        The same config object, truncated.
-    """
+    """Truncate ``text`` in place to its first ``num_layers`` layers; returns it."""
     text.num_hidden_layers = num_layers
     text.local_layer_ids = [i for i in text.local_layer_ids if i < num_layers]
     return text

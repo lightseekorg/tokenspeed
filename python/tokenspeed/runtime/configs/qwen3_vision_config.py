@@ -38,10 +38,12 @@ class Qwen3VLVisionConfig(PretrainedConfig):
         temporal_patch_size=2,
         out_hidden_size=3584,
         num_position_embeddings=2304,
-        deepstack_visual_indexes=[8, 16, 24],
+        deepstack_visual_indexes=None,
         initializer_range=0.02,
         **kwargs,
     ):
+        if deepstack_visual_indexes is None:
+            deepstack_visual_indexes = [8, 16, 24]
         super().__init__(**kwargs)
 
         self.depth = depth

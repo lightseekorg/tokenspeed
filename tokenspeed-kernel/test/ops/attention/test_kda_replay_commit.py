@@ -551,7 +551,7 @@ def test_zero_accepted_commits_the_pre_draft_state_unchanged():
 
 
 def test_mixed_accepted_lengths_in_one_batch():
-    """Spec 8.3: per-request lengths, including 0 and T, and a skipped row."""
+    """Invariant 4: per-request lengths, including 0 and T, and a skipped row."""
     n, t = 6, 4
     x = _window(n, t, seed=13)
     fresh = torch.arange(1, n + 1, device=DEV, dtype=torch.int32) + 16

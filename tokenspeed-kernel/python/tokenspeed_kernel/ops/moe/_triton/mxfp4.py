@@ -122,7 +122,7 @@ def _validate(
     if any(t.device != x.device for t in (w13, w13_scale, w2, w2_scale)):
         raise ValueError("x and weights must be on the same device")
 
-    num_tokens, hidden_size = x.shape
+    _, hidden_size = x.shape
     num_local_experts, twice_intermediate_size, packed_hidden_size = w13.shape
     intermediate_size = twice_intermediate_size // 2
     if num_local_experts == 0 or twice_intermediate_size % 2:

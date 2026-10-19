@@ -213,7 +213,8 @@ class Runner:
                         break
                 else:
                     raise RuntimeError(
-                        f"Could not prepare a {TARGET_RESPONSE_TOKENS}-token fake response"
+                        f"Could not prepare a {TARGET_RESPONSE_TOKENS}-token "
+                        "fake response"
                     )
                 responses.append({"role": "assistant", "content": text})
             prepared.append((index, (conv, responses)))
@@ -341,7 +342,7 @@ def summarize(args, results, wall_s):
 
 def main():
     args = parse_args()
-    with open(args.dataset) as f:
+    with open(args.dataset, encoding="utf-8") as f:
         data = json.load(f)
     convs = unique_first_turn_conversations(data["conversations"])
 
@@ -358,7 +359,7 @@ def main():
         f"parallel_{args.parallel}_number_{args.number}"
     )
     os.makedirs(outdir, exist_ok=True)
-    with open(f"{outdir}/benchmark_summary.json", "w") as f:
+    with open(f"{outdir}/benchmark_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     print(json.dumps(summary))
 

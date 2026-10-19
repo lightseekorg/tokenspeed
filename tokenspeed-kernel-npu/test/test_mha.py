@@ -63,7 +63,6 @@ def _paged_rows(
 
 
 def test_mha_prefill() -> None:
-    lengths = [3, 5]
     cumulative = torch.tensor([0, 3, 8], dtype=torch.int32, device="npu")
     q = torch.randn(8, 4, 64, dtype=torch.bfloat16, device="npu")
     k = torch.randn(8, 2, 64, dtype=torch.bfloat16, device="npu")

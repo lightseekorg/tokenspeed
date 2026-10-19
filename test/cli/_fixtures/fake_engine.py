@@ -98,7 +98,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
-    args, _ignored = parser.parse_known_args(argv)
+    args, _ = parser.parse_known_args(argv)
     asyncio.run(_serve(args.host, args.port))
 
 

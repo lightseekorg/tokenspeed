@@ -268,7 +268,7 @@ def get_blocked_layout(shape, dtype, num_warps, ndim=2):
         [1, vector_size],
         [4, 8],
         [num_warps // 2, 2],
-        [1, 0],  #  #  #
+        [1, 0],
     )
 
 
@@ -352,7 +352,6 @@ class MoEConfig:
     FUSE_X_W: gl.constexpr
     FUSE_W_W_SCALE: gl.constexpr
 
-    # scales
     SCALE_BLOCK: gl.constexpr  # Number of elements sharing one scale factor
     WITH_X_MX_SCALE: gl.constexpr
     WITH_W_MX_SCALE: gl.constexpr
@@ -367,7 +366,6 @@ class MoEConfig:
     USE_GATHER: gl.constexpr
     USE_WMMA_SCALED: gl.constexpr
 
-    # layouts
     shared_layout_x: gl.constexpr
     dot_layout_x: gl.constexpr
 

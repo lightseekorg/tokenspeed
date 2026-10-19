@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""DeepSeek V4 attention kernels for AMD GFX950."""
-
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.decode import (
     launch_gluon_dsv4_decode_split_gfx950,
 )

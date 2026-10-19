@@ -186,8 +186,8 @@ def _build_cu_extend_seq_lens_cpu(
         ``expected_len`` entries.
 
     Raises:
-        RuntimeError: the lengths disagree with ``query_start_loc`` on the
-            sequence count.
+        RuntimeError: The lengths are missing or disagree with
+            ``query_start_loc`` on the sequence count.
     """
     if extend_seq_lens_cpu is None:
         raise RuntimeError("host extend lengths are required for prefill")
@@ -1710,8 +1710,8 @@ class MambaAttnBackend(AttentionBackend):
             conv_states = conv_scratch
             conv_read = self._verify_scratch_base_rows(batch_size, draft_token_num)
             conv_out = output_indices[:batch_size]
-            # shouldn't use contiguous here, because causal_conv1d_update
-            # support input non-contiguous
+            # Don't make this contiguous: causal_conv1d_update supports
+            # non-contiguous input.
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
@@ -1725,7 +1725,7 @@ class MambaAttnBackend(AttentionBackend):
                 output_state_indices=conv_out,
                 parent_indices=self._tree_parents(batch_size),
             )
-            # needn't contiguous here.
+            # No need to make this contiguous.
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             state_in_blocks, state_out_blocks, conv_states, ssm_states = (

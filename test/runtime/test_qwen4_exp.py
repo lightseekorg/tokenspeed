@@ -1934,10 +1934,6 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# PLE batched-rewrite numerical-equivalence tests
-# ---------------------------------------------------------------------------
-
 _PLE_LENGTH_CASES = [
     [1, 1, 1, 1],  # decode
     [3, 1, 5],  # mixed prefill

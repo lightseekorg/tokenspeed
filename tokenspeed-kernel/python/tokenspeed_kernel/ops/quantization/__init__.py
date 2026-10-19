@@ -307,14 +307,11 @@ def quantize_fp8(
 
 def _quantize_fp8_dynamic(
     x: torch.Tensor,
-    # quantization options
     granularity: Literal["token", "token_group", "block"] = "token",
     group_size: int | None = None,
     block_size: tuple[int, int] | list[int] | None = None,
     scale_encoding: Literal["float32", "ue8m0", "packed_ue8m0"] = "float32",
-    # kernel options
     enable_pdl: bool = False,
-    # dispatch options
     override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -353,7 +350,8 @@ def _quantize_fp8_dynamic(
     if granularity == "token_group":
         if group_size is None or group_size <= 0:
             raise ValueError(
-                f"token_group granularity requires positive group_size, got {group_size}"
+                "token_group granularity requires positive group_size, "
+                f"got {group_size}"
             )
         granularity_trait = f"token_group_{group_size}"
     elif granularity == "block":
@@ -489,7 +487,6 @@ def rmsnorm_quantize_fp8(
     round_residual_sum_bf16: bool,
     x_scale: float | None = None,
     residual_scale: float | None = None,
-    # kernel options
     enable_pdl: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """RMSNorm that also quantizes its output to FP8 per token, in one kernel.
@@ -534,7 +531,6 @@ def silu_and_mul_quantize_fp8(
     token_scales: torch.Tensor,
     channel_scales: torch.Tensor,
     *,
-    # kernel options
     enable_pdl: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """SwiGLU of an FP8 GEMM output whose scales are not applied yet,
@@ -571,9 +567,7 @@ def silu_and_mul_quantize_fp8(
 
 def quantize_mxfp8(
     x: torch.Tensor,
-    # kernel options
     enable_pdl: bool = False,
-    # dispatch options
     override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -621,11 +615,8 @@ def quantize_mxfp8(
 def quantize_nvfp4(
     x: torch.Tensor,
     scale: float | torch.Tensor | None = None,
-    # quantization options
     scale_layout: Literal["linear", "swizzled"] = "swizzled",
-    # kernel options
     enable_pdl: bool = False,
-    # dispatch options
     override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -685,13 +676,10 @@ def quantize_nvfp4(
 
 def quantize_mxfp4(
     x: torch.Tensor,
-    # quantization options
     global_scale: float | None = None,
     scale_size: int = 32,
     scale_layout: Literal["linear", "128x4", "8x4"] = "128x4",
-    # kernel options
     enable_pdl: bool = False,
-    # dispatch options
     override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:

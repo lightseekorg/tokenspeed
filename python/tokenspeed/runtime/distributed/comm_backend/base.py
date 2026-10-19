@@ -64,8 +64,6 @@ class CommBackend(ABC):
             f"{type(self).__name__} does not run on named process groups"
         )
 
-    # ---- Collective ops ----
-
     def get_prepared_all_gather(self, group: Group, dtype: torch.dtype):
         """Return a prepared column all-gather allowed by this backend's policy."""
         return None
@@ -254,12 +252,14 @@ class CommBackend(ABC):
     @abstractmethod
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0
-    ) -> torch.Tensor: ...
+    ) -> torch.Tensor:
+        """All-gathers ``tensor`` across ``group``, concatenating along ``dim``."""
 
     @abstractmethod
     def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
-    ) -> None: ...
+    ) -> None:
+        """All-gathers ``input`` into the pre-allocated ``output`` buffer."""
 
     def all_gather_single_async(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
@@ -278,7 +278,8 @@ class CommBackend(ABC):
         )
 
     @abstractmethod
-    def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor: ...
+    def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
+        """Sums ``tensor`` across ``group`` and returns this rank's even shard."""
 
     @abstractmethod
     def all_to_all_single(
@@ -296,7 +297,6 @@ class CommBackend(ABC):
         ``i``-th rank and ``output_split_sizes[i]`` rows arrive from it (a
         zero-row chunk is allowed); the sizes must sum to the tensors' rows.
         """
-        ...
 
     # ---- Token-aware ops (uneven token distribution) ----
 
@@ -306,7 +306,8 @@ class CommBackend(ABC):
         tensor: torch.Tensor,
         group: Group,
         scattered_num_tokens: list[int],
-    ) -> torch.Tensor: ...
+    ) -> torch.Tensor:
+        """All-gathers rows when each rank holds ``scattered_num_tokens[i]`` rows."""
 
     @abstractmethod
     def token_reduce_scatter(
@@ -314,4 +315,5 @@ class CommBackend(ABC):
         tensor: torch.Tensor,
         group: Group,
         scattered_num_tokens: list[int],
-    ) -> torch.Tensor: ...
+    ) -> torch.Tensor:
+        """Reduce-scatters rows so rank ``i`` gets ``scattered_num_tokens[i]`` rows."""

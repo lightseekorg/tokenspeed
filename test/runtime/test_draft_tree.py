@@ -113,7 +113,7 @@ def test_positive_child_score_cannot_outrank_its_parent():
         depth=2,
         next_lanes=None,
     )
-    tokens, parent = draft_tree_finalize(
+    _, parent = draft_tree_finalize(
         entry_scores,
         entry_parent,
         entry_depth,
@@ -275,9 +275,7 @@ def test_nan_scores_keep_lanes_and_tree_valid():
         before = tree.lane_entry[:bs].clone()
         tree.expand(bs, step, *logprob_topk(lane_logits, topk), None)
         _parent_lanes(tree, bs, before)
-    tokens, parent = tree.finalize(
-        bs, torch.zeros(bs, dtype=torch.int32, device=DEVICE)
-    )
+    _, parent = tree.finalize(bs, torch.zeros(bs, dtype=torch.int32, device=DEVICE))
     for b in range(bs):
         for j in range(1, nodes):
             assert 0 <= int(parent[b, j]) < j

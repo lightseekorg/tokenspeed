@@ -129,12 +129,12 @@ def decode_grouped_batch(
     their original positions.
     """
     groups: dict[Any, list[Any]] = defaultdict(list)
-    for i, id in enumerate(ids):
+    for i, token_ids in enumerate(ids):
         key = (
             recv_obj.skip_special_tokens[i],
             recv_obj.spaces_between_special_tokens[i],
         )
-        groups[key].append((i, id))
+        groups[key].append((i, token_ids))
 
     texts: list[Any] = [None] * len(ids)
 
@@ -218,18 +218,20 @@ def incremental_decode_batch(
     for i in range(bs):
         try:
             s = decode_status[recv_obj.rids[i]]
-        except KeyError:
+        except KeyError as e:
             raise RuntimeError(
                 f"Decode status not found for request {recv_obj.rids[i]}. "
-                "It may be due to the request being evicted from the decode status due to memory pressure. "
+                "It may be due to the request being evicted from the decode "
+                "status due to memory pressure. "
                 "Please increase the maximum number of requests by setting "
-                "the TOKENSPEED_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
+                "the TOKENSPEED_DETOKENIZER_MAX_STATES environment variable to "
+                "a bigger value than the default value. "
                 f"The current value is {DETOKENIZER_MAX_STATES}."
-            )
+            ) from e
         new_text = read_texts[i][len(surr_texts[i]) :]
         if recv_obj.finished_reasons[i] is None:
             # Streaming chunk: update the decode status
-            if len(new_text) > 0 and not new_text.endswith("�"):
+            if new_text and not new_text.endswith("�"):
                 s.decoded_text = s.decoded_text + new_text
                 s.surr_offset = s.read_offset
                 s.read_offset = len(s.decode_ids)
@@ -327,7 +329,7 @@ class IncrementalDetokenizer:
         new_text = read_texts[0][len(surr_texts[0]) :]
         if finished_reason is None:
             # Streaming chunk: update the decode status
-            if len(new_text) > 0 and not new_text.endswith("�"):
+            if new_text and not new_text.endswith("�"):
                 s.decoded_text = s.decoded_text + new_text
                 s.surr_offset = s.read_offset
                 s.read_offset = len(s.decode_ids)

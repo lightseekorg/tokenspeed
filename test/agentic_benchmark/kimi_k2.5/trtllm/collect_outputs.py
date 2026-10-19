@@ -96,7 +96,11 @@ def main():
         sys.exit(f"Not a directory: {args.sweep_dir}")
 
     rows = collect(args.sweep_dir)
-    out = args.output.open("w", newline="") if args.output else sys.stdout
+    out = (
+        args.output.open("w", newline="", encoding="utf-8")
+        if args.output
+        else sys.stdout
+    )
     try:
         w = csv.DictWriter(out, fieldnames=COLUMNS)
         w.writeheader()

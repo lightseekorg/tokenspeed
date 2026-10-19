@@ -20,8 +20,7 @@
 
 """Prefill-side per-request receiver for the Mooncake embedding transfer.
 
-Split out of :mod:`tokenspeed.runtime.epd.mooncake.embedding_transfer`; the
-prefill-side manager it binds to lives in
+The prefill-side manager it binds to lives in
 :mod:`tokenspeed.runtime.epd.mooncake.prefill`.
 
 Wire-frame dataclasses live in :mod:`tokenspeed.runtime.epd.entities`: they

@@ -213,7 +213,8 @@ def test_greedy_tree_verify_walks_the_argmax_with_logprobs(backend_name):
     else:
         backend, req = _backend("greedy", logprobs=True)
 
-    # Node 1 misses, node 2 (its sibling) matches, node 3 under node 2 matches for request 0 only.
+    # Node 1 misses, node 2 (its sibling) matches, node 3 under node 2 matches
+    # for request 0 only.
     parent = [-1, 0, 0, 2]
     tree = _tree(parent, req)
     candidates = torch.randint(0, VOCAB, (BS, N), dtype=torch.int32, device="cuda")

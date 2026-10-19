@@ -28,8 +28,7 @@ then a second kernel reduces over the ``topk`` slot dim::
 
     out[token, :] = sum_slot out_partial[token, slot, :]
 
-Unquantized bf16 stage-2 (down GEMM + routed-weight scale). The
-``[num_tokens, topk, D]`` scratch + fp32-accumulate reduce (rather than
+The ``[num_tokens, topk, D]`` scratch + fp32-accumulate reduce (rather than
 atomics) avoids the ``topk``-way atomic contention on overlapping output
 rows -- same reduce-mode design as the mxfp4 sibling package.
 
@@ -37,11 +36,11 @@ GEMM idiom is the same a16w16 MFMA setup as stage 1 (``AMDMFMALayout(
 version=4, instr_shape=[16,16,32], k_width=8)`` + ``gl.amd.cdna3.mfma``),
 but the hot loop is deliberately **single-buffered** here: stage 2's K-loop
 is short (``K = I = 256`` -> 4 tiles at ``BLOCK_K=64``) and the kernel is
-bound by the wide ``[num_tokens, topk, D]`` partials write, so the v4/v9
+bound by the wide ``[num_tokens, topk, D]`` partials write, so the
 double-buffered prefetch pipeline (which wins on stage 1's long ``K = D``
 loop) measured *slower* here -- the prologue/epilogue and extra LDS don't
 amortize over 4 iterations. XCD PID remap likewise gave no stage-2 benefit,
-so stage 2 uses the plain ``pid`` mapping. See ``perf_report.md``.
+so stage 2 uses the plain ``pid`` mapping.
 
 Layout contract:
   inter (A)   (num_tokens * topk, I)   bf16   inter_row = token*topk + slot
@@ -133,7 +132,7 @@ def gluon_bf16_moe_stage2_kernel(
     )
     smem_b = gl.allocate_shared_memory(gl.bfloat16, [1, BLOCK_K, BLOCK_N], shared_b)
 
-    # ---- Per-slot A-row gather: inter_row = token * topk + slot --------
+    # Per-slot A-row gather: inter_row = token * topk + slot.
     am_layout: gl.constexpr = gl.SliceLayout(1, gload_a)
     ak_layout: gl.constexpr = gl.SliceLayout(0, gload_a)
     offs_m = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=am_layout)
@@ -147,7 +146,7 @@ def gluon_bf16_moe_stage2_kernel(
         gl.int32
     )
 
-    # ---- B offsets: element [k, n] = w2[e][n, k] -----------------------
+    # B offsets: element [k, n] = w2[e][n, k].
     bk_layout: gl.constexpr = gl.SliceLayout(1, gload_b)
     bn_layout: gl.constexpr = gl.SliceLayout(0, gload_b)
     offs_bk = gl.arange(0, BLOCK_K, layout=bk_layout)
@@ -161,7 +160,7 @@ def gluon_bf16_moe_stage2_kernel(
     A_K_STEP = BLOCK_K * stride_ak
     B_K_STEP = BLOCK_K * stride_bk
 
-    # ---- Single-buffered K-loop (short K; memory-bound epilogue) -------
+    # Single-buffered K-loop (short K; memory-bound epilogue).
     num_k = gl.cdiv(K, BLOCK_K)
     for k in range(num_k):
         cdna4_async_copy.buffer_load_to_shared(
@@ -196,7 +195,7 @@ def gluon_bf16_moe_stage2_kernel(
         b = smem_b.index(0).load(dot_b_layout)
         acc = gl.amd.cdna3.mfma(a, b, acc)
 
-    # ---- Routed-weight scale + scatter to partials[token, slot, n] -----
+    # Routed-weight scale + scatter to partials[token, slot, n].
     cm_layout: gl.constexpr = gl.SliceLayout(1, mfma_layout)
     cn_layout: gl.constexpr = gl.SliceLayout(0, mfma_layout)
     offs_cm = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=cm_layout)

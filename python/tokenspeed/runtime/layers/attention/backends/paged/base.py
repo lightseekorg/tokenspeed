@@ -28,8 +28,7 @@ it runs on beyond the ``is_draft`` verify-floor geometry. The
 ``CacheGroupRouter`` owns all of that and hands every leaf a fully resolved
 ``page_table`` (kernel pages, batch-ordered, padded to ``[bs,
 max_num_pages]``) on every metadata call; the leaf copies it into its own
-graph-recorded buffers. This is the interface the backends had before cache
-groups existed, minus the scheduler-table gather the router now performs.
+graph-recorded buffers.
 """
 
 from __future__ import annotations
@@ -100,8 +99,8 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
     default_kernel_page_size: int | None = None
     # This leaf forwards each layer's ``sliding_window_size`` to its kernels.
     # Left False, a declared window silently widens to full-history attention.
-    # Declared here as well as on AttentionBackend: the refactor made the two
-    # separate roots, so a paged leaf inherits only this one.
+    # Declared here as well as on AttentionBackend: a paged leaf does not
+    # inherit that one.
     supports_layer_sliding_window: bool = False
     supports_mla_dcp: bool = False
 
@@ -161,8 +160,11 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
     def tree_support(self) -> TreeSupport:
         name = type(self).__name__
         return TreeSupport(
-            verify_blocker=f"{name} has no tree verify path; use --attention-backend trtllm (MLA: trtllm_mla or tokenspeed_mla)",
-            draft_blocker=f"{name} has no tree lane path; use --drafter-attention-backend trtllm (MLA: trtllm_mla or tokenspeed_mla)",
+            verify_blocker=f"{name} has no tree verify path; use "
+            "--attention-backend trtllm (MLA: trtllm_mla or tokenspeed_mla)",
+            draft_blocker=f"{name} has no tree lane path; use "
+            "--drafter-attention-backend trtllm (MLA: trtllm_mla or "
+            "tokenspeed_mla)",
         )
 
     def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
@@ -217,10 +219,6 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
             window=nodes,
         )
 
-    # ------------------------------------------------------------------
-    # Static shape / lifecycle
-    # ------------------------------------------------------------------
-
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         # Graph buffers and views return with init_cuda_graph_state.
@@ -271,10 +269,6 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         time) override this to 1 together with ``fill_block_decode_seq_lens``.
         """
         return self.spec_num_tokens if self.block_decode_active else 1
-
-    # ------------------------------------------------------------------
-    # Metadata
-    # ------------------------------------------------------------------
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
         """Allocate the persistent decode buffers for
@@ -485,10 +479,6 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         capture seeding), before the model runs. Default: no-op.
         """
         del req_pool_indices
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
 
     @abstractmethod
     def forward_decode(

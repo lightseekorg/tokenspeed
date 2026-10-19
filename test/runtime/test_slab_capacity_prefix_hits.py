@@ -271,7 +271,9 @@ class TestSlabCapacityPrefixHits:
         old_pythonpath = os.environ.get("PYTHONPATH")
         old_flag = os.environ.get("TOKENSPEED_FORCE_LEGACY_KV_LAYOUT")
         try:
-            with open(os.path.join(tmpdir, "sitecustomize.py"), "w") as f:
+            with open(
+                os.path.join(tmpdir, "sitecustomize.py"), "w", encoding="utf-8"
+            ) as f:
                 f.write(_LEGACY_SITECUSTOMIZE)
             os.environ["PYTHONPATH"] = tmpdir + (
                 os.pathsep + old_pythonpath if old_pythonpath else ""

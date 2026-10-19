@@ -52,7 +52,8 @@ def swap_batch_vocab(
         )
     if vocab_size % tp_size != 0:
         raise ValueError(
-            f"swap_batch_vocab: vocab_size={vocab_size} must be divisible by tp_size={tp_size}"
+            f"swap_batch_vocab: vocab_size={vocab_size} must be divisible by "
+            f"tp_size={tp_size}"
         )
 
     reqs_per_rank = pad_bs // tp_size

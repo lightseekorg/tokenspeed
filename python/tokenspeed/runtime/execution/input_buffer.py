@@ -112,7 +112,8 @@ class InputBuffers:
             # request only on the chunk that completes its prompt.
             self.extend_prompt_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
 
-        # NOT pinned: python readers only; the H2D uses the per-step bulk pinned staging (_bulk_pinned).
+        # NOT pinned: python readers only; the H2D uses the per-step bulk pinned
+        # staging (_bulk_pinned).
         self.extend_prefix_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self.extend_seq_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         # Host-only extend facts the attention backend plans from: how many
@@ -444,7 +445,6 @@ class InputBuffers:
         )
 
         if num_extends > 0:
-            # Fresh bulk pinned per step (see _bulk_pinned: persistent staging races overlap scheduling).
             self.extend_prefix_lens_cpu[:num_extends] = torch.as_tensor(
                 forward_op.extend_prefix_lens, dtype=torch.int32
             )
@@ -473,7 +473,6 @@ class InputBuffers:
                 ext_prompt_cpu, non_blocking=True
             )
 
-        # Get valid cache lengths for requests
         req_pool_indices_device = self.req_pool_indices_buf[:batch_size]
         input_lengths_device = self.input_lengths_buf[:batch_size]
 
@@ -534,8 +533,7 @@ class InputBuffers:
 
         # Decode-only fast path: one fused Triton kernel writes positions and
         # seq_lens in a single launch and reads valid_cache_lengths[pool_idx]
-        # directly, so the indexSelect + compute_position + seq_lens add are
-        # all gone.
+        # directly.
         if num_extends == 0 and batch_size > 0:
             fused_decode_input_prep(
                 positions_ptr=self.positions_buf[:total_tokens],
@@ -544,7 +542,6 @@ class InputBuffers:
                 valid_cache_lengths=runtime_states.valid_cache_lengths,
                 uniform_input_length=total_tokens // batch_size,
             )
-            # Decode path's seq_lens / positions are done.
             valid_cache_lengths = None
         else:
             # Mixed / pure-prefill: keep the per-kernel pipeline. indexSelect
@@ -571,7 +568,6 @@ class InputBuffers:
                 out=self.positions_buf[:total_tokens],
             )
 
-        # Determine input_ids and forward_mode
         if num_extends > 0:
             prefill_token_count = sum(forward_op.input_lengths[:num_extends])
             n_ids = len(forward_op.input_ids)

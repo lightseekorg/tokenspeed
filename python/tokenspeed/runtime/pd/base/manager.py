@@ -134,9 +134,6 @@ class DisaggManagerBase:
         if bootstrap_room not in self.request_status:
             self.request_status[bootstrap_room] = status
         else:
-            # Status is only allowed to be incremented unless either side has
-            # observed a failure. Failed is sticky so a late success cannot
-            # resurrect a broken transfer.
             if (
                 self.request_status[bootstrap_room] == TransferPoll.Failed
                 or status == TransferPoll.Failed

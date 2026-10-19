@@ -75,17 +75,11 @@ def _controller():
     return PauseController(sender), sender
 
 
-# --- scheduler_drained -------------------------------------------------------
-
-
 def test_scheduler_drained_predicate():
     assert scheduler_drained(_FakeScheduler())
     assert not scheduler_drained(_FakeScheduler(waiting=1))
     assert not scheduler_drained(_FakeScheduler(decoding=1))
     assert not scheduler_drained(_FakeScheduler(prefilling=1))
-
-
-# --- keep mode ---------------------------------------------------------------
 
 
 def test_keep_mode_freezes_and_replies_immediately():
@@ -105,9 +99,6 @@ def test_keep_mode_freezes_and_replies_immediately():
     assert not ctrl.consume_cancel_grammar()
 
 
-# --- abort mode --------------------------------------------------------------
-
-
 def test_abort_mode_defers_reply_until_drained():
     ctrl, sender = _controller()
     ctrl.handle_pause(PauseSchedulerReqInput(mode="abort"))
@@ -124,11 +115,9 @@ def test_abort_mode_defers_reply_until_drained():
     assert ctrl.consume_cancel_grammar()
     assert not ctrl.consume_cancel_grammar()
 
-    # Still busy → no reply.
     ctrl.maybe_finish_drain(_FakeScheduler(decoding=2))
     assert sender.items == []
 
-    # Drained → reply now fires.
     ctrl.maybe_finish_drain(_FakeScheduler())
     assert len(sender.items) == 1
     assert isinstance(sender.items[0], PauseSchedulerReqOutput)
@@ -168,9 +157,6 @@ def test_second_pause_while_draining_is_rejected():
     assert sender.items[0].success
 
 
-# --- wait mode ---------------------------------------------------------------
-
-
 def test_wait_mode_defers_reply_without_abort_all():
     ctrl, sender = _controller()
     ctrl.handle_pause(PauseSchedulerReqInput(mode="wait"))
@@ -188,9 +174,6 @@ def test_wait_mode_defers_reply_without_abort_all():
     assert sender.items[0].success
 
 
-# --- invalid mode ------------------------------------------------------------
-
-
 def test_invalid_mode_replies_failure_and_stays_unpaused():
     ctrl, sender = _controller()
     ctrl.handle_pause(PauseSchedulerReqInput(mode="bogus"))
@@ -198,9 +181,6 @@ def test_invalid_mode_replies_failure_and_stays_unpaused():
     assert len(sender.items) == 1
     assert isinstance(sender.items[0], PauseSchedulerReqOutput)
     assert not sender.items[0].success
-
-
-# --- resume ------------------------------------------------------------------
 
 
 def test_resume_rejects_inflight_pause_then_acks():
@@ -238,9 +218,6 @@ def test_resume_without_inflight_pause_only_acks():
     assert isinstance(sender.items[0], ResumeSchedulerReqOutput)
 
 
-# --- is_paused ---------------------------------------------------------------
-
-
 def test_is_paused_reflects_state():
     ctrl, sender = _controller()
     ctrl.handle_is_paused(IsSchedulerPausedReqInput())
@@ -252,15 +229,11 @@ def test_is_paused_reflects_state():
     assert sender.items[-1].is_paused is True
 
 
-# --- spec buffering ----------------------------------------------------------
-
-
 def test_spec_buffering_is_fifo():
     ctrl, _ = _controller()
     ctrl.buffer_specs(["a", "b"])
     ctrl.buffer_specs(["c"])
     assert ctrl.buffered_specs == ["a", "b", "c"]
     assert ctrl.take_buffered_specs() == ["a", "b", "c"]
-    # Drained after take.
     assert ctrl.buffered_specs == []
     assert ctrl.take_buffered_specs() == []

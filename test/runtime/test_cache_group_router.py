@@ -777,8 +777,9 @@ class TestCacheGroupRouterTest:
         )
         assert (router.decode_write_locations) is (first)
         assert (tuple(first.by_group[FULL].shape)) == ((8,))
-        # Verify window N=2 for request 0 (seq 9): positions 7, 8 -> 6*4+3, 6*4+... no:
-        # kernel page for pos 7 is table[0][1]=6 -> 6*4+3=27; pos 8 -> table[0][2]=0 -> dummy.
+        # Verify window N=2 for request 0 (seq 9) covers positions 7, 8. The
+        # kernel page for pos 7 is table[0][1]=6 -> 6*4+3=27; pos 8 ->
+        # table[0][2]=0 -> dummy.
         assert (first.by_group[FULL][:2].tolist()) == ([27, 0])
 
     def test_draft_router_owns_decode_locations_too(self):
@@ -1241,8 +1242,8 @@ class TestCacheGroupRouterTest:
     def test_draft_write_locations_ride_the_history_stack(self):
         """The drafters' in-graph slot math reads the router's address-stable
         full-history table in the stack: page-size invariant vs the raw table,
-        and the view survives refreshes at the same address (the capture
-        contract the deleted DraftPageStaging carried)."""
+        and the view survives refreshes at the same address, as graph capture
+        requires."""
         router, _ = self._router(is_draft=True)
         raw = torch.tensor([[5, 6, 2], [9, 3, 7]], dtype=torch.int32)
         tables = {
@@ -1653,9 +1654,9 @@ class TestPagedLeafRebindTest:
 
         assert (leaf.cache_pool) is (pool)
         for name in slots:
-            _pytest_obj_1 = getattr(leaf, name)
-            _pytest_msg_2 = name
-            assert _pytest_obj_1 is None, _pytest_msg_2
+            value = getattr(leaf, name)
+            msg = name
+            assert value is None, msg
 
     def test_mha_leaf_forgets_the_previous_forward(self):
         from tokenspeed.runtime.layers.attention.backends.paged.mha import (

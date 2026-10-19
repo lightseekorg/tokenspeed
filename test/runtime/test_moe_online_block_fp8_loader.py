@@ -43,7 +43,7 @@ def test_copy_expert_shard_quantizes_unquantized_source() -> None:
 
 
 def test_copy_expert_shard_plain_copy_without_scales() -> None:
-    """Without a scale destination the copy must stay byte-for-byte as before."""
+    """Without a scale destination the copy is byte-for-byte."""
     src = torch.randn(8, 16, device="cuda", dtype=torch.bfloat16)
     dst = torch.zeros(8, 16, device="cuda", dtype=torch.bfloat16)
 

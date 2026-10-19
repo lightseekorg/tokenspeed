@@ -149,10 +149,10 @@ class TestBackendDeclarationTest(_CudaGraphSupportCase):
                 cls = getattr(importlib.import_module(module_name), cls_name)
             except (ImportError, ModuleNotFoundError) as exc:
                 pytest.skip(f"needs optional deps: {exc}")
-            _pytest_member_1 = "cuda_graph_support"
-            _pytest_container_2 = vars(cls)
-            _pytest_msg_3 = f"{cls_name} must declare cuda_graph_support on the class"
-            assert _pytest_member_1 in _pytest_container_2, _pytest_msg_3
+            member = "cuda_graph_support"
+            namespace = vars(cls)
+            msg = f"{cls_name} must declare cuda_graph_support on the class"
+            assert member in namespace, msg
 
 
 if __name__ == "__main__":

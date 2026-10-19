@@ -15,7 +15,6 @@ from ci_system import cuda_coredump
 
 from tokenspeed.runtime.utils.process import kill_process_tree
 
-# Configure logger to output to stdout
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
@@ -69,7 +68,6 @@ def is_retriable_failure(output: str) -> tuple[bool, str]:
         if re.search(pattern, output, re.IGNORECASE):
             return False, f"non-retriable error: {pattern}"
 
-    # Check for retriable patterns
     for pattern in RETRIABLE_PATTERNS:
         if re.search(pattern, output, re.IGNORECASE):
             return True, f"retriable pattern: {pattern}"
@@ -78,7 +76,6 @@ def is_retriable_failure(output: str) -> tuple[bool, str]:
     if re.search(r"AssertionError|^E\s+assert\s", output, re.MULTILINE):
         return True, "assertion failure (assuming retriable)"
 
-    # Default: not retriable
     return False, "unknown failure type"
 
 
@@ -88,7 +85,6 @@ def run_with_timeout(
     kwargs: Optional[dict] = None,
     timeout: float = None,
 ):
-    """Run a function with timeout."""
     ret_value = []
 
     def _target_func():
@@ -110,7 +106,7 @@ def write_github_step_summary(content: str):
     """Write content to GitHub Step Summary if available."""
     summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_file:
-        with open(summary_file, "a") as f:
+        with open(summary_file, "a", encoding="utf-8") as f:
             f.write(content)
 
 
@@ -143,7 +139,7 @@ def run_unittest_files(
     success = True
     passed_tests = []
     failed_tests = []
-    retried_tests = []  # Track which tests were retried
+    retried_tests = []
 
     for i, file in enumerate(files):
         if hasattr(file, "filename") and hasattr(file, "est_time"):
@@ -195,11 +191,11 @@ def run_unittest_files(
             elapsed = time.perf_counter() - file_tic
 
             logger.info(
-                f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n"
+                f".\n.\nEnd ({i}/{len(files) - 1}):\n"
+                f"{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n"
             )
             return process.returncode
 
-        # Retry loop for each file
         attempt = 1
         file_passed = False
         was_retried = False
@@ -229,7 +225,6 @@ def run_unittest_files(
                     passed_tests.append(filename)
                     break
                 else:
-                    # Check if we should retry
                     if enable_retry and ret_code == 1 and attempt < max_attempts:
                         output = "".join(output_lines)
                         is_retriable, reason = is_retriable_failure(output)
@@ -237,17 +232,18 @@ def run_unittest_files(
                         if is_retriable:
                             logger.info(f"\n[CI Retry] {filename} failed with {reason}")
                             logger.info(
-                                f"[CI Retry] Waiting {retry_wait_seconds}s before retry...\n"
+                                f"[CI Retry] Waiting {retry_wait_seconds}s "
+                                "before retry...\n"
                             )
                             time.sleep(retry_wait_seconds)
                             attempt += 1
                             continue
                         else:
                             logger.info(
-                                f"\n[CI Retry] {filename} failed with {reason} - not retrying\n"
+                                f"\n[CI Retry] {filename} failed with {reason} "
+                                "- not retrying\n"
                             )
 
-                    # No retry or not retriable
                     logger.info(
                         f"\n✗ FAILED: {filename} returned exit code {ret_code}\n"
                     )
@@ -282,7 +278,6 @@ def run_unittest_files(
     else:
         logger.info(f"Fail. Time elapsed: {elapsed_total:.2f}s")
 
-    # Print summary
     logger.info(f"\n{'='*60}")
     logger.info(f"Test Summary: {len(passed_tests)}/{len(files)} passed")
     if enable_retry and retried_tests:
@@ -302,7 +297,6 @@ def run_unittest_files(
             logger.info(f"  {test} ({attempts} attempts, {result})")
     logger.info(f"{'='*60}\n")
 
-    # Write GitHub Step Summary only if retries occurred
     if retried_tests:
         passed_on_retry = [t for t, _, r in retried_tests if r == "passed"]
         failed_after_retry = [t for t, _, r in retried_tests if r != "passed"]

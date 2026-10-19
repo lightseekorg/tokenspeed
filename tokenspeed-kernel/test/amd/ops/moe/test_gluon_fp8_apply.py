@@ -323,7 +323,6 @@ def test_gluon_block_fp8_exact_mfma_matches_materialized_bf16() -> None:
 def test_gluon_block_fp8_stage2_aligned_scale_matches_materialized_bf16(
     block_n: int, block_k: int
 ) -> None:
-    """Aligned scale tiles preserve exact BF16 stage-2 arithmetic."""
     _requires_gfx950()
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp8 import (
         gluon_fp8_block_dequantize,

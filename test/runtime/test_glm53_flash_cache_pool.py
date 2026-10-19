@@ -1,5 +1,3 @@
-"""GLM-5.3-Flash cache-pool tests."""
-
 from __future__ import annotations
 
 from dataclasses import replace

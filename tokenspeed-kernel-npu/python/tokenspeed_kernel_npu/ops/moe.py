@@ -400,7 +400,7 @@ def ascend_int8_precomputed_moe_apply(
 
 
 def _ascend_int8_gmm2_finalize(hidden, hidden_scale, counts, rows, ids, weights, w):
-    """Unchanged shared tail for composed and input-fused W8A8 paths."""
+    """W2 GMM and routing finalize shared by the composed and input-fused W8A8 paths."""
     hidden = torch_npu.npu_grouped_matmul(
         [hidden],
         [w.w2_weight],

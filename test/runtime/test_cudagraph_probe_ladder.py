@@ -424,7 +424,7 @@ def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
         root / "prefill_graph.py",
         root / "forward_step.py",
     ):
-        for node in ast.walk(ast.parse(path.read_text())):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if isinstance(node, ast.With):
                 spelled = [ast.unparse(item.context_expr) for item in node.items]
                 if any("observer" in text for text in spelled):

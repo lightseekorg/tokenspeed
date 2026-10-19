@@ -31,10 +31,6 @@ from tokenspeed_kernel.signature import (
     format_signatures,
 )
 
-# ===-----------------------------------------------------------------------===#
-# Routing: softmax top-k
-# ===-----------------------------------------------------------------------===#
-
 
 @register_kernel(
     "moe",
@@ -68,11 +64,6 @@ def torch_softmax_topk(
     return topk_weights, topk_ids.to(topk_indices_dtype)
 
 
-# ===-----------------------------------------------------------------------===#
-# Routing: sigmoid-bias top-k
-# ===-----------------------------------------------------------------------===#
-
-
 @register_kernel(
     "moe",
     "sigmoid_bias_topk",
@@ -102,11 +93,6 @@ def torch_sigmoid_bias_topk(
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     topk_weights = topk_weights * routed_scaling_factor
     return topk_weights.to(weights_dtype), topk_ids.to(torch.int32)
-
-
-# ===-----------------------------------------------------------------------===#
-# Routing: sqrt-softplus top-k
-# ===-----------------------------------------------------------------------===#
 
 
 @register_kernel(

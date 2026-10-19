@@ -278,7 +278,13 @@ def gumbel_sample_from_pools(
     *,
     num_tokens_per_req: int = 1,
 ) -> torch.Tensor:
-    """Sample token ids from logits with Gumbel-Max and pool-indexed scalars."""
+    """Sample token ids from logits with Gumbel-Max and pool-indexed scalars.
+
+    ``logits`` is ``[rows, vocab]`` with a stride-1 vocab dimension, and each
+    ``num_tokens_per_req`` consecutive rows share one ``req_pool_indices`` slot.
+    ``local_ids`` (int32) and ``local_scores`` (float32) must be at least
+    :func:`gumbel_scratch_shape`. Returns ``out[:rows]``.
+    """
     rows, vocab_size, num_blocks = _check_gumbel_pool_inputs(
         logits,
         req_pool_indices,

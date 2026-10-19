@@ -110,7 +110,6 @@ class MSAAttnBackend(PagedAttentionBackend):
         self.tp_kv_head_num = max(spec.num_kv_heads // spec.attn_tp_size, 1)
         self.qkv_dtype = config.dtype
 
-        # Sparse attention parameters
         self.index_head_dim = spec.index_head_dim
         self.index_topk_blocks = spec.index_topk_blocks
         self.index_init_blocks = spec.index_init_blocks

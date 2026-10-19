@@ -43,7 +43,8 @@ if platform.is_nvidia:
         priority=Priority.PERFORMANT,
         traits={
             "head_size": frozenset({64, 128, 256, 512}),
-            # Its vector loads straddle the NEOX cos/sin halves below 32-channel multiples.
+            # Its vector loads straddle the NEOX cos/sin halves below
+            # 32-channel multiples.
             "rotary_dim": frozenset(range(32, 513, 32)),
             "partial_rotary": frozenset({True, False}),
             "is_neox": frozenset({True, False}),

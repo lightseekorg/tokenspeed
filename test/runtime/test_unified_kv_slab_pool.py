@@ -77,7 +77,7 @@ class TestHybridSlabGroupSizeTest:
         assert (hybrid_slab_group_size(lt_inkling)) == (55)
 
     def test_sliding_subgroups_return_group_size(self):
-        # Inkling step 2.5: 5 sliding sub-groups + full, all count 11 ->
+        # Inkling: 5 sliding sub-groups + full, all count 11 ->
         # 11 slabs, every slab bound by one layer of each of the 6 groups.
         lt = SUBGROUP_LAYER_BLOCK * 11
         assert (hybrid_slab_group_size(lt, sliding_window_tokens=512)) == (11)

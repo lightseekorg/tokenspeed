@@ -22,8 +22,9 @@
 CuTe DSL MLA Prefill Kernel Wrapper
 ====================================
 
-Wraps BlackwellFusedMultiHeadAttentionForward for ragged MLA prefill on SM100/SM103/SM107.
-No padding required — kernel handles ragged varlen directly.
+Wraps BlackwellFusedMultiHeadAttentionForward for ragged MLA prefill on
+SM100/SM103/SM107. No padding is required; the kernel handles ragged varlen
+input directly.
 """
 
 import logging
@@ -93,9 +94,8 @@ def _compile_prefill_kernel(
 ):
     """Compile FMHA prefill kernel with fully fake/symbolic tensors.
 
-    New fmha.py accepts cute.Tensor (not .iterator) and handles ragged
-    varlen without padding. All tensor shapes are symbolic — compile once,
-    reuse for any buffer size.
+    The kernel handles ragged varlen without padding. All tensor shapes are
+    symbolic — compile once, reuse for any buffer size.
     """
     cutlass_dtype = torch_to_cutlass_dtype(q_dtype)
     out_cutlass_dtype = cutlass.BFloat16
@@ -136,7 +136,6 @@ def _compile_prefill_kernel(
         f"head_dim=({head_dim_qk},{head_dim_v}), causal={is_causal}, lse={return_lse}"
     )
 
-    # New API: pass cute.Tensor directly (not .iterator).
     # Fake tensors with correct row-major 5D strides for compile-once.
     # Layout: (1, total, h_k, h_r, d) with row-major strides.
     sym_s_q = cute.sym_int()
@@ -206,8 +205,7 @@ def _compile_prefill_kernel(
     return compiled
 
 
-# Cache: (dtype, d_qk, d_v, h_q, h_k, is_causal, return_lse, pdl, ex2)
-# New fmha.py accepts cute.Tensor and handles varlen without padding.
+# Cache: (dtype, d_qk, d_v, is_causal, return_lse, pdl, ex2)
 # TMA descriptors rebuilt from runtime tensors. Buffer sizes NOT in key.
 _compiled_kernels = {}
 
@@ -347,7 +345,6 @@ def tokenspeed_mla_prefill(
     o_5d = o_torch.view(1, total_q_tokens, h_k, h_r, d_v)
     o_ct = _to_cute(o_5d, out_cutlass_dtype)
 
-    # Cumulative sequence lengths.
     # Keep backing tensors alive until after kernel launch.
     cum_q_ct, _cum_q_backing = _to_cute_1d(cum_seq_lens_q)
     cum_k_ct, _cum_k_backing = _to_cute_1d(cum_seq_lens_kv)

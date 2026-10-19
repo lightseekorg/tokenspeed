@@ -175,7 +175,7 @@ def test_dispatcher_hands_rows_past_the_cap_to_the_grouped_kernel(monkeypatch):
     torch.manual_seed(7)
     logits = (torch.randn(cap + 1, EXPERTS, device="cuda") * 0.2).float()
     bias = (torch.randn(EXPERTS, device="cuda") * 0.01).float()
-    weights, ids = moe_sigmoid_bias_topk(
+    weights, _ = moe_sigmoid_bias_topk(
         logits, bias, TOPK, routed_scaling_factor=2.5, weights_dtype=torch.bfloat16
     )
     assert not calls
@@ -360,7 +360,7 @@ def test_packed_drops_nan_rows_like_the_grouped_kernel():
         logical_to_physical_map=None,
         weights_dtype=torch.float32,
     )
-    gw, gi = _grouped(logits, bias, normalize=True, scale=2.5)
+    _, gi = _grouped(logits, bias, normalize=True, scale=2.5)
 
     finite = [0, 1, 2]
     assert 17 not in pi[1].tolist()

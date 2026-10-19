@@ -281,7 +281,8 @@ def test_qsa_sparse_attention_ignores_nan_in_padding_write_slot(
     if solution == "flashinfer":
         runner = _FlashInferQSASparseRunner(torch.device(device))
         monkeypatch.setattr(
-            "tokenspeed_kernel.ops.attention.qsa.flashinfer.get_flashinfer_qsa_sparse_runner",
+            "tokenspeed_kernel.ops.attention.qsa.flashinfer."
+            "get_flashinfer_qsa_sparse_runner",
             lambda device: runner,
         )
 

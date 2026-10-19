@@ -489,7 +489,6 @@ class Qwen3VLMoeVisionModel(nn.Module):
             dh = h_idxs - h_floor
             dw = w_idxs - w_floor
 
-            # Create meshgrid view for all h, w vars
             dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
             h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
             h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
@@ -559,7 +558,6 @@ class Qwen3VLMoeVisionModel(nn.Module):
             pad = np.full((B_padded - B,), token_indptr[-1], dtype=token_indptr.dtype)
             token_indptr = np.concatenate([token_indptr, pad], axis=0)  # (B_padded+1,)
 
-        # convert token indptr -> element indptr
         elem_indptr = (token_indptr * int(elem_per_token)).astype(
             np.int32
         )  # (B_padded+1,)
@@ -625,7 +623,6 @@ class Qwen3VLMoeVisionModel(nn.Module):
 
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
 
-        # ---- build token indptr (B+1,) ----
         token_cu_seqlens = np.concatenate(
             [
                 np.zeros(1, dtype=np.int32),

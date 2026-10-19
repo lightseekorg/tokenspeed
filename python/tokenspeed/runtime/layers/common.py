@@ -26,10 +26,8 @@ import torch
 
 
 def concat(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Concatenate two tensors along the last dimension."""
     return torch.cat([a, b], dim=-1)
 
 
 def fp8_cast_contiguous(x: torch.Tensor) -> torch.Tensor:
-    """Cast to FP8 E4M3 and return a contiguous tensor."""
     return x.to(torch.float8_e4m3fn).contiguous()

@@ -183,10 +183,6 @@ class CacheGroupRouter(AttentionBackend):
         self.leaves = dict(sorted(leaves.items()))
         self._forget_bound_pool_state()
 
-    # ------------------------------------------------------------------
-    # Structure
-    # ------------------------------------------------------------------
-
     @property
     def group_ids(self) -> tuple[str, ...]:
         return tuple(self.leaves)
@@ -195,12 +191,16 @@ class CacheGroupRouter(AttentionBackend):
         return tuple(self.leaves.values())
 
     def _forget_bound_pool_state(self) -> None:
-        """The table stacks and write locations built for a bound pool; init rebuilds them."""
+        """Drops the table stacks and write locations built for a bound pool.
+
+        ``init_cuda_graph_state`` rebuilds them.
+        """
         self._offload_adapter = None
         self._stacks: GroupTableStacks | None = None
         self._decode_views: dict[tuple[int, int], RouterDecodeWriteLocations] = {}
         # Published write locations: the decode slot (graph-recorded views,
-        # refreshed in place) and the extend span (the stack's buffer, or fresh past it).
+        # refreshed in place) and the extend span (the stack's buffer, or fresh
+        # past it).
         self.decode_write_locations: RouterDecodeWriteLocations | None = None
         self._extend_write_locations: dict[str, torch.Tensor] | None = None
         self._decode_request_offset = 0
@@ -348,10 +348,6 @@ class CacheGroupRouter(AttentionBackend):
             )
         return next(iter(self.leaves.values()))
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
     @property
     def geometry(self) -> CacheGroupGeometry:
         if self._geometry is None:
@@ -415,10 +411,6 @@ class CacheGroupRouter(AttentionBackend):
             kernel_page_size=page_size,
         )
 
-    # ------------------------------------------------------------------
-    # Write locations
-    # ------------------------------------------------------------------
-
     @property
     def _decode_tokens_per_req(self) -> int:
         # The refresh-time window: the target's verify width, and the draft
@@ -454,7 +446,10 @@ class CacheGroupRouter(AttentionBackend):
         return self._decode_window_of(self.group_ids[self._draft_history_index()])
 
     def _decode_window_of(self, gid: str) -> torch.Tensor:
-        """Group ``gid``'s current decode write window view (see ``decode_window_locations``)."""
+        """Returns group ``gid``'s current decode write window view.
+
+        See ``decode_window_locations``.
+        """
         published = self.decode_write_locations
         if published is None:
             raise RuntimeError("decode window requested before any decode refresh")
@@ -493,7 +488,10 @@ class CacheGroupRouter(AttentionBackend):
             self._bind_tree_window_rows()
 
     def _bind_tree_window_rows(self) -> None:
-        """Per group, the address table of the K/V token-row buffers compaction moves rows in."""
+        """Builds, per group, the address table of the K/V token-row buffers.
+
+        Draft-tree compaction moves rows in these buffers.
+        """
         pool = self.cache_pool
         buffers_by_group: dict[str, list[torch.Tensor]] = {}
         for layer, gid in sorted(pool.history_group_by_layer().items()):
@@ -501,7 +499,8 @@ class CacheGroupRouter(AttentionBackend):
                 buffers_by_group.setdefault(gid, []).extend(pool.get_kv_buffer(layer))
         self._tree_window_rows = {}
         for gid, buffers in buffers_by_group.items():
-            # MLA's value is a view of its latent key row at the same address; the key row covers it.
+            # MLA's value is a view of its latent key row at the same address;
+            # the key row covers it.
             widest: dict[int, torch.Tensor] = {}
             for buf in buffers:
                 kept = widest.get(buf.data_ptr())
@@ -516,7 +515,8 @@ class CacheGroupRouter(AttentionBackend):
                     f"width per cache group; {gid} has widths {sorted(row_bytes)}, "
                     f"contiguous={contiguous}"
                 )
-            # Layers may alias one region through the memory plan; move each region once.
+            # Layers may alias one region through the memory plan; move each
+            # region once.
             addresses = torch.tensor(
                 sorted(widest),
                 dtype=torch.int64,
@@ -525,7 +525,8 @@ class CacheGroupRouter(AttentionBackend):
             self._tree_window_rows[gid] = (addresses, row_bytes.pop())
         if not self._tree_window_rows:
             raise NotImplementedError(
-                f"draft-tree compaction found no K/V rows in cache groups {self.group_ids}"
+                "draft-tree compaction found no K/V rows in cache groups "
+                f"{self.group_ids}"
             )
 
     def compact_verify_window(self, path: torch.Tensor) -> None:
@@ -614,7 +615,8 @@ class CacheGroupRouter(AttentionBackend):
             return locations
         if not forward_mode.is_extend_or_mixed():
             raise ValueError(
-                f"{locations.numel()} {forward_mode.name.lower()} write slots for {rows} rows"
+                f"{locations.numel()} {forward_mode.name.lower()} write slots for "
+                f"{rows} rows"
             )
         return self.stacks.padded_extend_span(layer.group_id, rows)
 
@@ -645,10 +647,6 @@ class CacheGroupRouter(AttentionBackend):
         if decode_locations.numel() == 0:
             return extend_locations
         return torch.cat((extend_locations, decode_locations))
-
-    # ------------------------------------------------------------------
-    # Metadata
-    # ------------------------------------------------------------------
 
     def _check_live_delivery(self, actual_bs: int, block_tables) -> None:
         """A live batch must deliver every routed group's table — the
@@ -784,7 +782,8 @@ class CacheGroupRouter(AttentionBackend):
         }
         batched = [gid for gid, pair in targets.items() if pair is not None]
         if batched:
-            # One launch fills every such leaf; two stream copies per leaf cost ~4 us each at bs=1.
+            # One launch fills every such leaf; two stream copies per leaf cost
+            # ~4 us each at bs=1.
             torch._foreach_copy_(
                 [buf for gid in batched for buf in targets[gid]],
                 [
@@ -824,7 +823,8 @@ class CacheGroupRouter(AttentionBackend):
         self.sparse_topk.clear()
         if not forward_mode.is_decode_or_idle():
             raise NotImplementedError(
-                f"{type(self).__name__} CUDA graphs record decode only, got {forward_mode}"
+                f"{type(self).__name__} CUDA graphs record decode only, got "
+                f"{forward_mode}"
             )
         self.stacks.fill(bs, 0, block_tables)
         self._decode_request_offset = 0
@@ -834,10 +834,6 @@ class CacheGroupRouter(AttentionBackend):
                 bs, seq_lens, self.stacks.table(gid, bs)
             )
             leaf.set_request_slots(req_pool_indices[:bs])
-
-    # ------------------------------------------------------------------
-    # Draft write locations (the drafters' in-graph slot math)
-    # ------------------------------------------------------------------
 
     def _draft_history_index(self) -> int:
         """Stack index of the full-history group the draft chain writes.
@@ -995,7 +991,8 @@ class CacheGroupRouter(AttentionBackend):
         record_kv_cache: bool | None = None,
         **kwargs,
     ):
-        # No ambient-ctx override: a MIXED round's halves pass sub-context modes this must honor.
+        # No ambient-ctx override: a MIXED round's halves pass sub-context modes
+        # this must honor.
         assert not save_kv_cache, _PREWRITTEN
         leaf = self._leaf_for(layer)
         if self._offload_adapter is not None and "topk_indices" in kwargs:

@@ -63,7 +63,7 @@ class PrefillCapacity:
             raise ValueError("prefill capacities must be positive")
 
     def validate(self, live_boundaries: torch.Tensor, tokens: int) -> None:
-        """Admit host boundaries of positive packed sequences that fit, without a D2H."""
+        """Admit host boundaries of positive packed sequences that fit, without D2H."""
         if tokens != self.token_capacity:
             raise ValueError("input extent differs from the token capacity")
         if live_boundaries.numel() != self.num_sequences + 1:
@@ -251,7 +251,8 @@ class CapacityPrefillBackend(MambaAttnBackend):
         self._prefill_metadata_pool: CachePool | None = None
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
-        # The orchestrator releases old graphs first; these are execution buffers, not state pages.
+        # The orchestrator releases old graphs first; these are execution
+        # buffers, not state pages.
         self._reset_prefill_metadata()
 
     def _reset_prefill_metadata(self) -> None:
@@ -319,4 +320,4 @@ class CapacityPrefillBackend(MambaAttnBackend):
         return True
 
     def _refresh_captured_prefill(self, metadata: CapacityPrefillMetadata) -> None:
-        """Refresh backend-owned buffers a retained shape's graphs read, before each use."""
+        """Refresh backend-owned buffers a retained shape's graphs read, before use."""

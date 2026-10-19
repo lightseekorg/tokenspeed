@@ -356,7 +356,8 @@ class MoonViTEncoderLayer(nn.Module):
     ):
         if not isinstance(max_seqlen, int):
             raise TypeError(
-                f"max_seqlen must be a Python int for capture-safety, got {type(max_seqlen)}"
+                "max_seqlen must be a Python int for capture-safety, got "
+                f"{type(max_seqlen)}"
             )
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
@@ -379,12 +380,12 @@ class MoonViTEncoderLayer(nn.Module):
 
 
 def get_rope_shape_decorate(func):
-    _get_rope_shape_first_call_flag = set()
+    warmed_up_keys = set()
 
     def wrapper(org, interpolation_mode, shape):
         key = (org.requires_grad, torch.is_grad_enabled(), interpolation_mode)
-        if key not in _get_rope_shape_first_call_flag:
-            _get_rope_shape_first_call_flag.add(key)
+        if key not in warmed_up_keys:
+            warmed_up_keys.add(key)
             _ = func(org, interpolation_mode, shape=(64, 64))
         return func(org, interpolation_mode, shape)
 
@@ -535,13 +536,16 @@ class Rope2DPosEmbRepeated(nn.Module):
         self.register_buffer("freqs_cis", None, persistent=False)
 
     def extra_repr(self):
-        return f"dim={self.dim}, max_height={self.max_height}, max_width={self.max_width}, theta_base={self.theta_base}"
+        return (
+            f"dim={self.dim}, max_height={self.max_height}, "
+            f"max_width={self.max_width}, theta_base={self.theta_base}"
+        )
 
     def _precompute_freqs_cis(self, device: torch.device) -> torch.Tensor:
         """Calculate the cis(freqs) for each position in the 2D grid.
         Return: complex tensor of shape (max_height, max_width, dim//2) and value:
             height axis: ret[h, w, 2*i] = cis(h * theta_base**(-4*i/dim))
-            weight axis: ret[h, w, 2*i+1] = cis(w * theta_base**(-4*i/dim))   with (i in [0, dim//4))
+            width axis: ret[h, w, 2*i+1] = cis(w * theta_base**(-4*i/dim))   with (i in [0, dim//4))
             note: `cis` is a mathematical notation defined by cis x = cos x + i sin x,
         """
         N = self.max_height * self.max_width
@@ -646,7 +650,6 @@ class MoonVision3dPatchEmbed(nn.Module):
             (L, Cout) tensor
         """
         x = self.proj(x).view(x.size(0), -1)
-        # apply positional embedding
         x = self.pos_emb(x, grid_thws)
         return x
 
@@ -753,6 +756,7 @@ class MoonViT3dPretrainedModel(nn.Module):
         mm_attention_backend: str | None = None,
         **kwargs,
     ):
+        del inputs, kwargs  # Unused.
         super().__init__()
         config = MoonViTConfig.from_config(config)
         self.config = config

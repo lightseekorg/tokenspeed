@@ -201,6 +201,7 @@ def depth_scale_coefficients(
 
 class BeamRMSNorm(RMSNorm):
     """Round the residual sum first; normalize and affine together in FP32.
+
     The weight is stored in the checkpoint dtype.
 
     An input norm whose attention runs its Q/K/V and gate projections as one
@@ -560,6 +561,7 @@ class BeamAttention(Qwen3Attention):
         (the weight becomes its ``[K, N]`` transpose, the scales stay). The
         fused GEMM and the separate projections read the same bytes.
         """
+        del layer
         projections = (self.qkv_proj, self.gate_proj)
         if self.qkv_gate_weight is not None:
             return
@@ -1067,6 +1069,7 @@ class BeamMLP(LlamaMLP):
         self.register_buffer("fp8_unit_scale", None, persistent=False)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
+        del layer
         # The loader visits this module before its projections, whose own
         # processing then leaves the [K, N] FP8 weights and FP32 scales.
         projections = (self.gate_up_proj, self.down_proj)
@@ -1599,7 +1602,8 @@ def _load_beam_weights(
                 ("gate_proj", "up_proj") if packed == "w13" else ("down_proj",)
             )
             names = {
-                f"{prefix}.{expert_schema.make_expert_weight_name(expert, projection)}{suffix}"
+                f"{prefix}."
+                f"{expert_schema.make_expert_weight_name(expert, projection)}{suffix}"
                 for expert in range(model.config.num_experts)
                 for projection in projections
             }
@@ -1642,7 +1646,8 @@ def _load_beam_weights(
             )
             if weight.dtype not in admitted:
                 raise TypeError(
-                    f"Checkpoint dtype mismatch for {name}: expected {storage_dtype}, got {weight.dtype}"
+                    f"Checkpoint dtype mismatch for {name}: "
+                    f"expected {storage_dtype}, got {weight.dtype}"
                 )
             if name == "lm_head.weight" and weight.ndim == 2:
                 weight = weight[:, : model.lm_head.embedding_dim]

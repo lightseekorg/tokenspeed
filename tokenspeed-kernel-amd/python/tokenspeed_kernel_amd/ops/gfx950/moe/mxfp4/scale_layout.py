@@ -60,10 +60,6 @@ is a single scale swizzle (:func:`swizzle_cdna4_mxfp4_scale`). Producer and
 consumer are hard-coupled: the byte order this swizzle bakes into memory must
 match the ``get_mfma_scale_layout`` the stage kernels address with, so any
 change here must be mirrored in the kernels' scale addressing.
-
-The swizzled scales feed a direct global->VGPR gather in the stage kernels, so
-the scale bytes arrive in registers already distributed for the MFMA with no
-in-kernel shuffle.
 """
 
 from __future__ import annotations

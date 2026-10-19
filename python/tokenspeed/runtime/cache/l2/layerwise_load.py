@@ -70,6 +70,7 @@ class LayerwiseLoadTracker:
         self.consumer_indices: tuple[int, ...] = ()
 
     def begin_load(self) -> int:
+        """Blocks until the previous load that used the claimed set has finished."""
         next_index = (self.current_load_index + 1) % len(self.event_sets)
         last_layer_done = self.event_sets[next_index].last_layer_done_event
         if not last_layer_done.query():

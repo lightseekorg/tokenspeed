@@ -80,11 +80,8 @@ BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm", "npu"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
 
-# CUDA kernels source and output directories
 CUDA_CSRC_DIR = THIRDPARTY_DIR / "cuda" / "csrc"
 CUDA_OBJS_DIR = THIRDPARTY_DIR / "cuda" / "objs"
-
-# JIT kernels source directory (no pre-compilation, just need sources available)
 
 CUDA_HOME = os.environ.get("CUDA_HOME", "/usr/local/cuda")
 NVCC = os.environ.get("FLASHINFER_NVCC", f"{CUDA_HOME}/bin/nvcc")
@@ -529,9 +526,6 @@ class CudaKernelBuilder:
         self.kernel_groups = kernel_groups
         self.verbose = verbose
 
-    # Target GPU architectures: detect from the CUDA driver or use env var override.
-    # FLASHINFER_CUDA_ARCH_LIST is accepted for compatibility, but TokenSpeed
-    # docs prefer TOKENSPEED_CUDA_ARCH=100 on GB200.
     def _normalize_cuda_arch(self, arch):
         has_suffix = arch.endswith("a")
         arch_clean = arch.rstrip("a")
@@ -546,6 +540,12 @@ class CudaKernelBuilder:
         return f"{major}{minor}{suffix}"
 
     def _detect_cuda_archs(self):
+        """Returns the target GPU architectures.
+
+        FLASHINFER_CUDA_ARCH_LIST is accepted for compatibility, but TokenSpeed
+        docs prefer TOKENSPEED_CUDA_ARCH=100 on GB200. Without an override, the
+        defaults are used, plus 107a when nvcc is 13.4 or newer.
+        """
         archs = set()
 
         arch_list = os.environ.get("FLASHINFER_CUDA_ARCH_LIST", "")
@@ -872,7 +872,6 @@ class CudaKernelBuilder:
         ldflags = ["-shared"] + self._resolve_cuda_lib_flags()
         build_identity = self._build_identity(nvcc_flags, include_dirs, ldflags)
 
-        # Ensure output directory exists
         CUDA_OBJS_DIR.mkdir(parents=True, exist_ok=True)
 
         stale_groups = []

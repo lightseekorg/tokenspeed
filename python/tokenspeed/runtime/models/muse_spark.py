@@ -241,7 +241,8 @@ class _MuseGatheredLinear(ColumnParallelLinear):
                 device=self.weight.device,
                 block_index=layer_id,
                 layer_count=layer_count,
-                model_scope=f"{prefix.split('.layers.')[0]}.{prefix.rsplit('.', 1)[-1]}",
+                model_scope=f"{prefix.split('.layers.')[0]}."
+                f"{prefix.rsplit('.', 1)[-1]}",
                 max_m=_GATHER_WORKSPACE_ROWS,
                 # Takes this call's weight view; the mailbox publishes wider blocks.
                 publish_gemm=partial(_block_gemm, self),
@@ -832,7 +833,7 @@ class MuseSparkAttention(nn.Module):
         ctx: ForwardContext,
         owned_global_rows: int | None,
     ) -> tuple[torch.Tensor, int | None, int]:
-        """Attend over rows already passed through ``normalize``."""
+        """Attend over rows already passed through the input norm."""
         if owned_global_rows is not None:
             projected = self.qkv_proj.project_owned_rows(normalized, owned_global_rows)
             iris = self.iris_state
@@ -939,7 +940,6 @@ class PreparedFP32RouterGEMV(nn.Module):
         self.register_buffer("prepared_weight", None, persistent=False)
 
     def process_weights_after_loading(self, _module: nn.Module) -> None:
-        """Prepare the loaded canonical weight for the selected backend."""
         self.prepared_weight = fp32_router_gemv_process_weight(
             self._plan,
             self.weight,

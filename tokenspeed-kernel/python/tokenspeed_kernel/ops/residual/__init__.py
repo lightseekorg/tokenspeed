@@ -286,7 +286,8 @@ def _same_tensor_contract(
         )
     if value.device != reference.device:
         raise ValueError(
-            f"{name} device must match the input ({reference.device}), got {value.device}"
+            f"{name} device must match the input ({reference.device}), "
+            f"got {value.device}"
         )
 
 
@@ -778,7 +779,7 @@ def mhc_pre(
     norm_weight: _torch.Tensor | None,
     norm_eps: float | None,
 ) -> tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor]:
-    """Compute the mHC pre-mapping for one residual stream.
+    """Compute the mHC pre-mapping of the residual streams.
 
     Args:
         residual: BF16 residual streams shaped ``[..., hc_mult, hidden_size]``.

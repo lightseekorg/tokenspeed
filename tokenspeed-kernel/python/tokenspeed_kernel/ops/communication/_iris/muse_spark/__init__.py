@@ -388,7 +388,8 @@ class MuseIrisState:
         output = self.all_reduce.producer_pull.scratch[: local_rows * 4096].view(
             local_rows, 4096
         )
-        # The local producer uses write-through stores; peer reads need no cache writeback.
+        # The local producer uses write-through stores; peer reads need no cache
+        # writeback.
         iris_pull_reduce_scatter[(_MUSE_ROW_SCATTER_PROGRAMS,)](
             self.all_reduce.producer.data,
             output,
@@ -466,7 +467,7 @@ class MuseIrisState:
     ) -> tuple[
         torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor
     ]:
-        """Gather pre-expert activations, expert IDs, and weights in one packed buffer."""
+        """Gather pre-expert activations, expert IDs, and weights in one packet."""
         assert self.can_use_owned_rows(rows)
         local_rows = triton.cdiv(rows, self.world_size)
         assert valid_rows == min(
@@ -624,7 +625,8 @@ class MuseIrisState:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reduce the attention output, update the residual, and normalize for MoE.
 
-        The FP32 normalized rows feed the router; BF16 rows feed the pre-expert projection.
+        The FP32 normalized rows feed the router; BF16 rows feed the pre-expert
+        projection.
         """
         assert self.can_all_reduce_symmetric_boundary(
             branch, stream, post_weight, alpha, beta, pre_weight

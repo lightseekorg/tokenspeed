@@ -171,7 +171,8 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
         self.stream_fork = StreamFork(alt_stream)
         if mapping.moe.tp_ep_size > config.num_local_experts:
             raise ValueError(
-                f"MoE parallel size {mapping.moe.tp_ep_size} exceeds {config.num_local_experts} experts."
+                f"MoE parallel size {mapping.moe.tp_ep_size} exceeds "
+                f"{config.num_local_experts} experts."
             )
 
         self.gate = ReplicatedLinear(
@@ -501,7 +502,8 @@ class MiniMaxM3Indexer(nn.Module):
         if total_index_heads != config.num_key_value_heads:
             raise ValueError(
                 "MiniMax-M3 requires one index-query head per GQA group: "
-                f"index_heads={total_index_heads}, kv_heads={config.num_key_value_heads}."
+                f"index_heads={total_index_heads}, "
+                f"kv_heads={config.num_key_value_heads}."
             )
         if mapping.attn.tp_size > total_index_heads:
             raise ValueError(

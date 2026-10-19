@@ -94,11 +94,6 @@ def _npu_is_available() -> bool:
     return bool(torch.npu.is_available())
 
 
-# ---------------------------------------------------------------------------
-# Core data structures
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class ArchVersion:
     """Hardware generation identifier. Supports comparison operators."""
@@ -141,11 +136,9 @@ class PlatformInfo:
     device_name: str
     device_count: int
 
-    # Memory
     total_memory: int  # Bytes per device
     memory_bandwidth: float  # GB/s
 
-    # Compute
     sm_count: int  # Streaming multiprocessors (or CUs)
     max_threads_per_sm: int
     max_shared_memory_per_sm: int  # Bytes
@@ -165,7 +158,6 @@ class PlatformInfo:
         """Detect platform from current environment."""
         return _detect_platform()
 
-    # Convenience properties
     @property
     def is_nvidia(self) -> bool:
         return self.vendor == "nvidia"
@@ -264,7 +256,6 @@ class PlatformInfo:
 
     @property
     def generation_name(self) -> str:
-        """Human-readable generation name."""
         arch_version = (self.arch_version.major, self.arch_version.minor)
         if self.is_nvidia:
             names = {
@@ -320,7 +311,6 @@ class CapabilityRequirement:
         return self.min_arch_version
 
     def satisfied_by(self, platform: PlatformInfo) -> bool:
-        """Check if platform satisfies these requirements."""
         if self.vendors and platform.vendor not in self.vendors:
             return False
 
@@ -340,14 +330,8 @@ class CapabilityRequirement:
         return True
 
     def missing_features(self, platform: PlatformInfo) -> set[str]:
-        """Return features required but not available."""
         all_features = platform.sm_features | platform.runtime_features
         return self.required_features - all_features
-
-
-# ---------------------------------------------------------------------------
-# Platform singleton
-# ---------------------------------------------------------------------------
 
 
 class Platform:
@@ -375,7 +359,6 @@ class Platform:
 
 
 def current_platform() -> PlatformInfo:
-    """Get current platform."""
     return Platform.get()
 
 
@@ -440,13 +423,7 @@ def pdl_enabled(overwrite: bool | None = None) -> bool:
     return _pdl_enabled
 
 
-# ---------------------------------------------------------------------------
-# Detection implementation
-# ---------------------------------------------------------------------------
-
-
 def _detect_platform() -> PlatformInfo:
-    """Detect current platform capabilities."""
     try:
         import torch
     except ImportError:
@@ -487,7 +464,6 @@ def _detect_npu_platform() -> PlatformInfo:
 
 
 def _detect_cuda_platform() -> PlatformInfo:
-    """Detect NVIDIA CUDA platform."""
     import torch
 
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
@@ -515,7 +491,6 @@ def _detect_cuda_platform() -> PlatformInfo:
 
 
 def _get_cuda_sm_features(arch_version: ArchVersion) -> frozenset[str]:
-    """Determine CUDA SM features from arch version."""
     features: set[str] = set()
 
     if arch_version >= ArchVersion(7, 0):
@@ -537,7 +512,6 @@ def _get_cuda_sm_features(arch_version: ArchVersion) -> frozenset[str]:
 
 
 def _get_cuda_runtime_features() -> frozenset[str]:
-    """Detect CUDA runtime features from environment."""
     features: set[str] = {"runtime:cuda_graph"}
 
     if _check_symmetric_memory_available():
@@ -551,13 +525,11 @@ def _get_cuda_runtime_features() -> frozenset[str]:
 
 
 def _detect_rocm_platform() -> PlatformInfo:
-    """Detect AMD ROCm platform."""
     import torch
 
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     arch = _extract_amd_arch(props.gcnArchName)
 
-    # Map supported AMD architectures.
     arch_map = {
         "gfx950": ArchVersion(9, 5),  # MI350
         "gfx1201": ArchVersion(12, 0),  # RDNA4
@@ -608,18 +580,12 @@ def _get_rocm_sm_features(arch: str) -> frozenset[str]:
 
 
 def _get_rocm_runtime_features() -> frozenset[str]:
-    """Detect ROCm runtime features from environment."""
     features: set[str] = set()
 
     if _check_symmetric_memory_available():
         features.add("comms:symmetric_memory")
 
     return frozenset(features)
-
-
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
 
 
 def _extract_amd_arch(gcn_arch_name: str) -> str:
@@ -649,7 +615,6 @@ def _estimate_amd_bandwidth(props: object) -> float:
 
 
 def _detect_cuda_interconnect() -> InterconnectInfo | None:
-    """Detect CUDA multi-GPU interconnect topology."""
     try:
         import torch
 
@@ -666,7 +631,6 @@ def _detect_cuda_interconnect() -> InterconnectInfo | None:
 
 
 def _detect_rocm_interconnect() -> InterconnectInfo | None:
-    """Detect ROCm multi-GPU interconnect topology."""
     try:
         import torch
 
@@ -686,7 +650,7 @@ def _detect_rocm_interconnect() -> InterconnectInfo | None:
                 for link in _os.listdir(links_dir):
                     pf = _os.path.join(links_dir, link, "properties")
                     try:
-                        with open(pf) as f:
+                        with open(pf, encoding="utf-8") as f:
                             for line in f:
                                 if line.startswith("type ") and line.split()[1] == "11":
                                     xgmi_count += 1
@@ -803,7 +767,6 @@ def _detect_cuda_nvlink_topology() -> str | None:
 
 
 def _check_symmetric_memory_available() -> bool:
-    """Check if PyTorch symmetric memory is available."""
     try:
         import torch.distributed._symmetric_memory  # noqa: F401
 
@@ -813,7 +776,6 @@ def _check_symmetric_memory_available() -> bool:
 
 
 def _check_nvlink_available() -> bool:
-    """Check if NVLink connectivity is available."""
     return _detect_cuda_nvlink_topology() is not None
 
 
@@ -864,6 +826,7 @@ def _hip_host_get_device_pointer(host_ptr: int) -> int:
         )
     if device_ptr.value is None:
         raise RuntimeError(
-            f"hipHostGetDevicePointer returned null for registered host pointer 0x{host_ptr:x}"
+            "hipHostGetDevicePointer returned null for registered host "
+            f"pointer 0x{host_ptr:x}"
         )
     return device_ptr.value

@@ -1332,7 +1332,7 @@ def test_decode_rows_packed_request_bounds_padding_and_replay(target, width, bs)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             prepare(2, 0)
-        for step in range(3):
+        for _ in range(3):
             seq.add_(1)
             pools.add_(3)
             for tensor in storage:

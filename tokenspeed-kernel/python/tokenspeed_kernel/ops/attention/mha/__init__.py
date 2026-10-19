@@ -108,11 +108,6 @@ def _blockscaled_signature_and_scales(
 LSE_LN = math.log2(math.e)
 
 
-# ===-----------------------------------------------------------------------===#
-# MHA Kernels
-# ===-----------------------------------------------------------------------===#
-
-
 def mha_plan(
     dtype: torch.dtype,
     head_dim: int,
@@ -228,7 +223,6 @@ def mha_prefill(
     """
     batch_size = cu_seqlens.shape[0] - 1
 
-    # Select kernel
     traits = {
         "head_dim": q.shape[-1],
         "logit_cap": logit_cap != 0.0,
@@ -247,7 +241,6 @@ def mha_prefill(
         override=override,
     )
 
-    # Record shapes
     shape_params = {
         "batch_size": batch_size,
         "total_q": q.shape[0],
@@ -273,7 +266,6 @@ def mha_prefill(
         else {}
     )
 
-    # Enter profiling scope
     with kernel_scope(
         "attention",
         "mha_prefill",
@@ -364,7 +356,6 @@ def mha_extend_with_kvcache(
         q, k_cache, v_cache, q_scale, k_scale, v_scale, fp8_kv_scales
     )
 
-    # Select kernel
     traits = {
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
@@ -383,7 +374,6 @@ def mha_extend_with_kvcache(
         override=override,
     )
 
-    # Record shapes
     shape_params = {
         "batch_size": cache_seqlens.shape[0],
         "total_q": q.shape[0],
@@ -404,7 +394,6 @@ def mha_extend_with_kvcache(
         shape_params,
     )
 
-    # Enter profiling scope
     with kernel_scope(
         "attention",
         "mha_extend_with_kvcache",
@@ -492,7 +481,6 @@ def mha_decode_with_kvcache(
         q, k_cache, v_cache, q_scale, k_scale, v_scale, fp8_kv_scales
     )
 
-    # Select kernel
     traits = {
         "q_len": max_seqlen_q,
         "head_dim": q.shape[-1],
@@ -511,7 +499,6 @@ def mha_decode_with_kvcache(
         override=override,
     )
 
-    # Record shapes
     shape_params = {
         "batch_size": cache_seqlens.shape[0],
         "total_q": q.shape[0],
@@ -532,7 +519,6 @@ def mha_decode_with_kvcache(
         shape_params,
     )
 
-    # Enter profiling scope
     with kernel_scope(
         "attention",
         "mha_decode_with_kvcache",

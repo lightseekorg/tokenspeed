@@ -42,7 +42,6 @@ def silu_and_mul(
 
     Positive ``limit`` values use the portable Triton implementation because
     the CUDA implementation does not expose the checkpoint's clamp semantics.
-
     """
     if current_platform().is_npu and limit is None:
         from tokenspeed_kernel.ops.activation.ascend import silu_and_mul as npu_swiglu

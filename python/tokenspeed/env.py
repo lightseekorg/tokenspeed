@@ -38,7 +38,6 @@ def is_rocm_build() -> bool:
     return getattr(torch.version, "hip", None) is not None
 
 
-# List of packages to check versions
 PACKAGE_LIST = [
     "tokenspeed",
     "aiohttp",
@@ -116,7 +115,6 @@ PACKAGE_LIST = [
 
 
 def get_package_versions(packages: list[str]) -> dict[str, str]:
-    """Get versions of specified packages."""
     versions = {}
     for package in packages:
         package_name = package.split("==")[0].split(">=")[0].split("<=")[0]
@@ -128,7 +126,6 @@ def get_package_versions(packages: list[str]) -> dict[str, str]:
 
 
 def get_cuda_info() -> dict[str, object]:
-    """Get CUDA-related information if available."""
     if is_cuda_build():
         cuda_info = {"CUDA available": torch.cuda.is_available()}
 
@@ -149,7 +146,6 @@ def get_cuda_info() -> dict[str, object]:
 
 
 def _get_gpu_info() -> dict[str, str]:
-    """Get information about available GPUs."""
     devices = defaultdict(list)
     capabilities = defaultdict(list)
     for device_index in range(torch.cuda.device_count()):
@@ -162,11 +158,9 @@ def _get_gpu_info() -> dict[str, str]:
         gpu_info[f"GPU {','.join(device_ids)}"] = name
 
     if len(capabilities) == 1:
-        # All GPUs have the same compute capability
         cap, gpu_ids = next(iter(capabilities.items()))
         gpu_info[f"GPU {','.join(gpu_ids)} Compute Capability"] = cap
     else:
-        # GPUs have different compute capabilities
         for cap, gpu_ids in capabilities.items():
             gpu_info[f"GPU {','.join(gpu_ids)} Compute Capability"] = cap
 
@@ -174,7 +168,6 @@ def _get_gpu_info() -> dict[str, str]:
 
 
 def _get_cuda_version_info() -> dict[str, str | None]:
-    """Get CUDA version information."""
     if is_cuda_build():
         from torch.utils.cpp_extension import CUDA_HOME
 
@@ -199,7 +192,6 @@ def _get_cuda_version_info() -> dict[str, str | None]:
 
 
 def _get_nvcc_info() -> dict[str, str]:
-    """Get NVCC version information."""
     if is_cuda_build():
         from torch.utils.cpp_extension import CUDA_HOME
 
@@ -241,7 +233,6 @@ def _get_nvcc_info() -> dict[str, str]:
 
 
 def _get_cuda_driver_version() -> dict[str, str]:
-    """Get CUDA driver version."""
     if is_cuda_build():
         try:
             output = subprocess.check_output(
@@ -284,7 +275,6 @@ def _get_cuda_driver_version() -> dict[str, str]:
 
 
 def get_gpu_topology() -> str | None:
-    """Get GPU topology information."""
     if is_cuda_build():
         try:
             result = subprocess.run(
@@ -326,7 +316,6 @@ def get_hypervisor_vendor() -> str | None:
 
 
 def main() -> None:
-    """Check and print environment information."""
     env_info = OrderedDict()
     env_info["Python"] = sys.version.replace("\n", "")
     env_info.update(get_cuda_info())

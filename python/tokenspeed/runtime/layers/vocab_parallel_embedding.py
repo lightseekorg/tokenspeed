@@ -62,7 +62,6 @@ _FUSED_GATHER_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
-    """Unquantized method for embeddings."""
 
     def create_weights(
         self,
@@ -74,7 +73,7 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        """Create weights for embedding layer."""
+        del input_size, output_size
         weight = Parameter(
             torch.empty(
                 sum(output_partition_sizes),
@@ -108,7 +107,7 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
 
 
 def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
-    """Pad the vocab size to the given value."""
+    """Pad the vocab size up to a multiple of ``pad_to``."""
     return ((vocab_size + pad_to - 1) // pad_to) * pad_to
 
 
@@ -131,7 +130,6 @@ def vocab_range_from_global_vocab_size(
 
 @dataclass
 class VocabParallelEmbeddingShardIndices:
-    """Indices for a shard of a vocab parallel embedding."""
 
     padded_org_vocab_start_index: int
     padded_org_vocab_end_index: int
@@ -172,7 +170,6 @@ class VocabParallelEmbeddingShardIndices:
         return self.num_org_elements_padded + self.num_added_elements_padded
 
     def __post_init__(self):
-        # sanity checks
         assert self.padded_org_vocab_start_index <= self.padded_org_vocab_end_index
         assert self.padded_added_vocab_start_index <= self.padded_added_vocab_end_index
 
@@ -339,7 +336,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
-        # Divide the weight matrix along the vocaburaly dimension.
+        # Divide the weight matrix along the vocabulary dimension.
         self.num_added_embeddings = self.num_embeddings - self.org_vocab_size
         self.num_embeddings_per_partition = divide(
             self.num_embeddings_padded, self.tp_size
@@ -494,7 +491,6 @@ class VocabParallelEmbedding(torch.nn.Module):
             param.data.copy_(loaded_weight)
             return
 
-        # Shard indexes for loading the weight
         start_idx = self.shard_indices.org_vocab_start_index
         shard_size = self.shard_indices.org_vocab_end_index - start_idx
 
@@ -515,9 +511,11 @@ class VocabParallelEmbedding(torch.nn.Module):
             assert loaded_weight.shape[output_dim] == (
                 self.org_vocab_size
                 // (self.tp_size if self.use_presharded_weights else 1)
-            ), f"{self.org_vocab_size=} {self.use_presharded_weights=} {loaded_weight.shape[output_dim]=}"
+            ), (
+                f"{self.org_vocab_size=} {self.use_presharded_weights=} "
+                f"{loaded_weight.shape[output_dim]=}"
+            )
 
-        # Copy the data.
         if not self.use_presharded_weights:
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
@@ -618,7 +616,6 @@ class VocabParallelEmbedding(torch.nn.Module):
             # No shard mask here: clamp the out-of-range ids CUDA-graph capture warmup can feed.
             masked_input = input_.clamp(min=0, max=self.num_embeddings_padded - 1)
             return self.quant_method.embedding(self, masked_input)
-        # Build the mask.
         masked_input, input_mask = get_masked_input_and_mask(
             input_,
             self.shard_indices.org_vocab_start_index,
@@ -628,7 +625,6 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.shard_indices.added_vocab_end_index,
         )
         output_parallel = self.quant_method.embedding(self, masked_input)
-        # Mask the output embedding.
         output_mask = input_mask.unsqueeze(-1)
         if output_parallel.dtype in _FLOAT8_DTYPES:
             # CUDA does not implement masked_fill_ for FP8. PLE keeps its
@@ -708,7 +704,6 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.register_parameter("bias", None)
 
     def tie_weights(self, embed_tokens: VocabParallelEmbedding):
-        """Tie the weights with word embeddings."""
         self.weight = embed_tokens.weight
         return self
 

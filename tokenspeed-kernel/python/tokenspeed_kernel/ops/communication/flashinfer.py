@@ -40,11 +40,14 @@ def get_flashinfer_moe_alltoall(
     dtype: torch.dtype,
     weights_dtype: torch.dtype,
 ) -> FlashInferMoeAlltoAll | None:
-    """Create one workspace per model/group, or return None without a shared NVLink fabric.
+    """Creates one workspace per model and group.
+
+    Returns None when the group does not share an NVLink fabric.
 
     Args:
         group: Expert-parallel process group.
-        model_scope: Model identity; overlapping target/draft graphs require separate storage.
+        model_scope: Model identity; overlapping target/draft graphs require
+            separate storage.
         max_tokens: Maximum local token capacity, including prefill and verification.
         hidden_size: Width of routed activations and outputs.
         top_k: Number of selected experts per token.
@@ -53,7 +56,8 @@ def get_flashinfer_moe_alltoall(
         weights_dtype: Precomputed routing-weight dtype.
 
     Returns:
-        A shared transport for sequential layers of this model, or None for the AG/RS fallback.
+        A shared transport for sequential layers of this model, or None for the
+        AG/RS fallback.
     """
     ranks = tuple(torch.distributed.get_process_group_ranks(group))
     if not current_platform().is_nvidia or not group_has_fabric(ranks):

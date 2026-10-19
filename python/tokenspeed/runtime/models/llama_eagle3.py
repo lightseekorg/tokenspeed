@@ -65,11 +65,6 @@ from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Attention
-# ---------------------------------------------------------------------------
-
-
 def _draft_window_left(config: LlamaConfig) -> int:
     """``window_left`` of the draft layer from the labels its cache plan reads: -1 unless sliding."""
     layer_types = resolve_cache_layer_types(
@@ -115,11 +110,6 @@ class LlamaAttention(BaseLlamaAttention):
         return self.attn.attend_live_rows(q, k, v, positions, ctx)
 
 
-# ---------------------------------------------------------------------------
-# MLP
-# ---------------------------------------------------------------------------
-
-
 class LlamaMLP(nn.Module):
 
     def __init__(
@@ -131,7 +121,7 @@ class LlamaMLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-
+        del hidden_act
         super().__init__()
         tp_rank = mapping.dense.tp_rank
         tp_size = mapping.dense.tp_size
@@ -169,11 +159,6 @@ class LlamaMLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
-
-
-# ---------------------------------------------------------------------------
-# Decoder layer
-# ---------------------------------------------------------------------------
 
 
 class Eagle3DecoderLayer(BaseDecoderLayer):
@@ -297,7 +282,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
                 )
             hidden_states = fused_norm_out
 
-        # Attention
         hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
         hidden_states = self.self_attn(
             positions=positions,
@@ -375,7 +359,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             )
         hidden_states = fused_norm_out
 
-        # Attention
         hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
         hidden_states = self.self_attn(
             positions=positions,
@@ -389,7 +372,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
-        # MLP
         hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
         hidden_states = self.mlp(hidden_states)
         hidden_states, residual = self.comm_manager.post_mlp_comm(
@@ -397,11 +379,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         )
 
         return hidden_states, residual
-
-
-# ---------------------------------------------------------------------------
-# Model and CausalLM
-# ---------------------------------------------------------------------------
 
 
 class Eagle3LlamaModel(BaseTransformerModel):

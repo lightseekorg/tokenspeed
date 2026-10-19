@@ -121,7 +121,8 @@ def _test_swap_chain_safety(
             row = out[local_req * n + d]
             expected_first = global_req * 10_000 + d * 100
             assert int(row[0].item()) == expected_first, (
-                f"rank={rank} local_req={local_req} d={d} got row[0]={int(row[0].item())}"
+                f"rank={rank} local_req={local_req} d={d}"
+                f" got row[0]={int(row[0].item())}"
                 f" expected {expected_first}"
             )
             assert int(row[-1].item()) == expected_first + (vocab - 1)

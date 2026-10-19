@@ -858,7 +858,7 @@ def _npcache_weight_files(model_dir: str) -> tuple[tuple[str, str], ...] | None:
     names_file = os.path.join(model_dir, "np", "weight_names.json")
     if not os.path.isfile(names_file):
         return None
-    with open(names_file) as handle:
+    with open(names_file, encoding="utf-8") as handle:
         weight_names = json.load(handle)
     if not isinstance(weight_names, list):
         raise ValueError("np/weight_names.json must be a JSON list")

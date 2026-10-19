@@ -43,6 +43,11 @@ class Qwen3_5TextConfig(Qwen3_5BaseTextConfig):
 
 
 class Qwen3_5Config(PretrainedConfig):
+    """Dict sub-configs become config classes, also when reassigned later.
+
+    Unknown attributes are forwarded to the text config.
+    """
+
     model_type = "qwen3_5"
     sub_configs = {
         "vision_config": Qwen3_5VisionConfig,
@@ -75,7 +80,6 @@ class Qwen3_5Config(PretrainedConfig):
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
 
     def _ensure_text_config(self, text_config):
-        """Convert text_config to the proper config class if it's a dict."""
         text_cls = self.sub_configs["text_config"]
         if isinstance(text_config, dict):
             return text_cls(**text_config)
@@ -88,7 +92,6 @@ class Qwen3_5Config(PretrainedConfig):
         return text_config
 
     def _ensure_vision_config(self, vision_config):
-        """Convert vision_config to the proper config class if it's a dict."""
         vision_cls = self.sub_configs["vision_config"]
         if isinstance(vision_config, dict):
             return vision_cls(**vision_config)

@@ -264,7 +264,7 @@ def test_json_schema_wrap_follows_the_prompt(model, parser, options, accepted, r
 
 def test_json_schema_wrap_assumes_open_reasoning_without_marker_tokens():
     # "<think>" is several GPT-2 tokens, so the prompt ids cannot show where
-    # the block opens; the wrap assumes the prompt opened it, as before.
+    # the block opens; the wrap assumes the prompt opened it.
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     prompt_ids = tokenizer.encode("Q: capital of France?\nA: <think>\n")
 

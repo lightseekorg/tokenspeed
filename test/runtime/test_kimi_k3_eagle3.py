@@ -125,6 +125,4 @@ def test_eagle_aux_ids_resolve_from_k3_text_config_dict():
 
 
 if __name__ == "__main__":
-    import pytest
-
     raise SystemExit(pytest.main([__file__, "-q"]))

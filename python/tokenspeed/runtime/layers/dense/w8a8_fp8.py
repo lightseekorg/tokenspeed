@@ -72,18 +72,17 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
 
         if self.quantization_config.is_checkpoint_fp8_serialized:
             weight_scale = layer.weight_scale.detach()
-            # If checkpoint offline quantized with w8a8_fp8, load the weight and weight_scale directly.
+            # If the checkpoint was quantized offline with w8a8_fp8, load the
+            # weight and weight_scale directly.
             layer.weight = Parameter(weight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
         else:
-            # use per-channel quantization on weight
             qweight, weight_scale = quantize_fp8(
                 layer.weight,
                 granularity="token",
             )
             weight_scale = weight_scale.t().contiguous()
 
-            # Update the layer with the new values.
             layer.weight = Parameter(qweight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
             layer.input_scale = None
@@ -139,7 +138,6 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         weight = layer.weight
         weight_scale = layer.weight_scale
 
-        # View input as 2D matrix for fp8 methods
         input_2d = input.view(-1, input.shape[-1])
         output_shape = [*input.shape[:-1], weight.shape[1]]
 

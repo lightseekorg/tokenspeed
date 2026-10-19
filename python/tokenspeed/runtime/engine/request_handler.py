@@ -189,10 +189,7 @@ def _profile_rank_tag(attn_mapping) -> str:
 
 
 class RequestHandler:
-    """
-    1. Recv Reqs from ZMQ
-    2. manage sessions
-    """
+    """Receives requests from ZMQ and dispatches the control requests."""
 
     def __init__(
         self,
@@ -460,10 +457,6 @@ class RequestHandler:
         elif ready_internal is not None:
             self._complete_internal_op(ready_internal)
         return new_req_specs, req_states, bootstrap_infos, abort_rids
-
-    # ------------------------------------------------------------------
-    # Internal control ops (online expert rebalance)
-    # ------------------------------------------------------------------
 
     def set_internal_op_completer(self, completer: InternalOpCompleter) -> None:
         """Install the owner of the internal ops (once, at startup)."""
@@ -820,7 +813,8 @@ class RequestHandler:
             and recv_req.session_params.id is not None
         ):
             req_state.finished_reason = FINISH_ABORT(
-                f"Invalid request: session id {recv_req.session_params.id} does not exist"
+                f"Invalid request: session id {recv_req.session_params.id} "
+                "does not exist"
             )
             return (
                 req_spec,
@@ -1074,7 +1068,8 @@ class RequestHandler:
             self.viztracer = VizTracer(
                 output_file=os.path.join(
                     self.profiler_output_dir,
-                    f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.viztracer.json",
+                    f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}"
+                    ".viztracer.json",
                 ),
                 min_duration=int(
                     os.environ.get("TOKENSPEED_VIZTRACER_MIN_DURATION_US", "100")
@@ -1134,7 +1129,8 @@ class RequestHandler:
             self.torch_profiler.export_chrome_trace(
                 os.path.join(
                     self.profiler_output_dir,
-                    f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.trace.json.gz",
+                    f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}"
+                    ".trace.json.gz",
                 )
             )
             self._profile_sync()
@@ -1142,7 +1138,8 @@ class RequestHandler:
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
                 self.profiler_output_dir,
-                f"{self.profile_id}-{self.profile_rank_tag}-memory{stage_suffix}.pickle",
+                f"{self.profile_id}-{self.profile_rank_tag}-memory{stage_suffix}"
+                ".pickle",
             )
             torch.cuda.memory._dump_snapshot(memory_profile_path)
             torch.cuda.memory._record_memory_history(enabled=None)

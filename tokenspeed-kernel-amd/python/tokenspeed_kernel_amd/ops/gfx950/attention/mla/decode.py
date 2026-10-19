@@ -55,10 +55,6 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.mla.reduce_project_value import 
 # Scale before the FP8 cast to retain small probabilities; cancel at normalization.
 _FP8_PROBABILITY_SCALE = gl.constexpr(256.0)
 
-# ===-----------------------------------------------------------------------===#
-# Kernel Config
-# ===-----------------------------------------------------------------------===#
-
 
 @gluon.aggregate
 class AttentionConfig:
@@ -652,11 +648,6 @@ class AttentionConfig:
         self.blocked_lse = gl.constexpr(blocked_lse)
 
 
-# ===-----------------------------------------------------------------------===#
-# Kernel Program
-# ===-----------------------------------------------------------------------===#
-
-
 @gluon.aggregate
 class AttentionProgram:
     cfg: gl.constexpr
@@ -1051,11 +1042,6 @@ class AttentionProgram:
                 gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse)
 
 
-# ===-----------------------------------------------------------------------===#
-# Entry Point
-# ===-----------------------------------------------------------------------===#
-
-
 @gluon.jit
 def _mla_decode_gluon(
     Q_nope,
@@ -1168,7 +1154,6 @@ def _mla_decode_program(program, Mid_lse, Final_lse):
             dtype, shape=[cfg.BLOCK_H, cfg.HEAD_DIM_KPE], layout=cfg.shared_q_pe
         )
 
-    # load q_nope / q_pe
     program.issue_load_q_nope(buf_q_nope)
     program.issue_load_q_pe(buf_q_pe)
 
@@ -1186,7 +1171,6 @@ def _mla_decode_program(program, Mid_lse, Final_lse):
     split_kv_start = program.split_kv_start
     start_n = split_kv_start
 
-    # bufs of page_number
     bufs_page = gl.allocate_shared_memory(
         gl.int32, shape=[2, cfg.BLOCK_N], layout=cfg.shared_page
     )
@@ -1203,7 +1187,6 @@ def _mla_decode_program(program, Mid_lse, Final_lse):
     start_n += cfg.BLOCK_N
     program.issue_page_load(bufs_page.index(1), start_n)
 
-    # local load Q
     gl.amd.cdna4.async_copy.wait_group(2)
     q_nope, q_pe = program.local_load_q(buf_q_nope, buf_q_pe)
 
@@ -1291,7 +1274,6 @@ def _mla_decode_program(program, Mid_lse, Final_lse):
     )
 
     buf_idx = 0
-    # main loop
     for i in range(num_iter - 2):
         async_idx = (buf_idx + 1) % 2
 
@@ -2940,7 +2922,8 @@ def launch_gluon_mla_decode_fp8_query_blocks_gfx950(
     if cache_seqlens.shape != (batch,) or not cache_seqlens.is_contiguous():
         raise ValueError(
             "query-block MLA requires one contiguous cache length per request, "
-            f"got shape {tuple(cache_seqlens.shape)} and strides {cache_seqlens.stride()}"
+            f"got shape {tuple(cache_seqlens.shape)} "
+            f"and strides {cache_seqlens.stride()}"
         )
     if page_table.dtype != torch.int32 or cache_seqlens.dtype != torch.int32:
         raise ValueError(

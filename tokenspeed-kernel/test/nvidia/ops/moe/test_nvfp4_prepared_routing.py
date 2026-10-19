@@ -142,7 +142,10 @@ def _bytes(
 
 
 def _weights(generator: torch.Generator) -> SimpleNamespace:
-    """Random NVFP4 expert weights in the kernel's shuffled layouts; scales stay small and finite."""
+    """Random NVFP4 expert weights in the kernel's shuffled layouts.
+
+    Scales stay small and finite.
+    """
     ones = torch.ones(LOCAL, device="cuda")
     return SimpleNamespace(
         _spec=SimpleNamespace(
@@ -221,11 +224,15 @@ def _apply(w, x_quantized, weights, ids, enable_pdl, prepared, do_finalize=False
 
 
 def _rows(result, tokens: int) -> torch.Tensor:
-    """Every local route's GEMM2 row in (token, route) order; zeros where another rank owns the route."""
+    """Every local route's GEMM2 row in (token, route) order.
+
+    Zeros where another rank owns the route.
+    """
     gemm2_out, _, permute_map = result
     permute_map = permute_map.view(tokens, TOPK).long()
     rows = gemm2_out[permute_map.clamp_min(0)]
-    # where, not a mask multiply: a remote route's row is uninitialized and a NaN there would survive.
+    # where, not a mask multiply: a remote route's row is uninitialized and a
+    # NaN there would survive.
     return torch.where((permute_map >= 0).unsqueeze(-1), rows, torch.zeros_like(rows))
 
 

@@ -178,7 +178,7 @@ def plan_history_gather(
             f"owned rows sum to {sum(counts)} but the history has "
             f"{virtual_slots.numel()} rows"
         )
-    local_slots, _owned = resolve_cache_slots(virtual_slots, placement)
+    local_slots, _ = resolve_cache_slots(virtual_slots, placement)
     owner = cyclic_slot_owner(virtual_slots, placement)
     order = torch.argsort(owner, stable=True)
     return HistoryGatherPlan(

@@ -24,15 +24,15 @@ Importing this family registers its Triton, AMD Gluon, and optional native
 solutions.
 
 Standalone packed rows place value bytes before scales (even FP4 element in
-low nibble). Formats: global = 512D E2M1/E4M3 groups of16, 288 bytes;
-index = 128D E2M1/E8M0 groups of32, 68 bytes; SWA = 512D E4M3/E8M0
- groups of32, 528 bytes -- the entire post-RoPE vector is quantized. The
+low nibble). Formats: global = 512D E2M1/E4M3 groups of 16, 288 bytes;
+index = 128D E2M1/E8M0 groups of 32, 68 bytes; SWA = 512D E4M3/E8M0
+groups of 32, 528 bytes -- the entire post-RoPE vector is quantized. The
 swa_v4/global_v4 rows are the same 512D content in FlashMLA's V4 layout: a
 576-byte data row of 448 E4M3 NoPE bytes then the 64 RoPE dims left as BF16,
-and an 8-byte scale row of E8M0 per64 with a pad byte. They exist for targets
+and an 8-byte scale row of E8M0 per 64 with a pad byte. They exist for targets
 whose FlashMLA reads V4 only.
 
-Paged fields use page-planar storage: all64 value rows, then all64 scale rows.
+Paged fields use page-planar storage: all 64 value rows, then all 64 scale rows.
 Their uint8 [pages,64,row_bytes] shape describes storage, not decoded row axes.
 Portable codecs honor every byte stride; native kernels require contiguous
 page bytes and aligned page strides. Physical slots address a particular field;
@@ -596,15 +596,16 @@ def index_topk(
         Empty history has zero lengths. Equal-score boundary ties may select
         any equivalent subset; no cross-chunk/TP bitwise tie guarantee.
 
-    The portable Full implementation uses16 fixed partitions bounded by device-visible
-    lengths, not table capacity; Reindex scores at most 2048*8 candidate rows.
+    The portable Full implementation uses 16 fixed partitions bounded by
+    device-visible lengths, not table capacity; Reindex scores at most 2048*8
+    candidate rows.
     Graph replay recomputes those loop bounds without host synchronization.
     Each partition keeps exact row/block TopK, merged once across partitions.
     Scratch is O(query_chunk_size * 16 * (rounded_topk + rounded_candidate_topk))
     plus gathered Q/weights, independent of configured or visible history.
-    FP32 scores and int64 IDs use12 bytes per partial entry; capacities round
-    to powers of two and at least the score tile width (at most256 lanes).
-    With replicated32 heads and compatible Blackwell pages, optional DeepGEMM
+    FP32 scores and int64 IDs use 12 bytes per partial entry; capacities round
+    to powers of two and at least the score tile width (at most 256 lanes).
+    With replicated 32 heads and compatible Blackwell pages, optional DeepGEMM
     scores packed FP4 inputs with FP32 accumulation and DeepSelect selects rows
     and block maxima; on Hopper, DeepGEMM scores FP8 ``index_v4`` rows and the
     in-tree CuTe DSL DeepSelect kernel selects. This native accumulation
@@ -759,7 +760,8 @@ def rope_inplace(
         values: BF16/FP16 [tokens,dim] or [tokens,heads,dim]. Writable views must
             not overlap; noncontiguous outer strides are supported. Expanded
             zero-stride rows/heads with more than one element are rejected.
-        positions: Int32/int64 token positions; negative padding positions use row0.
+        positions: Int32/int64 token positions; negative padding positions use
+            row 0.
         cos_sin_cache: FP32 [max_positions,rotary_dim], cosine then sine halves.
             Caller supplies forward or inverse sine signs. Positive out-of-range
             positions assert on device before invalid table reads.
@@ -797,12 +799,13 @@ def rope_pad_query(
 
     Args:
         values: BF16/FP16 [tokens,real_heads,512], 1..128 heads, strided rows/heads.
-        positions: Int32/int64 [tokens], with negative padding positions mapped to0.
+        positions: Int32/int64 [tokens], with negative padding positions
+            mapped to 0.
         cos_sin_cache: FP32 cosine/sine table for the interleaved head tail.
         solution: Optional registered implementation restriction.
 
     Returns:
-        Fresh contiguous [tokens,64 or128,512] queries. Every padded head is zero;
+        Fresh contiguous [tokens,64 or 128,512] queries. Every padded head is zero;
         input storage is unchanged. This is forward/graph-owned scratch, never
         persistent KV or a request-indexed state buffer.
     """

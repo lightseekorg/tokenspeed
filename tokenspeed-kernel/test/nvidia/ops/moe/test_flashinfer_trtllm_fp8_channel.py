@@ -420,10 +420,6 @@ def test_hopper_keeps_the_triton_kernel(h100_platform):
         _plan_on(h100_platform, solution="flashinfer_trtllm")
 
 
-# ---------------------------------------------------------------------------
-# GPU: the kernel against the FP64 emulation.
-# ---------------------------------------------------------------------------
-
 requires_sm100 = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),

@@ -13,10 +13,7 @@ from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed.runtime.layers.attention import backends
 from tokenspeed.runtime.layers.attention.backends.paged import ascend_dsa
 from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
-from tokenspeed.runtime.layers.attention.dcp.placement import (
-    CachePlacement,
-    resolve_cache_slots,
-)
+from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
 
 

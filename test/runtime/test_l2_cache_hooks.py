@@ -168,7 +168,7 @@ def _install_collectives(
 
 
 def test_collective_doubles_require_op_and_group() -> None:
-    tree = ast.parse(Path(__file__).read_text())
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
     found_reduce = False
     found_gather = False
     for node in ast.walk(tree):
@@ -567,10 +567,6 @@ def test_replica_backup_failure_raises_after_poll_all_reduce(
     assert gather_groups == []
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
-
-
 class _GridGroup:
     """A CPU group of the simulated grid: a barrier-backed rendezvous whose
     collectives time out (and fail the test) if any member skips them."""
@@ -680,3 +676,7 @@ def test_tp_pp_grid_counts_stay_equal_and_all_ranks_stop_polling_together(
     assert open_counts[0][5:] == [0] * (num_rounds - 5)
     # The last ticket closed in round 5; rounds 6-8 entered no collective anywhere.
     assert collectives == collectives_at_close
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

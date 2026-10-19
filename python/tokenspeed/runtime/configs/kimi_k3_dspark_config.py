@@ -219,7 +219,8 @@ def validate_k3_dspark_config(config: KimiK3DSparkConfig, target_config=None) ->
         )
     if len(set(config.target_layer_ids)) != len(config.target_layer_ids):
         raise ValueError(
-            f"K3 DSpark target_layer_ids must be distinct; got {config.target_layer_ids}."
+            "K3 DSpark target_layer_ids must be distinct; got "
+            f"{config.target_layer_ids}."
         )
     max_tap = max(config.target_layer_ids)
     if max_tap >= config.target_num_hidden_layers:

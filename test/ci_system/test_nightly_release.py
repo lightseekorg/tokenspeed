@@ -88,7 +88,10 @@ def test_tokenspeed_index_preserves_kernel_and_history(tmp_path, variant):
     dist.mkdir(parents=True)
     name = "tokenspeed-0.1.0.post20260930-py3-none-any.whl"
     (dist / name).write_bytes(b"wheel")
-    url = f"https://github.com/lightseekorg/whl/releases/download/tokenspeed-nightly-v0.1.0.post20260930/{name}"
+    url = (
+        "https://github.com/lightseekorg/whl/releases/download/"
+        f"tokenspeed-nightly-v0.1.0.post20260930/{name}"
+    )
     release = {
         "assets": [
             {"name": name, "browser_download_url": url, "digest": f"sha256:{'a' * 64}"}

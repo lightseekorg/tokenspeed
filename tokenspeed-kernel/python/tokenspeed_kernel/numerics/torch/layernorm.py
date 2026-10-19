@@ -21,7 +21,7 @@
 """PyTorch references for ``tokenspeed_kernel.ops.layernorm``.
 
 Each reference takes the arguments its operator's dispatcher passes to the
-registered kernels, does the math in FP32, and rounds once on output.
+registered kernels and does the math in FP32.
 """
 
 from __future__ import annotations

@@ -40,7 +40,11 @@ def resolve_group_slot(
     first_page,
     page_count,
 ):
-    """The shared raw-position -> group-slot mapping, with explicit bounds."""
+    """The shared raw-position -> group-slot mapping, with explicit bounds.
+
+    Returns -1 for negative positions, out-of-range requests or columns, and
+    table entries outside ``[first_page, page_count)``.
+    """
     logical = position // STRIDE
     column = logical // ROWS
     valid = (

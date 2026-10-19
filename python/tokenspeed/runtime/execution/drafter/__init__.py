@@ -229,7 +229,7 @@ def get_drafter_impl(
         InklingForConditionalGenerationNextN,
     )
 
-    DRAFTER_MAPPING = {
+    drafter_mapping = {
         "EAGLE3": Eagle,
         "MTP": Eagle,
         "DFLASH": DFlash,
@@ -244,9 +244,6 @@ def get_drafter_impl(
         if isinstance(model, DFlash2DraftModel):
             return DFlash2
 
-    # "MTP" covers two algorithms:
-    # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
-    # (2) Vanilla MTP (e.g. Inkling) with multi-layer weights stays on Mtp in mtp.py.
     if spec_algo == "DSPARK":
         from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
             DeepseekV41DSpark,
@@ -257,8 +254,11 @@ def get_drafter_impl(
 
         if isinstance(model, DeepseekV41ForCausalLMDSpark):
             return DeepseekV41DSpark
+    # "MTP" covers two algorithms:
+    # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
+    # (2) Vanilla MTP (e.g. Inkling) with multi-layer weights stays on Mtp in mtp.py.
     if spec_algo == "MTP" and isinstance(model, InklingForConditionalGenerationNextN):
         from tokenspeed.runtime.execution.drafter.mtp import Mtp
 
         return Mtp
-    return DRAFTER_MAPPING[spec_algo]
+    return drafter_mapping[spec_algo]

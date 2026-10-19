@@ -90,10 +90,6 @@ class MultimodalRuntime:
         except RuntimeError:
             return torch.zeros(size, dtype=torch.int64)
 
-    # ------------------------------------------------------------------
-    # M-RoPE position overrides
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _mrope_delta_scalar(mm_input) -> int:
         """Read the request's decode position delta.
@@ -230,7 +226,8 @@ class MultimodalRuntime:
                     # reaches past it (nothing re-prefills generated tokens).
                     raise RuntimeError(
                         "M-RoPE positions table has no rows for prefill chunk "
-                        f"[{start}, {end}) of request {forward_op.request_ids[batch_idx]}"
+                        f"[{start}, {end}) of request "
+                        f"{forward_op.request_ids[batch_idx]}"
                     )
                 mrope_chunks.append(positions.to(device=self.device, dtype=torch.int64))
                 continue
@@ -247,10 +244,6 @@ class MultimodalRuntime:
         mrope_positions = torch.cat(mrope_chunks, dim=1).contiguous()
         self.input_buffers.mrope_positions_buf[:, :total_tokens].copy_(mrope_positions)
         return self.input_buffers.mrope_positions_buf[:, :total_tokens]
-
-    # ------------------------------------------------------------------
-    # One-time wiring
-    # ------------------------------------------------------------------
 
     @staticmethod
     def install_encoder_graphs(model, server_args) -> dict:
@@ -303,10 +296,6 @@ class MultimodalRuntime:
                 "Speculative decoding on a multimodal target requires draft "
                 "substitute tokens, but none could be resolved from the HF config."
             )
-
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
 
     @staticmethod
     def timing_counts(multimodal_context) -> tuple[bool, int, int]:

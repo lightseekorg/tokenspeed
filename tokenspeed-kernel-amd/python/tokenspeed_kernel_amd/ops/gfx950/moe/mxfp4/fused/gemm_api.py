@@ -562,6 +562,13 @@ def gluon_mxfp_ragged_matmul(
     n_expts_act=None,
     **extra_kwargs,
 ) -> torch.Tensor | None:
+    """Route a ragged MXFP4 matmul to the dispatch or combine GEMM.
+
+    A call with ``scatter_indx`` and no ``gather_indx`` runs
+    :func:`gluon_mxfp_combine`; a call without ``scatter_indx`` and with a
+    SwiGLU ``fused_activation`` runs :func:`gluon_mxfp_dispatch_swiglu`.
+    Returns ``None`` when no supported route matches.
+    """
     assert w_mx_scale is not None
 
     if x_format == "e4m3":
@@ -637,7 +644,6 @@ def gluon_mxfp_ragged_matmul(
     }
 
     if has_scatter and not has_gather:
-        # gemm + combine
         w_preshuffle = bool(getattr(w_raw, "is_shuffled_for_gluon_dot", False))
         out = gluon_mxfp_combine(
             x_view,

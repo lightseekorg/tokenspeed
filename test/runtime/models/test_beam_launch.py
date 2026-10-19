@@ -86,7 +86,6 @@ def platform():
     Platform.override(original)
 
 
-# ---------------------------------------------------------------- config
 def test_the_config_round_trips(tmp_path):
     config = tiny_config()
     raw = config.to_dict()
@@ -147,7 +146,6 @@ def test_an_override_cannot_set_a_field_beam_fixes():
     assert config.to_dict() == raw
 
 
-# ---------------------------------------------------------------- KV cache layout
 # Beam's released stack: a full-attention layer after every five sliding
 # layers, plus a final full layer (43 sliding + 9 full).
 _FULL_LAYERS = {5, 11, 17, 23, 29, 35, 41, 47, 51}
@@ -252,7 +250,6 @@ def test_a_page_holds_only_the_layers_its_group_keeps(draft_layers, layer_slots)
     assert budget - plan.arena_bytes < 2 * plan.lcm_block_bytes
 
 
-# ---------------------------------------------------------------- backend defaults
 ATTENTION_APPLIED = "Beam default attention_backend=trtllm; pass --attention-backend"
 ATTENTION_NOT_APPLIED = (
     "Beam default attention_backend=trtllm not applied, left unset: "
@@ -457,7 +454,6 @@ def test_other_models_and_the_drafter_are_not_asked(checkpoints, caplog, sm100):
     assert _lines(caplog, "attention") == _lines(caplog, "moe") == []
 
 
-# ---------------------------------------------------------------- TF32
 TF32_KEYS = ("NVIDIA_TF32_OVERRIDE", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE")
 
 
@@ -553,7 +549,6 @@ def test_a_beam_checkpoint_in_the_hugging_face_cache(
     assert not args.disable_tf32 and args._beam_checkpoint is None
 
 
-# ---------------------------------------------------------------- all-reduce fusion
 def _fusion_launch(path, nnodes, **overrides):
     return _server_args(
         path,
@@ -649,7 +644,6 @@ def test_a_first_launch_from_a_hub_id_resolves_as_from_the_directory(
     )
 
 
-# ---------------------------------------------------------------- tokenizer
 def test_the_registered_tokenizer_loads_local_canonical_metadata(tmp_path):
     from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
 
@@ -663,7 +657,6 @@ def test_the_registered_tokenizer_loads_local_canonical_metadata(tmp_path):
     assert tokenizer.encode("t4 t5", add_special_tokens=False) == [4, 5]
 
 
-# ---------------------------------------------------------------- DFlash2 drafter
 def _drafter_config():
     """Beam's drafter config (RoPE, window, block) on one small layer."""
     return Qwen3Config(

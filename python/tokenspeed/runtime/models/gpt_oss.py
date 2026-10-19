@@ -133,7 +133,7 @@ class GptOssAttention(nn.Module):
         layer_type: str = "",
         params_dtype: torch.dtype = torch.bfloat16,
     ) -> None:
-
+        del config, rms_norm_eps
         super().__init__()
         self.mapping = mapping
         self.hidden_size = hidden_size
@@ -266,7 +266,7 @@ class GptOssSparseMoeBlock(nn.Module):
         layer_index: int = -1,
         prefix: str = "",
     ):
-
+        del intermediate_size, params_dtype
         super().__init__()
         self.mapping = mapping
         self.layer_index = layer_index
@@ -586,8 +586,6 @@ class GptOssForCausalLM(BaseCausalLM):
         ]
 
         params_dict = dict(self.named_parameters())
-        # MoE expert weights, scales, and activation scales are handled
-        # by the checkpoint loader.
         moe_loader = build_moe_checkpoint_loader(
             params_dict=params_dict,
             fused_schema=ExpertCheckpointSchema(
@@ -669,7 +667,7 @@ class GptOssForCausalLM(BaseCausalLM):
                 not_loaded_params.append(k)
 
         if rank == 0:
-            if len(not_loaded_params) > 0:
+            if not_loaded_params:
                 raise RuntimeError(f"Not all parameters loaded: {not_loaded_params=}")
             else:
                 logger.info("All parameters loaded successfully.")
@@ -840,7 +838,9 @@ class GptOssForCausalLM(BaseCausalLM):
         loaded_params: set = set()
 
         per_expert_re = re.compile(
-            r"^(?P<base>.*\.experts\.)(?P<expert>\d+)\.(?P<proj>gate_up_proj|down_proj)\.(?P<kind>weight_scale|weight|bias|input_scale)$"
+            r"^(?P<base>.*\.experts\.)(?P<expert>\d+)\."
+            r"(?P<proj>gate_up_proj|down_proj)\."
+            r"(?P<kind>weight_scale|weight|bias|input_scale)$"
         )
 
         for name, weight in weights:

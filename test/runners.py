@@ -43,11 +43,9 @@ DEFAULT_PROMPTS = [
     "The capital of the United Kingdom is",
     "Today is a sunny day and I like",
     "AI is a field of computer science focused on",
-    # the output of gemma-2-2b from SRT is unstable on the commented prompt
-    # "The capital of France is",
 ]
 dirpath = os.path.dirname(__file__)
-with open(os.path.join(dirpath, "long_prompt.txt"), "r") as f:
+with open(os.path.join(dirpath, "long_prompt.txt"), "r", encoding="utf-8") as f:
     long_prompt = f.read()
 DEFAULT_PROMPTS.append(long_prompt)
 
@@ -125,15 +123,15 @@ class HFRunner:
         tp_size: int = 1,
         max_model_len: Optional[int] = None,
     ):
-        # Apply model-specific patches
+        del matryoshka_dim
         monkey_patch_gemma2_sdpa()
 
-        # Disable async tensor loading to avoid CUDA illegal memory access in spawned subprocess.
-        # Transformers uses a ThreadPoolExecutor to load weights in parallel, which is not safe
-        # when CUDA is used from multiple threads in a subprocess started with "spawn".
+        # Disable async tensor loading to avoid CUDA illegal memory access in
+        # spawned subprocess. Transformers uses a ThreadPoolExecutor to load
+        # weights in parallel, which is not safe when CUDA is used from
+        # multiple threads in a subprocess started with "spawn".
         os.environ["HF_DEACTIVATE_ASYNC_LOAD"] = "1"
 
-        # Load the model and tokenizer
         if self.model_type == "generation":
             config = AutoConfig.from_pretrained(
                 model_path, trust_remote_code=self.trust_remote_code
@@ -174,11 +172,8 @@ class HFRunner:
             model_max_length=self.max_model_len,
         )
 
-        # Run forward
         while True:
-            prompts, image_data, max_new_tokens, lora_paths, token_ids_logprob = (
-                in_queue.get()
-            )
+            prompts, _, max_new_tokens, lora_paths, token_ids_logprob = in_queue.get()
             if lora_paths is not None:
                 assert len(prompts) == len(lora_paths)
 
@@ -252,6 +247,7 @@ class HFRunner:
         patch_model_do_sample_false: Optional[bool] = False,
         max_model_len: Optional[int] = None,
     ) -> ModelOutput:
+        del token_ids_logprob
         output_strs = []
         # Per-prompt list of (logprob, token_id) for each greedily generated
         # token; this is the sampled-token logprob reference.
@@ -259,7 +255,6 @@ class HFRunner:
 
         for i, p in enumerate(prompts):
             if isinstance(p, str):
-                # Apply max_model_len truncation if specified
                 if max_model_len is not None:
                     input_ids = tokenizer.encode(
                         p,
@@ -273,7 +268,6 @@ class HFRunner:
                     )
             else:
                 input_ids = torch.tensor([p], device=get_device())
-                # Apply max_model_len truncation for tensor input
                 if max_model_len is not None and input_ids.shape[1] > max_model_len:
                     input_ids = input_ids[:, :max_model_len]
 
@@ -300,7 +294,6 @@ class HFRunner:
                     max_new_tokens=max_new_tokens,
                     return_dict_in_generate=True,
                     output_scores=(not output_str_only),
-                    # make sure to disable compile
                     disable_compile=True,
                 ),
             )
@@ -309,10 +302,10 @@ class HFRunner:
                 outputs[0][0][len(input_ids[0]) :], skip_special_tokens=True
             )
 
-            # Check if the text is empty or only whitespace.
             if not text.strip():
                 raise ValueError(
-                    "Received an empty text response. Please verify your input or model configuration."
+                    "Received an empty text response. Please verify your input or "
+                    "model configuration."
                 )
             output_strs.append(text)
 
@@ -330,7 +323,6 @@ class HFRunner:
                 del outputs
 
             if lora_paths is not None and lora_paths[i] is not None:
-                # Unload the LoRA adapter if it is used
                 model.unload()
 
         return ModelOutput(
@@ -340,7 +332,7 @@ class HFRunner:
 
 
 class RTRunner:
-    _port_counter = 0  # Class-level port counter
+    _port_counter = 0
 
     def __init__(
         self,
@@ -373,7 +365,6 @@ class RTRunner:
         disable_kvstore: bool = True,
         **kwargs,
     ):
-        # Auto-assign port if not specified
         if port is None:
             port = DEFAULT_PORT_FOR_SRT_TEST_RUNNER + RTRunner._port_counter
             RTRunner._port_counter += 1
@@ -493,6 +484,7 @@ class RTRunner:
         top_k: Optional[int] = None,
         token_ids_logprob: Optional[List[int]] = None,
     ):
+        del lora_paths, logprob_start_len, token_ids_logprob
         # Output logprobs only: request the sampled token's logprob at each
         # output position via SamplingParams.logprobs=0. Prompt/top-k/token-id
         # logprobs are not supported, so their ModelOutput fields stay None.
@@ -510,17 +502,17 @@ class RTRunner:
         if top_k:
             sampling_params["top_k"] = top_k
 
-        for i, prompt in enumerate(prompts):
+        for _, prompt in enumerate(prompts):
             response = engine.generate(
                 prompt,
                 sampling_params=sampling_params,
             )
             text = response["text"]
 
-            # Check if the text is empty or only whitespace.
             if not text.strip():
                 raise ValueError(
-                    "Received an empty text response. Please verify your input or model configuration."
+                    "Received an empty text response. Please verify your input or "
+                    "model configuration."
                 )
             output_strs.append(text)
             output_ids.append(response["output_ids"])
@@ -546,7 +538,6 @@ class RTRunner:
         max_new_tokens,
         engine,
     ):
-        # the return value contains logprobs from prefill
         output_strs = []
         sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
         response = engine.generate(
@@ -585,7 +576,7 @@ def check_close_model_outputs(
     check_logprobs: bool = True,
     extra_references: Optional[List[List[str]]] = None,
 ):
-    # Compare output strings
+    del prefill_tolerance
     print(f"{hf_outputs.output_strs=}")
     print(f"{rt_outputs.output_strs=}")
     base_scores = calculate_rouge_l(hf_outputs.output_strs, rt_outputs.output_strs)

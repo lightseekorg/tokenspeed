@@ -184,7 +184,7 @@ def _resolve_head_ipv4(host: str, node_rank: int, env: dict[str, str]) -> str:
 
 def _ephemeral_port_range() -> tuple[int, int] | None:
     try:
-        with open(_EPHEMERAL_RANGE_PATH) as handle:
+        with open(_EPHEMERAL_RANGE_PATH, encoding="utf-8") as handle:
             low, high = handle.read().split()[:2]
         return int(low), int(high)
     except (OSError, ValueError):
@@ -265,7 +265,8 @@ def detect_topology(env: dict[str, str] | None = None) -> LauncherTopology | Non
     node_rank = _require_int(env, SLURM_NODEID)
     if not 0 <= node_rank < nnodes:
         raise ValueError(
-            f"{SLURM_NODEID}={node_rank} is out of range for {SLURM_STEP_NUM_NODES}={nnodes}"
+            f"{SLURM_NODEID}={node_rank} is out of range for "
+            f"{SLURM_STEP_NUM_NODES}={nnodes}"
         )
 
     nodelist = env.get(SLURM_STEP_NODELIST)

@@ -43,7 +43,8 @@ SWA = "sliding_attention"
 
 class TestWindowWriteLocationsTest:
     def test_window_writes_its_slots_from_its_start(self):
-        # Pages [3, 5, 0] (P=4): windows inside, across, over the hole, past the table and at the int32 limit.
+        # Pages [3, 5, 0] (P=4): windows inside, across, over the hole, past
+        # the table and at the int32 limit.
         tables = torch.tensor([3, 5, 0], dtype=torch.int32).expand(2, 5, 3).contiguous()
         page_sizes = torch.tensor([4, 4], dtype=torch.int32)
         starts = torch.tensor([0, 2, 6, 10, 2**31 - 2], dtype=torch.int32)
@@ -215,8 +216,7 @@ class TestMtpReanchorTest:
 
 
 class TestBaseWriteLocationsDefaultTest:
-    """A backend that owns no paged write locations must refuse the accessor
-    loudly — there is no caller-supplied fallback vector anymore."""
+    """A backend that owns no paged write locations must refuse the accessor."""
 
     def test_default_write_locations_raises(self):
         from tokenspeed.runtime.layers.attention.backends.base import (
@@ -226,7 +226,7 @@ class TestBaseWriteLocationsDefaultTest:
         class _MinimalBackend(AttentionBackend):
             pass
 
-        backend = _MinimalBackend.__new__(_MinimalBackend)  # skip __init__
+        backend = _MinimalBackend.__new__(_MinimalBackend)
         with pytest.raises((NotImplementedError), match=("write locations")):
             backend.write_locations(
                 SimpleNamespace(group_id="full_attention"), ForwardMode.DECODE

@@ -705,8 +705,7 @@ class EmbeddingReceiveJob:
         — and the broadcasts run through the device-work runner, i.e. on the
         forward thread, the same single thread that issues the model's
         collectives, which is what keeps the cross-rank launch order identical
-        across communicators (NCCL's requirement). Before the forward-thread
-        split this had to lean on the NON-overlap loop instead.
+        across communicators (NCCL's requirement).
 
         ``group_ranks`` is the attn-TP group as GLOBAL ranks
         (``mapping.attn.tp_group``): ``dist.broadcast`` takes a global src rank,
@@ -983,11 +982,8 @@ class EpdPrefillAdmission:
         )
 
         # EPD embedding row-sharding: each attn-TP rank receives only 1/N of every
-        # image's rows over the wire; the full embedding is rebuilt by an NCCL
-        # all-gather in drain() (job.reassemble), which runs on the prefill's
-        # NON-overlap loop so the drain and the forward launch from one thread in
-        # the same order on every rank -- the cross-rank launch-order consistency
-        # NCCL requires across communicators.
+        # image's rows over the wire; drain() rebuilds the full embedding with
+        # per-image NCCL broadcasts (job.reassemble).
         self._shard_embeddings = False
         self._nccl_group = None
         self._group_ranks = tuple(attn_tp_group)
@@ -1069,13 +1065,13 @@ class EpdPrefillAdmission:
         # all-reduce: a timed-out job -> code 0 -> all ranks abort it together;
         # union-of-timeout is rank-safe even if ranks cross the deadline a cycle
         # apart (any rank's 0 propagates via MIN).
-        _now = time.time()
-        for _i in range(len(self._pending)):
-            if codes[_i] == 1 and (_now - self._pending[_i][2]) > self._embed_timeout:
-                codes[_i] = 0
+        now = time.time()
+        for i in range(len(self._pending)):
+            if codes[i] == 1 and (now - self._pending[i][2]) > self._embed_timeout:
+                codes[i] = 0
                 logger.warning(
                     f"EPD embedding receive timed out after {self._embed_timeout:.0f}s "
-                    f"for rid={self._pending[_i][0]!s}; aborting",
+                    f"for rid={self._pending[i][0]!s}; aborting",
                 )
 
         if self._attn_tp_size > 1:

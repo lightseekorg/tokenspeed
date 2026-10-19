@@ -306,11 +306,13 @@ def rmsnorm(
         return (x if out is None else out), residual
     if x.shape[-1] != weight.shape[0]:
         raise ValueError(
-            f"weight shape {tuple(weight.shape)} does not match hidden size {x.shape[-1]}"
+            f"weight shape {tuple(weight.shape)} does not match hidden size "
+            f"{x.shape[-1]}"
         )
     if residual is not None and residual.shape != x.shape:
         raise ValueError(
-            f"residual shape {tuple(residual.shape)} does not match input shape {tuple(x.shape)}"
+            f"residual shape {tuple(residual.shape)} does not match input shape "
+            f"{tuple(x.shape)}"
         )
 
     # Without a residual the kernel reads strided rows (e.g. a column slice of
@@ -782,7 +784,8 @@ def _fused_qk_rmsnorm_kernel(
         )
         w_addrs = q_weight_ptr + offsets
 
-    # Weights are parameters nothing in the decode graph writes; safe to load before the PDL wait.
+    # Weights are parameters nothing in the decode graph writes; safe to load
+    # before the PDL wait.
     w = tl.load(w_addrs, mask=mask, other=0.0).to(tl.float32)
     # Adding +0.0 would turn a -0.0 weight into +0.0.
     if WEIGHT_OFFSET != 0.0:
@@ -1112,7 +1115,8 @@ def _rcp_approx_ftz(x):
 
 @triton.jit
 def _mul_ftz(a, b):
-    # fp4_quantize is built with fast math: its products flush subnormal inputs and results to zero.
+    # fp4_quantize is built with fast math: its products flush subnormal inputs
+    # and results to zero.
     return tl.inline_asm_elementwise(
         "mul.ftz.f32 $0, $1, $2;",
         "=f,f,f",
@@ -1150,7 +1154,8 @@ def _store_nvfp4(
     BLOCK,
     K_TILES,
 ):
-    # fp4_quantize's E4M3-scale recipe, bit for bit: block amax / 6 scaled into E4M3, values into E2M1.
+    # fp4_quantize's E4M3-scale recipe, bit for bit: block amax / 6 scaled into
+    # E4M3, values into E2M1.
     blocks = tl.reshape(normed, [BLOCK // 16, 16])
     vec_max = tl.max(tl.abs(blocks), axis=1).to(tl.float32)
     # Its zero test flushes too: a subnormal block amax counts as zero.
@@ -1209,7 +1214,8 @@ def _add_rmsnorm_kernel(
     K_TILES: tl.constexpr = n_cols // 64
     if HAS_FP4:
         if row >= n_rows:
-            # Rows past the batch in the last 128-row scale tile get zero scales, as fp4_quantize writes them.
+            # Rows past the batch in the last 128-row scale tile get zero
+            # scales, as fp4_quantize writes them.
             if ENABLE_PDL:
                 tl.extra.cuda.gdc_wait()
             for c in tl.static_range(CHUNKS):
@@ -1295,12 +1301,14 @@ def _add_rmsnorm_kernel(
 
 
 def _row_block(cols: int) -> int:
-    # Whole power-of-two chunks spare the masked lanes of one rounded-up block (5120 = 5 x 1024).
+    # Whole power-of-two chunks spare the masked lanes of one rounded-up block
+    # (5120 = 5 x 1024).
     chunk = cols & -cols
     return chunk if chunk >= 1024 else triton.next_power_of_2(cols)
 
 
-# fp4_quantize switches its recipe when one of these is exactly "1" at launch; the NVFP4 copy follows the default.
+# fp4_quantize switches its recipe when one of these is exactly "1" at launch;
+# the NVFP4 copy follows the default.
 _FP4_RECIPE_ENV = (
     "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
     "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
@@ -1309,7 +1317,8 @@ _FP4_RECIPE_ENV = (
 
 
 def _nvfp4_copy_possible(n_cols: int) -> bool:
-    # Blackwell's E2M1 conversions, and a row the NVFP4 stores, which are unmasked, cover in whole chunks.
+    # Blackwell's E2M1 conversions, and a row the NVFP4 stores, which are
+    # unmasked, cover in whole chunks.
     return (
         current_platform().is_blackwell
         and n_cols % 64 == 0
@@ -1318,7 +1327,7 @@ def _nvfp4_copy_possible(n_cols: int) -> bool:
 
 
 def nvfp4_copy_supported(n_cols: int) -> bool:
-    """Whether ``add_rmsnorm``'s NVFP4 copy of ``n_cols``-wide rows equals ``fp4_quantize``'s.
+    """Returns whether ``add_rmsnorm``'s NVFP4 copy matches ``fp4_quantize``'s.
 
     The copy needs Blackwell and a width that is a power of two of at least 64
     or a multiple of 1024 (walked in whole power-of-two chunks, 5120 = 5 x 1024),
@@ -1356,8 +1365,9 @@ def add_rmsnorm(
         fp8_scale: One-element FP32 dequant scale, given exactly with
             ``out_fp8``.
         out_fp4: Optional ``(values, scales)`` NVFP4 copy, as ``fp4_quantize``
-            returns it with its default recipe: ``[M, N // 2]`` uint8 E2M1 pairs and ``[ceil(M / 128) * 128,
-            N // 16]`` uint8 E4M3 block scales in its 128x4 swizzled layout.
+            returns it with its default recipe: ``[M, N // 2]`` uint8 E2M1
+            pairs and ``[ceil(M / 128) * 128, N // 16]`` uint8 E4M3 block
+            scales in its 128x4 swizzled layout.
         fp4_scale: One-element FP32 global scale the NVFP4 copy is quantized
             with (``fp4_quantize``'s ``global_scale``), given exactly with ``out_fp4``.
         gemma: Scale by ``1 + weight`` in FP32 (Gemma) instead of ``weight``.
@@ -1474,7 +1484,6 @@ def triton_gated_rmsnorm(
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
     if group_size > BLOCK_N:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    # heuristics for number of warps
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     block_m = GATED_RMSNORM_ROWS_PER_PROGRAM if num_warps == 1 else 1
     grid = (triton.cdiv(M, block_m), ngroups)

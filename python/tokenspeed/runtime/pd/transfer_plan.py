@@ -284,7 +284,8 @@ class CacheTransferPlanner:
                     for field in layout.fields_for_group(spec.group_id)
                 ):
                     raise UnsupportedPDLayoutError(
-                        "KVP transfer cannot use head-partitioned fields within page-sharded cache groups"
+                        "KVP transfer cannot use head-partitioned fields within "
+                        "page-sharded cache groups"
                     )
         self._has_sharded_cache = any(
             count > 1
@@ -569,7 +570,8 @@ class CacheTransferPlanner:
         if distinct_shards > tp_size or tp_size % distinct_shards:
             raise UnsupportedPDLayoutError(
                 f"Cache field {segment.field_id!r} cannot map global "
-                f"extent {global_extent} and local extent {local_extent} to TP={tp_size}"
+                f"extent {global_extent} and local extent {local_extent} "
+                f"to TP={tp_size}"
             )
         replica_group_size = tp_size // distinct_shards
         shard_rank = tp_rank // replica_group_size

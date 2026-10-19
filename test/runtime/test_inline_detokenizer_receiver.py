@@ -244,7 +244,7 @@ class TestFlagOffRegression:
 
     (The pre-existing raw-token path for ``--skip-tokenizer-init`` requires
     ``recv_obj.output_ids`` to be populated by the scheduler; we don't
-    exercise that path here — it isn't changed by this PR.)
+    exercise that path here.)
     """
 
     def test_flag_off_receiver_does_not_take_inline_branch(self):
@@ -266,12 +266,9 @@ class TestFlagOffRegression:
 
         out = state.collector.take()
         assert (out) is not None
-        # The inline detokenizer does NOT run on this path (the assertion
-        # this test exists for). What's emitted is the raw-token out_dict,
-        # which since the D.1-regression hotfix carries an empty ``text``
-        # key — matching the pre-D.1 BatchStrOut shape that subprocess
-        # conversion used to guarantee. The state machine that would have
-        # populated ``state.text`` never ran, so the value is "".
+        # The inline detokenizer does NOT run on this path. The raw-token
+        # out_dict still carries a ``text`` key, matching the BatchStrOut
+        # shape; ``state.text`` was never populated, so the value is "".
         assert (out["text"]) == ("")
         assert (out["meta_info"]["accept_draft_tokens"]) == (1.5)
         assert (state.inline_detokenizer) is None

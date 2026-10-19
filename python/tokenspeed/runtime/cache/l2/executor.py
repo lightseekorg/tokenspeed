@@ -203,7 +203,7 @@ class _BackupStats:
 
 
 class _PrefetchJob:
-    """One in-flight L3 prefetch on the lane: the op, its pages by prefix page,
+    """One in-flight L3 prefetch on the lane: the request, its page count,
     the absolute ``deadline`` counted from submission, and the future that
     resolves to the pages landed (a prefix length). A queued job whose deadline
     expires may be cancelled and reported as landing nothing. A failed future
@@ -333,7 +333,6 @@ class HostCacheExecutor:
         )
         host_lcm_block_bytes = compute_host_lcm_block_bytes(self.layout)
 
-        # --- L2 prefix tier -------------------------------------------------
         host_lcm_blocks = 0
         if l2_tier:
             host_lcm_blocks = _num_host_lcm_blocks(
@@ -342,7 +341,6 @@ class HostCacheExecutor:
                 host_ratio=host_ratio,
                 host_size_gb=host_size_gb,
             )
-        # --- retraction snapshot pool -----------------------------------------
         self.snapshot_sizing = resolve_retraction_pool(
             snapshot_pool,
             l2_tier=l2_tier,
@@ -449,7 +447,8 @@ class HostCacheExecutor:
         if l2_tier:
             logger.info(
                 f"Allocated {l2_bytes / 1000000000.0:.2f} GB compact Host L2 ("
-                f"{host_lcm_blocks!s} LCM blocks, {host_lcm_block_bytes!s} bytes/block)",
+                f"{host_lcm_blocks!s} LCM blocks, "
+                f"{host_lcm_block_bytes!s} bytes/block)",
             )
         if attn_tp_rank == 0:
             logger.info(
@@ -643,10 +642,6 @@ class HostCacheExecutor:
             if not job.future.cancelled():
                 job.future.exception()
 
-    # ------------------------------------------------------------------
-    # Submission (forward thread)
-    # ------------------------------------------------------------------
-
     def submit_write_backs(
         self, cache_ops: Sequence, *, prerequisite_stream, fence_stream
     ) -> None:
@@ -796,10 +791,6 @@ class HostCacheExecutor:
             self._start_restore(
                 restore_ops, restore_rows, prerequisite_stream=prerequisite_stream
             )
-
-    # ------------------------------------------------------------------
-    # L3 prefetch lane (control plane submits, a CPU thread fetches)
-    # ------------------------------------------------------------------
 
     def submit_prefetches(self, cache_ops: Sequence) -> None:
         """Start the plan's L3 prefetches on the lane; no stream dependency.
@@ -1016,7 +1007,8 @@ class HostCacheExecutor:
                 raise KeyError(f"prefetch op {op_id} is not in flight")
             if not 0 <= int(landed_pages) <= job.num_pages:
                 raise ValueError(
-                    f"prefetch op {op_id} landed {landed_pages} of {job.num_pages} pages"
+                    f"prefetch op {op_id} landed {landed_pages} of "
+                    f"{job.num_pages} pages"
                 )
             del self._prefetch_jobs[int(op_id)]
             self._prefetch_acks.append((int(op_id), int(landed_pages)))
@@ -1662,6 +1654,7 @@ class HostCacheExecutor:
         return failed
 
     def _complete_or_queue_write(self, ack: _Ack, results: list) -> None:
+        """A write with L3 pages is acknowledged only after its backup completes."""
         if not ack.backup_pages or self.l3_store is None:
             results.extend(self._write_done(op_id) for op_id in ack.op_ids)
             return
@@ -1686,8 +1679,8 @@ class HostCacheExecutor:
         cannot block the round.
         """
         total = 0
-        for group_id, host_block_id, _content_hash, _page_offset in pages:
-            _offset, size = self.host_storage.host_block_range(
+        for group_id, host_block_id, _, _ in pages:
+            _, size = self.host_storage.host_block_range(
                 int(group_id), int(host_block_id)
             )
             total += int(size)
@@ -1780,6 +1773,9 @@ class HostCacheExecutor:
             return self._backup_backlog_locked(now=time.monotonic())
 
     def _collect_finished_backups(self, results: list) -> None:
+        """Failures are logged, recorded for ``consume_backup_poll_failure`` and
+        retried; they are never raised here.
+        """
         with self._ack_lock:
             inflight = list(self._backup_futures)
             self._backup_futures = []
@@ -1855,6 +1851,7 @@ class HostCacheExecutor:
         return event
 
     def shutdown(self) -> None:
+        """In-flight prefetch outcomes are dropped."""
         # The fences and start events live on streams the callers named per
         # submission; the whole device covers them and the transfer streams.
         device_module.synchronize()

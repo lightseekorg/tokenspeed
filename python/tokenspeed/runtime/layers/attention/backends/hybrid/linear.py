@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 
 
 class HybridLinearAttnBackend(AttentionBackend):
-    """Hybrid backend that routes between full attention and linear attention by layer ID."""
+    """Hybrid backend that routes between full and linear attention by layer ID."""
 
     # Both sub-backends consume per-group tables (MHA: KV pages; Mamba:
     # two-slot state tables). Target verify publishes only the accepted
@@ -169,8 +169,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             return self.full_attn_backend
         return self.linear_attn_backend
 
-    # ---- Metadata delegation ----
-
     def configure_runtime(self, **kwargs) -> None:
         self.full_attn_backend.configure_runtime(**kwargs)
         self.linear_attn_backend.configure_runtime(**kwargs)
@@ -214,8 +212,6 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
         return self.full_attn_backend.supports_narrowed_draft_decode(forward_mode)
-
-    # ---- Forward dispatch ----
 
     def admits_prefill_graph(
         self, token_capacity: int, bs: int, forward_mode: ForwardMode
@@ -338,7 +334,8 @@ class HybridLinearAttnBackend(AttentionBackend):
                 )
         # Collapse the GDN scan's batched [1, T, Hv, D] to z-shaped (see docstring).
         if ret is not None and ret.dim() == 4:
-            # Strictly [1, T, Hv, D]: a genuine B>1 must fail loud, not corrupt the handoff.
+            # Strictly [1, T, Hv, D]: a genuine B>1 must fail loud, not corrupt
+            # the handoff.
             assert (
                 ret.shape[0] == 1
             ), f"GDN scan batched rank expected leading 1, got {ret.shape}"

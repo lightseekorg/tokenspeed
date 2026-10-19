@@ -15,7 +15,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Correctness tests for fused GDN QKV split kernel (b0/b1/b3)."""
+"""Correctness tests for fused GDN QKV split kernel."""
 
 from __future__ import annotations
 
@@ -102,7 +102,6 @@ def test_strided_input(nq, nv, hq, hv, T):
     hk = hq
     dtype = torch.bfloat16
     torch.manual_seed(99)
-    # Create strided view: slice every other row then pad back
     big = torch.randn(T * 2, nq * hq + nk * hk + nv * hv, dtype=dtype, device="cuda")
     strided = big[::2]  # stride(0) = 2 * original stride
     assert not strided.is_contiguous()
@@ -139,7 +138,8 @@ def test_strided_input(nq, nv, hq, hv, T):
 
 
 def test_row_stride_does_not_key_a_binary():
-    """Projection slices arrive with different row widths; that must not key a binary."""
+    """Projection slices arrive with different row widths; that must not key a
+    binary."""
     from unittest.mock import patch
 
     from tokenspeed_kernel.ops.attention.gdn._triton.qkv_split import (

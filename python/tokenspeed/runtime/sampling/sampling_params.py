@@ -110,7 +110,6 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         else:
             self.stop_token_ids = None
 
-        # Process some special cases
         if self.temperature < _SAMPLING_EPS:
             self.temperature = 1.0
             self.top_k = 1
@@ -170,7 +169,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                 )
             if not self.min_new_tokens <= self.max_new_tokens:
                 raise ValueError(
-                    f"min_new_tokens must be in (0, max_new_tokens({self.max_new_tokens})], got "
+                    "min_new_tokens must be in "
+                    f"(0, max_new_tokens({self.max_new_tokens})], got "
                     f"{self.min_new_tokens}."
                 )
         if self.logit_bias is not None:
@@ -193,7 +193,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.json_schema,
             self.regex,
             self.ebnf,
-        ]  # since mutually exclusive, only one can be set
+        ]
         if sum(x is not None for x in grammars) > 1:
             raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
 
@@ -247,7 +247,6 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         return replica
 
     def normalize(self, tokenizer) -> None:
-        # Process stop strings
         if self.stop_strs is None:
             self.stop_strs = []
             self.stop_str_max_len = 0

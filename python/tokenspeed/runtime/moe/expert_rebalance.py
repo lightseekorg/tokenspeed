@@ -114,7 +114,6 @@ class PlacementComputeWorker:
         self._ready: Future = self._pool.submit(_worker_ready)
 
     def submit(self, logical_count: torch.Tensor, **kwargs) -> Future:
-        """Schedule ``compute_placement_maps(logical_count, **kwargs)`` in the worker."""
         if logical_count.device.type != "cpu":
             raise ValueError("the placement worker takes host tensors only")
         return self._pool.submit(compute_placement_maps, logical_count, **kwargs)
@@ -125,9 +124,6 @@ class PlacementComputeWorker:
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)
-
-
-# -------------------------------- internal op kinds ---------------------------------
 
 
 @dataclass(frozen=True)
@@ -145,9 +141,6 @@ class EplbApplyChunk:
     """Move the weights of ``layer_ids`` and switch their routing tables."""
 
     layer_ids: tuple[int, ...]
-
-
-# -------------------------------- the move plan -------------------------------------
 
 
 @dataclass(frozen=True)
@@ -355,9 +348,6 @@ def expected_balancedness(
     return load_balancedness(per_slot, ep_size)
 
 
-# -------------------------------- the controller ------------------------------------
-
-
 class RebalancePhase(Enum):
     IDLE = "idle"
     # A snapshot op is queued or taken; the placement is being derived.
@@ -464,8 +454,6 @@ class ExpertRebalanceController:
         self._pending_chunks: list[tuple[int, ...]] = []
         self.rebalances_completed = 0
 
-    # -------------------------------- round driving -------------------------------
-
     @property
     def commit_delay_forwards(self) -> int:
         return self._commit_delay
@@ -512,8 +500,6 @@ class ExpertRebalanceController:
         self._next_snapshot_at = self.forwards + self._interval
         return EplbSnapshot()
 
-    # -------------------------------- op results ----------------------------------
-
     def on_snapshot(
         self, physical_count: torch.Tensor, physical_to_logical_map: torch.Tensor
     ) -> None:
@@ -530,7 +516,8 @@ class ExpertRebalanceController:
         expected = (specs.num_layers, specs.num_physical_experts)
         if tuple(physical_count.shape) != expected:
             raise ValueError(
-                f"expert load has shape {tuple(physical_count.shape)}, expected {expected}"
+                f"expert load has shape {tuple(physical_count.shape)}, "
+                f"expected {expected}"
             )
         self._old_map = physical_to_logical_map.to(device="cpu", dtype=torch.int32)
         self._logical_count = logical_count_of(

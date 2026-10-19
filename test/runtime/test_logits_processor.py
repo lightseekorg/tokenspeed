@@ -694,10 +694,6 @@ def test_get_logits_softcap_disables_fused_argmax(monkeypatch):
     assert out.shape == (4, 8)
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
-
-
 def _logprob_device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -1283,3 +1279,7 @@ def test_a_shard_refuses_pre_selected_rows_and_a_mismatched_head(monkeypatch):
                 query_shard=plan,
             ),
         )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

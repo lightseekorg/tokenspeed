@@ -30,8 +30,6 @@ from tokenspeed.runtime.utils import set_weight_attrs
 
 
 class UnquantizedLinearMethod(LinearMethodBase):
-    """Linear method without quantization."""
-
     def create_weights(
         self,
         layer: torch.nn.Module,

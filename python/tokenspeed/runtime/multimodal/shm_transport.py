@@ -322,9 +322,6 @@ def prepare_shm_features(
     Args:
         reqs: Requests that may carry SHM-backed multimodal features.
         group: CPU process group whose ranks will later execute the request.
-
-    Returns:
-        None.
     """
     pending = [
         mm

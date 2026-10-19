@@ -77,6 +77,7 @@ def triton_host_uint8_row_gather(
     indices: torch.Tensor,
     out: torch.Tensor,
 ) -> torch.Tensor:
+    """Gathers ``table[indices]`` into ``out``; out-of-range ids give zero rows."""
     flat = indices.reshape(-1)
     width = table.shape[1]
     table_bytes = table.view(torch.uint8)

@@ -49,14 +49,11 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> list[bool]:
     """
     if torch.distributed.get_backend(pg) == torch.distributed.Backend.NCCL:
         raise ValueError("in_the_same_node_as should be tested with a non-NCCL group.")
-    # local rank inside the group
     rank = torch.distributed.get_rank(group=pg)
     world_size = torch.distributed.get_world_size(group=pg)
 
-    # local tensor in each process to store the result
     is_in_the_same_node = torch.tensor([0] * world_size, dtype=torch.int32)
 
-    # global ranks of the processes in the group
     ranks = torch.distributed.get_process_group_ranks(pg)
 
     magic_message = b"magic_message"
@@ -65,7 +62,6 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> list[bool]:
     try:
         with contextlib.suppress(OSError):
             if rank == source_rank:
-                # create a shared memory segment
                 shm = shared_memory.SharedMemory(create=True, size=128)
                 shm.buf[: len(magic_message)] = magic_message
                 torch.distributed.broadcast_object_list(
@@ -73,7 +69,6 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> list[bool]:
                 )
                 is_in_the_same_node[rank] = 1
             else:
-                # try to open the shared memory segment
                 recv = [None]
                 torch.distributed.broadcast_object_list(
                     recv, src=ranks[source_rank], group=pg
@@ -97,7 +92,6 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> list[bool]:
 
     torch.distributed.barrier(group=pg)
 
-    # clean up the shared memory segment
     with contextlib.suppress(OSError):
         if rank == source_rank and shm:
             shm.unlink()

@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Common utilities."""
-
 from __future__ import annotations
 
 import asyncio
@@ -100,7 +98,6 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
 
 @lru_cache(maxsize=1)
 def get_device_module():
-    """Get the device module (cuda, hip, etc.) based on the current device."""
     return torch.get_device_module()
 
 
@@ -149,7 +146,7 @@ def get_available_gpu_memory(
     device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
 ):
     """
-    Get available memory for cuda:gpu_id device.
+    Get available memory in GiB for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
     if device in {"cuda", "npu"}:
@@ -232,7 +229,6 @@ def make_layers(
 
 
 def set_random_seed(seed: int) -> None:
-    """Set the random seed for all libraries."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -241,7 +237,6 @@ def set_random_seed(seed: int) -> None:
 
 
 def set_ulimit(target_soft_limit=65535):
-    # number of open files
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
 
@@ -251,7 +246,6 @@ def set_ulimit(target_soft_limit=65535):
         except ValueError as e:
             logger.warning(f"Failed to set RLIMIT_NOFILE: {e!s}")
 
-    # stack size
     resource_type = resource.RLIMIT_STACK
     current_soft, current_hard = resource.getrlimit(resource_type)
     target_soft_limit_stack_size = 1024 * target_soft_limit
@@ -294,22 +288,22 @@ def configure_logger(server_args, prefix: str = ""):
 
     suppress_noisy_third_party_logs()
 
-    if TOKENSPEED_LOGGING_CONFIG_PATH := envs.TOKENSPEED_LOGGING_CONFIG_PATH.get():
-        if not os.path.exists(TOKENSPEED_LOGGING_CONFIG_PATH):
+    if logging_config_path := envs.TOKENSPEED_LOGGING_CONFIG_PATH.get():
+        if not os.path.exists(logging_config_path):
             raise FileNotFoundError(
                 "Setting TOKENSPEED_LOGGING_CONFIG_PATH from env with "
-                f"{TOKENSPEED_LOGGING_CONFIG_PATH} but it does not exist!"
+                f"{logging_config_path} but it does not exist!"
             )
-        with open(TOKENSPEED_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
+        with open(logging_config_path, encoding="utf-8") as file:
             custom_config = json.loads(file.read())
         logging.config.dictConfig(custom_config)
         suppress_noisy_third_party_logs()
         return
-    format = f"[%(asctime)s{prefix}] %(message)s"
+    log_format = f"[%(asctime)s{prefix}] %(message)s"
     log_level = getattr(logging, server_args.log_level.upper())
     logging.basicConfig(
         level=log_level,
-        format=format,
+        format=log_format,
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
@@ -330,15 +324,7 @@ def set_weight_attrs(
     weight: torch.Tensor,
     weight_attrs: dict[str, Any] | None,
 ):
-    """Set attributes on a weight tensor.
-
-    This method is used to set attributes on a weight tensor. This method
-    will not overwrite existing attributes.
-
-    Args:
-        weight: The weight tensor.
-        weight_attrs: A dictionary of attributes to set on the weight tensor.
-    """
+    """Set attributes on a weight tensor; raises if one already exists."""
     if weight_attrs is None:
         return
     for key, value in weight_attrs.items():
@@ -485,7 +471,6 @@ prometheus_multiproc_dir: tempfile.TemporaryDirectory
 
 
 def set_prometheus_multiproc_dir():
-    # Set prometheus multiprocess directory
     # tokenspeed uses prometheus multiprocess mode
     # we need to set this before importing prometheus_client
     # https://prometheus.github.io/client_python/multiprocess/
@@ -540,7 +525,6 @@ def get_amdgpu_memory_capacity():
 
 def get_nvgpu_memory_capacity():
     try:
-        # Run nvidia-smi and capture the output
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
             capture_output=True,
@@ -550,7 +534,6 @@ def get_nvgpu_memory_capacity():
         if result.returncode != 0:
             raise RuntimeError(f"nvidia-smi error: {result.stderr.strip()}")
 
-        # Parse the output to extract memory values
         memory_values = [
             float(mem)
             for mem in result.stdout.strip().split("\n")
@@ -562,22 +545,21 @@ def get_nvgpu_memory_capacity():
             # typically in NVIDIA MIG mode.
             if torch.cuda.is_available():
                 logger.warning(
-                    "Failed to get GPU memory capacity from nvidia-smi, falling back to torch.cuda.mem_get_info()."
+                    "Failed to get GPU memory capacity from nvidia-smi, "
+                    "falling back to torch.cuda.mem_get_info()."
                 )
                 return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MB
             raise ValueError("No GPU memory values found.")
 
-        # Return the minimum memory value
         return min(memory_values)
 
-    except FileNotFoundError:
+    except FileNotFoundError as e:
         raise RuntimeError(
             "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
-        )
+        ) from e
 
 
 def crash_on_warnings():
-    # Crash on warning if we are running CI tests
     return get_bool_env_var("CI") or get_bool_env_var("GITHUB_ACTIONS")
 
 
@@ -677,7 +659,6 @@ class MultiprocessingSerializer:
         output = buf.read()
 
         if output_str:
-            # Convert bytes to base64-encoded string
             output = pybase64.b64encode(output).decode("utf-8")
 
         return output
@@ -694,7 +675,6 @@ class MultiprocessingSerializer:
             The deserialized Python object.
         """
         if isinstance(data, str):
-            # Decode base64 string to bytes
             data = pybase64.b64decode(data, validate=True)
 
         return ForkingPickler.loads(data)
@@ -723,7 +703,6 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
         """Check the health of the http server."""
         return Response(status_code=200)
 
-    # Add prometheus middleware
     if enable_metrics:
         add_prometheus_middleware(app)
         enable_func_timer()
@@ -742,7 +721,8 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     try:
         loop = asyncio.get_running_loop()
         logger.info(
-            f"Dummy health check server scheduled on existing loop at {host!s}:{port!s}",
+            "Dummy health check server scheduled on existing loop at "
+            f"{host!s}:{port!s}",
         )
         loop.create_task(server.serve())
 
@@ -812,19 +792,7 @@ def round_up(x: int, y: int) -> int:
 
 
 def add_prefix(name: str, prefix: str) -> str:
-    """Add a weight path prefix to a module name.
-
-    Args:
-        name: base module name.
-        prefix: weight prefix str to added to the front of `name` concatenated with `.`.
-
-    Returns:
-        The string `prefix.name` if prefix is non-empty, otherwise just `name`.
-    """
     return name if not prefix else f"{prefix}.{name}"
-
-
-# Can be more general if it is used in multiple places (keep it simple and thus not general now)
 
 
 def log_info_on_rank0(logger, msg):
@@ -854,16 +822,14 @@ def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
-# Only physical cores are used. Logical cores are excluded.
-
-
 def lru_cache_frozenset(maxsize=128):
+    """LRU cache decorator that also accepts unhashable arguments."""
+
     def _to_hashable(o):
         try:
             hash(o)
             return o
-        except TypeError:
-            # Not hashable; convert based on type
+        except TypeError as e:
             if isinstance(o, (dict)):
                 return frozenset(
                     (_to_hashable(k), _to_hashable(v)) for k, v in o.items()
@@ -875,7 +841,7 @@ def lru_cache_frozenset(maxsize=128):
             ):
                 return tuple(_to_hashable(v) for v in o)
             else:
-                raise TypeError(f"Cannot make hashable: {type(o)}")
+                raise TypeError(f"Cannot make hashable: {type(o)}") from e
 
     def decorator(func):
         cache = OrderedDict()
@@ -896,7 +862,7 @@ def lru_cache_frozenset(maxsize=128):
                 cache.popitem(last=False)
             return result
 
-        wrapper.cache_clear = cache.clear  # For manual cache clearing
+        wrapper.cache_clear = cache.clear
         return wrapper
 
     return decorator
@@ -917,13 +883,16 @@ class CustomFormatter(logging.Formatter):
 
     def format(self, record):
         if self.FORMATS is None:
-            format = f"[%(asctime)s {LOG_PREFIX}] - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)"
+            fmt = (
+                f"[%(asctime)s {LOG_PREFIX}] - %(levelname)s - %(message)s "
+                "(%(filename)s:%(lineno)d)"
+            )
             self.FORMATS = {
-                logging.DEBUG: self.grey + format + self.reset,
-                logging.INFO: self.grey + format + self.reset,
-                logging.WARNING: self.yellow + format + self.reset,
-                logging.ERROR: self.red + format + self.reset,
-                logging.CRITICAL: self.bold_red + format + self.reset,
+                logging.DEBUG: self.grey + fmt + self.reset,
+                logging.INFO: self.grey + fmt + self.reset,
+                logging.WARNING: self.yellow + fmt + self.reset,
+                logging.ERROR: self.red + fmt + self.reset,
+                logging.CRITICAL: self.bold_red + fmt + self.reset,
             }
 
         log_fmt = self.FORMATS.get(record.levelno)
@@ -951,7 +920,7 @@ def get_colorful_logger(name):
 
 
 def _maybe_json_dict(path: str | os.PathLike) -> dict[str, str]:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         try:
             value = json.loads(f.read())
         except json.JSONDecodeError:
@@ -965,7 +934,7 @@ def _maybe_json_dict(path: str | os.PathLike) -> dict[str, str]:
 
 def _maybe_space_split_dict(path: str | os.PathLike) -> dict[str, str]:
     parsed_dict = dict[str, str]()
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f.readlines():
             try:
                 model_name, redirect_name = line.strip().split()
@@ -979,9 +948,6 @@ def maybe_model_redirect(model: str) -> str:
     """
     Redirect the model name using a JSON string-to-string mapping or
     whitespace-separated pairs. Other JSON values use the whitespace fallback.
-
-    :param model: hf model name
-    :return: maybe redirect to a local folder
     """
 
     from tokenspeed.runtime.utils.env import envs

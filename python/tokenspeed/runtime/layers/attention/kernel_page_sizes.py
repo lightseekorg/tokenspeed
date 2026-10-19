@@ -20,7 +20,8 @@
 
 """Per-kernel page geometry, in one place.
 
-``kernel_page_size`` is the token span of one attention-kernel page — a property of the kernel implementation, not of the scheduler.
+``kernel_page_size`` is the token span of one attention-kernel page — a property
+of the kernel implementation, not of the scheduler.
 """
 
 # FlashMLA decode kernels read the KV cache with a fixed 64-token page stride.
@@ -50,8 +51,8 @@ TOKENSPEED_MLA_SUPPORTED_PAGE_SIZES = (32, 64)
 MLA_PAGE_SIZE = 64
 
 # The MSA sparse-attention kernels register exactly one supported page size
-# (see tokenspeed_kernel/ops/attention/msa.py: page_size {128}); this is a
-# kernel constraint, not a chosen default.
+# (page_size {128} in tokenspeed_kernel/ops/attention/msa); this is a kernel
+# constraint, not a chosen default.
 MSA_PAGE_SIZE = 128
 TRTLLM_MHA_PAGE_SIZE = 64
 

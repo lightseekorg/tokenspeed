@@ -63,9 +63,7 @@ if platform.is_nvidia:
         scale.copy_(s.float().squeeze(-1))
 
     def trtllm_fp8_token_group_128(x: torch.Tensor) -> torch.Tensor:
-        qweight, _scale = _per_token_group_quant_8bit(
-            x, group_size=128, use_ue8m0=False
-        )
+        qweight, _ = _per_token_group_quant_8bit(x, group_size=128, use_ue8m0=False)
         return qweight.float()
 
     def trtllm_fp8_token(x: torch.Tensor) -> torch.Tensor:

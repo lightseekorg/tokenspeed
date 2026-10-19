@@ -89,11 +89,6 @@ def _blockscaled_signature_and_scales(
 LSE_LN = math.log2(math.e)
 
 
-# ===-----------------------------------------------------------------------===#
-# KDA Kernels
-# ===-----------------------------------------------------------------------===#
-
-
 @dataclass(frozen=True)
 class KdaPrefillResult:
     """Results from a packed KDA prefill.

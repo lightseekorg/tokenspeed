@@ -62,7 +62,8 @@ def dsa_index_k_row_bytes(index_head_dim: int) -> int:
     """Bytes of one ``fp8_scaled`` index-K row (FP8 keys plus fp32 scales)."""
     if index_head_dim <= 0 or index_head_dim % _INDEX_K_FP8_GROUP_SIZE != 0:
         raise ValueError(
-            f"DSA index_head_dim must be a positive multiple of {_INDEX_K_FP8_GROUP_SIZE}, got {index_head_dim}"
+            f"DSA index_head_dim must be a positive multiple of "
+            f"{_INDEX_K_FP8_GROUP_SIZE}, got {index_head_dim}"
         )
     return (
         index_head_dim
@@ -148,7 +149,7 @@ class DSAConfig(MLAConfig):
     index_kpool: int | None = None
 
     def __post_init__(self) -> None:
-        # None is a DSA configure-attention hook that named no plane.
+        # Rejects None: a configure-attention hook that named no plane.
         index_k_plane_dtype(self.index_k_format)
         if self.index_topk < 0:
             raise ValueError(f"index_topk must be nonnegative, got {self.index_topk}")

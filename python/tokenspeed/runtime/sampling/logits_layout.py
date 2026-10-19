@@ -39,8 +39,6 @@ class LogitsLayoutPlan:
 
 
 class LogitsLayoutExecutor:
-    """Executes sampling-provided logits layout plans."""
-
     def __init__(
         self,
         *,

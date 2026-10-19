@@ -69,9 +69,9 @@ _K_TILE = 448 * 8
 # Per-kernel sweeps separate 608 from 304; end to end the two are indistinguishable.
 _LAMPORT_CTAS = 608
 _LAMPORT_THREADS = 512
-# Both BF16 lanes -0, so an unsanitized producer needs two coincidences, not one.
 # Polled per 16-bit half: no GEMM emits 0xFFFF, so producers may store single elements.
 HALF_POLLED_SENTINEL = 0xFFFFFFFF
+# Both BF16 lanes -0, so an unsanitized producer needs two coincidences, not one.
 _DOWN_SENTINEL = 0x80008000
 _BF16_BYTES = 2
 
@@ -382,9 +382,8 @@ class KimiK3LatentDownOp:
         broken or the rack has no NVLink domain. What is worth failing a boot
         over is the rendezvous, which runs only after all of this has passed.
 
-        Same order as the predicate it backs, which matters: the reachability
-        probe stays last, after the width tests the kernel would otherwise
-        raise on, and after the rotation test.
+        The order matters: the reachability probe stays last, after the width
+        tests the kernel would otherwise raise on, and after the rotation test.
         """
         if not dist.is_initialized():
             return "no process group"
@@ -436,10 +435,11 @@ class KimiK3LatentDownOp:
                 group. Raised to the fused kernel's ceiling when smaller: those
                 widths are compiled either way and cost eight mailbox rows.
             publish_gemm: ``None`` for K3's fused GEMM, whose failed rendezvous
-                raises on the validated architecture; else an ``(x, weight, out) -> [rows, shard]``
-                GEMM that writes ``out`` or returns a block to publish, writing
-                each element once, on a ``HALF_POLLED_SENTINEL`` mailbox whose
-                failed rendezvous declines.
+                raises on the validated architecture; else an
+                ``(x, weight, out) -> [rows, shard]`` GEMM that writes ``out``
+                or returns a block to publish, writing each element once, on a
+                ``HALF_POLLED_SENTINEL`` mailbox whose failed rendezvous
+                declines.
 
         Returns:
             The op, or None when the platform or shapes cannot support it.
@@ -644,7 +644,8 @@ class KimiK3LatentDownOp:
         from torch.distributed import _symmetric_memory as symm_mem
 
         fused_producer = publish_gemm is None
-        # An unsanitized (-0, -0) pair spells K3's word, so a library GEMM gets the NaN one.
+        # An unsanitized (-0, -0) pair spells K3's word, so a library GEMM gets
+        # the NaN one.
         sentinel = _DOWN_SENTINEL if fused_producer else HALF_POLLED_SENTINEL
         with torch.inference_mode(False), torch.no_grad():
             mailbox = symm_mem.empty(

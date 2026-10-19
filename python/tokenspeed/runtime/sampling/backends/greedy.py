@@ -94,8 +94,6 @@ def _verify_chain_greedy(
     batch_size: int,
     num_draft_tokens: int,
 ) -> None:
-
-    # Prefer the CUDA kernel when available AND the tensors are on CUDA.
     if _verify_chain_greedy_cuda is not error_fn and candidates.is_cuda:
 
         _verify_chain_greedy_cuda(
@@ -224,7 +222,8 @@ class GreedySamplingBackend(SamplingBackend):
         ).reshape(bs, num_tokens_per_req)
 
         if tree is not None:
-            # The accepted path rides in accept_index so the TP broadcast below carries it.
+            # The accepted path rides in accept_index so the TP broadcast below
+            # carries it.
             verify_tree(
                 predict,
                 accept_length,
@@ -270,7 +269,8 @@ class GreedySamplingBackend(SamplingBackend):
 
         if self.config.enable_output_logprobs:
             if tree is not None:
-                # predict is packed along the path; score it against the path's own rows.
+                # predict is packed along the path; score it against the path's own
+                # rows.
                 logits = logits.index_select(0, accepted_path_rows(accept_index))
             logits_output.next_token_logprobs = gather_token_logprobs(
                 logits, predict, logprob_order=self.config.logprob_order

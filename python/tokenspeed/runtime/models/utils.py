@@ -30,7 +30,8 @@ def validate_attention_partition(
         raise ValueError(f"tp_size must be positive, got {tp_size}.")
     if total_num_heads % tp_size != 0:
         raise ValueError(
-            f"num_attention_heads={total_num_heads} must be divisible by tp_size={tp_size}."
+            f"num_attention_heads={total_num_heads} must be divisible by "
+            f"tp_size={tp_size}."
         )
     if total_num_kv_heads <= 0:
         raise ValueError(
@@ -39,9 +40,11 @@ def validate_attention_partition(
     if total_num_kv_heads >= tp_size:
         if total_num_kv_heads % tp_size != 0:
             raise ValueError(
-                f"num_key_value_heads={total_num_kv_heads} must be divisible by tp_size={tp_size}."
+                f"num_key_value_heads={total_num_kv_heads} must be divisible by "
+                f"tp_size={tp_size}."
             )
     elif tp_size % total_num_kv_heads != 0:
         raise ValueError(
-            f"tp_size={tp_size} must be divisible by num_key_value_heads={total_num_kv_heads}."
+            f"tp_size={tp_size} must be divisible by "
+            f"num_key_value_heads={total_num_kv_heads}."
         )

@@ -96,9 +96,7 @@ DEFAULT_GRPC_MAX_MESSAGE_BYTES = "536870912"
 DEFAULT_SMG_POLICY = "passthrough"
 # smg reliability and background load-monitoring knobs we always want disabled
 # when launched under ts serve. These are tokenspeed-internal defaults: not
-# surfaced via the ts CLI, not routed through split_argv. This is independent
-# from the routing policy below: disabling load monitoring stops smg's
-# background engine-load polling.
+# surfaced via the ts CLI, not routed through split_argv.
 _DEFAULT_SMG_DISABLE_FLAGS = (
     "--disable-circuit-breaker",
     "--disable-retries",
@@ -202,9 +200,8 @@ def _gateway_args_with_default_reasoning_parser(
     whose ``tokenizer_config.json`` declares a ``response_template`` selects
     the ``symphony`` parser with ``hf`` reasoning and tool parsers while no
     parser is named. Explicit parser options retain their existing behavior.
-    This relies on the ``tokenspeed-smg`` pin in ``python/pyproject.toml``
-    providing these parser names, as the parser names set in
-    ``_args_with_default_model_parsers`` rely on it to know those names.
+    The ``tokenspeed-smg`` pin in ``python/pyproject.toml`` must provide these
+    parser names.
     """
     if "--reasoning-parser" in gateway_args:
         return gateway_args
@@ -249,7 +246,8 @@ def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str
     ``--policy cache_aware`` keeps load monitoring: its imbalance/overload
     triggers feed on the worker load monitor.
 
-    Health checks are off: ``ts serve`` supervises its one engine, and a generating probe stuck behind a saturated batch would strand healthy requests.
+    Health checks are off: ``ts serve`` supervises its one engine, and a
+    generating probe stuck behind a saturated batch would strand healthy requests.
 
     NOTE: ``--dp-aware`` is deliberately NOT auto-injected — rank pinning
     needs smg releases with TokenSpeed dp-affinity support; bump the
@@ -404,7 +402,7 @@ def _load_model_config(model_id: str | None, filename: str = "config.json") -> d
     if not config_path.is_file():
         return {}
     try:
-        with config_path.open() as f:
+        with config_path.open(encoding="utf-8") as f:
             config = json.load(f)
     except (OSError, ValueError):
         return {}
@@ -645,7 +643,8 @@ def _args_with_default_model_parsers(
         if "--tool-call-parser" not in gateway_result:
             gateway_result.extend(["--tool-call-parser", INKLING_TOOL_CALL_PARSER])
         if current_platform().is_nvidia:
-            # Inkling's NVIDIA rel-bias attention requires FA4; reject bad explicit backends before workers start.
+            # Inkling's NVIDIA rel-bias attention requires FA4; reject a bad
+            # explicit backend before workers start.
             if "--attention-backend" in engine_result:
                 backend_index = engine_result.index("--attention-backend")
                 backend = (
@@ -735,12 +734,11 @@ def _add_metrics_port(engine_args: list[str]) -> tuple[list[str], str | None]:
 
     With ``--enable-metrics`` and the Prometheus reporter (the default), the
     engine serves /metrics from its main process (see ``ServerArgs.metrics_port``).
-    Pin a stable port — like
-    ``--rl-control-port`` — so the scrape target survives engine restarts and
-    can be printed at startup. An operator-pinned ``--metrics-port`` is
-    preserved untouched; ``--metrics-port 0`` means auto-allocate, matching
-    the engine-side treatment of an unset port. Returns the scrape URL, or
-    None when Prometheus reporting is off.
+    Pin a stable port, like ``--rl-control-port``, so the scrape target survives
+    engine restarts and can be printed at startup. An operator-pinned
+    ``--metrics-port`` is preserved untouched; ``--metrics-port 0`` means
+    auto-allocate, matching the engine-side treatment of an unset port. Returns
+    the scrape URL, or None when Prometheus reporting is off.
     """
     reporters = []
     for index, arg in enumerate(engine_args):
@@ -885,16 +883,11 @@ async def run_smg(
         try:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
-            pass  # Windows: signal handlers via asyncio aren't supported. Out of scope.
+            pass  # Windows: asyncio signal handlers aren't supported.
 
     try:
         engine_port = _free_port_avoiding_ephemeral_range()
-
-        # Wire the in-engine RL control-plane port (always on). Must happen
-        # before spawn_engine.
         engine_args, rl_control_url = _add_rl_control_port(engine_args)
-
-        # Wire the engine metrics port when Prometheus reporting is enabled.
         engine_args, metrics_url = _add_metrics_port(engine_args)
 
         engine = await spawn_engine(engine_args, host="127.0.0.1", port=engine_port)
@@ -965,7 +958,7 @@ async def run_smg(
         gateway_wait = asyncio.create_task(gateway.wait())
         stop_wait = asyncio.create_task(stop.wait())
 
-        done, pending = await asyncio.wait(
+        _, pending = await asyncio.wait(
             [engine_wait, gateway_wait, stop_wait],
             return_when=asyncio.FIRST_COMPLETED,
         )
@@ -994,7 +987,6 @@ async def run_smg(
         logger.info("interrupted; exiting cleanly")
         return 0
     finally:
-        # Shutdown order: gateway first, then engine.
         if gateway is not None:
             await terminate_then_kill(gateway, drain_timeout=opts.drain_timeout)
         if engine is not None:
@@ -1039,6 +1031,7 @@ def _run_headless(argv: list[str]) -> None:
 
 def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     """Entry point called from cli/__main__.py for ``ts serve``."""
+    del args
     headless_argv = split_headless_argv(raw_argv)
     if headless_argv is not None:
         # Engine-only: skip the orchestrator entirely, including its

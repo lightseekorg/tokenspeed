@@ -144,10 +144,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             (pool_rows,), 1.0, dtype=torch.bfloat16, device=config.device
         )
 
-    # ------------------------------------------------------------------
-    # Lifecycle hooks
-    # ------------------------------------------------------------------
-
     def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:
 
         # Scatter scalars inherited from the parent backend (temperature, top_k,
@@ -175,7 +171,8 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             raw_ids = [int(tid) for tid in bias_map.keys()]
             assert all(0 <= tid < vocab for tid in raw_ids), (
                 f"logit_bias contains out-of-vocab token id(s); "
-                f"vocab_size={vocab}, offending={[t for t in raw_ids if not 0 <= t < vocab]}"
+                f"vocab_size={vocab}, "
+                f"offending={[t for t in raw_ids if not 0 <= t < vocab]}"
             )
             token_ids = torch.tensor(raw_ids, dtype=torch.long, pin_memory=True).to(
                 self._logit_bias.device, non_blocking=True
@@ -275,10 +272,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             weights.to(torch.int32),
             accumulate=True,
         )
-
-    # ------------------------------------------------------------------
-    # Sample / verify
-    # ------------------------------------------------------------------
 
     @nvtx_range("sampling:sample", color="yellow")
     def sample(

@@ -71,11 +71,6 @@ _NUM_XCDS = 8
 _FUSED_SORT_MAX_ROUTES = 1024
 
 
-# ---------------------------------------------------------------------------
-# Layouts and device helpers
-# ---------------------------------------------------------------------------
-
-
 @gluon.constexpr_function
 def _mfma_layouts(warps_m, warps_n, block_m, block_n):
     """MFMA 16x16x128 layouts for one 128-K step of a ``[BM, BN]`` tile."""
@@ -152,11 +147,6 @@ def _xcd_local_pid(NUM_XCDS: gl.constexpr):
     # The first ``num_pids % NUM_XCDS`` XCDs run one extra program.
     extra = num_pids - per_xcd * NUM_XCDS
     return xcd * per_xcd + gl.minimum(xcd, extra) + pid // NUM_XCDS
-
-
-# ---------------------------------------------------------------------------
-# Kernels
-# ---------------------------------------------------------------------------
 
 
 @gluon.jit
@@ -748,11 +738,6 @@ def gluon_mxfp4_a4w4_moe_apply_combine_gfx950(
         acc.to(out_ptr.dtype.element_ty),
         mask=row_mask[:, None],
     )
-
-
-# ---------------------------------------------------------------------------
-# Host launcher
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)

@@ -108,8 +108,8 @@ def test_fill_block_decode_seq_lens_publishes_clamped_lengths() -> None:
 def test_block_decode_keeps_every_metadata_row_and_uses_uniform_lengths() -> None:
     backend = _backend(draft_block_decode=True)
     backend.forward_decode_metadata = TRTLLMMLADecodeMetadata(
-        # Reproduce the old DFlash convention from the failing startup log.
-        # Block decode must ignore this discriminator and retain both rows.
+        # The legacy DFlash convention sets num_extends; block decode must ignore
+        # it and retain both rows.
         num_extends=2,
         page_table=torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
         max_seq_len_k=64,

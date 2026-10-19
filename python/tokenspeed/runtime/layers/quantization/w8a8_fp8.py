@@ -57,7 +57,7 @@ class W8A8Fp8Config(QuantizationConfig):
         return 89
 
     @classmethod
-    def get_name(self) -> str:
+    def get_name(cls) -> str:
         return "w8a8_fp8"
 
     @classmethod

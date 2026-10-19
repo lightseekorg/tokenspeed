@@ -310,11 +310,6 @@ def _round_trip(
             assert torch.equal(restored, original)
 
 
-# ----------------------------------------------------------------------
-# The packing helpers
-# ----------------------------------------------------------------------
-
-
 def test_pack_aligns_every_row_and_refuses_a_short_image():
     rows = [
         torch.tensor(7, dtype=torch.int32),
@@ -347,11 +342,6 @@ def test_pack_copies_a_non_contiguous_slot_slice():
     unpack_slot_rows([target[:, 1]], image, None)
     assert torch.equal(target[:, 1], ring[:, 2])
     assert target[:, 0].abs().sum() == 0
-
-
-# ----------------------------------------------------------------------
-# Round trips, one owner at a time
-# ----------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("draft_probs", [False, True])
@@ -565,9 +555,10 @@ def test_model_executor_lists_every_owner_once_and_the_layout_is_fixed():
     assert layout.nbytes == sum(owner.slot_state_bytes() for owner in exporters)
     assert [owner for owner, _, _ in layout.segments] == list(exporters)
     assert leaf.slot_state_bytes() == 0
-    rows = lambda slot: [  # noqa: E731
-        row for owner in exporters for row in owner.slot_state_rows(slot)
-    ]
+
+    def rows(slot):
+        return [row for owner in exporters for row in owner.slot_state_rows(slot)]
+
     torch.manual_seed(1)
     _randomize(rows(2))
     expected = [row.clone() for row in rows(2)]

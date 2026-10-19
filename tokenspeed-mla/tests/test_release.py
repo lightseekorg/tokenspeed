@@ -32,15 +32,16 @@ def release(tmp_path):
     source_dir = package_dir / "python" / "tokenspeed_mla"
     source_dir.mkdir(parents=True)
     (package_dir / "pyproject.toml").write_text(
-        '[project]\nname = "tokenspeed-mla"\nversion = "1.2.3"\n'
+        '[project]\nname = "tokenspeed-mla"\nversion = "1.2.3"\n',
+        encoding="utf-8",
     )
     entries = {}
     for name in ("__init__.py", "fmha.py", "mla_prefill.py", "mla_decode.py"):
         path = source_dir / name
-        path.write_text(f'"""{name}"""\n')
+        path.write_text(f'"""{name}"""\n', encoding="utf-8")
         entries[f"tokenspeed_mla/{name}"] = path.read_bytes()
     for name in ("LICENSE", "THIRDPARTYNOTICES"):
-        (package_dir / name).write_text(f"Public {name}\n")
+        (package_dir / name).write_text(f"Public {name}\n", encoding="utf-8")
         entries[f"tokenspeed_mla-1.2.3.dist-info/licenses/{name}"] = (
             package_dir / name
         ).read_bytes()
@@ -135,7 +136,8 @@ def test_rejects_multiple_artifacts(release):
 def test_rejects_local_release_version(release):
     package_dir, _, _ = release
     (package_dir / "pyproject.toml").write_text(
-        '[project]\nname = "tokenspeed-mla"\nversion = "1.2.3+local"\n'
+        '[project]\nname = "tokenspeed-mla"\nversion = "1.2.3+local"\n',
+        encoding="utf-8",
     )
     with pytest.raises(ValueError, match="public release version"):
         read_version(package_dir)

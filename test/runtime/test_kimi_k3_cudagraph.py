@@ -171,8 +171,6 @@ def test_replay_refreshes_buffers_in_place_and_pads_page_zero() -> None:
     # Real row 0: logical page 3 -> kernel pages [6, 7] (ratio 2), page 5 ->
     # [10, 11]. Expansion: page * ratio + k.
     assert md2.page_table[0].tolist() == [6, 7, 10, 11]
-
-    # Padded row 1: null page 0 everywhere.
     assert torch.all(md2.page_table[1] == 0)
 
 

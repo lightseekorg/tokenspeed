@@ -293,5 +293,7 @@ for B, W, L, G in [
     for degree in [1, 8]:
         run(B, W, L, G, degree, True)
 Path("results").mkdir(exist_ok=True)
-Path(f"results/mla-dcp-rank{rank}.json").write_text(json.dumps(results, indent=2))
+Path(f"results/mla-dcp-rank{rank}.json").write_text(
+    json.dumps(results, indent=2), encoding="utf-8"
+)
 torch.distributed.destroy_process_group()

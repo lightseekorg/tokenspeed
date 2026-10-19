@@ -33,8 +33,6 @@ import torch
 from tokenspeed_kernel_amd._triton import tl, triton
 
 
-# activation metadata
-# ---------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class FnSpecs:
     name: str
@@ -54,8 +52,6 @@ class FusedActivation:
     fn_args: tuple[object, ...] = tuple()
 
 
-# swiglu
-# ---------------------------------------------------------------------------- #
 @triton.jit
 def _swiglu_clip(x, limit, clip_lower: tl.constexpr):
     res = tl.minimum(x, limit)
@@ -82,8 +78,6 @@ def swiglu_fn(input, alpha, limit):
     return _compute_swiglu(gelu, linear, 1.0, alpha, limit)
 
 
-# data types
-# ---------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class IntegerType:
     bitwidth: int
@@ -121,8 +115,6 @@ INT64 = IntegerType(64, is_signed=True)
 DataType: TypeAlias = IntegerType | FloatType
 
 
-# layout utilities
-# ---------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class StridedLayout:
     major_dim: int = -1
@@ -130,7 +122,8 @@ class StridedLayout:
     def __post_init__(self):
         if not isinstance(self.major_dim, int):
             raise TypeError(
-                f"StridedLayout(major_dim=...) must be an int, got {type(self.major_dim)}"
+                "StridedLayout(major_dim=...) must be an int, "
+                f"got {type(self.major_dim)}"
             )
 
     @property
@@ -159,8 +152,6 @@ class StridedLayout:
         return base
 
 
-# storage
-# ---------------------------------------------------------------------------- #
 @dataclass
 class Storage:
     data: torch.Tensor
@@ -171,8 +162,6 @@ class Storage:
         return self.data.device
 
 
-# main tensor class
-# ---------------------------------------------------------------------------- #
 @dataclass
 class Tensor:
     storage: Storage
@@ -182,18 +171,19 @@ class Tensor:
 
     def __post_init__(self):
         assert isinstance(self.storage, Storage)
-        # initialize dtype
         if self.dtype.bitwidth < 8 and self.shape is None:
             raise ValueError("shape must be provided for sub-byte types")
-        # initialize shape
         if self.shape is None:
             self.shape = list(self.storage.data.shape)
         self.shape = list(self.shape)
         # validate shape: all elements must be `int` or numel-1 `torch.Tensor`
-        is_int = lambda s: isinstance(s, int)
-        is_item = lambda s: hasattr(s, "numel") and s.numel() == 1
+        def is_int(s):
+            return isinstance(s, int)
+
+        def is_item(s):
+            return hasattr(s, "numel") and s.numel() == 1
+
         assert all(map(lambda s: is_int(s) or is_item(s), self.shape))
-        # initialize shape_max
         if self.shape_max is None:
             self.shape_max = [None] * len(self.shape)
         for i, (s, smax) in enumerate(zip(self.shape, self.shape_max)):
@@ -203,10 +193,8 @@ class Tensor:
                 )
             if smax is None:
                 self.shape_max[i] = s
-        # validate shape_max: all elements must be `int`
         assert all(map(is_int, self.shape_max))
 
-    # torch compatibility layer
     @property
     def ndim(self):
         return len(self.shape)
@@ -310,8 +298,6 @@ def wrap_torch_tensor(
     )
 
 
-# sum bitmatrix rows
-# ---------------------------------------------------------------------------- #
 @triton.jit
 def vpopc(x):
     """
@@ -327,7 +313,7 @@ def vpopc(x):
     )
 
     BLOCK_N: tl.constexpr = x.shape[-1]  # summation axis
-    BATCHES: tl.constexpr = x.numel // BLOCK_N  # number of batches
+    BATCHES: tl.constexpr = x.numel // BLOCK_N
     if BLOCK_N >= 8:
         sa1: tl.constexpr = 8
     else:
@@ -358,12 +344,12 @@ def _sum_bitmatrix_rows(
     B,
     shape_bm,
     stride_bm: tl.constexpr,
-    stride_bn: tl.constexpr,  # input bitmatrix
+    stride_bn: tl.constexpr,
     Out,
     OutPartials,
     stride_pm: tl.constexpr,
     stride_pn,
-    shape_pn,  # outputs
+    shape_pn,
     BLOCK_MM: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
@@ -371,7 +357,6 @@ def _sum_bitmatrix_rows(
     TILE_SIZE: tl.constexpr = BLOCK_MM // BLOCK_M
     if isinstance(shape_bm, tl.tensor) and shape_bm.dtype.is_ptr():
         shape_bm = tl.load(shape_bm)
-    # load input bits
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     offs_bm = pid_m * BLOCK_MM + tl.arange(0, BLOCK_MM)
@@ -379,16 +364,13 @@ def _sum_bitmatrix_rows(
         B + pid_n * stride_bn + offs_bm * stride_bm, mask=offs_bm < shape_bm, other=0
     )
     bits = tl.reshape(bits, [TILE_SIZE, BLOCK_M])
-    # partial row sum
     partial_row_sum = vpopc(bits)  # [TILE_SIZE, 32]
-    # write-back partial row sum
     offs_pm = pid_m * TILE_SIZE + tl.arange(0, TILE_SIZE)
     offs_n = pid_n * 32 + tl.arange(0, 32)
     tl.store(
         OutPartials + offs_pm[:, None] * stride_pm + offs_n[None, :] * stride_pn,
         partial_row_sum,
     )
-    # update final row sum
     tl.atomic_add(Out + offs_n, tl.sum(partial_row_sum, 0), sem="relaxed")
 
 
@@ -414,27 +396,24 @@ def sum_bitmatrix_rows(x, partials_block_size=None):
         (grid_n * 32, grid_m * TILE_SIZE), device=x.device, dtype=torch.int32
     )
     out_partials = torch.transpose(out_partials, 0, 1)
-    # output tensors
     _sum_bitmatrix_rows[(grid_m, grid_n)](
         x.storage.data,
         n_rows,
         x.stride(0),
-        x.stride(1),  # input
-        out,  # output [final reduction]
+        x.stride(1),
+        out,
         out_partials,
         out_partials.stride(0),
         out_partials.stride(1),
-        out_partials.shape[1],  # output [partial reductions]
+        out_partials.shape[1],
         BLOCK_M=PARTIALS_BLOCK_M,
-        BLOCK_MM=BLOCK_MM,  # constants
+        BLOCK_MM=BLOCK_MM,
         num_warps=8,
     )
     out_partials = out_partials[: cdiv(n_rows_max, PARTIALS_BLOCK_M), :]
     return out, out_partials
 
 
-# bitmatrix metadata
-# ---------------------------------------------------------------------------- #
 @dataclass
 class BitmatrixMetadata:
     """
@@ -486,7 +465,6 @@ def _bitmatrix_metadata_compute_stage2(
         n_tokens = tl.load(n_tokens)
     nonzero_indx_size = n_tokens * TOKS_PER_ROW
     pid_m = tl.program_id(0)
-    # load column indices
     offs_local = tl.arange(0, BLOCK_SIZE)
     offs_global = pid_m * BLOCK_SIZE + offs_local
     mask = offs_global < nonzero_indx_size
@@ -501,13 +479,11 @@ def _bitmatrix_metadata_compute_stage2(
     x = kv_pairs & 0xFFFF0000 | 0x00000001
     cols_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
     exclusive_run_lengths = (cols_and_inclusive_run_lengths - 1) & 0xFFFF
-    # compute output
     row_sorted_indx = tl.load(
         ColPartialSum + pid_m * stride_pm + col_indx * stride_pn, mask=mask
     )
     row_sorted_indx += tl.load(ColOffs + col_indx, mask=mask)
     row_sorted_indx += exclusive_run_lengths
-    # write back output
     tl.store(RowSortedIndx + offs_global, row_sorted_indx, mask=mask)
     tl.store(ColSortedIndx + row_sorted_indx, offs_global, mask=mask)
 
@@ -560,7 +536,6 @@ def make_bitmatrix_metadata(nonzero_indx, bitmatrix):
     col_sum, col_partial_sum = sum_bitmatrix_rows(
         bitmatrix, partials_block_size=PARTIAL_BLOCK_M
     )
-    # allocate memory
     device = bitmatrix.device
     n_indx = nonzero_indx.numel()
     n_cols = bitmatrix.shape[1]
@@ -579,15 +554,15 @@ def make_bitmatrix_metadata(nonzero_indx, bitmatrix):
         n_indx * 2,
         -1,
         MEMSET_BLOCK,
-        col_sum,  #
+        col_sum,
         col_offs,
         col_sum.shape[0],
-        col_partial_sum,  # inputs
+        col_partial_sum,
         col_partial_sum.shape[0],
         col_partial_sum.stride(0),
-        col_partial_sum.stride(1),  # outputs
+        col_partial_sum.stride(1),
         BLOCK_M=512,
-        BLOCK_N=512,  # tunable parameters
+        BLOCK_N=512,
     )
     # this kernel computes valid entries of `{row,col}_sorted_indx`
     # using `col_offs` and `col_partial_sums`
@@ -596,15 +571,15 @@ def make_bitmatrix_metadata(nonzero_indx, bitmatrix):
     compute_grid = (cdiv(bitmatrix.shape_max[0], PARTIAL_BLOCK_M),)
     _bitmatrix_metadata_compute_stage2[compute_grid](
         col_sorted_indx,
-        row_sorted_indx,  # outputs
+        row_sorted_indx,
         nonzero_indx,
         bitmatrix.shape[0],
         col_partial_sum,
         col_partial_sum.stride(0),
-        col_partial_sum.stride(1),  # inputs
-        col_offs,  #
+        col_partial_sum.stride(1),
+        col_offs,
         TOKS_PER_ROW=toks_per_row,
-        BLOCK_PER_TOK=PARTIAL_BLOCK_M,  #
+        BLOCK_PER_TOK=PARTIAL_BLOCK_M,
     )
     return BitmatrixMetadata(
         col_sum=col_sum,
@@ -613,8 +588,6 @@ def make_bitmatrix_metadata(nonzero_indx, bitmatrix):
     )
 
 
-# sparse matrix
-# ---------------------------------------------------------------------------- #
 @dataclass
 class SparseMatrix:
     indx: torch.Tensor
@@ -625,8 +598,6 @@ class SparseMatrix:
         self.mask_metadata = make_bitmatrix_metadata(self.indx, self.mask)
 
 
-# topk forward kernels
-# ---------------------------------------------------------------------------- #
 @triton.jit
 def get_topmask_and_fullmask(x):
     tl.static_assert(
@@ -689,14 +660,12 @@ def streaming_topk(
     offs_x_n = loop_iterations * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_n = offs_x_n[None, :] < n_expts_tot
 
-    # first iteration:
     X_ptrs = X + offs_m[:, None] * stride_xm + offs_x_n[None, :]
     x = tl.load(X_ptrs, mask=(mask_m & mask_n), other=float("-inf"))
     x = fpval_to_key(x.to(x_utype, bitcast=True))
     x = (x.to(x_ultype) << 16) | indx_to_key(offs_x_n, N_EXPTS_PAD)[None, :]
     acc = tl.topk(x, N_EXPTS_ACT, dim=1)
 
-    # subsequent iterations:
     for _i in (tl.static_range if loop_iterations <= 4 else range)(loop_iterations):
         acc = tl.bitonic_merge(acc)  # ensure sorted ascending for the merge
         X_ptrs -= BLOCK_N
@@ -722,20 +691,20 @@ def streaming_topk(
 @triton.jit
 def _topk_forward(
     X,
-    stride_xm,  # inputs
+    stride_xm,
     PeerYvs,
     PeerYis,
-    stride_ym,  # topk values/indices
+    stride_ym,
     USE_PROVIDED_INDX: tl.constexpr,
     PeerBits,
     # The bitmatrix rows follow the token count; runtime so every batch shape
     # shares one binary.
     stride_rm,
-    stride_rn,  # bitmatrix
+    stride_rn,
     n_rows,
-    n_expts_tot,  # shape
+    n_expts_tot,
     dst_offs_m,
-    APPLY_SOFTMAX: tl.constexpr,  # constant
+    APPLY_SOFTMAX: tl.constexpr,
     BLOCK_M: tl.constexpr,
     N_EXPTS_PAD: tl.constexpr,
     N_EXPTS_ACT: tl.constexpr,
@@ -748,14 +717,12 @@ def _topk_forward(
         n_rows = tl.load(n_rows)
 
     if pid * BLOCK_M >= n_rows:
-        # early exit:
         return
 
     tl.static_assert(BLOCK_N % 32 == 0)
     tl.static_assert(N_EXPTS_PAD % BLOCK_N == 0)
     x_dtype: tl.constexpr = X.dtype.element_ty
 
-    # load logits
     offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_y_n = tl.arange(0, N_EXPTS_ACT)
     mask_m = offs_m[:, None] < n_rows
@@ -779,13 +746,11 @@ def _topk_forward(
             BLOCK_N,
         )
 
-    # normalize selected values
     if APPLY_SOFTMAX:
         y_values = tl.softmax(y_values.to(tl.float32), dim=1, keep_dims=True).to(
             x_dtype
         )
 
-    # write back
     for rank in tl.static_range(N_PEERS):
         Yv_ptrs = (
             PeerYvs[rank]
@@ -802,7 +767,6 @@ def _topk_forward(
             )
             tl.store(Yi_ptrs, y_indices, mask=mask_m)
 
-    # pack into bitmatrix
     y_div = y_indices // 32
     y_rem = y_indices % 32
     loop_iterations = N_EXPTS_PAD // BLOCK_N
@@ -901,22 +865,22 @@ def topk_forward(
     pids = cdiv(n_rows_max, BLOCK_M)
     _topk_forward[(pids,)](
         x.storage.data,
-        x.stride(0),  # inputs
+        x.stride(0),
         y_vals_bufs,
         y_indx_bufs,
         y_vals.stride(0),
-        use_provided_indx,  # output [topk]
+        use_provided_indx,
         bitmatrix_bufs,
         bitmatrix_data.stride(0),
-        bitmatrix_data.stride(1),  # output [bitmatrix]
+        bitmatrix_data.stride(1),
         n_rows,
-        n_cols,  # shapes
+        n_cols,
         symm_mem_pool.mesh.local_rank * n_rows_max if all_gather else 0,
         BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,  # tunable parameter
+        BLOCK_N=BLOCK_N,
         APPLY_SOFTMAX=apply_softmax,
         N_EXPTS_PAD=n_cols_pad,
-        N_EXPTS_ACT=k,  # constants
+        N_EXPTS_ACT=k,
     )
     if all_gather:
         symm_mem_pool.hdl.barrier(channel=0)
@@ -943,7 +907,7 @@ def topk(
 ):
     """
     Computes the top-k values and indices along a specified dimension of a tensor.
-    Note that the input can be either a `Tensor` or a `torch.Tensor`, but the output will always be a `torch.Tensor`.
+    Note that the input can be either a `Tensor` or a `torch.Tensor`.
 
     Parameters
     ----------
@@ -952,7 +916,7 @@ def topk(
     k : int
         Number of top elements to retrieve.
     apply_softmax : bool, default True
-        Whether to apply softmax to the input tensor before computing top-k.
+        Whether to apply softmax to the selected top-k values.
     dim : int, default 1
         Dimension along which to compute top-k.
     y_indx : torch.Tensor, optional
@@ -978,8 +942,6 @@ def topk(
     return SparseMatrix(vals=y_vals, indx=y_indx, mask=bitmatrix)
 
 
-# ragged tensor metadata
-# ---------------------------------------------------------------------------- #
 @dataclass
 class RaggedTensorMetadata:
     """
@@ -1007,7 +969,7 @@ class RaggedTensorMetadata:
     slice_offs: torch.Tensor
     # block_offs_data[k] = [0] + cumsum(ceil_div(slice_sizes, 16 * k))
     # i.e., `block_offs_data[k][i]` is the offset of the first block of
-    # `16*k`` token for batch `i` in a `bath_sizes`-shaped ragged tensor
+    # `16*k` tokens for batch `i` in a `slice_sizes`-shaped ragged tensor
     block_offs_data: torch.Tensor
     # let `num_blocks[k] = block_offs_data[k, 1:] - block_offs_data[k, :-1]
     # block_schedule_data[k] = cat(*[[(batch, blk) for blk in range(blks)] for batch, blks in enumerate(num_blocks)])
@@ -1075,7 +1037,9 @@ def exact_div(x, y):
 
 
 def empty_aligned(shape, dtype, device, pad_size):
-    pad = lambda x: cdiv(x, pad_size) * pad_size
+    def pad(x):
+        return cdiv(x, pad_size) * pad_size
+
     ret = torch.empty((*shape[:-1], pad(shape[-1])), dtype=dtype, device=device)
     ret_slices = (*[slice(None)] * (len(shape) - 1), slice(0, shape[-1]))
     return ret[ret_slices], ret.numel()
@@ -1106,11 +1070,9 @@ def _ragged_tensor_metadata_memset(
         # total number of blocks in slice processed as the loop iterates
         n_blocks_tot = tl.zeros([BLOCK], dtype=BlockOffs.dtype.element_ty)
         for i in range(0, n_slices + 1, BLOCK):
-            # load slice sizes
             offs = tl.arange(0, BLOCK) + i
             mask = offs < n_slices
             slice_sizes = tl.load(SliceSizes + offs, mask=mask, other=0)
-            # number of blocks in the slices loaded
             n_blocks = _cdiv_pow2(slice_sizes, block_size_log2)
             # start index of the blocks for the slices loaded
             block_starts = tl.cumsum(n_blocks, 0) + n_blocks_tot
@@ -1126,27 +1088,23 @@ def _ragged_tensor_metadata_memset(
 
 @triton.jit
 def _ragged_tensor_metadata_compute(
-    SliceSizes,  #
+    SliceSizes,
     BlockOffs,
-    block_offs_stride_m,  #
+    block_offs_stride_m,
     BlockSchedule,
-    block_schedule_stride_m,  #
-    first_block_size_log2,  #
+    block_schedule_stride_m,
+    first_block_size_log2,
     SIZES: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
     slice_id = pid // SIZES
     block_size_id = pid % SIZES
-    # offset pointers
     BlockOffs += block_size_id * block_offs_stride_m
     BlockSchedule += block_size_id * block_schedule_stride_m
-    # load slice sizes
     slice_sizes = tl.load(SliceSizes + slice_id)
-    # number of blocks in the slices loaded
     block_size_log2 = first_block_size_log2 + block_size_id
     n_blocks = _cdiv_pow2(slice_sizes, block_size_log2)
-    # compute block schedule
     block_off = tl.load(BlockOffs + slice_id)
     BlockSchedule += block_off
     for block_off in range(0, n_blocks, BLOCK):
@@ -1175,13 +1133,13 @@ def make_ragged_tensor_metadata(slice_sizes, n_total_rows):
 
     _ragged_tensor_metadata_memset[(slice_offs_combined.shape[0] + n_memset_blocks,)](
         slice_sizes,
-        n_slices,  #
+        n_slices,
         slice_offs_combined,
-        slice_offs_combined.stride(0),  #
-        block_schedule_data,  #
+        slice_offs_combined.stride(0),
+        block_schedule_data,
         block_sizes_log2[0],
         SIZES=len(block_sizes_log2),
-        BLOCK=MEMSET_BLOCK,  # optimization parameters
+        BLOCK=MEMSET_BLOCK,
         num_warps=4,
     )
 
@@ -1190,10 +1148,10 @@ def make_ragged_tensor_metadata(slice_sizes, n_total_rows):
         block_offs_data,
         block_offs_data.stride(0),
         block_schedule_data,
-        block_schedule_data.stride(0),  # outputs
+        block_schedule_data.stride(0),
         block_sizes_log2[0],
         SIZES=len(block_sizes_log2),
-        BLOCK=512,  # optimization parameters
+        BLOCK=512,
         num_warps=4,
     )
 

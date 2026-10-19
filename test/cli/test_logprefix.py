@@ -57,7 +57,6 @@ async def test_multi_line_each_prefixed_independently():
 
 @pytest.mark.asyncio
 async def test_traceback_lines_prefixed_per_line():
-    """Per-line prefixing for tracebacks (each frame ends with \\n)."""
     payload = (
         b"Traceback (most recent call last):\n"
         b'  File "x.py", line 1, in <module>\n'

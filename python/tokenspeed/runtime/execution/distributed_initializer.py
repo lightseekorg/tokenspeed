@@ -144,7 +144,6 @@ class DistributedInitializer:
         if config.device == "cuda":
             maybe_set_numa_aware_cpu_affinity(config.gpu_id)
 
-        # Determine backend
         if config.device == "cuda":
             backend = "nccl"
         elif config.device == "npu":
@@ -257,7 +256,6 @@ class DistributedInitializer:
             f"{mapping.attn.dp_rank!s}",
         )
 
-        # Get minimum available GPU memory across all ranks
         min_per_gpu_memory = get_available_gpu_memory(
             config.device,
             config.gpu_id,
@@ -265,7 +263,6 @@ class DistributedInitializer:
             cpu_group=pg_manager.get_process_group("gloo", mapping.world_group),
         )
 
-        # Verify memory balance for tensor parallelism
         if config.world_size > 1:
             local_gpu_memory = get_available_gpu_memory(config.device, config.gpu_id)
             if min_per_gpu_memory < local_gpu_memory * 0.9:

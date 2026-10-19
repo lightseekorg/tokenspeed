@@ -172,20 +172,16 @@ def get_w8a8_block_fp8_config(
 
 @triton.jit
 def _w8a8_block_fp8_matmul(
-    # Pointers to inputs and output
     A,
     B,
     C,
     As,
     Bs,
-    # Shape for matmul
     M,
     N,
     K,
-    # Block size for block-wise quantization
     group_n,
     group_k,
-    # Stride for inputs and output
     stride_am,
     stride_ak,
     stride_bk,
@@ -196,7 +192,6 @@ def _w8a8_block_fp8_matmul(
     stride_As_k,
     stride_Bs_k,
     stride_Bs_n,
-    # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -261,20 +256,16 @@ def _w8a8_block_fp8_matmul(
 
 @triton.jit
 def _w8a8_block_fp8_matmul_unrolledx4(
-    # Pointers to inputs and output
     A,
     B,
     C,
     As,
     Bs,
-    # Shape for matmul
     M,
     N,
     K,
-    # Block size for block-wise quantization
     group_n,
     group_k,
-    # Stride for inputs and output
     stride_am,
     stride_ak,
     stride_bk,
@@ -285,7 +276,6 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     stride_As_k,
     stride_Bs_k,
     stride_Bs_n,
-    # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -317,10 +307,8 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    # manually unroll to 4 iterations
     UNROLL_FACTOR = 4
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K * UNROLL_FACTOR)):
-        # 1st iteration
         a = tl.load(
             a_ptrs,
             mask=offs_k[None, :] < K - (k * UNROLL_FACTOR) * BLOCK_SIZE_K,
@@ -341,7 +329,6 @@ def _w8a8_block_fp8_matmul_unrolledx4(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-        # 2nd iteration
         a = tl.load(
             a_ptrs,
             mask=offs_k[None, :] < K - (k * UNROLL_FACTOR + 1) * BLOCK_SIZE_K,
@@ -362,7 +349,6 @@ def _w8a8_block_fp8_matmul_unrolledx4(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-        # 3rd iteration
         a = tl.load(
             a_ptrs,
             mask=offs_k[None, :] < K - (k * UNROLL_FACTOR + 2) * BLOCK_SIZE_K,
@@ -383,7 +369,6 @@ def _w8a8_block_fp8_matmul_unrolledx4(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-        # 4th iteration
         a = tl.load(
             a_ptrs,
             mask=offs_k[None, :] < K - (k * UNROLL_FACTOR + 3) * BLOCK_SIZE_K,
@@ -444,7 +429,7 @@ def w8a8_block_fp8_matmul_triton(
         As: The per-token-group quantization scale for `A`.
         Bs: The per-block quantization scale for `B`.
         block_size: The block size for per-block quantization. It should be 2-dim, e.g., [128, 128].
-        output_dytpe: The dtype of the returned tensor.
+        output_dtype: The dtype of the returned tensor.
 
     Returns:
         torch.Tensor: The result of matmul.
@@ -457,7 +442,6 @@ def w8a8_block_fp8_matmul_triton(
 
     config = get_w8a8_block_fp8_config(M, N, K, block_n, block_k)
     if config is None:
-        # Default config
         # Each K tile consumes one scale, so its width must equal the scale group.
         if Platform.get().is_amd:
             config = {
@@ -574,7 +558,6 @@ def scaled_mm_kernel(
     # so it is necessary to use tl.int64 for all the offsets, else SEGV will
     # eventually occur.
 
-    # Offsets and masks.
     offsets_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     masks_am = offsets_am < M
 
@@ -614,14 +597,12 @@ def scaled_mm_kernel(
         masks_b = masks_k[:, None] & masks_bn[None, :]
         b = tl.load(b_ptrs, mask=masks_b)
 
-        # Accumulate results.
         accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
 
         offsets_k += BLOCK_SIZE_K
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    # Apply scale at end.
     masks_scale_a = masks_scale_am[:, None] & (tl.arange(0, 1) < 1)[:, None]
     scale_a = tl.load(scale_a_ptrs[:, None], masks_scale_a)
     # Need to broadcast to the appropriate size, if scale_a is already
@@ -635,7 +616,6 @@ def scaled_mm_kernel(
     scale_b = scale_b.broadcast_to((BLOCK_SIZE_N, 1))
     accumulator = scale_b.T * accumulator.to(tl.float32)
 
-    # Convert to output format.
     c = accumulator.to(c_ptr.type.element_ty)
 
     # Add bias, it's already in output format, so add it after conversion.
@@ -646,7 +626,6 @@ def scaled_mm_kernel(
         bias = tl.load(bias_ptrs, bias_mask)
         c += bias
 
-    # Save output
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
     offs_cm = offs_cm.to(tl.int64)
@@ -690,9 +669,10 @@ def triton_scaled_mm(
     assert is_weak_contiguous(input)
     assert is_weak_contiguous(weight)
 
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
 
     result = (
         out
@@ -704,7 +684,8 @@ def triton_scaled_mm(
             f"triton_scaled_mm out expects dtype {out_dtype}, got {result.dtype}"
         )
 
-    has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
+    def has_scalar(x):
+        return x.shape[0] == 1 and x.shape[1] == 1
 
     if use_heuristic:
         is_small_N = N < 8192

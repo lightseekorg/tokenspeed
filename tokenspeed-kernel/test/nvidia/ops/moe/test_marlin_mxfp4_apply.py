@@ -89,7 +89,6 @@ def test_marlin_mxfp4_situ_matches_reference(num_tokens: int) -> None:
     raw = make_mxfp4_moe_weights(
         num_experts, hidden_size, intermediate_size, generator, device="cuda"
     )
-    # topk ids/weights: round-robin ids, normalized random weights.
     topk_ids = (
         torch.arange(num_tokens * top_k, device="cuda").reshape(num_tokens, top_k)
         % num_experts

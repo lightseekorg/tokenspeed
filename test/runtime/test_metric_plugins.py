@@ -74,7 +74,9 @@ def test_registration_stores_callbacks_without_creating_resources(monkeypatch):
 def test_failed_plugin_removes_registration_and_restores_override(registry):
     from tokenspeed.runtime.plugins.registry import recording
 
-    original_validate = lambda config: config
+    def original_validate(config):
+        return config
+
     _register(registry, "existing", override=False, validate=original_validate)
     original = registry.get_metric_reporter("existing")
     with pytest.raises(RuntimeError, match="plugin failed"):

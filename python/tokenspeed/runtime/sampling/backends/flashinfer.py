@@ -678,7 +678,8 @@ class FlashInferSamplingBackend(SamplingBackend):
                 or pad_bs % tp_size != 0
             ):
                 raise RuntimeError(
-                    f"invalid DP sampling pad_bs={pad_bs} for effective_bs={effective_bs}, "
+                    f"invalid DP sampling pad_bs={pad_bs} for "
+                    f"effective_bs={effective_bs}, "
                     f"max_pad_bs={self._dp_max_pad_bs}, tp_size={tp_size}"
                 )
             bs = pad_bs // tp_size

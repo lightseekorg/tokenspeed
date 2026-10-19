@@ -132,7 +132,8 @@ class K3AttnComm:
         if self._prepared_hidden_size is not None:
             if hidden_size != self._prepared_hidden_size:
                 raise ValueError(
-                    "K3 attention workspace hidden size differs from its initial configuration"
+                    "K3 attention workspace hidden size differs from its initial "
+                    "configuration"
                 )
             return
         hidden = hidden_size
@@ -342,7 +343,8 @@ class K3AttnComm:
             num_tokens=num_tokens,
             fusion_max_tokens=global_server_args_dict["comm_fusion_max_num_tokens"],
         ):
-            # Any later reduce in this process overwrites it; this layer is done by then.
+            # Any later reduce in this process overwrites it; this layer is done
+            # by then.
             residual_out, _ = self.cute_ar(
                 attn_partial,
                 prefix_sum,
@@ -477,7 +479,8 @@ class K3MoeTailComm:
                 K3MoeTailComm._workspace_config = configuration
             elif K3MoeTailComm._workspace_config != configuration:
                 raise ValueError(
-                    "K3 routed workspace geometry differs from its initial configuration"
+                    "K3 routed workspace geometry differs from its initial "
+                    "configuration"
                 )
 
     def prepare(self, max_num_tokens: int) -> bool:

@@ -392,9 +392,9 @@ class TestGrammarManagerTimeoutTests:
             assert (len(promoted)) == (1)
             _, promoted_state, _ = promoted[0]
             assert (promoted_state) is (state)
-            _pytest_expr_1 = state.finished
-            _pytest_msg_2 = f"expected admission, got abort: {state.to_abort_message!r}"
-            assert not _pytest_expr_1, _pytest_msg_2
+            finished = state.finished
+            message = f"expected admission, got abort: {state.to_abort_message!r}"
+            assert not finished, message
             assert not (state.grammar.is_invalid)
         finally:
             block_release.set()

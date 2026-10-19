@@ -486,7 +486,7 @@ class TestTritonRouteSelection:
             )
 
         direct_sampler.assert_called_once()
-        args, kwargs = direct_sampler.call_args
+        args, _ = direct_sampler.call_args
         assert (args[7].shape[0]) == (n)
         assert (args[8].shape[0]) == (n)
 

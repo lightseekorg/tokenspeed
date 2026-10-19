@@ -400,9 +400,6 @@ def test_prepared_symmetric_outputs_bypass_default_size_gate(backend, monkeypatc
     backend._nccl.all_reduce_two.assert_not_called()
 
 
-# ---- The one routing decision ----------------------------------------------
-
-
 @pytest.fixture
 def routing(backend, monkeypatch):
     """The fixture backend with a controllable multicast verdict; ``mapping``

@@ -238,15 +238,12 @@ class TestDenseLayerMapping:
             tp_groups.add(tuple(m.tp_group))
             dp_groups.add(tuple(m.dp_group))
 
-        # Should have dp_size distinct TP groups and tp_size distinct DP groups
         assert len(tp_groups) == 2  # dp_size
         assert len(dp_groups) == 4  # tp_size
 
-        # TP groups should be disjoint and cover all ranks
         all_tp_ranks = sorted(r for g in tp_groups for r in g)
         assert all_tp_ranks == list(range(ws))
 
-        # DP groups should be disjoint and cover all ranks
         all_dp_ranks = sorted(r for g in dp_groups for r in g)
         assert all_dp_ranks == list(range(ws))
 
@@ -760,20 +757,16 @@ class TestMapping:
             moe_tp_size=2,
             moe_ep_size=4,
         )
-        # Sizes resolved eagerly
         assert m.attn.tp_size == 4
         assert m.dense.tp_size == 8
         assert m.moe.tp_size == 2
         assert m.moe.ep_size == 4
 
-        # Set rank later
         m.rank = 3
         assert m.rank == 3
-        # Propagated to sub-mappings
         assert m.attn.rank == 3
         assert m.dense.rank == 3
         assert m.moe.rank == 3
-        # Derived ranks work
         assert m.attn.tp_rank == 3
         assert m.dense.tp_rank == 3
         assert m.moe.ep_rank == 1

@@ -989,7 +989,7 @@ def test_fmha_prefill_score_gates() -> None:
     assert not prefill_score_supported(index_q, pages, 32, 256, [8], [32000])
     # Below the measured crossover the Triton pair is faster.
     assert not prefill_score_supported(index_q, pages, 16, 64, [8], [8192])
-    # FP8 index cache is stage 3.
+    # FP8 index cache is not supported.
     assert not prefill_score_supported(
         index_q, pages.to(torch.float8_e4m3fn), 16, 256, [8], [32000]
     )

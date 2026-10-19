@@ -766,19 +766,19 @@ def _matmul(
     GatherIndx,
     WriteBackIndx,
     writeback_size,
-    RAGGED_DIMENSION: gl.constexpr,  #
+    RAGGED_DIMENSION: gl.constexpr,
     XSliceSizes,
     XSliceOffs,
     XBlockOffs,
     XBlockSchedule,
     X_EXPECTED_SLICE_SIZE: gl.constexpr,
-    X_SLICE_SIZES_DIVISIBILITY: gl.constexpr,  #
+    X_SLICE_SIZES_DIVISIBILITY: gl.constexpr,
     WSliceSizes,
     WSliceOffs,
     WBlockOffs,
     WBlockSchedule,
     W_EXPECTED_SLICE_SIZE: gl.constexpr,
-    _W_SLICE_SIZES_DIVISIBILITY: gl.constexpr,  #
+    _W_SLICE_SIZES_DIVISIBILITY: gl.constexpr,
     # true grid size
     batch_size,
     grid_m,
@@ -796,7 +796,7 @@ def _matmul(
     # optimization config
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
-    BLOCK_K: gl.constexpr,  #
+    BLOCK_K: gl.constexpr,
     GROUP_M: gl.constexpr,
     XCD_SWIZZLE: gl.constexpr,
     SWIZZLE_MX_SCALE: gl.constexpr,
@@ -1016,7 +1016,6 @@ def _matmul(
     if XGlobalScale is not None and not cfg.WITH_X_MX_SCALE:
         acc *= gl.load(XGlobalScale).to(gl.float32)
 
-    # bias
     b_dtype = B.dtype if B is not None else gl.float32
     BLOCKED_LAYOUT_BIAS: gl.constexpr = get_blocked_layout(
         [BLOCK_N], b_dtype, cfg.NUM_WARPS, 1
@@ -1649,7 +1648,8 @@ def gluon_mxfp_combine(
         if n_tokens is None:
             if out.shape[0] % int(n_expts_act) != 0:
                 raise ValueError(
-                    "n_tokens is required when output rows are not divisible by n_expts_act"
+                    "n_tokens is required when output rows are not divisible by "
+                    "n_expts_act"
                 )
             n_tokens = out.shape[0] // int(n_expts_act)
         out = out.view(int(n_tokens), int(n_expts_act), out.shape[-1]).sum(dim=1)
@@ -2879,7 +2879,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         device=hidden_states.device, dtype=torch.float32
     ).contiguous()
 
-    ragged_metadata, gather_indx, scatter_indx, _gate_scal = _precomputed_topk_route(
+    ragged_metadata, gather_indx, scatter_indx, _ = _precomputed_topk_route(
         topk_weights,
         topk_ids,
         num_experts,

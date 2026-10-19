@@ -81,10 +81,13 @@ _LAUNCH_OPTIONS = dict(
 
 
 def _network() -> tuple[tuple[int, int], ...]:
-    """The 15 ``(STRIDE, SIZE)`` stages of ATen's 32-item bitonic network
-    (``SortUtils.cuh`` bitonicSort): merge phases ``size = 2, 4, 8, 16`` with ``stride =
-    size / 2 .. 1`` and ``dir = (thread & (size / 2)) != 0``, then the final phase ``stride =
-    16 .. 1`` with ``dir = false`` (encoded as ``SIZE = 0``)."""
+    """Returns the 15 ``(STRIDE, SIZE)`` stages of ATen's 32-item bitonic network.
+
+    The network is ``SortUtils.cuh`` bitonicSort: merge phases
+    ``size = 2, 4, 8, 16`` with ``stride = size / 2 .. 1`` and
+    ``dir = (thread & (size / 2)) != 0``, then the final phase
+    ``stride = 16 .. 1`` with ``dir = false`` (encoded as ``SIZE = 0``).
+    """
     stages: list[tuple[int, int]] = []
     for size in (2, 4, 8, 16):
         stride = size // 2
@@ -98,14 +101,10 @@ def _network() -> tuple[tuple[int, int], ...]:
 NETWORK = _network()
 
 
-# ---------------------------------------------------------------------------------------
-# Triton helpers the lane-parallel router kernel imports.
-# ---------------------------------------------------------------------------------------
-
-
 @triton.jit
 def _ordered_key_tl(x, KEY_NAN: tl.constexpr):
-    # ordered_key: bits ^ ((bits >> 31) & 0x7FFFFFFF), NaN -> KEY_NAN (arithmetic shift).
+    # ordered_key: bits ^ ((bits >> 31) & 0x7FFFFFFF), NaN -> KEY_NAN
+    # (arithmetic shift).
     bits = x.to(tl.int32, bitcast=True)
     key = bits ^ ((bits >> 31) & 0x7FFFFFFF)
     return tl.where(x != x, KEY_NAN, key)
@@ -139,11 +138,6 @@ def _swap_desc(keys, order, valid, STRIDE: tl.constexpr, SIZE: tl.constexpr):
         tl.where(exchange, other_order, order),
         tl.where(exchange, other_valid, valid),
     )
-
-
-# ---------------------------------------------------------------------------------------
-# Host: admission
-# ---------------------------------------------------------------------------------------
 
 
 def grouped_select_rejection(

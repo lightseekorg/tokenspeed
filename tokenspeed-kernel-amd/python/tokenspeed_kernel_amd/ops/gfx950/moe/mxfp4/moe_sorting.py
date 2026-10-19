@@ -236,7 +236,7 @@ def _moe_sorting_stage3_kernel(
     num_valid_ids_ptr,  # (2,) int32
     tokens_cnts_ptr,  # (num_programs + 1, E) int32
     cumsum_ptr,  # (E + 1,) int32
-    m_total,  # python int -> int32 scalar
+    m_total,
     num_experts: gl.constexpr,
     # Route and program counts follow the batch; runtime so shapes share one binary.
     num_programs,
@@ -352,7 +352,7 @@ def gluon_moe_sorting(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Block-aligned expert sort producing sorted routing metadata.
 
-    Runs four small Gluon kernels on the *current* CUDA stream with no
+    Runs small Gluon kernels on the *current* CUDA stream with no
     device-to-host synchronization (see the module docstring for the output
     contract).
 

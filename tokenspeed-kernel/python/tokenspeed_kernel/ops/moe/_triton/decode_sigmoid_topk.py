@@ -28,6 +28,7 @@ from tokenspeed_kernel._triton import tl, triton
 
 @triton.jit
 def _float32_to_ordered_key(value):
+    """Maps FP32 values to uint32 keys whose unsigned order matches FP32 order."""
     bits = value.to(tl.uint32, bitcast=True)
     sign = tl.full(bits.shape, 0x80000000, tl.uint32)
     full = tl.full(bits.shape, 0xFFFFFFFF, tl.uint32)

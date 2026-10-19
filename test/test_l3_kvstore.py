@@ -221,7 +221,9 @@ class TestStorageKeyTest:
             snapshot = os.path.join(repo, "snapshots", commit)
             os.makedirs(os.path.join(repo, "refs"))
             os.makedirs(snapshot)
-            with open(os.path.join(snapshot, "config.json"), "w") as handle:
+            with open(
+                os.path.join(snapshot, "config.json"), "w", encoding="utf-8"
+            ) as handle:
                 handle.write("{}")
             assert (
                 self._checkpoint_id(
@@ -238,7 +240,9 @@ class TestStorageKeyTest:
             repo = os.path.join(root, "hub", "models--org--model")
             snapshot = os.path.join(repo, "snapshots", commit)
             os.makedirs(snapshot)
-            with open(os.path.join(snapshot, "config.json"), "w") as handle:
+            with open(
+                os.path.join(snapshot, "config.json"), "w", encoding="utf-8"
+            ) as handle:
                 handle.write('{"model_type":"x"}')
             with open(os.path.join(snapshot, "model.safetensors"), "wb") as handle:
                 handle.write(b"aaa")
@@ -262,7 +266,9 @@ class TestStorageKeyTest:
             os.makedirs(first)
             os.makedirs(second)
             for directory, payload in ((first, b"aaa"), (second, b"bbb")):
-                with open(os.path.join(directory, "config.json"), "w") as handle:
+                with open(
+                    os.path.join(directory, "config.json"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write('{"model_type":"x"}')
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                     handle.write(payload)
@@ -289,7 +295,9 @@ class TestStorageKeyTest:
             tempfile.TemporaryDirectory() as second,
         ):
             for directory, payload in ((first, b"aaa"), (second, b"bbb")):
-                with open(os.path.join(directory, "config.json"), "w") as handle:
+                with open(
+                    os.path.join(directory, "config.json"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write('{"model_type":"x"}')
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                     handle.write(payload)
@@ -328,7 +336,9 @@ class TestStorageKeyTest:
             os.makedirs(first)
             os.makedirs(second)
             for directory, payload in ((first, b"aaa"), (second, b"bbb")):
-                with open(os.path.join(directory, "config.json"), "w") as handle:
+                with open(
+                    os.path.join(directory, "config.json"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write('{"model_type":"x"}')
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                     handle.write(payload)
@@ -356,7 +366,9 @@ class TestStorageKeyTest:
             tempfile.TemporaryDirectory() as second,
         ):
             for directory, payload in ((first, b"aaa"), (second, b"bbb")):
-                with open(os.path.join(directory, "config.json"), "w") as handle:
+                with open(
+                    os.path.join(directory, "config.json"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write('{"model_type":"x"}')
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                     handle.write(payload)
@@ -382,12 +394,16 @@ class TestStorageKeyTest:
             tempfile.TemporaryDirectory() as second,
         ):
             for directory, kv_algo in ((first, "FP8"), (second, "INT8")):
-                with open(os.path.join(directory, "config.json"), "w") as handle:
+                with open(
+                    os.path.join(directory, "config.json"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write('{"model_type":"x"}')
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                     handle.write(b"weights")
                 with open(
-                    os.path.join(directory, "hf_quant_config.json"), "w"
+                    os.path.join(directory, "hf_quant_config.json"),
+                    "w",
+                    encoding="utf-8",
                 ) as handle:
                     handle.write(
                         '{"quantization":{"quant_algo":"NVFP4",'
@@ -418,13 +434,18 @@ class TestStorageKeyTest:
                 (first, "class Config: rope_theta = 10000\n"),
                 (second, "class Config: rope_theta = 500000\n"),
             ):
-                with open(os.path.join(directory, "config.json"), "w") as handle:
+                with open(
+                    os.path.join(directory, "config.json"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write(
-                        '{"model_type":"x","auto_map":{"AutoConfig":"configuration.Config"}}'
+                        '{"model_type":"x",'
+                        '"auto_map":{"AutoConfig":"configuration.Config"}}'
                     )
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                     handle.write(b"weights")
-                with open(os.path.join(directory, "configuration.py"), "w") as handle:
+                with open(
+                    os.path.join(directory, "configuration.py"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write(source)
             assert (
                 self._checkpoint_id(
@@ -453,17 +474,26 @@ class TestStorageKeyTest:
             ):
                 helpers = os.path.join(directory, "model_helpers")
                 os.makedirs(helpers)
-                with open(os.path.join(directory, "config.json"), "w") as handle:
+                with open(
+                    os.path.join(directory, "config.json"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write(
-                        '{"model_type":"x","auto_map":{"AutoConfig":"configuration.Config"}}'
+                        '{"model_type":"x",'
+                        '"auto_map":{"AutoConfig":"configuration.Config"}}'
                     )
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                     handle.write(b"weights")
-                with open(os.path.join(directory, "configuration.py"), "w") as handle:
+                with open(
+                    os.path.join(directory, "configuration.py"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write("from model_helpers.attention import rotary_dim\n")
-                with open(os.path.join(helpers, "__init__.py"), "w") as handle:
+                with open(
+                    os.path.join(helpers, "__init__.py"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write("")
-                with open(os.path.join(helpers, "attention.py"), "w") as handle:
+                with open(
+                    os.path.join(helpers, "attention.py"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write(helper)
             first_id = self._checkpoint_id(
                 first,
@@ -491,25 +521,38 @@ class TestStorageKeyTest:
             os.makedirs(second_pkg)
             os.makedirs(first_ckpt)
             os.makedirs(second_ckpt)
-            with open(os.path.join(first_pkg, "__init__.py"), "w") as handle:
+            with open(
+                os.path.join(first_pkg, "__init__.py"), "w", encoding="utf-8"
+            ) as handle:
                 handle.write("")
-            with open(os.path.join(first_pkg, "attention.py"), "w") as handle:
+            with open(
+                os.path.join(first_pkg, "attention.py"), "w", encoding="utf-8"
+            ) as handle:
                 handle.write("def rotary_dim():\n    return 64\n")
-            with open(os.path.join(second_pkg, "__init__.py"), "w") as handle:
+            with open(
+                os.path.join(second_pkg, "__init__.py"), "w", encoding="utf-8"
+            ) as handle:
                 handle.write("")
-            with open(os.path.join(second_pkg, "attention.py"), "w") as handle:
+            with open(
+                os.path.join(second_pkg, "attention.py"), "w", encoding="utf-8"
+            ) as handle:
                 handle.write("def rotary_dim():\n    return 128\n")
             for directory, package in (
                 (first_ckpt, first_pkg),
                 (second_ckpt, second_pkg),
             ):
-                with open(os.path.join(directory, "config.json"), "w") as handle:
+                with open(
+                    os.path.join(directory, "config.json"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write(
-                        '{"model_type":"x","auto_map":{"AutoConfig":"configuration.Config"}}'
+                        '{"model_type":"x",'
+                        '"auto_map":{"AutoConfig":"configuration.Config"}}'
                     )
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                     handle.write(b"weights")
-                with open(os.path.join(directory, "configuration.py"), "w") as handle:
+                with open(
+                    os.path.join(directory, "configuration.py"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write("from model_helpers.attention import rotary_dim\n")
                 os.symlink(package, os.path.join(directory, "model_helpers"))
             first_id = self._checkpoint_id(
@@ -529,7 +572,9 @@ class TestStorageKeyTest:
             assert (first_id) != (second_id)
             cycle = os.path.join(root, "cycle")
             os.makedirs(cycle)
-            with open(os.path.join(cycle, "config.json"), "w") as handle:
+            with open(
+                os.path.join(cycle, "config.json"), "w", encoding="utf-8"
+            ) as handle:
                 handle.write("{}")
             os.symlink(cycle, os.path.join(cycle, "loop"))
             assert self._checkpoint_id(
@@ -541,7 +586,9 @@ class TestStorageKeyTest:
 
     def test_checkpoint_id_uses_selected_load_format_weight_files(self):
         with tempfile.TemporaryDirectory() as directory:
-            with open(os.path.join(directory, "config.json"), "w") as handle:
+            with open(
+                os.path.join(directory, "config.json"), "w", encoding="utf-8"
+            ) as handle:
                 handle.write("{}")
             with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                 handle.write(b"safe-weights")
@@ -586,7 +633,9 @@ class TestStorageKeyTest:
             tempfile.TemporaryDirectory() as second,
         ):
             for directory, leftover in ((first, b"aaa"), (second, b"bbb")):
-                with open(os.path.join(directory, "config.json"), "w") as handle:
+                with open(
+                    os.path.join(directory, "config.json"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write("{}")
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                     handle.write(b"same-safe")
@@ -629,7 +678,9 @@ class TestStorageKeyTest:
             tempfile.TemporaryDirectory() as second,
         ):
             for directory, payload in ((first, b"rank0-a"), (second, b"rank0-b")):
-                with open(os.path.join(directory, "config.json"), "w") as handle:
+                with open(
+                    os.path.join(directory, "config.json"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write("{}")
                 with open(
                     os.path.join(directory, "model-rank-0-part-0.safetensors"),
@@ -658,7 +709,9 @@ class TestStorageKeyTest:
         from tokenspeed.runtime.cache.l3 import backend as l3_backend
 
         with tempfile.TemporaryDirectory() as directory:
-            with open(os.path.join(directory, "config.json"), "w") as handle:
+            with open(
+                os.path.join(directory, "config.json"), "w", encoding="utf-8"
+            ) as handle:
                 handle.write("{}")
             default_shard = os.path.join(directory, "model-rank-0-part-0.safetensors")
             alt_shard = os.path.join(directory, "alt-rank-0-part-0.bin")
@@ -719,7 +772,9 @@ class TestStorageKeyTest:
             tempfile.TemporaryDirectory() as second,
         ):
             for directory, np_payload in ((first, b"np-a"), (second, b"np-b")):
-                with open(os.path.join(directory, "config.json"), "w") as handle:
+                with open(
+                    os.path.join(directory, "config.json"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write("{}")
                 with open(os.path.join(directory, "pytorch_model.bin"), "wb") as handle:
                     handle.write(b"same-bin")
@@ -727,6 +782,7 @@ class TestStorageKeyTest:
                 with open(
                     os.path.join(directory, "np", "weight_names.json"),
                     "w",
+                    encoding="utf-8",
                 ) as handle:
                     handle.write('["w"]')
                 with open(os.path.join(directory, "np", "w"), "wb") as handle:
@@ -756,7 +812,9 @@ class TestStorageKeyTest:
                 (first, "consolidated.00.safetensors"),
                 (second, "consolidated.01.safetensors"),
             ):
-                with open(os.path.join(directory, "config.json"), "w") as handle:
+                with open(
+                    os.path.join(directory, "config.json"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write("{}")
                 with open(
                     os.path.join(directory, "consolidated.00.safetensors"),
@@ -771,6 +829,7 @@ class TestStorageKeyTest:
                 with open(
                     os.path.join(directory, "consolidated.safetensors.index.json"),
                     "w",
+                    encoding="utf-8",
                 ) as handle:
                     handle.write(f'{{"weight_map":{{"w":"{mapped}"}}}}')
             assert (
@@ -791,7 +850,9 @@ class TestStorageKeyTest:
 
     def test_checkpoint_id_rejects_unsupported_load_format(self):
         with tempfile.TemporaryDirectory() as directory:
-            with open(os.path.join(directory, "config.json"), "w") as handle:
+            with open(
+                os.path.join(directory, "config.json"), "w", encoding="utf-8"
+            ) as handle:
                 handle.write("{}")
             with pytest.raises((ValueError)):
                 self._checkpoint_id(
@@ -831,7 +892,9 @@ class TestStorageKeyTest:
             snapshot = os.path.join(repo, "snapshots", commit)
             os.makedirs(os.path.join(repo, "refs"))
             os.makedirs(snapshot)
-            with open(os.path.join(snapshot, "config.json"), "w") as handle:
+            with open(
+                os.path.join(snapshot, "config.json"), "w", encoding="utf-8"
+            ) as handle:
                 handle.write("{}")
             with open(os.path.join(snapshot, "model.safetensors"), "wb") as handle:
                 handle.write(b"same-weights")
@@ -887,7 +950,9 @@ class TestStorageKeyTest:
             snapshot = os.path.join(repo, "snapshots", commit)
             os.makedirs(os.path.join(repo, "refs"))
             os.makedirs(snapshot)
-            with open(os.path.join(snapshot, "config.json"), "w") as handle:
+            with open(
+                os.path.join(snapshot, "config.json"), "w", encoding="utf-8"
+            ) as handle:
                 handle.write("{}")
             with open(os.path.join(snapshot, "model.safetensors"), "wb") as handle:
                 handle.write(b"same-weights")
@@ -938,7 +1003,9 @@ class TestStorageKeyTest:
             with open(yaml_path, "w", encoding="utf-8") as handle:
                 handle.write(f"ext_def_file: {ext_def}\n")
             for directory, payload in ((first, b"weights-a"), (second, b"weights-b")):
-                with open(os.path.join(directory, "config.json"), "w") as handle:
+                with open(
+                    os.path.join(directory, "config.json"), "w", encoding="utf-8"
+                ) as handle:
                     handle.write("{}")
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                     handle.write(payload)
@@ -983,7 +1050,9 @@ class TestStorageKeyTest:
             snapshot = os.path.join(repo, "snapshots", commit)
             os.makedirs(os.path.join(repo, "refs"))
             os.makedirs(snapshot)
-            with open(os.path.join(snapshot, "config.json"), "w") as handle:
+            with open(
+                os.path.join(snapshot, "config.json"), "w", encoding="utf-8"
+            ) as handle:
                 handle.write("{}")
             with open(os.path.join(snapshot, "model.safetensors"), "wb") as handle:
                 handle.write(b"same-weights")
@@ -1023,7 +1092,9 @@ class TestStorageKeyTest:
             snapshot = os.path.join(repo, "snapshots", commit)
             os.makedirs(os.path.join(repo, "refs"))
             os.makedirs(snapshot)
-            with open(os.path.join(snapshot, "config.json"), "w") as handle:
+            with open(
+                os.path.join(snapshot, "config.json"), "w", encoding="utf-8"
+            ) as handle:
                 handle.write("{}")
             with open(os.path.join(snapshot, "model.safetensors"), "wb") as handle:
                 handle.write(b"same-weights")
@@ -1085,7 +1156,9 @@ class TestStorageKeyTest:
             snapshot = os.path.join(repo, "snapshots", commit)
             os.makedirs(os.path.join(repo, "refs"))
             os.makedirs(snapshot)
-            with open(os.path.join(snapshot, "config.json"), "w") as handle:
+            with open(
+                os.path.join(snapshot, "config.json"), "w", encoding="utf-8"
+            ) as handle:
                 handle.write("{}")
             with open(os.path.join(snapshot, "model.safetensors"), "wb") as handle:
                 handle.write(b"same-weights")
@@ -1169,7 +1242,9 @@ class TestStorageKeyTest:
 
         l3_backend._local_checkpoint_fingerprint.cache_clear()
         with tempfile.TemporaryDirectory() as directory:
-            with open(os.path.join(directory, "config.json"), "w") as handle:
+            with open(
+                os.path.join(directory, "config.json"), "w", encoding="utf-8"
+            ) as handle:
                 handle.write("{}")
             with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                 handle.write(b"weights")
@@ -1212,7 +1287,7 @@ class TestStorageKeyTest:
                 gather=gather_from([shared]),
             )
         ) == (shared)
-        assert (seen) == ([])
+        assert seen == []
         assert (
             share_l3_checkpoint_ids(
                 shared,
@@ -1264,12 +1339,12 @@ class TestStorageKeyTest:
         with tempfile.TemporaryDirectory() as directory:
             first = os.path.join(directory, "a.json")
             second = os.path.join(directory, "b.json")
-            with open(first, "w") as handle:
+            with open(first, "w", encoding="utf-8") as handle:
                 handle.write('{"scale":1}')
-            with open(second, "w") as handle:
+            with open(second, "w", encoding="utf-8") as handle:
                 handle.write('{"scale":2}')
             same_copy = os.path.join(directory, "a-copy.json")
-            with open(same_copy, "w") as handle:
+            with open(same_copy, "w", encoding="utf-8") as handle:
                 handle.write('{"scale":1}')
             first_id = l3_cache_quantization_id(
                 quantization="fp8",
@@ -1780,7 +1855,7 @@ class TestMooncakeKvStoreTest:
                 return [0] * len(keys)
 
             def batch_put_from(self, keys, ptrs, sizes):
-                del ptrs, sizes
+                del keys, ptrs, sizes
                 return [0]
 
         adapter = object.__new__(MooncakeKvStore)

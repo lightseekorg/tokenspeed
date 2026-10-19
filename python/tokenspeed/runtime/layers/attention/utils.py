@@ -30,7 +30,8 @@ from tokenspeed.runtime.utils.triton import tl, triton
 
 @triton.jit
 def create_flashinfer_kv_indices_triton(
-    page_table_ptr,  # [bs, max_context_len] per-token slot table, row i == batch position i
+    # [bs, max_context_len] per-token slot table, row i == batch position i
+    page_table_ptr,
     page_kernel_lens_ptr,
     kv_indptr,
     kv_indices_ptr,
@@ -51,9 +52,6 @@ def create_flashinfer_kv_indices_triton(
             mask=mask,
         )
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
-
-
-# --- Page-based memory profiling ---
 
 
 def profile_available_cache_memory_bytes(
@@ -79,7 +77,8 @@ def profile_available_cache_memory_bytes(
     available_gpu_memory = get_available_gpu_memory(attn_config.device, gpu_id)
     available_gpu_memory -= post_profile_bytes / (1 << 30)
     if tp_size > 1:
-        # Exact for any byte count, so the minimum never rounds above a rank's free memory.
+        # Exact for any byte count, so the minimum never rounds above a rank's
+        # free memory.
         tensor = torch.tensor(available_gpu_memory, dtype=torch.float64)
         torch.distributed.all_reduce(
             tensor, op=torch.distributed.ReduceOp.MIN, group=cpu_group

@@ -244,6 +244,9 @@ class ProtonProfiler:
     def _read_profiles(
         self, metadata_path: Path, replay_path: Path
     ) -> dict[str, dict[str, Any]]:
+        """FLOP metrics are attached to a replay kernel only when every invocation
+        has that kernel with the same launch count as the eager metadata.
+        """
         metadata_by_case = self._read_metadata(metadata_path)
         replays_by_case = self._read_replays(replay_path)
 

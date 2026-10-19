@@ -183,6 +183,7 @@ def compile_decoder_layer(
 ) -> CompiledDecoderLayer:
     """Analyse a decoder layer execution plan and produce a CompiledDecoderLayer."""
 
+    del layer  # Unused.
     last_compute_idx = _find_last_compute_index(exec_plan)
 
     steps: list[ExecutionStep] = []
@@ -490,6 +491,7 @@ def _initial_hidden_placement(
     prev_layer_output_group: ParallelGroup | None,
     first_compute_input_group: ParallelGroup,
 ) -> Placement | None:
+    del first_compute_input_group  # Unused.
     if prev_layer_output_group is None:
         return None
     if not group_has_parallel(mapping, prev_layer_output_group):
@@ -510,6 +512,7 @@ def _initial_residual_placement(
     prev_layer_output_group: ParallelGroup | None,
     first_compute_input_group: ParallelGroup,
 ) -> Placement | None:
+    del first_compute_input_group  # Unused.
     if prev_layer_output_group is None:
         return None
     if not group_has_parallel(mapping, prev_layer_output_group):
@@ -535,7 +538,7 @@ def _intervening_norm_supports_fusion(
     exec_plan: list[ExecutionNode],
     compute_index: int,
 ) -> bool:
-    """Check if there's a fusible norm between compute_index and the next compute module."""
+    """Check if a fusible norm follows compute_index before the next compute module."""
     for i in range(compute_index + 1, len(exec_plan)):
         spec = exec_plan[i].spec
         if spec.kind == ModuleKind.NORM:

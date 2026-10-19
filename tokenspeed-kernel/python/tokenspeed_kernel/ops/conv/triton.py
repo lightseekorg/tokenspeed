@@ -97,21 +97,12 @@ def triton_causal_conv1d_prefill(
         sequences are concatenated from left to right for varlen
     weight: (dim, width)
     conv_states: (...,dim,width - 1) itype
-        updated inplace if provided
-        [it use `cache_indices` to get the index to the cache of conv_state for that sequence
-
-        conv_state[cache_indices[i]] for seq-i - to be used as initial_state when has_initial_state[i] = True
-             and after that conv_state[cache_indices[i]] need to be shift-left and updated with values from 'x'
-        ]
+        updated inplace if provided. conv_states[cache_indices[i]] is seq-i's
+        initial_state when has_initial_state[i] is True, and is then
+        shifted left and updated with values from 'x'.
     query_start_loc: (batch + 1) int32
         The cumulative sequence lengths of the sequences in
         the batch, used to index into sequence. prepended by 0.
-        if
-        x = [5, 1, 1, 1] <- continuous batching (batch=4)
-        then
-        query_start_loc = [0, 5, 6, 7, 8] <- the starting index of the next sequence; while the last value is
-           the ending index of the last sequence
-        [length(query_start_loc)-1 == batch]
         for example: query_start_loc = torch.Tensor([0,10,16,17]),
         x.shape=(dim,17)
     cache_indices: (batch)  int32
@@ -120,7 +111,6 @@ def triton_causal_conv1d_prefill(
     has_initial_state: (batch) bool
         indicates whether should the kernel take the current state as initial
         state for the calculations
-        [single boolean for each sequence in the batch: True or False]
     bias: (dim,)
     activation: either None or "silu" or "swish" or True
     pad_slot_id: int
@@ -164,10 +154,11 @@ def triton_causal_conv1d_prefill(
     stride_istate_token = 0
     num_cache_lines = 0
     if conv_states is not None:
-        # 1. conv_states is used to replaced initial_states
-        # 2. conv_states serve as a cache with num cache lines can be larger than batch size
-        # 3. mapping from sequence x[idx] to a cache line at index as specified via cache_indices[idx]
-        # 4. computation can be skipped if cache_indices[idx] == pad_slot_id
+        # 1. conv_states replaces initial_states.
+        # 2. conv_states serves as a cache whose number of cache lines can be
+        #    larger than the batch size.
+        # 3. Sequence x[idx] maps to the cache line at cache_indices[idx].
+        # 4. Computation is skipped if cache_indices[idx] == pad_slot_id.
         num_cache_lines = conv_states.size(0)
         assert (
             num_cache_lines == conv_states.shape[0]
@@ -208,7 +199,6 @@ def triton_causal_conv1d_prefill(
 
     grid = (batch_ptr.numel(), triton.cdiv(dim, 256))
     _causal_conv1d_fwd_kernel[grid](
-        # Pointers to matrices
         x,
         weight,
         bias,
@@ -219,11 +209,9 @@ def triton_causal_conv1d_prefill(
         batch_ptr,
         token_chunk_offset_ptr,
         out,
-        # Matrix dimensions
         dim,
         cu_seqlen,
         num_cache_lines,
-        # stride
         stride_x_seq,
         stride_x_dim,
         stride_x_token,
@@ -235,9 +223,7 @@ def triton_causal_conv1d_prefill(
         stride_o_seq,
         stride_o_dim,
         stride_o_token,
-        # others
         pad_slot_id,
-        # META
         HAS_BIAS=bias is not None,
         KERNEL_WIDTH=width,
         SILU_ACTIVATION=activation in ["silu", "swish"],
@@ -296,9 +282,9 @@ def triton_causal_conv1d_update(
         and we are selecting the batch coords specified by conv_state_indices.
         Useful for a continuous batching scenario.
     pad_slot_id: int
-            if cache_indices is passed, lets the kernel identify padded
+            if conv_state_indices is passed, lets the kernel identify padded
             entries that will not be processed,
-            for example: cache_indices = [pad_slot_id, 1 ,20 ,pad_slot_id]
+            for example: conv_state_indices = [pad_slot_id, 1 ,20 ,pad_slot_id]
             in this case, the kernel will not process entries at
             indices 0 and 3
     parent_indices: (batch, seqlen), dtype int32; requires
@@ -355,20 +341,18 @@ def triton_causal_conv1d_update(
         )
     unsqueeze = x.dim() == 2
     if unsqueeze:
-        # make it (batch, dim, seqlen) with seqlen == 1
         x = x.unsqueeze(-1)
     batch, dim, seqlen = x.shape
     _, width = weight.shape
-    # conv_state: (..., dim, state_len), where state_len >= width - 1
     num_cache_lines, _, state_len = conv_state.size()
 
     if validate_data:
         assert dim == weight.size(0)
-        assert (
-            conv_state.stride(-2) == 1
-        ), f"ERROR: expect contiguous along feat-dim of conv_state (currently stride={conv_state.stride()})"
+        assert conv_state.stride(-2) == 1, (
+            "ERROR: expect contiguous along feat-dim of conv_state "
+            f"(currently stride={conv_state.stride()})"
+        )
         assert state_len >= width - 1
-        # when above happens, we don't shift-left to keep any records in conv_state
         assert dim == conv_state.size(1)
         if conv_state_indices is None:
             assert conv_state.size(0) >= batch
@@ -376,7 +360,7 @@ def triton_causal_conv1d_update(
             assert (batch,) == conv_state_indices.shape
 
         assert num_cache_lines >= batch
-        assert weight.stride(1) == 1  # Need this
+        assert weight.stride(1) == 1
         assert cache_seqlens is None
 
     out = x
@@ -401,7 +385,6 @@ def triton_causal_conv1d_update(
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
-    # prepare intermediate buffer strides if provided
     if intermediate_conv_window is not None:
         stride_inter_seq, stride_inter_step, stride_inter_dim, stride_inter_win = (
             intermediate_conv_window.stride(0),
@@ -420,7 +403,6 @@ def triton_causal_conv1d_update(
         stride_output_state_indices_seq = stride_output_state_indices_step = 0
 
     _causal_conv1d_update_kernel[grid](
-        # Pointers to matrices
         x,
         weight,
         bias,
@@ -431,13 +413,11 @@ def triton_causal_conv1d_update(
         intermediate_conv_window if intermediate_conv_window is not None else x,
         output_state_indices if output_state_indices is not None else x,
         out,
-        # Matrix dimensions
         batch,
         dim,
         seqlen,
         state_len,
         num_cache_lines,
-        # stride
         stride_x_seq,
         stride_x_dim,
         stride_x_token,
@@ -456,9 +436,7 @@ def triton_causal_conv1d_update(
         stride_o_seq,
         stride_o_dim,
         stride_o_token,
-        # others
         pad_slot_id,
-        # META
         HAS_BIAS=bias is not None,
         KERNEL_WIDTH=width,
         SILU_ACTIVATION=activation in ["silu", "swish"],

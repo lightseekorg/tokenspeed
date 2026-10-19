@@ -1507,7 +1507,7 @@ def test_packed_compressor_rejected_suffix_every_acceptance(prefix, accepted):
     torch.manual_seed(41)
     content, scores = torch.randn(2, prefix + width, 512)
     new_content, new_scores = torch.randn(2, width, 512)
-    meta = _extend(backend, tables, [prefix], [0], [0], _final([prefix], [0]))
+    _ = _extend(backend, tables, [prefix], [0], [0], _final([prefix], [0]))
     backend.compress(
         2,
         content[:prefix],
@@ -1531,7 +1531,7 @@ def test_packed_compressor_rejected_suffix_every_acceptance(prefix, accepted):
             num_tokens=width,
             for_graph_replay=False,
         )
-        meta = backend.query_metadata(ForwardMode.DECODE)
+        _ = backend.query_metadata(ForwardMode.DECODE)
         pooled, positions, _ = backend.compress(
             2,
             values,
@@ -1564,9 +1564,7 @@ def test_compressor_odd_chunks_arbitrary_requests_and_rejected_suffix():
     ).sum(1)
     parts = []
     for prefix, count in ((0, 3), (3, 2), (5, 2)):
-        meta = _extend(
-            backend, tables, [count], [prefix], [0], _final([count], [prefix])
-        )
+        _ = _extend(backend, tables, [count], [prefix], [0], _final([count], [prefix]))
         pooled, pos, req = backend.compress(
             2,
             content[prefix : prefix + count],
@@ -1584,7 +1582,7 @@ def test_compressor_odd_chunks_arbitrary_requests_and_rejected_suffix():
     torch.testing.assert_close(torch.cat(parts), expected)
     # Position-addressed history survives an uncommitted suffix; this is not
     # a claim that the gated speculative scheduler/commit path is supported.
-    meta = _extend(backend, tables, [2], [7], [0], _final([2], [7]))
+    _ = _extend(backend, tables, [2], [7], [0], _final([2], [7]))
     backend.compress(
         2,
         torch.randn(2, 512),
@@ -1594,7 +1592,7 @@ def test_compressor_odd_chunks_arbitrary_requests_and_rejected_suffix():
         norm_eps=0.0,
     )
     # Reject that suffix logically, then complete a different token7.
-    meta = _extend(backend, tables, [1], [7], [0], _final([1], [7]))
+    _ = _extend(backend, tables, [1], [7], [0], _final([1], [7]))
     new_content, new_scores = torch.randn(1, 512), torch.randn(1, 512)
     pooled, _, _ = backend.compress(
         2,

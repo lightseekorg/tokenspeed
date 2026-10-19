@@ -222,14 +222,13 @@ class CachePool(ABC):
         self.rank = rank
         self.layer_fields: dict[tuple[int, str], str] = {}
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
-            #  Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
+            # Tensor.index_put is not implemented for FP8 dtypes.
             self.store_dtype = torch.uint8
         else:
             self.store_dtype = dtype
         self._field_layer_offset = int(field_layer_offset)
         if self._field_layer_offset < 0:
             raise ValueError("field_layer_offset must be non-negative")
-        # default state for optional layer-wise transfer control
         self.layerwise_load_tracker = None
         logger.info(
             f"Initialized cache view over {arena.size:d} slots as {dtype!s}, layers "
@@ -374,10 +373,8 @@ class CachePool(ABC):
         # same arena, and zeroing it twice is harmless.
         self.arena.clear()
 
-    # ------------------------------------------------------------------
-    # What every cache view owes its kernels. Abstract, so a subclass that
-    # forgets one fails at construction instead of at the first write.
-    # ------------------------------------------------------------------
+    # Abstract, so a subclass that forgets one fails at construction instead
+    # of at the first write.
 
     @abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:

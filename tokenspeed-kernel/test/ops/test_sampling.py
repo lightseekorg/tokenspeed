@@ -134,7 +134,7 @@ def test_gather_sample_basic(device: str) -> None:
     temp_p, top_k_p, top_p_p, _, seed_p, offsets_p = _make_pools(pool_rows, device)
     index = torch.tensor([3, 1, 0, 2], device=device, dtype=torch.int32)
 
-    temps, top_ks, top_ps, min_ps, seeds, offsets = gather_and_expand_scalars(
+    temps, _, _, min_ps, seeds, offsets = gather_and_expand_scalars(
         index,
         temperature=temp_p,
         top_k=top_k_p,
@@ -169,7 +169,7 @@ def test_gather_min_p_only(device: str) -> None:
     temp_p, top_k_p, top_p_p, min_p_p, _, _ = _make_pools(pool_rows, device)
     index = torch.tensor([0, 5, 3], device=device, dtype=torch.int32)
 
-    temps, top_ks, top_ps, min_ps, seeds, offsets = gather_and_expand_scalars(
+    _, _, _, min_ps, seeds, offsets = gather_and_expand_scalars(
         index,
         temperature=temp_p,
         top_k=top_k_p,

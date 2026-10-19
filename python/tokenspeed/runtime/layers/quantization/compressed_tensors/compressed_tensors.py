@@ -110,8 +110,10 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.sparsity_scheme_map = sparsity_scheme_map
         self.sparsity_ignore_list = sparsity_ignore_list
         self.config = config
-        _packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
-        self.packed_modules_mapping = packed_modules_mapping or _packed_modules_mapping
+        default_packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+        self.packed_modules_mapping = (
+            packed_modules_mapping or default_packed_modules_mapping
+        )
         # MoE-kernel-selection knobs (mirror Mxfp4Config): Kimi-K3's
         # compressed-tensors MXFP4 routed experts are weight-only, so neither the
         # w4a8-fp8 nor the dynamic-mxfp4-activation path applies.
@@ -383,11 +385,9 @@ class CompressedTensorsConfig(QuantizationConfig):
             return False
 
     def _is_fp8_w8a8(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
-        # Confirm weights and activations quantized.
         if weight_quant is None or input_quant is None:
             return False
 
-        # Confirm weight scheme is supported.
         is_floating_point = (
             weight_quant.type == QuantizationType.FLOAT
             and input_quant.type == QuantizationType.FLOAT
@@ -412,21 +412,18 @@ class CompressedTensorsConfig(QuantizationConfig):
         if input_quant.dynamic:
             return True
 
-        # Confirm activation scheme is supported.
         is_symmetric_activation = input_quant.symmetric
         is_per_tensor_activation = input_quant.strategy == QuantizationStrategy.TENSOR
         return is_symmetric_activation and is_per_tensor_activation
 
     def _is_fp8_w8a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
-        # Confirm weights quantized.
+        del input_quant  # Unused.
         if weight_quant is None:
             return False
 
-        # Confirm we have 8-bit floating points.
         if weight_quant.type != QuantizationType.FLOAT or weight_quant.num_bits != 8:
             return False
 
-        # Confirm weight scheme is supported.
         is_symmetric_weight = weight_quant.symmetric
         is_static_weight = not weight_quant.dynamic
         is_per_tensor_or_channel_weight = weight_quant.strategy in [
@@ -440,7 +437,6 @@ class CompressedTensorsConfig(QuantizationConfig):
         ):
             return False
 
-        # All conditions satisfied.
         return True
 
     def _is_wNa16_group_channel(
@@ -474,7 +470,6 @@ class CompressedTensorsConfig(QuantizationConfig):
                 "supported: TokenSpeed has no FP8 weight-only GEMM"
             )
 
-        # Detect If Mixed Precision
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if (
                 self.quant_format == CompressionFormat.pack_quantized.value
@@ -524,15 +519,10 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         Detect whether a layer_name is found in any target and
         use the quantization scheme corresponding to the matched target
-        to select the CompressedTensorsScheme used for infernece.
+        to select the CompressedTensorsScheme used for inference.
         """
-
-        # Find the "target" in the compressed-tensors config
-        # that our layer conforms to.
-        # so we do not have to re-write these functions
-        # need to make accelerate optional in ct to do this
-
-        # Will be empty for models with only sparsity
+        # Find the "target" in the compressed-tensors config that our layer
+        # conforms to. This is empty for models with only sparsity.
         weight_quant = input_quant = None
         if self.target_scheme_map:
             matched_target = find_matched_target(
@@ -547,7 +537,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             input_quant = scheme_dict.get("input_activations")
 
         # Find the sparsity scheme of the layer
-        # assume that fused layers inerhit first component's sparsity scheme
+        # assume that fused layers inherit first component's sparsity scheme
         sparsity_targets = self.sparsity_scheme_map.keys() - set(
             self.sparsity_ignore_list
         )
@@ -576,7 +566,6 @@ class CompressedTensorsConfig(QuantizationConfig):
             return None
 
         else:
-            # Find the quant_scheme
             scheme = self._get_scheme_from_parts(  # type: ignore
                 weight_quant=weight_quant,
                 input_quant=input_quant,

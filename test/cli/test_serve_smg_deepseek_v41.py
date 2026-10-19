@@ -240,7 +240,7 @@ def gateway(reference, tmp_path_factory):
         TRANSFORMERS_OFFLINE="1",
         PYTHONPATH=str(root) + os.pathsep + env.get("PYTHONPATH", ""),
     )
-    with (directory / "gateway.log").open("w+") as log:
+    with (directory / "gateway.log").open("w+", encoding="utf-8") as log:
         process = subprocess.Popen(
             [
                 sys.executable,

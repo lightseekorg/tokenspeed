@@ -144,7 +144,8 @@ def test_conv_metadata_and_consumer_cuda_graph():
 
 
 def test_conv_compiles_once_across_prefill_shapes():
-    """Token totals, chunk-map offsets and output strides vary per prefill; none keys a binary."""
+    """Token totals, chunk-map offsets and output strides vary per prefill;
+    none keys a binary."""
     from unittest.mock import patch
 
     from tokenspeed_kernel.ops.conv._triton.causal_conv1d import (

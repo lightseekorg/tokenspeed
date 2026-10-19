@@ -29,11 +29,6 @@ from typing import Iterable, Optional
 _PGID_DIR = Path("/tmp/ci-pgid")
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
 def _safe_runner_id(runner_id: str) -> str:
     """Sanitise runner_id so it is safe to use as a filename."""
     return re.sub(r"[^A-Za-z0-9_.-]", "_", runner_id)
@@ -46,7 +41,7 @@ def _pgid_path(runner_id: str) -> Path:
 def _save_pgids(runner_id: str, pgids: Iterable[int]) -> None:
     _PGID_DIR.mkdir(parents=True, exist_ok=True)
     _pgid_path(runner_id).write_text(
-        "".join(f"{pgid}\n" for pgid in sorted(set(pgids)))
+        "".join(f"{pgid}\n" for pgid in sorted(set(pgids))), encoding="utf-8"
     )
 
 
@@ -62,7 +57,7 @@ def _load_pgids(runner_id: str) -> set[int]:
         return set()
     pgids: set[int] = set()
     try:
-        for token in path.read_text().split():
+        for token in path.read_text(encoding="utf-8").split():
             pgids.add(int(token))
     except (ValueError, OSError):
         return set()
@@ -274,7 +269,8 @@ class ProcessGroupManager:
     def terminate_all(self, dry_run: bool = False) -> None:
         """Kill all processes started via this manager."""
         print(
-            f"[pgm] terminate_all: runner={self.runner_id} tracked_procs={len(self._procs)}",
+            f"[pgm] terminate_all: runner={self.runner_id} "
+            f"tracked_procs={len(self._procs)}",
             flush=True,
         )
         if dry_run:
@@ -322,14 +318,16 @@ class ProcessGroupManager:
                 pgids.add(pgid)
                 _kill_pgid(pgid, signal.SIGTERM)
                 print(
-                    f"[pgm] terminate_all: sent SIGTERM to pgid={pgid} (pid={proc.pid})",
+                    f"[pgm] terminate_all: sent SIGTERM to pgid={pgid} "
+                    f"(pid={proc.pid})",
                     flush=True,
                 )
             except ProcessLookupError:
                 print(f"[pgm] terminate_all: pid={proc.pid} already exited", flush=True)
 
         print(
-            f"[pgm] terminate_all: waiting up to {self.term_timeout}s for graceful shutdown",
+            f"[pgm] terminate_all: waiting up to {self.term_timeout}s "
+            "for graceful shutdown",
             flush=True,
         )
         deadline = time.time() + self.term_timeout
@@ -363,11 +361,6 @@ class ProcessGroupManager:
         self._procs.clear()
         _remove_pgid(self.runner_id)
         print("[pgm] terminate_all: cleanup done, all processes cleared", flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Factory helper
-# ---------------------------------------------------------------------------
 
 
 def make_manager(term_timeout: float = 10.0) -> ProcessGroupManager:

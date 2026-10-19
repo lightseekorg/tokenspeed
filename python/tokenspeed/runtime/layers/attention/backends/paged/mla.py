@@ -202,10 +202,6 @@ class MLAAttnBackend(PagedAttentionBackend):
             solution=self.kernel_solution,
         )
 
-    # ------------------------------------------------------------------
-    # Metadata
-    # ------------------------------------------------------------------
-
     def init_forward_metadata(
         self,
         bs: int,
@@ -425,10 +421,6 @@ class MLAAttnBackend(PagedAttentionBackend):
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(metadata.q_len_per_req))
         self.page_table_buf[:bs].copy_(page_table[:bs])
         self.forward_decode_metadata = metadata
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
 
     def forward_decode(
         self,

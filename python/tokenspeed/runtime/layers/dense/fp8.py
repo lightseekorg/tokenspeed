@@ -96,7 +96,6 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
 
-        # WEIGHT
         weight_dtype = (
             torch.float8_e4m3fn
             if self.quant_config.is_checkpoint_fp8_serialized
@@ -116,7 +115,6 @@ class Fp8LinearMethod(LinearMethodBase):
         # If checkpoint is serialized fp8, load them.
         # Otherwise, wait until process_weights_after_loading.
         if self.quant_config.is_checkpoint_fp8_serialized:
-            # WEIGHT SCALE
             if self.block_quant:
                 if hasattr(self.quant_config, "activation_scheme"):
                     if self.quant_config.activation_scheme != "dynamic":
@@ -152,7 +150,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale", scale)
 
-            # INPUT ACTIVATION SCALE
             if (
                 hasattr(self.quant_config, "activation_scheme")
                 and self.quant_config.activation_scheme == "static"
@@ -202,14 +199,13 @@ class Fp8LinearMethod(LinearMethodBase):
 
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.quant_config.is_checkpoint_fp8_serialized:
-                # apply per-channel quantization default as
+                # Apply per-channel quantization by default.
                 qweight, weight_scale = quantize_fp8(
                     layer.weight,
                     granularity="token",
                 )
                 weight_scale = weight_scale.t().contiguous()
 
-                # Update the layer with the new values.
                 layer.weight = Parameter(qweight.t(), requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                 layer.input_scale = None
@@ -236,7 +232,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.weight_scale, layer.logical_widths
                 )
 
-                # Update layer with new values.
                 layer.weight = Parameter(weight.t(), requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                 if (
@@ -249,7 +244,8 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.input_scale = Parameter(
                         layer.input_scale.max(), requires_grad=False
                     )
-                    # Shards sharing one scale stay per-tensor, which cuBLASLt FP8 GEMMs take.
+                    # Shards sharing one scale stay per-tensor, which cuBLASLt FP8
+                    # GEMMs take.
                     if bool((weight_scale == weight_scale[0]).all()):
                         layer.weight_scale = Parameter(
                             weight_scale[0].clone(), requires_grad=False
@@ -324,14 +320,14 @@ class Fp8LinearMethod(LinearMethodBase):
             weight_scale = layer.weight_scale
             input_scale = layer.input_scale
 
-            # View input as 2D matrix for fp8 methods
             input_2d = input.view(-1, input.shape[-1])
             output_shape = [*input.shape[:-1], weight.shape[1]]
 
             if input_scale is not None:
                 if input_scale.numel() != 1:
                     raise ValueError(
-                        f"input_scale must contain exactly one value, got {input_scale.numel()}."
+                        "input_scale must contain exactly one value, got "
+                        f"{input_scale.numel()}."
                     )
                 if input_2d.dtype == torch.float8_e4m3fn:
                     # Its producer already quantized it with this layer's scale.
@@ -360,5 +356,6 @@ class Fp8LinearMethod(LinearMethodBase):
             return output.view(*output_shape)
 
     def static_fp8_input_scale(self, layer: torch.nn.Module) -> torch.Tensor | None:
-        # Block and dynamic activation scales are found per call, so no producer can apply them.
+        # Block and dynamic activation scales are found per call, so no producer
+        # can apply them.
         return None if self.block_quant else layer.input_scale

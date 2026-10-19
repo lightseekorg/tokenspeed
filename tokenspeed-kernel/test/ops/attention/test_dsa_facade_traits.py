@@ -262,9 +262,6 @@ def test_candidate_lens_cpu_reaches_only_leaves_declaring_the_feature(
         Platform.override(real_platform)
 
 
-# --- top-k leaves: slot_order ------------------------------------------------
-
-
 @pytest.fixture
 def ordering_topk_leaves(fresh_registry, h100_platform):
     """A silent bf16 leaf and one declaring ``slot_order`` per top-k mode."""
@@ -331,8 +328,6 @@ def test_topk_sorted_order_refuses_a_silent_leaf(ordering_topk_leaves, mode):
     with pytest.raises(ValueError, match="does not declare the slot_order"):
         _TOPK_CALLS[mode](plane, slot_order="sorted", solution=f"silent_{mode}")
 
-
-# --- workspace rows: index keys handed in workspace-row order -----------------
 
 ROWS = 16
 FP8_ROWS = {
@@ -574,9 +569,6 @@ def test_the_rows_selection_can_be_probed_without_running(row_leaves):
     with pytest.raises(ValueError, match="workspace-row order"):
         _probe("fp16")
     assert not any(row_leaves.values())
-
-
-# --- sparse cores: slot_order -------------------------------------------------
 
 
 def _register_core(mode: str, name: str, *, slot_orders, priority):

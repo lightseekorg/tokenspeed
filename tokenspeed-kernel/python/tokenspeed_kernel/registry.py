@@ -106,11 +106,11 @@ class Priority(IntEnum):
     +--------------+--------+----------------------------------------------------+
     | PORTABLE     |  4..7  | In-tree generic implementation with no arch or     |
     |              |        | shape gating beyond the family contract — e.g.     |
-    |              |        | default Triton, or PyTorch reference patsh used as |
+    |              |        | default Triton, or PyTorch reference paths used as |
     |              |        | last-resort coverage.                              |
     +--------------+--------+----------------------------------------------------+
     | PERFORMANT   | 8..11  | In-tree generally optimized kernel, covering a     |
-    |              |        | broad arch range — e.g. optimizied Triton for      |
+    |              |        | broad arch range — e.g. optimized Triton for       |
     |              |        | Hopper+. The default winner on supported vendor.   |
     +--------------+--------+----------------------------------------------------+
     | SPECIALIZED  | 12..15 | In-tree highly optimized kernel, narrowly gated on |
@@ -163,7 +163,6 @@ def _validate_priority(value: int | Priority) -> int:
 class KernelSpec:
     """Complete specification of a registered kernel."""
 
-    # Identity
     name: str  # Unique name, e.g., "flashinfer_decode_sm90"
     family: str  # "attention", "gemm", "moe", etc.
     mode: str  # "decode", "mm", "experts", etc.
@@ -172,13 +171,11 @@ class KernelSpec:
     )  # Orthogonal features, e.g., {"paged", "mla"}
     solution: str = ""  # "triton", "flashinfer", "cutlass", "torch", etc.
 
-    # Capabilities
     capability: CapabilityRequirement = field(default_factory=CapabilityRequirement)
     format_signatures: frozenset[FormatSignature] = frozenset()
     # Op-specific traits, e.g. {"head_dim": frozenset({64, 128, 256}), "persistent": frozenset({True})}
     traits: dict[str, frozenset[Any]] = field(default_factory=dict)
 
-    # Selection metadata
     # Higher = preferred. See :class:`Priority` for the band layout. The default
     # places unannotated kernels in PERFORMANT so they win against PORTABLE but
     # lose to SPECIALIZED. Selection scoring clamps out-of-range values.
@@ -228,7 +225,7 @@ class KernelSpec:
         storage_dtype: torch.dtype,
         roles: str | Iterable[str],
     ) -> FormatSignature | None:
-        """Return the single matching signature, or raise if ambiguous."""
+        """Return the single matching signature (None if none); raise if ambiguous."""
         matches = self.format_signatures_for_storage_dtype(storage_dtype, roles)
         if len(matches) > 1:
             role_list = ", ".join(_normalize_roles(roles)) or "none"
@@ -278,10 +275,7 @@ class KernelRegistry:
         """Reset singleton (for testing)."""
         cls._instance = None
 
-    # ---- Registration ----
-
     def register(self, spec: KernelSpec, impl: Callable) -> None:
-        """Register a kernel specification and its implementation."""
         if spec.name in self._by_name:
             # Allow re-registration (plugin override)
             self._unregister(spec.name)
@@ -302,14 +296,10 @@ class KernelRegistry:
         self._by_operator[key] = [s for s in self._by_operator[key] if s.name != name]
         self._invalidate_cache(key)
 
-    # ---- Queries ----
-
     def get_by_name(self, name: str) -> KernelSpec | None:
-        """Get a specific kernel spec by name."""
         return self._by_name.get(name)
 
     def get_impl(self, name: str) -> Callable | None:
-        """Get a kernel's callable implementation by name."""
         return self._impls.get(name)
 
     def get_for_operator(
@@ -323,7 +313,6 @@ class KernelRegistry:
         solution: str | None = None,
         ignore_layout: bool = False,
     ) -> list[KernelSpec]:
-        """Get all kernels for an operator, optionally filtered."""
         specs = list(self._by_operator.get((family, mode), []))
 
         if features is not None:
@@ -352,7 +341,6 @@ class KernelRegistry:
         family: str | None = None,
         mode: str | None = None,
     ) -> list[KernelSpec]:
-        """List registered kernel specs, optionally filtered."""
         if family and mode:
             return list(self._by_operator.get((family, mode), []))
         specs = list(self._by_name.values())
@@ -363,17 +351,12 @@ class KernelRegistry:
         return specs
 
     def list_solutions(self, family: str, mode: str) -> list[str]:
-        """List available solutions for an operator."""
         return list({s.solution for s in self._by_operator.get((family, mode), [])})
 
-    # ---- Cache management ----
-
     def cache_get(self, key: tuple) -> SelectedKernel | None:
-        """Look up a cached selection result."""
         return self._selection_cache.get(key)
 
     def cache_put(self, key: tuple, selected_kernel: SelectedKernel) -> None:
-        """Store a selection result in the cache."""
         self._selection_cache[key] = selected_kernel
 
     def _invalidate_cache(self, key: tuple[str, str]) -> None:

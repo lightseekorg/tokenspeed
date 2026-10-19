@@ -121,9 +121,10 @@ def test_hash_large_union_and_replay(queries, graph_mode):
     """Exercise real Q4 shared size, global tables, duplicate tags and padding."""
     h, stride, k, r = 4096, 5124, 2048, 4
     n = queries * k
-    ints = lambda count, fill=0: torch.full(
-        (count,), fill, dtype=torch.int32, device="cuda"
-    )
+
+    def ints(count, fill=0):
+        return torch.full((count,), fill, dtype=torch.int32, device="cuda")
+
     host = torch.arange(10000 * 17, dtype=torch.uint8).view(10000, 1, 17).pin_memory()
     device = torch.zeros((r * stride, 1, 17), dtype=torch.uint8, device="cuda")
     keys = ints(r * stride, -1)
@@ -168,7 +169,7 @@ def test_hash_large_union_and_replay(queries, graph_mode):
     if graph_mode:
         with torch.cuda.graph(graph):
             step()
-    for iteration in range(3):
+    for _ in range(3):
         keys.fill_(-1)
         offload.reset_lru(lru, None, hot=h)
         # Two resident copies must map to the smaller physical slot, even
@@ -219,9 +220,10 @@ def test_hash_collisions_and_large_positive_ids():
             collide.append(value)
         value += 1
     h, stride, n, r = 128, 132, 128, 3
-    ints = lambda count, fill=0: torch.full(
-        (count,), fill, dtype=torch.int32, device="cuda"
-    )
+
+    def ints(count, fill=0):
+        return torch.full((count,), fill, dtype=torch.int32, device="cuda")
+
     host = torch.arange(value * 4, dtype=torch.int32).view(value, 1, 4).pin_memory()
     device = torch.zeros((r * stride, 1, 4), dtype=torch.int32, device="cuda")
     keys = ints(r * stride, -1)

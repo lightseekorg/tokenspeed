@@ -61,8 +61,9 @@ def validate_environment(workspace: Path, cuda_home: Path) -> None:
         workspace: Checkout whose packages and constraints will be installed.
         cuda_home: Host-supplied CUDA Toolkit directory.
 
-    Returns:
-        None when Linux, Python 3.11, an active venv and CUDA 12.9 are present.
+    Raises:
+        RuntimeError: Unless Linux, Python 3.11, an active venv, a complete
+            checkout, no CUDA 13 packages, and a CUDA 12.9 nvcc are present.
     """
     if platform.system() != "Linux":
         raise RuntimeError(
@@ -188,7 +189,9 @@ def main() -> None:
     pip_install(["torch", "torchvision"], PYTORCH)
 
     native = [req for req in requirements if req.split("==")[0] in NATIVE_PACKAGES]
-    runtime = tomllib.loads((workspace / "python" / "pyproject.toml").read_text())
+    runtime = tomllib.loads(
+        (workspace / "python" / "pyproject.toml").read_text(encoding="utf-8")
+    )
     mooncake = [
         req
         for req in runtime["project"]["dependencies"]

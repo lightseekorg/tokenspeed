@@ -471,7 +471,9 @@ def test_save_keeps_rank_specific_tactics(monkeypatch, tmp_path):
     local = {"_metadata": {}, "rank0": ["Runner", 7]}
     peer = {"_metadata": {}, "rank1": ["Runner", 9]}
     monkeypatch.setattr(
-        tuner, "save_configs", lambda path: Path(path).write_text(json.dumps(local))
+        tuner,
+        "save_configs",
+        lambda path: Path(path).write_text(json.dumps(local), encoding="utf-8"),
     )
     monkeypatch.setattr(tuning.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(tuning.dist, "get_world_size", lambda group: 2)

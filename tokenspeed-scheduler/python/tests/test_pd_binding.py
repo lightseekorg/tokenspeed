@@ -60,7 +60,7 @@ def make_spec(request_id: str, tokens: list[int]) -> RequestSpec:
 
 
 def test_pd_event_fields_are_bound():
-    """PD event objects require request_id constructor arg and expose it as read-only."""
+    """PD events take request_id in the constructor and expose it read-only."""
     event = PD.BootstrappedEvent("req-0")
 
     assert event.request_id == "req-0"

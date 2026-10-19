@@ -358,8 +358,8 @@ def minimax_indexer(
             see ``query_lens_cpu``.
         score_out: Optional caller-owned ``[tokens, num_heads, max_blocks]``
             fp32 buffer, pre-filled with ``-inf`` and reused across layers in
-            place of a fresh per-call allocation. Honored only on the decode
-            path when its shape/dtype match; otherwise a buffer is allocated.
+            place of a fresh per-call allocation. Used only on the decode
+            path, where its shape/dtype must match.
 
     Returns:
         Selected logical block ids shaped ``[tokens, local_index_heads, topk]``.

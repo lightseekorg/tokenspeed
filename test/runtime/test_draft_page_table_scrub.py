@@ -92,9 +92,7 @@ class TestDraftHistoryScrubTest:
         _refresh(router, 8, 6, torch.full((6, 4), 7, dtype=torch.int32))
         _refresh(router, 8, 2, torch.full((2, 4), 3, dtype=torch.int32))
         view = router.draft_history_view()
-        _pytest_expr_1 = (view.table[2:] == 0).all()
-        _pytest_msg_2 = view.table
-        assert _pytest_expr_1, _pytest_msg_2
+        assert (view.table[2:] == 0).all(), view.table
         assert (view.table[:2] == 3).all()
 
     def test_padded_replay_rows_resolve_to_the_dummy_slot(self):
@@ -178,9 +176,7 @@ class TestIdleReplayScrubTest:
                 need_idle_forward=True,
             ),
         )
-        _pytest_expr_3 = (captured["rows"] == 0).all()
-        _pytest_msg_4 = captured["rows"]
-        assert _pytest_expr_3, _pytest_msg_4
+        assert (captured["rows"] == 0).all(), captured["rows"]
         assert (captured["attn_backend"]) is (ex.attn_backend)
         # The idle replay hands the runner empty extend slices, never None.
         extend_kwargs = captured["extend_kwargs"]
@@ -191,10 +187,7 @@ class TestIdleReplayScrubTest:
             "extend_seq_lens",
             "extend_seq_lens_cpu",
         ):
-            _pytest_first_5 = extend_kwargs[name].numel()
-            _pytest_second_6 = 0
-            _pytest_msg_7 = name
-            assert _pytest_first_5 == _pytest_second_6, _pytest_msg_7
+            assert extend_kwargs[name].numel() == 0, name
         # And the runner's required host tables: no request, no groups.
         assert (extend_kwargs["block_tables_cpu"]) == ({})
 

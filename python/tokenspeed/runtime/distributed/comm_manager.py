@@ -338,8 +338,6 @@ class CommManager:
             )
         self.dense_batch_invariant = dense_batch_invariant
 
-    # ---- Scattered token counts ----
-
     def _shard(self, ctx: ForwardContext) -> QueryShardPlan | None:
         """The forward's query shard when the rows this layer holds are a
         shard; None for replicated rows."""
@@ -395,6 +393,8 @@ class CommManager:
         return self.scattered_num_tokens(ctx)[start:end]
 
     def moe_tp_ep_group_scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
+        """Without a global count table under attention DP, only this rank's own
+        entry is filled in and the others are 0."""
         tp_ep_size = self.mapping.moe.tp_ep_size
         global_counts = (
             ctx.collective_global_num_tokens
@@ -422,8 +422,6 @@ class CommManager:
         result = [0] * tp_ep_size
         result[self.mapping.moe.tp_ep_rank] = num_tokens
         return result
-
-    # ---- Communication patterns ----
 
     def use_all_reduce(self, is_moe: bool):
         if is_moe:
@@ -684,8 +682,6 @@ class CommManager:
             scattered_num_tokens=self.attn_tp_group_scattered_num_tokens(ctx),
         )
         return hidden_states, residual
-
-    # ---- Fused allreduce+norm ----
 
     def use_all_reduce_norm_fusion(self) -> bool:
         from tokenspeed.runtime.utils.env import global_server_args_dict

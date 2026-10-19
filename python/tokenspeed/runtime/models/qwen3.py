@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Inference-only Qwen2 model compatible with HuggingFace weights."""
+"""Inference-only Qwen3 model compatible with HuggingFace weights."""
 
 from __future__ import annotations
 
@@ -213,6 +213,12 @@ class Qwen3Attention(nn.Module):
 
 
 class Qwen3DecoderLayer(nn.Module):
+    """Qwen3 decoder layer: pre-norm attention followed by a pre-norm MLP.
+
+    The all-reduce of each sub-block output is deferred to the next norm, where
+    it is optionally fused with the residual add and RMSNorm.
+    """
+
     def __init__(
         self,
         config: Qwen3Config,
@@ -225,7 +231,8 @@ class Qwen3DecoderLayer(nn.Module):
         self.mapping = mapping
         if self.mapping.attn.tp_size != self.mapping.dense.tp_size:
             raise ValueError(
-                "Qwen3 does not use CommManager and assumes attn_tp_size == dense_tp_size"
+                "Qwen3 does not use CommManager and assumes "
+                "attn_tp_size == dense_tp_size"
             )
         self.hidden_size = config.hidden_size
         rope_theta = get_rope_theta(config, 1000000)
@@ -270,7 +277,6 @@ class Qwen3DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -296,7 +302,6 @@ class Qwen3DecoderLayer(nn.Module):
             cos_sin=cos_sin,
         )
 
-        # Fully Connected
         if ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
             hidden_states = all_reduce(hidden_states, self.mapping.attn.tp_group)
             hidden_states, residual = self.post_attention_layernorm(
@@ -324,6 +329,7 @@ class Qwen3Model(nn.Module):
         prefix: str = "",
         decoder_layer_type: type[nn.Module] = None,
     ) -> None:
+        del prefix
         super().__init__()
         self.mapping = mapping
         self.config = config
@@ -392,7 +398,6 @@ class Qwen3Model(nn.Module):
 class Qwen3ForCausalLM(BaseCausalLM):
     model_cls = Qwen3Model
 
-    # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
         ".down_proj.",
@@ -403,7 +408,7 @@ class Qwen3ForCausalLM(BaseCausalLM):
         ".o_proj.",
     ]
     bitsandbytes_stacked_params_mapping = {
-        # shard_name, weight_name, index
+        # shard_name: (weight_name, index).
         "q_proj": ("qkv_proj", 0),
         "k_proj": ("qkv_proj", 1),
         "v_proj": ("qkv_proj", 2),
@@ -436,16 +441,15 @@ class Qwen3ForCausalLM(BaseCausalLM):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        """
-        'model.layers.0.self_attn.q_norm.weight',
-        'model.layers.0.self_attn.k_norm.weight',
-        'model.layers.0.self_attn.qkv_proj.weight',
-        'model.layers.0.self_attn.o_proj.weight',
-        'model.layers.0.mlp.gate_up_proj.weight',
-        'model.layers.0.mlp.down_proj.weight',
-        'model.layers.0.input_layernorm.weight',
-        'model.layers.0.post_attention_layernorm.weight'
-        """
+        # Parameter names per layer after fusion, for example:
+        #   model.layers.0.self_attn.q_norm.weight
+        #   model.layers.0.self_attn.k_norm.weight
+        #   model.layers.0.self_attn.qkv_proj.weight
+        #   model.layers.0.self_attn.o_proj.weight
+        #   model.layers.0.mlp.gate_up_proj.weight
+        #   model.layers.0.mlp.down_proj.weight
+        #   model.layers.0.input_layernorm.weight
+        #   model.layers.0.post_attention_layernorm.weight
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "Embedding" in self.config.name_or_path:

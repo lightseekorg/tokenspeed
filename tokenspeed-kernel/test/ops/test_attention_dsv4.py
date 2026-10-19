@@ -70,7 +70,7 @@ class TestDeepseekV4AttentionOpsCpuValidationTest:
         for override in invalid_overrides:
             case = valid | override
             with subtests.test(override=override):
-                assert not (_dsv4_use_serial_four_block_indexer_q(**case))
+                assert not _dsv4_use_serial_four_block_indexer_q(**case)
 
     def test_v4_table_kernels_do_not_specialize_runtime_geometry(self, subtests):
         cases = (
@@ -88,7 +88,7 @@ class TestDeepseekV4AttentionOpsCpuValidationTest:
             for name in names:
                 with subtests.test(kernel=kernel.__name__, name=name):
                     parameter = parameters[name]
-                    assert not (parameter.is_constexpr)
+                    assert not parameter.is_constexpr
                     assert parameter.do_not_specialize
 
     def test_sparse_prefill_gather_launch_config(self, subtests):
@@ -108,10 +108,10 @@ class TestDeepseekV4AttentionOpsCpuValidationTest:
         )
         for num_reqs, max_rows, expected in cases:
             with subtests.test(num_reqs=num_reqs, max_rows=max_rows):
-                assert (_dsv4_gather_launch_config(num_reqs, max_rows)) == (expected)
+                assert _dsv4_gather_launch_config(num_reqs, max_rows) == expected
 
 
-@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("CUDA is required"))
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 class TestDeepseekV4AttentionOpsTest:
     def _assert_persistent_topk_matches_torch(
         self,
@@ -539,7 +539,7 @@ class TestDeepseekV4AttentionOpsTest:
         )
         torch.cuda.synchronize()
 
-        assert (actual.data_ptr()) == (out.data_ptr())
+        assert actual.data_ptr() == out.data_ptr()
         assert torch.equal(
             actual.cpu(),
             torch.tensor([-1, -1, 10 * 4 + 1, -1, -1], dtype=torch.int64),
@@ -575,7 +575,7 @@ class TestDeepseekV4AttentionOpsTest:
         )
         torch.cuda.synchronize()
 
-        assert (actual.data_ptr()) == (out.data_ptr())
+        assert actual.data_ptr() == out.data_ptr()
         assert torch.equal(
             actual.cpu(),
             torch.tensor([-1, -1, 20 * 64 + 1, -1, -1, -1]),

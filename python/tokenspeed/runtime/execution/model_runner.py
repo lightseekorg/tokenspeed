@@ -101,7 +101,6 @@ def infer_multimodal_encoder_dtype(model: torch.nn.Module) -> str | None:
 class ModelRunner:
     def __init__(
         self,
-        # Configuration
         model_config: ModelConfig,
         server_args: ServerArgs,
         gpu_id: int,
@@ -123,7 +122,6 @@ class ModelRunner:
                 stages may not build it (``create_model_runner``).
             is_draft_worker: Whether this is the speculative draft model.
         """
-        # Store configuration
         self.model_config = model_config
         self.server_args = server_args
         self.device = server_args.device
@@ -471,7 +469,8 @@ class ModelRunner:
             if rejected:
                 return False, (
                     f"applied {len(names)} weights, but the update is rejected and "
-                    f"its weight version not advanced: {non_unit_kv_scale_message(rejected)}; "
+                    "its weight version not advanced: "
+                    f"{non_unit_kv_scale_message(rejected)}; "
                     "resend the weights without KV-cache scales"
                 )
             return True, f"updated {len(names)} weights"
@@ -706,6 +705,7 @@ class ModelRunner:
         clean group. Idempotent: tearing down when no group is live is a success
         so a trainer that always calls destroy (e.g. slime) never errors.
         """
+        del obj
         pg = self._weight_update_pg
         if pg is None:
             return True, "weight update group not initialized"

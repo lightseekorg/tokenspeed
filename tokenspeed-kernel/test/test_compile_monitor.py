@@ -293,7 +293,7 @@ def test_launch_options_are_plain_values():
         roots += [Path(path) for path in amd.submodule_search_locations]
     offenders = []
     for path in (p for root in roots for p in root.rglob("*.py")):
-        tree = ast.parse(path.read_text())
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         constexprs = {
             target.id
             for node in tree.body

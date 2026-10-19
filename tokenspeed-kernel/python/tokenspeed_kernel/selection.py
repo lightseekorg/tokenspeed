@@ -129,7 +129,6 @@ class AutotuneParams:
 class SelectionPolicy:
     """Per-op selection strategy configuration."""
 
-    # Default strategy for all ops
     default_strategy: SelectionStrategy = SelectionStrategy.HEURISTIC
 
     # Per-op overrides: (family, mode) -> strategy
@@ -624,7 +623,6 @@ def select_kernel(
             f"{solution_clause} with traits {traits} on {platform.device_name}"
         )
 
-    # Strategy dispatch
     strategy = _policy.get_strategy(family, mode)
 
     if strategy == SelectionStrategy.AUTOTUNE:
@@ -663,6 +661,7 @@ def _autotune_select(
     Falls back to heuristic ranking when the autotuning infrastructure
     (input generators, benchmark runner) is not yet available.
     """
+    del params
     scored = _rank(candidates, platform, traits)
     winner = scored[0][0]
     logger.debug(

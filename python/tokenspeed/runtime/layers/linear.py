@@ -103,8 +103,6 @@ def adjust_marlin_shard(param, shard_size, shard_offset):
 def adjust_bitsandbytes_4bit_shard(
     param: Parameter, qkv_offsets: dict[str, tuple[int, int]], loaded_shard_id: str
 ) -> tuple[int, int]:
-    """Adjust the quantization offsets and sizes for BitsAndBytes sharding."""
-
     total, _ = qkv_offsets["total"]
     orig_offset, orig_size = qkv_offsets[loaded_shard_id]
 
@@ -170,7 +168,6 @@ class LinearBase(torch.nn.Module):
     ):
         super().__init__()
 
-        # Keep input parameters
         self.input_size = input_size
         self.output_size = output_size
         self.skip_bias_add = skip_bias_add
@@ -187,7 +184,6 @@ class LinearBase(torch.nn.Module):
         ):
             self.quant_method: QuantizeMethodBase | None = UnquantizedLinearMethod()
         elif isinstance(quant_config, Nvfp4Config):
-            # For NVFP4, excluded layers use unquantized (bf16)
             if should_exclude_quant_module(prefix, quant_config.exclude_modules):
                 self.quant_method = UnquantizedLinearMethod()
             else:
@@ -258,7 +254,6 @@ class ReplicatedLinear(LinearBase):
             prefix=prefix,
         )
 
-        # All the linear layer supports quant method.
         assert self.quant_method is not None
         self.quant_method.create_weights(
             layer=self,
@@ -320,8 +315,9 @@ class ReplicatedLinear(LinearBase):
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
         if block_scale is not None:
-            # Note: block_scale is not None means flashinfer reduce-scatter fusion is used for fp8 block quant
-            # in this case, the input_ is already quantized to a fp8 tensor
+            # Note: block_scale is not None means flashinfer reduce-scatter
+            # fusion is used for fp8 block quant; in this case, the input_ is
+            # already quantized to a fp8 tensor.
             output = self.quant_method.apply(self, x, bias, block_scale, output_dtype)
         else:
             output = self.quant_method.apply(self, x, bias)
@@ -507,18 +503,17 @@ class ColumnParallelLinear(LinearBase):
         # ctx keeps the DP Linear call interface; ordinary TP needs no owner counts.
         bias = self.bias if not self.skip_bias_add else None
 
-        # Matrix multiply.
         assert self.quant_method is not None
         if block_scale is not None:
-            # Note: block_scale is not None means flashinfer all-reduce fusion is used for fp8 block quant
-            # in this case, the input_ is already quantized to a fp8 tensor
+            # Note: block_scale is not None means flashinfer all-reduce fusion
+            # is used for fp8 block quant; in this case, the input_ is already
+            # quantized to a fp8 tensor.
             output_parallel = self.quant_method.apply(
                 self, input_, bias, block_scale, output_dtype
             )
         else:
             output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output and self.tp_size > 1:
-            # All-gather across the partitions.
             output = all_gather(output_parallel, self.tp_group, dim=-1)
         else:
             output = output_parallel
@@ -629,7 +624,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 if packed_dim == output_dim:
                     shard_size = shard_size // param.pack_factor
                     shard_offset = shard_offset // param.pack_factor
-                    # Special case for Marlin.
                     shard_size, shard_offset = adjust_marlin_shard(
                         param, shard_size, shard_offset
                     )
@@ -651,7 +645,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             if packed_dim == output_dim:
                 shard_size = shard_size // param.pack_factor
                 shard_offset = shard_offset // param.pack_factor
-                # Special case for Marlin.
                 shard_size, shard_offset = adjust_marlin_shard(
                     param, shard_size, shard_offset
                 )
@@ -698,7 +691,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         """
         Handle special case for models where MLP layers are already
         fused on disk. In this case, we have no shard id. This function
-        determmines the shard id by splitting these layers and then calls
+        determines the shard id by splitting these layers and then calls
         the weight loader using the shard id.
 
         An example of a model with these fused layers:
@@ -888,7 +881,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         """
         Handle special case for models where QKV layers are already
         fused on disk. In this case, we have no shard id. This function
-        determmines the shard id by splitting these layers and then calls
+        determines the shard id by splitting these layers and then calls
         the weight loader using the shard id.
 
         An example of a model with these fused layers:
@@ -933,7 +926,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: str | None = None,
     ):
-        if loaded_shard_id is None:  # special case for certain models
+        if loaded_shard_id is None:
             if isinstance(param, PerTensorScaleParameter):
                 param.load_qkv_weight(loaded_weight=loaded_weight, shard_id=0)
                 return
@@ -1014,7 +1007,6 @@ class QKVParallelLinear(ColumnParallelLinear):
                     shard_size = shard_size // param.pack_factor
                     shard_offset = shard_offset // param.pack_factor
 
-                    # Special case for Marlin.
                     shard_size, shard_offset = adjust_marlin_shard(
                         param, shard_size, shard_offset
                     )
@@ -1070,7 +1062,6 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_size = shard_size // param.pack_factor
                 shard_offset = shard_offset // param.pack_factor
 
-                # Special case for Marlin.
                 shard_size, shard_offset = adjust_marlin_shard(
                     param, shard_size, shard_offset
                 )
@@ -1108,7 +1099,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             if not use_bitsandbytes_4bit and not self.use_presharded_weights:
                 loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
-        # Special case for for AQLM codebooks.
+        # Special case for AQLM codebooks.
         elif is_metadata:
             # metadata indicates fixed size concatenated along dim 0
             shard_size = loaded_weight.shape[0]
@@ -1280,8 +1271,9 @@ class RowParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
 
         if isinstance(param, RowParallelWeightParameter):
-            # This `BaseWeightParameter` is defined in tokenspeed/runtime/layers/parameter.py,
-            # It supports additional parameters like tp_rank and use_presharded_weights.
+            # This `BaseWeightParameter` is defined in
+            # tokenspeed/runtime/layers/parameter.py. It supports additional
+            # parameters like tp_rank and use_presharded_weights.
             param.load_row_parallel_weight(
                 loaded_weight,
                 tp_rank=self.tp_rank,
@@ -1311,7 +1303,6 @@ class RowParallelLinear(LinearBase):
             )
             input_parallel = splitted_input[self.tp_rank].contiguous()
 
-        # Matrix multiply.
         assert self.quant_method is not None
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)

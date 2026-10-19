@@ -460,7 +460,8 @@ class TestNumericsVerification:
         for i, result in enumerate(results):
             if not result.passed:
                 pytest.fail(
-                    f"Kernel {spec.name} failed numerics verification for shape set {i}:\n"
+                    f"Kernel {spec.name} failed numerics verification for "
+                    f"shape set {i}:\n"
                     f"{format_comparison(result, kernel_name=spec.name)}"
                 )
 

@@ -60,11 +60,6 @@ _GFX950_CAPABILITY = CapabilityRequirement(
 )
 
 
-# ===-----------------------------------------------------------------------===#
-# BF16: Gluon (AMD gfx950)
-# ===-----------------------------------------------------------------------===#
-
-
 if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
         gluon_rowcta_bf16_gemv_gfx950 as _rowcta_bf16_gemv_impl,
@@ -550,11 +545,6 @@ else:
         )
 
 
-# ===-----------------------------------------------------------------------===#
-# MXFP8: Gluon (AMD gfx950)
-# ===-----------------------------------------------------------------------===#
-
-
 if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (
         gluon_mm_mxfp8_decode_num_counters_gfx950 as _mm_mxfp8_decode_counters,
@@ -703,11 +693,6 @@ else:
         raise ImportError("gluon_mm_mxfp8_decode_gfx950 requires tokenspeed-kernel-amd")
 
 
-# ===-----------------------------------------------------------------------===#
-# MXFP4 linear with dynamic MXFP4 activations: Gluon (AMD gfx950)
-# ===-----------------------------------------------------------------------===#
-
-
 if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp4 import (
         gluon_mxfp4_linear_num_counters_gfx950 as _mxfp4_linear_counters,
@@ -808,11 +793,6 @@ else:
         raise ImportError(
             "gluon_mxfp4_swiglu_linear_gfx950 requires tokenspeed-kernel-amd"
         )
-
-
-# ===-----------------------------------------------------------------------===#
-# MXFP8 and FP8 block-scale: Gluon (AMD gfx1250)
-# ===-----------------------------------------------------------------------===#
 
 
 if platform.is_cdna5:
@@ -996,11 +976,6 @@ else:
         raise RuntimeError("gluon_mm_fp8_blockscale_gfx1250 requires CDNA5")
 
 
-# ===-----------------------------------------------------------------------===#
-# BF16 dense projections: Gluon WMMA (AMD gfx1250)
-# ===-----------------------------------------------------------------------===#
-
-
 if platform.is_cdna5:
     from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
         gluon_mm_a16w16_gfx1250 as _mm_a16w16_gfx1250_impl,
@@ -1097,11 +1072,6 @@ else:
         raise RuntimeError("gluon_grouped_bf16_projection_gfx1250 requires CDNA5")
 
 
-# ===-----------------------------------------------------------------------===#
-# Linear AttnRes partials: Gluon (AMD gfx950, gfx1250)
-# ===-----------------------------------------------------------------------===#
-
-
 if platform.is_cdna5:
     from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.linear_attnres_partials_gfx1250 import (
         launch_gluon_linear_attnres_partials_gfx1250 as _linear_attnres_partials_gfx1250_impl,
@@ -1191,11 +1161,6 @@ else:
         )
 
 
-# ===-----------------------------------------------------------------------===#
-# BF16 decode GEMV: Gluon WMMA (AMD gfx1250)
-# ===-----------------------------------------------------------------------===#
-
-
 def _gfx1250_wmma_dense_problem(m: int, n: int, k: int) -> bool:
     from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
         use_gluon_wmma_dense_gfx1250,
@@ -1246,11 +1211,6 @@ def gluon_wmma_dense_gemv_gfx1250(
     )
 
     return gluon_wmma_tdm_dense_gfx1250(x, weight, out=out, split_k=None)
-
-
-# ===-----------------------------------------------------------------------===#
-# FP32 decode GEMM: Gluon SIMT (NVIDIA)
-# ===-----------------------------------------------------------------------===#
 
 
 # Registered where it beat Torch's FP32 path at every point of a GB200 module

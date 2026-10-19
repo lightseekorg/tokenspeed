@@ -209,7 +209,6 @@ class BreakableCapture:
 
     @property
     def stream(self) -> torch.cuda.Stream:
-        """The stream used for warmup and capture."""
         return self._stream
 
     @classmethod

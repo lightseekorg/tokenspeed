@@ -272,7 +272,8 @@ class TestWeightLoaderPrefetch:
                     loader, "_prepare_weights", return_value=(tmpdir, files, True)
                 ),
                 mock.patch(
-                    "tokenspeed.runtime.model_loader.loader.filter_safetensors_files_by_weight_names",
+                    "tokenspeed.runtime.model_loader.loader."
+                    "filter_safetensors_files_by_weight_names",
                     side_effect=lambda paths, folder, index, accept: [
                         path for path in paths if accept(path)
                     ],

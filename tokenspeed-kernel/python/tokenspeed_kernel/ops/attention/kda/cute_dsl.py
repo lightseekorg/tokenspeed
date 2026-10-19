@@ -209,7 +209,7 @@ def cutedsl_kda_chunk_prefill(
     # The bound is a compile-time CUBIN constant; mismatches must fail
     # loudly rather than silently mis-gate.
     cutedsl_kda_check_config(float(lower_bound))
-    batch, tokens, num_heads, key_dim = q.shape
+    batch, tokens, _, key_dim = q.shape
     if key_dim != 128:
         raise ValueError(f"CuteDSL KDA requires key_dim=128, got {key_dim}")
     num_value_heads, value_dim = v.shape[2], v.shape[-1]

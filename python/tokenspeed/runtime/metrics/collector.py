@@ -70,10 +70,9 @@ class TimeStats:
         return self.forward_entry_time - self.wait_queue_entry_time
 
     def __str__(self) -> str:
-        # if unified
-        _type = self.get_type()
+        request_type = self.get_type()
 
-        if _type == self.RequestType.UNIFIED:
+        if request_type == self.RequestType.UNIFIED:
             queue_duration = self.forward_entry_time - self.wait_queue_entry_time
             forward_duration = self.completion_time - self.forward_entry_time
 
@@ -83,8 +82,12 @@ class TimeStats:
                     forward_duration=forward_duration,
                 )
 
-            return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.wait_queue_entry_time}"
-        if _type == self.RequestType.PREFILL:
+            return (
+                f"queue_duration={self.format_duration(queue_duration)}, "
+                f"forward_duration={self.format_duration(forward_duration)}, "
+                f"start_time={self.wait_queue_entry_time}"
+            )
+        if request_type == self.RequestType.PREFILL:
             bootstrap_duration = (
                 self.wait_queue_entry_time - self.prefill_bootstrap_queue_entry_time
             )
@@ -99,9 +102,13 @@ class TimeStats:
                     queue_duration=queue_duration,
                     forward_duration=forward_duration,
                 )
-            return f"bootstrap_duration={self.format_duration(bootstrap_duration)}, queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.prefill_bootstrap_queue_entry_time}"
-        # if decode
-        if _type == self.RequestType.DECODE:
+            return (
+                f"bootstrap_duration={self.format_duration(bootstrap_duration)}, "
+                f"queue_duration={self.format_duration(queue_duration)}, "
+                f"forward_duration={self.format_duration(forward_duration)}, "
+                f"start_time={self.prefill_bootstrap_queue_entry_time}"
+            )
+        if request_type == self.RequestType.DECODE:
             prealloc_duration = (
                 self.decode_transfer_queue_entry_time
                 - self.decode_prealloc_queue_entry_time
@@ -121,7 +128,13 @@ class TimeStats:
                     forward_duration=forward_duration,
                 )
 
-            return f"prealloc_duration={self.format_duration(prealloc_duration)}, transfer_duration={self.format_duration(transfer_duration)}, queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.decode_prealloc_queue_entry_time}"
+            return (
+                f"prealloc_duration={self.format_duration(prealloc_duration)}, "
+                f"transfer_duration={self.format_duration(transfer_duration)}, "
+                f"queue_duration={self.format_duration(queue_duration)}, "
+                f"forward_duration={self.format_duration(forward_duration)}, "
+                f"start_time={self.decode_prealloc_queue_entry_time}"
+            )
         return "Invalid Time Stats"
 
     def format_duration(self, duration: float) -> str:
@@ -303,7 +316,9 @@ class EngineMetrics:
         labelnames = list(labels.keys())
         self.num_requests_running = factory.gauge(
             name="tokenspeed:num_requests_running",
-            documentation="Requests with scheduler-side generation state (decode path).",
+            documentation=(
+                "Requests with scheduler-side generation state (decode path)."
+            ),
             labelnames=labelnames,
             multiprocess_mode="livemax",
         )
@@ -371,7 +386,9 @@ class EngineMetrics:
         )
         self.jit_serving_compile_seconds = factory.counter(
             name="tokenspeed:jit_serving_compile_seconds",
-            documentation="Wall time spent in Triton kernel compilations after startup.",
+            documentation=(
+                "Wall time spent in Triton kernel compilations after startup."
+            ),
             labelnames=labelnames,
         )
         self.num_nan_aborted_requests = factory.counter(
@@ -641,7 +658,9 @@ class RequestMetrics:
 
         self.histogram_inter_token_latency_seconds = factory.histogram(
             name="tokenspeed:inter_token_latency_seconds",
-            documentation="Histogram of frontend wall-clock inter-token latency in seconds.",
+            documentation=(
+                "Histogram of frontend wall-clock inter-token latency in seconds."
+            ),
             labelnames=labelnames,
             buckets=_INTER_TOKEN_LATENCY_BUCKETS,
         )

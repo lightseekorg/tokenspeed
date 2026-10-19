@@ -50,6 +50,9 @@ def rel_attention_logits(
         rel_extent: Distances with a relative logit.
         window_left: Sliding window, or ``-1`` for none.
         scale: Logit scale.
+
+    Returns:
+        ``[H, Sq, Sk]`` FP32 logits with masked entries set to ``-inf``.
     """
     Sq, H, _ = q.shape
     Sk, KV, _ = k.shape

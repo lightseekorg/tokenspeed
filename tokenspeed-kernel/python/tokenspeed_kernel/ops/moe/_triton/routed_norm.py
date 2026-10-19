@@ -158,7 +158,10 @@ def triton_routed_input_scale_rmsnorm_sum(
     weight_offset: float,
     enable_pdl: bool,
 ) -> torch.Tensor:
-    """Triton kernel of :func:`tokenspeed_kernel.ops.moe.routed_input_scale_rmsnorm_sum`."""
+    """Runs the Triton routed input-scale RMSNorm sum.
+
+    See :func:`tokenspeed_kernel.ops.moe.routed_input_scale_rmsnorm_sum`.
+    """
     if routes.ndim != 3:
         raise ValueError("routes must have shape [tokens, topk, width]")
     num_tokens, topk, width = routes.shape

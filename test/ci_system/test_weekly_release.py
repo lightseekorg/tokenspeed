@@ -455,7 +455,8 @@ def test_oversized_generated_notes_publish_bounded_body_with_all_links(
     assert "https://lightseek.org/whl/cu130/" in body[0]
     assert "actions/runs/5" in body[0]
     assert body[0].endswith(
-        "**Full Changelog**: https://github.com/lightseekorg/tokenspeed/compare/v0.1.3...v0.1.4\n"
+        "**Full Changelog**: "
+        "https://github.com/lightseekorg/tokenspeed/compare/v0.1.3...v0.1.4\n"
     )
 
 
@@ -655,7 +656,10 @@ def test_source_tree_check_catches_unreleased_changes(
     release_module, tmp_path, monkeypatch
 ):
     monkeypatch.chdir(tmp_path)
-    git = lambda *args: release_module.command("git", *args)
+
+    def git(*args):
+        return release_module.command("git", *args)
+
     git("init", "-q", "-b", "main")
     git("config", "user.name", "lightseek-bot")
     git("config", "user.email", release_module.IDENTITY)
@@ -701,7 +705,8 @@ def test_rocm_release_checks_updated_amd_requirement(tmp_path, monkeypatch):
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr(
             "kernel.dist-info/METADATA",
-            "Name: tokenspeed-kernel\nVersion: 0.1.4\nRequires-Dist: tokenspeed-kernel-amd>=0.1.4\n\n",
+            "Name: tokenspeed-kernel\nVersion: 0.1.4\n"
+            "Requires-Dist: tokenspeed-kernel-amd>=0.1.4\n\n",
         )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("AMD_NIGHTLY_VERSION", "")

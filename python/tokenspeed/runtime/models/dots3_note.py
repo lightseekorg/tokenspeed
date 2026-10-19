@@ -599,6 +599,7 @@ class Dots3NoteForCausalLM(DeepseekV3ForCausalLM):
         is_multimodal_active=False,
         mm_attention_backend=None,
     ):
+        del mm_attention_backend  # Unused.
         if is_multimodal_active:
             raise NotImplementedError(
                 "dots3-note encoders are not implemented; use --language-model-only"

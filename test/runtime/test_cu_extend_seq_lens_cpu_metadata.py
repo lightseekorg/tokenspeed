@@ -65,7 +65,6 @@ def test_length_misalignment_raises() -> None:
     # query_start_loc has 4 entries but only 2 lens -> 3 bounds: mismatch.
     with pytest.raises(RuntimeError, match="disagree with query_start_loc"):
         _build_cu_extend_seq_lens_cpu(lens, expected_len=4)
-    # And the over-long case.
     with pytest.raises(RuntimeError, match="disagree with query_start_loc"):
         _build_cu_extend_seq_lens_cpu(lens, expected_len=2)
 

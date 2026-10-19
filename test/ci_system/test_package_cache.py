@@ -32,7 +32,8 @@ def test_other_clusters_do_not_enable_package_cache(tmp_path: Path):
     env.pop("CI_WHEEL_CACHE_DIR", None)
     env.pop("CI_CCACHE_DIR", None)
     result = run_bash(
-        'configure_package_cache; printf "%s|%s|%s" "${PIP_CACHE_DIR:-}" "${CI_WHEEL_CACHE_DIR:-}" "${CI_CCACHE_DIR:-}"',
+        'configure_package_cache; printf "%s|%s|%s" "${PIP_CACHE_DIR:-}" '
+        '"${CI_WHEEL_CACHE_DIR:-}" "${CI_CCACHE_DIR:-}"',
         env,
     )
     assert result.stdout == "||"
@@ -50,7 +51,8 @@ def test_b200v2_uses_persistent_cache_next_to_flashinfer(tmp_path: Path):
     env.pop("CI_WHEEL_CACHE_DIR", None)
     env.pop("CI_CCACHE_DIR", None)
     result = run_bash(
-        'configure_package_cache >/dev/null; printf "%s|%s|%s" "${PIP_CACHE_DIR}" "${CI_WHEEL_CACHE_DIR}" "${CI_CCACHE_DIR}"',
+        'configure_package_cache >/dev/null; printf "%s|%s|%s" "${PIP_CACHE_DIR}" '
+        '"${CI_WHEEL_CACHE_DIR}" "${CI_CCACHE_DIR}"',
         env,
     )
     assert result.stdout == (
@@ -73,7 +75,8 @@ def test_slurm_uses_mounted_persistent_cache(tmp_path: Path):
     env.pop("CI_WHEEL_CACHE_DIR", None)
     env.pop("CI_CCACHE_DIR", None)
     result = run_bash(
-        'configure_package_cache >/dev/null; printf "%s|%s|%s" "${PIP_CACHE_DIR}" "${CI_WHEEL_CACHE_DIR}" "${CI_CCACHE_DIR}"',
+        'configure_package_cache >/dev/null; printf "%s|%s|%s" "${PIP_CACHE_DIR}" '
+        '"${CI_WHEEL_CACHE_DIR}" "${CI_CCACHE_DIR}"',
         env,
     )
     assert result.stdout == (
@@ -207,7 +210,10 @@ exit 1
     )
     (cache_dir / "pkg.whl").write_text("bad wheel")
     expected_sha256 = sha256(b"complete wheel").hexdigest()
-    command = f'for i in 1 2 3 4; do cache_remote_wheel "https://example.test/pkg.whl" "{expected_sha256}" & done; wait'
+    command = (
+        'for i in 1 2 3 4; do cache_remote_wheel "https://example.test/pkg.whl" '
+        f'"{expected_sha256}" & done; wait'
+    )
     result = run_bash(command, env)
     assert result.stdout.splitlines() == [str(cache_dir / "pkg.whl")] * 4
     assert (tmp_path / "curl-calls").read_text().splitlines() == ["called"]
@@ -233,7 +239,8 @@ def test_installed_wheel_requires_matching_version_and_archive(
     env = os.environ.copy()
     env["PYTHONPATH"] = str(tmp_path)
     result = run_bash(
-        "if installed_wheel_matches cache-test 1.0 expected; then echo reuse; else echo install; fi",
+        "if installed_wheel_matches cache-test 1.0 expected; "
+        "then echo reuse; else echo install; fi",
         env,
     )
     assert result.stdout.strip() == ("reuse" if matches else "install")

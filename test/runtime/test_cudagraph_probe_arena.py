@@ -92,7 +92,7 @@ _NO_FIXTURE = {
 
 
 def _function(module: str, name: str) -> ast.FunctionDef:
-    tree = ast.parse((RUNTIME / module).read_text())
+    tree = ast.parse((RUNTIME / module).read_text(encoding="utf-8"))
     return next(
         node
         for node in ast.walk(tree)
@@ -313,7 +313,8 @@ def test_the_floor_is_the_widest_row_count_the_probe_fabricates(
         # A graph ladder wider than the per-forward token budget.
         (65536, None, 4096, None, 80, 16),
         (None, [1, 8, 32], 40960, None, 80, 32),
-        # A narrowing decoder ladder fabricates a request per 128 rows, up to max_num_seqs.
+        # A narrowing decoder ladder fabricates a request per 128 rows, up to
+        # max_num_seqs.
         (None, None, 40960, 128, 80, 64),
         (None, None, 40960, 128, 16, 16),
     ],
@@ -347,7 +348,8 @@ class _ServingCapture(Exception):
 
 
 def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nvidia):
-    """Boot with fakes; returns (startup bytes each rebind got, devices read, stack kept)."""
+    """Boot with fakes; returns (startup bytes each rebind got, devices read,
+    stack kept)."""
     from tokenspeed.runtime.execution import factory
 
     free, reads, charged, stack = [1 << 40], [], [], [0]

@@ -95,7 +95,6 @@ def _fp64_reference(normalized, projection, up, projection_scale):
 @pytest.mark.parametrize("rows", [1, 7, 16, 17, 32, 33, 64, 100, 256])
 @pytest.mark.parametrize("projection_rows", [LOWRANK + HC_COUNT, LOWRANK])
 @pytest.mark.parametrize("projection_scale", [1.0, 0.25])
-# Serving stores the projection padded to eight rows (324 -> 328).
 @pytest.mark.parametrize("padded", [True, False])
 def test_mix_matches_gemm_epilogue_path(
     rows, projection_rows, projection_scale, padded

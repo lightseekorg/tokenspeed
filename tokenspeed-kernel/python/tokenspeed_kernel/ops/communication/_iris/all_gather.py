@@ -86,12 +86,14 @@ class IrisAllGather:
     def run(self, tensor: torch.Tensor) -> torch.Tensor:
         """Concatenate equal hidden-dimension TP4/TP8 shards through symmetric memory."""
         assert tensor.ndim == 2, "Iris column all-gather requires a 2D tensor"
-        assert (
-            tensor.device == self.producer.data.device
-        ), f"Iris device mismatch: tensor={tensor.device}, state={self.producer.data.device}"
-        assert (
-            tensor.dtype == self.producer.data.dtype
-        ), f"Iris dtype mismatch: tensor={tensor.dtype}, state={self.producer.data.dtype}"
+        assert tensor.device == self.producer.data.device, (
+            f"Iris device mismatch: tensor={tensor.device}, "
+            f"state={self.producer.data.device}"
+        )
+        assert tensor.dtype == self.producer.data.dtype, (
+            f"Iris dtype mismatch: tensor={tensor.dtype}, "
+            f"state={self.producer.data.dtype}"
+        )
         assert (
             tensor.is_contiguous()
         ), "Iris column all-gather requires contiguous input"
@@ -201,7 +203,7 @@ def iris_pull_allgather_columns(
     WORDS_PER_LANE: gl.constexpr,
     INPUT_PUBLISHED: gl.constexpr,
 ):
-    """Concatenate equal feature shards from four ranks into each local output.
+    """Concatenate equal feature shards from all ranks into each local output.
 
     Copy input_ptr into input_sym_ptr unless INPUT_PUBLISHED says the producer
     already wrote there. Read each peer's shard and write full rows to output_ptr.

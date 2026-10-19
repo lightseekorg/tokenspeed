@@ -61,9 +61,6 @@ requires_cuda = pytest.mark.skipif(
 )
 
 
-# ---------------------------------------------------------------------------
-# Wrapper dispatch (CPU, monkeypatched kernels)
-# ---------------------------------------------------------------------------
 def test_ragged_decode_topk_raises_when_persistent_kernel_unavailable(monkeypatch):
     monkeypatch.setattr(cuda_dsa_topk, "has_persistent_topk", lambda: False)
 
@@ -111,9 +108,6 @@ def test_deterministic_decode_topk_falls_back_to_flashinfer(monkeypatch):
     assert calls["dsa_graph_safe"] is True
 
 
-# ---------------------------------------------------------------------------
-# CuTe DSL single-pass multi-CTA (cluster) kernel (NVIDIA Blackwell sm_100+)
-# ---------------------------------------------------------------------------
 def _row_window(seq_lens: torch.Tensor, row: int, next_n: int, num_cols: int) -> int:
     """Causal candidate window for output row ``row`` (see kernel contract)."""
     req = row // next_n
@@ -230,9 +224,6 @@ def test_cute_dsl_decode_topk_widened_rows_match_narrow(next_n):
     assert torch.equal(got, ref), "widened-view selection differs from narrow slice"
 
 
-# ---------------------------------------------------------------------------
-# combine_topk_weights (Triton fused weights * q_scale * softmax_scale)
-# ---------------------------------------------------------------------------
 @requires_cuda
 @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("split_view", [False, True])
@@ -278,9 +269,6 @@ def test_combine_topk_weights_empty():
     assert out.shape == (0, 64) and out.dtype == torch.float32
 
 
-# ---------------------------------------------------------------------------
-# _prepare_logits_for_topk (DeepGEMM narrowed-logits widening + NaN/inf scrub)
-# ---------------------------------------------------------------------------
 def test_prepare_logits_for_topk_widens_and_scrubs():
     base = torch.arange(4 * 256, dtype=torch.float32).view(4, 256)
     expected = base.clone()

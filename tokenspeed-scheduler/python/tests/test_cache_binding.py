@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Tests for cache-related Python bindings."""
-
 import pytest
 import tokenspeed_scheduler as ts
 from tokenspeed_scheduler import Cache, ExecutionEvent

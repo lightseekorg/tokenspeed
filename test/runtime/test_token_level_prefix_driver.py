@@ -193,7 +193,7 @@ def test_an_identical_prompt_keeps_one_token_to_compute() -> None:
     pages."""
     scheduler = _scheduler()
     _run_cold(scheduler, "a", PROMPT)
-    plan, prefill = _hit(scheduler, "b", PROMPT)
+    _, prefill = _hit(scheduler, "b", PROMPT)
     assert list(prefill.extend_prefix_lens) == [32]
     assert list(prefill.input_lengths) == [8]
 

@@ -347,7 +347,8 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         rows = bs * (self.spec_num_tokens + 1)
         if context.shape[0] < rows or conv.shape[0] < rows:
             raise RuntimeError(
-                f"PLE verify workspace needs {rows} rows, exceeding preallocated capacity"
+                f"PLE verify workspace needs {rows} rows, exceeding preallocated "
+                "capacity"
             )
         return context[:rows], conv[:rows]
 

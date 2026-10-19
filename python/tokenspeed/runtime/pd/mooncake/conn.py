@@ -51,7 +51,8 @@ class MooncakeKVManagerBase(DisaggManagerBase):
         self.dist_init_addr = args.dist_init_addr
         if not args.enable_dp_attention and self.topology.dp_size != 1:
             raise ValueError(
-                "If dp_attention is not enabled, dp size must be 1 in disaggregation mode."
+                "If dp_attention is not enabled, dp size must be 1 in "
+                "disaggregation mode."
             )
 
         self.kv_transfer_metrics = KVTransferMetrics(

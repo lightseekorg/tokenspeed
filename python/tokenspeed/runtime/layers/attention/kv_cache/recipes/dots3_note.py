@@ -43,6 +43,13 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 
 
 class Dots3NoteRecipe(CacheRecipe):
+    """dots3-note cache recipe: FP8 DSA and SWA groups in one shared plane.
+
+    The 13 DSA layers keep full latent history plus index-K rows in 64-row
+    pages; the 33 SWA layers and an optional MTP layer keep a 513-token window
+    in 32-row pages. Two DSA pages and one SWA page share each parent.
+    """
+
     family = "dots3_note"
 
     @property

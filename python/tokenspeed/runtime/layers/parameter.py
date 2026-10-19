@@ -58,7 +58,7 @@ class BaseWeightParameter(Parameter):
         return super().__new__(cls, data=data, requires_grad=False)
 
     def __init__(self, data: torch.Tensor, weight_loader: Callable):
-        """Initialize the parameter wrapper with a weight-loader callback."""
+        del data
         self._weight_loader = weight_loader
 
     @property
@@ -245,8 +245,6 @@ class PerTensorScaleParameter(BaseWeightParameter):
         if isinstance(shard_id, int):
             return shard_id
 
-        # if not int, assume shard_id for qkv
-        # map to int and return
         if not isinstance(shard_id, str):
             raise TypeError(
                 f"shard_id must be a str or int, got {type(shard_id).__name__}."
@@ -280,7 +278,7 @@ class PerTensorScaleParameter(BaseWeightParameter):
         Slice the parameter data based on the shard id for
         loading.
         """
-
+        del kwargs
         param_data = self.data
         shard_id = self._shard_id_as_int(shard_id)
 
@@ -289,7 +287,8 @@ class PerTensorScaleParameter(BaseWeightParameter):
         if len(loaded_weight.shape) != 0:
             if loaded_weight.shape[0] != 1:
                 raise ValueError(
-                    f"Expected scale shard with first dimension 1, got {loaded_weight.shape}."
+                    "Expected scale shard with first dimension 1, got "
+                    f"{loaded_weight.shape}."
                 )
             loaded_weight = loaded_weight[0]
 
@@ -393,9 +392,8 @@ def permute_param_layout_(
     then I can call:
         permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
     to ensure x is in the correct layout (permuting it to the correct layout if
-    required, asserting if it cannot get it to the correct layout)
+    required, raising if it cannot get it to the correct layout)
     """
-
     curr_input_dim = getattr(param, "input_dim", None)
     curr_output_dim = getattr(param, "output_dim", None)
 
@@ -407,7 +405,7 @@ def permute_param_layout_(
             )
 
     # if one of the dimensions is not set, set it to the opposite of the other
-    #  we can only do this since we asserted the parameter is 2D above
+    #  we can only do this since we checked the parameter is 2D above
     if curr_input_dim is None:
         if curr_output_dim is None:
             raise ValueError("either input or output dim must be set")

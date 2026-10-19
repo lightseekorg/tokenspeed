@@ -259,8 +259,9 @@ if _AVAILABLE:
             or any(not t.is_contiguous() or t.data_ptr() % 16 for t in tensors)
         ):
             raise ValueError(
-                "fused CuTe HC requires six resident Blackwell clusters and 16-byte-aligned "
-                "contiguous BF16/FP16 tensors with HC4/H2560/R320 and at most 1024 rows"
+                "fused CuTe HC requires six resident Blackwell clusters and "
+                "16-byte-aligned contiguous BF16/FP16 tensors with "
+                "HC4/H2560/R320 and at most 1024 rows"
             )
         with torch.cuda.device(normalized.device):
             out = torch.empty(

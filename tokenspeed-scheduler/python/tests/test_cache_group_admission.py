@@ -173,7 +173,8 @@ def _speculative_config(
     cfg.prefix_granularity = 1
     cfg.decode_input_tokens = verify_width
     cfg.overlap_schedule_depth = overlap_depth
-    # A sliding group prepays no generation, so it holds exactly what decode reserves; no token expires here.
+    # A sliding group prepays no generation, so it holds exactly what decode
+    # reserves; no token expires here.
     cfg.cache_groups = [
         CacheGroupConfig(
             group_id="swa",

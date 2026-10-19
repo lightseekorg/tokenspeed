@@ -361,7 +361,7 @@ def _fused_topk(
     """Fused in-kernel top-k matching ``topk_forward(apply_softmax=True)``.
 
     Selects, per token row, the top ``TOPK`` experts by logit value (ties to
-    the smaller expert id, descending value order) and     the softmax gate over
+    the smaller expert id, descending value order) and computes the softmax gate over
     the selected logits -- reproducing the triton kernels ``_topk_forward``
     semantics without a separate launch or a ``y_vals``/``y_indx`` global
     round-trip.
@@ -1331,7 +1331,8 @@ def gluon_precomputed_topk_fused_route(
         raise ValueError(f"topk_ids must be int32, got {topk_ids.dtype}")
     if topk_weights.dtype not in GLUON_ROUTE_DTYPES or dtype not in GLUON_ROUTE_DTYPES:
         raise ValueError(
-            f"unsupported topk weight dtype: {topk_weights.dtype}, output dtype: {dtype}"
+            f"unsupported topk weight dtype: {topk_weights.dtype}, "
+            f"output dtype: {dtype}"
         )
 
     M, topk = topk_ids.shape
@@ -1341,7 +1342,8 @@ def gluon_precomputed_topk_fused_route(
         raise ValueError(f"invalid topk={topk} for num_experts={num_experts}")
     if num_experts < 1 or num_experts > GLUON_ROUTE_MAX_E:
         raise ValueError(
-            f"precomputed fused route supports 1 <= num_experts <= {GLUON_ROUTE_MAX_E}, "
+            "precomputed fused route supports "
+            f"1 <= num_experts <= {GLUON_ROUTE_MAX_E}, "
             f"got {num_experts}"
         )
     if M * topk > PRECOMPUTED_ROUTE_MAX_G:
@@ -1469,7 +1471,7 @@ def gluon_route_supported(
 
     Guards the structural assumptions the Gluon kernels make so unsupported
     configs fall back to the generic ``triton_kernels_routing`` pipeline:
-    a 2D float ``logits`` tensor,     a supported gate ``dtype``, a sane ``topk``
+    a 2D float ``logits`` tensor, a supported gate ``dtype``, a sane ``topk``
     and an expert count whose ``next_pow2`` keeps the histogram bins / EP-wide
     tiles bounded.
     """

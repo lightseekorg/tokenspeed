@@ -2227,12 +2227,12 @@ def invoke_gluon_mxfp4_moe_stage1(
     Layout contract: see the module docstring.
 
     Unsupported (raises ``NotImplementedError``):
-      ``quant_type != per_1x32``, ``activation != Silu``,
       ``splitk not in {0, 1, None}``, non-empty ``sorted_weights``,
       ``dst_type != bfloat16``.
 
     Accepted-but-ignored, kept for signature compatibility with upstream
-    dispatchers: ``kernelName``, ``w2``, ``use_non_temporal_load``.
+    dispatchers: ``kernelName``, ``w2``, ``use_non_temporal_load``,
+    ``quant_type``, ``activation`` (``situ_linear_beta`` selects the epilogue).
     """
     # Step 1: validate inputs and reject unsupported modes.
     del quant_type, activation  # only per-1x32 MXFP4 + SwiGLU is implemented

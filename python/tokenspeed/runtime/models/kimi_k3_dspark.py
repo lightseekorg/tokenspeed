@@ -651,7 +651,8 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
                 expected = (self.hidden_size, self.num_target_taps * width)
                 if tuple(loaded_weight.shape) != expected:
                     raise ValueError(
-                        f"context_proj weight shape {tuple(loaded_weight.shape)} != {expected}"
+                        f"context_proj weight shape {tuple(loaded_weight.shape)} "
+                        f"!= {expected}"
                     )
                 loaded_weight = torch.cat(
                     [

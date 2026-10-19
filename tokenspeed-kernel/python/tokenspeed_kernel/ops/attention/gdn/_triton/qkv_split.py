@@ -203,7 +203,6 @@ def _fused_qkv_split_l2norm_kernel(  # noqa: E501
         other=0.0,
     )
 
-    # ── Q: per-head l2norm ──
     for h in tl.static_range(NUM_Q_HEADS):
         h_start = h * HEAD_Q
         h_end = h_start + HEAD_Q
@@ -213,7 +212,6 @@ def _fused_qkv_split_l2norm_kernel(  # noqa: E501
         q_vals_normed = (q_vals / norm).to(values.dtype)
         tl.store(q + i_t * q_dim + offsets, q_vals_normed, mask=h_mask)
 
-    # ── K: per-head l2norm ──
     for h in tl.static_range(NUM_K_HEADS):
         h_start = q_dim + h * HEAD_K
         h_end = h_start + HEAD_K
@@ -223,7 +221,6 @@ def _fused_qkv_split_l2norm_kernel(  # noqa: E501
         k_vals_normed = (k_vals / norm).to(values.dtype)
         tl.store(k + i_t * k_dim + (offsets - q_dim), k_vals_normed, mask=h_mask)
 
-    # ── V: passthrough ──
     v_offsets = offsets - qk_dim
     tl.store(
         v + i_t * v_dim + v_offsets,

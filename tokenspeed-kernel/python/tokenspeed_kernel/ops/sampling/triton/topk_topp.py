@@ -416,7 +416,8 @@ def _check_top_k_top_p_gumbel_inputs(
 ) -> tuple[int, int, int]:
     if logits.ndim != 2:
         raise ValueError(
-            f"gumbel_sample_top_k_top_p_from_pools expects 2D logits, got {logits.ndim}D"
+            "gumbel_sample_top_k_top_p_from_pools expects 2D logits, "
+            f"got {logits.ndim}D"
         )
     if logits.device.type != "cuda":
         raise ValueError("gumbel_sample_top_k_top_p_from_pools requires CUDA logits")
@@ -491,7 +492,8 @@ def _check_top_k_top_p_gumbel_inputs(
     num_candidates = num_blocks * top_k_pad
     if candidate_ids.shape[1] < num_candidates:
         raise ValueError(
-            f"candidate_ids is too small: need {num_candidates}, got {candidate_ids.shape[1]}"
+            "candidate_ids is too small: "
+            f"need {num_candidates}, got {candidate_ids.shape[1]}"
         )
     if candidate_logits.shape[1] < num_candidates:
         raise ValueError(
@@ -518,7 +520,10 @@ def gumbel_sample_top_k_top_p_from_pools(
     top_k_pad: int = _TOP_K_TOP_P_PAD,
     num_tokens_per_req: int = 1,
 ) -> torch.Tensor:
-    """Sample finite top-k/top-p candidates with Gumbel-Max."""
+    """Sample finite top-k/top-p candidates with Gumbel-Max.
+
+    ``top_k`` is effectively capped at ``top_k_pad``.
+    """
     if top_k_pad & (top_k_pad - 1):
         raise ValueError("top_k_pad must be a power of two for tl.topk")
     rows, vocab_size, num_blocks = _check_top_k_top_p_gumbel_inputs(
@@ -1090,7 +1095,8 @@ def _check_top_k_top_p_qrita_inputs(
 ) -> tuple[int, int]:
     if logits.ndim != 2:
         raise ValueError(
-            f"gumbel_sample_top_k_top_p_qrita_from_pools expects 2D logits, got {logits.ndim}D"
+            "gumbel_sample_top_k_top_p_qrita_from_pools expects 2D logits, "
+            f"got {logits.ndim}D"
         )
     if logits.device.type != "cuda":
         raise ValueError(
@@ -1098,7 +1104,8 @@ def _check_top_k_top_p_qrita_inputs(
         )
     if logits.stride(-1) != 1:
         raise ValueError(
-            "gumbel_sample_top_k_top_p_qrita_from_pools requires stride-1 vocab dimension, "
+            "gumbel_sample_top_k_top_p_qrita_from_pools requires stride-1 vocab "
+            "dimension, "
             f"got stride={logits.stride()}"
         )
     rows, vocab_size = logits.shape

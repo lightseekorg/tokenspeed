@@ -287,6 +287,7 @@ class DFlash(BaseDrafter):
 
     def _probe_dist_argmax_state(self, dtype: torch.dtype, device: torch.device):
         """Ask for a drafting state, once the head's shard is a fit for one."""
+        del device
         head = self.lm_head
         shard = int(head.shard_indices.num_org_elements)
         tp_size = int(self.logits_processor.tp_size)
@@ -525,7 +526,8 @@ class DFlash(BaseDrafter):
         if hidden.shape[0] != base_ctx.input_num_tokens:
             raise RuntimeError(
                 "DFLASH hidden-state/token mismatch: "
-                f"hidden_tokens={hidden.shape[0]}, input_tokens={base_ctx.input_num_tokens}."
+                f"hidden_tokens={hidden.shape[0]}, "
+                f"input_tokens={base_ctx.input_num_tokens}."
             )
         if base_ctx.input_num_tokens == 0:
             return
@@ -1332,7 +1334,7 @@ class DFlash(BaseDrafter):
         if not self._incremental_kv_write_done:
             # Fork: aux stream runs full KV write (project + fused GEMM + scatter)
             positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
-            # Decode-only path (see can_overlap): the target router's verify
+            # Decode-only path (see _overlap_allowed): the target router's verify
             # window is the round's full write vector.
             cache_locs = base_ctx.attn_backend.decode_window_locations()[
                 : base_ctx.input_num_tokens

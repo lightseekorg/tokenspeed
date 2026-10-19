@@ -112,7 +112,8 @@ def test_nvfp4_copy_matches_fp4_quantize(
 
 @pytest.mark.parametrize("rows", [129, 1025])
 def test_nvfp4_copy_of_extreme_rows_in_place(rows: int) -> None:
-    # In place in strided rows: NaN, Inf, a flushed subnormal block, scales past E4M3's 448, TMA past 1024 rows.
+    # In place in strided rows: NaN, Inf, a flushed subnormal block, scales past
+    # E4M3's 448, TMA past 1024 rows.
     cols = 5120
     wide = torch.zeros(rows, 2 * cols, device="cuda").bfloat16()
     x = wide[:, :cols]
@@ -160,7 +161,8 @@ def test_nvfp4_copy_compiles_once_across_batch_sizes() -> None:
 def test_nvfp4_copy_supported_widths_and_recipes(monkeypatch) -> None:
     for cols in (1024, 3072, 4096, 5120, 6144):
         assert nvfp4_copy_supported(cols)
-    # 2560's 512-wide chunks are under 1024, so it gets one masked 4096-lane block; 2000 has partial scale groups.
+    # 2560's 512-wide chunks are under 1024, so it gets one masked 4096-lane
+    # block; 2000 has partial scale groups.
     for cols in (1536, 2000, 2560, 3584):
         assert not nvfp4_copy_supported(cols)
     for name in _RECIPE_ENV:

@@ -142,9 +142,11 @@ def cluster_routed_sum_supported(
     route_weights: torch.Tensor,
     norm_weight: torch.Tensor,
 ) -> bool:
-    """Whether the cluster routed sum accepts these operands' shapes, dtypes and alignment.
+    """Whether the cluster routed sum accepts these operands' shapes, dtypes
+    and alignment.
 
-    Arguments follow :func:`tokenspeed_kernel.ops.moe.routed_input_scale_rmsnorm_sum_gathered`.
+    Arguments follow
+    :func:`tokenspeed_kernel.ops.moe.routed_input_scale_rmsnorm_sum_gathered`.
     """
     if not _CUTE_AVAILABLE:
         return False
@@ -244,7 +246,8 @@ def cute_dsl_routed_input_scale_rmsnorm_sum_gathered(
 ) -> torch.Tensor:
     """The routed input-scale RMSNorm and top-k sum on one cluster per token.
 
-    Same contract as :func:`tokenspeed_kernel.ops.moe.routed_input_scale_rmsnorm_sum_gathered`;
+    Same contract as
+    :func:`tokenspeed_kernel.ops.moe.routed_input_scale_rmsnorm_sum_gathered`;
     each route's variance is summed in a fixed warp, CTA order.
     """
     if not cluster_routed_sum_supported(

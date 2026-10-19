@@ -104,8 +104,8 @@ def test_only_the_down_projection_moved_off_the_upstream_sentinel() -> None:
     assert [arg.arg for arg in dirty_check.args.args] == ["packed", "sentinel"]
 
     early_exit = (
-        package
-        / "thirdparty/cute_dsl/latent_moe_tail/allreduce_rmsnorm_reduce_scatter_early_exit.py"
+        package / "thirdparty/cute_dsl/latent_moe_tail/"
+        "allreduce_rmsnorm_reduce_scatter_early_exit.py"
     ).read_text()
     armed = "store_lamport_sentinel_128(clear_ptr, sentinel=NEG_ZERO_F32_BITS)"
     assert early_exit.count(armed) == 2

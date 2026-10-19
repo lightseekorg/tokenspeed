@@ -155,7 +155,6 @@ def test_fp8_merged_loading_codes_scales_and_pad() -> None:
         module = _build_fp8_merged(rank)
         _load(module, ckpt)
         module.verify_fp8_load_complete()  # full load passes the bitmap check
-        p = module.proj_local
         assert module.weight.dtype == torch.float8_e4m3fn  # FP8-resident
         assert module.weight.shape[0] % 128 == 0  # padded to the block grid
         # Codes land bitwise per segment (row-sharded except replicated f_a);

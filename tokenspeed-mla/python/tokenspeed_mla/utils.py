@@ -30,7 +30,6 @@ from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 
 
 def ceil_div(a: int, b: int) -> int:
-    """Ceiling division."""
     return (a + b - 1) // b
 
 
@@ -48,7 +47,6 @@ def get_cutlass_dtype(dtype: str) -> cutlass.dtype:
 
 
 def torch_to_cutlass_dtype(dtype: torch.dtype) -> cutlass.dtype:
-    """Return the corresponding cutlass dtype for the given torch.dtype."""
     dtype_map = {
         torch.float16: cutlass.Float16,
         torch.bfloat16: cutlass.BFloat16,
@@ -63,7 +61,6 @@ def torch_to_cutlass_dtype(dtype: torch.dtype) -> cutlass.dtype:
 
 @functools.cache
 def get_num_sm(device: torch.device) -> int:
-    # get the compute capability of the device, which would be cached
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
@@ -223,13 +220,11 @@ def make_ptr(
         ptr_address = a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
         # Create pointer from address
-        y = make_ptr(cutlass.Float32, ptr_address)
+        y = make_ptr(Float32, ptr_address)
     """
-    # check if value is int or ctypes.POINTER
     if isinstance(value, int):
         address_value = value
     elif isinstance(value, ctypes._Pointer):
-        # get address value
         address_value = ctypes.cast(value, ctypes.c_void_p).value
         assert address_value is not None, "Pointer address is None"
     else:

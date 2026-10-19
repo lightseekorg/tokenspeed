@@ -22,8 +22,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# -*- coding: utf-8 -*-
-
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -47,14 +45,11 @@ def l2norm_fwd_kernel1(
     i_t = tl.program_id(0)
     x += i_t * D
     y += i_t * D
-    # Compute mean and variance
     cols = tl.arange(0, BD)
     mask = cols < D
     b_x = tl.load(x + cols, mask=mask, other=0.0).to(tl.float32)
     b_var = tl.sum(b_x * b_x, axis=0)
     b_rstd = 1 / tl.sqrt(b_var + eps)
-    # tl.store(Rstd + i_t, rstd)
-    # Normalize and apply linear transformation
     b_y = b_x * b_rstd
     tl.store(y + cols, b_y, mask=mask)
 
@@ -94,7 +89,6 @@ def l2norm_fwd(
     enable_pdl = pdl_enabled()
     x_shape_og = x.shape
     x = x.reshape(-1, x.shape[-1])
-    # allocate output
     if output_dtype is None:
         y = torch.empty_like(x)
     else:

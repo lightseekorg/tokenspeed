@@ -48,6 +48,9 @@ def get_vision_cos_sin(
     theta: float,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns float32 ``(cos, sin)``, each ``[n_h * n_w, 1, dim]``: row-position
+    frequencies followed by column-position frequencies.
+    """
     inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     hpos = torch.arange(n_h).unsqueeze(1).expand(n_h, n_w)
     wpos = torch.arange(n_w).unsqueeze(0).expand(n_h, n_w)

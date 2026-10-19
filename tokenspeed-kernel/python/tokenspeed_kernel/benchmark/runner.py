@@ -68,8 +68,6 @@ def _percentile(sorted_values: list[float], percentile: float) -> float:
 
 
 class BenchmarkRunner:
-    """Benchmarks kernel implementations."""
-
     def __init__(self, config: BenchmarkConfig | None = None):
         if not torch.cuda.is_available():
             raise RuntimeError("BenchmarkRunner requires CUDA")
@@ -92,6 +90,7 @@ class BenchmarkRunner:
     def _time_kernel(
         self, kernel: Callable[..., Any], inputs: dict[str, Any]
     ) -> list[float]:
+        """Runs warmup then timed iterations and returns sorted latencies in us."""
         with torch.no_grad():
             for _ in range(self.config.warmup_iters):
                 kernel(**inputs)
@@ -308,7 +307,8 @@ class BenchmarkRunner:
         platform = current_platform()
         if not spec.capability.satisfied_by(platform):
             raise ValueError(
-                f"Kernel {kernel_name!r} is not compatible with platform {platform.device_name}"
+                f"Kernel {kernel_name!r} is not compatible with platform "
+                f"{platform.device_name}"
             )
 
         kernel = registry.get_impl(kernel_name)

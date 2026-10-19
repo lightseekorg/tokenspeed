@@ -45,7 +45,6 @@ if current_platform().is_hopper_plus:
 
 
 def flash_mla_api() -> ModuleType:
-    """Return the optional native V4.1 FlashMLA API."""
     if _FLASH_MLA_API is None:
         raise ImportError(
             "FlashMLA V4.1 requires tokenspeed-flashmla with its native CUDA extension"
@@ -54,7 +53,6 @@ def flash_mla_api() -> ModuleType:
 
 
 def is_flash_mla_v41_available() -> bool:
-    """Return whether the optional V4.1 API and native extension are available."""
     return _FLASH_MLA_API is not None
 
 

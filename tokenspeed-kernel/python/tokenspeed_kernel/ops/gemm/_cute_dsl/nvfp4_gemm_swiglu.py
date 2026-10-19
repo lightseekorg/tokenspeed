@@ -334,7 +334,8 @@ if platform.is_nvidia:
         """
         if ab_dtype != "float4_e2m1fn" or c_dtype != "float4_e2m1fn":
             raise ValueError(
-                "nvfp4_gemm_swiglu_nvfp4_quant currently supports NVFP4 input and output only"
+                "nvfp4_gemm_swiglu_nvfp4_quant currently supports NVFP4 input and "
+                "output only"
             )
         if a.device.type != "cuda" or b.device.type != "cuda":
             raise ValueError("nvfp4_gemm_swiglu_nvfp4_quant requires CUDA tensors")

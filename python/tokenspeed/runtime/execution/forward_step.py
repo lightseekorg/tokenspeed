@@ -358,7 +358,7 @@ class ForwardStepRunner:
             ]
             capture_range = tqdm.tqdm(capture_items) if rank == 0 else capture_items
             if rank == 0:
-                batch_sizes = list(dict.fromkeys(bs for _variant, bs in capture_items))
+                batch_sizes = list(dict.fromkeys(bs for _, bs in capture_items))
                 logger.info(f"Capturing batches: {batch_sizes!s}")
             for variant, bs in capture_range:
                 if rank == 0:

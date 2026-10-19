@@ -204,7 +204,8 @@ class CacheArena:
         )
         logger.info(
             f"Allocated cache arena: device_bytes={self.allocated_device_bytes:d}, "
-            f"host_bytes={self.allocated_host_bytes:d}, logical_plan_bytes={plan.arena_bytes:d}, prefix_granularity="
+            f"host_bytes={self.allocated_host_bytes:d}, "
+            f"logical_plan_bytes={plan.arena_bytes:d}, prefix_granularity="
             f"{plan.prefix_granularity:d}, num_lcm_blocks={plan.num_lcm_blocks:d}, "
             f"device {device!s}",
         )
@@ -246,8 +247,7 @@ class CacheArena:
     def size(self) -> int:
         """Token slots the most finely packed group addresses.
 
-        The plan's parent count times the tightest packing. One definition
-        here, so compute views no longer re-derive it and disagree.
+        The plan's parent count times the tightest packing.
         """
         max_packing = max(
             group.cache_blocks_per_lcm_block for group in self.plan.groups

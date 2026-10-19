@@ -1044,7 +1044,8 @@ def gluon_kda_recurrent_decode_gfx950(
     expected_tail = (heads, value_dim, key_dim)
     if state_pool.ndim != 4 or state_pool.shape[1:] != expected_tail:
         raise ValueError(
-            f"state_pool must have physical shape [pages, H, V, K] with tail {expected_tail}"
+            "state_pool must have physical shape [pages, H, V, K] "
+            f"with tail {expected_tail}"
         )
     expected_strides = (value_dim * key_dim, key_dim, 1)
     if state_pool.stride()[1:] != expected_strides:
@@ -1316,7 +1317,11 @@ def gluon_kda_fused_verify_gfx950(
     replay_gate: torch.Tensor | None = None,
     replay_beta: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run fused no-store KDA verify and capture its raw-g replay payload."""
+    """Run fused no-store KDA verify, optionally capturing its replay payload.
+
+    Neither state pool is written; accepted tokens are applied later by
+    ``launch_gluon_kda_fused_replay_gfx950``.
+    """
     del conv_scratch, state_scratch, write_indices
     if num_heads != 12 or head_dim != 128:
         raise ValueError("gfx950 fused KDA verify requires H=12, D=128")
@@ -1469,7 +1474,12 @@ def launch_gluon_kda_fused_replay_gfx950(
     conv_width: int,
     lower_bound: float,
 ) -> None:
-    """Replay every raw-g layer through the established Gluon recurrence."""
+    """Replay every raw-g layer through the established Gluon recurrence.
+
+    Each sequence replays its first ``accepted_length`` tokens from the read
+    page and writes the resulting convolution and recurrent state to the write
+    page.
+    """
     del f_a_dim, f_a_stride
     if num_heads != 12 or head_dim != 128 or conv_width != 4:
         raise ValueError("gfx950 batched KDA replay requires H=12, D=128, W=4")

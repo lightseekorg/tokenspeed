@@ -54,7 +54,7 @@ def replica_table_width(num_physical_experts: int, num_logical_experts: int) -> 
 
 
 def pad_replica_table(table: torch.Tensor, width: int) -> torch.Tensor:
-    """Bring a ``[..., X]`` replica table to ``width`` columns (-1 padded), int32 contiguous."""
+    """Fit a ``[..., X]`` replica table to ``width`` columns (-1 padded), int32."""
     current = table.shape[-1]
     if current > width:
         if bool((table[..., width:] != -1).any()):
@@ -110,7 +110,8 @@ def compute_placement_maps(
         )
     if ep_size <= 0 or num_physical_experts % ep_size:
         raise ValueError(
-            f"{num_physical_experts} physical experts do not divide over ep_size={ep_size}"
+            f"{num_physical_experts} physical experts do not divide over "
+            f"ep_size={ep_size}"
         )
     num_logical_experts = logical_count.shape[1]
     physical_to_logical_map, logical_to_all_physical_map, _ = (

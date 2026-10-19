@@ -130,8 +130,7 @@ def _reference_layer_states(model, text, input_ids):
 
 
 class _ConvCheckpointPool:
-    """KV pool view adding the paged sconv checkpoint buffers the backend
-    now requires (paged conv is mandatory; there is no rolling fallback)."""
+    """KV pool view adding the paged sconv checkpoint buffers the backend requires."""
 
     def __init__(self, kv_pool, *, layer_kv_widths, num_pages, rows, hidden, device):
         self._kv_pool = kv_pool
@@ -269,7 +268,7 @@ class _Harness:
             head_dim=text.head_dim,
             layer_num=text.num_hidden_layers,
             rank=0,
-            # Full and sliding layers serve their own KV head counts, as the recipe plans them.
+            # Full and sliding layers serve their own KV head counts.
             layer_kv_head_counts=layer_kv_heads,
             kv_alloc_head_count=text.num_key_value_heads,
         )
@@ -318,11 +317,8 @@ class _Harness:
             gid: table.cpu() for gid, table in self.block_tables.items()
         }
         self.seq_len = 0
-        # Unified decode path: decode metadata is refreshed into persistent
-        # buffers allocated here (production allocates them unconditionally
-        # at ForwardStepRunner construction, enforce-eager included). The
-        # router is hand-bound above, so bind the pool to its leaves the way
-        # set_cache_pool would.
+        # The router is hand-bound above, so bind the pool to its leaves the
+        # way set_cache_pool would.
         for leaf in leaves.values():
             leaf.set_cache_pool(self.kv_pool)
         # Production binds each layer's cache group from the pool's plan
@@ -330,6 +326,8 @@ class _Harness:
         # the router per label, so stamp the labels the same way.
         for layer_id, layer in enumerate(self.model.model.layers):
             layer.attn.attn.bind_cache_group(text.cache_layer_types[layer_id])
+        # Decode metadata is refreshed into persistent buffers; production
+        # allocates them at ForwardStepRunner construction, enforce-eager too.
         self.backend.init_cuda_graph_state(max_bs=4)
 
     def _ctx(self, mode):
@@ -348,7 +346,7 @@ class _Harness:
     def _check_write_locations(self, mode, start, n):
         """Pin the router-derived KV write slots to the page map above: every
         layer's group shares the request's page row, so every layer writes
-        the same token locations the old explicit out_cache_loc named."""
+        the same token locations."""
         expected = self._token_locs(start, n)
         for layer in self.model.model.layers:
             paged = layer.attn.attn  # InklingAttention -> its PagedAttention
@@ -466,13 +464,12 @@ class TestInklingActivationParity:
                 got = harness.decode(tok)
                 ref = list(_reference_layer_states(self.model, self.text, seq))
                 report += self._compare(f"decode{step}", got, ref, slice(-1, None))
-        # Print the full per-layer report on success for eyeballing.
         print("\n".join(report))
 
 
 class TestInklingRebindTest:
     def test_rebinding_the_pool_forgets_recorded_checkpoint_streams(self):
-        """Checkpoint streams are pool views and the ring held the old pool's requests."""
+        """Checkpoint streams are pool views; the ring held the old pool's requests."""
         from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
             InklingAttnBackend,
             InklingConvStatePool,

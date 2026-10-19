@@ -118,9 +118,6 @@ class SparseIndexScoreKernel:
         )
 
         # The K box is one candidate block: eight rows out of a 64-row page.
-        # The atom describes that box; the tile it lands in is built below with
-        # the same swizzle, whose row period is eight, so a box placed at a
-        # multiple of eight rows keeps the phase the MMA side expects.
         sK_box = cute.make_composed_layout(
             swizzle_128B,
             0,

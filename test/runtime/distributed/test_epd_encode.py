@@ -130,12 +130,6 @@ def test_cache_hit_skips_tower_but_still_ships():
     assert ex.executed_batches == [[111]]  # tower ran exactly once
 
 
-# --- The encode worker drives the cache through get()/put() only, so it works
-# with either the single-tier EmbeddingCache or the two-tier TieredEmbeddingCache.
-# These exercise the real consumer path against the tiered cache (with cpu copies)
-# and the production device<->host copy helpers the unit tests stub out. ---
-
-
 # --- A per-item contract violation in the tower step (a bad grid/token-count ->
 # ValueError, or an embedding larger than a ring slot -> RuntimeError) must fail
 # only the rooms in that batch, NOT raise out of the encode loop into the
@@ -258,15 +252,11 @@ def _encode_executor(ring_slots=3, ring_bytes=256):
 
 def test_copy_into_rejects_oversized_embedding():
     # An embedding larger than a slot must fail loud rather than silently truncate.
-    eng, ex = _encode_executor(ring_slots=2, ring_bytes=8)
+    _, ex = _encode_executor(ring_slots=2, ring_bytes=8)
     ex._ensure_rings()
     too_big = torch.zeros(64, dtype=torch.float32)  # 256 B >> 8 B slot
     with pytest.raises(RuntimeError):
         ex._copy_into(ex._main_ring, 0, too_big)
-
-
-# --- Slot lease: a wrapped-around slot must not be overwritten while its last
-# send can still read the pointer (in-flight, or parked for re-send). ---
 
 
 # --- Staging errors on the UNGUARDED paths must fail the room, not the worker.
@@ -472,9 +462,6 @@ def test_scheduler_rejects_bad_budgets():
         EncodeScheduler(max_tokens_per_batch=1, max_items_per_batch=0)
 
 
-# --------------------------------------------------------------------------- #
-# _embedding_cache_bytes
-# --------------------------------------------------------------------------- #
 def test_bytes_override(monkeypatch):
     env_field = encode_loop.envs.TOKENSPEED_EPD_ENCODE_EMBED_CACHE_MB
     monkeypatch.setenv(env_field.name, "8")
@@ -489,9 +476,6 @@ def test_bytes_negative_raises_with_env_name(monkeypatch):
     assert env_field.name in str(exc.value)
 
 
-# --------------------------------------------------------------------------- #
-# _make_embedding_cache (cache-type selection: the "L2 default off" property)
-# --------------------------------------------------------------------------- #
 def test_make_cache_l2_enabled_is_tiered_with_caps_and_device():
     cache = _make_embedding_cache(4 << 30, 8 << 30, "cuda:0")
     assert type(cache) is TieredEmbeddingCache

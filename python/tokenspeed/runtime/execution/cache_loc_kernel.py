@@ -34,14 +34,11 @@ logger = get_colorful_logger(__name__)
 
 @triton.jit(do_not_specialize=["max_pages"])
 def compute_out_cache_loc_kernel(
-    # Input pointers
     input_lengths_ptr,  # [batch_size] or None for uniform mode
     cache_start_ptr,  # [batch_size]
     page_table_ptr,  # [batch_size, max_pages], batch-ordered
     cumsum_lengths_ptr,  # [batch_size] or None for uniform mode
-    # Output pointer
     out_cache_loc_ptr,  # [total_tokens]
-    # Scalars
     uniform_input_length,  # used when input_lengths_ptr is None
     page_size: tl.constexpr,
     max_pages,  # runtime: constexpr here recompiles per page-table width
@@ -74,7 +71,6 @@ def compute_out_cache_loc_kernel(
     width. It only feeds the overflow test, the clamp and the row stride,
     none of which need a compile-time constant.
     """
-    # Program ID represents which request we're processing
     req_idx = tl.program_id(0)
 
     valid_cache_len = tl.load(cache_start_ptr + req_idx)
@@ -84,36 +80,29 @@ def compute_out_cache_loc_kernel(
         # Always load from cumsum, use 0 index for first request to ensure type consistency
         offset_idx = tl.where(req_idx > 0, req_idx - 1, 0)
         output_offset = tl.load(cumsum_lengths_ptr + offset_idx)
-        # Zero out offset for first request
         output_offset = tl.where(req_idx > 0, output_offset, 0)
     else:
         input_length = uniform_input_length
         output_offset = req_idx * uniform_input_length
 
-    # Process tokens in blocks
     num_blocks = tl.cdiv(input_length, BLOCK_SIZE)
     for block_idx in range(num_blocks):
         block_start = block_idx * BLOCK_SIZE
 
-        # Compute token offsets within this block
         token_offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = token_offsets < input_length
 
-        # Compute logical positions
         positions = valid_cache_len + token_offsets
 
-        # Compute page indices and offsets
         page_indices = positions // page_size
         overflow = page_indices >= max_pages
         # Clamp to last valid page to avoid OOB GMEM read.
         page_indices = tl.minimum(page_indices, max_pages - 1)
         offsets_in_page = positions % page_size
 
-        # Load page IDs from the batch-ordered page table.
         page_ptrs = page_table_ptr + req_idx * max_pages + page_indices
         page_ids = tl.load(page_ptrs, mask=mask, other=0)
 
-        # Compute physical cache locations
         cache_locs = page_ids * page_size + offsets_in_page
         # For overflow tokens, route to slot 0 (a fixed safe dummy target that
         # never aliases a real request's KV data). This avoids using a dynamic
@@ -122,20 +111,16 @@ def compute_out_cache_loc_kernel(
         # Null/hole pages (id <= 0) route to slot 0 as well.
         cache_locs = tl.where(overflow | (page_ids <= 0), 0, cache_locs)
 
-        # Store to output
         output_ptrs = out_cache_loc_ptr + output_offset + token_offsets
         tl.store(output_ptrs, cache_locs, mask=mask)
 
 
 @triton.jit(do_not_specialize=["max_pages"])
 def fused_decode_input_prep_kernel(
-    # Inputs
     req_pool_indices_ptr,  # [batch_size]
     valid_cache_lengths_ptr,  # [req_pool_size+1]
-    # Outputs
     positions_ptr,  # [batch_size * uniform_input_length]
     seq_lens_out_ptr,  # [batch_size]
-    # Scalars
     uniform_input_length,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -156,7 +141,6 @@ def fused_decode_input_prep_kernel(
     pool_idx = tl.load(req_pool_indices_ptr + req_idx)
     cache_start = tl.load(valid_cache_lengths_ptr + pool_idx)
 
-    # seq_lens[req_idx] = cache_start + uniform_input_length
     tl.store(seq_lens_out_ptr + req_idx, cache_start + uniform_input_length)
 
     output_offset = req_idx * uniform_input_length

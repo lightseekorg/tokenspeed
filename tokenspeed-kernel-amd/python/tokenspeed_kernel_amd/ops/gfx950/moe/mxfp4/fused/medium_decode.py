@@ -39,13 +39,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.pipelined_program import (
 
 @gluon.jit
 def _moe_masked_store(out, y_ptr, y_offs, mask, USE_BUFFER_STORE: gl.constexpr):
-    """Shared masked store for the prefill and medium-decode epilogues.
-
-    ``USE_BUFFER_STORE`` selects the AMD ``buffer_store`` intrinsic (the medium
-    dispatch path's fast store) vs generic ``gl.store`` (prefill + medium
-    combine). The caller owns all address/mask computation so each path keeps
-    its own addressing; only the final emit is shared.
-    """
     if USE_BUFFER_STORE:
         gl.amd.cdna4.buffer_store(out, y_ptr, y_offs.to(gl.int32), mask=mask)
     else:
@@ -233,8 +226,7 @@ def _medium_decode_body(
 
     ``MEDIUM_COMBINE=False`` is stage1 (gather X rows, SwiGLU + fp8-quant store);
     ``MEDIUM_COMBINE=True`` is stage2/combine (contiguous X rows, gate + scatter
-    store). This is selected only for the additive medium-decode path; the
-    existing prefill/default pipeline remains the fallback for all other shapes.
+    store).
     """
     pid_raw = gl.program_id(axis=0)
     grid_n: gl.constexpr = GRID_N

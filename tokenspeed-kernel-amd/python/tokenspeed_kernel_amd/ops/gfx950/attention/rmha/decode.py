@@ -40,11 +40,6 @@ cdiv = gl.cdiv
 _GFX950_SM_COUNT = 256
 
 
-# ===-----------------------------------------------------------------------===#
-# Kernel Config
-# ===-----------------------------------------------------------------------===#
-
-
 @gluon.aggregate
 class AttentionConfig:
     SM_SCALE: gl.constexpr
@@ -123,14 +118,16 @@ class AttentionConfig:
         k_layout = gl.DotOperandLayout(1, qk_layout, k_width=qk_kw)
         p_layout = gl.DotOperandLayout(0, pv_layout, k_width=pv_kw)
         v_layout = gl.DotOperandLayout(1, pv_layout, k_width=pv_kw)
-        # load_vec is the number of elements per lane, depends on the input dtype, same as qk_kw.
+        # load_vec is the number of elements per lane, depends on the input dtype,
+        # same as qk_kw.
         # load_threads is how many lanes span HEAD_DIM.
         load_vec = 16 if IS_FP8 else 8
         load_threads = HEAD_DIM // load_vec
         load_layout = gl.BlockedLayout(
             [1, load_vec], [64 // load_threads, load_threads], [1, 1], [1, 0]
         )
-        # store_vec depends on the output dtype, always 16-bit regardless of input dtype, so 128 / 16 = 8.
+        # store_vec depends on the output dtype, always 16-bit regardless of input
+        # dtype, so 128 / 16 = 8.
         # store_threads is how many lanes span HEAD_DIM.
         store_vec = 8
         store_threads = HEAD_DIM // store_vec
@@ -180,11 +177,6 @@ class AttentionConfig:
         self.reduce_layout = gl.constexpr(reduce_layout)
         self.k_smem_layout = gl.constexpr(k_smem_layout)
         self.v_smem_layout = gl.constexpr(v_smem_layout)
-
-
-# ===-----------------------------------------------------------------------===#
-# Kernel Program
-# ===-----------------------------------------------------------------------===#
 
 
 @gluon.aggregate
@@ -491,11 +483,6 @@ class AttentionProgram:
         offsets = (self.q_index * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.HEAD_DIM
         offsets += offs_d[None, :]
         cdna4.buffer_store(output, self.mid_o_ptr, offsets, mask=valid[:, None])
-
-
-# ===-----------------------------------------------------------------------===#
-# Entry Point
-# ===-----------------------------------------------------------------------===#
 
 
 @gluon.jit

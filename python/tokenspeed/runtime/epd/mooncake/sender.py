@@ -20,8 +20,7 @@
 
 """Encode-side per-request sender for the Mooncake embedding transfer.
 
-Split out of :mod:`tokenspeed.runtime.epd.mooncake.embedding_transfer`; the
-manager it drives lives in :mod:`tokenspeed.runtime.epd.mooncake.encode`.
+The manager it drives lives in :mod:`tokenspeed.runtime.epd.mooncake.encode`.
 """
 
 from __future__ import annotations

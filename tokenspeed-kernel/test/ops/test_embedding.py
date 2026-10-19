@@ -62,7 +62,6 @@ def test_rope_neox_full_bf16(
     query = torch.randn(num_tokens, num_q_heads * head_size, device=device, dtype=dtype)
     key = torch.randn(num_tokens, num_k_heads * head_size, device=device, dtype=dtype)
 
-    # Reference (PyTorch).
     cos_sin_ref = cos_sin_cache.index_select(0, positions)
     cos_ref, sin_ref = cos_sin_ref.chunk(2, dim=-1)
     cos_ref = cos_ref.unsqueeze(-2).to(dtype)
@@ -332,25 +331,28 @@ def test_rope_mla_quantize(
     cos, sin = cos_sin_cache.index_select(0, positions).chunk(2, dim=-1)
     cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
-    rope_ref = lambda x: (
-        torch.cat(
-            (
-                torch.chunk(x.float(), 2, dim=-1)[0] * cos
-                - torch.chunk(x.float(), 2, dim=-1)[1] * sin,
-                torch.chunk(x.float(), 2, dim=-1)[1] * cos
-                + torch.chunk(x.float(), 2, dim=-1)[0] * sin,
-            ),
-            dim=-1,
-        )
-        if is_neox
-        else torch.stack(
-            (
-                x.float()[..., ::2] * cos - x.float()[..., 1::2] * sin,
-                x.float()[..., 1::2] * cos + x.float()[..., ::2] * sin,
-            ),
-            dim=-1,
-        ).flatten(-2)
-    ).to(x.dtype)
+
+    def rope_ref(x):
+        return (
+            torch.cat(
+                (
+                    torch.chunk(x.float(), 2, dim=-1)[0] * cos
+                    - torch.chunk(x.float(), 2, dim=-1)[1] * sin,
+                    torch.chunk(x.float(), 2, dim=-1)[1] * cos
+                    + torch.chunk(x.float(), 2, dim=-1)[0] * sin,
+                ),
+                dim=-1,
+            )
+            if is_neox
+            else torch.stack(
+                (
+                    x.float()[..., ::2] * cos - x.float()[..., 1::2] * sin,
+                    x.float()[..., 1::2] * cos + x.float()[..., ::2] * sin,
+                ),
+                dim=-1,
+            ).flatten(-2)
+        ).to(x.dtype)
+
     q_rope = torch.randn(num_tokens, num_heads, rope_dim, device=device, dtype=dtype)
     k_rope = torch.randn(num_tokens, num_heads, rope_dim, device=device, dtype=dtype)
     q_nope = torch.randn(num_tokens, num_heads, nope_dim, device=device, dtype=dtype)

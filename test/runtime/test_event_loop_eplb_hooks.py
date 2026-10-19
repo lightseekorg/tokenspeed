@@ -224,7 +224,7 @@ def test_replicated_input_ep_checks_agreement_and_runs_the_whole_cycle():
 def test_all_to_all_ep_sums_the_load_over_the_ep_group():
     controller = _controller(ep_rank=1, all_to_all_ep=True)
     device = _Device(_load())
-    hooks, handler = _hooks(controller, device)
+    hooks, _ = _hooks(controller, device)
     peer_load = torch.zeros(3, 6, dtype=torch.int64)
     peer_load[:, 1] = 500  # the peer's tokens make expert 1 the hot one
     collectives = _Collectives(peer_load=peer_load)
@@ -248,7 +248,7 @@ def test_all_to_all_ep_sums_the_load_over_the_ep_group():
 
 def test_diverging_counters_under_replicated_input_ep_fail_loudly():
     controller = _controller(ep_rank=0)
-    hooks, handler = _hooks(controller, _Device(_load()))
+    hooks, _ = _hooks(controller, _Device(_load()))
     collectives = _Collectives(peer_checksum_differs=True)
     with mock.patch.object(torch.distributed, "all_reduce", collectives.all_reduce):
         with pytest.raises(RuntimeError, match="routed tokens differently"):
@@ -274,7 +274,7 @@ def test_single_rank_ep_group_runs_no_collective():
 def test_manual_trigger_only_while_idle():
     controller = _controller(ep_rank=0)
     device = _Device(_load())
-    hooks, handler = _hooks(controller, device, ep_group=(0,))
+    hooks, _ = _hooks(controller, device, ep_group=(0,))
     ok, message = hooks.begin_manual_rebalance()
     assert ok and "snapshot taken" in message and device.snapshots == 1
     ok, message = hooks.begin_manual_rebalance()

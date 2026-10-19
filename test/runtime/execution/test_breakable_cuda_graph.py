@@ -1,4 +1,4 @@
-"""Unit tests for the breakable CUDA graph core (Phase 1).
+"""Unit tests for the breakable CUDA graph core.
 
 Captures a tiny ``Linear -> eager break -> Linear`` forward with
 :class:`BreakableCapture`, mutates the static input buffer, replays, and asserts

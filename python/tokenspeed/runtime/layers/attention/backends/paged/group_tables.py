@@ -193,10 +193,6 @@ class GroupTableStacks:
             [spec.kernel_page_size for spec in groups], dtype=torch.int32, device=device
         )
 
-    # ------------------------------------------------------------------
-    # Views
-    # ------------------------------------------------------------------
-
     def index(self, group_id: str) -> int:
         return self._index[group_id]
 
@@ -243,10 +239,6 @@ class GroupTableStacks:
                 f"request, asked for {n}"
             )
         return self.decode_locs[self._index[group_id], : bs * n]
-
-    # ------------------------------------------------------------------
-    # Fills
-    # ------------------------------------------------------------------
 
     def fill(
         self, bs: int, actual_bs: int, block_tables: Mapping[str, torch.Tensor]

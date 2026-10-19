@@ -105,11 +105,13 @@ class RegistryVisitor(ast.NodeVisitor):
 
         if any(isinstance(arg, ast.Starred) for arg in func_call.args):
             raise ValueError(
-                f"{self.filename}: starred arguments are not supported in {func_call.func.id}()"
+                f"{self.filename}: starred arguments are not supported in "
+                f"{func_call.func.id}()"
             )
         if len(func_call.args) > len(_PARAM_ORDER):
             raise ValueError(
-                f"{self.filename}: too many positional arguments in {func_call.func.id}()"
+                f"{self.filename}: too many positional arguments in "
+                f"{func_call.func.id}()"
             )
 
         for name, arg in zip(_PARAM_ORDER, func_call.args):
@@ -119,22 +121,26 @@ class RegistryVisitor(ast.NodeVisitor):
         for kw in func_call.keywords:
             if kw.arg is None:
                 raise ValueError(
-                    f"{self.filename}: **kwargs are not supported in {func_call.func.id}()"
+                    f"{self.filename}: **kwargs are not supported in "
+                    f"{func_call.func.id}()"
                 )
             if kw.arg not in args:
                 raise ValueError(
-                    f"{self.filename}: unknown argument '{kw.arg}' in {func_call.func.id}()"
+                    f"{self.filename}: unknown argument '{kw.arg}' in "
+                    f"{func_call.func.id}()"
                 )
             if kw.arg in seen:
                 raise ValueError(
-                    f"{self.filename}: duplicated argument '{kw.arg}' in {func_call.func.id}()"
+                    f"{self.filename}: duplicated argument '{kw.arg}' in "
+                    f"{func_call.func.id}()"
                 )
             seen.add(kw.arg)
             args[kw.arg] = self._constant_value(kw.value)
 
         if args["est_time"] is _UNSET or args["suite"] is _UNSET:
             raise ValueError(
-                f"{self.filename}: est_time and suite are required constants in {func_call.func.id}()"
+                f"{self.filename}: est_time and suite are required constants in "
+                f"{func_call.func.id}()"
             )
 
         est_time, suite = args["est_time"], args["suite"]
@@ -239,7 +245,7 @@ class RegistryVisitor(ast.NodeVisitor):
 
 def ut_parse_one_file(filename: str) -> List[CIRegistry]:
     """Parse a single test file and return all CI registrations found."""
-    with open(filename, "r") as f:
+    with open(filename, "r", encoding="utf-8") as f:
         file_content = f.read()
     tree = ast.parse(file_content, filename=filename)
     visitor = RegistryVisitor(filename=filename)
@@ -284,7 +290,7 @@ def collect_tests(files: list[str], sanity_check: bool = True) -> List[CIRegistr
     ci_tests = []
     for file in files:
         registries = ut_parse_one_file(file)
-        if len(registries) == 0:
+        if not registries:
             msg = f"No CI registry found in {file}"
             if sanity_check:
                 raise ValueError(msg)

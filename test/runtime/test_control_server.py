@@ -172,12 +172,12 @@ class TestProxyPassthrough:
 
         # Every token must arrive, in order, followed by [DONE].
         for tok in _STREAM_TOKENS:
-            _pytest_expr_5 = any(f'"text":"{tok}"' in c for c in chunks)
-            _pytest_msg_6 = f"missing streamed token {tok!r}; got {chunks}"
-            assert _pytest_expr_5, _pytest_msg_6
-        _pytest_expr_1 = any("[DONE]" in c for c in chunks)
-        _pytest_msg_2 = f"no [DONE]: {chunks}"
-        assert _pytest_expr_1, _pytest_msg_2
+            found = any(f'"text":"{tok}"' in c for c in chunks)
+            msg = f"missing streamed token {tok!r}; got {chunks}"
+            assert found, msg
+        found = any("[DONE]" in c for c in chunks)
+        msg = f"no [DONE]: {chunks}"
+        assert found, msg
 
     def test_streaming_is_incremental(self):
         """The response must arrive incrementally, not buffered all-at-once —
@@ -214,10 +214,9 @@ class TestProxyPassthrough:
             timeout=10,
         )
         assert (r.status_code) == (200)
-        # Raw body must be a JSON object literal.
-        _pytest_expr_3 = r.text.lstrip().startswith("{")
-        _pytest_msg_4 = f"body looks double-encoded: {r.text[:80]}"
-        assert _pytest_expr_3, _pytest_msg_4
+        is_object = r.text.lstrip().startswith("{")
+        msg = f"body looks double-encoded: {r.text[:80]}"
+        assert is_object, msg
         data = r.json()
         assert isinstance((data), (dict))
         assert (data["choices"][0]["text"]) == ("paris")

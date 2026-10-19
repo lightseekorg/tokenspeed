@@ -150,11 +150,11 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         self.quant_config = quant_config
 
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
-        RMSNorm_cls = GemmaRMSNorm
-        self.pre_fc_norm_embedding = RMSNorm_cls(
+        rms_norm_cls = GemmaRMSNorm
+        self.pre_fc_norm_embedding = rms_norm_cls(
             config.hidden_size, config.rms_norm_eps
         )
-        self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
+        self.pre_fc_norm_hidden = rms_norm_cls(config.hidden_size, config.rms_norm_eps)
         config.num_hidden_layers = 1
         config.full_attention_interval = 1
         self.model = Qwen3_5DraftForCausalLM(
@@ -279,6 +279,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
+        del is_mtp
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -329,12 +330,10 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            # Only process MTP branch weights
             if "mtp" not in name:
                 continue
 
             if name.startswith("mtp."):
-                # Remove the mtp. prefix for processing
                 name = name.replace("mtp.", "model.")
 
                 name = name.replace("model.fc", "fc")
@@ -343,9 +342,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
-            # 1) Process stacked parameters (q_proj/k_proj/v_proj & gate_proj/up_proj)
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-matching weights
                 if weight_name not in name:
                     continue
 
@@ -355,7 +352,6 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
 
                 name_mapped = name.replace(weight_name, param_name)
 
-                # Skip loading extra parameters for GPTQ/nvfp4 models.
                 if (
                     name_mapped.endswith(ignore_suffixes)
                     and name_mapped not in params_dict
@@ -382,7 +378,6 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                     if moe_loader.is_expert_checkpoint_weight(name):
                         continue
 
-                # Skip loading extra parameters for GPTQ/nvfp4 models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue
 

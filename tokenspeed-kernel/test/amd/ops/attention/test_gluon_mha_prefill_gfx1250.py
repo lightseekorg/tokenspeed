@@ -49,6 +49,7 @@ def _inputs(seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype):
 
 
 def _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim, window_left=-1):
+    del n_q_heads, n_kv_heads
     outs = []
     for start, end in zip(cu_cpu[:-1], cu_cpu[1:]):
         out, _ = torch_dense_attention(

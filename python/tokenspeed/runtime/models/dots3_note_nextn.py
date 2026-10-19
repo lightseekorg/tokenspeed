@@ -43,6 +43,10 @@ from tokenspeed.runtime.utils import add_prefix
 
 
 class Dots3NoteDraftAttention(Dots3NoteAttention):
+    """With draft narrowing, writes KV for all verified rows and attends only
+    from each request's live row (``ctx.gather_ids``).
+    """
+
     def forward(self, positions, hidden_states, ctx, comm_manager, block_scale=None):
         if ctx.draft_narrowing is None or hidden_states.shape[0] == 0:
             return super().forward(

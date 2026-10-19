@@ -145,7 +145,7 @@ def main() -> None:
         solution="deep_gemm",
         slot_order="selection",
     )
-    # Main's native indexer has no forced-window arguments. Compare its
+    # The native indexer has no forced-window arguments. Compare its
     # unforced policy separately; the checks above exercise mandatory windows.
     unforced, unforced_lens = select_dsa_topk(
         q,

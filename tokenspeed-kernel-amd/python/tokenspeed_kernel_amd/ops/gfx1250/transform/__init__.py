@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""GFX1250 transform kernels."""
-
 from tokenspeed_kernel_amd.ops.gfx1250.transform.hadamard import (
     launch_gluon_hadamard_transform_128_gfx1250,
 )

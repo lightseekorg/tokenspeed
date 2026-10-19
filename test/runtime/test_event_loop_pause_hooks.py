@@ -126,9 +126,6 @@ def _spec(rid: str):
     return SimpleNamespace(request_id=rid)
 
 
-# --- apply_transitions --------------------------------------------------------
-
-
 def test_abort_pause_edge_cancels_inflight_and_grammar_queue() -> None:
     hooks, loop = _hooks(rid_to_state={"r0": _State(), "r1": _State()})
     hooks._pause.request_drain(
@@ -186,9 +183,6 @@ def test_resume_flushes_live_buffered_specs_and_reaps_finished() -> None:
     assert hooks._pause.buffered_specs == []
 
 
-# --- withhold_admissions ------------------------------------------------------
-
-
 def test_admission_gate_passes_through_when_unpaused() -> None:
     hooks, _ = _hooks()
     specs = [_spec("r0")]
@@ -219,9 +213,6 @@ def test_admission_gate_warns_when_pause_coalesced_with_requests(
     assert "TODO(pause-fifo)" in caplog.text
 
 
-# --- paused_idle_step ---------------------------------------------------------
-
-
 def test_paused_idle_step_leaves_the_drain_check_to_the_loop_tail() -> None:
     # The event loop resolves the drain at its tail, after the round's results
     # have advanced the scheduler; paused_idle_step must not consume it early.
@@ -235,9 +226,6 @@ def test_paused_idle_step_leaves_the_drain_check_to_the_loop_tail() -> None:
     hooks.paused_idle_step()
 
     assert hooks._pause.is_drain_pending
-
-
-# --- memory release/wake data plane -------------------------------------------
 
 
 def test_reset_caches_for_release_uses_scheduler_clear_when_present() -> None:

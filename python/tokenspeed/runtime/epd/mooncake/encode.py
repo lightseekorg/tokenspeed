@@ -240,7 +240,8 @@ class MooncakeEmbeddingManagerEncode(MooncakeEmbeddingManagerBase):
                 last_err = e
             time.sleep(0.5)
         logger.error(
-            f"encode failed to register to bootstrap server after retries: {last_err!s}",
+            "encode failed to register to bootstrap server after retries: "
+            f"{last_err!s}",
         )
 
     def add_transfer_request(self, room: int, chunk: EmbeddingChunk) -> None:

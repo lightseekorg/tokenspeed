@@ -164,7 +164,10 @@ def _aligned(nbytes: int) -> int:
 
 
 def scratch_device(gpu_id: int | None):
-    """CUDA device for pack staging. Index-less ``"cuda"`` is device 0 on new threads."""
+    """CUDA device for pack staging.
+
+    Index-less ``"cuda"`` is device 0 on new threads.
+    """
     import torch
 
     if gpu_id is None:

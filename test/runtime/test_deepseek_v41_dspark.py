@@ -870,7 +870,9 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
             json.dumps(
                 {
                     "weight_map": {
-                        f"mtp.{stage}.ffn.shared_experts.w1.weight": "not-loaded.safetensors"
+                        f"mtp.{stage}.ffn.shared_experts.w1.weight": (
+                            "not-loaded.safetensors"
+                        )
                         for stage in range(3)
                     }
                 }

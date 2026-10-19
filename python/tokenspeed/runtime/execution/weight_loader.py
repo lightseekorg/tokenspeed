@@ -41,7 +41,7 @@ class WeightLoader:
     """Handles model weight loading from disk.
 
     This class is stateless and does not modify external state.
-    It returns LoadedModel with all necessary information.
+    It returns the loaded model.
     """
 
     @staticmethod
@@ -66,7 +66,7 @@ class WeightLoader:
                 rank. See ``LoadConfig.checkpoint_load_group``.
 
         Returns:
-            LoadedModel with model and dtype
+            The loaded model.
         """
         if (
             server_args.kv_cache_dtype == "fp8_e4m3"
@@ -85,7 +85,6 @@ class WeightLoader:
 
         set_cuda_arch()
 
-        # Create load config
         load_config = LoadConfig(
             load_format=server_args.load_format,
             download_dir=server_args.download_dir,

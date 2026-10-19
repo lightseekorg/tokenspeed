@@ -214,7 +214,8 @@ class Glm53FlashTextConfig(PretrainedConfig):
             )
             if unknown_layers:
                 raise ValueError(
-                    "linear_attn_config must classify every layer as KDA or full attention"
+                    "linear_attn_config must classify every layer as KDA or "
+                    "full attention"
                 )
         self.layer_types = (
             layer_types

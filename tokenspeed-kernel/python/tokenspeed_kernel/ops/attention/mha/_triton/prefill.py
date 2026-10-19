@@ -337,7 +337,7 @@ def prefill_attention_fwd(
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
 
-    k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
+    k_buffer, v_buffer: flattened paged KV caches, read when has_kv_cache
     """
     platform = current_platform()
 

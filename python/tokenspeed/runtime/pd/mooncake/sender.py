@@ -43,7 +43,6 @@ class MooncakeKVSender:
         self.bootstrap_room = bootstrap_room
         self.kv_mgr.begin_room(bootstrap_room)
 
-        # inner state
         self.init_time = time.time()
         self.conclude_state = None
         self._layerwise_chunk_submitted = False
@@ -112,15 +111,19 @@ class MooncakeKVSender:
                     if elapsed >= self.kv_mgr.bootstrap_time_out:
                         logger.warning_once(
                             "Some requests timed out when bootstrapping, "
-                            "which means prefill instances fail to receive the cache manifest from the decode instance of this request. "
-                            "If a greater mean TTFT is acceptable, you can 'export TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
+                            "which means prefill instances fail to receive the "
+                            "cache manifest from the decode instance of this "
+                            "request. If a greater mean TTFT is acceptable, you can "
+                            "'export TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600' "
+                            "(10 minutes) to relax the timeout condition. "
                         )
                         self.kv_mgr.kv_transfer_metrics.record_kv_transfer_timeout(
                             "bootstrapping"
                         )
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,
-                            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in TransferPoll.Bootstrapping",
+                            f"Request {self.bootstrap_room} timed out after "
+                            f"{elapsed:.1f}s in TransferPoll.Bootstrapping",
                         )
                         self.conclude_state = TransferPoll.Failed
                         return TransferPoll.Failed
@@ -135,7 +138,7 @@ class MooncakeKVSender:
             self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
 
     def failure_exception(self):
-        # Explicitly set the status to failure since this request has failed in another rank
+        # The request already failed on another rank.
         if self.conclude_state is None:
             self.conclude_state = TransferPoll.Failed
 

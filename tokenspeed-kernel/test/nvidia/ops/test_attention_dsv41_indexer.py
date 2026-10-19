@@ -183,7 +183,7 @@ def _check_sparse_selection(selected, reference):
 )
 def test_sparse_candidate_scores_match_bf16_reference(tokens, count, strided):
     args = _sparse_inputs(tokens, count, strided)
-    queries, weights, cache, table, lengths, candidates, api = args
+    _, _, _, table, _, candidates, _ = args
     before = candidates.clone()
     actual = _sparse_candidate_scores(*args, skip_score_topk=0)
     expected = _reference_sparse_scores(*args[:-1])
@@ -208,7 +208,7 @@ def test_sparse_scoring_skip_uses_live_pool_count_in_one_graph(
     monkeypatch, malformed_candidates
 ):
     args = _sparse_inputs(4, 128, True)
-    queries, weights, cache, table, lengths, candidates, api = args
+    _, weights, cache, table, lengths, candidates, api = args
     table.copy_(torch.arange(1, cache.shape[0], device="cuda").view_as(table))
     candidates.copy_(torch.arange(128, device="cuda").expand_as(candidates))
     if malformed_candidates:
@@ -355,9 +355,7 @@ def test_reindex_chunked_graph_matches_sparse_reference(
 
 
 def test_reindex_unaligned_pages_keep_candidate_filtering(monkeypatch):
-    queries, weights, cache, table, lengths, candidates, _ = _sparse_inputs(
-        1, 128, False
-    )
+    _, weights, cache, table, lengths, candidates, _ = _sparse_inputs(1, 128, False)
     cache = cache.contiguous().view(-1, 64, 68)
     q = torch.ones(1, 32, 128, device="cuda", dtype=torch.bfloat16)
 

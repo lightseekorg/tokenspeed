@@ -208,7 +208,7 @@ def print_table(rows, summary):
 
 
 def write_csv(out_path: Path, rows, summary):
-    with out_path.open("w", newline="") as fp:
+    with out_path.open("w", newline="", encoding="utf-8") as fp:
         w = csv.writer(fp)
         w.writerow(
             [

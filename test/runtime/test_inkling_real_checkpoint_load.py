@@ -62,7 +62,7 @@ class TestInklingRealCheckpointLoad:
         from safetensors import safe_open
 
         snapshot = Path(_CKPT)
-        with open(snapshot / "model.safetensors.index.json") as f:
+        with open(snapshot / "model.safetensors.index.json", encoding="utf-8") as f:
             cls.weight_map: dict[str, str] = json.load(f)["weight_map"]
 
         # NVFP4 snapshots carry hf_quant_config.json; remap its exclude
@@ -73,7 +73,7 @@ class TestInklingRealCheckpointLoad:
         if cls.is_fp4:
             from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 
-            with open(snapshot / "hf_quant_config.json") as f:
+            with open(snapshot / "hf_quant_config.json", encoding="utf-8") as f:
                 quant_config = Nvfp4Config.from_config(json.load(f))
             inv = {real: rep for rep, real in _LAYER_MAP.items()}
             remapped = []
@@ -87,7 +87,7 @@ class TestInklingRealCheckpointLoad:
                     )
             quant_config.exclude_modules = remapped
 
-        with open(snapshot / "config.json") as f:
+        with open(snapshot / "config.json", encoding="utf-8") as f:
             cfg = json.load(f)
         cls.real_local_ids = set(cfg["text_config"]["local_layer_ids"])
         assert set(_LAYER_MAP.values()) & cls.real_local_ids == {
@@ -103,7 +103,7 @@ class TestInklingRealCheckpointLoad:
         cfg["vision_config"]["model_type"] = "inkling_vision_model"
         cfg["architectures"] = ["InklingForConditionalGeneration"]
         cls._tmpdir = tempfile.TemporaryDirectory()
-        with open(Path(cls._tmpdir.name) / "config.json", "w") as f:
+        with open(Path(cls._tmpdir.name) / "config.json", "w", encoding="utf-8") as f:
             json.dump(cfg, f)
 
         # Real names to feed: top-level + towers + the mapped layers (+ one

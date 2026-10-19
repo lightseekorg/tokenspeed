@@ -118,7 +118,9 @@ def main_ci_sources(sha):
             or path.name.startswith(("release-", "publish-"))
         ):
             continue
-        triggers = yaml.load(path.read_text(), Loader=yaml.BaseLoader)["on"]
+        triggers = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)[
+            "on"
+        ]
         if "push" not in triggers:
             continue
         push = triggers["push"] or {}
@@ -250,14 +252,16 @@ def read_version(package):
     if package == "tokenspeed-kernel":
         return re.search(
             r'^BASE_VERSION = "([^"]+)"$',
-            Path("tokenspeed-kernel/python/setup.py").read_text(),
+            Path("tokenspeed-kernel/python/setup.py").read_text(encoding="utf-8"),
             re.M,
         )[1]
-    return tomllib.loads(Path(PROJECTS[package]).read_text())["project"]["version"]
+    return tomllib.loads(Path(PROJECTS[package]).read_text(encoding="utf-8"))[
+        "project"
+    ]["version"]
 
 
 def requirements(path):
-    text = Path(path).read_text()
+    text = Path(path).read_text(encoding="utf-8")
     lines = (
         tomllib.loads(text)["project"]["dependencies"]
         if path.endswith(".toml")
@@ -324,10 +328,12 @@ def next_version(current, published, requested):
 
 
 def replace(path, pattern, replacement):
-    text, count = re.subn(pattern, replacement, Path(path).read_text(), flags=re.M)
+    text, count = re.subn(
+        pattern, replacement, Path(path).read_text(encoding="utf-8"), flags=re.M
+    )
     if count != 1:
         raise RuntimeError(f"Expected one version declaration in {path}")
-    Path(path).write_text(text)
+    Path(path).write_text(text, encoding="utf-8")
 
 
 def update_metadata(stage, versions):
@@ -434,7 +440,10 @@ def index_release(root, variant, package, release):
 class Release:
     packages_by_stage = PACKAGES
     pr_files = PR_FILES
-    pr_body = "Keep the weekly release ordered so downstream packages require already published component versions.\n"
+    pr_body = (
+        "Keep the weekly release ordered so downstream packages require already "
+        "published component versions.\n"
+    )
 
     def __init__(self, state_path, stage, *, resume_run_id=""):
         self.path = state_path
@@ -473,7 +482,8 @@ class Release:
     def pause(self):
         if time.monotonic() >= self.deadline:
             raise RuntimeError(
-                "Timed out; inspect recorded child runs and resume after manual intervention"
+                "Timed out; inspect recorded child runs and resume after manual "
+                "intervention"
             )
         time.sleep(30)
 
@@ -540,7 +550,8 @@ class Release:
             for path, record in ci["workflows"].items():
                 if "id" not in record:
                     runs = pages(
-                        f"actions/workflows/{record['workflow_id']}/runs?branch=main&event=push&head_sha={record['sha']}&per_page=100",
+                        f"actions/workflows/{record['workflow_id']}/runs?branch=main"
+                        f"&event=push&head_sha={record['sha']}&per_page=100",
                         "workflow_runs",
                     )
                     if not runs:
@@ -585,7 +596,7 @@ class Release:
                             REPO,
                             "--failed",
                         )
-                    except subprocess.CalledProcessError:
+                    except subprocess.CalledProcessError as error:
                         current = api(f"actions/runs/{record['id']}")
                         if (
                             current["run_attempt"] <= retry["attempt"]
@@ -593,7 +604,7 @@ class Release:
                         ):
                             raise RuntimeError(
                                 "CI retry outcome is unknown; inspect the recorded run"
-                            )
+                            ) from error
                     retry["requested"] = True
                     self.save()
                 elif not retry["requested"]:
@@ -695,7 +706,8 @@ class Release:
             self.state["versions"][p] != v for p, v in versions.items()
         ):
             raise RuntimeError(
-                "Upstream releases changed during this weekly run; manual intervention required"
+                "Upstream releases changed during this weekly run; "
+                "manual intervention required"
             )
         return versions
 
@@ -731,7 +743,8 @@ class Release:
             )
             if any(self.release_exists(WHL, tag) for tag in tags):
                 raise RuntimeError(
-                    "Reserved wheelhouse version already exists; inspect the previous release"
+                    "Reserved wheelhouse version already exists; "
+                    "inspect the previous release"
                 )
         self.state["versions"] = versions
         self.state["initial_versions"] = {
@@ -797,7 +810,8 @@ class Release:
                 self.update_metadata(stage)
                 if not command("git", "diff", "--name-only"):
                     raise RuntimeError(
-                        "Reserved metadata already on main without this run's PR; inspect manually"
+                        "Reserved metadata already on main without this run's PR; "
+                        "inspect manually"
                     )
                 hook_env = dict(os.environ, SKIP="clang-format")
                 hook_env.pop("GH_TOKEN", None)
@@ -895,7 +909,8 @@ class Release:
                     "--repo",
                     REPO,
                     "--json",
-                    "state,headRefOid,baseRefOid,mergeCommit,isDraft,reviewDecision,mergeable",
+                    "state,headRefOid,baseRefOid,mergeCommit,"
+                    "isDraft,reviewDecision,mergeable",
                 )
             )
             if pr["state"] == "MERGED":
@@ -1005,7 +1020,8 @@ class Release:
             if run["status"] == "completed":
                 if run["conclusion"] != "success":
                     raise RuntimeError(
-                        f"Child workflow failed; repair and rerun {run['html_url']} before resuming"
+                        f"Child workflow failed; repair and rerun {run['html_url']} "
+                        "before resuming"
                     )
                 record["complete"] = True
                 self.save()
@@ -1291,7 +1307,8 @@ class Release:
                 "api",
                 "--paginate",
                 "--slurp",
-                f"repos/{REPO}/actions/runs/{self.resume_run_id}/jobs?filter=latest&per_page=100",
+                f"repos/{REPO}/actions/runs/{self.resume_run_id}"
+                "/jobs?filter=latest&per_page=100",
             )
         )
         results = {
@@ -1299,7 +1316,8 @@ class Release:
         }
         if any(results.get(f"{stage} / stage") != "success" for stage in STAGES[:-1]):
             raise RuntimeError(
-                "Release-only recovery requires all publication stages to have succeeded"
+                "Release-only recovery requires all publication stages "
+                "to have succeeded"
             )
         self.state["resumed_by_run_id"] = os.environ["GITHUB_RUN_ID"]
 
@@ -1392,7 +1410,11 @@ class Release:
             f"| {p} | [{v}](https://pypi.org/project/{p}/{v}/) |\n"
             for p, v in versions.items()
         )
-        text += f"\nDocker: [{self.state['stages']['docker']['image']}](https://hub.docker.com/r/lightseekorg/tokenspeed/tags?name={versions['tokenspeed']}) (linux/amd64, linux/arm64).\n\n"
+        text += (
+            f"\nDocker: [{self.state['stages']['docker']['image']}]"
+            "(https://hub.docker.com/r/lightseekorg/tokenspeed/tags"
+            f"?name={versions['tokenspeed']}) (linux/amd64, linux/arm64).\n\n"
+        )
         text += (
             "Stable pip indexes: "
             + ", ".join(
@@ -1518,7 +1540,8 @@ class Release:
             raise RuntimeError(
                 "Cleanup requires verified publications and release page"
             )
-        # Legacy runs did not record refs separately; derive only their exact three refs.
+        # Legacy runs did not record refs separately; derive only their exact
+        # three refs.
         refs = self.state.setdefault("release_refs", {})
         pending = []
         for stage, package in PACKAGES.items():
@@ -1638,7 +1661,8 @@ class ComponentRelease(Release):
                     or indexed[name]["hashes"].get("sha256") != digest
                 ):
                     raise RuntimeError(
-                        f"{self.package} index files differ from the verified publication"
+                        f"{self.package} index files differ from the verified "
+                        "publication"
                     )
             if files.keys() <= indexed.keys():
                 return
@@ -1653,7 +1677,8 @@ class ComponentRelease(Release):
                 or current != version
             ):
                 raise RuntimeError(
-                    f"{self.package} dependency requires a completed publication of the current version"
+                    f"{self.package} dependency requires a completed publication "
+                    "of the current version"
                 )
             check_tree(self.state["stages"][self.stages[0]]["sha"], self.package)
             if self.files() != self.state["publication_files"]:
@@ -1680,7 +1705,8 @@ class ComponentRelease(Release):
             "complete"
         ):
             raise RuntimeError(
-                f"Previous {self.package.removeprefix('tokenspeed-')} stage did not complete"
+                f"Previous {self.package.removeprefix('tokenspeed-')} "
+                "stage did not complete"
             )
         if self.stage == self.stages[0]:
             self.reserve(requested)
@@ -1709,7 +1735,10 @@ class SchedulerRelease(ComponentRelease):
         "scheduler-version": [PROJECTS["tokenspeed-scheduler"]],
         "scheduler-dependency": [PROJECTS["tokenspeed"]],
     }
-    pr_body = "Keep the scheduler release ordered so TokenSpeed requires an already published version.\n"
+    pr_body = (
+        "Keep the scheduler release ordered so TokenSpeed requires an already "
+        "published version.\n"
+    )
 
     def update_metadata(self, stage):
         if stage == "scheduler-version":
@@ -1764,7 +1793,8 @@ class SchedulerRelease(ComponentRelease):
             or sum(name.endswith(".tar.gz") for name in files) != 1
         ):
             raise RuntimeError(
-                "Scheduler publication requires eight wheels and one source distribution"
+                "Scheduler publication requires eight wheels and one source "
+                "distribution"
             )
         return files
 
@@ -1785,7 +1815,8 @@ class SchedulerRelease(ComponentRelease):
         self.published("tokenspeed-scheduler", workflow, sha)
         files = self.files()
         release = request(
-            f"https://api.github.com/repos/{WHL}/releases/tags/tokenspeed-scheduler-v{version}",
+            f"https://api.github.com/repos/{WHL}/releases/tags/"
+            f"tokenspeed-scheduler-v{version}",
             github=True,
         )
         if (
@@ -1911,11 +1942,13 @@ def main():
     finally:
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary:
-            with Path(summary).open("a") as output:
-                print(
-                    f"{args.stage}: {'success' if release.phase.get('complete') else 'manual intervention required'}",
-                    file=output,
+            with Path(summary).open("a", encoding="utf-8") as output:
+                status = (
+                    "success"
+                    if release.phase.get("complete")
+                    else "manual intervention required"
                 )
+                print(f"{args.stage}: {status}", file=output)
                 print(
                     f"\n```json\n{json.dumps(release.state, indent=2)}\n```",
                     file=output,

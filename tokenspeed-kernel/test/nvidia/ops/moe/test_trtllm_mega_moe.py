@@ -180,7 +180,8 @@ def _check(output, expected, label):
     ).norm() / expected.float().norm().clamp_min(1e-6)
     maximum = (output.float() - expected.float()).abs().max()
     print(
-        f"rank={dist.get_rank()} {label}: relative_l2={error.item():.6f} max_abs={maximum.item():.6f}",
+        f"rank={dist.get_rank()} {label}: relative_l2={error.item():.6f} "
+        f"max_abs={maximum.item():.6f}",
         flush=True,
     )
     assert torch.isfinite(output).all()
@@ -334,7 +335,8 @@ def run_correctness(capacity: int, live_tokens: int, tune: bool):
     dist.barrier()
     if dist.get_rank() == 0:
         print(
-            "PASS NVFP4 SiTU MegaMoE eager, graph replay, idle ranks, and shared-arena capacity switching",
+            "PASS NVFP4 SiTU MegaMoE eager, graph replay, idle ranks, and "
+            "shared-arena capacity switching",
             flush=True,
         )
 

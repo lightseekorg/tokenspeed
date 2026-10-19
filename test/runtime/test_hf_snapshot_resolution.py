@@ -64,7 +64,9 @@ class TestHFSnapshotResolutionTests:
         }
         if snapshot_value is not None:
             config["snapshot_value"] = snapshot_value
-        with open(os.path.join(directory, "config.json"), "w") as file:
+        with open(
+            os.path.join(directory, "config.json"), "w", encoding="utf-8"
+        ) as file:
             json.dump(config, file)
 
     def test_registered_config_uses_revision_pinned_snapshot(self) -> None:

@@ -66,7 +66,6 @@ def find_nccl_library() -> str:
     # so_file can be set to None in tokenspeed
     so_file = os.environ.get("TOKENSPEED_NCCL_SO_PATH", None)
 
-    # manually load the nccl library
     if so_file:
         logger.info(
             f"Found nccl from environment variable TOKENSPEED_NCCL_SO_PATH={so_file!s}",

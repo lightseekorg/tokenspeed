@@ -70,7 +70,6 @@ class Req:
         origin_input_multi_ids: list[list[int]] | None = None,
         created_time: float | None = None,
     ):
-        # Input and output info
         self.rid = rid
         self.origin_input_text = origin_input_text
         self.origin_input_ids_unpadded = (
@@ -80,7 +79,6 @@ class Req:
         )
         self.origin_input_ids = origin_input_ids
         self.origin_input_multi_ids = origin_input_multi_ids
-        # Each decode stage's output ids
         self.output_ids = []
         self.output_multi_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
@@ -93,7 +91,6 @@ class Req:
         self.input_embeds = input_embeds
         self.input_extra_infos = input_extra_infos
 
-        # Sampling info
         if isinstance(sampling_params.custom_params, dict):
             sampling_params = copy.copy(sampling_params)
             sampling_params.custom_params = sampling_params.custom_params | {
@@ -104,25 +101,26 @@ class Req:
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
 
-        # Memory pool info
         self.req_pool_idx: int | None = None
         self.req_to_token_pool_info: ReqToTokenPoolInfo | None = None
         # substitute for prefix_indices
         self.prefix_page_ids = []
         self.prefix_len = 0
 
-        # Check finish
         self.tokenizer = None
-        # Cached tokenizer-related ids to avoid repeated HF attribute lookups in check_finished().
+        # Cached tokenizer-related ids to avoid repeated HF attribute lookups in
+        # check_finished().
         self._eos_token_id_cached: int | None = None
         self._additional_stop_token_ids_cached: set[int] | None = None
         self.finished_reason = None
-        # Whether this request has finished output
         self.finished_output = None
-        # If we want to abort the request in the middle of the event loop, set this to true
-        # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
+        # If we want to abort the request in the middle of the event loop, set this
+        # to True.
+        # Note: We should never set finished_reason in the middle; the req will get
+        # filtered and never respond.
         self.to_abort = False
-        # This carries the error message for `.to_abort` and will be attached to the finished_reason at the end of the event loop
+        # This carries the error message for `.to_abort` and will be attached to the
+        # finished_reason at the end of the event loop.
         self.to_abort_message: str = "Unknown error"
         self.stream = stream
         self.eos_token_ids = eos_token_ids
@@ -140,7 +138,6 @@ class Req:
         self.read_offset = None
         self.decoded_text = ""
 
-        # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices = []
         # Number of tokens to run prefill.
@@ -154,20 +151,17 @@ class Req:
         # processed.
         self.is_chunked = 0
 
-        # Incremental streamining
         self.send_token_offset: int = 0
         self.send_decode_id_offset: int = 0
         # because the decode server does not have the first output token logprobs
         self.send_output_token_logprobs_offset: int = 0
 
-        # Logprobs (arguments)
         self.return_logprob = return_logprob
         # Start index to compute logprob from.
         self.logprob_start_len = 0
         self.top_logprobs_num = top_logprobs_num
         self.token_ids_logprob = token_ids_logprob
 
-        # Logprobs (return values)
         self.input_logprob_sent: bool = False
         self.input_token_logprobs_val: list[float] | None = None
         self.input_token_logprobs_idx: list[int] | None = None
@@ -197,10 +191,8 @@ class Req:
             ) = None
         self.hidden_states = []
 
-        # Embedding (return values)
         self.embedding = None
 
-        # Constrained decoding
         self.grammar: BaseGrammarObject | None = None
 
         # The number of cached tokens that were already cached in the KV cache
@@ -213,15 +205,13 @@ class Req:
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
 
-        # Time of obj created
-        # Use the created_time from tokenizer if provided, otherwise use current time
         if created_time is not None:
             self.created_time = created_time
         else:
             self.created_time = time.time()
-        # Calculate the time from receiving the request at TokenizerManager to reaching process_input_requests in the scheduling process
+        # Calculate the time from receiving the request at TokenizerManager to
+        # reaching process_input_requests in the scheduling process.
         self.tokenizer_to_scheduler_latency = time.time() - self.created_time
-        # For metrics
         self.time_stats: TimeStats = TimeStats()
         self.has_log_time_stats: bool = False
         self.queue_time_start = None
@@ -234,7 +224,6 @@ class Req:
         self.first_chunk_forward_start_time = None
 
         self.reserve_num_tokens = 0
-        # For disaggregation
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: int | None = bootstrap_port
         self.bootstrap_room: int | None = bootstrap_room
@@ -246,7 +235,9 @@ class Req:
         # start_send_idx = len(req.fill_ids)
         self.start_send_idx: int = 0
 
-        # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
+        # For overlap schedule, we delay the kv transfer until
+        # `process_batch_result_disagg_prefill` rather than `process_prefill_chunk`
+        # in non-overlap.
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
@@ -275,7 +266,6 @@ class Req:
         return len(self.origin_input_ids) + len(self.output_ids)
 
     def finished(self) -> bool:
-        # Whether request reached finished condition
         return self.finished_reason is not None
 
     def init_incremental_detokenize(self):
@@ -286,7 +276,6 @@ class Req:
             self.surr_offset = max(
                 self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
-            # self.surr_offset = self.read_offset
 
         all_ids = self.origin_input_ids_unpadded + self.output_ids
         return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
@@ -317,7 +306,6 @@ class Req:
         if not self.sampling_params.ignore_eos:
             matched_eos = False
 
-            # Check stop token ids
             if self.sampling_params.stop_token_ids:
                 matched_eos = last_token_id in self.sampling_params.stop_token_ids
             if self.eos_token_ids:
@@ -332,7 +320,6 @@ class Req:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
                 return
 
-        # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
             tail_str = self.tokenizer.decode(
                 self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
@@ -346,5 +333,6 @@ class Req:
     def __repr__(self):
         return (
             f"Req(rid={self.rid}, "
-            f"input_ids={len(self.origin_input_ids)}, output_ids={len(self.output_ids)})"
+            f"input_ids={len(self.origin_input_ids)}, "
+            f"output_ids={len(self.output_ids)})"
         )

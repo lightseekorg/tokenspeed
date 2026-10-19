@@ -38,7 +38,7 @@ _DIRECTORY = _AMD / "python" / Path(*_PACKAGE.split("."))
 
 
 def _source_function(filename, name):
-    module = ast.parse((_DIRECTORY / filename).read_text())
+    module = ast.parse((_DIRECTORY / filename).read_text(encoding="utf-8"))
     return next(
         node
         for node in module.body

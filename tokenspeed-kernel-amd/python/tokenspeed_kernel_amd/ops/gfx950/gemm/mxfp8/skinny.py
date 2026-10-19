@@ -18,6 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""Skinny-M (M <= 64) MXFP8 GEMM for gfx950: E4M3 values are upcast exactly
+to bf16 and accumulated with bf16 MFMAs in FP32.
+"""
+
 from __future__ import annotations
 
 import torch

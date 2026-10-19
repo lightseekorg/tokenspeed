@@ -181,7 +181,8 @@ def launch_gluon_linear_attnres_partials_gfx1250(
     output_size = weight.shape[0]
     if output_size not in (_KIMI3_MLA_OUTPUT_SIZE, _KIMI3_KDA_OUTPUT_SIZE):
         raise ValueError(
-            f"output size must be one of {_KIMI3_MLA_OUTPUT_SIZE, _KIMI3_KDA_OUTPUT_SIZE}"
+            "output size must be one of "
+            f"{_KIMI3_MLA_OUTPUT_SIZE, _KIMI3_KDA_OUTPUT_SIZE}"
         )
     if output_size % _BLOCK_N_SIZE != 0:
         raise ValueError(f"output size must be divisible by {_BLOCK_N_SIZE}")

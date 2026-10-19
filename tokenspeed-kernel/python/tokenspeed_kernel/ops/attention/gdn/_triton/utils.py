@@ -48,7 +48,7 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
             The function to be decorated. It should take tensor inputs and return tensor outputs.
     Returns:
         Callable[..., torch.Tensor]:
-            A wrapped version of the input function with single-entry caching.
+            A wrapped version of the input function with a four-entry cache.
     """
 
     cache_entries: tuple[tuple | None, dict | None, Any] = []

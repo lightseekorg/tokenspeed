@@ -115,12 +115,6 @@ def attach_prefill_aliases(
     gdot128-preshuffled 3-D tensors and the scales are CDNA4-swizzled. Models
     whose weights are not in that layout are left untouched and fall back to the
     reference path (the dynamic entry returns None without these aliases).
-
-    Args:
-        w: the MoE layer whose ``w13_weight_triton_tensor`` /
-            ``w2_weight_triton_tensor`` were gdot128-preshuffled.
-        w13_scale: swizzled CDNA4 gate/up scale tensor.
-        w2_scale: swizzled CDNA4 down-projection scale tensor.
     """
     w13 = w.w13_weight_triton_tensor
     w2 = w.w2_weight_triton_tensor

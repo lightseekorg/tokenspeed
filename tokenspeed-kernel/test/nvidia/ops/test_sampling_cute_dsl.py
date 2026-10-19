@@ -47,8 +47,7 @@ requires_nvidia = pytest.mark.skipif(
 )
 
 
-# Vocab sizes for the models tokenspeed actively serves — same list as
-# ``tmp/integrate_cutedsl_argmax/bench_argmax.py::DEFAULT_N``.
+# Vocab sizes for the models tokenspeed actively serves.
 MODEL_VOCABS = {
     "dsv4": 129280,
     "qwen3_5": 151936,
@@ -62,14 +61,7 @@ def _need_cuda():
         pytest.skip("CUDA is required for the CuTe argmax kernel")
 
 
-# ---------------------------------------------------------------------------
-# Correctness — kernel path (N >= 256, N % 32 == 0, fp32, supported SM)
-# ---------------------------------------------------------------------------
-
-
-# Speculative-decoding-style small batches across real model vocabs. Mirrors
-# ``bench_argmax.py::DEFAULT_M`` so the kernel coverage tested here matches the
-# one we benchmark.
+# Speculative-decoding-style small batches across real model vocabs.
 _KERNEL_M_VALUES = [1, 4, 16, 64, 128]
 _KERNEL_SHAPES = [(m, n) for n in MODEL_VOCABS.values() for m in _KERNEL_M_VALUES] + [
     # Asymmetric M values to catch row-tail edge cases the powers-of-two miss.
@@ -123,11 +115,6 @@ def test_argmax_pair_writes_into_caller_buffer():
     ref_max, ref_idx = torch.max(x, dim=-1, keepdim=True)
     torch.testing.assert_close(out[:, 0:1], ref_max, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(out[:, 1:2].long(), ref_idx, atol=0, rtol=0)
-
-
-# ---------------------------------------------------------------------------
-# Fallback paths — these must still return correct indices
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("N", [8, 32, 64, 128, 256, 1024, 2048, 3072])
@@ -290,11 +277,6 @@ def test_ts_supported_arch_gates_unsupported_sm():
         Platform.override(real_platform)
 
 
-# ---------------------------------------------------------------------------
-# Special vocab patterns — ties / structured maxima
-# ---------------------------------------------------------------------------
-
-
 def test_argmax_returns_first_index_on_ties_like_torch():
     """Tied values: torch.argmax returns the lowest index. The CuTe kernel uses
     a redux.sync.min on candidates whose value equals the warp max, so it must
@@ -368,12 +350,6 @@ def test_argmax_mtp_pattern():
     assert out[0].item() == 1
 
 
-# ---------------------------------------------------------------------------
-# ``out=`` parameter — the kernel must honor caller-provided int32 / int64
-# buffers (used by greedy / flashinfer / eagle to skip a downstream cast).
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("out_dtype", [torch.int32, torch.int64])
 def test_argmax_writes_into_caller_buffer(out_dtype):
     """Caller-provided int32 / int64 buffer: kernel writes indices directly,
@@ -413,11 +389,6 @@ def test_argmax_rejects_invalid_out():
         cute_argmax(x, out=torch.empty(4, dtype=torch.float32, device="cuda"))
     with pytest.raises(ValueError, match="device"):
         cute_argmax(x, out=torch.empty(4, dtype=torch.int32, device="cpu"))
-
-
-# ---------------------------------------------------------------------------
-# CUDA graph compatibility — the kernel must run from inside a captured graph
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(

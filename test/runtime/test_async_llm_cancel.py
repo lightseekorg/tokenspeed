@@ -119,11 +119,10 @@ class TestWaitOneResponseCancellation:
         # Finally block cleanup.
         assert (obj.rid) not in (mgr.rid_to_state)
         aborts = mgr.engine_core_client.send_to_scheduler.aborts
-        _pytest_first_1 = len(aborts)
-        _pytest_second_2 = 1
-        _pytest_msg_3 = f"expected exactly one AbortReq on cancel, got {len(aborts)}"
-        assert _pytest_first_1 == _pytest_second_2, _pytest_msg_3
-        # The AbortReq should carry the right rid.
+        first = len(aborts)
+        second = 1
+        msg = f"expected exactly one AbortReq on cancel, got {len(aborts)}"
+        assert first == second, msg
         assert (getattr(aborts[0], "rid", None)) == (obj.rid)
 
     @pytest.mark.asyncio(loop_scope="function")
@@ -167,7 +166,6 @@ class TestWaitOneResponseCancellation:
         assert (len(results)) == (1)
         assert (results[0]["text"]) == ("hello")
         assert (obj.rid) not in (mgr.rid_to_state)
-        # Normal finish ⇒ no abort.
         assert (len(mgr.engine_core_client.send_to_scheduler.aborts)) == (
             0
         ), "normal finish should not schedule an AbortReq"

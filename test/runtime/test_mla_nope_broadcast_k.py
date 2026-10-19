@@ -12,7 +12,10 @@ TOKENS, Q_HEADS, NOPE, ROPE = 32, 6, 512, 64
 
 def _inputs(kv_heads: int, dev="cuda"):
     torch.manual_seed(0)
-    g = lambda h, d: torch.randn(TOKENS, h, d, device=dev, dtype=torch.bfloat16)
+
+    def g(h, d):
+        return torch.randn(TOKENS, h, d, device=dev, dtype=torch.bfloat16)
+
     return g(Q_HEADS, NOPE), g(Q_HEADS, ROPE), g(kv_heads, NOPE), g(kv_heads, ROPE)
 
 

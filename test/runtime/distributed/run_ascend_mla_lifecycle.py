@@ -358,5 +358,7 @@ def run(degree):
 
 for degree in [1, 8]:
     run(degree)
-Path(f"results/mla-lifecycle-rank{rank}.json").write_text(json.dumps(results, indent=2))
+Path(f"results/mla-lifecycle-rank{rank}.json").write_text(
+    json.dumps(results, indent=2), encoding="utf-8"
+)
 torch.distributed.destroy_process_group()

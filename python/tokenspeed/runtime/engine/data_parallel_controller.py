@@ -60,8 +60,6 @@ logger = get_colorful_logger(__name__)
 
 
 class LoadBalanceMethod(Enum):
-    """Load balance method."""
-
     ROUND_ROBIN = auto()
     SHORTEST_QUEUE = auto()
     MINIMUM_CACHE_USAGE = auto()
@@ -169,7 +167,6 @@ class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
 
     def __init__(self, server_args: ServerArgs, port_args: PortArgs) -> None:
-        # Parse args
         self.max_total_num_tokens = None
         self.max_req_input_len = None
         self.max_single_request_tokens = None
@@ -183,7 +180,6 @@ class DataParallelController:
             server_args.load_balance_method
         )
 
-        # Init inter-process communication
         self.context = zmq.Context(1 + server_args.mapping.attn.dp_size)
         if server_args.node_rank == 0:
             self.recv_from_tokenizer = IpcReceiver(
@@ -191,13 +187,12 @@ class DataParallelController:
                     self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
                 )
             )
-        # dp_worker for fixed data dispatch can be set by SINGLE_WORKER_ID environment variable
+        # SINGLE_WORKER_ID pins every request to that one DP worker.
         robin_scheduler = (
             self.round_robin_scheduler
             if os.environ.get("SINGLE_WORKER_ID", "-1") == "-1"
             else self.single_robin_scheduler
         )
-        # Dispatch method
         self.round_robin_counter = 0
         dispatch_lookup = {
             LoadBalanceMethod.ROUND_ROBIN: robin_scheduler,
@@ -206,14 +201,12 @@ class DataParallelController:
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
 
-        # Load balance budget
         self.dp_budget = DPBudget(self.load_balance_method)
         self.load_snapshot_store = LoadSnapshotStore(server_args.mapping.attn.dp_size)
         self.load_snapshot_epochs: list[str | None] = [
             None
         ] * server_args.mapping.attn.dp_size
 
-        # Launch data parallel workers
         self.scheduler_procs = []
         self.workers = [None] * server_args.mapping.attn.dp_size
 
@@ -275,8 +268,6 @@ class DataParallelController:
         threads = []
         dp_port_args = []
 
-        # Parse dist_init_addr from port_args to create per-dp-rank ports
-        # Extract base info from the passed port_args
         base_scheduler_port = int(port_args.scheduler_input_ipc_name.split(":")[-1])
         dist_init_host = port_args.scheduler_input_ipc_name.split("//")[1].split(":")[0]
 
@@ -293,13 +284,13 @@ class DataParallelController:
         # So we start from base_scheduler_port + 1 for dp_rank=0.
 
         for dp_rank in range(server_args.mapping.attn.dp_size):
-            # Create port_args for each dp_rank by adjusting scheduler_input_port
-            # This avoids calling PortArgs.init_new which might use default port
-            # Use base_scheduler_port + 1 + dp_rank to avoid conflict with TokenizerManager
+            # Not PortArgs.init_new, which might use the default port.
             scheduler_input_port = base_scheduler_port + 1 + dp_rank
             tmp_port_args = PortArgs(
                 tokenizer_ipc_name=port_args.tokenizer_ipc_name,
-                scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
+                scheduler_input_ipc_name=(
+                    f"tcp://{dist_init_host}:{scheduler_input_port}"
+                ),
                 nccl_port=port_args.nccl_port,
                 dist_init_addr=port_args.dist_init_addr,
                 rpc_ipc_name=port_args.rpc_ipc_name,
@@ -332,14 +323,12 @@ class DataParallelController:
                 dp_ranks_per_node * (server_args.node_rank + 1),
             )
         for dp_rank in dp_rank_range:
-            # Create a thread for each worker
             thread = threading.Thread(
                 target=self.launch_tensor_parallel_group,
                 args=(server_args, dp_port_args[dp_rank], dp_rank),
             )
             threads.append(thread)
 
-        # Start all threads
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -371,7 +360,6 @@ class DataParallelController:
         for attn_tp_rank in attn_tp_rank_range:
             global_rank = dp_rank * attn_tp_size + attn_tp_rank
 
-            # Create per-rank server_args with rank-initialized mapping
             rank_server_args = copy.copy(server_args)
             rank_server_args.mapping = copy.deepcopy(mapping_template)
             rank_server_args.mapping.rank = global_rank

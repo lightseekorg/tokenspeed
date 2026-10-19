@@ -210,15 +210,12 @@ class ScalarType:
         return self.signed
 
     def is_floating_point(self) -> bool:
-        "If the type is a floating point type"
         return self.exponent != 0
 
     def is_integer(self) -> bool:
-        "If the type is an integer type"
         return self.exponent == 0
 
     def has_bias(self) -> bool:
-        "If the type has a non-zero bias"
         return self.bias != 0
 
     def has_infs(self) -> bool:
@@ -279,10 +276,6 @@ class ScalarType:
     def __len__(self) -> int:
         raise TypeError
 
-    #
-    # Convenience Constructors
-    #
-
     @classmethod
     def int_(cls, size_bits: int, bias: int | None) -> "ScalarType":
         "Create a signed integer scalar type (size_bits includes sign-bit)."
@@ -292,7 +285,7 @@ class ScalarType:
 
     @classmethod
     def uint(cls, size_bits: int, bias: int | None) -> "ScalarType":
-        """Create a unsigned integer scalar type."""
+        """Create an unsigned integer scalar type."""
         ret = cls(0, size_bits, False, bias if bias else 0)
         ret.id  # noqa B018: make sure the id is cached
         return ret
@@ -330,18 +323,6 @@ class ScalarType:
         if scalar_type_id not in _SCALAR_TYPES_ID_MAP:
             raise ValueError(f"scalar_type_id {scalar_type_id} doesn't exists.")
         return _SCALAR_TYPES_ID_MAP[scalar_type_id]
-
-
-# naming generally follows: https://github.com/jax-ml/ml_dtypes
-# for floating point types (leading f) the scheme is:
-#  `float<size_bits>_e<exponent_bits>m<mantissa_bits>[flags]`
-#  flags:
-#  - no-flags: means it follows IEEE 754 conventions
-#  - f: means finite values only (no infinities)
-#  - n: means nans are supported (non-standard encoding)
-# for integer types the scheme is:
-#  `[u]int<size_bits>[b<bias>]`
-#  - if bias is not present it means its zero
 
 
 class scalar_types:

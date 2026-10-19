@@ -69,7 +69,6 @@ def apply_rotary_pos_emb_native(
     orig_k_dtype = k.dtype
     q, k = q.float(), k.float()
 
-    # embedding is performed in float
     cos = cos.unsqueeze(unsqueeze_dim).float()
     sin = sin.unsqueeze(unsqueeze_dim).float()
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -106,7 +105,6 @@ class RotaryEmbedding(torch.nn.Module):
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def _compute_inv_freq(self, base: int | float) -> torch.Tensor:
-        """Compute the inverse frequency."""
         #  To exactly match the HF implementation, we need to
         # use CPU to compute the cache and then move it to GPU. However, we
         # create the cache on GPU for faster initialization. This may cause
@@ -120,7 +118,6 @@ class RotaryEmbedding(torch.nn.Module):
         return inv_freq
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
-        """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
         t = torch.arange(self.max_position_embeddings, dtype=torch.float)
 
@@ -315,7 +312,7 @@ def _yarn_find_correction_range(
     high = math.ceil(
         _yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
     )
-    return max(low, 0), min(high, dim - 1)  # Clamp values just in case
+    return max(low, 0), min(high, dim - 1)
 
 
 def _yarn_linear_ramp_mask(
@@ -471,7 +468,8 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         self.short_mscale = short_mscale
         self.long_mscale = long_mscale
 
-        # Short-context rows, then long-context rows: as_rotary offsets into the second half.
+        # Short-context rows, then long-context rows; as_rotary offsets into the
+        # latter.
         rope_cache = torch.cat(
             [
                 self._compute_cos_sin_cache(
@@ -784,7 +782,8 @@ class MRotaryEmbedding(RotaryEmbedding):
             actual_sum = sum(self.mrope_section)
             if actual_sum != expected_sum:
                 logger.warning(
-                    f"MRoPE section sum mismatch: expected {expected_sum}, got {actual_sum}. "
+                    f"MRoPE section sum mismatch: expected {expected_sum}, "
+                    f"got {actual_sum}. "
                     f"Adjusting mrope_section to match rotary_dim // 2 = {expected_sum}"
                 )
                 # Auto-correct by scaling the mrope_section proportionally
@@ -803,13 +802,13 @@ class MRotaryEmbedding(RotaryEmbedding):
                     self.mrope_section = [
                         expected_sum // len(self.mrope_section)
                     ] * len(self.mrope_section)
-                    # Handle remainder
                     remainder = expected_sum % len(self.mrope_section)
                     for i in range(remainder):
                         self.mrope_section[i] += 1
 
                 logger.warning(
-                    f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
+                    f"Corrected mrope_section: {self.mrope_section} "
+                    f"(sum={sum(self.mrope_section)})"
                 )
 
     def as_rotary(self, positions: torch.Tensor) -> Rotary:
@@ -839,6 +838,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         second_per_grid_ts: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        del kwargs
         mrope_position_deltas = []
         if input_ids is not None and (
             image_grid_thw is not None or video_grid_thw is not None
@@ -903,11 +903,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                     )
                     text_len = ed - st
 
-                    st_idx = (
-                        llm_pos_ids_list[-1].max() + 1
-                        if len(llm_pos_ids_list) > 0
-                        else 0
-                    )
+                    st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
                     llm_pos_ids_list.append(
                         torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
                     )
@@ -958,11 +954,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                     st = ed + llm_grid_t * llm_grid_h * llm_grid_w
 
                 if st < len(input_tokens):
-                    st_idx = (
-                        llm_pos_ids_list[-1].max() + 1
-                        if len(llm_pos_ids_list) > 0
-                        else 0
-                    )
+                    st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
                     text_len = len(input_tokens) - st
                     llm_pos_ids_list.append(
                         torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
@@ -999,6 +991,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Get mrope input positions and delta value for GLM4V."""
+        del kwargs
         image_token_id = hf_config.image_token_id
         video_start_token_id = hf_config.video_start_token_id
         video_end_token_id = hf_config.video_end_token_id
@@ -1052,11 +1045,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                 llm_pos_ids_list = []
                 video_frame_num = 1
                 for modality_type, start_idx, end_idx in input_type_group:
-                    st_idx = (
-                        llm_pos_ids_list[-1].max() + 1
-                        if len(llm_pos_ids_list) > 0
-                        else 0
-                    )
+                    st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
 
                     if modality_type == "image":
                         t, h, w = (

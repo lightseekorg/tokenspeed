@@ -97,14 +97,14 @@ def _snapshot() -> str:
         config_path = os.path.join(candidate, "config.json")
         if not os.path.exists(config_path):
             continue
-        with open(config_path) as handle:
+        with open(config_path, encoding="utf-8") as handle:
             if json.load(handle).get("model_type") == "muse_spark":
                 return candidate
     pytest.skip("no Muse Spark checkpoint in the Hugging Face cache")
 
 
 def _raw_config(snapshot: str) -> dict:
-    with open(os.path.join(snapshot, "config.json")) as handle:
+    with open(os.path.join(snapshot, "config.json"), encoding="utf-8") as handle:
         return json.load(handle)
 
 

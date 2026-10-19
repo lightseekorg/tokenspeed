@@ -95,7 +95,8 @@ def test_tree_windows_match_per_path_reference():
 
 @pytest.mark.parametrize("width", [2, 3, 4])
 def test_tree_update_is_bitwise_per_path_reference(width):
-    """Products round to bf16 and add left to right in fp32, so the reference is exact."""
+    """Products round to bf16 and add left to right in fp32, so the reference is
+    exact."""
     torch.manual_seed(width)
     bs, dim, t = 4, 1000, 6
     parents = PARENTS + [[-1, 0, 0, 1, -1, 4]]
@@ -233,7 +234,8 @@ def test_tree_update_rejects_unknown_activation():
 
 
 def test_tree_update_skips_padded_entries():
-    """A padded entry (conv_state_indices == PAD_SLOT_ID) reads and writes no state, as on the chain path."""
+    """A padded entry (conv_state_indices == PAD_SLOT_ID) reads and writes no
+    state, as on the chain path."""
     bs, dim, width, t = 2, 64, 4, 4
     backing = torch.zeros(1 + 8, dim, width - 1, device="cuda", dtype=torch.bfloat16)
     backing[0] = 1000.0  # what index -1 would read

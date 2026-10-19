@@ -1115,9 +1115,6 @@ def test_transfer_kv_all_layer_mla(device: str) -> None:
         assert torch.equal(layers_dst[layer_idx], expected[layer_idx])
 
 
-# index_k_block_split_scatter (GLM-5 DSA index-K cache write)
-
-
 def _index_k_block_views(buf, num_pages, page_size, head_dim, num_groups):
     row = head_dim + num_groups * 4
     page_bytes = page_size * row

@@ -152,8 +152,6 @@ def _linear_calls_by_prefix(linear_calls):
     return {c["prefix"].rsplit(".", 1)[-1]: c for c in linear_calls if "prefix" in c}
 
 
-# The shard's own predicate starts at the platform, so there is no wiring to
-# assert off NVIDIA; the predicate itself is covered separately.
 @contextlib.contextmanager
 def _model_dtype(dtype: torch.dtype):
     """The context weight loading runs under, which the wiring reads."""
@@ -165,6 +163,8 @@ def _model_dtype(dtype: torch.dtype):
         torch.set_default_dtype(previous)
 
 
+# The shard's own predicate starts at the platform, so there is no wiring to
+# assert off NVIDIA; the predicate itself is covered separately.
 _NVIDIA_ONLY = pytest.mark.skipif(
     not current_platform().is_nvidia, reason="the latent down shard is NVIDIA-only"
 )
@@ -286,7 +286,8 @@ class TestKimiK3RegistrationTests:
 
     @_NVIDIA_ONLY
     def test_the_packed_input_projection_declines_a_narrowed_weight(self):
-        """It reads the routed weight directly, so a narrowed one would bypass the gather.
+        """It reads the routed weight directly, so a narrowed one would bypass
+        the gather.
 
         Shipped once without this: the packed path handed the experts one rank's
         448 columns where the expert weight takes 3584, and narrow and wide
@@ -330,7 +331,7 @@ class TestKimiK3RegistrationTests:
         )
         config, mapping = built.config, built.mapping
         linear_calls, multicast_calls = built.linear_calls, built.multicast_calls
-        _layer, get_pg = built.layer, built.get_pg
+        get_pg = built.get_pg
         self._assert_latent_projection_sharding(linear_calls, mapping, trtllm=True)
         # The native plan cannot reach this shard at all (it is AMD-only), so the
         # multicast wiring has to be asserted here or nowhere.

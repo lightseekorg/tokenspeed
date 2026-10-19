@@ -173,7 +173,8 @@ def _flashinfer_trtllm_mla_kv_cache(
             return kv_cache.contiguous()
     raise ValueError(
         "kv_cache must be flat [slots, dim], flat [slots, 1, dim], or paged "
-        f"[pages, page_size, 1, dim] for FlashInfer/TRTLLM sparse MLA, got {tuple(kv_cache.shape)}"
+        "[pages, page_size, 1, dim] for FlashInfer/TRTLLM sparse MLA, got "
+        f"{tuple(kv_cache.shape)}"
     )
 
 
@@ -379,7 +380,7 @@ def deterministic_decode_topk(
     """
     if top_k is None or TopKTieBreak is None:
         raise RuntimeError("flashinfer deterministic top_k is unavailable.")
-    _values, indices = top_k(
+    _, indices = top_k(
         logits.contiguous(),
         int(topk),
         deterministic=True,

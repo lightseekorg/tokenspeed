@@ -108,7 +108,8 @@ class RadioVisionModel(nn.Module):
         patch_dim = 3 * config.patch_size**2
         hidden_size = config.hidden_size
         self.temporal_patch_size = config.video_temporal_patch_size
-        # The planner's largest image grid, two rows of the patch budget, bounds a video pass.
+        # The planner's largest image grid, two rows of the patch budget, bounds a
+        # video pass.
         self.video_patches_per_pass = 2 * config.image_patch_budget
         self.grid_size = config.position_grid_size
         self.num_prefix_tokens = config.num_prefix_tokens
@@ -143,7 +144,8 @@ class RadioVisionModel(nn.Module):
         """
         side = max(rows, cols)
         grid = self.pos_embed.view(1, self.grid_size, self.grid_size, -1)
-        # The ref engine resizes this channels-last view; the NCHW kernel rounds differently.
+        # The ref engine resizes this channels-last view; the NCHW kernel rounds
+        # differently.
         grid = grid.permute(0, 3, 1, 2).float()
         if side < self.grid_size:
             grid = F.interpolate(
@@ -174,7 +176,9 @@ class RadioVisionModel(nn.Module):
     def embed_video(
         self, patches: torch.Tensor, frames: int, rows: int, cols: int
     ) -> torch.Tensor:
-        """Embed ``frames`` frames as tubelets; returns ``[tubelets * rows * cols, hidden]``.
+        """Embed ``frames`` frames as tubelets.
+
+        Returns ``[tubelets * rows * cols, hidden]``.
 
         A short last tubelet repeats the final frame. Tubelets attend only within
         themselves, so they run in passes no larger than the largest image.

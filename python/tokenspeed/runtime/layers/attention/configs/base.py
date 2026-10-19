@@ -103,7 +103,8 @@ def resolve_dtype(kv_cache_dtype_str: str) -> torch.dtype:
     elif kv_cache_dtype_str in ("fp8", "fp8_e4m3"):
         return torch.float8_e4m3fn
     elif kv_cache_dtype_str == "mxfp8":
-        # fp8-e4m3 data; the UE8M0 scale sidecar lives in the pool's scale buffers (kv_cache_mxfp8)
+        # fp8-e4m3 data; the UE8M0 scale sidecar lives in the pool's scale buffers
+        # (kv_cache_mxfp8).
         return torch.float8_e4m3fn
     else:
         raise ValueError(f"Unsupported kv_cache_dtype: {kv_cache_dtype_str!r}")
@@ -171,7 +172,8 @@ class AttnConfig:
     dtype: torch.dtype
     kv_cache_dtype: torch.dtype
     kv_cache_quant_method: str
-    # MXFP8 KV: UE8M0 vec-32 scale sidecar in pool buffers; kv_cache_dtype alone can't express it
+    # MXFP8 KV: UE8M0 vec-32 scale sidecar in pool buffers; kv_cache_dtype alone
+    # cannot express it.
     kv_cache_mxfp8: bool = False
     # Scheduler prefix granularity (CLI --block-size): the identity axis.
     prefix_granularity: int

@@ -26,7 +26,7 @@ atomics). One kernel:
   * in-kernel sentinel/zero init of the output + ``gl.barrier`` (folds away the
     separate init-kernel launch),
   * EP localization from global expert IDs plus ``gl.histogram`` -> per-expert
-    counts (remote routes are masked; EP = num_experts, no dump bin),
+    counts (remote routes are masked; no dump bin),
   * **single-block collapse**: top-k contains each expert at most once per
     token, so at M <= block_m, count[e] <= M <= block_m and every hit expert is
     exactly one block. So blocks_pe = (count>0), row_off = block_off*block_m, and

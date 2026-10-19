@@ -44,10 +44,6 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
     validate_block_widths,
 )
 
-# --------------------------------------------------------------------------
-# Draft query width and cache dtype
-# --------------------------------------------------------------------------
-
 
 def test_dspark_queries_one_row_per_draft_token() -> None:
     assert _resolve_draft_query_width(verify_width=8, sample_from_anchor=True) == 7
@@ -86,11 +82,6 @@ def test_other_mla_drafts_keep_the_requested_cache_dtype() -> None:
     assert (
         resolve_mla_kv_cache_dtype(args, config, is_draft=True) == torch.float8_e4m3fn
     )
-
-
-# --------------------------------------------------------------------------
-# The one rule: checkpoint block size -> launch widths
-# --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -146,11 +137,6 @@ def test_validate_holds_each_family_to_its_own_convention() -> None:
     assert BLOCK_SPEC_RULES in message
 
 
-# --------------------------------------------------------------------------
-# The drafter resolves its geometry through that rule
-# --------------------------------------------------------------------------
-
-
 def test_geometry_applies_the_family_convention() -> None:
     """spec_num_tokens is the verify width; drafts are one fewer."""
     assert _resolve_block_geometry(
@@ -183,11 +169,6 @@ def test_drafters_declare_their_checkpoint_convention() -> None:
     assert DFlash.spec_algorithm == "DFLASH"
     assert DFlash2.spec_algorithm == "DFLASH"
     assert DSpark.spec_algorithm == "DSPARK"
-
-
-# --------------------------------------------------------------------------
-# ModelConfig applies that rule to the launch flags
-# --------------------------------------------------------------------------
 
 
 def _spec_args(algorithm: str, *, steps: int, draft_tokens: int, explicit: bool):
@@ -237,11 +218,6 @@ def test_model_config_leaves_widths_alone(algorithm: str, cfg) -> None:
     assert (args.speculative_num_steps, args.speculative_num_draft_tokens) == (7, 8)
 
 
-# --------------------------------------------------------------------------
-# Markov head resolution
-# --------------------------------------------------------------------------
-
-
 def test_markov_params_read_top_level_fields() -> None:
     """Inferact/TorchSpec checkpoints declare markov fields at the top level."""
     cfg = SimpleNamespace(markov_rank=256, markov_head_type="vanilla")
@@ -260,22 +236,12 @@ def test_markov_params_default_to_disabled() -> None:
     assert _get_markov_params(SimpleNamespace()) == (0, "vanilla")
 
 
-# --------------------------------------------------------------------------
-# Algorithm dispatch
-# --------------------------------------------------------------------------
-
-
 def test_dspark_dispatches_to_dspark_drafter() -> None:
     assert get_drafter_impl("DSPARK", SimpleNamespace()) is DSpark
 
 
 def test_dflash_dispatch_is_unchanged_by_dspark() -> None:
     assert get_drafter_impl("DFLASH", SimpleNamespace()) is DFlash
-
-
-# --------------------------------------------------------------------------
-# Draft-worker architecture rewrite
-# --------------------------------------------------------------------------
 
 
 def _write_config(tmp_path, **fields) -> str:
@@ -320,11 +286,6 @@ def test_non_spec_archs_still_get_the_nextn_rewrite(tmp_path) -> None:
     assert config.architectures[0] == "Qwen3ForCausalLMNextN"
 
 
-# --------------------------------------------------------------------------
-# Sliding-window geometry of a windowed DSpark draft
-# --------------------------------------------------------------------------
-
-
 def _write_swa_draft_config(tmp_path, **overrides) -> str:
     """A DSpark draft whose layers are all sliding, as MiniMax-M3's ships."""
     return _write_config(
@@ -361,11 +322,6 @@ def test_dspark_draft_keeps_the_window_transformers_would_null(
     assert config.sliding_window == 1024
 
 
-# --------------------------------------------------------------------------
-# Draft dtype
-# --------------------------------------------------------------------------
-
-
 def _draft_dtype(server_dtype: str, target_dtype: torch.dtype) -> object:
     from tokenspeed.runtime.engine import event_loop as event_loop_module
 
@@ -399,11 +355,6 @@ def test_draft_inherits_the_targets_dtype_instead_of_its_own() -> None:
 
 def test_an_explicit_dtype_still_wins_for_the_draft() -> None:
     assert _draft_dtype("bfloat16", torch.bfloat16) == "bfloat16"
-
-
-# --------------------------------------------------------------------------
-# Draft cache grouping
-# --------------------------------------------------------------------------
 
 
 def _draft_attn_config(algorithm: str, layer_types: tuple[str, ...]):
@@ -463,11 +414,6 @@ def test_a_non_block_draft_keeps_its_own_labels() -> None:
 
     assert spec.cache_layer_types == ("sliding_attention",) * 6
     assert spec.sliding_window_tokens == 1024
-
-
-# --------------------------------------------------------------------------
-# Target-side capture on the base stack
-# --------------------------------------------------------------------------
 
 
 class _CaptureModel:
@@ -549,11 +495,6 @@ def test_an_idle_forward_hands_the_sink_nothing() -> None:
     causal_lm.model.notify(sink, 2, [])
 
     assert sink.seen == []
-
-
-# --------------------------------------------------------------------------
-# CLI contract
-# --------------------------------------------------------------------------
 
 
 def test_cli_accepts_dspark_algorithm() -> None:

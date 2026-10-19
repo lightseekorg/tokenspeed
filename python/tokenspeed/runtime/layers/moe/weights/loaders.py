@@ -96,6 +96,7 @@ def load_w13(
     expert_scale: torch.Tensor | None = None,
     block_shape: tuple[int, int] | None = None,
 ) -> None:
+    del tp_size  # Unused.
     if shard_id not in {"w1", "w3", "w13"}:
         raise ValueError(f"Unexpected w13 shard_id: {shard_id}")
 
@@ -154,6 +155,7 @@ def load_w2(
     expert_scale: torch.Tensor | None = None,
     block_shape: tuple[int, int] | None = None,
 ) -> None:
+    del tp_size  # Unused.
     if not isinstance(expert_data, torch.Tensor) or not isinstance(
         loaded_weight, torch.Tensor
     ):

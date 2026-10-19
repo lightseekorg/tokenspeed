@@ -380,7 +380,6 @@ if current_platform().is_nvidia:
             )
 
         def cleanup(self):
-            """Clean up workspace"""
             # Keyed on resource presence, not just the initialized flag: a
             # failed re-arm can leave ipc_handles set with initialized=False,
             # and skipping the destroy then would orphan them.
@@ -512,7 +511,8 @@ if current_platform().is_nvidia:
                 f"{target_max_token_num!s} hidden_dim={target_hidden_dim!s} "
                 f"use_fp32_lamport={target_use_fp32_lamport!s} "
                 f"(prev max_token_num={manager.max_token_num!s} hidden_dim="
-                f"{manager.hidden_dim!s} use_fp32_lamport={manager.use_fp32_lamport!s})",
+                f"{manager.hidden_dim!s} "
+                f"use_fp32_lamport={manager.use_fp32_lamport!s})",
             )
             manager.initialize(
                 world_size=world_size,
@@ -813,9 +813,6 @@ if current_platform().is_nvidia:
         max_sm_to_use: int | None = None,
         launch_with_pdl: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Use TRT-LLM fused allreduce + residual + RMS norm operation.
-        """
         world_size = group.size()
         assert world_size > 1, "Single GPU, no need for allreduce fusion"
         assert input_tensor.shape[0] <= max_token_num
@@ -1282,9 +1279,6 @@ if current_platform().is_nvidia:
         add_in: torch.Tensor | None = None,
         launch_with_pdl: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """
-        Use TRT-LLM fused reducescatter + residual + RMS norm operation.
-        """
         world_size = group.size()
         assert world_size > 1, "Single GPU, no need for reducescatter fusion"
         assert input_tensor.shape[0] <= max_token_num
@@ -1352,7 +1346,8 @@ if current_platform().is_nvidia:
         manager = _manager_for_group(group)
         if manager.workspace_tensor is None:
             raise RuntimeError(
-                "trtllm reducescatter fusion requires the IPC lamport workspace, which is "
+                "trtllm reducescatter fusion requires the IPC lamport workspace, "
+                "which is "
                 "unavailable on this group (cross-node, or IPC explicitly "
                 "skipped). Use the unfused path for this collective."
             )
@@ -1413,9 +1408,6 @@ if current_platform().is_nvidia:
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
-        """
-        Use TRT-LLM fused allgather + dual RMS norm + optional FP8 quantization.
-        """
         world_size = group.size()
         assert world_size > 1, "Single GPU, no need for allgather fusion"
 
@@ -1486,7 +1478,8 @@ if current_platform().is_nvidia:
         manager = _manager_for_group(group)
         if manager.workspace_tensor is None:
             raise RuntimeError(
-                "trtllm allgather fusion requires the IPC lamport workspace, which is "
+                "trtllm allgather fusion requires the IPC lamport workspace, "
+                "which is "
                 "unavailable on this group (cross-node, or IPC explicitly "
                 "skipped). Use the unfused path for this collective."
             )
@@ -1753,7 +1746,8 @@ if current_platform().is_nvidia:
                 or hidden <= 0
             ):
                 raise ValueError(
-                    "Lamport TRT-LLM reduction requires TP2/4/8/16, positive width and 1..128 rows"
+                    "Lamport TRT-LLM reduction requires TP2/4/8/16, positive width "
+                    "and 1..128 rows"
                 )
             if hidden % 8:
                 raise ValueError(

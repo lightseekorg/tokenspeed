@@ -24,6 +24,8 @@ import torch
 
 
 class StreamFork:
+    """Branches run inline without an aux stream or outside an enabled ``scope()``."""
+
     def __init__(self, aux_stream: torch.cuda.Stream | None):
         self.aux_stream = aux_stream
         self.fork_event = torch.cuda.Event() if aux_stream is not None else None

@@ -298,7 +298,7 @@ class PauseController:
             )
             return
         # If a wait/abort pause is still awaiting its drain reply, it has NOT
-        # drained — ``maybe_finish_drain`` clears ``_pending_reply`` the instant
+        # drained — ``maybe_finish_drain`` clears ``_pending_drain`` the instant
         # it does. We must still reply (resume uses a separate communicator and
         # cannot otherwise wake the pause caller, who would block forever), but
         # the reply must be a failure: acking success here would tell a

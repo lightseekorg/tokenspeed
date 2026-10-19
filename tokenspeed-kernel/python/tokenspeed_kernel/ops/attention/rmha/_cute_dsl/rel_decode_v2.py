@@ -52,7 +52,7 @@ import os as _os
 
 import torch
 
-# swa scans <=5 tiles (no split win); full attention splits + reduces in-kernel (A/B knob).
+# SWA scans <=5 tiles (no split win); full attention splits and reduces in-kernel.
 _V2_FULL_SPLITS = max(1, int(_os.environ.get("TSMHA_V2_FULL_SPLITS", "8")))
 
 
@@ -200,9 +200,9 @@ def _ensure_buffers(kv_splits, H, D, device, page_table, B, prediction=1):
 
     Buffers first allocated INSIDE a capture come from the graph mempool,
     whose blocks are reused by other captures/replays — persistent state
-    there gets clobbered (the bs>1 garbage root cause). The static table's
-    base pointer is shared by every [:b] slice, so the whole pow2 ladder is
-    pre-allocatable from any eager call."""
+    there gets clobbered. The static table's base pointer is shared by every
+    [:b] slice, so the whole pow2 ladder is pre-allocatable from any eager call.
+    """
     P = prediction
     row_stride = page_table.stride(0)
     for b in _ladder(B):
@@ -257,7 +257,7 @@ def is_compiled_for_v2(
     return key in _DECODE._cache
 
 
-# Contents are a pure function of the key (write-once), so graphs may bake the addresses.
+# Contents are a pure function of the key (write-once), so graphs may bake addresses.
 _OFFSETS: dict = {}
 
 
@@ -311,7 +311,7 @@ def rel_mha_decode_tsmha_v2(
     HK = k_cache.shape[2]
     page_tokens = k_cache.shape[1]
     assert page_tokens in (64, 128, 256), f"unsupported page size {page_tokens}"
-    # page_table is a column-sliced view; fold row stride into offsets to consume it zero-copy.
+    # page_table is a column-sliced view; fold its row stride into offsets (zero-copy).
     assert page_table.stride(-1) == 1, "page_table innermost dim must be dense"
     extent = rel_logits.shape[-1]
     kv_splits = 1 if window_left >= 0 else _V2_FULL_SPLITS
@@ -338,7 +338,8 @@ def rel_mha_decode_tsmha_v2(
     flat_table = torch.as_strided(page_table, (span,), (1,))
     offsets = _offsets_for(B, row_stride, q.device)
 
-    # Exact-B contiguous: sliced views mis-address the split reduction (dropped tail KV tiles).
+    # Exact-B contiguous: sliced views mis-address the split reduction (dropping tail
+    # KV tiles).
     if not torch.cuda.is_current_stream_capturing():
         _ensure_buffers(kv_splits, H, D, q.device, page_table, B, P)
     key = (kv_splits, H, D, q.device.index, B, P)

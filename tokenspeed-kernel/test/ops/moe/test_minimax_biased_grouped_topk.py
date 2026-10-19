@@ -68,7 +68,6 @@ def test_fused_matches_reference(num_tokens, num_experts, topk, renormalize):
     for t in range(num_tokens):
         assert set(fused_i[t].tolist()) == set(ref_i[t].tolist())
 
-    # Weight for each chosen expert must match.
     for t in range(num_tokens):
         fused_map = dict(zip(fused_i[t].tolist(), fused_w[t].tolist()))
         ref_map = dict(zip(ref_i[t].tolist(), ref_w[t].tolist()))
@@ -102,12 +101,12 @@ def test_nan_padding_rows_stay_in_range(num_experts, topk):
         topk_group=1,
         routed_scaling_factor=1.0,
     )
-    w, i = minimax_biased_grouped_topk(
+    _, i = minimax_biased_grouped_topk(
         torch.empty(5, 8, device="cuda"), logits, bias, **kw
     )
     assert int(i.max()) < num_experts and int(i.min()) >= 0
     # real rows still match the reference
-    ref_w, ref_i = _biased_grouped_topk_reference(
+    _, ref_i = _biased_grouped_topk_reference(
         torch.empty(5, 8, device="cuda"), logits, bias, **kw
     )
     for t in (0, 2, 4):

@@ -138,8 +138,6 @@ class LogprobsProcessor:
                 recv_obj_index,
             )
 
-    # --- shared wire access -------------------------------------------------
-
     @staticmethod
     def _row(recv_obj, field: str, idx: int):
         # Defensive: sampler may not have populated logprobs for this request
@@ -147,8 +145,6 @@ class LogprobsProcessor:
         # or out-of-range wire fields as empty rather than crashing the loop.
         lst = getattr(recv_obj, field, None) or []
         return lst[idx] if idx < len(lst) else []
-
-    # --- vLLM renderer ------------------------------------------------------
 
     def _render_vllm(
         self, logprobs_info: dict, recv_obj: BatchStrOut, idx: int
@@ -167,8 +163,6 @@ class LogprobsProcessor:
         logprobs_info["cumulative_logprob"] = logprobs_info.get(
             "cumulative_logprob", 0.0
         ) + (float(sum(out_sampled_val)) if out_sampled_val else 0.0)
-
-    # --- SGLang renderer ----------------------------------------------------
 
     def _render_sglang(
         self,

@@ -92,8 +92,6 @@ class DeepseekV41VisionConfig(PretrainedConfig):
 
 
 class DeepseekV41Config(PretrainedConfig):
-    """DeepSeek V4.1 text and vision configuration."""
-
     model_type = "deepseek_v41"
 
     def __init__(

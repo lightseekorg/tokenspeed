@@ -94,14 +94,15 @@ class CacheGroupSpec:
             raise ValueError("shard_count must be a positive integer")
         if self.attn_kind not in ATTN_KINDS:
             raise ValueError(
-                f"group {self.group_id!r}: unknown cache-group kind {self.attn_kind!r}; "
-                f"expected one of {sorted(ATTN_KINDS)}"
+                f"group {self.group_id!r}: unknown cache-group kind "
+                f"{self.attn_kind!r}; expected one of {sorted(ATTN_KINDS)}"
             )
         if self.attn_kind == "sliding_window":
             if self.sliding_window_tokens is None or self.sliding_window_tokens <= 0:
                 raise ValueError(
                     f"group {self.group_id!r}: a sliding-window group needs a "
-                    f"positive sliding_window_tokens, got {self.sliding_window_tokens!r}"
+                    "positive sliding_window_tokens, got "
+                    f"{self.sliding_window_tokens!r}"
                 )
         elif self.sliding_window_tokens is not None:
             raise ValueError(
@@ -275,7 +276,8 @@ def compute_max_logical_pages_for_capture(
     return _ceil_div(live_tokens, block_granularity)
 
 
-# Sliding sub-groups make each slab bound by one layer of every group — no dead slab rows.
+# Sliding sub-groups make each slab bound by one layer of every group, so no
+# slab rows are dead.
 _SLIDING_SUBGROUP_PREFIX = "sliding_attention_"
 
 

@@ -1390,7 +1390,8 @@ def launch_gluon_mm_a16w16_splitk_gfx950(
 
     This decode path maps the wide N dimension onto the MFMA rows, streams the
     ``[N, K]`` weight tile through double-buffered LDS async copies, splits K
-    into eight partial tiles, and sums those partial results in a second Gluon kernel.
+    into up to eight partial tiles, and sums those partial results in a second
+    Gluon kernel.
     """
     if A.ndim != 2 or B.ndim != 2:
         raise ValueError(

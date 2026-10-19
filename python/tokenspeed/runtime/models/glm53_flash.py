@@ -107,10 +107,6 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
-# ===----------------------------------------------------------------------=== #
-# Multimodal vision path
-# ===----------------------------------------------------------------------=== #
-
 
 class Glm53FlashVisionPatchEmbed(nn.Module):
     def __init__(self, config: Glm53FlashVisionConfig) -> None:
@@ -378,11 +374,6 @@ class Glm53FlashVision(nn.Module):
             else:
                 grids.append(item.image_grid_thw)
         return self(pixel_values, torch.cat(grids, dim=0))
-
-
-# ===----------------------------------------------------------------------=== #
-# Text model
-# ===----------------------------------------------------------------------=== #
 
 
 @dataclass
@@ -1735,11 +1726,6 @@ class Glm53FlashForCausalLM(BaseCausalLM):
                 layer.self_attn.fuse_conv_weights()
             if isinstance(layer.mlp, Glm53FlashMoE):
                 layer.mlp.experts.process_weights_after_loading(layer.mlp.experts)
-
-
-# ===----------------------------------------------------------------------=== #
-# Registered multimodal wrapper
-# ===----------------------------------------------------------------------=== #
 
 
 class Glm53FlashForConditionalGeneration(nn.Module):

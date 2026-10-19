@@ -84,11 +84,6 @@ def _blockscaled_signature_and_scales(
 LSE_LN = math.log2(math.e)
 
 
-# ===-----------------------------------------------------------------------===#
-# KPool Kernels
-# ===-----------------------------------------------------------------------===#
-
-
 def _validate_kpool_topk_inputs(
     q: torch.Tensor,
     pooled_k_cache: torch.Tensor,

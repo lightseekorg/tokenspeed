@@ -102,7 +102,7 @@ def sample_dspark_block_greedy(
     Returns:
         ``output``, filled in place.
     """
-    rows, block, local_vocab = local_base_logits.shape
+    rows, block, _ = local_base_logits.shape
     shard = lm_head.shard_indices
     if shard.num_added_elements != 0:
         raise ValueError("DSpark greedy sampling needs a head without added vocabulary")

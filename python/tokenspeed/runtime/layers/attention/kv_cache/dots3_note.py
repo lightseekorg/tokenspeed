@@ -32,6 +32,10 @@ from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 
 class Dots3NoteTokenToKVPool(DSATokenToKVPool):
+    """The latent KV and the RoPE key share one plane per layer; the index-K
+    cache stores scaled FP8 keys with their FP32 scales split within a page.
+    """
+
     def get_kv_size_bytes(self) -> int:
         return self.arena.buffer.nbytes
 

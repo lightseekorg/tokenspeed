@@ -92,7 +92,8 @@ def test_index_topk_graph_full_candidates_and_reindex():
 
 
 def _hopper_index_case(device, tokens, heads, blocks, pages, table_width, seed):
-    """An FP8 index cache, quantized queries and a candidate pool for the Hopper scorers.
+    """An FP8 index cache, quantized queries and a candidate pool for the Hopper
+    scorers.
 
     The page table is a permutation with a null and an out-of-range page, so a
     scorer that addressed pages by block id instead of through the table, or
@@ -137,7 +138,7 @@ def _hopper_index_case(device, tokens, heads, blocks, pages, table_width, seed):
     "blocks,pages,table_width", [(16, 64, 64), (48, 64, 32), (2048, 300, 256)]
 )
 def test_sparse_index_scores_match_the_dense_scorer(blocks, pages, table_width):
-    """The pool scorer reproduces the dense score's masks exactly and its values closely.
+    """The pool scorer matches the dense score's masks exactly and values closely.
 
     Masks (null candidates, blocks past the table, unmapped pages, rows past
     the visibility bound) must agree bit for bit; values follow the same FP8
@@ -431,7 +432,7 @@ def test_sparse_index_scores_address_a_cache_whose_scale_plane_passes_four_gigae
         pytest.skip("requires the Hopper FP8 indexer")
     device = torch.device("cuda:0")
     # 132-byte rows give a 2112-element scale page, so the plane passes 2**32
-    # at 2_033_899 pages; the field that implies is 17.2 GiB.
+    # at 2_033_602 pages, a 16 GiB field.
     pages, pitch = 2_100_000, 8448
     free, _ = torch.cuda.mem_get_info(device)
     if free < pages * pitch + (4 << 30):

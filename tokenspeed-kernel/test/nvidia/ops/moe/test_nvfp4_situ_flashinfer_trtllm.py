@@ -59,7 +59,6 @@ SITU_LINEAR_BETA = 25.0  # K3 activation_situ_linear_beta (up branch)
 
 _FP8_E4M3_MAX = 448.0
 _FP4_E2M1_MAX = 6.0
-# e2m1 nibble decode table (bit 3 = sign).
 
 
 def _situ_runtime_reason() -> str | None:

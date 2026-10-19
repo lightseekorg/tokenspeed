@@ -124,7 +124,6 @@ class SchedulerControlClient:
     """Scheduler control-plane client methods for AsyncLLM."""
 
     def init_communicators(self: AsyncLLM, server_args: ServerArgs):
-        # Communicators
         self.init_weights_update_group_communicator = _Communicator(
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
@@ -437,7 +436,6 @@ class SchedulerControlClient:
         responses: list[GetInternalStateReqOutput] = (
             await self.get_internal_state_communicator(req)
         )
-        # Many DP ranks
         return [res.internal_state for res in responses]
 
     async def set_internal_state(

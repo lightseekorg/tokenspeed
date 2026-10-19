@@ -267,15 +267,12 @@ class BaseDrafter:
         """
 
     def bind_tree(self, tree_spec: TreeSpec) -> None:
-        """Draft trees (--speculative-eagle-topk > 1); only EAGLE-style drafters expand lanes."""
+        """Bind a draft tree (--speculative-eagle-topk > 1); EAGLE-style only."""
         raise NotImplementedError(
-            f"{type(self).__name__} cannot draft trees (--speculative-eagle-topk > 1); "
-            "tree drafting needs an EAGLE-style drafter (EAGLE3, or MTP served by Eagle)"
+            f"{type(self).__name__} cannot draft trees "
+            "(--speculative-eagle-topk > 1); tree drafting needs an EAGLE-style "
+            "drafter (EAGLE3, or MTP served by Eagle)"
         )
-
-    # ------------------------------------------------------------------
-    # Slot-state image (SlotStateExporter)
-    # ------------------------------------------------------------------
 
     def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
         """The drafter-owned per-slot rows a retraction snapshot images.
@@ -316,6 +313,9 @@ class BaseDrafter:
         output_tokens: torch.Tensor,
         accept_lengths: torch.Tensor,
     ) -> torch.Tensor:
+        """Returns the ``[bs, spec_num_tokens]`` next verify window: column 0 holds
+        each request's last verified token, the rest its draft tokens.
+        """
         raise NotImplementedError
 
     @abstractmethod

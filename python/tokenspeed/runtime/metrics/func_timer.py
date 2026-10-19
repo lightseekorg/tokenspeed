@@ -27,7 +27,8 @@ enable_metrics = False
 
 def enable_func_timer():
     """Enable Prometheus-backed function latency metrics."""
-    # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
+    # We need to import prometheus_client after setting the env variable
+    # `PROMETHEUS_MULTIPROC_DIR`
     from prometheus_client import Histogram
 
     global enable_metrics, FUNC_LATENCY

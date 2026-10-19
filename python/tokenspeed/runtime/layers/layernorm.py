@@ -519,7 +519,8 @@ class FusedRMSNorm(nn.Module):
             input_kv_a: KV tensor to normalize
 
         Returns:
-            Tuple of (normalized_q_a, normalized_kv_a)
+            Tuple of (input_q_a, input_kv_a), normalized in place unless outputs
+            are given
         """
         if _platform.is_npu:
             # Ascend uses the registered RMSNorm leaves. Preserve the dual

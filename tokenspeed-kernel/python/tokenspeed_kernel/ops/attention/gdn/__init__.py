@@ -87,11 +87,6 @@ def _blockscaled_signature_and_scales(
 LSE_LN = math.log2(math.e)
 
 
-# ===-----------------------------------------------------------------------===#
-# GDN Kernels
-# ===-----------------------------------------------------------------------===#
-
-
 class GdnCheckpointLayout(str, Enum):
     """Backend-native checkpoint layout returned by GDN chunk prefill."""
 
@@ -104,7 +99,7 @@ class GdnCheckpointLayout(str, Enum):
 class GdnChunkPrefillResult:
     """Structured result for GDN chunk prefill.
 
-    Args:
+    Attributes:
         out: GDN output tensor.
         final_state: Final recurrent state, when requested.
         h: Optional backend-native intermediate recurrent checkpoints.
@@ -388,7 +383,8 @@ def gdn_decode_step(
         )
 
 
-# ReplaySSM draft trees of these sizes verify in the chunked form, which keeps no node states.
+# ReplaySSM draft trees of these sizes verify in the chunked form, which keeps no
+# node states.
 GDN_TREE_VERIFY_CHUNKED_MIN_NODES = 8
 GDN_TREE_VERIFY_CHUNKED_MAX_NODES = 16
 
@@ -405,7 +401,8 @@ def gdn_tree_verify_needs_node_states(num_nodes: int) -> bool:
     )
 
 
-# A ReplaySSM chain verifies faster in the chunked form from these sizes on, measured on Blackwell.
+# A ReplaySSM chain verifies faster in the chunked form from these sizes on,
+# measured on Blackwell.
 GDN_CHAIN_VERIFY_CHUNKED_MIN_TOKENS = 13
 GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES = 24
 

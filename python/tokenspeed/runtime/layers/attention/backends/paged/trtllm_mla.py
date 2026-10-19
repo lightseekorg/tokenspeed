@@ -113,7 +113,10 @@ def mla_tree_support(
     the model dtype or unscaled FP8 E4M3."""
     if kv_dtype in (model_dtype, torch.float8_e4m3fn):
         return TreeSupport(verify_blocker=None, draft_blocker=None)
-    reason = f"{name} reads the tree window's latent rows in the model dtype or FP8 E4M3; kv_cache_dtype {kv_dtype} is not supported"
+    reason = (
+        f"{name} reads the tree window's latent rows in the model dtype or FP8 "
+        f"E4M3; kv_cache_dtype {kv_dtype} is not supported"
+    )
     return TreeSupport(verify_blocker=reason, draft_blocker=reason)
 
 
@@ -201,14 +204,14 @@ class TRTLLMMLABackend(PagedAttentionBackend):
     def __init__(self, config: AttnConfig, spec: MLAConfig, *, kernel_page_size: int):
         if kernel_page_size not in TRTLLM_MLA_SUPPORTED_PAGE_SIZES:
             raise ValueError(
-                f"trtllm_mla backend requires page_size 32 or 64, got {kernel_page_size}"
+                "trtllm_mla backend requires page_size 32 or 64, got "
+                f"{kernel_page_size}"
             )
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         # The trtllm kernel walks pages at page_size, padded to the
         # fused-kernel block constraint.
         self.max_num_pages = calc_padded_blocks(config.context_len, kernel_page_size)
 
-        # MLA dimensions
         self.kv_lora_rank = spec.kv_lora_rank
         self.qk_nope_head_dim = spec.qk_nope_head_dim
         self.qk_rope_head_dim = spec.qk_rope_head_dim
@@ -224,12 +227,9 @@ class TRTLLMMLABackend(PagedAttentionBackend):
 
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
 
-        # Metadata
         self.forward_decode_metadata: TRTLLMMLADecodeMetadata | None = None
         self.forward_prefill_metadata: TRTLLMMLAPrefillMetadata | None = None
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None
-
-    # ---- Metadata initialization ----
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
@@ -345,8 +345,6 @@ class TRTLLMMLABackend(PagedAttentionBackend):
             page_table=page_table,
         )
 
-    # ---- CUDA Graph ----
-
     def _decode_views(self, bs: int) -> TRTLLMMLADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers.
 
@@ -412,8 +410,6 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         self.seq_lens_buf[:bs].copy_(
             block_seq_lens[:bs].clamp(self.spec_num_tokens, self.max_context_len)
         )
-
-    # ---- Forward: Decode ----
 
     def forward_decode(
         self,

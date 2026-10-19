@@ -89,11 +89,13 @@ class MoELayer(torch.nn.Module):
         swiglu_beta: float | None = None,
         w13_input_layout: str = "concatenated",
         with_bias=False,
-        routing_config: dict = {},
+        routing_config: dict | None = None,
         routing_mode: str | None = None,
         internal_activation_dtype_override: str | None = None,
         persistent_max_num_tokens_per_gpu: int | None = None,
     ):
+        if routing_config is None:
+            routing_config = {}
         super().__init__()
         self.layer_index = layer_index
         # Deployment-level override for the activation precision (e.g. a K3
@@ -182,7 +184,6 @@ class MoELayer(torch.nn.Module):
             a2a_backend=a2a_backend,
         )
 
-        # Routing config
         self.routing_config = routing_config
         self._correction_bias = routing_config.get("correction_bias", None)
         self._routing_method_type = routing_config.get(
@@ -291,7 +292,8 @@ class MoELayer(torch.nn.Module):
             if internal_activation_dtype not in {"input", "mxfp4"}:
                 raise ValueError(
                     "Gluon Petit MegaMoE requires MXFP4 activations; "
-                    f"the requested {internal_activation_dtype} activations are unsupported"
+                    f"the requested {internal_activation_dtype} activations are "
+                    "unsupported"
                 )
             # Keep Petit hardware and expert constraints here; ServerArgs checks
             # shared backends, model dtype, and scheduling capacity.
@@ -344,7 +346,6 @@ class MoELayer(torch.nn.Module):
         # layer synthetic inputs (kernel tuning) must match it.
         self.input_dtype = input_dtype
 
-        # Moe Backend plan
         moe_backend = get_moe_backend().value
         # Preserve the legacy CLI name; weight dtype selects the MegaMoE implementation.
         if moe_backend == "deep_gemm_mega_moe":
@@ -452,7 +453,8 @@ class MoELayer(torch.nn.Module):
                 # take the size as is.
                 raise ValueError(
                     "bf16_vendor_fp32_route requires an intermediate size per "
-                    f"partition that is a multiple of {TRTLLM_UNQUANT_ISPP_ALIGNMENT}"
+                    "partition that is a multiple of "
+                    f"{TRTLLM_UNQUANT_ISPP_ALIGNMENT}"
                 )
             self._fp32_correction_bias = True
             if self.ep_size > 1:
@@ -492,7 +494,8 @@ class MoELayer(torch.nn.Module):
             self._quant_kind,
             input_dtype=input_dtype,
             activation=self.activation,
-            # e.g. "precomputed_topk" when fused kernels cannot reproduce the routing; None = unconstrained.
+            # e.g. "precomputed_topk" when fused kernels cannot reproduce the
+            # routing; None = unconstrained.
             routing_mode=routing_mode,
             a2a_backend=self._spec.a2a_backend,
             ep_size=self.ep_size,
@@ -581,8 +584,8 @@ class MoELayer(torch.nn.Module):
             return
         padded = round_up(ispp, alignment)
         logger.info(
-            f"{self.prefix!s}: padding MoE intermediate size per partition {ispp:d} -> "
-            f"{padded:d} so {reason!s}",
+            f"{self.prefix!s}: padding MoE intermediate size per partition "
+            f"{ispp:d} -> {padded:d} so {reason!s}",
         )
         self.intermediate_size = padded * self.tp_size
         self._spec = replace(self._spec, intermediate_size=self.intermediate_size)

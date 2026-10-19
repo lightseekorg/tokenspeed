@@ -172,7 +172,6 @@ class FlashMLABackend(PagedAttentionBackend):
         self.kv_cache_quant_method = config.kv_cache_quant_method
         self.cache_dtype = config.kv_cache_dtype
 
-        # MLA-specific dimensions
         self.kv_lora_rank = spec.kv_lora_rank
         self.qk_nope_head_dim = spec.qk_nope_head_dim
         self.qk_rope_head_dim = spec.qk_rope_head_dim
@@ -240,10 +239,6 @@ class FlashMLABackend(PagedAttentionBackend):
         # graph recorded alive for the graph's lifetime.
         self._decode_tile_metadata: object | None = None
         self._decode_tile_metadata_keepalive: list[object] = []
-
-    # ------------------------------------------------------------------
-    # Metadata init
-    # ------------------------------------------------------------------
 
     def configure_runtime(
         self,
@@ -506,7 +501,6 @@ class FlashMLABackend(PagedAttentionBackend):
         *,
         page_table_cpu: torch.Tensor | None,
     ):
-        # EXTEND path — flashinfer ragged/paged prefill.
         seq_lens_cpu = seq_lens.cpu()
         seq_lens_sum = seq_lens_cpu.sum().item()
 
@@ -585,10 +579,6 @@ class FlashMLABackend(PagedAttentionBackend):
             max_chunk_len_per_loop=max_chunk_len_per_loop,
         )
 
-    # ------------------------------------------------------------------
-    # CUDA graph (decode only, any q_len)
-    # ------------------------------------------------------------------
-
     def _decode_views(self, bs: int) -> FlashMLADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers.
 
@@ -634,7 +624,6 @@ class FlashMLABackend(PagedAttentionBackend):
         # floor 1). Padding rows replay at seq_len 1 and clamp the same way.
         q_len = metadata.q_len_per_req
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
-        # Copy the router-resolved kernel page table into the persistent buffer.
         num_pages = page_table.shape[1]
         self.page_table_buf[:bs, :num_pages].copy_(page_table[:bs])
         if len(self.kvp_group) > 1:
@@ -678,10 +667,6 @@ class FlashMLABackend(PagedAttentionBackend):
             bs, block_seq_lens.clamp(self.spec_num_tokens, self.max_context_len)
         )
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
-
     def cache_placement(self, layer: PagedAttention) -> CachePlacement | None:
         if len(self.kvp_group) == 1:
             return None
@@ -710,7 +695,6 @@ class FlashMLABackend(PagedAttentionBackend):
     ):
         assert forward_mode is not None and forward_mode.is_extend()
 
-        # Prefill: dispatch to ragged (MHA-style) or absorbed (MQA) path.
         if self.forward_prefill_metadata.use_ragged:
             return self._forward_normal_extend(q, k, v, layer)
         return self._forward_absorbed_extend(q, layer, token_to_kv_pool)
@@ -783,10 +767,6 @@ class FlashMLABackend(PagedAttentionBackend):
         o, _ = self._run_flash_mla_decode(q, layer, token_to_kv_pool, bs)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-    # ------------------------------------------------------------------
-    # EXTEND prefill helpers
-    # ------------------------------------------------------------------
 
     def _forward_normal_extend(
         self,

@@ -74,7 +74,6 @@ class SamplingBatchInfo:
     # offset — a MIXED round's verify() sees only the decode suffix.
     batch_row_offset: int = 0
 
-    # Device
     device: str = "cuda"
 
     def __getitem__(self, s: slice) -> SamplingBatchInfo:
@@ -87,7 +86,8 @@ class SamplingBatchInfo:
         """
         if not isinstance(s, slice):
             raise TypeError(
-                f"SamplingBatchInfo only supports slice indexing, got {type(s).__name__}"
+                "SamplingBatchInfo only supports slice indexing, "
+                f"got {type(s).__name__}"
             )
 
         def _slice(t):

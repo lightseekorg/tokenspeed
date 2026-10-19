@@ -351,10 +351,6 @@ class RuntimeStates:
                 )
             offset += prefix_length
 
-    # ------------------------------------------------------------------
-    # Slot-state image (SlotStateExporter)
-    # ------------------------------------------------------------------
-
     def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
         """The per-slot rows a retraction snapshot images, in a fixed order.
 
@@ -537,7 +533,8 @@ class RuntimeStates:
         width = self.future_input_map.shape[1]
         if len(candidate_ids) != width:
             raise RuntimeError(
-                f"remote spec candidate width mismatch: got {len(candidate_ids)}, expected {width}"
+                "remote spec candidate width mismatch: got "
+                f"{len(candidate_ids)}, expected {width}"
             )
         ids = torch.tensor(
             candidate_ids,

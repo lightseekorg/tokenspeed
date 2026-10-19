@@ -44,7 +44,7 @@ Per-item encoded tensors live on the :class:`MultimodalDataItem` itself,
 not in an engine-global cache. Lifetime tracks the owning request: when
 the request finishes and its ``RequestState`` is dropped, the tensors are
 released by GC. Across chunked-prefill iterations of the same request the
-item is identical Python object, so the second chunk sees ``item.encoded``
+item is the same Python object, so the second chunk sees ``item.encoded``
 already set and skips re-encoding. Once the item's last encoder token is
 prefilled, its encoding is dropped: no later forward reads it -- a request
 never re-prefills (a capacity retraction restores its KV image rather than
@@ -174,11 +174,6 @@ def warmup_multimodal_encoders(
         )
 
 
-# ---------------------------------------------------------------------------
-# Input-id padding helper
-# ---------------------------------------------------------------------------
-
-
 def pad_input_tokens(input_ids: list[int], mm_inputs: MultimodalInputs) -> list[int]:
     """Substitute placeholder token IDs with each item's ``pad_value``.
 
@@ -188,6 +183,9 @@ def pad_input_tokens(input_ids: list[int], mm_inputs: MultimodalInputs) -> list[
     each placeholder run to carry a content-derived ID so two different
     images compare unequal. We rewrite each ``offsets`` range to the
     item's pre-computed ``pad_value`` here.
+
+    Returns:
+        ``input_ids`` itself if nothing changes, else a padded copy.
     """
     if not input_ids or not mm_inputs.mm_items:
         return input_ids
@@ -300,11 +298,6 @@ def _assign_encoder_items(
     )
 
 
-# ---------------------------------------------------------------------------
-# MultimodalEmbedder
-# ---------------------------------------------------------------------------
-
-
 class MultimodalEmbedder:
     """Multimodal input embedding pipeline for one model executor."""
 
@@ -323,8 +316,6 @@ class MultimodalEmbedder:
     @property
     def has_encoder_dp(self) -> bool:
         return self._encoder_dp_group is not None and len(self._encoder_dp_group) > 1
-
-    # --- public entry point ------------------------------------------------
 
     def apply(
         self,
@@ -782,8 +773,6 @@ class MultimodalEmbedder:
                 )
 
         return input_embeds, kwargs
-
-    # --- feature cleanup -------------------------------------------------
 
     @staticmethod
     def _drop_raw_feature(item: MultimodalDataItem) -> bool:

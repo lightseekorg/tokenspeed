@@ -169,6 +169,7 @@ def _gpu_acq_rel_fence(dummy_ptr):
 
 @triton.jit
 def _arrive_and_signal_layer(count_ptr, flag_ptr, last_cta_index):
+    """Counts this CTA's arrival; the last arriving CTA release-stores the flag."""
     tl.inline_asm_elementwise(
         """
         {
@@ -1006,11 +1007,6 @@ def state_verify_commit_rows(
         ENABLE_PDL=pdl_enabled(),
         **({"launch_pdl": True} if pdl_enabled() else {}),
     )
-
-
-# -----------------------------------------------------------------------------
-# Flat hybrid cache page sanitization
-# -----------------------------------------------------------------------------
 
 
 # -----------------------------------------------------------------------------
@@ -2171,11 +2167,6 @@ def fused_fp8_set_kv_buffer(
 
 
 # -----------------------------------------------------------------------------
-# Page Table Gather
-# -----------------------------------------------------------------------------
-
-
-# -----------------------------------------------------------------------------
 # KV Cache Transfer
 # -----------------------------------------------------------------------------
 
@@ -2228,20 +2219,18 @@ def _kv_transfer_per_layer_kernel(
     """
     pid = tl.program_id(0)
 
-    # Load src and dst positions
     pos_src = tl.load(indices_src_ptr + pid).to(tl.int64)
     pos_dst = tl.load(indices_dst_ptr + pid).to(tl.int64)
 
-    # Calculate base offsets in elements (not bytes, since we use element-based pointers)
+    # Calculate base offsets in elements (not bytes, since we use element-based
+    # pointers).
     src_offset = pos_src * kv_cache_src_stride
     dst_offset = pos_dst * kv_cache_dst_stride
 
-    # Copy K cache
     offs = tl.arange(0, BLOCK_SIZE)
     k_src = tl.load(k_cache_src_ptr + src_offset + offs)
     tl.store(k_cache_dst_ptr + dst_offset + offs, k_src)
 
-    # Copy V cache
     v_src = tl.load(v_cache_src_ptr + src_offset + offs)
     tl.store(v_cache_dst_ptr + dst_offset + offs, v_src)
 
@@ -2691,7 +2680,8 @@ def transfer_kv_all_layer(
 
     if item_size % 4 != 0:
         raise ValueError(
-            "Triton KV cache all-layer kernel requires item_size to be a multiple of 4 bytes."
+            "Triton KV cache all-layer kernel requires item_size to be a multiple "
+            "of 4 bytes."
         )
 
     words_per_chunk = 32
@@ -2925,9 +2915,8 @@ def quantize_mxfp8_rows(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """MXFP8-quantize [R, 128] rows: (fp8-e4m3 [R, 128], e8m0 [R, 4]).
 
-    PDL-capable row quantizer intended for the decode-Q fusion follow-up
-    (inkling_mxfp8_attn.md); parity-tested against flashinfer's
-    mxfp8_quantize, no runtime caller yet. PDL defaults to the platform policy;
+    PDL-capable row quantizer, parity-tested against flashinfer's
+    mxfp8_quantize; no runtime caller yet. PDL defaults to the platform policy;
     pass ``False`` to disable it explicitly.
     """
     r, d = x.shape

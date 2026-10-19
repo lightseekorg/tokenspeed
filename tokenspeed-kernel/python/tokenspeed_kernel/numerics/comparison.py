@@ -93,9 +93,11 @@ def compare_outputs(
     *,
     tolerance: Tolerance,
 ) -> ComparisonResult:
+    """An element mismatches if it exceeds both atol and rtol, or is non-finite."""
     if actual.shape != expected.shape:
         raise ValueError(
-            f"Shape mismatch: actual={tuple(actual.shape)} expected={tuple(expected.shape)}"
+            f"Shape mismatch: actual={tuple(actual.shape)} "
+            f"expected={tuple(expected.shape)}"
         )
 
     if actual.numel() == 0:

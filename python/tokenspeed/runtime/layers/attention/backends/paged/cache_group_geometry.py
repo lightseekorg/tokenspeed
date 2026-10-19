@@ -86,14 +86,7 @@ class CacheGroupGeometry:
 
 
 def learn_cache_group_geometry(cache_group_specs) -> CacheGroupGeometry:
-    """Build the geometry from the pool's published group specs.
-
-    Args:
-        cache_group_specs: The arena's ``cache_group_specs`` tuple.
-
-    Returns:
-        The frozen geometry.
-    """
+    """Build the geometry from the arena's published ``cache_group_specs``."""
     full_history = next(
         (spec for spec in cache_group_specs if spec.attn_kind == "full_history"), None
     )

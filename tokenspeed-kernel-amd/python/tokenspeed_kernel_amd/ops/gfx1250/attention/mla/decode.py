@@ -213,7 +213,6 @@ def _attend_kv_tile(
         float("-inf"),
     )
 
-    # compute running maximum
     # m_j : (BLOCK_M,)
     m_j = gl.maximum(M, gl.max(S, axis=1))
 
@@ -230,7 +229,6 @@ def _attend_kv_tile(
     # alpha : (BLOCK_M, )
     alpha = gl.exp2(M - m_j)
 
-    # update constants
     L = L * alpha + l_j
     M = m_j
 
@@ -274,31 +272,31 @@ def _mla_decode_fwd_kernel(
     SCALE: gl.constexpr,  # float32
     q_scale_ptr,  # float32
     kv_scale_ptr,  # float32
-    num_query_heads: gl.constexpr,  # int
-    num_kv_heads: gl.constexpr,  # int
-    block_tables_stride: gl.int64,  # int
-    query_stride_0: gl.int64,  # int
-    query_stride_1: gl.int64,  # int, should be equal to head_size
-    KV_LORA_RANK: gl.constexpr,  # int
-    QK_ROPE_HEAD_DIM: gl.constexpr,  # int
-    stride_kv_buffer_0: gl.int64,  # int
-    stride_kv_buffer_1: gl.int64,  # int
-    stride_kv_buffer_2: gl.int64,  # int
-    stride_kv_buffer_3: gl.constexpr,  # int
+    num_query_heads: gl.constexpr,
+    num_kv_heads: gl.constexpr,
+    block_tables_stride: gl.int64,
+    query_stride_0: gl.int64,
+    query_stride_1: gl.int64,  # should equal head_size
+    KV_LORA_RANK: gl.constexpr,
+    QK_ROPE_HEAD_DIM: gl.constexpr,
+    stride_kv_buffer_0: gl.int64,
+    stride_kv_buffer_1: gl.int64,
+    stride_kv_buffer_2: gl.int64,
+    stride_kv_buffer_3: gl.constexpr,
     query_start_len_ptr,  # [num_seqs+1]
     num_tokens_per_seq: gl.int32,
-    TILE_SIZE: gl.constexpr,  # int
-    BLOCK_Q: gl.constexpr,  # int
-    BLOCK_M: gl.constexpr,  # int
-    NUM_KV_SPLITS: gl.constexpr,  # int
-    WARP_SIZE: gl.constexpr,  # int
-    num_warps: gl.constexpr,  # int
-    num_stages: gl.constexpr,  # int
-    NUM_BUFFERS: gl.constexpr,  # int
-    NUM_HEAD_BLOCKS: gl.constexpr = 1,  # int
-    SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
-    ALL_DECODE: gl.constexpr = False,  # bool
-    K_WIDTH: gl.constexpr = 0,  # int
+    TILE_SIZE: gl.constexpr,
+    BLOCK_Q: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    NUM_KV_SPLITS: gl.constexpr,
+    WARP_SIZE: gl.constexpr,
+    num_warps: gl.constexpr,
+    num_stages: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    NUM_HEAD_BLOCKS: gl.constexpr = 1,
+    SHUFFLED_KV_CACHE: gl.constexpr = False,
+    ALL_DECODE: gl.constexpr = False,
+    K_WIDTH: gl.constexpr = 0,
     IS_FP8: gl.constexpr = False,
 ):
     assert not SHUFFLED_KV_CACHE
@@ -340,10 +338,8 @@ def _mla_decode_fwd_kernel(
     head_block_idx = q_block_local_idx % NUM_HEAD_BLOCKS
     head_offset = head_block_idx * BLOCK_M
 
-    # sequence len for this particular sequence
     seq_len = gl.load(seq_lens_ptr + seq_idx)
 
-    # Number of split-K partitions for this sequence.
     num_kv_splits = NUM_KV_SPLITS
     tiles_per_split = cdiv_fn(seq_len, num_kv_splits * TILE_SIZE)
 
@@ -502,7 +498,6 @@ def _mla_decode_fwd_kernel(
     )
     acc = gl.zeros([BLOCK_M, KV_LORA_RANK], dtype=gl.float32, layout=cfg.PV_WMMA_LAYOUT)
 
-    # context length for this particular sequences
     context_len = seq_len - num_tokens_per_seq
 
     # compute the length of the longest sequence prefix spanned by any
@@ -526,7 +521,6 @@ def _mla_decode_fwd_kernel(
     seq_offset = split_kv_id * tiles_per_split * TILE_SIZE + offs_seq_t
     tile_end = gl.minimum(tile_start + tiles_per_split, num_tiles)
 
-    # Iterate through tiles within the current KV split.
     if NUM_BUFFERS == 2:
         next_page = gl.load(
             block_tables_ptr_shifted + gl.minimum(tile_start + 1, tile_end - 1)
@@ -794,7 +788,8 @@ def _launch_split_reduce(
     all_decode: bool,
     page_size: int,
 ) -> None:
-    """Merge FP32 or BF16 split partials ``[tokens, heads, splits, rank]`` into ``out``."""
+    """Merge FP32 or BF16 split partials ``[tokens, heads, splits, rank]``
+    into ``out``."""
     num_tokens, num_query_heads, num_kv_splits, kv_lora_rank = split_output.shape
     # The merge builds aranges over the split count and its chunk, and those
     # extents must be powers of two.

@@ -125,6 +125,7 @@ if platform.is_hopper_plus:
         return topk_weights, topk_ids
 
     def deep_gemm_deepep_fp8_moe_weights(plan: dict, w: torch.nn.Module):
+        del plan  # Unused.
         # DeepGEMM's ``nt`` grouped GEMM consumes B as [E, N, K] with block
         # scales [E, ceil(N/128), ceil(K/128)] and computes ``a @ b.T``. That is
         # exactly what the shared MoE checkpoint loader already produces
@@ -846,6 +847,7 @@ if platform.is_nvidia:
     from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
 
     def flashinfer_cutedsl_deepep_nvfp4_moe_weights(plan: dict, w: torch.nn.Module):
+        del plan  # Unused.
         w13_ws2 = w.w13_weight_scale_2[:, 0]
         w13_input_scale = w.w13_input_scale.to(torch.float32)
         w2_input_scale = w.w2_input_scale.to(torch.float32)

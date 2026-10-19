@@ -80,7 +80,8 @@ class TestQwen3MoeConfig:
                         "use_sliding_window": False,
                         "vocab_size": 151936,
                     }
-                )
+                ),
+                encoding="utf-8",
             )
 
             config = get_config(tmpdir, trust_remote_code=False)

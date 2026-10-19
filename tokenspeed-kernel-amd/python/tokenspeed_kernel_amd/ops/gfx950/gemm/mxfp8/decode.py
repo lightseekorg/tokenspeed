@@ -379,7 +379,6 @@ def gluon_mm_mxfp8_decode_gfx950(
 
     # Software pipeline over the K tiles: fill NUM_BUFFERS - 1 stages, run a
     # runtime loop that consumes one stage and issues the next, then drain.
-    # Only the fill and drain are unrolled, so code size does not grow with K.
     # The in-flight stages' scales ride in a tuple rotated every iteration.
     scales = ()
     for t in gl.static_range(NUM_BUFFERS - 1):

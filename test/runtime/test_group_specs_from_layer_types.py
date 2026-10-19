@@ -132,7 +132,7 @@ class TestGroupSpecsFromLayerTypesTest:
         )
 
     def test_sliding_subgroups_yield_one_spec_per_subgroup(self):
-        # Inkling step 2.5 shape: 5 sliding sub-groups + full -> 6 specs,
+        # Inkling shape: 5 sliding sub-groups + full -> 6 specs,
         # first-appearance order, all sliding specs share the one window.
         block = [f"sliding_attention_{k}" for k in range(5)] + ["full_attention"]
         specs = _specs(

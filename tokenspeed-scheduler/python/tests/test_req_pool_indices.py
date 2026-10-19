@@ -179,9 +179,8 @@ class TestReqPoolIndices:
         first_plan = s.next_execution_plan()
         r0_idx = first_plan.forward[0].request_pool_indices[0]
 
-        advance_forward(
-            s, "r0", [102], finish=True
-        )  # the decode lands; r0 finishes and settles
+        # the decode lands; r0 finishes and settles
+        advance_forward(s, "r0", [102], finish=True)
         s.next_execution_plan()  # erases r0
 
         submit(s, "r1", list(range(4)))
@@ -189,9 +188,8 @@ class TestReqPoolIndices:
         r1_idx = new_plan.forward[0].request_pool_indices[0]
 
         submit(s, "r2", list(range(4)))
-        new_plan = (
-            s.next_execution_plan()
-        )  # r2: Submitted → PrefillDone (r1 also schedules)
+        # r2: Submitted → PrefillDone (r1 also schedules)
+        new_plan = s.next_execution_plan()
         r2_idx = new_plan.forward[0].request_pool_indices[0]
 
         assert r0_idx == 1

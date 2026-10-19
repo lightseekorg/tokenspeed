@@ -120,11 +120,6 @@ def _expand_via_stacks(backend, pool, logical_rows, device="cuda"):
     return stacks.table(_FULL, bs)
 
 
-# ---------------------------------------------------------------------------
-# Bridge: per-group table views
-# ---------------------------------------------------------------------------
-
-
 def test_bridge_exposes_full_attention_table() -> None:
     pool = _make_pool("cpu", usable_pages=2)
     table = np.array([[1, 2]], dtype=np.int32)
@@ -136,11 +131,6 @@ def test_bridge_exposes_full_attention_table() -> None:
 
     with pytest.raises(RuntimeError, match="stale"):
         metadata.tables(active_forward_op=object())
-
-
-# ---------------------------------------------------------------------------
-# Pool MLA adapter surface
-# ---------------------------------------------------------------------------
 
 
 def test_pool_mla_views_are_no_copy_and_layer_gated() -> None:
@@ -218,11 +208,6 @@ def test_pool_write_location_oracle_page_id_times_p_plus_offset() -> None:
     ref = latent.to(torch.float8_e4m3fn).to(torch.bfloat16)
     assert torch.equal(nope, ref[..., :_KV_LORA_RANK].contiguous())
     assert torch.equal(rope, ref[..., _KV_LORA_RANK:].contiguous())
-
-
-# ---------------------------------------------------------------------------
-# Backend: kernel-page table expansion parity (GPU)
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(

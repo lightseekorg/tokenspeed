@@ -438,7 +438,8 @@ def _select_bucket(
     bucket_offsets,
     group_layout: gl.constexpr,
 ):
-    """Return the bucket holding the remaining-th key, the count before it, and its count."""
+    """Return the bucket holding the remaining-th key, the count before it, and
+    its count."""
     count_pairs = counts.reshape([_MAX_BUCKETS // 2, 2])
     count_low, count_high = gl.split(count_pairs)
     count_low = gl.convert_layout(count_low, group_layout)

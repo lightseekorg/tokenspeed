@@ -121,7 +121,8 @@ def fused_gate_sigmoid_mul_add(
     num_tokens, hidden_dim = hidden_states.shape
     if gate_weight.shape[0] != hidden_dim:
         raise ValueError(
-            f"gate_weight dim mismatch: expected {hidden_dim}, got {gate_weight.shape[0]}"
+            f"gate_weight dim mismatch: expected {hidden_dim}, "
+            f"got {gate_weight.shape[0]}"
         )
     if shared_output.shape != (num_tokens, hidden_dim):
         raise ValueError(
@@ -218,8 +219,7 @@ def sigmoid_mul(
     equal heads. With it, the kernel computes
     ``x * (1 / (1 + exp(-(gate + bias))))`` in FP32 with libdevice ``exp`` and
     an IEEE-rounded division, rounding once on the store. Without it the
-    kernel is unchanged and uses ``tl.sigmoid``.
-
+    kernel uses ``tl.sigmoid``.
     """
     if x.ndim != 2:
         raise ValueError(f"x must be 2D, got {x.ndim}D")
@@ -345,7 +345,6 @@ def silu_and_mul(
 
     ``x`` is interpreted as ``[..., 2 * D]`` with gate values in the first half
     and up values in the second half. The output has shape ``[..., D]``.
-
     """
     if limit is not None and limit <= 0:
         raise ValueError(f"limit must be positive, got {limit}")
@@ -434,7 +433,6 @@ def swiglu_oai(
     ``gate_up`` is interpreted as ``[..., 2 * D]`` with gate values in the first
     half and up values in the second half. The gate is upper-clamped to ``limit``
     and up is clamped to ``[-limit, limit]``. The output has shape ``[..., D]``.
-
     """
     if gate_up.shape[-1] % 2 != 0:
         raise ValueError(f"last dimension must be even, got {gate_up.shape[-1]}")

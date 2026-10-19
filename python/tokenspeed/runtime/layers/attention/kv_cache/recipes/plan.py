@@ -359,7 +359,8 @@ class CacheMemoryPlan:
                 or block_id >= page_count
             ):
                 raise IndexError(
-                    f"page_id {block_id} outside [0, {page_count}) for group {group_id!r}"
+                    f"page_id {block_id} outside [0, {page_count}) for "
+                    f"group {group_id!r}"
                 )
         return [
             (base + block_id * stride, size)
@@ -607,7 +608,8 @@ def _align_up(value: int, alignment: int) -> int:
 def _solve_packing(fields):
     """Derive per-group cache blocks per LCM block from exact field ratios.
 
-    ``fields`` are ``(group_id, CacheFieldSpec)`` pairs.
+    ``fields`` are ``(group_id, CacheFieldSpec)`` pairs. Returns None when the
+    exact-stride constraints are inconsistent.
     """
     exact_by_plane: dict[str, dict[str, int]] = {}
     groups = set()

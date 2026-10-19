@@ -90,8 +90,6 @@ class KimiK3Recipe(CacheRecipe):
     family = "kimi_k3"
     uses_paged_state_verify = True
 
-    # ---- layer vocabulary ----
-
     @property
     def _text_config(self):
         return self.model_config.hf_text_config
@@ -188,8 +186,6 @@ class KimiK3Recipe(CacheRecipe):
             for spec, fields in super().groups()
         )
 
-    # ---- geometry ----
-
     @property
     @override
     def prefix_granularity(self) -> int:
@@ -201,8 +197,6 @@ class KimiK3Recipe(CacheRecipe):
         # A draft adds MLA planes of its own; the target-only bound would
         # reject the wider arena they imply.
         return float("inf") if self.num_draft_layers else 0.25
-
-    # ---- fields ----
 
     @cached_property
     def _kda_shapes(self):
@@ -266,8 +260,6 @@ class KimiK3Recipe(CacheRecipe):
             ),
         )
 
-    # ---- packing: state groups match the MLA plane's byte width ----
-
     @override
     def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
         fields_by_group = {spec.group_id: fields for spec, fields in groups}
@@ -312,8 +304,6 @@ class KimiK3Recipe(CacheRecipe):
                 f"MLA layer) plus {self.num_draft_layers} draft planes, got "
                 f"{len(layout.plane_bytes)}"
             )
-
-    # ---- extras ----
 
     @cached_property
     def replay_kda(self) -> bool:

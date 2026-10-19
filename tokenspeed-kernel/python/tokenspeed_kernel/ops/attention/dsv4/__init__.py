@@ -89,11 +89,6 @@ def _blockscaled_signature_and_scales(
 LSE_LN = math.log2(math.e)
 
 
-# ===-----------------------------------------------------------------------===#
-# DSv4 Kernels
-# ===-----------------------------------------------------------------------===#
-
-
 def dsv4_indexer_cache_format(use_fp4: bool | None = None) -> str:
     """Resolve the DeepSeek V4 indexer cache format for this kernel platform.
 

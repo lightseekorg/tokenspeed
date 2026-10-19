@@ -26,9 +26,9 @@ Override the port with ``--control-port PORT``.
 Architecture::
 
     Client  ──►  control_server  :8001
-                    ├─ /health, /get_server_info, /get_model_info,
+                    ├─ /get_server_info, /get_model_info,
                     │  /health_check, /abort  ──►  gRPC engine  (direct)
-                    └─ /generate, /v1/*, /flush_cache
+                    └─ /health, /generate, /v1/*, /flush_cache
                          ──►  smg gateway  :8000  ──►  gRPC engine
 """
 
@@ -89,19 +89,9 @@ def _stub() -> pb_grpc.TokenSpeedSchedulerStub:
     return _grpc_stub
 
 
-# ---------------------------------------------------------------------------
-# Health (proxied to smg → engine)
-# ---------------------------------------------------------------------------
-
-
 @app.get("/health")
 async def health(request: Request):
     return await _proxy_request(request)
-
-
-# ---------------------------------------------------------------------------
-# gRPC direct
-# ---------------------------------------------------------------------------
 
 
 async def _grpc_call(coro) -> JSONResponse:
@@ -174,11 +164,6 @@ async def abort(request: Request):
             )
         )
     )
-
-
-# ---------------------------------------------------------------------------
-# smg passthrough — generation + cache
-# ---------------------------------------------------------------------------
 
 
 async def _proxy_request(
@@ -532,11 +517,6 @@ async def model_info(request: Request):
 @app.post("/update_weight_version")
 async def update_weight_version(request: Request):
     return await _proxy_to_rl_control(request)
-
-
-# ---------------------------------------------------------------------------
-# Server lifecycle
-# ---------------------------------------------------------------------------
 
 
 def build_control_server(

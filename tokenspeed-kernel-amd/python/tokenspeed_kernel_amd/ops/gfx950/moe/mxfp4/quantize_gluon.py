@@ -21,7 +21,7 @@
 """Gluon MXFP4/MXFP8 quantization helpers for staged MXFP4-weight MoE.
 
 Both tiles pick each 32-value group's E8M0 scale in software and then
-converts through `gl.amd.cdna4.scaled_downcast`, so `v_cvt_scalef32_pk_fp4_f32`
+convert through `gl.amd.cdna4.scaled_downcast`, so `v_cvt_scalef32_pk_fp4_f32`
 / `v_cvt_scalef32_pk_fp8_f32` performs the `* 2**-scale_exp` rescale, the
 rounding, and (for E2M1) the nibble packing in one instruction per value pair.
 Some constraints come with that:

@@ -86,11 +86,6 @@ def _blockscaled_signature_and_scales(
 LSE_LN = math.log2(math.e)
 
 
-# ===-----------------------------------------------------------------------===#
-# MSA Kernels
-# ===-----------------------------------------------------------------------===#
-
-
 def msa_decode_with_kvcache(
     q: torch.Tensor,
     index_q: torch.Tensor,

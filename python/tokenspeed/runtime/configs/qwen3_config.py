@@ -51,7 +51,6 @@ class Qwen3Config(PretrainedConfig):
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
 
-
     Args:
         vocab_size (`int`, *optional*, defaults to 151936):
             Vocabulary size of the Qwen3 model. Defines the number of different tokens that can be represented by the
@@ -154,7 +153,6 @@ class Qwen3Config(PretrainedConfig):
     model_type = "qwen3"
     keys_to_ignore_at_inference = ["past_key_values"]
 
-    # Default tensor parallel plan for base model `Qwen3`
     base_model_tp_plan = {
         "layers.*.self_attn.q_proj": "colwise",
         "layers.*.self_attn.k_proj": "colwise",

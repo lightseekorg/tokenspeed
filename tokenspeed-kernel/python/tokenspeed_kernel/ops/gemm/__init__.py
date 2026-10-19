@@ -78,13 +78,10 @@ from tokenspeed_kernel.workspace import zeroed_state
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    # GEMM
     "bmm",
     "mm",
-    # NVFP4 x BF16 weight preparation
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "prepare_nvfp4_a16_weights",
-    # DeepSeek V4 projections
     "dsv4_grouped_output_projection",
     "dsv4_grouped_output_projection_plan",
     "dsv4_grouped_output_projection_preprocessor",
@@ -93,9 +90,7 @@ __all__ = [
     "dsv4_linear_fp32",
     "grouped_bf16_projection",
     "grouped_bf16_projection_quantize_fp8",
-    # MV: small-M dense projection
     "mv",
-    # Linear AttnRes partials
     "fp32_router_gemv",
     "fp32_router_gemv_counters",
     "fp32_router_gemv_execute",
@@ -104,7 +99,6 @@ __all__ = [
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
-    # Kimi K3 projections
     "KIMI3_HIDDEN_SIZE",
     "KIMI3_LATENT_SIZE",
     "KIMI3_QKVFAB_SIZE",
@@ -119,7 +113,6 @@ __all__ = [
     "kimi3_router_projection",
     "kimi3_shared_down_projection",
     "kimi3_shared_situ_projection",
-    # MXFP4 linear with dynamic MXFP4 activations
     "Mxfp4LinearWeight",
     "mxfp4_linear",
     "mxfp4_swiglu_linear",
@@ -132,10 +125,6 @@ __all__ = [
 _platform = Platform.get()
 _fp8_dtype = torch.float8_e4m3fn
 
-# ===-----------------------------------------------------------------------===#
-# Selection traits
-# ===-----------------------------------------------------------------------===#
-#
 # The trait dicts this module passes to ``select_kernel`` and the ``traits``
 # that gemm registrations declare share one vocabulary. Problem-shape traits
 # describe the kernel's supported envelope:
@@ -156,11 +145,6 @@ _fp8_dtype = torch.float8_e4m3fn
 # Trait dicts list the shape traits first, in ``batch``, ``m``, ``n``, ``k``
 # order with ``_align``/``_min`` after the exact sets and
 # ``mnk_problem_filter`` last, followed by the remaining traits alphabetically.
-
-
-# ===-----------------------------------------------------------------------===#
-# GEMM: mm and bmm
-# ===-----------------------------------------------------------------------===#
 
 
 # Kernels that accept and own bias application inside their GEMM wrapper.
@@ -195,7 +179,7 @@ def _infer_scale_type(
     A_scales: torch.Tensor | None,
     B_scales: torch.Tensor | None,
 ) -> str | None:
-    """For fp8, distinguish tensor/channel/scalar scaling."""
+    """For fp8, distinguish tensor/channel scaling; None if a scale is missing."""
     if A_scales is None or B_scales is None:
         return None
     if A_scales.numel() == 1 and B_scales.numel() == 1:
@@ -680,7 +664,6 @@ def mm(
         solution=solution,
         override=override,
     )
-    # Online activation quantization
     if (
         quant == "mxfp8"
         and A_scales is None
@@ -697,7 +680,6 @@ def mm(
             kernel_name=kernel.name,
         )
 
-    # Online per-token FP8 quantization of 16-bit activations.
     if (
         quant == "fp8"
         and A_scales is None
@@ -905,11 +887,6 @@ def bmm(
     return output
 
 
-# ===-----------------------------------------------------------------------===#
-# MXFP4 linear with dynamic MXFP4 activations
-# ===-----------------------------------------------------------------------===#
-
-
 @dataclass(frozen=True)
 class Mxfp4LinearWeight:
     """A dense MXFP4 weight prepared for the selected MXFP4 linear kernels.
@@ -1055,11 +1032,6 @@ def mxfp4_swiglu_linear(
         BF16 ``[M, N/2]``; ``out`` when provided.
     """
     return _run_mxfp4_linear("mxfp4_swiglu_linear", x, weight, out)
-
-
-# ===-----------------------------------------------------------------------===#
-# DeepSeek V4 projections
-# ===-----------------------------------------------------------------------===#
 
 
 @dataclass(frozen=True)
@@ -1279,7 +1251,8 @@ def dsv4_grouped_output_projection(
         )
     if weight.dtype != typed_plan.weight_dtype:
         raise ValueError(
-            f"grouped output projection expected weight dtype {typed_plan.weight_dtype}, "
+            "grouped output projection expected weight dtype "
+            f"{typed_plan.weight_dtype}, "
             f"got {weight.dtype}"
         )
 
@@ -1344,9 +1317,6 @@ def dsv4_grouped_output_projection_warmup(
         allow_unknown_layout: Whether unenrolled storage may be treated as
             canonical. Layers that preprocess weights must pass False.
         solution: Optional implementation family preference for this call.
-
-    Returns:
-        None.
     """
     typed_plan = _require_grouped_output_projection_plan(plan)
     kernel = _select_grouped_output_projection(
@@ -1385,9 +1355,6 @@ def dsv4_grouped_output_projection_warmup_model(
         allow_unknown_layout: Whether unenrolled storage may be treated as
             canonical. Layers that preprocess weights must pass False.
         solution: Optional implementation family preference for this call.
-
-    Returns:
-        None.
     """
     seen: set[tuple] = set()
     for module in model.modules():
@@ -1622,11 +1589,6 @@ def dsv4_linear_fp32(
         return kernel(hidden_states, weight, enable_pdl=enable_pdl)
 
 
-# ===-----------------------------------------------------------------------===#
-# MV: small-M dense projection
-# ===-----------------------------------------------------------------------===#
-
-
 # BF16 and FP32 small-M dense projection dispatch.
 #
 # Eligible small-M BF16 projections use FlashInfer joint runner/tactic selection.
@@ -1839,14 +1801,6 @@ def mv_weight_split(weight: torch.Tensor) -> torch.Tensor | None:
     ):
         return None
     return split_fp32_weight_bf16x3(weight)
-
-
-# ===-----------------------------------------------------------------------===#
-# Linear AttnRes partials
-# ===-----------------------------------------------------------------------===#
-
-
-# Linear projection with independent AttnRes block partials.
 
 
 def _validate_linear_attnres_inputs(
@@ -2163,11 +2117,6 @@ def linear_attnres_partials(
             scratch[1].copy_(unnormalized.sum(dim=0))
             scratch[2].copy_(torch.einsum("bt,bth->th", unnormalized, values))
     return out
-
-
-# ===-----------------------------------------------------------------------===#
-# Kimi K3 projections
-# ===-----------------------------------------------------------------------===#
 
 
 # Dense BF16 projection kernels for Kimi K3.

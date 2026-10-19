@@ -782,6 +782,7 @@ def prepare_moe_apply(
     platform: PlatformInfo,
 ) -> PreparedBenchmark:
     """Prepare one precomputed-routing MoE apply benchmark."""
+    del platform  # Unused.
 
     _validate_request_options(request)
     parameters = request.parameters
@@ -1150,7 +1151,7 @@ def prepare_latent_expert_shared(
         generator=generator,
         dtype=input_dtype,
     )
-    _router_logits, topk_weights, topk_ids = _routing_tensors(
+    _, topk_weights, topk_ids = _routing_tensors(
         tokens=tokens,
         experts=num_experts,
         topk=topk,
@@ -1162,7 +1163,7 @@ def prepare_latent_expert_shared(
         expert_start=0,
     )
     load_builtin_kernels()
-    _plan, weights = _prepare_routed_weights(
+    _, weights = _prepare_routed_weights(
         weight_dtype_name="mxfp4",
         weight_dtype=torch.uint8,
         input_dtype=input_dtype,

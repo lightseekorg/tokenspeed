@@ -103,7 +103,7 @@ def test_asr_config_parses_official_nested_shape(tmp_path):
             },
         },
     }
-    (tmp_path / "config.json").write_text(json.dumps(raw_config))
+    (tmp_path / "config.json").write_text(json.dumps(raw_config), encoding="utf-8")
     config = Qwen3ASRConfig.from_pretrained(tmp_path)
 
     assert config.architectures == ["Qwen3ASRForConditionalGeneration"]

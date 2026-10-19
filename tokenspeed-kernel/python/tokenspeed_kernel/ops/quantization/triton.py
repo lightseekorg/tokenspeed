@@ -94,14 +94,13 @@ def _flatten_to_2d(x: torch.Tensor):
         return 1, N, N
     M = x.numel() // N
     row_stride = x.stride(-2)
-    # Validate that every leading dim packs onto the next.
     for d in range(x.ndim - 2):
         expected = x.shape[d + 1] * x.stride(d + 1)
         if x.stride(d) != expected:
             raise ValueError(
                 f"cannot flatten dim {d}: stride={x.stride(d)} but expected "
-                f"shape[{d+1}]*stride[{d+1}]={expected}. Tensor shape={tuple(x.shape)}, "
-                f"stride={tuple(x.stride())}."
+                f"shape[{d+1}]*stride[{d+1}]={expected}. "
+                f"Tensor shape={tuple(x.shape)}, stride={tuple(x.stride())}."
             )
     return M, N, row_stride
 
@@ -166,7 +165,6 @@ def fp8_quantize(
     # nsys-driven sweep on B200 (kv_a [s,512] and v [s,h,128] for K2.5).
     # Pattern: num_warps=4, num_stages=2 win universally; BLOCK_M ramps with
     # M to amortize launch as the grid grows.
-    # See tasks/k2.5_optimization/{tune_fp8_quantize_nsys,parse_tune_fp8_quantize_nsys}.py
     if M <= 2048:
         block_m = 4
     elif M <= 16384:
@@ -1205,7 +1203,7 @@ def triton_rmsnorm_nvfp4_quant(
     mailbox_sentinel: int | None,
     enable_pdl: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Triton kernel of :func:`tokenspeed_kernel.ops.quantization.rmsnorm_nvfp4_quant`."""
+    """Triton kernel of ``tokenspeed_kernel.ops.quantization.rmsnorm_nvfp4_quant``."""
     if x.ndim != 2 or x.dtype != torch.bfloat16 or not x.is_cuda:
         raise ValueError("x must be a BF16 GPU tensor shaped [rows, width]")
     rows, width = x.shape

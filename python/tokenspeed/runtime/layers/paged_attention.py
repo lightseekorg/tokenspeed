@@ -120,10 +120,6 @@ def head_norm(q_norm: HeadRMSNorm, k_norm: HeadRMSNorm) -> HeadNorm:
 
 
 class PagedAttention(nn.Module):
-    """
-    The attention layer implementation.
-    """
-
     def __init__(
         self,
         num_heads: int,

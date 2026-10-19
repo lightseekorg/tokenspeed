@@ -1,6 +1,6 @@
 """Inkling MTP draft text-config derivation.
 
-Checkpoints since 4d71c3ea mix SWA and full-attention MTP depths
+Checkpoints may mix SWA and full-attention MTP depths
 (``mtp_config.local_layer_ids``); ``inkling_mtp_text_config`` turns the base
 text config into the draft worker's depth config: depth-local ids become the
 ``local_layer_ids`` that drive attention geometry and cache-group labels,

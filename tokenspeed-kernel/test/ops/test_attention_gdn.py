@@ -918,7 +918,10 @@ def test_gdn_decode_mtp_tree_parents_match_per_path_reference(
                 path.append(node)
                 node = par[node]
             path = path[::-1]
-            pick = lambda x: x[bi : bi + 1, path]
+
+            def pick(x):
+                return x[bi : bi + 1, path]
+
             ref_out, ref_states = _torch_gdn_decode_reference(
                 pick(q),
                 pick(k),

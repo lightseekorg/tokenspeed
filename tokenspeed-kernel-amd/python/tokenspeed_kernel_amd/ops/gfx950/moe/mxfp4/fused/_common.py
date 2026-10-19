@@ -73,7 +73,7 @@ def _ragged_block_schedule(metadata, block_size: int):
 
 
 def composition(cls):
-    """A decorator lets aggregate type to directly access attributes from its aggregate member."""
+    """Lets an aggregate type directly access attributes of its aggregate members."""
 
     def __getattr__(self, name):
         if name in self.__dict__:

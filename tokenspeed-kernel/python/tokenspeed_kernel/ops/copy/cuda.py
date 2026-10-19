@@ -35,23 +35,7 @@ def memcpy_2d_async(
     height: int,
     stream_ptr: int,
 ) -> None:
-    """Copy a 2D device rectangle asynchronously.
-
-    Args:
-        dst: Destination device pointer.
-        dst_pitch: Destination row pitch in bytes.
-        src: Source device pointer.
-        src_pitch: Source row pitch in bytes.
-        width: Bytes copied per row.
-        height: Number of rows.
-        stream_ptr: CUDA stream handle.
-
-    Returns:
-        None.
-
-    Raises:
-        RuntimeError: If the platform is not NVIDIA or the runtime copy fails.
-    """
+    """Copy a 2D device rectangle asynchronously; pitches and width are bytes."""
     if not current_platform().is_nvidia:
         raise RuntimeError("memcpy_2d_async is NVIDIA-only")
     from tokenspeed_kernel.thirdparty.cuda.memcpy_2d import cuda_memcpy_2d_async

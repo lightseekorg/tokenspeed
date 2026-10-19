@@ -234,7 +234,8 @@ class ModelOptMixedConfig(QuantizationConfig):
                 group_size = int(info.get("group_size", 16))
         if unknown:
             raise ValueError(
-                f"Unsupported quant_algo values in quantized_layers: {sorted(unknown)}. "
+                "Unsupported quant_algo values in quantized_layers: "
+                f"{sorted(unknown)}. "
                 f"Supported: {sorted(_SUPPORTED_QUANT_ALGOS)}."
             )
 
@@ -333,9 +334,8 @@ class ModelOptMixedConfig(QuantizationConfig):
     def _fp8_pb_wo_leaf_route(self, module_name: str) -> str:
         """Route an FP8_PB_WO module: ``"dequant"`` (bf16 at load) or ``"w8a8"``."""
         leaf = module_name.rsplit(".", 1)[-1]
-        # g_proj needs no per-sublayer distinction anymore: the KDA merged
-        # buffer and the MLA fused projection both keep it FP8 (w8a8); the
-        # model loader tells them apart by which runtime module exists.
+        # The KDA merged buffer and the MLA fused projection both keep g_proj
+        # FP8 (w8a8); the model loader tells them apart by which module exists.
         return "dequant" if leaf in _FP8_PB_WO_DEQUANT_LEAVES else "w8a8"
 
     def fp8_pb_wo_route(self, module_name: str) -> str | None:
@@ -347,6 +347,7 @@ class ModelOptMixedConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase:
+        del layer
         from tokenspeed.runtime.layers.dense import (
             Fp8LinearMethod,
             Nvfp4LinearMethod,

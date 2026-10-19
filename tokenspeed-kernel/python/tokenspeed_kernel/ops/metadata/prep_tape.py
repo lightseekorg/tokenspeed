@@ -126,8 +126,6 @@ class PrepTape:
         # from is allocated per run (see run()).
         self._regs_host = torch.zeros(32, dtype=torch.int64)
 
-    # -- recording ---------------------------------------------------------
-
     def _row(self, op, dst, src, idx, n, m, stride, scalar) -> None:
         if self._descs is not None:
             raise RuntimeError("tape already finalized")
@@ -148,10 +146,7 @@ class PrepTape:
         )
 
     def barrier(self) -> None:
-        """Start a stream-ordered launch stage after the recorded operations.
-
-        Returns ``None``.
-        """
+        """Start a stream-ordered launch stage after the recorded operations."""
         if self._descs is not None:
             raise RuntimeError("tape already finalized")
         self._stages.append([])
@@ -264,8 +259,6 @@ class PrepTape:
         )
         self._keepalive += [state_in, state_out]
 
-    # -- execution ---------------------------------------------------------
-
     def finalize(self) -> None:
         """Upload the explicitly recorded stages; the tape becomes immutable.
 
@@ -277,7 +270,7 @@ class PrepTape:
             for rows in self._stages
             if rows
         )
-        # Keep the latency-critical one-stage dispatch path unchanged.
+        # One stage keeps the latency-critical single-launch dispatch path.
         self._descs = stages[0] if len(stages) == 1 else stages
 
     def __len__(self) -> int:

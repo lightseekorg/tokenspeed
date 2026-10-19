@@ -75,19 +75,21 @@ def prefix_chunk_len(batch_size: int) -> int:
     return get_max_chunk_capacity() // batch_size
 
 
-# Here we suppose the length of each chunk is equal
-# For example, if we have 4 sequences with seq length [256, 512, 768, 1024], chunk_len = 256
-# num_chunks = cdiv(1024, 256) = 4
-# chunk_starts = [[0, 0, 0, 0], [256, 256, 256, 256], [512, 512, 512, 512], [768, 768, 768, 768]]
-# chunk_ends = [[256, 256, 256, 256], [256, 512, 512, 512], [256, 512, 768, 768], [256, 512, 768, 1024]]
-# chunk_seq_lens = [[256, 256, 256, 256], [0, 256, 256, 256], [0, 0, 256, 256], [0, 0, 0, 256]]
-"""
-        seq0 seq1 seq2 seq3
-chunk0   --   --   --   --
-chunk1   --   --   --   --
-chunk2   --   --   --   --
-chunk3   --   --   --   --
-"""
+# Here we suppose the length of each chunk is equal. For example, with 4
+# sequences of length [256, 512, 768, 1024] and chunk_len = 256:
+#   num_chunks = cdiv(1024, 256) = 4
+#   chunk_starts = [[0, 0, 0, 0], [256, 256, 256, 256],
+#                   [512, 512, 512, 512], [768, 768, 768, 768]]
+#   chunk_ends = [[256, 256, 256, 256], [256, 512, 512, 512],
+#                 [256, 512, 768, 768], [256, 512, 768, 1024]]
+#   chunk_seq_lens = [[256, 256, 256, 256], [0, 256, 256, 256],
+#                     [0, 0, 256, 256], [0, 0, 0, 256]]
+#
+#           seq0 seq1 seq2 seq3
+#   chunk0   --   --   --   --
+#   chunk1   --   --   --   --
+#   chunk2   --   --   --   --
+#   chunk3   --   --   --   --
 
 
 # starts, ends, len_in_chunk, cum_seq_lens, all satisfy the above layout

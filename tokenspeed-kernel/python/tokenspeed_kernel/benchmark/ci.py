@@ -298,7 +298,8 @@ def load_suite(
         schema_version = suite["schema_version"]
         if schema_version != _SCHEMA_VERSION:
             raise SuiteConfigError(
-                f"unsupported schema_version {schema_version}; expected {_SCHEMA_VERSION}"
+                f"unsupported schema_version {schema_version}; "
+                f"expected {_SCHEMA_VERSION}"
             )
         suite_id = _nonempty_string(suite["suite_id"], "suite_id")
         required_environment = _parse_environment(suite["environment"])

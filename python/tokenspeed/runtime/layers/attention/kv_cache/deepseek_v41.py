@@ -139,5 +139,6 @@ class DeepseekV41CachePool(CachePool):
         cache_v: torch.Tensor,
     ) -> None:
         raise NotImplementedError(
-            "V4.1 requires its quantized cache writer with swa(layer), not a generic K/V scatter"
+            "V4.1 requires its quantized cache writer with swa(layer), not a "
+            "generic K/V scatter"
         )

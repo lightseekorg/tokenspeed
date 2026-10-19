@@ -33,7 +33,9 @@ KVP_HISTORY_GROUP_NAME = "kvp_history"
 def _resolve_parallelism_sizes(world_size: int, *sizes: int | None) -> tuple[int, ...]:
     """Resolve the parallelism sizes given world_size.
 
-    `sizes` is ordered innermost (fastest-varying) to outermost.
+    `sizes` is ordered innermost (fastest-varying) to outermost. The first
+    None size takes the remaining factor of ``world_size``; later None sizes
+    resolve to 1.
     """
     assert all(x is None or x > 0 for x in sizes)
 
@@ -786,6 +788,7 @@ class Mapping(MappingBase):
             f"    Vision: tp={self.vision.tp_size}  item_dp={self.vision.dp_size}",
             f"  LM head : tp={self.lm_head.tp_size}",
             f"  Dense   : tp={self.dense.tp_size}  dp={self.dense.dp_size}",
-            f"  MoE     : tp={self.moe.tp_size}  ep={self.moe.ep_size}  dp={self.moe.dp_size}",
+            f"  MoE     : tp={self.moe.tp_size}  ep={self.moe.ep_size}  "
+            f"dp={self.moe.dp_size}",
         ]
         return "\n".join(lines)

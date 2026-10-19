@@ -29,8 +29,6 @@ __all__ = ["BenchmarkConfig"]
 
 @dataclass
 class BenchmarkConfig:
-    """Configuration for a benchmark run."""
-
     warmup_iters: int = 10
     bench_iters: int = 100
     verify: bool = True

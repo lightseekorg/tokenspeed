@@ -505,10 +505,15 @@ def rel_mha_decode_tsmha(
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(D)
     if blockscaled:
         # TVM-FFI carries fp8 as uint8 storage; SFQ rides the 4D batch-mode Q transpose.
-        data = lambda t: t.view(torch.uint8)
+        def data(t):
+            return t.view(torch.uint8)
+
         sf_args = (q_scale.view(B, P, H, D // 32), k_scale, v_scale)
     else:
-        data = lambda t: t
+
+        def data(t):
+            return t
+
         sf_args = (None, None, None)
     compiled(
         data(q).view(B, P, H, D),
@@ -559,7 +564,7 @@ def is_compiled_for(
     blockscaled=False,
     has_tau=False,
 ) -> bool:
-    """True when both prepass and fwd kernels for this config are cached."""
+    """True when the fwd (and combine, if split) kernels are cached."""
     H = q.shape[1]
     extent = rel_logits.shape[-1]
     is_local = window_left >= 0

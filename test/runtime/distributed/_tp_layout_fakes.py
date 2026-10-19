@@ -46,6 +46,7 @@ Q_LORA, KV_LORA = 16, 12
 def init_gloo(rank: int, rendezvous: str, mapping: Mapping) -> None:
     """One gloo world; every group the layouts use is registered under the
     device-backend key as well, so the NCCL-named backend path runs on CPU."""
+    del rank  # Unused.
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg_manager,
     )

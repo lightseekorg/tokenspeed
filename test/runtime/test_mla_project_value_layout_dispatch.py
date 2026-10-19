@@ -114,7 +114,7 @@ def test_weight_layout_matches_what_the_kernel_wants():
         device="cuda",
         dtype=torch.bfloat16,
     )
-    w_kc, w_vc = _prepare_mla_kv_b_proj_weights(w, _Attn())
+    _, w_vc = _prepare_mla_kv_b_proj_weights(w, _Attn())
 
     assert w_vc.shape == (heads, latent, _Attn.v_head_dim)
     wants_contiguous = mla_project_value_prefers_contiguous_weight(
@@ -131,5 +131,5 @@ def test_model_has_no_vendor_branches_left():
 
     import tokenspeed.runtime.models.deepseek_v3 as m
 
-    src = pathlib.Path(m.__file__).read_text()
+    src = pathlib.Path(m.__file__).read_text(encoding="utf-8")
     assert "_is_amd" not in src, "a vendor branch came back into deepseek_v3"

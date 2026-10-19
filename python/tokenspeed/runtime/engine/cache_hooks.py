@@ -243,7 +243,7 @@ class CacheOpHooks:
             [1 if local_has_work else 0, 1 if local_backup_failed else 0],
             dtype=torch.int32,
         )
-        for _size, group in self._replica_groups:
+        for _, group in self._replica_groups:
             dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
         return bool(flag[0].item()), bool(flag[1].item())
 

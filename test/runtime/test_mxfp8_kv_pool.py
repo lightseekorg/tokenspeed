@@ -99,7 +99,6 @@ def test_store_and_roundtrip():
 
     pool.set_kv_buffer(layer, loc, kv, kv * 0.5)
 
-    # Data lands at loc.
     assert torch.equal(pool.k_buffer[1][loc].view(torch.uint8), k_q.view(torch.uint8))
     assert torch.equal(pool.v_buffer[1][loc].view(torch.uint8), v_q.view(torch.uint8))
 
@@ -113,7 +112,7 @@ def test_store_and_roundtrip():
         .view(torch.int32)
         .reshape(T, HEADS)
     )
-    for t in range(0, T, 17):  # sample positions
+    for t in range(0, T, 17):
         slot = int(loc[t])
         page, off = divmod(slot, 128)
         pos = (off % 32) * 4 + (off // 32)

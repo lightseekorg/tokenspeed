@@ -294,7 +294,7 @@ def test_smg_disable_flags_appended_when_absent():
 
 
 def test_smg_disable_flags_not_duplicated():
-    """Idempotent: passing the flag explicitly must not double it up for smg's argparse."""
+    """Idempotent: an explicit flag must not be doubled for smg's argparse."""
     gateway_args = _gateway_args_with_smg_disable_defaults(
         ["--disable-circuit-breaker"]
     )
@@ -607,9 +607,8 @@ def test_deepseek_v4_default_reasoning_parser_survives_gateway_defaults():
 
     # Exactly one reasoning parser, and it is the deepseek-v4 default — the
     # generic passthrough reasoning-parser default must not be layered on top.
-    # Check the parser slot rather than bare membership: the value "passthrough"
-    # (== DEFAULT_REASONING_PARSER) now also appears as the --policy value, which
-    # is an unrelated flag.
+    # Check the parser slot rather than bare membership: "passthrough" is also
+    # the --policy value.
     assert gateway_args.count("--reasoning-parser") == 1
     idx = gateway_args.index("--reasoning-parser")
     assert gateway_args[idx + 1] == DEEPSEEK_V4_REASONING_PARSER
@@ -1838,7 +1837,7 @@ def test_engine_tokenizer_other_than_the_model_keeps_passthrough(
         prewarmed.append,
     )
 
-    # The prewarm fetches what the gateway loads at startup, as before.
+    # The prewarm fetches what the gateway loads at startup.
     assert prewarmed == [model]
     assert _get_from_args(captured["gateway_args"], "--reasoning-parser") == (
         "passthrough"

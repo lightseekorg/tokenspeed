@@ -478,8 +478,8 @@ def symm_mem_barrier(
 def _dp_sampling_swap_kernel(
     local_logits,
     recv_logits_ptrs_dev,
-    # The padded batch changes step to step; runtime so every bucket shares
-    # one binary.
+    # Runtime, not constexpr: the padded batch changes step to step and every
+    # bucket shares one binary.
     REQS_PER_RANK,
     N: tl.constexpr,
     V_LOCAL: tl.constexpr,
@@ -534,8 +534,8 @@ def _dp_sampling_gather_kernel(
     recv_predict_ptrs_dev,
     recv_accept_idx_ptrs_dev,
     recv_accept_len_ptrs_dev,
-    # The padded batch changes step to step; runtime so every bucket shares
-    # one binary.
+    # Runtime, not constexpr: the padded batch changes step to step and every
+    # bucket shares one binary.
     REQS_PER_RANK,
     N: tl.constexpr,
     RANK: tl.constexpr,
@@ -662,7 +662,6 @@ def create_dp_sampling_state(
     max_reqs_per_rank = max_pad_bs // tp_size
     v_local = vocab_size // tp_size
     swap_block_size = min(1024, _next_power_of_2(v_local))
-    gather_block_n = min(1024, _next_power_of_2(num_tokens_per_req))
     swap_max_blocks = (
         tp_size
         * max_reqs_per_rank
@@ -862,7 +861,8 @@ def dp_sampling_gather(
 def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:
     if torch.cuda.current_device() != gpu_id:
         logger.warning(
-            f"current device is not {gpu_id}, but {torch.cuda.current_device()}, which may cause useless memory allocation for torch CUDA context."
+            f"current device is not {gpu_id}, but {torch.cuda.current_device()}, "
+            "which may cause useless memory allocation for torch CUDA context."
         )
     if empty_cache:
         torch.cuda.empty_cache()
@@ -889,9 +889,10 @@ def rsag_get_context(
     state: TritonRSAGState, token_list_in_group: list
 ) -> Tuple[int, int, int]:
     total_num_tokens = sum(token_list_in_group)
-    assert (
-        total_num_tokens <= state.max_token_num
-    ), f"The inner comm buffer is too small: {total_num_tokens=} is not <= {state.max_token_num=}"
+    assert total_num_tokens <= state.max_token_num, (
+        f"The inner comm buffer is too small: {total_num_tokens=} is not <= "
+        f"{state.max_token_num=}"
+    )
     local_num_tokens = token_list_in_group[state.rank_in_group]
     local_token_offset = sum(token_list_in_group[: state.rank_in_group])
     return total_num_tokens, local_num_tokens, local_token_offset
@@ -977,7 +978,6 @@ def nvidia_rsag_reduce_scatter_num_blocks(
         and capped, then rounded up to a power of two. The cap is exactly what
         ``nvidia_create_rsag_state`` reserves signal-pad slots for.
     """
-    # Elements one CTA sweeps per grid-stride step (threads * elems-per-thread).
     numel_per_program = _RSAG_BLOCK_THREADS * _RSAG_NUMEL_PER_THREAD
     max_local_numel = max(token_list_in_group) * hidden_size
     needed_blocks = max(
@@ -1096,7 +1096,8 @@ def nvidia_create_rsag_state(
         )
     free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
     logger.info(
-        f"Custom Triton RSAG symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
+        "Custom Triton RSAG symmetric-memory buffer allocated: "
+        f"{free_gpu_memory_begin - free_gpu_memory_after} GB"
     )
     symm_mem.rendezvous(comm_buff, group=group)
     return TritonRSAGState(
@@ -1180,7 +1181,10 @@ def nvidia_rsag_reduce_scatter(
     )
     assert (hidden_states.shape[0] == total_num_tokens) and (
         hidden_states.shape[-1] == state.hidden_dim
-    ), f"Mismatched shape, {hidden_states.shape[0]=} != {total_num_tokens=} or {hidden_states.shape[-1]=} != {state.hidden_dim=} {hidden_states.shape=}"
+    ), (
+        f"Mismatched shape, {hidden_states.shape[0]=} != {total_num_tokens=} or "
+        f"{hidden_states.shape[-1]=} != {state.hidden_dim=} {hidden_states.shape=}"
+    )
     state.comm_buff[:total_num_tokens, :].copy_(hidden_states)
     num_blocks = nvidia_rsag_reduce_scatter_num_blocks(
         token_list_in_group, state.hidden_dim
@@ -1212,7 +1216,10 @@ def nvidia_rsag_all_gather(
     )
     assert (hidden_states.shape[0] == local_num_tokens) and (
         hidden_states.shape[-1] <= state.hidden_dim
-    ), f"{hidden_states.shape=}|{local_num_tokens=}|{hidden_states.device=} Mismatched shape"
+    ), (
+        f"{hidden_states.shape=}|{local_num_tokens=}|{hidden_states.device=} "
+        "Mismatched shape"
+    )
     hidden_size_bak, comm_buff_bak = rsag_resize_hidden_if_needed(
         state, hidden_states.shape[-1]
     )
@@ -1561,7 +1568,8 @@ def amd_create_rsag_state(
     )
     free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
     logger.info(
-        f"Custom Triton RSAG AMD symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
+        "Custom Triton RSAG AMD symmetric-memory buffer allocated: "
+        f"{free_gpu_memory_begin - free_gpu_memory_after} GB"
     )
     assert rank_in_group == symm_mem_hdl.rank, "Mismatched rank id"
     return TritonRSAGState(
@@ -1594,7 +1602,10 @@ def amd_rsag_reduce_scatter(
     )
     assert (hidden_states.shape[0] == total_num_tokens) and (
         hidden_states.shape[-1] == state.hidden_dim
-    ), f"Mismatched shape, {hidden_states.shape[0]=} != {total_num_tokens=} or {hidden_states.shape[-1]=} != {state.hidden_dim=} {hidden_states.shape=}"
+    ), (
+        f"Mismatched shape, {hidden_states.shape[0]=} != {total_num_tokens=} or "
+        f"{hidden_states.shape[-1]=} != {state.hidden_dim=} {hidden_states.shape=}"
+    )
 
     local_numel = local_num_tokens * state.hidden_dim
     global_offset = local_token_offset * state.hidden_dim
@@ -1643,7 +1654,10 @@ def amd_rsag_all_gather(
         )
         assert (hidden_states.shape[0] == local_num_tokens) and (
             hidden_states.shape[-1] <= state.hidden_dim
-        ), f"{hidden_states.shape=}|{local_num_tokens=}|{hidden_states.device=} Mismatched shape"
+        ), (
+            f"{hidden_states.shape=}|{local_num_tokens=}|{hidden_states.device=} "
+            "Mismatched shape"
+        )
         local_numel = local_num_tokens * state.hidden_dim
         global_offset = local_token_offset * state.hidden_dim
         grid = (amd_rsag_num_blocks(local_numel, state.device),)
@@ -1663,11 +1677,6 @@ def amd_rsag_all_gather(
         return output.clone() if safe else output
     finally:
         rsag_restore_hidden(state, hidden_size_bak, comm_buff_bak)
-
-
-# ------------------------------------------------------------------------------
-# AMD Triton All-Reduce
-# ------------------------------------------------------------------------------
 
 
 # ------------------------------------------------------------------------------
@@ -1740,7 +1749,8 @@ def create_allreduce_residual_rmsnorm_state(
         symm_mem_hdl = symm_mem.rendezvous(comm_buff, group=group)
         free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
-            f"Triton AR+RMSNorm AMD symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
+            "Triton AR+RMSNorm AMD symmetric-memory buffer allocated: "
+            f"{free_gpu_memory_begin - free_gpu_memory_after} GB"
         )
         assert rank_in_group == symm_mem_hdl.rank, "Mismatched rank id"
     else:
@@ -2108,7 +2118,8 @@ def nvidia_rsag_all_gather_inner(
     )
     assert state.hidden_dim % INNER_AG_NUMEL_PER_THREAD == 0, (
         f"state.hidden_dim={state.hidden_dim} must be a multiple of "
-        f"{INNER_AG_NUMEL_PER_THREAD} bf16 (16-byte multimem.st row stride alignment)"
+        f"{INNER_AG_NUMEL_PER_THREAD} bf16 (16-byte multimem.st row stride "
+        "alignment)"
     )
     total_tokens, in_hidden = hidden_states.shape
     assert in_hidden == local_hidden, (

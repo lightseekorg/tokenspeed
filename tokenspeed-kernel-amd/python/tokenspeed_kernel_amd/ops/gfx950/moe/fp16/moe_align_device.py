@@ -364,9 +364,7 @@ def moe_align_block_size_device(
             num_warps=4,
         )
     else:
-        counts = torch.zeros(
-            BLOCK_E, dtype=torch.float32, device=device
-        )  # count_kernel accum
+        counts = torch.zeros(BLOCK_E, dtype=torch.float32, device=device)
         INIT_BLOCK = 1024
         _init_kernel[(triton.cdiv(EM_max, INIT_BLOCK),)](
             sti, sw, EM_max, sentinel, BLOCK=INIT_BLOCK, NW=4, num_warps=4

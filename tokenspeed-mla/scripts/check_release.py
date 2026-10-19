@@ -30,7 +30,9 @@ from packaging.version import Version
 
 
 def read_version(package_dir: Path) -> str:
-    project = tomllib.loads((package_dir / "pyproject.toml").read_text())["project"]
+    project = tomllib.loads(
+        (package_dir / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
     if project["name"] != "tokenspeed-mla":
         raise ValueError("expected project name tokenspeed-mla")
     version = project["version"]

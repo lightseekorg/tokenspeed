@@ -82,7 +82,8 @@ def _profile(request: BenchmarkRequest) -> tuple[str, _GdnModelProfile]:
     name = request.parameters["model_profile"]
     if name not in _MODEL_PROFILES:
         raise _invalid(
-            f"Implemented GDN model_profile values: {', '.join(sorted(_MODEL_PROFILES))}"
+            "Implemented GDN model_profile values: "
+            f"{', '.join(sorted(_MODEL_PROFILES))}"
         )
     return name, _MODEL_PROFILES[name]
 

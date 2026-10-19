@@ -37,14 +37,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Experimental stage 2: MXFP4 inter x MXFP4 W2 direct MFMA + fused topk combine.
-#
-# This is the direct top-k variant of the reference combine GEMM.  It assumes the
-# intermediate rows are already in (token, topk-slot) order, so it does not
-# consume ragged metadata / scatter indices.  Keep it out of default dispatch
-# until the matching direct stage1 path writes this row order with MXFP4 output.
-# ---------------------------------------------------------------------------
+# Direct top-k variant of the reference combine GEMM. It assumes the intermediate
+# rows are already in (token, topk-slot) order, as the direct stage-1 kernel
+# writes them, so it consumes no ragged metadata or scatter indices.
 @gluon.jit
 def _stage2_mxfp4_direct_mfma_gluon(
     inter_ptr,  # (M*TOPK, I/2) uint8 e2m1 packed, slot order
@@ -323,6 +318,12 @@ def invoke_stage2_mxfp4_mfma_decode_gluon(
     M_DUP: int = 4,
     PIPELINE_K: bool = True,
 ):
+    """Launches the stage-2 direct MXFP4 MFMA decode kernel.
+
+    ``out`` is ``[num_tokens, D]`` when ``do_finalize``; otherwise it receives
+    ``[num_tokens * topk, D]`` per-slot partials and ``expanded_idx`` their row
+    indices (-1 for remote experts).
+    """
     assert inter_states_mxfp4.dtype == torch.uint8
     assert inter_scale.dtype == torch.uint8
     assert w2.dtype == torch.uint8 and w2_scale.dtype == torch.uint8

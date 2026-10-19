@@ -32,11 +32,6 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 __all__ = ["hadamard_transform"]
 
 
-# ===-----------------------------------------------------------------------===#
-# Hadamard Transform Kernels
-# ===-----------------------------------------------------------------------===#
-
-
 def hadamard_transform(
     x: torch.Tensor,
     *,

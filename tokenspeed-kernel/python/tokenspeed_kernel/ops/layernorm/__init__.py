@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Layernorm kernel entry points."""
-
 from __future__ import annotations
 
 import tokenspeed_kernel.ops.layernorm._triton.weightless  # noqa: F401

@@ -109,8 +109,7 @@ class TestMHAPoolGroupPublicationTest:
         )
 
     def test_hybrid_no_spec_publishes_two_groups(self):
-        # layer_num must match len(layer_types): the M12 slab layout's
-        # pairing-completeness assert cross-checks them.
+        # layer_num must match len(layer_types); the slab layout checks it.
         pool = self._pool(
             layer_types=GPT_OSS_LAYER_TYPES,
             sliding_window_tokens=128,

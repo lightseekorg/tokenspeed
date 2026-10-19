@@ -165,9 +165,6 @@ def set_benchmark_generator(
         generator: Callable that receives a complete benchmark request and the
             detected platform, then returns the registration, invocation,
             parameters, and optional correctness work for the shared harness.
-
-    Returns:
-        None.
     """
 
     _BENCHMARK_GENERATORS[(family, mode)] = generator

@@ -212,11 +212,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# ===----------------------------------------------------------------------=== #
-# Multimodal vision path
-# ===----------------------------------------------------------------------=== #
-
-
 class KimiK3Vision(MoonViTVisionPath):
     """K3 MoonViT3d tower and patchmergerv2 projector.
 
@@ -244,18 +239,13 @@ class KimiK3Vision(MoonViTVisionPath):
         weight_loader(param, loaded_weight)
 
 
-# ===----------------------------------------------------------------------=== #
-# Text sublayers: dense MLP (SiTU), NoPE-MLA attention, AttnRes helper
-# ===----------------------------------------------------------------------=== #
-
-
 class KimiLinearMLP(nn.Module):
     """Dense / shared-expert MLP with the SiTU (SituGLU) activation.
 
     Mirrors ``DeepseekV3MLP`` (gate_up_proj + down_proj) but swaps SiLU for the
     Kimi SiTU activation. ``down_proj`` normally reduces its partial sum in
     place because Kimi-K3 runs the AttnRes residual path outside
-    ``CommManager`` (see decision D4). EP Kimi can defer the shared-expert
+    ``CommManager``. EP Kimi can defer the shared-expert
     reduction so one Iris launch reduces it together with the routed latent.
     Unsharded callers use tp_size=1 and tp_group=None.
     """
@@ -294,7 +284,8 @@ class KimiLinearMLP(nn.Module):
                 )
             ):
                 raise ValueError(
-                    "Shared-expert TP requires matching explicit TP geometry and deferred reduction"
+                    "Shared-expert TP requires matching explicit TP geometry and "
+                    "deferred reduction"
                 )
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -394,6 +385,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         output_parallel: DenseLayerMapping | None,
         **kwargs,
     ) -> None:
+        del kwargs
         # The parent factories construct the final modules once, without a
         # transient replicated weight allocation for every sharded layer.
         self.qkv_parallel = qkv_parallel
@@ -495,7 +487,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         prefix: str,
         reduce_attn_results: bool,
     ) -> nn.Module:
-        """Shard only the projection; attention heads and caches retain their mapping."""
+        """Shard only the projection; heads and caches retain their mapping."""
         if self.output_parallel is not None:
             projection = DPRowParallelLinear(
                 self.num_heads * self.v_head_dim,
@@ -1017,11 +1009,6 @@ def _k3_trtllm_situ_internal_activation_dtype(
     return "fp8"
 
 
-# ===----------------------------------------------------------------------=== #
-# Text decoder layers
-# ===----------------------------------------------------------------------=== #
-
-
 class KimiKDAMergedProj(nn.Module):
     """Merged KDA input projections: ``[q | k | v | g | f_a | b]``, one GEMM.
 
@@ -1134,7 +1121,8 @@ class KimiKDAMergedProj(nn.Module):
             self._loaded_scale_shards = set()
         else:
             total = ceil_div(used, self._ROW_ALIGN) * self._ROW_ALIGN
-            # Explicit bf16: default-dtype fp32 would cost +6 GiB/rank and starve the KV budget.
+            # Explicit bf16: default-dtype fp32 would cost +6 GiB/rank and starve
+            # the KV budget.
             self.weight = nn.Parameter(
                 torch.empty(total, hidden_size, dtype=torch.bfloat16)
             )
@@ -1536,7 +1524,7 @@ class KimiLinearKDA(nn.Module):
 
         # Raw (pre-conv) q/k/v projections concatenated; the hybrid backend runs
         # the short causal conv (+ SiLU) and manages the conv / recurrent state
-        # cache (``KdaAttnBackend``). g_raw is the raw decay-gate
+        # cache (``KdaAttnBackend``). f_a_out is the low-rank decay-gate
         # input, beta the per-head logits (sigmoid applied in-kernel).
         mixed_qkv, out_gate, f_a_out, beta = self._project_qkvfab(
             h, ctx, attnres_partial_args
@@ -1553,7 +1541,6 @@ class KimiLinearKDA(nn.Module):
             mixed_qkv = mixed_qkv.contiguous()
         # f_b runs inside the backend: fused into the decode scan kernel, a
         # plain GEMV on the prefill path.
-        # Fused [3*proj, k] conv kernel bank, built once in post_load_weights.
         conv_weights = self.conv_weights
 
         core_out = ctx.attn_backend.forward(
@@ -1901,7 +1888,8 @@ class KimiLinearMoE(nn.Module):
         if mapping.attn.dp_size > 1:
             if not (mapping.attn.dp_size == mapping.moe.ep_size == mapping.world_size):
                 raise ValueError(
-                    "Kimi-K3 attention DP requires attention DP == MoE EP == world size."
+                    "Kimi-K3 attention DP requires attention DP == MoE EP == "
+                    "world size."
                 )
         elif mapping.attn.tp_size != mapping.moe.tp_ep_size:
             raise ValueError("Kimi-K3 attention TP must match the MoE TP x EP group.")
@@ -1940,7 +1928,6 @@ class KimiLinearMoE(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_token
         self.routed_scaling_factor = config.routed_scaling_factor
-        # Latent MoE: routed experts run at routed_expert_hidden_size.
         self.routed_hidden = (
             config.routed_expert_hidden_size
             if config.routed_expert_hidden_size is not None
@@ -2049,7 +2036,8 @@ class KimiLinearMoE(nn.Module):
             ),
         )
 
-        # AMD replicates both: no folded AR→GEMM→AR, and its native tail packs the weight.
+        # AMD replicates both: no folded AR→GEMM→AR, and its native tail packs the
+        # weight.
         self._shard_latent_projections = _shard_k3_latent_projection(
             mapping, config.hidden_size
         )
@@ -2114,7 +2102,6 @@ class KimiLinearMoE(nn.Module):
             else None
         )
 
-        # Shared experts (SiTU dense MLP over the full hidden size).
         shared_parallel = shared_expert_mapping(
             mapping, envs.TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE.get()
         )
@@ -2152,7 +2139,8 @@ class KimiLinearMoE(nn.Module):
             if self.execution_plan.use_mega_moe:
                 if layer_index == config.first_k_dense_replace:
                     logger.info(
-                        f"K3 routed MoE: {moe_backend.value} SiTU MegaMoE (EP={mapping.moe.ep_size})",
+                        f"K3 routed MoE: {moe_backend.value} SiTU MegaMoE "
+                        f"(EP={mapping.moe.ep_size})",
                     )
                 return
             if all2all_backend is not All2AllBackend.AGRS:
@@ -2185,7 +2173,8 @@ class KimiLinearMoE(nn.Module):
                 logger.info("K3 MoE communication: all-gather/reduce-scatter")
             return
 
-        # Native EP owns its collectives; native TP reduces before replicated up-projection.
+        # Native EP owns its collectives; native TP reduces before replicated
+        # up-projection.
         self.native_latent_moe = (
             LatentMoELayer(
                 router=self.gate,
@@ -2763,7 +2752,8 @@ class KimiLinearMoE(nn.Module):
             or prefix_sum.shape != (hidden_states.shape[0] // 8, hidden_states.shape[1])
         ):
             raise ValueError(
-                "A residual with only this rank's rows requires matching TP8 groups and one eighth of the token rows"
+                "A residual with only this rank's rows requires matching TP8 groups "
+                "and one eighth of the token rows"
             )
         if self.mapping.attn.dp_size > 1:
             if ctx is None:
@@ -2913,7 +2903,6 @@ class KimiLinearDecoderLayer(nn.Module):
         self.mapping = mapping
         self.layer_id = layer_id
 
-        # --- attention: KDA (linear) or NoPE-MLA (full); both under "self_attn" ---
         attn_prefix = add_prefix("self_attn", prefix)
         if config.is_kda_layer(layer_id):
             self.self_attn = KimiLinearKDA(
@@ -2946,7 +2935,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 output_parallel=output_parallel,
             )
 
-        # --- FFN: dense MLP (first_k_dense_replace) or MoE block ---
         self.is_moe_layer = (
             config.num_experts is not None
             and layer_id >= config.first_k_dense_replace
@@ -2987,7 +2975,6 @@ class KimiLinearDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        # --- AttnRes modules ---
         block = config.attn_res_block_size
         self.is_block_write_layer = layer_id % block == 0
         self.block_write_idx = layer_id // block
@@ -3026,8 +3013,6 @@ class KimiLinearDecoderLayer(nn.Module):
         # True when the PREVIOUS layer precomputes our mlp-side block partial.
         self._mlp_split = False
         self._dflash_attnres_capture_fallback = False
-        # True when the NEXT layer folds our routed+shared residual accumulate
-        # into its attn-side combine (we return the parts unsummed).
         self.comm_manager = CommManager(
             mapping=mapping,
             layer_id=layer_id,
@@ -3111,7 +3096,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 out_norm=self.input_layernorm,
             )
         if self.is_block_write_layer:
-            block_residual[self.block_write_idx] = prefix_sum  # snapshot
+            block_residual[self.block_write_idx] = prefix_sum
             prefix_sum = None
         return h, prefix_sum
 
@@ -3260,7 +3245,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 prefix_sum,
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-                # ctx is required by the cross-DP-EP token gather (was missing).
                 ctx=ctx,
                 prefix_is_sharded=prefix_is_sharded,
             )
@@ -3444,7 +3428,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 combine=ar_combine,
                 producer_direct=projection_out is not None,
             )
-        # --- mlp: AttnRes mixing -> norm -> FFN -> accumulate ---
         if h_fused is not None:
             h = h_fused
         elif split_mix:
@@ -3482,11 +3465,6 @@ class KimiLinearDecoderLayer(nn.Module):
         return prefix_sum, block_residual
 
 
-# ===----------------------------------------------------------------------=== #
-# Text backbone (KimiLinear)
-# ===----------------------------------------------------------------------=== #
-
-
 class KimiLinearModel(nn.Module):
     """Kimi-K3 text transformer: embedding + hybrid decoder layers + AttnRes.
 
@@ -3516,7 +3494,8 @@ class KimiLinearModel(nn.Module):
         if shared_parallel is not None:
             initialize_shared_expert_group(shared_parallel)
             logger.info(
-                f"K3 shared-expert TP enabled: tp_size={shared_parallel.tp_size}, num_groups={shared_parallel.dp_size}"
+                f"K3 shared-expert TP enabled: tp_size={shared_parallel.tp_size}, "
+                f"num_groups={shared_parallel.dp_size}"
             )
 
         qkv_parallel, output_parallel = validate_projection_settings(
@@ -3590,7 +3569,6 @@ class KimiLinearModel(nn.Module):
 
         if mapping.is_last_pp_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            # Model-level AttnRes output mixing.
             self.output_attn_res_norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
@@ -4267,7 +4245,8 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 elif getattr(merged, "fp8_block_quant", False):
                     merged.verify_fp8_load_complete()
 
-        # Fold the AttnRes rms_w * res_w products once; the split kernels take a single wp pointer.
+        # Fold the AttnRes rms_w * res_w products once; the split kernels take a
+        # single wp pointer.
         for layer in self.model.layers:
             if not hasattr(layer, "self_attention_res_norm"):
                 continue  # PPMissingLayer
@@ -4283,11 +4262,6 @@ class KimiLinearForCausalLM(BaseCausalLM):
         for layer in self.model.layers:
             if getattr(layer, "is_moe_layer", False):
                 layer.block_sparse_moe.pack_input_projection_weights()
-
-
-# ===----------------------------------------------------------------------=== #
-# Registered multimodal wrapper
-# ===----------------------------------------------------------------------=== #
 
 
 class KimiK3ForConditionalGeneration(nn.Module):
@@ -4307,6 +4281,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         mm_attention_backend: str | None = None,
         **kwargs,
     ) -> None:
+        del prefix, kwargs
         super().__init__()
         self.config = config
         self.mapping = mapping
@@ -4388,7 +4363,8 @@ class KimiK3ForConditionalGeneration(nn.Module):
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         if self.language_model is None:
             raise AttributeError(
-                "Kimi-K3 encoder-only mode does not support EAGLE3 speculative decoding."
+                "Kimi-K3 encoder-only mode does not support EAGLE3 speculative "
+                "decoding."
             )
         self.language_model.set_eagle3_layers_to_capture(layer_ids)
 

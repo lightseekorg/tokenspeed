@@ -112,7 +112,8 @@ def test_the_device_builds_the_pd_transfer_peer_from_the_mapping(monkeypatch, ro
     monkeypatch.setattr(factory, "create_kv_transfer", fake_create)
     monkeypatch.setattr(factory, "get_kv_args", lambda *a, **kw: "kv-args")
     monkeypatch.setattr(
-        "tokenspeed.runtime.distributed.process_group_manager.process_group_manager.get_process_group",
+        "tokenspeed.runtime.distributed.process_group_manager."
+        "process_group_manager.get_process_group",
         lambda backend, group: ("gloo", group),
     )
     server_args = SimpleNamespace(

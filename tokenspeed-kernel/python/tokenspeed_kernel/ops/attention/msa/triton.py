@@ -695,8 +695,6 @@ def triton_minimax_msa_decode_with_kvcache(
     score_out: torch.Tensor | None = None,
     enable_pdl: bool = False,
 ) -> torch.Tensor:
-    """Run MiniMax sparse-attention decode over paged caches."""
-
     max_blocks = min(
         page_table.shape[1],
         (max_seqlen_k + page_size - 1) // page_size,
@@ -768,8 +766,6 @@ def triton_minimax_msa_extend_with_kvcache(
     v_scale: float | torch.Tensor | None = None,
     query_lens_cpu: Sequence[int] | None = None,
 ) -> torch.Tensor:
-    """Run MiniMax sparse-attention extend over paged caches."""
-
     max_blocks = min(
         page_table.shape[1],
         (max_seqlen_k + page_size - 1) // page_size,

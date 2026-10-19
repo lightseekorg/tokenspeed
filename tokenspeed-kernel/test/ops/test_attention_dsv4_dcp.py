@@ -64,11 +64,6 @@ SWA_ROW_BYTES = SWA_TOKEN_STRIDE + 8  # plus one FP8 scale per 64-wide nope bloc
 SWA_PAGE_BYTES = -(-PAGE_ROWS * SWA_ROW_BYTES // SWA_TOKEN_STRIDE) * SWA_TOKEN_STRIDE
 
 
-# ---------------------------------------------------------------------------
-# Virtual block translation
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("rows", [1, 64, 256])
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 @pytest.mark.parametrize("parents,packing", [(3, 1), (2, 4), (5, 2)])
@@ -173,11 +168,6 @@ def test_virtual_slot_translation_rejects_invalid_geometry():
         virtual_slots_to_local(
             slots.float(), rows_per_page=1, virtual_block_count=9, degree=1, rank=0
         )
-
-
-# ---------------------------------------------------------------------------
-# Partial normalization and the LSE merge
-# ---------------------------------------------------------------------------
 
 
 @requires_cuda
@@ -301,11 +291,6 @@ def test_weight_and_sink_reject_inconsistent_shapes():
         )
 
 
-# ---------------------------------------------------------------------------
-# Kernel capability and the no-sink LSE contract
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize(
     "traits,expected",
     [
@@ -380,7 +365,7 @@ def test_decode_refuses_a_sink_together_with_lse():
 
 
 def _page_planar_cache(pages, page_size):
-    """A random FP8 SWA-layout cache plus its BF16 row reference [pages*page_size, 512]."""
+    """A random FP8 SWA cache plus its BF16 row reference [pages*page_size, 512]."""
     assert page_size == PAGE_ROWS
     nope = torch.randn(pages, page_size, 448, device="cuda").to(torch.float8_e4m3fn)
     rope = torch.randn(pages, page_size, 64, device="cuda", dtype=torch.bfloat16)
@@ -500,11 +485,6 @@ def test_flashmla_partials_merge_to_the_full_softmax_with_empty_shards(
         global_lse[finite], expected_lse[finite], atol=1e-5, rtol=1e-5
     )
     torch.testing.assert_close(actual, expected, atol=8e-3, rtol=8e-3)
-
-
-# ---------------------------------------------------------------------------
-# Owner-only compressed cache stores
-# ---------------------------------------------------------------------------
 
 
 @requires_cuda

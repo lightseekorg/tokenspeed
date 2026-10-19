@@ -39,7 +39,7 @@ window:
 
 Causal masking only touches the few KV tiles that reach the diagonal; the long
 prefix is a mask-free fast path. Sinks and sliding windows (causal or not) are
-applied per tile. This is the sole Gluon extend implementation.
+applied per tile.
 """
 
 from __future__ import annotations
@@ -59,16 +59,6 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
 
-
-# ===-----------------------------------------------------------------------===#
-# Query-batched path
-#
-# This path tiles BLOCK_M query rows (of a single q-head) into the MFMA M
-# dimension -- like the prefill kernel -- so each paged KV tile is loaded once
-# and reused across all BLOCK_M rows. KV still comes from the paged cache
-# (decode-style async page loads). Causal masking only touches the few KV tiles
-# that reach the diagonal; the long prefix is a mask-free fast path.
-# ===-----------------------------------------------------------------------===#
 
 _EXTEND_SHORT_Q_BLOCK_M = 64
 _EXTEND_SHORT_Q_NUM_WARPS = 2
@@ -152,21 +142,18 @@ class ExtendConfig:
         )
         qk_layout = mfma_layout
         pv_layout = mfma_layout
-        # load_vec is the number of elements per lane, depends on the input dtype, same as qk_kw.
-        # load_threads is how many lanes span HEAD_DIM.
+        # 128-bit loads per lane (same as qk_kw); load_threads lanes span HEAD_DIM.
         load_vec = 16 if IS_FP8 else 8
         load_threads = HEAD_DIM // load_vec
         load_layout = gl.BlockedLayout(
             [1, load_vec], [64 // load_threads, load_threads], [NUM_WARPS, 1], [1, 0]
         )
-        # store_vec depends on the output dtype, always 16-bit regardless of input dtype, so 128 / 16 = 8.
-        # store_threads is how many lanes span HEAD_DIM.
+        # The output is always 16-bit, so a 128-bit store holds 8 elements.
         store_vec = 8
         store_threads = HEAD_DIM // store_vec
         store_layout = gl.BlockedLayout(
             [1, store_vec], [64 // store_threads, store_threads], [NUM_WARPS, 1], [1, 0]
         )
-        # Padding interval is 64 lanes * load_vec elems.
         pad_interval = 64 * load_vec
         # Empirically tuned.
         pad_k = 16 if IS_FP8 else 8
@@ -656,6 +643,12 @@ def launch_gluon_rel_mha_extend_gfx950(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Launches causal rel_mha extend attention over a paged KV cache.
+
+    ``rel_logits`` is required and indexed by ``[query row, q-head, distance]``;
+    ``cache_seqlens`` includes the new tokens. ``cu_seqlens_kv``, ``max_seqlen_k``
+    and the q/k/v scales are unused. FP8 inputs produce a bfloat16 output.
+    """
     assert rel_logits is not None
     head_dim = q.shape[2]
     n_heads = q.shape[1]

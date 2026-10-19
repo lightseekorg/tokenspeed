@@ -750,7 +750,6 @@ class ModelConfig:
         self.quantization = quantization
         self.mapping = server_args.mapping
 
-        # Parse args
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
         if override_config_file and override_config_file.strip():
@@ -865,7 +864,6 @@ class ModelConfig:
             if hasattr(self.hf_config, "text_config"):
                 self.hf_config.text_config = self.hf_text_config
 
-        # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures)
         self.is_multimodal = (
             self.model_profile.is_multimodal
@@ -928,7 +926,6 @@ class ModelConfig:
         self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
-        # Derive context length
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
@@ -943,16 +940,20 @@ class ModelConfig:
                     self.context_len = context_length
                 else:
                     raise ValueError(
-                        f"User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
-                        f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config. "
-                        f"To allow overriding this maximum, set the env var TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
+                        f"User-specified context_length ({context_length}) is "
+                        "greater than the derived context_length "
+                        f"({derived_context_len}). "
+                        "This may lead to incorrect model outputs or CUDA errors. "
+                        "Note that the derived context_length may differ from "
+                        "max_position_embeddings in the model's config. "
+                        "To allow overriding this maximum, set the env var "
+                        "TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
                     )
             else:
                 self.context_len = context_length
         else:
             self.context_len = derived_context_len
 
-        # Unify the config keys for hf_text_config
         self.head_dim = getattr(
             self.hf_text_config,
             "head_dim",
@@ -1006,7 +1007,6 @@ class ModelConfig:
             self.hf_text_config, "num_key_value_heads", None
         )
 
-        # for Dbrx and MPT models
         if self.hf_config.model_type in {"dbrx", "mpt"}:
             self.num_key_value_heads = getattr(
                 self.hf_config.attn_config, "kv_n_heads", None
@@ -1038,7 +1038,6 @@ class ModelConfig:
                     self.num_attention_layers = nextn_layers
         self.vocab_size = self.hf_text_config.vocab_size
 
-        # Verify quantization
         self._verify_quantization()
         if server_args is not None and not is_draft_worker:
             # The decode TP layouts need unquantized o_proj / down_proj; judge
@@ -1052,7 +1051,6 @@ class ModelConfig:
             # resolves to BeamForCausalLMNextN and is not asked.
             _apply_beam_moe_default(self, server_args)
 
-        # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
         self.image_token_id = getattr(self.hf_config, "image_token_id", None)
 
@@ -1131,12 +1129,10 @@ class ModelConfig:
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
 
-        # Parse quantization method from the HF model config, if available.
         quant_cfg = self._parse_quant_hf_config()
 
         if quant_cfg is not None:
             quant_method = quant_cfg.get("quant_method", "").lower()
-            # Detect which checkpoint is it
             for _, method in QUANTIZATION_METHODS.items():
                 quantization_override = method.override_quantization_method(
                     quant_cfg, self.quantization
@@ -1146,7 +1142,6 @@ class ModelConfig:
                     self.quantization = quantization_override
                     break
 
-            # Verify quantization configurations.
             if self.quantization is None:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
@@ -1267,7 +1262,6 @@ def _get_and_verify_dtype(
     else:
         raise ValueError(f"Unknown dtype: {dtype}")
 
-    # Verify the dtype.
     if torch_dtype != config_dtype:
         if torch_dtype == torch.float32:
             # Upcasting to float32 is allowed.

@@ -28,10 +28,6 @@ from typing import NamedTuple
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
 
-# ===-----------------------------------------------------------------------===#
-# Kernel Config
-# ===-----------------------------------------------------------------------===#
-
 
 @gluon.aggregate
 class AttentionConfig:
@@ -113,11 +109,6 @@ class AttentionConfig:
         self.p_layout = gl.constexpr(
             gl.DotOperandLayout(0, self.pv_layout, pv_operand_width)
         )
-
-
-# ===-----------------------------------------------------------------------===#
-# Kernel Program
-# ===-----------------------------------------------------------------------===#
 
 
 @gluon.jit

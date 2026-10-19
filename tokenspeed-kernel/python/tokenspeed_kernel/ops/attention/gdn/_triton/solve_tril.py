@@ -22,9 +22,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# -*- coding: utf-8 -*-
-
-
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.gdn._triton.index import prepare_chunk_indices
@@ -411,12 +408,12 @@ def solve_tril(
     output_dtype: torch.dtype = torch.float,
 ) -> torch.Tensor:
     """
-    Compute the inverse of the lower triangular matrix
+    Compute the inverse of ``I + A``.
     A should be strictly lower triangular, i.e., A.triu() == 0.
 
     Args:
         A (torch.Tensor):
-            [B, T, H, K]
+            [B, T, H, BT] with BT in {16, 32, 64}.
         cu_seqlens (torch.Tensor):
             The cumulative sequence lengths of the input tensor.
             Default: None.

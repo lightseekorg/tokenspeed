@@ -134,7 +134,7 @@ def multimem_stage(
 
     Returns:
         A ``[rows, width]`` view of the symmetric buffer (valid until the next
-        stage of the same width), or None when multimem is unavailable — the
+        stage of the same width), or None when it cannot be staged — the
         caller falls back to its ordinary reduction path. Callers must keep
         their capacity history rank-lockstep: growth is a collective.
     """

@@ -44,11 +44,6 @@ _GFX950_SM_COUNT = 256
 _SLIDING_SPLIT_COUNTERS: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
 
-# ===-----------------------------------------------------------------------===#
-# Kernel Config
-# ===-----------------------------------------------------------------------===#
-
-
 @gluon.aggregate
 class AttentionConfig:
     SM_SCALE: gl.constexpr
@@ -155,11 +150,6 @@ class AttentionConfig:
         self.reduce_layout = gl.constexpr(reduce_layout)
         self.k_smem_layout = gl.constexpr(k_smem_layout)
         self.v_smem_layout = gl.constexpr(v_smem_layout)
-
-
-# ===-----------------------------------------------------------------------===#
-# Kernel Program
-# ===-----------------------------------------------------------------------===#
 
 
 @gluon.aggregate
@@ -549,11 +539,6 @@ class AttentionProgram:
             gl.store(counters_ptr + counter_offset, 0)
 
 
-# ===-----------------------------------------------------------------------===#
-# Entry Point
-# ===-----------------------------------------------------------------------===#
-
-
 @gluon.jit
 def gluon_mha_decode_gfx950(
     q_ptr,
@@ -874,7 +859,6 @@ def gluon_mha_decode_reduce_gfx950(
     split_end_raw = split_end_page * cfg.PAGE_SIZE
     split_end_tok = gl.where(split_end_raw < cache_len, split_end_raw, cache_len)
     split_valid = (split_start_tok < split_end_tok) & (offs_s < cfg.NUM_KV_SPLITS)
-    # Load every split's partial output and lse.
     base = (q_index * cfg.NUM_Q_HEADS + q_head) * cfg.NUM_KV_SPLITS + offs_s
     part_lse = gl.load(mid_lse_ptr + base, mask=split_valid, other=-float("inf"))
     o_off = base[:, None] * cfg.HEAD_DIM + offs_d[None, :]

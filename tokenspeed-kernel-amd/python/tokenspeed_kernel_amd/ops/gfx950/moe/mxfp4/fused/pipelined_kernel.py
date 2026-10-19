@@ -655,7 +655,6 @@ def _run_moe_tile_ncontig_w(
 
 @gluon.jit
 def _pipelined_moe_tile_compute(
-    # Tensors --------------------------------------------------------
     x_ptr,
     w_ptr,
     x_scale_ptr,

@@ -83,8 +83,7 @@ def packed_mla_decode_op(q, kv_cache, page_table, max_seqlen_k):
     Inputs are the absorbed query [B,1,H,576], packed cache [P,S,1,576],
     int32 page table [B,N], and the maximum context bound. Returning None
     preserves native FIA. Selection depends only on operator capabilities and
-    input geometry.
-    This predicate inspects metadata only, never device tensor contents.
+    input geometry, never device tensor contents.
     """
     if (
         q.ndim != 4

@@ -33,10 +33,6 @@ from tokenspeed_kernel.numerics.inputs import (
 from tokenspeed_kernel.numerics.tolerance import Tolerance, set_family_tolerance
 from tokenspeed_kernel.signature import TensorFormat
 
-# ---------------------------------------------------------------------------
-# Tolerance
-# ---------------------------------------------------------------------------
-
 _ATOL = {
     torch.float32: 1e-5,
     # bf16/fp16: error is dominated by the output cast (~1 ulp_rel = 2^-7 ≈ 8e-3
@@ -97,10 +93,6 @@ def tolerance(
 
 
 set_family_tolerance("gemm", tolerance)
-
-# ---------------------------------------------------------------------------
-# Input Generator
-# ---------------------------------------------------------------------------
 
 
 class GemmInputGenerator(InputGenerator):
@@ -319,10 +311,6 @@ class BmmInputGenerator(GemmInputGenerator):
 
 set_input_generator("gemm", "mm", GemmInputGenerator)
 set_input_generator("gemm", "bmm", BmmInputGenerator)
-
-# ---------------------------------------------------------------------------
-# Shape Presets
-# ---------------------------------------------------------------------------
 
 
 GEMM_MM_STANDARD_SHAPES: list[dict[str, int]] = [

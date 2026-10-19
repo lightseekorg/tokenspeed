@@ -212,6 +212,11 @@ class PooledSamplingBackend(SamplingBackend):
         bs: int,
         request_pool_indices: list[int] | None = None,
     ) -> None:
+        """Refills the persistent coin buffers outside the captured graph.
+
+        request_pool_indices=None is the capture/warm-up path, which uses the
+        capture generator; otherwise each row uses its slot's CPU generator.
+        """
         if bs <= 0:
             return
 

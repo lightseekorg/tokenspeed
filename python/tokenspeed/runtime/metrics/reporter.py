@@ -136,7 +136,6 @@ class Metric:
         self._last_gauge_emit_at = now
 
     def observe(self, value: float) -> None:
-        """Record one histogram observation."""
         self._check_operation("observe")
         if self._prometheus_metric is not None:
             self._prometheus_metric.observe(value)

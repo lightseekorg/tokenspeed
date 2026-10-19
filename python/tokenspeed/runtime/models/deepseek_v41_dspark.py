@@ -354,7 +354,10 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         return _norm(projected, self.main_norm)
 
     def _main_kv(self, attention, kv, positions):
-        """Reference chain for one stage's context rows: kv_norm, RoPE, FP8 round trip."""
+        """Reference chain for one stage's context rows.
+
+        Applies kv_norm, RoPE, and the FP8 round trip.
+        """
         return _quantized_kv(
             attention.rotary_emb(_norm(kv, attention.kv_norm), positions, False)
         )

@@ -41,7 +41,7 @@ def _definition(file, name):
     path = _SOURCE / file
     node = next(
         n
-        for n in ast.parse(path.read_text()).body
+        for n in ast.parse(path.read_text(encoding="utf-8")).body
         if isinstance(n, ast.FunctionDef) and n.name == name
     )
     node.decorator_list = []

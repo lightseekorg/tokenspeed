@@ -658,7 +658,8 @@ class TestKdaBackendPolicy:
                     ),
                 ),
                 mock.patch(
-                    "tokenspeed_kernel.ops.attention.kda.cute_dsl.cutedsl_kda_supported",
+                    "tokenspeed_kernel.ops.attention.kda.cute_dsl."
+                    "cutedsl_kda_supported",
                     return_value=cute_supported,
                 ) as supports_cute,
             ):

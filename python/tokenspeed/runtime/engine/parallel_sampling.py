@@ -89,8 +89,8 @@ def prepare_parallel_sampling_replica(
 
     Mutates ``tmp_obj`` to receive a fresh rid; returns a copy of
     ``tokenized_obj`` sharing that rid. Each replica gets its own
-    ``sampling_params`` with a per-replica seed; the rest of the payload
-    is shared.
+    ``sampling_params`` with a per-replica seed and its own multimodal
+    inputs; the rest of the payload is shared.
     """
     tokenized_copy = copy.copy(tokenized_obj)
     _own_multimodal_inputs(tokenized_copy)

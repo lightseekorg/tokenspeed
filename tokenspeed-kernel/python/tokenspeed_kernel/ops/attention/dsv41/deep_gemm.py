@@ -131,7 +131,8 @@ def _paged_scores(
 ):
     if cache.stride(0) >= 2**31 or cache.stride(0) % 16 or cache.data_ptr() % 16:
         raise ValueError(
-            "DeepGEMM packed pages require aligned sub-2GiB strides; use the portable solution"
+            "DeepGEMM packed pages require aligned sub-2GiB strides; "
+            "use the portable solution"
         )
     if queries[0].shape[0] == 0:
         return (
@@ -507,7 +508,8 @@ def _hopper_paged_scores(
 ):
     if cache.stride(0) >= 2**31 or cache.stride(0) % 16 or cache.data_ptr() % 16:
         raise ValueError(
-            "DeepGEMM packed pages require aligned sub-2GiB strides; use the portable solution"
+            "DeepGEMM packed pages require aligned sub-2GiB strides; "
+            "use the portable solution"
         )
     if queries[0].shape[0] == 0:
         return torch.zeros((0, capacity), dtype=torch.float32, device=cache.device)

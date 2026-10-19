@@ -66,7 +66,8 @@ def tree_window_attention(
             dtype. ``head_dim`` equals ``key_dim`` (GQA), or is narrower (MLA:
             the value is the key row's leading latent and the remaining
             ``key_dim - head_dim`` key channels are its rotary part).
-        page_table: ``[bs, max_pages]`` int32 page ids; slot = page * page_size + offset.
+        page_table: ``[bs, max_pages]`` int32 page ids; slot = page * page_size
+            + offset.
         seq_lens: ``[bs]`` int32 keys per request, the window included (>= window).
         mask: ``[bs * rows_per_req]`` int64 window visibility per query row.
         prefix_out: ``[bs * rows_per_req, num_q_heads, head_dim]`` causal prefix output.

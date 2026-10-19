@@ -1289,18 +1289,10 @@ class TestReplayStateTapeGPUTest:
             ref_in = torch.where(rows[:, 0] > 0, rows[:, 0], rows[:, 1])
             state_in = md.state_in_blocks_by_group[gid]
             state_out = md.state_out_blocks_by_group[gid]
-            _pytest_expr_1 = torch.equal(state_in[:real_bs], ref_in)
-            _pytest_msg_2 = gid
-            assert _pytest_expr_1, _pytest_msg_2
-            _pytest_expr_3 = torch.equal(state_out[:real_bs], rows[:, 1])
-            _pytest_msg_4 = gid
-            assert _pytest_expr_3, _pytest_msg_4
-            _pytest_expr_5 = (state_in[real_bs:] == -1).all()
-            _pytest_msg_6 = gid
-            assert _pytest_expr_5, _pytest_msg_6
-            _pytest_expr_7 = (state_out[real_bs:] == -1).all()
-            _pytest_msg_8 = gid
-            assert _pytest_expr_7, _pytest_msg_8
+            assert torch.equal(state_in[:real_bs], ref_in), gid
+            assert torch.equal(state_out[:real_bs], rows[:, 1]), gid
+            assert (state_in[real_bs:] == -1).all(), gid
+            assert (state_out[real_bs:] == -1).all(), gid
 
     def test_tape_and_eager_fallback_match_the_two_slot_reference(self):
         import torch
@@ -1311,10 +1303,7 @@ class TestReplayStateTapeGPUTest:
         for num_groups, taped in ((1, True), (5, True), (8, True), (9, False)):
             backend = self._backend(num_groups, bs=160)
             self._refresh(backend, num_groups, bs=160, real_bs=150)
-            _pytest_first_9 = bool(backend._replay_state_tapes)
-            _pytest_second_10 = taped
-            _pytest_msg_11 = num_groups
-            assert _pytest_first_9 == _pytest_second_10, _pytest_msg_11
+            assert bool(backend._replay_state_tapes) == taped, num_groups
 
     def test_rebuilt_graph_state_drops_tapes_bound_to_the_old_buffers(self):
         import torch

@@ -401,7 +401,8 @@ def _check_tree_parents(x: torch.Tensor, parent_indices: torch.Tensor | None) ->
     batch, steps = x.shape[:2]
     if steps > 64:
         raise ValueError(
-            f"a draft tree holds at most 64 tokens (a 64-bit ancestor mask), got {steps}"
+            "a draft tree holds at most 64 tokens (a 64-bit ancestor mask), "
+            f"got {steps}"
         )
     if (
         parent_indices.shape != (batch, steps)

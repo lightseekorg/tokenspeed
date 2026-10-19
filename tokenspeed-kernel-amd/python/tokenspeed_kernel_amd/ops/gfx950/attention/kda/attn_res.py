@@ -217,7 +217,13 @@ def attn_res_rmsnorm_gfx950(
     delta: torch.Tensor | None = None,
     block_write_idx: int = -1,
 ) -> torch.Tensor:
-    """Mix AttnRes candidates and apply the following RMSNorm in one launch."""
+    """Mix AttnRes candidates and apply the following RMSNorm in one launch.
+
+    ``layer_residual`` is BF16 ``[T, H]`` with H in {4096, 5120, 6144, 7168,
+    8192} and is updated in place when ``delta`` is given; ``block_residual`` is
+    token-major ``[T, blocks, H]``. At most 11 blocks are mixed, and a
+    non-negative ``block_write_idx`` must equal ``num_valid_blocks``.
+    """
     tokens, hidden = layer_residual.shape
     if layer_residual.dtype != torch.bfloat16 or hidden not in {
         4096,

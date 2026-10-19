@@ -117,7 +117,7 @@ class Engine(EngineBase):
 
     Note:
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
-    2. Inter-process communication is done through ICP (each process uses a different port) via the ZMQ library.
+    2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
 
     def __init__(self, **kwargs):
@@ -126,24 +126,19 @@ class Engine(EngineBase):
         Please refer to `ServerArgs` for the documentation.
         """
         if "server_args" in kwargs:
-            # Directly load server_args
             server_args = kwargs["server_args"]
         else:
-            # Construct server_args from kwargs
             if "log_level" not in kwargs:
                 # Do not print logs by default
                 kwargs["log_level"] = "error"
             server_args = ServerArgs(**kwargs)
 
         self.server_args = server_args
-        # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
-        # Allocate ports for inter-process communications
         self.port_args = PortArgs.init_new(server_args)
         logger.info(f"server_args={server_args!r}")
 
-        # Launch subprocesses
         try:
             tokenizer_manager, _, scheduler_info = _launch_subprocesses(
                 server_args=server_args,
@@ -461,7 +456,7 @@ class Engine(EngineBase):
         load_format: str | None = None,
         flush_cache: bool = True,
     ):
-        """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
+        """Update weights from in-memory tensors. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=[
@@ -524,7 +519,8 @@ def _set_socket_interface(server_args: ServerArgs):
     if interface is None:
         logger.warning(
             f"cannot tell which interface reaches the head node {head}; set "
-            "GLOO_SOCKET_IFNAME and NCCL_SOCKET_IFNAME explicitly if cross-node setup fails"
+            "GLOO_SOCKET_IFNAME and NCCL_SOCKET_IFNAME explicitly if cross-node "
+            "setup fails"
         )
         return
 
@@ -544,7 +540,6 @@ def _force_env(owner: str, key: str, value: str) -> None:
 
 
 def _set_envs_and_config(server_args: ServerArgs):
-    # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     if server_args.disable_symm_mem:
         os.environ["NCCL_CUMEM_ENABLE"] = "0"
@@ -596,11 +591,9 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     _set_socket_interface(server_args)
 
-    # Set prometheus env vars
     if metrics_enabled(server_args, "prometheus"):
         set_prometheus_multiproc_dir()
 
-    # Set ulimit
     set_ulimit()
 
     # Install a launch-phase SIGQUIT handler so a failing child tears down the
@@ -615,7 +608,6 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
 
-    # Set mp start method
     mp.set_start_method("spawn", force=True)
 
 
@@ -633,12 +625,10 @@ def _launch_subprocesses(
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """
-    # Configure global environment
     configure_logger(server_args)
     _set_envs_and_config(server_args)
     metrics_service.prepare(server_args)
 
-    # Allocate ports for inter-process communications
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
         logger.info(f"server_args={server_args!r}")

@@ -102,7 +102,8 @@ class Mamba2AttnBackend(CapacityPrefillBackend):
                 f"the Mamba2 state update does not clamp dt; got {mamba2.dt_limit}"
             )
         self._chunk_size = mamba2.chunk_size
-        # Every layer of a forward passes the same fresh host bounds tensor; keep its plan.
+        # Every layer of a forward passes the same fresh host bounds tensor;
+        # keep its plan.
         self._chunk_plans: deque[tuple[torch.Tensor, Mamba2ChunkMetadata]] = deque(
             maxlen=1
         )

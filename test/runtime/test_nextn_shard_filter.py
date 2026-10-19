@@ -40,7 +40,9 @@ class TestFilterDuplicateSafetensorsFiles:
                 with open(path, "wb"):
                     pass
             with open(
-                os.path.join(tmpdir, "model.safetensors.index.json"), "w"
+                os.path.join(tmpdir, "model.safetensors.index.json"),
+                "w",
+                encoding="utf-8",
             ) as index:
                 json.dump(
                     {"weight_map": {"model.weight": os.path.basename(shard)}}, index
@@ -58,7 +60,7 @@ class TestFilterDuplicateSafetensorsFiles:
 class TestFilterSafetensorsFilesByWeightNames:
     def _write_index(self, tmpdir, weight_map):
         index_path = os.path.join(tmpdir, "model.safetensors.index.json")
-        with open(index_path, "w") as f:
+        with open(index_path, "w", encoding="utf-8") as f:
             json.dump({"weight_map": weight_map}, f)
         return index_path
 
@@ -127,7 +129,11 @@ class TestLoaderSkipsFilteredShards:
                 {"model.mtp.fc.weight": torch.zeros(2)},
                 os.path.join(tmpdir, "model-00002-of-00002.safetensors"),
             )
-            with open(os.path.join(tmpdir, "model.safetensors.index.json"), "w") as f:
+            with open(
+                os.path.join(tmpdir, "model.safetensors.index.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
                 json.dump(
                     {
                         "weight_map": {

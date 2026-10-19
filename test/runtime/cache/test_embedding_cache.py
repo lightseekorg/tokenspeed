@@ -33,9 +33,6 @@ from tokenspeed.runtime.cache.embedding_cache import (
 )
 
 
-# --------------------------------------------------------------------------- #
-# EmbeddingCache
-# --------------------------------------------------------------------------- #
 def test_cache_hit_miss_and_counters():
     c = EmbeddingCache(capacity_bytes=1000)
     assert c.get("a") is None
@@ -69,13 +66,8 @@ def test_cache_skips_item_larger_than_capacity():
     assert c.current_bytes == 10
 
 
-# --------------------------------------------------------------------------- #
-# TieredEmbeddingCache (L1 VRAM + L2 host DRAM)
-#
-# Inject identity / tagging copy functions so the tiering logic is exercised
-# without a GPU (the production defaults call .cpu()/.to(device) on real
-# tensors). Sizes are tiny so eviction is easy to drive.
-# --------------------------------------------------------------------------- #
+# Identity copy functions exercise the tiering logic without a GPU (the
+# production defaults call .cpu()/.to(device) on real tensors).
 def _tiered(l1, l2, *, to_host=lambda v: v, to_device=lambda v: v):
     return TieredEmbeddingCache(l1, l2, to_host=to_host, to_device=to_device)
 

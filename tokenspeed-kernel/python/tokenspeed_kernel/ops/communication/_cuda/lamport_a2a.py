@@ -60,7 +60,8 @@ class TokenSpeedA2ALamportState:
         )
         if any(contract != contracts[0] for contract in contracts):
             raise ValueError(
-                "A2A requires one host and identical capacity, channels, and grid on all ranks"
+                "A2A requires one host and identical capacity, channels, and grid "
+                "on all ranks"
             )
         self.tp_size = group.size()
         if (
@@ -159,7 +160,8 @@ class TokenSpeedA2ALamportState:
             raise ValueError("All A2A peers must agree on the chunk threshold")
         if threshold_bytes <= 0 or self.channels % (8 * self.tp_size):
             raise ValueError(
-                "Chunk exchange requires a positive threshold and eight-BF16-aligned shards"
+                "Chunk exchange requires a positive threshold and "
+                "eight-BF16-aligned shards"
             )
         if self.chunk_threshold_bytes is not None:
             if self.chunk_threshold_bytes != threshold_bytes:

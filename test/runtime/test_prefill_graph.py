@@ -454,7 +454,6 @@ class TestDummyGroupTablesTest:
             specs=(
                 _spec("full_attention", block_granularity=64),
                 _spec("sliding_attention", block_granularity=64),
-                # state: included
                 _spec("linear_attention", attn_kind="state"),
             )
         )

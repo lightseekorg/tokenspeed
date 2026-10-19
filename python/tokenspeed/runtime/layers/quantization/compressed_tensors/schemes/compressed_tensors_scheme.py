@@ -39,17 +39,11 @@ class CompressedTensorsScheme(ABC):
     @classmethod
     @abstractmethod
     def get_min_capability(cls) -> int:
-        """
-        Get minimum device capability.
-        """
         raise NotImplementedError
 
     @abstractmethod
     def create_weights(self, *args, **kwargs):
-        """
-        Weight creation for the particular scheme. Inputs to this function
-
-        """
+        """Create the weights for the particular scheme."""
         raise NotImplementedError
 
     @abstractmethod

@@ -90,7 +90,7 @@ def _serve_server(log_path: Path) -> subprocess.Popen:
         "--trust-remote-code",
     ]
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_f = log_path.open("w")
+    log_f = log_path.open("w", encoding="utf-8")
     proc = subprocess.Popen(
         cmd,
         stdout=log_f,
@@ -143,8 +143,8 @@ class TestQwen35VlmE2E:
                     if log_path.exists()
                     else ""
                 )
-                _pytest_msg_3 = f"server did not become ready; log tail:\n{tail}"
-                assert False, _pytest_msg_3
+                msg = f"server did not become ready; log tail:\n{tail}"
+                assert False, msg
 
             payload = {
                 "model": SERVED_MODEL_NAME,
@@ -182,9 +182,9 @@ class TestQwen35VlmE2E:
             resp.raise_for_status()
             data = resp.json()
             content = data["choices"][0]["message"].get("content") or ""
-            _pytest_expr_1 = content.strip()
-            _pytest_msg_2 = f"empty VLM response: {data}"
-            assert _pytest_expr_1, _pytest_msg_2
+            stripped = content.strip()
+            msg = f"empty VLM response: {data}"
+            assert stripped, msg
             assert (data.get("usage", {}).get("prompt_tokens", 0)) > (0)
         finally:
             from tokenspeed.runtime.utils.process import kill_process_tree

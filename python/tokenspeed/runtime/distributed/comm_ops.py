@@ -20,8 +20,8 @@
 
 """Communication ops for distributed communication.
 
-All ops require explicit group (tuple of ranks) and rank parameters.
-Groups are looked up from pg_manager internally via comm_backend.
+All ops take an explicit group (tuple of ranks); process groups are looked up
+from pg_manager.
 """
 
 from dataclasses import dataclass
@@ -64,11 +64,6 @@ if TYPE_CHECKING:
 
 def _get_process_group(group: Group):
     return pg_manager.get_device_process_group(group)
-
-
-# ---------------------------------------------------------------------------
-# Fusion parameters
-# ---------------------------------------------------------------------------
 
 
 class FusionOp(IntEnum):
@@ -118,11 +113,6 @@ class FusionParams:
     trigger_completion_at_end: bool = False
     fp32_acc: bool = False
     max_sm_to_use: int | None = None
-
-
-# ---------------------------------------------------------------------------
-# Basic primitives
-# ---------------------------------------------------------------------------
 
 
 def prepare_projection_collectives(
@@ -575,11 +565,6 @@ def all_to_all_head_scatter(
     return received.view(rows_full, heads_local, dim)
 
 
-# ---------------------------------------------------------------------------
-# Fused ops (comm + residual + norm)
-# ---------------------------------------------------------------------------
-
-
 def fused_all_reduce(
     tensor: torch.Tensor,
     rank: int,
@@ -685,10 +670,6 @@ def fused_all_gather(
         f"Unsupported fusion_op {fusion_params.fusion_op} for fused_all_gather"
     )
 
-
-# ---------------------------------------------------------------------------
-# Token-aware ops (uneven token distribution via TritonRSAG)
-# ---------------------------------------------------------------------------
 
 # The wire alignment of a byte-preserving row gather: the low-latency
 # all-gather moves 16-byte vectors, so every rank's payload must be a

@@ -85,7 +85,6 @@ def chunk_fwd_kernel_o(
         i_tg = i_b * NT + i_t
         bos, eos = i_b * T, i_b * T + T
 
-    # offset calculation
     q += (bos * Hg + i_h // (H // Hg)) * K
     k += (bos * Hg + i_h // (H // Hg)) * K
     v += (bos * H + i_h) * V

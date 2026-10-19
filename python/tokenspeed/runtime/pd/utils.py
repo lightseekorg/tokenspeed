@@ -34,7 +34,6 @@ import torch.distributed as dist
 
 from tokenspeed.runtime.utils import get_colorful_logger
 
-# env var for testing failure, convert to float explicitly
 FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 logger = get_colorful_logger(__name__)
 
@@ -48,8 +47,6 @@ class DisaggregationMode(Enum):
 
 class FastQueue:
     class Empty(Exception):
-        """Exception raised when the queue is empty."""
-
         pass
 
     def __init__(self):
@@ -142,9 +139,10 @@ class StepCounter:
 
     @classmethod
     def is_step_ready(cls, current_step: int, target_step: int) -> bool:
-        # because COUNT_NUM_MAX is very large, we can make sure that if diff is > COUNT_NUM_MAX / 2 means the flush is finished
-        # and if the current_sent_count == task_stop_count also means the flush is not finished
-        # so if current_sent_count != task_stop_count and diff < COUNT_NUM_MAX / 2, the flush is not finished
+        # Steps wrap modulo COUNT_NUM_MAX, which is very large, so a forward
+        # distance from current to target above COUNT_NUM_MAX / 2 means the
+        # target is behind the current step and its flush is finished. Equal
+        # steps mean the flush is not finished.
         return (
             target_step != current_step
             and (target_step + cls.COUNT_NUM_MAX - current_step) % cls.COUNT_NUM_MAX
@@ -152,12 +150,11 @@ class StepCounter:
         )
 
     def __init__(self, device: str, gpu_id: int):
-        # utilities for cache step
+        del device
         self.d_ready_cache_step = torch.tensor(0, dtype=torch.int64).cuda(gpu_id)
         self.h_ready_cache_step = torch.tensor(0, dtype=torch.int64, pin_memory=True)
         self.cache_step: int = 0
 
-        # utilities for aux step
         self.d_ready_aux_step = torch.tensor(0, dtype=torch.int64).cuda(gpu_id)
         self.h_ready_aux_step = torch.tensor(0, dtype=torch.int64, pin_memory=True)
         self.aux_step: int = 0

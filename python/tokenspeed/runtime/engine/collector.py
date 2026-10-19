@@ -124,6 +124,7 @@ class RequestOutputCollector:
     def _merge_meta_info_into(
         self, pending: dict[str, Any], output: dict[str, Any]
     ) -> None:
+        """Logprob lists are appended; every other key takes the latest value."""
         for key, value in output.items():
             if key == "id":
                 existing = pending.get("id")
@@ -140,6 +141,10 @@ class RequestOutputCollector:
             pending[key] = value
 
     def _extend_sequence(self, container: dict[str, Any], key: str, value: Any) -> None:
+        """Appends ``value`` to ``container[key]``, keeping populated values.
+
+        None and empty follow-up values leave an existing sequence unchanged.
+        """
         if value is None:
             return
         existing = container.get(key)

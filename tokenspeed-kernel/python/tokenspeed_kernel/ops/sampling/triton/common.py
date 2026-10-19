@@ -113,7 +113,6 @@ def gather_and_expand_scalars(
     load/store paths are dead-code-eliminated.
 
     Args:
-        ...
         enable_pdl: whether to use Programmatic Dependent Launch. ``None`` uses
             the global platform default. Lets downstream flashinfer
             softmax/renorm kernels start their preamble while our writes drain.

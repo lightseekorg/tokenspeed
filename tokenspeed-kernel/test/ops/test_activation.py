@@ -112,9 +112,9 @@ def test_sigmoid_mul_strided_gate_from_qkv_split(
     q_size = num_heads * head_dim
     kv_size = num_kv_heads * head_dim
     qkv = torch.randn(num_tokens, 2 * q_size + 2 * kv_size, device=device, dtype=dtype)
-    q_gate, _k, _v = qkv.split([2 * q_size, kv_size, kv_size], dim=-1)
+    q_gate, _, _ = qkv.split([2 * q_size, kv_size, kv_size], dim=-1)
     q_gate = q_gate.view(num_tokens, num_heads, 2 * head_dim)
-    _q, gate = torch.chunk(q_gate, 2, dim=-1)
+    _, gate = torch.chunk(q_gate, 2, dim=-1)
     # Lock in the production-shape stride: row stride is the full qkv width.
     assert not gate.is_contiguous()
     assert gate.stride(0) == 2 * q_size + 2 * kv_size
@@ -231,9 +231,6 @@ def test_sigmoid_mul_rejects_bad_head_bias(
         sigmoid_mul(x, gate, head_bias=bias)
 
 
-# --- silu_and_mul tests ---
-
-
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("shape", [(1, 7168 * 2), (17, 1024), (128, 9216 * 2)])
 def test_silu_and_mul_matches_eager(
@@ -287,9 +284,6 @@ def test_swiglu_oai_matches_reference(dtype: torch.dtype, device: str) -> None:
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
-# --- situ_and_mul tests ---
-
-
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_tokens", [1, 17, 128])
 @pytest.mark.parametrize("linear_beta", [None, 25.0])
@@ -334,9 +328,6 @@ def test_situ_and_mul_rejects_invalid_beta(device: str) -> None:
     x = torch.randn(1, 64, device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="beta must be positive"):
         situ_and_mul(x, beta=0.0)
-
-
-# --- fused_gate_sigmoid_mul_add tests ---
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -432,9 +423,6 @@ def test_situ_and_mul_preallocated_out(device: str) -> None:
         )
 
 
-# --- fused_swiglu_fp8_ue8m0 tests ---
-
-
 def _unpack_ue8m0(packed: torch.Tensor, num_groups: int) -> torch.Tensor:
     bytes_ = torch.stack(
         [(packed >> (8 * i)) & 0xFF for i in range(4)], dim=-1
@@ -495,7 +483,8 @@ def test_relu2_matches_eager(shape: tuple[int, int], pdl: bool, device: str) -> 
 @pytest.mark.skipif(not platform.is_nvidia, reason="requires float8_e4m3fn CUDA")
 @pytest.mark.parametrize("pdl", [False, True])
 def test_relu2_fp8_quantizes_the_bf16_square(pdl: bool, device: str) -> None:
-    """Bit-identical to the BF16 activation followed by the linear's static quantization."""
+    """Bit-identical to the BF16 activation followed by the linear's static
+    quantization."""
     if pdl and not platform.is_hopper_plus:
         pytest.skip("PDL requires NVIDIA SM90+")
     pdl_enabled(overwrite=pdl)

@@ -72,8 +72,6 @@ class OrdinaryRecipe(CacheRecipe):
         super().__init__(**kwargs)
         self.family = family
 
-    # ---- layer vocabulary ----
-
     @cached_property
     def group_ids(self) -> tuple[str, ...]:
         ids = _config_group_ids(self.attn_config, self.num_target_layers)
@@ -153,8 +151,6 @@ class OrdinaryRecipe(CacheRecipe):
             )
         return capacity
 
-    # ---- geometry ----
-
     @property
     @override
     def alignment(self) -> int:
@@ -172,8 +168,6 @@ class OrdinaryRecipe(CacheRecipe):
     def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
         """One CacheBlock per parent: the block span is the identity grain."""
         return {spec.group_id: 1 for spec, _ in groups}
-
-    # ---- fields ----
 
     @override
     def fields_for_layer(

@@ -197,7 +197,7 @@ def _host_identity() -> int:
     name = ""
     for path in ("/proc/sys/kernel/random/boot_id", "/etc/machine-id"):
         try:
-            name = Path(path).read_text().strip()
+            name = Path(path).read_text(encoding="utf-8").strip()
         except OSError:
             continue
         if name:

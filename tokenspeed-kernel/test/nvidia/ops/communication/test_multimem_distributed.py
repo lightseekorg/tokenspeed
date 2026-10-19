@@ -220,8 +220,9 @@ def test_stage_refuses_unsupported_tensors():
     from tokenspeed_kernel.ops.communication.multimem import multimem_stage
 
     _, dev = _setup()
-    _require_multimem()  # None-returns below must come from validation, not
-    # from multimem being unavailable altogether.
+    # None-returns below must come from validation, not from multimem being
+    # unavailable altogether.
+    _require_multimem()
     name = _group_name()
     cpu = torch.randn(4, LATENT, dtype=torch.bfloat16, device="cpu")
     assert multimem_stage(cpu, name) is None, "CPU tensor must be refused"

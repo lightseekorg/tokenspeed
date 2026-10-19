@@ -1,7 +1,7 @@
 """Regression: max_new_tokens must always resolve to a finite cap bounded by
 the remaining context window — even when the caller omits it.
 
-Root cause context (dashllm1.log, DP4+EP4 Qwen3.5-397B, MTP, CUDA graph ON):
+Root cause context (DP4+EP4 Qwen3.5-397B, MTP, CUDA graph ON):
 both ``Req.check_finished`` and ``RequestState.check_finished`` decide the
 length stop via ``len(output_ids) >= sampling_params.max_new_tokens``. When a
 request arrives with ``max_new_tokens`` unset, that field stayed ``None`` all

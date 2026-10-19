@@ -60,6 +60,7 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        del input_size, output_size, params_dtype
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.logical_widths = output_partition_sizes
@@ -97,7 +98,8 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
             weight_scale.weight_loader = weight_loader
         layer.register_parameter("weight_scale", weight_scale)
 
-        # Per-tensor scales: scalar per partition, use needs_scalar_to_array for fused loading
+        # Per-tensor scales: scalar per partition, use needs_scalar_to_array for
+        # fused loading.
         input_scale = Parameter(
             torch.full(
                 (len(output_partition_sizes),),
@@ -128,7 +130,8 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
         """Compute alpha and input_scale_inv, swizzle block scales."""
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"[FP4_DENSE_POSTLOAD] w={layer.weight.shape!s}({layer.weight.dtype!s}) "
+                f"[FP4_DENSE_POSTLOAD] w={layer.weight.shape!s}"
+                f"({layer.weight.dtype!s}) "
                 f"ws={layer.weight_scale.shape!s} is={layer.input_scale!s} "
                 f"ws2={layer.weight_scale_2!s}"
             )
@@ -169,7 +172,6 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
             del layer.weight
             del layer.weight_scale
         else:
-            # Swizzle block scales for CUTLASS
             layer.weight_scale_interleaved = Parameter(
                 swizzle_blockscale_2d(layer.weight_scale),
                 requires_grad=False,
@@ -234,6 +236,7 @@ class Nvfp4W4A16LinearMethod(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        del input_size, output_size, params_dtype
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.logical_widths = output_partition_sizes
@@ -314,11 +317,6 @@ class Nvfp4W4A16LinearMethod(QuantizeMethodBase):
             quant="nvfp4_a16",
             override=layer.override_kernel_name,
         )
-
-
-# -------------------------------------------------------------------------
-# Utilities for FP4 linear method
-# -------------------------------------------------------------------------
 
 
 def swizzle_blockscale_2d(scales):

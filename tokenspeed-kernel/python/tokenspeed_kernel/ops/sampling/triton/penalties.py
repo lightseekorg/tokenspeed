@@ -120,7 +120,8 @@ def apply_penalties_logit_bias_inplace(
     if counts.shape[1] < vocab_size or logit_bias.shape[1] < vocab_size:
         raise ValueError(
             "counts/logit_bias vocab dimension must cover logits vocab, "
-            f"got counts={counts.shape}, logit_bias={logit_bias.shape}, logits={logits.shape}"
+            f"got counts={counts.shape}, logit_bias={logit_bias.shape}, "
+            f"logits={logits.shape}"
         )
     if rows == 0:
         return logits

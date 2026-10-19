@@ -199,7 +199,6 @@ class DisaggBootstrapServerBase:
             prefill_parallel_info.update(self._extra_parallel_info())
             return web.json_response(prefill_parallel_info, status=200)
 
-        # Find corresponding prefill info
         async with self.lock:
             bootstrap_info = self.prefill_port_table[int(target_dp_group)][
                 int(engine_rank)
@@ -235,7 +234,6 @@ class DisaggBootstrapServerBase:
         runner: web.AppRunner | None = None
         startup_succeeded = False
         try:
-            # Event Loop
             loop = asyncio.new_event_loop()
             self._loop = loop
             asyncio.set_event_loop(loop)

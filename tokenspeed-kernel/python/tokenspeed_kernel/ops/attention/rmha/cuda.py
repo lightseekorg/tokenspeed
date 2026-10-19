@@ -45,7 +45,8 @@ if platform.is_nvidia and platform.is_blackwell:
 
     import os
 
-    # Default on (bit-exact vs reference); TSMHA_REL_DECODE=0 falls back to fork varlen + fused rel_bias.
+    # Default on (bit-exact vs reference); TSMHA_REL_DECODE=0 falls back to fork
+    # varlen + fused rel_bias.
     _TSMHA_REL_DECODE = os.environ.get("TSMHA_REL_DECODE", "1") == "1"
     # Same for varlen prefill/extend; TSMHA_REL_EXTEND=0 falls back likewise.
     _TSMHA_REL_EXTEND = os.environ.get("TSMHA_REL_EXTEND", "1") == "1"
@@ -262,7 +263,8 @@ if platform.is_nvidia and platform.is_blackwell:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
         if (
             not return_lse
-            # k*128-token pages ride the same kernel via paged_kv_blocks_per_page (hetero slots).
+            # k*128-token pages ride the same kernel via
+            # paged_kv_blocks_per_page (hetero slots).
             and k_cache.shape[1] % 128 == 0
             and cu_seqlens_q.shape[0] - 1 <= 1024
             and _tsmha_varlen_eligible(q, k_cache.shape[2], rel_logits, window_left)
@@ -414,7 +416,8 @@ if platform.is_nvidia and platform.is_blackwell:
         if (
             _TSMHA_REL_DECODE
             and max_seqlen_q == 1
-            # k*128 pages ride the same kernel via paged_kv_blocks_per_page; bitwise-verified for k=2.
+            # k*128 pages ride the same kernel via paged_kv_blocks_per_page;
+            # bitwise-verified for k=2.
             and k_cache.shape[1] % 128 == 0
             and rel_logits.shape[-1] % 128 == 0
             and q.dtype in (torch.bfloat16, torch.float16)
@@ -424,7 +427,8 @@ if platform.is_nvidia and platform.is_blackwell:
                 rel_mha_decode_tsmha,
             )
 
-            # Never compile during graph capture; the engine's uncaptured warmup decode compiles first.
+            # Never compile during graph capture; the engine's uncaptured warmup
+            # decode compiles first.
             if (
                 is_compiled_for(
                     q,
@@ -449,7 +453,8 @@ if platform.is_nvidia and platform.is_blackwell:
                     tau=tau,
                     enable_pdl=enable_pdl,
                 )
-        # Varlen required: batch mode reports offset_q 0 for every request (wrong rel_logits rows).
+        # Varlen required: batch mode reports offset_q 0 for every request
+        # (wrong rel_logits rows).
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
         if tau is not None:
@@ -513,7 +518,8 @@ if platform.is_nvidia and platform.is_blackwell:
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # No score_mod fallback for fp8: ineligible configs raise instead of silently degrading.
+        # No score_mod fallback for fp8: ineligible configs raise instead of
+        # silently degrading.
         if not (
             max_seqlen_q == 1
             and k_cache.shape[1] % 128 == 0

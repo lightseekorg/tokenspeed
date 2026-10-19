@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Triton sampling kernel entry points."""
-
 from tokenspeed_kernel.ops.sampling.triton.draft_tree import (
     draft_tree_expand,
     draft_tree_finalize,

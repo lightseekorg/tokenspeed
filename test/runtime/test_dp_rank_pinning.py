@@ -365,8 +365,8 @@ class TestControllerPinnedDispatch:
         controller._request_dispatcher(pinned)
         assert (controller.workers[3].sent) == ([pinned])
         for worker in controller.workers[:3]:
-            assert (worker.sent) == ([])
-        assert (controller.dispatching.received) == ([])
+            assert worker.sent == []
+        assert controller.dispatching.received == []
 
         unpinned = TokenizedGenerateReqInput(
             rid="wire-2",
@@ -396,14 +396,14 @@ class TestControllerPinnedDispatch:
                 controller.dispatch_generate_request(req)
                 assert (controller.dispatching.received) == ([req])
                 for worker in controller.workers:
-                    assert (worker.sent) == ([])
+                    assert worker.sent == []
 
     def test_disagg_mode_ignores_pin(self):
         controller = _make_controller(disaggregation_mode="prefill")
         req = _tokenized(data_parallel_rank=1, bootstrap_room=7)
         controller.dispatch_generate_request(req)
         assert (controller.dispatching.received) == ([req])
-        assert (controller.workers[1].sent) == ([])
+        assert controller.workers[1].sent == []
 
     def test_pin_notes_budget_reservation(self):
         controller = _make_controller(dp_size=2)

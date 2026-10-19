@@ -859,9 +859,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         # (see GlmMoeDsaForCausalLM._pad_fused_qkv_a_proj_for_fp8_blockscale).
         # Drop the padding columns before the split / comm. No-op when the
         # projection output already matches the logical width.
-        _qkv_width = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
-        if qkv.shape[-1] != _qkv_width:
-            qkv = qkv[..., :_qkv_width]
+        qkv_width = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+        if qkv.shape[-1] != qkv_width:
+            qkv = qkv[..., :qkv_width]
         qkv = comm_manager.pre_attn_comm(qkv, ctx)
 
         q_a, latent_cache = qkv.split(

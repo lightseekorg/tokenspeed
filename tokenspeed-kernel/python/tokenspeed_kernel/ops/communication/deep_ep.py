@@ -60,9 +60,8 @@ _allow_mnnvl_resolved: bool | None = None
 def _resolve_allow_mnnvl(device_index: int) -> bool:
     """Decide once per process whether DeepEP may use MNNVL/fabric buffers.
 
-    ``TS_DEEPEP_ALLOW_MNNVL`` ("0"/"1") wins when set; otherwise the fabric
-    allocation probe decides. The result is cached because every rank must
-    hand the same choice to every DeepEP buffer it creates.
+    The result is cached because every rank must hand the same choice to every
+    DeepEP buffer it creates.
     """
     global _allow_mnnvl_resolved
     if _allow_mnnvl_resolved is None:
@@ -220,7 +219,7 @@ class DeepEPBuffer:
             # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_low_latency.py#L176
             num_qps_per_rank = num_experts // group.size()
         elif deepep_mode == DeepEPMode.auto:
-            # low-latency and normal mode all need run
+            # auto needs enough QPs for both modes.
             num_qps_per_rank = max(Buffer.num_sms, num_experts // group.size())
         else:
             raise NotImplementedError
@@ -611,10 +610,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         super().__init__(**kwargs)
 
-        """
-        num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
-        https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
-        """
+        # num_max_dispatch_tokens_per_rank: the actual batch size in the
+        # decoding engine should be less than 256. See
+        # https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
         self.return_recv_hook = return_recv_hook
         self.use_fp8 = use_fp8
         self.ue8m0_scales = ue8m0_scales

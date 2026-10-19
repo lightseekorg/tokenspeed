@@ -205,7 +205,8 @@ def test_gdn_chain_pdl_toggle(
             [qkv_width, value_heads * dim], dim=-1
         )
         b, a = projection[:, qkvz_width:].split(value_heads, dim=-1)
-        # A chain or plain decode packs them for the dense kernels, as GdnAttnBackend does.
+        # A chain or plain decode packs them for the dense kernels, as
+        # GdnAttnBackend does.
         qkv, a, b = pack_gdn_projection(qkv, a, b)
         causal_conv1d_update(
             qkv.view(batch, steps, qkv_width).transpose(1, 2),
@@ -307,7 +308,8 @@ def test_gdn_chain_pdl_toggle(
 
 @pytest.mark.parametrize("width", [2, 4])
 def test_tree_conv_waits_for_initial_windows(width, restore_pdl):
-    # Under ReplaySSM the seed copy writes the initial windows right before the first layer's tree conv.
+    # Under ReplaySSM the seed copy writes the initial windows right before the
+    # first layer's tree conv.
     torch.manual_seed(width)
     bs, dim, t = 4, 1024, 6
     x = torch.randn(bs, t, dim, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
@@ -359,7 +361,8 @@ def test_tree_conv_waits_for_initial_windows(width, restore_pdl):
 @pytest.mark.parametrize("target", ["rows", "mask", "reads", "A_log", "dt_bias"])
 @pytest.mark.parametrize("nodes", [7, 14])
 def test_gdn_tree_verify_waits_for_its_inputs(nodes, target, restore_pdl):
-    # A ReplaySSM tree verify, step by step at 7 nodes and chunked at 14, reads nothing the kernel before it writes until its PDL wait.
+    # A ReplaySSM tree verify, step by step at 7 nodes and chunked at 14, reads
+    # nothing the kernel before it writes until its PDL wait.
     torch.manual_seed(nodes)
     bs, heads, value_heads, dim = 2, 4, 12, 128
     qk_width = heads * dim

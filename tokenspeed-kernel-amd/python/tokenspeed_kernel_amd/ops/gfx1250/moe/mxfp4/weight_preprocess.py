@@ -122,6 +122,7 @@ def preprocess_gluon_mxfp4_gfx1250_moe_weights(
             module is mutated in-place with gfx1250-ready weight tensors and
             precision configs.
     """
+    del plan
     w13_layout = getattr(w, "w13_input_layout", "concatenated")
     if w13_layout not in {"interleaved", "concatenated"}:
         raise ValueError(f"unknown w13_input_layout: {w13_layout!r}")

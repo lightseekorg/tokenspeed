@@ -43,8 +43,6 @@ def _shape_int(shape_params: dict[str, Any], *keys: str) -> int | None:
 
 
 class ThroughputCalculator:
-    """Computes throughput metrics for benchmark results."""
-
     @staticmethod
     def gemm_mm_flops(M: int, N: int, K: int) -> int:
         return 2 * M * N * K

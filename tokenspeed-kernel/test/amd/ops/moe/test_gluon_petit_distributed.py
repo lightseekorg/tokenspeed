@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Eight-rank numerical checks for the registered Petit
+"""Eight-rank numerical checks for the registered Petit MoE kernel.
 
 Run with torchrun --standalone --nproc_per_node=8 -m pytest --import-mode=importlib
 <path-to-this-file>. Optional PETIT_OUTPUT_DIR saves outputs for an exact

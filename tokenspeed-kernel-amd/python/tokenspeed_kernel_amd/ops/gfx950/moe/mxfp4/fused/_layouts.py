@@ -25,10 +25,6 @@ from __future__ import annotations
 
 from tokenspeed_kernel_amd._triton import gl, gluon
 
-# ---------------------------------------------------------------------------
-# Layout factories (gluon constexpr functions)
-# ---------------------------------------------------------------------------
-
 
 @gluon.constexpr_function
 def _store_layout(
@@ -88,11 +84,6 @@ def _load_layout(
         lanes = [LANES_K, LANES_NONK]
         warps = [WARPS_K, WARPS_NONK]
     return gl.BlockedLayout(regs, lanes, warps, order)
-
-
-# ---------------------------------------------------------------------------
-# Software-pipelined Gluon MoE kernel
-# ---------------------------------------------------------------------------
 
 
 @gluon.constexpr_function
@@ -197,11 +188,6 @@ def _situ_reduce(
     gate = beta * gl.extra.libdevice.tanh(gate / beta) / (1.0 + gl.exp(-gate))
     linear = linear_beta * gl.extra.libdevice.tanh(linear / linear_beta)
     return gate * linear
-
-
-# ---------------------------------------------------------------------------
-# Scaled MFMA MoE kernel (mxfp4 / fp8 + e8m0 block scales)
-# ---------------------------------------------------------------------------
 
 
 @gluon.constexpr_function

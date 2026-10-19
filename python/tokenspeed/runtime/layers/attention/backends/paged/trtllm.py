@@ -176,10 +176,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         del forward_mode
         return True
 
-    # ------------------------------------------------------------------
-    # Metadata initialisation
-    # ------------------------------------------------------------------
-
     def init_forward_metadata(
         self,
         bs: int,
@@ -249,10 +245,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             cu_seqlens_k=cu_seqlens_k,
             page_table=page_table[:prefill_bs],
         )
-
-    # ------------------------------------------------------------------
-    # CUDA graph / decode refresh
-    # ------------------------------------------------------------------
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
         super().init_cuda_graph_state(max_bs)
@@ -361,10 +353,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             self._refresh_tree_prefix(bs, self.spec_cache_seqlens_buf)
             self.forward_prefill_metadata = self._verify_views(bs)
 
-    # ------------------------------------------------------------------
-    # KV cache helpers
-    # ------------------------------------------------------------------
-
     @property
     def workspace_buffer(self) -> torch.Tensor:
         """Per-use view of the shared scratch block (contract: workspace.py).
@@ -411,10 +399,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             q = q.contiguous()
 
         return q.view(-1, layer.tp_q_head_num, layer.head_dim)
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
 
     def forward_decode(
         self,
@@ -489,9 +473,11 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             return TreeSupport(verify_blocker=None, draft_blocker=None)
         return TreeSupport(
             verify_blocker=f"{type(self).__name__} reads the verify window K/V in the "
-            f"model dtype or FP8 E4M3; kv_cache_dtype {self.kv_cache_dtype} is not supported",
+            f"model dtype or FP8 E4M3; kv_cache_dtype {self.kv_cache_dtype} is not "
+            "supported",
             draft_blocker=f"{type(self).__name__} reads the lane window K/V in the "
-            f"model dtype or FP8 E4M3; kv_cache_dtype {self.kv_cache_dtype} is not supported",
+            f"model dtype or FP8 E4M3; kv_cache_dtype {self.kv_cache_dtype} is not "
+            "supported",
         )
 
     def _tree_cascade(
@@ -514,7 +500,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 "draft trees have no sliding-window or attention-sink path yet"
             )
         k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
-        # trtllm-gen also loads the key right after the prefix: the window's first slot, written this forward.
+        # trtllm-gen also loads the key right after the prefix: the window's first
+        # slot, written this forward.
         prefix_out, prefix_lse = trtllm_batch_decode_with_kv_cache(
             query=self._prepare_q(q, layer),
             kv_cache=(k_cache, v_cache),

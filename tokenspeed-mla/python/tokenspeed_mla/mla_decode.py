@@ -228,6 +228,7 @@ def _get_compiled_mla_kernel(
 
     All scalar arguments must be pre-wrapped as Int32/Float32.
     """
+    del kv_lora_rank, qk_rope_head_dim  # Unused; only part of the cache key.
     is_fp8 = torch_dtype == torch.float8_e4m3fn
     mma_qk_tiler_mn, mma_pv_tiler_mn = select_mla_decode_tilers(
         num_heads,
@@ -235,7 +236,6 @@ def _get_compiled_mla_kernel(
         is_fp8=is_fp8,
         compute_capability=compute_capability,
     )
-    # 2 CTAs for M=128 path; 1 CTA for M=64 path.
     cluster_shape_mnk = (2, 1, 1) if mma_qk_tiler_mn[0] == 128 else (1, 1, 1)
     KernelClass = (
         BlackwellMultiHeadLatentAttentionForwardFP8
@@ -261,7 +261,6 @@ def _get_compiled_mla_kernel(
         is_var_split_kv=is_var_split_kv,
         fold_sq_factor=fold_sq_factor,
     )
-    # Causal masking is now supported by both the FP8 and FP16/BF16 kernels.
     kernel_kwargs["is_causal"] = causal_mask
     kernel_kwargs["num_heads"] = num_heads
     kernel_kwargs["seq_len_q"] = seq_len_q
@@ -376,7 +375,7 @@ def _get_compiled_mla_kernel(
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # DCP: build an lse_fake when return_lse=True so the compiled kernel
-    # is shaped to emit LSE. Shape per mla_decode_fp8.py:359 = [B, q_len, H] fp32.
+    # is shaped to emit LSE: [B, q_len, H] fp32.
     if return_lse:
         lse_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Float32,
@@ -634,14 +633,15 @@ def _sm107_fp8_out_decode(
     qk_rope_head_dim = q_rope.shape[-1]
     if compute_capability != (10, 7):
         raise ValueError(
-            f"This FP8-input kernel is only supported on SM107, got sm_{compute_capability[0]}"
-            f"{compute_capability[1]}"
+            "This FP8-input kernel is only supported on SM107, got "
+            f"sm_{compute_capability[0]}{compute_capability[1]}"
         )
     if q_latent.dtype != torch.float8_e4m3fn:
         raise ValueError(f"SM107 decode requires FP8 E4M3 Q/KV, got {q_latent.dtype}")
     if window_left != -1 or cp_world != 1 or cp_rank != 0 or causal_seqs is not None:
         raise ValueError(
-            "SM107 M256 decode does not support sliding windows or decode context parallel"
+            "SM107 M256 decode does not support sliding windows or decode "
+            "context parallel"
         )
     if local_visible_lens is not None:
         raise ValueError("SM107 M256 decode does not support local_visible_lens")
@@ -658,10 +658,11 @@ def _sm107_fp8_out_decode(
         pack_q=True,
     ):
         raise ValueError(
-            f"SM107 M256 decode: unsupported configuration (q_len={q_len}, num_heads={H}, "
-            f"kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim}, "
-            f"page_size={page_size}, out_dtype={out.dtype}); needs "
-            f"at most 4 {SM107_MLA_M_TILE}-row tiles of num_heads * q_len rows"
+            f"SM107 M256 decode: unsupported configuration (q_len={q_len}, "
+            f"num_heads={H}, kv_lora_rank={kv_lora_rank}, "
+            f"qk_rope_head_dim={qk_rope_head_dim}, page_size={page_size}, "
+            f"out_dtype={out.dtype}); needs at most 4 {SM107_MLA_M_TILE}-row tiles "
+            "of num_heads * q_len rows"
         )
     # The kernel packs rows q_tok * H + head of adjacent tokens into M tiles.
     if q_latent.stride(1) != H * q_latent.stride(2) or out.stride(1) != H * out.stride(
@@ -770,9 +771,10 @@ def tokenspeed_mla_decode(
     query : torch.Tensor
         [B, q_len, H, D_qk] where D_qk = kv_lora_rank + qk_rope_head_dim
     kv_cache : torch.Tensor
-        [num_pages, page_size, D_ckv + D_kpe] (3D) or [num_pages, 1, page_size, D_ckv + D_kpe] (4D)
+        [num_pages, page_size, D_ckv + D_kpe] (3D) or
+        [num_pages, 1, page_size, D_ckv + D_kpe] (4D)
     workspace_buffer : torch.Tensor
-        Pre-allocated workspace buffer (uint8). Required size depends on batch size
+        Pre-allocated workspace buffer (int8). Required size depends on batch size
         and split_kv (auto-computed from B, q_len, and number of SMs):
 
         - Formula: ``B * H * q_len * split_kv * (kv_lora_rank + 1) * 4`` bytes
@@ -803,8 +805,6 @@ def tokenspeed_mla_decode(
         ``local_visible_lens``.
     is_var_seq : bool
         Whether the sequence length is variable.
-        If True, the sequence length is variable.
-        Otherwise,the sequence length is fixed for all the requests in the batch.
     causal_mask : bool
         Whether to enable causal masking in the CuTe DSL kernel.
         Supported by both the FP8 and FP16/BF16 kernel paths.
@@ -819,8 +819,7 @@ def tokenspeed_mla_decode(
         per-position ``|query_pos - key_pos| <= window_left``. A narrower
         window would no longer bound the distance between the block's own
         rows, and raises ``ValueError``. The window is part of the kernel cache key
-        and folds away at compile time, so ``-1`` compiles and runs exactly the
-        kernel it did before this argument existed.
+        and folds away at compile time.
     enable_pdl : bool
         When True, enables Programmatic Dependent Launch (PDL) on the
         underlying CuTe DSL decode kernel. Tokenspeed callers wire this from
@@ -925,7 +924,6 @@ def tokenspeed_mla_decode(
     # Page table: [B, max_pages]: passed directly, kernel reinterprets.
     page_table_k = block_tables
 
-    # Runtime validation (int comparisons only, negligible overhead)
     if max_seq_len <= 0:
         raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
     if window_left < -1:
@@ -1000,7 +998,6 @@ def tokenspeed_mla_decode(
         H_eff = mma_m_tile
         fold_sq_factor = 1
 
-    # Cached split_kv and workspace_size computation
     max_active_blocks = get_num_sm(query.device)
     split_kv, workspace_size = _get_split_kv_and_workspace_size(
         B,
@@ -1014,7 +1011,6 @@ def tokenspeed_mla_decode(
         min_split_kv,
     )
 
-    # Prepare workspace: slice of contiguous 1D buffer is already contiguous
     assert (
         workspace_buffer.dtype == torch.int8
     ), f"workspace_buffer must be torch.int8, got {workspace_buffer.dtype}"
@@ -1038,7 +1034,6 @@ def tokenspeed_mla_decode(
             (B, q_len, H, kv_lora_rank), dtype=out_dtype, device=query.device
         )
 
-    # cache_seqs: per-batch sequence lengths (skip .to() if already int32)
     cache_seqs = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
     # cp_world is the DCP world size; reject non-positive values up front. Otherwise
     # cp_world=0 slips past the cp_rank check below (max(cp_world, 1) == 1) and reaches
@@ -1088,10 +1083,8 @@ def tokenspeed_mla_decode(
     # FP8: keep the row max while it grows by <= 8 log2 units (P <= 256 < 448).
     skip_correction_threshold = 8.0 if is_fp8 else 0.0
 
-    # For fixed-length input, set is_persistent to True; otherwise, set to False.
     is_persistent = not is_var_seq
 
-    # Validate configuration (cached, negligible overhead after first call)
     _check_can_implement(
         torch_dtype=q_dtype,
         page_size=page_size,
@@ -1105,8 +1098,8 @@ def tokenspeed_mla_decode(
         compute_capability=compute_capability,
     )
 
-    # Get compiled kernel (cached after first compile)
-    # Note: when is_workspace_size_zero is True, workspace_bytes is None and it will launch one kernel without workspace.
+    # Note: when is_workspace_size_zero is True, workspace_bytes is None and it
+    # will launch one kernel without workspace.
     # Otherwise, workspace_bytes is not None and it will launch two kernels.
     compiled_kernel = _get_compiled_mla_kernel(
         torch_dtype=q_dtype,
@@ -1182,7 +1175,6 @@ def tokenspeed_mla_decode(
     with tvm_ffi.use_torch_stream():
         compiled_kernel(*call_args)
 
-    # DCP: return (o, lse) tuple when LSE was requested.
     o_result = out if out is not None else o_k
     if return_lse:
         return o_result, lse_real

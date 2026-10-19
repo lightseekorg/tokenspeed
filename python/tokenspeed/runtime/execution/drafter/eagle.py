@@ -229,10 +229,6 @@ class Eagle(BaseDrafter):
             config.topk, dtype=torch.int64, device=self.device
         ) << torch.arange(config.topk, device=self.device)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     def _model_shares_mtp_topk(self) -> bool:
         return bool(
             getattr(
@@ -495,7 +491,6 @@ class Eagle(BaseDrafter):
             )
 
         for i in range(1, self.spec_num_steps):
-            # make a ctx every time model runner forward
             # Multi-step decode is pure DECODE mode: one token per request.
             # global_num_tokens must reflect each rank's batch size, not the
             # target model's total tokens (which may be bs * spec_num_tokens).
@@ -643,10 +638,6 @@ class Eagle(BaseDrafter):
                 f"got logits of width {logits.shape[-1]}"
             )
         return logprob_topk(logits, self.draft_tree.topk)
-
-    # ------------------------------------------------------------------
-    # Public entry point (type-based dispatch from ModelExecutor)
-    # ------------------------------------------------------------------
 
     @override
     def draft(

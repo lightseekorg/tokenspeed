@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Tests for MultimodalRuntime (mrope overrides factored out of ModelExecutor)."""
+"""Tests for MultimodalRuntime."""
 
 from types import SimpleNamespace
 

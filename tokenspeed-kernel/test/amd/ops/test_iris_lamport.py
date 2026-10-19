@@ -74,8 +74,10 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
         options={"num_warps": 1},
     )
     assembly = kernel.asm["amdgcn"]
-    (tmp_path / f"lamport-rank{rank}.amdgcn").write_text(assembly)
-    (tmp_path / f"lamport-rank{rank}.llir").write_text(kernel.asm["llir"])
+    (tmp_path / f"lamport-rank{rank}.amdgcn").write_text(assembly, encoding="utf-8")
+    (tmp_path / f"lamport-rank{rank}.llir").write_text(
+        kernel.asm["llir"], encoding="utf-8"
+    )
     lines = assembly.splitlines()
     labels = {
         match[1]: index

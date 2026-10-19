@@ -39,7 +39,8 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.workspace import WorkspacePool
 
 
-# Minimum physical subgroup maximum for automatic fusion, independent of bucket.
+# TP sizes eligible for automatic fusion, and the minimum physical subgroup
+# maximum (rows) for it, independent of bucket.
 # Other TP sizes keep ordinary dispatch; direct kernel calls remain available.
 _FUSED_TP_SIZES = (2, 4)
 _FUSED_MIN_ROWS = 64

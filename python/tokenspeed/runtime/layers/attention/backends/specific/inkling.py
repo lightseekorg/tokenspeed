@@ -236,8 +236,8 @@ class InklingAttnBackend(AttentionBackend):
             device=attn_config.device,
         )
         logger.info(
-            f"Inkling {('draft ' if is_draft else '')!s}conv state pool: {num_layers:d} "
-            f"layers x {attn_config.max_bs + 2:d} slots, "
+            f"Inkling {('draft ' if is_draft else '')!s}conv state pool: "
+            f"{num_layers:d} layers x {attn_config.max_bs + 2:d} slots, "
             f"{conv_pool.mem_usage_bytes() / (1 << 20):.1f} MiB",
         )
         return cls(
@@ -521,10 +521,6 @@ class InklingAttnBackend(AttentionBackend):
                     valid.view(bs, 1, 1), values.to(buffer.dtype), current
                 )
 
-    # ------------------------------------------------------------------
-    # Conv metadata
-    # ------------------------------------------------------------------
-
     def init_forward_metadata(
         self,
         bs: int,
@@ -639,10 +635,6 @@ class InklingAttnBackend(AttentionBackend):
             remote_restore_mask=remote_restore_mask,
         )
 
-    # ------------------------------------------------------------------
-    # Speculative-decoding conv metadata
-    # ------------------------------------------------------------------
-
     def fixed_workspace_bytes(self) -> int:
         """Return persistent ShortConv state owned outside the LCM arenas."""
         return self.conv_pool.mem_usage_bytes()
@@ -738,10 +730,6 @@ class InklingAttnBackend(AttentionBackend):
                 f"ShortConv checkpoint stream {key!r} changed storage buffer"
             )
 
-    # ------------------------------------------------------------------
-    # Attention delegation
-    # ------------------------------------------------------------------
-
     # forward is NOT overridden: base dispatch sends rel_logits layers to the rel_mha overrides.
 
     def _rel_decode_cu_seqlens_q(
@@ -833,11 +821,11 @@ class InklingAttnBackend(AttentionBackend):
         k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
         v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
         metadata = inner.forward_extend_metadata
-        _num_real = metadata.cu_extend_seq_lens_cpu[-1]
+        num_real = metadata.cu_extend_seq_lens_cpu[-1]
         # Relative attention keeps bucket-shaped inputs because rel_logits and
         # its handoff are bucket-shaped. Scrub the padded rows instead of using
         # the plain MHA path's exact-row kernel contract.
-        scrub_padding_tail(_num_real, q, k, v)
+        scrub_padding_tail(num_real, q, k, v)
         plan = rel_mha_plan(
             dtype=torch.float8_e4m3fn if inner.is_fp8 else inner.qkv_dtype,
             head_dim=inner.head_dim,
@@ -864,8 +852,8 @@ class InklingAttnBackend(AttentionBackend):
                 solution=inner.kernel_solution,
             )
             output = output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
-            if output.shape[0] > _num_real:
-                output[_num_real:].zero_()
+            if output.shape[0] > num_real:
+                output[num_real:].zero_()
             return output
         scale_kwargs = {}
         if inner.is_mxfp8:
@@ -893,8 +881,8 @@ class InklingAttnBackend(AttentionBackend):
             **scale_kwargs,
         )
         output = output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
-        if output.shape[0] > _num_real:
-            output[_num_real:].zero_()
+        if output.shape[0] > num_real:
+            output[num_real:].zero_()
         return output
 
     def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
@@ -917,10 +905,6 @@ class InklingAttnBackend(AttentionBackend):
         if not forward_mode.is_decode() and not forward_mode.is_idle():
             self.step_counter.record_cache()
         return hidden_states
-
-    # ------------------------------------------------------------------
-    # CUDA graph hooks (decode-only, like the inner backend's)
-    # ------------------------------------------------------------------
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         """Allocate the static conv metadata the breakable prefill graphs bake.

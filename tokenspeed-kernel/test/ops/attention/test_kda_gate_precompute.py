@@ -79,9 +79,10 @@ def _run(kernel, block_t, block_k, rows, tensors, num_warps):
 
 def _tensors(rows):
     gen = torch.Generator(device="cuda").manual_seed(0)
-    rand = lambda *shape, dtype: torch.randn(  # noqa: E731
-        *shape, generator=gen, dtype=dtype, device="cuda"
-    )
+
+    def rand(*shape, dtype):
+        return torch.randn(*shape, generator=gen, dtype=dtype, device="cuda")
+
     return (
         [rand(rows, D_FA, dtype=torch.bfloat16) for _ in range(LAYERS)],
         [rand(HEADS * HEAD_DIM, D_FA, dtype=torch.bfloat16) for _ in range(LAYERS)],
@@ -130,7 +131,6 @@ def test_dot_path_matches_reduction_within_tiling_spread(rows) -> None:
 
 def test_dot_tiling_never_returns_a_tile_tl_dot_cannot_serve() -> None:
     """tl.dot needs 16 rows; the dot tiling must never propose fewer."""
-    device = torch.device("cuda")
     for rows in (16, 32, 64, 128, 512, 1024):
         block_t, block_k = _gate_tiling_dot(rows, HEAD_DIM)
         assert block_t >= 16, f"rows={rows} produced BT={block_t}"

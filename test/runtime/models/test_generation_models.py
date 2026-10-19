@@ -23,8 +23,6 @@ register_cuda_ci(est_time=300, suite="runtime-2gpu")
 
 import dataclasses
 import multiprocessing as mp
-import os
-import sys
 from typing import List
 
 import torch
@@ -155,7 +153,6 @@ class TestGenerationModels:
             model_type="generation",
             trust_remote_code=model_case.trust_remote_code,
             enforce_eager=model_case.enforce_eager,
-            # port=None uses auto-incrementing port
             **model_case.extra_kwargs,
         ) as rt_runner:
             if "speculative_algorithm" in model_case.extra_kwargs:
@@ -171,11 +168,13 @@ class TestGenerationModels:
                     zip(prompts, rt_outputs.output_strs)
                 ):
                     print(
-                        f"  [{i}] prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}",
+                        f"  [{i}] prompt: {prompt[:100]}"
+                        f"{'...' if len(prompt) > 100 else ''}",
                         flush=True,
                     )
                     print(
-                        f"  [{i}] output: {output[:100]}{'...' if len(output) > 100 else ''}",
+                        f"  [{i}] output: {output[:100]}"
+                        f"{'...' if len(output) > 100 else ''}",
                         flush=True,
                     )
                 print(f"{'='*60}\n", flush=True)
@@ -189,7 +188,10 @@ class TestGenerationModels:
                     continue
                 _pytest_member_1 = expected
                 _pytest_container_2 = output
-                _pytest_msg_3 = f"Expected {expected!r} in output for prompt {prompt!r}, got {output!r}"
+                _pytest_msg_3 = (
+                    f"Expected {expected!r} in output for prompt {prompt!r}, "
+                    f"got {output!r}"
+                )
                 assert _pytest_member_1 in _pytest_container_2, _pytest_msg_3
 
     def test_ci_models(self):
@@ -201,7 +203,6 @@ class TestGenerationModels:
 
                 prompts = [q["messages"][0]["content"] for q in QUALITY_CHECKS]
 
-                # Assert generation contains expected content.
                 self.assert_close_logits_and_output_strs(
                     prompts, model_case, torch_dtype
                 )
@@ -223,7 +224,6 @@ class TestGenerationModels:
             if model_case.skip_long_prompt:
                 prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
 
-            # Assert the logits and output strs are close
             self.assert_close_logits_and_output_strs(prompts, model_case, torch.float16)
 
 

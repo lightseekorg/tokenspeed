@@ -91,7 +91,8 @@ class MSAConfig(SoftmaxAttnConfig):
             )
         if server_args.kv_cache_quant_method != "none":
             raise ValueError(
-                f"MiniMax sparse attention does not support kv_cache_quant_method={server_args.kv_cache_quant_method!r}."
+                "MiniMax sparse attention does not support "
+                f"kv_cache_quant_method={server_args.kv_cache_quant_method!r}."
             )
 
         spec = cls(

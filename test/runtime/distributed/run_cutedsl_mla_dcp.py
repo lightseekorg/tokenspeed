@@ -212,8 +212,8 @@ def run_case(*, rank, mapping, context, dtype, queries, draft, block):
     leaf._workspace_pool.unfreeze()
     if mapping.kvp_rank == 0:
         print(
-            f"PASS group={mapping.kvp_group} dtype={dtype} context={context} Q={queries} draft={draft} "
-            f"block={block}",
+            f"PASS group={mapping.kvp_group} dtype={dtype} context={context} "
+            f"Q={queries} draft={draft} block={block}",
             flush=True,
         )
 
@@ -453,7 +453,9 @@ def run_prefill_case(*, rank, mapping, context, dtype):
     )
     if mapping.kvp_rank == 0:
         print(
-            f"PASS prefill group={mapping.kvp_group} dtype={dtype} context={context} chunks={leaf.chunked_prefill_metadata.chunked_loop_num}",
+            f"PASS prefill group={mapping.kvp_group} dtype={dtype} "
+            f"context={context} "
+            f"chunks={leaf.chunked_prefill_metadata.chunked_loop_num}",
             flush=True,
         )
 

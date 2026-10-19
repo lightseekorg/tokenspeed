@@ -37,7 +37,7 @@ SOURCE = (
 @pytest.fixture
 def dispatch():
     # Execute the actual methods while excluding unrelated platform imports.
-    tree = ast.parse(SOURCE.read_text())
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
     cls = next(
         node
         for node in tree.body

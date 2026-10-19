@@ -72,8 +72,6 @@ class QwenGDNRecipe(CacheRecipe):
         linear_attn.replay_ssm = self.replay_ssm
         linear_attn.draft_tree = self.draft_tree
 
-    # ---- layer vocabulary ----
-
     @cached_property
     def target_layer_types(self) -> tuple[str, ...]:
         return tuple(self.attn_config.component(SoftmaxAttnConfig).cache_layer_types)
@@ -100,7 +98,10 @@ class QwenGDNRecipe(CacheRecipe):
 
     @cached_property
     def _num_segments(self) -> int:
-        """K/V segments of the KV group, a draft layer's included when it shares them."""
+        """K/V segments of the KV group.
+
+        A draft layer's segments are included when it shares them.
+        """
         num_kv = len(self.target_layer_types) - self._num_state_layers
         if num_kv == 0:
             raise ValueError("Qwen3.5 cache requires at least one full-attention layer")
@@ -110,12 +111,20 @@ class QwenGDNRecipe(CacheRecipe):
 
     @cached_property
     def _num_state_groups(self) -> int:
-        """State groups of at most as many SSM states as the KV group has K/V segments."""
+        """Number of state groups.
+
+        Each group holds at most as many SSM states as the KV group has K/V
+        segments.
+        """
         return max(math.ceil(self._num_state_layers / self._num_segments), 1)
 
     @cached_property
     def _conv_planes(self) -> tuple[str, ...]:
-        """Each state occurrence's conv plane: the last segments when the states leave room, else its own."""
+        """Each state occurrence's conv plane.
+
+        The conv windows take the last segments when the states leave room,
+        else each takes a plane of its own.
+        """
         conv_shape, conv_dtype, ssm_shape, ssm_dtype = self._state_shapes
         states = math.ceil(self._num_state_layers / self._num_state_groups)
         per_segment = (math.prod(ssm_shape) * cache_dtype_bytes(ssm_dtype)) // (
@@ -130,7 +139,10 @@ class QwenGDNRecipe(CacheRecipe):
 
     @cached_property
     def _draft_shares_segments(self) -> bool:
-        """Whether a draft layer's fields are a target attention layer's K and V, byte for byte."""
+        """Whether a draft layer's fields match a target attention layer's K and V.
+
+        The match is byte for byte.
+        """
         target, draft = (
             [
                 field.payload_bytes
@@ -142,8 +154,6 @@ class QwenGDNRecipe(CacheRecipe):
             )
         )
         return target == draft
-
-    # ---- model geometry ----
 
     @property
     @override
@@ -159,7 +169,8 @@ class QwenGDNRecipe(CacheRecipe):
         )
         if num_full_attention == 0:
             raise ValueError("Qwen3.5 cache requires at least one full-attention layer")
-        # A draft layer whose K/V bytes exceed a target attention layer's counts as several.
+        # A draft layer whose K/V bytes exceed a target attention layer's counts
+        # as several.
         width = 1.0
         if self.num_draft_layers:
             target_bytes, draft_bytes = (
@@ -174,8 +185,6 @@ class QwenGDNRecipe(CacheRecipe):
             )
             width = draft_bytes / target_bytes
         return 1.0 + 2.0 * self.num_draft_layers * max(width, 1.0) / num_full_attention
-
-    # ---- decoder-layer fields ----
 
     @cached_property
     def _state_shapes(self):
@@ -286,8 +295,6 @@ class QwenGDNRecipe(CacheRecipe):
             head_dim=config.component(SoftmaxAttnConfig).head_dim,
             prefix_granularity=self.prefix_granularity,
         )
-
-    # ---- speculative verify workspace ----
 
     @cached_property
     def draft_tree(self) -> bool:

@@ -18,6 +18,66 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""FP8 Multi-Head Latent Attention (MLA) decode kernel for SM100/SM103/SM107.
+
+This module implements MLA decode with FP8 inputs using a TMA + TensorCore
+warp-specialized persistent kernel written in CuTe DSL. The kernel fuses the
+(Qc + Qr) * (Kc + Kr)^T matrix multiplication, softmax normalization, and
+softmax((Qc + Qr) * (Kc + Kr)^T) * Vc into a single kernel. It supports page
+table storage and variable-length KV cache sequences, and implements KV
+splitting to minimize latency for long KV sequences.
+
+Key optimizations:
+
+- Warp specialization for different computation phases (load, MMA, softmax,
+  correction, epilogue).
+- Pipeline stages between warps to overlap computation and memory access.
+- Support for different precision data types.
+- Two sub-kernels (split KV kernel and reduction kernel) that enable split KV
+  processing.
+
+Example usage:
+
+    python mla_decode_fp8.py                                             \\
+      --batch_size 4 --latent_dim 512 --rope_dim 64                      \\
+      --num_heads 128 --seq_len_q 1 --seq_len_k 1024                     \\
+      --in_dtype Float8E4M3FN --out_dtype Float8E4M3FN                   \\
+      --acc_dtype Float32 --lse_dtype Float32                            \\
+      --is_var_seq --is_var_split_kv                                     \\
+      --is_persistent
+
+This runs MLA with batch size 4, Q sequence length 1, K sequence length 1024,
+latent dimension 512, RoPE dimension 64, up to 128 heads, Float8E4M3FN input
+and output, and Float32 accumulation and LSE. It uses page table storage for
+the KV cache and enables both variable-length KV cache sequences and variable
+split KV processing with persistent scheduling.
+
+To collect performance with the NCU profiler:
+
+    ncu python mla_decode_fp8.py                                         \\
+      --batch_size 4 --latent_dim 512 --rope_dim 64                      \\
+      --num_heads 128 --seq_len_q 1 --seq_len_k 1024                     \\
+      --in_dtype Float8E4M3FN --out_dtype Float8E4M3FN                   \\
+      --acc_dtype Float32 --lse_dtype Float32                            \\
+      --is_var_seq --is_var_split_kv                                     \\
+      --is_persistent --warmup_iterations 3                              \\
+      --iterations 10 --skip_ref_check
+
+Constraints:
+
+- Data types: Float8E4M3FN input/output; Float32 accumulation and LSE.
+- Fixed architecture parameters: up to 128 attention heads, latent dimension
+  512, RoPE dimension 64.
+- Input query modes should be (NumHeads, LatentDim/RopeDim, SeqLenQ,
+  BatchSize).
+- Input KV latent/rope modes should be (SeqLenK, LatentDim/RopeDim,
+  BatchSize).
+- Query sequence length must be positive.
+- M64 (1-CTA) tiles are supported only on SM100; M128 tiles use 2-CTA
+  instructions.
+- Variable sequence length requires page table storage.
+"""
+
 import argparse
 import math
 from types import SimpleNamespace
@@ -79,9 +139,11 @@ except ImportError:
         get_mla_decode_fold_sq_factor,
     )
 
-# Please refer to https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/mma_sm100_desc.hpp#L412
-# For how to construct the Instruction Descriptor value.
-# Note: this is a WAR for WS mode MMA, need to be replaced when CuTe DSL supports.
+# Please refer to
+# https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/mma_sm100_desc.hpp#L412
+# for how to construct the Instruction Descriptor value.
+# Note: this is a workaround for WS mode MMA and needs to be replaced when CuTe
+# DSL supports it.
 _IDESC_F8E4M3_F32_M64_N128_KMAJ_1CTA = 0x04200010
 _IDESC_F8E4M3_F32_M64_N128_AK_BMN_1CTA = _IDESC_F8E4M3_F32_M64_N128_KMAJ_1CTA | (
     1 << 16
@@ -124,74 +186,6 @@ def tcgen05_mma_ws_f8f6f4_one(
         )
 
 
-"""
-A Multi-Head Latent Attention (MLA) example with FP8 inputs for SM100, SM103 and SM107 using CuTe DSL.
-
-This example implements multi-head latent attention using a TMA + TensorCore
-warp-specialized persistent kernel. The implementation integrates the (Qc + Qr)*(Kc + Kr)^T
-matrix multiplication, softmax normalization, and softmax((Qc + Qr)*(Kc + Kr)^T)*Vc into a single kernel.
-The kernel provides support for page table storage and variable-length KV cache sequences. It implements KV splitting
-functionality to minimize latency when processing long KV sequences.
-
-The kernel implements key optimizations including:
-- Warp specialization for different computation phases (load, MMA, softmax, correction, epilogue)
-- Pipeline stages between different warps for overlapping computation and memory access
-- Support for different precision data types
-- Two sub-kernels (split KV kernel and reduction kernel) that enable split KV processing
-
-To run this example:
-
-.. code-block:: bash
-
-    python examples/blackwell/mla_fp8.py                                 \
-      --batch_size 4 --latent_dim 512 --rope_dim 64                      \
-      --num_heads 128 --seq_len_q 1 --seq_len_k 1024                     \
-      --in_dtype Float8E4M3FN --out_dtype Float8E4M3FN                   \
-      --acc_dtype Float32 --lse_dtype Float32                            \
-      --is_var_seq --is_var_split_kv                                     \
-      --is_persistent
-
-The above example runs Multi-Head Latent Attention (MLA) with the following configuration:
-- Batch size: 4
-- Sequence length of Q: 1
-- Sequence length of K: 1024
-- Latent dimension: 512
-- RoPE dimension: 64
-- Number of heads: up to 128
-- Data types: Float8E4M3FN (input), Float8E4M3FN (output), Float32 (accumulation and LSE)
-
-It utilizes page table storage for the KV cache and enables both variable-length KV cache sequences
-and variable split KV processing with persistent scheduling.
-
-To collect performance with NCU profiler:
-
-.. code-block:: bash
-
-    ncu python examples/blackwell/mla_fp8.py                             \
-      --batch_size 4 --latent_dim 512 --rope_dim 64                      \
-      --num_heads 128 --seq_len_q 1 --seq_len_k 1024                     \
-      --in_dtype Float8E4M3FN --out_dtype Float8E4M3FN                   \
-      --acc_dtype Float32 --lse_dtype Float32                            \
-      --is_var_seq --is_var_split_kv                                     \
-      --is_persistent --warmup_iterations 3                              \
-      --iterations 10 --skip_ref_check
-
-Constraints for this example:
-* Data type requirements:
-  - Input/output: Float8E4M3FN
-  - Accumulation and LSE: Float32
-* Fixed architecture parameters:
-  - Number of attention heads: up to 128
-  - Latent dimension: 512
-  - RoPE dimension: 64
-* Input query modes should be (NumHeads, LatentDim/RopeDim, SeqLenQ, BatchSize)
-* Input kv latent/rope modes should be (SeqLenK, LatentDim/RopeDim, BatchSize)
-* Query sequence length must be positive
-* Only supports 2-CTA instructions
-* Variable sequence length requires page table storage enabled
-"""
-
-
 class BlackwellMultiHeadLatentAttentionForwardFP8:
     def __init__(
         self,
@@ -210,7 +204,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         num_heads: int = 128,
         seq_len_q: int = 1,
         window_left: int = -1,
-        cp_world: int = 1,  # DCP world size; >1 enables strided global-coord causal masking
+        # DCP world size; >1 enables strided global-coord causal masking.
+        cp_world: int = 1,
         cp_rank: int = 0,
         cp_interleave_size: int = 1,
         reducer_d_tiles: int = 1,
@@ -228,10 +223,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type acc_dtype: Type[cutlass.Numeric]
         :param lse_dtype: Data type for output LSE
         :type lse_dtype: Type[cutlass.Numeric]
-        :param mma_s_tiler: The (H, K) tile shape of the MMA instruction for S
-        :type mma_s_tiler: Tuple[int, int]
-        :param mma_p_tiler: The (H, D) tile shape of the MMA instruction for P
-        :type mma_p_tiler: Tuple[int, int]
+        :param mma_qk_tiler_mn: The (H, K) tile shape of the MMA instruction for S
+        :type mma_qk_tiler_mn: Tuple[int, int]
+        :param mma_pv_tiler_mn: The (H, D) tile shape of the MMA instruction for P
+        :type mma_pv_tiler_mn: Tuple[int, int]
         :param max_active_clusters: Maximum number of active clusters
         :type max_active_clusters: int
         :param page_size: The page size
@@ -357,7 +352,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.iterations_pv_k = self.mma_qk_tiler[1] // self.mma_pv_tiler[2]
         self.iterations_pv_n = self.latent_dim // self.mma_pv_tiler[1]
 
-        # Set specialized warp ids
         self.compute_warp_ids = (0, 1, 2, 3)
         self.correction_warp_ids = (4, 5, 6, 7)
         self.mma_warp_id = 8
@@ -375,11 +369,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             )
         )
 
-        # register settings
         self.softmax_reg_num = 208
         self.correction_reg_num = 240 if self.use_m64_ws else 256
         self.other_reg_num = 56 if self.use_m64_ws else 40
-        # Named barriers
         self.tmem_ptr_sync_bar = pipeline.NamedBarrier(
             barrier_id=1,
             num_threads=(
@@ -407,7 +399,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             self.load_k_stage = 4 if self.is_sm107 else 3
             self.load_v_stage = 4 if self.is_sm107 else 2
         else:
-            # No enough smem for WS mode
+            # Not enough smem for WS mode
             self.load_k_stage = 1
             self.load_v_stage = 1
         self.mma_s_stage = 2
@@ -476,25 +468,34 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         3. Initialization of hardware-specific parameters and memory layouts
         4. Configuration of TMA (Tensor Memory Access) operations
         5. Grid and work scheduling computation
-        6. Kernel launch(split KV kernel and reduction kernel) with appropriate parameters
+        6. Kernel launch(split KV kernel and reduction kernel) with appropriate
+           parameters
 
-        :param q_latent: The query tensor with shape [batch_size, seq_len_q, num_head, latent_dim] (contiguous)
+        :param q_latent: The query tensor with shape [batch_size, seq_len_q, num_head,
+            latent_dim] (contiguous)
         :type q_latent: cute.Tensor
-        :param q_rope: The query RoPE tensor with shape [batch_size, seq_len_q, num_head, rope_dim] (contiguous)
+        :param q_rope: The query RoPE tensor with shape [batch_size, seq_len_q,
+            num_head, rope_dim] (contiguous)
         :type q_rope: cute.Tensor
-        :param c_latent: The key tensor with shape [num_pages, page_size, latent_dim] (contiguous)
+        :param c_latent: The key tensor with shape [num_pages, page_size, latent_dim]
+            (contiguous)
         :type c_latent: cute.Tensor
-        :param c_rope: The key RoPE tensor with shape [num_pages, page_size, rope_dim] (contiguous)
+        :param c_rope: The key RoPE tensor with shape [num_pages, page_size, rope_dim]
+            (contiguous)
         :type c_rope: cute.Tensor
-        :param page_table: The page table tensor with shape [batch_size, page_count] (contiguous)
+        :param page_table: The page table tensor with shape [batch_size, page_count]
+            (contiguous)
         :type page_table: cute.Tensor
         :param local_visible_lens: Optional [batch_size, seq_len_q] exclusive
             prefix bounds into the compact local page table.
-        :param o: The output tensor with shape [batch_size, seq_len_q, num_head, latent_dim] (contiguous)
+        :param o: The output tensor with shape [batch_size, seq_len_q, num_head,
+            latent_dim] (contiguous)
         :type o: cute.Tensor
-        :param lse: The LSE tensor with shape [batch_size, seq_len_q, num_head] (contiguous)
+        :param lse: The LSE tensor with shape [batch_size, seq_len_q, num_head]
+            (contiguous)
         :type lse: cute.Tensor
-        :param workspace: The workspace tensor with 1-d shape prepared for acc_o and acc_lse
+        :param workspace: The workspace tensor with 1-d shape prepared for acc_o and
+            acc_lse
         :type workspace: cute.Tensor
         :param split_kv: The scalar factor for split KV
         :type split_kv: cutlass.Int32
@@ -512,19 +513,18 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :raises TypeError: If tensor data types don't match or aren't supported
         """
 
-        # setup static attributes before smem/grid/tma computation
         self.q_dtype = q_latent.element_type
         self.k_dtype = c_latent.element_type
         self.v_dtype = c_latent.element_type
         self.o_dtype = o.element_type
         self.skip_lse = lse is None
 
-        # check type consistency
         if cutlass.const_expr(
             self.q_dtype != self.k_dtype or self.q_dtype != self.v_dtype
         ):
             raise TypeError(
-                f"Type mismatch: {self.q_dtype} != {self.k_dtype} or {self.q_dtype} != {self.v_dtype}"
+                f"Type mismatch: {self.q_dtype} != {self.k_dtype} or "
+                f"{self.q_dtype} != {self.v_dtype}"
             )
 
         # Reinterpret contiguous [B, S_q, H, D] as [H, D, S_q, B]
@@ -847,7 +847,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             ),
             (None, None, None, (self.iterations_pv_n, None)),
         )
-        # TMA load for Q latent and rope
         tma_load_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(cta_group)
 
         q_smem_layout = cute.select(q_latent_smem_layout_staged, mode=[0, 1, 2])
@@ -869,7 +868,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             qk_tiled_mma,
             cta_layout_vmnk.shape,
         )
-        # TMA load for c latent and k rope
         kc_smem_layout = cute.select(kc_latent_smem_layout_for_tma, mode=[0])
         tma_atom_c_latent, tma_tensor_c_latent = self.make_paged_tiled_tma_atom(
             tma_load_op,
@@ -889,7 +887,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             is_k_load=True,
         )
 
-        # TMA load for c latent transpose
         vc_smem_layout = cute.select(vc_smem_layout_for_tma, mode=[0])
         tma_atom_c_latent_transpose, tma_tensor_c_latent_transpose = (
             self.make_paged_tiled_tma_atom(
@@ -968,7 +965,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         @cute.struct
         class SplitKVKernelSharedStorage:
-            # Pipeline barriers
             load_q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_q_stage * 2]
             load_k_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.load_k_pipeline_stage * 2
@@ -984,7 +980,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             p_cor_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.p_cor_stage * 2]
             mma_o_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_o_stage * 2]
 
-            # Smem tensors
             smem_p: cute.struct.Align[
                 cute.struct.MemRange[self.q_dtype, cute.cosize(p_smem_layout_staged)],
                 1024,
@@ -1025,10 +1020,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 self.acc_dtype, self.num_compute_warps * self.threads_per_warp
             ]
 
-            # Tmem dealloc cluster barrier
             tmem_dealloc_mbar_ptr: cutlass.Int64
 
-            # Tmem holding buffer
             tmem_holding_buf: cutlass.Int32
 
         softmax_scale_log2 = softmax_scale * LOG2_E
@@ -1193,19 +1186,23 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
     ):
         """The device split_kv kernel implementation of the Multi-Head Latent Attention.
 
-        This kernel coordinates multiple specialized warps to perform different phases of the MLA computation:
-        1. Load warp: Loads Q/C latent/rope data from global memory to shared memory using TMA
+        This kernel coordinates multiple specialized warps to perform different
+        phases of the MLA computation:
+        1. Load warps: Load Q/C latent/rope data from global memory to shared
+           memory using TMA
         2. MMA warp: Performs matrix multiplications (Q*K^T and P*V)
-        3. Compute warps: Compute softmax and do rescaling on accumulators, and store the intermediate/final results
-        to global memory
+        3. Compute warps: Compute softmax
+        4. Correction warps: Rescale accumulators and store the
+           intermediate/final results to global memory
 
-        The kernel produces either intermediate or final results of the MLA computation based on the split_kv parameter.
-        When split_kv is 1, the kernel generates the final results directly. Otherwise, it produces intermediate results
-        that will later be combined by a reduction kernel.
+        The kernel produces either intermediate or final results of the MLA
+        computation based on the split_kv parameter. When split_kv is 1, the
+        kernel generates the final results directly. Otherwise, it produces
+        intermediate results that will later be combined by a reduction kernel.
 
-        The kernel implements a complex pipeline with overlapping computation and memory operations,
-        using tensor memory access (TMA) for efficient data loading, warp specialization for different
-        computation phases.
+        The kernel implements a complex pipeline with overlapping computation and
+        memory operations, using tensor memory access (TMA) for efficient data
+        loading, warp specialization for different computation phases.
 
         :param tiled_mma_qk: Tiled MMA for Q*K^T
         :type tiled_mma_qk: cute.TiledMma
@@ -1285,11 +1282,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cpasync.prefetch_descriptor(tma_atom_q_rope)
             cpasync.prefetch_descriptor(tma_atom_c_latent_transpose)
 
-        # Alloc
         smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
-        # Tensor memory dealloc barrier init
         tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_ptr_sync_bar,
@@ -1345,7 +1340,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             storage.p_cor_mbar_ptr.data_ptr()
         )
 
-        # Generate smem tensor Q/KC/VC/exchange
         # (MMA, MMA_H, MMA_R, PIPE)
         sQ = storage.smem_q_latent.get_tensor(
             q_latent_smem_layout_staged.outer, swizzle=q_latent_smem_layout_staged.inner
@@ -1387,14 +1381,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cute.make_layout(self.num_compute_warps * self.threads_per_warp)
         )
 
-        #
         # Cluster wait before tensor memory alloc
-        #
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk)
 
-        # ///////////////////////////////////////////////////////////////////////////////
+        # //////////////////////////////////////////////////////////////////////////////
         #  Load warps, including page table and data tensors
-        # ///////////////////////////////////////////////////////////////////////////////
+        # //////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.empty_warp_ids[0] and warp_idx <= self.empty_warp_ids[-1]:
             cute.arch.setmaxregister_decrease(self.other_reg_num)
 
@@ -1525,9 +1517,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             load_q_pipeline.producer_tail(load_q_producer_state)
             load_v_pipeline.producer_tail(load_v_producer_state)
 
-        # ///////////////////////////////////////////////////////////////////////////////
+        # //////////////////////////////////////////////////////////////////////////////
         #  MMA warp
-        # ///////////////////////////////////////////////////////////////////////////////
+        # //////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.other_reg_num)
             # Fire off async TMEM allocation request early, then overlap
@@ -1636,9 +1628,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
 
-        # ///////////////////////////////////////////////////////////////////////////////
+        # //////////////////////////////////////////////////////////////////////////////
         #  Compute warp
-        # ///////////////////////////////////////////////////////////////////////////////
+        # //////////////////////////////////////////////////////////////////////////////
         if (
             warp_idx >= self.compute_warp_ids[0]
             and warp_idx <= self.compute_warp_ids[-1]
@@ -1710,9 +1702,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 work_tile = tile_sched.get_current_work()
             p_cor_pipeline.producer_tail(p_cor_producer_state)
 
-        # ///////////////////////////////////////////////////////////////////////////////
+        # //////////////////////////////////////////////////////////////////////////////
         #  Correction warp
-        # ///////////////////////////////////////////////////////////////////////////////
+        # //////////////////////////////////////////////////////////////////////////////
         if (
             warp_idx >= self.correction_warp_ids[0]
             and warp_idx <= self.correction_warp_ids[-1]
@@ -1824,8 +1816,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         has_local_visible_lens: cutlass.Constexpr,
         output_scale: cutlass.Float32,
     ):
-        """The reduction kernel for Multi-Head Latent Attention (MLA) that combines intermediate results
-        from multiple split_kv blocks into final outputs.
+        """The reduction kernel for Multi-Head Latent Attention (MLA) that combines
+        intermediate results from multiple split_kv blocks into final outputs.
 
         :param mO: Output tensor for storing final results
         :type mO: cute.Tensor
@@ -1875,7 +1867,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         k_tile_per_cta = cute.ceil_div(k_tile_total - k_tile_lo, local_split_kv)
         local_split_kv = cute.ceil_div(k_tile_total - k_tile_lo, max(1, k_tile_per_cta))
 
-        # Alloc shared memory
         smem = cutlass.memory.SmemAllocator()
         # LSE phase: one weight per lane of warp 0
         reducer_scale_count = (
@@ -1888,7 +1879,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             lse_scale_ptr, cute.make_layout(reducer_scale_count)
         )
 
-        # let the next split kernel get scheduled early; its own wait still orders the data
+        # Let the next split kernel get scheduled early; its own wait still orders
+        # the data.
         cute.arch.griddepcontrol_launch_dependents()
         cute.arch.griddepcontrol_wait()
 
@@ -1943,7 +1935,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 cute.make_layout(lse_per_thread), self.lse_dtype
             )
             lse_max = -self.lse_dtype.inf
-            # find the max lse
             for i in cutlass.range_constexpr(lse_per_thread):
                 split_kv_idx = tidx + i * self.threads_per_warp
                 local_lse[i] = (
@@ -1951,16 +1942,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     if cute.elem_less(split_kv_idx, local_split_kv)
                     else -self.lse_dtype.inf
                 )
-                # reduce the local lse
                 lse_max = cute.arch.fmax(lse_max, local_lse[i])
             lse_max = cute.arch.warp_reduction_max(lse_max)
             lse_max = lse_max if lse_max != -self.lse_dtype.inf else 0.0
-            # calculate sum_lse
             sum_lse = 0.0
             for i in cutlass.range_constexpr(lse_per_thread):
                 sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
             sum_lse = cute.arch.warp_reduction_sum(sum_lse)
-            # calculate the global_lse
             global_lse = (
                 lse_max + cute.math.log2(sum_lse, fastmath=True)
                 if not sum_lse == self.lse_dtype(0.0)
@@ -1970,7 +1958,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             if tidx == 0 and d_tile_idx == 0:
                 if cutlass.const_expr(not self.skip_lse):
                     mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse
-            # store the scale to shared memory, including output_scale (0 past local_split_kv)
+            # Store the scale to shared memory, including output_scale (0 past
+            # local_split_kv).
             for i in cutlass.range_constexpr(lse_per_thread):
                 split_kv_idx = tidx + i * self.threads_per_warp
                 smem_lse_scale[split_kv_idx] = (
@@ -2031,7 +2020,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         first: int,
         rAccO: cute.Tensor,
     ):
-        """Accumulate splits [first, first + batch) into rAccO, skipping empty groups."""
+        """Accumulate splits [first, first + batch) into rAccO, skipping empty ones."""
         batch = self.reducer_batch_splits
         group = self.reducer_accumulate_group
         for g in cutlass.range_constexpr(batch // group):
@@ -2058,9 +2047,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         :param B: Batch size
         :type B: int
-        :param S: Sequence length
+        :param S: Query sequence length
         :type S: int
-        :param K: Sequence length
+        :param K: KV sequence length
         :type K: int
         :param mma_qk_tiler_mn: MLA tiling parameters
         :type mma_qk_tiler_mn: tuple
@@ -2093,7 +2082,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         block_split_kvs: cute.Tensor,
         blk_coord: cute.Coord,
     ) -> tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]:
-        """Get the current k_index, k_tile_count, and local split_kv value for the MLA kernel.
+        """Get the current k_index, k_tile_count, and local split_kv value for the MLA
+        kernel.
 
         :param split_kv: Split_kv value
         :type split_kv: cutlass.Int32
@@ -2136,7 +2126,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         :param common_params: The common parameters (blk_coord, load_q_pipeline)
         :type common_params: SimpleNamespace
-        :param q_params: The q parameters (tiled_mma_qk, tma atoms, mQL, mQR, sQ, sQ_rope)
+        :param q_params: The q parameters (tiled_mma_qk, tma atoms, mQL, mQR, sQ,
+            sQ_rope)
         :type q_params: SimpleNamespace
         :param load_q_producer_state: The load q producer state
         :type load_q_producer_state: pipeline.PipelineState
@@ -2177,7 +2168,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tQLgQL = tQLgQL_mkl[None, None, None, q_group, common_params.blk_coord[2]]
         tQRgQR = tQRgQR_mkl[None, None, None, q_group, common_params.blk_coord[2]]
 
-        # Issue Q TMA copies
         load_q_pipeline = common_params.load_q_pipeline
         tma_bar_ptr = load_q_pipeline.producer_get_barrier(load_q_producer_state)
         load_q_pipeline.producer_acquire(load_q_producer_state)
@@ -2212,7 +2202,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         :param common_params: The common parameters (blk_coord, load_k_pipeline, mPT)
         :type common_params: SimpleNamespace
-        :param k_params: The k parameters (tiled_mma_qk, tma atoms, mCL, mKR, sKC, sKC_rope)
+        :param k_params: The k parameters (tiled_mma_qk, tma atoms, mCL, mKR, sKC,
+            sKC_rope)
         :type k_params: SimpleNamespace
         :param k_index: The k index
         :type k_index: cutlass.Int32
@@ -2221,10 +2212,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param load_k_producer_state: The load k producer state
         :type load_k_producer_state: pipeline.PipelineState
 
-        :return: The updated load k producer state
-        :rtype: pipeline.PipelineState
+        :return: The updated load k and load k rope producer states
+        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState]
         """
-        # page table
         mPT = common_params.mPT[None, common_params.blk_coord[2]]
 
         cta_m = min(
@@ -2272,7 +2262,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             k_params.sKC_rope,
             tSgKR,
         )
-        # set extra params
         common_params.mPT = mPT
         k_params.tSgCL = tSgCL
         k_params.tSgKR = tSgKR
@@ -2306,7 +2295,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         k_tile_count: cutlass.Int32,
         load_v_producer_state: pipeline.PipelineState,
     ) -> pipeline.PipelineState:
-        """Load wrap to load V tensors. Updates the load v producer state.
+        """Load warp to load V tensors. Updates the load v producer state.
 
         :param common_params: The common parameters
         :type common_params: SimpleNamespace
@@ -2322,7 +2311,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :return: The load v producer state
         :rtype: pipeline.PipelineState
         """
-        # page table
         mPT = common_params.mPT[None, common_params.blk_coord[2]]
 
         # Flatten divide and partition global tensors for V TMA load
@@ -2334,7 +2322,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         ]
         tOgCLT = cute.tiled_divide(gCLT, (cta_n, page_tile_size))
         tOgCLT = tOgCLT[None, 0, 0, None, None, None]
-        # tma partition for vc
         # smem: ((atom_v, rest_v), STAGE)
         # gmem: ((atom_v, rest_v), RestM, RestK, RestL)
         tVCsVC, tCLTgCLT = cpasync.tma_partition(
@@ -2345,7 +2332,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tOgCLT,
         )
 
-        # set extra params
         common_params.mPT = mPT
         v_params.tCLTgCLT = tCLTgCLT
         v_params.tVCsVC = tVCsVC
@@ -2381,8 +2367,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param load_k_producer_state: The load k producer state
         :type load_k_producer_state: pipeline.PipelineState
 
-        :return: The updated load k producer state
-        :rtype: pipeline.PipelineState
+        :return: The updated load k and load k rope producer states
+        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState]
         """
         page_per_tile = ceil_div(
             self.mma_qk_tiler[1] // self.page_size, k_params.tiled_mma_qk.thr_id.shape
@@ -2506,7 +2492,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         k_index: cutlass.Int32,
         load_v_producer_state: pipeline.PipelineState,
     ) -> pipeline.PipelineState:
-        """Load one k-tile of compressed latent transpose tensor(v). Updates the load qkv producer state.
+        """Load one k-tile of compressed latent transpose tensor(v). Updates the load
+        v producer state.
 
         :param common_params: The common parameters
         :type common_params: SimpleNamespace
@@ -2517,7 +2504,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param load_v_producer_state: The load v producer state
         :type load_v_producer_state: pipeline.PipelineState
 
-        :return: The load qkv producer state
+        :return: The load v producer state
         :rtype: pipeline.PipelineState
         """
         page_per_tile = self.mma_pv_tiler[2] * self.iterations_pv_k // self.page_size
@@ -2615,7 +2602,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         pipeline.PipelineState,
         pipeline.PipelineState,
     ]:
-        """MMA warp to compute the result of Q*K^T and P*V. Updates the tiled mma and pipeline states.
+        """MMA warp to compute the result of Q*K^T and P*V. Updates the tiled mma and
+        pipeline states.
 
         :param common_params: The common parameters for mma qk and pv
         :type common_params: SimpleNamespace
@@ -2642,8 +2630,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param mma_o_producer_state: The mma o producer state
         :type mma_o_producer_state: pipeline.PipelineState
 
-        :return: The tiled mma qk, the tiled mma pv, the load q consumer state, the load k consumer state, the load v consumer state, the mma s producer state, the p mma consumer state, and the mma o producer state
-        :rtype: tuple[cute.TiledMma, cute.TiledMma, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
+        :return: The tiled mma qk, the tiled mma pv, the load q consumer state, the load
+            k consumer state, the load v consumer state, the mma s producer state, the p
+            mma consumer state, and the mma o producer state
         """
 
         tSrQ = tiled_mma_qk.make_fragment_A(qk_params.sQ)
@@ -2695,7 +2684,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tStS_staged.iterator + self.tmem_o_offset, tOtO_layout
         )
 
-        # set more parameters
         qk_params.tSrQ = tSrQ
         qk_params.tSrQ_rope = tSrQ_rope
         qk_params.tSrKC = tSrKC
@@ -2705,7 +2693,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         pv_params.tOrVC = tOrVC
         pv_params.tOtO_staged = tOtO_staged
 
-        # mma O accumulates on K, so the accumulate flag is set to False once before all K blocks.
+        # MMA O accumulates on K, so the accumulate flag is set to False once
+        # before all K blocks.
         tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
         load_q_pipeline = common_params.load_q_pipeline
         pv_k_index = common_params.k_index
@@ -2836,7 +2825,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         pipeline.PipelineState,
         pipeline.PipelineState,
     ]:
-        """Compute one k-tile of mma for Q*K^T. Updates the tiled MMA QK and pipeline states.
+        """Compute one k-tile of mma for Q*K^T. Updates the tiled MMA QK and pipeline
+        states.
 
         :param qk_params: The qk parameters
         :type qk_params: SimpleNamespace
@@ -2849,8 +2839,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param mma_s_producer_state: The mma s producer state
         :type mma_s_producer_state: pipeline.PipelineState
 
-        :return: The tiled mma qk, the load q consumer state, the load k consumer state, and the mma s producer state
-        :rtype: tuple[cute.TiledMma, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
+        :return: The tiled mma qk, the load q consumer state, the load k consumer state,
+            the load k rope consumer state, and the mma s producer state
         """
         tStS = qk_params.tStS_staged[None, None, None, mma_s_producer_state.index]
 
@@ -2953,7 +2943,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         pipeline.PipelineState,
         pipeline.PipelineState,
     ]:
-        """Compute one k-tile of mma for P*V. Updates the tiled mma pv and pipeline states.
+        """Compute one k-tile of mma for P*V. Updates the tiled mma pv and pipeline
+        states.
 
         :param common_params: The common parameters
         :type common_params: SimpleNamespace
@@ -2968,8 +2959,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param mma_o_producer_state: The MMA o producer state
         :type mma_o_producer_state: pipeline.PipelineState
 
-        :return: The tiled mma pv, the load v consumer state, the P MMA consumer state, and the MMA o producer state
-        :rtype: tuple[cute.TiledMma, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
+        :return: The tiled mma pv, the load v consumer state, the P MMA consumer state,
+            and the MMA o producer state
         """
 
         pv_params.p_mma_pipeline.consumer_wait(p_mma_consumer_state)
@@ -3064,7 +3055,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         p_mma_producer_state: pipeline.PipelineState,
         p_cor_producer_state: pipeline.PipelineState,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]:
-        """Compute warp to compute the result of softmax, rescale, and epilogue. Updates the related pipeline states.
+        """Compute warp to compute the result of softmax, rescale, and epilogue. Updates
+        the related pipeline states.
 
         :param common_params: The common parameters
         :type common_params: SimpleNamespace
@@ -3081,8 +3073,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param p_cor_producer_state: The P correction producer state
         :type p_cor_producer_state: pipeline.PipelineState
 
-        :return: The MMA s consumer state, the P MMA producer state, and the P correction producer state
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
+        :return: The MMA s consumer state, the P MMA producer state, and the P
+            correction producer state
         """
 
         k_tile_total = cute.ceil_div(common_params.K, self.mma_qk_tiler[1])
@@ -3267,14 +3259,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         p_cor_consumer_state: pipeline.PipelineState,
         mma_o_consumer_state: pipeline.PipelineState,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
-        """Compute warp to compute the result of softmax, rescale, and epilogue. Updates the related pipeline states.
+        """Correction warp to rescale O and run the epilogue. Updates the related
+        pipeline states.
 
         :param common_params: The common parameters
         :type common_params: SimpleNamespace
         :param epilogue_params: The epilogue parameters
         :type epilogue_params: SimpleNamespace
-        :param k_index: The index of the k-tile
-        :type k_index: cutlass.Int32
         :param k_tile_count: The number of k-tiles
         :type k_tile_count: cutlass.Int32
         :param p_cor_consumer_state: The P correction consumer state
@@ -3417,7 +3408,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         cutlass.Float32,
         cutlass.Float32,
     ]:
-        """Softmax for one k-tile. Updates the related pipeline states and returns the computed results.
+        """Softmax for one k-tile. Updates the related pipeline states and returns the
+        computed results.
 
         :param common_params: The common parameters
         :type common_params: SimpleNamespace
@@ -3444,8 +3436,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param is_local_last_tile: Whether the last tile is local
         :type is_local_last_tile: cutlass.Boolean
 
-        :return: The MMA s consumer state, the P MMA producer state, the P correction producer state, the row max, the row sum, and the correction factor
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState, cutlass.Float32, cutlass.Float32, cutlass.Float32]
+        :return: The MMA s consumer state, the P MMA producer state, the P correction
+            producer state, the row max, the row sum, and the correction factor
         """
 
         mma_s_try_token = softmax_params.mma_s_pipeline.consumer_try_wait(
@@ -3455,7 +3447,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             mma_s_consumer_state, try_wait_token=mma_s_try_token
         )
 
-        # load S from tmem
         if cutlass.const_expr(self.use_m64_ws):
             tStS_shape = softmax_params.tiled_mma_ws_splitn_epi.partition_shape_C(
                 self.ws_splitn_epi_tiler_mn
@@ -3551,8 +3542,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                 min(q_tok, self.seq_len_q - 1),
                             ]
                         elif cutlass.const_expr(self.cp_world == 1):
-                            # Non-DCP: causal bound is the full local context length
-                            # (identical to the pre-DCP behavior; folded at compile time).
+                            # Non-DCP: causal bound is the full local context
+                            # length (identical to the pre-DCP behavior; folded
+                            # at compile time).
                             k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                         else:
                             global_bound = (
@@ -3603,7 +3595,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             )
                             else masked_score
                         )
-            # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
         else:  # SM103 and SM107 support TMEM load with a MAX reduction.
             tmem_load_red_atom = cute.make_copy_atom(
@@ -3665,8 +3656,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                 min(q_tok, self.seq_len_q - 1),
                             ]
                         elif cutlass.const_expr(self.cp_world == 1):
-                            # Non-DCP: causal bound is the full local context length
-                            # (identical to the pre-DCP behavior; folded at compile time).
+                            # Non-DCP: causal bound is the full local context
+                            # length (identical to the pre-DCP behavior; folded
+                            # at compile time).
                             k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                         else:
                             global_bound = (
@@ -3742,7 +3734,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     (tidx + 64) % (self.num_compute_warps * self.threads_per_warp)
                 ],
             )
-        # find correction factor
         max_delta = row_max - row_max_new
         if cutlass.const_expr(common_params.local_visible_lens is not None):
             # Both maxima are -inf until this row sees a local key.
@@ -3757,7 +3748,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         no_correction = cutlass.Int32(1) if skip else cutlass.Int32(0)
         row_max_new = row_max if skip else row_max_new
         correction_factor = cutlass.Float32(1.0) if skip else correction_factor
-        # split kv case
         if cutlass.const_expr(not is_local_last_tile):
             p_cor_producer_state = self.exchange_p_cor_metadata(
                 common_params,
@@ -3771,7 +3761,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 p_cor_producer_state,
             )
 
-        # softmax
         fma_b = softmax_params.softmax_scale_log2
         safe_row_max = row_max_new
         if cutlass.const_expr(common_params.local_visible_lens is not None):
@@ -3795,7 +3784,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         tTR_rS = cute.make_fragment_like(tTR_tS, self.q_dtype)
 
-        # quantize
         tTR_rS.store(tTR_rAcc.load().to(self.q_dtype))
 
         # Acquire close to STS so softmax work can overlap with downstream MMA.
@@ -3848,7 +3836,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             p_cor_producer_state
         )
 
-        # split kv case
         if cutlass.const_expr(is_local_last_tile):
             p_cor_producer_state = self.exchange_p_cor_metadata(
                 common_params,
@@ -3891,8 +3878,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param iter_n: The iteration number
         :type iter_n: int
 
-        :return: The tiled mma pv, the tiled mma pv, the tiled mma pv, the tiled mma pv, the tiled mma pv
-        :rtype: tuple[cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma]
+        :return: The TMEM load tiled copy, the O accumulator, its TMEM source
+            partition, the global output partition, the identity coordinate
+            partition, and the register fragment
         """
 
         if cutlass.const_expr(self.use_m64_ws):
@@ -4051,8 +4039,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param p_cor_consumer_state: The P correction consumer state
         :type p_cor_consumer_state: pipeline.PipelineState
 
-        :return: The P correction consumer state, the row_sum, the row_max, and the correction factor
-        :rtype: tuple[pipeline.PipelineState, cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Int32]
+        :return: The P correction consumer state, the row_sum, the row_max, and the
+            correction factor
         """
         common_params.p_cor_pipeline.consumer_wait(p_cor_consumer_state)
         tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
@@ -4143,7 +4131,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type mma_o_consumer_state: pipeline.PipelineState
         :param correction_factor: The correction factor
         :type correction_factor: cutlass.Float32
-        :param no_correction: Whether to apply correction factor
+        :param no_correction: Whether to skip the correction factor (1 skips)
         :type no_correction: cutlass.Int32
 
         :return: The MMA o consumer state
@@ -4153,14 +4141,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
             common_params.mma_o_pipeline.consumer_wait(mma_o_consumer_state)
             if not skip_correction:
-                # tmem load tiled copy and partition results.
                 tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
                     self._tmem_load_partition(
                         common_params, common_params.tiled_mma_pv, iter_n
                     )
                 )
 
-                # tmem store tiled copy
                 if cutlass.const_expr(self.use_m64_ws):
                     if cutlass.const_expr(self.mma_pv_tiler[1] == 256):
                         tmem_store_atom = cute.make_copy_atom(
@@ -4184,7 +4170,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     )
                 tmem_store_tiled_copy = tcgen05.make_tmem_copy(tmem_store_atom, tAcc)
 
-                # load o
                 cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
                 # rescale, using `mul_packed_f32x2` to reduce the number of instructions
                 for i in cutlass.range(
@@ -4261,17 +4246,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             epi_scale = cute.arch.rcp_approx(safe_row_sum)
             store_dtype = self.partial_dtype
 
-        # mma_o pipeline consumer wait
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
             common_params.mma_o_pipeline.consumer_wait(mma_o_consumer_state)
-            # tmem load tiled copy and partition results (full tile).
             tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
                 self._tmem_load_partition(
                     common_params, common_params.tiled_mma_pv, iter_n
                 )
             )
 
-            # Full TMEM load to registers
             cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
             if cutlass.const_expr(common_params.local_visible_lens is not None):
                 if row_sum == 0.0:
@@ -4304,12 +4286,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 num_epi_subtiles = tTR_rAcc.shape[2]
                 vec_size = cute.size(cute.select(tTR_rAcc.shape, mode=[0]))
 
-                # Prepare output fragment for type conversion
                 tR2G_rO_src = cute.make_fragment_like(tTR_gO, store_dtype)
                 tR2G_rO_dst = tTR_gO
 
                 for d_sub in cutlass.range_constexpr(num_epi_subtiles):
-                    # Elementwise: scale and normalize (using pre-computed epi_scale)
                     for i in cutlass.range(vec_size, vectorize=True, unroll_full=True):
                         tTR_rAcc[i, 0, d_sub] = tTR_rAcc[i, 0, d_sub] * epi_scale
 
@@ -4328,7 +4308,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                         )
 
-            # store the lse to global memory
             cta_pv_tiler = (
                 self.mma_pv_tiler[0] // self.cluster_shape_mnk[0],
                 self.mma_pv_tiler[1],
@@ -4585,14 +4564,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         max_active_clusters: int,
         is_persistent: bool,
     ) -> Tuple[MLAStaticTileSchedulerParams, Tuple[int, int, int]]:
-        """Compute grid shape for the output tensor C.
-
-        :param c: The output tensor C
-        :type c: cute.Tensor
-        :param cta_tile_shape_mnk: The shape (M, N, K) of the CTA tile.
-        :type cta_tile_shape_mnk: tuple[int, int, int]
-        :param cluster_shape_mn: Shape of each cluster in M, N dimensions.
-        :type cluster_shape_mn: tuple[int, int]
+        """Compute grid shape for the output tensor O.
 
         :return: Tile scheduler parameters and grid shape.
         :rtype: tuple[MLAStaticTileSchedulerParams, tuple[int, int, int]]
@@ -4620,7 +4592,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         split_kv: int,
         acc_dtype: Type[cutlass.Numeric],
     ) -> int:
-        """Get the extra workspace(device memory) size for the MLA kernel when split_kv is not 1.
+        """Get the extra workspace(device memory) size for the MLA kernel when split_kv
+        is not 1.
 
         :param H: The height of the output tensor C
         :type H: int
@@ -4653,8 +4626,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         acc_dtype: Type[cutlass.Numeric],
         workspace: cute.Tensor,
     ) -> tuple[cute.Tensor, cute.Tensor]:
-        """Initialize the workspace for the MLA kernel. Construct the intermediate tensors
-        acc_o and acc_lse.
+        """Initialize the workspace for the MLA kernel. Construct the intermediate
+        tensors acc_o and acc_lse.
 
         :param H: The height of the output tensor C
         :type H: cutlass.Int32
@@ -4671,8 +4644,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param workspace: The workspace tensor
         :type workspace: cute.Tensor
 
-        :return: The output tensor C and the workspace tensor
-        :rtype: tuple[cute.Tensor, cute.Tensor]
+        :return: The acc_o and acc_lse workspace views (None without a workspace)
+        :rtype: tuple[Optional[cute.Tensor], Optional[cute.Tensor]]
         """
         acc_o, acc_lse = None, None
         if cutlass.const_expr(workspace is not None):
@@ -4694,7 +4667,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 (H, split_kv, S, B),
                 stride=(split_kv, 1, H * split_kv, H * split_kv * S),
             )
-            # the partial block is a multiple of 1 KB; say so or LSE loads drop to 16-bit halves
+            # The partial block is a multiple of 1 KB; say so or LSE loads drop to
+            # 16-bit halves.
             # Convert bits to bytes before multiplying the Int32 element count.
             acc_lse_iter = cute.recast_ptr(
                 workspace.iterator
@@ -4750,7 +4724,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type lse_dtype: Type[cutlass.Numeric]
         :param mma_qk_tiler_mn: The tile shape of the query-key matrix multiplication
         :type mma_qk_tiler_mn: Tuple[int, int]
-        :param mma_pv_tiler_mn: The tile shape of the probability-value matrix multiplication
+        :param mma_pv_tiler_mn: The tile shape of the probability-value matrix
+            multiplication
         :type mma_pv_tiler_mn: Tuple[int, int]
         :param split_kv: The split key-value of the output tensor C
         :type split_kv: int
@@ -4837,10 +4812,12 @@ def run(
 ):
     """Execute MLA on SM100, SM103 or SM107 and validate results.
 
-    This function creates random input tensors for query latent/rope, compressed latent/rope, and value,
-    then performs the complete MLA computation pipeline. It supports configurable data types, tiling parameters,
-    page table, variable sequence length, and variable split_kv. Results can be validated against a PyTorch reference
-    implementation or run multiple times for performance measurement.
+    This function creates random input tensors for query latent/rope,
+    compressed latent/rope, and value, then performs the complete MLA
+    computation pipeline. It supports configurable data types, tiling
+    parameters, page table, variable sequence length, and variable split_kv.
+    Results can be validated against a PyTorch reference implementation or run
+    multiple times for performance measurement.
 
     :param batch_size: Batch size
     :type batch_size: int
@@ -4862,9 +4839,11 @@ def run(
     :type acc_dtype: Type[cutlass.Numeric]
     :param lse_dtype: Accumulator data type for log-sum-exp
     :type lse_dtype: Type[cutlass.Numeric]
-    :param mma_qk_tiler_mn: Matrix multiply accumulate tile shape (M, N) for query-key matrix multiplication
+    :param mma_qk_tiler_mn: Matrix multiply accumulate tile shape (M, N) for query-key
+        matrix multiplication
     :type mma_qk_tiler_mn: Tuple[int, int]
-    :param mma_pv_tiler_mn: Matrix multiply accumulate tile shape (M, N) for probability-value matrix multiplication
+    :param mma_pv_tiler_mn: Matrix multiply accumulate tile shape (M, N) for
+        probability-value matrix multiplication
     :type mma_pv_tiler_mn: Tuple[int, int]
     :param split_kv: Split key-value
     :type split_kv: int
@@ -4893,9 +4872,11 @@ def run(
     :param use_cold_l2: Whether to use cold L2 cache
     :type use_cold_l2: bool
 
-    :raises ValueError: If input shapes are incompatible or head dimension is unsupported
+    :raises ValueError: If input shapes are incompatible or head dimension is
+        unsupported
     :raises RuntimeError: If GPU is unavailable for computation
     """
+    del kwargs
 
     if num_heads * seq_len_q <= 64 and torch.cuda.get_device_capability() == (10, 0):
         mma_qk_tiler_mn = (64, 128)
@@ -4931,7 +4912,6 @@ def run(
     import cutlass.torch as cutlass_torch
     import torch
 
-    # Prepare pytorch tensors: Q, K, V (random from 0 to 2) and O (all zero)
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
 
@@ -4955,7 +4935,11 @@ def run(
         page_size,
     ):
         raise TypeError(
-            f"Unsupported testcase {batch_size}, {seq_len_q}, {seq_len_k}, {num_heads}, {latent_dim}, {rope_dim}, {in_dtype}, {out_dtype}, {acc_dtype}, {lse_dtype}, {mma_qk_tiler_mn}, {mma_pv_tiler_mn}, {split_kv}, {is_persistent}, {is_var_seq}, {is_var_split_kv}, {page_size}"
+            f"Unsupported testcase {batch_size}, {seq_len_q}, {seq_len_k}, "
+            f"{num_heads}, {latent_dim}, {rope_dim}, {in_dtype}, {out_dtype}, "
+            f"{acc_dtype}, {lse_dtype}, {mma_qk_tiler_mn}, {mma_pv_tiler_mn}, "
+            f"{split_kv}, {is_persistent}, {is_var_seq}, {is_var_split_kv}, "
+            f"{page_size}"
         )
 
     torch.manual_seed(1111)
@@ -4982,7 +4966,8 @@ def run(
         if seq_len_q is not None:
             shape = (B, seq_len_q, HK, D)
 
-        # Contiguous row-major: last dim has stride 1 (highest stride_order value = fastest)
+        # Contiguous row-major: last dim has stride 1 (highest stride_order
+        # value = fastest).
         if is_lse:
             shape = (B, seq_len_q, HK)
             leading_dim = 2
@@ -5008,13 +4993,10 @@ def run(
             init_config=init_config,
         )
 
-        # Create dtype torch tensor (gpu)
         torch_tensor_gpu = torch_tensor_cpu.cuda()
 
-        # Create f32 torch tensor (cpu)
         f32_torch_tensor = torch_tensor_cpu.to(dtype=torch.float32)
 
-        # Create dtype cute tensor (gpu)
         cute_tensor = from_dlpack(torch_tensor_gpu, assumed_align=16)
         cute_tensor.element_type = dtype
         if is_dynamic_layout:
@@ -5061,7 +5043,9 @@ def run(
         max_seq_len = seq_len_k if not is_var_seq else torch.max(cache_seqs_ref)
         page_count = ceil_div(max_seq_len, page_size)
         page_table_ref = torch.empty([batch_size, page_count], dtype=torch.int32)
-        # use transposed index for page table to make sure the value is in bound of `batch_size * seq_len_block`. In practice, the value could be any positive values. This setting is only for testing purpose.
+        # Use a transposed index for the page table to make sure the value is in
+        # bounds of `batch_size * seq_len_block`. In practice, the value could be
+        # any positive value. This setting is only for testing purposes.
         for b in range(batch_size):
             for j in range(page_count):
                 page_table_ref[b, j] = b + j * batch_size
@@ -5081,7 +5065,6 @@ def run(
         max_active_clusters,
     ):
         block_split_kvs_ref, block_split_kvs, block_split_kvs_gpu = None, None, None
-        # check if split_kv is valid otherwise do auto setting of split_kv
         # Use seq_len_q_for_split (effective S_q after fold grouping).
         if is_var_split_kv:
             block_split_kvs_ref = torch.zeros([batch_size], dtype=torch.int32)
@@ -5147,16 +5130,14 @@ def run(
         num_heads, seq_len_q, mma_qk_tiler_mn[0]
     )
     seq_len_q_for_split = seq_len_q // fold_sq_factor
-    split_kv, block_split_kvs_ref, block_split_kvs, block_split_kvs_torch = (
-        create_block_split_kvs(
-            batch_size,
-            split_kv,
-            cache_seqs_ref,
-            is_var_split_kv,
-            mma_qk_tiler_mn,
-            cluster_shape_mnk,
-            max_active_clusters,
-        )
+    split_kv, _, block_split_kvs, block_split_kvs_torch = create_block_split_kvs(
+        batch_size,
+        split_kv,
+        cache_seqs_ref,
+        is_var_split_kv,
+        mma_qk_tiler_mn,
+        cluster_shape_mnk,
+        max_active_clusters,
     )
 
     q_latent_ref, q_latent, q_latent_torch = create_data_tensor(
@@ -5238,12 +5219,9 @@ def run(
         partial_fp16=partial_fp16,
     )
 
-    # Get current CUDA stream from PyTorch
     torch_stream = torch.cuda.current_stream()
-    # Get the raw stream pointer as a CUstream
     stream = cuda.CUstream(torch_stream.cuda_stream)
 
-    # compile mla kernel
     compiled_mla = cute.compile(
         mla,
         q_latent,
@@ -5256,7 +5234,7 @@ def run(
         workspace,
         split_kv,
         cache_seqs,
-        cache_seqs,  # causal_seqs == cache_seqs for the standalone (non-DCP, cp_world=1)
+        cache_seqs,  # causal_seqs == cache_seqs when non-DCP (cp_world=1).
         block_split_kvs,
         softmax_scale,
         output_scale,
@@ -5339,7 +5317,7 @@ def run(
             s_ref = s_ref.masked_fill(
                 ~attn_mask.to(s_ref.device).expand_as(s_ref), float("-inf")
             )
-        s_ref_max, s_ref_max_pos = torch.max(s_ref, dim=-1, keepdim=True)
+        s_ref_max, _ = torch.max(s_ref, dim=-1, keepdim=True)
         softmax_scale_log2 = LOG2_E * softmax_scale
         s_ref_sum = torch.sum(
             torch.exp2((s_ref - s_ref_max) * softmax_scale_log2), dim=-1, keepdim=True
@@ -5354,11 +5332,11 @@ def run(
 
     if skip_correction_threshold > 0.0:
         print(
-            "Skipping correction verification since skip_correction_threshold is greater than 0.0..."
+            "Skipping correction verification since skip_correction_threshold "
+            "is greater than 0.0..."
         )
         skip_ref_check = True
     if not skip_ref_check:
-        # Execute kernel once for reference checking
         compiled_mla(
             q_latent,
             q_rope,
@@ -5370,7 +5348,7 @@ def run(
             workspace,
             split_kv,
             cache_seqs,
-            cache_seqs,  # causal_seqs == cache_seqs for the standalone (non-DCP, cp_world=1)
+            cache_seqs,  # causal_seqs == cache_seqs when non-DCP (cp_world=1).
             block_split_kvs,
             softmax_scale,
             output_scale,
@@ -5393,8 +5371,9 @@ def run(
         )
 
         if out_dtype in [cutlass.Float8E5M2, cutlass.Float8E4M3FN]:
-            # Avoid cute.testing.convert here because it can bus-error in local and CI runs.
-            # convert o back to f32 for comparison
+            # Avoid cute.testing.convert here because it can bus-error in local
+            # and CI runs.
+            # Convert o back to f32 for comparison.
             o_fp32, o_fp32_torch = cutlass_torch.cute_tensor_like(
                 torch.empty(*o_torch.shape, dtype=torch.float32),
                 cutlass.Float32,
@@ -5421,7 +5400,6 @@ def run(
             o = o_torch.cpu().to(torch.float32)
         lse = lse_torch.cpu()
         lse_ref = lse_ref.to(cutlass.torch.dtype(lse_dtype))
-        # Assert close results
         torch.testing.assert_close(o, o_ref, atol=tolerance, rtol=1e-05)
         torch.testing.assert_close(lse, lse_ref, atol=tolerance, rtol=1e-05)
         print("Results verified successfully!")
@@ -5493,7 +5471,7 @@ def run(
             is_lse=True,
             seq_len_q=seq_len_q,
         )
-        workspace, workspace_torch = create_workspace(
+        workspace, _ = create_workspace(
             num_heads_eff, seq_len_q_eff, latent_dim, batch_size, _split_kv, acc_dtype
         )
         return testing.JitArguments(
@@ -5507,7 +5485,7 @@ def run(
             workspace,
             _split_kv,
             cache_seqs,
-            cache_seqs,  # causal_seqs == cache_seqs for the standalone (non-DCP, cp_world=1)
+            cache_seqs,  # causal_seqs == cache_seqs when non-DCP (cp_world=1).
             block_split_kvs,
             softmax_scale,
             output_scale,
@@ -5557,10 +5535,10 @@ if __name__ == "__main__":
     def parse_comma_separated_ints(s: str) -> Tuple[int, ...]:
         try:
             return tuple(int(x.strip()) for x in s.split(","))
-        except ValueError:
-            raise argparse.ArgumentTypeError(  # noqa: B904
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
                 "Invalid format. Expected comma-separated integers."
-            )
+            ) from exc
 
     def parse_mma_tiler(s: str) -> Tuple[int, int, Tuple[int, int]]:
         ret = parse_comma_separated_ints(s)
@@ -5742,7 +5720,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--is_causal",
         action="store_true",
-        help="Apply spec-decoding causal mask: Q token qi sees KV [0, K - S_q + 1 + qi)",
+        help=(
+            "Apply spec-decoding causal mask: Q token qi sees KV "
+            "[0, K - S_q + 1 + qi)"
+        ),
     )
 
     parser.add_argument(

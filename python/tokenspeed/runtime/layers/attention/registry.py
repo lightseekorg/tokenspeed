@@ -239,8 +239,6 @@ def _cache_storage_report(
     }
 
 
-# ---------- backend registry ----------
-
 # Maps backend_name -> (supported archs, backend class)
 _BACKEND_REGISTRY: dict[str, tuple[set[AttentionArch], type[AttentionBackend]]] = {}
 
@@ -665,8 +663,6 @@ def _validate_lcm_page_size(
             f"size, got {prefix_granularity} and {kernel_page_size}"
         )
 
-
-# ---------- arch -> config class ----------
 
 _CONFIG_CLS: dict[AttentionArch, type[SoftmaxAttnConfig]] = {
     AttentionArch.MHA: MHAConfig,
@@ -1135,7 +1131,6 @@ def _prepare_fixed_workspaces(
         )
 
 
-# ---------- public API ----------
 def _narrow_spec_for_pp(
     spec: CachePoolSpec, ownership: CacheLayerOwnership
 ) -> CachePoolSpec:
@@ -1385,7 +1380,8 @@ def create_attn_components(
         logging.DEBUG if probe_batch_rows is not None else logging.INFO,
         f"Cache profile: parent_bytes={spec.memory_plan.lcm_block_bytes:d}, P="
         f"{spec.memory_plan.prefix_granularity:d}, parents="
-        f"{spec.memory_plan.num_lcm_blocks:d}, token_capacity={spec.token_capacity:d}, "
+        f"{spec.memory_plan.num_lcm_blocks:d}, token_capacity="
+        f"{spec.token_capacity:d}, "
         f"layers={len(spec.layer_types):d} (draft {num_draft_cache_layers:d}), "
         "groups="
         f"{ {group.group_id: group.cache_blocks_per_lcm_block for group in spec.memory_plan.groups}!s}",

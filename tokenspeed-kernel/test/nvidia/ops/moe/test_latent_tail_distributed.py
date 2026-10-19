@@ -63,6 +63,7 @@ def _require_attn_collective():
 
 
 def _attn_collective(dev, max_m):
+    del dev
     from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit import (  # noqa: E501
         CollectiveKernel,
     )

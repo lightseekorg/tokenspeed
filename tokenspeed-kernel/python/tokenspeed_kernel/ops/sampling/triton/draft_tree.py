@@ -254,7 +254,8 @@ def _draft_tree_expand_kernel(
     child = tl.where(child > 0.0, 0.0, child)
     token = tl.load(child_tokens_ptr + req * K * K + idx, mask=ok, other=0)
     score = tl.load(lane_scores_ptr + req * K + lane, mask=ok, other=0.0) + child
-    # NaN (e.g. a padded request's garbage logits) ranks last, so ranks stay a permutation.
+    # NaN (e.g. a padded request's garbage logits) ranks last, so ranks stay a
+    # permutation.
     score = tl.where(score == score, score, float("-inf"))
     parent = tl.load(lane_entry_ptr + req * K + lane, mask=ok, other=-1)
 
@@ -264,7 +265,8 @@ def _draft_tree_expand_kernel(
     tl.store(entry_depth_ptr + entry, tl.full([KK_PAD], depth, tl.int64), mask=ok)
     tl.store(entry_tokens_ptr + entry, token, mask=ok)
 
-    # Rank among the K * K children, ties to the lower index; the best K become the lanes.
+    # Rank among the K * K children, ties to the lower index; the best K become
+    # the lanes.
     rank = tl.zeros([KK_PAD], dtype=tl.int32)
     for j in tl.static_range(K * K):
         other_child = tl.load(child_scores_ptr + req * K * K + j)
@@ -281,7 +283,8 @@ def _draft_tree_expand_kernel(
     tl.store(lane_entry_ptr + req * K + rank, (start + idx).to(tl.int64), mask=best)
     tl.store(lane_tokens_ptr + req * K + rank, token, mask=best)
     if PREPARE_NEXT:
-        # The next step's lane r: its parent lane's ancestors plus its own lane window slot.
+        # The next step's lane r: its parent lane's ancestors plus its own lane
+        # window slot.
         own_bit = tl.full([KK_PAD], 1, tl.int64) << (mask_bit_base + rank).to(tl.int64)
         tl.store(lane_mask_ptr + req * K + rank, parent_mask | own_bit, mask=best)
         cols = tl.arange(0, HBLOCK)

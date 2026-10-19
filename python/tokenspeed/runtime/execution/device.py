@@ -1069,7 +1069,8 @@ def arm_data_plane_sync_debug(device: str) -> None:
         return
     if mode not in ("warn", "error"):
         raise ValueError(
-            f"TOKENSPEED_DATA_PLANE_SYNC_DEBUG must be default, warn or error, got {mode!r}"
+            "TOKENSPEED_DATA_PLANE_SYNC_DEBUG must be default, warn or error, "
+            f"got {mode!r}"
         )
     if torch.device(device).type != "cuda":
         logger.warning(

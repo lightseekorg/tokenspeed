@@ -42,8 +42,8 @@ SampleRegistration = tuple[dict, Callable]
 def detected_platform() -> PlatformInfo | None:
     """Return the current platform, or ``None`` when none is usable.
 
-    ``current_platform()`` raises when PyTorch sees no GPU or unsupported
-    architecture that. Tests gate themselves at import time, so turn that into
+    ``current_platform()`` raises when PyTorch sees no GPU or an unsupported
+    architecture. Tests gate themselves at import time, so turn that into
     a value they can branch on instead of a collection error.
     """
     try:
@@ -111,7 +111,10 @@ def assert_no_triton_compile(*kernels: Any) -> Iterator[None]:
 
 
 def compiled_kernels(kernel: Any) -> list[Any]:
-    """Every binary this process has compiled for a Triton ``kernel``, from its JIT cache."""
+    """Returns every binary this process has compiled for a Triton ``kernel``.
+
+    The binaries are read from the kernel's JIT cache.
+    """
     return [
         binary
         for cache in kernel.device_caches.values()

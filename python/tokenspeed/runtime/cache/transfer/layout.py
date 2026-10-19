@@ -184,7 +184,8 @@ def layout_from_lcm_plan(
         unknown_fields = field_ids - known_field_ids
         if unknown_fields:
             raise ValueError(
-                f"selected cache fields are absent from the plan: {sorted(unknown_fields)}"
+                "selected cache fields are absent from the plan: "
+                f"{sorted(unknown_fields)}"
             )
     fields_by_group = {
         group.group_id: tuple(

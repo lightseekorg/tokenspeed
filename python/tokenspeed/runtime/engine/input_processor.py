@@ -309,7 +309,7 @@ class InputProcessor:
         self,
         obj: GenerateReqInput | EmbeddingReqInput,
     ) -> TokenizedGenerateReqInput | TokenizedEmbeddingReqInput:
-        """Tokenize one request without changing current behavior."""
+        """Tokenize and validate one request."""
         input_embeds = None
         multimodal_inputs = None
         input_ids_unpadded = None

@@ -382,7 +382,8 @@ def gumbel_sample_top_p_parallel_from_pools(
         raise ValueError("gumbel_sample_top_p_parallel_from_pools requires CUDA logits")
     if logits.stride(-1) != 1:
         raise ValueError(
-            "gumbel_sample_top_p_parallel_from_pools requires stride-1 vocab dimension, "
+            "gumbel_sample_top_p_parallel_from_pools requires stride-1 vocab "
+            "dimension, "
             f"got stride={logits.stride()}"
         )
     rows, vocab_size = logits.shape
@@ -400,7 +401,8 @@ def gumbel_sample_top_p_parallel_from_pools(
     request_rows = rows // num_tokens_per_req
     if req_pool_indices.shape[0] != request_rows:
         raise ValueError(
-            "req_pool_indices length must match request rows for parallel top-p sample, "
+            "req_pool_indices length must match request rows for parallel top-p "
+            "sample, "
             f"got {req_pool_indices.shape[0]} and {request_rows}"
         )
     if num_attempts <= 0:

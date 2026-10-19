@@ -65,6 +65,7 @@ class PreparedInt8Linear(torch.nn.Module):
         )
 
     def forward(self, x, *, bias=None, defer_dequant=False):
+        """With ``defer_dequant``, returns ``(int32_result, per_token_scales)``."""
         if defer_dequant and bias is not None:
             raise ValueError("Deferred INT8 dequantization requires a bias-free linear")
         if isinstance(x, tuple):

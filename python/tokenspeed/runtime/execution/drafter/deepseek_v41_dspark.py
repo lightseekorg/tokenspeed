@@ -165,7 +165,7 @@ class DeepseekV41DSpark(BaseDrafter):
         meta = backend.query_metadata(ForwardMode.DECODE)
         width = self.spec_num_tokens
         # The anchor is the last accepted verify row; it and every earlier
-        # accepted position were written above, so history ends at start_pos.
+        # accepted position were written by run(), so history ends at start_pos.
         history_slots, _ = backend.window_slots(
             V41_SWA_GROUP_ID,
             start_pos,

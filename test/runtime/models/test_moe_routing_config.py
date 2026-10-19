@@ -15,7 +15,9 @@ def _call_name(node: ast.AST) -> str | None:
 
 
 def _routing_configs(relpath: str) -> list[dict[str, ast.AST]]:
-    tree = ast.parse((REPO_ROOT / relpath).read_text(), filename=relpath)
+    tree = ast.parse(
+        (REPO_ROOT / relpath).read_text(encoding="utf-8"), filename=relpath
+    )
     configs: list[dict[str, ast.AST]] = []
     for scope in (node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)):
         dict_assignments: dict[str, ast.Dict] = {}

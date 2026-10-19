@@ -18,13 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""``triton_router_route_lanepar`` on an NVIDIA device: Beam's route in one launch
-against ``torch_grouped_route``, byte for byte (ids strict; weights strict on random
-rows and under the NaN rule on the tie and edge corpora), in eager runs and
-CUDA-graph replays. Two pins come
-first and fail rather than skip: Torch's FP32 CUDA sigmoid against the kernel's
-recipe (``_sigmoid_rn``) on an enumerated edge corpus, and Torch's CUDA K8 sum
-against the reduction tree the kernel spells.
+"""``triton_router_route_lanepar`` on an NVIDIA device: Beam's route in one
+launch against ``torch_grouped_route``, byte for byte (ids strict; weights strict
+on random rows and under the NaN rule on the tie and edge corpora), in eager runs
+and CUDA-graph replays. Two pins come first and fail rather than skip: Torch's
+FP32 CUDA sigmoid against the kernel's recipe (``_sigmoid_rn``) on an enumerated
+edge corpus, and Torch's CUDA K8 sum against the reduction tree the kernel spells.
 """
 
 from __future__ import annotations
@@ -66,9 +65,9 @@ ROWS_GRAPH = (4,)
 PROBE_BLOCK = 256  # one row of lanes per program, as the router kernel's x
 CANONICAL_NAN_BITS = 0x7FC00000
 
-# ---------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 # Input builders: the random kind, the five tie kinds and the edge kind.
-# ---------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 
 LOGIT_STD, BIAS_STD = 0.6, 0.1
 TIE_ROW, NEGATIVE_ROW = 1, 2
@@ -95,7 +94,8 @@ def _f32_bits(value: float) -> int:
     return struct.unpack("<I", struct.pack("<f", value))[0]
 
 
-# (lane, logit bits, bias bits) of the edge block; the NaN lane's logit bits are per row.
+# (lane, logit bits, bias bits) of the edge block; the NaN lane's logit bits are
+# per row.
 EDGE_BLOCK = (
     (0, _f32_bits(0.0), _f32_bits(-0.5)),
     (1, _f32_bits(-0.0), _f32_bits(-0.5)),
@@ -224,9 +224,9 @@ def _edge_inputs(rows: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-# ---------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 # The sigmoid pin corpus: the enumerated edge values.
-# ---------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 
 MANTISSA_BITS = 23
 MANTISSA_MASK = (1 << MANTISSA_BITS) - 1
@@ -322,9 +322,9 @@ def _canonical(scores: torch.Tensor) -> torch.Tensor:
     )
 
 
-# ---------------------------------------------------------------------------------------
-# The probe jit (the product helper by import)
-# ---------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# The probe jit (the product helper by import).
+# --------------------------------------------------------------------------------------
 
 
 @triton.jit
@@ -347,11 +347,6 @@ def _sigmoid_probe(x: torch.Tensor):
     )
     torch.cuda.synchronize(DEVICE)
     return s, compiled
-
-
-# ---------------------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------------------
 
 
 def _on_device(pair: tuple[torch.Tensor, torch.Tensor]):

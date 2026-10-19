@@ -103,8 +103,6 @@ class MemoryOccupationController:
         """True while any GPU-memory region is released (data-plane sleep)."""
         return bool(self.released_tags)
 
-    # -- control-request handlers (driven by the request handler) -------------
-
     def handle_release(self, req: ReleaseMemoryOccupationReqInput) -> None:
         if not self._enabled:
             self._fail_release("memory saver not enabled (--enable-memory-saver)")
@@ -195,7 +193,6 @@ class MemoryOccupationController:
         if "kv_cache" in tags:
             self._kv_repair()
         if not self.released_tags:
-            # Fully awake → resume scheduling.
             self._pause.set_released(False)
         self._send.send_pyobj(ResumeMemoryOccupationReqOutput(success=True))
 

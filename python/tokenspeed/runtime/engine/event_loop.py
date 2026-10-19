@@ -682,10 +682,6 @@ class EventLoop:
                     state.scheduler_enqueue_time = enqueue_time
         self._l3_hooks.submit_requests(specs)
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     @startup_phase("model.config")
     def _load_model_config(
         self, model_path: str, is_draft_worker: bool = False
@@ -796,10 +792,6 @@ class EventLoop:
             num_total_pages=self._scheduler_cache_geometry.num_usable_pages,
             sample_stats=self._get_scheduler_stats,
         )
-
-    # ------------------------------------------------------------------
-    # Shared step helpers
-    # ------------------------------------------------------------------
 
     def _request_abort_or_mark(
         self, request_id: str, _reason: str, *, notify_client: bool = False
@@ -1082,10 +1074,6 @@ class EventLoop:
             num_iteration_tokens=num_iteration_tokens,
         )
         self.metrics.record_jit_compiles(compile_stats())
-
-    # ------------------------------------------------------------------
-    # Event loops
-    # ------------------------------------------------------------------
 
     def _shutdown_complete(self) -> bool:
         return self.shutdown_event.is_set()
@@ -1557,7 +1545,8 @@ def run_event_loop(
         exception_info = sys.exc_info()
         logger.warning(
             f"Scheduler exiting: rank={global_rank:d} pid={os.getpid():d} "
-            f"shutdown_requested={shutdown_event.is_set()!s} signal={received_signal!s}",
+            f"shutdown_requested={shutdown_event.is_set()!s} "
+            f"signal={received_signal!s}",
             exc_info=exception_info if exception_info[0] is not None else None,
         )
         if event_loop is not None:

@@ -64,8 +64,9 @@ class DraftTree:
             )
         if num_nodes - 1 > topk + (num_steps - 1) * topk * topk:
             raise ValueError(
-                f"{num_nodes - 1} draft nodes exceed the {topk + (num_steps - 1) * topk * topk} "
-                f"candidates of topk={topk} over {num_steps} steps"
+                f"{num_nodes - 1} draft nodes exceed the "
+                f"{topk + (num_steps - 1) * topk * topk} candidates of topk={topk} "
+                f"over {num_steps} steps"
             )
         self.topk = topk
         self.num_steps = num_steps

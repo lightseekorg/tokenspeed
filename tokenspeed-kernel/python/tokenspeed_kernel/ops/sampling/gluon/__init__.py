@@ -102,7 +102,8 @@ else:
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         raise ImportError(
-            f"gluon_argmax_gfx950 requires tokenspeed-kernel-amd: {_IMPORT_ERROR_MESSAGE}"
+            "gluon_argmax_gfx950 requires tokenspeed-kernel-amd: "
+            f"{_IMPORT_ERROR_MESSAGE}"
         )
 
     def gluon_argmax_gfx1250(
@@ -111,7 +112,8 @@ else:
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         raise ImportError(
-            f"gluon_argmax_gfx1250 requires tokenspeed-kernel-amd: {_IMPORT_ERROR_MESSAGE}"
+            "gluon_argmax_gfx1250 requires tokenspeed-kernel-amd: "
+            f"{_IMPORT_ERROR_MESSAGE}"
         )
 
 

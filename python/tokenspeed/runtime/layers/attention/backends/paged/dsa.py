@@ -362,7 +362,6 @@ class DSABackend(PagedAttentionBackend):
             self.kpool_runtime.reset_forward(req_pool_indices)
 
     def require_kpool_runtime(self) -> KPoolRuntime:
-        """Return the configured KPool runtime for sparse pooled indexing."""
         if self.kpool_runtime is None:
             raise RuntimeError("DSA backend was created without KPool configuration")
         return self.kpool_runtime
@@ -400,10 +399,6 @@ class DSABackend(PagedAttentionBackend):
                 f"table={rows}, rows=[{row_start}, {row_end})"
             )
         return table[row_start:row_end]
-
-    # ------------------------------------------------------------------
-    # Delegation surface
-    # ------------------------------------------------------------------
 
     @property
     def forward_decode_metadata(self):
@@ -467,10 +462,6 @@ class DSABackend(PagedAttentionBackend):
     # Capture is inherited: the leaf default routes through this wrapper's
     # refresh, whose lazy arm fills the dense leaf's per-bs cached metadata
     # fields _dsa_seq_lens_2d / _dsa_plan once per bs.
-
-    # ------------------------------------------------------------------
-    # Metadata
-    # ------------------------------------------------------------------
 
     def refresh_decode_metadata(
         self,
@@ -655,10 +646,6 @@ class DSABackend(PagedAttentionBackend):
                 self._prefill_page_table = page_table[:num_extends]
                 cmeta.page_table = self._prefill_page_table
 
-    # ------------------------------------------------------------------
-    # Query context parallelism: the gathered-history extend arm
-    # ------------------------------------------------------------------
-
     def _plan_query_shard(
         self,
         plan: QueryShardPlan,
@@ -804,10 +791,6 @@ class DSABackend(PagedAttentionBackend):
             index_k_format=self.index_k_format,
         )
 
-    # ------------------------------------------------------------------
-    # Validation helpers
-    # ------------------------------------------------------------------
-
     def _query_heads(self, q: torch.Tensor, layer) -> int:
         """The heads ``q`` carries: ``[rows, heads, head_dim]``, or
         ``[rows, heads * head_dim]``.
@@ -856,6 +839,7 @@ class DSABackend(PagedAttentionBackend):
             )
 
     def _validate_dense_context(self, seq_lens: torch.Tensor, bs: int) -> None:
+        """Dense attention is exact only when every live request fits the top-k."""
         if seq_lens is None or bs <= 0:
             return
         active_seq_lens = seq_lens[:bs]
@@ -869,10 +853,6 @@ class DSABackend(PagedAttentionBackend):
                 f"max seq_len {max_seq_len}. Sparse DSA top-k indices are "
                 "required for longer contexts."
             )
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
 
     def forward_extend(
         self,

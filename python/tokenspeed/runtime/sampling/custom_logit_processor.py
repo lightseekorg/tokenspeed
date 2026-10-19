@@ -45,7 +45,6 @@ class CustomLogitProcessor(ABC):
         logits: torch.Tensor,
         custom_param_list: list[dict[str, Any]] | None = None,
     ) -> torch.Tensor:
-        """Define the callable behavior."""
         raise NotImplementedError
 
     def to_str(self) -> str:

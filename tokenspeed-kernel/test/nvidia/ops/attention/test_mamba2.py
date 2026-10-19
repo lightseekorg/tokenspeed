@@ -313,7 +313,7 @@ def _verify_window(batch: int, steps: int, seed: int):
 
 def _decode_steps(pool, x, dt, B, C, A_log, D, dt_bias, reads, scratch_rows):
     """T single-token decode updates per request, each into its own scratch row."""
-    batch, steps = x.shape[:2]
+    _, steps = x.shape[:2]
     outs = []
     src = reads
     for t in range(steps):

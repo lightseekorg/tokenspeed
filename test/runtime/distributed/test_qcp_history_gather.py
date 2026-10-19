@@ -104,7 +104,7 @@ def _placement(rank: int) -> CachePlacement:
 
 def _local_plane(rank: int) -> torch.Tensor:
     """This rank's physical plane: every virtual slot it owns at its local slot."""
-    placement = _placement(rank)
+    _placement(rank)  # Validates the rank's placement.
     local_pages = 1 + (VIRTUAL_BLOCKS - 1 + WORLD - 1) // WORLD
     plane = torch.full(
         (local_pages * GRANULARITY, DIM), float("nan"), dtype=torch.bfloat16

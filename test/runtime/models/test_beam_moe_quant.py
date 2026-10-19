@@ -387,7 +387,9 @@ RAW = {
 GROUP = ("config_groups", "FP8_DYNAMIC")
 
 
-def ct(raw=RAW):
+def ct(raw=None):
+    if raw is None:
+        raw = RAW
     return CompressedTensorsConfig.from_config(copy.deepcopy(raw))
 
 
@@ -884,7 +886,7 @@ def test_quantized_attention_is_refused_where_the_config_quantizes_it(server):
     config = Nvfp4Config(exclude_modules=["lm_head", "model.layers.*.mlp.gate"])
     tensors = nvfp4_checkpoint()
     q = "model.layers.0.self_attn.q_proj"
-    packed, block, global_scale = quantize_nvfp4(tensors[f"{q}.weight"])
+    packed, _, global_scale = quantize_nvfp4(tensors[f"{q}.weight"])
     tensors.update({f"{q}.weight": packed, f"{q}.weight_scale_2": global_scale})
     with pytest.raises(ValueError, match="NVFP4 on its experts only; its attention"):
         _model(config).load_weights(list(tensors.items()))

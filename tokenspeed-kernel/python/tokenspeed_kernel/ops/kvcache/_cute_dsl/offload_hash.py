@@ -286,6 +286,9 @@ class HashResolve:
 
 
 class CopyRows:
+    """Host-to-device row copies (device-to-host with ``writeback``); pairs with a
+    non-positive source or negative destination are skipped."""
+
     def __init__(self, row_units, writeback):
         self.row, self.writeback = row_units, writeback
 

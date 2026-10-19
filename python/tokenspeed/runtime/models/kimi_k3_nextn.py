@@ -162,7 +162,6 @@ class KimiK3DraftDecoderLayer(nn.Module):
             prefix=add_prefix("block_sparse_moe", prefix),
             alt_stream=alt_stream,
         )
-        # The old underscored flag writes were dead; making that intent effective needs a spec-decode run.
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -368,7 +367,6 @@ class KimiK3NextNForCausalLM(nn.Module):
         return None
 
     def get_embed_and_head(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """The embedding and head weights this draft drafts with."""
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(

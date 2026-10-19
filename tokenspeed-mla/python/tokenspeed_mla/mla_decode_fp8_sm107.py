@@ -17,7 +17,6 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-
 """MLA decode with FP8 input and FP8/BF16 output for SM107, written in CuTe DSL.
 
 Based on FlashInfer PR #6177:
@@ -157,7 +156,7 @@ def _page_index(page_table: cute.Tensor, index: cutlass.Int32) -> cutlass.Int32:
 def _wait_cluster_mbarrier(mbar_ptr: cute.Pointer, phase: cutlass.Int32) -> None:
     """Block on a local mbarrier (plain CTA-scope parity wait).
 
-    Feynman sm140_mla_decode pattern: the P data's visibility is already
+    The P data's visibility is already
     established by the bulk copy's complete_tx on this mbarrier (async-proxy
     mechanism, same as every PipelineTmaUmma consumer in this kernel), so the
     pair-rendezvous vote only needs the barrier COUNT — no cluster-acquire
@@ -171,7 +170,7 @@ def _wait_cluster_mbarrier(mbar_ptr: cute.Pointer, phase: cutlass.Int32) -> None
 def _arrive_cluster_mbarrier(mbar_ptr: cute.Pointer, peer_rank: cutlass.Int32) -> None:
     """Arrive a peer CTA's mbarrier (plain remote arrive, CTA scope).
 
-    Count-only notification per the Feynman DSMEM pattern; see
+    Count-only notification; see
     _wait_cluster_mbarrier for why no cluster-release fence is needed. The
     DSL's remote-arrive default is deliberately CTA scope ("cluster scope is
     measurably slower", cute/arch/mbar.py).
@@ -204,29 +203,7 @@ class _Sm107FallbackBlackwellBase:
         num_heads: int = 128,
         seq_len_q: int = 1,
     ):
-        """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
-
-        :param acc_dtype: Data type for accumulation S and O
-        :type acc_dtype: Type[cutlass.Numeric]
-        :param lse_dtype: Data type for output LSE
-        :type lse_dtype: Type[cutlass.Numeric]
-        :param mma_s_tiler: The (H, K) tile shape of the MMA instruction for S
-        :type mma_s_tiler: Tuple[int, int]
-        :param mma_p_tiler: The (H, D) tile shape of the MMA instruction for P
-        :type mma_p_tiler: Tuple[int, int]
-        :param max_active_clusters: Maximum number of active clusters
-        :type max_active_clusters: int
-        :param page_size: The page size
-        :type page_size: int
-        :param skip_correction_threshold: Threshold to skip correction
-        :type skip_correction_threshold: float
-        :param is_persistent: Whether to use persistent kernel mode
-        :type is_persistent: bool
-        :param is_var_seq: Whether to use variable sequence length
-        :type is_var_seq: bool
-        :param is_var_split_kv: Whether to use variable split KV
-        :type is_var_split_kv: bool
-        """
+        """Initialize the configuration for a Blackwell MLA decode kernel."""
 
         self.latent_dim = 512
         self.rope_dim = 64
@@ -285,16 +262,15 @@ class _Sm107FallbackBlackwellBase:
         self.iterations_pv_k = self.mma_qk_tiler[1] // self.mma_pv_tiler[2]
         self.iterations_pv_n = self.latent_dim // self.mma_pv_tiler[1]
 
-        # Set specialized warp ids.
         # Compute (softmax) warp groups: g0 = warps 0-3 (even k-tiles), g1 = warps
         # 12-15 (odd k-tiles). Correction warps 4-7. MMA split: W8 issues mma_qk
-        # only, W11 issues mma_pv only (was empty filler).
+        # only, W11 issues mma_pv only.
         self.compute_warp_ids = (0, 1, 2, 3)
         self.correction_warp_ids = (4, 5, 6, 7)
         self.mma_qk_warp_id = 8
         self.load_tma_k_warp_id = 9
         self.load_tma_v_warp_id = 10
-        self.mma_pv_warp_id = 11  # was empty_warp_ids[0]
+        self.mma_pv_warp_id = 11
         # Second softmax warp group (g1): odd k-tiles. Mirrors compute_warp_ids.
         self.second_compute_warp_ids = (12, 13, 14, 15)
         self.num_total_compute_warps = self.num_compute_warps + len(
@@ -319,8 +295,6 @@ class _Sm107FallbackBlackwellBase:
         self.softmax_reg_num = 152
         self.correction_reg_num = 152
         self.other_reg_num = 56
-        # Named barriers
-        # tmem_ptr_sync_bar: mma_qk(1) + mma_pv(1) + 8 compute + 4 correction = 14 warps × 32
         self.tmem_ptr_sync_bar = pipeline.NamedBarrier(
             barrier_id=1,
             num_threads=(
@@ -329,8 +303,6 @@ class _Sm107FallbackBlackwellBase:
                 + self.threads_per_warp * self.num_compute_warps  # 4 correction
             ),
         )
-        # softmax_exchange covers BOTH compute groups (8 warps) for cross-group
-        # row_max / row_sum merge.
         self.softmax_exchange_sync_bar_0 = pipeline.NamedBarrier(
             barrier_id=2,
             num_threads=(self.threads_per_warp * self.num_compute_warps),
@@ -404,6 +376,11 @@ class _Sm107FallbackBlackwellBase:
         tiled_mma: cute.TiledMma,
         is_k_load: bool,
     ):
+        """Makes a non-executable tiled TMA load atom for a paged KV tensor.
+
+        The per-CTA tile is split into page-sized boxes so each TMA copy stays
+        within one page.
+        """
         ident = cute.make_identity_layout(gmem.shape)
         g_tile = cute.composition(ident, mma_tiler)
         cta_mn = mma_tiler[0] // tiled_mma.thr_id.shape
@@ -443,19 +420,7 @@ class _Sm107FallbackBlackwellBase:
         block_split_kvs: cute.Tensor,
         blk_coord: cute.Coord,
     ) -> tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]:
-        """Get the current k_index, k_tile_count, and local split_kv value for the MLA kernel.
-
-        :param split_kv: Split_kv value
-        :type split_kv: cutlass.Int32
-        :param cache_seqs: Cache sequence lengths tensor
-        :type cache_seqs: cute.Tensor
-        :param block_split_kvs: Per-block split_kv values tensor
-        :type block_split_kvs: cute.Tensor
-        :param blk_coord: Block coordinate
-        :type blk_coord: cute.Coord
-        :return: k_index, k_tile_count, split_kv
-        :rtype: tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]
-        """
+        """Get the current k_index, k_tile_count, and local split_kv value."""
         K = cache_seqs[blk_coord[2]]
         if cutlass.const_expr(self.is_var_split_kv):
             split_kv = block_split_kvs[blk_coord[2]]
@@ -477,25 +442,7 @@ class _Sm107FallbackBlackwellBase:
         load_q_producer_state: pipeline.PipelineState | None = None,
         load_k_producer_state: pipeline.PipelineState | None = None,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
-        """Load wrap to load Q/K tensors. Updates the load qk producer state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param qk_params: The qk parameters
-        :type qk_params: SimpleNamespace
-        :param k_index: The k index
-        :type k_index: cutlass.Int32
-        :param k_tile_count: The k tile count
-        :type k_tile_count: cutlass.Int32
-        :param load_q_producer_state: The load q producer state
-        :type load_q_producer_state: pipeline.PipelineState
-        :param load_k_producer_state: The load k producer state
-        :type load_k_producer_state: pipeline.PipelineState
-
-        :return: The load q producer state and load k producer state
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState]
-        """
-        # page table
+        """Load wrap to load Q/K tensors. Updates the load qk producer state."""
         mPT = common_params.mPT[None, common_params.blk_coord[2]]
 
         # Flatten divide and partition global tensors for QK TMA load
@@ -541,7 +488,6 @@ class _Sm107FallbackBlackwellBase:
             if cta_m < self.page_size
             else gKR[None, 0, None, None]
         )
-        # tma partition for q, k latent/rope
 
         # smem: ((atom_v, rest_v), STAGE)
         # gmem: ((atom_v, rest_v), RestM, RestK, RestL)
@@ -580,7 +526,6 @@ class _Sm107FallbackBlackwellBase:
         tQLgQL = tQLgQL_mkl[None, None, None, 0, common_params.blk_coord[2]]
         tQRgQR = tQRgQR_mkl[None, None, None, 0, common_params.blk_coord[2]]
 
-        # set extra params
         common_params.mPT = mPT
         qk_params.tQLgQL = tQLgQL
         qk_params.tQRgQR = tQRgQR
@@ -616,26 +561,9 @@ class _Sm107FallbackBlackwellBase:
         k_tile_count: cutlass.Int32,
         load_v_producer_state: pipeline.PipelineState,
     ) -> pipeline.PipelineState:
-        """Load wrap to load V tensors. Updates the load v producer state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param v_params: The v parameters
-        :type v_params: SimpleNamespace
-        :param k_index: The k index
-        :type k_index: cutlass.Int32
-        :param k_tile_count: The k tile count
-        :type k_tile_count: cutlass.Int32
-        :param load_v_producer_state: The load v producer state
-        :type load_v_producer_state: pipeline.PipelineState
-
-        :return: The load v producer state
-        :rtype: pipeline.PipelineState
-        """
-        # page table
+        """Load wrap to load V tensors. Updates the load v producer state."""
         mPT = common_params.mPT[None, common_params.blk_coord[2]]
 
-        # Flatten divide and partition global tensors for V TMA load
         page_tile_size = min(self.page_size, self.mma_pv_tiler[2])
         gCLT = cute.flat_divide(v_params.mCLT, (self.mma_pv_tiler[1], page_tile_size))
         cta_n = self.mma_pv_tiler[1] // v_params.tiled_mma_pv.thr_id.shape
@@ -644,7 +572,6 @@ class _Sm107FallbackBlackwellBase:
         ]
         tOgCLT = cute.tiled_divide(gCLT, (cta_n, page_tile_size))
         tOgCLT = tOgCLT[None, 0, 0, None, None, None]
-        # tma partition for vc
         # smem: ((atom_v, rest_v), STAGE)
         # gmem: ((atom_v, rest_v), RestM, RestK, RestL)
         tVCsVC, tCLTgCLT = cpasync.tma_partition(
@@ -655,7 +582,6 @@ class _Sm107FallbackBlackwellBase:
             tOgCLT,
         )
 
-        # set extra params
         common_params.mPT = mPT
         v_params.tCLTgCLT = tCLTgCLT
         v_params.tVCsVC = tVCsVC
@@ -682,26 +608,7 @@ class _Sm107FallbackBlackwellBase:
         load_k_producer_state: pipeline.PipelineState,
         load_q: bool,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
-        """Load one k-tile of Q/C latent/rope tensors. Updates the load qkv producer state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param qk_params: The qk parameters
-        :type qk_params: SimpleNamespace
-        :param k_index: The k index
-        :type k_index: cutlass.Int32
-        :param k_tile_count: The k tile count
-        :type k_tile_count: cutlass.Int32
-        :param load_q_producer_state: The load q producer state
-        :type load_q_producer_state: pipeline.PipelineState
-        :param load_k_producer_state: The load kv producer state
-        :type load_k_producer_state: pipeline.PipelineState
-        :param load_q: Whether to load q
-        :type load_q: bool
-
-        :return: The load q producer state and load kv producer state
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState]
-        """
+        """Load one k-tile of Q/C latent/rope tensors. Updates producer states."""
         page_per_tile = ceil_div(
             self.mma_qk_tiler[1] // self.page_size, qk_params.tiled_mma_qk.thr_id.shape
         )
@@ -723,12 +630,9 @@ class _Sm107FallbackBlackwellBase:
         # load q once at first iteration
         load_q_pipeline = common_params.load_q_pipeline
         if load_q:
-            # get the mbar ptr from pipeline.
             tma_bar_ptr = load_q_pipeline.producer_get_barrier(load_q_producer_state)
-            # expect the extra bytes for q.
             load_q_pipeline.producer_acquire(load_q_producer_state)
             for i in cutlass.range_constexpr(self.iterations_qk_latent):
-                # load q latent
                 cute.copy(
                     qk_params.tma_atom_q_latent,
                     qk_params.tQLgQL[None, common_params.blk_coord[1], i],
@@ -736,7 +640,6 @@ class _Sm107FallbackBlackwellBase:
                     tma_bar_ptr=tma_bar_ptr,
                 )
             for i in cutlass.range_constexpr(self.iterations_qk_rope):
-                # load q rope
                 cute.copy(
                     qk_params.tma_atom_q_rope,
                     qk_params.tQRgQR[None, common_params.blk_coord[1], i],
@@ -744,14 +647,12 @@ class _Sm107FallbackBlackwellBase:
                     tma_bar_ptr=tma_bar_ptr,
                 )
             load_q_producer_state.advance()
-        # get the mbar ptr from pipeline.
         tma_bar_ptr = common_params.load_k_pipeline.producer_get_barrier(
             load_k_producer_state
         )
         common_params.load_k_pipeline.producer_acquire(load_k_producer_state)
         for i in range(self.iterations_qk_latent):
             for k in range(page_per_tile):
-                # load k latent
                 cute.copy(
                     qk_params.tma_atom_c_latent,
                     qk_params.tCLgCL[None, i, k_idx[k]],
@@ -761,7 +662,6 @@ class _Sm107FallbackBlackwellBase:
 
         for i in cutlass.range_constexpr(self.iterations_qk_rope):
             for k in cutlass.range_constexpr(page_per_tile):
-                # load k rope
                 cute.copy(
                     qk_params.tma_atom_c_rope,
                     qk_params.tKRgKR[None, i, k_idx[k]],
@@ -780,20 +680,7 @@ class _Sm107FallbackBlackwellBase:
         k_index: cutlass.Int32,
         load_v_producer_state: pipeline.PipelineState,
     ) -> pipeline.PipelineState:
-        """Load one k-tile of compressed latent transpose tensor(v). Updates the load qkv producer state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param v_params: The load tma v parameters
-        :type v_params: SimpleNamespace
-        :param k_index: The k index
-        :type k_index: cutlass.Int32
-        :param load_v_producer_state: The load v producer state
-        :type load_v_producer_state: pipeline.PipelineState
-
-        :return: The load qkv producer state
-        :rtype: pipeline.PipelineState
-        """
+        """Load one k-tile of compressed latent transpose tensor (v)."""
         page_per_tile = self.mma_pv_tiler[2] * self.iterations_pv_k // self.page_size
         page_per_subtile = ceil_div(page_per_tile, self.iterations_pv_k)
         k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile), cutlass.Int32)
@@ -803,7 +690,6 @@ class _Sm107FallbackBlackwellBase:
                 if page_per_tile == 1
                 else _page_index(common_params.mPT, k_index * page_per_tile + i)
             )
-        # get the mbar ptr from pipeline.
         tma_bar_ptr = common_params.load_v_pipeline.producer_get_barrier(
             load_v_producer_state
         )
@@ -851,8 +737,7 @@ class _Sm107FallbackBlackwellBase:
     ]:
         """MMA-QK warp body (W8). Issues K mma_qk calls producing S to TMEM.
 
-        Split from the previous fused mma_qk_pv: PV is now handled by
-        mma_pv_warp_body on W11. See OPT#16 / OPT#14 (TMEM allocator on W11).
+        PV runs in ``mma_pv_warp_body`` on W11.
         """
 
         tSrQ = tiled_mma_qk.make_fragment_A(qk_params.sQ)
@@ -896,10 +781,8 @@ class _Sm107FallbackBlackwellBase:
                     wait_q=False,
                 )
                 k_tile_count -= 1
-            # release q consumer states
             load_q_pipeline.consumer_release(load_q_release_state)
             load_q_release_state.advance()
-            # NOTE: mma_pv (mainloop + epilog) is now handled by warp 11 (mma_pv_warp_body).
 
         return (
             tiled_mma_qk,
@@ -952,7 +835,6 @@ class _Sm107FallbackBlackwellBase:
         pv_params.tOrVC = tOrVC
         pv_params.tOtO_staged = tOtO_staged
 
-        # mma O accumulates across k-tiles, set ACCUMULATE=False once before loop.
         tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
 
         if common_params.is_leader_cta:
@@ -995,22 +877,7 @@ class _Sm107FallbackBlackwellBase:
         pipeline.PipelineState,
         pipeline.PipelineState,
     ]:
-        """Compute one k-tile of mma for Q*K^T. Updates the tiled MMA QK and pipeline states.
-
-        :param qk_params: The qk parameters
-        :type qk_params: SimpleNamespace
-        :param tiled_mma_qk: The tiled mma qk
-        :type tiled_mma_qk: cute.TiledMma
-        :param load_q_consumer_state: The load q consumer state
-        :type load_q_consumer_state: pipeline.PipelineState
-        :param load_k_consumer_state: The load k consumer state
-        :type load_k_consumer_state: pipeline.PipelineState
-        :param mma_s_producer_state: The mma s producer state
-        :type mma_s_producer_state: pipeline.PipelineState
-
-        :return: The tiled mma qk, the load q consumer state, the load k consumer state, and the mma s producer state
-        :rtype: tuple[cute.TiledMma, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
-        """
+        """Compute one k-tile of mma for Q*K^T. Updates the pipeline states."""
         tStS = qk_params.tStS_staged[None, None, None, mma_s_producer_state.index]
 
         qk_params.mma_s_pipeline.producer_acquire(mma_s_producer_state)
@@ -1074,24 +941,7 @@ class _Sm107FallbackBlackwellBase:
         pipeline.PipelineState,
         pipeline.PipelineState,
     ]:
-        """Compute one k-tile of mma for P*V. Updates the tiled mma pv and pipeline states.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param pv_params: The pv parameters
-        :type pv_params: SimpleNamespace
-        :param tiled_mma_pv: The tiled mma pv
-        :type tiled_mma_pv: cute.TiledMma
-        :param load_v_consumer_state: The load v consumer state
-        :type load_v_consumer_state: pipeline.PipelineState
-        :param p_mma_consumer_state: The P MMA consumer state
-        :type p_mma_consumer_state: pipeline.PipelineState
-        :param mma_o_producer_state: The MMA o producer state
-        :type mma_o_producer_state: pipeline.PipelineState
-
-        :return: The tiled mma pv, the load v consumer state, the P MMA consumer state, and the MMA o producer state
-        :rtype: tuple[cute.TiledMma, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
-        """
+        """Compute one k-tile of mma for P*V. Updates the pipeline states."""
 
         pv_params.p_mma_pipeline.consumer_wait(p_mma_consumer_state)
         load_v_pipeline = common_params.load_v_pipeline
@@ -1144,7 +994,7 @@ class _Sm107FallbackBlackwellBase:
         mma_s_consumer_state: pipeline.PipelineState,
         p_cor_producer_state: pipeline.PipelineState,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]:
-        """Advance the P MMA producer state, the MMA s consumer state, and the P correction producer state to the next group."""
+        """Advance the P MMA, MMA S and P correction states to the next group."""
         p_mma_producer_state.advance()
         mma_s_consumer_state.advance()
         p_cor_producer_state.advance()
@@ -1160,24 +1010,7 @@ class _Sm107FallbackBlackwellBase:
         p_cor_consumer_state: pipeline.PipelineState,
         mma_o_consumer_state: pipeline.PipelineState,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
-        """Compute warp to compute the result of softmax, rescale, and epilogue. Updates the related pipeline states.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param epilogue_params: The epilogue parameters
-        :type epilogue_params: SimpleNamespace
-        :param k_index: The index of the k-tile
-        :type k_index: cutlass.Int32
-        :param k_tile_count: The number of k-tiles
-        :type k_tile_count: cutlass.Int32
-        :param p_cor_consumer_state: The P correction consumer state
-        :type p_cor_consumer_state: pipeline.PipelineState
-        :param mma_o_consumer_state: The MMA o consumer state
-        :type mma_o_consumer_state: pipeline.PipelineState
-
-        :return: The P correction consumer state, and the MMA o consumer state
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState]
-        """
+        """Runs the correction loop: per-tile rescale, then the final epilogue."""
 
         k_tile_count_init = k_tile_count
         while k_tile_count > 0:
@@ -1215,7 +1048,7 @@ class _Sm107FallbackBlackwellBase:
         tidx: cutlass.Int32,
         p_cor_producer_state: pipeline.PipelineState,
     ) -> tuple[pipeline.PipelineState, cutlass.Float32]:
-        """Compute the correction factor for the last k tile."""
+        """Store (row_sum, row_max, correction, no_correction) to TMEM."""
         no_correction = 0
         if (
             row_max_new - row_max
@@ -1383,7 +1216,7 @@ class _Sm107FallbackBlackwellBase:
             tCor_part[None, None, None, other_stage],
             rCor,
         )
-        return rCor[1], rCor[0]  # (row_max, row_sum)
+        return rCor[1], rCor[0]
 
     @cute.jit
     def store_p_cor_row_sum(
@@ -1436,18 +1269,7 @@ class _Sm107FallbackBlackwellBase:
     ) -> tuple[
         cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma
     ]:
-        """Tensor memory load partition for rescale and epilogue.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param tiled_mma_pv: The tiled mma pv
-        :type tiled_mma_pv: cute.TiledMma
-        :param iter_n: The iteration number
-        :type iter_n: int
-
-        :return: The tiled mma pv, the tiled mma pv, the tiled mma pv, the tiled mma pv, the tiled mma pv
-        :rtype: tuple[cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma]
-        """
+        """Tensor memory load partition for rescale and epilogue."""
 
         tOtO_shape = tiled_mma_pv.partition_shape_C(
             cute.select(self.mma_pv_tiler, mode=[0, 1])
@@ -1480,7 +1302,6 @@ class _Sm107FallbackBlackwellBase:
             self.mma_pv_tiler[1],
             self.mma_pv_tiler[2],
         )
-        # Flatten divide and partition global tensors for O
         cta_pv_tiler_mn = cute.select(cta_pv_tiler, mode=[0, 1])
 
         gO = None
@@ -1547,19 +1368,9 @@ class _Sm107FallbackBlackwellBase:
         cutlass.Float32,
         cutlass.Int32,
     ]:
-        """Get the correction factor from the P correction consumer state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param p_cor_consumer_state: The P correction consumer state
-        :type p_cor_consumer_state: pipeline.PipelineState
-
-        :return: The P correction consumer state, the row_sum, the row_max, and the correction factor
-        :rtype: tuple[pipeline.PipelineState, cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Int32]
-        """
+        """Get the correction factor from the P correction consumer state."""
         common_params.p_cor_pipeline.consumer_wait(p_cor_consumer_state)
         tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
-        # load correction factor
         _, tAcc, _, _, _, _ = self._tmem_load_partition(
             common_params, common_params.tiled_mma_pv, 0
         )
@@ -1601,20 +1412,7 @@ class _Sm107FallbackBlackwellBase:
     def make_and_init_load_qkv_pipeline(
         self, load_qkv_mbar_ptr, cta_layout_vmnk, load_stages, tx_count
     ) -> pipeline.PipelineTmaUmma:
-        """Create and initialize the tma load qkv pipeline.
-
-        :param load_qkv_mbar_ptr: The load qkv mbar pointer
-        :type load_qkv_mbar_ptr: cute.Tensor
-        :param cta_layout_vmnk: The cta layout vmnk
-        :type cta_layout_vmnk: tuple[int, int, int]
-        :param load_stages: The load stages
-        :type load_stages: list[int]
-        :param tx_count: The tx count
-        :type tx_count: int
-
-        :return: The tma load qkv pipeline
-        :rtype: pipeline.PipelineTmaUmma
-        """
+        """Create and initialize the tma load qkv pipeline."""
         load_qkv_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, len([self.load_tma_k_warp_id])
         )
@@ -1634,16 +1432,7 @@ class _Sm107FallbackBlackwellBase:
     def make_and_init_mma_s_pipeline(
         self, mma_s_mbar_ptr, cta_layout_vmnk
     ) -> pipeline.PipelineUmmaAsync:
-        """Create and initialize the mma s pipeline.
-
-        :param mma_s_mbar_ptr: The mma s mbar pointer
-        :type mma_s_mbar_ptr: cute.Tensor
-        :param cta_layout_vmnk: The cta layout vmnk
-        :type cta_layout_vmnk: tuple[int, int, int]
-
-        :return: The mma s pipeline
-        :rtype: pipeline.PipelineUmmaAsync
-        """
+        """Create and initialize the mma s pipeline."""
 
         mma_s_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, len([self.mma_qk_warp_id])
@@ -1669,16 +1458,7 @@ class _Sm107FallbackBlackwellBase:
     def make_and_init_p_mma_pipeline(
         self, p_mma_mbar_ptr, cta_layout_vmnk
     ) -> pipeline.PipelineAsyncUmma:
-        """Create and initialize the p mma pipeline.
-
-        :param p_mma_mbar_ptr: The p mma mbar pointer
-        :type p_mma_mbar_ptr: cute.Tensor
-        :param cta_layout_vmnk: The cta layout vmnk
-        :type cta_layout_vmnk: tuple[int, int, int]
-
-        :return: The p mma pipeline
-        :rtype: pipeline.PipelineAsyncUmma
-        """
+        """Create and initialize the p mma pipeline."""
 
         producer_thread_size = (
             self.threads_per_warp
@@ -1704,14 +1484,7 @@ class _Sm107FallbackBlackwellBase:
     def make_and_init_p_cor_pipeline(
         self, p_cor_mbar_ptr
     ) -> pipeline.PipelineAsyncUmma:
-        """Create and initialize the p correction pipeline.
-
-        :param p_cor_mbar_ptr: The p correction mbar pointer
-        :type p_cor_mbar_ptr: cute.Tensor
-
-        :return: The p correction pipeline
-        :rtype: pipeline.PipelineAsyncUmma
-        """
+        """Create and initialize the p correction pipeline."""
 
         producer_thread_size = self.threads_per_warp * len(self.compute_warp_ids)
         p_cor_producer_group = pipeline.CooperativeGroup(
@@ -1733,16 +1506,7 @@ class _Sm107FallbackBlackwellBase:
     def make_and_init_mma_o_pipeline(
         self, mma_o_mbar_ptr, cta_layout_vmnk
     ) -> pipeline.PipelineUmmaAsync:
-        """Create and initialize the mma o pipeline.
-
-        :param mma_o_mbar_ptr: The mma o mbar pointer
-        :type mma_o_mbar_ptr: cute.Tensor
-        :param cta_layout_vmnk: The cta layout vmnk
-        :type cta_layout_vmnk: tuple[int, int, int]
-
-        :return: The mma o pipeline
-        :rtype: pipeline.PipelineUmmaAsync
-        """
+        """Create and initialize the mma o pipeline."""
 
         mma_o_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, len([self.mma_pv_warp_id])
@@ -1786,6 +1550,13 @@ class _Sm107FallbackBlackwellBase:
 
 
 class Sm107MultiHeadLatentAttentionForwardFP8:
+    """FP8 MLA decode kernel using mixed 4-CTA/2-CTA clusters.
+
+    The preferred 4-CTA cluster assigns QK/softmax and PV to separate CTA pairs;
+    a 2-CTA fallback cluster runs the Blackwell-derived body from
+    ``_MixedFallbackPrep``.
+    """
+
     def __init__(
         self,
         acc_dtype: Type[cutlass.Numeric],
@@ -1808,41 +1579,15 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
     ):
         """Initializes the SM107 FP8 MLA decode kernel configuration.
 
-        :param acc_dtype: Data type for accumulation S and O
-        :type acc_dtype: Type[cutlass.Numeric]
-        :param lse_dtype: Data type for output LSE
-        :type lse_dtype: Type[cutlass.Numeric]
         :param mma_qk_tiler_mn: The (M, N) tile of the QK MMA; M must be 256
-        :type mma_qk_tiler_mn: Tuple[int, int]
         :param mma_pv_tiler_mn: The (M, N) tile of the PV MMA; must be (256, 256)
-        :type mma_pv_tiler_mn: Tuple[int, int]
         :param max_active_clusters: Capacity in 4-CTA cluster units, counting
             fallback 2-CTA clusters as half a unit
-        :type max_active_clusters: int
-        :param page_size: The page size
-        :type page_size: int
-        :param skip_correction_threshold: Threshold to skip correction
-        :type skip_correction_threshold: float
-        :param is_persistent: Whether to use persistent kernel mode
-        :type is_persistent: bool
-        :param is_var_seq: Whether to use variable sequence length
-        :type is_var_seq: bool
-        :param is_var_split_kv: Whether to use variable split KV
-        :type is_var_split_kv: bool
-        :param num_heads: Number of query heads
-        :type num_heads: int
-        :param seq_len_q: Query tokens per request
-        :type seq_len_q: int
         :param is_causal: Apply the causal mask inside the ``seq_len_q`` block
-        :type is_causal: bool
-        :param use_fp16_softmax: Compute exp2 and the row sum in packed FP16
-        :type use_fp16_softmax: bool
         :param force_branch: ``"auto"`` launches 4-CTA clusters with a 2-CTA
             fallback; ``"preferred"`` or ``"fallback"`` compiles only one
-        :type force_branch: str
         :param reducer_max_splits: Compile-time capacity covering every runtime
             split count; use a power-of-two bucket to avoid recompilation
-        :type reducer_max_splits: int
         """
 
         if mma_qk_tiler_mn[0] != SM107_MLA_M_TILE:
@@ -1912,7 +1657,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         self.iterations_pv_k = self.mma_qk_tiler[1] // self.mma_pv_tiler[2]
         # No PV N split: the PV pair computes the full latent dim (QK is never recomputed).
         self.pv_n_splits = 1
-        self.latent_dim_per_group = self.latent_dim  # 512
+        self.latent_dim_per_group = self.latent_dim
         self.iterations_pv_n = self.latent_dim_per_group // self.mma_pv_tiler[1]
 
         # Auto-only N16 rescale experiment: keep four preloads but halve each
@@ -1967,10 +1712,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         self.mixed_preferred_softmax_reg_num = 208
         self.mixed_preferred_correction_reg_num = 208
         self.mixed_preferred_other_reg_num = 48
-        # Auto launches 512 threads. Runtime setmaxnreg donation redistributes
-        # the CTA register pool after common initialization.
-        # Keep the softmax TMEM load chunked so its score fragment does not
-        # unnecessarily raise the active-warp target.
         # Ten warps retrieve the TMEM pointer on either role. QK uses g0, g1,
         # W8 and W11; PV uses g0, W8, W11 and correction.
         self.tmem_ptr_sync_bar = pipeline.NamedBarrier(
@@ -2017,10 +1758,9 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                 + self.threads_per_warp * self.num_total_compute_warps
             ),
         )
-        # UBLKCP variant: per-softmax-group barrier ordering the group's 128
-        # STS threads before the single-warp cp.async.bulk P send (g0 -> 9,
-        # g1 -> 10). Pairs with the thread-scope proxy fence per the
-        # memory-model guide's Optimal STS->bulk pattern.
+        # Per-softmax-group barrier ordering the group's 128 STS threads before
+        # the single-warp cp.async.bulk P send (g0 -> 9, g1 -> 10). Pairs with
+        # the thread-scope proxy fence.
         self.p_src_write_bar_0 = pipeline.NamedBarrier(
             barrier_id=9,
             num_threads=(self.threads_per_warp * self.num_compute_warps),
@@ -2070,7 +1810,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         # only (8KB dedicated home, produce/consume per work tile makes the
         # rope home multi-wave safe automatically). Q LATENT has no fixed
         # home: it enters the K ring as two ordinary slot productions per
-        # work tile (gr150 pattern), which is what makes multi-wave (several
+        # work tile, which is what makes multi-wave (several
         # work tiles per cluster) safe by construction.
         self.load_q_stage = 1
         # K ring = 7 dedicated stages of 36,864B (latent 32,768 + rope
@@ -2081,7 +1821,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         # slots like any others. Ring wrap (slot 6 -> 0) is safe: the halves
         # use independent per-slot views.
         self.load_k_stage = 7
-        # k_armed ABA fix (Mengyu): the count-only notification ring must be
+        # k_armed ABA fix: the count-only notification ring must be
         # deeper than the K data ring. W9's lead over W10 is bounded by the 7
         # data slots plus the 2 self-produced Q-half notifications per work
         # tile (the Q fills bypass W10, so the data ring alone cannot bound
@@ -2089,9 +1829,8 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         # churn). Notification cursors are independent 9-deep states; the K
         # data/TMA barriers keep using the 7-deep cursors.
         self.k_armed_stage = self.load_k_stage + 2
-        # V stage holds both latent halves (iterations_pv_n=2) => 32KB/stage/CTA.
-        # Traded one V stage (was 9) for 2 extra p_full stages on the PV role
-        # (net 0: -32KB V, +32KB P), keeping the role at ~333.8KB.
+        # V stage holds both latent halves (iterations_pv_n=2) => 32KB/stage/CTA;
+        # with the 4 P stages this keeps the PV role at ~333.8KB.
         self.load_v_stage = 8
         # Two S stages: one per softmax warp group (pingpong).
         self.mma_s_stage = 2
@@ -2099,8 +1838,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         # metadata stages. Global k-tile t maps to P stage t % p_stage (the
         # group advance logic tracks absolute tile positions, so any even
         # p_stage works): with 4 stages g0 owns {0,2} and g1 owns {1,3},
-        # giving each softmax group double buffering of its own sends —
-        # funded by dropping one K stage and one V stage.
+        # giving each softmax group double buffering of its own sends.
         self.p_stage = 4
         # Correction metadata pipeline: 4 stages at zero SMEM growth (the
         # 2-word protocol halves the per-stage footprint; 4 x 1,024B = the old
@@ -2161,51 +1899,30 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         reduction kernel.
 
         :param q_latent: Query latent [batch_size, seq_len_q, num_heads, latent_dim]
-        :type q_latent: cute.Tensor
         :param q_rope: Query RoPE [batch_size, seq_len_q, num_heads, rope_dim]
-        :type q_rope: cute.Tensor
         :param c_latent: KV latent cache [num_pages, page_size, latent_dim]
-        :type c_latent: cute.Tensor
         :param c_rope: KV RoPE cache [num_pages, page_size, rope_dim]
-        :type c_rope: cute.Tensor
         :param page_table: Page table [batch_size, page_count]
-        :type page_table: cute.Tensor
         :param o: Output [batch_size, seq_len_q, num_heads, latent_dim], contiguous
-        :type o: cute.Tensor
         :param lse: Base-2 log-sum-exp [batch_size, seq_len_q, num_heads]
-        :type lse: cute.Tensor
         :param workspace: Split-KV scratch from ``get_workspace_size``; None when
             ``split_kv`` is 1
-        :type workspace: Optional[cute.Tensor]
-        :param split_kv: Number of KV splits
-        :type split_kv: cutlass.Int32
         :param cache_seqs: KV length per request [batch_size]
-        :type cache_seqs: cute.Tensor
         :param block_split_kvs: Split count per request [batch_size], used only
             with ``is_var_split_kv``
-        :type block_split_kvs: Optional[cute.Tensor]
-        :param softmax_scale: Scale applied to QK^T before softmax
-        :type softmax_scale: cutlass.Float32
-        :param output_scale: Scale applied to the output
-        :type output_scale: cutlass.Float32
-        :param stream: CUDA stream
-        :type stream: cuda.CUstream
-        :param use_pdl: Launch with programmatic dependent launch
-        :type use_pdl: cutlass.Constexpr
         """
 
-        # setup static attributes before smem/grid/tma computation
         self.q_dtype = q_latent.element_type
         self.k_dtype = c_latent.element_type
         self.v_dtype = c_latent.element_type
         self.o_dtype = o.element_type
 
-        # check type consistency
         if cutlass.const_expr(
             self.q_dtype != self.k_dtype or self.q_dtype != self.v_dtype
         ):
             raise TypeError(
-                f"Type mismatch: {self.q_dtype} != {self.k_dtype} or {self.q_dtype} != {self.v_dtype}"
+                f"Type mismatch: {self.q_dtype} != {self.k_dtype} or "
+                f"{self.q_dtype} != {self.v_dtype}"
             )
 
         # Packed rows r = q_tok * H + head need stride(S_q) == H * stride(H).
@@ -2278,7 +1995,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
             ),
         )
 
-        # check leading dimensions of input/output
         if cutlass.const_expr(q_latent.stride[1] != 1 or q_rope.stride[1] != 1):
             raise ValueError("q_latent and q_rope must have leading dimension 1")
         if cutlass.const_expr(c_latent.stride[1] != 1 or c_rope.stride[1] != 1):
@@ -2648,7 +2364,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
             * self.iterations_pv_k
         )
         self.p_tx_bytes_per_cta = p_bytes_per_cta
-        # corr metadata: per-CTA 128 rows x 4 words, tracked on each PV CTA's own
+        # corr metadata: per-CTA 128 rows x 2 words, tracked on each PV CTA's own
         # cor_full mbarrier.
         self.corr_rows = self.mma_qk_tiler[0] // self.cta_pair_size  # 128
         self.cor_tx_bytes = self.corr_rows * self.corr_words_per_row * 4
@@ -2684,7 +2400,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             # ---- QK-role data ----
-            # UBLKCP variant: local P staging, placed at the FRONT of the
+            # Local P staging, placed at the FRONT of the
             # role data (offset 1024, right after the shared mbar header).
             # Softmax writes P here (same PISL-swizzled layout as the PV
             # pair's smem_p), then one warp bulk-copies the 16KB stage to the
@@ -2693,11 +2409,8 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                 cute.struct.MemRange[self.q_dtype, cute.cosize(p_smem_layout_staged)],
                 1024,
             ]
-            # K ring stage aliasing — field ORDER is load-bearing: the
-            # K ring layouts span contiguously from smem_kc_latent into
-            # loopQ: no Q aliasing — the kc fields hold the FULL ring and
-            # Q latent transits through ring slots. Only the 8KB rope home
-            # lays the full ring over the base pointer.
+            # loopQ: no Q aliasing — the kc fields hold the FULL K ring and
+            # Q latent transits through ring slots; Q rope has its own 8KB home.
             smem_kc_latent: cute.struct.Align[
                 cute.struct.MemRange[
                     self.k_dtype, cute.cosize(kc_latent_smem_layout_staged)
@@ -3142,6 +2855,11 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         tiled_mma: cute.TiledMma,
         is_k_load: bool,
     ):
+        """Makes a non-executable tiled TMA load atom for a paged KV tensor.
+
+        The per-CTA tile is split into page-sized boxes so each TMA copy stays
+        within one page.
+        """
         ident = cute.make_identity_layout(gmem.shape)
         g_tile = cute.composition(ident, mma_tiler)
         cta_mn = mma_tiler[0] // tiled_mma.thr_id.shape
@@ -3219,78 +2937,10 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         smem_size_bytes: cutlass.Constexpr,
         work_q_fdd,
     ):
-        """The device split_kv kernel implementation of the Multi-Head Latent Attention.
+        """Preferred 4-CTA body: QK/softmax on cluster ranks 0-1, PV on ranks 2-3.
 
-        This kernel coordinates multiple specialized warps to perform different phases of the MLA computation:
-        1. Load warp: Loads Q/C latent/rope data from global memory to shared memory using TMA
-        2. MMA warp: Performs matrix multiplications (Q*K^T and P*V)
-        3. Compute warps: Compute softmax and do rescaling on accumulators, and store the intermediate/final results
-        to global memory
-
-        The kernel produces either intermediate or final results of the MLA computation based on the split_kv parameter.
-        When split_kv is 1, the kernel generates the final results directly. Otherwise, it produces intermediate results
-        that will later be combined by a reduction kernel.
-
-        The kernel implements a complex pipeline with overlapping computation and memory operations,
-        using tensor memory access (TMA) for efficient data loading, warp specialization for different
-        computation phases.
-
-        :param tiled_mma_qk: Tiled MMA for Q*K^T
-        :type tiled_mma_qk: cute.TiledMma
-        :param tiled_mma_pv: Tiled MMA for P*V
-        :type tiled_mma_pv: cute.TiledMma
-        :param tma_atom_q_latent: TMA copy atom for query latent tensor
-        :type tma_atom_q_latent: cute.CopyAtom
-        :param mQL: query latent tensor
-        :type mQL: cute.Tensor
-        :param tma_atom_q_rope: TMA copy atom for query rope tensor
-        :type tma_atom_q_rope: cute.CopyAtom
-        :param mKR: Compressed rope tensor
-        :type mKR: cute.Tensor
-        :param tma_atom_c_latent: TMA copy atom for c latent tensor
-        :type tma_atom_c_latent: cute.CopyAtom
-        :param mCL: Compressed latent tensor
-        :type mCL: cute.Tensor
-        :param tma_atom_c_rope: TMA copy atom for c rope tensor
-        :type tma_atom_c_rope: cute.CopyAtom
-        :param mCLT: Compressed latent transpose tensor
-        :type mCLT: cute.Tensor
-        :param mPT: Page table tensor
-        :type mPT: cute.Tensor
-        :param mO: Output tensor
-        :type mO: cute.Tensor
-        :param mLSE: Log-sum-exp tensor
-        :type mLSE: cute.Tensor
-        :param mAccO: Intermediate accumulator output tensor
-        :type mAccO: cute.Tensor
-        :param mAccLSE: Intermediate accumulator log-sum-exp tensor
-        :type mAccLSE: cute.Tensor
-        :param split_kv: The split_kv parameter
-        :type split_kv: cutlass.Int32
-        :param cache_seqs: The variable sequence length tensor
-        :type cache_seqs: cute.Tensor
-        :param block_split_kvs: The per-block split_kv values tensor
-        :type block_split_kvs: cute.Tensor
-        :param softmax_scale_log2: The log2 scale factor for softmax
-        :type softmax_scale_log2: cutlass.Float32
-        :param output_scale: The scale factor for the output
-        :type output_scale: cutlass.Float32
-        :param q_latent_smem_layout_staged: Shared memory layout for query tensor
-        :type q_latent_smem_layout_staged: cute.ComposedLayout
-        :param q_rope_smem_layout_staged: Shared memory layout for query rope tensor
-        :type q_rope_smem_layout_staged: cute.ComposedLayout
-        :param kc_latent_smem_layout_staged: Shared memory layout for key tensor
-        :type kc_latent_smem_layout_staged: cute.ComposedLayout
-        :param kc_rope_smem_layout_staged: Shared memory layout for key rope tensor
-        :type kc_rope_smem_layout_staged: cute.ComposedLayout
-        :param p_smem_layout_staged: Shared memory layout for probability matrix
-        :type p_smem_layout_staged: cute.ComposedLayout
-        :param vc_smem_layout_staged: Shared memory layout for value tensor
-        :type vc_smem_layout_staged: cute.ComposedLayout
-        :param cta_layout_vmnk: Layout for compute threads
-        :type cta_layout_vmnk: cute.Layout
-        :param SharedStorage: Shared storage for the kernel
-        :type SharedStorage: cutlass.Constexpr
+        With a split-KV workspace it writes partial O/LSE for the reduction
+        kernel; otherwise it writes the final results.
         """
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -3342,7 +2992,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         )
         clc_response_ptr = storage.clc_response.data_ptr()
 
-        # Tensor memory dealloc barrier init. W11 allocates and frees TMEM on
+        # W11 allocates and frees TMEM on
         # every CTA; W8 hands QK completion to W11 through barrier 4.
         tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
@@ -3410,7 +3060,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
             num_stages=self.k_armed_stage,
             agent=(pipeline.PipelineOp.AsyncThread, one_thread_group),
         )
-        # UBLKCP variant: no p_pair_ready mbarrier. Pair-readiness is folded
+        # Pair-readiness is folded
         # into the leader's p_full arrive count (the non-leader votes on the
         # leader's p_full after its own local P half has landed).
         cor_full_mbar = pipeline.MbarrierArray(
@@ -3475,7 +3125,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         sP = storage_pv.smem_p.get_tensor(
             p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner
         )
-        # UBLKCP variant: local P staging view on the QK role (byte-identical
+        # Local P staging view on the QK role (byte-identical
         # PISL layout to the PV pair's smem_p, so the bulk copy is a raw
         # same-offset block move).
         sP_src = storage.smem_p_src.get_tensor(
@@ -3500,9 +3150,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         epilogue_smem_exchange = storage_pv.epilogue_smem_exchange.get_tensor(
             cute.make_layout(self.num_total_compute_warps * self.threads_per_warp)
         )
-        #
-        # Cluster wait before tensor memory alloc
-        #
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk)
         # PDL: setup above overlaps the previous kernel; every role reads
         # inputs (at least cache_seqs) below.
@@ -3598,7 +3245,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                             role_blk_coord,
                         )
                         if k_tile_count > 0:
-                            # Construct fixed common/tma_qk params for load_tma
                             tma_common_params = SimpleNamespace(
                                 blk_coord=role_blk_coord,
                                 local_split_kv=local_split_kv,
@@ -3607,9 +3253,9 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                                 load_v_pipeline=load_v_pipeline,
                                 mPT=mPT,
                             )
-                            # tmaKV: W9 no longer issues K (moved to the PV
-                            # W10 multicast); it only paces the ring and signals
-                            # k_armed to the paired PV CTA.
+                            # W9 does not issue K (the PV W10 multicasts it);
+                            # it paces the ring and signals k_armed to the
+                            # paired PV CTA.
                             tma_qk_params = SimpleNamespace(
                                 tiled_mma_qk=tiled_mma_qk,
                                 tiled_mma_qk_tmem=tiled_mma_qk_tmem,
@@ -3625,7 +3271,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                                 k_armed_mbar=k_armed_mbar,
                                 k_armed_peer=role_pair_rank + self.cta_pair_size,
                             )
-                            # Load tma
                             (
                                 load_q_producer_state,
                                 load_k_producer_state,
@@ -3700,7 +3345,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                             role_blk_coord,
                         )
                         if k_tile_count > 0:
-                            # Construct fixed common/tma_pv params for load_tma
                             tma_common_params = SimpleNamespace(
                                 blk_coord=role_blk_coord,
                                 local_split_kv=local_split_kv,
@@ -3713,7 +3357,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                                 tma_atom_c_latent_transpose=tma_atom_c_latent_transpose,
                                 mCLT=mCLT,
                                 sVC=sVC_for_tma,
-                                # tmaKV: K issue moved here from the QK W9.
                                 tiled_mma_qk=tiled_mma_qk,
                                 tma_atom_c_latent=tma_atom_c_latent,
                                 tma_atom_c_rope=tma_atom_c_rope,
@@ -3758,7 +3401,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                 tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
                 if role_cta_rank < self.cta_pair_size:
-                    # Q-in-TMEM: create TMEM tensor and S2T copy setup (gr150 pattern)
+                    # Q-in-TMEM: create TMEM tensor and S2T copy setup
                     tQ_tmem = cute.make_tensor(
                         cute.recast_ptr(
                             tmem_ptr + self.tmem_q_offset, dtype=self.q_dtype
@@ -4216,7 +3859,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                             256,
                         )
                     if cutlass.const_expr(self.force_branch == "auto"):
-                        # Event 2 remains the work transition, not release time.
                         work_tile = next_work_tile
                     else:
                         clc_pipeline.consumer_wait(clc_consumer_state)
@@ -4501,18 +4143,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
     ) -> int:
         """Get the proper split_kv value for the MLA kernel based on parameters.
 
-        :param B: Batch size
-        :type B: int
-        :param S: Sequence length
-        :type S: int
-        :param K: Sequence length
-        :type K: int
-        :param mma_qk_tiler_mn: MLA tiling parameters
-        :type mma_qk_tiler_mn: tuple
         :param max_active_blocks: CTAs that fit in full 4-CTA clusters
-        :type max_active_blocks: int
-        :return: Split_kv value
-        :rtype: int
         """
         k_tiles = ceil_div(K, mma_qk_tiler_mn[1])
         # Budget four CTAs per work item and reserve 1/16 of the full clusters
@@ -4534,19 +4165,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         block_split_kvs: cute.Tensor,
         blk_coord: cute.Coord,
     ) -> tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]:
-        """Get the current k_index, k_tile_count, and local split_kv value for the MLA kernel.
-
-        :param split_kv: Split_kv value
-        :type split_kv: cutlass.Int32
-        :param cache_seqs: Cache sequence lengths tensor
-        :type cache_seqs: cute.Tensor
-        :param block_split_kvs: Per-block split_kv values tensor
-        :type block_split_kvs: cute.Tensor
-        :param blk_coord: Block coordinate
-        :type blk_coord: cute.Coord
-        :return: k_index, k_tile_count, split_kv
-        :rtype: tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]
-        """
+        """Get the current k_index, k_tile_count, and local split_kv value."""
         K = cache_seqs[blk_coord[3]]
         if cutlass.const_expr(self.is_var_split_kv):
             split_kv = block_split_kvs[blk_coord[3]]
@@ -4569,25 +4188,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         load_k_producer_state: pipeline.PipelineState | None = None,
         k_armed_notify_state: pipeline.PipelineState | None = None,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]:
-        """Load wrap to load Q/K tensors. Updates the load qk producer state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param qk_params: The qk parameters
-        :type qk_params: SimpleNamespace
-        :param k_index: The k index
-        :type k_index: cutlass.Int32
-        :param k_tile_count: The k tile count
-        :type k_tile_count: cutlass.Int32
-        :param load_q_producer_state: The load q producer state
-        :type load_q_producer_state: pipeline.PipelineState
-        :param load_k_producer_state: The load k producer state
-        :type load_k_producer_state: pipeline.PipelineState
-
-        :return: The load q producer state and load k producer state
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState]
-        """
-        # page table
+        """Load wrap to load Q/K tensors. Updates the load qk producer state."""
         mPT = common_params.mPT[None, common_params.blk_coord[3]]
 
         # Flatten divide and partition global tensors for QK TMA load
@@ -4603,9 +4204,9 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         tSgQL = thr_mma_q.partition_A(gQL)
         tSgQR = thr_mma_q.partition_A(gQR)
 
-        # tma partition for q (K issue moved to the PV W10, tmaKV).
+        # Q only; K is issued by the PV W10.
         # loopQ: the latent partition is rebuilt per half over the dynamic
-        # ring-slot views inside _loopq_produce_q below; only the gmem side
+        # ring-slot views below; only the gmem side
         # is fixed. A throwaway half view at slot 0 supplies the smem-side
         # shape for the gmem partition.
         _sQ_shape_probe = cute.make_tensor(
@@ -4637,7 +4238,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         tQLgQL = tQLgQL_mkl[None, None, None, 0, common_params.blk_coord[3]]
         tQRgQR = tQRgQR_mkl[None, None, None, 0, common_params.blk_coord[3]]
 
-        # set extra params
         common_params.mPT = mPT
         qk_params.tQLgQL = tQLgQL
         qk_params.tQRgQR = tQRgQR
@@ -4660,8 +4260,8 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                 tma_bar_ptr=rope_bar_ptr,
             )
         load_q_producer_state.advance()
-        # Q latent: two ordinary productions on the K ring (gr150 pattern,
-        # multi-wave safe: producer_acquire waits until the slot's previous
+        # Q latent: two ordinary productions on the K ring (multi-wave
+        # safe: producer_acquire waits until the slot's previous
         # K/Q occupant was consumed). expected_tx override because a Q half
         # (32,768B x pair) differs from a K stage (latent+rope). W9 still
         # remote-arrives k_armed for these slots — W10 waits it and SKIPS
@@ -4741,26 +4341,9 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         load_k_issue_state: pipeline.PipelineState = None,
         k_armed_notify_state: pipeline.PipelineState = None,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]:
-        """Load wrap to load V tensors. Updates the load v producer state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param v_params: The v parameters
-        :type v_params: SimpleNamespace
-        :param k_index: The k index
-        :type k_index: cutlass.Int32
-        :param k_tile_count: The k tile count
-        :type k_tile_count: cutlass.Int32
-        :param load_v_producer_state: The load v producer state
-        :type load_v_producer_state: pipeline.PipelineState
-
-        :return: The load v producer state
-        :rtype: pipeline.PipelineState
-        """
-        # page table
+        """Issue K (multicast to the paired QK CTA) and V; returns updated states."""
         mPT = common_params.mPT[None, common_params.blk_coord[3]]
 
-        # Flatten divide and partition global tensors for V TMA load
         page_tile_size = min(self.page_size, self.mma_pv_tiler[2])
         gCLT = cute.flat_divide(v_params.mCLT, (self.mma_pv_tiler[1], page_tile_size))
         cta_n = self.mma_pv_tiler[1] // v_params.tiled_mma_pv.thr_id.shape
@@ -4770,7 +4353,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         ]
         tOgCLT = cute.tiled_divide(gCLT, (cta_n, page_tile_size))
         tOgCLT = tOgCLT[None, 0, 0, None, None, None]
-        # tma partition for vc
         # smem: ((atom_v, rest_v), STAGE)
         # gmem: ((atom_v, rest_v), RestM, RestK, RestL)
         tVCsVC, tCLTgCLT = cpasync.tma_partition(
@@ -4781,9 +4363,9 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
             tOgCLT,
         )
 
-        # tmaKV: K partitions, PV-side. blk_coord[0] here is the PV CTA's
-        # pair rank == the target QK CTA's pair rank, so the page-index and
-        # slicing math is identical to the original QK-side W9 code. The
+        # K partitions, PV side. blk_coord[0] here is the PV CTA's pair rank ==
+        # the target QK CTA's pair rank, so the page-index and slicing math
+        # matches the QK side. The
         # smem views come from THIS CTA's union storage: identical offsets
         # on the receiving QK CTA (shared header design), which is what the
         # multicast delivers to.
@@ -4852,13 +4434,12 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
             load_k_issue_state.advance()
             k_armed_notify_state.advance()
 
-        # set extra params
         common_params.mPT = mPT
         v_params.tCLTgCLT = tCLTgCLT
         v_params.tVCsVC = tVCsVC
 
         while k_tile_count > 0:
-            # ---- K issue (before V, same warp; user design) ----
+            # ---- K issue (before V) ----
             k_pidx = cute.make_rmem_tensor(
                 cute.make_layout(k_page_per_tile), cutlass.Int32
             )
@@ -4899,7 +4480,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                     )
             load_k_issue_state.advance()
             k_armed_notify_state.advance()
-            # ---- V issue (unchanged) ----
+            # ---- V issue ----
             load_v_producer_state = self.load_tma_v_one_k_tile(
                 common_params,
                 v_params,
@@ -4922,31 +4503,12 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         k_armed_notify_state: pipeline.PipelineState,
         load_q: bool,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]:
-        """Load one k-tile of Q/C latent/rope tensors. Updates the load qkv producer state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param qk_params: The qk parameters
-        :type qk_params: SimpleNamespace
-        :param k_index: The k index
-        :type k_index: cutlass.Int32
-        :param k_tile_count: The k tile count
-        :type k_tile_count: cutlass.Int32
-        :param load_q_producer_state: The load q producer state
-        :type load_q_producer_state: pipeline.PipelineState
-        :param load_k_producer_state: The load kv producer state
-        :type load_k_producer_state: pipeline.PipelineState
-        :param load_q: Whether to load q
-        :type load_q: bool
-
-        :return: The load q producer state and load kv producer state
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState]
-        """
+        """Paces one K ring stage and signals k_armed to the paired PV CTA."""
         # loopQ: Q production happens in load_tma_qk at work-tile start
         # (two ring-slot productions + rope); nothing Q-related per k-tile,
         # and no alias gate — the ring's own produce/consume protocol covers
         # multi-wave reuse of every slot.
-        # tmaKV: the K data itself is issued by the paired PV CTA's W10 as a
+        # The K data itself is issued by the paired PV CTA's W10 as a
         # TMA multicast into this CTA's stage. W9 keeps the ring pacing:
         # producer_acquire waits the LOCAL stage-empty and (leader) arms the
         # expect_tx on the pair-leader full mbar - exactly the accounting the
@@ -4973,20 +4535,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         k_index: cutlass.Int32,
         load_v_producer_state: pipeline.PipelineState,
     ) -> pipeline.PipelineState:
-        """Load one k-tile of compressed latent transpose tensor(v). Updates the load qkv producer state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param v_params: The load tma v parameters
-        :type v_params: SimpleNamespace
-        :param k_index: The k index
-        :type k_index: cutlass.Int32
-        :param load_v_producer_state: The load v producer state
-        :type load_v_producer_state: pipeline.PipelineState
-
-        :return: The load qkv producer state
-        :rtype: pipeline.PipelineState
-        """
+        """Load one k-tile of compressed latent transpose tensor (v)."""
         page_per_tile = self.mma_pv_tiler[2] * self.iterations_pv_k // self.page_size
         page_per_subtile = ceil_div(page_per_tile, self.iterations_pv_k)
         k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile), cutlass.Int32)
@@ -4996,7 +4545,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                 if page_per_tile == 1
                 else _page_index(common_params.mPT, k_index * page_per_tile + i)
             )
-        # get the mbar ptr from pipeline.
         tma_bar_ptr = common_params.load_v_pipeline.producer_get_barrier(
             load_v_producer_state
         )
@@ -5055,10 +4603,8 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         tStS_staged_fake = tiled_mma_qk.make_fragment_C(
             cute.append(tStS_shape, self.mma_s_stage)
         )
-        # use real tmem ptr for tStS
         tStS_staged = cute.make_tensor(common_params.tmem_ptr, tStS_staged_fake.layout)
 
-        # set more parameters
         qk_params.tSrKC = tSrKC
         qk_params.tSrKC_rope = tSrKC_rope
         qk_params.tStS_staged = tStS_staged
@@ -5184,8 +4730,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                     wait_q=False,
                 )
                 k_tile_count -= 1
-            # (Q consumer release moved up, right after the S2T loops.)
-            # PV mainloop runs on the dedicated mma_pv warp.
 
         return (
             tiled_mma_qk,
@@ -5292,22 +4836,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         pipeline.PipelineState,
         pipeline.PipelineState,
     ]:
-        """Compute one k-tile of mma for Q*K^T. Updates the tiled MMA QK and pipeline states.
-
-        :param qk_params: The qk parameters
-        :type qk_params: SimpleNamespace
-        :param tiled_mma_qk: The tiled mma qk
-        :type tiled_mma_qk: cute.TiledMma
-        :param load_q_consumer_state: The load q consumer state
-        :type load_q_consumer_state: pipeline.PipelineState
-        :param load_k_consumer_state: The load k consumer state
-        :type load_k_consumer_state: pipeline.PipelineState
-        :param mma_s_producer_state: The mma s producer state
-        :type mma_s_producer_state: pipeline.PipelineState
-
-        :return: The tiled mma qk, the load q consumer state, the load k consumer state, and the mma s producer state
-        :rtype: tuple[cute.TiledMma, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
-        """
+        """Compute one k-tile of mma for Q*K^T. Updates the pipeline states."""
         tStS = qk_params.tStS_staged[None, None, None, mma_s_producer_state.index]
 
         load_q_pipeline = common_params.load_q_pipeline
@@ -5376,10 +4905,8 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         p_full completes on (expected tx bytes) + (arrive count 1). On the
         NON-LEADER the arrive is its own elect_one vote (arrive_self=True) and
         a CTA-scope wait suffices. On the LEADER the single arrive comes
-        REMOTELY from the non-leader (release.cluster) after ITS half landed,
-        so the leader's one wait doubles as the pair rendezvous and — per the
-        memory-model guide §4/§8 (mbarrier pairs carry implicit async fencing
-        at CTA scope only) — uses acquire.cluster semantics.
+        REMOTELY from the non-leader after ITS half landed, so the leader's one
+        wait doubles as the pair rendezvous (see ``_wait_cluster_mbarrier``).
         """
         # Each QK peer bulk-copies into this PV CTA's P SMEM and completes
         # this same CTA's p_full mbarrier (same-CTA data/mbar pairing is
@@ -5420,24 +4947,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         pipeline.PipelineState,
         pipeline.PipelineState,
     ]:
-        """Compute one k-tile of mma for P*V. Updates the tiled mma pv and pipeline states.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param pv_params: The pv parameters
-        :type pv_params: SimpleNamespace
-        :param tiled_mma_pv: The tiled mma pv
-        :type tiled_mma_pv: cute.TiledMma
-        :param load_v_consumer_state: The load v consumer state
-        :type load_v_consumer_state: pipeline.PipelineState
-        :param p_mma_consumer_state: The P MMA consumer state
-        :type p_mma_consumer_state: pipeline.PipelineState
-        :param mma_o_producer_state: The MMA o producer state
-        :type mma_o_producer_state: pipeline.PipelineState
-
-        :return: The tiled mma pv, the load v consumer state, the P MMA consumer state, and the MMA o producer state
-        :rtype: tuple[cute.TiledMma, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
-        """
+        """Compute one k-tile of mma for P*V. Updates the pipeline states."""
 
         load_v_pipeline = common_params.load_v_pipeline
         accumulate_flag = tiled_mma_pv.get(tcgen05.Field.ACCUMULATE)
@@ -5504,7 +5014,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         # The leader's p_full expects exactly one arrive: this remote vote.
         # It can only fire after THIS CTA's P half has landed, so the
         # leader's single p_full wait covers both halves of the pair.
-        # Plain CTA-scope remote arrive (Feynman DSMEM pattern): the vote is a
+        # Plain CTA-scope remote arrive: the vote is a
         # count-only notification — this CTA's P half's visibility to the
         # 2-CTA UMMA is established by the bulk copy's complete_tx on OUR
         # p_full, not by this arrive's ordering. The earlier CLUSTER/release
@@ -5529,26 +5039,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         p_cor_producer_state: pipeline.PipelineState,
         is_second_compute_warp: bool,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]:
-        """Compute warp to compute the result of softmax, rescale, and epilogue. Updates the related pipeline states.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param softmax_params: The softmax parameters
-        :type softmax_params: SimpleNamespace
-        :param k_index: The index of the k-tile
-        :type k_index: cutlass.Int32
-        :param k_tile_count: The number of k-tiles
-        :type k_tile_count: cutlass.Int32
-        :param mma_s_consumer_state: The MMA s consumer state
-        :type mma_s_consumer_state: pipeline.PipelineState
-        :param p_mma_producer_state: The P MMA producer state
-        :type p_mma_producer_state: pipeline.PipelineState
-        :param p_cor_producer_state: The P correction producer state
-        :type p_cor_producer_state: pipeline.PipelineState
-
-        :return: The MMA s consumer state, the P MMA producer state, and the P correction producer state
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
-        """
+        """Runs the softmax loop of one compute warp group over its k-tiles."""
 
         k_tile_total = cute.ceil_div(common_params.K, self.mma_qk_tiler[1])
 
@@ -5725,25 +5216,9 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         mma_o_consumer_state: pipeline.PipelineState,
         correction_group_idx: int,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
-        """Compute warp to compute the result of softmax, rescale, and epilogue. Updates the related pipeline states.
+        """Runs the correction loop: per-tile rescale, then the final epilogue.
 
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param epilogue_params: The epilogue parameters
-        :type epilogue_params: SimpleNamespace
-        :param k_index: The index of the k-tile
-        :type k_index: cutlass.Int32
-        :param k_tile_count: The number of k-tiles
-        :type k_tile_count: cutlass.Int32
-        :param p_cor_consumer_state: The P correction consumer state
-        :type p_cor_consumer_state: pipeline.PipelineState
-        :param mma_o_consumer_state: The MMA o consumer state
-        :type mma_o_consumer_state: pipeline.PipelineState
         :param correction_group_idx: The PV correction warpgroup index (0 or 1)
-        :type correction_group_idx: int
-
-        :return: The P correction consumer state, and the MMA o consumer state
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState]
         """
 
         k_tile_count_init = k_tile_count
@@ -5814,7 +5289,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         rCor[0] = row_sum
         rCor[1] = row_max_new
 
-        # Wait acquire.cluster for the PV CTA's release.cluster arrival on this
+        # Wait for the PV CTA's remote arrival on this
         # local cor_empty barrier. The producer state starts with phase=1 so the
         # first p_cor_stage acquires fall through.
         _wait_cluster_mbarrier(
@@ -5950,34 +5425,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         cutlass.Float32,
         cutlass.Float32,
     ]:
-        """Softmax for one k-tile. Updates the related pipeline states and returns the computed results.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param softmax_params: The softmax parameters
-        :type softmax_params: SimpleNamespace
-        :param k_index: The index of the k-tile
-        :type k_index: cutlass.Int32
-        :param mma_s_consumer_state: The MMA s consumer state
-        :type mma_s_consumer_state: pipeline.PipelineState
-        :param p_mma_producer_state: The P MMA producer state
-        :type p_mma_producer_state: pipeline.PipelineState
-        :param p_cor_producer_state: The P correction producer state
-        :type p_cor_producer_state: pipeline.PipelineState
-        :param row_max: The row max
-        :type row_max: cutlass.Float32
-        :param row_sum: The row sum
-        :type row_sum: cutlass.Float32
-        :param correction_factor: The correction factor
-        :type correction_factor: cutlass.Float32
-        :param is_last_tile: Whether the last tile
-        :type is_last_tile: bool
-        :param is_local_last_tile: Whether the last tile is local
-        :type is_local_last_tile: cutlass.Boolean
-
-        :return: The MMA s consumer state, the P MMA producer state, the P correction producer state, the row max, the row sum, and the correction factor
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState, cutlass.Float32, cutlass.Float32, cutlass.Float32]
-        """
+        """Softmax for one k-tile. Updates the related pipeline states."""
 
         # Keep the S wait early, but defer the P producer acquire until right
         # before STTM P so rmem-only softmax work can overlap with the prior
@@ -5986,7 +5434,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         peek_mma_s_full = mma_s_pipeline.consumer_try_wait(mma_s_consumer_state)
         mma_s_pipeline.consumer_wait(mma_s_consumer_state, peek_mma_s_full)
 
-        # load S from tmem
         tStS_shape = softmax_params.tiled_mma_qk.partition_shape_C(
             cute.select(self.mma_qk_tiler, mode=[0, 1])
         )
@@ -6045,7 +5492,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                         )
                         else -self.acc_dtype.inf
                     )
-            # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
         elif cutlass.const_expr(
             (arch >= Arch.sm_103 and arch <= Arch.sm_103f)
@@ -6132,8 +5578,8 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         # lazySum: my_prev_max = this GROUP's global-max view at ITS previous
         # tile (loop-carried row_max). The partial row_sum is rescaled by
         # exp2(my_prev_max - row_max_new) instead of the serial tile-to-tile
-        # factor; peer_row_sum is no longer inherited (mailbox row_sum word is
-        # dead, layout kept for the verified Rep(4) mbox machinery).
+        # factor; peer_row_sum is not inherited (the mailbox row_sum word is
+        # unused by the reader; the layout is kept for the Rep(4) mailbox copy).
         my_prev_max = row_max
         peer_row_max, peer_row_sum = self._load_group_mbox(
             common_params, softmax_params, peer_slot, tidx
@@ -6144,8 +5590,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
 
         # critShort: no_correction decision + row_max_new rollback HOISTED
         # above the mailbox publish (the published max must be the
-        # post-rollback value). Single source of truth: the exchange helper
-        # no longer recomputes/rolls back.
+        # post-rollback value).
         no_correction = cutlass.Int32(0)
         if (
             row_max_new - row_max
@@ -6185,7 +5630,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         correction_factor = _rescale_factor(
             row_max, row_max_new, softmax_params.softmax_scale_log2
         )
-        # split kv case
         if not is_local_last_tile:
             p_cor_producer_state, row_max_new = self.exchange_p_cor_metadata(
                 common_params,
@@ -6200,7 +5644,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
             )
 
         if cutlass.const_expr(self.use_fp16_softmax):
-            # FP16 softmax path (restored, mirroring the 2p2/ublkcp donor):
+            # FP16 softmax path:
             # fused f32x4 -> f16x2x2 -> fma -> exp2 -> e4m3x4 pipeline
             n_f16_elems = cute.size(tTR_rAcc)
             n_packed = n_f16_elems // 2  # pairs of f16x2
@@ -6281,8 +5725,8 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         # lazySum end-of-split merge (group-final tiles only):
         #  - the NON-serial-last group publishes its raw partial into the
         #    (otherwise unused) softmax_smem_exchange slot for its rows; its
-        #    mailbox store + order-bar arrive below order the write before the
-        #    serial-last group's read (bar.sync memory semantics).
+        #    end-of-split bar arrive orders the write before the serial-last
+        #    group's read.
         #  - the SERIAL-last group (owner of the split's final tile) folds the
         #    peer partial in, correcting it from the peer's final max view
         #    (= peer_row_max just read from the mailbox this tile) to the
@@ -6297,9 +5741,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
             def _lazy_merge() -> None:
                 # critShort: acquire via the dedicated end-of-split
                 # rendezvous bar (id3, 256 thr = both groups). The peer's
-                # raw-partial store is ordered before its arrive; the old
-                # ordering backer (tail mbox store + order-bar arrive) no
-                # longer exists after the hoist.
+                # raw-partial store is ordered before its arrive.
                 self.epilogue_exchange_sync_bar.arrive_and_wait()
                 _res[0] = row_sum + _exch[tidx] * _rescale_factor(
                     peer_row_max, row_max_new, _scale_log2
@@ -6317,7 +5759,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         # Split-kv correction metadata for the LAST tile: issued right after
         # the row_sum reduction (the reduction kernel consumes this row_sum as
         # the split's final sum, so it cannot be sent any earlier), but before
-        # the mailbox/P staging/send so the PV pair's O rescale overlaps them.
+        # the P staging/send so the PV pair's O rescale overlaps them.
         # lazySum: the non-serial-last group's exchange carries its PARTIAL;
         # harmless - the PV epilogue only consumes the FINAL cor stage's
         # row_sum (mid-stream row_sums are dead, see correction()).
@@ -6334,13 +5776,9 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                 p_cor_producer_state,
             )
 
-        # critShort: mailbox publish + order-bar release were hoisted to right
-        # after the merge (see above); nothing to publish here.
-
         # UBLKCP 2+2: stage P locally, then push the whole 16KB stage to the
         # paired PV CTA with a single cp.async.bulk (SASS: UBLKCP) posting one
-        # transaction on the peer's p_full — replacing the 1024 x 16B
-        # st.async micro-transactions of the STAS scheme.
+        # transaction on the peer's p_full.
         # Build the per-stage (M,K) PISL-swizzled view over the LOCAL staging
         # buffer (byte-identical layout to the PV pair's smem_p).
         sP = softmax_params.sP_src[None, None, None, (None, p_mma_producer_state.index)]
@@ -6461,7 +5899,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         sQ: cute.Tensor,
         tQ: cute.Tensor,
     ):
-        """Setup S2T (UTCCP) copy for SMEM→TMEM Q transfer (gr150 pattern)."""
+        """Setup S2T (UTCCP) copy for SMEM→TMEM Q transfer."""
         tCsQ_compact = cute.filter_zeros(sQ)
         tCtQ_compact_staged = cute.filter_zeros(tQ)
         tCtQ_compact = cute.filter_zeros(tQ[None, None, None, 0])
@@ -6487,18 +5925,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         iter_n: int,
         subtile_n: cutlass.Constexpr[int] = 0,
     ) -> tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor]:
-        """Tensor memory load partition for rescale and epilogue.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param tiled_mma_pv: The tiled mma pv
-        :type tiled_mma_pv: cute.TiledMma
-        :param iter_n: The iteration number
-        :type iter_n: int
-
-        :return: The tiled mma pv, the tiled mma pv, the tiled mma pv, the tiled mma pv, the tiled mma pv
-        :rtype: tuple[cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma]
-        """
+        """Tensor memory load partition for rescale and epilogue."""
 
         if cutlass.const_expr(subtile_n == 0):
             subtile_n = self.correction_subtile_n
@@ -6563,7 +5990,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
             subtile_n,
             self.mma_pv_tiler[2],
         )
-        # Flatten divide and partition global tensors for O
         cta_pv_tiler_mn = cute.select(cta_pv_tiler, mode=[0, 1])
 
         gmem_iter_n = (
@@ -6637,16 +6063,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         cutlass.Float32,
         cutlass.Int32,
     ]:
-        """Get the correction factor from the P correction consumer state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param p_cor_consumer_state: The P correction consumer state
-        :type p_cor_consumer_state: pipeline.PipelineState
-
-        :return: The P correction consumer state, the row_sum, the row_max, and the correction factor
-        :rtype: tuple[pipeline.PipelineState, cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Int32]
-        """
+        """Read this row's (row_sum, row_max) and derive the correction factor."""
         tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
         # elect_one() is warp-scoped: restrict single-arrive/re-arm operations to
         # one of the four correction warps or the barrier over-arrives.
@@ -6693,9 +6110,8 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
 
         # Release: one elected thread re-arms this CTA's cor_full transaction
         # count first, then every thread remote-arrives the QK peer's cor_empty
-        # barrier with release.cluster ordering after its read (arrive count =
-        # 256 threads). The producer can only unblock after all arrives, which
-        # orders it after the re-arm.
+        # barrier after its read (arrive count = 256 threads). The producer can
+        # only unblock after all arrives, which orders it after the re-arm.
         def _rearm_cor_full() -> None:
             with cute.arch.elect_one():
                 cute.arch.mbarrier_expect_tx(
@@ -6728,19 +6144,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
     ) -> pipeline.PipelineState:
         """Rescale for one k-tile. Updates the related pipeline state.
 
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param mma_o_consumer_state: The mma o consumer state
-        :type mma_o_consumer_state: pipeline.PipelineState
-        :param correction_factor: The correction factor
-        :type correction_factor: cutlass.Float32
-        :param no_correction: Whether to apply correction factor
-        :type no_correction: cutlass.Int32
         :param correction_group_idx: The PV correction warpgroup index (0 or 1)
-        :type correction_group_idx: int
-
-        :return: The MMA o consumer state
-        :rtype: pipeline.PipelineState
         """
         skip_correction = cute.arch.vote_all_sync(no_correction == 1)
         # Auto-only latency-overlap experiment: load four disjoint N16 fragments
@@ -6851,27 +6255,12 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
     ) -> pipeline.PipelineState:
         """Epilogue for one k-tile. Updates the related pipeline state.
 
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param epilogue_params: The epilogue parameters
-        :type epilogue_params: SimpleNamespace
-        :param mma_o_consumer_state: The mma o consumer state
-        :type mma_o_consumer_state: pipeline.PipelineState
-        :param row_sum: The row sum
-        :type row_sum: cutlass.Float32
-        :param row_max: The row max
-        :type row_max: cutlass.Float32
         :param correction_group_idx: The PV correction warpgroup index (0 or 1)
-        :type correction_group_idx: int
-
-        :return: The MMA o consumer state
-        :rtype: pipeline.PipelineState
         """
 
         tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
 
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
-            # mma_o pipeline consumer wait
             common_params.mma_o_pipeline.consumer_wait(mma_o_consumer_state)
 
             for group_subtile in cutlass.range_constexpr(
@@ -6881,7 +6270,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                     correction_group_idx + group_subtile * self.num_correction_groups
                 )
                 actual_n = iter_n * self.epilogue_n_subtiles + sub_n
-                # tmem load tiled copy and partition results.
                 tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_rAcc = (
                     self._tmem_load_partition(
                         common_params,
@@ -6891,14 +6279,12 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                     )
                 )
 
-                # load o
                 cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
 
                 # A fully masked row has row_sum == 0; write zeros, not NaN.
                 inverse_row_sum = (
                     cute.arch.rcp_approx(row_sum) if row_sum != 0.0 else 0.0
                 )
-                # apply output scale and normalize by row_sum
                 for i in cutlass.range(
                     cute.size(tTR_rAcc), vectorize=True, unroll_full=True
                 ):
@@ -6906,7 +6292,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                         tTR_rAcc[i] * epilogue_params.output_scale * inverse_row_sum
                     )
 
-                # store o to global memory
                 tR2G_rO_src = None
                 if cutlass.const_expr(common_params.mAccO is None):
                     tR2G_rO_src = cute.make_fragment_like(tTR_rAcc, self.o_dtype)
@@ -7015,20 +6400,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
     def make_and_init_load_qkv_pipeline(
         self, load_qkv_mbar_ptr, cta_layout_vmnk, load_stages, tx_count
     ) -> pipeline.PipelineTmaUmma:
-        """Create and initialize the tma load qkv pipeline.
-
-        :param load_qkv_mbar_ptr: The load qkv mbar pointer
-        :type load_qkv_mbar_ptr: cute.Tensor
-        :param cta_layout_vmnk: The cta layout vmnk
-        :type cta_layout_vmnk: tuple[int, int, int]
-        :param load_stages: The load stages
-        :type load_stages: list[int]
-        :param tx_count: The tx count
-        :type tx_count: int
-
-        :return: The tma load qkv pipeline
-        :rtype: pipeline.PipelineTmaUmma
-        """
+        """Create and initialize the tma load qkv pipeline."""
         load_qkv_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, len([self.load_tma_k_warp_id])
         )
@@ -7052,16 +6424,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
     def make_and_init_mma_s_pipeline(
         self, mma_s_mbar_ptr, cta_layout_vmnk
     ) -> pipeline.PipelineUmmaAsync:
-        """Create and initialize the mma s pipeline.
-
-        :param mma_s_mbar_ptr: The mma s mbar pointer
-        :type mma_s_mbar_ptr: cute.Tensor
-        :param cta_layout_vmnk: The cta layout vmnk
-        :type cta_layout_vmnk: tuple[int, int, int]
-
-        :return: The mma s pipeline
-        :rtype: pipeline.PipelineUmmaAsync
-        """
+        """Create and initialize the mma s pipeline."""
 
         mma_s_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, len([self.mma_qk_warp_id])
@@ -7085,16 +6448,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
     def make_and_init_mma_o_pipeline(
         self, mma_o_mbar_ptr, cta_layout_vmnk
     ) -> pipeline.PipelineUmmaAsync:
-        """Create and initialize the mma o pipeline.
-
-        :param mma_o_mbar_ptr: The mma o mbar pointer
-        :type mma_o_mbar_ptr: cute.Tensor
-        :param cta_layout_vmnk: The cta layout vmnk
-        :type cta_layout_vmnk: tuple[int, int, int]
-
-        :return: The mma o pipeline
-        :rtype: pipeline.PipelineUmmaAsync
-        """
+        """Create and initialize the mma o pipeline."""
 
         mma_o_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, len([self.mma_pv_warp_id])
@@ -7209,24 +6563,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         split_kv: int,
         acc_dtype: Type[cutlass.Numeric],
     ) -> int:
-        """Get the extra workspace(device memory) size for the MLA kernel when split_kv is not 1.
-
-        :param H: The height of the output tensor C
-        :type H: int
-        :param S: The sequence length of the output tensor C
-        :type S: int
-        :param D: The depth of the output tensor C
-        :type D: int
-        :param B: The batch size of the output tensor C
-        :type B: int
-        :param split_kv: The split key-value of the output tensor C
-        :type split_kv: int
-        :param acc_dtype: The data type of the output tensor C
-        :type acc_dtype: Type[cutlass.Numeric]
-
-        :return: The workspace size for the MLA kernel
-        :rtype: int
-        """
+        """Get the extra workspace (device memory) size for split_kv > 1."""
         if split_kv == 1:
             return 0
         return B * H * S * split_kv * (D + 1) * acc_dtype.width // 8
@@ -7244,24 +6581,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
     ) -> tuple[cute.Tensor, cute.Tensor]:
         """Initialize the workspace for the MLA kernel. Construct the intermediate tensors
         acc_o and acc_lse.
-
-        :param H: The height of the output tensor C
-        :type H: cutlass.Int32
-        :param D: The depth of the output tensor C
-        :type D: cutlass.Int32
-        :param S: The sequence length of the output tensor C
-        :type S: cutlass.Int32
-        :param B: The batch size of the output tensor C
-        :type B: cutlass.Int32
-        :param split_kv: The split key-value of the output tensor C
-        :type split_kv: cutlass.Int32
-        :param acc_dtype: The data type of the output tensor C
-        :type acc_dtype: Type[cutlass.Numeric]
-        :param workspace: The workspace tensor
-        :type workspace: cute.Tensor
-
-        :return: The output tensor C and the workspace tensor
-        :rtype: tuple[cute.Tensor, cute.Tensor]
         """
         acc_o, acc_lse = None, None
         if cutlass.const_expr(workspace is not None):
@@ -7303,31 +6622,9 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
     ) -> bool:
         """Check whether this kernel supports a problem.
 
-        :param num_heads: Number of query heads
-        :type num_heads: int
-        :param seq_len_q: Query tokens per request
-        :type seq_len_q: int
-        :param latent_dim: KV latent dimension
-        :type latent_dim: int
-        :param rope_dim: RoPE dimension
-        :type rope_dim: int
-        :param in_dtype: Q and KV data type
-        :type in_dtype: Type[cutlass.Numeric]
-        :param out_dtype: Output data type
-        :type out_dtype: Type[cutlass.Numeric]
-        :param page_size: KV cache page size
-        :type page_size: int
-        :param is_var_seq: Whether KV lengths vary across requests
-        :type is_var_seq: bool
-        :param is_var_split_kv: Whether the split count varies across requests
-        :type is_var_split_kv: bool
         :param pack_q: Accept any ``num_heads`` by packing query rows into
             256-row tiles; False keeps the folded contract, where
             ``num_heads`` divides 256 and every tile is full
-        :type pack_q: bool
-
-        :return: Whether the kernel can run the problem
-        :rtype: bool
         """
         if latent_dim != 512 or rope_dim != 64:
             return False
@@ -7406,27 +6703,9 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
         p_cor_producer_state: pipeline.PipelineState,
         is_second_compute_warp: bool,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]:
-        """Compute warp to compute the result of softmax, rescale, and epilogue. Updates the related pipeline states.
+        """Runs the softmax loop of one compute warp group over its k-tiles.
 
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param softmax_params: The softmax parameters
-        :type softmax_params: SimpleNamespace
-        :param k_index: The index of the k-tile
-        :type k_index: cutlass.Int32
-        :param k_tile_count: The number of k-tiles
-        :type k_tile_count: cutlass.Int32
-        :param mma_s_consumer_state: The MMA s consumer state
-        :type mma_s_consumer_state: pipeline.PipelineState
-        :param p_mma_producer_state: The P MMA producer state
-        :type p_mma_producer_state: pipeline.PipelineState
-        :param p_cor_producer_state: The P correction producer state
-        :type p_cor_producer_state: pipeline.PipelineState
         :param is_second_compute_warp: True for g1 (odd k-tiles), False for g0
-        :type is_second_compute_warp: bool
-
-        :return: The MMA s consumer state, the P MMA producer state, and the P correction producer state
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
         """
 
         k_tile_total = cute.ceil_div(common_params.K, self.mma_qk_tiler[1])
@@ -7605,35 +6884,11 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
         cutlass.Float32,
         cutlass.Float32,
     ]:
-        """Softmax for one k-tile. Updates the related pipeline states and returns the computed results.
+        """Softmax for one k-tile. Updates the related pipeline states.
 
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param softmax_params: The softmax parameters
-        :type softmax_params: SimpleNamespace
-        :param k_index: The index of the k-tile
-        :type k_index: cutlass.Int32
-        :param mma_s_consumer_state: The MMA s consumer state
-        :type mma_s_consumer_state: pipeline.PipelineState
-        :param p_mma_producer_state: The P MMA producer state
-        :type p_mma_producer_state: pipeline.PipelineState
-        :param p_cor_producer_state: The P correction producer state
-        :type p_cor_producer_state: pipeline.PipelineState
-        :param row_max: The row max
-        :type row_max: cutlass.Float32
-        :param row_sum: The row sum
-        :type row_sum: cutlass.Float32
-        :param correction_factor: The correction factor
-        :type correction_factor: cutlass.Float32
         :param apply_mask: Whether the tile needs K-bound / causal masking (Python bool
             for the unmasked/masked bulk loops; runtime cutlass.Boolean for the
             split-KV final iter where mask only applies on the global last tile).
-        :type apply_mask: bool | cutlass.Boolean
-        :param is_local_last_tile: Whether the last tile is local
-        :type is_local_last_tile: cutlass.Boolean
-
-        :return: The MMA s consumer state, the P MMA producer state, the P correction producer state, the row max, the row sum, and the correction factor
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState, cutlass.Float32, cutlass.Float32, cutlass.Float32]
         """
 
         softmax_exchange_sync_bar = (
@@ -7644,7 +6899,6 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
 
         softmax_params.mma_s_pipeline.consumer_wait(mma_s_consumer_state)
 
-        # load S from tmem
         tStS_shape = softmax_params.tiled_mma_qk.partition_shape_C(
             cute.select(self.mma_qk_tiler, mode=[0, 1])
         )
@@ -7713,7 +6967,6 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
                         )
                         else -self.acc_dtype.inf
                     )
-            # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
         elif cutlass.const_expr(
             (arch >= Arch.sm_101 and arch <= Arch.sm_101f)
@@ -7764,7 +7017,6 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
                         )
                         else -self.acc_dtype.inf
                     )
-                # reduction for row_max after manual masking
                 row_max_new = tTR_rAcc.load().reduce(
                     cute.ReductionOp.MAX, row_max_new, 0
                 )
@@ -7778,11 +7030,9 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
         softmax_params.mma_s_pipeline.consumer_release(mma_s_consumer_state)
 
         # Intra-group warps_in_n=2 exchange across warps (0,1)↔(2,3) within
-        # the group. Each group writes into its own half of softmax_smem_exchange:
-        # g0 → slots [0, 128), g1 → slots [128, 256). The named barrier covers
-        # both groups (one arrive_and_wait serves both the intra-group reduce
-        # AND the cross-group Sync #1 below — see the second smem_exchange read
-        # which gives this thread the PEER GROUP's row_max).
+        # the group. Each group writes into its own half of softmax_smem_exchange
+        # (g0 → slots [0, 128), g1 → slots [128, 256)) and syncs on its own
+        # named barrier.
         _group_offset = self.num_compute_warps * self.threads_per_warp
         if cutlass.const_expr(is_second_compute_warp):
             _my_base = _group_offset
@@ -7801,7 +7051,7 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
                 ],
             )
 
-        # === 2softmax cross-group merge via TMEM peer-read (tunePerf pattern) ===
+        # === 2softmax cross-group merge via TMEM peer-read ===
         # Pingpong A: wait for the OTHER group to release us. The peer's
         # exchange_p_cor_metadata TMEM store on its prev tile is happens-before
         # the .arrive() it issues at the bottom of its prev iter, so this
@@ -7812,7 +7062,6 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
             self.softmax_order_bar_1.arrive_and_wait()
         else:
             self.softmax_order_bar_0.arrive_and_wait()
-        # cute.nvgpu.cfence()
 
         # Serial inheritance: peer's prev-tile metadata IS the GLOBAL running
         # state right before THIS tile in serial tile order (pingpong serializes
@@ -7829,7 +7078,7 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
 
         # Choose the retained normalization base before computing the factor.
         # Otherwise metadata exchange rolls max back but row_sum is still
-        # rescaled by the pre-rollback factor (see skipcorr_fix_20260916).
+        # rescaled by the pre-rollback factor.
         if (
             row_max_new - row_max
         ) * softmax_params.softmax_scale_log2 <= self.skip_correction_threshold:
@@ -7858,7 +7107,6 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
                 p_cor_producer_state,
             )
 
-        # softmax
         fma_b = softmax_params.softmax_scale_log2
         fma_c = (
             0.0 - row_max_new if row_max_new != -self.acc_dtype.inf else 0.0
@@ -7870,10 +7118,8 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
 
         tTR_rS = cute.make_fragment_like(tTR_tS, self.q_dtype)
 
-        # quantize
         tTR_rS.store(tTR_rAcc.load().to(self.q_dtype))
 
-        # create sP
         sP = softmax_params.sP[None, None, None, (None, p_mma_producer_state.index)]
         sP_mk_view = cute.make_tensor(
             sP.iterator,
@@ -7918,7 +7164,7 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
         softmax_params.p_mma_pipeline.producer_commit(p_mma_producer_state)
         p_mma_producer_state.advance()
 
-        # row_sum update: tunePerf peer-inheritance pattern.
+        # row_sum update: peer-inheritance pattern.
         # row_sum entering this block = peer's prev-tile row_sum (the global
         # running sum BEFORE this tile, inherited via load_other_group_metadata).
         # Apply correction (rescale prev to new row_max base) and add this tile's
@@ -7946,12 +7192,6 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
                 tidx,
             )
 
-        # Pingpong B — signal the OTHER group to start its critical section.
-        # Split-phase .arrive() contributes this group's threads to the other
-        # group's bar and falls through immediately. cfence: control-flow fence
-        # to prevent ptxas from hoisting subsequent work above bar.arrive.
-
-        # split kv case
         if is_local_last_tile:
             p_cor_producer_state, row_max_new = self.exchange_p_cor_metadata(
                 common_params,
@@ -7964,12 +7204,13 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
                 tidx,
                 p_cor_producer_state,
             )
-        # cute.nvgpu.cfence()
+        # Pingpong B — signal the OTHER group to start its critical section.
+        # Split-phase .arrive() contributes this group's threads to the other
+        # group's bar and falls through immediately.
         if cutlass.const_expr(is_second_compute_warp):
             self.softmax_order_bar_0.arrive()  # g1 → g0
         else:
             self.softmax_order_bar_1.arrive()  # g0 → g1
-        # cute.nvgpu.cfence()
 
         mma_s_consumer_state.advance()
 
@@ -7990,20 +7231,7 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
         correction_factor: cutlass.Float32,
         no_correction: cutlass.Int32,
     ) -> pipeline.PipelineState:
-        """Rescale for one k-tile. Updates the related pipeline state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param mma_o_consumer_state: The mma o consumer state
-        :type mma_o_consumer_state: pipeline.PipelineState
-        :param correction_factor: The correction factor
-        :type correction_factor: cutlass.Float32
-        :param no_correction: Whether to apply correction factor
-        :type no_correction: cutlass.Int32
-
-        :return: The MMA o consumer state
-        :rtype: pipeline.PipelineState
-        """
+        """Rescale for one k-tile. Updates the related pipeline state."""
         skip_correction = cute.arch.vote_all_sync(no_correction == 1)
         # Share the fallback correction body across PV-N tiles. Preserve the
         # per-tile ownership protocol even when correction arithmetic is skipped.
@@ -8029,28 +7257,23 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
         """Keep iteration-local copy descriptors out of runtime loop state."""
         common_params.mma_o_pipeline.consumer_wait(mma_o_consumer_state)
         if not skip_correction:
-            # tmem load tiled copy and partition results.
             tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
                 self._tmem_load_partition(
                     common_params, common_params.tiled_mma_pv, iter_n
                 )
             )
 
-            # tmem store tiled copy
             tmem_store_atom = cute.make_copy_atom(
                 tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
             )
             tmem_store_tiled_copy = tcgen05.make_tmem_copy(tmem_store_atom, tAcc)
 
-            # load o
             cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
-            # rescale, using `mul_packed_f32x2` to reduce the number of instructions
             for i in cutlass.range(
                 cute.size(tTR_rAcc), vectorize=True, unroll_full=True
             ):
                 tTR_rAcc[i] = tTR_rAcc[i] * correction_factor
 
-            # store o to tensor memory for next k tile
             cute.copy(tmem_store_tiled_copy, tTR_rAcc, tTR_tAcc)
 
         cute.arch.fence_view_async_tmem_store()
@@ -8068,22 +7291,7 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
         row_sum: cutlass.Float32,
         row_max: cutlass.Float32,
     ) -> pipeline.PipelineState:
-        """Epilogue for one k-tile. Updates the related pipeline state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param epilogue_params: The epilogue parameters
-        :type epilogue_params: SimpleNamespace
-        :param mma_o_consumer_state: The mma o consumer state
-        :type mma_o_consumer_state: pipeline.PipelineState
-        :param row_sum: The row sum
-        :type row_sum: cutlass.Float32
-        :param row_max: The row max
-        :type row_max: cutlass.Float32
-
-        :return: The MMA o consumer state
-        :rtype: pipeline.PipelineState
-        """
+        """Epilogue for one k-tile. Updates the related pipeline state."""
 
         tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
 
@@ -8091,7 +7299,6 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
         if cutlass.const_expr(self.warps_in_n == 2):
             common_params.smem_exchange[tidx] = row_sum
             self.epilogue_exchange_sync_bar.arrive_and_wait()
-            # (64, 2)
             row_sum = (
                 row_sum
                 + common_params.smem_exchange[
@@ -8123,29 +7330,23 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
         """Process one PV N tile, preserving its wait/store/release sequence."""
         tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
         common_params.mma_o_pipeline.consumer_wait(mma_o_consumer_state)
-        # tmem load tiled copy and partition results.
         tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
             self._tmem_load_partition(common_params, common_params.tiled_mma_pv, iter_n)
         )
 
-        # load o
         cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
 
         # A fully masked row has row_sum == 0; write zeros, not NaN.
         inverse_row_sum = cute.arch.rcp_approx(row_sum) if row_sum != 0.0 else 0.0
-        # apply output scale and normalize by row_sum
         for i in cutlass.range(cute.size(tTR_rAcc), vectorize=True, unroll_full=True):
             tTR_rAcc[i] = tTR_rAcc[i] * epilogue_params.output_scale * inverse_row_sum
 
-        # store o to global memory
         tR2G_rO_src = None
         tR2G_rO_dst = tTR_gO
         if cutlass.const_expr(common_params.mAccO is None):
             tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
-            # using final output dtype for o
             tR2G_rO_src.store(tTR_rAcc.load().to(self.o_dtype))
         else:
-            # using accumulate dtype for o
             tR2G_rO_src = tTR_rAcc
 
         if cute.elem_less(tTR_cO[0][0], common_params.H):
@@ -8236,24 +7437,6 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
     ) -> tuple[cute.Tensor, cute.Tensor]:
         """Initialize the workspace for the MLA kernel. Construct the intermediate tensors
         acc_o and acc_lse.
-
-        :param H: The height of the output tensor C
-        :type H: cutlass.Int32
-        :param D: The depth of the output tensor C
-        :type D: cutlass.Int32
-        :param S: The sequence length of the output tensor C
-        :type S: cutlass.Int32
-        :param B: The batch size of the output tensor C
-        :type B: cutlass.Int32
-        :param split_kv: The split key-value of the output tensor C
-        :type split_kv: cutlass.Int32
-        :param acc_dtype: The data type of the output tensor C
-        :type acc_dtype: Type[cutlass.Numeric]
-        :param workspace: The workspace tensor
-        :type workspace: cute.Tensor
-
-        :return: The output tensor C and the workspace tensor
-        :rtype: tuple[cute.Tensor, cute.Tensor]
         """
         acc_o, acc_lse = None, None
         if cutlass.const_expr(workspace is not None):
@@ -8300,46 +7483,7 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
         is_var_split_kv: bool,
         page_size: int,
     ) -> bool:
-        """Check if the MLA kernel can be implemented.
-
-        :param B: The batch size of the output tensor C
-        :type B: int
-        :param S: The sequence length of the output tensor C
-        :type S: int
-        :param K: The width of the output tensor KV
-        :type K: int
-        :param H: The number of heads of the output tensor C
-        :type H: int
-        :param L: The number of latent dimensions of the tensor KV
-        :type L: int
-        :param R: The number of rope dimensions of the tensor C_rope
-        :type R: int
-        :param in_dtype: The data type of the input tensor
-        :type in_dtype: Type[cutlass.Numeric]
-        :param out_dtype: The data type of the output tensor
-        :type out_dtype: Type[cutlass.Numeric]
-        :param acc_dtype: The data type of the accumulator
-        :type acc_dtype: Type[cutlass.Numeric]
-        :param lse_dtype: The data type of the log-sum-exp
-        :type lse_dtype: Type[cutlass.Numeric]
-        :param mma_qk_tiler_mn: The tile shape of the query-key matrix multiplication
-        :type mma_qk_tiler_mn: Tuple[int, int]
-        :param mma_pv_tiler_mn: The tile shape of the probability-value matrix multiplication
-        :type mma_pv_tiler_mn: Tuple[int, int]
-        :param split_kv: The split key-value of the output tensor C
-        :type split_kv: int
-        :param is_persistent: Whether to use persistent kernel optimization
-        :type is_persistent: bool
-        :param is_var_seq: Whether to use variable sequence length
-        :type is_var_seq: bool
-        :param is_var_split_kv: Whether to use variable split_kv
-        :type is_var_split_kv: bool
-        :param page_size: The page size of the page table
-        :type page_size: int
-
-        :return: Whether the MLA kernel can be implemented
-        :rtype: bool
-        """
+        """Check if the MLA kernel can be implemented."""
         if L != 512 or R != 64:
             return False
         if in_dtype not in [cutlass.Float8E4M3FN]:
@@ -8358,7 +7502,8 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
         if H > mma_qk_tiler_mn[0]:
             return False
         # When H < M tile, fold up to F tokens of S into H (M_eff = H*F ≤ M_tile).
-        # F is auto-picked by run() as the largest divisor of S with H*F ≤ M_tile.
+        # F is picked by compute_fold_sq_ratio as the largest divisor of S with
+        # H*F ≤ M_tile.
         # F=1 always works, so any (H ≤ M_tile, S ≥ 1) is implementable.
         if S <= 0:
             return False
@@ -8384,7 +7529,7 @@ class _MixedFallbackPrep(_MixedFallbackBase):
     * ``fallback_kernel_body`` is the Blackwell ``split_kv_kernel`` body
       re-scheduled onto the (4,1,1) linear work walk: fallback pair
       ``p = cluster_idx4 // 2`` runs the baseline natively on the s = p row
-    block of its unit (full K range, own acc-slot indexing).
+      block of its unit (full K range, own acc-slot indexing).
     """
 
     num_clc_stage = 1
@@ -8471,46 +7616,10 @@ class _MixedFallbackPrep(_MixedFallbackBase):
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
     ):
-        """Execute the Multi-Head Latent Attention operation on the provided tensors.
+        """Prepare the fallback kernel arguments for the mixed-CGA launch.
 
-        The method handles:
-        1. Initialization of workspace for temporary split KV buffers
-        2. Validation of tensor data types
-        3. Initialization of hardware-specific parameters and memory layouts
-        4. Configuration of TMA (Tensor Memory Access) operations
-        5. Grid and work scheduling computation
-        6. Kernel launch(split KV kernel and reduction kernel) with appropriate parameters
-
-        :param q_latent: The query tensor with shape [num_head, latent_dim, seq_len_q, batch_size]
-        :type q_latent: cute.Tensor
-        :param q_rope: The query RoPE tensor with shape [num_head, rope_dim, seq_len_q, batch_size]
-        :type q_rope: cute.Tensor
-        :param c_latent: The key tensor with shape [seq_len_k, latent_dim, batch_size]
-        :type c_latent: cute.Tensor
-        :param c_rope: The key RoPE tensor with shape [seq_len_k, rope_dim, batch_size]
-        :type c_rope: cute.Tensor
-        :param page_table: The page table tensor with shape [page_count, batch_size]
-        :type page_table: cute.Tensor
-        :param o: The output tensor with shape [num_head, latent_dim, seq_len_q, batch_size]
-        :type o: cute.Tensor
-        :param lse: The LSE tensor with shape [num_head, seq_len_q, batch_size]
-        :type lse: cute.Tensor
-        :param workspace: The workspace tensor with 1-d shape prepared for acc_o and acc_lse
-        :type workspace: cute.Tensor
-        :param split_kv: The scalar factor for split KV
-        :type split_kv: cutlass.Int32
-        :param cache_seqs: The cache sequences tensor with shape [batch_size]
-        :type cache_seqs: cute.Tensor
-        :param block_split_kvs: The block split KV tensor with shape [batch_size]
-        :type block_split_kvs: cute.Tensor
-        :param softmax_scale: The scale factor for softmax
-        :type softmax_scale: cutlass.Float32
-        :param output_scale: The scale factor for the output
-        :type output_scale: cutlass.Float32
-        :param stream: The CUDA stream to execute the kernel on
-        :type stream: cuda.CUstream
-
-        :raises TypeError: If tensor data types don't match or aren't supported
+        Follows the Blackwell ``__call__`` without workspace initialization or
+        kernel launch.
         """
 
         # mixed-CGA: present the 2M-row unit as (M rows, s = 2 row
@@ -8523,20 +7632,18 @@ class _MixedFallbackPrep(_MixedFallbackBase):
         if cutlass.const_expr(acc_o is not None):
             acc_o = self._halve_rows(acc_o, 3)
             acc_lse = self._halve_rows(acc_lse, 2)
-        # setup static attributes before smem/grid/tma computation
         self.q_dtype = q_latent.element_type
         self.k_dtype = c_latent.element_type
         self.v_dtype = c_latent.element_type
         self.o_dtype = o.element_type
 
-        # check type consistency
         if cutlass.const_expr(
             self.q_dtype != self.k_dtype or self.q_dtype != self.v_dtype
         ):
             raise TypeError(
-                f"Type mismatch: {self.q_dtype} != {self.k_dtype} or {self.q_dtype} != {self.v_dtype}"
+                f"Type mismatch: {self.q_dtype} != {self.k_dtype} or "
+                f"{self.q_dtype} != {self.v_dtype}"
             )
-        # check leading dimensions of input/output
         if cutlass.const_expr(q_latent.stride[1] != 1 or q_rope.stride[1] != 1):
             raise ValueError("q_latent and q_rope must have leading dimension 1")
         if cutlass.const_expr(c_latent.stride[1] != 1 or c_rope.stride[1] != 1):
@@ -8552,7 +7659,7 @@ class _MixedFallbackPrep(_MixedFallbackBase):
         # E.g., H=32, S_q=8 → F=4, M_eff=128, S_q_eff=2
         # This works because MLA shares KV across all heads/queries independently.
         # Tensor layout: [H, D, S_q, B] → [H*F, D, S_q/F, B]; relies on
-        # stride_S == stride_H * H (always true for tensors created by run()).
+        # stride_S == stride_H * H.
         if cutlass.const_expr(self.fold_sq):
             F = self.fold_sq_ratio
 
@@ -8831,7 +7938,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
 
         @cute.struct
         class SplitKVKernelSharedStorage:
-            # Pipeline barriers
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_clc_stage * 2]
             clc_response: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Int32, self.num_clc_response_bytes // 4],
@@ -8845,7 +7951,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
             p_cor_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.p_cor_stage * 2]
             mma_o_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_o_stage * 2]
 
-            # Smem tensors
             smem_p: cute.struct.Align[
                 cute.struct.MemRange[self.q_dtype, cute.cosize(p_smem_layout_staged)],
                 1024,
@@ -8888,10 +7993,8 @@ class _MixedFallbackPrep(_MixedFallbackBase):
                 self.acc_dtype, self.num_compute_warps * self.threads_per_warp
             ]
 
-            # Tmem dealloc cluster barrier
             tmem_dealloc_mbar: cutlass.Int64
 
-            # Tmem holding buffer
             tmem_holding_buf: cutlass.Int32
 
         softmax_scale_log2 = softmax_scale * LOG2_E
@@ -8969,78 +8072,10 @@ class _MixedFallbackPrep(_MixedFallbackBase):
         SharedStorage: cutlass.Constexpr,
         work_q_fdd,
     ):
-        """The device split_kv kernel implementation of the Multi-Head Latent Attention.
+        """2-CTA fallback body: the pair runs one 128-row block of the work item.
 
-        This kernel coordinates multiple specialized warps to perform different phases of the MLA computation:
-        1. Load warp: Loads Q/C latent/rope data from global memory to shared memory using TMA
-        2. MMA warp: Performs matrix multiplications (Q*K^T and P*V)
-        3. Compute warps: Compute softmax and do rescaling on accumulators, and store the intermediate/final results
-        to global memory
-
-        The kernel produces either intermediate or final results of the MLA computation based on the split_kv parameter.
-        When split_kv is 1, the kernel generates the final results directly. Otherwise, it produces intermediate results
-        that will later be combined by a reduction kernel.
-
-        The kernel implements a complex pipeline with overlapping computation and memory operations,
-        using tensor memory access (TMA) for efficient data loading, warp specialization for different
-        computation phases.
-
-        :param tiled_mma_qk: Tiled MMA for Q*K^T
-        :type tiled_mma_qk: cute.TiledMma
-        :param tiled_mma_pv: Tiled MMA for P*V
-        :type tiled_mma_pv: cute.TiledMma
-        :param tma_atom_q_latent: TMA copy atom for query latent tensor
-        :type tma_atom_q_latent: cute.CopyAtom
-        :param mQL: query latent tensor
-        :type mQL: cute.Tensor
-        :param tma_atom_q_rope: TMA copy atom for query rope tensor
-        :type tma_atom_q_rope: cute.CopyAtom
-        :param mKR: Compressed rope tensor
-        :type mKR: cute.Tensor
-        :param tma_atom_c_latent: TMA copy atom for c latent tensor
-        :type tma_atom_c_latent: cute.CopyAtom
-        :param mCL: Compressed latent tensor
-        :type mCL: cute.Tensor
-        :param tma_atom_c_rope: TMA copy atom for c rope tensor
-        :type tma_atom_c_rope: cute.CopyAtom
-        :param mCLT: Compressed latent transpose tensor
-        :type mCLT: cute.Tensor
-        :param mPT: Page table tensor
-        :type mPT: cute.Tensor
-        :param mO: Output tensor
-        :type mO: cute.Tensor
-        :param mLSE: Log-sum-exp tensor
-        :type mLSE: cute.Tensor
-        :param mAccO: Intermediate accumulator output tensor
-        :type mAccO: cute.Tensor
-        :param mAccLSE: Intermediate accumulator log-sum-exp tensor
-        :type mAccLSE: cute.Tensor
-        :param split_kv: The split_kv parameter
-        :type split_kv: cutlass.Int32
-        :param cache_seqs: The variable sequence length tensor
-        :type cache_seqs: cute.Tensor
-        :param block_split_kvs: The per-block split_kv values tensor
-        :type block_split_kvs: cute.Tensor
-        :param softmax_scale_log2: The log2 scale factor for softmax
-        :type softmax_scale_log2: cutlass.Float32
-        :param output_scale: The scale factor for the output
-        :type output_scale: cutlass.Float32
-        :param q_latent_smem_layout_staged: Shared memory layout for query tensor
-        :type q_latent_smem_layout_staged: cute.ComposedLayout
-        :param q_rope_smem_layout_staged: Shared memory layout for query rope tensor
-        :type q_rope_smem_layout_staged: cute.ComposedLayout
-        :param kc_latent_smem_layout_staged: Shared memory layout for key tensor
-        :type kc_latent_smem_layout_staged: cute.ComposedLayout
-        :param kc_rope_smem_layout_staged: Shared memory layout for key rope tensor
-        :type kc_rope_smem_layout_staged: cute.ComposedLayout
-        :param p_smem_layout_staged: Shared memory layout for probability matrix
-        :type p_smem_layout_staged: cute.ComposedLayout
-        :param vc_smem_layout_staged: Shared memory layout for value tensor
-        :type vc_smem_layout_staged: cute.ComposedLayout
-        :param cta_layout_vmnk: Layout for compute threads
-        :type cta_layout_vmnk: cute.Layout
-        :param SharedStorage: Shared storage for the kernel
-        :type SharedStorage: cutlass.Constexpr
+        With a split-KV workspace it writes partial O/LSE for the reduction
+        kernel; otherwise it writes the final results.
         """
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -9050,7 +8085,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
         mma_tile_coord_v = bidx % cute.size(tiled_mma_qk.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
 
-        # Prefetch tma descriptor
         if warp_idx == self.mma_qk_warp_id:
             cpasync.prefetch_descriptor(tma_atom_q_latent)
             cpasync.prefetch_descriptor(tma_atom_q_rope)
@@ -9058,7 +8092,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
             cpasync.prefetch_descriptor(tma_atom_c_rope)
             cpasync.prefetch_descriptor(tma_atom_c_latent_transpose)
 
-        # Alloc
         smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
@@ -9071,12 +8104,11 @@ class _MixedFallbackPrep(_MixedFallbackBase):
         )
         clc_response_ptr = storage.clc_response.data_ptr()
 
-        # Tensor memory dealloc barrier init.
         # TMEM lifetime is owned by mma_pv warp (W11) — the LAST TMEM user.
         # W8 (mma_qk) finishes earlier via mma_s pipeline back-pressure, but W11
         # keeps reading P / writing O until its mma_o.producer_tail. Putting
         # allocate + free on W11 avoids the race where W8 frees TMEM while
-        # W11 still has in-flight mma_pv. See OPT#14.
+        # W11 still has in-flight mma_pv.
         tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_ptr_sync_bar,
@@ -9120,7 +8152,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk, is_relaxed=True)
 
-        # Generate smem tensor Q/KC/VC/exchange
         # (MMA, MMA_H, MMA_R, PIPE)
         sQ = storage.smem_q_latent.get_tensor(
             q_latent_smem_layout_staged.outer, swizzle=q_latent_smem_layout_staged.inner
@@ -9162,9 +8193,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
             cute.make_layout(self.num_compute_warps * self.threads_per_warp)
         )
 
-        #
-        # Cluster wait before tensor memory alloc
-        #
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk)
         # PDL: setup above overlaps the previous kernel; every role reads
         # inputs (at least cache_seqs) below.
@@ -9174,8 +8202,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
         # ///////////////////////////////////////////////////////////////////////////////
         #  Load warps, including page table and data tensors
         # ///////////////////////////////////////////////////////////////////////////////
-        # Note: warp 11 (formerly empty filler) is now mma_pv_warp_id — handled below.
-
         if warp_idx == self.load_tma_k_warp_id:
             cute.arch.setmaxregister_decrease(self.other_reg_num)
             load_q_producer_state = pipeline.make_pipeline_state(
@@ -9221,7 +8247,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
                     blk_coord,
                 )
                 if k_tile_count > 0:
-                    # Construct fixed common/tma_qk/tma_pv params for load_tma
                     tma_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
                         local_split_kv=local_split_kv,
@@ -9245,7 +8270,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
                         sKC=sKC_for_tma,
                         sKC_rope=sKC_rope_for_tma,
                     )
-                    # Load tma
                     load_q_producer_state, load_k_producer_state = self.load_tma_qk(
                         tma_common_params,
                         tma_qk_params,
@@ -9294,7 +8318,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
                     blk_coord,
                 )
                 if k_tile_count > 0:
-                    # Construct fixed common/tma_qk/tma_pv params for load_tma
                     tma_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
                         local_split_kv=local_split_kv,
@@ -9307,7 +8330,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
                         mCLT=mCLT,
                         sVC=sVC_for_tma,
                     )
-                    # Load tma
                     load_v_producer_state = self.load_tma_v(
                         tma_common_params,
                         tma_pv_params,
@@ -9323,7 +8345,7 @@ class _MixedFallbackPrep(_MixedFallbackBase):
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  MMA-QK warp (W8): issues all mma_qk, produces S via mma_s pipeline.
-        #  Does NOT allocate or free TMEM (W11 owns TMEM lifetime — OPT#14).
+        #  Does NOT allocate or free TMEM (W11 owns TMEM lifetime).
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_qk_warp_id:
             cute.arch.setmaxregister_decrease(self.other_reg_num)
@@ -9581,8 +8603,8 @@ class _MixedFallbackPrep(_MixedFallbackBase):
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Compute warp — second group (g1, warps 12-15, odd k-tiles).
-        #  2softmax Strategy A: alternates k-tiles with g0; cross-group merges
-        #  inside softmax() via softmax_exchange_sync_bar.
+        #  Alternates k-tiles with g0; cross-group merges inside softmax() via
+        #  the TMEM peer-read.
         # ///////////////////////////////////////////////////////////////////////////////
         if (
             warp_idx >= self.second_compute_warp_ids[0]
@@ -9610,11 +8632,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
             mma_s_consumer_state.advance()
             p_mma_producer_state.advance()
             p_cor_producer_state.advance()
-            # Pingpong init-phase trick: g1 pre-arrives softmax_order_bar_0 once
-            # so g0's FIRST softmax_order_bar_0.arrive_and_wait() completes
-            # without waiting for g1's first loop arrive. Replaces a per-iter
-            # is_first_tile guard. Bar is num_total_compute_warps (256 threads)
-            # so wait-side 128 + signal-side 128 = 256 → release.
             while work_tile.is_valid_tile:
                 # Decode the four logical CLC rows into the fallback pair's
                 # native rank and the re-viewed s=2 row block.
@@ -9682,7 +8699,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
                     work_tile = self.get_clc_work(clc_response_ptr)
                     clc_pipeline.consumer_release(clc_consumer_state)
                     clc_consumer_state.advance()
-            # NOTE: g1 skips p_cor_pipeline.producer_tail — g0 already does it.
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Correction warp

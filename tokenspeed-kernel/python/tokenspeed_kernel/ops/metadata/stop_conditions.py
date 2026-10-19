@@ -229,9 +229,6 @@ def apply_stop_conditions(
         decode_width: Output tokens per decode request.
         padding_index: Slot value of a padding row.
 
-    Returns:
-        None. ``accept_lengths`` and ``stopped`` are updated in place.
-
     Raises:
         ValueError: A tensor is not the shape, dtype or layout the update
             indexes with.

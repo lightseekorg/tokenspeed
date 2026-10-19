@@ -77,7 +77,7 @@ def test_moe_gather_vector_codegen(rank, prefix_is_sharded, tmp_path):
         options={"num_warps": 4},
     )
     assembly = kernel.asm["amdgcn"]
-    (tmp_path / f"moe-gather-rank{rank}.amdgcn").write_text(assembly)
+    (tmp_path / f"moe-gather-rank{rank}.amdgcn").write_text(assembly, encoding="utf-8")
     lines = assembly.splitlines()
     assert sum("buffer_load_dwordx4" in line for line in lines) == 3
     assert (

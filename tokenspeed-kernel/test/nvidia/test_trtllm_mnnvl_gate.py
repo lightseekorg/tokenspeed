@@ -129,7 +129,7 @@ def test_every_resolution_passes_the_call_width():
     root = pathlib.Path(tokenspeed_kernel.__file__).parents[2]
     sites = 0
     for path in root.rglob("*.py"):
-        tree = ast.parse(path.read_text())
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Call)

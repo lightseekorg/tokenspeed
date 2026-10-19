@@ -122,7 +122,8 @@ class CachePoolBinding:
         self.cache_pool: CachePool | None = None
 
     def child_backends(self) -> tuple[CachePoolBinding, ...]:
-        """The nodes this one composes (graph support, pointer walk, binding); leaves: ()."""
+        """The nodes this one composes (graph support, pointer walk, binding);
+        leaves: ()."""
         return ()
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
@@ -141,7 +142,8 @@ class CachePoolBinding:
         self._publish_cache_pool(cache_pool)
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
-        """A node's own binding work: read the old pool before super(), use the new one after."""
+        """A node's own binding work: read the old pool before super(), use the
+        new one after."""
         self.cache_pool = cache_pool
 
     def cache_placement(self, layer: PagedAttention) -> CachePlacement | None:
@@ -290,10 +292,6 @@ class AttentionBackend(CachePoolBinding, ABC):
         self.head_dim = spec.head_dim
         self._init_pool_binding()
 
-    # ------------------------------------------------------------------
-    # Structure
-    # ------------------------------------------------------------------
-
     def _init_pool_binding(self) -> None:
         """The binding lifecycle fields; wrappers that skip __init__ call this."""
         super()._init_pool_binding()
@@ -319,6 +317,7 @@ class AttentionBackend(CachePoolBinding, ABC):
         verify width. Composites delegate to their verify consumers. Backends
         without verify buffers return zero.
         """
+        del max_bs, draft_token_num
         return 0
 
     def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
@@ -511,7 +510,8 @@ class AttentionBackend(CachePoolBinding, ABC):
         capture asymmetry (unified_path.md, "Capture is inherited")."""
         if not forward_mode.is_decode_or_idle():
             raise NotImplementedError(
-                f"{type(self).__name__} CUDA graphs record decode only, got {forward_mode}"
+                f"{type(self).__name__} CUDA graphs record decode only, "
+                f"got {forward_mode}"
             )
         self.refresh_decode_metadata(
             bs,
@@ -555,10 +555,6 @@ class AttentionBackend(CachePoolBinding, ABC):
         """Whether a narrowed draft step in a round of ``forward_mode`` can
         attend its live rows as a DECODE dispatch (Eagle3's first step)."""
         return False
-
-    # ------------------------------------------------------------------
-    # Write locations
-    # ------------------------------------------------------------------
 
     def draft_write_locations_uniform(
         self, out: torch.Tensor, cache_start: torch.Tensor, num_tokens: int
@@ -725,10 +721,6 @@ class AttentionBackend(CachePoolBinding, ABC):
         yield
         if record_cache and writes_in_call:
             self.step_counter.record_cache()
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
 
     @break_point
     def forward(

@@ -159,7 +159,6 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         # message so the decode node's output logprobs start with it.
         self.bootstrap_logprobs: dict[int, float] = {}
         self.bootstrap_token_cond = threading.Condition()
-        # Determine the number of threads to use for kv sender
         cpu_count = os.cpu_count()
         transfer_thread_pool_size = (
             envs.TOKENSPEED_DISAGGREGATION_THREAD_POOL_SIZE.get_set_value_or(
@@ -224,7 +223,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 self.cached_tokens[room] = cached_tokens
 
     def record_bootstrap_logprob(self, room: int, logprob: float) -> None:
-        """Publish the bootstrap token's logprob before the final transfer is submitted."""
+        """Publish the bootstrap token's logprob before the final transfer."""
         with self.bootstrap_token_cond:
             if self.request_status.get(room) not in (None, TransferPoll.Failed):
                 self.bootstrap_logprobs[room] = logprob
@@ -422,7 +421,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             expected_decode_ranks
         ):
             raise ValueError(
-                "Cache-transfer room destination ranks disagree with the typed route plan"
+                "Cache-transfer room destination ranks disagree with the typed "
+                "route plan"
             )
 
     def _transfer_data(self, mooncake_session_id, transfer_blocks, packer=None):
@@ -1182,7 +1182,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     else None
                 )
                 if registration is None and rejected is None:
-                    raise ValueError("malformed request has no registered session")
+                    raise ValueError(
+                        "malformed request has no registered session"
+                    ) from exc
                 endpoint, dst_port = (
                     (registration.endpoint, registration.dst_port)
                     if registration is not None
@@ -1283,9 +1285,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             # queue.
             return
 
-        #  sharding according to the dst_infos to make sure
-        # requests with the same dst_sessions will be added into the same
-        # queue, which enables early abort with failed sessions.
+        # Requests with the same destination sessions share a queue, which
+        # enables early abort on failed sessions.
         dst_infos = destinations.keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)

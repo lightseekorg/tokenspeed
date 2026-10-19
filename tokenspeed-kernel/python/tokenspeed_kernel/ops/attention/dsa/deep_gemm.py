@@ -144,7 +144,8 @@ def _check_out(
     elif out.shape != expected_out or out.dtype != torch.int32 or out.device != device:
         raise ValueError(
             "out must be int32 with shape "
-            f"{expected_out} on {device}, got {tuple(out.shape)} {out.dtype} {out.device}"
+            f"{expected_out} on {device}, got "
+            f"{tuple(out.shape)} {out.dtype} {out.device}"
         )
     expected_lens = (tokens,)
     if lens_out is None:

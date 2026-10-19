@@ -23,12 +23,12 @@ from compressed_tensors import CompressionFormat
 
 
 def is_activation_quantization_format(format: str) -> bool:
-    _ACTIVATION_QUANTIZATION_FORMATS = [
+    activation_quantization_formats = [
         CompressionFormat.naive_quantized.value,
         CompressionFormat.int_quantized.value,
         CompressionFormat.float_quantized.value,
     ]
-    return format in _ACTIVATION_QUANTIZATION_FORMATS
+    return format in activation_quantization_formats
 
 
 def gptq_marlin_moe_repack(

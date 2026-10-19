@@ -44,11 +44,6 @@ def _require_iris():
     )
 
 
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
-
-
 def _get_open_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("", 0))
@@ -138,11 +133,6 @@ def test_plain_two_stage_is_independent_of_producer_thresholds(monkeypatch):
     monkeypatch.setattr(iris_ops, "_PRODUCER_TWO_SHOT_MIN_BYTES", {})
     assert iris_ops._use_two_stage_plain(8, 8 * 7168, torch.bfloat16)
     assert not iris_ops._use_two_stage_producer_direct(8, 8 * 7168, torch.bfloat16)
-
-
-# ---------------------------------------------------------------------------
-# Suite 1: iris_all_reduce
-# ---------------------------------------------------------------------------
 
 
 def _ar_shape_cases() -> List[Tuple[int, ...]]:
@@ -898,11 +888,6 @@ def test_iris_all_reduce_noncontiguous_subgroups():
     _skip_if_unsupported(world_size, "Iris subgroup all-reduce tests")
     port = _get_open_port()
     _spawn_and_collect(_ar_subgroup_worker_fn, (world_size, port), world_size)
-
-
-# ---------------------------------------------------------------------------
-# Suite 2: fused allreduce + residual + RMSNorm
-# ---------------------------------------------------------------------------
 
 
 # Token shapes spanning decode (1), short/long prefill (256, 1024), and

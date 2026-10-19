@@ -59,7 +59,7 @@ def auto_split_k(num_tokens: int, num_k_tiles: int) -> int:
     split-K (and its per-M partial buffer) once M is large enough to fill
     the GPU on its own. Clamped to a divisor of ``num_k_tiles``.
     """
-    # Tuned on MI355X, DSv3 TP=8 (see perf_report.md): the split-K win is
+    # Tuned on MI355X, DSv3 TP=8: the split-K win is
     # real only for M <= 16; at M >= 32 it is flat-to-negative (reduce +
     # partial-buffer overhead), so fall back to the single-launch path.
     if num_tokens <= 4:
@@ -70,7 +70,6 @@ def auto_split_k(num_tokens: int, num_k_tiles: int) -> int:
         want = 2
     else:
         return 1
-    # Clamp down to the largest allowed divisor <= want.
     for sk in (want, 8, 7, 4, 2, 1):
         if sk <= want and num_k_tiles % sk == 0:
             return sk
@@ -156,7 +155,6 @@ def gluon_bf16_moe_stage1_splitk_gemm_kernel(
         b_ptr.dtype.element_ty, [NBUF, BLOCK_K, BLOCK_N], shared_b
     )
 
-    # ---- Per-token A-row gather ----------------------------------------
     am_layout: gl.constexpr = gl.SliceLayout(1, gload_a)
     ak_layout: gl.constexpr = gl.SliceLayout(0, gload_a)
     offs_m = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=am_layout)
@@ -166,7 +164,6 @@ def gluon_bf16_moe_stage1_splitk_gemm_kernel(
     offs_ak = gl.arange(0, BLOCK_K, layout=ak_layout)
     a_offsets = (a_row[:, None] * stride_am + offs_ak[None, :] * stride_ak).to(gl.int32)
 
-    # ---- B (gate + up) offsets -----------------------------------------
     bk_layout: gl.constexpr = gl.SliceLayout(1, gload_b)
     bn_layout: gl.constexpr = gl.SliceLayout(0, gload_b)
     offs_bk = gl.arange(0, BLOCK_K, layout=bk_layout)
@@ -179,7 +176,6 @@ def gluon_bf16_moe_stage1_splitk_gemm_kernel(
         gl.int32
     )
 
-    # ---- Advance A/B base pointers to this split's K-slice -------------
     num_k_total = gl.cdiv(K, BLOCK_K)
     tps = num_k_total // SPLIT_K
     k_off = pid_sk * tps * BLOCK_K
@@ -192,9 +188,8 @@ def gluon_bf16_moe_stage1_splitk_gemm_kernel(
     gl.assume(tps > 1)
 
     if NBUF == 1:
-        # ---- single LDS buffer (min LDS -> max occupancy) --
-        # load(k) -> wait -> MFMA(k); no ping-pong. Relies on many WGPs/CU to
-        # hide latency rather than deep pipelining.
+        # Single LDS buffer (min LDS -> max occupancy): relies on many WGPs/CU
+        # to hide latency rather than deep pipelining.
         for k in range(0, tps):
             cdna4_async_copy.buffer_load_to_shared(
                 smem_a.index(0), a_base, a_offsets, mask=token_mask[:, None]
@@ -211,7 +206,6 @@ def gluon_bf16_moe_stage1_splitk_gemm_kernel(
             a_base += BLOCK_K * stride_ak
             b_base += BLOCK_K * stride_bk
     else:
-        # ---- Double-buffered ping-pong (1 global-prefetch stage) ----------
         cdna4_async_copy.buffer_load_to_shared(
             smem_a.index(0), a_base, a_offsets, mask=token_mask[:, None]
         )
@@ -249,8 +243,7 @@ def gluon_bf16_moe_stage1_splitk_gemm_kernel(
         gate_acc = gl.amd.cdna3.mfma(a, bg, gate_acc)
         up_acc = gl.amd.cdna3.mfma(a, bu, up_acc)
 
-    # ---- Write raw fp32 gate/up partials (NO SwiGLU) -------------------
-    # partial[inter_row, pid_sk, gate/up col]; inter_row = token*topk + slot.
+    # inter_row = token*topk + slot.
     cm_layout: gl.constexpr = gl.SliceLayout(1, mfma_layout)
     cn_layout: gl.constexpr = gl.SliceLayout(0, mfma_layout)
     offs_cm = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=cm_layout)
@@ -357,7 +350,7 @@ def invoke_stage1_splitk(
     assert hidden_states.dtype == torch.bfloat16 and w1.dtype == torch.bfloat16
     assert out.dtype == torch.bfloat16
     num_tokens, D = hidden_states.shape
-    E, two_I, Dw = w1.shape
+    _, two_I, Dw = w1.shape
     assert Dw == D and two_I % 2 == 0
     I_r = two_I // 2
     EM = sorted_token_ids.shape[0]
@@ -374,9 +367,8 @@ def invoke_stage1_splitk(
     # fp32 gate/up partials [n_rows, SPLIT_K, 2*I] then reduce+SwiGLU.
     fuse = split_k == 1
     if fuse:
-        partial = torch.empty(
-            1, dtype=torch.float32, device=out.device
-        )  # dummy (unused)
+        # dummy (unused)
+        partial = torch.empty(1, dtype=torch.float32, device=out.device)
         p_sr = p_ssk = p_sc = 1
     else:
         partial = torch.empty(

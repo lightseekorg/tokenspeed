@@ -1,7 +1,7 @@
 """CPU-only runtime shutdown regression tests.
 
 These tests deliberately bypass the heavyweight constructors.  They exercise
-the real loop/watchdog methods with fakes, so no model, CUDA context, ZMQ
+the real event-loop methods with fakes, so no model, CUDA context, ZMQ
 endpoint, or Mooncake native transfer is created.
 """
 

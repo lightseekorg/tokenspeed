@@ -118,7 +118,6 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
 
 @dataclass
 class GenerateReqInput:
-    # The input prompt. It can be a single prompt or a batch of prompts.
     text: list[str] | str | None = None
     # The token ids for text; one can specify either text or input_ids
     input_ids: list[list[int]] | list[int] | None = None
@@ -132,7 +131,6 @@ class GenerateReqInput:
     # offsets — the gateway is responsible for that. Typed as Any to avoid a
     # circular import on MultimodalInputs.
     precomputed_multimodal_inputs: Any | None = None
-    # The sampling_params. See descriptions below.
     sampling_params: list[dict] | dict | None = None
     input_extra_infos: list[dict] | dict | None = None
     # Optional client label for logging; defaults to `rid`. Safe to reuse.
@@ -157,7 +155,6 @@ class GenerateReqInput:
     # Output rendering dialect: "vllm" | "sglang" | "both". None = auto (match
     # the request dialect: vllm if sampling_params.logprobs is set, else sglang).
     logprob_format: list[str | None] | str | None = None
-    # Whether to stream output.
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
@@ -170,7 +167,6 @@ class GenerateReqInput:
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: list[str | None] | str | None = None
 
-    # Whether to return hidden states
     return_hidden_states: bool = False
 
     # For disaggregated inference
@@ -192,7 +188,6 @@ class GenerateReqInput:
                 "Exactly one of text, input_ids, or input_embeds should be provided."
             )
 
-        # Derive the batch size
         if self.text is not None:
             if isinstance(self.text, str):
                 self.is_single = True
@@ -237,12 +232,13 @@ class GenerateReqInput:
             self.parallel_sample_num = 1
         elif isinstance(self.sampling_params, dict):
             self.parallel_sample_num = self.sampling_params.get("n", 1)
-        else:  # isinstance(self.sampling_params, list):
+        else:
             self.parallel_sample_num = self.sampling_params[0].get("n", 1)
             for sp in self.sampling_params[1:]:
                 _require(
                     self.parallel_sample_num == sp.get("n", 1),
-                    "The parallel_sample_num should be the same for all samples in sample params.",
+                    "The parallel_sample_num should be the same for all samples "
+                    "in sample params.",
                 )
 
         if self.parallel_sample_num > 1 and self.is_single:
@@ -256,7 +252,6 @@ class GenerateReqInput:
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
 
-        # Fill in default arguments
         if self.is_single:
             if self.sampling_params is None:
                 self.sampling_params = {}
@@ -294,7 +289,6 @@ class GenerateReqInput:
             if self.parallel_sample_num == 1:
                 num = self.batch_size
             else:
-                # Expand parallel_sample_num
                 num = self.batch_size * self.parallel_sample_num
 
             if self.sampling_params is None:
@@ -417,7 +411,6 @@ class GenerateReqInput:
                     "data_parallel_rank list length must match the batch size.",
                 )
 
-        # Other checks
         if self.session_params is not None:
             _require(
                 isinstance(self.session_params, dict)
@@ -490,7 +483,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     input_text: str | None = None
     # The input token ids (None on the input-embeds path)
     input_ids: list[int] | None = None
-    # The sampling parameters
     sampling_params: SamplingParams
     # Whether to return the sampled token's logprob for this request.
     return_logprob: bool = False
@@ -504,7 +496,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     logprob_start_len: int = -1
     top_logprobs_num: int = 0
     token_ids_logprob: list[int] | None = None
-    # Whether to stream output
     stream: bool = False
 
     # The input embeds (nested float lists; shape varies by caller)
@@ -518,10 +509,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: str | None = None
 
-    # Whether to return hidden states
     return_hidden_states: bool = False
 
-    # Time at object instantiated
     created_time: float = 0.0
 
     # For disaggregated inference
@@ -551,7 +540,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
 @dataclass
 class EmbeddingReqInput:
-    # The input prompt. It can be a single prompt or a batch of prompts.
     text: list[str] | str | None = None
     # The token ids for text; one can either specify text or input_ids.
     input_ids: list[list[int]] | list[int] | None = None
@@ -573,7 +561,6 @@ class EmbeddingReqInput:
         ):
             raise ValueError("Either text or input_ids should be provided.")
 
-        # Derive the batch size
         if self.text is not None:
             if isinstance(self.text, str):
                 self.is_single = True
@@ -589,7 +576,6 @@ class EmbeddingReqInput:
                 self.is_single = False
                 self.batch_size = len(self.input_ids)
 
-        # Fill in default arguments
         if self.is_single:
             if self.rid is None:
                 self.rid = uuid.uuid4().hex
@@ -643,14 +629,11 @@ class EmbeddingReqInput:
 
 
 class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
-    # The input text
     input_text: str | None = None
-    # The input token ids
     input_ids: list[int] | None = None
     # Placeholder sampling params field so request metadata can share one shape
     # with generation-oriented code paths.
     sampling_params: SamplingParams
-    # Time at object instantiated
     created_time: float = 0.0
 
 
@@ -670,18 +653,15 @@ class BatchTokenIDOut(BaseBatchReq, kw_only=True):
     # not-yet-sent slice of each request's generated ids (see stream_output).
     output_ids: list[list[int]] | None
     output_multi_ids: list[list[int]] | None
-    # Detokenization configs
     skip_special_tokens: list[bool]
     spaces_between_special_tokens: list[bool]
     no_stop_trim: list[bool]
 
-    # Token counts
     prompt_tokens: list[int]
     completion_tokens: list[int]
     cached_tokens: list[int]
     spec_verify_ct: list[int]
 
-    # Logprobs
     # Per-request lists, parallel to rids. Prompt (input) logprobs are shipped
     # once, on the first frame after the prompt's final chunk committed, as
     # ``[None, lp(ids[start+1]), ...]`` over ``ids[start:]``; every other
@@ -706,7 +686,6 @@ class BatchTokenIDOut(BaseBatchReq, kw_only=True):
     output_token_ids_logprobs_val: list[list]
     output_token_ids_logprobs_idx: list[list]
 
-    # Hidden states
     output_hidden_states: list[list[float]]
     # Per-request draft-token acceptance (speculative decoding); None until
     # the request finishes, empty when spec decoding is off.
@@ -816,14 +795,10 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
 
 
 class BatchStrOut(BaseBatchReq, kw_only=True):
-    # The finish reason
     finished_reasons: list[FinishReasonDict | None]
-    # The output decoded strings
     output_strs: list[str]
-    # The token ids
     output_ids: list[int] | None
 
-    # Token counts
     prompt_tokens: list[int]
     completion_tokens: list[int]
     cached_tokens: list[int]
@@ -845,7 +820,6 @@ class BatchStrOut(BaseBatchReq, kw_only=True):
     output_token_ids_logprobs_val: list[list]
     output_token_ids_logprobs_idx: list[list]
 
-    # Hidden states
     output_hidden_states: list[list[float]]
     # See BatchTokenIDOut.batch_accept_draft_tokens (None mid-stream).
     batch_accept_draft_tokens: list[float | None]
@@ -857,11 +831,9 @@ class BatchStrOut(BaseBatchReq, kw_only=True):
 
 
 class BatchEmbeddingOut(BaseBatchReq, kw_only=True):
-    # The finish reason
     finished_reasons: list[FinishReasonDict | None]
     # The output embedding (dense rows or sparse dicts)
     embeddings: list
-    # Token counts
     prompt_tokens: list[int]
 
 
@@ -917,9 +889,7 @@ SUPPORTED_WEIGHT_UPDATE_SOURCES: frozenset[str] = frozenset(
 
 
 class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
-    # The model path with the new weights
     model_path: str
-    # The format to load the weights
     load_format: str | None = None
     # Optional: update the weight version after a successful load.
     weight_version: str | None = None
@@ -967,17 +937,11 @@ class UpdateWeightsFromTensorReqOutput(BaseReq, kw_only=True):
 
 
 class InitWeightsUpdateGroupReqInput(BaseReq, kw_only=True):
-    # The master address
     master_address: str
-    # The master port
     master_port: int
-    # The rank offset
     rank_offset: int
-    # The world size
     world_size: int
-    # The group name
     group_name: str = "weight_update_group"
-    # The backend
     backend: str = "nccl"
 
 

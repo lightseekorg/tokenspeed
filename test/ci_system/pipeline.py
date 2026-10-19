@@ -157,7 +157,7 @@ def should_run_perf_diagnostics(task: Dict[str, Any], runner: str) -> bool:
 
 
 def load_yaml(path: Path) -> Dict[str, Any]:
-    with path.open() as handle:
+    with path.open(encoding="utf-8") as handle:
         data = yaml.safe_load(handle)
     if not isinstance(data, dict):
         raise ValueError(f"{path}: top-level YAML document must be a mapping")
@@ -931,7 +931,7 @@ def run_perf_diagnostics(
 
 
 def _read_ast(path: Path) -> ast.AST:
-    return ast.parse(path.read_text(), filename=str(path))
+    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
 
 def _const_str(node: ast.AST) -> str | None:
@@ -1045,6 +1045,7 @@ def summarize_task_targets(task: Dict[str, Any], repo_root: Path) -> Dict[str, A
 
 
 def summarize_command_output(command: str, output: str) -> Dict[str, Any]:
+    del command  # Unused.
     result: Dict[str, Any] = {}
 
     models_run = sorted(
@@ -1417,8 +1418,10 @@ def format_perf_reference_table(checks: List[Dict[str, Any]]) -> List[str]:
         return []
     header = (
         f"{'Conc':>4}  "
-        f"{'Lat actual':>10} {'Lat ref':>9} {'Lat floor':>10} {'Lat actual/ref':>14}  "
-        f"{'Thru actual':>12} {'Thru ref':>10} {'Thru floor':>11} {'Thru actual/ref':>15}"
+        f"{'Lat actual':>10} {'Lat ref':>9} {'Lat floor':>10} "
+        f"{'Lat actual/ref':>14}  "
+        f"{'Thru actual':>12} {'Thru ref':>10} {'Thru floor':>11} "
+        f"{'Thru actual/ref':>15}"
     )
     rule = "-" * len(header)
     lines = [header, rule]
@@ -1610,7 +1613,7 @@ def write_detailed_step_summary(result: Dict[str, Any]) -> None:
     if not summary_path:
         return
     try:
-        with open(summary_path, "a") as handle:
+        with open(summary_path, "a", encoding="utf-8") as handle:
             handle.write("\n".join(build_step_summary_lines(result)))
     except OSError as exc:
         print(
@@ -1637,7 +1640,7 @@ def write_result(path: str | None, payload: Dict[str, Any]) -> None:
         return
     result_path = Path(path)
     result_path.parent.mkdir(parents=True, exist_ok=True)
-    result_path.write_text(json.dumps(payload, indent=2) + "\n")
+    result_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def server_exit_error(
@@ -1648,7 +1651,7 @@ def server_exit_error(
         return None
     detail = ""
     if log_path is not None and log_path.exists():
-        lines = log_path.read_text(errors="replace").splitlines()
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
         if lines:
             detail = "\nLast server log lines:\n" + "\n".join(lines[-20:])
     return f"server exited before readiness with exit code {returncode}{detail}"

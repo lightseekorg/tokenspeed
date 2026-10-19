@@ -99,7 +99,10 @@ def _fused_norm_rope_scatter_kernel(
     BLOCK_HD: tl.constexpr,
     IS_FP8: tl.constexpr,
 ):
-    """Fused RMSNorm(K) + RoPE(K) + scatter to KV pool. Grid: (total_ctx, num_kv_heads, n_layers)."""
+    """Fused RMSNorm(K) + RoPE(K) + scatter to KV pool.
+
+    Grid: (total_ctx, num_kv_heads, n_layers).
+    """
     ctx_id = tl.program_id(0)
     head_id = tl.program_id(1)
     layer_id = tl.program_id(2)
@@ -205,7 +208,7 @@ def _fused_norm_rope_stacked_scatter(
         raise ValueError(
             f"Expected 3D kv [total_ctx, n_layers, kv_size*2], got {tuple(kv.shape)}."
         )
-    total_ctx, n_layers, kv_dim = kv.shape
+    total_ctx, n_layers, _ = kv.shape
     if total_ctx == 0:
         return
 
@@ -276,7 +279,10 @@ def _fused_norm_rope_kernel_stacked(
     half_rotary_dim: tl.constexpr,
     BLOCK_HD: tl.constexpr,
 ):
-    """Fused RMSNorm(K) + RoPE(K) materialization. Grid: (total_ctx, num_kv_heads, n_layers)."""
+    """Fused RMSNorm(K) + RoPE(K) materialization.
+
+    Grid: (total_ctx, num_kv_heads, n_layers).
+    """
     ctx_id = tl.program_id(0)
     head_id = tl.program_id(1)
     layer_id = tl.program_id(2)
@@ -366,7 +372,7 @@ def _fused_norm_rope_stacked(
             f"Expected 3D kv [total_ctx, n_layers, kv_size*2], got {tuple(kv.shape)}."
         )
 
-    total_ctx, n_layers, kv_dim = kv.shape
+    total_ctx, n_layers, _ = kv.shape
     if total_ctx == 0:
         empty = torch.empty(
             (n_layers, 0, num_kv_heads, head_dim), dtype=kv.dtype, device=kv.device

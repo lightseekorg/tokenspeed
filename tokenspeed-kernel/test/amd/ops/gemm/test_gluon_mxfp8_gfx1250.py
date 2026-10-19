@@ -339,7 +339,9 @@ def test_fp8_blockscale_fused_tdm_matches_single_wave(monkeypatch) -> None:
     monkeypatch.setattr(
         mxfp8_mm,
         "_select_tdm_fusion",
-        lambda contract, selected_m, selected_n, selected_k, split_k: mxfp8_mm._TDM_FUSION_NONE,
+        lambda contract, selected_m, selected_n, selected_k, split_k: (
+            mxfp8_mm._TDM_FUSION_NONE
+        ),
     )
     expected = launch_gluon_mm_fp8_blockscale_gfx1250(
         a,
@@ -354,7 +356,9 @@ def test_fp8_blockscale_fused_tdm_matches_single_wave(monkeypatch) -> None:
     monkeypatch.setattr(
         mxfp8_mm,
         "_select_tdm_fusion",
-        lambda contract, selected_m, selected_n, selected_k, split_k: mxfp8_mm._TDM_FUSION_PAIR_2W,
+        lambda contract, selected_m, selected_n, selected_k, split_k: (
+            mxfp8_mm._TDM_FUSION_PAIR_2W
+        ),
     )
     actual = launch_gluon_mm_fp8_blockscale_gfx1250(
         a,

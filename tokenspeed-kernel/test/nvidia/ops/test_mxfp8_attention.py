@@ -20,8 +20,8 @@
 Builds a paged fp8 KV cache + interleaved UE8M0 scales (store_sf_interleaved),
 quantizes q per token, and compares mha_decode_with_kvcache /
 mha_extend_with_kvcache outputs on the block-scaled path against the same op
-running on the unquantized bf16 cache. The only error source is e4m3+e8m0
-quantization of q/k/v, so agreement is tight but not bit-exact.
+running on the dequantized bf16 q and cache, so q/k/v quantization error
+cancels; agreement is tight but not bit-exact.
 """
 
 from __future__ import annotations
@@ -301,8 +301,7 @@ def test_rel_decode_oob_pool_bytes_have_zero_effect(window_left: int):
     ref = run()
     assert torch.isfinite(ref.float()).all()
 
-    # Poison every unwritten row of the boundary page with all-NaN bytes
-    # (data 0x7F = e4m3 NaN, SF 0xFF = e8m0 NaN).
+    # Poison every unwritten row of the boundary page with e4m3 NaN bytes (0x7F).
     page = (seqlen - 1) // PAGE
     row_in_page = (seqlen - 1) % PAGE
     for cache in (k8, v8):

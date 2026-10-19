@@ -120,10 +120,12 @@ def resolve_run(source_run: str, repository: str) -> dict[str, str]:
 
 def failed_cases(manifest: Path) -> list[dict]:
     failed = []
-    for row in json.loads(manifest.read_text()):
+    for row in json.loads(manifest.read_text(encoding="utf-8")):
         try:
             result = json.loads(
-                (manifest.parent / f"{row['job_id']}-result.json").read_text()
+                (manifest.parent / f"{row['job_id']}-result.json").read_text(
+                    encoding="utf-8"
+                )
             )
         except (OSError, ValueError):
             result = {}
@@ -160,7 +162,7 @@ def replay(manifest: Path, root: Path, report: Path, coordinator: str) -> int:
         retained = (root / "scripts" / f"{stem}.sbatch").resolve()
         if retained.parent != root / "scripts":
             raise ValueError("retained script is outside the artifact root")
-        script = slurm.harden_bootstrap(retained.read_text())
+        script = slurm.harden_bootstrap(retained.read_text(encoding="utf-8"))
         archives = re.findall(r"^source_archive=(.+)$", script, re.M)
         if len(archives) != 1 or len(shlex.split(archives[0])) != 1:
             raise ValueError("retained script has no unique source snapshot")
@@ -176,7 +178,7 @@ def replay(manifest: Path, root: Path, report: Path, coordinator: str) -> int:
     if len({commit for _, _, commit in prepared}) > 1:
         raise ValueError("source cases do not share one commit")
 
-    summary = (manifest.parent / "summary.md").read_text()
+    summary = (manifest.parent / "summary.md").read_text(encoding="utf-8")
     pr = re.search(r"^\*\*Target PR:\*\* \[?#([0-9]+)", summary, re.M)
     source_pr = pr[1] if pr else None
     if rows:
@@ -230,7 +232,7 @@ def main(argv: list[str]) -> int:
                 args.manifest, args.artifact_root, args.report_dir, args.coordinator
             )
         outputs = resolve_run(args.source_run, args.repository)
-        with args.github_output.open("a") as output:
+        with args.github_output.open("a", encoding="utf-8") as output:
             for key, value in outputs.items():
                 output.write(f"{key}={value}\n")
         print(json.dumps(outputs, indent=2))

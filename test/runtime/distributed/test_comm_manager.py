@@ -68,17 +68,12 @@ def make_batch(mapping, dp_tokens: List[int]) -> ForwardContext:
     )
 
 
-# ---------------------------------------------------------------------------
-# Worker: runs on each GPU
-# ---------------------------------------------------------------------------
-
-
 def worker_fn(
     rank, world_size, port, attn_tp, dense_tp, dp_tokens, hidden_size, error_dict
 ):
     try:
         _worker_main(rank, world_size, port, attn_tp, dense_tp, dp_tokens, hidden_size)
-    except Exception as e:
+    except Exception:
         import traceback
 
         error_dict[rank] = traceback.format_exc()
@@ -105,15 +100,14 @@ def _worker_main(rank, world_size, port, attn_tp, dense_tp, dp_tokens, hidden_si
         dense_tp_size=dense_tp,
     )
 
-    # --- Initialize distributed via ProcessGroupManager ---
     pg_manager.init_distributed(
         mapping=mapping,
         distributed_init_method=f"tcp://localhost:{port}",
         backend="nccl",
     )
 
-    # Pre-create all process groups needed by CommManager.
-    # Order is fixed across all ranks; _make_all_groups ensures identical new_group calls.
+    # Pre-create all process groups needed by CommManager. Order is fixed across
+    # all ranks; _make_all_groups ensures identical new_group calls.
     for group in [
         mapping.attn.tp_group,
         mapping.dense.tp_group,
@@ -122,7 +116,6 @@ def _worker_main(rank, world_size, port, attn_tp, dense_tp, dp_tokens, hidden_si
         if len(group) > 1:
             pg_manager.init_process_group(group)
 
-    # --- Set up global state that CommManager depends on ---
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     max_tokens = max(sum(dp_tokens), 1)
@@ -144,7 +137,6 @@ def _worker_main(rank, world_size, port, attn_tp, dense_tp, dp_tokens, hidden_si
         query_sharded=False,
     )
 
-    # --- Token distribution ---
     scattered = build_scattered(dp_tokens, attn_tp)
     batch = make_batch(mapping, dp_tokens)
     # In all-reduce mode, all ranks in a TP group hold the same replicated tokens,
@@ -157,15 +149,12 @@ def _worker_main(rank, world_size, port, attn_tp, dense_tp, dp_tokens, hidden_si
 
     dist.barrier()
 
-    # --- Create input tensor on GPU ---
     torch.manual_seed(42 if is_all_reduce else 42 + rank)
     original = torch.randn(
         my_num_tokens, hidden_size, dtype=torch.bfloat16, device=device
     )
     hidden = original.clone()
     residual = original.clone()
-
-    # === Full communication cycle ===
 
     dbg(f"tokens={my_num_tokens}, pre_attn_comm")
     hidden = cm.pre_attn_comm(hidden, batch)
@@ -187,7 +176,6 @@ def _worker_main(rank, world_size, port, attn_tp, dense_tp, dp_tokens, hidden_si
     hidden, residual = cm.post_dense_comm(hidden, residual, batch)
     dbg(f"post_dense_comm done, shape={hidden.shape}")
 
-    # === Verify ===
     assert (
         hidden.shape == original.shape
     ), f"Rank {rank}: shape {hidden.shape} != {original.shape}"
@@ -218,10 +206,6 @@ def _run(world_size, attn_tp, dense_tp, dp_tokens, hidden_size=256):
     if error_dict:
         raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
 
-
-# ---------------------------------------------------------------------------
-# Test configs
-# ---------------------------------------------------------------------------
 
 PARALLELISM_CONFIGS = [
     pytest.param(4, 2, 2, id="ws4_atp2_dtp2"),

@@ -50,7 +50,7 @@ _STEP_OPERATIONS = frozenset({"autotune", "freeze", "capture", "capture_graphs"}
 
 
 def _tree(name: str) -> ast.Module:
-    return ast.parse((_RUNTIME / name).read_text())
+    return ast.parse((_RUNTIME / name).read_text(encoding="utf-8"))
 
 
 def _function(tree: ast.AST, name: str) -> ast.FunctionDef:

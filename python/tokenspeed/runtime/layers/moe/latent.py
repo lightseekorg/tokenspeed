@@ -207,10 +207,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
     symmetric memory, and it narrows storage the same way ``shard_group``
     does. That coupling is deliberate, and measured rather than inferred: the
     replica wins at every width where the fabric cannot carry the gather. The
-    numbers are on ``_gather_shards``, which is where the two routes are
-    described together; they are not repeated here because an earlier eager
-    set that was repriced away lived in this paragraph, two decimal places
-    from a value in the other arm.
+    numbers are on ``_gather_shards``.
 
     Where the fabric is there, the split pays from the mailbox ceiling
     upward: measured on GB300 TP8 under graph replay with cold weights, the
@@ -299,7 +296,8 @@ class Kimi3LatentProjection(ReplicatedLinear):
         if self.narrowed and (shard_id is not None or begin_size is not None):
             # Chunked loads use full-weight row offsets, which sharded params cannot honor.
             raise ValueError(
-                "column-parallel Kimi3LatentProjection only supports whole-tensor loads"
+                "column-parallel Kimi3LatentProjection only supports "
+                "whole-tensor loads"
             )
         if self.narrowed:
             rows = self.output_size_full // self.shard_size
@@ -340,9 +338,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
             8192   226.0     / 254.0     224.5     / 142.8
 
         Which is why a projection that cannot narrow does not take this route
-        at all. An earlier eager measurement here put the no-fabric gap at
-        4.5x rather than 2.1x; it timed host submission inside the interval,
-        and the two arms submit different amounts of Python.
+        at all.
 
         Returns:
             The full-width projection. **It may alias the backend's workspace**,
@@ -634,7 +630,8 @@ class LatentMoELayer(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.ndim != 2:
             raise ValueError(
-                f"latent MoE expects hidden states [T, H], got {tuple(hidden_states.shape)}"
+                "latent MoE expects hidden states [T, H], got "
+                f"{tuple(hidden_states.shape)}"
             )
         if prefix_sum is not None and self.shared_experts is None:
             raise ValueError("prefix_sum requires shared_experts")

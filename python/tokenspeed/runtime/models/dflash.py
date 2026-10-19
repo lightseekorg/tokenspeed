@@ -342,7 +342,8 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
         stream = self.aux_hidden_stream
         if not hasattr(target_model, "set_dflash_layers_to_capture"):
             raise ValueError(
-                "DFLASH requires the target model to support set_dflash_layers_to_capture."
+                "DFLASH requires the target model to support "
+                "set_dflash_layers_to_capture."
             )
         stream_setter = getattr(target_model, "set_dflash_aux_hidden_stream", None)
         if stream_setter is None and stream != "prefix":

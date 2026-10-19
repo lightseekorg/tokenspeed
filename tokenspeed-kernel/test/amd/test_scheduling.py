@@ -50,11 +50,11 @@ def schedule():
 def test_scheduler_library_is_package_data(schedule):
     path = Path(schedule._SCHED_LIBRARY_PATH)
     assert path.name == "sched_barrier.ll"
-    config = tomllib.loads((_AMD / "pyproject.toml").read_text())
+    config = tomllib.loads((_AMD / "pyproject.toml").read_text(encoding="utf-8"))
     patterns = config["tool"]["setuptools"]["package-data"][_PACKAGE]
     assert any(path.match(pattern) for pattern in patterns)
     # Triton links the library only for calls whose symbol contains its name.
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     symbols = set(re.findall(r"^define \S+ @(\w+)", text, re.M))
     assert symbols and all(schedule._SCHED_LIBRARY_NAME in symbol for symbol in symbols)
 

@@ -252,8 +252,6 @@ class KimiLinearConfig(PretrainedConfig):
             **kwargs,
         )
 
-    # ----- helpers -----
-
     def is_kda_layer(self, layer_idx: int) -> bool:
         """Whether ``layer_idx`` (0-based) is a KDA linear-attention layer.
 

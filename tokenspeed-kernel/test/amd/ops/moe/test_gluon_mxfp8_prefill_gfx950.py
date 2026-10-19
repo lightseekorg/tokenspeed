@@ -84,8 +84,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (  # noqa: E4
     gluon_a16w4_situ_warp_decode_ep_gfx950,
 )
 
-# noqa: E402
-
 _NAMES = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
 _RAW_NAMES = ("w13_weight", "w13_scale", "w2_weight", "w2_scale")
 _A8 = "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"

@@ -280,11 +280,10 @@ def _index_k_rows_kwargs(
 ) -> dict:
     """The workspace-row keywords for a selected top-k leaf, or nothing.
 
-    Only a leaf registered with ``INDEX_K_WORKSPACE_ROWS_FEATURE`` takes them;
-    the decision is the registration's, read here, never a signature probe.
+    Only a leaf registered with ``INDEX_K_WORKSPACE_ROWS_FEATURE`` takes them.
     Selection already required the feature for rows (ranking and overrides
-    alike), so a leaf without it here is refused rather than handed a keyword
-    its launcher does not take.
+    alike), so a leaf without it is refused there rather than handed a keyword
+    its launcher does not take; ``kernel`` is not consulted here.
     """
     if index_k_fp8 is None and index_k_bf16 is None:
         return {}

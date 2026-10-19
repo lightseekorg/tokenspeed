@@ -45,9 +45,6 @@ logger = logging.getLogger(__name__)
 # ===-----------------------------------------------------------------------===#
 
 
-# DeepGEMM implementation of the DeepSeek V4/V4.1 MegaMoE boundary.
-
-
 if platform.is_blackwell:
     prepare_cuda_toolkit_env()
     from deep_gemm import (

@@ -195,9 +195,11 @@ class TestDRoleStateSlots:
 
         assert len(result["finished"]) == len(rids), (
             "D-role deadlock: landed requests never finished; "
-            f"admitted={admitted} finished={result['finished']} generated={result['generated']} "
+            f"admitted={admitted} finished={result['finished']} "
+            f"generated={result['generated']} "
             f"waiting={result['waiting']} decoding={result['decoding']} "
-            f"available={result['available']} active={result['active']} idle_rounds={result['idle_rounds']}"
+            f"available={result['available']} active={result['active']} "
+            f"idle_rounds={result['idle_rounds']}"
         )
         assert result["active"] == 0, "finished requests must release every page"
 
@@ -227,8 +229,10 @@ class TestDRoleStateSlots:
         plan = scheduler.next_execution_plan()
         dispatched = [rid for op in _dispatched(plan) for rid in op.request_ids]
         assert set(dispatched) == set(admitted), (
-            f"first decode step blocked for {sorted(set(admitted) - set(dispatched))}: "
-            f"available={scheduler.available_lcm_blocks()} active={scheduler.active_lcm_blocks()}"
+            "first decode step blocked for "
+            f"{sorted(set(admitted) - set(dispatched))}: "
+            f"available={scheduler.available_lcm_blocks()} "
+            f"active={scheduler.active_lcm_blocks()}"
         )
         [batch] = _dispatched(plan)
         landed = {rid: _state_rows(batch, rid) for rid in admitted}

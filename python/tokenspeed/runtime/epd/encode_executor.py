@@ -219,9 +219,9 @@ class DisaggEncodeExecutor:
     def _stage_and_send(self, items: list[tuple[str, MultimodalDataItem]]) -> None:
         """Lease a ring slot per item and ship it; items that cannot lease a free
         slot (ring full) are DEFERRED for a later non-blocking retry rather than
-        blocking the loop. Stages every leased item then issues ONE stream sync
-        before the sends, so the one-sided RDMA reads never race the device-to-
-        device copies (the ViT->send corruption hazard)."""
+        blocking the loop. Stages every leased item then records ONE CUDA event
+        that every send waits on, so the one-sided RDMA reads never race the
+        device-to-device copies (the ViT->send corruption hazard)."""
         self._ensure_rings()
         staged = []
         for rid, item in items:

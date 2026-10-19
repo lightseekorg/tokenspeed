@@ -561,7 +561,8 @@ class DFlash2DraftModel(DFlashDraftModel):
         missing = sorted(set(params) - loaded)
         if missing:
             raise ValueError(
-                f"DFlash2 MLA checkpoint is missing {len(missing)} weights: {missing[:8]}"
+                f"DFlash2 MLA checkpoint is missing {len(missing)} weights: "
+                f"{missing[:8]}"
             )
         for layer in self.layers:
             self_attn = layer.self_attn

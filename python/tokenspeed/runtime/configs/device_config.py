@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Runtime device configuration helpers."""
-
 import torch
 
 from tokenspeed.runtime.utils import get_colorful_logger

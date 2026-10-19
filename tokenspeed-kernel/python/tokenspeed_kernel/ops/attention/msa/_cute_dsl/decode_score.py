@@ -516,7 +516,7 @@ def minimax_index_decode_score(
     Returns:
         None; ``scores`` is written in place.
     """
-    tokens, num_heads, head_dim = index_q.shape
+    _, num_heads, head_dim = index_q.shape
     kernel = IndexDecodeScoreKernel.compile(
         _TORCH_TO_CUTE_DTYPE[index_q.dtype],
         num_heads,

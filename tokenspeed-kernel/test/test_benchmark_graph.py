@@ -226,11 +226,11 @@ def test_profiler_uses_final_eager_warmup_and_measured_replays(
     ]
     for index in range(2):
         enter = backend.log.index(f"profile_enter:graph_replay:{index}")
-        exit = backend.log.index(f"profile_exit:graph_replay:{index}")
+        exit_index = backend.log.index(f"profile_exit:graph_replay:{index}")
         assert backend.log[enter + 1].startswith("record:")
         assert backend.log[enter + 2] == "replay:0"
         assert backend.log[enter + 3].startswith("record:")
-        assert exit == enter + 4
+        assert exit_index == enter + 4
 
     measurement_sync = max(_positions(backend.log, "sync:benchmark"))
     assert measurement_sync < backend.log.index("profile_exit:measurement:None")

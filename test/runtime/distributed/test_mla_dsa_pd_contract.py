@@ -99,7 +99,6 @@ def _attn_config(family: str, pd_enabled: bool):
 
 
 def _recipe(family: str, pd_enabled: bool = False):
-    """An ordinary recipe over ``_NUM_LAYERS`` MLA/DSA layers."""
     from types import SimpleNamespace
 
     config = _attn_config(family, pd_enabled)

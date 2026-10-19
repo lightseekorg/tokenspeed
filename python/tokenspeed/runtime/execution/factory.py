@@ -24,7 +24,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import tokenspeed.runtime.layers.attention.backends  # noqa: F401  # trigger register_backend() calls
+# Imported for its side effect: triggers the register_backend() calls.
+import tokenspeed.runtime.layers.attention.backends  # noqa: F401
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.model_executor import (
@@ -193,25 +194,25 @@ def configure_draft_target(
     released before profiling instead of being double-counted.
     """
     draft_model = draft_model_runner.model
-    DrafterImpl = get_drafter_impl(server_args.speculative_algorithm, draft_model)
+    drafter_cls = get_drafter_impl(server_args.speculative_algorithm, draft_model)
     if (
         draft_model_runner.model_config.requires_request_token_history
-        and not DrafterImpl.supports_request_token_history
+        and not drafter_cls.supports_request_token_history
     ):
         raise NotImplementedError(
             f"draft model requires request-token history, but drafter "
-            f"{DrafterImpl.__name__} does not thread it through its forwards"
+            f"{drafter_cls.__name__} does not thread it through its forwards"
         )
     if server_args.speculative_algorithm in ("DFLASH", "DSPARK"):
         if not isinstance(draft_model, TargetCaptureConfigurator):
             raise TypeError(
-                f"{type(draft_model).__name__} must implement TargetCaptureConfigurator "
-                f"for {server_args.speculative_algorithm}."
+                f"{type(draft_model).__name__} must implement "
+                f"TargetCaptureConfigurator for {server_args.speculative_algorithm}."
             )
         draft_model.configure_target(
             model_runner.model, model_runner.model_config.hf_text_config
         )
-    if DrafterImpl.shares_target_embed_head:
+    if drafter_cls.shares_target_embed_head:
         _share_target_embed_and_head(model_runner, draft_model)
     if server_args.speculative_algorithm == "EAGLE3" and hasattr(
         model_runner.model, "set_eagle3_layers_to_capture"

@@ -62,9 +62,6 @@ FUSION_HEADER = CSRC / "include/flashinfer/comm/trtllm_allreduce_fusion.cuh"
 BINDING = CSRC / "trtllm_mnnvl_sandwich_norm.cu"
 
 
-# ------------------------------------------------------------ NumPy models
-
-
 def _bf16(x: np.ndarray) -> np.ndarray:
     t = torch.from_numpy(np.ascontiguousarray(x, dtype=F32))
     return t.to(torch.bfloat16).to(torch.float32).numpy()
@@ -92,7 +89,10 @@ def _rsqrt(v: np.ndarray, ulp: int) -> np.ndarray:
 
 
 def _group_terms(x: np.ndarray):
-    sq = lambda i: (x[..., i] * x[..., i]).astype(F32)  # noqa: E731
+
+    def sq(i):
+        return (x[..., i] * x[..., i]).astype(F32)
+
     return (
         _fma(x[..., 0], x[..., 0], sq(2)),
         _fma(x[..., 1], x[..., 1], sq(3)),
@@ -282,7 +282,7 @@ def test_the_scale_pairs_expose_a_dropped_rounding_point(pair, drop):
 def test_without_a_scale_pair_the_add_is_the_plain_bf16_sum():
     """(1.0, 1.0) is the kernel's missing pair: both products are exact."""
     s, r, gp, g = _inputs(4096, "normal")
-    out, res, xp, rp, a = _boundary(s, r, gp, g, 1e-6, 1e-6, 1.0, 1.0, _fused_sumsq, 0)
+    _, res, xp, rp, a = _boundary(s, r, gp, g, 1e-6, 1e-6, 1.0, 1.0, _fused_sumsq, 0)
     assert np.array_equal(xp, a)
     assert np.array_equal(rp, r)
     assert np.array_equal(res, _bf16((a + r).astype(F32)))
@@ -306,9 +306,6 @@ def test_the_fused_order_does_not_depend_on_the_rows_around_a_row():
         )
         for full, one in zip(whole, alone):
             assert np.array_equal(full[row : row + 1], one)
-
-
-# ----------------------------------------------- the arithmetic that is pinned
 
 
 def test_epilogue_arithmetic_is_inline_ptx_without_flush_to_zero():
@@ -495,9 +492,6 @@ def test_two_shot_kernels_fit_two_ctas_of_21_warps_per_sm():
         pytest.skip("the build has no sm_100a / sm_103a code")
 
 
-# ------------------------------------------------- pattern code and parameters
-
-
 def test_pattern_code_parameters_and_build_agree():
     from tokenspeed_kernel.thirdparty.cuda.trtllm import (
         _MNNVL_SUPPORTED_PATTERNS,
@@ -540,9 +534,6 @@ def test_pattern_code_parameters_and_build_agree():
     assert 'CUDA_CSRC_DIR / "trtllm_mnnvl_sandwich_norm.cu"' in setup
     header = HEADER.read_text()
     assert "static constexpr int kMaxWarps = 256;" in header
-
-
-# ------------------------------------------------------------ the wrapper
 
 
 class _Group:

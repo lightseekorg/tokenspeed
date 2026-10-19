@@ -115,11 +115,6 @@ def test_capture_replay_address_stability() -> None:
     assert int(out[0]) == 77 * _P
 
 
-# --------------------------------------------------------------------------
-# Page-table width stays a runtime argument
-# --------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize(
     "kernel",
     [compute_out_cache_loc_kernel],

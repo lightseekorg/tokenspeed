@@ -20,7 +20,7 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 @pytest.fixture(autouse=True)
 def _clean_class_state():
-    """Both caches live on the class, so one test can answer for the next."""
+    """These caches outlive a test, so one test can answer for the next."""
     for cache in (
         latent_down.KimiK3LatentDownOp._verdicts,
         latent_down.KimiK3LatentDownOp._pools,
@@ -592,7 +592,7 @@ def test_the_vote_asks_about_the_widths_in_the_right_order() -> None:
 
 
 def test_initialize_hands_back_an_op_bound_to_its_slot_and_rank() -> None:
-    """The refusing half has nine witnesses; this is the succeeding one.
+    """The refusing half has many witnesses; this is the succeeding one.
 
     Without it, returning None on success -- the whole multicast shard disabled
     everywhere -- is indistinguishable from the shard working, because refusing

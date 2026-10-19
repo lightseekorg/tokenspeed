@@ -80,10 +80,6 @@ from tokenspeed.runtime.execution.types import (  # noqa: E402
 )
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
 
-# --------------------------------------------------------------------------
-# Ingress: logprob_start_len resolution and validation
-# --------------------------------------------------------------------------
-
 
 def test_resolve_logprob_start_len_follows_sglang():
     assert resolve_logprob_start_len(-1, 5) == 4
@@ -260,11 +256,6 @@ def test_input_processor_refuses_top_k_it_cannot_compute(server_args, kwargs, me
         _tokenize(processor=_input_processor(**server_args), **request)
 
 
-# --------------------------------------------------------------------------
-# RequestState
-# --------------------------------------------------------------------------
-
-
 def _state(
     input_ids: list[int],
     *,
@@ -304,11 +295,6 @@ def test_request_state_resolves_the_start_and_sizes_the_accumulator():
     decode_role = _state([1, 2, 3, 4], start=1, computes_prompt_logprobs=False)
     assert not decode_role.wants_input_logprobs
     assert decode_role.input_token_logprobs is None
-
-
-# --------------------------------------------------------------------------
-# The per-forward plan
-# --------------------------------------------------------------------------
 
 
 class _Op:
@@ -453,11 +439,6 @@ def test_the_sampled_k_has_no_default_like_the_prompt_logprob_plan():
     for name in ("input_logprob_plan", "sampled_top_k"):
         assert fields[name].default is dataclasses.MISSING
         assert params[name].default is inspect.Parameter.empty
-
-
-# --------------------------------------------------------------------------
-# Commit path: accumulation, finalization, one-shot emission
-# --------------------------------------------------------------------------
 
 
 class _Sender:
@@ -889,11 +870,6 @@ def test_result_rows_must_match_the_plan():
         )
 
 
-# --------------------------------------------------------------------------
-# Forward thread: the plan's device staging
-# --------------------------------------------------------------------------
-
-
 def _staging_executor(monkeypatch, *, shifted_ids: list[int], vocab_size: int = 32):
     from tokenspeed.runtime.execution import model_executor as executor_module
     from tokenspeed.runtime.execution.nan_guard import NanGuard
@@ -1018,11 +994,6 @@ def test_nan_guard_flags_the_slot_of_a_non_finite_prompt_logprob():
     assert logprobs[0].item() == -1.0 and logprobs[2].item() == -2.0
 
 
-# --------------------------------------------------------------------------
-# Admission: the prefix-probe cap handed to the C++ scheduler
-# --------------------------------------------------------------------------
-
-
 def _handler(disaggregation_mode: str) -> RequestHandler:
     handler = object.__new__(RequestHandler)
     handler.server_args = SimpleNamespace(
@@ -1083,11 +1054,6 @@ def test_make_spec_passes_the_cap_explicitly():
         ).max_cached_prefix_tokens
         == 2**31 - 1
     )
-
-
-# --------------------------------------------------------------------------
-# Wire: the per-request lists with a leading None survive the IPC codec
-# --------------------------------------------------------------------------
 
 
 def test_batch_token_id_out_codec_carries_prompt_logprobs():

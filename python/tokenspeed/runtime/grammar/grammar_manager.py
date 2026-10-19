@@ -178,7 +178,8 @@ class GrammarManager:
             # retry it.
             state.set_finish_with_abort(
                 "Grammar-based generation (json_schema, regex, ebnf, structural_tag) "
-                "is not supported when the server is launched with --grammar-backend none",
+                "is not supported when the server is launched with "
+                "--grammar-backend none",
                 status_code=HTTPStatus.BAD_REQUEST,
             )
 

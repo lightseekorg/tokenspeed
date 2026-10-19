@@ -63,9 +63,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
     CacheStoragePlan,
 )
 
-# A cache family names one registered recipe and pool factory. The in-tree
-# families are mha, mla, dsa, msa, qwen_gdn, qwen4_exp, mamba2, inkling,
-# kimi_k3, glm53_flash and deepseek_v41; plugins register their own.
+# A cache family names one registered recipe and pool factory (see _RECIPES);
+# plugins register their own.
 CacheModelFamily = str
 
 

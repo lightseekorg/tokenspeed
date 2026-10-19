@@ -24,7 +24,7 @@
 
 """Triton DSV4 kernel exports.
 
-TODO: Moe kernel implementations into their own dedicated files.
+TODO: Move kernel implementations into their own dedicated files.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ import logging
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -1259,7 +1259,6 @@ def _dsv4_fused_sparse_compress_cache_kernel(
 
 @functools.cache
 def _wide_compress_launch_supported(device: torch.device | int | None) -> bool:
-    """Return whether the wide sparse-compress launch is supported."""
 
     try:
         if not torch.cuda.is_available() or torch.version.hip is not None:
@@ -2217,8 +2216,6 @@ def dsv4_compressed_slot_mapping(
     compress_ratio: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Build compressed KV slot mapping for DeepSeek V4."""
-
     if out is None:
         out = torch.empty(num_tokens, dtype=torch.int64, device=seq_lens.device)
     out.fill_(-1)
@@ -2604,7 +2601,7 @@ def dsv4_fused_inv_rope_fp8_quant(
     Returns ``(o_fp8, o_scale)`` in the scale layout requested by the selected
     grouped output projection implementation.
     """
-    num_tokens, num_heads, head_dim = o.shape
+    num_tokens, _, head_dim = o.shape
     d = heads_per_group * head_dim
     num_scale_blocks = d // quant_group_size
     chunks_per_head = head_dim // quant_group_size

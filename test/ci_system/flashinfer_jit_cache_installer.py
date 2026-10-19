@@ -16,7 +16,7 @@ _QUERY_INSTALLED = object()
 
 def read_exact_pin(requirements_path: Path, package: str) -> str:
     pattern = re.compile(rf"^\s*{re.escape(package)}==([^#\s]+)")
-    for line in requirements_path.read_text().splitlines():
+    for line in requirements_path.read_text(encoding="utf-8").splitlines():
         match = pattern.match(line)
         if match:
             return match.group(1)

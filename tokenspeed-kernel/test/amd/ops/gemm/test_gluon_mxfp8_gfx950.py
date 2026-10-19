@@ -33,7 +33,7 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
-from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm  # noqa: E402
 from tokenspeed_kernel.profiling import ShapeCapture  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (  # noqa: E402
     _mxfp8_launch_metadata,

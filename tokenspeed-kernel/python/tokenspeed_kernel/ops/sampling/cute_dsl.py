@@ -880,7 +880,7 @@ if _CUTE_AVAILABLE:
                     else:
                         warp_max, warp_argmax = warp_reduce_argmax(peer_val, peer_idx)
                     # A row whose elements never beat -inf (all-NaN / all -inf) leaves
-                    # the argmax at its 0xFFFFFFFF sentinel; emit the in-range index 0.
+                    # the argmax at its 0x7FFFFFFF sentinel; emit the in-range index 0.
                     if warp_argmax == Int32(0x7FFFFFFF):
                         warp_argmax = Int32(0)
 

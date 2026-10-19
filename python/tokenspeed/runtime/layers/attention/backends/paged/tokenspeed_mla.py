@@ -222,7 +222,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
     def __init__(self, config: AttnConfig, spec: MLAConfig, *, kernel_page_size: int):
         if kernel_page_size not in TOKENSPEED_MLA_SUPPORTED_PAGE_SIZES:
             raise ValueError(
-                f"tokenspeed_mla backend requires page_size 32 or 64, got {kernel_page_size}"
+                "tokenspeed_mla backend requires page_size 32 or 64, got "
+                f"{kernel_page_size}"
             )
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
 
@@ -230,7 +231,6 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         # block_decode_expansion.
         self.draft_block_decode = bool(config.draft_block_decode)
 
-        # MLA dimensions
         self.kv_lora_rank = spec.kv_lora_rank
         self.qk_nope_head_dim = spec.qk_nope_head_dim
         self.qk_rope_head_dim = spec.qk_rope_head_dim
@@ -270,7 +270,6 @@ class CuteDSLMLABackend(PagedAttentionBackend):
 
         self.num_local_heads = self._num_heads_per_tp
 
-        # Metadata
         self.forward_decode_metadata: CuteDSLMLADecodeMetadata | None = None
         self.forward_prefill_metadata: CuteDSLMLAPrefillMetadata | None = None
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None

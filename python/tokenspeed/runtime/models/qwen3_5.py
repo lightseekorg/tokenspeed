@@ -36,21 +36,13 @@ from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5TextConfig,
 )
 from tokenspeed.runtime.configs.utils import get_rope_parameters
-
-# Distributed
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-
-# Layers - Attention
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import (
     RMSNorm as RMSNormGated,
 )
-
-# Layers - Others
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
-
-# Layers - Linear
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -247,7 +239,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.activation = config.hidden_act
         self.layer_norm_epsilon = config.rms_norm_eps
 
-        # Conv1d layer
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv1d = ColumnParallelLinear(
             input_size=self.conv_kernel_size,
@@ -325,7 +316,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self._ba_dim = (self.num_v_heads * 2) // self.attn_tp_size
             self._bind_packed_weight_loaders(self.in_proj_qkvzba)
 
-        # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
 
@@ -372,7 +362,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self.conv_weights = conv_weights
 
-        # Normalization layer
         self.norm = RMSNormGated(
             self.head_v_dim,
             eps=self.layer_norm_epsilon,
@@ -382,7 +371,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             dtype=config.dtype,
         )
 
-        # Output projection
         self.out_proj = RowParallelLinear(
             self.value_dim,
             self.hidden_size,
@@ -625,7 +613,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             config, mapping, layer_id, quant_config, prefix=prefix
         )
 
-        #  Determine the MLP type based on the model type
         # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
         if config.model_type == "qwen3_5_moe_text":
             self.mlp = Qwen3_5MoeSparseMoeBlock(
@@ -846,7 +833,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             qk_norm=(self.q_norm, self.k_norm),
         )
 
-        # Dense MLP for non-MoE variant
         if config.model_type == "qwen3_5_text":
             self.mlp = Qwen3_5MoeMLP(
                 parallelism="dense",
@@ -1043,7 +1029,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         # inline there.
         alt_stream = None if current_platform().is_amd else torch.cuda.Stream()
 
-        # Embedding layer
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -1080,7 +1065,6 @@ class Qwen3_5ForCausalLM(nn.Module):
             prefix=f"{prefix}.layers",
         )
 
-        # Final normalization
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # For DFLASH speculative decoding: set of layer indices whose
@@ -1103,7 +1087,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors=None,
         input_deepstack_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
-        # Initialize hidden states
         if input_embeds is None:
             # Only skip embedding allreduce when the first layer's fused
             # allreduce+residual+norm will handle it
@@ -1121,7 +1104,6 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         aux_hidden_states = [] if self.layers_to_capture else None
 
-        # Pass through decoder layers
         for layer_idx in range(len(self.layers)):
             layer = self.layers[layer_idx]
             capture = layer_idx in self.layers_to_capture
@@ -1140,7 +1122,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                     aux_hidden_states,
                 )
 
-            # Process deepstack embeddings if provided
             if (
                 input_deepstack_embeds is not None
                 and input_deepstack_embeds.numel() > 0
@@ -1153,7 +1134,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                     residual + input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
 
-        # Apply final normalization with optional allreduce fusion
         hidden_states, _ = layer.comm_manager.final_norm(
             hidden_states, residual, ctx, self.norm
         )

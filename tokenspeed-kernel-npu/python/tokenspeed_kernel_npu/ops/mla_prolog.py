@@ -133,8 +133,9 @@ def mla_prolog(
     [heads, 128, 512]. Cache is BF16 [pages, page_size, 1, 576] and cache_index
     supplies backend-owned int32/int64 flattened slots. The adapter widens
     int32 slots on-device for the operator; graph replay refreshes this cast.
-    Return absorbed Q and its unrotated
-    64-wide auxiliary tail, or None before any write for unsupported inputs.
+    Return absorbed Q and its unrotated 64-wide auxiliary tail (plus the query
+    norm when ``return_query_norm``), or None before any write for unsupported
+    inputs.
     Errors from an eligible operator propagate instead of retrying after writes.
     """
     op = _flash_mla_prolog()

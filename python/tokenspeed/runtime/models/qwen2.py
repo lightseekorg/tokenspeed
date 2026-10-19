@@ -115,6 +115,7 @@ class Qwen2Attention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
+        del config
         super().__init__()
         self.mapping = mapping
         self.hidden_size = hidden_size
@@ -207,7 +208,8 @@ class Qwen2DecoderLayer(nn.Module):
         self.mapping = mapping
         if self.mapping.attn.tp_size != self.mapping.dense.tp_size:
             raise ValueError(
-                "Qwen2 does not use CommManager and assumes attn_tp_size == dense_tp_size"
+                "Qwen2 does not use CommManager and assumes "
+                "attn_tp_size == dense_tp_size"
             )
         self.hidden_size = config.hidden_size
         rope_theta = get_rope_theta(config, 1000000)
@@ -302,6 +304,7 @@ class Qwen2Model(nn.Module):
         prefix: str = "",
         decoder_layer_type: type[nn.Module] = None,
     ) -> None:
+        del prefix
         super().__init__()
         self.mapping = mapping
         self.config = config

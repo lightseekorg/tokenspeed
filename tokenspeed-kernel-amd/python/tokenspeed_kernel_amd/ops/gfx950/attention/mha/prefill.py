@@ -41,11 +41,6 @@ cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
 
 
-# ===-----------------------------------------------------------------------===#
-# Kernel Config
-# ===-----------------------------------------------------------------------===#
-
-
 @gluon.aggregate
 class AttentionConfig:
     N_HEADS: gl.constexpr
@@ -155,11 +150,6 @@ class AttentionConfig:
         self.store_layout = gl.constexpr(store_layout)
         self.k_smem_layout = gl.constexpr(k_smem_layout)
         self.v_smem_layout = gl.constexpr(v_smem_layout)
-
-
-# ===-----------------------------------------------------------------------===#
-# Kernel Program
-# ===-----------------------------------------------------------------------===#
 
 
 @gluon.aggregate
@@ -972,11 +962,6 @@ def process_sliding_attention_tile(
     output = acc * recip_denom[:, None]
     output = gl.convert_layout(output, cfg.store_layout)
     program.store_output(output)
-
-
-# ===-----------------------------------------------------------------------===#
-# Entry Point
-# ===-----------------------------------------------------------------------===#
 
 
 @gluon.jit

@@ -18,4 +18,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""gfx950 deep sparse attention kernels."""
+"""gfx950 DeepSeek sparse attention (DSA) kernels."""

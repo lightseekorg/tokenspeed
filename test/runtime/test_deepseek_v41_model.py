@@ -1138,7 +1138,7 @@ def test_upstream_rope_and_hc_methods():
     if root is None:
         pytest.skip("set DEEPSEEK_V41_REFERENCE_DIR for upstream parity")
     path = Path(root) / "inference/model.py"
-    tree = ast.parse(path.read_text())
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     selected = []
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in (
@@ -2611,7 +2611,7 @@ def test_snapshot_full_text_manifest_and_wo_a_dtype(monkeypatch):
     if root is None:
         pytest.skip("set DEEPSEEK_V41_REFERENCE_DIR for full snapshot coverage")
     path = Path(root)
-    raw_config = json.loads((path / "config.json").read_text())
+    raw_config = json.loads((path / "config.json").read_text(encoding="utf-8"))
     config = SimpleNamespace(
         **raw_config["text_config"],
         num_hash_layers=0,
@@ -2619,9 +2619,9 @@ def test_snapshot_full_text_manifest_and_wo_a_dtype(monkeypatch):
         topk_group=1,
         expert_dtype="fp4",
     )
-    index = json.loads((path / "model.safetensors.index.json").read_text())[
-        "weight_map"
-    ]
+    index = json.loads(
+        (path / "model.safetensors.index.json").read_text(encoding="utf-8")
+    )["weight_map"]
     union = set()
     for rank in range(4):
         model = _loader_model(monkeypatch, config, rank, "meta")

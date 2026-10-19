@@ -129,7 +129,6 @@ def _reference_forward(model, text, input_ids: list[int]) -> torch.Tensor:
         attn = layer.attn
         # Per-layer native KV width (hetero serving).
         num_kv = attn.kv_size // head_dim
-        # --- attention sublayer ---
         x = _rms_norm(h, layer.attn_norm.weight, text.rms_norm_eps).to(h.dtype)
         qkvr = x @ attn.qkvr.weight.t()
         q, k, v, r = qkvr.split(
@@ -164,7 +163,6 @@ def _reference_forward(model, text, input_ids: list[int]) -> torch.Tensor:
         o = _ref_sconv(o, layer.attn_sconv.weight).to(h.dtype)
         h = h + o
 
-        # --- mlp sublayer ---
         x = _rms_norm(h, layer.mlp_norm.weight, text.rms_norm_eps).to(h.dtype)
         if not layer.is_moe:
             gu = x @ layer.mlp.gate_up_proj.weight.t()

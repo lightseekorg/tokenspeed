@@ -45,19 +45,9 @@ if current_platform().is_nvidia:
     import trtllm_kernel  # noqa: F401
 
 
-# ===-----------------------------------------------------------------------===#
-# DeepSeek V3 fused-A projection: TRT-LLM (NVIDIA)
-# ===-----------------------------------------------------------------------===#
-
-
 def dsv3_fused_a_gemm(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
     """Run TRT-LLM's shape-specialized DeepSeek V3 fused-A projection."""
     return torch.ops.trtllm.dsv3_fused_a_gemm_op(mat_a, mat_b, None, None)
-
-
-# ===-----------------------------------------------------------------------===#
-# NVFP4: TRT-LLM cuBLASLt (NVIDIA SM100+)
-# ===-----------------------------------------------------------------------===#
 
 
 _fp4_dtypes: frozenset[torch.dtype] = frozenset({torch.uint8, torch.float4_e2m1fn_x2})
@@ -138,11 +128,6 @@ def cublaslt_mm_nvfp4(
         out.copy_(output)
         return out
     return output
-
-
-# ===-----------------------------------------------------------------------===#
-# FP8 block-scale: TRT-LLM CuTe DSL (NVIDIA SM100)
-# ===-----------------------------------------------------------------------===#
 
 
 # Opt-in TRT-LLM CuTe-DSL FP8 GEMM with unmodified FP32 block scales.

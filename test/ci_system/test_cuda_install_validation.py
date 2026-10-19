@@ -68,8 +68,11 @@ def installed_stack(monkeypatch, tmp_path):
         "argv",
         ["-", str(requirements), str(thirdparty), "130", str(Path(__file__).parent)],
     )
-    installer = Path(__file__).with_name("install_deps.sh").read_text()
-    marker = 'python3 - "${CUDA_REQ}" "${THIRDPARTY_REQ}" "${CUINDEX}" "${SCRIPT_DIR}" <<\'PY\'\n'
+    installer = Path(__file__).with_name("install_deps.sh").read_text(encoding="utf-8")
+    marker = (
+        'python3 - "${CUDA_REQ}" "${THIRDPARTY_REQ}" "${CUINDEX}" "${SCRIPT_DIR}" '
+        "<<'PY'\n"
+    )
     script = installer.split(marker, 1)[1].split("\nPY", 1)[0]
     return compile(script, "install_deps.sh:validation", "exec"), torch, versions
 

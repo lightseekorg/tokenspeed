@@ -212,7 +212,8 @@ class EngramHashState(nn.Module):
         token_map, vocab_size = build_compressed_token_map(tokenizer)
         if vocab_size != config.engram_compressed_vocab_size:
             raise ValueError(
-                f"Engram compressed vocabulary: got {vocab_size}, expected {config.engram_compressed_vocab_size}"
+                f"Engram compressed vocabulary: got {vocab_size}, "
+                f"expected {config.engram_compressed_vocab_size}"
             )
         if not 0 <= config.engram_pad_token_id < len(token_map):
             raise ValueError("Engram pad token is outside the tokenizer vocabulary")

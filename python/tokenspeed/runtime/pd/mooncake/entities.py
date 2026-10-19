@@ -89,12 +89,17 @@ class KVTransferError(Exception):
 
     def __str__(self):
         if self.remote_endpoint:
-            return f"KVTransferError(bootstrap_room={self.bootstrap_room}, remote_endpoint={self.remote_endpoint}): {self.failure_reason}"
+            return (
+                f"KVTransferError(bootstrap_room={self.bootstrap_room}, "
+                f"remote_endpoint={self.remote_endpoint}): {self.failure_reason}"
+            )
         else:
-            return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
+            return (
+                f"KVTransferError(bootstrap_room={self.bootstrap_room}): "
+                f"{self.failure_reason}"
+            )
 
 
-# prefill
 @dataclasses.dataclass
 class TransferKVChunk:
     room: int
@@ -111,7 +116,6 @@ class TransferKVChunk:
     cache_block_selection: CachePDLayerwiseBlockSelection | None = None
 
 
-# decode
 @dataclasses.dataclass
 class TransferInfo:
     """One request manifest associated with a registered Decode session."""
@@ -149,7 +153,6 @@ class TransferInfo:
         )
 
 
-# decode
 @dataclasses.dataclass(frozen=True)
 class KVArgsRegisterInfo:
     endpoint: str
