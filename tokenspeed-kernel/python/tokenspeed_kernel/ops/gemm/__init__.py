@@ -92,6 +92,7 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
     "grouped_bf16_projection",
+    "grouped_bf16_projection_quantize_fp8",
     # MV: small-M dense projection
     "mv",
     # Linear AttnRes partials
@@ -335,7 +336,7 @@ def _online_quantize_mxfp8(
 
 def _kernel_handles_online_mxfp8(kernel_name: str) -> bool:
     spec = KernelRegistry.get().get_by_name(kernel_name)
-    return spec is not None and spec.solution == "reference"
+    return spec is not None and spec.solution == "torch"
 
 
 def _validate_gemm_out(
@@ -1483,6 +1484,54 @@ def grouped_bf16_projection(
         solution=solution,
     )
     return kernel(x, weight, out)
+
+
+def grouped_bf16_projection_quantize_fp8(
+    x: torch.Tensor, weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``grouped_bf16_projection`` flattened and quantized for an MXFP8 GEMM.
+
+    Args:
+        x: BF16 ``[tokens, groups, input_dim]`` activations (see
+            ``grouped_bf16_projection``).
+        weight: BF16 ``[groups, output_dim, input_dim]`` weights.
+
+    Returns:
+        E4M3 codes ``[tokens, groups * output_dim]`` and uint8 UE8M0 scales
+        ``[tokens, groups * output_dim / 32]`` of the BF16 projection, as
+        ``quantize_fp8(granularity="token_group", group_size=32,
+        scale_encoding="ue8m0")`` produces them. A kernel that quantizes in
+        its epilogue is used when one is registered for the geometry.
+    """
+    try:
+        kernel = select_kernel(
+            "gemm",
+            "grouped_bf16_projection_fp8",
+            format_signature(
+                x=dense_tensor_format(torch.bfloat16),
+                weight=dense_tensor_format(torch.bfloat16),
+            ),
+            traits={
+                "batch": weight.shape[0],
+                "n": weight.shape[1],
+                "k": weight.shape[2],
+                "a_inner_stride_one": x.stride(-1) == 1,
+                "b_contiguous": weight.is_contiguous(),
+                "is_cuda": x.is_cuda,
+            },
+        )
+    except NoKernelFoundError:
+        projected = grouped_bf16_projection(x, weight, None, None).flatten(1)
+        return quantize_fp8(
+            projected,
+            granularity="token_group",
+            group_size=32,
+            scale_encoding="ue8m0",
+            enable_pdl=False,
+            override=None,
+            solution=None,
+        )
+    return kernel(x, weight)
 
 
 def dsv4_linear_fp32(
@@ -3604,7 +3653,7 @@ def kimi3_router_projection(
 
 # Backend registration (side-effect imports)
 # isort: off
-import tokenspeed_kernel.numerics.reference.gemm  # noqa: E402,F401
+import tokenspeed_kernel.numerics.torch.gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.deepgemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.cute_dsl  # noqa: E402,F401

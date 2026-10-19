@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.layernorm import torch_gated_rmsnorm
 from tokenspeed_kernel.ops.layernorm import gated_rmsnorm
 from tokenspeed_kernel.ops.layernorm.triton import GATED_RMSNORM_ROWS_PER_PROGRAM
 from tokenspeed_kernel.platform import current_platform
@@ -37,17 +37,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 ROWS_PER_PROGRAM = GATED_RMSNORM_ROWS_PER_PROGRAM
-
-
-def _reference(x, weight, z, eps, group_size, norm_before_gate, sigmoid_gate):
-    x, z = x.float(), z.float()
-    gate = torch.sigmoid(z) if sigmoid_gate else F.silu(z)
-    if not norm_before_gate:
-        x = x * gate
-    groups = x.view(*x.shape[:-1], -1, group_size)
-    rstd = torch.rsqrt(groups.square().mean(-1, keepdim=True) + eps)
-    y = (groups * rstd).view_as(x) * weight.float()
-    return y * gate if norm_before_gate else y
 
 
 # Row counts around the per-program row block, including partial last blocks.
@@ -75,11 +64,11 @@ def test_gated_rmsnorm_matches_reference(
         fp8_scale=None,
         weights_independent=True,
     )
-    expected = _reference(
-        x, weight, z, 1e-6, group_size, norm_before_gate, sigmoid_gate
+    expected = torch_gated_rmsnorm(
+        x, weight, z, 1e-6, group_size, norm_before_gate, sigmoid_gate, None, True
     )
     # Two bf16 ulps: the reference rounds once, the kernel may differ in the last bit.
-    torch.testing.assert_close(out.float(), expected, rtol=2**-7, atol=2**-7)
+    torch.testing.assert_close(out.float(), expected.float(), rtol=2**-7, atol=2**-7)
 
 
 def test_gated_rmsnorm_rows_are_independent_of_their_neighbours(device):

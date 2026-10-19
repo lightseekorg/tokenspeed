@@ -25,6 +25,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel._triton import triton
+from tokenspeed_kernel.numerics.torch.quantization import dequantize_fp8_groups
 from tokenspeed_kernel.ops.attention.dsv4 import triton as ops
 
 
@@ -130,10 +131,10 @@ def _written_views(kvc, slots):
 
 
 def _dequant_rows(fp8_bytes, scale_bytes):
-    fp8 = fp8_bytes.view(torch.float8_e4m3fn).float()
-    exp = scale_bytes[:, : NOPE // ops.DEEPSEEK_V4_FP8_QUANT_BLOCK].float() - 127.0
-    scale = torch.exp2(exp).repeat_interleave(ops.DEEPSEEK_V4_FP8_QUANT_BLOCK, dim=-1)
-    return fp8 * scale
+    block = ops.DEEPSEEK_V4_FP8_QUANT_BLOCK
+    return dequantize_fp8_groups(
+        fp8_bytes.view(torch.float8_e4m3fn), scale_bytes[:, : NOPE // block], block
+    )
 
 
 def _assert_non_target_cache_bytes_unchanged(kvc, written_slots, label):

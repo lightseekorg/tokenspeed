@@ -724,6 +724,120 @@ TEST(CacheOperationTest, L3StorageHitsPlanAPrefetchNotAnAdmission) {
     EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 4) << "dropping the plan returns its blocks";
 }
 
+TEST(CacheOperationTest, L3PrefetchRestoresSparseStateCheckpoints) {
+    for (const bool host_prefix : {false, true}) {
+        for (const bool missing_last_state : {false, true}) {
+            for (const bool partial_landing : {false, true}) {
+                SCOPED_TRACE(host_prefix);
+                SCOPED_TRACE(missing_last_state);
+                SCOPED_TRACE(partial_landing);
+                BlockPool device_pool{16, {1, 1, 1}};
+                BlockPool host_pool{16, {1, 1, 1}};
+                const std::array specs{
+                    CacheGroupSpec{
+                        .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+                    CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
+                    CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
+                };
+                CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, true, &host_pool, nullptr, true);
+                const std::array<std::string, 4> hashes{"h0", "h1", "h2", "h3"};
+                std::vector<CacheKey> keys;
+                for (const std::string& hash : hashes) {
+                    keys.push_back(CacheKey{.group_id = 0, .content_hash = hash});
+                }
+                for (const std::uint32_t group : {1u, 2u}) {
+                    keys.push_back(CacheKey{.group_id = group, .content_hash = "h1"});
+                    if (group == 1 || !missing_last_state) {
+                        keys.push_back(CacheKey{.group_id = group, .content_hash = "h3"});
+                    }
+                }
+                coordinator.RegisterStorageKeys(keys);
+                if (host_prefix) {
+                    for (const CacheKey& key : keys) {
+                        if (key.content_hash == "h0" || key.content_hash == "h1") {
+                            CacheBlockRef block = coordinator.AcquireHostBlock(key.group_id, 0);
+                            ASSERT_TRUE(block);
+                            coordinator.CacheHostBlock(block, key);
+                        }
+                    }
+                }
+                const auto before = coordinator.ProbePrefix(hashes);
+                EXPECT_EQ(before.host.num_common_tokens, host_prefix ? 4 : 0);
+                EXPECT_EQ(before.storage.num_common_tokens, 8)
+                    << "sparse State checkpoints do not shorten the KV fetch coverage";
+                auto plan = coordinator.PlanPrefetch(before, 1);
+                ASSERT_TRUE(plan);
+                TierTransferManager transfers{coordinator};
+                const PrefetchOperation op = transfers.StartPrefetch("resume", std::move(*plan));
+                ASSERT_EQ(op.num_pages, host_prefix ? 2 : 4);
+                const auto done =
+                    transfers.CompletePrefetch(op.op_id, partial_landing ? op.num_pages / 2 : op.num_pages);
+                ASSERT_TRUE(done);
+                const auto resumed = coordinator.ProbePrefix(hashes);
+                EXPECT_EQ(resumed.host.num_common_tokens, partial_landing || missing_last_state ? 4 : 8)
+                    << "KV restoration must carry the sparse State checkpoints needed to resume";
+            }
+        }
+    }
+}
+
+TEST(CacheOperationTest, StateCheckpointNeedsItsWindowWithOrWithoutL3Prefetch) {
+    for (const bool l3_prefetch : {false, true}) {
+        for (const bool missing_checkpoint_window : {false, true}) {
+            SCOPED_TRACE(l3_prefetch);
+            SCOPED_TRACE(missing_checkpoint_window);
+            BlockPool device_pool{16, {1, 1, 1}};
+            BlockPool host_pool{16, {1, 1, 1}};
+            const std::array specs{
+                CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+                CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                               .sliding_window = 4,
+                               .cache_blocks_per_lcm_block = 1,
+                               .block_granularity = 2},
+                CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
+            };
+            CacheCoordinator coordinator =
+                MakeCoordinator(specs, 2, device_pool, l3_prefetch, &host_pool, nullptr, true);
+            const std::array<std::string, 4> hashes{"h0", "h1", "h2", "h3"};
+            std::vector<CacheKey> keys;
+            for (const std::string& hash : hashes) {
+                for (const std::uint32_t group : {0u, 1u}) {
+                    if (missing_checkpoint_window && group == 1 && hash == "h1") {
+                        continue;
+                    }
+                    keys.push_back(CacheKey{.group_id = group, .content_hash = hash});
+                }
+            }
+            keys.push_back(CacheKey{.group_id = 2, .content_hash = "h1"});
+            if (l3_prefetch) {
+                coordinator.RegisterStorageKeys(keys);
+                const auto before = coordinator.ProbePrefix(hashes);
+                EXPECT_EQ(before.host.num_common_tokens, 0);
+                EXPECT_EQ(before.storage.num_common_tokens, 8)
+                    << "the KV frontier has its window even when the earlier checkpoint does not";
+                auto plan = coordinator.PlanPrefetch(before, 1);
+                ASSERT_TRUE(plan);
+                TierTransferManager transfers{coordinator};
+                const PrefetchOperation op = transfers.StartPrefetch("earlier-state", std::move(*plan));
+                ASSERT_EQ(op.num_pages, 4);
+                ASSERT_TRUE(transfers.CompletePrefetch(op.op_id, op.num_pages));
+            } else {
+                for (const CacheKey& key : keys) {
+                    CacheBlockRef block = coordinator.AcquireHostBlock(key.group_id, 0);
+                    ASSERT_TRUE(block);
+                    coordinator.CacheHostBlock(block, key);
+                }
+            }
+            const auto resumed = coordinator.ProbePrefix(hashes);
+            EXPECT_EQ(resumed.host.num_common_tokens, missing_checkpoint_window ? 0 : 4)
+                << "Host admission needs the checkpoint's window, regardless of how the entries arrived";
+            if (!l3_prefetch) {
+                EXPECT_FALSE(coordinator.PlanPrefetch(resumed, 1));
+            }
+        }
+    }
+}
+
 TEST(CacheOperationTest, APrefetchThatLandsNothingPublishesNothing) {
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};
@@ -984,6 +1098,45 @@ TEST(CacheOperationTest, L3UnregisterPrunesStorageKeyOrder) {
     coordinator.RegisterStorageKeys(std::array{key});
     EXPECT_EQ(coordinator.NumStorageKeys(), 1);
     EXPECT_EQ(CacheCoordinatorTestAccess::NumStorageKeyOrder(coordinator), 1u);
+}
+
+TEST(CacheOperationTest, L3HostPublicationPreservesEvictionOrderAfterUnregister) {
+    BlockPool device_pool{4, {1}};
+    BlockPool host_pool{4, {1}};
+    const std::array specs{CacheGroupSpec{
+        .attn_kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true);
+    const auto key = [](const char* hash) { return CacheKey{.group_id = 0, .content_hash = hash}; };
+    coordinator.RegisterStorageKeys(std::array{key("a"), key("b"), key("c"), key("d")});
+    coordinator.UnregisterStorageKeys(std::array{key("b")});
+    for (const char* hash : {"b", "e", "f"}) {
+        CacheBlockRef block = host_pool.AcquireBlock(0);
+        ASSERT_TRUE(block);
+        coordinator.CacheHostBlock(block, key(hash));
+    }
+    EXPECT_EQ(coordinator.NumStorageKeys(), 4);
+    EXPECT_FALSE(coordinator.ContainsStorageKey(key("a")));
+    EXPECT_FALSE(coordinator.ContainsStorageKey(key("c")));
+    for (const char* hash : {"d", "b", "e", "f"}) {
+        EXPECT_TRUE(coordinator.ContainsStorageKey(key(hash))) << hash;
+    }
+
+    // A bulk probe protects its retained prefix while replacing unrelated keys.
+    coordinator.RegisterStorageKeys(std::array{key("d"), key("g"), key("h"), key("i"), key("j")});
+    EXPECT_FALSE(coordinator.ContainsStorageKey(key("j")));
+    CacheBlockRef block = host_pool.AcquireBlock(0);
+    ASSERT_TRUE(block);
+    coordinator.CacheHostBlock(block, key("j"));
+    EXPECT_EQ(coordinator.NumStorageKeys(), 4);
+    EXPECT_FALSE(coordinator.ContainsStorageKey(key("d")));
+    for (const char* hash : {"g", "h", "i", "j"}) {
+        EXPECT_TRUE(coordinator.ContainsStorageKey(key(hash))) << hash;
+    }
 }
 
 TEST(CacheOperationTest, APrefetchPageIsPlannedForEveryGroupOrNotAtAll) {

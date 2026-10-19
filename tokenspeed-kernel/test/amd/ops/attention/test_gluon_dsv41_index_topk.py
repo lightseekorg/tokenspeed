@@ -29,6 +29,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsv41 import (
+    torch_dsv41_cache_quantize,
+)
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import gluon as gluon_backend
 from tokenspeed_kernel.ops.attention.dsv41._gluon import indexer as gluon_indexer
@@ -43,7 +46,6 @@ _OPS = Path(__file__).resolve().parents[3] / "ops"
 if str(_OPS) not in sys.path:
     sys.path.insert(0, str(_OPS))
 
-from test_attention_dsv41 import _reference_quantize  # noqa: E402
 from test_attention_dsv41_index_scan import (  # noqa: E402
     run_index_scan_graph_oracle,
     run_index_topk_full_and_reindex,
@@ -265,7 +267,7 @@ def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
     g = torch.Generator(device=device).manual_seed(251)
     keys = torch.randn(512, 128, device=device, dtype=torch.bfloat16, generator=g)
     keys *= 0.1
-    _, key_reference = _reference_quantize(keys, "index")
+    _, key_reference = torch_dsv41_cache_quantize(keys, "index")
     # Padding between pages gives a page stride wider than the 64 * 68 payload.
     storage = torch.zeros(8, 64 * 68 + 16, device=device, dtype=torch.uint8)
     cache = storage[:, : 64 * 68].view(8, 64, 68)
@@ -299,7 +301,7 @@ def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
         score_chunk,
     )
 
-    _, q_reference = _reference_quantize(q.reshape(-1, 128), "index")
+    _, q_reference = torch_dsv41_cache_quantize(q.reshape(-1, 128), "index")
     q_reference = q_reference.reshape(2, 32, 128)
     expected = torch.full((2, width), -torch.inf)
     for row in range(2):

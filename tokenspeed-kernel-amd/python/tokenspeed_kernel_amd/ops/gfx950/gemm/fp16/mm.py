@@ -649,8 +649,25 @@ def gluon_mm_a16w16_medium_gfx950(
     SPLIT_K: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     PID_OFFSET: gl.constexpr = 0,
+    GROUPS: gl.constexpr = 1,
+    STRIDE_AG: gl.constexpr = 0,
+    STRIDE_BG: gl.constexpr = 0,
+    STRIDE_CG: gl.constexpr = 0,
+    scale_ptr=None,
+    STRIDE_SM: gl.constexpr = 0,
+    STRIDE_SG: gl.constexpr = 0,
+    QUANT_OUT: gl.constexpr = False,
 ):
     """MFMA/LDS dense16 GEMM for selected M <= 128 decode and middle-M tiles.
+
+    ``GROUPS > 1`` runs that many independent GEMMs in one launch: group g
+    reads A, B and writes C at element offsets g * STRIDE_AG/BG/CG and owns
+    its own split-K partials and counters.
+
+    ``QUANT_OUT`` stores C as group-32 E4M3 codes of the BF16-rounded result
+    (requires BLOCK_N % 32 == 0) and their UE8M0 scales at
+    ``scale_ptr + row * STRIDE_SM + group * STRIDE_SG + column // 32``, rounded
+    like gluon_quantize_fp8_group32_ue8m0_gfx950.
 
     With ``SPLIT_K > 1`` each output tile is computed by ``SPLIT_K`` programs
     over disjoint K slices. Each stores its FP32 partial to ``partial_ptr`` and
@@ -664,6 +681,17 @@ def gluon_mm_a16w16_medium_gfx950(
     pid = gl.program_id(axis=0) - PID_OFFSET
     num_pid_m = gl.cdiv(M, BLOCK_M)
     num_pid_n = gl.cdiv(N, BLOCK_N)
+    if GROUPS > 1:
+        group_programs = num_pid_m * num_pid_n * SPLIT_K
+        group = pid // group_programs
+        pid = pid % group_programs
+        a_ptr += group * STRIDE_AG
+        b_ptr += group * STRIDE_BG
+        c_ptr += group * STRIDE_CG
+        if QUANT_OUT:
+            scale_ptr += group * STRIDE_SG
+        partial_ptr += group * group_programs * (BLOCK_M * BLOCK_N)
+        counter_ptr += group * num_pid_m * num_pid_n
     if NUM_XCDS > 1:
         pid = _remap_xcd(pid, num_pid_m * num_pid_n * SPLIT_K, NUM_XCDS)
     if SPLIT_K == 1:
@@ -1078,6 +1106,42 @@ def gluon_mm_a16w16_medium_gfx950(
             mask=c_mask,
             other=0.0,
         )
+    if QUANT_OUT:
+        gl.static_assert(BLOCK_N % 32 == 0, "quantized output needs BLOCK_N % 32")
+        quant_layout: gl.constexpr = _coalesced_store_layout(
+            BLOCK_M, BLOCK_N, NUM_WARPS
+        )
+        values = gl.convert_layout(
+            acc_store.to(gl.bfloat16).to(gl.float32), layout=quant_layout
+        )
+        groups = gl.reshape(values, [BLOCK_M, BLOCK_N // 32, 32])
+        amax = gl.maximum(gl.max(gl.abs(groups), 2), 1.0e-4)
+        bits = (amax * (1.0 / 448.0)).to(gl.int32, bitcast=True)
+        exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(gl.int32)
+        inverse = 1.0 / (exponent << 23).to(gl.float32, bitcast=True)
+        codes = gl.reshape(
+            (groups * gl.expand_dims(inverse, 2)).to(gl.float8e4nv),
+            [BLOCK_M, BLOCK_N],
+        )
+        codes = gl.convert_layout(codes, layout=quant_layout)
+        qm = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, gl.SliceLayout(1, quant_layout))
+        qn = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, gl.SliceLayout(0, quant_layout))
+        gl.store(
+            c_ptr + qm[:, None] * stride_cm + qn[None, :] * stride_cn,
+            codes,
+            mask=(qm[:, None] < M) & (qn[None, :] < N),
+        )
+        scale_layout: gl.constexpr = gl.SliceLayout(2, groups.type.layout)
+        sm = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, gl.SliceLayout(1, scale_layout))
+        sg = pid_n * (BLOCK_N // 32) + gl.arange(
+            0, BLOCK_N // 32, gl.SliceLayout(0, scale_layout)
+        )
+        gl.store(
+            scale_ptr + sm[:, None] * STRIDE_SM + sg[None, :],
+            exponent.to(gl.uint8),
+            mask=(sm[:, None] < M) & (sg[None, :] < N // 32),
+        )
+        return
     c_base = c_ptr + pid_m * BLOCK_M * stride_cm + pid_n * BLOCK_N * stride_cn
     if _use_coalesced_store(BLOCK_M, BLOCK_N, NUM_WARPS):
         # Rows of 8 contiguous outputs per lane store 16 bytes at a time; the
@@ -1648,6 +1712,14 @@ _DECODE_CONFIGS: dict[
         32: (32, 32, 64, 2, 2, 8, 5, 1),
         64: (64, 16, 256, 4, 1, 2, 5, 1),
     },
+    # DeepSeek V4.1 MoE router gate (FP32 output), any TP.
+    (384, 5120): {
+        4: (16, 64, 256, 1, 4, 2, 10, 1),
+        8: (16, 64, 256, 1, 4, 2, 10, 1),
+        16: (16, 64, 256, 1, 4, 2, 10, 1),
+        32: (32, 32, 512, 2, 2, 2, 5, 1),
+        64: (32, 32, 512, 2, 2, 2, 5, 8),
+    },
     # QSA indexer query/key projection.
     (640, 2560): {
         4: (16, 64, 128, 1, 4, 4, 5, 8),
@@ -1778,6 +1850,166 @@ def launch_gluon_mm_a16w16_decode_gfx950(
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return C
+
+
+_GROUPED_M_BUCKETS = DECODE_M_BUCKETS + (128,)
+# Grouped decode GEMMs keyed by (groups, N, K), then M bucket; same tuple
+# layout as _DECODE_CONFIGS. Swept under graph replay on MI350X.
+_GROUPED_DECODE_CONFIGS: dict[
+    tuple[int, int, int], dict[int, tuple[int, int, int, int, int, int, int, int]]
+] = {
+    # DeepSeek V4.1 wo_a at TP4: two 1024x4096 groups.
+    (2, 1024, 4096): {
+        4: (16, 64, 256, 1, 4, 3, 4, 1),
+        8: (16, 64, 256, 1, 4, 3, 4, 1),
+        16: (16, 64, 256, 1, 4, 3, 4, 1),
+        32: (32, 32, 512, 2, 2, 2, 4, 1),
+        64: (32, 32, 512, 2, 2, 2, 2, 8),
+        128: (32, 32, 64, 2, 2, 3, 4, 8),
+    },
+}
+
+
+def _choose_grouped_decode_config(
+    M: int, G: int, N: int, K: int
+) -> tuple[int, int, int, int, int, int, int, int] | None:
+    if M < 1 or M > _GROUPED_M_BUCKETS[-1]:
+        return None
+    bucket = next(bound for bound in _GROUPED_M_BUCKETS if M <= bound)
+    return _GROUPED_DECODE_CONFIGS.get((G, N, K), {}).get(bucket)
+
+
+def supports_gluon_grouped_mm_a16w16_decode_gfx950(
+    M: int, G: int, N: int, K: int
+) -> bool:
+    """Whether the grouped decode GEMM has a measured config here."""
+    return _choose_grouped_decode_config(M, G, N, K) is not None
+
+
+def gluon_grouped_mm_a16w16_decode_num_counters_gfx950(
+    M: int, G: int, N: int, K: int
+) -> int:
+    """Split-K arrival counters a grouped decode launch needs; 0 without split-K."""
+    config = _choose_grouped_decode_config(M, G, N, K)
+    if config is None or config[6] == 1:
+        return 0
+    return G * triton.cdiv(M, config[0]) * triton.cdiv(N, config[1])
+
+
+def launch_gluon_grouped_mm_a16w16_decode_gfx950(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    counters: torch.Tensor,
+    quantize: bool,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Compute ``out[:, g] = x[:, g] @ weight[g].T`` for every group in one launch.
+
+    With ``quantize``, return instead the group-32 E4M3 codes ``[M, G * N]``
+    and uint8 UE8M0 scales ``[M, G * N / 32]`` of the BF16 result (``out``
+    must be None).
+
+    Args:
+        x: BF16/FP16 ``[M, G, K]`` with unit inner stride; token and group
+            strides are free (e.g. a slice of padded attention heads).
+        weight: Contiguous ``[G, N, K]`` weight in ``x``'s dtype.
+        counters: Zeroed int32 split-K counters, at least
+            ``gluon_grouped_mm_a16w16_decode_num_counters_gfx950`` of them; the
+            launch leaves them zeroed.
+        out: Optional contiguous ``[M, G, N]`` destination.
+
+    Returns:
+        ``[M, G, N]`` in ``x``'s dtype, or (codes, scales) with ``quantize``.
+    """
+    if x.ndim != 3 or weight.ndim != 3:
+        raise ValueError("grouped decode GEMM expects [M, G, K] and [G, N, K]")
+    M, G, K = x.shape
+    if weight.shape[0] != G or weight.shape[2] != K:
+        raise ValueError("grouped decode GEMM group/K mismatch")
+    N = weight.shape[1]
+    if x.dtype not in _SUPPORTED_DTYPES or weight.dtype != x.dtype:
+        raise TypeError("grouped decode GEMM expects matching fp16/bf16 operands")
+    if not x.is_cuda or weight.device != x.device:
+        raise ValueError("grouped decode GEMM requires colocated GPU tensors")
+    if (
+        x.stride(2) != 1
+        or x.stride(0) % 8
+        or x.stride(1) % 8
+        or x.data_ptr() % 16
+        or not weight.is_contiguous()
+    ):
+        raise ValueError("grouped decode GEMM needs 16-byte aligned rows")
+    config = _choose_grouped_decode_config(M, G, N, K)
+    if config is None:
+        raise ValueError(
+            f"grouped decode GEMM has no config for M={M} G={G} N={N} K={K}"
+        )
+    block_m, block_n, block_k, warps_m, warps_n, num_buffers, split_k, num_xcds = config
+    scales = None
+    if quantize:
+        if out is not None or N % block_n or block_n % 32:
+            raise ValueError(
+                "quantized grouped decode GEMM needs whole 32-column tiles"
+            )
+        out = torch.empty((M, G, N), dtype=torch.float8_e4m3fn, device=x.device)
+        scales = torch.empty((M, G * N // 32), dtype=torch.uint8, device=x.device)
+    elif out is None:
+        out = torch.empty((M, G, N), dtype=x.dtype, device=x.device)
+    elif out.shape != (M, G, N) or out.dtype != x.dtype or not out.is_contiguous():
+        raise ValueError("grouped decode GEMM out must be contiguous [M, G, N]")
+    num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    if split_k > 1:
+        check_splitk_counters(
+            counters, G * num_tiles, x.device, "gfx950 grouped decode GEMM"
+        )
+        partial = _get_partial_scratch(
+            x.device, G * num_tiles, split_k, block_n, block_m
+        )
+    else:
+        partial = counters = out
+    gluon_mm_a16w16_medium_gfx950[(G * num_tiles * split_k,)](
+        x,
+        weight,
+        out,
+        out,
+        out,
+        partial,
+        counters,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(2),
+        weight.stride(2),
+        weight.stride(1),
+        out.stride(0),
+        out.stride(2),
+        0,
+        0,
+        0,
+        0,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        WARPS_M=warps_m,
+        WARPS_N=warps_n,
+        NUM_BUFFERS=num_buffers,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        ADD3=False,
+        SPLIT_K=split_k,
+        NUM_XCDS=num_xcds,
+        GROUPS=G,
+        STRIDE_AG=x.stride(1),
+        STRIDE_BG=weight.stride(0),
+        STRIDE_CG=out.stride(1),
+        scale_ptr=scales,
+        STRIDE_SM=G * N // 32,
+        STRIDE_SG=N // 32,
+        QUANT_OUT=quantize,
+        num_warps=warps_m * warps_n,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+    return (out.view(M, G * N), scales) if quantize else out
 
 
 def supports_gluon_mm_a16w16_decode_add3_gfx950(M: int, N: int, K: int) -> bool:

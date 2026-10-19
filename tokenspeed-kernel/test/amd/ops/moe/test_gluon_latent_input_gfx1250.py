@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.moe import torch_latent_input
 from utils import assert_no_triton_compile, is_cdna5
 
 pytest.importorskip(
@@ -53,16 +54,14 @@ def _weights():
 
 
 def _reference(hidden, views):
-    router = torch.nn.functional.linear(hidden.float(), views[0].float())
-    routed = torch.nn.functional.linear(hidden, views[1])
-    gate, up = torch.nn.functional.linear(hidden, views[2]).chunk(2, dim=-1)
-    shared = (
-        GATE_CLAMP
-        * torch.tanh(gate.float() / GATE_CLAMP)
-        * torch.sigmoid(gate.float())
-        * (UP_CLAMP * torch.tanh(up.float() / UP_CLAMP))
-    ).to(hidden.dtype)
-    return router, routed, shared
+    return torch_latent_input(
+        hidden_states=hidden,
+        router_weight=views[0],
+        routed_weight=views[1],
+        shared_gate_up_weight=views[2],
+        gate_clamp=GATE_CLAMP,
+        up_clamp=UP_CLAMP,
+    )
 
 
 def _project(hidden, views, override):
@@ -181,21 +180,14 @@ def test_launcher_rejects_a_packed_weight_that_is_not_the_views(
 
 
 def _expected(hidden, packed, router_n, latent_n, shared_n, beta, linear_beta):
-    acc = hidden.float() @ packed.float().T
-    gate = acc[:, router_n + latent_n : router_n + latent_n + shared_n]
-    up = acc[:, router_n + latent_n + shared_n :]
-    gate = gate.to(torch.bfloat16).float()
-    up = up.to(torch.bfloat16).float()
-    shared = (
-        beta
-        * torch.tanh(gate / beta)
-        * torch.sigmoid(gate)
-        * (linear_beta * torch.tanh(up / linear_beta))
-    ).to(torch.bfloat16)
-    return (
-        acc[:, :router_n],
-        acc[:, router_n : router_n + latent_n].to(torch.bfloat16),
-        shared,
+    router, routed, shared = packed.split((router_n, latent_n, 2 * shared_n))
+    return torch_latent_input(
+        hidden_states=hidden,
+        router_weight=router,
+        routed_weight=routed,
+        shared_gate_up_weight=shared,
+        gate_clamp=beta,
+        up_clamp=linear_beta,
     )
 
 

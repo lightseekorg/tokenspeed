@@ -290,11 +290,11 @@ def make_sample_specs() -> dict[str, SampleRegistration]:
             ),
             priority=16,
         ),
-        "reference_decode": _sample_registration(
-            "reference_decode",
+        "torch_decode": _sample_registration(
+            "torch_decode",
             "attention",
             "decode",
-            "reference",
+            "torch",
             format_signatures(
                 ("q", "k_cache", "v_cache"),
                 "dense",

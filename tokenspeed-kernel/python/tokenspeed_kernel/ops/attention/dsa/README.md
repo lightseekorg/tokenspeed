@@ -80,9 +80,9 @@ never convert a plane:
 | `uint8` | `fp8_scaled` | `page_planar` | any other uint8 shape: per-page planes of keys and scales, the outer page stride possibly padded |
 | `bfloat16` | `bf16` | `packed` | `[slots, head_dim]`: the keys as the indexer produced them, no scale plane |
 
-The in-tree DeepGEMM, Triton and Gluon leaves score `fp8_scaled` planes; a
+The in-tree DeepGEMM, Triton, and Gluon leaves score `fp8_scaled` planes; a
 leaf scoring the checkpoint's bf16 keys (an indexer in the RL trainer's
-order) registers `index_k_format={"bf16"}`, `index_k_layout={"packed"}` and
+order) registers `index_k_format={"bf16"}`, `index_k_layout={"packed"}`, and
 the `batch_invariant` and `forced_initial_local` features, so a bf16 plane
 selects it and nothing else. A plane of any other dtype is a `TypeError`.
 
@@ -95,7 +95,7 @@ head_dim]` uint8 or float8_e4m3fn, `[workspace_rows, head_dim / 128]` fp32),
 each one row per entry of `kv_workspace_slots` and selecting with that
 `index_k_format` and `index_k_layout="packed"`, never together and never with
 `index_k_cache`; a call with neither a plane nor rows is a `ValueError`.
-Rows additionally REQUIRE the `index_k_workspace_rows` feature
+Rows additionally require the `index_k_workspace_rows` feature
 (`dsa.INDEX_K_WORKSPACE_ROWS_FEATURE`): a leaf declares it exactly when its
 launcher takes the row keywords for its format (DeepGEMM does, for the FP8
 pair; a bf16 leaf declares it and takes the `index_k_bf16` keyword), the
@@ -149,9 +149,9 @@ block-maxima selection.
 Contract:
 
 - `scores` is CUDA FP32 `[rows, width]` with unit column stride, a row
-  stride that is a multiple of 4 elements and a 16-byte aligned base;
+  stride that is a multiple of 4 elements, and a 16-byte aligned base;
   `ends` is int32 `[rows]` and bounds each row (clamped to `[0, width]`).
-- `capacity` is the compiled survivor capacity (512, 1024 or 2048) and
+- `capacity` is the compiled survivor capacity (512, 1024, or 2048) and
   bounds `topk`; `capacity_for` gives the smallest one that serves a `topk`.
 - A row with `ends[r] <= topk` yields `0 .. ends[r]-1` then `-1` slots
   scoring `-inf`. Otherwise every slot is a distinct index below `ends[r]`.
@@ -206,13 +206,13 @@ metadata and operator adaptation; model projections and indexer selection
 parameters remain model-owned. Its current constraints are BF16 KV and index
 keys, 128-token kernel pages, target verification of at most eight tokens,
 and no draft-model attention. Target verification can still consume draft
-candidates. These constraints are checked by the Ascend backend.
+candidates. The Ascend backend checks these constraints.
 
 ## Sharded Index-K candidates
 
 `dsa_index_candidates` scores a bounded query tile against rank-local Index-K
 for prefill and decode. Inputs are a position-preserving page table (`-1` for
-absent pages), request IDs and global causal lengths. Outputs are global logical
+absent pages), request IDs, and global causal lengths. Outputs are global logical
 offsets and FP32 scores: invalid candidates use `-1`/`-inf`, and forced
 initial/local candidates use `+inf`. Cross-rank merging belongs to runtime DCP.
 Runtime setup validates a positive power-of-two candidate count when the KVP
@@ -229,7 +229,7 @@ The Triton FP8 indexer skips Q/K scoring for tiles with no causally visible,
 owned entries. Empty tiles still write negative-infinite logits, including
 when lengths or ownership change during graph replay. Partially valid tiles
 keep the per-entry mask and global forced-window policy. This avoids redundant
-arithmetic without changing the launch grid, logits capacity or Top-K scan.
+arithmetic without changing the launch grid, logits capacity, or Top-K scan.
 
 ### Persistent CUDA top-k dependencies
 

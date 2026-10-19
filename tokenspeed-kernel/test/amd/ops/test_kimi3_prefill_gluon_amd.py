@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.residual.torch import torch_attn_res_fwd
 from utils import is_cdna4, is_cdna5
 
 if not (is_cdna4() or is_cdna5()):
@@ -59,16 +60,17 @@ def _attn_res_reference(
     score_eps: float,
     output_eps: float,
 ) -> torch.Tensor:
-    values = torch.cat((history[:, :valid_blocks], layer.unsqueeze(1)), dim=1).float()
-    inverse_rms = torch.rsqrt(values.square().mean(-1, keepdim=True) + score_eps)
-    logits = values.mul(inverse_rms) @ (score_weight * res_weight.float())
-    mixed = torch.matmul(logits.softmax(-1).unsqueeze(1), values).squeeze(1)
-    mixed = mixed.to(torch.bfloat16).float()
-    return (
-        mixed
-        * torch.rsqrt(mixed.square().mean(-1, keepdim=True) + output_eps)
-        * output_weight
-    ).to(torch.bfloat16)
+    # ``history`` is token-major ``[T, blocks, H]``.
+    return torch_attn_res_fwd(
+        layer_residual=layer.clone(),
+        block_residual=history.transpose(0, 1),
+        res_weight=res_weight,
+        rms_weight=score_weight,
+        eps=score_eps,
+        out_norm_weight=output_weight,
+        out_norm_eps=output_eps,
+        num_valid_blocks=valid_blocks,
+    )
 
 
 def _bf16_add_rne(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:

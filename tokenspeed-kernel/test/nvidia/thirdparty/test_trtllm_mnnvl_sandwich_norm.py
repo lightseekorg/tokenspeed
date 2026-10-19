@@ -42,6 +42,7 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.numerics.torch.communication import torch_sandwich_norm
 
 HIDDENS = tuple(
     int(h) for h in os.environ.get("SANDWICH_NORM_HIDDENS", "2048,4096,7168").split(",")
@@ -191,34 +192,27 @@ def _unfused(x, residual, post, weight, pair):
 
 def _staged(s, residual, post, weight, pair):
     """FP64 with the boundary's BF16 rounding points."""
-
-    def bf16(v64):
-        # FP32, then BF16: the rounding the kernels apply to an FP32 value.
-        return v64.float().to(torch.bfloat16)
-
-    def norm(v, gamma, e):
-        v64 = v.double()
-        rstd = torch.rsqrt(
-            v64.square().mean(-1, keepdim=True)
-            + float(torch.tensor(e, dtype=torch.float32))
-        )
-        return bf16(v64 * rstd * gamma.double())
-
-    xs, rs = (1.0, 1.0) if pair[0] is None else pair
-    a = norm(s, post, EPS)
-    xp = bf16(a.double() * float(torch.tensor(xs, dtype=torch.float32)))
-    rp = bf16(residual.double() * float(torch.tensor(rs, dtype=torch.float32)))
-    res = bf16(xp.double() + rp.double())
-    return norm(res, weight, EPS), res, xp, rp
+    return _sandwich(s, residual, post, weight, pair, True)
 
 
 def _exact(s, residual, post, weight, pair):
-    def norm(v, gamma, e):
-        return v * torch.rsqrt(v.square().mean(-1, keepdim=True) + e) * gamma.double()
+    out, res, _, _ = _sandwich(s, residual, post, weight, pair, False)
+    return out, res
 
+
+def _sandwich(s, residual, post, weight, pair, round_bf16):
     xs, rs = (1.0, 1.0) if pair[0] is None else pair
-    res = norm(s.double(), post, EPS) * xs + residual.double() * rs
-    return norm(res, weight, EPS), res
+    return torch_sandwich_norm(
+        s,
+        residual,
+        post,
+        weight,
+        post_eps=EPS,
+        eps=EPS,
+        x_scale=xs,
+        residual_scale=rs,
+        round_bf16=round_bf16,
+    )
 
 
 def _ulp(v):

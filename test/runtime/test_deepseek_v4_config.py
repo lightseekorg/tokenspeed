@@ -19,6 +19,10 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.residual import (
+    torch_mhc_post,
+    torch_mhc_pre,
+)
 from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_indexer_topk_prefill,
     indexer_topk_prefill,
@@ -100,17 +104,6 @@ def _fake_pool(*group_specs, **arena_attrs) -> SimpleNamespace:
     )
 
 
-def _mhc_sinkhorn_reference(
-    mixes: torch.Tensor, iters: int, eps: float
-) -> torch.Tensor:
-    mixes = torch.softmax(mixes, dim=-1) + eps
-    mixes = mixes / (mixes.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(iters - 1):
-        mixes = mixes / (mixes.sum(dim=-1, keepdim=True) + eps)
-        mixes = mixes / (mixes.sum(dim=-2, keepdim=True) + eps)
-    return mixes
-
-
 def _mhc_pre_reference(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -120,41 +113,17 @@ def _mhc_pre_reference(
     hc_eps: float,
     sinkhorn_iters: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_tokens, hc_mult, _ = residual.shape
-    x = residual.flatten(1).float()
-    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + rms_eps)
-    mixes = F.linear(x, fn.float()) * rsqrt
-    pre_raw, post_raw, comb_raw = torch.split(
-        mixes, [hc_mult, hc_mult, hc_mult * hc_mult], dim=-1
-    )
-    pre_base, post_base, comb_base = torch.split(
-        hc_base.float(), [hc_mult, hc_mult, hc_mult * hc_mult], dim=-1
-    )
-    pre = torch.sigmoid(pre_raw * hc_scale[0].float() + pre_base) + hc_eps
-    post = (torch.sigmoid(post_raw * hc_scale[1].float() + post_base) * 2.0).unsqueeze(
-        -1
-    )
-    comb = _mhc_sinkhorn_reference(
-        comb_raw.reshape(num_tokens, hc_mult, hc_mult) * hc_scale[2].float()
-        + comb_base.reshape(1, hc_mult, hc_mult),
-        sinkhorn_iters,
+    return torch_mhc_pre(
+        residual,
+        fn.float(),
+        hc_scale,
+        hc_base,
+        rms_eps,
         hc_eps,
+        sinkhorn_iters,
+        None,
+        None,
     )
-    layer_input = torch.sum(pre.unsqueeze(-1) * residual.float(), dim=1)
-    return layer_input.to(residual.dtype), post, comb
-
-
-def _mhc_post_reference(
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-) -> torch.Tensor:
-    if post.dim() == 2:
-        post = post.unsqueeze(-1)
-    mixed_residual = torch.einsum("tnm,tnh->tmh", comb.float(), residual.float())
-    block_update = post.float() * hidden_states.float().unsqueeze(1)
-    return (mixed_residual + block_update).to(hidden_states.dtype)
 
 
 class TestDeepseekV4Config:
@@ -1819,7 +1788,7 @@ class TestDeepseekV4Config:
             hc_eps=1e-6,
             sinkhorn_iters=2,
         )
-        updated = _mhc_post_reference(layer_input, residual, post, comb)
+        updated = torch_mhc_post(layer_input, residual, post, comb)
 
         assert (tuple(layer_input.shape)) == ((tokens, hidden))
         assert (tuple(post.shape)) == ((tokens, hc_mult, 1))
@@ -1883,7 +1852,7 @@ class TestDeepseekV4Config:
         post = torch.tensor([[[0.5], [0.25]]], dtype=torch.float32)
         comb = torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32)
 
-        updated = _mhc_post_reference(hidden_states, residual, post, comb)
+        updated = torch_mhc_post(hidden_states, residual, post, comb)
 
         expected = torch.empty_like(residual)
         expected[:, 0] = (

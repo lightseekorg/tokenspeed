@@ -25,6 +25,7 @@ DEEPSEEK_V41_REFERENCE_DIR enables JSON-only local checkpoint coverage.
 
 import json
 import os
+import sys
 from pathlib import Path
 from test.runtime.test_deepseek_v41_engram import _mapping
 from test.runtime.test_deepseek_v41_model import (
@@ -76,6 +77,11 @@ from tokenspeed.runtime.models.deepseek_v41_dspark import (
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.hf_transformers_utils import get_config
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
 @pytest.mark.parametrize(

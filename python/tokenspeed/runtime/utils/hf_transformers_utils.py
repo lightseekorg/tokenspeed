@@ -103,6 +103,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     NemotronHConfig.model_type: NemotronHConfig,
     NemotronHOmniConfig.model_type: NemotronHOmniConfig,
     MuseSparkConfig.model_type: MuseSparkConfig,
+    "nemotron_h_omni": NemotronHOmniConfig,
     "glm5_next": Glm53FlashConfig,
 }
 
@@ -540,6 +541,8 @@ def get_config(
         "Qwen3ASRConfig",
         "MiniMaxM3SparseForConditionalGeneration",
         "NemotronH_Nano_Omni_Reasoning_V3",
+        "NemotronH_Omni_Reasoning_V3",
+        "NemotronH_Omni_Reasoning_V3NextN",
         "NemotronHOmniConfig",
     ]:
         if config is text_config:

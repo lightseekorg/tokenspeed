@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from fused_boundary_reference import armed_mailbox, assert_child_keeps_waiting
+from fused_boundary_helpers import armed_mailbox, assert_child_keeps_waiting
 from tokenspeed_kernel.ops.layernorm import affine_rmsnorm
 from tokenspeed_kernel.ops.quantization import rmsnorm_nvfp4_quant
 from tokenspeed_kernel.platform import current_platform

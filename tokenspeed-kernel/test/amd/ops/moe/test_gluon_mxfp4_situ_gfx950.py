@@ -25,10 +25,8 @@ from unittest import mock
 
 import pytest
 import torch
-from kimi3_reference import (
-    dequantize_mxfp4,
-    mxfp4_moe_reference,
-)
+from tokenspeed_kernel.numerics.torch.moe import mxfp4_situ_moe_experts
+from tokenspeed_kernel.numerics.torch.quantization import dequantize_mxfp4
 from utils import is_cdna4, make_mxfp4_moe_weights, make_round_robin_topk
 
 if not is_cdna4():
@@ -279,7 +277,7 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
     local_weights = torch.where(
         local_mask, topk_weights, torch.zeros_like(topk_weights)
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -351,7 +349,7 @@ def test_ep_decode_unsupported_a16_shape_uses_a8_fallback_gfx950(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -405,7 +403,7 @@ def test_gdot_decode_accepts_padded_w2_scale_gfx950() -> None:
         situ_beta=4.0,
         situ_linear_beta=25.0,
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -499,7 +497,7 @@ def test_ep_unclipped_situ_uses_a16_fallback_gfx950() -> None:
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -621,7 +619,7 @@ def test_gluon_grouped_a16w4_situ_matches_kimi_k3_shape_gfx950() -> None:
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -690,7 +688,7 @@ def test_grouped_atomic_combine_matches_partial_reduction_gfx950(
     )
     atomic = run()
 
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -816,7 +814,7 @@ def test_gluon_grouped_device_align_localizes_global_ep_routes_gfx950() -> None:
         topk_weights,
         torch.zeros_like(topk_weights),
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         module.w13_weight,
         module.w13_weight_scale,
@@ -899,7 +897,7 @@ def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
         )
     actual = torch.stack([partial.float() for partial in partials]).sum(0)
     actual = actual.to(torch.bfloat16)
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -1082,7 +1080,7 @@ def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -1450,7 +1448,7 @@ def test_package_prefill_intermediate_padding_gfx950(
         situ_beta=4.0,
         situ_linear_beta=25.0,
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -1997,7 +1995,7 @@ def test_ep_situ_package_prefill_matches_reference_gfx950(
         topk_weights,
         torch.zeros_like(topk_weights),
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -2226,7 +2224,7 @@ def test_situ_warp_decode_matches_reference_above_old_bound_gfx950(
         topk_weights,
         torch.zeros_like(topk_weights),
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -2428,7 +2426,7 @@ def test_sorted_situ_dispatch_and_compilation_gfx950(monkeypatch, intermediate_s
             situ_beta=4.0,
             situ_linear_beta=25.0,
         )
-        expected = mxfp4_moe_reference(
+        expected = mxfp4_situ_moe_experts(
             x,
             raw["w13_weight"],
             raw["w13_scale"],

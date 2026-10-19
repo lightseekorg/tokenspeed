@@ -25,7 +25,9 @@ import math
 
 import pytest
 import torch
-import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.attention.mamba2 import (
+    torch_mamba2_recurrence,
+)
 from tokenspeed_kernel.ops.attention.mamba2 import (
     build_mamba2_chunk_metadata,
     mamba2_chunk_scan,
@@ -87,21 +89,9 @@ def _inputs(tokens: int, seed: int):
 
 def _oracle(x, dt, A_log, B, C, D, dt_bias, state):
     """Token-by-token recurrence in fp64 for one sequence; returns (y, final state)."""
-    heads_per_group = x.shape[1] // B.shape[1]
-    A = -torch.exp(A_log.double())
-    s = state.double().clone()
-    ys = []
-    for t in range(x.shape[0]):
-        step = F.softplus(dt[t].double() + dt_bias.double()).clamp(*DT_LIMIT)
-        b = B[t].double().repeat_interleave(heads_per_group, dim=0)
-        c = C[t].double().repeat_interleave(heads_per_group, dim=0)
-        xt = x[t].double()
-        s = (
-            s * torch.exp(step * A)[:, None, None]
-            + (step[:, None] * xt)[:, :, None] * b[:, None, :]
-        )
-        ys.append(torch.einsum("hpn,hn->hp", s, c) + D.double()[:, None] * xt)
-    return torch.stack(ys).float(), s.float()
+    return torch_mamba2_recurrence(
+        x, dt, A_log, B, C, D, dt_bias, state, dt_limit=DT_LIMIT
+    )
 
 
 def _relative(a: torch.Tensor, b: torch.Tensor) -> float:

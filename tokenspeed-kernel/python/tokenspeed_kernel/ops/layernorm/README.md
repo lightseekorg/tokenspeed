@@ -53,7 +53,7 @@ Beam's and fixed in the kernel. A `False` constexpr emits no code for its
 block, so the default specialization of every existing launch -- the
 `qk_rmsnorm` callers of the other models --
 is unchanged (only the Triton cache key gains the two constexprs). The host
-checks the positions vector's shape, layout, dtype and device (the memory
+checks the positions vector's shape, layout, dtype, and device (the memory
 safety of the in-kernel load); the operator guard states the full admission.
 
 The admission of the Triton kernel is declared twice on purpose: as spec traits

@@ -25,6 +25,9 @@ from unittest.mock import Mock
 import pytest
 import torch
 from tokenspeed_kernel._triton import triton
+from tokenspeed_kernel.numerics.torch.attention.dsv41 import (
+    torch_dsv41_sparse_scores,
+)
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm
 from tokenspeed_kernel.ops.attention.dsv41._deep_gemm.indexer import (
@@ -149,97 +152,17 @@ def test_deferred_query_preprocessing_matches_explicit_rope(broadcast, candidate
     torch.testing.assert_close(q, original, rtol=0, atol=0)
 
 
-def _unpack_fp4(payload, scales):
-    """Decode E2M1/UE8M0 independently of the production packing kernels."""
-    values = torch.tensor(
-        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
-        device=payload.device,
-        dtype=torch.float32,
-    )
-    codes = torch.stack((payload & 15, payload >> 4), dim=-1).flatten(-2)
-    return values[codes.long()] * torch.exp2(scales.float() - 127).repeat_interleave(
-        32, -1
-    )
-
-
 def _reference_sparse_scores(queries, weights, cache, table, lengths, candidates):
-    """Independent address oracle plus DeepGEMM's documented BF16 head arithmetic.
-
-    CPU set operations establish legal unique blocks. FP4 operands are decoded
-    explicitly, then PyTorch evaluates dot products and the four BF16 partial
-    head sums used by the official sparse kernel. This checks mapping, masking
-    and arithmetic without calling the production normalization or scorer.
-    """
-    tokens, count = candidates.shape
-    alignment = deep_select_alignment()[0] // 2
-    width = (count * 8 + alignment - 1) // alignment * alignment
-    scores = torch.full(
-        (tokens, width), -torch.inf, device=cache.device, dtype=torch.bfloat16
+    """Independent address oracle plus DeepGEMM's documented BF16 head arithmetic."""
+    return torch_dsv41_sparse_scores(
+        queries,
+        weights,
+        cache,
+        table,
+        lengths,
+        candidates,
+        alignment=deep_select_alignment()[0] // 2,
     )
-    full = torch.full(
-        (tokens, table.shape[1] * 64),
-        -torch.inf,
-        device=cache.device,
-        dtype=torch.bfloat16,
-    )
-    normalized = torch.full(
-        (tokens, width // 8), -1, device=cache.device, dtype=torch.int32
-    )
-    ends = torch.zeros(tokens, device=cache.device, dtype=torch.int32)
-    exponents = (
-        queries[1].long()[..., None] >> (torch.arange(4, device=cache.device) * 8)
-    ) & 255
-    q = _unpack_fp4(queries[0], exponents)
-    tables, visible, blocks = (
-        table.cpu().tolist(),
-        lengths.cpu().tolist(),
-        candidates.cpu().tolist(),
-    )
-    for row in range(tokens):
-        end = min(max(visible[row], 0), full.shape[1])
-        chosen = sorted(
-            {
-                block
-                for block in blocks[row]
-                if 0 <= block * 8 < end
-                and 0 <= tables[row][block // 8] < cache.shape[0]
-            }
-        )
-        if not chosen:
-            continue
-        chosen = torch.tensor(chosen, device=cache.device)
-        logical = (chosen[:, None] * 8 + torch.arange(8, device=cache.device)).flatten()
-        pages = table[row, logical // 64].long()
-        offsets = logical % 64
-        payload = cache[
-            pages[:, None],
-            offsets[:, None] * 64 + torch.arange(64, device=cache.device),
-        ]
-        scales = cache[
-            pages[:, None],
-            4096 + offsets[:, None] * 4 + torch.arange(4, device=cache.device),
-        ]
-        keys = _unpack_fp4(payload, scales)
-        dots = (q[row] @ keys.T).relu().bfloat16().float()
-        partial = torch.zeros((4, logical.numel()), device=cache.device)
-        for head in range(0, 32, 4):
-            partial = (
-                (
-                    dots[head : head + 4]
-                    * weights[row, head : head + 4].float()[:, None]
-                    + partial
-                )
-                .bfloat16()
-                .float()
-            )
-        pairs = (partial[:2] + partial[2:]).bfloat16().float()
-        values = (pairs[0] + pairs[1]).bfloat16()
-        valid = logical < end
-        scores[row, : logical.numel()] = values.masked_fill(~valid, -torch.inf)
-        full[row, logical[valid]] = values[valid]
-        normalized[row, : chosen.numel()] = chosen.int()
-        ends[row] = valid.sum()
-    return scores, ends, normalized, full
 
 
 def _check_sparse_selection(selected, reference):

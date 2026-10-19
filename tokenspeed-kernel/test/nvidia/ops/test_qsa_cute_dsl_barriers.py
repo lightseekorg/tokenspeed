@@ -41,18 +41,19 @@ def _run_delayed_pv(bf16_smem_slots: int) -> None:
     original_wait = pipeline.NamedBarrier.arrive_and_wait
 
     @cute.jit
-    def delay_pv():
-        start = cute.arch.clock64()
-        now = start
-        while now - start < 200000:
-            now = cute.arch.clock64()
+    def delay_pv(barrier_id):
+        # Barrier IDs can be staged values, including the alternating PV phase.
+        if barrier_id == 2 or barrier_id == 6:
+            start = cute.arch.clock64()
+            now = start
+            while now - start < 200000:
+                now = cute.arch.clock64()
 
     @dsl_user_op
     def delayed_wait(self, *, loc=None, ip=None):
-        # Only PV waits on QK barrier 2. Let QK reach its next notification
+        # Only PV waits on QK barriers 2/6. Let QK reach its next notification
         # first, including when the same CTA advances to another query.
-        if self.barrier_id == 2:
-            delay_pv()
+        delay_pv(self.barrier_id)
         original_wait(self, loc=loc, ip=ip)
 
     def select_config(

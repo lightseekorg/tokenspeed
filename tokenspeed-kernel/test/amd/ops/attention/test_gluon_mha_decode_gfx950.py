@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.mha import torch_dense_attention
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -53,20 +54,19 @@ def _reference(
     pages_per_request = SEQUENCE_LENGTH // PAGE_SIZE
     outputs = []
     for batch_index in range(q.shape[0]):
-        start = batch_index * pages_per_request
-        stop = start + pages_per_request
-        keys = k_cache[start:stop].reshape(SEQUENCE_LENGTH, KV_HEADS, HEAD_DIM)
-        values = v_cache[start:stop].reshape(SEQUENCE_LENGTH, KV_HEADS, HEAD_DIM)
-        heads = []
-        for head in range(Q_HEADS):
-            logits = (
-                keys[:, head // (Q_HEADS // KV_HEADS)].float()
-                @ q[batch_index, head].float()
-            )
-            logits *= HEAD_DIM**-0.5
-            weights = torch.softmax(torch.cat((logits, sinks[head, None])), dim=0)[:-1]
-            heads.append(weights @ values[:, head // (Q_HEADS // KV_HEADS)].float())
-        outputs.append(torch.stack(heads))
+        pages = slice(
+            batch_index * pages_per_request, (batch_index + 1) * pages_per_request
+        )
+        out, _ = torch_dense_attention(
+            q[batch_index, None],
+            k_cache[pages].flatten(0, 1),
+            v_cache[pages].flatten(0, 1),
+            scale=HEAD_DIM**-0.5,
+            causal_offset=None,
+            window_left=None,
+            sinks=sinks,
+        )
+        outputs.append(out[0])
     return torch.stack(outputs).to(torch.bfloat16)
 
 

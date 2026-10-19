@@ -8,8 +8,12 @@ from types import SimpleNamespace
 import pytest
 import tokenspeed_kernel.ops.attention.kda as attention_ops
 import torch
-from kimi3_reference import kda_gate
-from kimi3_reference import kda_recurrent as reference_kda_recurrent
+from tokenspeed_kernel.numerics.torch.attention.kda import (
+    kda_gate,
+)
+from tokenspeed_kernel.numerics.torch.attention.kda import (
+    torch_kda_recurrent as reference_kda_recurrent,
+)
 from tokenspeed_kernel.ops.attention.kda import (
     KdaPrefillResult,
     _attention_format_signature,

@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import sys
 import tempfile
@@ -1650,6 +1651,59 @@ class TestMooncakeConfigTest:
 
 
 class TestMooncakeKvStoreTest:
+    @pytest.mark.parametrize("failure", ["temporary", "permanent", "hard", "truncated"])
+    def test_capacity_pressure_keeps_unsaved_pages_unacknowledged(self, failure):
+        class Store:
+            def __init__(self):
+                self.objects = {"existing": b"original"}
+                self.capacity_failures = 0
+
+            def batch_is_exist(self, keys):
+                return [int(key in self.objects) for key in keys]
+
+            def batch_put_from(self, keys, ptrs, sizes):
+                results = []
+                for key, ptr, size in zip(keys, ptrs, sizes):
+                    if key in self.objects:
+                        raise AssertionError(
+                            "successful immutable pages must not be rewritten"
+                        )
+                    if key == "pressure" and (
+                        failure != "temporary" or self.capacity_failures == 0
+                    ):
+                        self.capacity_failures += 1
+                        results.append(-1 if failure == "hard" else -200)
+                    else:
+                        self.objects[key] = ctypes.string_at(ptr, size)
+                        results.append(0)
+                return results[:-1] if failure == "truncated" else results
+
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = Store()
+
+        class Host(bytearray):
+            def data_ptr(self):
+                return ctypes.addressof((ctypes.c_char * len(self)).from_buffer(self))
+
+        host = Host(b"00000000abcdefgh12345678")
+        result = adapter.batch_put_from(
+            ["existing", "saved", "pressure"], host, [0, 8, 16], [8, 8, 8]
+        )
+        if failure == "temporary":
+            assert result == [True, True, True]
+            assert adapter.store.objects["pressure"] == b"12345678"
+        elif failure == "truncated":
+            assert result == [False, False, False]
+        else:
+            assert result == [True, True, False]
+            assert "pressure" not in adapter.store.objects
+        assert adapter.store.objects["existing"] == b"original"
+        assert adapter.store.objects["saved"] == b"abcdefgh"
+        # A permanent error must terminate; a capacity failure may retry.
+        assert adapter.store.capacity_failures <= 4
+        if failure == "hard":
+            assert adapter.store.capacity_failures == 1
+
     def test_non_default_tenant_is_never_silently_dropped(self):
         class _Store:
             def setup(self, *args, **kwargs):
