@@ -122,8 +122,8 @@ def get_batch_sizes_to_capture(config: ModelExecutorConfig):
         capture_bs = list(sorted(set(capture_bs + [max_bs - 1] + [max_bs])))
 
     effective_max = min(config.max_cudagraph_capture_size, max_bs)
-    capture_bs = [bs for bs in capture_bs if 0 < bs <= effective_max]
-    return capture_bs
+    # Ascending and unique: padding bisects the ladder for a batch's graph.
+    return sorted({bs for bs in capture_bs if 0 < bs <= effective_max})
 
 
 global_graph_memory_pool = None
