@@ -239,17 +239,33 @@ node-local TP2 and TP4 projections use fusion; smaller batches, batch-invariant
 collectives, and unsupported configurations retain the ordinary operations.
 
 Row counts remain runtime inputs. Prepared row buckets bound specialization
-and are warmed before graph capture, so changing batch sizes does not compile
-kernels during forward execution. Row fusion covers the prepared workspace
-capacity without a separate upper dispatch cutoff. Peer readiness is enforced
-inside the kernel; fused execution requires an isolated, fully resident grid
-and does not support concurrent workspace use or competing distributed kernels.
+and are warmed before graph capture. Intermediate buckets reduce padding;
+large buckets can skip whole padding tiles while retaining prepared strides.
+Tiles crossing owner boundaries acquire each owner's readiness and route each
+output piece to its owner. Row fusion covers the prepared workspace capacity
+without a separate upper dispatch cutoff.
 
-For row projection, each rank computes BF16 partial outputs and their owner
-sums them in FP32 before rounding to BF16. This preserves the fused numerical
-contract, though ordinary BF16 collective reductions can round differently.
-Larger batches distribute the reduction across row and output-channel tiles
-to use more of the resident grid.
+The kernel combines input exchange and quantization with a pipelined GEMM and
+output exchange. Warp groups divide computation and data movement;
+completed GEMM CTAs share reduction work through a device queue. Selected
+buckets also overlap GEMM and reduction within a CTA or share operand loads
+between CTAs. These are scheduling choices within the same execution path.
+Peer waits require a fully resident grid; concurrent workspace use and competing
+distributed kernels are unsupported.
+
+Each row-projection producer rounds its partial output to BF16. The owner sums
+partials in fixed rank order in FP32, then rounds to BF16. Ordinary BF16
+collective reductions can round differently. Negative zero marks unfinished
+receive values; produced zeros are canonicalized so readiness remains distinct
+from data without changing this reduction contract.
+
+Receive storage, including padding, is cleared before the next producer can
+write it. Input publication and consumption acknowledgements order reuse, using
+multicast when available. Some buckets consume every prepared partial, including
+padding, so completion also proves that peers finished reading the owner's
+input. Those buckets may reuse the same input layout without another peer join;
+layout changes and kernels that skip padding retain that join. Empty owners
+participate in every communication epoch.
 
 ### Padding contract
 

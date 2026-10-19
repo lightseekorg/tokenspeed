@@ -32,12 +32,22 @@ from tokenspeed_kernel.ops.communication._cute_dsl.fused_tp_projection_kernel im
 )
 
 
-def _row_bucket(rows: int) -> int:
-    """Keep small shared tiles; align larger owners to whole 128-row tiles."""
+def _row_bucket(rows: int, row_parallel: bool, world_size: int) -> int:
+    """Choose prepared row buckets without specializing each batch size."""
     if rows <= 32:
         return 32
     if rows <= 64:
         return 64
+    if row_parallel and 128 < rows <= 160:
+        return 160
+    if row_parallel and 160 < rows <= 192:
+        return 192
+    if row_parallel and world_size == 4 and 192 < rows <= 224:
+        return 224
+    if row_parallel and world_size == 4 and 512 < rows <= 576:
+        return 576
+    if row_parallel and world_size == 4 and 896 < rows <= 960:
+        return 960
     # Eight intervals per power-of-two range above 2048 bound startup work.
     step = max(128, 1 << max(0, (rows - 1).bit_length() - 4))
     return (rows + step - 1) // step * step
@@ -55,7 +65,7 @@ class FusedTPProjectionState:
         output_size: Padded output width, divisible by group size times 128.
         row_parallel: Shard GEMM input channels and reduce output partials.
 
-    Tile-aligned row buckets share storage and epochs and compile before use.
+    Prepared row buckets share storage and epochs and compile before use.
     Above 2048 rows, bucket spacing grows with capacity to bound compilation.
     Sequential layers share this storage, but supply their own weights to run.
     Concurrent models/streams require separate states. No layer weight or final
@@ -105,7 +115,7 @@ class FusedTPProjectionState:
         self.receive_width = self.shard_size * self.world_size
         self.closed = False
         self.max_rows = max_rows
-        capacity = _row_bucket(max_rows)
+        capacity = _row_bucket(max_rows, row_parallel, self.world_size)
         self.a = symm_mem.empty(
             (capacity * self.world_size, self.gemm_input_size),
             dtype=torch.float8_e4m3fn,
@@ -119,9 +129,15 @@ class FusedTPProjectionState:
         self.receive = symm_mem.empty(
             (capacity, self.receive_width), dtype=torch.bfloat16, device=device
         )
+        if row_parallel:
+            self.receive.view(torch.int16).fill_(-32768)
         self.ready = symm_mem.empty((168,), dtype=torch.int64, device=device)
         self.ack = symm_mem.empty((168,), dtype=torch.int64, device=device)
-        self.input_flags = symm_mem.empty((168,), dtype=torch.int64, device=device)
+        self.input_flags = symm_mem.empty(
+            (176 + self.world_size * 16 if row_parallel else 168,),
+            dtype=torch.int64,
+            device=device,
+        )
         for flags in (self.ready, self.ack, self.input_flags):
             flags.zero_()
         tensors = (
@@ -147,11 +163,13 @@ class FusedTPProjectionState:
             for peers in self.peer_tensors[:2]
         )
         # Every bucket addresses the same allocations with its own logical
-        # row stride. Stream order and the final peer acknowledgements protect
-        # those views when consecutive calls use different row buckets.
+        # row stride. Stream order and peer acknowledgements protect reuse;
+        # the kernel joins peers before changing the physical row stride.
         buckets = [32]
         while buckets[-1] < capacity:
-            buckets.append(_row_bucket(buckets[-1] + 1))
+            buckets.append(
+                _row_bucket(buckets[-1] + 1, self.row_parallel, self.world_size)
+            )
         self.row_views = {
             rows: (
                 from_dlpack(
@@ -170,12 +188,18 @@ class FusedTPProjectionState:
                     from_dlpack(self.receive[:rows].unsqueeze(-1), assumed_align=16),
                     *(
                         from_dlpack(
-                            t[
-                                :rows,
-                                self.rank
-                                * self.shard_size : (self.rank + 1)
-                                * self.shard_size,
-                            ].unsqueeze(-1),
+                            (
+                                t[:rows].view(self.world_size, rows, self.shard_size)[
+                                    self.rank
+                                ]
+                                if row_parallel
+                                else t[
+                                    :rows,
+                                    self.rank
+                                    * self.shard_size : (self.rank + 1)
+                                    * self.shard_size,
+                                ]
+                            ).unsqueeze(-1),
                             assumed_align=16,
                         )
                         for t in self.peer_tensors[2]
@@ -188,7 +212,31 @@ class FusedTPProjectionState:
             tuple(from_dlpack(t, assumed_align=16) for t in peers)
             for peers in self.peer_tensors[3:]
         )
-        self.ready_cute = from_dlpack(self.ready, assumed_align=16)
+        # Each rank has one cache line for input and consumption epochs.
+        # Keep remote polling available when multicast is unsupported.
+        self.input_multicast_ptr = (
+            int(self.handles[5].multicast_ptr or 0) if row_parallel else 0
+        )
+        self.peer_input_flags_local = self.peer_input_flags
+        self.peer_ack_local = self.peer_ack
+        if row_parallel:
+            self.peer_input_flags = tuple(
+                from_dlpack(t[:168], assumed_align=16) for t in self.peer_tensors[5]
+            )
+            epoch_banks = self.input_flags[176:].view(self.world_size, 16)
+            peer_epoch_banks = tuple(
+                epoch_banks[(self.rank + peer) % self.world_size]
+                for peer in range(self.world_size)
+            )
+            self.peer_input_flags_local = tuple(
+                from_dlpack(bank, assumed_align=16) for bank in peer_epoch_banks
+            )
+            # The second word records consumption; multicast makes it local.
+            if self.input_multicast_ptr:
+                self.peer_ack_local = tuple(
+                    from_dlpack(bank[1:2], assumed_align=8) for bank in peer_epoch_banks
+                )
+        self.ready_cute = from_dlpack(self.ready[:168], assumed_align=16)
         self.ack_cute = from_dlpack(self.ack, assumed_align=16)
         self.input_flags_cute = from_dlpack(self.input_flags, assumed_align=16)
         weight = torch.zeros(
@@ -205,31 +253,49 @@ class FusedTPProjectionState:
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
         self.compiled = {}
-        # This TP2 projection has 112 GEMM tiles in the 128-row bucket.
-        # Keep the grid fixed across buckets so every live epoch slot advances.
-        active_clusters = (
-            112
-            if row_parallel
-            and self.world_size == 2
-            and input_size == 12288
-            and output_size == 7168
-            else 152
-        )
+        # Smaller TP2 buckets can begin reduction before their last GEMM wave.
+        # Larger buckets use all SMs; inactive CTA epoch slots advance in CTA zero.
+        self.active_ctas = 152
         for rows in self.row_views:
+            resident_ctas = (
+                128
+                if row_parallel
+                and self.world_size == 2
+                and input_size == 12288
+                and output_size == 7168
+                and rows < 512
+                else self.active_ctas
+            )
             inputs = torch.zeros(
                 (rows, input_size), dtype=torch.bfloat16, device=device
             )
             out = torch.empty((rows, output_size), dtype=torch.bfloat16, device=device)
             # At 32 rows per rank, TP4 needs more GEMM tiles to occupy the GPU.
             tile_m = 64 if row_parallel and self.world_size == 4 and rows == 32 else 128
-            kernel = FusedTPProjectionKernel(
-                cutlass.Float32, False, (tile_m, 128), (1, 1), row_parallel=row_parallel
+            # Pair adjacent N tiles to share activation loads through TMA.
+            cluster_shape = (
+                (1, 2)
+                if row_parallel
+                and self.world_size == 4
+                and input_size == 12288
+                and output_size == 7168
+                and rows in (2048, 2304, 4096, 4608)
+                else (1, 1)
             )
-            args = self._arguments(inputs, weight, scales, rows, out)
+            kernel = FusedTPProjectionKernel(
+                cutlass.Float32,
+                False,
+                (tile_m, 128),
+                cluster_shape,
+                row_parallel=row_parallel,
+                accumulator_groups=2 if row_parallel and rows >= 128 else 1,
+                use_input_multicast=bool(self.input_multicast_ptr),
+            )
+            args = self._arguments(inputs, weight, scales, rows, out, rows)
             self.compiled[rows] = cute.compile(
                 kernel,
                 *args[:5],
-                active_clusters,
+                resident_ctas,
                 *args[5:],
                 lambda v: v,
                 options="--opt-level=2",
@@ -246,6 +312,7 @@ class FusedTPProjectionState:
         scales: torch.Tensor,
         bucket: int,
         out: torch.Tensor,
+        live_rows: int,
     ) -> tuple:
         a, sa, peers = self.row_views[bucket]
         return (
@@ -262,7 +329,7 @@ class FusedTPProjectionState:
             self.ready_cute,
             self.peer_ready,
             self.ack_cute,
-            self.peer_ack,
+            self.peer_ack_local,
             cutlass.Int32(self.rank),
             from_dlpack(inputs, assumed_align=16).mark_compact_shape_dynamic(
                 mode=0, stride_order=inputs.dim_order()
@@ -270,7 +337,13 @@ class FusedTPProjectionState:
             self.input_peers,
             self.scale_peers,
             self.input_flags_cute,
-            self.peer_input_flags,
+            (
+                self.peer_input_flags_local
+                if self.row_parallel and bucket >= 160 and self.input_multicast_ptr
+                else self.peer_input_flags
+            ),
+            cutlass.Int64(self.input_multicast_ptr),
+            cutlass.Int32(live_rows),
         )
 
     def run(
@@ -291,7 +364,8 @@ class FusedTPProjectionState:
         ):
             raise ValueError("Fused TP projection counts exceed prepared capacity")
         rows = owner_rows[self.rank]
-        bucket = _row_bucket(max(owner_rows))
+        live_rows = max(owner_rows)
+        bucket = _row_bucket(live_rows, self.row_parallel, self.world_size)
         for tensor, shape, dtype in (
             (inputs, (rows, self.input_size), torch.bfloat16),
             (weight, (self.shard_size, self.gemm_input_size), torch.float8_e4m3fn),
@@ -311,7 +385,7 @@ class FusedTPProjectionState:
             ):
                 raise ValueError("Incompatible fused TP projection tensor")
         self.compiled[bucket](
-            *self._arguments(inputs, weight, weight_scales, bucket, out)
+            *self._arguments(inputs, weight, weight_scales, bucket, out, live_rows)
         )
         return out
 
@@ -325,6 +399,8 @@ class FusedTPProjectionState:
         self.row_views = {}
         self.input_peers = self.scale_peers = ()
         self.peer_ready = self.peer_ack = self.peer_input_flags = ()
+        self.peer_input_flags_local = self.peer_ack_local = ()
+        self.input_multicast_ptr = 0
         self.ready_cute = self.ack_cute = self.input_flags_cute = None
         self.peer_tensors = ()
         self.handles = []
