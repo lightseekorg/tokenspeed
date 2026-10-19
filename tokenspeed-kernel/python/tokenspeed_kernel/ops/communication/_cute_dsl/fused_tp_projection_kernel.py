@@ -4181,11 +4181,6 @@ class FusedTPProjectionKernel:
         row_tiles = cute.ceil_div(rows, reduction_rows)
         fragment = cute.make_rmem_tensor((8,), self.c_dtype)
         accum = cute.make_rmem_tensor((8,), cutlass.Float32)
-        cleared = cute.make_rmem_tensor((8,), self.c_dtype)
-        cleared_bits = cute.recast_tensor(cleared, cutlass.Uint16)
-        # Clear padding as well as live rows. Every bucket reuses this storage;
-        # the peer acknowledgement orders these clears before its next write.
-        cleared_bits.fill(cutlass.Uint16(0x8000))
         if tid == 0:
             queue_epoch = cute.arch.load(
                 ready.iterator + 2, cutlass.Int64, sem="acquire", scope="gpu"
