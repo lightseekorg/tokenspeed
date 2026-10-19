@@ -34,7 +34,7 @@ class QSAWorkspace:
     """
 
     def __init__(self) -> None:
-        self.runners: dict[tuple[torch.device, int], Any] = {}
+        self.runners: dict[torch.device, Any] = {}
 
     def clear(self) -> None:
         """Release cached eager plans and scratch without invalidating graphs."""

@@ -58,7 +58,7 @@ class _PrimTSQSAPlan:
 
 
 class _PrimTSQSARunner:
-    """Per-pool plans sharing a growable workspace on one CUDA stream.
+    """Per-pool plans sharing a growable workspace on one device.
 
     Plans retain cache views and route offsets, but no request-owned history.
     Packed queries supply their offsets separately. With split_kv=False,
@@ -211,15 +211,13 @@ class _PrimTSQSARunner:
         )
 
 
-def _get_runner(
-    workspace: QSAWorkspace, device: torch.device, stream: int
-) -> _PrimTSQSARunner:
-    # Stream identity separates mutable workspaces used concurrently.
-    key = (device, stream)
-    runner = workspace.runners.get(key)
+def _get_runner(workspace: QSAWorkspace, device: torch.device) -> _PrimTSQSARunner:
+    # Calls, including graph replays, must be ordered across streams because
+    # the runner shares mutable scratch on this device.
+    runner = workspace.runners.get(device)
     if runner is None:
         runner = _PrimTSQSARunner(device)
-        workspace.runners[key] = runner
+        workspace.runners[device] = runner
     return runner
 
 
@@ -245,6 +243,6 @@ def qsa_attention(
     Returns:
         A new BF16 output tensor with the query shape.
     """
-    return _get_runner(
-        metadata.workspace, q.device, torch.cuda.current_stream(q.device).cuda_stream
-    ).run(q, k_cache, v_cache, metadata, scale=scale, v_scale=v_scale)
+    return _get_runner(metadata.workspace, q.device).run(
+        q, k_cache, v_cache, metadata, scale=scale, v_scale=v_scale
+    )

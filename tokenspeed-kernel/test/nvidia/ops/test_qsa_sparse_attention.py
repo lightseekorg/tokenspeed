@@ -571,6 +571,51 @@ def test_prims_qsa_replays_live_candidates(device):
     )
 
 
+@pytest.mark.parametrize("query_width", [None, 1, 4])
+def test_prims_qsa_reuses_plan_across_ordered_streams(query_width, device):
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("PrimTS QSA requires SM100 or SM103")
+    q, k, v, slots, metadata = _prims_case(
+        lengths=(5, 3) if query_width is None else (query_width, query_width),
+        prefixes=(257, 29),
+        kv_heads=1,
+        shared_candidates=False,
+        block_size=4,
+        device=device,
+    )
+    kwargs = dict(
+        scale=1 / 16,
+        max_seqlen_q=query_width,
+        metadata_capacity_rows=None,
+        k_scale=None,
+        v_scale=None,
+        override=None,
+        solution="flashinfer_prims",
+        sparse_metadata=metadata,
+    )
+    warmup_stream = torch.cuda.Stream()
+    capture_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        qsa_sparse_attention(q, k, v, slots, **kwargs)
+    capture_stream.wait_stream(warmup_stream)
+    graph = torch.cuda.CUDAGraph()
+    # Capture on another stream without repeating warmup there.
+    with capture_session(graph), torch.cuda.graph(graph, stream=capture_stream):
+        captured = qsa_sparse_attention(q, k, v, slots, **kwargs)
+    warmup_stream.wait_stream(capture_stream)
+    with torch.cuda.stream(warmup_stream):
+        q.mul_(0.5)
+        eager = qsa_sparse_attention(q, k, v, slots, **kwargs)
+    capture_stream.wait_stream(warmup_stream)
+    with torch.cuda.stream(capture_stream):
+        graph.replay()
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    expected = _reference(q, k, v, slots, 1 / 16)
+    torch.testing.assert_close(eager, expected, atol=4e-3, rtol=1e-2)
+    torch.testing.assert_close(captured, expected, atol=4e-3, rtol=1e-2)
+
+
 def test_prims_qsa_captures_many_layers_and_releases_cache_storage(device):
     if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
         pytest.skip("PrimTS QSA requires SM100 or SM103")
