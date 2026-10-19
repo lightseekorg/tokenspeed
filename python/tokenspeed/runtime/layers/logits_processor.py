@@ -563,7 +563,7 @@ class LogitsProcessor(nn.Module):
         device = lm_head.weight.device
         key = (
             self.tp_group,
-            lm_head.weight.size(0),
+            lm_head.num_embeddings_per_partition,
             max_M,
             skip_ping_pong,
             dtype,
