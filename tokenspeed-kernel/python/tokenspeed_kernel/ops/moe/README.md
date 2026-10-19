@@ -15,9 +15,9 @@ the same registry and public dispatchers as the other MoE operations.
 
 ## Expert placement dispatch
 
-With redundant experts (`--ep-num-redundant-experts R`) a logical expert has
+With redundant experts (`--ep-num-redundant-experts R`), a logical expert has
 several physical replicas across the EP ranks, and routing must emit physical
-ids. Under replicated-input EP every rank runs the same routing over the same
+ids. Under replicated-input EP, every rank runs the same routing over the same
 all-gathered tokens, so the replica choice has to be a pure function of the
 token row and the route rank for exactly one rank to own each (token, expert)
 pair: `replicas[logical, (row + rank) % count]`.
@@ -35,7 +35,7 @@ the call and counts the mapped ids into its load counters afterwards.
 
 Follow-up: a fused Triton kernel for the same contract (one launch instead of
 four tensor ops per MoE layer per forward). Its arguments must follow the
-compile-time parameter rule: token count, top-k and table width are runtime
+compile-time parameter rule: token count, top-k, and table width are runtime
 arguments or bucketed, never `constexpr`.
 
 ## FlashInfer adapters (`flashinfer.py`)
@@ -72,7 +72,7 @@ blocks of 64 elements. Non-gated activations still need 128.
 `thirdparty/flashinfer/trtllm_bf16_moe.py` builds a private copy of the
 installed launcher in which only that check requires 64 for gated and 128 for
 non-gated activations. It uses a source-keyed JIT
-module, private operator names and cloned entry points, and refuses a launcher
+module, private operator names, and cloned entry points, and refuses a launcher
 whose check it does not find exactly once. The BF16 TRT-LLM SiLU/SwiGLU
 kernels declare `ispp_alignment` 64 when the adapter applies to the installed
 FlashInfer and FlashInfer's JIT can compile the private module, and 128
@@ -122,22 +122,22 @@ larger token counts use the full tuner. Only the matching shape gets a separate
 tuning-cache key, so a previously cached tile-8 choice cannot bypass this
 policy without forcing unrelated shapes to retune. If FlashInfer removes
 either tuning hook, changes the cache-key builder signature, or moves runner
-construction outside the cloned entrypoints, the adapter raises an error.
+construction outside the cloned entry points, the adapter raises an error.
 
 The cache-key builder derives the policy tag from the target profile.
-During autotuning this is the profile that `p.get_opt_shapes()` selects; during
+During autotuning, this is the profile that `p.get_opt_shapes()` selects; during
 serving it is the bucket matched to the request. FlashInfer passes caller
 tensors when checking a profile, but synthesized tensors when storing its
 winner, so the cache-key builder must not compute token-dependent tags from
 those tensors. A scoped hook on FlashInfer's shared cache-key builder adjusts
-only the private runner's keys. Other runners, cache persistence and
+only the private runner's keys. Other runners, cache persistence, and
 measurement remain unchanged. Different token profiles continue to store
 independent winners.
 
 This is a temporary workaround for FlashInfer 0.7's MoE tactic selection.
 When upstream tuning handles the full decode graph, remove it.
 
-The policy targets CUDA-graph latency across routing, shared experts and MoE
+The policy targets CUDA-graph latency across routing, shared experts, and MoE
 GEMMs. On the measured BS1 MTP3 graph, FlashInfer 0.7's isolated-kernel tuner
 selected tile 8, leaving an idle interval before routing. This policy keeps
 tile 32 available for that shape while retaining upstream routing and GEMM
@@ -169,7 +169,7 @@ allocated or grown, and reused across layers and calls. Left to allocate its
 own scratch per call, the SM90 chain read bytes it never wrote: for some
 (EP rank, routing) combinations the rank's routed output was NaN for finite
 inputs, reproducibly for that call, while the identical call with any
-caller-provided buffer matched the fp32 reference. Stream ordering serializes
+caller-provided buffer matched the FP32 reference. Stream ordering serializes
 consecutive MoE layers through their activations, so one buffer per device
 is never in use by two calls at once; a model that overlapped two MoE calls on
 separate streams would need one buffer per stream. PDL stays off in this
@@ -183,7 +183,7 @@ activations quantized per token) on FlashInfer's
 `trtllm_fp8_per_channel_scale_moe`. The kernel reads the per-row scales in the
 weights' own resident row order, so the weight preprocessor moves every scale
 with its row: the `[gate | up]` to `[up | gate]` swap, the gated-activation
-interleave and the epilogue-tile shuffle. Its per-expert output scalars stay 1.
+interleave, and the epilogue-tile shuffle. Its per-expert output scalars stay 1.
 Each rank pads its own intermediate partition to a multiple of 64 with zero rows
 and columns whose scales are 1, so a rank's channels do not move and the padding
 adds exactly zero, also to the per-route FC2-input quantization. Partitions that
@@ -251,13 +251,13 @@ added in FP32. It is a different arithmetic contract, not an equivalent of
 | Output scale | `output_scale` | Must be 1 |
 
 `MoELayer` accepts it for BF16 unquantized SiLU experts with DeepSeekV3
-routing, without expert bias, all-to-all, `--moe-combine-order slot` or an
+routing, without expert bias, all-to-all, `--moe-combine-order slot`, or an
 output scale. The policy asks `moe_plan` for `fp32_correction_bias`: the plan
 routes inside the kernel (`flashinfer_trtllm_unquant_moe_apply`) when the
 kernel's hook builds FlashInfer's routing with the FP32 bias
 (`thirdparty/flashinfer/trtllm_bf16_moe.py`), and otherwise plans precomputed
 top-k (`flashinfer_trtllm_unquant_routed_moe_apply`), where the caller's
-router adds the bias in FP32. Under expert parallelism the layer plans
+router adds the bias in FP32. Under expert parallelism, the layer plans
 precomputed top-k. In the kernel, `routing_config["routed_scaling_factor"]`
 is applied to the BF16 route weights; on precomputed routes the caller folds
 it into the FP32 route weights (Beam: in its route epilogue). The intermediate size per partition must be a
@@ -286,7 +286,7 @@ groups, the top 8 experts of the kept groups, their unbiased scores renormalized
 - `_triton/router_select.triton_router_route_lanepar` runs them in one launch,
   one row per program on one warp, byte for byte: the FP32 sigmoid with Torch's
   CUDA recipe (libdevice `exp`, inline `add.rn.f32` / `div.rn.f32`, no FTZ), the
-  grouped selection with Torch's radix keys, fill order and trimmed bitonic
+  grouped selection with Torch's radix keys, fill order, and trimmed bitonic
   network (`_triton/grouped_select.py`; the tie permutation is the pinned
   Torch's), and the epilogue with the sum in Torch's CUDA K8 order
   `((v0+v4)+(v2+v6)) + ((v1+v5)+(v3+v7))` (`_triton/route_epilogue.py`). Its host
@@ -299,7 +299,7 @@ Beam calls the Triton kernel on NVIDIA SM100 to SM103 where the guard admits the
 call and the Torch statements otherwise. The GPU tests
 (`test/nvidia/ops/moe/test_router_select_cuda.py`) pin Torch's FP32 sigmoid and
 K8 sum order first (a mismatch fails, never skips), then compare the two byte for
-byte on random rows, tie, edge and NaN corpora and in CUDA-graph replay.
+byte on random rows, tie, edge, and NaN corpora and in CUDA-graph replay.
 
 ## Routing weight storage and deferred finalize
 
