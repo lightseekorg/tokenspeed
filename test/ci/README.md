@@ -41,10 +41,10 @@ The NVIDIA B200 Tests and AMD Tests workflows run unit tests before model
 tests. AMD kernel benchmarks run in the separate AMD Kernel Benchmark workflow,
 concurrently with unit tests. Matrix entries within
 each stage run in parallel. The workflow treats a stage with no matching tasks
-as successfully satisfied.
+as satisfied.
 
 On NVIDIA runners, `ut-tokenspeed-kernel-part-i` runs tests outside
-`tokenspeed-kernel/test/ops/`, keeping the numerics, TRT-LLM communication and
+`tokenspeed-kernel/test/ops/`, keeping the numerics, TRT-LLM communication, and
 CUDA suites in separate processes. `ut-tokenspeed-kernel-part-ii` runs
 `tokenspeed-kernel/test/ops/`. Together the two tasks cover the kernel suite
 once. AMD runners run the same commands in the single `ut-tokenspeed-kernel`
@@ -280,19 +280,19 @@ files with `test/ci_system/ci_path_filter.py --runner-group <group>` and skips
 its GPU matrix jobs when nothing requires that runner group. The first
 matching rule decides (`ci_path_filter.py` holds the full lists):
 
-* Markdown files require no runner group.
-* Vendor-owned paths (`tokenspeed-kernel-amd/`, `tokenspeed-mla/`, the
+- Markdown files require no runner group.
+- Vendor-owned paths (`tokenspeed-kernel-amd/`, `tokenspeed-mla/`, the
   `tokenspeed-kernel/test/<vendor>/` subtrees, and vendor-specific requirements
   and CI scripts) require only that vendor's runner groups.
-* The scan job classifies kernel sources by solution name: names such as
+- The scan job classifies kernel sources by solution name: names such as
   `cuda`, `cute_dsl`, `flashinfer`, `deep_gemm`, and `trtllm` are NVIDIA;
   `gluon` is AMD. A vendor-named file whose content mentions another vendor
   stays shared.
-* `test/ci` task YAMLs require only the runner groups matching their
+- `test/ci` task YAMLs require only the runner groups matching their
   `runner.labels`.
-* Other paths under `python/`, `test/`, `tokenspeed-kernel/`, and
+- Other paths under `python/`, `test/`, `tokenspeed-kernel/`, and
   `tokenspeed-scheduler/` require every runner group.
-* Each workflow's own YAML requires only its runner group; `workflow_dispatch`
+- Each workflow's own YAML requires only its runner group; `workflow_dispatch`
   always runs.
 
 PR and push diffs containing only `test/ci/**/*.yaml` run only the changed tasks,
@@ -530,7 +530,7 @@ The preflight fails if an out-of-cluster Docker workload is already using the
 GPUs, because Kubernetes cannot account for those allocations.
 
 Pier's restricted egress proxy permits the agent to reach only the runner Pod
-IP on HTTP port 80. Kimi Code receives the local Tokenspeed endpoint through
+IP on HTTP port 80. Kimi Code receives the local TokenSpeed endpoint through
 `KIMI_MODEL_*`. Task containers retain DeepSWE's `no-network` policy. The
 workflow fails on incomplete/error trials and optionally on a binary-reward
 minimum. The default minimum is zero because a 10-task sample is not a stable
@@ -747,16 +747,16 @@ on the compute node.
 ### Retry unsuccessful Slurm cases
 
 Open **Actions → Retry Failed CI Cases → Run workflow** and enter the run URL
-or ID (for example `34550905154`) in `source_run`. The latest completed attempt
+or ID (for example, `34550905154`) in `source_run`. The latest completed attempt
 of **Slurm Dispatch**, or a previous retry, supplies the failed cases.
 The workflow skips only `COMPLETED` cases with exit code zero and `ok: true`.
 Retries reuse the original submission scripts and source snapshot, preserving
-the tested commit, image, configuration and GPU allocation. The original
+the tested commit, image, configuration, and GPU allocation. The original
 report artifact and coordinator's `scripts/` and `snapshots/` must still exist.
 The existing Slurm Dispatch scheduler defaults and PR installation mode apply.
 On retry, the workflow updates the known PyYAML bootstrap command to use the
 mounted pip cache, a 120-second socket timeout, and at most three installation
 attempts 10 seconds apart. Exhausted attempts stop before evaluation. This
 only changes dependency download handling. Retained files, source commit,
-image and test configuration stay unchanged.
+image, and test configuration stay unchanged.
 For workflows with one case per GitHub job, use **Re-run failed jobs**.

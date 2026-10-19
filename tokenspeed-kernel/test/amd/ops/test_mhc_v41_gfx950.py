@@ -180,6 +180,7 @@ def test_gluon_mhc_streams_no_recompile_across_batches() -> None:
                 pre[:tokens],
                 norm_weight=norm_weight,
                 norm_eps=norm_eps,
+                quantize=False,
             )
 
     run(1)

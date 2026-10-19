@@ -129,9 +129,8 @@ if platform.is_amd:
             hash_indices_table,
             input_ids,
             need_scores,
+            routed_scaling_factor,
         )
-        if routed_scaling_factor != 1.0:
-            weights = weights * routed_scaling_factor
         return weights.to(weights_dtype), ids, scores
 
 

@@ -47,13 +47,13 @@ files with the checkpoint. Pass a custom filename pattern through
 `{"pattern": "model-rank-{rank}-part-{part}.safetensors"}`. The serving CLI does
 not expose this loader or its extra configuration.
 
-## Sparse KV Offloading
+## Sparse KV offloading
 
 `--kv-offload-config` accepts a JSON object with four required fields:
 `layers` (unique target attention layer IDs), `hot_tokens` (a positive power of
 two), `host_gb` (a finite positive budget in GiB), and `overlap` (an explicit
 boolean enabling cross-layer prefetch). Omitting the argument disables offload.
-The model cache recipe validates supported fields, selection capacity and
+The model cache recipe validates supported fields, selection capacity, and
 execution constraints; unsupported recipes reject the configuration.
 
 Model-specific behavior stays in `--hf-overrides`. For a plugin supporting a
@@ -64,7 +64,7 @@ overlap, or change numerical settings implicitly.
 
 Offloading uses capacity aborts instead of snapshot recovery. Its snapshot
 pool is disabled automatically; positive snapshot sizes, snapshot request
-caps and `--debug-force-retraction-interval` are rejected. Under decode
+caps, and `--debug-force-retraction-interval` are rejected. Under decode
 memory pressure the scheduler releases the victim's history blocks and
 request slot and reports `CapacityAbort` to the client. A client that wants
 to continue must submit a new request. The fixed hot allocation persists;
@@ -174,7 +174,8 @@ chunked-prefill chunks, and ships them once, on the first frame after the
 prompt finished. A request that returns them from position `s` skips the
 prefix cache for positions `>= s`, so the engine recomputes those positions
 and always has logits for them. Positions before `s` reuse the cache as
-usual. Mixed prefill/decode batches (`--enable-mixed-batch`) are supported.
+usual. Mixed prefill/decode batches (`--enable-mixed-batch`) are supported
+where the selected parallelism configuration permits them.
 A NaN or infinite prompt logprob terminates the request with a
 `NumericalError` exactly like NaN logits on a sampled token
 (`--enable-nan-detection`). The response never carries a non-finite value.
@@ -320,7 +321,7 @@ update everywhere. A rank whose peer never receives the op waits
 indefinitely, as with `/flush_cache`. The design rationale is in
 `docs/design/event-loop.md`.
 
-Only the three loads (distributed, Mooncake and disk) take the frontend's
+Only the three loads (distributed, Mooncake, and disk) take the frontend's
 model-update writer lock (the lock keeps generation out while the load
 rewrites parameters). `init_weights_update_group` and
 `destroy_weights_update_group` rewrite nothing and do not wait for in-flight
@@ -436,7 +437,7 @@ for gateway discovery.
 | `--prefill-graph-capture-batch-sizes` | Request capacities for inline KDA prefill capture. Replay selects the smallest compatible capacity that fits the batch. |
 | `--retraction-snapshot-host-gb` | Explicit size, in gigabytes, of the per-rank pinned Host pool that holds a retraction image's tail (a retracted request's blocks of groups Host L2 never holds, a state group's unpublished input block, and its slot state; the published blocks, the partial last page and the live state block included, go to Host L2 and stay pinned there until the request is restored; with `--disable-kvstore` the pool holds whole images). Wins over `--retraction-snapshot-ratio` when set; `0` (the default) means not set, like `--kvstore-size` against `--kvstore-ratio`. A request a capacity retraction suspends is imaged here and resumes exactly where it stopped once the image is copied back; nothing is recomputed. When no resident's image fits -- the pool or its rows are exhausted -- the scheduler aborts the newest resident instead (finish `err_type` 524, see "Retraction snapshot pool" below), so the pool bounds how much can be suspended at once, never how long an admission waits. Fused and decode roles only; the prefill and encode roles never retract and ignore it with a log. Allowed under `--kv-parallel-size > 1`. |
 | `--retraction-snapshot-ratio` | Size of the retraction snapshot pool as a multiple of this rank's Device KV capacity (the base `--kvstore-ratio` scales too), used when `--retraction-snapshot-host-gb` is not set. Unset (the default) derives the pool at device build: 0.1 of the Device KV without the Host KVStore (whole images, kept cheap to pin; `1` makes every resident suspendable), else the image tails of `--retraction-snapshot-max-requests` requests (table below). An explicit `0` is the one way to run **without a pool**: nothing can be imaged, so every capacity block aborts its victim (the newest resident). |
-| `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, i.e. the most requests suspended at once, and the request count the derived pool size is multiplied by. `0` (the default) derives to `--max-num-seqs / attention-DP size`, which covers every resident request of the rank; refused with `--retraction-snapshot-ratio 0`, which has no rows to size. When no row is free the scheduler aborts a resident rather than waiting. |
+| `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, that is, the most requests suspended at once, and the request count the derived pool size is multiplied by. `0` (the default) derives to `--max-num-seqs / attention-DP size`, which covers every resident request of the rank; refused with `--retraction-snapshot-ratio 0`, which has no rows to size. When no row is free the scheduler aborts a resident rather than waiting. |
 | `--debug-force-retraction-interval` | **Test only.** Every `N` scheduler plans retract the oldest quiescent decoding request (`N > 0`), or with `-N` the one prefilling request between its chunks, without capacity pressure, so a test run exercises the suspend/restore path on every request (the bitwise continuation oracle of [Numerics](../design/numerics.md)). Refused with `--retraction-snapshot-ratio 0` (no pool to image into). `0` (the default) is off; never set it in serving. |
 
 For pure prefill, token capacities count newly computed tokens, not cached
@@ -462,8 +463,8 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | --- | --- |
 | `--tensor-parallel-size`, `--tp` | Familiar alias for setting attention tensor parallel size. |
 | `--attn-tp-size` | Tensor parallel size for attention. |
-| `--kv-parallel-size` | KV parallelism (KVP): shard full-history KV pages (MLA/DSA latent and index-K, DeepSeek V4 compressed KV) cyclically over a consecutive subgroup of attention TP; must divide `--attn-tp-size`. Each rank then stores one shard of every request's pages, so the KV capacity per GPU grows by that factor and the DSA indexer scores only owned pages. PD roles only, each side sharding its cache independently (a transfer edge copies only the pages both its prefill rank and its decode rank own): the decode role reads the shards with `--decode-context-parallel-size` (required there, equal to this); the prefill role writes them, with or without `--query-context-parallel-size`. An aggregated engine does not shard, because its steady-state decode would be DCP. GPU MLA/DSA speculative decoding is supported within each backend's device, dtype and draft-attention capabilities: the recipe shards the draft group like the target's, FlashMLA verification uses per-query local causal lengths and GPU DSA uses causal Top-K selection; non-causal DSA block drafts remain unsupported. Not supported yet: L3 storage (`--kvstore-storage-backend`: a page-cyclic sharded group has no owner-stable L3 key). The Host KVStore and the retraction snapshot pool are supported: the scheduler allocates every Host block in its Device block's residue class and each rank copies the blocks it owns. |
-| `--decode-context-parallel-size` | Decode context parallelism (DCP) on the PD decode role: every rank attends the KV pages it owns under `--kv-parallel-size` and the partials are merged across the KVP group by their log-sum-exp (`docs/serving/parallelism.md`). Requires `--disaggregation-mode decode` and must equal `--kv-parallel-size`, which requires it in turn on that role: a sharded cache has no other decode, so the launch names the compute explicitly. The backends key the DCP path on the mapping's KVP size, which the drafter's decode-shaped steps on a sharded prefill engine take as well. 1 (default) is off. |
+| `--kv-parallel-size` | KV parallelism (KVP): shard full-history KV pages (MLA/DSA latent and index-K, DeepSeek V4 compressed KV) cyclically over a consecutive subgroup of attention TP; must divide `--attn-tp-size`. Each rank then stores one shard of every request's pages, so the KV capacity per GPU grows by that factor and the DSA indexer scores only owned pages. Aggregated and PD decode engines require matching `--decode-context-parallel-size`. PD sides shard their caches independently (a transfer edge copies only the pages both its prefill rank and decode rank own); the prefill role writes them with or without `--query-context-parallel-size`. GPU MLA/DSA speculative decoding is supported within each backend's device, dtype and draft-attention capabilities: the recipe shards the draft group like the target's, FlashMLA verification uses per-query local causal lengths and GPU DSA uses causal Top-K selection; non-causal DSA block drafts remain unsupported. Not supported yet: L3 storage (`--kvstore-storage-backend`: a page-cyclic sharded group has no owner-stable L3 key). The Host KVStore and the retraction snapshot pool are supported: the scheduler allocates every Host block in its Device block's residue class and each rank copies the blocks it owns. |
+| `--decode-context-parallel-size` | Decode context parallelism (DCP) in aggregated or PD decode engines: every rank attends the KV pages it owns under `--kv-parallel-size` and the partials are merged across the KVP group by their log-sum-exp (`docs/serving/parallelism.md`). Requires `--disaggregation-mode null` (the default) or `decode` and must equal `--kv-parallel-size`, which requires it in turn on those roles: a sharded cache has no other decode, so the launch names the compute explicitly. Aggregated DCP rejects `--enable-mixed-batch`. The backends key the DCP path on the mapping's KVP size, which the drafter's decode-shaped steps on a sharded prefill engine take as well. 1 (default) is off. |
 | `--attn-head-tp-size` | Shard the MLA head projections (`q_b_proj`, `kv_b_proj`, `o_proj`) by heads over this many contiguous ranks that hold different rows; the attention exchanges heads for tokens around its core. Over attention-DP ranks (needs attention TP 1, attention DP and `--disaggregation-mode decode`; each rank keeps its own KV) the layout serves decode rows only, so it sets `--disable-prefill-graph` and tunes on a decode step; it admits any `max_new_tokens`, because a retracted request resumes by restore rather than by a recovery prefill. Over the query shards of a prefill engine (must equal `--query-context-parallel-size`) the extend rows run the absorbed sparse prefill through the exchange and none of the decode-only rules apply. Defaults to the ranks holding the same rows: the attention TP size, or 1 (head-replicated) under `--query-context-parallel-size`. See [Parallelism](../serving/parallelism.md#decode-side-tp-layouts-under-attention-dp). |
 | `--lm-head-tp-size` | Vocab-shard the LM head over this many contiguous ranks. Under attention DP the default 1 replicates it; a wider group gathers the ranks' rows before the logits GEMM and transposes the shards back. Without attention DP it must equal the attention TP size. Not combinable with `--dp-sampling`; under attention DP, requests asking for prompt logprobs (`logprob_start_len`) are refused. |
 | `--tp-batch-invariant` | `none` (default), `attn`, or `attn+dense`: make the head-sharded `o_proj` and the dense `down_proj` column-parallel on hidden (all-gather of the reduction dim, full-K GEMM, all-to-all back to own rows) so no cross-rank sum remains outside MoE and the bits equal a TP1 full-K GEMM. `attn` needs `--attn-head-tp-size` > 1; `attn+dense` also needs a dense TP group wider than attention TP (so not under `--query-context-parallel-size`, whose dense group is 1 or the attention TP width; only `attn` applies there); both need unquantized `o_proj` / `down_proj`, judged on the checkpoint's resolved quantization (a quantized checkpoint passes when its `disable_quant_module` excludes `self_attn` and, for `attn+dense`, `dense_mlp` / `mlps`). |
@@ -494,7 +495,7 @@ split knobs.
 | `--ep-num-redundant-experts` | Extra physical expert slots per MoE layer for replicas of hot experts (`P = E + R`, must divide over the EP size; needs `ep_size > 1`). Default 0. |
 | `--init-expert-location` | `trivial` (default). Otherwise the form is decided in order: inline JSON when the value starts with `{`, a directory of per-rank `*.expert-load.pt` records (merged), an existing `.pt`/`.json` file, else a glob over record files (merged). A `logical_count` `[layers, experts]` load record derives the placement with the EPLB algorithm, a `physical_to_logical_map` `[layers, slots]` pins one exactly. |
 | `--ep-dispatch-algorithm` | How routing picks among an expert's replicas; required with any of the flags above or below. `static_with_zero_expert` for models with zero experts (LongCat), `static` otherwise; `dynamic`/`dynamic_with_zero_expert`/`fake` draw at random (refused under `--numerics rl-bitwise` and on replicated-input EP). |
-| `--eplb-algorithm` | `auto` (default), `deepseek` or `deepseek_hierarchical`. |
+| `--eplb-algorithm` | `auto` (default), `deepseek`, or `deepseek_hierarchical`. |
 | `--expert-distribution-recorder-mode` | `stat` (the only mode): count the routes to every physical expert so the `EXPERT_LOAD` profile activity (`/start_profile` ... `/stop_profile`) can write each rank's load record and `--enable-eplb` can rebalance from the counters. |
 | `--enable-eplb` | Online expert rebalancing: every `--eplb-rebalance-num-iterations` forwards the routing load since the previous snapshot is rebalanced with the EPLB algorithm and the expert weights move between slots. Requires `--expert-distribution-recorder-mode stat` and a static `--ep-dispatch-algorithm`, both explicit, and `ep_size > 1`; `--ep-num-redundant-experts 0` is allowed (permutation only). `POST /rebalance_experts` starts one rebalance now. Under a `--numerics` envelope it rides the placement-independent slot-order MoE combine the envelope folds in (`--moe-combine-order slot`). |
 | `--eplb-rebalance-num-iterations` | Forwards between two load snapshots; required with `--enable-eplb`, `> 0`. |
@@ -503,7 +504,7 @@ split knobs.
 All of these apply only to models that opt in to expert placement
 (LongCat-Flash); other models refuse them at startup. See
 [static expert placement](../serving/parallelism.md#static-expert-placement-with-redundant-experts)
-for the record → place → route flow and the two dispatch flavours, and
+for the record → place → route flow and the two dispatch flavors, and
 [dynamic expert rebalancing](../serving/parallelism.md#dynamic-expert-rebalancing)
 for the online variant.
 
@@ -512,7 +513,7 @@ for the online variant.
 | Parameter | Purpose |
 | --- | --- |
 | `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. Names are checked against the backend registry at startup, after plugins load, so an installed plugin's backends are accepted too. On SM103 (B300/GB300), `fa4` ranks below every other attention kernel: naming it here or in `--drafter-attention-backend` selects it, and the default selection is unchanged. |
-| `--drafter-attention-backend` | Attention backend for speculative decoding drafter model; accepts the same names as `--attention-backend`. |
+| `--drafter-attention-backend` | Attention backend for the speculative decoding drafter model; accepts the same names as `--attention-backend`. |
 | `--moe-backend` | MoE backend. |
 | `--moe-mxfp4-fp8-activation` | Opt-in: run MXFP4 routed experts with FP8 activations. On Hopper this is the FlashInfer cutlass W4A8 MoE (faster than the default W4A16 kernel, a few percent of extra error on expert outputs). Applies to every MXFP4 expert layer, target and draft; startup fails where the selected MoE backend has no FP8-activation kernel for a layer, when a model's routed experts are not MXFP4, when the model pins another activation precision (Kimi-K3 on Hopper Marlin), or when the layer's SwiGLU is unclamped (the W4A8 FC2 scale relies on the clamp). |
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |
@@ -582,7 +583,7 @@ parser option keeps its existing behavior.
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.
 
-### Synthetic Acceptance Length
+### Synthetic acceptance length
 
 The supported benchmark configuration is `--sampling-backend greedy`, with
 speculative decoding enabled and `--dp-sampling` and `--enable-output-logprobs`
@@ -662,7 +663,7 @@ round's verify accepts with `coin * q(x) < p(x)` and resamples from
 `norm(relu(p - q))`. Both rules serve `p`. The draft-prob rule accepts
 `1 - TV(p, q)` of the drafts, which is markedly higher than `p(argmax q)` when
 requests sample at temperature. Greedy requests behave identically under both
-rules. `top_k`, `top_p`, `min_p`, penalties and `logit_bias` stay on the
+rules. `top_k`, `top_p`, `min_p`, penalties, and `logit_bias` stay on the
 verifier's side. `q` only follows the temperature.
 
 A request admitted has no
@@ -732,7 +733,7 @@ launch method. TokenSpeed selects its grouped-convolution and candidate-selector
 runtime from the checkpoint architecture, so you need no separate algorithm
 flag. Draft proposals greedily follow the selector's transition-conditioned
 path. One Triton kernel per verify step walks it. The target's verification
-step applies a request's `temperature`, `top_k` and `top_p`, never the
+step applies a request's `temperature`, `top_k`, and `top_p`, never the
 proposal, so the served distribution is the target's whatever the drafter
 proposed.
 `DFlash2BeamDraftModel`, Beam's drafter, is a DFlash2 drafter as well.
@@ -773,9 +774,9 @@ the draft's attention to the full history.
 | `--enable-log-requests` | Log request metadata and optionally payloads. On by default; `--no-enable-log-requests` disables. |
 | `--log-requests-level` | Request logging verbosity. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
-| --enable-metrics | Enable the selected metrics reporters. |
-| --metrics-reporters | Select prometheus or an installed metric output; repeat for multiple. Defaults to prometheus. |
-| --metrics-reporter-config | JSON file mapping external reporter names to their settings. See [metric output plugins](../metrics-plugins.md). |
+| `--enable-metrics` | Enable the selected metrics reporters. |
+| `--metrics-reporters` | Select `prometheus` or an installed metric output; repeat for multiple. Defaults to `prometheus`. |
+| `--metrics-reporter-config` | JSON file mapping external reporter names to their settings. See [metric output plugins](../metrics-plugins.md). |
 | `--metrics-port` | Port for the engine's `/metrics` HTTP endpoint. Defaults to an automatically allocated free port (logged at startup). |
 | `--metrics-host` | Bind host for the `/metrics` endpoint. Defaults to `--host`. |
 | `--decode-log-interval` | Decode batch log interval. |
@@ -823,7 +824,7 @@ does not start a Prometheus endpoint.
 
 ### Prometheus metrics
 
-With --enable-metrics and the prometheus reporter, every engine process on a node (scheduler ranks and
+With `--enable-metrics` and the `prometheus` reporter, every engine process on a node (scheduler ranks and
 the tokenizer manager) writes its metrics to a node-local
 `PROMETHEUS_MULTIPROC_DIR`, and the engine's main process aggregates and
 serves them as `GET /metrics` in Prometheus text format. Scrape it at
@@ -889,7 +890,7 @@ retraction whose victim cannot be imaged aborts it instead — those are
 `tokenspeed:num_capacity_aborted_requests`, never preemptions.
 
 The cached/uncached token split (the billing split Baseten/Fireworks-style
-dashboards show) derives from existing counters, no dedicated metric needed:
+dashboards show) derives from existing counters; no dedicated metric is needed:
 
 ```promql
 cached_prompt_tokens   = tokenspeed:prefix_cache_hits_total
@@ -965,7 +966,7 @@ carry the `model_name` and `app_key` labels:
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `tokenspeed:kv_transfer_latency_seconds` | Histogram | Wall time of one KV transfer send to a peer, recorded on the prefill node (one sample per peer per transferred chunk — per layerwise interval in layerwise mode; buckets span 1 ms to 60 s). |
+| `tokenspeed:kv_transfer_latency_seconds` | Histogram | Wall time of one KV transfer send to a peer, recorded on the prefill node (one sample per peer per transferred chunk — per layerwise interval in layerwise mode, except an interval with nothing for that peer; buckets span 1 ms to 60 s). |
 | `tokenspeed:kv_transfer_timeouts_total` | Counter | Transfers that timed out, with a bounded `stage` label: `bootstrapping` (prefill never received the cache manifest; `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT`) or `waiting_for_input` (decode never received the transfer-done signal; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`). |
 | `tokenspeed:kv_transfer_failures_total` | Counter | Transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss (heartbeat) on the decode node. Timeouts are counted separately. |
 
@@ -1056,10 +1057,10 @@ blocked request. The client sees the finish `{"type": "abort", "err_type":
 524, "message": "Request aborted by the scheduler: <detail>"}`
 (`ABORT_CODE.CapacityAbort`; the detail names the shortfall -- "snapshot
 pool cannot hold the image" or "no blob slot free
-(max_retracted_requests=N)" -- and the arg to raise), distinguishable from
+(max_retracted_requests=N)" -- and the argument to raise), distinguishable from
 a NaN abort (523) or a transfer failure (521), so a caller that can retry --
 an RL rollout, a batch job -- resubmits; the engine counts them in
-`tokenspeed:num_capacity_aborted_requests`. The two args therefore size how
+`tokenspeed:num_capacity_aborted_requests`. The two arguments therefore size how
 much work may be suspended at once, and exceeding them costs an abort of
 one request, never latency for everyone else. With no pool
 (`--retraction-snapshot-ratio 0`) nothing can be imaged, so a
@@ -1211,7 +1212,7 @@ in `--kvstore-storage-backend-extra-config`, for example:
 ```
 
 Constructing `MooncakeKvStore` requires `extra_config`. Pass `None` to
-use `MOONCAKE_MASTER` / `MOONCAKE_CLIENT` and the other env defaults.
+use `MOONCAKE_MASTER` / `MOONCAKE_CLIENT` and the other environment defaults.
 
 **Prefetch before admission.** An L3 hit is never loaded under a running
 forward. When a waiting request's registered L3 keys past its Device/Host
@@ -1229,7 +1230,7 @@ timeout -- so one batch may overrun the deadline, and a hung store holds
 its active pages. Queued prefetches whose workers have not started may be
 cancelled as misses after their deadline expires; active native calls
 remain pinned until completion. The replica
-agrees (a MIN across TP, CP and PP) on the pages
+agrees (a MIN across TP, CP, and PP) on the pages
 landed, the scheduler publishes exactly that prefix in Host L2 and forgets
 the rest of the keys, and the request's admission is then an ordinary Host
 hit whose Host-to-Device load overlaps its first chunk layer by layer.
@@ -1265,7 +1266,7 @@ hit rate.
 CI exercises that Mooncake-compatible contract end-to-end (scheduler
 prefetch after `register_storage_keys` / Host eviction, and a CUDA
 D2H → store → Host wipe → prefetch → H2D round trip). A separate
-ubuntu job boots `mooncake_master` and runs
+Ubuntu job boots `mooncake_master` and runs
 `test/test_l3_mooncake_master.py` against the real TCP client
 (`P2PHANDSHAKE`). Reuse an already-running master with
 `MOONCAKE_MASTER=host:port`.

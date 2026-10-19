@@ -33,6 +33,7 @@ import math
 import os
 import re
 import sys
+import weakref
 from copy import copy
 from pathlib import Path
 from test.runtime.test_deepseek_v41_cache import R1, R2, _backend, _extend, _tables
@@ -246,8 +247,16 @@ class _DenseFFN(nn.Module):
         self.owns_ep_communication = False
 
     def forward(
-        self, x, input_ids, num_global_tokens, max_num_tokens_per_gpu, ctx, comm_manager
+        self,
+        x,
+        input_ids,
+        num_global_tokens,
+        max_num_tokens_per_gpu,
+        ctx,
+        comm_manager,
+        out=None,
     ):
+        assert out is None
         return F.linear(F.silu(x.float()).to(x.dtype), self.weight)
 
 
@@ -315,6 +324,7 @@ class _Backend:
         swa_rope_cache,
         swa_norm_weight,
         swa_norm_eps,
+        out_rope_cache,
     ):
         self.calls.append(
             (
@@ -643,7 +653,7 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
             )
             x = _norm(collapsed, norm.weight, 1e-20)
             x = (
-                sublayer(positions, x, ctx)
+                sublayer(positions, x, ctx, reduce_output=True)
                 if name == "attn"
                 else sublayer(x, None, 3, 3, None, None)
             )
@@ -691,7 +701,7 @@ def test_attention_owner_cast_index_and_grouped_output(layer_id):
     backend = _Backend(positions, requests)
     ctx = _ctx(backend, 6, ForwardMode.EXTEND)
     x = torch.randn(6, 128, dtype=torch.bfloat16)
-    actual = attn(positions, x, ctx)
+    actual = attn(positions, x, ctx, reduce_output=True)
     qr = _norm(
         F.linear(x, attn.wq_a_wkv.weight[: config.q_lora_rank]),
         attn.q_norm.weight,
@@ -1061,8 +1071,8 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
     # row-local compute in between covers every row. Emulate the handoff
     # here, where no CUDA graph can run.
     def landed(original):
-        def forward(self, positions, hidden_states, ctx):
-            out = original(self, positions, hidden_states, ctx)
+        def forward(self, positions, hidden_states, ctx, *args, **kwargs):
+            out = original(self, positions, hidden_states, ctx, *args, **kwargs)
             pad = hidden_states.shape[0] - out.shape[0]
             return (
                 torch.cat((out, out.new_zeros((pad, *out.shape[1:])))) if pad else out
@@ -1939,11 +1949,14 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         pos = torch.arange(4, device=device)
         backend = _Backend(pos, torch.zeros_like(pos))
         x = torch.randn(4, 128, dtype=torch.bfloat16, device=device)
-        out = sharded(pos, x, _ctx(backend, 4, ForwardMode.EXTEND))
+        out = sharded(pos, x, _ctx(backend, 4, ForwardMode.EXTEND), reduce_output=True)
         assert backend.calls[-1][-1] is None
         assert sharded.indexer.n_local_heads == config.index_n_heads
         expected = full(
-            pos, x, _ctx(_Backend(pos, torch.zeros_like(pos)), 4, ForwardMode.EXTEND)
+            pos,
+            x,
+            _ctx(_Backend(pos, torch.zeros_like(pos)), 4, ForwardMode.EXTEND),
+            reduce_output=True,
         )
         torch.testing.assert_close(out, expected, rtol=0.02, atol=0.003)
         # Exercise the real packed-weight MegaMoE lifecycle, not the CPU loader
@@ -2395,6 +2408,28 @@ def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse, tm
     )
 
 
+def test_post_load_can_free_the_loaded_experts(monkeypatch, tmp_path):
+    """Post-processing replaces loader-format experts (on sm90 the MXFP4
+    interleave); nothing the load built may still reference them then, or
+    every replaced tensor stays alive and the expert footprint doubles."""
+    config = _loader_config()
+    with set_default_torch_dtype(torch.bfloat16):
+        model = _loader_model(monkeypatch, config, 0, "cpu")
+    rest = _bind_engram_tables(model, _checkpoint(config), tmp_path)
+    released = []
+
+    def post_load_weights(self):
+        for module in self.modules():
+            if isinstance(module, MoELayer):
+                loaded = weakref.ref(module.w13_weight)
+                module.w13_weight = nn.Parameter(torch.empty(0), requires_grad=False)
+                released.append(loaded() is None)
+
+    monkeypatch.setattr(DeepseekV41ForCausalLM, "post_load_weights", post_load_weights)
+    model.load_weights(rest.items())
+    assert released and all(released)
+
+
 @pytest.mark.parametrize(
     "missing",
     [
@@ -2563,6 +2598,15 @@ def test_routing_matches_reference_bias_and_normalization(topk, vision, with_ima
         weight=torch.eye(4), e_score_correction_bias=bias, bias_vl=bias_vl
     )
     moe.hash_indices_dtype = torch.int64
+    moe.use_mega_moe = False
+    moe.use_gluon_petit = False
+    empty = logits[:0]
+    target = torch.empty_like(empty)
+    assert moe(empty, image_mask, 0, 0) is empty
+    assert moe(empty, image_mask, 0, 0, out=target) is target
+    moe.use_mega_moe = True
+    with pytest.raises(ValueError, match="MegaMoE does not support out"):
+        moe(empty, image_mask, 0, 0, out=target)
     router_logits, actual_bias, _, _ = moe._routing_inputs(logits, image_mask)
     weights, ids = moe_topk(
         router_logits,
@@ -2645,12 +2689,14 @@ def test_ced_q_input_follows_narrowed_rows(layer_id):
     requests = torch.zeros(6, dtype=torch.int64)
     x = torch.randn(6, 128, dtype=torch.bfloat16)
     full = _Backend(positions, requests)
-    expected = attn(positions, x, _ctx(full, 6, ForwardMode.EXTEND))
+    expected = attn(positions, x, _ctx(full, 6, ForwardMode.EXTEND), reduce_output=True)
     keep = torch.tensor([1, 3, 5])
     query = SimpleNamespace(positions=positions[keep], request_indices=requests[keep])
     view = V41DecoderView(query, None, (), keep, None)
     narrowed = _Backend(positions, requests, view)
-    actual = attn(positions, x, _ctx(narrowed, 6, ForwardMode.EXTEND))
+    actual = attn(
+        positions, x, _ctx(narrowed, 6, ForwardMode.EXTEND), reduce_output=True
+    )
     torch.testing.assert_close(actual, expected[keep], rtol=0, atol=0)
     if layer_id == 20:
         assert narrowed.global_writes[layer_id][0].shape[0] == 6
@@ -2683,6 +2729,7 @@ def test_short_history_skips_query_projections_but_preserves_keys(
         positions,
         torch.randn(4, 128, dtype=torch.bfloat16),
         _ctx(backend, 4, ForwardMode.EXTEND),
+        reduce_output=True,
     )
     assert backend.calls[-1][3:5] == (None, None)
     assert bool(backend.global_writes) == (layer_id in (2, 20))

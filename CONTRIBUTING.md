@@ -2,7 +2,7 @@
 
 TokenSpeed is intentionally built as a lean, engineering-focused infrastructure project.
 
-In spirit, TokenSpeed's development style is closer to projects like OpenAI Triton:
+In spirit, TokenSpeed's development style is closer to projects such as OpenAI Triton:
 a lean and small core team, move fast, high technical ownership, and an extremely high quality bar.
 
 As a result, the project is intentionally selective about external contributions — not out of disregard for community involvement, but because maintaining long-term simplicity, performance, and reliability matters deeply for infrastructure software.
@@ -36,7 +36,7 @@ their names are allowed.
 
 To fix an unlinked email, add and verify the address in GitHub **Settings > Emails**
 and rerun the check, or use the exact noreply address shown in those settings.
-If changing an address, amend or rebase the affected commits, update any
+If you change an address, amend or rebase the affected commits, update any
 `Co-authored-by` trailers, and push the updated branch.
 
 `Signed-off-by` is a DCO attestation and remains subject to the DCO check.

@@ -16,12 +16,12 @@ checkpoint must expose the model type `muse_spark` and the architecture
 and no-RoPE schedule from that configuration. Expert parallelism spans the
 attention TP ranks with MoE TP1. The gateway loads the checkpoint's
 `chat_template.jinja`; pass `--chat-template` only to override it. The
-residual stream, the layer boundaries and the final norm run in FP32; the
+residual stream, the layer boundaries, and the final norm run in FP32; the
 attention and MoE branch outputs and the final-norm output are BF16.
 
 `ts serve` selects the `muse` reasoning and tool parsers: the `self` channel
 becomes `reasoning_content`, `user` and `commentary` stay visible, `<|eom|>`
-closes a channel and `<|eot|>` closes the turn. The bundled gateway reads them
+closes a channel, and `<|eot|>` closes the turn. The bundled gateway reads them
 with its Symphony parser, which `ts serve` selects with `--parser symphony`;
 forced tool calls and JSON answers run through the engine's xgrammar backend,
 which `ts serve` turns on for this model (`--grammar-backend xgrammar`). These
@@ -246,7 +246,7 @@ Notes:
   target's dtype rather than the standalone fp32-to-fp16 default, because the
   two exchange hidden states and share the target's embedding and LM head.
 - Measured on 4x GB300 with the launch above: gsm8k `mean_acc` 0.9719 versus
-  0.9704 without speculative decoding (paired disagreement 10 vs 8, McNemar
+  0.9704 without speculative decoding (paired disagreement 10 versus 8, McNemar
   p ~ 0.81 -- within run-to-run noise), so the draft does not move accuracy.
 
 ## Kimi K2.5 / K2.6
@@ -303,7 +303,6 @@ tokenspeed serve nvidia/Kimi-K2.6-NVFP4 \
   --port 8000
 ```
 
-
 Official DFlash2 checkpoints that declare `DFlash2DraftModel` use the same
 `--speculative-algorithm DFLASH` launch. TokenSpeed enables their grouped
 dynamic convolutions and candidate selector automatically from the draft
@@ -318,7 +317,7 @@ Draft proposals greedily follow the selector's transition-conditioned path.
 Candidate selection takes each vocabulary shard's local top-k and gathers only
 those, instead of gathering whole logits rows, whenever the head's shards carry
 no padding or added tokens.
-The target's verification step applies a request's `temperature`, `top_k` and
+The target's verification step applies a request's `temperature`, `top_k`, and
 `top_p`, never the proposal, so the served distribution is the target's
 whatever the drafter proposed.
 
@@ -366,7 +365,7 @@ Notes:
   implementation, including each backend's preferred recurrent-state layout.
   The runtime does not transpose or reinterpret that state.
 - The NVIDIA default selects `tokenspeed_mla` (FP8 KV), whose current kernels
-  support Blackwell. On Hopper explicitly select `--attention-backend flashmla`
+  support Blackwell. On Hopper, explicitly select `--attention-backend flashmla`
   or `mla` with `--kv-cache-dtype bfloat16`. AMD uses the `mla` backend.
 - `tokenspeed serve` auto-selects the `kimi_k3` reasoning and tool-call
   parsers. Explicit parser flags override these defaults.
@@ -586,7 +585,7 @@ disabled for the BF16 or block-FP8 checkpoints. The block-FP8 path retains
 compact expert weights for its decode-specialized Gluon kernel and
 materializes BF16 expert copies once at load time for prefill. Pass
 `--sampling-backend triton`: without it AMD defaults to greedy sampling, which
-ignores per-request `temperature`, `top_p` and `top_k`.
+ignores per-request `temperature`, `top_p`, and `top_k`.
 
 ```bash
 ts serve \
@@ -601,7 +600,7 @@ ts serve \
   --speculative-num-draft-tokens 4
 ```
 
-## Qwen3 Dense / Qwen3 30B-A3B
+## Qwen3 dense / Qwen3 30B-A3B
 
 Qwen2, dense Qwen3, and Qwen3 MoE checkpoints use different architecture names.
 For Qwen3 30B-A3B, the Hugging Face config advertises `qwen3_moe` and
@@ -810,6 +809,7 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
 ```
 
 Notes:
+
 - `--low-latency-max-num-tokens-per-gpu` sizes DeepEP's NVSHMEM heap (roughly
   2.0 GB at 64, 8.1 GB at 256), and startup claims that heap after profiling
   the KV pool. An oversized value therefore fails late, when the first
@@ -866,7 +866,6 @@ with optional predictive latent embeddings (PLE), optional QSA sparse
 attention, and a one-layer MTP draft. Dense and MoE checkpoints share the same
 launch command.
 
-
 ### NVIDIA
 
 ```bash
@@ -900,7 +899,7 @@ ts serve \
     --speculative-num-steps 3
 ```
 
-The above configuration caps the batch at 16 sequences for latency; raise
+The preceding configuration caps the batch at 16 sequences for latency; raise
 `--max-num-seqs` and `--max-cudagraph-capture-size` together for throughput.
 Keep ReplaySSM, the default.
 
@@ -1159,8 +1158,8 @@ rank's base logits, and packs the best `(logit, token)` of every vocabulary
 tile into one int64 candidate. One all-gather per step shares the candidates.
 The next step's kernel (or the final resolve) reduces them to the
 `torch.argmax` winner over the whole vocabulary, ties broken toward the lowest
-token id. A five-token block is therefore six kernels and five all-gathers
-instead of a per-step chain of masked embedding lookups, GEMMs, reductions and
+token ID. A five-token block is therefore six kernels and five all-gathers
+instead of a per-step chain of masked embedding lookups, GEMMs, reductions, and
 two all-gathers.
 
 Before each forward, one pinned upload carries every request's Engram history
@@ -1203,7 +1202,7 @@ The 1P1D CI tasks set `MODEL` explicitly so both serving roles and the
 evaluation client select the same checkpoint.
 
 DeepSeek V4.1 (`deepseek_v41`) runs on its own FlatKV attention backend
-with a four-group KV cache: the global KV chains, the SWA rows and the
+with a four-group KV cache: the global KV chains, the SWA rows, and the
 compressor tails. The recipe declares the last two **replayable**: they
 never enter the prefix cache, and a prefix
 hit re-feeds the cached prefix's last 128 tokens so the model regenerates
@@ -1265,7 +1264,7 @@ prefill chunk. Two consequences:
   (FP8 activation rounding). Treat it as opt-in and confirm the served model
   on GSM8K or a similar check before relying on it.
 
-`--moe-backend marlin` keeps the previous kernel, and stays required for
+`--moe-backend marlin` keeps the previous kernel and stays required for
 DeepEP all-to-all layouts and for Kimi-K3's SiTU experts, which the CUTLASS
 epilogue does not implement.
 
@@ -1323,7 +1322,7 @@ Without `PD_SLURM=1`, the same launcher retains the single-node smoke topology.
 ## Nemotron-3 Super
 
 `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` is a Nemotron-H hybrid. Its
-88 blocks are 40 Mamba2 layers, 40 latent MoE layers and 8 grouped-query
+88 blocks are 40 Mamba2 layers, 40 latent MoE layers, and 8 grouped-query
 attention layers without positional encoding. Only the Mamba2 and attention
 blocks own cache state, so the cache plans 48 layers. The routed experts use
 squared ReLU with NVFP4 weights on the FlashInfer TRT-LLM MoE, routed inside
@@ -1365,7 +1364,7 @@ tokenspeed serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
 
 Beam (`model_type=beam`, `BeamForCausalLM`) is a mixture-of-experts model
 with 52 decoder layers: 9 full-attention layers and 43 sliding-window layers
-with a 512-token window. Its BF16, FP8 and NVFP4 checkpoints run with the same
+with a 512-token window. Its BF16, FP8, and NVFP4 checkpoints run with the same
 command: the checkpoint's own quantization config selects the path, with no
 flag. Use these supported Hub revisions:
 
@@ -1399,9 +1398,10 @@ ts serve --model <beam-checkpoint-dir> \
   --host 0.0.0.0 --port 8000
 ```
 
-Without `--served-model-name`, the API model id is the full checkpoint path.
+Without `--served-model-name`, the API model ID is the full checkpoint path.
 
 Notes:
+
 - Serving requires `--dtype bfloat16`. Beam's flag-free defaults, the `trtllm`
   attention backend and the `flashinfer_trtllm` MoE backend, apply on NVIDIA
   SM100 to SM103 and were validated on SM100 (GB200) only. Beam serves without
@@ -1422,7 +1422,8 @@ The first start on a fresh machine tunes kernels for 30 to 45 minutes; pass
 `--engine-startup-timeout 5400`. Later starts reuse the caches.
 
 API notes:
-- Reasoning effort is `low`, `medium` (the default), `high`, `xhigh` or `max`.
+
+- Reasoning effort is `low`, `medium` (the default), `high`, `xhigh`, or `max`.
 - Keep `--grammar-backend xgrammar`. With it, the bundled gateway constrains
   every Beam turn to Beam's output format, including tool calls under
   `tool_choice: auto`, forced tool choice (`required` or a named function) and
@@ -1430,7 +1431,7 @@ API notes:
 
 For batches above 160, or above 80 with the drafter, set all three scheduling
 and graph flags. For 512 requests, use `--max-num-seqs 512`,
-`--max-cudagraph-capture-size 512` and
+`--max-cudagraph-capture-size 512`, and
 `--cudagraph-capture-sizes 1 8 32 64 128 160 256 384 512`. Setting only the
 first one or two leaves larger decode batches outside the captured graph list.
 
