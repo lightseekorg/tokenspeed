@@ -178,7 +178,7 @@ TS_DEVICE uint32_t extract_exact_bin(float x) {
   // Keep the transform in integer arithmetic to preserve subnormal scores
   // under CUDA fast math.
   const uint32_t bits = __float_as_uint(x);
-  const uint32_t sign = static_cast<int32_t>(bits) >> 31;
+  const uint32_t sign = 0u - (bits >> 31);
   return bits ^ (sign | 0x80000000u);
 }
 
@@ -187,7 +187,7 @@ TS_DEVICE uint32_t extract_coarse_bin(float x) {
   static_assert(0 < kBits && kBits < 15);
   const auto hx = cast<fp16_t>(x);
   const uint16_t bits = *reinterpret_cast<const uint16_t*>(&hx);
-  const uint32_t sign = static_cast<int16_t>(bits) >> 15;
+  const uint32_t sign = 0u - (bits >> 15);
   const uint16_t key = bits ^ (sign | 0x8000u);
   return key >> (16 - kBits);
 }
@@ -263,6 +263,7 @@ struct alignas(8) TieValue {
   uint32_t key;
   uint32_t idx;
   inline static constexpr TieValue invalid() {
+    // Key zero sorts below every supported score, including -infinity.
     return TieValue{0, 0xFFFFFFFFu};
   }
 };
@@ -588,8 +589,15 @@ struct TopKRadixBase : TopKConfig {
     }
   }
 
-  TS_DEVICE static void find_threshold(const uint32_t topk, const uint32_t seq_len, Smem* smem) {
+  TS_DEVICE static bool find_threshold(const uint32_t topk,
+                                       const uint32_t seq_len, Smem* smem) {
     const auto tx = threadIdx.x;
+    // An unmatched histogram must not retain an earlier round's threshold.
+    if (tx == 0) {
+      smem->threshold_bin = 0;
+      smem->threshold_count = 0;
+      smem->threshold_above = 0;
+    }
     constexpr uint32_t kItems =
         (kHistSize + kBlockSize - 1) / kBlockSize;
     uint32_t orig[kItems];
@@ -625,16 +633,27 @@ struct TopKRadixBase : TopKConfig {
       }
     }
     __syncthreads();
+    return smem->threshold_count != 0;
   }
 
   struct Threshold {
     uint32_t lo;
     uint32_t hi;  // Exclusive upper bound in ordered fp32 keys.
+
+    TS_DEVICE uint32_t collect_key_mask() const {
+      // Coarse buckets never span both signs, and refinement only narrows them.
+      // This mask gives every candidate its exact key in one XOR. Values of
+      // the other sign still classify wholly above or below the bucket.
+      return (lo & 0x80000000u) ? 0x80000000u : 0xFFFFFFFFu;
+    }
   };
 
   // A coarse bucket may contain arbitrarily many distinct fp32 scores.
   // Refine it before collecting so the bounded tie buffer never drops a
   // larger value. After all 32 bits, any excess candidates are exact ties.
+  // Cluster callers must pass identical reduced histograms and counts on all
+  // ranks: reduce_histogram contains cluster barriers, so every rank must take
+  // the same number of refinement rounds. A local count would deadlock.
   template <typename ForEach, typename ReduceHistogram>
   TS_DEVICE static Threshold refine_threshold(
       uint32_t topk, ForEach&& for_each, ReduceHistogram&& reduce_histogram,
@@ -645,12 +664,17 @@ struct TopKRadixBase : TopKConfig {
     uint32_t count = smem->threshold_count;
     if (count <= kMaxNumTie) [[likely]]
       return threshold;
+    // NaNs are unsupported. Their coarse bins can have empty exact-key bounds;
+    // do not refine an empty interval or consume an unmatched histogram.
+    if (threshold.lo >= threshold.hi) return threshold;
 
     uint32_t remaining = topk - smem->threshold_above;
     // Coarse bounds already fix leading bits of most finite buckets. Start at
     // their first differing bit and reuse the full histogram for fewer scans.
     const uint32_t differing_bits =
         32 - __clz(threshold.lo ^ (threshold.hi - 1));
+    // __clz(0) == 32 gives a singleton interval a full mask. No common prefix
+    // needs mask zero instead, avoiding an undefined shift by 32.
     uint32_t mask = differing_bits == 32 ? 0 : 0xFFFFFFFFu << differing_bits;
     uint32_t prefix = threshold.lo & mask;
     int shift = max(
@@ -671,7 +695,7 @@ struct TopKRadixBase : TopKConfig {
       });
       __syncthreads();
       reduce_histogram();
-      find_threshold(remaining, count, smem);
+      if (!find_threshold(remaining, count, smem)) break;
 
       prefix |= smem->threshold_bin << shift;
       mask |= (kHistSize - 1) << shift;
@@ -760,8 +784,9 @@ struct TopKRegister : TopKRadixBase<12> {
 
     // Phase 3: collect by ordered fp32 bounds (raw indices).
     const auto topk = problem.topk;
+    const uint32_t key_mask = threshold.collect_key_mask();
     for_each_local([&](float val, uint32_t idx) {
-      const auto key = extract_exact_bin(val);
+      const uint32_t key = __float_as_uint(val) ^ key_mask;
       if (key >= threshold.hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
         if (pos < topk) [[likely]]
@@ -823,8 +848,9 @@ struct TopKStreaming : TopKRegister<2> {
 
     // Phase 3: Collect candidates using the refined ordered fp32 bounds.
     const auto topk = problem.topk;
+    const uint32_t key_mask = threshold.collect_key_mask();
     for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
-      const auto key = extract_exact_bin(val);
+      const uint32_t key = __float_as_uint(val) ^ key_mask;
       if (key >= threshold.hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
         if (pos < topk) [[likely]] {
@@ -1004,6 +1030,7 @@ struct TopKCluster : TopKRadixBase<kHistBits_> {
     // Phase 3: Collect candidates over this rank's chunk; convert local indices
     // back to global by adding chunk_start. All ranks share the refined bounds.
     const auto topk = problem.topk;
+    const uint32_t key_mask = threshold.collect_key_mask();
 
     // Phase 3: collect candidates. The primary scatters straight into
     // `problem.out`, the others stage into block-local `smem->tmp_out`.
@@ -1021,7 +1048,7 @@ struct TopKCluster : TopKRadixBase<kHistBits_> {
       // stage to tmp_out first before writing to global/DSMEM
       for_each_local([&](float val, uint32_t local_idx) {
         const auto idx = chunk_start + local_idx;
-        const auto key = extract_exact_bin(val);
+        const uint32_t key = __float_as_uint(val) ^ key_mask;
         if (key >= threshold.hi) {
           const auto pos = atomicAdd(&smem->count_gt, 1);
           if (pos < topk) [[likely]] {
@@ -1068,7 +1095,7 @@ struct TopKCluster : TopKRadixBase<kHistBits_> {
     } else {
       for_each_local([&](float val, uint32_t local_idx) {
         const auto idx = chunk_start + local_idx;
-        const auto key = extract_exact_bin(val);
+        const uint32_t key = __float_as_uint(val) ^ key_mask;
         if (key >= threshold.hi) {
           const auto pos = atomicAdd(&smem->count_gt, 1);
           if (pos < topk) [[likely]] {

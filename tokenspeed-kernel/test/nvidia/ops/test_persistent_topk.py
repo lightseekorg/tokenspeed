@@ -20,14 +20,15 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda.dsv4_attention import (
     has_persistent_topk,
     persistent_topk,
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.hip is not None,
-    reason="requires an NVIDIA GPU",
+    not current_platform().is_hopper_plus,
+    reason="persistent CUDA top-k requires NVIDIA SM90+",
 )
 
 # Cover both register sizes, single-CTA streaming, and every cluster variant.
@@ -140,6 +141,90 @@ def test_threshold_capacity_partial_ties(rows, width, topk, candidate_count, neg
         enable_pdl=True,
     )
     assert_selection(scores, lengths, output)
+    assert bool((storage[:8] == -77).all())
+    assert bool((storage[-8:] == -77).all())
+
+
+@pytest.mark.parametrize("rows,width", SHAPES)
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize(
+    "distribution", ["zero_crossing", "positive_normal", "negative_normal"]
+)
+def test_subnormal_cutoff_boundaries(rows, width, topk, distribution):
+    ranks = torch.arange(width, device="cuda", dtype=torch.int32) % 4096 - 2048
+    if distribution == "zero_crossing":
+        bits = torch.where(ranks >= 0, ranks, (-ranks) | -2147483648)
+    else:
+        # Adjacent bit patterns straddle the normal/subnormal boundary.
+        base = 0x00800000 if distribution == "positive_normal" else -0x7F800000
+        bits = base + ranks
+    scores = bits.view(torch.float32).expand(rows, -1).contiguous()
+    scores[:, : topk // 2] = float("inf")
+    scores[:, -3:] = float("nan")
+    lengths = torch.full((rows,), width - 3, device="cuda", dtype=torch.int32)
+    output = torch.full((rows, topk), -77, device="cuda", dtype=torch.int32)
+    persistent_topk(
+        scores,
+        lengths,
+        output,
+        topk,
+        width,
+        q_len_per_req=1,
+        enable_pdl=True,
+    )
+    assert_selection(scores, lengths, output)
+
+
+@pytest.mark.parametrize("rows,width", SHAPES)
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_mixed_signed_zero_cutoff(rows, width, topk):
+    scores = torch.empty((rows, width), device="cuda")
+    scores.view(torch.int32).fill_(-2147483647)  # Smallest negative subnormal.
+    scores[:, ::2] = -0.0
+    scores[:, : topk // 4] = 1.0
+    scores[:, topk // 4 : 3 * topk // 4] = 0.0
+    scores[:, -3:] = float("nan")
+    lengths = torch.full((rows,), width - 3, device="cuda", dtype=torch.int32)
+    output = torch.full((rows, topk), -77, device="cuda", dtype=torch.int32)
+    persistent_topk(
+        scores,
+        lengths,
+        output,
+        topk,
+        width,
+        q_len_per_req=1,
+        enable_pdl=True,
+    )
+    assert_selection(scores, lengths, output)
+
+
+@pytest.mark.parametrize("rows,width", SHAPES)
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("distribution", ["positive", "negative", "mixed", "finite"])
+def test_nan_prefix_output_bounds(rows, width, topk, distribution):
+    # NaN value ordering is unsupported, but writes and returned indices must
+    # stay in bounds even when a coarse threshold has no exact-key candidates.
+    scores = torch.full((rows, width), float("nan"), device="cuda")
+    if distribution == "negative":
+        scores.view(torch.int32).fill_(-0x400000)
+    elif distribution in ("mixed", "finite"):
+        scores.view(torch.int32)[:, ::2] = -0x400000
+        if distribution == "finite":
+            scores[:, ::3] = torch.arange(0, width, 3, device="cuda").float()
+    length = width - 3
+    lengths = torch.full((rows,), length, device="cuda", dtype=torch.int32)
+    storage = torch.full((rows * topk + 16,), -77, device="cuda", dtype=torch.int32)
+    output = storage[8:-8].view(rows, topk)
+    persistent_topk(
+        scores,
+        lengths,
+        output,
+        topk,
+        width,
+        q_len_per_req=1,
+        enable_pdl=True,
+    )
+    assert bool(((output >= 0) & (output < length)).all())
     assert bool((storage[:8] == -77).all())
     assert bool((storage[-8:] == -77).all())
 
