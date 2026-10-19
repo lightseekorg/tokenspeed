@@ -382,8 +382,8 @@ class AutoBackend(CommBackend):
         if route is Route.NCCL:
             return self._nccl.all_reduce(tensor, group, op=op)
         # Tiered dispatch -- first match wins. This is Tier 1 (which backend);
-        # the trtllm backend then runs Tier 2 (mnnvl vs IPC, by payload bytes)
-        # inside _ar_fusion_workspace.
+        # the trtllm backend then runs Tier 2 (mnnvl vs IPC, by pattern, payload
+        # bytes and the IPC kernel's strategy) inside _ar_fusion_workspace.
         #   1. trtllm_ar armed for this group ...... trtllm_ar   (mnnvl / IPC fusion)
         #   2. group spans nodes ................... NCCL
         #   3. producer-owned memory or Iris can run Iris
