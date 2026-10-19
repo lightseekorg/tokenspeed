@@ -60,6 +60,10 @@ FP32 ranking. Each row retains its own frontier; groups stop after their longest
 frontier. Rows with at most 512 complete blocks return all valid ids and pad
 remaining slots with `-1`. Output order and boundary tie ids are unspecified.
 
+The compact selector unrolls its bounded candidate scan so running entries use
+fixed register indices. The full radix fallback retains runtime indexing;
+query counts and frontiers do not introduce new JIT specializations.
+
 Grids of up to 128 queries expose parallelism by splitting the key range.
 Independent rows, including ragged layouts, use four-warp native BF16 MMA score
 CTAs and an exact merge. Small grouped prefills with long contexts reuse K
@@ -180,3 +184,33 @@ durations must not be added to estimate latency.
 | 16384 / 16384 | 236.90 / 238.11 / 239.01 | 306.50 / 308.07 / 309.57 |
 | 8192 / 32768 | 370.31 / 371.19 / 372.77 | 341.48 / 345.95 / 355.27 |
 | 16384 / 32768 | 675.46 / 676.30 / 679.17 | 594.60 / 602.21 / 612.45 |
+
+### Bounded selector scan
+
+Unrolling the compact scan removes dynamic searches through each thread's
+eight running entries. A paired public-API comparison on the same L20B,
+using seeds 83/89/97, 10 warmups and 45 cold-L2 CUDA Graph samples per seed,
+measures the following medians of seed medians for 16384 query rows and
+32768 live KV tokens, with an 8192-block table and PDL enabled:
+
+| Implementation | Score plus selection (us) |
+| --- | ---: |
+| Stream before unrolling | 681.34 |
+| Stream with fixed register indices | 632.22 |
+| Logits with persistent CUDA top-k | 605.22 |
+
+Stream latency decreases by 7.2%. The kernel retains 64 registers per thread,
+231808 dynamic shared-memory bytes, 832 threads per CTA and one resident
+CTA per SM, with no spills. Nsight Compute records about 401.7 million
+executed instructions, down from 444.1 million. Profiler replay timings are
+not used for the latency comparison.
+
+Nsight Systems measures the single fused kernel over 20 graph replays at
+675.37 / 676.16 / 678.98 us before unrolling and
+627.40 / 628.22 / 629.89 us afterward (min/mean/max).
+
+Full-row validation covers the three target seeds, 8192 queries / 32768 KV,
+16384 queries / 65536 KV, a padded 16384 / 16384 table, zero-score ties and
+quantized inputs with boundary frontiers. All 90624 rows pass independent
+FP32 score-multiset, valid-count, unique-index and padding checks at
+`atol=1e-4, rtol=1e-5`.

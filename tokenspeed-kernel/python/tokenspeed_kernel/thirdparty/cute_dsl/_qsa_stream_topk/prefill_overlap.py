@@ -184,6 +184,44 @@ class OverlapPrefillTopK(PrefillTopK):
             )
         return bits, block_id
 
+    # A fixed group lets the compact scan read its running set directly
+    # instead of searching the per-thread registers as the radix path does.
+    @cute.jit
+    def _candidate_const_bits_id(
+        self,
+        group: cutlass.Constexpr[int],
+        candidate: cutlass.Int32,
+        running_count: cutlass.Int32,
+        score_stage: cutlass.Int32,
+        tile_base: cutlass.Int32,
+        running_values: cute.Tensor,
+        score_buffers: cute.Tensor,
+        score_offsets: cute.Tensor,
+        row_in_group: cutlass.Int32,
+    ):
+        bits = cutlass.Uint32(0)
+        block_id = cutlass.Int32(-1)
+        if cutlass.const_expr(group < _TOPK // self.selector_threads_per_row):
+            if candidate < running_count:
+                packed = running_values[group]
+                bits = cutlass.Uint32((packed >> 32) - 1)
+                block_id = cutlass.Int32(packed & cutlass.Int64(0xFFFFFFFF))
+            else:
+                offset = candidate - running_count
+                bits = self._float_bits(
+                    score_buffers[score_stage, row_in_group, offset]
+                )
+                block_id = tile_base + cutlass.Int32(
+                    score_offsets[score_stage, row_in_group, offset]
+                )
+        else:
+            offset = candidate - running_count
+            bits = self._float_bits(score_buffers[score_stage, row_in_group, offset])
+            block_id = tile_base + cutlass.Int32(
+                score_offsets[score_stage, row_in_group, offset]
+            )
+        return bits, block_id
+
     @cute.jit
     def _window_coarse(self, bits: cutlass.Uint32, origin: cutlass.Int32):
         value = cutlass.Float32(
@@ -569,58 +607,70 @@ class OverlapPrefillTopK(PrefillTopK):
                 tie_base = scalars[row_in_group, 5]
             better_offset = cutlass.Int32(0)
             tie_offset = cutlass.Int32(0)
-            candidate_base = warp_in_row * 32
-            while candidate_base < candidate_count:
-                candidate = candidate_base + lane_idx
-                active = candidate < candidate_count
-                bits = cutlass.Uint32(0)
-                block_id = cutlass.Int32(-1)
-                if active:
-                    bits, block_id = self._candidate_bits_id(
-                        candidate,
-                        running_count,
-                        score_stage,
-                        tile_base,
-                        running_values,
-                        score_buffers,
-                        score_offsets,
-                        row_in_group,
-                    )
-                active = active and bits >= cutoff_bits
-                ordered = self._ordered(bits)
-                bucket = cutlass.Int32(0)
-                if active:
-                    bucket = self._window_coarse(bits, coarse_origin)
-                better = active and bucket < coarse_bucket
-                tied = active and bucket == coarse_bucket
-                better_mask = cute.arch.vote_ballot_sync(better)
-                tie_mask = cute.arch.vote_ballot_sync(tied)
-                better_batch = cutlass.Int32(cute.arch.popc(cutlass.Int32(better_mask)))
-                tie_batch = cutlass.Int32(cute.arch.popc(cutlass.Int32(tie_mask)))
-                packed = ((cutlass.Int64(bits) + 1) << 32) | cutlass.Int64(block_id)
-                if better:
-                    position = (
-                        better_base
-                        + better_offset
-                        + cutlass.Int32(
-                            cute.arch.popc(cutlass.Int32(better_mask & lower_lane_mask))
+            # Unroll the bounded scan to keep running-set register indices static.
+            for candidate_group in cutlass.range_constexpr(
+                cute.ceil_div(_TOPK + self.stream_tile, self.selector_threads_per_row)
+            ):
+                candidate_base = (
+                    warp_in_row * 32 + candidate_group * self.selector_threads_per_row
+                )
+                if candidate_base < candidate_count:
+                    candidate = candidate_base + lane_idx
+                    active = candidate < candidate_count
+                    bits = cutlass.Uint32(0)
+                    block_id = cutlass.Int32(-1)
+                    if active:
+                        bits, block_id = self._candidate_const_bits_id(
+                            candidate_group,
+                            candidate,
+                            running_count,
+                            score_stage,
+                            tile_base,
+                            running_values,
+                            score_buffers,
+                            score_offsets,
+                            row_in_group,
                         )
+                    active = active and bits >= cutoff_bits
+                    ordered = self._ordered(bits)
+                    bucket = cutlass.Int32(0)
+                    if active:
+                        bucket = self._window_coarse(bits, coarse_origin)
+                    better = active and bucket < coarse_bucket
+                    tied = active and bucket == coarse_bucket
+                    better_mask = cute.arch.vote_ballot_sync(better)
+                    tie_mask = cute.arch.vote_ballot_sync(tied)
+                    better_batch = cutlass.Int32(
+                        cute.arch.popc(cutlass.Int32(better_mask))
                     )
-                    if position < _TOPK:
-                        compacted_row[position] = packed
-                if tied:
-                    position = (
-                        tie_base
-                        + tie_offset
-                        + cutlass.Int32(
-                            cute.arch.popc(cutlass.Int32(tie_mask & lower_lane_mask))
+                    tie_batch = cutlass.Int32(cute.arch.popc(cutlass.Int32(tie_mask)))
+                    packed = ((cutlass.Int64(bits) + 1) << 32) | cutlass.Int64(block_id)
+                    if better:
+                        position = (
+                            better_base
+                            + better_offset
+                            + cutlass.Int32(
+                                cute.arch.popc(
+                                    cutlass.Int32(better_mask & lower_lane_mask)
+                                )
+                            )
                         )
-                    )
-                    if position < 256:
-                        tie_candidates[row_in_group, position] = packed
-                better_offset += better_batch
-                tie_offset += tie_batch
-                candidate_base += self.selector_threads_per_row
+                        if position < _TOPK:
+                            compacted_row[position] = packed
+                    if tied:
+                        position = (
+                            tie_base
+                            + tie_offset
+                            + cutlass.Int32(
+                                cute.arch.popc(
+                                    cutlass.Int32(tie_mask & lower_lane_mask)
+                                )
+                            )
+                        )
+                        if position < 256:
+                            tie_candidates[row_in_group, position] = packed
+                    better_offset += better_batch
+                    tie_offset += tie_batch
             topk_barrier.arrive_and_wait()
 
             # Resolve the remaining FP16 bits only inside the compact bucket.

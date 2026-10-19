@@ -566,6 +566,68 @@ def test_cute_dsl_qsa_stream_topk_graph_refreshes_mixed_frontiers(
 
 
 @pytest.mark.parametrize("enable_pdl", [False, True])
+def test_cute_dsl_qsa_stream_topk_overlap_graph_refreshes_candidates(
+    device: str,
+    enable_pdl: bool,
+) -> None:
+    """Exercise initial and running selections with partial candidate buffers."""
+
+    torch.manual_seed(131)
+    rows, width, pages = 136, 8, 129
+    query = torch.randn(rows, 5, 128, device=device, dtype=torch.bfloat16)[:, :4]
+    query[::3].zero_()
+    requests_count = rows // width
+    keys = torch.randn(
+        requests_count * pages * 64,
+        1,
+        128,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    table = torch.stack(
+        [
+            torch.randperm(pages, device=device) + request * pages
+            for request in range(requests_count)
+        ]
+    ).to(torch.int32)
+    requests = torch.arange(
+        requests_count, device=device, dtype=torch.int32
+    ).repeat_interleave(width)
+    complete = torch.full((rows,), 8192, device=device, dtype=torch.int32)
+
+    def invoke() -> torch.Tensor:
+        return cute_dsl_qsa_stream_topk(
+            query,
+            keys,
+            table,
+            requests,
+            complete,
+            page_size=64,
+            block_topk=512,
+            queries_per_request=width,
+            max_partial_bytes=0,
+            enable_pdl=enable_pdl,
+        )
+
+    # More than 128 rows selects the grouped overlap implementation.
+    invoke()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = invoke()
+
+    frontiers = [511, 512, 513, 1023, 1024, 1025, 6143, 8192]
+    for counts in (frontiers, list(reversed(frontiers)), [0] * width):
+        complete.copy_(
+            torch.tensor(counts * requests_count, device=device, dtype=torch.int32)
+        )
+        graph.replay()
+        _assert_matches_reference(
+            query, keys, table, requests, complete, selected, 64, 512
+        )
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
 def test_cute_dsl_qsa_stream_topk_prefill_graph_without_global_partial(
     device: str,
     monkeypatch: pytest.MonkeyPatch,
