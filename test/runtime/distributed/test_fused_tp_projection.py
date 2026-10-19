@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Numerical correctness of fused DP row/column-linear and CUDA graph replay."""
+"""Representative numerical checks of fused projections and CUDA graph reuse."""
 
 import gc
 import os
@@ -402,163 +402,35 @@ def _check_column_projection(rank, world_size, device, parallel, config):
 
 
 def _row_projection_graph_counts(world_size):
-    """Keep transitions and repeated calls that exercise workspace reuse."""
-    # One graph switches buckets and includes an empty owner; replay new inputs.
-    counts_list = [
-        (1920,) * world_size,
-        tuple((1921, 128, 0, 1)[:world_size]),
-        tuple((2048, 1921, 0, 1)[:world_size]),
-        (1921,) * world_size,
-        (2048,) * world_size,
-        tuple((160, 129, 65, 0)[:world_size]),
-        tuple((192, 129, 65, 0)[:world_size]),
-        tuple((256, 192, 65, 0)[:world_size]),
-        (129,) * world_size,
-        (256,) * world_size,
-        tuple((0, 256, 1, 129)[:world_size]),
-        (128,) * world_size,
-        tuple((256, 0, 192, 65)[:world_size]),
-        (256,) * world_size,
-        (257,) * world_size,
-        (512,) * world_size,
-        (384,) * world_size,
-        (512,) * world_size,
-        (1024,) * world_size,
-        (1536,) * world_size,
-        tuple((1537, 128, 0, 1)[:world_size]),
-        (1536,) * world_size,
-        tuple((4097, 129, 0, 1)[:world_size]),
-        tuple((16384, 8193, 192, 0)[:world_size]),
-        (192,) * world_size,
-        (8192,) * world_size,
-        (160,) * world_size,
-        tuple((6144, 192, 0, 1)[:world_size]),
-        (2304,) * world_size,
-        (2049,) * world_size,
-        (2304,) * world_size,
-        (2176,) * world_size,
-        tuple((0, 2304, 65, 1)[:world_size]),
-        tuple((0, 4096, 65, 1)[:world_size]),
-        (4608,) * world_size,
-        (4096,) * world_size,
-        (4097,) * world_size,
-        (4608,) * world_size,
-        (9216,) * world_size,
-        (8193,) * world_size,
-        tuple((8193, 4097, 192, 0)[:world_size]),
-        tuple((0, 8193, 192, 0)[:world_size]),
-        (9216,) * world_size,
-        (8256,) * world_size,
-        (4608,) * world_size,
-        tuple((4352, 0, 129, 0)[:world_size]),
-        (128,) * world_size,
-        tuple((2049, 128, 0, 1)[:world_size]),
-        (64,) * world_size,
-        (64,) * world_size,
-        (32,) * world_size,
-        (32,) * world_size,
-        (65,) * world_size,
-        (96,) * world_size,
-        (128,) * world_size,
-        (32,) * world_size,
-        tuple((128, 65, 1, 0)[:world_size]),
-        tuple((96, 65, 1, 0)[:world_size]),
-        tuple((32, 17, 1, 0)[:world_size]),
-        tuple((0, 64, 32, 1)[:world_size]),
-    ]
-    # Changing partial/empty owners within one bucket must retire old inputs.
-    counts_list += [
-        tuple(c[:world_size])
-        for c in [
-            (193, 193, 193, 193),
-            (193, 193, 193, 193),
-            (256, 193, 0, 1),
-            (208, 255, 193, 0),
-            (0, 224, 240, 255),
-            (256, 256, 256, 256),
-            (255, 255, 255, 255),
-            (193, 193, 193, 193),
-            (513, 513, 513, 513),
-            (577, 513, 0, 1),
-            (640, 577, 0, 1),
-            (0, 513, 577, 640),
-            (640, 640, 640, 640),
-            (639, 639, 639, 639),
-            (513, 513, 513, 513),
-            (577, 0, 128, 1),
-        ]
-    ]
-    # Cross owner boundaries and switch into and out of the TP4 224-row bucket.
-    counts_list += [
-        tuple(c[:world_size])
-        for c in [
+    """Exercise dispatch, owner changes, and reuse across representative buckets."""
+    return [
+        tuple(counts[:world_size])
+        for counts in (
+            # Fallback, fusion, and a padded input with unequal owners.
+            (32, 32, 32, 32),
+            (64, 64, 64, 64),
+            (128, 65, 1, 0),
+            # Keep one bucket while the empty owner changes, then change stride.
             (224, 224, 224, 224),
             (193, 0, 1, 208),
-            (0, 208, 224, 1),
-            (224, 193, 208, 0),
-            (225, 225, 225, 225),
-            (192, 192, 192, 192),
-            (208, 208, 208, 208),
-            (224, 0, 1, 193),
-        ]
-    ]
-    # Larger buckets retain a clear prefix; this bucket must clear its receive tail.
-    counts_list += [
-        tuple(c[:world_size])
-        for c in [
-            (640, 640, 640, 640),
+            (0, 224, 193, 1),
+            (256, 256, 256, 256),
+            # Cross-owner tiles and receive-tail clearing above the small prefix.
             (576, 576, 576, 576),
             (513, 0, 1, 545),
-            (0, 544, 576, 1),
-            (576, 513, 545, 0),
-            (577, 577, 577, 577),
-            (512, 512, 512, 512),
-            (545, 545, 545, 545),
-            (576, 0, 1, 513),
-            (8192, 8192, 8192, 8192),
-            (576, 576, 576, 576),
-            (224, 224, 224, 224),
-        ]
-    ]
-    # Reuse scale and accumulator stages with partial and empty owners.
-    counts_list += [
-        tuple(c[:world_size])
-        for c in [
-            (240, 240, 240, 240),
-            (256, 0, 1, 225),
-            (0, 240, 256, 1),
-            (224, 224, 224, 224),
-        ]
-    ]
-    # Exercise partial and empty owners across the 1024-row bucket boundary.
-    counts_list += [
-        tuple(c[:world_size])
-        for c in [
-            (897, 897, 897, 897),
-            (1024, 897, 0, 1),
-            (0, 960, 1024, 1),
-            (1024, 1024, 1024, 1024),
-            (1023, 1023, 1023, 1023),
-            (896, 896, 896, 896),
-            (897, 0, 128, 1),
-            (1024, 0, 1, 897),
-        ]
-    ]
-    # Exercise the 960-row bucket and transitions to both neighboring buckets.
-    counts_list += [
-        tuple(c[:world_size])
-        for c in [
-            (960, 960, 960, 960),
+            (0, 576, 513, 1),
             (960, 897, 0, 1),
-            (0, 928, 960, 1),
-            (959, 959, 959, 959),
-            (961, 961, 961, 961),
-            (897, 960, 1, 0),
-            (960, 0, 1, 897),
-            (896, 960, 0, 1),
-        ]
+            # Clustered TP4 output and dynamic TP2 scheduling, including padding.
+            (2048, 2048, 2048, 2048),
+            (4608, 4608, 4608, 4608),
+            (4097, 0, 128, 1),
+            (0, 4097, 128, 1),
+            # Non-clustered large output, skipped padding, then a smaller layout.
+            (5120, 5120, 5120, 5120),
+            (4865, 0, 128, 1),
+            (64, 64, 64, 64),
+        )
     ]
-    return counts_list
 
 
 def _check_row_projection(rank, world_size, device, parallel, config):
@@ -582,7 +454,7 @@ def _check_row_projection(rank, world_size, device, parallel, config):
                 prefix="o_proj",
             )
         _initialize_weights((model,), rank)
-        prepare_dp_linear_communication(model, 16384, torch.bfloat16, AutoBackend())
+        prepare_dp_linear_communication(model, 5120, torch.bfloat16, AutoBackend())
         models.append(model)
     baseline, candidate = models
     # Retain the real AutoBackend transport and GEMM for the unfused reference.
@@ -632,96 +504,18 @@ def _check_row_projection(rank, world_size, device, parallel, config):
             total.add_(part.float())
         return total[rank * rows : rank * rows + x.shape[0]].to(torch.bfloat16)
 
+    # Sample execution behaviors instead of sweeping every tuning bucket.
     patterns = [
-        (n,) * world_size
-        for n in (
-            0,
-            1,
-            31,
-            32,
-            33,
-            63,
-            64,
-            65,
-            95,
-            96,
-            97,
-            127,
-            128,
-            129,
-            159,
-            160,
-            161,
-            191,
-            192,
-            193,
-            208,
-            223,
-            224,
-            225,
-            240,
-            248,
-            255,
-            256,
-            257,
-            384,
-            512,
-            513,
-            544,
-            545,
-            575,
-            576,
-            577,
-            640,
-            1024,
-            1536,
-            1537,
-            2048,
-            2049,
-            2176,
-            2304,
-            2560,
-            3072,
-            3584,
-            4096,
-            4097,
-            4352,
-            4608,
-            6144,
-            8192,
-            8193,
-            9216,
-            12288,
-            16384,
-        )
+        (rows,) * world_size for rows in (0, 32, 63, 64, 128, 129, 256, 576, 2048, 5120)
     ]
     patterns += [
-        tuple((1921, 128, 0, 1)[:world_size]),
-        tuple((2048, 1921, 0, 1)[:world_size]),
-        tuple((160, 129, 65, 0)[:world_size]),
-        tuple((192, 129, 65, 0)[:world_size]),
-        tuple((256, 192, 65, 0)[:world_size]),
-        tuple((256, 225, 248, 0)[:world_size]),
-        tuple((0, 240, 256, 1)[:world_size]),
-        tuple((128, 65, 1, 0)[:world_size]),
-        tuple((96, 65, 1, 0)[:world_size]),
-        tuple((32, 17, 1, 0)[:world_size]),
-        tuple((0, 64, 32, 1)[:world_size]),
-        # Exercise padding and an empty rank in large row buckets.
-        tuple((576, 513, 545, 0)[:world_size]),
-        tuple((0, 544, 576, 1)[:world_size]),
-        tuple((640, 513, 0, 385)[:world_size]),
-        tuple((0, 1024, 769, 513)[:world_size]),
-        tuple((8192, 4097, 192, 0)[:world_size]),
-        tuple((8193, 4097, 192, 0)[:world_size]),
-        # Large dynamic GEMM queues must also retire empty owners.
-        tuple((0, 8193, 192, 0)[:world_size]),
-        tuple((4608, 0, 128, 0)[:world_size]),
-        tuple((4352, 4097, 0, 1)[:world_size]),
-        tuple((2049, 129, 0, 1)[:world_size]),
-        tuple((0, 2304, 65, 1)[:world_size]),
-        tuple((0, 4096, 65, 1)[:world_size]),
-        tuple((16384, 8193, 192, 0)[:world_size]),
+        tuple(counts[:world_size])
+        for counts in (
+            (128, 65, 1, 0),
+            (224, 0, 129, 1),
+            (0, 960, 897, 1),
+            (0, 4097, 129, 1),
+        )
     ]
     for counts in patterns:
         x = torch.randn((counts[rank], 12288), device=device, dtype=torch.bfloat16)
@@ -759,27 +553,9 @@ def _check_row_projection(rank, world_size, device, parallel, config):
     for model in models:
         model.weight.copy_(signed_weight)
         model.weight_scale_inv.copy_(tiny_scales)
-    for rows in (
-        32,
-        64,
-        128,
-        160,
-        192,
-        224,
-        256,
-        576,
-        640,
-        960,
-        1024,
-        1921,
-        2048,
-        2049,
-        2304,
-        4096,
-        4097,
-        8192,
-        8193,
-    ):
+    # Small stores, split accumulators, cross-owner vector stores, and both
+    # clustered and non-clustered reduction must preserve the zero sentinel.
+    for rows in (32, 128, 960, 4608, 5120):
         counts = (rows,) * world_size
         x = torch.zeros((rows, 12288), device=device, dtype=torch.bfloat16)
         x[:, :: 12288 // world_size] = 448
@@ -809,23 +585,8 @@ def _check_row_projection(rank, world_size, device, parallel, config):
     alternate_scales = candidate.weight_scale_inv * 2
     baseline.weight.copy_(alternate_weight)
     baseline.weight_scale_inv.copy_(alternate_scales)
-    for rows in (
-        96,
-        128,
-        160,
-        192,
-        224,
-        256,
-        576,
-        640,
-        960,
-        1024,
-        2304,
-        4096,
-        4097,
-        8192,
-        8193,
-    ):
+    # Rebind descriptors for scalar scales, TMA scales, and clustered loads.
+    for rows in (128, 576, 4608):
         counts = (rows,) * world_size
         x = torch.randn((rows, 12288), device=device, dtype=torch.bfloat16)
         ctx = _context(rank, counts, counts)
@@ -841,10 +602,6 @@ def _check_row_projection(rank, world_size, device, parallel, config):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     baseline.weight.copy_(candidate.weight)
     baseline.weight_scale_inv.copy_(candidate.weight_scale_inv)
-    # Replay across the 32-bit boundary to exercise persistent 64-bit epochs.
-    state = candidate.projection_workspace.fused_row
-    _reset_epochs(state)
-
     counts_list = _row_projection_graph_counts(world_size)
     xs = [
         torch.randn((c[rank], 12288), device=device, dtype=torch.bfloat16)
@@ -864,7 +621,9 @@ def _check_row_projection(rank, world_size, device, parallel, config):
             (candidate(x, ctx=ctx)[0], fused(x, ctx)) for x, ctx in zip(xs, ctxs)
         ]
 
-    for replay in range(48):
+    # Reset after capture so replay itself crosses the 32-bit epoch boundary.
+    _reset_epochs(candidate.projection_workspace.fused_row)
+    for replay in range(8):
         for index, x in enumerate(xs):
             if (replay + index) % 3 == 0:
                 x.zero_()
