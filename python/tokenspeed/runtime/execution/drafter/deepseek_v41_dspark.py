@@ -91,7 +91,10 @@ class DeepseekV41DSpark(BaseDrafter):
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
         )
-        self._validate_tp_only_mapping(draft_model_runner.mapping)
+        mode = draft_model_runner.server_args.disaggregation_mode
+        self.prefill_only = mode == "prefill"
+        if draft_model_runner.mapping.attn.has_dp and mode not in ("prefill", "decode"):
+            raise ValueError("V4.1 DSpark attention DP requires PD disaggregation")
 
         self.device = torch.device(draft_model_runner.device)
         self.draft_model = draft_model_runner.model
@@ -115,25 +118,17 @@ class DeepseekV41DSpark(BaseDrafter):
         self.candidates, self.partials = dspark_greedy_workspace(
             int(self.draft_model.mapping.attn.tp_size),
             max_bs,
-            int(self.draft_model.lm_head.num_embeddings_per_partition),
+            int(self.model.markov_projection.num_embeddings_per_partition),
             self.device,
         )
-
-    @staticmethod
-    def _validate_tp_only_mapping(mapping) -> None:
-        dp_size = int(mapping.attn.dp_size)
-        if dp_size != 1:
-            raise ValueError(
-                "Week-0 DSPARK supports tensor parallelism only; "
-                f"got attention dp_size={dp_size}."
-            )
 
     def idle_forward_global_num_tokens(
         self, global_num_tokens: list[int], global_bs: list[int]
     ) -> list[list[int]]:
-        # Block drafter: one draft forward proposes the whole block.
-        del global_bs
-        return [global_num_tokens]
+        # Prefill only writes rank-local context KV. Decode executes one block.
+        if self.prefill_only:
+            return []
+        return [[batch * self.block_size for batch in global_bs]]
 
     def wire_target(self, target_model) -> None:
         """Bind execution resources; model setup already configured capture."""
@@ -181,6 +176,12 @@ class DeepseekV41DSpark(BaseDrafter):
             input_num_tokens=num_decodes * self.block_size,
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            global_num_tokens=(
+                [batch * self.block_size for batch in base_ctx.global_bs]
+                if base_ctx.global_bs is not None
+                else None
+            ),
+            global_bs=base_ctx.global_bs,
             all_decode_or_idle=base_ctx.all_decode_or_idle,
         )
         draft_hidden = self.model.forward_backbone(
@@ -191,7 +192,9 @@ class DeepseekV41DSpark(BaseDrafter):
             local_logits,
             bonus,
             self.model.markov_head,
-            self.lm_head,
+            # The target head is ReplicatedLinear under DP; the Markov head
+            # retains the identical vocabulary layout, including TP padding.
+            self.model.markov_projection,
             self.tp_group,
             self.candidates,
             self.partials,

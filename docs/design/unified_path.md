@@ -557,8 +557,14 @@ attention DP the split graph stays off: the narrowed row count is rank-local
 (which prompts complete on this rank), so the decoder bucket and the
 collective shapes its graph bakes would differ across ranks, and the stages
 size their collectives from their own rows, which the DP metadata gather
-does not carry (the same gap that keeps narrowing itself unimplemented under
-DP).
+does not carry. Eager TP1 attention/dense with fused EP may narrow: the
+fused dispatch exchanges the actual local row counts, while the original
+DP counts remain capacity bounds. V4.1 DSpark supports this layout on PD
+roles: prefill only writes context KV and performs no draft collectives;
+decode sizes its one draft forward at block width times each rank's batch.
+An idle decode rank participates in that same forward. Aggregated attention
+DP with V4.1 DSpark remains unsupported because mixed ranks need separate
+prefill and decode counts.
 
 ### Prefill requests without generated outputs
 

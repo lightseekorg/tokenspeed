@@ -47,7 +47,6 @@ from tokenspeed.runtime.configs.model_config import (
     is_deepseek_v4_nextn,
 )
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import DeepseekV41DSpark
 from tokenspeed.runtime.execution.drafter.eagle import (
     _advance_draft_forward_metadata_if_supported,
 )
@@ -1578,14 +1577,6 @@ class TestDeepseekV4Config:
             sample_dspark_block_greedy(
                 logits, bonus, markov, lm_head, object(), candidates, partials, output
             )
-
-    def test_dspark_tp_only_contract_uses_resolved_mapping(self):
-        mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1))
-        DeepseekV41DSpark._validate_tp_only_mapping(mapping)
-
-        invalid = SimpleNamespace(attn=SimpleNamespace(dp_size=2))
-        with pytest.raises((ValueError), match=("tensor parallelism only")):
-            DeepseekV41DSpark._validate_tp_only_mapping(invalid)
 
     def test_dspark_speculative_config_uses_block_plus_bonus_width(self):
         server_args = ServerArgs(
