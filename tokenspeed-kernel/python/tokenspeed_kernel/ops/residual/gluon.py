@@ -490,6 +490,7 @@ if current_platform().is_amd:
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx1250.mhc import (
+        launch_gluon_mhc_apply_pre_fp8_group32_gfx1250,
         launch_gluon_mhc_mixes_project_gfx1250,
         launch_gluon_mhc_mixes_reduce_gfx1250,
         use_gluon_mhc_mixes_project_gfx1250,
@@ -589,4 +590,30 @@ if current_platform().is_amd:
             sinkhorn_iters,
             _mhc_prenorm_gemm_gfx1250,
             launch_gluon_mhc_mixes_reduce_gfx1250,
+        )
+
+    @register_kernel(
+        "residual",
+        "mhc_apply_pre_fp8_group32",
+        name="gluon_mhc_apply_pre_fp8_group32_gfx1250",
+        solution="gluon",
+        capability=_GFX1250,
+        signatures=frozenset(
+            {
+                format_signature(
+                    residual=dense_tensor_format(torch.bfloat16),
+                    pre=dense_tensor_format(torch.float32),
+                )
+            }
+        ),
+        traits={
+            "buffer_offsets_fit_int32": frozenset({True}),
+            "hc_mult": frozenset({4}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mhc_apply_pre_fp8_group32_gfx1250(residual, pre, norm_weight, norm_eps):
+        """Collapse four streams with RMSNorm and also emit group-32 E4M3 codes."""
+        return launch_gluon_mhc_apply_pre_fp8_group32_gfx1250(
+            residual, pre, norm_weight, norm_eps
         )

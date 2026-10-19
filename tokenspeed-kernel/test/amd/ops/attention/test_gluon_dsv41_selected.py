@@ -34,24 +34,32 @@ pytest.importorskip("tokenspeed_triton")
 pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
 
 
-def _selected_name() -> str:
+def _selected_name(op: str, traits: dict) -> str:
     kernel = select_kernel(
         "attention",
-        "dsv41_selected_attention",
+        op,
         format_signature(x=dense_tensor_format(torch.bfloat16)),
-        traits={"flashmla_eligible": False},
+        traits=traits,
     )
     return kernel.name
 
 
-def test_fused_gluon_is_selected_on_supported_amd():
+@pytest.mark.parametrize(
+    ("op", "traits"),
+    [
+        ("dsv41_selected_attention", {"flashmla_eligible": False}),
+        ("dsv41_selected_attention_rope", {}),
+    ],
+)
+def test_fused_gluon_is_selected_on_supported_amd(op, traits):
     platform = current_platform()
     if platform.is_cdna4:
-        assert _selected_name() == "gluon_dsv41_selected_attention_gfx950"
+        arch = "gfx950"
     elif platform.is_cdna5:
-        assert _selected_name() == "gluon_dsv41_selected_attention_gfx1250"
+        arch = "gfx1250"
     else:
         pytest.skip("AMD fused selected attention")
+    assert _selected_name(op, traits) == f"gluon_{op}_{arch}"
 
 
 def _make_cache(x, fmt):
@@ -224,8 +232,6 @@ def test_fused_selected_attention_decode_shapes(tokens, real_heads, heads, with_
     platform = current_platform()
     if not (platform.is_cdna4 or platform.is_cdna5):
         pytest.skip("AMD fused selected attention")
-    if with_rope and not platform.is_cdna4:
-        pytest.skip("gfx950 fused output RoPE")
     device = torch.device("cuda:0")
     segments = _decode_inputs(tokens, device, 7)
     q, sink = _padded_query(tokens, real_heads, heads, device, 11)
@@ -284,8 +290,6 @@ def test_fused_selected_attention_no_recompile_across_rows(with_rope):
     the warmup rows.
     """
     platform = current_platform()
-    if with_rope and not platform.is_cdna4:
-        pytest.skip("gfx950 fused output RoPE")
     if platform.is_cdna4:
         from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import selected
 

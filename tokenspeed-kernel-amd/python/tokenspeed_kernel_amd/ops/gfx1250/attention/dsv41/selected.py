@@ -227,6 +227,29 @@ def _attend_tile(
     return max_value, denominator, accumulator, row_sum, row_count
 
 
+@gluon.jit
+def _inverse_rope(values, dims, rows, rope_row, dim_base, ROPE_DIM: gl.constexpr):
+    """Rotate the interleaved RoPE tail of BF16 [rows, dims] output tiles.
+
+    dims are absolute head dims; dim_base localizes the gather to the tile.
+    Only the last ROPE_DIM of 512 rotate. rope_row points at the token's
+    inverse cos/sin table row.
+    """
+    start: gl.constexpr = 512 - ROPE_DIM
+    rope = dims >= start
+    pair = gl.where(rope, (dims - start) // 2, 0)
+    cosine = gl.load(rope_row + pair, mask=rope, other=1.0)
+    sine = gl.load(rope_row + ROPE_DIM // 2 + pair, mask=rope, other=0.0)
+    value = values.to(gl.float32)
+    partner = gl.gather(
+        value, ((dims - dim_base) ^ 1)[None, :] + rows[:, None] * 0, axis=1
+    )
+    first = value * cosine[None, :]
+    second = partner * sine[None, :]
+    rotated = gl.where(((dims & 1) != 0)[None, :], first + second, first - second)
+    return gl.where(rope[None, :], rotated, value).to(gl.bfloat16)
+
+
 def _selected_attention_metadata(grid, kernel, args):
     """Report the attention FLOPs and DRAM bytes of one launch.
 
@@ -628,11 +651,15 @@ def gluon_dsv41_selected_attention_reduce_gfx1250(
     num_heads,
     num_splits,
     head_blocks,
+    rope_positions,
+    rope_cos_sin,
+    stride_rope: tl.int64,
     BLOCK_H: gl.constexpr,
     HEAD_GROUPS: gl.constexpr,
     MAX_SPLITS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     DIM_BLOCK: gl.constexpr,
+    ROPE_DIM: gl.constexpr,
 ):
     """Merge one token's split partials, adding the sink once.
 
@@ -716,12 +743,23 @@ def gluon_dsv41_selected_attention_reduce_gfx1250(
     scale = gl.convert_layout(
         gl.where(total > 0.0, 1.0 / total, 0.0), gl.SliceLayout(1, out_layout)
     )
+    result = (merged * scale[:, None]).to(gl.bfloat16)
+    if ROPE_DIM > 0:
+        if dim_base + DIM_BLOCK > HEAD_DIM - ROPE_DIM:
+            rope_row = (
+                rope_cos_sin
+                + gl.maximum(gl.load(rope_positions + token_idx), 0).to(tl.int64)
+                * stride_rope
+            )
+            result = _inverse_rope(
+                result, dims, out_heads, rope_row, dim_base, ROPE_DIM
+            )
     gl.store(
         out
         + token_idx.to(tl.int64) * stride_o_t
         + out_heads[:, None].to(tl.int64) * stride_o_h
         + dims[None, :],
-        (merged * scale[:, None]).to(gl.bfloat16),
+        result,
         mask=(out_heads < num_heads)[:, None],
     )
 
@@ -763,6 +801,55 @@ def _integers(x, shape, name):
         raise ValueError(f"{name} must be int32/int64 with shape {shape}")
 
 
+@gluon.jit
+def gluon_dsv41_output_rope_gfx1250(
+    out,
+    rope_positions,
+    rope_cos_sin,
+    stride_o_t,
+    stride_o_h,
+    stride_rope: tl.int64,
+    num_heads,
+    BLOCK_H: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    ROPE_DIM: gl.constexpr,
+):
+    """Rotate the RoPE tail of BLOCK_H heads of one token's output in place.
+
+    Even and odd dims load separately, so the rotation needs no lane swap.
+    """
+    gl.static_assert(ROPE_DIM >= 2 and ROPE_DIM <= 64, "RoPE tail of 2 to 64")
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1], [64 // ROPE_DIM, ROPE_DIM // 2], [4, 1], [1, 0]
+    )
+    token_idx = gl.program_id(axis=0)
+    heads = gl.program_id(axis=1) * BLOCK_H + gl.arange(
+        0, BLOCK_H, layout=gl.SliceLayout(1, layout)
+    )
+    pairs = gl.arange(0, ROPE_DIM // 2, layout=gl.SliceLayout(0, layout))
+    token_out = out + token_idx.to(tl.int64) * stride_o_t + (HEAD_DIM - ROPE_DIM)
+    even_offsets = heads[:, None] * stride_o_h + 2 * pairs[None, :]
+    mask = (heads < num_heads)[:, None]
+    rope_row = (
+        rope_cos_sin
+        + gl.maximum(gl.load(rope_positions + token_idx), 0).to(tl.int64) * stride_rope
+    )
+    cosine = gl.load(rope_row + pairs)[None, :]
+    sine = gl.load(rope_row + ROPE_DIM // 2 + pairs)[None, :]
+    even = gl.load(token_out + even_offsets, mask=mask, other=0.0).to(gl.float32)
+    odd = gl.load(token_out + even_offsets + 1, mask=mask, other=0.0).to(gl.float32)
+    gl.store(
+        token_out + even_offsets,
+        (even * cosine - odd * sine).to(gl.bfloat16),
+        mask=mask,
+    )
+    gl.store(
+        token_out + even_offsets + 1,
+        (odd * cosine + even * sine).to(gl.bfloat16),
+        mask=mask,
+    )
+
+
 def launch_gluon_dsv41_selected_attention_gfx1250(
     q,
     swa_cache,
@@ -778,12 +865,22 @@ def launch_gluon_dsv41_selected_attention_gfx1250(
     schedule,
     prefill_kv,
     prefill_indices,
+    rope_positions=None,
+    rope_cos_sin=None,
 ):
-    """Fused SWA+global selected attention over V4.1 page-planar caches."""
+    """Fused SWA+global selected attention over V4.1 page-planar caches.
+
+    With ``rope_positions`` [tokens] and an FP32 ``rope_cos_sin`` table
+    [positions, rope_dim] (inverse signs), the output tail is also rotated, as
+    ``rope_inplace`` would do afterwards: in the split reduction, or in a
+    per-token pass when the rows do not split. Paged decode inputs only.
+    """
     attn_sink = attn_sink[: q.shape[1]]
     if prefill_kv is not None:
         if prefill_indices is None:
             raise ValueError("prefill_kv requires prefill_indices")
+        if rope_positions is not None or rope_cos_sin is not None:
+            raise ValueError("output RoPE needs paged decode inputs")
         from tokenspeed_kernel.ops.attention.dsv4 import dsv4_prefill
 
         out = _output(out, q.shape, q.dtype, q.device)
@@ -807,6 +904,18 @@ def launch_gluon_dsv41_selected_attention_gfx1250(
         return out
     if prefill_indices is not None:
         raise ValueError("prefill_indices requires prefill_kv")
+    rope = rope_cos_sin is not None
+    if rope:
+        if (
+            rope_cos_sin.ndim != 2
+            or rope_cos_sin.dtype != torch.float32
+            or rope_cos_sin.stride(1) != 1
+            or rope_cos_sin.shape[1] not in (2, 4, 8, 16, 32, 64)
+        ):
+            raise ValueError("rope_cos_sin must be FP32 [positions, rope_dim]")
+        _integers(rope_positions, (q.shape[0],), "rope_positions")
+    elif rope_positions is not None:
+        raise ValueError("rope_positions requires rope_cos_sin")
     if q.ndim != 3 or q.shape[-1] != 512 or q.dtype != torch.bfloat16 or q.shape[1] < 1:
         raise ValueError("q must be BF16 [tokens, heads, 512]")
     if query_chunk_size < 1:
@@ -972,11 +1081,31 @@ def launch_gluon_dsv41_selected_attention_gfx1250(
             q.shape[1],
             splits,
             head_blocks,
+            rope_positions if rope else swa_lens_i,
+            rope_cos_sin if rope else sink,
+            rope_cos_sin.stride(0) if rope else 0,
             BLOCK_H=_BLOCK_H,
             HEAD_GROUPS=head_groups,
             MAX_SPLITS=_MAX_SPLITS,
             HEAD_DIM=_HEAD_DIM,
             DIM_BLOCK=_REDUCE_DIM_BLOCK,
+            ROPE_DIM=rope_cos_sin.shape[1] if rope else 0,
+            num_warps=4,
+        )
+    elif rope:
+        # Rotating in the single-split epilogue costs this register-heavy
+        # kernel more than a separate pass.
+        gluon_dsv41_output_rope_gfx1250[(tokens, triton.cdiv(q.shape[1], _BLOCK_H))](
+            out,
+            rope_positions,
+            rope_cos_sin,
+            out.stride(0),
+            out.stride(1),
+            rope_cos_sin.stride(0),
+            q.shape[1],
+            BLOCK_H=_BLOCK_H,
+            HEAD_DIM=_HEAD_DIM,
+            ROPE_DIM=rope_cos_sin.shape[1],
             num_warps=4,
         )
     return out

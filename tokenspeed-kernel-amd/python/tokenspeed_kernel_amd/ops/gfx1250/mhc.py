@@ -26,8 +26,10 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 __all__ = [
+    "gluon_mhc_apply_pre_fp8_group32_gfx1250",
     "gluon_mhc_mixes_project_gfx1250",
     "gluon_mhc_mixes_reduce_gfx1250",
+    "launch_gluon_mhc_apply_pre_fp8_group32_gfx1250",
     "launch_gluon_mhc_mixes_project_gfx1250",
     "launch_gluon_mhc_mixes_reduce_gfx1250",
     "use_gluon_mhc_mixes_project_gfx1250",
@@ -37,6 +39,7 @@ _BLOCK_M = 64
 _TILE_CONFIGS = ((128, 4), (64, 4), (64, 3))
 _WARP_BASES_M4 = ((1, 0), (2, 0))
 _REDUCE_WARPS = 4
+_APPLY_PRE_WARPS = 4
 
 
 @gluon.jit
@@ -463,3 +466,137 @@ def launch_gluon_mhc_mixes_reduce_gfx1250(
         NUM_WARPS=_REDUCE_WARPS,
         num_warps=_REDUCE_WARPS,
     )
+
+
+def _mhc_apply_pre_fp8_metadata(grid, kernel, args):
+    """Report the four streams read and the BF16 output, codes and scales
+    written per token."""
+    tokens = args["num_tokens"]
+    hidden = args["HIDDEN_SIZE"]
+    return {
+        "name": kernel.name,
+        "bytes": tokens * hidden * (8 + 2 + 1)
+        + tokens * (16 + hidden // 32)
+        + hidden * args["norm_weight"].element_size(),
+        "flops32": tokens * hidden * 12,
+    }
+
+
+@gluon.jit(
+    launch_metadata=_mhc_apply_pre_fp8_metadata, do_not_specialize=("num_tokens",)
+)
+def gluon_mhc_apply_pre_fp8_group32_gfx1250(
+    pre_mix,
+    residual,
+    norm_weight,
+    out,
+    codes,
+    scales,
+    num_tokens,
+    HIDDEN_SIZE: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    EPS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Collapse four BF16 streams with ``pre_mix``, apply RMSNorm, and store
+    the BF16 result with its group-32 E4M3 codes and UE8M0 scales.
+
+    One token per CTA so RMSNorm reduces the row in one pass; every lane moves
+    eight contiguous BF16 values (16-byte accesses), so four lanes hold one
+    quantization group. Rounded like ``gluon_quantize_fp8_group32_ue8m0_gfx1250``
+    reading the BF16 output.
+    """
+    token = gl.program_id(0)
+    layout: gl.constexpr = gl.BlockedLayout([8], [32], [NUM_WARPS], [0])
+    hidden = gl.arange(0, BLOCK_H, layout=layout)
+    mask = hidden < HIDDEN_SIZE
+    base = token * (4 * HIDDEN_SIZE) + hidden
+    acc = gl.zeros([BLOCK_H], gl.float32, layout=layout)
+    for stream in gl.static_range(4):
+        coefficient = gl.load(pre_mix + token * 4 + stream)
+        acc += coefficient * gl.amd.cdna5.buffer_load(
+            residual, base + stream * HIDDEN_SIZE, mask=mask
+        ).to(gl.float32)
+    # The weighted stream sum is rounded to BF16 before RMSNorm reads it, as
+    # in the unfused path.
+    normed = acc.to(gl.bfloat16).to(gl.float32)
+    variance = gl.sum(normed * normed, axis=0) / HIDDEN_SIZE
+    scale = gl.rsqrt(variance + EPS)
+    weight = gl.amd.cdna5.buffer_load(norm_weight, hidden, mask=mask).to(gl.float32)
+    values = (normed * scale * weight).to(gl.bfloat16)
+    gl.amd.cdna5.buffer_store(values, out, token * HIDDEN_SIZE + hidden, mask=mask)
+    groups = gl.reshape(values.to(gl.float32), [BLOCK_H // 32, 32])
+    amax = gl.maximum(gl.max(gl.abs(groups), 1), 1.0e-4)
+    bits = (amax * (1.0 / 448.0)).to(gl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(gl.int32)
+    group_scale = (exponent << 23).to(gl.float32, bitcast=True)
+    quantized = gl.div_rn(groups, group_scale[:, None]).to(gl.float8e4nv)
+    quantized = gl.convert_layout(gl.reshape(quantized, [BLOCK_H]), layout)
+    gl.amd.cdna5.buffer_store(quantized, codes, token * HIDDEN_SIZE + hidden, mask=mask)
+    group = gl.arange(0, BLOCK_H // 32, layout=gl.SliceLayout(1, groups.type.layout))
+    gl.amd.cdna5.buffer_store(
+        exponent.to(gl.uint8),
+        scales,
+        token * (HIDDEN_SIZE // 32) + group,
+        mask=group < HIDDEN_SIZE // 32,
+    )
+
+
+def launch_gluon_mhc_apply_pre_fp8_group32_gfx1250(
+    residual: torch.Tensor,
+    pre_mix: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Mix four BF16 streams with ``pre_mix``, apply RMSNorm and quantize.
+
+    Args:
+        residual: Contiguous BF16 residual streams ``[..., 4, hidden_size]``,
+            ``hidden_size`` divisible by 32.
+        pre_mix: Contiguous FP32 coefficients ``[..., 4]``.
+        norm_weight: Contiguous BF16 or FP32 RMSNorm weight ``[hidden_size]``.
+        norm_eps: RMSNorm epsilon.
+
+    Returns:
+        BF16 layer input ``[..., hidden_size]``, its group-32 E4M3 codes
+        ``[tokens, hidden_size]`` and uint8 UE8M0 scales
+        ``[tokens, hidden_size // 32]``.
+    """
+    hidden_size = residual.shape[-1]
+    if residual.shape[-2] != 4 or pre_mix.shape[-1] != 4:
+        raise ValueError("GFX1250 mHC apply-pre requires four residual streams")
+    if norm_weight.shape != (hidden_size,) or hidden_size % 32:
+        raise ValueError(
+            "GFX1250 mHC apply-pre needs a [hidden_size] norm weight and "
+            "hidden_size % 32 == 0"
+        )
+    if not all(t.is_contiguous() for t in (pre_mix, residual, norm_weight)):
+        raise ValueError("GFX1250 mHC apply-pre tensors must be contiguous")
+    if residual.dtype != torch.bfloat16 or pre_mix.dtype != torch.float32:
+        raise ValueError("GFX1250 mHC apply-pre needs BF16 streams, FP32 pre_mix")
+    if residual.numel() >= 2**31:
+        raise ValueError("GFX1250 mHC apply-pre exceeds 32-bit buffer offsets")
+    out = residual.new_empty((*residual.shape[:-2], hidden_size))
+    num_tokens = residual.numel() // (4 * hidden_size)
+    codes = torch.empty(
+        (num_tokens, hidden_size), dtype=torch.float8_e4m3fn, device=out.device
+    )
+    scales = torch.empty(
+        (num_tokens, hidden_size // 32), dtype=torch.uint8, device=out.device
+    )
+    if num_tokens:
+        gluon_mhc_apply_pre_fp8_group32_gfx1250[(num_tokens,)](
+            pre_mix,
+            residual,
+            norm_weight,
+            out,
+            codes,
+            scales,
+            num_tokens,
+            HIDDEN_SIZE=hidden_size,
+            BLOCK_H=triton.next_power_of_2(hidden_size),
+            EPS=norm_eps,
+            NUM_WARPS=_APPLY_PRE_WARPS,
+            num_warps=_APPLY_PRE_WARPS,
+        )
+    return out, codes, scales

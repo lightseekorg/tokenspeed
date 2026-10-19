@@ -30,12 +30,15 @@ from utils import assert_no_triton_compile, is_cdna5
 if not is_cdna5():
     pytest.skip("AMD CDNA5 is required", allow_module_level=True)
 
+from tokenspeed_kernel.ops.quantization import quantize_fp8  # noqa: E402
+from tokenspeed_kernel.ops.residual import mhc_apply_pre_quantize_fp8  # noqa: E402
 from tokenspeed_kernel.ops.residual.gluon import (  # noqa: E402
     gluon_mhc_mixes_gfx1250,
     gluon_mhc_pre_gfx1250,
 )
 from tokenspeed_kernel.ops.residual.triton import (  # noqa: E402
     compute_mhc_num_splits,
+    triton_mhc_apply_pre,
 )
 from tokenspeed_kernel.selection import select_kernel  # noqa: E402
 from tokenspeed_kernel.signature import (  # noqa: E402
@@ -168,6 +171,47 @@ def test_mhc_pre_selects_gfx1250_kernel() -> None:
         traits={"num_tokens": 8, "hc_mult": 4, "hidden_size": 4096},
     )
     assert kernel.name == "gluon_mhc_pre_gfx1250"
+
+
+@pytest.mark.parametrize("tokens", [1, 5, 80, 2048])
+def test_mhc_apply_pre_quantize_fp8_matches_unfused(tokens: int) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(tokens)
+    residual = torch.randn(
+        tokens, 4, 5120, device="cuda", generator=generator
+    ).bfloat16()
+    pre = torch.rand(tokens, 4, device="cuda", generator=generator)
+    weight = torch.rand(5120, device="cuda", generator=generator).bfloat16()
+    out, codes, scales = mhc_apply_pre_quantize_fp8(residual, pre, weight, _RMS_EPS)
+    expected = triton_mhc_apply_pre(
+        residual, pre, norm_weight=weight, norm_eps=_RMS_EPS
+    )
+    # The RMS reduction order differs, which moves a rare value by one ulp.
+    torch.testing.assert_close(out, expected, atol=0, rtol=2**-7)
+    assert (out != expected).double().mean().item() < 1e-3
+    expected_codes, expected_scales = quantize_fp8(
+        out,
+        granularity="token_group",
+        group_size=32,
+        scale_encoding="ue8m0",
+        enable_pdl=False,
+        override=None,
+        solution=None,
+    )
+    assert torch.equal(codes.view(torch.uint8), expected_codes.view(torch.uint8))
+    assert torch.equal(scales, expected_scales)
+
+
+def test_mhc_apply_pre_fp8_selects_gfx1250_kernel() -> None:
+    kernel = select_kernel(
+        "residual",
+        "mhc_apply_pre_fp8_group32",
+        format_signature(
+            residual=dense_tensor_format(torch.bfloat16),
+            pre=dense_tensor_format(torch.float32),
+        ),
+        traits={"buffer_offsets_fit_int32": True, "hc_mult": 4},
+    )
+    assert kernel.name == "gluon_mhc_apply_pre_fp8_group32_gfx1250"
 
 
 def test_mhc_mixes_cuda_graph_replay() -> None:

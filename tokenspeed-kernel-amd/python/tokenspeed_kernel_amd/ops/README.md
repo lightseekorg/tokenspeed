@@ -441,9 +441,10 @@ projection covers other batch sizes with the same model dimensions.
 ### gfx1250 BF16 GEMM
 
 `gluon_mm_a16w16_gfx1250` is a general BF16 GEMM with FP32 or BF16 output. It
-backs the DeepSeek V4.1 FP32 projection (`gluon_dsv4_linear_fp32_gfx1250`) and
-single-group BF16 projections up to 2048 rows
-(`gluon_grouped_bf16_projection_gfx1250`).
+backs the DeepSeek V4.1 FP32 projection (`gluon_dsv4_linear_fp32_gfx1250`).
+`gluon_grouped_mm_a16w16_gfx1250` runs the one- or two-group `wo_a`
+projections up to 2048 rows (`gluon_grouped_bf16_projection_gfx1250`) and can
+quantize the result for `wo_b` (`gluon_grouped_bf16_projection_fp8_gfx1250`).
 
 #### Contract
 
@@ -452,6 +453,11 @@ single-group BF16 projections up to 2048 rows
   and `K` divisible by 128.
 - Output is FP32 or BF16, chosen explicitly. A caller-owned output needs a unit
   column stride.
+- The grouped form takes `A` `[M, G, K]` with a unit inner stride and
+  contiguous `B` `[G, N, K]`, and returns contiguous BF16 `[M, G, N]`. With
+  quantization (`N` divisible by 32) it returns E4M3 codes `[M, G * N]` and
+  uint8 UE8M0 scales `[M, G * N / 32]`, bit-identical to quantizing the BF16
+  result with `gluon_quantize_fp8_group32_ue8m0_gfx1250`.
 
 #### Algorithm
 
@@ -465,6 +471,15 @@ batches use `128 x 64` tiles, split K in two when the grid still fits, and move
 to the large-M kernel once those tiles alone exceed the CUs. Split partials are
 FP32 and the shared reduction sums them in split order, so results are
 deterministic.
+
+The groups of a grouped call share one grid: the column-tile axis enumerates
+every group's tiles, and the tile choice above sees `G * N` columns. Batches
+beyond the dense tiles run each group on the large-M kernel. With
+quantization, the split-K reduction rounds each sum to BF16 and stores codes
+and scales instead of the BF16 result, so the activation never reaches
+memory. Up to 32 rows, which otherwise do not split, use 32-column tiles with
+K split in two; other batches whose tiles do not split K project, then
+quantize.
 
 ### gfx1250 dense BF16 large-M projection
 
@@ -820,6 +835,16 @@ x tiles stays within 640. That re-reads each selected row once per head
 block in exchange for more parallel workgroups, so the token count picks one
 of three compiled head-group widths. A split also covers at least two tiles,
 so SWA-only calls, which have two tiles, never split.
+
+`gluon_dsv41_selected_attention_rope_gfx1250` serves
+`dsv41_selected_attention_rope`. The split reduction rotates the RoPE tail of
+each output row back with the FP32 inverse table at the row's position before
+its store, so the unrotated output never reaches memory. Unlike gfx950, rows
+that do not split (from about 129 decode rows) rotate after the main kernel,
+in `gluon_dsv41_output_rope_gfx1250`, because rotating in its epilogue cost
+that register-heavy kernel 7 us at 129 and 192 rows. That pass covers 16
+heads per program and loads even and odd dims separately, so the rotation
+needs no lane swap; it costs no more than `rope_inplace` over the real heads.
 
 ### gfx950 QSA sparse attention
 
@@ -1816,6 +1841,28 @@ partition are runtime arguments.
 The reduction is the gfx950 kernel on 32-lane waves: sixteen lanes own a
 token's 4x4 matrix, so a wave covers two tokens when the splits stay in
 registers and one when they also spread over lanes.
+
+### gfx1250 mHC stream collapse with FP8 output
+
+`gluon_mhc_apply_pre_fp8_group32_gfx1250` serves `mhc_apply_pre_fp8_group32`
+for DeepSeek V4.1: the gfx950 stream collapse with RMSNorm that also writes
+the group-32 FP8 input of the next projection.
+
+#### Contract
+
+- Contiguous BF16 residual `[T, 4, H]` with `H` divisible by 32 and fewer
+  than 2^31 elements, FP32 pre coefficients `[T, 4]` and a BF16 or FP32 norm
+  weight `[H]`.
+- Returns the BF16 layer input `[T, H]`, numerically the gfx950 normalized
+  collapse, with E4M3 codes `[T, H]` and uint8 UE8M0 scales `[T, H / 32]`
+  bit-identical to `gluon_quantize_fp8_group32_ue8m0_gfx1250` reading it.
+
+#### Algorithm
+
+One four-wave CTA owns a token, so RMSNorm reduces the row once; each lane
+moves eight contiguous BF16 values, and four lanes hold one quantization
+group. The BF16-rounded result is quantized from registers, which saves the
+quantizer's launch and its re-read of the row.
 
 ## Quantization
 

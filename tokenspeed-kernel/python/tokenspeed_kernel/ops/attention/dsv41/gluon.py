@@ -158,6 +158,52 @@ if current_platform().is_amd:
 
     @register_kernel(
         "attention",
+        "dsv41_selected_attention_rope",
+        name="gluon_dsv41_selected_attention_rope_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_dsv41_selected_attention_rope_gfx1250(
+        q,
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        global_cache,
+        global_slots,
+        global_lens,
+        attn_sink,
+        softmax_scale,
+        schedule,
+        positions,
+        cos_sin_cache,
+    ):
+        return _dsv41_selected_gfx1250(
+            q,
+            swa_cache,
+            swa_slots,
+            swa_lens,
+            global_cache,
+            global_slots,
+            global_lens,
+            attn_sink,
+            softmax_scale,
+            None,
+            256,
+            schedule,
+            None,
+            None,
+            positions,
+            cos_sin_cache,
+        )
+
+    @register_kernel(
+        "attention",
         "dsv41_index_topk",
         name="gluon_dsv41_index_topk_gfx1250",
         solution="gluon",
