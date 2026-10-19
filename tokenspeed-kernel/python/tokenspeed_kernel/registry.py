@@ -170,7 +170,7 @@ class KernelSpec:
     features: frozenset[str] = (
         frozenset()
     )  # Orthogonal features, e.g., {"paged", "mla"}
-    solution: str = ""  # "triton", "flashinfer", "cutlass", "reference", etc.
+    solution: str = ""  # "triton", "flashinfer", "cutlass", "torch", etc.
 
     # Capabilities
     capability: CapabilityRequirement = field(default_factory=CapabilityRequirement)
@@ -496,10 +496,12 @@ def load_builtin_kernels() -> None:
     if not KernelRegistry.get().list_kernels():
         # Registry was reset; clear cached ops modules so decorators re-run.
         for key in list(sys.modules.keys()):
-            if key.startswith("tokenspeed_kernel.ops.") or key.startswith(
-                "tokenspeed_kernel.numerics.reference."
+            if key.startswith("tokenspeed_kernel.ops.") or (key + ".").startswith(
+                "tokenspeed_kernel.numerics.torch."
             ):
                 del sys.modules[key]
+    # PyTorch references, the ground truth for numerics and benchmark checks.
+    import tokenspeed_kernel.numerics.torch  # noqa: F401
     import tokenspeed_kernel.ops.attention  # noqa: F401
     import tokenspeed_kernel.ops.attention.dsa  # noqa: F401
     import tokenspeed_kernel.ops.attention.dsv4  # noqa: F401

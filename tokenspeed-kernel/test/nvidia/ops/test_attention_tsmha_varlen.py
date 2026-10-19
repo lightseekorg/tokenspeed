@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.rmha import torch_rel_attention
 from tokenspeed_kernel.ops.attention.rmha import cuda as fa_mod
 from tokenspeed_kernel.ops.attention.rmha import (
     rel_mha_extend_with_kvcache,
@@ -58,27 +59,6 @@ def _require_fa4(require) -> None:
 def _skip_unless_routable() -> None:
     if not getattr(fa_mod, "_TSMHA_REL_EXTEND", False):
         pytest.skip("TSMHA_REL_EXTEND disabled in this environment")
-
-
-def _ref_rel_attn(q, k, v, rel_logits, rel_extent, window_left, scale):
-    """Per-sequence torch reference. q [Sq,H,D], k/v [Sk,KV,D], rel [Sq,H,E]."""
-    Sq, H, _ = q.shape
-    Sk, KV, _ = k.shape
-    k = k.repeat_interleave(H // KV, dim=1)
-    v = v.repeat_interleave(H // KV, dim=1)
-    logits = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * scale
-    q_pos = torch.arange(Sq, device=q.device) + (Sk - Sq)
-    kv_pos = torch.arange(Sk, device=q.device)
-    dist = q_pos[:, None] - kv_pos[None, :]
-    in_range = (dist >= 0) & (dist < rel_extent)
-    idx = dist.clamp(0, rel_extent - 1)
-    bias = rel_logits.float().gather(-1, idx.unsqueeze(1).expand(Sq, H, Sk))
-    logits = logits + bias.permute(1, 0, 2).masked_fill(~in_range[None], 0.0)
-    masked = dist < 0
-    if window_left >= 0:
-        masked = masked | (dist > window_left)
-    logits = logits.masked_fill(masked[None], -torch.inf)
-    return torch.einsum("hqk,khd->qhd", torch.softmax(logits, dim=-1), v.float())
 
 
 def _cu(lens, device):
@@ -163,7 +143,7 @@ def test_tsmha_varlen_prefill(
 
     for i, length in enumerate(q_lens):
         s = cu_cpu[i]
-        ref = _ref_rel_attn(
+        ref, _ = torch_rel_attention(
             q[s : s + length],
             k[s : s + length],
             v[s : s + length],
@@ -230,7 +210,7 @@ def test_tsmha_varlen_extend_paged(
 
     for i, (ql, kl) in enumerate(zip(q_lens, kv_lens)):
         s = cu_cpu[i]
-        ref = _ref_rel_attn(
+        ref, _ = torch_rel_attention(
             q[s : s + ql],
             ks[i],
             vs[i],
@@ -273,7 +253,7 @@ def test_tsmha_varlen_gate_falls_back(device: str, require) -> None:
     assert set(rel_extend._FWD_VARLEN) == keys_before
     for i, length in enumerate(q_lens):
         s = cu_cpu[i]
-        ref = _ref_rel_attn(
+        ref, _ = torch_rel_attention(
             q[s : s + length],
             k[s : s + length],
             v[s : s + length],

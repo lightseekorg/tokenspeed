@@ -24,6 +24,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.qsa import (
+    torch_qsa_paged_block_scores,
+)
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -72,14 +75,9 @@ def _inputs(widths, contexts, heads=4, head_dim=128, seed=0):
 
 
 def _reference_scores(query, key_cache, table, requests, complete):
-    num_blocks = table.shape[1] * _PAGE_SIZE
-    blocks = torch.arange(num_blocks, device=query.device)
-    slots = table[requests].long()[:, blocks // _PAGE_SIZE] * _PAGE_SIZE + (
-        blocks % _PAGE_SIZE
+    return torch_qsa_paged_block_scores(
+        query, key_cache, table, requests, complete, page_size=_PAGE_SIZE
     )
-    keys = key_cache[slots, 0].float()
-    scores = torch.relu(torch.einsum("rhd,rnd->rhn", query.float(), keys)).sum(1)
-    return torch.where(blocks[None, :] < complete[:, None], scores, -torch.inf)
 
 
 # Prefill-sized single requests, MTP verify runs of four rows and one-row

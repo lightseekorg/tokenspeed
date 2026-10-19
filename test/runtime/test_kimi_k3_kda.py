@@ -27,6 +27,10 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.kda import (
+    kda_delta_rule,
+    kda_gate,
+)
 from tokenspeed_kernel.ops.attention.kda import kda_recurrent_layout
 from tokenspeed_kernel.platform import current_platform
 
@@ -251,25 +255,18 @@ def _naive_kda_scan(q, k, v, g_raw, beta_raw, A_log, dt_bias, lower_bound, S0):
     beta = sigmoid(beta_raw), scale = D ** -0.5.
     """
     T, H, D = q.shape
-    qf = q.float()
-    kf = k.float()
+    qf, kf = q.float(), k.float()
     qf = qf / (qf.pow(2).sum(-1, keepdim=True) + 1e-6).sqrt()
     kf = kf / (kf.pow(2).sum(-1, keepdim=True) + 1e-6).sqrt()
-    g = lower_bound * torch.sigmoid(
-        A_log.float().exp().view(H, 1) * (g_raw.float() + dt_bias.float().view(H, D))
+    outputs, state = kda_delta_rule(
+        qf * D**-0.5,
+        kf,
+        v,
+        kda_gate(g_raw, A_log, dt_bias.view(H, D), lower_bound=lower_bound),
+        torch.sigmoid(beta_raw.float()),
+        S0.transpose(-1, -2),
     )
-    beta = torch.sigmoid(beta_raw.float())
-    scale = D**-0.5
-    S = S0.float().clone()
-    vf = v.float()
-    outs = []
-    for t in range(T):
-        S = S * g[t].exp().unsqueeze(-1)
-        kt = kf[t]
-        v_delta = vf[t] - (kt.unsqueeze(-1) * S).sum(-2)
-        S = S + (beta[t].unsqueeze(-1) * kt).unsqueeze(-1) * v_delta.unsqueeze(-2)
-        outs.append(((qf[t] * scale).unsqueeze(-1) * S).sum(-2))
-    return torch.stack(outs), S
+    return outputs, state.transpose(-1, -2)
 
 
 # ---------------------------------------------------------------------------

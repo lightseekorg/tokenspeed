@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.kvcache import torch_store_sf_interleaved
 
 triton_mod = pytest.importorskip("tokenspeed_kernel.ops.kvcache.triton")
 store_sf_interleaved = triton_mod.store_sf_interleaved
@@ -39,25 +40,6 @@ needs_cuda = pytest.mark.skipif(
 NHEADS = 4
 SF_DIM = 4  # head_dim 128 / sf_vec_size 32
 PAGE = 128
-
-
-def _ref_scatter(sf_in: torch.Tensor, sf_out: torch.Tensor, loc: torch.Tensor):
-    """Documented mapping, applied one token at a time in torch."""
-    out_u32 = sf_out.view(torch.uint8).reshape(-1, 4).view(torch.int32).reshape(-1)
-    in_u32 = (
-        sf_in.view(torch.uint8)
-        .reshape(sf_in.shape[0], NHEADS, 4)
-        .contiguous()
-        .view(torch.int32)
-        .reshape(sf_in.shape[0], NHEADS)
-    )
-    page_stride = NHEADS * 128
-    for t in range(sf_in.shape[0]):
-        slot = int(loc[t])
-        page, off = divmod(slot, PAGE)
-        pos = (off % 32) * 4 + (off // 32)
-        for h in range(NHEADS):
-            out_u32[page * page_stride + h * 128 + pos] = in_u32[t, h]
 
 
 @needs_cuda
@@ -76,7 +58,7 @@ def test_matches_reference_scatter(num_tokens: int):
     ref = torch.zeros_like(out)
 
     store_sf_interleaved(sf_in, out, loc)
-    _ref_scatter(sf_in, ref, loc)
+    torch_store_sf_interleaved(sf_in, ref, loc, PAGE)
 
     assert torch.equal(out.view(torch.uint8), ref.view(torch.uint8))
 

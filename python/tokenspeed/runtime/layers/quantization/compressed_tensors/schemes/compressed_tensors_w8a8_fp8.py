@@ -110,7 +110,7 @@ def fp8_channel_gemm_available(platform=None) -> bool:
 
 
 def fp8_unscaled_gemm_available(platform=None) -> bool:
-    """Whether a vendor (not Triton, not reference) FP8 GEMM taking one FP32
+    """Whether a vendor (not Triton, not torch) FP8 GEMM taking one FP32
     scale per operand is registered for ``platform`` (default: this
     process's): the GEMM ``fp8_unscaled_linear`` runs with unit scales,
     leaving the per-token and per-channel scales to the kernel that consumes
@@ -128,7 +128,7 @@ def fp8_unscaled_gemm_available(platform=None) -> bool:
         platform=platform or current_platform(),
         format_signature=format_signature(a=operand, b=operand),
     )
-    return any(spec.solution not in ("triton", "reference") for spec in kernels)
+    return any(spec.solution not in ("triton", "torch") for spec in kernels)
 
 
 def fp8_unscaled_linear(

@@ -38,6 +38,7 @@ from unittest.mock import Mock
 import pytest
 import tokenspeed_kernel.ops.gemm as gemm_api
 import torch
+from tokenspeed_kernel.numerics.torch.gemm import fma32, torch_simt_gemm_fp32
 from tokenspeed_kernel.ops.gemm import _select_mv as _select
 from tokenspeed_kernel.ops.gemm import mv, mv_weight_split
 from tokenspeed_kernel.ops.gemm._gluon import gemv as gluon_gemv
@@ -67,51 +68,6 @@ _requires_split_kernel = pytest.mark.skipif(
     or not (10, 0) <= torch.cuda.get_device_capability() <= (10, 3),
     reason="the BF16x3 split kernel is registered for SM100 to SM103",
 )
-
-
-def _fma32(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-    """FP32 ``fma(a, b, c)`` exactly.
-
-    ``a * b`` of two FP32 values is exact in FP64; TwoSum gives the tail of
-    ``p + c``, and the FP32 rounding of the FP64 sum is the exact sum's
-    except on an FP32 midpoint, where the tail's sign decides.
-    """
-    p = a.double() * b.double()
-    c64 = c.double()
-    s = p + c64
-    bb = s - p
-    tail = (p - (s - bb)) + (c64 - bb)
-    r = s.float()
-    up = torch.nextafter(r, torch.full_like(r, float("inf")))
-    down = torch.nextafter(r, torch.full_like(r, float("-inf")))
-    above = (s == (r.double() + up.double()) * 0.5) & (tail > 0)
-    below = (s == (r.double() + down.double()) * 0.5) & (tail < 0)
-    return torch.where(above, up, torch.where(below, down, r))
-
-
-def _order_reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """The kernel's summation order (module doc of gluon_gemv) on the CPU."""
-    x, weight = x.float().cpu(), weight.float().cpu()
-    (m, k), n = x.shape, weight.shape[0]
-    chunk = k // 4
-    total = torch.zeros(m, n)
-    for s in range(4):
-        acc = torch.zeros(m, n, 128)
-        for i in range(chunk // 128):
-            k0 = s * chunk + 128 * i
-            acc = _fma32(
-                x[:, None, k0 : k0 + 128].expand(m, n, 128),
-                weight[None, :, k0 : k0 + 128].expand(m, n, 128),
-                acc,
-            )
-        # Lane 4 t + v: each warp lane t adds its four chains in order, then
-        # the warp runs the xor butterfly.
-        lanes = acc.view(m, n, 32, 4)
-        u = ((lanes[..., 0] + lanes[..., 1]) + lanes[..., 2]) + lanes[..., 3]
-        for offset in (16, 8, 4, 2, 1):
-            u = u + u[..., torch.arange(32) ^ offset]
-        total = total + u[..., 0]
-    return total
 
 
 def _error_bound(
@@ -163,7 +119,7 @@ def test_reference_fma_rounds_exactly():
         c = torch.tensor(-a * b * (1 + rng.gauss(0, 2.0**-20))).item()
         cases.append((a, b, c))
     a, b, c = (torch.tensor(column) for column in zip(*cases))
-    got = _fma32(a, b, c)
+    got = fma32(a, b, c)
     for (ai, bi, ci), gi in zip(cases, got.tolist()):
         exact = Fraction(ai) * Fraction(bi) + Fraction(ci)
         assert gi == _round_to_fp32(exact), (ai, bi, ci)
@@ -178,7 +134,7 @@ def test_reference_stays_inside_the_error_bound(k, x_dtype):
     # Rows that cancel: the second half negates the first half's products.
     x[1, k // 2 :] = -x[1, : k // 2]
     weight[1, k // 2 :] = weight[1, : k // 2]
-    got = _order_reference(x, weight).double()
+    got = torch_simt_gemm_fp32(x, weight).double()
     exact = x.double() @ weight.double().t()
     assert ((got - exact).abs() <= _error_bound(x, weight)).all()
     assert (got != exact).any()  # FP32 rounding, not a wider sum
@@ -429,7 +385,7 @@ def test_kernel_matches_the_reference_bit_for_bit(x_dtype, m, n, k):
     weight = torch.randn(n, k, device="cuda") * 0.02
     out = torch.full((m, n), float("nan"), device="cuda")
     assert gluon_simt_gemm_fp32(x, weight, out) is out
-    assert torch.equal(_bits(out), _bits(_order_reference(x, weight)))
+    assert torch.equal(_bits(out), _bits(torch_simt_gemm_fp32(x, weight)))
     exact = x.double().cpu() @ weight.double().cpu().t()
     assert ((out.double().cpu() - exact).abs() <= _error_bound(x, weight)).all()
 

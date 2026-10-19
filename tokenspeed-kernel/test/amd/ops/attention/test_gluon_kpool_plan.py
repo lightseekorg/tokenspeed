@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.kpool import torch_kpool_select
 from utils import is_cdna4, is_cdna5
 
 if not (is_cdna4() or is_cdna5()):
@@ -210,37 +211,21 @@ def _reference(
     index_table: torch.Tensor,
     kv_table: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    width = _TOPK * _POOL + _POOL - 1
-    slots = torch.full((q.shape[0], width), -1, dtype=torch.int32, device=_DEVICE)
-    lens = torch.empty(q.shape[0], dtype=torch.int32, device=_DEVICE)
-    pooled_k = pooled_k.view(-1, _PAGE, _DIM)
-    for token in range(q.shape[0]):
-        req = int(req_ids[token])
-        causal = max(int(causal_lens[token]), 0)
-        num_pools = causal // _POOL
-        if num_pools <= _TOPK:
-            selected = torch.arange(num_pools, device=_DEVICE)
-        else:
-            pools = torch.arange(num_pools, device=_DEVICE)
-            pages = index_table[req, pools // _PAGE].long()
-            keys = pooled_k[pages, pools % _PAGE]
-            head_scores = torch.einsum("hd,pd->hp", q[token].float(), keys)
-            scores = (head_scores.mul(_SCALE).relu() * weights[token, :, None]).sum(0)
-            selected = torch.topk(scores, k=_TOPK, sorted=False).indices
-        raw_slots = (
-            selected[:, None] * _POOL + torch.arange(_POOL, device=_DEVICE)
-        ).flatten()
-        raw_slots = torch.cat(
-            (
-                raw_slots,
-                torch.arange(num_pools * _POOL, causal, device=_DEVICE),
-            )
-        ).long()
-        pages = kv_table[req, raw_slots // _KV_PAGE].long()
-        global_slots = pages * _KV_PAGE + raw_slots % _KV_PAGE
-        slots[token, : raw_slots.numel()] = global_slots.to(torch.int32)
-        lens[token] = raw_slots.numel()
-    return slots, lens
+    return torch_kpool_select(
+        q,
+        pooled_k,
+        weights,
+        causal_lens,
+        req_ids,
+        index_table,
+        kv_table,
+        topk=_TOPK,
+        pool_size=_POOL,
+        index_page_size=_PAGE,
+        kv_page_size=_KV_PAGE,
+        scale=_SCALE,
+        apply_relu=True,
+    )
 
 
 def _row_sets(

@@ -1002,10 +1002,9 @@ def gluon_mhc_apply_pre_gfx950(
 def launch_gluon_mhc_apply_pre_gfx950(
     residual: torch.Tensor,
     pre_mix: torch.Tensor,
-    *,
     norm_weight: torch.Tensor | None,
     norm_eps: float | None,
-    quantize: bool = False,
+    quantize: bool,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Mix four BF16 streams with ``pre_mix``, optionally followed by RMSNorm.
 

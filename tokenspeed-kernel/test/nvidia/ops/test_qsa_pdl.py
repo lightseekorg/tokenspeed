@@ -59,15 +59,15 @@ def _publish_inputs(sources, targets, sizes: tl.constexpr, BLOCK: tl.constexpr):
         now = tl.inline_asm_elementwise(
             "mov.u64 $0, %clock64;", "=l", [], dtype=tl.uint64, is_pure=False, pack=1
         )
+    # Keep loop bounds and offsets in 64 bits: byte counts can exceed 2 GiB.
+    first = tl.program_id(0).to(tl.int64) * BLOCK
+    step = tl.num_programs(0).to(tl.int64) * BLOCK
     for tensor in tl.static_range(len(sizes)):
-        for base in range(
-            tl.program_id(0) * BLOCK, sizes[tensor], tl.num_programs(0) * BLOCK
-        ):
+        limit = tl.full((), sizes[tensor], tl.int64)
+        for base in range(first, limit, step):
             offsets = base + tl.arange(0, BLOCK)
-            values = tl.load(
-                sources[tensor] + offsets, offsets < sizes[tensor], other=0
-            )
-            tl.store(targets[tensor] + offsets, values, offsets < sizes[tensor])
+            values = tl.load(sources[tensor] + offsets, offsets < limit, other=0)
+            tl.store(targets[tensor] + offsets, values, offsets < limit)
 
 
 def _publish(sources, targets):
@@ -78,6 +78,27 @@ def _publish(sources, targets):
         BLOCK=256,
         launch_pdl=True,
     )
+
+
+def test_qsa_publish_inputs_large_byte_offsets():
+    """The delayed producer must copy beyond the signed int32 byte boundary."""
+    size = (1 << 31) + 256
+    if torch.cuda.mem_get_info()[0] < 2 * size + (1 << 30):
+        pytest.skip("large producer regression needs two buffers above 2 GiB")
+    sources = (
+        torch.arange(16, device="cuda", dtype=torch.uint8),
+        torch.full((size,), 91, device="cuda", dtype=torch.uint8),
+    )
+    targets = tuple(torch.zeros_like(source) for source in sources)
+    _publish(sources, targets)
+    assert all(torch.equal(source, target) for source, target in zip(sources, targets))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _publish(sources, targets)
+    sources[1].fill_(37)
+    targets[1].zero_()
+    graph.replay()
+    assert all(torch.equal(source, target) for source, target in zip(sources, targets))
 
 
 @pytest.fixture

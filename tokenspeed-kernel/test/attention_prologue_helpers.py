@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Shared inputs and the fp64 reference for the attention prologue tests.
+"""Shared inputs and fp64 checks for the attention prologue tests.
 
 ``ops/attention/test_attention_prologue.py`` covers the portable solutions and
 ``nvidia/ops/attention/test_fused_attention_prologue.py`` the NVIDIA ones; both
@@ -28,6 +28,9 @@ check "rounded once" against the same fp64 norm and rotation.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.numerics.torch.attention.prologue import (
+    torch_head_norm_rope,
+)
 from tokenspeed_kernel.ops.attention.prologue import (
     HeadKVCache,
     HeadNorm,
@@ -187,17 +190,6 @@ def latent_target(
     )
 
 
-def _pair_rows(mrope: MRope, half: int) -> list[int]:
-    """The T, H or W position row of each rotary pair (Qwen2-VL and Qwen3-VL)."""
-    if not mrope.interleaved:
-        return [row for row, pairs in enumerate(mrope.section) for _ in range(pairs)]
-    _, h, w = mrope.section
-    return [
-        1 if j % 3 == 1 and j < 3 * h else 2 if j % 3 == 2 and j < 3 * w else 0
-        for j in range(half)
-    ]
-
-
 def reference_heads(
     x: torch.Tensor,
     weight: torch.Tensor | None,
@@ -205,35 +197,24 @@ def reference_heads(
     rotary: Rotary | None,
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """fp64 norm and rotation of ``[num_tokens, heads * head_dim]`` rows, and
-    the magnitude of the terms each output sums."""
-    x = x.double().reshape(x.shape[0], -1, head_dim)
-    if norm is not None:
-        rms = torch.rsqrt(x.square().mean(-1, keepdim=True) + norm.eps)
-        x = x * rms * (weight.double() + norm.weight_offset)
-    magnitude = x.abs()
-    if rotary is not None:
-        half = rotary.rotary_dim // 2
-        table = rotary.cos_sin_cache.double()
-        positions = rotary.positions
-        if positions.ndim == 2:
-            rows = torch.tensor(_pair_rows(rotary.mrope, half) * 2, device="cuda")
-            cols = torch.arange(2 * half, device="cuda")
-            positions = positions[rows].T
-            cos_sin = table[positions, cols]
-        else:
-            cos_sin = table[positions]
-        cos, sin = cos_sin[:, None, :half], cos_sin[:, None, half:]
-        if rotary.style is RopeStyle.NEOX:
-            i1, i2 = slice(0, half), slice(half, 2 * half)
-        else:
-            i1, i2 = slice(0, 2 * half, 2), slice(1, 2 * half, 2)
-        x1, x2 = x[..., i1].clone(), x[..., i2].clone()
-        x[..., i1] = x1 * cos - x2 * sin
-        x[..., i2] = x2 * cos + x1 * sin
-        magnitude[..., i1] = x1.abs() * cos.abs() + x2.abs() * sin.abs()
-        magnitude[..., i2] = x2.abs() * cos.abs() + x1.abs() * sin.abs()
-    return x.flatten(1), magnitude.flatten(1)
+    """:func:`torch_head_norm_rope` of ``[num_tokens, heads * head_dim]`` rows
+    under a prologue's norm and rotary configuration."""
+    return torch_head_norm_rope(
+        x,
+        head_dim,
+        norm_weight=None if norm is None else weight,
+        norm_weight_offset=0.0 if norm is None else norm.weight_offset,
+        norm_eps=0.0 if norm is None else norm.eps,
+        cos_sin_cache=None if rotary is None else rotary.cos_sin_cache,
+        positions=None if rotary is None else rotary.positions,
+        neox=rotary is not None and rotary.style is RopeStyle.NEOX,
+        mrope_section=(
+            None if rotary is None or rotary.mrope is None else rotary.mrope.section
+        ),
+        mrope_interleaved=rotary is not None
+        and rotary.mrope is not None
+        and rotary.mrope.interleaved,
+    )
 
 
 def assert_rounded_once(

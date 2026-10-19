@@ -27,6 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.moe import torch_grouped_sigmoid_topk
 from tokenspeed_kernel.ops.moe import flashinfer as module
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.moe._triton.sigmoid_topk_routing import (
@@ -172,10 +173,10 @@ def _logits(generator: torch.Generator, tokens: int) -> torch.Tensor:
 
 def _routing(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """The route weights and ids the fused kernel selects for these logits."""
-    scores = torch.sigmoid(logits)
-    ids = scores.topk(TOPK, dim=-1).indices.to(torch.int32)
-    weights = scores.gather(1, ids.long())
-    return weights / weights.sum(dim=-1, keepdim=True), ids
+    ids, weights = torch_grouped_sigmoid_topk(
+        logits, torch.zeros(logits.shape[1], device=logits.device), TOPK, 1, 1, 1.0
+    )
+    return weights, ids.to(torch.int32)
 
 
 def _quantized(

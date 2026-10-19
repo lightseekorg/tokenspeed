@@ -24,6 +24,7 @@ import math
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.mla import torch_mla_paged_attention
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -76,12 +77,16 @@ def _make_inputs(seqlen: int, batch_size: int = 1):
 
 def _reference(q: torch.Tensor, kv_cache: torch.Tensor, seqlen: int):
     batch_size = q.shape[0]
-    kv = kv_cache[:, :, 0].reshape(batch_size, -1, _QK_DIM)[:, :seqlen].float()
-    scores = torch.einsum("bhd,bkd->bhk", q[:, 0].float(), kv) * _SOFTMAX_SCALE
-    probs = torch.softmax(scores, dim=-1)
-    out = torch.einsum("bhk,bkd->bhd", probs, kv[:, :, :_KV_LORA_RANK]).unsqueeze(1)
-    lse = torch.logsumexp(scores, dim=-1).unsqueeze(1)
-    return out, lse
+    table = torch.arange(kv_cache.shape[0], device=q.device).view(batch_size, -1)
+    lengths = torch.full((batch_size,), seqlen, device=q.device)
+    return torch_mla_paged_attention(
+        q,
+        kv_cache,
+        table,
+        lengths,
+        kv_lora_rank=_KV_LORA_RANK,
+        softmax_scale=_SOFTMAX_SCALE,
+    )
 
 
 def _run(
@@ -242,19 +247,14 @@ def test_native_fp8_mla_single_split_cuda_graph_replay(batch_size: int) -> None:
 
 
 def _query_block_reference(q, cache, table, lengths, softmax_scale=_SOFTMAX_SCALE):
-    output = torch.zeros((*q.shape[:-1], _KV_LORA_RANK), device=q.device)
-    lse = torch.full(q.shape[:-1], -float("inf"), device=q.device)
-    for request, length in enumerate(lengths.tolist()):
-        pages = table[request, : math.ceil(length / cache.shape[1])].long()
-        kv = cache[pages].reshape(-1, _QK_DIM)
-        for position in range(q.shape[1]):
-            visible = max(0, length - q.shape[1] + position + 1)
-            if visible:
-                values = kv[:visible].float()
-                scores = q[request, position].float() @ values.T * softmax_scale
-                output[request, position] = scores.softmax(-1) @ values[:, :512]
-                lse[request, position] = torch.logsumexp(scores, -1)
-    return output, lse
+    return torch_mla_paged_attention(
+        q,
+        cache,
+        table,
+        lengths,
+        kv_lora_rank=_KV_LORA_RANK,
+        softmax_scale=softmax_scale,
+    )
 
 
 def _query_block_decode(

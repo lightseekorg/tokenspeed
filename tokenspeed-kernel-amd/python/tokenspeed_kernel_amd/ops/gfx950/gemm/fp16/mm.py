@@ -1899,10 +1899,9 @@ def gluon_grouped_mm_a16w16_decode_num_counters_gfx950(
 def launch_gluon_grouped_mm_a16w16_decode_gfx950(
     x: torch.Tensor,
     weight: torch.Tensor,
-    *,
     counters: torch.Tensor,
+    quantize: bool,
     out: torch.Tensor | None = None,
-    quantize: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Compute ``out[:, g] = x[:, g] @ weight[g].T`` for every group in one launch.
 

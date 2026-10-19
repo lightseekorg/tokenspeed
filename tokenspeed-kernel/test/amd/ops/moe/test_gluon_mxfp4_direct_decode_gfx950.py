@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from kimi3_reference import dequantize_mxfp4
+from tokenspeed_kernel.numerics.torch.quantization import dequantize_mxfp4
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():

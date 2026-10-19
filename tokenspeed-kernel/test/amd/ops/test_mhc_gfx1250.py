@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.residual import torch_mhc_mixes
 from utils import assert_no_triton_compile, is_cdna5
 
 if not is_cdna5():
@@ -61,22 +62,15 @@ def _operands(tokens: int, hidden: int, seed: int):
 
 
 def _reference(residual, weight, scale, base):
-    tokens = residual.shape[0]
-    flat = residual.double().view(tokens, -1)
-    inv_rms = torch.rsqrt(flat.square().mean(-1, keepdim=True) + _RMS_EPS)
-    mixes = flat @ weight.double().T * inv_rms
-    scale, base = scale.double(), base.double()
-    pre = torch.sigmoid(mixes[:, :4] * scale[0] + base[:4]) + _HC_EPS
-    post = torch.sigmoid(mixes[:, 4:8] * scale[1] + base[4:8]) * 2.0
-    comb = torch.softmax(
-        mixes[:, 8:].view(tokens, 4, 4) * scale[2] + base[8:].view(1, 4, 4), dim=-1
+    return torch_mhc_mixes(
+        residual,
+        weight.double(),
+        scale.double(),
+        base.double(),
+        _RMS_EPS,
+        _HC_EPS,
+        _SINKHORN_ITERS,
     )
-    comb = comb + _HC_EPS
-    comb = comb / (comb.sum(-2, keepdim=True) + _HC_EPS)
-    for _ in range(1, _SINKHORN_ITERS):
-        comb = comb / (comb.sum(-1, keepdim=True) + _HC_EPS)
-        comb = comb / (comb.sum(-2, keepdim=True) + _HC_EPS)
-    return pre, post, comb
 
 
 def _run(residual, weight, scale, base):

@@ -239,8 +239,12 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
     def discard_room(self, room: int) -> None:
         """Drop all Prefill-manager state owned by one terminal request."""
-        self.transfer_infos.pop(room, None)
+        # Status before destinations, as abort_room (Failed) and the last
+        # chunk (Success) do: a thread that finds no destinations for a room
+        # reads its status (room_status) to tell an ended room from missing
+        # metadata.
         self.request_status.pop(room, None)
+        self.transfer_infos.pop(room, None)
         with self.bootstrap_token_cond:
             self.prefill_metadata.pop(room, None)
             self.cached_tokens.pop(room, None)
@@ -1024,6 +1028,16 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 self.update_status(kv_chunk.room, TransferPoll.Success)
                 self.transfer_infos.pop(kv_chunk.room, None)
             except Exception as exc:
+                if self.room_status(kv_chunk.room) in (None, TransferPoll.Failed):
+                    # Another thread aborted or dropped the room after this
+                    # chunk was queued, which is also why a chunk can find no
+                    # destinations: aborting again would overwrite the room's
+                    # failure reason or bring it back.
+                    logger.debug(
+                        f"Dropping CachePD chunk of ended room={kv_chunk.room!s}: "
+                        f"{exc}"
+                    )
+                    continue
                 logger.exception(f"CachePD transfer failed for room={kv_chunk.room!s}")
                 self.abort_room(kv_chunk.room, f"CachePD transfer failed: {exc}")
 
@@ -1216,25 +1230,27 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
     ):
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             raise RuntimeError("Transfer requests can only be added in prefill mode.")
-        if (
-            bootstrap_room not in self.request_status
-            or self.check_status(bootstrap_room) == TransferPoll.Failed
-        ):
+        # Read the status once: the control thread can drop the room between
+        # two reads.
+        if self.room_status(bootstrap_room) in (None, TransferPoll.Failed):
             logger.debug(
-                f"Request with bootstrap_room={bootstrap_room!s} already failed",
+                f"Request with bootstrap_room={bootstrap_room!s} already failed "
+                "or ended",
             )
             return
 
-        if bootstrap_room not in self.transfer_infos:
-            # This means that the current rank is a dummy rank for this request,
-            # and it has already been marked as success, so there is no need to
-            # add further chunks into the transfer queue.
+        destinations = self.transfer_infos.get(bootstrap_room)
+        if destinations is None:
+            # Either this rank is a dummy rank for this request and already
+            # marked it Success, or another thread aborted or dropped the room
+            # after the status check above. Either way there is nothing to
+            # queue.
             return
 
         #  sharding according to the dst_infos to make sure
         # requests with the same dst_sessions will be added into the same
         # queue, which enables early abort with failed sessions.
-        dst_infos = self.transfer_infos[bootstrap_room].keys()
+        dst_infos = destinations.keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
 

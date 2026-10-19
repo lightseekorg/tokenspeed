@@ -27,6 +27,9 @@ from functools import partial
 import pytest
 import tokenspeed_kernel.ops.attention.qsa as qsa_module
 import torch
+from tokenspeed_kernel.numerics.torch.attention.qsa import (
+    torch_qsa_selected_attention,
+)
 from tokenspeed_kernel.ops.attention.qsa import qsa_sparse_attention
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
@@ -53,21 +56,9 @@ def _reference(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
 ) -> torch.Tensor:
-    output = torch.zeros(
-        (q.shape[0], q.shape[1], v_cache.shape[-1]),
-        dtype=torch.float32,
-        device=q.device,
+    return torch_qsa_selected_attention(
+        q, k_cache, v_cache, selected_slots, scale, k_scale, v_scale
     )
-    group_size = q.shape[1] // k_cache.shape[1]
-    for row in range(q.shape[0]):
-        slots = selected_slots[row][selected_slots[row] > 0].long()
-        for head in range(q.shape[1]):
-            kv_head = head // group_size
-            keys = k_cache[slots, kv_head].float() * k_scale
-            values = v_cache[slots, kv_head].float() * v_scale
-            scores = q[row, head].float() @ keys.T
-            output[row, head] = torch.softmax(scores * scale, dim=-1) @ values
-    return output.to(q.dtype)
 
 
 def test_qsa_sparse_attention_requires_dispatch_arguments() -> None:
@@ -853,6 +844,88 @@ def test_qsa_sparse_attention_blackwell_cluster_capacity(
     assert _num_splits(num_clusters, capacity) == splits
 
 
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("splits", [1, 4])
+def test_qsa_sparse_attention_blackwell_large_kv_offsets(
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
+    cache_dtype: torch.dtype,
+    splits: int,
+) -> None:
+    """Gather, prefetch and tail reads must cross the int32 element boundary."""
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("large-cache QSA requires NVIDIA SM100 or SM103")
+    import tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse as sparse_module
+
+    def select_config(
+        num_rows: int,
+        head_tiles_per_row: int,
+        bf16_kv: bool,
+        sm_count: int,
+        wide_cluster_capacity: int,
+    ) -> tuple[int, int, int, bool]:
+        del num_rows, head_tiles_per_row, bf16_kv, sm_count, wide_cluster_capacity
+        # Two BF16 buffers keep lookahead prefetch active at the large addresses.
+        slots = 2 if cache_dtype is torch.bfloat16 else 3
+        return 1, splits, slots, cache_dtype is torch.bfloat16
+
+    monkeypatch.setattr(sparse_module, "_select_launch_config", select_config)
+    torch.manual_seed(313)
+    rows, q_heads, kv_heads, head_dim = 3, 24, 2, 256
+    boundary_slot = (1 << 31) // (kv_heads * head_dim)
+    cache_slots = boundary_slot + 32
+    required_bytes = 2 * cache_slots * kv_heads * head_dim * cache_dtype.itemsize
+    if torch.cuda.mem_get_info(device)[0] < required_bytes + (1 << 30):
+        pytest.skip("large-offset regression needs room for two 2^31-element caches")
+    q = torch.randn(rows, q_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.empty(cache_slots, kv_heads, head_dim, dtype=cache_dtype, device=device)
+    v = torch.empty_like(k)
+    # Only initialize the rows that can be read; allocating this cache tests
+    # the real pointer arithmetic without filling gigabytes of unused history.
+    physical = torch.tensor(
+        [2, 3, boundary_slot - 1, boundary_slot, boundary_slot + 1, cache_slots - 1],
+        dtype=torch.int32,
+        device=device,
+    )
+    k[1].zero_()
+    v[1].zero_()
+    k[physical.long()] = (torch.randn(6, kv_heads, head_dim, device=device) * 0.25).to(
+        cache_dtype
+    )
+    v[physical.long()] = (torch.randn(6, kv_heads, head_dim, device=device) * 0.25).to(
+        cache_dtype
+    )
+    selected = physical[torch.arange(2051, device=device) % 6].repeat(rows, 1)
+    selected[1, 2048:] = -1
+    selected[2].fill_(-1)
+
+    def forward():
+        return sparse_module.kernel(
+            q,
+            k,
+            v,
+            selected,
+            scale=1 / 16,
+            max_seqlen_q=1,
+            k_scale=None,
+            v_scale=None,
+            enable_pdl=False,
+        )
+
+    expected = _reference(q, k, v, selected, 1 / 16)
+    torch.testing.assert_close(forward(), expected, atol=2e-3, rtol=2e-2)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = forward()
+    # Keep K and the slots fixed: changed high-address V must be read again.
+    v[physical.long()] = (v[physical.long()].float() + 0.125).to(cache_dtype)
+    graph.replay()
+    torch.testing.assert_close(
+        output, _reference(q, k, v, selected, 1 / 16), atol=2e-3, rtol=2e-2
+    )
+    assert torch.count_nonzero(output[2]).item() == 0
+
+
 @pytest.mark.parametrize(
     ("rows", "head_tiles", "bf16", "sm_count", "expected"),
     [
@@ -860,11 +933,11 @@ def test_qsa_sparse_attention_blackwell_cluster_capacity(
         (64, 1, True, 152, (1, 2, 3, True)),
         (128, 1, True, 152, (1, 1, 3, True)),
         (256, 1, True, 152, (1, 1, 3, True)),
-        (512, 1, True, 152, (2, 1, 3, True)),
-        (513, 1, True, 152, (2, 1, 3, True)),
-        (128, 4, True, 152, (2, 1, 3, True)),
-        (416, 4, True, 152, (4, 1, 3, True)),
-        (512, 1, True, 80, (4, 1, 3, True)),
+        (512, 1, True, 152, (1, 1, 3, True)),
+        (513, 1, True, 152, (1, 1, 3, True)),
+        (128, 4, True, 152, (1, 1, 3, True)),
+        (416, 4, True, 152, (1, 1, 3, True)),
+        (512, 1, True, 80, (1, 1, 3, True)),
         (512, 1, False, 152, (1, 4, 1, False)),
     ],
 )

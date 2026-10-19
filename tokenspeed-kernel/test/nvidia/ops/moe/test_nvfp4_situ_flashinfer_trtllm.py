@@ -38,6 +38,15 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.activation import (
+    torch_silu_and_mul,
+    torch_situ_and_mul,
+)
+from tokenspeed_kernel.numerics.torch.moe import (
+    DequantizedExperts,
+    torch_moe_experts,
+)
+from tokenspeed_kernel.numerics.torch.quantization import dequantize_nvfp4_blocks
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 
@@ -51,8 +60,6 @@ SITU_LINEAR_BETA = 25.0  # K3 activation_situ_linear_beta (up branch)
 _FP8_E4M3_MAX = 448.0
 _FP4_E2M1_MAX = 6.0
 # e2m1 nibble decode table (bit 3 = sign).
-_E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
-_E2M1_VALUES = torch.tensor(_E2M1_LUT + [-v for v in _E2M1_LUT])
 
 
 def _situ_runtime_reason() -> str | None:
@@ -102,12 +109,9 @@ def _nvfp4_dequant(
     packed: torch.Tensor, sf: torch.Tensor, weight_scale_2: torch.Tensor
 ) -> torch.Tensor:
     """Exact fp32 dequantization of `_nvfp4_quantize` outputs."""
-    lut = _E2M1_VALUES.to(packed.device)
-    lo = lut[(packed & 0x0F).long()]
-    hi = lut[(packed >> 4).long()]
-    vals = torch.stack([lo, hi], dim=-1).reshape(packed.shape[0], -1)
-    scales = sf.float().repeat_interleave(16, dim=1)
-    return vals * scales * weight_scale_2.to(packed.device).float()
+    return (
+        dequantize_nvfp4_blocks(packed, sf) * weight_scale_2.to(packed.device).float()
+    )
 
 
 class _MoEWeights(torch.nn.Module):
@@ -172,12 +176,6 @@ def _make_nvfp4_moe_weights(
     }
 
 
-def _situ(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-    left = SITU_LINEAR_BETA * torch.tanh(up / SITU_LINEAR_BETA)
-    right = SITU_BETA * torch.tanh(gate / SITU_BETA) * torch.sigmoid(gate)
-    return left * right
-
-
 def _quant_dequant_activation(t: torch.Tensor, global_quant_scale: float):
     """Model the kernel's NVFP4 activation quantization (w4a4) in fp32."""
     from flashinfer import fp4_quantize
@@ -207,29 +205,36 @@ def _reference_moe(
     checkpoint's w13 input scale, and the GEMM1 activation output with the
     GEMM2 input scale (Kimi-K3-NVFP4 ships both as 1.0).
     """
-    x = _quant_dequant_activation(hidden_states.float(), 1.0)
-    out = torch.zeros_like(x)
-    for e in range(NUM_EXPERTS):
-        w13 = _nvfp4_dequant(
-            raw["w13_weight"][e].cuda(),
-            raw["w13_weight_scale"][e].cuda(),
-            raw["w13_weight_scale_2"][e],
+
+    def experts(prefix: str) -> DequantizedExperts:
+        return DequantizedExperts(
+            lambda packed, sf, scale_2: _nvfp4_dequant(
+                packed.cuda(), sf.cuda(), scale_2
+            ),
+            raw[f"{prefix}_weight"],
+            raw[f"{prefix}_weight_scale"],
+            raw[f"{prefix}_weight_scale_2"],
         )
-        w2 = _nvfp4_dequant(
-            raw["w2_weight"][e].cuda(),
-            raw["w2_weight_scale"][e].cuda(),
-            raw["w2_weight_scale_2"][e],
-        )
-        gate, up = w13[:ISPP], w13[ISPP:]
+
+    def activation(gate_up: torch.Tensor) -> torch.Tensor:
         if situ:
-            act = _situ(x @ gate.t(), x @ up.t())
-        else:
-            act = torch.nn.functional.silu(x @ gate.t()) * (x @ up.t())
-        act = _quant_dequant_activation(act, 1.0)
-        expert_out = act @ w2.t()
-        weight = torch.where(topk_ids == e, topk_weights.float(), 0.0).sum(dim=-1)
-        out += weight[:, None] * expert_out
-    return out
+            return torch_situ_and_mul(gate_up, SITU_BETA, SITU_LINEAR_BETA)
+        return torch_silu_and_mul(gate_up, None)
+
+    return torch_moe_experts(
+        hidden_states,
+        experts("w13"),
+        experts("w2"),
+        topk_ids,
+        topk_weights,
+        activation=activation,
+        w13_bias=None,
+        w2_bias=None,
+        quantize_input=lambda t: _quant_dequant_activation(t.float(), 1.0),
+        quantize_intermediate=lambda t: _quant_dequant_activation(t, 1.0),
+        round_expert_output=None,
+        first_expert=0,
+    )
 
 
 def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:

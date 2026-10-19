@@ -76,7 +76,7 @@ def _compatible_reference_for_signature(
         spec.family,
         spec.mode,
         format_signature=signature,
-        solution="reference",
+        solution="torch",
     )
     for ref in ref_specs:
         if ref.name == spec.name:

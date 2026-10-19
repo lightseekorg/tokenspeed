@@ -29,7 +29,7 @@ import itertools
 
 import pytest
 import torch
-from attention_prologue_reference import (
+from attention_prologue_helpers import (
     BF16,
     FP8,
     POISON,

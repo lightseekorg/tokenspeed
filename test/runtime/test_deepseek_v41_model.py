@@ -45,6 +45,7 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
+from tokenspeed_kernel.numerics.torch.residual import torch_mhc_mixes
 from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -597,25 +598,6 @@ def test_reference_linear_construction_preserves_checkpoint_loading(
         torch.testing.assert_close(layer.weight, expected, rtol=0, atol=0)
 
 
-def _mix_reference(x, weight, scale, base, eps, hc_eps, iters):
-    hc = x.shape[-2]
-    flat = x.float().flatten(-2)
-    logits = F.linear(flat, weight) * torch.rsqrt(
-        flat.square().mean(-1, keepdim=True) + eps
-    )
-    pre = (logits[..., :hc] * scale[0] + base[:hc]).sigmoid() + hc_eps
-    post = (logits[..., hc : 2 * hc] * scale[1] + base[hc : 2 * hc]).sigmoid() * 2
-    comb = logits[..., 2 * hc :].reshape(*x.shape[:-2], hc, hc) * scale[2] + base[
-        2 * hc :
-    ].reshape(hc, hc)
-    comb = comb.softmax(-1) + hc_eps
-    comb /= comb.sum(-2, keepdim=True) + hc_eps
-    for _ in range(iters - 1):
-        comb /= comb.sum(-1, keepdim=True) + hc_eps
-        comb /= comb.sum(-2, keepdim=True) + hc_eps
-    return pre, post, comb
-
-
 def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     config = _config()
@@ -654,7 +636,7 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
             (layer.attn, layer.attn_norm, "attn"),
             (layer.ffn, layer.ffn_norm, "ffn"),
         ):
-            pre, post, comb = _mix_reference(
+            pre, post, comb = torch_mhc_mixes(
                 expected,
                 getattr(layer, f"hc_{name}_fn"),
                 getattr(layer, f"hc_{name}_scale"),
@@ -670,7 +652,7 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
             )
             x = _norm(collapsed, norm.weight, 1e-20)
             x = (
-                sublayer(positions, x, ctx)
+                sublayer(positions, x, ctx, reduce_output=True)
                 if name == "attn"
                 else sublayer(x, None, 3, 3, None, None)
             )

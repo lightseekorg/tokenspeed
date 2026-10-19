@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.residual import torch_mhc_mixes
 from tokenspeed_kernel.ops.residual import mhc_apply_pre, mhc_mixes, mhc_post
 from tokenspeed_kernel.ops.residual.triton import (
     triton_mhc_apply_pre,
@@ -55,18 +56,9 @@ def _mixes_args(tokens: int, hidden: int, seed: int) -> tuple:
 
 
 def _mixes_reference(residual, weight, scale, base, rms_eps, hc_eps, iters):
-    flat = residual.flatten(-2).double()
-    mixes = flat @ weight.double().T
-    mixes = mixes * torch.rsqrt(flat.square().mean(-1, keepdim=True) + rms_eps)
-    pre = torch.sigmoid(mixes[:, :4] * scale[0] + base[:4]) + hc_eps
-    post = 2 * torch.sigmoid(mixes[:, 4:8] * scale[1] + base[4:8])
-    comb = (mixes[:, 8:] * scale[2] + base[8:]).unflatten(-1, (4, 4))
-    comb = comb.softmax(-1) + hc_eps
-    comb = comb / (comb.sum(-2, keepdim=True) + hc_eps)
-    for _ in range(iters - 1):
-        comb = comb / (comb.sum(-1, keepdim=True) + hc_eps)
-        comb = comb / (comb.sum(-2, keepdim=True) + hc_eps)
-    return pre, post, comb
+    return torch_mhc_mixes(
+        residual, weight.double(), scale, base, rms_eps, hc_eps, iters
+    )
 
 
 @pytest.mark.parametrize("hidden", [4096, 5120])
@@ -188,6 +180,7 @@ def test_gluon_mhc_streams_no_recompile_across_batches() -> None:
                 pre[:tokens],
                 norm_weight=norm_weight,
                 norm_eps=norm_eps,
+                quantize=False,
             )
 
     run(1)

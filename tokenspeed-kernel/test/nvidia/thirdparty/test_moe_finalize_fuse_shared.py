@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.moe import torch_moe_finalize
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
@@ -49,22 +50,6 @@ def _make_inputs(num_tokens, hidden, top_k, num_experts, ew_dtype, num_shared):
     return gemm2_out, expanded_idx, weights
 
 
-def _reference(gemm2_out, expanded_idx, weights, shared, top_k):
-    num_tokens = weights.shape[0]
-    idx = expanded_idx.view(num_tokens, top_k).long()
-    valid = idx >= 0
-    rows = gemm2_out.float()[idx.clamp(min=0)]  # [T, K, H]
-    rows = rows * valid.unsqueeze(-1)
-    out = (rows * weights.float()[:, :top_k, None]).sum(dim=1)
-    if shared is not None:
-        if shared.dim() == 2:
-            out = out + shared.float()
-        else:
-            gammas = weights.float()[:, top_k:]  # [T, S]
-            out = out + torch.einsum("sth,ts->th", shared.float(), gammas)
-    return out.to(torch.bfloat16)
-
-
 # num_tokens 4 exercises the general kernel; 4096 the vectorized one
 # (dispatch flips at numBlocksX * numBlocksY >= 1184).
 @pytest.mark.parametrize("num_tokens", [4, 4096])
@@ -80,7 +65,7 @@ def test_finalize_verbatim_shared_add(num_tokens, ew_dtype):
     out = moe_finalize_fuse_shared(
         gemm2_out, expanded_idx, weights, shared, top_k, hidden_dim=hidden
     )
-    ref = _reference(gemm2_out, expanded_idx, weights, shared, top_k)
+    ref = torch_moe_finalize(gemm2_out, expanded_idx, weights, shared, top_k)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
@@ -101,7 +86,7 @@ def test_finalize_weighted_shared_sink(num_tokens, ew_dtype, num_shared, top_k):
     out = moe_finalize_fuse_shared(
         gemm2_out, expanded_idx, weights, shared, top_k, hidden_dim=hidden
     )
-    ref = _reference(gemm2_out, expanded_idx, weights, shared, top_k)
+    ref = torch_moe_finalize(gemm2_out, expanded_idx, weights, shared, top_k)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
@@ -124,7 +109,7 @@ def test_finalize_no_shared_with_padded_input(
     out = moe_finalize_fuse_shared(
         gemm2_out, expanded_idx, weights, None, 8, hidden_dim=hidden
     )
-    ref = _reference(gemm2_out, expanded_idx, weights, None, 8)[:, :hidden]
+    ref = torch_moe_finalize(gemm2_out, expanded_idx, weights, None, 8)[:, :hidden]
     assert out.shape == (num_tokens, hidden)
     assert out.is_contiguous()
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)

@@ -22,6 +22,7 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.residual import torch_hyperconnection_mix
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -78,14 +79,17 @@ def _mix(inputs, override, projection_scale=1.0, *, padded=True):
 
 
 def _fp64_reference(normalized, projection, up, projection_scale):
-    x = normalized.double()
-    projected = (x @ projection.double().T) * projection_scale
-    gate = torch.nn.functional.silu(projected[:, :LOWRANK]) @ up.double().T
-    mixed = (
-        torch.sigmoid(gate).unflatten(-1, (HC_COUNT, HIDDEN_SIZE))
-        * x.unflatten(-1, (HC_COUNT, HIDDEN_SIZE))
-    ).mean(dim=-2)
-    return mixed, projected[:, LOWRANK:]
+    return torch_hyperconnection_mix(
+        normalized,
+        projection,
+        up,
+        HC_COUNT,
+        HIDDEN_SIZE,
+        LOWRANK,
+        projection.shape[0],
+        projection_scale,
+        True,
+    )
 
 
 @pytest.mark.parametrize("rows", [1, 7, 16, 17, 32, 33, 64, 100, 256])

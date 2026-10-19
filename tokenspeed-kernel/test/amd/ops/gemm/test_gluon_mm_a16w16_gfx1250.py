@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.gemm import torch_mm
 from utils import assert_no_triton_compile, is_cdna5
 
 if not is_cdna5():
@@ -52,7 +53,7 @@ def _operands(m: int, n: int, k: int, seed: int) -> tuple[torch.Tensor, torch.Te
 
 
 def _reference(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    return a.double() @ b.double().T
+    return torch_mm(a.double(), b.double(), None, None, torch.float64)
 
 
 def _mm_fp32(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:

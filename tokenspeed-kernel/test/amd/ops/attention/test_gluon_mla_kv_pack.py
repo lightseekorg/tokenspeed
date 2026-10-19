@@ -20,6 +20,7 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.mla import torch_mla_kv_pack
 from utils import is_cdna4, is_cdna5
 
 if not (is_cdna4() or is_cdna5()):
@@ -39,13 +40,7 @@ else:
 
 
 def _reference(k_nope, k_pe, v, k_scale_inv, v_scale_inv, fp8_dtype):
-    if k_pe.ndim == 2:
-        k_pe = k_pe.unsqueeze(1)
-    k_pe = k_pe.expand(-1, k_nope.shape[1], -1)
-    return (
-        (torch.cat((k_nope, k_pe), dim=-1).float() * k_scale_inv).to(fp8_dtype),
-        (v.float() * v_scale_inv).to(fp8_dtype),
-    )
+    return torch_mla_kv_pack(k_nope, k_pe, v, k_scale_inv, v_scale_inv, fp8_dtype)
 
 
 @pytest.mark.parametrize("seq_len", [0, 7, 256, 2048])
