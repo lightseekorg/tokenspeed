@@ -20,12 +20,46 @@
 
 from __future__ import annotations
 
+import ipaddress
+import socket
 import threading
 from functools import cache
 
 import zmq
 
 from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.utils.network import join_host_port
+
+
+def enable_ipv6_for_endpoint(sock: zmq.Socket, endpoint: str) -> None:
+    """Enable IPv6 on ``sock`` when the host of the ``tcp://`` ``endpoint`` is
+    an IPv6 literal (``join_host_port`` brackets it) or a name without an IPv4
+    address.
+
+    libzmq resolves only IPv4 addresses unless IPv6 is enabled: binding an
+    IPv6 address fails with ENODEV and a connect never delivers. With IPv6
+    enabled it resolves a name to its IPv6 address first and would miss an
+    IPv4-only listener, so only a name without an IPv4 address enables IPv6.
+    A dual-stack name keeps the IPv4 behaviour, even on an IPv6-only host, as
+    the lookup does not use ``AI_ADDRCONFIG``.
+    """
+    host = endpoint.split("://", 1)[-1].rsplit(":", 1)[0]
+    if host.startswith("["):
+        sock.setsockopt(zmq.IPV6, 1)
+        return
+    try:
+        ipaddress.IPv4Address(host)
+        return
+    except ValueError:
+        pass
+    try:
+        addresses = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        # A name that does not resolve, or a malformed one such as "a..b"
+        # (UnicodeError), keeps the default options and is left to libzmq.
+        return
+    if all(address[0] != socket.AF_INET for address in addresses):
+        sock.setsockopt(zmq.IPV6, 1)
 
 
 class DisaggManagerBase:
@@ -63,9 +97,24 @@ class DisaggManagerBase:
     def get_session_id(self) -> str:
         return self.engine.get_session_id()
 
+    def bind_server_socket(self, host: str) -> None:
+        """Bind the control socket to ``host`` on a port the OS picks in the
+        same call, and store that port in ``rank_port``.
+
+        A port probed before the bind could be taken by then, and an IPv4 probe
+        does not see a port held on IPv6.
+        """
+        endpoint = f"tcp://{join_host_port(host, '*')}"
+        enable_ipv6_for_endpoint(self.server_socket, endpoint)
+        self.server_socket.bind(endpoint)
+        # The bound endpoint, such as "tcp://[::1]:40123".
+        bound = self.server_socket.getsockopt_string(zmq.LAST_ENDPOINT)
+        self.rank_port = int(bound.rsplit(":", 1)[1])
+
     @cache
     def _connect(self, endpoint: str):
         socket = zmq.Context().socket(zmq.PUSH)
+        enable_ipv6_for_endpoint(socket, endpoint)
         socket.connect(endpoint)
         # PyZMQ sockets are not thread-safe. Managers run multiple transfer
         # workers, so serialize sends that reuse this cached endpoint socket.

@@ -86,6 +86,25 @@ def _native_indices(scores, lengths, topk):
     return deep_select_topk(scores, lengths, topk, output)
 
 
+def _select_topk_prepared(logits, ends, topk):
+    """Select nonempty contiguous native logits with pre-clamped int32 ends.
+
+    The native adapter owns both buffers. Borrow aligned logits read-only;
+    otherwise use select_topk's alignment copy. Return sorted logical IDs
+    with -1 padding, without candidate mapping or newest-block pinning.
+    """
+    _validate(logits, ends, topk, 1, None)
+    input_alignment, _ = deep_select_alignment()
+    alignment = input_alignment // logits.element_size()
+    # Contiguous rows must include the native vector-load padding.
+    if not (
+        logits.shape[1] % alignment == 0 and logits.data_ptr() % input_alignment == 0
+    ):
+        return select_topk(logits, ends, None, topk, 1)
+    indices = _native_indices(logits, ends, topk)
+    return finish_selection(indices, logits, ends, None, logits.shape[1], 1, True)
+
+
 @register_kernel(
     "attention",
     "dsv41_select_candidates",

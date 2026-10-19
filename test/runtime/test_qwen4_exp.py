@@ -561,6 +561,7 @@ def _qsa_root(
         _field_layer_id=lambda layer_id: layer_id,
         paged_group_ids=tuple(_QSA_GROUP_GRANULARITIES),
         arena=SimpleNamespace(
+            offload=None,
             field=fields.__getitem__,
             plan=SimpleNamespace(
                 fields=[
@@ -1209,11 +1210,6 @@ def _qsa_cache_test_indexer(device: str = "cuda"):
     rope_positions = torch.zeros((3, 3), dtype=torch.int64, device=device)
     indexer._fields = lambda pool: (raw, compressed, rope_positions)
     indexer._draft_scratch = {}
-    indexer.register_buffer(
-        "_persistent_topk_workspace",
-        torch.empty((1024 * 1024,), dtype=torch.uint8, device=device),
-        persistent=False,
-    )
     return indexer, SimpleNamespace(), raw, compressed, rope_positions
 
 
@@ -1833,6 +1829,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         block_size=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=0,
+        kv_offload_config=None,
     )
 
     setup = prepare_cache_setup(

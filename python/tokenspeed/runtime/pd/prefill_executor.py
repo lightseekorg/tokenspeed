@@ -34,6 +34,7 @@ from tokenspeed.runtime.pd.mooncake.prefill import (
 )
 from tokenspeed.runtime.pd.utils import poll_and_all_reduce
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.network import join_host_port
 
 logger = get_colorful_logger(__name__)
 
@@ -64,7 +65,7 @@ class DisaggPrefillExecutor:
     def _bootstrap(self, request_id, info):
         self.senders[request_id] = MooncakeKVSender(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{info.bootstrap_host}:{info.bootstrap_port}",
+            bootstrap_addr=join_host_port(info.bootstrap_host, info.bootstrap_port),
             bootstrap_room=info.bootstrap_room,
         )
 
@@ -105,6 +106,14 @@ class DisaggPrefillExecutor:
                 sender.bootstrap_room, {}
             )
             if not transfer_infos:
+                if self.kv_manager.room_status(sender.bootstrap_room) in (
+                    None,
+                    TransferPoll.Failed,
+                ):
+                    # Aborted by a transfer worker or the bootstrap thread
+                    # after this op was queued; the control plane fails the
+                    # request on its next poll.
+                    continue
                 raise RuntimeError("Cache-transfer destination metadata is unavailable")
             destinations = tuple(
                 info for info in transfer_infos.values() if not info.is_dummy
@@ -235,6 +244,13 @@ class DisaggPrefillExecutor:
                 sender.bootstrap_room, {}
             )
             if not transfer_infos:
+                if self.kv_manager.room_status(sender.bootstrap_room) in (
+                    None,
+                    TransferPoll.Failed,
+                ):
+                    # Aborted after this op was queued, as in
+                    # _prepare_cache_prefill: nothing to send or finish.
+                    continue
                 raise RuntimeError("Cache-transfer destination metadata is unavailable")
             destinations = [
                 info for info in transfer_infos.values() if not info.is_dummy

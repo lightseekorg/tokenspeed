@@ -11,6 +11,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     attnres_partial,
     attnres_partial_dual,
 )
+from tokenspeed_kernel.ops.residual.torch import torch_attn_res_fwd
 from tokenspeed_kernel.platform import pdl_enabled
 
 if not torch.cuda.is_available():
@@ -29,16 +30,15 @@ def disable_pdl():
 
 def _reference(prefix, blocks, wp, eps, out_w):
     """Direct softmax over the KB+1 candidate logits, fp32."""
-    cands = torch.cat([blocks.float(), prefix.float().unsqueeze(0)], dim=0)
-    wp = wp.float()[None, None, :]
-    rms = torch.rsqrt(cands.pow(2).mean(-1, keepdim=True) + eps)
-    logits = (cands * rms * wp).sum(-1)  # [KB+1, T]
-    w = torch.softmax(logits, dim=0)[..., None]
-    mix = (cands * w).sum(0).to(torch.bfloat16).float()
-    if out_w is None:
-        return mix
-    rms_o = torch.rsqrt(mix.pow(2).mean(-1, keepdim=True) + eps)
-    return mix * rms_o * out_w.float()
+    return torch_attn_res_fwd(
+        layer_residual=prefix.clone(),
+        block_residual=blocks,
+        res_weight=wp,
+        rms_weight=torch.ones_like(wp),
+        eps=eps,
+        out_norm_weight=out_w,
+        out_norm_eps=eps,
+    ).float()
 
 
 def _scratch(T):

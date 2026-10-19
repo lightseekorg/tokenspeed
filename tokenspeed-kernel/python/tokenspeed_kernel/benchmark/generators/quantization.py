@@ -104,6 +104,8 @@ def prepare_fp8_with_scale(
             traits={
                 "granularity": f"{granularity}_{group_size}",
                 "scale_encoding": scale_encoding,
+                # quantize_fp8 states the rows of a 2-D input.
+                "m": M,
             },
             solution=request.solution,
             override=request.registration,

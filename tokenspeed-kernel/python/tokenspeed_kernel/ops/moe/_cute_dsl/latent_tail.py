@@ -276,6 +276,7 @@ class KimiK3LatentTailOp:
             ctas=32,
             threads=224,
             sentinel=NEG_ZERO_F32_BITS,
+            poll_halves=False,
         )
         # Preserve the completion dependency across separate captured graphs.
         self._gather_complete = torch.cuda.Event(external=True)

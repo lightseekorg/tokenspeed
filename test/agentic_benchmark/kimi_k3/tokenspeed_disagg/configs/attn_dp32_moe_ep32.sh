@@ -36,7 +36,7 @@ exec "${SERVER_CMD[@]}" \
     --trust-remote-code \
     --attention-backend tokenspeed_mla \
     --kda-backend cutedsl_kda \
-    --moe-backend flashinfer_trtllm \
+    --moe-backend mega_moe \
     --kv-cache-dtype fp8 \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path lightseekorg/kimi-k3-eagle3-mla \

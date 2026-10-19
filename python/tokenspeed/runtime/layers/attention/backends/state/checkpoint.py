@@ -32,6 +32,12 @@ A forward reads slot 0 when it is non-null and slot 1 otherwise (in-place
 evolution), and always writes slot 1. A published checkpoint is never written:
 it only ever appears in slot 0, and slot 0 is never the write target. A
 request without history reads no block at all, whatever its row holds.
+
+A padding row (``-1`` in both slots: a graph padding row, or a request the
+device stopped while a forward behind it was already dispatched) reads the
+zero state and writes nothing; every state kernel skips negative blocks.
+The debug checks below cannot tell such a row from one corrupted to
+``(-1, -1)``, so they skip it.
 """
 
 from __future__ import annotations
@@ -93,17 +99,17 @@ def compute_state_block_indices(
     state_out = live.contiguous()
 
     if validate:
-        if bool((state_in[has_history] <= 0).any()):
+        real = (checkpoint != -1) | (live != -1)
+        if bool((state_in[has_history & real] <= 0).any()):
             raise ValueError(
                 "state paging: the input block is a pad (-1) or hole (0) for a "
                 "request with history; reading it would silently resume from "
                 f"the zero state ({group_id!r} table)"
             )
-        if bool((state_out <= 0).any()):
+        if bool((state_out[real] <= 0).any()):
             raise ValueError(
-                "state paging: the live block is a pad (-1) or hole (0); the "
-                f"request's working state block must be present in the {group_id!r} "
-                "table"
+                "state paging: the live block is a hole (0); the request's "
+                f"working state block must be present in the {group_id!r} table"
             )
         # A claimed checkpoint is read-only; the forward must write elsewhere.
         if bool((checkpoint[checkpoint > 0] == live[checkpoint > 0]).any()):
@@ -112,7 +118,7 @@ def compute_state_block_indices(
                 "the same block; writing it would corrupt every branch sharing "
                 f"the checkpoint ({group_id!r} table)"
             )
-        if torch.unique(state_out).numel() != state_out.numel():
+        if torch.unique(state_out[real]).numel() != int(real.sum()):
             raise ValueError(
                 f"state out pages must be unique per batch ({group_id!r} "
                 "table): two requests writing one working state page would "

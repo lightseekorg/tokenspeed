@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.mla import (
+    torch_mla_value_projection,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 
@@ -11,11 +14,7 @@ BATCH, HEADS, LATENT, VALUE = 1, 16, 512, 128
 
 
 def _ref(attention, weight, gate=None):
-    out = torch.bmm(attention.transpose(0, 1).float(), weight.float()).transpose(0, 1)
-    out = out.reshape(attention.shape[0], -1)
-    if gate is not None:
-        out = out * torch.sigmoid(gate.float())
-    return out
+    return torch_mla_value_projection(attention, weight, gate)
 
 
 def _inputs(dev="cuda"):

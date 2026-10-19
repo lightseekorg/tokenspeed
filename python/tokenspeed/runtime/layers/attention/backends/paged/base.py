@@ -388,6 +388,30 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
                 a shared in-place refresh cannot express.
         """
 
+    def decode_buffer_targets(
+        self, bs: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The ``(seq_lens, page_table)`` buffer views a decode refresh copies into.
+
+        A leaf whose :meth:`refresh_decode_metadata` is exactly those two
+        copies followed by :meth:`publish_decode_metadata` returns them, so
+        the router can fill every such leaf with one batched copy; a leaf
+        with any other refresh returns None and refreshes itself.
+
+        Args:
+            bs: Requests to prepare (the padded graph batch under replay).
+        """
+        return None
+
+    def publish_decode_metadata(
+        self, bs: int, seq_lens: torch.Tensor, *, num_extends: int
+    ) -> None:
+        """The rest of :meth:`refresh_decode_metadata` once the router has
+        filled :meth:`decode_buffer_targets`; arguments as there."""
+        raise NotImplementedError(
+            f"{type(self).__name__} returns no decode_buffer_targets"
+        )
+
     def init_forward_metadata_capture_cuda_graph(
         self, bs: int, seq_lens: torch.Tensor, page_table: torch.Tensor
     ) -> None:

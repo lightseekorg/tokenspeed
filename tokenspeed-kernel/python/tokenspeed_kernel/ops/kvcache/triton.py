@@ -1831,6 +1831,8 @@ def _store_kv_cache_kernel(
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        # Dependents may launch now; their own wait still covers this grid's completion.
+        tl.extra.cuda.gdc_launch_dependents()
 
     dst_row = tl.load(loc_ptr + row).to(tl.int64)
 
@@ -1844,9 +1846,6 @@ def _store_kv_cache_kernel(
             k_src_ptr + row * k_src_token_stride + offsets, mask=mask, other=0
         )
         tl.store(k_dst_ptr + dst_row * k_dst_row_stride + offsets, src, mask=mask)
-
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def store_kv_cache(

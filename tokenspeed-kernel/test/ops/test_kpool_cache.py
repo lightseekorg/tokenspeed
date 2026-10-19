@@ -26,6 +26,11 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.kpool import (
+    kpool_compress,
+    torch_kpool_decode_append,
+    torch_kpool_prefill_tail_write,
+)
 from tokenspeed_kernel.ops.attention.kpool import (
     kpool_decode_append,
     kpool_prefill_tail_write,
@@ -40,27 +45,6 @@ _ROWS_PER_PAGE = 64 // _POOL
 _FP8_MAX = 448.0
 _FP8_E4M3FN_MAX_FINITE_MAGNITUDE_CODE = 0x7E
 _MAX_FP8_QUANTUM_DISTANCE = 2
-
-
-def _sylvester_h(n: int) -> torch.Tensor:
-    idx = torch.arange(n, device="cuda")
-    bits = idx[:, None] & idx[None, :]
-    parity = torch.zeros_like(bits)
-    for shift in range(7):
-        parity ^= (bits >> shift) & 1
-    return torch.where(parity == 0, 1.0, -1.0).float()
-
-
-def _reference_compress(
-    keys: torch.Tensor, gates: torch.Tensor, ape: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    logits = gates.float() + ape.unsqueeze(0)
-    pooled = (torch.softmax(logits, dim=1) * keys.float()).sum(dim=1)
-    pooled = pooled.to(torch.bfloat16).float()
-    pooled = ((pooled @ _sylvester_h(_DIM)) / _DIM**0.5).to(torch.bfloat16).float()
-    scale = pooled.abs().amax(dim=-1).clamp(min=1e-4) / _FP8_MAX
-    values = (pooled / scale[:, None]).clamp(-_FP8_MAX, _FP8_MAX)
-    return values.to(torch.float8_e4m3fn), scale
 
 
 def _random(
@@ -224,38 +208,25 @@ def _reference_append(
     gates: torch.Tensor,
     seq_lens: torch.Tensor,
 ) -> tuple[torch.Tensor, ...]:
-    tail_k = state.tail_k.clone()
-    tail_gate = state.tail_gate.clone()
-    values = state.index_values.clone()
-    scales = state.index_scales.clone()
-    steps = keys.shape[1]
-
-    for req in range(keys.shape[0]):
-        request_slot = int(state.request_slots[req])
-        first_position = int(seq_lens[req]) - steps
-        for step in range(steps):
-            position = first_position + step
-            tail_slot = position % tail_k.shape[1]
-            tail_k[request_slot, tail_slot] = keys[req, step]
-            tail_gate[request_slot, tail_slot] = gates[req, step]
-            if position % _POOL != _POOL - 1:
-                continue
-
-            pool_start = position - (_POOL - 1)
-            tail_slots = torch.arange(pool_start, position + 1, device="cuda")
-            tail_slots.remainder_(tail_k.shape[1])
-            pooled, pooled_scale = _reference_compress(
-                tail_k[request_slot, tail_slots].unsqueeze(0).contiguous(),
-                tail_gate[request_slot, tail_slots].unsqueeze(0).contiguous(),
-                state.ape,
-            )
-            pool_id = position // _POOL
-            table_col = pool_id // _ROWS_PER_PAGE
-            page = int(state.block_table[req, table_col])
-            row = pool_id % _ROWS_PER_PAGE
-            values[page, row] = pooled[0]
-            scales[page, row, 0] = pooled_scale[0]
-    return tail_k, tail_gate, values, scales
+    expected = (
+        state.tail_k.clone(),
+        state.tail_gate.clone(),
+        state.index_values.clone(),
+        state.index_scales.clone(),
+    )
+    torch_kpool_decode_append(
+        k=keys,
+        gate=gates,
+        tail_k=expected[0],
+        tail_gate=expected[1],
+        seq_lens=seq_lens,
+        request_slots=state.request_slots,
+        index_block_table=state.block_table,
+        index_values=expected[2],
+        index_scales=expected[3],
+        ape=state.ape,
+    )
+    return expected
 
 
 def test_prefill_write_matches_reference() -> None:
@@ -275,7 +246,7 @@ def test_prefill_write_matches_reference() -> None:
 
     kpool_prefill_write(keys, gates, write_slots, values, scales, ape)
 
-    expected_values, expected_scales = _reference_compress(keys, gates, ape)
+    expected_values, expected_scales = kpool_compress(keys, gates, ape)
     pages = write_slots // _ROWS_PER_PAGE
     rows = write_slots % _ROWS_PER_PAGE
     _assert_encoded(
@@ -293,24 +264,18 @@ def _reference_tail_write(
     destination_positions: torch.Tensor,
     valid_counts: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    expected_k = tail_k.clone()
-    expected_gate = tail_gate.clone()
-    metadata = zip(
-        source_starts.tolist(),
-        destination_slots.tolist(),
-        destination_positions.tolist(),
-        valid_counts.tolist(),
+    expected_k, expected_gate = tail_k.clone(), tail_gate.clone()
+    torch_kpool_prefill_tail_write(
+        k=keys,
+        gate=gates,
+        tail_k=expected_k,
+        tail_gate=expected_gate,
+        source_starts=source_starts,
+        destination_slots=destination_slots,
+        destination_positions=destination_positions,
+        valid_counts=valid_counts,
+        pool_size=_POOL,
     )
-    for source, destination_slot, destination_position, count in metadata:
-        if not (0 <= destination_slot < tail_k.shape[0]) or destination_position < 0:
-            continue
-        for offset in range(min(count, _POOL)):
-            source_row = source + offset
-            if not 0 <= source_row < keys.shape[0]:
-                continue
-            destination_row = (destination_position + offset) % tail_k.shape[1]
-            expected_k[destination_slot, destination_row] = keys[source_row]
-            expected_gate[destination_slot, destination_row] = gates[source_row]
     return expected_k, expected_gate
 
 
@@ -592,7 +557,7 @@ def test_decode_append_defers_unmaterialized_pool() -> None:
         state.ape,
     )
 
-    expected_values, expected_scales = _reference_compress(
+    expected_values, expected_scales = kpool_compress(
         torch.cat((committed_k.unsqueeze(0), accepted_k[0])).unsqueeze(0),
         torch.cat((committed_gate.unsqueeze(0), accepted_gate[0])).unsqueeze(0),
         state.ape,

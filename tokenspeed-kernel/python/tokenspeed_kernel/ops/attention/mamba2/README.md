@@ -4,7 +4,7 @@ Four ops cover the Mamba2 SSD mixer. All take the checkpoint's `A_log` and
 compute the decay rate `A = -exp(A_log)` inside the kernel, so no per-call
 elementwise launch precedes them. `mamba2_chunk_scan` handles prefill,
 `mamba2_state_update` one token per request, `mamba2_verify_scan` a speculative
-verify window and `mamba2_replay_commit` the accepted part of that window. All
+verify window, and `mamba2_replay_commit` the accepted part of that window. All
 use the recurrence in the package docstring and keep states as
 `[heads, head_dim, d_state]` with `d_state` last, the layout of the runtime's
 recurrent-state pool, so the cache boundary requires no transpose.
@@ -49,10 +49,10 @@ Nemotron-3 Super geometry the scan takes 465 us for 8192 tokens per layer.
 ## Operand contract
 
 Every op validates its operands before launching, since the kernels index them
-directly. `x`, `dt`, `B` and `C` must be contiguous in their last dimension and
+directly. `x`, `dt`, `B`, and `C` must be contiguous in their last dimension and
 `out` contiguous. States, both pool slots and initial states, must be dense
 within a slot, the layout the replay commit also indexes, and pool slots must
-not overlap. The kernels widen only the leading token, request or slot index to
+not overlap. The kernels widen only the leading token, request, or slot index to
 64 bits, so the rest of one row of an operand must span fewer than 2^31
 elements. The tensors an op writes, `out` and the state pool, must not share
 storage with any other operand: scan programs read rows that other programs
@@ -76,14 +76,14 @@ destination table. Without the table it leaves the pool untouched: the caller
 keeps the verify inputs and `mamba2_replay_commit` later rebuilds only the
 accepted state, which avoids staging `T` full states per layer (4 MiB each for
 Nemotron-3 Super). The commit reads the recurrent replay payload
-`[K | V | a | b]` shared with GDN, holding `B`, `x` and the raw `dt`; the SSD
+`[K | V | a | b]` shared with GDN, holding `B`, `x`, and the raw `dt`; the SSD
 recurrence has no `b` and ignores that slot. It replays every layer of the
 round in one launch through a table of per-layer pool addresses.
 
 Decode runs the verify kernel, and replay repeats its arithmetic step for
 step. Both round the state through the pool dtype after every token, as
 decode's reload does, and the destination write is a runtime branch. Decode,
-verify and replay therefore produce bit-identical states, and verify outputs
+verify, and replay therefore produce bit-identical states, and verify outputs
 match decode outputs bit for bit, for fp32 and bf16 state pools alike.
 
 Instruction issue bounds the verify kernel, and at `d_state` 128 half of
@@ -113,5 +113,5 @@ initial states, resuming a split scan, padded update rows, and decode steps
 that continue a prefill, checks verify and replay bit for bit against
 consecutive decode updates, checks tree windows against chain verifies of each
 token's root path, checks verify outputs against the recurrence for fp32,
-misaligned and bf16 pools, and guards every kernel against recompiling when
+misaligned, and bf16 pools, and guards every kernel against recompiling when
 the batch shape changes.

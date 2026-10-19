@@ -34,10 +34,12 @@ if is_cdna4():
     from tokenspeed_kernel_amd.ops.gfx950.sampling import argmax as argmax_impl
 
     _ARCH = "gfx950"
+    _argmax = argmax_impl.launch_gluon_argmax_gfx950
 elif is_cdna5():
     from tokenspeed_kernel_amd.ops.gfx1250.sampling import argmax as argmax_impl
 
     _ARCH = "gfx1250"
+    _argmax = argmax_impl.launch_gluon_argmax_gfx1250
 else:
     pytest.skip(
         "AMD CDNA4 or CDNA5 is required for Gluon argmax tests",
@@ -53,7 +55,7 @@ else:
 def test_argmax_matches_torch_for_dtypes(dtype):
     torch.manual_seed(0xA950)
     x = torch.randn(8, 4096, device="cuda", dtype=dtype)
-    out = argmax_impl.argmax(x, out=None)
+    out = _argmax(x, out=None)
     torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
 
 
@@ -66,7 +68,7 @@ def test_argmax_matches_torch_for_dtypes(dtype):
 def test_argmax_matches_torch_for_model_shapes(M, N, dtype):
     torch.manual_seed(M ^ N)
     x = torch.randn(M, N, device="cuda", dtype=dtype)
-    out = argmax_impl.argmax(x, out=None)
+    out = _argmax(x, out=None)
     torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
 
 
@@ -81,7 +83,7 @@ def test_argmax_matches_torch_for_model_shapes(M, N, dtype):
 )
 def test_argmax_all_nan_rows_return_sentinel(M, N, dtype):
     x = torch.full((M, N), float("nan"), device="cuda", dtype=dtype)
-    out = argmax_impl.argmax(x, out=None)
+    out = _argmax(x, out=None)
     expected = torch.full((M,), -1, device="cuda", dtype=out.dtype)
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
@@ -96,7 +98,7 @@ def test_argmax_ignores_nan_but_preserves_valid_negative_infinity(M):
     x[2, 7] = 3.0
     x[2, 5] = 3.0
 
-    out = argmax_impl.argmax(x, out=None)
+    out = _argmax(x, out=None)
     expected = torch.full((M,), -1, device="cuda", dtype=out.dtype)
     expected[:3] = torch.tensor([456, 0, 5], device="cuda", dtype=out.dtype)
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
@@ -115,7 +117,7 @@ def test_argmax_returns_first_index_on_ties():
         for pos in positions:
             x[row, pos] = 0.0
     torch.testing.assert_close(
-        argmax_impl.argmax(x, out=None), torch.argmax(x, dim=-1), atol=0, rtol=0
+        _argmax(x, out=None), torch.argmax(x, dim=-1), atol=0, rtol=0
     )
 
 
@@ -125,7 +127,7 @@ def test_argmax_writes_into_strided_caller_buffer(out_dtype):
     x = torch.randn(M, N, device="cuda", dtype=torch.float32)
     storage = torch.empty(M * 2, device="cuda", dtype=out_dtype)
     out = storage[::2]
-    returned = argmax_impl.argmax(x, out=out)
+    returned = _argmax(x, out=out)
     assert returned.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out.long(), torch.argmax(x, dim=-1), atol=0, rtol=0)
 
@@ -138,12 +140,12 @@ def test_argmax_out_buffer_under_cuda_graph(M):
     x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
     out = torch.empty(M, dtype=torch.int32, device="cuda")
 
-    argmax_impl.argmax(x, out=out)
+    _argmax(x, out=out)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        argmax_impl.argmax(x, out=out)
+        _argmax(x, out=out)
 
     new_x = 0.1 * torch.randn_like(x)
     x.copy_(new_x)
@@ -160,7 +162,7 @@ def test_argmax_strided_rows_and_partial_tiles(M, N):
     x = torch.randn(M, N + 7, device="cuda", dtype=torch.float32)[:, :N]
     x[:, -1] = 100.0
     torch.testing.assert_close(
-        argmax_impl.argmax(x, out=None), torch.argmax(x, dim=-1), atol=0, rtol=0
+        _argmax(x, out=None), torch.argmax(x, dim=-1), atol=0, rtol=0
     )
 
 
@@ -184,7 +186,7 @@ def test_argmax_masks_padding_with_negative_logits(M, N, dtype):
 
     output_storage = torch.full((M * 2,), -7, device="cuda", dtype=out_dtype)
     out = output_storage[::2]
-    returned = argmax_impl.argmax(x, out=out)
+    returned = _argmax(x, out=out)
     assert returned is out
     expected = torch.full((M,), N - 1, device="cuda", dtype=out_dtype)
     expected[:3] = torch.tensor([-1, 0, N // 2], device="cuda", dtype=out_dtype)
@@ -201,9 +203,7 @@ def test_argmax_ties_across_splits_and_infinities(M, N):
     x[2, N // 16] = x[2, N // 2] = 10.0
     expected = torch.full((M,), -1, device="cuda", dtype=torch.int64)
     expected[:3] = torch.tensor([N // 32, N - 1, N // 16], device="cuda")
-    torch.testing.assert_close(
-        argmax_impl.argmax(x, out=None), expected, atol=0, rtol=0
-    )
+    torch.testing.assert_close(_argmax(x, out=None), expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("kind", ["small", "column_stride", "float64", "cpu", "empty"])
@@ -220,7 +220,7 @@ def test_argmax_unsupported_inputs_preserve_torch_fallback(kind):
     elif kind == "empty":
         x = x[:0]
     torch.testing.assert_close(
-        argmax_impl.argmax(x, out=None), torch.argmax(x, dim=-1), atol=0, rtol=0
+        _argmax(x, out=None), torch.argmax(x, dim=-1), atol=0, rtol=0
     )
 
 
@@ -271,7 +271,7 @@ def test_argmax_concurrent_streams_use_independent_scratch():
     for stream, x, out in zip(streams, xs, outputs):
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            argmax_impl.argmax(x, out=out)
+            _argmax(x, out=out)
         keys = _scratch_cache_keys_for(x, stream)
         assert keys
         scratch_pointers.append(
@@ -286,7 +286,7 @@ def test_argmax_concurrent_streams_use_independent_scratch():
     for _ in range(20):
         for stream, x, out in zip(streams, xs, outputs):
             with torch.cuda.stream(stream):
-                argmax_impl.argmax(x, out=out)
+                _argmax(x, out=out)
     for stream in streams:
         stream.synchronize()
     for x, out in zip(xs, outputs):
@@ -297,14 +297,14 @@ def test_argmax_first_capture_does_not_cache_graph_pool_scratch():
     x = torch.randn(7, MODEL_VOCABS["dsv4"], device="cuda")
     out = torch.empty(7, dtype=torch.int64, device="cuda")
     # Compile on a different stream, leaving the capture stream's scratch cold.
-    argmax_impl.argmax(x, out=out)
+    _argmax(x, out=out)
     torch.cuda.synchronize()
     stream = torch.cuda.Stream()
     for key in _scratch_cache_keys_for(x, stream):
         argmax_impl._scratch_cache.pop(key)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        argmax_impl.argmax(x, out=out)
+        _argmax(x, out=out)
     assert not _scratch_cache_keys_for(x, stream)
     for _ in range(3):
         x.normal_()
@@ -312,7 +312,7 @@ def test_argmax_first_capture_does_not_cache_graph_pool_scratch():
         torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
     with torch.cuda.stream(stream):
         stream.wait_stream(torch.cuda.current_stream())
-        argmax_impl.argmax(x, out=out)
+        _argmax(x, out=out)
     stream.synchronize()
     assert _scratch_cache_keys_for(x, stream)
     torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)

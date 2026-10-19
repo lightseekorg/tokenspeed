@@ -66,6 +66,14 @@ class CommBackend(ABC):
 
     # ---- Collective ops ----
 
+    def get_prepared_all_gather(self, group: Group, dtype: torch.dtype):
+        """Return a prepared column all-gather allowed by this backend's policy."""
+        return None
+
+    def broadcast_from_first_rank(self, tensor: torch.Tensor, group: Group) -> bool:
+        """Broadcast in place when prepared; otherwise let the caller fall back."""
+        return False
+
     def prepare_projection(
         self, spec: "ProjectionSpec", scratch_pool: "WorkspacePool | None" = None
     ) -> "ProjectionWorkspace":
@@ -194,6 +202,32 @@ class CommBackend(ABC):
         """
 
         return False
+
+    def all_reduce_mhc_post(
+        self,
+        tensor: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        group: Group,
+    ) -> torch.Tensor | None:
+        """Sum ``tensor`` over ``group`` and apply the hc=4 mHC post in one step.
+
+        Args:
+            tensor: BF16 [T, H] partial, normally from
+                ``acquire_all_reduce_outputs``.
+            residual: BF16 residual streams [T, 4, H].
+            post: FP32 post coefficients [T, 4].
+            comb: FP32 combination [T, 4 input, 4 output].
+            group: Global ranks participating in the reduction.
+
+        Returns:
+            The new BF16 residual streams [T, 4, H], or None when the backend
+            has no fused path for these operands (nothing has run then; the
+            caller reduces and applies the post itself). The answer must agree
+            on every rank of ``group``.
+        """
+        return None
 
     def acquire_all_reduce_outputs(
         self,

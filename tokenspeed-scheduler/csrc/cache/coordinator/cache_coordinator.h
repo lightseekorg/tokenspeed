@@ -165,7 +165,8 @@ public:
             std::vector<GroupPrefixProbe> per_group;
         };
         struct Tier {
-            // The boundary T this tier resumes at, in tokens.
+            // Device/Host: the resume boundary T. Storage: the aligned fetch
+            // coverage, which is not eligible for admission until it lands.
             std::int32_t num_common_tokens{0};
             // The full pages below it: num_common_tokens less the tail.
             std::int32_t full_page_tokens{0};
@@ -190,11 +191,10 @@ public:
         // Entries the Host tier holds beyond the Device hit. Admission loads
         // these; nothing an admission touches can miss.
         Tier host;
-        // L3 only: the prefix the storage shadow (keys known to exist in the
-        // remote store) extends beyond the Host hit, matched by the same
-        // matchers over "Host-cached or registered". Never admitted directly:
-        // PlanPrefetch turns it into a pre-admission Host fill, after which
-        // it is an ordinary Host hit. Empty without L3.
+        // L3 only: token-spanned fetch coverage beyond the Host hit, over
+        // Host-cached or registered keys. Hits also carry available State
+        // checkpoints and their windows. PlanPrefetch fills Host; the ordinary
+        // Host candidate phase then chooses a resume boundary. Empty without L3.
         Tier storage;
     };
     struct AdmissionResult {
@@ -522,8 +522,8 @@ private:
     BlockPool& tierPool();
     template <CacheTier Tier>
     const BlockPool& tierPool() const;
-    // with_storage_keys treats the L3 shadow's keys as hits beside the tier's
-    // entries (the Host tier only): the storage probe of ProbePrefix.
+    // Aligned matching over token-spanned groups; no State checkpoint hits.
+    // with_storage_keys also counts registered L3 keys (the Host tier only).
     template <CacheTier Tier>
     PrefixProbe::Tier probeTierWithKeys(std::span<const std::vector<CacheKey>> group_keys,
                                         std::span<const std::size_t> match_order, std::int32_t num_prefix_pages,
@@ -548,6 +548,11 @@ private:
     PrefixProbe::Tier probeTier(const PromptPrefix& prompt, std::span<const std::vector<CacheKey>> group_keys,
                                 std::span<const std::size_t> match_order, std::int32_t floor_tokens,
                                 bool claim_partial) const;
+    // Extends aligned fetch hits with State checkpoints and their windows;
+    // unlike probeTier, does not choose an admissible resume boundary.
+    PrefixProbe::Tier probeStorageForPrefetch(std::span<const std::vector<CacheKey>> group_keys,
+                                              std::span<const std::size_t> match_order, std::int32_t num_prefix_pages,
+                                              std::int32_t floor_tokens) const;
     std::vector<CacheKey> tailKeysForGroup(std::size_t i, const ContentHash& hash, std::int32_t tail_tokens) const;
     PrefixProbe probePrefixWithOrder(const PromptPrefix& prompt, std::span<const std::size_t> match_order,
                                      bool claim_partial) const;

@@ -37,12 +37,12 @@ import json
 import os
 import sys
 import tempfile
-import unittest
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
@@ -161,7 +161,7 @@ def _mock_device(ok: bool = True, message: str = "loaded"):
     return device
 
 
-class TestSchedulerDispatch(unittest.TestCase):
+class TestSchedulerDispatch:
     def test_disk_update_is_dispatched_and_answered(self):
         # Without a branch the request reaches the NotImplementedError
         # fallthrough and the scheduler process exits.
@@ -172,9 +172,9 @@ class TestSchedulerDispatch(unittest.TestCase):
 
         handler._device.update_weights.assert_called_once_with(req)
         output = handler.send_func.send_pyobj.call_args.args[0]
-        self.assertIsInstance(output, UpdateWeightFromDiskReqOutput)
-        self.assertTrue(output.success)
-        self.assertEqual(output.message, "loaded")
+        assert isinstance((output), (UpdateWeightFromDiskReqOutput))
+        assert output.success
+        assert (output.message) == ("loaded")
 
     def test_failed_disk_update_is_answered(self):
         handler = _handler(_mock_device(ok=False, message="no such checkpoint"))
@@ -182,9 +182,9 @@ class TestSchedulerDispatch(unittest.TestCase):
         handler.process_requests([UpdateWeightFromDiskReqInput(model_path="/nope")])
 
         output = handler.send_func.send_pyobj.call_args.args[0]
-        self.assertIsInstance(output, UpdateWeightFromDiskReqOutput)
-        self.assertFalse(output.success)
-        self.assertEqual(output.message, "no such checkpoint")
+        assert isinstance((output), (UpdateWeightFromDiskReqOutput))
+        assert not (output.success)
+        assert (output.message) == ("no such checkpoint")
 
     def test_prefix_cache_is_flushed_before_the_load(self):
         # Cached KV was computed under the old weights; prefix caching is on by
@@ -202,7 +202,7 @@ class TestSchedulerDispatch(unittest.TestCase):
 
         handler.process_requests([UpdateWeightFromDiskReqInput(model_path="/ckpt")])
 
-        self.assertEqual(order, ["flush", "load"])
+        assert (order) == (["flush", "load"])
 
     def test_failed_flush_skips_the_load(self):
         handler = _handler(_mock_device())
@@ -212,9 +212,9 @@ class TestSchedulerDispatch(unittest.TestCase):
 
         handler._device.update_weights.assert_not_called()
         output = handler.send_func.send_pyobj.call_args.args[0]
-        self.assertIsInstance(output, UpdateWeightFromDiskReqOutput)
-        self.assertFalse(output.success)
-        self.assertIn("cache flush failed", output.message)
+        assert isinstance((output), (UpdateWeightFromDiskReqOutput))
+        assert not (output.success)
+        assert ("cache flush failed") in (output.message)
 
     def test_weight_version_is_committed_after_a_successful_load(self):
         handler = _handler(_mock_device())
@@ -223,7 +223,7 @@ class TestSchedulerDispatch(unittest.TestCase):
             [UpdateWeightFromDiskReqInput(model_path="/ckpt", weight_version="v2")]
         )
 
-        self.assertEqual(handler.server_args.weight_version, "v2")
+        assert (handler.server_args.weight_version) == ("v2")
         handler._device.set_l3_weight_version.assert_called_once_with("v2")
 
     def test_l3_flush_without_weight_version_is_rejected_before_the_load(self):
@@ -234,17 +234,17 @@ class TestSchedulerDispatch(unittest.TestCase):
 
         handler._device.update_weights.assert_not_called()
         output = handler.send_func.send_pyobj.call_args.args[0]
-        self.assertIsInstance(output, UpdateWeightFromDiskReqOutput)
-        self.assertFalse(output.success)
+        assert isinstance((output), (UpdateWeightFromDiskReqOutput))
+        assert not (output.success)
 
 
-class TestDeviceRouting(unittest.TestCase):
+class TestDeviceRouting:
     def test_disk_request_reaches_the_model_runner(self):
         runner = mock.Mock()
         runner.update_weights_from_disk = mock.Mock(return_value=(True, "ok"))
         req = UpdateWeightFromDiskReqInput(model_path="/ckpt")
 
-        self.assertEqual(_device_handle(runner).update_weights(req), (True, "ok"))
+        assert (_device_handle(runner).update_weights(req)) == ((True, "ok"))
         runner.update_weights_from_disk.assert_called_once_with(req)
 
     def test_drafter_is_told_the_target_weights_changed(self):
@@ -259,11 +259,12 @@ class TestDeviceRouting(unittest.TestCase):
         drafter.on_target_weights_updated.assert_called_once_with()
 
 
-class TestRealCheckpoint(unittest.TestCase):
-    def setUp(self):
+class TestRealCheckpoint:
+    @pytest.fixture(autouse=True)
+    def _setup(self, request):
         self._tmp = tempfile.TemporaryDirectory()
+        request.addfinalizer(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
-        self.addCleanup(self._tmp.cleanup)
 
     def _load(self, runner, path, **kwargs):
         return runner.update_weights_from_disk(
@@ -278,10 +279,12 @@ class TestRealCheckpoint(unittest.TestCase):
 
         ok, message = self._load(runner, self.root / "step-1")
 
-        self.assertTrue(ok, message)
+        _pytest_expr_1 = ok
+        _pytest_msg_2 = message
+        assert _pytest_expr_1, _pytest_msg_2
         torch.testing.assert_close(model.w.data, updated["w"])
         torch.testing.assert_close(model.b.data, updated["b"])
-        self.assertFalse(torch.equal(model.w.data, original["w"]))
+        assert not (torch.equal(model.w.data, original["w"]))
 
     def test_round_trip_restores_the_original_values(self):
         original = _write_checkpoint(self.root / "step-0", scale=1.0)
@@ -290,10 +293,12 @@ class TestRealCheckpoint(unittest.TestCase):
         runner = _runner(model, self.root / "step-0")
 
         self._load(runner, self.root / "step-1")
-        self.assertFalse(torch.equal(model.w.data, original["w"]))
+        assert not (torch.equal(model.w.data, original["w"]))
         ok, message = self._load(runner, self.root / "step-0")
 
-        self.assertTrue(ok, message)
+        _pytest_expr_3 = ok
+        _pytest_msg_4 = message
+        assert _pytest_expr_3, _pytest_msg_4
         torch.testing.assert_close(model.w.data, original["w"])
         torch.testing.assert_close(model.b.data, original["b"])
 
@@ -304,9 +309,11 @@ class TestRealCheckpoint(unittest.TestCase):
 
         ok, message = self._load(runner, self.root / "step-1")
 
-        self.assertTrue(ok, message)
-        self.assertIn("2 checkpoint tensors read", message)
-        self.assertEqual(sorted(model.seen), ["b", "w"])
+        _pytest_expr_5 = ok
+        _pytest_msg_6 = message
+        assert _pytest_expr_5, _pytest_msg_6
+        assert ("2 checkpoint tensors read") in (message)
+        assert (sorted(model.seen)) == (["b", "w"])
 
     def test_worker_records_the_new_model_path(self):
         _write_checkpoint(self.root / "step-1", scale=3.0)
@@ -314,11 +321,10 @@ class TestRealCheckpoint(unittest.TestCase):
 
         self._load(runner, self.root / "step-1")
 
-        self.assertEqual(runner.model_config.model_path, str(self.root / "step-1"))
+        assert (runner.model_config.model_path) == (str(self.root / "step-1"))
 
     def test_non_unit_kv_scale_fails_the_update(self):
-        # The startup loader's screen applies to a reload: KV caches run at
-        # unit scale.
+        # A reload keeps the startup KV-cache scales, as a distributed update does.
         directory = self.root / "scaled"
         directory.mkdir()
         save_file(
@@ -332,9 +338,9 @@ class TestRealCheckpoint(unittest.TestCase):
 
         ok, message = self._load(runner, directory)
 
-        self.assertFalse(ok)
-        self.assertIn("only unit KV-cache scales are supported", message)
-        self.assertEqual(runner.model_config.model_path, str(self.root / "step-0"))
+        assert not (ok)
+        assert ("only unit KV-cache scales are supported") in (message)
+        assert (runner.model_config.model_path) == (str(self.root / "step-0"))
 
     def test_checkpoint_with_no_tensors_is_a_failure(self):
         empty = self.root / "empty"
@@ -345,9 +351,9 @@ class TestRealCheckpoint(unittest.TestCase):
 
         ok, message = self._load(runner, empty, load_format="pt")
 
-        self.assertFalse(ok)
-        self.assertIn("no checkpoint tensors", message)
-        self.assertEqual(model.seen, [])
+        assert not (ok)
+        assert ("no checkpoint tensors") in (message)
+        assert (model.seen) == ([])
 
     def test_missing_checkpoint_fails_instead_of_raising(self):
         # The scheduler runs this inline; an escaping exception kills it.
@@ -355,8 +361,8 @@ class TestRealCheckpoint(unittest.TestCase):
 
         ok, message = self._load(runner, self.root / "absent")
 
-        self.assertFalse(ok)
-        self.assertTrue(message)
+        assert not (ok)
+        assert message
 
     def test_request_load_format_overrides_the_servers(self):
         directory = self.root / "step-1"
@@ -372,7 +378,9 @@ class TestRealCheckpoint(unittest.TestCase):
 
         ok, message = self._load(runner, directory, load_format="safetensors")
 
-        self.assertTrue(ok, message)
+        _pytest_expr_7 = ok
+        _pytest_msg_8 = message
+        assert _pytest_expr_7, _pytest_msg_8
         torch.testing.assert_close(model.w.data, expected["w"])
 
     def test_load_format_that_reads_no_files_is_refused(self):
@@ -381,8 +389,8 @@ class TestRealCheckpoint(unittest.TestCase):
 
         ok, message = self._load(runner, self.root / "step-0", load_format="dummy")
 
-        self.assertFalse(ok)
-        self.assertIn("in-place reload", message)
+        assert not (ok)
+        assert ("in-place reload") in (message)
 
     def test_scheduler_request_reaches_the_parameters(self):
         original = _write_checkpoint(self.root / "step-0", scale=1.0)
@@ -398,10 +406,12 @@ class TestRealCheckpoint(unittest.TestCase):
                 [UpdateWeightFromDiskReqInput(model_path=str(path))]
             )
             output = handler.send_func.send_pyobj.call_args.args[0]
-            self.assertIsInstance(output, UpdateWeightFromDiskReqOutput)
-            self.assertTrue(output.success, output.message)
+            assert isinstance((output), (UpdateWeightFromDiskReqOutput))
+            _pytest_expr_21 = output.success
+            _pytest_msg_22 = output.message
+            assert _pytest_expr_21, _pytest_msg_22
             torch.testing.assert_close(model.w.data, expected["w"])
-        self.assertEqual(handler.clear_cache_fn.call_count, 2)
+        assert (handler.clear_cache_fn.call_count) == (2)
 
 
 def _bare(cls: type[torch.nn.Module]) -> torch.nn.Module:
@@ -439,7 +449,7 @@ class _SkippingModel(_TinyModel):
                 params[name].data.copy_(tensor)
 
 
-class TestPostLoadTransforms(unittest.TestCase):
+class TestPostLoadTransforms:
     def _transformed(self, **modules) -> list[str]:
         model = torch.nn.Module()
         for name, module in modules.items():
@@ -447,24 +457,22 @@ class TestPostLoadTransforms(unittest.TestCase):
         return loader_module.post_load_transformed_modules(model)
 
     def test_quantized_projection_is_a_transform(self):
-        self.assertEqual(
-            loader_module.post_load_transformed_modules(_quantized(torch.nn.Module())),
-            ["proj (Fp8LinearMethod)"],
-        )
+        assert (
+            loader_module.post_load_transformed_modules(_quantized(torch.nn.Module()))
+        ) == (["proj (Fp8LinearMethod)"])
 
     def test_moe_layer_whose_kernel_repacks_its_experts_is_a_transform(self):
         def shuffle_experts(plan, w):
             del plan, w
 
-        self.assertEqual(
-            self._transformed(experts=_moe(shuffle_experts)),
-            ["experts (shuffle_experts)"],
+        assert (self._transformed(experts=_moe(shuffle_experts))) == (
+            ["experts (shuffle_experts)"]
         )
 
     def test_moe_layer_whose_kernel_has_no_preprocessor_is_not(self):
         # The unquantized gfx950 MoE kernels plan no weight preprocessor, so
         # their experts keep the checkpoint layout.
-        self.assertEqual(self._transformed(experts=_moe(None)), [])
+        assert (self._transformed(experts=_moe(None))) == ([])
 
     def test_unknown_hook_is_a_transform(self):
         # A hook nobody has shown to be a no-op is treated as one that is not.
@@ -472,7 +480,7 @@ class TestPostLoadTransforms(unittest.TestCase):
             def process_weights_after_loading(self, module) -> None:
                 del module
 
-        self.assertEqual(self._transformed(layer=Repacked()), ["layer (Repacked)"])
+        assert (self._transformed(layer=Repacked())) == (["layer (Repacked)"])
 
     def test_unquantized_dense_layers_are_not(self):
         layers = {}
@@ -483,13 +491,13 @@ class TestPostLoadTransforms(unittest.TestCase):
         ):
             layers[name] = _bare(cls)
             layers[name].quant_method = UnquantizedLinearMethod()
-        self.assertEqual(self._transformed(**layers), [])
+        assert (self._transformed(**layers)) == ([])
 
-    def test_no_op_hooks_leave_the_layer_untouched(self):
+    def test_no_op_hooks_leave_the_layer_untouched(self, subtests):
         # The allow list is what keeps unquantized models reloadable, so each
         # member must really leave the loaded weights alone.
         for hook in loader_module.no_op_post_load_hooks():
-            with self.subTest(hook=hook.__qualname__):
+            with subtests.test(hook=hook.__qualname__):
                 layer = torch.nn.Module()
                 layer.weight = torch.nn.Parameter(
                     torch.arange(6.0).reshape(2, 3), requires_grad=False
@@ -499,16 +507,17 @@ class TestPostLoadTransforms(unittest.TestCase):
 
                 hook(layer, layer)
 
-                self.assertIs(layer.weight, weight)
-                self.assertTrue(torch.equal(layer.weight.detach(), values))
-                self.assertEqual((set(vars(layer)), set(layer._parameters)), attributes)
+                assert (layer.weight) is (weight)
+                assert torch.equal(layer.weight.detach(), values)
+                assert ((set(vars(layer)), set(layer._parameters))) == (attributes)
 
 
-class TestReloadRefusals(unittest.TestCase):
-    def setUp(self):
+class TestReloadRefusals:
+    @pytest.fixture(autouse=True)
+    def _setup(self, request):
         self._tmp = tempfile.TemporaryDirectory()
+        request.addfinalizer(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
-        self.addCleanup(self._tmp.cleanup)
 
     def _load(self, runner, path, **kwargs):
         return runner.update_weights_from_disk(
@@ -524,14 +533,14 @@ class TestReloadRefusals(unittest.TestCase):
 
         ok, message = self._load(runner, self.root / "step-1")
 
-        self.assertFalse(ok)
-        self.assertIn("proj (Fp8LinearMethod)", message)
-        self.assertIn("Nothing was written", message)
-        self.assertIn("restart the engine", message)
-        self.assertEqual(model.seen, [])
-        self.assertEqual(bound, [])
-        self.assertTrue(torch.equal(model.w.data, torch.zeros(4, 3)))
-        self.assertEqual(runner.model_config.model_path, str(self.root / "step-0"))
+        assert not (ok)
+        assert ("proj (Fp8LinearMethod)") in (message)
+        assert ("Nothing was written") in (message)
+        assert ("restart the engine") in (message)
+        assert (model.seen) == ([])
+        assert (bound) == ([])
+        assert torch.equal(model.w.data, torch.zeros(4, 3))
+        assert (runner.model_config.model_path) == (str(self.root / "step-0"))
 
     def test_model_with_only_no_op_hooks_still_reloads(self):
         updated = _write_checkpoint(self.root / "step-1", scale=7.0)
@@ -543,7 +552,9 @@ class TestReloadRefusals(unittest.TestCase):
 
         ok, message = self._load(runner, self.root / "step-1")
 
-        self.assertTrue(ok, message)
+        _pytest_expr_9 = ok
+        _pytest_msg_10 = message
+        assert _pytest_expr_9, _pytest_msg_10
         torch.testing.assert_close(model.w.data, updated["w"])
 
     def test_shape_mismatch_is_refused_before_anything_is_written(self):
@@ -561,11 +572,11 @@ class TestReloadRefusals(unittest.TestCase):
 
         ok, message = self._load(runner, wrong)
 
-        self.assertEqual(model.seen, [])
-        self.assertTrue(torch.equal(model.b.data, torch.zeros(4)))
-        self.assertFalse(ok)
-        self.assertIn("'w' has shape [5, 3], but [4, 3]", message)
-        self.assertIn("nothing was written", message)
+        assert (model.seen) == ([])
+        assert torch.equal(model.b.data, torch.zeros(4))
+        assert not (ok)
+        assert ("'w' has shape [5, 3], but [4, 3]") in (message)
+        assert ("nothing was written") in (message)
 
     def test_truncated_shard_is_refused_before_anything_is_written(self):
         _write_checkpoint(self.root / "step-0", scale=1.0)
@@ -588,10 +599,10 @@ class TestReloadRefusals(unittest.TestCase):
         ):
             ok, message = self._load(runner, partial)
 
-        self.assertEqual(model.seen, [])
-        self.assertFalse(ok)
-        self.assertIn("model-00002-of-00002.safetensors", message)
-        self.assertIn("nothing was written", message)
+        assert (model.seen) == ([])
+        assert not (ok)
+        assert ("model-00002-of-00002.safetensors") in (message)
+        assert ("nothing was written") in (message)
 
     def test_shapes_of_the_last_reload_survive_its_directory_being_deleted(self):
         # Trainers rotate checkpoint directories; the check must not depend on
@@ -601,7 +612,9 @@ class TestReloadRefusals(unittest.TestCase):
         model = _TinyModel()
         runner = _runner(model, self.root / "step-0")
         ok, message = self._load(runner, self.root / "step-1")
-        self.assertTrue(ok, message)
+        _pytest_expr_11 = ok
+        _pytest_msg_12 = message
+        assert _pytest_expr_11, _pytest_msg_12
         for step in ("step-0", "step-1"):
             for shard in (self.root / step).iterdir():
                 shard.unlink()
@@ -615,8 +628,8 @@ class TestReloadRefusals(unittest.TestCase):
 
         ok, message = self._load(runner, wrong)
 
-        self.assertFalse(ok)
-        self.assertIn("'w' has shape [5, 3], but [4, 3]", message)
+        assert not (ok)
+        assert ("'w' has shape [5, 3], but [4, 3]") in (message)
         torch.testing.assert_close(model.b.data, loaded["b"])
 
     def test_names_the_held_checkpoint_lacks_are_left_to_the_model(self):
@@ -632,8 +645,10 @@ class TestReloadRefusals(unittest.TestCase):
 
         ok, message = self._load(runner, extra)
 
-        self.assertTrue(ok, message)
-        self.assertTrue(torch.equal(model.w.data, torch.ones(4, 3)))
+        _pytest_expr_13 = ok
+        _pytest_msg_14 = message
+        assert _pytest_expr_13, _pytest_msg_14
+        assert torch.equal(model.w.data, torch.ones(4, 3))
 
     def test_one_element_tensors_match_whatever_their_shape(self):
         # The default weight loader fills a one-element parameter from any
@@ -650,8 +665,10 @@ class TestReloadRefusals(unittest.TestCase):
 
         ok, message = self._load(runner, update)
 
-        self.assertTrue(ok, message)
-        self.assertEqual(model.s.item(), 3.0)
+        _pytest_expr_15 = ok
+        _pytest_msg_16 = message
+        assert _pytest_expr_15, _pytest_msg_16
+        assert (model.s.item()) == (3.0)
 
     def test_failure_after_tensors_reached_the_model_reports_a_partial_update(self):
         _write_checkpoint(self.root / "step-1", scale=7.0)
@@ -667,25 +684,26 @@ class TestReloadRefusals(unittest.TestCase):
 
         ok, message = self._load(runner, self.root / "step-1")
 
-        self.assertFalse(ok)
-        self.assertIn("device lost", message)
-        self.assertIn("may now mix the old and new checkpoints", message)
-        self.assertIn("restart the engine", message)
+        assert not (ok)
+        assert ("device lost") in (message)
+        assert ("may now mix the old and new checkpoints") in (message)
+        assert ("restart the engine") in (message)
 
     def test_failure_before_any_tensor_reports_no_partial_update(self):
         runner = _runner(_TinyModel(), self.root / "step-0")
 
         ok, message = self._load(runner, self.root / "absent")
 
-        self.assertFalse(ok)
-        self.assertNotIn("may now mix", message)
+        assert not (ok)
+        assert ("may now mix") not in (message)
 
 
-class TestReloadMatchesStartupLoad(unittest.TestCase):
-    def setUp(self):
+class TestReloadMatchesStartupLoad:
+    @pytest.fixture(autouse=True)
+    def _setup(self, request):
         self._tmp = tempfile.TemporaryDirectory()
+        request.addfinalizer(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
-        self.addCleanup(self._tmp.cleanup)
 
     def _load(self, runner, path):
         return runner.update_weights_from_disk(
@@ -711,9 +729,11 @@ class TestReloadMatchesStartupLoad(unittest.TestCase):
 
         ok, message = self._load(runner, self.root / "step-1")
 
-        self.assertTrue(ok, message)
-        self.assertEqual(events[0], ("bind", str(self.root / "step-1")))
-        self.assertEqual(sorted(name for _, name in events[1:]), ["b", "w"])
+        _pytest_expr_17 = ok
+        _pytest_msg_18 = message
+        assert _pytest_expr_17, _pytest_msg_18
+        assert (events[0]) == (("bind", str(self.root / "step-1")))
+        assert (sorted(name for _, name in events[1:])) == (["b", "w"])
 
     def _groups_read(self, runner, path) -> list:
         real = loader_module.DefaultModelLoader._get_weights_iterator
@@ -729,7 +749,9 @@ class TestReloadMatchesStartupLoad(unittest.TestCase):
             loader_module.DefaultModelLoader, "_get_weights_iterator", spy
         ):
             ok, message = self._load(runner, path)
-        self.assertTrue(ok, message)
+        _pytest_expr_19 = ok
+        _pytest_msg_20 = message
+        assert _pytest_expr_19, _pytest_msg_20
         return groups
 
     def test_reload_falls_back_to_the_runners_checkpoint_load_group(self):
@@ -739,7 +761,7 @@ class TestReloadMatchesStartupLoad(unittest.TestCase):
         runner = _runner(_TinyModel(), self.root / "step-1")
         runner.checkpoint_load_group = (0, 1)
 
-        self.assertEqual(self._groups_read(runner, self.root / "step-1"), [(0, 1)])
+        assert (self._groups_read(runner, self.root / "step-1")) == ([(0, 1)])
 
     def test_models_own_checkpoint_load_group_wins(self):
         _write_checkpoint(self.root / "step-1", scale=7.0)
@@ -750,8 +772,8 @@ class TestReloadMatchesStartupLoad(unittest.TestCase):
         runner = _runner(model, self.root / "step-1")
         runner.checkpoint_load_group = (0, 1)
 
-        self.assertEqual(self._groups_read(runner, self.root / "step-1"), [(0, 2)])
+        assert (self._groups_read(runner, self.root / "step-1")) == ([(0, 2)])
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

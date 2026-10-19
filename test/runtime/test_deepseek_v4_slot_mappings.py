@@ -22,9 +22,16 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import fields
 
 from tokenspeed.runtime.execution.context import ForwardContext
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 def test_forward_context_carries_no_v4_memo_fields():

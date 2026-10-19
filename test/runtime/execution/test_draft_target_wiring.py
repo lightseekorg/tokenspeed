@@ -33,9 +33,6 @@ from tokenspeed.runtime.execution.context import ForwardContext  # noqa: E402
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.drafter import get_drafter_impl  # noqa: E402
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter  # noqa: E402
-from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (  # noqa: E402
-    DeepseekV4DSpark,
-)
 from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (  # noqa: E402
     DeepseekV41DSpark,
 )
@@ -95,6 +92,10 @@ def _head_layout(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**layout)
 
 
+def _unquantized_head() -> SimpleNamespace:
+    return SimpleNamespace(quant_method=None)
+
+
 def test_get_drafter_impl_routing():
     from tokenspeed.runtime.models.deepseek_v41_dspark import (
         DeepseekV41ForCausalLMDSpark,
@@ -124,6 +125,7 @@ class _Eagle3Target:
 
     def __init__(self):
         self.captured = None
+        self.lm_head = _unquantized_head()
         self.logits_processor = _head_layout()
 
     def get_embed_and_head(self):
@@ -205,6 +207,20 @@ class _EmbedDroppingDraft:
         return self.embedding, "DRAFT_HEAD"
 
 
+class _HeadAliasingDraft(_WeightSharingDraft):
+    """A draft that drafts with the head weight it aliased."""
+
+    def get_embed_and_head(self):
+        return self.embedding, self.shared[1]
+
+
+class _Fp8HeadMethod:
+    """A quantized LM head's method; wiring never runs it."""
+
+    def apply(self, layer, x, bias=None):
+        raise AssertionError("not called while wiring")
+
+
 def test_wire_mtp_shares_complete_lm_head_for_opted_in_draft():
     lm_head = object()
     target = _target_runner(
@@ -238,6 +254,36 @@ def test_wire_mtp_module_sharing_requires_target_lm_head():
         pytest.raises(ValueError, match="complete lm_head module"),
     ):
         factory.configure_draft_target(_server_args("MTP"), target, draft)
+
+
+def test_wire_refuses_a_draft_aliasing_a_quantized_target_head_weight():
+    head = SimpleNamespace(weight="FP8_WEIGHT", quant_method=_Fp8HeadMethod())
+    target = _target_runner(
+        SimpleNamespace(
+            lm_head=head,
+            get_embed_and_head=lambda: ("EMBED", head.weight),
+            logits_processor=_head_layout(),
+        )
+    )
+
+    with (
+        mock.patch.object(factory, "get_drafter_impl", return_value=Eagle),
+        pytest.raises(ValueError, match="_Fp8HeadMethod.*complete module"),
+    ):
+        factory.configure_draft_target(
+            _server_args("MTP"), target, _draft_runner(_HeadAliasingDraft())
+        )
+    # A draft drafting with its own head (an EAGLE3 draft) is not refused.
+    with mock.patch.object(factory, "get_drafter_impl", return_value=Eagle):
+        factory.configure_draft_target(
+            _server_args("MTP"), target, _draft_runner(_WeightSharingDraft())
+        )
+    module_draft = _ModuleSharingDraft()
+    with mock.patch.object(factory, "get_drafter_impl", return_value=Mtp):
+        factory.configure_draft_target(
+            _server_args("MTP"), target, _draft_runner(module_draft)
+        )
+    assert module_draft.shared == ("EMBED", head)
 
 
 def test_wire_off_pipeline_requires_both_target_weights():
@@ -315,7 +361,7 @@ def test_wire_last_pipeline_stage_shares_the_head_and_keeps_the_draft_embedding(
     # The last stage owns the target head but not its embedding: the draft is
     # handed embed=None, binds the head, and must still draft with the
     # embedding its checkpoint ships.
-    lm_head = object()
+    lm_head = _unquantized_head()
     weight_draft, module_draft = _WeightSharingDraft(), _ModuleSharingDraft()
     with mock.patch.object(factory, "get_drafter_impl", return_value=Eagle):
         factory.configure_draft_target(
@@ -345,7 +391,7 @@ def test_wire_last_pipeline_stage_rejects_a_draft_that_dropped_its_embedding():
     ):
         factory.configure_draft_target(
             _server_args("MTP"),
-            _last_stage_target(object()),
+            _last_stage_target(_unquantized_head()),
             _draft_runner(_EmbedDroppingDraft()),
         )
 
@@ -358,7 +404,7 @@ def test_wire_last_pipeline_stage_rejects_a_draft_that_reports_no_embedding():
     ):
         factory.configure_draft_target(
             _server_args("MTP"),
-            _last_stage_target(object()),
+            _last_stage_target(_unquantized_head()),
             _draft_runner(
                 SimpleNamespace(
                     set_embed_and_head=lambda e, h: None,
@@ -772,7 +818,7 @@ def test_block_drafter_binds_local_embedding_on_last_pipeline_stage():
 
 
 def test_deepseek_dspark_wire_target_only_binds_resources():
-    drafter = DeepseekV4DSpark.__new__(DeepseekV4DSpark)
+    drafter = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
     draft_head = object()
     drafter.draft_model = SimpleNamespace(lm_head=draft_head)
     target = SimpleNamespace(

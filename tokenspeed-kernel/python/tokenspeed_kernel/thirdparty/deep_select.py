@@ -66,10 +66,10 @@ def deep_select_topk(
     topk: int,
     output: torch.Tensor,
 ) -> torch.Tensor:
-    """Write unsorted FP32 top-k indices to caller-owned aligned output.
+    """Write unsorted FP32/BF16 top-k indices to caller-owned aligned output.
 
     Args:
-        scores: CUDA FP32 [queries, positions], with native aligned row stride.
+        scores: CUDA FP32/BF16 [queries, positions], with aligned row stride.
         lengths: CUDA contiguous int32 [queries], valid exclusive row ends.
         topk: Number of indices to select, from 1 through 4096.
         output: CUDA int32 [queries, topk], with native aligned row stride.

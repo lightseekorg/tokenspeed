@@ -38,11 +38,11 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-from runtime.cache_pd_test_utils import block_manifest as make_block_manifest
-from runtime.cache_pd_test_utils import group as make_group  # noqa: E402
-from runtime.cache_pd_test_utils import layout as make_layout
-from runtime.cache_pd_test_utils import producer_schedule as make_producer_schedule
-from runtime.cache_pd_test_utils import segment as make_segment
+from test.runtime.cache_pd_test_utils import block_manifest as make_block_manifest
+from test.runtime.cache_pd_test_utils import group as make_group  # noqa: E402
+from test.runtime.cache_pd_test_utils import layout as make_layout
+from test.runtime.cache_pd_test_utils import producer_schedule as make_producer_schedule
+from test.runtime.cache_pd_test_utils import segment as make_segment
 
 from tokenspeed.runtime.pd.base.status import TransferPoll  # noqa: E402
 from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
@@ -536,7 +536,7 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
     )
 
     def blocks(begin, end):
-        return list(
+        return next(
             manager._cache_transfer_blocks(
                 dst_tp_rank=0,
                 dst_ptr=0x20000,
@@ -546,7 +546,7 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
                 owner_filters={},
                 dst_cache_layout=destination_layout,
                 block_selection=selection,
-                field_ids=schedule.fields_in_range(begin, end),
+                step_field_ids=(schedule.fields_in_range(begin, end),),
             )
         )
 
@@ -589,13 +589,23 @@ def _layerwise_fanout_context():
         for rank, request in enumerate(requests)
     }
     manager.layerwise_debug = False
-    manager.kv_transfer_metrics = KVTransferMetrics({}, enabled=False)
+    manager.kv_transfer_metrics = KVTransferMetrics(
+        {}, reporters=["prometheus"], enabled=False
+    )
     manager.session_failures = defaultdict(int)
     return manager, requests
 
 
 def test_layerwise_fanout_is_layer_major_and_completes_once() -> None:
+    from prometheus_client import CollectorRegistry
+
+    from tokenspeed.runtime.metrics.collector import KVTransferMetrics
+
     manager, requests = _layerwise_fanout_context()
+    registry = CollectorRegistry()
+    manager.kv_transfer_metrics = KVTransferMetrics(
+        {}, reporters=["prometheus"], enabled=True, registry=registry
+    )
     chunk = TransferKVChunk(
         room=9,
         is_last=True,
@@ -614,9 +624,13 @@ def test_layerwise_fanout_is_layer_major_and_completes_once() -> None:
 
     def cache_transfer_blocks(**kwargs):
         destination = kwargs["dst_ptr"]
-        field_ids = kwargs["field_ids"]
-        events.append(("prepare", destination, field_ids))
-        yield (len(field_ids), destination, len(field_ids))
+        for field_ids in kwargs["step_field_ids"]:
+            events.append(("prepare", destination, field_ids))
+            # The second peer gets no field of layer 2 from this rank.
+            if destination == 0x21000 and field_ids == frozenset(("layer.2.k",)):
+                yield []
+                continue
+            yield [(len(field_ids), destination, len(field_ids))]
 
     manager._cache_transfer_blocks = cache_transfer_blocks
 
@@ -648,7 +662,6 @@ def test_layerwise_fanout_is_layer_major_and_completes_once() -> None:
         ("prepare", 0x20000),
         ("prepare", 0x21000),
         ("send", "session-0"),
-        ("send", "session-1"),
         ("wait", 104),
         ("prepare", 0x20000),
         ("prepare", 0x21000),
@@ -671,6 +684,10 @@ def test_layerwise_fanout_is_layer_major_and_completes_once() -> None:
     assert all(
         notification[5]["bootstrap_token"] == 42 for notification in notifications
     )
+    # One latency sample per send: the empty interval records none.
+    assert (
+        registry.get_sample_value("tokenspeed:kv_transfer_latency_seconds_count") == 5
+    )
 
 
 def test_layerwise_fanout_failure_aborts_before_later_intervals() -> None:
@@ -687,7 +704,9 @@ def test_layerwise_fanout_failure_aborts_before_later_intervals() -> None:
     manager._wait_until_cache_step = lambda step, **_kwargs: events.append(
         ("wait", step)
     )
-    manager._cache_transfer_blocks = lambda **_kwargs: iter(((1, 2, 3),))
+    manager._cache_transfer_blocks = lambda **kwargs: iter(
+        [[(1, 2, 3)]] * len(kwargs["step_field_ids"])
+    )
 
     def transfer(session, _blocks, packer=None):
         events.append(("send", session))

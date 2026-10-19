@@ -69,6 +69,8 @@ _IMPLEMENTED_ROUTING_WEIGHT_DTYPES = {
 _IMPLEMENTED_WEIGHT_FORMATS = {
     "fp8": torch.float8_e4m3fn,
     "mxfp4": torch.uint8,
+    # Unquantized expert weights in the BF16 input dtype.
+    "unquant": torch.bfloat16,
 }
 _IMPLEMENTED_ACTIVATIONS = frozenset({"silu", "situ", "swiglu"})
 _IMPLEMENTED_ROUTING_MODES = frozenset({"precomputed_topk"})
@@ -316,6 +318,49 @@ def _make_fp8_weights(
     )
 
 
+def _make_unquant_weights(
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+    weight_dtype: torch.dtype,
+    activation: str,
+    swiglu_limit: float | None,
+    situ_beta: float | None,
+    situ_linear_beta: float | None,
+    ep_rank: int,
+    ep_size: int,
+) -> SimpleNamespace:
+    swiglu_arg = (
+        SimpleNamespace(alpha=1.0, limit=swiglu_limit)
+        if activation == "swiglu"
+        else None
+    )
+    return SimpleNamespace(
+        w13_weight=torch.zeros(
+            (num_local_experts, 2 * intermediate_size_per_partition, hidden_size),
+            dtype=weight_dtype,
+            device="cuda",
+        ),
+        w2_weight=torch.zeros(
+            (num_local_experts, hidden_size, intermediate_size_per_partition),
+            dtype=weight_dtype,
+            device="cuda",
+        ),
+        w13_weight_bias=None,
+        w2_weight_bias=None,
+        activation=activation,
+        activation_situ_beta=situ_beta,
+        activation_situ_linear_beta=situ_linear_beta,
+        swiglu_arg=swiglu_arg,
+        swiglu_beta=None,
+        w13_input_layout="concatenated",
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        num_local_experts=num_local_experts,
+    )
+
+
 def _mxfp4_weight_shapes(
     *,
     num_local_experts: int,
@@ -456,6 +501,19 @@ def _prepare_routed_weights(
             weight_dtype=weight_dtype,
             activation=activation,
             swiglu_limit=swiglu_limit,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+        )
+    elif weight_dtype_name == "unquant":
+        weights = _make_unquant_weights(
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            weight_dtype=weight_dtype,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             ep_rank=ep_rank,
             ep_size=ep_size,
         )

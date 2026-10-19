@@ -142,6 +142,10 @@ def input_logprob_plan_for_forward(
     prompt token) are read on the device from the scheduler's shifted input
     ids, which cover the chunk boundary, so nothing per row crosses here.
 
+    The plan's ``top_k`` is the largest ``top_logprobs_num`` among the
+    planned slots: every gathered row returns that many alternatives, and the
+    commit path keeps each request's own count.
+
     Returns:
         The plan, or None when no row of the batch needs a prompt logprob.
     """
@@ -151,6 +155,7 @@ def input_logprob_plan_for_forward(
     row_starts: list[int] = []
     counts: list[int] = []
     position_starts: list[int] = []
+    top_k = 0
     row_offset = 0
     for i in range(num_extends):
         state = rid_to_state[forward_op.request_ids[i]]
@@ -170,6 +175,7 @@ def input_logprob_plan_for_forward(
             row_starts.append(row_offset + lo - chunk_start)
             counts.append(hi - lo)
             position_starts.append(lo)
+            top_k = max(top_k, state.top_logprobs_num)
         row_offset += chunk_len
     if not any(counts):
         return None
@@ -177,7 +183,29 @@ def input_logprob_plan_for_forward(
         row_starts=tuple(row_starts),
         counts=tuple(counts),
         position_starts=tuple(position_starts),
+        top_k=top_k,
     )
+
+
+def sampled_top_k_for_forward(forward_op, rid_to_state: Mapping) -> int:
+    """How many alternatives this forward's prefill samples are reported with.
+
+    The largest ``top_logprobs_num`` among the extend slots of requests that
+    return logprobs; 0 when none asks, which leaves the forward as it was.
+    The ingress takes a top-k request only when each of its tokens is sampled
+    in a prefill (``max_new_tokens <= 1``), so decode rows never need one.
+    """
+    num_extends = forward_op.num_extends()
+    if num_extends == 0:
+        return 0
+    # One read: each read of the binding's ``request_ids`` builds a new list.
+    request_ids = forward_op.request_ids
+    top_k = 0
+    for i in range(num_extends):
+        state = rid_to_state.get(request_ids[i])
+        if state is not None and state.return_logprob:
+            top_k = max(top_k, state.top_logprobs_num)
+    return top_k
 
 
 class RequestHistoryRows:

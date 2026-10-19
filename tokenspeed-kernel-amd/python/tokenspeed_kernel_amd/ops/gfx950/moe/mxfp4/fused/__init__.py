@@ -44,17 +44,6 @@ split.
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
     _extract_gluon_raw_s,
     _extract_gluon_raw_w,
-    _extract_gluon_raw_w_unshuffled,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.gemm_api import (
-    gluon_mxfp_combine,
-    gluon_mxfp_dispatch_swiglu,
-    gluon_mxfp_ragged_matmul,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.launch import (
-    assert_no_spills,
-    last_kernel_profile,
-    static_profile,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.moe import (
     gluon_mxfp4_fp8_precomputed_situ,
@@ -64,73 +53,20 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.moe import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.quantize import (
     _quantize_mxfp4_activation,
-    fp8_quantize,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.routing import (
-    FUSED_ROUTE_MAX_M,
-    GLUON_ROUTE_DTYPES,
-    GLUON_ROUTE_MAX_E,
-    GLUON_ROUTE_MAX_G,
-    SMALLM_MAX_M,
     _biased_grouped_topk_reference,
-    default_biased_grouped_route,
-    default_biased_route,
-    default_grouped_route,
-    default_packed_topk_route,
-    default_route,
-    default_scaled_route,
-    gluon_biased_grouped_fused_route,
-    gluon_biased_grouped_route_supported,
-    gluon_fused_route,
-    gluon_precomputed_topk_flat_m1_route,
-    gluon_precomputed_topk_fused_route,
-    gluon_precomputed_topk_route_supported,
-    gluon_route_supported,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.warp_decode import (
-    WARP_DECODE_MAX_M,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
-    MXFP4_BLOCK,
 )
 
 __all__ = [
-    # Compatibility surface consumed by mxfp4/moe.py, weight preprocessing,
-    # and the unit tests.
-    "_biased_grouped_topk_reference",
-    "_extract_gluon_raw_s",
-    "_extract_gluon_raw_w",
-    "_extract_gluon_raw_w_unshuffled",
-    "_quantize_mxfp4_activation",
-    "FUSED_ROUTE_MAX_M",
-    "GLUON_ROUTE_DTYPES",
-    "GLUON_ROUTE_MAX_E",
-    "GLUON_ROUTE_MAX_G",
-    "MXFP4_BLOCK",
-    "SMALLM_MAX_M",
-    "WARP_DECODE_MAX_M",
-    "assert_no_spills",
-    "default_biased_grouped_route",
-    "default_biased_route",
-    "default_grouped_route",
-    "default_packed_topk_route",
-    "default_route",
-    "default_scaled_route",
-    "fp8_quantize",
-    "gluon_biased_grouped_fused_route",
-    "gluon_biased_grouped_route_supported",
-    "gluon_fused_route",
-    "gluon_mxfp_combine",
-    "gluon_mxfp_dispatch_swiglu",
     "gluon_mxfp4_fp8_precomputed_situ",
     "gluon_mxfp_dynamic_mxfp4_fused_moe",
     "gluon_mxfp_fused_moe",
     "gluon_mxfp_precomputed_mxfp4_fused_moe",
-    "gluon_mxfp_ragged_matmul",
-    "gluon_precomputed_topk_flat_m1_route",
-    "gluon_precomputed_topk_fused_route",
-    "gluon_precomputed_topk_route_supported",
-    "gluon_route_supported",
-    "last_kernel_profile",
-    "static_profile",
+    # Private helpers shared with the tokenspeed-kernel MoE adapter and the
+    # unit tests.
+    "_biased_grouped_topk_reference",
+    "_extract_gluon_raw_s",
+    "_extract_gluon_raw_w",
+    "_quantize_mxfp4_activation",
 ]

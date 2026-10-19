@@ -156,7 +156,11 @@ Consequences:
   backpressured stage off the control plane. The remote submissions' only
   failure surface is a settle at the next round's `execute` (their semantic
   completion arrives through the transfer events; a submission that RAISED
-  produces none, so the settle must not swallow it). The handle's remaining
+  produces none, so the settle must not swallow it). A raise is therefore
+  for broken invariants only: a transfer worker, the bootstrap thread or
+  another Prefill rank can fail a request's transfer while its submission
+  waits on the FIFO, and that submission then does nothing for the request,
+  whose failure arrives as its transfer event. The handle's remaining
   `run_*` methods do block, deliberately — the DP idle forward, the landing of a
   completed remote prefill, the KV repair after a wake, the RL weight sync —
   but each is a low-rate path whose caller cannot proceed without the result
@@ -297,7 +301,7 @@ There are exactly two call sites, each with a documented reason:
 * **Head of the round** — completed Host cache-op events
   (`_cache_hooks.poll_ready_events()`: `WriteBackDone`, `LoadBackDone`,
   `PrefetchDone`, `SnapshotDone`, `RestoreDone`, each replica-intersected).
-  These must advance *before* `next_execution_plan`, otherwise cache-gated
+  These must advance *before* `next_execution_plan`; otherwise, cache-gated
   admissions -- a prefetched request's admission, a suspended request's
   restore, which waits for both of its store ACKs, then its own -- are
   delayed by a full round.
@@ -353,6 +357,19 @@ batches.
 The same reasoning fixes the metrics call: the loop records scheduler
 iteration metrics once per round, from the same pre-dispatch snapshot as the
 scheduler stats.
+
+Metric reporters share those collection points. Installed plugins must accept
+scalar observations promptly on the producer thread and perform delivery in the
+background. Plugin discovery and creation happen outside the loop. Reporters
+preserve the engine's worker termination behavior; a forcibly terminated worker
+may lose queued observations without running metrics cleanup. Their event
+channel is separate from load snapshots: counter increments and histogram
+observations cannot be conflated. The metric adapter suppresses unchanged gauge
+assignments before constructing events or distributing them, while retaining
+value changes and refreshing snapshots on subsequent assignments. This policy
+belongs to the metric adapter, not the scheduler loop or individual plugins. See
+[metric output plugins](../metrics-plugins.md) for event semantics, registration,
+and output lifecycle contracts.
 
 Per-request metrics anchor to request lifecycle points instead of the round
 snapshot. `tokenspeed:request_queue_time_seconds` stamps each request's
@@ -615,8 +632,11 @@ For orientation, one iteration of `event_loop`:
   it) while the executor's lane fills the pages in prefix order, stopping at
   the first missing object or at the deadline -- which bounds when the next
   batch may start, not a batch in flight: the store's `batch_get_into` has
-  no timeout, so a hung get holds the single-thread lane and every later
-  prefetch, the namespace delete and shutdown behind it. Each round the hooks
+  no timeout, so a hung get holds its active Host pages, namespace deletion
+  and shutdown. The deadline is counted from submission; an expired queued
+  job becomes a zero-page miss only when cancellation proves its worker
+  never started.
+  Active I/O retains its pages until completion. Each round the hooks
   MIN-reduce every in-flight op's landed prefix across the replica; the
   converged op is acknowledged once as `PrefetchDoneEvent(op_id,
   landed_pages)`, the scheduler publishes the landed prefix in the Host

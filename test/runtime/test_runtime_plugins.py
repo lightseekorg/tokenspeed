@@ -30,7 +30,9 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 import json
-from types import SimpleNamespace
+from importlib import util
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -706,10 +708,14 @@ def test_loader_rejects_a_profile_from_another_architecture(
     )
 
 
-def test_superseded_draft_profile_default_is_reported(caplog) -> None:
-    from tokenspeed.runtime.configs.model_config import _apply_attention_defaults
+def test_superseded_draft_profile_default_is_reported(caplog, monkeypatch) -> None:
+    from tokenspeed.runtime.configs.model_config import (
+        _apply_attention_defaults,
+        logger,
+    )
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
+    monkeypatch.setattr(logger, "propagate", True)
     args = ServerArgs(model="x")
     args.drafter_attention_backend = "target_choice"
     with caplog.at_level("INFO"):
@@ -807,14 +813,39 @@ def test_hybrid_kvp_accepts_builtin_groups_and_requires_history() -> None:
 
 def test_mla_dcp_checks_backend_capability(monkeypatch) -> None:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-    from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
-        FlashMLABackend,
+
+    kernel = Mock(side_effect=AssertionError("capability checks must not run kernels"))
+    vendor_exports = {
+        "tokenspeed_kernel.ops.attention.mha.cuda": {
+            "flash_attn_varlen_func": kernel,
+        },
+        "tokenspeed_kernel.ops.attention.mha.flashinfer": {
+            "BatchMLAPagedAttentionWrapper": kernel,
+            "BatchPrefillWithRaggedKVCacheWrapper": kernel,
+        },
+        "tokenspeed_kernel.ops.attention.mla.cuda": {
+            "flash_mla_with_kvcache": kernel,
+            "get_mla_metadata": kernel,
+        },
+    }
+    path = os.path.join(
+        os.path.dirname(attention_registry.__file__), "backends/paged/flashmla.py"
     )
+    spec = util.spec_from_file_location("_runtime_plugins_flashmla", path)
+    module = util.module_from_spec(spec)
+    with monkeypatch.context() as isolated:
+        for name, exports in vendor_exports.items():
+            vendor = ModuleType(name)
+            vendor.__dict__.update(exports)
+            isolated.setitem(sys.modules, name, vendor)
+        isolated.setitem(sys.modules, spec.name, module)
+        isolated.setattr(attention_registry, "register_backend", Mock())
+        spec.loader.exec_module(module)
 
     monkeypatch.setitem(
         attention_registry._BACKEND_REGISTRY,
         "fixture_dcp",
-        ({AttentionArch.MLA}, FlashMLABackend),
+        ({AttentionArch.MLA}, module.FlashMLABackend),
     )
     attention_registry._validate_mla_dcp_backend("fixture_dcp", AttentionArch.MLA)
     monkeypatch.setitem(

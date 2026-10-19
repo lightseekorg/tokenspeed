@@ -26,7 +26,6 @@ import asyncio
 import dataclasses
 import functools
 import io
-import ipaddress
 import json
 import logging
 import os
@@ -59,8 +58,12 @@ import zmq
 from starlette.routing import Mount
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.metrics.config import metrics_enabled
 from tokenspeed.runtime.metrics.func_timer import enable_func_timer
-from tokenspeed.runtime.utils.network import get_free_port
+from tokenspeed.runtime.utils.network import (  # noqa: F401
+    get_free_port,
+    is_valid_ipv6_address,
+)
 
 if TYPE_CHECKING:
     import uvicorn
@@ -703,14 +706,6 @@ def nullable_str(val: str):
     return val
 
 
-def is_valid_ipv6_address(address: str) -> bool:
-    try:
-        ipaddress.IPv6Address(address)
-        return True
-    except ValueError:
-        return False
-
-
 def launch_dummy_health_check_server(host, port, enable_metrics):
 
     import uvicorn
@@ -770,7 +765,7 @@ def launch_metrics_server(server_args: ServerArgs) -> uvicorn.Server | None:
     (poll ``started`` for readiness), or None when --enable-metrics is off or
     the bind failed.
     """
-    if not server_args.enable_metrics:
+    if not metrics_enabled(server_args, "prometheus"):
         return None
 
     import uvicorn
@@ -958,9 +953,14 @@ def get_colorful_logger(name):
 def _maybe_json_dict(path: str | os.PathLike) -> dict[str, str]:
     with open(path) as f:
         try:
-            return json.loads(f.read())
-        except Exception:
+            value = json.loads(f.read())
+        except json.JSONDecodeError:
             return dict[str, str]()
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+    ):
+        return dict[str, str]()
+    return value
 
 
 def _maybe_space_split_dict(path: str | os.PathLike) -> dict[str, str]:
@@ -977,7 +977,8 @@ def _maybe_space_split_dict(path: str | os.PathLike) -> dict[str, str]:
 
 def maybe_model_redirect(model: str) -> str:
     """
-    Use model_redirect to redirect the model name to a local folder.
+    Redirect the model name using a JSON string-to-string mapping or
+    whitespace-separated pairs. Other JSON values use the whitespace fallback.
 
     :param model: hf model name
     :return: maybe redirect to a local folder

@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.gemm import torch_mm_fp8_blockscale
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -61,14 +62,6 @@ def _inputs(
     return a, b, a_scales, b_scales
 
 
-def _dequantize(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    rows, k = values.shape
-    return (
-        values.float().reshape(rows, k // 32, 32)
-        * torch.exp2(scales.float() - 127).unsqueeze(-1)
-    ).reshape(rows, k)
-
-
 @pytest.mark.parametrize("k", [512, 1280])
 def test_mxfp8_gemm_matches_dequantized_reference(k: int) -> None:
     m, n = 256, 256
@@ -86,7 +79,9 @@ def test_mxfp8_gemm_matches_dequantized_reference(k: int) -> None:
         block_size=[1, 32],
         out=out,
     )
-    expected = (_dequantize(a, a_scales) @ _dequantize(b, b_scales).T).to(actual.dtype)
+    expected = torch_mm_fp8_blockscale(
+        a, b, a_scales, b_scales, actual.dtype, block_size=[1, 32]
+    )
 
     assert actual is out
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -120,7 +115,9 @@ def test_mxfp8_gemm_ragged_shapes_match_dequantized_reference(
         block_size=[1, 32],
         out=None,
     )
-    expected = (_dequantize(a, a_scales) @ _dequantize(b, b_scales).T).to(actual.dtype)
+    expected = torch_mm_fp8_blockscale(
+        a, b, a_scales, b_scales, actual.dtype, block_size=[1, 32]
+    )
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
@@ -183,7 +180,9 @@ def test_mxfp8_gemm_accepts_row_padded_operands_and_strided_scales(k: int) -> No
         block_size=[1, 32],
         out=None,
     )
-    expected = (_dequantize(a, a_scales) @ _dequantize(b, b_scales).T).to(actual.dtype)
+    expected = torch_mm_fp8_blockscale(
+        a, b, a_scales, b_scales, actual.dtype, block_size=[1, 32]
+    )
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
@@ -211,7 +210,9 @@ def test_mxfp8_gemm_async_scales_accept_row_padding() -> None:
         block_size=[1, 32],
         out=None,
     )
-    expected = (_dequantize(a, a_scales) @ _dequantize(b, b_scales).T).to(actual.dtype)
+    expected = torch_mm_fp8_blockscale(
+        a, b, a_scales, b_scales, actual.dtype, block_size=[1, 32]
+    )
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 

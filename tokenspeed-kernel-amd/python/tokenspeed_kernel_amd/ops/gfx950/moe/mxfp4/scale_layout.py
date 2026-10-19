@@ -24,7 +24,7 @@ Both scale producers and consumers must agree on the CDNA4 MXFP4 scale-swizzle
 parameters and byte permutation:
 
 * B-scales (weights): swizzled at load time by the weight preprocessor
-  (``mxfp4_gfx950_preprocess._swizzle_mxfp4`` via
+  (``weight_preprocess._swizzle_mxfp4`` via
   :func:`swizzle_cdna4_mxfp4_scale`).
 * A-scales (activations): MXFP4 quantization emits token-order scales that
   ``mxfp4.scale.gather_package_cdna4_scale`` reorders; the EP8 MXFP8 quantizer
@@ -81,16 +81,10 @@ MXFP4_BLOCK = 32
 CDNA4_SCALE_N_BLOCK = 32
 CDNA4_SCALE_K_BLOCK = 8
 
-# MFMA non-K dimension used by the block-scaled stage kernels
-# (``v_mfma_scale_f32_16x16x128_f8f6f4``). The scale swizzle below is fixed to
-# this shape.
-MFMA_NONK_DIM = 16
-
 __all__ = [
     "MXFP4_BLOCK",
     "CDNA4_SCALE_N_BLOCK",
     "CDNA4_SCALE_K_BLOCK",
-    "MFMA_NONK_DIM",
     "empty_swizzled_cdna4_mxfp4_scale",
     "is_swizzled_cdna4_mxfp4_scale",
     "swizzle_cdna4_mxfp4_scale",

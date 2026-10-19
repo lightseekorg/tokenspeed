@@ -89,6 +89,14 @@ class QuantizationConfig(ABC):
         """
         return self.get_name()
 
+    def quantizes_any(self, prefix: str) -> bool:
+        """Whether the checkpoint quantizes some module under ``prefix``.
+
+        A single-algorithm config covers every module it does not exclude;
+        mixed-precision configs answer from their per-module entries.
+        """
+        return True
+
     def get_moe_quant_config(self, prefix: str) -> "QuantizationConfig":
         """Return the concrete quantization config for a routed MoE layer."""
         return self

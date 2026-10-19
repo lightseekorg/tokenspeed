@@ -25,6 +25,8 @@ from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine import event_loop as event_loop_module  # noqa: E402
 from tokenspeed.runtime.engine.event_loop import EventLoop  # noqa: E402
 from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks  # noqa: E402
+from tokenspeed.runtime.metrics.service import MetricsService  # noqa: E402
+from tokenspeed.runtime.utils.server_args import PortArgs  # noqa: E402
 
 
 class _PauseHarness:
@@ -276,12 +278,24 @@ def test_run_event_loop_reports_exit_and_finally_closes(
         device="cpu",
         base_gpu_id=0,
         disaggregation_mode="decode",
+        enable_metrics=False,
         max_num_seqs=8,
         chunked_prefill_size=128,
+    )
+    port_args = PortArgs(
+        tokenizer_ipc_name="unused",
+        scheduler_input_ipc_name="unused",
+        nccl_port=0,
+        dist_init_addr="localhost:0",
+        rpc_ipc_name="unused",
+        metrics_ipc_name="unused",
+        tokenizer_worker_ipc_name=None,
     )
     pipe_writer = _PipeWriter()
 
     monkeypatch.setenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", "default")
+    # Each case models a fresh worker process with its own metrics lifecycle.
+    monkeypatch.setattr(event_loop_module, "metrics_service", MetricsService())
     monkeypatch.setattr(event_loop_module, "EventLoop", _FakeEventLoop)
     monkeypatch.setattr(event_loop_module.psutil, "Process", _Process)
     monkeypatch.setattr(
@@ -304,12 +318,12 @@ def test_run_event_loop_reports_exit_and_finally_closes(
 
     if exit_kind == "system_exit":
         with pytest.raises(SystemExit) as raised:
-            event_loop_module.run_event_loop(server_args, object(), pipe_writer)
+            event_loop_module.run_event_loop(server_args, port_args, pipe_writer)
         assert raised.value.code == 0
         assert trace == ["construct", "freeze_gc", "loop_enter", "close"]
         assert exit_logs[0][1][0] is SystemExit
     else:
-        event_loop_module.run_event_loop(server_args, object(), pipe_writer)
+        event_loop_module.run_event_loop(server_args, port_args, pipe_writer)
         assert trace == [
             "construct",
             "freeze_gc",

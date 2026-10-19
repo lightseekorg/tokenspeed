@@ -660,7 +660,7 @@ class IrisAllReduceShardedState:
                     ):
                         return None
 
-        from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_latent_projection
+        from tokenspeed_kernel.ops.gemm import kimi3_latent_projection
         from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
 
         routed = scratch[:routed_elements].view(local_rows, 3584)
