@@ -871,6 +871,53 @@ def dspark_rows(
     return out
 
 
+def dspark_workspace(
+    values: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+    positions: torch.Tensor | None,
+    cos_sin_cache: torch.Tensor | None,
+    window: torch.Tensor,
+    page: torch.Tensor,
+    row: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Gather history and encode current rows directly into an attention workspace.
+
+    Args:
+        values: BF16 ``[batch * block_size, 512]`` current rows, with unit
+            column stride. Optional RoPE and the same all-channel FP8 round
+            trip as ``dspark_rows`` are applied before writing these rows.
+        norm_weight: Optional BF16 RMSNorm weight applied before RoPE.
+        norm_eps: RMSNorm epsilon, present exactly with norm_weight.
+        positions: Integer current-row positions, given exactly with a RoPE
+            table; negative positions use position zero.
+        cos_sin_cache: Optional FP32 interleaved-tail RoPE table.
+        window: BF16 ``[pages, page_rows, 512]`` history field with unit column
+            stride. Page and row strides may include other fields or padding.
+        page: Integer ``[batch, history_width]`` valid history page addresses.
+        row: Integer history row addresses shaped like ``page``. Dummy page
+            addresses are copied verbatim; attention's selection masks them.
+        block_size: Positive number of current rows per request.
+
+    Returns:
+        Fresh contiguous BF16 ``[batch, history_width + block_size, 512]``.
+        Each tile owns one complete output row; no temporary gather or current
+        row buffers are retained or shared with another invocation.
+    """
+    return _kernel("dspark_workspace", values)(
+        values,
+        norm_weight,
+        norm_eps,
+        positions,
+        cos_sin_cache,
+        window,
+        page,
+        row,
+        block_size,
+    )
+
+
 def dspark_anchors(
     output_tokens: torch.Tensor,
     accept_lengths: torch.Tensor,
