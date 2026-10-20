@@ -23,11 +23,26 @@
 ``ServerArgs`` settles the knobs (role, request cap, the abort-only ratio 0);
 ``cache/l2/sizing.py`` turns them into LCM blocks against the rank's layout,
 with the tail unit the scheduler's ``CapacityModel`` answers.
+Registered in runtime-1gpu because ServerArgs imports the kernel runtime.
 """
 
 import logging
+import sys
+from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(
+    est_time=10,
+    suite="runtime-1gpu",
+    nightly=False,
+    disabled=None,
+    disabled_on_runners=None,
+    disabled_on_runners_reason=None,
+)
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 

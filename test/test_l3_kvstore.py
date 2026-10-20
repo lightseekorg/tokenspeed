@@ -172,6 +172,10 @@ class TestStorageKeyTest:
         )
         with pytest.raises((TypeError)):
             prefix(eagle3_layers_to_capture="2,16,29")
+        for shard_counts in ("41", b"41"):
+            for layout in ({}, cp):
+                with pytest.raises(TypeError, match="group_shard_counts"):
+                    prefix(**(layout | {"group_shard_counts": shard_counts}))
         with pytest.raises((TypeError)):
             prefix(model_overrides=["rope_theta"])
 

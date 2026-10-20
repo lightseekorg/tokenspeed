@@ -988,6 +988,7 @@ def storage_key_prefix(
     With KVP/QCP, a separate ``context_parallel`` entry records the KV and
     query widths, head TP width and per-group shard counts. Only identical
     CP layouts share objects; no conversion between layouts is implied.
+    ``group_shard_counts`` must be an integer sequence, not a string or bytes.
     ``attn_tp_size``
     belongs here rather than only in the per-object ``r{tp_rank}`` shard
     id: GQA with TP above the KV-head count keeps one local KV head per
@@ -1000,6 +1001,8 @@ def storage_key_prefix(
         raise TypeError("model_overrides must be a dict")
     if isinstance(eagle3_layers_to_capture, (str, bytes)):
         raise TypeError("eagle3_layers_to_capture must be a sequence of ints")
+    if isinstance(group_shard_counts, (str, bytes)):
+        raise TypeError("group_shard_counts must be a sequence of ints")
     identity = {
         "model": str(model_name),
         "revision": str(revision),
