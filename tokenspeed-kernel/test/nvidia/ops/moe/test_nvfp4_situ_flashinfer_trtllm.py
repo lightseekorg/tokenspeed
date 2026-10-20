@@ -502,6 +502,9 @@ def test_nvfp4_trtllm_registry_declares_ispp_alignment(kernel_name: str) -> None
         ("flashinfer_trtllm_nvfp4_routed_moe_apply", (10, 7), True),
         ("flashinfer_trtllm_nvfp4_moe_apply", (10, 8), False),
         ("flashinfer_trtllm_nvfp4_routed_moe_apply", (10, 8), False),
+        # Keep ReLU2 paths capped until they are validated on SM107.
+        ("flashinfer_trtllm_nvfp4_relu2_moe_apply", (10, 7), False),
+        ("flashinfer_trtllm_nvfp4_relu2_routed_moe_apply", (10, 7), False),
     ],
 )
 def test_nvfp4_trtllm_capability_range(
@@ -528,7 +531,9 @@ def test_nvfp4_trtllm_capability_range(
 @pytest.mark.parametrize("activation", ["silu", "swiglu"])
 @pytest.mark.parametrize("routing_mode", ["kernel_routing", "precomputed_topk"])
 @pytest.mark.parametrize("num_tokens", [1, 32, 64, 256])
-def test_nvfp4_silu_plan_executes_and_replays(activation, routing_mode, num_tokens):
+def test_nvfp4_silu_plan_executes_and_replays(
+    activation: str, routing_mode: str, num_tokens: int
+) -> None:
     plan = kernel_moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
