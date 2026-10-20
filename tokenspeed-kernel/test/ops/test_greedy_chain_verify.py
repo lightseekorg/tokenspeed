@@ -28,8 +28,6 @@ from tokenspeed_kernel.ops.sampling.triton.verify import (
 )
 from utils import assert_no_triton_compile
 
-from tokenspeed.runtime.sampling.backends.greedy import _verify_chain_greedy_torch
-
 
 def _inputs(bs, width, pattern, device):
     target = (
@@ -64,6 +62,9 @@ def _outputs(bs, width, device):
 
 
 def _reference(candidates, target):
+    # Keep this private oracle import in sync with runtime verifier refactors.
+    from tokenspeed.runtime.sampling.backends.greedy import _verify_chain_greedy_torch
+
     bs, width = candidates.shape
     out = _outputs(bs, width, candidates.device)
     _verify_chain_greedy_torch(*out, candidates, target, bs, width)
