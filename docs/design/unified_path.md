@@ -265,8 +265,8 @@ error, not an instruction to assume equal counts across ranks. Ordinary TP with
 replicated token rows uses the existing `ColumnParallelLinear` and
 `RowParallelLinear` contracts instead.
 
-The model runner prepares fixed-capacity communication workspaces before
-cache-memory profiling and graph capture.
+The model runner calls `prepare_dp_linear_communication` to prepare workspaces
+before cache-memory profiling and graph capture.
 Preparation binds each Linear and its workspace to the selected communication
 backend; forward operations dispatch through that same backend.
 Generic projection operations use the backend's ordinary collectives.
@@ -280,69 +280,33 @@ another projection reuses it. Final outputs belong to the caller and
 remain valid across later forwards. Graphs referencing a workspace are destroyed
 before it is released.
 
-Projection fusion replaces communication, quantization, and GEMM with one
-kernel within the same backend dispatch path. Column projection fuses
-all-gather, FP8 GEMM, and all-to-all; row projection fuses all-to-all, FP8 GEMM,
-and reduce-scatter. The goal is to reduce launch overhead and let computation
-consume peer data as it becomes available. Large TP4 column buckets share
-the row kernel's accumulator work distribution and shared-memory handoff to
-the output stage, keeping more partial GEMM results in flight. Input packing
-and operand prefetch use the same prepared buckets. Compact shared-memory scale
-storage allows selected TP4 column buckets to prefetch more operands without
-shrinking the scale queue. These TP4 buckets also issue weight loads first to
-reduce operand waits. Column scale loads prefetch several K blocks into registers
-before publishing them to shared memory, overlapping global reads with scale
-consumption. Numerical scaling order and collective ownership are unchanged.
-Column output copies work a tile at a time, with each owner's physical row count
-bounding the valid rows.
+Fused projection runs communication, quantization, and FP8 GEMM in one kernel.
+Column projection combines all-gather, GEMM, and all-to-all.
+Row projection combines all-to-all, GEMM, and reduce-scatter.
 
-Row projection also accepts E4M3 inputs with FP32 scales per 128 channels,
-allowing the preceding RMSNorm/gate operation to quantize once. Fusion forwards
-those values and scales without requantizing; the ordinary path exchanges both
-before GEMM. Eligible node-local fallback exchanges FP8 values and scales in one
-Lamport launch, including padding for unequal or empty owners. BF16 input keeps
-quantization inside the projection. Both formats
-return BF16, share workspace ownership, and are prepared before graph capture.
-All ranks in a projection call supply the same activation format. When active
-owners prequantize, empty owners also supply empty E4M3 values and FP32 scales
-so the ordinary fallback executes matching collectives on every rank.
+Use `DPColumnParallelLinear` or `DPRowParallelLinear` with `AutoBackend`.
+The backend selects fusion for supported TP2 and TP4 groups within one node.
+Fusion requires FP8 weights with FP32 scales for each 128 × 128 block.
+At least one rank must have 64 physical input rows.
+Smaller batches, batch-invariant collectives, and unsupported configurations use
+the ordinary projection operations. All ranks use their physical row counts to
+select the same path.
 
-Both directions follow the existing workspace ownership contract: the backend
-prepares shared communication storage, each Linear supplies its weights, and
-the caller owns the final output. All ranks select the same path using their
-physical subgroup counts, including unequal and empty owners. Eligible
-node-local TP2 and TP4 projections use fusion; smaller batches, batch-invariant
-collectives, and unsupported configurations retain the ordinary operations.
+Both fused kernels accept BF16 inputs and return BF16 outputs.
+Row projection also accepts E4M3 inputs with FP32 scales per 128 channels.
+Pass the scales to `DPRowParallelLinear.forward` through its `scale` argument.
+The kernel skips input quantization in this case. All ranks must use the same
+input format. For FP8 inputs, empty ranks must supply empty E4M3 inputs and
+FP32 scales.
 
-Row counts remain runtime inputs. Prepared row buckets bound specialization
-and are warmed before graph capture. Intermediate buckets reduce padding;
-large buckets can skip whole padding tiles while retaining prepared strides.
-Tiles crossing owner boundaries acquire each owner's readiness and route each
-output piece to its owner. Row fusion covers the prepared workspace capacity
-without a separate upper dispatch cutoff.
+The backend prepares kernels before CUDA graph capture.
+Supply runtime row counts within the prepared workspace capacity.
+Use each workspace on one stream.
+Do not run other distributed kernels at the same time.
 
-The kernel combines input exchange and quantization with a pipelined GEMM and
-output exchange. Warp groups divide computation and data movement;
-completed GEMM CTAs share reduction work through a device queue. Selected
-buckets also overlap GEMM and reduction within a CTA or share operand loads
-between CTAs. These are scheduling choices within the same execution path.
-Peer waits require a fully resident grid; concurrent workspace use and competing
-distributed kernels are unsupported.
-
-Each row-projection producer rounds its partial output to BF16. The owner sums
-partials in fixed rank order in FP32, then rounds to BF16. Ordinary BF16
-collective reductions can round differently. Negative zero marks unfinished
-receive values; produced zeros are canonicalized so readiness remains distinct
-from data without changing this reduction contract.
-
-Receive storage, including padding, is cleared before the next producer can
-write it. Input publication and consumption acknowledgements join local CTAs,
-then publish system-scoped rank epochs to peers to order reuse, using multicast
-when available. Some buckets consume every prepared partial, including
-padding, so completion also proves that peers finished reading the owner's
-input. Those buckets may reuse the same input layout without another peer join;
-layout changes and kernels that skip padding retain that join. Empty owners
-participate in every communication epoch.
+Row projection rounds partial results to BF16, sums them in fixed rank order
+in FP32, and returns BF16. This result can differ from an ordinary BF16
+collective reduction.
 
 ### Padding contract
 
