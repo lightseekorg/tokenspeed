@@ -163,7 +163,7 @@ def gluon_fp8_channel_bf16_precomputed_moe_apply(
         block_m=block_m,
     )
     output = torch.empty_like(x)
-    _combine(partials.view(-1, 5120), topk_weights, output)
+    _combine(partials.view(-1, 5120), topk_weights, output, None, 0)
     return output
 
 

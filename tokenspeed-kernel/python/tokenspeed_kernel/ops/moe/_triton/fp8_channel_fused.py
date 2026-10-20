@@ -209,5 +209,5 @@ def _triton_fp8_channel_fused_moe_impl(
             num_stages=2,
             enable_fp_fusion=False,
         )
-    _combine(routed_output, topk_weights, output)
+    _combine(routed_output, topk_weights, output, None, 0)
     return output
