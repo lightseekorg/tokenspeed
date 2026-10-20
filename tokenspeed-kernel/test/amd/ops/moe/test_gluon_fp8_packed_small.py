@@ -28,6 +28,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
+
 
 @pytest.fixture
 def gfx950_only() -> None:

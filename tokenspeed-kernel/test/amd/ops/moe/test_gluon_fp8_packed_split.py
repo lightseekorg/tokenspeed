@@ -29,6 +29,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
+
 
 @pytest.mark.parametrize(
     ("parameters", "expected"),
