@@ -4144,4 +4144,176 @@ TEST_F(TailPublicationTest, CapDropsTheLeastRecentlyUsedTailUnderOnePriorWithIts
 }
 
 }  // namespace
+
+// Tail COW keeps the source's KVP bucket, whereas a hole gets an ordinary
+// dense allocation. A full bucket must never borrow other owners' holes.
+class ShardedTailAdmissionTest : public ::testing::Test {
+protected:
+    ShardedTailAdmissionTest()
+        : pool_(1, {32}),
+          coordinator_(MakeCoordinator(std::vector<CacheGroupSpec>{CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                                                                                  .cache_blocks_per_lcm_block = 32,
+                                                                                  .block_granularity = 128,
+                                                                                  .shard_count = 8}},
+                                       128, pool_, false, nullptr, nullptr, false)) {
+        const std::array<std::int32_t, 4> buckets{7, 7, 7, 7};
+        held_ = pool_.AcquireBlocksInBuckets(0, buckets);
+        EXPECT_EQ(held_.size(), 4u);
+    }
+    TailPublication Tail() const {
+        return TailPublication{.tail_tokens = 127, .hash = HashPrefixPage(token_span(tokens_.data(), 127), "")};
+    }
+    void Publish() {
+        std::vector<BlockTable> owner{BlockTable::FromBlocks({held_[0]}, 1)};
+        const RequestProgress progress{.completed_pages = CompletedPages{.tail = Tail()}, .num_computed_tokens = 127};
+        coordinator_.CacheCompletedBlocks(owner, progress, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
+    }
+    CacheCoordinator::PrefixProbe Probe() const {
+        return coordinator_.ProbePromptPrefix(
+            CacheCoordinator::PromptPrefix{.prefix_hashes = {}, .tokens = tokens_, .max_tokens = 128});
+    }
+    BlockPool pool_;
+    CacheCoordinator coordinator_;
+    std::vector<CacheBlockRef> held_;
+    std::vector<std::int32_t> tokens_{MakeTokens(128)};
+};
+
+TEST_F(ShardedTailAdmissionTest, FirstHitRequiresTheSourcesBucket) {
+    Publish();
+    ASSERT_EQ(Probe().device.num_common_tokens, 127);
+    EXPECT_EQ(pool_.NumEmptyLcmBlocks(), 0);
+    EXPECT_EQ(pool_.NumFreeSlots(0), 28);
+    std::vector<BlockTable> hitter(1);
+    EXPECT_FALSE(AdmitForTest(coordinator_, hitter, Probe(), GroupDemand{.extent = DenseGrowth{1}}));
+    EXPECT_EQ(hitter[0].NumBlocks(), 0);
+    held_.back().reset();
+    const auto result = AdmitForTest(coordinator_, hitter, Probe(), GroupDemand{.extent = DenseGrowth{1}});
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->pages_to_copy[0].size(), 1u);
+    EXPECT_EQ(coordinator_.Allocator(0).BucketOf(hitter[0].Blocks()[0]->Location()), 7);
+    EXPECT_NE(hitter[0].Blocks()[0], held_[0]);
+}
+
+TEST_F(ShardedTailAdmissionTest, NullTailSlotUsesAnUnconstrainedFreshBlock) {
+    Publish();
+    auto probe = Probe();
+    // D's partial landing slot is a hole, rather than a Device copy source.
+    probe.device.tail->per_group[0].hits[0] = 0;
+    std::vector<BlockTable> hitter(1);
+    const auto result = AdmitForTest(coordinator_, hitter, std::move(probe), GroupDemand{.extent = DenseGrowth{1}});
+    ASSERT_TRUE(result);
+    EXPECT_TRUE(result->pages_to_copy[0].empty());
+    ASSERT_EQ(result->new_page_ids[0].size(), 1u);
+    EXPECT_NE(coordinator_.Allocator(0).BucketOf(hitter[0].Blocks()[0]->Location()), 7);
+}
+
+TEST_F(ShardedTailAdmissionTest, NoTailStillUsesDenseHoles) {
+    std::vector<BlockTable> cold(1);
+    const auto result = AdmitForTest(coordinator_, cold, 1);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(cold[0].NumBlocks(), 1);
+    EXPECT_TRUE(result->pages_to_copy[0].empty());
+}
+
+TEST_F(ShardedTailAdmissionTest, OwnerKeepsTheTailPrivateUntilItsBucketHasRoom) {
+    std::vector<BlockTable> owner{BlockTable::FromBlocks({held_[0]}, 1)};
+    const RequestProgress progress{.completed_pages = CompletedPages{.tail = Tail(), .owner_continues = true},
+                                   .num_computed_tokens = 127};
+    auto result =
+        AdmitForTest(coordinator_, owner, GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 1}, progress);
+    ASSERT_TRUE(result);
+    EXPECT_TRUE(result->pages_to_copy[0].empty());
+    EXPECT_EQ(owner[0].Blocks()[0], held_[0]);
+    EXPECT_EQ(coordinator_.NumTailEntries(), 0u);
+    held_.back().reset();
+    result = AdmitForTest(coordinator_, owner, GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 1}, progress);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->pages_to_copy[0].size(), 1u);
+    EXPECT_EQ(coordinator_.NumTailEntries(), 1u);
+    EXPECT_NE(owner[0].Blocks()[0], held_[0]);
+    EXPECT_EQ(coordinator_.Allocator(0).BucketOf(owner[0].Blocks()[0]->Location()), 7);
+}
+
+TEST_F(ShardedTailAdmissionTest, OwnerCanonicalizationKeepsItsActualCopyBucketProtected) {
+    Publish();
+    // Cache-only canonical source in bucket 7. The owner's current block and
+    // its other pinned neighbors fill bucket 0 as well.
+    held_[0].reset();
+    auto bucket_zero = pool_.AcquireBlocksInBuckets(0, std::array<std::int32_t, 4>{0, 0, 0, 0});
+    ASSERT_EQ(bucket_zero.size(), 4u);
+    std::vector<BlockTable> owner{BlockTable::FromBlocks({bucket_zero[0]}, 1)};
+    const RequestProgress progress{.completed_pages = CompletedPages{.tail = Tail(), .owner_continues = true},
+                                   .num_computed_tokens = 127};
+    const auto result =
+        AdmitForTest(coordinator_, owner, GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 1}, progress);
+    ASSERT_TRUE(result);
+    EXPECT_TRUE(result->pages_to_copy[0].empty());
+    EXPECT_EQ(owner[0].Blocks()[0], bucket_zero[0]) << "unfunded publication leaves the owner's block private";
+    EXPECT_TRUE(coordinator_.GroupPrefixIndex(0).Find(pool_, Key(Tail().hash, 0)));
+}
+
+TEST(ShardedTailAdmissionBoundaryTest, CanonicalSourceSurvivesACompanionEvictionDuringCommit) {
+    BlockPool pool(4, {32, 1});
+    CacheCoordinator coord = MakeCoordinator(
+        std::vector<CacheGroupSpec>{CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                                                   .cache_blocks_per_lcm_block = 32,
+                                                   .block_granularity = 128,
+                                                   .shard_count = 8},
+                                    CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1}},
+        128, pool, false, nullptr, nullptr, false);
+    auto held = pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 8>{7, 7, 7, 7, 0, 0, 0, 0});
+    ASSERT_EQ(held.size(), 8u);
+    const TailPublication tail{.tail_tokens = 127, .hash = "canonical-tail"};
+    std::vector<BlockTable> publisher(2);
+    publisher[0] = BlockTable::FromBlocks({held[0]}, 1);
+    coord.CacheCompletedBlocks(
+        publisher, RequestProgress{.completed_pages = CompletedPages{.tail = tail}, .num_computed_tokens = 127},
+        CacheCoordinatorTestAccess::NextAccessEpoch(coord));
+    const auto canonical_id = coord.Allocator(0).ResolveCacheBlockId(held[0]->Location());
+    coord.Free(publisher);
+    held[0].reset();                           // canonical is cache-only before planning
+    CacheForGroup(coord, pool, tail.hash, 1);  // eviction cascades across this tail's groups
+    CacheForGroup(coord, pool, "older-state", 1);
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 1);
+    std::vector<BlockTable> owner(2);
+    owner[0] = BlockTable::FromBlocks({held[4]}, 1);
+    const RequestProgress progress{.completed_pages = CompletedPages{.tail = tail, .owner_continues = true},
+                                   .num_computed_tokens = 127};
+    const auto result =
+        AdmitForTest(coord, owner, GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 1}, progress);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->pages_to_copy[0].size(), 1u);
+    EXPECT_EQ(result->pages_to_copy[0][0].first, canonical_id);
+    EXPECT_EQ(coord.Allocator(0).BucketOf(owner[0].Blocks()[0]->Location()), 7);
+    EXPECT_TRUE(coord.GroupPrefixIndex(0).Find(pool, Key(tail.hash, 0)));
+    EXPECT_FALSE(coord.GroupPrefixIndex(1).Find(pool, Key(tail.hash, 1))) << "companion really was evicted";
+}
+
+TEST(ShardedTailAdmissionBoundaryTest, SlidingOwnerCopiesOnlyTheRetainedTailSlot) {
+    BlockPool pool(8, {8});
+    CacheCoordinator coord =
+        MakeCoordinator(std::vector<CacheGroupSpec>{CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                                                                   .sliding_window = 16,
+                                                                   .cache_blocks_per_lcm_block = 8,
+                                                                   .block_granularity = 16,
+                                                                   .shard_count = 8}},
+                        64, pool, false, nullptr, nullptr, false);
+    auto blocks = pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 3>{0, 1, 2});
+    ASSERT_EQ(blocks.size(), 3u);
+    std::vector<BlockTable> owner{BlockTable::FromBlocks(blocks, 0)};
+    const TailPublication tail{.tail_tokens = 48, .hash = "sliding-tail"};
+    const auto result =
+        AdmitForTest(coord, owner, GroupDemand{.extent = DenseGrowth{1}},
+                     RequestProgress{.completed_pages = CompletedPages{.tail = tail, .owner_continues = true},
+                                     .num_computed_tokens = 48});
+    ASSERT_TRUE(result);
+    EXPECT_FALSE(owner[0].Blocks()[0]);
+    EXPECT_FALSE(owner[0].Blocks()[1]);
+    ASSERT_EQ(result->pages_to_copy[0].size(), 1u);
+    EXPECT_EQ(result->pages_to_copy[0][0].first, coord.Allocator(0).ResolveCacheBlockId(blocks[2]->Location()));
+    EXPECT_EQ(coord.Allocator(0).BucketOf(owner[0].Blocks()[2]->Location()), 2);
+    EXPECT_TRUE(coord.GroupPrefixIndex(0).Find(pool, Key(tail.hash, 0, 2)));
+    EXPECT_FALSE(coord.GroupPrefixIndex(0).Find(pool, Key(tail.hash, 0, 0)));
+}
+
 }  // namespace tokenspeed::test

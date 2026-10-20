@@ -40,6 +40,9 @@ namespace {
 struct AdmissionPlan {
     CacheCoordinator::PrefixProbe prefix;
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
+    // Publication may replace an owner's tail slot with this canonical block.
+    // Keep it alive through eviction cascades until commit has copied it.
+    std::vector<CacheBlockRef> tail_copy_sources;
 };
 
 // The table shape a restore rebuilds before its dense demand is placed: how
@@ -113,6 +116,8 @@ public:
         return true;
     }
 
+    std::vector<CacheBlockRef> TakeTailCopySources() { return std::move(tail_copy_sources_); }
+
 private:
     // Current prefix hits are protected before candidates reach this policy.
     // A request-only block with no CacheEntry is reclaimed first. Cached
@@ -169,6 +174,7 @@ private:
                 blocks_needed_[i] = geometry_[i].BlocksNeededFor(*demand.table, demand) + tailBlocksNeeded(i) +
                                     zeroStateBlocksNeeded(i);
                 shape_need_[i].assign(buckets, 0);
+                collectTailCopyBuckets(i, shape_need_[i], blocks_needed_[i]);
                 if (!prefix_.host.per_group.empty()) {
                     collectHostHitBuckets(i, shape_need_[i]);
                 }
@@ -235,6 +241,61 @@ private:
             blocks += (completed_->tail->tail_tokens + block_granularity - 1) / block_granularity;
         }
         return blocks;
+    }
+
+    // A non-empty tail slot is copied in its current bucket, like a Host
+    // hit's destination. Its fresh copy cannot consume a hole in another
+    // bucket even though ordinary dense growth can.
+    void collectTailCopyBuckets(std::size_t i, std::vector<std::int64_t>& need, std::int64_t& dense_need) {
+        if (!geometry_[i].HasTokenSpan()) {
+            return;
+        }
+        const GroupAllocator& allocator = groups_[i].Allocator();
+        const auto count_copy = [&](const CacheBlockRef& block) {
+            if (block) {
+                ++need[static_cast<std::size_t>(allocator.BucketOf(block->Location()))];
+                --dense_need;
+            }
+        };
+        if (const auto& tail = prefix_.device.tail; tail && !tail->group_keys[i].empty()) {
+            const std::int32_t first =
+                FirstTailBlockNeeded(groups_[i].Spec(), geometry_[i].BlockGranularity(), tail->tail_tokens);
+            const GroupPrefixProbe& probe = tail->per_group[i];
+            for (std::size_t j = static_cast<std::size_t>(first); j < probe.hits.size(); ++j) {
+                if (probe.hits[j] != 0) {
+                    const CacheBlockRef block = groups_[i].Index().Find(pool_, tail->group_keys[i][j]);
+                    _assert(static_cast<bool>(block), "a matched Device tail block must remain cached during planning");
+                    count_copy(block);
+                }
+            }
+        }
+        if (completed_ != nullptr && completed_->owner_continues && completed_->tail && num_computed_tokens_ &&
+            !groups_[i].Spec().replayable) {
+            const std::int32_t granularity = geometry_[i].BlockGranularity();
+            const std::int32_t tokens = *num_computed_tokens_;
+            const std::int32_t tail_first = (tokens - tokens % prefix_granularity_) / granularity;
+            const std::int32_t first = std::max(tail_first, geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), tokens));
+            const std::int32_t past_end = (tokens + granularity - 1) / granularity;
+            const auto blocks = demands_[i].table->Blocks();
+            for (std::int32_t slot = first; slot < std::min(past_end, demands_[i].table->NumBlocks()); ++slot) {
+                const CacheBlockRef& block = blocks[static_cast<std::size_t>(slot)];
+                if (!block) {
+                    continue;
+                }
+                // Publication canonicalizes an existing key before the copy.
+                // Keep that source stable through this transaction's eviction.
+                const CacheKey key{.group_id = groups_[i].Id(),
+                                   .content_hash = completed_->tail->hash,
+                                   .page_offset = slot - tail_first};
+                const CacheBlockRef canonical = groups_[i].Index().Find(pool_, key);
+                if (canonical) {
+                    protected_locations_.insert(canonical->Location());
+                    tail_copy_sources_.push_back(canonical);
+                }
+                count_copy(canonical ? canonical : block);
+            }
+        }
+        _assert(dense_need >= 0, "tail copies must be included in the total block demand");
     }
 
     // Whether the probe matched a checkpoint for State group i on either
@@ -548,6 +609,7 @@ private:
     std::size_t next_request_candidate_index_{0};
     std::vector<CacheGroupVictimCandidates> cache_group_candidates_;
     std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> protected_locations_;
+    std::vector<CacheBlockRef> tail_copy_sources_;
     std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> request_reclaim_locations_;
     std::vector<PrefixCacheIndex::EvictionCandidate> epoch_scratch_;
 };
@@ -576,7 +638,8 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
     if (!planner.Plan()) {
         return std::nullopt;
     }
-    return AdmissionPlan{.prefix = std::move(prefix), .victims = std::move(victims)};
+    return AdmissionPlan{
+        .prefix = std::move(prefix), .victims = std::move(victims), .tail_copy_sources = planner.TakeTailCopySources()};
 }
 
 // The same progress without the tail it would publish: the full pages still
