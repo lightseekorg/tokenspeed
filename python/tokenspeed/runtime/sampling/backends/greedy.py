@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 
 def _verify_chain_greedy_torch(
     predicts: torch.Tensor,  # [bs * N] int32, in/out
-    accept_index: torch.Tensor,  # [bs, N] int32, in/out (-1-filled on entry)
+    accept_index: torch.Tensor,  # [bs, N] int32, out
     accept_token_num: torch.Tensor,  # [bs] int32, out
     candidates: torch.Tensor,  # [bs, N] int32
     target_predict: torch.Tensor,  # [bs, N] int64 (argmax output)
