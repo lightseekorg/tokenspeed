@@ -32,9 +32,16 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 from tokenspeed_kernel.ops.moe import plan_softmax_bias_topk, softmax_bias_topk
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError
 
 from tokenspeed.runtime.layers.moe.topk import torch_router_topk
+
+# torch_softmax_bias_topk declares batch invariance only on NVIDIA.
+pytestmark = pytest.mark.skipif(
+    not current_platform().is_nvidia,
+    reason="the batch-invariant torch router is registered for NVIDIA only",
+)
 
 
 def original_router(logits, bias, top_k, num_real, scale, indices_dtype):

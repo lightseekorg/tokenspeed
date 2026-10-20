@@ -49,6 +49,8 @@ from tokenspeed_kernel.numerics.torch.moe import (
 from tokenspeed_kernel.numerics.torch.quantization import dequantize_nvfp4_blocks
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import SelectedKernel
 
 NUM_EXPERTS = 16
 TOP_K = 10  # scaled-down test shape (real Kimi-K3 num_experts_per_token=16)
@@ -310,9 +312,14 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
         is_sf_swizzled_layout=False,
         enable_pdl=False,
     )
+    apply_name = "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"
     quantized_result = kernel_moe_apply(
         {
-            "apply_kernel_name": "flashinfer_trtllm_nvfp4_situ_routed_moe_apply",
+            "apply_kernel_name": apply_name,
+            "apply_kernel": SelectedKernel(
+                apply_name, KernelRegistry.get().get_impl(apply_name)
+            ),
+            "features": frozenset(),
             "a2a_backend": "none",
         },
         prequantized,

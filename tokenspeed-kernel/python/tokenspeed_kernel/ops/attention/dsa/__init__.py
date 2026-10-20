@@ -1345,7 +1345,6 @@ def dsa_plan(
         kernel = select_kernel(
             "attention",
             "dsa_plan",
-            "plan_dsa_topk",
             format_signature(),
             traits=traits,
             solution=solution,
@@ -1365,7 +1364,6 @@ def dsa_plan(
     with kernel_scope(
         "attention",
         "dsa_plan",
-        "plan_dsa_topk",
         seq_lens_2d.dtype,
         kernel_name=kernel.name,
         **shape_params,
