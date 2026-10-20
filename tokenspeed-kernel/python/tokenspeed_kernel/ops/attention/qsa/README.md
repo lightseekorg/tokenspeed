@@ -71,6 +71,11 @@ FP32 ranking. Each row retains its own frontier; groups stop after their longest
 frontier. Rows with at most 512 complete blocks return all valid ids and pad
 remaining slots with `-1`. Output order and boundary tie ids are unspecified.
 
+`test_qsa_stream_topk_buckets.py` constructs exact FP32 scores from BF16 inputs
+and checks score multisets with zero tolerance. It covers 255/256/257-entry
+boundary buckets, larger single buckets, partial ties, FP16 rounding midpoints,
+subnormal and overflow bins, and graph replay across all CuTe dispatch paths.
+
 The compact selector unrolls its bounded candidate scan so running entries use
 fixed register indices. The full radix fallback retains runtime indexing;
 query counts and frontiers do not introduce new JIT specializations.
