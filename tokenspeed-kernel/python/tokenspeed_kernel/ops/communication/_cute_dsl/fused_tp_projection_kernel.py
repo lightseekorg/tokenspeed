@@ -271,6 +271,7 @@ class FusedTPProjectionKernel:
         self.tile_owner_input = False
         self.independent_operand_stages = False
         self.tma_scales = False
+        self.register_scale_prefetch = False
         self.input_phase_clear = False
         self.concurrent_reduction = False
         self.reduce_sync_barrier = pipeline.NamedBarrier(barrier_id=4, num_threads=128)
@@ -677,6 +678,12 @@ class FusedTPProjectionKernel:
         )
         self.tile_owner_input = self.row_parallel and peers[1].shape[0] >= 512
         self.scale_k_total = sfa.shape[1]
+        # Aligned K groups allow four adjacent scales per global load.
+        self.register_scale_prefetch = (
+            not self.row_parallel
+            and self.split_accumulator
+            and self.scale_k_total % 4 == 0
+        )
         # Every TMA destination begins on a 128-byte boundary.
         self.scale_b_stride = (self.scale_k_total + 31) // 32 * 32
         self.bulk_scale_stages = 1
@@ -1159,7 +1166,15 @@ class FusedTPProjectionKernel:
             self.threads_per_warp * len(self.acc_update_warp_id),
         )
         scale_pipeline = None
-        if cutlass.const_expr(self.tma_scales):
+        if cutlass.const_expr(self.register_scale_prefetch):
+            scale_pipeline = pipeline.PipelineAsync.create(
+                barrier_storage=storage.scale_mbar_ptr.data_ptr(),
+                num_stages=self.num_scale_stage,
+                producer_group=scale_pipeline_producer_group,
+                consumer_group=scale_pipeline_consumer_group,
+                defer_sync=True,
+            )
+        elif cutlass.const_expr(self.tma_scales):
             scale_pipeline = pipeline.PipelineTmaAsync.create(
                 barrier_storage=storage.scale_mbar_ptr.data_ptr(),
                 num_stages=self.bulk_scale_stages,
@@ -2023,7 +2038,86 @@ class FusedTPProjectionKernel:
                             rank,
                             ready_input_owners,
                         )
-                    if cutlass.const_expr(self.tma_scales):
+                    if cutlass.const_expr(self.register_scale_prefetch):
+                        scale_copy = cute.make_copy_atom(
+                            cute.nvgpu.CopyUniversalOp(),
+                            self.acc_dtype,
+                            num_bits_per_copy=128,
+                        )
+                        scale_rows_per_lane = (
+                            self.scale_m_per_tile // self.threads_per_warp
+                        )
+                        # Fetch the next four K blocks before waiting for shared
+                        # stages. Consumers still receive one K block at a time.
+                        for scale_chunk in cutlass.range(k_tile_cnt // 4, unroll=1):
+                            prefetched_a = cute.make_rmem_tensor(
+                                cute.make_layout(
+                                    (scale_rows_per_lane, 4), stride=(4, 1)
+                                ),
+                                self.acc_dtype,
+                            )
+                            for row_slot in cutlass.range_constexpr(
+                                scale_rows_per_lane
+                            ):
+                                scale_row = (
+                                    tile_info[0] * self.scale_m_per_tile
+                                    + lane_idx
+                                    + row_slot * self.threads_per_warp
+                                )
+                                source_a = cute.make_tensor(
+                                    mSFA_mkl.iterator
+                                    + cute.assume(
+                                        scale_row * self.scale_k_total
+                                        + scale_chunk * 4,
+                                        divby=4,
+                                    ),
+                                    cute.make_layout((4,), stride=(1,)),
+                                )
+                                cute.copy(
+                                    scale_copy, source_a, prefetched_a[(row_slot, None)]
+                                )
+                            prefetched_b = cute.make_rmem_tensor((4,), self.acc_dtype)
+                            if lane_idx == 0:
+                                source_b = cute.make_tensor(
+                                    mSFB_nkl.iterator
+                                    + cute.assume(
+                                        tile_info[1] * self.scale_k_total
+                                        + scale_chunk * 4,
+                                        divby=4,
+                                    ),
+                                    cute.make_layout((4,), stride=(1,)),
+                                )
+                                cute.copy(scale_copy, source_b, prefetched_b)
+                            for within_chunk in cutlass.range_constexpr(4):
+                                scale_pipeline.producer_acquire(scale_producer_state)
+                                scale_shared = cute.make_tensor(
+                                    sSFA.iterator
+                                    + scale_producer_state.index
+                                    * self.scale_m_per_tile,
+                                    cute.make_layout(
+                                        (self.scale_m_per_tile,), stride=(1,)
+                                    ),
+                                )
+                                for row_slot in cutlass.range_constexpr(
+                                    scale_rows_per_lane
+                                ):
+                                    scale_shared[
+                                        lane_idx + row_slot * self.threads_per_warp
+                                    ] = prefetched_a[(row_slot, within_chunk)]
+                                if lane_idx == 0:
+                                    scale_shared_b = cute.make_tensor(
+                                        sSFB.iterator,
+                                        cute.make_layout(
+                                            (self.num_scale_stage,), stride=(1,)
+                                        ),
+                                    )
+                                    scale_shared_b[scale_producer_state.index] = (
+                                        prefetched_b[within_chunk]
+                                    )
+                                # PipelineAsync publishes the ordinary shared stores.
+                                scale_pipeline.producer_commit(scale_producer_state)
+                                scale_producer_state.advance()
+                    elif cutlass.const_expr(self.tma_scales):
                         scale_pipeline.producer_acquire(scale_producer_state)
                         barrier = scale_pipeline.producer_get_barrier(
                             scale_producer_state

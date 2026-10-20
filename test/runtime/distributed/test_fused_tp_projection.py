@@ -162,6 +162,10 @@ def _check_column_projection(rank, world_size, device, parallel, config):
                 ]
             )
         _initialize_weights(model, rank)
+        # Adjacent K blocks need distinct scales when vector loads are prefetched.
+        for linear in model:
+            blocks = torch.arange(linear.weight_scale_inv.shape[1], device=device)
+            linear.weight_scale_inv.mul_(torch.exp2((blocks % 7 - 3).float()))
         prepare_dp_linear_communication(model, 4097, torch.bfloat16, backend)
         models.append(model)
     baseline, candidate = models
