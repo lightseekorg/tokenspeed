@@ -821,7 +821,9 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(
 
     # A subsequent eager forward must still be able to initialize the states.
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(proc, "_init_dist_argmax_state", lambda lm_head: None)
+    monkeypatch.setattr(
+        proc, "_init_dist_argmax_state", lambda lm_head, logits_dtype: None
+    )
     monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: object())
     monkeypatch.setattr(
         logits_processor_module,
@@ -1492,6 +1494,7 @@ def test_rocm_keeps_the_portable_sharded_argmax(monkeypatch):
     )
     hidden = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     head = torch.nn.Linear(2, 4, bias=False).requires_grad_(False)
+    head.num_embeddings_per_partition = 4
     actual = processor._get_logits(
         hidden,
         head,
