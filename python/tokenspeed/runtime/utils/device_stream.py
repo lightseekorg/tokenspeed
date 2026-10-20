@@ -24,6 +24,13 @@ from typing import Any
 import torch
 
 
+def is_current_stream_capturing(device: torch.device) -> bool:
+    """Query capture on the tensor's accelerator; CPU has no graph capture."""
+    if device.type == "cpu":
+        return False
+    return torch.get_device_module(device).is_current_stream_capturing()
+
+
 def new_device_stream():
     """Create a stream for the active accelerator, or None on CPU-only hosts."""
     try:

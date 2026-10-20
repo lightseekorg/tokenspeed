@@ -78,6 +78,12 @@ class AscendDSAKernels:
         self._attention = getattr(
             torch.ops.custom, "npu_sparse_flash_attention_decode", None
         )
+        self._select_local = getattr(
+            torch.ops.custom, "npu_select_local_topk_indices", None
+        )
+        self._merge_partials = getattr(
+            torch.ops.custom, "npu_kvp_attention_merge", None
+        )
         if self._index is None or self._attention is None:
             raise RuntimeError(
                 "LongCatDSA needs LightningIndexer and "
@@ -141,6 +147,16 @@ class AscendDSAKernels:
 
     def finalize_prolog_window(self):
         torch.ops.custom.finalize_group_first_rdma("dsa_prolog_fused")
+
+    def select_local(self, indices, positions, rank):
+        if self._select_local is None:
+            raise RuntimeError("Ascend DSA CP requires SelectLocalTopkIndices")
+        return self._select_local(indices, positions, rank)
+
+    def merge_partials(self, output, lse):
+        if self._merge_partials is None:
+            raise RuntimeError("Ascend DSA CP requires KvpAttentionMerge")
+        return self._merge_partials(output, lse)
 
     def merge_topk_fused(self, indices, values, *, group, rank_size):
         return torch.ops.custom.npu_dcp_merge_topk(

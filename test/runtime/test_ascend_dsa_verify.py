@@ -627,7 +627,7 @@ def test_dcp_verify_batches_query_rows_with_causal_lengths(width):
             return q
 
         def _run_indexed_sparse_attention(
-            self, selection, layer, pool, *, head_major_output
+            self, selection, layer, pool, *, head_major_output, is_prefill: bool
         ):
             del layer, pool, head_major_output
             return selection.flatten(1)
@@ -821,7 +821,7 @@ def test_single_token_mixed_decode_selects_request_shaped_query_metadata():
             return q
 
         def _run_indexed_sparse_attention(
-            self, selection, layer, pool, *, head_major_output
+            self, selection, layer, pool, *, head_major_output, is_prefill: bool
         ):
             del layer, pool, head_major_output
             return selection.flatten(1)
@@ -894,7 +894,7 @@ class _CpuFusedDsaKernels:
         return merged[rank * local_heads : (rank + 1) * local_heads].bfloat16()
 
 
-def _fused_backend(monkeypatch, rows, *, degree):
+def _fused_backend(monkeypatch, rows, *, degree, rank=0):
     def initialize_base(self, config, spec, *, kernel_page_size):
         self.is_draft = False
         self.spec_num_tokens = 8
@@ -909,7 +909,7 @@ def _fused_backend(monkeypatch, rows, *, degree):
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method=None,
         kvp_size=degree,
-        kvp_rank=0,
+        kvp_rank=rank,
         kvp_group=tuple(range(degree)),
     )
     spec = SimpleNamespace(
@@ -925,9 +925,160 @@ def _fused_backend(monkeypatch, rows, *, degree):
     )
     backend = ascend_dsa.AscendDSABackend(config, spec, kernel_page_size=128)
     backend._dcp.bind_virtual_block_count(17)
-    placement = CachePlacement(128, 17, tuple(range(degree)), 0)
+    placement = CachePlacement(128, 17, tuple(range(degree)), rank)
     monkeypatch.setattr(backend, "cache_placement", lambda layer: placement)
     return backend
+
+
+class _CpuCollectiveDsaKernels(_CpuFusedDsaKernels):
+    """Substitute device math while real Gloo exchanges rank-specific tensors."""
+
+    def __init__(self, rows, degree, rank):
+        super().__init__(rows, degree)
+        self.degree = degree
+        self.rank = rank
+
+    def index_partial(self, *args, **kwargs):
+        indices = torch.arange(2048, dtype=torch.int32).expand(self.rows, 1, -1)
+        scores = indices.float() * self.degree + self.rank
+        return indices.contiguous(), scores.contiguous()
+
+    def select_local(self, indices, positions, rank):
+        owned = positions.div(indices.shape[-1], rounding_mode="floor") == rank
+        selected = indices.squeeze(1).gather(1, positions.long() % indices.shape[-1])
+        output = torch.full_like(selected, -1)
+        for row in range(self.rows):
+            values = selected[row, owned[row]]
+            output[row, : values.numel()] = values
+        return (
+            output[:, None, :],
+            (owned.sum(1) + 127).div(128, rounding_mode="floor").int(),
+        )
+
+    def attention_partial(self, *args, **kwargs):
+        head = torch.arange(64, dtype=torch.float32)[:, None, None] / 8
+        row = torch.arange(self.rows, dtype=torch.float32)[None, :, None] / 4
+        feature = (torch.arange(512, dtype=torch.float32) % 4)[None, None, :] / 16
+        output = self.rank + head + row + feature
+        maximum = torch.full((1, self.rows, 64), self.rank / 4)
+        total = torch.full_like(maximum, self.rank + 1)
+        if self.rank == self.degree - 1:
+            output.fill_(float("nan"))
+            maximum.fill_(-3e38)
+            total.zero_()
+        return output, maximum, total
+
+    def merge_partials(self, output, lse):
+        weights = torch.softmax(lse, dim=0)
+        clean = torch.where(weights[..., None] == 0, 0, output)
+        return (clean * weights[..., None]).sum(0).bfloat16()
+
+
+def _collective_dsa_worker(rank, rendezvous):
+    from tokenspeed.runtime.distributed import process_group_manager as pg_module
+    from tokenspeed.runtime.distributed.mapping import MappingBase
+    from tokenspeed.runtime.distributed.process_group_manager import ProcessGroupManager
+
+    torch.set_num_threads(1)
+    degree = 8
+    manager = ProcessGroupManager()
+    manager.init_distributed(
+        MappingBase(rank=rank, world_size=degree),
+        rendezvous,
+        backend="gloo",
+        timeout=45,
+        device_id=None,
+    )
+    try:
+        manager.init_process_group(tuple(range(degree)), backend="gloo")
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(pg_module, "process_group_manager", manager)
+            for rows in (1, 3, 16):
+                backend = _fused_backend(patch, rows, degree=degree, rank=rank)
+                backend._indexer_kernels = _CpuCollectiveDsaKernels(rows, degree, rank)
+                # Small shapes must retain the general path even after the
+                # model has configured native buffers for larger shapes.
+                backend.configure_fused_decode(
+                    group="fused-dsa",
+                    attention_outputs={64: (torch.empty(64, 64, 512),)},
+                    peer_inputs={64: torch.arange(degree)},
+                )
+                query = torch.full((rows, 8, 576), rank, dtype=torch.bfloat16)
+                layer = SimpleNamespace(layer_id=0, scaling=1.0)
+                index_cache = torch.zeros(8, 128, 1, 128, dtype=torch.bfloat16)
+                kv_cache = torch.zeros(8, 128, 1, 576, dtype=torch.bfloat16)
+                pool = SimpleNamespace(
+                    get_component=lambda *args: index_cache,
+                    get_key_buffer=lambda *args: kv_cache,
+                )
+                selection = backend._select_indexed(
+                    query,
+                    None,
+                    layer,
+                    torch.arange(rows),
+                    pool,
+                    torch.arange(1, rows + 1, dtype=torch.int32),
+                    torch.full((rows,), 128, dtype=torch.int32),
+                    torch.ones(rows, 1, dtype=torch.int32),
+                    dict(
+                        index_query=None,
+                        index_weights=None,
+                        index_init_tokens=0,
+                        index_local_tokens=0,
+                        index_cache_written=True,
+                    ),
+                    query_group_size=1,
+                    context_parallel=True,
+                    query_width=1,
+                )
+                expected_query = torch.arange(degree, dtype=torch.bfloat16)[
+                    :, None, None, None
+                ].expand(degree, rows, 8, 576)
+                torch.testing.assert_close(selection.query, expected_query)
+                # Across all eight shards the largest 2048 scores contain
+                # exactly the last 256 local indices from every rank.
+                expected_indices = torch.full((rows, 1, 2048), -1, dtype=torch.int32)
+                expected_indices[:, :, :256] = torch.arange(2047, 1791, -1)
+                torch.testing.assert_close(selection.indices, expected_indices)
+                assert selection.valid_chunks.tolist() == [2] * rows
+                ranks = torch.arange(degree - 1, dtype=torch.float64)
+                offset = (ranks * torch.softmax(ranks / 4 + (ranks + 1).log(), 0)).sum()
+                head = torch.arange(rank * 8, (rank + 1) * 8)[:, None, None] / 8
+                row = torch.arange(rows)[None, :, None] / 4
+                feature = (torch.arange(512) % 4)[None, None, :] / 16
+                expected = (offset + head.double() + row + feature).bfloat16()
+                for head_major in (False, True):
+                    for is_prefill in (False, True):
+                        actual = backend._run_indexed_sparse_attention(
+                            selection,
+                            layer,
+                            pool,
+                            head_major_output=head_major,
+                            is_prefill=is_prefill,
+                        )
+                        reference = (
+                            expected
+                            if head_major
+                            else expected.transpose(0, 1).contiguous().flatten(1)
+                        )
+                        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_collective_dsa_small_rows_merge_real_eight_rank_exchanges(tmp_path):
+    """Exercise padding, rank/head order and empty-shard LSE over real Gloo."""
+    if torch.distributed.is_initialized() or torch.cuda.is_initialized():
+        pytest.skip("requires an isolated CPU process group")
+    if not torch.distributed.is_gloo_available():
+        pytest.skip("requires the Gloo CPU backend")
+    torch.multiprocessing.start_processes(
+        _collective_dsa_worker,
+        args=(f"file://{tmp_path / 'dsa-rendezvous'}",),
+        nprocs=8,
+        join=True,
+        start_method="fork",
+    )
 
 
 @pytest.mark.parametrize("width", [1, 2, 4, 8])
@@ -1051,6 +1202,7 @@ def test_fused_dsa_uses_registered_outputs_and_merges_lse(
         layer,
         pool,
         head_major_output=head_major,
+        is_prefill=False,
     )
     # Independent log-softmax reference over the configured context shards.
     ranks = torch.arange(degree, dtype=torch.float64)
@@ -1085,6 +1237,7 @@ def test_dsa_missing_fused_resources_fail_before_native_launch(monkeypatch):
         None,
         3,
         True,
+        True,
     )
     pool = SimpleNamespace(get_key_buffer=lambda layer: torch.empty(128, 576))
     with pytest.raises(RuntimeError, match="Initialize fused DSA resources"):
@@ -1093,6 +1246,7 @@ def test_dsa_missing_fused_resources_fail_before_native_launch(monkeypatch):
             SimpleNamespace(layer_id=0),
             pool,
             head_major_output=True,
+            is_prefill=False,
         )
     outputs = (torch.empty(64, 64, 512), torch.empty(1, 64, 64), torch.empty(1, 64, 64))
     backend.configure_fused_decode(
@@ -1107,4 +1261,5 @@ def test_dsa_missing_fused_resources_fail_before_native_launch(monkeypatch):
             SimpleNamespace(layer_id=0),
             pool,
             head_major_output=True,
+            is_prefill=False,
         )

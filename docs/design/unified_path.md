@@ -105,6 +105,14 @@ directly into persistent consumer buffers. Layers share this result within
 the forward; replay recomputes it from the live request inputs. Eager and Graph
 execution use this same path. This DSA-specific preparation retains the common
 DCP ownership semantics without changing the shared placement implementation.
+Prefill and decode shapes without a prepared fused projection use the same
+persistent metadata outputs. They exchange query and TopK candidates over the
+existing device group, then merge sparse-attention partials on the model stream.
+That path creates no auxiliary communicator or stream. Selecting fused execution
+is explicit in the sparse selection; a live native error is never retried through
+the collective path. A model with fused decode prepared can still execute its
+ordinary prefill or smaller capture buckets.
+
 Single-rank decode uses the same preparation with identity page ownership:
 verify still needs one causal length and page-table row per candidate. Its
 Indexer and attention receive matching per-query batch axes, even without a
@@ -995,6 +1003,15 @@ packs tokens and accept lengths into one region (`_output_pack_buf`), so its
 `get_packed_output_d2h` collapses the two device-to-host copies into one; the
 Triton backends return separate token and length buffers and take the
 executor's two-copy path (`get_packed_output_d2h` returns None).
+
+### Logits capture state follows the tensor's device
+
+The logits processor queries capture on the tensor's accelerator module;
+CPU tensors have no capture. Lazy communication-state probes stay outside
+capture and use the TP group's configured device collective, including HCCL
+on NPU. The multicast argmax provider retains its NVIDIA eligibility vote;
+an ineligible group keeps the portable vocabulary-parallel argmax or the
+plain gather, without entering CUDA APIs on another device.
 
 ## What stays graph-only
 

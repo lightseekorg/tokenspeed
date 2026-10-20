@@ -6,6 +6,11 @@ where new logic belongs, how components feed results back into the scheduler,
 and what the loop body itself is allowed to contain. The rules below are
 deliberate; treat deviations as bugs in review.
 
+At worker startup, `global_server_args_dict_update` publishes the resolved
+`disaggregation_mode` before model construction and warmup. Model plugins use
+this role to prepare resources for the worker's topology; a prefill worker must
+not infer a decode role from graph settings or missing metadata.
+
 ## Principle 1: the loop runs no GPU work, and cannot reach any
 
 The event loop is the **control plane**: ZMQ input, gloo collectives, the C++

@@ -216,6 +216,35 @@ def test_zero_page_fields_matches_host_expansion_without_recompiling(
         )
 
 
+def test_zero_page_fields_large_admission_preserves_unselected_bytes(
+    device: str,
+) -> None:
+    # 1025 pages x 12 fields x 32 tiles exceeded Ascend's 65535 launch limit.
+    capacity = 1100
+    selected = torch.randperm(capacity, generator=torch.Generator().manual_seed(42))[
+        :1025
+    ]
+    fields = []
+    offset = 64
+    for size in [65537, *range(17, 28)]:
+        stride = ((size + 31) // 32 + 1) * 32
+        fields.append((offset, stride, size))
+        offset += capacity * stride + 64
+    expected = torch.full((offset,), 173, dtype=torch.uint8)
+    backing = expected.to(device)
+    for base, stride, size in fields:
+        view = expected[base : base + capacity * stride].view(capacity, stride)
+        view[selected, :size] = 0
+    zero_page_fields(
+        backing,
+        selected.to(device=device, dtype=torch.int32),
+        torch.tensor(fields, dtype=torch.int64, device=device),
+        max_field_bytes=65537,
+    )
+    # Includes fields, padding bytes, guard gaps and the 75 untouched pages.
+    torch.testing.assert_close(backing.cpu(), expected, rtol=0, atol=0)
+
+
 def test_copy_page_fields_matches_host_expansion_without_recompiling(
     device: str,
 ) -> None:

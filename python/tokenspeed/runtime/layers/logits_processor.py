@@ -85,6 +85,7 @@ from tokenspeed.runtime.sampling.utils import (
     top_token_logprobs,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
 from tokenspeed.runtime.utils.triton import tl, triton
 
 logger = get_colorful_logger(__name__)
@@ -571,10 +572,10 @@ class LogitsProcessor(nn.Module):
         )
         if key in self._LOGITS_DIST_ARGMAX_STATES:
             return self._LOGITS_DIST_ARGMAX_STATES[key]
-        if torch.cuda.is_current_stream_capturing():
+        if is_current_stream_capturing(device):
             return None  # never rendezvous inside capture; warmup probes first
 
-        group = pg_manager.get_process_group("nccl", self.tp_group)
+        group = pg_manager.get_device_process_group(self.tp_group)
         if self._agree_across_tp(
             current_platform().is_nvidia and dist_argmax_available(), group, device
         ):
@@ -615,7 +616,7 @@ class LogitsProcessor(nn.Module):
                 skip_ping_pong=True,
                 dtype=logits_dtype,
             )
-        if state is None and not torch.cuda.is_current_stream_capturing():
+        if state is None and not is_current_stream_capturing(lm_head.weight.device):
             state = VocabParallelArgmax(self.tp_group, self.tp_rank * vocab_per_rank)
         return state
 
@@ -979,7 +980,7 @@ class LogitsProcessor(nn.Module):
             return dp_group_row_counts(
                 table, self.tp_group, self.tp_group[self.tp_rank], rows
             )
-        if hidden_states.is_cuda and torch.cuda.is_current_stream_capturing():
+        if is_current_stream_capturing(hidden_states.device):
             return [rows] * self.tp_size
         counts = torch.tensor([rows], dtype=torch.int64, device=hidden_states.device)
         return all_gather(counts, self.tp_group, dim=0).tolist()
@@ -1079,7 +1080,7 @@ class LogitsProcessor(nn.Module):
             if self.do_argmax and not require_full_vocab:
                 if (
                     self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED
-                    and not torch.cuda.is_current_stream_capturing()
+                    and not is_current_stream_capturing(logits.device)
                 ):
                     self._dist_argmax_state = self._init_dist_argmax_state(
                         lm_head, logits.dtype
@@ -1103,7 +1104,7 @@ class LogitsProcessor(nn.Module):
             )
             if state is self._LOGITS_AG_STATE_UNINITIALIZED:
                 # create_state rendezvouses; leave it for an eager call.
-                if torch.cuda.is_current_stream_capturing():
+                if is_current_stream_capturing(logits.device):
                     state = None
                 else:
                     state = self._all_gather_state = self._init_all_gather_state(
