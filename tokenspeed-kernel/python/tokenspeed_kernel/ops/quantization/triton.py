@@ -100,7 +100,7 @@ def _flatten_to_2d(x: torch.Tensor):
         if x.stride(d) != expected:
             raise ValueError(
                 f"cannot flatten dim {d}: stride={x.stride(d)} but expected "
-                f"shape[{d+1}]*stride[{d+1}]={expected}. Tensor shape={tuple(x.shape)}, "
+                f"shape[{d + 1}]*stride[{d + 1}]={expected}. Tensor shape={tuple(x.shape)}, "
                 f"stride={tuple(x.stride())}."
             )
     return M, N, row_stride
@@ -240,7 +240,7 @@ def fp8_token_multiplier(amax):
 def fp8_quantize_by_multiplier(x, multiplier):
     """FP8 E4M3 codes of FP32 ``x`` times its quantization ``multiplier``."""
     q = tl.clamp(x * multiplier, -_FP8_E4M3_MAX, _FP8_E4M3_MAX)
-    return q.to(tl.float8e4nv)
+    return q.to(tl.float8e4nv, fp_downcast_rounding="rtne")
 
 
 @triton.jit
@@ -652,6 +652,7 @@ _FP8_PER_TOKEN_MAX_M = 64
     "fp8_with_scale",
     name="triton_quantize_fp8_per_token",
     solution="triton",
+    features={"token_fp8_min_scaling"},
     # SM100 and newer, where the per-token FP8 GEMMs that take its output run.
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
@@ -694,6 +695,63 @@ def triton_quantize_fp8_per_token(
             f"scale_encoding={scale_encoding!r}"
         )
     return fp8_quantize_per_token(x, enable_pdl=enable_pdl)
+
+
+@register_kernel(
+    "quantization",
+    "fp8_with_scale",
+    name="triton_quantize_fp8_per_token_portable",
+    solution="triton",
+    features={"token_fp8_min_scaling"},
+    capability=CapabilityRequirement(
+        vendors=frozenset({"amd"}),
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={
+        "granularity": frozenset({"token"}),
+        "scale_encoding": frozenset({"float32"}),
+    },
+    priority=Priority.PORTABLE + 1,
+)
+def triton_quantize_fp8_per_token_portable(
+    x: torch.Tensor,
+    *,
+    granularity: str,
+    group_size: int | None,
+    scale_encoding: str,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Portable per-token E4M3 quantization with a minimum scale, for any row count.
+
+    Args:
+        x: BF16 or FP16 activations; the last dimension is one token.
+        granularity: Must be ``"token"``.
+        group_size: Must be None.
+        scale_encoding: Must be ``"float32"``.
+        enable_pdl: Launch with Programmatic Dependent Launch on Hopper+.
+
+    Returns:
+        FP8 E4M3 codes with the input shape and FP32 scales with a singleton
+        last dimension. The scale
+        floor and independently rounded reciprocal match the shared token
+        quantizer, including zero and tiny rows.
+    """
+    if enable_pdl and not current_platform().is_hopper_plus:
+        raise ValueError("this platform does not support enable_pdl")
+    shape = x.shape
+    rows = x.reshape(-1, shape[-1])
+    if rows.stride(-1) != 1:
+        rows = rows.contiguous()
+    values, scales = triton_quantize_fp8_per_token(
+        rows,
+        granularity=granularity,
+        group_size=group_size,
+        scale_encoding=scale_encoding,
+        enable_pdl=enable_pdl,
+    )
+    return values.reshape(shape), scales.reshape(*shape[:-1], 1)
 
 
 # The widest SwiGLU half (intermediate size) one program holds: a row per

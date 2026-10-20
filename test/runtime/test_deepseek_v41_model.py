@@ -33,6 +33,7 @@ import math
 import os
 import re
 import sys
+import weakref
 from copy import copy
 from pathlib import Path
 from test.runtime.test_deepseek_v41_cache import R1, R2, _backend, _extend, _tables
@@ -342,6 +343,12 @@ class _Backend:
             for requests in (request_indices,)
         )
         return (q * 0.25).to(q.dtype)
+
+    def plan_indexer_queries(
+        self, layer_id, positions, requests, forward_mode, index_process_group
+    ):
+        # Projection tests use unpartitioned queries.
+        return None
 
     def indexer_needs_scores(self, layer_id, positions, requests, mode):
         return True
@@ -2405,6 +2412,28 @@ def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse, tm
         4,
         1,
     )
+
+
+def test_post_load_can_free_the_loaded_experts(monkeypatch, tmp_path):
+    """Post-processing replaces loader-format experts (on sm90 the MXFP4
+    interleave); nothing the load built may still reference them then, or
+    every replaced tensor stays alive and the expert footprint doubles."""
+    config = _loader_config()
+    with set_default_torch_dtype(torch.bfloat16):
+        model = _loader_model(monkeypatch, config, 0, "cpu")
+    rest = _bind_engram_tables(model, _checkpoint(config), tmp_path)
+    released = []
+
+    def post_load_weights(self):
+        for module in self.modules():
+            if isinstance(module, MoELayer):
+                loaded = weakref.ref(module.w13_weight)
+                module.w13_weight = nn.Parameter(torch.empty(0), requires_grad=False)
+                released.append(loaded() is None)
+
+    monkeypatch.setattr(DeepseekV41ForCausalLM, "post_load_weights", post_load_weights)
+    model.load_weights(rest.items())
+    assert released and all(released)
 
 
 @pytest.mark.parametrize(

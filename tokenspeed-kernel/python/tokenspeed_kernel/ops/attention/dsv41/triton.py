@@ -671,8 +671,11 @@ def selected_attention(
     schedule,
     prefill_kv,
     prefill_indices,
+    *,
+    lse=None,
 ):
-    attn_sink = attn_sink[: q.shape[1]]
+    if attn_sink is not None:
+        attn_sink = attn_sink[: q.shape[1]]
     from tokenspeed_kernel.ops.attention.dsv4 import dsv4_prefill
 
     if prefill_kv is not None:
@@ -687,9 +690,10 @@ def selected_attention(
             kv=prefill_kv,
             indices=prefill_indices,
             lens=lengths,
-            attn_sink=attn_sink.contiguous(),
+            attn_sink=None if attn_sink is None else attn_sink.contiguous(),
             softmax_scale=softmax_scale,
             out=out,
+            lse=lse,
             override=None,
             solution="triton",
         )
@@ -713,7 +717,9 @@ def selected_attention(
             out,
         ),
     )
-    if attn_sink.shape != (q.shape[1],) or attn_sink.dtype != torch.float32:
+    if attn_sink is not None and (
+        attn_sink.shape != (q.shape[1],) or attn_sink.dtype != torch.float32
+    ):
         raise ValueError("attn_sink must be FP32 [heads]")
     segments = [(swa_cache, swa_slots, swa_lens, "swa")]
     if global_cache is None:
@@ -734,6 +740,8 @@ def selected_attention(
     out = _output(out, q.shape, q.dtype, q.device)
     width = sum(slots.shape[1] for _, slots, _, _ in segments)
     if width == 0:
+        if lse is not None:
+            lse.fill_(-float("inf"))
         return out.zero_()
     # ponytail: bounded gather costs 640 KiB/query at width 640; replace with a
     # direct two-reader attention kernel when memory bandwidth/launches dominate.
@@ -762,9 +770,10 @@ def selected_attention(
             kv=kv,
             indices=indices,
             lens=lens,
-            attn_sink=attn_sink.contiguous(),
+            attn_sink=None if attn_sink is None else attn_sink.contiguous(),
             softmax_scale=softmax_scale,
             out=out[start:end],
+            lse=None if lse is None else lse[start:end],
             override=None,
             solution="triton",
         )
@@ -3585,6 +3594,23 @@ def _index_select_all(
     tl.store(BlockLengths + row, count)
 
 
+@triton.jit(do_not_specialize=["K", "S0", "S1", "LS"])
+def _compact_slots_kernel(
+    Slots, Lengths, Out, Counts, K, S0, S1, LS, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0)
+    i = tl.arange(0, BLOCK)
+    length = tl.load(Lengths + row * LS)
+    value = tl.load(Slots + row * S0 + i * S1, i < K, other=-1)
+    valid = (i < K) & (i < length) & (value >= 0)
+    prefix = tl.cumsum(valid.to(tl.int32))
+    count = tl.sum(valid.to(tl.int32), 0)
+    # Packed writes and padding writes cover disjoint output addresses.
+    tl.store(Out + row * K + prefix - 1, value, valid)
+    tl.store(Out + row * K + i, -1, (i < K) & (i >= count))
+    tl.store(Counts + row, count)
+
+
 @register_kernel(
     "attention",
     "dsv41_index_select_all",
@@ -3990,3 +4016,29 @@ def index_block_select(logits, visible, candidate_topk, block_out, block_lens):
         BLOCK=1024,
         num_warps=8,
     )
+
+
+@register_kernel(
+    "attention",
+    "dsv41_compact_slots",
+    name="triton_dsv41_compact_slots",
+    solution="triton",
+    signatures=_INTEGER_SIGNATURES,
+    capability=_CAPABILITY,
+    priority=Priority.PORTABLE,
+)
+def compact_slots(slots, lengths):
+    out = torch.empty(slots.shape, dtype=slots.dtype, device=slots.device)
+    counts = torch.empty(slots.shape[0], dtype=torch.int32, device=slots.device)
+    if slots.shape[0]:
+        _compact_slots_kernel[(slots.shape[0],)](
+            slots,
+            lengths,
+            out,
+            counts,
+            slots.shape[1],
+            *slots.stride(),
+            lengths.stride(0),
+            BLOCK=triton.next_power_of_2(max(1, slots.shape[1])),
+        )
+    return out, counts

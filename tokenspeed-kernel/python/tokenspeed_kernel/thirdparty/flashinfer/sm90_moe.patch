@@ -1,0 +1,674 @@
+diff --git a/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh b/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
+index c4f877e2e6fe73635767fad786f938a50a5f09da..b281d6778683f75229b57922efffc73e0ac45071 100644
+--- a/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
++++ b/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
+@@ -3358 +3358 @@
+-                           bool enable_pdl, cudaStream_t stream) {
++                           bool enable_pdl, cudaStream_t stream, int64_t expected_m) {
+@@ -3362,0 +3363,5 @@
++#ifdef FLASHINFER_SM90_MOE_MAX_STAGES_FC1
++  constexpr int max_num_stages_fc1 = FLASHINFER_SM90_MOE_MAX_STAGES_FC1;
++#else
++  constexpr int max_num_stages_fc1 = -1;
++#endif
+@@ -3367 +3372,2 @@
+-                      quant_params.fp8_block_scaling.fc1_scales_ptrs);
++                      quant_params.fp8_block_scaling.fc1_scales_ptrs, expected_m,
++                      max_num_stages_fc1);
+@@ -3400 +3406,2 @@
+-                           QuantParams& quant_params, bool enable_pdl, cudaStream_t stream) {
++                           QuantParams& quant_params, bool enable_pdl, cudaStream_t stream,
++                           int64_t expected_m) {
+@@ -3402,0 +3410,5 @@
++#ifdef FLASHINFER_SM90_MOE_MAX_STAGES_FC2
++  constexpr int max_num_stages_fc2 = FLASHINFER_SM90_MOE_MAX_STAGES_FC2;
++#else
++  constexpr int max_num_stages_fc2 = -1;
++#endif
+@@ -3407 +3419,2 @@
+-                      quant_params.fp8_block_scaling.fc2_scales_ptrs);
++                      quant_params.fp8_block_scaling.fc2_scales_ptrs, expected_m,
++                      max_num_stages_fc2);
+@@ -3451,23 +3464,21 @@
+-void CutlassMoeFCRunner<
+-    T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, Sm90Wfp4Afp8Mode,
+-    Enable>::gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
+-                                 Sm90Wfp4Afp8Mode>& gemm_runner,
+-                   DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input,
+-                   T* const output, void* const intermediate_result,
+-                   int64_t const* const expert_first_token_offset,
+-                   int const* const permuted_token_selected_experts,
+-                   TmaWarpSpecializedGroupedGemmInput const tma_ws_input_template,
+-                   WeightType const* const fc1_expert_weights,
+-                   ScaleBiasType const* const fc1_expert_biases,
+-                   int64_t const* const num_valid_tokens_ptr,
+-                   ScaleBiasType const* const fc1_int_scales, float const* const fc1_fp8_dequant,
+-                   float const* const fc2_fp8_quant, float* const act_fp8_token_scale,
+-                   TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc1_fp4_act_flat,
+-                   TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_flat,
+-                   QuantParams quant_params, int64_t const num_rows,
+-                   int64_t const expanded_num_rows, int64_t const hidden_size,
+-                   int64_t const inter_size, int const num_experts_per_node,
+-                   ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array,
+-                   bool bias_is_broadcast, cudaStream_t stream,
+-                   cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
+-                   int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
++void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
++                        Sm90Wfp4Afp8Mode, Enable>::
++    gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>&
++              gemm_runner,
++          DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input,
++          T* const output, void* const intermediate_result,
++          int64_t const* const expert_first_token_offset,
++          int const* const permuted_token_selected_experts,
++          TmaWarpSpecializedGroupedGemmInput const tma_ws_input_template,
++          WeightType const* const fc1_expert_weights, ScaleBiasType const* const fc1_expert_biases,
++          int64_t const* const num_valid_tokens_ptr, ScaleBiasType const* const fc1_int_scales,
++          float const* const fc1_fp8_dequant, float const* const fc2_fp8_quant,
++          float* const act_fp8_token_scale,
++          TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc1_fp4_act_flat,
++          TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_flat, QuantParams quant_params,
++          int64_t const num_rows, int64_t const expanded_num_rows, int64_t const hidden_size,
++          int64_t const inter_size, int const num_experts_per_node,
++          ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array,
++          bool bias_is_broadcast, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config,
++          bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
++          bool enable_pdl, int64_t expected_m) {
+@@ -3479,2 +3490,2 @@
+-                        num_experts_per_node, fc1_activation_type, quant_params, enable_pdl,
+-                        stream);
++                        num_experts_per_node, fc1_activation_type, quant_params, enable_pdl, stream,
++                        expected_m);
+@@ -3736 +3747,2 @@
+-          int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
++          int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
++          int64_t expected_m) {
+@@ -3748,7 +3760,7 @@
+-    Self::BlockScaleFC2(*fp8_blockscale_gemm_runner, input, gemm_output, final_output,
+-                        expert_first_token_offset, fc2_expert_weights, fc2_expert_biases,
+-                        unpermuted_final_scales, unpermuted_row_to_permuted_row,
+-                        permuted_row_to_unpermuted_row, token_selected_experts,
+-                        num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size,
+-                        unpadded_hidden_size, inter_size, num_experts_per_node, k,
+-                        parallelism_config, enable_alltoall, quant_params, enable_pdl, stream);
++    Self::BlockScaleFC2(
++        *fp8_blockscale_gemm_runner, input, gemm_output, final_output, expert_first_token_offset,
++        fc2_expert_weights, fc2_expert_biases, unpermuted_final_scales,
++        unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row, token_selected_experts,
++        num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, unpadded_hidden_size,
++        inter_size, num_experts_per_node, k, parallelism_config, enable_alltoall, quant_params,
++        enable_pdl, stream, expected_m);
+@@ -4096 +4108,9 @@
+-                    MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream) {
++                    MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
++                    int64_t expected_m) {
++#if (defined(FLASHINFER_SM90_MOE_MAX_STAGES_FC1) && FLASHINFER_SM90_MOE_MAX_STAGES_FC1 != -1) || \
++    (defined(FLASHINFER_SM90_MOE_MAX_STAGES_FC2) && FLASHINFER_SM90_MOE_MAX_STAGES_FC2 != -1)
++  TLLM_CHECK_WITH_INFO(use_deepseek_fp8_block_scale && !min_latency_mode,
++                       "Stage bounds require FP8 block-scaled MoE without min-latency mode");
++#endif
++  TLLM_CHECK_WITH_INFO(expected_m == -1 || (use_deepseek_fp8_block_scale && !min_latency_mode),
++                       "expected_m is supported only by DeepSeek FP8 block-scaled MoE");
+@@ -4435 +4455 @@
+-                nullptr, enable_pdl);
++                nullptr, enable_pdl, expected_m);
+@@ -4448,9 +4468,10 @@
+-    Self::gemm2(
+-        moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, gemm2_result, final_output,
+-        expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,
+-        fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_, quant_params,
+-        token_topk_unpermuted_scales, permuted_token_final_scales_, unpermuted_row_to_permuted_row,
+-        permuted_row_to_unpermuted_row_, token_selected_experts, num_valid_tokens_ptr, num_rows,
+-        expanded_num_rows, hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
+-        experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
+-        parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr, enable_pdl);
++    Self::gemm2(moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, gemm2_result, final_output,
++                expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights,
++                fc2_expert_biases, fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_,
++                quant_params, token_topk_unpermuted_scales, permuted_token_final_scales_,
++                unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row_,
++                token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows,
++                hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
++                experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
++                parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr,
++                enable_pdl, expected_m);
+diff --git a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
+index 8aced03878c5d2058da77d393d7cd20d8bb97798..c1127e1189331a62209ce5afd393290d4876bedd 100644
+--- a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
++++ b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
+@@ -339,0 +340,6 @@
++  /**
++   * @brief Validate tensor inputs, prepare workspace, and execute fused MoE.
++   * @param expected_m Expected tokens per local expert for both DeepSeek FP8 GEMMs;
++   * -1 uses the default estimate. Explicit hints require the OSS runner without
++   * minimum-latency mode and are validated before dispatch.
++   */
+@@ -352 +358,2 @@
+-              Optional<TensorView> workspace_buffer = Optional<TensorView>{}) {
++              Optional<TensorView> workspace_buffer = Optional<TensorView>{},
++              int64_t expected_m = -1) {
+@@ -354,0 +362,5 @@
++
++    TVM_FFI_ICHECK(expected_m == -1 || (expected_m > 0 && expected_m <= UINT32_MAX))
++        << "expected_m must be -1 or a positive uint32 value";
++    TVM_FFI_ICHECK(expected_m == -1 || (mUseDeepSeekFP8BlockScaling && !min_latency_mode))
++        << "expected_m requires DeepSeek FP8 block scaling without min-latency mode";
+@@ -486 +498 @@
+-        min_latency_mode, min_latency_params, enable_pdl, stream);
++        min_latency_mode, min_latency_params, enable_pdl, stream, expected_m);
+@@ -487,0 +500 @@
++    TVM_FFI_ICHECK_EQ(expected_m, -1) << "expected_m requires the OSS CUTLASS MoE runner";
+@@ -780,0 +794 @@
++  /** @brief Return a named MoE execution or profiling entry point for TVM FFI. */
+@@ -841 +855,2 @@
+-                 int64_t base_activation_type, Optional<TensorView> workspace_buffer) {
++                 int64_t base_activation_type, Optional<TensorView> workspace_buffer,
++                 int64_t expected_m) {
+@@ -847 +862,2 @@
+-                   enable_pdl, static_cast<ActivationType>(base_activation_type), workspace_buffer);
++                   enable_pdl, static_cast<ActivationType>(base_activation_type), workspace_buffer,
++                   expected_m);
+diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh b/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh
+index fbdc902972668033d6bd8653d60c875dd51889f7..9177735f0ee0288bb7393570211ba024522a3d0c 100644
+--- a/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh
++++ b/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh
+@@ -268 +268,20 @@
+-    std::filesystem::path path = getCacheDir() / name;
++    // The caller selects a module at initialization, never process-wide state.
++#ifdef FLASHINFER_SM90_GROUPED_MOE_OPTIMIZATIONS
++    // Reserve a conservative shared-memory budget for scheduler metadata.
++    // CUDA permits at most 32 warps per block; round static storage up for alignment.
++    const size_t scheduler_smem =
++        ((static_cast<size_t>(num_groups) * 3 + 1 + 32) * sizeof(uint32_t) + 127) / 128 * 128;
++    const bool prefix_scheduler =
++        swapAB && gemm_type == deep_gemm::GemmType::GroupedWithOffset &&
++        scheduler_smem + get_smem_size(num_stages, shape_k, block_m, block_n, block_k, true) <=
++            232448;
++#else
++    constexpr bool prefix_scheduler = false;
++#endif
++    std::filesystem::path path = getCacheDir();
++    const bool tile_map_scheduler = prefix_scheduler;
++    if (tile_map_scheduler)
++      path /= "tile_map_scheduler";
++    else if (prefix_scheduler)
++      path /= "prefix_scheduler";
++    path /= name;
+@@ -288,0 +308,2 @@
++    if (prefix_scheduler) flags.push_back("-DMOE_MBU_PREFIX_SCHEDULER=1");
++    if (tile_map_scheduler) flags.push_back("-DMOE_MBU_TILE_MAP_SCHEDULER=1");
+diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh b/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh
+index ae03a82216126c5554e49ca491c874484573d325..dbfb06d3c6f1e55d38e8a73a820157af2d206f75 100644
+--- a/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh
++++ b/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh
+@@ -571,0 +572,59 @@
++#ifdef MOE_MBU_PREFIX_SCHEDULER
++  __shared__ uint32_t tile_prefix[kNumGroups + 1];
++  __shared__ uint32_t warp_totals[kNumThreads / 32];
++  if (threadIdx.x == 0) tile_prefix[0] = 0;
++  __syncthreads();
++  // Scan chunks so expert count need not match block or warp size.
++  for (uint32_t base = 0; base < kNumGroups; base += kNumThreads) {
++    const uint32_t group = base + threadIdx.x;
++    uint32_t partial = 0;
++    if (group < kNumGroups) {
++      const auto rows = problem_input.problem_n_offsets[group + 1] -
++                        problem_input.problem_n_offsets[group];
++      partial = ceil_div(rows, static_cast<int64_t>(BLOCK_N));
++    }
++#pragma unroll
++    for (int delta = 1; delta < 32; delta *= 2) {
++      const uint32_t other = __shfl_up_sync(0xffffffff, partial, delta);
++      if (lane_idx >= delta) partial += other;
++    }
++    if (lane_idx == 31) warp_totals[warp_idx] = partial;
++    __syncthreads();
++    if (warp_idx == 0) {
++      uint32_t total = lane_idx < kNumThreads / 32 ? warp_totals[lane_idx] : 0;
++#pragma unroll
++      for (int delta = 1; delta < 32; delta *= 2) {
++        const uint32_t other = __shfl_up_sync(0xffffffff, total, delta);
++        if (lane_idx >= delta) total += other;
++      }
++      if (lane_idx < kNumThreads / 32) warp_totals[lane_idx] = total;
++    }
++    __syncthreads();
++    if (group < kNumGroups) {
++      tile_prefix[group + 1] = tile_prefix[base] + partial +
++                               (warp_idx ? warp_totals[warp_idx - 1] : 0);
++    }
++    __syncthreads();
++  }
++#ifdef MOE_MBU_TILE_MAP_SCHEDULER
++  // Bounded shared lookup; larger inputs keep the prefix binary search.
++  __shared__ uint32_t tile_groups[2 * kNumGroups];
++  const uint32_t mapped_tiles = min(tile_prefix[kNumGroups], 2 * kNumGroups);
++  for (uint32_t tile = threadIdx.x; tile < mapped_tiles; tile += kNumThreads) {
++    uint32_t low = 0;
++    uint32_t high = kNumGroups;
++    while (low < high) {
++      const uint32_t mid = (low + high) / 2;
++      if (tile_prefix[mid + 1] <= tile)
++        low = mid + 1;
++      else
++        high = mid;
++    }
++    tile_groups[tile] = low;
++  }
++  __syncthreads();
++  auto scheduler = SchedulerType(problem_input, tile_prefix, tile_groups);
++#else
++  auto scheduler = SchedulerType(problem_input, tile_prefix);
++#endif
++#else
+@@ -572,0 +632 @@
++#endif
+diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/jit_utils.cuh b/csrc/nv_internal/tensorrt_llm/deep_gemm/jit_utils.cuh
+index 8e26486d4d5596e4ef2b244cec59987c798216c0..2e1a838884bb6dca28d6ac0ed548c854a4d4aa02 100644
+--- a/csrc/nv_internal/tensorrt_llm/deep_gemm/jit_utils.cuh
++++ b/csrc/nv_internal/tensorrt_llm/deep_gemm/jit_utils.cuh
+@@ -66 +66 @@
+-                                bool swap_ab);
++                                bool swap_ab, int max_num_stages);
+@@ -139 +139,2 @@
+-                                       bool is_grouped_contiguous = false, bool swap_ab = false) {
++                                       bool is_grouped_contiguous = false, bool swap_ab = false,
++                                       int max_num_stages = -1) {
+@@ -205,0 +207,3 @@
++    if (max_num_stages > 0 && num_stages > max_num_stages) {
++      continue;
++    }
+diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/scheduler.cuh b/csrc/nv_internal/tensorrt_llm/deep_gemm/scheduler.cuh
+index 15a624af4233f45eb95ad4b0cc39fbf010d4ce1e..c39a7ffca8f3fdd34e92511a5dbb585a501eee57 100644
+--- a/csrc/nv_internal/tensorrt_llm/deep_gemm/scheduler.cuh
++++ b/csrc/nv_internal/tensorrt_llm/deep_gemm/scheduler.cuh
+@@ -451,0 +452,15 @@
++#ifdef MOE_MBU_PREFIX_SCHEDULER
++  uint32_t const* tile_prefix;
++#ifdef MOE_MBU_TILE_MAP_SCHEDULER
++  uint32_t const* tile_groups;
++  __device__ __forceinline__ GroupedWithOffsetSchedulerSwapAB(Input& input, uint32_t const* prefix,
++                                                              uint32_t const* groups)
++      : GroupedWithOffsetSchedulerSwapAB(input, prefix) {
++    tile_groups = groups;
++  }
++#endif
++  __device__ __forceinline__ GroupedWithOffsetSchedulerSwapAB(Input& input, uint32_t const* prefix)
++      : GroupedWithOffsetSchedulerSwapAB(input) {
++    tile_prefix = prefix;
++  }
++#endif
+@@ -490,0 +506,27 @@
++#ifdef MOE_MBU_PREFIX_SCHEDULER
++    const uint32_t global_n_tile = next_block_idx / kNumMBlocks;
++    if (global_n_tile >= tile_prefix[kNumGroups]) return false;
++#ifdef MOE_MBU_TILE_MAP_SCHEDULER
++    if (global_n_tile < 2 * kNumGroups) {
++      curr_group_idx = tile_groups[global_n_tile];
++    } else {
++#endif
++      uint32_t low = curr_group_idx;
++      uint32_t high = kNumGroups;
++      while (low < high) {
++        const uint32_t mid = (low + high) / 2;
++        if (tile_prefix[mid + 1] <= global_n_tile)
++          low = mid + 1;
++        else
++          high = mid;
++      }
++      curr_group_idx = low;
++#ifdef MOE_MBU_TILE_MAP_SCHEDULER
++    }
++#endif
++    curr_cumsum = tile_prefix[curr_group_idx];
++    num_n_blocks = tile_prefix[curr_group_idx + 1] - curr_cumsum;
++    n_offset = __ldg(problem_n_offsets + curr_group_idx);
++    n_boundary = __ldg(problem_n_offsets + curr_group_idx + 1);
++    n_padded_4_offset = compute_padded_offset(n_offset, curr_group_idx);
++#else
+@@ -506,0 +549,2 @@
++
++#endif
+diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
+index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..426e570591ebc749e5350192757c1026563d2586 100644
+--- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
++++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
+@@ -20,0 +21,2 @@
++#include <limits>
++
+@@ -93,0 +96,7 @@
++/**
++ * @brief Run grouped FP8 expert GEMMs using the configured workspace.
++ * @param expected_m Positive uint32 token estimate for DeepGEMM configuration
++ * selection, or -1 to use the stored estimate. Explicit hints require DeepGEMM
++ * and apply only to this invocation, preserving workspace capacity and runner state.
++ * @param max_num_stages Pipeline stage upper bound, or -1 for upstream selection.
++ */
+@@ -98,2 +107,13 @@
+-    float const* scales_b) {
+-#ifdef ENABLE_FP8_BLOCK_SCALE
++    float const* scales_b, int64_t expected_m, int max_num_stages) {
++#ifdef ENABLE_FP8_BLOCK_SCALE
++  TLLM_CHECK_WITH_INFO(
++      expected_m == -1 || (expected_m > 0 && expected_m <= std::numeric_limits<uint32_t>::max()),
++      "expected_m must be -1 or a positive uint32 value");
++  TLLM_CHECK_WITH_INFO(expected_m == -1 || getDeepGemmEnabled(),
++                       "expected_m requires the DeepGEMM backend");
++  TLLM_CHECK_WITH_INFO(max_num_stages == -1 || max_num_stages >= 4,
++                       "max_num_stages must be -1 or at least four");
++  TLLM_CHECK_WITH_INFO(max_num_stages == -1 || getDeepGemmEnabled(),
++                       "max_num_stages requires the DeepGEMM backend");
++  // A per-call scheduling hint must not change the runner's legacy load estimate.
++  int64_t const effective_m = expected_m == -1 ? expected_m_ : expected_m;
+@@ -140 +160 @@
+-                         problem_m_offsets, num_problems, expected_m_, max_shape_m_4_align_,
++                         problem_m_offsets, num_problems, effective_m, max_shape_m_4_align_,
+@@ -142 +162 @@
+-                         internal_quantize_a, internal_quantize_b);
++                         internal_quantize_a, internal_quantize_b, max_num_stages);
+@@ -148,2 +168,2 @@
+-                         expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
+-                         shape_k, stream, internal_quantize_a, internal_quantize_b);
++                         effective_m, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
++                         shape_k, stream, internal_quantize_a, internal_quantize_b, max_num_stages);
+@@ -155,2 +175,2 @@
+-                         expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
+-                         shape_k, stream, internal_quantize_a, internal_quantize_b);
++                         effective_m, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
++                         shape_k, stream, internal_quantize_a, internal_quantize_b, max_num_stages);
+diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h
+index 040a1463b919b4297d8c17b9df0fcaf3026ffb75..9b9a0d3045216214c7a502ac6367922ae825c1d3 100644
+--- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h
++++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h
+@@ -40,0 +41,6 @@
++  /**
++   * @brief Execute grouped FP8 GEMMs with rows partitioned by problem_m_offsets.
++   * @param expected_m Expected tokens per expert for DeepGEMM configuration
++   * selection in this call, or -1 to use the runner's stored estimate.
++   * @param max_num_stages Pipeline stage upper bound, or -1 for upstream selection.
++   */
+@@ -44 +50,2 @@
+-                       float const* scales_b = nullptr) = 0;
++                       float const* scales_b = nullptr, int64_t expected_m = -1,
++                       int max_num_stages = -1) = 0;
+@@ -90,0 +98,6 @@
++  /**
++   * @brief Run grouped FP8 expert GEMMs with optional input quantization.
++   * @param expected_m Per-call DeepGEMM token estimate, or -1 for the stored
++   * estimate. Explicit hints must be positive uint32 values and require DeepGEMM.
++   * @param max_num_stages Pipeline stage upper bound, or -1 for upstream selection.
++   */
+@@ -93 +106,2 @@
+-               float const* scales_a = nullptr, float const* scales_b = nullptr) override;
++               float const* scales_a = nullptr, float const* scales_b = nullptr,
++               int64_t expected_m = -1, int max_num_stages = -1) override;
+diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
+index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..af21a026679fba9e93790c4aa17ed54ed6cffcad 100644
+--- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
++++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
+@@ -1465 +1465,2 @@
+-                           cudaStream_t stream, int num_device_sms = kNumDeviceSMs) {
++                           cudaStream_t stream, int max_num_stages,
++                           int num_device_sms = kNumDeviceSMs) {
+@@ -1476 +1477 @@
+-                                             num_device_sms);
++                                             num_device_sms, false, false, max_num_stages);
+@@ -1490 +1491 @@
+-                                             num_device_sms, false, true);
++                                             num_device_sms, false, true, max_num_stages);
+@@ -1509 +1510 @@
+-                          bool internal_quantize_a = true, bool internal_quantize_b = true) {
++                          bool internal_quantize_a, bool internal_quantize_b, int max_num_stages) {
+@@ -1553 +1554 @@
+-                          stream);
++                          stream, max_num_stages);
+diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
+index 19e4b314358c94482e2beac17b56e4c80a604e19..caecc791181a1ac539505ea157e50dad22f694ad 100644
+--- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
++++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
+@@ -476,0 +477,5 @@
++  /**
++   * @brief Execute the routed expert layers and combine their outputs.
++   * @param expected_m Per-call token estimate for both DeepSeek FP8 block-scale
++   * GEMMs, or -1 for the default estimate. Explicit hints exclude minimum-latency mode.
++   */
+@@ -489,2 +494,2 @@
+-                      MoeMinLatencyParams& min_latency_params, bool enable_pdl,
+-                      cudaStream_t stream) = 0;
++                      MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
++                      int64_t expected_m = -1) = 0;
+@@ -703,0 +709,5 @@
++  /**
++   * @brief Permute tokens, run both expert GEMMs, and finalize the MoE output.
++   * @param expected_m DeepSeek FP8 token estimate forwarded to both GEMMs for
++   * this call, or -1 to retain their default configuration-selection policy.
++   */
+@@ -715,2 +725,2 @@
+-              MoeMinLatencyParams& min_latency_params, bool enable_pdl,
+-              cudaStream_t stream) override;
++              MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
++              int64_t expected_m = -1) override;
+@@ -719,27 +729,36 @@
+-  static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
+-                                  Sm90Wfp4Afp8Mode>& gemm_runner,
+-                    // This argument must not be null if fp8 block scaling is being used.
+-                    // The gemm_runner will be ignored in that case. NOTE: it would
+-                    // be great if we could consolidate gemm_runner and fp8_blockscale_gemm_runner.
+-                    // For now, they don't share the same interface, so we just use two separate
+-                    // arguments.
+-                    DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input,
+-                    T* const output, void* const intermediate_result,
+-                    int64_t const* const expert_first_token_offset,
+-                    int const* const permuted_token_selected_experts,
+-                    TmaWarpSpecializedGroupedGemmInput const tma_ws_input_template,
+-                    WeightType const* const fc1_expert_weights,
+-                    ScaleBiasType const* const fc1_expert_biases,
+-                    int64_t const* const num_valid_tokens_ptr,
+-                    ScaleBiasType const* const fc1_int_scales, float const* const fc1_fp8_dequant,
+-                    float const* const fc2_fp8_quant, float* const act_fp8_token_scale,
+-                    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc1_fp4_act_flat,
+-                    TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_flat,
+-                    QuantParams quant_params, int64_t const num_rows,
+-                    int64_t const expanded_num_rows, int64_t const hidden_size,
+-                    int64_t const inter_size, int const num_experts_per_node,
+-                    ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array,
+-                    bool bias_is_broadcast, cudaStream_t stream,
+-                    cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
+-                    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl);
+-
++  /**
++   * @brief Dispatch the first expert GEMM and its activation processing.
++   * @param expected_m Per-call token estimate for the FP8 block-scale runner;
++   * -1 uses its default estimate. Other GEMM paths do not consume this hint.
++   */
++  static void gemm1(
++      MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>&
++          gemm_runner,
++      // This argument must not be null if fp8 block scaling is being used.
++      // The gemm_runner will be ignored in that case. NOTE: it would
++      // be great if we could consolidate gemm_runner and fp8_blockscale_gemm_runner.
++      // For now, they don't share the same interface, so we just use two separate
++      // arguments.
++      DeepSeekBlockScaleGemmRunner* fp8_blockscale_gemm_runner, T const* const input,
++      T* const output, void* const intermediate_result,
++      int64_t const* const expert_first_token_offset,
++      int const* const permuted_token_selected_experts,
++      TmaWarpSpecializedGroupedGemmInput const tma_ws_input_template,
++      WeightType const* const fc1_expert_weights, ScaleBiasType const* const fc1_expert_biases,
++      int64_t const* const num_valid_tokens_ptr, ScaleBiasType const* const fc1_int_scales,
++      float const* const fc1_fp8_dequant, float const* const fc2_fp8_quant,
++      float* const act_fp8_token_scale,
++      TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc1_fp4_act_flat,
++      TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_flat, QuantParams quant_params,
++      int64_t const num_rows, int64_t const expanded_num_rows, int64_t const hidden_size,
++      int64_t const inter_size, int const num_experts_per_node,
++      ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array,
++      bool bias_is_broadcast, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config,
++      bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
++      bool enable_pdl, int64_t expected_m = -1);
++
++  /**
++   * @brief Dispatch the second expert GEMM and combine routed token outputs.
++   * @param expected_m Per-call token estimate for the FP8 block-scale runner;
++   * -1 uses its default estimate. Other GEMM paths do not consume this hint.
++   */
+@@ -766 +785 @@
+-      bool enable_pdl);
++      bool enable_pdl, int64_t expected_m = -1);
+@@ -986,0 +1006,5 @@
++  /**
++   * @brief Run the first FP8 block-scale expert GEMM and apply its activation.
++   * @param expected_m Token estimate forwarded to DeepGEMM for this call, or -1
++   * for the runner's default estimate. The workspace must already be configured.
++   */
+@@ -996,2 +1020,7 @@
+-                            bool enable_pdl, cudaStream_t stream);
+-
++                            bool enable_pdl, cudaStream_t stream, int64_t expected_m = -1);
++
++  /**
++   * @brief Run the second FP8 block-scale expert GEMM and finalize token outputs.
++   * @param expected_m Token estimate forwarded to DeepGEMM for this call, or -1
++   * for the runner's default estimate. The workspace must already be configured.
++   */
+@@ -1009 +1038,2 @@
+-      bool const enable_alltoall, QuantParams& quant_params, bool enable_pdl, cudaStream_t stream);
++      bool const enable_alltoall, QuantParams& quant_params, bool enable_pdl, cudaStream_t stream,
++      int64_t expected_m = -1);
+diff --git a/flashinfer/fused_moe/core.py b/flashinfer/fused_moe/core.py
+index 68a9c34e8971c153c8c4961789c8047b1b1f76e0..7ed91f8bb31fd237e753228c4156413855e03326 100644
+--- a/flashinfer/fused_moe/core.py
++++ b/flashinfer/fused_moe/core.py
+@@ -647,0 +648,23 @@
++def _validate_cutlass_moe_expected_m(
++    expected_m: Optional[int],
++    *,
++    use_deepseek_fp8_block_scale: bool,
++    min_latency_mode: bool,
++    backend: str,
++) -> None:
++    """Validate the optional per-call token estimate and supported MoE modes.
++
++    Raise ValueError unless a supplied hint is a positive uint32 integer, and
++    NotImplementedError unless CUTLASS DeepSeek FP8 block scaling is selected
++    without minimum-latency mode. None retains the default estimate.
++    """
++    if expected_m is None:
++        return
++    if type(expected_m) is not int or not 0 < expected_m <= 2**32 - 1:
++        raise ValueError("expected_m must be a positive integer fitting in uint32")
++    if backend != "cutlass" or not use_deepseek_fp8_block_scale or min_latency_mode:
++        raise NotImplementedError(
++            "expected_m requires the CUTLASS DeepSeek FP8 block-scale MoE backend"
++        )
++
++
+@@ -649 +672,9 @@
+-def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
++def get_cutlass_fused_moe_module(
++    backend: str = "100",
++    use_fast_build: bool = False,
++    *,
++    enable_sm90_moe_optimizations: bool = False,
++):
++    """Build and cache CUTLASS MoE operations and their workspace-size query."""
++    if enable_sm90_moe_optimizations and backend != "90":
++        raise ValueError("SM90 MoE optimizations require the SM90 backend")
+@@ -657 +688,4 @@
+-        module = gen_cutlass_fused_moe_sm90_module(use_fast_build).build_and_load()
++        module = gen_cutlass_fused_moe_sm90_module(
++            use_fast_build,
++            enable_sm90_moe_optimizations=enable_sm90_moe_optimizations,
++        ).build_and_load()
+@@ -800 +834 @@
+-            )
++            ) + (("sm90_grouped_optimized",) if enable_sm90_moe_optimizations else ())
+@@ -981,0 +1016,4 @@
++    op_name = "flashinfer::cutlass_fused_moe"
++    if enable_sm90_moe_optimizations:
++        op_name += "_sm90_grouped_optimized"
++
+@@ -983 +1021 @@
+-        "flashinfer::cutlass_fused_moe",
++        op_name,
+@@ -1023,0 +1062 @@
++        expected_m: Optional[int] = None,
+@@ -1024,0 +1064,12 @@
++        """Execute CUTLASS MoE with the selected tactics and workspace.
++
++        Forward expected_m to both DeepSeek FP8 block-scale expert GEMMs for
++        this call. None uses the native runner's default estimate.
++        """
++        if expected_m is not None:
++            _validate_cutlass_moe_expected_m(
++                expected_m,
++                use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
++                min_latency_mode=min_latency_mode,
++                backend="cutlass",
++            )
+@@ -1151,0 +1203,5 @@
++            *(
++                []
++                if min_latency_mode
++                else [expected_m if expected_m is not None else -1]
++            ),
+@@ -1165 +1221 @@
+-    @register_fake_op("flashinfer::cutlass_fused_moe")
++    @register_fake_op(op_name)
+@@ -1203,0 +1260 @@
++        expected_m: Optional[int] = None,
+@@ -1204,0 +1262,5 @@
++        """Infer output tensors for fake execution of the CUTLASS MoE operation.
++
++        Minimum-latency mode also returns expert-routing metadata. The
++        expected_m scheduling hint does not affect output shapes or dtypes.
++        """
+@@ -1336,0 +1399,2 @@
++    expected_m: Optional[int] = None,
++    enable_sm90_moe_optimizations: bool = False,
+@@ -1522,0 +1587,18 @@
++    expected_m : Optional[int]
++        Expected number of tokens per local expert for DeepGEMM configuration selection.
++        Supported only by CUTLASS DeepSeek FP8 block-scale MoE on SM90 with DeepGEMM
++        enabled. ``None`` preserves the existing estimate. A positive integer fitting
++        in uint32 applies to both expert GEMMs in this call only; it does not change
++        routing, workspace capacity, or the runner's stored estimate. Choose a hint
++        based on the local routing distribution; an underestimate can reduce performance
++        for skewed routing. Set it before CUDA graph capture; replay retains the
++        captured configuration.
++
++    enable_sm90_moe_optimizations : bool
++        Select an isolated SM90 DeepSeek FP8 block-scale module with tile-to-expert
++        lookup for supported SwapAB grouped GEMMs.
++        This does not set ``expected_m``. The default module keeps the original
++        scheduling and ignores the former ``MOE_MBU_*`` environment switches.
++        Choose this option before warmup and CUDA graph capture. Modules, native
++        kernel caches and tuning keys are separate for the two configurations.
++
+@@ -1542,0 +1625,15 @@
++    if type(enable_sm90_moe_optimizations) is not bool:
++        raise TypeError("enable_sm90_moe_optimizations must be a bool")
++    if enable_sm90_moe_optimizations and (
++        backend != "cutlass" or not use_deepseek_fp8_block_scale or min_latency_mode
++    ):
++        raise ValueError(
++            "SM90 MoE optimizations require CUTLASS DeepSeek FP8 block-scale MoE"
++        )
++    if expected_m is not None:
++        _validate_cutlass_moe_expected_m(
++            expected_m,
++            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
++            min_latency_mode=min_latency_mode,
++            backend=backend,
++        )
+@@ -1634 +1731,7 @@
+-        return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
++        if enable_sm90_moe_optimizations:
++            module = get_cutlass_fused_moe_module(
++                device_arch, enable_sm90_moe_optimizations=True
++            )
++        else:
++            module = get_cutlass_fused_moe_module(device_arch)
++        return module.cutlass_fused_moe(
+@@ -1671,0 +1775 @@
++            expected_m=expected_m,

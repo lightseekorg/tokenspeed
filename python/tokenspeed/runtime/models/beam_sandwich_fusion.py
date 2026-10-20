@@ -79,6 +79,8 @@ def beam_sandwich_fusion_refusal(model: Any) -> str:
     """
     if not global_server_args_dict.get("enable_allreduce_fusion", False):
         return "--enable-allreduce-fusion is off"
+    if not current_platform().is_nvidia:
+        return "sandwich boundary fusion requires NVIDIA kernels"
     mapping = model.mapping
     attn = mapping.attn
     if attn.tp_size <= 1:

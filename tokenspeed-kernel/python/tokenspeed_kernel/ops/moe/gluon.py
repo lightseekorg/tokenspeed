@@ -42,6 +42,130 @@ from tokenspeed_kernel.signature import (
 
 platform = current_platform()
 
+GLUON_FP8_CHANNEL_APPLY = "gluon_fp8_channel_bf16_precomputed_moe_apply"
+
+
+@register_kernel(
+    "moe",
+    "apply",
+    name=GLUON_FP8_CHANNEL_APPLY,
+    solution="gluon",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    traits={
+        "weight_dtype": frozenset({"fp8_channel"}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "swiglu_form": frozenset({"standard"}),
+        "activation_clamped": frozenset({False}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({False}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ep_size": frozenset({1}),
+        "ispp": frozenset({320, 640}),
+        "hidden": frozenset({5120}),
+        "num_experts": frozenset({256}),
+        "top_k": frozenset({8}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "supports_bias": frozenset({False}),
+        "expert_id_repeats": frozenset({False}),
+    },
+    priority=Priority.SPECIALIZED,
+)
+def gluon_fp8_channel_bf16_precomputed_moe_apply(
+    plan: dict,
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    num_tokens_global: int | None = None,
+    max_num_tokens_per_gpu: int | None = None,
+    do_finalize: bool = True,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """TP4/TP8 EP1 experts: FP8 storage, BF16 MFMA, FP32 accumulation.
+
+    Accepts only the default precision policy.
+    Uses pre-existing grouped Gluon stages, not native-FP8 projection kernels.
+    The resident codes/scales and unweighted-BF16-before-FP32-combine boundary
+    match the channel expert contract; FP32 accumulation order can differ from
+    native FP8.
+    """
+    if plan.get("precision_policy", "default") != "default":
+        raise ValueError(
+            "Gluon BF16-compute channel experts require default precision_policy"
+        )
+    if enable_pdl:
+        raise ValueError("Gluon channel experts do not support enable_pdl=True")
+    if (
+        plan.get("combine_order", "rank") != "rank"
+        or plan.get("output_scale", 1.0) != 1.0
+        or getattr(w, "ep_size", 1) != 1
+        or getattr(w, "ep_rank", 0) != 0
+    ):
+        raise ValueError(
+            "Gluon channel experts require EP1 rank-local output and unit output scale"
+        )
+    intermediate = w.w2_weight.shape[-1]
+    if (
+        x.ndim != 2
+        or x.shape[1] != 5120
+        or intermediate not in (320, 640)
+        or w.w13_weight.shape != (256, 2 * intermediate, 5120)
+        or w.w2_weight.shape != (256, 5120, intermediate)
+        or topk_ids is None
+        or topk_ids.shape != (x.shape[0], 8)
+    ):
+        raise ValueError("Gluon channel experts require E256 H5120 I320/I640 top8")
+    from tokenspeed_kernel.ops.moe._triton.common import _combine
+    from tokenspeed_kernel.ops.moe._triton.fp8_channel import _validate_fp8_channel_moe
+    from tokenspeed_kernel.ops.moe._triton.fp8_channel_fused import _quantize_routes
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.exact_mfma import (
+        prepare_gluon_fp8_channel_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.stage2_kernel import (
+        launch_gluon_fp8_channel_stage2_gfx950,
+    )
+
+    _validate_fp8_channel_moe(plan, x, w, topk_weights, topk_ids, do_finalize)
+    if x.shape[0] == 0:
+        return torch.empty_like(x)
+    codes, scales = quantize_fp8(
+        x, granularity="token", scale_encoding="float32", enable_pdl=False
+    )
+    activated, routing, block_m = prepare_gluon_fp8_channel_gfx950(
+        codes,
+        scales,
+        w.w13_weight,
+        w.w13_weight_scale,
+        topk_ids,
+        topk_weights,
+    )
+    route_codes, route_scales = _quantize_routes(activated)
+    partials = torch.zeros((x.shape[0], 8, 5120), dtype=torch.bfloat16, device=x.device)
+    sorted_ids, sorted_experts, sorted_weights, num_valid = routing
+    launch_gluon_fp8_channel_stage2_gfx950(
+        route_codes,
+        w.w2_weight,
+        route_scales.view(-1, 1),
+        w.w2_weight_scale,
+        sorted_ids,
+        sorted_experts,
+        sorted_weights,
+        num_valid,
+        partials,
+        block_m=block_m,
+    )
+    output = torch.empty_like(x)
+    _combine(partials.view(-1, 5120), topk_weights, output)
+    return output
+
 
 # ===-----------------------------------------------------------------------===#
 # Routing: softmax top-k (AMD gfx950)

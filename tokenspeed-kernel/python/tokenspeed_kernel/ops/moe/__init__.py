@@ -58,7 +58,42 @@ __all__ = [
     "prepare_nvfp4_routing",
     "routed_input_scale_rmsnorm_sum",
     "routed_input_scale_rmsnorm_sum_gathered",
+    "prepare_sm90_fp8_moe",
 ]
+
+
+def prepare_sm90_fp8_moe(
+    *,
+    mode: Literal["default", "expected_m", "optimized"],
+    max_num_stages_fc1: int = -1,
+    max_num_stages_fc2: int = -1,
+) -> Callable:
+    """Prepare an explicit FlashInfer block-FP8 MoE implementation at init.
+
+    Args:
+        mode: ``default`` binds the installed FlashInfer implementation.
+            ``expected_m`` binds the SM90 per-call load-hint backport.
+            ``optimized`` adds tile-prefix and direct tile-to-expert lookup.
+        max_num_stages_fc1: Optional FC1 grouped GEMM pipeline stage limit. ``-1`` keeps
+            upstream selection; a positive integer of at least four caps the
+            supported FC1 candidates. Requires a private mode.
+        max_num_stages_fc2: Independent FC2 pipeline stage limit, with the
+            same semantics and default as ``max_num_stages_fc1``.
+
+    Returns:
+        A callable accepting FlashInfer's ``cutlass_fused_moe`` arguments and
+        returning its output list. Private modes additionally accept a positive
+        uint32 ``expected_m`` or None. Callers compute that hint from their own
+        routing layout. Initialize before warmup and CUDA graph capture;
+        private modes require FlashInfer 0.7.2, Hopper, and a working JIT compiler.
+    """
+    from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_fused_moe
+
+    return make_cutlass_fused_moe(
+        mode=mode,
+        max_num_stages_fc1=max_num_stages_fc1,
+        max_num_stages_fc2=max_num_stages_fc2,
+    )
 
 
 # ===-----------------------------------------------------------------------===#
@@ -1241,6 +1276,8 @@ def _build_traits(
     ep_size: int | None,
     ispp: int | None,
     hidden: int | None,
+    num_experts: int | None,
+    top_k: int | None,
     swiglu_form: str | None,
     activation_clamped: bool,
     expert_id_repeats: bool,
@@ -1253,6 +1290,9 @@ def _build_traits(
         internal_activation_dtype = "input"
 
     traits: dict[str, Any] = {"weight_dtype": weight_dtype}
+    # Unknown counts must not admit a kernel restricted to particular counts.
+    traits["num_experts"] = num_experts
+    traits["top_k"] = top_k
     # Seller-declared: excludes only kernels declaring another order; the
     # post-selection check turns a silent kernel down for "slot".
     traits["combine_order"] = combine_order
@@ -1354,6 +1394,8 @@ def moe_plan(
     swiglu_form: str | None,
     activation_clamped: bool,
     expert_id_repeats: bool,
+    num_experts: int | None = None,
+    top_k: int | None = None,
     fp8_scale_block_shape: tuple[int, int] | None = None,
     internal_activation_dtype: str | None = None,
     with_bias: bool = False,
@@ -1403,6 +1445,10 @@ def moe_plan(
             expert id more than once for one token (zero-expert placeholders).
             Kernels whose permutation needs distinct ids per token declare
             ``expert_id_repeats={False}``. Required keyword.
+        num_experts: Global expert count. None means unknown and excludes
+            kernels restricted to a particular expert count.
+        top_k: Number of selected experts per token. None means unknown and
+            excludes kernels restricted to a particular route count.
         fp8_scale_block_shape: Optional FP8 block-scale shape requirement.
         internal_activation_dtype: Optional internal activation dtype requirement.
             "input" is a special value that uses the whatever dtype the input
@@ -1476,6 +1522,8 @@ def moe_plan(
         ep_size=ep_size,
         ispp=ispp,
         hidden=hidden,
+        num_experts=num_experts,
+        top_k=top_k,
         swiglu_form=swiglu_form,
         activation_clamped=activation_clamped,
         expert_id_repeats=expert_id_repeats,

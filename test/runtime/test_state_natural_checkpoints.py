@@ -82,15 +82,14 @@ def _state_row(batch) -> list[int]:
 @pytest.mark.parametrize(
     "token_budget, lengths", [(1024, [868]), (768, [768, 100]), (300, [300, 300, 268])]
 )
-def test_chunks_preserve_the_budget_and_reusable_state_boundary(
+def test_chunks_follow_the_budget_alone(
     disable_prefix_cache: bool,
     with_state: bool,
     token_budget: int,
     lengths: list[int],
 ) -> None:
-    """Only cached, chunked State prompts add a boundary before the replay tail."""
-    if with_state and not disable_prefix_cache and token_budget == 300:
-        lengths = [300, 300, 168, 100]
+    """A state group does not shape the prefill chunk: chunks end where the
+    token budget says, on a page boundary or not, and decode follows."""
     scheduler = _scheduler(
         token_budget=token_budget,
         with_state=with_state,
@@ -149,8 +148,7 @@ def test_state_rows_rotate_between_chunks_and_into_the_first_decode(
     scheduler.submit_requests([request])
 
     rows = []
-    boundaries = (300, 600, 700) if disable_prefix_cache else (300, 600, 640, 700)
-    for computed in boundaries:
+    for computed in (300, 600, 700):
         plan = scheduler.next_execution_plan()
         (batch,) = [op for op in plan.forward if op.request_ids]
         rows.append(_state_row(batch))
@@ -162,20 +160,18 @@ def test_state_rows_rotate_between_chunks_and_into_the_first_decode(
         event = ts.ExecutionEvent()
         event.add_event(result)
         scheduler.advance(event)
-    first = rows[0]
+    first, second, third = rows
     assert first[0] > 0 and first[1] > 0 and first[0] != first[1]
-    for previous, current in zip(rows, rows[1:]):
-        assert current[0] == previous[1] and current[1] > 0
-        assert current[1] != current[0]
-    final = rows[-1]
+    assert second[0] == first[1] and second[1] > 0 and second[1] != second[0]
+    assert third[0] == second[1] and third[1] > 0 and third[1] != third[0]
 
     plan = scheduler.next_execution_plan()
     (decode,) = [op for op in plan.forward if op.request_ids]
     decode_row = _state_row(decode)
     if disable_prefix_cache:
-        assert decode_row == [0, final[1]]
+        assert decode_row == [0, third[1]]
     else:
-        assert decode_row[0] == final[1] and decode_row[1] > 0
+        assert decode_row[0] == third[1] and decode_row[1] > 0
         assert decode_row[1] != decode_row[0]
     # A state block is never copied; the prompt-end copy-in is the KV page's.
     assert plan.pages_to_copy_arrays()["state"].shape == (0, 2)

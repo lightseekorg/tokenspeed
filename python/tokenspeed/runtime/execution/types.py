@@ -45,6 +45,7 @@ class DpForwardMetadata:
 
     global_num_tokens: list[int]
     global_batch_size: list[int]
+    global_num_decodes: list[int]
     global_forward_mode: list[int]
     all_decode_or_idle: bool
     all_extend: bool

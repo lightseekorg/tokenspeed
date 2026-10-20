@@ -127,6 +127,7 @@ def test_fused_selected_attention_matches_gather_softmax(heads, with_global):
         None,
         None,
         None,
+        lse=None,
     )
     torch.testing.assert_close(out, expected, rtol=0.008, atol=0.004)
     assert torch.count_nonzero(out[[1, 4]]).item() == 0
@@ -235,6 +236,7 @@ def test_fused_selected_attention_decode_shapes(tokens, real_heads, heads, with_
         None,
         None,
         None,
+        lse=None,
     )
     if with_rope:
         positions = torch.arange(tokens, dtype=torch.int64, device=device) - 1

@@ -1,8 +1,26 @@
 # Copyright (c) 2026 LightSeek Foundation
-# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 """Ascend DSA gives each verify candidate its own causal DCP metadata."""
 
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +36,70 @@ from tokenspeed.runtime.layers.attention.dcp.placement import (
     resolve_cache_slots,
 )
 from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
+
+
+@pytest.fixture(autouse=True)
+def cpu_metadata_operator(monkeypatch):
+    # This suite exercises backend lifecycle without NPU buffers. Actual native
+    # integer math and changing-input Graph replay are tested on hardware.
+    def reference(table, lengths, **k):
+        from tokenspeed.runtime.layers.attention.dcp.metadata import (
+            CompactDCPLayout,
+            refresh_dcp_page_table_metadata,
+        )
+
+        width = k["query_width"]
+        if width > 1:
+            offsets = torch.arange(1 - width, 1, dtype=lengths.dtype)
+            lengths = (lengths[:, None] + offsets).clamp_min(1).reshape(-1)
+            table = table.repeat_interleave(width, 0)
+        visible = torch.stack(
+            (
+                lengths.clamp_max(k["initial_tokens"]),
+                (lengths - k["window_tokens"]).clamp_min(0),
+                lengths,
+            ),
+            1,
+        )
+        meta = refresh_dcp_page_table_metadata(
+            page_table=table,
+            virtual_block_count=k["virtual_block_count"],
+            degree=k["degree"],
+            rank=k["rank"],
+            layout=CompactDCPLayout(
+                seq_lens=lengths,
+                page_size=k["page_size"],
+                block_granularity=k["block_granularity"],
+                visible_lens=visible,
+            ),
+            previous=None,
+        )
+        k["out"].copy_(meta.local_page_table)
+        k["local_lengths"].copy_(meta.local_seq_lens)
+        k["initial_counts"].copy_(meta.local_visible_lens[:, 0])
+        k["window_counts"].copy_(
+            meta.local_visible_lens[:, 2] - meta.local_visible_lens[:, 1]
+        )
+        k["query_ends"].copy_(torch.arange(1, lengths.numel() + 1, dtype=torch.int32))
+        last = slice(k["query_group_size"] - 1, None, k["query_group_size"])
+        for output, source in (
+            ("index_table", "out"),
+            ("index_lengths", "local_lengths"),
+            ("index_initial_counts", "initial_counts"),
+            ("index_query_ends", "query_ends"),
+        ):
+            k[output].copy_(k[source][last])
+        if k["slots"] is not None:
+            placement = CachePlacement(
+                k["block_granularity"],
+                k["virtual_block_count"],
+                tuple(range(k["degree"])),
+                k["rank"],
+            )
+            local, owned = resolve_cache_slots(k["slots"], placement)
+            k["local_slots"].copy_(torch.where(owned, local, -1))
+
+    monkeypatch.setattr(ascend_dsa, "ascend_dsa_cp_metadata", reference)
 
 
 def test_ascend_backend_reuses_the_common_dsa_base():
@@ -40,8 +122,20 @@ def test_ascend_mla_prologue_supports_native_prefill_and_decode():
     assert spec.traits["store"] == frozenset({True})
 
 
-@pytest.mark.parametrize("degree,rank", [(1, 0), (8, 3)])
-def test_ascend_dsa_consumes_host_kvp_topology(monkeypatch, degree, rank):
+@pytest.mark.parametrize(
+    "degree,rank,missing",
+    [
+        (1, 0, None),
+        (1, 0, "npu_dcp_merge_topk"),
+        (2, 0, None),
+        (4, 0, None),
+        (8, 3, None),
+        (8, 3, "npu_dcp_merge_topk"),
+        (8, 3, "npu_dsa_merge_lse_direct"),
+        (16, 0, None),
+    ],
+)
+def test_ascend_dsa_consumes_host_kvp_topology(monkeypatch, degree, rank, missing):
     # Mock device initialization, but keep the NPU constructor and its topology
     # checks. The config deliberately has no legacy dcp_* attributes.
     def initialize_base(self, config, spec, *, kernel_page_size):
@@ -50,12 +144,15 @@ def test_ascend_dsa_consumes_host_kvp_topology(monkeypatch, degree, rank):
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
 
     monkeypatch.setattr(DSABackend, "__init__", initialize_base)
-    monkeypatch.setattr(ascend_dsa, "new_device_stream", lambda: None)
-    monkeypatch.setattr(ascend_dsa, "StreamFork", lambda stream: None)
+
+    def require_fused(*, rank_size, num_heads):
+        if missing is not None:
+            raise RuntimeError(f"Ascend DSA CP requires fused operators: {missing}")
+
     monkeypatch.setattr(
         ascend_dsa,
         "ascend_dsa_kernels",
-        lambda: SimpleNamespace(require_context_parallel=lambda: None),
+        lambda: SimpleNamespace(require_fused_context_parallel=require_fused),
     )
     config = SimpleNamespace(
         kv_cache_dtype=torch.bfloat16,
@@ -71,6 +168,10 @@ def test_ascend_dsa_consumes_host_kvp_topology(monkeypatch, degree, rank):
         attn_tp_size=degree,
         num_attention_heads=2 * degree,
     )
+    if degree > 1 and missing is not None:
+        with pytest.raises(RuntimeError, match=missing):
+            ascend_dsa.AscendDSABackend(config, spec, kernel_page_size=128)
+        return
     backend = ascend_dsa.AscendDSABackend(config, spec, kernel_page_size=128)
     assert (backend._dcp.degree, backend._dcp.rank, backend._dcp.ranks) == (
         degree,
@@ -83,35 +184,37 @@ def test_ascend_dsa_consumes_host_kvp_topology(monkeypatch, degree, rank):
             ascend_dsa.AscendDSABackend(config, spec, kernel_page_size=128)
 
 
-def test_ascend_write_translation_is_shared_and_refreshed(monkeypatch):
-    placement = ascend_dsa._AscendCachePlacement(128, 17, tuple(range(8)), 1)
-    slots = torch.tensor([128, 256, 0, 257], dtype=torch.int64)
-    calls = []
-    resolve = ascend_dsa.resolve_cache_slots
-
-    def counted(locations, geometry):
-        calls.append(locations)
-        return resolve(locations, geometry)
-
-    monkeypatch.setattr(ascend_dsa, "resolve_cache_slots", counted)
-    first = ascend_dsa.ascend_cache_write_slots(slots, placement)
-    for _ in range(12):
-        assert ascend_dsa.ascend_cache_write_slots(slots[:], placement) is first
-    assert len(calls) == 1
-    assert first.tolist() == [-1, 128, -1, 129]
-    # A new round can mutate the same persistent source address.
-    backend = SimpleNamespace(
-        _ascend_placement=placement,
-        _dcp=SimpleNamespace(clear_forward_metadata=lambda: None),
+def test_dsa_slots_share_the_metadata_refresh():
+    dcp = ascend_dsa._AscendDSAContextParallel(
+        degree=8,
+        rank=1,
+        ranks=tuple(range(8)),
+        virtual_block_count=17,
     )
-    ascend_dsa.AscendDSABackend._clear_forward_scratch(backend)
+    slots = torch.tensor([128, 256, 0, 257], dtype=torch.int64)
+    lengths = torch.tensor([260], dtype=torch.int32)
+    table = torch.tensor([[1, 2, 3]], dtype=torch.int32)
+
+    def prepare():
+        dcp.prepare_metadata(
+            seq_lens=lengths,
+            page_table=table,
+            page_size=128,
+            block_granularity=128,
+            init_tokens=0,
+            local_tokens=0,
+            query_width=1,
+            query_group_size=1,
+            slots=slots,
+        )
+        return dcp.write_slots
+
+    first = prepare()
+    assert first.tolist() == [-1, 128, -1, 129]
+    assert prepare().data_ptr() == first.data_ptr()
+    dcp.clear_forward_metadata()
     slots[0] = 258
-    second = ascend_dsa.ascend_cache_write_slots(slots, placement)
-    assert len(calls) == 2
-    assert second.tolist() == [130, 128, -1, 129]
-    # Another geometry owns different rows, never borrowing this rank's result.
-    other = ascend_dsa._AscendCachePlacement(128, 17, tuple(range(8)), 0)
-    assert ascend_dsa.ascend_cache_write_slots(slots, other).tolist() == [-1] * 4
+    assert prepare().tolist() == [130, 128, -1, 129]
 
 
 def test_indexer_writes_only_its_own_cache_after_mla_prologue():
@@ -162,6 +265,9 @@ def test_indexer_writes_only_its_own_cache_after_mla_prologue():
             "index_init_tokens": 0,
             "index_local_tokens": 0,
         },
+        query_group_size=1,
+        query_width=1,
+        context_parallel=False,
     )
     assert len(writes) == 1
     assert writes[0][1].data_ptr() == index_cache.data_ptr()
@@ -175,7 +281,6 @@ def test_each_candidate_keeps_its_own_local_page_prefix():
         degree=8,
         rank=1,
         ranks=tuple(range(8)),
-        auxiliary_namespace="test_dsa_cp",
     )
     dcp.refresh_metadata(
         page_table=table,
@@ -184,6 +289,9 @@ def test_each_candidate_keeps_its_own_local_page_prefix():
         block_granularity=128,
         init_tokens=0,
         local_tokens=0,
+        query_width=1,
+        query_group_size=1,
+        slots=None,
     )
     compact = dcp.metadata(start=0, end=4)
     assert compact.seq_lens.tolist() == [126, 127, 128, 128]
@@ -196,7 +304,6 @@ def test_dcp_metadata_is_shared_only_within_matching_forward(monkeypatch):
         degree=8,
         rank=1,
         ranks=tuple(range(8)),
-        auxiliary_namespace="test_dsa_cp",
     )
     table = torch.tensor([[1, 2, 3]] * 4, dtype=torch.int32)
     lengths = torch.tensor([254, 255, 256, 257], dtype=torch.int32)
@@ -217,6 +324,9 @@ def test_dcp_metadata_is_shared_only_within_matching_forward(monkeypatch):
             block_granularity=128,
             init_tokens=0,
             local_tokens=local,
+            query_width=1,
+            query_group_size=1,
+            slots=None,
         )
 
     for _ in range(6):
@@ -249,16 +359,15 @@ def test_decode_metadata_storage_is_stable_across_batch_sizes():
         degree=1,
         rank=0,
         ranks=(0,),
-        auxiliary_namespace="test_dsa_cp",
         virtual_block_count=8,
     )
     dcp.allocate_decode_buffers(rows=8, columns=3, device="cpu")
-    large = dcp._copy_buffer("query_page_table", torch.ones((8, 3), dtype=torch.int32))
-    small = dcp._copy_buffer("query_page_table", torch.zeros((2, 3), dtype=torch.int32))
+    large = dcp._buffer("page_table", (8, 3), torch.device("cpu"))
+    small = dcp._buffer("page_table", (2, 3), torch.device("cpu")).zero_()
     assert large.data_ptr() == small.data_ptr()
     assert small.tolist() == [[0, 0, 0], [0, 0, 0]]
     with pytest.raises(RuntimeError, match="preallocated decode geometry"):
-        dcp._copy_buffer("query_page_table", torch.ones((9, 3), dtype=torch.int32))
+        dcp._buffer("page_table", (9, 3), torch.device("cpu"))
 
 
 @pytest.mark.parametrize("prefill_rows,prefill_columns", [(17, 3), (4, 4)])
@@ -269,7 +378,6 @@ def test_large_prefill_does_not_replace_decode_metadata_buffers(
         degree=8,
         rank=0,
         ranks=tuple(range(8)),
-        auxiliary_namespace="test_dsa_cp",
         virtual_block_count=17,
     )
     dcp.allocate_decode_buffers(8, 3, "cpu")
@@ -284,6 +392,9 @@ def test_large_prefill_does_not_replace_decode_metadata_buffers(
             block_granularity=128,
             init_tokens=0,
             local_tokens=0,
+            query_width=1,
+            query_group_size=1,
+            slots=None,
         )
         meta = dcp.metadata(start=0, end=rows)
         assert meta.seq_lens.tolist() == [132] * rows
@@ -326,12 +437,10 @@ def test_sharded_index_write_and_read_use_local_storage(degree, block_size):
             degree=degree,
             rank=rank,
             ranks=tuple(range(degree)),
-            auxiliary_namespace="test_dsa_cp",
             virtual_block_count=virtual_count,
         )
-        # Stop before collectives: this test exercises the real write and
-        # metadata paths independently for every owner.
-        dcp.primary_process_group = object()
+        # Stop before the merge kernel: exercise real writes and metadata
+        # independently for every owner.
 
         class Kernels:
             def scatter(self, rows, destination, locations):
@@ -354,12 +463,13 @@ def test_sharded_index_write_and_read_use_local_storage(degree, block_size):
             kernel_page_size=128,
             step_counter=None,
             _dcp=dcp,
+            _fused_group="test-dsa",
             cache_placement=lambda layer: placement,
         )
         with pytest.raises(ReachedIndexer):
             ascend_dsa.AscendDSABackend._select_indexed(
                 backend,
-                None,
+                torch.zeros(8, 1, 8),
                 None,
                 SimpleNamespace(layer_id=0),
                 slots,
@@ -375,6 +485,8 @@ def test_sharded_index_write_and_read_use_local_storage(degree, block_size):
                     index_local_tokens=129,
                 ),
                 context_parallel=True,
+                query_group_size=1,
+                query_width=1,
             )
         assert (cache[:block_size] == -99).all()
         for local_block in (1, 2):
@@ -391,6 +503,9 @@ def test_sharded_index_write_and_read_use_local_storage(degree, block_size):
             block_granularity=block_size,
             init_tokens=131,
             local_tokens=129,
+            query_width=1,
+            query_group_size=1,
+            slots=None,
         )
         meta = dcp.metadata(start=0, end=8)
         for row, end in enumerate(lengths.tolist()):
@@ -464,10 +579,6 @@ def test_dcp_verify_batches_query_rows_with_causal_lengths(width):
         def __init__(self):
             self.refreshed = []
 
-        def _copy_buffer(self, name, value):
-            del name
-            return value.clone()
-
         def refresh_metadata(self, *, seq_lens, page_table, **kwargs):
             del kwargs
             self.refreshed.append((seq_lens.clone(), page_table.clone()))
@@ -485,8 +596,6 @@ def test_dcp_verify_batches_query_rows_with_causal_lengths(width):
             self._dense_backend = SimpleNamespace(
                 refresh_decode_metadata=lambda *args, **kwargs: None
             )
-            self._decode_query_seq_lens = None
-            self._decode_query_page_table = None
             self.selections = []
 
         def _validate_logit_cap(self, value):
@@ -508,7 +617,7 @@ def test_dcp_verify_batches_query_rows_with_causal_lengths(width):
             del k, layer, pool, kwargs
             self.selections.append(
                 (
-                    q_ends.clone(),
+                    q_ends,
                     kv_lengths.clone(),
                     pages.clone(),
                     locations.clone(),
@@ -525,14 +634,6 @@ def test_dcp_verify_batches_query_rows_with_causal_lengths(width):
 
     backend = FakeBackend()
     ascend_dsa.AscendDSABackend.refresh_decode_metadata(backend, 3, 3, lengths, table)
-    expected_lengths = torch.cat(
-        [torch.arange(int(end) - width + 1, int(end) + 1) for end in lengths]
-    ).to(torch.int32)
-    torch.testing.assert_close(backend._decode_query_seq_lens, expected_lengths)
-    torch.testing.assert_close(
-        backend._decode_query_page_table, table.repeat_interleave(width, dim=0)
-    )
-    # The model supplies selection policy at execution, not metadata refresh.
     assert not backend._dcp.refreshed
 
     rows = 2 * width
@@ -551,9 +652,10 @@ def test_dcp_verify_batches_query_rows_with_causal_lengths(width):
     torch.testing.assert_close(output, query.flatten(1))
     assert len(backend.selections) == 1
     q_ends, visible, pages, selected_locations, options = backend.selections[0]
-    assert q_ends.tolist() == list(range(1, rows + 1))
-    torch.testing.assert_close(visible, expected_lengths[width:])
-    torch.testing.assert_close(pages, table[1:].repeat_interleave(width, dim=0))
+    assert q_ends is None
+    assert options["query_width"] == width
+    torch.testing.assert_close(visible, lengths[1:])
+    torch.testing.assert_close(pages, table[1:])
     torch.testing.assert_close(selected_locations, locations)
     assert options["context_parallel"] is True
 
@@ -573,6 +675,9 @@ def test_index_policy_is_validated_at_execution(initial, local):
             None,
             None,
             {"index_init_tokens": initial, "index_local_tokens": local},
+            query_group_size=1,
+            query_width=1,
+            context_parallel=False,
         )
 
 
@@ -587,10 +692,6 @@ def test_dcp_indexer_receives_model_policy_for_each_candidate(width):
     records = []
 
     class Dcp(ascend_dsa._AscendDSAContextParallel):
-        @property
-        def ready(self):
-            return True
-
         def refresh_metadata(
             self,
             *,
@@ -600,6 +701,7 @@ def test_dcp_indexer_receives_model_policy_for_each_candidate(width):
             block_granularity,
             init_tokens,
             local_tokens,
+            **metadata_args,
         ):
             assert init_tokens == initial and local_tokens == local
             super().refresh_metadata(
@@ -609,6 +711,7 @@ def test_dcp_indexer_receives_model_policy_for_each_candidate(width):
                 block_granularity=block_granularity,
                 init_tokens=init_tokens,
                 local_tokens=local_tokens,
+                **metadata_args,
             )
 
     class Kernels:
@@ -624,11 +727,11 @@ def test_dcp_indexer_receives_model_policy_for_each_candidate(width):
         _indexer_kernels=Kernels(),
         kernel_page_size=128,
         step_counter=None,
+        _fused_group="test-dsa",
         _dcp=Dcp(
             degree=2,
             rank=1,
             ranks=(0, 1),
-            auxiliary_namespace="test_dsa_cp",
             virtual_block_count=8,
         ),
         cache_placement=lambda layer: CachePlacement(128, 8, (0, 1), 1),
@@ -652,6 +755,8 @@ def test_dcp_indexer_receives_model_policy_for_each_candidate(width):
                 "index_local_tokens": local,
             },
             context_parallel=True,
+            query_group_size=1,
+            query_width=1,
         )
     args = records[0]
     expected_initial = [
@@ -687,7 +792,6 @@ def test_single_token_mixed_decode_selects_request_shaped_query_metadata():
         spec_num_tokens = 4
         kernel_page_size = 128
         forward_decode_metadata = metadata
-        _decode_query_ends = torch.arange(1, 9, dtype=torch.int32)
 
         def __init__(self):
             self._dcp = FakeDcp()
@@ -709,7 +813,8 @@ def test_single_token_mixed_decode_selects_request_shaped_query_metadata():
             **options,
         ):
             del k, layer, locations, pool, kwargs
-            assert q_ends.tolist() == [1]
+            assert q_ends is None
+            assert options["query_width"] == 1
             assert kv_lengths.tolist() == [24]
             assert pages.tolist() == [[2]]
             assert options["context_parallel"] is True
@@ -734,3 +839,272 @@ def test_single_token_mixed_decode_selects_request_shaped_query_metadata():
         1,
     )
     assert not backend._dcp.refreshed
+
+
+class _CpuFusedDsaKernels:
+    """CPU stand-ins for native SFA and IPC, using real producer buffers."""
+
+    def require_fused_context_parallel(self, *, rank_size, num_heads):
+        """The fixture substitutes the installed device and IPC operators."""
+
+    def __init__(self, rows, degree):
+        self.rows = rows
+        self.peer_outputs = torch.arange(degree, dtype=torch.float32)[
+            :, None, None, None
+        ]
+        self.peer_maximum = torch.arange(degree, dtype=torch.float32)[:, None, None] / 4
+        self.peer_sum = torch.arange(1, degree + 1, dtype=torch.float32)[:, None, None]
+
+    def index_partial(self, *args, **kwargs):
+        values = torch.arange(2048, dtype=torch.float32).expand(self.rows, 1, -1)
+        indices = torch.arange(2048, dtype=torch.int32).expand(self.rows, 1, -1)
+        return indices.contiguous(), values.contiguous()
+
+    def merge_topk_fused(self, indices, values, *, group, rank_size):
+        # Only the registered native communicator exists in this environment.
+        rank = {"fused-dsa": 0}[group]
+        return indices[rank].expand(self.rows, -1).contiguous(), torch.full(
+            (self.rows,), 16, dtype=torch.int32
+        )
+
+    def attention_partial(self, *args, out, **kwargs):
+        output, maximum, total = out
+        output.fill_(0)
+        maximum.fill_(0)
+        total.fill_(1)
+        return out
+
+    def merge_lse_direct(
+        self, output, maximum, total, peer_inputs, *, group, rank_size, setup_mode
+    ):
+        rank = {"fused-dsa": 0}[group]
+        assert setup_mode == 0
+        # Resolve the registered IPC table, then include the original producer.
+        peers = self.peer_outputs[peer_inputs].expand(-1, 64, self.rows, 512).clone()
+        maxima = self.peer_maximum[peer_inputs].expand(-1, self.rows, 64).clone()
+        sums = self.peer_sum[peer_inputs].expand_as(maxima).clone()
+        peers[rank].copy_(output)
+        maxima[rank].copy_(maximum[0])
+        sums[rank].copy_(total[0])
+        global_max = maxima.max(0).values
+        weights = (maxima - global_max).exp() * sums
+        weighted = peers * weights.transpose(1, 2)[..., None]
+        merged = weighted.sum(0) / weights.sum(0).T[..., None]
+        local_heads = output.shape[0] // rank_size
+        return merged[rank * local_heads : (rank + 1) * local_heads].bfloat16()
+
+
+def _fused_backend(monkeypatch, rows, *, degree):
+    def initialize_base(self, config, spec, *, kernel_page_size):
+        self.is_draft = False
+        self.spec_num_tokens = 8
+        self.num_local_heads = 64 // degree
+        self.step_counter = None
+        self.kernel_page_size = kernel_page_size
+
+    kernels = _CpuFusedDsaKernels(rows, degree)
+    monkeypatch.setattr(DSABackend, "__init__", initialize_base)
+    monkeypatch.setattr(ascend_dsa, "ascend_dsa_kernels", lambda: kernels)
+    config = SimpleNamespace(
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method=None,
+        kvp_size=degree,
+        kvp_rank=0,
+        kvp_group=tuple(range(degree)),
+    )
+    spec = SimpleNamespace(
+        is_dsa=True,
+        index_k_format="bf16",
+        attn_tp_size=degree,
+        num_attention_heads=64,
+        index_head_dim=128,
+        index_topk=2048,
+        kv_cache_dim=576,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    backend = ascend_dsa.AscendDSABackend(config, spec, kernel_page_size=128)
+    backend._dcp.bind_virtual_block_count(17)
+    placement = CachePlacement(128, 17, tuple(range(degree)), 0)
+    monkeypatch.setattr(backend, "cache_placement", lambda layer: placement)
+    return backend
+
+
+@pytest.mark.parametrize("width", [1, 2, 4, 8])
+def test_single_rank_verify_preserves_each_candidates_causal_context(
+    monkeypatch, width
+):
+    class SingleRankKernels:
+        def index(self, query, key, weights, *metadata):
+            return torch.zeros(query.shape[0], 1, 1, dtype=torch.int32), torch.ones(
+                query.shape[0], dtype=torch.int32
+            )
+
+    rows = 2 * width
+    backend = _fused_backend(monkeypatch, rows, degree=1)
+    monkeypatch.setattr(backend, "_indexer_kernels", SingleRankKernels())
+    monkeypatch.setattr(backend, "cache_placement", lambda layer: None)
+    table = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+    lengths = torch.tensor([129, 257], dtype=torch.int32)
+    cache = torch.zeros(8, 128, 1, 128, dtype=torch.bfloat16)
+    selection = backend._select_indexed(
+        torch.zeros(rows, 1, 576),
+        None,
+        SimpleNamespace(layer_id=0),
+        torch.zeros(rows, dtype=torch.int64),
+        SimpleNamespace(get_component=lambda *args: cache),
+        None,
+        lengths,
+        table,
+        dict(
+            index_query=torch.zeros(rows, 16, 128),
+            index_weights=None,
+            index_init_tokens=0,
+            index_local_tokens=0,
+            index_cache_written=True,
+        ),
+        query_group_size=width,
+        query_width=width,
+        context_parallel=False,
+    )
+    assert selection.q_ends.tolist() == list(range(1, rows + 1))
+    assert selection.kv_lengths.tolist() == list(range(130 - width, 130)) + list(
+        range(258 - width, 258)
+    )
+    assert selection.table.tolist() == [[1, 2, 3]] * width + [[4, 5, 6]] * width
+    assert selection.context_parallel is False
+    assert lengths.tolist() == [129, 257]
+
+
+def test_dsa_metadata_needs_no_collective_process_group(monkeypatch):
+    # The global runtime may exist while this backend has no HCCL groups.
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    backend = _fused_backend(monkeypatch, 64, degree=8)
+    backend._dcp.refresh_metadata(
+        page_table=torch.tensor([[1, 2]], dtype=torch.int32),
+        seq_lens=torch.tensor([256], dtype=torch.int32),
+        page_size=128,
+        block_granularity=128,
+        init_tokens=0,
+        local_tokens=0,
+        query_width=1,
+        query_group_size=1,
+        slots=None,
+    )
+    metadata = backend._dcp.metadata(start=0, end=1)
+    assert metadata.seq_lens.tolist() == [128]
+    assert metadata.page_table.tolist() == [[1, 0]]
+
+
+@pytest.mark.parametrize(
+    "degree,rows", [(2, 64), (4, 64), (8, 64), (8, 128), (8, 256), (8, 512), (16, 64)]
+)
+@pytest.mark.parametrize("head_major", [False, True])
+def test_fused_dsa_uses_registered_outputs_and_merges_lse(
+    monkeypatch, degree, rows, head_major
+):
+    backend = _fused_backend(monkeypatch, rows, degree=degree)
+    outputs = (
+        torch.empty(64, rows, 512),
+        torch.empty(1, rows, 64),
+        torch.empty(1, rows, 64),
+    )
+    backend.configure_fused_decode(
+        group="fused-dsa",
+        attention_outputs={rows: outputs},
+        peer_inputs={rows: torch.arange(degree)},
+    )
+    local_heads = 64 // degree
+    packed_query = torch.zeros(degree, rows, local_heads, 576, dtype=torch.bfloat16)
+    layer = SimpleNamespace(layer_id=0, scaling=1.0)
+    index_cache = torch.zeros(2, 128, 1, 128, dtype=torch.bfloat16)
+    kv_cache = torch.zeros(2, 128, 1, 576, dtype=torch.bfloat16)
+    pool = SimpleNamespace(
+        get_component=lambda *args: index_cache,
+        get_key_buffer=lambda *args: kv_cache,
+    )
+    selection = backend._select_indexed(
+        packed_query[0],
+        None,
+        layer,
+        torch.arange(rows),
+        pool,
+        torch.arange(1, rows + 1, dtype=torch.int32),
+        torch.full((rows,), 128, dtype=torch.int32),
+        torch.ones(rows, 1, dtype=torch.int32),
+        dict(
+            index_query=None,
+            index_weights=None,
+            index_init_tokens=0,
+            index_local_tokens=0,
+            index_cache_written=True,
+            packed_query=packed_query,
+        ),
+        query_group_size=8,
+        context_parallel=True,
+        query_width=1,
+    )
+    assert selection.query is packed_query
+    assert selection.indices.shape == (rows, 2048)
+    actual = backend._run_indexed_sparse_attention(
+        selection,
+        layer,
+        pool,
+        head_major_output=head_major,
+    )
+    # Independent log-softmax reference over the configured context shards.
+    ranks = torch.arange(degree, dtype=torch.float64)
+    probabilities = torch.softmax(ranks / 4 + (ranks + 1).log(), dim=0)
+    expected = (ranks * probabilities).sum().bfloat16()
+    shape = (local_heads, rows, 512) if head_major else (rows, local_heads * 512)
+    torch.testing.assert_close(
+        actual, torch.full(shape, expected, dtype=torch.bfloat16)
+    )
+
+
+def test_dsa_rejects_ipc_resources_for_a_different_cp_group(monkeypatch):
+    backend = _fused_backend(monkeypatch, 64, degree=4)
+    outputs = (torch.empty(64, 64, 512), torch.empty(1, 64, 64), torch.empty(1, 64, 64))
+    with pytest.raises(ValueError, match="cover the CP group"):
+        backend.configure_fused_decode(
+            group="fused-dsa",
+            attention_outputs={64: outputs},
+            peer_inputs={64: torch.arange(8)},
+        )
+    assert backend._fused_group is None
+
+
+def test_dsa_missing_fused_resources_fail_before_native_launch(monkeypatch):
+    backend = _fused_backend(monkeypatch, 64, degree=8)
+    selection = ascend_dsa._AscendSparseSelection(
+        torch.empty(8, 64, 8, 576),
+        None,
+        None,
+        None,
+        None,
+        None,
+        3,
+        True,
+    )
+    pool = SimpleNamespace(get_key_buffer=lambda layer: torch.empty(128, 576))
+    with pytest.raises(RuntimeError, match="Initialize fused DSA resources"):
+        backend._run_indexed_sparse_attention(
+            selection,
+            SimpleNamespace(layer_id=0),
+            pool,
+            head_major_output=True,
+        )
+    outputs = (torch.empty(64, 64, 512), torch.empty(1, 64, 64), torch.empty(1, 64, 64))
+    backend.configure_fused_decode(
+        group="fused-dsa",
+        attention_outputs={64: outputs},
+        peer_inputs={64: torch.arange(8)},
+    )
+    selection = dataclasses.replace(selection, query=torch.empty(8, 65, 8, 576))
+    with pytest.raises(ValueError, match="prepared"):
+        backend._run_indexed_sparse_attention(
+            selection,
+            SimpleNamespace(layer_id=0),
+            pool,
+            head_major_output=True,
+        )

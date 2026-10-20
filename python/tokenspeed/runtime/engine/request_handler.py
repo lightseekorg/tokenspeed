@@ -188,6 +188,18 @@ def _profile_rank_tag(attn_mapping) -> str:
     return "-".join(parts)
 
 
+def _all_thread_profile_config():
+    # The process-global flag also covers workers created before profiling.
+    if not isinstance(
+        getattr(torch.autograd.profiler, "_is_profiler_enabled", None), bool
+    ):
+        raise RuntimeError("missing process-global profiler state")
+    try:
+        return torch.profiler._ExperimentalConfig(profile_all_threads=True)
+    except (AttributeError, TypeError) as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
 class RequestHandler:
     """
     1. Recv Reqs from ZMQ
@@ -429,7 +441,14 @@ class RequestHandler:
                 # rendezvous blocks this thread too.
                 self._pending_weight_ops.append(recv_req)
             elif isinstance(recv_req, _WEIGHT_LOAD_OPS):
-                ok, msg = self._require_weight_version_for_l3_flush(recv_req)
+                refusal = (
+                    self.memory_controller.refuse_weight_load()
+                    if self.memory_controller is not None
+                    else None
+                )
+                ok, msg = (False, refusal) if refusal is not None else (True, "")
+                if ok:
+                    ok, msg = self._require_weight_version_for_l3_flush(recv_req)
                 if ok:
                     ok, msg = self._require_flush_for_l3_version_switch(recv_req)
                 if not ok:
@@ -464,6 +483,11 @@ class RequestHandler:
     # ------------------------------------------------------------------
     # Internal control ops (online expert rebalance)
     # ------------------------------------------------------------------
+
+    @property
+    def has_pending_weight_ops(self) -> bool:
+        """Whether a queued frontend/internal op can still touch model memory."""
+        return bool(self._pending_weight_ops or self._pending_internal_ops)
 
     def set_internal_op_completer(self, completer: InternalOpCompleter) -> None:
         """Install the owner of the internal ops (once, at startup)."""
@@ -984,6 +1008,15 @@ class RequestHandler:
                     "the server with --expert-distribution-recorder-mode stat.",
                 )
 
+        if {"CPU", "GPU"} & set(activities):
+            try:
+                _all_thread_profile_config()
+            except RuntimeError as exc:
+                return ProfileReqOutput(
+                    success=False,
+                    message=f"This PyTorch runtime cannot provide all-thread phase profiling: {exc}",
+                )
+
         self.profile_by_stage = profile_by_stage
         self.profiler_output_dir = output_dir
         self.torch_profiler_with_stack = with_stack
@@ -1031,10 +1064,18 @@ class RequestHandler:
         ]
 
         if torchprof_activities:
+            try:
+                experimental_config = _all_thread_profile_config()
+            except RuntimeError as exc:
+                return ProfileReqOutput(
+                    success=False,
+                    message=f"This PyTorch runtime cannot provide all-thread phase profiling: {exc}",
+                )
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,
                 record_shapes=record_shapes if record_shapes is not None else False,
+                experimental_config=experimental_config,
             )
             self.torch_profiler.start()
 

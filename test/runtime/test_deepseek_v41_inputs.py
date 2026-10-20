@@ -1105,6 +1105,7 @@ def test_execute_idle_forward_passes_empty_engram_views(buffers):
         DpForwardMetadata(
             global_num_tokens=[0],
             global_batch_size=[0],
+            global_num_decodes=[0],
             global_forward_mode=[ForwardMode.IDLE],
             all_decode_or_idle=True,
             all_extend=False,

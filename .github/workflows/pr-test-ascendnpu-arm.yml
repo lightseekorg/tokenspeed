@@ -1,0 +1,168 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+name: PR Test Ascend NPU ARM
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-test-npu-arm-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'high priority' && format('-ignored-label-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  select:
+    name: Check Ascend NPU ARM changes
+    if: |
+      (github.repository == 'lightseekorg/tokenspeed' ||
+       github.repository == vars.TOKENSPEED_NPU_CI_REPOSITORY) &&
+      github.event.deleted != true &&
+      (github.event.action != 'labeled' || github.event.label.name == 'high priority')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      should_run: ${{ steps.changes.outputs.should_run }}
+      reason: ${{ steps.changes.outputs.reason }}
+    steps:
+      - name: Check out event commit and full history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select operator tests
+        id: changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest ci.npu_ops_test.test_changes
+          python3 -B ci/npu_ops_test/changes.py \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --manifest ci/npu_ops_test/manifest.json \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --event-path "$GITHUB_EVENT_PATH" \
+            --checkout-sha "$GITHUB_SHA" \
+            --checkout-ref "$GITHUB_REF" \
+            --github-output "$GITHUB_OUTPUT" \
+            | tee "$RUNNER_TEMP/npu-change-selection.json"
+
+  npu:
+    name: Ascend NPU ARM operator tests
+    needs: select
+    if: |
+      vars.TOKENSPEED_NPU_ARM_CI_ENABLED == 'true' &&
+      needs.select.outputs.should_run == 'true' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    runs-on: tokenspeed-npu-arm64
+    env:
+      TOKENSPEED_NPU_CI_REPOSITORY: ${{ vars.TOKENSPEED_NPU_CI_REPOSITORY }}
+      TOKENSPEED_NPU_ARM_RUNNER_NAME: ${{ vars.TOKENSPEED_NPU_ARM_RUNNER_NAME }}
+    timeout-minutes: 60
+    steps:
+      - name: Run accuracy tests for all operators
+        id: accuracy
+        shell: bash
+        env:
+          NPU_PHASE: accuracy
+        # The bootstrap must live here: the repository script is not available yet.
+        run: &npu-bootstrap |
+          set -Eeuo pipefail
+          stage=bootstrap
+          started=$SECONDS
+          finish() {
+            rc=$?
+            trap - EXIT
+            if (( rc != 0 )); then
+              message="ARM NPU ${NPU_PHASE}: ${stage} failed (exit=${rc})"
+              printf '::error::%s\n' "$message"
+              printf '\n### ARM NPU phase failed\n\nPhase: `%s`; stage: `%s`; exit: `%s`. See the raw logs in this step.\n' \
+                "$NPU_PHASE" "$stage" "$rc" >> "$GITHUB_STEP_SUMMARY" || rc=1
+            fi
+            printf 'ARM NPU phase finished: %s, exit=%s, elapsed=%ss\n' "$NPU_PHASE" "$rc" "$((SECONDS-started))"
+            exit "$rc"
+          }
+          trap finish EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          require_equal() {
+            printf 'Checking %s: actual=%s; expected=%s\n' "$1" "$3" "$2"
+            [[ "$2" = "$3" ]] || { printf '%s does not match the deployment contract\n' "$1" >&2; return 1; }
+          }
+          echo "ARM NPU phase started: $NPU_PHASE"
+          stage=deployment-contract
+          [[ -n "${TOKENSPEED_NPU_ARM_RUNNER_NAME:-}" ]] || { echo 'Repository variable TOKENSPEED_NPU_ARM_RUNNER_NAME must be configured' >&2; exit 1; }
+          require_equal runner "$TOKENSPEED_NPU_ARM_RUNNER_NAME" "$RUNNER_NAME"
+          require_equal server https://github.com "$GITHUB_SERVER_URL"
+          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ ]] || { echo 'Invalid GITHUB_REPOSITORY format' >&2; exit 1; }
+          [[ "${GITHUB_REPOSITORY#*/}" != . && "${GITHUB_REPOSITORY#*/}" != .. ]] || { echo 'Invalid GITHUB_REPOSITORY name' >&2; exit 1; }
+          [[ "$GITHUB_REPOSITORY" = lightseekorg/tokenspeed || ( -n "${TOKENSPEED_NPU_CI_REPOSITORY:-}" && "$GITHUB_REPOSITORY" = "$TOKENSPEED_NPU_CI_REPOSITORY" ) ]] || { echo 'GITHUB_REPOSITORY is not in the repository allowlist' >&2; exit 1; }
+          # Reject a mislabelled x86 runner before fetching or executing test code.
+          stage=platform
+          require_equal system Linux "$(uname -s)"
+          architecture=$(uname -m)
+          echo "Checking architecture: $architecture"
+          case "$architecture" in aarch64|arm64) ;; *) echo 'An ARM64 runner is required' >&2; exit 1 ;; esac
+          stage=runner-contract
+          require_equal user ci-npu "$(id -un)"
+          require_equal runner_environment self-hosted "$RUNNER_ENVIRONMENT"
+          stage=validate-event
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'Invalid GITHUB_SHA format' >&2; exit 1; }
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]] || { echo 'Invalid run_id/attempt format' >&2; exit 1; }
+          git check-ref-format "$GITHUB_REF"
+          if [[ "$NPU_PHASE" = accuracy ]]; then
+            stage=checkout
+            work=$(mktemp -d "/srv/npu-ci/jobs/slot0/actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.XXXXXXXX")
+            echo "Run directory: $work"
+            printf 'NPU_CI_WORK=%s\n' "$work" >> "$GITHUB_ENV"
+            git init -q "$work/checkout"
+            # Public repository: do not forward credentials into PR test processes.
+            GIT_TERMINAL_PROMPT=0 git -C "$work/checkout" -c credential.helper= \
+              fetch --no-tags --depth=1 \
+              "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+            git -C "$work/checkout" -c core.hooksPath=/dev/null checkout -q --detach FETCH_HEAD
+            printf 'repository=%s\nsha=%s\nref=%s\nrun_id=%s\nattempt=%s\n' \
+              "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$GITHUB_REF" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+              | tee "$work/source.txt"
+          else
+            work="${NPU_CI_WORK:?Missing accuracy checkout}"
+            [[ "$work" == /srv/npu-ci/jobs/slot0/actions-"${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}".* ]] || { echo 'Run directory does not match run_id/attempt' >&2; exit 1; }
+          fi
+          stage=verify-checkout
+          actual_sha=$(git -C "$work/checkout" rev-parse HEAD)
+          require_equal checkout_sha "$GITHUB_SHA" "$actual_sha"
+          status=$(git -C "$work/checkout" status --porcelain --untracked-files=all)
+          [[ -z "$status" ]] || { echo 'Checkout contains modified or untracked files' >&2; exit 1; }
+          stage=run-phase
+          bash "$work/checkout/ci/npu_ops_test/run_step.sh" "$NPU_PHASE" "$work"
+      - name: Run performance tests for all operators
+        id: performance
+        if: ${{ success() }}
+        shell: bash
+        env:
+          NPU_PHASE: performance
+        run: *npu-bootstrap

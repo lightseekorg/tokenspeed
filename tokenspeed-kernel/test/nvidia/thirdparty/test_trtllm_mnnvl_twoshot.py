@@ -291,6 +291,72 @@ def test_twoshot_residual_rmsnorm_matches_reference(token_num):
     torch.testing.assert_close(norm_out.float(), ref_norm, atol=norm_atol, rtol=5e-2)
 
 
+@pytest.mark.parametrize("token_num", [1024, 2048])
+def test_large_fused_allreduce_stays_on_ipc_only_for_its_oneshot(token_num):
+    """A fused all-reduce of 14 or 28 MiB stays on the IPC workspace only where
+    IPC would run its one-shot kernel (world 2); otherwise it runs on the mnnvl
+    two-shot. The mnnvl and IPC two-shots, and the call, agree bit for bit."""
+    from tokenspeed_kernel.ops.communication import trtllm as comm
+    from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+        AllReduceFusionPattern,
+        _ar_should_use_oneshot,
+    )
+
+    ctx = _skip_unless_mnnvl()
+    if ctx["ipc"] is None:
+        pytest.skip("IPC lamport workspace unavailable (world spans nodes)")
+    dev, rank, group = ctx["dev"], ctx["rank"], dist.group.WORLD
+    x = _inputs(token_num, dev, rank, seed=11)
+    torch.manual_seed(4243)  # residual/weight identical on every rank
+    residual = torch.randn(token_num, H, dtype=torch.bfloat16, device=dev) * 0.1
+    weight = torch.randn(H, dtype=torch.bfloat16, device=dev)
+
+    comm.ensure_workspace_initialized(
+        rank=rank,
+        group=group,
+        max_token_num=MAXTOK,
+        hidden_dim=H,
+        use_fp32_lamport=False,
+    )
+    manager = comm._manager_for_group(group)
+    if manager.mnnvl_workspace is None:
+        pytest.skip("the group's shared workspace has no mnnvl part")
+    flags = manager.mnnvl_workspace.buffer_flags
+    before = flags.tolist()
+    norm_out, residual_out, _, _ = comm.allreduce_residual_rmsnorm(
+        x, residual, weight, rank, group, eps=EPS, max_token_num=MAXTOK
+    )
+    torch.cuda.synchronize()
+    after = flags.tolist()
+    # The mnnvl rotation advances only when the call ran there; [3] = 2 stages.
+    if _ar_should_use_oneshot(token_num, H, torch.bfloat16, ctx["world"]):
+        assert after == before
+    else:
+        assert after[0] == (before[0] + 1) % 3 and after[3] == 2
+
+    outs = {}
+    for name, ws in (("ipc", ctx["ipc"]), ("mnnvl", ctx["mnnvl"])):
+        outs[name] = (torch.empty_like(x), torch.empty_like(residual))
+        _ar(
+            ws,
+            x,
+            token_num,
+            use_oneshot=False,
+            pattern_code=AllReduceFusionPattern.kARResidualRMSNorm,
+            pattern_kwargs=dict(
+                residual_in=residual,
+                residual_out=outs[name][1],
+                norm_out=outs[name][0],
+                rms_gamma=weight,
+                rms_eps=EPS,
+            ),
+        )
+    torch.cuda.synchronize()
+    for got in (outs["mnnvl"], (norm_out, residual_out)):
+        for a, b in zip(got, outs["ipc"]):
+            assert torch.equal(a.view(torch.int16), b.view(torch.int16))
+
+
 def test_twoshot_epilogue_bitwise_identical_across_ranks():
     """Every rank re-runs the epilogue locally; outputs must match bit-for-bit,
     otherwise ranks silently diverge after a few layers."""

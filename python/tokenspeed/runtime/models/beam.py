@@ -302,6 +302,22 @@ class BeamRMSNorm(RMSNorm):
         consumer.offer_token_fp8(out, codes, scales)
         return out if residual is None else (out, residual_sum)
 
+    def forward_unfused(
+        self, x: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Materialize this boundary's BF16 products and sum before RMSNorm.
+
+        A fold norm owns the coefficients on the incoming raw pair. The
+        ordinary forward still requires that pair; this explicit unfused
+        entry normalizes the materialized sum without applying a second fold.
+        """
+        if self.residual_fold is not None:
+            x_scale, residual_scale = self.residual_fold
+            x = x * x_scale
+            residual = residual * residual_scale
+        combined = x + residual
+        return BeamRMSNorm.forward(self, combined), combined
+
 
 class BeamResidualFoldRMSNorm(BeamRMSNorm):
     """The consumer of a layer's MLP depth-scale pair.
@@ -899,6 +915,11 @@ class BeamVendorMoE(BeamMoE):
     FP8 per-channel routed kernel (``fp8ch_vendor_fp32_route``), always on
     Beam's routes with their FP32 weights; the kernel quantizes its input per
     token.
+
+    On AMD gfx950, BF16, FP8 per-channel and Quark MXFP4 experts use the default
+    precision policy and registry selection, with precomputed FP32 routes.
+    Explicit backend selection is passed through to the registry. Routing
+    applies the routed scale once; experts use their standard default arithmetic.
     """
 
     def __init__(
@@ -913,22 +934,43 @@ class BeamVendorMoE(BeamMoE):
         if not config.norm_topk_prob:
             raise NotImplementedError("Beam's vendor MoE requires normalized routes")
         fmt = None if quant_config is None else beam_checkpoint_format(quant_config)
-        policy = {
-            None: BEAM_MOE_VENDOR_POLICY,
-            "nvfp4": BEAM_MOE_NVFP4_POLICY,
-            "fp8_channel": BEAM_MOE_FP8_POLICY,
-        }[fmt]
+        platform = current_platform()
+        amd_default = platform.is_cdna4
+        if platform.is_amd and fmt == "nvfp4":
+            raise ValueError("Beam NVFP4 experts require NVIDIA vendor MoE")
+        if amd_default:
+            policy = "default"
+        elif fmt == "mxfp4":
+            raise ValueError("Beam MXFP4 experts require AMD gfx950")
+        else:
+            policy = {
+                None: BEAM_MOE_VENDOR_POLICY,
+                "nvfp4": BEAM_MOE_NVFP4_POLICY,
+                "fp8_channel": BEAM_MOE_FP8_POLICY,
+            }[fmt]
         adapted = copy(config)
         adapted.moe_precision_policy = policy
+        if amd_default:
+            # Beam owns grouped selection and folds the routed scale into its
+            # FP32 coefficients once, independent of the selected expert backend.
+            adapted.moe_routing_mode = "precomputed_topk"
         adapted.moe_output_scale = 1.0
         self._init_moe(adapted, mapping, layer_id, prefix, quant_config)
         experts = self.experts
+        if amd_default:
+            # Beam consumes finalized output, even when the selected kernel
+            # also supports separate routes for other models' combiners.
+            experts.plan["supports_deferred_finalize"] = False
         self.kernel_routing = experts.support_routing
         if (
-            experts.plan.get("precision_policy") != policy
-            or experts.plan.get("output_scale") != 1.0
+            (not amd_default and experts.plan.get("precision_policy") != policy)
+            or experts.plan.get("output_scale", 1.0) != adapted.moe_output_scale
             or experts.supports_deferred_finalize
             or self.kernel_routing != self.topk.topk_config.output_format.is_bypassed()
+            or (
+                amd_default
+                and (self.kernel_routing or not experts.supports_precomputed_topk)
+            )
         ):
             raise NotImplementedError(
                 f"Beam's vendor MoE requires the finalized {policy} policy"
@@ -956,7 +998,7 @@ class BeamVendorMoE(BeamMoE):
             self.topk.topk_config.routed_scaling_factor = None
         if layer_id == config.mlp_layer_types.index("sparse"):
             logger.info(
-                f"Beam vendor MoE rank {mapping.rank}/{mapping.world_size}: "
+                f"Beam finalized MoE rank {mapping.rank}/{mapping.world_size}: "
                 f"routing={'kernel' if self.kernel_routing else 'beam'} "
                 f"apply={experts.plan['apply_kernel_name']} "
                 f"ep_size={experts.ep_size} ep_rank={experts.ep_rank} "
@@ -1018,13 +1060,20 @@ def beam_moe_class(quantized_experts: bool = False) -> type[BeamMoE]:
 
     ``--moe-backend flashinfer_trtllm`` (Beam's model default on NVIDIA SM100 to
     SM103 where the policy starts) selects :class:`BeamVendorMoE`; every other
-    backend keeps BeamMoE, and refuses quantized (NVFP4 or FP8) experts.
+    backend keeps BeamMoE. AMD gfx950 uses the finalized default-policy path
+    for BF16, FP8 and MXFP4 experts, with backend selection left to the registry.
+    Unsupported quantized backends fail before loading.
     """
     if get_moe_backend().value == "flashinfer_trtllm":
         return BeamVendorMoE
+    platform = current_platform()
+    if platform.is_cdna4:
+        return BeamVendorMoE
     if quantized_experts:
         raise ValueError(
-            "Beam runs NVFP4 and FP8 experts on its vendor MoE, which needs "
+            "Beam runs FP8 experts on AMD gfx950 with --moe-backend auto, triton "
+            "or gluon (BF16 projection operands); "
+            "NVFP4 and NVIDIA FP8 experts use the vendor MoE, which needs "
             "--moe-backend flashinfer_trtllm (Beam's default on NVIDIA SM100 "
             f"to SM103 where it applies), not {get_moe_backend().value}"
         )
@@ -1118,6 +1167,16 @@ class BeamMLP(LlamaMLP):
 
 
 class BeamCommManager(CommManager):
+    @staticmethod
+    def _unfused_add_norm(
+        norm: BeamRMSNorm,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Beam's consuming norm owns depth scaling on the raw residual pair;
+        # the generic helper would add it before those coefficients apply.
+        return norm.forward_unfused(hidden_states, residual)
+
     def use_all_reduce_norm_fusion(self) -> bool:
         # The output norm must run after the TP reduction and before the scaled
         # add; the standard fused reduce/add/norm changes that order.
@@ -1488,7 +1547,9 @@ class BeamForCausalLM(BaseCausalLM):
             isinstance(module, BeamVendorMoE) and module.kernel_routing
             for module in self.modules()
         )
-        beam_moe_agreement(mapping, (beam_moe_class().__name__, kernel_routing))
+        beam_moe_agreement(
+            mapping, (beam_moe_class(quant is not None).__name__, kernel_routing)
+        )
 
     def resolve_lm_head(self, config: Any, quant_config: Any, prefix: str):
         # Vocabulary-sharded BF16 head: each rank stores and multiplies its

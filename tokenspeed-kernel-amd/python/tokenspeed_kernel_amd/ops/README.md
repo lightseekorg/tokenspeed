@@ -4,7 +4,7 @@
 
 ### Names
 
-Profilers show kernel names after the `def` function `@gluon.jit` attached to,
+Profilers show kernel names after the `def` that `@gluon.jit` decorates,
 so the kernel should carry the `tokenspeed-kernel` registration name verbatim
 (for example, `gluon_mm_mxfp8_gfx950`), and the Python launcher calling the
 kernel should be named `launch_<name>` (for example, `launch_gluon_mm_mxfp8_gfx950`).
@@ -42,8 +42,8 @@ Iris push collectives also keep explicit workgroup barriers around their
 cross-rank publication protocol. The VMEM drain and system-scope atomics order
 one subgroup's traffic, but the barriers join all producer subgroups before
 they publish a generation and all consumer subgroups before they read the
-peer inbox. Removing either rendezvous can potentially increase cross-rank
-skew and regress perf even when the generated kernel remains correct.
+peer inbox. Removing either rendezvous can increase cross-rank
+skew and regress performance even when the generated kernel remains correct.
 
 ## GEMM
 
@@ -165,7 +165,7 @@ constexprs alone.
   wave, so the four waves split every K iteration and reduce through LDS once;
   weights load K-contiguous and reach the operand layout through LDS.
 - Weight loads are streaming (`.cg`). K loops are unrolled: a loop-carried
-  register copy of a pending load waits for the load and serialized the chunks.
+  register copy of a pending load waits for the load and serializes the chunks.
 
 ### gfx950 MXFP8 projection
 
@@ -649,7 +649,7 @@ and the rescale factors return through LDS for the PV MFMA, whose output
 channels the waves split. Full-rate 16x16x32 MFMAs serve both products; the
 transposed score layout already is the PV A operand. The kernel stays under
 80 KiB of LDS so two workgroups share a CU, and each XCD processes a
-contiguous token range so neighbouring tokens' overlapping rows hit in its L2.
+contiguous token range so neighboring tokens' overlapping rows hit in its L2.
 The prefill gathers `tokens x width` KV rows into LDS once per 16 heads; that
 on-CU traffic (LDS writes plus K and V reads), not HBM or MFMA, bounds it.
 64- and 128-head cases with widths above 128 use a 64-head sparse kernel with
@@ -788,7 +788,7 @@ Dense-workspace prefill calls are forwarded to `dsv4_prefill`.
 A four-wave workgroup owns one query row, up to 64 heads and a contiguous share
 of the row's 64-row tiles (SWA tiles, then global tiles). Each wave loads 16
 contiguous bytes of a row per lane, dequantizes with the CDNA4 scaled
-conversions (`v_cvt_scalef32_pk_bf16_fp8`; E2M1 via
+conversions (`v_cvt_scalef32_pk_bf16_fp8`; E2M1 through
 `v_cvt_scalef32_pk_f32_fp4` times the exact FP32 E4M3 scale) into BF16 rows
 in LDS, and the waves split the tile's rows for QK and the head dims for PV
 (16x16x32 BF16 MFMA). Slots are prefetched two tiles ahead and rows one tile
@@ -1019,6 +1019,12 @@ FP8 conversion. A wave skips the rescale when none of its rows moved. Empty
 asm statements keep LLVM from moving each cluster's results across cluster
 barriers.
 
+### gfx950 MHA cached extension
+
+Cached attention supports grouped-query attention even when the number of
+query heads per KV head is not a power of two. Multi-token extensions preserve
+the masking semantics of full and sliding-window attention.
+
 ### gfx950 MLA extend
 
 `gluon_mla_extend_gfx950` computes absorbed MLA attention for cached extend
@@ -1057,7 +1063,7 @@ KV tiles stream into a four-stage LDS ring with direct-to-LDS buffer loads,
 swizzled so both the K reads and the transposed V reads are conflict-free.
 The loop is software-pipelined one tile deep: the current tile's softmax runs
 in the MFMA shadows of the next tile's Q @ K^T, and the next copy is issued
-under the first P @ V chunk. The running maximum only moves when a tile
+under the first P @ V chunk. The running maximum moves only when a tile
 raises it by more than 8 (base 2), keeping P within FP8 range.
 
 When the grid leaves CUs idle, the launcher splits the KV stream and
@@ -1212,7 +1218,7 @@ element size and batch size to limit shared-memory usage.
 The Kimi K3 prefill path projects one packed BF16 input weight into router,
 routed-latent, and shared-expert inputs. Automatic selection uses the
 small-batch Gluon kernel through 320 tokens, a mid-range Gluon tile for
-321--1280, and the large-M Gluon tile from 1281 tokens. The portable packed
+321-1280, and the large-M Gluon tile from 1281 tokens. The portable packed
 Triton kernel remains available for other shapes and devices.
 
 #### Contract
@@ -1303,7 +1309,7 @@ SIMD. Workgroups are renumbered so each of the eight XCDs gets a contiguous
 run of the `GROUP_M`-grouped tile order, which keeps the workgroups that
 share A or B rows on one L2. Before storing, the kernel redistributes each
 half accumulator so neighboring lanes cover adjacent output columns, which
-coalesces the BF16 stores, and masks rather than the tile index place each
+coalesces the BF16 stores, and masks, rather than the tile index, place each
 column in the router or routed region, so FP32 router logits reach memory
 without a round trip through BF16.
 
@@ -1516,7 +1522,7 @@ slice. Padding blocks of the over-sized grid carry a `-1` schedule entry and
 exit after one load. The program issues its weight TDM loads as soon as the
 expert ID is known, before the row metadata, gather indices and scatter rows
 that the activation loads and epilogue need. Long reductions (gate/up) load
-512-wide K steps, i.e. 256-byte MXFP4 row segments. Short reductions (down)
+512-wide K steps (256-byte MXFP4 row segments). Short reductions (down)
 load 128-wide steps so three buffers hold all of K in a small LDS footprint,
 and more programs stay resident to hide each one's fixed latency.
 
@@ -1622,6 +1628,12 @@ the Kimi K3 specialists: FP16, BF16, or FP32, 1 to 1024 experts, and top-k
 One program handles one token with four warps. It walks the expert vector
 once per selected route, keeps the maximum finite score, and breaks ties by
 the minimum expert id. The weight is the sigmoid captured for that expert.
+
+### gfx950 channel-FP8 experts with BF16 projection operands
+
+Channel-scaled FP8 expert weights can remain in their compact checkpoint
+format while projections use BF16 operands and FP32 accumulation. FP8 storage
+does not require native FP8 matrix arithmetic.
 
 ## Residual
 
@@ -1837,3 +1849,11 @@ FP32 bits of the quotient, and its codes are the correctly rounded
 `x / scale` cast to E4M3. Each program covers consecutive groups, with four
 threads per group and eight elements per thread: 32 groups and four warps
 below 49,152 groups, and 256 groups and eight warps from there.
+
+## Layernorm
+
+### gfx950 QK RMSNorm and SSMax query fusion
+
+Query normalization can be fused with position-dependent SSMax scaling while
+preserving the rounding of the separate operations. The positional scale
+applies only to queries; keys retain ordinary RMS normalization.

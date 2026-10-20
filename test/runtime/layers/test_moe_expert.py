@@ -32,7 +32,7 @@ register_cuda_ci(est_time=20, suite="runtime-1gpu")
 @pytest.mark.parametrize(
     "backend,dtype,routing_config,error",
     [
-        ("flashinfer_cutlass", torch.bfloat16, {}, "only by the Triton"),
+        ("flashinfer_cutlass", torch.bfloat16, {}, "requires --moe-backend triton"),
         ("triton", torch.float16, {}, "requires BF16"),
         ("triton", torch.bfloat16, {"routed_scaling_factor": 2.5}, "unscaled"),
     ],

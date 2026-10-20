@@ -221,6 +221,7 @@ class DeepseekV41Recipe(CacheRecipe):
         specs = [
             CacheGroupSpec(
                 group_id=gid,
+                shard_count=self.attn_config.kvp_size if windows[gid] is None else 1,
                 attn_kind=(
                     "full_history" if windows[gid] is None else "sliding_window"
                 ),
@@ -276,7 +277,10 @@ class DeepseekV41Recipe(CacheRecipe):
             upper_bound=(
                 self.token_limit
                 if self.token_limit is not None
-                else num_lcm_blocks * self._group_packing()[V41_GLOBAL_R1_GROUP_ID] * 64
+                else num_lcm_blocks
+                * self._group_packing()[V41_GLOBAL_R1_GROUP_ID]
+                * 64
+                * self.attn_config.kvp_size
             ),
         )
 
@@ -336,8 +340,17 @@ class DeepseekV41Recipe(CacheRecipe):
         )
         # Ratio-2 pooling returns T FP32 rows, including inactive (-1) positions.
         compressor_output = queries * V41_HEAD_DIM * 4
+        # One request at a time: send/receive/ordered packed history plus
+        # owner/order/slot scratch. Keep this outside the persistent cache budget.
+        kvp_history = 0
+        if self.attn_config.kvp_size > 1:
+            history_rows = ((self.attn_config.context_len + 63) // 64 + 1) * 64
+            kvp_history = history_rows * (
+                4 * max(rows.global_row_bytes, rows.index_row_bytes) + 64
+            )
         return (
-            metadata
+            kvp_history
+            + metadata
             + selections
             + compressor_output
             + native_attention

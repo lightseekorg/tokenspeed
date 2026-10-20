@@ -91,8 +91,6 @@ class DeepseekV41DSpark(BaseDrafter):
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
         )
-        self._validate_tp_only_mapping(draft_model_runner.mapping)
-
         self.device = torch.device(draft_model_runner.device)
         self.draft_model = draft_model_runner.model
         self.model = self.draft_model.model
@@ -115,25 +113,21 @@ class DeepseekV41DSpark(BaseDrafter):
         self.candidates, self.partials = dspark_greedy_workspace(
             int(self.draft_model.mapping.attn.tp_size),
             max_bs,
-            int(self.draft_model.lm_head.num_embeddings_per_partition),
+            int(self.model.markov_projection.num_embeddings_per_partition),
             self.device,
         )
 
-    @staticmethod
-    def _validate_tp_only_mapping(mapping) -> None:
-        dp_size = int(mapping.attn.dp_size)
-        if dp_size != 1:
-            raise ValueError(
-                "Week-0 DSPARK supports tensor parallelism only; "
-                f"got attention dp_size={dp_size}."
-            )
-
     def idle_forward_global_num_tokens(
-        self, global_num_tokens: list[int], global_bs: list[int]
+        self,
+        global_num_tokens: list[int],
+        global_bs: list[int],
+        *,
+        global_num_decodes: list[int],
     ) -> list[list[int]]:
-        # Block drafter: one draft forward proposes the whole block.
-        del global_bs
-        return [global_num_tokens]
+        # Only decode requests draft; all ranks join if any rank has decodes.
+        if not any(global_num_decodes):
+            return []
+        return [[batch * self.block_size for batch in global_num_decodes]]
 
     def wire_target(self, target_model) -> None:
         """Bind execution resources; model setup already configured capture."""
@@ -158,10 +152,40 @@ class DeepseekV41DSpark(BaseDrafter):
     ) -> None:
         num_extends = base_ctx.num_extends
         num_decodes = base_ctx.bs - num_extends
-        if num_decodes <= 0:
+        global_num_decodes = base_ctx.global_num_decodes
+        if global_num_decodes is None and base_ctx.global_bs is not None:
+            raise RuntimeError("DSpark attention DP requires per-rank decode counts")
+        if num_decodes == 0 and not any(global_num_decodes or []):
             return
         backend = base_ctx.attn_backend
         pool = base_ctx.token_to_kv_pool
+        draft_ctx = ForwardContext(
+            attn_backend=backend,
+            token_to_kv_pool=pool,
+            bs=num_decodes,
+            num_extends=0,
+            output_layout=ForwardOutputLayout(0, 0, num_decodes, self.block_size),
+            input_num_tokens=num_decodes * self.block_size,
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            global_num_tokens=(
+                [batch * self.block_size for batch in global_num_decodes]
+                if global_num_decodes is not None
+                else None
+            ),
+            # global_bs keeps the round's total request counts, as in the idle
+            # ranks' draft context; the decode-only counts the draft sizes by
+            # ride in global_num_decodes and global_num_tokens.
+            global_bs=base_ctx.global_bs,
+            global_num_decodes=global_num_decodes,
+            all_decode_or_idle=base_ctx.all_decode_or_idle,
+        )
+        if num_decodes == 0:
+            # A prefill-only rank still joins the peers' draft MoE collectives.
+            draft_ctx.forward_mode = ForwardMode.IDLE
+            empty = next_tokens.new_empty(0)
+            self.draft_model_runner.forward(draft_ctx, input_ids=empty, positions=empty)
+            return
         meta = backend.query_metadata(ForwardMode.DECODE)
         width = self.spec_num_tokens
         # The anchor is the last accepted verify row; it and every earlier
@@ -172,26 +196,25 @@ class DeepseekV41DSpark(BaseDrafter):
             meta.request_indices[: num_decodes * width : width],
         )
         bonus = next_tokens[num_extends:, 0]
-        draft_ctx = ForwardContext(
-            attn_backend=backend,
-            token_to_kv_pool=pool,
-            bs=num_decodes,
-            num_extends=0,
-            output_layout=ForwardOutputLayout(0, 0, num_decodes, self.block_size),
-            input_num_tokens=num_decodes * self.block_size,
-            forward_mode=ForwardMode.DECODE,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            all_decode_or_idle=base_ctx.all_decode_or_idle,
-        )
         draft_hidden = self.model.forward_backbone(
             bonus, start_pos, history_slots, pool, draft_ctx
         )
         local_logits = self.model.local_base_logits(draft_hidden, self.lm_head.weight)
+        # The greedy step's shard offsets come from the Markov projection, so
+        # the target head's logits must span its local vocabulary.
+        markov_vocab = int(self.model.markov_projection.num_embeddings_per_partition)
+        if local_logits.shape[-1] != markov_vocab:
+            raise ValueError(
+                "DSpark base logits do not span the Markov projection's local "
+                f"vocabulary: {local_logits.shape[-1]} != {markov_vocab}"
+            )
         sample_dspark_block_greedy(
             local_logits,
             bonus,
             self.model.markov_head,
-            self.lm_head,
+            # The target head is ReplicatedLinear under DP; the Markov head
+            # retains the identical vocabulary layout, including TP padding.
+            self.model.markov_projection,
             self.tp_group,
             self.candidates,
             self.partials,
@@ -240,10 +263,11 @@ class DeepseekV41DSpark(BaseDrafter):
         # accepted verify position. Incomplete prefills have no token, so
         # their rows in [num_prefill_outputs, num_extends) are left as is.
         next_tokens = self.next_tokens_buf[: base_ctx.bs]
+        start_pos = self.start_pos_buf[:num_decodes]
         if rows == 0:
+            self._draft_decode_rows(base_ctx, start_pos, next_tokens)
             return next_tokens
 
-        start_pos = self.start_pos_buf[:num_decodes]
         num_prefill_outputs = base_ctx.output_layout.num_prefill_outputs
         dsv41.dspark_anchors(
             output_tokens,

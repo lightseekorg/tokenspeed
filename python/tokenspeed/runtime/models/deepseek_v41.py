@@ -45,9 +45,9 @@ the candidate source on) runs on the rows the backend's ``decoder_view()``
 keeps -- each prompt's last window (one row for a chunk that leaves its prompt
 open) plus every decode row -- after the candidate source has written the
 decoder's global KV for all rows. DSpark captures the kept rows and the model
-reports them as ``ctx.captured_rows``. PP, CP and narrowing under attention DP
-are not implemented. Attention and MoE TPxEP widths must match to keep the HC
-stream replicated on attention TP.
+reports them as ``ctx.captured_rows``. PP and CP are not implemented.
+Attention and MoE TPxEP widths match, or fused EP keeps attention/dense/MoE
+TP1 rows local. Its dispatch exchanges actual counts after CED narrowing.
 
 The forward is four stages on one path -- ``encoder_forward`` (embedding and
 the layers below the candidate source, one row per token), ``narrowing_forward``
@@ -1137,17 +1137,43 @@ class DeepseekV41Attention(nn.Module):
                         rows.query.request_indices,
                     )
                 if self.indexer is not None:
+                    partition = None
                     if backend.indexer_needs_scores(
                         self.layer_id, positions, requests, mode
                     ):
-                        index_q, index_weights = self.indexer(
+                        partition = (
+                            backend.plan_indexer_queries(
+                                self.layer_id, positions, requests, mode, index_group
+                            )
+                            if hidden_states.is_cuda
+                            and mode.is_extend()
+                            and not mode.is_mixed()
+                            else None
+                        )
+                        index_x, index_input, index_scale, index_positions = (
                             hidden_states,
                             index_q_input,
                             index_q_scale,
                             positions,
+                        )
+                        if partition is not None:
+                            # Only indexer projections consume the local query rows.
+                            index_x, index_input, index_positions = (
+                                t[partition.local_slice].contiguous()
+                                for t in (hidden_states, index_q_input, positions)
+                            )
+                            if index_q_scale is not None:
+                                index_scale = index_q_scale[
+                                    partition.local_slice
+                                ].contiguous()
+                        index_q, index_weights = self.indexer(
+                            index_x,
+                            index_input,
+                            index_scale,
+                            index_positions,
                             self.rotary_emb,
                         )
-                    if mode.is_decode():
+                    if mode.is_decode() or partition is not None:
                         prepared = backend.prepare_global_selection(
                             self.layer_id,
                             index_q,
@@ -1156,6 +1182,7 @@ class DeepseekV41Attention(nn.Module):
                             requests,
                             mode,
                             index_group,
+                            projected_partition=partition,
                         )
                         index_q = index_weights = None
             q, _ = self.wq_b(
@@ -1620,16 +1647,16 @@ class DeepseekV41Model(nn.Module):
         super().__init__()
         if mapping.pp_size != 1:
             raise NotImplementedError("V4.1 full-prompt baseline requires PP=1")
-        local_petit = (
-            get_moe_backend().is_gluon_petit()
+        local_fused_ep = (
+            (get_moe_backend().is_gluon_petit() or get_moe_backend().is_mega_moe())
             and mapping.attn.tp_size
             == mapping.dense.tp_size
             == mapping.moe.tp_size
             == 1
         )
-        if mapping.attn.tp_size != mapping.moe.tp_ep_size and not local_petit:
+        if mapping.attn.tp_size != mapping.moe.tp_ep_size and not local_fused_ep:
             raise NotImplementedError(
-                "V4.1 requires attention TP == MoE TPxEP or Gluon Petit with attention/dense/MoE TP1"
+                "V4.1 requires attention TP == MoE TPxEP or fused EP with attention/dense/MoE TP1"
             )
         if config.hc_mult != 4 or config.hc_sinkhorn_iters < 1:
             raise ValueError(
@@ -1874,14 +1901,14 @@ class DeepseekV41Model(nn.Module):
         if (
             view.keep_rows is not None
             and ctx.global_num_tokens is not None
-            and not self.layers[start].ffn.use_gluon_petit
+            and not self.layers[start].ffn.owns_ep_communication
         ):
             raise NotImplementedError(
                 "V4.1 CED narrowing under attention data parallelism needs the "
                 "narrowed row counts exchanged across ranks"
             )
         captured = list(state.captured)
-        # Petit exchanges actual local row counts inside its dispatch. The
+        # Fused EP exchanges actual local row counts inside its dispatch. The
         # original DP counts remain valid capacity bounds after CED narrowing;
         # no host exchange is needed for its routed or rank-local shared experts.
         with report_collective_sizing(ctx, view.metadata.positions.numel(), None):
@@ -2517,7 +2544,6 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             )
         self.checkpoint_load_report = {"loaded": len(loaded), "skipped": dict(skipped)}
         logger.info(f"V4.1 checkpoint coverage: {self.checkpoint_load_report!s}")
-        self.post_load_weights()
 
     def _load_missing_engram_tables(self, loaded: set[str]) -> None:
         """Load Engram embed tables from safetensors get_slice only."""
@@ -2638,6 +2664,12 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 pass
         else:
             self._load_text_weights(text_weights(), **kwargs)
+            # Post-process only after the loader's frame is gone: its
+            # parameter dict still references every loaded expert tensor, so
+            # interleaving the experts there kept the loader-format copies
+            # alive and doubled the expert footprint at the peak (TP4 + EP4 on
+            # 141 GB GPUs ran out of memory).
+            self.post_load_weights()
         missing = params.keys() - loaded
         if missing:
             raise ValueError(f"Missing V4.1 vision tensors: {sorted(missing)}")

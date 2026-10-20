@@ -41,12 +41,22 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.engine.event_loop import EventLoop  # noqa: E402
-from tokenspeed.runtime.engine.io_struct import NullSender  # noqa: E402
+from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
+    NullSender,
+    PauseSchedulerReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeSchedulerReqInput,
+)
+from tokenspeed.runtime.engine.memory_occupation import (  # noqa: E402
+    MemoryOccupationController,
+    MemoryRegion,
+)
 from tokenspeed.runtime.engine.pause import (  # noqa: E402
     PauseController,
     PauseHooks,
     PauseState,
 )
+from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo  # noqa: E402
 
 
 class _State:
@@ -85,9 +95,18 @@ class _Scheduler:
 
     def __init__(self) -> None:
         self.submitted: list[list] = []
+        # PD lifecycle counts the release gate reads.
+        self.bootstrapping = 0
+        self.pd_transfers = 0
 
     def submit_requests(self, specs: list) -> None:
         self.submitted.append(list(specs))
+
+    def bootstrapping_size(self) -> int:
+        return self.bootstrapping
+
+    def pd_transfer_size(self) -> int:
+        return self.pd_transfers
 
     def waiting_size(self) -> int:
         return 0
@@ -109,6 +128,7 @@ class _FakeLoop:
         self.output_processor = _OutputProcessor(rid_to_state or {})
         self.scheduler = _Scheduler()
         self.has_dp = False
+        self.kv_transfer = None
 
     def _submit_scheduler_requests(self, specs: list) -> None:
         self.scheduler.submit_requests(specs)
@@ -219,6 +239,48 @@ def test_admission_gate_warns_when_pause_coalesced_with_requests(
     assert "TODO(pause-fifo)" in caplog.text
 
 
+class _Transfer:
+    def __init__(self) -> None:
+        self.registered: list[tuple[str, BootstrapInfo]] = []
+
+    def register(self, request_id: str, bootstrap: BootstrapInfo) -> None:
+        self.registered.append((request_id, bootstrap))
+
+
+@pytest.mark.parametrize("state", [PauseState.PAUSED_NEW, PauseState.PAUSED_ALL])
+def test_buffered_pd_handshake_starts_only_when_live_request_is_admitted(state):
+    hooks, loop = _hooks(
+        rid_to_state={"live": _State(), "aborted": _State(finished=True)}
+    )
+    transfer = _Transfer()
+    loop.kv_transfer = transfer
+    hooks._pause.state = state
+    specs = [_spec("live"), _spec("aborted"), _spec("gone")]
+    infos = [BootstrapInfo("127.0.0.1", 1234, i) for i in range(3)]
+    for spec, info in zip(specs, infos, strict=True):
+        hooks.register_pd_admission(spec.request_id, info)
+    assert hooks.withhold_admissions(specs, True)
+    hooks.apply_transitions(_GrammarManager())
+    assert transfer.registered == []
+
+    hooks._pause.handle_resume(ResumeSchedulerReqInput())
+    hooks.apply_transitions(_GrammarManager())
+    assert transfer.registered == [("live", infos[0])]
+    assert loop.scheduler.submitted == [[specs[0]]]
+    assert hooks._pause.buffered_pd_bootstraps == {}
+    hooks.apply_transitions(_GrammarManager())
+    assert transfer.registered == [("live", infos[0])]
+
+
+def test_unpaused_pd_handshake_starts_immediately():
+    hooks, loop = _hooks()
+    transfer = _Transfer()
+    loop.kv_transfer = transfer
+    info = BootstrapInfo("127.0.0.1", 1234, 42)
+    hooks.register_pd_admission("live", info)
+    assert transfer.registered == [("live", info)]
+
+
 # --- paused_idle_step ---------------------------------------------------------
 
 
@@ -251,17 +313,168 @@ def test_reset_caches_for_release_uses_scheduler_clear_when_present() -> None:
     assert hooks.reset_caches_for_release()
 
 
-def test_kv_repair_after_wake_delegates_to_the_injected_device() -> None:
-    cleared: list[str] = []
-    hooks, _ = _hooks(
-        device=SimpleNamespace(run_kv_repair=lambda: cleared.append("repair"))
+class _Device:
+    """Records the data-plane work the memory regions hand to the handle."""
+
+    def __init__(self, trace: list[str]) -> None:
+        self._trace = trace
+
+    def synchronize(self) -> None:
+        self._trace.append("synchronize")
+
+    def prepare_kv_release(self) -> None:
+        self._trace.append("prepare_kv_release")
+
+    def finish_kv_resume(self) -> None:
+        self._trace.append("finish_kv_resume")
+
+    def suspend_nccl(self) -> None:
+        self._trace.append("suspend_nccl")
+
+    def resume_nccl(self) -> None:
+        self._trace.append("resume_nccl")
+
+
+class _Saver:
+    def __init__(self, trace: list[str]) -> None:
+        self._trace = trace
+
+    def pause(self, tag: str) -> None:
+        self._trace.append(f"pause:{tag}")
+
+    def resume(self, tag: str) -> None:
+        self._trace.append(f"resume:{tag}")
+
+
+def test_kv_region_quiesces_before_unmapping_and_repairs_after_remapping() -> None:
+    trace: list[str] = []
+    hooks, _ = _hooks(device=_Device(trace))
+    regions = hooks.memory_regions(_Saver(trace), nccl_suspendable=True)
+
+    regions["kv_cache"].release()
+    regions["kv_cache"].resume()
+
+    # Which pools and peers get walked is the data plane's business; this
+    # side only orders the handle's work around the unmap and the re-map.
+    assert trace == [
+        "prepare_kv_release",
+        "pause:kv_cache",
+        "resume:kv_cache",
+        "finish_kv_resume",
+    ]
+
+
+def test_allocator_regions_synchronize_before_unmapping_and_nccl_suspends() -> None:
+    trace: list[str] = []
+    hooks, _ = _hooks(device=_Device(trace))
+    regions = hooks.memory_regions(_Saver(trace), nccl_suspendable=True)
+
+    for tag in ("weights", "cuda_graph", "nccl"):
+        regions[tag].release()
+    for tag in ("nccl", "cuda_graph", "weights"):
+        regions[tag].resume()
+
+    assert trace == [
+        "synchronize",
+        "pause:weights",
+        "synchronize",
+        "pause:cuda_graph",
+        "suspend_nccl",
+        "resume_nccl",
+        "resume:cuda_graph",
+        "resume:weights",
+    ]
+
+
+def test_no_nccl_region_without_an_nccl_that_can_suspend() -> None:
+    trace: list[str] = []
+    hooks, _ = _hooks(device=_Device(trace))
+
+    regions = hooks.memory_regions(_Saver(trace), nccl_suspendable=False)
+
+    assert sorted(regions) == ["cuda_graph", "kv_cache", "weights"]
+
+
+class _TransferPeer:
+    def __init__(self) -> None:
+        self.inflight = False
+
+    def has_inflight_transfers(self) -> bool:
+        return self.inflight
+
+
+def test_transfers_idle_needs_no_bootstrap_no_pinned_pages_and_an_idle_peer() -> None:
+    hooks, loop = _hooks()
+    # Outside PD: no peer, nothing bootstrapping or pinned.
+    assert hooks.transfers_idle_for_release()
+
+    peer = _TransferPeer()
+    loop.kv_transfer = peer
+    assert hooks.transfers_idle_for_release()
+
+    loop.scheduler.bootstrapping = 1
+    assert not hooks.transfers_idle_for_release()
+    loop.scheduler.bootstrapping = 0
+    loop.scheduler.pd_transfers = 2
+    assert not hooks.transfers_idle_for_release()
+    loop.scheduler.pd_transfers = 0
+    # The request is gone, but its sender/receiver is still registered.
+    peer.inflight = True
+    assert not hooks.transfers_idle_for_release()
+
+
+@pytest.mark.parametrize("mode", ["wait", "keep"])
+@pytest.mark.parametrize("pd", [False, True])
+def test_release_with_buffered_specs_refuses_only_pd_without_changing_pause(mode, pd):
+    class Sender:
+        def __init__(self):
+            self.items = []
+
+        def send_pyobj(self, reply):
+            self.items.append(reply)
+
+    sender = Sender()
+    pause = PauseController(sender)
+    loop = _FakeLoop()
+    if pd:
+        loop.kv_transfer = _TransferPeer()
+        loop.kv_transfer.inflight = True
+    hooks = PauseHooks(loop, pause, None)
+    calls = []
+    memory = MemoryOccupationController(
+        send_func=sender,
+        pause_controller=pause,
+        regions={
+            "weights": MemoryRegion(
+                release=lambda: calls.append("release"), resume=lambda: None
+            )
+        },
+        enabled=True,
+        reset_caches_fn=lambda: True,
+        transfers_idle_fn=hooks.transfers_idle_for_release,
+        release_refusal_fn=hooks.memory_release_refusal,
+        weights_busy_fn=lambda: False,
     )
+    pause.handle_pause(PauseSchedulerReqInput(mode=mode))
+    pause.maybe_finish_drain(loop.scheduler)
+    pause.buffer_specs([_spec("buffered")])
+    prior_state = pause.state
 
-    hooks.kv_repair_after_wake()
+    memory.handle_release(ReleaseMemoryOccupationReqInput(tags=["weights"]))
 
-    # Which pools get walked is the data plane's business; this side only
-    # says when, and cannot reach a pool to walk it itself.
-    assert cleared == ["repair"]
+    if pd:
+        assert not sender.items[-1].success
+        assert "buffered" in sender.items[-1].message
+        assert pause.state == prior_state and not pause.is_drain_pending
+        assert not memory.is_releasing_or_released and calls == []
+        # Follow the refusal's recovery instruction: resume, admit and drain
+        # the buffered request before asking for a release again.
+        pause.handle_resume(ResumeSchedulerReqInput())
+        assert len(pause.take_buffered_specs()) == 1
+        loop.kv_transfer.inflight = False
+        memory.handle_release(ReleaseMemoryOccupationReqInput(tags=["weights"]))
+    pause.maybe_finish_drain(loop.scheduler)
+    assert sender.items[-1].success and calls == ["release"]
 
 
 if __name__ == "__main__":

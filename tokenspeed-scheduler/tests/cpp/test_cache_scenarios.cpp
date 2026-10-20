@@ -3569,7 +3569,6 @@ TEST_F(JunctionCutSuite, CutsTheFirstChunkAtTheJunctionAndPublishesTheCheckpoint
     RequestSpec seed = MakeRequestSpec("seed", /*num_pages=*/6);
     Submit(seed);
     PlanOnce();  // chunk end at token 8: KV pages published, no state
-    PlanOnce();  // aligned checkpoint at token 10, before the replay tail
     PlanOnce();  // prompt end at token 12
     SendForwardDone("seed", {42});
     PlanOnce();  // first decode: the prompt-end checkpoint (state@12) is published
@@ -3605,26 +3604,17 @@ TEST_F(JunctionCutSuite, CutsTheFirstChunkAtTheJunctionAndPublishesTheCheckpoint
     SendForwardDone("first");
 
     // The next chunk's admission publishes the junction's natural checkpoint
-    // (state@6 under the sixth token's page hash) and rotates the slots. This
-    // chunk ends at the aligned checkpoint, still holding the head of line.
-    plan = PlanOnce();
-    batch = FindForwardBatch(plan);
-    ASSERT_NE(batch, nullptr);
-    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
-    EXPECT_EQ(batch->extend_prefix_lens.at(0), 6);
-    EXPECT_EQ(batch->input_lengths.at(0), 4);
-    const std::vector<std::int32_t> rotated = batch->block_tables.at("state").at(0);
-    EXPECT_EQ(rotated[0], state_row[1]) << "the previous chunk's output is this chunk's input";
-    EXPECT_NE(rotated[1], 0);
-    EXPECT_NE(rotated[1], rotated[0]);
-    SendForwardDone("first");
-
-    // The final chunk completes the prompt, so `second` joins behind it.
+    // (state@6 under the sixth token's page hash) and rotates the slots. The
+    // chunk completes the prompt, so `second` joins the round behind it.
     plan = PlanOnce();
     batch = FindForwardBatch(plan);
     ASSERT_NE(batch, nullptr);
     ASSERT_EQ(batch->request_ids, (std::vector<std::string>{"first", "second"}));
-    EXPECT_EQ(batch->input_lengths.at(0), 2);
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 6);
+    const std::vector<std::int32_t> rotated = batch->block_tables.at("state").at(0);
+    EXPECT_EQ(rotated[0], state_row[1]) << "the previous chunk's output is this chunk's input";
+    EXPECT_NE(rotated[1], 0);
+    EXPECT_NE(rotated[1], rotated[0]);
     SendForwardDone("first", {7});
     SendForwardDone("second");
 

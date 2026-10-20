@@ -363,7 +363,8 @@ def test_shared_q_decode_graph_replay_with_auxiliary_indexer(monkeypatch):
     )
     selected = []
 
-    def prepare(owner, q, weights, pos, requests, mode, group):
+    def prepare(owner, q, weights, pos, requests, mode, group, *, projected_partition):
+        assert projected_partition is None
         selected.append((q, weights))
         return q, weights
 

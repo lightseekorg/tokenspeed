@@ -99,31 +99,27 @@ TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
                                                    /*snapshot_pool=*/nullptr, false);
     // A hit at 16 re-feeds 8 tokens first: 40 of budget leave 32 for new
     // tokens; a hit shorter than the window re-feeds only itself.
-    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/true, 100, 40, 0, /*state_checkpoint=*/0),
-              32);
-    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/4, /*resumes_hit=*/true, 100, 40, 0, /*state_checkpoint=*/0), 36);
+    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/true, 100, 40, 0), 32);
+    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/4, /*resumes_hit=*/true, 100, 40, 0), 36);
     // Nothing left for a new token: wait for a fresher budget.
-    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/true, 100, 8, 0, /*state_checkpoint=*/0), 0);
+    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/true, 100, 8, 0), 0);
     // A later chunk starts where the previous one ended and re-feeds nothing.
-    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/false, 100, 40, 0, /*state_checkpoint=*/0),
-              40);
+    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/false, 100, 40, 0), 40);
     // The final chunk is never shorter than the window: 70 unscheduled under
     // a budget of 64 leaves 62 so that 8 remain; the remainder itself fits.
-    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/0, /*resumes_hit=*/true, 70, 64, 0, /*state_checkpoint=*/0), 62);
-    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/62, /*resumes_hit=*/false, 8, 64, 0, /*state_checkpoint=*/0), 8);
+    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/0, /*resumes_hit=*/true, 70, 64, 0), 62);
+    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/62, /*resumes_hit=*/false, 8, 64, 0), 8);
     // A junction cuts the chunk at any token, under the debited budget.
-    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/true, 100, 40, /*junction=*/27,
-                                 /*state_checkpoint=*/0),
-              11);
+    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/true, 100, 40, /*junction=*/27), 11);
     // A junction inside the final window cannot be honored without leaving a
     // short final chunk: the chunk passes it and completes the prompt instead
     // of waiting forever; when the whole remainder does not fit the budget
     // yet, it waits like any other final window.
     EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/48, /*resumes_hit=*/false, /*unscheduled=*/8, 64,
-                                 /*junction=*/52, /*state_checkpoint=*/0),
+                                 /*junction=*/52),
               8);
     EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/48, /*resumes_hit=*/false, /*unscheduled=*/8, 6,
-                                 /*junction=*/52, /*state_checkpoint=*/0),
+                                 /*junction=*/52),
               0);
 
     // Without replayable groups the helper is min(budget, unscheduled), cut
@@ -131,11 +127,10 @@ TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
     BlockPool plain_pool(16, {1});
     const CacheCoordinator plain = MakeCoordinator(FullOnlySpecs(), 4, plain_pool, /*enable_l3_storage=*/false, nullptr,
                                                    /*snapshot_pool=*/nullptr, false);
-    EXPECT_EQ(PrefillChunkTokens(plain, 16, true, 100, 40, 0, /*state_checkpoint=*/0), 40);
-    EXPECT_EQ(PrefillChunkTokens(plain, 16, true, 30, 40, 0, /*state_checkpoint=*/0), 30);
-    EXPECT_EQ(PrefillChunkTokens(plain, 16, false, 100, 40, /*junction=*/21, /*state_checkpoint=*/0), 5);
-    EXPECT_EQ(PrefillChunkTokens(plain, 21, false, 95, 40, /*junction=*/21, /*state_checkpoint=*/0), 40)
-        << "a junction already passed";
+    EXPECT_EQ(PrefillChunkTokens(plain, 16, true, 100, 40, 0), 40);
+    EXPECT_EQ(PrefillChunkTokens(plain, 16, true, 30, 40, 0), 30);
+    EXPECT_EQ(PrefillChunkTokens(plain, 16, false, 100, 40, /*junction=*/21), 5);
+    EXPECT_EQ(PrefillChunkTokens(plain, 21, false, 95, 40, /*junction=*/21), 40) << "a junction already passed";
     // A State group adds no alignment: chunks are cut by budget alone.
     BlockPool state_pool(16, {1, 1});
     const std::vector<CacheGroupSpec> with_state = {
@@ -147,36 +142,8 @@ TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
     };
     const CacheCoordinator hybrid = MakeCoordinator(with_state, 4, state_pool, /*enable_l3_storage=*/false, nullptr,
                                                     /*snapshot_pool=*/nullptr, false);
-    EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 100, 7, 0, /*state_checkpoint=*/0), 7);
-    EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 5, 7, 0, /*state_checkpoint=*/0), 5);
-}
-
-TEST(PrefillStateCheckpointTest, LongPromptsLeaveAReusablePageBeforeTheirReplayTail) {
-    auto specs = FullOnlySpecs();
-    specs.push_back(
-        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0});
-    BlockPool pool(64, {1, 1});
-    const CacheCoordinator hybrid = MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false);
-    EXPECT_EQ(PrefillStateCheckpointTokens(hybrid, 26, 8, 0), 24);
-    EXPECT_EQ(PrefillStateCheckpointTokens(hybrid, 24, 8, 0), 20) << "leave the last logits token";
-    EXPECT_EQ(PrefillStateCheckpointTokens(hybrid, 8, 8, 0), 0) << "short prompts keep one forward";
-    EXPECT_EQ(PrefillStateCheckpointTokens(hybrid, 26, 8, 7), 16) << "leave the configured replay tail";
-    EXPECT_EQ(PrefillStateCheckpointTokens(hybrid, 4, 2, 8), 0) << "no positive checkpoint fits";
-    EXPECT_EQ(PrefillChunkTokens(hybrid, 16, false, 8, 8, 0, 20), 4);
-    EXPECT_EQ(PrefillChunkTokens(hybrid, 20, false, 4, 8, 0, 20), 4);
-    EXPECT_EQ(PrefillChunkTokens(hybrid, 0, true, 24, 8, 6, 20), 6) << "an earlier KV junction still wins";
-
-    BlockPool plain_pool(64, {1});
-    const CacheCoordinator plain = MakeCoordinator(FullOnlySpecs(), 4, plain_pool, false, nullptr, nullptr, false);
-    EXPECT_EQ(PrefillStateCheckpointTokens(plain, 26, 8, 0), 0);
-
-    auto replay_specs = ReplayableSpecs();
-    replay_specs.push_back(specs.back());
-    BlockPool replay_pool(64, {1, 1, 1, 1});
-    const CacheCoordinator replay = MakeCoordinator(replay_specs, 4, replay_pool, false, nullptr, nullptr, false);
-    EXPECT_EQ(PrefillStateCheckpointTokens(replay, 30, 16, 0), 20);
-    EXPECT_EQ(PrefillChunkTokens(replay, 16, false, 14, 16, 0, 20), 4);
-    EXPECT_EQ(PrefillChunkTokens(replay, 20, false, 10, 16, 0, 20), 10);
+    EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 100, 7, 0), 7);
+    EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 5, 7, 0), 5);
 }
 
 TEST(MinPrefillChunkTokensTest, ReservesReplayPlusAWindowOrPage) {

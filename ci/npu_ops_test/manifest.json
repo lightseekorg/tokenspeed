@@ -1,0 +1,36 @@
+{
+  "schema_version": 3,
+  "watch_paths": [
+    "tokenspeed-kernel-npu/**",
+    "tokenspeed-kernel/python/**",
+    "python/pyproject.toml",
+    "ci/npu_ops_test/**",
+    ".github/workflows/pr-test-ascendnpu-arm.yml",
+    "test/ci_system/*ascend*"
+  ],
+  "expected_plans": "ci/npu_ops_test/expected-plans.json",
+  "execution": {
+    "phases": [
+      "accuracy",
+      "performance"
+    ],
+    "fail_fast": true
+  },
+  "performance_policy": {
+    "mode": "record_only"
+  },
+  "operators": [
+    {
+      "name": "scatter",
+      "accuracy_cases": 5,
+      "performance_configs": 6,
+      "script": "ci/npu_ops_test/tests/scatter-test.py"
+    },
+    {
+      "name": "virtual_slots_to_local",
+      "accuracy_cases": 48,
+      "performance_configs": 8,
+      "script": "ci/npu_ops_test/tests/virtual_slots_to_local-test.py"
+    }
+  ]
+}

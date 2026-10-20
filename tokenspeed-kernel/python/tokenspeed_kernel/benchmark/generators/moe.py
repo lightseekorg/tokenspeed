@@ -33,9 +33,14 @@ from tokenspeed_kernel.benchmark.harness import (
     PreparedBenchmark,
 )
 from tokenspeed_kernel.ops import moe as moe_ops
+from tokenspeed_kernel.ops.moe.grouped_route import torch_grouped_route
 from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
-from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
+from tokenspeed_kernel.selection import (
+    NoKernelFoundError,
+    resolve_kernel_override,
+    select_kernel,
+)
 from tokenspeed_kernel.signature import (
     FormatSignature,
     dense_tensor_format,
@@ -53,7 +58,13 @@ __all__ = [
 
 
 _IMPLEMENTED_MODEL_PROFILES = frozenset(
-    {"dsv41_flash_tp4", "glm53_flash_tp4", "kimi_k3_tp8", "qwen38_flash_tp2"}
+    {
+        "dsv41_flash_tp4",
+        "glm53_flash_tp4",
+        "kimi_k3_tp8",
+        "qwen38_flash_tp2",
+        "beam_fp8_tp4",
+    }
 )
 _IMPLEMENTED_INPUT_DTYPES = {
     "bfloat16": torch.bfloat16,
@@ -68,6 +79,7 @@ _IMPLEMENTED_ROUTING_WEIGHT_DTYPES = {
 }
 _IMPLEMENTED_WEIGHT_FORMATS = {
     "fp8": torch.float8_e4m3fn,
+    "fp8_channel": torch.float8_e4m3fn,
     "mxfp4": torch.uint8,
     # Unquantized expert weights in the BF16 input dtype.
     "unquant": torch.bfloat16,
@@ -75,11 +87,12 @@ _IMPLEMENTED_WEIGHT_FORMATS = {
 _IMPLEMENTED_ACTIVATIONS = frozenset({"silu", "situ", "swiglu"})
 _IMPLEMENTED_ROUTING_MODES = frozenset({"precomputed_topk"})
 _IMPLEMENTED_ROUTE_SCOPES = frozenset({"global", "local"})
-_IMPLEMENTED_ROUTE_DISTRIBUTIONS = frozenset({"router"})
+_IMPLEMENTED_ROUTE_DISTRIBUTIONS = frozenset({"router", "grouped_router"})
 _IMPLEMENTED_TOKEN_COUNT_SCOPES = frozenset({"global", "local"})
 _IMPLEMENTED_INTERNAL_ACTIVATION_DTYPES = frozenset({"input", "mxfp4"})
 _IMPLEMENTED_FP8_BLOCK_SHAPES = frozenset({(128, 128)})
 _MXFP4_GROUP_SIZE = 32
+_CHANNEL_WEIGHT_CONSTRUCTION = "per-output-channel-normal-0.02-v1"
 
 
 def _implemented_value(
@@ -229,6 +242,66 @@ def _intermediate_per_partition(intermediate_size: int, tp_size: int) -> int:
     return intermediate_size // tp_size
 
 
+def _grouped_routing_tensors(
+    *,
+    tokens: int,
+    experts: int,
+    topk: int,
+    num_groups: int,
+    group_topk: int,
+    topk_groups: int,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    logits = torch.randn(
+        (tokens, experts),
+        device=generator.device,
+        dtype=torch.float32,
+        generator=generator,
+    )
+    weights, ids = torch_grouped_route(
+        logits,
+        _correction_bias(experts, device=logits.device),
+        num_groups=num_groups,
+        group_topk=group_topk,
+        topk_groups=topk_groups,
+        topk=topk,
+        renormalize=normalize_topk_weights,
+        scale=routed_scaling_factor,
+    )
+    return logits, weights.contiguous(), ids.contiguous()
+
+
+def _grouping(parameters: dict, experts: int, topk: int) -> tuple[int, int, int]:
+    try:
+        values = tuple(
+            parameters[name] for name in ("num_groups", "group_topk", "topk_groups")
+        )
+    except KeyError as error:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "MoE grouped routing requires explicit grouping counts",
+        ) from error
+    if any(type(value) is not int or value <= 0 for value in values):
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "MoE grouping counts must be positive integers",
+        )
+    groups, group_topk, topk_groups = values
+    if (
+        experts % groups
+        or group_topk > experts // groups
+        or topk_groups > groups
+        or topk > topk_groups * (experts // groups)
+    ):
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "MoE grouping cannot select the requested experts",
+        )
+    return groups, group_topk, topk_groups
+
+
 def _num_local_experts(num_experts: int, ep_size: int) -> int:
     if num_experts % ep_size:
         raise BenchmarkCaseError(
@@ -272,6 +345,76 @@ def _fp8_weight_shapes(
 
 def _zero_fp8(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
     return torch.empty(shape, dtype=dtype, device="cuda").zero_()
+
+
+def _fp8_channel_weight_shapes(
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+) -> dict[str, tuple[int, ...]]:
+    return {
+        "w13": (num_local_experts, 2 * intermediate_size_per_partition, hidden_size),
+        "w13_scale": (num_local_experts, 2 * intermediate_size_per_partition),
+        "w2": (num_local_experts, hidden_size, intermediate_size_per_partition),
+        "w2_scale": (num_local_experts, hidden_size),
+    }
+
+
+def _make_fp8_channel_weights(
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+    ep_rank: int,
+    ep_size: int,
+    generator: torch.Generator,
+) -> SimpleNamespace:
+    shapes = _fp8_channel_weight_shapes(
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size_per_partition=intermediate_size_per_partition,
+    )
+    tensors = {
+        name: torch.empty(
+            shape,
+            device=generator.device,
+            dtype=torch.float32 if name.endswith("scale") else torch.float8_e4m3fn,
+        )
+        for name, shape in shapes.items()
+    }
+    # Build only one expert projection in FP32 at a time. Full Beam FP8
+    # storage is multi-GiB; a full FP32 source copy is unnecessary.
+    for expert in range(num_local_experts):
+        for name in ("w13", "w2"):
+            weight = (
+                torch.randn(
+                    shapes[name][1:],
+                    device=generator.device,
+                    dtype=torch.float32,
+                    generator=generator,
+                )
+                * 0.02
+            )
+            scale = (weight.abs().amax(dim=-1) / 448.0).clamp(min=2.0**-126)
+            tensors[name][expert].copy_(
+                (weight / scale[:, None]).to(torch.float8_e4m3fn)
+            )
+            tensors[f"{name}_scale"][expert].copy_(scale)
+            del weight, scale
+    return SimpleNamespace(
+        w13_weight=tensors["w13"],
+        w13_weight_scale=tensors["w13_scale"],
+        w2_weight=tensors["w2"],
+        w2_weight_scale=tensors["w2_scale"],
+        activation="silu",
+        swiglu_arg=None,
+        swiglu_beta=None,
+        w13_input_layout="concatenated",
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        num_local_experts=num_local_experts,
+    )
 
 
 def _ones(shape: tuple[int, ...]) -> torch.Tensor:
@@ -462,12 +605,15 @@ def _prepare_routed_weights(
     intermediate_size_per_partition: int,
     num_experts: int,
     num_local_experts: int,
+    top_k: int,
     ep_rank: int,
     swiglu_limit: float | None,
     situ_beta: float | None,
     situ_linear_beta: float | None,
     block_shape: tuple[int, int] | None,
     internal_activation_dtype: str,
+    fast_math: bool,
+    weight_seed: int,
 ) -> tuple[dict, SimpleNamespace]:
     from tokenspeed_kernel.ops import moe as moe_ops
 
@@ -481,13 +627,15 @@ def _prepare_routed_weights(
         ep_size=ep_size,
         ispp=intermediate_size_per_partition,
         hidden=hidden_size,
+        num_experts=num_experts,
+        top_k=top_k,
         swiglu_form="standard" if activation == "swiglu" else None,
         activation_clamped=swiglu_limit is not None,
         expert_id_repeats=False,
         fp8_scale_block_shape=block_shape,
         internal_activation_dtype=internal_activation_dtype,
         with_bias=False,
-        fast_math=False,
+        fast_math=fast_math,
         combine_order="rank",
         solution=None,
     )
@@ -516,6 +664,15 @@ def _prepare_routed_weights(
             situ_linear_beta=situ_linear_beta,
             ep_rank=ep_rank,
             ep_size=ep_size,
+        )
+    elif weight_dtype_name == "fp8_channel":
+        weights = _make_fp8_channel_weights(
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+            generator=_generator(weight_seed),
         )
     else:
         weights = _make_mxfp4_weights(
@@ -878,6 +1035,64 @@ def prepare_moe_apply(
             "MoE topk exceeds the selected expert pool",
         )
 
+    channel = weight_dtype_name == "fp8_channel"
+    grouped = route_distribution == "grouped_router"
+    if model_profile == "beam_fp8_tp4" and not channel:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "Beam apply benchmarks require FP8 channel weights",
+        )
+    if channel and not (
+        model_profile == "beam_fp8_tp4"
+        and activation == "silu"
+        and internal_activation_dtype == "input"
+        and grouped
+        and route_scope == "global"
+        and router_logits_dtype == torch.float32
+        and ep_size == 1
+        and ep_rank == 0
+        and tp_size == 4
+        and parameters.get("fp8_scale_block_shape") is None
+    ):
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "FP8 channel benchmarks require Beam TP4/EP1, SiLU, FP32 global grouped routes and input activations",
+        )
+    if grouped and not channel:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "Grouped-route apply benchmarks require FP8 channel weights",
+        )
+    grouping = _grouping(parameters, num_experts, topk) if grouped else None
+    if channel:
+        for name, required in (
+            ("weight_storage_dtype", "float8_e4m3fn"),
+            ("scale_dtype", "float32"),
+            ("route_weights_dtype", "float32"),
+            ("route_ids_dtype", "int32"),
+        ):
+            _implemented_value(name, parameters[name], {required})
+    fast_math = parameters["fast_math"] if channel else False
+    if type(fast_math) is not bool:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE, "MoE fast_math must be boolean"
+        )
+    weight_seed = request.seed ^ 0x4245414D
+    if channel:
+        # Only apply may be overridden in a separate timing process. Routing
+        # overrides would change the synthetic input distribution unnoticed.
+        for operation in ("grouped_route", "router_select", "route_epilogue", "plan"):
+            if resolve_kernel_override("moe", operation, None):
+                raise BenchmarkCaseError(
+                    BenchmarkStatus.INVALID_CASE,
+                    f"Beam apply preparation refuses moe.{operation} override",
+                )
+        if resolve_kernel_override("quantization", "fp8", None):
+            raise BenchmarkCaseError(
+                BenchmarkStatus.INVALID_CASE,
+                "Beam apply preparation refuses quantization.fp8 override",
+            )
+
     load_builtin_kernels()
     plan, weights = _prepare_routed_weights(
         weight_dtype_name=weight_dtype_name,
@@ -890,12 +1105,15 @@ def prepare_moe_apply(
         intermediate_size_per_partition=intermediate_size_per_partition,
         num_experts=num_experts,
         num_local_experts=num_local_experts,
+        top_k=topk,
         ep_rank=ep_rank,
         swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         block_shape=block_shape,
         internal_activation_dtype=internal_activation_dtype,
+        fast_math=fast_math,
+        weight_seed=weight_seed,
     )
     spec = KernelRegistry.get().get_by_name(plan["apply_kernel_name"])
     if spec is None:
@@ -912,17 +1130,54 @@ def prepare_moe_apply(
     )
     route_experts = num_local_experts if route_scope == "local" else num_experts
     expert_start = ep_rank * num_local_experts if route_scope == "local" else 0
-    router_logits, topk_weights, topk_ids = _routing_tensors(
+    routing_arguments = dict(
         tokens=tokens,
         experts=route_experts,
         topk=topk,
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
-        router_logits_dtype=router_logits_dtype,
-        weights_dtype=torch.float32,
         generator=generator,
-        expert_start=expert_start,
     )
+    if grouped:
+        num_groups, group_topk, topk_groups = grouping
+        router_logits, topk_weights, topk_ids = _grouped_routing_tensors(
+            **routing_arguments,
+            num_groups=num_groups,
+            group_topk=group_topk,
+            topk_groups=topk_groups,
+        )
+    else:
+        router_logits, topk_weights, topk_ids = _routing_tensors(
+            **routing_arguments,
+            router_logits_dtype=router_logits_dtype,
+            weights_dtype=torch.float32,
+            expert_start=expert_start,
+        )
+    channel_parameters = {}
+    if channel:
+        channel_parameters = {
+            "weight_storage_dtype": str(weights.w13_weight.dtype).removeprefix(
+                "torch."
+            ),
+            "scale_dtype": str(weights.w13_weight_scale.dtype).removeprefix("torch."),
+            "route_weights_dtype": str(topk_weights.dtype).removeprefix("torch."),
+            "route_ids_dtype": str(topk_ids.dtype).removeprefix("torch."),
+            "num_groups": num_groups,
+            "group_topk": group_topk,
+            "topk_groups": topk_groups,
+            "fast_math": fast_math,
+            "internal_activation_dtype": internal_activation_dtype,
+            "weight_seed": weight_seed,
+            "weight_construction": _CHANNEL_WEIGHT_CONSTRUCTION,
+            "routes_per_expert": torch.bincount(
+                topk_ids.long().flatten(), minlength=num_experts
+            )
+            .cpu()
+            .tolist(),
+            "selected_apply_registration": spec.name,
+            "apply_override": resolve_kernel_override("moe", "apply", None),
+            "precision_contract": "BF16 input; native FP8 leaf-owned quantization; FP32 FC1 activation; BF16 before FC2 FP8 quantization; BF16 FC2; ordered FP32 route combine to BF16",
+        }
 
     def invoke() -> object:
         return moe_ops.moe_apply(
@@ -975,7 +1230,10 @@ def prepare_moe_apply(
             "mxfp4_group_size": (
                 _MXFP4_GROUP_SIZE if weight_dtype_name == "mxfp4" else None
             ),
-            "topk_generation": "sigmoid_bias_topk",
+            "topk_generation": (
+                "grouped_sigmoid_bias_topk" if grouped else "sigmoid_bias_topk"
+            ),
+            **channel_parameters,
         },
         validation=None,
     )
@@ -1173,12 +1431,15 @@ def prepare_latent_expert_shared(
         intermediate_size_per_partition=intermediate_size,
         num_experts=num_experts,
         num_local_experts=num_local_experts,
+        top_k=topk,
         ep_rank=ep_rank,
         swiglu_limit=None,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         block_shape=None,
         internal_activation_dtype="input",
+        fast_math=False,
+        weight_seed=request.seed ^ 0x4245414D,
     )
     w13_weight, w13_scale, w2_weight, w2_scale = _latent_expert_shared_weights(weights)
     shared_input = _randn(
