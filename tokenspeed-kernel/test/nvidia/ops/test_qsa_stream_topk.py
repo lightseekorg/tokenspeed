@@ -21,23 +21,22 @@
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk as stream_topk
 import torch
+from tokenspeed_kernel.platform import current_platform
+
+if not current_platform().is_blackwell:
+    pytest.skip(
+        "CuTe DSL QSA stream top-k requires NVIDIA Blackwell",
+        allow_module_level=True,
+    )
+
+import tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk as stream_topk
 from tokenspeed_kernel.ops.attention.qsa import qwen4_exp_qsa_block_topk
 from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
     can_use_cute_dsl_qwen4_exp_qsa_block_topk,
 )
 from tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk import (
     kernel as cute_dsl_qsa_stream_topk,
-)
-
-
-def _is_blackwell() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
-
-
-pytestmark = pytest.mark.skipif(
-    not _is_blackwell(), reason="CuTe DSL QSA stream top-k requires NVIDIA Blackwell"
 )
 
 

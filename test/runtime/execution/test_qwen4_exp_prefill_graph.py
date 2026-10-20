@@ -238,6 +238,7 @@ def test_qsa_break_replays_live_rows_positions_and_cache_writes(monkeypatch) -> 
                 qsa_locs=logical,
                 recent_locs=logical,
                 complete_blocks=torch.ones(count, device="cuda", dtype=torch.int32),
+                queries_per_request=(lengths[0] if len(set(lengths)) == 1 else None),
                 qsa_page_table=pool.compressed,
                 full_page_table=pool.compressed,
                 full_kernel_page_size=64,
