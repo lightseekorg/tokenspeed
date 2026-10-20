@@ -400,6 +400,9 @@ class ModelExecutorConfig:
     # every row.
     query_shard_size: int
     query_shard_rank: int
+    # Sleep/wake (--enable-memory-saver): decode CUDA graphs are captured into
+    # the memory saver's ``cuda_graph`` region so a release can free them.
+    enable_memory_saver: bool
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -503,6 +506,7 @@ class ModelExecutorConfig:
             decode_only_attention=server_args.mapping.attn.head_tp_serves_decode_only,
             query_shard_size=server_args.mapping.attn.qcp_size,
             query_shard_rank=server_args.mapping.attn.qcp_rank,
+            enable_memory_saver=server_args.enable_memory_saver,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,

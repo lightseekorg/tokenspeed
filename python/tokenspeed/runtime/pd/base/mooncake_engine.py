@@ -95,6 +95,11 @@ class MooncakeTransferEngine:
         return ret_value
 
     def deregister(self, ptr):
+        """Deregister ``ptr`` from Mooncake.
+
+        Returns:
+            0 on success, nonzero on failure.
+        """
         try:
             ret_value = self.engine.unregister_memory(ptr)
         except Exception:
@@ -103,6 +108,7 @@ class MooncakeTransferEngine:
 
         if ret_value != 0:
             logger.debug(f"Mooncake memory deregistration {ptr!s} failed.")
+        return ret_value
 
     def initialize(
         self,

@@ -55,6 +55,27 @@ class DisaggPrefillExecutor:
         self._layerwise_interval = 1
         self._bootstrap_stall_logged_at: float | None = None
 
+    def has_inflight_transfers(self) -> bool:
+        """Whether a KV send is still registered (bootstrapping or sending)."""
+        return bool(self.senders)
+
+    def release_cache_registration(self) -> None:
+        """Deregister the cache arena before a sleep release unmaps it."""
+        if self.senders:
+            raise RuntimeError(
+                "cannot release the cache while KV sends are in flight: "
+                f"{sorted(self.senders)!r}"
+            )
+        self.kv_manager.deregister_buffer_from_engine()
+
+    def restore_cache_registration(self) -> None:
+        """Register the re-mapped cache arena with the same transfer engine.
+
+        The prefill node only initiates writes, from its own registration, so
+        no peer holds its memory keys and the session can stay.
+        """
+        self.kv_manager.restore_buffer_registration()
+
     def register_layerwise_step_counter(self, step_counter, interval: int) -> None:
         self._layerwise_enabled = True
         self._layerwise_interval = max(int(interval), 1)

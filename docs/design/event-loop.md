@@ -417,11 +417,23 @@ Current inventory:
 | `_gc_hooks` | `GcHooks` — `engine/gc_hooks.py` | self-contained (only its interval; no loop reference) | `note_round` |
 
 `_pause_hooks` and `_pd_hooks` also receive the `DeviceHandle`: both have
-work that must land on the data plane — the DP idle forward and the KV repair
-after a memory-saver wake, and the device writes that land a completed remote
-prefill. `PauseHooks` additionally supplies `reset_caches_for_release` and
-`kv_repair_after_wake` to the memory-occupation controller as callbacks.
-Those are not loop entry points — they fire on release/wake.
+work that must land on the data plane — the DP idle forward and the work
+around a memory-saver release/wake, and the device writes that land a
+completed remote prefill. `PauseHooks` additionally supplies the
+memory-occupation controller's regions (`memory_regions`: one release/resume
+pair per tag, whose data-plane half — quiescing copies, the PD transfer
+engine's registration, the KV repair, NCCL suspend — rides the handle) and its
+release gates (`reset_caches_for_release`, `transfers_idle_for_release`).
+Those are not loop entry points — they fire on release/wake. A disaggregated
+engine refuses new requests while a release is draining or memory is
+released: their transfer registration would name memory the release unmaps
+(and a decode node re-registers it under a new transfer session on wake).
+Release also waits for both weight-op FIFOs to empty through their usual
+same-round gate. It refuses a paused PD engine with buffered requests, whose
+transfers cannot drain until those requests are admitted. Their handshake
+registration is deferred until resume admits them: polling a handshake before
+its scheduler request exists would lose its completion event and strand the
+request after resume. Aborted buffered requests never register a transfer.
 
 `EplbHooks` is the online expert rebalance (`--enable-eplb`). The
 controller counts the forwards this rank submitted — real or DP-idle, so the
