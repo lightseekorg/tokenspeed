@@ -231,7 +231,7 @@ def test_block_selector_table_widths_and_query_rows_reuse_binary():
     out = torch.empty(24, 4, dtype=torch.int32, device="cuda")
     lens = torch.empty(24, dtype=torch.int32, device="cuda")
     logits = torch.randn(24, 8192, device="cuda")
-    # Real table capacities are multiples of64; preserve their existing
+    # Real table capacities are multiples of 64; preserve their existing
     # alignment information while varying the runtime dimensions and bound.
     index_block_select(
         logits[:6, :128].contiguous(),
