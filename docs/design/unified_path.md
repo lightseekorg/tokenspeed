@@ -91,6 +91,12 @@ the group-local page IDs differ. The probe arena reserves the sum of each
 group's rounded-up parent demand, using its virtual packing for sharded groups.
 Decode capture continues to use the reserved null page.
 
+Memory-saver boots skip the disposable graph-memory probe: the installed
+allocator cannot destroy a tagged probe graph pool and then capture again.
+They bind the real cache pool directly and capture the serving graphs once,
+leaving GPU-utilization headroom for graph memory. The rebind contract below
+applies to boots that perform the probe.
+
 `set_cache_pool` may run more than once on the same backend tree: a memory
 probe binds a small pool, captures into a throwaway graph pool, then binds
 the real pool. The contract is that a rebound backend is indistinguishable

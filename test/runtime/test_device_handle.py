@@ -1276,3 +1276,114 @@ def test_expert_placement_chunk_applies_then_synchronizes_the_execution_stream()
     )
     with pytest.raises(RuntimeError, match="--enable-eplb"):
         handle.apply_expert_placement((0,), rows, moves)
+
+
+# ----------------------------------------------------------------------
+# Memory-saver release/wake: what surrounds the unmap runs on the data plane.
+# ----------------------------------------------------------------------
+
+
+class _SleepArena:
+    def __init__(self, trace) -> None:
+        self._trace = trace
+
+    def synchronize(self) -> None:
+        self._trace.append("arena.synchronize")
+
+
+class _SleepPool:
+    def __init__(self, trace) -> None:
+        self._trace = trace
+        self.arena = _SleepArena(trace)
+
+    def clear_kv_buffers(self) -> None:
+        self._trace.append("clear_kv_buffers")
+
+
+class _SleepDeviceModule:
+    def __init__(self, trace) -> None:
+        self._trace = trace
+
+    def synchronize(self) -> None:
+        self._trace.append("device.synchronize")
+
+
+class _SleepExecutor:
+    """Only what the release/wake operations read off the executor."""
+
+    def __init__(self, trace) -> None:
+        self.forward_thread = _ForwardThread(trace)
+        self.device_module = _SleepDeviceModule(trace)
+        self.token_to_kv_pool = _SleepPool(trace)
+
+
+class _RegisteringDecodePeer(DisaggDecodeExecutor):
+    """A decode-role peer; the real ``__init__`` (sockets, engine) is bypassed."""
+
+    def __init__(self, trace) -> None:
+        self._trace = trace
+
+    def release_cache_registration(self) -> None:
+        self._trace.append("peer.deregister")
+
+    def restore_cache_registration(self) -> None:
+        self._trace.append("peer.register")
+
+
+def test_kv_release_quiesces_copies_and_deregisters_the_peer_on_the_forward_thread():
+    trace = []
+    handle = DeviceHandle(
+        _SleepExecutor(trace), kv_transfer=_RegisteringDecodePeer(trace)
+    )
+
+    handle.prepare_kv_release()
+    # One blocking submission: the offload copy streams, then the device, then
+    # the registration that pins the pages about to be unmapped.
+    assert trace == [
+        "run",
+        "arena.synchronize",
+        "device.synchronize",
+        "peer.deregister",
+    ]
+    trace.clear()
+
+    handle.finish_kv_resume()
+    # Zero the re-mapped garbage before a peer can write into it again.
+    assert trace == ["run", "clear_kv_buffers", "peer.register"]
+
+
+def test_kv_release_without_a_peer_only_quiesces_and_repairs():
+    trace = []
+    handle = DeviceHandle(_SleepExecutor(trace))
+
+    handle.prepare_kv_release()
+    handle.finish_kv_resume()
+    handle.synchronize()
+
+    assert trace == [
+        "run",
+        "arena.synchronize",
+        "device.synchronize",
+        "run",
+        "clear_kv_buffers",
+        "run",
+        "device.synchronize",
+    ]
+
+
+def test_nccl_suspend_and_resume_ride_the_forward_thread(monkeypatch):
+    from tokenspeed.runtime.execution import device as device_module
+
+    trace = []
+    monkeypatch.setattr(
+        device_module, "suspend_nccl_communicators", lambda: trace.append("suspend")
+    )
+    monkeypatch.setattr(
+        device_module, "resume_nccl_communicators", lambda: trace.append("resume")
+    )
+    handle = DeviceHandle(_SleepExecutor(trace))
+
+    handle.suspend_nccl()
+    handle.resume_nccl()
+
+    assert trace == ["run", "suspend", "run", "resume"]
