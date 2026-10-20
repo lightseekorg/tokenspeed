@@ -548,7 +548,7 @@ class Eagle4CandidateLogitsProcessor(LogitsProcessor):
         gather_dot(weight, global_ids, hidden, vocab_start, out=block[:, :nc])
         if self.tp_size > 1:
             block = all_gather(block, self.tp_group)
-        # Rank r's candidates: columns r * 5nc on of the gathered rows.
+        # Rank r's candidates: columns r * 5 * nc onward of the gathered rows.
         ranks, width = block.shape[1] // (5 * nc), 5 * nc
         cand_logits = block.as_strided(
             (ranks, rows, nc), (width, block.stride(0), 1), block.storage_offset()

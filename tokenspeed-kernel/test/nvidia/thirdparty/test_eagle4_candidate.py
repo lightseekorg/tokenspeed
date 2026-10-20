@@ -29,7 +29,7 @@ from tokenspeed_kernel.thirdparty.cuda.eagle4_candidate import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not current_platform().is_hopper_plus,
+    not torch.cuda.is_available() or not current_platform().is_hopper_plus,
     reason="needs an NVIDIA SM90+ GPU (thread-block clusters)",
 )
 

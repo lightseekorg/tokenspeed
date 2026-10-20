@@ -230,6 +230,10 @@ def robust_mean(data: list[float], convergence: float) -> tuple[float, bool]:
     mean = np.mean(kept)
     for _ in range(50):
         values = np.asarray(kept, dtype=np.float64)
+        if values.std() == 0:
+            # Identical samples span nothing; a zero mean still never converges.
+            range_rate = 0.0 if mean != 0 else np.inf
+            break
         with np.errstate(divide="ignore", invalid="ignore"):
             z = np.abs((values - values.mean()) / values.std())
         kept = [x for i, x in enumerate(kept) if z[i] < threshold]

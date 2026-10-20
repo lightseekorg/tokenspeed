@@ -57,6 +57,9 @@ def test_robust_mean_drops_outliers_and_reports_convergence() -> None:
     # Too spread to converge.
     _, converged = robust_mean([float(i) for i in range(1, 100)], 0.3)
     assert not converged
+    # Identical samples converge on their value; all-zero samples never do.
+    assert robust_mean([12.0] * 16, 0.3) == (12.0, True)
+    assert not robust_mean([0.0] * 16, 0.3)[1]
 
 
 def _record(us: int, count: int, q: int, kv: int, category: str):
@@ -72,7 +75,7 @@ def test_pipeline_estimates_stage_cost_per_interval(tmp_path) -> None:
     records = []
     for kind, widths in (("cache_slm", [1]), ("cache_llm", [1, 8])):
         for q in widths:
-            # Timing jitter of +-1 us that averages out: constant samples never converge.
+            # Timing jitter of +-1 us that averages out.
             records += [
                 _record(
                     (2 if kv < 128 else 3) * q * 8 + (-1) ** (kv // 4), 8, q, kv, kind

@@ -430,6 +430,7 @@ def _rounds(
             is_moe_target=False,
             exec_mode=0,
             benchmark_config=os.path.join(root, "config", "benchmark_config.json"),
+            file_group=None,
             chain_width_table=harness.chain_width_table,
             device=drafter.device,
             late=late,

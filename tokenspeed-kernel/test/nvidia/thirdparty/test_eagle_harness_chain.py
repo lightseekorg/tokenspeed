@@ -33,7 +33,7 @@ from tokenspeed_kernel.thirdparty.cuda.eagle_harness_chain import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not current_platform().is_nvidia,
+    not torch.cuda.is_available() or not current_platform().is_nvidia,
     reason="eagle_harness_chain CUDA kernel is NVIDIA-only",
 )
 

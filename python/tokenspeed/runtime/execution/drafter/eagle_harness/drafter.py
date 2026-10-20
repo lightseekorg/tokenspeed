@@ -93,6 +93,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
+from tokenspeed.runtime.layers.attention.configs.base import resolve_cache_layer_types
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackend,
@@ -134,13 +135,22 @@ class Eagle4(Eagle):
     are each row's candidate tokens, drafting trees on ``Eagle4TreeLanes``."""
 
     @override
-    def _bind_tree_lanes(self, config: TreeSpecConfig, max_bs: int) -> None:
-        super()._bind_tree_lanes(config, max_bs)
-        # Rebind EAGLE-4's lanes in place of the plain ones.
-        self.tree_lanes = Eagle4TreeLanes(
-            config.topk, config.num_steps, max_bs, self.device
+    def _make_tree_lanes(self, config: TreeSpecConfig, max_bs: int) -> Eagle4TreeLanes:
+        draft_config = self.draft_model_runner.model.config
+        # The draft layer's cache label, as its attention reads its window from it.
+        layer_types = resolve_cache_layer_types(
+            draft_config,
+            num_layers=draft_config.num_hidden_layers,
+            is_draft=True,
+            draft_block_decode=False,
         )
-        self.attn_backend.bind_tree_draft(self.tree_lanes)
+        return Eagle4TreeLanes(
+            config.topk,
+            config.num_steps,
+            max_bs,
+            self.device,
+            slides="sliding_attention" in layer_types,
+        )
 
     @override
     def _score_candidates(

@@ -90,13 +90,13 @@ def _attention(
 
 
 def _lane_router():
-    """A single-group draft router with EAGLE-4 lanes (K = 2, 3 steps) bound."""
+    """A single-group draft router with sliding-window EAGLE-4 lanes (K = 2, 3 steps) bound."""
     leaf = _StubLeaf(4, is_draft=True, spec=2)
     router = CacheGroupRouter(
         None, is_draft=True, spec_num_tokens=2, device="cpu", consumed_group_ids=None
     )
     router.bind(_geometry(), {FULL: leaf})
-    lanes = Eagle4TreeLanes(2, 3, 4, torch.device("cpu"))
+    lanes = Eagle4TreeLanes(2, 3, 4, torch.device("cpu"), slides=True)
     router.bind_tree_draft(lanes)
     router.init_cuda_graph_state(4)
     return router, leaf, lanes
@@ -264,7 +264,9 @@ def test_trtllm_lanes_match_reference(topk, steps, frozen, poison, kv_dtype):
     )
     router.bind(geometry, {FULL: leaf})
     router.init_cuda_graph_state(8)
-    lanes = Eagle4TreeLanes(topk, steps, 8, torch.device("cuda"))
+    lanes = Eagle4TreeLanes(
+        topk, steps, 8, torch.device("cuda"), slides=frozen is not None
+    )
     router.bind_tree_draft(lanes)
     lengths = torch.tensor(frontier, dtype=torch.int32, device="cuda")
     router.refresh_decode_metadata(

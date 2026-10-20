@@ -176,6 +176,7 @@ def _policy(
         is_moe_target=moe,
         exec_mode=exec_mode,
         benchmark_config=config,
+        file_group=None,
         chain_width_table=table,
         device=_DEVICE,
     )
@@ -706,6 +707,26 @@ def test_cost_widths_a_round_cannot_verify_are_refused(
             depth=8,
             verify=16,
             exec_mode=exec_mode,
+        )
+
+
+def test_chain_cost_widths_the_stop_test_does_not_price_are_refused(tmp_path) -> None:
+    """The chain stop test prices widths 2, 4, ..., 16 by position."""
+    _write_cost_dir(
+        str(tmp_path),
+        (1, 2, 4),
+        [0, 1, 2, 3, 4, 5, 6, 7, 15],
+        [0],
+        bs_slope=0.3,
+        cliff=0.0,
+    )
+    with pytest.raises(ValueError, match="chain cost data needs widths 1, 2, 4"):
+        _policy(
+            load_cost_data(str(tmp_path / "cost")),
+            topk=1,
+            depth=_CHAIN_DEPTH,
+            verify=16,
+            intensity="chain_intensity",
         )
 
 

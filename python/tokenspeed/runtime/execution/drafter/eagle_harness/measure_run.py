@@ -381,10 +381,11 @@ def main(argv: list[str] | None = None) -> None:
                 ):
                     print(f"[measure] batch {batch_size}: done", flush=True)
                     break
-                print(
-                    f"[measure] batch {batch_size}: unstable, retry {attempt + 1}/3",
-                    flush=True,
-                )
+                if attempt < 3:
+                    print(
+                        f"[measure] batch {batch_size}: unstable, retry {attempt + 1}/3",
+                        flush=True,
+                    )
             else:
                 raise SystemExit(f"batch {batch_size} stayed unstable")
     finally:

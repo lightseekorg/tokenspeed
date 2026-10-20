@@ -46,16 +46,24 @@ class Eagle4TreeLanes(TreeDraftInputs):
     * Lane windows up to 128 slots (EAGLE-Harness drafts past the verify
       budget): a row's ancestor mask is ``mask_words`` int64 words, window
       slot ``j`` at bit ``j % 64`` of word ``j // 64``.
-    * A sliding-window draft layer sees the window frozen at the round's
-      prefix end: each lane row decodes the committed prefix alone, over a
-      copy of its request's table row.
+    * A sliding-window draft layer (``slides``) sees the window frozen at
+      the round's prefix end: each lane row decodes the committed prefix
+      alone, over a copy of its request's table row.
     """
 
     def __init__(
-        self, topk: int, num_steps: int, max_bs: int, device: torch.device
+        self,
+        topk: int,
+        num_steps: int,
+        max_bs: int,
+        device: torch.device,
+        *,
+        slides: bool,
     ) -> None:
         super().__init__(topk, num_steps, max_bs, device)
         self.max_bs = max_bs
+        # Only a sliding-window draft layer reads the per-row tables and frontiers.
+        self.slides = slides
         self.mask_words = (self.num_slots + 63) // 64
         self.lane_mask = torch.zeros(
             (max_bs * topk * self.mask_words,), dtype=torch.int64, device=device
@@ -70,6 +78,8 @@ class Eagle4TreeLanes(TreeDraftInputs):
     @override
     def set_frontier(self, bs: int, frontier: torch.Tensor) -> None:
         super().set_frontier(bs, frontier)
+        if not self.slides:
+            return
         k = self.topk
         self.frontier_rows[: bs * k].view(bs, k).copy_(
             frontier[:bs, None].expand(-1, k)
@@ -79,14 +89,17 @@ class Eagle4TreeLanes(TreeDraftInputs):
     def cascade_rows(self, leaf: PagedAttentionBackend, bs: int) -> TreeCascadeRows:
         k = self.topk
         table = leaf.page_table_buf[:bs]
-        pages = leaf.page_table_buf.shape[1]
-        row_tables = self._row_tables.get(leaf)
-        if row_tables is None or row_tables.shape[1] != pages:
-            row_tables = table.new_zeros((self.max_bs * k, pages))
-            self._row_tables[leaf] = row_tables
-        row_table = row_tables[: bs * k]
-        # The lane attention kernels read dense page-table rows.
-        row_table.view(bs, k, -1).copy_(table[:, None].expand(-1, k, -1))
+        row_table = row_prefix_lens = None
+        if self.slides:
+            pages = leaf.page_table_buf.shape[1]
+            row_tables = self._row_tables.get(leaf)
+            if row_tables is None or row_tables.shape[1] != pages:
+                row_tables = table.new_zeros((self.max_bs * k, pages))
+                self._row_tables[leaf] = row_tables
+            row_table = row_tables[: bs * k]
+            # The lane attention kernels read dense page-table rows.
+            row_table.view(bs, k, -1).copy_(table[:, None].expand(-1, k, -1))
+            row_prefix_lens = self.frontier_rows[: bs * k]
         return TreeCascadeRows(
             page_table=table,
             seq_lens=self.window_seq_lens[:bs],
@@ -95,5 +108,5 @@ class Eagle4TreeLanes(TreeDraftInputs):
             rows=k,
             window=self.num_slots,
             row_page_table=row_table,
-            row_prefix_lens=self.frontier_rows[: bs * k],
+            row_prefix_lens=row_prefix_lens,
         )

@@ -181,6 +181,8 @@ _CHAIN_REF_COST = 2.43
 # Cliff: a cost step above the floor and ratio x the next; the stop test then looks 2 depths ahead.
 _CHAIN_CLIFF_MIN_COST = 0.15
 _CHAIN_CLIFF_RATIO = 1.5
+# A chain's measured verify widths 1, 2, 4, ..., 16 as width - 1, which the stop test indexes by step.
+_CHAIN_WIDTH_INDEX = [0, *range(1, 16, 2)]
 # The kernels' limit of measured target widths per interval.
 _MAX_WIDTHS = 32
 _INT32_MAX = 2**31 - 1
@@ -393,8 +395,7 @@ def _check_cost_data(
     context interval, a cache_length_step that is not a nonzero integer, fewer
     ratios than measured widths, more than 32 widths, widths that are not
     strictly increasing integers in [0, 2**31 - 1); a chain's widths other
-    than 1 (2, 4, ..., 16);
-    a tree's without width 1, or (exec mode 1) without a second one within
+    than 1, 2, 4, ..., 16; a tree's without width 1, or (exec mode 1) without a second one within
     the verify budget ``verify_num``, the width its batch cut verifies."""
     if not cost.intervals:
         raise ValueError(f"{where}: no context interval")
@@ -416,10 +417,10 @@ def _check_cost_data(
                 f"measured width and at most {_MAX_WIDTHS} strictly increasing "
                 f"widths in [0, 2**31 - 1), got {index}"
             )
-        if chain and (len(index) != 9 or index[1] != 1 or index[-1] != 15):
+        if chain and list(index) != _CHAIN_WIDTH_INDEX:
             raise ValueError(
-                f"{where} interval {interval}: chain cost data needs widths 2, 4, "
-                f"..., 16, got {index[1:]}"
+                f"{where} interval {interval}: chain cost data needs widths 1, 2, "
+                f"4, ..., 16 (index {_CHAIN_WIDTH_INDEX}), got {index}"
             )
         if not chain and (
             0 not in index
@@ -650,9 +651,9 @@ class DevicePolicy:
         is_moe_target: bool,
         exec_mode: int,
         benchmark_config: str,
+        file_group: dist.ProcessGroup | None,
         chain_width_table: ChainWidthTable,
         device: torch.device,
-        file_group: dist.ProcessGroup | None = None,
     ) -> None:
         self.chain = compute_intensity == "chain_intensity"
         self.node_top_k = node_top_k

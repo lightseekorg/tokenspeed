@@ -221,17 +221,21 @@ class Eagle(BaseDrafter):
 
     def _bind_tree_lanes(self, config: TreeSpecConfig, max_bs: int) -> None:
         """Bind the top-K draft lanes, as every tree drafter does."""
-        self.tree_lanes = TreeDraftInputs(
-            topk=config.topk,
-            num_steps=config.num_steps,
-            max_bs=max_bs,
-            device=self.device,
-        )
+        self.tree_lanes = self._make_tree_lanes(config, max_bs)
         self.attn_backend.bind_tree_draft(self.tree_lanes)
         self.lanes_per_request = config.topk
         self._tree_seed_lane_mask = torch.ones(
             config.topk, dtype=torch.int64, device=self.device
         ) << torch.arange(config.topk, device=self.device)
+
+    def _make_tree_lanes(self, config: TreeSpecConfig, max_bs: int) -> TreeDraftInputs:
+        """The draft lanes ``_bind_tree_lanes`` binds."""
+        return TreeDraftInputs(
+            topk=config.topk,
+            num_steps=config.num_steps,
+            max_bs=max_bs,
+            device=self.device,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
