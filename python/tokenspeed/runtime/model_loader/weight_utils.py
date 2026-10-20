@@ -55,6 +55,7 @@ from tokenspeed.runtime.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
 )
+from tokenspeed.runtime.layers.quantization.modelopt_mixed import normalize_quant_algo
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -135,17 +136,16 @@ def with_hf_quant_layers(quant_cfg: dict, hf_quant: dict) -> dict:
 
     ModelOpt writes both; a config.json copy can lack entries the export file
     has (Nemotron 3.5 Super VL's leaves out its MTP experts), which would load
-    those modules as unquantized. Entries whose algorithms disagree are refused.
+    those modules as unquantized. Algorithms must agree after alias normalization.
     """
     layers = dict(quant_cfg["quantized_layers"])
     missing = {}
     for name, entry in hf_quant.get("quantized_layers", {}).items():
         if name not in layers:
             missing[name] = entry
-        elif (
+        elif normalize_quant_algo(
             str(layers[name].get("quant_algo")).upper()
-            != str(entry.get("quant_algo")).upper()
-        ):
+        ) != normalize_quant_algo(str(entry.get("quant_algo")).upper()):
             raise ValueError(
                 f"config.json quantizes {name} as {layers[name]}, "
                 f"hf_quant_config.json as {entry}"
