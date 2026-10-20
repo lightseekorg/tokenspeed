@@ -60,7 +60,8 @@ def test_request_rows_and_padded_sink(monkeypatch, tokens, rank):
         torch.testing.assert_close(value, sink[rank * 8 : (rank + 1) * 8])
         return sink
 
-    def attention(query, *args):
+    def attention(query, *args, lse):
+        assert lse is None
         torch.testing.assert_close(query, full_q[rows])
         torch.testing.assert_close(args[6], sink)
         assert args[-2] is workspace

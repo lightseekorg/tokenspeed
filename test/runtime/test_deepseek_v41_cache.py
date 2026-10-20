@@ -2061,7 +2061,8 @@ def test_native_decode_receives_compact_window_and_real_lengths(monkeypatch, pos
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     captured = []
 
-    def selected(*args):
+    def selected(*args, lse):
+        assert lse is None
         captured.append(args)
         return torch.zeros_like(args[0])
 

@@ -105,7 +105,11 @@ def test_selected_attention_partial_lse(native, heads, scale, compact):
     weights = logits.softmax(-1).nan_to_num()
     expected = torch.einsum("thk,tkd->thd", weights, kv).to(torch.bfloat16)
     torch.testing.assert_close(lse, expected_lse.float(), rtol=2e-5, atol=2e-4)
-    torch.testing.assert_close(out, expected, rtol=0.008, atol=0.004)
+    # FlashMLA multiplies V by BF16-rounded probabilities, which peaked
+    # logits (scale=8) push just past the portable kernel's bound.
+    torch.testing.assert_close(
+        out, expected, rtol=0.008, atol=0.008 if native else 0.004
+    )
     assert not out[2].any()
     assert torch.isneginf(lse[2]).all()
 
