@@ -253,7 +253,7 @@ def test_iris_allreduce_sizes():
     flags = torch.zeros(1024, device=DEVICE, dtype=torch.int32)
     heaps = [1 << 40] * 8
     arch = comm.pull_all_reduce_arch_config()
-    common = dict(RANK=0, WORLD_SIZE=8, SUBGROUP_SIZE=arch.subgroup_size)
+    common = dict(RANK=0, WORLD_SIZE=8)
     common.update(WORDS_PER_LANE=2, ELEMENT_DTYPE=gl.bfloat16, ELEMENTS_PER_WORD=4)
     common.update(
         PEER_LOAD_CACHE=arch.peer_load_cache,

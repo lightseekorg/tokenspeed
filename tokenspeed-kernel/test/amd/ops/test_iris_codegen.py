@@ -73,6 +73,7 @@ def _compile(arch_name, kind, world_size):
     from tokenspeed_kernel.ops.communication._iris import all_reduce as ar
 
     arch = ar.pull_all_reduce_arch_config(_ARCH_VERSIONS[arch_name])
+    subgroup_size = triton.backends.amd.compiler.HIPOptions(arch=arch_name).warp_size
     if kind == "staged_oneshot":
         fn = ar.iris_pull_oneshot_staged
         signature = {
@@ -121,7 +122,6 @@ def _compile(arch_name, kind, world_size):
             "RANK": 0,
             "WORLD_SIZE": world_size,
             "NUM_WARPS": num_warps,
-            "SUBGROUP_SIZE": arch.subgroup_size,
             "WORDS_PER_LANE": ar._PULL_WORDS_PER_LANE,
             "ELEMENT_DTYPE": gl.bfloat16,
             "ELEMENTS_PER_WORD": ar._PACKED_WORD_BYTES // 2,
@@ -135,7 +135,7 @@ def _compile(arch_name, kind, world_size):
         }
         if two_shot:
             constexprs["BLOCK_WORDS"] = (
-                num_warps * arch.subgroup_size * ar._PULL_WORDS_PER_LANE // world_size
+                num_warps * subgroup_size * ar._PULL_WORDS_PER_LANE // world_size
             )
             constexprs["EXIT_BARRIER"] = kind == "pull_twoshot_exit"
         else:
@@ -149,7 +149,7 @@ def _compile(arch_name, kind, world_size):
         )
     kernel = triton.compile(
         source,
-        target=triton.backends.compiler.GPUTarget("hip", arch_name, arch.subgroup_size),
+        target=triton.backends.compiler.GPUTarget("hip", arch_name, subgroup_size),
         options={"num_warps": num_warps},
     )
     return kernel

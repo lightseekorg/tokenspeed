@@ -21,7 +21,6 @@
 """Iris all-reduce protocols and the synchronization used by its fusions."""
 
 import dataclasses
-import functools
 import math
 
 import torch
@@ -49,23 +48,18 @@ class PullAllReduceArchConfig:
     """Per-architecture code generation for the pull all-reduce protocols.
 
     Attributes:
-        subgroup_size: Lanes per subgroup the Gluon layouts are built for.
         peer_load_cache: Cache modifier for loads of peer symmetric memory;
             empty selects the default.
         remote_store_cache: Cache modifier for stores into peer symmetric
             memory; empty selects the default.
     """
 
-    subgroup_size: int
     peer_load_cache: str
     remote_store_cache: str
 
 
-_GFX950 = ArchVersion(9, 5)
-
 _PULL_ALL_REDUCE_ARCH_CONFIGS = {
-    _GFX950: PullAllReduceArchConfig(
-        subgroup_size=64,
+    ArchVersion(9, 5): PullAllReduceArchConfig(
         peer_load_cache=".cg",
         remote_store_cache=".wt",
     ),
@@ -73,26 +67,26 @@ _PULL_ALL_REDUCE_ARCH_CONFIGS = {
     # partially read sector over the fabric, and ".wt" peer stores are an order
     # of magnitude slower than plain ones.
     ArchVersion(12, 5): PullAllReduceArchConfig(
-        subgroup_size=32,
         peer_load_cache="",
         remote_store_cache="",
     ),
 }
 
 
-@functools.cache
 def pull_all_reduce_arch_config(
     arch: ArchVersion | None = None,
 ) -> PullAllReduceArchConfig:
     """Return the configuration for ``arch``, or for the current device.
 
-    Architectures without an entry keep gfx950's code generation.
+    Raises:
+        ValueError: ``arch`` has no pull all-reduce configuration.
     """
     if arch is None:
         arch = current_platform().arch_version
-    return _PULL_ALL_REDUCE_ARCH_CONFIGS.get(
-        arch, _PULL_ALL_REDUCE_ARCH_CONFIGS[_GFX950]
-    )
+    config = _PULL_ALL_REDUCE_ARCH_CONFIGS.get(arch)
+    if config is None:
+        raise ValueError(f"Iris pull all-reduce has no configuration for {arch}")
+    return config
 
 
 def _pull_scratch_numel(max_numel: int, world_size: int) -> int:
@@ -219,9 +213,10 @@ def _launch_pull_twoshot(
     elements_per_word = _PACKED_WORD_BYTES // inputs.element_size()
     numel = out.numel() if hc_post is None else out.numel() // 4
     partition_words = numel // peers.world_size // elements_per_word
+    subgroup_size = triton.runtime.driver.active.get_current_target().warp_size
     block_words = (
         _TWO_SHOT_NUM_SUBGROUPS
-        * arch.subgroup_size
+        * subgroup_size
         * _PULL_WORDS_PER_LANE
         // peers.world_size
     )
@@ -240,7 +235,6 @@ def _launch_pull_twoshot(
         NUM_PROGRAMS=num_programs,
         NUM_TILES=num_tiles,
         NUM_WARPS=_TWO_SHOT_NUM_SUBGROUPS,
-        SUBGROUP_SIZE=arch.subgroup_size,
         WORDS_PER_LANE=_PULL_WORDS_PER_LANE,
         ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
         ELEMENTS_PER_WORD=elements_per_word,
@@ -396,7 +390,6 @@ class ProducerPull:
             NUM_PROGRAMS=num_programs,
             NUM_TILES=num_tiles,
             NUM_WARPS=self.NUM_SUBGROUPS,
-            SUBGROUP_SIZE=arch.subgroup_size,
             WORDS_PER_LANE=_PULL_WORDS_PER_LANE,
             PUBLISH_READY=False,
             ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
@@ -905,8 +898,6 @@ def _iris_sync_rank_epoch(
     otherwise read each peer's counter directly. Counter comparisons allow
     wraparound and peers that have already advanced to the next epoch.
     """
-    # The host sizes the grid from the same subgroup size.
-    gl.static_assert(NUM_WARPS * SUBGROUP_SIZE == hip_utils.num_threads())
     ready_layout: gl.constexpr = gl.BlockedLayout(
         [1], [SUBGROUP_SIZE], [NUM_WARPS], [0]
     )
@@ -1093,7 +1084,6 @@ def iris_pull_oneshot(
     NUM_PROGRAMS,
     NUM_TILES,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
     WORDS_PER_LANE: gl.constexpr,
     PUBLISH_READY: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
@@ -1116,6 +1106,7 @@ def iris_pull_oneshot(
     and completion. All peer reads finish before the next producer can reuse
     the symmetric input; PUBLISH_READY selects how those counters are exchanged.
     """
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
     block_id = gl.program_id(0)
     local_heap = _iris_heap_base(
         RANK,
@@ -1281,7 +1272,6 @@ def iris_pull_twoshot(
     NUM_PROGRAMS,
     NUM_TILES,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
     WORDS_PER_LANE: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
@@ -1305,6 +1295,7 @@ def iris_pull_twoshot(
     EXIT_BARRIER adds a final peer wait for callers that stage inputs before
     launch. Both communication phases run in this one kernel.
     """
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
     block_id = gl.program_id(0)
     local_heap = _iris_heap_base(
         RANK,
