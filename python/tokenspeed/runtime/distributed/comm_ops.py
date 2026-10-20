@@ -182,6 +182,44 @@ def try_fused_dp_column_linear(
     )
 
 
+def try_fused_dp_row_linear(
+    tensor: torch.Tensor,
+    input_scales: torch.Tensor | None,
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor | None,
+    owner_rows: tuple[int, ...],
+    out: torch.Tensor,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
+) -> bool:
+    """Attempt a fused DP row-parallel linear operation on locally owned rows.
+
+    Fuses input all-to-all, quantization, GEMM, and reduce-scatter so each
+    owner receives all output channels for its own input rows.
+
+    Args:
+        tensor: Full input channels for this owner's physical token rows.
+        input_scales: FP32 per-128 scales for E4M3 input, or None for BF16.
+        weight: Local input-channel shard of the linear weight.
+        weight_scales: Block-FP8 weight scales, or None for unsupported formats.
+        owner_rows: Physical counts in subgroup order, including graph padding.
+        out: Caller-owned destination for this owner's complete output channels.
+        workspace: Collectively prepared scratch for this linear operation.
+        backend: Backend used to prepare the workspace; None selects the global
+            backend.
+
+    Returns:
+        True when the fused operation wrote out. False leaves out untouched so
+        the caller can run the ordinary all-to-all, GEMM, and reduce-scatter path.
+        Invalid inputs and execution failures remain visible.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.try_fused_dp_row_linear(
+        tensor, input_scales, weight, weight_scales, owner_rows, out, workspace
+    )
+
+
 def projection_all_gather(
     tensor: torch.Tensor,
     rows: int,
@@ -208,6 +246,8 @@ def projection_all_to_all(
     out: torch.Tensor | None,
     workspace: ProjectionWorkspace,
     backend: CommBackend | None,
+    *,
+    input_scales: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Exchange token/channel axes, optionally fusing forward FP8 quantization.
 
@@ -215,12 +255,14 @@ def projection_all_to_all(
     It requires out=None and returns borrowed output, optionally quantized to
     FP8 with 1x128 MN-major scales. Inverse maps [TP*rows,N/TP] to [rows,N],
     requires quantize=False and writes into caller-owned out; callers may
-    retain it across later communication calls.
+    retain it across later communication calls. For prequantized forward input,
+    input_scales supplies FP32 per-128 scales; both are exchanged unchanged
+    with inverse=False and quantize=False.
     """
     if backend is None:
         backend = get_global_backend()
     return backend.projection_all_to_all(
-        tensor, rows, inverse, quantize, out, workspace
+        tensor, rows, inverse, quantize, out, workspace, input_scales=input_scales
     )
 
 

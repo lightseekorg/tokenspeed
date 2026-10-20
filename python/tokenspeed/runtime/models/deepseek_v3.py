@@ -415,6 +415,7 @@ class DeepseekV3MoE(nn.Module):
             tp_size=self.mapping.moe.tp_size,
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
+            routing_mode=getattr(config, "moe_routing_mode", None),
             routing_config={
                 "n_group": getattr(config, "n_group", 0),
                 "topk_group": getattr(config, "topk_group", 0),

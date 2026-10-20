@@ -3124,9 +3124,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers: "
-            f"{attention_backend_names}, or a name a plugin registers. 'gluon' "
-            "forces registered Gluon kernels for supported attention "
-            "architectures.",
+            f"{attention_backend_names}, or a name a plugin registers. 'mha' "
+            "selects compatible registered MHA kernels; 'gluon' forces "
+            "registered Gluon MLA kernels.",
         )
         parser.add_argument(
             "--kda-backend",

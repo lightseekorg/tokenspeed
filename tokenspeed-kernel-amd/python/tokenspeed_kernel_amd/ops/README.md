@@ -1019,6 +1019,12 @@ FP8 conversion. A wave skips the rescale when none of its rows moved. Empty
 asm statements keep LLVM from moving each cluster's results across cluster
 barriers.
 
+### gfx950 MHA cached extension
+
+Cached attention supports grouped-query attention even when the number of
+query heads per KV head is not a power of two. Multi-token extensions preserve
+the masking semantics of full and sliding-window attention.
+
 ### gfx950 MLA extend
 
 `gluon_mla_extend_gfx950` computes absorbed MLA attention for cached extend
@@ -1623,6 +1629,12 @@ One program handles one token with four warps. It walks the expert vector
 once per selected route, keeps the maximum finite score, and breaks ties by
 the minimum expert id. The weight is the sigmoid captured for that expert.
 
+### gfx950 channel-FP8 experts with BF16 projection operands
+
+Channel-scaled FP8 expert weights can remain in their compact checkpoint
+format while projections use BF16 operands and FP32 accumulation. FP8 storage
+does not require native FP8 matrix arithmetic.
+
 ## Residual
 
 ### gfx1250 Kimi K3 AttnRes
@@ -1837,3 +1849,11 @@ FP32 bits of the quotient, and its codes are the correctly rounded
 `x / scale` cast to E4M3. Each program covers consecutive groups, with four
 threads per group and eight elements per thread: 32 groups and four warps
 below 49,152 groups, and 256 groups and eight warps from there.
+
+## Layernorm
+
+### gfx950 QK RMSNorm and SSMax query fusion
+
+Query normalization can be fused with position-dependent SSMax scaling while
+preserving the rounding of the separate operations. The positional scale
+applies only to queries; keys retain ordinary RMS normalization.

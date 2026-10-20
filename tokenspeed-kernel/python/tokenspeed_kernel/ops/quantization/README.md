@@ -9,6 +9,10 @@ For a 2-D input, the row count is a selection trait (`m`), so a kernel can
 bound the rows it takes (`m_max`). On NVIDIA SM100 and newer, `token`
 quantization of up to 64 rows runs the one-launch Triton per-token quantizer.
 
+Compressed-tensors W8A8 checkpoints require per-token quantization that
+preserves their minimum positive scale and rounding behavior. Token-group
+quantization is not an interchangeable substitute.
+
 Two functions write that quantizer's codes and scales from the kernel that
 produces the activation, so no separate quantize launch follows:
 `rmsnorm_quantize_fp8`, an RMSNorm that also quantizes its output, and

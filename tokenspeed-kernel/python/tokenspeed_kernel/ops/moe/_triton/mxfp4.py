@@ -103,6 +103,13 @@ def _validate(
         raise TypeError("do_finalize must be a bool")
     if topk_weights is None or topk_ids is None:
         raise ValueError("Triton MoE requires precomputed topk weights and ids")
+    precision_policy = plan.get("precision_policy", "default")
+    if precision_policy != "default":
+        raise ValueError(
+            f"Unsupported MXFP4 MoE precision policy: {precision_policy!r}"
+        )
+    if plan.get("output_scale", 1.0) != 1.0:
+        raise ValueError("MXFP4 MoE requires output_scale=1.0")
 
     w13 = w.w13_weight
     w13_scale = w.w13_weight_scale

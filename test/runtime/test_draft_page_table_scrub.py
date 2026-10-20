@@ -172,6 +172,7 @@ class TestIdleReplayScrubTest:
             DpForwardMetadata(
                 global_num_tokens=[0],
                 global_batch_size=[0],
+                global_num_decodes=[0],
                 global_forward_mode=[int(ForwardMode.IDLE)],
                 all_decode_or_idle=True,
                 all_extend=False,

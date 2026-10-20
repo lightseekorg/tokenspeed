@@ -45,9 +45,9 @@ the candidate source on) runs on the rows the backend's ``decoder_view()``
 keeps -- each prompt's last window (one row for a chunk that leaves its prompt
 open) plus every decode row -- after the candidate source has written the
 decoder's global KV for all rows. DSpark captures the kept rows and the model
-reports them as ``ctx.captured_rows``. PP, CP and narrowing under attention DP
-are not implemented. Attention and MoE TPxEP widths must match to keep the HC
-stream replicated on attention TP.
+reports them as ``ctx.captured_rows``. PP and CP are not implemented.
+Attention and MoE TPxEP widths match, or fused EP keeps attention/dense/MoE
+TP1 rows local. Its dispatch exchanges actual counts after CED narrowing.
 
 The forward is four stages on one path -- ``encoder_forward`` (embedding and
 the layers below the candidate source, one row per token), ``narrowing_forward``
@@ -1647,16 +1647,16 @@ class DeepseekV41Model(nn.Module):
         super().__init__()
         if mapping.pp_size != 1:
             raise NotImplementedError("V4.1 full-prompt baseline requires PP=1")
-        local_petit = (
-            get_moe_backend().is_gluon_petit()
+        local_fused_ep = (
+            (get_moe_backend().is_gluon_petit() or get_moe_backend().is_mega_moe())
             and mapping.attn.tp_size
             == mapping.dense.tp_size
             == mapping.moe.tp_size
             == 1
         )
-        if mapping.attn.tp_size != mapping.moe.tp_ep_size and not local_petit:
+        if mapping.attn.tp_size != mapping.moe.tp_ep_size and not local_fused_ep:
             raise NotImplementedError(
-                "V4.1 requires attention TP == MoE TPxEP or Gluon Petit with attention/dense/MoE TP1"
+                "V4.1 requires attention TP == MoE TPxEP or fused EP with attention/dense/MoE TP1"
             )
         if config.hc_mult != 4 or config.hc_sinkhorn_iters < 1:
             raise ValueError(
@@ -1901,14 +1901,14 @@ class DeepseekV41Model(nn.Module):
         if (
             view.keep_rows is not None
             and ctx.global_num_tokens is not None
-            and not self.layers[start].ffn.use_gluon_petit
+            and not self.layers[start].ffn.owns_ep_communication
         ):
             raise NotImplementedError(
                 "V4.1 CED narrowing under attention data parallelism needs the "
                 "narrowed row counts exchanged across ranks"
             )
         captured = list(state.captured)
-        # Petit exchanges actual local row counts inside its dispatch. The
+        # Fused EP exchanges actual local row counts inside its dispatch. The
         # original DP counts remain valid capacity bounds after CED narrowing;
         # no host exchange is needed for its routed or rank-local shared experts.
         with report_collective_sizing(ctx, view.metadata.positions.numel(), None):

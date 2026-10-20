@@ -405,20 +405,19 @@ class MoELayer(torch.nn.Module):
                 or combine_order != "rank"
             ):
                 raise ValueError(
-                    "bf16_route_accum_fp32 requires BF16 unquantized SiLU experts "
-                    "without expert parallelism, all-to-all, bias or slot combine"
+                    f"{precision_policy} requires BF16 input and unquantized "
+                    "weights with SiLU, without expert parallelism, all-to-all, "
+                    "bias or slot combine"
                 )
             if moe_backend not in {None, "triton"}:
                 raise ValueError(
-                    "bf16_route_accum_fp32 is supported only by the Triton "
-                    f"BF16 MoE backend, not {moe_backend!r}"
+                    f"{precision_policy} requires --moe-backend triton for "
+                    f"unquantized weights, not {moe_backend!r}"
                 )
             if routing_mode not in {None, "precomputed_topk"}:
-                raise ValueError("bf16_route_accum_fp32 requires precomputed top-k")
+                raise ValueError(f"{precision_policy} requires precomputed top-k")
             if self._routed_scaling_factor != 1.0:
-                raise ValueError(
-                    "bf16_route_accum_fp32 requires unscaled route weights"
-                )
+                raise ValueError(f"{precision_policy} requires unscaled route weights")
             if not 0.0 < output_scale < float("inf"):
                 raise ValueError("MoE output_scale must be finite and positive")
             moe_backend = "triton"
@@ -498,6 +497,8 @@ class MoELayer(torch.nn.Module):
             ep_size=self.ep_size,
             ispp=self.intermediate_size // self.tp_size,
             hidden=hidden_size,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
             swiglu_form=self._swiglu_form(),
             activation_clamped=(
                 self.swiglu_arg is not None and self.swiglu_arg.limit is not None

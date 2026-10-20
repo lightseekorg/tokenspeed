@@ -29,7 +29,12 @@ from tokenspeed_kernel.ops.quantization import (
     quantize_mxfp8,
     quantize_nvfp4,
 )
+from tokenspeed_kernel.ops.quantization import triton as quant_triton
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
+from tokenspeed_kernel.platform import Platform
+from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import NoKernelFoundError
+from utils import kernel_supported
 
 _FP8_DTYPE = torch.float8_e4m3fn
 _FP8_FINFO = torch.finfo(_FP8_DTYPE)
@@ -70,6 +75,100 @@ def test_fp8_roundtrip_rejects_pdl() -> None:
             scale_encoding="ue8m0",
             dequantize=True,
             enable_pdl=True,
+        )
+
+
+def test_portable_token_quantizer_rejects_pdl(mi350_platform, monkeypatch) -> None:
+    monkeypatch.setattr(Platform, "_instance", mi350_platform)
+    monkeypatch.setattr(KernelRegistry.get(), "_selection_cache", {})
+    with pytest.raises(ValueError, match="does not support enable_pdl"):
+        quantize_fp8(
+            torch.ones(1, 32, dtype=torch.bfloat16),
+            granularity="token",
+            enable_pdl=True,
+        )
+
+
+def test_portable_token_quantizer_forwards_pdl(h100_platform, monkeypatch) -> None:
+    monkeypatch.setattr(Platform, "_instance", h100_platform)
+    monkeypatch.setattr(KernelRegistry.get(), "_selection_cache", {})
+    launches = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((grid, kwargs))
+
+            return launch
+
+    monkeypatch.setattr(quant_triton, "_fp8_token_quantize_kernel", Kernel())
+    quant_triton.triton_quantize_fp8_per_token_portable(
+        torch.ones(128, 32, dtype=torch.bfloat16),
+        granularity="token",
+        group_size=None,
+        scale_encoding="float32",
+        enable_pdl=True,
+    )
+    assert len(launches) == 1
+    grid, options = launches[0]
+    assert grid == (128,)
+    assert options["ENABLE_PDL"] is True
+    assert options["launch_pdl"] is True
+
+
+@pytest.mark.parametrize("layout", ["contiguous", "strided", "higher_rank"])
+def test_portable_token_quantizer_preserves_layout(device, layout):
+    if not torch.cuda.is_available() or not kernel_supported(
+        "triton_quantize_fp8_per_token_portable"
+    ):
+        pytest.skip("portable minimum-scale E4M3 quantization requires gfx950")
+    torch.manual_seed(196)
+    x = torch.randn(130, 128, device=device, dtype=torch.bfloat16)
+    if layout == "strided":
+        x = x[:, ::2]
+    elif layout == "higher_rank":
+        x = x.reshape(2, 65, 128)
+    values, scales = quantize_fp8(
+        x,
+        granularity="token",
+        override="triton_quantize_fp8_per_token_portable",
+        required_features=frozenset({"token_fp8_min_scaling"}),
+    )
+    amax = x.float().abs().amax(-1, keepdim=True)
+    expected_scales = (amax.double() / 448.0).float().clamp_min(1.0 / (448 * 512))
+    multiplier = (448.0 / amax.double()).float().clamp_max(448 * 512)
+    expected = (x.float() * multiplier).clamp(-448, 448).to(torch.float8_e4m3fn)
+    assert values.shape == x.shape
+    assert scales.shape == (*x.shape[:-1], 1)
+    torch.testing.assert_close(
+        values.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "options,override",
+    [
+        ({}, "triton_quantize_fp8"),
+        ({"granularity": "token"}, "triton_quantize_fp8_with_scale"),
+        (
+            {
+                "granularity": "token_group",
+                "group_size": 128,
+                "scale_encoding": "ue8m0",
+                "dequantize": True,
+            },
+            "triton_quantize_fp8_roundtrip",
+        ),
+    ],
+)
+def test_fp8_required_features_cannot_be_bypassed_by_override(options, override):
+    with pytest.raises(NoKernelFoundError, match="token_fp8_min_scaling"):
+        quantize_fp8(
+            torch.empty(2, 128, dtype=torch.bfloat16),
+            override=override,
+            required_features=frozenset({"token_fp8_min_scaling"}),
+            **options,
         )
 
 

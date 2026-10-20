@@ -96,6 +96,19 @@ class CommBackend(ABC):
         """Run fused DP column-linear, or leave out untouched and return False."""
         return False
 
+    def try_fused_dp_row_linear(
+        self,
+        tensor: torch.Tensor,
+        input_scales: torch.Tensor | None,
+        weight: torch.Tensor,
+        weight_scales: torch.Tensor | None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+        workspace: "ProjectionWorkspace",
+    ) -> bool:
+        """Run fused DP row-linear, or leave out untouched and return False."""
+        return False
+
     def projection_all_gather(
         self,
         tensor: torch.Tensor,
@@ -118,6 +131,8 @@ class CommBackend(ABC):
         quantize: bool,
         out: torch.Tensor | None,
         workspace: "ProjectionWorkspace",
+        *,
+        input_scales: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Exchange token/channel axes using prepared layout and fusion resources."""
         from tokenspeed.runtime.distributed.comm_backend.projection import (
@@ -125,7 +140,14 @@ class CommBackend(ABC):
         )
 
         return projection_all_to_all(
-            tensor, rows, inverse, quantize, out, workspace, self
+            tensor,
+            rows,
+            inverse,
+            quantize,
+            out,
+            workspace,
+            self,
+            input_scales=input_scales,
         )
 
     def acquire_projection_output(

@@ -804,6 +804,9 @@ draft: `mla` and `tokenspeed_mla` (`gluon` on AMD) for MLA drafts, and
 rejects any other `--drafter-attention-backend` rather than quietly widening
 the draft's attention to the full history.
 
+Use `--attention-backend mha` and `--drafter-attention-backend mha` for
+standard or grouped-query attention in the target and draft, respectively.
+
 ## Observability
 
 | Parameter | Purpose |

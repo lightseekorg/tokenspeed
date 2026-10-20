@@ -250,6 +250,13 @@ expert ids. With FP32 route weights the routed kernel stops before its
 finalize and `moe_finalize_fuse_shared` combines the per-route outputs with the
 FP32 weights, accumulating in FP32 and rounding once to BF16.
 
+## FP8 per-channel experts
+
+Per-channel FP8 experts store weights in FP8 E4M3 with FP32 scales per output
+channel and quantize activations per token. FP32 routing weights remain FP32
+during combination. Native FP8 matrix arithmetic uses FP32 accumulators but
+need not match sequential FP32 arithmetic.
+
 ## Shared MoE precision policies
 
 The unquantized Triton MoE normally keeps GEMM1 accumulators in FP32 through

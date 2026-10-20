@@ -36,7 +36,7 @@ import importlib
 import inspect
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from types import SimpleNamespace
 
@@ -143,6 +143,7 @@ from tokenspeed_kernel.selection import (
     spec_matches_traits,
 )
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from utils import is_amd
 
 _ATTENTION_GLUON_MODULES = [
     _attention_gluon_dsa,
@@ -3477,6 +3478,206 @@ def test_gfx950_dynamic_mxfp4_moe_selects_gluon_a4w4(
     )
     assert with_bias["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
     assert bf16_activations["apply_kernel_name"] == "gluon_mxfp4_precomputed_moe_apply"
+
+
+@pytest.mark.parametrize(
+    "platform_fixture,rows,expected",
+    [
+        ("h100_platform", 129, None),
+        ("b200_platform", 1, "triton_quantize_fp8_per_token"),
+        ("b200_platform", 129, None),
+        ("mi350_platform", 129, "triton_quantize_fp8_per_token_portable"),
+        ("mi450_platform", 129, None),
+    ],
+)
+def test_token_quantizer_preserves_required_minimum_scale(
+    request, monkeypatch, platform_fixture, rows, expected
+):
+    monkeypatch.setattr(
+        Platform, "_instance", request.getfixturevalue(platform_fixture)
+    )
+    monkeypatch.setattr(KernelRegistry.get(), "_selection_cache", {})
+    select = partial(
+        _quantization_pkg.select_fp8_token_quantizer,
+        rows,
+        torch.bfloat16,
+        solution="triton",
+        override=None,
+        required_features=frozenset({"token_fp8_min_scaling"}),
+    )
+    if expected is None:
+        with pytest.raises(kernel_NoKernelFoundError):
+            select()
+    else:
+        assert select().name == expected
+
+
+@pytest.mark.parametrize(
+    "family,mode,name",
+    [
+        ("gemm", "mm", "triton_mm_fp8_scaled"),
+        ("moe", "apply", "triton_fp8_channel_fused_precomputed_moe_apply"),
+        ("quantization", "fp8_with_scale", "triton_quantize_fp8_per_token_portable"),
+    ],
+)
+@pytest.mark.parametrize(
+    "platform_fixture,arch_version,dense_eligible,gfx950_eligible",
+    [
+        ("a100_platform", ArchVersion(8, 0), False, False),
+        ("h100_platform", ArchVersion(9, 0), False, False),
+        ("b200_platform", ArchVersion(10, 0), True, False),
+        ("b300_platform", ArchVersion(10, 3), True, False),
+        ("mi350_platform", ArchVersion(9, 4), False, False),
+        ("mi350_platform", ArchVersion(9, 5), True, True),
+        ("mi350_platform", ArchVersion(12, 0), True, False),
+        ("mi450_platform", ArchVersion(12, 5), True, False),
+    ],
+)
+def test_fp8_kernels_select_supported_hardware(
+    request,
+    platform_fixture,
+    arch_version,
+    dense_eligible,
+    gfx950_eligible,
+    family,
+    mode,
+    name,
+) -> None:
+    platform = replace(
+        request.getfixturevalue(platform_fixture), arch_version=arch_version
+    )
+    candidates = KernelRegistry.get().get_for_operator(
+        family, mode, platform=platform, solution="triton"
+    )
+    eligible = dense_eligible if family == "gemm" else gfx950_eligible
+    assert (name in {candidate.name for candidate in candidates}) == eligible
+
+
+def _moe_fp8_channel_plan(platform: PlatformInfo, **overrides) -> dict:
+    kwargs = dict(
+        weight_dtype="fp8_channel",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        routing_mode="precomputed_topk",
+        ep_size=1,
+        ispp=640,
+        hidden=5120,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=False,
+        combine_order="rank",
+    )
+    kwargs.update(overrides)
+    registry = KernelRegistry.get()
+    real_platform = Platform.get()
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        return kernel_moe_plan(**kwargs)
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+
+@pytest.mark.parametrize("intermediate", [320, 640])
+def test_default_fp8_channel_plan_selects_gluon(
+    mi350_platform: PlatformInfo,
+    intermediate: int,
+) -> None:
+    plan = _moe_fp8_channel_plan(
+        mi350_platform, ispp=intermediate, num_experts=256, top_k=8
+    )
+    assert plan["apply_kernel_name"] == _moe_gluon.GLUON_FP8_CHANNEL_APPLY
+
+
+@pytest.mark.parametrize("intermediate", [320, 640])
+@pytest.mark.parametrize(
+    "solution,expected",
+    [
+        ("gluon", _moe_gluon.GLUON_FP8_CHANNEL_APPLY),
+        ("triton", "triton_fp8_channel_fused_precomputed_moe_apply"),
+    ],
+)
+def test_explicit_fp8_channel_plan_preserves_solution(
+    mi350_platform: PlatformInfo,
+    intermediate: int,
+    solution: str,
+    expected: str,
+) -> None:
+    plan = _moe_fp8_channel_plan(
+        mi350_platform,
+        solution=solution,
+        ispp=intermediate,
+        num_experts=256,
+        top_k=8,
+    )
+    assert plan["apply_kernel_name"] == expected
+    assert plan["weight_preprocessor"] is None
+    assert not plan["supports_deferred_finalize"]
+
+
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        {},
+        {"num_experts": 256},
+        {"top_k": 8},
+        {"num_experts": 128, "top_k": 8},
+        {"num_experts": 256, "top_k": 4},
+    ],
+)
+def test_fp8_channel_plan_falls_back_for_unsupported_or_unknown_counts(
+    mi350_platform: PlatformInfo,
+    geometry: dict,
+) -> None:
+    plan = _moe_fp8_channel_plan(mi350_platform, **geometry)
+    assert plan["apply_kernel_name"] == "triton_fp8_channel_fused_precomputed_moe_apply"
+    with pytest.raises(kernel_NoKernelFoundError):
+        _moe_fp8_channel_plan(mi350_platform, solution="gluon", **geometry)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"ep_size": 2},
+        {"ispp": 352},
+        {"hidden": 2048},
+        {"activation_clamped": True},
+        {"expert_id_repeats": True},
+        {"requires_deferred_finalize": True},
+        {"with_bias": True},
+    ],
+)
+def test_gluon_fp8_channel_plan_rejects_unsupported_geometry(
+    mi350_platform: PlatformInfo,
+    override: dict,
+) -> None:
+    with pytest.raises(kernel_NoKernelFoundError):
+        _moe_fp8_channel_plan(
+            mi350_platform, solution="gluon", num_experts=256, top_k=8, **override
+        )
+
+
+@pytest.mark.parametrize(
+    "dtype,width,expected",
+    [
+        ("unquant", 640, "gluon_bf16_precomputed_moe_apply"),
+        ("fp8", 1024, "gluon_fp8_block_precomputed_moe_apply"),
+    ],
+)
+def test_legacy_gluon_plans_keep_existing_implementation(
+    mi350_platform: PlatformInfo,
+    dtype: str,
+    width: int,
+    expected: str,
+) -> None:
+    if not is_amd() and KernelRegistry.get().get_by_name(expected) is None:
+        pytest.skip("Legacy Gluon implementations are only registered on AMD")
+    plan = _moe_fp8_channel_plan(
+        mi350_platform, weight_dtype=dtype, ispp=width, solution="gluon"
+    )
+    assert plan["apply_kernel_name"] == expected
 
 
 def _select_on(platform: PlatformInfo, *args, **kwargs) -> str:

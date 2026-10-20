@@ -280,32 +280,58 @@ another projection reuses it. Final outputs belong to the caller and
 remain valid across later forwards. Graphs referencing a workspace are destroyed
 before it is released.
 
-An optional complete projection kernel follows the same ownership contract:
-the backend prepares its shared communication storage, each Linear supplies
-its own weights, and the caller owns the final output. Selection uses all
-physical subgroup counts so every peer takes the same collective path.
-`try_fused_dp_column_linear` returns true after writing the complete local output,
-or false without modifying it so the caller can use the ordinary projection
-operations.
-The fused column projection specializes its prepared state by TP size and padded
-channel widths; actual owner counts remain runtime data within warmed row buckets.
-Its peer-memory transport requires a node-local group. Cross-node groups retain
-the ordinary collectives. Fusion is enabled automatically for eligible TP2 and
-TP4 projections when the maximum physical owner count is at least 64.
-Batch-invariant collectives retain the ordinary path. Row buckets select the
-prepared kernel variant independently of that threshold. Buckets are 32, 64,
-then 128-row steps through 2048. Above 2048, each power-of-two range has eight
-equal intervals: 256-row steps through 4096, 512-row steps through 8192, and so
-on. This bounds padding overhead below 12.5% above 2048 and makes the number of
-prepared variants grow logarithmically. All owner boundaries remain aligned to
-the 128-row GEMM tile. Unequal owners still pad to the shared bucket.
-All variants up to the rounded workspace capacity compile and warm before use;
-actual owner counts remain runtime inputs, including during graph replay.
-Preparation allocates fused state only for TP sizes enabled in automatic dispatch
-and capacities that can reach their minimum row count. Direct kernel APIs may
-support additional TP sizes without allocating their state in ordinary serving.
-When column projection fusion cannot be prepared, the first rank in each subgroup
-logs the reason once during workspace preparation, outside the forward path.
+Projection fusion replaces communication, quantization, and GEMM with one
+kernel within the same backend dispatch path. Column projection fuses
+all-gather, FP8 GEMM, and all-to-all; row projection fuses all-to-all, FP8 GEMM,
+and reduce-scatter. The goal is to reduce launch overhead and let computation
+consume peer data as it becomes available.
+
+Row projection also accepts E4M3 inputs with FP32 scales per 128 channels,
+allowing the preceding RMSNorm/gate operation to quantize once. Fusion forwards
+those values and scales without requantizing; the ordinary path exchanges both
+before GEMM. Eligible node-local fallback exchanges FP8 values and scales in one
+Lamport launch, including padding for unequal or empty owners. BF16 input keeps
+quantization inside the projection. Both formats
+return BF16, share workspace ownership, and are prepared before graph capture.
+All ranks in a projection call supply the same activation format. When active
+owners prequantize, empty owners also supply empty E4M3 values and FP32 scales
+so the ordinary fallback executes matching collectives on every rank.
+
+Both directions follow the existing workspace ownership contract: the backend
+prepares shared communication storage, each Linear supplies its weights, and
+the caller owns the final output. All ranks select the same path using their
+physical subgroup counts, including unequal and empty owners. Eligible
+node-local TP2 and TP4 projections use fusion; smaller batches, batch-invariant
+collectives, and unsupported configurations retain the ordinary operations.
+
+Row counts remain runtime inputs. Prepared row buckets bound specialization
+and are warmed before graph capture. Intermediate buckets reduce padding;
+large buckets can skip whole padding tiles while retaining prepared strides.
+Tiles crossing owner boundaries acquire each owner's readiness and route each
+output piece to its owner. Row fusion covers the prepared workspace capacity
+without a separate upper dispatch cutoff.
+
+The kernel combines input exchange and quantization with a pipelined GEMM and
+output exchange. Warp groups divide computation and data movement;
+completed GEMM CTAs share reduction work through a device queue. Selected
+buckets also overlap GEMM and reduction within a CTA or share operand loads
+between CTAs. These are scheduling choices within the same execution path.
+Peer waits require a fully resident grid; concurrent workspace use and competing
+distributed kernels are unsupported.
+
+Each row-projection producer rounds its partial output to BF16. The owner sums
+partials in fixed rank order in FP32, then rounds to BF16. Ordinary BF16
+collective reductions can round differently. Negative zero marks unfinished
+receive values; produced zeros are canonicalized so readiness remains distinct
+from data without changing this reduction contract.
+
+Receive storage, including padding, is cleared before the next producer can
+write it. Input publication and consumption acknowledgements order reuse, using
+multicast when available. Some buckets consume every prepared partial, including
+padding, so completion also proves that peers finished reading the owner's
+input. Those buckets may reuse the same input layout without another peer join;
+layout changes and kernels that skip padding retain that join. Empty owners
+participate in every communication epoch.
 
 ### Padding contract
 
@@ -603,8 +629,15 @@ attention DP the split graph stays off: the narrowed row count is rank-local
 (which prompts complete on this rank), so the decoder bucket and the
 collective shapes its graph bakes would differ across ranks, and the stages
 size their collectives from their own rows, which the DP metadata gather
-does not carry (the same gap that keeps narrowing itself unimplemented under
-DP).
+does not carry. Eager TP1 attention/dense with fused EP may narrow: the
+fused dispatch exchanges the actual local row counts, while the original
+DP counts remain capacity bounds. The CPU metadata gather also carries
+per-rank decode request counts. V4.1 DSpark sizes its one draft forward at
+block width times these counts, including in aggregated mixed batches.
+Prefill writes context KV; if another rank has decodes, prefill-only and
+idle ranks join its draft collectives with empty rows. A round with no
+decodes performs no draft forward. Decode graph warmup and capture use the
+same uniform padded decode counts as their target batches.
 
 ### Prefill requests without generated outputs
 

@@ -321,7 +321,10 @@ def test_idle_rank_hands_history_drafts_an_empty_view() -> None:
     executor.model_runner = SimpleNamespace(forward=lambda ctx, **kwargs: None)
     executor.forward_step = SimpleNamespace(can_run=lambda bs, ctx: False)
     executor.drafter = SimpleNamespace(
-        idle_forward_global_num_tokens=lambda tokens, bs: [tokens, bs],
+        idle_forward_global_num_tokens=lambda tokens, bs, *, global_num_decodes: [
+            tokens,
+            bs,
+        ],
         attn_backend=SimpleNamespace(),
         token_to_kv_pool=SimpleNamespace(),
         draft_model_runner=SimpleNamespace(
@@ -333,6 +336,7 @@ def test_idle_rank_hands_history_drafts_an_empty_view() -> None:
         DpForwardMetadata(
             global_num_tokens=[0, 4],
             global_batch_size=[0, 4],
+            global_num_decodes=[0, 4],
             global_forward_mode=[ForwardMode.IDLE, ForwardMode.DECODE],
             all_decode_or_idle=True,
             all_extend=False,
