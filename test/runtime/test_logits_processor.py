@@ -129,35 +129,6 @@ def test_dist_argmax_ineligibility_uses_the_device_collective(monkeypatch, tmp_p
         torch.distributed.destroy_process_group()
 
 
-@pytest.mark.parametrize("device_type", ["cuda", "privateuseone"])
-def test_stream_capture_tracks_the_tensor_accelerator(monkeypatch, device_type):
-    from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
-
-    class DeviceBackend:
-        def __init__(self):
-            self.capturing = False
-
-        def is_current_stream_capturing(self):
-            return self.capturing
-
-    backend = DeviceBackend()
-    other = DeviceBackend()
-    other.capturing = True
-    backends = {
-        device_type: backend,
-        "privateuseone" if device_type == "cuda" else "cuda": other,
-    }
-    device = torch.device(device_type)
-    # CPU CI lacks CUDA/NPU contexts; substitute only the accelerator module.
-    monkeypatch.setattr(
-        torch, "get_device_module", lambda actual: backends[actual.type]
-    )
-    assert not is_current_stream_capturing(device)
-    backend.capturing = True
-    assert is_current_stream_capturing(device)
-    assert not is_current_stream_capturing(torch.device("cpu"))
-
-
 def test_logits_processor_only_uses_fused_lm_head_for_kimi(monkeypatch):
     hidden_states = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
     lm_head = SimpleNamespace(weight=torch.eye(2, dtype=torch.float32))

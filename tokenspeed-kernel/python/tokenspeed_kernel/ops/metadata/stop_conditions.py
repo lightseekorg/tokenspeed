@@ -336,7 +336,7 @@ def apply_stop_conditions(
     "apply_stop_conditions",
     name="triton_apply_stop_conditions",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd", "ascend"})),
     signatures=format_signatures("req_pool_indices", "dense", {torch.int64}),
     priority=Priority.PORTABLE,
 )
@@ -355,7 +355,15 @@ def triton_apply_stop_conditions(
     decode_width,
     padding_index,
 ) -> None:
-    """Launch the GPU stop-condition update after public input validation."""
+    """Apply the portable device update after public input validation.
+
+    Registry leaves accept all 13 arguments positionally in this order:
+    ``req_pool_indices``, ``output_tokens``, ``accept_lengths``,
+    ``input_lengths``, ``prompt_lengths``, ``valid_cache_lengths``,
+    ``stop_token_ids``, ``token_limits``, ``stopped``, ``num_extends``,
+    ``num_prefill_outputs``, ``decode_width``, ``padding_index``.
+    Shapes, dtypes and in-place semantics follow :func:`apply_stop_conditions`.
+    """
     batch_size = req_pool_indices.shape[0]
     _apply_stop_conditions_kernel[(triton.cdiv(batch_size, _BLOCK),)](
         req_pool_indices,

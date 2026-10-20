@@ -610,6 +610,7 @@ class AscendDSABackend(DSABackend):
         table,
         kwargs,
         *,
+        fused: bool,
         query_group_size: int,
         context_parallel,
         query_width,
@@ -620,7 +621,12 @@ class AscendDSABackend(DSABackend):
         slots belong to the router. The MLA prologue already wrote KV.
         """
         del k
-        if kwargs.get("packed_query") is not None and self._fused_group is None:
+        packed_query = kwargs.get("packed_query")
+        if fused and packed_query is None:
+            raise ValueError("Fused DSA requires the fused Prolog query")
+        if not fused and packed_query is not None:
+            raise ValueError("Ordinary DSA does not accept a fused Prolog query")
+        if fused and self._fused_group is None:
             raise RuntimeError(
                 "Initialize fused DSA resources before using packed queries"
             )
@@ -720,8 +726,7 @@ class AscendDSABackend(DSABackend):
             visible_lengths=index_metadata.visible_lengths,
         )
 
-        packed_query = kwargs.get("packed_query")
-        if packed_query is None:
+        if not fused:
             packed_query, indices, valid_chunks = self._select_collective_topk(
                 q, local_indices, local_values
             )
@@ -762,8 +767,15 @@ class AscendDSABackend(DSABackend):
             True,
         )
 
-    def _attention_kernels(self, *, is_prefill: bool):
-        """Select attention providers without changing cache or CP metadata."""
+    def attention_kernels(self, *, is_prefill: bool):
+        """Return the SFA provider for the explicit prefill/decode stage.
+
+        Plugins may override this hook to supply stage-specific ``attention``
+        and ``attention_partial`` implementations. ``is_prefill`` identifies
+        extend calls; false identifies decode/verify calls. The provider must
+        preserve the AscendDSAKernels tensor and empty-shard contracts and
+        must not change cache ownership or CP metadata.
+        """
         return self._indexer_kernels
 
     def _run_collective_attention(self, selection, kv_cache, layer, kernels):
@@ -778,22 +790,10 @@ class AscendDSABackend(DSABackend):
             layer.scaling,
             sparse_mode=selection.sparse_mode,
         )
-        collective = self._context_collectives()
-        spec = self._indexer_spec
-        degree = self._dcp.degree
-        heads = spec.num_attention_heads // degree
-        tokens = selection.indices.shape[0]
-        send = output.view(degree, heads, tokens, spec.kv_lora_rank).contiguous()
-        received = torch.empty_like(send)
-        collective.all_to_all(received, send, auxiliary=False)
-        lse = (maximum + total.log()).squeeze(0).transpose(0, 1)
-        send_lse = lse.reshape(degree, heads, tokens).contiguous()
-        received_lse = torch.empty_like(send_lse)
-        collective.all_to_all(received_lse, send_lse, auxiliary=False)
-        return kernels.merge_partials(
-            received.reshape(degree, heads * tokens, spec.kv_lora_rank).contiguous(),
-            received_lse.reshape(degree, heads * tokens).contiguous(),
-        ).view(heads, tokens, spec.kv_lora_rank)
+        lse = (maximum + total.log()).squeeze(0)
+        return self._context_collectives().combine(
+            output.transpose(0, 1), lse, merge=kernels.merge_partials
+        )
 
     def _run_indexed_sparse_attention(
         self,
@@ -817,7 +817,7 @@ class AscendDSABackend(DSABackend):
                 f"Ascend DSA query width must be {expected_width}, got "
                 f"{selection.query.shape[-1]}"
             )
-        kernels = self._attention_kernels(is_prefill=is_prefill)
+        kernels = self.attention_kernels(is_prefill=is_prefill)
         if not selection.context_parallel:
             # TND accepts 32/64 query heads. TP can leave fewer Q heads on
             # each rank; repeat those heads locally and keep only the first
@@ -853,9 +853,9 @@ class AscendDSABackend(DSABackend):
         if not selection.fused:
             result = self._run_collective_attention(selection, kv_cache, layer, kernels)
             return (
-                result
+                result.transpose(0, 1).contiguous()
                 if head_major_output
-                else result.transpose(0, 1).contiguous().flatten(1)
+                else result.flatten(1)
             )
         if self._fused_group is None:
             raise RuntimeError(
@@ -905,6 +905,8 @@ class AscendDSABackend(DSABackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
+        *,
+        fused: bool,
         **kwargs,
     ) -> torch.Tensor:
         self._validate_logit_cap(layer.logit_cap)
@@ -940,6 +942,7 @@ class AscendDSABackend(DSABackend):
             kv_lengths,
             table,
             kwargs,
+            fused=fused,
             query_group_size=1,
             context_parallel=context_parallel,
             query_width=1,
@@ -981,6 +984,8 @@ class AscendDSABackend(DSABackend):
         bs: int,
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
+        *,
+        fused: bool,
         **kwargs,
     ) -> torch.Tensor:
         self._validate_logit_cap(layer.logit_cap)
@@ -1011,6 +1016,7 @@ class AscendDSABackend(DSABackend):
             query_lengths,
             query_table,
             kwargs,
+            fused=fused,
             query_group_size=tokens_per_request,
             context_parallel=self._dcp.degree > 1,
             query_width=tokens_per_request,

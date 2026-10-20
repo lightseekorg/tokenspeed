@@ -525,6 +525,8 @@ def zero_page_fields(
     )
     # Ascend's launch limit applies to the flattened grid. Stride the ranges
     # when long-context admission exceeds it; every requested page is cleared.
+    # With num_ranges >= 1, tiles_per_range <= 1024, so this cap always
+    # leaves at least one program in the first dimension.
     if backing.device.type == "npu":
         grid = (min(grid[0], 65535 // grid[1]), grid[1])
     _zero_page_fields_kernel[grid](

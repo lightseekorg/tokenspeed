@@ -690,12 +690,13 @@ Its responsibilities:
   what the prefill forward wrote and nothing writes them again. The copies
   are the one thing such an admission may need beyond what the completing
   chunk reserved, so they are best effort: when the plan does not fit with
-  them, `Admit` replans without the tail -- the owner keeps its partial
-  block private and publishes neither the tail nor the state checkpoint
-  keyed by it at that point (its full pages still publish; its finish
-  publishes the frontier later). A request whose reserve covers its
-  generation therefore never waits on a block it did not reserve, which is
-  what keeps a pool full of such requests from wedging at their first
+  them (under page-cyclic sharding a copy may need a parent while other
+  buckets still have holes), `Admit` replans without the tail -- the owner
+  keeps its partial block private and publishes neither the tail nor the
+  state checkpoint keyed by it at that point (its full pages still publish;
+  its finish publishes the frontier later). A request whose reserve covers
+  its generation therefore never waits on a block it did not reserve, which
+  is what keeps a pool full of such requests from wedging at their first
   decodes. Copies are
   fire-and-forget: the runtime orders them on the forward thread's default
   stream after the execution stream's in-flight forwards and before the
@@ -1570,16 +1571,21 @@ available. A failed acquire leaves both placement and request tables unchanged.
 
 Beside that balanced path, `BlockPool::AcquireBlocksInBuckets(group, buckets)`
 acquires blocks in **given** buckets — one per requested block — for the
-transfers above and for `GroupAllocator::AcquireShape`, which rebuilds a
-retracted request's table from its recorded shape (claimed blocks in place,
-fresh ones in the imaged buckets). Its exact check is per bucket with one
-shared empty-parent budget: an opened parent gives every bucket
-`packing / shard_count` slots at once, so the parents needed are
+transfers above, for tail copies (a hitter's copy of a claimed tail block, an
+owner's copy-in; each in its source's bucket) and for
+`GroupAllocator::AcquireShape`, which rebuilds a retracted request's table
+from its recorded shape (claimed blocks in place, fresh ones in the imaged
+buckets). Its exact check is per bucket with one shared empty-parent budget:
+an opened parent gives every bucket `packing / shard_count` slots at once, so
+the parents needed are
 `max_b ceil((need_b - holes_b)+ / (packing / shard_count))`
 (`ParentsNeededForBuckets`, the formula the pool, the coordinator's image
-probe and the admission planner's shadow occupancy share). `D = 1` passes
-bucket 0 everywhere and is the same path. No mutation on a failed check, and
-the choice is deterministic on every mirrored rank.
+probe and the admission planner's shadow occupancy share). The planner counts
+every block an admission places in a given bucket — a Host hit's destination,
+a tail copy — as that bucket's demand, and only growth and a hole's fresh
+block as dense demand; a group's bucket-exact acquisitions precede its dense
+ones. `D = 1` passes bucket 0 everywhere and is the same path. No mutation on
+a failed check, and the choice is deterministic on every mirrored rank.
 
 `BlockPool` maintains the free-slot count of each group per bucket and an
 ordered parent index per bucket. Each parent records only its lowest free slot per bucket;

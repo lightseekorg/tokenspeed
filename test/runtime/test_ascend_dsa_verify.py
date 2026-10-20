@@ -268,6 +268,7 @@ def test_indexer_writes_only_its_own_cache_after_mla_prologue():
         query_group_size=1,
         query_width=1,
         context_parallel=False,
+        fused=False,
     )
     assert len(writes) == 1
     assert writes[0][1].data_ptr() == index_cache.data_ptr()
@@ -487,6 +488,7 @@ def test_sharded_index_write_and_read_use_local_storage(degree, block_size):
                 context_parallel=True,
                 query_group_size=1,
                 query_width=1,
+                fused=False,
             )
         assert (cache[:block_size] == -99).all()
         for local_block in (1, 2):
@@ -555,6 +557,7 @@ def test_prefill_uses_global_query_visibility_before_dcp_compaction(degree):
         torch.arange(5),
         None,
         2,
+        fused=False,
     )
     args, options = records[0]
     assert options["context_parallel"] == (degree > 1)
@@ -648,6 +651,7 @@ def test_dcp_verify_batches_query_rows_with_causal_lengths(width):
         locations,
         None,
         2,
+        fused=False,
     )
     torch.testing.assert_close(output, query.flatten(1))
     assert len(backend.selections) == 1
@@ -678,6 +682,7 @@ def test_index_policy_is_validated_at_execution(initial, local):
             query_group_size=1,
             query_width=1,
             context_parallel=False,
+            fused=False,
         )
 
 
@@ -757,6 +762,7 @@ def test_dcp_indexer_receives_model_policy_for_each_candidate(width):
             context_parallel=True,
             query_group_size=1,
             query_width=1,
+            fused=False,
         )
     args = records[0]
     expected_initial = [
@@ -837,6 +843,7 @@ def test_single_token_mixed_decode_selects_request_shaped_query_metadata():
         torch.tensor([7], dtype=torch.int32),
         None,
         1,
+        fused=False,
     )
     assert not backend._dcp.refreshed
 
@@ -894,7 +901,9 @@ class _CpuFusedDsaKernels:
         return merged[rank * local_heads : (rank + 1) * local_heads].bfloat16()
 
 
-def _fused_backend(monkeypatch, rows, *, degree, rank=0):
+def _fused_backend(
+    monkeypatch, rows, *, degree, rank=0, backend_class=ascend_dsa.AscendDSABackend
+):
     def initialize_base(self, config, spec, *, kernel_page_size):
         self.is_draft = False
         self.spec_num_tokens = 8
@@ -923,7 +932,7 @@ def _fused_backend(monkeypatch, rows, *, degree, rank=0):
         kv_lora_rank=512,
         qk_rope_head_dim=64,
     )
-    backend = ascend_dsa.AscendDSABackend(config, spec, kernel_page_size=128)
+    backend = backend_class(config, spec, kernel_page_size=128)
     backend._dcp.bind_virtual_block_count(17)
     placement = CachePlacement(128, 17, tuple(range(degree)), rank)
     monkeypatch.setattr(backend, "cache_placement", lambda layer: placement)
@@ -970,8 +979,7 @@ class _CpuCollectiveDsaKernels(_CpuFusedDsaKernels):
 
     def merge_partials(self, output, lse):
         weights = torch.softmax(lse, dim=0)
-        clean = torch.where(weights[..., None] == 0, 0, output)
-        return (clean * weights[..., None]).sum(0).bfloat16()
+        return (output * weights[..., None]).sum(0).bfloat16()
 
 
 def _collective_dsa_worker(rank, rendezvous):
@@ -1030,6 +1038,7 @@ def _collective_dsa_worker(rank, rendezvous):
                     query_group_size=1,
                     context_parallel=True,
                     query_width=1,
+                    fused=False,
                 )
                 expected_query = torch.arange(degree, dtype=torch.bfloat16)[
                     :, None, None, None
@@ -1117,6 +1126,7 @@ def test_single_rank_verify_preserves_each_candidates_causal_context(
         query_group_size=width,
         query_width=width,
         context_parallel=False,
+        fused=False,
     )
     assert selection.q_ends.tolist() == list(range(1, rows + 1))
     assert selection.kv_lengths.tolist() == list(range(130 - width, 130)) + list(
@@ -1194,6 +1204,7 @@ def test_fused_dsa_uses_registered_outputs_and_merges_lse(
         query_group_size=8,
         context_parallel=True,
         query_width=1,
+        fused=True,
     )
     assert selection.query is packed_query
     assert selection.indices.shape == (rows, 2048)
@@ -1262,4 +1273,74 @@ def test_dsa_missing_fused_resources_fail_before_native_launch(monkeypatch):
             pool,
             head_major_output=True,
             is_prefill=False,
+        )
+
+
+@pytest.mark.parametrize("is_prefill", [False, True])
+def test_public_attention_provider_hook_selects_stage(monkeypatch, is_prefill):
+    class StageKernels:
+        def __init__(self, value):
+            self.value = value
+
+        def attention(self, query, *args):
+            return torch.full_like(query, self.value)
+
+    class StageBackend(ascend_dsa.AscendDSABackend):
+        def attention_kernels(self, *, is_prefill):
+            return StageKernels(2 if is_prefill else 3)
+
+    backend = _fused_backend(monkeypatch, 1, degree=1, backend_class=StageBackend)
+    selection = ascend_dsa._AscendSparseSelection(
+        torch.zeros(1, 8, 576), None, None, None, None, None, 3, False, False
+    )
+    pool = SimpleNamespace(get_key_buffer=lambda layer: torch.zeros(128, 576))
+    result = backend._run_indexed_sparse_attention(
+        selection,
+        SimpleNamespace(layer_id=0, scaling=1.0),
+        pool,
+        head_major_output=False,
+        is_prefill=is_prefill,
+    )
+    torch.testing.assert_close(
+        result, torch.full((1, 8 * 512), 2 if is_prefill else 3, dtype=torch.float32)
+    )
+
+
+def test_fused_selection_rejects_missing_prolog_query(monkeypatch):
+    backend = _fused_backend(monkeypatch, 64, degree=8)
+    with pytest.raises(ValueError, match="requires the fused Prolog query"):
+        backend._select_indexed(
+            torch.empty(64, 8, 576),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            {},
+            fused=True,
+            query_group_size=8,
+            context_parallel=True,
+            query_width=8,
+        )
+
+
+def test_ordinary_selection_rejects_fused_prolog_query(monkeypatch):
+    backend = _fused_backend(monkeypatch, 64, degree=8)
+    with pytest.raises(ValueError, match="does not accept a fused Prolog query"):
+        backend._select_indexed(
+            torch.empty(64, 8, 576),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            {"packed_query": torch.empty(8, 64, 8, 576)},
+            fused=False,
+            query_group_size=8,
+            context_parallel=True,
+            query_width=8,
         )

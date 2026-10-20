@@ -108,10 +108,27 @@ DCP ownership semantics without changing the shared placement implementation.
 Prefill and decode shapes without a prepared fused projection use the same
 persistent metadata outputs. They exchange query and TopK candidates over the
 existing device group, then merge sparse-attention partials on the model stream.
-That path creates no auxiliary communicator or stream. Selecting fused execution
-is explicit in the sparse selection; a live native error is never retried through
-the collective path. A model with fused decode prepared can still execute its
-ordinary prefill or smaller capture buckets.
+That path creates no auxiliary communicator or stream. The model adapter must
+pass ``fused=True`` after fused Prolog and ``fused=False`` after ordinary
+projections. A fused call without its packed query fails before selection;
+a live native error is never retried through the collective path. A model with
+fused decode prepared can still execute ordinary prefill or smaller decode
+buckets. Capturing collective buckets requires HCCL graph support and target
+device validation; eager or fused-only validation does not establish that.
+
+The public ``AscendDSABackend.attention_kernels(is_prefill=...)`` hook returns
+the stage's SFA provider. Plugins may override it while preserving the
+``AscendDSAKernels`` tensor contracts and the common cache/CP metadata. Partial
+outputs use the shared DCP combine: zero empty-shard O before exchange, then
+normalize all-empty LSE rows before the native merge.
+
+For ``T`` query rows and ``H`` global heads, the BF16 gathered query occupies
+``T * H * 576 * 2`` bytes. Each FP32 partial-output buffer occupies
+``T * H * 512 * 4`` bytes; exchange needs both send and receive buffers, with
+additional storage for sanitization/layout conversion, TopK and LSE. At 16K
+rows and 64 heads these are 1.125 GiB for Q and 2 GiB per partial buffer.
+Plan the prefill chunk against this transient peak as well as resident weights
+and cache; the native fused bucket's memory plan does not bound this path.
 
 Single-rank decode uses the same preparation with identity page ownership:
 verify still needs one causal length and page-table row per candidate. Its

@@ -435,8 +435,10 @@ blocks are still in its table. A tail is at most `P − 1` tokens, so that is
 copy); a sliding group caps it at its lookback. The charge is what lets a
 pool sized for a request fund its copy-in; when a pool cannot (several
 retraction-exempt requests reaching their first decode together, each
-needing a copy), the owner publishes nothing at that point instead of
-waiting (§1).
+needing a copy, or a sharded group whose copy's bucket is full while other
+buckets have holes — the charge is bucket-blind), the owner publishes
+nothing at that point instead of waiting (§1), and a hitter's admission
+waits.
 
 Speculative decode admission grows from the committed token frontier plus the verify
 spans still in flight, the span being scheduled and the next span, which the

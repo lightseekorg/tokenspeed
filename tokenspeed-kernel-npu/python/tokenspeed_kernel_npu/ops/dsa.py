@@ -81,9 +81,6 @@ class AscendDSAKernels:
         self._select_local = getattr(
             torch.ops.custom, "npu_select_local_topk_indices", None
         )
-        self._merge_partials = getattr(
-            torch.ops.custom, "npu_kvp_attention_merge", None
-        )
         if self._index is None or self._attention is None:
             raise RuntimeError(
                 "LongCatDSA needs LightningIndexer and "
@@ -154,9 +151,15 @@ class AscendDSAKernels:
         return self._select_local(indices, positions, rank)
 
     def merge_partials(self, output, lse):
-        if self._merge_partials is None:
-            raise RuntimeError("Ascend DSA CP requires KvpAttentionMerge")
-        return self._merge_partials(output, lse)
+        """Merge normalized O[P,N,D] with natural-log LSE[P,N].
+
+        Callers must zero O for every empty shard (LSE=-inf) before exchange.
+        All-empty rows use finite equal merge weights and return zero; other
+        rows retain their LSE weights. Return BF16 output with shape [N,D].
+        """
+        from tokenspeed_kernel_npu.ops.mla_dcp import merge_dcp_partials
+
+        return merge_dcp_partials(output, lse)
 
     def merge_topk_fused(self, indices, values, *, group, rank_size):
         return torch.ops.custom.npu_dcp_merge_topk(
@@ -177,7 +180,12 @@ class AscendDSAKernels:
         """Validate topology against the installed operators without device work."""
         missing = [
             name
-            for name in ("npu_dcp_merge_topk", "npu_dsa_merge_lse_direct")
+            for name in (
+                "npu_dcp_merge_topk",
+                "npu_dsa_merge_lse_direct",
+                "npu_select_local_topk_indices",
+                "npu_kvp_attention_merge",
+            )
             if getattr(torch.ops.custom, name, None) is None
         ]
         if missing:

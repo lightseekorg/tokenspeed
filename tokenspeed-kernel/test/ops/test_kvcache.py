@@ -216,6 +216,35 @@ def test_zero_page_fields_matches_host_expansion_without_recompiling(
         )
 
 
+@pytest.mark.parametrize("page_dtype", [torch.int32, torch.int64])
+def test_zero_page_fields_small_grid_strides_pages_and_fields(
+    device: str, page_dtype: torch.dtype
+) -> None:
+    fields = [(3, 32, 7), (257, 192, 137), (2049, 64, 33)]
+    page_ids = [5, 0, 3, 1]
+    expected = torch.full((2600,), 173, dtype=torch.uint8)
+    backing = expected.to(device)
+    for page in page_ids:
+        for base, stride, size in fields:
+            expected[base + page * stride : base + page * stride + size] = 0
+
+    # Two programs must cover twelve ranges, crossing both pages and fields.
+    # Two byte tiles must also loop for the largest field, including its
+    # partial final tile.
+    _zero_page_fields_kernel[(2, 2)](
+        backing,
+        torch.tensor(page_ids, dtype=page_dtype, device=device),
+        torch.tensor(fields, dtype=torch.int64, device=device),
+        len(fields),
+        len(page_ids) * len(fields),
+        BLOCK_SIZE=32,
+        num_warps=4,
+    )
+
+    # Check all bytes, including unselected pages, payload tails and guards.
+    torch.testing.assert_close(backing.cpu(), expected, rtol=0, atol=0)
+
+
 def test_zero_page_fields_large_admission_preserves_unselected_bytes(
     device: str,
 ) -> None:
