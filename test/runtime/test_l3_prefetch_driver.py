@@ -31,7 +31,22 @@ which the request is admitted as an ordinary Host hit of the landed prefix.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(
+    est_time=10,
+    suite="runtime-1gpu",
+    nightly=False,
+    disabled=None,
+    disabled_on_runners=None,
+    disabled_on_runners_reason=None,
+)
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
