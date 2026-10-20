@@ -124,8 +124,7 @@ def _tree_window_merge_kernel(
     if WORDS == 1:
         bits = tl.load(mask_ptr + token, mask=row_ok, other=0)
 
-    # After a causal partial row r's covers keys [0, prefix - TAIL + r), else the
-    # whole prefix; attend the prefix tail and the window.
+    # Partial row r covers keys [0, first + r) if causal, else the prefix; add the tail and window.
     seq_len = tl.load(seq_lens_ptr + req)
     prefix = seq_len - W
     first = prefix - TAIL

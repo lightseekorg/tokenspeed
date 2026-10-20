@@ -18,32 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// EAGLE-4 low-rank candidate head (draft LM head): the shard top-k of the
-// low-rank scores and everything after the candidate all-gather, each in one
-// launch, with the results of the torch ops they replace bit for bit.
-//
-// Selection semantics (torch.topk(sorted=False)): keys are torch's
-// order-preserving radix keys (NaN largest); the K-th largest key `kth` is found exactly, then
-// the output holds the keys above kth in ascending position order followed by the kth ties in
-// ascending position order until K are taken.
-//
-// Shard top-k: one cluster of 8 CTAs per row, each CTA a
-// contiguous 1/8 of the row, each thread E contiguous positions held as keys in registers.
-// Two 8-bit histogram passes (high byte, then the low byte of the keys in the K-th key's bin)
-// find kth; every CTA pushes its 256-bin histogram into every CTA's shared memory and one
-// cluster barrier per pass publishes them, so each CTA also knows how many selected keys the
-// earlier CTAs hold and writes its own selected positions straight to their output slots.
-// After the second barrier no CTA touches another's shared memory, so none waits at exit.
-//
-// Candidate tail: one CTA per row, one gathered candidate (rank r, column j: candidate order
-// r * NC + j) per thread, NC a power of two. The NC-th largest key by a bitwise radix select (one
-// __syncthreads_count per key bit), output slots by warp ballots; then warp 0 runs torch's
-// softmax_warp_forward arithmetic (lane l holds slots l, l + 32, ...; ternary max and
-// xor-butterfly reductions; expf; IEEE division) and the top-k: the top_k largest
-// probabilities by repeated warp argmax (largest key, then lowest slot: torch.max for k = 1, and
-// torch.topk's selection), output in descending order when their keys are distinct; with ties
-// among them, torch.topk(sorted=True)'s order comes from replaying its gatherTopK placement and
-// the 32-wide SmallBitonicSort network on the selected entries.
+// EAGLE-4 low-rank candidate head: shard top-k and post-all-gather tail, bit for bit as torch.
 
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -78,11 +53,9 @@ __device__ __forceinline__ float radix_key_to_float(uint32_t key) {
   return __uint_as_float(b);
 }
 
-// ------------------------------------------------------------------------------------------
-// Shard top-k: one cluster of kCluster CTAs per row.
+// Shard top-k in torch.topk(sorted=False) order: one cluster of kCluster CTAs per row.
 
-// Exclusive prefix sum over the threads of the block (thread order), unsigned (two packed
-// 16-bit fields). All threads call it, once (s_warp is not reusable afterwards).
+// Exclusive block scan of packed 16-bit pairs; call once (s_warp is not reusable afterwards).
 template <int THREADS>
 __device__ __forceinline__ uint32_t block_exclusive_scan_once(uint32_t v, uint32_t* s_warp) {
   constexpr int WARPS = THREADS / 32;
@@ -101,10 +74,7 @@ __device__ __forceinline__ uint32_t block_exclusive_scan_once(uint32_t v, uint32
   return before + incl - v;
 }
 
-// One warp, after the cluster barrier: hist[c][bin] holds CTA c's histogram. Finds the bin b of
-// the cluster histogram g = sum_c hist[c] (keys in bin b are larger than those in b - 1) holding
-// the target-th largest key, S(b) >= target > S(b + 1) with S(b) = sum_{b' >= b} g[b'], and
-// writes b, S(b + 1), the same suffix sum over the CTAs before `rank` and their count in bin b.
+// out: bin b of the target-th largest key, keys above b, and for CTAs < rank: keys above b, in b.
 __device__ __forceinline__ void find_bin_warp(const int (*hist)[256], int rank, int target, int* out) {
   const int lane = threadIdx.x & 31;
   int gv[8], pv[8];
@@ -176,8 +146,7 @@ __global__ void __cluster_dims__(kCluster, 1, 1) __launch_bounds__(THREADS)
   const int t = threadIdx.x, warp = t >> 5;
   const __nv_bfloat16* row = scores + static_cast<int64_t>(m) * stride_sm;
   const int pos0 = (rank * THREADS + t) * E;
-  // Distributed shared memory may only be written once its CTA runs: arrive now, wait before
-  // the first push (the other CTAs started long before then; the wait is short).
+  // Arrive now; wait before the first DSMEM push, which needs every CTA of the cluster running.
   asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory");
 
   int keys[E];  // radix keys, -1 = no element
@@ -273,12 +242,9 @@ __global__ void __cluster_dims__(kCluster, 1, 1) __launch_bounds__(THREADS)
   }
 }
 
-// ------------------------------------------------------------------------------------------
-// Candidate tail: one CTA per row.
+// Candidate tail: one CTA per row, one thread per gathered candidate (candidate order r * NC + j).
 
-// One bitonicSwap round of torch's SmallBitonicSort<32> (descending, invalid entries last) on
-// packed entries (rank code << 6 | selection index << 1 | valid), lane = position; the codes
-// order the keys like the keys themselves (equal codes for equal keys).
+// One torch SmallBitonicSort<32> round, descending, on (code << 6 | index << 1 | valid) per lane.
 __device__ __forceinline__ uint32_t bitonic_round(uint32_t g, int lane, int log2_stride, int half) {
   const int stride = 1 << log2_stride;
   const uint32_t other = __shfl_xor_sync(0xffffffffu, g, stride);
@@ -325,8 +291,7 @@ __global__ void __launch_bounds__(1024, 2) eagle4_candidate_tail_cuda_kernel(
     const __nv_bfloat16 x = cand_logits[r * stride_cl_r + m * stride_cl_m + j];
     const int64_t tok = cand_tokens[r * stride_ct_r + m * stride_ct_m + j];
     const uint32_t key = radix_key(x);
-    // The NC-th largest key, bit by bit from the top (as torch's radix select, one bit per
-    // block-wide count).
+    // The NC-th largest key, one bit per block-wide count from the top, as torch's radix select.
     uint32_t prefix = 0u;
     int remaining = NC;
 #pragma unroll
@@ -404,8 +369,7 @@ __global__ void __launch_bounds__(1024, 2) eagle4_candidate_tail_cuda_kernel(
     pk[it] = radix_key(p);
   }
 
-  // The top-k of probs over the slots lane + 32 * it: the topk largest (key, then lowest
-  // slot) by repeated warp argmax; lane i keeps the i-th.
+  // Top-k by repeated warp argmax (largest key, then lowest slot); lane i keeps the i-th.
   unsigned live = (1u << ITER) - 1u;
   uint32_t sel_key = 0, prev = 0;
   int sel_slot = 0;
@@ -437,8 +401,7 @@ __global__ void __launch_bounds__(1024, 2) eagle4_candidate_tail_cuda_kernel(
     }
     return;
   }
-  // Ties among the selected keys: torch.topk(sorted=True)'s order, i.e. the gatherTopK
-  // placement (keys above the k-th largest in slot order, then its ties in slot order) ...
+  // Ties: torch.topk(sorted=True)'s order, gatherTopK placement (above kth, then ties, by slot) ...
   const uint32_t kth = prev;
   const unsigned lt_mask = (1u << lane) - 1u;
   const int n_gt = __popc(__ballot_sync(0xffffffffu, lane < topk && sel_key > kth));
@@ -520,10 +483,7 @@ void eagle4_shard_topk(TensorView scores, int64_t k, int64_t vocab_start, Tensor
   }
 }
 
-// cand_logits / cand_tokens: [R, M, NC] bf16 / int64 views (any rank / row strides, unit column
-// stride).
-// tokens_out is unused for R == 1; topk_probs / topk_tokens unused for topk == 0.
-// The outputs are contiguous rows.
+// Inputs [R, M, NC] (unit column stride); tokens_out unused if R == 1, top-k outputs if topk == 0.
 void eagle4_candidate_tail(TensorView cand_logits, TensorView cand_tokens, int64_t topk,
                            TensorView logits_out, TensorView tokens_out, TensorView topk_probs,
                            TensorView topk_tokens) {

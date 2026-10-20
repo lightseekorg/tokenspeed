@@ -158,17 +158,14 @@ _PAST_VERIFY_ROUNDS = 16
 # Tree batch tiers (_cost_tier), then the cost variant of a tiny round.
 _SMALL, _MEDIUM, _LARGE, _HUGE, _TINY_VARIANT = range(5)
 _VARIANTS = 5
-# Per cost variant: the least verify width a round's draft budget starts
-# from, and the batch size ratio of the stop threshold.
+# Per cost variant: a draft budget's least starting verify width; the stop threshold's batch ratio.
 _VERIFY_FLOOR = (16, 8, 4, 2, 32)
 _BATCH_SIZE_RATIO = (1.25, 1.50, 1.75, 2.00, 1.00)
 # Least ranked node budget of a tree round.
 _MIN_VERIFY_COUNT = 16
 # Verify width a chain round starts its work lists from; chains verify every drafted node.
 _CHAIN_VERIFY_NUM = 16
-# Chain batch tiers by how fast the target's verify cost grows with its width
-# (the "scale index"), and per tier the stop threshold of a step's gain per
-# cost, the per-depth decay of that gain, and the power of the cost scale.
+# Chain batch tiers by scale index: how fast the target's verify cost grows with its width.
 _CHAIN_SCALE_TINY = 1.25
 _CHAIN_TINY_MAX_BS = 2
 _CHAIN_SCALE_SMALL = 1.45
@@ -181,8 +178,7 @@ _CHAIN_COEFS = (
 )
 # The mean round cost the thresholds were tuned at, in one-token verify units.
 _CHAIN_REF_COST = 2.43
-# A verify cost step this much above the next one (and above the floor) is a
-# cliff: the stop test then looks two depths ahead.
+# Cliff: a cost step above the floor and ratio x the next; the stop test then looks 2 depths ahead.
 _CHAIN_CLIFF_MIN_COST = 0.15
 _CHAIN_CLIFF_RATIO = 1.5
 # The kernels' limit of measured target widths per interval.

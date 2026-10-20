@@ -475,9 +475,7 @@ class EagleHarness(Eagle4):
         self._tree_seed_lane_mask = seed
         self._depth_done = [torch.cuda.Event() for _ in range(depth)]
 
-    # ------------------------------------------------------------------
-    # Round
-    # ------------------------------------------------------------------
+    # --- Round ---
 
     @override
     def draft(self, draft_input: EagleDraftInput) -> torch.Tensor:

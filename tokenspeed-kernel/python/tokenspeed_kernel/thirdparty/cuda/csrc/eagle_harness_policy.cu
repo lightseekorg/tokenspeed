@@ -18,39 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// EAGLE-Harness tree policy on the device (EAGLE-4): EAGLE-4's round
-// decisions (tree width, chain depth and verify count), taken by single-CTA
-// kernels that read and write device memory only, so a round's depths can run
-// as captured graphs without host synchronization.
-//
-// device_policy.py precomputes every cost-data value in Python double precision
-// into tables indexed by batch size, cost data, context interval, cost variant
-// and depth; the kernels only compare, and evaluate the few operations on
-// device inputs (work deltas, ranked scores) with one IEEE rounding per Python
-// operation, in Python's order (explicit __d*_rn intrinsics: no FMA contraction).
-//
-// The call order per round is device_policy.py's. Slots, per depth d: width
-// (lanes depth d expands), cumu_start (pool size before depth d's children),
-// work_size (node count of the work deltas queued after depth d, 0 for none),
-// go (depth d drafts). go is mirrored to mapped pinned memory as
-// (seq << 1) | go, seq counting begin_round launches, so the host can poll it
-// without a CUDA synchronization. device_policy.py refuses cost data
-// EAGLE-4's decisions reject, so the kernels check none.
-//
-// A chain round whose batch size the width table covers (batch_table's
-// kTableWidthCol, W > 0) takes no decision: begin_round writes every depth's
-// slots and go flags (depths 1..W-2 draft) and the round's counts (verify W),
-// reads no cost data, and the decisions launched in its depths change no
-// state or slot.
-//
-// Latency: the kernels run between the drafter's forwards, with L2 cold, and
-// the drafter waits on most of them. Each gathers its inputs into shared
-// memory in waves of independent loads, then one thread decides from shared
-// memory. begin_round copies the round's cost row (fixed by its batch size
-// and context interval) to round_f64 and stages the batch size's
-// largest past verify width in the state, so the decisions read their inputs
-// in one wave. fp64 division costs several hundred cycles
-// on some GPUs: the verify's divisions run in parallel, off its serial steps.
+// EAGLE-4 round decisions on the device, in device_policy.py's arithmetic, without host sync.
 
 #include <cub/block/block_scan.cuh>
 
@@ -62,8 +30,7 @@
 
 namespace {
 
-// Scalars of the int32 state tensor: the policy's persistent state, then the
-// current round's.
+// Scalars of the int32 state tensor: the policy's persistent state, then the current round's.
 enum State : int {
   kTiny = 0,        // the last compared tree decision ran on one request (kept across rounds)
   kTier,            // the batch tier: 0 small, 1 medium, 2 large, 3 huge
@@ -105,8 +72,7 @@ constexpr int kMaxHistory = 32;
 // Tree depths whose cost row begin_round copies in one wave.
 constexpr int kMaxDepth = 32;
 
-// Columns of batch_table ([max_bs, cols], int64): begin_round's inputs per
-// batch size; kTableWidthCol: a chain's width table width (0: the rule decides).
+// Columns of batch_table ([max_bs, cols], int64): begin_round's inputs per batch size.
 enum BatchCol : int {
   kCostIdCol = 0,
   kChainTierRowCol,
@@ -117,24 +83,18 @@ enum BatchCol : int {
 };
 // Columns of interval_i32 ([costs, intervals, cols], trees).
 enum IntervalI32Col : int { kNumWidthsCol = 0, kWidthsCol };
-// Columns of interval_f64: draft_cost[-1], model cost ratio, then the stop
-// thresholds per cost variant and depth, then the verify cost deltas.
+// Columns of interval_f64: draft_cost[-1], cost ratio, thresholds[variant][depth], cost deltas.
 enum IntervalF64Col : int { kDraftCostCol = 0, kModelCostRatioCol, kStopThresholdCol };
-// Entries of chain_f64 ([costs, intervals, 2 tier rows, depth, entries]); the
-// cliff entries are 0 where no verify cost cliff makes the test look ahead.
+// chain_f64 [costs, intervals, 2 tier rows, depth, entries]; cliff entries are 0 without a cliff.
 enum ChainF64 : int { kGainDenom = 0, kStepCost, kChainThreshold, kCliffGainDenom, kCliffCost,
                       kChainF64 };
-// The round's cost row, copied by begin_round: a tree's round_f64 holds the
-// draft cost, model cost ratio and the stop threshold per depth (of the
-// round's cost variant); a chain's its chain_f64 entries per depth (of the
-// round's tier row).
+// round_f64 (begin_round's copy): a tree's draft cost, cost ratio, thresholds; a chain's chain_f64.
 enum RoundF64 : int { kRoundDraftCost = 0, kRoundModelCostRatio, kRoundThresholds };
 
 constexpr int kWarp = 32;
 constexpr unsigned kFullMask = 0xffffffffu;
 
-// torch.cumsum's CUB scan: 128 threads of 15 items per tile; two tiles keep
-// the decoupled look-back's sums in a fixed order.
+// torch.cumsum's CUB scan tiles (128 threads x 15 items); two tiles keep the look-back's sum order.
 constexpr int kRankThreads = 128;
 constexpr int kRankItems = 15;
 constexpr int kRankTile = kRankThreads * kRankItems;
@@ -147,9 +107,7 @@ using BlockScan = cub::BlockScan<float, kRankThreads, cub::BLOCK_SCAN_WARP_SCANS
 
 constexpr int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
-// One lane or thread per entry: the one-warp kernels load a state scalar,
-// tier table entry and history entry per lane, verify_width_choose a width per
-// lane; select_verify's last two warps load the scores a verify compares.
+// One lane (one-warp kernels) or thread (select_verify's last two warps) per entry.
 static_assert(kNumState <= kWarp && kTierTableSize <= kWarp && kMaxHistory <= kWarp);
 static_assert(kMaxNarrow < kWarp && kChainF64 <= kWarp && kMaxWidths <= kWarp);
 static_assert(kRankMaxCols <= kRankThreads - 2 * kWarp);
@@ -166,10 +124,7 @@ __device__ __forceinline__ int64_t floor_div(int64_t a, int64_t b) {
   return q;
 }
 
-// Up to kPerThread values per thread in registers: a kernel loads all its
-// inputs of a wave (load) before it stores any to shared memory (store), so
-// the loads overlap. Thread tid holds entries tid + k * threads, n <=
-// kPerThread * threads.
+// Register staging (entries tid + k * threads): a wave loads all before storing any, to overlap.
 template <int kPerThread, typename T>
 struct Fetch {
   T v[kPerThread];
@@ -199,8 +154,7 @@ struct Decision {
   bool cost_stop;
 };
 
-// A round kernel's state and slots in shared memory: the slots of its depth
-// d (cur) and of depth d + 1 (next, written back at the end).
+// A round kernel's state and slots in shared memory: depth d's (cur) and depth d + 1's (next).
 struct RoundShared {
   int32_t s[kNumState];
   int32_t cur[kNumSlotRows];
@@ -230,8 +184,7 @@ struct Round {
   int verify_num;
   int min_verify_count;       // trees
 
-  // Whether depth d + 1 drafts, also to the host mirror: a relaxed
-  // system-scope store, unfenced, as the host reads nothing else on it.
+  // Depth d + 1's go flag, mirrored to the host unfenced: the host reads nothing else on it.
   __device__ void publish_go(bool draft) {
     next[kGoRow] = draft;
     const int64_t value = (seq << 1) | (draft ? 1 : 0);
@@ -246,8 +199,7 @@ struct Round {
     return d % 2 == 0;
   }
 
-  // Depth d's decision without work deltas ("narrow": the
-  // tree's width at the round's tier); not decided when it compares them.
+  // Depth d's decision when it needs no work deltas (narrow: the tier's width); else not decided.
   __device__ Decision early_decision(int d, int narrow) const {
     if (chain) {
       if (d == tree_depth - 1) return {true, -1, true};
@@ -260,10 +212,7 @@ struct Round {
     return {false, 0, false};
   }
 
-  // The round stops after depth d (its children are the last in the pool);
-  // then complete_round (the start of the verify tree write): the ranked node count
-  // (verify_count) and whether the ranking is flat; a chain verifies every
-  // ranked node.
+  // Stops the round after depth d, setting verify count and flat flag; a chain verifies all ranked.
   __device__ void finish(int decided_width) {
     s[kLastDepth] = depth;
     s[kStopWidth] = decided_width;
@@ -282,8 +231,7 @@ struct Round {
     }
   }
 
-  // Take depth d's decision: sampled rounds stop only at their planned depth;
-  // a continuing round writes depth d + 1's slots.
+  // Takes depth d's decision; a sampled round stops only at its planned depth.
   __device__ void commit(int decided_width, bool cost_stop) {
     const int d = depth;
     bool stop = cost_stop;
@@ -303,9 +251,7 @@ struct Round {
   }
 };
 
-// The loads of a decision kernel's one wave (one warp) are unconditional,
-// at indices clamped into range, so they issue back to back without
-// branches; the stores to shared memory follow them.
+// A decision kernel's one load wave: unconditional loads at clamped indices, issued back to back.
 struct RoundLoad {
   int32_t state_value;
   int32_t slot_value;
@@ -330,8 +276,7 @@ struct RoundLoad {
   }
 };
 
-// The end of a decision kernel (one warp): the changed state scalars and
-// depth d + 1's slots back to global memory.
+// Writes back a decision kernel's changed state scalars and depth d + 1's slots (one warp).
 __device__ __forceinline__ void store_round(const RoundShared& sh, int32_t* state,
                                             int32_t state_value, int32_t* slots,
                                             int depth_slots, int d) {
@@ -347,10 +292,7 @@ __device__ bool batch_cut(const int32_t* s, int exec_mode, int bs) {
   return bench > 4 * bs && bench > bs + 4;
 }
 
-// ---------------------------------------------------------------------------
-// Round start (finish_round): past_verify_num, the sampled plan, the cost
-// context's interval, depth 0's decision and depth 1's slots.
-// ---------------------------------------------------------------------------
+// Round start (finish_round): past_verify_num, sampled plan, cost interval, depth 0's decision.
 struct BeginInputs {
   int bs;
   bool sampled;
@@ -360,9 +302,7 @@ struct BeginInputs {
   int chain_past_verify_num;
 };
 
-// A width table round of width W: depths 1..W-2 draft (the last drafted depth
-// W-2), and it verifies its whole pool of W nodes. Its stopping depth and width
-// are those the confidence rule records for a stop there.
+// Width-W table round: depths 1..W-2 draft, all W nodes verify, stop fields as the rule records.
 __device__ void begin_table_round(Round& r, int width) {
   int32_t* s = r.s;
   const int last = width - 2;
@@ -374,10 +314,7 @@ __device__ void begin_table_round(Round& r, int width) {
   s[kVerifyNum] = s[kVerifyCount];
 }
 
-// A width table round's slot of depth d (last: its last drafted depth): width
-// one from pool size d + 1, no work deltas, go up to the last drafted depth.
-// Depth 1 always runs (it begins the round), so a round stopping at depth 0
-// keeps a width-one depth 1 whose child no verify ranks.
+// Table round slot of depth d: depth 1 always runs, so a stop at depth 0 keeps an unranked depth 1.
 __device__ __forceinline__ int table_round_slot(int row, int d, int last) {
   const bool runs = d <= max(last, 1);
   if (row == kWidthRow) return runs ? 1 : 0;
@@ -422,8 +359,7 @@ __device__ void begin_round(Round& r, const BeginInputs& in) {
       min(max(floor_div(average_cache_len, step) - 1, static_cast<int64_t>(0)),
           row[kIntervalsCol] - 1);
   s[kInterval] = static_cast<int>(interval);
-  // Set at the round's start, not at its first cost read: tiny and tier change
-  // only after that read.
+  // Fixed at round start: tiny and tier change only after the round's first cost read.
   s[kVariant] = r.chain ? static_cast<int>(row[kChainTierRowCol])
                         : (s[kTiny] ? kTinyVariant : s[kTier]);
   // Depth 0: the root (one node) and its K children from the first step.
@@ -436,8 +372,7 @@ __device__ void begin_round(Round& r, const BeginInputs& in) {
   r.commit(decision.width, decision.cost_stop);
 }
 
-// The cost table begin_round copies the round's row from: trees'
-// interval_f64, chains' chain_f64.
+// begin_round's cost row source: interval_f64 for trees, chain_f64 for chains.
 struct CostTable {
   const double* f64;
   int num_intervals;
@@ -515,8 +450,7 @@ __global__ void __launch_bounds__(kWarp)
   __syncwarp();
   const int table_width = sh.s[kTableWidth];
   const int table_last = table_width - 2;
-  // A table round's go flags, up to the depth after its last drafted one
-  // (at least depth 2, which the drafter asks after depth 1).
+  // Go flags through last drafted depth + 1, at least depth 2 (the drafter reads it after depth 1).
   if (table_width > 0) {
     for (int d = lane + 1; d <= max(table_last + 1, 2); d += kWarp) {
       const int64_t value = (sh.seq << 1) | (d <= table_last ? 1 : 0);
@@ -556,11 +490,7 @@ __global__ void __launch_bounds__(kWarp)
   }
 }
 
-// ---------------------------------------------------------------------------
-// Depth d's tree width decision, before depth d drafts.
-// ---------------------------------------------------------------------------
-// row: draft_cost[-1], the model cost ratio and the stop threshold at the
-// decision's depth, from round_f64.
+// Tree width decision before depth d drafts; row: draft cost, cost ratio, depth d's stop threshold.
 __device__ void decide_tree(Round& r, const float* work_deltas, const double* row, int exec_mode,
                             double async_layer_ratio) {
   const int d = r.depth;
@@ -577,8 +507,7 @@ __device__ void decide_tree(Round& r, const float* work_deltas, const double* ro
       decision = {true, 1, true};
     } else {
       s[kTiny] = bs == 1;
-      // (work_deltas[width] - work_deltas[0]) / draft_cost[-1] * model_cost_ratio
-      // * async_layer_ratio
+      // (work_deltas[narrow] - work_deltas[0]) / draft_cost * ratios, one rounding per op, no FMA.
       double gain = __dsub_rn(static_cast<double>(work_deltas[narrow]),
                               static_cast<double>(work_deltas[0]));
       gain = __ddiv_rn(gain, row[kRoundDraftCost]);
@@ -647,9 +576,7 @@ __global__ void __launch_bounds__(kWarp)
   // No live round (none begun, none requested, or a warm-up): nothing to decide.
   if (sh.s[kBatchSize] <= 0) return;
   if (kChain && sh.s[kTableWidth] > 0) {
-    // begin_round wrote the width table round's slots and go flags; past its
-    // last drafted depth a decision only clears the next go flag, as a stopped
-    // round's does, and leaves the slots.
+    // Table round: begin_round wrote the slots; past its last depth, only clear the next go flag.
     if (lane == 0 && sh.cur[kGoRow] != 1) {
       *reinterpret_cast<volatile int64_t*>(go_host + d + 1) = sh.seq << 1;
     }
@@ -668,23 +595,14 @@ __global__ void __launch_bounds__(kWarp)
   store_round(sh, state, round.state_value, slots, depth_slots, d);
 }
 
-// ---------------------------------------------------------------------------
-// Cumulative ranked scores of top_scores[:rows, :cols], bit for bit as
-// torch.cumsum(top_scores.mean(dim=0), dim=0) (or of top_scores.view(-1)
-// when flat) on a contiguous tensor.
-// ---------------------------------------------------------------------------
+// Cumulative ranked scores bit for bit as torch.cumsum(top_scores.mean(dim=0)) (flat: view(-1)).
 __device__ __forceinline__ int last_pow2(int n) {
   int p = 1;
   while (p * 2 <= n) p *= 2;
   return p;
 }
 
-// torch's mean over dim 0 of a contiguous [rows, cols] float tensor
-// (Reduce.cuh with output vectorization, rows <= 32, cols <= 64): each thread
-// sums a column into 4 accumulators by row index mod 4 and combines them in
-// order; one column is instead split over last_pow2(rows) lanes, each summing
-// rows l and l + lanes, then reduced by halving offsets. The sum is scaled by
-// float(cols) / (rows * cols).
+// Replays Reduce.cuh's mean(dim=0) summation order for rows <= 32, cols <= 64 (cols == 1 differs).
 __device__ float column_mean(const float* top, int stride, int rows, int cols, int c) {
   const float factor = __fdiv_rn(static_cast<float>(cols), static_cast<float>(rows * cols));
   float total;
@@ -708,25 +626,20 @@ __device__ float column_mean(const float* top, int stride, int rows, int cols, i
   return __fmul_rn(total, factor);
 }
 
-// The block prefix of the second tile: the first tile's aggregate, as CUB's
-// decoupled look-back hands it over.
+// Second tile's block prefix: the first tile's aggregate, as CUB's decoupled look-back passes it.
 struct TilePrefix {
   float prefix;
   __device__ float operator()(float) const { return prefix; }
 };
 
-// Shared memory of the ranking: the [rows, cols] scores (row-major, zero to
-// the end of the second scan tile), turned in place into the cumulative
-// ranked scores.
+// Ranking scratch: [rows, cols] scores row-major, zero-padded to two tiles, scanned in place.
 struct RankShared {
   float values[kRankTile * kRankTiles];
   float means[kRankMaxCols];
   typename BlockScan::TempStorage scan;
 };
 
-// top[:rows, :cols] (rows of `stride` floats, a supported shape) loaded into
-// registers, then stored to rank.values with zeros past it; all
-// kRankThreads threads.
+// top[:rows, :cols] to registers, then to rank.values zero-padded; all kRankThreads threads.
 struct ScoreFetch {
   // Thread tid holds column tid % kRankMaxCols of rows tid / kRankMaxCols + k * kRowStep.
   static constexpr int kRowStep = kRankThreads / kRankMaxCols;
@@ -762,8 +675,7 @@ struct ScoreFetch {
   }
 };
 
-// The cumulative ranked scores, in place in rank.values[0, ranked count); all
-// kRankThreads threads, after ScoreFetch::store and a barrier.
+// Cumulative ranked scores in place in rank.values; all threads, after ScoreFetch::store + barrier.
 __device__ void rank_scores(RankShared& rank, int rows, int cols, bool flat) {
   const int tid = threadIdx.x;
   if (!flat) {
@@ -793,10 +705,7 @@ __device__ void rank_scores(RankShared& rank, int rows, int cols, bool flat) {
   __syncthreads();
 }
 
-// ---------------------------------------------------------------------------
-// Verify width, the verify history, the sampled plan, and this round's ranked
-// scores published for the next round.
-// ---------------------------------------------------------------------------
+// Verify width and history, the sampled plan, and this round's ranked scores for the next round.
 __device__ int find_majority(const int32_t* nums, int n) {
   for (int i = 0; i < n; ++i) {
     int count = 0;
@@ -811,15 +720,13 @@ __device__ void shift_in(int32_t* nums, int n, int value) {
   nums[n - 1] = value;
 }
 
-// A round's verify inputs: its (batch size, interval) row of the verify
-// tables and its (cost data, interval) row of the interval tables.
+// A round's verify inputs: its (batch size, interval) and (cost data, interval) table rows.
 struct VerifyRow {
   int32_t tier;  // _cost_tier
   double thresholds[2];  // threshold * 0.95, * 1.05
   int32_t num_widths;
   int32_t index[kMaxWidths];  // measured target widths
-  // The verify width's cost deltas by position ([max_widths, max_widths]); 0
-  // where cost_delta > 0.04 fails.
+  // Cost deltas by position pair [max_widths, max_widths]; 0 where cost_delta > 0.04 fails.
   double cost_delta[kMaxWidths * kMaxWidths];
 };
 
@@ -831,8 +738,7 @@ struct VerifyPlan {
   int widths[kMaxWidths];
   int last_verify_num;
   const float* ranked;  // the ranked scores it sizes on (shared memory)
-  // Per position pair (i, j) and stability threshold: whether width j's
-  // gain per cost over width i falls below it.
+  // Per pair (i, j) and stability threshold: width j's gain per cost over width i is below it.
   bool below[kMaxWidths * kMaxWidths * 2];
 };
 
@@ -849,9 +755,7 @@ __device__ int verify_width_unranked(int32_t* recent, int recent_len, const Veri
   return width;
 }
 
-// The verify width on cumulative ranked scores (fp32, widened exactly), up to the
-// score comparisons: sets plan.width, or plan.compare and their inputs.
-// Width 1 is a measured width (and exec mode 1 measures a second one).
+// Verify width on fp32 ranked scores up to the comparisons: sets plan.width or plan.compare.
 __device__ void verify_width_plan(const int32_t* s, int32_t* recent, int recent_len,
                                   const VerifyRow& v, int exec_mode, int verify_count,
                                   const float* ranked, int ranked_len, VerifyPlan& plan) {
@@ -883,8 +787,7 @@ __device__ void verify_width_plan(const int32_t* s, int32_t* recent, int recent_
   plan.ranked = ranked;
 }
 
-// The score comparisons, both stability thresholds of every position pair at
-// once (all threads): the same operations as the serial loop, off its chain.
+// All pairs' comparisons at both thresholds in parallel: the serial loop's ops, off its chain.
 __device__ void verify_width_compare(const VerifyRow& v, int max_widths, VerifyPlan& plan) {
   const int n = plan.n;
   for (int p = threadIdx.x; p < n * n * 2; p += kRankThreads) {
@@ -903,9 +806,7 @@ __device__ void verify_width_compare(const VerifyRow& v, int max_widths, VerifyP
   }
 }
 
-// The verify width after the comparisons (warp 0): the stability mask and the
-// chosen width. Each width's mask entry changes only in its own column of
-// the pair loop, so lane j replays column j in order.
+// Mask and chosen width (warp 0): width j's mask changes only in column j, so lane j replays it.
 __device__ int verify_width_choose(int32_t* recent, int recent_len, int verify_count,
                                    const VerifyPlan& plan) {
   const int lane = threadIdx.x;
@@ -940,9 +841,7 @@ struct VerifyTables {
   int max_widths;
 };
 
-// This round's ranked scores and verify width: the scores are published for
-// the next round before the verify is sized, which reads the previous round's
-// (its own in the first).
+// Publishes this round's ranked scores, then sizes the verify on the previous round's (first: own).
 __global__ void __launch_bounds__(kRankThreads)
     select_verify_kernel(int32_t* state, int32_t* recent, int recent_len, int32_t* hist,
                          int hist_len, float* published, int64_t published_capacity,
@@ -975,8 +874,7 @@ __global__ void __launch_bounds__(kRankThreads)
   const int verify_count = s[kVerifyCount];
   const bool flat = s[kFlat] != 0;
   const int own_count = flat ? rows * verify_count : verify_count;
-  // Wave 2: the scores, the verify history and the verify inputs, all loaded
-  // before any is stored.
+  // Wave 2: scores, verify history and verify inputs, all loaded before any is stored.
   ScoreFetch scores;
   scores.load(top, top_stride, rows, verify_count);
   int32_t* history = hist + static_cast<int64_t>(bs - 1) * hist_len;
@@ -1052,12 +950,7 @@ __global__ void __launch_bounds__(kRankThreads)
   }
 }
 
-// ---------------------------------------------------------------------------
-// Host entry points
-// ---------------------------------------------------------------------------
-// The checks below cover what the kernels index past their fixed capacities
-// or read through a caller's view; device_policy.py builds every table,
-// state and slot tensor contiguous in the kernels' dtypes and layouts.
+// Host entry points check fixed capacities and views; device_policy.py builds contiguous tables.
 
 // tree_depth from the [4, tree_depth + 1] slots, within kMaxDepth.
 int round_depth(const TensorView& slots) {

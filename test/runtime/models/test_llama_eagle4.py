@@ -27,8 +27,7 @@ from __future__ import annotations
 
 import os
 import sys
-from types import SimpleNamespace
-from unittest import mock
+from dataclasses import dataclass
 
 import pytest
 import torch
@@ -43,6 +42,12 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.eagle_harness.drafter import Eagle4
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.input_buffer import InputBuffers
+from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
+from tokenspeed.runtime.layers.attention.backends.paged.router import (
+    CacheGroupRouter,
+)
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.moe import utils as moe_utils
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -71,8 +76,7 @@ def _build_model(
     monkeypatch.setitem(global_server_args_dict, "max_model_len", 256)
     monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
     monkeypatch.setitem(global_server_args_dict, "comm_fusion_max_num_tokens", 256)
-    # The engine's default --moe-backend, which picks the latent MoE's kernel;
-    # an earlier test in the process may have left another one set.
+    # The engine's default --moe-backend (an earlier test may have left another one set).
     monkeypatch.setattr(moe_utils, "MOE_BACKEND", moe_utils.MoeBackend.AUTO)
 
     old_dtype = torch.get_default_dtype()
@@ -82,6 +86,61 @@ def _build_model(
             return LlamaForCausalLMEagle4(config, mapping)
     finally:
         torch.set_default_dtype(old_dtype)
+
+
+@dataclass(frozen=True)
+class _DraftModelConfig:
+    requires_request_token_history: bool
+
+
+class _DraftRunner:
+    """The draft ModelRunner's parts a drafter reads, around a model built in
+    place (a ModelRunner loads its model from a checkpoint)."""
+
+    def __init__(self, model: LlamaForCausalLMEagle4) -> None:
+        self.device = torch.device("cuda")
+        self.model = model
+        self.mapping = Mapping(rank=0, world_size=1)
+        self.model_config = _DraftModelConfig(requires_request_token_history=False)
+
+
+def _static_tree_drafter(model: LlamaForCausalLMEagle4, topk: int) -> Eagle4:
+    """An EAGLE-4 drafter over ``model`` bound to a static tree of ``topk``
+    children per node, on an unbound draft router."""
+    max_bs, steps = 4, 3
+    nodes = (steps - 1) * topk
+    drafter = Eagle4(
+        spec_num_tokens=nodes,
+        spec_num_steps=steps,
+        draft_model_runner=_DraftRunner(model),
+        attn_backend=CacheGroupRouter(
+            None,
+            is_draft=True,
+            spec_num_tokens=1,
+            device="cuda",
+            consumed_group_ids=None,
+        ),
+        runtime_states=RuntimeStates(
+            req_pool_size=max_bs,
+            vocab_size=model.config.vocab_size,
+            output_length=nodes,
+            device="cuda",
+        ),
+        input_buffers=InputBuffers(
+            max_bs=max_bs,
+            max_num_tokens=max_bs * nodes,
+            state_write_padding_pool_index=max_bs,
+        ),
+        vocab_size=model.config.vocab_size,
+    )
+    drafter.bind_tree(
+        TreeSpec(
+            TreeSpecConfig(topk=topk, num_steps=steps, num_nodes=nodes),
+            max_bs=max_bs,
+            device=drafter.device,
+        )
+    )
+    return drafter
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -149,15 +208,12 @@ def test_eagle4_candidate_head_scores_the_low_rank_top_candidates_exactly(
     torch.testing.assert_close(probs, top.values, rtol=0, atol=0)
     assert torch.equal(tokens, ids.gather(-1, top.indices))
     # A static EAGLE-4 tree ranks the same candidates by log-probability.
-    drafter = mock.MagicMock(spec=Eagle4)
-    drafter.draft_tree = SimpleNamespace(topk=4)
-    scores, tree_tokens = Eagle4._score_candidates(drafter, output)
+    scores, tree_tokens = _static_tree_drafter(model, 4)._score_candidates(output)
     assert torch.equal(tree_tokens.long(), tokens)
     torch.testing.assert_close(scores.exp(), probs, rtol=1e-5, atol=1e-6)
 
 
-# The released drafts' config keys at toy sizes. The MoE sizes are the
-# smallest the BF16 squared-ReLU expert kernels plan for.
+# Toy sizes; the MoE's are the smallest the BF16 squared-ReLU expert kernels plan for.
 _MOE_HIDDEN, _LATENT, _EXPERT_INTER, _EXPERTS, _TOP_K, _SHARED_INTER = (
     256,
     128,
@@ -370,8 +426,7 @@ def _nemotron_draft_checkpoint(
         "self_attn.o_proj.weight": rand(h, h),
         "post_attention_layernorm.weight": rand(h),
         "mlp.gate.weight": rand(_EXPERTS, h),
-        # As trained: a large common offset and a small spread across experts,
-        # which a BF16 bias would round away; routing adds it in FP32.
+        # As trained: a large common offset whose small per-expert spread a BF16 bias would round away.
         "mlp.gate.e_score_correction_bias": 25.0
         + rand(_EXPERTS, dtype=torch.float32) * 0.25,
         "mlp.fc1_latent_proj.weight": rand(_LATENT, h),
@@ -550,11 +605,7 @@ def test_eagle4_latent_moe_matches_the_trained_block(
     weights = _nemotron_draft_checkpoint("layers.0.", "cuda")
     model.load_weights(weights.items())
     moe = model.model.midlayer.mlp
-    # What the model loader runs after load_weights.
-    for module in moe.modules():
-        quant_method = getattr(module, "quant_method", None)
-        if quant_method is not None:
-            quant_method.process_weights_after_loading(module)
+    # The block's one post-load hook the model loader runs that is not a no-op.
     moe.experts.process_weights_after_loading(moe.experts)
     x = torch.randn(tokens, _MOE_HIDDEN, device="cuda").bfloat16()
     ctx = ForwardContext(

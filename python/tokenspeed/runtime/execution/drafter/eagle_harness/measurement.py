@@ -208,8 +208,7 @@ class CostMeasurement:
         # The batch size the driver measures (None before it wrote one).
         self.measured_batch_size: int | None = None
         self.records: list[MeasureRecord] = []
-        # The token every request commits this round, read by the decode graph:
-        # FORCED_TOKEN, then the EOS once the batch has its rounds.
+        # Committed token of every request, read in-graph: FORCED_TOKEN, then EOS once finished.
         self.commit_token = torch.full(
             (1,), FORCED_TOKEN, dtype=torch.int32, device=device
         )
@@ -252,8 +251,7 @@ class CostMeasurement:
 
     def _drain(self) -> None:
         if self.tp_group is not None:
-            # On the device group the forward thread alone uses: the control
-            # plane's CPU collectives run on the event-loop thread.
+            # Device group: the control plane's CPU collectives run on the event-loop thread.
             dist.all_reduce(self._barrier, group=self.tp_group)
         torch.cuda.synchronize()
 

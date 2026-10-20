@@ -139,8 +139,7 @@ def test_measure_policy_cycles_widths_and_lags_the_first_depth() -> None:
         policy.next_widths(4, 4)
         policy.write_round()
         rounds.append((policy.widths[1:9].tolist(), policy.verify_num.item()))
-    # Draft widths 1, 2, 4, 8 and verify widths 64, 32, 16, 8, 1 by the counter;
-    # each round's first depth runs the previous round's width.
+    # Draft and verify widths cycle by the counter; each round's depth 1 runs the previous round's width.
     assert rounds[0] == ([8] + [2] * 7, 32)
     assert rounds[1] == ([2] + [4] * 7, 16)
     assert rounds[2] == ([4] + [8] * 7, 8)

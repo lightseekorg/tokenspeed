@@ -209,11 +209,7 @@ _SCENARIOS = {
     ),
 }
 
-# Per (scenario, batch size), per round: (past verify width, last decided
-# depth, its width, verify count, verify width), recorded from EAGLE-4's
-# tree-width and verify-count rules (and its sampled-round plans) on
-# _write_cost_dir and _rounds (seeded by the batch size; the node count at most
-# the round's drafted pool).
+# EAGLE-4's decisions per (scenario, batch size) and round, as _Outcome.recorded orders them.
 # fmt: off
 _RECORDED = {
     ('high', 1): [
@@ -305,10 +301,7 @@ _RECORDED = {
         (32, 1, 4, 41, 16), (32, 1, 4, 41, 32), (32, 1, 4, 10, 8), (32, 1, 4, 41, 8),
     ],
 }
-# Per batch size, per round: the depth a chain stopped at, recorded from
-# EAGLE-4's chain-depth rule on the chain cost data (verify widths 1, 2,
-# 4, ..., 16, one draft width, a verify cost cliff from width 6 at batch 4 and
-# up) and _chain_rounds.
+# Per batch size, per round: the depth EAGLE-4's chain-depth rule stopped the chain at.
 _CHAIN_RECORDED = {
     1: [2, 2, 2, 4, 4, 6, 4, 2, 2, 2, 2, 8, 2, 8, 2, 6, 6, 12, 2, 2, 4, 4, 2, 4],
     2: [4, 8, 8, 4, 2, 4, 4, 2, 2, 2, 6, 2, 6, 4, 8, 4, 6, 4, 4, 2, 2, 6, 6, 8],
@@ -726,9 +719,7 @@ def _ratio_13_model_ratio() -> float:
 
 
 _W4 = [0, 1, 3, 7]
-# name: (index, ratio, model cost ratio, policy changes, rounds). One cost
-# interval; rounds "<bs>[s][f][x<d>|t<d>]": sampled, flat ranked scores, no gain
-# at depth d's decision or that decision on its threshold (large gains else).
+# name: (cost index, cost ratio, model cost ratio, policy changes, rounds), one cost interval.
 _BOUNDARIES = {
     # A sampled first round sizes unranked (verify_count 7 is a measured width).
     "unranked_first_round": (
@@ -800,8 +791,7 @@ _BOUNDARIES = {
     ),
 }
 # fmt: off
-# Per round, as _RECORDED's: EAGLE-4's decisions (computed on the host by the
-# same rules).
+# Per round, as _RECORDED's: EAGLE-4's decisions.
 _BOUNDARY_EXPECTED = {
     'batch_size_ratio_exactly_13': [
         (16, 9, -1, 16, 8), (32, 9, -1, 16, 8), (32, 9, -1, 16, 8), (32, 7, 2, 16, 8),
@@ -851,9 +841,7 @@ _BOUNDARY_EXPECTED = {
         (64, 5, -1, 64, 31), (64, 5, -1, 64, 32),
     ],
 }
-# Per "t" scenario: the compared work delta's index and fp32 bits, and per "t"
-# round depth 0's work delta (fp32 bits) that puts the decision on either side
-# of its threshold (bisected on EAGLE-4's double-precision test).
+# Per "t" scenario: the compared delta's index and fp32 bits, then each round's delta 0 bits around the threshold.
 _ON_THRESHOLD = {
     'batch_size_ratio_exactly_13': (2, 0x3EA83586, [0x329B5FFB, 0x329B5FFB, 0x329B5FFC, 0x329B5FFC, 0x329B5FFB, 0x329B5FFC]),
     'chain_cliff_after_stop': (1, 0x4013C362, [0x346CBFB1, 0x346CBFB1, 0x346CBFB2, 0x346CBFB2, 0x346CBFB1, 0x346CBFB2]),
@@ -864,7 +852,11 @@ _ON_THRESHOLD = {
 
 @pytest.mark.parametrize("name", sorted(_BOUNDARIES))
 def test_rounds_at_exact_boundaries(name: str) -> None:
-    """Literal bounds and stability comparisons on their exact values."""
+    """Literal bounds and stability comparisons on their exact values. A
+    round ``<bs>[s][f][x<d>|t<d>]`` is sampled, has flat ranked scores, no gain
+    at depth d's decision or that decision on its threshold (large gains
+    else); a threshold's depth 0 work delta is bisected on EAGLE-4's
+    double-precision test."""
     index, ratio, model_ratio, changes, rounds = _BOUNDARIES[name]
     chain = index is None
     target = IntervalCost(

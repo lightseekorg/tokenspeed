@@ -18,20 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// EAGLE-Harness device-chained rounds (EAGLE-4): the GPU launches a round's
-// draft depths and its finalize graph itself, so the host never waits on the
-// round's decisions.
-//
-// Each depth's graph holds chain_kernel, which tail-launches the round's next
-// graph from an exec table of the padded batch: depth + 1 while its go flag is
-// set, else the finalize graph (sampled or not). The host launches depth 1 (an
-// ordinary graph); the later depths and the finalize are instantiated for
-// device launch. A tail launch starts once the launching graph has completed,
-// and the stream that launched depth 1 orders its later work after the whole
-// chain.
-//
-// Built with relocatable device code and linked with the device runtime
-// (cudaGraphLaunch from device code).
+// EAGLE-4 chained rounds: each depth's graph tail-launches the next or the finalize; no host wait.
 
 #include <cstdint>
 
@@ -39,16 +26,12 @@
 
 namespace {
 
-// execs (int64 [last_depth + 3]): column d holds depth d's graph exec
-// (2 <= d <= last_depth; 0 where the batch did not capture it), then the
-// finalize graphs, not sampled and sampled. go (int32 [>= last_depth + 1]):
-// whether depth d drafts this round, written by depth d - 1's decision.
+// execs: [d] depth d's exec (0: uncaptured), [last_depth + 1 + sampled] finalize; go[d]: d drafts.
 __global__ void chain_kernel(const int64_t* __restrict__ execs, const int32_t* __restrict__ go,
                              const bool* __restrict__ sampled, int depth, int last_depth) {
   const bool deeper = depth < last_depth && go[depth + 1] != 0;
   const int64_t next = execs[deeper ? depth + 1 : last_depth + 1 + (*sampled ? 1 : 0)];
-  // A round reaching a graph its batch did not capture would leave its tree
-  // unwritten: fail loudly instead.
+  // An uncaptured graph would leave the round's tree unwritten: trap instead.
   if (next == 0 ||
       cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(next), cudaStreamGraphTailLaunch) !=
           cudaSuccess) {

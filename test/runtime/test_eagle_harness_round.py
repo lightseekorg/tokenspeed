@@ -38,10 +38,10 @@ import random
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
-from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest  # noqa: E402
+import tokenspeed_scheduler as ts  # noqa: E402
 import torch  # noqa: E402
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 from transformers import LlamaConfig  # noqa: E402
@@ -54,6 +54,10 @@ register_cuda_ci(
 )
 
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
+from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
+    advance_scheduler,
+    make_config,
+)
 from tokenspeed.runtime.execution.context import ForwardContext  # noqa: E402
 from tokenspeed.runtime.execution.drafter.eagle import EagleDraftInput  # noqa: E402
 from tokenspeed.runtime.execution.drafter.eagle_harness.config import (  # noqa: E402
@@ -297,10 +301,14 @@ class _Rounds:
         torch.cuda.current_stream().wait_stream(stream)
         self.ladder = tuple(sorted(ladder))
 
-    def draft(self, bs: int, rng: random.Random) -> list[int]:
-        """Fill a decode round's inputs (random slots, contexts, verified
-        tokens and accept lengths) and draft its first step; returns the slots."""
-        slots = rng.sample(range(POOL), bs)
+    def draft(
+        self, bs: int, rng: random.Random, slots: list[int] | None = None
+    ) -> list[int]:
+        """Fill a decode round's inputs (``slots``, else random ones, and
+        random contexts, verified tokens and accept lengths) and draft its
+        first step; returns the slots."""
+        if slots is None:
+            slots = rng.sample(range(POOL), bs)
         device = self.drafter.device
         slot_rows = torch.tensor(slots, dtype=torch.int64, device=device)
         self.buffers.req_pool_indices_buf[:bs] = slot_rows
@@ -429,6 +437,54 @@ def _rounds(
     return _Rounds(drafter, buffers, states, nodes)
 
 
+def _decode_batch(bs: int, width: int):
+    """The scheduler's decode batch of ``bs`` requests, ``width`` tokens
+    each, once their prefill landed."""
+    scheduler = ts.Scheduler(
+        make_config(
+            num_device_pages=65,
+            max_scheduled_tokens=bs * width,
+            max_batch_size=bs,
+            prefix_granularity=4,
+            num_host_pages=0,
+            disable_l2_cache=True,
+            enable_l3_storage=False,
+            role="fused",
+            num_snapshot_pages=1,
+            max_retracted_requests=0,
+            l3_prefetch_min_pages=0,
+            decode_input_tokens=width,
+            cache_groups=[
+                ts.CacheGroupConfig(
+                    group_id="history",
+                    block_granularity=4,
+                    total_pages=65,
+                    attn_kind=ts.AttnKind.Full,
+                )
+            ],
+        )
+    )
+    for i in range(bs):
+        spec = ts.RequestSpec()
+        spec.request_id = f"r{i}"
+        spec.tokens = [1, 2, 3]
+        spec.max_new_tokens = 8
+        scheduler.submit_requests([spec])
+    (prefill,) = [
+        op for op in scheduler.next_execution_plan().forward if op.request_ids
+    ]
+    results = []
+    for request_id in prefill.request_ids:
+        result = ts.ForwardEvent.ExtendResult()
+        result.request_id = request_id
+        result.tokens = [5]
+        results.append(result)
+    advance_scheduler(scheduler, results)
+    (decode,) = [op for op in scheduler.next_execution_plan().forward if op.request_ids]
+    assert decode.num_extends() == 0 and max(decode.request_pool_indices) < POOL
+    return decode
+
+
 def _depths(parents: torch.Tensor) -> list[int]:
     """Each node's depth in a verify tree (its parents' row)."""
     depths = []
@@ -495,20 +551,14 @@ def test_a_round_drafts_beside_the_next_forwards_staging(tmp_path, graphs) -> No
         rounds.capture((MAX_BS,))
     buffers, states = rounds.buffers, rounds.states
     rng = random.Random(1)
+    # The next forward, its requests reordered: it refills the buffers the round drafted from.
+    op = _decode_batch(4, NODES)
+    order = list(op.request_pool_indices)
     # A first round loads the kernels (a lazy module load synchronizes).
     for staging in (False, True):
         states.future_input_map.fill_(-1)
-        slots = rounds.draft(4, rng)
+        slots = rounds.draft(4, rng, order[::-1])
         rounds.finish_round(4)
-        # The next forward, its requests reordered: it refills the buffers the round drafted from.
-        order = slots[::-1]
-        op = SimpleNamespace(
-            request_ids=order,
-            request_pool_indices=order,
-            input_lengths=[NODES] * len(order),
-            decode_input_ids=None,
-            num_extends=lambda: 0,
-        )
         total = len(order) * NODES
         decode_input_ids = buffers.fill_input_buffers(op, states, total)
         if staging:
@@ -606,8 +656,7 @@ def test_a_round_launched_behind_the_decode_graph_drafts_beside_the_forward(
         assert torch.equal(*trees)
 
 
-# Chain rounds: the confidence rule below 3 requests, then widths 5, 2 (no
-# drafted depth: depth 1, which starts the round, still runs) and the full 16.
+# The confidence rule below 3 requests, then widths 5, 2 (depth 1 still runs) and the full 16.
 _CHAIN_TABLE = (ChainWidthEntry(3, 5), ChainWidthEntry(5, 2), ChainWidthEntry(7, 16))
 
 

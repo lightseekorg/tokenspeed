@@ -97,8 +97,7 @@ def _gather_dot_kernel(
     )
 
 
-# (candidates, hidden) where one candidate per program was validated against
-# BLOCK_K 4: at BLOCK_H 2048 and 8 warps the reduction along H keeps its layout.
+# (candidates, hidden) where BLOCK_K 1 was validated against BLOCK_K 4 (same H reduction layout).
 _ONE_CANDIDATE_SHAPES = frozenset({(128, 5120)})
 
 

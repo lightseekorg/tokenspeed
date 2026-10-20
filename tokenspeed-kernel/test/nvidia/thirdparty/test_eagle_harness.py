@@ -56,8 +56,7 @@ def _distinct_scores(rows: int, cols: int, generator: torch.Generator) -> torch.
 @pytest.mark.parametrize("n,k", [(5, 5), (1024, 64)])
 def test_stable_topk_desc(n: int, k: int) -> None:
     generator = torch.Generator().manual_seed(n)
-    # Few distinct values: ties must keep the lower index first. A padded row
-    # and columns past n (as in a captured graph) are never read or written.
+    # Ties keep the lower index first; a padded row and columns past n are never read or written.
     cols = min(n + 3, 1024)
     scores = (torch.randint(0, 8, (4, cols), generator=generator).float() / 8).to(
         _DEVICE
@@ -393,8 +392,7 @@ def test_sample_children_reads_strided_rows() -> None:
     def full(rows: torch.Tensor) -> torch.Tensor:
         return rows.view(reqs, k, -1)
 
-    # All K lanes passed with the expanded width on the device draw what the
-    # expanded lanes alone draw.
+    # All K lanes with the expanded width on the device draw what the expanded lanes alone draw.
     packed = [lanes(rows).contiguous() for rows in (logits, cand, tokens, scores)]
     packed_tables = draw(*packed, width=None)
     in_place = tokens.clone(), scores.clone()
@@ -423,8 +421,7 @@ def test_write_verify_tree(verify_num: int) -> None:
     for node in range(1, nodes):
         prev[:, node] = torch.randint(0, node, (bs,), generator=generator)
     tokens = torch.randint(0, 1000, (bs, nodes), generator=generator)
-    # An ancestor-first ranking: each node's parent is ranked before it.
-    # A padded row past the live ones is never written.
+    # Ancestor-first rankings (each parent ranked first); a padded row past the live ones is never written.
     ranked = torch.zeros((bs + 1, 16), dtype=torch.int64)
     for b in range(bs):
         chosen = [0]

@@ -1295,8 +1295,7 @@ def test_eagle_taps_are_the_full_stream_after_each_named_block(
     mapping = Mapping(rank=0, world_size=1)
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
     monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
-    # The engine's default --moe-backend, which picks the BF16 experts' kernel;
-    # an earlier test in the process may have left another one set.
+    # The engine's default --moe-backend (an earlier test may have left another one set).
     monkeypatch.setattr(moe_utils, "MOE_BACKEND", moe_utils.MoeBackend.AUTO)
     config = _config(
         hybrid_override_pattern="EEEE",

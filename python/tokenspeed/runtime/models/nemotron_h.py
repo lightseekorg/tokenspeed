@@ -811,8 +811,7 @@ class NemotronHModel(nn.Module):
             mapping,
             config.num_hidden_layers,
         )
-        # Blocks whose input an EAGLE draft reads, in ascending order (set by
-        # set_eagle3_layers_to_capture); num_hidden_layers is the final norm's.
+        # Ascending blocks whose input a draft reads; num_hidden_layers means the final norm's.
         self.layers_to_capture: list[int] = []
 
     def forward(
@@ -831,8 +830,7 @@ class NemotronHModel(nn.Module):
         residual = None
         for index, layer in enumerate(self.layers):
             previous, residual = layer(previous, residual, ctx)
-            # A block's norm folded the previous mixer's output into residual,
-            # all-reduced under TP: residual is the full input of this block.
+            # After the norm's TP all-reduce and add, residual is this block's full input.
             capture_layer_input(
                 layer.norm.comm_manager,
                 residual,

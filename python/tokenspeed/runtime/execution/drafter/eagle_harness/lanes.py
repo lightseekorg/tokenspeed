@@ -64,9 +64,7 @@ class Eagle4TreeLanes(TreeDraftInputs):
         self.frontier_rows = torch.zeros(
             (max_bs * topk,), dtype=torch.int32, device=device
         )
-        # Each leaf's table per lane row ([max_bs * K, pages]), allocated on its
-        # first lane forward (again when a rebind resizes the leaf's table) and
-        # rewritten by every later one.
+        # Per leaf, its page table per lane row; reallocated when a rebind resizes the leaf's table.
         self._row_tables: dict[PagedAttentionBackend, torch.Tensor] = {}
 
     @override

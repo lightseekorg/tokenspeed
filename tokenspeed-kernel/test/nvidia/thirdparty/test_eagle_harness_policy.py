@@ -36,8 +36,7 @@ pytestmark = pytest.mark.skipif(
 
 _DEVICE = "cuda"
 _MAX_ROWS, _MAX_COLS = 32, 64
-# The state scalars a ranking reads and writes (``State`` in eagle_harness_policy.cu);
-# the others zero make a first, unsampled round.
+# The ``State`` scalars (eagle_harness_policy.cu) a ranking uses; all others zero make a first unsampled round.
 _RANKED_COUNT, _BATCH_SIZE, _VERIFY_COUNT, _FLAT, _NUM_STATE = 6, 7, 17, 18, 21
 
 

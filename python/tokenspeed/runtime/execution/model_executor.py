@@ -2641,8 +2641,7 @@ class ModelExecutor:
                 if timing_enabled:
                     output_d2h_ms = (time.perf_counter() - output_d2h_start) * 1000.0
 
-            # Behind the output copies; the next forward or task completes the
-            # rest. A zero-token forward ran no drafter.
+            # Enqueued behind the output copies; the next forward or task completes the rest.
             if self.drafter is not None and total_tokens > 0:
                 self.drafter.finish_round(ctx, self.forward_step.last_graph_bs)
 

@@ -125,8 +125,7 @@ class TestEagleHarnessConfig:
         # Off unless given: the confidence rule decides every round.
         assert table() == []
         assert table(speculative_chain_width_table="64:4,384:3") == [(64, 4), (384, 3)]
-        # Sorted by batch size, widths capped at the chain's full width; a
-        # round takes the entry of the largest batch size it reaches.
+        # Sorted by batch size, widths capped at the chain's; a round takes the largest entry it reaches.
         width_table = {"speculative_chain_width_table": " 16:3 , 4:9 "}
         sa = self._resolve_tree("EAGLE4", 1, 7, 8, **{**chain, **width_table})
         entries = chain_width_table(sa)

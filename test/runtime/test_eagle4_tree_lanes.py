@@ -25,19 +25,14 @@ fp32 reference."""
 
 import os
 import sys
-from types import SimpleNamespace
 
 import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
-from runtime.test_cache_group_router import (  # noqa: E402
-    FULL,
-    _geometry,
-    _layer,
-    _StubLeaf,
-)
+from runtime.cache_pool_test_utils import make_mha_memory_plan, make_pool  # noqa: E402
+from runtime.test_cache_group_router import FULL, _geometry, _StubLeaf  # noqa: E402
 from runtime.test_tree_attention_cascade import (  # noqa: E402
     ATOL,
     HKV,
@@ -47,7 +42,6 @@ from runtime.test_tree_attention_cascade import (  # noqa: E402
     D,
 )
 from runtime.test_tree_attention_cascade import _backend as _trtllm_leaf  # noqa: E402
-from runtime.test_tree_attention_cascade import _layer as _trtllm_layer  # noqa: E402
 
 register_cuda_ci(
     est_time=30,
@@ -66,11 +60,33 @@ from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry imp
 from tokenspeed.runtime.layers.attention.backends.paged.router import (  # noqa: E402
     CacheGroupRouter,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.mha import (  # noqa: E402
+    MHATokenToKVPool,
+)
+from tokenspeed.runtime.layers.paged_attention import PagedAttention  # noqa: E402
 
 requires_nvidia = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,
     reason="needs an NVIDIA GPU",
 )
+
+
+def _attention(
+    num_heads: int, num_kv_heads: int, head_dim: int, sliding_window_size: int = -1
+) -> PagedAttention:
+    """A draft attention layer on the full-history group."""
+    layer = PagedAttention(
+        num_heads,
+        head_dim,
+        head_dim**-0.5,
+        num_kv_heads,
+        0,
+        sliding_window_size=sliding_window_size,
+        rotary_emb=None,
+        qk_norm=None,
+    )
+    layer.bind_cache_group(FULL)
+    return layer
 
 
 def _lane_router():
@@ -113,7 +129,7 @@ def test_lane_rows_decode_over_their_requests_live_table_rows():
     lanes.active = True
     lane_slots = router.publish_draft_step_locations(start, 2)
     assert lane_slots.tolist() == [25, 26, 37, 38]
-    written = router.write_locations(_layer(FULL), ForwardMode.DECODE)
+    written = router.write_locations(_attention(8, 8, 16), ForwardMode.DECODE)
     assert written.tolist() == lane_slots.tolist()
     rows = lanes.cascade_rows(leaf, 2)
     assert rows.page_table[:, :2].tolist() == [[5, 6], [9, 0]]
@@ -194,8 +210,27 @@ def _lane_problem(frontier, rows, window, max_pages, gen, kv_dtype, frozen, pois
                 pos = prefix + j
                 if pos // PAGE > (prefix - 1) // PAGE:
                     v_rows[int(table[b, pos // PAGE]) * PAGE + pos % PAGE] = poison
-    k_rows, v_rows = k_rows.cuda().to(kv_dtype), v_rows.cuda().to(kv_dtype)
-    pool = SimpleNamespace(get_kv_buffer=lambda _: (k_rows, v_rows))
+    plan = make_mha_memory_plan(
+        size=bs * pages * PAGE,
+        prefix_granularity=PAGE,
+        layer_num=1,
+        kv_heads=HKV,
+        head_dim=D,
+        dtype=kv_dtype,
+    )
+    _, pool = make_pool(
+        MHATokenToKVPool,
+        plan,
+        device="cuda",
+        dtype=kv_dtype,
+        head_num=HKV,
+        head_dim=D,
+        layer_num=1,
+        rank=0,
+    )
+    k_cache, v_cache = pool.get_kv_buffer(0)
+    k_cache.copy_(k_rows.cuda().to(kv_dtype))
+    v_cache.copy_(v_rows.cuda().to(kv_dtype))
     return table.cuda(), q.cuda(), bits.cuda(), pool, ref
 
 
@@ -242,9 +277,7 @@ def test_trtllm_lanes_match_reference(topk, steps, frozen, poison, kv_dtype):
     )
     lanes.set_frontier(bs, lengths)
     lanes.lane_mask[: bits.numel()] = bits
-    layer = _trtllm_layer()
-    if frozen is not None:
-        layer.sliding_window_size = frozen - 1
+    layer = _attention(HQ, HKV, D, -1 if frozen is None else frozen - 1)
     lanes.active = True
     out = leaf.forward_decode(q, None, None, layer, None, pool, bs)
     lanes.active = False

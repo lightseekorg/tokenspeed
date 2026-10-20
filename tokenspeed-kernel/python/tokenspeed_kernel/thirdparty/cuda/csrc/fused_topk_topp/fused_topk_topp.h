@@ -47,10 +47,7 @@ size_t getWorkspaceSize(SizeType32 batchSize, SizeType32 vocabSize);
 //   outProbs[bs, V] — same shape as probs; non-selected positions are 0; kept
 //                     positions are renormalized so the row sums to 1.
 //
-// inPlaceSkip: outProbs is probs, renormalized in place; no stage reads or
-// writes greedy rows (top-k 1) or rows that cut nothing (top-k > K_TOPK_MAX,
-// top-p >= 1). Otherwise greedy rows come out one-hot, uncut rows renormalized.
-//
+// inPlaceSkip: outProbs is probs; skips rows with top-k 1, or top-k > K_TOPK_MAX and top-p >= 1.
 // CUDA-graph safe: every kernel launch has fixed grid/block; per-row mode is
 // resolved by the kernels themselves via topKs[row].
 void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float const* topPs,

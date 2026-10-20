@@ -139,8 +139,7 @@ def attention_samples(
     workspace = torch.zeros(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
     scale = head_dim**-0.5
     causal = sliding_window <= 0
-    # Row r sees the window keys of its path: a chain for verify rows, one
-    # ancestor per depth for lanes.
+    # Row r sees its path's window keys: a chain for verify rows, one ancestor per depth for lanes.
     if causal:
         bits = [(1 << (r + 1)) - 1 for r in range(rows)]
     else:
@@ -222,8 +221,7 @@ def _attention_config(config) -> tuple[int, int, int, int]:
 def _full_attention_layers(config) -> int:
     """A hybrid model's softmax-attention layers, or every layer."""
     text = getattr(config, "text_config", None) or config
-    # A hybrid TokenSpeed config lists them (Nemotron-H's layer_types name
-    # block kinds, not attention kinds).
+    # Nemotron-H's layer_types name block kinds, so a hybrid config's full_attention_layer_ids wins.
     layer_ids = getattr(text, "full_attention_layer_ids", None)
     if layer_ids is not None:
         return len(layer_ids)
@@ -356,8 +354,7 @@ def main(argv: list[str] | None = None) -> None:
     from tokenspeed.runtime.entrypoints.engine import Engine
     from tokenspeed.runtime.utils.hf_transformers_utils import get_config
 
-    # The language model's config as serving reads it (a multimodal
-    # checkpoint's own config class may not load without its remote code).
+    # Read as serving does: a multimodal checkpoint's config class may not load without remote code.
     target_cfg = get_hf_text_config(get_config(args.model, trust_remote_code=True))
     draft_cfg = AutoConfig.from_pretrained(args.draft_model, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model)

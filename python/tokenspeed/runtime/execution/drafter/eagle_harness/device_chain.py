@@ -61,8 +61,7 @@ class DeviceChain:
 
     def __init__(self, max_bs: int, last_depth: int, device: torch.device) -> None:
         self.last_depth = last_depth
-        # Per padded batch: depth d's exec at column d (from 2), then the
-        # finalize graphs (not sampled, sampled); 0 where none was captured.
+        # Column d >= 2: depth d's exec; then finalize execs (unsampled, sampled); 0: not captured.
         self._execs = torch.zeros(
             (max_bs + 1, last_depth + 3), dtype=torch.int64, device=device
         )

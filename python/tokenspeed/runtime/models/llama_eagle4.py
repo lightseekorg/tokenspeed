@@ -70,8 +70,7 @@ from tokenspeed.runtime.utils import add_prefix
 # The one MoE an EAGLE-4 draft layer may carry: Nemotron-H's latent squared-ReLU block.
 LATENT_MOE_ARCHITECTURE = "nemotron_latent_relu2"
 
-# Config keys an EAGLE-4 draft may carry beyond LlamaConfig's own. A key in
-# neither set fails construction, so no draft structure is dropped silently.
+# Draft config keys beyond LlamaConfig's; a key in neither set fails, so none is dropped silently.
 _STRUCTURAL_KEYS = frozenset(
     {
         # aux-hidden-state input
@@ -134,9 +133,7 @@ _NON_STRUCTURAL_KEYS = frozenset(
         "moe_initialization",
         "moe_mtp_layer_index",
         "moe_mtp_source_revision",
-        # The latent MoE routes in FP32 as trained: its BF16 router weights
-        # multiply with FP32 accumulation and output (exact against an FP32
-        # router on those values) and the correction bias is added in FP32.
+        # The latent MoE routes in FP32 as trained (BF16 weights, FP32 accumulate, output and bias).
         "moe_router_dtype",
         "rope_interleave",
         "max_window_layers",
@@ -144,8 +141,7 @@ _NON_STRUCTURAL_KEYS = frozenset(
         "torch_dtype",
     }
 )
-# The draft attention uses head_dim for q, k and v; a config may carry these
-# only at that value.
+# The draft attention uses head_dim for q, k and v; a config may carry these only at that value.
 _DERIVED_HEAD_DIM_KEYS = frozenset({"v_head_dim", "swa_head_dim", "swa_v_head_dim"})
 _EFFICIENT_LM_HEAD_KEYS = frozenset({"type", "rank", "num_candidates", "smooth_factor"})
 # The sizes and routing of a latent MoE, which its config must state.
@@ -239,8 +235,7 @@ def validate_draft_config(config: LlamaConfig) -> None:
     _expect(config, "num_aux_hidden_states", (3,))
     # The candidate head scores the target vocabulary.
     _expect(config, "draft_vocab_size", (None, config.vocab_size))
-    # The model reads fc_norm (enable_fc_norm is its alias) and an fc input of
-    # three aux states of the draft's width.
+    # fc_norm is read (enable_fc_norm is its alias); the fc input is three draft-width aux states.
     _expect(config, "enable_fc_norm", (getattr(config, "fc_norm", False),))
     _expect(config, "target_hidden_size", (config.hidden_size,))
     # The draft layer's window comes from layer_types alone.
@@ -265,8 +260,7 @@ def validate_draft_config(config: LlamaConfig) -> None:
             "input takes exactly three aux hidden states"
         )
 
-    # The type names how the shipped head weights were factored; the loader
-    # requires them.
+    # The type names how the shipped head weights were factored; the loader requires those weights.
     head = getattr(config, "efficient_lm_head_config", None)
     if (
         not isinstance(head, dict)
@@ -282,8 +276,7 @@ def validate_draft_config(config: LlamaConfig) -> None:
         return
     _expect(config, "moe_architecture", (LATENT_MOE_ARCHITECTURE,))
     _expect(config, "hidden_act", ("relu2",))
-    # The Nemotron-H router: sigmoid scores, top-k over the bias-corrected
-    # scores, the unbiased scores renormalized.
+    # Nemotron-H routing: sigmoid, top-k over bias-corrected scores, renormalized unbiased scores.
     _expect(config, "scoring_func", ("sigmoid",))
     _expect(config, "topk_method", ("noaux_tc",))
     _expect(config, "norm_topk_prob", (True,))
@@ -548,8 +541,7 @@ class Eagle4CandidateLogitsProcessor(LogitsProcessor):
         scores = torch.matmul(low_rank, lm_head.scores_head.weight.T)
         rows = hidden.shape[0]
         vocab_start = lm_head.lm_head.shard_indices.org_vocab_start_index
-        # This rank's block of the exchange: nc bf16 logits, then nc int64 ids
-        # as raw bytes (4 bf16 lanes each), so one all-gather moves both.
+        # Per rank: nc bf16 logits, then nc int64 ids as raw bytes, so one all-gather moves both.
         block = torch.empty((rows, 5 * nc), dtype=weight.dtype, device=hidden.device)
         global_ids = block.view(torch.int64)[:, nc // 4 : nc // 4 + nc]
         eagle4_shard_topk(scores, nc, vocab_start, global_ids)
@@ -706,8 +698,7 @@ class LlamaForCausalLMEagle4(LlamaForCausalLMEagle3):
             else:
                 weight_loader(param, tensor, shard_id)
             loaded.add((name, shard_id))
-        # The target's embedding (and head, without the draft's own) replace
-        # these after loading (set_embed_and_head).
+        # set_embed_and_head later supplies these from the target (head only without a draft one).
         shared = {"model.embed_tokens.weight"}
         if self.load_lm_head_from_target:
             shared.add("lm_head.weight")

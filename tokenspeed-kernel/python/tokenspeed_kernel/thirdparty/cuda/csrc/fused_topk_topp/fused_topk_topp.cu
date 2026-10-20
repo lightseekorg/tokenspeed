@@ -343,9 +343,7 @@ size_t getWorkspaceSize(SizeType32 batchSize, SizeType32 vocabSize) {
 // 16B-aligned (both bases 16B-aligned and vocab_size % 4 == 0), so the top-p
 // V-scan can use float4 loads/stores with no peel. Decided host-side in
 // invokeFusedTopKTopP; see the mode 3.2 branch.
-// IN_PLACE (in-place skip mode): rows are read and written through out_probs
-// alone (`probs` is unused, so both keep __restrict__). Without the memset, the
-// cut rows write their own zeros and skipped rows return at once.
+// IN_PLACE: probs is unused (__restrict__ holds); cut rows write their zeros, skipped rows exit.
 template <int BLOCK_SIZE, int ITEMS_PER_THREAD, bool ROWS_ALIGNED, bool IN_PLACE>
 __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
     float const* __restrict__ probs,

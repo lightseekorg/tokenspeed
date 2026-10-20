@@ -83,8 +83,7 @@ __all__ = [
 
 # Batch sizes the cost measurement samples.
 COST_BATCH_SIZES = (1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256)
-# The most live requests a chain round the confidence rule decides can have:
-# its cost data (and the measurement, exec mode 2) stop here.
+# Largest chain round the confidence rule decides; the cost data and its measurement stop here.
 CHAIN_RULE_MAX_BATCH_SIZE = COST_BATCH_SIZES[-1]
 
 

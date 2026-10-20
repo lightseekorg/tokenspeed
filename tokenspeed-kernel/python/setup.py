@@ -476,8 +476,7 @@ KERNEL_GROUPS = [
         [],
     ),
     (
-        # Launches CUDA graphs from device code: relocatable device code,
-        # device-linked with the device runtime.
+        # Device-side CUDA graph launch needs relocatable device code linked with cudadevrt.
         "eagle_harness_chain",
         [
             CUDA_CSRC_DIR / "eagle_harness_chain.cu",

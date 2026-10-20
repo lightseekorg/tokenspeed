@@ -18,14 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// EAGLE-Harness draft-tree bookkeeping (EAGLE-4): the node pool a round grows
-// one depth at a time, the frontier each depth expands, the work deltas the
-// width policy reads, and the ancestor-first ranking verification takes.
-//
-// Node pool, per request: node 0 the root; every expanded node's node_top_k
-// children appended in expansion order. A node records its token, score (path
-// probability; the children draft depth d >= 1 appends are scaled by
-// 0.9999^(d + 1), the root's are not) and parent (prev).
+// EAGLE-4 draft trees: per-request node pool, the root (node 0) then children in expansion order.
 
 #include <curand_kernel.h>
 
@@ -43,9 +36,7 @@ constexpr int MAX_BATCH_SIZE = 512;       // the work deltas' one thread per req
 constexpr float DEPTH_DECAY = 0.9999f;    // draft depth d >= 1's children: path score * DEPTH_DECAY^(d + 1)
 constexpr int MAX_TREE_NODES = 64;        // verify tree nodes per request
 
-// ---------------------------------------------------------------------------
 // The root's children: the first level of the pool, the work and sort lists.
-// ---------------------------------------------------------------------------
 __global__ void update_node_data_kernel(float* __restrict__ pool_scores,
                                         int64_t* __restrict__ pool_tokens,
                                         float* __restrict__ work_scores,
@@ -67,17 +58,7 @@ __global__ void update_node_data_kernel(float* __restrict__ pool_scores,
   }
 }
 
-// ---------------------------------------------------------------------------
-// Work deltas: work_deltas[j] is the batch mean of the best min(node_count + j,
-// verify_num) scores among the two sorted segments of a row (the current best
-// node_count scores, then the next depth's j best frontier scores), over the
-// first *live_rows rows (a graph's padded rows sum as zeros). The counts are
-// device scalars; a zero node count queues no deltas.
-//
-// One thread per row, summed by a halving tree over kThreads: 256 threads up
-// to 256 rows, 512 above. The extra halving step of 512 threads adds zeros to
-// the first 256 sums, so both sizes give the same bits up to 256 live rows.
-// ---------------------------------------------------------------------------
+// work_deltas[j]: batch mean of each row's best min(node_count + j, verify_num) merged scores.
 template <int kThreads>
 __global__ void calculate_work_deltas_kernel(const float* __restrict__ work_scores,
                                              float* __restrict__ work_deltas,
@@ -119,7 +100,7 @@ __global__ void calculate_work_deltas_kernel(const float* __restrict__ work_scor
   s_reduction_sums[tid] = row_sum;
   __syncthreads();
 
-  for (unsigned int s = kThreads / 2; s > 0; s >>= 1) {
+  for (unsigned int s = kThreads / 2; s > 0; s >>= 1) {  // 512's extra step adds zeros: 256's bits
     if (tid < s) s_reduction_sums[tid] += s_reduction_sums[tid + s];
     __syncthreads();
   }
@@ -127,36 +108,15 @@ __global__ void calculate_work_deltas_kernel(const float* __restrict__ work_scor
   if (tid == 0) work_deltas[j] = s_reduction_sums[0] / batch_size;
 }
 
-// ---------------------------------------------------------------------------
-// One draft depth's bookkeeping after its lane forward, one CTA per request
-// row. The expanded lanes' width * K children get path scores (child
-// probability times the lane's path score), sorted descending by a fixed
-// 64-wide bitonic network whose tie order the frontier inherits; the best K
-// become the next frontier (tokens, scores, pool indices, and their parent
-// lanes' output hidden rows). Every child is appended to the pool (score
-// times 0.9999^(depth + 1), and its parent); the sort list keeps the best
-// verify_num path scores of [its head, the sorted children] by stable rank, and
-// the work list holds that head and the frontier's scores for the next work
-// deltas.
-// The lanes move one slot on (positions + 1, slot starts + K) and, when the
-// next depth fits in the lane window, next lane r's mask row is its parent
-// lane's row plus its own slot depth * K + r.
-// ---------------------------------------------------------------------------
-// Warps 0-4 do the bookkeeping, the other 19 copy the hidden rows: enough
-// loads in flight that the copy is not latency-bound at small batch, while
-// two CTAs still fit an SM at large batch.
-constexpr int DRAFT_DEPTH_THREADS = 768;
+// Depth update, one CTA per request: sort children, best K become the frontier, all join the pool.
+constexpr int DRAFT_DEPTH_THREADS = 768;  // warps 0-4 bookkeep, the other 19 copy hidden rows
 constexpr int DRAFT_DEPTH_COPY_THREADS = DRAFT_DEPTH_THREADS - 5 * 32;
 constexpr int DRAFT_DEPTH_MAX_CHILDREN = 64;  // width * K, the sort network's size
 constexpr int DRAFT_DEPTH_MAX_VERIFY = 256;   // the sort list's merged head
 constexpr int DRAFT_DEPTH_MAX_MASK_WORDS = 4;
 constexpr int DRAFT_DEPTH_COPY_UNROLL = 4;
 
-// One compare-exchange of the sort network across lanes: position p pairs
-// with p ^ stride (in lane l ^ stride / 2, the same register). The pair (i, j)
-// is exchanged when j < n and it is out of its block's order (descending when
-// bit `size` of i is clear), by strict comparison: ties and NaN never swap.
-// Both lanes evaluate the same comparison of the same two values.
+// Compare-exchange of positions p and p ^ stride; strict comparison, so ties and NaN never swap.
 __device__ __forceinline__ void sort_exchange_lanes(float& v, int& x, int p, int stride, int size,
                                                     int n) {
   const float o = __shfl_xor_sync(0xffffffff, v, stride >> 1);
@@ -168,10 +128,7 @@ __device__ __forceinline__ void sort_exchange_lanes(float& v, int& x, int p, int
   x = swap ? ox : x;
 }
 
-// Descending sort of n <= 64 values on one warp, lane l holding positions 2l
-// and 2l + 1 (value v, original position x): a bitonic network over 64
-// positions that skips every pair reaching past n. Positions past n keep
-// their values.
+// Descending warp sort of n <= 64 values, lane l holding positions 2l, 2l + 1; pairs past n skip.
 __device__ __forceinline__ void bitonic_sort_64_warp(float& v0, int& x0, float& v1, int& x1,
                                                      int n) {
   const int p0 = 2 * (threadIdx.x & 31);
@@ -234,10 +191,7 @@ __global__ void __launch_bounds__(DRAFT_DEPTH_THREADS) draft_depth_update_kernel
   int64_t* masks = lane_mask + lanes * mask_words;
   const int64_t node_row = b * node_stride;
 
-  // Reads of the frontier scores, sort list and lane masks, all before the
-  // barrier that orders them ahead of their rewrites. Every lane's children
-  // are read, not only the expanded ones, so the reads need not wait for the
-  // device counts; children past n are dropped.
+  // Reads before the rewrite barrier; all lanes' children are read so loads need not wait for n.
   if (warp == 0) {
     const int p0 = 2 * lane;
     const int p1 = p0 + 1;
@@ -305,8 +259,7 @@ __global__ void __launch_bounds__(DRAFT_DEPTH_THREADS) draft_depth_update_kernel
       }
     }
   } else if (warp <= 4) {
-    // Stable rank of each entry of [sort list head, sorted children]; the
-    // best `kept` land at their rank.
+    // Stable rank of each entry of [head, sorted children]; the best `kept` land at their rank.
     const int total = head + n;
     for (int e = tid - 32; e < total; e += 4 * 32) {
       const float key = e < head ? s_head[e] : s_scores[e - head];
@@ -342,14 +295,7 @@ __global__ void __launch_bounds__(DRAFT_DEPTH_THREADS) draft_depth_update_kernel
   }
 }
 
-// ---------------------------------------------------------------------------
-// The first k entries of a stable descending sort per row (NaN first, then
-// descending value, ties by ascending index), the order verification ranks
-// pool nodes in: a parent always precedes its equal-scored children. The
-// order is a strict total one, so any power-of-two network width p >= n and
-// any thread count give the same first n entries.
-// ---------------------------------------------------------------------------
-// Whether (v, i) comes before (best_v, best_i) in that order, torch.argmax's.
+// Verify ranking order, torch.argmax's: NaN first, then larger value, then lower index.
 __device__ __forceinline__ bool argmax_before(float v, int i, float best_v, int best_i) {
   const bool an = isnan(v);
   const bool bn = isnan(best_v);
@@ -404,12 +350,7 @@ __global__ void stable_topk_desc_kernel(const float* __restrict__ scores, int64_
   }
 }
 
-// ---------------------------------------------------------------------------
-// The round's verify tree into the next round's inputs: slot i < verify_num is
-// ranked node i (its token; its parent's slot, earlier in ancestor-first
-// order), later slots repeat the root (pool node 0) with parent -1. One CTA
-// per request.
-// ---------------------------------------------------------------------------
+// Verify tree into the next round's inputs: slot i < verify_num is ranked node i, later the root.
 __global__ void write_verify_tree_kernel(const int64_t* __restrict__ ranked, int64_t ranked_stride,
                                          const int64_t* __restrict__ pool_tokens,
                                          const int64_t* __restrict__ pool_prev,
@@ -444,15 +385,7 @@ __global__ void write_verify_tree_kernel(const int64_t* __restrict__ ranked, int
 }
 
 
-// ---------------------------------------------------------------------------
-// Sampled trees (requests with temperature > 0). An expanded row's K children
-// are drawn without replacement from its draft distribution q over the
-// candidates (cut to the request's top-k / top-p) by Gumbel-top-K, keyed by
-// the row and candidate in the round's Philox stream. q and its candidate ids
-// are kept per expanded row (a slot) for the verifier, and each child records
-// its parent's slot and its position among the candidates. Greedy rows keep
-// their top-K children (slot -1).
-// ---------------------------------------------------------------------------
+// Sampled trees: K children by Gumbel-top-K from q (cut by top-k / top-p); greedy rows take top-K.
 constexpr int SAMPLE_CHILDREN_THREADS = 128;
 constexpr int SAMPLE_CHILDREN_PER_THREAD = 8;
 
@@ -622,21 +555,7 @@ __global__ void sample_children_kernel(
   }
 }
 
-// ---------------------------------------------------------------------------
-// The verify tree's acceptance by rejection sampling, one CTA per request and
-// one warp per node. A node's children (the nodes whose parent it is, in index
-// order) are tried in turn against the target's row p' at the node: sampled
-// children (their parent's q recorded) by recursive rejection without
-// replacement, which updates the row to the residual (p' - q)+ as children are
-// rejected; deterministic children by p'(child) over the mass left. The
-// accepted path runs from the root; the bonus token comes from the last
-// accepted node's residual row (residual_sample).
-//
-// A greedy row (top-k 1) has a one-hot p' at its argmax: rejection accepts the
-// first child holding the argmax for every coin and rejects the others, so the
-// kernel decides it from the argmax alone and never reads the row.
-// ---------------------------------------------------------------------------
-// The first child of `node` after node `after` (children in index order), -1 past the last.
+// Tree rejection sampling, one CTA per request, one warp per node; greedy rows use the argmax only.
 __device__ __forceinline__ int next_child(const int32_t* s_parent, int node, int after,
                                           int num_nodes) {
   for (int j = after + 1; j < num_nodes; ++j) {
@@ -680,9 +599,7 @@ __global__ void tree_reject_sample_kernel(
       int rejected_pos[MAX_SAMPLED_CHILDREN];
       int rejected_count = 0;
       float q_left = 0.0f, p_cand = 0.0f;
-      // The row's argmax before its updates, for a residual that vanishes:
-      // every entry of the row the updates below touch is folded in before
-      // its first one.
+      // Argmax before the updates, for a vanishing residual; each touched entry is folded in first.
       float best_v = -INFINITY;
       int best_i = INT_MAX;
       for (int j = lane; j < nc; j += 32) {
@@ -750,8 +667,7 @@ __global__ void tree_reject_sample_kernel(
             if (r_child > 0.0f) {
               accepted = child;
             } else {
-              // The bonus is the target's argmax: the entries not updated
-              // above still hold their target values (rare, so scanned here).
+              // Bonus = target's argmax: untouched entries keep target values (rare, so scanned).
               for (int j = lane; j < vocab; j += 32) {
                 const float v = p[j];
                 if (argmax_before(v, j, best_v, best_i)) {
@@ -822,17 +738,9 @@ __global__ void tree_reject_sample_kernel(
   }
 }
 
-// ---------------------------------------------------------------------------
-// The bonus token: an inverse-CDF draw from the last accepted node's (residual)
-// row with the request's final coin; the row need not be normalized. Written
-// at the end of the accepted path in ``predicts``. A greedy row's residual is
-// its one-hot p' (its argmax child, if any, was accepted): the bonus is its
-// argmax, the row unread.
-// ---------------------------------------------------------------------------
+// Bonus token: inverse-CDF draw from the last accepted node's unnormalized row; greedy: its argmax.
 constexpr int RESIDUAL_SAMPLE_THREADS = 1024;
-// Each warp stages its 32 lanes' segments through shared memory in runs of 16
-// elements, so the global loads stay coalesced; every lane still sums its own
-// segment left to right.
+// Runs of 16 staged in shared memory coalesce the loads; each lane still sums its segment in order.
 constexpr int RESIDUAL_SAMPLE_RUN = 16;
 static_assert(32 % RESIDUAL_SAMPLE_RUN == 0, "a warp load stages whole runs");
 constexpr int RESIDUAL_SAMPLE_SMEM_BYTES =
@@ -945,12 +853,7 @@ __global__ void __launch_bounds__(RESIDUAL_SAMPLE_THREADS)
   }
 }
 
-// ---------------------------------------------------------------------------
-// A sampled round's draft distributions into the next round's tables, at the
-// request's row: its slots' q and candidate ids, and per verify node the slot
-// and position of its parent's draw (-1: the root, a deterministic child, or a
-// slot past verify_num).
-// ---------------------------------------------------------------------------
+// A sampled round's q, candidate ids and parent draws (slot -1: none) into the next round's tables.
 __global__ void publish_draft_q_kernel(const int64_t* __restrict__ ranked, int64_t ranked_stride,
                                        const int32_t* __restrict__ node_slot,
                                        const int32_t* __restrict__ node_pos, int64_t node_stride,
@@ -982,9 +885,7 @@ __global__ void publish_draft_q_kernel(const int64_t* __restrict__ ranked, int64
   }
 }
 
-// ---------------------------------------------------------------------------
 // Host entry points: shapes and strides are checked, dtypes are the caller's.
-// ---------------------------------------------------------------------------
 void eagle_harness_update_node_data(TensorView pool_scores, TensorView pool_tokens,
                                     TensorView work_scores, TensorView sort_scores,
                                     TensorView child_scores, TensorView child_tokens) {
@@ -1058,8 +959,7 @@ void eagle_harness_draft_depth_update(
   const int64_t num_nodes = pool_tokens.size(1);
   TVM_FFI_ICHECK(pool_scores.size(1) == num_nodes && pool_prev.size(1) == num_nodes)
       << "eagle_harness_draft_depth_update: node pool";
-  // The device counts are the caller's: the pool fits every depth's children and
-  // the sort and work lists the verify sizes the policy can reach.
+  // The caller sizes the pool and lists for every depth and verify size the policy can reach.
   TVM_FFI_ICHECK(depth >= 1 && sort_scores.size(1) <= DRAFT_DEPTH_MAX_VERIFY &&
                  sort_scores.size(1) + k <= work_scores.size(1))
       << "eagle_harness_draft_depth_update: verify lists";

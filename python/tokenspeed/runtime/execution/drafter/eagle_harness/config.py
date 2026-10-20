@@ -150,20 +150,17 @@ class EagleHarnessConfig:
     data_path: str
     compute_intensity: str
     is_moe_target: bool
-    # Requests with temperature > 0 draw their children from the draft q, and
-    # the verifier accepts them by rejection sampling against it.
+    # Temperature > 0 requests sample children from the draft q, accepted by rejection sampling.
     sampled_trees: bool
     # The TP-synced seed of the children's draws.
     seed: int
     # The token exec mode 2 commits to end a measured batch (None: the model declares no EOS).
     eos_token_id: int | None
-    # Chains in exec modes 0 and 1: the verify width per live batch size
-    # (--speculative-chain-width-table); empty where the confidence rule decides.
+    # Chain verify width per live batch size, exec modes 0/1; empty: the confidence rule decides.
     chain_width_table: ChainWidthTable
     # --max-num-seqs: the most live requests of a round.
     max_requests: int
-    # (padded batch, floor) per decode graph: the forwards replaying it have
-    # floor + 1 to padded batch live requests (decode_graph_floors).
+    # (padded batch, floor) per decode graph: it serves floor + 1 to padded batch live requests.
     decode_graph_floors: tuple[tuple[int, int], ...]
 
     @classmethod
@@ -381,9 +378,7 @@ def validate_server_args(server_args: ServerArgs) -> None:
     if chain and mode != 2:
         _validate_chain_rule_domain(server_args)
     steps = server_args.speculative_num_steps
-    # Lanes draft past the verify budget into reserved headroom; their ancestor
-    # masks are at most two 64-bit words, the node ranking sorts at most 1024
-    # nodes, and sampled depths launch < 64.
+    # Kernel limits: ancestor masks <= two 64-bit words, ranking <= 1024 nodes, sampled depths < 64.
     if (
         not 2 <= steps <= 64
         or (steps - 1) * topk > 128
