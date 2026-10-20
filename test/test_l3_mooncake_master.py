@@ -252,6 +252,42 @@ class TestMooncakeMasterLiveTest:
             "device_name": "",
         }
 
+    def test_l3_sharded_object_restores_through_a_different_client(self) -> None:
+        writer_host = _Host(nbytes=4096, page=64)
+        reader_host = _Host(nbytes=4096, page=64)
+        stores = []
+        try:
+            for rank, host in ((1, writer_host), (0, reader_host)):
+                backend = create_kvstore_storage_backend(
+                    "mooncake",
+                    json.dumps(self._extra_config()),
+                    host_buffer=host.host_buffer,
+                    tp_size=2,
+                    pp_size=1,
+                )
+                stores.append(
+                    L3HostStore(
+                        backend,
+                        host,
+                        key_prefix="live-cp",
+                        rank=rank,
+                        shard_counts=(2,),
+                    )
+                )
+            writer, reader = stores
+            payload = bytes(range(64))
+            writer_host.host_buffer[:64] = payload
+            assert writer.backup([(0, 1, "shared", 1)]) == [True]
+            assert reader.exists([(0, 0, "shared", 1)]) == [True]
+            assert reader.prefetch([(0, 3, "shared", 1)]) == [True]
+            assert bytes(reader_host.host_buffer[128:192]) == payload
+            assert reader.stats().get.ok_keys == 1
+            assert writer.rotate_namespace()
+            assert reader.exists([(0, 0, "shared", 1)]) == [False]
+        finally:
+            for store in reversed(stores):
+                store.close()
+
     def test_l3_host_store_round_trips_through_mooncake_master(self) -> None:
         host = _Host(nbytes=4096, page=64)
         payload = b"mooncake-l3-bytes"
@@ -264,7 +300,7 @@ class TestMooncakeMasterLiveTest:
             pp_size=1,
         )
         assert isinstance((backend), (MooncakeKvStore))
-        l3 = L3HostStore(backend, host, key_prefix="live", rank=0)
+        l3 = L3HostStore(backend, host, key_prefix="live", rank=0, shard_counts=(1,))
         pages = [(0, 1, "h0", 0)]
         assert (l3.backup(pages)) == ([True])
         assert (l3.exists(pages)) == ([True])

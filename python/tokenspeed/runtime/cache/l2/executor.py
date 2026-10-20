@@ -608,6 +608,7 @@ class HostCacheExecutor:
             self.host_storage,
             key_prefix=key_prefix,
             rank=rank,
+            shard_counts=self._owners(HostTier.L2).shard_counts,
         )
 
     def set_l3_weight_version(self, weight_version: str) -> None:

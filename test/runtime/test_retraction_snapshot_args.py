@@ -160,22 +160,25 @@ def test_the_pool_is_independent_of_the_kvstore():
     assert not args.retraction_snapshot_pool_disabled
 
 
-def test_kvp_takes_both_host_tiers_but_not_l3():
+@pytest.mark.parametrize("role", ["null", "prefill", "decode"])
+def test_kvp_takes_both_host_tiers_and_l3(role):
     # The scheduler allocates every Host block in its Device block's residue
     # class and the executor translates ownership on both ends of every row,
     # so a KV-page-sharded engine may run the Host KVStore and the snapshot
-    # pool. L3 keys have no owner-stable form under sharding and stay refused.
-    sharded_decode = dict(
+    # pool. Aggregated and prefill roles also prefetch L3 into owned Host blocks.
+    sharded = dict(
         model="x",
         world_size=2,
-        disaggregation_mode="decode",
+        disaggregation_mode=role,
         kv_parallel_size=2,
-        decode_context_parallel_size=2,
+        decode_context_parallel_size=1 if role == "prefill" else 2,
+        query_context_parallel_size=2 if role == "prefill" else 1,
     )
-    args = ServerArgs(**sharded_decode, retraction_snapshot_host_gb=1.0)
-    assert args.enable_kvstore is True and args.retraction_snapshot_host_gb == 1.0
-    with pytest.raises(ValueError, match="L3.*kv-parallel-size"):
-        ServerArgs(**sharded_decode, kvstore_storage_backend="mooncake", **PREFETCH)
+    if role != "prefill":
+        args = ServerArgs(**sharded, retraction_snapshot_host_gb=1.0)
+        assert args.enable_kvstore is True and args.retraction_snapshot_host_gb == 1.0
+    args = ServerArgs(**sharded, kvstore_storage_backend="mooncake", **PREFETCH)
+    assert args.enable_kvstore and args.mapping.attn.kvp_size == 2
 
 
 def test_forced_retraction_is_a_test_knob_that_needs_a_pool():

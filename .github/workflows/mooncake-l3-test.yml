@@ -5,6 +5,12 @@ on:
     branches: [main]
     paths:
       - "python/tokenspeed/runtime/cache/l3/**"
+      - "python/tokenspeed/runtime/cache/l2/executor.py"
+      - "python/tokenspeed/runtime/cache/transfer/ownership.py"
+      - "python/tokenspeed/runtime/execution/device.py"
+      - "python/tokenspeed/runtime/utils/server_args.py"
+      - "tokenspeed-scheduler/csrc/cache/**"
+      - "tokenspeed-scheduler/csrc/scheduler/types.cpp"
       - "test/test_l3_mooncake_master.py"
       - "test/test_l3_kvstore.py"
       - ".github/workflows/mooncake-l3-test.yml"
@@ -12,6 +18,12 @@ on:
     branches: [main]
     paths:
       - "python/tokenspeed/runtime/cache/l3/**"
+      - "python/tokenspeed/runtime/cache/l2/executor.py"
+      - "python/tokenspeed/runtime/cache/transfer/ownership.py"
+      - "python/tokenspeed/runtime/execution/device.py"
+      - "python/tokenspeed/runtime/utils/server_args.py"
+      - "tokenspeed-scheduler/csrc/cache/**"
+      - "tokenspeed-scheduler/csrc/scheduler/types.cpp"
       - "test/test_l3_mooncake_master.py"
       - "test/test_l3_kvstore.py"
       - ".github/workflows/mooncake-l3-test.yml"

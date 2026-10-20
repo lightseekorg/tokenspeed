@@ -100,6 +100,10 @@ class TestStorageKeyTest:
                 "cache_signature": "layout",
                 "pipeline_rank": 0,
                 "attn_tp_size": 1,
+                "attn_kvp_size": 1,
+                "attn_qcp_size": 1,
+                "attn_head_tp_size": 1,
+                "group_shard_counts": (1,),
                 "draft_model": "",
                 "draft_revision": "",
                 "draft_weight_version": "",
@@ -123,6 +127,15 @@ class TestStorageKeyTest:
         assert (base) != (prefix(pipeline_rank=1))
         assert (base) != (prefix(attn_tp_size=8))
         assert (prefix(attn_tp_size=8)) != (prefix(attn_tp_size=16))
+        cp = dict(attn_tp_size=8, attn_kvp_size=4, group_shard_counts=(4, 1))
+        assert prefix(**cp) != prefix(attn_tp_size=8)
+        for field, value in (
+            ("attn_kvp_size", 8),
+            ("attn_qcp_size", 8),
+            ("attn_head_tp_size", 8),
+            ("group_shard_counts", (4, 4)),
+        ):
+            assert prefix(**cp) != prefix(**(cp | {field: value}))
         assert (base) != (prefix(draft_model="org/draft"))
         assert (base) != (prefix(cache_quantization='{"quantization":"fp8"}'))
         assert (base) != (prefix(model_overrides={"rope_theta": 10000.0}))
@@ -1420,10 +1433,53 @@ class TestMemoryKvStoreTest:
 
 
 class TestL3HostStoreTest:
+    @pytest.mark.parametrize("shards", [2, 4])
+    def test_sharded_content_restores_on_a_different_owner(self, shards):
+        backend = MemoryKvStore()
+        payloads = [bytes([rank + 1]) * 8 for rank in range(shards)]
+        for rank, payload in enumerate(payloads):
+            host = _FakeHost(payload, size=64)
+            host.host_buffer[8:16] = bytes([rank + 16]) * 8
+            writer = L3HostStore(
+                backend, host, key_prefix="cp", rank=rank, shard_counts=(shards, 1)
+            )
+            assert writer.backup(
+                [(0, 1, f"h{rank}", rank % 2), (1, 2, "state", 0)]
+            ) == [True, True]
+
+        probes = [(0, 0, f"h{rank}", rank % 2) for rank in range(shards)]
+        for rank in range(shards):
+            host = _FakeHost(bytes(8), size=64)
+            reader = L3HostStore(
+                backend, host, key_prefix="cp", rank=rank, shard_counts=(shards, 1)
+            )
+            # Every rank can discover every sharded object before allocation.
+            assert reader.exists(probes) == [True] * shards
+            old_owner = (rank + 1) % shards
+            assert reader.prefetch(
+                [(0, 3, f"h{old_owner}", old_owner % 2), (1, 4, "state", 0)]
+            ) == [True, True]
+            assert host.host_buffer[16:24] == payloads[old_owner]
+            # Replicated groups may contain different TP slices of state.
+            assert host.host_buffer[24:32] == bytes([rank + 16]) * 8
+            assert reader.stats().get.payload_bytes == 16
+            assert reader.exists([(0, 0, f"h{old_owner}", 9)]) == [False]
+
+        other_subgroup = L3HostStore(
+            backend,
+            _FakeHost(bytes(8), size=64),
+            key_prefix="cp",
+            rank=shards,
+            shard_counts=(shards, 1),
+        )
+        assert other_subgroup.exists(probes) == [False] * shards
+        assert reader.rotate_namespace()
+        assert reader.exists(probes) == [False] * shards
+
     def test_backups_and_prefetches_packed_pages(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, shard_counts=(1,))
         pages = [(0, 1, "h0", 0)]
         assert (l3.backup(pages)) == ([True])
         assert (l3.exists(pages)) == ([True])
@@ -1442,14 +1498,16 @@ class TestL3HostStoreTest:
     def test_namespace_clear_deletes_objects_without_changing_the_prefix(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, shard_counts=(1,))
         pages = [(0, 1, "h0", 0)]
         assert (l3.backup(pages)) == ([True])
         old_key = l3.object_key("h0", 0, 0)
         l3.rotate_namespace()
         assert (old_key) == (l3.object_key("h0", 0, 0))
         assert (l3.exists(pages)) == ([False])
-        restarted = L3HostStore(backend, host, key_prefix="m", rank=1)
+        restarted = L3HostStore(
+            backend, host, key_prefix="m", rank=1, shard_counts=(1,)
+        )
         assert (restarted.object_key("h0", 0, 0)) == (old_key)
         assert (restarted.exists(pages)) == ([False])
 
@@ -1457,7 +1515,11 @@ class TestL3HostStoreTest:
         backend = mock.Mock()
         backend.remove_by_prefix.return_value = False
         l3 = L3HostStore(
-            backend, _FakeHost(b"abcdefgh", size=64), key_prefix="m", rank=1
+            backend,
+            _FakeHost(b"abcdefgh", size=64),
+            key_prefix="m",
+            rank=1,
+            shard_counts=(1,),
         )
         old_key = l3.object_key("h0", 0, 0)
 
@@ -1469,7 +1531,11 @@ class TestL3HostStoreTest:
         backend = mock.Mock()
         backend.remove_by_prefix.side_effect = RuntimeError("delete failed")
         l3 = L3HostStore(
-            backend, _FakeHost(b"abcdefgh", size=64), key_prefix="m", rank=1
+            backend,
+            _FakeHost(b"abcdefgh", size=64),
+            key_prefix="m",
+            rank=1,
+            shard_counts=(1,),
         )
         old_key = l3.object_key("h0", 0, 0)
 
@@ -1480,7 +1546,7 @@ class TestL3HostStoreTest:
     def test_set_key_prefix_republishes_under_the_new_namespace(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="v1", rank=0)
+        l3 = L3HostStore(backend, host, key_prefix="v1", rank=0, shard_counts=(1,))
         pages = [(0, 1, "h0", 0)]
         assert (l3.backup(pages)) == ([True])
         old_key = l3.object_key("h0", 0, 0)
@@ -1499,7 +1565,7 @@ class TestL3StoreStatsTest:
     def test_backup_prefetch_and_exists_record_calls_keys_bytes(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, shard_counts=(1,))
         pages = [(0, 1, "h0", 0), (0, 2, "h1", 0)]
 
         assert (l3.backup(pages)) == ([True, True])
@@ -1535,7 +1601,7 @@ class TestL3StoreStatsTest:
                 return super().batch_get_into(keys, host_buffer, offsets, sizes)
 
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(SlowStore(), host, key_prefix="m", rank=0)
+        l3 = L3HostStore(SlowStore(), host, key_prefix="m", rank=0, shard_counts=(1,))
         pages = [(0, 1, "h0", 0)]
         assert (l3.backup(pages)) == ([True])
         assert (l3.prefetch(pages)) == ([True])
@@ -1551,7 +1617,9 @@ class TestL3StoreStatsTest:
                 return [False] * len(keys)
 
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(FailingStore(), host, key_prefix="m", rank=0)
+        l3 = L3HostStore(
+            FailingStore(), host, key_prefix="m", rank=0, shard_counts=(1,)
+        )
         pages = [(0, 1, "h0", 0), (0, 2, "h1", 0)]
 
         assert (l3.backup(pages)) == ([False, False])
@@ -1566,7 +1634,7 @@ class TestL3StoreStatsTest:
     def test_stats_snapshot_is_detached_from_later_calls(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=0)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=0, shard_counts=(1,))
         pages = [(0, 1, "h0", 0)]
 
         assert (l3.backup(pages)) == ([True])

@@ -73,6 +73,172 @@ class TestL3FlatKvRoundTripTest:
         self.CacheGroupLayout = CacheGroupLayout
         self.CacheTransferLayout = CacheTransferLayout
 
+    def test_cp_restores_sharded_bytes_on_a_different_owner(self, request):
+        from tokenspeed.runtime.cache.transfer.ops import PrefetchOp, PrefetchRow
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+            CacheRuntimeContract,
+        )
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            CacheGroupSpec,
+        )
+
+        torch = self.torch
+        specs = (
+            CacheGroupSpec(
+                group_id="history",
+                attn_kind="full_history",
+                rows_per_page=2,
+                entry_stride_tokens=1,
+                sliding_window_tokens=None,
+                replayable=False,
+                transfer_policy="full_suffix",
+                shard_count=2,
+            ),
+            CacheGroupSpec(
+                group_id="state",
+                attn_kind="state",
+                rows_per_page=None,
+                entry_stride_tokens=None,
+                sliding_window_tokens=None,
+                replayable=False,
+                transfer_policy="latest_snapshot",
+                shard_count=1,
+            ),
+        )
+        contract = CacheRuntimeContract(
+            prefix_granularity=2,
+            num_lcm_blocks=8,
+            token_capacity=16,
+            group_specs=specs,
+            group_page_counts={"history": 9, "state": 9},
+            group_packing={"history": 1, "state": 1},
+        )
+
+        class Pool:
+            def __init__(self, layout):
+                self.layout = layout
+                self.arena = self
+                self.runtime_contract = contract
+                self.cache_group_specs = specs
+                self.load_tracker = None
+
+            def cache_transfer_layout(self):
+                return self.layout
+
+            def register_layerwise_load_tracker(self, tracker):
+                self.load_tracker = tracker
+
+        backend = self.MemoryKvStore()
+        ranks = []
+        for rank in range(2):
+            history = torch.zeros(72, dtype=torch.uint8, device="cuda")
+            state = torch.zeros_like(history)
+            layout = self.CacheTransferLayout(
+                num_lcm_blocks=8,
+                groups=(
+                    self.CacheGroupLayout(
+                        "history", 1, (self.CacheField("layer.0.kv", 0, 0, 8, 8),)
+                    ),
+                    self.CacheGroupLayout(
+                        "state", 1, (self.CacheField("layer.1.state", 1, 0, 8, 8),)
+                    ),
+                ),
+                buffers=(history, state),
+                consumers=(("layer.0.kv",), ("layer.1.state",)),
+            )
+            pool = Pool(layout)
+            with patch.object(self.executor_module, "_HOST_MEM_HEADROOM_BYTES", 0):
+                executor = self.executor_module.HostCacheExecutor(
+                    pool,
+                    draft_pool=None,
+                    l2_tier=True,
+                    host_ratio=1.0,
+                    host_size_gb=0,
+                    snapshot_pool=self.no_pool,
+                    slot_state_exporters=None,
+                    io_backend="direct",
+                    attn_tp_rank=rank,
+                    kvp_rank=rank,
+                    nprocs_per_node=1,
+                    world_cpu_group=None,
+                )
+            executor.attach_l3_storage(
+                backend,
+                key_prefix="cp-e2e",
+                rank=rank,
+                prefix_for_weight_version=lambda version: f"cp-e2e-{version}",
+                prefetch_timeout_base_s=10.0,
+                prefetch_timeout_per_page_s=0.0,
+                prefetch_batch_pages=2,
+            )
+            request.addfinalizer(executor.shutdown)
+            history[8:16].fill_(0x10 + rank)
+            state[32:40].fill_(0x20 + rank)
+            executor._start_writing(
+                [7],
+                [(0, 1, 1), (1, 4, 4)],
+                [(0, 1, f"h{rank}", 0), (1, 4, "state", 0)],
+                lane=executor._pinned_write_lane,
+                prerequisite_stream=torch.cuda.current_stream(),
+            )
+            executor.write_stream.synchronize()
+            deadline = time.monotonic() + 10
+            results = []
+            while not results and time.monotonic() < deadline:
+                results = executor.poll_results()
+                if not results:
+                    time.sleep(0.001)
+            assert [event.op_id for event in results] == [7]
+            ranks.append((executor, pool, history, state))
+
+        # Cold local buffers, and each sharded page now lands on the other rank.
+        op = PrefetchOp(
+            op_id=8,
+            request_id="reader",
+            first_page=0,
+            num_pages=2,
+            rows=(
+                PrefetchRow(0, 2, "h0", 0, 0),
+                PrefetchRow(0, 1, "h1", 0, 1),
+                PrefetchRow(1, 4, "state", 0, 1),
+            ),
+        )
+        for executor, _, history, state in ranks:
+            executor.host_storage.host_buffer.zero_()
+            history.zero_()
+            state.zero_()
+            executor.submit_prefetches([op])
+        for rank, (executor, pool, history, state) in enumerate(ranks):
+            deadline = time.monotonic() + 10
+            while (
+                not executor.l3_prefetch_progress()[8][0]
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.001)
+            assert executor.l3_prefetch_progress()[8] == (True, 2)
+            executor.complete_l3_prefetch(8, 2)
+            (ack,) = executor.poll_results()
+            assert ack.op_id == 8 and ack.landed_pages == 2
+            # One owned history object plus this TP rank's replicated state.
+            assert executor.l3_store.stats().get.ok_keys == 2
+            load = executor._start_loading(
+                [9],
+                [(0, 2, 1), (1, 5, 4)],
+                prerequisite_stream=torch.cuda.current_stream(),
+            )
+            pool.load_tracker.set_consumers(load)
+            pool.load_tracker.wait_for_layer(0)
+            pool.load_tracker.wait_for_layer(1)
+            torch.cuda.synchronize()
+            assert [event.op_id for event in executor.poll_results()] == [9]
+            assert torch.equal(
+                history[16:24].cpu(),
+                torch.full((8,), 0x10 + 1 - rank, dtype=torch.uint8),
+            )
+            assert torch.equal(
+                state[40:48].cpu(), torch.full((8,), 0x20 + rank, dtype=torch.uint8)
+            )
+
     @pytest.mark.parametrize("capacity_pressure", [False, True])
     def test_d2h_backup_host_wipe_prefetch_h2d_restores_bytes(
         self, request, capacity_pressure

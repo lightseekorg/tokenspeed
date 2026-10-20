@@ -1541,4 +1541,121 @@ TEST(CacheOperationTest, APrefetchPageCountsEveryGroupsRows) {
     EXPECT_EQ(plan->page_row_ends, std::vector<std::size_t>{3});
 }
 
+TEST(CacheOperationTest, ShardedL3PrefetchLandsACommonPrefixAndLoadsInTheHostOwners) {
+    for (const std::int32_t shards : {2, 4}) {
+        SCOPED_TRACE(shards);
+        BlockPool device_pool{16, {4, 1}};
+        BlockPool host_pool{16, {4, 1}};
+        const std::array specs{
+            CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                           .cache_blocks_per_lcm_block = 4,
+                           .block_granularity = 2,
+                           .shard_count = shards},
+            CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        };
+        CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, device_pool,
+                                                       /*enable_l3_storage=*/true, &host_pool,
+                                                       /*snapshot_pool=*/nullptr,
+                                                       /*stream_device_cache_to_host=*/false);
+        const std::array<std::string, 3> hashes{"h0", "h1", "h2"};
+        coordinator.RegisterStorageKeys(coordinator.ExpandPrefixKeys(hashes));
+        auto plan = coordinator.PlanPrefetch(coordinator.ProbePrefix(hashes), /*min_pages=*/1);
+        ASSERT_TRUE(plan);
+        ASSERT_EQ(plan->rows.size(), 9u);
+        EXPECT_EQ(device_pool.NumEmptyLcmBlocks(), 16) << "prefetch holds no Device capacity";
+        for (const auto& row : plan->rows) {
+            const auto& allocator = coordinator.Allocator(row.group_id);
+            const std::int32_t bucket = row.group_id == 0 ? (row.page_index * 2 + row.key.page_offset) % shards : 0;
+            EXPECT_EQ(allocator.BucketOf(row.host_block->Location()), bucket);
+        }
+        TierTransferManager transfers(coordinator);
+        PrefetchOperation op = transfers.StartPrefetch("reader", std::move(*plan));
+        // A rank failed on page 2. The runtime's common prefix ACK publishes
+        // both groups of pages 0 and 1, and drops every unlanded row's pin.
+        auto done = transfers.CompletePrefetch(op.op_id, /*landed_pages=*/2);
+        ASSERT_TRUE(done);
+        EXPECT_EQ(done->published.size(), 6u);
+        EXPECT_EQ(done->unlanded.size(), 3u);
+        coordinator.UnregisterStorageKeys(done->unlanded);
+        EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 6);
+        auto probe = coordinator.ProbePrefix(hashes);
+        EXPECT_EQ(probe.host.num_common_tokens, 8);
+        EXPECT_FALSE(coordinator.PlanPrefetch(probe, /*min_pages=*/1));
+
+        std::vector<BlockTable> tables(2);
+        std::vector<GroupDemand> demands{
+            {.table = &tables[0], .extent = DenseGrowth{12}},
+            {.table = &tables[1], .extent = DenseGrowth{12}},
+        };
+        auto admission = coordinator.Admit(std::move(probe), demands, RequestProgress{},
+                                           /*request_access_epoch=*/std::nullopt);
+        ASSERT_TRUE(admission);
+        EXPECT_EQ(admission->host_prefix_tokens, 8);
+        ASSERT_EQ(admission->load_pairs.size(), 6u);
+        for (const auto& pair : admission->load_pairs) {
+            const auto& allocator = coordinator.Allocator(pair.group_id);
+            EXPECT_EQ(allocator.BucketOf(pair.source->Location()), allocator.BucketOf(pair.destination->Location()));
+        }
+        done->published.clear();
+        LoadBackOperation load = transfers.StartPrefixLoad(std::move(admission->load_pairs));
+        transfers.CompleteLoadBack(load.op_id);
+        EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 0);
+        coordinator.Free(tables);
+    }
+}
+
+TEST(CacheOperationTest, ShardedL3ThresholdCountsEvictableCapacityInEachBucket) {
+    BlockPool device_pool{8, {2}};
+    BlockPool host_pool{2, {2}};
+    const std::array specs{CacheGroupSpec{
+        .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2, .shard_count = 2}};
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
+                                                   /*enable_l3_storage=*/true, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
+    auto pinned = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 2>{1, 1});
+    ASSERT_EQ(pinned.size(), 2u);
+    for (const std::string hash : {"old0", "old1"}) {
+        auto block = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0});
+        ASSERT_EQ(block.size(), 1u);
+        coordinator.CacheHostBlock(block.front(), CacheKey{.group_id = 0, .content_hash = hash});
+    }
+    const std::array<std::string, 2> hashes{"new0", "new1"};
+    coordinator.RegisterStorageKeys(coordinator.ExpandPrefixKeys(hashes));
+    auto probe = coordinator.ProbePrefix(hashes);
+    EXPECT_FALSE(coordinator.PlanPrefetch(probe, /*min_pages=*/2));
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 2) << "a refused threshold must evict nothing";
+    for (const std::string hash : {"old0", "old1"}) {
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(CacheKey{.group_id = 0, .content_hash = hash}));
+    }
+    pinned.pop_back();
+    auto plan = coordinator.PlanPrefetch(probe, /*min_pages=*/2);
+    ASSERT_TRUE(plan);
+    EXPECT_EQ(plan->rows.size(), 2u);
+    EXPECT_EQ(coordinator.Allocator(0).BucketOf(plan->rows[1].host_block->Location()), 1);
+}
+
+TEST(CacheOperationTest, ShardedL3PrefetchStartsAfterTheExistingHostPrefix) {
+    BlockPool device_pool{4, {4}};
+    BlockPool host_pool{4, {4}};
+    const std::array specs{CacheGroupSpec{
+        .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = 2, .shard_count = 4}};
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
+                                                   /*enable_l3_storage=*/true, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
+    // Host hits can have any allocation owner, independently of content.
+    auto cached = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{3});
+    coordinator.CacheHostBlock(cached.front(), CacheKey{.group_id = 0, .content_hash = "h0"});
+    const std::array<std::string, 4> hashes{"h0", "h1", "h2", "h3"};
+    coordinator.RegisterStorageKeys(coordinator.ExpandPrefixKeys(hashes));
+    auto plan = coordinator.PlanPrefetch(coordinator.ProbePrefix(hashes), /*min_pages=*/1);
+    ASSERT_TRUE(plan);
+    EXPECT_EQ(plan->first_page, 1);
+    ASSERT_EQ(plan->rows.size(), 3u);
+    for (const auto& row : plan->rows) {
+        EXPECT_EQ(coordinator.Allocator(0).BucketOf(row.host_block->Location()), row.page_index);
+    }
+}
+
 }  // namespace tokenspeed::test

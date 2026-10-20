@@ -1712,6 +1712,13 @@ def build_device_side(
                 cache_signature=cache_signature,
                 pipeline_rank=pipeline_rank,
                 attn_tp_size=attn_tp_size,
+                attn_kvp_size=server_args.mapping.attn.kvp_size,
+                attn_qcp_size=server_args.mapping.attn.qcp_size,
+                attn_head_tp_size=server_args.mapping.attn.head_tp_size,
+                group_shard_counts=[
+                    spec.shard_count
+                    for spec in views.token_to_kv_pool.arena.runtime_contract.group_specs
+                ],
                 draft_model=draft_model,
                 draft_revision=draft_revision,
                 draft_weight_version=weight_version if draft_model else "",

@@ -2026,22 +2026,6 @@ class ServerArgs:
     def validate_cache_options(self):
         # Runs after _handle_kvstore() has applied the KVStore default, so the
         # check sees the effective setting rather than the pre-resolution flag.
-        # Both Host tiers -- the L2 KVStore and the retraction snapshot pool --
-        # are legal under KV-page sharding (--kv-parallel-size):
-        # the scheduler allocates every Host block in its Device block's
-        # residue class and the executor translates ownership on both ends of
-        # every row (cache/transfer/ownership.py), so each rank copies the
-        # blocks it owns. L3 is not: its keys name content and position, but
-        # which rank owns a block is decided at allocation, so a rank cannot
-        # answer an existence probe for blocks it did not own when the object
-        # was written (docs/design/cache-concepts.md, the retraction image).
-        if self.kv_parallel_size > 1 and (self.kvstore_storage_backend is not None):
-            raise ValueError(
-                "--kvstore-storage-backend (L3) is not supported under "
-                "--kv-parallel-size > 1: a page-cyclic sharded group "
-                "has no owner-stable L3 key. The Host KVStore itself and the "
-                "retraction snapshot pool are supported."
-            )
         # Same-checkpoint DSpark's KVStore support depends on where the draft
         # keeps its context; the engine decides once the draft config resolves
         # (resolve_dspark_prefix_replay_tokens).
@@ -3692,9 +3676,9 @@ class ServerArgs:
             "decode engines require equal --decode-context-parallel-size; "
             "the PD prefill role writes the shards and "
             "may split its query rows over them with "
-            "--query-context-parallel-size. Works with the Host KVStore and the "
-            "retraction snapshot pool; not with L3 storage "
-            "(--kvstore-storage-backend).",
+            "--query-context-parallel-size. Works with the Host KVStore, the "
+            "retraction snapshot pool and L3 storage "
+            "(--kvstore-storage-backend); L3 reuse requires the same CP layout.",
         )
         parser.add_argument(
             "--decode-context-parallel-size",

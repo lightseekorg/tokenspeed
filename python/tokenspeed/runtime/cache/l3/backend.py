@@ -108,7 +108,9 @@ def storage_object_key(
     TokenSpeed's Host pool is one compact byte buffer (flat KV). One Mooncake
     object stores the packed bytes of a single CacheBlock, keyed by the
     scheduler content hash plus the group/offset/rank that uniquely identify
-    the shard. Attention TP ranks each own a different physical KV slice.
+    the shard. ``rank`` identifies the physical KV slice: the attention TP
+    rank for a replicated group, or the first TP rank of the KVP subgroup
+    for a page-sharded group (whose allocation owner may change on restore).
     The trailing ``|c0`` is the retired context-parallel shard id, kept
     literal so objects written before its removal stay addressable; drop it
     with the next deliberate key-format bump.
@@ -937,6 +939,10 @@ def storage_key_prefix(
     cache_signature: str,
     pipeline_rank: int,
     attn_tp_size: int,
+    attn_kvp_size: int,
+    attn_qcp_size: int,
+    attn_head_tp_size: int,
+    group_shard_counts: Sequence[int],
     draft_model: str,
     draft_revision: str,
     draft_weight_version: str,
@@ -979,6 +985,9 @@ def storage_key_prefix(
     scales, no HF overrides). The payload keeps a literal ``cp_size`` of 1,
     the retired context-parallel width, so the namespace of every existing
     deployment is unchanged until the next deliberate key-format bump.
+    With KVP/QCP, a separate ``context_parallel`` entry records the KV and
+    query widths, head TP width and per-group shard counts. Only identical
+    CP layouts share objects; no conversion between layouts is implied.
     ``attn_tp_size``
     belongs here rather than only in the per-object ``r{tp_rank}`` shard
     id: GQA with TP above the KV-head count keeps one local KV head per
@@ -991,28 +1000,34 @@ def storage_key_prefix(
         raise TypeError("model_overrides must be a dict")
     if isinstance(eagle3_layers_to_capture, (str, bytes)):
         raise TypeError("eagle3_layers_to_capture must be a sequence of ints")
+    identity = {
+        "model": str(model_name),
+        "revision": str(revision),
+        "weight_version": str(weight_version),
+        "model_overrides": model_overrides,
+        "cache_signature": str(cache_signature),
+        "pipeline_rank": int(pipeline_rank),
+        "attn_tp_size": int(attn_tp_size),
+        "cp_size": 1,
+        "draft_model": str(draft_model),
+        "draft_revision": str(draft_revision),
+        "draft_weight_version": str(draft_weight_version),
+        "cache_quantization": str(cache_quantization),
+        "runtime_compat": str(runtime_compat),
+        "attention_backend": str(attention_backend),
+        "draft_attention_backend": str(draft_attention_backend),
+        "skip_softmax_threshold": float(skip_softmax_threshold),
+        "eagle3_layers_to_capture": [int(layer) for layer in eagle3_layers_to_capture],
+    }
+    if attn_kvp_size > 1 or attn_qcp_size > 1:
+        identity["context_parallel"] = {
+            "kvp_size": int(attn_kvp_size),
+            "qcp_size": int(attn_qcp_size),
+            "head_tp_size": int(attn_head_tp_size),
+            "group_shard_counts": [int(count) for count in group_shard_counts],
+        }
     payload = json.dumps(
-        {
-            "model": str(model_name),
-            "revision": str(revision),
-            "weight_version": str(weight_version),
-            "model_overrides": model_overrides,
-            "cache_signature": str(cache_signature),
-            "pipeline_rank": int(pipeline_rank),
-            "attn_tp_size": int(attn_tp_size),
-            "cp_size": 1,
-            "draft_model": str(draft_model),
-            "draft_revision": str(draft_revision),
-            "draft_weight_version": str(draft_weight_version),
-            "cache_quantization": str(cache_quantization),
-            "runtime_compat": str(runtime_compat),
-            "attention_backend": str(attention_backend),
-            "draft_attention_backend": str(draft_attention_backend),
-            "skip_softmax_threshold": float(skip_softmax_threshold),
-            "eagle3_layers_to_capture": [
-                int(layer) for layer in eagle3_layers_to_capture
-            ],
-        },
+        identity,
         sort_keys=True,
         separators=(",", ":"),
     )

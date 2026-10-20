@@ -73,18 +73,6 @@ void SchedulerConfig::Validate() const {
         throw std::invalid_argument(
             "Scheduler: l3_prefetch_min_pages is an L3 setting; it must be 0 without L3 storage");
     }
-    if (enable_l3_storage) {
-        // A Host copy keeps its Device block's residue, but an L3 prefetch
-        // allocates its Host page before any Device destination exists.
-        for (const CacheGroupConfig& group : cache_groups) {
-            if (group.shard_count > 1) {
-                throw std::invalid_argument(
-                    "Scheduler: L3 storage is not supported for page-cyclic sharded cache "
-                    "groups (group '" +
-                    group.group_id + "')");
-            }
-        }
-    }
     // The snapshot pool is stated explicitly on every role: the null page
     // alone (and no slots) says "never retract", anything more needs slots.
     // The messages name the binding field and the server arg that sets it,

@@ -125,7 +125,13 @@ class L3StoreStats:
 
 
 class L3HostStore:
-    """Zero-copy adapter from compact Host pages to a ``KvStoreStorage``."""
+    """Zero-copy adapter from compact Host pages to a ``KvStoreStorage``.
+
+    ``rank`` is the attention TP rank. ``shard_counts`` follows the scheduler's
+    group order: 1 keeps rank-local keys, a larger count shares keys within
+    that consecutive KVP subgroup. Callers supply only locally owned pages,
+    with Host block IDs already translated to local storage IDs.
+    """
 
     def __init__(
         self,
@@ -134,11 +140,17 @@ class L3HostStore:
         *,
         key_prefix: str,
         rank: int,
+        shard_counts: Sequence[int],
     ):
         self.backend = backend
         self.host_storage = host_storage
         self._base_key_prefix = key_prefix
         self.rank = int(rank)
+        self.shard_counts = tuple(int(count) for count in shard_counts)
+        if self.rank < 0 or any(count < 1 for count in self.shard_counts):
+            raise ValueError(
+                "L3 needs a non-negative TP rank and positive shard counts"
+            )
         self._stats = L3StoreStats()
 
     @property
@@ -181,12 +193,18 @@ class L3HostStore:
             return False
 
     def object_key(self, content_hash: str, group_id: int, page_offset: int) -> str:
+        if not 0 <= group_id < len(self.shard_counts):
+            raise IndexError(f"unknown L3 cache group {group_id}")
+        # A sharded group's bytes are identical across its KVP subgroup;
+        # allocation chooses which rank holds a block, not its identity.
+        # Replicated groups can hold different TP slices and keep their rank.
+        shard_count = self.shard_counts[group_id]
         return storage_object_key(
             content_hash,
             group_id,
             page_offset,
             prefix=self.key_prefix,
-            rank=self.rank,
+            rank=self.rank - self.rank % shard_count,
         )
 
     def stats(self) -> L3StoreStatsSnapshot:

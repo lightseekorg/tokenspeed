@@ -71,13 +71,15 @@ class _Device:
         return False
 
 
-def _scheduler() -> ts.Scheduler:
+def _scheduler(shard_count: int) -> ts.Scheduler:
     groups = [
         ts.CacheGroupConfig(
             group_id="history",
             block_granularity=PAGE,
-            total_pages=64 + 1,
+            total_pages=64 * shard_count + 1,
             attn_kind=ts.AttnKind.Full,
+            cache_blocks_per_lcm_block=shard_count,
+            shard_count=shard_count,
         )
     ]
     return ts.Scheduler(
@@ -123,10 +125,12 @@ def _l3_hooks(scheduler, device) -> L3CacheHooks:
 
 
 @pytest.mark.parametrize("landed", [2, 1])
+@pytest.mark.parametrize("shard_count", [1, 2, 4])
 def test_an_l3_hit_is_prefetched_before_admission_and_admitted_as_a_host_hit(
     landed: int,
+    shard_count: int,
 ) -> None:
-    scheduler = _scheduler()
+    scheduler = _scheduler(shard_count)
     device = _Device()
     cache_hooks = _cache_hooks(device)
     l3_hooks = _l3_hooks(scheduler, device)
@@ -180,4 +184,6 @@ def test_an_l3_hit_is_prefetched_before_admission_and_admitted_as_a_host_hit(
     assert list(forward.input_lengths) == [len(PROMPT) - landed * PAGE]
     loads = [c for c in plan.cache if isinstance(c, ts.Cache.LoadBackOp)]
     assert len(loads) == 1 and len(loads[0].src_pages[0]) == landed
+    for host, device in zip(loads[0].src_pages[0], loads[0].dst_pages[0]):
+        assert (int(host) - 1) % shard_count == (int(device) - 1) % shard_count
     assert scheduler.waiting_size() == 0

@@ -511,9 +511,10 @@ to other ranks is still acknowledged by this rank from an empty copy; the
 hooks' replica intersection completes the op only once every owner has. The
 scheduler side (residue-class allocation for every tier transfer, the Host
 pools registered with each group's `shard_count`) is what makes the
-translation exact, so both Host tiers serve a KV-page-sharded engine; L3
-storage does not (`scheduler.md`), because an L3 key names content and
-position while ownership is decided at allocation.
+translation exact, so both Host tiers serve a KV-page-sharded engine. An L3
+prefetch chooses Host ownership first; the later admission places Device
+blocks in those Host buckets. L3 content identity is independent of the
+allocation owner within a KVP subgroup.
 
 ## block vs. page
 
@@ -860,11 +861,18 @@ Its responsibilities:
   request is admitted (`PrefetchOperation`, `fsm::Prefetching`); the
   admission that follows runs the ordinary H2D load against real Host
   entries.
-  Object keys are `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c0`;
-  the trailing `c0` is the retired context-parallel shard id, kept literal
+  Object keys are `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{slice_rank}|c0`.
+  `slice_rank` is the TP rank for a replicated group and the first TP rank
+  of the KVP subgroup for a sharded group. A sharded group's fields are
+  shared across its owners, so a block written by one rank can be fetched
+  by another after allocation changes; replicated groups retain their
+  distinct TP slices. Only the current owner transfers the block's bytes.
+  The trailing `c0` is the retired context-parallel shard id, kept literal
   (as is the `cp_size: 1` entry of the hashed namespace) so objects written
   before its removal stay addressable until the next deliberate key-format
-  bump.
+  bump. KVP/QCP deployments add their KV, query and head-TP widths and the
+  per-group shard counts to the namespace. Reuse requires the same CP
+  layout; existing non-CP namespaces remain unchanged.
   The hashed namespace (`storage_key_prefix`) covers the loaded checkpoint
   (`model` + resolved immutable revision + `--weight-version`), the packed
   Host CacheBlock layout (dtype and field payload geometry, not device
@@ -1443,11 +1451,13 @@ in its source's bucket (`AcquireHostBlocks(group_ids, buckets)`,
 a batch. A Host block's residue is therefore its owner exactly as a Device
 block's is, and one `owned_local_pages` translation serves both ends of every
 row: a rank keeps the rows it owns and translates both ids to local pages, a
-replicated group (`D = 1`) owns every row. L3 storage stays refused with a
-sharded group (`SchedulerConfig::Validate`): an L3 key names content, group,
-offset and `tp_rank`, but which rank owns a block is decided at allocation,
-so a rank probing `batch_exists` can only answer for the blocks it owned when
-the object was written. A residue-constrained acquisition can fail while
+replicated group (`D = 1`) owns every row. An L3 prefetch has no Device
+source: it distributes each group's logical block indices cyclically over
+the Host buckets and checks the threshold against free and evictable
+capacity in each bucket before allocating. Admission later follows those
+Host owners. The L3 key uses the KVP subgroup's first TP rank for sharded
+groups, so every owner can probe the same content before allocation.
+A residue-constrained acquisition can fail while
 other buckets have room; a restore then waits like any readmission, and the
 balanced allocator keeps ordinary admissions within one block per bucket, so
 the imbalance a restore sees is bounded by what its own victim table

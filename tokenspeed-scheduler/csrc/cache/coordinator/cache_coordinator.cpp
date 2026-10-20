@@ -79,13 +79,6 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
             _assert(spec.attn_kind == AttnKind::kSlidingWindow, "a replayable group must be a sliding window");
             replay_window_tokens_ = std::max(replay_window_tokens_, spec.sliding_window);
         }
-        // Every Host copy keeps the bucket of its Device end, so a page-cyclic
-        // owner translation selects the same rows on both sides. An L3
-        // prefetch allocates its Host page before any Device destination
-        // exists and would have to choose the bucket blind, so L3 stays
-        // replicated-only.
-        _assert(!enable_l3_storage_ || spec.shard_count == 1,
-                "L3 storage is not supported for page-cyclic sharded cache groups");
         if (groups_[i].Matcher().IsPrefixClosed()) {
             match_order_.push_back(i);
         }
@@ -790,6 +783,7 @@ std::optional<CacheCoordinator::PrefetchPlan> CacheCoordinator::PlanPrefetch(con
     struct PageRows {
         std::vector<std::uint32_t> groups;
         std::vector<CacheKey> keys;
+        std::vector<std::int32_t> buckets;
     };
     std::vector<PageRows> pages(static_cast<std::size_t>(extension_pages));
     for (std::size_t i = 0; i < groups_.size(); ++i) {
@@ -809,26 +803,37 @@ std::optional<CacheCoordinator::PrefetchPlan> CacheCoordinator::PlanPrefetch(con
                 _assert(storage_keys_.contains(key), "storage probe hit without a Host or L3 entry");
                 pages[static_cast<std::size_t>(page)].groups.push_back(groups_[i].Id());
                 pages[static_cast<std::size_t>(page)].keys.push_back(key);
+                // No Device block exists yet. Spread the logical blocks over
+                // owners; admission will allocate Device in this Host bucket.
+                pages[static_cast<std::size_t>(page)].buckets.push_back((floor_blocks + b) %
+                                                                        groups_[i].Spec().shard_count);
             }
         }
     }
     // The threshold is decided before anything is acquired: a fill that would
     // stop short of min_pages must evict nothing for the attempt. Counted per
-    // group against its free slots, its unpinned entries and the pool's empty
+    // group and bucket against free slots, unpinned entries and the pool's empty
     // parents (conservative: another group's evictable parents are not
     // counted, so a plan this refuses might have fit by evicting them -- the
     // request then computes the pages, which never blocks it).
     {
-        std::vector<std::int64_t> rows_by_group(groups_.size(), 0);
+        std::vector<std::vector<std::int64_t>> rows_by_bucket;
+        for (const CacheGroup& group : groups_) {
+            rows_by_bucket.emplace_back(group.Spec().shard_count, 0);
+        }
         for (std::int32_t page = 0; page < min_pages; ++page) {
-            for (const std::uint32_t group_id : pages[static_cast<std::size_t>(page)].groups) {
-                ++rows_by_group[group_id];
+            const PageRows& rows = pages[static_cast<std::size_t>(page)];
+            for (std::size_t r = 0; r < rows.groups.size(); ++r) {
+                ++rows_by_bucket[rows.groups[r]][rows.buckets[r]];
             }
         }
         std::int64_t parents_needed = 0;
         for (std::size_t i = 0; i < groups_.size(); ++i) {
-            const std::int64_t evictable = groups_[i].Index().EvictableCandidates(*host_pool_).size();
-            const std::vector<std::int64_t> need{std::max<std::int64_t>(0, rows_by_group[i] - evictable)};
+            auto& need = rows_by_bucket[i];
+            for (const auto& candidate : groups_[i].Index().EvictableCandidates(*host_pool_)) {
+                auto& bucket_need = need[groups_[i].Allocator().BucketOf(candidate.location)];
+                bucket_need = std::max<std::int64_t>(0, bucket_need - 1);
+            }
             parents_needed +=
                 ParentsNeededForBuckets(need, host_pool_->FreeSlotsByBucket(groups_[i].Id()),
                                         /*dense_need=*/0, groups_[i].Allocator().CacheBlocksPerLcmBlock());
@@ -842,12 +847,8 @@ std::optional<CacheCoordinator::PrefetchPlan> CacheCoordinator::PlanPrefetch(con
         // Every group's rows of the page are acquired in one batch (one Host
         // allocation pass per page, not per row); a shortfall leaves a row
         // empty, and the page -- its other blocks returning -- is not planned.
-        // L3 is accepted only for replicated groups (one bucket), see
-        // Validate; a prefetch destination has no Device counterpart whose
-        // bucket it would have to follow.
         PageRows& rows = pages[static_cast<std::size_t>(page)];
-        const std::vector<std::int32_t> buckets(rows.groups.size(), 0);
-        HostAllocationBatch host_blocks = AcquireHostBlocks(rows.groups, buckets);
+        HostAllocationBatch host_blocks = AcquireHostBlocks(rows.groups, rows.buckets);
         if (host_blocks.stats.unallocated != 0) {
             break;  // the Host pool is pinned full: the fill stops before this page
         }
