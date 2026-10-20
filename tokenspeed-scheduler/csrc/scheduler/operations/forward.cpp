@@ -361,15 +361,12 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTrac
 Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   Request* request, std::int32_t remaining,
                                                                   std::int32_t decode_input_tokens) {
-    // A D-role admission always needs a request slot. Avoid hashing/probing
-    // queued prompts when no slot can admit them; preserve P/fused admission.
-    if (config_.role == Role::kD && req_pool_allocator_.AvailableSlots() == 0) {
-        return FirstChunkOutcome{};
-    }
-    AdmissionMatch match = matchPrefixAtAdmission(request);
+    // No admission is possible while slots are full. L3 preparation runs
+    // independently before forward scheduling and needs no request slot.
     if (req_pool_allocator_.AvailableSlots() == 0) {
         return FirstChunkOutcome{};
     }
+    AdmissionMatch match = matchPrefixAtAdmission(request);
 
     // The D role's prompts are the peer's work; every other first chunk is local.
     const fsm::PrefillSource source =
