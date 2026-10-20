@@ -28,20 +28,12 @@ namespace tokenspeed {
 
 // How a local prefill chunk is cut. A chunk is min(budget, unscheduled)
 // shaped by what the cache groups need: a junction cut when a hit's KV
-// coverage reached further than its state checkpoint, or a reusable State
-// checkpoint before a long prompt's tail; for replayable groups
+// coverage reached further than its state checkpoint; for replayable groups
 // the re-fed window is debited from a hit chunk's budget and a prompt's final
 // chunk is never shorter than the window (ChunkKeepingFinalWindow). Every
 // function here is pure token arithmetic on the coordinator's facts; the
 // forward planner calls PrefillChunkTokens and never branches on a group kind
 // itself.
-
-// One reusable State checkpoint before a long prompt's final window. Short
-// prompts stay in one forward; models without State groups need no cut.
-// The returned boundary leaves both logits replay and replayable state a
-// complete final window. Zero means no additional checkpoint.
-std::int32_t PrefillStateCheckpointTokens(const CacheCoordinator& coordinator, std::int32_t prompt_tokens,
-                                          std::int32_t chunk_budget, std::int32_t prefix_replay_tokens);
 
 // Chunk size that never leaves the prompt's final chunk shorter than
 // replay_window: bounded replay narrows the model's decoder to the prompt's
@@ -53,17 +45,16 @@ std::int32_t PrefillStateCheckpointTokens(const CacheCoordinator& coordinator, s
 std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t unscheduled, std::int32_t replay_window);
 
 // Token count of a local prefill chunk starting at first_pos with the given
-// unscheduled prompt, remaining round budget, pending junction, and reusable
-// State checkpoint (0 means none). The nearest pending boundary cuts the
-// chunk, so its natural checkpoint can serve the next matching prompt.
+// unscheduled prompt, remaining round budget and pending junction (0 means
+// none): a chunk is cut to end at the junction so the natural checkpoint it
+// leaves coincides with KV already cached, and the next prompt resumes there.
 // `resumes_hit` marks a hit's first chunk, whose re-fed replay window
 // (CacheCoordinator::ReplayTokens) comes out of the budget before any new
 // token. A junction inside the prompt's final replay window yields to the
 // window rule: the chunk passes the junction rather than waiting for a chunk
 // end that satisfies both. Returns 0 when no chunk fits this round's budget.
 std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_t first_pos, bool resumes_hit,
-                                std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens,
-                                std::int32_t state_checkpoint_tokens);
+                                std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens);
 
 // Budget a fused mixed-mode decode batch leaves untouched so a pending local
 // prefill can still advance: for replayable groups the replay window plus the
