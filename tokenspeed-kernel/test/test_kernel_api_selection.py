@@ -351,6 +351,9 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
     """Only proven same-band overlaps may use specialized priority offsets."""
     registry = KernelRegistry.get()
     expected_offsets = {
+        # Prefer packed FP8 experts over the overlapping block-FP8 Gluon plan.
+        "gluon_fp8_packed_ep1_precomputed_moe_apply": Priority.SPECIALIZED + 1,
+        "gluon_fp8_packed_ep4_precomputed_moe_apply": Priority.SPECIALIZED + 1,
         "gluon_mxfp4_a4w4_ep_deferred_precomputed_moe_apply": Priority.SPECIALIZED + 1,
         "gluon_mxfp4_dynamic_moe_apply": Priority.SPECIALIZED + 1,
         # Prefer the coupled MXFP8 bank over the overlapping A16 EP8 plan.
