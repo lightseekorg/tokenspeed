@@ -197,18 +197,26 @@ def _warmup_projection(workspace: ProjectionWorkspace) -> None:
             spec.dtype == torch.bfloat16
             and spec.input_size % (128 * len(spec.group)) == 0
         ):
-            # Empty input warms masked byte/scale packing, even at capacity one.
-            backend.projection_all_to_all(
-                probe[:0].to(torch.float8_e4m3fn),
-                1,
-                False,
-                False,
-                None,
-                workspace,
-                input_scales=torch.ones(
-                    (0, spec.input_size // 128), dtype=torch.float32, device=spec.device
-                ),
+            # Warm empty-owner FP8 exchange, including the ordinary fallback
+            # used beyond native capacity. Both mask padding at capacity one.
+            empty = probe[:0].to(torch.float8_e4m3fn)
+            empty_scales = torch.ones(
+                (0, spec.input_size // 128), dtype=torch.float32, device=spec.device
             )
+            backend.projection_all_to_all(
+                empty, 1, False, False, None, workspace, input_scales=empty_scales
+            )
+            if workspace.a2a is not None:
+                projection_all_to_all(
+                    empty,
+                    1,
+                    False,
+                    False,
+                    None,
+                    workspace,
+                    backend,
+                    input_scales=empty_scales,
+                )
         partial = backend.acquire_projection_output(1, workspace)
         partial.zero_()
         backend.projection_reduce_scatter(partial, 1, workspace)
@@ -679,11 +687,7 @@ class ProjectionBackend:
         *,
         input_scales: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if (
-            input_scales is not None
-            or workspace.a2a is None
-            or rows > workspace.a2a.max_rows
-        ):
+        if workspace.a2a is None or rows > workspace.a2a.max_rows:
             return projection_all_to_all(
                 inputs,
                 rows,
@@ -696,22 +700,41 @@ class ProjectionBackend:
             )
         from tokenspeed_kernel.ops.communication.cuda import (
             tokenspeed_a2a_lamport,
+            tokenspeed_a2a_lamport_fp8,
             tokenspeed_a2a_lamport_fp8_quantize,
         )
 
         _check_workspace(rows, workspace, self._fallback)
         _check_a2a_options(inverse, quantize, out)
-        sent = (
-            inputs.contiguous()
-            if inverse
-            else prepare_padded_rows(inputs, rows, workspace.send, alignment_bytes=16)
-        )
-        if quantize and workspace.a2a.fp8_output is not None:
-            return tokenspeed_a2a_lamport_fp8_quantize(workspace.a2a, sent)
-        return (
-            tokenspeed_a2a_lamport(workspace.a2a, sent, inverse=inverse, out=out),
-            None,
-        )
+        if input_scales is not None:
+            # FP8 row inputs carry their existing scales through one exchange.
+            if inverse or quantize or workspace.spec.kind != "row":
+                raise ValueError(
+                    "Prequantized A2A requires FP8 row inputs and per-128 scales"
+                )
+            # Local layout differences must not change the collective chosen
+            # by the subgroup. Normalize only ranks that need a copy.
+            values = inputs.contiguous()
+            if values.data_ptr() % 4:
+                values = values.clone()
+            return tokenspeed_a2a_lamport_fp8(
+                workspace.a2a, values, input_scales.contiguous(), rows
+            )
+        else:
+            # BF16 exchange, optionally quantizing received shards before GEMM.
+            sent = (
+                inputs.contiguous()
+                if inverse
+                else prepare_padded_rows(
+                    inputs, rows, workspace.send, alignment_bytes=16
+                )
+            )
+            if quantize and workspace.a2a.fp8_output is not None:
+                return tokenspeed_a2a_lamport_fp8_quantize(workspace.a2a, sent)
+            return (
+                tokenspeed_a2a_lamport(workspace.a2a, sent, inverse=inverse, out=out),
+                None,
+            )
 
     def acquire_output(self, rows: int, workspace: ProjectionWorkspace) -> torch.Tensor:
         if workspace.reduction is None or rows > workspace.reduction.max_rows:

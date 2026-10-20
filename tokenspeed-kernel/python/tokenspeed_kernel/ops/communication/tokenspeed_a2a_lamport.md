@@ -145,6 +145,21 @@ materialization and a quantization launch, not link bytes. Persistent FP8 and
 scale outputs add `R*(K/P) + 4*R*K/(128*P)` bytes at the configured maximum `M`.
 The existing BF16 output remains available, and inverse exchange is unchanged.
 
+## Prequantized FP8 exchange
+
+`tokenspeed_a2a_lamport_fp8(state, inputs, input_scales, rows)` exchanges E4M3
+values and FP32 per-128 scales together through the existing tagged-packet
+protocol. Both payloads are preserved bit for bit; the kernel performs no
+quantization. Each channel shard must contain complete 128-element groups.
+The common physical `rows` is explicit. Local inputs may have fewer rows or be
+empty; the kernel publishes zero padding for both values and scales.
+
+The result is borrowed E4M3 `[TP*rows,K/TP]` and row-major FP32 scales
+`[TP*rows,K/(128*TP)]`. Both fit in the existing BF16 output allocation.
+The packet ring and generation counter are shared with BF16 exchange, so
+interleaved formats follow the same serialized-stream lifetime. This entry
+point uses packet exchange; it does not select the BF16 chunk path.
+
 ## Validation and measurement methodology
 
 From the repository root, with optional CUDA/FlashInfer dependencies installed:

@@ -29,6 +29,7 @@ import torch.multiprocessing as mp
 from tokenspeed_kernel.ops.communication.cuda import (
     TokenSpeedA2ALamportState,
     tokenspeed_a2a_lamport,
+    tokenspeed_a2a_lamport_fp8,
     tokenspeed_a2a_lamport_fp8_quantize,
 )
 from tokenspeed_kernel.ops.communication.triton import (
@@ -140,9 +141,57 @@ def _check_a2a(rank, device, size):
                 restored.view(torch.int16), retained.view(torch.int16), rtol=0, atol=0
             )
         del graph
+    _check_prequantized_a2a(state, rank, device, size)
     torch.cuda.synchronize(device)
     dist.barrier()
     del state
+
+
+def _check_prequantized_a2a(state, rank, device, size):
+    # Small and pipelined packet reads; the last owner stays empty. Reuse the
+    # BF16 communicator so format changes exercise the same generation ring.
+    for rows in (1, 33):
+        local_rows = max(rows - rank, 0) if rank != size - 1 else 0
+        values = torch.empty(
+            (local_rows, KDA_WIDTH), dtype=torch.float8_e4m3fn, device=device
+        )
+        scales = torch.empty(
+            (local_rows, KDA_WIDTH // 128), dtype=torch.float32, device=device
+        )
+        bf16 = torch.randn(rows, KDA_WIDTH, dtype=torch.bfloat16, device=device)
+        bf16_out = torch.empty(
+            size * rows, KDA_WIDTH // size, dtype=torch.bfloat16, device=device
+        )
+
+        def exchange():
+            tokenspeed_a2a_lamport(state, bf16, inverse=False, out=bf16_out)
+            return tokenspeed_a2a_lamport_fp8(state, values, scales, rows)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = exchange()
+        for capture in (False, True, True):
+            # Preserve arbitrary payloads, including signed zero and NaNs in
+            # either format; compare integer views instead of float values.
+            values.view(torch.uint8).random_(0, 256)
+            scales.view(torch.int32).random_(-(2**31), 2**31)
+            expected = []
+            for source in (values.view(torch.uint8), scales.view(torch.int32)):
+                padded = source.new_zeros(rows, source.shape[1])
+                padded[:local_rows].copy_(source)
+                parts = [torch.empty_like(padded) for _ in range(size)]
+                dist.all_gather(parts, padded)
+                width = source.shape[1] // size
+                expected.append(torch.cat(parts)[:, rank * width : (rank + 1) * width])
+            torch.cuda._sleep(100000 * rank)
+            if capture:
+                graph.replay()
+                actual = captured
+            else:
+                actual = exchange()
+            for tensor, ref in zip(actual, expected):
+                torch.testing.assert_close(tensor.view(ref.dtype), ref, rtol=0, atol=0)
+        graph.reset()
 
 
 def _check_allgather_quant(rank, device):

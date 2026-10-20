@@ -39,10 +39,12 @@ __device__ __forceinline__ uint64_t observe(const uint64_t *p) {
   return value;
 }
 
-template <int NRanks, bool Inverse, int Pipeline, bool Quantize, int Threads>
+template <int NRanks, bool Inverse, int Pipeline, bool Quantize,
+          bool Prequantized, int Threads>
 __global__ __launch_bounds__(Threads, 1) void lamport_a2a(
     const uint32_t *input, uint32_t *output, float *scales, uint64_t **peers,
-    uint32_t *control, int capacity, int rows, int channels, int rank) {
+    uint32_t *control, int capacity, int rows, int channels, int rank,
+    const uint32_t *input_scales, int input_rows) {
   __shared__ uint32_t epoch;
   if (threadIdx.x == 0)
     epoch = control[0];
@@ -55,7 +57,10 @@ __global__ __launch_bounds__(Threads, 1) void lamport_a2a(
   // kernel. Grid <= SM count permits all entry counters to become resident.
   if (threadIdx.x == 0)
     atomicAdd(control + 1, 1);
-  const int width = channels / (2 * NRanks); // 32-bit words per shard
+  const int value_width = channels / ((Prequantized ? 4 : 2) * NRanks);
+  const int scale_width = Prequantized ? channels / (128 * NRanks) : 0;
+  // FP8 values and scales share one tagged row; both fit in the BF16 ring.
+  const int width = value_width + scale_width;
   const int count = rows * width;
   const int offset = (epoch % 3) * capacity;
   uint64_t *buffers[NRanks];
@@ -69,11 +74,26 @@ __global__ __launch_bounds__(Threads, 1) void lamport_a2a(
     const int row = i / width, col = i % width;
 #pragma unroll
     for (int peer = 0; peer < NRanks; ++peer) {
-      const int src = Inverse ? peer * count + i
-                              : row * NRanks * width + peer * width + col;
+      uint32_t payload;
+      if constexpr (Prequantized) {
+        // Every owner publishes the common physical row count, including
+        // empty owners. Do not read beyond its logical input/scale rows.
+        payload = 0;
+        if (row < input_rows) {
+          if (col < value_width)
+            payload = input[row * NRanks * value_width + peer * value_width + col];
+          else
+            payload = input_scales[row * NRanks * scale_width +
+                                   peer * scale_width + col - value_width];
+        }
+      } else {
+        const int src = Inverse ? peer * count + i
+                                : row * NRanks * width + peer * width + col;
+        payload = input[src];
+      }
       const int dst = Inverse ? row * NRanks * width + rank * width + col
                               : rank * count + i;
-      publish(buffers[peer] + dst, (uint64_t(epoch) << 32) | input[src]);
+      publish(buffers[peer] + dst, (uint64_t(epoch) << 32) | payload);
     }
   }
   // No grid barrier separates publish and polling. Every sender CTA completes
@@ -119,8 +139,19 @@ __global__ __launch_bounds__(Threads, 1) void lamport_a2a(
 #pragma unroll
       for (int j = 0; j < Pipeline; ++j) {
         const int index = i + j * stride;
-        if (index < NRanks * count)
-          output[index] = uint32_t(packets[j]);
+        if (index < NRanks * count) {
+          if constexpr (Prequantized) {
+            const int row = index / width, col = index % width;
+            if (col < value_width)
+              output[row * value_width + col] = uint32_t(packets[j]);
+            else
+              reinterpret_cast<uint32_t *>(scales)[row * scale_width +
+                                                   col - value_width] =
+                  uint32_t(packets[j]);
+          } else {
+            output[index] = uint32_t(packets[j]);
+          }
+        }
       }
     }
   }
@@ -235,9 +266,9 @@ void exchange_impl(TensorView input, TensorView output, TensorView peers,
   auto ptrs = static_cast<uint64_t **>(peers.data_ptr());
   auto ctrl = static_cast<uint32_t *>(control.data_ptr());
 #define LAUNCH(INVERSE, PIPELINE)                                              \
-  lamport_a2a<NRanks, INVERSE, PIPELINE, false, 256>                           \
+  lamport_a2a<NRanks, INVERSE, PIPELINE, false, false, 256>                           \
       <<<blocks, 256, 0, stream>>>(in, out, nullptr, ptrs, ctrl, capacity,     \
-                                   rows, channels, rank)
+                                   rows, channels, rank, nullptr, rows)
   if (rows * channels * 2 >= (4 << 20) && rows * channels * 2 <= (8 << 20)) {
 #define PAIRED(RANK)                                                           \
   if (inverse) {                                                               \
@@ -354,14 +385,14 @@ void exchange_fp8_impl(TensorView input, TensorView output, TensorView scales,
     TVM_FFI_ICHECK_EQ(input.device().device_id, tensor.device().device_id);
   auto stream = get_stream(input.device());
 #define QUANT(THREADS)                                                         \
-  lamport_a2a<NRanks, false, 1, true, THREADS>                                 \
+  lamport_a2a<NRanks, false, 1, true, false, THREADS>                                 \
       <<<blocks, THREADS, 0, stream>>>(                                        \
           static_cast<const uint32_t *>(input.data_ptr()),                     \
           static_cast<uint32_t *>(output.data_ptr()),                          \
           static_cast<float *>(scales.data_ptr()),                             \
           static_cast<uint64_t **>(peers.data_ptr()),                          \
           static_cast<uint32_t *>(control.data_ptr()), capacity, rows,         \
-          channels, rank)
+          channels, rank, nullptr, rows)
   if (rows * channels * 2 >= (4 << 20)) {
     QUANT(1024);
   } else {
@@ -393,3 +424,78 @@ void exchange_fp8(TensorView input, TensorView output, TensorView scales,
 #undef DISPATCH
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exchange_fp8, exchange_fp8);
+
+// Exchange prequantized values and scales without packing or requantization.
+// The physical row count is common; input_rows may differ on every owner.
+template <int NRanks>
+void exchange_prequantized_impl(
+    TensorView input, TensorView input_scales, TensorView output,
+    TensorView output_scales, TensorView peers, TensorView control,
+    int64_t capacity, int64_t rows, int64_t channels, int64_t rank,
+    int64_t blocks) {
+  ffi::CUDADeviceGuard guard(input.device().device_id);
+  for (auto tensor : {input, input_scales, output, output_scales, peers, control}) {
+    CHECK_INPUT(tensor);
+    TVM_FFI_ICHECK_EQ(input.device().device_id, tensor.device().device_id);
+  }
+  TVM_FFI_ICHECK_EQ(input.dtype(), dl_float8_e4m3fn);
+  TVM_FFI_ICHECK_EQ(output.dtype(), dl_float8_e4m3fn);
+  TVM_FFI_ICHECK_EQ(input_scales.dtype(), dl_float32);
+  TVM_FFI_ICHECK_EQ(output_scales.dtype(), dl_float32);
+  TVM_FFI_ICHECK(channels > 0 && channels % (128 * NRanks) == 0 && rows > 0);
+  TVM_FFI_ICHECK_EQ(input.numel() % channels, 0);
+  const int64_t input_rows = input.numel() / channels;
+  TVM_FFI_ICHECK(input_rows <= rows);
+  TVM_FFI_ICHECK_EQ(input_scales.numel(), input.numel() / 128);
+  TVM_FFI_ICHECK_EQ(output.numel(), rows * channels);
+  TVM_FFI_ICHECK_EQ(output_scales.numel(), output.numel() / 128);
+  TVM_FFI_ICHECK(rank >= 0 && rank < NRanks && blocks > 0);
+  TVM_FFI_ICHECK(capacity >= rows * channels / 2 && capacity <= INT32_MAX / 3);
+  TVM_FFI_ICHECK_EQ(peers.dtype(), dl_int64);
+  TVM_FFI_ICHECK_EQ(peers.numel(), NRanks);
+  TVM_FFI_ICHECK_EQ(control.dtype(), dl_int32);
+  TVM_FFI_ICHECK_EQ(control.numel(), 2);
+  auto stream = get_stream(input.device());
+#define PREQUANTIZED(PIPELINE)                                                 \
+  lamport_a2a<NRanks, false, PIPELINE, false, true, 256>                         \
+      <<<blocks, 256, 0, stream>>>(                                            \
+          static_cast<const uint32_t *>(input.data_ptr()),                     \
+          static_cast<uint32_t *>(output.data_ptr()),                          \
+          static_cast<float *>(output_scales.data_ptr()),                      \
+          static_cast<uint64_t **>(peers.data_ptr()),                           \
+          static_cast<uint32_t *>(control.data_ptr()), capacity, rows,          \
+          channels, rank,                                                     \
+          static_cast<const uint32_t *>(input_scales.data_ptr()), input_rows)
+  if (rows * channels * 33 / 128 <= blocks * 256) {
+    PREQUANTIZED(1);
+  } else {
+    PREQUANTIZED(4);
+  }
+#undef PREQUANTIZED
+  TVM_FFI_ICHECK(cudaGetLastError() == cudaSuccess);
+}
+void exchange_prequantized(
+    TensorView input, TensorView input_scales, TensorView output,
+    TensorView output_scales, TensorView peers, TensorView control,
+    int64_t capacity, int64_t rows, int64_t channels, int64_t rank,
+    int64_t blocks) {
+#define DISPATCH(N)                                                            \
+  exchange_prequantized_impl<N>(input, input_scales, output, output_scales,      \
+                               peers, control, capacity, rows, channels,       \
+                               rank, blocks)
+  switch (peers.numel()) {
+  case 2:
+    DISPATCH(2);
+    break;
+  case 4:
+    DISPATCH(4);
+    break;
+  case 8:
+    DISPATCH(8);
+    break;
+  default:
+    TVM_FFI_ICHECK(false) << "Lamport A2A requires TP2, TP4 or TP8";
+  }
+#undef DISPATCH
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exchange_prequantized, exchange_prequantized);

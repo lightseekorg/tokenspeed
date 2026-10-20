@@ -243,7 +243,9 @@ consume peer data as it becomes available.
 Row projection also accepts E4M3 inputs with FP32 scales per 128 channels,
 allowing the preceding RMSNorm/gate operation to quantize once. Fusion forwards
 those values and scales without requantizing; the ordinary path exchanges both
-before GEMM. BF16 input keeps quantization inside the projection. Both formats
+before GEMM. Eligible node-local fallback exchanges FP8 values and scales in one
+Lamport launch, including padding for unequal or empty owners. BF16 input keeps
+quantization inside the projection. Both formats
 return BF16, share workspace ownership, and are prepared before graph capture.
 All ranks in a projection call supply the same activation format. When active
 owners prequantize, empty owners also supply empty E4M3 values and FP32 scales

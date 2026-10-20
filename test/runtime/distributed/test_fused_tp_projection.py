@@ -700,6 +700,20 @@ def _check_row_projection(rank, world_size, device, parallel, config):
         torch.testing.assert_close(destination, expected, rtol=0, atol=0)
         torch.testing.assert_close(fused(x, ctx, scale), expected, rtol=0, atol=0)
 
+    # Only one owner has an unaligned value pointer and strided scales. Local
+    # layout normalization must preserve the collective selected by its peers.
+    if rank == 0:
+        x, scale = pairs[0]
+        unaligned = torch.empty(x.numel() + 1, dtype=x.dtype, device=device)[
+            1:
+        ].view_as(x)
+        unaligned.copy_(x)
+        strided = torch.empty(
+            (scale.shape[0], scale.shape[1] * 2), dtype=scale.dtype, device=device
+        )[:, ::2]
+        strided.copy_(scale)
+        pairs[0] = unaligned, strided
+
     # Reuse FP8 input and scale pointers while their contents and peer timing
     # change. Interleave BF16 to check both compiled variants share epochs safely.
     bf16_x = torch.randn(
