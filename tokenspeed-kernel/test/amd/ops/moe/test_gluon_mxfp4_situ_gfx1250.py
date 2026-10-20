@@ -76,6 +76,8 @@ def _make_mxfp4_module(
 
 def _make_case(
     num_tokens: int,
+    intermediate_size: int = 384,
+    num_experts: int = 16,
 ) -> tuple[
     torch.nn.Module,
     dict[str, torch.Tensor],
@@ -85,7 +87,7 @@ def _make_case(
     torch.Tensor,
 ]:
     generator = torch.Generator(device="cuda").manual_seed(20260829 + num_tokens)
-    num_experts, hidden_size, intermediate_size, top_k = 16, 3584, 384, 16
+    hidden_size, top_k = 3584, 16
     module, raw = _make_mxfp4_module(
         num_experts=num_experts,
         hidden_size=hidden_size,
@@ -113,14 +115,14 @@ def _make_case(
     return module, raw, hidden_states, topk_weights, topk_ids, router_logits
 
 
-def _make_plan() -> dict:
+def _make_plan(ispp: int = 384) -> dict:
     plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
         routing_mode="precomputed_topk",
         ep_size=1,
-        ispp=384,
+        ispp=ispp,
         internal_activation_dtype="input",
         solution="gluon",
         hidden=None,
@@ -137,14 +139,24 @@ def _make_plan() -> dict:
 
 # 65 is the smallest size above the prefill BLOCK_M of 64, so off_m is nonzero
 # for the tail block.
-@pytest.mark.parametrize("num_tokens", [1, 4, 32, 65])
+@pytest.mark.parametrize(
+    ("num_tokens", "ispp", "num_experts"),
+    [
+        *((m, ispp, 16) for ispp in (384, 768) for m in (1, 4, 32, 65, 2048)),
+        # K3's full routed-expert count at TP4's width.
+        (4, 768, 896),
+        (2048, 768, 896),
+    ],
+)
 def test_kimi_k3_tp_situ_matches_a8w4_reference_gfx1250(
     num_tokens: int,
+    ispp: int,
+    num_experts: int,
 ) -> None:
     module, raw, hidden_states, topk_weights, topk_ids, router_logits = _make_case(
-        num_tokens
+        num_tokens, ispp, num_experts
     )
-    plan = _make_plan()
+    plan = _make_plan(ispp)
     kernel_moe_process_weights(plan, module)
 
     actual = kernel_moe_apply(

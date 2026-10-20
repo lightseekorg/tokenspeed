@@ -1981,8 +1981,9 @@ if platform.is_amd:
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({False}),
             "supports_all_to_all_ep": frozenset({False}),
-            # K3 TP8 shards the 3072-wide expert intermediate to 384 columns.
-            "ispp": frozenset({384}),
+            # K3 shards the 3072-wide expert intermediate to 384 columns at
+            # TP8 and 768 at TP4.
+            "ispp": frozenset({384, 768}),
             "ispp_alignment": frozenset({128}),
             "internal_activation_dtype": frozenset({"input"}),
         },
