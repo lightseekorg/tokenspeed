@@ -333,11 +333,12 @@ def _check_column_projection(rank, world_size, device, parallel, config):
     for counts, value in inputs.items():
         sample = torch.randn_like(value)
         sample.view(value.shape[0], 7168 // 128, 128).mul_(block_scales.view(1, -1, 1))
-        # Change scales sharply between epochs, with opposite shifts across owners.
+        # Change FP8 values and scales between epochs so operand prefetch cannot
+        # reuse stale data, with opposite scale shifts across owners.
         source[counts] = [
             torch.zeros_like(value),
             sample,
-            sample * (16.0 if rank % 2 else 0.0625),
+            sample.flip(1) * (16.0 if rank % 2 else 0.0625),
         ]
     expected = {}
     for counts in contexts:

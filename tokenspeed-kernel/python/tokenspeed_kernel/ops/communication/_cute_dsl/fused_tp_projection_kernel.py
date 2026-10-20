@@ -1905,7 +1905,18 @@ class FusedTPProjectionKernel:
                                     ab_producer_state
                                 )
 
-                        # TMA load A/B
+                        # Prioritize weight fetches for split column tiles.
+                        if cutlass.const_expr(
+                            not self.row_parallel and self.split_accumulator
+                        ):
+                            cute.copy(
+                                tma_atom_b,
+                                tBgB_k,
+                                tBsB_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=b_full_mcast_mask,
+                                cache_policy=b_cache_policy,
+                            )
                         cute.copy(
                             tma_atom_a,
                             tAgA_k,
@@ -1913,14 +1924,17 @@ class FusedTPProjectionKernel:
                             tma_bar_ptr=tma_bar,
                             mcast_mask=a_full_mcast_mask,
                         )
-                        cute.copy(
-                            tma_atom_b,
-                            tBgB_k,
-                            tBsB_pipe,
-                            tma_bar_ptr=tma_bar,
-                            mcast_mask=b_full_mcast_mask,
-                            cache_policy=b_cache_policy,
-                        )
+                        if cutlass.const_expr(
+                            self.row_parallel or not self.split_accumulator
+                        ):
+                            cute.copy(
+                                tma_atom_b,
+                                tBgB_k,
+                                tBsB_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=b_full_mcast_mask,
+                                cache_policy=b_cache_policy,
+                            )
 
                     #
                     # Advance to next tile

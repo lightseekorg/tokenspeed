@@ -289,11 +289,12 @@ the row kernel's accumulator work distribution and shared-memory handoff to
 the output stage, keeping more partial GEMM results in flight. Input packing
 and operand prefetch use the same prepared buckets. Compact shared-memory scale
 storage allows selected TP4 column buckets to prefetch more operands without
-shrinking the scale queue. Column scale loads prefetch several K blocks into
-registers before publishing them to shared memory, overlapping global reads with
-scale consumption. Numerical scaling order and collective ownership are unchanged.
-Column output copies work a tile at a
-time, with each owner's physical row count bounding the valid rows.
+shrinking the scale queue. These TP4 buckets also issue weight loads first to
+reduce operand waits. Column scale loads prefetch several K blocks into registers
+before publishing them to shared memory, overlapping global reads with scale
+consumption. Numerical scaling order and collective ownership are unchanged.
+Column output copies work a tile at a time, with each owner's physical row count
+bounding the valid rows.
 
 Row projection also accepts E4M3 inputs with FP32 scales per 128 channels,
 allowing the preceding RMSNorm/gate operation to quantize once. Fusion forwards
