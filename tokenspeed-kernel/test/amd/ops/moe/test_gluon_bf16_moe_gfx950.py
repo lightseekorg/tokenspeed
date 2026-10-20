@@ -27,12 +27,17 @@ from tokenspeed_kernel.numerics.torch.moe import torch_moe_experts
 from tokenspeed_kernel.ops.moe.native import torch_softmax_topk
 from utils import assert_no_triton_compile, is_cdna4
 
+pytest.importorskip(
+    "tokenspeed_kernel_amd.ops.gfx950.moe.fp16",
+    reason="tokenspeed-kernel-amd is required for Gluon BF16 MoE tests",
+)
+
 requires_cdna4 = pytest.mark.skipif(
     not is_cdna4(), reason="AMD CDNA4 is required for BF16-weight Gluon MoE tests"
 )
 
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import gluon_bf16_moe
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_device import (
+from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import gluon_bf16_moe  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_device import (  # noqa: E402
     moe_align_block_size_device,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_fused import (  # noqa: E402

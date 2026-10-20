@@ -59,9 +59,12 @@ def preprocess_gluon_fp8_packed_gfx950_moe_weights(
         w.w2_weight.copy_(pack_fp8_weight_n16k32(w.w2_weight))
     # The layer owns the one-time preprocessing guard. Reloads retain the
     # checkpoint loader and graph-captured address without a linear bank.
-    w.w13_weight.weight_loader = partial(
-        w.w13_weight.weight_loader, weight_copy=_copy_packed_fp8_shard
-    )
-    w.w2_weight.weight_loader = partial(
-        w.w2_weight.weight_loader, weight_copy=_copy_packed_fp8_shard
-    )
+    # Plain tensors, such as benchmark-generated weights, carry no loader.
+    if hasattr(w.w13_weight, "weight_loader"):
+        w.w13_weight.weight_loader = partial(
+            w.w13_weight.weight_loader, weight_copy=_copy_packed_fp8_shard
+        )
+    if hasattr(w.w2_weight, "weight_loader"):
+        w.w2_weight.weight_loader = partial(
+            w.w2_weight.weight_loader, weight_copy=_copy_packed_fp8_shard
+        )

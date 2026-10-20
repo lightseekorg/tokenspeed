@@ -27,8 +27,17 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import moe_align_device, moe_align_fused
 from utils import is_cdna4
+
+pytest.importorskip(
+    "tokenspeed_kernel_amd.ops.gfx950.moe.fp16",
+    reason="tokenspeed-kernel-amd is required for packed FP8 MoE route tests",
+)
+
+from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import (  # noqa: E402
+    moe_align_device,
+    moe_align_fused,
+)
 
 pytestmark = pytest.mark.skipif(not is_cdna4(), reason="requires AMD gfx950 GPU")
 

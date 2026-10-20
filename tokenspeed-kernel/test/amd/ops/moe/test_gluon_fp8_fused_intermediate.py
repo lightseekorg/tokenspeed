@@ -23,11 +23,17 @@
 import pytest
 import torch
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
-from tokenspeed_kernel_amd._triton import gl, gluon
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.packed_small import (
+from utils import is_cdna4
+
+pytest.importorskip(
+    "tokenspeed_kernel_amd.ops.gfx950.moe.fp8.packed_small",
+    reason="tokenspeed-kernel-amd is required for fused intermediate tests",
+)
+
+from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.packed_small import (  # noqa: E402
     gluon_fp8_packed_small_activation_gfx950,
 )
-from utils import is_cdna4
 
 pytestmark = pytest.mark.skipif(not is_cdna4(), reason="requires AMD gfx950 GPU")
 

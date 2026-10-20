@@ -27,7 +27,13 @@ from types import SimpleNamespace
 import pytest
 import tokenspeed_kernel.ops.moe.gluon as fp8
 import torch
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.weight_preprocess import (
+
+pytest.importorskip(
+    "tokenspeed_kernel_amd.ops.gfx950.moe.fp8.weight_preprocess",
+    reason="tokenspeed-kernel-amd is required for packed FP8 MoE integration tests",
+)
+
+from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.weight_preprocess import (  # noqa: E402
     _copy_packed_fp8_shard,
     pack_fp8_weight_n16k32,
 )
@@ -277,6 +283,29 @@ def test_packed_fp8_reload_rejects_tile_aligned_partial_input_columns() -> None:
     with pytest.raises(ValueError, match="complete local FP8 rows"):
         _copy_packed_fp8_shard(packed[0, :, :32], source)
     assert torch.equal(packed.view(torch.uint8), original)
+
+
+def test_packed_fp8_preprocess_packs_plain_tensor_weights() -> None:
+    # The benchmark harness builds weight modules from plain tensors without
+    # checkpoint loaders; packing must not require a weight_loader hook.
+    w13 = _small_fp8_weight(128).detach()
+    w2 = _small_fp8_weight(64).detach()
+    module = SimpleNamespace(
+        w13_weight=w13,
+        w2_weight=w2,
+        w13_weight_scale_inv=torch.ones(2, 2, 1),
+        w2_weight_scale_inv=torch.ones(2, 1, 1),
+    )
+    original13, original2 = w13.clone(), w2.clone()
+    fp8.gluon_fp8_packed_moe_weights({}, module)
+    assert torch.equal(
+        module.w13_weight.view(torch.uint8),
+        pack_fp8_weight_n16k32(original13).view(torch.uint8),
+    )
+    assert torch.equal(
+        module.w2_weight.view(torch.uint8),
+        pack_fp8_weight_n16k32(original2).view(torch.uint8),
+    )
 
 
 def test_linear_fp8_preprocessor_receives_original_checkpoint_layout(
