@@ -760,6 +760,13 @@ def test_embedding_reads_strided_ids(device, rows, layout, dtype):
     assert actual.is_contiguous()
 
 
+def test_embedding_rejects_noncontiguous_three_dimensional_ids(device):
+    weight, scales = _mxfp8_table(device)
+    ids = torch.zeros((2, 3, 4), device=device, dtype=torch.int64).transpose(0, 1)
+    with pytest.raises(ValueError, match="contiguous or two-dimensional IDs"):
+        mxfp8_embedding(weight, scales, ids, 17, 70)
+
+
 def test_embedding_replays_updated_layer_slice(device):
     weight, scales = _mxfp8_table(device)
     ids = _mxfp8_indices(device, 6, "layer", torch.int64)
