@@ -55,13 +55,22 @@ class MooncakeTransferEngine:
         self.hostname = hostname
         self.gpu_id = gpu_id
         self.ib_device = ib_device
-        # Page-gathered batch WRITE (pages x fields expanded inside Mooncake)
-        # is the only way the CachePD sender moves whole fields, so an engine
-        # without it is a wrong install, not a slower one.
-        if not hasattr(self.engine, "batch_transfer_sync_write_pages"):
+        # Prefer Mooncake's page API when available; older builds expose only
+        # the ordinary batched WRITE API. This is a capability, not a setting.
+        self.page_transfer_mode = (
+            "native"
+            if callable(getattr(self.engine, "batch_transfer_sync_write_pages", None))
+            else "batch"
+        )
+        required_api = (
+            "batch_transfer_sync_write_pages"
+            if self.page_transfer_mode == "native"
+            else "batch_transfer_sync_write"
+        )
+        if not callable(getattr(self.engine, required_api, None)):
             raise RuntimeError(
-                "Mooncake's TransferEngine lacks batch_transfer_sync_write_pages; "
-                "install tokenspeed-mooncake >= 0.3.13.post20260929."
+                f"Mooncake's TransferEngine lacks {required_api} required by "
+                f"page_transfer_mode={self.page_transfer_mode!r}."
             )
 
         self.initialize(
@@ -74,7 +83,8 @@ class MooncakeTransferEngine:
         # (Prefill's "session=..."), so name it once per process here.
         logger.info(
             f"Mooncake transfer engine ready: session_id={self.session_id} "
-            f"gpu_id={self.gpu_id} ib_device={self.ib_device}"
+            f"gpu_id={self.gpu_id} ib_device={self.ib_device} "
+            f"page_transfer_mode={self.page_transfer_mode}"
         )
 
     def register(self, ptr, length):
@@ -189,18 +199,93 @@ class MooncakeTransferEngine:
         """WRITE the pages x fields grid described by ``fields`` (see
         ``PageFieldCopies``) in batches of at most ``max_batch_size``."""
         try:
-            ret = self.engine.batch_transfer_sync_write_pages(
-                session_id, src_pages, dst_pages, fields, max_batch_size
-            )
+            if self.page_transfer_mode == "native":
+                ret = self.engine.batch_transfer_sync_write_pages(
+                    session_id, src_pages, dst_pages, fields, max_batch_size
+                )
+            else:
+                ret = self._batch_transfer_pages(
+                    session_id, src_pages, dst_pages, fields, max_batch_size
+                )
         except Exception:
             logger.exception("Mooncake page-gathered batch transfer raised")
             ret = -1
-        if ret < 0:
+        if ret != 0:
             logger.debug(
-                f"Failed to batch transfer {fields.shape[0]} fields x "
-                f"{src_pages.shape[0]} pages to session {session_id!s}"
+                f"Page transfer failed: session={session_id!s} "
+                f"mode={self.page_transfer_mode} ret={ret}"
             )
         return ret
+
+    def _batch_transfer_pages(
+        self, session_id, src_pages, dst_pages, fields, max_batch_size
+    ) -> int:
+        """Expand metadata only; device payloads remain direct WRITE sources.
+
+        Validate the entire grid before submission, without materializing it.
+        A failed batch may still have writes in flight: stop, never retry it
+        here, and let the receiver apply the transfer-failure lifetime policy.
+        """
+        if type(max_batch_size) is not int or max_batch_size <= 0:
+            raise ValueError("max_batch_size must be a positive integer")
+        for pages in (src_pages, dst_pages):
+            if (
+                not isinstance(pages, np.ndarray)
+                or pages.ndim != 1
+                or pages.dtype != np.int64
+                or not pages.flags.c_contiguous
+            ):
+                raise TypeError("page IDs must be contiguous 1-D int64 arrays")
+            if np.any(pages < 0):
+                raise ValueError("page IDs must be nonnegative")
+        if src_pages.shape != dst_pages.shape:
+            raise ValueError("source and destination page counts differ")
+        if (
+            not isinstance(fields, np.ndarray)
+            or fields.ndim != 2
+            or fields.shape[1] != 5
+            or fields.dtype != np.int64
+            or not fields.flags.c_contiguous
+        ):
+            raise TypeError("fields must be a contiguous int64 [F, 5] array")
+        src_max = int(src_pages.max()) if src_pages.size else 0
+        dst_max = int(dst_pages.max()) if dst_pages.size else 0
+        max_address = int(np.iinfo(np.uintp).max)
+        for row in fields:
+            src_base, src_stride, dst_base, dst_stride, length = map(int, row)
+            if min(src_base, dst_base, length) <= 0 or min(src_stride, dst_stride) < 0:
+                raise ValueError(
+                    "bases/length must be positive and strides nonnegative"
+                )
+            if (
+                src_base + src_max * src_stride + length - 1 > max_address
+                or dst_base + dst_max * dst_stride + length - 1 > max_address
+            ):
+                raise OverflowError("page transfer address exceeds uintptr_t")
+
+        sources: list[int] = []
+        destinations: list[int] = []
+        lengths: list[int] = []
+        for row in fields:
+            src_base, src_stride, dst_base, dst_stride, length = map(int, row)
+            for i in range(src_pages.size):
+                sources.append(src_base + int(src_pages[i]) * src_stride)
+                destinations.append(dst_base + int(dst_pages[i]) * dst_stride)
+                lengths.append(length)
+                if len(sources) == max_batch_size:
+                    ret = self.engine.batch_transfer_sync_write(
+                        session_id, sources, destinations, lengths
+                    )
+                    if ret != 0:
+                        return ret
+                    sources.clear()
+                    destinations.clear()
+                    lengths.clear()
+        if sources:
+            return self.engine.batch_transfer_sync_write(
+                session_id, sources, destinations, lengths
+            )
+        return 0
 
     def transfer_submit_write(
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int
