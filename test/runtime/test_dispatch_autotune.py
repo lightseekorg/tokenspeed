@@ -757,6 +757,7 @@ def _situ_plan(routing_mode):
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
         with_bias=False,
         process_group=None,
         deepep_mode=None,

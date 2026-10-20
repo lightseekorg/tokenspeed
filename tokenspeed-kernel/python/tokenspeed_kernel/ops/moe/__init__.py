@@ -1496,7 +1496,7 @@ def moe_plan(
     persistent_max_num_tokens_per_gpu: int | None = None,
     fast_math: bool,
     combine_order: str,
-    features: frozenset[str] = frozenset(),
+    features: frozenset[str],
     solution: str | None = None,
     fp32_correction_bias: bool = False,
 ) -> dict:
@@ -1569,7 +1569,10 @@ def moe_plan(
             the caller must not reduce; it needs a kernel declaring the
             ``combine_order`` trait with ``"slot"`` and, for ``ep_size > 1``,
             the EP process group. Required keyword.
-        features: Required registered capabilities, e.g. batch_invariant.
+        features: Registered capabilities the apply kernel must declare, e.g.
+            ``frozenset({"batch_invariant"})``, which plans the kernel once
+            from static geometry (``KernelPlan``); empty for ordinary
+            selection. Required keyword.
         solution: Optional kernel solution to force through normal selection.
             None leaves the concrete kernel choice to the registry.
         fp32_correction_bias: Whether routing must add the DeepSeekV3

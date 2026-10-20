@@ -124,6 +124,7 @@ def test_triton_bf16_moe_matches_torch(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     if precision_policy != "default":
         plan["precision_policy"] = precision_policy

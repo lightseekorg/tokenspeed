@@ -293,6 +293,7 @@ def test_unbuildable_private_module_keeps_trtllm_at_128(
             internal_activation_dtype="input",
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
             **kwargs,
         )["solution"]
 
@@ -415,6 +416,7 @@ def test_trtllm_unquant_admits_gated_sizes_the_launcher_accepts(
             internal_activation_dtype="input",
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
         )
     finally:
         Platform.override(real_platform)
@@ -516,6 +518,7 @@ def test_64_aligned_outputs_match_128_padded(
             solution="flashinfer_trtllm",
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
         )
         # Zero-pad each half of w13 and the columns of w2 like the loader.
         pad = torch.zeros(num_experts, ispp - inter, hidden, device="cuda")
@@ -827,6 +830,7 @@ def _plan(platform, weight_dtype, routing_mode=None, **kwargs):
             internal_activation_dtype="input",
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
             **kwargs,
         )
     finally:
@@ -1074,6 +1078,7 @@ def test_fp32_bias_plan_routes_like_precomputed_fp32_topk(
             solution="flashinfer_trtllm",
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
             **kwargs,
         )
 

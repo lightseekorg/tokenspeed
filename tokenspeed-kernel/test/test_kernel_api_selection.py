@@ -2960,6 +2960,7 @@ def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
         )
     finally:
         Platform.override(real_platform)
@@ -3002,6 +3003,7 @@ def test_nvfp4_deepep_rejects_modes_without_normal_legs(
                 expert_id_repeats=False,
                 fast_math=True,
                 combine_order="rank",
+                features=frozenset(),
             )
     finally:
         Platform.override(real_platform)
@@ -3033,6 +3035,7 @@ def test_moe_plan_rejects_persistent_workspace_for_ordinary_kernel(
                 expert_id_repeats=False,
                 fast_math=True,
                 combine_order="rank",
+                features=frozenset(),
             )
     finally:
         Platform.override(real_platform)
@@ -3088,6 +3091,7 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
         )
     finally:
         Platform.override(real_platform)
@@ -3113,6 +3117,7 @@ def test_moe_plan_defaults_deepep_mode_to_auto() -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     assert plan["deepep_mode"] == "auto"
     assert plan["deepep_low_latency_max_num_tokens_per_gpu"] is None
@@ -3144,6 +3149,7 @@ def test_moe_plan_rejects_invalid_deepep_mode(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
         )
 
 
@@ -3456,6 +3462,7 @@ def test_gfx950_dynamic_mxfp4_moe_selects_gluon_a4w4(
             expert_id_repeats=False,
             fast_math=False,
             combine_order="rank",
+            features=frozenset(),
         )
         return kernel_moe_plan("mxfp4", **{**kwargs, **overrides})
 
@@ -3567,6 +3574,7 @@ def _moe_fp8_channel_plan(platform: PlatformInfo, **overrides) -> dict:
         expert_id_repeats=False,
         fast_math=False,
         combine_order="rank",
+        features=frozenset(),
     )
     kwargs.update(overrides)
     registry = KernelRegistry.get()
@@ -3862,6 +3870,7 @@ def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
         )
     finally:
         Platform.override(real_platform)
@@ -3899,6 +3908,7 @@ def test_triton_mxfp4_supports_input_activation_dtype(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
         )
         assert plan["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
     finally:
@@ -3962,6 +3972,7 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
         )
     finally:
         Platform.override(real_platform)
@@ -4008,6 +4019,7 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
         )
     finally:
         Platform.override(real_platform)
@@ -4047,6 +4059,7 @@ def test_gluon_mxfp4_a4w4_deferred_ep4_traits_select_matching_kernel(
             expert_id_repeats=False,
             fast_math=False,
             combine_order="rank",
+            features=frozenset(),
         )
     finally:
         Platform.override(real_platform)
@@ -4083,6 +4096,7 @@ def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
         )
     finally:
         Platform.override(real_platform)
@@ -4175,6 +4189,7 @@ def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
         )
     finally:
         Platform.override(real_platform)
@@ -4214,6 +4229,7 @@ def test_dsv41_mxfp4_swiglu_tp_selection_on_cdna5(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
         )
     finally:
         Platform.override(real_platform)
@@ -4475,6 +4491,7 @@ def _moe_apply_unquant_trtllm() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -4537,6 +4554,7 @@ def _moe_apply_unquant_cutlass() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -4563,6 +4581,7 @@ def _moe_apply_fp8_cutlass() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -4605,6 +4624,7 @@ def _moe_apply_mxfp4_plan(
         solution=solution,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
 
 
@@ -4829,6 +4849,7 @@ def _moe_apply_fp8_trtllm() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -4855,6 +4876,7 @@ def _moe_apply_nvfp4_trtllm() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -4887,6 +4909,7 @@ def _moe_apply_nvfp4_cutlass() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -4914,6 +4937,7 @@ def _moe_apply_nvfp4_trtllm_routed() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -4953,6 +4977,7 @@ def _moe_apply_nvfp4_trtllm_unconstrained_routing() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -4981,6 +5006,7 @@ def _moe_apply_unquant_trtllm_routed() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -5020,6 +5046,7 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -5050,6 +5077,7 @@ def _moe_apply_fp8_deepep_deep_gemm() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -5086,6 +5114,7 @@ def _moe_apply_mxfp4_trtllm() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -5113,6 +5142,7 @@ def _moe_apply_mxfp4_triton() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -5148,6 +5178,7 @@ def _moe_apply_fp8_block(ispp: int, apply: str, preprocessor: str | None) -> obj
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(plan, apply=apply, preprocessor=preprocessor)
     x = torch.empty((4, 16), dtype=torch.bfloat16)
@@ -5180,6 +5211,7 @@ def _moe_apply_unquant_triton() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -5214,6 +5246,7 @@ def _moe_apply_mxfp4_gluon() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -5239,6 +5272,7 @@ def _moe_apply_mxint4_trtllm() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -5264,6 +5298,7 @@ def _moe_apply_mxfp4_dynamic_tp() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     _assert_moe_plan(
         plan,
@@ -7109,6 +7144,7 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
         )
 
         assert plan["apply_kernel_name"] == ("flashinfer_trtllm_fp8_routed_moe_apply")

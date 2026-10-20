@@ -83,6 +83,7 @@ def test_triton_mxfp4_moe_matches_torch(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     plan["precision_policy"] = "default"
     plan["output_scale"] = 1.0
@@ -185,6 +186,7 @@ def test_triton_mxfp4_moe_defers_local_ep_routes() -> None:
         persistent_max_num_tokens_per_gpu=None,
         fast_math=False,
         combine_order="rank",
+        features=frozenset(),
         solution="triton",
     )
     assert plan["supports_deferred_finalize"] is True
