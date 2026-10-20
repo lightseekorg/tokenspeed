@@ -21,7 +21,11 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.residual.triton import _mhc_mixes_impl, _mhc_pre_impl
+from tokenspeed_kernel.ops.residual.triton import (
+    _mhc_mixes_impl,
+    _mhc_pre_impl,
+    mhc_pre_mix_hc4,
+)
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -120,4 +124,5 @@ if platform.is_hopper_plus:
             hc_eps,
             sinkhorn_iters,
             tf32_hc_prenorm_gemm,
+            mhc_pre_mix_hc4,
         )

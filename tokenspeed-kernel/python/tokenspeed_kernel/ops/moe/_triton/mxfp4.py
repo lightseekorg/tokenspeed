@@ -914,7 +914,7 @@ def _moe(
     )
     if not do_finalize:
         return route_output, None, expanded_idx
-    _combine(route_output, topk_weights, output)
+    _combine(route_output, topk_weights, output, None, 0)
     return output
 
 
