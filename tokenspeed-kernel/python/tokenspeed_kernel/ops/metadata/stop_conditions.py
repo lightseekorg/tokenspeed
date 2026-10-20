@@ -33,6 +33,14 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 __all__ = ["apply_stop_conditions"]
 
@@ -63,8 +71,6 @@ def _apply_stop_conditions_kernel(
     row_mask = rows < batch_size
     slots = tl.load(req_pool_indices_ptr + rows, mask=row_mask, other=padding_index)
     live = row_mask & (slots != padding_index)
-    # Keep inactive gather addresses in bounds as well as masking their values.
-    slots = tl.where(live, slots, 0)
     is_extend = rows < num_extends
     valid = tl.load(valid_cache_lengths_ptr + slots, mask=live, other=0)
     limits = tl.load(token_limits_ptr + slots, mask=live, other=0)
@@ -80,9 +86,8 @@ def _apply_stop_conditions_kernel(
     )
     has_output = live & (~is_extend | (rows < num_prefill_outputs))
     token_mask = has_output[:, None] & (columns[None, :] < width[:, None])
-    token_offsets = tl.where(token_mask, first_token[:, None] + columns[None, :], 0)
     tokens = tl.load(
-        output_tokens_ptr + token_offsets,
+        output_tokens_ptr + first_token[:, None] + columns[None, :],
         mask=token_mask,
         other=-1,
     )
@@ -304,6 +309,54 @@ def apply_stop_conditions(
         )
         return
 
+    kernel = select_kernel(
+        "metadata",
+        "apply_stop_conditions",
+        format_signature(req_pool_indices=dense_tensor_format(req_pool_indices.dtype)),
+    )
+    kernel(
+        req_pool_indices,
+        output_tokens,
+        accept_lengths,
+        input_lengths,
+        prompt_lengths,
+        valid_cache_lengths,
+        stop_token_ids,
+        token_limits,
+        stopped,
+        num_extends,
+        num_prefill_outputs,
+        decode_width,
+        padding_index,
+    )
+
+
+@register_kernel(
+    "metadata",
+    "apply_stop_conditions",
+    name="triton_apply_stop_conditions",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=format_signatures("req_pool_indices", "dense", {torch.int64}),
+    priority=Priority.PORTABLE,
+)
+def triton_apply_stop_conditions(
+    req_pool_indices,
+    output_tokens,
+    accept_lengths,
+    input_lengths,
+    prompt_lengths,
+    valid_cache_lengths,
+    stop_token_ids,
+    token_limits,
+    stopped,
+    num_extends,
+    num_prefill_outputs,
+    decode_width,
+    padding_index,
+) -> None:
+    """Launch the GPU stop-condition update after public input validation."""
+    batch_size = req_pool_indices.shape[0]
     _apply_stop_conditions_kernel[(triton.cdiv(batch_size, _BLOCK),)](
         req_pool_indices,
         # An unfinished prefill batch can owe no sample. Keep a valid pointer

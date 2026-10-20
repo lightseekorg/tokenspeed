@@ -51,8 +51,8 @@ def _pack_argmax_key_kernel(
         tl.float32
     )
     bits = value.to(tl.int32, bitcast=True)
-    # Canonicalize both zero signs in integer bits before ordering the keys.
-    bits = tl.where((bits & 0x7FFFFFFF) == 0, 0, bits)
+    # Canonicalize signed zero explicitly: compilers may fold away x + 0.0.
+    bits = tl.where(value == 0.0, 0, bits)
     # Flip the magnitude bits of negatives so int32 order matches float order.
     ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
     # A local argmax that picks NaN ranks it above every number, as

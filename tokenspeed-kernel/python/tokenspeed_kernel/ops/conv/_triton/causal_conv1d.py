@@ -245,13 +245,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
                 VAL = state_len - seqlen
 
-                # Keep inactive lanes within this sequence's allocation as
-                # well as masking their values below.
-                safe_tokens = tl.minimum(
-                    tl.maximum(idx_tokens_conv - VAL, 0), seqlen - 1
-                )
                 x_ptrs = (
-                    x_base[None, :] + (safe_tokens * stride_x_token)[:, None]
+                    x_base[None, :]
+                    + ((idx_tokens_conv - VAL) * stride_x_token)[:, None]
                 )  # [BLOCK_M, BLOCK_N]
 
                 mask_x = (
@@ -280,12 +276,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
                 VAL = state_len - seqlen
 
-                # Preserve the value mask below while bounding masked addresses.
-                safe_tokens = tl.minimum(
-                    tl.maximum(idx_tokens_conv - VAL, 0), seqlen - 1
-                )
                 x_ptrs = (
-                    x_base[None, :] + (safe_tokens * stride_x_token)[:, None]
+                    x_base[None, :]
+                    + ((idx_tokens_conv - VAL) * stride_x_token)[:, None]
                 )  # [BLOCK_M, BLOCK_N]
 
                 mask_x = (
