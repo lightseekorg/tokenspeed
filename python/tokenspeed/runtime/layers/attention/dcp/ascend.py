@@ -40,7 +40,7 @@ class AscendDCPContext:
         degree: int,
         rank: int,
         ranks: tuple[int, ...],
-        auxiliary_namespace: str,
+        auxiliary_namespace: str | None,
     ):
         if degree < 1 or len(ranks) != degree or len(set(ranks)) != degree:
             raise ValueError("invalid DCP group")
@@ -57,6 +57,8 @@ class AscendDCPContext:
             # Import the manager used by the host, without imposing runtime
             # imports on the standalone address/reference tests.
             self.primary_process_group = pg_manager.get_device_process_group(ranks)
+            if auxiliary_namespace is None:
+                return
             self.auxiliary_process_group = pg_manager.get_dedicated_device_group(
                 ranks, auxiliary_namespace
             )

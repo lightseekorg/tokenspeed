@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from tokenspeed.runtime.metrics.collector import KVTransferMetrics
+from tokenspeed.runtime.metrics.service import metrics_service
 from tokenspeed.runtime.pd.base.bootstrap import DisaggBootstrapServerBase
 from tokenspeed.runtime.pd.base.manager import DisaggManagerBase
 from tokenspeed.runtime.pd.base.mooncake_engine import (
@@ -58,9 +59,9 @@ class MooncakeKVManagerBase(DisaggManagerBase):
                 "model_name": args.served_model_name,
                 "app_key": args.app_key or "",
             },
-            enabled=(
-                args.enable_metrics and "prometheus" in (args.metrics_reporters or [])
-            ),
+            enabled=args.enable_metrics,
+            reporters=args.metrics_reporters,
+            event_sink=metrics_service.get_event_sink(),
         )
 
         # Build the Mooncake data-plane engine here and inject it into the
@@ -73,13 +74,49 @@ class MooncakeKVManagerBase(DisaggManagerBase):
         )
         super().__init__(engine=engine)
 
-    def register_buffer_to_engine(self):
+    def _registration_regions(self) -> tuple[tuple[int, int], ...]:
         layout = self.kv_args.cache_layout
-        regions = self.kv_args.registration_regions or (
+        return self.kv_args.registration_regions or (
             (self.kv_args.kv_data_ptr, layout.plan.arena_bytes),
         )
-        for pointer, size in regions:
+
+    def register_buffer_to_engine(self):
+        for pointer, size in self._registration_regions():
             self.engine.register(pointer, size)
+
+    def deregister_buffer_from_engine(self) -> None:
+        """Deregister the cache arena before a sleep release unmaps it.
+
+        A registration pins the physical pages under the arena's virtual
+        range; the memory saver frees exactly those pages.
+        """
+        failed = [
+            pointer
+            for pointer, _ in self._registration_regions()
+            if self.engine.deregister(pointer) != 0
+        ]
+        if failed:
+            raise RuntimeError(
+                f"Mooncake failed to deregister {len(failed)} cache region(s) "
+                "before the memory release"
+            )
+
+    def restore_buffer_registration(self) -> None:
+        """Register the cache arena again after a wake re-maps it.
+
+        The virtual range is unchanged, so every published address stays
+        valid; only the new physical pages need registering.
+        """
+        failed = [
+            pointer
+            for pointer, size in self._registration_regions()
+            if self.engine.register(pointer, size) != 0
+        ]
+        if failed:
+            raise RuntimeError(
+                f"Mooncake failed to register {len(failed)} cache region(s) "
+                "after the memory resume"
+            )
 
 
 class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):

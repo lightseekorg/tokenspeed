@@ -12,6 +12,7 @@
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
 
+import os
 import sys
 
 import pytest
@@ -20,6 +21,11 @@ from torch import nn
 
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.weights.mxfp4 import create_mxfp4_weight_pair
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 
 class TestDeepseekV4MegaMoE:

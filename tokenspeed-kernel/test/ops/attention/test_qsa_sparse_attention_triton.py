@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.qsa import (
+    torch_qsa_selected_attention,
+)
 from tokenspeed_kernel.ops.attention.qsa.triton import (
     _triton_qsa_sparse_attention_kernel,
     _triton_qsa_sparse_attention_merge_kernel,
@@ -37,22 +40,9 @@ _WIDTH = 2051
 
 
 def _reference(q, k_cache, v_cache, selected_slots, scale):
-    output = torch.zeros(
-        (q.shape[0], q.shape[1], v_cache.shape[-1]),
-        dtype=torch.float32,
-        device=q.device,
+    return torch_qsa_selected_attention(
+        q, k_cache, v_cache, selected_slots, scale, 1.0, 1.0
     )
-    group = q.shape[1] // k_cache.shape[1]
-    for row in range(q.shape[0]):
-        slots = selected_slots[row][selected_slots[row] > 0].long()
-        if slots.numel() == 0:
-            continue
-        for head in range(q.shape[1]):
-            keys = k_cache[slots, head // group].float()
-            values = v_cache[slots, head // group].float()
-            scores = q[row, head].float() @ keys.T
-            output[row, head] = torch.softmax(scores * scale, dim=-1) @ values
-    return output.to(q.dtype)
 
 
 def _inputs(rows, num_heads, num_kv_heads, cache_dtype, seed=0):

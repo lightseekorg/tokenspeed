@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import bisect
 import gc
-import queue
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager
 from typing import TYPE_CHECKING
@@ -64,6 +63,7 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.drafter.base import BaseDrafter
@@ -122,8 +122,8 @@ def get_batch_sizes_to_capture(config: ModelExecutorConfig):
         capture_bs = list(sorted(set(capture_bs + [max_bs - 1] + [max_bs])))
 
     effective_max = min(config.max_cudagraph_capture_size, max_bs)
-    capture_bs = [bs for bs in capture_bs if 0 < bs <= effective_max]
-    return capture_bs
+    # Ascending and unique: padding bisects the ladder for a batch's graph.
+    return sorted({bs for bs in capture_bs if 0 < bs <= effective_max})
 
 
 global_graph_memory_pool = None
@@ -224,6 +224,11 @@ class ForwardStepRunner:
         self.enable_cudagraph_gc = config.enable_cudagraph_gc
         self.device = config.device
         self.device_module = torch.get_device_module(self.device)
+        # Decode graphs capture into the memory saver's ``cuda_graph`` region
+        # so a sleep release can free their pool (a no-op adapter otherwise).
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=config.enable_memory_saver
+        )
         self.gpu_id = config.gpu_id
         self.global_rank = config.global_rank
         # Physical extent: capture tables must cover the spec-verify overshoot
@@ -555,6 +560,7 @@ class ForwardStepRunner:
             # symm-mem -> NaN draft logits -> accept_rate 0. Set the matching
             # uniform dummy.
             ctx.global_bs = [bs] * self.world_size
+            ctx.global_num_decodes = [bs] * self.world_size
 
         # The sampler has a single pool-indexed route: greedy requests are
         # served by top_k=1 in the pool buffers, so capture and every replay
@@ -594,9 +600,8 @@ class ForwardStepRunner:
         )
 
         def run_once():
-            # Dummy add_batch keeps the grammar queue 1:1 with replays —
-            # fetch_batch pops once per forward, so warmup + capture
-            # would otherwise raise queue.Empty.
+            # Dummy add_batch keeps the grammar gate 1:1 with replays: the
+            # hostfunc pops one decision per forward.
             if self.capturable_grammar is not None:
                 self.capturable_grammar.add_batch(
                     grammars=[None] * bs,
@@ -648,14 +653,25 @@ class ForwardStepRunner:
         global _is_capture_mode
         _is_capture_mode = True
         global global_graph_memory_pool
-        graph_kwargs = {"auto_dispatch_capture": True} if self.device == "npu" else {}
+        if self.device == "npu":
+            graph_capture = self.device_module.graph(
+                graph,
+                pool=global_graph_memory_pool,
+                stream=self.stream,
+                auto_dispatch_capture=True,
+            )
+        else:
+            # Only the graph's private pool joins the ``cuda_graph`` region:
+            # capture_session's pre-zeroed kernel state is allocated before
+            # the capture starts and stays resident across a release.
+            graph_capture = self.memory_saver_adapter.cuda_graph(
+                graph,
+                pool=global_graph_memory_pool,
+                stream=self.stream,
+                tag="cuda_graph",
+            )
         # The kernel state captured launches need lives as long as the graph.
-        with observer, capture_session(graph), self.device_module.graph(
-            graph,
-            pool=global_graph_memory_pool,
-            stream=self.stream,
-            **graph_kwargs,
-        ):
+        with observer, capture_session(graph), graph_capture:
             out = run_once()
 
         self.device_module.synchronize()
@@ -663,16 +679,8 @@ class ForwardStepRunner:
         _is_capture_mode = False
         _is_cuda_graph_phase = False
 
-        # Graph capture records the hostfunc launches without invoking
-        # them, so the dummy run_once pushed stays queued — drain it, and
-        # reset prev_batch/current_batch so the first real replay's build
-        # doesn't advance the matcher from a stale warmup entry.
+        # Drop the capture's unconsumed gate decision; the first replay would pop it.
         if self.capturable_grammar is not None:
-            while True:
-                try:
-                    self.capturable_grammar.queue.get_nowait()
-                except queue.Empty:
-                    break
             self.capturable_grammar.reset_state()
 
         global_graph_memory_pool = graph.pool()
@@ -730,6 +738,7 @@ class ForwardStepRunner:
                         bs * self.max_tokens_per_req
                     ] * self.world_size
                     ctx.global_bs = [bs] * self.world_size
+                    ctx.global_num_decodes = [bs] * self.world_size
 
                 sampling_info = SamplingBatchInfo(
                     req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],

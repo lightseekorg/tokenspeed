@@ -64,7 +64,11 @@ NUM_PREEMPTIONS = "tokenspeed:num_preemptions_total"
 def _make_metrics():
     registry = CollectorRegistry()
     metrics = RequestMetrics(
-        LABELS, enabled=True, max_model_len=MAX_MODEL_LEN, registry=registry
+        LABELS,
+        enabled=True,
+        max_model_len=MAX_MODEL_LEN,
+        reporters=["prometheus"],
+        registry=registry,
     )
     return metrics, registry
 
@@ -88,7 +92,11 @@ DECODE_TPOT = "tokenspeed:decode_time_per_output_token_seconds"
 def test_batched_inter_token_latency_matches_per_token_observe():
     registry = CollectorRegistry()
     metrics = RequestMetrics(
-        LABELS, enabled=True, max_model_len=MAX_MODEL_LEN, registry=registry
+        LABELS,
+        enabled=True,
+        max_model_len=MAX_MODEL_LEN,
+        reporters=["prometheus"],
+        registry=registry,
     )
     metrics.observe_inter_token_latency(0.030, 3)  # 0.010/token
     metrics.observe_inter_token_latency(0.400, 4)  # 0.100/token
@@ -255,7 +263,9 @@ def test_request_token_histograms_bucket_grid():
 
 def test_engine_preemptions_counter():
     registry = CollectorRegistry()
-    metrics = EngineMetrics(LABELS, enabled=True, registry=registry)
+    metrics = EngineMetrics(
+        LABELS, enabled=True, reporters=["prometheus"], registry=registry
+    )
 
     metrics.record_preemptions(0)
     assert registry.get_sample_value(NUM_PREEMPTIONS, LABELS) is None
@@ -267,7 +277,11 @@ def test_engine_preemptions_counter():
 def test_decode_time_per_output_token_recording():
     registry = CollectorRegistry()
     metrics = RequestMetrics(
-        LABELS, enabled=True, max_model_len=MAX_MODEL_LEN, registry=registry
+        LABELS,
+        enabled=True,
+        max_model_len=MAX_MODEL_LEN,
+        reporters=["prometheus"],
+        registry=registry,
     )
     metrics.observe_decode_time_per_output_token(0.010)
     metrics.observe_decode_time_per_output_token(0.030)
@@ -284,7 +298,11 @@ def test_decode_time_per_output_token_recording():
 def test_observe_inter_token_latency_rejects_nonpositive_token_counts():
     registry = CollectorRegistry()
     metrics = RequestMetrics(
-        LABELS, enabled=True, max_model_len=MAX_MODEL_LEN, registry=registry
+        LABELS,
+        enabled=True,
+        max_model_len=MAX_MODEL_LEN,
+        reporters=["prometheus"],
+        registry=registry,
     )
     for observe in (
         metrics.observe_inter_token_latency,

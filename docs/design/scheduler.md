@@ -81,7 +81,7 @@ cached position has none, so the runtime admits it with the bound set to `s`
 and the positions `>= s` are recomputed as ordinary prefill input whatever the
 cache holds. The bound limits the probe itself, not a later trim, so excluded
 hit pages are never claimed and the recomputed suffix lands on private pages.
-Only a `Submitted` prompt is probed: a retracted request is never re-probed,
+Only a `Submitted` prompt is probed: a retracted request is never re-probed;
 it comes back by restoring its image (§4), so no position whose logits were
 produced is ever matched against another request's pages or recomputed. The
 decode role of a disaggregated deployment never computes prompt rows (the
@@ -119,8 +119,8 @@ It picks the rule by the group's kind, never by call site:
 
 - *Full-history* groups hold the decode slot — the chunk that
   completes the prompt reserves `decode_input_tokens`, so the first decode step
-  is guaranteed a slot; intermediate chunks reserve nothing, they are not about
-  to decode — raised on a decoding role's first chunk to the rest of the prompt
+  is guaranteed a slot; intermediate chunks reserve nothing because they are
+  not about to decode — raised on a decoding role's first chunk to the rest of the prompt
   plus the admission headroom (§4), so a partially prefetched request is never
   stranded.
 - *Sliding-window* groups recycle slid-out pages, so they hold the decode
@@ -435,8 +435,10 @@ blocks are still in its table. A tail is at most `P − 1` tokens, so that is
 copy); a sliding group caps it at its lookback. The charge is what lets a
 pool sized for a request fund its copy-in; when a pool cannot (several
 retraction-exempt requests reaching their first decode together, each
-needing a copy), the owner publishes nothing at that point instead of
-waiting (§1).
+needing a copy, or a sharded group whose copy's bucket is full while other
+buckets have holes — the charge is bucket-blind), the owner publishes
+nothing at that point instead of waiting (§1), and a hitter's admission
+waits.
 
 Speculative decode admission grows from the committed token frontier plus the verify
 spans still in flight, the span being scheduled and the next span, which the
@@ -684,7 +686,7 @@ phases.
 
 The P role never retracts: `buildPrefillWorkerPlan` does not call
 `maybeRetractForCapacity` (the only two call sites are the D and fused
-grammars). See 3.1 for why.
+grammars). See §3.1 for why.
 
 ## 3. Per role: explicit phases
 
@@ -964,7 +966,7 @@ before `CompleteSnapshotRestore` republishes its L2-tier destinations — the
 victim's pages left the Device when they were granted away, so their
 descriptors are typically gone by the time the restore lands.
 
-**A readmission that does not fit, waits.** Its failed restore never
+**A readmission that does not fit waits.** Its failed restore never
 triggers retraction (it is never recorded as the capacity blocker): when the
 restore needs a victim, the two do not fit together, and swapping
 them — two images and two restores per swap — is pure thrash. The resident
@@ -1001,7 +1003,7 @@ victim policy and it **cannot be retracted again**, and is not aborted either
 (§2): it needs no further page, so it finishes on its own reserve and frees
 its pages then — except where a sliding-window group's growth outruns that
 reserve (§1), which the empty-round retraction covers (§2). This is a
-per-request adaptive backoff: it penalises only the
+per-request adaptive backoff: it penalizes only the
 request whose admission proved over-optimistic, and never makes anyone else
 wait. The constant is a thrash bound only; no liveness argument rests on it.
 
@@ -1032,7 +1034,7 @@ snapshot-pool leg (always, with `--disable-kvstore`) is indexed nowhere and
 visible through no pin, hence the explicit count. A flush is likewise refused
 while any image copy is in flight (`HasAnyInFlight` includes the snapshot
 ops). The pause drain counts suspended requests as waiting, so a correct
-runtime never hits either refusal; they are defence in depth.
+runtime never hits either refusal; they are defense in depth.
 `SnapshotPoolFreeBlocks()` and `HostPoolPinnedBlocks()` are the leak checks:
 with no request suspended both must read empty and zero.
 

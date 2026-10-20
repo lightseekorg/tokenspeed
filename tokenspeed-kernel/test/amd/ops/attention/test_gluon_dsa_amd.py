@@ -1,4 +1,22 @@
 # Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 from __future__ import annotations
 
@@ -8,6 +26,11 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsa import (
+    torch_dsa_paged_index_topk,
+    torch_dsa_sparse_attention,
+    torch_dsa_workspace_index_topk,
+)
 from utils import is_cdna4, is_cdna5
 
 if not (is_cdna4() or is_cdna5()):
@@ -495,106 +518,6 @@ def _make_prefill_workspace(
     )
 
 
-def _index_scores(
-    q: torch.Tensor,
-    weights: torch.Tensor,
-    index_k: torch.Tensor,
-    softmax_scale: float,
-) -> torch.Tensor:
-    per_head = index_k.float() @ q.float().transpose(0, 1)
-    return (per_head.relu() * weights.float()).sum(dim=1) * softmax_scale
-
-
-def _reference_decode_topk(
-    q: torch.Tensor,
-    weights: torch.Tensor,
-    index_k: torch.Tensor,
-    seq_lens: torch.Tensor,
-    block_table: torch.Tensor,
-    *,
-    page_size: int,
-    topk: int,
-    softmax_scale: float,
-    q_len_per_req: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
-    out = torch.full((q.shape[0], topk), -1, device=q.device, dtype=torch.int32)
-    lens = torch.empty((q.shape[0],), device=q.device, dtype=torch.int32)
-    candidate_ids_and_scores: list[tuple[torch.Tensor, torch.Tensor]] = []
-    for token in range(q.shape[0]):
-        req = token // int(q_len_per_req)
-        q_offset = token - req * int(q_len_per_req)
-        seq_len = int(seq_lens[req].item())
-        if q_len_per_req != 1:
-            seq_len = seq_len - (int(q_len_per_req) - 1) + q_offset
-        count = min(seq_len, int(topk))
-        lens[token] = count
-        if count == 0:
-            candidate_ids_and_scores.append(
-                (
-                    torch.empty((0,), device=q.device, dtype=torch.long),
-                    torch.empty((0,), device=q.device, dtype=torch.float32),
-                )
-            )
-            continue
-        offsets = torch.arange(seq_len, device=q.device, dtype=torch.long)
-        pages = block_table[req].long().index_select(0, offsets // page_size)
-        slots = pages * int(page_size) + offsets.remainder(page_size)
-        scores = _index_scores(
-            q[token],
-            weights[token],
-            index_k.index_select(0, slots),
-            softmax_scale,
-        )
-        selected = torch.topk(scores, count).indices
-        out[token, :count] = slots.index_select(0, selected).to(torch.int32)
-        candidate_ids_and_scores.append((slots, scores))
-    return out, lens, candidate_ids_and_scores
-
-
-def _reference_prefill_topk(
-    q: torch.Tensor,
-    weights: torch.Tensor,
-    index_k: torch.Tensor,
-    kv_workspace_slots: torch.Tensor,
-    row_starts: torch.Tensor,
-    row_ends: torch.Tensor,
-    *,
-    topk: int,
-    softmax_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
-    out = torch.full((q.shape[0], topk), -1, device=q.device, dtype=torch.int32)
-    candidate_lens = (row_ends - row_starts).clamp_min(0)
-    lens = torch.minimum(candidate_lens, torch.full_like(candidate_lens, int(topk)))
-    candidate_ids_and_scores: list[tuple[torch.Tensor, torch.Tensor]] = []
-    for token in range(q.shape[0]):
-        count = int(lens[token].item())
-        if count == 0:
-            candidate_ids_and_scores.append(
-                (
-                    torch.empty((0,), device=q.device, dtype=torch.long),
-                    torch.empty((0,), device=q.device, dtype=torch.float32),
-                )
-            )
-            continue
-        rows = torch.arange(
-            int(row_starts[token].item()),
-            int(row_ends[token].item()),
-            device=q.device,
-            dtype=torch.long,
-        )
-        slots = kv_workspace_slots.index_select(0, rows).long()
-        scores = _index_scores(
-            q[token],
-            weights[token],
-            index_k.index_select(0, slots),
-            softmax_scale,
-        )
-        selected = torch.topk(scores, count).indices
-        out[token, :count] = rows.index_select(0, selected).to(torch.int32)
-        candidate_ids_and_scores.append((rows, scores))
-    return out, lens, candidate_ids_and_scores
-
-
 def _assert_topk_matches(
     actual: torch.Tensor,
     actual_lens: torch.Tensor,
@@ -673,16 +596,18 @@ def test_dsa_decode_topk_fp8_glm52_cases(case: _TopKDecodeCase) -> None:
         q_len_per_req=case.q_len_per_req,
         index_k_cache=packed_index_k,
     )
-    expected_slots, expected_lens, candidate_ids_and_scores = _reference_decode_topk(
-        q,
-        weights,
-        index_k,
-        seq_lens,
-        block_table,
-        page_size=page_size,
-        topk=case.topk,
-        softmax_scale=softmax_scale,
-        q_len_per_req=case.q_len_per_req,
+    expected_slots, expected_lens, candidate_ids_and_scores = (
+        torch_dsa_paged_index_topk(
+            q,
+            weights,
+            index_k,
+            seq_lens,
+            block_table,
+            page_size=page_size,
+            topk=case.topk,
+            softmax_scale=softmax_scale,
+            q_len_per_req=case.q_len_per_req,
+        )
     )
 
     _assert_topk_matches(
@@ -736,15 +661,17 @@ def test_dsa_prefill_topk_fp8_glm52_cases(case: _TopKPrefillCase) -> None:
         index_k_cache=packed_index_k,
         page_size=page_size,
     )
-    expected_indices, expected_lens, candidate_ids_and_scores = _reference_prefill_topk(
-        q,
-        weights,
-        index_k,
-        kv_workspace_slots,
-        row_starts,
-        row_ends,
-        topk=case.topk,
-        softmax_scale=softmax_scale,
+    expected_indices, expected_lens, candidate_ids_and_scores = (
+        torch_dsa_workspace_index_topk(
+            q,
+            weights,
+            index_k,
+            kv_workspace_slots,
+            row_starts,
+            row_ends,
+            topk=case.topk,
+            softmax_scale=softmax_scale,
+        )
     )
 
     _assert_topk_matches(
@@ -832,16 +759,18 @@ def test_dsa_decode_topk_fp8_accepts_glm52_bf16_split_weights(
             invoke()
         graph.replay()
         torch.cuda.synchronize()
-    expected_slots, expected_lens, candidate_ids_and_scores = _reference_decode_topk(
-        q,
-        weights,
-        index_k,
-        seq_lens,
-        block_table,
-        page_size=page_size,
-        topk=topk,
-        softmax_scale=head_dim**-0.5 * index_heads**-0.5,
-        q_len_per_req=q_len_per_req,
+    expected_slots, expected_lens, candidate_ids_and_scores = (
+        torch_dsa_paged_index_topk(
+            q,
+            weights,
+            index_k,
+            seq_lens,
+            block_table,
+            page_size=page_size,
+            topk=topk,
+            softmax_scale=head_dim**-0.5 * index_heads**-0.5,
+            q_len_per_req=q_len_per_req,
+        )
     )
 
     _assert_topk_matches(
@@ -892,15 +821,17 @@ def test_dsa_prefill_topk_fp8_accepts_glm52_bf16_split_weights() -> None:
         index_k_cache=packed_index_k,
         page_size=page_size,
     )
-    expected_indices, expected_lens, candidate_ids_and_scores = _reference_prefill_topk(
-        q,
-        weights,
-        index_k,
-        workspace,
-        row_starts,
-        row_ends,
-        topk=topk,
-        softmax_scale=head_dim**-0.5 * index_heads**-0.5,
+    expected_indices, expected_lens, candidate_ids_and_scores = (
+        torch_dsa_workspace_index_topk(
+            q,
+            weights,
+            index_k,
+            workspace,
+            row_starts,
+            row_ends,
+            topk=topk,
+            softmax_scale=head_dim**-0.5 * index_heads**-0.5,
+        )
     )
 
     _assert_topk_matches(
@@ -948,6 +879,54 @@ def test_dsa_prefill_topk_keeps_late_values_above_threshold() -> None:
     assert selected_set.issuperset(set(greater_indices.cpu().tolist()))
     assert len(selected_set.intersection(set(equal_indices.cpu().tolist()))) == 1
     torch.testing.assert_close(lens_out.cpu(), torch.tensor([topk], dtype=torch.int32))
+
+
+@pytest.mark.parametrize("cols", (16384, 40960))
+def test_dsa_prefill_topk_selects_largest_values_on_ragged_rows(cols: int) -> None:
+    topk = 2048
+    gen = _generator("cuda", cols)
+    noise = torch.randn((4, cols), device="cuda", generator=gen)
+    logits = torch.stack(
+        (
+            noise[0],
+            noise[1],
+            torch.round(noise[2] * 4) / 4,
+            1.0 + 0.01 * noise[3],
+            noise[0].flip(0),
+        )
+    ).contiguous()
+    row_starts = torch.tensor([0, 1000, 0, 7, 5], device="cuda", dtype=torch.int32)
+    row_ends = torch.tensor(
+        [cols, cols - 77, cols, cols, 5 + topk + 1], device="cuda", dtype=torch.int32
+    )
+    rows = logits.shape[0]
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    dsa_topk_backend._dsa_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    torch.testing.assert_close(
+        lens_out.cpu(), torch.full((rows,), topk, dtype=torch.int32)
+    )
+    for row in range(rows):
+        start, end = int(row_starts[row]), int(row_ends[row])
+        selected = out[row].long()
+        assert torch.unique(selected).numel() == topk
+        assert ((selected >= start) & (selected < end)).all()
+        expected = torch.topk(logits[row, start:end], topk).values
+        torch.testing.assert_close(
+            torch.sort(logits[row, selected], descending=True).values,
+            expected,
+            rtol=0.0,
+            atol=0.0,
+        )
 
 
 def test_dsa_decode_topk_keeps_late_values_above_threshold() -> None:
@@ -1130,33 +1109,6 @@ def _pack_sparse_kv(
     return sparse, latent_fp8.float() * scale
 
 
-def _dsa_reference(
-    q: torch.Tensor,
-    latent: torch.Tensor,
-    rope: torch.Tensor,
-    topk_slots: torch.Tensor,
-    topk_lens: torch.Tensor,
-    softmax_scale: float,
-) -> torch.Tensor:
-    refs = []
-    kv_lora_rank = latent.shape[1]
-    for token in range(q.shape[0]):
-        valid_slots = topk_slots[token, : int(topk_lens[token].item())].long()
-        valid_slots = valid_slots[valid_slots >= 0]
-        q_nope = q[token, :, :kv_lora_rank].float()
-        q_rope = q[token, :, kv_lora_rank:].float()
-        if valid_slots.numel() == 0:
-            refs.append(torch.zeros_like(q_nope))
-            continue
-        k_nope = latent.index_select(0, valid_slots).float()
-        k_rope = rope.index_select(0, valid_slots).float()
-        scores = torch.einsum("hd,kd->hk", q_nope, k_nope)
-        scores += torch.einsum("hd,kd->hk", q_rope, k_rope)
-        probs = torch.softmax(scores * softmax_scale, dim=-1)
-        refs.append(torch.matmul(probs, k_nope))
-    return torch.stack(refs, dim=0).to(torch.bfloat16)
-
-
 def _dsa_visible_ranges(case: _DSACase, device: str) -> tuple[list[range], int]:
     if case.mode == "decode":
         assert case.visible_lens is not None
@@ -1273,7 +1225,7 @@ def test_dsa_with_sparse_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
         page_size=64,
     )
 
-    ref = _dsa_reference(
+    ref = torch_dsa_sparse_attention(
         q,
         dequant_latent,
         rope,
@@ -1355,7 +1307,7 @@ def test_dsa_dense_kvcache(
         page_size=64,
     )
 
-    ref = _dsa_reference(
+    ref = torch_dsa_sparse_attention(
         q,
         dequant_latent,
         dequant_rope,
@@ -1466,7 +1418,7 @@ def test_dsa_dense_fp8_glm52_production_shape(
         q_len_per_req=4 if api is gluon_dsa_decode else 1,
     )
 
-    ref = _dsa_reference(
+    ref = torch_dsa_sparse_attention(
         q,
         kv_cache[:, :kv_lora_rank],
         kv_cache[:, kv_lora_rank:],
@@ -1486,6 +1438,79 @@ def test_dsa_dense_fp8_glm52_production_shape(
     torch.testing.assert_close(
         empty_out, torch.zeros_like(empty_out), rtol=0.0, atol=0.0
     )
+    torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.parametrize(
+    "api",
+    [
+        pytest.param(gluon_dsa_decode, id="decode"),
+        pytest.param(gluon_dsa_prefill, id="prefill"),
+    ],
+)
+def test_dsa_dense_fp8_ignores_poisoned_unselected_rows(api) -> None:
+    device = "cuda"
+    valid_lengths = (0, 1, 65, 1000, 2048)
+    tokens = len(valid_lengths)
+    num_heads = 8
+    num_slots = 4160
+    topk = 2048
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 192
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
+    gen = _generator(device, 409)
+
+    q = _randn_bf16(
+        (tokens, num_heads, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+        generator=gen,
+    ).to(torch.float8_e4m3fn)
+    kv_cache = _randn_bf16(
+        (num_slots, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+        generator=gen,
+    )
+    poisoned = torch.arange(0, num_slots, 7, device=device, dtype=torch.int32)
+    kv_cache[poisoned.long()] = float("nan")
+    kv_cache = kv_cache.to(torch.float8_e4m3fn)
+    is_clean = torch.ones(num_slots, device=device, dtype=torch.bool)
+    is_clean[poisoned.long()] = False
+    clean = torch.nonzero(is_clean).flatten().to(torch.int32)
+
+    topk_slots = poisoned[torch.arange(topk, device=device) % poisoned.numel()]
+    topk_slots = topk_slots.repeat(tokens, 1).contiguous()
+    topk_lens = torch.tensor(valid_lengths, device=device, dtype=torch.int32)
+    for token, count in enumerate(valid_lengths):
+        perm = torch.randperm(clean.numel(), device=device, generator=gen)[:count]
+        topk_slots[token, :count] = clean[perm]
+    topk_slots[3, 100:900:9] = -1
+
+    out = api(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=num_slots,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        page_size=64,
+        q_len_per_req=1,
+    )
+
+    ref = torch_dsa_sparse_attention(
+        q,
+        kv_cache[:, :kv_lora_rank],
+        kv_cache[:, kv_lora_rank:],
+        topk_slots,
+        topk_lens,
+        softmax_scale,
+    )
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out[0], torch.zeros_like(out[0]), rtol=0.0, atol=0.0)
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 
@@ -1528,7 +1553,7 @@ def test_dsa_decode_sparse_kvcache_trims_large_topk_for_tiny_lens() -> None:
         page_size=64,
     )
 
-    ref = _dsa_reference(
+    ref = torch_dsa_sparse_attention(
         q,
         dequant_latent,
         rope,
@@ -1710,7 +1735,7 @@ def test_dsa_decode_glm53_flash_bf16_split_matrix(tokens: int) -> None:
         page_size=64,
         q_len_per_req=4,
     )
-    ref = _dsa_reference(
+    ref = torch_dsa_sparse_attention(
         q,
         kv_cache,
         torch.empty((num_slots, 0), dtype=q.dtype, device=device),
@@ -1793,7 +1818,7 @@ def test_dsa_decode_glm53_flash_bf16_split_graph_tracks_live_lengths(
         invoke(eager_out)
         torch.cuda.synchronize()
         torch.testing.assert_close(replayed, eager_out, rtol=0.0, atol=0.0)
-        ref = _dsa_reference(
+        ref = torch_dsa_sparse_attention(
             q,
             kv_cache,
             torch.empty((num_slots, 0), dtype=q.dtype, device=device),
@@ -1910,7 +1935,7 @@ def test_dsa_prefill_glm53_flash_dense_mfma(
         softmax_scale=softmax_scale,
         page_size=64,
     )
-    ref = _dsa_reference(
+    ref = torch_dsa_sparse_attention(
         q,
         kv_cache,
         torch.empty((num_slots, 0), device=device, dtype=q_dtype),
@@ -2049,7 +2074,7 @@ def test_dsa_glm52_selected_attention_cases(case: _DSACase) -> None:
     else:
         out = gluon_dsa_prefill(**common_kwargs)
 
-    ref = _dsa_reference(
+    ref = torch_dsa_sparse_attention(
         q,
         reference_latent,
         reference_rope,

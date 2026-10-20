@@ -363,6 +363,41 @@ def load_per_tensor_input_scale(
     torch.maximum(param.data, value, out=param.data)
 
 
+def load_per_expert_input_scale(
+    param: torch.nn.Parameter,
+    loaded_weight: torch.Tensor,
+    shard_id: str,
+    local_expert_id: int | None,
+) -> None:
+    """Keep one activation scale per expert, broadcasting a checkpoint that ships one.
+
+    Checkpoints that ship a scalar scale per expert load it once per expert
+    with ``local_expert_id=None``; accumulate the running maximum so every
+    expert uses the global maximum, matching ``load_per_tensor_input_scale``.
+
+    Args:
+        param: The layer's ``[num_local_experts]`` activation scale.
+        loaded_weight: A scalar, or one scale per expert.
+        shard_id: Unused; the scale covers the whole projection.
+        local_expert_id: Expert this scale belongs to, or None when the tensor
+            already covers every local expert.
+    """
+    del shard_id
+    value = loaded_weight.detach().to(dtype=torch.float32, device=param.device)
+    if local_expert_id is not None:
+        param.data[local_expert_id] = value.amax()
+        return
+    if value.numel() == 1:
+        torch.maximum(param.data, value, out=param.data)
+        return
+    if value.numel() != param.data.numel():
+        raise ValueError(
+            f"expected one activation scale per expert, got {value.numel()} "
+            f"for {param.data.numel()} experts"
+        )
+    param.data.copy_(value.reshape(param.data.shape))
+
+
 def make_weight_loader(
     spec: MoELayerSpec,
     *,

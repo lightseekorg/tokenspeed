@@ -317,10 +317,6 @@ _ROUTE_NB = len(RaggedTensorMetadata.block_sizes())
 SMALLM_MAX_M = 16
 
 
-# Backwards-compatible alias for the small-M bound.
-FUSED_ROUTE_MAX_M = SMALLM_MAX_M
-
-
 # Configs the Gluon routing path supports; everything else falls back to the
 # generic triton_kernels_routing pipeline.
 GLUON_ROUTE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)

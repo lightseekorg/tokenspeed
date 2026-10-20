@@ -12,6 +12,7 @@ import os
 import sys
 import textwrap
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -633,6 +634,49 @@ class TestCacheGroupRouterTest:
             ]
         )
         assert (leaves[FULL].calls[-2]) == (("refresh", 4, 2, 0, False))
+
+    def test_refresh_fills_copy_only_leaves_in_one_batched_copy(self):
+        class _CopyOnlyLeaf(_StubLeaf):
+            def decode_buffer_targets(self, bs):
+                return self.seq_lens_buf[:bs], self.page_table_buf[:bs]
+
+            def publish_decode_metadata(self, bs, seq_lens, *, num_extends):
+                self.calls.append(("publish", bs, num_extends))
+
+        batched, own = _CopyOnlyLeaf(4), _StubLeaf(2)
+        router = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
+        router.bind(_geometry(), {FULL: batched, SWA: own})
+        router.init_cuda_graph_state(4)
+        foreach_copy = torch._foreach_copy_
+        launches = []
+
+        def counting_copy(dsts, srcs):
+            launches.append(len(dsts))
+            foreach_copy(dsts, srcs)
+
+        with mock.patch.object(torch, "_foreach_copy_", counting_copy):
+            router.refresh_decode_metadata(
+                4,
+                2,
+                torch.arange(4, dtype=torch.int32),
+                torch.tensor([9, 4, 1, 1], dtype=torch.int32),
+                forward_mode=ForwardMode.DECODE,
+                block_tables=self._tables(),
+            )
+        assert launches == [2]
+        assert batched.seq_lens_buf.tolist() == [9, 4, 1, 1]
+        assert batched.page_table_buf.tolist() == (
+            [[5, 6, 0, 0, 0, 0], [9, 0, 2, 0, 0, 0], [0] * 6, [0] * 6]
+        )
+        assert batched.calls[-2] == ("publish", 4, 0)
+        # A leaf without targets keeps its own refresh.
+        assert own.calls[-2] == ("refresh", 4, 2, 0, False)
 
     def test_forward_dispatches_by_group_with_group_write_locations(self):
         router, leaves = self._router()

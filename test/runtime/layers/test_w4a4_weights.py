@@ -146,6 +146,7 @@ def test_w4a4_plan_selects_only_the_fused_kernel():
         solution="flash_npu_chain",
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "ascend_int4_precomputed_moe_apply"
     assert plan["solution"] == "flash_npu_chain"

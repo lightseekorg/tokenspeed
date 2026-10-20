@@ -712,6 +712,13 @@ def test_sampling_backend_slot_state_is_complete(cls):
         for name, tensor in per_slot.items():
             if name in SamplingBackend.constant_slot_state:
                 continue
+            if name in SamplingBackend.token_derived_slot_state:
+                # Derived scratch is neither restored nor changed by admission.
+                tensor[2].fill_(197)
+                before = tensor.clone()
+                backend._reset_slot(2, _sampling_params("r2"))
+                assert torch.equal(tensor, before)
+                continue
             tensor.fill_(0)
             backend._reset_slot(2, _sampling_params("r2"))
             if tensor[2].abs().sum() != 0:
@@ -729,3 +736,37 @@ def test_completeness_check_catches_an_unexported_buffer():
     backend._rogue_pool = torch.zeros(POOL_ROWS, VOCAB, dtype=torch.int32)
     with pytest.raises(AssertionError, match="_rogue_pool"):
         _assert_slot_state_complete(backend, exporter=backend, slot_domains={POOL_ROWS})
+
+
+@pytest.mark.parametrize("cls", SAMPLING_BACKENDS[1:], ids=lambda cls: cls.__name__)
+def test_sampling_offsets_recompute_after_restore_to_another_slot(cls):
+    from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+
+    backend = _sampling_backend(cls)
+    rid = "offset-restore"
+    backend.prepare_step([rid], [4], [_sampling_params(rid)], num_tokens_per_req=2)
+    frontier = torch.zeros(POOL_ROWS, dtype=torch.int32)
+    frontier[4] = 130
+    info = SamplingBatchInfo(
+        req_pool_indices=torch.tensor([4]),
+        valid_cache_lengths=frontier,
+        extend_lengths=torch.tensor([895], dtype=torch.int32),
+    )
+    assert backend._prepare_sampling_offsets(info)[4].item() == 1025
+    image = torch.empty(backend.slot_state_bytes(), dtype=torch.uint8)
+    backend.export_slot_state(4, image, None, request_id=rid)
+    backend._sampling_offsets_pool[8] = -99
+    backend.import_slot_state(8, image, None, request_id=rid)
+    # RuntimeStates restores the accepted frontier separately. A destination's
+    # stale scratch must not affect the position regenerated for the next draw.
+    frontier[8] = frontier[4]
+    restored = SamplingBatchInfo(
+        req_pool_indices=torch.tensor([8]),
+        valid_cache_lengths=frontier,
+        extend_lengths=torch.tensor([895], dtype=torch.int32),
+    )
+    assert backend._prepare_sampling_offsets(restored)[8].item() == 1025
+    assert frontier[8].item() == 130
+    frontier[8] = 1025
+    restored.extend_lengths = None
+    assert backend._prepare_sampling_offsets(restored)[8].item() == 1026

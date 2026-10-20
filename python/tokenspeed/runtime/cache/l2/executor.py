@@ -204,16 +204,21 @@ class _BackupStats:
 
 class _PrefetchJob:
     """One in-flight L3 prefetch on the lane: the op, its pages by prefix page,
-    and the future that resolves to the pages landed (a prefix length). A
-    failed future is reported once (``failure_logged``), not on every poll
-    until the replica converges."""
+    the absolute ``deadline`` counted from submission, and the future that
+    resolves to the pages landed (a prefix length). A queued job whose deadline
+    expires may be cancelled and reported as landing nothing. A failed future
+    is reported once (``failure_logged``), not on every poll until the replica
+    converges."""
 
-    __slots__ = ("request_id", "num_pages", "future", "failure_logged")
+    __slots__ = ("request_id", "num_pages", "future", "failure_logged", "deadline")
 
-    def __init__(self, request_id: str, num_pages: int, future: Future) -> None:
+    def __init__(
+        self, request_id: str, num_pages: int, future: Future, deadline: float
+    ) -> None:
         self.request_id = request_id
         self.num_pages = num_pages
         self.future = future
+        self.deadline = deadline
         self.failure_logged = False
 
 
@@ -564,13 +569,13 @@ class HostCacheExecutor:
             rank: This rank's position in the L3 key.
             prefix_for_weight_version: Builds the namespace of a weight version.
             prefetch_timeout_base_s: A prefetch op's deadline is
-                ``base + per_page * pages`` seconds after it starts on the
+                ``base + per_page * pages`` seconds after submission to the
                 lane (``--kvstore-prefetch-timeout-base-s``); a batch is not
                 started past the deadline and the op lands what it has. The
                 deadline bounds nothing else: ``batch_get_into`` has no
                 timeout, so a batch already issued runs to completion and a
-                hung store holds the single-thread lane -- later prefetches,
-                the namespace delete and shutdown wait behind it.
+                hung store holds the active pages, namespace delete and
+                shutdown. Queued jobs may expire only before their worker starts.
             prefetch_timeout_per_page_s: The per-page term of that deadline
                 (``--kvstore-prefetch-timeout-per-page-s``).
             prefetch_batch_pages: Prefix pages per ``batch_get_into``
@@ -635,7 +640,8 @@ class HostCacheExecutor:
         with self._ack_lock:
             jobs = list(self._prefetch_jobs.values())
         for job in jobs:
-            job.future.exception()
+            if not job.future.cancelled():
+                job.future.exception()
 
     # ------------------------------------------------------------------
     # Submission (forward thread)
@@ -869,6 +875,7 @@ class HostCacheExecutor:
                     self._l3_prefetch_timeout_base_s
                     + self._l3_prefetch_timeout_per_page_s * len(pages)
                 )
+                deadline = time.monotonic() + deadline_s
                 self._prefetch_jobs[int(op.op_id)] = _PrefetchJob(
                     request_id=str(op.request_id),
                     num_pages=len(pages),
@@ -877,8 +884,9 @@ class HostCacheExecutor:
                         int(op.op_id),
                         str(op.request_id),
                         pages,
-                        deadline_s,
+                        deadline,
                     ),
+                    deadline=deadline,
                 )
         if self.attn_tp_rank == 0:
             logger.info(
@@ -891,7 +899,7 @@ class HostCacheExecutor:
         op_id: int,
         request_id: str,
         pages: list[list[StoragePage]],
-        deadline_s: float,
+        deadline: float,
     ) -> int:
         """The lane's job: fetch ``pages`` in prefix order; return the pages landed.
 
@@ -907,7 +915,6 @@ class HostCacheExecutor:
         l3_store = self.l3_store
         if l3_store is None:
             raise RuntimeError("L3 prefetch ran without a storage backend")
-        deadline = time.monotonic() + deadline_s
         landed = 0
         batch = self._l3_prefetch_batch_pages
         for start in range(0, len(pages), batch):
@@ -968,7 +975,19 @@ class HostCacheExecutor:
         progress: dict[int, tuple[bool, int]] = {}
         for op_id, job in jobs.items():
             if not job.future.done():
+                if time.monotonic() > job.deadline and job.future.cancel():
+                    # Cancellation succeeds only before the worker starts;
+                    # active I/O must retire before its Host pages can be reused.
+                    logger.warning(
+                        f"[L3] prefetch {op_id} ({job.request_id}) expired before "
+                        f"its worker started; landing 0/{job.num_pages} pages"
+                    )
+                    progress[op_id] = (True, 0)
+                    continue
                 progress[op_id] = (False, 0)
+                continue
+            if job.future.cancelled():
+                progress[op_id] = (True, 0)
                 continue
             failed = job.future.exception()
             if failed is not None:

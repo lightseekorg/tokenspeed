@@ -22,7 +22,12 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.activation import eager_silu_and_mul
+from tokenspeed_kernel.numerics.torch.moe import torch_moe_experts
+from tokenspeed_kernel.numerics.torch.quantization import (
+    dequantize_mxfp4,
+    fake_quantize_mxfp4_even,
+)
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -44,7 +49,6 @@ EXPERTS = 64
 HIDDEN = 1024
 INTER = 320
 TOP_K = 8
-_E2M1 = (0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6)
 
 
 def _weights(seed: int = 0) -> torch.nn.Module:
@@ -93,6 +97,7 @@ def _plan(solution: str | None) -> dict:
         expert_id_repeats=False,
         fast_math=False,
         combine_order="rank",
+        features=frozenset(),
     )
 
 
@@ -104,50 +109,23 @@ def _routes(m: int, seed: int = 1):
     return x, weights, ids.indices.to(torch.int32)
 
 
-def _dequant(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    table = torch.tensor(_E2M1, device=packed.device, dtype=torch.float32)
-    codes = torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(-2)
-    return table[codes.long()] * torch.exp2(scale.float() - 127).repeat_interleave(
-        32, dim=-1
-    )
-
-
-def _fake_quant(values: torch.Tensor) -> torch.Tensor:
-    """MXFP4 round trip: Quark "even" scale, saturating E2M1 RNE."""
-    groups = values.float().reshape(*values.shape[:-1], -1, 32)
-    amax = groups.abs().amax(dim=-1, keepdim=True)
-    # amax = m * 2**e with m < 1.75 takes exponent e - 2, otherwise e - 1;
-    # scaled values above 6 saturate (they land past the last midpoint).
-    exponent = ((amax.view(torch.int32) + 0x200000) >> 23) - 2
-    scale = torch.exp2(exponent.clamp(0, 254).float() - 127)
-    scaled = groups.abs() / scale
-    grid = torch.tensor(_E2M1[:8], device=values.device)
-    midpoints = (grid[1:] + grid[:-1]) / 2
-    # A tie rounds to the neighbour with the even E2M1 code.
-    index = (scaled[..., None] > midpoints).sum(-1) + (
-        (scaled[..., None] == midpoints)
-        & (torch.arange(7, device=values.device) % 2 == 1)
-    ).sum(-1)
-    return (grid[index] * groups.sign() * scale).reshape(values.shape)
-
-
 def _torch_reference(x, w, topk_weights, topk_ids):
     """FP32-GEMM reference of the dynamic MXFP4 SiLU MoE semantics."""
-    x_deq = _fake_quant(x)
-    w13 = _dequant(w.w13_weight, w.w13_weight_scale)
-    w2 = _dequant(w.w2_weight, w.w2_weight_scale)
-    out = torch.zeros(x.shape, device=x.device, dtype=torch.float32)
-    for expert in range(EXPERTS):
-        tokens, slots = torch.where(topk_ids == expert)
-        if tokens.numel() == 0:
-            continue
-        gate_up = x_deq[tokens] @ w13[expert].T
-        gate = gate_up[:, :INTER].to(torch.bfloat16).float()
-        up = gate_up[:, INTER:].to(torch.bfloat16).float()
-        act = (F.silu(gate).to(torch.bfloat16).float() * up).to(torch.bfloat16)
-        routed = (_fake_quant(act) @ w2[expert].T).to(torch.bfloat16)
-        out.index_add_(0, tokens, routed.float() * topk_weights[tokens, slots, None])
-    return out
+    return torch_moe_experts(
+        x,
+        dequantize_mxfp4(w.w13_weight, w.w13_weight_scale),
+        dequantize_mxfp4(w.w2_weight, w.w2_weight_scale),
+        topk_ids,
+        topk_weights,
+        # Gate, up and silu(gate) each round to BF16.
+        activation=lambda gate_up: eager_silu_and_mul(gate_up.bfloat16()),
+        w13_bias=None,
+        w2_bias=None,
+        quantize_input=fake_quantize_mxfp4_even,
+        quantize_intermediate=fake_quantize_mxfp4_even,
+        round_expert_output=torch.Tensor.bfloat16,
+        first_expert=0,
+    )
 
 
 # 1-64 rows run the decode blocks; 300 and 1100 the LDS-staged larger blocks.
@@ -175,6 +153,33 @@ def test_matches_reference(m: int) -> None:
     ).float()
     torch.testing.assert_close(actual, portable, atol=3e-2, rtol=2e-2)
     assert (actual == portable).float().mean().item() > 0.99
+
+
+# Decode route sets whose padded expert blocks span one to several 256-row
+# padding stores of the fused sort.
+@pytest.mark.parametrize("m", [1, 16, 64, 128])
+def test_fused_sort_matches_the_standalone_sort(m: int, monkeypatch) -> None:
+    w = _weights()
+    moe_process_weights(_plan(None), w)
+    x, topk_weights, topk_ids = _routes(m, seed=m)
+
+    def run():
+        return mxfp4_gemm.launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
+            x,
+            w.w13_weight,
+            w.w13_weight_scale,
+            w.w2_weight,
+            w.w2_weight_scale,
+            topk_weights,
+            topk_ids,
+        )
+
+    fused = run()
+    # Every route set takes gluon_moe_sorting instead.
+    monkeypatch.setattr(mxfp4_gemm, "_FUSED_SORT_MAX_ROUTES", 0)
+    # Routes are computed per row and combined in slot order, so the order of
+    # routes within an expert block does not change the bits.
+    torch.testing.assert_close(fused, run(), atol=0, rtol=0)
 
 
 def test_row_strided_activations_match_contiguous() -> None:

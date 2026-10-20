@@ -47,6 +47,9 @@ class _Leaf:
     def refresh_decode_metadata(self, *args, **kwargs):
         pass
 
+    def decode_buffer_targets(self, bs):
+        return None
+
     def set_request_slots(self, req_pool_indices):
         pass
 
@@ -169,6 +172,7 @@ class TestIdleReplayScrubTest:
             DpForwardMetadata(
                 global_num_tokens=[0],
                 global_batch_size=[0],
+                global_num_decodes=[0],
                 global_forward_mode=[int(ForwardMode.IDLE)],
                 all_decode_or_idle=True,
                 all_extend=False,

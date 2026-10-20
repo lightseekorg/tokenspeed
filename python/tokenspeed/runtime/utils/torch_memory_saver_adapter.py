@@ -21,6 +21,8 @@
 from abc import ABC
 from contextlib import contextmanager
 
+import torch
+
 try:
     import torch_memory_saver
 
@@ -40,6 +42,13 @@ class TorchMemorySaverAdapter(ABC):
         raise NotImplementedError
 
     def region(self, tag: str | None = None, enable_cpu_backup: bool = False):
+        raise NotImplementedError
+
+    def cuda_graph(self, graph, *, pool, stream, tag: str):
+        """Capture context for ``graph``: ``torch.cuda.graph`` whose private
+        memory pool, when the saver is enabled, lands in the pausable region
+        ``tag`` (discarded on pause; every replay rewrites it before reading).
+        """
         raise NotImplementedError
 
     def pause(self, tag: str | None = None):
@@ -62,6 +71,17 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
             tag=tag or "default", enable_cpu_backup=enable_cpu_backup
         )
 
+    def cuda_graph(self, graph, *, pool, stream, tag: str):
+        # Requires the library's preload hook mode, which configure_subprocess
+        # sets up for the scheduler processes.
+        return _primary_memory_saver.cuda_graph(
+            cuda_graph=graph,
+            pool=pool,
+            stream=stream,
+            tag=tag,
+            enable_cpu_backup=False,
+        )
+
     def pause(self, tag: str | None = None):
         return _primary_memory_saver.pause(tag=tag)
 
@@ -77,6 +97,9 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
     @contextmanager
     def region(self, tag: str | None = None, enable_cpu_backup: bool = False):
         yield
+
+    def cuda_graph(self, graph, *, pool, stream, tag: str):
+        return torch.cuda.graph(graph, pool=pool, stream=stream)
 
     def pause(self, tag: str | None = None):
         pass

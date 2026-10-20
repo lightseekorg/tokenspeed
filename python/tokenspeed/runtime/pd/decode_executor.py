@@ -28,6 +28,7 @@ from tokenspeed.runtime.pd.mooncake.decode import MooncakeKVManagerDecode
 from tokenspeed.runtime.pd.mooncake.receiver import MooncakeKVReceiver
 from tokenspeed.runtime.pd.utils import poll_and_all_reduce
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.network import join_host_port
 
 logger = get_colorful_logger(__name__)
 
@@ -48,7 +49,7 @@ class DisaggDecodeExecutor:
     def _bootstrap(self, request_id, info):
         self.receivers[request_id] = MooncakeKVReceiver(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{info.bootstrap_host}:{info.bootstrap_port}",
+            bootstrap_addr=join_host_port(info.bootstrap_host, info.bootstrap_port),
             bootstrap_room=info.bootstrap_room,
         )
 
@@ -94,6 +95,27 @@ class DisaggDecodeExecutor:
     ):
         self._local_states[request_id] = TransferPoll.Bootstrapping
         self._bootstrap(request_id, bootstrap_info)
+
+    def has_inflight_transfers(self) -> bool:
+        """Whether a KV receive is still registered (bootstrapping or landing).
+
+        A receiver leaves on success or failure; one whose request was aborted
+        leaves once its wait times out.
+        """
+        return bool(self.receivers)
+
+    def release_cache_registration(self) -> None:
+        """Deregister the cache arena before a sleep release unmaps it."""
+        if self.receivers:
+            raise RuntimeError(
+                "cannot release the cache while KV receives are in flight: "
+                f"{sorted(self.receivers)!r}"
+            )
+        self.kv_manager.deregister_buffer_from_engine()
+
+    def restore_cache_registration(self) -> None:
+        """Register the re-mapped cache arena under a fresh transfer session."""
+        self.kv_manager.restore_buffer_registration()
 
     def execute(self, op):
         """Pull this admitted prompt's KV from the prefill node.

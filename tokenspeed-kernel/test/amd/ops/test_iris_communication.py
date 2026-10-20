@@ -709,14 +709,14 @@ def test_iris_all_reduce_correctness_world8():
     _run_ar_test(world_size=8, allocator_type=None)
 
 
-def _ar_epoch_worker_fn(rank, world_size, port, producer_direct, rows, error_dict):
+def _ar_epoch_worker_fn(rank, world_size, port, path, rows, error_dict):
     try:
-        _ar_epoch_worker_main(rank, world_size, port, producer_direct, rows)
+        _ar_epoch_worker_main(rank, world_size, port, path, rows)
     except Exception:
         error_dict[rank] = traceback.format_exc()
 
 
-def _ar_epoch_worker_main(rank, world_size, port, producer_direct, rows):
+def _ar_epoch_worker_main(rank, world_size, port, path, rows):
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     from tokenspeed_kernel.ops.communication.iris import (
@@ -742,12 +742,17 @@ def _ar_epoch_worker_main(rank, world_size, port, producer_direct, rows):
             heap_size=None,
             device=device,
         )
+        producer_direct = path == "producer_direct"
         if producer_direct:
             local = iris_acquire_outputs(state, ((rows, 7168),))[0]
             flags = state.producer_pull.ready_flags
         else:
             local = torch.empty((rows, 7168), dtype=torch.bfloat16, device=device)
-            flags = state.staged_two_shot.ready_flags
+            staged = (
+                state.staged_two_shot if path == "staged_two_shot" else state.staged
+            )
+            assert staged is not None
+            flags = staged.ready_flags
 
         def reduce():
             if producer_direct:
@@ -763,9 +768,19 @@ def _ar_epoch_worker_main(rank, world_size, port, producer_direct, rows):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = reduce()
+        if path == "staged_one_shot":
+            # Guard against the dispatcher silently picking another path.
+            before = flags.clone()
+            graph.replay()
+            torch.cuda.synchronize()
+            dist.barrier()
+            used = math.ceil(rows * 7168 / state.staged.block_size)
+            assert torch.equal(flags[:used, rank], before[:used, rank] + 1)
 
         for replay in (False, True):
             # Include entry and intermediate-stage wraps, plus a normal epoch.
+            # Consecutive calls from each preset cross the wrap, so a staging
+            # slot reused too early or a wait that passes too early shows up.
             for index, initial_epoch in enumerate((17, 2**31 - 1, -1, 2**31 - 2, -2)):
                 torch.cuda.synchronize()
                 dist.barrier()
@@ -773,39 +788,50 @@ def _ar_epoch_worker_main(rank, world_size, port, producer_direct, rows):
                 local.zero_()
                 torch.cuda.synchronize()
                 dist.barrier()
-                # A stale flag must not let peers read before this producer.
-                if rank == world_size - 1:
-                    time.sleep(0.1)
-                scale = index + 2
-                local.fill_(scale * (rank + 1))
-                if replay:
-                    graph.replay()
-                    result = captured
-                else:
-                    result = reduce()
-                torch.cuda.synchronize()
-                expected = scale * world_size * (world_size + 1) // 2
-                mismatches = [None] * world_size
-                dist.all_gather_object(
-                    mismatches, int(torch.count_nonzero(result != expected).item())
-                )
-                assert not any(mismatches), (
-                    f"{producer_direct=} {rows=} {initial_epoch=} {replay=}: "
-                    f"mismatched elements per rank: {mismatches}"
-                )
+                for call in range(3):
+                    # A stale flag must not let peers read before this producer.
+                    if rank == world_size - 1:
+                        time.sleep(0.1)
+                    scale = 3 * index + call + 2
+                    local.fill_(scale * (rank + 1))
+                    if replay:
+                        graph.replay()
+                        result = captured
+                    else:
+                        result = reduce()
+                    torch.cuda.synchronize()
+                    expected = scale * world_size * (world_size + 1) // 2
+                    mismatches = [None] * world_size
+                    dist.all_gather_object(
+                        mismatches, int(torch.count_nonzero(result != expected).item())
+                    )
+                    assert not any(mismatches), (
+                        f"{path=} {rows=} {initial_epoch=} {call=} {replay=}: "
+                        f"mismatched elements per rank: {mismatches}"
+                    )
+                    dist.barrier()
     finally:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("producer_direct,rows", [(True, 1), (True, 16), (False, 16)])
-def test_iris_all_reduce_epoch_rollover(producer_direct, rows):
-    _skip_if_unsupported(8, "Iris epoch rollover tests")
-    if not current_platform().is_cdna4:
+@pytest.mark.parametrize(
+    "world_size,path,rows",
+    [
+        (8, "producer_direct", 1),
+        (8, "producer_direct", 16),
+        (8, "staged_two_shot", 16),
+        (2, "staged_one_shot", 1),
+        (2, "staged_one_shot", 16),
+    ],
+)
+def test_iris_all_reduce_epoch_rollover(world_size, path, rows):
+    _skip_if_unsupported(world_size, "Iris epoch rollover tests")
+    if path != "staged_one_shot" and not current_platform().is_cdna4:
         pytest.skip("Producer-direct Iris reductions require CDNA4")
     _spawn_and_collect(
         _ar_epoch_worker_fn,
-        (8, _get_open_port(), producer_direct, rows),
-        8,
+        (world_size, _get_open_port(), path, rows),
+        world_size,
     )
 
 

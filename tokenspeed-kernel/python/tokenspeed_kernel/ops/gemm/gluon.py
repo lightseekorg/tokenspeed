@@ -26,6 +26,7 @@ import torch
 from tokenspeed_kernel.ops.gemm import KIMI3_HIDDEN_SIZE, KIMI3_QKVFAB_SIZE
 from tokenspeed_kernel.ops.gemm._gluon.gemv import gluon_simt_gemm_fp32
 from tokenspeed_kernel.ops.gemm.triton import MXFP4_LINEAR_SIGNATURES
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -65,11 +66,26 @@ _GFX950_CAPABILITY = CapabilityRequirement(
 
 
 if platform.is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
+        gluon_rowcta_bf16_gemv_gfx950 as _rowcta_bf16_gemv_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        launch_gluon_gemv_a16w16_gfx950 as _gemv_a16w16_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        prefers_gluon_gemv_a16w16_gfx950 as _prefers_gemv_a16w16,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        supports_gluon_gemv_a16w16_gfx950 as _supports_gemv_a16w16,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
         launch_gluon_mm_a16w16_prefill_gfx950 as _mm_a16w16_prefill_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
         supports_gluon_mm_a16w16_prefill_gfx950 as _supports_mm_a16w16_prefill,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        gluon_grouped_mm_a16w16_decode_num_counters_gfx950 as _grouped_decode_counters,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         gluon_mm_a16w16_decode_num_counters_gfx950 as _mm_a16w16_decode_counters,
@@ -78,12 +94,129 @@ if platform.is_amd:
         launch_gluon_bmm_a16w16_gfx950 as _bmm_a16w16_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        launch_gluon_grouped_mm_a16w16_decode_gfx950 as _grouped_decode_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         launch_gluon_mm_a16w16_decode_gfx950 as _mm_a16w16_decode_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        supports_gluon_grouped_mm_a16w16_decode_gfx950 as _supports_grouped_decode,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         supports_gluon_mm_a16w16_decode_gfx950 as _supports_mm_a16w16_decode,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
+        gluon_fp32_router_gemv_gfx950 as _fp32_router_gemv_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
+        transpose_fp32_router_weight_gfx950 as _transpose_fp32_router_weight,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (
+        launch_gluon_mm_mxfp8_decode_gfx950 as _mm_mxfp8_decode_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (
+        supports_gluon_mm_mxfp8_decode_gfx950 as _supports_mxfp8_decode_problem,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
+        launch_gluon_mm_mxfp8_gfx950 as _mm_mxfp8_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
+        supports_mxfp8_gemm_shape as _supports_mxfp8_gemm_shape,
+    )
 
+    @register_kernel(
+        "gemm",
+        "mv",
+        name="gluon_rowcta_bf16_gemv_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED + 1,
+        traits={
+            "m": frozenset({1}),
+            "n_min": frozenset({128}),
+            "k_min": frozenset({128}),
+        },
+    )
+    def gluon_rowcta_bf16_gemv_gfx950(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Dispatch one-row BF16 GEMV to the gfx950 Gluon implementation."""
+        if out is None:
+            out = torch.empty(
+                (1, weight.shape[0]),
+                dtype=x.dtype,
+                device=x.device,
+            )
+        return _rowcta_bf16_gemv_impl(x, weight, out)
+
+    @register_kernel(
+        "gemm",
+        "prepared_fp32_router_gemv",
+        name="gluon_fp32_router_gemv_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.float32),
+                    weight=dense_tensor_format(torch.float32),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED + 1,
+        weight_preprocessor=_transpose_fp32_router_weight,
+    )
+    def gluon_fp32_router_gemv_gfx950(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        multiplier: float,
+        counters: torch.Tensor,
+        enable_pdl: bool,
+    ) -> torch.Tensor:
+        """Dispatch decode-sized FP32 router GEMV to the gfx950 kernel."""
+        return _fp32_router_gemv_impl(
+            x,
+            weight,
+            multiplier,
+            counters,
+            enable_pdl,
+        )
+
+    try:
+        from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.linear_attnres_partials_gfx950 import (
+            launch_gluon_linear_attnres_partials_gfx950 as _linear_attnres_partials_impl,
+        )
+    except ImportError as exc:
+        # Keep the message only: an exception object carries its traceback,
+        # which pins every frame that was importing at the time.
+        _IMPORT_ERROR_MESSAGE = str(exc)
+        _linear_attnres_partials_impl = None
+    else:
+        _IMPORT_ERROR_MESSAGE = None
+
+    _GFX950_CAPABILITY = CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    )
     _DENSE16_SIGNATURES = frozenset(
         {
             format_signature(
@@ -172,6 +305,189 @@ if platform.is_amd:
             device=x.device,
         )
         return _mm_a16w16_decode_impl(x, weight, x.dtype, counters=counters, out=out)
+
+    @register_kernel(
+        "gemm",
+        "dsv4_linear_fp32",
+        name="gluon_dsv4_linear_fp32_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    hidden_states=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            # Shapes with measured decode GEMM configs.
+            "n": frozenset({384}),
+            "k": frozenset({5120}),
+            "has_tokens": frozenset({True}),
+            "hidden_inner_stride_one": frozenset({True}),
+            "hidden_rank": frozenset({2}),
+            "weight_contiguous": frozenset({True}),
+        },
+    )
+    def gluon_dsv4_linear_fp32_gfx950(
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        enable_pdl: bool,
+    ) -> torch.Tensor:
+        """FP32 hidden_states @ weight.T for the measured decode row buckets.
+
+        Fall back to hipBLASLt for other row counts.
+        """
+        if enable_pdl:
+            raise ValueError("gfx950 DSV4 FP32 linear does not support PDL")
+        m, n, k = hidden_states.shape[0], weight.shape[0], weight.shape[1]
+        if not hidden_states.is_contiguous() or not _supports_mm_a16w16_decode(m, n, k):
+            return torch.mm(hidden_states, weight.t(), out_dtype=torch.float32)
+        counters = zeroed_state(
+            _mm_a16w16_decode_counters(m, n, k),
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+        return _mm_a16w16_decode_impl(
+            hidden_states, weight, torch.float32, counters=counters
+        )
+
+    @register_kernel(
+        "gemm",
+        "grouped_bf16_projection",
+        name="gluon_grouped_bf16_projection_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            # Shapes with measured grouped decode GEMM configs (V4.1 wo_a TP4).
+            "batch": frozenset({2}),
+            "n": frozenset({1024}),
+            "k": frozenset({4096}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_contiguous": frozenset({True}),
+            "is_cuda": frozenset({True}),
+        },
+    )
+    def gluon_grouped_bf16_projection_gfx950(
+        x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
+    ) -> torch.Tensor:
+        """One-launch grouped decode GEMM writing [tokens, groups, rows] directly.
+
+        Fall back to torch.einsum for row counts without a measured config.
+        """
+        m, g, k = x.shape
+        n = weight.shape[1]
+        if not _supports_grouped_decode(m, g, n, k):
+            result = torch.einsum("tgd,grd->tgr", x, weight)
+            return result if out is None else out.copy_(result)
+        counters = zeroed_state(
+            _grouped_decode_counters(m, g, n, k), dtype=torch.int32, device=x.device
+        )
+        return _grouped_decode_impl(
+            x, weight, counters=counters, quantize=False, out=out
+        )
+
+    @register_kernel(
+        "gemm",
+        "grouped_bf16_projection_fp8",
+        name="gluon_grouped_bf16_projection_fp8_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "batch": frozenset({2}),
+            "n": frozenset({1024}),
+            "k": frozenset({4096}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_contiguous": frozenset({True}),
+            "is_cuda": frozenset({True}),
+        },
+    )
+    def gluon_grouped_bf16_projection_fp8_gfx950(
+        x: torch.Tensor, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Grouped decode GEMM with a group-32 FP8 quantizing epilogue."""
+        m, g, k = x.shape
+        n = weight.shape[1]
+        if not _supports_grouped_decode(m, g, n, k):
+            projected = torch.einsum("tgd,grd->tgr", x, weight).flatten(1)
+            return quantize_fp8(
+                projected,
+                granularity="token_group",
+                group_size=32,
+                scale_encoding="ue8m0",
+                enable_pdl=False,
+                override=None,
+                solution=None,
+            )
+        counters = zeroed_state(
+            _grouped_decode_counters(m, g, n, k), dtype=torch.int32, device=x.device
+        )
+        return _grouped_decode_impl(x, weight, counters=counters, quantize=True)
+
+    def _gemv_a16w16_filter(m: int, n: int, k: int) -> bool:
+        return _supports_gemv_a16w16(m, n, k) and _prefers_gemv_a16w16(m, n, k)
+
+    # Ranked above the decode GEMM: the GEMV's measured buckets are the
+    # shapes where it beat the default selection.
+    @register_kernel(
+        "gemm",
+        "mv",
+        name="gluon_gemv_a16w16_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        # Above gluon_rowcta_bf16_gemv_gfx950, which takes any single row:
+        # this kernel claims only the shapes where it measured faster.
+        priority=Priority.SPECIALIZED + 2,
+        traits={"mnk_problem_filter": frozenset({_gemv_a16w16_filter})},
+    )
+    def gluon_gemv_a16w16_gfx950(
+        x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``x @ weight.T`` for decode batches (M <= 16), one program per CU.
+
+        Selection takes it only for the shapes and row buckets where it
+        measured faster than the default; a direct call serves any supported
+        shape.
+
+        Args:
+            x: ``[M, K]`` fp16/bf16 activation with unit inner stride.
+            weight: Contiguous ``[N, K]`` weight in ``x``'s dtype.
+            out: Optional ``[M, N]`` row-major destination.
+
+        Returns:
+            ``[M, N]`` output in ``x``'s dtype.
+        """
+        if out is None:
+            out = x.new_empty((x.shape[0], weight.shape[0]))
+        return _gemv_a16w16_impl(x, weight, out)
 
     @register_kernel(
         "gemm",
@@ -639,7 +955,7 @@ if platform.is_cdna5:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "m": frozenset(range(1, 17)),
+            "m": frozenset(range(1, 65)),
             "n_align": frozenset({128}),
             "k_align": frozenset({128}),
             "k_min": frozenset({128}),

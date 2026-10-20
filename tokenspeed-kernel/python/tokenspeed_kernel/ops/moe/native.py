@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
     dense_tensor_format,
@@ -132,6 +133,8 @@ def torch_sqrt_softplus_topk(
     hash_indices_table: torch.Tensor | None,
     input_ids: torch.Tensor | None,
     need_scores: bool,
+    routed_scaling_factor: float,
+    weights_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     scores = torch.sqrt(F.softplus(router_logits.float()))
     if hash_indices_table is not None:
@@ -160,4 +163,57 @@ def torch_sqrt_softplus_topk(
             keepdim=True,
         ).clamp_min(torch.finfo(topk_weights.dtype).tiny)
     output_scores = scores if need_scores else router_logits
-    return topk_weights.to(torch.float32), topk_ids.to(torch.int32), output_scores
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights.to(weights_dtype), topk_ids.to(torch.int32), output_scores
+
+
+@register_kernel(
+    "moe",
+    "softmax_bias_topk",
+    name="torch_softmax_bias_topk",
+    solution="torch",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}), min_arch_version=ArchVersion(9, 0)
+    ),
+    signatures=format_signatures(
+        "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+    ),
+    traits={"experts_max": frozenset({2048}), "tie_order": frozenset({"torch"})},
+    features={"batch_invariant", "cuda_graph"},
+    priority=Priority.REFERENCE,
+)
+def torch_softmax_bias_topk(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    top_k: int,
+    num_real_experts: int,
+    routed_scaling_factor: float,
+    indices_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Correction-bias routing in the trainer's torch order (``--router-topk torch``).
+
+    fp32 ``torch.softmax`` keeps every probability bit; ``torch.topk`` on the
+    biased probabilities with ``sorted=True`` gives PyTorch's tie order; the
+    weights are the UNBIASED probabilities times ``routed_scaling_factor``.
+    Zero experts (ids past the real experts) become ``-1`` and keep their
+    weight so the model can apply its identity residual.
+
+    Args:
+        router_logits: ``[tokens, num_candidates]`` router logits (any float
+            dtype); candidates are the real experts followed by zero experts.
+        correction_bias: ``[num_candidates]`` fp32 selection bias.
+        top_k: Experts selected per token.
+        num_real_experts: Candidates below this id are real experts.
+        routed_scaling_factor: Multiplier on the selected probabilities.
+        indices_dtype: dtype of the returned ids.
+
+    Returns:
+        ``(weights, ids)`` with shapes ``[tokens, top_k]``; weights fp32, ids
+        in ``indices_dtype`` with ``-1`` for zero experts.
+    """
+    probs = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+    _, ids = torch.topk(probs + correction_bias, k=top_k, dim=-1, sorted=True)
+    weights = probs.gather(1, ids) * routed_scaling_factor
+    ids = ids.masked_fill(ids >= num_real_experts, -1).to(indices_dtype)
+    return weights, ids

@@ -49,6 +49,11 @@ registrations = [
     ("triton_dsv41_" + op, "dsv41_" + op, "triton", "triton")
     for op in operations
 ] + [
+    ("triton_dsv41_global_rope_scatter", "dsv41_global_rope_scatter", "triton", "_triton.rope"),
+    ("triton_dsv41_index_key_norm_rope", "dsv41_index_key_norm_rope", "triton", "_triton.rope"),
+    ("triton_dsv41_index_query_rope_weights", "dsv41_index_query_rope_weights", "triton", "_triton.rope"),
+    ("triton_dsv41_index_query_rope_quant", "dsv41_index_query_rope_quant", "triton", "_triton.rope"),
+    ("triton_dsv41_index_key_norm_rope_scatter", "dsv41_index_key_norm_rope_scatter", "triton", "_triton.rope"),
     ("flashmla_dsv41_selected_attention", "dsv41_selected_attention", "flashmla", "flash_mla"),
     ("deep_gemm_dsv41_index_topk", "dsv41_index_topk", "deep_gemm", "deep_gemm"),
     ("deepselect_dsv41_select_candidates", "dsv41_select_candidates", "deepselect", "deep_select"),

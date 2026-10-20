@@ -64,6 +64,7 @@ def gluon_bf16_moe_stage2_kernel(
     a_ptr,  # inter    (num_tokens*topk, I)   bf16
     b_ptr,  # w2       (E, D, I)              bf16
     b_scale_ptr,
+    a_scale_ptr,
     c_ptr,  # partials (num_tokens, topk, D)  bf16
     sorted_token_ids_ptr,
     sorted_expert_ids_ptr,
@@ -89,7 +90,11 @@ def gluon_bf16_moe_stage2_kernel(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    # Weight-only FP8: dequantize 128x128 weight blocks before the BF16 dot.
     WEIGHT_FP8: gl.constexpr,
+    # Per-channel FP8 weights and per-row FP8 activations: widen raw codes,
+    # apply both scales after the dot, and leave route weighting to the combine.
+    CHANNEL_FP8: gl.constexpr,
 ):
     pid = gl.program_id(axis=0)
     num_pid_n = gl.cdiv(N, BLOCK_N)
@@ -129,7 +134,9 @@ def gluon_bf16_moe_stage2_kernel(
     shared_b: gl.constexpr = gl.SwizzledSharedLayout(8, 2, 8, order=[0, 1])
 
     smem_a = gl.allocate_shared_memory(
-        a_ptr.dtype.element_ty, [1, BLOCK_M, BLOCK_K], shared_a
+        gl.bfloat16 if CHANNEL_FP8 else a_ptr.dtype.element_ty,
+        [1, BLOCK_M, BLOCK_K],
+        shared_a,
     )
     smem_b = gl.allocate_shared_memory(gl.bfloat16, [1, BLOCK_K, BLOCK_N], shared_b)
 
@@ -164,10 +171,26 @@ def gluon_bf16_moe_stage2_kernel(
     # ---- Single-buffered K-loop (short K; memory-bound epilogue) -------
     num_k = gl.cdiv(K, BLOCK_K)
     for k in range(num_k):
-        cdna4_async_copy.buffer_load_to_shared(
-            smem_a.index(0), a_base, a_offsets + k * A_K_STEP, mask=token_mask[:, None]
-        )
-        if WEIGHT_FP8:
+        if CHANNEL_FP8:
+            # Register widening preserves raw codes and the BF16 shared layout;
+            # it does not attempt an unsupported eight-byte async vector.
+            a_codes = gl.load(
+                a_base + a_offsets + k * A_K_STEP, mask=token_mask[:, None], other=0.0
+            )
+            smem_a.index(0).store(a_codes.to(gl.bfloat16))
+            smem_b.index(0).store(
+                gl.load(b_base + b_off + k * B_K_STEP).to(gl.bfloat16)
+            )
+        else:
+            cdna4_async_copy.buffer_load_to_shared(
+                smem_a.index(0),
+                a_base,
+                a_offsets + k * A_K_STEP,
+                mask=token_mask[:, None],
+            )
+        if CHANNEL_FP8:
+            pass
+        elif WEIGHT_FP8:
             if BLOCK_N <= 128 and 128 % BLOCK_N == 0 and 128 % BLOCK_K == 0:
                 scale_offset = (
                     off_experts * stride_bse
@@ -208,7 +231,19 @@ def gluon_bf16_moe_stage2_kernel(
     token_c = packed_c & 0xFFFFFF
     slot_c = packed_c >> 24
 
-    c_val = (acc * moe_weight[:, None]).to(c_ptr.type.element_ty)
+    if CHANNEL_FP8:
+        route_scale = gl.load(
+            a_scale_ptr + token_c * top_k + slot_c, mask=token_c < num_tokens, other=0
+        )
+        channel_scale = gl.load(
+            b_scale_ptr + off_experts * N + offs_cn, mask=offs_cn < N, other=0
+        )
+        # Round the UNWEIGHTED down result before the separate FP32 FMA combine.
+        c_val = ((acc * route_scale[:, None]) * channel_scale[None, :]).to(
+            c_ptr.type.element_ty
+        )
+    else:
+        c_val = (acc * moe_weight[:, None]).to(c_ptr.type.element_ty)
     c_ptrs = (
         c_ptr
         + token_c[:, None].to(gl.int64) * stride_pt
@@ -356,6 +391,7 @@ def invoke_stage2(
         inter_states,
         weight,
         scale,
+        inter_states,
         partials,
         sorted_token_ids,
         sorted_expert_ids,
@@ -382,6 +418,7 @@ def invoke_stage2(
         BLOCK_K=BLOCK_K,
         NUM_WARPS=num_warps,
         WEIGHT_FP8=weight_fp8,
+        CHANNEL_FP8=False,
         num_warps=num_warps,
     )
 
@@ -403,3 +440,62 @@ def invoke_stage2(
         num_warps=4,
     )
     return out
+
+
+def launch_gluon_fp8_channel_stage2_gfx950(
+    route_codes,
+    w2,
+    route_scales,
+    channel_scales,
+    sorted_token_ids,
+    sorted_expert_ids,
+    sorted_weights,
+    num_valid_ids,
+    partials,
+    *,
+    block_m,
+):
+    """Return unweighted BF16 partials; never select atomic output or reduction."""
+    assert route_codes.dtype == w2.dtype == torch.float8_e4m3fn
+    assert route_scales.dtype == channel_scales.dtype == torch.float32
+    num_tokens, topk, hidden = partials.shape
+    experts, weight_hidden, intermediate = w2.shape
+    assert weight_hidden == hidden and partials.dtype == torch.bfloat16
+    assert route_codes.shape == (num_tokens * topk, intermediate)
+    assert route_scales.shape == (num_tokens * topk, 1)
+    assert channel_scales.shape == (experts, hidden)
+    block_n = 64 if block_m == 16 else 128
+    block_k = 64
+    assert intermediate % block_k == hidden % block_n == 0
+    em = sorted_token_ids.numel()
+    grid = triton.cdiv(em, block_m) * triton.cdiv(hidden, block_n)
+    return gluon_bf16_moe_stage2_kernel[(grid,)](
+        route_codes,
+        w2,
+        channel_scales,
+        route_scales,
+        partials,
+        sorted_token_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        num_valid_ids,
+        hidden,
+        intermediate,
+        em,
+        num_tokens,
+        topk,
+        *route_codes.stride(),
+        *w2.stride(),
+        0,
+        0,
+        0,
+        *partials.stride(),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        NUM_WARPS=4,
+        WEIGHT_FP8=False,
+        CHANNEL_FP8=True,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )

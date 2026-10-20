@@ -19,6 +19,10 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.residual import (
+    torch_mhc_post,
+    torch_mhc_pre,
+)
 from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_indexer_topk_prefill,
     indexer_topk_prefill,
@@ -27,7 +31,7 @@ from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_compute_global_topk_indices_and_lens,
 )
 from tokenspeed_kernel.ops.moe import moe_topk
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.thirdparty.cuda import (
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
@@ -43,7 +47,6 @@ from tokenspeed.runtime.configs.model_config import (
     is_deepseek_v4_nextn,
 )
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import DeepseekV41DSpark
 from tokenspeed.runtime.execution.drafter.eagle import (
     _advance_draft_forward_metadata_if_supported,
 )
@@ -100,17 +103,6 @@ def _fake_pool(*group_specs, **arena_attrs) -> SimpleNamespace:
     )
 
 
-def _mhc_sinkhorn_reference(
-    mixes: torch.Tensor, iters: int, eps: float
-) -> torch.Tensor:
-    mixes = torch.softmax(mixes, dim=-1) + eps
-    mixes = mixes / (mixes.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(iters - 1):
-        mixes = mixes / (mixes.sum(dim=-1, keepdim=True) + eps)
-        mixes = mixes / (mixes.sum(dim=-2, keepdim=True) + eps)
-    return mixes
-
-
 def _mhc_pre_reference(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -120,41 +112,17 @@ def _mhc_pre_reference(
     hc_eps: float,
     sinkhorn_iters: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_tokens, hc_mult, _ = residual.shape
-    x = residual.flatten(1).float()
-    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + rms_eps)
-    mixes = F.linear(x, fn.float()) * rsqrt
-    pre_raw, post_raw, comb_raw = torch.split(
-        mixes, [hc_mult, hc_mult, hc_mult * hc_mult], dim=-1
-    )
-    pre_base, post_base, comb_base = torch.split(
-        hc_base.float(), [hc_mult, hc_mult, hc_mult * hc_mult], dim=-1
-    )
-    pre = torch.sigmoid(pre_raw * hc_scale[0].float() + pre_base) + hc_eps
-    post = (torch.sigmoid(post_raw * hc_scale[1].float() + post_base) * 2.0).unsqueeze(
-        -1
-    )
-    comb = _mhc_sinkhorn_reference(
-        comb_raw.reshape(num_tokens, hc_mult, hc_mult) * hc_scale[2].float()
-        + comb_base.reshape(1, hc_mult, hc_mult),
-        sinkhorn_iters,
+    return torch_mhc_pre(
+        residual,
+        fn.float(),
+        hc_scale,
+        hc_base,
+        rms_eps,
         hc_eps,
+        sinkhorn_iters,
+        None,
+        None,
     )
-    layer_input = torch.sum(pre.unsqueeze(-1) * residual.float(), dim=1)
-    return layer_input.to(residual.dtype), post, comb
-
-
-def _mhc_post_reference(
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-) -> torch.Tensor:
-    if post.dim() == 2:
-        post = post.unsqueeze(-1)
-    mixed_residual = torch.einsum("tnm,tnh->tmh", comb.float(), residual.float())
-    block_update = post.float() * hidden_states.float().unsqueeze(1)
-    return (mixed_residual + block_update).to(hidden_states.dtype)
 
 
 class TestDeepseekV4Config:
@@ -402,12 +370,14 @@ class TestDeepseekV4Config:
                 correction_bias=correction_bias,
                 routed_scaling_factor=2.0,
                 hash_routing=False,
+                weights_dtype=torch.bfloat16,
             )(hidden_states, router_logits)
 
         assert (output.topk_weights) is (topk_weights)
         assert (output.topk_ids) is (topk_ids)
         assert (output.router_logits) is (router_logits)
-        assert (calls[0][0][2:6]) == (("sqrt_softplus", "topk", True, 2.0))
+        assert calls[0][0][2:6] == ("sqrt_softplus", "topk", True, 2.0)
+        assert (calls[0][1]["topk_weights_dtype"]) == (torch.bfloat16)
 
     def test_deepseek_v4_topk_routes_simulated_logits(self):
         router_logits = torch.zeros((2, 4))
@@ -428,6 +398,7 @@ class TestDeepseekV4Config:
                 correction_bias=torch.zeros(4),
                 routed_scaling_factor=1.0,
                 hash_routing=False,
+                weights_dtype=torch.float32,
             )(torch.ones((2, 3)), router_logits)
             expected = topk_module.simulated_router_logits(router_logits)
 
@@ -493,6 +464,7 @@ class TestDeepseekV4Config:
             def __init__(self, **kwargs):
                 captured.update(kwargs)
                 self.topk_output_format = object()
+                self.topk_weights_dtype = torch.bfloat16
 
         class FakeTopK:
             def __init__(self, **kwargs):
@@ -543,6 +515,101 @@ class TestDeepseekV4Config:
         assert (captured["routing_mode"]) == ("precomputed_topk")
         assert (captured["routing_config"]["routed_scaling_factor"]) == (1.0)
         assert (topk_config["routed_scaling_factor"]) == (2.5)
+        assert (topk_config["weights_dtype"]) == (torch.bfloat16)
+
+    @staticmethod
+    def _fake_deferred_moe(
+        make_moe, hidden_states, input_ids, route_weights, kernel_result
+    ):
+        moe = make_moe(
+            hidden_states,
+            input_ids,
+            StreamFork(None),
+            [],
+            norm_topk_prob=True,
+        )
+        moe.topk = lambda *args, **kwargs: SimpleNamespace(topk_weights=route_weights)
+        moe.experts = Mock(return_value=kernel_result)
+        moe.experts.supports_deferred_cuda_finalize = True
+        return moe
+
+    def test_deepseek_v4_moe_deferred_finalize_fuses_the_shared_expert(self):
+        hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
+        input_ids = torch.arange(2)
+        route_weights = torch.full((2, 1), 2.0, dtype=torch.bfloat16)
+        gemm = hidden_states + 1
+        indices = torch.arange(2, dtype=torch.int32)
+        moe = self._fake_deferred_moe(
+            self._make_fake_deepseek_v4_moe,
+            hidden_states,
+            input_ids,
+            route_weights,
+            (gemm, route_weights, indices),
+        )
+
+        def finalize(gemm2_out, expanded_idx, expert_weights, shared, **kwargs):
+            assert gemm2_out is gemm and expanded_idx is indices
+            assert expert_weights is route_weights
+            assert kwargs["top_k"] == 1
+            assert kwargs["hidden_dim"] == hidden_states.shape[-1]
+            return (
+                gemm2_out.float() * expert_weights.float() + shared.float()
+            ).bfloat16()
+
+        with patch.object(
+            deepseek_v4_model, "moe_finalize_fuse_shared", side_effect=finalize
+        ):
+            actual = moe.forward_normal(hidden_states, input_ids, 2, 2)
+        assert not moe.experts.call_args.kwargs["do_finalize"]
+        torch.testing.assert_close(
+            actual, (hidden_states + 1) * 2 + hidden_states + 3, atol=0, rtol=0
+        )
+
+    def test_deepseek_v4_moe_common_finalize_trims_padding_without_shared(self):
+        hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
+        input_ids = torch.arange(2)
+        weights = torch.full((2, 1), 2.0, dtype=torch.bfloat16)
+        gemm = torch.ones(2, 8, dtype=torch.bfloat16)
+        moe = self._fake_deferred_moe(
+            self._make_fake_deepseek_v4_moe,
+            hidden_states,
+            input_ids,
+            weights,
+            (gemm, weights, torch.arange(2, dtype=torch.int32)),
+        )
+        moe.n_shared_experts = None
+        moe.shared_experts = None
+        with patch.object(
+            deepseek_v4_model,
+            "moe_finalize_fuse_shared",
+            return_value=(gemm * weights)[:, : hidden_states.shape[-1]].contiguous(),
+        ) as finalize:
+            actual = moe.forward_normal(hidden_states, input_ids, 2, 2)
+        assert finalize.call_args.args[3] is None
+        assert finalize.call_args.kwargs["hidden_dim"] == hidden_states.shape[-1]
+        assert actual.shape == hidden_states.shape
+        assert actual.is_contiguous()
+        torch.testing.assert_close(actual, hidden_states * 2, atol=0, rtol=0)
+
+    def test_deepseek_v4_moe_keeps_finalize_for_unsupported_consumer(self):
+        hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
+        input_ids = torch.arange(2)
+        moe = self._make_fake_deepseek_v4_moe(
+            hidden_states,
+            input_ids,
+            StreamFork(None),
+            [],
+            norm_topk_prob=True,
+        )
+        moe.experts = Mock(return_value=hidden_states * 2)
+        moe.experts.supports_deferred_cuda_finalize = False
+        with patch.object(deepseek_v4_model, "moe_finalize_fuse_shared") as finalize:
+            actual = moe.forward_normal(hidden_states, input_ids, 2, 2)
+        assert moe.experts.call_args.kwargs["do_finalize"]
+        finalize.assert_not_called()
+        torch.testing.assert_close(
+            actual, hidden_states * 2 + hidden_states + 3, atol=0, rtol=0
+        )
 
     def test_deepseek_v4_shared_mlp_uses_dense_tp(self):
         mapping = Mapping(
@@ -1511,14 +1578,6 @@ class TestDeepseekV4Config:
                 logits, bonus, markov, lm_head, object(), candidates, partials, output
             )
 
-    def test_dspark_tp_only_contract_uses_resolved_mapping(self):
-        mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1))
-        DeepseekV41DSpark._validate_tp_only_mapping(mapping)
-
-        invalid = SimpleNamespace(attn=SimpleNamespace(dp_size=2))
-        with pytest.raises((ValueError), match=("tensor parallelism only")):
-            DeepseekV41DSpark._validate_tp_only_mapping(invalid)
-
     def test_dspark_speculative_config_uses_block_plus_bonus_width(self):
         server_args = ServerArgs(
             model="unused",
@@ -1720,7 +1779,7 @@ class TestDeepseekV4Config:
             hc_eps=1e-6,
             sinkhorn_iters=2,
         )
-        updated = _mhc_post_reference(layer_input, residual, post, comb)
+        updated = torch_mhc_post(layer_input, residual, post, comb)
 
         assert (tuple(layer_input.shape)) == ((tokens, hidden))
         assert (tuple(post.shape)) == ((tokens, hc_mult, 1))
@@ -1784,7 +1843,7 @@ class TestDeepseekV4Config:
         post = torch.tensor([[[0.5], [0.25]]], dtype=torch.float32)
         comb = torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32)
 
-        updated = _mhc_post_reference(hidden_states, residual, post, comb)
+        updated = torch_mhc_post(hidden_states, residual, post, comb)
 
         expected = torch.empty_like(residual)
         expected[:, 0] = (
@@ -1958,7 +2017,15 @@ class TestDeepseekV4Config:
         topk_ids = torch.empty(3, 6, device="cuda", dtype=torch.int32)
 
         try:
-            softplus_sqrt_topk_flash(logits, bias, topk_ids, topk_weights, 1.0, True)
+            softplus_sqrt_topk_flash(
+                logits,
+                bias,
+                topk_ids,
+                topk_weights,
+                1.0,
+                True,
+                enable_pdl=pdl_enabled(),
+            )
         except (AttributeError, RuntimeError) as exc:
             pytest.skip(f"fused DeepSeek V4 router op unavailable: {exc}")
         torch.cuda.synchronize()
@@ -2012,7 +2079,14 @@ class TestDeepseekV4Config:
 
         try:
             hash_softplus_sqrt_topk_flash(
-                logits, input_ids, table, topk_ids, topk_weights, 1.0, True
+                logits,
+                input_ids,
+                table,
+                topk_ids,
+                topk_weights,
+                1.0,
+                True,
+                enable_pdl=pdl_enabled(),
             )
         except (AttributeError, RuntimeError) as exc:
             pytest.skip(f"fused DeepSeek V4 hash router op unavailable: {exc}")

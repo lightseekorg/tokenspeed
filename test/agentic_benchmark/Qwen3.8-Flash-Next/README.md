@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next NVFP4 agentic benchmark
 
 Run [NVIDIA's NVFP4 checkpoint](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
-with attention TP4, MoE EP4, three-step MTP and BF16 KV cache on four Blackwell
+with attention TP4, MoE EP4, three-step MTP, and BF16 KV cache on four Blackwell
 GPUs. TokenSpeed must already be installed in the active environment or the
 repository's `.venv` / `venv`. Port 8000 must be free.
 The launcher requires `ts`, `curl`, and `setsid` in `PATH` and reports missing
@@ -27,13 +27,13 @@ as the Kimi-K3 benchmark (`acd09b44384d53174768bb1063f675420f76fae9`), downloads
 the existing CI SWE-Smith dataset at revision
 `2779acd48a05c211f2f82eee71bdbdf688d984ca`, rebuilds its input budgets with
 the tested Qwen checkpoint's tokenizer, starts the server, waits for
-`/readiness`, warms up, benchmarks and writes `summary.csv`. It stops the server
-and its workers on success, error or interruption. Dataset downloads are cached.
+`/readiness`, warms up, benchmarks, and writes `summary.csv`. It stops the server
+and its workers on success, error, or interruption. Dataset downloads are cached.
 
 `tokenspeed/model_config.sh` pins the checkpoint and tokenizer to the same
 revision. Preparation downloads tokenizer assets into
 `tokenspeed/data/tokenizer/<revision>/`. The engine (`--tokenizer`), gateway
-(`--tokenizer-path`) and both EvalScope phases (`--tokenizer-path`) use that
+(`--tokenizer-path`), and both EvalScope phases (`--tokenizer-path`) use that
 local directory. The model's `--revision` is pinned too.
 
 Conversation order and turn counts match the shared CI dataset. Each source
@@ -97,7 +97,7 @@ budgets before sending requests. The replay script leaves the service running.
 
 Results persist under `tokenspeed/outputs/<UTC timestamp>_<suffix>/`, including
 `server.log`, `warmup.log`, `benchmark.log`, the hidden `.warmup/` directory,
-per-concurrency EvalScope JSON/SQLite artifacts and `summary.csv`.
+per-concurrency EvalScope JSON/SQLite artifacts, and `summary.csv`.
 
 | CSV column | Definition |
 | --- | --- |
@@ -113,7 +113,7 @@ The wall time covers the first request's start through the last completion at
 each concurrency level. Input tokens, including cached history, are excluded.
 
 Missing required metrics (including `Failed Requests`), failed requests,
-invalid TPOT or missing concurrency results fail the run.
+invalid TPOT, or missing concurrency results fail the run.
 To collect an existing sweep again:
 
 ```bash

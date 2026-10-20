@@ -588,14 +588,25 @@ class ModelRunner:
                     consumed += 1
                     yield name, tensor
 
-            # Same session as a distributed load. The loader's iterator
-            # already refuses KV-cache scales other than one.
+            # Same session and KV-cache scale screen as a distributed load.
+            rejected: list[str] = []
             with weight_update_session([self.model]):
-                self.model.load_weights(_counted())
+                self.model.load_weights(
+                    record_non_unit_kv_scales(
+                        _counted(),
+                        rejected,
+                    )
+                )
             if consumed == 0:
                 return False, (
                     f"no checkpoint tensors found at {model_path!r}; "
                     "nothing was updated"
+                )
+            if rejected:
+                return False, (
+                    f"{non_unit_kv_scale_message(rejected)}; a weight update keeps "
+                    f"the KV-cache scales loaded at startup ({consumed} checkpoint "
+                    "tensors had reached the model)"
                 )
             if self.device != "cpu":
                 torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))

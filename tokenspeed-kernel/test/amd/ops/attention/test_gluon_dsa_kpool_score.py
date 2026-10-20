@@ -26,6 +26,7 @@ from functools import partial
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.kpool import kpool_scores
 from utils import assert_no_triton_compile, is_cdna4, is_cdna5
 
 if not (is_cdna4() or is_cdna5()):
@@ -190,14 +191,13 @@ def _reference(
     )
     expected = []
     for row, end_tensor in enumerate(row_ends):
-        end = int(end_tensor.item())
-        pools = pool_offset + torch.arange(end, device=_DEVICE)
-        request = int(req_ids[row].item())
-        pages = block_table[request, pools // _PAGE_SIZE].long()
+        pools = pool_offset + torch.arange(int(end_tensor), device=_DEVICE)
+        pages = block_table[int(req_ids[row]), pools // _PAGE_SIZE].long()
         selected_keys = keys[pages, pools.remainder(_PAGE_SIZE)]
-        head_scores = torch.einsum("hd,pd->hp", q[row].float(), selected_keys.float())
         expected.append(
-            (head_scores.relu() * weights[row, :, None]).sum(dim=0) * _SOFTMAX_SCALE
+            kpool_scores(
+                q[row], selected_keys, weights[row], _SOFTMAX_SCALE, apply_relu=True
+            )
         )
     return expected, row_ends
 

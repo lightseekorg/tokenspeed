@@ -162,15 +162,15 @@ class TestDeepseekV4AttentionOpsTest:
         output = torch.full(
             (lengths.numel(), topk), -77, device=device, dtype=torch.int32
         )
-        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
 
         persistent_topk(
             logits,
             lengths,
             output,
-            workspace,
             topk,
             int(lengths.max().item()),
+            enable_pdl=False,
+            q_len_per_req=1,
         )
         torch.cuda.synchronize()
 
@@ -199,15 +199,15 @@ class TestDeepseekV4AttentionOpsTest:
             if raw_len < stride:
                 logits[row_idx, raw_len:] = 1.0e6
         output = torch.full((num_rows, topk), -77, device=device, dtype=torch.int32)
-        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
 
         persistent_topk(
             logits,
             lengths,
             output,
-            workspace,
             topk,
             stride,
+            enable_pdl=False,
+            q_len_per_req=1,
         )
         torch.cuda.synchronize()
 
@@ -222,7 +222,6 @@ class TestDeepseekV4AttentionOpsTest:
         torch.manual_seed(6792)
         device = torch.device("cuda")
         stride = 262144
-        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
 
         for topk in (512, 1024, 2048):
             with subtests.test(topk=topk):
@@ -247,9 +246,10 @@ class TestDeepseekV4AttentionOpsTest:
                     logits,
                     lengths,
                     output,
-                    workspace,
                     topk,
                     int(lengths.max().item()),
+                    enable_pdl=False,
+                    q_len_per_req=1,
                 )
                 torch.cuda.synchronize()
 
@@ -264,7 +264,6 @@ class TestDeepseekV4AttentionOpsTest:
         torch.manual_seed(6794)
         device = torch.device("cuda")
         topk = 2048
-        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
 
         for stride, raw_lengths in (
             (131072, [1024, 8192, 65537, 131071]),
@@ -284,12 +283,28 @@ class TestDeepseekV4AttentionOpsTest:
                     dtype=torch.int32,
                 )
 
-                persistent_topk(logits, lengths, output, workspace, topk, stride)
+                persistent_topk(
+                    logits,
+                    lengths,
+                    output,
+                    topk,
+                    stride,
+                    enable_pdl=True,
+                    q_len_per_req=1,
+                )
                 torch.cuda.synchronize()
 
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
-                    persistent_topk(logits, lengths, output, workspace, topk, stride)
+                    persistent_topk(
+                        logits,
+                        lengths,
+                        output,
+                        topk,
+                        stride,
+                        enable_pdl=True,
+                        q_len_per_req=1,
+                    )
                 for _ in range(3):
                     graph.replay()
                 torch.cuda.synchronize()
@@ -305,7 +320,6 @@ class TestDeepseekV4AttentionOpsTest:
         torch.manual_seed(6795)
         device = torch.device("cuda")
         topk = 2048
-        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
 
         # Exercise both sides of the register-cluster and cluster-16 ceilings,
         # including the portable cluster-8 fallback above 256K.
@@ -323,9 +337,10 @@ class TestDeepseekV4AttentionOpsTest:
                     logits,
                     lengths,
                     output,
-                    workspace,
                     topk,
                     max_seq_len,
+                    enable_pdl=False,
+                    q_len_per_req=1,
                 )
                 torch.cuda.synchronize()
 
@@ -365,16 +380,15 @@ class TestDeepseekV4AttentionOpsTest:
             device=device,
             dtype=torch.int32,
         )
-        workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
 
         persistent_topk(
             logits,
             request_lengths,
             output,
-            workspace,
             topk,
             int(request_lengths.max().item()),
             q_len_per_req,
+            enable_pdl=False,
         )
         torch.cuda.synchronize()
 

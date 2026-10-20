@@ -69,7 +69,7 @@ def test_draft_loader_preserves_own_embedding_and_shares_only_head(monkeypatch):
     target = SimpleNamespace(
         logits_processor=layout,
         get_embed_and_head=lambda: (main_embedding, main_head),
-        lm_head=nn.Linear(4, 8, bias=False),
+        lm_head=SimpleNamespace(quant_method=None),
     )
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)

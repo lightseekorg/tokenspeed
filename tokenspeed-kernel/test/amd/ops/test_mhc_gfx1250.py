@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.residual import torch_mhc_mixes
 from utils import assert_no_triton_compile, is_cdna5
 
 if not is_cdna5():
@@ -61,22 +62,15 @@ def _operands(tokens: int, hidden: int, seed: int):
 
 
 def _reference(residual, weight, scale, base):
-    tokens = residual.shape[0]
-    flat = residual.double().view(tokens, -1)
-    inv_rms = torch.rsqrt(flat.square().mean(-1, keepdim=True) + _RMS_EPS)
-    mixes = flat @ weight.double().T * inv_rms
-    scale, base = scale.double(), base.double()
-    pre = torch.sigmoid(mixes[:, :4] * scale[0] + base[:4]) + _HC_EPS
-    post = torch.sigmoid(mixes[:, 4:8] * scale[1] + base[4:8]) * 2.0
-    comb = torch.softmax(
-        mixes[:, 8:].view(tokens, 4, 4) * scale[2] + base[8:].view(1, 4, 4), dim=-1
+    return torch_mhc_mixes(
+        residual,
+        weight.double(),
+        scale.double(),
+        base.double(),
+        _RMS_EPS,
+        _HC_EPS,
+        _SINKHORN_ITERS,
     )
-    comb = comb + _HC_EPS
-    comb = comb / (comb.sum(-2, keepdim=True) + _HC_EPS)
-    for _ in range(1, _SINKHORN_ITERS):
-        comb = comb / (comb.sum(-1, keepdim=True) + _HC_EPS)
-        comb = comb / (comb.sum(-2, keepdim=True) + _HC_EPS)
-    return pre, post, comb
 
 
 def _run(residual, weight, scale, base):
@@ -97,9 +91,11 @@ def _splits(tokens: int, hidden: int) -> int:
     )
 
 
-# Token counts reach 80, 64 and at most 32 K splits; 4 * 1000 does not tile
-# into 64-wide K tiles, so that width keeps the Triton GEMM.
-@pytest.mark.parametrize("tokens", [1, 96, 192, 2048, 8192])
+# On 256 CUs these token counts reach 80, 64, 32 and fewer K splits, so both
+# 64-wide K tiles (64 or more splits) and 128-wide ones run; 320 is the
+# cheapest 128-wide case. 4 * 1000 does not tile into 64-wide K tiles, so that
+# width keeps the Triton GEMM.
+@pytest.mark.parametrize("tokens", [1, 96, 192, 320, 2048, 8192])
 @pytest.mark.parametrize("hidden", [5120, 1000])
 def test_mhc_mixes_matches_reference(tokens: int, hidden: int) -> None:
     operands = _operands(tokens, hidden, seed=tokens + hidden)

@@ -21,7 +21,7 @@
 """Tests for the DSA decode indexer top-k backends.
 
 Covers the per-solution wrappers behind ``deep_gemm_dsa_decode_topk``:
-  * ``ragged_decode_topk`` (CUDA persistent-radix) dispatch + arg forwarding.
+  * ``ragged_decode_topk`` errors when the CUDA persistent kernel is unavailable.
   * ``deterministic_decode_topk`` (flashinfer) pre-masked fallback path.
   * ``cute_dsl_decode_topk`` (CuTe DSL cluster radix): per-row causal-window
     ``torch.topk`` accuracy across batch / next_n / top-k / context length /
@@ -41,6 +41,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsa import torch_dsa_logits_topk
 from tokenspeed_kernel.ops.attention.dsa import cuda as cuda_dsa_topk
 from tokenspeed_kernel.ops.attention.dsa import flashinfer as fi_dsa_topk
 from tokenspeed_kernel.ops.attention.dsa.cute_dsl import (
@@ -63,54 +64,12 @@ requires_cuda = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 # Wrapper dispatch (CPU, monkeypatched kernels)
 # ---------------------------------------------------------------------------
-def test_ragged_decode_topk_delegates_to_persistent_topk(monkeypatch):
-    calls = {}
-
-    monkeypatch.setattr(cuda_dsa_topk, "has_persistent_topk", lambda: True)
-
-    def fake_persistent_topk(
-        logits, lengths, output, workspace, k, max_seq_len, q_len_per_req=1
-    ):
-        calls["logits"] = logits
-        calls["lengths"] = lengths
-        calls["workspace"] = workspace
-        calls["k"] = k
-        calls["max_seq_len"] = max_seq_len
-        calls["q_len_per_req"] = q_len_per_req
-        output.fill_(7)
-
-    monkeypatch.setattr(cuda_dsa_topk, "persistent_topk", fake_persistent_topk)
-
-    logits = torch.randn(2, 8, dtype=torch.float32)
-    lengths = torch.tensor([[3], [6]], dtype=torch.int64)
-    output = torch.empty(2, 4, dtype=torch.int32)
-    workspace = torch.empty(32, dtype=torch.uint8)
-
-    cuda_dsa_topk.ragged_decode_topk(
-        logits,
-        output,
-        4,
-        lengths=lengths,
-        workspace=workspace,
-        max_seq_len=8,
-    )
-
-    assert torch.equal(output, torch.full_like(output, 7))
-    assert calls["logits"].is_contiguous()
-    assert torch.equal(calls["lengths"], torch.tensor([3, 6], dtype=torch.int32))
-    assert calls["workspace"] is workspace
-    assert calls["k"] == 4
-    assert calls["max_seq_len"] == 8
-    assert calls["q_len_per_req"] == 1
-
-
 def test_ragged_decode_topk_raises_when_persistent_kernel_unavailable(monkeypatch):
     monkeypatch.setattr(cuda_dsa_topk, "has_persistent_topk", lambda: False)
 
     logits = torch.randn(2, 8, dtype=torch.float32)
     output = torch.empty(2, 4, dtype=torch.int32)
     lengths = torch.tensor([3, 6], dtype=torch.int32)
-    workspace = torch.empty(32, dtype=torch.uint8)
 
     with pytest.raises(RuntimeError, match="length-aware"):
         cuda_dsa_topk.ragged_decode_topk(
@@ -118,8 +77,9 @@ def test_ragged_decode_topk_raises_when_persistent_kernel_unavailable(monkeypatc
             output,
             4,
             lengths=lengths,
-            workspace=workspace,
             max_seq_len=8,
+            enable_pdl=False,
+            q_len_per_req=1,
         )
 
 
@@ -165,14 +125,11 @@ def _reference_topk_values(
     logits: torch.Tensor, seq_lens: torch.Tensor, topk: int, next_n: int
 ) -> torch.Tensor:
     """Per-row causal-window top-k values, sorted ascending, ``-inf`` padded."""
-    num_rows, num_cols = logits.shape
-    out = torch.full((num_rows, topk), float("-inf"))
-    for r in range(num_rows):
-        win = _row_window(seq_lens, r, next_n, num_cols)
-        k = min(topk, win)
-        if k > 0:
-            vals = logits[r, :win].topk(k).values.sort().values
-            out[r, :k] = vals.cpu()
+    columns = torch_dsa_logits_topk(logits, seq_lens, topk, next_n).long()
+    out = torch.full(columns.shape, float("-inf"))
+    for row, picked in enumerate(columns):
+        picked = picked[picked >= 0]
+        out[row, : picked.numel()] = logits[row, picked].sort().values.cpu()
     return out
 
 

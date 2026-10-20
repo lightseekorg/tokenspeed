@@ -3,10 +3,10 @@
 TokenSpeed-kernel aims to provide a collection of the best portable and
 performant kernels for multi-silicon AI inference. It features:
 
-* A clean layered API for maximal structured flexibility
-* Kernel registration and selection logic to decouple complexity and increase reuse
-* Plugin mechanism for multi-silicon extensibility
-* A minimal list of curated dependencies for fast iteration
+- A clean layered API for maximal structured flexibility
+- Kernel registration and selection logic to decouple complexity and increase reuse
+- A plugin mechanism for multi-silicon extensibility
+- A minimal list of curated dependencies for fast iteration
 
 TokenSpeed-kernel is pip-installable on its own. Others can use it
 directly.
@@ -49,16 +49,16 @@ Historical nightlies are retained. Automatic cleanup is deferred.
 
 TokenSpeed-kernel is designed with these functionality goals in mind:
 
-* Support various kernels in AI models (such as attention and MoE)
-* Support multiple silicon vendors and generations
-* Marry default portability and performance solutions
+- Support various kernels in AI models (such as attention and MoE)
+- Support multiple silicon vendors and generations
+- Marry default portability and performance solutions
 
 Additional goals target a better devflow for fast iteration:
 
-* Provide unified infra to verify and debug kernel numerics standalone
-* Provide unified infra to run and benchmark kernels standalone
-* Support tracing shapes and profiling workloads at runtime
-* Stay forward-looking, with guardrails for agentic devflow
+- Provide unified infra to verify and debug kernel numerics standalone
+- Provide unified infra to run and benchmark kernels standalone
+- Support tracing shapes and profiling workloads at runtime
+- Stay forward-looking, with guardrails for agentic devflow
 
 ## Overall design
 
@@ -98,6 +98,13 @@ preceding goals (still evolving; subject to change):
   priority, and returns a callable. Selection supports per-call `solution=`
   and `override=` plus config-file overrides for development.
 
+For call sites requiring batch invariance, `KernelPlan.select()` selects from declared
+capabilities at initialization using static geometry. Execution reuses that
+plan and validates its input contract without re-ranking by batch size. This
+is opt-in; ordinary auto-selection keeps its existing policy. A planned leaf
+that can be recorded into a CUDA graph also declares the `cuda_graph` feature;
+callers that plan their leaves capture only through leaves declaring it.
+
 ### Directory structure
 
 ```
@@ -118,7 +125,7 @@ tokenspeed_kernel/
     ...
 
   numerics/              # Reference impls + tolerance + comparison + CLI
-    reference/           # PyTorch ground-truth kernels
+    torch/               # PyTorch ground truth, laid out like ops/
   benchmark/             # Unified runner, throughput model, report, CLI
   plugins/               # Out-of-tree backend discovery
   thirdparty/            # Vendored / wrapped third-party kernel sources
@@ -127,7 +134,7 @@ tokenspeed_kernel/
 Each `ops/<family>/` directory groups implementations by operator variant and
 then solution. For example, attention uses `attention/<variant>/<solution>.py`
 such as `attention/mha/triton.py`. A solution is either an in-tree JIT kernel
-(Triton/Gluon/CuteDSL), or a thin wrapper around an external library.
+(Triton/Gluon/CuteDSL) or a thin wrapper around an external library.
 All of them register through the same decorator, and the same selection
 logic scores them, so adding a backend is one new file in the right family
 folder.
@@ -170,8 +177,11 @@ every graph it captures.
   for decode
 - **Vendor libraries** — wrapped (such as FlashAttention and TRT-LLM);
   no in-tree C++ build
-- **PyTorch reference** — under `numerics/reference/`; never auto-selects
-  over a real backend but always available as ground truth
+- **PyTorch reference** — under `numerics/torch/`, one module per
+  `ops/` family (`attention/<variant>.py` for attention), registered with
+  `solution="torch"`; never auto-selects over a real backend but always
+  available as ground truth. Kernel tests compare against these references
+  instead of writing their own.
 
 TokenSpeed-kernel carefully curates external dependencies and actively
 re-evaluates their inclusion to maintain minimal dependencies and enable
@@ -181,7 +191,7 @@ faster iteration.
 
 - `python -m tokenspeed_kernel.numerics` — dtype-aware tolerances, standard
   input generators, and a comparison/bisect flow that pits any registered
-  kernel against the reference impl.
+  kernel against the reference implementation.
 - `python -m tokenspeed_kernel.benchmark` — unified timing, throughput
   (FLOPs / bytes) per op family, tabular reports, and Proton integration.
 - `KernelBenchmarkHarness` — registration-level device timing through warmed

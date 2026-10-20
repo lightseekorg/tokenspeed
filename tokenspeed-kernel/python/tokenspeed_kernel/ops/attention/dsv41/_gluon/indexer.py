@@ -156,6 +156,7 @@ def run_dsv41_csa2_index_topk(
     score_chunk_size,
     process_group,
     out,
+    index_metadata,
     launch_logits,
     select_rows,
     select_blocks,
@@ -166,6 +167,7 @@ def run_dsv41_csa2_index_topk(
     ``select_rows`` has the ``select_rows_torch`` contract and
     ``select_blocks`` the ``select_blocks_torch`` contract.
     """
+    del index_metadata
     out = _index_topk_outputs(
         index_q,
         weights,

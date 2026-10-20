@@ -160,6 +160,7 @@ class ForwardContext:
     # --- dp attention ---
     global_num_tokens: list[int] | None = None
     global_bs: list[int] | None = None
+    global_num_decodes: list[int] | None = None
     all_decode_or_idle: bool = False
     all_extend: bool = False
     # --- query context parallelism ---

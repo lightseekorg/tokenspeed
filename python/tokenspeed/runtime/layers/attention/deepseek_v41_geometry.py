@@ -115,13 +115,16 @@ V41_CACHE_FORMATS: Mapping[str, V41CacheFormat] = {
             V41_COMPRESSOR_TAIL_GROUP_ID: 54,
         },
         lcm_block_bytes=1_382_400,
+        # With three DSpark stages, two SWA pages are the smallest packing
+        # that keeps every group within 5% padding and index page strides
+        # divisible by 512 for native sparse scoring.
         dspark_group_packing={
-            V41_SWA_GROUP_ID: 1,
-            V41_GLOBAL_R2_GROUP_ID: 22,
-            V41_GLOBAL_R1_GROUP_ID: 66,
-            V41_COMPRESSOR_TAIL_GROUP_ID: 62,
+            V41_SWA_GROUP_ID: 2,
+            V41_GLOBAL_R2_GROUP_ID: 45,
+            V41_GLOBAL_R1_GROUP_ID: 140,
+            V41_COMPRESSOR_TAIL_GROUP_ID: 126,
         },
-        dspark_lcm_block_bytes=1_571_328,
+        dspark_lcm_block_bytes=3_225_600,
     ),
     "v4": V41CacheFormat(
         swa_kernel_format="swa_v4",

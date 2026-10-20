@@ -30,10 +30,15 @@ import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
+from tokenspeed_kernel.signature import (
+    dense_format_signature,
+    dense_tensor_format,
+    format_signature,
+)
 
 __all__ = [
+    "bf16_moe_routes",
     "COMBINE_ORDERS",
     "ExpertDispatch",
     "dispatch_topk_ids",
@@ -44,9 +49,120 @@ __all__ = [
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
+    "moe_warmup",
     "moe_topk",
+    "softmax_bias_topk",
+    "plan_softmax_bias_topk",
+    "torch_softmax_bias_topk",
     "packed_projection_weight_view",
+    "moe_sigmoid_bias_topk_routing",
+    "FUSED_ROUTING_MAX_TOKENS",
+    "PreparedNvfp4Routing",
+    "prepare_nvfp4_routing",
+    "routed_input_scale_rmsnorm_sum",
+    "routed_input_scale_rmsnorm_sum_gathered",
+    "prepare_sm90_fp8_moe",
 ]
+
+
+def plan_softmax_bias_topk(
+    *, dtype: torch.dtype, experts: int, top_k: int
+) -> KernelPlan:
+    """Plan FP32 softmax/bias routing with PyTorch's sorted top-k tie order.
+
+    dtype describes logits; experts includes identity candidates. top_k and
+    expert count are fixed model dimensions; token rows may vary at execution.
+    The provider's batch-invariant domain is checked during selection.
+    """
+    if not 0 < top_k <= experts:
+        raise ValueError("top_k must be in [1, experts]")
+    return KernelPlan.select(
+        "moe",
+        "softmax_bias_topk",
+        format_signature(router_logits=dense_tensor_format(dtype)),
+        features=frozenset({"batch_invariant"}),
+        static_traits={"experts": experts, "top_k": top_k, "tie_order": "torch"},
+        variable_traits=frozenset({"m"}),
+        declared_traits=frozenset({"tie_order"}),
+        solution=None,
+        ignore_layout=False,
+    )
+
+
+def softmax_bias_topk(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    *,
+    top_k: int,
+    num_real_experts: int,
+    routed_scaling_factor: float,
+    indices_dtype: torch.dtype,
+    plan: KernelPlan,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Execute a planned torch-order router; return FP32 weights and expert IDs.
+
+    router_logits is [tokens, candidates], correction_bias is [candidates].
+    IDs >= num_real_experts become -1 without discarding their weights.
+    Pass candidates as num_real_experts to keep all local IDs for group mapping.
+    indices_dtype selects the returned integer dtype. The scale multiplies
+    selected unbiased probabilities. No renormalization is performed here.
+    """
+    plan.validate(
+        "moe",
+        "softmax_bias_topk",
+        format_signature(router_logits=dense_tensor_format(router_logits.dtype)),
+        traits={
+            "experts": router_logits.shape[-1],
+            "top_k": top_k,
+            "m": router_logits.shape[0],
+            "tie_order": "torch",
+        },
+        features=frozenset({"batch_invariant"}),
+        solution=None,
+        override=None,
+    )
+    return plan.kernel(
+        router_logits=router_logits,
+        correction_bias=correction_bias,
+        top_k=top_k,
+        num_real_experts=num_real_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        indices_dtype=indices_dtype,
+    )
+
+
+def prepare_sm90_fp8_moe(
+    *,
+    mode: Literal["default", "expected_m", "optimized"],
+    max_num_stages_fc1: int = -1,
+    max_num_stages_fc2: int = -1,
+) -> Callable:
+    """Prepare an explicit FlashInfer block-FP8 MoE implementation at init.
+
+    Args:
+        mode: ``default`` binds the installed FlashInfer implementation.
+            ``expected_m`` binds the SM90 per-call load-hint backport.
+            ``optimized`` adds tile-prefix and direct tile-to-expert lookup.
+        max_num_stages_fc1: Optional FC1 grouped GEMM pipeline stage limit. ``-1`` keeps
+            upstream selection; a positive integer of at least four caps the
+            supported FC1 candidates. Requires a private mode.
+        max_num_stages_fc2: Independent FC2 pipeline stage limit, with the
+            same semantics and default as ``max_num_stages_fc1``.
+
+    Returns:
+        A callable accepting FlashInfer's ``cutlass_fused_moe`` arguments and
+        returning its output list. Private modes additionally accept a positive
+        uint32 ``expected_m`` or None. Callers compute that hint from their own
+        routing layout. Initialize before warmup and CUDA graph capture;
+        private modes require FlashInfer 0.7.2, Hopper, and a working JIT compiler.
+    """
+    from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_fused_moe
+
+    return make_cutlass_fused_moe(
+        mode=mode,
+        max_num_stages_fc1=max_num_stages_fc1,
+        max_num_stages_fc2=max_num_stages_fc2,
+    )
 
 
 # ===-----------------------------------------------------------------------===#
@@ -818,6 +934,53 @@ def _moe_sigmoid_bias_topk(
 # Routing and expert APIs
 # ===-----------------------------------------------------------------------===#
 
+from tokenspeed_kernel.ops.moe._triton.sigmoid_topk_routing import (  # noqa: E402
+    MAX_TOKENS as FUSED_ROUTING_MAX_TOKENS,
+)
+from tokenspeed_kernel.ops.moe.flashinfer import (  # noqa: E402
+    PreparedNvfp4Routing,
+    prepare_nvfp4_routing,
+)
+from tokenspeed_kernel.ops.moe.routed_norm import (  # noqa: E402
+    routed_input_scale_rmsnorm_sum,
+    routed_input_scale_rmsnorm_sum_gathered,
+)
+
+
+def moe_sigmoid_bias_topk_routing(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    local_expert_offset: int,
+    num_local_experts: int,
+    routing: object,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select experts as ``moe_sigmoid_bias_topk`` does and fill ``routing`` in the same launch.
+
+    Serves at most ``FUSED_ROUTING_MAX_TOKENS`` tokens, the batches where one
+    program beats the separate top-k and routing kernels. ``routing`` is a
+    flashinfer trtllm-gen routing metadata slot the expert GEMMs will read.
+    """
+    kernel = select_kernel(
+        "moe",
+        "sigmoid_bias_topk_routing",
+        format_signature(router_logits=dense_tensor_format(router_logits.dtype)),
+    )
+    return kernel(
+        router_logits=router_logits,
+        correction_bias=correction_bias,
+        topk=topk,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
+        local_expert_offset=local_expert_offset,
+        num_local_experts=num_local_experts,
+        routing=routing,
+        enable_pdl=enable_pdl,
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -885,6 +1048,8 @@ def moe_topk(
         logical_to_physical_map: Optional expert-id map for sigmoid routing.
         topk_indices_dtype: Integer dtype for returned expert ids.
         topk_weights_dtype: Floating-point dtype for returned routing weights.
+            Sqrt-softplus scoring, normalization and scaling use FP32; CUDA
+            and Triton can write BF16 directly after scaling.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
     Returns:
@@ -1057,9 +1222,13 @@ def moe_topk(
             hash_indices_table,
             input_ids,
             False,
+            scaling_factor,
+            (
+                topk_weights_dtype
+                if topk_weights_dtype in (torch.float32, torch.bfloat16)
+                else torch.float32
+            ),
         )
-        if scaling_factor != 1.0:
-            topk_weights = topk_weights * scaling_factor
         return topk_weights.to(topk_weights_dtype), topk_ids.to(topk_indices_dtype)
 
 
@@ -1176,6 +1345,8 @@ def _build_traits(
     ep_size: int | None,
     ispp: int | None,
     hidden: int | None,
+    num_experts: int | None,
+    top_k: int | None,
     swiglu_form: str | None,
     activation_clamped: bool,
     expert_id_repeats: bool,
@@ -1188,6 +1359,9 @@ def _build_traits(
         internal_activation_dtype = "input"
 
     traits: dict[str, Any] = {"weight_dtype": weight_dtype}
+    # Unknown counts must not admit a kernel restricted to particular counts.
+    traits["num_experts"] = num_experts
+    traits["top_k"] = top_k
     # Seller-declared: excludes only kernels declaring another order; the
     # post-selection check turns a silent kernel down for "slot".
     traits["combine_order"] = combine_order
@@ -1228,14 +1402,36 @@ def _build_traits(
 
 
 def _select_moe_apply(
-    input_dtype: torch.dtype, traits: dict[str, Any], solution: str | None
+    input_dtype: torch.dtype,
+    traits: dict[str, Any],
+    solution: str | None,
+    features: frozenset[str],
 ):
+    signature = format_signature(x=dense_tensor_format(input_dtype))
+    if "batch_invariant" in features:
+        selected = KernelPlan.select(
+            "moe",
+            "apply",
+            signature,
+            features=features,
+            static_traits=traits,
+            variable_traits=frozenset({"m", "num_tokens", "batch_size"}),
+            solution=solution,
+            declared_traits=(
+                frozenset({"combine_order"})
+                if traits["combine_order"] == "slot"
+                else frozenset()
+            ),
+            ignore_layout=True,
+        )
+        return selected.kernel, selected.spec
     kernel = select_kernel(
         "moe",
         "apply",
-        format_signature(x=dense_tensor_format(input_dtype)),
+        signature,
         traits=traits,
         solution=solution,
+        features=features,
         ignore_layout=True,
     )
     apply_spec = KernelRegistry.get().get_by_name(kernel.name)
@@ -1252,6 +1448,29 @@ def _log_fp32_correction_bias_fallback(kernel_name: str) -> None:
     )
 
 
+def bf16_moe_routes(
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_start: int,
+) -> torch.Tensor:
+    """Return unweighted BF16 SwiGLU outputs for every selected local expert.
+
+    Args:
+        x: Contiguous BF16 hidden states ``[tokens, hidden]``.
+        w13: Local concatenated gate/up weights ``[experts, 2I, hidden]``.
+        w2: Local down weights ``[experts, hidden, I]``.
+        topk_ids: Global selected expert ids ``[tokens, topk]``.
+        expert_start: First global expert represented by ``w13`` and ``w2``.
+
+    Returns:
+        Route outputs ``[tokens, topk, hidden]``; routes to other ranks' experts are zero.
+    """
+    kernel = select_kernel("moe", "routes", dense_format_signature(("x",), (x.dtype,)))
+    return kernel(x, w13, w2, topk_ids, expert_start)
+
+
 def moe_plan(
     weight_dtype: str,
     input_dtype: torch.dtype = torch.bfloat16,
@@ -1266,6 +1485,8 @@ def moe_plan(
     swiglu_form: str | None,
     activation_clamped: bool,
     expert_id_repeats: bool,
+    num_experts: int | None = None,
+    top_k: int | None = None,
     fp8_scale_block_shape: tuple[int, int] | None = None,
     internal_activation_dtype: str | None = None,
     with_bias: bool = False,
@@ -1275,6 +1496,7 @@ def moe_plan(
     persistent_max_num_tokens_per_gpu: int | None = None,
     fast_math: bool,
     combine_order: str,
+    features: frozenset[str],
     solution: str | None = None,
     fp32_correction_bias: bool = False,
 ) -> dict:
@@ -1315,6 +1537,10 @@ def moe_plan(
             expert id more than once for one token (zero-expert placeholders).
             Kernels whose permutation needs distinct ids per token declare
             ``expert_id_repeats={False}``. Required keyword.
+        num_experts: Global expert count. None means unknown and excludes
+            kernels restricted to a particular expert count.
+        top_k: Number of selected experts per token. None means unknown and
+            excludes kernels restricted to a particular route count.
         fp8_scale_block_shape: Optional FP8 block-scale shape requirement.
         internal_activation_dtype: Optional internal activation dtype requirement.
             "input" is a special value that uses the whatever dtype the input
@@ -1343,6 +1569,10 @@ def moe_plan(
             the caller must not reduce; it needs a kernel declaring the
             ``combine_order`` trait with ``"slot"`` and, for ``ep_size > 1``,
             the EP process group. Required keyword.
+        features: Registered capabilities the apply kernel must declare, e.g.
+            ``frozenset({"batch_invariant"})``, which plans the kernel once
+            from static geometry (``KernelPlan``); empty for ordinary
+            selection. Required keyword.
         solution: Optional kernel solution to force through normal selection.
             None leaves the concrete kernel choice to the registry.
         fp32_correction_bias: Whether routing must add the DeepSeekV3
@@ -1388,6 +1618,8 @@ def moe_plan(
         ep_size=ep_size,
         ispp=ispp,
         hidden=hidden,
+        num_experts=num_experts,
+        top_k=top_k,
         swiglu_form=swiglu_form,
         activation_clamped=activation_clamped,
         expert_id_repeats=expert_id_repeats,
@@ -1398,7 +1630,7 @@ def moe_plan(
     )
     traits["persistent_workspace"] = persistent_max_num_tokens_per_gpu is not None
 
-    kernel, apply_spec = _select_moe_apply(input_dtype, traits, solution)
+    kernel, apply_spec = _select_moe_apply(input_dtype, traits, solution, features)
     # A kernel that routes from logits keeps an FP32 correction bias only if
     # its hook says so; TokenSpeed's top-k routers always add it in FP32.
     fp32_bias_hook = getattr(kernel.impl, "_tokenspeed_fp32_correction_bias", None)
@@ -1415,7 +1647,7 @@ def moe_plan(
             )
         _log_fp32_correction_bias_fallback(apply_spec.name)
         routing_mode = traits["routing_mode"] = "precomputed_topk"
-        kernel, apply_spec = _select_moe_apply(input_dtype, traits, solution)
+        kernel, apply_spec = _select_moe_apply(input_dtype, traits, solution, features)
     _validate_selected_deepep_mode(
         a2a_backend,
         deepep_mode,
@@ -1440,10 +1672,33 @@ def moe_plan(
     supports_deferred_finalize = True in apply_spec.traits.get(
         "supports_deferred_finalize", frozenset({False})
     )
+    topk_weights_dtypes = apply_spec.traits.get(
+        "topk_weights_dtype", frozenset({torch.float32})
+    )
+    if len(topk_weights_dtypes) != 1:
+        raise ValueError(
+            f"MoE kernel {apply_spec.name!r} must declare exactly one "
+            "topk_weights_dtype"
+        )
+    topk_weights_dtype = next(iter(topk_weights_dtypes))
+    if supports_deferred_finalize and topk_weights_dtype not in (
+        torch.float32,
+        torch.bfloat16,
+    ):
+        raise ValueError(
+            f"MoE kernel {apply_spec.name!r} uses unsupported deferred-finalize "
+            f"weight dtype {topk_weights_dtype}"
+        )
+    supports_prequantized_input = True in apply_spec.traits.get(
+        "supports_prequantized_input", frozenset({False})
+    )
     return {
         "weight_dtype": weight_dtype,
         "activation": activation,
         "apply_kernel_name": apply_spec.name,
+        "apply_kernel": kernel,
+        "input_dtype": input_dtype,
+        "features": features,
         "weight_preprocessor": apply_spec.weight_preprocessor,
         "warmup": getattr(kernel.impl, "_tokenspeed_warmup", None),
         "a2a_backend": a2a_backend,
@@ -1458,6 +1713,8 @@ def moe_plan(
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
+        "topk_weights_dtype": topk_weights_dtype,
+        "supports_prequantized_input": supports_prequantized_input,
         # All-to-all EP (DeepEP, Petit): each rank runs its own tokens'
         # routes, so routing may pick per-rank replicas. Otherwise every
         # rank routes every token and must agree on one replica per route.
@@ -1509,6 +1766,17 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
     return result
 
 
+def moe_warmup(plan: dict, w: torch.nn.Module, *, max_num_tokens: int) -> None:
+    """Warm ``plan``'s selected backend using ``w``'s processed expert weights.
+
+    ``max_num_tokens`` bounds global routing rows. Plans without a warmup
+    callback need no work; this function returns nothing.
+    """
+    warmup = plan.get("warmup")
+    if warmup is not None:
+        warmup({**plan, "warmup_max_num_tokens": max_num_tokens}, w)
+
+
 def moe_apply(
     plan: dict,
     x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -1528,15 +1796,18 @@ def moe_apply(
     shared_input: torch.Tensor | None = None,
     shared_weight: torch.Tensor | None = None,
     shared_out: torch.Tensor | None = None,
+    x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
+    routing_prepared: object | None = None,
 ):
     """Apply a planned MoE kernel.
 
     Args:
         plan: Execution plan returned by moe_plan.
         x: Hidden states with shape [tokens, hidden_size], or a
-            (packed_nvfp4, block_scales) pair for a kernel supporting prequantized
+            (packed_fp4, block_scales) pair for a kernel supporting prequantized
             input. Packed data is uint8 [tokens, hidden_size // 2]; scales are
-            linear uint8/float8 [tokens, hidden_size // 16].
+            linear uint8/float8 [tokens, hidden_size // 16] for NVFP4 or
+            CDNA4-swizzled E8M0 bytes for the gfx950 MXFP4 kernel.
         w: Module containing processed MoE weights.
         router_logits: Router logits with shape [tokens, num_experts], or None
             for a precomputed-TopK kernel that consumes only IDs and weights.
@@ -1567,16 +1838,21 @@ def moe_apply(
         shared_out: Optional destination for the shared-expert down projection
             with shape [tokens, output_size]. Must be provided together with
             ``shared_input`` and ``shared_weight``.
+        x_quantized: Optional ``x`` already quantized in the kernel's
+            activation format, so the kernel skips its own quantize. Only
+            forwarded when given; kernels that cannot consume it reject it.
+        routing_prepared: Routing metadata the top-k kernel filled ahead of
+            this call, so the kernel skips its routing launch. Only forwarded
+            when given; kernels that cannot consume it reject it.
 
     Solutions may use precomputed top-k tensors or route from logits directly.
     """
     data = x[0] if isinstance(x, tuple) else x
-    kernel = select_kernel(
-        "moe",
-        "apply",
-        format_signature(x=dense_tensor_format(data.dtype)),
-        override=plan["apply_kernel_name"],
-    )
+    kernel = plan["apply_kernel"]
+    if "batch_invariant" in plan["features"] and data.dtype != plan["input_dtype"]:
+        raise ValueError(
+            "Batch-invariant MoE input dtype differs from its initialization plan"
+        )
     # Only the all-to-all EP kernels own dispatch/combine legs, so the mode
     # decision stays off the signature every other apply kernel implements.
     a2a_kwargs = (
@@ -1598,6 +1874,10 @@ def moe_apply(
         if all(value is not None for value in shared_tensors)
         else {}
     )
+    # Kernels that cannot consume a pre-quantized activation never see the argument.
+    quantized_kwargs = {"x_quantized": x_quantized} if x_quantized is not None else {}
+    if routing_prepared is not None:
+        quantized_kwargs["routing_prepared"] = routing_prepared
     return kernel(
         plan=plan,
         x=x,
@@ -1611,6 +1891,7 @@ def moe_apply(
         enable_pdl=pdl_enabled(),
         **a2a_kwargs,
         **shared_kwargs,
+        **quantized_kwargs,
     )
 
 
@@ -1625,6 +1906,9 @@ import tokenspeed_kernel.ops.moe.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.marlin  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.native  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: E402,F401
-from tokenspeed_kernel.ops.moe.native import torch_softmax_topk  # noqa: E402
+from tokenspeed_kernel.ops.moe.native import (
+    torch_softmax_topk,
+    torch_softmax_bias_topk,
+)  # noqa: E402
 
 # isort: on

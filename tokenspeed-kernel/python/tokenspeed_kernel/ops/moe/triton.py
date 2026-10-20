@@ -20,11 +20,14 @@
 
 from __future__ import annotations
 
+import tokenspeed_kernel.ops.moe._triton.routed_norm  # noqa: F401
 import torch
 from tokenspeed_kernel.ops.moe._triton.bf16 import (
-    _triton_bf16_moe_impl,
-    _validate_bf16_moe,
+    _check_route_tensors as _check_bf16_route_tensors,
 )
+from tokenspeed_kernel.ops.moe._triton.bf16 import _moe as _triton_bf16_moe_impl
+from tokenspeed_kernel.ops.moe._triton.bf16 import _route_outputs as _bf16_route_outputs
+from tokenspeed_kernel.ops.moe._triton.bf16 import _validate as _validate_bf16_moe
 from tokenspeed_kernel.ops.moe._triton.decode_sigmoid_topk import (
     decode_sigmoid_bias_topk,
 )
@@ -36,6 +39,9 @@ from tokenspeed_kernel.ops.moe._triton.fp8_channel import (
     _triton_fp8_channel_moe_impl,
     _validate_fp8_channel_moe,
 )
+from tokenspeed_kernel.ops.moe._triton.fp8_channel_fused import (
+    _triton_fp8_channel_fused_moe_impl,
+)
 from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
     kimi3_sigmoid_bias_topk,
 )
@@ -45,7 +51,10 @@ from tokenspeed_kernel.ops.moe._triton.latent_input import (
 from tokenspeed_kernel.ops.moe._triton.minimax_topk import (
     minimax_biased_grouped_topk,
 )
-from tokenspeed_kernel.ops.moe._triton.mxfp4 import _triton_mxfp4_moe_impl
+from tokenspeed_kernel.ops.moe._triton.mxfp4 import _moe as _triton_mxfp4_moe_impl
+from tokenspeed_kernel.ops.moe._triton.sigmoid_topk_routing import (
+    triton_sigmoid_bias_topk_routing,
+)
 from tokenspeed_kernel.ops.moe._triton.softmax_topk import triton_softmax_topk
 from tokenspeed_kernel.ops.moe._triton.sqrt_softplus_topk import (
     triton_sqrt_softplus_topk,
@@ -460,6 +469,40 @@ def triton_decode_sigmoid_bias_topk_mapped(
 
 @register_kernel(
     "moe",
+    "routes",
+    name="triton_bf16_moe_routes",
+    solution="triton",
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    priority=Priority.PORTABLE,
+)
+def triton_bf16_moe_routes(
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_start: int,
+) -> torch.Tensor:
+    """Triton kernel of :func:`tokenspeed_kernel.ops.moe.bf16_moe_routes`."""
+    _check_bf16_route_tensors(x, w13, w2, topk_ids)
+    if x.dtype != torch.bfloat16:
+        raise TypeError("x must use torch.bfloat16")
+    if expert_start < 0:
+        raise ValueError("expert_start must be non-negative")
+    return _bf16_route_outputs(
+        x,
+        w13,
+        w2,
+        topk_ids,
+        "swiglu",
+        1.0,
+        None,
+        expert_start,
+        False,
+    )
+
+
+@register_kernel(
+    "moe",
     "apply",
     name="triton_bf16_precomputed_moe_apply",
     solution="triton",
@@ -493,6 +536,11 @@ def triton_bf16_precomputed_moe_apply(
 
     Args:
         plan: MoE plan selecting standard SiLU/SwiGLU or SiTU activation.
+            Opt-in ``precision_policy="bf16_route_accum_fp32"`` rounds GEMM1
+            gate/up outputs to BF16 before FP32 SiLU, rounds every weighted
+            BF16 GEMM2 output to BF16, accumulates those routes in FP32, and
+            applies the required ``output_scale`` before the final BF16 store.
+            Route weights must already be normalized, unscaled FP32 values.
         x: Contiguous hidden states `[tokens, hidden]` in FP16 or BF16.
         w: Module with contiguous `w13_weight` `[E, 2I, H]` and
             `w2_weight` `[E, H, I]` tensors matching `x.dtype`.
@@ -519,6 +567,8 @@ def triton_bf16_precomputed_moe_apply(
         activation,
         float(getattr(w, "activation_situ_beta", 1.0) or 1.0),
         getattr(w, "activation_situ_linear_beta", None),
+        plan.get("precision_policy", "default") == "bf16_route_accum_fp32",
+        float(plan.get("output_scale", 1.0)),
     )
 
 
@@ -644,9 +694,10 @@ def triton_fp8_channel_precomputed_moe_apply(
     """Apply FP8 per-output-channel experts with dynamic per-token activations.
 
     Args:
-        plan: MoE plan for standard SiLU/SwiGLU. The rounding points are
-            those of the ``_triton/fp8_channel.py`` docstring; fold any routed
-            scale into ``topk_weights``.
+        plan: MoE plan for standard SiLU/SwiGLU and the default precision
+            policy. The rounding points are those of the
+            ``_triton/fp8_channel.py`` docstring; fold any routed scale into
+            ``topk_weights``.
         x: Contiguous BF16 hidden states ``[tokens, hidden]``.
         w: Module with contiguous FP8 E4M3 ``w13_weight`` ``[E, 2I, H]`` (gate
             rows, then up rows), FP32 ``w13_weight_scale`` ``[E, 2I]``, FP8
@@ -671,6 +722,77 @@ def triton_fp8_channel_precomputed_moe_apply(
         plan, x, w, topk_weights, topk_ids, do_finalize
     )
     return _triton_fp8_channel_moe_impl(
+        x,
+        w.w13_weight,
+        w.w13_weight_scale,
+        w.w2_weight,
+        w.w2_weight_scale,
+        topk_weights,
+        topk_ids,
+        expert_offset,
+    )
+
+
+# ===-----------------------------------------------------------------------===#
+# FP8 per-channel experts with fused FP32 activation
+# ===-----------------------------------------------------------------------===#
+
+
+@register_kernel(
+    "moe",
+    "apply",
+    name="triton_fp8_channel_fused_precomputed_moe_apply",
+    solution="triton",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"amd"}),
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    traits={
+        "weight_dtype": frozenset({"fp8_channel"}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "swiglu_form": frozenset({"standard"}),
+        "activation_clamped": frozenset({False}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({False, True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({32}),
+        "hidden_alignment": frozenset({128}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "supports_bias": frozenset({False}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_fp8_channel_fused_precomputed_moe_apply(
+    plan: dict,
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    num_tokens_global: int | None = None,
+    max_num_tokens_per_gpu: int | None = None,
+    do_finalize: bool = True,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Apply standard FP8 channel experts, retaining FP32 gate/up until SiLU.
+
+    Arguments and resident weight layout match
+    ``triton_fp8_channel_precomputed_moe_apply``. The selected kernel explicitly
+    chooses fused FP32 activation and BF16-before-E4M3 route quantization;
+    it preserves original FP32 route weights and finalizes to BF16. Expert
+    parallelism filters global expert IDs to this rank's contiguous range.
+    Input rows use the public token quantizer. No vendor weight shuffle is used.
+    Returns finalized BF16 hidden states with the shape of ``x``.
+    """
+    if enable_pdl:
+        raise ValueError("Portable FP8 channel MoE does not support enable_pdl=True")
+    expert_offset = _validate_fp8_channel_moe(
+        plan, x, w, topk_weights, topk_ids, do_finalize
+    )
+    return _triton_fp8_channel_fused_moe_impl(
         x,
         w.w13_weight,
         w.w13_weight_scale,
@@ -726,8 +848,8 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
         "weight_dtype": frozenset({"mxfp4"}),
         "activation": frozenset({"silu", "situ", "swiglu"}),
         "routing_mode": frozenset({"precomputed_topk"}),
-        "supports_deferred_finalize": frozenset({False}),
-        "supports_ep": frozenset({False}),
+        "supports_deferred_finalize": frozenset({False, True}),
+        "supports_ep": frozenset({False, True}),
         "supports_all_to_all_ep": frozenset({False}),
         "ispp_alignment": frozenset({32, 128}),
         "internal_activation_dtype": frozenset({"input", "mxfp4"}),
@@ -746,8 +868,12 @@ def triton_mxfp4_precomputed_moe_apply(
     max_num_tokens_per_gpu: int | None = None,
     do_finalize: bool = True,
     enable_pdl: bool = False,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, None, torch.Tensor]:
     """Apply experts with dynamic MXFP4 activations or weight-only MXFP4.
+
+    Only the default precision policy and unit ``output_scale`` are supported.
+    Expert outputs are stored in the input dtype, then weighted and summed
+    in FP32 before the final store. Fold any routed scale into ``topk_weights``.
 
     Args:
         plan: MoE plan selecting standard SiLU/SwiGLU or SiTU activation.
@@ -756,14 +882,18 @@ def triton_mxfp4_precomputed_moe_apply(
             E8M0 `w13_weight_scale`/`w2_weight_scale` tensors.
         router_logits: Unused because routing must be precomputed.
         topk_weights: Route weights `[tokens, top_k]`.
-        topk_ids: Expert ids `[tokens, top_k]`. Out-of-range ids contribute zero.
-        num_tokens_global: Unused; distributed expert parallelism is unsupported.
+        topk_ids: Global expert ids `[tokens, top_k]`. Experts outside this
+            rank's contiguous shard contribute zero.
+        num_tokens_global: Unused; EP reduction stays with the caller.
         max_num_tokens_per_gpu: Unused token-capacity hint.
-        do_finalize: Must be true.
+        do_finalize: Whether to reduce the weighted routes into hidden states.
         enable_pdl: Unused launch hint.
 
     Returns:
-        Finalized hidden states `[tokens, hidden]` with dtype matching `x`.
+        Finalized hidden states `[tokens, hidden]` with dtype matching `x`, or
+        `(route_outputs, None, expanded_idx)` for deferred finalization. The
+        map holds canonical route rows for local experts and `-1` for remote
+        experts.
     """
     del router_logits, num_tokens_global, max_num_tokens_per_gpu, enable_pdl
     return _triton_mxfp4_moe_impl(
@@ -803,3 +933,16 @@ register_kernel(
         "inputs_contiguous": frozenset({True}),
     },
 )(triton_latent_input_packed)
+
+
+register_kernel(
+    "moe",
+    "sigmoid_bias_topk_routing",
+    name="triton_sigmoid_bias_topk_routing",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=format_signatures(
+        "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+    ),
+    priority=Priority.PERFORMANT,
+)(triton_sigmoid_bias_topk_routing)

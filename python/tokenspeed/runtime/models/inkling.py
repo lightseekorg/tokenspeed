@@ -929,7 +929,9 @@ class InklingSparseMoeBlock(nn.Module):
     def forward(self, x: torch.Tensor, ctx: ForwardContext) -> torch.Tensor:
         # weights: [T, k + S] — selected-routed weights then shared sink gammas (joint normalization).
         top_k = self.gate.top_k
-        deferred = not self.use_torch_moe and self.experts.supports_deferred_finalize
+        deferred = (
+            not self.use_torch_moe and self.experts.supports_deferred_cuda_finalize
+        )
         if deferred:
             num_global_tokens, max_tokens_per_gpu = self.comm_manager.get_num_tokens(
                 ctx
@@ -962,6 +964,7 @@ class InklingSparseMoeBlock(nn.Module):
                 weights,
                 shared_out,
                 top_k=top_k,
+                hidden_dim=x.shape[-1],
             )
         else:
             weights, topk_ids, router_logits = self.gate(x)

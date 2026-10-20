@@ -27,7 +27,9 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.distributed.comm_backend import get_global_backend
 from tokenspeed.runtime.execution.slot_state import (
     PREPARED_MARKER_BYTES,
     pack_slot_rows,
@@ -173,12 +175,9 @@ class SamplingBackend(ABC):
     _SUPPORTS_DP_VERIFY: bool = False
     _SUPPORTS_SYNTHETIC_ACCEPTANCE: bool = False
 
-    #: Pool-shaped buffers whose rows never change (every slot reads the same
-    #: constant), so a retraction image carries nothing for them. The
-    #: architecture test accepts these beside the exported rows; no sampling
-    #: row is token-derived.
-    constant_slot_state: tuple[str, ...] = ("_zero_offsets_pool",)
-    token_derived_slot_state: tuple[str, ...] = ()
+    constant_slot_state: tuple[str, ...] = ()
+    # Recomputed from the current frontier before every consumer; no restore.
+    token_derived_slot_state: tuple[str, ...] = ("_sampling_offsets_pool",)
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 
@@ -230,12 +229,16 @@ class SamplingBackend(ABC):
         # Pool-indexed kernels (the Triton Gumbel-max routes, the FlashInfer
         # backends' per-request stream) take int32 pool indices and a
         # pool-indexed offsets table; see _req_pool_indices_for_kernels and
-        # _offsets_pool_for_kernels. Backends with DP padding re-carve them.
+        # _prepare_sampling_offsets. Backends with DP padding re-carve them.
         self._req_pool_indices_i32: torch.Tensor = torch.empty(
             (0,), dtype=torch.int32, device=config.device
         )
-        self._zero_offsets_pool: torch.Tensor = torch.zeros(
-            (config.max_req_pool_size + 1,), dtype=torch.int64, device=config.device
+        self._sampling_offsets_pool: torch.Tensor | None = (
+            torch.zeros(
+                (config.max_req_pool_size + 1,), dtype=torch.int64, device=config.device
+            )
+            if self._HAS_POOL_STATE
+            else None
         )
         if self._HAS_POOL_STATE:
             self._allocate_pool_index_buffer(config.max_bs)
@@ -314,14 +317,29 @@ class SamplingBackend(ABC):
         out.copy_(req_pool_indices, non_blocking=True)
         return out
 
-    def _offsets_pool_for_kernels(
+    def _prepare_sampling_offsets(
         self, sampling_info: SamplingBatchInfo
     ) -> torch.Tensor:
-        """The pool-indexed cache lengths that position each request's stream,
-        or an all-zero pool when the step carries none (capture warm-up)."""
-        if sampling_info.valid_cache_lengths is not None:
-            return sampling_info.valid_cache_lengths
-        return self._zero_offsets_pool
+        """Prepare just this sampler call's slots, on the sampling stream.
+
+        Offsets are scratch for the pool-kernel ABI, not request state. Slot
+        zero remains the padding sentinel; omitted/open-prefill rows do no work.
+        """
+        if sampling_info.valid_cache_lengths is None:
+            raise ValueError(
+                "Sampling offsets require valid_cache_lengths, including during "
+                "warmup and CUDA graph capture"
+            )
+        from tokenspeed_kernel.ops.sampling import prepare_sampling_offsets
+
+        assert self._sampling_offsets_pool is not None
+        prepare_sampling_offsets(
+            sampling_info.valid_cache_lengths,
+            sampling_info.req_pool_indices,
+            sampling_info.extend_lengths,
+            out=self._sampling_offsets_pool,
+        )
+        return self._sampling_offsets_pool
 
     def broadcast_verify_outputs(self) -> None:
         """Broadcast the packed verify triple from tp_group[0] in one collective.
@@ -330,11 +348,7 @@ class SamplingBackend(ABC):
         including stale rows past the live batch. No-op when sync is off or
         tp_size <= 1. Graph-safe.
         """
-        if self._tp_pg is None:
-            return
-        dist.broadcast(
-            self._output_pack_buf, src=self._tp_src_global_rank, group=self._tp_pg
-        )
+        self.maybe_broadcast(self._output_pack_buf)
 
     def accepted_path(self, bs: int, num_nodes: int) -> torch.Tensor:
         """``[bs, N]`` accepted path (root first, ``-1`` past it) of the last
@@ -376,6 +390,14 @@ class SamplingBackend(ABC):
         if self._tp_pg is None:
             return
         for t in tensors:
+            if (
+                current_platform().is_cdna4
+                and self.config.tp_group is not None
+                and get_global_backend().broadcast_from_first_rank(
+                    t, self.config.tp_group
+                )
+            ):
+                continue
             dist.broadcast(t, src=self._tp_src_global_rank, group=self._tp_pg)
 
     def prepare_step(

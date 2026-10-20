@@ -24,8 +24,10 @@ An FP8 W8A8 linear with per-token activation and per-channel weight scales
 can run on the registry's per-tensor FP8 GEMM (cuBLASLt) with both scales 1:
 its BF16 output is the codes' product rounded once. The next kernel that reads
 that output applies ``token_scale * channel_scale`` (``fp8_dequantize_unscaled``)
-before its own work, such as the SwiGLU with the down projection's per-token
-quantization (``silu_and_mul_quantize_fp8``).
+before its own work: the SwiGLU with the down projection's per-token
+quantization (``silu_and_mul_quantize_fp8``), and Beam's Q/K norms with the
+V and output gate columns (``fused_qk_rmsnorm_rope`` / ``qk_rmsnorm_ssmax`` with
+``dequant=``).
 
 Range: ``|code| <= 448``, so ``|sum| <= 448^2 * K`` (8.2e8 at K = 4,096), far
 inside BF16's range; the unscaled output's rounding is relative (2^-9), as the
@@ -37,6 +39,15 @@ import torch
 from tokenspeed_kernel.ops.activation.triton import silu_and_mul
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.gemm import triton_fp8_channel
+from tokenspeed_kernel.ops.layernorm.qk_rmsnorm_ssmax import (
+    TORCH_QK_RMSNORM_SSMAX,
+    TRITON_FUSED_QK_RMSNORM_SSMAX,
+    qk_rmsnorm_ssmax,
+)
+from tokenspeed_kernel.ops.layernorm.triton import (
+    UnscaledFP8QKVGate,
+    fused_qk_rmsnorm_rope,
+)
 from tokenspeed_kernel.ops.quantization import silu_and_mul_quantize_fp8
 from tokenspeed_kernel.ops.quantization import triton as quant_triton
 from tokenspeed_kernel.ops.quantization.triton import (
@@ -54,6 +65,9 @@ pytestmark = pytest.mark.skipif(
 
 FP8 = torch.float8_e4m3fn
 BF16 = torch.bfloat16
+# Beam's TP8 attention shard: 6 query heads, 1 KV head, head_dim 128.
+Q_HEADS, KV_HEADS, HEAD_DIM = 6, 1, 128
+QW, KVW = Q_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM
 
 
 def _weight(n, k, seed):
@@ -82,8 +96,21 @@ def _rel(out, ref):
 
 
 # (N, K): Llama-3.1-8B shards at 8-way tensor parallelism (fused Q/K/V,
-# output, gate/up, down).
-@pytest.mark.parametrize("n,k", [(768, 4096), (4096, 512), (3584, 4096), (4096, 1792)])
+# output, gate/up, down), and Beam's TP8 shards (fused Q/K/V + output gate,
+# dense gate/up, down, output).
+@pytest.mark.parametrize(
+    "n,k",
+    [
+        (768, 4096),
+        (4096, 512),
+        (3584, 4096),
+        (4096, 1792),
+        (1792, 5120),
+        (5120, 5120),
+        (5120, 2560),
+        (5120, 768),
+    ],
+)
 @pytest.mark.parametrize("m", [1, 4, 17, 64])
 def test_the_unit_scale_gemm_is_the_rounded_code_product(m, n, k):
     w8, _ = _weight(n, k, seed=n + k)
@@ -109,7 +136,8 @@ def test_the_largest_code_product_fits_bf16():
     assert bool((out.float() == -(448.0**2) * k).all())
 
 
-@pytest.mark.parametrize("width", [2048, 192])
+# 2,560 and 320: Beam's dense and expert intermediate size per TP8 rank.
+@pytest.mark.parametrize("width", [2048, 192, 2560, 320])
 @pytest.mark.parametrize("m", [1, 7, 64])
 def test_silu_and_mul_dequantizes_then_quantizes_per_token(m, width):
     k = 4096
@@ -163,3 +191,63 @@ def test_row_counts_do_not_recompile():
     with assert_no_triton_compile(quant_triton._silu_and_mul_quantize_fp8_kernel):
         for m in (7, 16, 64):
             run(m)
+
+
+def _qkvg(m, seed):
+    k = 5120
+    w8, w_scales = _weight(2 * QW + 2 * KVW, k, seed=seed)
+    a8, a_scales = fp8_quantize_per_token(_rows(m, k, seed=seed + m))
+    raw = _unscaled(a8, w8)
+    q, k_, v, gate = raw.split([QW, KVW, KVW, QW], -1)
+    sq, sk, sv, sg = w_scales.split([QW, KVW, KVW, QW])
+    dequant = UnscaledFP8QKVGate(
+        token_scales=a_scales,
+        q_scales=sq,
+        k_scales=sk,
+        v=v,
+        v_scales=sv,
+        gate=gate,
+        gate_scales=sg,
+        v_out=torch.empty(m, KVW, device="cuda", dtype=BF16),
+        gate_out=torch.empty(m, QW, device="cuda", dtype=BF16),
+    )
+    scaled = dequantize_unscaled_fp8(raw, a_scales, w_scales)
+    return q, k_, dequant, scaled.split([QW, KVW, KVW, QW], -1)
+
+
+def _norm_weights():
+    generator = torch.Generator(device="cuda").manual_seed(5)
+    return [
+        (1 + 0.1 * torch.randn(HEAD_DIM, device="cuda", generator=generator)).to(BF16)
+        for _ in range(2)
+    ]
+
+
+@pytest.mark.parametrize("m", [1, 5, 64])
+@pytest.mark.parametrize(
+    "kernel",
+    ["fused_qk_rmsnorm_rope", TRITON_FUSED_QK_RMSNORM_SSMAX, TORCH_QK_RMSNORM_SSMAX],
+)
+def test_the_qk_norms_dequantize_first(m, kernel):
+    """Bit for bit the kernel on the scaled GEMM's BF16 output (the PyTorch
+    dequantization), and V and the output gate are that output's columns."""
+    q, k, dequant, (sq, sk, sv, sg) = _qkvg(m, seed=30)
+    q_weight, k_weight = _norm_weights()
+    positions = torch.arange(100, 100 + m, device="cuda", dtype=torch.int64)
+    call = dict(solution=None, override=kernel)
+    if kernel == "fused_qk_rmsnorm_rope":
+        inv = 1.0 / (
+            10000.0 ** (torch.arange(0, HEAD_DIM, 2, device="cuda") / HEAD_DIM)
+        )
+        freqs = torch.outer(torch.arange(4096, device="cuda").float(), inv)
+        cache = torch.cat([freqs.cos(), freqs.sin()], -1)
+        args = (q_weight, k_weight, cache, positions, 1e-6, Q_HEADS, KV_HEADS, HEAD_DIM)
+        got = fused_qk_rmsnorm_rope(q, k, *args, dequant=dequant)
+        expected = fused_qk_rmsnorm_rope(sq, sk, *args)
+    else:
+        got = qk_rmsnorm_ssmax(
+            q, k, q_weight, k_weight, 1e-6, positions, dequant=dequant, **call
+        )
+        expected = qk_rmsnorm_ssmax(sq, sk, q_weight, k_weight, 1e-6, positions, **call)
+    assert torch.equal(got[0], expected[0]) and torch.equal(got[1], expected[1])
+    assert torch.equal(dequant.v_out, sv) and torch.equal(dequant.gate_out, sg)

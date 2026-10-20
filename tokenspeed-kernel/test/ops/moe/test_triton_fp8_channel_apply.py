@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.moe import torch_moe_experts
+from tokenspeed_kernel.numerics.torch.quantization import (
+    quantize_fp8_rows,
+    round_to_bf16_exact,
+)
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
@@ -39,6 +44,7 @@ def _plan(**overrides) -> dict:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
         # On SM100 and SM103 FlashInfer's TRT-LLM kernel ranks first.
         solution="triton",
     )
@@ -106,40 +112,33 @@ def test_fp8_channel_plan_needs_sm90_or_newer(a100_platform) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _bf16(x: torch.Tensor) -> torch.Tensor:
-    # Single RNE rounding of FP64 values (torch rounds FP64 via FP32 first).
-    mantissa, exponent = torch.frexp(x)
-    return torch.ldexp(torch.round(mantissa * 256) / 256, exponent)
-
-
-def _quantize_rows_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    # Correctly rounded FP32 quotients: an FP64 quotient of FP32 values rounds
-    # to the FP32 one (Torch divides by a scalar through its reciprocal).
-    values = x.double()
-    scale = (values.abs().amax(dim=1) / 448.0).float().clamp(min=2.0**-126)
-    codes = (values / scale.double()[:, None]).float()
-    return codes.clamp(-448.0, 448.0).to(torch.float8_e4m3fn), scale
-
-
 def _moe_reference(x, w13, w13_scale, w2, w2_scale, topk_weights, topk_ids, offset):
-    intermediate_size = w2.shape[2]
-    x_codes, x_scale = _quantize_rows_reference(x)
-    local_ids = topk_ids.long() - offset
-    output = torch.zeros(x.shape, dtype=torch.float64, device=x.device)
-    for expert in range(w13.shape[0]):
-        tokens, slots = torch.where(local_ids == expert)
-        if tokens.numel() == 0:
-            continue
-        fc1 = x_codes[tokens].double() @ w13[expert].double().T
-        fc1 *= x_scale[tokens, None].double() * w13_scale[expert].double()
-        gate = _bf16(fc1[:, :intermediate_size])
-        up = _bf16(fc1[:, intermediate_size:])
-        activated = _bf16(gate * torch.sigmoid(gate) * up)
-        act_codes, act_scale = _quantize_rows_reference(activated)
-        fc2 = act_codes.double() @ w2[expert].double().T
-        fc2 = _bf16(fc2 * act_scale[:, None].double() * w2_scale[expert].double())
-        output.index_add_(0, tokens, fc2 * topk_weights[tokens, slots, None].double())
-    return _bf16(output)
+    def dequantize(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        return weight.double() * scale.double()[..., None]
+
+    def activation(fc1: torch.Tensor) -> torch.Tensor:
+        gate, up = round_to_bf16_exact(fc1).chunk(2, dim=-1)
+        return round_to_bf16_exact(gate * torch.sigmoid(gate) * up)
+
+    def quantize(values: torch.Tensor) -> torch.Tensor:
+        codes, scale = quantize_fp8_rows(values)
+        return codes.double() * scale.double()[:, None]
+
+    output = torch_moe_experts(
+        x,
+        dequantize(w13, w13_scale),
+        dequantize(w2, w2_scale),
+        topk_ids.long(),
+        topk_weights,
+        activation=activation,
+        w13_bias=None,
+        w2_bias=None,
+        quantize_input=quantize,
+        quantize_intermediate=quantize,
+        round_expert_output=round_to_bf16_exact,
+        first_expert=offset,
+    )
+    return round_to_bf16_exact(output)
 
 
 def _quantized(shape: tuple[int, ...], generator: torch.Generator):
@@ -174,7 +173,7 @@ def test_fp8_channel_row_quantization_is_exact() -> None:
     expert_ids = torch.tensor([0, 1, -1, 3, 1, 9], device="cuda", dtype=torch.int32)
 
     codes, scales = _quantize_rows(x)
-    expected_codes, expected_scales = _quantize_rows_reference(x)
+    expected_codes, expected_scales = quantize_fp8_rows(x)
     assert torch.equal(codes.view(torch.uint8), expected_codes.view(torch.uint8))
     assert torch.equal(scales, expected_scales)
 

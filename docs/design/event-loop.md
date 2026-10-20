@@ -156,7 +156,11 @@ Consequences:
   backpressured stage off the control plane. The remote submissions' only
   failure surface is a settle at the next round's `execute` (their semantic
   completion arrives through the transfer events; a submission that RAISED
-  produces none, so the settle must not swallow it). The handle's remaining
+  produces none, so the settle must not swallow it). A raise is therefore
+  for broken invariants only: a transfer worker, the bootstrap thread or
+  another Prefill rank can fail a request's transfer while its submission
+  waits on the FIFO, and that submission then does nothing for the request,
+  whose failure arrives as its transfer event. The handle's remaining
   `run_*` methods do block, deliberately — the DP idle forward, the landing of a
   completed remote prefill, the KV repair after a wake, the RL weight sync —
   but each is a low-rate path whose caller cannot proceed without the result
@@ -245,6 +249,18 @@ same on every rank, so the ranks collect in the same round and each
 collection walks only what serving keeps alive. The young generations still
 collect automatically.
 
+### Profiling the issuing thread
+
+Profiling must include the forward thread that issues device work. Batch and
+request annotations describe the immutable submitted work, not its later
+completion. Collecting them must not read device tensors or change scheduling
+and synchronization behavior.
+
+Device work may outlive its host range. Analysis must correlate launches with
+device events within each rank and process rather than clip GPU time to host
+timestamps. Profile startup rejects unsupported capture capabilities instead
+of silently producing an incomplete trace.
+
 ### The capture contract
 
 Information crosses to the data plane **only** inside the submitted closure,
@@ -297,7 +313,7 @@ There are exactly two call sites, each with a documented reason:
 * **Head of the round** — completed Host cache-op events
   (`_cache_hooks.poll_ready_events()`: `WriteBackDone`, `LoadBackDone`,
   `PrefetchDone`, `SnapshotDone`, `RestoreDone`, each replica-intersected).
-  These must advance *before* `next_execution_plan`, otherwise cache-gated
+  These must advance *before* `next_execution_plan`; otherwise, cache-gated
   admissions -- a prefetched request's admission, a suspended request's
   restore, which waits for both of its store ACKs, then its own -- are
   delayed by a full round.
@@ -354,6 +370,19 @@ The same reasoning fixes the metrics call: the loop records scheduler
 iteration metrics once per round, from the same pre-dispatch snapshot as the
 scheduler stats.
 
+Metric reporters share those collection points. Installed plugins must accept
+scalar observations promptly on the producer thread and perform delivery in the
+background. Plugin discovery and creation happen outside the loop. Reporters
+preserve the engine's worker termination behavior; a forcibly terminated worker
+may lose queued observations without running metrics cleanup. Their event
+channel is separate from load snapshots: counter increments and histogram
+observations cannot be conflated. The metric adapter suppresses unchanged gauge
+assignments before constructing events or distributing them, while retaining
+value changes and refreshing snapshots on subsequent assignments. This policy
+belongs to the metric adapter, not the scheduler loop or individual plugins. See
+[metric output plugins](../metrics-plugins.md) for event semantics, registration,
+and output lifecycle contracts.
+
 Per-request metrics anchor to request lifecycle points instead of the round
 snapshot. `tokenspeed:request_queue_time_seconds` stamps each request's
 waiting-queue entry at `_submit_scheduler_requests` — the single funnel
@@ -400,11 +429,23 @@ Current inventory:
 | `_gc_hooks` | `GcHooks` — `engine/gc_hooks.py` | self-contained (only its interval; no loop reference) | `note_round` |
 
 `_pause_hooks` and `_pd_hooks` also receive the `DeviceHandle`: both have
-work that must land on the data plane — the DP idle forward and the KV repair
-after a memory-saver wake, and the device writes that land a completed remote
-prefill. `PauseHooks` additionally supplies `reset_caches_for_release` and
-`kv_repair_after_wake` to the memory-occupation controller as callbacks.
-Those are not loop entry points — they fire on release/wake.
+work that must land on the data plane — the DP idle forward and the work
+around a memory-saver release/wake, and the device writes that land a
+completed remote prefill. `PauseHooks` additionally supplies the
+memory-occupation controller's regions (`memory_regions`: one release/resume
+pair per tag, whose data-plane half — quiescing copies, the PD transfer
+engine's registration, the KV repair, NCCL suspend — rides the handle) and its
+release gates (`reset_caches_for_release`, `transfers_idle_for_release`).
+Those are not loop entry points — they fire on release/wake. A disaggregated
+engine refuses new requests while a release is draining or memory is
+released: their transfer registration would name memory the release unmaps
+(and a decode node re-registers it under a new transfer session on wake).
+Release also waits for both weight-op FIFOs to empty through their usual
+same-round gate. It refuses a paused PD engine with buffered requests, whose
+transfers cannot drain until those requests are admitted. Their handshake
+registration is deferred until resume admits them: polling a handshake before
+its scheduler request exists would lose its completion event and strand the
+request after resume. Aborted buffered requests never register a transfer.
 
 `EplbHooks` is the online expert rebalance (`--enable-eplb`). The
 controller counts the forwards this rank submitted — real or DP-idle, so the
@@ -615,8 +656,11 @@ For orientation, one iteration of `event_loop`:
   it) while the executor's lane fills the pages in prefix order, stopping at
   the first missing object or at the deadline -- which bounds when the next
   batch may start, not a batch in flight: the store's `batch_get_into` has
-  no timeout, so a hung get holds the single-thread lane and every later
-  prefetch, the namespace delete and shutdown behind it. Each round the hooks
+  no timeout, so a hung get holds its active Host pages, namespace deletion
+  and shutdown. The deadline is counted from submission; an expired queued
+  job becomes a zero-page miss only when cancellation proves its worker
+  never started.
+  Active I/O retains its pages until completion. Each round the hooks
   MIN-reduce every in-flight op's landed prefix across the replica; the
   converged op is acknowledged once as `PrefetchDoneEvent(op_id,
   landed_pages)`, the scheduler publishes the landed prefix in the Host

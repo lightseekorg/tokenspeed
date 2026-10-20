@@ -27,6 +27,7 @@ packed Host CacheBlocks.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import sys
 import threading
@@ -72,7 +73,10 @@ class TestL3FlatKvRoundTripTest:
         self.CacheGroupLayout = CacheGroupLayout
         self.CacheTransferLayout = CacheTransferLayout
 
-    def test_d2h_backup_host_wipe_prefetch_h2d_restores_bytes(self, request):
+    @pytest.mark.parametrize("capacity_pressure", [False, True])
+    def test_d2h_backup_host_wipe_prefetch_h2d_restores_bytes(
+        self, request, capacity_pressure
+    ):
         torch = self.torch
         first = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
         second = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
@@ -139,6 +143,43 @@ class TestL3FlatKvRoundTripTest:
                 world_cpu_group=None,
             )
         store = self.MemoryKvStore()
+        retry_started = threading.Event()
+        release_retry = threading.Event()
+        if capacity_pressure:
+            from tokenspeed.runtime.cache.l3.mooncake import MooncakeKvStore
+
+            class RpcStore:
+                def __init__(self):
+                    self.objects = {}
+                    self.failed = False
+
+                def batch_is_exist(self, keys):
+                    return [int(key in self.objects) for key in keys]
+
+                def batch_put_from(self, keys, ptrs, sizes):
+                    if self.failed:
+                        retry_started.set()
+                        if not release_retry.wait(timeout=10):
+                            raise TimeoutError("test did not release capacity retry")
+                    results = []
+                    for key, ptr, size in zip(keys, ptrs, sizes):
+                        if not self.failed:
+                            self.failed = True
+                            results.append(-200)
+                        else:
+                            self.objects[key] = ctypes.string_at(ptr, size)
+                            results.append(0)
+                    return results
+
+                def batch_get_into(self, keys, ptrs, sizes):
+                    for key, ptr, size in zip(keys, ptrs, sizes):
+                        payload = self.objects[key]
+                        assert len(payload) == size
+                        ctypes.memmove(ptr, payload, size)
+                    return list(sizes)
+
+            store = object.__new__(MooncakeKvStore)
+            store.store = RpcStore()
         executor.attach_l3_storage(
             store,
             key_prefix="e2e",
@@ -149,6 +190,7 @@ class TestL3FlatKvRoundTripTest:
             prefetch_batch_pages=128,
         )
         request.addfinalizer(executor.shutdown)
+        request.addfinalizer(release_retry.set)
 
         # A CUDA fence cannot complete a CPU storage future. Hold PUT until
         # the test observes the pending ACK, then let normal polling finish it.
@@ -192,12 +234,19 @@ class TestL3FlatKvRoundTripTest:
         assert (write_results) == ([])
         assert put_started.wait(timeout=10), "L3 backup did not start"
         release_put.set()
+        if capacity_pressure:
+            assert retry_started.wait(timeout=2), "capacity failure was not retried"
+            assert executor.poll_results() == []
+            assert not executor.consume_backup_poll_failure()
+            assert executor.l3_backup_backlog().pending_pages == 3
+            release_retry.set()
         deadline = time.monotonic() + 10
         while not write_results and time.monotonic() < deadline:
             write_results = executor.poll_results()
             if not write_results:
                 time.sleep(0.001)
         assert ([int(event.op_id) for event in write_results]) == ([7])
+        assert not executor.consume_backup_poll_failure()
         assert (executor.l3_store.exists(backup_pages)) == ([True, True, True])
 
         # Prove restore comes from L3, not leftover Host bytes.

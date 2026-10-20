@@ -18,10 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Numerical correctness of fused DP column-linear and CUDA graph replay."""
+"""Representative numerical checks of fused projections and CUDA graph reuse."""
 
+import gc
 import os
 import sys
+from contextlib import contextmanager
 from datetime import timedelta
 
 import pytest
@@ -34,28 +36,66 @@ sys.path.insert(
 )
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, suite="runtime-2gpu")
+register_cuda_ci(est_time=360, suite="runtime-2gpu")
 
 
-@torch.no_grad()
-def _worker(rank, world_size, rendezvous):
-    from tokenspeed_kernel.ops.communication.cute_dsl import (
-        create_fused_tp_projection_state,
-        cute_dsl_fused_fp8_dp_column_linear,
-    )
-    from tokenspeed_kernel.ops.quantization import quantize_fp8
+@contextmanager
+def _capture_graph(graph, stream):
+    # Destructors of discarded CUDA objects can invalidate an active capture.
+    # Match the runtime's capture guard and restore the caller's GC state.
+    gc.collect()
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            yield
+    finally:
+        if gc_was_enabled:
+            gc.enable()
 
-    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
-    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
-    from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
+
+def _context(rank, counts, physical):
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
-    from tokenspeed.runtime.layers.linear import (
-        DPColumnParallelLinear,
-        prepare_dp_linear_communication,
-        release_dp_linear_communication,
+
+    return ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=physical[rank],
+        num_extends=0,
+        input_num_tokens=physical[rank],
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, physical[rank], 1),
+        global_num_tokens=list(counts),
+        collective_global_num_tokens=list(physical),
     )
+
+
+def _initialize_weights(layers, rank):
+    for index, linear in enumerate(layers):
+        torch.manual_seed(917 + rank + 4 * index)
+        linear.weight.copy_(
+            torch.randn_like(linear.weight, dtype=torch.bfloat16).to(
+                torch.float8_e4m3fn
+            )
+        )
+        linear.weight_scale_inv.copy_(
+            torch.rand_like(linear.weight_scale_inv) * 0.005 + 0.005
+        )
+
+
+def _reset_epochs(state):
+    # Replay across the 32-bit boundary to exercise persistent 64-bit epochs.
+    for flags in (state.ready, state.ack, state.input_flags):
+        flags.fill_(2**32 - 4)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
+@torch.no_grad()
+def _worker(rank, world_size, rendezvous, kind):
+    from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
     from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 
     torch.cuda.set_device(rank)
@@ -78,6 +118,28 @@ def _worker(rank, world_size, rendezvous):
         weight_block_size=[128, 128],
         scale_fmt=None,
     )
+    try:
+        check = {"column": _check_column_projection, "row": _check_row_projection}[kind]
+        check(rank, world_size, device, parallel, config)
+    finally:
+        dist.destroy_process_group()
+
+
+def _check_column_projection(rank, world_size, device, parallel, config):
+    from tokenspeed_kernel.ops.communication.cute_dsl import (
+        create_fused_tp_column_projection_state,
+        cute_dsl_fused_fp8_dp_column_linear,
+    )
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
+
+    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+    from tokenspeed.runtime.layers.linear import (
+        DPColumnParallelLinear,
+        prepare_dp_linear_communication,
+        release_dp_linear_communication,
+    )
+
     models = []
     for backend in (NcclBackend(), AutoBackend()):
         with torch.device(device):
@@ -99,16 +161,7 @@ def _worker(rank, world_size, rendezvous):
                     for index in range(2)
                 ]
             )
-        for index, linear in enumerate(model):
-            torch.manual_seed(917 + rank + 4 * index)
-            linear.weight.copy_(
-                torch.randn_like(linear.weight, dtype=torch.bfloat16).to(
-                    torch.float8_e4m3fn
-                )
-            )
-            linear.weight_scale_inv.copy_(
-                torch.rand_like(linear.weight_scale_inv) * 0.005 + 0.005
-            )
+        _initialize_weights(model, rank)
         prepare_dp_linear_communication(model, 4097, torch.bfloat16, backend)
         models.append(model)
     baseline, candidate = models
@@ -117,24 +170,11 @@ def _worker(rank, world_size, rendezvous):
     state = workspace.fused_column
     if world_size == 8:
         # TP8 is available only through an explicitly prepared native state.
-        state = create_fused_tp_projection_state(
+        state = create_fused_tp_column_projection_state(
             dist.group.WORLD, device, 4097, 7168, candidate[0].output_size
         )
     else:
         assert state is not None
-
-    def context(counts, physical):
-        return ForwardContext(
-            attn_backend=None,
-            token_to_kv_pool=None,
-            bs=physical[rank],
-            num_extends=0,
-            input_num_tokens=physical[rank],
-            forward_mode=ForwardMode.DECODE,
-            output_layout=ForwardOutputLayout(0, 0, physical[rank], 1),
-            global_num_tokens=counts,
-            collective_global_num_tokens=physical,
-        )
 
     def counts_for_group(pattern):
         return (tuple(pattern) * ((world_size + len(pattern) - 1) // len(pattern)))[
@@ -189,7 +229,7 @@ def _worker(rank, world_size, rendezvous):
         fused = uses_fusion(max(counts))
         torch.manual_seed(712 + rank)
         x = torch.randn((counts[rank], 7168), device=device, dtype=torch.bfloat16)
-        ctx = context(counts, counts)
+        ctx = _context(rank, counts, counts)
         epoch = int(state.ready[0])
         for left, right in zip(baseline, candidate):
             expected = left(x, ctx=ctx)[0]
@@ -206,7 +246,7 @@ def _worker(rank, world_size, rendezvous):
                     padded_inputs[: x.shape[0]].copy_(x)
                     padded_counts = (32,) * world_size
                     native_expected = left(
-                        padded_inputs, ctx=context(padded_counts, padded_counts)
+                        padded_inputs, ctx=_context(rank, padded_counts, padded_counts)
                     )[0][: x.shape[0]]
                 out = x.new_empty((counts[rank], right.output_size))
                 cute_dsl_fused_fp8_dp_column_linear(
@@ -269,7 +309,7 @@ def _worker(rank, world_size, rendezvous):
         (counts_for_group(counts), native) for counts, native in graph_cases
     )
     contexts = {
-        counts: context([int(n > 0) for n in counts], list(counts))
+        counts: _context(rank, [int(n > 0) for n in counts], counts)
         for counts, _ in graph_cases
     }
     inputs = {
@@ -295,15 +335,12 @@ def _worker(rank, world_size, rendezvous):
                 layer(inputs[counts], ctx=contexts[counts])
     stream.synchronize()
     # Exercise device epoch width and successive layers without host joins.
-    for flags in (state.ready, state.ack, state.input_flags):
-        flags.fill_(2**32 - 4)
-    torch.cuda.synchronize()
-    dist.barrier()
+    _reset_epochs(state)
     graph = torch.cuda.CUDAGraph()
     # Interleave automatic 32-row fallback with padded and unequal fused calls.
     # Explicit 32-row fusion remains available for kernel experiments.
     calls = graph_cases * 6
-    with torch.cuda.graph(graph, stream=stream):
+    with _capture_graph(graph, stream):
         outputs = []
         for index, (counts, native) in enumerate(calls):
             repeat = index // len(graph_cases)
@@ -362,11 +399,358 @@ def _worker(rank, world_size, rendezvous):
             atol=0,
         )
         release_dp_linear_communication(candidate)
-    dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("world_size", (2, 4, 8))
-def test_registered_tp_projection(tmp_path, world_size):
+def _row_projection_graph_counts(world_size):
+    """Exercise dispatch, owner changes, and reuse across representative buckets."""
+    return [
+        tuple(counts[:world_size])
+        for counts in (
+            # Fallback, fusion, and a padded input with unequal owners.
+            (32, 32, 32, 32),
+            (64, 64, 64, 64),
+            (128, 65, 1, 0),
+            # Keep one bucket while the empty owner changes, then change stride.
+            (224, 224, 224, 224),
+            (193, 0, 1, 208),
+            (0, 224, 193, 1),
+            (256, 256, 256, 256),
+            # Cross-owner tiles and receive-tail clearing above the small prefix.
+            (576, 576, 576, 576),
+            (513, 0, 1, 545),
+            (0, 576, 513, 1),
+            (960, 897, 0, 1),
+            # Clustered TP4 output and dynamic TP2 scheduling, including padding.
+            (2048, 2048, 2048, 2048),
+            (4608, 4608, 4608, 4608),
+            (4097, 0, 128, 1),
+            (0, 4097, 128, 1),
+            # Non-clustered large output, skipped padding, then a smaller layout.
+            (5120, 5120, 5120, 5120),
+            (4865, 0, 128, 1),
+            (64, 64, 64, 64),
+        )
+    ]
+
+
+def _check_row_projection(rank, world_size, device, parallel, config):
+    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+    from tokenspeed.runtime.layers.linear import (
+        DPRowParallelLinear,
+        RowParallelLinear,
+        prepare_dp_linear_communication,
+        release_dp_linear_communication,
+    )
+
+    models = []
+    for _ in range(2):
+        with torch.device(device):
+            model = DPRowParallelLinear(
+                12288,
+                7168,
+                parallel=parallel,
+                params_dtype=torch.bfloat16,
+                quant_config=config,
+                prefix="o_proj",
+            )
+        _initialize_weights((model,), rank)
+        prepare_dp_linear_communication(model, 5120, torch.bfloat16, AutoBackend())
+        models.append(model)
+    baseline, candidate = models
+    # Retain the real AutoBackend transport and GEMM for the unfused reference.
+    if baseline.projection_workspace.fused_row is not None:
+        baseline.projection_workspace.fused_row.close()
+    baseline.projection_workspace.fused_row = None
+
+    from tokenspeed_kernel.ops.communication.cute_dsl import (
+        cute_dsl_fused_fp8_dp_row_linear,
+    )
+
+    def fused(x, ctx, scale=None):
+        out = torch.empty((x.shape[0], 7168), device=device, dtype=torch.bfloat16)
+        return cute_dsl_fused_fp8_dp_row_linear(
+            candidate.projection_workspace.fused_row,
+            x,
+            candidate.weight,
+            candidate.weight_scale_inv,
+            tuple(ctx.collective_global_num_tokens),
+            out,
+            input_scales=scale,
+        )
+
+    def reference(x, ctx, scale=None):
+        rows = max(ctx.collective_global_num_tokens)
+        if rows == 0:
+            return x.new_empty((0, 7168), dtype=torch.bfloat16)
+        if rows <= 128 and scale is None:
+            return baseline(x, ctx=ctx)[0].clone()
+        # Above 128 rows, the ordinary path uses NCCL's BF16 reduction.
+        # Verify the fused contract with ordinary GEMM partials and an FP32 sum.
+        from tokenspeed.runtime.distributed.comm_backend.projection import (
+            projection_all_to_all,
+        )
+
+        values, scales = projection_all_to_all(
+            x,
+            rows,
+            False,
+            False,
+            None,
+            baseline.projection_workspace,
+            baseline.comm_backend,
+            input_scales=scale,
+        )
+        if scale is not None:
+            # Independently gather owner rows, then take this producer's channel
+            # shard. Check the real fallback exchanges FP8 bytes and scales.
+            gathered = []
+            for source in (x.view(torch.uint8), scale):
+                padded = source.new_zeros((rows, source.shape[1]))
+                padded[: source.shape[0]].copy_(source)
+                parts = [torch.empty_like(padded) for _ in range(world_size)]
+                dist.all_gather(parts, padded)
+                full = torch.cat(parts)
+                shard = source.shape[1] // world_size
+                gathered.append(full[:, rank * shard : (rank + 1) * shard].contiguous())
+            torch.testing.assert_close(
+                values.view(torch.uint8), gathered[0], rtol=0, atol=0
+            )
+            torch.testing.assert_close(scales, gathered[1], rtol=0, atol=0)
+            values, scales = gathered[0].view(x.dtype), gathered[1]
+        partial = RowParallelLinear.forward(baseline, values, scale=scales, out=None)[0]
+        parts = [torch.empty_like(partial) for _ in range(world_size)]
+        dist.all_gather(parts, partial)
+        total = torch.zeros_like(partial, dtype=torch.float32)
+        for part in parts:
+            total.add_(part.float())
+        return total[rank * rows : rank * rows + x.shape[0]].to(torch.bfloat16)
+
+    # Sample execution behaviors instead of sweeping every tuning bucket.
+    patterns = [
+        (rows,) * world_size for rows in (0, 32, 63, 64, 128, 129, 256, 576, 2048, 5120)
+    ]
+    patterns += [
+        tuple(counts[:world_size])
+        for counts in (
+            (128, 65, 1, 0),
+            (224, 0, 129, 1),
+            (0, 960, 897, 1),
+            (0, 4097, 129, 1),
+        )
+    ]
+    for counts in patterns:
+        x = torch.randn((counts[rank], 12288), device=device, dtype=torch.bfloat16)
+        ctx = _context(rank, counts, counts)
+        expected = reference(x, ctx)
+        actual = candidate(x, ctx=ctx)[0]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        if max(counts) > 0:
+            torch.testing.assert_close(fused(x, ctx), expected, rtol=0, atol=0)
+
+    # Neighboring quantization groups have different maxima at different lanes.
+    # This catches accidental scale sharing between the eight-lane groups.
+    counts = (128,) * world_size
+    x = torch.zeros((128, 12288), device=device, dtype=torch.bfloat16)
+    row_ids = torch.arange(128, device=device)[:, None]
+    group_ids = torch.arange(96, device=device)[None, :]
+    columns = group_ids * 128 + (row_ids + 17 * group_ids + rank) % 128
+    x.scatter_(
+        1, columns, torch.exp2((group_ids % 17 - 8).float()).expand(128, -1).to(x.dtype)
+    )
+    ctx = _context(rank, counts, counts)
+    expected = reference(x, ctx)
+    torch.testing.assert_close(candidate(x, ctx=ctx)[0], expected, rtol=0, atol=0)
+    torch.testing.assert_close(fused(x, ctx), expected, rtol=0, atol=0)
+    # Small weight scales produce signed-zero and subnormal BF16 partials.
+    saved_weight = candidate.weight.clone()
+    saved_scales = candidate.weight_scale_inv.clone()
+    signed_weight = torch.ones_like(candidate.weight, dtype=torch.bfloat16)
+    signed_weight[::2].neg_()
+    scale_exponents = torch.tensor((-145, -143, -140, -126, 0), device=device)
+    scale_rows = torch.arange(candidate.weight_scale_inv.shape[0], device=device)
+    tiny_scales = torch.exp2(scale_exponents[scale_rows % 5].float())[
+        :, None
+    ].expand_as(candidate.weight_scale_inv)
+    for model in models:
+        model.weight.copy_(signed_weight)
+        model.weight_scale_inv.copy_(tiny_scales)
+    # Small stores, split accumulators, cross-owner vector stores, and both
+    # clustered and non-clustered reduction must preserve the zero sentinel.
+    for rows in (32, 128, 256, 4608, 5120):
+        counts = (rows,) * world_size
+        x = torch.zeros((rows, 12288), device=device, dtype=torch.bfloat16)
+        x[:, :: 12288 // world_size] = 448
+        x[1::4].mul_(-1)
+        x[2::4].mul_(8)
+        x[3::4].zero_()
+        ctx = _context(rank, counts, counts)
+        # One active input per weight shard gives the same exact partial on
+        # every producer; use the FP32-to-BF16 contract directly. The ordinary
+        # library GEMM flushes subnormal scales and is not an oracle here.
+        partial = (
+            x[:, :1].float()
+            * signed_weight[:, 0][None, :].float()
+            * tiny_scales[:, 0].repeat_interleave(128)[None, :]
+        ).to(torch.bfloat16)
+        total = torch.zeros_like(partial, dtype=torch.float32)
+        for _ in range(world_size):
+            total.add_(partial.float())
+        expected = total.to(torch.bfloat16)
+        torch.testing.assert_close(fused(x, ctx), expected, rtol=0, atol=0)
+    for model in models:
+        model.weight.copy_(saved_weight)
+        model.weight_scale_inv.copy_(saved_scales)
+    # Reuse the prepared kernel with different weight and scale allocations.
+    # Prefetch must use each call's descriptors rather than a previous layer's.
+    alternate_weight = (-candidate.weight.to(torch.bfloat16)).to(candidate.weight.dtype)
+    alternate_scales = candidate.weight_scale_inv * 2
+    baseline.weight.copy_(alternate_weight)
+    baseline.weight_scale_inv.copy_(alternate_scales)
+    # Rebind descriptors for scalar scales, TMA scales, and clustered loads.
+    for rows in (128, 576, 4608):
+        counts = (rows,) * world_size
+        x = torch.randn((rows, 12288), device=device, dtype=torch.bfloat16)
+        ctx = _context(rank, counts, counts)
+        expected = reference(x, ctx)
+        actual = cute_dsl_fused_fp8_dp_row_linear(
+            candidate.projection_workspace.fused_row,
+            x,
+            alternate_weight,
+            alternate_scales,
+            counts,
+            torch.empty_like(expected),
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    baseline.weight.copy_(candidate.weight)
+    baseline.weight_scale_inv.copy_(candidate.weight_scale_inv)
+    counts_list = _row_projection_graph_counts(world_size)
+    xs = [
+        torch.randn((c[rank], 12288), device=device, dtype=torch.bfloat16)
+        for c in counts_list
+    ]
+    ctxs = [_context(rank, c, c) for c in counts_list]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for x, ctx in zip(xs, ctxs):
+            candidate(x, ctx=ctx)
+            fused(x, ctx)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with _capture_graph(graph, stream):
+        outputs = [
+            (candidate(x, ctx=ctx)[0], fused(x, ctx)) for x, ctx in zip(xs, ctxs)
+        ]
+
+    # Reset after capture so replay itself crosses the 32-bit epoch boundary.
+    _reset_epochs(candidate.projection_workspace.fused_row)
+    for replay in range(8):
+        for index, x in enumerate(xs):
+            if (replay + index) % 3 == 0:
+                x.zero_()
+            else:
+                x.copy_(torch.randn_like(x))
+        expected = [reference(x, ctx) for x, ctx in zip(xs, ctxs)]
+        torch.cuda._sleep(100000 * ((rank + replay) % world_size))
+        graph.replay()
+        for pair, ref in zip(outputs, expected):
+            for actual in pair:
+                torch.testing.assert_close(actual, ref, rtol=0, atol=0)
+    graph.reset()
+
+    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_gate
+
+    # Real KDA norm/gate/quant outputs: fallback, small fusion, vector stores,
+    # pipelined input exchange with an empty owner, and clustered GEMM.
+    fp8_counts = [
+        tuple(counts[:world_size])
+        for counts in (
+            (32, 17, 1, 0),
+            (128, 65, 1, 0),
+            (256, 241, 1, 0),
+            (0, 513, 576, 1),
+            (4608, 4608, 4608, 4608),
+        )
+    ]
+    norm_weight = torch.randn(128, dtype=torch.bfloat16, device=device)
+
+    def quantized(counts):
+        x = torch.randn((counts[rank], 12288), dtype=torch.bfloat16, device=device)
+        gate = torch.randn_like(x)
+        return quantize_fp8_with_gate(
+            x, gate, norm_weight=norm_weight, eps=1e-6, enable_pdl=False
+        )
+
+    empty = torch.empty((0, 12288), dtype=torch.float8_e4m3fn, device=device)
+    empty_scales = torch.empty((0, 96), dtype=torch.float32, device=device)
+    empty_counts = (0,) * world_size
+    empty_output = candidate(
+        empty, scale=empty_scales, ctx=_context(rank, empty_counts, empty_counts)
+    )[0]
+    torch.testing.assert_close(
+        empty_output, empty.new_empty((0, 7168), dtype=torch.bfloat16), rtol=0, atol=0
+    )
+    pairs = [quantized(counts) for counts in fp8_counts]
+    contexts = [_context(rank, counts, counts) for counts in fp8_counts]
+    for (x, scale), ctx in zip(pairs, contexts):
+        expected = reference(x, ctx, scale)
+        destination = torch.full_like(expected, float("nan"))
+        actual = candidate(x, scale=scale, ctx=ctx, out=destination)[0]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(destination, expected, rtol=0, atol=0)
+        torch.testing.assert_close(fused(x, ctx, scale), expected, rtol=0, atol=0)
+
+    # Only one owner has an unaligned value pointer and strided scales. Local
+    # layout normalization must preserve the collective selected by its peers.
+    if rank == 0:
+        x, scale = pairs[0]
+        unaligned = torch.empty(x.numel() + 1, dtype=x.dtype, device=device)[
+            1:
+        ].view_as(x)
+        unaligned.copy_(x)
+        strided = torch.empty(
+            (scale.shape[0], scale.shape[1] * 2), dtype=scale.dtype, device=device
+        )[:, ::2]
+        strided.copy_(scale)
+        pairs[0] = unaligned, strided
+
+    # Reuse FP8 input and scale pointers while their contents and peer timing
+    # change. Interleave BF16 to check both compiled variants share epochs safely.
+    bf16_x = torch.randn(
+        (fp8_counts[2][rank], 12288), dtype=torch.bfloat16, device=device
+    )
+    bf16_ctx = contexts[2]
+    torch.cuda.synchronize()
+    with _capture_graph(graph, stream):
+        fp8_outputs = [
+            candidate(x, scale=scale, ctx=ctx)[0]
+            for (x, scale), ctx in zip(pairs[:4], contexts[:4])
+        ]
+        bf16_output = candidate(bf16_x, ctx=bf16_ctx)[0]
+    for replay in range(3):
+        for counts, (x, scale) in zip(fp8_counts[:4], pairs[:4]):
+            new_x, new_scale = quantized(counts)
+            x.copy_(new_x)
+            scale.copy_(new_scale)
+        expected = [
+            reference(x, ctx, scale) for (x, scale), ctx in zip(pairs[:4], contexts[:4])
+        ]
+        bf16_expected = reference(bf16_x, bf16_ctx)
+        torch.cuda._sleep(100000 * ((rank + replay) % world_size))
+        graph.replay()
+        for actual, ref in zip(fp8_outputs, expected):
+            torch.testing.assert_close(actual, ref, rtol=0, atol=0)
+        torch.testing.assert_close(bf16_output, bf16_expected, rtol=0, atol=0)
+    graph.reset()
+    for model in models:
+        release_dp_linear_communication(model)
+
+
+@pytest.mark.parametrize(
+    ("kind", "world_size"),
+    (("column", 2), ("column", 4), ("column", 8), ("row", 2), ("row", 4)),
+)
+def test_registered_tp_projection(tmp_path, kind, world_size):
     if torch.cuda.device_count() < world_size or torch.cuda.get_device_capability() != (
         10,
         3,
@@ -374,7 +758,7 @@ def test_registered_tp_projection(tmp_path, world_size):
         pytest.skip(f"requires {world_size} node-local GB300 GPUs")
     mp.spawn(
         _worker,
-        args=(world_size, f"file://{tmp_path / 'rendezvous'}"),
+        args=(world_size, f"file://{tmp_path / 'rendezvous'}", kind),
         nprocs=world_size,
         join=True,
     )

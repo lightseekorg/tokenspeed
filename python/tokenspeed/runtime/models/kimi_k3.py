@@ -743,8 +743,15 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             # Finish any O collective after QKV, without local attention work.
             if self.output_parallel is None:
                 return hidden_states
-            empty = hidden_states.new_empty((0, self.num_local_heads * self.v_head_dim))
-            return self.o_proj(empty, ctx=ctx)[0]
+            width = self.num_local_heads * self.v_head_dim
+            # Ordinary collectives require empty owners to match peers' format.
+            if self.use_output_gate and self.o_proj.supports_fp8_group128_input:
+                empty = hidden_states.new_empty((0, width), dtype=torch.float8_e4m3fn)
+                scales = hidden_states.new_empty((0, width // 128), dtype=torch.float32)
+            else:
+                empty = hidden_states.new_empty((0, width))
+                scales = None
+            return self.o_proj(empty, scale=scales, ctx=ctx, out=projection_out)[0]
         fuse_value_gate = (
             gate is not None
             and ctx.num_extends == 0
@@ -1545,7 +1552,14 @@ class KimiLinearKDA(nn.Module):
             # Empty owners participate in QKV above and O below, but own no
             # convolution, recurrent-state update, gate or norm work.
             if self.output_parallel is not None:
-                return self.o_proj(h.new_empty((0, hn * hd)), ctx=ctx)[0]
+                # Match the prequantized format used by token-bearing owners.
+                if self.o_proj.supports_fp8_group128_input:
+                    empty = h.new_empty((0, hn * hd), dtype=torch.float8_e4m3fn)
+                    scales = h.new_empty((0, hn * hd // 128), dtype=torch.float32)
+                else:
+                    empty = h.new_empty((0, hn * hd))
+                    scales = None
+                return self.o_proj(empty, scale=scales, ctx=ctx, out=projection_out)[0]
             return h
         # Prefill consumes compact QKV; perform this copy in the captured
         # projection segment rather than inside the eager attention break.
@@ -2069,6 +2083,7 @@ class KimiLinearMoE(nn.Module):
                 model_scope=model_scope,
                 # The gate itself, so mailbox and gather meet by construction.
                 max_m=DOWN_MAILBOX_MAX_TOKENS,
+                publish_gemm=None,
             )
             # The mailbox and both producers are bf16; another activation dtype
             # keeps the replica rather than failing at the first forward.

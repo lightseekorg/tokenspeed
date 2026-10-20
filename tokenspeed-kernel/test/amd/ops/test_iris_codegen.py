@@ -127,6 +127,11 @@ def _compile(arch_name, kind, world_size):
             "ELEMENTS_PER_WORD": ar._PACKED_WORD_BYTES // 2,
             "PEER_LOAD_CACHE": arch.peer_load_cache,
             "REMOTE_STORE_CACHE": arch.remote_store_cache,
+            "residual": None,
+            "post": None,
+            "comb": None,
+            "HIDDEN_WORDS": 0,
+            "HC_POST": False,
         }
         if two_shot:
             constexprs["BLOCK_WORDS"] = (

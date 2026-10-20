@@ -280,14 +280,7 @@ def _mnnvl_should_use_oneshot(
 # kernel header. Workspace slot layout: [A: token][rank][hidden] + [B: token][hidden].
 MNNVL_TWOSHOT_MAX_TOKEN = 2048
 
-# Above this payload the IPC lamport workspace beats the mnnvl one on a single
-# node: multicast/scatter wins while cost tracks the number of stores, but past
-# ~10 MiB bandwidth dominates and IPC's direct peer writes come out ahead.
-# Measured at world 4, hidden 7168, bf16, with the scatter phase A: mnnvl leads
-# through 768 tokens (10.5 MiB, 60.0 vs 63.4 us) and trails from 1024 (14 MiB,
-# 86.1 vs 75.4). Expressed in input-tensor bytes so it holds across hidden sizes
-# and dtypes. Only reachable single-node -- cross-node there is no IPC
-# workspace, and there mnnvl beats NCCL across the whole supported range.
+# Single-node calls this large stay on IPC only when its one-shot serves them; mnnvl beats its two-shot.
 MNNVL_PREFER_IPC_BYTES = int(
     os.environ.get("TOKENSPEED_MNNVL_PREFER_IPC_BYTES", 12 * 1024 * 1024)
 )

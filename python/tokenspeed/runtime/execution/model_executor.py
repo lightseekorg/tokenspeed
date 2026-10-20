@@ -23,11 +23,12 @@ from __future__ import annotations
 import gc
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
 from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
+from tokenspeed_kernel.ops.metadata.ngram import commit_ngram_inputs
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.tuning import (
     autotune,
@@ -153,35 +154,6 @@ def _sampling_info_for_requests(
         ]
         info.vocab_mask = mask[::mask_width].contiguous() if prefill else mask
     return info
-
-
-def _with_prefill_sample_offsets(
-    sampling_info: SamplingBatchInfo, input_lengths: torch.Tensor
-) -> SamplingBatchInfo:
-    """Key each prefill row's sample on the position of its last input token.
-
-    The pool kernels draw a request's noise from (seed, offset), and decode
-    and verify take the offset from ``valid_cache_lengths``, which is the
-    absolute position of the step's first input token. A prefill samples
-    before its frontier advances, so that table still holds the chunk's
-    prefix length: a prefix-cache hit or a chunk boundary would move the
-    first sampled token's stream, and the same seeded request would diverge
-    from its first token. The last input position is the same however the
-    prompt was split, and it sits one below the first decode's offset.
-    ``sampling_info`` covers exactly the prefill rows; ``input_lengths`` are
-    their input lengths, in the same order.
-    """
-    cache_lengths = sampling_info.valid_cache_lengths
-    if cache_lengths is None or sampling_info.req_pool_indices is None:
-        return sampling_info
-    pool_rows = sampling_info.req_pool_indices.long()
-    last = cache_lengths.index_select(0, pool_rows) + input_lengths[
-        : pool_rows.shape[0]
-    ].to(cache_lengths.dtype)
-    offsets = cache_lengths.index_copy(
-        0, pool_rows, (last - 1).clamp_min(0).to(cache_lengths.dtype)
-    )
-    return replace(sampling_info, valid_cache_lengths=offsets)
 
 
 def _set_sampled_top_logprobs(
@@ -323,6 +295,49 @@ def select_dspark_context_producer(
     return None
 
 
+@runtime_checkable
+class RopeTableModel(Protocol):
+    """A model that sizes its RoPE table itself (Beam's covers the
+    speculative pad past the context)."""
+
+    # Positions its precomputed cos/sin table covers; None without one.
+    rope_positions: int | None
+
+
+def warn_past_rope_table(
+    model: torch.nn.Module,
+    model_config: ModelConfig,
+    context_len: int,
+    physical_context_len: int,
+) -> None:
+    """Warn when spec verify can index past the model's RoPE table.
+
+    Spec verify commits positions up to physical_context_len - 1 for a
+    finished request lingering one overlap step, and the RoPE kernels read
+    the precomputed cos/sin table at those positions. A RopeTableModel
+    reports the table it built; any other model's tables are precomputed for
+    its derived context length. The values only feed a dead request's garbage
+    KV, but the read itself is out of table bounds — warn so the operator can
+    lower --max-model-len by the difference.
+    """
+    if isinstance(model, RopeTableModel):
+        table_len = model.rope_positions
+        if table_len is None:
+            return
+    else:
+        table_len = get_context_length(model_config.hf_text_config)
+    if physical_context_len > table_len:
+        logger.warning(
+            f"physical context extent {physical_context_len!s} (context_len "
+            f"{context_len!s} + spec overshoot "
+            f"pad {physical_context_len - context_len!s}) exceeds the "
+            f"{table_len!s} positions of the model's rope tables; "
+            "positions in the pad index past the precomputed rope tables. "
+            "Lower --max-model-len by at least "
+            f"{physical_context_len - table_len!s} to stay in bounds.",
+        )
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -385,6 +400,9 @@ class ModelExecutorConfig:
     # every row.
     query_shard_size: int
     query_shard_rank: int
+    # Sleep/wake (--enable-memory-saver): decode CUDA graphs are captured into
+    # the memory saver's ``cuda_graph`` region so a release can free them.
+    enable_memory_saver: bool
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -430,6 +448,7 @@ class ModelExecutorConfig:
     def from_server_args(
         server_args: ServerArgs,
         model_config: ModelConfig,
+        model: torch.nn.Module,
         max_req_pool_size: int,
         gpu_id: int,
         global_rank: int,
@@ -444,25 +463,12 @@ class ModelExecutorConfig:
         rope_parameters = get_rope_parameters(model_config.hf_text_config)
         model_is_mrope = bool(rope_parameters and "mrope_section" in rope_parameters)
 
-        # Spec verify commits positions up to physical_context_len - 1 for a
-        # finished request lingering one overlap step. Rope cos/sin tables are
-        # precomputed for the model's derived context length, so positions in
-        # the pad read past them when context_len is set flush against the
-        # model limit. The values only feed a dead request's garbage KV, but
-        # the read itself is out of table bounds — warn so the operator can
-        # lower --max-model-len by the pad.
-        physical_context_len = model_config.context_len + server_args.spec_context_pad
-        derived_context_len = get_context_length(model_config.hf_text_config)
-        if physical_context_len > derived_context_len:
-            logger.warning(
-                f"physical context extent {physical_context_len!s} (context_len "
-                f"{model_config.context_len!s} + spec overshoot "
-                f"pad {server_args.spec_context_pad!s}) exceeds the model's derived "
-                f"context length {derived_context_len!s}; "
-                "positions in the pad index past the precomputed rope tables. "
-                "Lower --max-model-len by at least "
-                f"{physical_context_len - derived_context_len!s} to stay in bounds.",
-            )
+        warn_past_rope_table(
+            model,
+            model_config,
+            model_config.context_len,
+            model_config.context_len + server_args.spec_context_pad,
+        )
 
         # User intent only; backend-imposed graph restrictions are declared on
         # the backend classes (cuda_graph_support) and resolved in
@@ -500,6 +506,7 @@ class ModelExecutorConfig:
             decode_only_attention=server_args.mapping.attn.head_tp_serves_decode_only,
             query_shard_size=server_args.mapping.attn.qcp_size,
             query_shard_rank=server_args.mapping.attn.qcp_rank,
+            enable_memory_saver=server_args.enable_memory_saver,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
@@ -584,7 +591,11 @@ class ModelExecutor:
             raise NotImplementedError(
                 "Engram input history requires PP=1 and in-flight depth <= 1"
             )
-        self.input_buffers.init_ngram_buffers(ngram_context)
+        self.input_buffers.init_ngram_buffers(
+            ngram_context,
+            model_runner.model.get_ngram_hash_parameters() if ngram_context else None,
+            config.vocab_size,
+        )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
             vocab_size=config.vocab_size,
@@ -1501,12 +1512,7 @@ class ModelExecutor:
         sampled_top_k = ctx.sampled_top_k
 
         if num_decodes == 0 and num_prefill_outputs == num_extends:
-            sampled = self.sampling_backend.sample(
-                logits_output,
-                _with_prefill_sample_offsets(
-                    sampling_info, self.input_buffers.input_lengths_buf
-                ),
-            )
+            sampled = self.sampling_backend.sample(logits_output, sampling_info)
             if sampled_top_k:
                 _set_sampled_top_logprobs(
                     logits_output, logits_output.next_token_logits, sampled_top_k
@@ -1551,11 +1557,8 @@ class ModelExecutor:
             )
             tokens, lengths = self.sampling_backend.sample(
                 prefill_out,
-                _with_prefill_sample_offsets(
-                    _sampling_info_for_requests(
-                        sampling_info, prefill, mask_width=mask_width, prefill=True
-                    ),
-                    self.input_buffers.input_lengths_buf,
+                _sampling_info_for_requests(
+                    sampling_info, prefill, mask_width=mask_width, prefill=True
                 ),
             )
             if sampled_top_k:
@@ -1809,8 +1812,25 @@ class ModelExecutor:
                     .to(torch.int32)
                 )
 
+        bs = req_pool_indices.shape[0]
         ib = self.input_buffers
         tail = self.runtime_states.ngram_accepted_tokens
+        if tail is not None:
+            commit_ngram_inputs(
+                req_pool_indices,
+                input_lengths,
+                accept_lengths,
+                ib.input_ids_buf,
+                ib.ngram_previous_tokens_buf,
+                ib.ngram_token_mask_buf,
+                ib.ngram_prefix_buf[:bs],
+                tail,
+                self.runtime_states.ngram_needs_seed,
+                self.runtime_states.valid_cache_lengths,
+                num_extends,
+                ib.state_write_padding_pool_index,
+            )
+            return
         advance_accepted_frontier(
             req_pool_indices,
             input_lengths,
@@ -1818,16 +1838,17 @@ class ModelExecutor:
             self.runtime_states.valid_cache_lengths,
             num_extends,
             ib.state_write_padding_pool_index,
-            ngram_tail=tail,
-            ngram_previous_tokens=ib.ngram_previous_tokens_buf,
-            ngram_token_mask=ib.ngram_token_mask_buf,
-            input_ids=ib.input_ids_buf if tail is not None else None,
         )
 
-    def _build_sampling_info(self, bs: int) -> SamplingBatchInfo:
+    def _build_sampling_info(self, bs: int, num_extends: int) -> SamplingBatchInfo:
         return SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
+            extend_lengths=(
+                self.input_buffers.input_lengths_buf[:num_extends]
+                if num_extends
+                else None
+            ),
             draft_probs=self.runtime_states.draft_probs,
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
@@ -1853,6 +1874,7 @@ class ModelExecutor:
                 forward_mode=graph_forward_mode,
                 global_num_tokens=dp_metadata.global_num_tokens,
                 global_bs=dp_metadata.global_batch_size,
+                global_num_decodes=dp_metadata.global_num_decodes,
                 all_decode_or_idle=dp_metadata.all_decode_or_idle,
             )
             sampling_info = SamplingBatchInfo(
@@ -1867,8 +1889,8 @@ class ModelExecutor:
                     batch_size=padded_bs,
                     total_tokens=padded_bs * self.config.output_length,
                 )
-                # Captured hostfunc pops one entry per replay; push a dummy
-                # for this idle replay, same as run_once.
+                # Captured hostfunc pops one gate decision per replay; add a
+                # dummy for this idle replay, same as run_once.
                 if self.capturable_grammar is not None:
                     self.capturable_grammar.add_batch(
                         grammars=[None] * padded_bs,
@@ -1937,7 +1959,9 @@ class ModelExecutor:
                         )
                     )
                 step_global_num_tokens = self.drafter.idle_forward_global_num_tokens(
-                    dp_metadata.global_num_tokens, dp_metadata.global_batch_size
+                    dp_metadata.global_num_tokens,
+                    dp_metadata.global_batch_size,
+                    global_num_decodes=dp_metadata.global_num_decodes,
                 )
                 for step_idx, draft_global_num_tokens in enumerate(
                     step_global_num_tokens
@@ -1952,6 +1976,7 @@ class ModelExecutor:
                         forward_mode=ForwardMode.IDLE,
                         global_num_tokens=draft_global_num_tokens,
                         global_bs=dp_metadata.global_batch_size,
+                        global_num_decodes=dp_metadata.global_num_decodes,
                         all_decode_or_idle=dp_metadata.all_decode_or_idle,
                     )
                     self.drafter.draft_model_runner.forward(
@@ -2386,11 +2411,12 @@ class ModelExecutor:
                         )
                     ctx.global_num_tokens = dp_metadata.global_num_tokens
                     ctx.global_bs = dp_metadata.global_batch_size
+                    ctx.global_num_decodes = dp_metadata.global_num_decodes
                     ctx.all_decode_or_idle = dp_metadata.all_decode_or_idle
                     ctx.all_extend = dp_metadata.all_extend
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_start = time.perf_counter() if timing_enabled else 0.0
-                    sampling_info = self._build_sampling_info(bs)
+                    sampling_info = self._build_sampling_info(bs, num_extends)
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,
                         bs=bs,

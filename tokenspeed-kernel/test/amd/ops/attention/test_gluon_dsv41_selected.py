@@ -127,6 +127,7 @@ def test_fused_selected_attention_matches_gather_softmax(heads, with_global):
         None,
         None,
         None,
+        lse=None,
     )
     torch.testing.assert_close(out, expected, rtol=0.008, atol=0.004)
     assert torch.count_nonzero(out[[1, 4]]).item() == 0
@@ -201,7 +202,8 @@ def _padded_query(tokens, real_heads, heads, device, seed):
     ("tokens", "real_heads", "heads"),
     [(6, 16, 64), (6, 64, 64), (192, 16, 64), (192, 64, 64), (6, 16, 128)],
 )
-def test_fused_selected_attention_decode_shapes(tokens, real_heads, heads):
+@pytest.mark.parametrize("with_rope", [False, True])
+def test_fused_selected_attention_decode_shapes(tokens, real_heads, heads, with_rope):
     """Split (6 rows) and single-workgroup (192 rows) paths at decode widths.
 
     Padded zero-query heads take the row-sum shortcut and must still match the
@@ -212,6 +214,8 @@ def test_fused_selected_attention_decode_shapes(tokens, real_heads, heads):
     platform = current_platform()
     if not (platform.is_cdna4 or platform.is_cdna5):
         pytest.skip("AMD fused selected attention")
+    if with_rope and not platform.is_cdna4:
+        pytest.skip("gfx950 fused output RoPE")
     device = torch.device("cuda:0")
     segments = _decode_inputs(tokens, device, 7)
     q, sink = _padded_query(tokens, real_heads, heads, device, 11)
@@ -232,11 +236,39 @@ def test_fused_selected_attention_decode_shapes(tokens, real_heads, heads):
         None,
         None,
         None,
+        lse=None,
     )
+    if with_rope:
+        positions = torch.arange(tokens, dtype=torch.int64, device=device) - 1
+        angles = torch.arange(tokens * 32, dtype=torch.float32, device=device)
+        angles = angles.reshape(tokens, 32) * 0.03125
+        cos_sin = torch.cat((angles.cos(), -angles.sin()), dim=1)
+        unrotated = out.clone()
+        expected_rope = dsv41.rope_inplace(out, positions, cos_sin, None)
+        out = dsv41.selected_attention_rope(
+            q,
+            swa,
+            swa_slots,
+            swa_lens,
+            glob,
+            global_slots,
+            global_lens,
+            sink,
+            512**-0.5,
+            None,
+            positions,
+            cos_sin,
+        )
+        torch.testing.assert_close(out[..., :-64], unrotated[..., :-64], rtol=0, atol=0)
+        torch.testing.assert_close(
+            out[..., -64:], expected_rope[..., -64:], rtol=0.008, atol=0.0005
+        )
+        expected = dsv41.rope_inplace(expected, positions, cos_sin, None)
     torch.testing.assert_close(out, expected, rtol=0.008, atol=0.004)
 
 
-def test_fused_selected_attention_gfx950_no_recompile_across_rows():
+@pytest.mark.parametrize("with_rope", [False, True])
+def test_fused_selected_attention_gfx950_no_recompile_across_rows(with_rope):
     """Row count changes the grid and split count, never a compile key."""
     if not current_platform().is_cdna4:
         pytest.skip("gfx950 kernel")
@@ -246,6 +278,9 @@ def test_fused_selected_attention_gfx950_no_recompile_across_rows():
     segments = _decode_inputs(192, device, 3)
     (swa, swa_slots, swa_lens, _), (glob, global_slots, global_lens, _) = segments
     q, sink = _padded_query(192, 16, 64, device, 5)
+    positions = torch.arange(192, dtype=torch.int64, device=device)
+    angles = torch.randn((192, 32), dtype=torch.float32, device=device)
+    cos_sin = torch.cat((angles.cos(), -angles.sin()), dim=1)
 
     def run(tokens):
         selected.launch_gluon_dsv41_selected_attention_gfx950(
@@ -263,6 +298,8 @@ def test_fused_selected_attention_gfx950_no_recompile_across_rows():
             None,
             None,
             None,
+            rope_positions=positions[:tokens] if with_rope else None,
+            rope_cos_sin=cos_sin if with_rope else None,
         )
 
     for tokens in (1, 192):

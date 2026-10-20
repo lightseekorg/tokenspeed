@@ -22,18 +22,27 @@
 
 Pairs with the control-plane :class:`PauseController`. A *release* pauses and
 drains the scheduler (delegated to the pause controller) and only then frees GPU
-memory via the torch_memory_saver adapter; a *resume* re-maps memory and, when
-the KV region returns, repairs the KV cache. Tags (``weights``, ``kv_cache``)
-are freed/restored independently so the RL loop can resume weights, push fresh
-weights, then resume the KV cache.
+memory; a *resume* re-maps it. Each tag is one :class:`MemoryRegion` and is
+freed/restored independently, so the RL loop can resume weights (and NCCL),
+push fresh weights, then resume the KV cache:
+
+- ``weights``: model parameters (restored from their CPU backup);
+- ``kv_cache``: the cache arena (discarded; zeroed on resume);
+- ``cuda_graph``: the decode CUDA graph memory pool (discarded; every replay
+  rewrites it before reading);
+- ``nccl``: NCCL communicator buffers (suspended and resumed in place); only
+  on an engine whose NCCL can suspend a communicator.
 
 This module knows nothing about ZMQ beyond a ``send_func`` reply socket, and
-nothing about scheduling beyond delegating drain to the pause controller.
+nothing about scheduling beyond delegating drain to the pause controller. What
+a region does to free or restore its memory is the caller's (``PauseHooks``).
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.engine.io_struct import (
     IsSleepingReqInput,
@@ -43,21 +52,53 @@ from tokenspeed.runtime.engine.io_struct import (
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
 )
-from tokenspeed.runtime.engine.pause import PauseController
 
-VALID_TAGS = ("weights", "kv_cache")
+if TYPE_CHECKING:
+    # The pause module builds this module's regions (PauseHooks), so a
+    # runtime import here would be circular.
+    from tokenspeed.runtime.engine.pause import PauseController
+
+# Release order: the KV cache first (a PD engine deregisters it from the
+# transfer engine before it is unmapped), NCCL last (nothing may issue a
+# collective after it is suspended). Resume runs the reverse order, so NCCL and
+# the graphs are back before the weights and the KV cache are used again.
+VALID_TAGS = ("kv_cache", "weights", "cuda_graph", "nccl")
+RESUME_ORDER = tuple(reversed(VALID_TAGS))
 
 
-def _normalize_tags(tags: list[str] | None) -> tuple[list[str] | None, str | None]:
-    """Return ``(ordered_tags, error)``. ``None`` ⇒ all tags. The order is fixed
-    (``weights`` before ``kv_cache``) for determinism; an unknown tag yields an
-    error and ``None`` tags."""
+@dataclass(frozen=True)
+class MemoryRegion:
+    """How one releasable tag frees and restores its GPU memory.
+
+    Attributes:
+        release: Frees the memory; runs once the scheduler has drained.
+        resume: Restores the memory and whatever state must accompany it
+            (zeroed KV, transfer-engine registration) before scheduling
+            resumes.
+    """
+
+    release: Callable[[], None]
+    resume: Callable[[], None]
+
+
+def _normalize_tags(
+    tags: list[str] | None, order: tuple[str, ...], available
+) -> tuple[list[str] | None, str | None]:
+    """Return ``(ordered_tags, error)``. ``None`` ⇒ every ``available`` tag.
+    The order is fixed (``order``) for determinism; an unknown tag, or one this
+    engine cannot release, yields an error and ``None`` tags."""
     if tags is None:
-        return list(VALID_TAGS), None
+        return [t for t in order if t in available], None
     bad = [t for t in tags if t not in VALID_TAGS]
     if bad:
         return None, f"invalid tags: {bad!r}; valid: {list(VALID_TAGS)}"
-    return [t for t in VALID_TAGS if t in tags], None
+    unavailable = [t for t in tags if t not in available]
+    if unavailable:
+        return None, (
+            f"tags not releasable on this engine: {unavailable!r}; "
+            f"available: {[t for t in VALID_TAGS if t in available]!r}"
+        )
+    return [t for t in order if t in tags], None
 
 
 class MemoryOccupationController:
@@ -68,26 +109,32 @@ class MemoryOccupationController:
         *,
         send_func,
         pause_controller: PauseController,
-        adapter,
+        regions: dict[str, MemoryRegion],
         enabled: bool,
         reset_caches_fn: Callable[[], bool],
-        kv_repair_fn: Callable[[], None],
-        weights_release_refusal_fn: Callable[[], str | None],
+        transfers_idle_fn: Callable[[], bool],
+        release_refusal_fn: Callable[[], str | None],
         weights_busy_fn: Callable[[], bool],
         kv_cache_release_allowed: bool = True,
     ) -> None:
+        unknown = [t for t in regions if t not in VALID_TAGS]
+        if unknown:
+            raise ValueError(f"memory regions for unknown tags {unknown!r}")
         self._send = send_func
         self._pause = pause_controller
-        self._adapter = adapter
+        # The tags this engine can release (``nccl`` needs an NCCL that can
+        # suspend a communicator); a release without tags frees all of them.
+        self._regions = regions
         self._enabled = enabled
         self._reset_caches = reset_caches_fn
-        self._kv_repair = kv_repair_fn
-        # The online expert rebalance writes the weights from the control
-        # plane's gated ops: a release is refused while one is in progress
-        # (``weights_release_refusal_fn`` names why), and a drained release
-        # waits while chunk ops still write the weights (``weights_busy_fn``),
-        # which complete through the gate without further forwards.
-        self._weights_release_refusal = weights_release_refusal_fn
+        # A disaggregated engine must not free the KV cache while a peer can
+        # still read or write it: the release waits until no request is
+        # bootstrapping or holds pages pinned for a transfer.
+        self._transfers_idle = transfers_idle_fn
+        # Refuse releases that cannot drain (buffered PD requests or an active
+        # rebalance). Already queued weight ops must finish through the normal
+        # same-round gate before any region is released.
+        self._release_refusal = release_refusal_fn
         self._weights_busy = weights_busy_fn
         # Whether releasing the ``kv_cache`` region is safe in this engine. False
         # when prefix caching is on but the scheduler exposes no prefix-cache
@@ -97,11 +144,38 @@ class MemoryOccupationController:
         # at construction), not a runtime duck-typed probe.
         self._kv_cache_release_allowed = kv_cache_release_allowed
         self.released_tags: set[str] = set()
+        # True from an accepted release request until it frees memory or
+        # fails, so admission can tell a memory release from a plain pause.
+        self._release_pending = False
 
     @property
     def is_sleeping(self) -> bool:
         """True while any GPU-memory region is released (data-plane sleep)."""
         return bool(self.released_tags)
+
+    @property
+    def is_releasing_or_released(self) -> bool:
+        """True while a release is draining or any region is released.
+
+        A disaggregated engine refuses new requests in this window: their
+        transfer registration would name the KV memory the release is about to
+        unmap and re-register.
+        """
+        return self._release_pending or bool(self.released_tags)
+
+    def refuse_weight_load(self) -> str | None:
+        """Why a weight load cannot run now, or None when it can.
+
+        A load writes the weights region and may issue collectives, so both
+        the ``weights`` and the ``nccl`` regions must be resident.
+        """
+        released = [t for t in ("weights", "nccl") if t in self.released_tags]
+        if not released:
+            return None
+        return (
+            f"memory regions {released!r} are released; resume them with "
+            "resume_memory_occupation before updating weights"
+        )
 
     # -- control-request handlers (driven by the request handler) -------------
 
@@ -109,7 +183,7 @@ class MemoryOccupationController:
         if not self._enabled:
             self._fail_release("memory saver not enabled (--enable-memory-saver)")
             return
-        tags, err = _normalize_tags(req.tags)
+        tags, err = _normalize_tags(req.tags, VALID_TAGS, self._regions)
         if err is not None:
             self._fail_release(err)
             return
@@ -127,7 +201,7 @@ class MemoryOccupationController:
         if self._pause.is_drain_pending:
             self._fail_release("a pause or release is already in progress")
             return
-        refusal = self._weights_release_refusal()
+        refusal = self._release_refusal()
         if refusal is not None:
             self._fail_release(f"cannot release memory: {refusal}")
             return
@@ -135,14 +209,16 @@ class MemoryOccupationController:
         # in-flight requests finish (the RL rollout is idle between steps).
         # A post-finish L2 transfer can outlive the request; keep the release
         # pending until ClearL1Cache can atomically invalidate its cache refs,
-        # and until no gated op is still writing the weights.
+        # until no PD transfer still touches the cache, and until no gated op
+        # is still writing the weights.
         reset_caches = self._reset_caches if "kv_cache" in tags else None
 
         def ready() -> bool:
-            if self._weights_busy():
+            if self._weights_busy() or not self._transfers_idle():
                 return False
             return reset_caches is None or reset_caches()
 
+        self._release_pending = True
         self._pause.request_drain(
             abort_inflight=False,
             on_drained=lambda: self._finish_release(tags),
@@ -151,13 +227,15 @@ class MemoryOccupationController:
         )
 
     def _finish_release(self, tags: list[str]) -> None:
+        self._release_pending = False
         for tag in tags:
-            self._adapter.pause(tag=tag)
+            self._regions[tag].release()
             self.released_tags.add(tag)
         self._pause.set_released(True)
         self._send.send_pyobj(ReleaseMemoryOccupationReqOutput(success=True))
 
     def _fail_release(self, message: str) -> None:
+        self._release_pending = False
         self._send.send_pyobj(
             ReleaseMemoryOccupationReqOutput(success=False, message=message)
         )
@@ -169,9 +247,9 @@ class MemoryOccupationController:
         # stranding the released region. Resolve against ``released_tags`` so a
         # partial release round-trips with a default resume_memory_occupation().
         if req.tags is None:
-            tags = [t for t in VALID_TAGS if t in self.released_tags]
+            tags = [t for t in RESUME_ORDER if t in self.released_tags]
         else:
-            tags, err = _normalize_tags(req.tags)
+            tags, err = _normalize_tags(req.tags, RESUME_ORDER, self._regions)
             if err is not None:
                 self._send.send_pyobj(
                     ResumeMemoryOccupationReqOutput(success=False, message=err)
@@ -190,10 +268,8 @@ class MemoryOccupationController:
             self._send.send_pyobj(ResumeMemoryOccupationReqOutput(success=True))
             return
         for tag in tags:
-            self._adapter.resume(tag=tag)
+            self._regions[tag].resume()
             self.released_tags.discard(tag)
-        if "kv_cache" in tags:
-            self._kv_repair()
         if not self.released_tags:
             # Fully awake → resume scheduling.
             self._pause.set_released(False)

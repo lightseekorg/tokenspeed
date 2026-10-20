@@ -1021,7 +1021,7 @@ class PrefillGraph:
 
     def _dummy_group_tables(self, bs: int) -> dict[str, "torch.Tensor"]:
         """Build the capture batch's group tables: one row per fabricated
-        request, one width per group, row ``i`` holding block ``i + 1``.
+        request, one width per group, and disjoint parents across groups.
 
         A history group's width is ``ceil(physical_context_len / grain)``,
         whatever its retention. The physical extent is the quantity every
@@ -1064,8 +1064,16 @@ class PrefillGraph:
         # Built on the host: make_dummy_batch's only use of these is
         # ``.cpu().numpy()`` for the contract packer, so a device tensor here
         # would be allocated and copied straight back off per group per bucket.
-        first_block = torch.arange(1, bs + 1, dtype=torch.int32)
+        parent_offset = 0
         for spec in self.token_to_kv_pool.arena.cache_group_specs:
+            packing = self.token_to_kv_pool.arena.runtime_contract.virtual_packing[
+                spec.group_id
+            ]
+            # Groups share byte planes, so each must own separate physical parents.
+            first_block = (
+                torch.arange(1, bs + 1, dtype=torch.int32) + parent_offset * packing
+            )
+            parent_offset += -(-bs // packing)
             if spec.attn_kind == "state":
                 rows = torch.zeros((bs, STATE_TABLE_SLOTS), dtype=torch.int32)
                 rows[:, STATE_LIVE_SLOT] = first_block

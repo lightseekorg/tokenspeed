@@ -161,6 +161,7 @@ class TestPrefillCaptureArgsTest:
             decode_only_attention=False,
             query_shard_size=1,
             query_shard_rank=0,
+            enable_memory_saver=False,
         )
         with pytest.raises((TypeError), match=("prefill_graph_capture_batch_sizes")):
             ModelExecutorConfig(**config_args)
@@ -333,6 +334,19 @@ def _spec(
 
 def _fake_pool(*, specs=(), **arena_attrs) -> SimpleNamespace:
     """A cache-view double: the arena publishes, the view just names it."""
+    if specs and "runtime_contract" not in arena_attrs:
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+            CacheRuntimeContract,
+        )
+
+        arena_attrs["runtime_contract"] = CacheRuntimeContract(
+            prefix_granularity=64,
+            num_lcm_blocks=64,
+            token_capacity=64 * 64,
+            group_specs=tuple(specs),
+            group_page_counts={spec.group_id: 65 for spec in specs},
+            group_packing={spec.group_id: 1 for spec in specs},
+        )
     return SimpleNamespace(
         arena=SimpleNamespace(cache_group_specs=tuple(specs), **arena_attrs)
     )
@@ -398,6 +412,43 @@ class TestDummyGroupTablesTest:
         )
         return pg
 
+    @pytest.mark.parametrize("bs", [1, 3, 64])
+    @pytest.mark.parametrize("shards", [1, 2])
+    def test_capture_groups_own_distinct_physical_parents(self, bs, shards):
+        from dataclasses import replace
+
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+            CacheRuntimeContract,
+        )
+
+        specs = (
+            replace(_spec("kv", block_granularity=64), shard_count=shards),
+            _spec("side", block_granularity=4),
+            _spec("state", attn_kind="state"),
+        )
+        packing = {"kv": 2, "side": 3, "state": 1}
+        contract = CacheRuntimeContract(
+            prefix_granularity=64,
+            num_lcm_blocks=128,
+            token_capacity=128 * 64,
+            group_specs=specs,
+            group_page_counts={gid: 128 * count + 1 for gid, count in packing.items()},
+            group_packing=packing,
+        )
+        tables = self._bare(
+            _backend(), _fake_pool(specs=specs, runtime_contract=contract)
+        )._dummy_group_tables(bs)
+        occupied = set()
+        for spec in specs:
+            pages = tables[spec.group_id][:, -1]
+            assert len(set(pages.tolist())) == bs
+            parents = set(
+                ((pages - 1) // contract.virtual_packing[spec.group_id]).tolist()
+            )
+            assert not occupied.intersection(parents), spec.group_id
+            assert max(parents) < contract.num_lcm_blocks
+            occupied.update(parents)
+
     def test_every_group_gets_a_real_block(self):
         backend = _backend()
         pool = _fake_pool(
@@ -426,7 +477,8 @@ class TestDummyGroupTablesTest:
             )
             assert _pytest_a_1 > _pytest_b_2, _pytest_msg_3
         # The fabricated request starts from the zero state and writes a real block.
-        assert (tables["linear_attention"].tolist()) == ([[0, 1]])
+        assert tables["linear_attention"][0, 0] == 0
+        assert tables["linear_attention"][0, 1] > 0
 
     def test_width_spans_the_extent_at_a_realistic_magnitude(self):
         """Width is ceil(physical extent / grain), at a size where a silent
@@ -507,7 +559,8 @@ class TestDummyGroupTablesTest:
         assert (set(tables)) == ({"full_attention", "linear_attention"})
         assert (tables["full_attention"].shape) == ((1, 8))  # ceil(1000/128)
         # A state row is its two slots: a null input checkpoint and the live block.
-        assert (tables["linear_attention"].tolist()) == ([[0, 1]])
+        assert tables["linear_attention"][0, 0] == 0
+        assert tables["linear_attention"][0, 1] > 0
 
     def test_each_capture_row_gets_its_own_block(self):
         """A state group needs one working block per request: two rows sharing
@@ -1331,6 +1384,7 @@ class TestPrefillRoleGraphsTest:
             enable_speculative_sampling=False,
             query_shard_size=1,
             query_shard_rank=0,
+            enable_memory_saver=False,
             prefill_graph_max_tokens=256,
         )
 

@@ -47,6 +47,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.communication import torch_sandwich_norm
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -161,29 +162,26 @@ def _boundary(s, r, gp, g, eps_p, eps, xs, rs, sumsq, ulp, drop=None):
 
 def _staged_reference(s, r, gp, g, eps_p, eps, xs, rs):
     """FP64 arithmetic with the BF16 rounding points of the boundary."""
-
-    def norm(x, gamma, e):
-        x64 = x.astype(np.float64)
-        rstd = 1.0 / np.sqrt((x64 * x64).mean(axis=1) + float(F32(e)))
-        return _bf16((x64 * rstd[:, None] * gamma.astype(np.float64)).astype(F32))
-
-    a = norm(s, gp, eps_p)
-    xp = _bf16((a.astype(np.float64) * float(F32(xs))).astype(F32))
-    rp = _bf16((r.astype(np.float64) * float(F32(rs))).astype(F32))
-    res = _bf16((xp.astype(np.float64) + rp).astype(F32))
-    return norm(res, g, eps), res, xp, rp
+    return tuple(
+        t.float().numpy() for t in _sandwich(s, r, gp, g, eps_p, eps, xs, rs, True)
+    )
 
 
 def _exact_reference(s, r, gp, g, eps_p, eps, xs, rs):
     """FP64 throughout, no intermediate rounding."""
+    out, res, _, _ = _sandwich(s, r, gp, g, eps_p, eps, xs, rs, False)
+    return out.numpy(), res.numpy()
 
-    def norm(x, gamma, e):
-        rstd = 1.0 / np.sqrt((x * x).mean(axis=1) + float(F32(e)))
-        return x * rstd[:, None] * gamma.astype(np.float64)
 
-    a = norm(s.astype(np.float64), gp, eps_p)
-    res = a * float(F32(xs)) + r.astype(np.float64) * float(F32(rs))
-    return norm(res, g, eps), res
+def _sandwich(s, r, gp, g, eps_p, eps, xs, rs, round_bf16):
+    return torch_sandwich_norm(
+        *(torch.from_numpy(np.ascontiguousarray(v)) for v in (s, r, gp, g)),
+        post_eps=eps_p,
+        eps=eps,
+        x_scale=xs,
+        residual_scale=rs,
+        round_bf16=round_bf16,
+    )
 
 
 def _ulp(v: np.ndarray) -> np.ndarray:

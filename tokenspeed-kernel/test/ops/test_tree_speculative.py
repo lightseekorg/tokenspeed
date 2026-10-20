@@ -24,6 +24,11 @@ import random
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.mha import torch_dense_attention
+from tokenspeed_kernel.numerics.torch.attention.tree import (
+    torch_tree_window_attention,
+)
+from tokenspeed_kernel.numerics.torch.sampling import torch_verify_tree
 from tokenspeed_kernel.ops.attention.tree import tree_window_attention
 from tokenspeed_kernel.ops.kvcache.triton import compact_window_rows
 from tokenspeed_kernel.ops.sampling.triton.logprob_topk import logprob_topk
@@ -39,30 +44,6 @@ def _last_dim_strided(t):
     )
     backing[..., ::2] = t
     return backing[..., ::2]
-
-
-def _reference_verify(cands, parents, target):
-    bs, n = cands.shape
-    predicts = torch.zeros(bs * n, dtype=torch.int32)
-    lengths, paths = [], torch.full((bs, n), -1, dtype=torch.int32)
-    for b in range(bs):
-        cur, path = 0, [0]
-        while True:
-            pick = int(target[b * n + cur])
-            kids = [
-                j
-                for j in range(n)
-                if int(parents[b, j]) == cur and int(cands[b, j]) == pick
-            ]
-            if not kids:
-                break
-            predicts[b * n + len(path) - 1] = pick
-            cur = kids[0]
-            path.append(cur)
-        predicts[b * n + len(path) - 1] = int(target[b * n + cur])
-        lengths.append(len(path))
-        paths[b, : len(path)] = torch.tensor(path, dtype=torch.int32)
-    return predicts, torch.tensor(lengths, dtype=torch.int32), paths
 
 
 def _random_tree(n, max_depth, rng):
@@ -90,7 +71,7 @@ def test_verify_tree_matches_reference(n, max_depth, vocab):
     parents[0] = torch.arange(-1, n - 1)
     cands[1, 1:] = 0
     target[n : 2 * n] = 0
-    ref = _reference_verify(cands, parents, target)
+    ref = torch_verify_tree(cands, parents, target)
     out = [
         torch.zeros(bs * n, dtype=torch.int32),
         torch.zeros(bs, dtype=torch.int32),
@@ -166,17 +147,12 @@ def _paged_tree_problem(
             mask[b * r + i] = (
                 bits - (1 << 64) if bits >> 63 else bits
             )  # bit 63 is the sign
-        group = hq // hkv
-        kk = keys.float().repeat_interleave(group, 1)
-        vv = vals.float().repeat_interleave(group, 1)
-        qq = q[b * r : (b + 1) * r].float()
-        s = torch.einsum("nhd,xhd->hnx", qq, kk) * scale
-        vis = torch.ones(r, plen + n, dtype=torch.bool)
-        for i in range(r):
-            for j in range(n):
-                vis[i, plen + j] = bool((int(mask[b * r + i]) >> j) & 1)
-        s = s.masked_fill(~vis[None], float("-inf"))
-        refs.append(torch.einsum("hnx,xhd->nhd", torch.softmax(s, -1), vv))
+        rows_b = slice(b * r, (b + 1) * r)
+        refs.append(
+            torch_tree_window_attention(
+                q[rows_b], keys, vals, plen, mask[rows_b], scale
+            )
+        )
     return q, kt, vt, mask, k_cache, v_cache, tables, torch.cat(refs), scale
 
 
@@ -231,24 +207,23 @@ def test_tree_window_attention_ignores_nonfinite_v_in_unseen_slots(poison, requi
 def _causal_prefix_partial(q, k_rows, v_rows, tables, prefix_lens, r, page, scale):
     """What a causal ``q_len = r`` decode over each request's prefix returns: row
     ``i`` attends keys ``[0, P - r + 1 + i)``; bf16 output and base-2 LSE."""
-    hq, hkv = q.shape[1], k_rows.shape[1]
-    group = hq // hkv
     out = q.new_zeros(*q.shape[:2], v_rows.shape[-1])
     lse = torch.full(q.shape[:2], float("-inf"))
     for b, plen in enumerate(prefix_lens):
         pos = torch.arange(plen)
         slots = (tables[b, pos // page].long() * page + pos % page).tolist()
-        kk = k_rows[slots].float().repeat_interleave(group, 1)
-        vv = v_rows[slots].float().repeat_interleave(group, 1)
-        for i in range(r):
-            covered = plen - r + 1 + i
-            if covered <= 0:
-                continue
-            s = torch.einsum("hd,xhd->hx", q[b * r + i].float(), kk[:covered]) * scale
-            out[b * r + i] = torch.einsum(
-                "hx,xhd->hd", torch.softmax(s, -1), vv[:covered]
-            ).bfloat16()
-            lse[b * r + i] = torch.logsumexp(s, -1) / torch.log(torch.tensor(2.0))
+        rows = slice(b * r, (b + 1) * r)
+        request_out, request_lse = torch_dense_attention(
+            q[rows],
+            k_rows[slots],
+            v_rows[slots],
+            scale=scale,
+            causal_offset=plen - r,
+            window_left=None,
+            sinks=None,
+        )
+        out[rows] = request_out.bfloat16()
+        lse[rows] = request_lse / torch.log(torch.tensor(2.0))
     return out, lse
 
 
@@ -354,7 +329,6 @@ def _check_mla_tree_window(
         parent = [-1] + [
             int(torch.randint(0, j, (1,), generator=gen)) for j in range(1, n)
         ]
-        vis = torch.ones(r, plen + n, dtype=torch.bool)
         for i in range(r):
             if rows is None:
                 bits, cur = 0, i
@@ -366,15 +340,11 @@ def _check_mla_tree_window(
                     (1 << n) - 1
                 )
             mask[b * r + i] = bits - (1 << 64) if bits >> 63 else bits
-            for j in range(n):
-                vis[i, plen + j] = bool((bits >> j) & 1)
-        s = (
-            torch.einsum("nhd,xd->hnx", q[b * r : (b + 1) * r].float(), keys[:, 0])
-            * scale
-        )
-        s = s.masked_fill(~vis[None], float("-inf"))
+        rows_b = slice(b * r, (b + 1) * r)
         refs.append(
-            torch.einsum("hnx,xd->nhd", torch.softmax(s, -1), keys[:, 0, :latent])
+            torch_tree_window_attention(
+                q[rows_b], keys, keys[..., :latent], plen, mask[rows_b], scale
+            )
         )
     k_rows = cache.to(kv_dtype)
     prefix_out, prefix_lse = _causal_prefix_partial(

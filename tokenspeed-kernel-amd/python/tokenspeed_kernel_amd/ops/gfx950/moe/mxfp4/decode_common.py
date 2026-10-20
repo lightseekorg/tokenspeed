@@ -142,9 +142,12 @@ def _compact_mxfp4_scale_tile(expanded_layout, axis):
 
 
 @gluon.constexpr_function
-def _direct_mxfp4_mfma_layouts(m_dup, block_n, block_k_scale):
+def _direct_mxfp4_mfma_layouts(m_dup, block_n, block_k_scale, num_warps):
     mfma = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 1]
+        version=4,
+        instr_shape=[16, 16, 128],
+        transposed=True,
+        warps_per_cta=[1, num_warps],
     )
     dot_a = gl.DotOperandLayout(operand_index=0, parent=mfma, k_width=16)
     dot_b = gl.DotOperandLayout(operand_index=1, parent=mfma, k_width=16)

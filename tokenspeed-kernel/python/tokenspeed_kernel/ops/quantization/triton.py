@@ -19,7 +19,12 @@ from typing import Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -95,7 +100,7 @@ def _flatten_to_2d(x: torch.Tensor):
         if x.stride(d) != expected:
             raise ValueError(
                 f"cannot flatten dim {d}: stride={x.stride(d)} but expected "
-                f"shape[{d+1}]*stride[{d+1}]={expected}. Tensor shape={tuple(x.shape)}, "
+                f"shape[{d + 1}]*stride[{d + 1}]={expected}. Tensor shape={tuple(x.shape)}, "
                 f"stride={tuple(x.stride())}."
             )
     return M, N, row_stride
@@ -235,7 +240,7 @@ def fp8_token_multiplier(amax):
 def fp8_quantize_by_multiplier(x, multiplier):
     """FP8 E4M3 codes of FP32 ``x`` times its quantization ``multiplier``."""
     q = tl.clamp(x * multiplier, -_FP8_E4M3_MAX, _FP8_E4M3_MAX)
-    return q.to(tl.float8e4nv)
+    return q.to(tl.float8e4nv, fp_downcast_rounding="rtne")
 
 
 @triton.jit
@@ -647,6 +652,7 @@ _FP8_PER_TOKEN_MAX_M = 64
     "fp8_with_scale",
     name="triton_quantize_fp8_per_token",
     solution="triton",
+    features={"token_fp8_min_scaling"},
     # SM100 and newer, where the per-token FP8 GEMMs that take its output run.
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
@@ -689,6 +695,63 @@ def triton_quantize_fp8_per_token(
             f"scale_encoding={scale_encoding!r}"
         )
     return fp8_quantize_per_token(x, enable_pdl=enable_pdl)
+
+
+@register_kernel(
+    "quantization",
+    "fp8_with_scale",
+    name="triton_quantize_fp8_per_token_portable",
+    solution="triton",
+    features={"token_fp8_min_scaling"},
+    capability=CapabilityRequirement(
+        vendors=frozenset({"amd"}),
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={
+        "granularity": frozenset({"token"}),
+        "scale_encoding": frozenset({"float32"}),
+    },
+    priority=Priority.PORTABLE + 1,
+)
+def triton_quantize_fp8_per_token_portable(
+    x: torch.Tensor,
+    *,
+    granularity: str,
+    group_size: int | None,
+    scale_encoding: str,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Portable per-token E4M3 quantization with a minimum scale, for any row count.
+
+    Args:
+        x: BF16 or FP16 activations; the last dimension is one token.
+        granularity: Must be ``"token"``.
+        group_size: Must be None.
+        scale_encoding: Must be ``"float32"``.
+        enable_pdl: Launch with Programmatic Dependent Launch on Hopper+.
+
+    Returns:
+        FP8 E4M3 codes with the input shape and FP32 scales with a singleton
+        last dimension. The scale
+        floor and independently rounded reciprocal match the shared token
+        quantizer, including zero and tiny rows.
+    """
+    if enable_pdl and not current_platform().is_hopper_plus:
+        raise ValueError("this platform does not support enable_pdl")
+    shape = x.shape
+    rows = x.reshape(-1, shape[-1])
+    if rows.stride(-1) != 1:
+        rows = rows.contiguous()
+    values, scales = triton_quantize_fp8_per_token(
+        rows,
+        granularity=granularity,
+        group_size=group_size,
+        scale_encoding=scale_encoding,
+        enable_pdl=enable_pdl,
+    )
+    return values.reshape(shape), scales.reshape(*shape[:-1], 1)
 
 
 # The widest SwiGLU half (intermediate size) one program holds: a row per
@@ -1082,11 +1145,184 @@ def triton_quantize_mxfp4(
     return mxfp4_quantize(x)
 
 
+NVFP4_BLOCK = 16
+
+
+@triton.jit
+def _rcp_approx(x):
+    """flashinfer's reciprocal: the approximate, flush-to-zero PTX instruction."""
+    return tl.inline_asm_elementwise(
+        "rcp.approx.ftz.f32 $0, $1;",
+        "=f,f",
+        [x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _mailbox_row_dirty(halves, sentinel_half: tl.constexpr):
+    """Whether any BF16 element of the row still holds the sentinel's half."""
+    return tl.max((halves == sentinel_half).to(tl.int32), axis=0) != 0
+
+
+@triton.jit
+def _rmsnorm_nvfp4_quant_kernel(
+    x_ptr,
+    weight_ptr,
+    global_scale_ptr,
+    out_ptr,
+    scale_ptr,
+    width: tl.constexpr,
+    eps: tl.constexpr,
+    weight_offset: tl.constexpr,
+    sentinel_word: tl.constexpr,
+    sentinel_half: tl.constexpr,
+    MAILBOX: tl.constexpr,
+    BLOCK: tl.constexpr,
+    SF_BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    # flashinfer: sf = e4m3(gs * amax * rcp(6)), y = e2m1(x * rcp(sf * rcp(gs))).
+    row = tl.program_id(0).to(tl.int64)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < width
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        # Dependents may launch now; their own wait still covers this grid's completion.
+        tl.extra.cuda.gdc_launch_dependents()
+    if MAILBOX:
+        # One row-wide poll load keeps the plain path's variance sum order bitwise.
+        half_ptr = x_ptr.to(tl.pointer_type(tl.int16)) + row * width + offsets
+        halves = tl.load(half_ptr, mask=mask, other=0, volatile=True)
+        while _mailbox_row_dirty(halves, sentinel_half):
+            halves = tl.load(half_ptr, mask=mask, other=0, volatile=True)
+        values = halves.to(tl.bfloat16, bitcast=True).to(tl.float32)
+        word_ptr = x_ptr.to(tl.pointer_type(tl.int32)) + row * (width // 2)
+        word_ptr += tl.arange(0, BLOCK // 2)
+        tl.store(word_ptr, tl.full([BLOCK // 2], sentinel_word, tl.int32))
+    else:
+        values = tl.load(x_ptr + row * width + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+    variance = tl.sum(values * values, axis=0) / width
+    values *= tl.rsqrt(variance + eps)
+    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    values *= (weight + weight_offset).to(tl.bfloat16).to(tl.float32)
+    values = values.to(tl.bfloat16).to(tl.float32)
+    # flashinfer's quantizer is flush-to-zero: a subnormal input is a zero to it.
+    values = tl.where(tl.abs(values) < 1.1754944e-38, 0.0, values)
+    blocks = tl.reshape(values, [BLOCK // SF_BLOCK, SF_BLOCK])
+    amax = tl.max(tl.abs(blocks), axis=1)
+    global_scale = tl.load(global_scale_ptr) + tl.zeros_like(amax)
+    rcp_six = _rcp_approx(tl.full(amax.shape, 6.0, tl.float32))
+    sf_value = tl.where(amax != 0.0, global_scale * (amax * rcp_six), 0.0)
+    sf_e4m3 = sf_value.to(tl.float8e4nv)
+    sf_f32 = sf_e4m3.to(tl.float32)
+    out_scale = _rcp_approx(sf_f32 * _rcp_approx(global_scale))
+    out_scale = tl.where(amax != 0.0, out_scale, 0.0)
+    scaled = tl.reshape(blocks * out_scale[:, None], [BLOCK // 2, 2])
+    low, high = tl.split(scaled)
+    packed = tl.inline_asm_elementwise(
+        "{ .reg .b8 b; cvt.rn.satfinite.e2m1x2.f32 b, $2, $1; mov.b32 $0, {b, b, b, b}; }",
+        "=r,f,f",
+        [low, high],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    half = tl.arange(0, BLOCK // 2)
+    tl.store(
+        out_ptr + row * (width // 2) + half,
+        (packed & 0xFF).to(tl.uint8),
+        mask=half < width // 2,
+    )
+    sf_index = tl.arange(0, BLOCK // SF_BLOCK)
+    tl.store(
+        scale_ptr + row * (width // SF_BLOCK) + sf_index,
+        sf_e4m3.to(tl.uint8, bitcast=True),
+        mask=sf_index < width // SF_BLOCK,
+    )
+
+
+@register_kernel(
+    "quantization",
+    "rmsnorm_nvfp4",
+    name="triton_rmsnorm_nvfp4_quant",
+    solution="triton",
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    priority=Priority.PORTABLE,
+)
+def triton_rmsnorm_nvfp4_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    weight_offset: float,
+    global_scale: torch.Tensor,
+    mailbox_sentinel: int | None,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Triton kernel of :func:`tokenspeed_kernel.ops.quantization.rmsnorm_nvfp4_quant`."""
+    if x.ndim != 2 or x.dtype != torch.bfloat16 or not x.is_cuda:
+        raise ValueError("x must be a BF16 GPU tensor shaped [rows, width]")
+    rows, width = x.shape
+    if width % NVFP4_BLOCK:
+        raise ValueError(f"width must be a multiple of {NVFP4_BLOCK}, got {width}")
+    if weight.shape != (width,) or weight.device != x.device:
+        raise ValueError("weight must be colocated and match x's final dimension")
+    if global_scale.numel() != 1 or global_scale.dtype != torch.float32:
+        raise ValueError("global_scale must be one FP32 value")
+    if mailbox_sentinel is not None:
+        if not 0 <= mailbox_sentinel <= 0xFFFFFFFF or (mailbox_sentinel & 0xFFFF) != (
+            mailbox_sentinel >> 16
+        ):
+            raise ValueError("the mailbox sentinel is one word whose halves agree")
+        if width & (width - 1) or not x.is_contiguous():
+            raise ValueError("a mailbox needs contiguous rows of a power-of-two width")
+    values = x.contiguous()
+    packed = torch.empty((rows, width // 2), dtype=torch.uint8, device=x.device)
+    # flashinfer's consumers may touch the round_up(rows, 16) tail; keep that storage.
+    padded_rows = (rows + 15) // 16 * 16
+    scales = torch.empty(
+        (padded_rows, width // NVFP4_BLOCK), dtype=torch.uint8, device=x.device
+    )[:rows]
+    if rows == 0:
+        return packed, scales
+    block = triton.next_power_of_2(width)
+    if block > 65536:
+        raise ValueError("the normalized dimension is too wide for one Triton block")
+    use_pdl = enable_pdl and current_platform().is_hopper_plus
+    launch = {"launch_pdl": True} if use_pdl else {}
+    sentinel = 0 if mailbox_sentinel is None else mailbox_sentinel
+    _rmsnorm_nvfp4_quant_kernel[(rows,)](
+        values,
+        weight,
+        global_scale,
+        packed,
+        scales,
+        width=width,
+        eps=eps,
+        weight_offset=weight_offset,
+        # The kernel compares int16 halves and stores int32 words: signed images.
+        sentinel_word=sentinel - (1 << 32) if sentinel >= 1 << 31 else sentinel,
+        sentinel_half=(sentinel & 0xFFFF) - (1 << 16 if sentinel & 0x8000 else 0),
+        MAILBOX=mailbox_sentinel is not None,
+        BLOCK=block,
+        SF_BLOCK=NVFP4_BLOCK,
+        ENABLE_PDL=use_pdl,
+        num_warps=8,
+        **launch,
+    )
+    return packed, scales
+
+
 __all__ = [
     "fp8_quantize",
     "mxfp4_quantize",
     "triton_quantize_fp8_roundtrip",
     "triton_quantize_mxfp4",
+    "triton_rmsnorm_nvfp4_quant",
     "triton_quantize_fp8_with_scale",
 ]
 
@@ -1102,7 +1338,8 @@ def _fp8_group32_ue8m0_quantize(X, Q, S, K: tl.constexpr, X0: tl.constexpr):
     bits = raw.to(tl.int32, bitcast=True)
     exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
     scale = (exponent << 23).to(tl.float32, bitcast=True)
-    quantized = tl.div_rn(values, scale).to(tl.float8e4nv)
+    inverse_scale = 1.0 / scale
+    quantized = (values * inverse_scale).to(tl.float8e4nv)
     tl.store(Q + row * K + column, quantized)
     tl.store(S + group, exponent.to(tl.uint8))
 
@@ -1226,6 +1463,38 @@ def _gated_fp8_quantize_kernel(
     tl.store(scale_ptr + row * groups + group, scale, valid_group)
 
 
+@triton.jit(do_not_specialize=["X0"])
+def _rmsnorm_fp8_group32_ue8m0(
+    X,
+    W,
+    N,
+    Q,
+    S,
+    X0,
+    K: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.arange(0, BLOCK)
+    x = tl.load(X + row * X0 + col, col < K, 0).to(tl.float32)
+    w = tl.load(W + col, col < K, 0).to(tl.float32)
+    inv = tl.rsqrt(tl.sum(x * x, 0) / K + EPS)
+    normalized = (x * inv * w).to(N.dtype.element_ty)
+    tl.store(N + row * K + col, normalized, col < K)
+    values = tl.reshape(normalized.to(tl.float32), (BLOCK // 32, 32))
+    raw = tl.maximum(tl.max(tl.abs(values), 1), 1e-4) * (1.0 / 448.0)
+    bits = raw.to(tl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    quantized = tl.reshape(
+        values * (1.0 / (exponent << 23).to(tl.float32, bitcast=True))[:, None],
+        (BLOCK,),
+    ).to(tl.float8e4nv)
+    tl.store(Q + row * K + col, quantized, col < K)
+    groups = tl.arange(0, BLOCK // 32)
+    tl.store(S + row * (K // 32) + groups, exponent.to(tl.uint8), groups < K // 32)
+
+
 @register_kernel(
     "quantization",
     "gated_fp8",
@@ -1297,3 +1566,229 @@ def triton_gated_fp8_quantize(
             **({"launch_pdl": True} if enable_pdl else {}),
         )
     return values, scales
+
+
+@register_kernel(
+    "quantization",
+    "rmsnorm_fp8_group32_ue8m0",
+    name="triton_rmsnorm_fp8_group32_ue8m0",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def triton_rmsnorm_fp8_group32_ue8m0(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return BF16 normalized rows, E4M3 codes and canonical group-32 scales."""
+    if (
+        x.ndim != 2
+        or not x.is_cuda
+        or x.dtype != torch.bfloat16
+        or x.shape[1] <= 0
+        or x.shape[1] % 32
+        or x.stride(1) != 1
+        or weight.shape != (x.shape[1],)
+        or not weight.is_contiguous()
+        or weight.dtype != x.dtype
+        or weight.device != x.device
+        or eps <= 0
+    ):
+        raise ValueError("Expected BF16 [M,K] input and [K] weight, K divisible by 32")
+    m, k = x.shape
+    normalized = torch.empty_like(x, memory_format=torch.contiguous_format)
+    quantized = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty((m, k // 32), dtype=torch.uint8, device=x.device)
+    if m:
+        _rmsnorm_fp8_group32_ue8m0[(m,)](
+            x,
+            weight,
+            normalized,
+            quantized,
+            scales,
+            x.stride(0),
+            k,
+            eps,
+            triton.next_power_of_2(k),
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return normalized, quantized, scales
+
+
+@triton.jit(do_not_specialize=["X0"])
+def _silu_and_mul_fp8_group32_ue8m0(
+    X,
+    Q,
+    S,
+    X0,
+    I: tl.constexpr,
+    LIMIT: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # silu(gate) * up rounded to BF16 exactly as _silu_and_mul_kernel, then
+    # quantized like _fp8_group32_ue8m0_quantize.
+    row = tl.program_id(0).to(tl.int64)
+    column = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = column < I
+    gate = tl.load(X + row * X0 + column, mask, 0.0).to(tl.float32)
+    up = tl.load(X + row * X0 + I + column, mask, 0.0).to(tl.float32)
+    if HAS_LIMIT:
+        gate = tl.minimum(gate, LIMIT)
+        up = tl.clamp(up, -LIMIT, LIMIT)
+    values = (gate * tl.sigmoid(gate) * up).to(tl.bfloat16).to(tl.float32)
+    groups = tl.reshape(values, (BLOCK // 32, 32))
+    amax = tl.maximum(tl.max(tl.abs(groups), 1), 1.0e-4)
+    bits = (amax * (1.0 / 448.0)).to(tl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    inverse_scale = 1.0 / (exponent << 23).to(tl.float32, bitcast=True)
+    quantized = tl.reshape(groups * inverse_scale[:, None], (BLOCK,))
+    tl.store(Q + row * I + column, quantized.to(tl.float8e4nv), mask)
+    group = tl.program_id(1) * (BLOCK // 32) + tl.arange(0, BLOCK // 32)
+    tl.store(S + row * (I // 32) + group, exponent.to(tl.uint8), group < I // 32)
+
+
+@register_kernel(
+    "quantization",
+    "silu_and_mul_fp8_group32_ue8m0",
+    name="triton_silu_and_mul_fp8_group32_ue8m0",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def triton_silu_and_mul_fp8_group32_ue8m0(
+    x: torch.Tensor, limit: float | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return E4M3 codes and UE8M0 group-32 scales of BF16 silu(gate) * up."""
+    if (
+        x.ndim != 2
+        or x.dtype != torch.bfloat16
+        or x.shape[1] % 64
+        or x.stride(1) != 1
+        or (limit is not None and limit <= 0)
+    ):
+        raise ValueError(
+            "Expected BF16 [M, 2I] gate/up rows with contiguous columns, I % 32 == 0"
+        )
+    m, inner = x.shape[0], x.shape[1] // 2
+    quantized = torch.empty((m, inner), dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty((m, inner // 32), dtype=torch.uint8, device=x.device)
+    block = min(1024, triton.next_power_of_2(inner))
+    if m:
+        _silu_and_mul_fp8_group32_ue8m0[(m, triton.cdiv(inner, block))](
+            x,
+            quantized,
+            scales,
+            x.stride(0),
+            inner,
+            0.0 if limit is None else limit,
+            limit is not None,
+            block,
+            num_warps=4,
+        )
+    return quantized, scales
+
+
+@triton.jit
+def _fp8_swizzled_scale_offset(row, column, K_TILES: tl.constexpr):
+    # Equivalent to [Mtiles,4,32,Ktiles,4].transpose(1,3).contiguous().
+    return (
+        (row // 128 * K_TILES + column // 4) * 512
+        + row % 32 * 16
+        + row // 32 % 4 * 4
+        + column % 4
+    )
+
+
+@triton.jit(
+    do_not_specialize=["M", "X0"],
+    do_not_specialize_on_alignment=["M", "X0"],
+)
+def _fp8_group32_ue8m0_quantize_swizzled(
+    X,
+    Q,
+    S,
+    M,
+    X0,
+    K: tl.constexpr,
+    GROUPS: tl.constexpr,
+    ZERO_BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    k_tiles = tl.cdiv(K, 128)
+    if pid * GROUPS < M * (K // 32):
+        group = pid * GROUPS + tl.arange(0, GROUPS)
+        row = group // (K // 32)
+        scale_column = group % (K // 32)
+        column = scale_column[:, None] * 32 + tl.arange(0, 32)[None, :]
+        values = tl.load(X + row[:, None] * X0 + column, row[:, None] < M, 0.0).to(
+            tl.float32
+        )
+        # Preserve the original quantizer's exact arithmetic and rounding boundary.
+        amax = tl.maximum(tl.max(tl.abs(values), 1), 1.0e-4)
+        raw = amax * (1.0 / 448.0)
+        bits = raw.to(tl.int32, bitcast=True)
+        exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        scale = (exponent << 23).to(tl.float32, bitcast=True)
+        quantized = tl.div_rn(values, scale[:, None]).to(tl.float8e4nv)
+        tl.store(Q + row[:, None] * K + column, quantized, row[:, None] < M)
+        scale_offset = _fp8_swizzled_scale_offset(row, scale_column, k_tiles)
+        tl.store(S + scale_offset, exponent.to(tl.uint8), row < M)
+
+    # Padding writes have disjoint addresses from all live scale stores. Each
+    # program owns a fixed slice, so no memset/copy or cross-CTA barrier is needed.
+    if M % 128 != 0 or K % 128 != 0:
+        padded_columns = k_tiles * 4
+        index = pid * ZERO_BLOCK + tl.arange(0, ZERO_BLOCK)
+        pad_row, pad_column = index // padded_columns, index % padded_columns
+        padding = (index < tl.cdiv(M, 128) * 128 * padded_columns) & (
+            (pad_row >= M) | (pad_column >= K // 32)
+        )
+        offset = _fp8_swizzled_scale_offset(pad_row, pad_column, k_tiles)
+        tl.store(S + offset, 0, padding)
+
+
+def _quantize_fp8_group32_swizzled(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact group-32 quantization in the prepared GEMM's F8_128x4 layout."""
+    m, k = x.shape
+    quantized = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
+    scale_count = triton.cdiv(m, 128) * 128 * triton.cdiv(k, 128) * 4
+    scales = torch.empty((scale_count,), dtype=torch.uint8, device=x.device)
+    if m:
+        # Small inputs need enough independent CTAs; large inputs amortize
+        # address/reduction overhead across more groups per CTA. These static
+        # work sizes never depend on input values or request history.
+        total_groups = m * (k // 32)
+        if total_groups <= 1024:
+            groups = 4
+        elif total_groups <= 8192:
+            groups = 16
+        elif total_groups <= 131072:
+            groups = 32
+        else:
+            groups = 64
+        zero_block = 256
+        programs = max(
+            triton.cdiv(m * (k // 32), groups), triton.cdiv(scale_count, zero_block)
+        )
+        _fp8_group32_ue8m0_quantize_swizzled[(programs,)](
+            x,
+            quantized,
+            scales,
+            m,
+            x.stride(0),
+            k,
+            groups,
+            zero_block,
+            num_warps=4,
+            num_stages=1,
+        )
+    return quantized, scales

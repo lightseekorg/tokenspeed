@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 
 import torch as _torch
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -709,6 +710,60 @@ def mhc_apply_pre(
     return kernel(residual, pre, norm_weight=norm_weight, norm_eps=norm_eps)
 
 
+def mhc_apply_pre_quantize_fp8(
+    residual: _torch.Tensor,
+    pre: _torch.Tensor,
+    norm_weight: _torch.Tensor,
+    norm_eps: float,
+) -> tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor]:
+    """``mhc_apply_pre`` with RMSNorm that also quantizes its output.
+
+    The output is quantized like ``quantize_fp8(granularity="token_group",
+    group_size=32, scale_encoding="ue8m0")``. A fused kernel is used when one
+    is registered; otherwise the two ops run back to back.
+
+    Args:
+        residual: Contiguous BF16 residual streams ``[..., hc_mult, H]``.
+        pre: Contiguous FP32 pre coefficients ``[..., hc_mult]``.
+        norm_weight: RMSNorm weight ``[H]``.
+        norm_eps: RMSNorm epsilon.
+
+    Returns:
+        BF16 layer input ``[..., H]``, E4M3 codes ``[tokens, H]`` and uint8
+        UE8M0 scales ``[tokens, H / 32]``.
+    """
+    if pre.shape != residual.shape[:-1]:
+        raise ValueError("mhc_apply_pre requires pre shaped like residual[..., :, 0]")
+    try:
+        kernel = select_kernel(
+            "residual",
+            "mhc_apply_pre_fp8_group32",
+            format_signature(
+                residual=dense_tensor_format(residual.dtype),
+                pre=dense_tensor_format(pre.dtype),
+            ),
+            traits={
+                "buffer_offsets_fit_int32": residual.numel() < 2**31,
+                "hc_mult": int(residual.shape[-2]),
+            },
+            override=None,
+            solution=None,
+        )
+    except NoKernelFoundError:
+        out = mhc_apply_pre(residual, pre, norm_weight=norm_weight, norm_eps=norm_eps)
+        codes, scales = quantize_fp8(
+            out.reshape(-1, out.shape[-1]),
+            granularity="token_group",
+            group_size=32,
+            scale_encoding="ue8m0",
+            enable_pdl=False,
+            override=None,
+            solution=None,
+        )
+        return out, codes, scales
+    return kernel(residual, pre, norm_weight, norm_eps)
+
+
 def mhc_pre(
     residual: _torch.Tensor,
     fn: _torch.Tensor,
@@ -910,11 +965,19 @@ def mhc_fused_hc(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.residual.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.residual._cute_dsl.gated_boundary  # noqa: E402,F401
+import tokenspeed_kernel.ops.residual._triton.gated_boundary  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.cute_fused  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.torch  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.triton  # noqa: E402,F401
+from tokenspeed_kernel.ops.residual.gated_boundary import (  # noqa: E402
+    boundary_gathers_mailbox,
+    post_norm_residual_pre_norm,
+    post_norm_residual_pre_norm_bf16,
+    residual_gate_coefficients,
+)
 
 # isort: on
 
@@ -922,14 +985,19 @@ import tokenspeed_kernel.ops.residual.triton  # noqa: E402,F401
 __all__ = [
     "attn_res_fwd",
     "attn_res_fwd_available",
+    "boundary_gathers_mailbox",
     "gated_residual_combine",
     "gated_residual_mix",
     "mhc_apply_pre",
+    "mhc_apply_pre_quantize_fp8",
     "mhc_fused_hc",
     "mhc_mixes",
     "mhc_post",
     "mhc_pre",
     "pad_gated_residual_projection_weight",
+    "post_norm_residual_pre_norm",
+    "post_norm_residual_pre_norm_bf16",
+    "residual_gate_coefficients",
 ]
 
 

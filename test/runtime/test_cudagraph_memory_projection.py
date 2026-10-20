@@ -598,5 +598,23 @@ def test_the_reserve_comes_out_of_the_profiled_budget(profiled, reserve, expecte
     assert attn_utils.reserve_cache_budget(profiled, reserve) == expected
 
 
+@pytest.mark.parametrize(
+    "probe, profiled, fits",
+    [
+        (4 * GIB, 8 * GIB, True),
+        (8 * GIB, 8 * GIB, True),
+        (9 * GIB, 8 * GIB, False),
+        # Weights that leave less than the utilization headroom.
+        (1 * GIB, -2 * GIB, False),
+    ],
+)
+def test_a_probe_arena_the_profile_cannot_hold_is_refused(probe, profiled, fits):
+    if fits:
+        attn_utils.check_probe_cache_fits(probe, profiled)
+        return
+    with pytest.raises(ValueError, match=r"needs \d+\.\d+ GiB .* left -?\d+\.\d+ GiB"):
+        attn_utils.check_probe_cache_fits(probe, profiled)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

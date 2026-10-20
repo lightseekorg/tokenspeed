@@ -18,12 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Host-side launch marshaling for the pipelined ragged GEMM kernel, plus
-AMDGCN static profiling / spill-check helpers."""
+"""Host-side launch marshaling for the pipelined ragged GEMM kernel."""
 
 from __future__ import annotations
-
-from typing import Any
 
 import torch
 from tokenspeed_kernel_amd.ops.gfx950.moe._common import (
@@ -54,89 +51,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     is_swizzled_cdna4_mxfp4_scale,
     swizzle_cdna4_mxfp4_scale,
 )
-
-# ---------------------------------------------------------------------------
-# Static profile helper (sgpr/vgpr spill detection)
-# ---------------------------------------------------------------------------
-
-
-def _parse_amdgcn_metric(amdgcn: str, key: str) -> int | None:
-    """Look for ``.<key>: N`` or ``;  Key: N`` in the AMDGCN dump."""
-    import re
-
-    m = re.search(rf"\.{key}:\s+(\d+)", amdgcn)
-    if m is not None:
-        return int(m.group(1))
-    m = re.search(rf";\s+{key}\s*[:=]?\s+(\d+)", amdgcn)
-    if m is not None:
-        return int(m.group(1))
-    return None
-
-
-def static_profile(kernel: Any, *, label: str = "") -> dict:
-    amdgcn = kernel.asm.get("amdgcn", "")
-    fields = [
-        "sgpr_count",
-        "sgpr_spill_count",
-        "vgpr_count",
-        "vgpr_spill_count",
-        "ScratchSize",
-        "codeLenInByte",
-        "Occupancy",
-    ]
-    profile = {f: _parse_amdgcn_metric(amdgcn, f) for f in fields}
-    if label:
-        profile["label"] = label
-    return profile
-
-
-_LAST_KERNEL_PROFILE: dict | None = None
-
-
-_PROFILE_BY_KERNEL_ID: dict[int, dict] = {}
-
-
-def _capture_launch_profile(k: Any) -> None:
-    global _LAST_KERNEL_PROFILE
-    key = id(k)
-    prof = _PROFILE_BY_KERNEL_ID.get(key)
-    if prof is None:
-        prof = static_profile(k)
-        name = getattr(k, "name", None)
-        if name is None:
-            md = getattr(k, "metadata", None)
-            name = getattr(md, "name", None) if md is not None else None
-        if name is not None:
-            prof["kernel_name"] = str(name)
-        md = getattr(k, "metadata", None)
-        if md is not None:
-            shared = getattr(md, "shared", None)
-            if shared is not None:
-                prof["shared"] = int(shared)
-        _PROFILE_BY_KERNEL_ID[key] = prof
-    _LAST_KERNEL_PROFILE = prof
-
-
-def last_kernel_profile() -> dict | None:
-    return _LAST_KERNEL_PROFILE
-
-
-def assert_no_spills(profile: dict, *, allow_scratch: int = 0) -> None:
-    sgpr_spill = profile.get("sgpr_spill_count") or 0
-    vgpr_spill = profile.get("vgpr_spill_count") or 0
-    scratch = profile.get("ScratchSize") or 0
-    msg = []
-    if sgpr_spill:
-        msg.append(f"sgpr_spill={sgpr_spill}")
-    if vgpr_spill:
-        msg.append(f"vgpr_spill={vgpr_spill}")
-    if scratch > allow_scratch:
-        msg.append(f"scratch={scratch} (allowed={allow_scratch})")
-    if msg:
-        raise AssertionError(
-            f"Gluon MoE kernel '{profile.get('label', '?')}' "
-            f"shows static spills: {', '.join(msg)}"
-        )
 
 
 def _dense_grid_dims(M: int, block_m: int) -> tuple[int, int]:
@@ -625,7 +539,7 @@ def _launch_kernel(
         medium_kwargs["XCD_SWIZZLE"] = 1
         medium_kwargs["num_stages"] = 1
         medium_kwargs.pop("waves_per_eu", None)
-        k = _pipelined_moe_kernel_scaled[(num_tiles_total,)](
+        _pipelined_moe_kernel_scaled[(num_tiles_total,)](
             *common_args,
             block_offs_buf,
             block_schedule_buf,
@@ -637,10 +551,9 @@ def _launch_kernel(
             MEDIUM_COMBINE=medium_decode_combine,
             **medium_kwargs,
         )
-        _capture_launch_profile(k)
         return
 
-    k = _pipelined_moe_kernel_scaled[grid](
+    _pipelined_moe_kernel_scaled[grid](
         *common_args,
         block_offs_buf,
         block_schedule_buf,
@@ -650,5 +563,3 @@ def _launch_kernel(
         N_EXPTS_TOT=n_slices,
         **common_kwargs,
     )
-
-    _capture_launch_profile(k)

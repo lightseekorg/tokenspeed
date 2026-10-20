@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-from kimi3_reference import dequantize_mxfp4, mxfp4_moe_reference
+from tokenspeed_kernel.numerics.torch.moe import mxfp4_situ_moe_experts
+from tokenspeed_kernel.numerics.torch.quantization import dequantize_mxfp4
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -121,6 +122,7 @@ def _plan(policy: str):
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
 
 
@@ -1258,7 +1260,7 @@ def test_n16_joint_decode_retains_raw_bank_arithmetic(joint_bank, m):
         shared.view(torch.int16), expected[1].view(torch.int16), atol=0, rtol=0
     )
     local_ids = torch.where(ids >= 112, ids - 112, -1)
-    oracle = mxfp4_moe_reference(
+    oracle = mxfp4_situ_moe_experts(
         x,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -1328,7 +1330,7 @@ def test_n16_a16_cell_tiles_tails_and_strided_output(m, d, i):
         torch.testing.assert_close(
             actual.view(torch.int16), expected.view(torch.int16), atol=0, rtol=0
         )
-    oracle = mxfp4_moe_reference(
+    oracle = mxfp4_situ_moe_experts(
         x,
         raw["w13_weight"],
         raw["w13_scale"],

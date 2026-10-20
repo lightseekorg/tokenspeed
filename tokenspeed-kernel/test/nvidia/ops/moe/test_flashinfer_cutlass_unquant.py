@@ -44,6 +44,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.activation import torch_silu_and_mul
+from tokenspeed_kernel.numerics.torch.moe import torch_moe_experts
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
@@ -163,17 +165,20 @@ def test_wrapper_passes_one_persistent_zeroed_workspace(monkeypatch) -> None:
 
 def _reference(x, ids, weights, w13, w2, first_expert):
     """SwiGLU experts in fp32; the w13 halves are [gate | up] as loaded."""
-    out = torch.zeros(x.shape[0], w2.shape[1], dtype=torch.float32, device=x.device)
-    inter = w2.shape[2]
-    for token in range(x.shape[0]):
-        for slot in range(ids.shape[1]):
-            expert = int(ids[token, slot]) - first_expert
-            if not 0 <= expert < w13.shape[0]:
-                continue
-            gate_up = x[token].float() @ w13[expert].float().T
-            act = torch.nn.functional.silu(gate_up[:inter]) * gate_up[inter:]
-            out[token] += weights[token, slot] * (act @ w2[expert].float().T)
-    return out
+    return torch_moe_experts(
+        x,
+        w13,
+        w2,
+        ids,
+        weights,
+        activation=lambda gate_up: torch_silu_and_mul(gate_up, None),
+        w13_bias=None,
+        w2_bias=None,
+        quantize_input=None,
+        quantize_intermediate=None,
+        round_expert_output=None,
+        first_expert=first_expert,
+    )
 
 
 @pytest.mark.parametrize("ep_rank", [0, 1])
@@ -210,6 +215,7 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         internal_activation_dtype="input",
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
         solution="flashinfer_cutlass",
     )
     reference_w13 = w13.clone()
