@@ -331,8 +331,9 @@ receive values; produced zeros are canonicalized so readiness remains distinct
 from data without changing this reduction contract.
 
 Receive storage, including padding, is cleared before the next producer can
-write it. Input publication and consumption acknowledgements order reuse, using
-multicast when available. Some buckets consume every prepared partial, including
+write it. Input publication and consumption acknowledgements join local CTAs,
+then publish system-scoped rank epochs to peers to order reuse, using multicast
+when available. Some buckets consume every prepared partial, including
 padding, so completion also proves that peers finished reading the owner's
 input. Those buckets may reuse the same input layout without another peer join;
 layout changes and kernels that skip padding retain that join. Empty owners

@@ -254,7 +254,8 @@ class FusedTPProjectionKernel:
             raise ValueError("Projection requires one or two accumulator warp groups")
         self.split_accumulator = accumulator_groups == 2
         self.smem_epilogue = row_parallel or self.split_accumulator
-        self.local_flag_scope = "gpu" if row_parallel else "sys"
+        # Column consumers acquire producer CTA readiness across GPUs.
+        self.ready_flag_scope = "gpu" if row_parallel else "sys"
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
@@ -3413,7 +3414,7 @@ class FusedTPProjectionKernel:
             flags.iterator + 16 + block,
             cutlass.Int64,
             sem="acquire",
-            scope=self.local_flag_scope,
+            scope="gpu",
         ) + cutlass.Int64(1)
         if cutlass.const_expr(self.row_parallel):
             previous_rows = cute.arch.load(
@@ -3615,17 +3616,15 @@ class FusedTPProjectionKernel:
                     if lane % lanes_per_group == 0:
                         scale_peers[peer][rank * rows + row, peer_group, 0] = inverse
         # The CTA barrier orders every writer before its leader's release.
-        # Row projection joins these device-local arrivals in CTA zero, then
-        # publishes one system-release epoch for remote input consumers.
-        if cutlass.const_expr(not self.row_parallel):
-            cute.arch.fence_acq_rel_sys()
+        # CTA zero joins these device-local arrivals, then publishes one
+        # system-release epoch for remote input consumers.
         cute.arch.barrier()
         if tid == 0:
             cute.arch.store(
                 flags.iterator + 16 + block,
                 epoch,
                 sem="release",
-                scope=self.local_flag_scope,
+                scope="gpu",
             )
         if block == 0:
             if cutlass.const_expr(self.row_parallel and blocks < self.num_cta_flags):
@@ -3643,14 +3642,14 @@ class FusedTPProjectionKernel:
                     flags.iterator + 16 + tid,
                     cutlass.Int64,
                     sem="acquire",
-                    scope=self.local_flag_scope,
+                    scope="gpu",
                 )
                 while arrival < epoch:
                     arrival = cute.arch.load(
                         flags.iterator + 16 + tid,
                         cutlass.Int64,
                         sem="acquire",
-                        scope=self.local_flag_scope,
+                        scope="gpu",
                     )
             cute.arch.barrier()
             if tid == 0:
@@ -3743,7 +3742,7 @@ class FusedTPProjectionKernel:
                 flags.iterator + 16 + block,
                 cutlass.Int64,
                 sem="acquire",
-                scope=self.local_flag_scope,
+                scope="gpu",
             )
             lane = cute.arch.lane_idx()
             address = peer_flags[0].iterator
@@ -3783,7 +3782,7 @@ class FusedTPProjectionKernel:
             flags.iterator + 16 + block,
             cutlass.Int64,
             sem="acquire",
-            scope=self.local_flag_scope,
+            scope="gpu",
         )
         first_owner = tile_m * self.cta_tile_shape_mnk[0] // rows
         owners_per_tile = max(1, self.cta_tile_shape_mnk[0] // rows)
@@ -3867,7 +3866,7 @@ class FusedTPProjectionKernel:
             ready.iterator + 16 + block,
             cutlass.Int64,
             sem="acquire",
-            scope=self.local_flag_scope,
+            scope=self.ready_flag_scope,
         ) + cutlass.Int64(1)
         cute.arch.barrier()
         if tid == 0:
@@ -3875,7 +3874,7 @@ class FusedTPProjectionKernel:
                 ready.iterator + 16 + block,
                 epoch,
                 sem="relaxed" if self.row_parallel else "release",
-                scope=self.local_flag_scope,
+                scope=self.ready_flag_scope,
             )
         copy_in = cute.make_copy_atom(
             cute.nvgpu.CopyG2ROp(),
@@ -3998,15 +3997,13 @@ class FusedTPProjectionKernel:
         # CTA zero acquires each per-CTA arrival in parallel and publishes
         # one rank epoch. The barrier completes every reader before the local
         # release; CTA zero forwards that ordering with a system-release ack.
-        if cutlass.const_expr(not self.row_parallel):
-            cute.arch.fence_acq_rel_sys()
         cute.arch.barrier()
         if tid == 0:
             cute.arch.store(
                 ack.iterator + 16 + block,
                 epoch,
                 sem="release",
-                scope=self.local_flag_scope,
+                scope="gpu",
             )
         if block == 0:
             if cutlass.const_expr(self.row_parallel and blocks < self.num_cta_flags):
@@ -4028,14 +4025,14 @@ class FusedTPProjectionKernel:
                     ack.iterator + 16 + tid,
                     cutlass.Int64,
                     sem="acquire",
-                    scope=self.local_flag_scope,
+                    scope="gpu",
                 )
                 while arrival < epoch:
                     arrival = cute.arch.load(
                         ack.iterator + 16 + tid,
                         cutlass.Int64,
                         sem="acquire",
-                        scope=self.local_flag_scope,
+                        scope="gpu",
                     )
             cute.arch.barrier()
             if tid == 0:

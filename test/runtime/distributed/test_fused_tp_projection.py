@@ -321,13 +321,17 @@ def _check_column_projection(rank, world_size, device, parallel, config):
         counts: torch.randn((counts[rank], 7168), device=device, dtype=torch.bfloat16)
         for counts in contexts
     }
-    source = {
-        counts: [torch.randn_like(value) for _ in range(3)]
-        for counts, value in inputs.items()
-    }
+    source = {}
+    for counts, value in inputs.items():
+        sample = torch.randn_like(value)
+        # Change scales sharply between epochs, with opposite shifts across owners.
+        source[counts] = [
+            torch.zeros_like(value),
+            sample,
+            sample * (16.0 if rank % 2 else 0.0625),
+        ]
     expected = {}
     for counts in contexts:
-        source[counts][0].zero_()
         expected[counts] = [
             [layer(value, ctx=contexts[counts])[0] for layer in baseline]
             for value in source[counts]
