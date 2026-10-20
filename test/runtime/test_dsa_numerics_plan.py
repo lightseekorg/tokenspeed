@@ -81,6 +81,26 @@ def _register(registry, invariant):
             reference,
         )
 
+    # The AMD dense delegate (MLAAttnBackend) plans its own batch-invariant
+    # leaves at construction; these only satisfy planning and never run.
+    def dense_unused(**kwargs):
+        raise AssertionError("the sparse path must not call dense MLA")
+
+    for mode in ("mla_extend_with_kvcache", "mla_decode_with_kvcache"):
+        registry.register(
+            KernelSpec(
+                name=f"public_{mode}",
+                family="attention",
+                mode=mode,
+                solution="public_reference",
+                format_signatures=format_signatures(
+                    ("q", "kv_cache"), "dense", {torch.bfloat16}
+                ),
+                features=frozenset({"batch_invariant"}),
+            ),
+            dense_unused,
+        )
+
 
 def _backend():
     spec = DSAConfig(

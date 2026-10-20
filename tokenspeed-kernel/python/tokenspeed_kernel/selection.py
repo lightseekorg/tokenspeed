@@ -73,6 +73,16 @@ class SelectedKernel:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.impl(*args, **kwargs)
 
+    # Two selections of the same registered kernel are interchangeable, so the
+    # plans that hold them (KernelPlan, the moe_plan dict) compare by value.
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SelectedKernel):
+            return NotImplemented
+        return (self.name, self.impl) == (other.name, other.impl)
+
+    def __hash__(self) -> int:
+        return hash((self.name, self.impl))
+
     def __repr__(self) -> str:
         return f"SelectedKernel(name={self.name!r})"
 

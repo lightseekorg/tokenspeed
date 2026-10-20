@@ -91,6 +91,14 @@ def test_plan_survives_registry_changes_and_batch_changes(h100_platform):
         assert torch.equal(selected(inputs), torch.tensor([4.0, 10.0]).repeat(count))
 
 
+def test_plans_compare_by_selected_kernel(h100_platform):
+    _register("fixed", priority=1, invariant=True, traits={})
+    first = _plan(h100_platform)
+    assert _plan(h100_platform) == first
+    _register("later_faster", priority=19, invariant=True, traits={})
+    assert _plan(h100_platform) != first
+
+
 @pytest.mark.parametrize(
     "traits", [{name: frozenset({16})} for name in ("m", "m_min", "m_max", "m_align")]
 )
