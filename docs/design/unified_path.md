@@ -288,7 +288,8 @@ consume peer data as it becomes available. Large TP4 column buckets share
 the row kernel's accumulator work distribution and shared-memory handoff to
 the output stage, keeping more partial GEMM results in flight. Input packing
 and operand prefetch use the same prepared buckets; numerical scaling order
-and collective ownership are unchanged.
+and collective ownership are unchanged. Column output copies work a tile at a
+time, with each owner's physical row count bounding the valid rows.
 
 Row projection also accepts E4M3 inputs with FP32 scales per 128 channels,
 allowing the preceding RMSNorm/gate operation to quantize once. Fusion forwards

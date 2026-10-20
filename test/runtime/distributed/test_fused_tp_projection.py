@@ -298,6 +298,8 @@ def _check_column_projection(rank, world_size, device, parallel, config):
         ((96, 65, 1, 0), False),
         ((0, 128), False),
         ((129, 255, 128, 0), False),
+        # Exercise output-copy tails for tiny and empty owners in a larger bucket.
+        ((255, 32, 1, 0), False),
         ((257, 384, 33, 0), False),
         ((385, 512, 1, 0), False),
         ((513, 640, 0, 129), False),

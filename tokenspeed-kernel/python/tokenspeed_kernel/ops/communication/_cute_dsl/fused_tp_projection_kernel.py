@@ -3963,50 +3963,38 @@ class FusedTPProjectionKernel:
                                                 scope="sys",
                                             )
             cute.arch.barrier()
-            vectors_per_tile = valid_rows * 16
-            total_vectors = vectors_per_tile * tile_count
+            # Copy one column tile at a time; row indexing only needs shifts.
             fragments = tuple(
                 cute.make_rmem_tensor((8,), self.c_dtype) for _ in range(4)
             )
-            for base in cutlass.range(tid, total_vectors, self.threads_per_cta * 4):
-                for item in cutlass.range_constexpr(4):
-                    vector = base + item * self.threads_per_cta
-                    if vector < total_vectors:
-                        row = (vector // 16) % valid_rows
-                        column_tile = (
-                            first_column_tile
-                            + (vector // vectors_per_tile) * producer_groups
-                        )
-                        column = (
-                            producer * shard_width
-                            + column_tile * 128
-                            + (vector % 16) * 8
-                        )
-                        offset = cute.assume(row * width + column, divby=8)
-                        source = cute.make_tensor(
-                            peers[1].iterator + offset,
-                            cute.make_layout((8,), stride=(1,)),
-                        )
-                        cute.copy(copy_in, source, fragments[item])
-                for item in cutlass.range_constexpr(4):
-                    vector = base + item * self.threads_per_cta
-                    if vector < total_vectors:
-                        row = (vector // 16) % valid_rows
-                        column_tile = (
-                            first_column_tile
-                            + (vector // vectors_per_tile) * producer_groups
-                        )
-                        column = (
-                            producer * shard_width
-                            + column_tile * 128
-                            + (vector % 16) * 8
-                        )
-                        offset = cute.assume(row * width + column, divby=8)
-                        target = cute.make_tensor(
-                            output.iterator + offset,
-                            cute.make_layout((8,), stride=(1,)),
-                        )
-                        cute.copy(copy_out, fragments[item], target)
+            for tile_index in cutlass.range(tile_count):
+                column_tile = first_column_tile + tile_index * producer_groups
+                column_base = producer * shard_width + column_tile * 128
+                for base in cutlass.range(
+                    tid, valid_rows * 16, self.threads_per_cta * 4
+                ):
+                    for item in cutlass.range_constexpr(4):
+                        vector = base + item * self.threads_per_cta
+                        if vector < valid_rows * 16:
+                            row = vector // 16
+                            column = column_base + (vector % 16) * 8
+                            offset = cute.assume(row * width + column, divby=8)
+                            source = cute.make_tensor(
+                                peers[1].iterator + offset,
+                                cute.make_layout((8,), stride=(1,)),
+                            )
+                            cute.copy(copy_in, source, fragments[item])
+                    for item in cutlass.range_constexpr(4):
+                        vector = base + item * self.threads_per_cta
+                        if vector < valid_rows * 16:
+                            row = vector // 16
+                            column = column_base + (vector % 16) * 8
+                            offset = cute.assume(row * width + column, divby=8)
+                            target = cute.make_tensor(
+                                output.iterator + offset,
+                                cute.make_layout((8,), stride=(1,)),
+                            )
+                            cute.copy(copy_out, fragments[item], target)
         # CTA zero acquires each per-CTA arrival in parallel and publishes
         # one rank epoch. The barrier completes every reader before the local
         # release; CTA zero forwards that ordering with a system-release ack.
