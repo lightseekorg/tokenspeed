@@ -60,6 +60,8 @@ from tokenspeed.runtime.engine.io_struct import (
     ResumeSchedulerReqInput,
     ResumeSchedulerReqOutput,
 )
+from tokenspeed.runtime.engine.memory_occupation import MemoryRegion
+from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +138,8 @@ class PauseController:
         self.state = PauseState.UNPAUSED
         # RequestSpecs withheld from the scheduler while paused; flushed on resume.
         self.buffered_specs: list = []
+        # A PD handshake must not finish before its scheduler request exists.
+        self.buffered_pd_bootstraps: dict[str, BootstrapInfo] = {}
         # Deferred post-drain action for abort/wait pause OR memory release; held
         # until the scheduler drains. Single-consumer: only one may be armed.
         self._pending_drain: _PendingDrain | None = None
@@ -240,6 +244,18 @@ class PauseController:
             self._send.send_pyobj(
                 PauseSchedulerReqOutput(
                     success=False, message=f"invalid pause mode: {req.mode!r}"
+                )
+            )
+            return
+
+        if self.released:
+            # A wait/abort pause would enable forwards again before the memory
+            # is restored, and the wake would silently undo a keep pause. The
+            # caller must wake via ``resume_memory_occupation`` first.
+            self._send.send_pyobj(
+                PauseSchedulerReqOutput(
+                    success=False,
+                    message="memory is unavailable; use resume_memory_occupation",
                 )
             )
             return
@@ -396,13 +412,25 @@ class PauseHooks:
                 state.set_finish_with_abort("Aborted by pause", notify_client=True)
 
         if not self._pause.admit_blocked and self._pause.buffered_specs:
-            specs = [
-                spec
-                for spec in self._pause.take_buffered_specs()
-                if self._reap_or_keep_buffered_spec(spec)
-            ]
+            specs = []
+            for spec in self._pause.take_buffered_specs():
+                bootstrap = self._pause.buffered_pd_bootstraps.pop(
+                    spec.request_id, None
+                )
+                if not self._reap_or_keep_buffered_spec(spec):
+                    continue
+                if bootstrap is not None:
+                    self._loop.kv_transfer.register(spec.request_id, bootstrap)
+                specs.append(spec)
             if specs:
                 loop._submit_scheduler_requests(specs)
+
+    def register_pd_admission(self, request_id: str, bootstrap: BootstrapInfo) -> None:
+        """Start the handshake only when this request can enter the scheduler."""
+        if self._pause.admit_blocked:
+            self._pause.buffered_pd_bootstraps[request_id] = bootstrap
+        else:
+            self._loop.kv_transfer.register(request_id, bootstrap)
 
     def _reap_or_keep_buffered_spec(self, spec) -> bool:
         """Resolve a buffered spec on resume; return True if it should be admitted.
@@ -481,6 +509,22 @@ class PauseHooks:
 
     # -- memory release/wake data plane (wired into MemoryOccupationController) -
 
+    def memory_release_refusal(self) -> str | None:
+        """Refuse a PD release whose buffered requests cannot make progress."""
+        if self._loop.kv_transfer is not None and self._pause.buffered_specs:
+            return (
+                "PD requests are buffered by a scheduler pause; resume_scheduler "
+                "and drain them before releasing memory"
+            )
+        return None
+
+    def weights_busy_for_release(self) -> bool:
+        """Queued weight ops keep their same-round gate ahead of the release."""
+        loop = self._loop
+        return loop.request_handler.has_pending_weight_ops or (
+            loop._eplb is not None and loop._eplb.is_applying
+        )
+
     def reset_caches_for_release(self) -> bool:
         """Invalidate the prefix/single-table cache before KV is discarded on release.
 
@@ -495,11 +539,60 @@ class PauseHooks:
         clear = getattr(self._loop.scheduler, "clear_l1_cache", None)
         return not callable(clear) or clear()
 
-    def kv_repair_after_wake(self) -> None:
-        """Zero re-mapped KV buffers (garbage after re-map) for every KV pool.
+    def transfers_idle_for_release(self) -> bool:
+        """True when no PD transfer can still read or write the cache.
 
-        The pools live behind the data plane and the zeroing is device work,
-        so the handle owns which pools are walked and does the walking; this
-        side only says when.
+        A drained scheduler can still hold requests waiting for their PD
+        bootstrap and pages pinned for an in-flight transfer (a finished
+        prefill whose KV is still being written to the decode node), and the
+        transfer peer can still hold a sender/receiver whose request is gone.
+        All are empty outside PD.
         """
-        self._device.run_kv_repair()
+        loop = self._loop
+        scheduler = loop.scheduler
+        if scheduler.bootstrapping_size() != 0 or scheduler.pd_transfer_size() != 0:
+            return False
+        return loop.kv_transfer is None or not loop.kv_transfer.has_inflight_transfers()
+
+    def memory_regions(
+        self, adapter, *, nccl_suspendable: bool
+    ) -> dict[str, MemoryRegion]:
+        """The releasable GPU-memory regions of this engine, keyed by tag.
+
+        The memory-saver ``adapter`` unmaps and re-maps the allocator regions;
+        the device handle does the data-plane work that must surround them.
+        Which pools and peers that work touches is the handle's business; this
+        side only says when. ``nccl_suspendable`` says whether the process's
+        NCCL can suspend communicators; without it there is no ``nccl`` region.
+        """
+        device = self._device
+
+        def release_kv_cache() -> None:
+            # Wait for in-flight copies and deregister the arena from the PD
+            # transfer engine before its memory goes away.
+            device.prepare_kv_release()
+            adapter.pause(tag="kv_cache")
+
+        def resume_kv_cache() -> None:
+            adapter.resume(tag="kv_cache")
+            # Re-mapped memory holds garbage: zero it, then register it with
+            # the PD transfer engine again.
+            device.finish_kv_resume()
+
+        def allocator_region(tag: str) -> MemoryRegion:
+            def release() -> None:
+                device.synchronize()
+                adapter.pause(tag=tag)
+
+            return MemoryRegion(release=release, resume=lambda: adapter.resume(tag=tag))
+
+        regions = {
+            "kv_cache": MemoryRegion(release=release_kv_cache, resume=resume_kv_cache),
+            "weights": allocator_region("weights"),
+            "cuda_graph": allocator_region("cuda_graph"),
+        }
+        if nccl_suspendable:
+            regions["nccl"] = MemoryRegion(
+                release=device.suspend_nccl, resume=device.resume_nccl
+            )
+        return regions

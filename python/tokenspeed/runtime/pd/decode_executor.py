@@ -96,6 +96,27 @@ class DisaggDecodeExecutor:
         self._local_states[request_id] = TransferPoll.Bootstrapping
         self._bootstrap(request_id, bootstrap_info)
 
+    def has_inflight_transfers(self) -> bool:
+        """Whether a KV receive is still registered (bootstrapping or landing).
+
+        A receiver leaves on success or failure; one whose request was aborted
+        leaves once its wait times out.
+        """
+        return bool(self.receivers)
+
+    def release_cache_registration(self) -> None:
+        """Deregister the cache arena before a sleep release unmaps it."""
+        if self.receivers:
+            raise RuntimeError(
+                "cannot release the cache while KV receives are in flight: "
+                f"{sorted(self.receivers)!r}"
+            )
+        self.kv_manager.deregister_buffer_from_engine()
+
+    def restore_cache_registration(self) -> None:
+        """Register the re-mapped cache arena under a fresh transfer session."""
+        self.kv_manager.restore_buffer_registration()
+
     def execute(self, op):
         """Pull this admitted prompt's KV from the prefill node.
 

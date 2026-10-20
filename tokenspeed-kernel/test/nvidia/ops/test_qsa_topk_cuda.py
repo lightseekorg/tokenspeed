@@ -112,14 +112,10 @@ def test_qsa_topk_solutions_preserve_prefixes_ties_and_strides(
         torch.testing.assert_close(ordered.long(), expected.sort(dim=1).values)
 
 
-@pytest.mark.xfail(
-    reason="Existing CUDA coarse-bin selection truncates overflowing tie candidates",
-    strict=False,
-)
 def test_cuda_qsa_topk_quantized_scores_preserve_selected_score_multiset(require):
     require("attention", "qsa_block_topk_select", "cuda", torch.float32, "logits")
-    # The native kernel predates this registration. More than 2048 candidates
-    # in the threshold's coarse bin can discard higher scores before refinement.
+    # More than 2048 candidates in the threshold's coarse bin must not discard
+    # higher scores before refinement.
     scores = torch.arange(65536, device="cuda").remainder(257).float()[None, :]
     lengths = torch.tensor([scores.shape[1]], dtype=torch.int32, device="cuda")
     selected = qsa_block_topk_select(
