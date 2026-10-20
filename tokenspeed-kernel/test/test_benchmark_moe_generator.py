@@ -421,6 +421,26 @@ def _kimi_latent_expert_shared_request() -> BenchmarkRequest:
     )
 
 
+@pytest.mark.parametrize("ep_size", [1, 4])
+def test_fp8_weights_retain_global_and_local_expert_counts(monkeypatch, ep_size):
+    _use_cpu_allocations(monkeypatch)
+    weights = moe_generator._make_fp8_weights(
+        num_experts=16,
+        num_local_experts=16 // ep_size,
+        hidden_size=128,
+        intermediate_size_per_partition=128,
+        block_shape=(128, 128),
+        weight_dtype=torch.float8_e4m3fn,
+        activation="swiglu",
+        swiglu_limit=10.0,
+        ep_rank=0,
+        ep_size=ep_size,
+    )
+    assert weights.num_experts == 16
+    assert weights.num_local_experts == 16 // ep_size
+    assert weights.w13_weight.shape[0] == weights.w2_weight.shape[0] == 16 // ep_size
+
+
 def test_moe_fp8_weight_shapes_match_tp_and_ep_layouts() -> None:
     tp_shapes = moe_generator._fp8_weight_shapes(
         num_local_experts=288,
@@ -679,6 +699,7 @@ def test_moe_apply_generator_precomputes_local_ep_routes(
     assert seen["weights"].ep_rank == 2
     assert seen["weights"].ep_size == 4
     assert seen["weights"].num_local_experts == 4
+    assert seen["weights"].num_experts == 16
     assert seen["apply"]["hidden_shape"] == (3, 8)
     assert seen["apply"]["router_shape"] == (3, 4)
     assert seen["apply"]["topk_ids"].dtype is torch.int32

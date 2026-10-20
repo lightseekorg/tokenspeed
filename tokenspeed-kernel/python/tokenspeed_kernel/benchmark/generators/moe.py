@@ -423,6 +423,7 @@ def _ones(shape: tuple[int, ...]) -> torch.Tensor:
 
 def _make_fp8_weights(
     *,
+    num_experts: int,
     num_local_experts: int,
     hidden_size: int,
     intermediate_size_per_partition: int,
@@ -457,6 +458,7 @@ def _make_fp8_weights(
         w13_input_layout="concatenated",
         ep_rank=ep_rank,
         ep_size=ep_size,
+        num_experts=num_experts,
         num_local_experts=num_local_experts,
     )
 
@@ -643,6 +645,7 @@ def _prepare_routed_weights(
     if weight_dtype_name == "fp8":
         assert block_shape is not None
         weights = _make_fp8_weights(
+            num_experts=num_experts,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size_per_partition,
