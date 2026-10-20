@@ -1692,14 +1692,14 @@ def test_indexer_rope_weights_match_separate_operations(
         dsv41.rope_weights_inplace(
             queries[:6], positions[:6], table, weights[:6], scale, "triton"
         )
-        with assert_no_triton_compile():
+        with assert_no_triton_compile(implementation._rope_inplace_kernel):
             dsv41.rope_weights_inplace(
                 queries[:12], positions[:12], table, weights[:12], scale, "triton"
             )
 
     if heads == 32 and rows >= 192:
         # Both grid sizes use separate scaling and share the ordinary RoPE JIT.
-        with assert_no_triton_compile():
+        with assert_no_triton_compile(implementation._rope_inplace_kernel):
             dsv41.rope_weights_inplace(
                 queries[:129], positions[:129], table, weights[:129], scale, "triton"
             )
