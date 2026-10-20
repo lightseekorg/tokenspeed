@@ -46,7 +46,12 @@ import torch  # noqa: E402
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 from transformers import LlamaConfig  # noqa: E402
 
-register_cuda_ci(est_time=10, suite="runtime-1gpu")
+register_cuda_ci(
+    est_time=10,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="the eagle_harness policy kernels are NVIDIA-only",
+)
 
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.execution.context import ForwardContext  # noqa: E402

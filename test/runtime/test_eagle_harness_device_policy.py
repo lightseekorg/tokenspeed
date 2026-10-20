@@ -56,7 +56,12 @@ from tokenspeed.runtime.execution.drafter.eagle_harness.device_policy import (
     DevicePolicy,
 )
 
-register_cuda_ci(est_time=30, suite="runtime-1gpu")
+register_cuda_ci(
+    est_time=30,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="the eagle_harness policy kernels are NVIDIA-only",
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA GPU is required"

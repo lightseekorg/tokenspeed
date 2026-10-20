@@ -22,14 +22,15 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda.eagle4_candidate import (
     eagle4_candidate_tail,
     eagle4_shard_topk,
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
-    reason="needs an SM90+ GPU (thread-block clusters)",
+    not current_platform().is_hopper_plus,
+    reason="needs an NVIDIA SM90+ GPU (thread-block clusters)",
 )
 
 

@@ -53,7 +53,12 @@ from tokenspeed.runtime.models.llama_eagle4 import (
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
-register_cuda_ci(est_time=5, suite="runtime-1gpu")
+register_cuda_ci(
+    est_time=5,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="the EAGLE-4 candidate head kernels are NVIDIA-only",
+)
 
 _HIDDEN = 32
 

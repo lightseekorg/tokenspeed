@@ -25,6 +25,7 @@ launching stream orders its later work after the whole chain."""
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda.eagle_harness_chain import (
     eagle_harness_chain_destroy,
     eagle_harness_chain_instantiate,
@@ -32,7 +33,8 @@ from tokenspeed_kernel.thirdparty.cuda.eagle_harness_chain import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA GPU is required"
+    not current_platform().is_nvidia,
+    reason="eagle_harness_chain CUDA kernel is NVIDIA-only",
 )
 
 _LAST_DEPTH = 4

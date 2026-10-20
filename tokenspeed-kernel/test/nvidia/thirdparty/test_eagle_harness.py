@@ -23,6 +23,7 @@
 import numpy as np
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda.eagle_harness import (
     eagle_harness_draft_depth_update,
     eagle_harness_publish_draft_q,
@@ -35,7 +36,8 @@ from tokenspeed_kernel.thirdparty.cuda.eagle_harness import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA GPU is required"
+    not current_platform().is_nvidia,
+    reason="eagle_harness CUDA kernels are NVIDIA-only",
 )
 
 _DEVICE = "cuda"

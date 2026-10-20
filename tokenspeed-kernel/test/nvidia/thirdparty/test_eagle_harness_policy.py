@@ -24,12 +24,14 @@ policy ranks."""
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda.eagle_harness_policy import (
     eagle_harness_policy_select_verify,
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA GPU is required"
+    not current_platform().is_nvidia,
+    reason="eagle_harness_policy CUDA kernel is NVIDIA-only",
 )
 
 _DEVICE = "cuda"

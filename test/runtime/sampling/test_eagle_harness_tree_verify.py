@@ -46,7 +46,12 @@ from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ, TreeVerifyBatch
 
-register_cuda_ci(est_time=20, suite="runtime-1gpu")
+register_cuda_ci(
+    est_time=20,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="the eagle_harness CUDA kernels are NVIDIA-only",
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
