@@ -22,6 +22,7 @@
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci_system.ci_register import register_cuda_ci
@@ -38,9 +39,12 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
+from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.moe.utils import MoeBackend
+from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
+from tokenspeed.runtime.models import deepseek_v41 as v41
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
@@ -114,6 +118,67 @@ def test_unquantized_initialization_rejects_a_provider_without_the_feature(regis
     method = UnquantizedLinearMethod()
     with pytest.raises(NoKernelFoundError):
         method.create_weights(torch.nn.Module(), 4, [8], 4, 8, torch.float32)
+
+
+def test_v41_bf16_dequantized_linear_plans_after_loading(registry, monkeypatch):
+    registry.register(
+        KernelSpec(
+            name="public_reference_mm",
+            family="gemm",
+            mode="mm",
+            solution="public_reference",
+            format_signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
+            features=frozenset({"batch_invariant"}),
+        ),
+        _mm,
+    )
+    # Hopper loads the FP8 codes into BF16 and folds the scales after loading.
+    monkeypatch.setattr(
+        v41, "current_platform", lambda: SimpleNamespace(is_hopper=True)
+    )
+    quant = v41.v41_mxfp8_config(
+        Fp8Config.from_config(
+            {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+                "weight_block_size": [32, 32],
+                "scale_fmt": "ue8m0",
+            }
+        )
+    )
+    layer = ReplicatedLinear(
+        64,
+        32,
+        bias=False,
+        quant_config=quant,
+        params_dtype=torch.bfloat16,
+        prefix="model.proj",
+    )
+    codes = ((torch.arange(32 * 64).reshape(32, 64) % 9) - 4).to(torch.float8_e4m3fn)
+    # E8M0 127 is 2**0, 128 is 2**1.
+    scales = (torch.arange(2).reshape(1, 2) + 127).to(torch.uint8)
+    layer.weight.weight_loader(layer.weight, codes)
+    layer.weight_scale_inv.weight_loader(
+        layer.weight_scale_inv, scales.view(torch.float8_e8m0fnu)
+    )
+    layer.quant_method.process_weights_after_loading(layer)
+
+    assert isinstance(layer.quant_method, UnquantizedLinearMethod)
+    assert layer.quant_method.kernel_plan.kernel.name == "public_reference_mm"
+    weight = codes.float() * torch.tensor([1.0, 2.0]).repeat_interleave(32)
+    x = (torch.arange(3 * 64).reshape(3, 64) % 5 - 2).to(torch.bfloat16)
+    expected = _mm(
+        x,
+        weight.to(torch.bfloat16),
+        None,
+        None,
+        torch.bfloat16,
+        alpha=None,
+        block_size=None,
+    )
+    for inputs, reference in [(x, expected), (x[1:2], expected[1:2])]:
+        actual = layer.quant_method.apply(layer, inputs)
+        assert torch.equal(actual, reference)
 
 
 def test_dense_override_cannot_bypass_the_requirement(registry):

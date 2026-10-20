@@ -321,6 +321,8 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         layer.weight.data.unflatten(-1, (-1, 32)).mul_(scale.unsqueeze(-1))
         layer.register_parameter("weight_scale_inv", None)
         layer.quant_method = UnquantizedLinearMethod()
+        # Plans the batch-invariant GEMM under a bitwise envelope.
+        layer.quant_method.process_weights_after_loading(layer)
 
     @torch.no_grad()
     def prepare_weight_scales(self, layer: nn.Module) -> None:
