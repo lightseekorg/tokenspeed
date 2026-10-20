@@ -25,9 +25,10 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
-    _e2m1_encode,
     _index_gather_heads,
     _index_topk_outputs,
+    _mxfp4_index_rows,
+    _ue8m0_word,
 )
 
 _PAGE_SIZE = 64
@@ -66,18 +67,18 @@ def _pack_index_queries_padded(
     head = tl.program_id(1).to(tl.int64)
     d = tl.arange(0, 128)
     live = head < HEADS
-    x = tl.load(Q + token * Q0 + head * Q1 + d * Q2, live, 0.0).to(tl.float32)
+    # Inner-strided views can span more than int32 elements within one head.
+    x = tl.load(Q + token * Q0 + head * Q1 + d.to(tl.int64) * Q2, live, 0.0).to(
+        tl.float32
+    )
     grouped = tl.reshape(x, (4, 32))
     # Match cache_pack(index): multiplication by the rounded reciprocal of six.
     raw = tl.maximum(tl.max(tl.abs(grouped), 1), 6 * 2.0**-126) * (1.0 / 6.0)
-    bits = raw.to(tl.int32, bitcast=True)
-    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
-    scale = (exponent << 23).to(tl.float32, bitcast=True)
-    normalized = tl.reshape(tl.div_rn(grouped, scale[:, None]), (128,))
-    code = _e2m1_encode(normalized).to(tl.int32)
-    pairs = tl.reshape(code, (64, 2))
-    packed = tl.sum(pairs << (tl.arange(0, 2)[None, :] * 4), 1).to(tl.uint8)
-    word = tl.sum(exponent.to(tl.uint32) << (tl.arange(0, 4) * 8), 0)
+    packed, exponent = _mxfp4_index_rows(
+        tl.reshape(grouped, (1, 4, 32)), tl.reshape(raw, (1, 4)), 1
+    )
+    packed = tl.reshape(packed, (64,))
+    word = tl.sum(_ue8m0_word(exponent), 0)
     row = token * 32 + head
     tl.store(V + row * 64 + tl.arange(0, 64), tl.where(live, packed, 0))
     tl.store(S + row, tl.where(live, word.to(tl.int32), 0))
