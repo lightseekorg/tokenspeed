@@ -322,8 +322,13 @@ def _check_column_projection(rank, world_size, device, parallel, config):
         for counts in contexts
     }
     source = {}
+    # Vary adjacent K-block scales to catch reuse of a stale pipeline stage.
+    block_scales = torch.exp2(
+        (torch.arange(7168 // 128, device=device) % 7 - 3).float()
+    ).to(torch.bfloat16)
     for counts, value in inputs.items():
         sample = torch.randn_like(value)
+        sample.view(value.shape[0], 7168 // 128, 128).mul_(block_scales.view(1, -1, 1))
         # Change scales sharply between epochs, with opposite shifts across owners.
         source[counts] = [
             torch.zeros_like(value),

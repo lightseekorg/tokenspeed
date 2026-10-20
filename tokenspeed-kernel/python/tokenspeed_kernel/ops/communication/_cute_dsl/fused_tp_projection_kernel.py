@@ -345,7 +345,7 @@ class FusedTPProjectionKernel:
         # TMEM offset for final accumulator
         self.tmem_final_offset = 384
 
-    def _setup_attributes(self):
+    def _setup_attributes(self, row_bucket: int):
         """Set up configurations that are dependent on GEMM inputs
 
         This method configures various attributes based on the input tensor properties
@@ -446,6 +446,11 @@ class FusedTPProjectionKernel:
 
         if self.shared_mma_completion:
             self.num_ab_stage = self.num_acc_stage
+
+        if not self.row_parallel and self.split_accumulator and row_bucket <= 256:
+            # Packing weight scales beside the barriers leaves room for another
+            # operand stage without reducing scale buffering.
+            self.num_ab_stage = 6
 
         if self.tma_scales:
             self.num_scale_stage = self.scale_k_total * self.bulk_scale_stages
@@ -702,7 +707,7 @@ class FusedTPProjectionKernel:
         )
         if cutlass.const_expr(self.independent_operand_stages):
             self.shared_mma_completion = False
-        self._setup_attributes()
+        self._setup_attributes(peers[1].shape[0])
         if cutlass.const_expr(self.dynamic_gemm):
             self.num_tile_stage = 1
 
@@ -901,6 +906,14 @@ class FusedTPProjectionKernel:
             epi_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 1 * 2]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
+            # Weight scales fit before the operands; bulk scale loads need
+            # 128-byte alignment, without the operands' larger alignment.
+            sSFB: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.sfb_dtype, cute.cosize(self.sfb_smem_layout_staged)
+                ],
+                128,
+            ]
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
             sC: cute.struct.Align[
                 cute.struct.MemRange[
@@ -927,13 +940,6 @@ class FusedTPProjectionKernel:
             sSFA: cute.struct.Align[
                 cute.struct.MemRange[
                     self.sfa_dtype, cute.cosize(self.sfa_smem_layout_staged)
-                ],
-                self.buffer_align_bytes,
-            ]
-            # (granularity_n, repeat_n), (granularity_k, repeat_k), num_scale_stage)
-            sSFB: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.sfb_dtype, cute.cosize(self.sfb_smem_layout_staged)
                 ],
                 self.buffer_align_bytes,
             ]
