@@ -3,14 +3,14 @@
 QSA scores compressed index keys, selects logical blocks, expands them to
 full-cache slots, and attends to those slots. The public block selector in
 `ops.attention.qsa` takes an explicit `auto`, `stream` or `logits` path and
-dispatches registered scoring, selection and streaming implementations through
+dispatches registered scoring, selection, and streaming implementations through
 `select_kernel`. Backend selection (`solution`) and kernel overrides preserve
 the requested path.
 Slot expansion and attention share the same contracts for all paths.
 
 ## Automatic selection
 
-Automatic selection uses query rows, compressed block-table capacity and
+Automatic selection uses query rows, compressed block-table capacity, and
 supported layouts, independently of prefill/decode. The current policy selects
 grouped CuTe streaming from 512 rows for tables of at least
 16384 compressed blocks (64K tokens at ratio four), and from 8192 rows for
@@ -33,7 +33,7 @@ On NVIDIA Blackwell, CuTe DSL accepts four BF16 index heads of width 128,
 64-block pages, block top-k 512, and capacities up to 131072 compressed blocks
 (512K tokens at compression ratio four), including speculative context padding.
 Strided Q vectors must remain 16-byte aligned. Page-table columns must be
-contiguous; their runtime row stride may retain the persistent table capacity
+contiguous; their runtime row stride can retain the persistent table capacity
 when a batched prefill trims its view. Keys and row metadata remain contiguous
 and aligned.
 
@@ -101,7 +101,7 @@ Head-dimension tiles of 32 bound shared memory, and split comparison pairs reduc
 sorting layout conversions. Sorted tiles are padded after sorting, and groups
 with at most top-k complete blocks return all ids without scoring. No partial
 or merge buffer is allocated, even with a zero budget.
-Query count, request count, page-table width, Q strides and live frontiers remain
+Query count, request count, page-table width, Q strides, and live frontiers remain
 runtime arguments. Split geometry uses power-of-two capacity buckets to bound
 the tuned kernels' compilation cache. PDL waits precede asynchronous Q copies
 and producer-owned metadata reads; captured graphs retain the supplied flag.
@@ -146,16 +146,16 @@ for zero queries that stress equal-score selection. Cold-cache isolated
 measurements establish kernel costs; end-to-end model measurements must also
 include slot expansion, sparse attention and interference from other layers.
 
-The baseline matrix before the stream tuning below, after merging `main` at
+The baseline matrix before the stream tuning that follows, after merging `main` at
 `26fffca5`, uses NVIDIA L20B (SM103),
 CUDA 13.0, PyTorch 2.14.0+cu130, CuTe DSL 4.8.0 and tokenspeed-triton
 3.8.10.post20260920. BF16 queries have four 128-wide heads and top-k 512,
 with PDL enabled, causal frontiers and cold L2. The matrix covers 20 layouts,
-three seeds and three paths (CuTe, logits and auto), with 10 warmups and
+three seeds, and three paths (CuTe, logits, and auto), with 10 warmups and
 45 samples per run. Backends use paired inputs on the same GPU in randomized
 order. Every run validates up to eight rows against FP32 reference scores,
-including counts, unique ids and padding. Times below are medians of the three
-seed medians, in microseconds, and cover scoring plus selection.
+including counts, unique ids and padding. The following times are medians of the
+three seed medians, in microseconds, and cover scoring plus selection.
 
 | Query rows / live KV tokens | Logits | CuTe stream | Stream time change |
 | --- | ---: | ---: | ---: |
@@ -185,7 +185,7 @@ streaming even when explicitly requested logits would be faster. These
 operator measurements do not imply whole-model throughput improvements.
 
 The portable Triton stream retains the PR's output-only optimization and its
-zero-scratch contract; the comparison above uses CuTe streaming and the latest
+zero-scratch contract; the preceding comparison uses CuTe streaming and the latest
 registered materialized scoring/selection path.
 
 Nsight Systems captures of the same graph nodes, with seed 83 and 20 replays

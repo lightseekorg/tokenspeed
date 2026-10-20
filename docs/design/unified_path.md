@@ -1013,7 +1013,7 @@ QSA block selection carries an explicit uniform query width into its kernel
 API. Decode derives it from its uniform row contract; extend metadata checks
 the scheduler's host query lengths, including fixed-width decode rows in a
 mixed batch. Ragged runs carry `None`. This adds no device-to-host length read.
-Materialized scoring may group a divisor of that width to share K
+Materialized scoring can group a divisor of that width to share K
 within a request; it must retain each query's complete-block frontier and
 selection. Group size one and larger groups use the same scoring kernel, in
 both eager and captured forwards. Grouping must not be inferred from the total
@@ -1025,7 +1025,7 @@ The materialized path composes the registered `qsa_block_scores` and
 Required `logits`/`stream` features keep backend overrides within the requested
 algorithm, including forced kernel names that bypass ordinary operator matching.
 CUDA selection owns its launch details and scratch. Automatic
-selection uses query rows, table capacity and supported layouts, never the
+selection uses query rows, table capacity, and supported layouts, never the
 prefill/decode mode. The caller's logits budget forces streaming when the score
 matrix would exceed it. Explicit paths bypass that automatic budget.
 
@@ -1035,7 +1035,7 @@ BF16 index heads of width 128, 64-block pages, and block top-k 512. Grouped
 scoring requires explicit eight-row request runs; small query grids can score
 rows independently, including ragged queries. Grouped streams keep exact
 running selections in selector registers, with double-buffered score
-candidates overlapping selection and MMA across tiles. Small grids may split
+candidates overlapping selection and MMA across tiles. Small grids can split
 the key range into bounded global scratch. The caller's partial-workspace
 budget bounds that scratch. Grouped CuTe and portable Triton streaming only
 allocate their output; each Triton program scans a group contained in an explicit
@@ -1043,7 +1043,7 @@ uniform request run and keeps each row's running top-k locally, with no split/me
 buffers. Ragged runs use group size one in the same kernel. Candidate pruning must
 prove that discarded scores cannot enter the top-k, or perform a full-score
 fallback. Each row retains its complete-block frontier. Query count, request
-count, page-table width and Q strides remain runtime values; split geometry is
+count, page-table width, and Q strides remain runtime values; split geometry is
 bucketed before specializing the compiled signature. PDL waits precede
 asynchronous Q copies and producer-owned metadata reads.
 Trimmed batched page-table views retain a runtime row stride. Speculative
