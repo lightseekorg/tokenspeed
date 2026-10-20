@@ -360,11 +360,19 @@ def test_prims_qsa_prefill_dispatch(cache_dtype, rows, topk, block_size, tensor_
     [(torch.bfloat16, 256), (torch.float8_e4m3fn, 4)],
 )
 def test_prims_qsa_prefill_fa2_fallback_matches_reference(
-    cache_dtype: torch.dtype, block_size: int, device: str
+    cache_dtype: torch.dtype,
+    block_size: int,
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     platform = current_platform()
     if not platform.is_nvidia or platform.arch_version < ArchVersion(9, 0):
         pytest.skip("QSA BF16/FP8 fallback requires NVIDIA Hopper or newer")
+    import tokenspeed_kernel.ops.attention.qsa._flashinfer.runner as runner_module
+
+    # Other tests capture the process runner and pin its metadata shape.
+    # Give this fallback geometry a fresh cache of real FA2 runners.
+    monkeypatch.setattr(runner_module, "_runners", {})
     q, k, v, slots, metadata = _prims_case(
         lengths=(5, 3),
         prefixes=(385, 29),
@@ -394,10 +402,23 @@ def test_prims_qsa_prefill_fa2_fallback_matches_reference(
     )
 
 
-def test_prims_query_groups_stop_at_request_boundaries():
+@pytest.mark.parametrize(
+    ("offsets", "group_size", "expected"),
+    [
+        ((0, 5, 5, 8, 17), 4, (0, 4, 5, 8, 12, 16, 17)),
+        ((0, 4, 8), 4, (0, 4, 8)),
+        ((0, 1, 3), 4, (0, 1, 3)),
+        ((0, 0, 0), 4, (0,)),
+        ((0, 2, 5), 1, (0, 1, 2, 3, 4, 5)),
+    ],
+)
+def test_prims_query_groups_stop_at_request_boundaries(offsets, group_size, expected):
+    # The adapter imports FlashInfer, which is only installed on NVIDIA runners.
+    if not current_platform().is_nvidia:
+        pytest.skip("FlashInfer PrimTS requires NVIDIA")
     from tokenspeed_kernel.thirdparty.flashinfer.qsa_prims import _group_offsets
 
-    assert _group_offsets((0, 5, 5, 8, 17), 4) == (0, 4, 5, 8, 12, 16, 17)
+    assert _group_offsets(offsets, group_size) == expected
 
 
 @pytest.mark.parametrize("block_size", [4, 8, 16, 32, 64, 128])
