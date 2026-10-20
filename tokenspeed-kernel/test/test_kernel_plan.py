@@ -22,13 +22,22 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention.dsa import dsa_decode_topk, plan_dsa_topk
+from tokenspeed_kernel.ops.attention.mla import (
+    mla_project_value,
+    plan_mla_project_value,
+)
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 from tokenspeed_kernel.selection import (
     KernelPlan,
     NoKernelFoundError,
     kernel_override,
 )
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 pytestmark = pytest.mark.usefixtures("fresh_registry")
 SIGNATURE = format_signature(a=dense_tensor_format(torch.float32))
@@ -276,3 +285,200 @@ def test_variable_dimension_does_not_reject_static_layout(
             solution=None,
             override=None,
         )
+
+
+def _register_decode_topk(name, *, priority, traits):
+    # Scores every causal position in a fixed order and emits the chosen
+    # positions in ascending order (slot_order="sorted").
+    def decode_topk(
+        *, q, weights, seq_lens, block_table, page_size, topk, q_len_per_req, **kwargs
+    ):
+        index_k_cache = kwargs["index_k_cache"]
+        slots = torch.full((q.shape[0], topk), -1, dtype=torch.int32)
+        lens = torch.zeros(q.shape[0], dtype=torch.int32)
+        for token in range(q.shape[0]):
+            request = token // q_len_per_req
+            bound = int(seq_lens[request]) - q_len_per_req + 1 + token % q_len_per_req
+            positions = torch.arange(bound)
+            rows = (
+                block_table[request, positions // page_size].long() * page_size
+                + positions % page_size
+            )
+            logits = q[token].float() @ index_k_cache[rows].float().T
+            scores = (logits.relu() * weights[token, :, None]).sum(0)
+            chosen = torch.topk(scores, min(topk, bound)).indices.sort().values
+            slots[token, : len(chosen)] = rows[chosen].to(torch.int32)
+            lens[token] = len(chosen)
+        return slots, lens
+
+    KernelRegistry.get().register(
+        KernelSpec(
+            name=name,
+            family="attention",
+            mode="dsa_decode_topk",
+            solution=name,
+            format_signatures=frozenset(
+                {
+                    format_signature(
+                        q=dense_tensor_format(torch.bfloat16),
+                        weights=dense_tensor_format(torch.float32),
+                    )
+                }
+            ),
+            priority=priority,
+            features=frozenset({"batch_invariant"}),
+            traits=traits,
+        ),
+        decode_topk,
+    )
+
+
+def _plan_decode_topk(**overrides):
+    kwargs = dict(
+        mode="dsa_decode_topk",
+        index_heads=2,
+        head_dim=8,
+        topk=3,
+        page_size=4,
+        q_dtype=torch.bfloat16,
+        weights_dtype=torch.float32,
+        index_k_format="bf16",
+        slot_order="sorted",
+        forced_initial_local=False,
+        q_lens=frozenset({1, 2}),
+        workspace_rows=False,
+    )
+    return plan_dsa_topk(**{**kwargs, **overrides})
+
+
+def _decode_topk(plan, rows, *, topk=3):
+    generator = torch.Generator().manual_seed(0)
+    q = torch.randn(4, 2, 8, generator=generator).to(torch.bfloat16)
+    weights = torch.rand(4, 2, generator=generator)
+    index_k_cache = torch.randn(16, 8, generator=generator).to(torch.bfloat16)
+    # Two requests of two query tokens each, on non-contiguous pages.
+    block_table = torch.tensor([[2, 0], [1, 3]], dtype=torch.int32)
+    seq_lens = torch.tensor([7, 6], dtype=torch.int32)
+    tokens = torch.cat([torch.arange(2 * r, 2 * r + 2) for r in rows])
+    return dsa_decode_topk(
+        q[tokens],
+        weights[tokens],
+        seq_lens[rows],
+        block_table[rows],
+        page_size=4,
+        topk=topk,
+        softmax_scale=1.0,
+        batch_invariant=True,
+        q_len_per_req=2,
+        index_k_cache=index_k_cache,
+        slot_order="sorted",
+        kernel_plan=plan,
+    )
+
+
+def test_dsa_topk_plan_keeps_its_provider_across_batches():
+    sorted_trait = {"slot_order": frozenset({"sorted"}), "q_len": frozenset({1, 2})}
+    _register_decode_topk("fixed", priority=1, traits=sorted_trait)
+    plan = _plan_decode_topk()
+    assert plan.kernel.name == "fixed"
+    # Execution reuses the saved callable; nothing is left to reselect.
+    KernelRegistry.get()._unregister("fixed")
+    slots, lens = _decode_topk(plan, [0, 1])
+    for request in (0, 1):
+        solo_slots, solo_lens = _decode_topk(plan, [request])
+        rows = slice(2 * request, 2 * request + 2)
+        assert torch.equal(solo_slots, slots[rows])
+        assert torch.equal(solo_lens, lens[rows])
+    with pytest.raises(ValueError, match="static trait topk changed"):
+        _decode_topk(plan, [0, 1], topk=2)
+
+
+@pytest.mark.parametrize(
+    "traits",
+    [
+        # No slot-order declaration, so the sorted promise is not inferred.
+        {"q_len": frozenset({1, 2})},
+        {"slot_order": frozenset({"sorted"}), "q_len": frozenset({1})},
+        # Bounded in a dimension that varies with the batch.
+        {"slot_order": frozenset({"sorted"}), "max_pages": frozenset({2})},
+    ],
+)
+def test_dsa_topk_plan_rejects_a_provider_outside_the_contract(traits):
+    _register_decode_topk("limited", priority=19, traits=traits)
+    with pytest.raises(NoKernelFoundError):
+        _plan_decode_topk()
+
+
+def test_dsa_topk_plan_checks_the_mode_domain():
+    with pytest.raises(ValueError, match="nonempty q_lens"):
+        _plan_decode_topk(q_lens=frozenset())
+    with pytest.raises(ValueError, match="prefill top-k input"):
+        _plan_decode_topk(workspace_rows=True)
+
+
+def _register_project_value(name, *, priority, invariant):
+    # Per-head FP32 accumulation over the latent dimension in a fixed order.
+    def project_value(*, attention, weight, gate, out):
+        if not invariant:
+            raise AssertionError("a planned projection must not run this leaf")
+        heads, latent_dim, value_dim = weight.shape
+        result = torch.zeros(attention.shape[0], heads, value_dim)
+        for k in range(latent_dim):
+            result += attention[:, :, k, None].float() * weight[None, :, k].float()
+        out.copy_(result.to(attention.dtype).flatten(1))
+        return out
+
+    KernelRegistry.get().register(
+        KernelSpec(
+            name=name,
+            family="attention",
+            mode="mla_project_value",
+            solution=name,
+            format_signatures=format_signatures(
+                ("attention", "weight", "out"), "dense", {torch.bfloat16}
+            ),
+            priority=priority,
+            features=frozenset({"batch_invariant"}) if invariant else frozenset(),
+            traits={"gate_kind": frozenset({"none"})},
+        ),
+        project_value,
+    )
+
+
+def _plan_project_value():
+    return plan_mla_project_value(
+        num_heads=2,
+        latent_dim=8,
+        value_dim=4,
+        dtype=torch.bfloat16,
+        gate_kind="none",
+        batch_invariant=True,
+    )
+
+
+def test_mla_value_projection_plan_keeps_its_provider_across_batches():
+    _register_project_value("ordinary", priority=19, invariant=False)
+    _register_project_value("fixed", priority=1, invariant=True)
+    plan = _plan_project_value()
+    assert plan.kernel.name == "fixed"
+    KernelRegistry.get()._unregister("fixed")
+    # Small integers keep every FP32 sum exact, whatever the reference's order.
+    attention = (torch.arange(5 * 2 * 8).reshape(5, 2, 8) % 5 - 2).to(torch.bfloat16)
+    weight = (torch.arange(2 * 8 * 4).reshape(2, 8, 4) % 3 - 1).to(torch.bfloat16)
+    expected = torch.einsum("bhk,hkv->bhv", attention.float(), weight.float())
+    full = mla_project_value(attention, weight, plan=plan)
+    torch.testing.assert_close(
+        full, expected.to(torch.bfloat16).flatten(1), rtol=0, atol=0
+    )
+    for rows in (slice(1, 2), slice(2, 5)):
+        assert torch.equal(
+            mla_project_value(attention[rows], weight, plan=plan), full[rows]
+        )
+    with pytest.raises(ValueError, match="static trait"):
+        mla_project_value(attention[:, :, :4], weight[:, :4], plan=plan)
+
+
+def test_mla_value_projection_plan_requires_declared_invariance():
+    _register_project_value("ordinary", priority=19, invariant=False)
+    with pytest.raises(NoKernelFoundError):
+        _plan_project_value()

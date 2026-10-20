@@ -379,9 +379,15 @@ Execution validates the same formats and static traits and calls the saved
 implementation. It does not consult the registry, retune, or use an unplanned
 GEMV/fused fallback. A missing provider or an incompatible input fails. The
 provider's declaration covers its internal choices across the varying rows.
-DSA indexer top-k and value projection use the same planning contract: the
-index-key format, head geometry and slot order are static, while request counts
-and history lengths vary without provider selection.
+`plan_dsa_topk` and `plan_mla_project_value` offer the same contract for the
+DSA indexer top-k and the MLA value projection: the index-key format, head
+geometry and slot order are static, while request counts and history lengths
+vary without provider selection. These operators run inside the model, so the
+model builds their plans and passes them in (`kernel_plan=` on
+`dsa_prefill_topk` / `dsa_decode_topk`, `plan=` on `mla_project_value`). No
+in-tree model plans them yet, since none is verified under `rl-bitwise` (see
+the per-model verification below); out-of-tree models that are verified are
+the current callers.
 Plans for different operators or phases still require cross-phase numerical
 acceptance; an individual capability declaration does not establish that.
 
