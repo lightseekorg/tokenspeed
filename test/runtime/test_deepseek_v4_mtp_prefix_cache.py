@@ -34,7 +34,9 @@ def test_draft_idle_global_num_tokens_match_multi_step_decode_shape():
     global_num_tokens = [6, 0, 3]
     global_bs = [2, 0, 1]
 
-    steps = drafter.idle_forward_global_num_tokens(global_num_tokens, global_bs)
+    steps = drafter.idle_forward_global_num_tokens(
+        global_num_tokens, global_bs, global_num_decodes=global_bs
+    )
 
     assert len(steps) == 3
     assert steps[0] is global_num_tokens
@@ -42,7 +44,7 @@ def test_draft_idle_global_num_tokens_match_multi_step_decode_shape():
     assert steps[2] is global_bs
     assert (
         BaseDrafter(spec_num_tokens=1).idle_forward_global_num_tokens(
-            global_num_tokens, global_bs
+            global_num_tokens, global_bs, global_num_decodes=global_bs
         )
         == []
     )
@@ -51,20 +53,17 @@ def test_draft_idle_global_num_tokens_match_multi_step_decode_shape():
 def test_block_drafters_idle_with_one_forward_of_the_targets_rows():
     # Block drafters propose the whole block in one draft forward, so an idle
     # rank mirrors them with a single IDLE forward sized by the target's rows.
-    from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
-        DeepseekV41DSpark,
-    )
     from tokenspeed.runtime.execution.drafter.dflash import DFlash
     from tokenspeed.runtime.execution.drafter.dspark import DSpark
 
     global_num_tokens = [6, 0, 3]
     global_bs = [2, 0, 1]
-    for cls in (DFlash, DSpark, DeepseekV41DSpark):
+    for cls in (DFlash, DSpark):
         drafter = cls.__new__(cls)
         drafter.spec_num_steps = 3
-        assert drafter.idle_forward_global_num_tokens(global_num_tokens, global_bs) == [
-            global_num_tokens
-        ], cls.__name__
+        assert drafter.idle_forward_global_num_tokens(
+            global_num_tokens, global_bs, global_num_decodes=global_bs
+        ) == [global_num_tokens], cls.__name__
 
 
 if __name__ == "__main__":

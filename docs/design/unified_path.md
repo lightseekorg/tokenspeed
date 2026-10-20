@@ -82,6 +82,46 @@ unconditionally at wrapper construction, `enforce_eager` included. A decode
 above the ladder runs the same refresh with no graph; it is a first-class
 path, not a fallback.
 
+### Ascend context-parallel decode
+
+Ascend DSA context-parallel decode uses one prepared communicator for fused
+TopK selection and LSE merging. Both stages run on the model stream. Its
+context object owns local page metadata only; it creates no auxiliary process
+group or stream. Bind the communicator, producer outputs and IPC tables before
+capture, and retain their storage until graph destruction. Missing resources
+fail before a context-parallel kernel is launched. The backend takes its CP
+degree and ranks from the host topology and passes that degree to every fused
+collective. The installed operators' Meta implementations validate topology
+and head layout before execution or graph capture; the framework carries no
+CP degree whitelist. The current native fusion remains specialized for DCP8.
+Bindings must supply Meta implementations for this startup check; a missing
+Meta kernel reports a binding upgrade, separately from unsupported topology.
+
+DSA CP prepares its metadata before the first fused Prolog. One device launch
+expands request lengths into causal query rows, compacts owned pages, counts
+visible/initial/window tokens, writes the Indexer's grouped layout, and maps
+write slots to local INT64 addresses (-1 for skipped writes). The kernel writes
+directly into persistent consumer buffers. Layers share this result within
+the forward; replay recomputes it from the live request inputs. Eager and Graph
+execution use this same path. This DSA-specific preparation retains the common
+DCP ownership semantics without changing the shared placement implementation.
+Single-rank decode uses the same preparation with identity page ownership:
+verify still needs one causal length and page-table row per candidate. Its
+Indexer and attention receive matching per-query batch axes, even without a
+collective; ordinary single-rank prefill retains its request-span layout.
+
+### Ascend vocabulary-parallel greedy selection
+
+Greedy selection keeps each row's logit ordering and token-id tie break in
+one INT64 key. The HCCL backend handles INT64 MAX payloads up to
+4 KiB with AllGather over an INT32 bit view followed by an exact local MAX.
+This preserves every key bit while allowing AIV communication, whose
+AllReduce does not support INT64. Larger payloads and other reductions retain
+their ordinary HCCL implementation. Eager and graph capture use the same
+collective path and return the original in-place output buffer.
+Ranks choose the collective from the shared dtype, operation and element
+count; local layout differences only require packing and copying back.
+
 ### Rebinding a cache pool
 
 Prefill autotune and graph capture use distinct writable pages per fabricated
@@ -563,8 +603,15 @@ attention DP the split graph stays off: the narrowed row count is rank-local
 (which prompts complete on this rank), so the decoder bucket and the
 collective shapes its graph bakes would differ across ranks, and the stages
 size their collectives from their own rows, which the DP metadata gather
-does not carry (the same gap that keeps narrowing itself unimplemented under
-DP).
+does not carry. Eager TP1 attention/dense with fused EP may narrow: the
+fused dispatch exchanges the actual local row counts, while the original
+DP counts remain capacity bounds. The CPU metadata gather also carries
+per-rank decode request counts. V4.1 DSpark sizes its one draft forward at
+block width times these counts, including in aggregated mixed batches.
+Prefill writes context KV; if another rank has decodes, prefill-only and
+idle ranks join its draft collectives with empty rows. A round with no
+decodes performs no draft forward. Decode graph warmup and capture use the
+same uniform padded decode counts as their target batches.
 
 ### Prefill requests without generated outputs
 

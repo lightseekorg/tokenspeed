@@ -180,6 +180,7 @@ def _run_idle_round(drafter) -> list[ForwardMode]:
         DpForwardMetadata(
             global_num_tokens=[0, 8],
             global_batch_size=[0, 2],
+            global_num_decodes=[0, 2],
             global_forward_mode=[ForwardMode.IDLE, ForwardMode.DECODE],
             all_decode_or_idle=True,
             all_extend=False,
@@ -237,7 +238,9 @@ class TestDrafterAcceptIndexing:
         global_num_tokens = [8, 0, 12, 4]
         global_bs = [2, 0, 3, 1]
 
-        steps = drafter.idle_forward_global_num_tokens(global_num_tokens, global_bs)
+        steps = drafter.idle_forward_global_num_tokens(
+            global_num_tokens, global_bs, global_num_decodes=global_bs
+        )
 
         assert (len(steps)) == (3)
         for step in steps:
@@ -271,7 +274,9 @@ class TestDrafterAcceptIndexing:
         # (here a block drafter's single step) shapes the round, not the
         # base class's Eagle default.
         class _BlockShaped(BaseDrafter):
-            def idle_forward_global_num_tokens(self, global_num_tokens, global_bs):
+            def idle_forward_global_num_tokens(
+                self, global_num_tokens, global_bs, *, global_num_decodes
+            ):
                 return [global_bs]
 
             def run(self, *args, **kwargs):

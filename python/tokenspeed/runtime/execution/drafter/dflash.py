@@ -178,7 +178,11 @@ class DFlash(BaseDrafter):
 
     @override
     def idle_forward_global_num_tokens(
-        self, global_num_tokens: list[int], global_bs: list[int]
+        self,
+        global_num_tokens: list[int],
+        global_bs: list[int],
+        *,
+        global_num_decodes: list[int],
     ) -> list[list[int]]:
         # Block drafter: one draft forward proposes the whole block.
         del global_bs

@@ -429,7 +429,11 @@ class Mtp(BaseDrafter):
 
     @override
     def idle_forward_global_num_tokens(
-        self, global_num_tokens: list[int], global_bs: list[int]
+        self,
+        global_num_tokens: list[int],
+        global_bs: list[int],
+        *,
+        global_num_decodes: list[int],
     ) -> list[list[int]]:
         # Every depth re-runs the target's rows (the k-window per decode
         # request, the prompt chunk on extend) — never one row per request.

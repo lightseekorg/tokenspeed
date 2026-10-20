@@ -655,7 +655,10 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
         spec_num_tokens=width,
         spec_num_steps=block,
         draft_model_runner=SimpleNamespace(
-            model=adapter, mapping=adapter.mapping, device="cuda:0"
+            model=adapter,
+            mapping=adapter.mapping,
+            device="cuda:0",
+            server_args=ServerArgs(model="unused", disaggregation_mode="null"),
         ),
         attn_backend=None,
         token_to_kv_pool=None,
@@ -727,6 +730,11 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
     # The requests differ, so identical drafts would mean the rows collapsed.
     assert not torch.equal(forward[0], forward[1])
     assert not torch.equal(forward[1], forward[2])
+    # A target head whose local vocabulary diverges from the Markov
+    # projection's must fail instead of drafting with wrong shard offsets.
+    drafter.lm_head = SimpleNamespace(weight=adapter.lm_head.weight[:-1])
+    with pytest.raises(ValueError, match="local vocabulary"):
+        run([0, 1, 2])
 
 
 def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):
@@ -739,7 +747,10 @@ def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):
         spec_num_tokens=width,
         spec_num_steps=block,
         draft_model_runner=SimpleNamespace(
-            model=adapter, mapping=adapter.mapping, device="cuda:0"
+            model=adapter,
+            mapping=adapter.mapping,
+            device="cuda:0",
+            server_args=ServerArgs(model="unused", disaggregation_mode="null"),
         ),
         attn_backend=None,
         token_to_kv_pool=None,
@@ -1033,3 +1044,73 @@ class TestDSparkBaseLogits:
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(logits, hidden.float() @ head.float().T)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("mode", ["prefill", "decode", "null"])
+def test_tp1_ep2_draft_checkpoint_and_idle_schedule(monkeypatch, rank, mode):
+    from test.runtime.test_deepseek_v41_model import _mock_loader_hardware
+
+    from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.model_runner import ModelRunner
+
+    mapping = Mapping(
+        rank=rank,
+        world_size=2,
+        attn_tp_size=1,
+        attn_dp_size=2,
+        dense_tp_size=1,
+        dense_dp_size=2,
+        moe_tp_size=1,
+        moe_ep_size=2,
+        moe_dp_size=1,
+        vision_tp_size=1,
+        vision_dp_size=1,
+        linear_attn_tp_size=1,
+        nprocs_per_node=2,
+        nnodes=1,
+    )
+    _mock_loader_hardware(monkeypatch, mapping)
+    monkeypatch.delitem(global_server_args_dict, "disaggregation_mode", raising=False)
+    adapter = DeepseekV41ForCausalLMDSpark(
+        DeepseekV41Config(text_config=vars(_draft_config())), mapping, _quant()
+    )
+    adapter.load_weights(_draft_checkpoint(adapter.model).items())
+    # The runner's GPU initialization is outside this CPU checkpoint test.
+    runner = Mock(spec=ModelRunner)
+    runner.model, runner.mapping, runner.device = adapter, mapping, "cpu"
+    runner.server_args = ServerArgs(model="unused", disaggregation_mode=mode)
+    kwargs = dict(
+        spec_num_tokens=6,
+        spec_num_steps=5,
+        draft_model_runner=runner,
+        attn_backend=None,
+        token_to_kv_pool=None,
+        runtime_states=None,
+        input_buffers=InputBuffers(3, 1024, 8, device="cpu"),
+        vocab_size=adapter.model.config.vocab_size,
+    )
+    drafter = DeepseekV41DSpark(**kwargs)
+    # Idle and active ranks must perform the same number of block forwards.
+    assert drafter.idle_forward_global_num_tokens(
+        [0, 18], [0, 3], global_num_decodes=[0, 3]
+    ) == [[0, 15]]
+    assert drafter.idle_forward_global_num_tokens(
+        [128, 18], [1, 3], global_num_decodes=[0, 3]
+    ) == [[0, 15]]
+    assert drafter.idle_forward_global_num_tokens(
+        [140, 18], [3, 3], global_num_decodes=[2, 3]
+    ) == [[10, 15]]
+    assert (
+        drafter.idle_forward_global_num_tokens(
+            [128, 128], [1, 1], global_num_decodes=[0, 0]
+        )
+        == []
+    )
+    assert (
+        adapter.lm_head.weight.shape[0]
+        == adapter.model.markov_projection.weight.shape[0]
+    )
+    assert adapter.checkpoint_load_report["loaded"] > 0

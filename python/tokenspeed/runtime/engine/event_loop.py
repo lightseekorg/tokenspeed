@@ -341,8 +341,8 @@ class EventLoop:
             self.world_cpu_group = pg_manager.get_process_group(
                 "gloo", mapping.world_group
             )
-            self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
-            self._dp_global_info = torch.zeros(mapping.world_size, 3, dtype=torch.int32)
+            self._dp_local_info = torch.zeros(1, 4, dtype=torch.int32)
+            self._dp_global_info = torch.zeros(mapping.world_size, 4, dtype=torch.int32)
         # The cache hooks gather over the TP CPU group, so the gather is sized
         # by that group, which --emulate-rank-zero backs with this process alone.
         cache_replica_tp_size = self.attn_tp_cpu_group.size()
@@ -1038,6 +1038,9 @@ class EventLoop:
         self._dp_local_info[0, 0] = num_tokens
         self._dp_local_info[0, 1] = batch_size
         self._dp_local_info[0, 2] = int(forward_mode)
+        self._dp_local_info[0, 3] = (
+            batch_size - forward_op.num_extends() if executes_model_forward else 0
+        )
         dist.all_gather_single(
             self._dp_global_info,
             self._dp_local_info,
@@ -1063,6 +1066,7 @@ class EventLoop:
         return DpForwardMetadata(
             global_num_tokens=global_num_tokens,
             global_batch_size=global_batch_size,
+            global_num_decodes=self._dp_global_info[:, 3].tolist(),
             global_forward_mode=global_forward_mode,
             all_decode_or_idle=all_decode_or_idle,
             all_extend=all_extend,
