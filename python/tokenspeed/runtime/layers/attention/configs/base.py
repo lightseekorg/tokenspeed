@@ -38,8 +38,6 @@ from dataclasses import dataclass
 from typing import ClassVar, TypeVar
 
 import torch
-from tokenspeed_kernel.ops.attention.dsv4 import dsv4_decode_supports_partials
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
@@ -139,8 +137,8 @@ class SoftmaxAttnConfig(AttnComponentSpec):
     # the cache recipes; empty -> single full-history group. A layer's
     # compute mask lives on its PagedAttention (sliding_window_size).
     cache_layer_types: tuple[str, ...] = ()
-    # Retention window for per-layer cache recipes. Families that declare
-    # whole groups, such as DeepSeek V4, put their windows on those groups.
+    # Sliding window for per-layer cache recipes. Recipes that declare whole
+    # groups, such as DeepSeek V4.1, put their windows on those groups.
     sliding_window_tokens: int | tuple[int | None, ...] | None = None
 
     @classmethod
@@ -220,6 +218,8 @@ class AttnConfig:
                 "AttnConfig requires exactly one softmax-family component, got "
                 f"{[type(c).__name__ for c in self.components] or 'none'}"
             )
+        if self.kv_cache_dtype == torch.int8:
+            raise ValueError("INT8 KV cache is not supported by the runtime")
         if self.qcp_size > 1:
             softmax = softmax_components[0]
             # The gathered-history extend arm exists on the GPU DSA leaf only;
@@ -248,44 +248,30 @@ class AttnConfig:
             if softmax.backend_name == "flashmla":
                 if torch.device(self.device).type != "cuda":
                     raise ValueError("FlashMLA DCP decode requires CUDA")
-                if (
-                    self.speculative_num_steps > 0
-                    or self.speculative_num_draft_tokens > 1
-                    or self.is_draft
-                ):
-                    raise ValueError(
-                        "FlashMLA DCP decode does not yet support speculation"
-                    )
             elif softmax.backend_name == "tokenspeed_mla":
                 pass
             elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
-                if torch.device(self.device).type != "cuda":
-                    raise ValueError("GPU DSA DCP decode requires CUDA")
-                if (
-                    self.speculative_num_steps > 0
-                    or self.speculative_num_draft_tokens > 1
-                    or self.is_draft
-                ):
+                device_type = torch.device(self.device).type
+                if device_type not in ("cuda", "npu"):
+                    raise ValueError("DSA DCP decode requires CUDA or Ascend NPU")
+                if device_type == "cuda" and self.draft_block_decode:
                     raise ValueError(
-                        "GPU DSA DCP decode does not yet support speculation"
+                        "GPU DSA DCP decode does not yet support non-causal "
+                        "block drafts"
                     )
             elif softmax.backend_name == "hybrid_linear_attn":
                 # The registry resolves the user's full-attention leaf after
                 # composing the hybrid components, and validates it before
                 # cache allocation. The composite name is not a capability.
                 pass
-            elif softmax.backend_name != "deepseek_v4":
+            elif softmax.backend_name == "deepseek_v41":
+                if self.is_draft:
+                    raise ValueError("V4.1 KVP requires the target attention backend")
+            else:
                 raise ValueError(
                     "--kv-parallel-size > 1 (DCP decode) currently requires "
-                    "DeepSeek V4, GPU DSA, FlashMLA or CuTe MLA attention"
+                    "DSA, FlashMLA or CuTe MLA attention"
                 )
-            else:
-                platform = current_platform()
-                if not dsv4_decode_supports_partials(platform):
-                    raise ValueError(
-                        "DCP decode requires a DeepSeek V4 decode kernel that returns a "
-                        f"no-sink LSE; none is registered for {platform.device_name}"
-                    )
 
     def component(self, cls: type[ComponentT]) -> ComponentT | None:
         """The first component that is a ``cls``, or None.

@@ -60,35 +60,24 @@ def _glm53_flash_recipe():
     return _recipe(tp_size=8, mla_cache_dtype=torch.bfloat16)
 
 
-def _deepseek_v4_recipe():
-    from test.runtime.test_deepseek_v4_config import _v4_recipe
-
-    return _v4_recipe(
-        SimpleNamespace(
-            num_hidden_layers=3,
-            compress_ratios=[0, 4, 128],
-            num_attention_heads=64,
-            head_dim=512,
-            qk_rope_head_dim=64,
-            sliding_window=128,
-            index_head_dim=128,
-            attention_config={},
-        )
-    )
-
-
 def _deepseek_v41_recipe():
     from test.runtime.test_deepseek_v41_cache import _recipe
 
     return _recipe("cpu")
 
 
+def _dots3_note_recipe():
+    from test.runtime.test_dots3_note_cache import _recipe
+
+    return _recipe(draft_layers=1, pd=True)
+
+
 # The families whose per-group demand sizes their own parents.
 _RECIPES = {
     "kimi_k3": _kimi_k3_recipe,
     "glm53_flash": _glm53_flash_recipe,
-    "deepseek_v4": _deepseek_v4_recipe,
     "deepseek_v41": _deepseek_v41_recipe,
+    "dots3_note": _dots3_note_recipe,
 }
 _NO_FIXTURE = {
     "mha",
@@ -140,8 +129,20 @@ def test_every_family_binds_a_probe_arena_and_reports_its_cost(family, rows) -> 
     # A floor, not a size: the arena also has to admit one token per group.
     assert plan.num_lcm_blocks >= rows
     assert built.cache_budget_bytes == recipe.workspace_bytes() + plan.arena_bytes
-    if family == "kimi_k3" and rows == 1024:
-        assert plan.num_lcm_blocks == 1024
+
+
+@pytest.mark.parametrize("family", sorted(_RECIPES))
+def test_probe_holds_disjoint_parents_for_every_capture_group(family) -> None:
+    recipe = _RECIPES[family]()
+    recipe.cache_budget_bytes = 0
+    recipe.probe_batch_rows = 64
+    built = recipe.setup()
+    shards = {spec.group_id: spec.shard_count for spec in built.spec.cache_group_specs}
+    parents = sum(
+        -(-64 // (group.cache_blocks_per_lcm_block * shards[group.group_id]))
+        for group in built.spec.memory_plan.groups
+    )
+    assert built.spec.memory_plan.num_lcm_blocks >= parents
 
 
 def test_the_probe_arena_does_not_grow_with_max_num_seqs() -> None:
@@ -154,6 +155,97 @@ def test_the_probe_arena_does_not_grow_with_max_num_seqs() -> None:
     assert arena_bytes(8) == arena_bytes(512)
     # A cap, not a floor: a server smaller than the probe's batch stays smaller.
     assert arena_bytes(1) < arena_bytes(512)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires an NVIDIA GPU",
+)
+def test_offload_probe_budget_includes_hot_storage(monkeypatch) -> None:
+    from test.runtime.test_cache_setup import _mla_config
+
+    from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+    from tokenspeed.runtime.layers.attention.kv_cache.offload_config import (
+        KVOffloadPolicy,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
+        OrdinaryRecipe,
+    )
+
+    recipe = OrdinaryRecipe(
+        family="mla",
+        server_args=SimpleNamespace(
+            kv_offload_config=None,
+            max_total_tokens=None,
+            disaggregation_mode="null",
+            chunked_prefill_size=1024,
+            enable_prefix_caching=False,
+        ),
+        model_config=SimpleNamespace(
+            num_attention_layers=2, hf_config=SimpleNamespace()
+        ),
+        attn_config=_mla_config(),
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=0,
+        probe_batch_rows=2,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+    policy = KVOffloadPolicy(
+        field_ids=("layer.0.latent_kv",),
+        hot_tokens=4096,
+        reserved_tokens=1,
+        topk=2048,
+        queries=1,
+        host_budget_bytes=1 << 30,
+        overlap=True,
+        cyclic_tokens=0,
+        selection_consumers=(),
+    )
+    monkeypatch.setattr(recipe, "offload_policy", lambda: policy)
+    setup = recipe.setup()
+    arena = CacheArena(
+        setup.spec.memory_plan,
+        "cuda",
+        cache_group_specs=setup.spec.cache_group_specs,
+        storage_plan=setup.spec.storage_plan,
+    )
+    report = registry._cache_storage_report(
+        configured_cache_bytes=setup.cache_budget_bytes,
+        pool=SimpleNamespace(arena=arena),
+        fixed_workspace_bytes=setup.fixed_workspace_bytes,
+    )
+    assert report["allocated_cache_bytes"] > arena.plan.arena_bytes
+    assert report["allocated_cache_bytes"] <= setup.cache_budget_bytes
+    assert report["planned_peak_cache_bytes"] == setup.cache_budget_bytes
+
+    # Serving uses the same configured token cap as the ordinary recipe.
+    # CapacityModel's per-request rounding is for admission working sets,
+    # not an extra parent to add to a flat history capacity limit.
+    recipe.probe_batch_rows = None
+    recipe.cache_budget_bytes = 1 << 30
+    recipe.server_args.max_total_tokens = 512
+    del recipe.token_limit  # Rebuild with a changed startup configuration.
+    serving = recipe.setup()
+    assert serving.spec.token_capacity == 512
+    rows = serving.spec.storage_plan.offload.device_rows
+    # With the history cap reached, serving must keep the demand-sized pool
+    # instead of spending the remaining budget on unusable hot rows.
+    assert rows == setup.spec.storage_plan.offload.device_rows
+    assert serving.spec.storage_plan.device_budget_bytes < recipe.cache_budget_bytes
+    serving_arena = CacheArena(
+        serving.spec.memory_plan,
+        "cuda",
+        cache_group_specs=serving.spec.cache_group_specs,
+        storage_plan=serving.spec.storage_plan,
+    )
+    assert serving_arena.compute_field("layer.0.latent_kv").shape[0] == rows
+    from dataclasses import replace
+
+    recipe.attn_config = replace(recipe.attn_config, context_len=131072)
+    longer = recipe.setup()
+    assert longer.spec.storage_plan.offload.device_rows == rows
 
 
 def test_the_override_reaches_the_plan_through_the_factory_seam() -> None:
@@ -321,7 +413,9 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
         device,
         "current_platform",
         lambda: SimpleNamespace(
-            restore_stack_limit=restore_stack_limit, is_nvidia=is_nvidia
+            restore_stack_limit=restore_stack_limit,
+            is_nvidia=is_nvidia,
+            is_cdna4=False,
         ),
     )
     monkeypatch.setattr(factory, "create_model_runner", lambda *a: (target, None))
@@ -560,15 +654,18 @@ def test_pool_staged_verify_scratch_keeps_the_serving_concurrency(monkeypatch) -
 
 
 def test_each_refusal_turns_the_probe_off_and_names_itself() -> None:
-    def refusal(disable=False, eager=False):
+    def refusal(disable=False, eager=False, memory_saver=False):
         args = SimpleNamespace(
-            disable_cudagraph_memory_reserve=disable, enforce_eager=eager
+            disable_cudagraph_memory_reserve=disable,
+            enforce_eager=eager,
+            enable_memory_saver=memory_saver,
         )
         return device._cudagraph_probe_refusal(args)
 
     assert refusal() is None
     assert "--disable-cudagraph-memory-reserve" in refusal(disable=True)
     assert "--enforce-eager" in refusal(eager=True)
+    assert "tagged CUDA-graph probe pool" in refusal(memory_saver=True)
 
 
 if __name__ == "__main__":

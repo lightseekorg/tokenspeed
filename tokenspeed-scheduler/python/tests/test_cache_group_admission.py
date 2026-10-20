@@ -4,9 +4,8 @@ from collections import deque
 
 import pytest
 from tokenspeed_scheduler import (
+    AttnKind,
     CacheGroupConfig,
-    CacheGroupFamily,
-    CacheRetention,
     ExecutionEvent,
     ForwardEvent,
     RequestSpec,
@@ -75,8 +74,7 @@ def _overlap_admission_scheduler(verify_width: int) -> Scheduler:
             group_id="overlap.history",
             block_granularity=1,
             total_pages=total_pages,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
         )
     ]
     scheduler = Scheduler(cfg)
@@ -110,24 +108,27 @@ def test_speculative_reservations_do_not_accumulate_across_prefill_interruptions
             group_id="history",
             block_granularity=64,
             total_pages=4096,
+            attn_kind=AttnKind.Full,
         ),
         CacheGroupConfig(
             group_id="compressor",
             block_granularity=4,
             total_pages=4096,
-            retention=CacheRetention.SlidingWindow,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.SlidingWindow,
             sliding_window_tokens=8,
         ),
         CacheGroupConfig(
             group_id="state",
-            block_granularity=64,
+            block_granularity=0,
             total_pages=4096,
-            family=CacheGroupFamily.State,
+            attn_kind=AttnKind.State,
         ),
     ]
     scheduler = Scheduler(cfg)
-    scheduler.submit_requests([_make_spec("long", list(range(16)))])
+    # A declared budget, so its decodes also hold the next verify window.
+    long_request = _make_spec("long", list(range(16)))
+    long_request.max_new_tokens = 4096
+    scheduler.submit_requests([long_request])
     pending = deque()
     for step in range(100):
         if step % 5 == 3:
@@ -138,7 +139,7 @@ def test_speculative_reservations_do_not_accumulate_across_prefill_interruptions
                 table = op.block_tables["compressor"][row]
                 committed = scheduler.request_token_size("long") - 1
                 reservation_end = (
-                    committed + (overlap_depth + 1) * cfg.decode_input_tokens
+                    committed + (overlap_depth + 2) * cfg.decode_input_tokens
                 )
                 assert len(table) <= (reservation_end + 3) // 4
                 assert table[committed // 4] > 0
@@ -165,6 +166,79 @@ def test_speculative_reservations_do_not_accumulate_across_prefill_interruptions
             scheduler.advance(events)
 
 
+def _speculative_config(
+    verify_width: int, overlap_depth: int, total_pages: int
+) -> SchedulerConfig:
+    cfg = _base_config(num_device_pages=total_pages)
+    cfg.prefix_granularity = 1
+    cfg.decode_input_tokens = verify_width
+    cfg.overlap_schedule_depth = overlap_depth
+    # A sliding group prepays no generation, so it holds exactly what decode reserves; no token expires here.
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="swa",
+            block_granularity=1,
+            total_pages=total_pages,
+            attn_kind=AttnKind.SlidingWindow,
+            sliding_window_tokens=1024,
+        )
+    ]
+    return cfg
+
+
+def _speculative_scheduler(
+    verify_width: int, overlap_depth: int, max_new_tokens: int, total_pages: int = 256
+) -> Scheduler:
+    """A two-token prompt whose prefill is done: its next plan is the first decode."""
+    scheduler = Scheduler(_speculative_config(verify_width, overlap_depth, total_pages))
+    spec = _make_spec("r", [1, 2])
+    spec.max_new_tokens = max_new_tokens
+    scheduler.submit_requests([spec])
+    assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
+    _advance_tokens(scheduler, "r", [3])
+    return scheduler
+
+
+def _used_pages(scheduler: Scheduler) -> int:
+    # Page 0 is the allocator's.
+    return 256 - 1 - scheduler.cache_group_available_pages("swa")
+
+
+@pytest.mark.parametrize("overlap_depth", [0, 1])
+@pytest.mark.parametrize("verify_width", [2, 4, 16])
+def test_speculative_decode_reserves_the_next_verify_window(
+    overlap_depth: int, verify_width: int
+):
+    """Draft steps and draft-tree lanes write into the next verify window, so
+    from the first decode on a speculative decode holds it too."""
+    scheduler = _speculative_scheduler(verify_width, overlap_depth, 64)
+    assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
+    assert _used_pages(scheduler) == 2 + 2 * verify_width
+
+
+def test_an_overlapped_decode_reserves_the_next_verify_window_too():
+    """A decode planned before the previous result commits holds the window
+    after its own, not only the first decode."""
+    scheduler = _speculative_scheduler(4, 1, 64)
+    for _ in range(2):
+        assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
+    # The in-flight verify window, this decode's and the next one.
+    assert _used_pages(scheduler) == 2 + 3 * 4
+
+
+@pytest.mark.parametrize("max_new_tokens", [0, 3])
+def test_a_pool_sized_to_the_admission_limit_runs_the_first_decode(
+    max_new_tokens: int,
+):
+    """Admission validates the prompt plus max(max_new_tokens, N): a budget
+    ending inside the verify window holds only that window, and an undeclared
+    one reserves no draft window, so either decodes in a pool of exactly that size."""
+    # Page 0 is the allocator's: six usable pages hold the prompt and one window.
+    scheduler = _speculative_scheduler(4, 0, max_new_tokens, total_pages=7)
+    assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
+    assert scheduler.cache_group_available_pages("swa") == 0
+
+
 def test_overlap_schedule_depth_defaults_to_zero_and_rejects_deeper_pipeline():
     assert SchedulerConfig().overlap_schedule_depth == 0
     cfg = _base_config()
@@ -173,6 +247,7 @@ def test_overlap_schedule_depth_defaults_to_zero_and_rejects_deeper_pipeline():
             group_id="history",
             block_granularity=cfg.prefix_granularity,
             total_pages=cfg.num_device_pages,
+            attn_kind=AttnKind.Full,
         )
     ]
     for invalid_depth in (-1, 2):
@@ -200,7 +275,7 @@ def test_sliding_release_before_admit_prevents_oom():
             group_id="swa.test",
             block_granularity=2,
             total_pages=8,
-            retention=CacheRetention.SlidingWindow,
+            attn_kind=AttnKind.SlidingWindow,
             sliding_window_tokens=4,
         )
     ]
@@ -218,7 +293,9 @@ def test_sliding_release_before_admit_prevents_oom():
 
 
 def test_batch_admission_debits_simulated_free_pages():
-    cfg = _base_config(num_device_pages=12)
+    # Thirteen usable pages admit one eight-token prompt (two groups of
+    # ceil(9 / 2) blocks plus a tail handover each), never two.
+    cfg = _base_config(num_device_pages=14)
     cfg.prefix_granularity = 2
     cfg.max_batch_size = 4
     cfg.max_scheduled_tokens = 512
@@ -226,8 +303,8 @@ def test_batch_admission_debits_simulated_free_pages():
         CacheGroupConfig(
             group_id=f"swa.g{i}",
             block_granularity=2,
-            total_pages=12,
-            retention=CacheRetention.SlidingWindow,
+            total_pages=14,
+            attn_kind=AttnKind.SlidingWindow,
             sliding_window_tokens=4,
         )
         for i in range(2)
@@ -251,17 +328,15 @@ def test_group_tables_use_each_groups_block_granularity():
             group_id="history",
             block_granularity=8,
             total_pages=17,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
         ),
         CacheGroupConfig(
             group_id="swa",
             block_granularity=2,
             total_pages=65,
             cache_blocks_per_lcm_block=4,
-            retention=CacheRetention.SlidingWindow,
+            attn_kind=AttnKind.SlidingWindow,
             sliding_window_tokens=4,
-            family=CacheGroupFamily.History,
         ),
     ]
     scheduler = Scheduler(cfg)
@@ -288,16 +363,14 @@ def _hybrid_chunked_scheduler(num_usable_pages: int) -> Scheduler:
             group_id="history",
             block_granularity=4,
             total_pages=cfg.num_device_pages,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
         ),
         CacheGroupConfig(
             group_id="swa",
             block_granularity=4,
             total_pages=cfg.num_device_pages,
-            retention=CacheRetention.SlidingWindow,
+            attn_kind=AttnKind.SlidingWindow,
             sliding_window_tokens=4,
-            family=CacheGroupFamily.History,
         ),
     ]
     return Scheduler(cfg)
@@ -307,11 +380,13 @@ def test_first_chunk_prepays_prompt_headroom_only_in_full_history_groups():
     # A 32-token prompt with max_new_tokens=8 admits its first 8-token chunk on
     # a decoding role with 24 unscheduled prompt tokens + 8 tokens of decode
     # headroom prepaid. The full-history group must hold that: 8 + 32 tokens
-    # -> 10 pages. The sliding-window group recycles slid-out pages, so the
-    # rest of the prompt costs it nothing: it holds only the chunk, 2 pages.
-    # 12 pages fit a 16-page pool; had the headroom been broadcast to both
-    # groups (20 pages) the request would have sat in the waiting queue.
-    scheduler = _hybrid_chunked_scheduler(num_usable_pages=16)
+    # -> 10 pages. The sliding-window group recycles slid-out pages, so with no
+    # other request holding pages the rest of the prompt costs it nothing: it
+    # holds only the chunk, 2 pages.
+    # 12 pages fit an 18-page pool (the startup bound admits the 40-token
+    # limit); had the headroom been broadcast to both groups (20 pages) the
+    # request would have sat in the waiting queue.
+    scheduler = _hybrid_chunked_scheduler(num_usable_pages=18)
     request = _make_spec("long", list(range(32)))
     request.max_new_tokens = 8
     scheduler.submit_requests([request])
@@ -323,6 +398,6 @@ def test_first_chunk_prepays_prompt_headroom_only_in_full_history_groups():
     tables = dict(operation.block_tables)
     assert len(tables["history"][0]) == 10
     assert len(tables["swa"][0]) == 2
-    assert scheduler.cache_group_available_pages("history") == 4
+    assert scheduler.cache_group_available_pages("history") == 6
     assert scheduler.waiting_size() == 0
     assert scheduler.prefilling_size() == 1

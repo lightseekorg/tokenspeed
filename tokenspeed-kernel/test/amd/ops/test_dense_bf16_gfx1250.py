@@ -28,6 +28,7 @@ if not is_cdna5():
     pytest.skip("AMD CDNA5 is required", allow_module_level=True)
 
 from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
+    _dense_num_buffers,
     _wmma_tdm_dense_kernel,
     gluon_wmma_tdm_dense_gfx1250,
     gluon_wmma_tdm_kda_qkvfab_gfx1250,
@@ -71,6 +72,16 @@ def test_dense_split_k_reduction_multiple_tiles():
     expected = (a_cpu.float() @ b_cpu.float().T).to(torch.bfloat16)
     torch.testing.assert_close(actual.cpu(), expected, atol=1e-2, rtol=1e-2)
     assert torch.isnan(storage.cpu()[:, n:]).all()
+
+
+def test_dense_buffers_fit_k_and_shared_lds():
+    tile = dict(block_m=16, block_n=16, block_k=256)
+    # Two programs per CU still fit eight 16 x 16 stages.
+    assert _dense_num_buffers(8, 28, 393, **tile) == 8
+    assert _dense_num_buffers(8, 3, 224, **tile) == 3
+    # Two resident 16 x 32 programs share LDS; one 64 x 32 program fills it.
+    assert _dense_num_buffers(8, 28, 640, block_m=16, block_n=32, block_k=256) == 6
+    assert _dense_num_buffers(8, 28, 224, block_m=64, block_n=32, block_k=256) == 6
 
 
 @pytest.mark.parametrize("k", [128, 256, 384])

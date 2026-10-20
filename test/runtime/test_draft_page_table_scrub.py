@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import os
 import sys
-import unittest
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -47,6 +47,9 @@ class _Leaf:
     def refresh_decode_metadata(self, *args, **kwargs):
         pass
 
+    def decode_buffer_targets(self, bs):
+        return None
+
     def set_request_slots(self, req_pool_indices):
         pass
 
@@ -61,10 +64,10 @@ def _draft_router(rows: int = 8) -> CacheGroupRouter:
     router.bind(
         CacheGroupGeometry(
             granularities={FULL: 128},
-            families={FULL: "history"},
+            attn_kinds={FULL: "full_history"},
             full_history_group_id=FULL,
             row_geometry={FULL: (128, 1)},
-            retentions={FULL: ("full_history", None)},
+            windows={FULL: None},
         ),
         {FULL: _Leaf()},
     )
@@ -83,14 +86,16 @@ def _refresh(router, bs, actual_bs, table):
     )
 
 
-class DraftHistoryScrubTest(unittest.TestCase):
+class TestDraftHistoryScrubTest:
     def test_smaller_batch_clears_prior_rows(self):
         router = _draft_router()
         _refresh(router, 8, 6, torch.full((6, 4), 7, dtype=torch.int32))
         _refresh(router, 8, 2, torch.full((2, 4), 3, dtype=torch.int32))
         view = router.draft_history_view()
-        self.assertTrue((view.table[2:] == 0).all(), view.table)
-        self.assertTrue((view.table[:2] == 3).all())
+        _pytest_expr_1 = (view.table[2:] == 0).all()
+        _pytest_msg_2 = view.table
+        assert _pytest_expr_1, _pytest_msg_2
+        assert (view.table[:2] == 3).all()
 
     def test_padded_replay_rows_resolve_to_the_dummy_slot(self):
         router = _draft_router()
@@ -101,16 +106,16 @@ class DraftHistoryScrubTest(unittest.TestCase):
             out, cache_start=torch.zeros(4, dtype=torch.int32), num_tokens=2
         )
         # Rows 1..3 are padding: their pages are null, so slots are 0.
-        self.assertEqual(out[2:].tolist(), [0] * 6)
+        assert (out[2:].tolist()) == ([0] * 6)
 
     def test_idle_refresh_zeroes_every_row(self):
         router = _draft_router()
         _refresh(router, 8, 8, torch.full((8, 4), 9, dtype=torch.int32))
         _refresh(router, 8, 0, None)
-        self.assertTrue((router.draft_history_view().table == 0).all())
+        assert (router.draft_history_view().table == 0).all()
 
 
-class IdleReplayScrubTest(unittest.TestCase):
+class TestIdleReplayScrubTest:
     """A DP rank that served a large batch and then goes idle replays the
     captured drafter graph at padded_bs while another rank decodes; the idle
     refresh must present null rows to the drafter's recorded kernels."""
@@ -155,6 +160,9 @@ class IdleReplayScrubTest(unittest.TestCase):
                 vocab_size=32,
             ),
             device="cpu",
+            device_module=torch.cpu,
+            default_stream=torch.cpu.current_stream(),
+            execution_stream=torch.cpu.Stream(),
             config=SimpleNamespace(output_length=1),
             capturable_grammar=None,
             forward_step=_Step(),
@@ -164,27 +172,33 @@ class IdleReplayScrubTest(unittest.TestCase):
             DpForwardMetadata(
                 global_num_tokens=[0],
                 global_batch_size=[0],
+                global_num_decodes=[0],
                 global_forward_mode=[int(ForwardMode.IDLE)],
                 all_decode_or_idle=True,
                 all_extend=False,
                 need_idle_forward=True,
             ),
         )
-        self.assertTrue((captured["rows"] == 0).all(), captured["rows"])
-        self.assertIs(captured["attn_backend"], ex.attn_backend)
+        _pytest_expr_3 = (captured["rows"] == 0).all()
+        _pytest_msg_4 = captured["rows"]
+        assert _pytest_expr_3, _pytest_msg_4
+        assert (captured["attn_backend"]) is (ex.attn_backend)
         # The idle replay hands the runner empty extend slices, never None.
         extend_kwargs = captured["extend_kwargs"]
-        self.assertIs(extend_kwargs["extend_with_prefix"], False)
+        assert (extend_kwargs["extend_with_prefix"]) is (False)
         for name in (
             "extend_prefix_lens",
             "extend_prefix_lens_cpu",
             "extend_seq_lens",
             "extend_seq_lens_cpu",
         ):
-            self.assertEqual(extend_kwargs[name].numel(), 0, name)
+            _pytest_first_5 = extend_kwargs[name].numel()
+            _pytest_second_6 = 0
+            _pytest_msg_7 = name
+            assert _pytest_first_5 == _pytest_second_6, _pytest_msg_7
         # And the runner's required host tables: no request, no groups.
-        self.assertEqual(extend_kwargs["block_tables_cpu"], {})
+        assert (extend_kwargs["block_tables_cpu"]) == ({})
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

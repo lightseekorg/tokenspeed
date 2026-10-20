@@ -20,6 +20,10 @@
 
 from __future__ import annotations
 
+import os
+import sys
+from http import HTTPStatus
+
 import pytest
 import torch
 
@@ -27,12 +31,23 @@ from tokenspeed.runtime.engine.generation_output_processor import (
     OutputProcesser,
     RequestState,
 )
+from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.request_stats import (
     NOOP_STATS,
     RequestStats,
     RequestStatsTracker,
 )
+from tokenspeed.runtime.execution.types import (
+    MAX_STOP_TOKEN_IDS,
+    ModelExecutionResult,
+)
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+# CI registration (AST-parsed, runtime no-op).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=15, suite="runtime-1gpu")
 
 
 class _Sender:
@@ -88,6 +103,10 @@ class _ExecutionResult:
     next_input_ids = None
     input_token_logprobs = None
     input_logprob_plan = None
+    input_top_logprobs_val = None
+    input_top_logprobs_idx = None
+    output_top_logprobs_val = None
+    output_top_logprobs_idx = None
 
 
 def _state(input_ids: list[int], *, computed_length: int = 0) -> RequestState:
@@ -122,6 +141,72 @@ def test_mixed_forward_updates_reserve_for_decode_slots_only():
     assert len(reserve_events) == 1
     assert reserve_events[0].request_id == "decode"
     assert reserve_events[0].reserve_num_tokens_in_next_schedule_event == 1
+
+
+def test_a_landed_forward_of_a_finished_request_still_reports_to_the_scheduler():
+    """A request finished on an earlier result while this forward was already
+    dispatched (the overlap schedule): its row is untracked here, but the
+    scheduler counts the landing and publishes the frontier it consumed, so
+    the row's ExtendResult goes out with its tokens -- empty for a chunk that
+    owes none."""
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
+
+    events = processor.post_process_forward_op(
+        _ForwardOp(), _ExecutionResult(), is_prefill_instance=False
+    )
+
+    extends = {
+        event.request_id: list(event.tokens)
+        for event in events
+        if type(event).__name__ == "ExtendResult"
+    }
+    assert extends == {"prefill": [11], "decode": [22]}
+    assert "decode" not in processor.rid_to_state
+
+    class _MidChunkOp(_ForwardOp):
+        request_ids = ["gone"]
+        request_pool_indices = [0]
+        input_lengths = [4]
+        prefill_lengths = [8]
+
+        def num_extends(self):
+            return 1
+
+    class _OneRow(_ExecutionResult):
+        output_tokens = torch.tensor([11], dtype=torch.int32)
+        output_lengths = torch.tensor([1], dtype=torch.int32)
+
+    events = processor.post_process_forward_op(
+        _MidChunkOp(), _OneRow(), is_prefill_instance=False
+    )
+    (extend,) = [event for event in events if type(event).__name__ == "ExtendResult"]
+    assert extend.request_id == "gone"
+    assert list(extend.tokens) == []
+
+
+def test_an_extend_sets_its_computed_length_and_a_decode_adds_to_it():
+    """An extend computed its prompt up to prefix plus input, whatever the
+    length was before (a prefix hit starts past zero), so a prefix hit that
+    completes the prompt commits its first token; a decode adds its input."""
+
+    class _PrefixHitOp(_ForwardOp):
+        input_lengths = [4, 1]
+        prefill_lengths = [8]
+        extend_prefix_lens = [4]
+
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    hit = _state([1, 2, 3, 4, 5, 6, 7, 8])
+    decode = _state([5, 6, 7], computed_length=3)
+    processor.rid_to_state["prefill"] = hit
+    processor.rid_to_state["decode"] = decode
+
+    processor.post_process_forward_op(
+        _PrefixHitOp(), _ExecutionResult(), is_prefill_instance=False
+    )
+
+    assert (hit.computed_length, hit.output_ids) == (8, [11])
+    assert (decode.computed_length, decode.output_ids) == (4, [22])
 
 
 def test_cached_tokens_count_the_replayed_window_as_a_hit():
@@ -603,6 +688,10 @@ class _PrefillExecutionResult:
     next_input_ids = torch.tensor([[101, 102, 103]], dtype=torch.int32)
     input_token_logprobs = None
     input_logprob_plan = None
+    input_top_logprobs_val = None
+    input_top_logprobs_idx = None
+    output_top_logprobs_val = None
+    output_top_logprobs_idx = None
 
 
 class _EmptyPrefillExecutionResult(_PrefillExecutionResult):
@@ -804,18 +893,19 @@ def test_spec_decode_metrics_count_mixed_rounds_and_proposed_drafts():
 
 
 @pytest.mark.parametrize(
-    "local_hits,remote_hits,expected",
-    [(0, 1280, 1280), (256, 1280, 1280), (1280, 256, 1280)],
+    "local_hits,prefill_hits",
+    [(0, 1280), (256, 1280), (1280, 256), (1280, 0)],
 )
-def test_remote_prefill_usage_merges_overlapping_prefixes(
-    local_hits, remote_hits, expected
-):
-    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+def test_remote_prefill_usage_reports_prefill_hits(local_hits, prefill_hits):
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     state = _state(list(range(2048)), computed_length=2048)
+    state.sampling_params.max_new_tokens = 1
     state.cached_tokens = local_hits
     processor.rid_to_state["decode"] = state
-    processor.on_remote_prefill_done("decode", 101, remote_hits, None)
-    assert state.cached_tokens == expected
+    processor.on_remote_prefill_done("decode", 101, prefill_hits, None)
+    processor.finish_remote_prefill_only_request("decode")
+    assert sender.items[0].cached_tokens == [prefill_hits]
 
 
 def test_non_pd_cached_tokens_reach_output():
@@ -903,3 +993,258 @@ def test_a_client_abort_crossing_a_capacity_abort_keeps_the_clients_finish():
     (out,) = sender.items
     assert out.rids == ["paused"]
     assert out.finished_reasons[0] == paused.finished_reason.to_json()
+
+
+class _EosTokenizer(_Tokenizer):
+    eos_token_id = 3
+    additional_stop_token_ids = {4}
+
+
+def test_stop_token_ids_merge_every_source_unless_eos_is_ignored():
+    """The finish check and the device's verify cut read one stop set: the
+    request's own ids, the model's EOS ids and the tokenizer's."""
+    state = RequestState(
+        prompt_input_ids=[1, 2, 3, 4, 5],
+        sampling_params=SamplingParams(max_new_tokens=8, stop=[], stop_token_ids={5}),
+        stream=False,
+        tokenizer=_EosTokenizer(),
+        computes_prompt_logprobs=True,
+        eos_token_ids=[2],
+    )
+    assert state.stop_token_ids == {2, 3, 4, 5}
+    assert state.stop_criteria.stop_token_ids == (2, 3, 4, 5)
+    assert state.stop_criteria.token_limit == 5 + 8
+    state.output_ids = [4]
+    state.check_finished()
+    assert state.finished_reason.to_json()["matched"] == 4
+
+    ignoring = RequestState(
+        prompt_input_ids=[1],
+        sampling_params=SamplingParams(
+            max_new_tokens=8, stop=[], stop_token_ids={5}, ignore_eos=True
+        ),
+        stream=False,
+        tokenizer=_EosTokenizer(),
+        computes_prompt_logprobs=True,
+        eos_token_ids=[2],
+    )
+    assert ignoring.stop_criteria.stop_token_ids == ()
+
+
+class _DecodeOp:
+    request_ids = ["decode"]
+    request_pool_indices = [1]
+    input_lengths = [3]
+    prefill_lengths = []
+    extend_prefix_lens = []
+    extend_replay_lens = []
+
+    def num_extends(self):
+        return 0
+
+
+class _DecodeResult(_ExecutionResult):
+    output_tokens = torch.tensor([11, 12, 13], dtype=torch.int32)
+    output_lengths = torch.tensor([3], dtype=torch.int32)
+
+
+def test_a_finish_before_the_last_kept_token_reports_the_whole_round():
+    """A stop string ends the request on the round's first token, but the
+    device kept all three (it cuts only at stop tokens and the token limit):
+    the client sees the first, the scheduler gets every kept token so the
+    frontier it publishes matches the state and KV the device holds."""
+    processor = OutputProcesser(
+        _Sender(),
+        attn_tp_rank=0,
+        metrics=_Metrics(),
+        spec_algorithm="EAGLE",
+        spec_num_tokens=3,
+    )
+    state = RequestState(
+        prompt_input_ids=[5, 6, 7],
+        sampling_params=SamplingParams(max_new_tokens=8, stop=["11"]),
+        stream=False,
+        tokenizer=_Tokenizer(),
+        computes_prompt_logprobs=True,
+    )
+    state.computed_length = 3
+    processor.rid_to_state["decode"] = state
+
+    events = processor.post_process_forward_op(
+        _DecodeOp(), _DecodeResult(), is_prefill_instance=False
+    )
+
+    (extend,) = [e for e in events if type(e).__name__ == "ExtendResult"]
+    assert list(extend.tokens) == [11, 12, 13]
+    assert state.output_ids == [11]
+    assert any(type(e).__name__ == "Finish" for e in events)
+
+
+def test_a_live_decode_that_keeps_no_token_is_an_error():
+    """Only a request the device already stopped keeps nothing, and the
+    processor no longer tracks a finished request."""
+
+    class _Empty(_DecodeResult):
+        output_lengths = torch.tensor([0], dtype=torch.int32)
+
+    processor = OutputProcesser(
+        _Sender(),
+        attn_tp_rank=0,
+        metrics=_Metrics(),
+        spec_algorithm="EAGLE",
+        spec_num_tokens=3,
+    )
+    processor.rid_to_state["decode"] = _state([5, 6, 7], computed_length=3)
+    with pytest.raises(RuntimeError, match="kept no token"):
+        processor.post_process_forward_op(
+            _DecodeOp(), _Empty(), is_prefill_instance=False
+        )
+
+
+def test_a_request_with_more_stop_tokens_than_the_device_table_is_refused():
+    def state(num_ids):
+        return RequestState(
+            prompt_input_ids=[1],
+            sampling_params=SamplingParams(
+                max_new_tokens=8, stop=[], stop_token_ids=set(range(100, 100 + num_ids))
+            ),
+            stream=False,
+            tokenizer=_EosTokenizer(),
+            computes_prompt_logprobs=True,
+        )
+
+    handler = object.__new__(RequestHandler)
+    # The tokenizer's two stop ids count against the limit.
+    fits = state(MAX_STOP_TOKEN_IDS - 2)
+    handler._refuse_too_many_stop_token_ids(fits)
+    assert not fits.finished
+    refused = state(MAX_STOP_TOKEN_IDS - 1)
+    handler._refuse_too_many_stop_token_ids(refused)
+    reason = refused.finished_reason.to_json()
+    assert reason["status_code"] == HTTPStatus.BAD_REQUEST
+    assert f"at most {MAX_STOP_TOKEN_IDS - 2} other" in reason["message"]
+
+
+def test_a_row_behind_a_stopped_request_reads_its_own_token():
+    """A request the device stopped keeps no token, but its decode row still
+    holds its stored token: the next row's token is at the next position, so
+    a live request never takes its neighbour's token (and so never misses
+    its own stop token)."""
+
+    class _TwoDecodes:
+        request_ids = ["stopped", "live"]
+        request_pool_indices = [1, 2]
+        input_lengths = [1, 1]
+        prefill_lengths = []
+        extend_prefix_lens = []
+        extend_replay_lens = []
+
+        def num_extends(self):
+            return 0
+
+    class _Result(_ExecutionResult):
+        output_tokens = torch.tensor([11, 22], dtype=torch.int32)
+        output_lengths = torch.tensor([0, 1], dtype=torch.int32)
+
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    live = _state([5, 6, 7], computed_length=3)
+    processor.rid_to_state["live"] = live
+
+    events = processor.post_process_forward_op(
+        _TwoDecodes(), _Result(), is_prefill_instance=False
+    )
+
+    extends = {
+        event.request_id: list(event.tokens)
+        for event in events
+        if type(event).__name__ == "ExtendResult"
+    }
+    assert extends == {"stopped": [], "live": [22]}
+    assert live.output_ids == [22]
+
+
+class _LetterTokenizer:
+    """A tokenizer with an EOS id and an extra stop id; decodes to letters."""
+
+    eos_token_id = 900
+    additional_stop_token_ids = [901]
+
+    def decode(self, ids):
+        return "".join(chr(ord("a") + i % 26) for i in ids)
+
+
+_MODEL_EOS = 902
+
+
+def _stop_state(prompt: list[int], **params) -> RequestState:
+    stream = params.pop("stream", False)
+    return_logprob = params.pop("return_logprob", False)
+    sampling = SamplingParams(**{"max_new_tokens": 30, "stop": [], **params})
+    sampling.normalize(None)
+    state = RequestState(
+        prompt_input_ids=prompt,
+        sampling_params=sampling,
+        stream=stream,
+        tokenizer=_LetterTokenizer(),
+        computes_prompt_logprobs=True,
+        eos_token_ids=[_MODEL_EOS],
+        return_logprob=return_logprob,
+    )
+    state.computed_length = len(prompt)
+    return state
+
+
+class _DecodeRound:
+    """One decode round over ``request_ids`` (the scheduler op's surface)."""
+
+    def __init__(self, request_ids: list[str], width: int) -> None:
+        self.request_ids = list(request_ids)
+        self.request_pool_indices = list(range(len(request_ids)))
+        self.input_lengths = [width] * len(request_ids)
+        self.prefill_lengths = []
+        self.extend_prefix_lens = []
+        self.extend_replay_lens = []
+
+    def num_extends(self) -> int:
+        return 0
+
+
+def test_streamed_frames_carry_the_detokenizer_ids_once():
+    """Across a streaming request's frames the decode ids are the prompt's
+    surrounding tail and then each output token exactly once, against a
+    fixed read offset."""
+    processor = OutputProcesser(
+        _Sender(),
+        attn_tp_rank=0,
+        spec_algorithm="EAGLE",
+        spec_num_tokens=3,
+        metrics=_Metrics(),
+    )
+    prompt = [10, 11, 12, 13, 14, 15, 16, 17]
+    state = _stop_state(prompt, stream=True)
+    processor.rid_to_state["s"] = state
+
+    for rows, accepted in (
+        [[101, 102, 103], 2],
+        [[104, 105, 106], 3],
+        [[107, 0, 0], 1],
+    ):
+        processor.post_process_forward_op(
+            _DecodeRound(["s"], 3),
+            ModelExecutionResult(
+                output_tokens=torch.tensor(rows, dtype=torch.int32),
+                output_lengths=torch.tensor([accepted], dtype=torch.int32),
+            ),
+            is_prefill_instance=False,
+        )
+
+    frames = processor.send_to_tokenizer.items
+    assert len(frames) == 3
+    sent = [i for frame in frames for i in frame.decode_ids[0]]
+    assert sent == prompt[3:] + [101, 102, 104, 105, 106, 107]
+    assert [frame.read_offsets[0] for frame in frames] == [5, 5, 5]
+    assert [frame.output_ids[0] for frame in frames] == [
+        [101, 102],
+        [104, 105, 106],
+        [107],
+    ]

@@ -72,7 +72,7 @@ def _fp8_arange(shape: tuple[int, ...]) -> torch.Tensor:
 def test_weight_preprocessor_uses_shuffled_block_major_k() -> None:
     from flashinfer import shuffle_matrix_a
     from flashinfer.fused_moe import convert_to_block_layout
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_fp8 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_fp8_moe_process_weights,
     )
 
@@ -140,8 +140,8 @@ def test_weight_preprocessor_uses_shuffled_block_major_k() -> None:
 @requires_flashinfer
 @pytest.mark.parametrize("enable_pdl", [False, True])
 def test_apply_forwards_prepared_layout_and_pdl(monkeypatch, enable_pdl: bool) -> None:
+    import tokenspeed_kernel.ops.moe.flashinfer as trtllm_fp8
     from flashinfer.tllm_enums import WeightLayout
-    from tokenspeed_kernel.ops.moe.flashinfer import trtllm_fp8
 
     captured: dict[str, object] = {}
 
@@ -206,7 +206,7 @@ def test_apply_forwards_prepared_layout_and_pdl(monkeypatch, enable_pdl: bool) -
 
 @requires_flashinfer
 def test_apply_supports_deferred_finalize(monkeypatch) -> None:
-    from tokenspeed_kernel.ops.moe.flashinfer import trtllm_fp8
+    import tokenspeed_kernel.ops.moe.flashinfer as trtllm_fp8
 
     captured: dict[str, object] = {}
 
@@ -259,7 +259,7 @@ def test_apply_supports_deferred_finalize(monkeypatch) -> None:
 
 @requires_flashinfer
 def test_empty_apply_preserves_deferred_finalize_contract() -> None:
-    from tokenspeed_kernel.ops.moe.flashinfer import trtllm_fp8
+    import tokenspeed_kernel.ops.moe.flashinfer as trtllm_fp8
 
     weights = _MoEWeights(
         torch.empty((2, 1, 256, 128), dtype=torch.float8_e4m3fn),

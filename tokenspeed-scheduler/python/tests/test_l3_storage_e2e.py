@@ -61,8 +61,7 @@ def _l3_config(
             group_id="full",
             block_granularity=cfg.prefix_granularity,
             total_pages=cfg.num_device_pages,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
         )
     ]
     if with_swa:
@@ -71,9 +70,8 @@ def _l3_config(
                 group_id="swa",
                 block_granularity=cfg.prefix_granularity,
                 total_pages=cfg.num_device_pages,
-                retention=ts.CacheRetention.SlidingWindow,
+                attn_kind=ts.AttnKind.SlidingWindow,
                 sliding_window_tokens=4,
-                family=ts.CacheGroupFamily.History,
             )
         )
     cfg.cache_groups = groups
@@ -214,6 +212,46 @@ def test_l3_register_storage_keys_emits_a_prefetch_before_admission() -> None:
     assert scheduler.host_pool_pinned_blocks() == 0
 
 
+@pytest.mark.parametrize("with_swa,checkpoint_page", [(False, 3), (True, 1)])
+def test_l3_hybrid_prefetch_restores_state_before_admission(
+    with_swa: bool, checkpoint_page: int
+) -> None:
+    cfg = _l3_config(
+        num_device_pages=32, num_host_pages=32, with_swa=with_swa, min_prefetch_pages=1
+    )
+    state_group = len(cfg.cache_groups)
+    cfg.cache_groups = list(cfg.cache_groups) + [
+        ts.CacheGroupConfig(
+            group_id="state",
+            block_granularity=0,
+            total_pages=cfg.num_device_pages,
+            attn_kind=ts.AttnKind.State,
+        )
+    ]
+    scheduler = ts.Scheduler(cfg)
+    tokens = list(range(1, 10))
+    hashes = scheduler.prefix_hashes_for_tokens(tokens)
+    groups, expanded, offsets = scheduler.expand_prefix_keys(hashes)
+    keys = [
+        (group, content_hash, offset)
+        for group, content_hash, offset in zip(groups, expanded, offsets)
+        if group != state_group or content_hash == hashes[checkpoint_page]
+    ]
+    scheduler.register_storage_keys(*map(list, zip(*keys)))
+    scheduler.submit_requests([_spec("hybrid", tokens)])
+    prefetch = _find_op(scheduler.next_execution_plan(), ts.Cache.PrefetchOp)
+    assert prefetch is not None
+    assert set(prefetch.group_ids[0]) == set(range(state_group + 1))
+    _ack_prefetch(scheduler, prefetch.op_ids[0], len(hashes))
+    admit = scheduler.next_execution_plan()
+    assert list(admit.forward[0].extend_prefix_lens) == [2 * (checkpoint_page + 1)]
+    load = _find_op(admit, ts.Cache.LoadBackOp)
+    assert load is not None
+    assert set(load.group_ids[0]) == set(range(state_group + 1))
+    _ack_load_back(scheduler, load.op_ids[0])
+    assert scheduler.host_pool_pinned_blocks() == 0
+
+
 def test_l3_partial_landing_admits_on_the_landed_prefix() -> None:
     scheduler = ts.Scheduler(
         _l3_config(
@@ -301,15 +339,13 @@ def test_l3_host_shortage_skips_a_page_it_cannot_fetch_whole() -> None:
             group_id="full_fine",
             block_granularity=2,
             total_pages=cfg.num_device_pages,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
         ),
         ts.CacheGroupConfig(
             group_id="full_coarse",
             block_granularity=4,
             total_pages=cfg.num_device_pages,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
         ),
     ]
     scheduler = ts.Scheduler(cfg)
@@ -401,14 +437,19 @@ def test_l3_host_eviction_still_prefetches_registered_prefix() -> None:
     _ack_write_back(scheduler, wb1.op_ids[0])
     scheduler.next_execution_plan()
 
-    churn = _spec("churn", list(range(501, 511)))
-    wb2 = _find_op(_run_to_finalize(scheduler, churn), ts.Cache.WriteBackOp)
-    assert wb2 is not None, "a full Host pool must replace r1's committed entries"
-    _finish_and_reap(scheduler, "churn")
-    _ack_write_back(scheduler, wb2.op_ids[0])
-    scheduler.next_execution_plan()
+    # Two churns in a row: the first's write-back replaces r1's Host entries,
+    # and between them they recycle every Device page r1 left behind (the
+    # startup bound keeps one block per group for a tail handover, so a single
+    # prompt never fills the pool).
+    for request_id, start in (("churn", 501), ("churn2", 701)):
+        churn = _spec(request_id, list(range(start, start + 8)))
+        wb2 = _find_op(_run_to_finalize(scheduler, churn), ts.Cache.WriteBackOp)
+        assert wb2 is not None, "a full Host pool must replace the older entries"
+        _finish_and_reap(scheduler, request_id)
+        _ack_write_back(scheduler, wb2.op_ids[0])
+        scheduler.next_execution_plan()
 
-    r3_tokens = list(range(1, 11))
+    r3_tokens = list(range(1, 10))
     _register_prompt(scheduler, r3_tokens)
     scheduler.submit_requests([_spec("r3", r3_tokens)])
     plan = scheduler.next_execution_plan()

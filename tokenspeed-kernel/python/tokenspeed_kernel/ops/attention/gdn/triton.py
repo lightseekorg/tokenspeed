@@ -38,7 +38,7 @@ expensive here).
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._triton import libdevice, tl, triton
+from tokenspeed_kernel._triton import gl, gluon, libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.gdn import (
     GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
     GdnCheckpointLayout,
@@ -65,6 +65,7 @@ from tokenspeed_kernel.ops.attention.gdn._triton.prefill_state_inputs import (
 )
 from tokenspeed_kernel.ops.attention.gdn._triton.qkv_split import (
     fused_qkv_split_gdn_prefill,
+    pack_gdn_projection,
 )
 from tokenspeed_kernel.platform import (
     CapabilityRequirement,
@@ -73,6 +74,9 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+
+# The payload stores take ptxas to 172 registers, a CTA per SM fewer; 168 keeps three CTAs.
+_TREE_VERIFY_REPLAY_MAX_REGISTERS = 168
 
 
 @register_kernel(
@@ -167,6 +171,7 @@ def _fused_gdn_decode_update_kernel(
     b,
     o,
     h0_source,
+    ht_dest,
     h0_indices,
     output_state_indices,
     intermediate_states_buffer,
@@ -203,19 +208,21 @@ def _fused_gdn_decode_update_kernel(
     contract); h0_indices ([B]) selects each batch entry's read row, ``-1``
     skipped (state contribution treated as zero -- mirrors flashinfer's
     float32 legacy decode path; output for that batch entry is undefined).
+    ``ht_dest`` is the K-last pool both output-state index forms address; it
+    may be ``h0_source`` itself.
 
     T=1 is a plain decode step; T>1 is an MTP verify step. Three independent,
     mutually-exclusive-by-convention state-output mechanisms:
     - HAS_OUTPUT_STATE_INDICES: after the LAST processed step, write to the
-      single row ``output_state_indices[i_n]`` (``[B]``-shaped; T=1 decode's
-      dual-index paging remap).
+      single ``ht_dest`` row ``output_state_indices[i_n]`` (``[B]``-shaped;
+      T=1 decode's dual-index paging remap).
     - CACHE_INTERMEDIATE_STATES: after EVERY step (every branch point under
       HAS_TREE), write to the batch-scoped
       ``intermediate_states_buffer[i_n, step]`` (``[B, T, HV, V, K]``,
       K-last -- matches flashinfer's MTP intermediate-state-buffer convention).
     - HAS_PER_TOKEN_OUTPUT_STATE_INDICES: after EVERY step, write directly to
-      the pool row ``per_token_output_state_indices[i_n, step]`` (``[B, T]``),
-      matching FlashInfer 0.6.15's ``ssm_state_indices`` contract.
+      the ``ht_dest`` row ``per_token_output_state_indices[i_n, step]``
+      (``[B, T]``), matching FlashInfer 0.6.15's ``ssm_state_indices`` contract.
     DISABLE_STATE_UPDATE additionally gates a final write-back to
     ``h0_indices[i_n]`` (the read row) when neither of the above applies.
 
@@ -324,18 +331,24 @@ def _fused_gdn_decode_update_kernel(
                             + o_k[:, None]
                         )
                         b_h = tl.load(p_parent, mask=mask_h, other=0).to(tl.float32)
-                else:
-                    row = tl.where(
-                        parent < 0,
-                        idx,
-                        tl.load(
-                            per_token_output_state_indices
-                            + i_n * T
-                            + tl.maximum(parent, 0)
-                        ).to(tl.int64),
-                    )
+                elif parent < 0:
                     p_parent = (
                         h0_source
+                        + idx * HV * V * K
+                        + i_hv * V * K
+                        + o_v[None, :] * K
+                        + o_k[:, None]
+                    )
+                    b_h = tl.load(p_parent, mask=mask_h & (idx >= 0), other=0).to(
+                        tl.float32
+                    )
+                else:
+                    # Non-root parents were written to the destination pool.
+                    row = tl.load(per_token_output_state_indices + i_n * T + parent).to(
+                        tl.int64
+                    )
+                    p_parent = (
+                        ht_dest
                         + row * HV * V * K
                         + i_hv * V * K
                         + o_v[None, :] * K
@@ -387,7 +400,7 @@ def _fused_gdn_decode_update_kernel(
             )
             if out_idx >= 0:
                 p_step_out = (
-                    h0_source
+                    ht_dest
                     + out_idx * HV * V * K
                     + i_hv * V * K
                     + o_v[None, :] * K
@@ -410,7 +423,7 @@ def _fused_gdn_decode_update_kernel(
         out_idx = tl.load(output_state_indices + i_n).to(tl.int64)
         if out_idx >= 0:
             p_out = (
-                h0_source
+                ht_dest
                 + out_idx * HV * V * K
                 + i_hv * V * K
                 + o_v[None, :] * K
@@ -440,6 +453,7 @@ def _launch_fused_gdn_decode_update(
     b: torch.Tensor,
     initial_state: torch.Tensor,
     initial_state_indices: torch.Tensor,
+    output_state: torch.Tensor | None,
     scale: float | None,
     use_qk_l2norm: bool,
     disable_state_update: bool,
@@ -451,7 +465,8 @@ def _launch_fused_gdn_decode_update(
     """Shared launcher for the ``gdn_decode_step`` (T=1) / ``gdn_decode_mtp``
     (T>1) Triton fallback kernels. q/k: [B, T, H, K]; v: [B, T, HV, V]; a/b:
     [B, T, HV]; initial_state is the K-last [pool_size, HV, V, K] SSM state
-    pool (the shared runtime contract -- see module docstring).
+    pool (the shared runtime contract -- see module docstring); output_state
+    is the K-last pool the output-state indices address (None: initial_state).
     """
     enable_pdl = pdl_enabled()
     B, T, H, K = q.shape
@@ -459,6 +474,12 @@ def _launch_fused_gdn_decode_update(
     V = v.shape[3]
     if scale is None:
         scale = K**-0.5
+    # The kernel addresses output rows densely (row * HV * V * K).
+    if output_state is not None and not output_state.is_contiguous():
+        raise ValueError(
+            "Triton GDN decode requires a contiguous output_state, got strides "
+            f"{output_state.stride()}"
+        )
 
     o = q.new_empty(B, T, HV, V)
 
@@ -482,6 +503,7 @@ def _launch_fused_gdn_decode_update(
         b=b,
         o=o,
         h0_source=initial_state,
+        ht_dest=initial_state if output_state is None else output_state,
         h0_indices=initial_state_indices,
         output_state_indices=output_state_indices,
         intermediate_states_buffer=intermediate_states_buffer,
@@ -525,6 +547,7 @@ def _launch_fused_gdn_decode_update(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
     priority=Priority.PORTABLE,
+    traits={"strided_qkv": frozenset({False, True})},
 )
 def triton_gdn_decode_step(
     q: torch.Tensor,
@@ -556,6 +579,7 @@ def triton_gdn_decode_step(
         b=b,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
+        output_state=None,
         scale=scale,
         use_qk_l2norm=use_qk_l2norm,
         disable_state_update=False,
@@ -581,6 +605,7 @@ def _gdn_tree_verify_chunked_kernel(
     h0_source,
     h0_indices,
     tree_ancestors,
+    replay,
     scale,
     T,
     H: tl.constexpr,
@@ -590,6 +615,7 @@ def _gdn_tree_verify_chunked_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     T_BLOCK: tl.constexpr,
+    HAS_REPLAY: tl.constexpr,
     LOG2_T_BLOCK: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
@@ -610,7 +636,8 @@ def _gdn_tree_verify_chunked_kernel(
     solving ``(I + beta * D_strict * k k^T) U = beta * (v - exp(G) * k h0)``,
     node t's output is ``exp(G_t) q_t h0 + sum_s D[t, s] (q_t . k_s) U_s``:
     the recurrence along that path, without its serial steps. The pool is left
-    untouched.
+    untouched. With ``HAS_REPLAY`` it also copies each node's k, v, a and b, as
+    loaded, into its ``replay`` row ``[k | v | a | b]`` (the ReplaySSM payload).
     """
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -641,17 +668,32 @@ def _gdn_tree_verify_chunked_kernel(
         + o_v[None, :] * V_STRIDES[3],
         mask=valid[:, None] & mask_v[None, :],
         other=0,
-    ).to(tl.float32)
+    )
     b_a = tl.load(
         a + i_n * A_STRIDES[0] + nodes * A_STRIDES[1] + i_hv * A_STRIDES[2],
         mask=valid,
         other=0,
-    ).to(tl.float32)
+    )
     b_b = tl.load(
         b + i_n * B_STRIDES[0] + nodes * B_STRIDES[1] + i_hv * B_STRIDES[2],
         mask=valid,
         other=0,
-    ).to(tl.float32)
+    )
+    REPLAY_WIDTH: tl.constexpr = H * K + HV * V + 2 * HV
+    p_replay = replay + (i_n * T + nodes).to(tl.int64) * REPLAY_WIDTH
+    # Gates come from each value head's first V tile, k from each key head's first value head.
+    writes_k = HAS_REPLAY & (i_v == 0) & (i_hv % (HV // H) == 0)
+    if HAS_REPLAY:
+        tl.store(
+            p_replay[:, None] + H * K + i_hv * V + o_v[None, :],
+            b_v,
+            mask=valid[:, None] & mask_v[None, :],
+        )
+        tl.store(p_replay + H * K + HV * V + i_hv, b_a, mask=valid & (i_v == 0))
+        tl.store(p_replay + H * K + HV * V + HV + i_hv, b_b, mask=valid & (i_v == 0))
+    b_v = b_v.to(tl.float32)
+    b_a = b_a.to(tl.float32)
+    b_b = b_b.to(tl.float32)
     bits = tl.load(tree_ancestors + i_n * T + nodes, mask=valid, other=0)
 
     r_q = tl.full([T_BLOCK], 1.0, tl.float32) * scale
@@ -681,6 +723,10 @@ def _gdn_tree_verify_chunked_kernel(
         c_q = tl.load(p_q + o_k[None, :] * Q_STRIDES[3], mask=mask_qk, other=0)
         c_q = c_q.to(tl.float32) * r_q[:, None]
         c_k = tl.load(p_k + o_k[None, :] * K_STRIDES[3], mask=mask_qk, other=0)
+        if HAS_REPLAY:
+            tl.store(
+                p_replay[:, None] + i_h * K + o_k[None, :], c_k, mask=mask_qk & writes_k
+            )
         c_k = c_k.to(tl.float32) * r_k[:, None]
         # The K-last pool row loads as [BV, BK] with K contiguous.
         c_h = tl.load(
@@ -753,16 +799,29 @@ def _launch_gdn_tree_verify_chunked(
     scale: float | None,
     use_qk_l2norm: bool,
     tree_ancestors: torch.Tensor,
+    replay_payload: torch.Tensor | None,
 ) -> torch.Tensor:
     enable_pdl = pdl_enabled()
     B, T, H, K = q.shape
     HV, V = v.shape[2], v.shape[3]
     if scale is None:
         scale = K**-0.5
+    if replay_payload is not None and (
+        replay_payload.shape != (B * T, H * K + HV * V + 2 * HV)
+        or not replay_payload.is_contiguous()
+        or {replay_payload.dtype, k.dtype, v.dtype, a.dtype, b.dtype} != {q.dtype}
+    ):
+        raise ValueError(
+            "replay_payload must be a contiguous [B * T, H * K + HV * V + 2 * HV] "
+            "tensor of the dtype of q, k, v, a and b"
+        )
     o = q.new_empty(B, T, HV, V)
     # Once the (request, head) programs outnumber the SMs, fewer and wider V tiles are faster.
     wide = B * HV > current_platform().sm_count
     BV = min(triton.next_power_of_2(V), 128 if wide else 64)
+    # Half-width V tiles (>= 16 for tl.dot) fill the SMs at a few requests, up to two programs per SM.
+    if BV >= 32 and triton.cdiv(V, BV // 2) * B * HV <= 2 * current_platform().sm_count:
+        BV //= 2
     T_BLOCK = triton.next_power_of_2(GDN_TREE_VERIFY_CHUNKED_MAX_NODES)
     _gdn_tree_verify_chunked_kernel[(triton.cdiv(V, BV), B * HV)](
         A_log=A_log,
@@ -778,6 +837,7 @@ def _launch_gdn_tree_verify_chunked(
         h0_source=initial_state,
         h0_indices=initial_state_indices,
         tree_ancestors=tree_ancestors,
+        replay=o if replay_payload is None else replay_payload,
         scale=scale,
         T=T,
         H=H,
@@ -787,6 +847,7 @@ def _launch_gdn_tree_verify_chunked(
         BK=min(triton.next_power_of_2(K), 32),
         BV=BV,
         T_BLOCK=T_BLOCK,
+        HAS_REPLAY=replay_payload is not None,
         LOG2_T_BLOCK=T_BLOCK.bit_length() - 1,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm,
         # Three TF32 products per FP32 one keep FP32 accuracy on tensor cores.
@@ -799,6 +860,11 @@ def _launch_gdn_tree_verify_chunked(
         ENABLE_PDL=enable_pdl,
         num_warps=4,
         **({"launch_pdl": True} if enable_pdl else {}),
+        **(
+            {"maxnreg": _TREE_VERIFY_REPLAY_MAX_REGISTERS}
+            if replay_payload is not None and current_platform().is_nvidia
+            else {}
+        ),
     )
     return o
 
@@ -813,6 +879,10 @@ def _launch_gdn_tree_verify_chunked(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
     priority=Priority.PORTABLE,
+    traits={
+        "separate_output_state": frozenset({False, True}),
+        "strided_qkv": frozenset({False, True}),
+    },
 )
 def triton_gdn_decode_mtp(
     q: torch.Tensor,
@@ -830,13 +900,16 @@ def triton_gdn_decode_mtp(
     use_qk_l2norm: bool = True,
     intermediate_states_buffer: torch.Tensor | None = None,
     output_state_indices: torch.Tensor | None = None,
+    output_state: torch.Tensor | None = None,
     tree_ancestors: torch.Tensor | None,
+    replay_payload: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Portable Triton fallback for ``gdn_decode_mtp`` (see
     ``flashinfer/gated_delta_rule.py`` for the shared contract). Supports both
     batch-scoped intermediate-state caching and direct per-token pool scatter
     through ``output_state_indices``, and draft trees: ReplaySSM trees given no
-    ``intermediate_states_buffer`` in the chunked form, the others step by step.
+    ``intermediate_states_buffer`` in the chunked form, which also fills
+    ``replay_payload``, the others step by step.
     """
     if (
         tree_ancestors is not None
@@ -856,7 +929,10 @@ def triton_gdn_decode_mtp(
             scale=scale,
             use_qk_l2norm=use_qk_l2norm,
             tree_ancestors=tree_ancestors,
+            replay_payload=replay_payload,
         )
+    if replay_payload is not None:
+        raise ValueError("only a chunked ReplaySSM tree verify fills replay_payload")
     return _launch_fused_gdn_decode_update(
         q,
         k,
@@ -867,6 +943,7 @@ def triton_gdn_decode_mtp(
         b=b,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
+        output_state=output_state,
         scale=scale,
         use_qk_l2norm=use_qk_l2norm,
         disable_state_update=disable_state_update,
@@ -882,7 +959,7 @@ def triton_gdn_decode_mtp(
 # ===-----------------------------------------------------------------------===#
 
 
-@triton.jit(do_not_specialize=["B", "T", "PAYLOAD_LAYER_STRIDE"])
+@gluon.jit(do_not_specialize=["B", "T", "PAYLOAD_LAYER_STRIDE"])
 def _gdn_replay_commit_kernel(
     payload,
     parameters,
@@ -894,101 +971,245 @@ def _gdn_replay_commit_kernel(
     B,
     T,
     PAYLOAD_LAYER_STRIDE,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    STATE_DTYPE_CODE: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
+    H: gl.constexpr,
+    HV: gl.constexpr,
+    K: gl.constexpr,
+    V: gl.constexpr,
+    BK: gl.constexpr,
+    BV: gl.constexpr,
+    STATE_DTYPE_CODE: gl.constexpr,
+    ENABLE_PDL: gl.constexpr,
+    WARP_SIZE: gl.constexpr,
+    THREADS_V: gl.constexpr,
+    SPT_K: gl.constexpr,
+    TOKENS_PER_CHUNK: gl.constexpr,
 ):
     """Recompute accepted GDN states with one Triton program per state tile."""
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
         # Release successor setup; its wait still guards all dependent reads.
         tl.extra.cuda.gdc_launch_dependents()
-    i_lnh, i_v, i_k = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_hv = i_lnh % HV
-    i_ln = i_lnh // HV
-    i_n = i_ln % B
-    i_l = i_ln // B
+    # Keep batch out of grid division so serving batch changes remain runtime.
+    i_hv = (gl.program_id(0) // gl.cdiv(V, BV)) % HV
+    i_v = gl.program_id(0) % gl.cdiv(V, BV)
+    i_k = 0
+    i_n = gl.program_id(0) // (HV * gl.cdiv(V, BV))
+    i_l = gl.program_id(1)
     i_h = i_hv // (HV // H)
 
-    o_k = i_k * BK + tl.arange(0, BK)
-    o_v = i_v * BV + tl.arange(0, BV)
+    # Adjacent CTAs cover contiguous V tiles; lanes own contiguous K.
+    # Warps own independent V columns.
+    layout: gl.constexpr = gl.BlockedLayout(
+        [SPT_K, 1], [WARP_SIZE // THREADS_V, THREADS_V], [1, gl.num_warps()], [0, 1]
+    )
+    o_k = i_k * BK + gl.arange(0, BK, layout=gl.SliceLayout(1, layout))
+    o_v = i_v * BV + gl.arange(0, BV, layout=gl.SliceLayout(0, layout))
     mask_k = o_k < K
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
 
-    key_width: tl.constexpr = H * K
-    value_width: tl.constexpr = HV * V
-    payload_width: tl.constexpr = key_width + value_width + 2 * HV
-    layer_base = i_l.to(tl.int64) * PAYLOAD_LAYER_STRIDE
-    request_base = layer_base + i_n.to(tl.int64) * T * payload_width
-    p_k = payload + request_base + i_h * K + o_k
-    p_v = payload + request_base + key_width + i_hv * V + o_v
-    p_a = payload + request_base + key_width + value_width + i_hv
-    p_b = p_a + HV
+    key_width: gl.constexpr = H * K
+    value_width: gl.constexpr = HV * V
+    payload_width: gl.constexpr = key_width + value_width + 2 * HV
+    layer_base = i_l.to(gl.int64) * PAYLOAD_LAYER_STRIDE
+    request_base = layer_base + i_n.to(gl.int64) * T * payload_width
 
     layer_request = i_l * B + i_n
-    read_idx = tl.load(read_indices + layer_request).to(tl.int64)
-    steps = tl.load(accepted_length + i_n).to(tl.int32)
-    steps = tl.minimum(tl.maximum(steps, 0), T)
-    state_address = tl.load(state_addresses + i_l)
+    read_idx = gl.load(read_indices + layer_request).to(gl.int64)
+    steps = gl.load(accepted_length + i_n).to(gl.int32)
+    steps = gl.minimum(gl.maximum(steps, 0), T)
+    state_address = gl.load(state_addresses + i_l)
     if STATE_DTYPE_CODE == 0:
-        state_pool = state_address.to(tl.pointer_type(tl.bfloat16))
+        state_pool = state_address.to(gl.pointer_type(gl.bfloat16))
     elif STATE_DTYPE_CODE == 1:
-        state_pool = state_address.to(tl.pointer_type(tl.float16))
+        state_pool = state_address.to(gl.pointer_type(gl.float16))
     else:
-        state_pool = state_address.to(tl.pointer_type(tl.float32))
-    state_row_stride = tl.load(state_row_strides + i_l).to(tl.int64)
-    b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    if read_idx >= 0:
-        p_h0 = (
-            state_pool
-            + read_idx * state_row_stride
-            + i_hv * V * K
-            + o_v[None, :] * K
-            + o_k[:, None]
-        )
-        b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
-
+        state_pool = state_address.to(gl.pointer_type(gl.float32))
+    state_row_stride = gl.load(state_row_strides + i_l).to(gl.int64)
     parameter_base = i_l * 2 * HV + i_hv
-    b_A_log = tl.load(parameters + parameter_base).to(tl.float32)
-    b_dt_bias = tl.load(parameters + parameter_base + HV).to(tl.float32)
-    for _ in range(0, steps):
-        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-        b_a = tl.load(p_a).to(tl.float32)
-        b_beta_raw = tl.load(p_b).to(tl.float32)
-
-        x = b_a + b_dt_bias
-        softplus_x = tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
-        b_g = -tl.exp(b_A_log) * softplus_x
-        b_beta = 1.0 / (1.0 + tl.exp(-b_beta_raw))
-        b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
-
-        next_h = b_h * tl.exp(b_g)
-        delta = b_v - tl.sum(next_h * b_k[:, None], 0)
-        next_h += b_k[:, None] * (delta * b_beta)[None, :]
-        b_h = next_h
-
-        p_k += payload_width
-        p_v += payload_width
-        p_a += payload_width
-        p_b += payload_width
-
-    write_idx = tl.load(write_indices + layer_request).to(tl.int64)
-    if write_idx >= 0:
-        p_out = (
-            state_pool
-            + write_idx * state_row_stride
-            + i_hv * V * K
-            + o_v[None, :] * K
-            + o_k[:, None]
+    raw_A = gl.load(parameters + parameter_base).to(gl.float32)
+    b_dt_bias = gl.load(parameters + parameter_base + HV).to(gl.float32)
+    write_idx = gl.load(write_indices + layer_request).to(gl.int64)
+    # Pool row strides can break alignment; check each actual row address.
+    STATE_BITS: gl.constexpr = 32 if STATE_DTYPE_CODE == 2 else 16
+    PACK: gl.constexpr = 64 // STATE_BITS
+    PACK_WORDS: gl.constexpr = SPT_K // PACK
+    STATE_ALIGNMENT: gl.constexpr = 8 * PACK_WORDS
+    if STATE_DTYPE_CODE == 2 and K % PACK == 0:
+        # Each 64-bit word holds two FP32 elements.
+        packed_3d: gl.constexpr = gl.BlockedLayout(
+            [PACK_WORDS, PACK, 1],
+            [WARP_SIZE // THREADS_V, 1, THREADS_V],
+            [1, 1, gl.num_warps()],
+            [1, 0, 2],
         )
-        tl.store(p_out, b_h.to(p_out.dtype.element_ty), mask=mask_h)
+        packed_layout: gl.constexpr = gl.SliceLayout(1, packed_3d)
+        packed_k = i_k * (BK // PACK) + gl.arange(
+            0, BK // PACK, layout=gl.SliceLayout(1, packed_layout)
+        )
+        packed_v = i_v * BV + gl.arange(0, BV, layout=gl.SliceLayout(0, packed_layout))
+        pack_shift = (
+            gl.arange(0, PACK, layout=gl.SliceLayout(0, gl.SliceLayout(2, packed_3d)))
+            * STATE_BITS
+        )
+        packed_mask = (packed_k < K // PACK)[:, None] & (packed_v < V)[None, :]
+    b_h = gl.zeros([BK, BV], dtype=gl.float32, layout=layout)
+    if read_idx >= 0:
+        base = state_pool + read_idx * state_row_stride + i_hv * V * K
+        if K % PACK == 0:
+            if (base.to(gl.uint64) & (STATE_ALIGNMENT - 1)) == 0:
+                # Unsigned pointers isolate alignment hints from the fallback.
+                if STATE_DTYPE_CODE == 2:
+                    packed_ptr = base.to(gl.pointer_type(gl.uint64))
+                    packed_ptr = gl.multiple_of(packed_ptr, STATE_ALIGNMENT)
+                    raw = gl.load(
+                        packed_ptr
+                        + packed_v[None, :] * (K // PACK)
+                        + packed_k[:, None],
+                        mask=packed_mask,
+                        other=0,
+                    )
+                    bits = raw[:, None, :] >> pack_shift[None, :, None]
+                    values = bits.to(gl.uint32).to(gl.float32, bitcast=True)
+                    b_h = gl.convert_layout(gl.reshape(values, [BK, BV]), layout)
+                else:
+                    aligned_ptr = base.to(gl.pointer_type(gl.uint16))
+                    aligned_ptr = gl.multiple_of(aligned_ptr, STATE_ALIGNMENT)
+                    raw = gl.load(
+                        aligned_ptr + o_v[None, :] * K + o_k[:, None],
+                        mask=mask_h,
+                        other=0,
+                    )
+                    if STATE_DTYPE_CODE == 0:
+                        b_h = raw.to(gl.bfloat16, bitcast=True).to(gl.float32)
+                    else:
+                        b_h = raw.to(gl.float16, bitcast=True).to(gl.float32)
+            else:
+                p_h0 = base + o_v[None, :] * K + o_k[:, None]
+                b_h = gl.load(p_h0, mask=mask_h, other=0).to(gl.float32)
+        else:
+            p_h0 = base + o_v[None, :] * K + o_k[:, None]
+            b_h = gl.load(p_h0, mask=mask_h, other=0).to(gl.float32)
+
+    b_A = -gl.exp(raw_A)
+    # Preserve normalization order while matching shared reads to state packing.
+    key_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 2 if STATE_DTYPE_CODE == 2 else 4],
+        [THREADS_V, WARP_SIZE // THREADS_V],
+        [gl.num_warps(), 1],
+        [1, 0],
+    )
+    key_read_layout: gl.constexpr = gl.BlockedLayout(
+        [1, SPT_K], [THREADS_V, WARP_SIZE // THREADS_V], [gl.num_warps(), 1], [1, 0]
+    )
+    value_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 2], [4, WARP_SIZE // 4], [1, gl.num_warps()], [1, 0]
+    )
+    shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    shared_k = gl.allocate_shared_memory(
+        gl.float32, [TOKENS_PER_CHUNK, BK], shared_layout
+    )
+    shared_v = gl.allocate_shared_memory(
+        gl.float32, [TOKENS_PER_CHUNK, BV], shared_layout
+    )
+    key_nodes = gl.arange(0, TOKENS_PER_CHUNK, layout=gl.SliceLayout(1, key_layout))
+    keys = gl.arange(0, BK, layout=gl.SliceLayout(0, key_layout))
+    value_nodes = gl.arange(0, TOKENS_PER_CHUNK, layout=gl.SliceLayout(1, value_layout))
+    values = i_v * BV + gl.arange(0, BV, layout=gl.SliceLayout(0, value_layout))
+    for start in range(0, steps, TOKENS_PER_CHUNK):
+        key_tokens = start + key_nodes
+        key_rows = payload + request_base + key_tokens.to(gl.int64) * payload_width
+        keys_raw = gl.load(
+            key_rows[:, None] + i_h * K + keys[None, :],
+            mask=(key_tokens < steps)[:, None] & (keys < K)[None, :],
+            other=0,
+        ).to(gl.float32)
+        keys_normalized = (
+            keys_raw / gl.sqrt(gl.sum(keys_raw * keys_raw, 1) + 1e-6)[:, None]
+        )
+        shared_k.store(keys_normalized)
+        value_tokens = start + value_nodes
+        value_rows = payload + request_base + value_tokens.to(gl.int64) * payload_width
+        values_raw = gl.load(
+            value_rows[:, None] + key_width + i_hv * V + values[None, :],
+            mask=(value_tokens < steps)[:, None] & (values < V)[None, :],
+            other=0,
+        ).to(gl.float32)
+        shared_v.store(values_raw)
+        raw_a = gl.load(
+            key_rows + key_width + value_width + i_hv, mask=key_tokens < steps, other=0
+        ).to(gl.float32)
+        raw_b = gl.load(
+            key_rows + key_width + value_width + HV + i_hv,
+            mask=key_tokens < steps,
+            other=0,
+        ).to(gl.float32)
+        x = raw_a + b_dt_bias
+        softplus = gl.where(x <= 20.0, gl.log(1.0 + gl.exp(x)), x)
+        decay = gl.exp(b_A * softplus)
+        beta = 1.0 / (1.0 + gl.exp(-raw_b))
+        gate_layout: gl.constexpr = gl.BlockedLayout(
+            [1], [WARP_SIZE], [gl.num_warps()], [0]
+        )
+        decay = gl.convert_layout(decay, gate_layout)
+        beta = gl.convert_layout(beta, gate_layout)
+        gl.barrier()
+        for step in gl.static_range(0, TOKENS_PER_CHUNK):
+            if start + step < steps:
+                index = gl.full([1], step, gl.int32, layout=gate_layout)
+                b_decay = gl.sum(gl.gather(decay, index, 0), 0)
+                b_beta = gl.sum(gl.gather(beta, index, 0), 0)
+                b_k = gl.convert_layout(
+                    gl.reshape(shared_k.slice(step, 1).load(key_read_layout), [BK]),
+                    gl.SliceLayout(1, layout),
+                )
+                b_v = gl.convert_layout(
+                    gl.reshape(shared_v.slice(step, 1).load(layout), [BV]),
+                    gl.SliceLayout(0, layout),
+                )
+                next_h = b_h * b_decay
+                delta = b_v - gl.sum(next_h * b_k[:, None], 0)
+                next_h += b_k[:, None] * (delta * b_beta)[None, :]
+                b_h = next_h
+        # Finish every consumer before overwriting the next shared chunk.
+        gl.barrier()
+
+    if write_idx >= 0:
+        base = state_pool + write_idx * state_row_stride + i_hv * V * K
+        if K % PACK == 0:
+            if (base.to(gl.uint64) & (STATE_ALIGNMENT - 1)) == 0:
+                # Unsigned pointers isolate alignment hints from the fallback.
+                if STATE_DTYPE_CODE == 2:
+                    packed_ptr = base.to(gl.pointer_type(gl.uint64))
+                    packed_ptr = gl.multiple_of(packed_ptr, STATE_ALIGNMENT)
+                    packed_values = gl.convert_layout(
+                        gl.reshape(b_h, [BK // PACK, PACK, BV]), packed_3d
+                    )
+                    bits = packed_values.to(gl.uint32, bitcast=True).to(gl.uint64)
+                    raw = gl.sum(bits << pack_shift[None, :, None], 1)
+                    gl.store(
+                        packed_ptr
+                        + packed_v[None, :] * (K // PACK)
+                        + packed_k[:, None],
+                        raw,
+                        mask=packed_mask,
+                    )
+                else:
+                    aligned_ptr = base.to(gl.pointer_type(gl.uint16))
+                    if STATE_DTYPE_CODE == 0:
+                        bits = b_h.to(gl.bfloat16).to(gl.uint16, bitcast=True)
+                    else:
+                        bits = b_h.to(gl.float16).to(gl.uint16, bitcast=True)
+                    aligned_ptr = gl.multiple_of(aligned_ptr, STATE_ALIGNMENT)
+                    gl.store(
+                        aligned_ptr + o_v[None, :] * K + o_k[:, None], bits, mask=mask_h
+                    )
+            else:
+                p_out = base + o_v[None, :] * K + o_k[:, None]
+                gl.store(p_out, b_h.to(p_out.dtype.element_ty), mask=mask_h)
+        else:
+            p_out = base + o_v[None, :] * K + o_k[:, None]
+            gl.store(p_out, b_h.to(p_out.dtype.element_ty), mask=mask_h)
 
 
 @register_kernel(
@@ -1045,6 +1266,11 @@ def triton_gdn_replay_commit(
         address in one kernel launch.
     """
     enable_pdl = pdl_enabled()
+    wide_state = (
+        current_platform().is_nvidia
+        and state_dtype != torch.float32
+        and head_k_dim == 128
+    )
     num_layers = payload.shape[0]
     batch_size = accepted_length.numel()
     state_dtype_codes = {
@@ -1056,12 +1282,11 @@ def triton_gdn_replay_commit(
         raise ValueError(f"unsupported GDN replay state dtype: {state_dtype}")
 
     BK = triton.next_power_of_2(head_k_dim)
-    # The replay is latency-bound; narrow V tiles keep more programs in flight.
-    BV = min(triton.next_power_of_2(head_v_dim), 16)
+    BV = min(triton.next_power_of_2(head_v_dim), 64)
     NK, NV = triton.cdiv(head_k_dim, BK), triton.cdiv(head_v_dim, BV)
     if NK != 1:
         raise ValueError("GDN replay does not support head dimensions above one tile")
-    _gdn_replay_commit_kernel[(num_layers * batch_size * num_v_heads, NV, NK)](
+    _gdn_replay_commit_kernel[(batch_size * num_v_heads * NV, num_layers)](
         payload=payload,
         parameters=parameters,
         state_addresses=state_addresses,
@@ -1079,8 +1304,17 @@ def triton_gdn_replay_commit(
         BK=BK,
         BV=BV,
         STATE_DTYPE_CODE=state_dtype_codes[state_dtype],
-        num_warps=1,
+        num_warps=4,
         num_stages=3,
         ENABLE_PDL=enable_pdl,
+        TOKENS_PER_CHUNK=8,
+        WARP_SIZE=triton.runtime.driver.active.get_current_target().warp_size,
+        THREADS_V=4,
+        SPT_K=(
+            (4 if current_platform().is_nvidia and head_k_dim == 128 else 2)
+            if state_dtype == torch.float32
+            else (8 if wide_state else 4)
+        ),
         **({"launch_pdl": True} if enable_pdl else {}),
+        **({"maxnreg": 128, "sched4reg": True} if wide_state else {}),
     )

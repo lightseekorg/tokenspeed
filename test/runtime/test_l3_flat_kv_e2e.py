@@ -27,13 +27,15 @@ packed Host CacheBlocks.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import sys
 import threading
 import time
-import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -41,8 +43,8 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
-class L3FlatKvRoundTripTest(unittest.TestCase):
-    def setUp(self):
+class TestL3FlatKvRoundTripTest:
+    def setup_method(self):
         try:
             import torch
 
@@ -55,9 +57,9 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
                 CacheTransferLayout,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
+            pytest.skip(f"needs runtime dependencies: {exc}")
         if not torch.cuda.is_available():
-            self.skipTest("needs a CUDA device")
+            pytest.skip("needs a CUDA device")
         self.torch = torch
         self.executor_module = executor_module
         self.no_pool = RetractionPoolRequest(
@@ -71,7 +73,10 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         self.CacheGroupLayout = CacheGroupLayout
         self.CacheTransferLayout = CacheTransferLayout
 
-    def test_d2h_backup_host_wipe_prefetch_h2d_restores_bytes(self):
+    @pytest.mark.parametrize("capacity_pressure", [False, True])
+    def test_d2h_backup_host_wipe_prefetch_h2d_restores_bytes(
+        self, request, capacity_pressure
+    ):
         torch = self.torch
         first = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
         second = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
@@ -97,6 +102,10 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         )
 
         class SyntheticPool:
+            def __init__(self):
+                self.load_tracker = None
+                self.arena = None
+
             def cache_transfer_layout(self):
                 return layout
 
@@ -130,8 +139,47 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
                 io_backend="direct",
                 attn_tp_rank=0,
                 kvp_rank=0,
+                nprocs_per_node=1,
+                world_cpu_group=None,
             )
         store = self.MemoryKvStore()
+        retry_started = threading.Event()
+        release_retry = threading.Event()
+        if capacity_pressure:
+            from tokenspeed.runtime.cache.l3.mooncake import MooncakeKvStore
+
+            class RpcStore:
+                def __init__(self):
+                    self.objects = {}
+                    self.failed = False
+
+                def batch_is_exist(self, keys):
+                    return [int(key in self.objects) for key in keys]
+
+                def batch_put_from(self, keys, ptrs, sizes):
+                    if self.failed:
+                        retry_started.set()
+                        if not release_retry.wait(timeout=10):
+                            raise TimeoutError("test did not release capacity retry")
+                    results = []
+                    for key, ptr, size in zip(keys, ptrs, sizes):
+                        if not self.failed:
+                            self.failed = True
+                            results.append(-200)
+                        else:
+                            self.objects[key] = ctypes.string_at(ptr, size)
+                            results.append(0)
+                    return results
+
+                def batch_get_into(self, keys, ptrs, sizes):
+                    for key, ptr, size in zip(keys, ptrs, sizes):
+                        payload = self.objects[key]
+                        assert len(payload) == size
+                        ctypes.memmove(ptr, payload, size)
+                    return list(sizes)
+
+            store = object.__new__(MooncakeKvStore)
+            store.store = RpcStore()
         executor.attach_l3_storage(
             store,
             key_prefix="e2e",
@@ -141,13 +189,14 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
             prefetch_timeout_per_page_s=0.0,
             prefetch_batch_pages=128,
         )
-        self.addCleanup(executor.shutdown)
+        request.addfinalizer(executor.shutdown)
+        request.addfinalizer(release_retry.set)
 
         # A CUDA fence cannot complete a CPU storage future. Hold PUT until
         # the test observes the pending ACK, then let normal polling finish it.
         put_started = threading.Event()
         release_put = threading.Event()
-        self.addCleanup(release_put.set)
+        request.addfinalizer(release_put.set)
         backend = executor.l3_store.backend
         original_put = backend.batch_put_from
 
@@ -159,7 +208,7 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
 
         put_patch = patch.object(backend, "batch_put_from", gated_put)
         put_patch.start()
-        self.addCleanup(put_patch.stop)
+        request.addfinalizer(put_patch.stop)
 
         first[16:20].fill_(0x11)
         second[28:34].fill_(0x12)
@@ -182,56 +231,63 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         )
         executor.write_stream.synchronize()
         write_results = executor.poll_results()
-        self.assertEqual(write_results, [])
-        self.assertTrue(put_started.wait(timeout=10), "L3 backup did not start")
+        assert (write_results) == ([])
+        assert put_started.wait(timeout=10), "L3 backup did not start"
         release_put.set()
+        if capacity_pressure:
+            assert retry_started.wait(timeout=2), "capacity failure was not retried"
+            assert executor.poll_results() == []
+            assert not executor.consume_backup_poll_failure()
+            assert executor.l3_backup_backlog().pending_pages == 3
+            release_retry.set()
         deadline = time.monotonic() + 10
         while not write_results and time.monotonic() < deadline:
             write_results = executor.poll_results()
             if not write_results:
                 time.sleep(0.001)
-        self.assertEqual([int(event.op_id) for event in write_results], [7])
-        self.assertEqual(executor.l3_store.exists(backup_pages), [True, True, True])
+        assert ([int(event.op_id) for event in write_results]) == ([7])
+        assert not executor.consume_backup_poll_failure()
+        assert (executor.l3_store.exists(backup_pages)) == ([True, True, True])
 
         # Prove restore comes from L3, not leftover Host bytes.
         executor.host_storage.host_buffer.fill_(0)
         first.fill_(0xEE)
         second.fill_(0xEE)
         torch.cuda.synchronize()
-        self.assertFalse(bool(executor.host_storage.host_buffer.any().item()))
+        assert not (bool(executor.host_storage.host_buffer.any().item()))
 
-        self.assertEqual(executor.l3_store.prefetch(backup_pages), [True, True, True])
-        self.assertTrue(bool(executor.host_storage.host_buffer.any().item()))
+        assert (executor.l3_store.prefetch(backup_pages)) == ([True, True, True])
+        assert bool(executor.host_storage.host_buffer.any().item())
 
         load_index = executor._start_loading(  # pylint: disable=protected-access
             [9],
             [(0, 2, 1), (0, 5, 4), (1, 4, 3)],
             prerequisite_stream=torch.cuda.current_stream(),
         )
-        self.assertIsNotNone(load_index)
+        assert (load_index) is not None
         pool.load_tracker.set_consumers(load_index)
         pool.load_tracker.wait_for_layer(0)
         pool.load_tracker.wait_for_layer(1)
         torch.cuda.synchronize()
         load_results = executor.poll_results()
-        self.assertEqual([int(event.op_id) for event in load_results], [9])
+        assert ([int(event.op_id) for event in load_results]) == ([9])
 
-        self.assertTrue(
-            torch.equal(first[24:28].cpu(), torch.full((4,), 0x11, dtype=torch.uint8))
+        assert torch.equal(
+            first[24:28].cpu(), torch.full((4,), 0x11, dtype=torch.uint8)
         )
-        self.assertTrue(
-            torch.equal(second[40:46].cpu(), torch.full((6,), 0x12, dtype=torch.uint8))
+        assert torch.equal(
+            second[40:46].cpu(), torch.full((6,), 0x12, dtype=torch.uint8)
         )
-        self.assertTrue(
-            torch.equal(first[48:52].cpu(), torch.full((4,), 0x41, dtype=torch.uint8))
+        assert torch.equal(
+            first[48:52].cpu(), torch.full((4,), 0x41, dtype=torch.uint8)
         )
-        self.assertTrue(
-            torch.equal(second[76:82].cpu(), torch.full((6,), 0x42, dtype=torch.uint8))
+        assert torch.equal(
+            second[76:82].cpu(), torch.full((6,), 0x42, dtype=torch.uint8)
         )
-        self.assertTrue(
-            torch.equal(first[104:109].cpu(), torch.full((5,), 0x73, dtype=torch.uint8))
+        assert torch.equal(
+            first[104:109].cpu(), torch.full((5,), 0x73, dtype=torch.uint8)
         )
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

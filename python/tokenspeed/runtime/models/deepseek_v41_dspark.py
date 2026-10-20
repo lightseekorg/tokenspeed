@@ -49,8 +49,6 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from tokenspeed.runtime.models.deepseek_v4_dspark import DeepseekV4DSparkModel
-from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import DSparkVanillaMarkov
 from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41ForCausalLM,
     DeepseekV41Model,
@@ -61,6 +59,7 @@ from tokenspeed.runtime.models.deepseek_v41 import (
     v41_mxfp8_config,
     v41_quantize_fp8,
 )
+from tokenspeed.runtime.models.deepseek_v41_dspark_heads import DSparkVanillaMarkov
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.utils import add_prefix
 
@@ -125,7 +124,7 @@ class _WindowAttention:
     def query_metadata(self, mode):
         return self.meta
 
-    def _workspace(self, swa, positions, swa_rope_cache):
+    def _workspace(self, swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps):
         """Per-request ``[batch, window + block, head_dim]`` BF16 rows.
 
         History rows are gathered straight from the strided paged field; the
@@ -137,8 +136,8 @@ class _WindowAttention:
         if swa.is_cuda and swa.shape[-1] == 512:
             rows = dsv41.dspark_rows(
                 swa,
-                None,
-                None,
+                swa_norm_weight,
+                swa_norm_eps if swa_norm_weight is not None else None,
                 positions if swa_rope_cache is not None else None,
                 swa_rope_cache,
                 None,
@@ -146,6 +145,9 @@ class _WindowAttention:
                 torch.empty_like(swa),
             )
         else:
+            if swa_norm_weight is not None:
+                # The model defers the SWA norm only to the fused CUDA rows.
+                raise ValueError("A deferred SWA norm requires 512-wide CUDA rows")
             if swa_rope_cache is not None:
                 swa = rope_inplace(swa.clone(), positions, swa_rope_cache, None)
             rows = _quantized_kv(swa)
@@ -166,13 +168,22 @@ class _WindowAttention:
         softmax_scale,
         index_process_group,
         swa_rope_cache,
+        swa_norm_weight,
+        swa_norm_eps,
+        out_rope_cache=None,
     ):
         if index_q is not None or index_weights is not None:
             raise ValueError("DSpark window attention has no indexer")
-        kv = self._workspace(swa, positions, swa_rope_cache)
+        kv = self._workspace(
+            swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps
+        )
         if q.is_cuda and q.shape[-1] == 512:
-            return self._kernel_forward(q, kv, attn_sink, softmax_scale)
-        return self._reference_forward(q, kv, attn_sink, softmax_scale)
+            out = self._kernel_forward(q, kv, attn_sink, softmax_scale)
+        else:
+            out = self._reference_forward(q, kv, attn_sink, softmax_scale)
+        if out_rope_cache is not None:
+            rope_inplace(out, positions, out_rope_cache, None)
+        return out
 
     def _kernel_forward(self, q, kv, attn_sink, softmax_scale):
         """The target's prefill workspace kernel over ``[history, block]`` rows.
@@ -196,6 +207,7 @@ class _WindowAttention:
             None,
             kv.view(-1, 1, kv.shape[-1]),
             self.selection.indices,
+            lse=None,
         )
 
     def _reference_forward(self, q, kv, attn_sink, softmax_scale):
@@ -214,11 +226,34 @@ class _WindowAttention:
 
 
 class DeepseekV41DSparkModel(DeepseekV41Model):
-    local_base_logits = DeepseekV4DSparkModel.local_base_logits
+    def local_base_logits(
+        self,
+        hidden_states: torch.Tensor,
+        head: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute public FP32 base logits from the local vocabulary shard.
+
+        ``head`` is the target's BF16 shard shared with the draft. BF16
+        products are exact in FP32, so accumulating them in FP32 reproduces
+        the reference's FP32 head GEMM up to summation order without keeping
+        an FP32 copy of the head.
+        """
+
+        if head.ndim != 2 or head.dtype != hidden_states.dtype:
+            raise ValueError(
+                "DSpark base logits need a rank-2 head in the hidden dtype; got "
+                f"{tuple(head.shape)} {head.dtype} for {hidden_states.dtype}."
+            )
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        if flat.is_cuda:
+            logits = torch.mm(flat, head.T, out_dtype=torch.float32)
+        else:
+            logits = flat.float() @ head.float().T
+        return logits.view(*hidden_states.shape[:-1], head.shape[0])
 
     def __init__(self, config, mapping, quant_config, prefix):
-        if mapping.attn.dp_size != 1 or mapping.pp_size != 1:
-            raise NotImplementedError("V4.1 DSpark requires attention DP=PP=1")
+        if mapping.pp_size != 1:
+            raise NotImplementedError("V4.1 DSpark requires PP=1")
         stages = int(config.dspark_num_stages)
         block_size = int(config.dspark_block_size)
         taps = tuple(config.dspark_target_layer_ids)

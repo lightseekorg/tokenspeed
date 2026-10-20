@@ -30,7 +30,7 @@ The scheduler records these phases:
 | `kv.build` | Attention backend and KV pool construction, including rebinds |
 | `executor.init` | Executor construction |
 | `kernels.autotune` | Startup tactic selection |
-| `graph.probe_rebind` | Optional partial capture probe, release and KV rebind |
+| `graph.probe_rebind` | Optional partial capture probe, release, and KV rebind |
 | `graph.capture` | Final serving graph capture |
 
 Detailed weight phases currently cover the default loader. Other loaders still
@@ -48,14 +48,14 @@ With the existing Triton compile monitor enabled, end records also contain
 the span. A disabled monitor produces `null`, not zero. These are process-wide,
 inclusive observations, not a cache-hit ratio or total backend compilation time.
 In particular, zero Triton compilations does not establish a FlashInfer,
-CuTeDSL or DeepGEMM cache hit. Keep the serving JIT checks enabled.
+CuTeDSL, or DeepGEMM cache hit. Keep the serving JIT checks enabled.
 
-For an initial audit, hold source, model revision, image, hardware, parallelism
+For an initial audit, hold source, model revision, image, hardware, parallelism,
 and serving parameters fixed. Compare compile-cache-cold and compile-cache-warm
 runs, recording the separate checkpoint/page-cache state. Do not clear a shared
 host's page cache. Preserve each backend's cache directory across containers,
 and use its own diagnostics to establish cache hits. Separate deployment setup
-(image pulls, package installation and downloads) from server startup.
+(image pulls, package installation, and downloads) from server startup.
 
 Use the slowest rank and the enclosing wall-clock measurements to identify the
 critical path. In particular, distinguish the partial graph-memory probe from

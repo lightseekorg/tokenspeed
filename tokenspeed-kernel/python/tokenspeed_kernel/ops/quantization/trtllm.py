@@ -46,7 +46,14 @@ if platform.is_nvidia:
                 "trtllm fp8_quantize_1x128 only supports group_size=128, "
                 f"got {group_size}"
             )
-        return torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
+        q, scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
+        if scale.ndim == 1:
+            # The flat-buffer ABI uses 4-row alignment and trailing padding.
+            rows, columns = x.shape
+            padded_rows = (rows + 3) // 4 * 4
+            groups = columns // group_size
+            scale = scale[: groups * padded_rows].view(groups, padded_rows)[:, :rows]
+        return q, scale
 
     def _per_token_quant_fp8(
         input: torch.Tensor, output: torch.Tensor, scale: torch.Tensor
@@ -71,6 +78,7 @@ if platform.is_nvidia:
         "quantization",
         "fp8_with_scale",
         name="trtllm_quantize_fp8_with_scale",
+        features={"token_fp8_min_scaling"},
         solution="trtllm",
         capability=CapabilityRequirement(
             max_arch_version=ArchVersion(10, 9),
@@ -94,10 +102,13 @@ if platform.is_nvidia:
             if scale_encoding != "float32":
                 raise ValueError("TRT-LLM token FP8 requires float32 scales")
 
-            q = torch.empty_like(x, dtype=_FP8_DTYPE)
-            scale = torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device)
-            _per_token_quant_fp8(x, q, scale)
-            return q, scale.unsqueeze(-1)
+            # The op's own codes and its scales as FP32 [..., 1]: one launch,
+            # no copies into new buffers (the scales are reshaped, or
+            # converted only if the op wrote another dtype).
+            q, scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(x)
+            if q.dtype != _FP8_DTYPE:
+                raise ValueError(f"TRT-LLM token FP8 wrote {q.dtype}, not E4M3")
+            return q.reshape(x.shape), scale.float().reshape(*x.shape[:-1], 1)
 
         if granularity == "token_group":
             q, scale = _per_token_group_quant_8bit(
@@ -108,6 +119,47 @@ if platform.is_nvidia:
             return q, scale.t().contiguous()
 
         raise ValueError(f"unsupported TRT-LLM FP8 granularity: {granularity!r}")
+
+    @register_kernel(
+        "quantization",
+        "fp8_with_scale",
+        name="trtllm_quantize_fp8_mn_major",
+        solution="trtllm",
+        capability=CapabilityRequirement(
+            max_arch_version=ArchVersion(10, 9),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "granularity": frozenset({"token_group_128"}),
+            "scale_encoding": frozenset({"float32"}),
+            "scale_layout": frozenset({"mn_major"}),
+        },
+        features=frozenset({"mn_major_scales"}),
+        # A solution override (override="trtllm") skips trait matching and
+        # takes the solution's highest priority; the lowest band keeps it on
+        # trtllm_quantize_fp8_with_scale's contiguous scales.
+        priority=Priority.REFERENCE,
+    )
+    def trtllm_quantize_fp8_mn_major(
+        x: torch.Tensor,
+        *,
+        granularity: str,
+        group_size: int,
+        scale_encoding: str,
+        enable_pdl: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return FP8 values and a logical [M,K/128] view of native scales."""
+        if granularity != "token_group" or scale_encoding != "float32":
+            raise ValueError(
+                "MN-major FP8 quantization requires FP32 token-group scales"
+            )
+        if enable_pdl:
+            raise ValueError("TRT-LLM FP8 quantization does not expose PDL control")
+        q, scale = _per_token_group_quant_8bit(x, group_size, use_ue8m0=False)
+        # Preserve the native M stride; padding depends on the TRT-LLM ABI.
+        # Consumers may still need to align or repack these scales.
+        return q, scale.t()
 
     __all__ = [
         "trtllm_fp8_token_group_128",

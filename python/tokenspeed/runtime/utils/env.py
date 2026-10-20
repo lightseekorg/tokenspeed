@@ -28,6 +28,7 @@ from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 global_server_args_dict: dict = {
+    "disaggregation_mode": ServerArgs.disaggregation_mode,
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
     "attention_use_fp4_indexer_cache": ServerArgs.attention_use_fp4_indexer_cache,
@@ -55,6 +56,7 @@ global_server_args_dict: dict = {
     "device": ServerArgs.device,
     "draft_model_path_use_base": ServerArgs.draft_model_path_use_base,
     "disable_pdl": ServerArgs.disable_pdl,
+    "disable_autotune": ServerArgs.disable_autotune,
     "enable_prefix_caching": ServerArgs.enable_prefix_caching,
     "mla_disable_ragged": ServerArgs.mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
@@ -86,6 +88,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
     pdl_enabled(not server_args.disable_pdl)
     global_server_args_dict.update(
         {
+            "disaggregation_mode": server_args.disaggregation_mode,
             "attention_backend": server_args.attention_backend,
             "sampling_backend": server_args.sampling_backend,
             "attention_use_fp4_indexer_cache": server_args.attention_use_fp4_indexer_cache,
@@ -115,6 +118,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "speculative_algorithm": server_args.speculative_algorithm,
             "speculative_num_draft_tokens": server_args.speculative_num_draft_tokens,
             "disable_pdl": server_args.disable_pdl,
+            "disable_autotune": server_args.disable_autotune,
             "enable_prefix_caching": server_args.enable_prefix_caching,
             "mla_disable_ragged": server_args.mla_disable_ragged,
             "chunked_prefill_size": server_args.chunked_prefill_size,
@@ -259,7 +263,6 @@ class Envs:
 
     # Model download
     TOKENSPEED_USE_MODELSCOPE = EnvBool(False)
-
 
     # Test and debug
     TOKENSPEED_CUDA_COREDUMP = EnvBool(False)

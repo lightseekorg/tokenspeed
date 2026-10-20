@@ -64,6 +64,7 @@ class _FakeLLM:
             weight_version="default",
             model="model-x",
             kvstore_storage_backend=storage_backend,
+            rl_control_api_key=None,
         )
         self.updates: list = []
         self.succeed = True

@@ -219,6 +219,18 @@ def test_qwen4_exp_gdn_norm_fused_matches_eager(dtype: torch.dtype) -> None:
     )
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=_requires_cuda)])
+def test_qwen4_exp_gdn_norm_normalizes_each_head_of_a_row(device: str) -> None:
+    torch.manual_seed(5)
+    heads, head_v_dim = 3, 128
+    norm = _Qwen4ExpRMSNormGated(head_v_dim, 1e-6).to(device)
+    x = torch.randn(9, heads * head_v_dim, device=device)
+    z = torch.randn_like(x)
+    per_head = norm(x.view(-1, head_v_dim), z.view(-1, head_v_dim)).view_as(x)
+
+    torch.testing.assert_close(norm(x, z), per_head, rtol=0, atol=0)
+
+
 def test_qwen4_exp_selects_checkpoint_output_gate_type() -> None:
     assert _qwen4_exp_uses_sigmoid_output_gate(
         SimpleNamespace(output_gate_type="sigmoid")
@@ -513,15 +525,13 @@ def _qsa_router(
     router.bind(
         CacheGroupGeometry(
             granularities=dict(_QSA_GROUP_GRANULARITIES),
-            families={gid: "history" for gid in _QSA_GROUP_GRANULARITIES},
+            attn_kinds={gid: "full_history" for gid in _QSA_GROUP_GRANULARITIES},
             full_history_group_id=FULL_ATTENTION,
             row_geometry={
                 gid: (granularity, 1)
                 for gid, granularity in _QSA_GROUP_GRANULARITIES.items()
             },
-            retentions={
-                gid: ("full_history", None) for gid in _QSA_GROUP_GRANULARITIES
-            },
+            windows={gid: None for gid in _QSA_GROUP_GRANULARITIES},
         ),
         {
             gid: router._leaf_factory(gid, granularity)
@@ -551,6 +561,7 @@ def _qsa_root(
         _field_layer_id=lambda layer_id: layer_id,
         paged_group_ids=tuple(_QSA_GROUP_GRANULARITIES),
         arena=SimpleNamespace(
+            offload=None,
             field=fields.__getitem__,
             plan=SimpleNamespace(
                 fields=[
@@ -569,8 +580,7 @@ def _qsa_root(
                 SimpleNamespace(
                     group_id=gid,
                     block_granularity=granularity,
-                    family="history",
-                    retention="full_history",
+                    attn_kind="full_history",
                     rows_per_page=granularity,
                     entry_stride_tokens=1,
                     sliding_window_tokens=None,
@@ -708,29 +718,29 @@ def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
     )
 
 
-def test_qwen4_exp_qsa_topk_solution_reads_env(monkeypatch) -> None:
+def test_qwen4_exp_qsa_topk_algorithm_reads_env(monkeypatch) -> None:
     indexer = object.__new__(QSAIndexer)
     small = torch.empty(1, 64)  # 1 x 4096 blocks x 4B fits any default budget
     large = torch.empty(1, 8192)  # 1 x 524288 blocks x 4B exceeds 1 MiB
 
     monkeypatch.delenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", raising=False)
     monkeypatch.delenv("TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB", raising=False)
-    assert indexer._topk_solution(1, small, 64) == "logits"
-    assert indexer._topk_solution(1, large, 64) == "logits"
+    assert indexer._topk_algorithm(1, small, 64) == "logits"
+    assert indexer._topk_algorithm(1, large, 64) == "logits"
 
     # A tighter budget flips only the oversized batch onto the stream path.
     monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB", "1")
-    assert indexer._topk_solution(1, small, 64) == "logits"
-    assert indexer._topk_solution(1, large, 64) == "stream"
+    assert indexer._topk_algorithm(1, small, 64) == "logits"
+    assert indexer._topk_algorithm(1, large, 64) == "stream"
 
     # Explicit backends pin the routing regardless of shape or budget.
     for pinned in ("stream", "logits"):
         monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", pinned)
-        assert indexer._topk_solution(1, large, 64) == pinned
+        assert indexer._topk_algorithm(1, large, 64) == pinned
 
     monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", "bogus")
     with pytest.raises(ValueError, match="TOPK_PATH"):
-        indexer._topk_solution(1, small, 64)
+        indexer._topk_algorithm(1, small, 64)
 
 
 def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
@@ -1200,11 +1210,6 @@ def _qsa_cache_test_indexer(device: str = "cuda"):
     rope_positions = torch.zeros((3, 3), dtype=torch.int64, device=device)
     indexer._fields = lambda pool: (raw, compressed, rope_positions)
     indexer._draft_scratch = {}
-    indexer.register_buffer(
-        "_persistent_topk_workspace",
-        torch.empty((1024 * 1024,), dtype=torch.uint8, device=device),
-        persistent=False,
-    )
     return indexer, SimpleNamespace(), raw, compressed, rope_positions
 
 
@@ -1824,6 +1829,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         block_size=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=0,
+        kv_offload_config=None,
     )
 
     setup = prepare_cache_setup(
@@ -1852,29 +1858,30 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         fields[qsa_raw_key_field(1)].plane_id
         == fields[qsa_rope_position_field(1)].plane_id
     )
-    assert groups[QWEN4_EXP_PLE_CACHE_GROUP].family == "state"
-    assert groups[QWEN4_EXP_QSA_CACHE_GROUP].family == "history"
+    assert groups[QWEN4_EXP_PLE_CACHE_GROUP].attn_kind == "state"
+    assert groups[QWEN4_EXP_QSA_CACHE_GROUP].attn_kind != "state"
     assert fields[qsa_compressed_field(1)].group_id == QWEN4_EXP_QSA_CACHE_GROUP
     assert fields[qsa_raw_key_field(1)].group_id == QWEN4_EXP_QSA_RECENT_CACHE_GROUP
     assert (
         fields[qsa_rope_position_field(1)].group_id == QWEN4_EXP_QSA_RECENT_CACHE_GROUP
     )
-    assert groups[QWEN4_EXP_QSA_CACHE_GROUP].retention == "full_history"
+    assert groups[QWEN4_EXP_QSA_CACHE_GROUP].attn_kind == "full_history"
     assert groups[QWEN4_EXP_QSA_CACHE_GROUP].rows_per_page == 64
     assert groups[QWEN4_EXP_QSA_CACHE_GROUP].entry_stride_tokens == 4
     assert groups[QWEN4_EXP_QSA_CACHE_GROUP].block_granularity == 256
-    assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].family == "history"
-    assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].retention == "sliding_window"
+    assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].attn_kind != "state"
+    assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].attn_kind == "sliding_window"
     assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].sliding_window_tokens == 4
     assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].rows_per_page == 64
     assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].entry_stride_tokens == 1
     assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].block_granularity == 64
     assert setup.spec.memory_plan.prefix_granularity == 256
+    # A State group's blocks are its two state slots and span no tokens.
     assert all(
         setup.spec.memory_plan.prefix_granularity % group.block_granularity == 0
         for group in groups.values()
+        if group.attn_kind != "state"
     )
-    assert groups[QWEN4_EXP_PLE_CACHE_GROUP].block_granularity == 256
     assert fields[context_field].dtype == "int64"
     selected, consumers = select_layer_fields(
         setup.spec.memory_plan.fields,

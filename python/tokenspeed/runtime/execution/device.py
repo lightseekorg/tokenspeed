@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import json
 import os
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
@@ -89,8 +90,13 @@ from tokenspeed.runtime.cache.l2.sizing import (
     RetractionPoolRequest,
     tail_lcm_blocks_per_request,
 )
+from tokenspeed.runtime.distributed.nccl_suspend import (
+    resume_nccl_communicators,
+    suspend_nccl_communicators,
+)
 from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.epd.recv_pool import recv_pool_bytes
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     PendingExecution,
@@ -127,15 +133,42 @@ class EncoderModelFacts:
 
     Attributes:
         device: The engine's device.
-        hidden: Model hidden width.
+        hidden: Encoder output width, independent of the language hidden width.
         num_deepstack: Number of deepstack embeddings, 0 when unsupported.
-        dtype: The vision tower's dtype.
+        dtype: Encoder output dtype, which may be integer for discrete tokens.
     """
 
     device: Any
     hidden: int
     num_deepstack: int
     dtype: Any
+
+    @classmethod
+    def from_model(cls, model: Any, *, device: Any) -> EncoderModelFacts:
+        output_spec = getattr(model, "get_encoder_output_spec", None)
+        if output_spec is not None:
+            hidden, dtype = output_spec()
+        else:
+            hidden = model.config.hidden_size
+            vision = next(
+                module
+                for module in (
+                    getattr(model, name, None)
+                    for name in ("visual", "vision_tower", "vision")
+                )
+                if module is not None
+            )
+            dtype = getattr(vision, "dtype", None)
+            if dtype is None:
+                dtype = next(vision.parameters()).dtype
+        if hidden <= 0:
+            raise ValueError("Encoder output width must be positive")
+        return cls(
+            device=device,
+            hidden=hidden,
+            num_deepstack=getattr(model, "num_deepstack_embeddings", 0),
+            dtype=dtype,
+        )
 
 
 @dataclass(frozen=True)
@@ -172,7 +205,7 @@ class DeviceSpecs:
             rows (the PD decode role, whose prefill node returns them) or its
             LM head scores every prompt row on this rank (no row narrowing,
             no pipeline split). The ingress refuses such requests otherwise.
-        cache_state_group_ids: Group ids of the state-family cache groups,
+        cache_state_group_ids: Group ids of the state cache groups,
             for the per-group page-usage debug line. Empty for pools with no
             recurrent/conv state.
         num_host_pages: The L2 host tier's page count (incl. the null page),
@@ -327,6 +360,10 @@ class DeviceHandle:
         # The transfer peer's submissions, settled at the next round's
         # execute (see ``_settle``).
         self._transfer_submissions: deque = deque()
+        # The plan's page copies, settled likewise: a copy has no ACK, so a
+        # submission that raised would otherwise vanish with the hitter's
+        # block left unfilled.
+        self._copy_submissions: deque = deque()
 
     # ------------------------------------------------------------------
     # Per-round work
@@ -349,7 +386,11 @@ class DeviceHandle:
         forward thread's default stream before anything else of the plan is
         enqueued; a pinned write-back -- an ordinary publication, whose
         sources the scheduler holds until the ACK -- rides the write stream
-        and fences nothing), then page zeroing (the new owner's
+        and fences nothing), then the Device-to-Device block copies
+        (``pages_to_copy``: a prefix hit's private copy of the block holding
+        its boundary, an owner's move off the block it just published; the
+        source may be re-granted by this very plan, so the copy precedes the
+        zeroing), then page zeroing (the new owner's
         sanitization), then the L3 prefetches (``PrefetchOp``: a waiting
         request's Host pages filled from L3 on a CPU lane -- no stream, no
         Device page, acknowledged after the replica converges on the landed
@@ -391,6 +432,11 @@ class DeviceHandle:
             "PD transfer submission failed on the data plane; it produces no "
             "transfer event, so its request would hang silently",
         )
+        _settle(
+            self._copy_submissions,
+            "page copy submission failed on the data plane; it has no "
+            "completion event, so the destination block would stay unfilled",
+        )
 
         executor = self._executor
         cache_ops = cache_ops_from_plan(execution_plan)
@@ -410,7 +456,28 @@ class DeviceHandle:
                     )
                 )
             )
-        pages = execution_plan.pages_to_zero
+        # Between the stores and the zeroing: a copy's source may be a block
+        # this plan re-grants (and zeroes); its destination is already in the
+        # hitter's table and is never zeroed. Stream order on the default
+        # stream, behind the execution stream, is the whole argument.
+        copies = {
+            group_id: pairs
+            for group_id, pairs in execution_plan.pages_to_copy_arrays().items()
+            if len(pairs)
+        }
+        if copies:
+            self._copy_submissions.append(
+                self._thread.submit(lambda: executor.copy_cache_pages(copies))
+            )
+        # The plan lists every group, empty or not; only groups with pages
+        # are work. An empty submission per idle round would flood the FIFO
+        # faster than the data plane drains it, starving the real work
+        # queued behind (a D role's remote-prefill receive).
+        pages = {
+            group_id: page_ids
+            for group_id, page_ids in execution_plan.pages_to_zero.items()
+            if len(page_ids)
+        }
         zero_future = (
             self._thread.submit(lambda: executor.zero_cache_pages(pages))
             if pages
@@ -504,17 +571,40 @@ class DeviceHandle:
         executor = self._executor
 
         def _forward():
-            return executor.execute_forward_op(
-                planned.forward_op,
-                planned.sampling_params_list,
-                dp_metadata=planned.dp_metadata,
-                grammar_inputs=planned.grammar_inputs,
-                multimodal_context=planned.multimodal_context,
-                capture_next_input_ids=capture_next_input_ids,
-                ngram_inputs=planned.ngram_inputs,
-                request_history_seeds=planned.request_history_seeds,
-                input_logprob_plan=planned.input_logprob_plan,
-            )
+            phase_range = contextlib.nullcontext()
+            # The C++ profiler-enabled query is thread-local and stays false
+            # on pre-existing workers under all-thread capture. This installed
+            # PyTorch process-global flag is validated by profile startup.
+            if getattr(torch.autograd.profiler, "_is_profiler_enabled", False):
+                batch = planned.forward_op
+                num_extends = batch.num_extends()
+                metadata = {
+                    "mode": ForwardMode.from_num_extends(
+                        num_extends, len(batch.request_ids)
+                    ).name,
+                    "num_extends": num_extends,
+                    "request_ids": batch.request_ids,
+                    "input_lengths": batch.input_lengths,
+                    "prefill_lengths": batch.prefill_lengths,
+                    "extend_prefix_lens": batch.extend_prefix_lens,
+                }
+                phase_range = torch.profiler.record_function(
+                    f"tokenspeed.forward.v1:{json.dumps(metadata, separators=(',', ':'))}"
+                )
+            with phase_range:
+                return executor.execute_forward_op(
+                    planned.forward_op,
+                    planned.sampling_params_list,
+                    dp_metadata=planned.dp_metadata,
+                    grammar_inputs=planned.grammar_inputs,
+                    multimodal_context=planned.multimodal_context,
+                    capture_next_input_ids=capture_next_input_ids,
+                    ngram_inputs=planned.ngram_inputs,
+                    request_history_seeds=planned.request_history_seeds,
+                    input_logprob_plan=planned.input_logprob_plan,
+                    sampled_top_k=planned.sampled_top_k,
+                    stop_criteria=planned.stop_criteria,
+                )
 
         return PendingExecution(self._thread.submit(_forward))
 
@@ -622,18 +712,27 @@ class DeviceHandle:
             self._l2.set_l3_weight_version(weight_version)
 
     def shutdown_cache(self) -> None:
-        """Join queued cache submissions, then close the Host cache (L2/L3, pool)."""
+        """Join every queued data-plane submission, then close the Host cache.
 
-        if self._l2 is None:
-            return
+        A cache plan, a PD transfer or a page copy the last round queued is
+        settled by the next round's execute or poll; at shutdown there is no
+        next round, so they are joined here and the first failure re-raised
+        after the Host cache (L2/L3, pool) is closed.
+        """
         errors = []
-        while self._l2_submissions:
-            future = self._l2_submissions.popleft()
-            try:
-                future.result()
-            except BaseException as exc:  # noqa: BLE001 — surface after close
-                errors.append(exc)
-        self._thread.run(self._l2.shutdown)
+        for submissions in (
+            self._l2_submissions,
+            self._transfer_submissions,
+            self._copy_submissions,
+        ):
+            while submissions:
+                future = submissions.popleft()
+                try:
+                    future.result()
+                except BaseException as exc:  # noqa: BLE001 — surface after close
+                    errors.append(exc)
+        if self._l2 is not None:
+            self._thread.run(self._l2.shutdown)
         if errors:
             raise errors[0]
 
@@ -724,16 +823,59 @@ class DeviceHandle:
         self._thread.submit(_logged)
         return None
 
-    def run_kv_repair(self) -> None:
-        """Zero the KV arena after a memory-saver wake re-maps its storage.
+    # ------------------------------------------------------------------
+    # Memory-saver release/wake (see engine/memory_occupation.py)
+    # ------------------------------------------------------------------
 
-        Re-mapped memory holds garbage. The draft pool names the same arena,
-        so clearing the target's clears both — walking two pools only cleared
-        it twice. FP8 KV scales ride with the weights region and need no
-        reset.
+    def synchronize(self) -> None:
+        """Wait for all device work before a memory region is unmapped."""
+        self._thread.run(self._executor.device_module.synchronize)
+
+    def prepare_kv_release(self) -> None:
+        """Quiesce everything that can touch the KV arena before it is unmapped.
+
+        The arena's own copy streams (sparse KV offload) and the device are
+        synchronized, then the arena is deregistered from the PD transfer
+        engine: a registration pins the physical pages the release frees.
+        """
+        arena = self._executor.token_to_kv_pool.arena
+        device_module = self._executor.device_module
+        kv_transfer = self._kv_transfer
+
+        def _prepare() -> None:
+            arena.synchronize()
+            device_module.synchronize()
+            if kv_transfer is not None:
+                kv_transfer.release_cache_registration()
+
+        self._thread.run(_prepare)
+
+    def finish_kv_resume(self) -> None:
+        """Repair the KV arena after a memory-saver wake re-maps its storage.
+
+        Re-mapped memory holds garbage, so the arena is zeroed first. The
+        draft pool names the same arena, so clearing the target's clears both.
+        FP8 KV scales ride with the weights region and need no reset. The
+        arena then goes back to the PD transfer engine, which registers the
+        new physical pages.
         """
         pool = self._executor.token_to_kv_pool
-        self._thread.run(pool.clear_kv_buffers)
+        kv_transfer = self._kv_transfer
+
+        def _finish() -> None:
+            pool.clear_kv_buffers()
+            if kv_transfer is not None:
+                kv_transfer.restore_cache_registration()
+
+        self._thread.run(_finish)
+
+    def suspend_nccl(self) -> None:
+        """Free the NCCL communicators' buffers; they stay usable after resume."""
+        self._thread.run(suspend_nccl_communicators)
+
+    def resume_nccl(self) -> None:
+        """Restore the NCCL communicators suspended by :meth:`suspend_nccl`."""
+        self._thread.run(resume_nccl_communicators)
 
     def run_remote_prefill_landing(
         self,
@@ -881,7 +1023,8 @@ class DeviceHandle:
 
         Type-dispatched on the request — join the trainer's NCCL group,
         receive and apply one broadcast, read one committed version from the
-        Mooncake weight store, or tear the group down. One entry point because
+        Mooncake weight store, reload a checkpoint from disk, or tear the group
+        down. One entry point because
         it is one capability: rewriting model parameters in place, which must
         be ordered against forwards rather than raced with them.
 
@@ -897,6 +1040,7 @@ class DeviceHandle:
         from tokenspeed.runtime.engine.io_struct import (
             DestroyWeightsUpdateGroupReqInput,
             InitWeightsUpdateGroupReqInput,
+            UpdateWeightFromDiskReqInput,
             UpdateWeightsFromDistributedReqInput,
             UpdateWeightsFromMooncakeReqInput,
         )
@@ -913,6 +1057,7 @@ class DeviceHandle:
                 )
             ),
             DestroyWeightsUpdateGroupReqInput: runner.destroy_weights_update_group,
+            UpdateWeightFromDiskReqInput: runner.update_weights_from_disk,
         }
         handler = handlers.get(type(req))
         if handler is None:
@@ -920,6 +1065,7 @@ class DeviceHandle:
         loads_weights = type(req) in (
             UpdateWeightsFromDistributedReqInput,
             UpdateWeightsFromMooncakeReqInput,
+            UpdateWeightFromDiskReqInput,
         )
 
         def _apply_update():
@@ -1017,6 +1163,11 @@ def _cudagraph_probe_refusal(server_args: ServerArgs) -> str | None:
         return "--disable-cudagraph-memory-reserve is set"
     if server_args.enforce_eager:
         return "--enforce-eager captures no graphs"
+    if server_args.enable_memory_saver:
+        # torch_memory_saver 0.0.9 cannot dispose a tagged graph pool and then
+        # capture again: empty_cache in the next capture fails with an invalid
+        # CUDA free. Keep the serving capture, without a throwaway probe.
+        return "memory saver cannot discard a tagged CUDA-graph probe pool"
     return None
 
 
@@ -1201,13 +1352,10 @@ def build_device_side(
     and persistent communication buffers must be prepared after weights are
     loaded and before ``create_attn_components`` profiles memory for the KV
     budget (the EPD receive pool, which the admission allocates later, is left
-    out of that budget instead), and the chunked-prefill limit must be aligned
-    to the cache groups before ``ModelExecutorConfig`` sizes the input buffers
-    from it.
+    out of that budget instead).
 
     Args:
-        server_args: Parsed server arguments. ``chunked_prefill_size`` may
-            be lowered here to the cache-group checkpoint grain.
+        server_args: Parsed server arguments.
         model_config: The target model's config.
         draft_model_config: The draft model's config, or None.
         gpu_id: Local device index.
@@ -1228,10 +1376,7 @@ def build_device_side(
     """
     # Imported here: these pull in the model/backend registries, which
     # import execution types — a module-level import would cycle.
-    from tokenspeed.runtime.engine.scheduler_utils import (
-        aligned_max_scheduled_tokens,
-        log_gpu_memory_summary,
-    )
+    from tokenspeed.runtime.engine.scheduler_utils import log_gpu_memory_summary
     from tokenspeed.runtime.execution.factory import (
         ModelExecutorConfig,
         _eagle_aux_layer_ids,
@@ -1243,6 +1388,7 @@ def build_device_side(
         DriverMemoryDeltaObserver,
     )
     from tokenspeed.runtime.execution.prefill_graph import narrowing_prefill_model
+    from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
@@ -1251,9 +1397,16 @@ def build_device_side(
     target, draft = create_model_runner(
         server_args, model_config, draft_model_config, gpu_id, global_rank
     )
-    with startup_phase("multimodal.init"):
-        if server_args.disaggregation_mode in ("null", "prefill"):
-            target.prepare_multimodal_runtime()
+
+    def prepare_multimodal():
+        with startup_phase("multimodal.init"):
+            if server_args.disaggregation_mode in ("null", "prefill"):
+                target.prepare_multimodal_runtime()
+
+    # CDNA4 encoders share the fixed Iris heap with the language model.
+    communication_first = current_platform().is_cdna4
+    if not communication_first:
+        prepare_multimodal()
     max_forward_tokens = (
         server_args.chunked_prefill_size
         if server_args.chunked_prefill_size > 0
@@ -1267,6 +1420,8 @@ def build_device_side(
         target.prepare_communication_runtime(max_forward_tokens)
         if draft is not None:
             draft.prepare_communication_runtime(max_forward_tokens)
+    if communication_first:
+        prepare_multimodal()
 
     post_profile_bytes = recv_pool_bytes(server_args, model_config.is_multimodal_active)
     if post_profile_bytes:
@@ -1335,22 +1490,6 @@ def build_device_side(
         reuse_draft_backend=None,
     )
     views = pool_views(attention)
-    # Lowering the limit is safe; a configured chunk smaller than one
-    # state checkpoint block is rejected by aligned_max_scheduled_tokens
-    # instead of silently increasing a frozen buffer limit.
-    if server_args.enable_prefix_caching:
-        aligned = aligned_max_scheduled_tokens(
-            server_args.chunked_prefill_size, views.cache_groups
-        )
-        if aligned != server_args.chunked_prefill_size:
-            logger.warning(
-                f"chunked_prefill_size={server_args.chunked_prefill_size!s} is not a "
-                "multiple of the "
-                f"state-snapshot checkpoint grain; using {aligned!s} so recurrent-state"
-                " "
-                "pages can register for prefix-cache reuse.",
-            )
-            server_args.chunked_prefill_size = aligned
 
     # On CUDA, what startup keeps resident after the probe build joins the reserve.
     startup_memory = (
@@ -1364,7 +1503,8 @@ def build_device_side(
             config=ModelExecutorConfig.from_server_args(
                 server_args=server_args,
                 model_config=model_config,
-                max_req_pool_size=max_batch_size + 1,
+                model=target.model,
+                max_req_pool_size=RequestSlotLayout(max_batch_size).padding,
                 gpu_id=gpu_id,
                 global_rank=global_rank,
                 prefix_granularity=views.cache_geometry.prefix_granularity,
@@ -1396,6 +1536,18 @@ def build_device_side(
                 requested_backends,
                 startup_resident_bytes=sum(startup_memory.samples.get("startup", ())),
             )
+        if (
+            draft is not None
+            and server_args.speculative_algorithm == "DFLASH"
+            and not executor.config.prefill_only
+        ):
+            # Rebinding recreates the draft's auxiliary stream. Graph-phase
+            # warmups bypass its overlap path, so initialize its BLAS handle
+            # eagerly again before the final capture uses that fresh stream.
+            with torch.no_grad():
+                executor.forward_step.warmup_decode_path(
+                    batch_sizes=(1,), graph_phase=False
+                )
 
     with startup_phase("graph.capture"):
         executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
@@ -1432,6 +1584,9 @@ def build_device_side(
     )
     if server_args.enable_kvstore or not snapshot_pool.disabled:
         from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
 
         host_cache_executor = HostCacheExecutor(
             views.token_to_kv_pool,
@@ -1444,6 +1599,12 @@ def build_device_side(
             io_backend=server_args.kvstore_io_backend,
             attn_tp_rank=attn_tp_rank,
             kvp_rank=server_args.mapping.attn.kvp_rank,
+            nprocs_per_node=server_args.mapping.nprocs_per_node,
+            world_cpu_group=(
+                pg_manager.get_process_group("gloo", server_args.mapping.world_group)
+                if server_args.mapping.world_size > 1
+                else None
+            ),
         )
     elif attn_tp_rank == 0:
         # With an executor the line comes from its resolved sizing.
@@ -1608,7 +1769,7 @@ def build_device_side(
         cache_state_group_ids=tuple(
             str(spec.group_id)
             for spec in views.token_to_kv_pool.arena.cache_group_specs
-            if spec.family == "state"
+            if spec.attn_kind == "state"
         ),
         num_host_pages=(
             host_cache_executor.num_host_pages if host_cache_executor is not None else 0
@@ -1631,24 +1792,7 @@ def build_device_side(
     )
 
     def encoder_model_facts() -> EncoderModelFacts:
-        model = target.model
-        vision = next(
-            module
-            for module in (
-                getattr(model, name, None)
-                for name in ("visual", "vision_tower", "vision")
-            )
-            if module is not None
-        )
-        dtype = getattr(vision, "dtype", None)
-        if dtype is None:
-            dtype = next(vision.parameters()).dtype
-        return EncoderModelFacts(
-            device=executor.device,
-            hidden=model.config.hidden_size,
-            num_deepstack=getattr(model, "num_deepstack_embeddings", 0),
-            dtype=dtype,
-        )
+        return EncoderModelFacts.from_model(target.model, device=executor.device)
 
     return DeviceBuild(
         specs=specs,
@@ -1831,7 +1975,7 @@ def _build_kv_transfer(
             bootstrap_port=server_args.disaggregation_bootstrap_port,
             dist_init_addr=server_args.dist_init_addr,
             topology=topology,
-            enable_metrics=False,
+            enable_metrics=server_args.enable_metrics,
             served_model_name=server_args.served_model_name,
             app_key=server_args.app_key,
             metrics_reporters=server_args.metrics_reporters,

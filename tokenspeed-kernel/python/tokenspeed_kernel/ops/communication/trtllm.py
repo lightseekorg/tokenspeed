@@ -19,13 +19,14 @@
 # SOFTWARE.
 
 import logging
+import math
 import os
 from ctypes import c_void_p
 
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.quantization import quantize_fp8
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import ErrorClass, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -80,9 +81,11 @@ __all__ = [
     "AllReduceFusionPattern",
     "allgather_dual_rmsnorm",
     "allreduce_residual_rmsnorm",
+    "allreduce_sandwich_rmsnorm",
     "reducescatter_residual_rmsnorm",
     "trtllm_allreduce_fusion",
     "trtllm_create_ipc_workspace_for_all_reduce_fusion",
+    "trtllm_workspace_all_gather",
     "trtllm_workspace_allreduce",
     "group_spans_nodes",
     "armed_workspace_hidden_dim",
@@ -103,6 +106,8 @@ trtllm_reduce_scatter = error_fn
 MNNVL_TWOSHOT_MAX_TOKEN = 0
 allgather_dual_rmsnorm = error_fn
 allreduce_residual_rmsnorm = error_fn
+allreduce_sandwich_rmsnorm = error_fn
+trtllm_workspace_all_gather = error_fn
 trtllm_workspace_allreduce = error_fn
 armed_workspace_hidden_dim = error_fn
 ensure_workspace_initialized = error_fn
@@ -129,6 +134,8 @@ if current_platform().is_nvidia:
         trtllm_create_ipc_workspace_for_all_reduce_fusion,
         trtllm_create_mnnvl_workspace_for_all_reduce_fusion,
         trtllm_destroy_ipc_workspace_for_all_reduce_fusion,
+        trtllm_mnnvl_allgather,
+        trtllm_mnnvl_sandwich_norm_allreduce,
         trtllm_reducescatter_fusion,
     )
 
@@ -538,6 +545,7 @@ if current_platform().is_nvidia:
         dtype: torch.dtype,
         pattern_code: int,
         use_oneshot: bool,
+        ipc_oneshot: bool,
         residual_reduce_scattered: bool = False,
     ):
         """Pick the AR workspace for one call: mnnvl when eligible, else IPC.
@@ -545,8 +553,9 @@ if current_platform().is_nvidia:
         Tier 2 of AR dispatch (Tier 1 chose the trtllm backend in auto.py).
         Decision, first match wins:
           1. compatible IPC workspace exists (single-node, lamport sentinel
-             width matches) AND (payload >= MNNVL_PREFER_IPC_BYTES
-             OR pattern == kAllReduceLatentNorm) ....... IPC lamport/twoshot
+             width matches) AND (pattern == kAllReduceLatentNorm OR
+             (``ipc_oneshot`` AND payload >= MNNVL_PREFER_IPC_BYTES))
+             ............................................ IPC lamport one-shot
           2. mnnvl supports this shape ................. mnnvl (the caller's
              ``use_oneshot`` parameter selects its strategy)
           3. no usable IPC (cross-node, or lamport sentinel width mismatch)
@@ -555,21 +564,16 @@ if current_platform().is_nvidia:
              raise loudly -- never a null workspace into the kernel)
           4. otherwise ................................ IPC
         Cross-node, workspace_tensor is None so only 2/3 apply -- mnnvl serves
-        the whole range (it beats NCCL everywhere there).
+        the whole range (it beats NCCL everywhere there). ``ipc_oneshot`` is
+        the strategy the IPC kernel would run for this call.
         """
         mnnvl = manager.mnnvl_workspace
-        # Byte-based split between the two fused workspaces: multicast (mnnvl)
-        # for small payloads, IPC lamport once bandwidth dominates. Only bites
-        # single-node -- cross-node workspace_tensor is None and mnnvl is the
-        # only option. See MNNVL_PREFER_IPC_BYTES for the measurement.
         from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
 
         payload_bytes = token_num * hidden_dim * dtype.itemsize
-        # Prefer IPC when it exists (single node) for large payloads, and for
-        # latent-norm whose wide lane the mnnvl geometry handles slightly worse.
-        # Cross-node workspace_tensor is None, so mnnvl serves both.
-        prefer_ipc = payload_bytes >= MNNVL_PREFER_IPC_BYTES or (
-            pattern_code == AllReduceFusionPattern.kAllReduceLatentNorm
+        # One node: IPC keeps the latent-norm lane and large one-shot payloads; cross-node mnnvl serves all.
+        prefer_ipc = pattern_code == AllReduceFusionPattern.kAllReduceLatentNorm or (
+            ipc_oneshot and payload_bytes >= MNNVL_PREFER_IPC_BYTES
         )
         # A sentinel-width mismatch corrupts the lamport neg-zero wait/clear protocol.
         ipc_ok = manager.workspace_tensor is not None and (
@@ -737,6 +741,7 @@ if current_platform().is_nvidia:
             tensor_2d.dtype,
             AllReduceFusionPattern.kAllReduce,
             resolved_oneshot,
+            ipc_oneshot=requested_oneshot,
         )
         if workspace is None:
             return None
@@ -764,6 +769,30 @@ if current_platform().is_nvidia:
             allreduce_out=allreduce_out,
         )
         return allreduce_out.view(input_tensor.shape)
+
+    def trtllm_workspace_all_gather(
+        input_tensor: torch.Tensor,
+        group: dist.ProcessGroup,
+    ) -> torch.Tensor | None:
+        """All-gather of 16-bit rows along the last dim through the group's
+        mnnvl workspace: one lamport exchange, no barrier.
+
+        Args:
+            input_tensor: ``[T, W]`` rows of this rank.
+            group: process group whose armed workspace to use.
+
+        Returns:
+            ``[T, world * W]`` (rank-major columns, bit for bit), or None when
+            no mnnvl workspace serves the shape.
+        """
+        manager = _manager_for_group(group)
+        mnnvl = manager.mnnvl_workspace
+        if mnnvl is None or input_tensor.dim() != 2:
+            return None
+        gathered = trtllm_mnnvl_allgather(input_tensor, mnnvl, pdl_enabled())
+        if gathered is not None:
+            _mark_captured(manager, mnnvl)
+        return gathered
 
     def allreduce_residual_rmsnorm(
         input_tensor: torch.Tensor,
@@ -867,7 +896,8 @@ if current_platform().is_nvidia:
             input_tensor.dtype,
             pattern_code,
             resolved_oneshot,
-            residual_reduce_scattered,
+            ipc_oneshot=requested_oneshot,
+            residual_reduce_scattered=residual_reduce_scattered,
         )
         # IPC has its own heuristic; only MNNVL uses the workspace's frozen cap.
         if workspace is not manager.mnnvl_workspace:
@@ -928,6 +958,145 @@ if current_platform().is_nvidia:
         else:
             return norm_out, residual_out, None, partial_norm_out
 
+    def _sandwich_scale_pair(
+        x_scale: float | None, residual_scale: float | None
+    ) -> tuple[float, float]:
+        """The multipliers of the two addends. A missing one is 1.0, as in the
+        unfused ``rmsnorm()``: its product is exact, so that addend enters the
+        add unscaled (a missing pair is the plain sum)."""
+        x_scale = 1.0 if x_scale is None else x_scale
+        residual_scale = 1.0 if residual_scale is None else residual_scale
+        for name, value in (("x_scale", x_scale), ("residual_scale", residual_scale)):
+            # What the unfused rmsnorm() takes, so a declined call runs too.
+            if not isinstance(value, float) or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite float, got {value!r}")
+        return x_scale, residual_scale
+
+    def allreduce_sandwich_rmsnorm(
+        input_tensor: torch.Tensor,
+        residual: torch.Tensor,
+        post_weight: torch.Tensor,
+        weight: torch.Tensor,
+        rank: int,
+        group: dist.ProcessGroup,
+        *,
+        eps: float,
+        x_scale: float | None = None,
+        residual_scale: float | None = None,
+        max_token_num: int = 2048,
+        trigger_completion_at_end: bool = True,
+        launch_with_pdl: bool | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """All-reduce a sublayer partial and run the pre/post norm boundary on
+        the sum in one MNNVL launch.
+
+        The result is the unfused chain's::
+
+            s = all_reduce(input_tensor)
+            a = rmsnorm(s, post_weight, eps)
+            norm_out, residual_out = rmsnorm(
+                a, weight, eps, residual=residual, round_residual_sum_bf16=True,
+                x_scale=x_scale, residual_scale=residual_scale)
+
+        (``ops/layernorm/triton.py``) with the same operations and BF16
+        rounding points; only the order of the two sum-of-squares reductions
+        differs. That order does not depend on the token count, the strategy
+        or the launch geometry.
+
+        Args:
+            input_tensor: This rank's contiguous BF16 ``[T, H]`` partial.
+            residual: Contiguous BF16 ``[T, H]`` residual stream.
+            post_weight: BF16 ``[H]`` weight of the norm of the sum.
+            weight: BF16 ``[H]`` weight of the norm of the new residual.
+            rank: This rank's index in ``group``.
+            group: The device process group of the all-reduce.
+            eps: Epsilon of both norms.
+            x_scale, residual_scale: Optional multipliers of the normalized sum
+                and the residual (a missing one is 1.0); each product is
+                rounded to BF16 before the add.
+            max_token_num: Token capacity to arm the group's workspace for.
+            trigger_completion_at_end: Release PDL dependents after the last
+                store (otherwise after the inputs are loaded).
+            launch_with_pdl: Programmatic dependent launch; None follows
+                ``pdl_enabled()``.
+
+        Returns:
+            ``(norm_out, residual_out)``, or None when no fused kernel serves
+            the call (one rank, a token count outside ``[1, max_token_num]``,
+            no MNNVL workspace for the group, or a shape its partition cannot
+            split). Nothing is launched then and the caller runs the unfused
+            chain; the answer depends only on state every rank shares.
+
+        Raises:
+            ValueError: the tensors or the scale pair do not form a valid call.
+        """
+        if input_tensor.ndim != 2:
+            raise ValueError("input_tensor must be [tokens, hidden]")
+        tokens, hidden = input_tensor.shape
+        for name, tensor, shape in (
+            ("input_tensor", input_tensor, (tokens, hidden)),
+            ("residual", residual, (tokens, hidden)),
+            ("post_weight", post_weight, (hidden,)),
+            ("weight", weight, (hidden,)),
+        ):
+            if (
+                tensor.dtype != torch.bfloat16
+                or tuple(tensor.shape) != shape
+                or not tensor.is_contiguous()
+                or tensor.device != input_tensor.device
+            ):
+                raise ValueError(
+                    f"{name} must be a contiguous BF16 {shape} tensor on "
+                    f"{input_tensor.device}, got {tensor.dtype} "
+                    f"{tuple(tensor.shape)} on {tensor.device}"
+                )
+        x_scale, residual_scale = _sandwich_scale_pair(x_scale, residual_scale)
+        world_size = group.size()
+        if world_size <= 1 or not 1 <= tokens <= max_token_num:
+            return None
+        if not ensure_workspace_initialized(
+            rank=rank,
+            group=group,
+            max_token_num=max_token_num,
+            hidden_dim=hidden,
+            use_fp32_lamport=False,
+        ):
+            return None
+        manager = _manager_for_group(group)
+        mnnvl = manager.mnnvl_workspace
+        if mnnvl is None:
+            return None
+        use_oneshot = mnnvl.resolve_use_oneshot(tokens, None, hidden)
+        if not mnnvl.supports(
+            tokens,
+            hidden,
+            torch.bfloat16,
+            world_size,
+            AllReduceFusionPattern.kARSandwichResidualRMSNorm,
+            use_oneshot=use_oneshot,
+        ):
+            return None
+        _mark_captured(manager, mnnvl)
+        norm_out = torch.empty_like(input_tensor)
+        residual_out = torch.empty_like(residual)
+        trtllm_mnnvl_sandwich_norm_allreduce(
+            mnnvl,
+            input_tensor,
+            residual,
+            post_weight,
+            weight,
+            norm_out,
+            residual_out,
+            world_rank=rank,
+            use_oneshot=use_oneshot,
+            rms_eps=eps,
+            x_scale=x_scale,
+            residual_scale=residual_scale,
+            trigger_completion_at_end=trigger_completion_at_end,
+            launch_with_pdl=launch_with_pdl,
+        )
+        return norm_out, residual_out
+
     def allreduce_residual_attnres_combine(
         input_tensor: torch.Tensor,
         residual: torch.Tensor,
@@ -977,6 +1146,7 @@ if current_platform().is_nvidia:
             input_tensor.dtype,
             AllReduceFusionPattern.kARResidualAttnResCombine,
             use_oneshot=True,
+            ipc_oneshot=True,
         )
         if workspace is None:
             # Lands here cross-node out-of-mnnvl-range, or single-node on a
@@ -1060,6 +1230,7 @@ if current_platform().is_nvidia:
             lane.dtype,
             AllReduceFusionPattern.kAllReduceLatentNorm,
             use_oneshot=True,
+            ipc_oneshot=True,
         )
         if workspace is None:
             # Lands here cross-node out-of-mnnvl-range, or single-node on a

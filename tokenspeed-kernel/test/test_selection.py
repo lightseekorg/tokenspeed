@@ -28,7 +28,6 @@ from unittest import mock
 import pytest
 import tokenspeed_kernel.ops.gemm as gemm
 import torch
-from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import (
     KernelRegistry,
     KernelSpec,
@@ -157,7 +156,7 @@ class TestRanking:
             name="oracle_winner",
             family="f",
             mode="m",
-            solution="reference",
+            solution="torch",
             priority=0,
         )
         priority_winner = KernelSpec(
@@ -826,9 +825,9 @@ class TestSelectKernel:
             "decode",
             ATTN_DECODE_BF16,
             platform=h100_platform,
-            override="reference_decode",
+            override="torch_decode",
         )
-        assert impl() == "reference_decode"
+        assert impl() == "torch_decode"
 
     def test_override_by_solution(self, sample_specs, h100_platform):
         reg = KernelRegistry.get()
@@ -909,7 +908,7 @@ class TestSelectKernel:
 
         with mock.patch.dict(
             os.environ,
-            {"TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DECODE": "reference_decode"},
+            {"TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DECODE": "torch_decode"},
         ):
             impl = select_kernel(
                 "attention",
@@ -917,7 +916,7 @@ class TestSelectKernel:
                 ATTN_DECODE_BF16,
                 platform=h100_platform,
             )
-            assert impl() == "reference_decode"
+            assert impl() == "torch_decode"
 
     def test_override_refuses_a_kernel_lacking_a_required_feature(
         self, sample_specs, h100_platform
@@ -947,9 +946,9 @@ class TestSelectKernel:
             ATTN_DECODE_BF16,
             platform=h100_platform,
             features=frozenset({"paged"}),
-            override="reference_decode",
+            override="torch_decode",
         )
-        assert impl() == "reference_decode"
+        assert impl() == "torch_decode"
         with pytest.raises(NoKernelFoundError, match="'paged'"):
             select_kernel(
                 "attention",
@@ -1034,20 +1033,20 @@ class TestKernelOverride:
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)
 
-        with kernel_override("attention", "decode", "reference_decode"):
+        with kernel_override("attention", "decode", "torch_decode"):
             impl = select_kernel(
                 "attention",
                 "decode",
                 ATTN_DECODE_BF16,
                 platform=h100_platform,
             )
-            assert impl() == "reference_decode"
+            assert impl() == "torch_decode"
 
     def test_context_manager_restores(self, sample_specs, h100_platform):
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)
 
-        with kernel_override("attention", "decode", "reference_decode"):
+        with kernel_override("attention", "decode", "torch_decode"):
             pass
 
         impl = select_kernel(
@@ -1056,17 +1055,17 @@ class TestKernelOverride:
             ATTN_DECODE_BF16,
             platform=h100_platform,
         )
-        assert impl() != "reference_decode" or True
+        assert impl() != "torch_decode" or True
 
     def test_nested_override(self, sample_specs, h100_platform):
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)
 
-        with kernel_override("attention", "decode", "reference_decode"):
+        with kernel_override("attention", "decode", "torch_decode"):
             impl1 = select_kernel(
                 "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
             )
-            assert impl1() == "reference_decode"
+            assert impl1() == "torch_decode"
 
             with kernel_override("attention", "decode", "triton_decode"):
                 impl2 = select_kernel(
@@ -1077,7 +1076,7 @@ class TestKernelOverride:
             impl3 = select_kernel(
                 "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
             )
-            assert impl3() == "reference_decode"
+            assert impl3() == "torch_decode"
 
     def test_verbose_logs_an_override_once_per_kernel(
         self, sample_specs, h100_platform, monkeypatch, caplog
@@ -1095,12 +1094,12 @@ class TestKernelOverride:
         with caplog.at_level(logging.INFO, logger="tokenspeed_kernel.selection"):
             ranked = select()
             select()  # cache hit: not logged
-            with kernel_override("attention", "decode", "reference_decode"):
+            with kernel_override("attention", "decode", "torch_decode"):
                 for _ in range(3):
                     select()
             with kernel_override("attention", "decode", "triton"):
                 select()
-            with kernel_override("attention", "decode", "reference_decode"):
+            with kernel_override("attention", "decode", "torch_decode"):
                 select()  # already logged
 
         arch = h100_platform.arch
@@ -1113,9 +1112,7 @@ class TestKernelOverride:
         assert f"attention.decode({ATTN_DECODE_BF16}) -> {ranked.name} (ora=" in (
             messages[0]
         )
-        assert messages[1].endswith(
-            f"-> reference_decode (override reference_decode, {arch})"
-        )
+        assert messages[1].endswith(f"-> torch_decode (override torch_decode, {arch})")
         assert messages[2].endswith(f"-> triton_decode (override triton, {arch})")
 
     def test_override_log_waits_for_verbose(
@@ -1140,7 +1137,7 @@ class TestKernelOverride:
 
         with (
             caplog.at_level(logging.INFO, logger="tokenspeed_kernel.selection"),
-            kernel_override("attention", "decode", "reference_decode"),
+            kernel_override("attention", "decode", "torch_decode"),
         ):
             select()
             assert messages() == []
@@ -1148,7 +1145,7 @@ class TestKernelOverride:
             select()
             select()
         assert len(messages()) == 1
-        assert "-> reference_decode (override reference_decode, " in messages()[0]
+        assert "-> torch_decode (override torch_decode, " in messages()[0]
 
 
 class TestSetPolicy:
@@ -1209,18 +1206,18 @@ class TestExplainSelection:
             (
                 None,
                 None,
-                "reference_decode",
-                "reference_decode (explicit override= argument)",
+                "torch_decode",
+                "torch_decode (explicit override= argument)",
             ),
             (
                 None,
                 "triton",
-                "reference_decode",
+                "torch_decode",
                 "triton (kernel_override())",
             ),
             (
                 "triton_decode",
-                "reference_decode",
+                "torch_decode",
                 "flashinfer_decode",
                 "triton_decode (env TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DECODE)",
             ),

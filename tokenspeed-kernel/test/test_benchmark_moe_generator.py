@@ -21,6 +21,9 @@
 from __future__ import annotations
 
 import importlib
+import json
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -33,8 +36,13 @@ from tokenspeed_kernel.benchmark.harness import (
     BenchmarkStatus,
 )
 from tokenspeed_kernel.ops import moe as moe_ops
-from tokenspeed_kernel.platform import PlatformInfo
+from tokenspeed_kernel.platform import Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+from tokenspeed_kernel.selection import (
+    SelectedKernel,
+    kernel_override,
+    resolve_kernel_override,
+)
 
 
 def _use_cpu_allocations(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -46,6 +54,340 @@ def _use_cpu_allocations(monkeypatch: pytest.MonkeyPatch) -> None:
             return _allocation(*args, **kwargs)
 
         monkeypatch.setattr(torch, name, cpu_allocation)
+
+
+def _beam_request(**overrides) -> BenchmarkRequest:
+    fragment = (
+        Path(__file__).resolve().parents[1] / "benchmarks/amd/gfx950/beam/moe.json"
+    )
+    parameters = json.loads(fragment.read_text())["common_parameters"]
+    # Keep the same TP4/grouped-route contract with small real tensors.
+    parameters.update(
+        tokens=2,
+        hidden_size=128,
+        intermediate_size=256,
+        num_experts=16,
+        num_local_experts=16,
+    )
+    parameters.update(overrides)
+    return BenchmarkRequest(
+        family="moe",
+        mode="apply",
+        parameters=parameters,
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+
+
+def test_beam_channel_full_weight_shapes_without_allocating_payload():
+    assert moe_generator._fp8_channel_weight_shapes(
+        num_local_experts=256,
+        hidden_size=5120,
+        intermediate_size_per_partition=640,
+    ) == {
+        "w13": (256, 1280, 5120),
+        "w13_scale": (256, 1280),
+        "w2": (256, 5120, 640),
+        "w2_scale": (256, 5120),
+    }
+
+
+def test_channel_weights_are_real_seeded_per_output_channel_gate_then_up():
+    def build():
+        return moe_generator._make_fp8_channel_weights(
+            num_local_experts=3,
+            hidden_size=128,
+            intermediate_size_per_partition=32,
+            ep_rank=0,
+            ep_size=1,
+            generator=torch.Generator(device="cpu").manual_seed(7),
+        )
+
+    first, repeat = build(), build()
+    generator = torch.Generator(device="cpu").manual_seed(7)
+    for expert in range(3):
+        for name, shape in (("w13", (64, 128)), ("w2", (128, 32))):
+            raw = torch.randn(shape, generator=generator) * 0.02
+            scale = (raw.abs().amax(-1) / 448).clamp(min=2.0**-126)
+            expected = (raw / scale[:, None]).to(torch.float8_e4m3fn)
+            codes = getattr(first, f"{name}_weight")
+            scales = getattr(first, f"{name}_weight_scale")
+            assert codes.dtype == torch.float8_e4m3fn and scales.dtype == torch.float32
+            assert codes.is_contiguous() and scales.is_contiguous()
+            assert torch.isfinite(codes.float()).all() and torch.count_nonzero(
+                codes.float()
+            )
+            assert (scales > 0).all() and torch.isfinite(scales).all()
+            assert torch.equal(
+                codes[expert].view(torch.uint8), expected.view(torch.uint8)
+            )
+            assert torch.equal(scales[expert], scale)
+            assert torch.equal(
+                codes.view(torch.uint8),
+                getattr(repeat, f"{name}_weight").view(torch.uint8),
+            )
+    assert first.w13_input_layout == "concatenated"
+    assert (first.ep_rank, first.ep_size, first.num_local_experts) == (0, 1, 3)
+
+
+@pytest.mark.parametrize("experts", [16, 32, 64])
+def test_beam_grouped_routes_use_biased_selection_but_unbiased_fp32_weights(
+    monkeypatch,
+    experts,
+):
+    # Nonzero bias distinguishes selection from weights without dominating
+    # the group-score differences that the truncation checks exercise.
+    bias = torch.linspace(-0.04, 0.04, experts, dtype=torch.float32)
+    monkeypatch.setattr(
+        moe_generator, "_correction_bias", lambda experts, *, device: bias
+    )
+    logits, weights, ids = moe_generator._grouped_routing_tensors(
+        tokens=3,
+        experts=experts,
+        topk=8,
+        num_groups=8,
+        group_topk=2,
+        topk_groups=4,
+        routed_scaling_factor=2.5,
+        normalize_topk_weights=True,
+        generator=torch.Generator(device="cpu").manual_seed(13),
+    )
+    expected_ids = []
+    scores = logits.sigmoid()
+    choices = scores + bias
+    group_width = experts // 8
+    distinguishes_group_sum = False
+    for row in choices:
+        group_scores = [
+            sum(
+                sorted(
+                    row[group * group_width : (group + 1) * group_width].tolist(),
+                    reverse=True,
+                )[:2]
+            )
+            for group in range(8)
+        ]
+        groups = sorted(range(8), key=lambda group: group_scores[group], reverse=True)[
+            :4
+        ]
+        all_member_scores = [
+            sum(row[group * group_width : (group + 1) * group_width].tolist())
+            for group in range(8)
+        ]
+        wrong_groups = sorted(
+            range(8), key=lambda group: all_member_scores[group], reverse=True
+        )[:4]
+        distinguishes_group_sum |= set(groups) != set(wrong_groups)
+        selected = sorted(
+            (
+                expert
+                for group in groups
+                for expert in range(group * group_width, (group + 1) * group_width)
+            ),
+            key=lambda expert: float(row[expert]),
+            reverse=True,
+        )[:8]
+        expected_ids.append(selected)
+    if experts > 16:
+        assert 4 * group_width > 8  # Final expert selection also truncates.
+        assert distinguishes_group_sum
+    expected_ids = torch.tensor(expected_ids, dtype=torch.int32)
+    gathered = scores.gather(1, expected_ids.long())
+    expected_weights = gathered / (gathered.sum(-1, keepdim=True) + 1e-20) * 2.5
+    assert torch.equal(ids, expected_ids)
+    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+    assert weights.dtype == torch.float32 and ids.dtype == torch.int32
+    assert logits.dtype == torch.float32
+    assert torch.all((ids >= 0) & (ids < experts))
+    assert all(len(set(row)) == 8 for row in ids.tolist())
+    torch.testing.assert_close(weights.sum(-1), torch.full((3,), 2.5))
+    wrong = choices.gather(1, ids.long())
+    wrong = wrong / wrong.sum(-1, keepdim=True) * 2.5
+    assert not torch.allclose(weights, wrong)
+
+
+def test_beam_channel_ordinary_admission_without_a_timing_override(mi350_platform):
+    assert resolve_kernel_override("moe", "apply", None) is None
+    moe_generator.load_builtin_kernels()
+    original = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        KernelRegistry.get().clear_cache()
+        plan = moe_ops.moe_plan(
+            "fp8_channel",
+            input_dtype=torch.bfloat16,
+            activation="silu",
+            requires_deferred_finalize=False,
+            routing_mode="precomputed_topk",
+            a2a_backend="none",
+            ep_size=1,
+            ispp=640,
+            hidden=5120,
+            num_experts=256,
+            top_k=8,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fp8_scale_block_shape=None,
+            internal_activation_dtype="input",
+            with_bias=False,
+            fast_math=True,
+            combine_order="rank",
+            solution=None,
+        )
+    finally:
+        Platform.override(original)
+        KernelRegistry.get().clear_cache()
+    assert plan["apply_kernel_name"] == "gluon_fp8_channel_bf16_precomputed_moe_apply"
+    assert plan["weight_preprocessor"] is None
+    assert plan["supports_precomputed_topk"] and not plan["supports_deferred_finalize"]
+
+
+def test_beam_preparation_keeps_routing_and_quantization_outside_the_wrong_boundary(
+    monkeypatch, mi350_platform
+):
+    assert resolve_kernel_override("moe", "apply", None) is None
+    # The preparation API receives platform metadata, but public MoE planning
+    # also consults the global platform. Isolate both selection and its cache.
+    monkeypatch.setattr(Platform, "_instance", mi350_platform)
+    monkeypatch.setattr(KernelRegistry.get(), "_selection_cache", {})
+    monkeypatch.setattr(
+        moe_generator,
+        "_generator",
+        lambda seed: torch.Generator(device="cpu").manual_seed(seed),
+    )
+    monkeypatch.setattr(
+        moe_generator,
+        "_randn",
+        lambda shape, *, generator, dtype: torch.randn(
+            shape, generator=generator, dtype=dtype
+        ),
+    )
+    selected_call = SelectedKernel.__call__
+    leaf_calls = []
+
+    def cpu_leaf(selected, *args, **kwargs):
+        if selected.name == "triton_fp8_channel_fused_precomputed_moe_apply":
+            leaf_calls.append(kwargs)
+            return kwargs["x"]
+        return selected_call(selected, *args, **kwargs)
+
+    # Only unavailable GPU leaf execution is replaced; public moe_apply,
+    # planning, preprocessing and public grouped routing remain real.
+    monkeypatch.setattr(SelectedKernel, "__call__", cpu_leaf)
+    prepared = prepare_moe_apply(_beam_request(), mi350_platform)
+    assert not leaf_calls
+    first, second = prepared.invocation.invoke(), prepared.invocation.invoke()
+    assert first is second and first.dtype == torch.bfloat16
+    assert len(leaf_calls) == 2
+    for call in leaf_calls:
+        assert call["x"] is first and call["x"].shape == (2, 128)
+        assert call["router_logits"].dtype == torch.float32
+        assert call["topk_weights"].dtype == torch.float32
+        assert call["topk_ids"].dtype == torch.int32
+        assert call["w"].w13_weight.dtype == torch.float8_e4m3fn
+        assert call["w"].w13_weight_scale.dtype == torch.float32
+        assert call["do_finalize"] is True
+        assert call["num_tokens_global"] == call["max_num_tokens_per_gpu"] == 2
+    assert leaf_calls[0]["topk_ids"] is leaf_calls[1]["topk_ids"]
+    assert leaf_calls[0]["topk_weights"] is leaf_calls[1]["topk_weights"]
+    assert prepared.validation is None
+    assert (
+        prepared.parameters["selected_apply_registration"] == prepared.registration.name
+    )
+    assert prepared.parameters["apply_override"] is None
+    assert sum(prepared.parameters["routes_per_expert"]) == 16
+    assert prepared.parameters["weight_seed"] == 42 ^ 0x4245414D
+    assert (
+        prepared.parameters["weight_construction"]
+        == "per-output-channel-normal-0.02-v1"
+    )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"activation": "swiglu", "swiglu_limit": 10.0},
+        {"internal_activation_dtype": "mxfp4"},
+        {"router_logits_dtype": "bfloat16"},
+        {"route_distribution": "router"},
+        {"route_scope": "local"},
+        {"fp8_scale_block_shape": [128, 128]},
+        {"tp_size": 3},
+        {"ep_rank": 1},
+        {"num_groups": 0},
+        {"num_groups": 3},
+        {"group_topk": 3},
+        {"topk_groups": 9},
+        {"route_weights_dtype": "bfloat16"},
+    ],
+)
+def test_beam_channel_rejects_unimplemented_contract_before_allocating(
+    updates, mi350_platform
+):
+    with pytest.raises(BenchmarkCaseError):
+        prepare_moe_apply(_beam_request(**updates), mi350_platform)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"solution": "triton"},
+        {"registration": "triton_fp8_channel_fused_precomputed_moe_apply"},
+    ],
+)
+def test_beam_still_refuses_request_level_exact_selection(options, mi350_platform):
+    with pytest.raises(BenchmarkCaseError, match="normal kernel selection"):
+        prepare_moe_apply(replace(_beam_request(), **options), mi350_platform)
+
+
+def test_beam_still_reports_generator_validation_unavailable(mi350_platform):
+    with pytest.raises(
+        BenchmarkCaseError, match="correctness validation is not implemented"
+    ):
+        prepare_moe_apply(_beam_request(validation={"runs": 1}), mi350_platform)
+
+
+@pytest.mark.parametrize(
+    "operation", ["grouped_route", "router_select", "route_epilogue", "plan"]
+)
+def test_beam_rejects_unexplained_preparation_overrides(
+    monkeypatch, operation, mi350_platform
+):
+    monkeypatch.setenv(
+        f"TOKENSPEED_KERNEL_OVERRIDE_MOE_{operation.upper()}", "unexplained"
+    )
+    with pytest.raises(BenchmarkCaseError, match="override"):
+        prepare_moe_apply(_beam_request(), mi350_platform)
+
+
+def test_beam_rejects_a_quantizer_override_that_changes_the_timed_operation(
+    monkeypatch, mi350_platform
+):
+    monkeypatch.setenv("TOKENSPEED_KERNEL_OVERRIDE_QUANTIZATION_FP8", "unexplained")
+    with pytest.raises(BenchmarkCaseError, match="quantization.fp8 override"):
+        prepare_moe_apply(_beam_request(), mi350_platform)
+
+
+def test_beam_grouping_counts_are_required_before_allocation(mi350_platform):
+    request = _beam_request()
+    del request.parameters["group_topk"]
+    with pytest.raises(BenchmarkCaseError, match="explicit grouping counts"):
+        prepare_moe_apply(request, mi350_platform)
+
+
+def test_timing_override_precedence_and_restoration_are_not_admission(monkeypatch):
+    monkeypatch.delenv("TOKENSPEED_KERNEL_OVERRIDE_MOE_APPLY", raising=False)
+    assert resolve_kernel_override("moe", "apply", None) is None
+    with kernel_override("moe", "apply", "context-only"):
+        assert resolve_kernel_override("moe", "apply", None) == "context-only"
+        with monkeypatch.context() as environment:
+            environment.setenv("TOKENSPEED_KERNEL_OVERRIDE_MOE_APPLY", "timing-only")
+            assert resolve_kernel_override("moe", "apply", None) == "timing-only"
+        assert resolve_kernel_override("moe", "apply", None) == "context-only"
+    assert resolve_kernel_override("moe", "apply", None) is None
 
 
 def _kimi_latent_expert_shared_request() -> BenchmarkRequest:
@@ -493,7 +835,7 @@ def test_latent_input_generator_matches_runtime_packed_projection_contract(
     )
     seen = {}
     _use_cpu_allocations(monkeypatch)
-    latent_input_ops = importlib.import_module("tokenspeed_kernel.ops.moe.latent_input")
+    latent_input_ops = importlib.import_module("tokenspeed_kernel.ops.moe")
     monkeypatch.setattr(moe_generator, "load_builtin_kernels", lambda: None)
     monkeypatch.setattr(moe_generator, "_selected_spec", lambda *_args: spec)
     monkeypatch.setattr(
@@ -594,9 +936,7 @@ def test_latent_expert_shared_generator_uses_global_ep_routes_and_reset(
     )
     seen = {}
     _use_cpu_allocations(monkeypatch)
-    latent_decode_ops = importlib.import_module(
-        "tokenspeed_kernel.ops.moe.latent_decode"
-    )
+    latent_decode_ops = importlib.import_module("tokenspeed_kernel.ops.moe")
     monkeypatch.setattr(moe_generator, "load_builtin_kernels", lambda: None)
     monkeypatch.setattr(
         moe_generator,
@@ -710,3 +1050,96 @@ def test_latent_expert_shared_skips_incompatible_weight_representation() -> None
 
     assert error.value.status is BenchmarkStatus.NOT_APPLICABLE
     assert "not compatible with the joint" in str(error.value)
+
+
+def _qwen38_request(mode: str, **parameters: object) -> BenchmarkRequest:
+    return BenchmarkRequest(
+        family="moe",
+        mode=mode,
+        parameters={"model_profile": "qwen38_flash_tp2", **parameters},
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_softmax_topk_generator_selection_matches_operation_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tokenspeed_kernel.ops.moe as softmax_topk_ops
+
+    captured: list[tuple] = []
+
+    def select(family, mode, signature, **kwargs):
+        captured.append((family, mode, signature, kwargs["traits"]))
+        raise RuntimeError("selection captured")
+
+    monkeypatch.setattr(softmax_topk_ops, "select_kernel", select)
+    monkeypatch.setattr(moe_generator, "select_kernel", select)
+    monkeypatch.setattr(moe_generator, "load_builtin_kernels", lambda: None)
+
+    with pytest.raises(RuntimeError, match="selection captured"):
+        moe_ops.moe_topk(
+            torch.zeros((64, 512), dtype=torch.bfloat16, device="cuda"),
+            10,
+            "softmax",
+            "topk",
+            True,
+            1.0,
+        )
+    request = _qwen38_request(
+        "softmax_topk",
+        tokens=64,
+        num_experts=512,
+        topk=10,
+        router_logits_dtype="bfloat16",
+        normalize_topk_weights=True,
+    )
+    with pytest.raises(RuntimeError, match="selection captured"):
+        moe_generator.prepare_softmax_topk(request, None)
+
+    assert captured[0] == captured[1]
+
+
+def test_moe_apply_generator_plans_dynamic_mxfp4_activations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def capture_plan(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("plan captured")
+
+    monkeypatch.setattr(moe_generator, "load_builtin_kernels", lambda: None)
+    monkeypatch.setattr(moe_ops, "moe_plan", capture_plan)
+    request = _qwen38_request(
+        "apply",
+        tokens=64,
+        hidden_size=2560,
+        intermediate_size=640,
+        num_experts=512,
+        num_local_experts=512,
+        topk=10,
+        tp_size=2,
+        ep_size=1,
+        ep_rank=0,
+        input_dtype="bfloat16",
+        router_logits_dtype="bfloat16",
+        weight_dtype="mxfp4",
+        activation="silu",
+        routing_mode="precomputed_topk",
+        route_scope="global",
+        route_distribution="router",
+        routed_scaling_factor=1.0,
+        normalize_topk_weights=True,
+        internal_activation_dtype="mxfp4",
+        token_count_scope="global",
+    )
+    with pytest.raises(RuntimeError, match="plan captured"):
+        prepare_moe_apply(request, None)
+
+    assert captured["weight_dtype"] == "mxfp4"
+    assert captured["internal_activation_dtype"] == "mxfp4"
+    assert captured["ispp"] == 320

@@ -65,7 +65,7 @@ In these test cases, `q_seqlen = 4` and `kv_seqlen = 80K`.
 
 TensorRT-LLM uses a single kernel for MLA decode, which appears to adopt a swap-AB strategy in the tested cases. In contrast, TokenSpeed’s MLA decode kernel uses a two-kernel implementation: one kernel computes the MLA decode with split-KV, and a second kernel performs the reduction of the split-KV partial results.
 
-Key Optimization of TokenSpeed MLA decode kernel: Group `q_seqlen` and `num_heads` into BMM1 `M`
+Key optimization of the TokenSpeed MLA decode kernel: group `q_seqlen` and `num_heads` into BMM1 `M`
 
 In `mla_decode.py`, `mla_decode_fp16.py`, and `mla_decode_fp8.py`, decode uses
 `fold_sq_factor` to partially fold query tokens into the head axis when
@@ -84,11 +84,10 @@ decode scenarios, especially token-by-token agent traffic. Example: with
 query tokens into `M` (`H_eff=128`) and schedules the remaining two query
 groups on the scheduler second dimension (`q_seqlen_eff=2`).
 
-The public `tokenspeed_mla_decode` also accepts `enable_packed_q=True` to
-opt into continuous query/head packing on the FP8 and FP16/BF16 M128 paths, adapted from
-FlashInfer PR #4178. The default is **False**, preserving the folded-query
-implementation. M64 and token-gapped Q/output views continue to
-use that implementation even when the option is enabled.
+`tokenspeed_mla_decode` automatically selects continuous query/head packing
+on the FP8 and FP16/BF16 M128 paths when it uses fewer tiles than folding.
+Ties, M64 kernels, and token-gapped Q/output views retain folding.
+The packing implementation is adapted from FlashInfer PR #4178.
 
 The packing orders rows as `query_token * num_heads + head`. Each 2-CTA
 group owns 128 consecutive rows, including across query boundaries. Thus
@@ -99,27 +98,26 @@ per-row causal positions and predicates partial output/LSE rows.
 
 For packed queries, auto split-KV uses `ceil(H * q_len / 128)` query tiles,
 and workspace needs `B * 128 * ceil(H * q_len / 128) * split_kv * 513 * 4`
-bytes for D512/FP32 partials, or zero when split-KV is one. Callers enabling
-this option must provide sufficient workspace. Output shape, output dtype
+bytes for D512/FP32 partials, or zero when split-KV is one. Callers must
+provide sufficient workspace for the selected layout. Output shape, output dtype
 (BF16 for FP8; input dtype for FP16/BF16), and base-2 LSE semantics are unchanged.
 The FP16/BF16 implementation retains its existing split-KV heuristic, reducer
-capacity and PDL waits. The option is part of the
-compile cache key. Existing direct kernel callers retain the old layout;
-opting in through the public wrapper keeps tiling and workspace consistent.
+capacity and PDL waits. The selected layout is part of the compile cache key.
+The wrapper keeps tiling, workspace sizing, and kernel selection consistent.
 
 Sliding-window and DCP masking remain supported; window boundaries use the
 packed row's original query-token position.
 
 Regression coverage is in [tests/test_mla_decode.py](tests/test_mla_decode.py).
 It checks packed-query geometry, split-KV workspace sizing, FP8/FP16/BF16
-outputs and LSE, reducer variants, CUDA-graph replay, sliding windows and DCP.
+outputs and LSE, reducer variants, CUDA-graph replay, sliding windows, and DCP.
 From the repository root, select this checkout's sources explicitly:
 
 ```bash
 PYTHONPATH=tokenspeed-mla/python python -m pytest -q tokenspeed-mla/tests/test_mla_decode.py
 ```
 
-GPU cases require SM100, SM103 or SM107; pytest skips them on other devices.
+GPU cases require SM100, SM103, or SM107; pytest skips them on other devices.
 Add `-k 'not TestGPU and not TestCompile'` for CPU checks, `-k TestCompile`
 for compilation checks across all three architectures, or `-k TestGPU` for
 GPU checks. Compilation checks require a CuTe DSL and CUDA toolchain that
@@ -128,10 +126,10 @@ support the target architecture, even when no GPU is visible.
 ### SM107 decode
 
 FP8 and FP16/BF16 decode share the existing kernel classes, scheduler,
-split-KV reducer and masking logic across SM100, SM103 and SM107. The public
+split-KV reducer, and masking logic across SM100, SM103, and SM107. The public
 wrapper selects the architecture from `query.device` and includes it in the
 compile cache key and compiler target. Direct kernel construction requires
-an explicit `compute_capability=(10, 0)`, `(10, 3)` or `(10, 7)`.
+an explicit `compute_capability=(10, 0)`, `(10, 3)`, or `(10, 7)`.
 
 On SM107, an `out` tensor with dtype `torch.float8_e4m3fn` selects
 [`mla_decode_fp8_sm107.py`](python/tokenspeed_mla/mla_decode_fp8_sm107.py).
@@ -139,17 +137,43 @@ The kernel packs query/head rows into M256 tiles and uses 4-CTA clusters
 to separate QK/softmax from PV, with a 2-CTA fallback. BF16 output keeps
 using the shared kernel.
 
+The M256 kernel and its 2-CTA fallback also support native BF16 output for
+direct launches through `_sm107_fp8_out_decode`. The compilation helper takes
+an explicit `output_dtype`, which determines the output tensor type and is
+part of the compile cache key. Epilogues, the split-KV reducer, and empty-row
+stores write the selected dtype directly; no conversion kernel is needed.
+Q/KV and probabilities remain FP8, and split-KV partials remain FP32. Changing
+the output dtype does not change split selection or softmax precision.
+BF16 results are checked against an FP32 reference; bitwise equality with
+the shared M128 kernel is not guaranteed because the computation order and
+normalization parameters differ.
+
 The public wrapper uses FP32 for softmax exponentials and row sums. Packed
 FP16 softmax remains an explicit option for direct kernel construction.
+In the mixed-cluster kernel, both precisions handle each softmax group's
+final tile in the masked tail loop. This removes final-sum exchange branches
+from the full-tile loop while preserving causal masks and odd/even tile counts.
+Unsplit walks retain the normalization base for maximum increases of up to
+4 log2 units; split chunks use 8. This reduces PV rescaling and bounds the
+unnormalized probabilities by 16 and 256 respectively, within FP8 E4M3's range.
+The normalization base affects FP8 rounding, so output and LSE accuracy are
+checked against an FP32 reference.
 
-FP8 output supports up to four M256 tiles per request. By default, `H` must
-divide 256 and `q_len` must be a multiple of `256 / H`;
-`enable_packed_q=True` accepts other shapes such as H96 and partial tiles.
-The kernel supports causal/non-causal attention, split-KV, LSE, PDL and CUDA
+Automatic split-KV planning uses the capacity of full 4-CTA clusters, reserves
+`clusters // 16` slots, and targets one wave of work. The wrapper preserves
+an explicit `min_split_kv` and normalizes the result to nonempty partitions.
+This limits workspace traffic and reduction work, but can reduce parallelism
+too far for some shapes. The H96/B16/Q4 cases regress when the split count
+drops from three to one.
+
+The M256 kernel always packs query/head rows into 256-row tiles and supports
+up to four tiles per request for either output dtype, including H96 and
+partial final tiles.
+The kernel supports causal/non-causal attention, split-KV, LSE, PDL, and CUDA
 graphs; it does not support sliding windows, DCP, or `local_visible_lens`.
 Rows with no visible keys produce zero output and `-inf` LSE.
 
-SM107 FP8-output compilation and GPU regression tests reject CuTe DSL warnings.
+SM107 FP8/BF16-output compilation and GPU regression tests reject CuTe DSL warnings.
 The mixed-cluster kernel issues CLC queries directly and owns its unswizzled
 grid and response decoding, avoiding the deprecated example scheduler classes.
 
@@ -165,11 +189,10 @@ Other optimizations include:
   when the real output rows do not fill the GPU. These changes adapt the
   split-KV and reducer optimizations from FlashInfer PR #4178 to TokenSpeed's
   folded-query layout; both reducer settings are included in the compile cache.
-- Using 2CTA UTCMMA instruction to reduce shared memory usage.
-- Try to use as few mbarriers as possible.
+- Use the 2CTA UTCMMA instruction to reduce shared memory usage.
+- Use as few mbarriers as possible.
 - Split the KV loading warp to get more latency-hiding ability. After loading K, V is already in the L2 cache. Loading K of the next tile does not have to wait for the completion of V loading.
-- Using multiple stages (sub-tiling) for STG in the epilogue.
-
+- Use multiple stages (sub-tiling) for STG in the epilogue.
 
 Collect the performance numbers with this command line:
 ```
@@ -245,7 +268,7 @@ multiply by the same-GPU speedups.
 
 ## Kernel capability summary
 
-### MLA Prefill (`tokenspeed_mla_prefill`)
+### MLA prefill (`tokenspeed_mla_prefill`)
 
 What it supports:
 
@@ -267,11 +290,11 @@ Input/output dtype behavior:
 
 - The CuTe DSL backend accepts these input dtypes:
   - `torch.float16`, `torch.bfloat16`, `torch.float8_e4m3fn`, `torch.float8_e5m2`
-  - MLA Prefill supports only `torch.float8_e4m3fn`
+  - MLA prefill supports only `torch.float8_e4m3fn`
 - Prefill output tensor is BF16 (`torch.bfloat16`)
 - Optional LSE output is FP32
 
-### MLA Decode (`tokenspeed_mla_decode`)
+### MLA decode (`tokenspeed_mla_decode`)
 
 What it supports:
 

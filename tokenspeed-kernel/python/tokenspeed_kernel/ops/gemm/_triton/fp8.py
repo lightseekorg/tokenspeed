@@ -1,0 +1,924 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+import functools
+import math
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import List, Optional
+
+import torch
+from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import Platform
+
+
+def prepare_block_fp8_matmul_inputs(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: List[int],
+    output_dtype: torch.dtype = torch.float16,
+    out: torch.Tensor | None = None,
+) -> tuple[int, int, int, torch.Tensor]:
+    assert len(block_size) == 2
+    block_n, block_k = block_size[0], block_size[1]
+
+    assert A.shape[-1] == B.shape[-1]
+    assert A.shape[:-1] == As.shape[:-1]
+    assert A.is_contiguous()
+
+    if As.dtype == torch.float:
+        assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+    elif As.dtype == torch.int:
+        assert (
+            triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1]
+        ), f"{A.shape=} {As.shape=} {block_size=}"
+    elif As.dtype == torch.uint8:
+        assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+    else:
+        raise NotImplementedError
+
+    M = A.numel() // A.shape[-1]
+
+    assert B.ndim == 2
+    assert B.is_contiguous()
+    assert Bs.ndim == 2
+    N, K = B.shape
+
+    if Bs.dtype == torch.float:
+        assert triton.cdiv(N, block_n) == Bs.shape[0]
+        assert triton.cdiv(K, block_k) == Bs.shape[1]
+    elif Bs.dtype == torch.int:
+        assert N == Bs.shape[0], f"{B.shape=} {Bs.shape=} {block_size=}"
+        assert (
+            triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1]
+        ), f"{B.shape=} {Bs.shape=} {block_size=}"
+    elif Bs.dtype == torch.uint8:
+        assert triton.cdiv(N, block_n) == Bs.shape[0]
+        assert triton.cdiv(K, block_k) == Bs.shape[1]
+    else:
+        raise NotImplementedError
+
+    C_shape = A.shape[:-1] + (N,)
+    C = out if out is not None else A.new_empty(C_shape, dtype=output_dtype)
+
+    return M, N, K, C
+
+
+_GFX950_W8A8_BLOCK_FP8_SHAPES = frozenset(
+    {
+        (1024, 4096),
+        (2048, 4096),
+        (4096, 512),
+        (4096, 1536),
+        (4096, 3072),
+        (4096, 4096),
+        (6144, 4096),
+    }
+)
+
+
+@functools.lru_cache(maxsize=256)
+def _get_gfx950_w8a8_block_fp8_config(
+    M: int, N: int, K: int, block_n: int, block_k: int
+) -> Mapping[str, int] | None:
+    if (N, K) not in _GFX950_W8A8_BLOCK_FP8_SHAPES or (block_n, block_k) != (128, 128):
+        return None
+
+    if M <= 64:
+        # The narrow output benefits from less M grouping through the
+        # measured M=16 bucket; nearest-bucket dispatch crossed over at M=25.
+        if (N, K) == (1024, 4096) and M <= 24:
+            group_size_m = 1
+        elif (N, K) == (4096, 512):
+            group_size_m = 4
+        else:
+            group_size_m = 8
+        config = {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": group_size_m,
+            "num_warps": 2,
+            "num_stages": 1,
+        }
+    elif M <= 128:
+        config = {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
+    else:
+        config = {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
+    return MappingProxyType(config)
+
+
+def get_w8a8_block_fp8_config(
+    M: int, N: int, K: int, block_n: int, block_k: int
+) -> Mapping[str, int] | None:
+    """Select the measured block-FP8 GEMM launch configuration.
+
+    The gfx950 policy is the compact form of a shape sweep over GLM-5.3's
+    dense FP8 projections. Explicit ranges preserve the legacy launch choices
+    without relying on nearest-neighbor lookup through per-shape JSON files.
+    Uncovered architectures, matrix shapes, and scale layouts return ``None``
+    so the portable launch heuristic remains the fallback.
+
+    Args:
+        M: Number of activation rows.
+        N: Output width.
+        K: Reduction width.
+        block_n: Weight-scale block size along N.
+        block_k: Activation and weight-scale block size along K.
+
+    Returns:
+        An immutable mapping of Triton launch parameters when the shape is
+        covered by the gfx950 sweep, otherwise ``None``.
+    """
+    if not Platform.get().is_cdna4:
+        return None
+    return _get_gfx950_w8a8_block_fp8_config(M, N, K, block_n, block_k)
+
+
+@triton.jit
+def _w8a8_block_fp8_matmul(
+    # Pointers to inputs and output
+    A,
+    B,
+    C,
+    As,
+    Bs,
+    # Shape for matmul
+    M,
+    N,
+    K,
+    # Block size for block-wise quantization
+    group_n,
+    group_k,
+    # Stride for inputs and output
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_As_m,
+    stride_As_k,
+    stride_Bs_k,
+    stride_Bs_n,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """Triton-accelerated function used to perform linear operations (dot
+    product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
+    tensor `C`.
+    """
+
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    As_ptrs = As + offs_am * stride_As_m
+    offs_bsn = offs_bn // group_n
+    Bs_ptrs = Bs + offs_bsn * stride_Bs_n
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+
+        k_start = k * BLOCK_SIZE_K
+        offs_ks = k_start // group_k
+        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
+        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+        if As.dtype.element_ty == tl.uint8:
+            a_s = tl.exp2(a_s.to(tl.float32) - 127.0)
+        if Bs.dtype.element_ty == tl.uint8:
+            b_s = tl.exp2(b_s.to(tl.float32) - 127.0)
+
+        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if C.dtype.element_ty == tl.bfloat16:
+        c = accumulator.to(tl.bfloat16)
+    elif C.dtype.element_ty == tl.float16:
+        c = accumulator.to(tl.float16)
+    else:
+        c = accumulator.to(tl.float32)
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+@triton.jit
+def _w8a8_block_fp8_matmul_unrolledx4(
+    # Pointers to inputs and output
+    A,
+    B,
+    C,
+    As,
+    Bs,
+    # Shape for matmul
+    M,
+    N,
+    K,
+    # Block size for block-wise quantization
+    group_n,
+    group_k,
+    # Stride for inputs and output
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_As_m,
+    stride_As_k,
+    stride_Bs_k,
+    stride_Bs_n,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """Triton-accelerated function used to perform linear operations (dot
+    product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
+    tensor `C`.
+    """
+
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    As_ptrs = As + offs_am * stride_As_m
+    offs_bsn = offs_bn // group_n
+    Bs_ptrs = Bs + offs_bsn * stride_Bs_n
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # manually unroll to 4 iterations
+    UNROLL_FACTOR = 4
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K * UNROLL_FACTOR)):
+        # 1st iteration
+        a = tl.load(
+            a_ptrs,
+            mask=offs_k[None, :] < K - (k * UNROLL_FACTOR) * BLOCK_SIZE_K,
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=offs_k[:, None] < K - (k * UNROLL_FACTOR) * BLOCK_SIZE_K,
+            other=0.0,
+        )
+
+        k_start = (k * UNROLL_FACTOR) * BLOCK_SIZE_K
+        offs_ks = k_start // group_k
+        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
+        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+
+        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+        # 2nd iteration
+        a = tl.load(
+            a_ptrs,
+            mask=offs_k[None, :] < K - (k * UNROLL_FACTOR + 1) * BLOCK_SIZE_K,
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=offs_k[:, None] < K - (k * UNROLL_FACTOR + 1) * BLOCK_SIZE_K,
+            other=0.0,
+        )
+
+        k_start = k_start + BLOCK_SIZE_K
+        offs_ks = k_start // group_k
+        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
+        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+
+        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+        # 3rd iteration
+        a = tl.load(
+            a_ptrs,
+            mask=offs_k[None, :] < K - (k * UNROLL_FACTOR + 2) * BLOCK_SIZE_K,
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=offs_k[:, None] < K - (k * UNROLL_FACTOR + 2) * BLOCK_SIZE_K,
+            other=0.0,
+        )
+
+        k_start = k_start + BLOCK_SIZE_K
+        offs_ks = k_start // group_k
+        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
+        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+
+        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+        # 4th iteration
+        a = tl.load(
+            a_ptrs,
+            mask=offs_k[None, :] < K - (k * UNROLL_FACTOR + 3) * BLOCK_SIZE_K,
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=offs_k[:, None] < K - (k * UNROLL_FACTOR + 3) * BLOCK_SIZE_K,
+            other=0.0,
+        )
+
+        k_start = k_start + BLOCK_SIZE_K
+        offs_ks = k_start // group_k
+        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
+        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+
+        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if C.dtype.element_ty == tl.bfloat16:
+        c = accumulator.to(tl.bfloat16)
+    elif C.dtype.element_ty == tl.float16:
+        c = accumulator.to(tl.float16)
+    else:
+        c = accumulator.to(tl.float32)
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+def _get_device_core_count(device_id: int = 0) -> int:
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_properties(device_id).multi_processor_count
+    return 0
+
+
+def w8a8_block_fp8_matmul_triton(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: List[int],
+    output_dtype: torch.dtype = torch.float16,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """This function performs matrix multiplication with block-wise quantization.
+
+    It takes two input tensors `A` and `B` with scales `As` and `Bs`.
+    The output is returned in the specified `output_dtype`.
+
+    Args:
+        A: The input tensor, e.g., activation.
+        B: The input tensor, e.g., weight.
+        As: The per-token-group quantization scale for `A`.
+        Bs: The per-block quantization scale for `B`.
+        block_size: The block size for per-block quantization. It should be 2-dim, e.g., [128, 128].
+        output_dytpe: The dtype of the returned tensor.
+
+    Returns:
+        torch.Tensor: The result of matmul.
+    """
+    M, N, K, C = prepare_block_fp8_matmul_inputs(
+        A, B, As, Bs, block_size, output_dtype, out=out
+    )
+
+    block_n, block_k = block_size
+
+    config = get_w8a8_block_fp8_config(M, N, K, block_n, block_k)
+    if config is None:
+        # Default config
+        # Each K tile consumes one scale, so its width must equal the scale group.
+        if Platform.get().is_amd:
+            config = {
+                "BLOCK_SIZE_M": 16 if M <= 128 else 32,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": block_size[1],
+                "GROUP_SIZE_M": 8,
+                "num_warps": 4,
+                "num_stages": 1,
+            }
+        else:
+            config = {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": max(64, block_size[0]),
+                "BLOCK_SIZE_K": block_size[1],
+                "GROUP_SIZE_M": 32,
+                "num_warps": 4,
+                "num_stages": 3,
+            }
+
+    if config["BLOCK_SIZE_K"] != block_k:
+        raise ValueError(
+            "block-scaled FP8 GEMM requires BLOCK_SIZE_K to match the scale "
+            f"group exactly, got BLOCK_SIZE_K={config['BLOCK_SIZE_K']} and "
+            f"group_k={block_k}"
+        )
+
+    kernel = _w8a8_block_fp8_matmul
+    if Platform.get().is_amd and config["BLOCK_SIZE_N"] == block_size[0]:
+        num_workgroups = math.ceil(M / config["BLOCK_SIZE_M"]) * math.ceil(
+            N / config["BLOCK_SIZE_N"]
+        )
+        if num_workgroups <= _get_device_core_count():
+            # Use manually unrolledx4 kernel on AMD GPU when the grid size is small.
+            # Empirical testing shows the sweet spot lies when it's less than the # of
+            # compute units available on the device.
+            kernel = _w8a8_block_fp8_matmul_unrolledx4
+
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
+
+    kernel[grid](
+        A,
+        B,
+        C,
+        As,
+        Bs,
+        M,
+        N,
+        K,
+        block_n,
+        block_k,
+        A.stride(-2),
+        A.stride(-1),
+        B.stride(1),
+        B.stride(0),
+        C.stride(-2),
+        C.stride(-1),
+        As.stride(-2),
+        As.stride(-1),
+        Bs.stride(1),
+        Bs.stride(0),
+        **config,
+    )
+
+    return C
+
+
+def is_weak_contiguous(x: torch.Tensor):
+    strides = x.stride()
+    sizes = x.shape
+    is_not_transpose = strides[0] == 1 and (strides[1] >= max(1, sizes[0]))
+    is_transpose = strides[1] == 1 and (strides[0] >= max(1, sizes[1]))
+    return is_transpose or is_not_transpose
+
+
+@triton.jit
+def scaled_mm_kernel(
+    a_ptr,
+    b_ptr,
+    scale_a_ptr,
+    scale_b_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    ACCUMULATOR_DTYPE: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_SCALE_A: tl.constexpr,
+    BLOCK_SIZE_SCALE_B: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    accumulator_dtype = ACCUMULATOR_DTYPE
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=accumulator_dtype)
+
+    # NOTE: Some tensor inputs are so large, they will cause int32 overflow
+    # so it is necessary to use tl.int64 for all the offsets, else SEGV will
+    # eventually occur.
+
+    # Offsets and masks.
+    offsets_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    masks_am = offsets_am < M
+
+    offsets_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    masks_bn = offsets_bn < N
+
+    offsets_k = tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
+    offsets_a = stride_am * offsets_am[:, None] + stride_ak * offsets_k[None, :]
+    offsets_b = stride_bk * offsets_k[:, None] + stride_bn * offsets_bn[None, :]
+
+    # NOTE: BLOCK_SIZE_SCALE_A could be 1 or BLOCK_SIZE_M, so need to create
+    # appropriate offsets and masks for each case. Same goes for
+    # BLOCK_SIZE_SCALE_B.
+    offsets_scale_am = (
+        tl.arange(0, BLOCK_SIZE_SCALE_A)
+        + (BLOCK_SIZE_SCALE_A > 1) * pid_m * BLOCK_SIZE_M
+    )
+    masks_scale_am = offsets_scale_am < M
+
+    offsets_scale_bn = (
+        tl.arange(0, BLOCK_SIZE_SCALE_B)
+        + (BLOCK_SIZE_SCALE_B > 1) * pid_n * BLOCK_SIZE_N
+    )
+    masks_scale_bn = offsets_scale_bn < N
+
+    a_ptrs = a_ptr + offsets_a
+    b_ptrs = b_ptr + offsets_b
+
+    scale_a_ptrs = scale_a_ptr + offsets_scale_am
+    scale_b_ptrs = scale_b_ptr + offsets_scale_bn
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        masks_k = offsets_k < K
+        masks_a = masks_am[:, None] & masks_k[None, :]
+        a = tl.load(a_ptrs, mask=masks_a, other=0.0)
+
+        masks_b = masks_k[:, None] & masks_bn[None, :]
+        b = tl.load(b_ptrs, mask=masks_b, other=0.0)
+
+        # Accumulate results.
+        accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
+
+        offsets_k += BLOCK_SIZE_K
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    # Apply scale at end.
+    masks_scale_a = masks_scale_am[:, None] & (tl.arange(0, 1) < 1)[:, None]
+    scale_a = tl.load(scale_a_ptrs[:, None], masks_scale_a)
+    # Need to broadcast to the appropriate size, if scale_a is already
+    # (BLOCK_SIZE_M, 1) then it will broadcast to its own shape. Same goes
+    # for scale_b below.
+    scale_a = scale_a.broadcast_to((BLOCK_SIZE_M, 1))
+    accumulator = scale_a * accumulator.to(tl.float32)
+
+    masks_scale_b = masks_scale_bn[:, None] & (tl.arange(0, 1) < 1)[None, :]
+    scale_b = tl.load(scale_b_ptrs[:, None], masks_scale_b)
+    scale_b = scale_b.broadcast_to((BLOCK_SIZE_N, 1))
+    accumulator = scale_b.T * accumulator.to(tl.float32)
+
+    # Convert to output format.
+    c = accumulator.to(c_ptr.type.element_ty)
+
+    # Add bias, it's already in output format, so add it after conversion.
+    if bias_ptr:
+        offsets_bias = offsets_bn
+        bias_ptrs = bias_ptr + offsets_bias
+        bias_mask = offsets_bias < N
+        bias = tl.load(bias_ptrs, bias_mask)
+        c += bias
+
+    # Save output
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    offs_cm = offs_cm.to(tl.int64)
+    offs_cn = offs_cn.to(tl.int64)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+# input  - [M, K]
+# weight - [K, N]
+def triton_scaled_mm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: type[torch.dtype],
+    bias: Optional[torch.Tensor] = None,
+    block_size_m: int = 32,
+    block_size_n: int = 32,
+    block_size_k: int = 32,
+    use_heuristic=True,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    M, K = input.shape
+    N = weight.shape[1]
+
+    assert N > 0 and K > 0 and M >= 0
+    assert weight.shape[0] == K
+    assert input.dtype == weight.dtype
+
+    scale_a = scale_a.reshape(-1, 1) if scale_a.dim() <= 1 else scale_a
+    scale_b = scale_b.reshape(-1, 1) if scale_b.dim() <= 1 else scale_b
+
+    assert scale_a.dtype == scale_b.dtype and scale_a.is_floating_point()
+    assert scale_a.shape[1] == 1 and (scale_a.shape[0] == 1 or scale_a.shape[0] == M)
+    assert scale_b.shape[1] == 1 and (scale_b.shape[0] == 1 or scale_b.shape[0] == N)
+    assert out_dtype.is_floating_point
+    assert bias is None or bias.is_floating_point()
+    assert is_weak_contiguous(input)
+    assert is_weak_contiguous(weight)
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+
+    result = (
+        out
+        if out is not None
+        else torch.empty((M, N), dtype=out_dtype, device=input.device)
+    )
+    if result.dtype != out_dtype:
+        raise ValueError(
+            f"triton_scaled_mm out expects dtype {out_dtype}, got {result.dtype}"
+        )
+
+    if M == 0:
+        return result
+
+    has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
+
+    if use_heuristic:
+        is_small_N = N < 8192
+        next_power_of_2_M = max(32, triton.next_power_of_2(M))
+        if next_power_of_2_M <= 32:
+            tile_shape = (64, 64, 256) if is_small_N else (64, 128, 256)
+        elif next_power_of_2_M <= 64:
+            tile_shape = (64, 64, 256)
+        elif next_power_of_2_M <= 128:
+            tile_shape = (64, 128, 128)
+        else:
+            tile_shape = (128, 128, 128)
+
+    block_size_m, block_size_n, block_size_k = tile_shape
+
+    block_size_sa = 1 if has_scalar(scale_a) else block_size_m
+    block_size_sb = 1 if has_scalar(scale_b) else block_size_n
+
+    accumulator_dtype = tl.float32 if input.is_floating_point() else tl.int32
+
+    # A = input, B = weight, C = result
+    # A = M x K, B = K x N, C = M x N
+    scaled_mm_kernel[grid](
+        input,
+        weight,
+        scale_a,
+        scale_b,
+        result,
+        bias,
+        M,
+        N,
+        K,
+        input.stride(0),
+        input.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        result.stride(0),
+        result.stride(1),
+        accumulator_dtype,
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_n,
+        BLOCK_SIZE_K=block_size_k,
+        BLOCK_SIZE_SCALE_A=block_size_sa,
+        BLOCK_SIZE_SCALE_B=block_size_sb,
+    )
+
+    return result
+
+
+@triton.jit
+def _w8a8_block_fp8_bmm(
+    A,
+    B,
+    C,
+    As,
+    Bs,
+    M,
+    N,
+    K,
+    group_n,
+    group_k,
+    stride_ab,
+    stride_am,
+    stride_ak,
+    stride_bb,
+    stride_bn,
+    stride_bk,
+    stride_cb,
+    stride_cm,
+    stride_cn,
+    stride_asb,
+    stride_asm,
+    stride_ask,
+    stride_bsb,
+    stride_bsn,
+    stride_bsk,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k_start in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_offsets = k_start * BLOCK_SIZE_K + offs_k
+        a = tl.load(
+            A
+            + batch * stride_ab
+            + offs_m[:, None] * stride_am
+            + k_offsets[None, :] * stride_ak,
+            mask=(offs_m[:, None] < M) & (k_offsets[None, :] < K),
+            other=0.0,
+        )
+        b = tl.load(
+            B
+            + batch * stride_bb
+            + offs_n[None, :] * stride_bn
+            + k_offsets[:, None] * stride_bk,
+            mask=(offs_n[None, :] < N) & (k_offsets[:, None] < K),
+            other=0.0,
+        )
+        scale_k = (k_start * BLOCK_SIZE_K) // group_k
+        a_scale = tl.load(
+            As + batch * stride_asb + offs_m * stride_asm + scale_k * stride_ask,
+            mask=offs_m < M,
+            other=0.0,
+        )
+        b_scale = tl.load(
+            Bs
+            + batch * stride_bsb
+            + (offs_n // group_n) * stride_bsn
+            + scale_k * stride_bsk,
+            mask=offs_n < N,
+            other=0.0,
+        )
+        if As.dtype.element_ty == tl.uint8:
+            a_scale = tl.exp2(a_scale.to(tl.float32) - 127.0)
+        if Bs.dtype.element_ty == tl.uint8:
+            b_scale = tl.exp2(b_scale.to(tl.float32) - 127.0)
+        acc += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+
+    tl.store(
+        C
+        + batch * stride_cb
+        + offs_m[:, None] * stride_cm
+        + offs_n[None, :] * stride_cn,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def triton_bmm_fp8_blockscale(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if alpha is not None:
+        raise ValueError("triton block-scaled FP8 BMM does not support alpha")
+    if block_size is None:
+        raise ValueError("block_size is required for triton block-scaled FP8 BMM")
+    if A_scales is None or B_scales is None:
+        raise ValueError("A_scales and B_scales are required for FP8 BMM")
+
+    batch, m, k = A.shape
+    b_batch, n, b_k = B.shape
+    block_n, block_k = block_size
+    if b_batch != batch or b_k != k:
+        raise ValueError(f"FP8 BMM shape mismatch: A={A.shape}, B={B.shape}")
+    if A_scales.shape != (batch, m, triton.cdiv(k, block_k)):
+        raise ValueError(
+            f"FP8 BMM A scale shape mismatch: A={A.shape}, scales={A_scales.shape}"
+        )
+    expected_b_scales = (batch, triton.cdiv(n, block_n), triton.cdiv(k, block_k))
+    if B_scales.shape != expected_b_scales:
+        raise ValueError(
+            "FP8 BMM B scale shape mismatch: "
+            f"expected {expected_b_scales}, got {tuple(B_scales.shape)}"
+        )
+
+    C = (
+        out
+        if out is not None
+        else torch.empty((batch, m, n), device=A.device, dtype=out_dtype)
+    )
+    config = {
+        "BLOCK_SIZE_M": 16 if Platform.get().is_amd and m <= 128 else 32,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": block_k,
+        "num_warps": 4,
+        "num_stages": 1 if Platform.get().is_amd else 3,
+    }
+    _w8a8_block_fp8_bmm[
+        (batch, triton.cdiv(m, config["BLOCK_SIZE_M"]), triton.cdiv(n, 64))
+    ](
+        A,
+        B,
+        C,
+        A_scales,
+        B_scales,
+        m,
+        n,
+        k,
+        block_n,
+        block_k,
+        A.stride(0),
+        A.stride(1),
+        A.stride(2),
+        B.stride(0),
+        B.stride(1),
+        B.stride(2),
+        C.stride(0),
+        C.stride(1),
+        C.stride(2),
+        A_scales.stride(0),
+        A_scales.stride(1),
+        A_scales.stride(2),
+        B_scales.stride(0),
+        B_scales.stride(1),
+        B_scales.stride(2),
+        **config,
+    )
+    return C

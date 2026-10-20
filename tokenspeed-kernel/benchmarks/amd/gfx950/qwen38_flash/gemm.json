@@ -1,0 +1,221 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "qwen38_flash.gemm.mv/tp2-hc_down-n324-k10240-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mv",
+        "parameters": {
+          "M": [
+            16,
+            64
+          ],
+          "N": 324,
+          "K": 10240,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5107
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.gemm.mv/tp2-final_mixer-n320-k10240-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mv",
+        "parameters": {
+          "M": [
+            16,
+            64
+          ],
+          "N": 320,
+          "K": 10240,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5108
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.gemm.mv/tp2-hc_up-n10240-k320-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mv",
+        "parameters": {
+          "M": [
+            16,
+            64
+          ],
+          "N": 10240,
+          "K": 320,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5109
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.gemm.mv/tp2-o_proj-n2560-k3072-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mv",
+        "parameters": {
+          "M": [
+            16,
+            64
+          ],
+          "N": 2560,
+          "K": 3072,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5110
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.gemm.mv/tp2-router-n512-k2560-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mv",
+        "parameters": {
+          "M": [
+            16,
+            64
+          ],
+          "N": 512,
+          "K": 2560,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5111
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.gemm.mv/tp2-qsa_indexer-n640-k2560-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mv",
+        "parameters": {
+          "M": [
+            16,
+            64
+          ],
+          "N": 640,
+          "K": 2560,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5112
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.gemm.mv/tp2-mtp_fc-n2560-k2560-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mv",
+        "parameters": {
+          "M": [
+            16,
+            64
+          ],
+          "N": 2560,
+          "K": 2560,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5113
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.gemm.mv/tp2-gdn_in_proj-n8240-k2560-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mv",
+        "parameters": {
+          "M": [
+            16,
+            64
+          ],
+          "N": 8240,
+          "K": 2560,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5114
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.gemm.mv/tp2-attn_qkv-n6656-k2560-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mv",
+        "parameters": {
+          "M": [
+            16,
+            64
+          ],
+          "N": 6656,
+          "K": 2560,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5115
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    }
+  ]
+}

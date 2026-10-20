@@ -12,6 +12,7 @@ slurm:
   gpus_per_node: 4
 env:
   CI: "true"
+  MODEL: deepseek-ai/DeepSeek-V4.1-Flash-1017
   PD_SLURM: "1"
   WORLD_SIZE: "4"
   PREFILL_GPUS: "0,1,2,3"
@@ -26,7 +27,6 @@ env:
   MAX_TOTAL_TOKENS: "262144"
   MAX_NUM_SEQS: "16"
   MAX_CUDAGRAPH_CAPTURE_SIZE: "8"
-  REASONING_PARSER: deepseek_v31
   STARTUP_TIMEOUT: "7200"
   LB_PORT: "8000"
 install:
@@ -43,7 +43,7 @@ eval:
   command: >-
     HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
-    --model deepseek-ai/DeepSeek-V4.1-Flash
+    --model deepseek-ai/DeepSeek-V4.1-Flash-1017
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
     --datasets gsm8k

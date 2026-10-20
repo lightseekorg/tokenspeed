@@ -236,6 +236,29 @@ def _attend_tile(
     return max_value, denominator, accumulator, row_sum, row_count
 
 
+@gluon.jit
+def _inverse_rope(values, dims, rows, rope_row, dim_base, ROPE_DIM: gl.constexpr):
+    """Rotate the interleaved RoPE tail of BF16 [rows, dims] output tiles.
+
+    dims are absolute head dims; dim_base localizes the gather to the tile.
+    Only the last ROPE_DIM of 512 rotate. rope_row points at the token's
+    inverse cos/sin table row.
+    """
+    start: gl.constexpr = 512 - ROPE_DIM
+    rope = dims >= start
+    pair = gl.where(rope, (dims - start) // 2, 0)
+    cosine = gl.load(rope_row + pair, mask=rope, other=1.0)
+    sine = gl.load(rope_row + ROPE_DIM // 2 + pair, mask=rope, other=0.0)
+    value = values.to(gl.float32)
+    partner = gl.gather(
+        value, ((dims - dim_base) ^ 1)[None, :] + rows[:, None] * 0, axis=1
+    )
+    first = value * cosine[None, :]
+    second = partner * sine[None, :]
+    rotated = gl.where(((dims & 1) != 0)[None, :], first + second, first - second)
+    return gl.where(rope[None, :], rotated, value).to(gl.bfloat16)
+
+
 def _selected_attention_metadata(grid, kernel, args):
     # Capacity bound without reading device lengths: every selected slot is
     # valid and every head is computed. Split partials are FP32 [heads, 512].
@@ -296,11 +319,15 @@ def gluon_dsv41_selected_attention_gfx950(
     swa_capacity,
     global_capacity,
     num_heads,
+    rope_positions,
+    rope_cos_sin,
+    stride_rope: tl.int64,
     HAS_GLOBAL: gl.constexpr,
     HEAD_GROUPS: gl.constexpr,
     BLOCK_H: gl.constexpr,
     TILE_K: gl.constexpr,
     HEAD_DIM: gl.constexpr,
+    ROPE_DIM: gl.constexpr,
 ):
     # Program (t, s, b) covers query row t, the s-th contiguous share of its
     # selected tiles (SWA tiles first, then global tiles) and head block b.
@@ -398,6 +425,13 @@ def gluon_dsv41_selected_attention_gfx950(
     q_heads = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, q_layout))
     q_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, q_layout))
     out_base = out + token_idx.to(tl.int64) * stride_o_t + q_dims[None, :]
+    # With ROPE_DIM > 0 the single-split epilogue applies the inverse RoPE.
+    rope_row = rope_cos_sin
+    if ROPE_DIM > 0:
+        rope_row += (
+            gl.maximum(gl.load(rope_positions + token_idx), 0).to(tl.int64)
+            * stride_rope
+        )
     # Partial rows are [token, split, head] ([token, split] for row sums).
     part_row = (token_idx * num_splits + split_idx).to(tl.int64)
     row_sum = gl.zeros([BLOCK_H, HEAD_DIM], dtype=gl.float32, layout=mfma)
@@ -628,11 +662,16 @@ def gluon_dsv41_selected_attention_gfx950(
             if active:
                 if single:
                     scale = gl.where(denominator > 0.0, 1.0 / denominator, 0.0)
+                    result = gl.convert_layout(
+                        (accumulator * scale[:, None]).to(gl.bfloat16), q_layout
+                    )
+                    if ROPE_DIM > 0:
+                        result = _inverse_rope(
+                            result, q_dims, heads, rope_row, 0, ROPE_DIM
+                        )
                     gl.store(
                         out_base + heads[:, None].to(tl.int64) * stride_o_h,
-                        gl.convert_layout(
-                            (accumulator * scale[:, None]).to(gl.bfloat16), q_layout
-                        ),
+                        result,
                         mask=(heads < num_heads)[:, None],
                     )
                 else:
@@ -669,11 +708,16 @@ def gluon_dsv41_selected_attention_gfx950(
                     total = count * weight + gl.exp(sink - frame)
                     coefficient = gl.where(total > 0.0, weight / total, 0.0)
                     heads = head_base + group * BLOCK_H + q_heads
+                    result = gl.convert_layout(
+                        (row_sum * coefficient[:, None]).to(gl.bfloat16), q_layout
+                    )
+                    if ROPE_DIM > 0:
+                        result = _inverse_rope(
+                            result, q_dims, heads, rope_row, 0, ROPE_DIM
+                        )
                     gl.store(
                         out_base + heads[:, None].to(tl.int64) * stride_o_h,
-                        gl.convert_layout(
-                            (row_sum * coefficient[:, None]).to(gl.bfloat16), q_layout
-                        ),
+                        result,
                         mask=(heads < num_heads)[:, None],
                     )
         else:
@@ -727,11 +771,15 @@ def gluon_dsv41_selected_attention_reduce_gfx950(
     num_heads,
     num_splits,
     head_blocks,
+    rope_positions,
+    rope_cos_sin,
+    stride_rope: tl.int64,
     BLOCK_H: gl.constexpr,
     HEAD_GROUPS: gl.constexpr,
     MAX_SPLITS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     DIM_BLOCK: gl.constexpr,
+    ROPE_DIM: gl.constexpr,
 ):
     """Merge one token's split partials for 16 heads and ``DIM_BLOCK`` dims,
     adding the sink once.
@@ -815,12 +863,23 @@ def gluon_dsv41_selected_attention_reduce_gfx950(
     scale = gl.convert_layout(
         gl.where(total > 0.0, 1.0 / total, 0.0), gl.SliceLayout(1, out_layout)
     )
+    result = (merged * scale[:, None]).to(gl.bfloat16)
+    if ROPE_DIM > 0:
+        if dim_base + DIM_BLOCK > HEAD_DIM - ROPE_DIM:
+            rope_row = (
+                rope_cos_sin
+                + gl.maximum(gl.load(rope_positions + token_idx), 0).to(tl.int64)
+                * stride_rope
+            )
+            result = _inverse_rope(
+                result, dims, out_heads, rope_row, dim_base, ROPE_DIM
+            )
     gl.store(
         out
         + token_idx.to(tl.int64) * stride_o_t
         + out_heads[:, None].to(tl.int64) * stride_o_h
         + dims[None, :],
-        (merged * scale[:, None]).to(gl.bfloat16),
+        result,
         mask=(out_heads < num_heads)[:, None],
     )
 
@@ -877,12 +936,21 @@ def launch_gluon_dsv41_selected_attention_gfx950(
     schedule,
     prefill_kv,
     prefill_indices,
+    rope_positions=None,
+    rope_cos_sin=None,
 ):
-    """Fused SWA+global selected attention over V4.1 page-planar caches."""
+    """Fused SWA+global selected attention over V4.1 page-planar caches.
+
+    With ``rope_positions`` [tokens] and an FP32 ``rope_cos_sin`` table
+    [positions, rope_dim] (inverse signs), the output tail is also rotated, as
+    ``rope_inplace`` would do afterwards. Paged decode inputs only.
+    """
     attn_sink = attn_sink[: q.shape[1]]
     if prefill_kv is not None:
         if prefill_indices is None:
             raise ValueError("prefill_kv requires prefill_indices")
+        if rope_cos_sin is not None:
+            raise ValueError("output RoPE needs paged decode inputs")
         from tokenspeed_kernel.ops.attention.dsv4 import dsv4_prefill
 
         out = _output(out, q.shape, q.dtype, q.device)
@@ -906,6 +974,18 @@ def launch_gluon_dsv41_selected_attention_gfx950(
         return out
     if prefill_indices is not None:
         raise ValueError("prefill_indices requires prefill_kv")
+    rope = rope_cos_sin is not None
+    if rope:
+        if (
+            rope_cos_sin.ndim != 2
+            or rope_cos_sin.dtype != torch.float32
+            or rope_cos_sin.stride(1) != 1
+            or rope_cos_sin.shape[1] not in (2, 4, 8, 16, 32, 64)
+        ):
+            raise ValueError("rope_cos_sin must be FP32 [positions, rope_dim]")
+        _integers(rope_positions, (q.shape[0],), "rope_positions")
+    elif rope_positions is not None:
+        raise ValueError("rope_positions requires rope_cos_sin")
     if q.ndim != 3 or q.shape[-1] != 512 or q.dtype != torch.bfloat16 or q.shape[1] < 1:
         raise ValueError("q must be BF16 [tokens, heads, 512]")
     if query_chunk_size < 1:
@@ -1036,11 +1116,15 @@ def launch_gluon_dsv41_selected_attention_gfx950(
         swa_cache.shape[0] * _PAGE_ROWS,
         global_capacity,
         q.shape[1],
+        rope_positions if rope else swa_lens_i,
+        rope_cos_sin if rope else sink,
+        rope_cos_sin.stride(0) if rope else 0,
         HAS_GLOBAL=has_global,
         HEAD_GROUPS=head_groups,
         BLOCK_H=_BLOCK_H,
         TILE_K=_TILE_K,
         HEAD_DIM=_HEAD_DIM,
+        ROPE_DIM=rope_cos_sin.shape[1] if rope else 0,
         num_warps=4,
         num_stages=1,
     )
@@ -1060,11 +1144,15 @@ def launch_gluon_dsv41_selected_attention_gfx950(
             q.shape[1],
             splits,
             head_blocks,
+            rope_positions if rope else swa_lens_i,
+            rope_cos_sin if rope else sink,
+            rope_cos_sin.stride(0) if rope else 0,
             BLOCK_H=_BLOCK_H,
             HEAD_GROUPS=head_groups,
             MAX_SPLITS=_MAX_SPLITS,
             HEAD_DIM=_HEAD_DIM,
             DIM_BLOCK=_REDUCE_DIM_BLOCK,
+            ROPE_DIM=rope_cos_sin.shape[1] if rope else 0,
             num_warps=4,
         )
     return out

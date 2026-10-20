@@ -1,31 +1,47 @@
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
-from tokenspeed.runtime.distributed.comm_backend import (
-    triton_allreduce as triton_allreduce_module,
-)
-from tokenspeed.runtime.distributed.comm_backend import (
-    triton_rsag as triton_rsag_module,
-)
+from tokenspeed.runtime.distributed.comm_backend import iris as iris_module
 from tokenspeed.runtime.distributed.comm_backend.auto import (
     AutoBackend,
     Collective,
     Route,
 )
+from tokenspeed.runtime.distributed.comm_backend.iris import (
+    IrisBackend,
+)
 from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
-from tokenspeed.runtime.distributed.comm_backend.triton_allreduce import (
-    TritonAllReduceBackend,
-)
-from tokenspeed.runtime.distributed.comm_backend.triton_rsag import (
-    TritonRSAGBackend,
-)
 from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
     TrtllmAllReduceBackend,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+
+def test_runtime_import_without_iris():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent("""
+                import sys
+                sys.modules["iris"] = None
+                sys.modules["tokenspeed_kernel.ops.communication._iris"] = None
+                from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+                from tokenspeed.runtime.layers.layernorm import RMSNorm
+                AutoBackend()
+            """),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.fixture
@@ -34,80 +50,11 @@ def backend(monkeypatch):
     monkeypatch.setattr(instance, "_nccl", Mock())
     monkeypatch.setattr(instance, "_rsag", Mock())
     monkeypatch.setattr(instance, "_trtllm_ar", Mock())
-    monkeypatch.setattr(instance, "_triton_ar", Mock())
-    instance._triton_ar.producer_direct_max_bytes = 1024 * 1024
-    instance._triton_ar.can_acquire_outputs.return_value = True
-    instance._triton_ar.can_reduce_outputs.return_value = False
+    monkeypatch.setattr(instance, "_iris", Mock())
+    instance._iris.producer_direct_max_bytes = 1024 * 1024
+    instance._iris.can_acquire_outputs.return_value = True
+    instance._iris.can_reduce_outputs.return_value = False
     return instance
-
-
-@pytest.mark.parametrize(
-    ("method_name", "args"),
-    [
-        ("token_all_gather", (torch.empty(1, 4), (0, 1), [1, 1])),
-        ("token_reduce_scatter", (torch.empty(2, 4), (0, 1), [1, 1])),
-        ("all_gather", (torch.empty(1, 4), (0, 1), -1)),
-    ],
-)
-def test_force_deterministic_rsag_routes_to_nccl(
-    backend, monkeypatch, method_name, args
-):
-    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", True)
-
-    getattr(backend, method_name)(*args)
-
-    getattr(backend._nccl, method_name).assert_called_once_with(*args)
-    getattr(backend._rsag, method_name).assert_not_called()
-
-
-@pytest.mark.parametrize(
-    ("method_name", "args"),
-    [
-        ("token_all_gather", (torch.empty(1, 4), (0, 1), [1, 1])),
-        ("token_reduce_scatter", (torch.empty(2, 4), (0, 1), [1, 1])),
-    ],
-)
-def test_default_token_ops_keep_triton_rsag(backend, monkeypatch, method_name, args):
-    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
-
-    getattr(backend, method_name)(*args)
-
-    getattr(backend._rsag, method_name).assert_called_once_with(*args)
-    getattr(backend._nccl, method_name).assert_not_called()
-
-
-def test_force_deterministic_rsag_routes_all_reduce_to_nccl(backend, monkeypatch):
-    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", True)
-    tensor = torch.empty(1, 4)
-    group = (0, 1)
-
-    backend.all_reduce(tensor, group)
-
-    backend._nccl.all_reduce.assert_called_once_with(tensor, group, op=None)
-    backend._trtllm_ar.has_trtllm_ar.assert_not_called()
-    backend._triton_ar.can_run.assert_not_called()
-
-
-def test_force_deterministic_rsag_routes_all_reduce_collection_to_nccl(
-    backend, monkeypatch
-):
-    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", True)
-    first = torch.empty(1, 4)
-    second = torch.empty(1, 4)
-    third = torch.empty(1, 8)
-    group = (0, 1)
-
-    tensors = (first, second, third)
-    backend.all_reduce(tensors, group)
-
-    assert backend._nccl.all_reduce.call_count == len(tensors)
-    for call, tensor in zip(backend._nccl.all_reduce.call_args_list, tensors):
-        assert call.args[0] is tensor
-        assert call.args[1] == group
-        assert call.kwargs == {"op": None}
-    backend._nccl.all_reduce_two.assert_not_called()
-    backend._trtllm_ar.has_trtllm_ar.assert_not_called()
-    backend._triton_ar.can_run.assert_not_called()
 
 
 def test_all_reduce_rejects_empty_collection(backend):
@@ -115,16 +62,10 @@ def test_all_reduce_rejects_empty_collection(backend):
         backend.all_reduce((), (0, 1))
 
 
-def test_triton_collection_fallback_reduces_each_tensor(monkeypatch):
+def test_iris_collection_fallback_reduces_each_tensor(monkeypatch):
     fallback = Mock()
     fallback.all_reduce.side_effect = lambda tensor, _group, op: tensor
-    backend = TritonAllReduceBackend(fallback)
-    monkeypatch.setattr(backend, "_get_or_create", lambda _group: object())
-    monkeypatch.setattr(
-        triton_allreduce_module,
-        "all_reduce_can_run",
-        lambda _state, _tensor, op: False,
-    )
+    backend = IrisBackend(fallback)
     tensors = tuple(torch.empty(1) for _ in range(3))
 
     assert backend.all_reduce(tensors, (0, 1)) == tensors
@@ -135,8 +76,8 @@ def test_triton_collection_fallback_reduces_each_tensor(monkeypatch):
     )
 
 
-def test_triton_ordinary_all_reduce_keeps_512_kib_limit(monkeypatch):
-    backend = TritonAllReduceBackend(Mock(), producer_direct_max_bytes=1024 * 1024)
+def test_iris_ordinary_all_reduce_keeps_512_kib_limit(monkeypatch):
+    backend = IrisBackend(Mock(), producer_direct_max_bytes=1024 * 1024)
     group = tuple(range(8))
     tensor = Mock(
         is_cuda=True,
@@ -144,15 +85,9 @@ def test_triton_ordinary_all_reduce_keeps_512_kib_limit(monkeypatch):
         dtype=torch.bfloat16,
     )
     monkeypatch.setattr(
-        triton_allreduce_module,
+        iris_module,
         "current_platform",
         lambda: SimpleNamespace(is_amd=True),
-    )
-    monkeypatch.setattr(backend, "_get_or_create", lambda _group: object())
-    monkeypatch.setattr(
-        triton_allreduce_module,
-        "all_reduce_can_run",
-        lambda _state, _tensor, op: True,
     )
 
     tensor.numel.return_value = 36 * 7168
@@ -162,96 +97,36 @@ def test_triton_ordinary_all_reduce_keeps_512_kib_limit(monkeypatch):
     assert backend.producer_direct_max_bytes == 1024 * 1024
 
 
-@pytest.mark.parametrize("enable_lamport", [False, True])
-def test_triton_preparation_caps_only_ordinary_staging(monkeypatch, enable_lamport):
-    backend = TritonAllReduceBackend(Mock(), producer_direct_max_bytes=256)
+def test_iris_preparation_caps_only_ordinary_staging(monkeypatch):
+    backend = IrisBackend(Mock(), producer_direct_max_bytes=256)
     group = (0, 1)
-    process_group = object()
     state = SimpleNamespace(
-        max_numel=128,
-        max_bytes=1024,
-        attnres_max_numel=32,
-        max_token_num=4,
-        enable_lamport=enable_lamport,
-        moe_tail_max_rows=0,
-    )
-    create = Mock(return_value=state)
-    initialize = Mock()
-    monkeypatch.setattr(
-        triton_allreduce_module,
-        "current_platform",
-        lambda: SimpleNamespace(is_amd=True),
-    )
-    monkeypatch.setattr(
-        triton_allreduce_module.pg_manager,
-        "get_process_group",
-        lambda backend_name, requested_group: (
-            process_group
-            if (backend_name, requested_group) == ("nccl", group)
-            else None
-        ),
-    )
-    monkeypatch.setattr(triton_allreduce_module.dist, "get_rank", lambda: 0)
-    monkeypatch.setattr(triton_allreduce_module.torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(triton_allreduce_module, "create_state", create)
-    monkeypatch.setattr(
-        triton_allreduce_module, "initialize_all_reduce_state", initialize
-    )
-
-    assert backend.prepare_all_reduce_buffers(
-        group,
-        staged_max_numel=512,
+        staged_max_numel=128,
         producer_direct_max_numel=512,
-        attnres_max_numel=32,
-        attnres_max_rows=4,
-        enable_lamport=enable_lamport,
-        moe_tail_max_rows=0,
         dtype=torch.bfloat16,
     )
-    create.assert_called_once_with(
-        group=process_group,
-        rank_in_group=0,
-        max_tokens=0,
-        hidden_size=0,
-        device=torch.device("cuda:0"),
-        max_numel=128,
-        max_bytes=1024,
-        attnres_max_numel=32,
-        attnres_max_rows=4,
-        enable_lamport=enable_lamport,
-        moe_tail_max_rows=0,
-    )
-    initialize.assert_called_once_with(state, torch.bfloat16)
-    assert backend._instances[group] is state
+    created = []
 
+    def create(requested_group, dtype, staged, producer):
+        created.append((requested_group, dtype, staged, producer))
+        backend.install(requested_group, state)
+        return state
+
+    monkeypatch.setattr(
+        iris_module, "current_platform", lambda: SimpleNamespace(is_amd=True)
+    )
+    monkeypatch.setattr(backend, "_create", create)
     capacities = dict(
-        staged_max_numel=512,
-        producer_direct_max_numel=512,
-        attnres_max_numel=32,
-        attnres_max_rows=4,
-        moe_tail_max_rows=0,
-        dtype=torch.bfloat16,
+        staged_max_numel=512, producer_direct_max_numel=512, dtype=torch.bfloat16
     )
-    assert backend.prepare_all_reduce_buffers(
-        group, **capacities, enable_lamport=enable_lamport
-    )
-    with pytest.raises(RuntimeError, match="below the requested"):
-        backend.prepare_all_reduce_buffers(
-            group,
-            **(capacities | {"moe_tail_max_rows": 512}),
-            enable_lamport=enable_lamport,
-        )
-    with pytest.raises(RuntimeError, match="different Lamport policy"):
-        backend.prepare_all_reduce_buffers(
-            group, **capacities, enable_lamport=not enable_lamport
-        )
+    assert backend.prepare_all_reduce_buffers(group, **capacities)
+    assert created == [(group, torch.bfloat16, 128, 512)]
+    assert backend.prepare_all_reduce_buffers(group, **capacities)
+    assert backend.state(group, torch.bfloat16) is state
+    assert len(created) == 1
 
 
-@pytest.mark.parametrize("enable_lamport", [False, True])
-@pytest.mark.parametrize("tail_rows", [0, 512])
-def test_public_preparation_forwards_lamport_policy(
-    backend, monkeypatch, enable_lamport, tail_rows
-):
+def test_public_preparation_preserves_capacities(backend, monkeypatch):
     from tokenspeed.runtime.distributed.comm_ops import prepare_all_reduce_buffers
 
     monkeypatch.setattr(
@@ -261,29 +136,21 @@ def test_public_preparation_forwards_lamport_policy(
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
     monkeypatch.setitem(global_server_args_dict, "mapping", None)
     backend._trtllm_ar.has_trtllm_ar.return_value = False
-    backend._triton_ar.prepare_all_reduce_buffers.return_value = True
+    backend._iris.prepare_all_reduce_buffers.return_value = True
     capacities = dict(
-        staged_max_numel=0,
-        producer_direct_max_numel=512 * 10752,
-        attnres_max_numel=0,
-        attnres_max_rows=0,
-        enable_lamport=enable_lamport,
-        moe_tail_max_rows=tail_rows,
-        dtype=torch.bfloat16,
+        staged_max_numel=0, producer_direct_max_numel=512 * 10752, dtype=torch.bfloat16
     )
     group = tuple(range(8))
-
     assert prepare_all_reduce_buffers(group, **capacities, backend=backend)
-
-    backend._triton_ar.prepare_all_reduce_buffers.assert_called_once_with(
+    backend._iris.prepare_all_reduce_buffers.assert_called_once_with(
         group, **capacities
     )
 
 
 def test_unprepared_group_keeps_default_producer_dispatch_limit(monkeypatch):
-    backend = TritonAllReduceBackend(Mock(), producer_direct_max_bytes=1024)
+    backend = IrisBackend(Mock(), producer_direct_max_bytes=1024)
     monkeypatch.setattr(
-        triton_allreduce_module,
+        iris_module,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
@@ -301,19 +168,19 @@ def test_unprepared_group_keeps_default_producer_dispatch_limit(monkeypatch):
 
 
 def test_prepared_group_uses_its_producer_capacity(monkeypatch):
-    backend = TritonAllReduceBackend(Mock(), producer_direct_max_bytes=1024)
+    backend = IrisBackend(Mock(), producer_direct_max_bytes=1024)
     group = (0, 1)
     max_tokens = 8192
     shapes = ((max_tokens, 3584), (max_tokens, 7168))
-    state = SimpleNamespace(max_bytes=max_tokens * (3584 + 7168) * 2)
-    backend._instances[group] = state
+    state = SimpleNamespace(
+        producer_direct_max_numel=max_tokens * (3584 + 7168), dtype=torch.bfloat16
+    )
+    backend._instances[group, torch.bfloat16] = state
     monkeypatch.setattr(
-        triton_allreduce_module,
+        iris_module,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    supported = Mock(return_value=True)
-    monkeypatch.setattr(triton_allreduce_module, "symm_outputs_can_run", supported)
     like = SimpleNamespace(is_cuda=True, dtype=torch.bfloat16)
 
     assert backend.can_acquire_outputs(shapes, like, group)
@@ -322,16 +189,15 @@ def test_prepared_group_uses_its_producer_capacity(monkeypatch):
         like,
         group,
     )
-    supported.assert_called_once_with(state, shapes, torch.bfloat16, op=None)
 
 
-def test_triton_output_acquisition_does_not_initialize_iris_off_cdna4(monkeypatch):
+def test_iris_output_acquisition_does_not_initialize_iris_off_cdna4(monkeypatch):
     fallback = Mock()
-    backend = TritonAllReduceBackend(fallback)
+    backend = IrisBackend(fallback)
     get_or_create = Mock(side_effect=AssertionError("must not initialize Iris"))
     monkeypatch.setattr(backend, "_get_or_create", get_or_create)
     monkeypatch.setattr(
-        triton_allreduce_module,
+        iris_module,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=False),
     )
@@ -342,11 +208,11 @@ def test_triton_output_acquisition_does_not_initialize_iris_off_cdna4(monkeypatc
     get_or_create.assert_not_called()
 
 
-def test_triton_output_acquisition_propagates_iris_setup_failure(monkeypatch):
+def test_iris_output_acquisition_propagates_iris_setup_failure(monkeypatch):
     fallback = Mock()
-    backend = TritonAllReduceBackend(fallback)
+    backend = IrisBackend(fallback)
     monkeypatch.setattr(
-        triton_allreduce_module,
+        iris_module,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
@@ -359,21 +225,6 @@ def test_triton_output_acquisition_propagates_iris_setup_failure(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Iris setup failed"):
         backend.acquire_all_reduce_outputs(((2, 4),), like, (0, 1))
-
-
-def test_triton_output_acquisition_propagates_staging_failure(monkeypatch):
-    fallback = Mock()
-    backend = TritonAllReduceBackend(fallback)
-    state = SimpleNamespace()
-    monkeypatch.setattr(backend, "can_acquire_outputs", lambda *args, **kwargs: True)
-    monkeypatch.setattr(backend, "_get_or_create", lambda _group: state)
-    monkeypatch.setattr(
-        triton_allreduce_module,
-        "acquire_symm_outputs",
-        Mock(side_effect=RuntimeError("Iris staging failed")),
-    )
-    with pytest.raises(RuntimeError, match="Iris staging failed"):
-        backend.acquire_all_reduce_outputs(((2, 4),), torch.empty(2, 4), (0, 1))
 
 
 def test_nccl_collection_uses_single_tensor_path():
@@ -435,7 +286,7 @@ def test_amd_collection_past_iris_capacity_uses_grouped_rccl(
     backend._nccl.all_reduce_two.assert_called_once_with(*tensors, group, op=None)
 
 
-def test_acquire_all_reduce_outputs_uses_triton(backend, monkeypatch):
+def test_acquire_all_reduce_outputs_uses_iris(backend, monkeypatch):
     monkeypatch.setattr(
         "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
         lambda: SimpleNamespace(is_amd=True),
@@ -444,17 +295,17 @@ def test_acquire_all_reduce_outputs_uses_triton(backend, monkeypatch):
     monkeypatch.setitem(global_server_args_dict, "mapping", None)
     backend._trtllm_ar.has_trtllm_ar.return_value = False
     expected = (torch.empty(1, 7168), torch.empty(1, 3584))
-    backend._triton_ar.acquire_all_reduce_outputs.return_value = expected
+    backend._iris.acquire_all_reduce_outputs.return_value = expected
     like = torch.empty(1, 3584, dtype=torch.bfloat16)
     shapes = ((1, 7168), (1, 3584))
 
     result = backend.acquire_all_reduce_outputs(shapes, like, (0, 1))
 
     assert result is expected
-    backend._triton_ar.acquire_all_reduce_outputs.assert_called_once_with(
+    backend._iris.acquire_all_reduce_outputs.assert_called_once_with(
         shapes, like, (0, 1), op=None
     )
-    backend._triton_ar.can_acquire_outputs.assert_called_once_with(
+    backend._iris.can_acquire_outputs.assert_called_once_with(
         shapes, like, (0, 1), op=None
     )
 
@@ -470,14 +321,14 @@ def test_acquire_all_reduce_outputs_amd_uses_base_when_iris_is_ineligible(
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
     monkeypatch.setitem(global_server_args_dict, "mapping", None)
     backend._trtllm_ar.has_trtllm_ar.return_value = False
-    backend._triton_ar.can_acquire_outputs.return_value = False
+    backend._iris.can_acquire_outputs.return_value = False
     like = torch.empty(1, 3584, dtype=torch.bfloat16)
     shapes = ((1, 7168), (1, 3584))
 
     result = backend.acquire_all_reduce_outputs(shapes, like, (0, 1))
 
     assert tuple(output.shape for output in result) == shapes
-    backend._triton_ar.acquire_all_reduce_outputs.assert_not_called()
+    backend._iris.acquire_all_reduce_outputs.assert_not_called()
 
 
 def test_acquire_all_reduce_outputs_non_amd_keeps_existing_delegation(
@@ -491,15 +342,15 @@ def test_acquire_all_reduce_outputs_non_amd_keeps_existing_delegation(
     )
     backend._trtllm_ar.has_trtllm_ar.return_value = False
     expected = (torch.empty(1, 7168), torch.empty(1, 3584))
-    backend._triton_ar.acquire_all_reduce_outputs.return_value = expected
+    backend._iris.acquire_all_reduce_outputs.return_value = expected
     like = torch.empty(1, 3584, dtype=torch.bfloat16)
     shapes = ((1, 7168), (1, 3584))
 
     assert backend.acquire_all_reduce_outputs(shapes, like, (0, 1)) is expected
-    backend._triton_ar.acquire_all_reduce_outputs.assert_called_once_with(
+    backend._iris.acquire_all_reduce_outputs.assert_called_once_with(
         shapes, like, (0, 1), op=None
     )
-    backend._triton_ar.can_acquire_outputs.assert_not_called()
+    backend._iris.can_acquire_outputs.assert_not_called()
 
 
 def test_acquire_all_reduce_outputs_preserves_trtllm(backend, monkeypatch):
@@ -512,22 +363,22 @@ def test_acquire_all_reduce_outputs_preserves_trtllm(backend, monkeypatch):
     result = backend.acquire_all_reduce_outputs(shapes, like, (0, 1))
 
     assert tuple(output.shape for output in result) == shapes
-    backend._triton_ar.acquire_all_reduce_outputs.assert_not_called()
+    backend._iris.acquire_all_reduce_outputs.assert_not_called()
 
 
 @pytest.mark.parametrize("num_outputs", [1, 2])
-def test_symmetric_outputs_route_back_to_triton(backend, monkeypatch, num_outputs):
+def test_symmetric_outputs_route_back_to_iris(backend, monkeypatch, num_outputs):
     monkeypatch.setattr(
         "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
         lambda: SimpleNamespace(is_amd=True),
     )
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
-    backend._triton_ar.can_reduce_outputs.return_value = True
+    backend._iris.can_reduce_outputs.return_value = True
     outputs = (torch.empty(1, 4), torch.empty(1, 8))[:num_outputs]
-    backend._triton_ar.all_reduce.return_value = outputs
+    backend._iris.all_reduce.return_value = outputs
 
     assert backend.all_reduce(outputs, (0, 1)) is outputs
-    backend._triton_ar.all_reduce.assert_called_once_with(outputs, (0, 1), op=None)
+    backend._iris.all_reduce.assert_called_once_with(outputs, (0, 1), op=None)
     backend._nccl.all_reduce.assert_not_called()
 
 
@@ -537,32 +388,16 @@ def test_prepared_symmetric_outputs_bypass_default_size_gate(backend, monkeypatc
         "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
         lambda: SimpleNamespace(is_amd=True),
     )
-    backend._triton_ar.can_reduce_outputs.return_value = True
+    backend._iris.can_reduce_outputs.return_value = True
     outputs = (
         torch.empty(2 * 1024 * 1024, dtype=torch.bfloat16),
         torch.empty(2 * 1024 * 1024, dtype=torch.bfloat16),
     )
-    backend._triton_ar.all_reduce.return_value = outputs
+    backend._iris.all_reduce.return_value = outputs
 
     assert backend.all_reduce(outputs, (0, 1)) is outputs
-    backend._triton_ar.all_reduce.assert_called_once_with(outputs, (0, 1), op=None)
+    backend._iris.all_reduce.assert_called_once_with(outputs, (0, 1), op=None)
     backend._nccl.all_reduce_two.assert_not_called()
-
-
-def test_non_amd_collections_do_not_probe_symmetric_outputs(backend, monkeypatch):
-    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
-    monkeypatch.setattr(
-        "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
-        lambda: SimpleNamespace(is_amd=False),
-    )
-    backend._trtllm_ar.has_trtllm_ar.return_value = False
-    backend._triton_ar.can_run.return_value = False
-    tensors = (torch.empty(1, 4), torch.empty(1, 8))
-
-    backend.all_reduce(tensors, (0, 1))
-
-    backend._triton_ar.can_reduce_outputs.assert_not_called()
-    assert backend._nccl.all_reduce.call_count == 2
 
 
 # ---- The one routing decision ----------------------------------------------
@@ -570,15 +405,9 @@ def test_non_amd_collections_do_not_probe_symmetric_outputs(backend, monkeypatch
 
 @pytest.fixture
 def routing(backend, monkeypatch):
-    """The fixture backend with the real payload test and a controllable
-    multicast verdict; ``mapping`` None makes every group node-local."""
+    """The fixture backend with a controllable multicast verdict; ``mapping``
+    None makes every group node-local."""
     monkeypatch.setitem(global_server_args_dict, "mapping", None)
-    monkeypatch.setattr(
-        triton_rsag_module, "current_platform", lambda: SimpleNamespace(is_nvidia=True)
-    )
-    backend._rsag.serves_multimem_all_reduce = (
-        TritonRSAGBackend.serves_multimem_all_reduce
-    )
     return backend
 
 
@@ -591,6 +420,7 @@ def _switches(monkeypatch, *, force: bool, invariant: bool) -> None:
 
 ROWS = torch.empty(4, 16, dtype=torch.bfloat16)
 GROUP = (0, 1)
+REDUCTIONS = [collective for collective in Collective if collective.is_reduction]
 
 
 @pytest.mark.parametrize("collective", list(Collective))
@@ -605,50 +435,32 @@ def test_force_deterministic_rsag_routes_everything_to_nccl(
 def test_force_deterministic_rsag_keeps_reductions_on_the_fold(
     routing, monkeypatch, collective
 ):
-    # Under rl-bitwise plus the knob: today's behaviour, fold for reductions
-    # and NCCL for the gathers, never the switch.
     _switches(monkeypatch, force=True, invariant=True)
     expected = Route.ORDERED_FOLD if collective.is_reduction else Route.NCCL
     assert routing.route(collective, ROWS, GROUP) is expected
 
 
-def test_batch_invariant_all_reduce_takes_the_switch_where_multicast_reaches(
-    routing, monkeypatch
-):
-    _switches(monkeypatch, force=False, invariant=True)
-    assert routing.route(Collective.ALL_REDUCE, ROWS, GROUP) is Route.MULTIMEM
-    # A group multicast cannot map falls to the fold, not to NCCL.
-    monkeypatch.setattr(
-        AutoBackend, "_multicast_reachable", staticmethod(lambda g: False)
-    )
-    assert routing.route(Collective.ALL_REDUCE, ROWS, GROUP) is Route.ORDERED_FOLD
-
-
+@pytest.mark.parametrize("collective", REDUCTIONS)
+@pytest.mark.parametrize("reachable", [True, False])
 @pytest.mark.parametrize(
     "payload",
     [
-        torch.empty(4, 16, dtype=torch.float32),  # not bf16
-        torch.empty(64, dtype=torch.bfloat16),  # not 2-D
-        torch.empty(4, 12, dtype=torch.bfloat16),  # width not a multiple of 8
+        torch.empty(4, 16, dtype=torch.bfloat16),
+        torch.empty(4, 16, dtype=torch.float32),
+        torch.empty(64, dtype=torch.bfloat16),
+        torch.empty(4, 12, dtype=torch.bfloat16),
     ],
 )
-def test_batch_invariant_all_reduce_folds_payloads_the_switch_cannot_take(
-    routing, monkeypatch, payload
+def test_batch_invariant_reductions_always_fold(
+    routing, monkeypatch, collective, reachable, payload
 ):
+    # The in-switch reduction's order moves with a row's offset in the buffer,
+    # so no reduction takes it under the contract, whatever multicast reaches.
     _switches(monkeypatch, force=False, invariant=True)
-    assert routing.route(Collective.ALL_REDUCE, payload, GROUP) is Route.ORDERED_FOLD
-
-
-@pytest.mark.parametrize(
-    "collective", [Collective.REDUCE_SCATTER, Collective.TOKEN_REDUCE_SCATTER]
-)
-def test_batch_invariant_reduce_scatters_keep_the_fold(
-    routing, monkeypatch, collective
-):
-    # The in-switch order depends on the issuing rank, so a per-rank slice
-    # would move a row's bits with the slicing; the fold moves each byte once.
-    _switches(monkeypatch, force=False, invariant=True)
-    assert routing.route(collective, ROWS, GROUP) is Route.ORDERED_FOLD
+    monkeypatch.setattr(
+        AutoBackend, "_multicast_reachable", staticmethod(lambda g: reachable)
+    )
+    assert routing.route(collective, payload, GROUP) is Route.ORDERED_FOLD
 
 
 @pytest.mark.parametrize(
@@ -673,65 +485,61 @@ def test_auto_routes_keep_the_performance_defaults(routing, monkeypatch):
     assert routing.route(Collective.TOKEN_REDUCE_SCATTER, ROWS, GROUP) is Route.MULTIMEM
 
 
+def test_all_gather_takes_the_workspace_exchange_where_it_serves(routing, monkeypatch):
+    _switches(monkeypatch, force=False, invariant=False)
+    gathered = torch.empty(4, 32, dtype=torch.bfloat16)
+    routing._trtllm_ar.lamport_all_gather.return_value = gathered
+    assert routing.all_gather(ROWS, GROUP, -1) is gathered
+    routing._rsag.all_gather.assert_not_called()
+    routing._trtllm_ar.lamport_all_gather.return_value = None
+    assert routing.all_gather(ROWS, GROUP, -1) is routing._rsag.all_gather.return_value
+    routing._rsag.all_gather.assert_called_once_with(ROWS, GROUP, -1)
+
+
 def test_route_never_reads_the_row_count(routing, monkeypatch):
-    # A site's route must not move with the batch; only the capacity check
-    # inside the multimem all-reduce sees the rows, and it refuses rather
-    # than reroutes.
+    # A site's route must not move with the batch.
     _switches(monkeypatch, force=False, invariant=True)
     for rows in (0, 1, 7, 100_000):
         payload = torch.empty(rows, 16, dtype=torch.bfloat16)
-        assert routing.route(Collective.ALL_REDUCE, payload, GROUP) is Route.MULTIMEM
+        assert (
+            routing.route(Collective.ALL_REDUCE, payload, GROUP) is Route.ORDERED_FOLD
+        )
 
 
-def test_batch_invariant_all_reduce_dispatches_to_the_multimem_backend(
+def test_batch_invariant_all_reduce_folds_the_gathered_partials_in_rank_order(
     routing, monkeypatch
 ):
     _switches(monkeypatch, force=False, invariant=True)
-    tensor = torch.ones(4, 16, dtype=torch.bfloat16)
-    routing._rsag.multimem_all_reduce.return_value = tensor
+    # Two partials whose sum rounds differently in bf16 than in fp32: the fold
+    # accumulates in fp32 and rounds once.
+    mine = torch.full((4, 16), 1.0, dtype=torch.bfloat16)
+    peer = torch.full((4, 16), 2.0**-9, dtype=torch.bfloat16)
+    routing._nccl.all_gather.side_effect = lambda tensor, group, dim: torch.cat(
+        [mine, peer]
+    )
+    tensor = mine.clone()
 
     assert routing.all_reduce(tensor, GROUP) is tensor
 
-    routing._rsag.multimem_all_reduce.assert_called_once_with(tensor, GROUP)
+    expected = (mine.float() + peer.float()).to(torch.bfloat16)
+    assert torch.equal(tensor, expected)
     routing._nccl.all_reduce.assert_not_called()
-    routing._nccl.all_gather.assert_not_called()
+    assert not routing._rsag.method_calls
     # Collections take the same route tensor by tensor.
-    routing._rsag.multimem_all_reduce.reset_mock()
-    routing.all_reduce((tensor, tensor), GROUP)
-    assert routing._rsag.multimem_all_reduce.call_count == 2
+    routing._nccl.all_gather.reset_mock()
+    routing.all_reduce((mine.clone(), mine.clone()), GROUP)
+    assert routing._nccl.all_gather.call_count == 2
 
 
-def test_batch_invariant_all_reduce_refuses_non_sum(routing, monkeypatch):
+def test_batch_invariant_all_reduce_refuses_order_dependent_non_sum(
+    routing, monkeypatch
+):
+    # MAX and MIN are exact in any order and take NCCL; a floating-point
+    # product depends on the order and has no batch-invariant route.
     _switches(monkeypatch, force=False, invariant=True)
     with pytest.raises(ValueError, match="SUM"):
         routing.all_reduce(
             torch.ones(4, 16, dtype=torch.bfloat16),
             GROUP,
-            op=torch.distributed.ReduceOp.MAX,
+            op=torch.distributed.ReduceOp.PRODUCT,
         )
-
-
-def test_batch_invariant_all_reduce_skips_the_kernel_for_empty_rows(
-    routing, monkeypatch
-):
-    _switches(monkeypatch, force=False, invariant=True)
-    empty = torch.empty(0, 16, dtype=torch.bfloat16)
-    assert routing.all_reduce(empty, GROUP) is empty
-    routing._rsag.multimem_all_reduce.assert_not_called()
-
-
-def test_multimem_all_reduce_refuses_a_payload_past_its_buffer(monkeypatch):
-    # The ordered fold would return different bits for that batch alone, so
-    # the contract forbids rerouting; a payload the launch did not size for is
-    # a bug reported as such.
-    monkeypatch.setattr(
-        triton_rsag_module, "current_platform", lambda: SimpleNamespace(is_nvidia=True)
-    )
-    rsag = TritonRSAGBackend(fallback=Mock())
-    monkeypatch.setattr(
-        rsag, "_get_or_create", lambda group, hidden: SimpleNamespace(max_token_num=4)
-    )
-    with pytest.raises(RuntimeError, match="past the 4"):
-        rsag.multimem_all_reduce(torch.ones(8, 16, dtype=torch.bfloat16), GROUP)
-    with pytest.raises(ValueError, match="2-D bf16"):
-        rsag.multimem_all_reduce(torch.ones(8, 16, dtype=torch.float32), GROUP)

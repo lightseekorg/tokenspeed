@@ -130,4 +130,28 @@ void trtllm_mnnvl_allreduce_fusion(
   });
 }
 
+// Gathers every rank's 16-bit rows rank-major on the trtllm_mnnvl_allreduce_fusion rotation.
+void trtllm_mnnvl_allgather(TensorView input, TensorView output, int64_t world_size,
+                            int64_t world_rank, int64_t multicast_ptr, int64_t buffer_ptr_local,
+                            TensorView buffer_flags, bool launch_with_pdl) {
+  cudaSetDevice(input.device().device_id);
+  // trtllm_mnnvl_allgather (Python) checks the rows against the workspace and allocates output.
+  int64_t const num_tokens = input.size(0), width = input.size(1);
+  TVM_FFI_ICHECK(input.dtype().bits == 16 && width % 128 == 0 && width <= 4096)
+      << "all-gather takes 16-bit rows of a width that is a multiple of 128, <= 4096";
+
+  MnnvlCommArgs comm;
+  comm.multicast_ptr = reinterpret_cast<void*>(multicast_ptr);
+  comm.buffer_ptr_local = reinterpret_cast<void*>(buffer_ptr_local);
+  comm.peer_ptrs = nullptr;
+  comm.buffer_flags = reinterpret_cast<uint32_t*>(buffer_flags.data_ptr());
+  auto status = mnnvl_allgather_op(
+      static_cast<uint16_t const*>(input.data_ptr()), static_cast<uint16_t*>(output.data_ptr()),
+      static_cast<int>(num_tokens), static_cast<int>(width), static_cast<int>(world_size),
+      static_cast<int>(world_rank), comm, launch_with_pdl, get_stream(input.device()));
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "mnnvl_allgather_op failed with error code " << cudaGetErrorString(status);
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mnnvl_allreduce_fusion, trtllm_mnnvl_allreduce_fusion);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mnnvl_allgather, trtllm_mnnvl_allgather);

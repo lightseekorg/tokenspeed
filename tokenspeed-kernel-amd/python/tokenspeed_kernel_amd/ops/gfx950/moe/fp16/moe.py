@@ -64,13 +64,19 @@ DECODE_S1_BLOCK_K = 128  # stage-1 K tile
 DECODE_S1_NBUF = 1  # single LDS buffer
 
 
-def _decode_split_k(num_tokens: int) -> int:
+def _decode_split_k(num_tokens: int, num_k_tiles: int) -> int:
     """Decode split-K factor for the stage-1 tile (K=128 -> 56 K-tiles).
-    Tuned: more splits at tiny M for occupancy, fewer as M grows."""
+    Tuned: more splits at tiny M for occupancy, fewer as M grows. Clamped to
+    a divisor of ``num_k_tiles``, as the split-K kernel requires."""
     if num_tokens <= 4:
-        return 4
-    if num_tokens <= 8:
-        return 2
+        want = 4
+    elif num_tokens <= 8:
+        want = 2
+    else:
+        return 1
+    for sk in (4, 2):
+        if sk <= want and num_k_tiles % sk == 0:
+            return sk
     return 1
 
 
@@ -160,7 +166,11 @@ def gluon_bf16_moe(
     )
     if decode:
         # decode stage 1 (small M/N, K=128, single LDS buffer) + split-K.
-        sk = split_k if split_k is not None else _decode_split_k(num_tokens)
+        sk = (
+            split_k
+            if split_k is not None
+            else _decode_split_k(num_tokens, D // DECODE_S1_BLOCK_K)
+        )
         invoke_stage1_splitk(
             hidden_states,
             w1,
@@ -185,6 +195,7 @@ def gluon_bf16_moe(
             inter,
             topk,
             BLOCK_M=block_m,
+            BLOCK_N=128 if I_r % 128 == 0 else 64,
             split_k=split_k,
         )
 

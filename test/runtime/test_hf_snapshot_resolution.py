@@ -4,11 +4,11 @@ import json
 import os
 import sys
 import tempfile
-import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 from transformers import PretrainedConfig
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -45,13 +45,11 @@ class _RecordingLock:
         self.events.append("release")
 
 
-class HFSnapshotResolutionTests(unittest.TestCase):
+class TestHFSnapshotResolutionTests:
     def test_snapshot_commit_hash_requires_standard_hf_layout(self) -> None:
         commit = "c" * 40
-        self.assertEqual(
-            _snapshot_commit_hash(f"/cache/repo/snapshots/{commit}/"), commit
-        )
-        self.assertIsNone(_snapshot_commit_hash("/cache/repo/snapshots/main"))
+        assert (_snapshot_commit_hash(f"/cache/repo/snapshots/{commit}/")) == (commit)
+        assert (_snapshot_commit_hash("/cache/repo/snapshots/main")) is None
 
     def _write_config(
         self,
@@ -104,8 +102,8 @@ class HFSnapshotResolutionTests(unittest.TestCase):
             ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
         )
         from_pretrained.assert_called_once_with(snapshot)
-        self.assertIs(config, loaded)
-        self.assertEqual(config._name_or_path, "org/model")
+        assert (config) is (loaded)
+        assert (config._name_or_path) == ("org/model")
 
     def test_remote_code_config_uses_repo_and_commit_under_lock(self) -> None:
         commit = "a" * 40
@@ -147,9 +145,9 @@ class HFSnapshotResolutionTests(unittest.TestCase):
             trust_remote_code=True,
             revision=commit,
         )
-        self.assertEqual(events, ["acquire", "snapshot", "parse", "release"])
-        self.assertIs(config, loaded)
-        self.assertEqual(config._name_or_path, "org/model")
+        assert (events) == (["acquire", "snapshot", "parse", "release"])
+        assert (config) is (loaded)
+        assert (config._name_or_path) == ("org/model")
 
     def test_remote_code_config_without_commit_falls_back_to_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as snapshot:
@@ -177,8 +175,8 @@ class HFSnapshotResolutionTests(unittest.TestCase):
 
         from_pretrained.assert_called_once_with(snapshot, trust_remote_code=True)
         warn.assert_called_once()
-        self.assertIs(config, loaded)
-        self.assertEqual(config._name_or_path, "org/model")
+        assert (config) is (loaded)
+        assert (config._name_or_path) == ("org/model")
 
     def test_ordinary_auto_config_uses_snapshot_after_releasing_lock(self) -> None:
         commit = "e" * 40
@@ -219,9 +217,9 @@ class HFSnapshotResolutionTests(unittest.TestCase):
             snapshot,
             trust_remote_code=False,
         )
-        self.assertEqual(events, ["acquire", "snapshot", "release", "parse"])
-        self.assertIs(config, loaded)
-        self.assertEqual(config._name_or_path, "org/model")
+        assert (events) == (["acquire", "snapshot", "release", "parse"])
+        assert (config) is (loaded)
+        assert (config._name_or_path) == ("org/model")
 
     def test_local_config_is_parsed_from_its_real_json(self) -> None:
         with tempfile.TemporaryDirectory() as snapshot:
@@ -243,7 +241,7 @@ class HFSnapshotResolutionTests(unittest.TestCase):
                 config = get_config(snapshot, trust_remote_code=False)
 
         download.assert_not_called()
-        self.assertEqual(config.snapshot_value, "from-snapshot")
+        assert (config.snapshot_value) == ("from-snapshot")
 
     def test_generation_config_uses_revision_pinned_snapshot(self) -> None:
         loaded = SimpleNamespace()
@@ -276,7 +274,7 @@ class HFSnapshotResolutionTests(unittest.TestCase):
             "/resolved/generation-snapshot",
             trust_remote_code=True,
         )
-        self.assertIs(config, loaded)
+        assert (config) is (loaded)
 
     def test_generation_config_missing_snapshot_metadata_returns_none(self) -> None:
         with (
@@ -295,7 +293,7 @@ class HFSnapshotResolutionTests(unittest.TestCase):
                 revision="missing-revision",
             )
 
-        self.assertIsNone(config)
+        assert (config) is None
 
     def test_tokenizer_uses_revision_pinned_snapshot(self) -> None:
         events: list[str] = []
@@ -341,10 +339,10 @@ class HFSnapshotResolutionTests(unittest.TestCase):
             trust_remote_code=False,
             clean_up_tokenization_spaces=False,
         )
-        self.assertEqual(events, ["acquire", "snapshot", "release", "parse"])
-        self.assertIs(result, tokenizer)
-        self.assertEqual(result.name_or_path, "org/tokenizer")
-        self.assertEqual(result.init_kwargs["name_or_path"], "org/tokenizer")
+        assert (events) == (["acquire", "snapshot", "release", "parse"])
+        assert (result) is (tokenizer)
+        assert (result.name_or_path) == ("org/tokenizer")
+        assert (result.init_kwargs["name_or_path"]) == ("org/tokenizer")
 
     def test_remote_code_tokenizer_uses_repo_and_commit_under_lock(self) -> None:
         commit = "b" * 40
@@ -388,8 +386,8 @@ class HFSnapshotResolutionTests(unittest.TestCase):
             clean_up_tokenization_spaces=False,
             revision=commit,
         )
-        self.assertEqual(events, ["acquire", "snapshot", "parse", "release"])
-        self.assertIs(result, tokenizer)
+        assert (events) == (["acquire", "snapshot", "parse", "release"])
+        assert (result) is (tokenizer)
 
     def test_remote_code_tokenizer_without_commit_falls_back_to_snapshot(self) -> None:
         events: list[str] = []
@@ -433,7 +431,7 @@ class HFSnapshotResolutionTests(unittest.TestCase):
             trust_remote_code=True,
             clean_up_tokenization_spaces=False,
         )
-        self.assertEqual(events, ["acquire", "snapshot", "release", "parse"])
+        assert (events) == (["acquire", "snapshot", "release", "parse"])
         warn.assert_called_once()
 
     def test_local_tokenizer_does_not_resolve_remote_snapshot(self) -> None:
@@ -460,7 +458,7 @@ class HFSnapshotResolutionTests(unittest.TestCase):
         )
 
     def test_tokenizer_rejects_conflicting_revisions(self) -> None:
-        with self.assertRaisesRegex(ValueError, "must match"):
+        with pytest.raises((ValueError), match=("must match")):
             get_tokenizer(
                 "org/tokenizer",
                 tokenizer_revision="tokenizer-revision",
@@ -474,7 +472,7 @@ class HFSnapshotResolutionTests(unittest.TestCase):
                 "tokenspeed.runtime.utils.hf_transformers_utils.cached_file",
                 side_effect=AssertionError("must not re-resolve a local snapshot"),
             ) as cached,
-            self.assertRaisesRegex(RuntimeError, "encoding/encoding_dsv4.py"),
+            pytest.raises((RuntimeError), match=("encoding/encoding_dsv4.py")),
         ):
             _find_deepseek_v4_encoding_file(snapshot, None)
 
@@ -482,4 +480,4 @@ class HFSnapshotResolutionTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    raise SystemExit(pytest.main([__file__, "-v", *sys.argv[1:]]))

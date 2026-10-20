@@ -21,6 +21,9 @@ from tokenspeed_kernel.ops.communication.trtllm import (
     allreduce_residual_rmsnorm as _allreduce_residual_rmsnorm,
 )
 from tokenspeed_kernel.ops.communication.trtllm import (
+    allreduce_sandwich_rmsnorm as _allreduce_sandwich_rmsnorm,
+)
+from tokenspeed_kernel.ops.communication.trtllm import (
     reducescatter_residual_rmsnorm as _reducescatter_residual_rmsnorm,
 )
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -142,6 +145,72 @@ def allreduce_residual_rmsnorm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run fused all-reduce, residual addition, and RMS normalization."""
 
+    if current_platform().is_amd:
+        if (
+            block_quant_fp8
+            or residual_reduce_scattered
+            or has_partial_norm_out
+            or input_tensor.dim() != 2
+            or residual is None
+        ):
+            return None, None, None, None
+        from tokenspeed_kernel.ops.communication import iris as iris_ops
+
+        token_num, hidden_dim = input_tensor.shape
+        if (
+            input_tensor.is_cuda
+            and residual.is_cuda
+            and weight.is_cuda
+            and input_tensor.is_contiguous()
+            and residual.is_contiguous()
+            and weight.is_contiguous()
+            and input_tensor.dtype == torch.bfloat16
+            and residual.dtype == torch.bfloat16
+            and input_tensor.shape == residual.shape
+            and weight.shape == (hidden_dim,)
+            and group.size() > 1
+            and token_num <= max_token_num
+        ):
+            key = (id(group), max_token_num, hidden_dim, input_tensor.dtype)
+            state = iris_ops.IRIS_AR_RMSNORM_STATES.get(key)
+            if state is None:
+                state = iris_ops.create_iris_ar_rmsnorm_state(
+                    group=group,
+                    rank_in_group=rank,
+                    max_token_num=max_token_num,
+                    hidden_dim=hidden_dim,
+                    dtype=input_tensor.dtype,
+                )
+                iris_ops.IRIS_AR_RMSNORM_STATES[key] = state
+            norm_out, residual_out = iris_ops.iris_allreduce_residual_rmsnorm(
+                state,
+                input_tensor=input_tensor,
+                residual=residual,
+                weight=weight,
+                eps=eps,
+            )
+            return norm_out, residual_out, None, None
+        from tokenspeed_kernel.ops.communication.triton import (
+            symm_allreduce_residual_rmsnorm,
+        )
+
+        return symm_allreduce_residual_rmsnorm(
+            input_tensor=input_tensor,
+            residual=residual,
+            weight=weight,
+            rank=rank,
+            group=group,
+            eps=eps,
+            max_token_num=max_token_num,
+            use_oneshot=use_oneshot,
+            trigger_completion_at_end=trigger_completion_at_end,
+            fp32_acc=fp32_acc,
+            block_quant_fp8=block_quant_fp8,
+            residual_reduce_scattered=residual_reduce_scattered,
+            has_partial_norm_out=has_partial_norm_out,
+            max_sm_to_use=max_sm_to_use,
+            launch_with_pdl=False,
+        )
     return _allreduce_residual_rmsnorm(
         input_tensor=input_tensor,
         residual=residual,
@@ -157,6 +226,48 @@ def allreduce_residual_rmsnorm(
         residual_reduce_scattered=residual_reduce_scattered,
         has_partial_norm_out=has_partial_norm_out,
         max_sm_to_use=max_sm_to_use,
+        launch_with_pdl=pdl_enabled(),
+    )
+
+
+def allreduce_sandwich_rmsnorm(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    post_weight: torch.Tensor,
+    weight: torch.Tensor,
+    rank: int,
+    group: dist.ProcessGroup,
+    *,
+    eps: float,
+    x_scale: float | None = None,
+    residual_scale: float | None = None,
+    max_token_num: int = 2048,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """All-reduce a sublayer partial and run a pre/post ("sandwich") norm
+    boundary on the sum in one launch.
+
+    ``a = rmsnorm(all_reduce(input_tensor), post_weight, eps)``, then
+    ``rmsnorm(a, weight, eps, residual=residual, round_residual_sum_bf16=True,
+    x_scale=x_scale, residual_scale=residual_scale)``: the same operations and
+    BF16 rounding points as those unfused calls, the sums of squares reduced
+    in another order. Returns ``(norm_out, residual_out)``, or None when no
+    fused kernel serves the call (nothing is launched; the caller runs the
+    unfused calls).
+    """
+
+    if not current_platform().is_nvidia:
+        return None
+    return _allreduce_sandwich_rmsnorm(
+        input_tensor,
+        residual,
+        post_weight,
+        weight,
+        rank,
+        group,
+        eps=eps,
+        x_scale=x_scale,
+        residual_scale=residual_scale,
+        max_token_num=max_token_num,
         launch_with_pdl=pdl_enabled(),
     )
 
@@ -243,6 +354,7 @@ __all__ = [
     "allreduce_lane_latent_norm",
     "allreduce_lane_latent_norm_supported",
     "allreduce_residual_rmsnorm",
+    "allreduce_sandwich_rmsnorm",
     "prepare_allreduce_fusion",
     "reducescatter_residual_rmsnorm",
 ]

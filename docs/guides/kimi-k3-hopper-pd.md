@@ -1,4 +1,4 @@
-# Kimi K3 on Hopper with PD, DeepEP and DSpark
+# Kimi K3 on Hopper with PD, DeepEP, and DSpark
 
 This layout uses 64 GPUs: four eight-GPU H200 nodes for each engine.
 The runtime supports the configuration below. Complete the GPU validation
@@ -25,7 +25,7 @@ backend selects the prefill scan, while KDA decode/verify uses the
 platform-selected kernels.
 
 Install this checkout with the standard recipe
-(`bash test/ci_system/install_deps.sh`, see the
+(`bash test/ci_system/install_deps.sh`; see the
 [getting-started guide](getting-started.md)). The recipe rebuilds the
 checkout's kernel and scheduler packages and does not start the P, D, or SMG
 services.
@@ -54,7 +54,7 @@ TP group because stages consume different weight subsets.
 
 Add these argument sets to the existing engine launcher. Supply target and
 draft paths, node rank, rendezvous address, gateway transport, context
-length and memory utilization separately. Run one launcher per node with
+length, and memory utilization separately. Run one launcher per node with
 eight GPU workers and use separate P/D rendezvous addresses. These argument
 sets do not configure or start an SMG gateway.
 
@@ -101,15 +101,13 @@ P runs eager in this configuration: the chunk pipeline
 (`--pipeline-parallel-size 4`) forces `--enforce-eager`, and DeepEP keeps the
 prefill graph off regardless. A prefill node without PP or DeepEP captures
 prefill CUDA graphs like any server. The runtime skips only the decode graph
-there, since the role never decodes. Its layer windows partition the target
+there, because the role never decodes. Its layer windows partition the target
 decoder layers, excluding draft layers. The automatic split of 93 layers is
 `24,23,23,23`.
 `--pp-layer-partition 24,24,24,21` is another candidate: its first three
 boundaries align with the standard AttnRes blocks and the last stage owns
 fewer target layers alongside context writing and draft execution. Measure
-stage time before choosing a partition for throughput. KDA geometry can
-reduce the effective prefill chunk size to align state checkpoints.
-Startup logs report the effective chunk size.
+stage time before choosing a partition for throughput.
 
 D arguments:
 
@@ -140,8 +138,8 @@ maximum context capacity or memory utilization.
 ## Token layout and capacity
 
 The runtime selects `KimiLinearMoEDeepEP` when it constructs each MoE. It owns
-token slicing, projection placement, dispatch/combine and the attention-TP tail.
-Shared MLPs receive explicit TP rank, size and group. They never infer weight
+token slicing, projection placement, dispatch/combine, and the attention-TP tail.
+Shared MLPs receive explicit TP rank, size, and group. They never infer weight
 layout from a global all-to-all setting.
 
 Each TP rank takes a disjoint slice of its attention batch before routing
@@ -171,8 +169,8 @@ for the full admissible batch, not just the CUDA graph ladder: larger eager
 batches remain possible. The selected value must also satisfy DeepEP's
 alignment requirements.
 
-The decode node runs no extend-shaped work -- a retracted request is restored
-from its image, never re-prefilled -- so a pinned `low_latency` needs only the
+The decode node runs no extend-shaped work — a retracted request is restored
+from its image, never re-prefilled — so a pinned `low_latency` needs only the
 decode batch's rows per rank. Prefer `auto` all the same: it keeps the
 default dispatch for anything that is not a graph-shaped decode step.
 
@@ -228,11 +226,11 @@ of the target embedding. The final P stage loads its TP shard because the
 target embedding lives on the first stage. Non-PP execution on D continues
 to borrow the target embedding. When sizing memory and choosing the PP
 partition, include the final stage's proposal weights, embedding shard,
-activations and proposal execution time.
+activations, and proposal execution time.
 
 All P stages share one logical cache geometry, with target physical fields
 assigned by stage and draft fields owned only by the last stage. The same
-ownership drives producer readiness, sender filtering and receiver routes.
+ownership drives producer readiness, sender filtering, and receiver routes.
 A final producer barrier follows the completed drafter call, covering all
 draft cache writes. Bootstrap publishes explicit field placement per stage.
 PD routing does not reconstruct target/draft ownership. P and D must both
@@ -242,7 +240,7 @@ P sends its sampled bootstrap token and the complete candidate window:
 the anchor followed by DSpark proposals. D installs this window before its
 first ordinary verify round, which can accept the supplied proposals and
 produce the next candidate window through its local drafter. MLA, KDA
-recurrent/conv state and draft KV must all arrive before that round. The
+recurrent/conv state, and draft KV must all arrive before that round. The
 handoff uses the existing candidate transfer and verify path.
 
 ## MTP (NextN) on the prefill pipeline
@@ -251,14 +249,14 @@ handoff uses the existing candidate transfer and verify path.
 (`model.layers.<num_hidden_layers>.*`, the default draft path) runs on the
 same P pipeline. No stage produces anything across the pipeline: the NextN
 layer reads the final hidden states the last stage already computes, so only
-the last P stage holds the NextN layer, its embedding shard and the draft
+the last P stage holds the NextN layer, its embedding shard, and the draft
 cache, samples the first token, runs the draft extend over the completed
 prompt and the multi-step draft, and writes the candidate block. The other
 stages build and load no draft model at all. The NextN checkpoint must
 ship its `embed_tokens` weight: the last stage loads that TP shard because
 the target embedding lives on the first stage, while the draft shares the
 target's head as usual. Ownership, bootstrap placement, transfer
-routes and the candidate handoff are identical to the DSpark case, and
+routes, and the candidate handoff are identical to the DSpark case, and
 layerwise transfer (`--disaggregation-layerwise-interval`) works on every
 stage: only the last stage finalizes a draft-final step. The last stage
 carries the NextN MoE layer plus the draft extend and drafting time. Size
@@ -267,26 +265,26 @@ MTP` without PP and verifies the supplied candidates as before.
 
 ## Validation
 
-Run the existing cache-transfer, model-configuration and Marlin tests in the
+Run the existing cache-transfer, model-configuration, and Marlin tests in the
 configured runtime environment. Validate the full serving topology on the
 GPU hosts:
 
 1. Compare Marlin with the dequantized reference, then test DeepEP normal
    EP8 and low latency EP32 at actual K3 geometry. Include nonzero EP ranks,
-   empty/unequal source batches and skewed expert routing.
+   empty/unequal source batches, and skewed expert routing.
 2. Compare eager and repeated graph MoE results while changing routes,
-   active DP ranks and live counts inside one capture bucket. Include
+   active DP ranks, and live counts inside one capture bucket. Include
    batches below TP8 and padded verify rows.
 3. Compare concatenated context projection with PP accumulation, including
-   `fc_norm`, both configured tap streams and PP boundaries. Floating-point
+   `fc_norm`, both configured tap streams, and PP boundaries. Floating-point
    addition order differs. Compare errors and finite values rather than
    requiring BF16 bitwise equality.
 4. Validate P-to-D target/cache behavior without speculation, then enable
-   DSpark and compare initial logits, generation and acceptance. Verify
+   DSpark and compare initial logits, generation, and acceptance. Verify
    that P transfers its sampled anchor and actual proposals, and compare
    the first D verify round in eager mode and with graph replay.
 5. Exercise chunked prompts, prefix hits, page boundaries, concurrency,
-   cancellation and repeated slot reuse. Keep graph enabled with unequal
+   cancellation, and repeated slot reuse. Keep graph enabled with unequal
    DP batches. `TOKENSPEED_GRAPH_DEBUG=1` checks metadata pointer stability
    during correctness runs.
 6. Measure realistic prompts across concurrency levels. Record P computed
@@ -313,8 +311,7 @@ python -m pytest -q \
 ```
 
 Also run the existing K3 DSpark/capture tests. Keep runtime and kernel test
-roots in separate pytest
-invocations to avoid their conflicting `conftest` module names.
+roots in separate pytest invocations to avoid their conflicting `conftest` module names.
 
 The configuration regressions below check that the MTP layer passes a single
 MoE block through `create_kimi_linear_moe` and that DSpark rejects a tap count
@@ -347,7 +344,7 @@ torchrun --standalone --nproc-per-node=8 -m pytest -q \
   tokenspeed-kernel/test/nvidia/ops/moe/test_marlin_deepep_distributed.py
 ```
 
-These smoke tests use small expert matrices. Full K3 geometry, EP32 transport
+These smoke tests use small expert matrices. Full K3 geometry, EP32 transport,
 and graph replay need the GPU validation described above. Run normal and
 low-latency tests in separate process invocations. The DeepEP buffer is
 process-scoped.

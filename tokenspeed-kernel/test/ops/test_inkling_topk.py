@@ -30,22 +30,12 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
-from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
+from tokenspeed_kernel.numerics.torch.moe import torch_inkling_topk
+from tokenspeed_kernel.ops.moe._triton.inkling_topk import inkling_topk
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="inkling_topk needs CUDA"
 )
-
-
-def _reference(logits, bias, global_scale, top_k, n_routed, route_scale):
-    routed = logits[:, :n_routed].float()
-    selection = routed.sigmoid() + bias
-    _, ids = torch.topk(selection, top_k, dim=-1)
-    active = torch.cat([routed.gather(-1, ids), logits[:, n_routed:].float()], dim=-1)
-    log_probs = F.logsigmoid(active)
-    weights = torch.exp(log_probs - torch.logsumexp(log_probs, dim=-1, keepdim=True))
-    return weights * route_scale * global_scale, ids
 
 
 def _make_inputs(num_tokens, n_routed, n_shared, seed=0, dtype=torch.float32):
@@ -78,7 +68,9 @@ def test_matches_gate_reference(num_tokens, n_routed, n_shared, top_k):
     weights, ids = inkling_topk(
         logits, bias, global_scale, top_k=top_k, n_routed=n_routed, route_scale=8.0
     )
-    ref_w, ref_ids = _reference(logits, bias, global_scale, top_k, n_routed, 8.0)
+    ref_w, ref_ids = torch_inkling_topk(
+        logits, bias, global_scale, top_k=top_k, n_routed=n_routed, route_scale=8.0
+    )
 
     assert ids.dtype == torch.int32 and weights.dtype == torch.float32
     assert ids.shape == (num_tokens, top_k)
@@ -141,7 +133,9 @@ def test_bf16_logits():
     weights, ids = inkling_topk(
         logits, bias, global_scale, top_k=top_k, n_routed=n_routed, route_scale=8.0
     )
-    ref_w, ref_ids = _reference(logits, bias, global_scale, top_k, n_routed, 8.0)
+    ref_w, ref_ids = torch_inkling_topk(
+        logits, bias, global_scale, top_k=top_k, n_routed=n_routed, route_scale=8.0
+    )
     assert torch.equal(ids.long(), ref_ids)
     torch.testing.assert_close(weights, ref_w, atol=1e-5, rtol=1e-5)
 

@@ -409,3 +409,91 @@ def tokenspeed_a2a_lamport_fp8_quantize(state, inputs):
             state.blocks,
         )
     return values, scales
+
+
+@register_kernel(
+    family="communication",
+    mode="stateful_all_to_all_fp8",
+    name="cuda_tokenspeed_a2a_lamport_fp8",
+    solution="cuda",
+    signatures=format_signatures(("inputs",), "dense", {torch.float8_e4m3fn}),
+)
+def tokenspeed_a2a_lamport_fp8(state, inputs, input_scales, rows):
+    """Exchange prequantized row shards and per-128 scales in one kernel.
+
+    Args:
+        state: Collectively prepared TokenSpeedA2ALamportState.
+        inputs: Contiguous, four-byte-aligned E4M3 [local_rows,K].
+        input_scales: Contiguous FP32 [local_rows,K/128], preserved bit for bit.
+        rows: Common positive physical rows per owner, at least local_rows.
+            Unequal and empty owners publish zero padding inside the kernel.
+
+    Returns:
+        Borrowed E4M3 [TP*rows,K/TP] and row-major FP32 scales
+        [TP*rows,K/(128*TP)]. Both share state.output and remain valid until
+        the next exchange. No quantization or additional preparation is needed.
+        Each shard must contain complete 128-element groups.
+    """
+    if (
+        state.channels % (128 * state.tp_size)
+        or inputs.ndim != 2
+        or inputs.dtype != torch.float8_e4m3fn
+        or inputs.device != state.output.device
+        or not inputs.is_contiguous()
+        or inputs.data_ptr() % 4
+        or inputs.shape[1] != state.channels
+        or not 0 < rows <= state.max_rows
+        or not 0 <= inputs.shape[0] <= rows
+        or input_scales.shape != (inputs.shape[0], state.channels // 128)
+        or input_scales.dtype != torch.float32
+        or input_scales.device != inputs.device
+        or not input_scales.is_contiguous()
+    ):
+        raise ValueError("Prequantized A2A requires FP8 row inputs and per-128 scales")
+    for tensor in (inputs, input_scales):
+        storage = tensor.untyped_storage().data_ptr()
+        if any(
+            buffer is not None and storage == buffer.untyped_storage().data_ptr()
+            for buffer in (
+                state.output,
+                state.scratch,
+                state.control,
+                state.peers,
+                state.chunk_scratch,
+                state.chunk_flags,
+                state.chunk_control,
+                state.chunk_peers,
+                state.chunk_flag_peers,
+                state.fp8_output,
+                state.fp8_scales,
+            )
+        ):
+            raise ValueError("Prequantized A2A inputs must not alias state storage")
+    # Values and scales together need less space than the BF16 output. Views
+    # share the existing lifetime without adding another persistent allocation.
+    count = rows * state.channels
+    storage = state.output.view(torch.uint8)
+    values = (
+        storage[:count]
+        .view(torch.float8_e4m3fn)
+        .view(state.tp_size * rows, state.channels // state.tp_size)
+    )
+    scales = (
+        storage[count : count + count // 128 * 4]
+        .view(torch.float32)
+        .view(state.tp_size * rows, state.channels // (128 * state.tp_size))
+    )
+    state.module.exchange_prequantized(
+        inputs,
+        input_scales,
+        values,
+        scales,
+        state.peers,
+        state.control,
+        state.words,
+        rows,
+        state.channels,
+        state.rank,
+        state.blocks,
+    )
+    return values, scales

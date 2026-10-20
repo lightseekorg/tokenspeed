@@ -27,21 +27,54 @@ import importlib
 import importlib.abc
 import importlib.util
 import sys
+from functools import partial
 
-import tokenspeed_triton.experimental.gluon.language as gl
 import torch
-from tokenspeed_triton.experimental import gluon
-from tokenspeed_triton.language.core import _aggregate as aggregate
-from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
 
 _IS_NPU = hasattr(torch, "npu") and torch.npu.is_available()
 
 if _IS_NPU:
     from tokenspeed_kernel_npu._triton import libdevice, proton, tl, triton
+
+    # Gluon and tensor descriptors belong to the CUDA/ROCm vendor package.
+    # Keep GPU registrations importable without requiring that package.
+    aggregate = None
+    TensorDescriptor = None
+    gl = None
+
+    class _UnavailableGluonKernel:
+        def __init__(self, fn, options):
+            self.fn = fn
+            self.options = options
+
+        def __getitem__(self, grid):
+            raise RuntimeError(
+                f"Gluon kernel {self.fn.__name__} cannot execute on Ascend"
+            )
+
+        def __call__(self, *args, **kwargs):
+            raise RuntimeError(
+                f"Gluon kernel {self.fn.__name__} cannot execute on Ascend"
+            )
+
+    class _UnavailableGluon:
+        """Import-only decorators; capability selection must exclude Ascend."""
+
+        @staticmethod
+        def jit(fn=None, **options):
+            if fn is None:
+                return partial(_UnavailableGluonKernel, options=options)
+            return _UnavailableGluonKernel(fn, options)
+
+    gluon = _UnavailableGluon()
 else:
     import tokenspeed_triton as triton
+    import tokenspeed_triton.experimental.gluon.language as gl
     from tokenspeed_triton import language as tl
+    from tokenspeed_triton.experimental import gluon
+    from tokenspeed_triton.language.core import _aggregate as aggregate
     from tokenspeed_triton.language.extra import libdevice
+    from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
 
     try:
         import tokenspeed_triton.profiler as proton
@@ -49,8 +82,9 @@ else:
         proton = None
 
 __all__ = [
-    "aggregate",
     "TensorDescriptor",
+    "aggregate",
+    "get_hip_runtime_path",
     "gl",
     "gluon",
     "libdevice",
@@ -59,6 +93,13 @@ __all__ = [
     "tl",
     "triton",
 ]
+
+
+def get_hip_runtime_path() -> str:
+    """Return the HIP runtime library path used by the Triton driver."""
+    from tokenspeed_triton.backends.amd.driver import _get_path_to_hip_runtime_dylib
+
+    return _get_path_to_hip_runtime_dylib()
 
 
 _TRITON_SRC = "triton"

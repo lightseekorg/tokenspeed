@@ -17,7 +17,7 @@
 
 """FlashInfer gated delta net (GDN) prefill + decode/MTP kernels.
 
-Prefill: fast-path for GDN chunked prefill on Blackwell (sm100/sm103) + CUDA 13
+Prefill: fast-path for GDN chunked prefill on Hopper/Blackwell + CUDA 13
 + bf16 + head_dim==128. The caller gates on ``is_supported`` and must fail fast
 when the fast-path is unavailable; this module has no Triton fallback for it.
 
@@ -81,11 +81,8 @@ if platform.is_hopper_plus:
 def is_available() -> bool:
     """Whether the flashinfer GDN chunk-prefill kernel can run on this platform."""
     cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    # flashinfer's gdn_prefill treats compute-capability major 10 as the
-    # Blackwell path (sm100 B200/GB200, sm103 B300), gated on CUDA>=13 and the
-    # prefill kernel being present; it raises NotImplementedError otherwise.
-    # Mirror that here so the caller does not commit to a crashing fast-path.
-    return platform.is_blackwell and cuda_major >= 13
+    # FlashInfer provides separate SM90 and Blackwell prefill kernels.
+    return (platform.is_hopper or platform.is_blackwell) and cuda_major >= 13
 
 
 def is_supported(
@@ -108,20 +105,6 @@ def is_decode_available() -> bool:
     return platform.is_hopper_plus
 
 
-def is_decode_supported(head_dim: int, dtype: torch.dtype) -> bool:
-    """Whether ``gdn_decode_step``/``gdn_decode_mtp`` support this shape/dtype.
-
-    Both kernels require K == V == 128 and a float16/bfloat16 q/k/v dtype. The
-    recurrent state pool may be float32 or bfloat16; FlashInfer dispatches the
-    latter to its dedicated BF16-state kernel.
-    """
-    return (
-        is_decode_available()
-        and head_dim == SUPPORTED_HEAD_DIM
-        and dtype in (torch.float16, torch.bfloat16)
-    )
-
-
 CHUNK_SIZE = 64
 
 flashinfer_gdn_chunk_prefill = error_fn
@@ -134,7 +117,7 @@ if is_available():
         name="flashinfer_gdn_chunk_prefill",
         solution="flashinfer",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
+            min_arch_version=ArchVersion(9, 0),
             max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
@@ -162,7 +145,7 @@ if is_available():
         output_final_state: bool = True,
         output_h: bool = False,
     ):
-        """Run one chunked GDN prefill on the sm100 kernel.
+        """Run one chunked GDN prefill on Hopper or Blackwell.
 
         q, k, v are [B, T, H, D] (B==1) or [T, H, D]; q/k already L2-normalized.
         g, beta are [B, T, H] or [T, H]; g in log space. initial_state is the
@@ -297,6 +280,7 @@ if is_decode_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+            "strided_qkv": frozenset({False}),
         },
     )
     def flashinfer_gdn_decode_step(
@@ -366,6 +350,8 @@ if is_decode_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+            "separate_output_state": frozenset({False}),
+            "strided_qkv": frozenset({False}),
         },
     )
     def flashinfer_gdn_decode_mtp(
@@ -384,7 +370,9 @@ if is_decode_available():
         use_qk_l2norm: bool = True,
         intermediate_states_buffer: torch.Tensor | None = None,
         output_state_indices: torch.Tensor | None = None,
+        output_state: torch.Tensor | None = None,
         tree_ancestors: torch.Tensor | None,
+        replay_payload: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run one multi-token (T>1) GDN MTP verify step, K-last pool+indices.
 
@@ -421,9 +409,13 @@ if is_decode_available():
 
         Returns the [B, T, HV, V] decode output (q.dtype).
         """
-        if tree_ancestors is not None:
+        if tree_ancestors is not None or replay_payload is not None:
             raise NotImplementedError(
                 "FlashInfer GDN MTP kernels follow a chain; draft trees run the Triton kernel"
+            )
+        if output_state is not None:
+            raise NotImplementedError(
+                "FlashInfer GDN MTP kernels write states into initial_state only"
             )
         # Normalize decay inputs for FlashInfer's FP32 CuteDSL/DLPack boundary.
         A_log = A_log.detach().float()

@@ -15,8 +15,9 @@ import contextlib
 import io
 import os
 import sys
-import unittest
 from types import SimpleNamespace
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,8 +29,8 @@ from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
-class PrefillCaptureArgsTest(unittest.TestCase):
-    def setUp(self):
+class TestPrefillCaptureArgsTest:
+    def setup_method(self):
         from tokenspeed.runtime.utils.server_args import ServerArgs
 
         self.parser = argparse.ArgumentParser()
@@ -62,9 +63,9 @@ class PrefillCaptureArgsTest(unittest.TestCase):
             ]
             direct = self.parser.parse_args(argv)
             routed = self.parser.parse_args(split_argv(argv).engine)
-            self.assertEqual(vars(direct), vars(routed))
-            self.assertFalse(hasattr(direct, "prefill_graph_capture_token_sizes"))
-            self.assertEqual(direct.prefill_graph_capture_sizes, [1024, 2048, 4096])
+            assert (vars(direct)) == (vars(routed))
+            assert not (hasattr(direct, "prefill_graph_capture_token_sizes"))
+            assert (direct.prefill_graph_capture_sizes) == ([1024, 2048, 4096])
             config = SimpleNamespace(**vars(direct))
             config.prefill_graph_max_tokens = config.chunked_prefill_size = 4096
             config.context_len = 4096
@@ -76,8 +77,7 @@ class PrefillCaptureArgsTest(unittest.TestCase):
                 for bucket in buckets
                 for bs in resolve_prefill_capture_batch_sizes(config, bucket)
             ]
-            self.assertEqual(
-                combinations,
+            assert (combinations) == (
                 [
                     (1024, 1),
                     (1024, 2),
@@ -85,16 +85,16 @@ class PrefillCaptureArgsTest(unittest.TestCase):
                     (2048, 2),
                     (4096, 1),
                     (4096, 2),
-                ],
+                ]
             )
             owner = PrefillGraph.__new__(PrefillGraph)
             owner.capture_buckets = buckets
-            self.assertEqual((owner._padded_bucket(868 + 869), 2), (2048, 2))
-            self.assertIsNone(owner._padded_bucket(4097))
+            assert ((owner._padded_bucket(868 + 869), 2)) == ((2048, 2))
+            assert (owner._padded_bucket(4097)) is None
             configurations.append((vars(direct), combinations))
-        self.assertEqual(*configurations)
+        assert configurations[0] == configurations[1]
 
-    def test_token_aliases_are_mutually_exclusive(self):
+    def test_token_aliases_are_mutually_exclusive(self, subtests):
         from tokenspeed.cli._argsplit import split_argv
 
         flags = ("--prefill-graph-capture-token-sizes", "--prefill-graph-capture-sizes")
@@ -108,29 +108,29 @@ class PrefillCaptureArgsTest(unittest.TestCase):
                     )
                     argv = ["--model", "test", *args]
                     for routed in (argv, split_argv(argv).engine):
-                        with self.subTest(argv=routed):
+                        with subtests.test(argv=routed):
                             with contextlib.redirect_stderr(io.StringIO()) as error:
-                                with self.assertRaises(SystemExit) as raised:
+                                with pytest.raises((SystemExit)) as raised:
                                     self.parser.parse_args(routed)
-                            self.assertEqual(raised.exception.code, 2)
-                            self.assertIn("not allowed with argument", error.getvalue())
-                            self.assertIn(first, error.getvalue())
-                            self.assertIn(second, error.getvalue())
+                            assert (raised.value.code) == (2)
+                            assert ("not allowed with argument") in (error.getvalue())
+                            assert (first) in (error.getvalue())
+                            assert (second) in (error.getvalue())
 
     def test_defaults_and_help_keep_token_and_request_units_separate(self):
         args = self.parser.parse_args(["--model", "test"])
-        self.assertIsNone(args.prefill_graph_capture_sizes)
-        self.assertIsNone(args.prefill_graph_capture_batch_sizes)
+        assert (args.prefill_graph_capture_sizes) is None
+        assert (args.prefill_graph_capture_batch_sizes) is None
         help_text = " ".join(self.parser.format_help().split())
-        self.assertIn("Total input-token capacities per forward", help_text)
-        self.assertIn("not per-request sequence lengths", help_text)
-        self.assertIn(
-            "Request capacities for inline prefill attention capture", help_text
+        assert ("Total input-token capacities per forward") in (help_text)
+        assert ("not per-request sequence lengths") in (help_text)
+        assert ("Request capacities for inline prefill attention capture") in (
+            help_text
         )
-        self.assertIn("smallest fitting captured batch size", help_text)
-        self.assertIn("Compatibility alias", help_text)
+        assert ("smallest fitting captured batch size") in (help_text)
+        assert ("Compatibility alias") in (help_text)
 
-    def test_executor_requires_explicit_capture_batch_sizes(self):
+    def test_executor_requires_explicit_capture_batch_sizes(self, subtests):
         from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
         from tokenspeed.runtime.execution.prefill_graph import (
             resolve_prefill_capture_batch_sizes,
@@ -161,29 +161,28 @@ class PrefillCaptureArgsTest(unittest.TestCase):
             decode_only_attention=False,
             query_shard_size=1,
             query_shard_rank=0,
+            enable_memory_saver=False,
         )
-        with self.assertRaisesRegex(TypeError, "prefill_graph_capture_batch_sizes"):
+        with pytest.raises((TypeError), match=("prefill_graph_capture_batch_sizes")):
             ModelExecutorConfig(**config_args)
 
         for sizes, expected in ((None, [1]), ([1, 2, 4], [1, 2, 4])):
-            with self.subTest(capture_batch_sizes=sizes):
+            with subtests.test(capture_batch_sizes=sizes):
                 config = ModelExecutorConfig(
                     **config_args, prefill_graph_capture_batch_sizes=sizes
                 )
-                self.assertIs(config.prefill_graph_capture_batch_sizes, sizes)
-                self.assertEqual(
-                    resolve_prefill_capture_batch_sizes(config, 1024), expected
-                )
+                assert (config.prefill_graph_capture_batch_sizes) is (sizes)
+                assert (resolve_prefill_capture_batch_sizes(config, 1024)) == (expected)
 
 
-class PrefillCaptureStreamTest(unittest.TestCase):
-    def test_warmup_runs_on_the_capture_stream(self):
+class TestPrefillCaptureStreamTest:
+    def test_warmup_runs_on_the_capture_stream(self, subtests):
         import torch
 
         from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 
         if not torch.cuda.is_available():
-            self.skipTest("requires CUDA")
+            pytest.skip("requires CUDA")
 
         class StreamProbe(PrefillGraph):
             """Minimal owner with the shared buffers used by real bucket captures."""
@@ -208,22 +207,20 @@ class PrefillCaptureStreamTest(unittest.TestCase):
                 return self.values[:num_tokens] * 2, None
 
         for wrapper in (SimpleNamespace(stream=torch.cuda.Stream()), None):
-            with self.subTest(explicit_stream=wrapper is not None):
+            with subtests.test(explicit_stream=wrapper is not None):
                 owner = StreamProbe()
                 capture, output = owner._capture_bucket(
                     8, wrapper, NULL_MEMORY_DELTA_OBSERVER.measure("prefill")
                 )
-                self.assertEqual(
-                    owner.warmed_streams, {int(capture.stream.cuda_stream)}
-                )
+                assert (owner.warmed_streams) == ({int(capture.stream.cuda_stream)})
                 torch.testing.assert_close(output.hidden_states, owner.values * 2)
                 owner.values.add_(3)
                 capture.replay()
                 torch.testing.assert_close(output.hidden_states, owner.values * 2)
 
 
-class KdaPrefillFallbackTest(unittest.TestCase):
-    def test_outer_attention_break_does_not_capture_kda_graphs(self):
+class TestKdaPrefillFallbackTest:
+    def test_outer_attention_break_does_not_capture_kda_graphs(self, subtests):
         from unittest.mock import patch
 
         import torch
@@ -258,85 +255,76 @@ class KdaPrefillFallbackTest(unittest.TestCase):
         ):
             scan.return_value = output
             for bs, bucket in ((1, 128), (2, 2048), (4, 4096), (1, 8192)):
-                for checkpoint in (None, object()):
-                    live = SimpleNamespace(prefill_checkpoint_batch=checkpoint)
-                    backend.forward_metadata = live
+                # The live (uncaptured) metadata the fallback must keep serving.
+                live = SimpleNamespace()
+                backend.forward_metadata = live
 
-                    def forward():
-                        results.append(
-                            backend.forward_extend(
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                bs,
-                                ForwardMode.EXTEND,
-                                save_kv_cache=True,
-                                layer_id=0,
-                                seq_len=bucket,
-                            )
+                def forward():
+                    results.append(
+                        backend.forward_extend(
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            bs,
+                            ForwardMode.EXTEND,
+                            save_kv_cache=True,
+                            layer_id=0,
+                            seq_len=bucket,
                         )
+                    )
 
-                    capture.segments = [forward]
-                    for iteration in range(3):
-                        with self.subTest(bs=bs, bucket=bucket, iteration=iteration):
-                            scan.reset_mock()
-                            capture.replay(valid_rows=bucket - 1)
-                            scan.assert_called_once_with(
-                                backend,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                bs,
-                                ForwardMode.EXTEND,
-                                save_kv_cache=True,
-                                layer_id=0,
-                                seq_len=bucket,
-                            )
-                            self.assertIs(results[-1], output)
-                            self.assertIs(backend.forward_metadata, live)
-                            self.assertFalse(backend.prefill_metadata_is_capture_ready)
+                capture.segments = [forward]
+                for iteration in range(3):
+                    with subtests.test(bs=bs, bucket=bucket, iteration=iteration):
+                        scan.reset_mock()
+                        capture.replay(valid_rows=bucket - 1)
+                        scan.assert_called_once_with(
+                            backend,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            bs,
+                            ForwardMode.EXTEND,
+                            save_kv_cache=True,
+                            layer_id=0,
+                            seq_len=bucket,
+                        )
+                        assert (results[-1]) is (output)
+                        assert (backend.forward_metadata) is (live)
+                        assert not (backend.prefill_metadata_is_capture_ready)
             graph.assert_not_called()
-        self.assertEqual(len(results), 24)
+        assert (len(results)) == (12)
 
 
 def _spec(
     group_id: str,
     *,
-    family: str = "history",
+    attn_kind: str = "full_history",
     block_granularity: int = 64,
-    retention: str = "full_history",
     sliding_window_tokens: int | None = None,
 ):
     """A published group spec.
 
     The real dataclass, not a namespace: it derives ``block_granularity`` from
-    the geometry the way production does, refuses ``page_size`` on a
-    checkpoint-state group, and carries ``retention`` -- which the width rule
-    deliberately ignores, and which a namespace double cannot express at all,
-    so ``test_sliding_window_group_still_spans_the_whole_extent`` could not be
+    the geometry the way production does, refuses ``page_size`` on a state
+    group, and carries ``attn_kind`` -- which the width rule deliberately ignores,
+    and which a namespace double cannot express at all, so
+    ``test_sliding_window_group_still_spans_the_whole_extent`` could not be
     written against one.
     """
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
         CacheGroupSpec,
     )
 
-    if family == "state":
-        return CacheGroupSpec(
-            group_id=group_id,
-            retention=retention,
-            family="state",
-            checkpoint_granularity=block_granularity,
-            sliding_window_tokens=sliding_window_tokens,
-            replayable=False,
-        )
+    if attn_kind == "state":
+        return CacheGroupSpec(group_id=group_id, attn_kind=attn_kind, replayable=False)
     return CacheGroupSpec(
         group_id=group_id,
-        retention=retention,
-        family=family,
+        attn_kind=attn_kind,
         rows_per_page=block_granularity,
         entry_stride_tokens=1,
         sliding_window_tokens=sliding_window_tokens,
@@ -346,6 +334,19 @@ def _spec(
 
 def _fake_pool(*, specs=(), **arena_attrs) -> SimpleNamespace:
     """A cache-view double: the arena publishes, the view just names it."""
+    if specs and "runtime_contract" not in arena_attrs:
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+            CacheRuntimeContract,
+        )
+
+        arena_attrs["runtime_contract"] = CacheRuntimeContract(
+            prefix_granularity=64,
+            num_lcm_blocks=64,
+            token_capacity=64 * 64,
+            group_specs=tuple(specs),
+            group_page_counts={spec.group_id: 65 for spec in specs},
+            group_packing={spec.group_id: 1 for spec in specs},
+        )
     return SimpleNamespace(
         arena=SimpleNamespace(cache_group_specs=tuple(specs), **arena_attrs)
     )
@@ -357,16 +358,16 @@ def _backend(**attrs) -> SimpleNamespace:
     return SimpleNamespace(**attrs)
 
 
-class SliceMhaExtendInputsTest(unittest.TestCase):
+class TestSliceMhaExtendInputsTest:
     """MHA kernels see exactly the rows covered by live cu-seqlens."""
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import torch
 
             from tokenspeed.runtime.layers.attention.backends.paged import mha
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.slice_inputs = mha._slice_extend_inputs
 
@@ -378,25 +379,25 @@ class SliceMhaExtendInputsTest(unittest.TestCase):
 
         q, k, v = self.slice_inputs(metadata, q, k, v)
 
-        self.assertEqual((q.shape[0], k.shape[0], v.shape[0]), (3, 3, 3))
+        assert ((q.shape[0], k.shape[0], v.shape[0])) == ((3, 3, 3))
 
     def test_unpadded_inputs_are_unchanged(self):
         metadata = SimpleNamespace(cu_extend_seq_lens_cpu=[0, 4])
         q = self.torch.zeros(4, 2, 8)
-        self.assertIs(self.slice_inputs(metadata, q, None, None)[0], q)
+        assert (self.slice_inputs(metadata, q, None, None)[0]) is (q)
 
 
-class DummyGroupTablesTest(unittest.TestCase):
+class TestDummyGroupTablesTest:
     """Capture-time dummy tables: every group gets a real, writable block;
     none get the reserved null block 0."""
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import torch  # noqa: F401
 
             from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + runtime deps: {exc}")
+            pytest.skip(f"needs torch + runtime deps: {exc}")
         self.PrefillGraph = PrefillGraph
 
     def _bare(self, backend, pool):
@@ -411,6 +412,43 @@ class DummyGroupTablesTest(unittest.TestCase):
         )
         return pg
 
+    @pytest.mark.parametrize("bs", [1, 3, 64])
+    @pytest.mark.parametrize("shards", [1, 2])
+    def test_capture_groups_own_distinct_physical_parents(self, bs, shards):
+        from dataclasses import replace
+
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+            CacheRuntimeContract,
+        )
+
+        specs = (
+            replace(_spec("kv", block_granularity=64), shard_count=shards),
+            _spec("side", block_granularity=4),
+            _spec("state", attn_kind="state"),
+        )
+        packing = {"kv": 2, "side": 3, "state": 1}
+        contract = CacheRuntimeContract(
+            prefix_granularity=64,
+            num_lcm_blocks=128,
+            token_capacity=128 * 64,
+            group_specs=specs,
+            group_page_counts={gid: 128 * count + 1 for gid, count in packing.items()},
+            group_packing=packing,
+        )
+        tables = self._bare(
+            _backend(), _fake_pool(specs=specs, runtime_contract=contract)
+        )._dummy_group_tables(bs)
+        occupied = set()
+        for spec in specs:
+            pages = tables[spec.group_id][:, -1]
+            assert len(set(pages.tolist())) == bs
+            parents = set(
+                ((pages - 1) // contract.virtual_packing[spec.group_id]).tolist()
+            )
+            assert not occupied.intersection(parents), spec.group_id
+            assert max(parents) < contract.num_lcm_blocks
+            occupied.update(parents)
+
     def test_every_group_gets_a_real_block(self):
         backend = _backend()
         pool = _fake_pool(
@@ -418,25 +456,29 @@ class DummyGroupTablesTest(unittest.TestCase):
                 _spec("full_attention", block_granularity=64),
                 _spec("sliding_attention", block_granularity=64),
                 # state: included
-                _spec("linear_attention", family="state", block_granularity=128),
+                _spec("linear_attention", attn_kind="state"),
             )
         )
         tables = self._bare(backend, pool)._dummy_group_tables(1)
-        self.assertEqual(
-            set(tables),
-            {"full_attention", "sliding_attention", "linear_attention"},
+        assert (set(tables)) == (
+            {"full_attention", "sliding_attention", "linear_attention"}
         )
-        # Each group in its own grain, rounded UP: 1000 is a multiple of
-        # neither, so a floor would give 15 and 7 and fail here.
-        self.assertEqual(tables["full_attention"].shape, (1, 16))
-        self.assertEqual(tables["linear_attention"].shape, (1, 8))
-        for group_id, table in tables.items():
-            self.assertGreater(
-                int(table.min()),
-                0,
+        # Each history group in its own grain, rounded UP: 1000 is not a
+        # multiple of 64, so a floor would give 15 and fail here. A state row
+        # is its two slots.
+        assert (tables["full_attention"].shape) == ((1, 16))
+        assert (tables["linear_attention"].shape) == ((1, 2))
+        for group_id in ("full_attention", "sliding_attention"):
+            _pytest_a_1 = int(tables[group_id].min())
+            _pytest_b_2 = 0
+            _pytest_msg_3 = (
                 f"{group_id}: capture writes KV, so no group may get the "
-                "reserved null block",
+                "reserved null block"
             )
+            assert _pytest_a_1 > _pytest_b_2, _pytest_msg_3
+        # The fabricated request starts from the zero state and writes a real block.
+        assert tables["linear_attention"][0, 0] == 0
+        assert tables["linear_attention"][0, 1] > 0
 
     def test_width_spans_the_extent_at_a_realistic_magnitude(self):
         """Width is ceil(physical extent / grain), at a size where a silent
@@ -446,7 +488,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             _fake_pool(specs=(_spec("full_attention", block_granularity=64),)),
         )
         bare.config.physical_context_len = 262144
-        self.assertEqual(bare._dummy_group_tables(1)["full_attention"].shape[1], 4096)
+        assert (bare._dummy_group_tables(1)["full_attention"].shape[1]) == (4096)
 
     def test_sliding_window_group_still_spans_the_whole_extent(self):
         """A sliding group must NOT be narrowed to its window.
@@ -465,7 +507,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                 _spec(
                     "sliding_attention",
                     block_granularity=128,
-                    retention="sliding_window",
+                    attn_kind="sliding_window",
                     sliding_window_tokens=128,
                 ),
             )
@@ -474,16 +516,14 @@ class DummyGroupTablesTest(unittest.TestCase):
         bare.config.physical_context_len = 8192
 
         tables = bare._dummy_group_tables(1)
-        self.assertEqual(tables["full_attention"].shape[1], 64)
-        self.assertEqual(
-            tables["sliding_attention"].shape[1],
-            64,
-            "retention must not narrow a capture row; the window bound is a "
-            "decode-side answer to a different question",
+        assert (tables["full_attention"].shape[1]) == (64)
+        assert (tables["sliding_attention"].shape[1]) == (64), (
+            "a sliding window must not narrow a capture row; the window bound is a "
+            "decode-side answer to a different question"
         )
         # The bound the runtime actually enforces, restated here so the number
         # above is tied to it: ceil-1 of the largest position in the extend.
-        self.assertLess((8192 - 1) // 128, tables["sliding_attention"].shape[1])
+        assert ((8192 - 1) // 128) < (tables["sliding_attention"].shape[1])
 
     def test_width_follows_each_groups_own_geometry(self):
         # DeepSeek-V4 shape: sibling groups with very different grains. Each
@@ -499,10 +539,10 @@ class DummyGroupTablesTest(unittest.TestCase):
         # 1000 % 256 != 0, so a floor would give 3 for the coarse group.
         tables = self._bare(backend, pool)._dummy_group_tables(1)
 
-        self.assertEqual(tables["fine"].shape, (1, 250))  # ceil(1000/4)
-        self.assertEqual(tables["coarse"].shape, (1, 4))  # ceil(1000/256)
-        self.assertGreater(int(tables["fine"].min()), 0)
-        self.assertGreater(int(tables["coarse"].min()), 0)
+        assert (tables["fine"].shape) == ((1, 250))  # ceil(1000/4)
+        assert (tables["coarse"].shape) == ((1, 4))  # ceil(1000/256)
+        assert (int(tables["fine"].min())) > (0)
+        assert (int(tables["coarse"].min())) > (0)
 
     def test_hybrid_wrapper_needs_no_child_descent(self):
         # A hybrid wrapper carries no kernel geometry of its own; the one
@@ -512,12 +552,15 @@ class DummyGroupTablesTest(unittest.TestCase):
         pool = _fake_pool(
             specs=(
                 _spec("full_attention", block_granularity=128),
-                _spec("linear_attention", family="state", block_granularity=128),
+                _spec("linear_attention", attn_kind="state"),
             )
         )
         tables = self._bare(wrapper, pool)._dummy_group_tables(1)
-        self.assertEqual(set(tables), {"full_attention", "linear_attention"})
-        self.assertEqual(tables["full_attention"].shape, (1, 8))  # ceil(1000/128)
+        assert (set(tables)) == ({"full_attention", "linear_attention"})
+        assert (tables["full_attention"].shape) == ((1, 8))  # ceil(1000/128)
+        # A state row is its two slots: a null input checkpoint and the live block.
+        assert tables["linear_attention"][0, 0] == 0
+        assert tables["linear_attention"][0, 1] > 0
 
     def test_each_capture_row_gets_its_own_block(self):
         """A state group needs one working block per request: two rows sharing
@@ -535,32 +578,33 @@ class DummyGroupTablesTest(unittest.TestCase):
         pool = _fake_pool(
             specs=(
                 _spec("full_attention", block_granularity=64),
-                _spec("linear_attention", family="state", block_granularity=128),
+                _spec("linear_attention", attn_kind="state"),
             )
         )
         bare = self._bare(_backend(), pool)
         bare.config.physical_context_len = 1024
         tables = bare._dummy_group_tables(3)
         for group_id, table in tables.items():
-            self.assertEqual(table.shape[0], 3, group_id)
-            self.assertGreater(int(table.min()), 0, group_id)
-            # The state path gathers at (seq_len - 1) // grain -- the LAST live
-            # column, never column 0. Asserting only on column 0 admits a table
-            # that aliases everywhere the runtime actually reads.
+            _pytest_first_4 = table.shape[0]
+            _pytest_second_5 = 3
+            _pytest_msg_6 = group_id
+            assert _pytest_first_4 == _pytest_second_5, _pytest_msg_6
+            # The live block the state path writes is the LAST column; the
+            # history rows hold one block throughout.
             last_column = table[:, -1].tolist()
-            self.assertEqual(
-                len(set(last_column)),
-                3,
-                f"{group_id}: rows alias at the column the state path reads, "
-                f"got {last_column}",
+            _pytest_first_7 = len(set(last_column))
+            _pytest_second_8 = 3
+            _pytest_msg_9 = (
+                f"{group_id}: rows alias at the column the state path writes, "
+                f"got {last_column}"
             )
+            assert _pytest_first_7 == _pytest_second_8, _pytest_msg_9
+        assert (int(tables["full_attention"].min())) > (0)
         # Strongest form: hand the shipped table to the production helper and
         # let its own uniqueness rule be the assertion.
         compute_state_block_indices(
             tables["linear_attention"],
-            128,
             torch.zeros(3, dtype=torch.int32),
-            torch.full((3,), 1024, dtype=torch.int32),
             validate=True,
             group_id="linear_attention",
         )
@@ -599,13 +643,10 @@ class DummyGroupTablesTest(unittest.TestCase):
         stacks.fill(1, 1, dict(tables))
         expanded = stacks.table("full_attention", 1)
 
-        self.assertEqual(
-            expanded.shape[1],
-            max_num_pages,
-            "the expanded row must span the width the kernel derives from "
-            "max_kv_len",
+        assert (expanded.shape[1]) == (max_num_pages), (
+            "the expanded row must span the width the kernel derives from " "max_kv_len"
         )
-        self.assertGreater(int(expanded.min()), 0)
+        assert (int(expanded.min())) > (0)
 
         # Padded max_num_pages: TRTLLM-MLA rounds its width up to a block
         # constraint, so the expansion tail is zero-filled past the live
@@ -629,17 +670,13 @@ class DummyGroupTablesTest(unittest.TestCase):
         stacks.fill(1, 1, dict(tables))
         padded = stacks.table("full_attention", 1)
         live = -(-8192 // 64)
-        self.assertEqual(padded.shape[1], 130)
-        self.assertGreater(
-            int(padded[:, :live].min()),
-            0,
-            "the live prefix must never contain the reserved null block",
-        )
-        self.assertEqual(
-            int(padded[:, live:].abs().sum()),
-            0,
-            "the tail past the live range is the zero-filled null page",
-        )
+        assert (padded.shape[1]) == (130)
+        assert (int(padded[:, :live].min())) > (
+            0
+        ), "the live prefix must never contain the reserved null block"
+        assert (int(padded[:, live:].abs().sum())) == (
+            0
+        ), "the tail past the live range is the zero-filled null page"
 
     def _dummy_batch_probe(
         self,
@@ -661,7 +698,6 @@ class DummyGroupTablesTest(unittest.TestCase):
         order, and every entry inside ``group_page_counts - 1``; a capture
         they refuse kills the boot, so they are the assertion.
         """
-        from unittest import mock
 
         import torch
 
@@ -717,15 +753,14 @@ class DummyGroupTablesTest(unittest.TestCase):
         )
         bs = ctx.bs
         ib = pg.input_buffers
-        self.assertEqual(
-            ib.request_token_history_input_lengths_buf[:bs].tolist(),
-            ib.extend_seq_lens_cpu[:bs].tolist(),
+        assert (ib.request_token_history_input_lengths_buf[:bs].tolist()) == (
+            ib.extend_seq_lens_cpu[:bs].tolist()
         )
-        self.assertEqual(ib.input_start_offsets_buf[0].item(), 0)
-        self.assertEqual(ib.input_start_offsets_buf[bs].item(), num_tokens)
-        self.assertTrue(ib.active_request_mask_buf[:bs].all().item())
-        self.assertIs(ctx.attn_backend, pg.attn_backend)
-        self.assertIs(ctx.token_to_kv_pool, pg.token_to_kv_pool)
+        assert (ib.input_start_offsets_buf[0].item()) == (0)
+        assert (ib.input_start_offsets_buf[bs].item()) == (num_tokens)
+        assert ib.active_request_mask_buf[:bs].all().item()
+        assert (ctx.attn_backend) is (pg.attn_backend)
+        assert (ctx.token_to_kv_pool) is (pg.token_to_kv_pool)
         seen["ctx"] = ctx
         return seen
 
@@ -743,20 +778,22 @@ class DummyGroupTablesTest(unittest.TestCase):
         )
         tables = seen["block_tables"]
         table = tables["full_attention"]
-        self.assertEqual(table.shape[0], 3, "one row per fabricated request")
+        assert (table.shape[0]) == (3), "one row per fabricated request"
         # physical (1024), not the user-facing context_len (960): 16 vs 15.
-        self.assertEqual(table.shape[1], 16)
-        self.assertGreater(int(table.min()), 0)
+        assert (table.shape[1]) == (16)
+        assert (int(table.min())) > (0)
         # The dummy tables travel bridge-packed (one storage, contract order);
         # the cache-metadata object itself no longer rides to backends.
-        self.assertNotIn("cache_metadata", seen)
+        assert ("cache_metadata") not in (seen)
         # The tables are built on the host; the packer's output is what the
         # backend gets, and it must land on the configured device. Nothing
         # else re-places them, so this assertion is the whole device contract.
-        self.assertEqual(table.device.type, "cpu")
-        self.assertEqual(seen["max_prefix"], 0, "capture fabricates no prefix")
+        assert (table.device.type) == ("cpu")
+        assert (seen["max_prefix"]) == (0), "capture fabricates no prefix"
 
-    def test_explicit_request_count_uses_balanced_nonempty_placeholder_rows(self):
+    def test_explicit_request_count_uses_balanced_nonempty_placeholder_rows(
+        self, subtests
+    ):
         spec = _spec("full_attention", block_granularity=64)
         seen = self._dummy_batch_probe(
             num_tokens=1737,
@@ -765,11 +802,11 @@ class DummyGroupTablesTest(unittest.TestCase):
             specs=(spec,),
             capture_bs=2,
         )
-        self.assertEqual(seen["extend_seq_lens_cpu"].tolist(), [869, 868])
-        self.assertEqual(seen["block_tables"]["full_attention"].shape[0], 2)
+        assert (seen["extend_seq_lens_cpu"].tolist()) == ([869, 868])
+        assert (seen["block_tables"]["full_attention"].shape[0]) == (2)
         for tokens, bs in [(1, 2), (1737, 0), (1737, 17), (4096, 1)]:
-            with self.subTest(tokens=tokens, bs=bs):
-                with self.assertRaisesRegex(ValueError, "token/context capacity"):
+            with subtests.test(tokens=tokens, bs=bs):
+                with pytest.raises((ValueError), match=("token/context capacity")):
                     self._dummy_batch_probe(
                         num_tokens=tokens,
                         context_len=2048,
@@ -795,19 +832,18 @@ class DummyGroupTablesTest(unittest.TestCase):
             query_shard=(4, 3),
         )
         plan = seen["ctx"].query_shard
-        self.assertEqual(
-            plan,
+        assert (plan) == (
             QueryShardPlan.from_forward(
                 total_tokens=1737, input_lengths=[869, 868], size=4, rank=3
-            ),
+            )
         )
-        self.assertIs(seen["query_shard"], plan)
-        self.assertEqual(sum(plan.row_counts), 1737)
-        self.assertEqual(plan.local_rows, plan.row_counts[3])
+        assert (seen["query_shard"]) is (plan)
+        assert (sum(plan.row_counts)) == (1737)
+        assert (plan.local_rows) == (plan.row_counts[3])
         # The whole span still fills the buffers and the metadata; the model
         # takes its slice (ModelExecutor.autotune).
-        self.assertEqual(seen["num_tokens"], 1737)
-        self.assertEqual(seen["extend_seq_lens_cpu"].tolist(), [869, 868])
+        assert (seen["num_tokens"]) == (1737)
+        assert (seen["extend_seq_lens_cpu"].tolist()) == ([869, 868])
         unsharded = self._dummy_batch_probe(
             num_tokens=1737,
             context_len=2048,
@@ -815,8 +851,8 @@ class DummyGroupTablesTest(unittest.TestCase):
             specs=(spec,),
             capture_bs=2,
         )
-        self.assertIsNone(unsharded["ctx"].query_shard)
-        self.assertIsNone(unsharded["query_shard"])
+        assert (unsharded["ctx"].query_shard) is None
+        assert (unsharded["query_shard"]) is None
 
     def test_real_active_page_backend_gets_positions_alongside_its_tables(self):
         """A backend that validates live-page geometry (V4) is told how many
@@ -831,9 +867,9 @@ class DummyGroupTablesTest(unittest.TestCase):
             specs=(spec,),
             capture_bs=None,
         )
-        self.assertEqual(seen["num_tokens"], 128)
-        self.assertEqual(seen["positions"].shape[0], 128)
-        self.assertIn("full_attention", seen["block_tables"])
+        assert (seen["num_tokens"]) == (128)
+        assert (seen["positions"].shape[0]) == (128)
+        assert ("full_attention") in (seen["block_tables"])
 
     def test_block_ids_are_checked_against_the_groups_real_block_count(self):
         """The probe's default arena has ~20x slack, so an id error would not
@@ -849,7 +885,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             capture_bs=None,
             arena_blocks=2,
         )
-        with self.assertRaises(ValueError) as caught:
+        with pytest.raises((ValueError)) as caught:
             self._dummy_batch_probe(
                 num_tokens=2880,
                 context_len=960,
@@ -858,7 +894,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                 capture_bs=None,
                 arena_blocks=2,
             )
-        self.assertIn("page ID outside", str(caught.exception))
+        assert ("page ID outside") in (str(caught.value))
 
     def test_ceiling_is_exact_at_the_residue_that_distinguishes_it(self):
         """Pin the rounding at the only residue where it shows.
@@ -873,9 +909,9 @@ class DummyGroupTablesTest(unittest.TestCase):
         bare.config.physical_context_len = 4097
 
         cols = bare._dummy_group_tables(1)["full_attention"].shape[1]
-        self.assertEqual(cols, 65)  # ceil(4097/64); extent-1 would give 64
+        assert (cols) == (65)  # ceil(4097/64); extent-1 would give 64
         # Restate the bound the runtime enforces so the constant is tied to it.
-        self.assertGreater(cols, (4097 - 1) // 64)
+        assert (cols) > ((4097 - 1) // 64)
 
     def test_degenerate_extent_still_yields_one_column(self):
         """A non-positive extent is not reachable through ServerArgs, but the
@@ -885,14 +921,15 @@ class DummyGroupTablesTest(unittest.TestCase):
         bare = self._bare(_backend(), _fake_pool(specs=(spec,)))
         for extent in (0, -8):
             bare.config.physical_context_len = extent
-            self.assertEqual(
-                bare._dummy_group_tables(1)["full_attention"].shape[1], 1, extent
-            )
+            _pytest_first_10 = bare._dummy_group_tables(1)["full_attention"].shape[1]
+            _pytest_second_11 = 1
+            _pytest_msg_12 = extent
+            assert _pytest_first_10 == _pytest_second_11, _pytest_msg_12
 
     def test_pool_without_groups_is_empty(self):
         backend = _backend()
         pool = _fake_pool(specs=())
-        self.assertEqual(self._bare(backend, pool)._dummy_group_tables(1), {})
+        assert (self._bare(backend, pool)._dummy_group_tables(1)) == ({})
 
     def test_mla_target_gets_tables_from_the_pool_alone(self):
         """No backend gate: the pool's published specs are the only key.
@@ -902,14 +939,12 @@ class DummyGroupTablesTest(unittest.TestCase):
         backend = _backend()
         pool = _fake_pool(specs=(_spec("full_attention", block_granularity=128),))
         tables = self._bare(backend, pool)._dummy_group_tables(2)
-        self.assertEqual(set(tables), {"full_attention"})
+        assert (set(tables)) == ({"full_attention"})
         # Scheduler-table columns span block_granularity: ceil(1000/128).
-        self.assertEqual(tables["full_attention"].shape, (2, 8))
-        self.assertGreater(
-            int(tables["full_attention"].min()),
-            0,
+        assert (tables["full_attention"].shape) == ((2, 8))
+        assert (int(tables["full_attention"].min())) > (0), (
             "MLA rejects the null block in live metadata, so capture needs a "
-            "real writable block",
+            "real writable block"
         )
 
     def test_runtime_contract_pool_is_eligible_for_capture(self):
@@ -943,7 +978,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                 config=config,
             )
 
-        self.assertFalse(graph.disable)
+        assert not (graph.disable)
         capture.assert_not_called()
 
         model_runner.model_config.requires_request_token_history = True
@@ -961,10 +996,10 @@ class DummyGroupTablesTest(unittest.TestCase):
                 input_buffers=object(),
                 config=config,
             )
-        self.assertTrue(graph.disable)
+        assert graph.disable
 
 
-class CaptureFailureIsLoudTest(unittest.TestCase):
+class TestCaptureFailureIsLoudTest:
     """A capture the dummy-batch machinery cannot serve must stop the boot.
 
     Degrading here is what let a whole model family run eager prefill with a
@@ -972,13 +1007,13 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
     that are deliberately eager.
     """
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import torch
 
             from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + runtime deps: {exc}")
+            pytest.skip(f"needs torch + runtime deps: {exc}")
         self.torch = torch
         self.PrefillGraph = PrefillGraph
 
@@ -1018,9 +1053,9 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
         cannot be left behind -- the boot dies with it."""
         cause = RuntimeError("backend refused the dummy batch")
         pg = self._bare(raises=cause)
-        with self.assertRaises(RuntimeError) as caught:
+        with pytest.raises((RuntimeError)) as caught:
             pg.capture(None, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
-        self.assertIs(caught.exception, cause)
+        assert (caught.value) is (cause)
 
     def test_successful_capture_does_not_raise(self):
         self._bare().capture(None, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
@@ -1029,23 +1064,23 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
         """OOM keeps its own type and message. The capture pool not fitting is
         an operator-visible sizing failure, not something to recover from."""
         pg = self._bare(raises=self.torch.cuda.OutOfMemoryError("no room"))
-        with self.assertRaises(self.torch.cuda.OutOfMemoryError):
+        with pytest.raises((self.torch.cuda.OutOfMemoryError)):
             pg.capture(None, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
 
 
-class NarrowingPrefillGraphTest(unittest.TestCase):
+class TestNarrowingPrefillGraphTest:
     """A NarrowingPrefillModel is captured as encoder graphs per token bucket
     plus decoder graphs per decoder-row bucket around its eager narrowing
     stage; replay sequences the three and falls back to an eager decoder
     stage above the largest decoder bucket."""
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import torch
 
             from tokenspeed.runtime.execution import prefill_graph
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + runtime deps: {exc}")
+            pytest.skip(f"needs torch + runtime deps: {exc}")
         self.torch = torch
         self.mod = prefill_graph
 
@@ -1053,12 +1088,12 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
         buckets = self.mod.get_decoder_row_buckets
         ladder = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
         # 128 rows per request x 32 requests caps the decoder at 4096 rows.
-        self.assertEqual(buckets(ladder, 128, 32), ladder[:-1])
+        assert (buckets(ladder, 128, 32)) == (ladder[:-1])
         # A cap between rungs becomes the top rung itself.
-        self.assertEqual(buckets(ladder, 128, 3), [16, 32, 64, 128, 256, 384])
+        assert (buckets(ladder, 128, 3)) == ([16, 32, 64, 128, 256, 384])
         # The token ladder bounds the cap: narrowing never adds rows.
-        self.assertEqual(buckets([16, 48], 128, 32), [16, 48])
-        self.assertEqual(buckets([], 128, 32), [])
+        assert (buckets([16, 48], 128, 32)) == ([16, 48])
+        assert (buckets([], 128, 32)) == ([])
 
     def _model(self, rows, calls):
         torch = self.torch
@@ -1100,9 +1135,9 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
         from unittest import mock
 
         model, _ = self._model(128, [])
-        self.assertIsInstance(model, self.mod.NarrowingPrefillModel)
-        self.assertNotIsInstance(
-            SimpleNamespace(embed_tokens=object()), self.mod.NarrowingPrefillModel
+        assert isinstance((model), (self.mod.NarrowingPrefillModel))
+        assert not isinstance(
+            (SimpleNamespace(embed_tokens=object())), (self.mod.NarrowingPrefillModel)
         )
         for inner, expected_buckets in (
             (model, [64, 256, 384]),
@@ -1134,9 +1169,9 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
                     input_buffers=object(),
                     config=config,
                 )
-            self.assertFalse(graph.disable)
-            self.assertIs(graph._narrowing, inner if expected_buckets else None)
-            self.assertEqual(graph.decoder_buckets, expected_buckets)
+            assert not (graph.disable)
+            assert (graph._narrowing) is (inner if expected_buckets else None)
+            assert (graph.decoder_buckets) == (expected_buckets)
 
     def test_narrowing_model_stays_eager_under_attention_dp(self):
         """The narrowed row count is rank-local, so decoder buckets (and the
@@ -1175,8 +1210,8 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
                     input_buffers=object(),
                     config=config,
                 )
-            self.assertEqual(graph.disable, expected_disable)
-            self.assertEqual(graph.decoder_buckets, [])
+            assert (graph.disable) == (expected_disable)
+            assert (graph.decoder_buckets) == ([])
 
     def _bare(self, model, State, decoder_buckets, calls):
         pg = self.mod.PrefillGraph.__new__(self.mod.PrefillGraph)
@@ -1232,8 +1267,7 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
         pg = self._bare(model, State, [64, 192], calls)
         ctx = self._ctx(200)
         hidden, aux = pg._replay_narrowed(256, ctx, 200)
-        self.assertEqual(
-            calls,
+        assert (calls) == (
             [
                 # The encoder replays over the padded bucket with the real
                 # token count as its valid rows; the narrowing stage runs
@@ -1246,71 +1280,70 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
                 ("land", 100, 192),
                 ("decoder graph", 192, 100),
                 ("finish", 100, 200),
-            ],
+            ]
         )
-        self.assertEqual(hidden.shape, (100, 2))
-        self.assertIsNone(aux)
-        self.assertEqual(ctx.input_num_tokens, 200, "the pin is restored")
-        self.assertTrue(pg._has_bucket(256) and not pg._has_bucket(64))
+        assert (hidden.shape) == ((100, 2))
+        assert (aux) is None
+        assert (ctx.input_num_tokens) == (200), "the pin is restored"
+        assert pg._has_bucket(256) and not pg._has_bucket(64)
 
     def test_rows_above_the_decoder_ladder_run_the_decoder_eager(self):
         calls = []
         model, State = self._model(300, calls)
         pg = self._bare(model, State, [64, 192], calls)
-        self.assertIsNone(pg._decoder_bucket(300))
-        self.assertEqual(pg._decoder_bucket(64), 64)
-        self.assertEqual(pg._decoder_bucket(65), 192)
+        assert (pg._decoder_bucket(300)) is None
+        assert (pg._decoder_bucket(64)) == (64)
+        assert (pg._decoder_bucket(65)) == (192)
         hidden, _ = pg._replay_narrowed(256, self._ctx(256), 256)
-        self.assertEqual(
-            calls,
+        assert (calls) == (
             [
                 ("encoder", 256),
                 ("narrow", 256, 256),
                 ("decoder eager", 300, 256),
                 ("finish", 300, 256),
-            ],
+            ]
         )
-        self.assertEqual(hidden.shape, (300, 2))
+        assert (hidden.shape) == ((300, 2))
 
     def test_narrowing_disagreeing_with_the_metadata_is_fatal(self):
         calls = []
         model, State = self._model(100, calls)
         model.decoder_rows = lambda ctx: 99
         pg = self._bare(model, State, [192], calls)
-        with self.assertRaisesRegex(RuntimeError, "narrowing yielded 100 rows"):
+        with pytest.raises((RuntimeError), match=("narrowing yielded 100 rows")):
             pg._replay_narrowed(256, self._ctx(200), 200)
 
 
-class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
+class TestTrtllmPrefillGraphSeamsTest:
     """trtllm leaves reach the prefill graph through the cache-group router."""
 
-    def setUp(self):
+    def setup_method(self):
         try:
             from tokenspeed.runtime.layers.attention.backends.paged import (  # noqa: F401
                 trtllm,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs torch + tokenspeed_kernel: {exc}")
 
-    def test_router_declares_history_contract_family(self):
-        # The family claim moved off the leaves: the runner-facing node in
+    def test_router_declares_the_history_kinds(self):
+        # The kind claim moved off the leaves: the runner-facing node in
         # front of every trtllm leaf is the CacheGroupRouter, whose base
-        # declaration is the history family.
+        # declaration is the two history kinds.
         from tokenspeed.runtime.layers.attention.backends.paged.router import (
             CacheGroupRouter,
         )
 
-        self.assertEqual(
-            CacheGroupRouter.cache_consumer_families, frozenset({"history"})
+        assert (CacheGroupRouter.cache_consumer_attn_kinds) == (
+            frozenset({"full_history", "sliding_window"})
         )
 
 
-class PrefillRoleGraphsTest(unittest.TestCase):
+class TestPrefillRoleGraphsTest:
     """The PD prefill role never runs a decode step, so the decode graph has
     nothing to capture there; the prefill graph keeps its ordinary gating
     instead of the role forcing eager execution."""
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import torch  # noqa: F401
 
@@ -1319,7 +1352,7 @@ class PrefillRoleGraphsTest(unittest.TestCase):
                 ModelExecutorConfig,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + runtime deps: {exc}")
+            pytest.skip(f"needs torch + runtime deps: {exc}")
         self.forward_step = forward_step
         self.prefill_graph = prefill_graph
         self.ModelExecutorConfig = ModelExecutorConfig
@@ -1351,6 +1384,7 @@ class PrefillRoleGraphsTest(unittest.TestCase):
             enable_speculative_sampling=False,
             query_shard_size=1,
             query_shard_rank=0,
+            enable_memory_saver=False,
             prefill_graph_max_tokens=256,
         )
 
@@ -1386,23 +1420,57 @@ class PrefillRoleGraphsTest(unittest.TestCase):
                 config=config,
             )
 
+    def test_placeholder_tables_give_a_state_group_its_two_slots(self):
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            STATE_TABLE_SLOTS,
+            CacheGroupSpec,
+        )
+
+        class Backend:
+            def init_cuda_graph_state(self, *args, **kwargs):
+                pass
+
+        specs = (
+            CacheGroupSpec(
+                group_id="full",
+                attn_kind="full_history",
+                rows_per_page=128,
+                entry_stride_tokens=1,
+                sliding_window_tokens=None,
+                replayable=False,
+            ),
+            CacheGroupSpec(group_id="state", attn_kind="state", replayable=False),
+        )
+        runner = self.forward_step.ForwardStepRunner(
+            forward_func=lambda *args, **kwargs: None,
+            attn_backend=Backend(),
+            token_to_kv_pool=_fake_pool(specs=specs, cache_group_page_counts={}),
+            input_buffers=object(),
+            config=self._config(prefill_only=False),
+        )
+        tables = runner._placeholder_tables
+        assert (set(tables)) == ({"full", "state"})
+        assert (tables["state"].shape[1]) == (STATE_TABLE_SLOTS)
+        assert (tables["full"].shape[1]) > (STATE_TABLE_SLOTS)
+        assert all(table.shape[0] == runner.max_decode_bs for table in tables.values())
+
     def test_prefill_role_skips_the_decode_graph_and_keeps_the_prefill_graph(
         self,
     ):
         config = self._config(prefill_only=True)
-        self.assertTrue(self._decode_runner(config).disable)
-        self.assertFalse(self._prefill_owner(config).disable)
+        assert self._decode_runner(config).disable
+        assert not (self._prefill_owner(config).disable)
 
     def test_a_serving_node_keeps_both_graphs(self):
         config = self._config(prefill_only=False)
-        self.assertFalse(self._decode_runner(config).disable)
-        self.assertFalse(self._prefill_owner(config).disable)
+        assert not (self._decode_runner(config).disable)
+        assert not (self._prefill_owner(config).disable)
 
     def test_explicit_eager_still_disables_the_prefill_graph_on_the_role(self):
         config = self._config(prefill_only=True, enforce_eager=True)
-        self.assertTrue(self._decode_runner(config).disable)
-        self.assertTrue(self._prefill_owner(config).disable)
+        assert self._decode_runner(config).disable
+        assert self._prefill_owner(config).disable
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

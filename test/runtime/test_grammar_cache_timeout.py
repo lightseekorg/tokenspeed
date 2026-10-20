@@ -47,7 +47,8 @@ import os
 import sys
 import threading
 import time
-import unittest
+
+import pytest
 
 # CI registration (AST-parsed, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -64,6 +65,10 @@ from tokenspeed.runtime.grammar.base_grammar_backend import (  # noqa: E402
 
 class _FakeGrammar(BaseGrammarObject):
     """Trivial successful compile result; copy() returns self for cheap equality."""
+
+    @property
+    def memory_size_bytes(self) -> int:
+        return 0
 
     def copy(self):
         return self
@@ -86,7 +91,7 @@ class _GatedBackend(BaseGrammarBackend):
         return _FakeGrammar()
 
 
-class GrammarBackendCacheTests(unittest.TestCase):
+class TestGrammarBackendCacheTests:
     KEY = ("json", "schema-A")
 
     # --- attribute interface (no isinstance) ---
@@ -96,10 +101,10 @@ class GrammarBackendCacheTests(unittest.TestCase):
         callers don't need isinstance to branch."""
         ok = _FakeGrammar()
         bad = InvalidGrammarObject("nope")
-        self.assertFalse(ok.is_invalid)
-        self.assertTrue(bad.is_invalid)
-        self.assertFalse(ok.expired)
-        self.assertFalse(bad.expired)  # no expires_at -> permanent
+        assert not (ok.is_invalid)
+        assert bad.is_invalid
+        assert not (ok.expired)
+        assert not (bad.expired)  # no expires_at -> permanent
 
     # --- permanent failures ---
 
@@ -107,13 +112,13 @@ class GrammarBackendCacheTests(unittest.TestCase):
         b = _GatedBackend()
         b.cache_invalid(self.KEY, "bad regex")
         v, hit = b.get_cached_or_future_value(self.KEY)
-        self.assertTrue(hit)
-        self.assertTrue(v.is_invalid)
-        self.assertEqual(v.error_message, "bad regex")
-        self.assertIsNone(v.expires_at)
+        assert hit
+        assert v.is_invalid
+        assert (v.error_message) == ("bad regex")
+        assert (v.expires_at) is None
         # Even after a long sleep it stays invalid.
         time.sleep(0.05)
-        self.assertFalse(v.expired)
+        assert not (v.expired)
 
     # --- transient timeouts (TTL) ---
 
@@ -125,27 +130,25 @@ class GrammarBackendCacheTests(unittest.TestCase):
         b = _GatedBackend()
         # Start a compile and let it block.
         fut = b.executor.submit(b.init_value, self.KEY)
-        self.assertTrue(b.compile_started.wait(timeout=1.0))
+        assert b.compile_started.wait(timeout=1.0)
 
         # Mid-compile: cache a transient timeout marker.
         b.record_compile_timeout(self.KEY, "timed out", ttl_secs=2.0, max_retries=2)
 
         v, hit = b.get_cached_or_future_value(self.KEY)
-        self.assertTrue(hit)
-        self.assertTrue(v.is_invalid)
-        self.assertFalse(v.expired)
-        self.assertEqual(v.error_message, "timed out")
+        assert hit
+        assert v.is_invalid
+        assert not (v.expired)
+        assert (v.error_message) == ("timed out")
 
         # Now let the slow compile finish — it must NOT clobber the marker.
         b.compile_can_finish.set()
         fut.result(timeout=1.0)
 
         v, hit = b.get_cached_or_future_value(self.KEY)
-        self.assertTrue(hit, "expected cache hit, got miss")
-        self.assertTrue(
-            v.is_invalid, "late finish wrongly un-invalidated the cache marker"
-        )
-        self.assertEqual(v.error_message, "timed out")
+        assert hit, "expected cache hit, got miss"
+        assert v.is_invalid, "late finish wrongly un-invalidated the cache marker"
+        assert (v.error_message) == ("timed out")
 
     def test_marker_expires_and_recovers(self):
         """After the TTL, a fresh compile is dispatched and the success path
@@ -156,19 +159,19 @@ class GrammarBackendCacheTests(unittest.TestCase):
         time.sleep(0.15)
 
         v, hit = b.get_cached_or_future_value(self.KEY)
-        self.assertFalse(hit, "expired marker should evict on lookup")
+        assert not (hit), "expired marker should evict on lookup"
         # The returned value is a Future from the executor; the worker is
         # already running and blocked on compile_can_finish.
-        self.assertTrue(b.compile_started.wait(timeout=1.0))
+        assert b.compile_started.wait(timeout=1.0)
         b.compile_can_finish.set()
         result = v.result(timeout=1.0)
-        self.assertFalse(result.is_invalid)
-        self.assertEqual(b.compile_count, 1, "exactly one fresh compile expected")
+        assert not (result.is_invalid)
+        assert (b.compile_count) == (1), "exactly one fresh compile expected"
 
         # Subsequent lookups see the real grammar.
         v, hit = b.get_cached_or_future_value(self.KEY)
-        self.assertTrue(hit)
-        self.assertFalse(v.is_invalid)
+        assert hit
+        assert not (v.is_invalid)
 
     def test_repeated_timeouts_escalate_to_permanent(self):
         """After max_retries+1 consecutive timeouts the marker becomes
@@ -180,18 +183,18 @@ class GrammarBackendCacheTests(unittest.TestCase):
                 self.KEY, "timed out", ttl_secs=0.01, max_retries=2
             )
             v, hit = b.get_cached_or_future_value(self.KEY)
-            self.assertTrue(hit)
-            self.assertTrue(v.is_invalid)
-            self.assertIsNotNone(v.expires_at, "first 2 timeouts must have a TTL")
+            assert hit
+            assert v.is_invalid
+            assert (v.expires_at) is not None, "first 2 timeouts must have a TTL"
             time.sleep(0.02)  # let TTL expire so the next call sees a miss path
 
         # 3rd timeout escalates to permanent.
         b.record_compile_timeout(self.KEY, "timed out", ttl_secs=0.01, max_retries=2)
         v, hit = b.get_cached_or_future_value(self.KEY)
-        self.assertTrue(hit)
-        self.assertTrue(v.is_invalid)
-        self.assertIsNone(v.expires_at, "post-escalation marker must be permanent")
-        self.assertIn("gave up after", v.error_message)
+        assert hit
+        assert v.is_invalid
+        assert (v.expires_at) is None, "post-escalation marker must be permanent"
+        assert ("gave up after") in (v.error_message)
 
     def test_successful_compile_clearstimeout_history(self):
         """A successful compile after some transient timeouts resets the
@@ -201,28 +204,26 @@ class GrammarBackendCacheTests(unittest.TestCase):
         b.record_compile_timeout(self.KEY, "t1", ttl_secs=0.01, max_retries=2)
         time.sleep(0.02)
         b.record_compile_timeout(self.KEY, "t2", ttl_secs=0.01, max_retries=2)
-        self.assertEqual(b.timeout_history[self.KEY].count, 2)
+        assert (b.timeout_history[self.KEY].count) == (2)
         time.sleep(0.02)
 
         # Trigger a fresh compile that succeeds.
         v, hit = b.get_cached_or_future_value(self.KEY)
-        self.assertFalse(hit)
+        assert not (hit)
         b.compile_can_finish.set()
         v.result(timeout=1.0)
 
         # Successful compile must have cleared the per-key history; a
         # subsequent timeout is also a no-op here (cache holds a valid
         # grammar, so record_compile_timeout drops the spurious mark).
-        self.assertNotIn(self.KEY, b.timeout_history)
+        assert (self.KEY) not in (b.timeout_history)
         b.record_compile_timeout(self.KEY, "t3", ttl_secs=0.01, max_retries=2)
-        self.assertNotIn(
-            self.KEY,
-            b.timeout_history,
-            "spurious timeout against a valid cached grammar must not increment",
-        )
+        assert (self.KEY) not in (
+            b.timeout_history
+        ), "spurious timeout against a valid cached grammar must not increment"
         v, hit = b.get_cached_or_future_value(self.KEY)
-        self.assertTrue(hit)
-        self.assertFalse(v.is_invalid, "valid grammar must not be clobbered by timeout")
+        assert hit
+        assert not (v.is_invalid), "valid grammar must not be clobbered by timeout"
 
     # --- compile_started_at excludes executor queueing ---
 
@@ -247,31 +248,27 @@ class GrammarBackendCacheTests(unittest.TestCase):
         # While queued, no entry exists yet -> compile_started_at is None.
         for _ in range(5):
             if b.compile_started.is_set():
-                self.fail("worker must not have started while queue is blocked")
-            self.assertIsNone(b.compile_started_at(self.KEY))
+                assert False, "worker must not have started while queue is blocked"
+            assert (b.compile_started_at(self.KEY)) is None
             time.sleep(0.02)
 
         queue_delay = time.monotonic() - submit_ts
-        self.assertGreater(
-            queue_delay,
-            0.05,
-            "test setup failed: expected measurable queue delay before unblocking",
-        )
+        assert (queue_delay) > (
+            0.05
+        ), "test setup failed: expected measurable queue delay before unblocking"
 
         # Release the blocker so the worker can pick up the real compile.
         block_release.set()
-        self.assertTrue(b.compile_started.wait(timeout=1.0))
+        assert b.compile_started.wait(timeout=1.0)
 
         started_at = b.compile_started_at(self.KEY)
-        self.assertIsNotNone(started_at)
+        assert (started_at) is not None
         # started_at must reflect the worker start, well after submit_ts +
         # queue_delay. Slack the bound a bit but require it to be later than
         # the submit instant by at least the observed queue delay.
-        self.assertGreaterEqual(
-            started_at,
-            submit_ts + queue_delay - 0.02,
-            "started_at should be past submit_ts + queue delay",
-        )
+        assert (started_at) >= (
+            submit_ts + queue_delay - 0.02
+        ), "started_at should be past submit_ts + queue delay"
 
         # After the compile finishes, started_at must REMAIN set — callers
         # use it to compute compile-only elapsed time, and a worker that
@@ -280,10 +277,10 @@ class GrammarBackendCacheTests(unittest.TestCase):
         # (that was a real bug — see GrammarManager's done()-recheck).
         b.compile_can_finish.set()
         future.result(timeout=1.0)
-        self.assertEqual(b.compile_started_at(self.KEY), started_at)
+        assert (b.compile_started_at(self.KEY)) == (started_at)
 
 
-class GrammarManagerTimeoutTests(unittest.TestCase):
+class TestGrammarManagerTimeoutTests:
     """End-to-end timeout behavior in GrammarManager.get_ready_grammar_requests:
 
     queued-but-not-yet-started compiles must still time out (otherwise a
@@ -341,28 +338,28 @@ class GrammarManagerTimeoutTests(unittest.TestCase):
         try:
             state = self._fake_state()
             value, hit = backend.get_cached_or_future_value(self.KEY)
-            self.assertFalse(hit)
+            assert not (hit)
             state.grammar = value  # the Future
             state.grammar_key = self.KEY
             mgr.add_to_queue(spec=object(), state=state, bootstrap_info=object())
 
             # compile_started_at must be None (worker is queued, not running).
-            self.assertIsNone(backend.compile_started_at(self.KEY))
+            assert (backend.compile_started_at(self.KEY)) is None
 
             # First poll — within the budget, no failure.
             promoted = mgr.get_ready_grammar_requests()
-            self.assertEqual(promoted, [])
+            assert (promoted) == ([])
 
             # Wait past the compile timeout; worker still hasn't started.
             time.sleep(0.07)
-            self.assertIsNone(backend.compile_started_at(self.KEY))
+            assert (backend.compile_started_at(self.KEY)) is None
 
             promoted = mgr.get_ready_grammar_requests()
-            self.assertEqual(len(promoted), 1)
+            assert (len(promoted)) == (1)
             _, promoted_state, _ = promoted[0]
-            self.assertIs(promoted_state, state)
-            self.assertTrue(state.finished)
-            self.assertIn("timed out", state.to_abort_message)
+            assert (promoted_state) is (state)
+            assert state.finished
+            assert ("timed out") in (state.to_abort_message)
         finally:
             block_release.set()
 
@@ -374,7 +371,7 @@ class GrammarManagerTimeoutTests(unittest.TestCase):
         try:
             state = self._fake_state()
             value, hit = backend.get_cached_or_future_value(self.KEY)
-            self.assertFalse(hit)
+            assert not (hit)
             state.grammar = value
             state.grammar_key = self.KEY
             mgr.add_to_queue(spec=object(), state=state, bootstrap_info=object())
@@ -382,7 +379,7 @@ class GrammarManagerTimeoutTests(unittest.TestCase):
             # Let the worker start compiling, then sleep past the timeout
             # budget WITHOUT completing the compile yet.
             block_release.set()
-            self.assertTrue(backend.compile_started.wait(timeout=1.0))
+            assert backend.compile_started.wait(timeout=1.0)
             time.sleep(0.07)  # past compile_timeout_secs from started_at
 
             # NOW finish the compile, *before* the next poll. From the poll's
@@ -392,14 +389,13 @@ class GrammarManagerTimeoutTests(unittest.TestCase):
             value.result(timeout=1.0)
 
             promoted = mgr.get_ready_grammar_requests()
-            self.assertEqual(len(promoted), 1)
+            assert (len(promoted)) == (1)
             _, promoted_state, _ = promoted[0]
-            self.assertIs(promoted_state, state)
-            self.assertFalse(
-                state.finished,
-                f"expected admission, got abort: {state.to_abort_message!r}",
-            )
-            self.assertFalse(state.grammar.is_invalid)
+            assert (promoted_state) is (state)
+            _pytest_expr_1 = state.finished
+            _pytest_msg_2 = f"expected admission, got abort: {state.to_abort_message!r}"
+            assert not _pytest_expr_1, _pytest_msg_2
+            assert not (state.grammar.is_invalid)
         finally:
             block_release.set()
 
@@ -411,7 +407,7 @@ class GrammarManagerTimeoutTests(unittest.TestCase):
         try:
             state = self._fake_state()
             value, hit = backend.get_cached_or_future_value(self.KEY)
-            self.assertFalse(hit)
+            assert not (hit)
             state.grammar = value
             state.grammar_key = self.KEY
             mgr.add_to_queue(spec=object(), state=state, bootstrap_info=object())
@@ -420,24 +416,24 @@ class GrammarManagerTimeoutTests(unittest.TestCase):
             # so the worker starts running our compile.
             time.sleep(0.07)
             block_release.set()
-            self.assertTrue(backend.compile_started.wait(timeout=1.0))
+            assert backend.compile_started.wait(timeout=1.0)
 
             # We're past the queue budget, but compile just started → must
             # NOT be marked failed yet.
             promoted = mgr.get_ready_grammar_requests()
-            self.assertEqual(promoted, [], "compile budget should reset on start")
-            self.assertFalse(state.finished)
+            assert (promoted) == ([]), "compile budget should reset on start"
+            assert not (state.finished)
 
             # Within the fresh compile budget, complete the compile.
             backend.compile_can_finish.set()
             value.result(timeout=1.0)
             promoted = mgr.get_ready_grammar_requests()
-            self.assertEqual(len(promoted), 1)
-            self.assertFalse(state.finished, "successful compile should not abort")
-            self.assertFalse(state.grammar.is_invalid)
+            assert (len(promoted)) == (1)
+            assert not (state.finished), "successful compile should not abort"
+            assert not (state.grammar.is_invalid)
         finally:
             block_release.set()
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

@@ -63,6 +63,17 @@ public:
     // required because one LCM parent can still contain live sibling children.
     // The runtime clears these exact byte ranges before transfers/forward.
     std::map<std::string, std::vector<std::int32_t>> pages_to_zero;
+    // Device -> Device whole-block copies, per cache group id, as (source,
+    // destination) scheduler virtual block ids: a hitter's private copy of
+    // the shared block containing its boundary, or an owner's fresh block at
+    // a publication point it keeps writing past. Fire-and-forget like
+    // pages_to_zero: no op id, no ACK. The runtime enqueues them on the
+    // forward thread's default stream after the execution stream's in-flight
+    // forwards and BEFORE this plan's zeroing, so a source re-granted in the
+    // same round is read before it is zeroed. Destinations are never listed
+    // in pages_to_zero. Both ends share a residue class under page-cyclic
+    // sharding, so the rank that owns one end owns the other.
+    std::map<std::string, std::vector<std::pair<std::int32_t, std::int32_t>>> pages_to_copy;
 
     // The plan separates its streams by executor, and the two remote
     // streams are the transfer peer's half of the role: work the peer runs

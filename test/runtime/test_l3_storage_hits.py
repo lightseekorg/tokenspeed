@@ -368,9 +368,15 @@ def loop_methods():
     namespace = {
         "deque": deque,
         "maybe_control_plane_guard": nullcontext,
+        # The loop labels its scheduler calls for the torch profiler; here
+        # that is a no-op context like the control-plane guard.
+        "torch": SimpleNamespace(
+            profiler=SimpleNamespace(record_function=lambda _name: nullcontext())
+        ),
         "PlannedForward": SimpleNamespace,
         "ngram_inputs_for_forward": lambda *args: None,
         "input_logprob_plan_for_forward": lambda *args: None,
+        "sampled_top_k_for_forward": lambda *args: 0,
         "advance_scheduler": lambda scheduler, events: scheduler.advance(events),
     }
     exec(
@@ -464,8 +470,9 @@ def test_prefetch_convergence_precedes_the_rounds_cache_poll(
             drain_ready_embeddings=Mock(), assert_embeddings_received=Mock()
         ),
         _eplb_hooks=SimpleNamespace(note_round=Mock()),
+        _gc_hooks=SimpleNamespace(note_round=Mock()),
         _cache_hooks=SimpleNamespace(
-            poll_ready_events=poll_ready_events, count_plan_ops=Mock()
+            poll_ready_events=poll_ready_events, count_plan_ops=Mock(return_value=0)
         ),
         _l3_hooks=hooks,
         _pause=SimpleNamespace(forward_blocked=False, maybe_finish_drain=Mock()),
@@ -480,6 +487,7 @@ def test_prefetch_convergence_precedes_the_rounds_cache_poll(
             need_idle_forward=forward is None
         ),
         _gather_sampling_params=Mock(return_value=[]),
+        _gather_stop_criteria=Mock(return_value=()),
         _gather_grammar_state=Mock(return_value=None),
         output_processor=SimpleNamespace(
             rid_to_state={},
@@ -491,6 +499,7 @@ def test_prefetch_convergence_precedes_the_rounds_cache_poll(
         _request_history_rows=None,
         _dispatch_depends_on_pending_commit=Mock(return_value=False),
         _mark_stats_scheduled=Mock(),
+        _record_request_queue_time=Mock(),
         _batch_logger=SimpleNamespace(log_dispatch=Mock()),
         model_config=SimpleNamespace(is_multimodal_active=False),
         _pd_hooks=SimpleNamespace(poll_transfer_events=Mock(return_value=[])),

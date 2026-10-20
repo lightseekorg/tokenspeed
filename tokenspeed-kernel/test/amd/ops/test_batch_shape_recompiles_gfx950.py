@@ -25,9 +25,6 @@ specialization class, then sweep the batch-dependent value inside
 ``assert_no_triton_compile``.
 """
 
-import importlib
-import sys
-
 import pytest
 import torch
 from utils import (
@@ -191,7 +188,8 @@ def test_mxfp4_moe_sorting_route_count():
                 128,
                 torch.bfloat16,
                 block,
-                compact_route_programs=False,
+                use_minimum_route_chunks=False,
+                runtime_rows=False,
             )
         )
         assert int(valid[1]) == tokens
@@ -246,20 +244,10 @@ def test_moe_topk_row_count():
             run(rows)
 
 
-def test_iris_allreduce_sizes(monkeypatch):
+def test_iris_allreduce_sizes():
     pytest.importorskip("iris")
     from tokenspeed_kernel._triton import gl
-
-    # Other tests stub the Iris module through sys.modules, which only works
-    # while it has not been imported; record its absence so teardown drops the
-    # import this test makes.
-    name = "tokenspeed_kernel.ops.communication.iris"
-    if name not in sys.modules:
-        package = importlib.import_module("tokenspeed_kernel.ops.communication")
-        monkeypatch.setattr(package, "iris", None, raising=False)
-        monkeypatch.setitem(sys.modules, name, None)
-        del sys.modules[name]
-    comm = importlib.import_module(name)
+    from tokenspeed_kernel.ops.communication._iris import all_reduce as comm
 
     buf = torch.empty(1 << 22, device=DEVICE, dtype=torch.bfloat16)
     flags = torch.zeros(1024, device=DEVICE, dtype=torch.int32)
@@ -270,7 +258,7 @@ def test_iris_allreduce_sizes(monkeypatch):
     # Compile only: the allreduce itself needs the symmetric heap of every rank.
     def two_stage(words):
         tiles = -(-words // 128)
-        comm.iris_reduce_symmetric_two_stage_gluon_kernel.warmup(
+        comm.iris_pull_twoshot.warmup(
             buf,
             buf,
             buf,
@@ -289,7 +277,7 @@ def test_iris_allreduce_sizes(monkeypatch):
 
     def one_stage(numel):
         tiles = -(-numel // 512)
-        comm.iris_reduce_symmetric_gluon_kernel.warmup(
+        comm.iris_pull_oneshot.warmup(
             buf,
             buf,
             flags,
@@ -311,8 +299,8 @@ def test_iris_allreduce_sizes(monkeypatch):
     one_stage(7168 * 3)
     one_stage(7168 * 3 + 1)
     with assert_no_triton_compile(
-        comm.iris_reduce_symmetric_two_stage_gluon_kernel,
-        comm.iris_reduce_symmetric_gluon_kernel,
+        comm.iris_pull_twoshot,
+        comm.iris_pull_oneshot,
     ):
         for words in (157248, 996240, 236880, 79296):
             two_stage(words)
@@ -387,9 +375,6 @@ def test_kda_fused_decode_batch_size():
             beta_logits=rows[:, 4 * width + head_dim :],
             A_log=torch.zeros(heads, device=DEVICE),
             dt_bias=torch.zeros(width, device=DEVICE),
-            output_gate=rows[:, 3 * width : 4 * width],
-            norm_weight=torch.ones(head_dim, device=DEVICE).bfloat16(),
-            norm_eps=1e-6,
             state_pool=state_pool,
             read_indices=torch.arange(batch, device=DEVICE, dtype=torch.int32),
             write_indices=torch.arange(

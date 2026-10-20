@@ -24,6 +24,48 @@ the online softmax; unused entries remain `-1`.
 Portable Triton implementations remain the fallback for trait combinations
 without a matching native registration.
 
+## Materialized Triton row top-k
+
+`triton_topk_from_logits(logits, topk, seq_lens=..., enable_pdl=...)` selects
+FP32 rows with descending scores and smaller column ids first on ties.
+`seq_lens` is an int32 or int64 vector on the scores' device, clamped per row
+to `[0, width]`; explicit `None` selects the full row. Scores and lengths may
+be strided. Invalid scores inside the visible prefix still use `-inf` and
+produce `-1` output padding. Entries beyond the prefix are never read and may
+be uninitialized.
+
+The sorting and radix implementations both bound input reads by these device
+lengths. Radix histogram reduction excludes unwritten tiles and selects at
+most `min(topk, seq_lens[row])` entries, including empty and short rows.
+CUDA Graph replay may change the lengths without changing allocation or launch
+capacity. QSA passes its complete compressed-block counts to both CUDA and
+Triton selection, so its scorer writes only valid prefixes.
+
+## Persistent CUDA row top-k
+
+`persistent_topk` selects unsorted indices for `k` of 512, 1024, or 2048.
+It reads only the visible prefix, applies causal lengths for grouped queries,
+and pads short rows with `-1`. Equal scores may select any distinct tied indices.
+Its ordered keys rank `-0.0` below `+0.0`; it does not promise lowest-index tie
+selection or declare `batch_invariant`. The lowest-index tie contract in
+`docs/design/numerics.md` applies to leaves selected with `batch_invariant=True`.
+NaNs in the visible prefix are unsupported: value selection is unspecified,
+but output indices and writes remain in bounds. The unread suffix may contain
+NaNs. Empty or unmatched refinement histograms never reuse stale thresholds.
+
+The register, streaming, and cluster implementations share a coarse FP16
+histogram followed by exact FP32 selection. If the threshold bucket exceeds
+the 2048-entry candidate buffer, additional FP32 radix passes narrow it before
+collection. Refinement skips the leading bits fixed by the coarse bounds and
+reuses the existing histogram storage, without increasing shared memory. It stops
+when candidates fit or all remaining keys are identical. Truncation is safe only
+in the latter case. Ordered integer bounds preserve nearest-even FP16 bucket
+boundaries, including negative midpoints, signed zero, and infinities. Candidates
+retain their integer keys through tie selection so subnormal scores remain
+distinct under CUDA fast math. Cluster ranks reduce every refinement histogram
+together before collecting candidates. Equal reduced histograms and counts keep
+every rank's refinement rounds and cluster barriers in sync.
+
 ## Index-K plane formats
 
 `dsa_prefill_topk` and `dsa_decode_topk` read the storage of the index-key
@@ -38,9 +80,9 @@ never convert a plane:
 | `uint8` | `fp8_scaled` | `page_planar` | any other uint8 shape: per-page planes of keys and scales, the outer page stride possibly padded |
 | `bfloat16` | `bf16` | `packed` | `[slots, head_dim]`: the keys as the indexer produced them, no scale plane |
 
-The in-tree DeepGEMM, Triton and Gluon leaves score `fp8_scaled` planes; a
+The in-tree DeepGEMM, Triton, and Gluon leaves score `fp8_scaled` planes; a
 leaf scoring the checkpoint's bf16 keys (an indexer in the RL trainer's
-order) registers `index_k_format={"bf16"}`, `index_k_layout={"packed"}` and
+order) registers `index_k_format={"bf16"}`, `index_k_layout={"packed"}`, and
 the `batch_invariant` and `forced_initial_local` features, so a bf16 plane
 selects it and nothing else. A plane of any other dtype is a `TypeError`.
 
@@ -53,7 +95,7 @@ head_dim]` uint8 or float8_e4m3fn, `[workspace_rows, head_dim / 128]` fp32),
 each one row per entry of `kv_workspace_slots` and selecting with that
 `index_k_format` and `index_k_layout="packed"`, never together and never with
 `index_k_cache`; a call with neither a plane nor rows is a `ValueError`.
-Rows additionally REQUIRE the `index_k_workspace_rows` feature
+Rows additionally require the `index_k_workspace_rows` feature
 (`dsa.INDEX_K_WORKSPACE_ROWS_FEATURE`): a leaf declares it exactly when its
 launcher takes the row keywords for its format (DeepGEMM does, for the FP8
 pair; a bf16 leaf declares it and takes the `index_k_bf16` keyword), the
@@ -107,9 +149,9 @@ block-maxima selection.
 Contract:
 
 - `scores` is CUDA FP32 `[rows, width]` with unit column stride, a row
-  stride that is a multiple of 4 elements and a 16-byte aligned base;
+  stride that is a multiple of 4 elements, and a 16-byte aligned base;
   `ends` is int32 `[rows]` and bounds each row (clamped to `[0, width]`).
-- `capacity` is the compiled survivor capacity (512, 1024 or 2048) and
+- `capacity` is the compiled survivor capacity (512, 1024, or 2048) and
   bounds `topk`; `capacity_for` gives the smallest one that serves a `topk`.
 - A row with `ends[r] <= topk` yields `0 .. ends[r]-1` then `-1` slots
   scoring `-inf`. Otherwise every slot is a distinct index below `ends[r]`.
@@ -155,13 +197,27 @@ output buffers retain their identity. Decode transposes the vendor's
 `[batch, heads, query]` LSE to token-major order. This does not reinterpret
 regular BF16 KV as packed FP8 or change its Triton decode selection.
 
+## Runtime backend selection
+
+The runtime selects DSA with `--attention-backend dsa`, or automatically from
+the DSA architecture. The same name resolves to `AscendDSABackend` on Ascend
+and `DSABackend` on GPU platforms. The Ascend implementation owns its device
+metadata and operator adaptation; model projections and indexer selection
+parameters remain model-owned. Its current constraints are BF16 KV and index
+keys, 128-token kernel pages, target verification of at most eight tokens,
+and no draft-model attention. Target verification can still consume draft
+candidates. The Ascend backend checks these constraints.
+
 ## Sharded Index-K candidates
 
 `dsa_index_candidates` scores a bounded query tile against rank-local Index-K
 for prefill and decode. Inputs are a position-preserving page table (`-1` for
-absent pages), request IDs and global causal lengths. Outputs are global logical
+absent pages), request IDs, and global causal lengths. Outputs are global logical
 offsets and FP32 scores: invalid candidates use `-1`/`-inf`, and forced
 initial/local candidates use `+inf`. Cross-rank merging belongs to runtime DCP.
+Runtime setup validates a positive power-of-two candidate count when the KVP
+group has multiple ranks, using the cache-parallel topology (`kvp_group` /
+`kvp_size`). Single-rank selection keeps its existing top-k choices.
 
 DeepGEMM compacts owned, causally visible pages and maps results back to global
 offsets, masking padding and handling partial tails and empty shards. Query
@@ -173,4 +229,15 @@ The Triton FP8 indexer skips Q/K scoring for tiles with no causally visible,
 owned entries. Empty tiles still write negative-infinite logits, including
 when lengths or ownership change during graph replay. Partially valid tiles
 keep the per-entry mask and global forced-window policy. This avoids redundant
-arithmetic without changing the launch grid, logits capacity or Top-K scan.
+arithmetic without changing the launch grid, logits capacity, or Top-K scan.
+
+### Persistent CUDA top-k dependencies
+
+`ragged_decode_topk` needs no workspace and requires an explicit `enable_pdl`.
+With PDL, selection waits before reading lengths or scores, including empty and
+short rows. Cluster and single-CTA launches both honor the PDL flag.
+
+For non-cluster PDL grids with no more rows than SMs, the launcher selects a
+one-block register budget to reduce packing of waiting CTAs. Larger grids keep
+the two-block budget. Launch bounds guide register allocation; they are not a
+hard limit on resident CTAs. Both variants use the same radix algorithm.

@@ -28,11 +28,12 @@ from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed.runtime.utils.triton import tl, triton
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_a"], do_not_specialize_on_alignment=["a"])
 def fused_gdn_gating_kernel(
     g,
     A_log,
     a,
+    stride_a,
     dt_bias,
     seq_len,
     NUM_HEADS: tl.constexpr,
@@ -50,7 +51,8 @@ def fused_gdn_gating_kernel(
     off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
     mask = head_off < NUM_HEADS
     blk_A_log = tl.load(A_log + head_off, mask=mask)
-    blk_a = tl.load(a + off, mask=mask)
+    row = (i_b * seq_len + i_s).to(tl.int64)
+    blk_a = tl.load(a + row * stride_a + head_off, mask=mask)
     blk_bias = tl.load(dt_bias + head_off, mask=mask)
     x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
     softplus_x = tl.where(
@@ -71,11 +73,13 @@ def fused_gdn_gating(
     batch, num_heads = a.shape
     seq_len = 1
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
-    g = torch.empty_like(a, dtype=torch.float32)
+    # ``a`` may be a row-strided view (unit inner stride); ``g`` is contiguous.
+    g = torch.empty(a.shape, dtype=torch.float32, device=a.device)
     fused_gdn_gating_kernel[grid](
         g,
         A_log,
         a,
+        a.stride(0),
         dt_bias,
         seq_len,
         num_heads,

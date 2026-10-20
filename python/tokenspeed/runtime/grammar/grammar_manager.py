@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import time
 from concurrent import futures
+from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 import torch
@@ -51,12 +52,38 @@ logger = get_colorful_logger(__name__)
 QueueEntry = tuple["object", "RequestState", "object"]  # (spec, state, bootstrap_info)
 
 
+def _compiled_value(future: futures.Future):
+    """The grammar a finished compile future resolved to."""
+    # init_value_impl is supposed to fold compile errors into an
+    # InvalidGrammarObject, but it can leak (e.g. KeyError from the
+    # structural_tag legacy dict-walk in xgrammar_backend). Catching
+    # here keeps the leak from re-raising out of the event loop.
+    try:
+        return future.result()
+    except Exception as exc:
+        return InvalidGrammarObject(f"{type(exc).__name__}: {exc}")
+
+
+def _compile_failure_status(value) -> HTTPStatus | None:
+    """HTTP status for a request whose grammar is invalid.
+
+    A failure a retry cannot fix is the request's own: a grammar that does
+    not compile, or a key whose compile timed out more than
+    ``grammar_compile_max_retries`` times. Both are cached without an
+    expiry and answered 400, so clients do not retry them. A timeout marker
+    with an expiry lets the next request compile again, so it keeps no
+    status, as before.
+    """
+    return HTTPStatus.BAD_REQUEST if value.expires_at is None else None
+
+
 class GrammarManager:
     def __init__(
         self,
         server_args: ServerArgs,
         tokenizer,
         vocab_size: int,
+        stop_token_ids: set[int] | None = None,
     ) -> None:
 
         self.server_args = server_args
@@ -73,7 +100,7 @@ class GrammarManager:
         # RequestHandler loads the scheduler-side tokenizer unconditionally,
         # so the vocab the backend needs is always available here.
         self.grammar_backend = create_grammar_backend(
-            server_args, tokenizer, vocab_size
+            server_args, tokenizer, vocab_size, stop_token_ids=stop_token_ids
         )
 
         # Grammar admission must be coherent across attention TP ranks: every rank
@@ -118,8 +145,8 @@ class GrammarManager:
                 # every concurrent request for the same grammar key
                 # (see ``get_cached_or_future_value``), so cancelling
                 # would raise CancelledError on still-valid waiters.
-                # The compile runs to completion in the background and
-                # its result lands in the cache for future reuse.
+                # The compile runs to completion in the background; its
+                # grammar is kept only if a request is admitted with it.
                 state.set_finish_with_abort("Aborted by AbortReq.")
 
                 # The queue entry is cleaned up by the next
@@ -132,6 +159,8 @@ class GrammarManager:
 
         Returns True if the request is admittable now (no grammar, cache hit, or
         already aborted), False if it must be queued until its future resolves.
+        With attention TP > 1 a cache hit is queued too (as a resolved future),
+        so that every rank admits the request in the same iteration.
         """
         sp = state.sampling_params
 
@@ -144,9 +173,13 @@ class GrammarManager:
             return True
 
         if self.grammar_backend is None:
+            # The request asks for something this server cannot do: report a
+            # client error (400) instead of an internal one, so clients do not
+            # retry it.
             state.set_finish_with_abort(
                 "Grammar-based generation (json_schema, regex, ebnf, structural_tag) "
-                "is not supported when the server is launched with --grammar-backend none"
+                "is not supported when the server is launched with --grammar-backend none",
+                status_code=HTTPStatus.BAD_REQUEST,
             )
 
             return True
@@ -166,10 +199,20 @@ class GrammarManager:
         value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
         state.grammar_key = key
 
+        if cache_hit and self.grammar_sync_size > 1:
+            # Another attention TP rank may still be compiling this key, or
+            # may no longer cache it: admit through the queue, whose
+            # all_gather admits the request on every rank in one iteration.
+            done = futures.Future()
+            done.set_result(value)
+            state.grammar = done
+            return False
+
         if cache_hit:
             if value.is_invalid:
                 state.set_finish_with_abort(
-                    f"Failed to compile {key[0]} grammar: {value.error_message}"
+                    f"Failed to compile {key[0]} grammar: {value.error_message}",
+                    status_code=_compile_failure_status(value),
                 )
 
                 state.grammar = None
@@ -197,11 +240,13 @@ class GrammarManager:
         Per-rank: scan futures, mark ready/failed locally.
         Cross-rank (attn TP > 1): all_gather indices and admit only the
         intersection of ready sets and the union of failed sets, so every rank
-        admits the same requests in the same iteration.
+        admits the same requests in the same iteration. A ready request whose
+        grammar is invalid on any rank is aborted on every rank.
 
         Caller is responsible for invoking this every loop iteration when
-        ``grammar_sync_size > 1`` so the collective stays in sync; with size 1
-        it's a no-op when the queue is empty.
+        ``grammar_sync_size > 1`` so the collective stays in sync; with an
+        empty queue it only drops finished compiles no request was admitted
+        with.
         """
         # Queue length is identical on every attn-TP rank: recv_reqs
         # broadcasts the new/abort sets, so add_to_queue and mark_abort
@@ -209,6 +254,9 @@ class GrammarManager:
         # rank consensus. If our queue is empty, every rank's is — no
         # indices to negotiate, so we can safely skip the collective.
         if not self.grammar_queue:
+            # A compile whose requests were all aborted while queued can
+            # finish after the pass that dropped them.
+            self._retain([])
             return []
 
         now = time.monotonic()
@@ -259,22 +307,45 @@ class GrammarManager:
                 else:
                     failed_idxs.add(i)
 
+        # Invalid grammars among the ready requests, by queue index.
+        invalid: dict[int, InvalidGrammarObject] = {}
+
         if self.grammar_sync_size > 1:
-            gathered: list[tuple[set, set]] = [None] * self.grammar_sync_size
+            # Each rank compiles and caches on its own, so a request ready on
+            # every rank can still be invalid on some of them only (a timeout
+            # marker cached on one rank, a compile that raised on one). Send
+            # those too: the request is then aborted on every rank, with the
+            # lowest such rank's reason.
+            for i in ready_idxs:
+                state = self.grammar_queue[i][1]
+
+                if not state.finished and state.grammar is not None:
+                    value = _compiled_value(state.grammar)
+
+                    if value.is_invalid:
+                        invalid[i] = value
+
+            gathered: list[tuple[set, set, dict]] = [None] * self.grammar_sync_size
 
             torch.distributed.all_gather_object(
                 gathered,
-                (ready_idxs, failed_idxs),
+                (ready_idxs, failed_idxs, invalid),
                 group=self.grammar_sync_group,
             )
 
             ready_idxs = set.intersection(*[g[0] for g in gathered])
             failed_idxs = set.union(*[g[1] for g in gathered])
 
+            for g in reversed(gathered):
+                invalid.update(g[2])
+
         if not ready_idxs and not failed_idxs:
+            self._retain([])
             return []
 
         promoted: list[QueueEntry] = []
+        # (key, grammar) of the requests admitted with a grammar, in order.
+        admitted: list = []
 
         for i in sorted(ready_idxs):
             spec, state, bootstrap = self.grammar_queue[i]
@@ -283,21 +354,15 @@ class GrammarManager:
             if state.finished or state.grammar is None:
                 continue
 
-            # init_value_impl is supposed to fold compile errors into an
-            # InvalidGrammarObject, but it can leak (e.g. KeyError from the
-            # structural_tag legacy dict-walk in xgrammar_backend). Catching
-            # here keeps the leak from re-raising out of the event loop.
-            try:
-                value = state.grammar.result()
-            except Exception as exc:
-                value = InvalidGrammarObject(f"{type(exc).__name__}: {exc}")
+            value = invalid[i] if i in invalid else _compiled_value(state.grammar)
 
             if value.is_invalid:
                 state.grammar = None
 
                 state.set_finish_with_abort(
                     f"Failed to compile {state.grammar_key[0]} grammar: "
-                    f"{value.error_message}"
+                    f"{value.error_message}",
+                    status_code=_compile_failure_status(value),
                 )
 
             else:
@@ -305,6 +370,7 @@ class GrammarManager:
                 # shared compile; copy so each request has its own matcher
                 # state.
                 state.grammar = value.copy()
+                admitted.append((state.grammar_key, value))
 
         # Dedupe record_compile_timeout by key: multiple concurrent
         # requests share a single compile, so one timeout wave would
@@ -321,8 +387,14 @@ class GrammarManager:
             # done() so we don't falsely time out a compile that just
             # finished — the cost of one extra ``result()`` here is
             # negligible compared to the hours a user could spend
-            # debugging a phantom timeout.
-            if isinstance(state.grammar, futures.Future) and state.grammar.done():
+            # debugging a phantom timeout. Not with attention TP > 1: the
+            # failed set is the group's, and a compile that finished on
+            # this rank alone must not admit the request here only.
+            if (
+                self.grammar_sync_size == 1
+                and isinstance(state.grammar, futures.Future)
+                and state.grammar.done()
+            ):
                 try:
                     value = state.grammar.result()
                 except BaseException:
@@ -332,13 +404,22 @@ class GrammarManager:
                     # See above: copy per-request so concurrent waiters on a
                     # shared compile future don't share matcher state.
                     state.grammar = value.copy()
+                    admitted.append((state.grammar_key, value))
                     continue
+
+            # With attention TP > 1, a rank whose result for this request
+            # was ready did not time out: its grammar or failure marker
+            # stands, and the ranks still compiling record the timeout.
+            ready_here = (
+                self.grammar_sync_size > 1
+                and isinstance(state.grammar, futures.Future)
+                and state.grammar.done()
+            )
 
             # Don't cancel the future: it's shared across all
             # concurrent requests for this key. The compile runs to
-            # completion in the background; its result (or the timeout
-            # marker we post below) lands in the cache for future
-            # requests to consume.
+            # completion in the background; the timeout marker we post
+            # below lands in the cache for future requests to consume.
             state.grammar = None
 
             timeout_msg = (
@@ -351,7 +432,7 @@ class GrammarManager:
             # and after compile_max_retries timeouts the marker is
             # escalated to permanent (the compiler is consistently
             # broken for this key).
-            if state.grammar_key not in timed_out_keys:
+            if not ready_here and state.grammar_key not in timed_out_keys:
                 timed_out_keys.add(state.grammar_key)
                 self.grammar_backend.record_compile_timeout(
                     state.grammar_key,
@@ -368,4 +449,20 @@ class GrammarManager:
             entry for i, entry in enumerate(self.grammar_queue) if i not in drop
         ]
 
+        # Every rank admitted the same requests.
+        self._retain(admitted)
+
         return promoted
+
+    def _retain(self, admitted: list) -> None:
+        """Let the backend keep the grammars of the requests just admitted,
+        within its bound, and drop the compiled grammars no queued request
+        waits for (``BaseGrammarBackend.retain``)."""
+        backend = self.grammar_backend
+
+        if backend is None or not (admitted or backend.compiled_keys):
+            return
+
+        backend.retain(
+            admitted, {state.grammar_key for _, state, _ in self.grammar_queue}
+        )

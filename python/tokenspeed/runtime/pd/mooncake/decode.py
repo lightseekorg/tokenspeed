@@ -27,6 +27,7 @@ from dataclasses import dataclass
 import numpy as np
 import requests
 
+from tokenspeed.runtime.pd.base.mooncake_engine import MooncakeTransferEngine
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
     CacheTransferContract,
@@ -38,7 +39,7 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
 from tokenspeed.runtime.utils.env import envs
-from tokenspeed.runtime.utils.network import get_free_port, get_local_ip_by_remote
+from tokenspeed.runtime.utils.network import get_local_ip_by_remote
 
 logger = get_colorful_logger(__name__)
 
@@ -125,9 +126,33 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         # their sockets only after the manager is fully initialized.
         self.start_decode_thread()
 
+    def restore_buffer_registration(self) -> None:
+        """Register the arena under a fresh transfer session after a wake.
+
+        Decode memory is the target of the prefill node's RDMA writes, and the
+        prefill engine caches each decode session's memory descriptors,
+        remote keys included. Re-registering under the same session would
+        leave it writing with the keys of the freed pages, so a new engine --
+        a new session -- takes the registration, and the connection pool is
+        cleared so the next request registers that session with the prefill
+        node again.
+        """
+        old_engine = self.engine
+        self.engine = MooncakeTransferEngine(
+            hostname=old_engine.hostname,
+            gpu_id=old_engine.gpu_id,
+            ib_device=old_engine.ib_device,
+        )
+        super().restore_buffer_registration()
+        with self.connection_lock:
+            self.connection_pool.clear()
+        logger.info(
+            "Mooncake decode session refreshed after wake: "
+            f"{old_engine.get_session_id()} -> {self.engine.get_session_id()}"
+        )
+
     def start_decode_thread(self):
-        self.rank_port = get_free_port()
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
+        self.bind_server_socket(get_local_ip_by_remote())
         # Maps bootstrap_room -> bootstrap_token (first output token from prefill).
         # Populated by decode_thread when a Success message carries a valid token,
         # consumed by DisaggDecodeExecutor.generate_events() via pop_bootstrap_token().
@@ -330,16 +355,23 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         # Report the requests associated with the failed bootstrap addr and mark their status as TransferPoll.Failed
         affected_rooms = []
         for room in possible_affected_rooms:
-            if (
-                room in self.request_status
-                and self.check_status(room) != TransferPoll.Success
-            ):
-                self.record_failure(
-                    room,
-                    f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
-                )
-                self.update_status(room, TransferPoll.Failed)
-                affected_rooms.append(room)
+            # One failure counts once: skip rooms that already succeeded,
+            # already failed (the prefill counted those on its side), or were
+            # already recorded here (e.g. after a receiver-side timeout).
+            status = self.room_status(room)
+            if status is None or status in (TransferPoll.Success, TransferPoll.Failed):
+                continue
+            with self.failure_lock:
+                already_counted = room in self.failure_records
+            if already_counted:
+                continue
+            self.record_failure(
+                room,
+                f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
+            )
+            self.kv_transfer_metrics.record_kv_transfer_failure()
+            self.update_status(room, TransferPoll.Failed)
+            affected_rooms.append(room)
         logger.error(
             "Losing connection with prefill instance (bootstrap_addr: "
             f"{failed_bootstrap_addr!s}), affected {len(affected_rooms)!s} requests",

@@ -52,15 +52,28 @@ class _State:
         self.finish_calls.append(message)
 
 
-def _handshaked_item():
-    return SimpleNamespace(encode_handshake=object(), encoded=None)
+def _handshaked_item(offsets=((0, 3),)):
+    return SimpleNamespace(
+        encode_handshake=object(), encoded=None, offsets=list(offsets)
+    )
 
 
 def _plain_item():
-    return SimpleNamespace(encode_handshake=None, encoded=None)
+    return SimpleNamespace(encode_handshake=None, encoded=None, offsets=[(0, 3)])
+
+
+def _context(*mm_items, prefix: int = 0, seq: int = 8):
+    return SimpleNamespace(
+        has_extend_inputs=lambda: True,
+        mm_inputs=[SimpleNamespace(mm_items=list(mm_items))],
+        extend_prefix_lens=[prefix],
+        extend_seq_lens=[seq],
+    )
 
 
 class _Admission:
+    receives_embeddings = True
+
     def __init__(self) -> None:
         self.staged: list[str] = []
         self.drain_result: tuple[list, list] = ([], [])
@@ -212,28 +225,102 @@ def test_drain_withholds_admission_while_paused() -> None:
 
 def test_assert_embeddings_received_raises_on_unreceived_handshaked_item() -> None:
     hooks = EpdPrefillHooks(_FakeLoop(), _Admission())
-    context = SimpleNamespace(
-        has_extend_inputs=lambda: True,
-        mm_inputs=[SimpleNamespace(mm_items=[_handshaked_item()])],
-    )
 
     with pytest.raises(RuntimeError, match="un-received"):
-        hooks.assert_embeddings_received(context)
+        hooks.assert_embeddings_received(_context(_handshaked_item()))
 
 
 def test_assert_embeddings_received_accepts_filled_items_and_non_epd() -> None:
-    filled = SimpleNamespace(encode_handshake=object(), encoded=object())
-    context = SimpleNamespace(
-        has_extend_inputs=lambda: True,
-        mm_inputs=[SimpleNamespace(mm_items=[filled, _plain_item()])],
+    filled = SimpleNamespace(
+        encode_handshake=object(), encoded=object(), offsets=[(0, 3)]
     )
-    EpdPrefillHooks(_FakeLoop(), _Admission()).assert_embeddings_received(context)
+    EpdPrefillHooks(_FakeLoop(), _Admission()).assert_embeddings_received(
+        _context(filled, _plain_item())
+    )
     # Non-EPD node: no-op even with an un-received item.
-    bad = SimpleNamespace(
-        has_extend_inputs=lambda: True,
-        mm_inputs=[SimpleNamespace(mm_items=[_handshaked_item()])],
+    EpdPrefillHooks(_FakeLoop(), None).assert_embeddings_received(
+        _context(_handshaked_item())
     )
-    EpdPrefillHooks(_FakeLoop(), None).assert_embeddings_received(bad)
+
+
+def test_assert_embeddings_received_ignores_items_an_earlier_chunk_prefilled() -> None:
+    """A chunked prompt: the image's tokens [0, 3] were all prefilled by the first
+    chunk, which dropped the encoding; the second chunk [8, 16) scatters nothing
+    of it. An item still overlapping the chunk must hold its embedding."""
+    hooks = EpdPrefillHooks(_FakeLoop(), _Admission())
+    hooks.assert_embeddings_received(
+        _context(_handshaked_item(offsets=[(0, 3)]), prefix=8, seq=8)
+    )
+    with pytest.raises(RuntimeError, match="un-received"):
+        hooks.assert_embeddings_received(
+            _context(_handshaked_item(offsets=[(0, 3), (10, 12)]), prefix=8, seq=8)
+        )
+
+
+def test_pipeline_admission_waits_for_pp0_without_receiving_on_followers(monkeypatch):
+    from tokenspeed.runtime.epd import prefill_admission
+
+    local = _Admission()
+    first = prefill_admission.PipelineEpdPrefillAdmission(
+        local_admission=local, pp_ranks=(0, 2, 4, 6), pp_cpu_group="pp"
+    )
+    follower = prefill_admission.PipelineEpdPrefillAdmission(
+        local_admission=None, pp_ranks=(0, 2, 4, 6), pp_cpu_group="pp"
+    )
+    wire = []
+
+    def broadcast(payload, *, src, group):
+        assert src == 0 and group == "pp"
+        if payload[0] is not None:
+            wire.append(payload[0])
+        else:
+            payload[0] = wire.pop(0)
+
+    monkeypatch.setattr(prefill_admission.dist, "broadcast_object_list", broadcast)
+    for admission in (first, follower):
+        admission.stage("ok", [_handshaked_item()])
+        admission.stage("failed", [_handshaked_item()])
+    assert first.receives_embeddings and not follower.receives_embeddings
+    assert local.staged == ["ok", "failed"]
+    assert first.drain() == follower.drain() == ([], [])
+    assert first.has_pending() and follower.has_pending()
+    local.drain_result = (["ok"], ["failed"])
+    assert first.drain() == follower.drain() == (["ok"], ["failed"])
+    assert not first.has_pending() and not follower.has_pending()
+    assert first.drain() == follower.drain() == ([], [])
+    assert not wire
+
+
+def test_pipeline_follower_neither_allocates_pool_nor_reads_encoder_facts(monkeypatch):
+    from tokenspeed.runtime.epd import prefill_admission, recv_pool
+
+    mapping = SimpleNamespace(is_first_pp_rank=False, pp_group=(0, 2, 4, 6))
+    server_args = SimpleNamespace(disaggregation_mode="prefill", mapping=mapping)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("non-PP0 attempted to build an encoder receiver")
+
+    monkeypatch.setattr(prefill_admission, "build_prefill_embedding_manager", forbidden)
+    admission = prefill_admission.make_epd_prefill_admission(
+        server_args,
+        2,
+        model_config=SimpleNamespace(is_multimodal_active=True),
+        encoder_model_facts=forbidden,
+        mapping=mapping,
+        attn_tp_rank=0,
+        attn_tp_size=2,
+        attn_tp_cpu_group=None,
+        pg_manager=SimpleNamespace(get_process_group=lambda *args: "pp"),
+    )
+    assert not admission.receives_embeddings
+    assert recv_pool.recv_pool_bytes(server_args, True) == 0
+    hooks = EpdPrefillHooks(SimpleNamespace(), admission)
+    hooks.assert_embeddings_received(
+        SimpleNamespace(
+            has_extend_inputs=lambda: True,
+            mm_inputs=[SimpleNamespace(mm_items=[_handshaked_item()])],
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -23,6 +23,8 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
+from fractions import Fraction
 from functools import cached_property
 
 import torch
@@ -85,7 +87,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
     @property
     @override
     def max_padding_fraction(self) -> float:
-        """Allow the narrow PLE and QSA side-cache planes."""
+        """Allow side groups that do not fill every shared plane."""
         return float("inf")
 
     def _ple_fields(self) -> tuple[CacheFieldSpec, ...]:
@@ -96,7 +98,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         fields = (
             CacheFieldSpec(
                 context_field,
-                context_field,
+                "unit.0",
                 (int(self._text_config.ngram_context_len),),
                 cache_dtype_name(torch.int64),
                 exact_page_stride=False,
@@ -106,12 +108,12 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         return fields + tuple(
             CacheFieldSpec(
                 qwen4_exp_ple_conv_field(layer_id),
-                qwen4_exp_ple_conv_field(layer_id),
+                f"unit.{unit}",
                 conv_shape,
                 cache_dtype_name(torch.bfloat16),
                 exact_page_stride=False,
             )
-            for layer_id in ple_layer_ids
+            for unit, layer_id in enumerate(ple_layer_ids)
         )
 
     @cached_property
@@ -173,7 +175,9 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         compressed_fields = []
         recent_fields = []
         for unit, (layer_id, index_dim) in enumerate(self._qsa_layers):
-            recent_plane = f"qwen4_exp.qsa.unit.{unit}.recent"
+            # Different cache groups own different parents, so side state can
+            # reuse the attention planes without reserving them a second time.
+            recent_plane = f"unit.{2 * unit}"
             recent_fields.extend(
                 (
                     CacheFieldSpec(
@@ -195,7 +199,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             compressed_fields.append(
                 CacheFieldSpec(
                     qsa_compressed_field(layer_id),
-                    f"qwen4_exp.qsa.unit.{unit}.compressed",
+                    f"unit.{2 * unit}",
                     (QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE, 1, index_dim),
                     cache_dtype_name(torch.bfloat16),
                 )
@@ -208,6 +212,10 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         if (
             not self.num_draft_layers
             or self.attn_config.speculative_num_draft_tokens <= 1
+            or (
+                self.pd_disaggregation_enabled
+                and self.server_args.disaggregation_mode == "prefill"
+            )
         ):
             return 0
         num_ple_layers = sum(
@@ -248,10 +256,8 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                 (
                     CacheGroupSpec(
                         group_id=QWEN4_EXP_PLE_CACHE_GROUP,
-                        retention="full_history",
+                        attn_kind="state",
                         sliding_window_tokens=None,
-                        family="state",
-                        checkpoint_granularity=self.prefix_granularity,
                         replayable=False,
                     ),
                     ple_fields,
@@ -261,11 +267,10 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         if qsa_compressed_fields:
             qsa_spec = CacheGroupSpec(
                 group_id=QWEN4_EXP_QSA_CACHE_GROUP,
-                retention="full_history",
+                attn_kind="full_history",
                 rows_per_page=QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE,
                 entry_stride_tokens=self._qsa_compress_ratio,
                 sliding_window_tokens=None,
-                family="history",
                 replayable=False,
             )
             # Raw block ids require exactly one model/kernel page per block.
@@ -287,11 +292,10 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                 (
                     CacheGroupSpec(
                         group_id=QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
-                        retention="sliding_window",
+                        attn_kind="sliding_window",
                         rows_per_page=QWEN4_EXP_QSA_RECENT_ROWS_PER_PAGE,
                         entry_stride_tokens=1,
                         sliding_window_tokens=self._qsa_compress_ratio,
-                        family="history",
                         replayable=False,
                     ),
                     qsa_recent_fields,
@@ -303,7 +307,45 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                 (spec, fields)
                 for spec, (_, fields) in zip(policies, extras, strict=True)
             )
-        return super().groups() + extras
+        decoder_groups = super().groups()
+        attention_plane_bytes = {
+            field.plane_id: field.payload_bytes
+            for spec, fields in decoder_groups
+            if spec.group_id == FULL_ATTENTION
+            for field in fields
+        }
+        shared_extras = []
+        for spec, fields in extras:
+            plane_bytes: dict[str, int] = {}
+            for field in sorted(fields, key=lambda field: field.field_id):
+                offset = plane_bytes.get(field.plane_id, 0)
+                size = field.element_size
+                plane_bytes[field.plane_id] = (
+                    offset + size - 1
+                ) // size * size + field.payload_bytes
+            compatible = plane_bytes.keys() <= attention_plane_bytes.keys() and all(
+                size > 0 for size in plane_bytes.values()
+            )
+            if compatible:
+                if spec.group_id == QWEN4_EXP_QSA_CACHE_GROUP:
+                    # Exact strides need one packing ratio across all layers.
+                    ratios = {
+                        Fraction(attention_plane_bytes[plane], size)
+                        for plane, size in plane_bytes.items()
+                    }
+                    compatible = len(ratios) == 1
+                else:
+                    compatible = all(
+                        size <= attention_plane_bytes[plane]
+                        for plane, size in plane_bytes.items()
+                    )
+            if not compatible:
+                fields = tuple(
+                    replace(field, plane_id=f"{spec.group_id}.{field.plane_id}")
+                    for field in fields
+                )
+            shared_extras.append((spec, fields))
+        return decoder_groups + tuple(shared_extras)
 
     @override
     def _verify_workspace_field_suffixes(self) -> tuple[str, ...]:

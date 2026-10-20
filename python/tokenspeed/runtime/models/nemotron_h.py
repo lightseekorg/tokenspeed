@@ -32,7 +32,7 @@ from collections.abc import Iterable
 
 import torch
 from tokenspeed_kernel.ops.activation import relu2
-from tokenspeed_kernel.ops.gemm.ll_bf16 import (
+from tokenspeed_kernel.ops.gemm.cute_dsl import (
     cute_dsl_ll_bf16_router,
     ll_bf16_router_supported,
 )
@@ -73,6 +73,7 @@ from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
+    KV_CACHE_SCALE_SUFFIXES,
     default_weight_loader,
     sharded_weight_loader,
 )
@@ -843,8 +844,8 @@ class NemotronHForCausalLM(BaseCausalLM):
                 if name.startswith(old):
                     name = new + name[len(old) :]
                     break
-            if name.endswith((".k_scale", ".v_scale")):
-                # The loader already required unit KV scales; the cache uses no scale.
+            if name.endswith(KV_CACHE_SCALE_SUFFIXES):
+                # Only the startup load takes them (load_kv_cache_scales).
                 continue
             if ".mixer.in_proj." in name:
                 block = self.model.layers[int(name.split(".")[2])]
@@ -852,6 +853,16 @@ class NemotronHForCausalLM(BaseCausalLM):
                 continue
             name = name.replace(".mixer.conv1d.", ".mixer.conv_")
             load_weight(params, expert_loader, name, loaded)
+
+    def load_kv_cache_scales(self, scales: dict[str, torch.Tensor]) -> None:
+        for checkpoint_name, scale in scales.items():
+            if checkpoint_name.startswith("mtp."):
+                # The MTP head's; its draft model takes them.
+                continue
+            # backbone.layers.N.mixer.{k,v}_proj.{k,v}_scale
+            layer = checkpoint_name.removeprefix("backbone.layers.").split(".")[0]
+            block = self.model.layers[int(layer)]
+            block.mixer.attn.load_kv_cache_scale(checkpoint_name, scale)
 
 
 EntryClass = NemotronHForCausalLM

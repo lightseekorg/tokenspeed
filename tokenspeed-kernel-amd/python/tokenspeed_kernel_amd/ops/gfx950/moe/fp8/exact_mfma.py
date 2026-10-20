@@ -26,7 +26,10 @@ import torch
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_device import (
     moe_align_block_size_device,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.stage1_kernel import invoke_stage1
+from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.stage1_kernel import (
+    invoke_stage1,
+    launch_gluon_fp8_channel_stage1_gfx950,
+)
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.stage2_kernel import invoke_stage2
 
 
@@ -143,3 +146,49 @@ def gluon_fp8_block_exact_mfma_moe(
         w2_scale=w2_scale,
     )
     return output
+
+
+def prepare_gluon_fp8_channel_gfx950(
+    token_codes,
+    token_scales,
+    w13,
+    channel_scales,
+    topk_ids,
+    topk_weights,
+):
+    """Group routes and run channel-FP8 FC1 with the existing BF16 pipeline.
+
+    Return BF16 activation plus device routing buffers, so the caller can apply
+    its precision-specific route quantizer before launching the down stage.
+    This path never selects split-K, warp decode or materialized BF16 weights.
+    """
+    tokens, _ = token_codes.shape
+    experts, twice_intermediate, _ = w13.shape
+    topk = topk_ids.shape[1]
+    block_m = _select_route_block_size(tokens, topk, experts)
+    routing = moe_align_block_size_device(
+        topk_ids.to(torch.int32),
+        topk_weights,
+        experts,
+        block_m,
+        expert_start=0,
+    )
+    sorted_ids, sorted_experts, _, num_valid = routing
+    activated = torch.zeros(
+        (tokens * topk, twice_intermediate // 2),
+        dtype=torch.bfloat16,
+        device=token_codes.device,
+    )
+    launch_gluon_fp8_channel_stage1_gfx950(
+        token_codes,
+        w13,
+        token_scales,
+        channel_scales,
+        sorted_ids,
+        sorted_experts,
+        num_valid,
+        activated,
+        topk,
+        block_m=block_m,
+    )
+    return activated, routing, block_m

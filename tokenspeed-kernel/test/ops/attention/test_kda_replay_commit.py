@@ -23,6 +23,7 @@ What has to hold for that to be lossless:
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.kda import torch_kda_conv_decode
 from utils import is_cdna4, is_cdna5
 
 if not torch.cuda.is_available():
@@ -452,36 +453,28 @@ def _canonical(page):
 def _reference(x, n, t, accepted):
     """fp32 torch reference: ``accepted[i]`` sequential decode steps.
 
-    Deliberately written as an ordinary decode loop with no notion of a draft
-    window, so agreeing with it IS the statement that replay is equivalent to
-    non-speculative decoding.
+    An ordinary decode loop with no notion of a draft window, so agreeing
+    with it IS the statement that replay is equivalent to non-speculative
+    decoding.
     """
-    conv_w = x["conv_w"].float()
-    w_fb = x["w_fb"].float()
-    exp_a = torch.exp(x["A_log"])[:, None]
-    windows, states = [], []
-    for i in range(n):
-        r = int(x["read_indices"][i])
-        window = x["conv_pool"][r].float()
-        h = _canonical(x["h_pool"][r]).clone()
-        for step in range(int(accepted[i])):
-            tok = i * t + step
-            xt = x["qkv_raw"][tok].float()
-            acc = (window * conv_w[:, :3]).sum(-1) + xt * conv_w[:, 3]
-            y = acc * torch.sigmoid(acc)
-            window = torch.cat([window[:, 1:], xt[:, None]], dim=1)
-            k = y[P : 2 * P].view(HV, K)
-            v = y[2 * P :].view(HV, V)
-            k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
-            gate = ((w_fb @ x["f_a"][tok].float()) + x["dt_bias"]).view(HV, K)
-            gk = LOWER_BOUND * torch.sigmoid(exp_a * gate)
-            h = h * torch.exp(gk)[:, :, None]
-            resid = v - torch.einsum("hkv,hk->hv", h, k)
-            resid = resid * torch.sigmoid(x["beta"][tok].float())[:, None]
-            h = h + torch.einsum("hk,hv->hkv", k, resid)
-        windows.append(window)
-        states.append(h)
-    return windows, states
+    return torch_kda_conv_decode(
+        x["qkv_raw"],
+        x["conv_w"],
+        x["conv_pool"],
+        x["h_pool"],
+        x["read_indices"][:n],
+        x["w_fb"],
+        x["f_a"],
+        x["A_log"],
+        x["dt_bias"],
+        x["beta"],
+        accepted,
+        tokens_per_request=t,
+        num_heads=HV,
+        head_k_dim=K,
+        head_v_dim=V,
+        lower_bound=LOWER_BOUND,
+    )
 
 
 def _check_against_reference(x, out, write_indices, n, t, accepted):

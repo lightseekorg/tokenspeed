@@ -58,8 +58,10 @@ A draft model served by this drafter implements:
   at every depth), so the model keeps the default collective sizing and
   does NOT report ``global_bs`` through ``report_collective_sizing`` the
   way the Eagle-chain heads do.
-* ``get_embed_and_head()`` / ``set_embed_and_head(embed, head)``: the
-  embedding and LM head are shared from the target
+* ``get_embed_and_head()`` / ``set_embed_and_head(embed, head)`` (or
+  ``set_embed_and_head_module(embed, lm_head)``, which takes the target's
+  whole head, quantized or not): the embedding and LM head are shared from
+  the target
   (``shares_target_embed_head``); a draft needing a request-token-history
   view is refused at startup (``supports_request_token_history``).
 * ``checkpoint_weight_name_filter(name)`` plus ``load_weights`` mapping the
@@ -427,7 +429,11 @@ class Mtp(BaseDrafter):
 
     @override
     def idle_forward_global_num_tokens(
-        self, global_num_tokens: list[int], global_bs: list[int]
+        self,
+        global_num_tokens: list[int],
+        global_bs: list[int],
+        *,
+        global_num_decodes: list[int],
     ) -> list[list[int]]:
         # Every depth re-runs the target's rows (the k-window per decode
         # request, the prompt chunk on extend) — never one row per request.

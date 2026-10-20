@@ -67,7 +67,7 @@ def test_mm_reference_rejects_out_dtype_mismatch() -> None:
 def test_mi350_glm53_dense_fp8_decode_config(
     monkeypatch: pytest.MonkeyPatch, n: int, k: int
 ) -> None:
-    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm.triton")
+    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm._triton.fp8")
     monkeypatch.setattr(
         triton_gemm.Platform, "get", Mock(return_value=Mock(is_cdna4=True))
     )
@@ -92,7 +92,7 @@ def test_mi350_glm53_dense_fp8_decode_config(
 def test_mi350_narrow_dense_fp8_group_boundary(
     monkeypatch: pytest.MonkeyPatch, m: int, expected_group_size: int
 ) -> None:
-    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm.triton")
+    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm._triton.fp8")
     monkeypatch.setattr(
         triton_gemm.Platform, "get", Mock(return_value=Mock(is_cdna4=True))
     )
@@ -106,7 +106,7 @@ def test_mi350_narrow_dense_fp8_group_boundary(
 def test_mi350_short_k_dense_fp8_group_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm.triton")
+    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm._triton.fp8")
     monkeypatch.setattr(
         triton_gemm.Platform, "get", Mock(return_value=Mock(is_cdna4=True))
     )
@@ -137,7 +137,7 @@ def test_dense_fp8_tuning_falls_back_outside_gfx950_sweep(
     block_n: int,
     block_k: int,
 ) -> None:
-    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm.triton")
+    triton_gemm = importlib.import_module("tokenspeed_kernel.ops.gemm._triton.fp8")
     monkeypatch.setattr(
         triton_gemm.Platform, "get", Mock(return_value=Mock(is_cdna4=is_cdna4))
     )
@@ -242,13 +242,13 @@ def test_gluon_bmm_falls_back_for_fp32_output(device: str, require) -> None:
 
 
 def test_decode_gemv_writes_preallocated_output() -> None:
-    from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+    from tokenspeed_kernel.ops.gemm import mv
 
     x = torch.randn(2, 8)
     weight = torch.randn(4, 8)
     out = torch.empty(2, 4)
 
-    returned = decode_gemv(x, weight, out=out)
+    returned = mv(x, weight, out=out)
 
     assert returned.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out, x @ weight.t())
@@ -297,7 +297,7 @@ def test_linear_attnres_partials_portable_composition() -> None:
 
 
 def test_linear_attnres_partials_decode_fallback_uses_gemv(monkeypatch) -> None:
-    from tokenspeed_kernel.ops.gemm import triton_gemv
+    import tokenspeed_kernel.ops.gemm as gemm_api
 
     hidden = torch.randn(1, 6, dtype=torch.bfloat16)
     weight = torch.randn(9, 6, dtype=torch.bfloat16)
@@ -313,7 +313,7 @@ def test_linear_attnres_partials_decode_fallback_uses_gemv(monkeypatch) -> None:
     )
     expected = torch.empty(1, 9, dtype=torch.bfloat16)
     gemv = Mock(return_value=expected)
-    monkeypatch.setattr(triton_gemv, "decode_gemv", gemv)
+    monkeypatch.setattr(gemm_api, "mv", gemv)
 
     assert not linear_attnres_partials_available(
         hidden,
@@ -340,9 +340,7 @@ def test_linear_attnres_partials_decode_fallback_uses_gemv(monkeypatch) -> None:
 def test_linear_attnres_partials_cpu_skips_device_kernel_selection(
     monkeypatch,
 ) -> None:
-    module = importlib.import_module(
-        "tokenspeed_kernel.ops.gemm.linear_attnres_partials"
-    )
+    module = importlib.import_module("tokenspeed_kernel.ops.gemm")
     selector = Mock()
     monkeypatch.setattr(module, "select_kernel", selector)
     hidden = torch.randn(1, 6, dtype=torch.bfloat16)
@@ -713,18 +711,3 @@ def test_triton_fp8_scaled_mm_per_channel_matches_reference(
     expected = (a.float() * a_scales) @ (b.float() * b_scales).t()
     # FP32 accumulation, then BF16 output rounding.
     torch.testing.assert_close(out.float(), expected, rtol=2**-8, atol=5e-4)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-def test_grouped_bf16_projection_torch_writes_contiguous_einsum_result():
-    from tokenspeed_kernel.numerics.reference.gemm import (
-        grouped_bf16_projection_torch,
-    )
-
-    # Strided token rows from padded attention heads, as V4.1 wo_a reads them.
-    rows = torch.randn(37, 3 * 2 * 256, device="cuda").bfloat16()
-    x = rows[:, : 2 * 256].unflatten(1, (2, 256))
-    weight = torch.randn(2, 128, 256, device="cuda").bfloat16()
-    out = grouped_bf16_projection_torch(x, weight, None)
-    assert out.is_contiguous()
-    assert torch.equal(out, torch.einsum("tgd,grd->tgr", x, weight))

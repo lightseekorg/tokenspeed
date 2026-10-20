@@ -29,7 +29,7 @@ import site
 import sys
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import cache, lru_cache
 from pathlib import Path
 
 import torch
@@ -43,6 +43,7 @@ __all__ = [
     "CapabilityRequirement",
     "Platform",
     "current_platform",
+    "max_active_ctas",
     "prepare_cuda_toolkit_env",
 ]
 
@@ -378,6 +379,55 @@ def current_platform() -> PlatformInfo:
     return Platform.get()
 
 
+@cache
+def max_active_ctas(kernel) -> int:
+    """Return the resident CTAs per SM/CU for a compiled non-cluster kernel.
+
+    The driver accounts for the loaded kernel's registers, shared memory and
+    threads. Results are cached by the device-specific compiled specialization.
+
+    Args:
+        kernel: A compiled Triton or Gluon kernel with one CTA per cluster.
+
+    Returns:
+        The maximum number of simultaneously resident CTAs on one SM/CU.
+    """
+    kernel._init_handles()
+    if kernel.metadata.num_ctas != 1:
+        raise ValueError("CTA occupancy requires a non-cluster kernel")
+    backend = kernel.metadata.target.backend
+    if backend == "cuda":
+        library = ctypes.CDLL("libcuda.so.1")
+        query = library.cuOccupancyMaxActiveBlocksPerMultiprocessor
+    elif backend == "hip":
+        from tokenspeed_kernel._triton import get_hip_runtime_path
+
+        # Kernel handles belong to the runtime that loaded the Triton module.
+        library = ctypes.CDLL(get_hip_runtime_path())
+        query = library.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor
+    else:
+        raise ValueError(f"Unsupported occupancy backend: {backend}")
+    query.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_size_t,
+    ]
+    query.restype = ctypes.c_int
+    resident = ctypes.c_int()
+    status = query(
+        ctypes.byref(resident),
+        kernel.function,
+        kernel.metadata.num_warps * kernel.metadata.target.warp_size,
+        kernel.metadata.shared,
+    )
+    if status != 0 or resident.value < 1:
+        raise RuntimeError(
+            f"{backend} occupancy query failed: {status}, {resident.value}"
+        )
+    return resident.value
+
+
 _pdl_enabled: bool | None = None
 
 
@@ -393,16 +443,6 @@ def pdl_enabled(overwrite: bool | None = None) -> bool:
 # ---------------------------------------------------------------------------
 # Detection implementation
 # ---------------------------------------------------------------------------
-
-
-def _torch_version() -> tuple[int, ...]:
-    """Return PyTorch version as a comparable tuple, e.g. (2, 7, 0)."""
-    try:
-        import torch
-
-        return tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:3])
-    except Exception:
-        return (0, 0, 0)
 
 
 def _detect_platform() -> PlatformInfo:

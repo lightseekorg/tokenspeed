@@ -74,7 +74,9 @@ def _resolve_qcp_size(tp_size: int, qcp_size: int) -> int:
     it adds no world-size dimension. The shard spans the whole group (1 is
     off): a partial shard would leave the ranks holding the same rows strided
     by the shard width, which no group here (the head group, the KVP group)
-    is built with, and ``validate_qcp`` pins the server to the same rule.
+    is built with. This is the one place the rule lives; the server's
+    ``validate_qcp`` and ``validate_context_parallel_roles`` cover what the
+    mapping cannot see (the engine role, the other parallel groups).
     """
     if isinstance(qcp_size, bool) or not isinstance(qcp_size, int) or qcp_size < 1:
         raise ValueError("qcp_size must be a positive integer")
