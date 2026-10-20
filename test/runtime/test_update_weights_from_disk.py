@@ -133,6 +133,7 @@ def _device_handle(runner, drafter=None) -> DeviceHandle:
 
 def _handler(device) -> RequestHandler:
     handler = RequestHandler.__new__(RequestHandler)
+    handler.memory_controller = None
     handler.send_func = mock.Mock()
     handler.server_args = mock.Mock(weight_version="v1", kvstore_storage_backend=None)
     handler._device = device

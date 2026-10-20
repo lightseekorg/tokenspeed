@@ -429,7 +429,14 @@ class RequestHandler:
                 # rendezvous blocks this thread too.
                 self._pending_weight_ops.append(recv_req)
             elif isinstance(recv_req, _WEIGHT_LOAD_OPS):
-                ok, msg = self._require_weight_version_for_l3_flush(recv_req)
+                refusal = (
+                    self.memory_controller.refuse_weight_load()
+                    if self.memory_controller is not None
+                    else None
+                )
+                ok, msg = (False, refusal) if refusal is not None else (True, "")
+                if ok:
+                    ok, msg = self._require_weight_version_for_l3_flush(recv_req)
                 if ok:
                     ok, msg = self._require_flush_for_l3_version_switch(recv_req)
                 if not ok:
@@ -464,6 +471,11 @@ class RequestHandler:
     # ------------------------------------------------------------------
     # Internal control ops (online expert rebalance)
     # ------------------------------------------------------------------
+
+    @property
+    def has_pending_weight_ops(self) -> bool:
+        """Whether a queued frontend/internal op can still touch model memory."""
+        return bool(self._pending_weight_ops or self._pending_internal_ops)
 
     def set_internal_op_completer(self, completer: InternalOpCompleter) -> None:
         """Install the owner of the internal ops (once, at startup)."""
