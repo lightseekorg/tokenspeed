@@ -267,6 +267,8 @@ backend serves the layer. A per-token-head cache keeps the activation dtype.
 MXFP8 is a GQA format for 128-wide key and value heads. FP8 per-token-head is
 an MLA format.
 
+Ascend native DSA exposes BF16 KV cache storage in the runtime.
+
 ## MLA shapes
 
 Absorbed attention reads the latent cache. Its query's non-RoPE part is
@@ -319,3 +321,22 @@ rest. A trait the kernel does not declare admits every value, so declare each
 behavioral trait (`has_norm`, `mrope`, `return_kv`, `expanded`, and the rest)
 the kernel does not implement for every value. An `override` naming a kernel
 this platform cannot run, or whose traits exclude the request, raises.
+
+## Ascend native DSA model components
+
+`tokenspeed.runtime.layers.attention.dsa.ascend` owns `AscendDSAAttention`,
+`AscendDSAIndexer`, prepared `FusedDSADecode` and bit-preserving projection
+weight layouts. Models supply their configuration, projection dimensions and
+explicit independent-selection/separate-projection choices. The shared module
+has no dependency on model extensions.
+
+The native decode ABI currently supports DCP8, draft8, hidden width 4096,
+64 global index heads and eight local attention heads. Its supported gathered
+row counts are 64/128/256/512. The prepared prologue owns normalization,
+optional independent MLA/indexer RoPE and BF16 cache writes;
+the existing paged backend owns sparse selection and attention. Unsupported
+execution shapes fail instead of selecting another projection path.
+
+Device projection format conversion stays behind the kernel-package adapter.
+Preparing a weight allocates fresh NZ29 storage without changing coefficients
+or dtype; graph execution consumes the prepared buffers and communication state.

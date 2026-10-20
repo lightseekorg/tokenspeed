@@ -89,6 +89,10 @@ from tokenspeed.runtime.cache.l2.sizing import (
     RetractionPoolRequest,
     tail_lcm_blocks_per_request,
 )
+from tokenspeed.runtime.distributed.nccl_suspend import (
+    resume_nccl_communicators,
+    suspend_nccl_communicators,
+)
 from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.epd.recv_pool import recv_pool_bytes
 from tokenspeed.runtime.execution.types import (
@@ -796,16 +800,59 @@ class DeviceHandle:
         self._thread.submit(_logged)
         return None
 
-    def run_kv_repair(self) -> None:
-        """Zero the KV arena after a memory-saver wake re-maps its storage.
+    # ------------------------------------------------------------------
+    # Memory-saver release/wake (see engine/memory_occupation.py)
+    # ------------------------------------------------------------------
 
-        Re-mapped memory holds garbage. The draft pool names the same arena,
-        so clearing the target's clears both — walking two pools only cleared
-        it twice. FP8 KV scales ride with the weights region and need no
-        reset.
+    def synchronize(self) -> None:
+        """Wait for all device work before a memory region is unmapped."""
+        self._thread.run(self._executor.device_module.synchronize)
+
+    def prepare_kv_release(self) -> None:
+        """Quiesce everything that can touch the KV arena before it is unmapped.
+
+        The arena's own copy streams (sparse KV offload) and the device are
+        synchronized, then the arena is deregistered from the PD transfer
+        engine: a registration pins the physical pages the release frees.
+        """
+        arena = self._executor.token_to_kv_pool.arena
+        device_module = self._executor.device_module
+        kv_transfer = self._kv_transfer
+
+        def _prepare() -> None:
+            arena.synchronize()
+            device_module.synchronize()
+            if kv_transfer is not None:
+                kv_transfer.release_cache_registration()
+
+        self._thread.run(_prepare)
+
+    def finish_kv_resume(self) -> None:
+        """Repair the KV arena after a memory-saver wake re-maps its storage.
+
+        Re-mapped memory holds garbage, so the arena is zeroed first. The
+        draft pool names the same arena, so clearing the target's clears both.
+        FP8 KV scales ride with the weights region and need no reset. The
+        arena then goes back to the PD transfer engine, which registers the
+        new physical pages.
         """
         pool = self._executor.token_to_kv_pool
-        self._thread.run(pool.clear_kv_buffers)
+        kv_transfer = self._kv_transfer
+
+        def _finish() -> None:
+            pool.clear_kv_buffers()
+            if kv_transfer is not None:
+                kv_transfer.restore_cache_registration()
+
+        self._thread.run(_finish)
+
+    def suspend_nccl(self) -> None:
+        """Free the NCCL communicators' buffers; they stay usable after resume."""
+        self._thread.run(suspend_nccl_communicators)
+
+    def resume_nccl(self) -> None:
+        """Restore the NCCL communicators suspended by :meth:`suspend_nccl`."""
+        self._thread.run(resume_nccl_communicators)
 
     def run_remote_prefill_landing(
         self,
@@ -1093,6 +1140,11 @@ def _cudagraph_probe_refusal(server_args: ServerArgs) -> str | None:
         return "--disable-cudagraph-memory-reserve is set"
     if server_args.enforce_eager:
         return "--enforce-eager captures no graphs"
+    if server_args.enable_memory_saver:
+        # torch_memory_saver 0.0.9 cannot dispose a tagged graph pool and then
+        # capture again: empty_cache in the next capture fails with an invalid
+        # CUDA free. Keep the serving capture, without a throwaway probe.
+        return "memory saver cannot discard a tagged CUDA-graph probe pool"
     return None
 
 

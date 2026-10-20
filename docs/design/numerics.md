@@ -384,6 +384,18 @@ exact conversion) instead of materializing an fp32 copy of the `[rows, vocab]`
 tensor first; because both paths go through the one function, whatever
 rounding the kernel applies is applied to both.
 
+Vocabulary-parallel argmax packs the shard maximum and its global index into
+an int64 key, reduced with MAX over the vocabulary group. This portable Triton
+kernel runs on CUDA, ROCm and Ascend; signed zeros have one canonical key so
+ties select the lowest global index. Ascend prepares this state before graph
+capture and uses HCCL for the reduction. Full-vocabulary callers retain the
+ordinary gather, dtype and sampling arithmetic above.
+
+Accepted stop tokens and length limits are applied on the device before
+recurrent-state commit and accepted-frontier updates. Ascend uses the same
+Triton stop-condition kernel during eager and NPUGraph execution; the scalar
+reference is kept off captured device streams.
+
 Top-k alternatives (`top_logprobs_num`, `torch` order only) follow the same
 rule: `top_token_logprobs`, beside it, takes a row's `top_k` largest entries
 of that fp32 log-softmax for the prompt rows and the prefill-sampled rows

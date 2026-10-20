@@ -310,21 +310,24 @@ def _compact_dcp_pages_ascend(
 ):
     # The Ascend Triton launcher for this kernel initializes a lock with
     # synchronous rtMemcpy. That launcher cannot execute during graph capture.
-    # Sort valid source columns, then gather into contiguous output positions;
-    # native device operations keep this path capture-safe and preserve order.
+    # An inclusive owner scan gives stable destinations without sorting.
+    # Invalid pages receive the remaining, also unique, destinations so scatter
+    # writes each output element once and clears every unused table entry.
     cols = torch.arange(table.shape[1], device=table.device, dtype=torch.int64)
     blocks = table // subpages
     valid = (blocks > 0) & (blocks < virtual_block_count)
     valid &= (blocks - 1) % degree == rank
     if page_prefix is None:
         valid &= cols[None, :] * page_size < lengths[:, None]
-    else:
+    prefix = valid.cumsum(1, dtype=torch.int32)
+    if page_prefix is not None:
         page_prefix[:, 0].zero_()
-        page_prefix[:, 1:].copy_(valid.cumsum(1, dtype=torch.int32))
-    order = torch.where(valid, cols[None, :], table.shape[1]).sort(1).values
+        page_prefix[:, 1:].copy_(prefix)
+    destinations = torch.where(
+        valid, prefix - 1, prefix[:, -1:] + cols[None, :] - prefix
+    )
     local_pages = ((blocks - 1) // degree + 1) * subpages + table % subpages
-    packed = local_pages.gather(1, order.clamp_max(table.shape[1] - 1))
-    out.copy_(torch.where(order < table.shape[1], packed, 0))
+    out.scatter_(1, destinations.to(torch.int64), torch.where(valid, local_pages, 0))
     visible = (lengths[:, None] - cols[None, :] * page_size).clamp(0, page_size)
     local_lengths.copy_(torch.where(valid, visible, 0).sum(1))
 

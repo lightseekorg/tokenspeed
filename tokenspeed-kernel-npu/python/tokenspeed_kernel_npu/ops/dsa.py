@@ -78,31 +78,128 @@ class AscendDSAKernels:
         self._attention = getattr(
             torch.ops.custom, "npu_sparse_flash_attention_decode", None
         )
-        self._select_local = getattr(
-            torch.ops.custom, "npu_select_local_topk_indices", None
-        )
-        self._merge_partials = getattr(
-            torch.ops.custom, "npu_kvp_attention_merge", None
-        )
         if self._index is None or self._attention is None:
             raise RuntimeError(
                 "LongCatDSA needs LightningIndexer and "
                 "SparseFlashAttentionDecode operators"
             )
         self._full_scan_chunks = {}
+        self._identity_rotary = {}
 
     interleave_rope = staticmethod(interleave_rope)
 
-    def require_context_parallel(self):
-        missing = []
-        if self._select_local is None:
-            missing.append("SelectLocalTopkIndices")
-        if self._merge_partials is None:
-            missing.append("KvpAttentionMerge")
+    @staticmethod
+    def prepare_projection_weight(value):
+        """Copy a projection carrier into fresh NPU NZ29 storage.
+
+        The returned tensor preserves the input shape, dtype and coefficients;
+        it owns storage independent of the input. Internal-format allocation
+        is disabled again when preparation finishes.
+        """
+        import torch_npu
+
+        # Allocate a fresh 2D storage descriptor before the NZ conversion.
+        plain = torch.empty(tuple(value.shape), dtype=value.dtype, device="npu")
+        plain.copy_(value)
+        # This TorchNPU option has a setter but no readable attribute.
+        # The existing weight loader leaves it disabled after preparing NZ.
+        try:
+            torch.npu.config.allow_internal_format = True
+            result = torch_npu.npu_format_cast(plain, 29)
+            if torch_npu.get_npu_format(result) != 29:
+                raise RuntimeError(
+                    "DSA projection weight conversion did not produce NZ29"
+                )
+            return result
+        finally:
+            torch.npu.config.allow_internal_format = False
+
+    def fused_prolog(self, *args, rotary=None):
+        """Fused projections/store, optionally GPT-J RoPE (MLA=1, Indexer=2).
+
+        ``rotary`` carries int64 positions, an FP32 [P,64] cos/sin table,
+        and the explicit bit mask. Omitting it leaves projections unrotated.
+        """
+        if rotary is None:
+            x = args[0]
+            key = (x.device, x.shape[0])
+            if key not in self._identity_rotary:
+                self._identity_rotary[key] = (
+                    torch.zeros(x.shape[0], dtype=torch.int64, device=x.device),
+                    torch.zeros((1, 64), dtype=torch.float32, device=x.device),
+                    0,
+                )
+            rotary = self._identity_rotary[key]
+        return torch.ops.custom.npu_dsa_prolog_fused(*args, *rotary)
+
+    def initialize_prolog_window(self, rank, rendezvous, *, rank_size):
+        name = "dsa_prolog_fused"
+        torch.ops.custom.initialize_group_first_rdma(
+            name, rank, rank_size, rendezvous, 32 << 20
+        )
+        return torch.ops.custom.dsa_prolog_window(name)
+
+    def finalize_prolog_window(self):
+        torch.ops.custom.finalize_group_first_rdma("dsa_prolog_fused")
+
+    def merge_topk_fused(self, indices, values, *, group, rank_size):
+        return torch.ops.custom.npu_dcp_merge_topk(
+            indices, values, group=group, rank_size=rank_size, sorted_input=True
+        )
+
+    def merge_lse_direct(
+        self, output, maximum, total, peer_inputs, *, group, rank_size, setup_mode
+    ):
+        return torch.ops.custom.npu_dsa_merge_lse_direct(
+            output, maximum, total, peer_inputs, group, rank_size, setup_mode
+        )
+
+    def output_projection_partial(self, output, w_vc, w_o):
+        return torch.ops.custom.npu_dsa_output_projection_partial(output, w_vc, w_o)
+
+    def require_fused_context_parallel(self, *, rank_size, num_heads):
+        """Validate topology against the installed operators without device work."""
+        missing = [
+            name
+            for name in ("npu_dcp_merge_topk", "npu_dsa_merge_lse_direct")
+            if getattr(torch.ops.custom, name, None) is None
+        ]
         if missing:
             raise RuntimeError(
-                "Ascend DSA context parallelism needs " + ", ".join(missing)
+                "Ascend DSA CP requires fused operators: " + ", ".join(missing)
             )
+        # Meta executes the native ABI's shape/topology checks without allocating
+        # NPU buffers or touching a communicator. Keep its limits at that boundary.
+        rows = 64
+        group = "tokenspeed-dsa-contract"
+        indices = torch.empty((rows, 1, 2048), dtype=torch.int32, device="meta")
+        scores = torch.empty_like(indices, dtype=torch.bfloat16)
+        output = torch.empty((num_heads, rows, 512), dtype=torch.float32, device="meta")
+        statistics = torch.empty(
+            (1, rows, num_heads), dtype=torch.float32, device="meta"
+        )
+        peers = torch.empty(rank_size, dtype=torch.int64, device="meta")
+        try:
+            self.merge_topk_fused(indices, scores, group=group, rank_size=rank_size)
+            self.merge_lse_direct(
+                output,
+                statistics,
+                statistics,
+                peers,
+                group=group,
+                rank_size=rank_size,
+                setup_mode=0,
+            )
+        except NotImplementedError as exc:
+            raise RuntimeError(
+                "Installed Ascend DSA fused operators provide no Meta "
+                "implementation; upgrade the flash_ops binding"
+            ) from exc
+        except RuntimeError as exc:
+            raise ValueError(
+                f"Installed Ascend DSA fused operators reject CP{rank_size} "
+                f"with {num_heads} heads: {exc}"
+            ) from exc
 
     def _full_scan_chunk_hints(self, indices):
         """Stable scheduling hints for SFAD's full 2048-entry scan.
@@ -182,7 +279,11 @@ class AscendDSAKernels:
         local_counts,
         *,
         sparse_mode,
+        visible_lengths=None,
     ):
+        optional = {}
+        if visible_lengths is not None:
+            optional["visible_lengths"] = visible_lengths
         result, values = self._index(
             query.contiguous(),
             key,
@@ -199,13 +300,9 @@ class AscendDSAKernels:
             pre_tokens=9223372036854775807,
             next_tokens=9223372036854775807,
             return_value=True,
+            **optional,
         )
         return result, values
-
-    def select_local(self, local_indices, global_positions, rank):
-        if self._select_local is None:
-            raise RuntimeError("LongCat DSA CP needs SelectLocalTopkIndices")
-        return self._select_local(local_indices, global_positions, rank)
 
     def attention(
         self,
@@ -255,8 +352,15 @@ class AscendDSAKernels:
         scale,
         *,
         sparse_mode,
+        out=None,
     ):
-        output, softmax_max, softmax_sum = self._attention(
+        operation = self._attention if out is None else self._attention.out
+        outputs = (
+            {}
+            if out is None
+            else dict(out=out[0], softmax_max=out[1], softmax_sum=out[2])
+        )
+        output, softmax_max, softmax_sum = operation(
             packed_query,
             key,
             key,
@@ -277,10 +381,102 @@ class AscendDSAKernels:
             attention_mode=2,
             return_softmax_lse=True,
             sparse_prep_mode=1,
+            **outputs,
         )
         return output, softmax_max, softmax_sum
 
-    def merge_partials(self, output, lse):
-        if self._merge_partials is None:
-            raise RuntimeError("LongCat DSA CP needs KvpAttentionMerge")
-        return self._merge_partials(output, lse)
+
+def dsa_cp_metadata(
+    table,
+    lengths,
+    *,
+    page_size,
+    block_granularity,
+    virtual_block_count,
+    degree,
+    rank,
+    initial_tokens,
+    window_tokens,
+    query_width,
+    query_group_size,
+    slots,
+    out,
+    local_lengths,
+    initial_counts,
+    window_counts,
+    query_ends,
+    index_table,
+    index_lengths,
+    index_initial_counts,
+    index_query_ends,
+    local_slots,
+):
+    """Write causal query metadata, grouped Indexer metadata and local slots.
+
+    Let ``B, P = table.shape``, ``R = B * query_width`` and
+    ``N = R // query_group_size``. All buffers live on ``table.device``.
+
+    Args:
+        table: INT32 kernel-page IDs, shape [B, P], with contiguous columns.
+        lengths: Contiguous INT32 global sequence ends, shape [B].
+        page_size: Tokens in one kernel page.
+        block_granularity: Tokens in one ownership block; a positive multiple
+            of page_size. Block zero is reserved and has no owner.
+        virtual_block_count: Ownership-block capacity, including block zero.
+        degree: Number of ranks sharing the cache.
+        rank: This rank's group-relative index, in [0, degree).
+        initial_tokens: Global prefix extent whose owned tokens are counted.
+        window_tokens: Trailing global extent whose owned tokens are counted.
+        query_width: Positive queries per request. For width W > 1, candidate i
+            sees max(1, lengths[b] - W + 1 + i); width one preserves lengths.
+        query_group_size: Positive contiguous query rows per Indexer group;
+            must divide R. Each group takes its last row's page/length metadata.
+        slots: Optional contiguous INT32/INT64 global token-slot addresses.
+            Its shape is independent of the query metadata row count.
+        out: INT32 [R, P] compact local page tables, with unused entries zeroed.
+        local_lengths: INT32 [R] visible owned-token counts per query.
+        initial_counts: INT32 [R] visible owned tokens in the initial prefix.
+        window_counts: INT32 [R] visible owned tokens in the trailing window.
+        query_ends: INT32 [R] cumulative query ends, 1 through R.
+        index_table: INT32 [N, P] grouped local page tables.
+        index_lengths: INT32 [N] grouped visible owned-token counts.
+        index_initial_counts: INT32 [N] grouped initial-prefix counts.
+        index_query_ends: INT32 [N] cumulative ends G, 2G, ..., R, where
+            G = query_group_size.
+        local_slots: Optional contiguous INT64 buffer matching slots.shape.
+            Owned addresses are translated to local storage; null, invalid or
+            foreign slots become -1. Pass both slot buffers as None to omit them.
+
+    Returns:
+        None. Caller-provided output buffers are overwritten in place. They
+        must be contiguous, must not overlap inputs or one another, and must
+        remain alive throughout any graph that captures this launch.
+    """
+    import flash_ops  # noqa: F401
+
+    if page_size <= 0 or block_granularity % page_size:
+        raise ValueError("DSA ownership blocks must contain whole kernel pages")
+    torch.ops.custom.npu_kvp_metadata.dsa_out(
+        table,
+        lengths,
+        page_size,
+        block_granularity // page_size,
+        virtual_block_count,
+        degree,
+        rank,
+        initial_tokens,
+        window_tokens,
+        query_width,
+        query_group_size,
+        slots,
+        out=out,
+        local_lengths=local_lengths,
+        initial_counts=initial_counts,
+        window_counts=window_counts,
+        query_ends=query_ends,
+        index_table=index_table,
+        index_lengths=index_lengths,
+        index_initial_counts=index_initial_counts,
+        index_query_ends=index_query_ends,
+        local_slots=local_slots,
+    )

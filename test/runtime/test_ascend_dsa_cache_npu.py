@@ -21,13 +21,14 @@
 
 """NPU DCP writes and Graph replay against physically sharded storage."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
-    _AscendCachePlacement,
+    AscendDSABackend,
     _AscendDSAContextParallel,
-    ascend_cache_write_slots,
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
@@ -39,32 +40,139 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_shared_write_slots_recompute_on_graph_replay():
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("width", [1, 2, 4, 8])
+def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
+    from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
+
+    class CheckedKernels(AscendDSAKernels):
+        def index(self, query, key, weights, q_ends, lengths, table, *policy):
+            # Fail before a native launch if request rows reach per-query ops.
+            assert q_ends.numel() == lengths.numel() == table.shape[0] == query.shape[0]
+            return super().index(query, key, weights, q_ends, lengths, table, *policy)
+
     torch.npu.set_device(0)
-    placement = _AscendCachePlacement(128, 17, tuple(range(8)), 1)
-    slots = torch.tensor([128, 256, 0, 257], dtype=torch.int64, device="npu")
+    page, heads, prefix_rows = 128, 32, 1
+    rows = batch * width
+    host_pages = torch.tensor([[4, 2, 7], [6, 3, 5]][:batch], dtype=torch.int32)
+    # Include an extend row so the decode slice cannot accidentally use row zero.
+    table = torch.cat((torch.ones(1, 3, dtype=torch.int32), host_pages)).npu()
+    endpoints = torch.tensor([129, 257][:batch], dtype=torch.int32)
+    lengths = torch.cat((torch.tensor([20], dtype=torch.int32), endpoints)).npu()
+    host_kv = torch.zeros(8, page, 1, 576, dtype=torch.bfloat16)
+    for request, pages in enumerate(host_pages.tolist()):
+        values = torch.arange(3 * page, dtype=torch.float32) + request * 400
+        host_kv[pages, :, 0, :512] = values.bfloat16().view(3, page, 1)
+    kv_cache = host_kv.npu()
+    index_cache = torch.full((8, page, 1, 128), -99, dtype=torch.bfloat16, device="npu")
+    query = torch.zeros(rows, heads, 576, dtype=torch.bfloat16, device="npu")
+    index_query = torch.zeros(rows, 16, 128, dtype=torch.bfloat16, device="npu")
+    weights = torch.zeros(rows, 16, dtype=torch.bfloat16, device="npu")
+    index_keys = torch.arange(1, rows + 1, dtype=torch.bfloat16).view(rows, 1, 1)
+    index_keys = index_keys.expand(rows, 1, 128).contiguous().npu()
 
-    def forward():
-        placement.write_slots.clear()
-        first = ascend_cache_write_slots(slots, placement)
-        for _ in range(12):
-            assert ascend_cache_write_slots(slots[:], placement) is first
-        return first
+    def physical_slots(ends, pages):
+        positions = torch.stack([torch.arange(int(n) - width, int(n)) for n in ends])
+        return (
+            pages.gather(1, positions // page).long() * page + positions % page
+        ).flatten()
 
-    for _ in range(3):
-        forward()
+    locations = physical_slots(endpoints, host_pages).npu()
+
+    # The model, dense leaf and scheduler are absent; execute the real Ascend
+    # forward, metadata kernel, Indexer and SFA against these owned cache buffers.
+    backend = object.__new__(AscendDSABackend)
+    backend.kernel_page_size = page
+    backend.spec_num_tokens = width
+    backend.step_counter = None
+    backend.kvp_group = (0,)
+    backend._ascend_placement = None
+    backend._fused_group = None
+    backend._indexer_spec = SimpleNamespace(
+        index_head_dim=128,
+        index_topk=2048,
+        kv_cache_dim=576,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    backend._indexer_kernels = CheckedKernels()
+    backend._dcp = _AscendDSAContextParallel(
+        degree=1, rank=0, ranks=(0,), virtual_block_count=None
+    )
+    backend._dcp.allocate_decode_buffers(rows, 3, "npu")
+    backend._dense_backend = SimpleNamespace(
+        forward_decode_metadata=SimpleNamespace(
+            num_extends=prefix_rows, seq_lens=lengths, page_table=table
+        )
+    )
+    pool = SimpleNamespace(
+        get_component=lambda *args: index_cache,
+        get_key_buffer=lambda *args: kv_cache,
+    )
+    layer = SimpleNamespace(layer_id=0, scaling=576**-0.5, logit_cap=0)
+
+    def run():
+        backend._clear_forward_scratch()
+        return backend.forward_decode(
+            query,
+            None,
+            None,
+            layer,
+            locations,
+            pool,
+            batch,
+            index_key=index_keys,
+            index_query=index_query,
+            index_weights=weights,
+            index_init_tokens=0,
+            index_local_tokens=0,
+            index_cache_written=False,
+        )
+
+    def check(actual, ends, pages):
+        causal = torch.stack(
+            [torch.arange(int(n) - width + 1, int(n) + 1) for n in ends]
+        )
+        assert backend._dcp.seq_lens.cpu().tolist() == causal.flatten().tolist()
+        assert backend._dcp.query_ends.cpu().tolist() == list(range(1, rows + 1))
+        slots = physical_slots(ends, pages)
+        assert torch.equal(backend._dcp.write_slots.cpu(), slots)
+        written = index_cache.view(-1, 128)[slots.npu()].cpu()
+        torch.testing.assert_close(
+            written, index_keys.cpu().view(rows, 128), rtol=0, atol=0
+        )
+        assert (index_cache[0].cpu() == -99).all()
+        actual = actual.cpu().view(rows, heads, 512)
+        for row, end in enumerate(causal.flatten().tolist()):
+            request = row // width
+            history = host_kv[pages[request].long()].reshape(-1, 576)[:end, :512]
+            expected = history.double().mean(0).float().expand(heads, -1)
+            torch.testing.assert_close(
+                actual[row].float(), expected, rtol=4e-3, atol=1e-3
+            )
+
+    for _ in range(2):
+        eager = run()
     torch.npu.synchronize()
+    check(eager, endpoints, host_pages)
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
-        result = forward()
-    for values, expected in (
-        ([128, 256, 0, 257], [-1, 128, -1, 129]),
-        ([258, 1280, -1, 1281], [130, 256, -1, 257]),
-    ):
-        slots.copy_(torch.tensor(values, device="npu"))
+        replayed = run()
+    pointers = (backend._dcp.page_table.data_ptr(), backend._dcp.seq_lens.data_ptr())
+    for changed in (False, True, False):
+        ends = endpoints + 5 if changed else endpoints
+        pages = host_pages.flip(0) if changed else host_pages
+        lengths[prefix_rows:].copy_(ends)
+        table[prefix_rows:].copy_(pages)
+        locations.copy_(physical_slots(ends, pages))
         graph.replay()
         torch.npu.synchronize()
-        assert result.cpu().tolist() == expected
+        check(replayed, ends, pages)
+        assert (
+            backend._dcp.page_table.data_ptr(),
+            backend._dcp.seq_lens.data_ptr(),
+        ) == pointers
+    graph.reset()
 
 
 @pytest.mark.parametrize("rank", [0, 1, 7])
@@ -95,7 +203,6 @@ def test_dcp_local_storage_replay(rank, block_size):
         degree=degree,
         rank=rank,
         ranks=tuple(range(degree)),
-        auxiliary_namespace="test_dcp_cache",
         virtual_block_count=virtual_count,
     )
     dcp.allocate_decode_buffers(8, table.shape[1], "npu")
@@ -115,6 +222,9 @@ def test_dcp_local_storage_replay(rank, block_size):
                 block_granularity=block_size,
                 init_tokens=131,
                 local_tokens=129,
+                query_width=1,
+                query_group_size=1,
+                slots=None,
             )
         return local
 
@@ -175,19 +285,18 @@ def test_dcp_local_storage_replay(rank, block_size):
 
 
 @pytest.mark.parametrize("endpoint", [64, 6144])
-def test_dcp_topk_and_lse_match_unsharded_attention(endpoint):
-    """Run eight physical shards on one NPU, with actual selection/merge ops.
+def test_dcp_metadata_feeds_indexer_and_sparse_attention(endpoint):
+    """Feed actual Indexer/SFA from eight local metadata shards on one NPU.
 
-    Concatenation supplies collective contents here; the distributed serving
-    smoke separately exercises HCCL. Strictly ordered index scores make the
-    global selected set independently checkable, including seven empty shards.
+    CPU reference selection and merging supply collective contents here. The
+    production path uses fused distributed TopK/LSE; no legacy CP kernels are
+    required by this metadata regression.
     """
     from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
 
     torch.npu.set_device(0)
     torch.manual_seed(981016)
     kernels = AscendDSAKernels()
-    kernels.require_context_parallel()
     degree, block_size, page, width, topk = 8, 256, 128, 8, 2048
     blocks = list(range(24, 0, -1))
     pages = [b * 2 + s for b in blocks for s in range(2)]
@@ -232,7 +341,6 @@ def test_dcp_topk_and_lse_match_unsharded_attention(endpoint):
             degree=degree,
             rank=rank,
             ranks=tuple(range(degree)),
-            auxiliary_namespace="test_dcp_ops",
             virtual_block_count=25,
         )
         dcp.refresh_metadata(
@@ -242,6 +350,9 @@ def test_dcp_topk_and_lse_match_unsharded_attention(endpoint):
             block_granularity=block_size,
             init_tokens=0,
             local_tokens=0,
+            query_width=1,
+            query_group_size=1,
+            slots=None,
         )
         meta = dcp.metadata(start=0, end=width)
         ix, score = kernels.index_partial(
@@ -268,7 +379,21 @@ def test_dcp_topk_and_lse_match_unsharded_attention(endpoint):
     scale = 576**-0.5
     for rank in range(degree):
         meta = metadata[rank]
-        selected, chunks = kernels.select_local(indices[rank], global_positions, rank)
+        # Reference the fused TopK result's rank-major candidate offsets. This
+        # is test input construction, not another production execution path.
+        positions_cpu = global_positions.cpu().long() - rank * topk
+        owned = (positions_cpu >= 0) & (positions_cpu < topk)
+        chosen = (
+            indices[rank].cpu().squeeze(1).gather(1, positions_cpu.clamp(0, topk - 1))
+        )
+        selected_cpu = torch.full((width, 1, topk), -1, dtype=torch.int32)
+        chunk_counts = []
+        for row in range(width):
+            valid = chosen[row][owned[row] & (chosen[row] >= 0)]
+            selected_cpu[row, 0, : valid.numel()] = valid
+            chunk_counts.append((valid.numel() + 127) // 128)
+        selected = selected_cpu.npu()
+        chunks = torch.tensor(chunk_counts, dtype=torch.int32, device="npu")
         for row, n in enumerate(lengths.cpu().tolist()):
             logical = [
                 p for p in range(n) if (pages[p // page] // 2 - 1) % degree == rank
@@ -290,12 +415,14 @@ def test_dcp_topk_and_lse_match_unsharded_attention(endpoint):
             scale,
             sparse_mode=3,
         )
-        outputs.append(out.reshape(64 * width, 512))
-        lses.append((maximum + total.log()).squeeze(0).transpose(0, 1).reshape(-1))
-    actual = kernels.merge_partials(
-        torch.stack(outputs).contiguous(), torch.stack(lses).contiguous()
-    )
-    actual = actual.view(64, width, 512).transpose(0, 1).cpu().float()
+        outputs.append(out.reshape(64 * width, 512).cpu().float())
+        lses.append(
+            (maximum + total.log()).squeeze(0).transpose(0, 1).reshape(-1).cpu().float()
+        )
+    stacked_lse = torch.stack(lses)
+    weights = torch.softmax(stacked_lse, dim=0)
+    actual = (torch.stack(outputs) * weights[:, :, None]).sum(0)
+    actual = actual.view(64, width, 512).transpose(0, 1)
     for row, n in enumerate(lengths.cpu().tolist()):
         selected = list(range(max(0, n - topk), n))
         assert sorted(selected_positions[row]) == selected

@@ -58,7 +58,42 @@ __all__ = [
     "prepare_nvfp4_routing",
     "routed_input_scale_rmsnorm_sum",
     "routed_input_scale_rmsnorm_sum_gathered",
+    "prepare_sm90_fp8_moe",
 ]
+
+
+def prepare_sm90_fp8_moe(
+    *,
+    mode: Literal["default", "expected_m", "optimized"],
+    max_num_stages_fc1: int = -1,
+    max_num_stages_fc2: int = -1,
+) -> Callable:
+    """Prepare an explicit FlashInfer block-FP8 MoE implementation at init.
+
+    Args:
+        mode: ``default`` binds the installed FlashInfer implementation.
+            ``expected_m`` binds the SM90 per-call load-hint backport.
+            ``optimized`` adds tile-prefix and direct tile-to-expert lookup.
+        max_num_stages_fc1: Optional FC1 grouped GEMM pipeline stage limit. ``-1`` keeps
+            upstream selection; a positive integer of at least four caps the
+            supported FC1 candidates. Requires a private mode.
+        max_num_stages_fc2: Independent FC2 pipeline stage limit, with the
+            same semantics and default as ``max_num_stages_fc1``.
+
+    Returns:
+        A callable accepting FlashInfer's ``cutlass_fused_moe`` arguments and
+        returning its output list. Private modes additionally accept a positive
+        uint32 ``expected_m`` or None. Callers compute that hint from their own
+        routing layout. Initialize before warmup and CUDA graph capture;
+        private modes require FlashInfer 0.7.2, Hopper, and a working JIT compiler.
+    """
+    from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_fused_moe
+
+    return make_cutlass_fused_moe(
+        mode=mode,
+        max_num_stages_fc1=max_num_stages_fc1,
+        max_num_stages_fc2=max_num_stages_fc2,
+    )
 
 
 # ===-----------------------------------------------------------------------===#

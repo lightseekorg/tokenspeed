@@ -283,7 +283,7 @@ def apply_stop_conditions(
         raise ValueError("apply_stop_conditions needs colocated tensors")
     if batch_size == 0:
         return
-    if not req_pool_indices.is_cuda:
+    if not req_pool_indices.is_cuda and req_pool_indices.device.type != "npu":
         _apply_stop_conditions_torch(
             req_pool_indices,
             output_tokens,
@@ -303,7 +303,9 @@ def apply_stop_conditions(
 
     _apply_stop_conditions_kernel[(triton.cdiv(batch_size, _BLOCK),)](
         req_pool_indices,
-        output_tokens,
+        # An unfinished prefill batch can owe no sample. Keep a valid pointer
+        # even when every token load is masked (also required by Ascend DMA).
+        output_tokens if output_tokens.numel() else accept_lengths,
         accept_lengths,
         input_lengths,
         # An empty extend span still needs a valid pointer.
