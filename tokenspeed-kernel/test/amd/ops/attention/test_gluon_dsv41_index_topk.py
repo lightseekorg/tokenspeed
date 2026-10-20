@@ -501,6 +501,24 @@ def test_index_query_planes_match_codec_and_padding(device, rows, heads, strided
         torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
 
+def test_index_query_planes_large_inner_stride(device):
+    stride = 1 << 25
+    elements = 191 * stride + 1
+    required_bytes = elements * torch.bfloat16.itemsize
+    if torch.cuda.mem_get_info(device)[0] < required_bytes + (256 << 20):
+        pytest.skip("requires space for a large-stride query view")
+    storage = torch.empty(elements, dtype=torch.bfloat16, device=device)
+    # Keep wrapped int32 reads in bounds so a regression fails by value.
+    storage.as_strided((192,), (stride,)).fill_(-17)
+    q = storage.as_strided((1, 1, 128), (0, 0, stride), storage_offset=64 * stride)
+    q.copy_(torch.arange(128, dtype=torch.bfloat16, device=device).view(1, 1, 128))
+    w = torch.ones(1, 1, dtype=torch.bfloat16, device=device)
+    expected = gluon_indexer._pack_index_q(q.contiguous(), w)
+    actual = gluon_indexer._pack_index_q(q, w)
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
 def test_index_query_planes_do_not_specialize_on_rows_or_row_strides(device):
     q = torch.randn(257, 32, 128, dtype=torch.bfloat16, device=device)
     w = torch.randn(257, 32, dtype=torch.bfloat16, device=device)
