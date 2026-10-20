@@ -251,3 +251,7 @@ def test_trtllm_lanes_match_reference(topk, steps, frozen, poison, kv_dtype):
     torch.testing.assert_close(
         out.view(-1, HQ, D).float().cpu(), ref, atol=ATOL[kv_dtype], rtol=2e-2
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))

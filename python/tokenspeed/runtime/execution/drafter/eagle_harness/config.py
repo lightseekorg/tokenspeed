@@ -25,7 +25,10 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, TypeVar
+
+import torch.distributed as dist
 
 from tokenspeed.runtime.execution.drafter.eagle_harness.cost import (
     CHAIN_RULE_MAX_BATCH_SIZE,
@@ -45,6 +48,7 @@ __all__ = [
     "chain_width_table",
     "check_chain_cost_domain",
     "decode_graph_floors",
+    "first_rank_value",
     "load_run_config",
     "validate_server_args",
 ]
@@ -249,6 +253,35 @@ def _routes_experts(hf_config) -> bool:
             for arch in getattr(hf_config, "architectures", None) or ()
         )
     )
+
+
+_T = TypeVar("_T")
+
+
+def first_rank_value(load: Callable[[], _T], group: dist.ProcessGroup | None) -> _T:
+    """``load()`` run by the first rank of ``group`` alone, its value (or the
+    exception it raised) the same on every rank: the harness files decide the
+    collectives a round runs, so the ranks must not read them apart.
+
+    Args:
+        load: Reads a harness file (cost data, a run config).
+        group: The ranks' CPU group of their own (None: this rank alone).
+
+    Returns:
+        ``load``'s value on the first rank.
+    """
+    if group is None:
+        return load()
+    payload: list = [None]
+    if dist.get_rank(group) == 0:
+        try:
+            payload[0] = load()
+        except Exception as exc:  # noqa: BLE001 — raised on every rank below
+            payload[0] = exc
+    dist.broadcast_object_list(payload, src=dist.get_global_rank(group, 0), group=group)
+    if isinstance(payload[0], Exception):
+        raise payload[0]
+    return payload[0]
 
 
 def load_run_config(path: str) -> dict:

@@ -70,6 +70,7 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.engine import scheduler_utils as scheduler_utils_module
 from tokenspeed.runtime.execution.device import DeviceHandle, EncoderModelFacts
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.forward_thread import ForwardThread
 from tokenspeed.runtime.execution.types import PlannedForward
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
@@ -1026,6 +1027,19 @@ def test_shutdown_cache_surfaces_a_failed_final_round_copy_without_a_host_cache(
         handle.shutdown_cache()
     assert list(handle._copy_submissions) == []
     assert list(handle._transfer_submissions) == []
+
+
+def test_shutdown_cache_finishes_the_last_pending_round_without_a_host_cache():
+    """With no Host cache to close, shutdown still runs a forward-thread task,
+    which finishes the last forward's pending draft round."""
+    pending = ["round"]
+    thread = ForwardThread(torch.device("cpu"), settle=pending.clear)
+    handle = DeviceHandle(SimpleNamespace(forward_thread=thread))
+    try:
+        handle.shutdown_cache()
+    finally:
+        thread.shutdown()
+    assert pending == []
 
 
 def test_cache_polling_without_kvstore_refuses_loudly():

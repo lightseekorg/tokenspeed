@@ -68,6 +68,7 @@ from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
     EagleHarnessConfig,
     chain_table_width,
     check_chain_cost_domain,
+    first_rank_value,
 )
 from tokenspeed.runtime.execution.drafter.eagle_harness.cost import load_cost_data
 from tokenspeed.runtime.execution.drafter.eagle_harness.device_chain import (
@@ -352,13 +353,22 @@ class EagleHarness(Eagle4):
         also starts its measurement), or the cost-data policy of the
         compute intensity, taken on the device."""
         harness = self.harness
+        mapping = self.draft_model_runner.mapping
+        # The harness files decide each round's collectives: the TP ranks take the first rank's read.
+        file_group = None
+        if mapping.attn.tp_size > 1:
+            pg_manager.init_process_group(
+                mapping.attn.tp_group, backend="gloo", name="eagle_harness_files"
+            )
+            file_group = pg_manager.get_process_group(
+                "gloo", mapping.attn.tp_group, name="eagle_harness_files"
+            )
         if harness.exec_mode == 2:
             if harness.eos_token_id is None:
                 raise ValueError(
                     "EAGLE-Harness exec mode 2 ends a measured batch with an EOS "
                     "token; the model declares none"
                 )
-            mapping = self.draft_model_runner.mapping
             self.measurement = CostMeasurement(
                 run_dir=harness.data_path,
                 tree_depth=depth,
@@ -367,6 +377,7 @@ class EagleHarness(Eagle4):
                     if mapping.attn.tp_size > 1
                     else None
                 ),
+                file_group=file_group,
                 rank=mapping.rank,
                 eos_token=harness.eos_token_id,
                 device=self.device,
@@ -379,7 +390,7 @@ class EagleHarness(Eagle4):
                 device=self.device,
             )
         cost_dir = f"{harness.data_path}/cost"
-        cost_data = load_cost_data(cost_dir)
+        cost_data = first_rank_value(lambda: load_cost_data(cost_dir), file_group)
         if harness.compute_intensity == "chain_intensity":
             check_chain_cost_domain(
                 sorted(cost_data),
@@ -398,6 +409,7 @@ class EagleHarness(Eagle4):
             benchmark_config=f"{harness.data_path}/config/benchmark_config.json",
             chain_width_table=harness.chain_width_table,
             device=self.device,
+            file_group=file_group,
         )
 
     def _allocate(

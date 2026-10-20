@@ -654,8 +654,6 @@ __global__ void tree_reject_sample_kernel(
     const int64_t* __restrict__ argmax, int32_t* __restrict__ path,
     int32_t* __restrict__ predicts, int32_t* __restrict__ accept_length,
     int64_t* __restrict__ last_row, int num_nodes, int num_slots, int nc, int vocab) {
-  const float PROBA_EPS = 1e-6f;
-  const float PROBA_OFFSET = 2e-6f;
   const int b = blockIdx.x;
   __shared__ int32_t s_parent[MAX_TREE_NODES];
   __shared__ int s_accept_child[MAX_TREE_NODES];
@@ -790,14 +788,17 @@ __global__ void tree_reject_sample_kernel(
       float total = 1.0f;
       while (child >= 0) {
         const int64_t child_token = tokens[(int64_t)b * num_nodes + child];
-        const float child_proba = p[child_token];
-        const float coin = coins[(int64_t)b * coins_stride + child];
-        if (child_proba > 0.0f && coin <= (child_proba + PROBA_OFFSET) / (total + PROBA_EPS)) {
-          accepted = child;
-          break;
+        if (static_cast<uint64_t>(child_token) < static_cast<uint64_t>(vocab)) {
+          const float child_proba = p[child_token];
+          // Accepts with probability p'(child) over the mass its rejected siblings left.
+          if (child_proba > 0.0f &&
+              coins[(int64_t)b * coins_stride + child] * total < child_proba) {
+            accepted = child;
+            break;
+          }
+          total = fmaxf(total - child_proba, 0.0f);
+          p[child_token] = 0.0f;
         }
-        total = fmaxf(total - child_proba, 0.0f);
-        p[child_token] = 0.0f;
         child = next_child(s_parent, node, child, num_nodes);
       }
     }

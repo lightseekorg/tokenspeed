@@ -64,7 +64,8 @@ register_cuda_ci(
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA GPU is required"
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="needs an NVIDIA GPU",
 )
 
 _DEVICE = torch.device("cuda")
@@ -686,6 +687,32 @@ def test_chain_width_table_beyond_the_chain_is_refused(tmp_path) -> None:
             depth=8,
             verify=16,
             table=_CHAIN_TABLE,
+        )
+
+
+@pytest.mark.parametrize(
+    "widths, exec_mode, match",
+    [
+        ([0, 63, 7], 0, "strictly increasing"),
+        ([0, 7, 7, 15], 0, "strictly increasing"),
+        ([0, 31, 63], 1, "within the verify budget 16"),
+    ],
+)
+def test_cost_widths_a_round_cannot_verify_are_refused(
+    tmp_path, widths: list[int], exec_mode: int, match: str
+) -> None:
+    """Widths out of order, or a batch cut wider than the verify budget, would
+    write past the verify tree."""
+    _write_cost_dir(
+        str(tmp_path), (1, 2, 4), widths, _DRAFT_WIDTHS, bs_slope=0.2, cliff=0.0
+    )
+    with pytest.raises(ValueError, match=match):
+        _policy(
+            load_cost_data(str(tmp_path / "cost")),
+            topk=4,
+            depth=8,
+            verify=16,
+            exec_mode=exec_mode,
         )
 
 

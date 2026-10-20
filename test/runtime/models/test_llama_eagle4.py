@@ -313,6 +313,16 @@ def test_eagle4_refuses_draft_structures_it_does_not_build(
         validate_draft_config(_nemotron_draft_config(**overrides))
 
 
+def test_eagle4_refuses_a_vocab_its_heads_would_pad(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vocab the LM heads pad to a multiple of 64 leaves zero rows a shard's
+    top-k could pick: the candidate head refuses it."""
+    config = _qwen38_draft_config(vocab_size=1000, draft_vocab_size=1000)
+    with pytest.raises(ValueError, match="unpadded vocab shards"):
+        _build_model(monkeypatch, config, "meta")
+
+
 def test_eagle4_draft_attends_without_rope_only_when_the_config_says_so(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -421,6 +431,7 @@ def test_eagle4_latent_moe_checkpoint_fills_every_parameter_from_its_tensor(
     "drop,error",
     [
         ("layers.0.mlp.experts.3.down_proj.weight", "expert tensors"),
+        ("layers.0.self_attn.k_proj.weight", r"qkv_proj.weight \(k\)"),
         ("layers.0.mlp.gate.e_score_correction_bias", "lacks"),
         ("layers.0.pre_attention_layernorm.weight", "lacks"),
         ("efficient_lm_head.weight", "lacks"),
@@ -434,6 +445,21 @@ def test_eagle4_refuses_an_incomplete_checkpoint(
     del weights[drop]
 
     with pytest.raises(ValueError, match=error):
+        model.load_weights(weights.items())
+
+
+def test_eagle4_refuses_an_expert_tensor_given_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One expert's tensor under two prefixes cannot stand in for another's."""
+    model = _build_model(monkeypatch, _nemotron_draft_config(), "meta")
+    weights = _nemotron_draft_checkpoint("layers.0.", "meta")
+    del weights["layers.0.mlp.experts.3.down_proj.weight"]
+    weights["midlayer.mlp.experts.2.down_proj.weight"] = weights[
+        "layers.0.mlp.experts.2.down_proj.weight"
+    ]
+
+    with pytest.raises(ValueError, match="repeats"):
         model.load_weights(weights.items())
 
 

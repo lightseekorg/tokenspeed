@@ -166,8 +166,8 @@ def test_measurement_counts_rounds_from_the_last_prefill_and_ends_with_eos(
         json.dump({"batch_size": 3}, f)
     ranks = [
         CostMeasurement(
-            run_dir=str(tmp_path), tree_depth=13, tp_group=None, rank=rank,
-            eos_token=7, device=torch.device("cuda"),
+            run_dir=str(tmp_path), tree_depth=13, tp_group=None, file_group=None,
+            rank=rank, eos_token=7, device=torch.device("cuda"),
         )  # fmt: skip
         for rank in (0, 1)
     ]

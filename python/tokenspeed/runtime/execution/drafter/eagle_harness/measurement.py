@@ -45,7 +45,10 @@ import os
 import torch
 import torch.distributed as dist
 
-from tokenspeed.runtime.execution.drafter.eagle_harness.config import load_run_config
+from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
+    first_rank_value,
+    load_run_config,
+)
 from tokenspeed.runtime.execution.drafter.eagle_harness.cost import (
     MeasureRecord,
     save_records,
@@ -181,7 +184,8 @@ class MeasurePolicy:
 
 class CostMeasurement:
     """Exec mode 2 sampling: the run's parameters, the round timers and the
-    recorded samples (rank 0 keeps and writes them)."""
+    recorded samples (rank 0 keeps and writes them). The TP ranks read the
+    driver's config through ``file_group`` (``first_rank_value``)."""
 
     def __init__(
         self,
@@ -189,6 +193,7 @@ class CostMeasurement:
         run_dir: str,
         tree_depth: int,
         tp_group,
+        file_group: dist.ProcessGroup | None,
         rank: int,
         eos_token: int,
         device: torch.device,
@@ -197,6 +202,7 @@ class CostMeasurement:
         self.config_path = os.path.join(run_dir, "config", "measure_config.json")
         self.tree_depth = tree_depth
         self.tp_group = tp_group
+        self.file_group = file_group
         self._barrier = torch.zeros((1,), dtype=torch.int32, device=device)
         self.recorder = rank == 0
         # The batch size the driver measures (None before it wrote one).
@@ -223,8 +229,11 @@ class CostMeasurement:
     def on_extend(self) -> None:
         """A prefill: reload the measured batch size and start the batch afresh."""
         path = self.config_path
-        self.measured_batch_size = (
-            load_run_config(path)["batch_size"] if os.path.exists(path) else None
+        self.measured_batch_size = first_rank_value(
+            lambda: (
+                load_run_config(path)["batch_size"] if os.path.exists(path) else None
+            ),
+            self.file_group,
         )
         self.records = []
         self.pending_verify = None

@@ -569,6 +569,36 @@ def test_sampled_tree_emits_the_target_distribution() -> None:
             )
 
 
+def test_deterministic_children_emit_the_target_distribution() -> None:
+    """Children without a draft q are accepted by p'(child) over the mass their
+    rejected siblings left: with the residual bonus the first token's law is
+    the root's target."""
+    vocab, bs, trials = 16, 8192, 24
+    generator = torch.Generator().manual_seed(1)
+    target = torch.softmax(torch.randn(vocab, generator=generator) * 1.5, dim=-1)
+    second, best = torch.topk(target, 2).indices.tolist()[::-1]
+    tokens = torch.tensor([0, second, best], dtype=torch.int32, device=_DEVICE)
+    tokens = tokens.repeat(bs, 1)
+    parents = torch.tensor([-1, 0, 0], dtype=torch.int32, device=_DEVICE).repeat(bs, 1)
+    q_tables = (
+        torch.full((1, 3), -1, dtype=torch.int32, device=_DEVICE),
+        torch.zeros((1, 3), dtype=torch.int32, device=_DEVICE),
+        torch.zeros((1, 1, 1), device=_DEVICE),
+        torch.zeros((1, 1, 1), dtype=torch.int32, device=_DEVICE),
+    )
+    unread = torch.full((bs * 3,), -1, dtype=torch.int64, device=_DEVICE)
+    probas = target.to(_DEVICE).repeat(bs * 3, 1)
+    first = torch.zeros(vocab)
+    for _ in range(trials):
+        _, predicts, _, _ = _verify(
+            probas.clone(), tokens, parents, None, q_tables,
+            torch.rand((bs, 3), device=_DEVICE), torch.rand(bs, device=_DEVICE),
+            _no_top_k(bs * 3), unread,
+        )  # fmt: skip
+        first += torch.bincount(predicts[:, 0].long().cpu(), minlength=vocab).float()
+    torch.testing.assert_close(first / (bs * trials), target, rtol=0, atol=0.005)
+
+
 def _no_top_k(rows: int) -> torch.Tensor:
     """Per-row top-k of sampled (never greedy) rows."""
     return torch.full((rows,), 1 << 30, dtype=torch.int32, device=_DEVICE)

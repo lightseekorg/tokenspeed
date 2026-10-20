@@ -717,8 +717,9 @@ class DeviceHandle:
 
         A cache plan, a PD transfer or a page copy the last round queued is
         settled by the next round's execute or poll; at shutdown there is no
-        next round, so they are joined here and the first failure re-raised
-        after the Host cache (L2/L3, pool) is closed.
+        next round, so they are joined here, a drafter's pending round is
+        finished, and the first failure re-raised after the Host cache
+        (L2/L3, pool) is closed.
         """
         errors = []
         for submissions in (
@@ -732,8 +733,8 @@ class DeviceHandle:
                     future.result()
                 except BaseException as exc:  # noqa: BLE001 — surface after close
                     errors.append(exc)
-        if self._l2 is not None:
-            self._thread.run(self._l2.shutdown)
+        # The task settles the last forward's pending draft round first, even with no Host cache.
+        self._thread.run(self._l2.shutdown if self._l2 is not None else lambda: None)
         if errors:
             raise errors[0]
 

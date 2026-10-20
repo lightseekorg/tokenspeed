@@ -617,11 +617,6 @@ class LlamaForCausalLMEagle4(LlamaForCausalLMEagle3):
         validate_draft_config(config)
         super().__init__(config, mapping, quant_config, prefix)
         head = config.efficient_lm_head_config
-        if config.vocab_size % mapping.lm_head.tp_size:
-            raise ValueError(
-                "the candidate head scores unpadded vocab shards: vocab_size "
-                f"{config.vocab_size} must divide by {mapping.lm_head.tp_size}"
-            )
         self.efficient_lm_head_down_proj = ReplicatedLinear(
             config.hidden_size,
             head["rank"],
@@ -637,16 +632,27 @@ class LlamaForCausalLMEagle4(LlamaForCausalLMEagle3):
             prefix=add_prefix("efficient_lm_head", prefix),
         )
         self.num_candidates = head["num_candidates"]
+        # A padded shard's zero rows could outscore every real token's.
+        shard_vocab = config.vocab_size // mapping.lm_head.tp_size
+        if any(
+            h.weight.shape[0] * mapping.lm_head.tp_size != config.vocab_size
+            for h in (self.lm_head, self.efficient_lm_head)
+        ):
+            raise ValueError(
+                "the candidate head scores unpadded vocab shards: vocab_size "
+                f"{config.vocab_size} must split into {mapping.lm_head.tp_size} "
+                "shards the LM heads do not pad"
+            )
         if not eagle4_candidate_supports(
             self.lm_head.weight.dtype,
-            config.vocab_size // mapping.lm_head.tp_size,
+            shard_vocab,
             self.num_candidates,
             mapping.lm_head.tp_size,
         ):
             raise ValueError(
                 f"the candidate head kernels do not cover {self.num_candidates} "
                 f"candidates over {mapping.lm_head.tp_size} {self.lm_head.weight.dtype} "
-                f"vocab shards of {config.vocab_size // mapping.lm_head.tp_size}"
+                f"vocab shards of {shard_vocab}"
             )
         self.logits_processor = Eagle4CandidateLogitsProcessor(
             config,
@@ -669,15 +675,18 @@ class LlamaForCausalLMEagle4(LlamaForCausalLMEagle3):
             if latent_moe
             else None
         )
-        expert_tensors = 0
-        loaded: set[str] = set()
+        expert_tensors: set[str] = set()
+        # (parameter, shard): a fused parameter is filled once each of its shards arrived.
+        loaded: set[tuple[str, str | int | None]] = set()
         for checkpoint_name, tensor in weights:
             name = _module_name(checkpoint_name)
             if experts is not None and name.startswith("model.midlayer.mlp."):
                 if experts.matches(name):
-                    expert_tensors += 1
+                    if name in expert_tensors:
+                        raise ValueError(f"draft checkpoint repeats {name!r}")
+                    expert_tensors.add(name)
                 else:
-                    loaded.add(name)
+                    loaded.add((name, None))
                 load_weight(params, experts, name, tensor)
                 continue
             shard_id = None
@@ -696,24 +705,26 @@ class LlamaForCausalLMEagle4(LlamaForCausalLMEagle3):
                 weight_loader(param, tensor)
             else:
                 weight_loader(param, tensor, shard_id)
-            loaded.add(name)
+            loaded.add((name, shard_id))
         # The target's embedding (and head, without the draft's own) replace
         # these after loading (set_embed_and_head).
         shared = {"model.embed_tokens.weight"}
         if self.load_lm_head_from_target:
             shared.add("lm_head.weight")
-        missing = sorted(
-            name
-            for name in params
-            if name not in loaded
-            and name not in shared
-            and not (latent_moe and name.startswith("model.midlayer.mlp.experts."))
-        )
+        required = set()
+        for name in params:
+            if name in shared or (
+                latent_moe and name.startswith("model.midlayer.mlp.experts.")
+            ):
+                continue
+            shards = [s for suffix, _, s in _STACKED_PARAMS if suffix in name]
+            required.update((name, shard) for shard in shards or [None])
+        missing = sorted(f"{name} ({shard})" for name, shard in required - loaded)
         if missing:
             raise ValueError(f"draft checkpoint lacks {missing}")
-        if latent_moe and expert_tensors != 2 * self.config.n_routed_experts:
+        if latent_moe and len(expert_tensors) != 2 * self.config.n_routed_experts:
             raise ValueError(
-                f"draft checkpoint has {expert_tensors} expert tensors, expected "
+                f"draft checkpoint has {len(expert_tensors)} expert tensors, expected "
                 f"up_proj and down_proj of {self.config.n_routed_experts} experts"
             )
 

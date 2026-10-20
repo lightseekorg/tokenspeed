@@ -26,6 +26,8 @@ import sys
 import tempfile
 
 import pytest
+import torch
+import torch.distributed as dist
 from transformers import PretrainedConfig
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -39,6 +41,7 @@ from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
     chain_table_width,
     chain_width_table,
     decode_graph_floors,
+    first_rank_value,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -204,6 +207,32 @@ class TestEagleHarnessConfig:
         assert not _routes_experts(PretrainedConfig(num_experts=None))
         assert _routes_experts(PretrainedConfig(num_experts=None, n_routed_experts=512))
         assert _routes_experts(PretrainedConfig(architectures=["Qwen3MoeForCausalLM"]))
+
+
+def _first_rank_worker(rank: int, init_file: str) -> None:
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2
+    )
+    try:
+        group = dist.new_group([0, 1], backend="gloo")
+        config = first_rank_value(lambda: {"batch_size": 24 + rank}, group)
+        assert config == {"batch_size": 24}
+
+        def missing() -> dict:
+            raise FileNotFoundError(f"rank {rank} has no benchmark config")
+
+        with pytest.raises(FileNotFoundError, match="rank 0 has no"):
+            first_rank_value(missing, group)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_every_rank_takes_the_first_ranks_read(tmp_path):
+    """Whatever a rank's own files hold, it takes the first rank's read: its
+    value, or the exception it raised."""
+    torch.multiprocessing.spawn(
+        _first_rank_worker, args=(str(tmp_path / "init"),), nprocs=2
+    )
 
 
 if __name__ == "__main__":

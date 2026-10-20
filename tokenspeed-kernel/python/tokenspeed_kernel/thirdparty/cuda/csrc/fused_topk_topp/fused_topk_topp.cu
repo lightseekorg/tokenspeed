@@ -497,7 +497,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
 
         const int cutoff = s_cutoff_j;
         const float inv = s_inv_factor;
-        float* out_row = out_probs + b * vocab_size;
+        float* out_row = out_probs + static_cast<size_t>(b) * vocab_size;
         for (int i = threadIdx.x; i <= cutoff; i += BLOCK_SIZE) {
             const int idx = s_idx[i];
             if (static_cast<unsigned>(idx) < static_cast<unsigned>(vocab_size)) {
@@ -530,8 +530,8 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
                 ? 0.0f
                 : air_top_p::twiddleOut<float>(topp_counters[b].kthValueBits, false);
 
-        float const* in_row = (IN_PLACE ? out_probs : probs) + b * vocab_size;
-        float* out_row = out_probs + b * vocab_size;
+        float const* in_row = (IN_PLACE ? out_probs : probs) + static_cast<size_t>(b) * vocab_size;
+        float* out_row = out_probs + static_cast<size_t>(b) * vocab_size;
 
         if constexpr (ROWS_ALIGNED) {
             // Every row base is 16B-aligned and in phase: no peel, no tail.

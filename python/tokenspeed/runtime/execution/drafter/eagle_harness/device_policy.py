@@ -71,6 +71,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 from tokenspeed_kernel.thirdparty.cuda.eagle_harness_policy import (
     eagle_harness_policy_begin_round,
     eagle_harness_policy_decide_chain,
@@ -82,6 +83,7 @@ from tokenspeed_kernel.thirdparty.cuda.eagle_harness_policy import (
 from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
     ChainWidthTable,
     chain_table_width,
+    first_rank_value,
     load_run_config,
 )
 from tokenspeed.runtime.execution.drafter.eagle_harness.cost import (
@@ -388,12 +390,16 @@ def _chain_terms(
     return terms
 
 
-def _check_cost_data(cost: BatchCost, where: str, chain: bool, exec_mode: int) -> None:
+def _check_cost_data(
+    cost: BatchCost, where: str, chain: bool, exec_mode: int, verify_num: int
+) -> None:
     """Refuse cost data the tables cannot hold or a round cannot use: no
     context interval, a cache_length_step that is not a nonzero integer, fewer
     ratios than measured widths, more than 32 widths, widths that are not
-    integers in [0, 2**31 - 1); a chain's widths other than 1 (2, 4, ..., 16);
-    a tree's without width 1, or (exec mode 1) without a second one."""
+    strictly increasing integers in [0, 2**31 - 1); a chain's widths other
+    than 1 (2, 4, ..., 16);
+    a tree's without width 1, or (exec mode 1) without a second one within
+    the verify budget ``verify_num``, the width its batch cut verifies."""
     if not cost.intervals:
         raise ValueError(f"{where}: no context interval")
     if not isinstance(cost.cache_length_step, int) or cost.cache_length_step == 0:
@@ -407,20 +413,26 @@ def _check_cost_data(cost: BatchCost, where: str, chain: bool, exec_mode: int) -
             len(target.ratio) < len(index)
             or len(index) > _MAX_WIDTHS
             or not all(isinstance(w, int) and 0 <= w < _INT32_MAX for w in index)
+            or any(b <= a for a, b in zip(index, index[1:]))
         ):
             raise ValueError(
                 f"{where} interval {interval}: the device policy needs a ratio per "
-                f"measured width and at most {_MAX_WIDTHS} widths in [0, 2**31 - 1)"
+                f"measured width and at most {_MAX_WIDTHS} strictly increasing "
+                f"widths in [0, 2**31 - 1), got {index}"
             )
         if chain and (len(index) != 9 or index[1] != 1 or index[-1] != 15):
             raise ValueError(
                 f"{where} interval {interval}: chain cost data needs widths 2, 4, "
                 f"..., 16, got {index[1:]}"
             )
-        if not chain and (0 not in index or (exec_mode == 1 and len(index) < 2)):
+        if not chain and (
+            0 not in index
+            or (exec_mode == 1 and (len(index) < 2 or index[1] >= verify_num))
+        ):
             raise ValueError(
                 f"{where} interval {interval}: the verify cost needs width 1 "
-                f"(index 0), and exec mode 1 a second width, got {index}"
+                f"(index 0), and exec mode 1 a second width within the verify "
+                f"budget {verify_num}, got {index}"
             )
 
 
@@ -543,7 +555,9 @@ def _build_tables(
     costs = [cost_data[bs] for bs in ids]
     names = [f"EAGLE-Harness cost data bs_{bs}" for bs in ids]
     for cost, name in zip(costs, names):
-        _check_cost_data(cost, name, policy.chain, policy.exec_mode)
+        _check_cost_data(
+            cost, name, policy.chain, policy.exec_mode, policy.verify_num_limit
+        )
     cost_ids = [ids[bs] for bs in nearest]
     batch_table = torch.zeros((max_bs, _BATCH_COLS), dtype=torch.int64)
     for bs in range(1, max_bs + 1):
@@ -609,6 +623,9 @@ class DevicePolicy:
             only the root's children and verifies narrowly).
         benchmark_config: ``<data path>/config/benchmark_config.json``,
             ``{"batch_size": N}`` (read once, when exec mode 1 first needs it).
+        file_group: The TP ranks' CPU group of their own, over which the
+            first rank's read of ``benchmark_config`` reaches every rank
+            (None: this rank reads it).
         chain_width_table: A chain's verify width per live batch size
             (``--speculative-chain-width-table``; empty: the confidence rule
             decides every round). A round it covers drafts depths 1 to
@@ -639,6 +656,7 @@ class DevicePolicy:
         benchmark_config: str,
         chain_width_table: ChainWidthTable,
         device: torch.device,
+        file_group: dist.ProcessGroup | None = None,
     ) -> None:
         self.chain = compute_intensity == "chain_intensity"
         self.node_top_k = node_top_k
@@ -649,6 +667,7 @@ class DevicePolicy:
         self.depth_loss_ratio = _DEPTH_LOSS_RATIO * (2.0 if is_moe_target else 1.0)
         self.exec_mode = exec_mode
         self.benchmark_config = benchmark_config
+        self.file_group = file_group
         self.chain_width_table = chain_width_table
         self.device = device
         # Exec mode 1: next_round reads the benchmark's batch size until it loads.
@@ -715,16 +734,21 @@ class DevicePolicy:
             FileNotFoundError: Exec mode 1's benchmark config is missing then.
         """
         if self._benchmark_pending and batch_size > 1:
-            if not os.path.exists(self.benchmark_config):
-                raise FileNotFoundError(
-                    "EAGLE-Harness exec mode 1 reads the benchmark's batch size from "
-                    f'{self.benchmark_config} ({{"batch_size": N}}), which the '
-                    "benchmark client writes before its first request"
-                )
-            config = load_run_config(self.benchmark_config)
-            self._state[_BENCH_BATCH_SIZE].fill_(int(config["batch_size"]))
+            benchmark_batch_size = first_rank_value(
+                self._benchmark_batch_size, self.file_group
+            )
+            self._state[_BENCH_BATCH_SIZE].fill_(benchmark_batch_size)
             self._benchmark_pending = False
         self._rounds += 1
+
+    def _benchmark_batch_size(self) -> int:
+        if not os.path.exists(self.benchmark_config):
+            raise FileNotFoundError(
+                "EAGLE-Harness exec mode 1 reads the benchmark's batch size from "
+                f'{self.benchmark_config} ({{"batch_size": N}}), which the '
+                "benchmark client writes before its first request"
+            )
+        return int(load_run_config(self.benchmark_config)["batch_size"])
 
     def begin_round(
         self, live_rows: torch.Tensor, frontier: torch.Tensor, sampled: torch.Tensor
