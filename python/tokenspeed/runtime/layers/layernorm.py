@@ -24,8 +24,11 @@ from typing import ClassVar
 
 import torch
 import torch.nn as nn
-from tokenspeed_kernel.ops.communication.triton import (
-    allreduce_residual_rmsnorm as triton_allreduce_residual_rmsnorm,
+from tokenspeed_kernel.ops.communication import (
+    allreduce_residual_rmsnorm as iris_allreduce_residual_rmsnorm,
+)
+from tokenspeed_kernel.ops.communication import (
+    allreduce_sandwich_rmsnorm,
 )
 from tokenspeed_kernel.ops.communication.trtllm import (
     allgather_dual_rmsnorm,
@@ -36,9 +39,15 @@ from tokenspeed_kernel.ops.communication.trtllm import (
 from tokenspeed_kernel.ops.communication.trtllm import (
     reducescatter_residual_rmsnorm,
 )
-from tokenspeed_kernel.ops.layernorm import rmsnorm
+from tokenspeed_kernel.ops.layernorm import (
+    add_rmsnorm,
+    nvfp4_copy_supported,
+    rmsnorm,
+)
+from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -75,7 +84,7 @@ if _is_amd:
         rmsnorm_fused_parallel as triton_rmsnorm_fused_parallel,
     )
 
-    _allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
+    _allreduce_residual_rmsnorm = iris_allreduce_residual_rmsnorm
 elif _platform.is_nvidia:
     from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
     from tokenspeed_kernel.ops.layernorm.flashinfer import (
@@ -244,6 +253,7 @@ class GemmaRMSNorm(torch.nn.Module):
         self.register_buffer("gemma_weight", self.weight.data + 1.0, persistent=False)
         # (Chen-0210) Gemma weight = standard_weight + 1. Precompute once.
         self.weight.weight_loader = self._weight_loader
+        self._nvfp4_copy_supported = nvfp4_copy_supported(hidden_size)
 
     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         if param.size() != loaded_weight.size():
@@ -296,6 +306,90 @@ class GemmaRMSNorm(torch.nn.Module):
                 self.variance_epsilon,
             )
             return out
+
+    def add_norm_with_fp8(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        fp8_scale: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """``forward(x, residual)``, plus the normed rows in static FP8 when ``fp8_scale`` is given.
+
+        Returns the normed rows, their FP8 copy or ``None`` where it is not
+        made (AMD), and the updated residual.
+        """
+        x, x_fp8, _, residual = self._add_norm(
+            x, residual, fp8_scale=fp8_scale, fp4_scale=None
+        )
+        return x, x_fp8, residual
+
+    def add_norm_with_fp4(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        fp4_scale: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None, torch.Tensor]:
+        """``forward(x, residual)``, plus ``fp4_quantize(rows, fp4_scale)`` when ``fp4_scale`` is given.
+
+        Returns the normed rows, their NVFP4 ``(values, scales)`` or ``None``
+        where the copy cannot equal ``fp4_quantize``'s (see
+        ``nvfp4_copy_supported``) or rows are not BF16, and the updated residual.
+        """
+        x, _, x_fp4, residual = self._add_norm(
+            x, residual, fp8_scale=None, fp4_scale=fp4_scale
+        )
+        return x, x_fp4, residual
+
+    def _add_norm(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        *,
+        fp8_scale: torch.Tensor | None,
+        fp4_scale: torch.Tensor | None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        tuple[torch.Tensor, torch.Tensor] | None,
+        torch.Tensor,
+    ]:
+        if _is_amd:
+            x, residual = self(x, residual)
+            return x, None, None, residual
+        # The NVFP4 linear's prequantized path returns BF16 whatever the model dtype.
+        if not (self._nvfp4_copy_supported and x.dtype == torch.bfloat16):
+            fp4_scale = None
+        rows, cols = x.shape
+        x_fp8 = (
+            None
+            if fp8_scale is None
+            else torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        )
+        x_fp4 = None
+        if fp4_scale is not None:
+            x_fp4 = (
+                torch.empty(rows, cols // 2, dtype=torch.uint8, device=x.device),
+                torch.empty(
+                    (rows + 127) // 128 * 128,
+                    cols // 16,
+                    dtype=torch.uint8,
+                    device=x.device,
+                ),
+            )
+        add_rmsnorm(
+            x,
+            residual,
+            self.weight.data,
+            self.variance_epsilon,
+            x2=None,
+            out=x,
+            out_fp8=x_fp8,
+            fp8_scale=fp8_scale,
+            out_fp4=x_fp4,
+            fp4_scale=fp4_scale,
+            gemma=True,
+        )
+        return x, x_fp8, x_fp4, residual
 
     def forward_with_allreduce_fusion(
         self,
@@ -427,7 +521,16 @@ class FusedRMSNorm(nn.Module):
         Returns:
             Tuple of (normalized_q_a, normalized_kv_a)
         """
-        if _is_amd:
+        if _platform.is_npu:
+            # Ascend uses the registered RMSNorm leaves. Preserve the dual
+            # norm contract: omitted outputs overwrite their input buffers.
+            self.q_a_norm(
+                input_q_a, out=input_q_a if output_q_a is None else output_q_a
+            )
+            self.kv_a_norm(
+                input_kv_a, out=input_kv_a if output_kv_a is None else output_kv_a
+            )
+        elif _is_amd:
             triton_rmsnorm_fused_parallel(
                 input1=input_q_a,
                 weight1=self.weight_q_a,
@@ -509,3 +612,153 @@ class FusedRMSNorm(nn.Module):
             self.forward(input_q_a=q, input_kv_a=k_nope, output_q_a=q_contiguous)
 
         return qkv, q_contiguous, k_nope, None
+
+
+def _check_plain_gamma(*norms: RMSNorm) -> None:
+    """The boundary scales by ``weight`` itself: refuse a norm whose
+    multiplier is ``weight + weight_offset`` (``GemmaRMSNorm``)."""
+    for norm in norms:
+        offset = getattr(norm, "weight_offset", 0.0)
+        if offset != 0.0:
+            raise ValueError(
+                f"{type(norm).__name__} scales by weight + {offset}; the "
+                "sandwich norm boundary takes norms that scale by weight"
+            )
+
+
+def sandwich_rmsnorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_norm: RMSNorm,
+    norm: RMSNorm,
+    *,
+    x_scale: float | None = None,
+    residual_scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A pre/post ("sandwich") norm boundary on a reduced sublayer output.
+
+    ``a = post_norm(x)``, then ``residual_out = RN(RN(x_scale * a) +
+    RN(residual_scale * residual))`` (each RN a BF16 rounding; without a scale
+    pair the plain BF16 sum) and ``out = norm(residual_out)``. Both norms run
+    ``ops/layernorm/triton.py``'s ``rmsnorm`` with the modules' weights and
+    epsilons: the arithmetic the fused all-reduce epilogue
+    (``allreduce_sandwich_rmsnorm``) reproduces.
+
+    Args:
+        x: BF16 ``[T, H]`` all-reduced sublayer output.
+        residual: BF16 ``[T, H]`` residual stream.
+        post_norm: The norm of the sublayer output (applied before the add).
+        norm: The norm of the new residual stream (the next pre-norm).
+        x_scale, residual_scale: Optional multipliers of the two addends
+            (a missing one is 1.0; NVIDIA only, as ``rmsnorm``'s).
+
+    Returns:
+        ``(out, residual_out)``.
+
+    Raises:
+        ValueError: A norm scales by ``weight + weight_offset`` with a nonzero
+            offset (``GemmaRMSNorm``); both norms must scale by ``weight``.
+    """
+    _check_plain_gamma(post_norm, norm)
+    a = triton_rmsnorm(
+        x, post_norm.weight.data, post_norm.variance_epsilon, enable_pdl=None
+    )
+    return triton_rmsnorm(
+        a,
+        norm.weight.data,
+        norm.variance_epsilon,
+        residual=residual,
+        enable_pdl=None,
+        round_residual_sum_bf16=True,
+        x_scale=x_scale,
+        residual_scale=residual_scale,
+    )
+
+
+def _sandwich_fusion_applies(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_norm: RMSNorm,
+    norm: RMSNorm,
+    group: tuple[int, ...],
+) -> bool:
+    """Whether to try the fused launch: ``--enable-allreduce-fusion``, a
+    group of two or more ranks, ``1 <= T <= --comm-fusion-max-num-tokens``,
+    BF16 tensors and weights and one epsilon for both norms (the fused
+    kernel's contract)."""
+    return (
+        global_server_args_dict.get("enable_allreduce_fusion", False)
+        and len(group) > 1
+        and post_norm.variance_epsilon == norm.variance_epsilon
+        and 1 <= x.shape[0] <= global_server_args_dict["comm_fusion_max_num_tokens"]
+        and all(
+            t.dtype == torch.bfloat16
+            for t in (x, residual, post_norm.weight, norm.weight)
+        )
+    )
+
+
+def sandwich_rmsnorm_with_allreduce(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_norm: RMSNorm,
+    norm: RMSNorm,
+    *,
+    rank: int,
+    group: tuple[int, ...],
+    x_scale: float | None = None,
+    residual_scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All-reduce a sublayer partial and run the sandwich boundary on the sum.
+
+    The helper a model calls where a tensor-parallel sublayer output meets
+    its own output norm, the residual add and the next pre-norm. Under
+    ``--enable-allreduce-fusion`` a call of at most
+    ``--comm-fusion-max-num-tokens`` rows runs as one MNNVL launch when the
+    group's workspace serves it (``allreduce_sandwich_rmsnorm``); every other
+    call all-reduces ``x`` through the runtime backend and runs
+    :func:`sandwich_rmsnorm`. The two paths perform the same operations with
+    the same BF16 rounding points. The fused launch sums the partials as the
+    plain MNNVL all-reduce does; where the runtime backend takes that path
+    too, only the order of the sum-of-squares reductions differs, and where
+    it takes another (IPC, NCCL) the order of the sum may differ as well.
+    Every rank of ``group`` takes the same path: the choice depends only on
+    the launch options, the shapes and the group's shared workspace.
+
+    Args:
+        x: This rank's BF16 ``[T, H]`` sublayer partial (not yet reduced).
+        residual: BF16 ``[T, H]`` residual stream, replicated across ``group``.
+        post_norm: The norm of the reduced sublayer output.
+        norm: The norm of the new residual stream.
+        rank: This rank's index in ``group``.
+        group: Global ranks of the all-reduce.
+        x_scale, residual_scale: Optional multipliers of the two addends.
+
+    Returns:
+        ``(out, residual_out)`` as :func:`sandwich_rmsnorm` of the reduced
+        ``x``.
+
+    Raises:
+        ValueError: As :func:`sandwich_rmsnorm`, before any collective.
+    """
+    _check_plain_gamma(post_norm, norm)
+    if _sandwich_fusion_applies(x, residual, post_norm, norm, group):
+        fused = allreduce_sandwich_rmsnorm(
+            x.contiguous(),
+            residual.contiguous(),
+            post_norm.weight.data,
+            norm.weight.data,
+            rank,
+            _get_process_group(group),
+            eps=norm.variance_epsilon,
+            x_scale=x_scale,
+            residual_scale=residual_scale,
+            max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
+        )
+        if fused is not None:
+            return fused
+    if len(group) > 1:
+        x = all_reduce(x, group)
+    return sandwich_rmsnorm(
+        x, residual, post_norm, norm, x_scale=x_scale, residual_scale=residual_scale
+    )

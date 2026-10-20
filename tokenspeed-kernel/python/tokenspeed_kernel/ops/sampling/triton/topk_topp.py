@@ -609,7 +609,7 @@ def _top_k_top_p_qrita_gumbel_kernel(
     out_ptr,
     logits_row_stride: tl.constexpr,
     qrita_buffer_row_stride: tl.constexpr,
-    batch_size: tl.constexpr,
+    batch_size,
     vocab_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_SIZE_TRUNC: tl.constexpr,
@@ -672,6 +672,10 @@ def _top_k_top_p_qrita_gumbel_kernel(
             num_outliers = tl.zeros((), dtype=tl.uint32)
             num_finite_total = tl.zeros((), dtype=tl.uint32)
 
+            # Threads exchange values through qrita_buffer in global memory,
+            # which the compiler does not synchronize. Barrier every hand-off:
+            # here, so the previous row's reads finish before it is rewritten.
+            tl.debug_barrier()
             for i in range(0, num_tiles):
                 offs_n = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
                 mask_n = offs_n < vocab_size
@@ -703,6 +707,7 @@ def _top_k_top_p_qrita_gumbel_kernel(
                 write_pos = tl.where(outlier_mask, cumulative_pos, -1)
                 tl.store(buffer_row + write_pos, logits_blk, mask=outlier_mask)
 
+            tl.debug_barrier()
             min_logit = tl.minimum(min_logit, max_logit)
 
             num_iters = 0
@@ -927,6 +932,7 @@ def _top_k_top_p_qrita_gumbel_kernel(
                         write_pos = tl.where(outlier_mask, cumulative_pos, -1)
                         tl.store(buffer_row + write_pos, probs_blk, mask=outlier_mask)
 
+                    tl.debug_barrier()
                     search_range = tl.cast(num_outliers_2, tl.int32)
                     search_iters = tl.cast(
                         (num_outliers_2 + BLOCK_SIZE_TRUNC - 1) // BLOCK_SIZE_TRUNC,
@@ -941,6 +947,7 @@ def _top_k_top_p_qrita_gumbel_kernel(
                         probs_blk = probs_blk / sum_exp_logits
                         tl.store(buffer_row + offs_n, probs_blk, mask=mask_n_2)
 
+                tl.debug_barrier()
                 max_range = 1.0 / sum_exp_logits
                 min_range = tl.exp(min_logit - max_logit) / sum_exp_logits
                 p_pivot = 1.0

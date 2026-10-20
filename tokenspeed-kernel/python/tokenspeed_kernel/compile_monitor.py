@@ -37,6 +37,12 @@ Triton, torch and this package, so the layers of a model that legitimately
 launch a kernel with different dimensions count separately. Powers of two are
 not counted: rounding up to one is how a kernel buckets a compile-time bound,
 and it is log-bounded.
+
+The serving mark is also the package's compile switch, kept whether or not the
+monitor is installed: :func:`is_serving` turns true, and a kernel whose library
+compiles once per batch shape -- outside Triton, so no key can be bucketed for
+it -- runs only before then. Afterwards its callers take another
+implementation; CUDA graphs captured during startup keep what they recorded.
 """
 
 from __future__ import annotations
@@ -60,6 +66,7 @@ __all__ = [
     "UnboundedSpecializationError",
     "compile_stats",
     "install_compile_monitor",
+    "is_serving",
     "mark_serving",
     "uninstall_compile_monitor",
 ]
@@ -344,6 +351,7 @@ class _Hooks:
 
 
 _hooks: _Hooks | None = None
+_serving = False
 
 
 def install_compile_monitor(on_unbounded: OnUnbounded) -> None:
@@ -377,12 +385,16 @@ def uninstall_compile_monitor() -> None:
 
 
 def mark_serving() -> None:
-    """Mark the end of startup; later compilations are reported.
-
-    A no-op when the monitor is not installed.
-    """
+    """Mark the end of startup: close the compile switch and report later compilations."""
+    global _serving
+    _serving = True
     if _hooks is not None:
         _hooks.monitor.serving = True
+
+
+def is_serving() -> bool:
+    """Whether startup has ended, after which no kernel may compile per batch shape."""
+    return _serving
 
 
 def compile_stats() -> CompileStats | None:

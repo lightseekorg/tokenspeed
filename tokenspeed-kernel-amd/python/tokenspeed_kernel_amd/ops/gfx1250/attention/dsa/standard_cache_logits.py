@@ -38,9 +38,17 @@ __all__ = [
 def _make_wmma_layout(
     NUM_WARPS: gl.constexpr,
     Q_IS_FP8: gl.constexpr,
+    IS_KPOOL: gl.constexpr,
 ):
-    """Map Wave32 workgroups over 32 scoring heads and candidate columns."""
-    if NUM_WARPS == 2:
+    """Map Wave32 workgroups over 32 scoring heads and candidate columns.
+
+    KPool warps split only columns, so each warp folds all 32 heads of its
+    columns in registers. Standard scoring splits heads first, which measured
+    faster for its 64-head prefill.
+    """
+    if IS_KPOOL:
+        warp_bases = [[0, 1 << i] for i in range(NUM_WARPS.bit_length() - 1)]
+    elif NUM_WARPS == 2:
         warp_bases = [[1, 0]]
     elif NUM_WARPS == 4:
         warp_bases = [[1, 0], [0, 1]]
@@ -138,10 +146,12 @@ def _score_head_tile(
     query,
     key,
     head_weights,
+    scores,
     wmma_layout: gl.constexpr,
+    fold_layout: gl.constexpr,
     BLOCK_N: gl.constexpr,
-    ORDERED_HEAD_FOLD: gl.constexpr,
 ):
+    """Add 32 weighted head scores to ``scores`` in logical head order."""
     accumulator = gl.zeros([32, BLOCK_N], gl.float32, layout=wmma_layout)
     head_scores = gl.amd.cdna5.wmma(query, key, accumulator)
     head_scores = gl.maximum(
@@ -150,23 +160,18 @@ def _score_head_tile(
         propagate_nan=tl.PropagateNan.ALL,
     )
     contributions = head_scores * head_weights[:, None]
-    if not ORDERED_HEAD_FOLD:
-        return gl.sum(contributions, axis=0)
-
-    output_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
+    # One layout conversion gives each lane all heads of its output column, so
+    # the ordered sum below is plain register adds. This is faster than the
+    # cross-lane tree reduction of gl.sum and keeps the result deterministic.
+    contributions = gl.convert_layout(contributions, fold_layout)
     gather_indices = gl.zeros(
         [BLOCK_N],
         dtype=gl.int32,
-        layout=output_layout,
+        layout=gl.SliceLayout(0, fold_layout),
     )[None, :]
-    scores = gl.zeros([BLOCK_N], dtype=gl.float32, layout=output_layout)
     for head in gl.static_range(0, 32):
         contribution = gl.gather(contributions, gather_indices + head, axis=0)
-        contribution = gl.convert_layout(
-            gl.reshape(contribution, [BLOCK_N]),
-            output_layout,
-        )
-        scores += contribution
+        scores += gl.reshape(contribution, [BLOCK_N])
     return scores
 
 
@@ -187,6 +192,8 @@ def _score_key_tile(
     model_scale,
     wmma_layout: gl.constexpr,
     k_dot_layout: gl.constexpr,
+    key_memory_layout: gl.constexpr,
+    fold_layout: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     HEAD_DIM: gl.constexpr,
@@ -194,11 +201,12 @@ def _score_key_tile(
     NUM_HEADS: gl.constexpr,
     Q_IS_FP8: gl.constexpr,
     IS_PREFILL: gl.constexpr,
-    ORDERED_HEAD_FOLD: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
 ):
-    dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, k_dot_layout))[:, None]
-    columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, k_dot_layout))[None, :]
+    dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, key_memory_layout))[:, None]
+    columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, key_memory_layout))[
+        None, :
+    ]
     positions = candidate_start + columns
     valid = positions < candidate_end
     slots = _candidate_slots(
@@ -227,26 +235,30 @@ def _score_key_tile(
             mask=valid,
             other=0.0,
         )
+    raw_key = gl.convert_layout(raw_key, k_dot_layout)
     key = raw_key if Q_IS_FP8 else raw_key.to(gl.bfloat16)
+    output_layout: gl.constexpr = gl.SliceLayout(0, fold_layout)
+    scores = gl.zeros([BLOCK_N], dtype=gl.float32, layout=output_layout)
     scores = _score_head_tile(
         query_0,
         key,
         weight_0,
+        scores,
         wmma_layout,
+        fold_layout,
         BLOCK_N,
-        ORDERED_HEAD_FOLD,
     )
     if NUM_HEADS == 64:
-        scores += _score_head_tile(
+        scores = _score_head_tile(
             query_1,
             key,
             weight_1,
+            scores,
             wmma_layout,
+            fold_layout,
             BLOCK_N,
-            ORDERED_HEAD_FOLD,
         )
 
-    output_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
     scale_positions = candidate_start + gl.arange(0, BLOCK_N, layout=output_layout)
     scale_valid = scale_positions < candidate_end
     scale_slots = _candidate_slots(
@@ -309,6 +321,7 @@ def _standard_cache_logits_body(
     max_candidates,
     q_len_per_req,
     pool_offset,
+    split_cols,
     PAGE_SIZE: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     POOL_SIZE: gl.constexpr,
@@ -320,33 +333,36 @@ def _standard_cache_logits_body(
     Q_IS_FP8: gl.constexpr,
     IS_PREFILL: gl.constexpr,
     IS_KPOOL: gl.constexpr,
-    ORDERED_HEAD_FOLD: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
 ):
     row_id = gl.program_id(0)
     split_id = gl.program_id(1)
+    # Prefill and KPool programs score the split_id-th split_cols-wide slice of
+    # their row's columns; decode programs score one CHUNK_N slice. KPool rows
+    # cover a CHUNK_N-wide window starting at output_base.
+    split_start = split_id * split_cols
     if IS_KPOOL:
         if IS_PREFILL:
             request_id = 0
             workspace_start = gl.maximum(gl.load(row_starts + row_id), 0)
             workspace_end = gl.minimum(gl.load(row_ends + row_id), max_candidates)
             output_base = workspace_start + pool_offset
-            candidate_start = gl.minimum(output_base, workspace_end)
-            candidate_end = gl.minimum(output_base + CHUNK_N, workspace_end)
+            window_end = gl.minimum(output_base + CHUNK_N, workspace_end)
         else:
             request_id = gl.load(req_ids + row_id).to(gl.int32)
             num_pools = (
                 gl.maximum(gl.load(seq_lens + row_id).to(gl.int32), 0) // POOL_SIZE
             )
             output_base = pool_offset
-            candidate_start = pool_offset
-            candidate_end = gl.minimum(num_pools, pool_offset + CHUNK_N)
-            candidate_end = gl.minimum(candidate_end, max_candidates)
+            window_end = gl.minimum(num_pools, pool_offset + CHUNK_N)
+            window_end = gl.minimum(window_end, max_candidates)
+        candidate_start = gl.minimum(output_base + split_start, window_end)
+        candidate_end = gl.minimum(candidate_start + split_cols, window_end)
     elif IS_PREFILL:
         request_id = row_id
         output_base = 0
-        candidate_start = gl.maximum(gl.load(row_starts + row_id), 0)
+        candidate_start = gl.maximum(gl.load(row_starts + row_id), split_start)
         candidate_end = gl.minimum(gl.load(row_ends + row_id), max_candidates)
     else:
         request_id = row_id // q_len_per_req
@@ -359,8 +375,13 @@ def _standard_cache_logits_body(
         candidate_end = gl.minimum(candidate_end, candidate_start + CHUNK_N)
         candidate_end = gl.minimum(candidate_end, max_candidates)
     candidate_start = gl.minimum(candidate_start, candidate_end)
+    if IS_PREFILL and not IS_KPOOL:
+        # Clamping the split end after the common bounds keeps LLVM's faster
+        # schedule for unsplit rows.
+        candidate_end = gl.minimum(candidate_end, split_start + split_cols)
+        candidate_end = gl.maximum(candidate_end, candidate_start)
 
-    wmma_layout: gl.constexpr = _make_wmma_layout(NUM_WARPS, Q_IS_FP8)
+    wmma_layout: gl.constexpr = _make_wmma_layout(NUM_WARPS, Q_IS_FP8, IS_KPOOL)
     k_width: gl.constexpr = 16 if Q_IS_FP8 else 8
     q_dot_layout: gl.constexpr = gl.DotOperandLayout(
         0,
@@ -372,6 +393,23 @@ def _standard_cache_logits_body(
         wmma_layout,
         k_width=k_width,
     )
+    # Each lane owns one output column with all of its heads for the head fold.
+    fold_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1], [1, 32], [1, NUM_WARPS], [1, 0]
+    )
+    # Load adjacent key bytes together, then restore the WMMA operand layout.
+    # Standard decode keeps the operand layout; the conversion did not pay off
+    # there.
+    if IS_KPOOL:
+        key_memory_layout: gl.constexpr = gl.BlockedLayout(
+            [16, 1], [8, 4], [1, NUM_WARPS], [0, 1]
+        )
+    elif IS_PREFILL and not IS_KPOOL:
+        key_memory_layout: gl.constexpr = gl.BlockedLayout(
+            [8, 1], [16, 2], [1, NUM_WARPS], [0, 1]
+        )
+    else:
+        key_memory_layout: gl.constexpr = k_dot_layout
     q_load_layout: gl.constexpr = gl.BlockedLayout(
         [1, k_width],
         [4, 8],
@@ -440,6 +478,8 @@ def _standard_cache_logits_body(
             model_scale,
             wmma_layout,
             k_dot_layout,
+            key_memory_layout,
+            fold_layout,
             PAGE_SIZE,
             PAGE_STRIDE_BYTES,
             HEAD_DIM,
@@ -447,7 +487,6 @@ def _standard_cache_logits_body(
             NUM_HEADS,
             Q_IS_FP8,
             IS_PREFILL,
-            ORDERED_HEAD_FOLD,
             USE_BUFFER_LOAD,
         )
         output_positions = positions - output_base if IS_KPOOL else positions
@@ -487,6 +526,7 @@ def gluon_dsa_prefill_topk_standard_gfx1250(
     logits_stride,
     model_scale,
     workspace_rows,
+    split_cols,
     PAGE_SIZE: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     NUM_HEADS: gl.constexpr,
@@ -523,6 +563,7 @@ def gluon_dsa_prefill_topk_standard_gfx1250(
         workspace_rows,
         1,
         0,
+        split_cols,
         PAGE_SIZE,
         PAGE_STRIDE_BYTES,
         1,
@@ -533,7 +574,6 @@ def gluon_dsa_prefill_topk_standard_gfx1250(
         NUM_WARPS,
         Q_IS_FP8,
         True,
-        False,
         False,
         USE_BUFFER_LOAD,
         USE_BUFFER_STORE,
@@ -564,6 +604,7 @@ def gluon_kpool_prefill_topk_fp8_gfx1250(
     model_scale,
     max_candidates,
     pool_offset,
+    split_cols,
     PAGE_SIZE: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     POOL_SIZE: gl.constexpr,
@@ -572,7 +613,6 @@ def gluon_kpool_prefill_topk_fp8_gfx1250(
     BLOCK_N: gl.constexpr,
     WINDOW_COLS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    ORDERED_HEAD_FOLD: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
 ):
@@ -581,7 +621,7 @@ def gluon_kpool_prefill_topk_fp8_gfx1250(
     window_end = gl.minimum(num_pools, pool_offset + WINDOW_COLS)
     window_end = gl.minimum(window_end, max_candidates)
     local_end = gl.maximum(window_end - pool_offset, 0)
-    gl.store(row_ends + row_id, local_end)
+    gl.store(row_ends + row_id, local_end, mask=gl.program_id(1) == 0)
 
     _standard_cache_logits_body(
         q,
@@ -609,6 +649,7 @@ def gluon_kpool_prefill_topk_fp8_gfx1250(
         max_candidates,
         1,
         pool_offset,
+        split_cols,
         PAGE_SIZE,
         PAGE_STRIDE_BYTES,
         POOL_SIZE,
@@ -620,7 +661,6 @@ def gluon_kpool_prefill_topk_fp8_gfx1250(
         False,
         False,
         True,
-        ORDERED_HEAD_FOLD,
         USE_BUFFER_LOAD,
         USE_BUFFER_STORE,
     )
@@ -649,6 +689,7 @@ def gluon_kpool_prefill_topk_fp8_plan_gfx1250(
     model_scale,
     workspace_rows,
     pool_offset,
+    split_cols,
     PAGE_SIZE: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     POOL_SIZE: gl.constexpr,
@@ -657,7 +698,6 @@ def gluon_kpool_prefill_topk_fp8_plan_gfx1250(
     BLOCK_N: gl.constexpr,
     WINDOW_COLS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    ORDERED_HEAD_FOLD: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
 ):
@@ -666,7 +706,7 @@ def gluon_kpool_prefill_topk_fp8_plan_gfx1250(
     workspace_end = gl.minimum(gl.load(row_ends + row_id), workspace_rows)
     row_pools = gl.maximum(workspace_end - workspace_start, 0)
     local_end = gl.minimum(gl.maximum(row_pools - pool_offset, 0), WINDOW_COLS)
-    gl.store(local_row_ends + row_id, local_end)
+    gl.store(local_row_ends + row_id, local_end, mask=gl.program_id(1) == 0)
 
     _standard_cache_logits_body(
         q,
@@ -694,6 +734,7 @@ def gluon_kpool_prefill_topk_fp8_plan_gfx1250(
         workspace_rows,
         1,
         pool_offset,
+        split_cols,
         PAGE_SIZE,
         PAGE_STRIDE_BYTES,
         POOL_SIZE,
@@ -705,7 +746,6 @@ def gluon_kpool_prefill_topk_fp8_plan_gfx1250(
         False,
         True,
         True,
-        ORDERED_HEAD_FOLD,
         USE_BUFFER_LOAD,
         USE_BUFFER_STORE,
     )
@@ -770,6 +810,7 @@ def gluon_dsa_decode_topk_standard_gfx1250(
         max_candidates,
         q_len_per_req,
         0,
+        CHUNK_N,
         PAGE_SIZE,
         PAGE_STRIDE_BYTES,
         1,
@@ -779,7 +820,6 @@ def gluon_dsa_decode_topk_standard_gfx1250(
         CHUNK_N,
         NUM_WARPS,
         Q_IS_FP8,
-        False,
         False,
         False,
         USE_BUFFER_LOAD,

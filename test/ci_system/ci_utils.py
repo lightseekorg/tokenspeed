@@ -74,9 +74,9 @@ def is_retriable_failure(output: str) -> tuple[bool, str]:
         if re.search(pattern, output, re.IGNORECASE):
             return True, f"retriable pattern: {pattern}"
 
-    # If we have an AssertionError but didn't match non-retriable, assume retriable
-    if re.search(r"AssertionError", output):
-        return True, "AssertionError (assuming retriable)"
+    # Assume remaining assertion failures are retriable.
+    if re.search(r"AssertionError|^E\s+assert\s", output, re.MULTILINE):
+        return True, "assertion failure (assuming retriable)"
 
     # Default: not retriable
     return False, "unknown failure type"
@@ -160,15 +160,24 @@ def run_unittest_files(
             nonlocal process, output_lines
 
             full_path = os.path.join(os.getcwd(), filename)
+            command = [
+                "python3",
+                "-m",
+                "pytest",
+                full_path,
+                "-v",
+                "-s",
+                "--log-cli-level=INFO",
+            ]
             logger.info(
-                f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {full_path}\n.\n.\n"
+                f".\n.\nBegin ({i}/{len(files) - 1}):\n{' '.join(command)}\n.\n.\n"
             )
             file_tic = time.perf_counter()
 
             if capture_output:
                 # Capture output for retry decision
                 process = subprocess.Popen(
-                    ["python3", full_path],
+                    command,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -180,9 +189,7 @@ def run_unittest_files(
                     output_lines.append(line)
                 process.wait()
             else:
-                process = subprocess.Popen(
-                    ["python3", full_path], stdout=None, stderr=None
-                )
+                process = subprocess.Popen(command, stdout=None, stderr=None)
                 process.wait()
 
             elapsed = time.perf_counter() - file_tic
@@ -223,7 +230,7 @@ def run_unittest_files(
                     break
                 else:
                     # Check if we should retry
-                    if enable_retry and attempt < max_attempts:
+                    if enable_retry and ret_code == 1 and attempt < max_attempts:
                         output = "".join(output_lines)
                         is_retriable, reason = is_retriable_failure(output)
 

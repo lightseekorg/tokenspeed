@@ -102,11 +102,11 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
     // full target group + a sliding "draft" group (window 8 -> lookback 2
     // blocks): the draft-SWA-under-full-target shape.
     const std::vector<CacheGroupSpec> specs = {
-        {.kind = AttnKind::kFull,
+        {.attn_kind = AttnKind::kFull,
          .sliding_window = 0,
          .cache_blocks_per_lcm_block = 1,
          .block_granularity = kBlockTokens},
-        {.kind = AttnKind::kSlidingWindow,
+        {.attn_kind = AttnKind::kSlidingWindow,
          .sliding_window = 8,
          .cache_blocks_per_lcm_block = 1,
          .block_granularity = kBlockTokens},
@@ -120,6 +120,7 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
         {
             CacheCoordinator coordinator =
                 MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                /*snapshot_pool=*/nullptr,
                                 /*stream_device_cache_to_host=*/false);
             // Random per-group caching: each group caches a random prefix
             // subset of the request's blocks (front-truncated to mimic the
@@ -180,11 +181,11 @@ TEST(JointMatchInvariantsTest, ReplayableGroupIsNotPartOfTheJointInvariant) {
     constexpr std::int32_t kBlocks = 12;
     constexpr std::int32_t kBlockTokens = 4;
     const std::vector<CacheGroupSpec> specs = {
-        {.kind = AttnKind::kFull,
+        {.attn_kind = AttnKind::kFull,
          .sliding_window = 0,
          .cache_blocks_per_lcm_block = 1,
          .block_granularity = kBlockTokens},
-        {.kind = AttnKind::kSlidingWindow,
+        {.attn_kind = AttnKind::kSlidingWindow,
          .sliding_window = 8,
          .replayable = true,
          .cache_blocks_per_lcm_block = 1,
@@ -197,6 +198,7 @@ TEST(JointMatchInvariantsTest, ReplayableGroupIsNotPartOfTheJointInvariant) {
         BlockPool pool(64, {1, 1});
         CacheCoordinator coordinator =
             MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                            /*snapshot_pool=*/nullptr,
                             /*stream_device_cache_to_host=*/false);
         std::uniform_int_distribution<std::int32_t> depth_dist(0, kBlocks);
         const std::int32_t full_depth = depth_dist(rng);
@@ -226,22 +228,23 @@ TEST(JointMatchInvariantsTest, DraftOnlyGroupJoinsConvergenceAsOrdinaryGroup) {
     constexpr std::int32_t kBlocks = 8;
     constexpr std::int32_t kBlockTokens = 4;
     const std::vector<CacheGroupSpec> specs = {
-        {.kind = AttnKind::kFull,
+        {.attn_kind = AttnKind::kFull,
          .sliding_window = 0,
          .cache_blocks_per_lcm_block = 1,
          .block_granularity = kBlockTokens},
-        {.kind = AttnKind::kFull,
+        {.attn_kind = AttnKind::kFull,
          .sliding_window = 0,
          .cache_blocks_per_lcm_block = 2,
          .block_granularity = kBlockTokens},
-        {.kind = AttnKind::kSlidingWindow,
+        {.attn_kind = AttnKind::kSlidingWindow,
          .sliding_window = 8,
          .cache_blocks_per_lcm_block = 1,
          .block_granularity = kBlockTokens},
     };
     BlockPool pool(64, {1, 2, 1});
-    CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false,
-                                                   /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false,
+                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     const std::vector<std::string> hashes = MakeHashes(kBlocks);
 
     // Cache depth 6 for the full groups, but only blocks [2, 5) for the

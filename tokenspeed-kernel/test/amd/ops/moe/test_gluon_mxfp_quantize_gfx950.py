@@ -30,7 +30,8 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
-import tokenspeed_kernel  # noqa: E402
+from tokenspeed_kernel.ops.quantization import quantize_mxfp4 as kernel_quantize_mxfp4
+from tokenspeed_kernel.ops.quantization import quantize_mxfp8 as kernel_quantize_mxfp8
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._layouts import (  # noqa: E402
     _mxfp4_swiglu_reduce,
@@ -44,6 +45,8 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (  # noqa:
     quantize_mxfp8_sorted_routes,
     scaled_downcast_layout,
 )
+
+# noqa: E402
 
 
 def _unswizzle_cdna4_route_scales(
@@ -85,7 +88,7 @@ def test_sorted_route_mxfp8_quantization_matches_standard_gfx950() -> None:
         sorted_ids,
         num_valid_ids,
     )
-    expected, expected_scales = tokenspeed_kernel.quantize_mxfp8(
+    expected, expected_scales = kernel_quantize_mxfp8(
         hidden_states[source_rows.long()],
         solution="triton",
     )
@@ -197,14 +200,14 @@ def test_quantize_tile_matches_reference_quantizer_gfx950(output_fp8: bool) -> N
     actual, actual_scales, _ = _quantize_tile_probe(values, output_fp8=output_fp8)
 
     if output_fp8:
-        expected, expected_scales = tokenspeed_kernel.quantize_mxfp8(
+        expected, expected_scales = kernel_quantize_mxfp8(
             values,
             enable_pdl=False,
             override=None,
             solution="triton",
         )
     else:
-        expected, expected_scales = tokenspeed_kernel.quantize_mxfp4(
+        expected, expected_scales = kernel_quantize_mxfp4(
             values,
             global_scale=None,
             scale_size=32,

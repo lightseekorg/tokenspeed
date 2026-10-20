@@ -105,7 +105,7 @@ def create_allreduce_fusion_workspace(
     max_num_tokens: int,
     rms_eps: float,
 ) -> AllReduceFusionWorkspace:
-    """Collectively prepare LL/BT and patched HT before graph capture.
+    """Collectively prepare FlashInfer LL/BT/HT before graph capture.
 
     Args:
         group: TP4, TP8, or TP16 group; all ranks must supply identical configuration
@@ -248,7 +248,7 @@ def allreduce_fusion(
 def flashinfer_allreduce_fusion(
     input, workspace, pattern, rms_gamma, num_tokens, expert_weights, expanded_idx
 ):
-    """Dispatch a validated first-stage call to imported LL/BT or patched HT."""
+    """Dispatch a validated first-stage call to FlashInfer LL/BT/HT."""
     return workspace.backend.run(
         input,
         rms_gamma,

@@ -77,7 +77,7 @@ REQUIREMENTS_DIR = ROOT / "requirements"
 THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
 BASE_VERSION = "0.1.4"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
-VALID_BACKENDS = {"cuda", "rocm"}
+VALID_BACKENDS = {"cuda", "rocm", "npu"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
 
 # CUDA kernels source and output directories
@@ -85,7 +85,6 @@ CUDA_CSRC_DIR = THIRDPARTY_DIR / "cuda" / "csrc"
 CUDA_OBJS_DIR = THIRDPARTY_DIR / "cuda" / "objs"
 
 # JIT kernels source directory (no pre-compilation, just need sources available)
-JIT_CSRC_DIR = THIRDPARTY_DIR / "jit_kernel" / "csrc"
 
 CUDA_HOME = os.environ.get("CUDA_HOME", "/usr/local/cuda")
 NVCC = os.environ.get("FLASHINFER_NVCC", f"{CUDA_HOME}/bin/nvcc")
@@ -232,7 +231,7 @@ def _selected_backend() -> str:
 
     raise RuntimeError(
         "Unable to detect CUDA or ROCm for tokenspeed_kernel dependencies. "
-        f"Set {BACKEND_ENV}=cuda or {BACKEND_ENV}=rocm."
+        f"Set {BACKEND_ENV}=cuda, {BACKEND_ENV}=rocm, or {BACKEND_ENV}=npu."
     )
 
 
@@ -508,6 +507,7 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "trtllm_allreduce.cu",
             CUDA_CSRC_DIR / "trtllm_allreduce_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_mnnvl_allreduce_fusion.cu",
+            CUDA_CSRC_DIR / "trtllm_mnnvl_sandwich_norm.cu",
             CUDA_CSRC_DIR / "trtllm_reducescatter_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_allgather_fusion.cu",
         ],
@@ -1040,8 +1040,22 @@ setup(
     install_requires=_selected_install_requires(),
     packages=find_packages(),
     package_data={
-        "tokenspeed_kernel.ops.communication": ["_cuda/*.cu", "README.md"],
-        "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
+        "tokenspeed_kernel.ops.communication": [
+            "_cuda/*.cu",
+            "_cuda/*.cuh",
+        ],
+        "tokenspeed_kernel.thirdparty.cuda": [
+            "objs/**/*.so",
+            # Vendored Lamport protocol and FFI headers for the optional JIT extension.
+            "csrc/tvm_ffi_utils.h",
+            "csrc/include/**/*.h",
+            "csrc/include/**/*.cuh",
+        ],
+        # Optional JIT adapter for fused AllGather quantization.
+        "tokenspeed_kernel.thirdparty.flashinfer": [
+            "allgather_quant.cu",
+            "sm90_moe.patch",
+        ],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
         # loaded via the upstream sys.path bootstrap), so ship it as data.
         "tokenspeed_kernel.thirdparty.msa": [

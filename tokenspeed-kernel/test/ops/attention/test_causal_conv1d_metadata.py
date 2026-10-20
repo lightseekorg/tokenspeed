@@ -22,6 +22,9 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.gdn import (
+    torch_causal_conv1d_prefill_metadata,
+)
 from tokenspeed_kernel.ops.attention.gdn._triton.causal_conv1d_metadata import (
     build_causal_conv1d_prefill_metadata,
 )
@@ -39,14 +42,6 @@ def _boundaries(lengths, device, dtype):
     return torch.tensor(values, device=device, dtype=dtype)
 
 
-def _reference(lengths, block_m):
-    counts = [(length + block_m - 1) // block_m for length in lengths]
-    return (
-        [row for row, count in enumerate(counts) for _ in range(count)],
-        [chunk for count in counts for chunk in range(count)],
-    )
-
-
 @pytest.mark.parametrize(
     "lengths",
     [
@@ -58,6 +53,7 @@ def _reference(lengths, block_m):
         [8193, 17],
         [0, 17, 8199, 0],
         [1] * 129,
+        [5, 0, 9] * 100,
     ],
 )
 @pytest.mark.parametrize("block_m", [8, 16])
@@ -66,12 +62,39 @@ def test_metadata_matches_reference(device, lengths, block_m, dtype):
     metadata = build_causal_conv1d_prefill_metadata(
         _boundaries(lengths, device, dtype), torch.tensor(lengths, dtype=dtype), block_m
     )
-    rows, chunks = _reference(lengths, block_m)
+    rows, chunks = torch_causal_conv1d_prefill_metadata(lengths, block_m)
     assert metadata.batch_indices.tolist() == rows
     assert metadata.chunk_offsets.tolist() == chunks
     assert metadata.batch_indices.dtype == metadata.chunk_offsets.dtype == torch.int32
     assert metadata.block_m == block_m
     assert metadata.batch_indices.device.type == device
+    assert metadata.cu_seqlens_cpu.tolist() == [
+        0,
+        *torch.tensor(lengths, dtype=torch.int64).cumsum(0).tolist(),
+    ]
+
+
+def test_metadata_compiles_once_across_request_counts():
+    """Request and chunk counts follow the batch; neither may key a new binary."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires a GPU")
+    from tokenspeed_kernel.ops.attention.gdn._triton.causal_conv1d_metadata import (
+        _build_causal_conv1d_metadata_kernel,
+    )
+    from utils import assert_no_triton_compile
+
+    def run(lengths):
+        metadata = build_causal_conv1d_prefill_metadata(
+            _boundaries(lengths, "cuda", torch.int32), torch.tensor(lengths), 8
+        )
+        rows, chunks = torch_causal_conv1d_prefill_metadata(lengths, 8)
+        assert metadata.batch_indices.tolist() == rows
+        assert metadata.chunk_offsets.tolist() == chunks
+
+    run([9, 7])
+    with assert_no_triton_compile(_build_causal_conv1d_metadata_kernel):
+        for lengths in ([1], [16], [17, 3], [8] * 16, [5, 0, 9] * 43, [1] * 300):
+            run(lengths)
 
 
 def test_metadata_forward_storage_is_independent(device):
@@ -127,7 +150,7 @@ def test_metadata_cuda_graph_refresh():
         lengths.copy_(torch.tensor(values, dtype=torch.int32))
         boundaries.copy_(_boundaries(values, "cuda", torch.int32))
         graph.replay()
-        rows, chunks = _reference(values, 8)
+        rows, chunks = torch_causal_conv1d_prefill_metadata(values, 8)
         assert metadata.batch_indices.tolist() == rows
         assert metadata.chunk_offsets.tolist() == chunks
         assert metadata.batch_indices.data_ptr() == pointer

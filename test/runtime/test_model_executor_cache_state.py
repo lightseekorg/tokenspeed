@@ -45,6 +45,9 @@ class _ExecutionStream:
 
 def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
     executor = ModelExecutor.__new__(ModelExecutor)
+    from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+
+    executor.attn_backend = CachePoolBinding()
     executor.device = "cpu"
     executor.device_module = torch.cuda
     executor.default_stream = object()
@@ -78,6 +81,9 @@ def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
     can establish these lengths: they come from the prefill node's complete
     prompt, not from the local extend prefix."""
     executor = ModelExecutor.__new__(ModelExecutor)
+    from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+
+    executor.attn_backend = CachePoolBinding()
     executor.device = "cpu"
     executor.device_module = torch.cuda
     executor.default_stream = object()
@@ -108,6 +114,41 @@ def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
     assert executor.runtime_states.valid_cache_lengths[13].item() == 13
 
 
+def test_remote_slot_preparation_orders_behind_the_default_stream(monkeypatch):
+    """The slot a remote admission is granted may be the one a retraction in
+    the same plan imaged: the snapshot store reads it on the write stream and
+    fences the default stream, so the backend write must order behind that
+    stream before anything of the slot changes."""
+    trace = []
+
+    class _Stream:
+        def wait_stream(self, stream):
+            trace.append(("wait", stream))
+
+    class _Backend:
+        def prepare_remote_cache_slots(self, slots):
+            trace.append(("prepare", slots))
+
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.device_module = torch.cuda
+    executor.default_stream = "default"
+    executor.execution_stream = _Stream()
+    executor.attn_backend = _Backend()
+    monkeypatch.setattr(
+        torch.cuda,
+        "stream",
+        lambda stream: (trace.append(("on", stream)), nullcontext())[1],
+    )
+
+    executor.prepare_remote_cache_slots([3, 5])
+
+    assert trace == [
+        ("wait", "default"),
+        ("on", executor.execution_stream),
+        ("prepare", [3, 5]),
+    ]
+
+
 def test_draft_final_step_follows_the_complete_drafter_run():
     events = []
 
@@ -126,6 +167,10 @@ def test_draft_final_step_follows_the_complete_drafter_run():
             events.append("future-input")
 
     executor = ModelExecutor.__new__(ModelExecutor)
+    from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+
+    executor.attn_backend = CachePoolBinding()
+    executor.device_module = SimpleNamespace(current_stream=lambda: None)
     executor.input_buffers = SimpleNamespace(
         req_pool_indices_buf=torch.tensor([0]),
         state_write_req_pool_indices_buf=torch.tensor([0]),
@@ -137,6 +182,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     executor.config = SimpleNamespace(spec_algo="EAGLE3", pp_size=1, output_length=4)
     executor.runtime_states = SimpleNamespace(
         future_input_map=_FutureInputMap(),
+        mark_spec_candidates_drafted=lambda _rows: events.append("candidates-real"),
         vocab_size=32,
     )
     executor.nan_guard = SimpleNamespace(
@@ -144,7 +190,12 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         merge_oov=lambda *_args: None,
     )
     executor._run_target_forward = lambda *_args: SimpleNamespace(
-        next_token_logprobs=None, input_token_logprobs=None
+        next_token_logprobs=None,
+        input_token_logprobs=None,
+        input_top_logprobs_val=None,
+        input_top_logprobs_idx=None,
+        sampled_top_logprobs_val=None,
+        sampled_top_logprobs_idx=None,
     )
     executor._run_sampling = lambda *_args: (
         torch.tensor([3], dtype=torch.int32),
@@ -171,6 +222,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         "draft-write-1",
         "draft-return",
         "future-input",
+        "candidates-real",
         "draft-final",
     ]
 
@@ -220,19 +272,25 @@ def test_non_spec_decode_routes_through_verify():
 
     Non-speculative decode is verify's N == 1 case — _decode_candidates
     yields the one-column window (this step's input token per request) and
-    _run_sampling must call verify(), never the sample() fast path.
+    _sample_and_verify must call verify(), never the sample() fast path.
     """
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
 
     calls = []
 
     executor = ModelExecutor.__new__(ModelExecutor)
+    from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+
+    executor.attn_backend = CachePoolBinding()
+    executor.device_module = SimpleNamespace(current_stream=lambda: None)
     executor.drafter = None
     executor.tree_spec = None
     executor.config = SimpleNamespace(output_length=1)
+    executor._simulated_accept_length = None
     executor.input_buffers = SimpleNamespace(
         input_ids_buf=torch.arange(8, dtype=torch.int32),
         force_single_token_verify_buf=torch.zeros(8, dtype=torch.bool),
+        input_lengths_buf=torch.ones(8, dtype=torch.int32),
     )
     executor.sampling_backend = SimpleNamespace(
         sample=lambda *_a, **_k: calls.append("sample") or (None, None),
@@ -250,12 +308,13 @@ def test_non_spec_decode_routes_through_verify():
         input_num_tokens=3,
         decode_input_ids=None,
         output_layout=ForwardOutputLayout(0, 0, 3, 1),
+        sampled_top_k=0,
     )
     candidates = executor._decode_candidates(ctx)
     assert candidates.shape == (3, 1)
     assert candidates.view(-1).tolist() == [0, 1, 2]
 
-    executor._run_sampling(object(), object(), ctx, candidates)
+    executor._sample_and_verify(object(), object(), ctx, candidates)
     assert calls == [("verify", (3, 1))]
 
     # Pure prefill still samples.
@@ -266,9 +325,15 @@ def test_non_spec_decode_routes_through_verify():
         input_num_tokens=6,
         decode_input_ids=None,
         output_layout=ForwardOutputLayout(2, 2, 0, 1),
+        sampled_top_k=0,
     )
     assert executor._decode_candidates(ctx2) is None
-    executor._run_sampling(object(), object(), ctx2, None)
+    executor._sample_and_verify(
+        object(),
+        SimpleNamespace(valid_cache_lengths=None, req_pool_indices=None),
+        ctx2,
+        None,
+    )
     assert calls == ["sample"]
 
 

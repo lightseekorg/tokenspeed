@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.attention.mha import torch_causal_attention
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -84,13 +84,6 @@ def _qkv(seed: int = 0):
     return q, k, v
 
 
-def _dense_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Single-sequence causal dense reference; fp32 SDPA math. [S,H,D] layout."""
-    qt, kt, vt = (x.transpose(0, 1).float().unsqueeze(0) for x in (q, k, v))
-    out = F.scaled_dot_product_attention(qt, kt, vt, is_causal=True)
-    return out.squeeze(0).transpose(0, 1).to(q.dtype)
-
-
 def _rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
     return (
         (a.float() - b.float()).abs().mean() / b.float().abs().mean().clamp_min(1e-6)
@@ -118,7 +111,7 @@ def _run(q, k, v, skip_softmax_threshold: float, **kwargs):
 
 def test_skip_softmax_no_regression() -> None:
     q, k, v = _qkv()
-    dense = _dense_ref(q, k, v)
+    dense = torch_causal_attention(q, k, v)
     out0 = _run(q, k, v, skip_softmax_threshold=0.0)
     assert torch.isfinite(out0).all()
     assert _rel_err(out0, dense) < _NO_REGRESSION_TOL
@@ -131,7 +124,7 @@ def test_skip_softmax_tiny_threshold_matches_dense() -> None:
     never runs the skip branch's arithmetic.
     """
     q, k, v = _qkv()
-    dense = _dense_ref(q, k, v)
+    dense = torch_causal_attention(q, k, v)
     out = _run(q, k, v, skip_softmax_threshold=_TINY_THRESHOLD)
     assert torch.isfinite(out).all()
     assert _rel_err(out, dense) < _NO_REGRESSION_TOL
@@ -140,7 +133,7 @@ def test_skip_softmax_tiny_threshold_matches_dense() -> None:
 @pytest.mark.parametrize("threshold", _THRESHOLDS)
 def test_skip_softmax_degrades_gracefully(threshold: float) -> None:
     q, k, v = _qkv()
-    dense = _dense_ref(q, k, v)
+    dense = torch_causal_attention(q, k, v)
     out = _run(q, k, v, skip_softmax_threshold=threshold)
     assert torch.isfinite(out).all()
     assert _rel_err(out, dense) < _DEGRADATION_BOUND
@@ -159,7 +152,7 @@ def test_skip_softmax_ragged_seqlen_stays_bounded(threshold: float) -> None:
     q = torch.randn(shape, device="cuda", dtype=_DTYPE)
     k = torch.randn(kv_shape, device="cuda", dtype=_DTYPE)
     v = torch.randn(kv_shape, device="cuda", dtype=_DTYPE)
-    dense = _dense_ref(q, k, v)
+    dense = torch_causal_attention(q, k, v)
 
     cu_seqlens = torch.tensor([0, seqlen], device="cuda", dtype=torch.int32)
     out = launch_gluon_mha_prefill_gfx950(

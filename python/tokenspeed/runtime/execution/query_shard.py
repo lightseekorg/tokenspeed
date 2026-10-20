@@ -20,7 +20,7 @@
 
 """The query shard of a prefill forward under query context parallelism.
 
-Under ``--prefill-context-parallel-size N`` the ranks of the attention TP
+Under ``--query-context-parallel-size N`` the ranks of the attention TP
 group split one extend forward's rows between them: rank ``r`` computes the
 batch-global contiguous rows ``[sum(c[:r]), sum(c[:r+1]))`` of the
 scheduler's packed extend span, with ``c = scatter_count(total_tokens, N)``

@@ -13,9 +13,9 @@ _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _TEST_DIR)
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
 
+from test.runtime.cache_pool_test_utils import make_arena
 from test.runtime.conftest import kimi_recipe, kimi_tp8_layout
 
-from cache_pool_test_utils import make_arena
 from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")

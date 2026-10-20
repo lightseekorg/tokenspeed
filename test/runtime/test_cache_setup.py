@@ -2,6 +2,7 @@ import os
 import sys
 from dataclasses import fields, replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -39,6 +40,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
+    pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     prepare_cache_setup,
@@ -72,6 +74,91 @@ def _pool_over_new_arena(spec, config, *, num_layers: int, rank: int = 0):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width", [1, 3])
+def test_glm_workspace_budget_includes_kda_and_shared_kpool_tails(width):
+    from test.runtime.test_glm53_flash_cache_spec import _recipe
+
+    from tokenspeed.runtime.layers.attention import registry
+
+    recipe = _recipe(
+        tp_size=8,
+        mla_cache_dtype=torch.float8_e4m3fn,
+        draft_layers=int(width > 1),
+    )
+    config = replace(recipe.attn_config, device="cuda", max_bs=2)
+    recipe.attn_config = config
+    if recipe.draft_attn_config is not None:
+        recipe.draft_attn_config = replace(
+            recipe.draft_attn_config, device="cuda", max_bs=2
+        )
+    recipe.probe_batch_rows = 4
+    recipe.server_args.disable_kda_prefill_graph = True
+    recipe.server_args.kda_backend = "auto"
+    linear = config.component(LinearAttnConfig)
+    num_layers = recipe.model_config.num_attention_layers
+    model = SimpleNamespace(
+        num_attention_layers=num_layers,
+        attention_arch=registry.AttentionArch.DSA,
+        hf_config=SimpleNamespace(
+            architectures=["Glm53FlashForConditionalGeneration"],
+            full_attention_layer_ids=[
+                layer for layer in range(num_layers) if layer not in linear.layer_ids
+            ],
+        ),
+    )
+    setup = recipe.setup()
+    arena = create_cache_arena(
+        setup.spec, device=config.device, enable_memory_saver=False
+    )
+    backend, pool = registry._create_target_components(
+        server_args=recipe.server_args,
+        model_config=model,
+        config=config,
+        cache_spec=setup.spec.layer_view(first_layer=0, num_layers=num_layers),
+        arena=arena,
+        rank=0,
+        full_attn_backend_name="dsa",
+        linear_attention="kda",
+        is_inkling=False,
+        backend=None,
+    )
+    backend.set_cache_pool(pool)
+    # The tail allocation is shared by target/draft views; count its storage
+    # once, together with the verify buffers owned by the target backend.
+    tail_bytes = pool._kpool_tail_workspace.storage.nbytes
+    verify_bytes = (
+        backend.preallocate_verify_workspace(config.max_bs, width) if width > 1 else 0
+    )
+    assert setup.fixed_workspace_bytes == tail_bytes + verify_bytes
+
+
+@pytest.mark.parametrize(
+    "uses_paged_state_verify,expected_bytes",
+    [(True, 128), (True, 0), (False, 128)],
+)
+def test_verify_preparation_calls_root_with_existing_budget_gate(
+    uses_paged_state_verify, expected_bytes
+):
+    backend = Mock(spec=AttentionBackend)
+    backend.preallocate_verify_workspace.return_value = 128
+    draft_backend = Mock(spec=AttentionBackend)
+    kwargs = dict(
+        server_args=SimpleNamespace(speculative_num_draft_tokens=3),
+        config=SimpleNamespace(max_bs=4, qcp_size=1),
+        backend=backend,
+        draft_backend=draft_backend,
+        uses_paged_state_verify=uses_paged_state_verify,
+        is_inkling=False,
+    )
+    _prepare_fixed_workspaces(**kwargs, expected_bytes=expected_bytes)
+    if uses_paged_state_verify and expected_bytes:
+        backend.preallocate_verify_workspace.assert_called_once_with(4, 3)
+    else:
+        backend.preallocate_verify_workspace.assert_not_called()
+    draft_backend.preallocate_verify_workspace.assert_not_called()
+
+
 def _model_wide_kwargs(**overrides) -> dict:
     """The AttnConfig (model-wide) tier the test configs share."""
     kwargs = dict(
@@ -99,6 +186,59 @@ def _mha_config() -> AttnConfig:
         cache_layer_types=(),
     )
     return AttnConfig(components=(spec,), **_model_wide_kwargs())
+
+
+@pytest.mark.parametrize(
+    "is_draft,width,num_layers,layerwise,ring_rows",
+    [(False, 1, 3, True, 4), (True, 4, 1, False, 7)],
+)
+def test_inkling_construction_matches_ring_reservation(
+    is_draft, width, num_layers, layerwise, ring_rows
+):
+    from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+        InklingAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
+        _conv_ring_bytes,
+    )
+
+    config = _mha_config()
+    spec = replace(
+        config.component(MHAConfig),
+        num_attention_heads=4,
+        num_kv_heads=4,
+        attn_tp_size=2,
+    )
+    config = replace(
+        config,
+        components=(spec,),
+        is_draft=is_draft,
+        speculative_num_draft_tokens=width,
+    )
+    text = SimpleNamespace(
+        sconv_kernel_size=4,
+        num_key_value_heads=4,
+        head_dim=2,
+        hidden_size=8,
+    )
+    inner = AttentionBackend(config, spec)
+    backend = InklingAttnBackend.from_config(
+        inner,
+        text,
+        config,
+        num_layers=num_layers,
+        is_draft=is_draft,
+        enable_layerwise_cache_ready=layerwise,
+    )
+    assert backend.conv_pool.conv_state.shape == (num_layers, 4, ring_rows, 24)
+    assert backend.conv_spec_num_tokens == width
+    assert backend.enable_layerwise_cache_ready is layerwise
+    assert backend.fixed_workspace_bytes() == _conv_ring_bytes(
+        text_config=text,
+        attn_config=config,
+        num_layers=num_layers,
+        spec_tokens=width,
+    )
 
 
 def _mla_config() -> AttnConfig:
@@ -159,7 +299,7 @@ class _SyntheticHybridRecipe(CacheRecipe):
         **kwargs,
     ) -> None:
         super().__init__(
-            server_args=SimpleNamespace(max_total_tokens=None),
+            server_args=SimpleNamespace(kv_offload_config=None, max_total_tokens=None),
             model_config=None,
             attn_config=_ns_config(
                 prefix_granularity=4,
@@ -212,10 +352,8 @@ class _SyntheticHybridRecipe(CacheRecipe):
             (
                 CacheGroupSpec(
                     group_id=self._extra_state_group,
-                    retention="full_history",
+                    attn_kind="state",
                     sliding_window_tokens=None,
-                    family="state",
-                    checkpoint_granularity=self.prefix_granularity,
                     replayable=False,
                 ),
                 (CacheFieldSpec("layer.0.state", "slot.0", (128,), "uint8"),),
@@ -297,6 +435,7 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         **_model_wide_kwargs(),
     )
     server_args = SimpleNamespace(
+        kv_offload_config=None,
         prefix_granularity=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=0,
@@ -340,17 +479,27 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
 
 
 @pytest.mark.parametrize(
-    ("replay_enabled", "replay_supported", "topk", "expected_workspace_bytes"),
+    (
+        "replay_enabled",
+        "replay_supported",
+        "topk",
+        "draft_tokens",
+        "expected_workspace_bytes",
+    ),
     # Non-replay stages conv+ssm for 8 verify rows: 8 * (8 + 8). Replay: 64
     # conv staging bytes plus the captured payload (6 rows of 7 bf16
     # channels) and the fp32 A_log/dt_bias pairs -- 64 + 84 + 16.
     # A replayed draft tree (topk 2) adds one 8-byte ssm state per draft position: 2 * 3 * 8.
     (
-        (False, True, 1, 128),
-        (True, False, 1, 128),
-        (True, True, 1, 164),
-        (False, True, 2, 128),
-        (True, True, 2, 212),
+        (False, True, 1, 3, 128),
+        (True, False, 1, 3, 128),
+        (True, True, 1, 3, 164),
+        (False, True, 2, 3, 128),
+        (True, True, 2, 3, 212),
+        (True, True, 2, 7, 452),
+        (True, True, 2, 8, 384),
+        (True, True, 2, 16, 736),
+        (True, True, 2, 17, 1052),
     ),
 )
 def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
@@ -358,6 +507,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     replay_enabled: bool,
     replay_supported: bool,
     topk: int,
+    draft_tokens: int,
     expected_workspace_bytes: int,
 ) -> None:
     monkeypatch.setattr(
@@ -384,9 +534,10 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
         components=(replace(target_spec, cache_layer_types=(FULL_ATTENTION,)),),
     )
     server_args = SimpleNamespace(
+        kv_offload_config=None,
         block_size=64,
         max_total_tokens=None,
-        speculative_num_draft_tokens=3,
+        speculative_num_draft_tokens=draft_tokens,
         speculative_eagle_topk=topk,
         enable_replay_ssm=replay_enabled,
     )
@@ -413,8 +564,9 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
 
 @pytest.mark.parametrize("speculative,width", [(False, 1), (True, 1), (True, 3)])
 @pytest.mark.parametrize("ple_enabled", (False, True))
+@pytest.mark.parametrize("role", ("null", "prefill", "decode"))
 def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
-    speculative: bool, width: int, ple_enabled: bool
+    speculative: bool, width: int, ple_enabled: bool, role: str
 ) -> None:
     text_config = SimpleNamespace(
         ple_layer_ids=(0, 1) if ple_enabled else (),
@@ -440,6 +592,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         speculative_num_draft_tokens=width,
         **_model_wide_kwargs(),
     )
+    attn_config = replace(attn_config, pd_disaggregation_enabled=role != "null")
     draft_config = (
         replace(
             attn_config,
@@ -449,11 +602,13 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         else None
     )
     server_args = SimpleNamespace(
+        kv_offload_config=None,
         block_size=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=width,
         speculative_eagle_topk=1,
         enable_replay_ssm=False,
+        disaggregation_mode=role,
     )
     setup = prepare_cache_setup(
         family="qwen4_exp",
@@ -471,7 +626,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
-    if not speculative:
+    if not speculative or role == "prefill":
         assert setup.fixed_workspace_bytes == 0
         return
 
@@ -506,6 +661,52 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
     assert setup.fixed_workspace_bytes == 128 + ple_bytes  # GDN conv + SSM: 128 B.
 
 
+def test_parent_is_its_planes_whatever_the_group_packings() -> None:
+    # Coprime packings, as Qwen4-Exp's PLE and QSA side planes get: a parent
+    # rounded up to their LCM (5376 bytes here) would hold 4096 bytes no field
+    # addresses. At Qwen3.8-Flash-Next TP1 that rounding made a 255 MB parent
+    # 54 GB.
+    def state(group_id: str) -> CacheGroupSpec:
+        return CacheGroupSpec(
+            group_id=group_id,
+            attn_kind="state",
+            sliding_window_tokens=None,
+            replayable=False,
+        )
+
+    layout = pack(
+        (
+            (
+                state("ssm"),
+                (CacheFieldSpec("ssm.state", "plane.ssm", (4096,), "uint8"),),
+            ),
+            (
+                state("side_a"),
+                (CacheFieldSpec("side_a.key", "plane.a", (256,), "uint8"),),
+            ),
+            (
+                state("side_b"),
+                (CacheFieldSpec("side_b.key", "plane.b", (256,), "uint8"),),
+            ),
+        ),
+        prefix_granularity=16,
+        cache_blocks_per_lcm_block={"ssm": 1, "side_a": 3, "side_b": 7},
+        alignment=256,
+        max_padding_fraction=float("inf"),
+    )
+    plan = layout.bind(3)
+
+    planes = sum(plane.bytes_per_lcm_block for plane in plan.planes)
+    assert planes == 4096 + 3 * 256 + 7 * 256
+    assert plan.lcm_block_bytes == planes
+    assert plan.arena_bytes == 4 * planes
+    # Every group's last page still ends inside the arena.
+    for group in plan.groups:
+        _, fields = plan.page_field_layout(group.group_id)
+        for base, stride, size in fields:
+            assert base + (group.page_count - 1) * stride + size <= plan.arena_bytes
+
+
 @pytest.mark.parametrize(
     ("full_layers", "sliding_layers", "usable_pages"),
     ((2, 0, 15), (1, 4, 7)),
@@ -525,7 +726,7 @@ def test_ordinary_mha_reserves_null_parent_within_cache_budget(
         sliding_window_tokens=512,
     )
     attn_config = replace(attn_config, components=(mha,))
-    server_args = SimpleNamespace(max_total_tokens=None)
+    server_args = SimpleNamespace(kv_offload_config=None, max_total_tokens=None)
 
     setup = prepare_cache_setup(
         family="mha",
@@ -565,7 +766,7 @@ def test_ordinary_mla_reserves_null_parent_within_cache_budget() -> None:
         hf_config=SimpleNamespace(),
     )
     attn_config = _mla_config()
-    server_args = SimpleNamespace(max_total_tokens=None)
+    server_args = SimpleNamespace(kv_offload_config=None, max_total_tokens=None)
 
     setup = prepare_cache_setup(
         family="mla",
@@ -611,7 +812,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
 
     setup = prepare_cache_setup(
         family=family,
-        server_args=SimpleNamespace(max_total_tokens=None),
+        server_args=SimpleNamespace(kv_offload_config=None, max_total_tokens=None),
         model_config=model_config,
         attn_config=target_attn_config,
         draft_model_config=draft_model_config,
@@ -758,53 +959,6 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
         )
 
 
-def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import tokenspeed.runtime.layers.attention.registry as registry
-
-    monkeypatch.setattr(
-        registry,
-        "is_deepseek_v4",
-        lambda config: getattr(config, "is_deepseek_v4", False),
-    )
-    server_args = SimpleNamespace(
-        attention_backend=None,
-        drafter_attention_backend=None,
-        disaggregation_mode="prefill",
-    )
-    target = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            architectures=("LlamaForCausalLM",),
-            is_deepseek_v4=False,
-        ),
-        model_profile=None,
-    )
-    draft = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            architectures=("DeepseekV4ForCausalLMNextN",),
-            is_deepseek_v4=True,
-        ),
-        model_profile=None,
-    )
-
-    with pytest.raises(NotImplementedError, match="target-only"):
-        registry.create_attn_components(
-            server_args,
-            target,
-            gpu_id=0,
-            rank=0,
-            gpu_memory=0,
-            draft_model_config=draft,
-            graph_reserve_bytes=0,
-            post_profile_bytes=0,
-            probe_batch_rows=None,
-            profiled_cache_bytes=None,
-            reuse_target_backend=None,
-            reuse_draft_backend=None,
-        )
-
-
 def test_hybrid_draft_layers_share_plan_with_disjoint_views() -> None:
     setup = _hybrid_setup_with_narrow_draft()
 
@@ -864,9 +1018,8 @@ def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:
 def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
     """No new contract: the one spec publishes draft-only
     groups as ordinary groups; pool publication and the scheduler config
-    conversion carry them with their natural retention — the C++ side
-    instantiates its existing SwaManager for them, no draft concept
-    anywhere."""
+    conversion carry them with their own kind -- the C++ side treats them as
+    any sliding-window group, no draft concept anywhere."""
     from test.runtime.cache_pool_test_utils import MinimalCacheView
 
     import torch
@@ -957,7 +1110,8 @@ def test_qwen_mtp_padding_allowance_tracks_draft_planes() -> None:
             "linear_attention",
             "full_attention",
         ) * full_attention_layers
-        recipe.draft_attn_config = object() if draft_layers else None
+        recipe.attn_config = _mha_config()
+        recipe.draft_attn_config = _mha_config() if draft_layers else None
         recipe.draft_model_config = SimpleNamespace(num_attention_layers=draft_layers)
         return QwenGDNRecipe.max_padding_fraction.fget(recipe)
 
@@ -970,6 +1124,165 @@ def test_qwen_mtp_padding_allowance_tracks_draft_planes() -> None:
             )
             < 1e-9
         )
+
+
+def _qwen_gdn_setup(
+    full_attention_layers: int,
+    *,
+    gdn_layers_per_block: int = 3,
+    target_kv_dtype: torch.dtype = torch.bfloat16,
+    draft_kv_heads: int | None = None,
+):
+    """Plan Qwen3.5 blocks of GDN layers and one attention layer; an SSM state is one bf16 K page."""
+    labels = (
+        (LINEAR_ATTENTION,) * gdn_layers_per_block + (FULL_ATTENTION,)
+    ) * full_attention_layers
+    target_spec = MHAConfig(
+        backend_name="fa2",
+        num_attention_heads=1,
+        num_kv_heads=1,
+        head_dim=128,
+        attn_tp_size=1,
+        cache_layer_types=labels,
+    )
+    components = (target_spec,)
+    if gdn_layers_per_block:
+        components += (
+            LinearAttnConfig(
+                num_k_heads=8,
+                num_v_heads=8,
+                head_k_dim=32,
+                head_v_dim=32,
+                conv_kernel_size=4,
+                layer_ids=tuple(
+                    layer_id
+                    for layer_id, label in enumerate(labels)
+                    if label == LINEAR_ATTENTION
+                ),
+                tp_size=1,
+            ),
+        )
+    attn_config = AttnConfig(
+        components=components,
+        **_model_wide_kwargs(
+            kv_cache_dtype=target_kv_dtype, prefix_granularity=128, kernel_page_size=128
+        ),
+    )
+    draft_attn_config = None
+    if draft_kv_heads is not None:
+        draft_spec = replace(
+            target_spec,
+            num_attention_heads=draft_kv_heads,
+            num_kv_heads=draft_kv_heads,
+            cache_layer_types=(FULL_ATTENTION,),
+        )
+        draft_attn_config = replace(
+            attn_config, components=(draft_spec,), kv_cache_dtype=torch.bfloat16
+        )
+    return prepare_cache_setup(
+        family="qwen_gdn",
+        server_args=SimpleNamespace(
+            kv_offload_config=None,
+            block_size=64,
+            max_total_tokens=None,
+            speculative_num_draft_tokens=3,
+            speculative_eagle_topk=1,
+            enable_replay_ssm=False,
+        ),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(text_config=SimpleNamespace()),
+        ),
+        attn_config=attn_config,
+        draft_model_config=SimpleNamespace(
+            num_attention_layers=int(draft_kv_heads is not None)
+        ),
+        draft_attn_config=draft_attn_config,
+        cache_budget_bytes=1 << 28,
+        probe_batch_rows=None,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+
+
+def _page_padding(memory_plan) -> dict[str, int]:
+    """Bytes of each group's page that none of its fields use."""
+    payload = {}
+    for field in memory_plan.fields:
+        payload[field.group_id] = payload.get(field.group_id, 0) + field.payload_bytes
+    return {
+        group.group_id: memory_plan.lcm_block_bytes // group.cache_blocks_per_lcm_block
+        - payload[group.group_id]
+        for group in memory_plan.groups
+    }
+
+
+@pytest.mark.parametrize(
+    "draft_kv_heads,target_kv_dtype",
+    [(4, torch.bfloat16), (1, torch.float8_e4m3fn)],
+)
+def test_qwen_recipe_plans_a_draft_layer_wider_than_a_target_attention_layer(
+    draft_kv_heads, target_kv_dtype
+) -> None:
+    """GDN groups pad over a draft layer's K/V planes wider in bytes than a target attention layer's."""
+    # More KV heads, or bf16 over an FP8 target: wider in bytes than a target attention layer.
+    setup = _qwen_gdn_setup(
+        2, target_kv_dtype=target_kv_dtype, draft_kv_heads=draft_kv_heads
+    )
+
+    fields_by_id = {field.field_id: field for field in setup.spec.memory_plan.fields}
+    assert fields_by_id["layer.3.k"].shape == (128, 1, 128)
+    assert fields_by_id["layer.8.k"].shape == (128, draft_kv_heads, 128)
+    assert fields_by_id["layer.8.k"].dtype == "bfloat16"
+    assert fields_by_id["layer.8.k"].group_id == FULL_ATTENTION
+    assert setup.spec.token_capacity > 0
+
+
+def test_qwen_state_blocks_carry_no_attention_planes() -> None:
+    """A GDN state block holds its SSM states and conv windows only; KV pages pad by the conv windows."""
+    plan = _qwen_gdn_setup(2, gdn_layers_per_block=2).spec.memory_plan
+    conv_bytes = {
+        field.payload_bytes for field in plan.fields if field.field_id.endswith(".conv")
+    }.pop()
+
+    # Two attention layers' K and V span four SSM states: all four GDN layers share one page.
+    assert _page_padding(plan) == {
+        FULL_ATTENTION: 4 * conv_bytes,
+        "linear_attention_0": 0,
+    }
+
+
+def test_qwen_conv_windows_fill_a_free_state_segment() -> None:
+    """When the SSM states leave a segment free, the conv windows pack into it and KV pages pad nothing."""
+    plan = _qwen_gdn_setup(2).spec.memory_plan
+    payload = {
+        suffix: {
+            field.payload_bytes
+            for field in plan.fields
+            if field.field_id.endswith(suffix)
+        }.pop()
+        for suffix in (".ssm", ".conv")
+    }
+
+    # Six GDN layers over four segments: two groups of three states, one segment left for their conv windows.
+    assert plan.lcm_block_bytes == 4 * payload[".ssm"]
+    assert _page_padding(plan) == {
+        FULL_ATTENTION: 0,
+        "linear_attention_0": payload[".ssm"] - 3 * payload[".conv"],
+        "linear_attention_1": payload[".ssm"] - 3 * payload[".conv"],
+    }
+
+
+def test_qwen_mtp_draft_layer_fills_state_segments() -> None:
+    """An MTP layer of a target attention layer's bytes takes segments the state layers fill too."""
+    plan = _qwen_gdn_setup(2, draft_kv_heads=1).spec.memory_plan
+    fields = {field.field_id: field for field in plan.fields}
+    state_planes = {
+        field.plane_id for field in plan.fields if field.field_id.endswith(".ssm")
+    }
+
+    assert fields["layer.8.k"].group_id == FULL_ATTENTION
+    assert {fields["layer.8.k"].plane_id, fields["layer.8.v"].plane_id} <= state_planes
+    assert _page_padding(plan)["linear_attention_0"] == 0
 
 
 def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
@@ -1008,11 +1321,11 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
         ("tokenspeed_mla", None, None),
         (None, "tokenspeed_mla", None),
         ("trtllm_mla", None, "does not support MLA DCP"),
-        (None, "trtllm_mla", "DCP currently requires"),
-        (None, "flashmla", "does not yet support speculation"),
+        (None, "trtllm_mla", r"\(DCP decode\) currently requires"),
+        (None, "flashmla", None),
     ],
 )
-def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
+def test_kimi_kvp_resolves_target_and_draft_before_cache_allocation(
     monkeypatch, target_backend, draft_backend, error
 ):
     from test.runtime.conftest import kimi_recipe
@@ -1024,7 +1337,7 @@ def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
     args = SimpleNamespace(
         attention_backend=target_backend,
         drafter_attention_backend=draft_backend,
-        decode_context_parallel_size=2,
+        kv_parallel_size=2,
         disaggregation_mode="null",
         mapping=SimpleNamespace(world_size=8, world_group=tuple(range(8))),
         gpu_memory_utilization=0.9,
@@ -1052,8 +1365,8 @@ def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
         config = replace(
             base,
             device="cuda",
-            dcp_size=2,
-            dcp_group=(0, 1),
+            kvp_size=2,
+            kvp_group=(0, 1),
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
             is_draft=is_draft,
@@ -1069,8 +1382,8 @@ def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
     def profile(**kwargs):
         config = kwargs["attn_config"]
         assert config.component(SoftmaxAttnConfig).backend_name == "tokenspeed_mla"
-        assert (
-            built_draft[0].component(SoftmaxAttnConfig).backend_name == "tokenspeed_mla"
+        assert built_draft[0].component(SoftmaxAttnConfig).backend_name == (
+            draft_backend or "tokenspeed_mla"
         )
         raise ReadyForAllocation
 
@@ -1115,8 +1428,8 @@ def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
         assert args.drafter_attention_backend == draft_backend
 
 
-@pytest.mark.parametrize("degree", [1, 2])
-def test_kimi_dspark_rejects_sharded_context_writes(degree):
+@pytest.mark.parametrize("degree", [1, 2, 8])
+def test_kimi_dspark_preserves_backend_with_kvp(degree):
     from tokenspeed.runtime.layers.attention import registry
 
     def side(architecture):
@@ -1131,16 +1444,13 @@ def test_kimi_dspark_rejects_sharded_context_writes(degree):
     args = SimpleNamespace(
         attention_backend="tokenspeed_mla",
         drafter_attention_backend="tokenspeed_mla",
-        decode_context_parallel_size=degree,
+        kv_parallel_size=degree,
     )
     target = side("KimiK3ForConditionalGeneration")
     draft = side("K3DSparkModel")
-    if degree > 1:
-        with pytest.raises(ValueError, match="K3 DSpark does not support DCP"):
-            registry._apply_backend_overrides(args, target, draft)
-    else:
-        registry._apply_backend_overrides(args, target, draft)
-        assert args.drafter_attention_backend == "tokenspeed_mla"
+    registry._apply_backend_overrides(args, target, draft)
+    assert args.attention_backend == registry.HYBRID_LINEAR_ATTN_BACKEND
+    assert args.drafter_attention_backend == "tokenspeed_mla"
 
 
 class _Sized(Exception):
@@ -1164,7 +1474,6 @@ def _fake_around_the_budget(monkeypatch, free):
     )
     monkeypatch.setattr(common.torch, "get_device_module", lambda device: gpu)
     side = SimpleNamespace(
-        is_deepseek_v4=False,
         is_hybrid_linear=False,
         is_dspark=False,
         requested_backend=None,
@@ -1173,7 +1482,7 @@ def _fake_around_the_budget(monkeypatch, free):
     monkeypatch.setattr(registry, "_check_pd_support", lambda *a, **k: None)
     monkeypatch.setattr(registry, "_apply_backend_overrides", lambda *a, **k: None)
     config = SimpleNamespace(
-        component=lambda cls: SimpleNamespace(), dcp_size=1, device="cuda"
+        component=lambda cls: SimpleNamespace(), kvp_size=1, device="cuda"
     )
     monkeypatch.setattr(registry, "_create_attn_config", lambda *a, **k: config)
     monkeypatch.setattr(registry, "_resolve_cache_family", lambda *a: "mha")
@@ -1223,7 +1532,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
         prepare_communication_runtime=lambda tokens: None,
     )
     monkeypatch.setattr(factory, "create_model_runner", lambda *a: (target, None))
-    monkeypatch.setattr(device, "probe_arena_floor", lambda *a: 8)
+    monkeypatch.setattr(device, "probe_arena_floor", lambda *a, **k: 8)
     server_args = SimpleNamespace(
         disaggregation_mode=mode,
         chunked_prefill_size=8192,
@@ -1233,7 +1542,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
         enforce_eager=False,
         enable_memory_saver=False,
         gpu_memory_utilization=0.9,
-        mapping=SimpleNamespace(world_size=1, world_group=None),
+        mapping=SimpleNamespace(world_size=1, world_group=None, is_first_pp_rank=True),
     )
     with pytest.raises(_Sized) as sized:
         device.build_device_side(
@@ -1334,7 +1643,10 @@ def test_the_admission_builds_the_pool_the_budget_left_out(
         attn_tp_group=[0],
         pg_manager=None,
     )
-    prefill = SimpleNamespace(disaggregation_mode="prefill")
+    prefill = SimpleNamespace(
+        disaggregation_mode="prefill",
+        mapping=SimpleNamespace(is_first_pp_rank=True),
+    )
     assert sum(registered) == recv_pool.recv_pool_bytes(prefill, True)
     pool = slots * slot_mb << 20 if slots > 0 and slot_mb > 0 else 0
     assert sum(registered) == pool
@@ -1368,7 +1680,7 @@ def test_the_admission_builds_the_pool_exactly_where_the_budget_left_it_out(
         disaggregation_mode=mode,
         disaggregation_bootstrap_port=0,
         disaggregation_ib_device=None,
-        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1)),
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1), is_first_pp_rank=True),
     )
     facts = SimpleNamespace(device="cpu", hidden=16, num_deepstack=0, dtype=None)
     prefill_admission.make_epd_prefill_admission(
@@ -1376,7 +1688,11 @@ def test_the_admission_builds_the_pool_exactly_where_the_budget_left_it_out(
         0,
         model_config=SimpleNamespace(is_multimodal=True, is_multimodal_active=active),
         encoder_model_facts=lambda: facts,
-        mapping=SimpleNamespace(attn=SimpleNamespace(tp_group=[0])),
+        mapping=SimpleNamespace(
+            attn=SimpleNamespace(tp_group=[0]),
+            is_first_pp_rank=True,
+            has_pp=False,
+        ),
         attn_tp_rank=0,
         attn_tp_size=1,
         attn_tp_cpu_group=None,

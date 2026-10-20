@@ -1,10 +1,10 @@
-# Agentic Benchmark — TokenSpeed
+# Agentic benchmark — TokenSpeed
 
 Sweep `ts serve` against an agentic, multi-turn workload (SWE-Smith) at a
 fixed set of attention/MoE parallelism layouts and report per-config throughput,
 latency, and KV-cache hit rate.
 
-Server listens on port **8000**.
+The server listens on port **8000**.
 
 ## Layout
 
@@ -25,7 +25,7 @@ cd test/agentic_benchmark/kimi_k2.5/tokenspeed
 The script (1) installs evalscope at the pinned commit, (2) builds the SWE-Smith
 multi-turn dataset, (3) iterates each config in `CONFIGS=()`: launch server, poll
 `/readiness` until ready, run `evalscope perf`, kill server, wait for the port to be
-free, repeat. Aborts the whole sweep on the first failure (`set -e`).
+free, repeat. It aborts the whole sweep on the first failure (`set -e`).
 
 To narrow the matrix, comment out entries in the `CONFIGS=()` array.
 
@@ -44,7 +44,8 @@ layout. Key flags:
 Naming: `attn_<X>_moe_<Y>` where `X ∈ {tp4,tp8,dp8}` and `Y ∈ {tp4,tp8,ep4,ep8}`.
 World size = the number after `attn_(tp|dp)`.
 
-To verify the parallelism actually applied, grep the server log:
+To verify the parallelism that was actually applied, grep the server log:
+
 ```bash
 grep -A6 "Parallelism configuration" /tmp/tokenspeed_server_<config>.log
 ```
@@ -55,8 +56,9 @@ grep -A6 "Parallelism configuration" /tmp/tokenspeed_server_<config>.log
 python3 collect_outputs.py outputs/<sweep_ts> -o sweep.csv
 ```
 
-Emits one row per (config, concurrency) with `Conc.`, `Latency (tps/user)`,
-`Throughput (tps/gpu)`, `Approx Cache Hit`, `Decoded Tok/Iter`. `tps/gpu` divides
+`collect_outputs.py` emits one row per (config, concurrency) with `Conc.`,
+`Latency (tps/user)`, `Throughput (tps/gpu)`, `Approx Cache Hit`, and
+`Decoded Tok/Iter`. `tps/gpu` divides
 the system-wide `Total Throughput (tok/s)` by the GPU count inferred from the
-config name; the other metrics come straight from `benchmark_summary.json`
+config name. The other metrics come straight from `benchmark_summary.json`
 (same numbers as evalscope's `performance_summary.txt` Request Metrics table).

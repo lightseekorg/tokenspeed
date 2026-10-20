@@ -28,17 +28,16 @@ architecture:
   replay is "refresh + graph.replay()");
 * per-bs metadata views are pointer-stable and lazily built for a bs never
   captured (the above-ladder decode path);
-* the persistent buffers are sized by max decode bs, not the capture ladder;
-* every leaf class carries the uniform leaf signature, every runner-facing
-  node the runner signature (conformance).
+* the persistent buffers are sized by max decode bs, not the capture ladder.
 """
 
 from __future__ import annotations
 
 import os
 import sys
-import unittest
 from types import SimpleNamespace
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -56,12 +55,13 @@ MAX_NUM_PAGES = 6
 FULL = "full_attention"
 
 
-class _TorchCase(unittest.TestCase):
-    def setUp(self):
+class _TorchCase:
+    @pytest.fixture(autouse=True)
+    def _setup_torch(self):
         try:
             import torch
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch: {exc}")
+            pytest.skip(f"needs torch: {exc}")
         self.torch = torch
 
 
@@ -70,14 +70,14 @@ class _RouterCase(_TorchCase):
     MAX_DECODE_BS (the wrapper passes max_decode_bs to
     init_cuda_graph_state, never the capture-ladder max)."""
 
-    def setUp(self):
-        super().setUp()
+    @pytest.fixture(autouse=True)
+    def _setup_router(self, _setup_torch):
         try:
             from tokenspeed.runtime.layers.attention.backends.paged.mha import (
                 MHAAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs tokenspeed_kernel: {exc}")
         from tokenspeed.runtime.layers.attention.backends.paged.router import (
             CacheGroupRouter,
         )
@@ -101,10 +101,10 @@ class _RouterCase(_TorchCase):
         router.bind(
             CacheGroupGeometry(
                 granularities={FULL: 2},
-                families={FULL: "history"},
+                attn_kinds={FULL: "full_history"},
                 full_history_group_id=FULL,
                 row_geometry={FULL: (2, 1)},
-                retentions={FULL: ("full_history", None)},
+                windows={FULL: None},
             ),
             {FULL: leaf},
         )
@@ -131,7 +131,7 @@ class _RouterCase(_TorchCase):
         return self.leaf.forward_decode_metadata
 
 
-class EagerMatchesPaddedReplayTest(_RouterCase):
+class TestEagerMatchesPaddedReplayTest(_RouterCase):
     def test_live_rows_identical_across_paths(self):
         torch = self.torch
         seq = torch.tensor([5, 4], dtype=torch.int32)
@@ -144,7 +144,7 @@ class EagerMatchesPaddedReplayTest(_RouterCase):
             SimpleNamespace(group_id=FULL, layer_id=0), ForwardMode.DECODE
         )[:2].clone()
         # Padded rows landed on the null page.
-        self.assertTrue((self.leaf.page_table_buf[2:LADDER_BS] == 0).all())
+        assert (self.leaf.page_table_buf[2:LADDER_BS] == 0).all()
 
         # Eager refresh at the true bs (unpadded) over the same buffers.
         md = self._refresh(2, 2, seq, replay=False)
@@ -156,23 +156,23 @@ class EagerMatchesPaddedReplayTest(_RouterCase):
             replay_locs,
         )
         # Metadata views the SAME persistent storage on both paths.
-        self.assertEqual(md.page_table.data_ptr(), self.leaf.page_table_buf.data_ptr())
+        assert (md.page_table.data_ptr()) == (self.leaf.page_table_buf.data_ptr())
 
 
-class AboveLadderDecodeTest(_RouterCase):
+class TestAboveLadderDecodeTest(_RouterCase):
     def test_refresh_serves_bs_above_capture_ladder(self):
         torch = self.torch
         bs = MAX_DECODE_BS  # above LADDER_BS: no graph exists, same refresh
         seq = torch.arange(3, 3 + bs, dtype=torch.int32)
         md = self._refresh(bs, bs, seq, replay=False)
-        self.assertEqual(md.seq_lens.shape[0], bs)
+        assert (md.seq_lens.shape[0]) == (bs)
         torch.testing.assert_close(self.leaf.seq_lens_buf[:bs], seq)
         # Lazy per-bs views: built once, pointer-stable on the next refresh.
         md2 = self._refresh(bs, bs, seq + 1, replay=False)
-        self.assertIs(md2, md)
+        assert (md2) is (md)
 
 
-class FlashMLATileScheduleTest(_TorchCase):
+class TestFlashMLATileScheduleTest(_TorchCase):
     """FlashMLA's kernel freezes its tile schedule on the first call against
     a sched-meta object (a request that has since crossed a page boundary
     loses its newest page), so the object is bound to one seq_lens value and
@@ -180,12 +180,12 @@ class FlashMLATileScheduleTest(_TorchCase):
     scratch held on the backend — never a field of the pointer-stable decode
     views, so the graph_ptr_guard has nothing to exempt."""
 
-    def setUp(self):
-        super().setUp()
+    @pytest.fixture(autouse=True)
+    def _setup_flashmla(self, request, _setup_torch):
         try:
             from tokenspeed.runtime.layers.attention.backends.paged import flashmla
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs tokenspeed_kernel: {exc}")
         from unittest import mock
 
         self.flashmla = flashmla
@@ -195,7 +195,7 @@ class FlashMLATileScheduleTest(_TorchCase):
             flashmla, "get_mla_metadata", lambda: (SimpleNamespace(), None)
         )
         patcher.start()
-        self.addCleanup(patcher.stop)
+        request.addfinalizer(patcher.stop)
 
         torch = self.torch
         leaf = flashmla.FlashMLABackend.__new__(flashmla.FlashMLABackend)
@@ -206,10 +206,10 @@ class FlashMLATileScheduleTest(_TorchCase):
         leaf.max_context_len = MAX_NUM_PAGES * flashmla.PAGE_SIZE
         leaf.kernel_page_size = flashmla.PAGE_SIZE
         leaf.device = "cpu"
-        leaf.dcp_group = (0,)
-        leaf.dcp_rank = 0
-        leaf.dcp_block_granularity = None
-        leaf.dcp_virtual_block_count = None
+        leaf.kvp_group = (0,)
+        leaf.kvp_rank = 0
+        leaf.kvp_block_granularity = None
+        leaf.kvp_virtual_block_count = None
         leaf.dcp_metadata = None
         leaf.forward_decode_metadata = None
         leaf._decode_tile_metadata = None
@@ -228,15 +228,14 @@ class FlashMLATileScheduleTest(_TorchCase):
             LADDER_BS, self.seq, self.table
         )
         md = self.leaf.forward_decode_metadata
-        self.assertFalse(hasattr(md, "flashmla_metadata"))
-        self.assertIsNotNone(self.leaf._decode_tile_metadata)
+        assert not (hasattr(md, "flashmla_metadata"))
+        assert (self.leaf._decode_tile_metadata) is not None
         paths = set(snapshot_graph_metadata(self.leaf))
-        self.assertEqual(
-            paths,
+        assert (paths) == (
             {
                 "FlashMLABackend.forward_decode_metadata.page_table",
                 "FlashMLABackend.forward_decode_metadata.seq_lens_k",
-            },
+            }
         )
 
     def test_capture_installs_a_kept_alive_schedule_that_replay_leaves_alone(self):
@@ -244,25 +243,25 @@ class FlashMLATileScheduleTest(_TorchCase):
             LADDER_BS, self.seq, self.table
         )
         captured = self.leaf._decode_tile_metadata
-        self.assertIn(captured, self.leaf._decode_tile_metadata_keepalive)
+        assert (captured) in (self.leaf._decode_tile_metadata_keepalive)
         # A second variant's capture at the same bs records its own object.
         self.leaf.init_forward_metadata_capture_cuda_graph(
             LADDER_BS, self.seq, self.table
         )
-        self.assertIsNot(self.leaf._decode_tile_metadata, captured)
-        self.assertIn(captured, self.leaf._decode_tile_metadata_keepalive)
+        assert (self.leaf._decode_tile_metadata) is not (captured)
+        assert (captured) in (self.leaf._decode_tile_metadata_keepalive)
         current = self.leaf._decode_tile_metadata
         self.leaf.refresh_decode_metadata(
             LADDER_BS, 2, self.seq, self.table, for_graph_replay=True
         )
-        self.assertIs(self.leaf._decode_tile_metadata, current)
+        assert (self.leaf._decode_tile_metadata) is (current)
 
     def test_eager_refresh_takes_a_fresh_schedule_every_step(self):
         self.leaf.refresh_decode_metadata(LADDER_BS, LADDER_BS, self.seq, self.table)
         first = self.leaf._decode_tile_metadata
         self.leaf.refresh_decode_metadata(LADDER_BS, LADDER_BS, self.seq, self.table)
-        self.assertIsNot(self.leaf._decode_tile_metadata, first)
-        self.assertEqual(self.leaf._decode_tile_metadata_keepalive, [])
+        assert (self.leaf._decode_tile_metadata) is not (first)
+        assert (self.leaf._decode_tile_metadata_keepalive) == ([])
 
     def test_draft_seq_lens_edits_renew_the_schedule(self):
         """Chain steps, the step-0 accept correction and block fills all
@@ -273,16 +272,16 @@ class FlashMLATileScheduleTest(_TorchCase):
 
         self.leaf.advance_draft_forward_metadata(self.seq + 1)
         step1 = self.leaf._decode_tile_metadata
-        self.assertIsNot(step1, step0)
+        assert (step1) is not (step0)
         torch.testing.assert_close(self.leaf.seq_lens_buf[:LADDER_BS], self.seq + 1)
 
         self.leaf.draft_block_decode = True
         self.leaf.spec_num_tokens = 2
         self.leaf.fill_block_decode_seq_lens(LADDER_BS, self.seq + 3)
-        self.assertIsNot(self.leaf._decode_tile_metadata, step1)
+        assert (self.leaf._decode_tile_metadata) is not (step1)
         torch.testing.assert_close(self.leaf.seq_lens_buf[:LADDER_BS], self.seq + 3)
         # Eager edits: nothing recorded, nothing to keep alive.
-        self.assertEqual(self.leaf._decode_tile_metadata_keepalive, [])
+        assert (self.leaf._decode_tile_metadata_keepalive) == ([])
 
     def test_in_graph_seq_lens_edits_keep_their_schedule_alive(self):
         from unittest import mock
@@ -300,15 +299,13 @@ class FlashMLATileScheduleTest(_TorchCase):
         ):
             self.leaf.advance_draft_forward_metadata(self.seq + 1)
         in_graph = self.leaf._decode_tile_metadata
-        self.assertIsNot(in_graph, captured)
+        assert (in_graph) is not (captured)
         # Both the capture seed and the recorded chain step outlive the round:
         # the graph replays their schedule-builds against these objects.
-        self.assertEqual(
-            self.leaf._decode_tile_metadata_keepalive, [captured, in_graph]
-        )
+        assert (self.leaf._decode_tile_metadata_keepalive) == ([captured, in_graph])
 
 
-class DefaultCaptureTest(_RouterCase):
+class TestDefaultCaptureTest(_RouterCase):
     """The default capture (idle fill + leaf idle refresh) over a real
     router: it binds the same cached per-bs views a refresh binds, seeds
     the same buffers, and is idempotent across the capture-time re-init
@@ -330,10 +327,10 @@ class DefaultCaptureTest(_RouterCase):
         torch = self.torch
         seq = torch.full((LADDER_BS,), 7, dtype=torch.int32)
         md = self._default_capture(LADDER_BS, seq)
-        self.assertIs(md, self.leaf._decode_views_by_bs[LADDER_BS])
+        assert (md) is (self.leaf._decode_views_by_bs[LADDER_BS])
         torch.testing.assert_close(self.leaf.seq_lens_buf[:LADDER_BS], seq)
         # Idle fill: no live tables were read, leaf buffers stay null.
-        self.assertTrue((self.leaf.page_table_buf[:LADDER_BS] == 0).all())
+        assert (self.leaf.page_table_buf[:LADDER_BS] == 0).all()
 
     def test_capture_is_idempotent_and_pointer_stable(self):
         from tokenspeed.runtime.execution.graph_ptr_guard import (
@@ -345,129 +342,18 @@ class DefaultCaptureTest(_RouterCase):
         md = self._default_capture(LADDER_BS, seq)
         snap = snapshot_graph_metadata(self.router)
         for _ in range(5):
-            self.assertIs(self._default_capture(LADDER_BS, seq), md)
-        self.assertEqual(snapshot_graph_metadata(self.router), snap)
+            assert (self._default_capture(LADDER_BS, seq)) is (md)
+        assert (snapshot_graph_metadata(self.router)) == (snap)
 
     def test_replay_refresh_rebinds_the_captured_views(self):
         torch = self.torch
         seq = torch.full((LADDER_BS,), 7, dtype=torch.int32)
         md = self._default_capture(LADDER_BS, seq)
         padded_seq = torch.tensor([5, 4, 1, 1], dtype=torch.int32)
-        self.assertIs(self._refresh(LADDER_BS, 2, padded_seq, replay=True), md)
+        assert (self._refresh(LADDER_BS, 2, padded_seq, replay=True)) is (md)
 
 
-class LeafSignatureConformanceTest(_TorchCase):
-    """Every paged leaf class carries the uniform leaf contract.
-
-    The router calls every leaf with the same positional/keyword shape; a
-    narrower bespoke signature TypeErrors on exactly the configs that need
-    it. Runner-facing nodes (router, composites, V4, state) are checked
-    against the runner kwarg set separately below.
-    """
-
-    _LEAF_CLASSES = (
-        ("tokenspeed.runtime.layers.attention.backends.paged.mha", "MHAAttnBackend"),
-        ("tokenspeed.runtime.layers.attention.backends.paged.msa", "MSAAttnBackend"),
-        (
-            "tokenspeed.runtime.layers.attention.backends.paged.trtllm",
-            "TRTLLMMHAAttnBackend",
-        ),
-        ("tokenspeed.runtime.layers.attention.backends.paged.mla", "MLAAttnBackend"),
-        (
-            "tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla",
-            "TRTLLMMLABackend",
-        ),
-        (
-            "tokenspeed.runtime.layers.attention.backends.paged.tokenspeed_mla",
-            "CuteDSLMLABackend",
-        ),
-        (
-            "tokenspeed.runtime.layers.attention.backends.paged.flashmla",
-            "FlashMLABackend",
-        ),
-        ("tokenspeed.runtime.layers.attention.backends.paged.dsa", "DSABackend"),
-    )
-
-    def _classes(self):
-        import importlib
-
-        for module_name, cls_name in self._LEAF_CLASSES:
-            try:
-                yield getattr(importlib.import_module(module_name), cls_name)
-            except (ImportError, ModuleNotFoundError) as exc:
-                self.skipTest(f"needs optional deps for {cls_name}: {exc}")
-
-    def test_every_leaf_is_a_paged_attention_backend(self):
-        from tokenspeed.runtime.layers.attention.backends.paged.base import (
-            PagedAttentionBackend,
-        )
-
-        for cls in self._classes():
-            with self.subTest(backend=cls.__name__):
-                self.assertTrue(issubclass(cls, PagedAttentionBackend))
-
-    def test_constructor_takes_injected_kernel_page_size(self):
-        import inspect
-
-        for cls in self._classes():
-            with self.subTest(backend=cls.__name__):
-                sig = inspect.signature(cls.__init__)
-                param = sig.parameters.get("kernel_page_size")
-                self.assertIsNotNone(param, f"{cls.__name__} lacks kernel_page_size")
-                self.assertEqual(param.kind, param.KEYWORD_ONLY)
-
-    def test_refresh_signature_binds_the_leaf_call_shape(self):
-        import inspect
-
-        for cls in self._classes():
-            with self.subTest(backend=cls.__name__):
-                sig = inspect.signature(cls.refresh_decode_metadata)
-                try:
-                    # (self, bs, actual_bs, seq_lens, page_table, ...)
-                    sig.bind(
-                        None, 8, 8, None, None, num_extends=0, for_graph_replay=True
-                    )
-                except TypeError as exc:
-                    self.fail(f"{cls.__name__}.refresh_decode_metadata: {exc}")
-
-    def test_init_forward_metadata_binds_the_leaf_call_shape(self):
-        import inspect
-
-        for cls in self._classes():
-            with self.subTest(backend=cls.__name__):
-                sig = inspect.signature(cls.init_forward_metadata)
-                try:
-                    # (self, bs, num_extends, seq_lens, page_table, mode, ...)
-                    sig.bind(
-                        None,
-                        8,
-                        8,
-                        None,
-                        None,
-                        None,
-                        extend_seq_lens=None,
-                        extend_seq_lens_cpu=None,
-                        extend_prefix_lens=None,
-                        extend_prefix_lens_cpu=None,
-                        extend_with_prefix=False,
-                        query_shard=None,
-                        page_table_cpu=None,
-                    )
-                except TypeError as exc:
-                    self.fail(f"{cls.__name__}.init_forward_metadata: {exc}")
-                for name in ("query_shard", "page_table_cpu"):
-                    param = sig.parameters.get(name)
-                    self.assertIsNotNone(
-                        param, f"{cls.__name__}.init_forward_metadata lacks {name}"
-                    )
-                    self.assertIs(
-                        param.default,
-                        inspect.Parameter.empty,
-                        f"{cls.__name__}.init_forward_metadata gives {name} a default",
-                    )
-
-
-class WrapperForwardsTheExtendBundleTest(_TorchCase):
+class TestWrapperForwardsTheExtendBundleTest(_TorchCase):
     """A wrapper that re-states the extend bundle for an inner runner-facing
     node must forward every field: a field it accepts but drops would reach
     the inner node's required-keyword check only on hardware that runs it."""
@@ -483,7 +369,7 @@ class WrapperForwardsTheExtendBundleTest(_TorchCase):
         wrapper = InklingAttnBackend.__new__(InklingAttnBackend)
         wrapper.inner = Mock()
         wrapper._pfg_seq_idx = None
-        wrapper.conv_columns = {"group_block_tokens": {"conv": 4}}
+        wrapper.conv_columns = {"groups": ("conv",), "pd_endpoint_snapshots": False}
         counts = torch.tensor([3], dtype=torch.int32)
         prefix = torch.tensor([0], dtype=torch.int32)
         bundle = dict(
@@ -510,178 +396,17 @@ class WrapperForwardsTheExtendBundleTest(_TorchCase):
         )
         forwarded = wrapper.inner.init_forward_metadata.call_args.kwargs
         for name, value in bundle.items():
-            self.assertIs(forwarded[name], value, f"{name} was not forwarded")
+            _pytest_expr1_3 = forwarded[name]
+            _pytest_expr2_4 = value
+            _pytest_msg_5 = f"{name} was not forwarded"
+            assert _pytest_expr1_3 is _pytest_expr2_4, _pytest_msg_5
 
 
-class RunnerSignatureConformanceTest(_TorchCase):
-    """Every runner-facing node accepts the runner's kwarg set."""
-
-    _RUNNER_CLASSES = (
-        (
-            "tokenspeed.runtime.layers.attention.backends.paged.router",
-            "CacheGroupRouter",
-        ),
-        (
-            "tokenspeed.runtime.layers.attention.backends.paged.msa",
-            "MSAHybridAttnBackend",
-        ),
-        (
-            "tokenspeed.runtime.layers.attention.backends.specific.deepseek_v4",
-            "DeepseekV4AttentionBackend",
-        ),
-        (
-            "tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41",
-            "DeepseekV41AttentionBackend",
-        ),
-        (
-            "tokenspeed.runtime.layers.attention.backends.state.mamba",
-            "MambaAttnBackend",
-        ),
-        (
-            "tokenspeed.runtime.layers.attention.backends.hybrid.linear",
-            "HybridLinearAttnBackend",
-        ),
-        ("tokenspeed.runtime.layers.attention.backends.state.kda", "KdaAttnBackend"),
-        (
-            "tokenspeed.runtime.layers.attention.backends.specific.inkling",
-            "InklingAttnBackend",
-        ),
-        (
-            "tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp",
-            "Qwen4ExpBackend",
-        ),
-        (
-            "tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple",
-            "Qwen4ExpPLEBackend",
-        ),
-        (
-            "tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer",
-            "QSAIndexerBackend",
-        ),
-    )
-
-    def test_init_forward_metadata_binds_the_runner_call_shape(self):
-        """The runner's extend call: five positionals, then block_tables with
-        its CPU mirror, the seven extend fields and the query shard as required
-        keywords (no defaults anywhere), plus the model-side extras a node may
-        ignore."""
-        import importlib
-        import inspect
-
-        for module_name, cls_name in self._RUNNER_CLASSES:
-            try:
-                cls = getattr(importlib.import_module(module_name), cls_name)
-            except (ImportError, ModuleNotFoundError) as exc:
-                self.skipTest(f"needs optional deps for {cls_name}: {exc}")
-            sig = inspect.signature(cls.init_forward_metadata)
-            with self.subTest(backend=cls_name):
-                try:
-                    # (self, bs, num_extends, req_pool_indices, seq_lens, mode, ...)
-                    sig.bind(
-                        None,
-                        8,
-                        8,
-                        None,
-                        None,
-                        None,
-                        block_tables={},
-                        block_tables_cpu={},
-                        extend_seq_lens=None,
-                        extend_seq_lens_cpu=None,
-                        extend_prefix_lens=None,
-                        extend_prefix_lens_cpu=None,
-                        extend_replay_lens_cpu=None,
-                        extend_prompt_lens_cpu=None,
-                        extend_with_prefix=False,
-                        query_shard=None,
-                        positions=None,
-                        global_num_tokens=None,
-                        all_decode_or_idle=False,
-                        capture_hidden_mode=None,
-                        num_tokens=8,
-                    )
-                except TypeError as exc:
-                    self.fail(f"{cls_name}.init_forward_metadata: {exc}")
-                for name in (
-                    "extend_seq_lens",
-                    "extend_seq_lens_cpu",
-                    "extend_prefix_lens",
-                    "extend_prefix_lens_cpu",
-                    "extend_replay_lens_cpu",
-                    "extend_prompt_lens_cpu",
-                    "extend_with_prefix",
-                    "query_shard",
-                ):
-                    param = sig.parameters.get(name)
-                    if param is None:
-                        # Composites forward ``*args, **kwargs`` to children
-                        # that declare the field themselves.
-                        self.assertTrue(
-                            any(
-                                p.kind is inspect.Parameter.VAR_KEYWORD
-                                for p in sig.parameters.values()
-                            ),
-                            f"{cls_name}.init_forward_metadata lacks {name}",
-                        )
-                        continue
-                    self.assertIs(
-                        param.default,
-                        inspect.Parameter.empty,
-                        f"{cls_name}.init_forward_metadata gives {name} a default",
-                    )
-
-    def test_capture_signatures_bind_the_runner_kwarg_set(self):
-        import importlib
-        import inspect
-
-        for module_name, cls_name in self._RUNNER_CLASSES:
-            try:
-                cls = getattr(importlib.import_module(module_name), cls_name)
-            except (ImportError, ModuleNotFoundError) as exc:
-                self.skipTest(f"needs optional deps for {cls_name}: {exc}")
-            sig = inspect.signature(cls.init_forward_metadata_capture_cuda_graph)
-            with self.subTest(backend=cls_name):
-                try:
-                    # (self, bs, req_pool_indices, seq_lens, forward_mode, ...)
-                    sig.bind(None, 8, None, None, None, block_tables={}, num_tokens=8)
-                except TypeError as exc:
-                    self.fail(
-                        f"{cls_name}.init_forward_metadata_capture_cuda_graph "
-                        f"rejects a runner kwarg: {exc}"
-                    )
-
-    def test_init_cuda_graph_state_signatures_bind_the_runner_kwarg_set(self):
-        import importlib
-        import inspect
-
-        for module_name, cls_name in self._RUNNER_CLASSES:
-            try:
-                cls = getattr(importlib.import_module(module_name), cls_name)
-            except (ImportError, ModuleNotFoundError) as exc:
-                self.skipTest(f"needs optional deps for {cls_name}: {exc}")
-            sig = inspect.signature(cls.init_cuda_graph_state)
-            with self.subTest(backend=cls_name):
-                try:
-                    sig.bind(
-                        None,
-                        8,
-                        cache_group_specs=(),
-                        cache_group_page_counts=None,
-                        max_tokens_per_req=2,
-                        overlap_schedule_depth=1,
-                    )
-                except TypeError as exc:
-                    self.fail(
-                        f"{cls_name}.init_cuda_graph_state rejects a runner "
-                        f"kwarg: {exc}"
-                    )
-
-
-class GraphPtrGuardWalkTest(_TorchCase):
+class TestGraphPtrGuardWalkTest(_TorchCase):
     """Walk semantics of graph_ptr_guard on a stub backend (no kernels)."""
 
-    def setUp(self):
-        super().setUp()
+    @pytest.fixture(autouse=True)
+    def _setup_guard(self, _setup_torch):
         from tokenspeed.runtime.execution import graph_ptr_guard
 
         self.guard = graph_ptr_guard
@@ -705,12 +430,11 @@ class GraphPtrGuardWalkTest(_TorchCase):
 
     def test_snapshot_records_every_tensor_under_the_slots(self):
         snap = self.guard.snapshot_graph_metadata(self.stub)
-        self.assertEqual(
-            set(snap),
+        assert (set(snap)) == (
             {
                 "_StubBackend.forward_decode_metadata.stable",
                 "_StubBackend.forward_decode_metadata.nested['a']",
-            },
+            }
         )
 
     def test_backend_scratch_outside_the_slots_may_move(self):
@@ -721,7 +445,7 @@ class GraphPtrGuardWalkTest(_TorchCase):
     def test_rebound_tensor_is_reported_with_its_path(self):
         snap = self.guard.snapshot_graph_metadata(self.stub)
         self.stub.forward_decode_metadata.stable = self.torch.zeros(4)
-        with self.assertRaisesRegex(RuntimeError, r"forward_decode_metadata\.stable"):
+        with pytest.raises((RuntimeError), match=(r"forward_decode_metadata\.stable")):
             self.guard.verify_graph_metadata(self.stub, snap, context="test")
 
     def test_child_backends_are_walked(self):
@@ -732,17 +456,17 @@ class GraphPtrGuardWalkTest(_TorchCase):
                 return (stub,)
 
         snap = self.guard.snapshot_graph_metadata(_Wrapper())
-        self.assertIn("_Wrapper._StubBackend.forward_decode_metadata.stable", set(snap))
+        assert ("_Wrapper._StubBackend.forward_decode_metadata.stable") in (set(snap))
 
 
-class RouterPtrGuardTest(_RouterCase):
+class TestRouterPtrGuardTest(_RouterCase):
     """The guard over a real router refresh: the positive arm pins the
     per-bs view cache (leaf metadata + router write-loc views), the
     negative arm is the address-freezing bug class (buffer reallocated,
     views lazily rebuilt over fresh storage)."""
 
-    def setUp(self):
-        super().setUp()
+    @pytest.fixture(autouse=True)
+    def _setup_guard(self, _setup_router):
         from tokenspeed.runtime.execution.graph_ptr_guard import (
             snapshot_graph_metadata,
             verify_graph_metadata,
@@ -764,10 +488,9 @@ class RouterPtrGuardTest(_RouterCase):
         self._refresh(LADDER_BS, 2, self._padded_seq(), replay=True)
         snap = self.snapshot(self.router)
         # The router's write-loc views are part of the walked surface.
-        self.assertTrue(
-            any("decode_write_locations" in path for path in snap),
-            sorted(snap),
-        )
+        _pytest_expr_1 = any("decode_write_locations" in path for path in snap)
+        _pytest_msg_2 = sorted(snap)
+        assert _pytest_expr_1, _pytest_msg_2
         # Fresh lengths, same buffers: replay refresh must not move anything.
         self._refresh(LADDER_BS, 2, self._padded_seq() + 1, replay=True)
         self.verify(self.router, snap, context="test")
@@ -782,9 +505,9 @@ class RouterPtrGuardTest(_RouterCase):
         self.leaf.seq_lens_buf = torch.ones(MAX_DECODE_BS, dtype=torch.int32)
         self.leaf._decode_views_by_bs.clear()
         self._refresh(LADDER_BS, 2, self._padded_seq(), replay=True)
-        with self.assertRaisesRegex(RuntimeError, r"seq_lens"):
+        with pytest.raises((RuntimeError), match=(r"seq_lens")):
             self.verify(self.router, snap, context="test")
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

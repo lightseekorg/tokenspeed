@@ -1,8 +1,8 @@
-# Kimi K3 on Hopper with PD, DeepEP and DSpark
+# Kimi K3 on Hopper with PD, DeepEP, and DSpark
 
 This layout uses 64 GPUs: four eight-GPU H200 nodes for each engine.
-The runtime supports the configuration below; the GPU validation steps at
-the end are required before treating a deployment as validated.
+The runtime supports the configuration below. Complete the GPU validation
+steps at the end before treating a deployment as validated.
 
 | Engine | Attention | Routed experts | Shared experts | Execution |
 | --- | --- | --- | --- | --- |
@@ -18,17 +18,19 @@ Use the MXFP4 K3 target and a compatible `k3_dspark` checkpoint. Marlin
 executes packed W4A16 routed experts with BF16 activations. This Hopper
 example uses FlashMLA with BF16 target and draft caches. Keep target cache
 precision identical on P and D. The current `tokenspeed_mla` implementation
-uses Blackwell instructions and must not be selected on H100/H200.
+uses Blackwell instructions. Do not select it on H100/H200.
 Build the kernel package with its Marlin CUDA extension on the GPU hosts.
-`--kda-backend flashkda` requires the matching FlashKDA package; it selects
-the prefill scan, while KDA decode/verify uses the platform-selected kernels.
+`--kda-backend flashkda` requires the matching FlashKDA package. The FlashKDA
+backend selects the prefill scan, while KDA decode/verify uses the
+platform-selected kernels.
 
 Install this checkout with the standard recipe
-(`bash test/ci_system/install_deps.sh`, see the
-[getting-started guide](getting-started.md)); it rebuilds the checkout's
-kernel and scheduler packages and does not start the P, D, or SMG services.
+(`bash test/ci_system/install_deps.sh`; see the
+[getting-started guide](getting-started.md)). The recipe rebuilds the
+checkout's kernel and scheduler packages and does not start the P, D, or SMG
+services.
 
-This runtime requires `tokenspeed-scheduler>=0.1.18` for the prefill role's
+This runtime requires `tokenspeed-scheduler>=0.1.27` for the prefill role's
 decode-slot reserve and the PD lifecycle counters. Rebuild the scheduler from
 this checkout when testing before the matching wheel is published.
 
@@ -45,14 +47,14 @@ low-latency combine.
 EP32 low latency requires the installed DeepEP build's inter-node transport
 prerequisites. Use consistent dependency builds on all ranks. For initial
 validation, `--load-format auto` keeps checkpoint loading independent of
-InstantTensor; optional InstantTensor context loading uses each P stage's
+InstantTensor. Optional InstantTensor context loading uses each P stage's
 TP group because stages consume different weight subsets.
 
 ## Engine arguments
 
 Add these argument sets to the existing engine launcher. Supply target and
 draft paths, node rank, rendezvous address, gateway transport, context
-length and memory utilization separately. Run one launcher per node with
+length, and memory utilization separately. Run one launcher per node with
 eight GPU workers and use separate P/D rendezvous addresses. These argument
 sets do not configure or start an SMG gateway.
 
@@ -80,7 +82,7 @@ Common arguments:
 ```
 
 Verify width includes the anchor: eight target rows use seven DSpark
-proposal queries. Select a width supported by the draft checkpoint.
+proposal queries. Select a width the draft checkpoint supports.
 
 P arguments:
 
@@ -98,15 +100,14 @@ P arguments:
 P runs eager in this configuration: the chunk pipeline
 (`--pipeline-parallel-size 4`) forces `--enforce-eager`, and DeepEP keeps the
 prefill graph off regardless. A prefill node without PP or DeepEP captures
-prefill CUDA graphs like any server; only the decode graph is skipped there,
-since the role never decodes. Its layer windows partition the target decoder
-layers, excluding draft layers. The automatic split of 93 layers is `24,23,23,23`.
+prefill CUDA graphs like any server. The runtime skips only the decode graph
+there, because the role never decodes. Its layer windows partition the target
+decoder layers, excluding draft layers. The automatic split of 93 layers is
+`24,23,23,23`.
 `--pp-layer-partition 24,24,24,21` is another candidate: its first three
 boundaries align with the standard AttnRes blocks and the last stage owns
 fewer target layers alongside context writing and draft execution. Measure
-stage time before choosing a partition for throughput. KDA geometry can
-reduce the effective prefill chunk size to align state checkpoints;
-startup logs report it.
+stage time before choosing a partition for throughput.
 
 D arguments:
 
@@ -121,9 +122,12 @@ D arguments:
 ```
 
 `auto` keeps ordinary decode on low latency and CUDA graph. If cache
-pressure retracts a request and the scheduler performs a recovery prefill,
-that extend-shaped work uses normal dispatch and eager execution. Disabling
-KVStore does not eliminate recovery prefills.
+pressure retracts a request, the scheduler images it to Host and restores it
+by a copy, never by a prefill, so the decode node runs no extend-shaped work
+(the image pool is sized by default from `--max-num-seqs`; see
+`--retraction-snapshot-ratio` in [Server configuration](../configuration/server.md),
+whose explicit `0` removes the pool so a capacity-blocked round aborts the
+newest resident with finish `err_type` 524 instead).
 
 `max-num-seqs` is global across DP: this example allows 32 requests per D
 replica and captures through that local batch size. Keep graph padding
@@ -133,9 +137,9 @@ maximum context capacity or memory utilization.
 
 ## Token layout and capacity
 
-`KimiLinearMoEDeepEP` is selected when each MoE is constructed. It owns token
-slicing, projection placement, dispatch/combine and the attention-TP tail.
-Shared MLPs receive explicit TP rank, size and group; they never infer weight
+The runtime selects `KimiLinearMoEDeepEP` when it constructs each MoE. It owns
+token slicing, projection placement, dispatch/combine, and the attention-TP tail.
+Shared MLPs receive explicit TP rank, size, and group. They never infer weight
 layout from a global all-to-all setting.
 
 Each TP rank takes a disjoint slice of its attention batch before routing
@@ -146,8 +150,9 @@ TP reduction. No full hidden-state or residual gather replicates the four
 attention-DP batches across EP32.
 
 DeepEP low-latency send capacity defaults to 256 token rows per rank, as for
-other models. Use `--low-latency-max-num-tokens-per-gpu` to set it explicitly;
-the runtime does not automatically derive or validate a workload bound at startup.
+other models. Use `--low-latency-max-num-tokens-per-gpu` to set it explicitly.
+The runtime does not automatically derive or validate a workload bound at
+startup.
 It rejects nonpositive values and rejects a low-latency dispatch whose actual
 source batch exceeds the configured capacity.
 
@@ -158,56 +163,57 @@ ceil((max_num_seqs // attention_DP) * verify_width / attention_TP)
 ```
 
 The D example needs at least 32 source rows per EP rank but retains the default
-256-row capacity unless explicitly changed. To reduce that allocation for this
-configuration, pass `--low-latency-max-num-tokens-per-gpu 32`. Size for the full
-admissible batch, not just the CUDA graph ladder: larger eager batches remain
-possible. The selected value must also satisfy DeepEP's alignment requirements.
+256-row capacity unless you change it explicitly. To reduce that allocation
+for this configuration, pass `--low-latency-max-num-tokens-per-gpu 32`. Size
+for the full admissible batch, not just the CUDA graph ladder: larger eager
+batches remain possible. The selected value must also satisfy DeepEP's
+alignment requirements.
 
-If `low_latency` is pinned, include the configured prefill/recovery chunk beside
-the decode batch before TP slicing, because no normal buffers exist. For the
-D example and an 8192-token chunk, this requires at least 1056 source rows per
-rank. The default 256 or a decode-only setting of 32 would be insufficient for
-that workload. Prefer `auto` to route extends through normal dispatch.
+The decode node runs no extend-shaped work — a retracted request is restored
+from its image, never re-prefilled — so a pinned `low_latency` needs only the
+decode batch's rows per rank. Prefer `auto` all the same: it keeps the
+default dispatch for anything that is not a graph-shaped decode step.
 
 DeepEP's own receive buffers still reserve expert capacity. The Marlin
 bridge uses device counts to construct aligned work and bound intermediate
 storage by source routes, avoiding SiTU work over the entire
-`experts * capacity` padding extent. Communication buffers are prepared
-by the common DeepEP MoE weight-processing path before KV memory profiling. Measure persistent memory and
-capture/runtime peaks separately.
+`experts * capacity` padding extent. The common DeepEP MoE weight-processing
+path prepares communication buffers before KV memory profiling. Measure
+persistent memory and capture/runtime peaks separately.
 
 Empty slices and idle DP ranks participate in both EP legs. The target's
-persistent cache write slots identify graph padding on the GPU; those
-routes use ID -1 and weight zero. Python counts recorded during capture
-are not used as the live-token mask.
+persistent cache write slots identify graph padding on the GPU. Those
+routes use ID -1 and weight zero. The runtime does not use Python counts
+recorded during capture as the live-token mask.
 
 ## Context production and handoff
 
 A *tap* is one selected intermediate target hidden stream, with one vector
 per token. The draft checkpoint specifies which layers and stream to read.
-For example, `target_layer_ids=[2,23,47,71,89]` selects five taps; these
+For example, `target_layer_ids=[2,23,47,71,89]` selects five taps. These
 zero-based IDs refer to completed target layers. The number of taps is
 independent of the draft network's depth and the four PP stages.
 
 For `aux_hidden_stream=prefix`, each tap reads the prefix stream after its
 named layer. For `attn_res`, it reads the result of the next consumer's
-attention mixing; the final layer uses the output mixing. A tap's owner is
+attention mixing. The final layer uses the output mixing. A tap's owner is
 the stage with the weights needed to produce that stream.
 
-K3 capture selection is configured once after model loading through
+K3 capture selection happens once after model loading through
 `K3DSparkModel.configure_target`, on every stage. All block-draft models
 implement the explicit `TargetCaptureConfigurator` setup interface. The
 ordinary DSpark drafter binds execution resources without selecting taps
-again; K3 capture and projection semantics stay in the model.
+again. K3 capture and projection semantics stay in the model.
 
-`DSparkContextProducer` coordinates DSpark context accumulation and cache writes;
-the K3 draft model owns tap placement and projection arithmetic. PP and non-PP
-use the same per-tap projection. P stages pass one FP32
+`DSparkContextProducer` coordinates DSpark context accumulation and cache
+writes. The K3 draft model owns tap placement and projection arithmetic. PP
+and non-PP use the same per-tap projection. P stages pass one FP32
 `[tokens, draft_hidden]` accumulator alongside ordinary PP state. Per-tap
-`fc_norm` precedes projection; `context_norm` follows the complete sum.
-Every AttnRes tap L is captured at layer L+1's entry, before its input
-normalization; the final tap uses the output mixer. The checkpoint indices
-are unchanged, including when L+1 begins another pipeline stage.
+`fc_norm` precedes projection. `context_norm` follows the complete sum.
+The model captures every AttnRes tap L at layer L+1's entry, before that
+layer's input normalization. The final tap uses the output mixer. The
+checkpoint indices are unchanged, including when L+1 begins another pipeline
+stage.
 
 Each stage loads the tap projection parameters it uses. Only the last P
 stage also owns the complete DSpark proposal network and the draft cache.
@@ -217,16 +223,16 @@ for that token. Proposal execution uses the target's output head.
 
 The draft checkpoint must include `embed_tokens.weight` as a frozen copy
 of the target embedding. The final P stage loads its TP shard because the
-target embedding lives on the first stage; non-PP execution on D continues
-to borrow the target embedding. Include the final stage's proposal weights,
-embedding shard, activations and proposal execution time when sizing memory
-and choosing the PP partition.
+target embedding lives on the first stage. Non-PP execution on D continues
+to borrow the target embedding. When sizing memory and choosing the PP
+partition, include the final stage's proposal weights, embedding shard,
+activations, and proposal execution time.
 
 All P stages share one logical cache geometry, with target physical fields
 assigned by stage and draft fields owned only by the last stage. The same
-ownership drives producer readiness, sender filtering and receiver routes.
+ownership drives producer readiness, sender filtering, and receiver routes.
 A final producer barrier follows the completed drafter call, covering all
-draft cache writes. Bootstrap publishes explicit field placement per stage;
+draft cache writes. Bootstrap publishes explicit field placement per stage.
 PD routing does not reconstruct target/draft ownership. P and D must both
 use the field-placement bootstrap contract from this revision.
 
@@ -234,51 +240,51 @@ P sends its sampled bootstrap token and the complete candidate window:
 the anchor followed by DSpark proposals. D installs this window before its
 first ordinary verify round, which can accept the supplied proposals and
 produce the next candidate window through its local drafter. MLA, KDA
-recurrent/conv state and draft KV must all arrive before that round. The
+recurrent/conv state, and draft KV must all arrive before that round. The
 handoff uses the existing candidate transfer and verify path.
 
 ## MTP (NextN) on the prefill pipeline
 
 `--speculative-algorithm MTP` with the K3 NextN checkpoint layer
 (`model.layers.<num_hidden_layers>.*`, the default draft path) runs on the
-same P pipeline. Nothing is produced across stages: the NextN layer reads
-the final hidden states the last stage already computes, so only the last P
-stage holds the NextN layer, its embedding shard and the draft cache, samples
-the first token, runs the draft extend over the completed prompt and the
-multi-step draft, and writes the candidate block. The other stages build and
-load no draft model at all. The NextN checkpoint must
+same P pipeline. No stage produces anything across the pipeline: the NextN
+layer reads the final hidden states the last stage already computes, so only
+the last P stage holds the NextN layer, its embedding shard, and the draft
+cache, samples the first token, runs the draft extend over the completed
+prompt and the multi-step draft, and writes the candidate block. The other
+stages build and load no draft model at all. The NextN checkpoint must
 ship its `embed_tokens` weight: the last stage loads that TP shard because
-the target embedding lives on the first stage, while the draft head is
-shared from the target as usual. Ownership, bootstrap placement, transfer
-routes and the candidate handoff are identical to the DSpark case, and
+the target embedding lives on the first stage, while the draft shares the
+target's head as usual. Ownership, bootstrap placement, transfer
+routes, and the candidate handoff are identical to the DSpark case, and
 layerwise transfer (`--disaggregation-layerwise-interval`) works on every
 stage: only the last stage finalizes a draft-final step. The last stage
-carries the NextN MoE layer plus the draft extend and drafting time; size
+carries the NextN MoE layer plus the draft extend and drafting time. Size
 its memory and `--pp-layer-partition` for it. D keeps `--speculative-algorithm
 MTP` without PP and verifies the supplied candidates as before.
 
 ## Validation
 
-Run the existing cache-transfer, model-configuration and Marlin tests in the
+Run the existing cache-transfer, model-configuration, and Marlin tests in the
 configured runtime environment. Validate the full serving topology on the
 GPU hosts:
 
 1. Compare Marlin with the dequantized reference, then test DeepEP normal
    EP8 and low latency EP32 at actual K3 geometry. Include nonzero EP ranks,
-   empty/unequal source batches and skewed expert routing.
+   empty/unequal source batches, and skewed expert routing.
 2. Compare eager and repeated graph MoE results while changing routes,
-   active DP ranks and live counts inside one capture bucket. Include
+   active DP ranks, and live counts inside one capture bucket. Include
    batches below TP8 and padded verify rows.
 3. Compare concatenated context projection with PP accumulation, including
-   `fc_norm`, both configured tap streams and PP boundaries. Floating-point
-   addition order differs; compare errors and finite values rather than
+   `fc_norm`, both configured tap streams, and PP boundaries. Floating-point
+   addition order differs. Compare errors and finite values rather than
    requiring BF16 bitwise equality.
 4. Validate P-to-D target/cache behavior without speculation, then enable
-   DSpark and compare initial logits, generation and acceptance. Verify
+   DSpark and compare initial logits, generation, and acceptance. Verify
    that P transfers its sampled anchor and actual proposals, and compare
    the first D verify round in eager mode and with graph replay.
 5. Exercise chunked prompts, prefix hits, page boundaries, concurrency,
-   cancellation and repeated slot reuse. Keep graph enabled with unequal
+   cancellation, and repeated slot reuse. Keep graph enabled with unequal
    DP batches. `TOKENSPEED_GRAPH_DEBUG=1` checks metadata pointer stability
    during correctness runs.
 6. Measure realistic prompts across concurrency levels. Record P computed
@@ -286,8 +292,8 @@ GPU hosts:
    peaks and errors, with exact arguments and dependency versions.
 
 Disabling graph is a diagnostic comparison, not completion of the decode
-graph requirement. No GPU performance or stability result is implied by
-the presence of this configuration.
+graph requirement. The presence of this configuration implies no GPU
+performance or stability result.
 
 ### Focused test commands
 
@@ -305,8 +311,7 @@ python -m pytest -q \
 ```
 
 Also run the existing K3 DSpark/capture tests. Keep runtime and kernel test
-roots in separate pytest
-invocations to avoid their conflicting `conftest` module names.
+roots in separate pytest invocations to avoid their conflicting `conftest` module names.
 
 The configuration regressions below check that the MTP layer passes a single
 MoE block through `create_kimi_linear_moe` and that DSpark rejects a tap count
@@ -339,7 +344,7 @@ torchrun --standalone --nproc-per-node=8 -m pytest -q \
   tokenspeed-kernel/test/nvidia/ops/moe/test_marlin_deepep_distributed.py
 ```
 
-These smoke tests use small expert matrices. Full K3 geometry, EP32 transport
+These smoke tests use small expert matrices. Full K3 geometry, EP32 transport,
 and graph replay need the GPU validation described above. Run normal and
-low-latency tests in separate process invocations; the DeepEP buffer is
+low-latency tests in separate process invocations. The DeepEP buffer is
 process-scoped.

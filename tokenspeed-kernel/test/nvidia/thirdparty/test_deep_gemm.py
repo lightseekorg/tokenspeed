@@ -23,10 +23,10 @@ from __future__ import annotations
 import pytest
 import torch
 
+deep_gemm = pytest.importorskip("deep_gemm")
 deep_gemm_testing = pytest.importorskip("deep_gemm.testing")
 deep_gemm_utils = pytest.importorskip("deep_gemm.utils")
 
-from tokenspeed_kernel.ops.gemm import deep_gemm as deep_gemm_ops
 from tokenspeed_kernel.platform import current_platform
 
 platform = current_platform()
@@ -39,10 +39,6 @@ def test_deep_gemm_mm_fp8_blockscale_matches_reference(
 ) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for DeepGEMM verification")
-
-    kernel = getattr(deep_gemm_ops, "deep_gemm_mm_fp8_blockscale", None)
-    if kernel is None:
-        pytest.skip("DeepGEMM kernel is not available")
 
     torch.manual_seed(0)
     m, n, k = 128, 128, 256
@@ -63,15 +59,15 @@ def test_deep_gemm_mm_fp8_blockscale_matches_reference(
         gran_k=128,
     )
 
-    actual = kernel(
-        a_fp8,
-        b_fp8,
-        a_scales,
-        b_scales,
-        torch.bfloat16,
-        block_size=[128, 128],
-        enable_pdl=enable_pdl,
-    )
+    if a_scales.dtype == torch.float32:
+        a_scales = deep_gemm.get_mn_major_tma_aligned_tensor(a_scales)
+    actual = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+    previous_pdl = deep_gemm.get_pdl()
+    try:
+        deep_gemm.set_pdl(enable_pdl)
+        deep_gemm.fp8_gemm_nt((a_fp8, a_scales), (b_fp8, b_scales), actual)
+    finally:
+        deep_gemm.set_pdl(previous_pdl)
 
     torch.cuda.synchronize()
     assert deep_gemm_testing.calc_diff(actual, expected) < 0.001

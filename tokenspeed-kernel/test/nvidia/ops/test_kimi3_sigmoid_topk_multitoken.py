@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.moe.native import torch_sigmoid_bias_topk
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -46,17 +47,14 @@ if is_amd():
         allow_module_level=True,
     )
 
-from tokenspeed_kernel.ops.moe import sigmoid_topk as sigmoid_topk_mod  # noqa: E402
-from tokenspeed_kernel.ops.moe.sigmoid_topk import (  # noqa: E402
+import tokenspeed_kernel.ops.moe.triton as moe_triton  # noqa: E402
+from tokenspeed_kernel.ops.moe import (  # noqa: E402
     _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk,
 )
-from tokenspeed_kernel.ops.moe.triton import (  # noqa: E402
-    kimi3_sigmoid_topk as kimi3_sigmoid_topk_mod,
-)
-from tokenspeed_kernel.ops.moe.triton.kimi3_sigmoid_topk import (  # noqa: E402
+from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (  # noqa: E402
     kimi3_sigmoid_bias_topk,
 )
-from tokenspeed_kernel.ops.moe.triton.minimax_topk import (  # noqa: E402
+from tokenspeed_kernel.ops.moe._triton.minimax_topk import (  # noqa: E402
     minimax_biased_grouped_topk,
 )
 
@@ -74,12 +72,14 @@ def _by_expert(weights, ids):
 
 
 def _reference(logits, bias, *, normalize, scale):
-    scores = logits.sigmoid()
-    ids = torch.topk(scores + bias.unsqueeze(0), TOPK, dim=-1, sorted=False).indices
-    weights = scores.gather(1, ids)
-    if normalize:
-        weights = weights / weights.sum(dim=-1, keepdim=True)
-    return weights * scale, ids
+    return torch_sigmoid_bias_topk(
+        router_logits=logits,
+        correction_bias=bias,
+        topk=TOPK,
+        routed_scaling_factor=scale,
+        normalize_topk_weights=normalize,
+        weights_dtype=logits.dtype,
+    )
 
 
 # 128 rows is where the packed path peaks, so pin correctness there too.
@@ -118,13 +118,13 @@ def test_dispatcher_sends_a_verify_window_to_the_packed_kernel(tokens, monkeypat
     for the output dtype directly, which is what retires the per-layer cast.
     """
     calls = []
-    real = kimi3_sigmoid_topk_mod.kimi3_sigmoid_bias_topk
+    real = moe_triton.kimi3_sigmoid_bias_topk
 
     def spy(*args, **kwargs):
         calls.append(kwargs["weights_dtype"])
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(kimi3_sigmoid_topk_mod, "kimi3_sigmoid_bias_topk", spy)
+    monkeypatch.setattr(moe_triton, "kimi3_sigmoid_bias_topk", spy)
 
     torch.manual_seed(5)
     logits = (torch.randn(tokens, EXPERTS, device="cuda") * 0.2).float()
@@ -156,21 +156,21 @@ def test_dispatcher_hands_rows_past_the_cap_to_the_grouped_kernel(monkeypatch):
     """One row past the crossover the packed kernel must not run, and the
     grouped kernel must be asked for the output dtype rather than returning
     fp32 for the wrapper to cast."""
-    cap = kimi3_sigmoid_topk_mod._PACKED_ROWS_NVIDIA.stop - 1
+    cap = moe_triton._PACKED_ROWS_NVIDIA.stop - 1
     calls = []
     monkeypatch.setattr(
-        kimi3_sigmoid_topk_mod,
+        moe_triton,
         "kimi3_sigmoid_bias_topk",
         lambda *a, **k: calls.append(k) or pytest.fail("packed ran past the cap"),
     )
     grouped_dtypes = []
-    real_grouped = sigmoid_topk_mod.minimax_biased_grouped_topk
+    real_grouped = moe_triton.minimax_biased_grouped_topk
 
     def grouped_spy(*args, **kwargs):
         grouped_dtypes.append(kwargs["weights_dtype"])
         return real_grouped(*args, **kwargs)
 
-    monkeypatch.setattr(sigmoid_topk_mod, "minimax_biased_grouped_topk", grouped_spy)
+    monkeypatch.setattr(moe_triton, "minimax_biased_grouped_topk", grouped_spy)
 
     torch.manual_seed(7)
     logits = (torch.randn(cap + 1, EXPERTS, device="cuda") * 0.2).float()
@@ -187,13 +187,13 @@ def test_dispatcher_copies_a_strided_window_onto_the_packed_kernel(monkeypatch):
     """The registry cannot see strides, so a column slice of a wider verify
     buffer takes the packed kernel after a contiguous copy."""
     calls = []
-    real = kimi3_sigmoid_topk_mod.kimi3_sigmoid_bias_topk
+    real = moe_triton.kimi3_sigmoid_bias_topk
 
     def spy(*args, **kwargs):
         calls.append(args[0].is_contiguous())
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(kimi3_sigmoid_topk_mod, "kimi3_sigmoid_bias_topk", spy)
+    monkeypatch.setattr(moe_triton, "kimi3_sigmoid_bias_topk", spy)
 
     torch.manual_seed(3)
     wide = (torch.randn(4, EXPERTS + 128, device="cuda") * 0.2).float()
@@ -219,13 +219,13 @@ def test_dispatcher_widens_a_bf16_bias_onto_the_packed_kernel(monkeypatch):
     """The registry signature only encodes the logits dtype. A BF16 bias used
     to miss the packed inline gate; widening here keeps that input working."""
     calls = []
-    real = kimi3_sigmoid_topk_mod.kimi3_sigmoid_bias_topk
+    real = moe_triton.kimi3_sigmoid_bias_topk
 
     def spy(*args, **kwargs):
         calls.append(args[1].dtype)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(kimi3_sigmoid_topk_mod, "kimi3_sigmoid_bias_topk", spy)
+    monkeypatch.setattr(moe_triton, "kimi3_sigmoid_bias_topk", spy)
 
     torch.manual_seed(13)
     logits = (torch.randn(4, EXPERTS, device="cuda") * 0.2).float()
@@ -254,11 +254,11 @@ def test_packed_mapped_wrapper_keeps_an_int64_dispatch_map(monkeypatch):
         empty_ids = torch.empty(1, TOPK, device="cuda", dtype=torch.int32)
         return empty_w, empty_ids
 
-    monkeypatch.setattr(kimi3_sigmoid_topk_mod, "kimi3_sigmoid_bias_topk", fake_kernel)
+    monkeypatch.setattr(moe_triton, "kimi3_sigmoid_bias_topk", fake_kernel)
     logits = torch.empty(1, EXPERTS, device="cuda", dtype=torch.float32)
     bias = torch.empty(EXPERTS, device="cuda", dtype=torch.float32)
     dispatch = torch.arange(EXPERTS, device="cuda", dtype=torch.int64)
-    kimi3_sigmoid_topk_mod.triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped(
+    moe_triton.triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped(
         router_logits=logits,
         correction_bias=bias,
         topk=TOPK,

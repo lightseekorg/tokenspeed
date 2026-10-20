@@ -50,6 +50,7 @@ from tokenspeed_kernel.ops.attention.prologue.checks import (
     check_mla_request,
 )
 from tokenspeed_kernel.ops.attention.prologue.types import (
+    FP8TensorScales,
     GQAPrologueOutput,
     HeadKVCache,
     HeadNorm,
@@ -368,6 +369,7 @@ def latent_store(
 
 
 __all__ = [
+    "FP8TensorScales",
     "GQAPrologueOutput",
     "HeadKVCache",
     "HeadNorm",

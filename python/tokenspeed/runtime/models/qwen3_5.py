@@ -28,7 +28,7 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
@@ -77,6 +77,8 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
+from tokenspeed.runtime.models.base.decoder_layer import capture_layer_input
+from tokenspeed.runtime.models.base.transformer_model import notify_target_capture
 from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeMLP,
     Qwen3_5MoeSparseMoeBlock,
@@ -104,7 +106,6 @@ from tokenspeed.runtime.utils import (
     set_weight_attrs,
 )
 from tokenspeed.runtime.utils.env import envs
-from tokenspeed.runtime.utils.triton import tl, triton
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +169,54 @@ def _gdn_in_proj_stacked_mapping(param_names) -> list:
         ("in_proj_qkvzba.", "in_proj_b.", 4),
         ("in_proj_qkvzba.", "in_proj_a.", 5),
     ]
+
+
+def _input_norm(
+    comm_manager: CommManager,
+    norm: GemmaRMSNorm,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    fp8_scale: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """The layer-opening add + norm, plus a static-FP8 copy for ``fp8_scale``'s projection.
+
+    Past the first layer, without attention TP and with the fused layer boundary, one
+    kernel adds, normalizes and quantizes; otherwise the communication policy runs the
+    norm and the projection quantizes for itself.
+    """
+    if (
+        residual is None
+        or comm_manager.mapping.has_attn_tp
+        or comm_manager.layer_boundary_norm == "unfused"
+    ):
+        hidden_states, residual = comm_manager.input_reduce_norm(
+            hidden_states, residual
+        )
+        return hidden_states, None, residual
+    return norm.add_norm_with_fp8(hidden_states, residual, fp8_scale)
+
+
+def _post_attn_norm(
+    comm_manager: CommManager,
+    norm: GemmaRMSNorm,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    fp4_scale: torch.Tensor | None,
+    ctx: ForwardContext,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None, torch.Tensor]:
+    """The post-attention add + norm, plus gate_up_proj's NVFP4 input for ``fp4_scale``.
+
+    Without attention TP one kernel adds, normalizes and, unless dense TP gathers
+    the rows afterwards, quantizes; otherwise the communication policy runs the norm.
+    """
+    if comm_manager.mapping.has_attn_tp:
+        hidden_states, residual = comm_manager.post_attn_reduce_norm(
+            hidden_states, residual, ctx
+        )
+        return hidden_states, None, residual
+    if comm_manager.mapping.dense.has_tp:
+        fp4_scale = None
+    return norm.add_norm_with_fp4(hidden_states, residual, fp4_scale)
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -327,7 +376,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.norm = RMSNormGated(
             self.head_v_dim,
             eps=self.layer_norm_epsilon,
-            group_size=None,
+            group_size=self.head_v_dim,
             norm_before_gate=True,
             device=torch.get_device_module().current_device(),
             dtype=config.dtype,
@@ -468,12 +517,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
-    def _forward_input_proj(self, hidden_states: torch.Tensor):
+    def input_fp8_scale(self) -> torch.Tensor | None:
+        """The static-FP8 input scale of the projection that may take FP8 rows."""
+        proj = self.in_proj_qkvz if self._split_in_proj else self.in_proj_qkvzba
+        return proj.quant_method.static_fp8_input_scale(proj)
+
+    def _forward_input_proj(
+        self, hidden_states: torch.Tensor, hidden_fp8: torch.Tensor | None
+    ):
+        projection_input = hidden_states if hidden_fp8 is None else hidden_fp8
         if self._split_in_proj:
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_qkvz, _ = self.in_proj_qkvz(projection_input)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
             return projected_states_qkvz, projected_states_ba
-        projected_all, _ = self.in_proj_qkvzba(hidden_states)
+        projected_all, _ = self.in_proj_qkvzba(projection_input)
         projected_states_qkvz, projected_states_ba = projected_all.split(
             [self._qkvz_dim, self._ba_dim], dim=-1
         )
@@ -482,25 +539,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        hidden_fp8: torch.Tensor | None,
         ctx: ForwardContext,
     ):
         seq_len, _ = hidden_states.shape
 
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
+            hidden_states, hidden_fp8
         )
 
         if self.num_v_heads % self.num_k_heads == 0 and not getattr(
             self, "requires_qkvz_reordering", False
         ):
-            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
-                projected_states_qkvz,
-                projected_states_ba,
-                triton.cdiv(self.num_k_heads, self.attn_tp_size),
-                triton.cdiv(self.num_v_heads, self.attn_tp_size),
-                self.head_k_dim,
-                self.head_v_dim,
+            # Row-strided views of [q | k | v | z] and [b | a]; consumers read them in place.
+            v_tp = self.value_dim // self.attn_tp_size
+            mixed_qkv, z = projected_states_qkvz.split(
+                [projected_states_qkvz.shape[-1] - v_tp, v_tp], dim=-1
             )
+            b, a = projected_states_ba.split(self.num_v_heads // self.attn_tp_size, -1)
         else:
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
                 projected_states_qkvz, projected_states_ba
@@ -540,12 +596,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             **kwargs,
         )
 
-        z_shape_og = z.shape
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
+        # Each head normalized on its own, rows kept whole (z may be a strided view).
+        core_attn_out = core_attn_out.reshape(seq_len, -1)
+        z = z.reshape(seq_len, -1)
         core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
         output, _ = self.out_proj(core_attn_out)
         return output
 
@@ -620,29 +674,50 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
+        aux_hidden_states: list[torch.Tensor] | None = None,
         **kwargs,
     ):
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
         )
 
+        hidden_fp4 = None
         if not ctx.forward_mode.is_idle():
-            hidden_states, residual = self.comm_manager.input_reduce_norm(
-                hidden_states, residual
+            hidden_states, hidden_fp8, residual = _input_norm(
+                self.comm_manager,
+                self.input_layernorm,
+                hidden_states,
+                residual,
+                self.linear_attn.input_fp8_scale(),
             )
+            capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
             hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
 
             hidden_states = self.linear_attn(
                 hidden_states,
+                hidden_fp8,
                 ctx,
             )
+            # Free the copy once consumed, as the projection frees its own quant.
+            del hidden_fp8
 
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                hidden_states, residual, ctx
+            hidden_states, hidden_fp4, residual = _post_attn_norm(
+                self.comm_manager,
+                self.post_attention_layernorm,
+                hidden_states,
+                residual,
+                self.mlp.nvfp4_global_scale(),
+                ctx,
+            )
+        else:
+            # No rows, but the tap and its gather stay aligned across ranks.
+            capture_layer_input(
+                self.comm_manager, hidden_states, ctx, aux_hidden_states
             )
 
         hidden_states = self.forward_mlp(
             hidden_states,
+            hidden_fp4,
             residual,
             ctx,
             num_global_tokens,
@@ -654,6 +729,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
     def forward_mlp(
         self,
         hidden_states,
+        hidden_fp4,
         residual,
         ctx: ForwardContext,
         num_global_tokens,
@@ -665,7 +741,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp.forward_prequantized(hidden_states, hidden_fp4)
             hidden_states, residual = self.comm_manager.post_mlp_fused(
                 hidden_states, residual, ctx
             )
@@ -848,7 +924,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        """Full attention forward pass."""
+        """Full attention forward pass; ``hidden_states`` may be qkv_proj's FP8 copy, which only ``_project_qkv`` reads."""
         q, k, v, gate = self._project_qkv(hidden_states)
         attn_output = self._attn(positions, q, k, v, gate, ctx)
         output, _ = self.o_proj(attn_output)
@@ -868,29 +944,50 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
+        aux_hidden_states: list[torch.Tensor] | None = None,
         **kwargs,
     ):
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
         )
 
+        hidden_fp4 = None
         if not ctx.forward_mode.is_idle():
-            hidden_states, residual = self.comm_manager.input_reduce_norm(
-                hidden_states, residual
+            hidden_states, hidden_fp8, residual = _input_norm(
+                self.comm_manager,
+                self.input_layernorm,
+                hidden_states,
+                residual,
+                self.qkv_proj.quant_method.static_fp8_input_scale(self.qkv_proj),
             )
+            capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
             hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
+            # qkv_proj is the only reader, so the FP8 copy can stand in for the rows.
             hidden_states = self.self_attention(
                 positions=positions,
-                hidden_states=hidden_states,
+                hidden_states=hidden_states if hidden_fp8 is None else hidden_fp8,
                 ctx=ctx,
             )
+            # Free the copy once consumed, as the projection frees its own quant.
+            del hidden_fp8
             residual = self._maybe_narrow_residual(residual, ctx)
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                hidden_states, residual, ctx
+            hidden_states, hidden_fp4, residual = _post_attn_norm(
+                self.comm_manager,
+                self.post_attention_layernorm,
+                hidden_states,
+                residual,
+                self.mlp.nvfp4_global_scale(),
+                ctx,
+            )
+        else:
+            # No rows, but the tap and its gather stay aligned across ranks.
+            capture_layer_input(
+                self.comm_manager, hidden_states, ctx, aux_hidden_states
             )
 
         hidden_states = self.forward_mlp(
             hidden_states,
+            hidden_fp4,
             residual,
             ctx,
             num_global_tokens,
@@ -902,6 +999,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     def forward_mlp(
         self,
         hidden_states,
+        hidden_fp4,
         residual,
         ctx: ForwardContext,
         num_global_tokens,
@@ -913,7 +1011,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp.forward_prequantized(hidden_states, hidden_fp4)
             hidden_states, residual = self.comm_manager.post_mlp_fused(
                 hidden_states, residual, ctx
             )
@@ -938,7 +1036,12 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.mapping = mapping
         self.hidden_size = config.hidden_size
 
-        alt_stream = torch.cuda.Stream()
+        # The shared expert overlaps the routed experts on this stream. In a
+        # ROCm HIP graph, each cross-stream edge costs microseconds of queue
+        # signaling; at decode the join alone idles the GPU for about 15 us
+        # per MoE layer, longer than the shared expert takes, so it runs
+        # inline there.
+        alt_stream = None if current_platform().is_amd else torch.cuda.Stream()
 
         # Embedding layer
         self.embed_tokens = VocabParallelEmbedding(
@@ -1021,26 +1124,21 @@ class Qwen3_5ForCausalLM(nn.Module):
         # Pass through decoder layers
         for layer_idx in range(len(self.layers)):
             layer = self.layers[layer_idx]
-            if aux_hidden_states is not None and layer_idx in self.layers_to_capture:
-                # Under RSAG the inter-layer hidden/residual are reduce-scattered
-                # across the attn TP group; aux consumers (e.g. the DFLASH
-                # drafter) expect full rows, so gather before capturing.
-                aux = (
-                    hidden_states + residual if residual is not None else hidden_states
-                )
-                gathered = layer.comm_manager.gather_residual(aux, ctx)
-                capture_idx = self._dflash_capture_idx_map.get(layer_idx)
-                if ctx.target_capture_sink is not None and capture_idx is not None:
-                    ctx.target_capture_sink.on_target_capture(capture_idx, gathered)
-                aux_hidden_states.append(
-                    gathered if gathered is aux else gathered.clone()
-                )
+            capture = layer_idx in self.layers_to_capture
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
                 ctx=ctx,
+                aux_hidden_states=aux_hidden_states if capture else None,
             )
+            if capture and ctx.target_capture_sink is not None:
+                notify_target_capture(
+                    ctx.target_capture_sink,
+                    self._dflash_capture_idx_map,
+                    layer_idx,
+                    aux_hidden_states,
+                )
 
             # Process deepstack embeddings if provided
             if (
@@ -1049,8 +1147,10 @@ class Qwen3_5ForCausalLM(nn.Module):
                 and layer_idx < 3
             ):
                 sep = self.hidden_size * layer_idx
-                hidden_states.add_(
-                    input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                # Add to the residual: under all-reduce fusion hidden_states is
+                # this rank's partial sum, which the next layer reduces.
+                residual = (
+                    residual + input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
 
         # Apply final normalization with optional allreduce fusion
@@ -1432,8 +1532,8 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         return self.model.embed_tokens
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
-        # DFLASH checkpoints name 0-indexed target layer outputs. The capture
-        # check runs before layer i, so capture at i + 1 for layer i's output.
+        # DFLASH checkpoints name 0-indexed target layer outputs. A layer
+        # captures the residual entering it, so capture at i + 1 for layer i's output.
         num_layers = len(self.model.layers)
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError("DFLASH target_layer_ids must be unique.")
@@ -1758,130 +1858,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoeForConditionalGeneration):
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),  # no ``model.language_model`` scope
         )
-
-
-@triton.jit
-def fused_qkvzba_split_reshape_cat_contiguous_kernel(
-    mixed_qkv,
-    z,
-    b,
-    a,
-    mixed_qkvz,
-    mixed_ba,
-    stride_qkvz: tl.constexpr,
-    stride_ba: tl.constexpr,
-    NUM_HEADS_QK: tl.constexpr,
-    NUM_HEADS_V: tl.constexpr,
-    HEAD_QK: tl.constexpr,
-    HEAD_V: tl.constexpr,
-    BLOCK: tl.constexpr,
-    BLOCK_BA: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
-):
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
-        # Release successor setup; its wait still guards all dependent reads.
-        tl.extra.cuda.gdc_launch_dependents()
-    row, tile = tl.program_id(0), tl.program_id(1)
-    TOTAL_V: tl.constexpr = NUM_HEADS_V * HEAD_V
-    QKV_DIM: tl.constexpr = 2 * NUM_HEADS_QK * HEAD_QK + TOTAL_V
-    QKVZ_DIM: tl.constexpr = QKV_DIM + TOTAL_V
-    # QKVZ is already ordered, including non-power-of-two head ratios.
-    offsets = tile * BLOCK + tl.arange(0, BLOCK)
-    values = tl.load(
-        mixed_qkvz + row * stride_qkvz + offsets,
-        offsets < QKVZ_DIM,
-        other=0,
-    )
-    # Keep output bases separate: pointer selection breaks AMD canonicalization.
-    tl.store(
-        mixed_qkv + row * QKV_DIM + offsets,
-        values,
-        offsets < QKV_DIM,
-    )
-    tl.store(
-        z + row * TOTAL_V + offsets - QKV_DIM,
-        values,
-        (offsets >= QKV_DIM) & (offsets < QKVZ_DIM),
-    )
-
-    # One tile owns each row's gates; adjacent lanes copy adjacent heads.
-    if tile == 0:
-        heads = tl.arange(0, BLOCK_BA)
-        mask = heads < NUM_HEADS_V
-        b_values = tl.load(mixed_ba + row * stride_ba + heads, mask, other=0)
-        a_values = tl.load(
-            mixed_ba + row * stride_ba + NUM_HEADS_V + heads, mask, other=0
-        )
-        tl.store(b + row * NUM_HEADS_V + heads, b_values, mask)
-        tl.store(a + row * NUM_HEADS_V + heads, a_values, mask)
-
-
-def fused_qkvzba_split_reshape_cat_contiguous(
-    mixed_qkvz,
-    mixed_ba,
-    num_heads_qk,
-    num_heads_v,
-    head_qk,
-    head_v,
-):
-    """Repack Qwen3.5 projections into contiguous, independently owned outputs.
-
-    Inputs have unit inner strides; row strides and storage offsets may vary.
-    The leading dimension counts tokens, including flattened MTP tokens.
-    QKV and Z retain the QKVZ dtype; B and A retain the BA dtype.
-
-    Input layout (per row):
-        mixed_qkvz: [all_q | all_k | all_v | all_z]
-        mixed_ba:   [all_b | all_a]
-
-    Output layout:
-        mixed_qkv: [all_q | all_k | all_v]  (z stripped)
-        z: [num_v_heads, head_v]
-        b: [num_v_heads]
-        a: [num_v_heads]
-    """
-    enable_pdl = pdl_enabled()
-    batch, seq_len = mixed_qkvz.shape[0], 1
-    qkv_dim_t = num_heads_qk * head_qk * 2 + num_heads_v * head_v
-    mixed_qkv = torch.empty(
-        [batch * seq_len, qkv_dim_t],
-        dtype=mixed_qkvz.dtype,
-        device=mixed_qkvz.device,
-    )
-    z = torch.empty(
-        [batch * seq_len, num_heads_v, head_v],
-        dtype=mixed_qkvz.dtype,
-        device=mixed_qkvz.device,
-    )
-    b = torch.empty(
-        [batch * seq_len, num_heads_v],
-        dtype=mixed_ba.dtype,
-        device=mixed_ba.device,
-    )
-    a = torch.empty_like(b)
-    grid = (batch * seq_len, triton.cdiv(qkv_dim_t + num_heads_v * head_v, 2048))
-    fused_qkvzba_split_reshape_cat_contiguous_kernel[grid](
-        mixed_qkv,
-        z,
-        b,
-        a,
-        mixed_qkvz,
-        mixed_ba,
-        mixed_qkvz.stride(0),
-        mixed_ba.stride(0),
-        num_heads_qk,
-        num_heads_v,
-        head_qk,
-        head_v,
-        BLOCK=2048,
-        BLOCK_BA=triton.next_power_of_2(num_heads_v),
-        num_warps=4,
-        num_stages=1,
-        ENABLE_PDL=enable_pdl,
-        **({"launch_pdl": True} if enable_pdl else {}),
-    )
-    return mixed_qkv, z, b, a
 
 
 EntryClass = [

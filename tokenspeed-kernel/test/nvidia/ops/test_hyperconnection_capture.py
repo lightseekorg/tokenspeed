@@ -24,8 +24,7 @@ from unittest import mock
 
 import pytest
 import torch
-from tokenspeed_kernel import gated_residual_mix
-from tokenspeed_kernel.ops.residual import cute_fused
+from tokenspeed_kernel.ops.residual import cute_fused, gated_residual_mix
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -58,6 +57,7 @@ def _mix(inputs):
         4,
         2560,
         320,
+        projection_rows=324,
         weights_independent=True,
         projection_scale=1.0,
         override="cute_fused_hyperconnection_mix",

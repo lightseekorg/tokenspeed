@@ -24,6 +24,7 @@ from lib.moe.rocm.mega_moe_config_selector import (
     MegaMoEConfigSelector,
     MegaMoEStage1M64W4Config,
     MegaMoEStage1M64W8Config,
+    kMegaMoETwoStageMxFp4ClampedSiluSolutionId,
     kMegaMoETwoStageMxFp4KimiSituSolutionId,
     kMegaMoETwoStageMxFp4SiluSolutionId,
     kMegaMoETwoStageMxFp4SolutionId,
@@ -117,6 +118,16 @@ def _MegaMoESolutions():
         3072,
         (P.kCta56, P.kCta192),
     )
+    for experts, topk in ((384, 6), (128, 3)):
+        register(
+            kMegaMoETwoStageMxFp4ClampedSiluSolutionId,
+            8,
+            experts,
+            topk,
+            5120,
+            2560,
+            (P.kCta56, P.kCta64, P.kCta128, P.kCta192),
+        )
     return dict(entries)
 
 

@@ -36,147 +36,14 @@ if current_platform().is_amd:
         launch_gluon_dsv4_decode_split_gfx950 as _dsv4_decode_split_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
-        launch_gluon_dsv4_decode_topk_mxfp4_gfx950 as _dsv4_decode_topk_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
-        launch_gluon_dsv4_plan_gfx950 as _dsv4_plan_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
         launch_gluon_dsv4_prefill_gfx950 as _dsv4_prefill_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
-        launch_gluon_dsv4_prefill_topk_mxfp4_gfx950 as _dsv4_prefill_topk_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
         launch_gluon_dsv4_decode_gfx1250 as _dsv4_decode_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
-        launch_gluon_dsv4_decode_topk_mxfp4_gfx1250 as _dsv4_decode_topk_gfx1250_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
-        launch_gluon_dsv4_plan_gfx1250 as _dsv4_plan_gfx1250_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
         launch_gluon_dsv4_prefill_gfx1250 as _dsv4_prefill_gfx1250_impl,
     )
-    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4 import (
-        launch_gluon_dsv4_prefill_topk_mxfp4_gfx1250 as _dsv4_prefill_topk_gfx1250_impl,
-    )
-
-    _DSV4_MXFP4_SIGNATURE = format_signature(
-        q=dense_tensor_format(torch.uint8),
-        weights=dense_tensor_format(torch.float32),
-        index_k_cache=dense_tensor_format(torch.uint8),
-    )
-    _DSV4_MXFP4_TRAITS = {
-        "index_heads": frozenset({32, 64}),
-        "head_dim": frozenset({128}),
-        "page_size": frozenset({64}),
-        "topk": frozenset({512, 1024, 2048}),
-        "index_k_format": frozenset({"mxfp4"}),
-    }
-
-    @register_kernel(
-        "attention",
-        "dsv4_prefill_topk",
-        name="gluon_dsv4_prefill_topk_mxfp4_gfx950",
-        solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
-        ),
-        signatures=frozenset({_DSV4_MXFP4_SIGNATURE}),
-        traits=_DSV4_MXFP4_TRAITS,
-        priority=Priority.SPECIALIZED,
-    )
-    def gluon_dsv4_prefill_topk_mxfp4_gfx950(*args, **kwargs):
-        return _dsv4_prefill_topk_impl(*args, **kwargs)
-
-    @register_kernel(
-        "attention",
-        "dsv4_decode_topk",
-        name="gluon_dsv4_decode_topk_mxfp4_gfx950",
-        solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
-        ),
-        signatures=frozenset({_DSV4_MXFP4_SIGNATURE}),
-        traits=_DSV4_MXFP4_TRAITS,
-        priority=Priority.SPECIALIZED,
-    )
-    def gluon_dsv4_decode_topk_mxfp4_gfx950(*args, **kwargs):
-        return _dsv4_decode_topk_impl(*args, **kwargs)
-
-    @register_kernel(
-        "attention",
-        "dsv4_plan",
-        name="gluon_dsv4_plan_gfx950",
-        solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
-        ),
-        signatures=frozenset({format_signature()}),
-        traits={"page_size": frozenset({64})},
-        priority=Priority.SPECIALIZED,
-    )
-    def gluon_dsv4_plan_gfx950(**kwargs):
-        return _dsv4_plan_impl(**kwargs)
-
-    @register_kernel(
-        "attention",
-        "dsv4_prefill_topk",
-        name="gluon_dsv4_prefill_topk_mxfp4_gfx1250",
-        solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(12, 5),
-            max_arch_version=ArchVersion(12, 5),
-            vendors=frozenset({"amd"}),
-        ),
-        signatures=frozenset({_DSV4_MXFP4_SIGNATURE}),
-        traits=_DSV4_MXFP4_TRAITS,
-        priority=Priority.SPECIALIZED,
-    )
-    def gluon_dsv4_prefill_topk_mxfp4_gfx1250(*args, **kwargs):
-        return _dsv4_prefill_topk_gfx1250_impl(*args, **kwargs)
-
-    @register_kernel(
-        "attention",
-        "dsv4_decode_topk",
-        name="gluon_dsv4_decode_topk_mxfp4_gfx1250",
-        solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(12, 5),
-            max_arch_version=ArchVersion(12, 5),
-            vendors=frozenset({"amd"}),
-        ),
-        signatures=frozenset({_DSV4_MXFP4_SIGNATURE}),
-        traits=_DSV4_MXFP4_TRAITS,
-        priority=Priority.SPECIALIZED,
-    )
-    def gluon_dsv4_decode_topk_mxfp4_gfx1250(*args, **kwargs):
-        return _dsv4_decode_topk_gfx1250_impl(*args, **kwargs)
-
-    @register_kernel(
-        "attention",
-        "dsv4_plan",
-        name="gluon_dsv4_plan_gfx1250",
-        solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(12, 5),
-            max_arch_version=ArchVersion(12, 5),
-            vendors=frozenset({"amd"}),
-        ),
-        signatures=frozenset({format_signature()}),
-        traits={"page_size": frozenset({64})},
-        priority=Priority.SPECIALIZED,
-    )
-    def gluon_dsv4_plan_gfx1250(**kwargs):
-        return _dsv4_plan_gfx1250_impl(**kwargs)
 
     @register_kernel(
         "attention",

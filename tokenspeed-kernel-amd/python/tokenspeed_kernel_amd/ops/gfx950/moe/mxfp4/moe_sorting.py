@@ -66,7 +66,7 @@ _SCAN_NUM_WARPS = 4
 
 
 def _small_sort_launch_metadata(grid, kernel, args):
-    """Report compact route-sort traffic to Proton."""
+    """Report single-chunk route-sort traffic to Proton."""
     numel = args["numel"]
     num_experts = args["num_experts"]
     int_bytes = args["topk_ids_ptr"].element_size()
@@ -92,11 +92,6 @@ def _max_padded_route_capacity(
     # The actual padded extent is block-aligned, so the largest multiple no
     # greater than the per-expert padding bound is sufficient.
     return upper_bound // block_size * block_size
-
-
-@gluon.jit
-def _add(a, b):
-    return a + b
 
 
 @gluon.jit(do_not_specialize=("numel", "tokens_per_program"))
@@ -157,7 +152,7 @@ def _moe_sorting_stage1_kernel(
 @gluon.jit(
     launch_metadata=_small_sort_launch_metadata, do_not_specialize=("m_total", "numel")
 )
-def _moe_sorting_small_histogram_prefix_kernel(
+def gluon_mxfp4_moe_sort_histogram_prefix_gfx950(
     topk_ids_ptr,
     tokens_cnts_ptr,
     cumsum_ptr,
@@ -204,7 +199,7 @@ def _moe_sorting_small_histogram_prefix_kernel(
     )
     padded = ((histogram + block_size - 1) // block_size) * block_size
     padded = gl.where(expert_valid, padded, 0)
-    inclusive = gl.associative_scan(padded, 0, _add)
+    inclusive = gl.cumsum(padded, 0)
     gl.store(cumsum_ptr, 0)
     gl.store(cumsum_ptr + 1 + expert, inclusive, mask=expert_valid)
     gl.store(num_valid_ids_ptr, gl.sum(padded))
@@ -232,7 +227,7 @@ def _moe_sorting_stage2_kernel(
     mask = rows < num_programs
     offs = (rows + 1) * num_experts + pid
     cnt = gl.load(tokens_cnts_ptr + offs, mask=mask, other=0)
-    inclusive = gl.associative_scan(cnt, 0, _add)
+    inclusive = gl.cumsum(cnt, 0)
     gl.store(tokens_cnts_ptr + offs, inclusive, mask=mask)
 
 
@@ -262,7 +257,7 @@ def _moe_sorting_stage3_kernel(
     off_last = num_programs * num_experts
     cnt = gl.load(tokens_cnts_ptr + off_last + e, mask=mask, other=0)
     padded = ((cnt + block_size - 1) // block_size) * block_size
-    inclusive = gl.associative_scan(padded, 0, _add)
+    inclusive = gl.cumsum(padded, 0)
     gl.store(cumsum_ptr, 0)
     gl.store(cumsum_ptr + 1 + e, inclusive, mask=mask)
     gl.store(num_valid_ids_ptr + 0, gl.sum(padded))
@@ -350,7 +345,8 @@ def gluon_moe_sorting(
     out_dtype: torch.dtype,
     block_size: int,
     *,
-    compact_route_programs: bool,
+    use_minimum_route_chunks: bool,
+    runtime_rows: bool,
     expert_start: int = 0,
     out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -368,9 +364,11 @@ def gluon_moe_sorting(
         model_dim: hidden dim of the ``out`` buffer.
         out_dtype: dtype of the ``out`` buffer (bf16 in production).
         block_size: per-expert padding granularity ``B`` (the stage BLOCK_M).
-        compact_route_programs: use the minimum route-program count and fuse
-            the one-program histogram and prefix scan. Decode selects this;
-            package prefill preserves its locality-oriented chunk count.
+        use_minimum_route_chunks: use the minimum route-program count and fuse
+            the one-program histogram and prefix scan. Short prefills select
+            this; larger prefills preserve their locality-oriented chunk count.
+        runtime_rows: retain the fixed 32-route bound for medium batches.
+            Every path already passes row and chunk counts as runtime values.
         expert_start: global ID of local expert zero.
         out: optional preallocated ``(M, model_dim)`` output buffer.
 
@@ -427,12 +425,15 @@ def gluon_moe_sorting(
     # Keep route chunks at a practical vector width. The chunk prefix scan
     # preserves their source order even when there are fewer experts than
     # required route programs.
-    max_routes_per_program = 1024
+    max_routes_per_program = 32 if runtime_rows else 1024
     num_programs = triton.cdiv(numel, max_routes_per_program)
-    if not compact_route_programs:
+    if not use_minimum_route_chunks:
         num_programs = max(E, num_programs)
     tokens_per_program = triton.cdiv(numel, num_programs)
-    route_block = triton.next_power_of_2(tokens_per_program)
+    if runtime_rows:
+        route_block = 32
+    else:
+        route_block = triton.next_power_of_2(tokens_per_program)
     expert_pad = triton.next_power_of_2(E + 1)
     program_pad = triton.next_power_of_2(num_programs)
 
@@ -441,7 +442,7 @@ def gluon_moe_sorting(
     cumsum = torch.empty((E + 1,), dtype=torch.int32, device=device)
 
     if num_programs == 1:
-        _moe_sorting_small_histogram_prefix_kernel[(1,)](
+        gluon_mxfp4_moe_sort_histogram_prefix_gfx950[(1,)](
             topk_ids,
             tokens_cnts,
             cumsum,
@@ -510,3 +511,115 @@ def gluon_moe_sorting(
     )
 
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, out
+
+
+def _route_tile_launch_metadata(grid, kernel, args):
+    rows = args["rows"] if "rows" in args else args["MAX_ROWS"]
+    return {"name": f"{kernel.name} (M={rows})"}
+
+
+@gluon.jit(launch_metadata=_route_tile_launch_metadata, do_not_specialize=["rows"])
+def gluon_mxfp4_moe_route_descriptors_gfx950(
+    ids,
+    sorted_routes,
+    descriptors,
+    group_count,
+    mapping,
+    rows,
+    EXPERT_START: gl.constexpr,
+    NUM_EXPERTS: gl.constexpr,
+    TOPK: gl.constexpr,
+    MAX_ROWS: gl.constexpr,
+):
+    """Pack one tile per expert; distinct top-k IDs bound each count by rows."""
+    ROUTE_BLOCK: gl.constexpr = triton.next_power_of_2(MAX_ROWS * TOPK)
+    EXPERT_PAD: gl.constexpr = triton.next_power_of_2(NUM_EXPERTS)
+    routes_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
+    expert_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
+    matrix_layout: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [4, 1], [1, 0])
+    route = gl.arange(0, ROUTE_BLOCK, layout=routes_layout)
+    expert = gl.load(ids + route, route < rows * TOPK, other=-1) - EXPERT_START
+    valid = (route < rows * TOPK) & (expert >= 0) & (expert < NUM_EXPERTS)
+    safe = gl.where(valid, expert, 0)
+    histogram = gl.histogram(safe, EXPERT_PAD, mask=valid, layout=expert_layout)
+    inclusive = gl.cumsum(histogram, 0)
+    starts = inclusive - histogram
+    active = (histogram > 0).to(gl.int32)
+    group = gl.cumsum(active, 0) - active
+    local_expert = gl.arange(0, EXPERT_PAD, layout=expert_layout)
+    gl.store(descriptors + group * 3, starts, active != 0)
+    gl.store(descriptors + group * 3 + 1, histogram, active != 0)
+    gl.store(descriptors + group * 3 + 2, local_expert, active != 0)
+    gl.store(group_count, gl.sum(active, 0))
+    row_expert = gl.convert_layout(safe, gl.SliceLayout(1, matrix_layout))[:, None]
+    col_expert = gl.convert_layout(safe, gl.SliceLayout(0, matrix_layout))[None, :]
+    row_valid = gl.convert_layout(valid, gl.SliceLayout(1, matrix_layout))[:, None]
+    col_valid = gl.convert_layout(valid, gl.SliceLayout(0, matrix_layout))[None, :]
+    row = gl.arange(0, ROUTE_BLOCK, layout=gl.SliceLayout(1, matrix_layout))[:, None]
+    col = gl.arange(0, ROUTE_BLOCK, layout=gl.SliceLayout(0, matrix_layout))[None, :]
+    earlier = ((row_expert == col_expert) & row_valid & col_valid & (col < row)).to(
+        gl.int32
+    )
+    rank = gl.convert_layout(gl.sum(earlier, 1), routes_layout)
+    position = gl.gather(gl.convert_layout(starts, routes_layout), safe, axis=0) + rank
+    gl.store(sorted_routes + position, route, valid)
+    gl.store(mapping + route, gl.where(valid, route, -1), route < rows * TOPK)
+
+
+@gluon.jit(launch_metadata=_route_tile_launch_metadata, do_not_specialize=["rows"])
+def gluon_mxfp4_moe_route_pack_gfx950(
+    ids,
+    sorted_routes,
+    expert_counts,
+    mapping,
+    rows,
+    EXPERT_START: gl.constexpr,
+    NUM_EXPERTS: gl.constexpr,
+    TOPK: gl.constexpr,
+    MAX_ROWS: gl.constexpr,
+):
+    """Collect each expert's route IDs in a fixed-capacity list."""
+    ROUTE_BLOCK: gl.constexpr = triton.next_power_of_2(MAX_ROWS * TOPK)
+    layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
+    expert = gl.program_id(0)
+    route = gl.arange(0, ROUTE_BLOCK, layout=layout)
+    expert_id = gl.load(ids + route, route < rows * TOPK, other=-1)
+    selected = (route < rows * TOPK) & (expert_id == EXPERT_START + expert)
+    selected_i = selected.to(gl.int32)
+    position = gl.cumsum(selected_i, 0) - selected_i
+    gl.store(sorted_routes + expert * MAX_ROWS + position, route, selected)
+    gl.store(expert_counts + expert, gl.sum(selected_i, 0))
+    if expert == 0:
+        owned = (expert_id >= EXPERT_START) & (expert_id < EXPERT_START + NUM_EXPERTS)
+        gl.store(mapping + route, gl.where(owned, route, -1), route < rows * TOPK)
+
+
+@gluon.jit(launch_metadata=_route_tile_launch_metadata)
+def gluon_mxfp4_moe_route_tiles_gfx950(
+    expert_counts,
+    descriptors,
+    group_count,
+    NUM_EXPERTS: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    MAX_ROWS: gl.constexpr,
+):
+    """Partition each expert's list into descriptors of at most BLOCK_M routes."""
+    EXPERT_PAD: gl.constexpr = triton.next_power_of_2(NUM_EXPERTS)
+    layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
+    expert = gl.arange(0, EXPERT_PAD, layout=layout)
+    count = gl.load(expert_counts + expert, expert < NUM_EXPERTS, other=0)
+    tiles = (count + BLOCK_M - 1) // BLOCK_M
+    first = gl.cumsum(tiles, 0) - tiles
+    for part in gl.static_range(MAX_ROWS // BLOCK_M):
+        valid = part < tiles
+        descriptor = first + part
+        gl.store(
+            descriptors + descriptor * 3, expert * MAX_ROWS + part * BLOCK_M, valid
+        )
+        gl.store(
+            descriptors + descriptor * 3 + 1,
+            gl.minimum(count - part * BLOCK_M, BLOCK_M),
+            valid,
+        )
+        gl.store(descriptors + descriptor * 3 + 2, expert, valid)
+    gl.store(group_count, gl.sum(tiles, 0))

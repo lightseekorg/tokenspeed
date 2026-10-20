@@ -21,8 +21,8 @@
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.platform import current_platform
 
 _platform = current_platform()
@@ -78,7 +78,7 @@ def _mm(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     x, x_scales, w, w_scales, alpha = operands
-    return tokenspeed_kernel.mm(
+    return mm(
         x,
         w.T,
         A_scales=x_scales,

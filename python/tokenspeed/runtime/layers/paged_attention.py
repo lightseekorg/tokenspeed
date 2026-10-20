@@ -34,9 +34,11 @@ from typing import Protocol
 
 import torch
 from tokenspeed_kernel.ops.attention.prologue import (
+    FP8TensorScales,
     GQAPrologueOutput,
     HeadKVCache,
     HeadNorm,
+    KVCacheFormat,
     LatentKVCache,
     MLAExpandedKV,
     MLAPrologueOutput,
@@ -53,6 +55,10 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
+from tokenspeed.runtime.model_loader.weight_utils import (
+    K_CACHE_SCALE_SUFFIXES,
+    V_CACHE_SCALE_SUFFIXES,
+)
 
 
 @dataclass(frozen=True)
@@ -156,6 +162,31 @@ class PagedAttention(nn.Module):
         self._group_id: str | None = None
         self.rotary_emb = rotary_emb
         self.qk_norm = qk_norm
+        # Per-tensor FP8 KV-cache scales (None at unit); a non-FP8 cache ignores them.
+        self.fp8_kv_scales: FP8TensorScales | None = None
+
+    def load_kv_cache_scale(self, name: str, scale: torch.Tensor) -> None:
+        """Take a checkpoint's key, value or shared KV-cache scale tensor."""
+        if scale.numel() != 1:
+            raise NotImplementedError(
+                f"PagedAttention layer_id={self.layer_id}: {name} holds "
+                f"{scale.numel()} scales; only per-tensor KV-cache scales are "
+                "supported"
+            )
+        k, v = (
+            (1.0, 1.0)
+            if self.fp8_kv_scales is None
+            else (self.fp8_kv_scales.k, self.fp8_kv_scales.v)
+        )
+        if name.endswith(K_CACHE_SCALE_SUFFIXES):
+            k = float(scale.item())
+        elif name.endswith(V_CACHE_SCALE_SUFFIXES):
+            v = float(scale.item())
+        elif name.endswith(".kv_scale"):
+            k = v = float(scale.item())
+        else:
+            raise KeyError(f"{name!r} is not a KV-cache scale tensor")
+        self.fp8_kv_scales = None if k == v == 1.0 else FP8TensorScales(k, v)
 
     @property
     def group_id(self) -> str:
@@ -266,6 +297,31 @@ class PagedAttention(nn.Module):
             override=None,
         )
 
+    def store_prepared(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> GQAPrologueOutput:
+        """Write rows whose projection or collective already applied norm/RoPE.
+
+        The producer must match this layer's prologue numerical contract.
+        This method owns the usual padded write slots and cache conversion;
+        call :meth:`attend` with its result to avoid repeating the head steps.
+        """
+        return gqa_prologue(
+            q,
+            k,
+            v,
+            norm=None,
+            rotary=None,
+            cache=self._write_target(q, ctx),
+            return_kv=not ctx.forward_mode.is_decode(),
+            solution=None,
+            override=None,
+        )
+
     def _steps(
         self, positions: torch.Tensor | None
     ) -> tuple[HeadNorm | None, Rotary | None]:
@@ -285,11 +341,25 @@ class PagedAttention(nn.Module):
     def _local_target(
         self, slots: torch.Tensor, ctx: ForwardContext
     ) -> HeadKVCache | LatentKVCache:
-        """The pool's target for ``slots``, local to this rank's shard under DCP."""
+        """The pool's target for ``slots``, local to this rank's shard under KVP."""
         slots, owned = resolve_cache_slots(
             slots, ctx.attn_backend.cache_placement(self)
         )
-        return ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots, owned)
+        target = ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots, owned)
+        if (
+            self.fp8_kv_scales is not None
+            and isinstance(target, HeadKVCache)
+            and target.format is KVCacheFormat.FP8
+        ):
+            # Every reader of this cache must apply the scales it was written at.
+            if not ctx.attn_backend.reads_fp8_kv_scales(self):
+                raise NotImplementedError(
+                    f"layer {self.layer_id} has per-tensor KV-cache scales "
+                    f"{self.fp8_kv_scales}, which "
+                    f"{type(ctx.attn_backend).__name__} does not read"
+                )
+            target = replace(target, scales=self.fp8_kv_scales)
+        return target
 
     def attend_live_rows(
         self,
@@ -408,7 +478,7 @@ class PagedAttention(nn.Module):
 
 class _CacheGroupSpecLike(Protocol):
     group_id: str
-    retention: str
+    attn_kind: str
     sliding_window_tokens: int | None
 
 
@@ -447,7 +517,7 @@ def bind_cache_groups(model: nn.Module, cache_pool: _CacheViewLike) -> None:
         if group_id is None:
             raise ValueError(
                 f"{model_name}: attention layer {name!r} (layer_id="
-                f"{module.layer_id}) has no history-family cache group in the "
+                f"{module.layer_id}) has no history cache group in the "
                 f"pool's plan (planned layers: {sorted(group_by_layer)})."
             )
         _check_visibility_within_retention(model_name, name, module, specs[group_id])
@@ -457,7 +527,7 @@ def bind_cache_groups(model: nn.Module, cache_pool: _CacheViewLike) -> None:
 def _check_visibility_within_retention(
     model_name: str, name: str, layer: PagedAttention, spec: _CacheGroupSpecLike
 ) -> None:
-    if spec.retention != "sliding_window":
+    if spec.attn_kind != "sliding_window":
         return
     window_left = layer.sliding_window_size
     retained = spec.sliding_window_tokens
@@ -498,7 +568,7 @@ def check_block_drafter_storage(
         if not isinstance(module, PagedAttention):
             continue
         group_id = module.group_id
-        if group_id not in target_groups or specs[group_id].retention != "full_history":
+        if group_id not in target_groups or specs[group_id].attn_kind != "full_history":
             raise ValueError(
                 f"{model_name}: block drafter layer {name!r} (layer_id="
                 f"{module.layer_id}) rides cache group {group_id!r}, but a block "

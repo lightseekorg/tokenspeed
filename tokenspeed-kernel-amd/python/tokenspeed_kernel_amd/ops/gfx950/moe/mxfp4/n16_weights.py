@@ -18,7 +18,20 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Single-bank N16/K64-byte storage for the MXFP8 prefill pipeline."""
+"""Single-bank N16/K64-byte MXFP4 expert storage for gfx950 MoE pipelines.
+
+Each 16-row group of a weight stores its K bytes as 64-byte chunks, each a
+1 KiB block in MFMA lane order, so one wave reads its fragment as one
+contiguous 1 KiB load. W13 alternates 16-row gate and up groups. W2 keeps
+its rows' chunks back to back; a K width that is not a multiple of 64
+bytes ends in a half chunk holding only the leading lane quads, so W2 is
+stored flat (``[E, D / 16, 16 * I / 2]``) without padding. Scales of two
+16-row groups and two K groups share a 32-bit word (``_n32_scale_offset``);
+W2 scales pad K to whole 8-group cells.
+
+Users: the MXFP8 SiTU prefill/decode pipelines and the dynamic-MXFP4
+(A4W4) pipeline in ``mxfp4_gemm.py``.
+"""
 
 from __future__ import annotations
 
@@ -30,8 +43,13 @@ from tokenspeed_kernel_amd._triton import gluon
 
 @gluon.jit
 def _n16_weight_offset(n, k_packed, packed_k):
+    """Byte offset of packed K byte ``k_packed`` of row ``n``."""
+    # Whole chunks first, then the half-chunk tail of a row group. Keep this
+    # form: with a runtime ``packed_k`` the single ``n // 16 * packed_k * 16``
+    # product made the SiTU warp decode about 10% slower.
     return (
         (n // 16 * (packed_k // 64) + k_packed // 64) * 1024
+        + n // 16 * (packed_k % 64 * 16)
         + (k_packed // 16 % 4) * 256
         + n % 16 * 16
         + k_packed % 16
@@ -56,8 +74,16 @@ def _shuffle_weight(weight: torch.Tensor, *, gate_up: bool) -> torch.Tensor:
         weight = weight.reshape(experts, 2, columns // 32, 16, packed_k // 64, 4, 16)
         order = (0, 2, 1, 4, 5, 3, 6)
     else:
-        weight = weight.reshape(experts, columns // 16, 16, packed_k // 64, 4, 16)
-        order = (0, 1, 3, 4, 2, 5)
+        # Flat rows of chunks; a trailing half chunk keeps its two leading
+        # lane quads only.
+        chunks = (packed_k + 63) // 64
+        weight = torch.nn.functional.pad(weight, (0, chunks * 64 - packed_k))
+        return (
+            weight.reshape(experts, columns // 16, 16, chunks, 4, 16)
+            .permute(0, 1, 3, 4, 2, 5)
+            .reshape(experts, columns // 16, chunks * 1024)[..., : 16 * packed_k]
+            .contiguous()
+        )
     return (
         weight.permute(order)
         .contiguous()
@@ -71,6 +97,10 @@ def _shuffle_scale(scale: torch.Tensor, *, gate_up: bool) -> torch.Tensor:
         scale = scale.reshape(experts, 2, columns // 32, 16, groups // 8, 2, 4)
         order = (0, 2, 4, 6, 3, 5, 1)
     else:
+        # Pad K to whole 8-group cells with unit scales.
+        cells = (groups + 7) // 8
+        scale = torch.nn.functional.pad(scale, (0, cells * 8 - groups), value=127)
+        groups = cells * 8
         scale = scale.reshape(experts, columns // 32, 2, 16, groups // 8, 2, 4)
         order = (0, 1, 4, 6, 3, 5, 2)
     return (
@@ -86,23 +116,30 @@ def n16_mxfp4_shape(
     w2: torch.Tensor,
     s2: torch.Tensor,
 ) -> tuple[int, int, int]:
-    """Validate packed cell axes and return (experts, hidden, intermediate)."""
+    """Validate packed cell axes and return (experts, hidden, intermediate).
+
+    Requires ``hidden % 256 == 0`` and ``intermediate % 64 == 0``; pipelines
+    with stricter K tiling check their own multiples.
+    """
     tensors = (w13, s13, w2, s2)
-    if any(
-        t.ndim != 6 or t.dtype != torch.uint8 or not t.is_contiguous() for t in tensors
-    ):
-        raise ValueError("N16 MXFP4 requires contiguous rank-6 uint8 cells")
+    if any(t.dtype != torch.uint8 or not t.is_contiguous() for t in tensors) or tuple(
+        t.ndim for t in tensors
+    ) != (6, 6, 3, 6):
+        raise ValueError(
+            "N16 MXFP4 requires contiguous uint8 cells: rank-6 W13 and scales, "
+            "rank-3 W2"
+        )
     e, d, i = w13.shape[0], w13.shape[2] * 128, w13.shape[1] * 8
     if (
         not e
         or not d
         or not i
         or d % 256
-        or i % 256
+        or i % 64
         or w13.shape != (e, i // 8, d // 128, 4, 16, 16)
         or s13.shape != (e, i // 16, d // 256, 4, 16, 4)
-        or w2.shape != (e, d // 16, i // 128, 4, 16, 16)
-        or s2.shape != (e, d // 32, i // 256, 4, 16, 4)
+        or w2.shape != (e, d // 16, 8 * i)
+        or s2.shape != (e, d // 32, (i + 255) // 256, 4, 16, 4)
         or len({t.device for t in tensors}) != 1
     ):
         raise ValueError("inconsistent N16 weight/scale cell shapes")
@@ -119,6 +156,7 @@ def _load_n16_expert(
     gate_up: bool,
     is_scale: bool,
     interleaved: bool,
+    linear_k: int,
 ) -> None:
     # Reuse checkpoint sharding/conversion on one temporary linear expert.
     # Copy back into the existing bank so captured pointers remain valid.
@@ -130,14 +168,23 @@ def _load_n16_expert(
         cells = cells.reshape(1, n, k, 4, 16, 2, 2)
         order = (0, 6, 1, 4, 2, 5, 3) if gate_up else (0, 1, 6, 4, 2, 5, 3)
         linear = cells.permute(order).contiguous().reshape(1, n * 32, k * 8)
-    else:
+    elif gate_up:
         _, n, k, _, _, _ = cells.shape
-        if gate_up:
-            cells = cells.reshape(1, n // 2, 2, k, 4, 16, 16)
-            order = (0, 2, 1, 5, 3, 4, 6)
-        else:
-            order = (0, 1, 4, 2, 3, 5)
-        linear = cells.permute(order).contiguous().reshape(1, n * 16, k * 64)
+        cells = cells.reshape(1, n // 2, 2, k, 4, 16, 16)
+        linear = (
+            cells.permute(0, 2, 1, 5, 3, 4, 6).contiguous().reshape(1, n * 16, k * 64)
+        )
+    else:
+        _, n, size = cells.shape
+        chunks = (linear_k + 63) // 64
+        cells = torch.nn.functional.pad(cells, (0, chunks * 1024 - size))
+        linear = (
+            cells.reshape(1, n, chunks, 4, 16, 16)
+            .permute(0, 1, 4, 2, 3, 5)
+            .reshape(1, n * 16, chunks * 64)
+        )
+    # Drop the K padding of the last W2 chunk or scale cell.
+    linear = linear[..., :linear_k].contiguous()
     if interleaved:
         linear = (
             linear.reshape(1, 2, -1, linear.shape[-1])
@@ -178,13 +225,13 @@ def preprocess_n16_mxfp4_weights(w: torch.nn.Module) -> None:
     if (
         two_i % 2
         or hidden % 256
-        or intermediate % 256
+        or intermediate % 64
         or w2.shape != (experts, hidden, intermediate // 2)
         or s13.shape != (experts, two_i, hidden // 32)
         or s2.shape != (experts, hidden, intermediate // 32)
     ):
         raise ValueError(
-            "N16 MXFP4 requires D and I divisible by 256 and matching scales"
+            "N16 MXFP4 requires D divisible by 256, I by 64 and matching scales"
         )
     if len({t.device for t in tensors}) != 1:
         raise ValueError("N16 MXFP4 weights and scales must be colocated")
@@ -221,5 +268,6 @@ def preprocess_n16_mxfp4_weights(w: torch.nn.Module) -> None:
                 gate_up=gate_up,
                 is_scale=name.endswith("scale"),
                 interleaved=gate_up and input_layout == "interleaved",
+                linear_k=int(original.shape[-1]),
             )
         setattr(w, name, parameter)

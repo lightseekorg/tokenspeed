@@ -38,6 +38,9 @@ import pytest
 import tokenspeed_kernel
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from utils import is_cdna4
 
 
@@ -188,7 +191,7 @@ class _TestMoeLayer(torch.nn.Module):
 
 
 def _make_plan(profile: _BenchmarkProfile) -> dict:
-    return tokenspeed_kernel.moe_plan(
+    return kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation=profile.activation,
@@ -351,7 +354,7 @@ def test_distributed_petit_reference(profile_name):
     layer = _TestMoeLayer(profile, device)
     _weights(layer, profile, rank)
     plan = _make_plan(profile)
-    tokenspeed_kernel.moe_process_weights(plan, layer)
+    kernel_moe_process_weights(plan, layer)
     output_dir = os.environ.get("PETIT_OUTPUT_DIR")
     # Exercise empty source ranks, padding/tile boundaries and capacity, then
     # refresh both hidden states and destinations within the same captured graph.
@@ -382,7 +385,7 @@ def test_distributed_petit_reference(profile_name):
             weights.copy_(new_weights)
 
         def run():
-            return tokenspeed_kernel.moe_apply(
+            return kernel_moe_apply(
                 plan,
                 x,
                 layer,

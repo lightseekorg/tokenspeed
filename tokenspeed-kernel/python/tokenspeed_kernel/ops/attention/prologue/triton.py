@@ -38,7 +38,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
 )
 from tokenspeed_kernel.ops.embedding import FusedMLASetKVBufferArg
 from tokenspeed_kernel.ops.embedding.triton import apply_rope_mla_set_kv_buffer_triton
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -146,12 +146,19 @@ def _gqa_store_tile(
     i2,
     row_mask,
     half_mask,
+    inv_scale,
     head_dim: tl.constexpr,
     rotary_dim: tl.constexpr,
     BLOCK: tl.constexpr,
+    SCALED: tl.constexpr,
 ):
     offs = tl.arange(0, BLOCK)
     dtype = dst.dtype.element_ty
+    if SCALED:
+        # A per-tensor scaled FP8 cache holds x / scale, saturated to e4m3's range.
+        rows = tl.clamp(rows.to(tl.float32) * inv_scale, -448.0, 448.0)
+        o1 = tl.clamp(o1.to(tl.float32) * inv_scale, -448.0, 448.0)
+        o2 = tl.clamp(o2.to(tl.float32) * inv_scale, -448.0, 448.0)
     tl.store(
         dst[:, None] + offs[None, :],
         rows.to(dtype),
@@ -162,7 +169,10 @@ def _gqa_store_tile(
     tl.store(dst[:, None] + i2[None, :], o2.to(dtype), mask=pair_mask)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens", "num_rows", "positions_stride"],
+    do_not_specialize_on_alignment=["positions_ptr", "slots_ptr"],
+)
 def _gqa_prologue_kernel(
     q_ptr,
     k_ptr,
@@ -186,6 +196,8 @@ def _gqa_prologue_kernel(
     k_out_stride_t,
     cos_sin_stride,
     positions_stride,
+    k_inv_scale,
+    v_inv_scale,
     k_cache_stride_s,
     k_cache_stride_h,
     v_cache_stride_s,
@@ -203,6 +215,7 @@ def _gqa_prologue_kernel(
     S1: tl.constexpr,
     S2: tl.constexpr,
     RETURN_K: tl.constexpr,
+    KV_SCALED: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK: tl.constexpr,
     HALF_BLOCK: tl.constexpr,
@@ -216,6 +229,7 @@ def _gqa_prologue_kernel(
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     cos = 0.0
     sin = 0.0
@@ -261,9 +275,11 @@ def _gqa_prologue_kernel(
             i2,
             row_mask,
             half_mask,
+            1.0,
             head_dim,
             2 * half_rotary,
             BLOCK,
+            False,
         )
     else:
         kv_head = head - num_q_heads
@@ -292,9 +308,11 @@ def _gqa_prologue_kernel(
                 i2,
                 row_mask,
                 half_mask,
+                1.0,
                 head_dim,
                 2 * half_rotary,
                 BLOCK,
+                False,
             )
         write_mask = tokens < num_rows
         slot = tl.load(slots_ptr + tokens, mask=write_mask, other=0).to(tl.int64)
@@ -307,9 +325,11 @@ def _gqa_prologue_kernel(
             i2,
             write_mask,
             half_mask,
+            k_inv_scale,
             head_dim,
             2 * half_rotary,
             BLOCK,
+            KV_SCALED,
         )
         offs = tl.arange(0, BLOCK)
         mask = write_mask[:, None] & (offs < head_dim)[None, :]
@@ -322,10 +342,9 @@ def _gqa_prologue_kernel(
             + (slot * v_cache_stride_s + kv_head * v_cache_stride_h)[:, None]
             + offs[None, :]
         )
+        if KV_SCALED:
+            value = tl.clamp(value.to(tl.float32) * v_inv_scale, -448.0, 448.0)
         tl.store(dst, value.to(dst.dtype.element_ty), mask=mask)
-
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _block_tokens(num_tokens: int, block: int) -> int:
@@ -344,7 +363,7 @@ def _block_tokens(num_tokens: int, block: int) -> int:
     priority=Priority.PERFORMANT,
     traits={
         "has_norm": BOOLS,
-        "kv_format": frozenset({"native", "fp8"}),
+        "kv_format": frozenset({"native", "fp8", "fp8_per_tensor"}),
         "kv_convert": BOOLS,
         "mrope": BOOLS,
         "partial_rotary": BOOLS,
@@ -363,19 +382,33 @@ def triton_gqa_prologue(
     return_kv: bool,
     enable_pdl: bool,
 ) -> GQAPrologueOutput:
+    prepared = current_platform().is_cdna4 and norm is None and rotary is None
     num_tokens = q.shape[0]
     num_kv_heads, head_dim = cache.k_cache.shape[1:]
     num_q_heads = q.shape[1:].numel() // head_dim
-    q_out = torch.empty(
-        (num_tokens, num_q_heads * head_dim), dtype=q.dtype, device=q.device
+    q_out = (
+        q.flatten(1)
+        if prepared
+        else torch.empty(
+            (num_tokens, num_q_heads * head_dim), dtype=q.dtype, device=q.device
+        )
     )
     k_out = (
-        torch.empty(
-            (num_tokens, num_kv_heads * head_dim), dtype=k.dtype, device=k.device
+        k
+        if prepared
+        else (
+            torch.empty(
+                (num_tokens, num_kv_heads * head_dim), dtype=k.dtype, device=k.device
+            )
+            if return_kv
+            else q_out
         )
-        if return_kv
-        else q_out
     )
+    if prepared:
+        # Prepared rows with flat heads need no Q/K copy. Only the slotted
+        # KV heads need a cache write.
+        num_q_heads = 0
+        num_tokens = cache.slots.numel()
     if num_tokens > 0:
         half_rotary = 0 if rotary is None else rotary.rotary_dim // 2
         positions = cache.slots if rotary is None else rotary.positions
@@ -383,6 +416,7 @@ def triton_gqa_prologue(
         mrope_rows = positions.ndim == 2
         s0, s1, s2 = mrope.section if mrope_rows else (0, 0, 0)
         block_t = _block_tokens(num_tokens, triton.next_power_of_2(head_dim))
+        scales = cache.scales if cache.format is KVCacheFormat.FP8_PER_TENSOR else None
         _gqa_prologue_kernel[
             (triton.cdiv(num_tokens, block_t), num_q_heads + num_kv_heads)
         ](
@@ -408,6 +442,8 @@ def triton_gqa_prologue(
             k_out.stride(0),
             0 if rotary is None else rotary.cos_sin_cache.stride(0),
             positions.stride(0) if mrope_rows else 0,
+            1.0 if scales is None else 1.0 / scales.k,
+            1.0 if scales is None else 1.0 / scales.v,
             cache.k_cache.stride(0),
             cache.k_cache.stride(1),
             cache.v_cache.stride(0),
@@ -424,7 +460,8 @@ def triton_gqa_prologue(
             S0=s0,
             S1=s1,
             S2=s2,
-            RETURN_K=return_kv,
+            RETURN_K=return_kv and not prepared,
+            KV_SCALED=scales is not None,
             BLOCK_T=block_t,
             BLOCK=triton.next_power_of_2(head_dim),
             HALF_BLOCK=max(triton.next_power_of_2(half_rotary), 1),
@@ -488,7 +525,7 @@ def triton_mla_prologue(
         is_neox=is_neox,
         fused_mla_set_kv_buffer_arg=FusedMLASetKVBufferArg(
             k_nope=latent[..., :rank],
-            kv_buffer=cache.kv_cache.view(cache.kv_cache.shape[0], -1),
+            kv_buffer=cache.kv_cache.squeeze(-2),
             cache_loc=cache.slots,
             q_nope=query[..., :rank] if fp8 else None,
             sanitize=cache.sanitize,

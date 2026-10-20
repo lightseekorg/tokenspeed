@@ -26,7 +26,6 @@ uses async activation loads at both row counts; stage2 retains register loads
 and phased LDS publication. Output exchange happens after FP32 arithmetic.
 """
 
-from tokenspeed_kernel_amd._scheduling import sched_barrier
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import (
     _n16_weight_offset,
@@ -262,15 +261,15 @@ def _stage1_interleaved(
             new_b += (_load_b(w, K, NEXT, 1, 0),)
         elif phase == 3:
             new_b += (_load_b(w, K, NEXT, 1, 1),)
-        sched_barrier()
+        gl.amd.hint.sched_barrier()
         for mi in gl.static_range(phase * READS, min((phase + 1) * READS, BM // 16)):
             for kh in gl.static_range(2):
                 new_a += (_fragment(smem, mi, kh),)
-        sched_barrier()
+        gl.amd.hint.sched_barrier()
         acc = _bmajor_phase(
             acc, old_a, old_b[phase], old_as, old_bs, phase // 2, phase % 2
         )
-        sched_barrier()
+        gl.amd.hint.sched_barrier()
     # The phase read order is M-major; the consumer tuple is K-half-major.
     a = ()
     for kh in gl.static_range(2):
@@ -454,7 +453,6 @@ def _mxfp8_stage1(
     BETA: gl.constexpr,
     LINEAR_BETA: gl.constexpr,
     BUFFER_SAFE: gl.constexpr,
-    SCHED_LIBRARY_HASH: gl.constexpr,  # Cache dependency; not a device operand.
     BM: gl.constexpr,
 ):
     gl.static_assert(BM == 32 or BM == 128)
@@ -481,11 +479,11 @@ def _mxfp8_stage1(
     )
     offsets = _a_offsets(ids, m_base, M, TOPK, K, False, BM, True)
     acc = _zeros(BM)
-    sched_barrier()
+    gl.amd.hint.sched_barrier()
     _copy_a(a0, x, offsets, 0, BUFFER_SAFE)
-    sched_barrier()
+    gl.amd.hint.sched_barrier()
     scales_a, scales_b = _load_scales(sa, sb, K, 0, BM)
-    sched_barrier()
+    gl.amd.hint.sched_barrier()
     if K > 256:
         _copy_a(a1, x, offsets, 1, BUFFER_SAFE)
     b = ()
@@ -493,17 +491,17 @@ def _mxfp8_stage1(
         for ni in gl.static_range(2):
             b += (_load_b(w, K, 0, kh, ni),)
     cdna4_async_copy.wait_group(0)
-    sched_barrier()
+    gl.amd.hint.sched_barrier()
     a = _full_fragments(a0, BM)
-    sched_barrier()
+    gl.amd.hint.sched_barrier()
 
     TAIL: gl.constexpr = 1 if K // 256 % 2 else 2
     for kt in gl.static_range(0, K // 256 - TAIL):
         read_slot = a1 if kt % 2 == 0 else a0
         write_slot = a0 if kt % 2 == 0 else a1
-        sched_barrier()
+        gl.amd.hint.sched_barrier()
         cdna4_async_copy.wait_group(0)
-        sched_barrier()
+        gl.amd.hint.sched_barrier()
         if kt + 2 < K // 256:
             _copy_a(write_slot, x, offsets, kt + 2, BUFFER_SAFE)
         acc, a, b, scales_a, scales_b = _stage1_interleaved(
@@ -577,7 +575,6 @@ def _mxfp8_stage2(
     OUT_STRIDE: gl.constexpr,
     BUFFER_A_SAFE: gl.constexpr,
     BUFFER_OUT_SAFE: gl.constexpr,
-    SCHED_LIBRARY_HASH: gl.constexpr,  # Cache dependency; not a device operand.
     BM: gl.constexpr,
 ):
     gl.static_assert(BM == 32 or BM == 128)
@@ -613,10 +610,10 @@ def _mxfp8_stage2(
     )
     offsets = _a_offsets(ids, m_base, M, TOPK, K, True, BM, False)
     acc = _zeros(BM)
-    sched_barrier()
+    gl.amd.hint.sched_barrier()
     b_lo = (_load_b(w, K, 0, 0, 0), _load_b(w, K, 0, 0, 1))
     scales_a, scales_b = _load_scales(sa, sb, K, 0, BM)
-    sched_barrier()
+    gl.amd.hint.sched_barrier()
     _publish_a(a0, _load_a(x, offsets, 0, BUFFER_A_SAFE, 0, BM // 16), 0, BM // 16)
     first_lo, first_hi = _fragment_k64(a0, 0, 0, 0), _fragment_k64(a0, 0, 1, 0)
     tail_a, tail_b, tail_as, tail_bs = None, None, None, None

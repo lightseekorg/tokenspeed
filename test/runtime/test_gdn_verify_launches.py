@@ -42,11 +42,10 @@ from tokenspeed_kernel.ops.attention.gdn import flashinfer as gdn
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.state.mamba import MambaAttnBackend
 
-pytestmark = pytest.mark.skipif(
+
+@pytest.mark.skipif(
     not gdn.is_decode_available(), reason="FlashInfer GDN MTP requires SM90+"
 )
-
-
 @pytest.mark.parametrize("batch", [1, 8])
 @pytest.mark.parametrize("replay_ssm", [False, True])
 @pytest.mark.parametrize("cuda_graph", [False, True])
@@ -63,7 +62,7 @@ def test_verify_has_no_elementwise_launches(
     ssm = torch.randn(pool_size, heads, dim, dim, dtype=torch.float32, device="cuda")
     conv[0].zero_()
     ssm[0].zero_()
-    pool = _ContractPool(4, {0: ("linear_attention", conv, ssm)})
+    pool = _ContractPool({0: ("linear_attention", conv, ssm)})
     backend = MambaAttnBackend(
         *_mamba_config_pair(
             torch,
@@ -170,6 +169,87 @@ def test_verify_has_no_elementwise_launches(
             output[:, : actual_bs * steps], expected[:, : actual_bs * steps]
         )
         assert ssm[0].count_nonzero() == 0
+
+
+@pytest.mark.parametrize("steps", [1, 3])
+def test_gdn_backend_reads_projection_views_like_dense_inputs(steps: int) -> None:
+    """Plain decode and chain verify pack the model's row-strided projection
+    views (here with a misaligned ``a``) for FlashInfer's kernels, or hand them
+    to kernels that read by stride: outputs and states match dense inputs bit
+    for bit."""
+    from tokenspeed.runtime.layers.attention.backends.state.gdn import GdnAttnBackend
+
+    torch.manual_seed(5)
+    batch, heads, dim, conv_width = 2, 12, 128, 4
+    channels, rows, pool_size = 3 * heads * dim, batch * steps, 2 * batch + 1
+    conv_init = torch.randn(
+        pool_size, channels, conv_width - 1, dtype=torch.bfloat16, device="cuda"
+    )
+    ssm_init = 0.02 * torch.randn(pool_size, heads, dim, dim, device="cuda")
+    conv_init[0].zero_()
+    ssm_init[0].zero_()
+    projection = torch.randn(
+        rows, channels + heads * dim + 2 * heads, dtype=torch.bfloat16, device="cuda"
+    )
+    b, a = projection[:, -2 * heads :].split(heads, dim=-1)
+    views = dict(mixed_qkv=projection[:, :channels], a=a, b=b)
+    fixed = dict(
+        conv_weights=torch.randn(
+            channels, conv_width, dtype=torch.bfloat16, device="cuda"
+        ),
+        bias=None,
+        activation="silu",
+        key_dim=heads * dim,
+        value_dim=heads * dim,
+        attention_tp_size=1,
+        head_k_dim=dim,
+        head_v_dim=dim,
+        A_log=torch.randn(heads, device="cuda"),
+        dt_bias=torch.randn(heads, device="cuda"),
+        layer_id=0,
+        seq_len=rows,
+    )
+    tables = torch.arange(1, pool_size, dtype=torch.int32, device="cuda").view(batch, 2)
+    results = []
+    for inputs in (views, {name: t.contiguous() for name, t in views.items()}):
+        conv, ssm = conv_init.clone(), ssm_init.clone()
+        pool = _ContractPool({0: ("linear_attention", conv, ssm)})
+        backend = GdnAttnBackend(
+            *_mamba_config_pair(
+                torch,
+                heads=heads,
+                head_dim=dim,
+                spec_tokens=steps,
+                max_bs=batch,
+                device="cuda",
+            )
+        )
+        backend.set_kv_pool(pool)
+        backend.init_cuda_graph_state(batch)
+        backend.refresh_decode_metadata(
+            batch,
+            batch,
+            torch.arange(batch, dtype=torch.int32, device="cuda"),
+            torch.full((batch,), 7, dtype=torch.int32, device="cuda"),
+            forward_mode=ForwardMode.DECODE,
+            for_graph_replay=False,
+            block_tables={"linear_attention": tables},
+        )
+        out = backend.forward_decode(
+            None,
+            None,
+            None,
+            layer=None,
+            out_cache_loc=None,
+            token_to_kv_pool=pool,
+            bs=batch,
+            save_kv_cache=True,
+            **inputs,
+            **fixed,
+        )
+        results.append((out, conv, ssm))
+    for strided, dense in zip(*results):
+        assert torch.equal(strided, dense)
 
 
 if __name__ == "__main__":

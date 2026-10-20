@@ -23,7 +23,7 @@
 The scheduler addresses every cache group by virtual block ID; a group with
 ``shard_count`` D assigns those IDs cyclically to D owners, and a replicated
 group (D == 1) owns every ID itself. The same translation serves both, so the
-zeroing path never asks which case it is in.
+zeroing and copying paths never ask which case they are in.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ def owned_local_pages(
         virtual_blocks: Scheduler block IDs, including reserved null ID 0; a
             sequence or an integer array (the scheduler's zero-copy export).
         shard_count: Cyclic owner count from the group's spec; 1 is replicated.
-        rank: This process's rank in the DCP subgroup.
+        rank: This process's rank in the KVP subgroup.
         virtual_block_count: Exclusive bound from the arena's runtime contract.
 
     Returns:
@@ -69,7 +69,7 @@ def owned_local_pages(
     """
     require_positive_int("shard_count", shard_count)
     if rank < 0 or (shard_count > 1 and rank >= shard_count):
-        raise ValueError("DCP rank is out of range")
+        raise ValueError("KVP rank is out of range")
     blocks = np.asarray(virtual_blocks, dtype=np.int64).reshape(-1)
     if blocks.size == 0:
         return np.zeros(0, dtype=bool), blocks
@@ -122,7 +122,7 @@ def local_pages_by_group(
         virtual_blocks_by_group: Scheduler block IDs keyed by cache group id.
         contract: The bound arena's runtime contract; supplies each group's
             shard count and virtual block bound.
-        rank: This process's rank in the DCP subgroup.
+        rank: This process's rank in the KVP subgroup.
 
     Returns:
         Owned local page ID arrays keyed by the same group ids.
@@ -138,3 +138,50 @@ def local_pages_by_group(
         )
         for group_id, block_ids in virtual_blocks_by_group.items()
     }
+
+
+def local_page_pairs_by_group(
+    virtual_pairs_by_group: Mapping[str, np.ndarray],
+    *,
+    contract: CacheRuntimeContract,
+    rank: int,
+) -> dict[str, np.ndarray]:
+    """Translate every group's ``(source, destination)`` block pairs.
+
+    The scheduler acquires a copy's destination in its source's bucket, so
+    under KVP the two ends of a pair have one owner: the owning rank keeps the
+    pair and translates both ids, every other rank drops it. A pair whose ends
+    disagree on their owner is a scheduler bug, not a pair to split.
+
+    Args:
+        virtual_pairs_by_group: ``[n, 2]`` integer arrays of scheduler block
+            ids keyed by cache group id.
+        contract: The bound arena's runtime contract; supplies each group's
+            shard count and virtual block bound.
+        rank: This process's rank in the KVP subgroup.
+
+    Returns:
+        Owned local ``[m, 2]`` page-id arrays keyed by the same group ids.
+    """
+    shard_counts = {spec.group_id: spec.shard_count for spec in contract.group_specs}
+    counts = contract.virtual_block_counts
+    out: dict[str, np.ndarray] = {}
+    for group_id, pairs in virtual_pairs_by_group.items():
+        pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+        ends = [
+            owned_local_pages(
+                pairs[:, column],
+                shard_count=shard_counts[group_id],
+                rank=rank,
+                virtual_block_count=counts[group_id],
+            )
+            for column in (0, 1)
+        ]
+        (owned_src, local_src), (owned_dst, local_dst) = ends
+        if not np.array_equal(owned_src, owned_dst):
+            raise ValueError(
+                f"cache group {group_id!r}: a block copy pairs blocks of "
+                "different owners"
+            )
+        out[group_id] = np.stack((local_src, local_dst), axis=1)
+    return out

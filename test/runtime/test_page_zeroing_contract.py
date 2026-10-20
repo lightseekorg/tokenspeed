@@ -11,7 +11,8 @@ from __future__ import annotations
 import os
 import sys
 import types
-import unittest
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -34,7 +35,7 @@ def _as_lists(pages):
     return {group: list(map(int, ids)) for group, ids in pages.items()}
 
 
-class ZeroCachePagesContractTest(unittest.TestCase):
+class TestZeroCachePagesContractTest:
     # Group-keyed requests are translated from scheduler (virtual) IDs before
     # any pool sees them; every group here is replicated, so the translation
     # only drops the reserved null block 0.
@@ -55,7 +56,7 @@ class ZeroCachePagesContractTest(unittest.TestCase):
                 ),
                 virtual_block_counts={group_id: 64 for group_id in cls._GROUPS},
             ),
-            _cache_dcp_rank=0,
+            _cache_kvp_rank=0,
         )
 
     @classmethod
@@ -70,8 +71,8 @@ class ZeroCachePagesContractTest(unittest.TestCase):
 
         trace = []
         fake = self._fake(types.SimpleNamespace(), None, trace)
-        self.assertIsNone(ModelExecutor.zero_cache_pages(fake, []))
-        self.assertEqual(trace, [], "an empty list places no fence either")
+        assert (ModelExecutor.zero_cache_pages(fake, [])) is None
+        assert (trace) == ([]), "an empty list places no fence either"
 
     def test_zeroing_orders_itself_behind_the_execution_stream(self):
         # The pages' previous owner may still be writing them from a forward
@@ -86,22 +87,22 @@ class ZeroCachePagesContractTest(unittest.TestCase):
             zero_pages=lambda page_ids: trace.append(("zero", list(page_ids))),
         )
         fake = self._fake(pool, None, trace)
-        self.assertIsNone(ModelExecutor.zero_cache_pages(fake, [4, 5]))
-        self.assertEqual(trace, [("wait", "execution-stream"), ("zero", [4, 5])])
+        assert (ModelExecutor.zero_cache_pages(fake, [4, 5])) is None
+        assert (trace) == ([("wait", "execution-stream"), ("zero", [4, 5])])
 
     def test_pure_attention_pool_ignores_page_reuse_list(self):
         # No zero_pages and not flagged as state-aliasing -> skip, no raise.
         pool = types.SimpleNamespace(requires_page_zeroing=False)
-        self.assertIsNone(self._call(pool, [1, 2, 3]))
+        assert (self._call(pool, [1, 2, 3])) is None
 
     def test_missing_flag_defaults_to_skip(self):
         pool = types.SimpleNamespace()  # attribute absent entirely
-        self.assertIsNone(self._call(pool, [1, 2, 3]))
+        assert (self._call(pool, [1, 2, 3])) is None
 
     def test_state_aliasing_pool_without_impl_fails_loudly(self):
         # Declares it needs zeroing but forgot to implement it -> tripwire.
         pool = types.SimpleNamespace(requires_page_zeroing=True)
-        with self.assertRaises(RuntimeError):
+        with pytest.raises((RuntimeError)):
             self._call(pool, [1, 2, 3])
 
     def test_pool_with_impl_is_invoked(self):
@@ -111,8 +112,8 @@ class ZeroCachePagesContractTest(unittest.TestCase):
             zero_pages=lambda page_ids: seen.append(list(page_ids)),
         )
         # device="cpu" -> returns None after invoking zero_pages.
-        self.assertIsNone(self._call(pool, [4, 5]))
-        self.assertEqual(seen, [[4, 5]])
+        assert (self._call(pool, [4, 5])) is None
+        assert (seen) == ([[4, 5]])
 
     def test_group_aware_pool_is_invoked(self):
         seen = []
@@ -121,8 +122,8 @@ class ZeroCachePagesContractTest(unittest.TestCase):
             zero_new_blocks=lambda pages: seen.append(_as_lists(pages)),
         )
         pages = {"full": [4, 5], "state": [9]}
-        self.assertIsNone(self._call(pool, pages))
-        self.assertEqual(seen, [pages])
+        assert (self._call(pool, pages)) is None
+        assert (seen) == ([pages])
 
     def test_group_aware_pool_never_sees_the_null_block(self):
         seen = []
@@ -130,15 +131,15 @@ class ZeroCachePagesContractTest(unittest.TestCase):
             requires_page_zeroing=True,
             zero_new_blocks=lambda pages: seen.append(_as_lists(pages)),
         )
-        self.assertIsNone(self._call(pool, {"full": [0, 4], "state": [0]}))
-        self.assertEqual(seen, [{"full": [4], "state": []}])
+        assert (self._call(pool, {"full": [0, 4], "state": [0]})) is None
+        assert (seen) == ([{"full": [4], "state": []}])
 
     def test_group_aware_pool_rejects_out_of_range_virtual_blocks(self):
         pool = types.SimpleNamespace(
             requires_page_zeroing=True,
             zero_new_blocks=lambda pages: None,
         )
-        with self.assertRaises(IndexError):
+        with pytest.raises((IndexError)):
             self._call(pool, {"full": [64]})
 
     def test_stateful_draft_pool_zeros_its_group_subset(self):
@@ -160,10 +161,10 @@ class ZeroCachePagesContractTest(unittest.TestCase):
         )
         pages = {"history": [4], "state": [9], "target_only": [12]}
 
-        self.assertIsNone(self._call(target, pages, draft))
-        self.assertEqual(target_seen, [pages])
-        self.assertEqual(draft_seen, [{"history": [4], "state": [9]}])
+        assert (self._call(target, pages, draft)) is None
+        assert (target_seen) == ([pages])
+        assert (draft_seen) == ([{"history": [4], "state": [9]}])
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

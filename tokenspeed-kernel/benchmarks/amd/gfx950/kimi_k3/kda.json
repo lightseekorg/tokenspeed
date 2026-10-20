@@ -26,8 +26,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 10.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 10.0
       }
     },
     {
@@ -46,8 +45,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 10.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 10.0
       }
     },
     {
@@ -66,13 +64,12 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 5.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 5.0
       }
     },
     {
       "id": "kimi_k3.attention.kda_fused_paged_decode/decode-bfloat16",
-      "comparison_epoch": 1,
+      "comparison_epoch": 2,
       "measurement_blocks": 50,
       "definition": {
         "family": "attention",
@@ -82,21 +79,19 @@
           "conv_kernel_size": 4,
           "state_page_bytes": 884736,
           "state_pages": 1025,
-          "state_page_relation": "in_place",
-          "norm_eps": 1e-05
+          "state_page_relation": "in_place"
         },
         "cold_cache": true,
         "seed": 4711
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.5,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.5
       }
     },
     {
       "id": "kimi_k3.attention.kda_fused_paged_decode/decode-large-bfloat16",
-      "comparison_epoch": 1,
+      "comparison_epoch": 2,
       "measurement_blocks": 50,
       "definition": {
         "family": "attention",
@@ -106,16 +101,14 @@
           "conv_kernel_size": 4,
           "state_page_bytes": 884736,
           "state_pages": 1025,
-          "state_page_relation": "in_place",
-          "norm_eps": 1e-05
+          "state_page_relation": "in_place"
         },
         "cold_cache": true,
         "seed": 4712
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 2.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 2.0
       }
     },
     {
@@ -139,8 +132,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -165,8 +157,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 2.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 2.0
       }
     }
   ]

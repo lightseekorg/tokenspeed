@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.activation import torch_silu_and_mul
+from tokenspeed_kernel.numerics.torch.moe import torch_moe_experts
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -30,7 +32,11 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
-import tokenspeed_kernel  # noqa: E402
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
+
+# noqa: E402
 
 # DeepSeek-V3 TP=8 MoE reference shape.
 E = 256
@@ -40,16 +46,21 @@ TOPK = 8
 
 
 def _torch_moe_ref(x, w13, w2, topk_ids, topk_weights) -> torch.Tensor:
-    xf, w13f, w2f = x.float(), w13.float(), w2.float()
-    ids, wts = topk_ids.cpu(), topk_weights.float().cpu()
-    out = torch.zeros(x.shape[0], D, dtype=torch.float32, device=x.device)
-    for t in range(x.shape[0]):
-        for s in range(TOPK):
-            e = int(ids[t, s])
-            g = xf[t] @ w13f[e].T
-            inter = torch.nn.functional.silu(g[:I_R]) * g[I_R:]
-            out[t] += float(wts[t, s]) * (inter @ w2f[e].T)
-    return out
+    """Golden fp32 MoE FFN: y[t] = sum_s w * (silu(h@wg) * (h@wu)) @ wd."""
+    return torch_moe_experts(
+        x,
+        w13,
+        w2,
+        topk_ids,
+        topk_weights,
+        activation=lambda gate_up: torch_silu_and_mul(gate_up, None),
+        w13_bias=None,
+        w2_bias=None,
+        quantize_input=None,
+        quantize_intermediate=None,
+        round_expert_output=None,
+        first_expert=0,
+    )
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 16])
@@ -68,7 +79,7 @@ def test_gluon_bf16_moe_apply_matches_reference(num_tokens):
     topk_weights = (topk_weights / topk_weights.sum(-1, keepdim=True)).to(torch.float32)
     topk_ids = topk_ids.to(torch.int32)
 
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "bf16",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -88,9 +99,9 @@ def test_gluon_bf16_moe_apply_matches_reference(num_tokens):
     w.w13_weight = w13  # [E, 2*I, D], gate rows [0:I], up rows [I:2I]
     w.w2_weight = w2  # [E, D, I]
     w.top_k = TOPK
-    tokenspeed_kernel.moe_process_weights(plan, w)  # no-op for this plan
+    kernel_moe_process_weights(plan, w)  # no-op for this plan
 
-    out = tokenspeed_kernel.moe_apply(
+    out = kernel_moe_apply(
         plan, x, w, logits, topk_weights=topk_weights, topk_ids=topk_ids
     )
     torch.cuda.synchronize()

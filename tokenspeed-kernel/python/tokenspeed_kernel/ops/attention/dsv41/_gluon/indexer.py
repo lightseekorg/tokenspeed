@@ -27,7 +27,6 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _index_gather_heads,
     _index_topk_outputs,
     cache_pack,
-    index_q_quantize,
 )
 
 _MFMA_HEADS = 32
@@ -53,9 +52,7 @@ def _pack_index_q(q: torch.Tensor, weights: torch.Tensor):
     scales = packed[:, 64:68].contiguous().view(torch.int32).reshape(tokens, heads)
     pad = _MFMA_HEADS - heads
     if pad < 0:
-        raise ValueError(
-            f"GFX950 CSA2 MFMA indexer supports at most {_MFMA_HEADS} heads"
-        )
+        raise ValueError(f"AMD CSA2 MXFP4 indexer supports at most {_MFMA_HEADS} heads")
     if pad:
         values = torch.nn.functional.pad(values, (0, 0, 0, pad))
         scales = torch.nn.functional.pad(scales, (0, pad))
@@ -63,20 +60,6 @@ def _pack_index_q(q: torch.Tensor, weights: torch.Tensor):
     else:
         weights = weights.float()
     return values.contiguous(), scales.contiguous(), weights.contiguous()
-
-
-def _pad_query(q: torch.Tensor, weights: torch.Tensor):
-    q = index_q_quantize(q.contiguous(), "index", None)
-    tokens, heads, _ = q.shape
-    pad = _MFMA_HEADS - heads
-    if pad < 0:
-        raise ValueError(f"GFX1250 CSA2 indexer supports at most {_MFMA_HEADS} heads")
-    if pad:
-        q = torch.nn.functional.pad(q, (0, 0, 0, pad))
-        weights = torch.nn.functional.pad(weights.float(), (0, pad))
-    else:
-        weights = weights.float()
-    return q.contiguous(), weights.contiguous()
 
 
 def _select_sorted(scores: torch.Tensor, k: int, out: torch.Tensor, lens: torch.Tensor):
@@ -106,6 +89,59 @@ def _logical_from_scan(columns: torch.Tensor, candidate_blocks: torch.Tensor | N
     return torch.where(block >= 0, logical, torch.iinfo(torch.int64).max)
 
 
+def select_rows_torch(logits, candidates, live_widths, topk, row_out, row_lens):
+    """Write each row's top-``topk`` finite logits as position-sorted ids.
+
+    Column c maps to logical row c, or ``candidates[q, c // 8] * 8 + c % 8``.
+    ``live_widths`` (None or [Q]) bounds the columns that may be finite; the
+    rest are -inf, so this reference may scan whole rows and ignore it.
+    Row q of ``row_out`` gets the ids ascending, then -1; ``row_lens`` the
+    count. Equal-score boundary ties may pick any equivalent subset.
+    """
+    width = logits.shape[1]
+    values_topk, columns = logits.topk(min(int(topk), width), dim=1, sorted=False)
+    _write_selected_rows(values_topk, columns, candidates, row_out, row_lens)
+
+
+def _write_selected_rows(values_topk, columns, candidates, row_out, row_lens):
+    logical = _logical_from_scan(columns, candidates)
+    packed = torch.where(
+        values_topk > -torch.inf,
+        logical,
+        torch.iinfo(torch.int64).max,
+    )
+    ordered = packed.sort(dim=1).values
+    ordered = ordered.masked_fill(ordered == torch.iinfo(torch.int64).max, -1)
+    take = ordered.shape[1]
+    row_out[:, :take].copy_(ordered.to(row_out.dtype))
+    row_out[:, take:].fill_(-1)
+    row_lens.copy_((values_topk > -torch.inf).sum(dim=1).to(row_lens.dtype))
+
+
+def select_blocks_torch(logits, visible, candidate_topk, block_out, block_lens):
+    """Write each row's top ``candidate_topk`` eight-row blocks, position-sorted.
+
+    A block scores the max of its 8 logits; the block holding row
+    ``visible[q] - 1`` is forced in when it has a finite score. Row q of
+    ``block_out`` gets the block ids ascending, then -1; ``block_lens`` the
+    count. Equal-score boundary ties may pick any equivalent subset.
+    """
+    queries, width = logits.shape
+    n_blocks = width // 8
+    block_scores = logits[:, : n_blocks * 8].reshape(queries, n_blocks, 8).amax(-1)
+    latest = (visible.to(torch.int64) - 1) // 8
+    live = (visible > 0) & (latest < n_blocks)
+    latest = latest.clamp(0, n_blocks - 1)
+    rows = torch.arange(queries, device=logits.device)
+    current = block_scores[rows, latest]
+    block_scores[rows, latest] = torch.where(
+        live & (current > -torch.inf),
+        torch.full_like(current, float("inf")),
+        current,
+    )
+    _select_sorted(block_scores, int(candidate_topk), block_out, block_lens)
+
+
 def run_dsv41_csa2_index_topk(
     index_q,
     weights,
@@ -120,9 +156,18 @@ def run_dsv41_csa2_index_topk(
     score_chunk_size,
     process_group,
     out,
+    index_metadata,
     launch_logits,
+    select_rows,
+    select_blocks,
 ):
-    """Gather, score, and select CSA2 rows with shape-bounded, graph-safe scratch."""
+    """Gather, score, and select CSA2 rows with shape-bounded, graph-safe scratch.
+
+    ``launch_logits`` scores a query tile into -inf-initialized FP32 logits;
+    ``select_rows`` has the ``select_rows_torch`` contract and
+    ``select_blocks`` the ``select_blocks_torch`` contract.
+    """
+    del index_metadata
     out = _index_topk_outputs(
         index_q,
         weights,
@@ -151,22 +196,26 @@ def run_dsv41_csa2_index_topk(
 
     tokens = index_q.shape[0]
     row_out, row_lens, block_out, block_lens = out
-    row_out.fill_(-1)
-    row_lens.zero_()
-    block_out.fill_(-1)
-    block_lens.zero_()
     if not tokens or not page_table.shape[1] or need < 1:
+        row_out.fill_(-1)
+        row_lens.zero_()
+        block_out.fill_(-1)
+        block_lens.zero_()
         return out
 
     # Arena pages have gaps between them but contiguous bytes within each page.
     # Flatten only the inner dimensions to preserve their storage and page stride.
     cache_2d = index_cache.flatten(1)
-    if cache_2d.stride(1) != 1:
+    if cache_2d.stride(1) != 1 or cache_2d.stride(0) % 16:
         # Flatten can retain a non-unit byte stride (for example [..., ::2]).
-        # The scorers address adjacent page bytes, so normalize that layout only.
+        # The scorers address adjacent page bytes, and the gfx1250 scorer
+        # loads 16-byte row chunks, so normalize only those layouts. Runtime
+        # arenas align index pages to 256 bytes and never take this copy.
         cache_2d = cache_2d.contiguous()
     query_chunk_size = min(int(query_chunk_size), 256)
     make_blocks = bool(candidate_topk)
+    if not make_blocks:
+        block_lens.zero_()
 
     for start in range(0, tokens, query_chunk_size):
         end = min(start + query_chunk_size, tokens)
@@ -208,41 +257,20 @@ def run_dsv41_csa2_index_topk(
                 logits,
                 score_chunk_size,
             )
-            values_topk, columns = logits.topk(
-                min(int(topk), width), dim=1, sorted=False
-            )
-            logical = _logical_from_scan(columns, tile_candidates)
-            packed = torch.where(
-                values_topk > -torch.inf,
-                logical,
-                torch.iinfo(torch.int64).max,
-            )
-            ordered = packed.sort(dim=1).values
-            ordered = ordered.masked_fill(ordered == torch.iinfo(torch.int64).max, -1)
-            take = ordered.shape[1]
-            row_out[output_begin:output_end, :take].copy_(ordered.to(row_out.dtype))
-            row_lens[output_begin:output_end].copy_(
-                (values_topk > -torch.inf).sum(dim=1).to(row_lens.dtype)
+            select_rows(
+                logits,
+                tile_candidates,
+                # Full selection scores only each query's visible rows; the
+                # rest of its page-table-capacity row stays -inf.
+                tile_visible if tile_candidates is None else None,
+                int(topk),
+                row_out[output_begin:output_end],
+                row_lens[output_begin:output_end],
             )
             if make_blocks:
-                n_blocks = width // 8
-                block_scores = (
-                    logits[:, : n_blocks * 8]
-                    .reshape(tile_queries, n_blocks, 8)
-                    .amax(-1)
-                )
-                latest = (tile_visible.to(torch.int64) - 1) // 8
-                live = (tile_visible > 0) & (latest < n_blocks)
-                latest = latest.clamp(0, n_blocks - 1)
-                rows = torch.arange(tile_queries, device=q.device)
-                current = block_scores[rows, latest]
-                block_scores[rows, latest] = torch.where(
-                    live & (current > -torch.inf),
-                    torch.full_like(current, float("inf")),
-                    current,
-                )
-                _select_sorted(
-                    block_scores,
+                select_blocks(
+                    logits,
+                    tile_visible,
                     int(candidate_topk),
                     block_out[output_begin:output_end],
                     block_lens[output_begin:output_end],
@@ -278,9 +306,10 @@ def launch_gfx1250_logits(
         dsv41_index_logits_gfx1250,
     )
 
-    q, w = _pad_query(q, w)
+    values, scales, w = _pack_index_q(q, w)
     dsv41_index_logits_gfx1250(
-        q,
+        values,
+        scales,
         w,
         cache_2d,
         table,
@@ -289,3 +318,29 @@ def launch_gfx1250_logits(
         logits,
         score_chunk_size,
     )
+
+
+def select_rows_gfx950(logits, candidates, live_widths, topk, row_out, row_lens):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import (
+        launch_gluon_dsv41_index_topk_select_gfx950,
+    )
+
+    launch_gluon_dsv41_index_topk_select_gfx950(
+        logits, candidates, live_widths, topk, row_out, row_lens
+    )
+
+
+def select_rows_gfx1250(logits, candidates, live_widths, topk, row_out, row_lens):
+    # The radix select runs one program per row, so it only beats torch.topk
+    # once a score tile has enough rows to occupy most of the GPU.
+    if logits.shape[0] < 128:
+        select_rows_torch(logits, candidates, live_widths, topk, row_out, row_lens)
+        return
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41 import (
+        launch_triton_dsv41_index_topk_select_gfx1250,
+    )
+
+    values_topk, columns = launch_triton_dsv41_index_topk_select_gfx1250(
+        logits, min(int(topk), logits.shape[1])
+    )
+    _write_selected_rows(values_topk, columns, candidates, row_out, row_lens)

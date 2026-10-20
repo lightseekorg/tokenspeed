@@ -18,16 +18,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The one cache allocation every compute view is a window onto."""
+"""The cache owner for ordinary allocations and mixed host/device planes."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 import torch
-from tokenspeed_kernel.ops.kvcache.triton import zero_page_fields
+from tokenspeed_kernel.ops.kvcache import zero_byte_ranges
+from tokenspeed_kernel.ops.kvcache.triton import copy_page_fields, zero_page_fields
 
+from tokenspeed.runtime.layers.attention.kv_cache.offload import SparseKVOffload
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
 )
@@ -35,10 +37,37 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemor
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
+    CacheStoragePlan,
+    plan_cache_storage,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
+
+
+def _copy_waves(pairs: np.ndarray) -> list[np.ndarray]:
+    """Order ``(source, destination)`` pairs so a block is read before it is
+    overwritten: a pair runs in the wave after every pair that still reads
+    its destination. A destination is a block granted fresh this plan and a
+    source one published before it, so the pairs never form a cycle.
+
+    Raises:
+        ValueError: The pairs copy blocks in a cycle.
+    """
+    waves: list[np.ndarray] = []
+    remaining = pairs
+    while remaining.shape[0]:
+        ready = ~np.isin(remaining[:, 1], remaining[:, 0])
+        if not ready.any():
+            raise ValueError(
+                f"block pairs copy in a cycle: {remaining.tolist()}; no order "
+                "reads every block before it is overwritten"
+            )
+        waves.append(remaining[ready])
+        remaining = remaining[~ready]
+    return waves
 
 
 class CacheArena:
@@ -63,6 +92,7 @@ class CacheArena:
         cache_group_specs: tuple[CacheGroupSpec, ...],
         token_capacity: int | None = None,
         enable_memory_saver: bool = False,
+        storage_plan: CacheStoragePlan | None = None,
     ):
         if not cache_group_specs:
             raise ValueError(
@@ -71,9 +101,10 @@ class CacheArena:
         self.plan = plan
         self.device = device
         # Materialize immutable byte geometry at setup, not on first hand-out.
-        # zero_blocks ships only page ids per call; each group's field table
-        # (page-0 offset, page stride, payload bytes) lives on the device.
-        # The kernel trusts these ranges, so their bound is checked once here.
+        # zero_blocks and copy_blocks ship only page ids per call; each group's
+        # field table (page-0 offset, page stride, payload bytes) lives on the
+        # device. The kernels trust these ranges, so their bound is checked
+        # once here.
         # A group may have no fields on this rank: pipeline parallelism keeps
         # every group but drops the fields of layers another stage owns.
         self._zero_field_tables: dict[str, tuple[int, torch.Tensor, int]] = {}
@@ -103,17 +134,49 @@ class CacheArena:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
+        self.storage_plan = storage_plan or plan_cache_storage(
+            plan,
+            cache_group_specs,
+            offload=None,
+        )
+        expected_storage = plan_cache_storage(
+            plan,
+            cache_group_specs,
+            offload=self.storage_plan.offload,
+        )
+        if self.storage_plan != expected_storage:
+            raise ValueError("cache physical binding does not match its memory plan")
+        self.offload_config = self.storage_plan.offload
+        self.offload: SparseKVOffload | None = None
+        self.regions: dict[str, torch.Tensor] = {}
+        # Only device regions live in the memory saver's pool; pinned Host
+        # regions (sparse offload history) are ordinary Host allocations and
+        # stay mapped across sleep. Wake zeroes both (clear()).
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
-            self.buffer = torch.zeros(
-                plan.arena_bytes,
-                dtype=torch.uint8,
-                device=device,
-            )
-
-        # The plan names every field and its dtype
+            for region in self.storage_plan.regions:
+                host = region.placement == "host"
+                self.regions[region.region_id] = torch.zeros(
+                    region.size_bytes,
+                    dtype=torch.uint8,
+                    device="cpu" if host else device,
+                    pin_memory=host,
+                )
+        self._field_bindings = {b.field_id: b for b in self.storage_plan.fields}
         self._fields: dict[str, torch.Tensor] = {
             field.field_id: self._bind(field) for field in plan.fields
         }
+        if self.offload_config is not None:
+            self.offload = SparseKVOffload(
+                self, self.offload_config, workspaces=self.storage_plan.workspaces
+            )
+        expected_device = (
+            self.storage_plan.device_history_bytes
+            + self.storage_plan.persistent_workspace_bytes
+        )
+        if self.allocated_device_bytes != expected_device:
+            raise RuntimeError(
+                "cache allocation differs from its physical workspace plan"
+            )
         plan_groups = {group.group_id: group for group in plan.groups}
         # The contract joins the recipe's logical specs with the plan's
         # physical facts for the same groups. The plan owns page counts and
@@ -141,10 +204,19 @@ class CacheArena:
             },
         )
         logger.info(
-            f"Allocated cache arena: {plan.arena_bytes:d} bytes, prefix_granularity="
+            f"Allocated cache arena: device_bytes={self.allocated_device_bytes:d}, "
+            f"host_bytes={self.allocated_host_bytes:d}, logical_plan_bytes={plan.arena_bytes:d}, prefix_granularity="
             f"{plan.prefix_granularity:d}, num_lcm_blocks={plan.num_lcm_blocks:d}, "
             f"device {device!s}",
         )
+        if self.offload_config is not None:
+            logger.info(
+                f"Sparse KV hot pool: rows={self.offload_config.device_rows}, "
+                f"buffer_rows={self.offload_config.buffer_tokens}, "
+                f"request_slots={self.offload_config.request_slots}, "
+                f"persistent_bytes={self.storage_plan.persistent_workspace_bytes}, "
+                f"temporary_budget_bytes={self.storage_plan.temporary_workspace_bytes}"
+            )
 
     @property
     def cache_group_specs(self) -> tuple[CacheGroupSpec, ...]:
@@ -197,28 +269,40 @@ class CacheArena:
         for extent in reversed(field.shape):
             element_strides.append(stride)
             stride *= extent
-        pages = self.buffer.view(dtype).as_strided(
+        binding = self._field_bindings[field.field_id]
+        buffer = self.regions[binding.region_id]
+        offset = binding.offset_bytes
+        pages = buffer.view(dtype).as_strided(
             (group.page_count, *field.shape),
             (
                 field.page_stride_bytes // field.element_size,
                 *reversed(element_strides),
             ),
-            self.field_block_byte_offset(field.field_id, 0) // field.element_size,
+            offset // field.element_size,
         )
         spec = self._cache_group_specs_by_id[field.group_id]
-        if field.shape[0] != self.plan.prefix_granularity or spec.family == "state":
+        # Keep ordinary fields' addressing contract. History groups can also
+        # contain page-indexed compressor state whose shape starts with rows.
+        token_rows = self.plan.prefix_granularity
+        if (
+            self.offload_config is not None
+            and field.field_id in self.offload_config.field_ids
+        ):
+            token_rows = spec.rows_per_page
+        if spec.attn_kind == "state" or field.shape[0] != token_rows:
             return pages
         return pages.view(-1, *field.shape[1:])
 
     def field(self, field_id: str) -> torch.Tensor:
         """Return one planned field's view into the arena.
 
-        The view is shaped the way the field is addressed. A field whose
-        planned shape leads with the identity grain stores one entry per
-        token, so its page axis is folded away and consumers index entries
-        directly; every other field (recurrent state, block-scaled scale
-        planes, V4's byte-shaped planes) is addressed per page and keeps its
-        planned shape. The plan decides which, so no compute view restates
+        The view is shaped the way the field is addressed. A history field whose
+        planned shape leads with the prefix grain stores an entry per token,
+        so its page axis is folded away and consumers index entries directly.
+        Offloaded fields use their group's physical row grain for this fold.
+        Other fields (recurrent state, compressor state, block-scaled scale
+        planes, V4's byte-shaped planes) retain page-indexed views.
+        The plan decides which, so no compute view restates
         its kernel's geometry, and the dtype likewise comes from the plan.
 
         Args:
@@ -235,12 +319,96 @@ class CacheArena:
         except KeyError:
             raise ValueError(f"cache field {field_id!r} is not planned") from None
 
+    def field_address(self, field_id: str) -> int:
+        """Address of physical block zero, including host placement."""
+        return self._fields[field_id].data_ptr()
+
+    @property
+    def buffer(self) -> torch.Tensor:
+        """Compatibility view for consumers requiring a single device slab."""
+        if not self.storage_plan.monolithic:
+            raise ValueError("this cache uses physical regions, not a device slab")
+        return self.regions["arena"]
+
+    def registration_regions(self) -> tuple[tuple[int, int], ...]:
+        return tuple((b.data_ptr(), b.nbytes) for b in self.regions.values())
+
+    @property
+    def allocated_device_bytes(self) -> int:
+        history = sum(
+            self.regions[r.region_id].nbytes
+            for r in self.storage_plan.regions
+            if r.placement == "device"
+        )
+        return history + (
+            0
+            if self.offload is None
+            else sum(state.device_nbytes for state in self.offload.fields.values())
+        )
+
+    @property
+    def allocated_host_bytes(self) -> int:
+        return sum(
+            self.regions[r.region_id].nbytes
+            for r in self.storage_plan.regions
+            if r.placement == "host"
+        )
+
+    def compute_field(self, field_id: str) -> torch.Tensor:
+        if self.offload is not None and field_id in self.offload.fields:
+            return self.offload.fields[field_id].device
+        return self.field(field_id)
+
     def field_ids(self) -> frozenset[str]:
         """Every field the plan names, all of them materialized."""
         return frozenset(self._fields)
 
     def field_block_byte_offset(self, field_id: str, block_id: int) -> int:
         return self.plan.field_page_byte_offset(field_id, block_id)
+
+    def _validate_block_ids(
+        self, group_id: str, ids: np.ndarray, *, expected_ndim: int
+    ) -> bool:
+        """Check one group's local block ids; False when this rank holds no bytes."""
+        page_count, fields, _ = self._zero_field_tables[group_id]
+        if (
+            not isinstance(ids, np.ndarray)
+            or ids.ndim != expected_ndim
+            or ids.dtype.kind not in "iu"
+        ):
+            raise TypeError(
+                f"block IDs for group {group_id!r} must be a {expected_ndim}-D "
+                "integer array"
+            )
+        if ids.size == 0:
+            return False
+        low, high = int(ids.min()), int(ids.max())
+        if low < 0 or high >= page_count:
+            raise IndexError(
+                f"local block ID {low if low < 0 else high} outside "
+                f"[0, {page_count}) for group {group_id!r}"
+            )
+        # Validated, but this rank may hold none of the group's bytes.
+        return fields.shape[0] > 0
+
+    def _upload_block_ids(
+        self, arrays: Sequence[np.ndarray], *, columns: int
+    ) -> tuple[torch.Tensor, list[int]]:
+        """Stage every group's ids through one pinned copy, 16-byte aligned spans."""
+        spans: list[int] = []
+        total = 0
+        for ids in arrays:
+            spans.append(total)
+            # Each group's span starts 16-byte aligned, as the kernels require
+            # of the pointer they receive.
+            total += -(-ids.shape[0] * columns // 4) * 4
+        # The caching host allocator tracks the pinned block's pending copy,
+        # so the next call cannot overwrite it early.
+        staging = torch.empty(total, dtype=torch.int32, pin_memory=True)
+        host = staging.numpy()
+        for start, ids in zip(spans, arrays, strict=True):
+            host[start : start + ids.size] = ids.reshape(-1)
+        return staging.to(self.buffer.device, non_blocking=True), spans
 
     def zero_blocks(self, block_ids_by_group: Mapping[str, np.ndarray]) -> None:
         """Clear local physical blocks after validating every group's IDs.
@@ -259,52 +427,130 @@ class CacheArena:
             IndexError: A block ID is outside its group's physical range.
             TypeError: A group's IDs are not a 1-D integer array.
         """
-        spans: list[tuple[str, int, int]] = []
+        groups: list[str] = []
         arrays: list[np.ndarray] = []
-        total = 0
         for group_id, ids in block_ids_by_group.items():
-            page_count, fields, _ = self._zero_field_tables[group_id]
-            if (
-                not isinstance(ids, np.ndarray)
-                or ids.ndim != 1
-                or ids.dtype.kind not in "iu"
-            ):
-                raise TypeError(
-                    f"block IDs for group {group_id!r} must be a 1-D integer array"
-                )
-            if ids.size == 0:
-                continue
-            low, high = int(ids.min()), int(ids.max())
-            if low < 0 or high >= page_count:
-                raise IndexError(
-                    f"local block ID {low if low < 0 else high} outside "
-                    f"[0, {page_count}) for group {group_id!r}"
-                )
-            if fields.shape[0] == 0:
-                # Validated, but this rank holds none of the group's bytes.
-                continue
-            spans.append((group_id, total, ids.size))
-            arrays.append(ids)
-            # Each group's span starts 16-byte aligned, as the kernel requires
-            # of the pointer it receives.
-            total += -(-ids.size // 4) * 4
-        if total == 0:
+            if self._validate_block_ids(group_id, ids, expected_ndim=1):
+                groups.append(group_id)
+                arrays.append(ids)
+        if not arrays:
             return
-        # The caching host allocator tracks the pinned block's pending copy,
-        # so the next call cannot overwrite it early.
-        staging = torch.empty(total, dtype=torch.int32, pin_memory=True)
-        host = staging.numpy()
-        for (_, start, count), ids in zip(spans, arrays, strict=True):
-            host[start : start + count] = ids
-        pages = staging.to(self.buffer.device, non_blocking=True)
-        for group_id, start, count in spans:
+        if not self.storage_plan.monolithic:
+            # Mixed regions use physical bindings; Host clears run on the
+            # execution stream through the CuTeDSL kernel boundary.
+            segments = [
+                segment
+                for group_id, ids in zip(groups, arrays, strict=True)
+                for segment in self.block_byte_segments(group_id, ids.tolist())
+            ]
+            for region_id, ranges in self.storage_plan.split_ranges(segments).items():
+                zero_byte_ranges(self.regions[region_id], ranges, device=self.device)
+            return
+        pages, spans = self._upload_block_ids(arrays, columns=1)
+        for group_id, start, ids in zip(groups, spans, arrays, strict=True):
             _, fields, max_field_bytes = self._zero_field_tables[group_id]
             zero_page_fields(
                 self.buffer,
-                pages[start : start + count],
+                pages[start : start + ids.size],
                 fields,
                 max_field_bytes=max_field_bytes,
             )
+
+    def copy_blocks(self, block_pairs_by_group: Mapping[str, np.ndarray]) -> None:
+        """Copy local physical blocks whole onto other blocks of their group.
+
+        The same O(pages) path as :meth:`zero_blocks`: one pinned upload of
+        the ``(source, destination)`` pairs, one page x field expansion per
+        group and wave in the kernel. Every source is read as it was before
+        any of the plan's copies: a block the plan both reads and overwrites
+        (a published tail some hitter copies, evicted and re-granted as a
+        copy-in's destination in the same plan) is read in an earlier wave
+        than it is written. Pairs of one wave copy in parallel.
+
+        Args:
+            block_pairs_by_group: Local ``[n, 2]`` integer arrays per group of
+                ``(source, destination)`` block IDs, each in
+                [0, group.page_count).
+
+        Raises:
+            IndexError: A block ID is outside its group's physical range.
+            TypeError: A group's pairs are not an ``[n, 2]`` integer array.
+            ValueError: A pair copies a block onto itself or two pairs share
+                a destination.
+        """
+        groups: list[str] = []
+        arrays: list[np.ndarray] = []
+        for group_id, pairs in block_pairs_by_group.items():
+            if not self._validate_block_ids(group_id, pairs, expected_ndim=2):
+                continue
+            if pairs.shape[1] != 2:
+                raise TypeError(
+                    f"block pairs for group {group_id!r} must be an [n, 2] array"
+                )
+            destinations = pairs[:, 1]
+            if (pairs[:, 0] == destinations).any():
+                raise ValueError(
+                    f"block pairs for group {group_id!r} copy a block onto itself"
+                )
+            if np.unique(destinations).size != destinations.size:
+                raise ValueError(
+                    f"block pairs for group {group_id!r} write one destination "
+                    "twice; the copies of a wave run in parallel"
+                )
+            for wave in _copy_waves(pairs):
+                groups.append(group_id)
+                arrays.append(wave)
+        if not arrays:
+            return
+        if not self.storage_plan.monolithic:
+            self._copy_block_byte_ranges(groups, arrays)
+            return
+        pairs, spans = self._upload_block_ids(arrays, columns=2)
+        for group_id, start, ids in zip(groups, spans, arrays, strict=True):
+            _, fields, max_field_bytes = self._zero_field_tables[group_id]
+            copy_page_fields(
+                self.buffer,
+                pairs[start : start + ids.size].view(-1, 2),
+                fields,
+                max_field_bytes=max_field_bytes,
+            )
+
+    def _copy_block_byte_ranges(
+        self, groups: list[str], waves: list[np.ndarray]
+    ) -> None:
+        """Copy blocks of a region-backed cache field by field, in wave order.
+
+        A device region copies on the current stream. A Host region is pinned
+        memory that GPU kernels write on that stream, so the stream drains
+        once before the first host copy; the copies themselves are host
+        memcpys that complete before the thread enqueues the next forward.
+        Block copies are rare (a tail hit, an owner's move off a published
+        block), so the per-field Python here is affordable.
+        """
+        drained = False
+        for group_id, pairs in zip(groups, waves, strict=True):
+            for source, destination in pairs.tolist():
+                source_ranges = self.storage_plan.split_ranges(
+                    self.block_byte_segments(group_id, [source])
+                )
+                destination_ranges = self.storage_plan.split_ranges(
+                    self.block_byte_segments(group_id, [destination])
+                )
+                for region_id, region in self.regions.items():
+                    ranges = zip(
+                        source_ranges[region_id],
+                        destination_ranges[region_id],
+                        strict=True,
+                    )
+                    if (
+                        region.device.type == "cpu"
+                        and not drained
+                        and source_ranges[region_id]
+                    ):
+                        torch.cuda.current_stream(self.device).synchronize()
+                        drained = True
+                    for (src, size), (dst, _) in ranges:
+                        region[dst : dst + size].copy_(region[src : src + size])
 
     def block_byte_segments(
         self, group_id: str, block_ids: list[int]
@@ -328,11 +574,26 @@ class CacheArena:
             )
         return self.buffer
 
+    def synchronize(self) -> None:
+        """Wait for the arena's own copy streams (sparse KV offload).
+
+        A sleep release calls this before the device regions are unmapped, so
+        no prefetch or writeback still reads or writes them.
+        """
+        if self.offload is not None:
+            self.offload.synchronize()
+
     @torch.no_grad()
     def clear(self) -> None:
         """Zero the arena after sleep/wake remaps its storage.
 
         Exactly one owner, so callers may fan this out over every compute
-        view without double-clearing or needing a "views skip" rule.
+        view without double-clearing or needing a "views skip" rule. The
+        sparse offload's hot-pool tags and replacement state are reset with
+        it, and its Host history is zeroed like any other region.
         """
-        self.buffer.zero_()
+        if self.offload is not None:
+            self.offload.synchronize()
+            self.offload.clear()
+        for buffer in self.regions.values():
+            zero_byte_ranges(buffer, [(0, buffer.nbytes)], device=self.device)

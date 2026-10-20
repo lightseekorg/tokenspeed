@@ -92,8 +92,6 @@ public:
     PrefixCacheIndex(PrefixCacheIndex&&) = default;
     PrefixCacheIndex& operator=(PrefixCacheIndex&&) = default;
 
-    std::uint32_t GroupId() const noexcept { return group_id_; }
-
     // Registers block_ref under key. If key already has a canonical block,
     // block_ref is replaced with a reference to that block.
     void Register(const BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch,
@@ -185,6 +183,21 @@ public:
         }
         ConstCacheEntryIterator entry_it = findEntry(*cache_index, key);
         return entry_it == cache_index->entries.end() ? CacheBlockRef{} : entry_it->block_ref;
+    }
+
+    // The key this tier publishes `block_ref` under, when the entry's block is
+    // this very block (identity, not just location). A retraction asks this
+    // of each data slot to decide which tier images it.
+    std::optional<CacheKey> KeyOf(const BlockPool& pool, const CacheBlockRef& block_ref) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr || !block_ref) {
+            return std::nullopt;
+        }
+        ConstCacheEntryIterator entry_it = findEntry(*cache_index, block_ref->Location());
+        if (entry_it == cache_index->entries.end() || entry_it->block_ref != block_ref) {
+            return std::nullopt;
+        }
+        return entry_it->key;
     }
 
     std::optional<CachedBlockMetadata> MetadataFor(const BlockPool& pool, CacheBlockLocation location) const {

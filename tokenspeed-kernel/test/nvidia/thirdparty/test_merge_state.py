@@ -21,10 +21,12 @@
 from __future__ import annotations
 
 import math
-from typing import Tuple
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.mha import (
+    torch_merge_attention_states,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda.merge_state import (
     LSE_LN,
@@ -36,32 +38,6 @@ pytestmark = pytest.mark.skipif(
     not current_platform().is_nvidia,
     reason="merge_state CUDA kernel is NVIDIA-only",
 )
-
-
-def _reference_merge(
-    v_a: torch.Tensor,
-    s_a: torch.Tensor,
-    v_b: torch.Tensor,
-    s_b: torch.Tensor,
-    lse_scale_log2: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pure-PyTorch reference mirroring the kernel's log2-internal arithmetic.
-
-    The merge math is base-agnostic — using log2 internally and rebasing input/
-    output via ``lse_scale_log2`` matches the kernel exactly so tolerances stay
-    tight (no exp vs exp2 lib-call drift).
-    """
-    s_a_log2 = s_a.float() * lse_scale_log2
-    s_b_log2 = s_b.float() * lse_scale_log2
-    s_max = torch.maximum(s_a_log2, s_b_log2)
-    w_a = torch.exp2(s_a_log2 - s_max)
-    w_b = torch.exp2(s_b_log2 - s_max)
-    sum_w = w_a + w_b
-    v_merged = (
-        w_a.unsqueeze(-1) * v_a.float() + w_b.unsqueeze(-1) * v_b.float()
-    ) / sum_w.unsqueeze(-1)
-    s_merged = (torch.log2(sum_w) + s_max) * (1.0 / lse_scale_log2)
-    return v_merged.to(v_a.dtype), s_merged
 
 
 def _make_inputs(
@@ -123,7 +99,7 @@ def test_inplace_alias_multiblock(
 ) -> None:
     """inplace=True must write the merge through the v_a/s_a aliases."""
     v_a, s_a, v_b, s_b = _make_inputs(T, H, D, device, torch.bfloat16, seed=3)
-    v_ref, s_ref = _reference_merge(v_a, s_a, v_b, s_b, LSE_LN)
+    v_ref, s_ref = torch_merge_attention_states(v_a, s_a, v_b, s_b, LSE_LN)
 
     v_out, s_out = merge_state(v_a, s_a, v_b, s_b, inplace=True, enable_pdl=enable_pdl)
     torch.cuda.synchronize()
@@ -159,7 +135,7 @@ def test_natural_log_default(
     v_out, s_out = merge_state(v_a, s_a, v_b, s_b)
     torch.cuda.synchronize()
 
-    v_ref, s_ref = _reference_merge(v_a, s_a, v_b, s_b, LSE_LN)
+    v_ref, s_ref = torch_merge_attention_states(v_a, s_a, v_b, s_b, LSE_LN)
 
     # bf16/fp16 V accumulator drift scales with H*D — ~5e-2 abs is normal.
     # LSE is fp32 throughout so a tighter bound is fine.
@@ -175,7 +151,7 @@ def test_log2_basis(device: str, T: int, H: int, D: int) -> None:
     v_out, s_out = merge_state(v_a, s_a, v_b, s_b, lse_scale_log2=LSE_LOG2)
     torch.cuda.synchronize()
 
-    v_ref, s_ref = _reference_merge(v_a, s_a, v_b, s_b, LSE_LOG2)
+    v_ref, s_ref = torch_merge_attention_states(v_a, s_a, v_b, s_b, LSE_LOG2)
 
     assert torch.allclose(v_out.float(), v_ref.float(), atol=5e-2, rtol=1e-2)
     assert torch.allclose(s_out, s_ref, atol=1e-4, rtol=1e-5)
@@ -214,7 +190,7 @@ def test_arbitrary_lse_base(device: str) -> None:
     v_out, s_out = merge_state(v_a, s_a, v_b, s_b, lse_scale_log2=scale)
     torch.cuda.synchronize()
 
-    v_ref, s_ref = _reference_merge(v_a, s_a, v_b, s_b, scale)
+    v_ref, s_ref = torch_merge_attention_states(v_a, s_a, v_b, s_b, scale)
     assert torch.allclose(v_out.float(), v_ref.float(), atol=5e-2, rtol=1e-2)
     assert torch.allclose(s_out, s_ref, atol=1e-4, rtol=1e-5)
 

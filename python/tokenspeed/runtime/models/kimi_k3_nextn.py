@@ -54,9 +54,12 @@ from tokenspeed.runtime.models.deepseek_v3 import (
 )
 from tokenspeed.runtime.models.kimi_k3 import (
     KimiLinearMLAAttention,
+    KimiLinearMoE,
     create_kimi_linear_moe,
+    prepare_k3_all_reduce_buffers,
     sigmoid_mul,
 )
+from tokenspeed.runtime.models.kimi_k3_comm import K3AttnComm
 from tokenspeed.runtime.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -145,6 +148,8 @@ class KimiK3DraftDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             reduce_attn_results=True,
             alt_stream=alt_stream,
+            qkv_parallel=None,
+            output_parallel=None,
         )
         self.block_sparse_moe = create_kimi_linear_moe(
             config=config,
@@ -338,6 +343,24 @@ class KimiK3NextNForCausalLM(nn.Module):
             dp_lm_head_tp=False,
         )
 
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        routed_hidden_size = (
+            self.config.routed_expert_hidden_size
+            if self.config.routed_expert_hidden_size is not None
+            else self.config.hidden_size
+        )
+        prepared = prepare_k3_all_reduce_buffers(
+            mapping=self.mapping,
+            hidden_size=self.config.hidden_size,
+            routed_hidden_size=routed_hidden_size,
+            max_num_tokens=max_num_tokens,
+            states=K3AttnComm.iris_states,
+        )
+        moe = self.model.decoder.block_sparse_moe
+        if isinstance(moe, KimiLinearMoE):
+            moe.iris_state = K3AttnComm.iris_states.get(self.mapping.moe.tp_ep_group)
+        return prepared
+
     def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens
 
@@ -522,6 +545,9 @@ class KimiK3ForConditionalGenerationNextN(nn.Module):
         )
         self.logits_processor = self.language_model.logits_processor
         self.lm_head = self.language_model.lm_head
+
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        return self.language_model.prepare_communication_runtime(max_num_tokens)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.language_model.get_input_embeddings()

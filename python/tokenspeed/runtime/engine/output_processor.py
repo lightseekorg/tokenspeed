@@ -51,7 +51,10 @@ from tokenspeed.runtime.engine.io_struct import (
     BatchTokenIDOut,
 )
 from tokenspeed.runtime.engine.logprobs import LogprobsProcessor
-from tokenspeed.runtime.metrics.collector import RequestFinishStats
+from tokenspeed.runtime.metrics.collector import (
+    RequestFinishStats,
+    finish_reason_label,
+)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.async_llm import AsyncLLM
@@ -120,6 +123,11 @@ class OutputProcessor:
                 )
                 continue
 
+            # Whether out_dict's output_ids hold every id so far instead of
+            # this frame's. Only the raw-token path streams them that way;
+            # a non-streamed output replaces the pending one anyway.
+            cumulative_ids = False
+
             # Build meta_info and return value
             meta_info = {
                 "id": rid,
@@ -128,6 +136,11 @@ class OutputProcessor:
                 "weight_version": self.engine.server_args.weight_version,
             }
             logprobs_info = state.logprobs_info if not state.obj.stream else {}
+            if state.obj.stream and "cumulative_logprob" in state.logprobs_info:
+                # Lists cover this frame; the scalar covers the whole request.
+                logprobs_info["cumulative_logprob"] = state.logprobs_info[
+                    "cumulative_logprob"
+                ]
 
             obj = state.obj
             sp = getattr(obj, "sampling_params", None) or {}
@@ -155,6 +168,7 @@ class OutputProcessor:
                         f"Failed to attach logprobs for rid={rid!s}: {exc!s}. Returning"
                         " response without logprobs.",
                     )
+            state.logprobs_info = logprobs_info
 
             if not isinstance(recv_obj, BatchEmbeddingOut):
                 meta_info.update(
@@ -174,12 +188,10 @@ class OutputProcessor:
                     )
                 state.text += recv_obj.output_strs[i]
                 if state.obj.stream:
-                    state.logprobs_info = logprobs_info
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
                 else:
-                    state.logprobs_info.update(logprobs_info)
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids.copy()
 
@@ -224,12 +236,10 @@ class OutputProcessor:
                         )
                     state.text += incremental_emit
                     if state.obj.stream:
-                        state.logprobs_info = logprobs_info
                         state.output_ids.extend(recv_obj.output_ids[i])
                         output_token_ids = state.output_ids[state.last_output_offset :]
                         state.last_output_offset = len(state.output_ids)
                     else:
-                        state.logprobs_info.update(logprobs_info)
                         state.output_ids.extend(recv_obj.output_ids[i])
                         output_token_ids = state.output_ids.copy()
 
@@ -271,6 +281,7 @@ class OutputProcessor:
                     else:
                         state.output_ids.extend(recv_obj.output_ids[i])
                         output_token_ids = state.output_ids.copy()
+                        cumulative_ids = True
                         if recv_obj.output_multi_ids is not None:
                             output_multi_ids = recv_obj.output_multi_ids[i]
 
@@ -315,7 +326,9 @@ class OutputProcessor:
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
             state.collector.put(
-                out_dict, stream=bool(getattr(state.obj, "stream", False))
+                out_dict,
+                stream=bool(getattr(state.obj, "stream", False)),
+                cumulative=cumulative_ids,
             )
             state.event.set()
 
@@ -344,11 +357,12 @@ class OutputProcessor:
             state.last_completion_tokens = completion_tokens
             state.first_completion_tokens = completion_tokens
             self.engine.metrics.observe_time_to_first_token(
-                state.first_token_time - state.created_time
+                state.first_token_time - state.created_time,
+                stream=bool(state.obj.stream),
             )
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
-            if num_new_tokens:
+            if num_new_tokens > 0:
                 new_time = time.time()
                 interval = new_time - state.last_time
                 pure_interval = recv_obj.generated_time - state.last_pure_time
@@ -356,7 +370,7 @@ class OutputProcessor:
                     interval,
                     num_new_tokens,
                 )
-                self.engine.metrics.observe_inter_token_latency(
+                self.engine.metrics.observe_scheduler_inter_token_latency(
                     pure_interval, num_new_tokens
                 )
                 state.last_pure_time = recv_obj.generated_time
@@ -383,12 +397,14 @@ class OutputProcessor:
                     e2e_latency=state.finished_time - state.created_time,
                     cached_prompt_tokens=cached_prompt,
                     finished_ok=finished_ok,
+                    finish_reason=finish_reason_label(fr),
+                    stream=bool(state.obj.stream),
                 )
             )
             if (completion_tokens - state.first_completion_tokens) > 0:
-                self.engine.metrics.observe_inter_token_latency(
-                    state.finished_time - state.first_token_time,
-                    completion_tokens - state.first_completion_tokens,
+                self.engine.metrics.observe_decode_time_per_output_token(
+                    (state.last_time - state.first_token_time)
+                    / (completion_tokens - state.first_completion_tokens)
                 )
 
     def dump_requests(self, state: ReqState, out_dict: dict):

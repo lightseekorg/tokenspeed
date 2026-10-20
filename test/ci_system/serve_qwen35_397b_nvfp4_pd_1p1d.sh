@@ -86,6 +86,7 @@ echo "[pd-1p1d] prefill=${PREFILL_GPUS}/${PREFILL_PORT}/${PREFILL_BOOTSTRAP_PORT
 echo "[pd-1p1d] world_size=$WORLD_SIZE enable_mtp=$ENABLE_MTP moe_backend=$MOE_BACKEND attention_backend=$ATTENTION_BACKEND"
 
 pids=()
+logs=()
 cleanup() {
   local code=$?
   trap - EXIT INT TERM
@@ -190,6 +191,7 @@ start_worker() {
       --disaggregation-mode "$role"
   ) >"$log" 2>&1 &
   pids+=("$!")
+  logs+=("$log")
 }
 
 # Each engine reserves a small control-plane port cluster around its
@@ -224,8 +226,13 @@ python3 -m smg launch \
   --prometheus-port "$PROMETHEUS_PORT" \
   >"$LOG_DIR/lb.log" 2>&1 &
 pids+=("$!")
+logs+=("$LOG_DIR/lb.log")
 
 wait_http lb "http://127.0.0.1:${LB_PORT}/v1/models" 600
 echo "[pd-1p1d] serving on http://127.0.0.1:${LB_PORT}/v1"
 
-wait -n "${pids[@]}"
+# A worker's failure status must not end the script (set -e) before the
+# report names it; the cleanup trap then exits with that status.
+wait -n "${pids[@]}" || status=$?
+report_exited_workers "pd-1p1d" logs pids
+exit "${status:-0}"

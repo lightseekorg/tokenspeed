@@ -39,6 +39,21 @@ class SiluDotOp:
         return r0 + r1
 
 
+class ClampedSiluDotOp:
+    """Checkpoint SwiGLU: upper-clamped gate and symmetric up clamp, limit 10."""
+
+    __triton_builtin__ = True
+
+    @g.jit
+    def Apply(gate, up):
+        clipped_gate = ()
+        clipped_up = ()
+        for i in l.static_range(4):
+            clipped_gate += (l.minimum(gate[i], 10.0),)
+            clipped_up += (l.minimum(l.maximum(up[i], -10.0), 10.0),)
+        return SiluDotOp.Apply(clipped_gate, clipped_up)
+
+
 class KimiSituOp:
     __triton_builtin__ = True
 

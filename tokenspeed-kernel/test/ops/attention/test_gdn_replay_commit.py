@@ -22,11 +22,24 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.gdn import (
+    gdn_gate,
+    gdn_l2norm,
+    torch_gdn_recurrence,
+)
 from tokenspeed_kernel.ops.attention.gdn import (
     gdn_decode_mtp,
     gdn_replay_commit,
 )
+from tokenspeed_kernel.ops.attention.gdn.triton import _gdn_replay_commit_kernel
 from tokenspeed_kernel.registry import KernelRegistry
+from utils import assert_no_triton_compile
+
+_STATE_TOLERANCES = {
+    torch.bfloat16: {"rtol": 2e-2, "atol": 1e-3},
+    torch.float16: {"rtol": 1e-3, "atol": 1e-6},
+    torch.float32: {"rtol": 1e-5, "atol": 1e-6},
+}
 
 
 def test_gdn_replay_commit_registration_stays_portable():
@@ -47,27 +60,24 @@ def _reference_states(
     initial: torch.Tensor,
     accepted: torch.Tensor,
 ) -> torch.Tensor:
-    """Token-by-token GDN state oracle; all arithmetic is FP32."""
-    batch, draft_tokens, num_k_heads, _ = k.shape
-    num_v_heads = v.shape[2]
-    group = num_v_heads // num_k_heads
-    state = initial.float().transpose(-2, -1).clone()  # [B, HV, K, V]
-    head_map = torch.arange(num_v_heads, device=k.device) // group
-    for step in range(draft_tokens):
-        key = k[:, step].float()
-        key = key / torch.sqrt(key.square().sum(-1, keepdim=True) + 1e-6)
-        key = key.index_select(1, head_map)
-        x = a[:, step].float() + dt_bias.float()
-        softplus = torch.where(x <= 20.0, torch.log1p(torch.exp(x)), x)
-        decay = torch.exp(-torch.exp(A_log.float()) * softplus)
-        beta = torch.sigmoid(b[:, step].float())
-        next_state = state * decay[..., None, None]
-        predicted = torch.einsum("bhk,bhkv->bhv", key, next_state)
-        delta = beta[..., None] * (v[:, step].float() - predicted)
-        next_state = next_state + key[..., None] * delta[..., None, :]
-        active = (accepted > step).view(batch, 1, 1, 1)
-        state = torch.where(active, next_state, state)
-    return state.transpose(-2, -1)
+    """The K-last state after each request's accepted prefix; FP32 arithmetic."""
+    key = gdn_l2norm(k.float(), 1e-6)
+    _, states = torch_gdn_recurrence(
+        key,
+        key,
+        v,
+        gdn_gate(a.float(), dt_bias.float(), A_log.float()),
+        torch.sigmoid(b.float()),
+        initial,
+        scale=1.0,
+        parents=None,
+        compute_dtype=torch.float32,
+    )
+    final = initial.float().clone()
+    for batch, count in enumerate(accepted.clamp(max=k.shape[1]).tolist()):
+        if count > 0:
+            final[batch] = states[batch, count - 1]
+    return final
 
 
 def _inputs(
@@ -81,13 +91,14 @@ def _inputs(
     torch.manual_seed(17)
     batch, draft_tokens = 4, 4
     num_k_heads, num_v_heads = 2, 4
+    input_dtype = torch.float16 if state_dtype == torch.float16 else torch.bfloat16
     k = torch.randn(
         batch,
         draft_tokens,
         num_k_heads,
         head_k_dim,
         device=device,
-        dtype=torch.bfloat16,
+        dtype=input_dtype,
     )
     v = torch.randn(
         batch,
@@ -95,14 +106,14 @@ def _inputs(
         num_v_heads,
         head_v_dim,
         device=device,
-        dtype=torch.bfloat16,
+        dtype=input_dtype,
     )
     a = torch.randn(
         batch,
         draft_tokens,
         num_v_heads,
         device=device,
-        dtype=torch.bfloat16,
+        dtype=input_dtype,
     )
     b = torch.randn_like(a)
     A_log = torch.randn(num_v_heads, device=device, dtype=torch.float32) * 0.1
@@ -167,8 +178,8 @@ def _replay(
     )
 
 
-@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("head_dims", [(32, 24), (128, 65), (128, 128)])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("head_dims", [(32, 24), (33, 65), (128, 65), (128, 128)])
 def test_gdn_replay_commit_matches_accepted_prefix_reference(
     device: str,
     state_dtype: torch.dtype,
@@ -203,8 +214,7 @@ def test_gdn_replay_commit_matches_accepted_prefix_reference(
     torch.testing.assert_close(
         pool[write.long()].float(),
         expected.to(state_dtype).float(),
-        rtol=2e-2,
-        atol=3e-2,
+        **_STATE_TOLERANCES[state_dtype],
     )
     torch.testing.assert_close(pool[read.long()], original[read.long()])
     untouched = torch.tensor(
@@ -212,6 +222,233 @@ def test_gdn_replay_commit_matches_accepted_prefix_reference(
         device=device,
     )
     torch.testing.assert_close(pool[untouched], original[untouched])
+
+
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("storage_offset", [1, 4])
+def test_gdn_replay_commit_preserves_unaligned_pool_padding(
+    device: str, state_dtype: torch.dtype, storage_offset: int, require
+):
+    require("attention", "gdn_replay_commit", "triton", torch.bfloat16, "q")
+    k, v, a, b, A_log, dt_bias, pool, read, write, accepted = _inputs(
+        device, state_dtype, head_k_dim=128, head_v_dim=65
+    )
+    row_elements = pool[0].numel()
+    stride = row_elements + 1
+    backing = torch.randn(
+        pool.shape[0] * stride + storage_offset, device=device, dtype=state_dtype
+    )
+    padded_pool = torch.as_strided(
+        backing,
+        pool.shape,
+        (stride, pool.stride(1), pool.stride(2), 1),
+        storage_offset=storage_offset,
+    )
+    padded_pool.copy_(pool)
+    write[1] = read[1]  # Cover in-place replay as well as separate destinations.
+    accepted[0], accepted[-1] = -2, 9
+    expected = _reference_states(
+        k, v, a, b, A_log, dt_bias, padded_pool[read.long()], accepted
+    )
+    original = backing.clone()
+
+    _replay(k, v, a, b, A_log, dt_bias, padded_pool, read, write, accepted)
+
+    torch.testing.assert_close(
+        padded_pool[write.long()].float(),
+        expected.to(state_dtype).float(),
+        **_STATE_TOLERANCES[state_dtype],
+    )
+    written = torch.zeros_like(backing, dtype=torch.bool)
+    for row in write.tolist():
+        start = storage_offset + row * stride
+        written[start : start + row_elements] = True
+    torch.testing.assert_close(backing[~written], original[~written], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_gdn_replay_commit_reuses_shared_chunks_without_reading_rejected_tokens(
+    device: str, state_dtype: torch.dtype, require
+):
+    require("attention", "gdn_replay_commit", "triton", torch.bfloat16, "q")
+    k, v, a, b, A_log, dt_bias, pool, read, write, _ = _inputs(
+        device, state_dtype, head_k_dim=128, head_v_dim=65
+    )
+    draft_tokens = 19
+    k, v, a, b = (
+        torch.randn(
+            tensor.shape[0],
+            draft_tokens,
+            *tensor.shape[2:],
+            device=device,
+            dtype=tensor.dtype,
+        )
+        for tensor in (k, v, a, b)
+    )
+    accepted = torch.tensor([0, 1, 9, 23], dtype=torch.int32, device=device)
+    k[:, 1, 0] = 0
+    a[:, 0, 0] = 128  # Exercise the linear softplus branch.
+    b[:, 0, 0] = -128
+    for row, length in enumerate(accepted.tolist()):
+        for tensor in (k, v, a, b):
+            tensor[row, length:] = float("nan")
+    expected = _reference_states(
+        k, v, a, b, A_log, dt_bias, pool[read.long()], accepted
+    )
+
+    _replay(k, v, a, b, A_log, dt_bias, pool, read, write, accepted)
+
+    torch.testing.assert_close(
+        pool[write.long()].float(),
+        expected.to(state_dtype).float(),
+        **_STATE_TOLERANCES[state_dtype],
+    )
+
+
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_gdn_replay_commit_batch_window_and_capacity_do_not_recompile(
+    device: str, state_dtype: torch.dtype, require
+):
+    require("attention", "gdn_replay_commit", "triton", torch.bfloat16, "q")
+    H, HV, K, V = 2, 4, 128, 128
+    width = H * K + HV * V + 2 * HV
+
+    def commit(batch: int, tokens: int, capacity: int, layers: int):
+        payload = torch.randn(
+            layers, capacity, width, dtype=torch.bfloat16, device=device
+        )
+        pool = torch.zeros(
+            layers, batch * 2, HV, V, K, dtype=state_dtype, device=device
+        )
+        read = torch.arange(batch, dtype=torch.int32, device=device).repeat(layers, 1)
+        gdn_replay_commit(
+            payload,
+            torch.zeros(layers, 2, HV, device=device),
+            state_addresses=torch.tensor(
+                [pool[layer].data_ptr() for layer in range(layers)],
+                dtype=torch.uint64,
+                device=device,
+            ),
+            state_row_strides=torch.full(
+                (layers,), HV * V * K, dtype=torch.int64, device=device
+            ),
+            read_indices=read,
+            write_indices=read + batch,
+            accepted_length=torch.full(
+                (batch,), tokens, dtype=torch.int32, device=device
+            ),
+            draft_token_num=tokens,
+            geometry=(H, HV, K, V),
+            state_dtype=pool.dtype,
+            solution="triton",
+        )
+        torch.cuda.synchronize()
+
+    commit(batch=1, tokens=1, capacity=7, layers=2)
+    with assert_no_triton_compile(_gdn_replay_commit_kernel):
+        commit(batch=4, tokens=3, capacity=13, layers=3)
+        commit(batch=17, tokens=16, capacity=281, layers=1)
+
+
+@pytest.mark.parametrize("batch", [16, 32, 64])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_gdn_replay_commit_tp4_graph_refresh(
+    device: str, batch: int, state_dtype: torch.dtype, require
+):
+    """TP4 head grouping preserves state as graph acceptance and padding change."""
+    require("attention", "gdn_replay_commit", "triton", torch.bfloat16, "q")
+    torch.manual_seed(3109)
+    layers, tokens, H, HV, K, V = 2, 4, 4, 12, 128, 128
+    width = H * K + HV * V + 2 * HV
+    payload = torch.randn(
+        layers, batch * tokens, width, device=device, dtype=torch.bfloat16
+    )
+    original_payload = payload.clone()
+    parameters = torch.randn(layers, 2, HV, device=device) * 0.1
+    pool = (
+        torch.randn(layers, batch * 2 + 3, HV, V, K, device=device, dtype=state_dtype)
+        * 0.02
+    )
+    read = torch.arange(1, batch + 1, device=device, dtype=torch.int32).repeat(
+        layers, 1
+    )
+    read[1].copy_(read[1].roll(1))
+    read[:, 0] = -1
+    write = torch.arange(
+        batch + 1, batch * 2 + 1, device=device, dtype=torch.int32
+    ).repeat(layers, 1)
+    write[:, 1] = read[:, 1]  # Each in-place row belongs to only one request.
+    write[:, -1] = -1
+    accepted = torch.arange(batch, device=device, dtype=torch.int32) % (tokens + 1)
+    addresses = torch.tensor(
+        [pool[layer].data_ptr() for layer in range(layers)],
+        device=device,
+        dtype=torch.uint64,
+    )
+    strides = torch.full((layers,), pool.stride(1), device=device, dtype=torch.int64)
+
+    def commit():
+        gdn_replay_commit(
+            payload,
+            parameters,
+            state_addresses=addresses,
+            state_row_strides=strides,
+            read_indices=read,
+            write_indices=write,
+            accepted_length=accepted,
+            draft_token_num=tokens,
+            geometry=(H, HV, K, V),
+            state_dtype=state_dtype,
+            solution="triton",
+        )
+
+    commit()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        commit()
+
+    packed = payload.view(layers, batch, tokens, width)
+    for offset in (0, 1):
+        accepted.copy_((torch.arange(batch, device=device) + offset) % (tokens + 1))
+        payload.copy_(original_payload)
+        rejected = torch.arange(tokens, device=device)[None, :] >= accepted[:, None]
+        packed[:, rejected] = float("nan")
+        original = pool.clone()
+        expected = []
+        for layer in range(layers):
+            initial = original[layer, read[layer].clamp_min(0).long()].clone()
+            initial[read[layer] < 0] = 0
+            expected.append(
+                _reference_states(
+                    packed[layer, :, :, : H * K].reshape(batch, tokens, H, K),
+                    packed[layer, :, :, H * K : H * K + HV * V].reshape(
+                        batch, tokens, HV, V
+                    ),
+                    packed[layer, :, :, H * K + HV * V : -HV],
+                    packed[layer, :, :, -HV:],
+                    parameters[layer, 0],
+                    parameters[layer, 1],
+                    initial,
+                    accepted,
+                )
+            )
+
+        graph.replay()
+        torch.cuda.synchronize()
+
+        for layer in range(layers):
+            live = write[layer] >= 0
+            torch.testing.assert_close(
+                pool[layer, write[layer, live].long()].float(),
+                expected[layer][live].to(state_dtype).float(),
+                **_STATE_TOLERANCES[state_dtype],
+            )
+            written = torch.zeros(pool.shape[1], device=device, dtype=torch.bool)
+            written[write[layer, live].long()] = True
+            torch.testing.assert_close(
+                pool[layer, ~written], original[layer, ~written], rtol=0, atol=0
+            )
 
 
 def test_gdn_replay_commit_ignores_rejected_suffix(device: str, require):
@@ -333,7 +570,7 @@ def test_gdn_replay_commit_matches_flashinfer_qwen_geometry(device: str, require
         disable_state_update=False,
         use_qk_l2norm=True,
         solution="flashinfer",
-        parent_indices=None,
+        tree_ancestors=None,
     )
     _replay(
         k,

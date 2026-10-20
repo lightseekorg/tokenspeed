@@ -68,7 +68,8 @@ def combine_attention_partials(
     Args:
         local_output: CUDA local context output [tokens, gathered_heads, head_dim].
         local_lse: Natural-log FP32 LSE [tokens, gathered_heads].
-        group: Consecutive DCP subgroup of attention TP.
+        group: The KVP subgroup (consecutive attention-TP ranks) whose
+            partials are merged.
         rank: This process's position in group.
         sink: Required keyword: TP-local sink logits, or explicitly None for
             attention without a sink. There is no implicit sink policy.
@@ -117,27 +118,3 @@ def combine_attention_partials(
             dtype=local_output.dtype, memory_format=torch.contiguous_format
         ).contiguous()
     return dcp_apply_sink(output, lse, sink, dtype=local_output.dtype)
-
-
-def gather_owned_rows(
-    local_rows: torch.Tensor,
-    owned: torch.Tensor,
-    group: tuple[int, ...],
-) -> torch.Tensor:
-    """Reconstruct aligned rows with one owner per row through a sum reduction.
-
-    Args:
-        local_rows: Local values [rows, ...], in identical logical order on all ranks.
-        owned: Boolean vector [rows]; false rows must contribute zero, even if NaN.
-        group: DCP ranks collectively owning those rows, or a singleton group.
-
-    Returns:
-        Contiguous reconstructed rows with the original shape and dtype.
-    """
-    if owned.shape != local_rows.shape[:1] or owned.dtype != torch.bool:
-        raise ValueError("DCP owner mask must be bool [rows]")
-    mask = owned.reshape((-1,) + (1,) * (local_rows.ndim - 1))
-    rows = torch.where(mask, local_rows, 0).contiguous()
-    if len(group) == 1:
-        return rows
-    return all_reduce(rows, group).contiguous()

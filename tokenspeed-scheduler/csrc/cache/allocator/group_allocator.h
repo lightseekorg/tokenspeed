@@ -21,8 +21,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -133,15 +135,88 @@ public:
         return true;
     }
 
+    // The bucket a block's bytes belong to under page-cyclic sharding: the
+    // residue of its slot inside the parent, which equals (virtual id - 1) %
+    // shard_count because packing is a multiple of the shard count.
+    std::int32_t BucketOf(CacheBlockLocation location) const noexcept { return location.slot_index % shard_count_; }
+
+    // Rebuilds a table from a recorded shape: identical block count, null
+    // holes, tail capacity and reclaimed prefix. `claimed` is parallel to
+    // shape.slots: a non-empty entry is a Device block the coordinator claims
+    // for that slot (a still-cached canonical block of the slot's key), every
+    // empty entry gets one fresh block in the slot's bucket (read off its
+    // Host block, which shares the Device block's residue). Returns false
+    // without mutation when the pool cannot place the bucket demand. One
+    // bucket degenerates to ordinary placement, so the shard count stays a
+    // parameter of one path.
+    bool AcquireShape(BlockPool& pool, BlockTable& table, const ImageTable& shape, std::vector<CacheBlockRef> claimed) {
+        _assert(table.NumBlocks() == 0, "AcquireShape requires a fresh (empty) table");
+        _assert(claimed.size() == shape.slots.size(), "claimed blocks must parallel the recorded slots");
+        std::vector<std::int32_t> buckets;
+        buckets.reserve(shape.slots.size());
+        for (std::size_t i = 0; i < shape.slots.size(); ++i) {
+            const ImageSlot& slot = shape.slots[i];
+            _assert(slot.block && 0 <= slot.slot_index && slot.slot_index < shape.num_blocks,
+                    "image slot must hold a block inside the recorded table");
+            if (!claimed[i]) {
+                buckets.push_back(BucketOf(slot.block->Location()));
+            }
+        }
+        std::vector<CacheBlockRef> fresh = pool.AcquireBlocksInBuckets(group_id_, buckets);
+        if (fresh.size() != buckets.size()) {
+            return false;
+        }
+        table.blocks_.resize(static_cast<std::size_t>(shape.num_blocks));
+        std::size_t next_fresh = 0;
+        for (std::size_t i = 0; i < shape.slots.size(); ++i) {
+            CacheBlockRef& destination = table.blocks_[static_cast<std::size_t>(shape.slots[i].slot_index)];
+            destination = claimed[i] ? std::move(claimed[i]) : std::move(fresh[next_fresh++]);
+        }
+        table.available_tokens_ = shape.available_tokens;
+        table.reclaimed_prefix_blocks_ = shape.reclaimed_prefix_blocks;
+        return true;
+    }
+
+    // Swaps a fresh block into `slot`, in the bucket of the block it replaces
+    // (any bucket when the slot was a hole), and sets the table's unconsumed
+    // tail capacity. Returns the replaced block: a hitter's shared partial
+    // block or an owner's just-published one, which the caller copies into
+    // the fresh block; empty for a hole, which the caller zeroes instead.
+    CacheBlockRef SwapInFreshBlock(BlockPool& pool, BlockTable& table, std::int32_t slot,
+                                   std::int32_t available_tokens) {
+        _assert(0 <= slot && slot < table.NumBlocks(), "swapped slot lies inside the table");
+        _assert(available_tokens >= 0, "tail capacity must be non-negative");
+        CacheBlockRef& current = table.blocks_[static_cast<std::size_t>(slot)];
+        std::vector<CacheBlockRef> fresh;
+        if (current) {
+            const std::array<std::int32_t, 1> bucket{BucketOf(current->Location())};
+            fresh = pool.AcquireBlocksInBuckets(group_id_, bucket);
+        } else {
+            fresh = pool.AcquireBlocks(group_id_, 1, BucketLoads(table));
+        }
+        FatalCheck(fresh.size() == 1, "admission plan no longer fits the block pool");
+        CacheBlockRef replaced = std::exchange(current, std::move(fresh.front()));
+        table.available_tokens_ = available_tokens;
+        return replaced;
+    }
+
+    // Appends one Device destination per Host hit, each in its Host block's
+    // bucket so the copy's two ends share an owner under page-cyclic sharding.
+    // tail_available_tokens is the capacity left in the last appended block
+    // when the Host hit ends inside it (0 on a block boundary).
     void AppendHostExtension(BlockPool& pool, BlockTable& table, std::vector<CacheBlockRef>&& host_block_refs,
-                             std::vector<BlockTransfer>& load_pairs) {
+                             std::vector<BlockTransfer>& load_pairs, std::int32_t tail_available_tokens) {
         _assert(table.available_tokens_ == 0, "host extension must append on a full-page boundary");
-        const std::int32_t num_pages = static_cast<std::int32_t>(std::ranges::count_if(
-            host_block_refs, [](const CacheBlockRef& block_ref) { return static_cast<bool>(block_ref); }));
+        _assert(tail_available_tokens >= 0, "tail capacity must be non-negative");
+        std::vector<std::int32_t> buckets;
+        for (const CacheBlockRef& block_ref : host_block_refs) {
+            if (block_ref) {
+                buckets.push_back(BucketOf(block_ref->Location()));
+            }
+        }
         table.blocks_.reserve(table.blocks_.size() + host_block_refs.size());
-        std::vector<CacheBlockRef> destination_refs = pool.AcquireBlocks(group_id_, num_pages, BucketLoads(table));
-        FatalCheck(static_cast<std::int32_t>(destination_refs.size()) == num_pages,
-                   "admission plan no longer fits the block pool");
+        std::vector<CacheBlockRef> destination_refs = pool.AcquireBlocksInBuckets(group_id_, buckets);
+        FatalCheck(destination_refs.size() == buckets.size(), "admission plan no longer fits the block pool");
         auto destination_it = destination_refs.begin();
         for (CacheBlockRef& host_block_ref : host_block_refs) {
             if (!host_block_ref) {
@@ -158,6 +233,69 @@ public:
             });
         }
         _assert(destination_it == destination_refs.end(), "unused host extension destination");
+        table.available_tokens_ = tail_available_tokens;
+    }
+
+    // --- two-slot State tables -------------------------------------------
+    // Slot 0 is the checkpoint the next forward reads, slot 1 the block it
+    // writes. The table has exactly two slots once shaped.
+
+    // Shapes a State table for its first admission: slot 0 the claimed hit
+    // block (or null until the admission installs one), slot 1 empty until
+    // AcquireStateLive.
+    void ShapeStateTable(BlockTable& table, CacheBlockRef input) {
+        _assert(table.blocks_.empty(), "ShapeStateTable requires a fresh (empty) table");
+        table.blocks_.push_back(std::move(input));
+        table.blocks_.emplace_back();
+        table.available_tokens_ = 0;
+        table.reclaimed_prefix_blocks_ = 0;
+    }
+    static void assertStateTable(const BlockTable& table) {
+        _assert(table.NumBlocks() == 2, "a State table has exactly two slots");
+    }
+    // Drops the table's reference to slot 0; the index keeps the block when
+    // it is published, otherwise it returns to the pool.
+    void ReleaseStateInput(BlockTable& table) {
+        assertStateTable(table);
+        table.blocks_[0].reset();
+    }
+    // Slot 0 receives a block the admission acquired: a Host checkpoint's
+    // fresh destination, or the zeroed block a prompt starts from.
+    void InstallStateInput(BlockTable& table, CacheBlockRef input) {
+        assertStateTable(table);
+        _assert(!table.blocks_[0], "the input slot is installed only when empty");
+        table.blocks_[0] = std::move(input);
+    }
+    // Slot 1 becomes slot 0 (the block the last forward wrote is the next
+    // one's input); slot 1 is left empty for AcquireStateLive.
+    void RotateState(BlockTable& table) {
+        assertStateTable(table);
+        table.blocks_[0] = std::exchange(table.blocks_[1], CacheBlockRef{});
+    }
+    bool AcquireStateLive(BlockPool& pool, BlockTable& table) {
+        assertStateTable(table);
+        _assert(!table.blocks_[1], "the live slot is acquired only once per step");
+        return acquireStateSlot(pool, table, 1);
+    }
+    // A fresh block for an empty slot 0: the zero state a prompt starts from.
+    bool AcquireStateInput(BlockPool& pool, BlockTable& table) {
+        assertStateTable(table);
+        _assert(!table.blocks_[0], "the input slot is acquired only when empty");
+        return acquireStateSlot(pool, table, 0);
+    }
+    // Slot 0's block when this step releases it and the table is its only
+    // owner besides the index (reclaimable by the admission that releases it).
+    std::optional<CacheBlockLocation> ReleasableStateInput(const PrefixCacheIndex& index, const BlockTable& table,
+                                                           const StateStep& step) const {
+        if (step.kind == StateStep::Kind::kKeep || table.NumBlocks() == 0 || !table.Blocks()[0]) {
+            return std::nullopt;
+        }
+        const CacheBlockRef& block = table.Blocks()[0];
+        const bool cached = index.Contains(block);
+        if ((cached && block.use_count() == 2) || (!cached && block.unique())) {
+            return block->Location();
+        }
+        return std::nullopt;
     }
 
     // Retention execution: the first num_expired_blocks table slots become
@@ -225,6 +363,14 @@ public:
     }
 
 private:
+    bool acquireStateSlot(BlockPool& pool, BlockTable& table, std::size_t slot) {
+        std::vector<CacheBlockRef> fresh = pool.AcquireBlocks(group_id_, 1, BucketLoads(table));
+        if (fresh.size() != 1) {
+            return false;
+        }
+        table.blocks_[slot] = std::move(fresh.front());
+        return true;
+    }
     std::vector<std::int32_t> BucketLoads(const BlockTable& table) const {
         if (shard_count_ == 1) {
             return {};

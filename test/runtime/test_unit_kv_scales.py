@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""KV caches run at unit scale, so a checkpoint or scale file may only carry ones."""
+"""The startup load hands a checkpoint's KV-cache scales to the model; a scale
+file and a weight update may only carry ones."""
 
 import json
 import os
@@ -35,8 +36,9 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution import weight_loader  # noqa: E402
 from tokenspeed.runtime.model_loader.weight_utils import (  # noqa: E402
+    non_unit_kv_scale_message,
+    record_non_unit_kv_scales,
     require_unit_kv_scale_file,
-    require_unit_kv_scales,
 )
 
 KV_SCALE_NAMES = [
@@ -50,25 +52,30 @@ KV_SCALE_NAMES = [
 ]
 
 
+def _screen(weights):
+    """The weight-update screen: weights passed through and the scales rejected."""
+    rejected: list[str] = []
+    return list(record_non_unit_kv_scales(weights, rejected)), rejected
+
+
 def test_weights_without_kv_scales_pass_through_unchanged():
     weights = [("layers.0.self_attn.k_proj.weight", torch.ones(4, 4))]
-    assert list(require_unit_kv_scales(weights)) == weights
+    assert _screen(weights) == (weights, [])
 
 
 @pytest.mark.parametrize("name", KV_SCALE_NAMES)
-def test_unit_kv_scales_pass_through(name):
-    weights = [(name, torch.ones(4))]
-    assert list(require_unit_kv_scales(weights)) == weights
+def test_a_weight_update_drops_unit_kv_scales(name):
+    assert _screen([(name, torch.ones(4))]) == ([], [])
 
 
 @pytest.mark.parametrize("name", KV_SCALE_NAMES)
 @pytest.mark.parametrize("value", [0.5, 2.0, 1 + 2**-23, float("nan")])
-def test_a_non_unit_kv_scale_fails_the_load(name, value):
+def test_a_weight_update_rejects_a_non_unit_kv_scale(name, value):
     """One non-unit entry of a per-head scale is enough."""
     scale = torch.ones(4)
     scale[2] = value
-    with pytest.raises(ValueError, match=name):
-        list(require_unit_kv_scales([(name, scale)]))
+    _, rejected = _screen([(name, scale)])
+    assert len(rejected) == 1 and rejected[0].startswith(name)
 
 
 def test_weight_scales_are_not_mistaken_for_kv_scales():
@@ -76,23 +83,20 @@ def test_weight_scales_are_not_mistaken_for_kv_scales():
         ("layers.0.self_attn.k_proj.weight_scale", torch.tensor(0.5)),
         ("layers.0.self_attn.k_scale.weight", torch.tensor(0.5)),
     ]
-    assert list(require_unit_kv_scales(weights)) == weights
+    assert _screen(weights) == (weights, [])
 
 
-def test_the_checkpoint_error_names_every_non_unit_scale():
-    """The stream is drained before raising, so the message lists them all."""
+def test_the_rejection_names_every_non_unit_scale():
     weights = [
         ("layers.0.self_attn.k_proj.k_scale", torch.tensor(0.5)),
         ("layers.0.mlp.weight", torch.ones(2)),
         ("layers.5.self_attn.v_proj.v_scale", torch.tensor(2.0)),
     ]
-    seen = []
-    with pytest.raises(ValueError) as info:
-        for name, _ in require_unit_kv_scales(weights):
-            seen.append(name)
-    assert seen == [name for name, _ in weights]
-    assert "layers.0.self_attn.k_proj.k_scale" in str(info.value)
-    assert "layers.5.self_attn.v_proj.v_scale" in str(info.value)
+    passed, rejected = _screen(weights)
+    assert [name for name, _ in passed] == ["layers.0.mlp.weight"]
+    message = non_unit_kv_scale_message(rejected)
+    assert "layers.0.self_attn.k_proj.k_scale" in message
+    assert "layers.5.self_attn.v_proj.v_scale" in message
 
 
 def _scale_file(tmp_path, scales: dict[int, dict[int, float]]) -> str:
@@ -177,24 +181,143 @@ def test_the_loader_checks_the_scale_file_of_an_fp8_cache(
     assert checks == ([path] if checked else [])
 
 
-def test_a_checkpoint_load_rejects_a_non_unit_kv_scale(tmp_path):
+class _Linear(torch.nn.Linear):
+    """A model whose ``load_weights`` knows only its own parameters."""
+
+    def load_weights(self, weights):
+        for name, tensor in weights:
+            self.get_parameter(name).data.copy_(tensor)
+
+
+@pytest.mark.parametrize("k_scale", [1.0, 0.5])
+def test_the_startup_load_refuses_scales_the_model_does_not_load(
+    tmp_path, monkeypatch, k_scale
+):
+    """The loader keeps every KV-cache scale from ``load_weights``; one other
+    than one needs the model's ``load_kv_cache_scales``."""
     from safetensors.torch import save_file
 
     from tokenspeed.runtime.configs.load_config import LoadConfig
-    from tokenspeed.runtime.model_loader.loader import DefaultModelLoader
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.model_loader import loader
 
     save_file(
         {
-            "model.layers.0.self_attn.k_proj.weight": torch.zeros(2, 2),
-            "model.layers.0.self_attn.k_proj.k_scale": torch.tensor(0.5),
+            "weight": torch.ones(2, 4),
+            "bias": torch.zeros(2),
+            "attn.k_scale": torch.tensor([k_scale]),
+            "attn.v_scale": torch.tensor([1.0]),
         },
         str(tmp_path / "model.safetensors"),
     )
-    loader = DefaultModelLoader(LoadConfig())
-    model = SimpleNamespace(fall_back_to_pt_during_load=False, secondary_weights=())
-    model_config = SimpleNamespace(model_path=str(tmp_path), revision=None)
-    with pytest.raises(ValueError, match="k_proj.k_scale"):
-        list(loader._get_all_weights(model_config, model))
+    monkeypatch.setattr(loader, "_initialize_model", lambda *args: _Linear(4, 2))
+
+    def load():
+        return loader.DefaultModelLoader(LoadConfig()).load_model(
+            model_config=SimpleNamespace(
+                model_path=str(tmp_path),
+                revision=None,
+                dtype=torch.float32,
+                mapping=Mapping(rank=0, world_size=1),
+            ),
+            device_config=SimpleNamespace(device="cpu"),
+        )
+
+    if k_scale == 1.0:
+        assert torch.equal(load().weight, torch.ones(2, 4))
+    else:
+        with pytest.raises(ValueError, match=r"_Linear: .*attn\.k_scale=\[0\.5\]"):
+            load()
+
+
+def _attention():
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+    return PagedAttention(4, 16, 0.25, 2, 0, rotary_emb=None, qk_norm=None)
+
+
+def test_a_layer_takes_per_tensor_kv_scales():
+    from tokenspeed_kernel.ops.attention.prologue import FP8TensorScales
+
+    attn = _attention()
+    attn.load_kv_cache_scale("layers.0.mixer.k_proj.k_scale", torch.tensor([0.5]))
+    assert attn.fp8_kv_scales == FP8TensorScales(0.5, 1.0)
+    attn.load_kv_cache_scale("layers.0.mixer.v_proj.v_scale", torch.tensor(0.25))
+    assert attn.fp8_kv_scales == FP8TensorScales(0.5, 0.25)
+    with pytest.raises(NotImplementedError, match="per-tensor"):
+        attn.load_kv_cache_scale("layers.0.mixer.k_proj.k_scale", torch.ones(2))
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("leaf", ["mha", "qsa", "trtllm"])
+@pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_an_fp8_cache_is_written_at_the_scales_only_for_a_leaf_reading_them(
+    hybrid, leaf, cache_dtype
+):
+    from tokenspeed_kernel.ops.attention.prologue import FP8TensorScales, HeadKVCache
+
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.backends.paged.mha import (
+        MHAAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.backends.paged.qsa import (
+        QSAAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.backends.paged.router import (
+        CacheGroupRouter,
+    )
+    from tokenspeed.runtime.layers.attention.backends.paged.trtllm import (
+        TRTLLMMHAAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+        MambaAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        FULL_ATTENTION,
+    )
+
+    leaf_cls = {
+        "mha": MHAAttnBackend,
+        "qsa": QSAAttnBackend,
+        "trtllm": TRTLLMMHAAttnBackend,
+    }[leaf]
+    router = CacheGroupRouter(
+        lambda group, page_size: None,
+        is_draft=False,
+        spec_num_tokens=1,
+        device="cpu",
+        consumed_group_ids=(FULL_ATTENTION,),
+    )
+    router.leaves = {FULL_ATTENTION: leaf_cls.__new__(leaf_cls)}
+    backend = (
+        HybridLinearAttnBackend(router, MambaAttnBackend.__new__(MambaAttnBackend), [0])
+        if hybrid
+        else router
+    )
+    attn = _attention()
+    attn.load_kv_cache_scale("a.k_scale", torch.tensor(0.5))
+    attn.bind_cache_group(FULL_ATTENTION)
+    rows = torch.zeros(8, 2, 16, dtype=cache_dtype)
+    # The forward context and the pool's write target, as a forward hands them.
+    ctx = SimpleNamespace(
+        attn_backend=backend,
+        token_to_kv_pool=SimpleNamespace(
+            kv_write_target=lambda layer_id, slots, owned: HeadKVCache(
+                rows, rows, None, slots
+            )
+        ),
+    )
+    if cache_dtype is not torch.float8_e4m3fn:
+        # Another dtype holds the rows unscaled, so any leaf reads them.
+        assert attn._local_target(torch.arange(3), ctx).scales is None
+    elif leaf == "mha":
+        target = attn._local_target(torch.arange(3), ctx)
+        assert target.scales == FP8TensorScales(0.5, 1.0)
+    else:
+        with pytest.raises(NotImplementedError, match="does not read"):
+            attn._local_target(torch.arange(3), ctx)
 
 
 def test_a_distributed_update_finishes_its_load_before_rejecting_a_scale(monkeypatch):
@@ -224,4 +347,5 @@ def test_a_distributed_update_finishes_its_load_before_rejecting_a_scale(monkeyp
     )
     assert not ok and "k_proj.k_scale" in message
     assert len(received) == len(names)
-    assert loaded == [*names, "post_load"]
+    # The scale never reaches the model.
+    assert loaded == ["layers.0.mlp.weight", "post_load"]

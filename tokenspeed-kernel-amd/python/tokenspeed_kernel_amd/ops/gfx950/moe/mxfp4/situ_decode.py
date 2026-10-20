@@ -148,7 +148,7 @@ def _supports_a16w4_warp_decode_ep_gfx950(
             _, packed_hidden, intermediate = n16_mxfp4_shape(*tensors)
         except ValueError:
             return False
-        shapes_match = packed_hidden == hidden
+        shapes_match = packed_hidden == hidden and intermediate % 256 == 0
     elif any(t.ndim != 3 for t in tensors):
         return False
     elif linear_weights:
@@ -1115,6 +1115,8 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         )
         if weight_hidden != hidden_dim:
             raise ValueError("N16 W13 shape is inconsistent with activations")
+        if intermediate_dim % 256:
+            raise ValueError("N16 SiTU decode requires I divisible by 256")
         packed_hidden = hidden_dim // 2
         w13_stride_k = w2_stride_k = 1
         w13_stride_n = packed_hidden
@@ -1296,6 +1298,9 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
             NUM_WARPS=stage1_warps,
             MASK_K_TAIL=packed_hidden % stage1_block_kb != 0,
             num_warps=stage1_warps,
+            # The FP32 dot products rely on FMA contraction; request it
+            # explicitly instead of depending on Triton's default.
+            enable_fp_fusion=True,
         )
 
     out = torch.empty_like(hidden_states) if routed_out is None else routed_out
@@ -1493,10 +1498,6 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
     return out
 
 
-gluon_a16w4_warp_decode_ep_gfx950 = gluon_a16w4_situ_warp_decode_ep_gfx950
-
-
 __all__ = [
     "gluon_a16w4_situ_warp_decode_ep_gfx950",
-    "gluon_a16w4_warp_decode_ep_gfx950",
 ]

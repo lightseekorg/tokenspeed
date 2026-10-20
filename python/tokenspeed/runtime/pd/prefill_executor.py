@@ -34,6 +34,7 @@ from tokenspeed.runtime.pd.mooncake.prefill import (
 )
 from tokenspeed.runtime.pd.utils import poll_and_all_reduce
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.network import join_host_port
 
 logger = get_colorful_logger(__name__)
 
@@ -54,6 +55,27 @@ class DisaggPrefillExecutor:
         self._layerwise_interval = 1
         self._bootstrap_stall_logged_at: float | None = None
 
+    def has_inflight_transfers(self) -> bool:
+        """Whether a KV send is still registered (bootstrapping or sending)."""
+        return bool(self.senders)
+
+    def release_cache_registration(self) -> None:
+        """Deregister the cache arena before a sleep release unmaps it."""
+        if self.senders:
+            raise RuntimeError(
+                "cannot release the cache while KV sends are in flight: "
+                f"{sorted(self.senders)!r}"
+            )
+        self.kv_manager.deregister_buffer_from_engine()
+
+    def restore_cache_registration(self) -> None:
+        """Register the re-mapped cache arena with the same transfer engine.
+
+        The prefill node only initiates writes, from its own registration, so
+        no peer holds its memory keys and the session can stay.
+        """
+        self.kv_manager.restore_buffer_registration()
+
     def register_layerwise_step_counter(self, step_counter, interval: int) -> None:
         self._layerwise_enabled = True
         self._layerwise_interval = max(int(interval), 1)
@@ -64,7 +86,7 @@ class DisaggPrefillExecutor:
     def _bootstrap(self, request_id, info):
         self.senders[request_id] = MooncakeKVSender(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{info.bootstrap_host}:{info.bootstrap_port}",
+            bootstrap_addr=join_host_port(info.bootstrap_host, info.bootstrap_port),
             bootstrap_room=info.bootstrap_room,
         )
 
@@ -105,6 +127,14 @@ class DisaggPrefillExecutor:
                 sender.bootstrap_room, {}
             )
             if not transfer_infos:
+                if self.kv_manager.room_status(sender.bootstrap_room) in (
+                    None,
+                    TransferPoll.Failed,
+                ):
+                    # Aborted by a transfer worker or the bootstrap thread
+                    # after this op was queued; the control plane fails the
+                    # request on its next poll.
+                    continue
                 raise RuntimeError("Cache-transfer destination metadata is unavailable")
             destinations = tuple(
                 info for info in transfer_infos.values() if not info.is_dummy
@@ -140,6 +170,7 @@ class DisaggPrefillExecutor:
                 prompt_len=prompt_len,
                 chunk_start=selection_start,
                 chunk_end=chunk_end,
+                state_prefix_cached=first.block_manifest.state_prefix_cached,
             )
             for destination in destinations:
                 if destination.block_manifest is None:
@@ -149,6 +180,8 @@ class DisaggPrefillExecutor:
                 if (
                     destination.block_manifest.prefix_len != prefix_len
                     or destination.block_manifest.prompt_len != prompt_len
+                    or destination.block_manifest.state_prefix_cached
+                    != first.block_manifest.state_prefix_cached
                 ):
                     raise ValueError(
                         "Cache-transfer destinations disagree on the prompt window"
@@ -232,6 +265,13 @@ class DisaggPrefillExecutor:
                 sender.bootstrap_room, {}
             )
             if not transfer_infos:
+                if self.kv_manager.room_status(sender.bootstrap_room) in (
+                    None,
+                    TransferPoll.Failed,
+                ):
+                    # Aborted after this op was queued, as in
+                    # _prepare_cache_prefill: nothing to send or finish.
+                    continue
                 raise RuntimeError("Cache-transfer destination metadata is unavailable")
             destinations = [
                 info for info in transfer_infos.values() if not info.is_dummy
@@ -252,6 +292,7 @@ class DisaggPrefillExecutor:
                 request_row=index,
                 prefix_len=destination.block_manifest.prefix_len,
                 prompt_len=destination.block_manifest.prompt_len,
+                state_prefix_cached=destination.block_manifest.state_prefix_cached,
             )
             for destination in destinations:
                 if destination.block_manifest is None:
@@ -262,6 +303,8 @@ class DisaggPrefillExecutor:
                     destination.block_manifest.prefix_len != block_manifest.prefix_len
                     or destination.block_manifest.prompt_len
                     != block_manifest.prompt_len
+                    or destination.block_manifest.state_prefix_cached
+                    != block_manifest.state_prefix_cached
                 ):
                     raise ValueError(
                         "Cache-transfer destinations disagree on the prompt window"

@@ -108,18 +108,10 @@ class OrdinaryRecipe(CacheRecipe):
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
         groups = super().groups()
-        if self.family not in ("mla", "dsa") or self.attn_config.dcp_size == 1:
+        if self.family not in ("mla", "dsa") or self.attn_config.kvp_size == 1:
             return groups
-        if self.draft_attn_config is not None:
-            # The draft group would shard like the target's, but the draft's
-            # DCP decode steps are unvalidated and AttnConfig already rejects
-            # speculation under FlashMLA/GPU DSA DCP (docs/design/cache-concepts.md).
-            raise ValueError(
-                "Sharded MLA/DSA cache does not yet support a draft model; "
-                "run DCP without speculative decoding"
-            )
         return tuple(
-            (replace(spec, shard_count=self.attn_config.dcp_size), fields)
+            (replace(spec, shard_count=self.attn_config.kvp_size), fields)
             for spec, fields in groups
         )
 
@@ -223,7 +215,7 @@ class OrdinaryRecipe(CacheRecipe):
         )
         if self.token_limit is None:
             return budgeted
-        # The DCP shard count, not layout packing: a layout that packs more
+        # The KVP shard count, not layout packing: a layout that packs more
         # than one CacheBlock per parent without sharding must keep the
         # unsharded floor semantics of _capped_parents.
         shard_count = self._shard_counts[FULL_ATTENTION]

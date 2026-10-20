@@ -23,8 +23,9 @@
 The head embeds the next token and the target's final hidden state, merges
 them with ``eh_proj`` and runs the checkpoint's MTP blocks (one NoPE attention
 and one latent MoE block) with the target's block code, then
-``final_layernorm``. Embedding and LM head are the target's. The checkpoint
-keeps the whole MTP subtree in BF16, so it is built without quantization.
+``final_layernorm``. Embedding and LM head are the target's. The head follows
+the checkpoint's quantization, and stays in BF16 when nothing under ``mtp.`` is
+quantized.
 """
 
 from __future__ import annotations
@@ -52,6 +53,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from tokenspeed.runtime.model_loader.weight_utils import KV_CACHE_SCALE_SUFFIXES
 from tokenspeed.runtime.models.nemotron_h import (
     MixerOutput,
     NemotronHBlock,
@@ -91,7 +93,7 @@ class NemotronHForCausalLMNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        del quant_config, prefix
+        del prefix
         require_single_tp_group(mapping)
         block_types = tuple(config.mtp_layers_block_type)
         if (
@@ -106,6 +108,9 @@ class NemotronHForCausalLMNextN(nn.Module):
                 "attention block and has no Mamba2 blocks, got "
                 f"{config.num_nextn_predict_layers} of {block_types}"
             )
+        # An export that quantizes no MTP module (Nemotron 3 Super) left it in BF16.
+        if quant_config is not None and not quant_config.quantizes_any("mtp."):
+            quant_config = None
         self.config = config
         self.mapping = mapping
         attn = mapping.attn
@@ -121,7 +126,11 @@ class NemotronHForCausalLMNextN(nn.Module):
         self.enorm = RMSNorm(hidden, eps=eps)
         self.hnorm = RMSNorm(hidden, eps=eps)
         self.eh_proj = ReplicatedLinear(
-            2 * hidden, hidden, bias=False, prefix="mtp.layers.0.eh_proj"
+            2 * hidden,
+            hidden,
+            bias=False,
+            quant_config=quant_config,
+            prefix="mtp.layers.0.eh_proj",
         )
         alt_stream = torch.cuda.Stream()
         self.layers = nn.ModuleList(
@@ -131,7 +140,7 @@ class NemotronHForCausalLMNextN(nn.Module):
                 block_type,
                 0 if block_type == "attention" else None,
                 config.num_hidden_layers + i,
-                None,
+                quant_config,
                 f"mtp.layers.{i}",
                 alt_stream,
             )
@@ -163,11 +172,13 @@ class NemotronHForCausalLMNextN(nn.Module):
     def get_embed_and_head(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.embed_tokens.weight, self.lm_head.weight
 
-    def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
+    def set_embed_and_head_module(
+        self, embed: torch.Tensor, lm_head: nn.Module
+    ) -> None:
+        """Share the target's embedding and its whole LM head, quantized or not."""
         del self.embed_tokens.weight
-        del self.lm_head.weight
         self.embed_tokens.weight = embed
-        self.lm_head.weight = head
+        self.lm_head = lm_head
         torch.cuda.empty_cache()
 
     @torch.no_grad()
@@ -223,10 +234,21 @@ class NemotronHForCausalLMNextN(nn.Module):
         params = dict(self.named_parameters())
         expert_loader = expert_checkpoint_loader(params, self.config, self.mapping)
         for checkpoint_name, loaded in weights:
-            if checkpoint_name.startswith("mtp."):
+            # KV-cache scales are taken only at startup (load_kv_cache_scales).
+            if checkpoint_name.startswith("mtp.") and not checkpoint_name.endswith(
+                KV_CACHE_SCALE_SUFFIXES
+            ):
                 load_weight(
                     params, expert_loader, _mtp_param_name(checkpoint_name), loaded
                 )
+
+    def load_kv_cache_scales(self, scales: dict[str, torch.Tensor]) -> None:
+        for checkpoint_name, scale in scales.items():
+            if checkpoint_name.startswith("mtp."):
+                # mtp.layers.I.mixer.{k,v}_proj.{k,v}_scale
+                layer = checkpoint_name.removeprefix("mtp.layers.").split(".")[0]
+                block = self.layers[int(layer)]
+                block.mixer.attn.load_kv_cache_scale(checkpoint_name, scale)
 
 
 EntryClass = NemotronHForCausalLMNextN

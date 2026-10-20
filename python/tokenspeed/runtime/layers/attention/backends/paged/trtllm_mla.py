@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     trtllm_batch_decode_with_kv_cache_mla,
     trtllm_ragged_attention_deepseek,
 )
+from tokenspeed_kernel.ops.attention.tree import tree_window_attention
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -41,6 +42,10 @@ from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+    TreeCascadeRows,
+)
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
@@ -99,6 +104,51 @@ def get_trtllm_workspace_buffer(device):
             device=device,
         )
     return _trtllm_workspace_buffer
+
+
+def mla_tree_support(
+    name: str, kv_dtype: torch.dtype, model_dtype: torch.dtype
+) -> TreeSupport:
+    """An MLA leaf's tree support: the window kernel reads the latent rows in
+    the model dtype or unscaled FP8 E4M3."""
+    if kv_dtype in (model_dtype, torch.float8_e4m3fn):
+        return TreeSupport(verify_blocker=None, draft_blocker=None)
+    reason = f"{name} reads the tree window's latent rows in the model dtype or FP8 E4M3; kv_cache_dtype {kv_dtype} is not supported"
+    return TreeSupport(verify_blocker=reason, draft_blocker=reason)
+
+
+def finish_mla_tree(
+    q: torch.Tensor,
+    layer: PagedAttention,
+    latent_rows: torch.Tensor,
+    tree: TreeCascadeRows,
+    prefix_out: torch.Tensor,
+    prefix_lse: torch.Tensor,
+    *,
+    page_size: int,
+    query_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Merge the tree window and the prefix tail into an MLA cascade's causal
+    prefix partial (base-2 log-sum-exp): one latent KV row per token whose
+    leading ``v_head_dim`` channels are the value."""
+    heads, width, latent = layer.tp_q_head_num, layer.head_dim, layer.v_head_dim
+    rows = latent_rows.view(-1, 1, width)
+    out = tree_window_attention(
+        # An FP8 query (FP8 cache) widens exactly to the model dtype.
+        q.view(-1, heads, width).to(query_dtype),
+        rows,
+        rows[..., :latent],
+        tree.page_table,
+        tree.seq_lens,
+        tree.mask,
+        prefix_out.view(-1, heads, latent),
+        prefix_lse.view(-1, heads),
+        rows_per_req=tree.rows,
+        window=tree.window,
+        page_size=page_size,
+        sm_scale=layer.scaling,
+    )
+    return out.view(-1, heads * latent)
 
 
 @dataclass
@@ -335,6 +385,7 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         metadata.num_extends = num_extends
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(metadata.q_len_per_req))
+        self._refresh_tree_prefix(bs, self.seq_lens_buf)
         # The persistent buffer is padded to the fused-kernel block constraint;
         # columns past the router table's width stay 0 (never read: the kernel
         # bounds access by seq_lens).
@@ -376,11 +427,22 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         **kwargs,
     ) -> torch.Tensor:
         # q is the absorbed query [T, H, head_dim]; the prologue wrote the latent cache.
+        lanes = self._tree_lane_rows(bs)
+        if lanes is not None:
+            return self._tree_cascade(q, layer, token_to_kv_pool, lanes)
         metadata = self.forward_decode_metadata
         # A block drafter's decode metadata describes only decode rows, so
         # there are no leading extend rows to slice away.
         num_extends = 0 if self.draft_block_decode else metadata.num_extends
         q_len_per_req = q.shape[0] // bs if bs > 0 else 1
+        tree = self._tree_verify_rows(
+            bs,
+            q_len_per_req,
+            metadata.page_table[num_extends:],
+            metadata.seq_lens_k[num_extends:],
+        )
+        if tree is not None:
+            return self._tree_cascade(q, layer, token_to_kv_pool, tree)
 
         if q_len_per_req > 1 and self.is_draft:
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
@@ -434,6 +496,49 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         )
 
         return raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def tree_support(self) -> TreeSupport:
+        return mla_tree_support(type(self).__name__, self.data_type, self.q_data_type)
+
+    def _tree_cascade(
+        self,
+        q: torch.Tensor,
+        layer: PagedAttention,
+        token_to_kv_pool,
+        tree: TreeCascadeRows,
+    ) -> torch.Tensor:
+        """Draft-tree attention (verify nodes or drafting lanes): trtllm-gen's
+        causal ``rows``-token MLA decode over the committed prefix, with its
+        log-sum-exp, then the tree window merged in (``finish_mla_tree``)."""
+        k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if self.data_type != k_cache.dtype:
+            k_cache = k_cache.to(self.data_type)
+        query = q.view(-1, tree.rows, layer.tp_q_head_num, layer.head_dim)
+        prefix_out, prefix_lse = trtllm_batch_decode_with_kv_cache_mla(
+            query=query.to(self.data_type),
+            kv_cache=k_cache.view(
+                -1, self.kernel_page_size, self.kv_cache_dim
+            ).unsqueeze(1),
+            workspace_buffer=self.trtllm_workspace,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=tree.page_table,
+            seq_lens=tree.prefix_lens,
+            max_seq_len=self.max_context_len,
+            bmm1_scale=layer.scaling,
+            return_lse=True,
+        )
+        return finish_mla_tree(
+            q,
+            layer,
+            k_cache,
+            tree,
+            prefix_out,
+            prefix_lse,
+            page_size=self.kernel_page_size,
+            query_dtype=self.q_data_type,
+        )
 
     def forward_extend(
         self,

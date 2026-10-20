@@ -25,7 +25,7 @@ import torch
 from tokenspeed_kernel.ops.sampling.triton.draft_tree import (
     draft_tree_expand,
     draft_tree_finalize,
-    tree_ancestry,
+    load_tree_ancestry,
 )
 from tokenspeed_kernel.ops.sampling.triton.logprob_topk import logprob_topk
 
@@ -141,16 +141,58 @@ def test_finalize_keeps_a_parent_tied_with_its_child():
     assert out_parent.tolist() == [[-1, 0]]
 
 
+def _ancestry(parent):
+    """Depth and ancestor-or-self mask of every node of ``[bs, N]`` int32
+    trees, each request's tree at its own pool row."""
+    parent_map = parent.to(DEVICE)
+    bs, nodes = parent_map.shape
+    depth = torch.empty_like(parent_map)
+    mask = torch.empty((bs, nodes), dtype=torch.int64, device=DEVICE)
+    positions = torch.zeros(bs * nodes, dtype=torch.int64, device=DEVICE)
+    rows = torch.arange(bs, device=DEVICE)
+    load_tree_ancestry(
+        parent_map, rows, torch.empty_like(parent_map), depth, mask, positions
+    )
+    return depth, mask
+
+
 @pytest.mark.parametrize("nodes", [2, 17, 64])
 def test_tree_ancestry_walks_full_chain(nodes):
     """Depth is not capped: the default chain of N nodes is N - 1 deep."""
-    parent = torch.arange(-1, nodes - 1, dtype=torch.int32, device=DEVICE)[None]
-    depth = torch.empty_like(parent)
-    mask = torch.empty(parent.shape, dtype=torch.int64, device=DEVICE)
-    tree_ancestry(parent, depth, mask)
+    depth, mask = _ancestry(torch.arange(-1, nodes - 1, dtype=torch.int32)[None])
     assert depth[0].tolist() == list(range(nodes))
     got = [m & ((1 << 64) - 1) for m in mask[0].tolist()]
     assert got == [(1 << (i + 1)) - 1 for i in range(nodes)]
+
+
+def test_load_tree_ancestry_gathers_by_pool_row_and_shifts_positions():
+    """One launch: each request's parents from its pool row, every node's depth
+    and ancestor-or-self mask, and the window positions moved from vc + i to
+    vc + depth."""
+    trees = [[-1, 0, 0, 1, 3, 2], [-1, 0, 1, 2, 3, 4]]
+    parent_map = torch.full((4, 6), 9, dtype=torch.int32, device=DEVICE)
+    parent_map[2] = torch.tensor(trees[0], device=DEVICE)
+    parent_map[0] = torch.tensor(trees[1], device=DEVICE)
+    rows = torch.tensor([2, 0], device=DEVICE)
+    positions = torch.tensor(
+        [100 + i for i in range(6)] + [7 + i for i in range(6)], device=DEVICE
+    )
+    parent = torch.empty(2, 6, dtype=torch.int32, device=DEVICE)
+    depth, mask = torch.empty_like(parent), torch.empty(
+        2, 6, dtype=torch.int64, device=DEVICE
+    )
+    load_tree_ancestry(parent_map, rows, parent, depth, mask, positions)
+
+    assert parent.tolist() == trees
+    assert depth.tolist() == [[0, 1, 1, 2, 3, 2], list(range(6))]
+    # Bit j: node j is an ancestor of, or equal to, the row's node.
+    assert mask.tolist() == [
+        [0b1, 0b11, 0b101, 0b1011, 0b11011, 0b100101],
+        [(1 << (i + 1)) - 1 for i in range(6)],
+    ]
+    assert positions.tolist() == [100, 101, 101, 102, 103, 102] + [
+        7 + i for i in range(6)
+    ]
 
 
 @pytest.mark.parametrize(
@@ -167,10 +209,7 @@ def test_tree_ancestry_walks_full_chain(nodes):
 )
 def test_draft_tree_structure(bs, topk, steps, nodes):
     tokens, parent, record = _drive(bs, topk, steps, nodes, vocab=50, seed=nodes)
-    depth = torch.empty_like(parent, device=DEVICE)
-    mask = torch.empty(parent.shape, dtype=torch.int64, device=DEVICE)
-    tree_ancestry(parent.to(DEVICE), depth, mask)
-    depth, mask = depth.cpu(), mask.cpu()
+    depth, mask = (t.cpu() for t in _ancestry(parent))
     for b in range(bs):
         assert tokens[b, 0] == 7 + b and parent[b, 0] == -1
         paths = {0: ()}

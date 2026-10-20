@@ -28,8 +28,8 @@ def specs_for_layers(
     """The group specs a layer vocabulary produces.
 
     A group must declare fields, so this supplies a one-byte placeholder per
-    layer: the subject here is the scheduler semantics (retention, family,
-    block span), not the bytes.
+    layer: the subject here is the scheduler semantics (kind, window, block
+    span), not the bytes.
     """
     return tuple(
         group_spec
@@ -56,8 +56,8 @@ def one_group(group_id: str, *fields, **spec_kwargs):
     it. Row geometry defaults so a byte-layout test need not restate
     scheduler semantics. ``group`` (the pipeline stage) is the other way in.
     """
-    spec_kwargs.setdefault("retention", "full_history")
-    if "checkpoint_granularity" not in spec_kwargs:
+    spec_kwargs.setdefault("attn_kind", "full_history")
+    if spec_kwargs["attn_kind"] != "state":
         spec_kwargs.setdefault("rows_per_page", spec_kwargs.pop("page_size", 1))
         spec_kwargs.setdefault("entry_stride_tokens", 1)
     return spec.CacheGroupSpec(
@@ -73,12 +73,12 @@ def plan_group_specs(plan) -> tuple[spec.CacheGroupSpec, ...]:
     rather than restating numbers: a group's CacheBlock spans
     ``prefix_granularity / cache_blocks_per_lcm_block`` tokens, declared here
     as one row per token. Tests whose subject *is* the geometry or the
-    retention/transfer policy pass their own specs instead.
+    kind/transfer policy pass their own specs instead.
     """
     return tuple(
         spec.CacheGroupSpec(
             group_id=group.group_id,
-            retention="full_history",
+            attn_kind="full_history",
             rows_per_page=plan.prefix_granularity // group.cache_blocks_per_lcm_block,
             entry_stride_tokens=1,
             replayable=False,

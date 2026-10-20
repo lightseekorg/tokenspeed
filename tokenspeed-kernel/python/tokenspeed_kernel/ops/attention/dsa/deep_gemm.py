@@ -27,7 +27,7 @@ from tokenspeed_kernel.ops.attention.dsa.triton import (
     local_topk_to_global_slots,
     mark_forced_initial_local_logits,
 )
-from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -39,7 +39,6 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 platform = current_platform()
-_PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 # Default the DSA decode top-k to the CuTe DSL cluster kernel; set
 # ``TS_DSA_DECODE_TOPK_CUTEDSL=0`` to fall back to the ragged/persistent path.
@@ -304,33 +303,9 @@ if platform.is_hopper_plus:
         local_tokens: int = 0,
         batch_invariant: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert weights.dtype in (torch.float32, torch.bfloat16)
-        # Raw weights may be a column-split view of the fused wk_weights_proj
-        # output; the fused combine only needs unit-stride rows.
-        assert weights.stride(-1) == 1
-        assert seq_lens.dtype == torch.int32
-        assert seq_lens.is_contiguous()
-        assert block_table.dtype == torch.int32
-        assert block_table.is_contiguous()
-
-        out, lens_out = _check_out(
-            out,
-            lens_out,
-            tokens=q.shape[0],
-            topk=topk,
-            device=q.device,
-        )
-
-        q, weights = _pad_index_heads(q, weights)
-        q_2d = q.view(-1, q.shape[-1])
-        q_fp8, q_scale = quantize_fp8_with_scale(
-            q_2d,
-            granularity="token_group",
-            group_size=128,
-            scale_encoding="float32",
-        )
-        q_fp8 = q_fp8.view_as(q)
-        scaled_weights = combine_topk_weights(weights, q_scale, softmax_scale)
+        # Dispatch selects BF16/FP32 weights; their producer supplies unit
+        # inner stride, including packed projection views. Metadata buffers
+        # are allocated as contiguous int32 by the backend.
 
         if seq_lens_2d is None or plan is None:
             raise RuntimeError(
@@ -344,6 +319,25 @@ if platform.is_hopper_plus:
                 "DeepGEMM DSA paged top-k requires block table capacity >= topk; "
                 f"got capacity={max_seq_len}, topk={topk}"
             )
+
+        out, lens_out = _check_out(
+            out,
+            lens_out,
+            tokens=q.shape[0],
+            topk=topk,
+            device=q.device,
+        )
+
+        q, weights = _pad_index_heads(q, weights)
+        q_2d = q.view(-1, q.shape[-1])
+        q_fp8, q_scale = quantize_fp8(
+            q_2d,
+            granularity="token_group",
+            group_size=128,
+            scale_encoding="float32",
+        )
+        q_fp8 = q_fp8.view_as(q)
+        scaled_weights = combine_topk_weights(weights, q_scale, softmax_scale)
 
         kv_cache = index_k_cache.view(
             -1,
@@ -414,12 +408,8 @@ if platform.is_hopper_plus:
                 topk,
                 lengths=seq_lens,
                 q_len_per_req=q_len_per_req,
-                workspace=torch.empty(
-                    (_PERSISTENT_TOPK_WORKSPACE_BYTES,),
-                    dtype=torch.uint8,
-                    device=q.device,
-                ),
                 max_seq_len=max_seq_len,
+                enable_pdl=pdl_enabled(),
             )
         else:
             # No ragged CUDA top-k: mask each row to its causal window first.
@@ -508,7 +498,7 @@ if platform.is_hopper_plus:
 
         q, weights = _pad_index_heads(q, weights)
         q_2d = q.view(-1, q.shape[-1])
-        q_fp8, q_scale = quantize_fp8_with_scale(
+        q_fp8, q_scale = quantize_fp8(
             q_2d,
             granularity="token_group",
             group_size=128,
@@ -664,7 +654,7 @@ if platform.is_hopper_plus:
             page_size,
         )
         q, weights = _pad_index_heads(q.contiguous(), weights)
-        q_fp8, scale = quantize_fp8_with_scale(
+        q_fp8, scale = quantize_fp8(
             q.reshape(-1, q.shape[-1]),
             granularity="token_group",
             group_size=128,

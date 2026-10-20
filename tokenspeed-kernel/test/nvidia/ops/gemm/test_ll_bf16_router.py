@@ -22,12 +22,13 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.gemm.kimi3 import (
+from tokenspeed_kernel import compile_monitor
+from tokenspeed_kernel.ops.gemm import (
     KIMI3_HIDDEN_SIZE,
     KIMI3_ROUTER_SIZE,
     kimi3_router_projection,
 )
-from tokenspeed_kernel.ops.gemm.ll_bf16 import (
+from tokenspeed_kernel.ops.gemm.cute_dsl import (
     MAX_M,
     ll_bf16_router_supported,
 )
@@ -96,16 +97,46 @@ def test_declines_non_contiguous_and_odd_k() -> None:
     assert not ll_bf16_router_supported(odd, odd_w, 1)
 
 
+@pytest.mark.parametrize("operand", ["activation", "weight"])
+def test_router_guard_declines_misaligned_storage(operand: str) -> None:
+    a, b = _inputs(1, seed=13)
+    original = a if operand == "activation" else b
+    storage = torch.empty(original.numel() + 1, device="cuda", dtype=torch.bfloat16)
+    misaligned = storage[1:].view_as(original)
+    misaligned.copy_(original)
+    if operand == "activation":
+        a = misaligned
+    else:
+        b = misaligned
+    assert not ll_bf16_router_supported(a, b, 1)
+    with pytest.raises(ValueError, match="ll_bf16 cannot serve"):
+        ll_bf16_router(a, b, None, enable_pdl=pdl_enabled())
+
+
+def test_router_guard_declines_empty_or_invalid_shapes() -> None:
+    a, b = _inputs(1, seed=13)
+    assert not ll_bf16_router_supported(a[:0], b, 0)
+    assert not ll_bf16_router_supported(a, b[:0], 1)
+    assert not ll_bf16_router_supported(a[:, :0], b[:, :0], 1)
+    assert not ll_bf16_router_supported(a[0], b, 1)
+    assert not ll_bf16_router_supported(a, b.unsqueeze(0), 1)
+    assert not ll_bf16_router_supported(a, b, 2)
+
+
 def test_compiled_cache_separates_pdl_policy() -> None:
     a, b = _inputs(1, seed=23)
     previous = pdl_enabled()
     try:
         pdl_enabled(False)
-        without_pdl = ll_bf16_router(a, b, out_dtype=torch.bfloat16)
+        without_pdl = ll_bf16_router(
+            a, b, enable_pdl=pdl_enabled(), out_dtype=torch.bfloat16
+        )
         assert any(key[-1] is False for key in ll_bf16_router._dotprod)
 
         assert pdl_enabled(True)
-        with_pdl = ll_bf16_router(a, b, out_dtype=torch.bfloat16)
+        with_pdl = ll_bf16_router(
+            a, b, enable_pdl=pdl_enabled(), out_dtype=torch.bfloat16
+        )
         assert any(key[-1] is True for key in ll_bf16_router._dotprod)
         torch.testing.assert_close(with_pdl, without_pdl)
     finally:
@@ -120,12 +151,33 @@ _MM_MS = [1, 4, 8, 32]
 def test_bf16_epilogue_rounds_once(m: int) -> None:
     """The epilogue converts from its FP32 accumulator, so no double rounding."""
     a, b = _inputs(m, seed=5)
-    fp32 = ll_bf16_router(a, b)
+    fp32 = ll_bf16_router(a, b, enable_pdl=pdl_enabled())
     assert torch.equal(
-        ll_bf16_router(a, b, out_dtype=torch.bfloat16), fp32.to(torch.bfloat16)
+        ll_bf16_router(a, b, enable_pdl=pdl_enabled(), out_dtype=torch.bfloat16),
+        fp32.to(torch.bfloat16),
     )
     bias = torch.randn(KIMI3_ROUTER_SIZE, device="cuda", dtype=torch.bfloat16)
     assert torch.equal(
-        ll_bf16_router(a, b, bias=bias, out_dtype=torch.bfloat16),
+        ll_bf16_router(
+            a, b, enable_pdl=pdl_enabled(), bias=bias, out_dtype=torch.bfloat16
+        ),
         (fp32 + bias.float()).to(torch.bfloat16),
     )
+
+
+def test_serving_declines_only_the_per_row_count_dot_product(monkeypatch) -> None:
+    """The dot-product kernel compiles once per exact M; serving hands those rows on."""
+    monkeypatch.setattr(compile_monitor, "_hooks", None)
+    monkeypatch.setattr(compile_monitor, "_serving", False)
+    a, b = _inputs(32)
+    # Too narrow for every split-K rank to own a K tile, so the dot product at any M.
+    narrow_a, narrow_b = a[:, :320].contiguous(), b[:, :320].contiguous()
+    cases = {"dot product": (a[:3], b), "narrow": (narrow_a[:24], narrow_b)}
+    split_k = {m: (a[:m], b) for m in (8, 24)}
+    for x, w in [*cases.values(), *split_k.values()]:
+        assert ll_bf16_router_supported(x, w, x.shape[0])
+    compile_monitor.mark_serving()
+    for x, w in cases.values():
+        assert not ll_bf16_router_supported(x, w, x.shape[0])
+    for x, w in split_k.values():
+        assert ll_bf16_router_supported(x, w, x.shape[0])

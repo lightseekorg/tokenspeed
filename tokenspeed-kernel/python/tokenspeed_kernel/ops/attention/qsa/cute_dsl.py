@@ -56,51 +56,42 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
 ) -> torch.Tensor:
-    """Run the adaptive workspace-free B200/B300 QSA specialization.
+    """Run Blackwell QSA with exact query-prefix and KV operand reuse.
 
     Args:
-        q: BF16 query tensor shaped ``[tokens, query_heads, 256]``, with 6,
-            12 or 24 query heads. The count must be divisible by ``kv_heads``.
-        k_cache: BF16 or FP8 E4M3 key cache shaped
-            ``[cache_slots, kv_heads, 256]``, with 1, 2 or 4 KV heads.
-        v_cache: BF16 or FP8 E4M3 value cache shaped
-            ``[cache_slots, kv_heads, 256]``. Its dtype must match ``k_cache``.
-        selected_slots: Physical cache slots shaped ``[tokens, 2051]``;
-            non-positive values are ignored.
+        q: BF16 query tensor shaped [tokens, query_heads, 256], with 6,
+            12 or 24 query heads, divisible by the KV-head count.
+        k_cache: BF16 or FP8 E4M3 key cache shaped [slots, kv_heads, 256],
+            with 1, 2 or 4 KV heads.
+        v_cache: Value cache with the same shape and dtype as k_cache.
+        selected_slots: Int32 physical slots shaped [tokens, 2051];
+            non-positive entries are masked.
         scale: Softmax scale applied to query-key scores.
-        max_seqlen_q: Uniform query-token count per request; 1 for decode and
-            ``spec_num_tokens`` for compact speculative decode.
-        metadata_capacity_rows: Ignored because this implementation is
-            workspace-free.
-        k_scale: Scalar key-cache descale, folded into ``scale``.
+        max_seqlen_q: Uniform query-token count per request, including
+            speculative decode. Query groups never cross request boundaries.
+        metadata_capacity_rows: Capacity for stateful fallback plans, unused
+            by this implementation's call-owned prefix flags.
+        k_scale: Scalar key-cache descale, folded into scale.
         v_scale: Scalar value-cache descale, applied to the output.
 
     Returns:
-        BF16 attention output shaped ``[tokens, query_heads, 256]``.
+        BF16 attention output with q's shape.
 
-    Each KV head owns a contiguous group of query heads, divided into tiles
-    of up to eight heads. A CTA or split cluster handles consecutive query
-    rows for one KV/head tile. Every row retains its own selected slots and
-    softmax state; query grouping reuses the CTA workspace and TMEM allocation.
-    It does not widen the per-query MMA atom.
+    Twelve BF16 query heads share one sixteen-head tile. Larger batches group
+    consecutive queries only when their complete ordered 2048-entry prefixes
+    match; each query keeps separate softmax state and three private tail slots.
+    A distinct prefix retains one query per CTA. The measured head geometry
+    selects query-group size, operand stages and warp/register allocation.
 
-    The launch policy counts independent query/head outputs and queries the
-    device SM count before jointly choosing query rows per CTA, KV splits and
-    operand stages. Large BF16 launches use one split and two asynchronous
-    K-or-V slots; sufficiently large outputs group two or four query rows per
-    CTA. Intermediate BF16 launches use two or four splits with two slots.
-    Smaller launches retain the sixteen/eight/four split policy, subject to
-    the device's wide-cluster capacity. Actual compiled-kernel occupancy must
-    be queried separately from these measured scheduling thresholds.
-
-    Each BF16 operand slot holds 128x256 values in shared memory. Asynchronous
-    barrier arrivals publish copy completion while the producer can fill the
-    next free slot. An unsplit CTA merges each head and its three tail slots
-    within one warp; split clusters use the existing head-owning DSM combine.
-    FP8 retains the gather/conversion pipeline with operands in TMEM.
+    Two-query groups and six-head geometries detect equality inside attention.
+    Larger twelve-head groups refresh prefix flags in one preparation kernel
+    before attention. Both launches are included in full-call benchmarks. KV
+    data is gathered directly from the cache with 64-bit offsets; preparation
+    neither copies KV nor caches decisions across calls or graph replays.
+    FP8 retains its gather/conversion and split-cluster path.
     """
 
-    del metadata_capacity_rows  # The workspace-free specialization has no metadata.
+    del metadata_capacity_rows  # This backend does not use fallback plan storage.
     return _cute_dsl_qsa_sparse_attention(
         q,
         k_cache,

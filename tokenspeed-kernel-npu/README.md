@@ -21,6 +21,15 @@ records every Python package mutation needed by this Ascend path, including the
 TokenSpeed applications should continue to import operators from
 `tokenspeed-kernel`; it owns registration and dispatch to this package.
 
+The Ascend plugin's explicit prefill composition can prepare a
+`W4A4GroupedPlan` from the existing fused W4A4 weight plan. It shares NZ
+weights, encodes official GMM scales once, and executes Cube FlatQuant before
+packed gather, GMM13, SwiGLU, Cube FlatQuant, and GMM2. The caller supplies exact
+sorted route rows and per-expert counts; no token padding is added. Both NZ
+orientations are supported. This is an explicit composed implementation, not
+a fallback when the fused decode kernel rejects a shape. Official GMM's BF16
+epilogue has different intermediate rounding from fused vector dequantization.
+
 Run the operator correctness suite on a visible NPU with:
 
 ```bash
@@ -33,7 +42,7 @@ For the complete Qwen3-0.6B launch command, ACL Graph capture sizes, serving
 limits, and a request example, see the
 [Ascend model recipe](../docs/recipes/models.md#qwen3-06b-on-ascend-npu).
 
-## Serving Dependencies in a Source Checkout
+## Serving dependencies in a source checkout
 
 When running TokenSpeed directly from a checkout through `PYTHONPATH`, install
 the SMG serving packages explicitly. Run these commands from the repository
@@ -43,9 +52,9 @@ root with the same Python interpreter used to launch TokenSpeed:
 source /usr/local/Ascend/cann-9.0.0/set_env.sh
 
 python -m pip install \
-    "tokenspeed-smg==1.9.0.post20260823" \
-    "tokenspeed-smg-grpc-proto==0.4.14.post20260823" \
-    "tokenspeed-smg-grpc-servicer==0.8.0.post20260823" \
+    "tokenspeed-smg==1.11.0.post20261007" \
+    "tokenspeed-smg-grpc-proto==0.4.22.post20261007" \
+    "tokenspeed-smg-grpc-servicer==0.13.0.post20261007" \
     "grpcio==1.81.1" \
     "grpcio-health-checking==1.81.1" \
     "grpcio-reflection==1.81.1" \

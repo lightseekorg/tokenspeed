@@ -28,6 +28,7 @@ from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 global_server_args_dict: dict = {
+    "disaggregation_mode": ServerArgs.disaggregation_mode,
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
     "attention_use_fp4_indexer_cache": ServerArgs.attention_use_fp4_indexer_cache,
@@ -55,6 +56,7 @@ global_server_args_dict: dict = {
     "device": ServerArgs.device,
     "draft_model_path_use_base": ServerArgs.draft_model_path_use_base,
     "disable_pdl": ServerArgs.disable_pdl,
+    "disable_autotune": ServerArgs.disable_autotune,
     "enable_prefix_caching": ServerArgs.enable_prefix_caching,
     "mla_disable_ragged": ServerArgs.mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
@@ -86,6 +88,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
     pdl_enabled(not server_args.disable_pdl)
     global_server_args_dict.update(
         {
+            "disaggregation_mode": server_args.disaggregation_mode,
             "attention_backend": server_args.attention_backend,
             "sampling_backend": server_args.sampling_backend,
             "attention_use_fp4_indexer_cache": server_args.attention_use_fp4_indexer_cache,
@@ -115,6 +118,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "speculative_algorithm": server_args.speculative_algorithm,
             "speculative_num_draft_tokens": server_args.speculative_num_draft_tokens,
             "disable_pdl": server_args.disable_pdl,
+            "disable_autotune": server_args.disable_autotune,
             "enable_prefix_caching": server_args.enable_prefix_caching,
             "mla_disable_ragged": server_args.mla_disable_ragged,
             "chunked_prefill_size": server_args.chunked_prefill_size,
@@ -260,7 +264,6 @@ class Envs:
     # Model download
     TOKENSPEED_USE_MODELSCOPE = EnvBool(False)
 
-
     # Test and debug
     TOKENSPEED_CUDA_COREDUMP = EnvBool(False)
     TOKENSPEED_CUDA_COREDUMP_DIR = EnvStr("/tmp/tokenspeed_cuda_coredumps")
@@ -286,9 +289,11 @@ class Envs:
     TOKENSPEED_NVTX = EnvBool(False)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
 
-    # Shared-expert parallelism. Keep raw strings so every rank can agree
-    # before strict validation; EnvInt would silently default malformed input.
-    TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE = EnvStr("1")
+    # Shared-expert parallelism.
+    TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE = EnvInt(1)
+    # Independent projection groups retain attention's local token ownership.
+    TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE = EnvInt(1)
+    TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE = EnvInt(1)
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)
@@ -343,6 +348,13 @@ class Envs:
     TOKENSPEED_MODEL_REDIRECT_PATH = EnvStr(None)
     TOKENSPEED_MOE_PADDING = EnvBool(False)
     TOKENSPEED_MOE_CONFIG_DIR = EnvStr(None)
+    # "uniform" routes each token to a fixed random set of experts, so dummy
+    # weights spread MoE traffic like a trained router does.
+    TOKENSPEED_MOE_ROUTING_SIMULATION = EnvStr("")
+    # Tokens per request each speculative verify step keeps, on average, in
+    # place of what verification accepted. A raw string so malformed input
+    # fails at startup instead of silently turning the simulation off.
+    TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN = EnvStr("")
     TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE = EnvBool(True)
     TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY = EnvBool(True)
     TOKENSPEED_REQUEST_CONVERSION_WORKERS = EnvInt(8)

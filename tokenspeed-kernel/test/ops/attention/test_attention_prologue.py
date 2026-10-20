@@ -24,11 +24,12 @@ sequence, and the single rounding of the Triton GQA and MLA solutions."""
 from __future__ import annotations
 
 import dataclasses
+import functools
 import itertools
 
 import pytest
 import torch
-from attention_prologue_reference import (
+from attention_prologue_helpers import (
     BF16,
     FP8,
     POISON,
@@ -50,6 +51,7 @@ from attention_prologue_reference import (
     split,
 )
 from tokenspeed_kernel.ops.attention.prologue import (
+    FP8TensorScales,
     HeadKVCache,
     HeadNorm,
     KVCacheFormat,
@@ -63,6 +65,7 @@ from tokenspeed_kernel.ops.attention.prologue import (
     mla_prologue,
     qk_norm_rope,
 )
+from tokenspeed_kernel.ops.attention.prologue.triton import _gqa_prologue_kernel
 from tokenspeed_kernel.ops.embedding import apply_rope, apply_rope_mla
 from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
@@ -72,9 +75,11 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 from tokenspeed_kernel.ops.layernorm import qk_rmsnorm
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from utils import assert_no_triton_compile
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -533,6 +538,99 @@ def test_gqa_writes_only_the_slotted_rows(solution, cache_dtype):
     assert bytes_equal(v_cache[loc], v[:rows].view(rows, hkv, dim).to(cache_dtype))
 
 
+def _scaled_gqa(solution, inputs, hq, hkv, dim, loc, total, scales):
+    q, k, v = split(inputs.clone(), hq, hkv, dim)
+    k_cache, v_cache = gqa_cache(total, hkv, dim, FP8)
+    out = gqa_prologue(
+        q,
+        k,
+        v,
+        norm=None,
+        rotary=None,
+        cache=HeadKVCache(k_cache, v_cache, scales, loc),
+        return_kv=True,
+        solution=solution,
+        override=None,
+    )
+    return out, k_cache[loc], v_cache[loc]
+
+
+def test_gqa_scaled_fp8_cache_holds_rows_over_their_scale():
+    """A per-tensor scaled FP8 cache stores K / k and V / v, saturated to e4m3's
+    range; the query and the returned rows stay unscaled."""
+    tokens, hq, hkv, dim, total = 12, 4, 2, 128, 64
+    # Wide rows so that some values saturate past 448 * scale.
+    inputs = qkv(tokens, hq, hkv, dim, seed=13) * 8
+    loc = slots(tokens, total, seed=14)
+    scales = FP8TensorScales(k=0.0614, v=0.0513)
+    unit, _, _ = _scaled_gqa(None, inputs, hq, hkv, dim, loc, total, None)
+    out, k_rows, v_rows = _scaled_gqa(None, inputs, hq, hkv, dim, loc, total, scales)
+    for a, b in zip((out.q, out.k, out.v), (unit.q, unit.k, unit.v)):
+        assert bytes_equal(a, b)
+
+    def stored(x: torch.Tensor, scale: float) -> torch.Tensor:
+        x = x.view(tokens, hkv, dim).float() * (1.0 / scale)
+        return x.clamp(-448.0, 448.0).to(FP8)
+
+    assert bytes_equal(v_rows, stored(out.v, scales.v))
+    assert bytes_equal(k_rows, stored(out.k, scales.k))
+    assert (k_rows.float().abs() == 448).any()
+
+
+def test_kv_scale_values_reuse_the_compiled_kernel():
+    """Scales are runtime arguments: each layer's own values compile nothing new."""
+    from tokenspeed_kernel.ops.attention.prologue.triton import _gqa_prologue_kernel
+    from utils import assert_no_triton_compile
+
+    tokens, hq, hkv, dim, total = 6, 4, 2, 64, 32
+    inputs = qkv(tokens, hq, hkv, dim, seed=17)
+    loc = slots(tokens, total, seed=18)
+    run = functools.partial(_scaled_gqa, "triton", inputs, hq, hkv, dim, loc, total)
+    run(FP8TensorScales(0.5, 2.0))
+    with assert_no_triton_compile(_gqa_prologue_kernel):
+        for k, v in ((0.0614, 0.0513), (3.0, 0.25)):
+            run(FP8TensorScales(k, v))
+
+
+def test_only_the_triton_solution_writes_a_scaled_cache():
+    tokens, hq, hkv, dim, total = 4, 4, 2, 64, 16
+    inputs = qkv(tokens, hq, hkv, dim, seed=19)
+    with pytest.raises(NoKernelFoundError):
+        _scaled_gqa(
+            "composite",
+            inputs,
+            hq,
+            hkv,
+            dim,
+            slots(tokens, total, seed=20),
+            total,
+            FP8TensorScales(0.5, 0.5),
+        )
+
+
+def test_per_tensor_kv_scales_need_an_fp8_cache_and_positive_values():
+    tokens, hq, hkv, dim, total = 4, 4, 2, 64, 16
+    q, k, v = split(qkv(tokens, hq, hkv, dim, seed=15), hq, hkv, dim)
+    k_cache, v_cache = gqa_cache(total, hkv, dim, BF16)
+    with pytest.raises(ValueError, match="FP8 cache only"):
+        gqa_prologue(
+            q,
+            k,
+            v,
+            norm=None,
+            rotary=None,
+            cache=HeadKVCache(
+                k_cache, v_cache, FP8TensorScales(0.5, 0.5), slots(tokens, total, 16)
+            ),
+            return_kv=False,
+            solution=None,
+            override=None,
+        )
+    for bad in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="positive"):
+            FP8TensorScales(k=bad, v=1.0)
+
+
 def test_int32_indices_give_the_int64_bytes():
     """Slots and positions arrive as int32 or int64; every solution reads both alike."""
     tokens, hq, hkv, dim, total = 6, 4, 2, 64, 16
@@ -818,6 +916,73 @@ def test_a_single_kv_head_cache_may_carry_any_head_stride():
         assert bytes_equal(a, b)
 
 
+@pytest.mark.skipif(
+    not current_platform().is_cdna4,
+    reason="the Triton solution's no-copy prepared store exists only on CDNA4",
+)
+@pytest.mark.parametrize(
+    "dtype,cache_dtype,return_kv",
+    [(BF16, BF16, False), (torch.float16, BF16, True), (BF16, FP8, False)],
+)
+def test_prepared_gqa_reuses_rows_and_replays_the_cache_write(
+    dtype, cache_dtype, return_kv
+):
+    """A prepared receiver's rows survive the store; replay refreshes KV and slots."""
+
+    tokens, hq, hkv, dim, total = 2051, 32, 4, 64, 8192
+    packed = torch.randn(tokens, (hq + 2 * hkv) * dim, dtype=dtype, device="cuda")
+    q, k, v = split(packed, hq, hkv, dim)
+    k_cache, v_cache = (
+        torch.zeros(total, hkv + 1, dim, dtype=cache_dtype, device="cuda")[:, :hkv]
+        for _ in range(2)
+    )
+    loc = torch.arange(1, 2 * (tokens - 2) + 1, 2, device="cuda")
+    cache = HeadKVCache(k_cache, v_cache, None, loc)
+
+    def run(rows=tokens, target=cache):
+        return gqa_prologue(
+            q[:rows],
+            k[:rows],
+            v[:rows],
+            norm=None,
+            rotary=None,
+            cache=target,
+            return_kv=return_kv,
+            solution="triton",
+            override=None,
+        )
+
+    out = run()
+    assert out.q.data_ptr() == q.data_ptr()
+    assert bytes_equal(out.q, q)
+    if return_kv:
+        assert out.k.data_ptr() == k.data_ptr()
+        assert out.v.data_ptr() == v.data_ptr()
+    else:
+        assert out.k is None and out.v is None
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run()
+    packed.mul_(0.5)
+    loc.add_(1)
+    k_cache.zero_()
+    v_cache.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    expected_k, expected_v = torch.zeros_like(k_cache), torch.zeros_like(v_cache)
+    expected_k[loc] = k[: loc.numel()].view(-1, hkv, dim).to(cache_dtype)
+    expected_v[loc] = v[: loc.numel()].view(-1, hkv, dim).to(cache_dtype)
+    assert bytes_equal(k_cache, expected_k)
+    assert bytes_equal(v_cache, expected_v)
+    assert bytes_equal(out.q, q)
+    if return_kv:
+        assert bytes_equal(out.k, k) and bytes_equal(out.v, v)
+
+    with assert_no_triton_compile(_gqa_prologue_kernel):
+        run(2039, HeadKVCache(k_cache, v_cache, None, loc[:2037]))
+
+
 def test_composite_reads_kv_rows_past_int32_offsets():
     """The native store's row index times the source row stride passes 2^31 at row
     16; a sentinel sits where the wrapped offset would land."""
@@ -1090,7 +1255,7 @@ def test_expanded_attention_leaves_its_inputs_untouched(fp8_cache, rope_style):
 @pytest.mark.parametrize("solution", ["triton", "composite"])
 @pytest.mark.parametrize("fp8_cache", [True, False])
 def test_a_write_mask_skips_the_rows_it_excludes(solution, fp8_cache):
-    """A DCP rank stores only the rows it owns: skipped rows keep the cache's
+    """A KVP rank stores only the rows it owns: skipped rows keep the cache's
     bytes, stored rows match the unmasked write, and the query is unaffected."""
     tokens, heads, rank, rope, total = 9, 16, 512, 64, 64
     cache_dtype = FP8 if fp8_cache else BF16
@@ -2022,7 +2187,10 @@ def _scale(dtype: torch.dtype, rows: int, width: int = 1):
             dict(cache__kv_cache=lambda c: c.kv_cache[:1].expand(8, -1, -1)),
             "latent cache rows",
         ),
-        (dict(cache__kv_cache=lambda c: c.kv_cache.unsqueeze(1)), "latent cache rows"),
+        (
+            dict(cache__kv_cache=lambda c: c.kv_cache.unsqueeze(1).unsqueeze(1)),
+            "latent cache rows",
+        ),
         (dict(cache__kv_cache=lambda c: c.kv_cache[..., :512]), "latent cache rows"),
         (
             dict(cache__kv_cache=lambda c: torch.cat([c.kv_cache] * 2, -1)[..., :640]),
@@ -2153,7 +2321,7 @@ def test_prologue_kernels_constrain_only_traits_the_entries_state(monkeypatch):
 
 @pytest.mark.parametrize("mrope", [None, MRope((16, 8, 8), False)])
 def test_gqa_token_count_reuses_compiled_tiles(mrope):
-    """Warm each tile size and runtime integer class before varying batch sizes."""
+    """Warm each tile size once; token counts and index offsets then reuse it."""
     from tokenspeed_kernel.ops.attention.prologue.triton import _gqa_prologue_kernel
     from utils import assert_no_triton_compile
 
@@ -2162,9 +2330,10 @@ def test_gqa_token_count_reuses_compiled_tiles(mrope):
     norm = head_norm(dim, 1.0, seed=201)
     k_cache, v_cache = gqa_cache(2048, hkv, dim, BF16)
 
-    def run(count):
+    def run(count, offset):
         q, k, v = split(qkv(count, hq, hkv, dim, seed=202), hq, hkv, dim)
-        positions = torch.arange(count, device="cuda")
+        # An offset leaves the index vectors off 16-byte alignment, as slices of a batch do.
+        positions = torch.arange(-offset, count, device="cuda")
         if mrope is not None:
             positions = positions.repeat(3, 1)
         out = gqa_prologue(
@@ -2172,9 +2341,12 @@ def test_gqa_token_count_reuses_compiled_tiles(mrope):
             k,
             v,
             norm=norm,
-            rotary=Rotary(table, positions, RopeStyle.NEOX, mrope),
+            rotary=Rotary(table, positions[..., offset:], RopeStyle.NEOX, mrope),
             cache=HeadKVCache(
-                k_cache, v_cache, None, torch.arange(count, device="cuda")
+                k_cache,
+                v_cache,
+                None,
+                torch.arange(-offset, count, device="cuda")[offset:],
             ),
             return_kv=True,
             solution="triton",
@@ -2183,11 +2355,12 @@ def test_gqa_token_count_reuses_compiled_tiles(mrope):
         assert bytes_equal(k_cache[:count].flatten(1), out.k)
         assert bytes_equal(v_cache[:count].flatten(1), v)
 
-    for count in (1, 32, 33, 128, 129, 512, 513):
-        run(count)
+    for count in (32, 128, 512):
+        run(count, 0)
     with assert_no_triton_compile(_gqa_prologue_kernel):
-        for count in (7, 48, 63, 97, 192, 255, 320, 777, 1024):
-            run(count)
+        for count in (1, 7, 33, 48, 63, 97, 129, 192, 255, 320, 513, 777, 1024):
+            for offset in (0, 1):
+                run(count, offset)
 
 
 def test_mla_token_count_reuses_compiled_tiles():
@@ -2314,3 +2487,54 @@ def test_the_fused_kernel_declines_the_storeless_form():
                 torch.arange(tokens, device="cuda"),
             ),
         )
+
+
+@pytest.mark.parametrize("solution", ["triton", "composite"])
+@pytest.mark.parametrize("rank,page_size", [(512, 64), (1024, 32)])
+def test_mla_writes_strided_fp8_pages_without_touching_padding(
+    solution, rank, page_size
+):
+    tokens, heads, rope = 9, 8, 64
+    q_nope, q_pe, latent = mla_inputs(tokens, heads, rank, rope, seed=195)
+    loc = torch.tensor(
+        [
+            0,
+            page_size - 1,
+            page_size,
+            page_size + 2,
+            2 * page_size,
+            3 * page_size,
+            3 * page_size + 1,
+            3 * page_size + 3,
+            4 * page_size - 1,
+        ],
+        device="cuda",
+    )
+    mask = torch.tensor([1, 1, 0, 1, 0, 1, 1, 1, 1], device="cuda").bool()
+    storage = poisoned_latent(4 * (page_size + 5), rank + rope, FP8).view(
+        4, page_size + 5, 1, rank + rope
+    )
+    cache = storage[:, :page_size]
+    padding = storage[:, page_size:].clone()
+    flat = cache.reshape(-1, 1, rank + rope).clone()
+    rotary = Rotary(
+        cos_sin_cache(rope), torch.arange(tokens, device="cuda"), RopeStyle.GPTJ, None
+    )
+
+    def run(target):
+        return mla_prologue(
+            mla_query(q_nope, rope),
+            q_pe.clone(),
+            latent.clone(),
+            expanded=None,
+            rotary=rotary,
+            cache=latent_target(target, loc, write_mask=mask),
+            solution=solution,
+            override=None,
+        ).query
+
+    ref = run(flat)
+    got = run(cache)
+    assert bytes_equal(got, ref)
+    assert bytes_equal(cache, flat.view_as(cache))
+    assert bytes_equal(storage[:, page_size:], padding)

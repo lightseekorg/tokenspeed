@@ -361,11 +361,13 @@ def _sconv_apply(
 
     ``weight`` is ``[dim, W]``; ``channel_offset``/``dim`` select the state
     channels in the layer's conv pool buffer. Fusing adjacent streams (K+V)
-    is just a wider ``dim`` with concatenated weights. The paged bridges are
-    mandatory and fused: extend chunks tap the checkpoint at their aligned
+    is just a wider ``dim`` with concatenated weights. The checkpoint bridges
+    are mandatory and fused: extend chunks tap the input checkpoint at their
     start (the prefill kernel never reads the ring), decode rounds tap the
-    ring (the decode kernel never reads the checkpoint blocks), and both publish
-    every covered boundary in-kernel.
+    ring (the decode kernel never reads the checkpoint blocks), and the
+    chunk-end window is published to the live slot in-kernel whenever the
+    chunk ends at the committed frontier -- a target verify publishes its
+    accepted window after acceptance instead.
     """
     backend = ctx.attn_backend
     # Same routing as the dense metadata: prefill-family forwards read the
@@ -405,7 +407,7 @@ def _sconv_apply(
             md,
             checkpoint_group,
         )
-    y = inkling_ring_sconv(
+    return inkling_ring_sconv(
         x,
         weight,
         state,
@@ -418,18 +420,10 @@ def _sconv_apply(
         checkpoint_buffers[0],
         checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
         num_extends=md.num_extends,
-        page_size=backend.conv_columns["block_tokens"],
+        publish_live=(
+            md.num_extends > 0 or backend.conv_spec_num_tokens == 1 or backend.is_draft
+        ),
     )
-    if md.num_extends > 0 and backend.conv_columns.get("pd_endpoint_snapshots", False):
-        # The fused kernel already publishes aligned boundaries. CachePD also
-        # needs the exact prompt endpoint, which may lie inside the last page.
-        backend.publish_shortconv_endpoint(
-            state,
-            checkpoint_buffers,
-            md,
-            checkpoint_group,
-        )
-    return y
 
 
 class InklingRelLogitsProj(nn.Module):
@@ -700,7 +694,7 @@ class InklingGate(nn.Module):
     thus compete for probability mass without entering top-k (a "sink").
 
     Selection and weighting run in one fused Triton kernel
-    (``tokenspeed_kernel.ops.moe.triton.inkling_topk``, reached through
+    (``tokenspeed_kernel.ops.moe._triton.inkling_topk``, reached through
     ``TopK`` / ``select_experts``), which implements the reference's
     deterministic lowest-index tie-breaking and computes the sink
     normalization in linear space (identical to the reference's
@@ -935,7 +929,9 @@ class InklingSparseMoeBlock(nn.Module):
     def forward(self, x: torch.Tensor, ctx: ForwardContext) -> torch.Tensor:
         # weights: [T, k + S] — selected-routed weights then shared sink gammas (joint normalization).
         top_k = self.gate.top_k
-        deferred = not self.use_torch_moe and self.experts.supports_deferred_finalize
+        deferred = (
+            not self.use_torch_moe and self.experts.supports_deferred_cuda_finalize
+        )
         if deferred:
             num_global_tokens, max_tokens_per_gpu = self.comm_manager.get_num_tokens(
                 ctx
@@ -968,6 +964,7 @@ class InklingSparseMoeBlock(nn.Module):
                 weights,
                 shared_out,
                 top_k=top_k,
+                hidden_dim=x.shape[-1],
             )
         else:
             weights, topk_ids, router_logits = self.gate(x)
@@ -1511,6 +1508,14 @@ class InklingTextModel(nn.Module):
         return hidden_states, None
 
 
+class _InklingLogitsProcessor(LogitsProcessor):
+    """Keeps full-vocabulary logits: the model masks its padded vocabulary
+    columns after this processor runs, so a fused argmax could pick one."""
+
+    def fuse_argmax(self) -> None:
+        return None
+
+
 class InklingForConditionalGeneration(nn.Module):
     """Inkling top-level model (text decoder + optional audio/vision towers)."""
 
@@ -1595,7 +1600,7 @@ class InklingForConditionalGeneration(nn.Module):
             prefix=add_prefix("lm_head", prefix),
         )
         # All-gather vocab-sharded logits before sampling; do_argmax would bypass the pad masking below.
-        self.logits_processor = LogitsProcessor(
+        self.logits_processor = _InklingLogitsProcessor(
             text_config,
             skip_all_gather=mapping.attn.has_dp,
             tp_rank=mapping.attn.tp_rank,

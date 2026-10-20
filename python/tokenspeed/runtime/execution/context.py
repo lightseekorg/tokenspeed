@@ -119,6 +119,9 @@ class InputLogprobRows:
     num_input_rows: int
     chunk_tokens: int
     rows_per_rank: tuple[int, ...] | None
+    # The plan's ``top_k``: how many most likely next tokens every row also
+    # returns (0 for none).
+    top_k: int = 0
 
     @property
     def num_result_rows(self) -> int:
@@ -157,6 +160,7 @@ class ForwardContext:
     # --- dp attention ---
     global_num_tokens: list[int] | None = None
     global_bs: list[int] | None = None
+    global_num_decodes: list[int] | None = None
     all_decode_or_idle: bool = False
     all_extend: bool = False
     # --- query context parallelism ---
@@ -180,6 +184,10 @@ class ForwardContext:
     # Prompt rows whose next-token logprob this forward returns (SGLang
     # ``logprob_start_len``); None when no extend row asks for any.
     input_logprob_rows: InputLogprobRows | None = None
+    # How many most likely tokens each prefill row's sampled token is
+    # reported with (the requests' ``top_logprobs_num``); 0 for none, and in every
+    # captured graph.
+    sampled_top_k: int = 0
     # Set by a target model that captures its taps on a narrowed row subset
     # (see CapturedRows); None means one captured row per input row.
     captured_rows: CapturedRows | None = None

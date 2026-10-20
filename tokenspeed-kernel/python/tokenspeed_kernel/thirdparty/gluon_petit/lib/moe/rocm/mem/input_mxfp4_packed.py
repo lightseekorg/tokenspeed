@@ -4,13 +4,12 @@ from typing import NamedTuple
 
 from lib.gemm.rocm.intrinsics import (
     BufferResource,
-    amdgcn_mov_dpp,
-    amdgcn_perm_b32,
     amdgcn_s_waitcnt_barrier,
     amdgcn_thread_id,
 )
 from lib.moe.rocm.memory_ops import _load_vector4, _register_array_get
 from lib.tal.device import DeviceTemplate, device_method
+from lib.tal.tensor_ops import transpose_packed_bytes
 from triton.experimental.gluon import language as l
 
 
@@ -256,14 +255,7 @@ class MxFp4InputPacked(DeviceTemplate):
                 + raw_word
                 - raw_stage * self.kScaleWordsPerStage
             )
-            v0 = amdgcn_mov_dpp(raw, 0x00, 0xF, 0xF, False)
-            v1 = amdgcn_mov_dpp(raw, 0x55, 0xF, 0xF, False)
-            v2 = amdgcn_mov_dpp(raw, 0xAA, 0xF, 0xF, False)
-            v3 = amdgcn_mov_dpp(raw, 0xFF, 0xF, 0xF, False)
-            select_pair = 0x0C0C0400 + quad_lane * 0x00000101
-            pair01 = amdgcn_perm_b32(v1, v0, select_pair)
-            pair23 = amdgcn_perm_b32(v3, v2, select_pair)
-            packed += (amdgcn_perm_b32(pair23, pair01, 0x05040100),)
+            packed += (transpose_packed_bytes(raw),)
         l.barrier()
         for i in l.static_range(kTasksPerThread):
             task = (quad + i * kNumQuads) % kScaleTasks

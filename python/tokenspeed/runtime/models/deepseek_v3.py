@@ -31,6 +31,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from compressed_tensors.quantization import QuantizationStrategy
 from tokenspeed_kernel.ops.attention import attn_merge_state
 from tokenspeed_kernel.ops.attention.mla import (
     mla_project_value,
@@ -38,11 +39,11 @@ from tokenspeed_kernel.ops.attention.mla import (
 )
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV, MLAPrologueOutput
-from tokenspeed_kernel.ops.gemm import bmm
-from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
-from tokenspeed_kernel.ops.gemm.cute_dsl import (
+from tokenspeed_kernel.ops.gemm import bmm, mm
+from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
+from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
@@ -91,7 +92,6 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.attention.dcp.cache import gather_mla_history
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -109,6 +109,12 @@ from tokenspeed.runtime.layers.paged_attention import (
     QueryShardGather,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsLinearMethod,
+)
+from tokenspeed.runtime.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW8A8Fp8,
+)
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
     block_dequant,
@@ -124,6 +130,8 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
+from tokenspeed.runtime.models.base.decoder_layer import capture_layer_input
+from tokenspeed.runtime.models.base.transformer_model import notify_target_capture
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import (
     LazyValue,
@@ -347,6 +355,8 @@ class MoEGate(nn.Module):
                 self.weight,
                 out_dtype=torch.float32,
             )
+        elif _platform.is_amd:
+            logits = mm(hidden_states, self.weight)
         else:
             logits = F.linear(hidden_states, self.weight, None)
         return logits
@@ -405,6 +415,7 @@ class DeepseekV3MoE(nn.Module):
             tp_size=self.mapping.moe.tp_size,
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
+            routing_mode=getattr(config, "moe_routing_mode", None),
             routing_config={
                 "n_group": getattr(config, "n_group", 0),
                 "topk_group": getattr(config, "topk_group", 0),
@@ -412,6 +423,8 @@ class DeepseekV3MoE(nn.Module):
                 "normalize_topk_weights": config.norm_topk_prob,
                 "correction_bias": self.gate.e_score_correction_bias,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "precision_policy": getattr(config, "moe_precision_policy", "default"),
+                "output_scale": getattr(config, "moe_output_scale", 1.0),
             },
         )
 
@@ -458,7 +471,7 @@ class DeepseekV3MoE(nn.Module):
                     router_logits=router_logits,
                 )
 
-            deferred_finalize = self.experts.supports_deferred_finalize
+            deferred_finalize = self.experts.supports_deferred_cuda_finalize
             routed_expert_output = self.experts(
                 hidden_states=hidden_states,
                 topk_output=topk_output,
@@ -480,6 +493,7 @@ class DeepseekV3MoE(nn.Module):
                 expert_weights,
                 shared_output,
                 top_k=self.topk.topk_config.top_k,
+                hidden_dim=hidden_states.shape[-1],
             )
         else:
             final_hidden_states = (
@@ -532,6 +546,30 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
             quant_config=quant_config,
             prefix=prefix,
         )
+        # Model loaders write q_a_proj and kv_a_proj_with_mqa into this one
+        # linear at row offsets (begin_size). Per-channel FP8 weight scales
+        # follow their rows, but a per-tensor weight scale or a static input
+        # scale has a single slot here, not one per source layer.
+        if isinstance(self.quant_method, CompressedTensorsLinearMethod) and isinstance(
+            self.scheme, CompressedTensorsW8A8Fp8
+        ):
+            per_channel = self.scheme.strategy == QuantizationStrategy.CHANNEL
+            static_input = self.scheme.is_static_input_scheme
+            if not per_channel or static_input:
+                weights = "per-channel" if per_channel else "per-tensor"
+                inputs = (
+                    "static input scales" if static_input else "dynamic activations"
+                )
+                raise ValueError(
+                    f"{prefix}: compressed-tensors FP8 {weights} weight scales "
+                    f"with {inputs} are not supported on the fused q_a_proj and "
+                    "kv_a_proj_with_mqa linear. Both layers load into it at row "
+                    "offsets, which keeps per-channel weight scales with their "
+                    "rows but has one slot for a per-tensor weight scale and one "
+                    "for a static input scale, so kv_a_proj_with_mqa's would be "
+                    "dropped. Per-channel weight scales with dynamic per-token "
+                    "activations are supported."
+                )
         self.use_min_latency = (
             self.bias is None
             and self.weight.dtype == torch.bfloat16
@@ -658,12 +696,9 @@ class DeepseekV3AttentionMLA(nn.Module):
             rope_scaling["rope_type"] = "deepseek_yarn"
 
         if self.q_lora_rank is not None:
-            self.fused_qkv_a_proj_with_mqa = DeepseekV3FusedQkvAProjWithMqa(
-                self.hidden_size,
-                self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
-                bias=False,
+            self.fused_qkv_a_proj_with_mqa = self._make_qkv_a_projection(
                 quant_config=quant_config,
-                prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
+                prefix=prefix,
             )
 
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
@@ -712,35 +747,11 @@ class DeepseekV3AttentionMLA(nn.Module):
             tp_size=self.head_tp_size,
             tp_group=self.head_tp_group,
         )
-        # O projection.
-        if self.o_proj_batch_invariant:
-            # Full K (every head's values, all-gathered) on every rank; the
-            # output is this rank's hidden shard of every gathered token.
-            self.o_proj = ColumnParallelLinear(
-                self.num_heads * self.v_head_dim,
-                self.hidden_size,
-                bias=False,
-                quant_config=None,
-                prefix=add_prefix("o_proj", prefix),
-                tp_rank=self.head_tp_rank,
-                tp_size=self.head_tp_size,
-                tp_group=self.head_tp_group,
-            )
-        else:
-            self.o_proj = RowParallelLinear(
-                self.num_heads * self.v_head_dim,
-                self.hidden_size,
-                bias=False,
-                # Under head TP the attention's own tail (project_output)
-                # reduces the partials: a reduce-scatter to each rank's rows,
-                # or an all-reduce on a replicated-row forward.
-                reduce_results=reduce_attn_results and not self.has_head_tp,
-                quant_config=quant_config,
-                prefix=add_prefix("o_proj", prefix),
-                tp_rank=self.head_tp_rank,
-                tp_size=self.head_tp_size,
-                tp_group=self.head_tp_group,
-            )
+        self.o_proj = self._make_output_projection(
+            quant_config=quant_config,
+            prefix=prefix,
+            reduce_attn_results=reduce_attn_results,
+        )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         # Fusion layer
@@ -801,6 +812,51 @@ class DeepseekV3AttentionMLA(nn.Module):
         self.w_kc = None
         self.w_vc = None
 
+    def _make_qkv_a_projection(
+        self, *, quant_config: QuantizationConfig | None, prefix: str
+    ) -> nn.Module:
+        """Build fused_qkv_a_proj_with_mqa; default to the DeepSeek layout."""
+        return DeepseekV3FusedQkvAProjWithMqa(
+            self.hidden_size,
+            self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
+        )
+
+    def _make_output_projection(
+        self,
+        *,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        reduce_attn_results: bool,
+    ) -> nn.Module:
+        """Build o_proj, retaining the DeepSeek reduction and padding contract."""
+        if self.o_proj_batch_invariant:
+            # Full K on every rank; each produces a hidden-channel shard.
+            return ColumnParallelLinear(
+                self.num_heads * self.v_head_dim,
+                self.hidden_size,
+                bias=False,
+                quant_config=None,
+                prefix=add_prefix("o_proj", prefix),
+                tp_rank=self.head_tp_rank,
+                tp_size=self.head_tp_size,
+                tp_group=self.head_tp_group,
+            )
+        # Head TP reduces in project_output: RS for owned rows, AR otherwise.
+        return RowParallelLinear(
+            self.num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=False,
+            reduce_results=reduce_attn_results and not self.has_head_tp,
+            quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
+            tp_rank=self.head_tp_rank,
+            tp_size=self.head_tp_size,
+            tp_group=self.head_tp_group,
+        )
+
     @property
     def supports_head_tp(self) -> bool:
         """Whether this class's ``forward`` runs the head-TP exchange.
@@ -855,11 +911,11 @@ class DeepseekV3AttentionMLA(nn.Module):
             return hidden_states.new_empty(0, self.hidden_size)
         if self.has_head_tp and ctx.num_extends > 0:
             # Unreachable by configuration (see _validate_decode_tp_layouts
-            # and validate_qcp): a guard against a prefill row reaching the
-            # expanded prologue on a head-sharded layout. Head TP serves
-            # decode rows, or extend rows under query context parallelism
-            # through the absorbed sparse prefill (the shard was refused
-            # above); the expanded path never.
+            # and validate_context_parallel_roles): a guard against a prefill
+            # row reaching the expanded prologue on a head-sharded layout.
+            # Head TP serves decode rows, or extend rows under query context
+            # parallelism through the absorbed sparse prefill (the shard was
+            # refused above); the expanded path never.
             raise RuntimeError(
                 "attention head TP serves decode rows, or extend rows under query "
                 "context parallelism with an absorbed sparse prefill: the "
@@ -1606,23 +1662,15 @@ class DeepseekV3AttentionMLA(nn.Module):
             else torch.bfloat16
         )
 
-        placement = attn_backend.cache_placement(self.attn_mha)
-        for loop_idx in range(chunk_meta.chunked_loop_num):
-            chunk_kv_indices = chunk_meta.chunk_kv_indices_list[loop_idx]
-
-            if placement is None:
-                kv_a_normed, k_pe = ctx.token_to_kv_pool.get_mla_kv_buffer(
-                    self.attn_mha, chunk_kv_indices, read_dtype
-                )
-            else:
-                kv_a_normed, k_pe = gather_mla_history(
-                    ctx.token_to_kv_pool,
-                    self.attn_mha,
-                    chunk_kv_indices,
-                    dst_dtype=read_dtype,
-                    placement=placement,
-                )
-
+        # The backend reads every loop's rows: from this rank's cache, or from
+        # their page owners when it deals history pages over them.
+        history = attn_backend.read_prefix_history(
+            ctx.token_to_kv_pool,
+            self.attn_mha,
+            chunk_meta.chunk_kv_indices_list,
+            dst_dtype=read_dtype,
+        )
+        for loop_idx, (kv_a_normed, k_pe) in enumerate(history):
             kv_a_normed = kv_a_normed.squeeze(1)
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
@@ -1857,6 +1905,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         residual: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
 
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
@@ -1872,6 +1921,10 @@ class DeepseekV3DecoderLayer(nn.Module):
                 ctx=ctx,
                 comm_manager=self.comm_manager,
             )
+            # No rows, but the tap and its gather stay aligned across ranks.
+            capture_layer_input(
+                self.comm_manager, hidden_states, ctx, aux_hidden_states
+            )
             hidden_states = self.forward_mlp(
                 hidden_states,
                 residual,
@@ -1884,6 +1937,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         hidden_states, residual = self.comm_manager.input_reduce_norm(
             hidden_states, residual
         )
+        capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -1994,27 +2048,22 @@ class DeepseekV3Model(nn.Module):
         residual = None
         aux_hidden_states = [] if self.layers_to_capture else None
         for i in range(len(self.layers)):
-            if aux_hidden_states is not None and i in self.layers_to_capture:
-                # Under RSAG the inter-layer hidden/residual are reduce-
-                # scattered across the attn TP group; aux consumers (e.g. the
-                # EAGLE3 drafter) expect full rows, so gather before capturing.
-                aux = (
-                    hidden_states + residual if residual is not None else hidden_states
-                )
-                gathered = self.layers[i].comm_manager.gather_residual(aux, ctx)
-                capture_idx = self._dflash_capture_idx_map.get(i)
-                if ctx.target_capture_sink is not None and capture_idx is not None:
-                    ctx.target_capture_sink.on_target_capture(capture_idx, gathered)
-                aux_hidden_states.append(
-                    gathered if gathered is aux else gathered.clone()
-                )
             layer = self.layers[i]
+            capture = i in self.layers_to_capture
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 ctx,
                 residual,
+                aux_hidden_states=aux_hidden_states if capture else None,
             )
+            if capture and ctx.target_capture_sink is not None:
+                notify_target_capture(
+                    ctx.target_capture_sink,
+                    self._dflash_capture_idx_map,
+                    i,
+                    aux_hidden_states,
+                )
         if not ctx.forward_mode.is_idle():
             hidden_states, _ = layer.comm_manager.final_norm(
                 hidden_states, residual, ctx, self.norm
@@ -2071,8 +2120,8 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         return self._routed_experts_weights_of_layer.value
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None):
-        # layer_ids are 0-indexed from the external API; +1 because the capture
-        # check runs *before* the layer forward, so index i captures layer i-1's output.
+        # layer_ids are 0-indexed from the external API; +1 because a layer
+        # captures the residual entering it, so index i captures layer i-1's output.
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = {2, num_layers // 2, num_layers - 3}
@@ -2080,8 +2129,8 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
             self.model.layers_to_capture = {val + 1 for val in layer_ids}
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
-        # DFlash checkpoints name 0-indexed target layer outputs. The capture
-        # check runs before layer i, so capture at i + 1 for layer i's output.
+        # DFlash checkpoints name 0-indexed target layer outputs. A layer
+        # captures the residual entering it, so capture at i + 1 for layer i's output.
         num_layers = len(self.model.layers)
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError("DFLASH target_layer_ids must be unique.")
@@ -2792,6 +2841,10 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
 
     def get_hot_token_id(self):
         return self.hot_token_id
+
+    def mark_embedding_initialized(self) -> None:
+        """Count the embedding as loaded, as when dummy weights fill it."""
+        self._embed_loaded_from_checkpoint = True
 
     def set_embed_and_head(self, embed, head):
         if (

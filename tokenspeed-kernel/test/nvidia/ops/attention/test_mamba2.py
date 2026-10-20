@@ -25,7 +25,9 @@ import math
 
 import pytest
 import torch
-import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.attention.mamba2 import (
+    torch_mamba2_recurrence,
+)
 from tokenspeed_kernel.ops.attention.mamba2 import (
     build_mamba2_chunk_metadata,
     mamba2_chunk_scan,
@@ -87,21 +89,9 @@ def _inputs(tokens: int, seed: int):
 
 def _oracle(x, dt, A_log, B, C, D, dt_bias, state):
     """Token-by-token recurrence in fp64 for one sequence; returns (y, final state)."""
-    heads_per_group = x.shape[1] // B.shape[1]
-    A = -torch.exp(A_log.double())
-    s = state.double().clone()
-    ys = []
-    for t in range(x.shape[0]):
-        step = F.softplus(dt[t].double() + dt_bias.double()).clamp(*DT_LIMIT)
-        b = B[t].double().repeat_interleave(heads_per_group, dim=0)
-        c = C[t].double().repeat_interleave(heads_per_group, dim=0)
-        xt = x[t].double()
-        s = (
-            s * torch.exp(step * A)[:, None, None]
-            + (step[:, None] * xt)[:, :, None] * b[:, None, :]
-        )
-        ys.append(torch.einsum("hpn,hn->hp", s, c) + D.double()[:, None] * xt)
-    return torch.stack(ys).float(), s.float()
+    return torch_mamba2_recurrence(
+        x, dt, A_log, B, C, D, dt_bias, state, dt_limit=DT_LIMIT
+    )
 
 
 def _relative(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -548,6 +538,66 @@ def test_tree_verify_scan_steps_each_node_like_its_root_path(state_dtype, staged
                     i,
                     node,
                 )
+
+
+@pytest.mark.parametrize(
+    "state_dtype, misaligned, tol",
+    [
+        (torch.float32, False, 1e-2),
+        (torch.float32, True, 1e-2),
+        (torch.bfloat16, False, 2e-2),
+    ],
+)
+@pytest.mark.parametrize("tree", [False, True])
+def test_verify_outputs_follow_the_recurrence_for_every_pool_layout(
+    state_dtype, misaligned, tol, tree
+):
+    """The pool's dtype and alignment pick how output rows are summed; each way matches fp64."""
+    batch, steps = 3, 4
+    parents = [-1, 0, 1, 0] if tree else [-1, 0, 1, 2]
+    A_log, D, dt_bias = _params(54)
+    x, dt, B, C = _verify_window(batch, steps, 55)
+    g = torch.Generator(device="cuda").manual_seed(56)
+    size = HEADS * HEAD_DIM * D_STATE
+    storage = 0.1 * torch.randn(1 + (1 + batch) * size, generator=g, device="cuda")
+    start = 1 if misaligned else 0
+    pool = storage[start : start + (1 + batch) * size].to(state_dtype)
+    pool = pool.view(1 + batch, HEADS, HEAD_DIM, D_STATE)
+    reads = torch.arange(1, batch + 1, dtype=torch.int32, device="cuda")
+    out = torch.empty_like(x)
+    mamba2_verify_scan(
+        pool,
+        x,
+        dt,
+        A_log,
+        B,
+        C,
+        D,
+        dt_bias,
+        state_indices=reads,
+        dst_state_indices=None,
+        parent_indices=(
+            torch.tensor([parents] * batch, dtype=torch.int32, device="cuda")
+            if tree
+            else None
+        ),
+        null_slot=-1,
+        out=out,
+    )
+    for i in range(batch):
+        for node in range(steps):
+            path = _tree_path(parents, node)
+            ref_y, _ = _oracle(
+                x[i, path],
+                dt[i, path],
+                A_log,
+                B[i, path],
+                C[i, path],
+                D,
+                dt_bias,
+                pool[reads[i]],
+            )
+            assert _relative(out[i, node], ref_y[-1]) < tol, (i, node)
 
 
 @pytest.mark.parametrize(

@@ -31,6 +31,24 @@
 
 namespace tokenspeed {
 
+// Why the scheduler finished a request on its own.
+enum class AbortReason : std::uint8_t {
+    // A capacity retraction chose it and its KV image did not fit the host
+    // budgets (snapshot pool or blob slots), so its pages were freed by
+    // aborting it instead of imaging it (Scheduler::onImageDoesNotFit).
+    kImageDoesNotFit = 0,
+};
+
+// A request the scheduler finished this round: already Finished on every
+// rank (the plan is built identically), so the runtime only has to fail it
+// toward the client with `detail` as the message. A later Abort/Finish for
+// the id is harmless.
+struct SchedulerAbort {
+    std::string request_id;
+    AbortReason reason{AbortReason::kImageDoesNotFit};
+    std::string detail;
+};
+
 class ExecutionPlan {
 public:
     template <typename OperationType>
@@ -45,6 +63,17 @@ public:
     // required because one LCM parent can still contain live sibling children.
     // The runtime clears these exact byte ranges before transfers/forward.
     std::map<std::string, std::vector<std::int32_t>> pages_to_zero;
+    // Device -> Device whole-block copies, per cache group id, as (source,
+    // destination) scheduler virtual block ids: a hitter's private copy of
+    // the shared block containing its boundary, or an owner's fresh block at
+    // a publication point it keeps writing past. Fire-and-forget like
+    // pages_to_zero: no op id, no ACK. The runtime enqueues them on the
+    // forward thread's default stream after the execution stream's in-flight
+    // forwards and BEFORE this plan's zeroing, so a source re-granted in the
+    // same round is read before it is zeroed. Destinations are never listed
+    // in pages_to_zero. Both ends share a residue class under page-cyclic
+    // sharding, so the rank that owns one end owns the other.
+    std::map<std::string, std::vector<std::pair<std::int32_t, std::int32_t>>> pages_to_copy;
 
     // The plan separates its streams by executor, and the two remote
     // streams are the transfer peer's half of the role: work the peer runs
@@ -52,9 +81,9 @@ public:
     // occupies a batch slot or token budget, and the runtime submits them on
     // every round the plan carries one -- rounds with no batch included.
     //
-    // remote_decode rides beside any forward work. remote_prefill does not:
-    // a D-role round is either a decode batch, one remote admission, or a
-    // local recovery prefill (see buildDecodeWorkerPlan).
+    // remote_decode rides beside any forward work, and so does remote_prefill
+    // on the D role: at most one remote admission per round, beside the
+    // decode batch and a restore (see buildDecodeWorkerPlan).
     //
     // P role: completed prefills whose final chunk's result has landed; each
     // one's decode happens on the peer node, so its KV goes out. Rows are
@@ -64,6 +93,11 @@ public:
     // receive pulls their KV into the freshly admitted (and sanitized)
     // pages. The model sees the request only after RemotePrefillDone.
     std::optional<ForwardBatch> remote_prefill;
+
+    // Requests the scheduler aborted while building this plan (none on most
+    // rounds): the last resort of a capacity retraction whose victim could
+    // not be imaged.
+    std::vector<SchedulerAbort> aborts;
 
 private:
     std::vector<Operation> operations_;

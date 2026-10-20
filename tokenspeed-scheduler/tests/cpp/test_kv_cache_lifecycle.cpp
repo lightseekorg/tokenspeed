@@ -48,18 +48,17 @@ protected:
         full_grp.block_granularity = cfg.prefix_granularity;
         full_grp.total_pages = cfg.device_allocator.total_pages;
         full_grp.cache_blocks_per_lcm_block = 2;
-        full_grp.retention = CacheGroupConfig::Retention::FullHistory;
-        full_grp.family = CacheGroupFamily::History;
+        full_grp.attn_kind = AttnKind::kFull;
 
         CacheGroupConfig swa_grp;
         swa_grp.group_id = "swa";
         swa_grp.block_granularity = cfg.prefix_granularity;
         swa_grp.total_pages = cfg.device_allocator.total_pages;
-        swa_grp.retention = CacheGroupConfig::Retention::SlidingWindow;
+        swa_grp.attn_kind = AttnKind::kSlidingWindow;
         swa_grp.sliding_window_tokens = 4;
-        swa_grp.family = CacheGroupFamily::History;
 
         cfg.cache_groups = {full_grp, swa_grp};
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };

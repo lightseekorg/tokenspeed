@@ -60,6 +60,7 @@ def gluon_bf16_moe_stage1_kernel(
     a_ptr,  # hidden_states  (num_tokens, D)  bf16
     b_ptr,  # w1             (E, 2*I, D)      bf16
     b_scale_ptr,
+    a_scale_ptr,
     c_ptr,  # out            (num_tokens*topk, I) bf16
     sorted_token_ids_ptr,
     sorted_expert_ids_ptr,
@@ -88,6 +89,7 @@ def gluon_bf16_moe_stage1_kernel(
     GROUP_SIZE_M: gl.constexpr,
     WEIGHT_FP8: gl.constexpr,
     FP8_ASYNC: gl.constexpr,
+    CHANNEL_FP8: gl.constexpr,
 ):
     num_pid_m = gl.cdiv(EM, BLOCK_M)
     # Grid covers the SwiGLU output columns ``I_r`` (not the un-fused
@@ -140,7 +142,9 @@ def gluon_bf16_moe_stage1_kernel(
 
     NBUF: gl.constexpr = 2
     smem_a = gl.allocate_shared_memory(
-        a_ptr.dtype.element_ty, [NBUF, BLOCK_M, BLOCK_K], shared_a
+        gl.bfloat16 if CHANNEL_FP8 else a_ptr.dtype.element_ty,
+        [NBUF, BLOCK_M, BLOCK_K],
+        shared_a,
     )
     if WEIGHT_FP8 and FP8_ASYNC:
         smem_bg = gl.allocate_shared_memory(
@@ -190,10 +194,20 @@ def gluon_bf16_moe_stage1_kernel(
     gl.assume(num_k > 1)
 
     # ---- Prologue: prefetch tile 0 into buffer 0 -----------------------
-    cdna4_async_copy.buffer_load_to_shared(
-        smem_a.index(0), a_base, a_offsets, mask=token_mask[:, None]
-    )
-    if WEIGHT_FP8:
+    if CHANNEL_FP8:
+        # Eight FP8 elements would be an unsupported 64-bit async copy.
+        # Widen raw codes exactly in registers into the established BF16 LDS.
+        a_codes = gl.load(a_base + a_offsets, mask=token_mask[:, None], other=0.0)
+        smem_a.index(0).store(a_codes.to(gl.bfloat16))
+        smem_bg.index(0).store(gl.load(b_base + b_off_gate).to(gl.bfloat16))
+        smem_bu.index(0).store(gl.load(b_base + b_off_up).to(gl.bfloat16))
+    else:
+        cdna4_async_copy.buffer_load_to_shared(
+            smem_a.index(0), a_base, a_offsets, mask=token_mask[:, None]
+        )
+    if CHANNEL_FP8:
+        pass
+    elif WEIGHT_FP8:
         if FP8_ASYNC:
             cdna4_async_copy.buffer_load_to_shared(smem_bg.index(0), b_base, b_off_gate)
             cdna4_async_copy.buffer_load_to_shared(smem_bu.index(0), b_base, b_off_up)
@@ -222,10 +236,18 @@ def gluon_bf16_moe_stage1_kernel(
     for k in range(num_k - 1):
         l_idx = k % 2
         g_idx = 1 - l_idx
-        cdna4_async_copy.buffer_load_to_shared(
-            smem_a.index(g_idx), a_base, a_offsets, mask=token_mask[:, None]
-        )
-        if WEIGHT_FP8:
+        if CHANNEL_FP8:
+            a_codes = gl.load(a_base + a_offsets, mask=token_mask[:, None], other=0.0)
+            smem_a.index(g_idx).store(a_codes.to(gl.bfloat16))
+            smem_bg.index(g_idx).store(gl.load(b_base + b_off_gate).to(gl.bfloat16))
+            smem_bu.index(g_idx).store(gl.load(b_base + b_off_up).to(gl.bfloat16))
+        else:
+            cdna4_async_copy.buffer_load_to_shared(
+                smem_a.index(g_idx), a_base, a_offsets, mask=token_mask[:, None]
+            )
+        if CHANNEL_FP8:
+            pass
+        elif WEIGHT_FP8:
             if FP8_ASYNC:
                 cdna4_async_copy.buffer_load_to_shared(
                     smem_bg.index(g_idx), b_base, b_off_gate
@@ -328,6 +350,19 @@ def gluon_bf16_moe_stage1_kernel(
     gate_acc = gl.amd.cdna3.mfma(a, bg, gate_acc)
     up_acc = gl.amd.cdna3.mfma(a, bu, up_acc)
 
+    if CHANNEL_FP8:
+        scale_rows = gl.convert_layout(a_row, gl.SliceLayout(1, mfma_layout))
+        row_scale = gl.load(
+            a_scale_ptr + scale_rows, mask=scale_rows < num_tokens, other=0
+        )
+        scale_cols = pid_n * BLOCK_N + gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout)
+        )
+        gate_scale = gl.load(b_scale_ptr + off_experts * (2 * I_r) + scale_cols)
+        up_scale = gl.load(b_scale_ptr + off_experts * (2 * I_r) + I_r + scale_cols)
+        gate_acc = (gate_acc * row_scale[:, None]) * gate_scale[None, :]
+        up_acc = (up_acc * row_scale[:, None]) * up_scale[None, :]
+
     # ---- SwiGLU: silu(gate) * up  (silu(x) = x * sigmoid(x)) -----------
     sig = 1.0 / (1.0 + gl.exp(-gate_acc))
     inter = gate_acc * sig * up_acc
@@ -361,8 +396,9 @@ def invoke_stage1(
     num_valid_ids: torch.Tensor,
     out: torch.Tensor,  # (num_tokens*topk, I) bf16
     topk: int,
-    BLOCK_M: int = 64,
-    BLOCK_N: int = 128,
+    *,
+    BLOCK_M: int,
+    BLOCK_N: int,
     BLOCK_K: int | None = None,
     num_warps: int = 4,
     num_xcds: int = 8,
@@ -448,6 +484,7 @@ def invoke_stage1(
         hidden_states,
         weight,
         scale,
+        hidden_states,
         out,
         sorted_token_ids,
         sorted_expert_ids,
@@ -476,6 +513,71 @@ def invoke_stage1(
         GROUP_SIZE_M=group_size_m,
         WEIGHT_FP8=weight_fp8,
         FP8_ASYNC=fp8_async,
+        CHANNEL_FP8=False,
         num_warps=num_warps,
     )
     return out
+
+
+def launch_gluon_fp8_channel_stage1_gfx950(
+    hidden_states,
+    w1,
+    token_scales,
+    channel_scales,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    *,
+    block_m,
+):
+    """Reuse grouped BF16 MFMA on exactly widened raw E4M3 codes."""
+    assert hidden_states.dtype == w1.dtype == torch.float8_e4m3fn
+    assert token_scales.dtype == channel_scales.dtype == torch.float32
+    num_tokens, hidden = hidden_states.shape
+    experts, twice_intermediate, weight_hidden = w1.shape
+    intermediate = twice_intermediate // 2
+    assert hidden == weight_hidden and token_scales.shape == (num_tokens, 1)
+    assert channel_scales.shape == (experts, twice_intermediate)
+    assert (
+        out.shape == (num_tokens * topk, intermediate) and out.dtype == torch.bfloat16
+    )
+    block_n = 64 if block_m == 16 or intermediate == 320 else 128
+    block_k = 64
+    assert hidden % block_k == intermediate % block_n == 0
+    em = sorted_token_ids.numel()
+    grid = triton.cdiv(em, block_m) * triton.cdiv(intermediate, block_n)
+    return gluon_bf16_moe_stage1_kernel[(grid,)](
+        hidden_states,
+        w1,
+        channel_scales,
+        token_scales,
+        out,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        hidden,
+        em,
+        num_tokens,
+        topk,
+        *hidden_states.stride(),
+        *w1.stride(),
+        0,
+        0,
+        0,
+        *out.stride(),
+        grid,
+        I_r=intermediate,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        NUM_WARPS=4,
+        NUM_XCDS=1 if block_m == 16 else 8,
+        GROUP_SIZE_M=4 if block_m == 16 else 8,
+        WEIGHT_FP8=False,
+        FP8_ASYNC=False,
+        CHANNEL_FP8=True,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )

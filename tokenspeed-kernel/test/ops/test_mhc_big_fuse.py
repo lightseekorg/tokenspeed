@@ -22,6 +22,10 @@ import inspect
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.residual import (
+    mhc_mix_coefficients,
+    torch_mhc_apply_pre,
+)
 from tokenspeed_kernel.ops.residual.triton import (
     _pre_reduce_apply_fuses_norm,
     _pre_reduce_apply_is_supported,
@@ -47,17 +51,13 @@ def reference(
     hc_eps: float,
     sinkhorn_iters: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The mHC pre-mapping from split-K partial projections and square sums."""
     values = projection.sum(dim=0)
     rstd = torch.rsqrt(square_sum.sum(dim=0) / (4 * residual.shape[-1]) + rms_eps)
-    pre = torch.sigmoid(values[:, :4] * rstd[:, None] * scale[0] + base[:4]) + hc_eps
-    post = torch.sigmoid(values[:, 4:8] * rstd[:, None] * scale[1] + base[4:8]) * 2
-    comb = (values[:, 8:] * rstd[:, None] * scale[2] + base[8:]).view(-1, 4, 4)
-    comb = torch.softmax(comb, dim=2) + hc_eps
-    comb = comb / (comb.sum(dim=1, keepdim=True) + hc_eps)
-    for _ in range(1, sinkhorn_iters):
-        comb = comb / (comb.sum(dim=2, keepdim=True) + hc_eps)
-        comb = comb / (comb.sum(dim=1, keepdim=True) + hc_eps)
-    layer = torch.einsum("mi,mih->mh", pre, residual.float()).bfloat16()
+    pre, post, comb = mhc_mix_coefficients(
+        values * rstd[:, None], scale, base, hc_eps, sinkhorn_iters
+    )
+    layer = torch_mhc_apply_pre(residual, pre, norm_weight=None, norm_eps=None)
     return layer, post, comb
 
 

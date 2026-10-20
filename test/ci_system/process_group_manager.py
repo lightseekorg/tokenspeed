@@ -69,14 +69,6 @@ def _load_pgids(runner_id: str) -> set[int]:
     return pgids
 
 
-def _load_pgid(runner_id: str) -> Optional[int]:
-    """Backward-compatible single-pgid accessor for older callers/tests."""
-    pgids = _load_pgids(runner_id)
-    if not pgids:
-        return None
-    return next(iter(sorted(pgids)))
-
-
 def _remove_pgid(runner_id: str) -> None:
     _pgid_path(runner_id).unlink(missing_ok=True)
 
@@ -157,7 +149,7 @@ class ProcessGroupManager:
         print(f"[pgm] start: launching command for runner={self.runner_id}", flush=True)
         print(f"$ {command}", flush=True)
         if dry_run:
-            print(f"[pgm] start: [dry-run] skip", flush=True)
+            print("[pgm] start: [dry-run] skip", flush=True)
             return None
 
         proc = subprocess.Popen(
@@ -204,7 +196,7 @@ class ProcessGroupManager:
         print(f"[pgm] run: executing command for runner={self.runner_id}", flush=True)
         print(f"$ {command}", flush=True)
         if dry_run:
-            print(f"[pgm] run: [dry-run] skip", flush=True)
+            print("[pgm] run: [dry-run] skip", flush=True)
             return {"command": command, "returncode": 0, "output": "", "dry_run": True}
 
         proc = subprocess.Popen(
@@ -311,7 +303,7 @@ class ProcessGroupManager:
                     _kill_pgid(pgid, signal.SIGKILL)
             else:
                 print(
-                    f"[pgm] terminate_all: no tracked processes, nothing to do",
+                    "[pgm] terminate_all: no tracked processes, nothing to do",
                     flush=True,
                 )
             _remove_pgid(self.runner_id)
@@ -370,7 +362,7 @@ class ProcessGroupManager:
 
         self._procs.clear()
         _remove_pgid(self.runner_id)
-        print(f"[pgm] terminate_all: cleanup done, all processes cleared", flush=True)
+        print("[pgm] terminate_all: cleanup done, all processes cleared", flush=True)
 
 
 # ---------------------------------------------------------------------------

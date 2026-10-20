@@ -10,9 +10,9 @@ These run CPU-only against a stub AsyncLLM -- no engine, NCCL, or GPU needed.
 
 import os
 import sys
-import unittest
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 # CI registration (AST-parsed, runtime no-op).
@@ -42,7 +42,7 @@ class _StubLLM:
         return self._result
 
 
-class DestroyWeightsUpdateGroupHandlerTest(unittest.TestCase):
+class TestDestroyWeightsUpdateGroupHandlerTest:
     def _client(self, result):
         llm = _StubLLM(result)
         return TestClient(build_sglang_compat_app(llm)), llm
@@ -51,34 +51,33 @@ class DestroyWeightsUpdateGroupHandlerTest(unittest.TestCase):
         client, llm = self._client((True, "weight update group destroyed"))
         resp = client.post("/destroy_weights_update_group", json={"group_name": "g1"})
 
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(
-            resp.json(),
-            {"success": True, "message": "weight update group destroyed"},
+        assert (resp.status_code) == (200)
+        assert (resp.json()) == (
+            {"success": True, "message": "weight update group destroyed"}
         )
         # No longer a no-op: the request reached AsyncLLM with the asked group.
-        self.assertEqual(len(llm.calls), 1)
-        self.assertIsInstance(llm.calls[0], DestroyWeightsUpdateGroupReqInput)
-        self.assertEqual(llm.calls[0].group_name, "g1")
+        assert (len(llm.calls)) == (1)
+        assert isinstance((llm.calls[0]), (DestroyWeightsUpdateGroupReqInput))
+        assert (llm.calls[0].group_name) == ("g1")
 
     def test_empty_body_defaults_group_name(self):
         # slime/verl may POST destroy with no body; it must not 4xx.
         client, llm = self._client((True, "weight update group not initialized"))
         resp = client.post("/destroy_weights_update_group")
 
-        self.assertEqual(resp.status_code, 200)
-        self.assertTrue(resp.json()["success"])
-        self.assertEqual(llm.calls[0].group_name, "weight_update_group")
+        assert (resp.status_code) == (200)
+        assert resp.json()["success"]
+        assert (llm.calls[0].group_name) == ("weight_update_group")
 
     def test_failure_maps_to_400(self):
         client, _ = self._client((False, "boom"))
         resp = client.post("/destroy_weights_update_group", json={})
 
-        self.assertEqual(resp.status_code, 400)
-        self.assertEqual(resp.json(), {"success": False, "message": "boom"})
+        assert (resp.status_code) == (400)
+        assert (resp.json()) == ({"success": False, "message": "boom"})
 
 
-class ModelRunnerDestroyIdempotentTest(unittest.TestCase):
+class TestModelRunnerDestroyIdempotentTest:
     def test_destroy_without_live_group_is_success(self):
         # The path slime hits when destroy is called with no prior init (or
         # twice): no live group -> success, no torch/NCCL work required.
@@ -88,9 +87,9 @@ class ModelRunnerDestroyIdempotentTest(unittest.TestCase):
         runner._weight_update_pg = None
         ok, msg = runner.destroy_weights_update_group(None)
 
-        self.assertTrue(ok)
-        self.assertIn("not initialized", msg)
+        assert ok
+        assert ("not initialized") in (msg)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

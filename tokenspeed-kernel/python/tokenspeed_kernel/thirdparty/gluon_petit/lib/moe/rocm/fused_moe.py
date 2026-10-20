@@ -66,6 +66,7 @@ class FusedMoEActivationFunction(IntEnum):
     kSiluDot = 0
     kOpenAISwiGLU = 1
     kKimiSitu = 2
+    kClampedSiluDot = 3
 
 
 class FusedMoEStage1Buffering(IntEnum):

@@ -1,9 +1,9 @@
-# TokenSpeed Governance
+# TokenSpeed governance
 
 TokenSpeed is maintained by the LightSeek Foundation and the project core
 maintainers.
 
-## Core Maintainers
+## Core maintainers
 
 Named core maintainers include:
 
@@ -27,16 +27,16 @@ Major project decisions, including maintainer membership, release policy,
 project scope, and changes to this document, require approval from more than
 half of the active core maintainers.
 
-## Adding Maintainers
+## Adding maintainers
 
 A contributor may be nominated as a core maintainer after making significant
 contributions to TokenSpeed and helping maintain the project for at least three
 months.
 
-A nomination must be made by an existing core maintainer and passes when more
+An existing core maintainer must make the nomination, and it passes when more
 than half of the active core maintainers approve it.
 
-## Governance Changes
+## Governance changes
 
-Changes to this document should be proposed by pull request and require
+Propose changes to this document by pull request. Changes require
 approval from more than half of the active core maintainers.

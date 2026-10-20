@@ -33,10 +33,10 @@ prefill graph: vLLM's ``BreakableCUDAGraphWrapper`` (the homogeneous segment-lis
 structure + the ``set_forward_context``/``get_forward_context`` ambient pattern we
 mirror in :func:`active_forward`/:func:`current_forward_ctx`) and SGLang's
 breakable prefill graph (the eager-copy output handoff at each break). Unlike a
-full prefill graph, attention -- the only batch/length-aware op and the source of
-the host-side ``max_seq_len_q`` scalar -- stays eager, so it never enters a graph.
-Keeping all KV-cache reads/writes in the eager breaks also makes them honor the
-per-layer transfer consumer index naturally.
+full prefill graph, attention and request-shaped state updates stay eager, so
+live lengths and cache addresses never enter a captured segment. Keeping all
+KV-cache reads/writes in eager breaks also makes them honor the per-layer
+transfer consumer index naturally.
 
 Address-stability contract (the load-bearing invariant):
 
@@ -51,15 +51,17 @@ Address-stability contract (the load-bearing invariant):
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import gc
 from collections import deque
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from typing import Any
 
 import torch
 from tokenspeed_kernel.ops.transform.weak_ref import weak_ref_tensor as _kernel_weak_ref
+from tokenspeed_kernel.workspace import capture_session
 
 __all__ = [
     "BreakableCapture",
@@ -132,20 +134,45 @@ def _set_replay_valid_rows(valid_rows: int | None) -> None:
 
 
 def weak_ref_tensor(t: Any) -> Any:
-    """Reference a break-point tensor without pinning its cudagraph mempool slot.
+    """Reference a break-point tensor without pinning its graph-pool block.
 
     CUDA tensors are wrapped in a non-owning view (``tokenspeed_kernel``
     ``ops.transform.weak_ref``, an ``at::from_blob`` alias -- the vLLM/sglang
     approach), so break closures do not pin pool blocks and graph capture
-    memory stays ~peak-live instead of scaling with the bucket sum. Safe
-    because replay is stream-ordered: the captured segment rewrites the
-    aliased address before the break reads it. Non-tensors and CPU tensors
+    memory stays ~peak-live instead of scaling with the bucket sum. Safe when
+    the aliased memory is owned elsewhere for the graph's lifetime (static
+    input buffers, weights) or is rewritten by the captured segment before the
+    break reads it on every replay (replay is stream-ordered). Non-tensors and CPU tensors
     pass through; if the kernel extension is unavailable this degrades to
     the identity (strong ref -- correct, more memory).
     """
     if isinstance(t, torch.Tensor) and t.is_cuda:
         return _kernel_weak_ref(t)
     return t
+
+
+def _weak_ref_arg(a: Any) -> Any:
+    """Hold break arg ``a`` without pinning its graph-pool blocks.
+
+    A CUDA tensor becomes a :func:`weak_ref_tensor` view. A frozen dataclass
+    whose fields all hold a tensor or ``None`` (MLA's ``MLAPrologueOutput``)
+    becomes a copy with each tensor field so viewed; the copy is built field by
+    field, without running the class's ``__init__``, since this happens during
+    capture. Anything else is returned as is, so tuples, lists and other
+    dataclasses keep holding their tensors.
+    """
+    if (
+        dataclasses.is_dataclass(a)
+        and not isinstance(a, type)
+        and a.__dataclass_params__.frozen
+    ):
+        values = {f.name: getattr(a, f.name) for f in dataclasses.fields(a)}
+        if all(v is None or isinstance(v, torch.Tensor) for v in values.values()):
+            held = object.__new__(type(a))
+            for name, v in values.items():
+                object.__setattr__(held, name, weak_ref_tensor(v))
+            return held
+    return weak_ref_tensor(a)
 
 
 class BreakableCapture:
@@ -197,11 +224,19 @@ class BreakableCapture:
             stream = BreakableCapture._default_capture_stream
         self._stream = stream
         self._stream_ctx: Any | None = None
+        # Kernel state the segments' launches need zeroed; it lives as long as
+        # this capture, which holds the segments.
+        self._capture_session: AbstractContextManager[None] | None = None
         # Break-output handoff buffers keyed by (shape, dtype, device); see break_point.
         self._handoff: dict[HandoffKey, torch.Tensor] = {}
         self._handoff_storage: dict[HandoffSlot, torch.Tensor] = (
             {} if handoff_storage is None else handoff_storage
         )
+
+    @property
+    def stream(self) -> torch.cuda.Stream:
+        """The stream used for warmup and capture."""
+        return self._stream
 
     @classmethod
     def current(cls) -> BreakableCapture | None:
@@ -224,6 +259,8 @@ class BreakableCapture:
         self._stream_ctx = torch.cuda.stream(self._stream)
         self._stream_ctx.__enter__()
         BreakableCapture._active = self
+        self._capture_session = capture_session(self)
+        self._capture_session.__enter__()
         self._begin_segment()
         return self
 
@@ -231,6 +268,9 @@ class BreakableCapture:
         try:
             self._end_segment()
         finally:
+            if self._capture_session is not None:
+                self._capture_session.__exit__(*exc)
+                self._capture_session = None
             BreakableCapture._active = None
             if self._stream_ctx is not None:
                 self._stream_ctx.__exit__(*exc)
@@ -319,10 +359,14 @@ def _record_break(
     """Record ``fn(*args, **kwargs)`` as an eager break on ``cap`` (the one closure
     builder shared by :func:`break_here` and :func:`break_point`).
 
-    Args/kwargs are bound once at capture time, with two live exceptions: (1) tensor
-    args alias persistent storage (the static input buffers / pool-pinned segment
-    intermediates), so they carry live values at replay -- ``weak_ref_tensor`` is
-    the (currently identity) hook to avoid pinning their pool slots; (2) the
+    Args/kwargs are bound once at capture time, with two live exceptions: (1) CUDA
+    tensor args, bare or as the fields of a frozen dataclass of tensors, carry live
+    values at replay because their addresses are stable: storage owned elsewhere
+    (the static input buffers, weights) or graph-pool intermediates the captured
+    segment rewrites before the break on every replay. The closure holds them as
+    non-owning views (:func:`_weak_ref_arg`), so later segments and later captures
+    sharing the pool reuse their blocks; ``fn`` must finish reading them before it
+    returns and keep none of them. (2) The
     per-forward ``ForwardContext`` is rebound by identity to the live ambient
     context each replay (see :func:`active_forward`), so ``fn`` may read live
     ``ctx`` fields exactly like the eager path. **Other (loose) non-tensor scalars
@@ -334,10 +378,15 @@ def _record_break(
     reused verbatim on every replay, where the (possibly shorter, see
     :func:`_land_in`) live result is copied into it.
     """
-    weak_args = tuple(weak_ref_tensor(a) for a in args)
-    weak_kwargs = {k: weak_ref_tensor(v) for k, v in kwargs.items()}
-    # Capture-time ambient ctx (the dummy batch's), rebound live at replay.
+    # Capture-time ambient ctx (the dummy batch's), rebound live at replay; it
+    # is kept as is so the identity check below still finds it.
     captured_ctx = current_forward_ctx()
+
+    def hold(a: Any) -> Any:
+        return a if a is captured_ctx else _weak_ref_arg(a)
+
+    weak_args = tuple(hold(a) for a in args)
+    weak_kwargs = {k: hold(v) for k, v in kwargs.items()}
     state: dict[str, torch.Tensor] = {}
 
     def replay_fn() -> torch.Tensor:
@@ -441,6 +490,10 @@ def break_point(method: Callable | None = None) -> Callable:
     Inside the method ``ctx`` is live (rebound by identity at replay), so write the
     body exactly like the eager path. Loose non-tensor scalar args are frozen to
     their capture-time value -- route per-request quantities through ``ctx`` / metadata.
+    Tensor args, bare or as the fields of a frozen dataclass of tensors (e.g.
+    ``MLAPrologueOutput``), are held without owning their memory (see
+    :func:`_record_break`): finish reading them before the method returns and keep
+    none of them for a later break.
     The decorator never skips the method: 0-row / idle batches remain each decorated
     model method's own explicit guard, on the eager path and under capture alike.
     """

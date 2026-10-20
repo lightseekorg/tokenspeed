@@ -62,7 +62,7 @@ def derive_state_groups_by_layer(
     state_layer_ids: Iterable[int],
     state_field_suffixes: Iterable[str],
 ) -> dict[int, str]:
-    """Map each recurrent layer to the state-family group holding its fields.
+    """Map each recurrent layer to the state group holding its fields.
 
     The memory plan is the single record of which group a layer's fields were
     declared in, so the mapping is read back from the planned fields rather
@@ -77,14 +77,14 @@ def derive_state_groups_by_layer(
             recurrent state.
 
     Returns:
-        View-local layer id -> state-family group id, one entry per state
+        View-local layer id -> state group id, one entry per state
         layer whose fields the plan declares inside this view's window.
 
     Raises:
         ValueError: a state layer's fields span more than one state group.
     """
     state_groups = {
-        spec.group_id for spec in arena.cache_group_specs if spec.family == "state"
+        spec.group_id for spec in arena.cache_group_specs if spec.attn_kind == "state"
     }
     wanted = set(state_layer_ids)
     wanted_suffixes = set(state_field_suffixes)
@@ -114,7 +114,7 @@ def derive_history_groups_by_layer(
     num_layers: int,
     kv_planes: Iterable[str],
 ) -> dict[int, str]:
-    """Map each attention layer to the history-family group holding its KV.
+    """Map each attention layer to the history group holding its KV.
 
     The counterpart of :func:`derive_state_groups_by_layer` for the paged
     side: read back from the planned fields, restricted to the planes this
@@ -130,7 +130,7 @@ def derive_history_groups_by_layer(
             ``latent_kv``).
 
     Returns:
-        View-local layer id -> history-family group id, one entry per layer
+        View-local layer id -> history group id, one entry per layer
         whose KV planes the plan declares inside this view's window.
 
     Raises:
@@ -139,7 +139,7 @@ def derive_history_groups_by_layer(
     history = {
         str(spec.group_id)
         for spec in arena.cache_group_specs
-        if spec.family == "history"
+        if spec.attn_kind != "state"
     }
     wanted_planes = set(kv_planes)
     mapping: dict[int, str] = {}
@@ -162,7 +162,7 @@ def derive_history_groups_by_layer(
 def derive_paged_group_ids(
     arena: CacheArena, *, first_layer: int, num_layers: int
 ) -> tuple[str, ...]:
-    """The history-family cache groups this view's layers deposit KV in.
+    """The history cache groups this view's layers deposit KV in.
 
     Read back from the planned fields like the state mapping above: a
     group counts when some per-layer field inside the view's layer window
@@ -181,7 +181,7 @@ def derive_paged_group_ids(
     history = {
         str(spec.group_id)
         for spec in arena.cache_group_specs
-        if spec.family == "history"
+        if spec.attn_kind != "state"
     }
     found: set[str] = set()
     for field in arena.plan.fields:
@@ -220,6 +220,7 @@ class CachePool(ABC):
         self.arena = arena
         self.dtype = dtype
         self.rank = rank
+        self.layer_fields: dict[tuple[int, str], str] = {}
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
             #  Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
@@ -237,7 +238,7 @@ class CachePool(ABC):
 
     @property
     def paged_group_ids(self) -> tuple[str, ...]:
-        """History-family groups this view's layers write KV into (sorted);
+        """History groups this view's layers write KV into (sorted);
         the router builds one paged leaf per id."""
         return derive_paged_group_ids(
             self.arena,
@@ -246,7 +247,7 @@ class CachePool(ABC):
         )
 
     def history_group_by_layer(self) -> dict[int, str]:
-        """View-local layer id -> the history-family group its KV planes
+        """View-local layer id -> the history group its KV planes
         ride; what ``bind_cache_groups`` stamps onto the model's
         ``PagedAttention`` layers."""
         return derive_history_groups_by_layer(
@@ -301,6 +302,7 @@ class CachePool(ABC):
         this view's layer window, and file each under the attribute its
         kernels read.
         """
+        self.layer_fields.clear()
         lists = {
             attribute: [None] * self.layer_num
             for attribute in self.layer_plane_bindings.values()
@@ -312,10 +314,11 @@ class CachePool(ABC):
             if located is None:
                 continue
             layer_id, plane = located
+            self.layer_fields[(layer_id, plane)] = field.field_id
             attribute = self.layer_plane_bindings.get(plane)
             if attribute is None:
                 continue
-            lists[attribute][layer_id] = self.arena.field(field.field_id)
+            lists[attribute][layer_id] = self.arena.compute_field(field.field_id)
         for attribute, values in lists.items():
             setattr(self, attribute, values)
 
@@ -342,6 +345,9 @@ class CachePool(ABC):
 
     def _build_cache_transfer_layout(self, field_ids, consumers):
         from tokenspeed.runtime.cache.transfer.layout import layout_from_lcm_plan
+
+        if isinstance(self.arena, CacheArena) and self.arena.offload is not None:
+            raise ValueError("KV offloading does not support L2 or snapshot transfers")
 
         local_group_ids = {
             field.group_id
@@ -399,7 +405,7 @@ class CachePool(ABC):
         self, layer_id: int, slots: torch.Tensor, write_mask: torch.Tensor | None
     ) -> HeadKVCache | LatentKVCache:
         """Where the attention prologue writes this layer's rows at ``slots``;
-        ``write_mask`` skips the rows another DCP rank owns."""
+        ``write_mask`` skips the rows another KVP rank owns."""
         raise NotImplementedError(
             f"{type(self).__name__} serves no attention prologue writes"
         )

@@ -21,6 +21,7 @@
 """CPU-only checks of the installed EvalScope 1.11.1 report contract."""
 
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -31,6 +32,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 @pytest.fixture

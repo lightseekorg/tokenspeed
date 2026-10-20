@@ -55,33 +55,28 @@ from tokenspeed.runtime.pd.cache_protocol import (
 
 def _group_spec(
     group_id: str,
-    family: str,
+    attn_kind: str,
     policy: str,
     *,
     prefix_granularity: int = 4,
-    retention: str = "full_history",
     sliding_window_tokens: int | None = None,
     shard_count: int = 1,
 ) -> CacheGroupSpec:
-    # A state group is one checkpoint per block; a history group is rows.
-    if family == "state":
+    # A state group is one state per block; a history group is rows.
+    if attn_kind == "state":
         return CacheGroupSpec(
             group_id=group_id,
-            retention=retention,
-            sliding_window_tokens=sliding_window_tokens,
-            family=family,
+            attn_kind=attn_kind,
             transfer_policy=policy,
-            checkpoint_granularity=prefix_granularity,
             replayable=False,
             shard_count=shard_count,
         )
     return CacheGroupSpec(
         group_id=group_id,
-        retention=retention,
+        attn_kind=attn_kind,
         rows_per_page=prefix_granularity,
         entry_stride_tokens=1,
         sliding_window_tokens=sliding_window_tokens,
-        family=family,
         transfer_policy=policy,
         replayable=False,
         shard_count=shard_count,
@@ -151,7 +146,7 @@ def _contract(
 
 def _layout(capacity: int = 64) -> CacheTransferContract:
     specs = (
-        _group_spec("attention", "history", "full_suffix"),
+        _group_spec("attention", "full_history", "full_suffix"),
         _group_spec("linear-a", "state", "latest_snapshot"),
         _group_spec("linear-b", "state", "latest_snapshot"),
     )
@@ -164,12 +159,29 @@ def _layout(capacity: int = 64) -> CacheTransferContract:
 
 
 def _op(page_offset: int = 0) -> SimpleNamespace:
+    # State rows are two slots (input checkpoint, live), padded to the batch's
+    # column count like every group's rows.
     tables = {
         "attention": np.array([[1, 2, 3, 4, -1]], dtype=np.int32) + page_offset,
-        "linear-a": np.array([[11, 12, 13, 14, -1]], dtype=np.int32) + page_offset,
-        "linear-b": np.array([[21, 22, 23, 24, -1]], dtype=np.int32) + page_offset,
+        "linear-a": np.array([[0, 14, -1, -1, -1]], dtype=np.int32),
+        "linear-b": np.array([[0, 24, -1, -1, -1]], dtype=np.int32),
     }
+    for group_id in ("linear-a", "linear-b"):
+        tables[group_id][0, 1] += page_offset
     return SimpleNamespace(block_tables_arrays=lambda: tables)
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_transfer_contract_rejects_group_mismatch_with_field_addresses(missing):
+    contract = _layout()
+    specs = contract.group_specs
+    specs = specs[:-1] if missing else (*specs, replace(specs[0], group_id="extra"))
+    with pytest.raises(CacheContractError, match="group IDs disagree"):
+        replace(
+            contract,
+            group_specs=specs,
+            field_addresses={field.field_id: 1024 for field in contract.plan.fields},
+        )
 
 
 def test_recipe_layer_owns_transfer_schema_api() -> None:
@@ -197,13 +209,14 @@ def test_cache_protocol_compatibility_reexports_recipe_compiler() -> None:
     assert compatibility_build_cache_transfer_schema is build_cache_transfer_schema
 
 
-def test_manifest_selects_history_suffix_and_only_final_state_slot() -> None:
+def test_manifest_selects_history_suffix_and_the_live_state_slot() -> None:
     manifest = build_cache_block_manifest(
         _op(),
         layout=_layout(),
         request_row=0,
         prefix_len=4,
         prompt_len=14,
+        state_prefix_cached=False,
     )
 
     assert manifest.groups[0] == CachePDGroupBlocks("attention", (2, 3, 4))
@@ -211,6 +224,79 @@ def test_manifest_selects_history_suffix_and_only_final_state_slot() -> None:
         CachePDGroupBlocks("linear-a", (14,)),
         CachePDGroupBlocks("linear-b", (24,)),
     )
+    assert manifest.state_prefix_cached is False
+
+
+def test_unaligned_prefix_includes_the_block_holding_it() -> None:
+    # A prefix hit ending inside block 1 (tokens 4..7): the Prefill's private,
+    # fully valid copy of that block travels with the suffix.
+    manifest = build_cache_block_manifest(
+        _op(),
+        layout=_layout(),
+        request_row=0,
+        prefix_len=5,
+        prompt_len=14,
+        state_prefix_cached=False,
+    )
+    assert manifest.groups[0] == CachePDGroupBlocks("attention", (2, 3, 4))
+    validate_cache_manifest(manifest, layout=_layout(), peer="source")
+    manifest = build_cache_block_manifest(
+        _op(),
+        layout=_layout(),
+        request_row=0,
+        prefix_len=9,
+        prompt_len=14,
+        state_prefix_cached=False,
+    )
+    assert manifest.groups[0] == CachePDGroupBlocks("attention", (3, 4))
+
+
+def test_cached_state_prefix_omits_every_latest_snapshot_group() -> None:
+    manifest = build_cache_block_manifest(
+        _op(),
+        layout=_layout(),
+        request_row=0,
+        prefix_len=4,
+        prompt_len=14,
+        state_prefix_cached=True,
+    )
+    assert manifest.groups[0] == CachePDGroupBlocks("attention", (2, 3, 4))
+    assert manifest.groups[1:] == (
+        CachePDGroupBlocks("linear-a", ()),
+        CachePDGroupBlocks("linear-b", ()),
+    )
+    validate_cache_manifest(manifest, layout=_layout(), peer="destination")
+    # The flag is part of the manifest: a peer that disagrees fails validation.
+    with pytest.raises(CacheContractError, match="block count"):
+        validate_cache_manifest(
+            replace(manifest, state_prefix_cached=False),
+            layout=_layout(),
+            peer="destination",
+        )
+    assert CachePDBlockManifest.from_wire_bytes(manifest.to_wire_bytes()) == manifest
+    # A prefix outside [0, prompt_len) is refused before it indexes any slot:
+    # a negative one would wrap the slot arithmetic silently.
+    for prefix_len in (-1, 14, 15):
+        with pytest.raises(CacheContractError, match="0 <= prefix_len < prompt_len"):
+            validate_cache_manifest(
+                replace(manifest, prefix_len=prefix_len),
+                layout=_layout(),
+                peer="destination",
+            )
+    selection = build_cache_layerwise_block_selection(
+        _op(),
+        layout=_layout(),
+        request_row=0,
+        prefix_len=4,
+        prompt_len=14,
+        chunk_start=4,
+        chunk_end=14,
+        state_prefix_cached=True,
+    )
+    assert selection.groups[0].source_block_ids == (2, 3, 4)
+    for group in selection.groups[1:]:
+        assert group.source_block_ids == ()
+        assert group.destination_positions == ()
 
 
 def test_contract_serializes_recipe_specs_without_a_pd_group_projection() -> None:
@@ -232,6 +318,7 @@ def test_source_and_destination_block_ids_are_independent() -> None:
         request_row=0,
         prefix_len=4,
         prompt_len=14,
+        state_prefix_cached=False,
     )
     destination = build_cache_block_manifest(
         _op(40),
@@ -239,6 +326,7 @@ def test_source_and_destination_block_ids_are_independent() -> None:
         request_row=0,
         prefix_len=4,
         prompt_len=14,
+        state_prefix_cached=False,
     )
 
     validate_cache_peer_layout(source_layout, destination_layout)
@@ -250,7 +338,7 @@ def test_manifest_rejects_null_padding_and_out_of_capacity_block(
     bad_block: int,
 ) -> None:
     operation = _op()
-    operation.block_tables_arrays()["linear-a"][0, 3] = bad_block
+    operation.block_tables_arrays()["linear-a"][0, 1] = bad_block
     with pytest.raises(CacheContractError, match="invalid block ID"):
         build_cache_block_manifest(
             operation,
@@ -258,19 +346,11 @@ def test_manifest_rejects_null_padding_and_out_of_capacity_block(
             request_row=0,
             prefix_len=4,
             prompt_len=14,
+            state_prefix_cached=False,
         )
 
 
 def test_manifest_accepts_reordered_mapping_but_rejects_wrong_keys() -> None:
-    with pytest.raises(CacheContractError, match="prefix_granularity"):
-        build_cache_block_manifest(
-            _op(),
-            layout=_layout(),
-            request_row=0,
-            prefix_len=3,
-            prompt_len=14,
-        )
-
     reordered = _op()
     tables = reordered.block_tables_arrays()
     reordered.block_tables_arrays = lambda: {
@@ -284,6 +364,7 @@ def test_manifest_accepts_reordered_mapping_but_rejects_wrong_keys() -> None:
         request_row=0,
         prefix_len=4,
         prompt_len=14,
+        state_prefix_cached=False,
     )
     assert tuple(group.group_id for group in manifest.groups) == (
         "attention",
@@ -303,12 +384,17 @@ def test_manifest_accepts_reordered_mapping_but_rejects_wrong_keys() -> None:
                 request_row=0,
                 prefix_len=4,
                 prompt_len=14,
+                state_prefix_cached=False,
             )
 
 
 def _sharded_layout(shard_count: int, capacity: int = 64) -> CacheTransferContract:
     return _contract(
-        (_group_spec("attention", "history", "full_suffix", shard_count=shard_count),),
+        (
+            _group_spec(
+                "attention", "full_history", "full_suffix", shard_count=shard_count
+            ),
+        ),
         (_field("attention", "attention.k"),),
         capacity=capacity,
     )
@@ -327,7 +413,12 @@ def test_sharded_manifest_is_bounded_by_the_virtual_block_count() -> None:
 
     # Remote-owner IDs above the physical page count are valid scheduler IDs.
     manifest = build_cache_block_manifest(
-        op(252), layout=layout, request_row=0, prefix_len=4, prompt_len=14
+        op(252),
+        layout=layout,
+        request_row=0,
+        prefix_len=4,
+        prompt_len=14,
+        state_prefix_cached=False,
     )
     assert manifest.groups[0].block_ids == (100, 200, 252)
     validate_cache_manifest(manifest, layout=layout, peer="source")
@@ -339,13 +430,19 @@ def test_sharded_manifest_is_bounded_by_the_virtual_block_count() -> None:
         prompt_len=14,
         chunk_start=4,
         chunk_end=14,
+        state_prefix_cached=False,
     )
     assert selection.groups[0].source_block_ids == (100, 200, 252)
 
     # The virtual bound is exclusive; the physical bound alone would reject 100.
     with pytest.raises(CacheContractError, match="invalid block ID"):
         build_cache_block_manifest(
-            op(253), layout=layout, request_row=0, prefix_len=4, prompt_len=14
+            op(253),
+            layout=layout,
+            request_row=0,
+            prefix_len=4,
+            prompt_len=14,
+            state_prefix_cached=False,
         )
     with pytest.raises(CacheContractError, match="out-of-bounds"):
         validate_cache_manifest(
@@ -372,6 +469,7 @@ def test_contract_and_manifest_wire_round_trip_has_no_version_field() -> None:
         request_row=0,
         prefix_len=4,
         prompt_len=14,
+        state_prefix_cached=False,
     )
     layout_wire = layout.to_wire_bytes()
     manifest_wire = manifest.to_wire_bytes()
@@ -388,13 +486,14 @@ def test_contract_and_manifest_wire_round_trip_has_no_version_field() -> None:
     manifest_payload = json.loads(manifest_wire)
     assert "version" not in manifest_payload
     assert manifest_payload["groups"][0]["block_ids"] == [2, 3, 4]
+    assert manifest_payload["state_prefix_cached"] is False
     assert "page_ids" not in manifest_payload["groups"][0]
     assert CacheTransferContract.from_wire_bytes(layout_wire) == layout
     assert CachePDBlockManifest.from_wire_bytes(manifest_wire) == manifest
 
 
 def test_lcm_group_capacity_uses_its_cache_blocks_per_parent() -> None:
-    spec = _group_spec("history", "history", "full_suffix")
+    spec = _group_spec("history", "full_history", "full_suffix")
     # Null parent plus three usable parents, each packing two child pages.
     layout = _contract(
         (spec,),
@@ -420,6 +519,7 @@ def test_lcm_group_capacity_uses_its_cache_blocks_per_parent() -> None:
         request_row=0,
         prefix_len=0,
         prompt_len=8,
+        state_prefix_cached=False,
     )
     tables["history"][0, 1] = 7
     with pytest.raises(CacheContractError, match="invalid block ID"):
@@ -429,6 +529,7 @@ def test_lcm_group_capacity_uses_its_cache_blocks_per_parent() -> None:
             request_row=0,
             prefix_len=0,
             prompt_len=8,
+            state_prefix_cached=False,
         )
 
 
@@ -436,7 +537,7 @@ def test_destination_manifest_uses_peer_local_group_packing() -> None:
     def layout(*, packing: int, physical_page_bytes: int) -> CacheTransferContract:
         spec = _group_spec(
             "history",
-            "history",
+            "full_history",
             "full_suffix",
             prefix_granularity=2,
         )
@@ -463,11 +564,13 @@ def test_destination_manifest_uses_peer_local_group_packing() -> None:
         groups=(CachePDGroupBlocks("history", (3,)),),
         prefix_len=0,
         prompt_len=2,
+        state_prefix_cached=False,
     )
     destination = CachePDBlockManifest(
         groups=(CachePDGroupBlocks("history", (6,)),),
         prefix_len=0,
         prompt_len=2,
+        state_prefix_cached=False,
     )
 
     validate_cache_peer_layout(source_layout, destination_layout)
@@ -485,15 +588,14 @@ def test_destination_manifest_uses_peer_local_group_packing() -> None:
         )
 
 
-def test_logical_slots_accepts_block_granularity() -> None:
-    assert _logical_slots(
-        "full_suffix",
-        prefix_len=4,
-        prompt_len=14,
-        block_granularity=4,
-        retention="full_history",
-        sliding_window_tokens=None,
-    ) == (1, 2, 3)
+def test_logical_slots_follow_the_group_spec() -> None:
+    history = _group_spec("attention", "full_history", "full_suffix")
+    state = _group_spec("linear", "state", "latest_snapshot")
+    assert _logical_slots(history, 4, 14, state_prefix_cached=False) == (1, 2, 3)
+    assert _logical_slots(history, 5, 14, state_prefix_cached=False) == (1, 2, 3)
+    assert _logical_slots(history, 5, 14, state_prefix_cached=True) == (1, 2, 3)
+    assert _logical_slots(state, 5, 14, state_prefix_cached=False) == (1,)
+    assert _logical_slots(state, 5, 14, state_prefix_cached=True) == ()
 
 
 def _cache_buffer(nbytes: int, data_ptr: int = 0x10000):
@@ -576,11 +678,10 @@ def _two_plane_lcm_plan(num_lcm_blocks: int) -> CacheMemoryPlan:
 _LCM_SPECS = (
     CacheGroupSpec(
         group_id="history",
-        retention="full_history",
+        attn_kind="full_history",
         rows_per_page=4,
         entry_stride_tokens=1,
         sliding_window_tokens=None,
-        family="history",
         transfer_policy="full_suffix",
         replayable=False,
     ),
@@ -756,7 +857,7 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
     assert layout.plan.prefix_granularity == 16
     assert len(layout.group_specs) == 1
     group = layout.group_specs[0]
-    assert (group.group_id, group.family) == ("full_attention", "history")
+    assert (group.group_id, group.attn_kind) == ("full_attention", "full_history")
     # Packing lives on the plan, not on the group spec.
     assert layout.plan.group("full_attention").cache_blocks_per_lcm_block == 1
 
@@ -794,7 +895,7 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
 
 
 def test_producer_schedule_groups_draft_fields_in_the_final_step() -> None:
-    spec = _group_spec("history", "history", "full_suffix")
+    spec = _group_spec("history", "full_history", "full_suffix")
     layout = _contract(
         (spec,),
         tuple(

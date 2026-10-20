@@ -1,4 +1,4 @@
-# Code Review Guidelines
+# Code review guidelines
 
 Read [AGENTS.md](AGENTS.md) and any local overrides first. Map changed files to
 the relevant TokenSpeed design documents below before reviewing.
@@ -16,7 +16,7 @@ Prefix **every inline comment** with one of these markers:
 For example:
 
 > 🔴 **Important**: The buffer is sized to the capture ladder rather than the
-> maximum decode batch. A larger eager batch will write past its capacity.
+> maximum decode batch. A larger eager batch writes past its capacity.
 
 Explain the triggering condition, observable impact, and a concrete correction.
 Verify findings against the surrounding code and callers; avoid speculative
@@ -46,8 +46,8 @@ pre-existing issues from regressions introduced by the PR.
 
 ## Domain references
 
-Treat the design documents as the source of truth. Deliberate deviations must
-be justified and documented in the same change.
+Treat the design documents as the source of truth. Justify and document
+deliberate deviations in the same change.
 
 | Changed area | Read |
 | ------------ | ---- |
@@ -76,18 +76,18 @@ the [Claude GitHub App](https://github.com/apps/claude) for this repository.
 The workflow uses the app's short-lived token for reviews and replies.
 
 As in the SMG workflow, provide `ANTHROPIC_API_KEY` through the runner pod's
-environment, typically from a Kubernetes Secret; the workflow passes it to the
+environment, typically from a Kubernetes Secret. The workflow passes it to the
 Claude action. Do not commit the key or print it in logs. The runner needs Git,
 `jq`, `curl`, `tar`, and network access to GitHub and the Anthropic API, plus the
 prerequisites for `anthropics/claude-code-action@v1`. The workflow installs the
 Linux AMD64 GitHub CLI (`gh`) if it is missing.
 
 Automatic reviews run for same-repository pull requests on `opened`,
-`synchronize` (new commits), and `reopened`, including drafts. Fork PRs and runs
-triggered by `dependabot[bot]` are skipped. PR events are also skipped when all
-changed paths match `*.md`, `docs/**`, or `*.lock`.
+`synchronize` (new commits), and `reopened`, including drafts. The workflow
+skips fork PRs and runs triggered by `dependabot[bot]`. It also skips PR
+events when all changed paths match `*.md`, `docs/**`, or `*.lock`.
 
 Mention `@claude` in a new issue/PR conversation comment or inline PR review
 comment to request a reply. Both jobs load the official `pr-review-toolkit`
-plugin. This CPU runner reviews source and CI evidence; GPU tests remain in
+plugin. This CPU runner reviews source and CI evidence. GPU tests remain in
 the repository's existing CI workflows.

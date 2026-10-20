@@ -24,6 +24,7 @@ import logging
 import os
 from collections import deque
 from collections.abc import Mapping
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -82,11 +83,11 @@ from tokenspeed.runtime.engine.io_struct import (
 )
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import (
-    RETRACTION_SAFE_STEPS,
     UNBOUNDED_CACHED_PREFIX_TOKENS,
     make_spec,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.types import MAX_STOP_TOKEN_IDS
 from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
 from tokenspeed.runtime.moe.expert_location import (
     EXPERT_LOAD_RECORD_SUFFIX,
@@ -121,6 +122,7 @@ _WEIGHT_OPS: tuple[tuple[type, type], ...] = (
     (DestroyWeightsUpdateGroupReqInput, DestroyWeightsUpdateGroupReqOutput),
     (UpdateWeightsFromMooncakeReqInput, UpdateWeightsFromMooncakeReqOutput),
     (RebalanceExpertsReqInput, RebalanceExpertsReqOutput),
+    (UpdateWeightFromDiskReqInput, UpdateWeightFromDiskReqOutput),
 )
 _WEIGHT_OP_CODES: dict[type, int] = {
     req_type: code for code, (req_type, _) in enumerate(_WEIGHT_OPS, start=1)
@@ -131,6 +133,7 @@ _WEIGHT_OP_OUTPUTS: dict[type, type] = dict(_WEIGHT_OPS)
 _WEIGHT_LOAD_OPS = (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromMooncakeReqInput,
+    UpdateWeightFromDiskReqInput,
 )
 # Internal control ops: the online expert rebalance's steps, enqueued by the
 # engine itself at rank-identical rounds (``enqueue_internal_op``) and
@@ -183,6 +186,18 @@ def _profile_rank_tag(attn_mapping) -> str:
         parts.append(f"DP{attn_mapping.dp_rank}")
     parts.append(f"TP{attn_mapping.tp_rank}")
     return "-".join(parts)
+
+
+def _all_thread_profile_config():
+    # The process-global flag also covers workers created before profiling.
+    if not isinstance(
+        getattr(torch.autograd.profiler, "_is_profiler_enabled", None), bool
+    ):
+        raise RuntimeError("missing process-global profiler state")
+    try:
+        return torch.profiler._ExperimentalConfig(profile_all_threads=True)
+    except (AttributeError, TypeError) as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 class RequestHandler:
@@ -259,7 +274,7 @@ class RequestHandler:
         # Flush MIN includes attention DP after TP/PP: object keys omit
         # DP rank, so DP replicas share the Mooncake namespace. Exists,
         # prefetch, and WriteBackDone stay TP/PP only (EventLoop /
-        # L2CacheHooks); those ranks hold different sequences.
+        # CacheOpHooks); those ranks hold different sequences.
         self.attn_dp_size = mapping.attn.dp_size
         self.attn_dp_cpu_group = (
             pg_manager.get_process_group("gloo", mapping.attn.dp_group)
@@ -302,15 +317,6 @@ class RequestHandler:
 
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
-        # Head TP over attention-DP ranks serves decode rows only, so that
-        # engine cannot run the local recovery prefill a capacity retraction
-        # would need; it admits only requests the scheduler never retracts
-        # (generation budget within one safe-step window,
-        # docs/design/scheduler.md section 4). Head TP over the query shards
-        # of a prefill engine serves its extend rows and keeps no budget.
-        self.max_new_tokens_budget: int | None = (
-            RETRACTION_SAFE_STEPS if mapping.attn.head_tp_serves_decode_only else None
-        )
         # LM-head TP under attention DP exchanges the logits rows with the
         # group once per forward (LogitsProcessor._lm_head_tp_row_counts); the
         # prompt-logprob chunk loop would run that exchange a per-rank number
@@ -338,8 +344,12 @@ class RequestHandler:
             [(ProfileReq, self.profile)]
         )
 
+        # The grammar ends on the ids the engine stops on.
         self.grammar_manager = GrammarManager(
-            self.server_args, self.tokenizer, self.vocab_size
+            self.server_args,
+            self.tokenizer,
+            self.vocab_size,
+            stop_token_ids=self.hf_eos_token_id,
         )
 
         self.init_profiler()
@@ -431,7 +441,14 @@ class RequestHandler:
                 # rendezvous blocks this thread too.
                 self._pending_weight_ops.append(recv_req)
             elif isinstance(recv_req, _WEIGHT_LOAD_OPS):
-                ok, msg = self._require_weight_version_for_l3_flush(recv_req)
+                refusal = (
+                    self.memory_controller.refuse_weight_load()
+                    if self.memory_controller is not None
+                    else None
+                )
+                ok, msg = (False, refusal) if refusal is not None else (True, "")
+                if ok:
+                    ok, msg = self._require_weight_version_for_l3_flush(recv_req)
                 if ok:
                     ok, msg = self._require_flush_for_l3_version_switch(recv_req)
                 if not ok:
@@ -440,25 +457,16 @@ class RequestHandler:
                     )
                 else:
                     self._pending_weight_ops.append(recv_req)
-            # The in-engine RL control app refuses these two sources up front
+            # The in-engine RL control app refuses this source up front
             # (SUPPORTED_WEIGHT_UPDATE_SOURCES in io_struct, also advertised to
-            # gateways as rl.update_from); keep that set in step with the load
-            # branches above.
+            # gateways as rl.update_from); keep that set in step with
+            # _WEIGHT_LOAD_OPS.
             elif isinstance(recv_req, UpdateWeightsFromTensorReqInput):
                 self.send_func.send_pyobj(
                     UpdateWeightsFromTensorReqOutput(
                         success=False,
                         message="update_weights_from_tensor is not supported on "
                         "this engine",
-                    )
-                )
-            elif isinstance(recv_req, UpdateWeightFromDiskReqInput):
-                self.send_func.send_pyobj(
-                    UpdateWeightFromDiskReqOutput(
-                        success=False,
-                        message="update_weights_from_disk is not supported on "
-                        "this engine",
-                        num_paused_requests=0,
                     )
                 )
             else:
@@ -475,6 +483,11 @@ class RequestHandler:
     # ------------------------------------------------------------------
     # Internal control ops (online expert rebalance)
     # ------------------------------------------------------------------
+
+    @property
+    def has_pending_weight_ops(self) -> bool:
+        """Whether a queued frontend/internal op can still touch model memory."""
+        return bool(self._pending_weight_ops or self._pending_internal_ops)
 
     def set_internal_op_completer(self, completer: InternalOpCompleter) -> None:
         """Install the owner of the internal ops (once, at startup)."""
@@ -511,7 +524,7 @@ class RequestHandler:
         objects remain and can be restored for incompatible weights.
         """
 
-        storage_backend = getattr(self.server_args, "kvstore_storage_backend", None)
+        storage_backend = self.server_args.kvstore_storage_backend
         if (
             storage_backend is None
             or not recv_req.flush_cache
@@ -530,7 +543,7 @@ class RequestHandler:
         as if they belonged to the new weights.
         """
 
-        storage_backend = getattr(self.server_args, "kvstore_storage_backend", None)
+        storage_backend = self.server_args.kvstore_storage_backend
         if storage_backend is None or recv_req.flush_cache:
             return True, ""
         version = resolve_l3_weight_version(
@@ -669,10 +682,15 @@ class RequestHandler:
             )
             return
         if _weight_op_wants_flush(recv_req) and not flush_success:
+            # The scheduler refuses ClearCache while Host cache ops (write-backs,
+            # retraction image stores and restores) are in flight or a request
+            # is suspended with a retraction image, whose pinned Host entries
+            # the flush would invalidate under it.
             ok = False
             msg = (
-                "cache flush failed; retry the update after in-flight "
-                "Host writebacks drain"
+                "cache flush failed; retry the update after in-flight Host "
+                "cache ops drain and no request is suspended with a retraction "
+                "image (retracted or restoring)"
             )
         else:
             local_ok, msg = self._device.update_weights(recv_req)
@@ -765,7 +783,7 @@ class RequestHandler:
             self.server_args.weight_version,
             _requested_weight_version(recv_req),
             flush_cache=recv_req.flush_cache,
-            storage_backend=getattr(self.server_args, "kvstore_storage_backend", None),
+            storage_backend=self.server_args.kvstore_storage_backend,
         )
         if version is None:
             return True, msg
@@ -839,6 +857,7 @@ class RequestHandler:
             )
 
         self._refuse_unsupported_input_logprobs(req_state)
+        self._refuse_too_many_stop_token_ids(req_state)
         self._apply_generation_budget(req_spec, req_state)
         return (
             req_spec,
@@ -859,11 +878,28 @@ class RequestHandler:
                 "available with --lm-head-tp-size > 1 under attention DP"
             )
 
+    def _refuse_too_many_stop_token_ids(self, req_state) -> None:
+        """Finish a request with a client error when its stop tokens -- its
+        own ``stop_token_ids`` and the model's EOS ids -- do not fit the
+        device's per-request stop table (``MAX_STOP_TOKEN_IDS``)."""
+        if len(req_state.stop_token_ids) <= MAX_STOP_TOKEN_IDS:
+            return
+        model_ids = req_state.stop_token_ids - set(
+            req_state.sampling_params.stop_token_ids or ()
+        )
+        req_state.finished_reason = FINISH_ABORT(
+            f"Invalid request: {len(req_state.stop_token_ids)} stop token ids "
+            f"exceed the limit of {MAX_STOP_TOKEN_IDS}, which includes the "
+            f"model's {len(model_ids)} EOS ids; pass at most "
+            f"{MAX_STOP_TOKEN_IDS - len(model_ids)} other stop_token_ids",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
     def _apply_generation_budget(self, req_spec, req_state) -> None:
-        """Clamp ``max_new_tokens`` to the context; refuse what exceeds this
-        engine's per-request budget (``max_new_tokens_budget``), finishing the
-        request with an abort instead of admitting work the engine cannot
-        complete."""
+        """Clamp ``max_new_tokens`` to the context and declare it to the
+        scheduler, which sizes the request's admission reserve from it. No
+        layout caps it: a retracted request resumes by restore, never by a
+        recovery prefill, so a decode-only attention layout admits any budget."""
         req_state.sampling_params.max_new_tokens = min(
             (
                 req_state.sampling_params.max_new_tokens
@@ -873,15 +909,6 @@ class RequestHandler:
             self.max_req_len - len(req_state.prompt_input_ids) - 1,
         )
         req_spec.max_new_tokens = req_state.sampling_params.max_new_tokens
-        if (
-            self.max_new_tokens_budget is not None
-            and req_spec.max_new_tokens > self.max_new_tokens_budget
-        ):
-            req_state.finished_reason = FINISH_ABORT(
-                "Invalid request: this decode engine (--attn-head-tp-size) serves "
-                f"at most {self.max_new_tokens_budget} new tokens per request; "
-                f"got max_new_tokens={req_spec.max_new_tokens}"
-            )
 
     # ------------------------------------------------------------------
     # Profiling: torch / cuda / viztracer / mem-snapshot / proton, driven
@@ -981,6 +1008,15 @@ class RequestHandler:
                     "the server with --expert-distribution-recorder-mode stat.",
                 )
 
+        if {"CPU", "GPU"} & set(activities):
+            try:
+                _all_thread_profile_config()
+            except RuntimeError as exc:
+                return ProfileReqOutput(
+                    success=False,
+                    message=f"This PyTorch runtime cannot provide all-thread phase profiling: {exc}",
+                )
+
         self.profile_by_stage = profile_by_stage
         self.profiler_output_dir = output_dir
         self.torch_profiler_with_stack = with_stack
@@ -1028,10 +1064,18 @@ class RequestHandler:
         ]
 
         if torchprof_activities:
+            try:
+                experimental_config = _all_thread_profile_config()
+            except RuntimeError as exc:
+                return ProfileReqOutput(
+                    success=False,
+                    message=f"This PyTorch runtime cannot provide all-thread phase profiling: {exc}",
+                )
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,
                 record_shapes=record_shapes if record_shapes is not None else False,
+                experimental_config=experimental_config,
             )
             self.torch_profiler.start()
 
