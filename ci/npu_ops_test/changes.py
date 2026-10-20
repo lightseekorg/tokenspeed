@@ -27,6 +27,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from fnmatch import fnmatchcase
 from pathlib import Path
 
@@ -118,6 +119,7 @@ def select_suite(
         raise ValueError("Checkout HEAD does not match the event SHA")
     changed, matched = None, []
     comparison = None
+    revision = {"checkout_sha": checkout_sha, "checkout_ref": checkout_ref}
     if event_name == "workflow_dispatch":
         if not checkout_ref.startswith(("refs/heads/", "refs/tags/")):
             raise ValueError("Manual run requires a branch or tag ref")
@@ -135,8 +137,29 @@ def select_suite(
         for sha in (base, head):
             require_commit(repo, sha)
         parents = git(repo, "show", "-s", "--format=%P", checkout_sha).decode().split()
-        if parents != [base, head]:
-            raise ValueError("PR merge commit parents differ from event base/head")
+        revision.update(event_base=base, event_head=head, merge_parents=parents)
+        print(
+            f"NPU PR revision check: {json.dumps(revision)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if len(parents) != 2:
+            raise ValueError("PR merge commit must have exactly two parents")
+        if parents[1] != head:
+            raise ValueError("PR merge head differs from event head")
+        if parents[0] != base:
+            # GitHub can refresh the merge base after the event snapshot was made.
+            # Accept only forward base movement; the event head must still match.
+            try:
+                git(repo, "merge-base", "--is-ancestor", base, parents[0])
+            except subprocess.CalledProcessError as exc:
+                if exc.returncode != 1:
+                    raise
+                raise ValueError(
+                    "PR event base is not an ancestor of the merge first parent"
+                ) from exc
+        revision["base_relationship"] = "equal" if parents[0] == base else "advanced"
+        # Keep selection tied to the event snapshot, including when it is rerun.
         merge_base = git(repo, "merge-base", base, head).decode().strip()
         comparison = (validate_sha(merge_base), head)
     elif event_name == "push":
@@ -161,6 +184,7 @@ def select_suite(
     else:
         raise ValueError(f"Unsupported event: {event_name}")
     if comparison is not None:
+        print(f"NPU comparison: {json.dumps(comparison)}", file=sys.stderr, flush=True)
         # No rename detection: both the deleted and added paths are checked.
         raw = git(
             repo,
@@ -188,6 +212,8 @@ def select_suite(
         "changed_files": changed,
         "matched_files": len(matched),
         "matched_paths_sample": matched[:20],
+        "revision": revision,
+        "comparison": comparison,
     }
 
 

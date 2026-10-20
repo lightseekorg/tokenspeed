@@ -17,7 +17,7 @@ Unrelated label events use a separate group to avoid canceling an active test ru
 The GitHub-hosted `select` job fetches complete Git history and runs `ci/npu_ops_test/changes.py`:
 
 - Pushes compare the `before` and `after` commits. An all-zero `before` conservatively selects the full suite. With the current main-only trigger, this applies when creating main or invoking the selector independently.
-- PRs require the checkout to be the actual merge commit identified by `GITHUB_SHA`, with parents matching the event's base and head SHAs in that order. Selection compares `merge-base(base, head)..head`, excluding changes introduced only on base. Tests execute the merge SHA, not the head SHA.
+- PRs require the checkout to be the actual two-parent merge commit identified by `GITHUB_SHA`, with its second parent matching the event's head SHA. Its first parent must equal the event's base SHA or descend from it: GitHub can refresh the merge after the event's base snapshot. A changed head, unrelated base, or backward base movement fails selection. Selection still compares `merge-base(event base, event head)..event head`, excluding changes introduced only on base and preserving the event snapshot on reruns. Tests execute the merge SHA, not the head SHA. Logs include both event SHAs, the actual merge parents, and the comparison range.
 - Manual runs execute the full suite at the selected branch or tag's `GITHUB_SHA`.
 - Invalid SHAs, refs, missing Git objects, or comparison failures fail selection instead of silently skipping tests. Tag pushes and branch deletion do not start operator tests.
 
@@ -25,6 +25,7 @@ Path rules in `ci/npu_ops_test/manifest.json` cover the NPU package, the shared 
 Documentation changes ending in `.md` or `.rst` are excluded. Matching is case-sensitive and includes additions, modifications, deletions, and both sides of a rename, without a file-count limit.
 Any matching path selects every registered operator. Unrelated changes emit `should_run=false` and `reason=no-watched-changes`.
 The workflow has no top-level path filter, so unrelated changes still produce a selection result.
+The existing selection step prints an English scheduling decision and appends it to the Actions summary. It distinguishes unrelated changes, disabled hardware, draft PRs, and a request for a runner; multiple skip reasons can apply. A selected, enabled, non-draft run with a missing runner-name variable fails before entering the hardware queue. A request for a runner is not evidence of NPU execution.
 NVIDIA/AMD workflows, shared path filters, task pipelines, and cancellation/retry controllers are unchanged.
 NPU CI implementation and operator tests live under `ci/npu_ops_test/`; new operators do not require changes to GPU task lists under `test/**`.
 
@@ -90,7 +91,8 @@ From the repository home page, open **Settings > Secrets and variables > Actions
 | `TOKENSPEED_NPU_ARM_CI_ENABLED` | Set to `true` only after deployment requirements are met; leave unset to disable the hardware job |
 
 Assign the dedicated label to an online Linux ARM64 NPU runner running under the `ci-npu` service account.
-Once enabled, a missing or mismatched runner-name variable fails the step before checkout.
+Runner names, labels, and organization runner groups are separate settings. A name or group does not supply the `tokenspeed-npu-arm64` label automatically. Existing runners can retain their other labels when this dedicated label is added. For an organization runner, an administrator opens the organization home page, then **Settings > Actions > Runners**, selects the runner, and assigns the label in **Labels**. The group must also allow this repository, public repositories when applicable, and the workflow.
+A selected, enabled, non-draft run with a missing runner-name variable fails selection. A mismatched runner-name variable fails the hardware step before checkout.
 If no online runner has the required label, the job waits for scheduling and cannot execute runtime checks.
 The environment entry point is `/srv/tokenspeed-npu/cann9-torch29-py312-root/env.sh`, and the interpreter is `venv/bin/python` under the same directory.
 Working CANN, torch, torch_npu, and Triton Ascend dependencies and NPU device access for that account are required. Installing the runner alone is insufficient.
@@ -169,3 +171,4 @@ To invoke the common phase executor directly with a new output directory:
 
 Direct executor invocation does not include the workflow's host lock or deployment checks. Prefer the workflow entry point for acceptance and use an output directory that does not already exist.
 Final acceptance requires real Actions runs demonstrating success, unrelated-change skipping, accuracy failure with performance skipped, and agreement between Actions summaries and VM evidence.
+For CI fixes, create a candidate branch from the current upstream main and validate it in an explicitly configured fork before opening an upstream PR. Preserve fork-only history when preparing its integration baseline. Use controlled PRs targeting main for unrelated changes, watched changes, and an unmerged operator fault; use isolated Git fixtures to exercise base advancement and invalid revision identities. Manual dispatch can validate the candidate branch's hardware execution but does not replace PR-event validation. A rerun retains the original event SHA/ref and does not test a later patch. Record the candidate SHA, tested merge SHA, run/attempt, selection decision, and operator results for every acceptance case.

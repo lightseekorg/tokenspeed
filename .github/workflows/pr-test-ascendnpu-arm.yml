@@ -58,6 +58,10 @@ jobs:
       - name: Select operator tests
         id: changes
         shell: bash
+        env:
+          NPU_ARM_CI_ENABLED: ${{ vars.TOKENSPEED_NPU_ARM_CI_ENABLED }}
+          NPU_ARM_RUNNER_NAME: ${{ vars.TOKENSPEED_NPU_ARM_RUNNER_NAME }}
+          NPU_PR_IS_DRAFT: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == true }}
         run: |
           set -euo pipefail
           python3 -B ci/npu_ops_test/changes.py \
@@ -69,6 +73,52 @@ jobs:
             --checkout-ref "$GITHUB_REF" \
             --github-output "$GITHUB_OUTPUT" \
             | tee "$RUNNER_TEMP/npu-change-selection.json"
+          python3 -B - "$RUNNER_TEMP/npu-change-selection.json" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          selection = json.loads(Path(sys.argv[1]).read_text())
+          enabled = os.environ["NPU_ARM_CI_ENABLED"].lower() == "true"
+          draft = os.environ["NPU_PR_IS_DRAFT"] == "true"
+          runner_name_configured = bool(os.environ["NPU_ARM_RUNNER_NAME"].strip())
+          reasons = []
+          if not selection["should_run"]:
+              reasons.append(selection["reason"])
+          if not enabled:
+              reasons.append("hardware-disabled")
+          if draft:
+              reasons.append("draft-pr")
+          action = "skip" if reasons else "request-runner"
+          if action == "request-runner" and not runner_name_configured:
+              action = "fail"
+              reasons.append("missing-runner-name")
+          decision = {
+              "hardware_action": action,
+              "reasons": reasons,
+              "selection_reason": selection["reason"],
+              "should_run": selection["should_run"],
+              "hardware_enabled": enabled,
+              "draft_pr": draft,
+              "required_runner_label": "tokenspeed-npu-arm64",
+              "runner_name_configured": runner_name_configured,
+          }
+          print(json.dumps(decision, indent=2), flush=True)
+          summary = [
+              "### Ascend NPU ARM scheduling decision", "",
+              "| Field | Value |", "| --- | --- |",
+              *[f"| {key} | `{json.dumps(value)}` |" for key, value in decision.items()],
+              "",
+              "Requesting a runner does not mean the operators have run. "
+              "GitHub must find an available runner with the required label and repository access.",
+              "",
+          ]
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as output:
+              output.write("\n".join(summary))
+          if action == "fail":
+              raise SystemExit("Repository variable TOKENSPEED_NPU_ARM_RUNNER_NAME must be configured")
+          PY
 
   npu:
     name: Ascend NPU ARM operator tests
