@@ -110,6 +110,7 @@ from tokenspeed.runtime.moe.expert_rebalance import ExpertRebalanceSpecs, SlotMo
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.host_sync import allow_host_sync
+from tokenspeed.runtime.utils.server_args import AUX_CAPTURE_SPEC_ALGORITHMS
 from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 logger = get_colorful_logger(__name__)
@@ -606,7 +607,7 @@ class DeviceHandle:
                     stop_criteria=planned.stop_criteria,
                 )
 
-        return PendingExecution(self._thread.submit(_forward))
+        return PendingExecution(self._thread.submit_forward(_forward))
 
     def poll_cache_results(self) -> list:
         """Collect completed Host cache ops (both tiers); never blocks.
@@ -1691,7 +1692,7 @@ def build_device_side(
         )
         attn_tp_size = int(server_args.mapping.attn.tp_size)
         eagle3_layers_to_capture: list[int] = []
-        if server_args.speculative_algorithm == "EAGLE3":
+        if server_args.speculative_algorithm in AUX_CAPTURE_SPEC_ALGORITHMS:
             configured_layers = server_args.eagle3_layers_to_capture
             if configured_layers:
                 eagle3_layers_to_capture = [int(layer) for layer in configured_layers]

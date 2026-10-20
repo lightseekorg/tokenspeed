@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
-    from tokenspeed.runtime.execution.tree_spec import TreeSpec
+    from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -217,6 +217,10 @@ class Eagle(BaseDrafter):
         self.draft_tree = DraftTree(
             max_bs, config.topk, config.num_steps, config.num_nodes, self.device
         )
+        self._bind_tree_lanes(config, max_bs)
+
+    def _bind_tree_lanes(self, config: TreeSpecConfig, max_bs: int) -> None:
+        """Bind the top-K draft lanes, as every tree drafter does."""
         self.tree_lanes = TreeDraftInputs(
             topk=config.topk,
             num_steps=config.num_steps,
@@ -648,16 +652,10 @@ class Eagle(BaseDrafter):
     # Public entry point (type-based dispatch from ModelExecutor)
     # ------------------------------------------------------------------
 
-    @override
-    def draft(
-        self,
-        draft_input: EagleDraftInput,
+    def _last_verified_window(
+        self, bs: int, draft_input: EagleDraftInput
     ) -> torch.Tensor:
-
-        bs = draft_input.accept_lengths.shape[0]
-
-        # Layout: column 0 holds the last verified id (the base model's accepted token);
-        # columns 1..spec_num_steps hold the drafter's speculative tokens.
+        """The next verify window, every column the request's last verified id."""
         next_tokens = torch.empty(
             (bs, self.spec_num_tokens),
             dtype=torch.int32,
@@ -684,6 +682,19 @@ class Eagle(BaseDrafter):
             )
         if self.spec_num_tokens > 1:
             next_tokens[:, 1:] = next_tokens[:, :1]
+        return next_tokens
+
+    @override
+    def draft(
+        self,
+        draft_input: EagleDraftInput,
+    ) -> torch.Tensor:
+
+        bs = draft_input.accept_lengths.shape[0]
+
+        # Layout: column 0 holds the last verified id (the base model's accepted token);
+        # columns 1..spec_num_steps hold the drafter's speculative tokens.
+        next_tokens = self._last_verified_window(bs, draft_input)
 
         # The runner refreshed the draft decode metadata over the target's
         # post-verify lengths (vc + N). Step 0 narrows to the live rows, whose

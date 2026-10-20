@@ -683,7 +683,9 @@ def test_drafter_future_inputs_keep_original_request_rows():
         capturable_grammar=None,
         dspark_context_producer=None,
         drafter=SimpleNamespace(
-            prepare_target_forward=lambda ctx: None, run=lambda **kwargs: draft_tokens
+            prepare_target_forward=lambda ctx: None,
+            rewrite_verify_outputs=lambda ctx, output_tokens, accept_lengths: None,
+            run=lambda **kwargs: draft_tokens,
         ),
         config=SimpleNamespace(pp_size=1),
         nan_guard=NanGuard(4, "cpu"),
@@ -952,6 +954,7 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         extend_replay_lens_cpu=empty,
         extend_prompt_lens_cpu=empty,
         block_tables_cpu={},
+        settle=lambda: None,
     )
     assert observed == [(padded_bs, ForwardOutputLayout(0, 0, padded_bs, width))]
     assert ctx.bs == live_bs

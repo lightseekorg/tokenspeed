@@ -271,6 +271,9 @@ class Envs:
     TOKENSPEED_CUPTI_GRAPH_WARMUP = EnvBool(False)
     TOKENSPEED_TEST_REQUEST_TIME_STATS = EnvBool(False)
     TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
+    # Log the EAGLE-Harness round counts per batch size bucket and verify
+    # width on rank 0 every N rounds (0: off; see eagle_harness/round_stats.py).
+    TOKENSPEED_EAGLE_HARNESS_ROUND_STATS = EnvInt(0)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
     # torch.cuda sync-debug mode armed once serving starts (after capture and
     # tuning, which synchronize legitimately): "warn" reports every host

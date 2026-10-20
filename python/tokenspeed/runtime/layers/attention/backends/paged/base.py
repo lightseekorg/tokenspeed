@@ -190,15 +190,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         """The drafting lanes' cascade while a lane forward runs, else None."""
         if not self.tree_lane_step_active:
             return None
-        lanes = self.tree_draft
-        return TreeCascadeRows(
-            page_table=self.page_table_buf[:bs],
-            seq_lens=lanes.window_seq_lens[:bs],
-            prefix_lens=lanes.frontier[:bs],
-            mask=lanes.lane_mask[: bs * lanes.topk],
-            rows=lanes.topk,
-            window=lanes.num_slots,
-        )
+        return self.tree_draft.cascade_rows(self, bs)
 
     def _tree_verify_rows(
         self, bs: int, q_len: int, page_table: torch.Tensor, seq_lens: torch.Tensor

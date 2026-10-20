@@ -78,6 +78,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
+from tokenspeed.runtime.models.base.decoder_layer import capture_layer_input
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import set_weight_attrs
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -810,6 +811,9 @@ class NemotronHModel(nn.Module):
             mapping,
             config.num_hidden_layers,
         )
+        # Blocks whose input an EAGLE draft reads, in ascending order (set by
+        # set_eagle3_layers_to_capture); num_hidden_layers is the final norm's.
+        self.layers_to_capture: list[int] = []
 
     def forward(
         self,
@@ -817,17 +821,32 @@ class NemotronHModel(nn.Module):
         positions: torch.Tensor,
         ctx: ForwardContext,
         input_embeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, None]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         del positions
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
+        aux_hidden_states = [] if self.layers_to_capture else None
         previous: MixerOutput = (hidden_states, None)
         residual = None
-        for layer in self.layers:
+        for index, layer in enumerate(self.layers):
             previous, residual = layer(previous, residual, ctx)
-        hidden_states, _, _ = self.norm.add_norm(previous, residual, None, ctx)
-        return hidden_states, None
+            # A block's norm folded the previous mixer's output into residual,
+            # all-reduced under TP: residual is the full input of this block.
+            capture_layer_input(
+                layer.norm.comm_manager,
+                residual,
+                ctx,
+                aux_hidden_states if index in self.layers_to_capture else None,
+            )
+        hidden_states, _, residual = self.norm.add_norm(previous, residual, None, ctx)
+        capture_layer_input(
+            self.norm.comm_manager,
+            residual,
+            ctx,
+            aux_hidden_states if len(self.layers) in self.layers_to_capture else None,
+        )
+        return hidden_states, aux_hidden_states
 
 
 class NemotronHForCausalLM(BaseCausalLM):

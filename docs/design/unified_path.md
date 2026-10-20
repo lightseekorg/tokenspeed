@@ -1037,7 +1037,9 @@ of replaying a recorded graph: input-buffer padding to the ladder bs plus the
 DFLASH sentinel req-pool rows, `_set_graph_state_write_indices`, the DeepEP
 dispatch-mode restore (`deepep_adapter.replay()`), the sampler-variant
 `graph_key` lookup, the `TOKENSPEED_GRAPH_DEBUG` metadata verify,
-output-buffer re-slicing, and the `ctx.bs` save/restore.
+output-buffer re-slicing, the `ctx.bs` save/restore, and the replay itself
+through the drafter (`replay_decode_graph`: EAGLE-Harness replays it on its
+round stream and launches its device-chained round behind it).
 
 Address-freezing bugs — a refresh that binds metadata views over storage the
 captured graph never recorded — are assertable: capture snapshots the tensor

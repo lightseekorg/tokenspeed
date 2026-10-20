@@ -312,6 +312,8 @@ class ForwardStepRunner:
 
         self.graphs: dict[tuple[str, int], object] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
+        # The padded batch the last call replayed a decode graph at (None: eager).
+        self.last_graph_bs: int | None = None
         # TOKENSPEED_GRAPH_DEBUG=1: capture-time tensor-identity snapshots,
         # re-verified before every replay (graph_ptr_guard). Off by default —
         # replays then pay a single bool check.
@@ -670,9 +672,15 @@ class ForwardStepRunner:
                 stream=self.stream,
                 tag="cuda_graph",
             )
-        # The kernel state captured launches need lives as long as the graph.
-        with observer, capture_session(graph), graph_capture:
-            out = run_once()
+        with observer:
+            # The kernel state captured launches need lives as long as the graph.
+            with capture_session(graph), graph_capture:
+                out = run_once()
+            # The drafter's own graphs at this batch share the pool and the measure.
+            if self.drafter is not None and variant == CUDA_GRAPH_VARIANT_DEFAULT:
+                self.drafter.capture_round_graphs(
+                    bs, stream=self.stream, pool=graph.pool()
+                )
 
         self.device_module.synchronize()
         dist.barrier()
@@ -842,6 +850,7 @@ class ForwardStepRunner:
         forward_mode: ForwardMode,
         *,
         use_graph: bool,
+        settle: Callable[[], None],
         block_tables: dict | None = None,
         **cache_kwargs,
     ):
@@ -867,6 +876,8 @@ class ForwardStepRunner:
             for_graph_replay=use_graph,
             **cache_kwargs,
         )
+        # A pending draft round drafts over the draft backend's metadata.
+        settle()
         if self.draft_attn_backend is not None:
             # Seed the drafter-owned buffer for the round: the DFLASH drafter
             # reads it directly, and the refresh below snapshots it into the
@@ -1036,6 +1047,7 @@ class ForwardStepRunner:
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         block_tables_cpu: dict,
+        settle: Callable[[], None],
         positions: torch.Tensor | None = None,
         block_tables: dict | None = None,
     ):
@@ -1055,6 +1067,10 @@ class ForwardStepRunner:
         ``block_tables`` on the host (the same group keys; empty at bs 0) for
         backends that plan an extend from the tables without waiting on the
         device.
+
+        ``settle`` finishes what the inputs still wait on (a pending draft
+        round): a decode calls it after the target's decode metadata, which
+        that round does not read, any other forward first.
 
         Returns ``(output_tokens, output_lengths, output_logprobs,
         forward_logprobs)``; the last is an extend/mixed forward's
@@ -1119,9 +1135,11 @@ class ForwardStepRunner:
                 seq_lens,
                 forward_mode=ctx.forward_mode,
                 use_graph=use_graph,
+                settle=settle,
                 block_tables=block_tables,
             )
         else:
+            settle()
             # Extend/mixed (and the never-in-practice eager idle): dynamic
             # shapes, fresh construction.
             self._init_forward_metadata(
@@ -1176,7 +1194,10 @@ class ForwardStepRunner:
                     ),
                 )
             with nvtx_range("graph_replay", color="red"):
-                graph.replay()
+                if self.drafter is not None:
+                    self.drafter.replay_decode_graph(graph, bs=bs, graph_bs=padded_bs)
+                else:
+                    graph.replay()
             if self._expert_load_rows is not None:
                 self._expert_load_rows.clear()
 
@@ -1214,9 +1235,10 @@ class ForwardStepRunner:
                 num_extends=ctx.num_extends,
                 accepted_path=(
                     self.sampling_backend.accepted_path(bs, self.config.spec_num_tokens)
-                    if self.config.spec_topk > 1 and ctx.num_extends == 0
+                    if self.config.spec_draft_tree and ctx.num_extends == 0
                     else None
                 ),
             )
 
+        self.last_graph_bs = padded_bs if use_graph else None
         return result

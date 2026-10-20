@@ -606,16 +606,20 @@ parser option keeps its existing behavior.
 | Parameter | Purpose |
 | --- | --- |
 | `--speculative-config` | JSON speculative decoding configuration. |
-| `--speculative-algorithm` | Speculative algorithm, such as `EAGLE3`, `MTP`, `DFLASH`, `DSPARK`, or `DUMMY`. `DUMMY` generates deterministic candidates without a draft checkpoint; it tests target multi-token verification, not draft-model quality. Set `--speculative-num-draft-tokens` above 1 and do not pass a draft model path. |
+| `--speculative-algorithm` | Speculative algorithm, such as `EAGLE3`, `EAGLE4`, `MTP`, `DFLASH`, `DSPARK`, or `DUMMY`. `DUMMY` generates deterministic candidates without a draft checkpoint; it tests target multi-token verification, not draft-model quality. Set `--speculative-num-draft-tokens` above 1 and do not pass a draft model path. |
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
 | `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`; required for draft trees. |
 | `--synthetic-acceptance-length` | Benchmark-only mean emitted tokens per speculative verification, including the guaranteed target token. Unset disables it. |
 | `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
-| `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters (see below). Off by default. |
+| `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters and EAGLE-Harness trees (see below). Off by default. |
 | `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. |
-| `--eagle3-layers-to-capture` | EAGLE3 layers to capture. |
+| `--eagle3-layers-to-capture` | Target layers whose hidden states feed an `EAGLE3` or `EAGLE4` draft. |
+| `--speculative-exec-mode` | `EAGLE4` drafting (see below): `-1` (default) static chains and trees, `0` EAGLE-Harness dynamic chains and trees, `1` the same for evaluation runs, `2` measures the EAGLE-Harness cost data. |
+| `--speculative-data-path` | EAGLE-Harness run directory: the cost data exec modes 0 and 1 read, which exec mode 2 writes. |
+| `--speculative-compute-intensity` | EAGLE-Harness policy tier: `high_intensity` (default) or `low_intensity` for trees, `chain_intensity` for chains (`--speculative-eagle-topk 1`). |
+| `--speculative-chain-width-table` | EAGLE-Harness chains in exec modes 0 and 1: `MIN_BS:WIDTH,...` fixes the verify width of rounds with at least `MIN_BS` live requests. `off` (default) lets the confidence rule decide every round. |
 | `--disable-replay-ssm` | Stage every verify position's recurrent state instead of replaying the accepted tokens. ReplaySSM is on by default for supported Qwen GDN and Nemotron-H Mamba2 targets; `--enable-replay-ssm` is accepted as a deprecated no-op. |
 
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
@@ -665,7 +669,7 @@ must equal `--speculative-num-steps + 1`. With `--speculative-eagle-topk` above 
 they draft a tree instead, and `--speculative-num-draft-tokens` is its node
 budget (root included). Set it explicitly: topk 1..16, steps 1..10,
 `(steps - 1) * topk` lane slots within the node budget, and at most 64 nodes. Trees need the `trtllm`
-attention backends (`trtllm_mla` or `tokenspeed_mla` for MLA models) and the `greedy` or `triton` sampling backend; see
+attention backends (`trtllm_mla` or `tokenspeed_mla` for MLA models) and the `greedy`, `triton` or `flashinfer` sampling backend; see
 [draft-tree speculation](../design/tree-speculation.md) for the full scope.
 
 `MTP` serves two head shapes under one flag. An Eagle-like head (one MTP
@@ -685,6 +689,48 @@ lands on the decode node the draft rewrites prompt-tail draft-KV positions
 from an unfilled stash. Draft acceptance may dip for those rounds.
 Verification stays exact. Shipping the stash with the bootstrap payload is a
 planned follow-up.
+
+### EAGLE-4
+
+`EAGLE4` serves an EAGLE-4 draft, whose candidate head scores a short list of
+candidate tokens per draft row instead of the whole vocabulary. With the
+default `--speculative-exec-mode -1` it drafts static chains and trees under
+the `EAGLE3` rules above.
+
+The draft config selects its layer's structure: `attn_norm` merges the
+embedding and hidden inputs through `eh_proj`, `use_rope: false` attends
+without rotary embeddings, and `enable_moe` with `moe_architecture:
+nemotron_latent_relu2` routes Nemotron-H's latent MoE (without expert
+parallelism). Loading refuses a draft config key or checkpoint tensor the
+model does not build.
+
+With exec mode `0`, EAGLE-Harness sizes each round on the device from
+measured cost data (or, for chains, from the width table where it applies):
+how deep the draft grows and how many nodes the target verifies. Measure the cost data with the exec mode `2` driver
+(`python -m tokenspeed.runtime.execution.drafter.eagle_harness.measure_run --help`),
+then serve with `--speculative-data-path` set to its run directory and the
+same draft shape, TP size, attention backends and state dtype. Exec mode
+`1` serves evaluation clients that write their batch size to
+`<data path>/config/benchmark_config.json`: it runs like exec mode `0`,
+except that a tree round far smaller than that batch drafts only the root's
+children and verifies narrowly. Harness rounds, chains included,
+run on the draft-tree path and share its requirements, with these limits:
+
+- Trees: `--speculative-eagle-topk` 2, 4 or 8 with `high_intensity` or
+  `low_intensity`, at most 32 requests per rank.
+- Chains: `--speculative-eagle-topk 1` with `chain_intensity`, at most 15
+  steps and 16 draft tokens, and at most 512 requests per rank (256 when
+  measuring). The
+  confidence rule decides rounds of up to 256 requests (the cost data's
+  range); `--speculative-chain-width-table` must cover larger rounds. To
+  calibrate a table, `TOKENSPEED_EAGLE_HARNESS_ROUND_STATS=N` logs rank 0's
+  round counts per batch size every `N` rounds.
+- `--speculative-num-steps` 2 to 32 (64 when measuring), with
+  `(steps - 1) * topk` at most 128 and `1 + topk + (steps - 1) * topk^2` at
+  most 1024.
+- `--enable-speculative-sampling` samples harness trees (not chains, and not
+  when measuring) and needs `--sampling-backend flashinfer`, which accepts
+  them by tree rejection sampling. Static `EAGLE4` drafts do not take it.
 
 ### Draft-prob rejection sampling
 

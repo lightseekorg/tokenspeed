@@ -30,8 +30,14 @@ and the service refuses tree drafting for them.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.backends.paged.base import (
+        PagedAttentionBackend,
+    )
 
 __all__ = ["TreeCascadeRows", "TreeDraftInputs", "TreeVerifyInputs"]
 
@@ -67,6 +73,10 @@ class TreeDraftInputs:
     its own ancestors (``lane_mask`` bit ``j`` for window slot ``j``). Window
     K/V are only valid while this round's tree is drafted. The drafter writes
     everything here.
+
+    Lanes read the leaves' live decode tables and write through the draft
+    router's decode window. A drafter whose lanes need more (wider windows,
+    per-row tables) subclasses this and overrides :meth:`cascade_rows`.
     """
 
     def __init__(
@@ -85,6 +95,17 @@ class TreeDraftInputs:
         self.frontier[:bs].copy_(frontier[:bs])
         torch.add(self.frontier[:bs], self.num_slots, out=self.window_seq_lens[:bs])
 
+    def cascade_rows(self, leaf: PagedAttentionBackend, bs: int) -> TreeCascadeRows:
+        """The cascade ``leaf`` runs for the first ``bs`` requests' lane rows."""
+        return TreeCascadeRows(
+            page_table=leaf.page_table_buf[:bs],
+            seq_lens=self.window_seq_lens[:bs],
+            prefix_lens=self.frontier[:bs],
+            mask=self.lane_mask[: bs * self.topk],
+            rows=self.topk,
+            window=self.num_slots,
+        )
+
 
 @dataclass(frozen=True)
 class TreeCascadeRows:
@@ -95,6 +116,9 @@ class TreeCascadeRows:
     page_table: torch.Tensor  # [bs, max_pages] kernel pages
     seq_lens: torch.Tensor  # [bs] keys per request, the window included
     prefix_lens: torch.Tensor  # [bs] committed keys before the window
-    mask: torch.Tensor  # [bs * rows] int64 window visibility per row
+    mask: torch.Tensor  # [bs * rows * cdiv(window, 64)] int64 window visibility
     rows: int
     window: int
+    # Per lane row, for a sliding-window layer that decodes each row's prefix alone.
+    row_page_table: torch.Tensor | None = None
+    row_prefix_lens: torch.Tensor | None = None
