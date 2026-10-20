@@ -288,7 +288,9 @@ class FusedTPProjectionState:
                 (tile_m, 128),
                 cluster_shape,
                 row_parallel=row_parallel,
-                accumulator_groups=2 if row_parallel and rows >= 128 else 1,
+                accumulator_groups=(
+                    2 if (row_parallel or self.world_size == 4) and rows >= 128 else 1
+                ),
                 use_input_multicast=bool(self.input_multicast_ptr),
             )
             input_dtypes = (

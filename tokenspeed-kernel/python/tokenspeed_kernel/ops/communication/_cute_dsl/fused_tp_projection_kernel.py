@@ -253,6 +253,7 @@ class FusedTPProjectionKernel:
         if accumulator_groups not in (1, 2):
             raise ValueError("Projection requires one or two accumulator warp groups")
         self.split_accumulator = accumulator_groups == 2
+        self.smem_epilogue = row_parallel or self.split_accumulator
         self.local_flag_scope = "gpu" if row_parallel else "sys"
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
@@ -651,7 +652,9 @@ class FusedTPProjectionKernel:
             )
             else 0
         )
-        self.large_row_bucket = self.row_parallel and peers[1].shape[0] >= 128
+        self.large_row_bucket = peers[1].shape[0] >= 128 and (
+            self.row_parallel or self.split_accumulator
+        )
         # Multicast operands need completion from every consuming CTA.
         self.shared_mma_completion = (
             self.row_parallel
@@ -692,6 +695,9 @@ class FusedTPProjectionKernel:
         self.independent_operand_stages = self.row_parallel and (
             (len(peer_ready) == 2 and peers[1].shape[0] >= 512)
             or (len(peer_ready) == 4 and 256 <= peers[1].shape[0] <= 1536)
+        )
+        self.independent_operand_stages = self.independent_operand_stages or (
+            not self.row_parallel and self.split_accumulator
         )
         if cutlass.const_expr(self.independent_operand_stages):
             self.shared_mma_completion = False
@@ -2304,7 +2310,9 @@ class FusedTPProjectionKernel:
                     ab_consumer_state.reset_count()
                     peek_ab_full_status = cutlass.Boolean(1)
                     if ab_consumer_state.count < k_tile_cnt and is_leader_cta:
-                        if cutlass.const_expr(self.row_parallel):
+                        if cutlass.const_expr(
+                            self.row_parallel or self.split_accumulator
+                        ):
                             # A peek must not suspend before current MMA completion
                             # is published to the accumulator warps.
                             peek_ab_full_status = (
@@ -2373,7 +2381,9 @@ class FusedTPProjectionKernel:
                         peek_ab_full_status = cutlass.Boolean(1)
                         if ab_consumer_state.count < k_tile_cnt:
                             if is_leader_cta:
-                                if cutlass.const_expr(self.row_parallel):
+                                if cutlass.const_expr(
+                                    self.row_parallel or self.split_accumulator
+                                ):
                                     # A peek must not suspend before current MMA completion
                                     # is published to the accumulator warps.
                                     peek_ab_full_status = (
@@ -2466,8 +2476,8 @@ class FusedTPProjectionKernel:
                     (self.mma_tiler[0], 32),
                 )
 
-                # Row epilogues consume the rounded tile directly from shared memory.
-                if cutlass.const_expr(self.row_parallel):
+                # Hand the rounded tile directly to the shared-memory epilogue.
+                if cutlass.const_expr(self.smem_epilogue):
                     handoff_smem = cute.flat_divide(sC, (self.mma_tiler[0], 32))
                     handoff_smem = cute.group_modes(
                         handoff_smem, 2, cute.rank(handoff_smem)
@@ -2776,7 +2786,7 @@ class FusedTPProjectionKernel:
                     if cutlass.const_expr(self.tma_scales):
                         scale_pipeline.consumer_release(scale_consumer_state)
                         scale_consumer_state.advance()
-                    if cutlass.const_expr(self.row_parallel):
+                    if cutlass.const_expr(self.smem_epilogue):
                         if cutlass.const_expr(not self.concurrent_reduction):
                             epi_pipeline.producer_acquire(epi_producer_state)
                         for subtile_idx in cutlass.range_constexpr(
@@ -2792,18 +2802,19 @@ class FusedTPProjectionKernel:
                                     .to(self.c_dtype)
                                 )
                             )
-                            # The FP32 reduction starts at +0, so replacing BF16
-                            # -0 partials by +0 preserves its result and reserves
-                            # -0 to mean that an incoming value is not ready yet.
-                            handoff_bits = cute.recast_tensor(
-                                handoff_regs, cutlass.Uint32
-                            )
-                            for value_index in cutlass.range_constexpr(
-                                cute.size(handoff_bits)
-                            ):
-                                handoff_bits[value_index] = _canonicalize_zero_pair(
-                                    handoff_bits[value_index]
+                            if cutlass.const_expr(self.row_parallel):
+                                # The FP32 reduction starts at +0, so replacing BF16
+                                # -0 partials by +0 preserves its result and reserves
+                                # -0 to mean that an incoming value is not ready yet.
+                                handoff_bits = cute.recast_tensor(
+                                    handoff_regs, cutlass.Uint32
                                 )
+                                for value_index in cutlass.range_constexpr(
+                                    cute.size(handoff_bits)
+                                ):
+                                    handoff_bits[value_index] = _canonicalize_zero_pair(
+                                        handoff_bits[value_index]
+                                    )
                             cute.copy(
                                 handoff_copy,
                                 handoff_regs,
@@ -3177,7 +3188,7 @@ class FusedTPProjectionKernel:
                         #
                         subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                         for subtile_idx in cutlass.range(subtile_cnt):
-                            if cutlass.const_expr(self.row_parallel):
+                            if cutlass.const_expr(self.smem_epilogue):
                                 c_buffer = subtile_idx
 
                             else:
@@ -3269,7 +3280,7 @@ class FusedTPProjectionKernel:
                                     c_pipeline.producer_acquire()
                             self.epilog_sync_barrier.arrive_and_wait()
 
-                        if cutlass.const_expr(self.row_parallel):
+                        if cutlass.const_expr(self.smem_epilogue):
                             if warp_idx == self.epilog_warp_id[0]:
                                 c_pipeline.producer_tail()
                             self.epilog_sync_barrier.arrive_and_wait()
@@ -3464,12 +3475,9 @@ class FusedTPProjectionKernel:
         group_stride = blocks * (self.threads_per_cta // lanes_per_group)
         # Direct FP8 copies avoid lookahead bookkeeping at this bucket.
         prefetch_input = (
-            self.row_parallel
-            and rows >= 160
-            and not (
-                self.input_phase_clear and rows == 256 and source_scales is not None
-            )
-        )
+            (self.row_parallel and rows >= 160)
+            or (not self.row_parallel and self.split_accumulator)
+        ) and not (self.input_phase_clear and rows == 256 and source_scales is not None)
         pending_input = cute.make_rmem_tensor((values_per_lane,), source.element_type)
         if cutlass.const_expr(prefetch_input):
             pending_input.fill(0)
@@ -4714,7 +4722,8 @@ class FusedTPProjectionKernel:
                  (ACC stages, A/B operand stages, C stages)
         :rtype: tuple[int, int, int]
         """
-        # Row epilogues use shared memory, freeing the fourth TMEM stage.
+        # Large buckets hand results through shared memory, freeing the fourth
+        # TMEM stage for partial accumulators.
         num_acc_stage = 4 if large_row_bucket else (3 if mma_tiler_mnk[0] == 128 else 6)
 
         # Default C stages

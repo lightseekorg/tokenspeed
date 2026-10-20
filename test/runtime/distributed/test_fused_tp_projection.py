@@ -194,6 +194,7 @@ def _check_column_projection(rank, world_size, device, parallel, config):
         65,
         87,
         88,
+        96,
         128,
         129,
         256,
@@ -293,6 +294,8 @@ def _check_column_projection(rank, world_size, device, parallel, config):
         ((32,) * 4, True),
         ((64, 17, 0, 63), False),
         ((64,) * 4, False),
+        # Verify padded split-accumulator tiles with unequal and empty owners.
+        ((96, 65, 1, 0), False),
         ((0, 128), False),
         ((129, 255, 128, 0), False),
         ((257, 384, 33, 0), False),

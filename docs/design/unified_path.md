@@ -284,7 +284,11 @@ Projection fusion replaces communication, quantization, and GEMM with one
 kernel within the same backend dispatch path. Column projection fuses
 all-gather, FP8 GEMM, and all-to-all; row projection fuses all-to-all, FP8 GEMM,
 and reduce-scatter. The goal is to reduce launch overhead and let computation
-consume peer data as it becomes available.
+consume peer data as it becomes available. Large TP4 column buckets share
+the row kernel's accumulator work distribution and shared-memory handoff to
+the output stage, keeping more partial GEMM results in flight. Input packing
+and operand prefetch use the same prepared buckets; numerical scaling order
+and collective ownership are unchanged.
 
 Row projection also accepts E4M3 inputs with FP32 scales per 128 channels,
 allowing the preceding RMSNorm/gate operation to quantize once. Fusion forwards
