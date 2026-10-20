@@ -51,7 +51,7 @@ def registry(monkeypatch):
     return registry
 
 
-def _register(registry, invariant):
+def _register(registry, invariant, *, graph):
     def reference(*, q, kv_cache, topk_slots, topk_lens, softmax_scale, **kwargs):
         result = []
         flat = kv_cache.reshape(-1, q.shape[-1]).float()
@@ -72,7 +72,8 @@ def _register(registry, invariant):
                 mode=mode,
                 solution="public_reference",
                 format_signatures=format_signatures("q", "dense", {torch.bfloat16}),
-                features=frozenset({"batch_invariant"}) if invariant else frozenset(),
+                features=(frozenset({"batch_invariant"}) if invariant else frozenset())
+                | (frozenset({"cuda_graph"}) if graph else frozenset()),
                 traits={
                     "slot_order": frozenset({"sorted"}),
                     "q_len": frozenset({1, 2}),
@@ -135,7 +136,7 @@ def _backend():
 
 
 def test_sparse_plans_keep_their_provider_across_batches_and_registry_changes(registry):
-    _register(registry, True)
+    _register(registry, True, graph=False)
     backend = _backend()
     for mode in ("dsa_prefill", "dsa_decode"):
         registry._unregister(f"public_{mode}")
@@ -182,6 +183,15 @@ def test_sparse_plans_keep_their_provider_across_batches_and_registry_changes(re
 
 
 def test_sparse_backend_rejects_missing_invariance_at_initialization(registry):
-    _register(registry, False)
+    _register(registry, False, graph=False)
     with pytest.raises(NoKernelFoundError):
         _backend()
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_sparse_plans_decide_decode_graph_capture(registry, graph):
+    _register(registry, True, graph=graph)
+    support = _backend().cuda_graph_support
+    assert support.decode_graph is graph
+    # DSA keeps prefills eager whatever the planned leaf declares.
+    assert not support.prefill_graph

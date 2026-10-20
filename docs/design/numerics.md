@@ -385,6 +385,12 @@ and history lengths vary without provider selection.
 Plans for different operators or phases still require cross-phase numerical
 acceptance; an individual capability declaration does not establish that.
 
+A planned attention leaf that can be recorded into a CUDA graph also declares
+the `cuda_graph` feature. `MLAAttnBackend` and `DSABackend` derive their graph
+support from the leaves they planned (`CudaGraphSupport.from_plans`), so a
+leaf without the feature runs eagerly instead of being captured; startup logs
+which backend disabled which graph.
+
 ### Absorbed MLA
 
 Under a bitwise envelope, `MLAAttnBackend` plans the standard
@@ -397,8 +403,6 @@ the latent cache through its prepared-input path.
 The current absorbed extend interface cannot express a sliding window, so
 this path rejects windowed configurations rather than widening their mask.
 Value projection stays separate to preserve its explicit rounding boundary.
-Each planned attention leaf declares `cuda_graph` when that entry supports
-capture; the backend derives graph support from the selected leaves.
 Provider registration owns dtype, head geometry and hardware constraints.
 The ordinary auto envelope retains its existing dynamic selection policy.
 

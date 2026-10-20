@@ -193,15 +193,8 @@ class MLAAttnBackend(PagedAttentionBackend):
         # The strict arithmetic materializes latent output before value projection.
         self.supports_mla_projected_value_decode = not self.batch_invariant
         self.supports_layer_sliding_window = not self.batch_invariant
-        self.cuda_graph_support = CudaGraphSupport(
-            prefill_graph=(
-                self.extend_kernel_plan is None
-                or "cuda_graph" in self.extend_kernel_plan.spec.features
-            ),
-            decode_graph=(
-                self.decode_kernel_plan is None
-                or "cuda_graph" in self.decode_kernel_plan.spec.features
-            ),
+        self.cuda_graph_support = CudaGraphSupport.from_plans(
+            prefill=self.extend_kernel_plan, decode=self.decode_kernel_plan
         )
 
         self.forward_decode_metadata: MLADecodeMetadata | None = None

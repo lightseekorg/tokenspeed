@@ -281,6 +281,10 @@ class DSABackend(PagedAttentionBackend):
             # dummy's gather. Overrides the KPool consumer's declaration too.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=False)
             self._probe_history_gather_topk_leaf(spec)
+        # Planned sparse cores are captured only if they declare cuda_graph.
+        self.cuda_graph_support = self.cuda_graph_support & CudaGraphSupport.from_plans(
+            prefill=self.prefill_kernel_plan, decode=self.decode_kernel_plan
+        )
 
     def _probe_history_gather_topk_leaf(self, spec: DSAConfig) -> None:
         """Select, at construction, the indexer leaf the sharded extend arm
