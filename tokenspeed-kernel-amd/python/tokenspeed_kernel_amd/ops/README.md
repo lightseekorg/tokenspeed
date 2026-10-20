@@ -1251,6 +1251,24 @@ element size and batch size to limit shared-memory usage.
 
 ## MoE
 
+### Packed FP8 routed experts on gfx950
+
+The GLM-5.3 path computes clamped SwiGLU routed experts from BF16 activations
+and E4M3 weights with FP32 scales per 128-by-128 weight block. It returns this
+rank's contribution; expert selection and cross-rank communication remain
+outside the operation.
+
+At checkpoint load, each local expert's weights are packed once into canonical
+parameter storage. The loader accepts complete local rows and aligned gate/up
+halves, and rejects partial input-column writes before modification. Runtime
+keeps no duplicate linear weight bank or unpacking step.
+
+For small, fully local batches, warp-level FP32 arithmetic streams packed
+weights and remaps activation loads. Other supported batches quantize the BF16
+input into E4M3 groups and use public scaled matrix multiplication. Both paths
+perform gate/up projection, clamped activation, and down projection. The matrix
+path reuses existing route sorting and shared activation quantization.
+
 ### gfx950 latent input projection
 
 The Kimi K3 prefill path projects one packed BF16 input weight into router,

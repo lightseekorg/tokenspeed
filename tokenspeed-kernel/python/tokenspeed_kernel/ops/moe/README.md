@@ -213,6 +213,17 @@ be wrong here. The kernel test checks non-unit input scales against a
 dequantized reference, and checks in-kernel sigmoid-plus-bias routing with 512
 experts and top-22.
 
+### Packed FP8 expert intermediate
+
+The matrix-based routed-expert path converts the clamped gate/up result into
+E4M3 inputs for the down projection, with one FP32 scale per 128 activations.
+It preserves BF16 intermediate rounding and clipping before conversion.
+Unsplit projections
+fuse conversion into the activation producer; split projections combine their
+partial results before the nonlinear activation and conversion. Only FP8 values
+and scales are materialized. The first BF16 input conversion still uses the
+shared quantizer rather than an upstream model operation.
+
 ### Unquantized CUTLASS MoE workspace
 
 `flashinfer_cutlass_unquant_moe_apply` hands `cutlass_fused_moe` one

@@ -358,6 +358,7 @@ def _fp8_token_group_quantize_kernel(
     bit8_max,
     BLOCK: tl.constexpr,
     GROUPS_PER_PROGRAM: tl.constexpr,
+    USE_RECIPROCAL: tl.constexpr,
 ):
     # Each program quantizes GROUPS_PER_PROGRAM consecutive groups, one per
     # tile row; every group's arithmetic is independent of the tiling.
@@ -375,15 +376,35 @@ def _fp8_token_group_quantize_kernel(
 
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     scale = tl.maximum(tl.max(tl.abs(x), axis=1), eps) / bit8_max
-    out = tl.clamp(x / scale[:, None], bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
+    if USE_RECIPROCAL:
+        inverse_scale = 1.0 / scale
+        normalized = x * inverse_scale[:, None]
+    else:
+        normalized = x / scale[:, None]
+    out = tl.clamp(normalized, bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
 
     tl.store(out_ptr + offsets, out, mask=mask)
     tl.store(scale_ptr + group_ids, scale, mask=group_mask)
 
 
+def _fp8_token_group_groups_per_cta(
+    x: torch.Tensor, group_size: int, groups: int
+) -> int | None:
+    # The grouped launch was measured on gfx950 with 256 compute units. Its
+    # crossover keeps at least two workgroups per compute unit on that device.
+    if group_size != 128 or x.device.type != "cuda" or torch.version.hip is None:
+        return None
+    device_properties = torch.cuda.get_device_properties(x.device)
+    if (
+        not current_platform().is_cdna4
+        or device_properties.multi_processor_count != 256
+    ):
+        return None
+    return 16 if groups >= 32 * device_properties.multi_processor_count else 1
+
+
 def _fp8_token_group_quantize(
-    x: torch.Tensor,
-    group_size: int,
+    x: torch.Tensor, group_size: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.shape[-1] % group_size != 0:
         raise ValueError(
@@ -402,6 +423,7 @@ def _fp8_token_group_quantize(
     )
 
     groups = x.numel() // group_size
+    groups_per_cta = _fp8_token_group_groups_per_cta(x, group_size, groups)
     block = triton.next_power_of_2(group_size)
     # Tile by input size, measured on GB300: one group per program below
     # 16 Ki padded elements, then tiles of consecutive groups, 1024 elements
@@ -416,6 +438,8 @@ def _fp8_token_group_quantize(
         groups_per_program = 1024 // block
     else:
         groups_per_program = 8192 // block
+    if groups_per_cta is not None:
+        groups_per_program = groups_per_cta
     fp8_finfo = torch.finfo(out_dtype)
     args = (x, out, scales, groups, group_size, 1e-10)
     options = {
@@ -428,19 +452,32 @@ def _fp8_token_group_quantize(
     # input of another size and the same signature compiles nothing while
     # serving.
     if not is_serving() and block < 1024:
-        for tile in (1, 1024 // block, 8192 // block):
+        tiles = (
+            (1, 16) if groups_per_cta is not None else (1, 1024 // block, 8192 // block)
+        )
+        for tile in tiles:
             _fp8_token_group_quantize_kernel.warmup(
                 *args,
                 **options,
                 GROUPS_PER_PROGRAM=tile,
-                num_warps=min(max(tile * block // 256, 1), 8),
+                USE_RECIPROCAL=groups_per_cta is not None and tile == 16,
+                num_warps=(
+                    1
+                    if groups_per_cta is not None
+                    else min(max(tile * block // 256, 1), 8)
+                ),
                 grid=(1,),
             )
     _fp8_token_group_quantize_kernel[(triton.cdiv(groups, groups_per_program),)](
         *args,
         **options,
         GROUPS_PER_PROGRAM=groups_per_program,
-        num_warps=min(max(groups_per_program * block // 256, 1), 8),
+        USE_RECIPROCAL=groups_per_cta == 16,
+        num_warps=(
+            1
+            if groups_per_cta is not None
+            else min(max(groups_per_program * block // 256, 1), 8)
+        ),
     )
     return out, scales
 

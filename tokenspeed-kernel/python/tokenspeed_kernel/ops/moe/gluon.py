@@ -28,6 +28,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.moe import packed_projection_weight_view
+from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -556,6 +557,16 @@ _DIRECT_DECODE_MAX_TOKENS = 32
 _EXACT_MFMA_MAX_TOKENS = 4096
 
 
+def _quantize_packed_activation(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize each activation row in groups of 128 values."""
+    return quantize_fp8_with_scale(
+        x,
+        granularity="token_group",
+        group_size=128,
+        solution="triton",
+    )
+
+
 def _validate_fp8_moe(
     plan: dict,
     x: torch.Tensor,
@@ -663,6 +674,10 @@ if platform.is_amd:
         gluon_fp8_block_dequantize,
         gluon_fp8_block_exact_mfma_moe,
         gluon_fp8_block_warp_decode_moe,
+        launch_gluon_fp8_packed_moe_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.weight_preprocess import (
+        preprocess_gluon_fp8_packed_gfx950_moe_weights as gluon_fp8_packed_moe_weights,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.moe.fp8 import (
         launch_gluon_fp8_block_experts_gfx1250,
@@ -764,6 +779,7 @@ if platform.is_amd:
                 swiglu_limit,
                 expert_start,
                 int(getattr(w, "ep_size", 1)) > 1,
+                packed_weights=False,
             )
         if x.shape[0] <= _EXACT_MFMA_MAX_TOKENS:
             num_local_experts = int(
@@ -901,6 +917,113 @@ if platform.is_amd:
         # Expert programs skip ids outside this rank and leave those rows unset.
         _combine(route_output, validated_weights, output, validated_ids, num_experts)
         return output
+
+    _PACKED_FP8_TRAITS = {
+        "weight_dtype": frozenset({"fp8"}),
+        "activation": frozenset({"swiglu"}),
+        "swiglu_form": frozenset({"standard"}),
+        "activation_clamped": frozenset({True}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({False, True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "hidden": frozenset({4096}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "fp8_scale_block_shape": frozenset({(_FP8_BLOCK, _FP8_BLOCK)}),
+        "supports_bias": frozenset({False}),
+        "expert_id_repeats": frozenset({False}),
+        "combine_order": frozenset({"rank"}),
+    }
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_fp8_packed_ep1_precomputed_moe_apply",
+        solution="gluon",
+        weight_preprocessor=gluon_fp8_packed_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            **_PACKED_FP8_TRAITS,
+            "ep_size": frozenset({1}),
+            "ispp": frozenset({512}),
+        },
+        priority=Priority.SPECIALIZED + 1,
+    )
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_fp8_packed_ep4_precomputed_moe_apply",
+        solution="gluon",
+        weight_preprocessor=gluon_fp8_packed_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            **_PACKED_FP8_TRAITS,
+            "ep_size": frozenset({4}),
+            "ispp": frozenset({2048}),
+        },
+        priority=Priority.SPECIALIZED + 1,
+    )
+    def gluon_fp8_packed_precomputed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        """Apply packed block-FP8 experts and return this rank's full partial.
+
+        Args:
+            plan: MoE execution plan selecting standard clamped SwiGLU.
+            x: Contiguous BF16 hidden states ``[tokens, 4096]``.
+            w: Module holding canonical packed FP8 expert parameters.
+            router_logits: Unused for precomputed routing.
+            topk_weights: Global route weights ``[tokens, top_k]``.
+            topk_ids: Global expert ids ``[tokens, top_k]``.
+            num_tokens_global: Unused EP token count.
+            max_num_tokens_per_gpu: Unused token-capacity hint.
+            do_finalize: Must be true.
+            enable_pdl: Unused launch hint.
+
+        Returns:
+            Finalized BF16 local expert contribution ``[tokens, 4096]``.
+        """
+        validated_weights, validated_ids, swiglu_limit = _validate_fp8_moe(
+            plan, x, w, topk_weights, topk_ids, do_finalize
+        )
+        if swiglu_limit is None or validated_ids.shape[1] != 8:
+            raise ValueError("packed FP8 MoE requires clamped SwiGLU and eight routes")
+        if x.shape[0] == 0:
+            return torch.empty_like(x)
+
+        num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
+        return launch_gluon_fp8_packed_moe_gfx950(
+            x,
+            w.w13_weight,
+            w.w2_weight,
+            w.w13_weight_scale_inv,
+            w.w2_weight_scale_inv,
+            validated_ids.to(dtype=torch.int32).contiguous(),
+            validated_weights.to(dtype=torch.float32).contiguous(),
+            float(swiglu_limit),
+            int(getattr(w, "ep_rank", 0)) * num_local_experts,
+            num_experts_total=w.num_experts,
+            quantize_activation=_quantize_packed_activation,
+        )
 
 
 # ===-----------------------------------------------------------------------===#

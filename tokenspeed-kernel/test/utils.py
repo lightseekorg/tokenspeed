@@ -119,6 +119,33 @@ def compiled_kernels(kernel: Any) -> list[Any]:
     ]
 
 
+def assert_fp8_same_or_adjacent_at_midpoint(
+    x: torch.Tensor,
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+) -> None:
+    """Bound FP8 changes from reciprocal normalization to rounding boundaries."""
+    assert x.shape == actual.shape == reference.shape
+    assert actual.dtype == reference.dtype == torch.float8_e4m3fn
+    actual_bits = actual.view(torch.uint8)
+    reference_bits = reference.view(torch.uint8)
+    differs = actual_bits != reference_bits
+    assert torch.equal(actual_bits >> 7, reference_bits >> 7)
+    code_delta = (actual_bits & 0x7F).to(torch.int16) - (reference_bits & 0x7F).to(
+        torch.int16
+    )
+    assert (code_delta.abs() <= 1).all()
+    if differs.any():
+        midpoint = (actual.float()[differs] + reference.float()[differs]) * 0.5
+        expanded_scales = scales.repeat_interleave(group_size, dim=-1)
+        quotient = x.float()[differs] / expanded_scales[differs]
+        # Allow a few FP32 rounding steps, not an arbitrary neighboring code.
+        tolerance = 8 * torch.finfo(torch.float32).eps * midpoint.abs().clamp_min(1)
+        assert ((quotient - midpoint).abs() <= tolerance).all()
+
+
 def int_specialization_class(value: int) -> str:
     """The class Triton specializes a runtime integer on."""
     return "one" if value == 1 else "div16" if value % 16 == 0 else "other"
