@@ -556,6 +556,7 @@ def test_nvfp4_silu_plan_executes_and_replays(
         internal_activation_dtype="input",
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
         solution="flashinfer_trtllm",
     )
     generator = torch.Generator().manual_seed(42)
