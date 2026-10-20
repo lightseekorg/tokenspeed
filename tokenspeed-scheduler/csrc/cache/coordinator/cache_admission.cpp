@@ -92,8 +92,7 @@ public:
           victims_{victims},
           local_free_slots_by_bucket_(groups.size()),
           shape_need_(groups.size()),
-          blocks_needed_(groups.size()),
-          owner_copy_sources_(groups.size()) {}
+          blocks_needed_(groups.size()) {}
 
     bool Plan() {
         victims_.clear();
@@ -186,9 +185,11 @@ private:
                 // and each Device tail copy lands on a fresh Device block in
                 // its source block's own bucket, exactly like a restored slot.
                 shape_need_[i].assign(buckets, 0);
-                owner_copy_sources_[i] = ownerCopySources(i);
                 blocks_needed_[i] = geometry_[i].BlocksNeededFor(*demand.table, demand) +
                                     tailBlocksNeeded(i, shape_need_[i]) + zeroStateBlocksNeeded(i);
+                if (collectOwnerCopyBuckets(i, shape_need_[i])) {
+                    owner_copy_changes_bucket_ = true;
+                }
                 if (!prefix_.host.per_group.empty()) {
                     collectHostHitBuckets(i, shape_need_[i]);
                 }
@@ -224,13 +225,14 @@ private:
     // key. So on a first admission every block of a Device tail becomes the
     // hitter's own (a copy of the shared block, or a fresh block where the
     // probe left a hole), and an owner that keeps writing past a published
-    // tail moves every published tail block to a fresh one. A copy takes its
-    // fresh block in its source's bucket (SwapInFreshBlock), so it is added
-    // to `need` like a Host hit; a hole's fresh block takes any bucket and is
-    // returned with the growth. A dense growth starts from the capacity the
-    // last tail block leaves, which the live table cannot show yet; a sparse
-    // suffix (the D role's landing of a sliding window) starts at an absolute
-    // block past the tail and is costed whole by BlocksNeededFor.
+    // tail moves every published tail block to a fresh one
+    // (collectOwnerCopyBuckets). A copy takes its fresh block in its source's
+    // bucket (SwapInFreshBlock), so it is added to `need` like a Host hit; a
+    // hole's fresh block takes any bucket and is returned with the growth. A
+    // dense growth starts from the capacity the last tail block leaves, which
+    // the live table cannot show yet; a sparse suffix (the D role's landing
+    // of a sliding window) starts at an absolute block past the tail and is
+    // costed whole by BlocksNeededFor.
     std::int64_t tailBlocksNeeded(std::size_t i, std::vector<std::int64_t>& need) const {
         if (!geometry_[i].HasTokenSpan()) {
             return 0;  // a State group's step is costed by BlocksNeededFor
@@ -244,7 +246,7 @@ private:
             for (const CacheBlockLocation& source : copied) {
                 ++need[static_cast<std::size_t>(allocator.BucketOf(source))];
             }
-            blocks += static_cast<std::int64_t>(tail->group_keys[i].size() - copied.size()) -
+            blocks += static_cast<std::int64_t>(tail->group_keys[i].size()) - static_cast<std::int64_t>(copied.size()) -
                       FirstTailBlockNeeded(groups_[i].Spec(), block_granularity, tail->tail_tokens);
             if (const auto* dense = std::get_if<DenseGrowth>(&demands_[i].extent)) {
                 const std::int32_t partial_rows = tail->tail_tokens % block_granularity;
@@ -258,28 +260,26 @@ private:
                         "a sparse suffix lands past the hit's tail blocks");
             }
         }
-        for (const CacheBlockLocation& source : owner_copy_sources_[i]) {
-            ++need[static_cast<std::size_t>(allocator.BucketOf(source))];
-        }
         return blocks;
     }
 
-    // The blocks Admit's copy-in reads for an owner that keeps writing past
-    // the tail it publishes: the tail page's slots whose retention has not
-    // expired (Admit reclaims the expired ones first), each the canonical
-    // block when another request published the tail first (the publication
-    // swaps it into the table), else the owner's own. Locations, not
-    // references: an extra reference would pin a block against the reclaim
-    // and eviction checks.
-    std::vector<CacheBlockLocation> ownerCopySources(std::size_t i) const {
-        std::vector<CacheBlockLocation> sources;
+    // Adds to `need`, in its bucket, each block Admit's copy-in reads for an
+    // owner that keeps writing past the tail it publishes: the tail page's
+    // slots whose retention has not expired (Admit reclaims the expired ones
+    // first), each the canonical block when another request published the
+    // tail first (the publication swaps it into the table), else the owner's
+    // own. Returns whether a copy reads a canonical block in another bucket
+    // than the owner's own block (protectDedupedTail).
+    bool collectOwnerCopyBuckets(std::size_t i, std::vector<std::int64_t>& need) const {
         if (completed_ == nullptr || !completed_->owner_continues || !completed_->tail ||
             !geometry_[i].HasTokenSpan() || groups_[i].Spec().replayable) {
-            return sources;
+            return false;
         }
+        const GroupAllocator& allocator = groups_[i].Allocator();
         const BlockTable& table = *demands_[i].table;
         const std::int32_t computed = *num_computed_tokens_;
         const TailSlots slots = tailSlots(geometry_[i], prefix_granularity_, computed);
+        bool copy_changes_bucket = false;
         for (std::int32_t slot = std::max(slots.first, geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), computed));
              slot < std::min(slots.past_end, table.NumBlocks()); ++slot) {
             const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(slot)];
@@ -290,9 +290,13 @@ private:
                 groups_[i].Index().Find(pool_, CacheKey{.group_id = groups_[i].Id(),
                                                         .content_hash = completed_->tail->hash,
                                                         .page_offset = slot - slots.first});
-            sources.push_back(canonical ? canonical->Location() : block->Location());
+            const std::int32_t bucket = allocator.BucketOf(canonical ? canonical->Location() : block->Location());
+            ++need[static_cast<std::size_t>(bucket)];
+            if (bucket != allocator.BucketOf(block->Location())) {
+                copy_changes_bucket = true;
+            }
         }
-        return sources;
+        return copy_changes_bucket;
     }
 
     // Whether the probe matched a checkpoint for State group i on either
@@ -435,12 +439,10 @@ private:
     // owner's own bucket needs no protection: either copy lands in the bucket
     // the plan charged.
     void protectDedupedTail() {
-        if (completed_ == nullptr || !completed_->owner_continues || !completed_->tail) {
+        if (!owner_copy_changes_bucket_) {
             return;
         }
         const TailPublication& tail = *completed_->tail;
-        std::vector<CacheBlockLocation> companions;
-        bool copy_changes_bucket = false;
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             // A State group keys one checkpoint under the tail's hash.
             const std::int32_t blocks =
@@ -448,23 +450,10 @@ private:
             for (std::int32_t offset = 0; offset < blocks; ++offset) {
                 const CacheBlockRef block = groups_[i].Index().Find(
                     pool_, CacheKey{.group_id = groups_[i].Id(), .content_hash = tail.hash, .page_offset = offset});
-                if (!block) {
-                    continue;
-                }
-                companions.push_back(block->Location());
-                if (std::ranges::find(owner_copy_sources_[i], block->Location()) != owner_copy_sources_[i].end()) {
-                    const GroupAllocator& allocator = groups_[i].Allocator();
-                    const std::int32_t slot =
-                        tailSlots(geometry_[i], prefix_granularity_, *num_computed_tokens_).first + offset;
-                    const CacheBlockRef& own = demands_[i].table->Blocks()[static_cast<std::size_t>(slot)];
-                    if (allocator.BucketOf(own->Location()) != allocator.BucketOf(block->Location())) {
-                        copy_changes_bucket = true;
-                    }
+                if (block) {
+                    protected_locations_.insert(block->Location());
                 }
             }
-        }
-        if (copy_changes_bucket) {
-            protected_locations_.insert(companions.begin(), companions.end());
         }
     }
 
@@ -647,8 +636,9 @@ private:
     std::vector<std::vector<std::int64_t>> local_free_slots_by_bucket_;
     std::vector<std::vector<std::int64_t>> shape_need_;
     std::vector<std::int64_t> blocks_needed_;
-    // Per group: the blocks an owner's copy-in reads (ownerCopySources).
-    std::vector<std::vector<CacheBlockLocation>> owner_copy_sources_;
+    // Whether an owner's copy-in reads a canonical block in another bucket
+    // than its own (collectOwnerCopyBuckets, protectDedupedTail).
+    bool owner_copy_changes_bucket_{false};
     std::int64_t empty_parent_count_{0};
     std::vector<VictimCandidate> request_reclaim_candidates_;
     std::size_t next_request_candidate_index_{0};

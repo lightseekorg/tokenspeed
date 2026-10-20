@@ -3959,16 +3959,16 @@ protected:
         : ShardedTailCopyTest(/*packing=*/4, /*block_granularity=*/kP, /*shard_count=*/2) {}
 
     // An owner computes three tokens and publishes them as a tail, its block
-    // in bucket 0 and its state checkpoint beside it. Returns the tail block.
-    CacheBlockLocation CacheTailInBucketZero() {
+    // in bucket 0 and its state checkpoint beside it. Sets `source` to the
+    // tail block.
+    void CacheTailInBucketZero(CacheBlockLocation& source) {
         std::vector<BlockTable> owner(2);
-        EXPECT_TRUE(AdmitForTest(coordinator_, owner, 3));
-        const CacheBlockLocation source = owner[0].Blocks()[0]->Location();
+        ASSERT_TRUE(AdmitForTest(coordinator_, owner, 3));
+        source = owner[0].Blocks()[0]->Location();
         EXPECT_EQ(BucketOf(owner[0].Blocks()[0]), 0);
         coordinator_.CacheCompletedBlocks(owner, TailAtThree(/*owner_continues=*/false, /*publish_state=*/true),
                                           CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
         coordinator_.Free(owner);
-        return source;
     }
 
     // A hitter's probe of the prompt: it matches the cached tail.
@@ -3977,16 +3977,16 @@ protected:
             CacheCoordinator::PromptPrefix{.prefix_hashes = {}, .tokens = prompt_, .max_tokens = 3});
     }
 
-    // An unrelated full page cached from the block a dense growth takes next.
-    CacheBlockLocation CacheUnrelatedPage() {
+    // An unrelated full page cached from the block a dense growth takes next;
+    // sets `location` to its block.
+    void CacheUnrelatedPage(CacheBlockLocation& location) {
         std::vector<BlockTable> filler(2);
-        EXPECT_TRUE(AdmitForTest(coordinator_, filler, coordinator_.ProbePrefix({}),
+        ASSERT_TRUE(AdmitForTest(coordinator_, filler, coordinator_.ProbePrefix({}),
                                  GroupDemand{.extent = DenseGrowth{kP}}, RequestProgress{},
                                  StateStep{StateStep::Kind::kKeep}));
-        const CacheBlockLocation location = filler[0].Blocks()[0]->Location();
+        location = filler[0].Blocks()[0]->Location();
         CacheFullBlocksForTest(coordinator_, filler, unrelated_page_);
         coordinator_.Free(filler);
-        return location;
     }
 
     std::optional<CacheBlockLocation> CachedUnrelatedPage() const {
@@ -3997,7 +3997,8 @@ protected:
 };
 
 TEST_F(ShardedTailCopyPackingFourTest, HitterCopyWaitsForAHoleInTheSourceBucket) {
-    const CacheBlockLocation source = CacheTailInBucketZero();
+    CacheBlockLocation source;
+    ASSERT_NO_FATAL_FAILURE(CacheTailInBucketZero(source));
     // Group 0's two holes are both in bucket 1; the one empty parent left is
     // what the hitter's State live slot needs.
     std::vector<CacheBlockRef> resident = Resident(0);
@@ -4024,11 +4025,13 @@ TEST_F(ShardedTailCopyPackingFourTest, HitterCopyWaitsForAHoleInTheSourceBucket)
 }
 
 TEST_F(ShardedTailCopyPackingFourTest, HitterCopyIsFundedByAnEvictionInTheSourceBucket) {
-    const CacheBlockLocation source = CacheTailInBucketZero();
+    CacheBlockLocation source;
+    ASSERT_NO_FATAL_FAILURE(CacheTailInBucketZero(source));
     // Bucket 0's only other slot holds an unrelated cached page; bucket 1
     // has a hole, and the one empty parent is the State live slot's.
     std::vector<CacheBlockRef> resident = Resident(1);
-    const CacheBlockLocation page = CacheUnrelatedPage();
+    CacheBlockLocation page;
+    ASSERT_NO_FATAL_FAILURE(CacheUnrelatedPage(page));
     ASSERT_EQ(coordinator_.Allocator(0).BucketOf(page), 0);
     ASSERT_EQ(pool_.FreeSlotsByBucket(0)[0], 0);
     ASSERT_EQ(pool_.FreeSlotsByBucket(0)[1], 1);
@@ -4046,11 +4049,13 @@ TEST_F(ShardedTailCopyPackingFourTest, HitterCopyIsFundedByAnEvictionInTheSource
 }
 
 TEST_F(ShardedTailCopyPackingFourTest, HitterCopyIsNotFundedByAnEvictionInAnotherBucket) {
-    CacheTailInBucketZero();
+    CacheBlockLocation source;
+    ASSERT_NO_FATAL_FAILURE(CacheTailInBucketZero(source));
     // Bucket 0 is full; the only cached entry to evict besides the hit is a
     // page in bucket 1, and the one empty parent is the State live slot's.
     std::vector<CacheBlockRef> resident = Resident(0);
-    const CacheBlockLocation page = CacheUnrelatedPage();
+    CacheBlockLocation page;
+    ASSERT_NO_FATAL_FAILURE(CacheUnrelatedPage(page));
     ASSERT_EQ(coordinator_.Allocator(0).BucketOf(page), 1);
     ASSERT_EQ(pool_.FreeSlotsByBucket(0)[0], 0);
     ASSERT_EQ(pool_.FreeSlotsByBucket(0)[1], 1);
@@ -4134,21 +4139,22 @@ protected:
 
     // Another request publishes the owner's tail first from a bucket-1 block
     // while the owner's own tail block is in bucket 0, so the owner's
-    // publication dedupes onto that block and the copy-in copies it. Returns
-    // the canonical block; `residents_` keeps bucket 1 full and, with
+    // publication dedupes onto that block and the copy-in copies it. Sets
+    // `canonical` to that block; `residents_` keeps bucket 1 full and, with
     // own_bucket_full, bucket 0 too.
-    CacheBlockLocation PublishCanonicalInBucketOne(std::vector<BlockTable>& owner, bool own_bucket_full) {
+    void PublishCanonicalInBucketOne(std::vector<BlockTable>& owner, bool own_bucket_full,
+                                     CacheBlockLocation& canonical) {
         std::vector<CacheBlockRef> kept = Resident(0);
         std::vector<CacheBlockRef> owner_room = Resident(0);  // freed below for the owner's block
         std::vector<CacheBlockRef> spare = Resident(0);
         std::vector<BlockTable> other(2);
-        EXPECT_TRUE(AdmitForTest(coordinator_, other, coordinator_.ProbePrefix({}),
+        ASSERT_TRUE(AdmitForTest(coordinator_, other, coordinator_.ProbePrefix({}),
                                  GroupDemand{.extent = DenseGrowth{3}}, RequestProgress{},
                                  StateStep{StateStep::Kind::kKeep}));
-        const CacheBlockLocation canonical = other[0].Blocks()[0]->Location();
+        canonical = other[0].Blocks()[0]->Location();
         EXPECT_EQ(BucketOf(other[0].Blocks()[0]), 1);
         owner_room.clear();
-        EXPECT_TRUE(AdmitForTest(coordinator_, owner, 3));
+        ASSERT_TRUE(AdmitForTest(coordinator_, owner, 3));
         EXPECT_EQ(BucketOf(owner[0].Blocks()[0]), 0);
         coordinator_.CacheCompletedBlocks(other, TailAtThree(/*owner_continues=*/false, /*publish_state=*/false),
                                           CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
@@ -4157,7 +4163,6 @@ protected:
             spare.clear();
         }
         residents_ = {std::move(kept), std::move(spare), Resident(1), Resident(1)};
-        return canonical;
     }
 
     std::vector<std::vector<CacheBlockRef>> residents_;
@@ -4165,7 +4170,8 @@ protected:
 
 TEST_F(ShardedTailCopyPackingSixTest, OwnerCopyInIsCountedInTheBucketOfTheBlockItDedupesOnto) {
     std::vector<BlockTable> owner(2);
-    const CacheBlockLocation canonical = PublishCanonicalInBucketOne(owner, /*own_bucket_full=*/false);
+    CacheBlockLocation canonical;
+    ASSERT_NO_FATAL_FAILURE(PublishCanonicalInBucketOne(owner, /*own_bucket_full=*/false, canonical));
     ASSERT_EQ(pool_.FreeSlotsByBucket(0)[0], 1) << "the owner's own bucket has a hole";
     ASSERT_EQ(pool_.FreeSlotsByBucket(0)[1], 0) << "the canonical block's bucket has none";
     ASSERT_EQ(pool_.NumEmptyLcmBlocks(), 0);
@@ -4180,7 +4186,8 @@ TEST_F(ShardedTailCopyPackingSixTest, OwnerCopyInIsCountedInTheBucketOfTheBlockI
 
 TEST_F(ShardedTailCopyPackingSixTest, OwnerCopyInKeepsTheBlockItDedupesOnto) {
     std::vector<BlockTable> owner(2);
-    const CacheBlockLocation canonical = PublishCanonicalInBucketOne(owner, /*own_bucket_full=*/true);
+    CacheBlockLocation canonical;
+    ASSERT_NO_FATAL_FAILURE(PublishCanonicalInBucketOne(owner, /*own_bucket_full=*/true, canonical));
     ASSERT_EQ(pool_.NumFreeSlots(0), 0);
     ASSERT_EQ(pool_.NumEmptyLcmBlocks(), 0);
 
