@@ -1130,6 +1130,7 @@ def _muse_tp_routes_worker(rank, world_size, device):
     cases += [(n, True, False) for n in (3, 6, 33)]
     cases += [
         (192, True, True),
+        (193, True, True),
         (193, False, True),
         (2049, True, True),
         (8191, False, True),
@@ -1142,10 +1143,14 @@ def _muse_tp_routes_worker(rank, world_size, device):
         weights = (
             torch.linspace(0.01, 1, topk, device=device).expand(tokens, -1).contiguous()
         )
-        routes = torch.empty(
-            (indices.numel(), width if canonical else width + 16),
-            device=device,
-            dtype=torch.bfloat16,
+        routes = (
+            state.acquire_owned_route_input(tokens)
+            if owned and canonical
+            else torch.empty(
+                (indices.numel(), width if canonical else width + 16),
+                device=device,
+                dtype=torch.bfloat16,
+            )
         )
 
         def update(step):
@@ -1194,6 +1199,17 @@ def _muse_tp_routes_worker(rank, world_size, device):
         update(0)
         actual = run()
         torch.testing.assert_close(actual, reference(0), rtol=0, atol=2**-8)
+        if tokens == 192 and owned and canonical:
+            before = routes.clone()
+            rotated = ((indices + 1) % indices.numel()).int()
+            with pytest.raises(ValueError, match="must not overlap"):
+                state.reduce_scatter_owned_routes(routes, rotated, tokens)
+            shifted = state.owned_route_input.flatten()[
+                width : width + routes.numel()
+            ].view_as(routes)
+            with pytest.raises(ValueError, match="must not overlap"):
+                state.reduce_scatter_owned_routes(shifted, None, tokens)
+            torch.testing.assert_close(routes, before, rtol=0, atol=0)
         if tokens <= 33 or owned:
             if owned:
                 state.owned_route_scatter_flags.view(torch.int32).fill_(-2)
@@ -1218,7 +1234,7 @@ def _muse_tp_routes_worker(rank, world_size, device):
         dist.barrier()
 
 
-def _muse_tp_owned_forward_worker(rank, world_size, device):
+def _muse_tp_owned_forward_worker(rank, world_size, device, *, quantized: bool):
     """Exercise the real router/pool/gather/expert/unpool caller on uneven rows."""
     from tokenspeed.runtime.configs.muse_spark_config import MuseSparkConfig
     from tokenspeed.runtime.distributed import process_group_manager as pgm
@@ -1226,6 +1242,7 @@ def _muse_tp_owned_forward_worker(rank, world_size, device):
         initialize_comm_backend,
     )
     from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
     from tokenspeed.runtime.models.muse_spark import MuseSparkMoE
 
     torch.set_grad_enabled(False)
@@ -1261,8 +1278,8 @@ def _muse_tp_owned_forward_worker(rank, world_size, device):
             output_multiplier=0.125,
             residual_gate_temperature=0.3,
             moe_hidden_size=4096,
-            moe_intermediate_size=256,
-            num_local_experts=8,
+            moe_intermediate_size=4096 if quantized else 256,
+            num_local_experts=256 if quantized else 8,
             num_experts_per_tok=8,
             num_shared_experts=0,
             routed_scaling_factor=1.0,
@@ -1281,19 +1298,35 @@ def _muse_tp_owned_forward_worker(rank, world_size, device):
         projector_hidden_size=32,
         projector_hidden_act="gelu",
     )
+    quant_config = (
+        Mxfp4Config(
+            is_checkpoint_mxfp4_serialized=True,
+            use_dynamic_mxfp4_activations=True,
+        )
+        if quantized
+        else None
+    )
     with torch.device(device):
-        moe = MuseSparkMoE(config, mapping, None, 0, "model.layers.0.mlp", None)
+        moe = MuseSparkMoE(config, mapping, quant_config, 0, "model.layers.0.mlp", None)
     torch.manual_seed(117)
     for parameter in moe.parameters():
-        parameter.normal_(0, 0.02)
+        if parameter.is_floating_point():
+            parameter.normal_(0, 0.02)
     # Sparse pool/unpool weights make the reference insensitive to GEMM tiling.
     for projection in (moe.pre_expert_proj, moe.post_expert_proj):
         projection.weight.zero_()
         index = torch.arange(projection.output_size, device=device)
         projection.weight[index, (index * 3) % projection.input_size] = 1
     torch.manual_seed(117 + rank)
-    moe.experts.w13_weight.normal_(0, 0.02)
-    moe.experts.w2_weight.normal_(0, 0.02)
+    if quantized:
+        moe.experts.w13_weight.random_(0, 256)
+        moe.experts.w2_weight.random_(0, 256)
+        moe.experts.w13_weight_scale.random_(118, 124)
+        moe.experts.w2_weight_scale.random_(118, 124)
+        moe.experts.process_weights_after_loading(moe.experts)
+    else:
+        moe.experts.w13_weight.normal_(0, 0.02)
+        moe.experts.w2_weight.normal_(0, 0.02)
     moe.gate.process_weights_after_loading(moe.gate)
     _, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=world_size)
     for rows in (192, 193):
@@ -1517,7 +1550,11 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         pytest.param(_muse_routed_lamport_worker, "nccl", id="routed_lamport"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
         pytest.param(_muse_tp_routes_worker, "nccl", id="tp_routes"),
-        pytest.param(_muse_tp_owned_forward_worker, "nccl", id="tp_owned_forward"),
+        pytest.param(
+            partial(_muse_tp_owned_forward_worker, quantized=False),
+            "nccl",
+            id="tp_owned_forward",
+        ),
     ],
 )
 @pytest.mark.parametrize("world_size", [4, 8])
@@ -1529,4 +1566,18 @@ def test_muse_collective_replay(check, backend, world_size):
         _communication_worker,
         (world_size, _get_open_port(), check, backend),
         world_size,
+    )
+
+
+def test_muse_tp8_owned_a4w4_forward():
+    _skip_if_unsupported(8, "Muse A4W4 owned forward")
+    _spawn_and_collect(
+        _communication_worker,
+        (
+            8,
+            _get_open_port(),
+            partial(_muse_tp_owned_forward_worker, quantized=True),
+            "nccl",
+        ),
+        8,
     )

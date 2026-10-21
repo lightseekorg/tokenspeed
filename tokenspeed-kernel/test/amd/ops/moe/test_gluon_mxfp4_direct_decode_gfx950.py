@@ -760,6 +760,10 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
         )
         reference = torch.empty((rows * 8, 4096), dtype=torch.bfloat16, device="cuda")
         reference_map = torch.empty(rows * 8, dtype=torch.int32, device="cuda")
+        guarded = torch.full(
+            (rows * 8 + 2, 4096), 17, dtype=torch.bfloat16, device="cuda"
+        )
+        destination = guarded[1:-1]
 
         def run_reference():
             invoke_stage1_mxfp4_mfma_decode_gluon(
@@ -794,7 +798,7 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
                 PIPELINE_K=False,
             )
 
-        def run_actual():
+        def run_actual(output):
             return moe_apply(
                 plan,
                 (packed, scales),
@@ -803,15 +807,20 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
                 topk_weights=weights,
                 topk_ids=ids,
                 do_finalize=False,
+                deferred_out=output,
             )
 
         run_reference()
         with assert_no_triton_compile(*kernels):
-            run_actual()
+            allocated, _, allocated_map = run_actual(None)
+            supplied, _, supplied_map = run_actual(destination)
+            torch.testing.assert_close(supplied, allocated, atol=0, rtol=0)
+            torch.testing.assert_close(supplied_map, allocated_map, atol=0, rtol=0)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 run_reference()
-                actual, _, actual_map = run_actual()
+                actual, _, actual_map = run_actual(destination)
+        assert actual.data_ptr() == destination.data_ptr()
         for phase in range(3):
             new_hidden = _exact_mxfp4_activation(rows, 4096, generator)
             new_packed, new_scales = _quantize_mxfp4_activation(new_hidden)
@@ -891,3 +900,9 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
                 atol=0,
             )
             assert bool(torch.isfinite(actual[owned]).all())
+            torch.testing.assert_close(
+                guarded[0], torch.full_like(guarded[0], 17), rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                guarded[-1], torch.full_like(guarded[-1], 17), rtol=0, atol=0
+            )
