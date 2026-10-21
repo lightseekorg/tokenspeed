@@ -358,7 +358,6 @@ def iris_k3attn_push_oneshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
         WAIT_VMEM=WAIT_VMEM,
     )
     local_inbox = inbox_sym_ptr + inbox_slot_offset

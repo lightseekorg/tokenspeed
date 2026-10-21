@@ -261,7 +261,6 @@ def iris_pull_allgather_columns(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
         PUBLISH=True,
         PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
     )
@@ -305,7 +304,6 @@ def iris_pull_allgather_columns(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
         PUBLISH=True,
         PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
     )
