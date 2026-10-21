@@ -1426,6 +1426,46 @@ This avoids the per-route partials buffer and FP32 reduction kernel, at the cost
 of order-dependent BF16 rounding. Stage 2 clears the destination on each call
 and graph replay. Larger token counts retain the FP32 reduction path.
 
+### gfx950 BF16 expert routes
+
+`gluon_bf16_moe_routes_gfx950` serves `bf16_moe_routes`, the unweighted
+expert (down-projection) output of every route, replacing the portable Triton
+kernel, which loops over every local expert in every program. Up to 16 tokens
+take the direct decode kernels (`moe/fp16/routes_decode.py`), larger batches
+the grouped prefill kernels (`moe/fp16/routes_prefill.py`).
+
+#### Contract
+
+- Contiguous BF16 `x [tokens, hidden]`, gate/up weights
+  `[experts, 2 * I, hidden]` (gate rows first) and down weights
+  `[experts, hidden, I]` for intermediate size `I`, with `hidden % 512 == 0`
+  and `I % 256 == 0`; global expert ids `[tokens, topk]` with `topk` in
+  {1, 2, 4, 8, 16}.
+- Writes the output of every selected local expert to row
+  `token * topk + slot` and zeros for routes to non-local or invalid experts.
+  A token may select one expert in several slots.
+- Both GEMMs accumulate in FP32; the SwiGLU intermediate is rounded to BF16
+  between them.
+- The token count is a runtime argument. Other shapes, and route buffers or
+  an expert's gate/up weights of 2 GiB or more (`buffer_offsets_fit_int32`),
+  select the Triton kernel.
+
+#### Algorithm
+
+Decode launches one program per output tile and route for each GEMM. The
+first route that selects an expert gathers every token routed to it into one
+16-row MFMA tile and streams the expert's weights once; later routes of the
+same expert exit. The waves split K and reduce through LDS once, as in the
+dense decode GEMV.
+
+Prefill zeroes the rows of non-local routes, then packs each expert's routes,
+in route order and without atomics (per-block histograms, one prefix sum and
+a stable scatter), into 256-row tiles plus at most one 128-row remainder.
+Both GEMMs run the eight-wave warp-pipelined tile of the dense BF16 prefill
+kernel and gather activation rows through the sorted route ids. Programs are
+numbered over the live tiles only, so the XCD remap spreads them over all
+eight XCDs.
+
 ### MoE route from precomputed top-k
 
 `_precomputed_topk_route` builds the ragged expert metadata, gather/scatter

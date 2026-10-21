@@ -47,6 +47,7 @@ from tokenspeed_kernel.ops.moe import (
     FUSED_ROUTING_MAX_TOKENS,
     PreparedNvfp4Routing,
     bf16_moe_routes,
+    bf16_moe_routes_warmup,
     gather_moe_routes,
     moe_sigmoid_bias_topk_routing,
     moe_topk,
@@ -1555,6 +1556,8 @@ class MuseSparkMoE(nn.Module):
                     if self.tp_size > 1 and self.iris_state is not None
                     else None
                 ),
+                batch_invariant=global_server_args_dict["numerics"]
+                in BITWISE_ENVELOPES,
             )
             combined = self._reduce_expert_routes(
                 routes=routes,
@@ -2585,15 +2588,20 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             if self._loaded_audio != audio_parameters:
                 missing = sorted(audio_parameters - self._loaded_audio)
                 raise ValueError(f"checkpoint is missing audio tensors: {missing[:5]}")
-        if global_server_args_dict["disable_autotune"]:
-            return
-        experts_to_warm = [
-            layer.mlp.experts
-            for layer in self.model.layers
-            if layer.mlp.quantized_experts
-            and layer.mlp.experts.plan.get("warmup") is not None
+        bf16_mlps = [
+            layer.mlp for layer in self.model.layers if not layer.mlp.quantized_experts
         ]
-        if not experts_to_warm:
+        experts_to_warm = (
+            []
+            if global_server_args_dict["disable_autotune"]
+            else [
+                layer.mlp.experts
+                for layer in self.model.layers
+                if layer.mlp.quantized_experts
+                and layer.mlp.experts.plan.get("warmup") is not None
+            ]
+        )
+        if not bf16_mlps and not experts_to_warm:
             return
         # Match the global routing span reserved by execution/device.py.
         chunk = int(global_server_args_dict["chunked_prefill_size"])
@@ -2610,6 +2618,18 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         if global_server_args_dict["speculative_algorithm"]:
             decode_rows *= int(global_server_args_dict["speculative_num_draft_tokens"])
         max_tokens = max(max_tokens, decode_rows)
+        # BF16 expert layers compile their route kernels before graph capture.
+        # This is JIT warmup, not tuning, so disable_autotune does not skip it.
+        for mlp in bf16_mlps:
+            bf16_moe_routes_warmup(
+                mlp.experts.w13_weight,
+                mlp.experts.w2_weight,
+                mlp.topk,
+                mlp.expert_start,
+                max_num_tokens=max_tokens,
+                batch_invariant=global_server_args_dict["numerics"]
+                in BITWISE_ENVELOPES,
+            )
         for experts in experts_to_warm:
             if not experts._weights_processed:
                 raise RuntimeError("MoE weights must be processed before warmup")
