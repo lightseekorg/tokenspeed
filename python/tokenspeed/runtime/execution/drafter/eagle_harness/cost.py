@@ -209,6 +209,7 @@ def save_records(test_dir: str, records: list[MeasureRecord]) -> None:
 
 
 def load_records(path: str) -> list[dict]:
+    """The records of a ``save_records`` JSONL file, one dict per line."""
     with open(path, encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
 

@@ -467,6 +467,8 @@ class Eagle4DecoderLayer(Eagle3DecoderLayer):
 
 
 class Eagle4LlamaModel(Eagle3LlamaModel):
+    """The EAGLE-3 draft model body over EAGLE-4 decoder layers."""
+
     layer_cls = Eagle4DecoderLayer
 
 
@@ -596,6 +598,7 @@ class Eagle4CandidateLogitsProcessor(LogitsProcessor):
 
 
 class LlamaForCausalLMEagle4(LlamaForCausalLMEagle3):
+    """The EAGLE-4 draft: an EAGLE-3 draft with the low-rank candidate head."""
 
     model_cls = Eagle4LlamaModel
 
