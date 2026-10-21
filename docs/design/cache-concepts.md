@@ -278,7 +278,11 @@ null, so the first decode reads the landed state). When the decode role's
 own prefix cache holds the state for the prompt end -- a state hit counts
 only at the prompt end exactly, since the prefill's final state supersedes
 any shorter one -- `Forward.Batch.state_prefix_cached` is set for that row
-and both sides omit the group from the manifest (`pd/cache_protocol.py`).
+and both sides omit the group from the manifest (`pd/cache_protocol.py`). The
+admission copies that immutable input checkpoint into the request's private
+live slot. This supplies the same prompt-end state as a remote landing even
+if the bootstrap token finishes the request before any decode forward runs;
+publication and checkpoint preparation can therefore still use the live slot.
 
 Speculative KDA verification stores no per-position recurrent states: it
 captures each window's raw projections in a compact payload and commits by
