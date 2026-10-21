@@ -21,12 +21,19 @@ records every Python package mutation needed by this Ascend path, including the
 TokenSpeed applications should continue to import operators from
 `tokenspeed-kernel`; it owns registration and dispatch to this package.
 
+The BF16 local-expert chain keeps FP32 router coefficients through
+FinalizeRouting. Expert GEMM inputs, weights and outputs remain BF16; routing
+coefficients are not rounded to BF16 before the weighted sum.
+
 The Ascend plugin's explicit prefill composition can prepare a
 `W4A4GroupedPlan` from the existing fused W4A4 weight plan. It shares NZ
 weights, encodes official GMM scales once, and executes Cube FlatQuant before
-packed gather, GMM13, SwiGLU, Cube FlatQuant, and GMM2. The caller supplies exact
-sorted route rows and per-expert counts; no token padding is added. Both NZ
-orientations are supported. This is an explicit composed implementation, not
+official InitRouting, GMM13, SwiGLU, Cube FlatQuant, GMM2, and FinalizeRouting.
+The caller supplies token-major expert IDs, route weights, and its local
+expert interval. InitRouting copies packed INT4 bytes and FP32 scales with
+one permutation; group-aware consumers skip unused capacity rows. No token
+padding is added. Both NZ orientations are supported. This is an explicit
+composed implementation, not
 a fallback when the fused decode kernel rejects a shape. Official GMM's BF16
 epilogue has different intermediate rounding from fused vector dequantization.
 
