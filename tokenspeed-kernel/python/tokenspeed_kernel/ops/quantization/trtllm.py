@@ -48,7 +48,7 @@ if platform.is_nvidia:
             )
         q, scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
         if scale.ndim == 1:
-            # Native scales have a 4-row stride and trailing allocation padding.
+            # The flat-buffer ABI uses 4-row alignment and trailing padding.
             rows, columns = x.shape
             padded_rows = (rows + 3) // 4 * 4
             groups = columns // group_size
@@ -78,6 +78,7 @@ if platform.is_nvidia:
         "quantization",
         "fp8_with_scale",
         name="trtllm_quantize_fp8_with_scale",
+        features={"token_fp8_min_scaling"},
         solution="trtllm",
         capability=CapabilityRequirement(
             max_arch_version=ArchVersion(10, 9),
@@ -118,6 +119,47 @@ if platform.is_nvidia:
             return q, scale.t().contiguous()
 
         raise ValueError(f"unsupported TRT-LLM FP8 granularity: {granularity!r}")
+
+    @register_kernel(
+        "quantization",
+        "fp8_with_scale",
+        name="trtllm_quantize_fp8_mn_major",
+        solution="trtllm",
+        capability=CapabilityRequirement(
+            max_arch_version=ArchVersion(10, 9),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "granularity": frozenset({"token_group_128"}),
+            "scale_encoding": frozenset({"float32"}),
+            "scale_layout": frozenset({"mn_major"}),
+        },
+        features=frozenset({"mn_major_scales"}),
+        # A solution override (override="trtllm") skips trait matching and
+        # takes the solution's highest priority; the lowest band keeps it on
+        # trtllm_quantize_fp8_with_scale's contiguous scales.
+        priority=Priority.REFERENCE,
+    )
+    def trtllm_quantize_fp8_mn_major(
+        x: torch.Tensor,
+        *,
+        granularity: str,
+        group_size: int,
+        scale_encoding: str,
+        enable_pdl: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return FP8 values and a logical [M,K/128] view of native scales."""
+        if granularity != "token_group" or scale_encoding != "float32":
+            raise ValueError(
+                "MN-major FP8 quantization requires FP32 token-group scales"
+            )
+        if enable_pdl:
+            raise ValueError("TRT-LLM FP8 quantization does not expose PDL control")
+        q, scale = _per_token_group_quant_8bit(x, group_size, use_ue8m0=False)
+        # Preserve the native M stride; padding depends on the TRT-LLM ABI.
+        # Consumers may still need to align or repack these scales.
+        return q, scale.t()
 
     __all__ = [
         "trtllm_fp8_token_group_128",

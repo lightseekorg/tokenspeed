@@ -76,6 +76,7 @@ def _plan(combine_order: str, **overrides) -> dict:
         expert_id_repeats=True,
         fast_math=False,
         combine_order=combine_order,
+        features=frozenset(),
     )
     kwargs.update(overrides)
     return moe_plan("unquant", **kwargs)

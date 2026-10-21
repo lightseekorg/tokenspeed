@@ -23,7 +23,11 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.gemm import KIMI3_HIDDEN_SIZE, KIMI3_QKVFAB_SIZE
+from tokenspeed_kernel.ops.gemm import (
+    KIMI3_HIDDEN_SIZE,
+    KIMI3_QKVFAB_SIZE,
+    grouped_bf16_projection,
+)
 from tokenspeed_kernel.ops.gemm._gluon.gemv import gluon_simt_gemm_fp32
 from tokenspeed_kernel.ops.gemm.triton import MXFP4_LINEAR_SIGNATURES
 from tokenspeed_kernel.ops.quantization import quantize_fp8
@@ -1003,7 +1007,13 @@ else:
 
 if platform.is_cdna5:
     from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
+        gluon_grouped_mm_a16w16_gfx1250 as _grouped_mm_a16w16_gfx1250_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
         gluon_mm_a16w16_gfx1250 as _mm_a16w16_gfx1250_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
+        supports_gluon_grouped_mm_a16w16_fp8_gfx1250 as _supports_grouped_mm_a16w16_fp8_gfx1250,
     )
 
     @register_kernel(
@@ -1064,7 +1074,8 @@ if platform.is_cdna5:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "batch": frozenset({1}),
+            # DeepSeek V4.1 wo_a: one group per rank at TP8, two at TP4.
+            "batch": frozenset({1, 2}),
             "m_min": frozenset({1}),
             "m_max": frozenset({2048}),
             "n_align": frozenset({16}),
@@ -1078,15 +1089,59 @@ if platform.is_cdna5:
     def gluon_grouped_bf16_projection_gfx1250(
         x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
     ) -> torch.Tensor:
-        """Project a single group with CDNA5 WMMA; the API validates layouts."""
-        tokens = x.shape[0]
-        rows = weight.shape[1]
-        if out is None:
-            out = torch.empty((tokens, 1, rows), dtype=x.dtype, device=x.device)
-        _mm_a16w16_gfx1250_impl(
-            x[:, 0], weight[0], torch.bfloat16, out=out.view(tokens, rows)
-        )
-        return out
+        """Project every group with CDNA5 WMMA; the API validates layouts."""
+        return _grouped_mm_a16w16_gfx1250_impl(x, weight, out=out, quantize=False)
+
+    @register_kernel(
+        "gemm",
+        "grouped_bf16_projection_fp8",
+        name="gluon_grouped_bf16_projection_fp8_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "batch": frozenset({1, 2}),
+            "n_align": frozenset({32}),
+            "k_align": frozenset({128}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_contiguous": frozenset({True}),
+            "is_cuda": frozenset({True}),
+        },
+    )
+    def gluon_grouped_bf16_projection_fp8_gfx1250(
+        x: torch.Tensor, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Grouped projection whose split-K reduction quantizes to group-32 FP8.
+
+        Row counts whose tiles do not split K run the selected projection,
+        then quantize.
+        """
+        m, g, k = x.shape
+        n = weight.shape[1]
+        if not _supports_grouped_mm_a16w16_fp8_gfx1250(m, g, n, k):
+            projected = grouped_bf16_projection(x, weight, None, None)
+            return quantize_fp8(
+                projected.flatten(1),
+                granularity="token_group",
+                group_size=32,
+                scale_encoding="ue8m0",
+                enable_pdl=False,
+                override=None,
+                solution=None,
+            )
+        return _grouped_mm_a16w16_gfx1250_impl(x, weight, out=None, quantize=True)
 
 else:
 
@@ -1095,6 +1150,9 @@ else:
 
     def gluon_grouped_bf16_projection_gfx1250(*args, **kwargs):
         raise RuntimeError("gluon_grouped_bf16_projection_gfx1250 requires CDNA5")
+
+    def gluon_grouped_bf16_projection_fp8_gfx1250(*args, **kwargs):
+        raise RuntimeError("gluon_grouped_bf16_projection_fp8_gfx1250 requires CDNA5")
 
 
 # ===-----------------------------------------------------------------------===#
@@ -1304,6 +1362,7 @@ __all__ = [
     "gluon_mm_mxfp8_ue8m0_largem_gfx1250",
     "gluon_dsv4_linear_fp32_gfx1250",
     "gluon_grouped_bf16_projection_gfx1250",
+    "gluon_grouped_bf16_projection_fp8_gfx1250",
     "gluon_linear_attnres_partials_gfx950",
     "gluon_linear_attnres_partials_gfx1250",
 ]

@@ -344,6 +344,12 @@ class _Backend:
         )
         return (q * 0.25).to(q.dtype)
 
+    def plan_indexer_queries(
+        self, layer_id, positions, requests, forward_mode, index_process_group
+    ):
+        # Projection tests use unpartitioned queries.
+        return None
+
     def indexer_needs_scores(self, layer_id, positions, requests, mode):
         return True
 

@@ -229,8 +229,7 @@ admission states what the pair does through the group's `StateStep`
 stops writing it — the same `PublicationPoint` that publishes the KV tail
 (§1): a fused prompt end (the first decode's admission publishes slot 1 under
 the prompt's key before rotating it into slot 0), a chunk end that falls on a
-junction (§1) or the reusable boundary described below, and a finish or
-retraction on every role (`kFinal`: the P's
+junction (§1), and a finish or retraction on every role (`kFinal`: the P's
 transferred prompt, the D's and the fused engine's last decoded state). An
 ordinary chunk end or decode step publishes nothing for a State group
 (`CompletedPages::publish_state` is false). The key is the key of the exact
@@ -240,17 +239,6 @@ request's progress across every group kind (`cache-concepts.md`). A published
 state block is never written again: rotation moves it to slot 0, where it is
 read only, and the next step releases the request's reference while the
 cache keeps the block.
-
-With prefix caching enabled, a prompt longer than `max_scheduled_tokens`
-leaves one extra checkpoint at the last prefix-page boundary before its
-replay tail. The tail is at least one token, `prefix_replay_tokens`, and the
-largest replayable group's window. Cutting a chunk there makes a second
-request with a changed ending reuse the common prefix immediately: the
-prompt-end state cannot serve a hit that must replay its final token. This
-uses the same rotation and publication as a junction, costs at most one
-additional forward, and retains an evictable cache block per State group.
-Prompts within one configured chunk and models without State groups do not
-add this checkpoint; the D role still lands remote prefill in one transfer.
 
 **A finish settles when its last forward has landed.** `forward::Finish`
 (and the P role's `pd::SucceededEvent`) moves a page-holding request to
@@ -290,10 +278,9 @@ claimed cache block (a Host checkpoint is loaded into a fresh slot 0 like any
 Host hit). When the KV groups reach further than the state (`kv_tokens >
 num_common_tokens`), the difference is the junction: the first chunk ends
 there and publishes the checkpoint the cache lacked, so the next prompt that
-shares the prefix resumes at the KV boundary in every group. Junctions can
-be unaligned; the additional checkpoint before the replay tail is page
-aligned. No checkpoint is produced inside a forward: a chunk's state output
-is its own natural checkpoint.
+shares the prefix resumes at the KV boundary in every group. No alignment is
+ever imposed on a chunk for the state's sake, and no checkpoint is produced
+inside a forward: a chunk's state output is its own natural checkpoint.
 `CacheProgress::junction_tokens` is the only progress a State group adds to
 the request; the backend contract for the two slots is in
 [Cache concepts](cache-concepts.md#recurrent-state-two-slots-natural-checkpoints).
@@ -448,8 +435,10 @@ blocks are still in its table. A tail is at most `P − 1` tokens, so that is
 copy); a sliding group caps it at its lookback. The charge is what lets a
 pool sized for a request fund its copy-in; when a pool cannot (several
 retraction-exempt requests reaching their first decode together, each
-needing a copy), the owner publishes nothing at that point instead of
-waiting (§1).
+needing a copy, or a sharded group whose copy's bucket is full while other
+buckets have holes — the charge is bucket-blind), the owner publishes
+nothing at that point instead of waiting (§1), and a hitter's admission
+waits.
 
 Speculative decode admission grows from the committed token frontier plus the verify
 spans still in flight, the span being scheduled and the next span, which the

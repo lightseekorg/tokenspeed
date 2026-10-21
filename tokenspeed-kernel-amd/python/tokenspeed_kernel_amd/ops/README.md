@@ -441,9 +441,10 @@ projection covers other batch sizes with the same model dimensions.
 ### gfx1250 BF16 GEMM
 
 `gluon_mm_a16w16_gfx1250` is a general BF16 GEMM with FP32 or BF16 output. It
-backs the DeepSeek V4.1 FP32 projection (`gluon_dsv4_linear_fp32_gfx1250`) and
-single-group BF16 projections up to 2048 rows
-(`gluon_grouped_bf16_projection_gfx1250`).
+backs the DeepSeek V4.1 FP32 projection (`gluon_dsv4_linear_fp32_gfx1250`).
+`gluon_grouped_mm_a16w16_gfx1250` runs the one- or two-group `wo_a`
+projections up to 2048 rows (`gluon_grouped_bf16_projection_gfx1250`) and can
+quantize the result for `wo_b` (`gluon_grouped_bf16_projection_fp8_gfx1250`).
 
 #### Contract
 
@@ -452,6 +453,11 @@ single-group BF16 projections up to 2048 rows
   and `K` divisible by 128.
 - Output is FP32 or BF16, chosen explicitly. A caller-owned output needs a unit
   column stride.
+- The grouped form takes `A` `[M, G, K]` with a unit inner stride and
+  contiguous `B` `[G, N, K]`, and returns contiguous BF16 `[M, G, N]`. With
+  quantization (`N` divisible by 32) it returns E4M3 codes `[M, G * N]` and
+  uint8 UE8M0 scales `[M, G * N / 32]`, bit-identical to quantizing the BF16
+  result with `gluon_quantize_fp8_group32_ue8m0_gfx1250`.
 
 #### Algorithm
 
@@ -465,6 +471,15 @@ batches use `128 x 64` tiles, split K in two when the grid still fits, and move
 to the large-M kernel once those tiles alone exceed the CUs. Split partials are
 FP32 and the shared reduction sums them in split order, so results are
 deterministic.
+
+The groups of a grouped call share one grid: the column-tile axis enumerates
+every group's tiles, and the tile choice above sees `G * N` columns. Batches
+beyond the dense tiles run each group on the large-M kernel. With
+quantization, the split-K reduction rounds each sum to BF16 and stores codes
+and scales instead of the BF16 result, so the activation never reaches
+memory. Up to 32 rows, which otherwise do not split, use 32-column tiles with
+K split in two; other batches whose tiles do not split K project, then
+quantize.
 
 ### gfx1250 dense BF16 large-M projection
 
@@ -694,13 +709,12 @@ preparation, validation and tiling, and runs two steps per query tile: a
 scorer writes one row of FP32 logits per query, one per candidate column, and
 a selector turns each row into that query's sorted list of logical KV row ids.
 gfx950 runs both steps in Gluon (`gluon_dsv41_index_topk_gfx950`, then
-`gluon_dsv41_index_topk_select_gfx950`) and selects candidate blocks with the
-portable Triton radix select (`tokenspeed_kernel` `index_block_select`);
-gfx1250 has a Gluon scorer and, for query tiles of 128 rows and up, a Triton
-radix selector
-(`triton_dsv41_index_topk_select_gfx1250`); smaller tiles use the portable
-torch selector. Both scorers take queries packed as MXFP4 values with one E8M0
-scale per 32 values.
+`gluon_dsv41_index_topk_select_gfx950`), and gfx1250 does the same
+(`gluon_dsv41_index_topk_gfx1250`, then
+`gluon_dsv41_index_topk_select_gfx1250`). Both select candidate blocks with
+the portable Triton radix select (`tokenspeed_kernel` `index_block_select`),
+and both scorers take queries packed as MXFP4 values with one E8M0 scale per
+32 values.
 
 #### Contract
 
@@ -714,8 +728,9 @@ scale per 32 values.
   without a candidate, or on a missing or out-of-range page stay `-inf`.
 - Row selection writes the logical ids of the `min(topk, width)` largest
   finite logits in ascending order, then -1, plus their count (the
-  `select_rows_torch` contract). The gfx950 selector and the gfx1250 radix
-  selector keep the lowest columns among equal-score boundary ties.
+  `select_rows_torch` contract). The Gluon selectors keep the lowest columns
+  among equal-score boundary ties; the gfx1250 selector also ties `-0.0` with
+  `+0.0`.
 - Optional block selection keeps the best 8-row blocks by their maximum logit.
   A valid newest visible block remains eligible regardless of its score.
 - Selection scores the configured page-table or candidate capacity without
@@ -753,18 +768,14 @@ ascending without candidates and with ascending candidate lists; otherwise an
 all-pairs rank sorts them. LDS atomics cost about one wave instruction per 64
 lanes regardless of conflicts, so the radix passes dominate on wide rows.
 
-The gfx1250 radix selector runs one program per row. Four 8-bit histogram
-passes find the K-th largest value, and a final pass writes the selected
-values and columns in ascending column order, taking ties at the threshold in
-column order. The adapter then maps the columns to logical rows and sorts them
-in torch. Tiles below 128 rows, including decode, use the torch selector.
+The gfx1250 selector runs the same passes on sixteen 32-lane waves, so each
+workgroup keeps 512 lanes and the 2048-bin histograms.
 
 Block selection takes the maximum logit of each 8-row block, forces the
 newest visible block to `+inf`, and keeps the top blocks in ascending order.
-On gfx950 the portable Triton block select runs one program per query: it
-reads only the visible blocks, runs a four-pass MSD radix select (8 key bits
-per pass), and emits the picks in block order, so no sort is needed. gfx1250
-uses torch.
+The portable Triton block select runs one program per query: it reads only
+the visible blocks, runs a four-pass MSD radix select (8 key bits per pass),
+and emits the picks in block order, so no sort is needed.
 
 ### gfx950 DeepSeek V4.1 selected attention
 
@@ -807,6 +818,33 @@ the row sum and count). `gluon_dsv41_selected_attention_reduce_gfx950` merges
 them in a fixed order and adds the sink once; each of its workgroups owns one
 token, 16 heads and a 64-dim slice, so the merge of a small batch still spreads
 over many CUs.
+
+### gfx1250 DeepSeek V4.1 selected attention
+
+`gluon_dsv41_selected_attention_gfx1250` and its reduce kernel follow the
+gfx950 contract, split and zero-query shortcut above. QK and PV use 16x16x32
+BF16 WMMA. Rows are dequantized with the CDNA5 `scaled_upcast` at a unit
+scale and then multiplied by the block scale: the E8M0 SWA scale as an exact
+BF16 power of two, the E4M3 global scale as BF16. Rows are not prefetched,
+and V is read from LDS only after QK: the registers this saves buy more
+workgroups per CU than the overlap would.
+
+The launch differs from gfx950 in two ways. Small batches give each
+workgroup one or two 16-head groups instead of four while rows x head blocks
+x tiles stays within 640. That re-reads each selected row once per head
+block in exchange for more parallel workgroups, so the token count picks one
+of three compiled head-group widths. A split also covers at least two tiles,
+so SWA-only calls, which have two tiles, never split.
+
+`gluon_dsv41_selected_attention_rope_gfx1250` serves
+`dsv41_selected_attention_rope`. The split reduction rotates the RoPE tail of
+each output row back with the FP32 inverse table at the row's position before
+its store, so the unrotated output never reaches memory. Unlike gfx950, rows
+that do not split (from about 129 decode rows) rotate after the main kernel,
+in `gluon_dsv41_output_rope_gfx1250`, because rotating in its epilogue cost
+that register-heavy kernel 7 us at 129 and 192 rows. That pass covers 16
+heads per program and loads even and odd dims separately, so the rotation
+needs no lane swap; it costs no more than `rope_inplace` over the real heads.
 
 ### gfx950 QSA sparse attention
 
@@ -1018,6 +1056,12 @@ than 8 (base 2); FP8 keeps the exact maximum so P stays at most 1 before its
 FP8 conversion. A wave skips the rescale when none of its rows moved. Empty
 asm statements keep LLVM from moving each cluster's results across cluster
 barriers.
+
+### gfx950 MHA cached extension
+
+Cached attention supports grouped-query attention even when the number of
+query heads per KV head is not a power of two. Multi-token extensions preserve
+the masking semantics of full and sliding-window attention.
 
 ### gfx950 MLA extend
 
@@ -1259,7 +1303,7 @@ Input, weight, and output shapes and dtypes are the gfx950 entry's. Two
 things differ:
 
 - Automatic dispatch selects the decode launcher for 1 to 64 tokens and the
-  prefill kernel from 1536; the range between them retains the Triton kernel.
+  prefill kernel from 1025; the range between them retains the Triton kernel.
 - The packed tensor passed alongside the three weights must be their
   consecutive view. The kernels read only it, so the launchers reject a
   packed tensor the weights do not live inside.
@@ -1623,6 +1667,12 @@ One program handles one token with four warps. It walks the expert vector
 once per selected route, keeps the maximum finite score, and breaks ties by
 the minimum expert id. The weight is the sigmoid captured for that expert.
 
+### gfx950 channel-FP8 experts with BF16 projection operands
+
+Channel-scaled FP8 expert weights can remain in their compact checkpoint
+format while projections use BF16 operands and FP32 accumulation. FP8 storage
+does not require native FP8 matrix arithmetic.
+
 ## Residual
 
 ### gfx1250 Kimi K3 AttnRes
@@ -1776,9 +1826,11 @@ four branches across waves, so the gate tensor never reaches memory.
 ### gfx1250 mHC mixes projection
 
 `gluon_mhc_mixes_gfx1250` computes the hc=4 prenorm mixing coefficients for
-BF16 residual streams. It shares split selection, normalization, and the
-Sinkhorn iterations with `triton_mhc_mixes`, and replaces only the projection
-`x @ fn.T` with its row sums of squares.
+BF16 residual streams. It shares split selection with `triton_mhc_mixes` and
+replaces both of its kernels: the projection `x @ fn.T` with its row sums of
+squares, and the reduction that runs normalization and the Sinkhorn
+iterations. `gluon_mhc_pre_gfx1250` runs the same two kernels for `mhc_pre`
+at every token count, then collapses the streams with the portable kernel.
 
 #### Contract
 
@@ -1797,6 +1849,32 @@ give the FP32 projection up to accumulation order. Each program covers 64 rows
 and one K partition, pipelines K tiles through three or four TDM buffers, and
 pads the 24 mixes to two 16-wide WMMA tiles. The token count and tiles per
 partition are runtime arguments.
+
+The reduction is the gfx950 kernel on 32-lane waves: sixteen lanes own a
+token's 4x4 matrix, so a wave covers two tokens when the splits stay in
+registers and one when they also spread over lanes.
+
+### gfx1250 mHC stream collapse with FP8 output
+
+`gluon_mhc_apply_pre_fp8_group32_gfx1250` serves `mhc_apply_pre_fp8_group32`
+for DeepSeek V4.1: the gfx950 stream collapse with RMSNorm that also writes
+the group-32 FP8 input of the next projection.
+
+#### Contract
+
+- Contiguous BF16 residual `[T, 4, H]` with `H` divisible by 32 and fewer
+  than 2^31 elements, FP32 pre coefficients `[T, 4]` and a BF16 or FP32 norm
+  weight `[H]`.
+- Returns the BF16 layer input `[T, H]`, numerically the gfx950 normalized
+  collapse, with E4M3 codes `[T, H]` and uint8 UE8M0 scales `[T, H / 32]`
+  bit-identical to `gluon_quantize_fp8_group32_ue8m0_gfx1250` reading it.
+
+#### Algorithm
+
+One four-wave CTA owns a token, so RMSNorm reduces the row once; each lane
+moves eight contiguous BF16 values, and four lanes hold one quantization
+group. The BF16-rounded result is quantized from registers, which saves the
+quantizer's launch and its re-read of the row.
 
 ## Quantization
 
@@ -1837,3 +1915,11 @@ FP32 bits of the quotient, and its codes are the correctly rounded
 `x / scale` cast to E4M3. Each program covers consecutive groups, with four
 threads per group and eight elements per thread: 32 groups and four warps
 below 49,152 groups, and 256 groups and eight warps from there.
+
+## Layernorm
+
+### gfx950 QK RMSNorm and SSMax query fusion
+
+Query normalization can be fused with position-dependent SSMax scaling while
+preserving the rounding of the separate operations. The positional scale
+applies only to queries; keys retain ordinary RMS normalization.

@@ -122,8 +122,8 @@ def get_batch_sizes_to_capture(config: ModelExecutorConfig):
         capture_bs = list(sorted(set(capture_bs + [max_bs - 1] + [max_bs])))
 
     effective_max = min(config.max_cudagraph_capture_size, max_bs)
-    capture_bs = [bs for bs in capture_bs if 0 < bs <= effective_max]
-    return capture_bs
+    # Ascending and unique: padding bisects the ladder for a batch's graph.
+    return sorted({bs for bs in capture_bs if 0 < bs <= effective_max})
 
 
 global_graph_memory_pool = None
@@ -560,6 +560,7 @@ class ForwardStepRunner:
             # symm-mem -> NaN draft logits -> accept_rate 0. Set the matching
             # uniform dummy.
             ctx.global_bs = [bs] * self.world_size
+            ctx.global_num_decodes = [bs] * self.world_size
 
         # The sampler has a single pool-indexed route: greedy requests are
         # served by top_k=1 in the pool buffers, so capture and every replay
@@ -737,6 +738,7 @@ class ForwardStepRunner:
                         bs * self.max_tokens_per_req
                     ] * self.world_size
                     ctx.global_bs = [bs] * self.world_size
+                    ctx.global_num_decodes = [bs] * self.world_size
 
                 sampling_info = SamplingBatchInfo(
                     req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],

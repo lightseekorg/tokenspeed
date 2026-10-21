@@ -98,6 +98,13 @@ preceding goals (still evolving; subject to change):
   priority, and returns a callable. Selection supports per-call `solution=`
   and `override=` plus config-file overrides for development.
 
+For call sites requiring batch invariance, `KernelPlan.select()` selects from declared
+capabilities at initialization using static geometry. Execution reuses that
+plan and validates its input contract without re-ranking by batch size. This
+is opt-in; ordinary auto-selection keeps its existing policy. A planned leaf
+that can be recorded into a CUDA graph also declares the `cuda_graph` feature;
+callers that plan their leaves capture only through leaves declaring it.
+
 ### Directory structure
 
 ```

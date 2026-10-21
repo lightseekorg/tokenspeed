@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import json
 import os
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
@@ -95,6 +96,7 @@ from tokenspeed.runtime.distributed.nccl_suspend import (
 )
 from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.epd.recv_pool import recv_pool_bytes
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     PendingExecution,
@@ -569,19 +571,40 @@ class DeviceHandle:
         executor = self._executor
 
         def _forward():
-            return executor.execute_forward_op(
-                planned.forward_op,
-                planned.sampling_params_list,
-                dp_metadata=planned.dp_metadata,
-                grammar_inputs=planned.grammar_inputs,
-                multimodal_context=planned.multimodal_context,
-                capture_next_input_ids=capture_next_input_ids,
-                ngram_inputs=planned.ngram_inputs,
-                request_history_seeds=planned.request_history_seeds,
-                input_logprob_plan=planned.input_logprob_plan,
-                sampled_top_k=planned.sampled_top_k,
-                stop_criteria=planned.stop_criteria,
-            )
+            phase_range = contextlib.nullcontext()
+            # The C++ profiler-enabled query is thread-local and stays false
+            # on pre-existing workers under all-thread capture. This installed
+            # PyTorch process-global flag is validated by profile startup.
+            if getattr(torch.autograd.profiler, "_is_profiler_enabled", False):
+                batch = planned.forward_op
+                num_extends = batch.num_extends()
+                metadata = {
+                    "mode": ForwardMode.from_num_extends(
+                        num_extends, len(batch.request_ids)
+                    ).name,
+                    "num_extends": num_extends,
+                    "request_ids": batch.request_ids,
+                    "input_lengths": batch.input_lengths,
+                    "prefill_lengths": batch.prefill_lengths,
+                    "extend_prefix_lens": batch.extend_prefix_lens,
+                }
+                phase_range = torch.profiler.record_function(
+                    f"tokenspeed.forward.v1:{json.dumps(metadata, separators=(',', ':'))}"
+                )
+            with phase_range:
+                return executor.execute_forward_op(
+                    planned.forward_op,
+                    planned.sampling_params_list,
+                    dp_metadata=planned.dp_metadata,
+                    grammar_inputs=planned.grammar_inputs,
+                    multimodal_context=planned.multimodal_context,
+                    capture_next_input_ids=capture_next_input_ids,
+                    ngram_inputs=planned.ngram_inputs,
+                    request_history_seeds=planned.request_history_seeds,
+                    input_logprob_plan=planned.input_logprob_plan,
+                    sampled_top_k=planned.sampled_top_k,
+                    stop_criteria=planned.stop_criteria,
+                )
 
         return PendingExecution(self._thread.submit(_forward))
 
@@ -1513,6 +1536,18 @@ def build_device_side(
                 requested_backends,
                 startup_resident_bytes=sum(startup_memory.samples.get("startup", ())),
             )
+        if (
+            draft is not None
+            and server_args.speculative_algorithm == "DFLASH"
+            and not executor.config.prefill_only
+        ):
+            # Rebinding recreates the draft's auxiliary stream. Graph-phase
+            # warmups bypass its overlap path, so initialize its BLAS handle
+            # eagerly again before the final capture uses that fresh stream.
+            with torch.no_grad():
+                executor.forward_step.warmup_decode_path(
+                    batch_sizes=(1,), graph_phase=False
+                )
 
     with startup_phase("graph.capture"):
         executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)

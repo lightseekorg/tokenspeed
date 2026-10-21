@@ -50,9 +50,12 @@ def _config(monkeypatch, device, backend_name, **overrides):
         configs,
         "torch",
         SimpleNamespace(
-            device=lambda name: SimpleNamespace(type=name), bfloat16=torch.bfloat16
+            device=lambda name: SimpleNamespace(type=name),
+            bfloat16=torch.bfloat16,
+            int8=torch.int8,
         ),
     )
+    packed_width = overrides.pop("packed_width", 576)
     spec = DSAConfig(
         backend_name=backend_name,
         num_attention_heads=64,
@@ -64,7 +67,7 @@ def _config(monkeypatch, device, backend_name, **overrides):
         qk_rope_head_dim=64,
         v_head_dim=128,
         scaling=1.0,
-        kv_cache_dim=576,
+        kv_cache_dim=packed_width,
         index_topk=2048,
         index_head_dim=128,
         index_n_heads=16,
@@ -137,3 +140,44 @@ def test_ascend_draft_constraint_is_owned_by_the_backend(monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+def test_ascend_bf16_kv_keeps_native_row_layout(monkeypatch):
+    config, spec = _config(monkeypatch, "npu", "dsa")
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
+        _mla_layer_fields,
+    )
+
+    fields = _mla_layer_fields(config, 0, 0)
+    assert fields[0].shape == (128, 1, 576)
+    assert fields[0].dtype == "bfloat16"
+    assert fields[0].payload_bytes == 128 * 576 * 2
+    assert spec.cache_cell_size(config) == (576 + 128) * 2
+
+
+@pytest.mark.parametrize("device", ["cuda", "npu"])
+@pytest.mark.parametrize("width", [576, 672])
+def test_int8_cache_is_rejected_before_storage_planning(monkeypatch, device, width):
+    with pytest.raises(ValueError, match="INT8 KV cache is not supported"):
+        _config(
+            monkeypatch, device, "dsa", kv_cache_dtype=torch.int8, packed_width=width
+        )
+
+
+def test_int8_cache_dtype_is_not_resolved():
+    from tokenspeed.runtime.layers.attention.configs.base import resolve_dtype
+
+    with pytest.raises(ValueError, match="Unsupported kv_cache_dtype"):
+        resolve_dtype("int8")
+
+
+def test_int8_cache_is_rejected_by_server_arguments():
+    import argparse
+
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    with pytest.raises(SystemExit) as error:
+        parser.parse_args(["--model", "x", "--kv-cache-dtype", "int8"])
+    assert error.value.code == 2

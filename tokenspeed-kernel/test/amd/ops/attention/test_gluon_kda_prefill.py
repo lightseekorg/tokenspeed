@@ -25,15 +25,20 @@ from itertools import accumulate
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.attention.kda import kda_delta_rule, kda_gate
-from utils import is_cdna4
+from utils import is_cdna4, is_cdna5
 
-if not is_cdna4():
-    pytest.skip("AMD CDNA4 is required for Gluon KDA tests", allow_module_level=True)
-
-
-from tokenspeed_kernel_amd.ops.gfx950.attention.kda.prefill import (  # noqa: E402
-    launch_gluon_kda_paged_prefill_gfx950,
-)
+if is_cdna4():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.prefill import (
+        launch_gluon_kda_paged_prefill_gfx950 as launch_kda_prefill,
+    )
+elif is_cdna5():
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.prefill import (
+        launch_gluon_kda_paged_prefill_gfx1250 as launch_kda_prefill,
+    )
+else:
+    pytest.skip(
+        "AMD CDNA4 or CDNA5 is required for Gluon KDA tests", allow_module_level=True
+    )
 
 
 def _reference_sequence(
@@ -47,8 +52,8 @@ def _reference_sequence(
     dt_bias: torch.Tensor,
     lower_bound: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # V-major: state is [heads, V, K] (value-major), matching gfx950's
-    # physical recurrent-state pool layout.
+    # V-major: state is [heads, V, K] (value-major), matching the physical
+    # recurrent-state pool layout.
     q, k = q.float(), k.float()
     q = q * torch.rsqrt(torch.sum(q * q, dim=-1, keepdim=True) + 1e-6)
     k = k * torch.rsqrt(torch.sum(k * k, dim=-1, keepdim=True) + 1e-6)
@@ -104,7 +109,7 @@ def test_kda_prefill_matches_packed_recurrent_reference(
         expected_outputs.append(output)
         expected_states.append(state)
 
-    actual_output, actual_state = launch_gluon_kda_paged_prefill_gfx950(
+    actual_output, actual_state = launch_kda_prefill(
         q,
         k,
         v,

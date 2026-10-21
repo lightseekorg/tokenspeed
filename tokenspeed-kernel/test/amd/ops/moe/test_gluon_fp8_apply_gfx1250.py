@@ -107,6 +107,7 @@ def _plan(activation: str, swiglu_limit: float | None) -> dict:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     assert plan["apply_kernel_name"] == _KERNEL_NAME
     return plan

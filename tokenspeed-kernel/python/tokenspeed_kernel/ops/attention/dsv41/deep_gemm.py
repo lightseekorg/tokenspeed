@@ -792,3 +792,100 @@ def _use_sparse_candidate_scores(cache, candidates, candidate_topk):
         and cache.stride(0) < 2**31
         and cache.data_ptr() % 16 == 0
     )
+
+
+def _candidate_topk(scores, topk):
+    ends = torch.full(
+        (scores.shape[0],), scores.shape[1], dtype=torch.int32, device=scores.device
+    )
+    cluster = row_select.choose_cluster_size(
+        scores.shape[0], scores.shape[1], _ROW_CAPACITY, platform.sm_count
+    )
+    indices, values = row_select.deepselect_topk(
+        scores.contiguous(),
+        ends,
+        min(topk, scores.shape[1]),
+        capacity=_ROW_CAPACITY,
+        cluster_size=cluster,
+    )
+    if indices.shape[1] < topk:
+        padding = (0, topk - indices.shape[1])
+        indices = torch.nn.functional.pad(indices, padding, value=-1)
+        values = torch.nn.functional.pad(values, padding, value=-float("inf"))
+    return indices.long(), values
+
+
+@register_kernel(
+    "attention",
+    "dsv41_index_candidates",
+    name="deep_gemm_hopper_dsv41_index_candidates",
+    solution="deep_gemm",
+    signatures=[format_signature(x=dense_tensor_format(torch.bfloat16))],
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 0),
+        max_arch_version=ArchVersion(9, 0),
+        vendors=frozenset({"nvidia"}),
+    ),
+    priority=Priority.SPECIALIZED,
+)
+def index_candidates(index_q, weights, index_cache, table, visible, candidates, topk):
+    queries, folded = quantize_index_queries(index_q, weights)
+    _hopper_api(queries)
+    if candidates is None:
+        from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
+            compact_index_pages,
+            gather_index_candidates,
+        )
+
+        requests = torch.arange(table.shape[0], device=table.device, dtype=torch.int64)
+        pages, positions, lengths = compact_index_pages(table, requests, visible, 64)
+        scores = _hopper_paged_scores(
+            (queries,),
+            index_cache,
+            folded,
+            pages,
+            lengths[:, 0],
+            table.shape[1] * 64,
+            clean=True,
+        )
+        offsets, _ = _candidate_topk(scores, topk)
+        logical, selected = gather_index_candidates(offsets, scores, positions, 64)
+    else:
+        values, scales = _index_planes(index_cache)
+        scores = sparse_index_scores(
+            queries,
+            folded,
+            values.view(torch.float8_e4m3fn),
+            scales,
+            table,
+            visible,
+            candidates,
+            pdl_enabled(),
+        )
+        offsets, selected = _candidate_topk(scores, topk)
+        logical = (
+            candidates.gather(1, offsets.clamp_min(0) // 8).long() * 8 + offsets % 8
+        )
+    logical = logical.to(torch.int32).masked_fill(selected == -float("inf"), -1)
+    return torch.stack((logical, selected.contiguous().view(torch.int32)), dim=-1)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_merge_index_candidates",
+    name="deep_gemm_hopper_dsv41_merge_index_candidates",
+    solution="deep_gemm",
+    signatures=[format_signature(x=dense_tensor_format(torch.int32))],
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 0),
+        max_arch_version=ArchVersion(9, 0),
+        vendors=frozenset({"nvidia"}),
+    ),
+    priority=Priority.SPECIALIZED,
+)
+def merge_index_candidates(packed, rows, lengths):
+    scores = packed[:, :, 1].contiguous().view(torch.float32)
+    selected, values = _candidate_topk(scores, rows.shape[1])
+    logical = packed[:, :, 0].gather(1, selected.clamp_min(0))
+    _finish_topk(values, logical, rows, lengths)
+    return rows, lengths

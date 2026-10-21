@@ -11,6 +11,13 @@ On CDNA4, ordinary GEMM dispatch admits the measured single-row
 Callers that publish directly into a collective buffer pass that buffer as
 `out` to the same `mv` operation.
 
+## Per-token/per-channel FP8
+
+Per-channel FP8 projections use FP8 E4M3 weights with FP32 scales per output
+channel and dynamically quantize activations per token. This scale format is
+distinct from block scaling. Native FP8 matrix arithmetic uses FP32
+accumulators but need not match sequential FP32 arithmetic.
+
 ## DeepSeek V4 grouped output projection
 
 The grouped-projection plan describes the projection geometry and source formats.

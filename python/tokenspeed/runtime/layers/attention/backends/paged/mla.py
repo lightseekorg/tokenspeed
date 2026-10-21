@@ -32,14 +32,18 @@ from tokenspeed_kernel.ops.attention.mla import (
     mla_use_absorbed_extend,
     supports_mla_decode_query_blocks,
 )
+from tokenspeed_kernel.selection import KernelPlan
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
@@ -50,6 +54,7 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -136,6 +141,61 @@ class MLAAttnBackend(PagedAttentionBackend):
 
         backend_name = spec.backend_name or "mla"
         self.kernel_solution = {"mla": None, "gluon": "gluon"}[backend_name]
+        self.batch_invariant = global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+        self.extend_kernel_plan = None
+        self.decode_kernel_plan = None
+        if self.batch_invariant:
+            if spec.sliding_window_tokens is not None:
+                raise ValueError(
+                    "Absorbed MLA extend does not yet carry a sliding-window mask"
+                )
+            signature = format_signature(
+                q=dense_tensor_format(self.q_data_type),
+                kv_cache=dense_tensor_format(self.data_type),
+            )
+            traits = {
+                "num_q_heads": self.num_local_heads,
+                "qk_nope_head_dim": self.qk_nope_head_dim,
+                "kv_lora_rank": self.kv_lora_rank,
+                "qk_rope_head_dim": self.qk_rope_head_dim,
+                "page_size": self.kernel_page_size,
+                "logit_cap": False,
+                "return_lse": False,
+            }
+            variable_traits = frozenset({"batch_size", "max_seqlen_q", "max_seqlen_k"})
+            self.extend_kernel_plan = KernelPlan.select(
+                "attention",
+                "mla_extend_with_kvcache",
+                signature,
+                features=frozenset({"batch_invariant"}),
+                static_traits={**traits, "is_causal": True},
+                variable_traits=variable_traits,
+                solution=self.kernel_solution,
+                declared_traits=frozenset(),
+                ignore_layout=False,
+            )
+            self.decode_kernel_plan = KernelPlan.select(
+                "attention",
+                "mla_decode_with_kvcache",
+                signature,
+                features=frozenset({"batch_invariant"}),
+                static_traits={
+                    **traits,
+                    "q_len": 1,
+                    "sliding_window": False,
+                    "noncausal_block_size": 1,
+                },
+                variable_traits=variable_traits,
+                solution=self.kernel_solution,
+                declared_traits=frozenset(),
+                ignore_layout=False,
+            )
+        # The strict arithmetic materializes latent output before value projection.
+        self.supports_mla_projected_value_decode = not self.batch_invariant
+        self.supports_layer_sliding_window = not self.batch_invariant
+        self.cuda_graph_support = CudaGraphSupport.from_plans(
+            prefill=self.extend_kernel_plan, decode=self.decode_kernel_plan
+        )
 
         self.forward_decode_metadata: MLADecodeMetadata | None = None
         self.forward_prefill_metadata: MLAPrefillMetadata | None = None
@@ -154,6 +214,8 @@ class MLAAttnBackend(PagedAttentionBackend):
         flattened one-row-per-block-position metadata the portable kernel
         reads, which is what every other configuration has always sent.
         """
+        if self.decode_kernel_plan is not None:
+            return False
         key = (num_q_heads, q_len, sliding_window)
         answer = self._query_block_decode.get(key)
         if answer is None:
@@ -190,6 +252,10 @@ class MLAAttnBackend(PagedAttentionBackend):
     def _should_use_absorbed_cached_extend(
         self, *, max_extend_seq_len: int, max_extend_prefix_len: int
     ) -> bool:
+        if self.batch_invariant:
+            # Initial and cached prefill need the same query representation
+            # as decode, independent of prefix length or batch geometry.
+            return True
         return max_extend_prefix_len > 0 and mla_use_absorbed_extend(
             q_dtype=self.q_data_type,
             kv_dtype=self.data_type,
@@ -442,6 +508,11 @@ class MLAAttnBackend(PagedAttentionBackend):
         **kwargs,
     ) -> torch.Tensor:
         # q is the absorbed MLA query [T, H, R + D_rope]; the prologue wrote the latent cache.
+        if (
+            kwargs.get("value_weight") is not None
+            and not self.supports_mla_projected_value_decode
+        ):
+            raise ValueError("Batch-invariant MLA requires a separate value projection")
         metadata = self.forward_decode_metadata
         assert metadata is not None
         num_extends = metadata.num_extends
@@ -554,6 +625,7 @@ class MLAAttnBackend(PagedAttentionBackend):
                 softmax_scale=softmax_scale,
                 logit_cap=layer.logit_cap,
                 solution=self.kernel_solution,
+                plan=self.decode_kernel_plan,
                 window_left=window_left,
                 noncausal_block_size=noncausal_block_size,
             )
@@ -599,6 +671,7 @@ class MLAAttnBackend(PagedAttentionBackend):
                 is_causal=True,
                 logit_cap=layer.logit_cap,
                 solution=self.kernel_solution,
+                plan=self.extend_kernel_plan,
             )
             output = self._unwrap_output(result)
             return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)

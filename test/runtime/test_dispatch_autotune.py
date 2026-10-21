@@ -757,6 +757,7 @@ def _situ_plan(routing_mode):
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
         with_bias=False,
         process_group=None,
         deepep_mode=None,
@@ -1583,7 +1584,7 @@ def test_mm_runs_the_joint_bf16_gemm_only_before_serving(monkeypatch, serving):
 
 
 @pytest.mark.parametrize("kind", ["environment", "context"])
-@pytest.mark.parametrize("numerics", ["default", "rl-bitwise"])
+@pytest.mark.parametrize("numerics", ["auto"])
 def test_dense_mm_override_precedes_decode_shortcut(monkeypatch, kind, numerics):
     monkeypatch.setitem(env_module.global_server_args_dict, "numerics", numerics)
     if kind == "environment":
@@ -1607,8 +1608,6 @@ def test_dense_mm_override_precedes_decode_shortcut(monkeypatch, kind, numerics)
     ((args, kwargs),) = mm_calls
     assert args[0] is x and args[1] is layer.weight
     expected = {"bias": None}
-    if numerics == "rl-bitwise":
-        expected["override"] = "aok"
     assert kwargs == expected
 
 

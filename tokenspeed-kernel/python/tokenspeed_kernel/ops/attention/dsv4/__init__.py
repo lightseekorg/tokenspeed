@@ -364,11 +364,12 @@ def dsv4_prefill(
     kv: torch.Tensor,
     indices: torch.Tensor,
     lens: torch.Tensor,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,
     softmax_scale: float,
     out: torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
+    lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run DeepSeek V4 selected attention over a dense K/V workspace.
 
@@ -379,11 +380,13 @@ def dsv4_prefill(
             Negative entries are ignored. Nonnegative entries in each active
             prefix must be smaller than the number of rows in ``kv``.
         lens: Valid selected width for each query token.
-        attn_sink: One attention sink logit per query head.
+        attn_sink: One sink logit per head, or None for a no-sink partial.
         softmax_scale: Scale applied to query-key dot products.
         out: Optional output shaped like ``q``.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
+        lse: Optional FP32 [tokens, heads] output for natural-log LSE.
+            Partial output requires attn_sink=None; the sink is applied at merge.
 
     Returns:
         BF16 attention output shaped like ``q``.
@@ -399,8 +402,31 @@ def dsv4_prefill(
         raise ValueError("indices must have one row per query token")
     if lens.ndim != 1 or lens.numel() != tokens:
         raise ValueError("lens must have one entry per query token")
-    if out is not None and (out.shape != q.shape or out.dtype != q.dtype):
-        raise ValueError("out must match q shape and dtype")
+    if indices.dtype not in (torch.int32, torch.int64):
+        raise TypeError("indices must have dtype int32 or int64")
+    if lens.dtype not in (torch.int32, torch.int64):
+        raise TypeError("lens must have dtype int32 or int64")
+    if attn_sink is not None and attn_sink.numel() < q.shape[1]:
+        raise ValueError("attn_sink must provide one value per query head")
+    if any(
+        tensor is not None and tensor.device != q.device
+        for tensor in (kv, indices, lens, attn_sink, lse)
+    ):
+        raise ValueError("all selected-attention tensors must share a device")
+    if out is not None and (
+        out.shape != q.shape or out.dtype != q.dtype or out.device != q.device
+    ):
+        raise ValueError("out must match q shape, dtype, and device")
+
+    if lse is not None:
+        if attn_sink is not None:
+            raise ValueError("partial attention LSE requires no sink")
+        if (
+            lse.shape != q.shape[:2]
+            or lse.dtype != torch.float32
+            or not lse.is_contiguous()
+        ):
+            raise ValueError("lse must be contiguous FP32 [tokens, heads]")
 
     signature = _attention_format_signature(q=q, kv=kv)
     traits = {
@@ -409,8 +435,10 @@ def dsv4_prefill(
         "selected_width": int(indices.shape[-1]),
         "cache_layout": "dense_workspace",
         "metadata_dtypes": frozenset({indices.dtype, lens.dtype}),
-        "sinks": True,
+        "sinks": attn_sink is not None,
     }
+    if lse is not None:
+        traits["return_lse"] = True
     kernel = select_kernel(
         "attention",
         "dsv4_prefill",
@@ -448,6 +476,7 @@ def dsv4_prefill(
             attn_sink=attn_sink,
             softmax_scale=softmax_scale,
             out=out,
+            **({"lse": lse} if lse is not None else {}),
         )
 
 

@@ -78,10 +78,13 @@ def _routing(
 def _combine_kernel(
     route_output_ptr,
     topk_weights_ptr,
+    topk_ids_ptr,
     output_ptr,
     num_tokens,
     hidden_size,
+    num_experts,
     top_k: tl.constexpr,
+    SKIP_INVALID_IDS: tl.constexpr,
     ROUND_WEIGHTED_ROUTES: tl.constexpr,
     OUTPUT_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -94,14 +97,18 @@ def _combine_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for slot in range(top_k):
         route_offsets = token_offsets * top_k + slot
+        route_mask = token_mask
+        if SKIP_INVALID_IDS:
+            ids = tl.load(topk_ids_ptr + route_offsets, mask=token_mask, other=-1)
+            route_mask &= (ids >= 0) & (ids < num_experts)
         values = tl.load(
             route_output_ptr
             + route_offsets[:, None] * hidden_size
             + hidden_offsets[None, :],
-            mask=token_mask[:, None] & hidden_mask[None, :],
+            mask=route_mask[:, None] & hidden_mask[None, :],
             other=0.0,
         )
-        weights = tl.load(topk_weights_ptr + route_offsets, mask=token_mask, other=0.0)
+        weights = tl.load(topk_weights_ptr + route_offsets, mask=route_mask, other=0.0)
         weighted = values.to(tl.float32) * weights[:, None]
         if ROUND_WEIGHTED_ROUTES:
             weighted = weighted.to(tl.bfloat16).to(tl.float32)
@@ -119,18 +126,28 @@ def _combine(
     route_output: torch.Tensor,
     topk_weights: torch.Tensor,
     output: torch.Tensor,
+    topk_ids: torch.Tensor | None,
+    num_experts: int,
     round_weighted_routes: bool = False,
     output_scale: float = 1.0,
 ) -> None:
+    """Sum weighted route rows into ``output``.
+
+    With ``topk_ids``, routes whose id is outside ``[0, num_experts)`` are not
+    read, so their ``route_output`` rows may hold anything.
+    """
     num_tokens, top_k = topk_weights.shape
     hidden_size = output.shape[1]
     _combine_kernel[(triton.cdiv(num_tokens, 4), triton.cdiv(hidden_size, 256))](
         route_output,
         topk_weights.contiguous(),
+        None if topk_ids is None else topk_ids.contiguous(),
         output,
         num_tokens,
         hidden_size,
+        num_experts,
         top_k=top_k,
+        SKIP_INVALID_IDS=topk_ids is not None,
         ROUND_WEIGHTED_ROUTES=round_weighted_routes,
         OUTPUT_SCALE=output_scale,
         BLOCK_M=4,

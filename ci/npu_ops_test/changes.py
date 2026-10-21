@@ -135,9 +135,21 @@ def select_suite(
         for sha in (base, head):
             require_commit(repo, sha)
         parents = git(repo, "show", "-s", "--format=%P", checkout_sha).decode().split()
-        if parents != [base, head]:
-            raise ValueError("PR merge commit parents differ from event base/head")
-        merge_base = git(repo, "merge-base", base, head).decode().strip()
+        if len(parents) != 2 or parents[1] != head:
+            raise ValueError(
+                "PR merge commit must have two parents and match event head"
+            )
+        # The event base can lag behind the merge parent as the target advances.
+        # Accept only forward history and compare against the base actually merged.
+        try:
+            git(repo, "merge-base", "--is-ancestor", base, parents[0])
+        except subprocess.CalledProcessError as exc:
+            if exc.returncode != 1:
+                raise
+            raise ValueError(
+                "PR merge commit base parent must descend from event base"
+            ) from exc
+        merge_base = git(repo, "merge-base", parents[0], head).decode().strip()
         comparison = (validate_sha(merge_base), head)
     elif event_name == "push":
         ref = validate_ref(repo, event.get("ref"))

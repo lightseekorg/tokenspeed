@@ -488,6 +488,53 @@ def test_fused_linears_load_each_shard(platform):
 
 
 # ---------------------------------------------------------------- run: FP8 GEMM or BF16
+@pytest.mark.parametrize(
+    "vendor,arch", [("amd", (12, 5)), ("nvidia", (12, 0)), ("nvidia", (9, 0))]
+)
+def test_unqualified_platforms_keep_dense_fp8_fallback(vendor, arch):
+    original = current_platform()
+    Platform.override(
+        dataclasses.replace(original, vendor=vendor, arch_version=ArchVersion(*arch))
+    )
+    try:
+        assert not w8a8.fp8_channel_gemm_available()
+        layer, _, _ = _loaded(_parse(CHANNEL_DYNAMIC))
+        layer.quant_method.process_weights_after_loading(layer)
+        assert layer.scheme.dequantized
+        assert layer.weight.dtype == torch.bfloat16
+        assert layer.weight_scale is None
+    finally:
+        Platform.override(original)
+
+
+@pytest.mark.parametrize("raw", [CHANNEL_DYNAMIC, TENSOR_DYNAMIC])
+def test_gfx950_loading_retains_fp8_weights_and_fp32_channel_scales(raw):
+    original = current_platform()
+    Platform.override(
+        dataclasses.replace(
+            original,
+            vendor="amd",
+            arch_version=ArchVersion(9, 5),
+            runtime_features=frozenset(),
+        )
+    )
+    try:
+        assert w8a8.fp8_channel_gemm_available()
+        layer, codes, scale = _loaded(_parse(raw))
+        layer.quant_method.process_weights_after_loading(layer)
+        assert not layer.scheme.dequantized
+        assert layer.weight.dtype == FP8
+        assert layer.weight_scale.dtype == torch.float32
+        torch.testing.assert_close(
+            layer.weight.t().float(), codes.float(), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            layer.weight_scale, scale.float().expand(8, 1), rtol=0, atol=0
+        )
+    finally:
+        Platform.override(original)
+
+
 def _loaded(config, rows=8, cols=16, scale_dtype=torch.bfloat16):
     layer = ColumnParallelLinear(
         cols,

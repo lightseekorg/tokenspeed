@@ -249,6 +249,18 @@ same on every rank, so the ranks collect in the same round and each
 collection walks only what serving keeps alive. The young generations still
 collect automatically.
 
+### Profiling the issuing thread
+
+Profiling must include the forward thread that issues device work. Batch and
+request annotations describe the immutable submitted work, not its later
+completion. Collecting them must not read device tensors or change scheduling
+and synchronization behavior.
+
+Device work may outlive its host range. Analysis must correlate launches with
+device events within each rank and process rather than clip GPU time to host
+timestamps. Profile startup rejects unsupported capture capabilities instead
+of silently producing an incomplete trace.
+
 ### The capture contract
 
 Information crosses to the data plane **only** inside the submitted closure,

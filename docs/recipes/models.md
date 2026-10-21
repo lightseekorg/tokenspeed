@@ -1365,8 +1365,8 @@ tokenspeed serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
 Beam (`model_type=beam`, `BeamForCausalLM`) is a mixture-of-experts model
 with 52 decoder layers: 9 full-attention layers and 43 sliding-window layers
 with a 512-token window. Its BF16, FP8, and NVFP4 checkpoints run with the same
-command: the checkpoint's own quantization config selects the path, with no
-flag. Use these supported Hub revisions:
+NVIDIA command below: the checkpoint's own quantization config selects the
+path, with no flag. Use these supported Hub revisions:
 
 | Checkpoint | Revision |
 | --- | --- |
@@ -1434,6 +1434,43 @@ and graph flags. For 512 requests, use `--max-num-seqs 512`,
 `--max-cudagraph-capture-size 512`, and
 `--cudagraph-capture-sizes 1 8 32 64 128 160 256 384 512`. Setting only the
 first one or two leaves larger decode batches outside the captured graph list.
+
+### AMD gfx950
+
+Beam supports BF16 and compressed-tensors dynamic W8A8 FP8 checkpoints on
+gfx950. The following configuration runs an eight-GPU FP8 target with a BF16
+DFlash2 drafter, mixed prefill/decode batching, and graph replay:
+
+```bash
+ts serve --model <beam-fp8-checkpoint-dir> \
+  --tensor-parallel-size 8 --ep-size 1 \
+  --dtype bfloat16 --kv-cache-dtype bfloat16 \
+  --attention-backend mha --moe-backend gluon --all2all-backend none \
+  --sampling-backend triton_full --grammar-backend xgrammar \
+  --disable-tf32 --layer-boundary-norm unfused \
+  --max-model-len 262144 --max-num-seqs 16 --chunked-prefill-size 8192 \
+  --prefill-graph-max-tokens 8192 \
+  --max-cudagraph-capture-size 16 --cudagraph-capture-sizes 1 2 4 8 16 \
+  --gpu-memory-utilization 0.85 --disable-kvstore --disable-prefix-caching \
+  --enable-mixed-batch --speculative-algorithm DFLASH \
+  --speculative-draft-model-path <beam-dflash2-checkpoint-dir> \
+  --speculative-draft-model-quantization unquant \
+  --drafter-attention-backend mha \
+  --speculative-num-steps 15 --speculative-num-draft-tokens 16 \
+  --host 127.0.0.1 --port 8000
+```
+
+For a BF16 target, use its checkpoint and `--moe-backend triton` with the
+same attention, dtype and unfused-boundary settings. Omit the speculative
+arguments for target-only decoding. The context and memory fraction above
+are starting budgets, not a capacity guarantee; check the startup allocation
+for the chosen checkpoint and request lengths.
+
+This recipe covers BF16 and FP8 checkpoints, not other quantization formats.
+
+Use the gateway dependencies pinned by this checkout and the original
+checkpoint chat template. Check raw generation, parsed chat/tool APIs,
+numerical parity and performance independently before deployment.
 
 ## Tuning order
 

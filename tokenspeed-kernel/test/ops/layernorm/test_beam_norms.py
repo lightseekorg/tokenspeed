@@ -34,6 +34,7 @@ import importlib
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.layernorm import gluon
 from tokenspeed_kernel.ops.layernorm import qk_rmsnorm_ssmax as qk
 from tokenspeed_kernel.platform import ArchVersion, Platform
 from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
@@ -150,8 +151,45 @@ def test_qk_ranked_selection_runs_triton_exactly_where_its_guard_admits(
                 selected = qk.select_qk_rmsnorm_ssmax_kernel(
                     *call, dequant=dequant, solution=None, override=None
                 )
+                amd_fused = (
+                    platform.is_cdna4
+                    and on_cuda
+                    and not dequant
+                    and case in ("beam_tp8", "int32_positions")
+                )
                 assert selected.name == (
-                    qk.TRITON_FUSED_QK_RMSNORM_SSMAX
-                    if guard == ""
-                    else qk.TORCH_QK_RMSNORM_SSMAX
+                    "gluon_qk_rmsnorm_ssmax_gfx950"
+                    if amd_fused
+                    else (
+                        qk.TRITON_FUSED_QK_RMSNORM_SSMAX
+                        if guard == ""
+                        else qk.TORCH_QK_RMSNORM_SSMAX
+                    )
                 ), (platform.device_name, on_cuda, dequant)
+
+
+@pytest.mark.parametrize(
+    "change", ["dtype", "positions", "eps", "rows", "shape", "dequant"]
+)
+def test_qk_by_name_rejects_before_any_device_launch(
+    change, mi350_platform, monkeypatch
+):
+    """Each case raises for its own reason: CUDA metadata and the gfx950
+    platform admit the default arguments, so only ``change`` can reject."""
+    monkeypatch.setattr(Platform, "_instance", mi350_platform)
+    args = list(_qk())
+    extra = {}
+    if change == "dtype":
+        args[0] = args[0].float()
+    elif change == "positions":
+        args[5] = args[5].float()
+    elif change == "eps":
+        args[4] = 0.0
+    elif change == "rows":
+        args = list(_qk(tokens=0))
+    elif change == "shape":
+        args[0] = args[0][:, :640]
+    else:
+        extra["dequant"] = object()
+    with pytest.raises(ValueError):
+        gluon.gluon_qk_rmsnorm_ssmax_gfx950(*_on_cuda(tuple(args)), **extra)

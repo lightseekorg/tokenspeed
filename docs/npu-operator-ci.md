@@ -14,10 +14,10 @@ The label does not change the order: accuracy always precedes performance.
 The independent `pr-test-npu-arm` concurrency group is keyed by PR or ref. Automatic events cancel older runs in the same group; manual events do not initiate cancellation.
 Unrelated label events use a separate group to avoid canceling an active test run. Test code never runs through `pull_request_target`.
 
-The GitHub-hosted `select` job fetches complete Git history and runs `ci/npu_ops_test/changes.py`:
+The GitHub-hosted `select` job fetches complete Git history, runs the CPU-only regression tests with `python3 -B -m unittest ci.npu_ops_test.test_changes`, then runs `ci/npu_ops_test/changes.py`:
 
 - Pushes compare the `before` and `after` commits. An all-zero `before` conservatively selects the full suite. With the current main-only trigger, this applies when creating main or invoking the selector independently.
-- PRs require the checkout to be the actual merge commit identified by `GITHUB_SHA`, with parents matching the event's base and head SHAs in that order. Selection compares `merge-base(base, head)..head`, excluding changes introduced only on base. Tests execute the merge SHA, not the head SHA.
+- PRs require the checkout to be the two-parent merge commit identified by `GITHUB_SHA`, with its second parent matching the event's head SHA. Its first parent must equal or descend from the event's base SHA, allowing the target branch to advance. Selection compares `merge-base(first_parent, head)..head`, excluding changes introduced only on base, including base updates already incorporated by the PR. Tests execute the merge SHA, not the head SHA.
 - Manual runs execute the full suite at the selected branch or tag's `GITHUB_SHA`.
 - Invalid SHAs, refs, missing Git objects, or comparison failures fail selection instead of silently skipping tests. Tag pushes and branch deletion do not start operator tests.
 

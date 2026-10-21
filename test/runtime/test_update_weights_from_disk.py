@@ -505,8 +505,15 @@ class TestPostLoadTransforms:
                 )
                 weight, values = layer.weight, layer.weight.detach().clone()
                 attributes = set(vars(layer)), set(layer._parameters)
+                # The unquantized method's hook reads its own planning state,
+                # so it runs on a real method; module hooks run on the layer.
+                owner = (
+                    UnquantizedLinearMethod()
+                    if hook is UnquantizedLinearMethod.process_weights_after_loading
+                    else layer
+                )
 
-                hook(layer, layer)
+                hook(owner, layer)
 
                 assert (layer.weight) is (weight)
                 assert torch.equal(layer.weight.detach(), values)

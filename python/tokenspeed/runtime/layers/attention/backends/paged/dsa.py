@@ -31,7 +31,8 @@ from tokenspeed_kernel.ops.attention.dsa import (
     select_dsa_prefill_topk_for_rows,
 )
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.selection import NoKernelFoundError
+from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
@@ -205,16 +206,64 @@ class DSABackend(PagedAttentionBackend):
         self.q_data_type = config.dtype
         self.num_attention_heads = spec.num_attention_heads
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
-        # rl-bitwise pins the sparse decode onto the batch-invariant no-split
-        # leaves; without one registered, selection fails at the first decode
-        # instead of silently serving an occupancy-split kernel.
+        # Plan from static geometry; sparse request sizes never select a new core.
         self.batch_invariant: bool = (
             global_server_args_dict["numerics"] in BITWISE_ENVELOPES
         )
-        self.kernel_solution: str | None = "aok" if self.batch_invariant else None
         # --dsa-slot-order: how the cores reduce the selected slots
         # (docs/design/numerics.md, invariance.batch).
         self.slot_order: str = global_server_args_dict["dsa_slot_order"]
+        self.kernel_solution: str | None = None
+        self.prefill_kernel_plan = None
+        self.decode_kernel_plan = None
+        if self.batch_invariant:
+            signature = format_signature(q=dense_tensor_format(self.q_data_type))
+            traits = {
+                "qk_nope_head_dim": self.qk_nope_head_dim,
+                "kv_lora_rank": self.kv_lora_rank,
+                "qk_rope_head_dim": self.qk_rope_head_dim,
+                "page_size": self.kernel_page_size,
+                "has_kv_cache": True,
+                "has_sparse_kv_cache": False,
+                "logit_cap": False,
+                "topk_layout": "global_slots",
+                "slot_order": self.slot_order,
+                "return_lse": frozenset({False, len(self.kvp_group) > 1}),
+            }
+            variable = frozenset({"batch_size", "tokens", "topk", "max_seqlen_k"})
+            self.prefill_kernel_plan = KernelPlan.select(
+                "attention",
+                "dsa_prefill",
+                signature,
+                features=frozenset({"batch_invariant"}),
+                static_traits={**traits, "q_len": 1},
+                variable_traits=variable,
+                solution=None,
+                declared_traits=(
+                    frozenset({"slot_order"})
+                    if self.slot_order == "sorted"
+                    else frozenset()
+                ),
+                ignore_layout=False,
+            )
+            self.decode_kernel_plan = KernelPlan.select(
+                "attention",
+                "dsa_decode",
+                signature,
+                features=frozenset({"batch_invariant"}),
+                static_traits={
+                    **traits,
+                    "q_len": frozenset(range(1, self.spec_num_tokens + 1)),
+                },
+                variable_traits=variable,
+                solution=None,
+                declared_traits=(
+                    frozenset({"slot_order"})
+                    if self.slot_order == "sorted"
+                    else frozenset()
+                ),
+                ignore_layout=False,
+            )
         self._prefill_page_table: torch.Tensor | None = None
         self.kpool_runtime = (
             KPoolRuntime(spec.index_kpool, spec.index_topk)
@@ -232,6 +281,10 @@ class DSABackend(PagedAttentionBackend):
             # dummy's gather. Overrides the KPool consumer's declaration too.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=False)
             self._probe_history_gather_topk_leaf(spec)
+        # Planned sparse cores are captured only if they declare cuda_graph.
+        self.cuda_graph_support = self.cuda_graph_support & CudaGraphSupport.from_plans(
+            prefill=self.prefill_kernel_plan, decode=self.decode_kernel_plan
+        )
 
     def _probe_history_gather_topk_leaf(self, spec: DSAConfig) -> None:
         """Select, at construction, the indexer leaf the sharded extend arm
@@ -1097,6 +1150,7 @@ class DSABackend(PagedAttentionBackend):
             k_scale=1.0,
             return_lse=use_dcp,
             solution=self.kernel_solution,
+            kernel_plan=self.prefill_kernel_plan,
             slot_order=self.slot_order,
         )
         if use_dcp:
@@ -1177,6 +1231,7 @@ class DSABackend(PagedAttentionBackend):
                 k_scale=1.0,
                 return_lse=False,
                 solution=self.kernel_solution,
+                kernel_plan=self.prefill_kernel_plan,
                 slot_order=self.slot_order,
             )
         return out
@@ -1320,6 +1375,7 @@ class DSABackend(PagedAttentionBackend):
             k_scale=1.0,
             return_lse=use_dcp,
             solution=self.kernel_solution,
+            kernel_plan=self.decode_kernel_plan,
             slot_order=self.slot_order,
         )
         if use_dcp:

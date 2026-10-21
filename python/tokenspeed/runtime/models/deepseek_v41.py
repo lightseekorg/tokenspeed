@@ -45,9 +45,9 @@ the candidate source on) runs on the rows the backend's ``decoder_view()``
 keeps -- each prompt's last window (one row for a chunk that leaves its prompt
 open) plus every decode row -- after the candidate source has written the
 decoder's global KV for all rows. DSpark captures the kept rows and the model
-reports them as ``ctx.captured_rows``. PP, CP and narrowing under attention DP
-are not implemented. Attention and MoE TPxEP widths must match to keep the HC
-stream replicated on attention TP.
+reports them as ``ctx.captured_rows``. PP and CP are not implemented.
+Attention and MoE TPxEP widths match, or fused EP keeps attention/dense/MoE
+TP1 rows local. Its dispatch exchanges actual counts after CED narrowing.
 
 The forward is four stages on one path -- ``encoder_forward`` (embedding and
 the layers below the candidate source, one row per token), ``narrowing_forward``
@@ -321,6 +321,8 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         layer.weight.data.unflatten(-1, (-1, 32)).mul_(scale.unsqueeze(-1))
         layer.register_parameter("weight_scale_inv", None)
         layer.quant_method = UnquantizedLinearMethod()
+        # Plans the batch-invariant GEMM under a bitwise envelope.
+        layer.quant_method.process_weights_after_loading(layer)
 
     @torch.no_grad()
     def prepare_weight_scales(self, layer: nn.Module) -> None:
@@ -691,8 +693,8 @@ def _reduce_hc_post(
 def _v41_hc_input_fp8(
     x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    """HC input, plus its group-32 FP8 codes and scales on CDNA4 (else None)."""
-    if not (x.is_cuda and current_platform().is_cdna4):
+    """HC input, plus its group-32 FP8 codes and scales on CDNA4/5 (else None)."""
+    if not (x.is_cuda and (current_platform().is_cdna4 or current_platform().is_cdna5)):
         return _v41_hc_input(x, pre, norm), None, None
     return mhc_apply_pre_quantize_fp8(x, pre, norm.weight, norm.variance_epsilon)
 
@@ -1066,7 +1068,11 @@ class DeepseekV41Attention(nn.Module):
         if (
             qr.is_cuda
             and qr.dtype == torch.bfloat16
-            and (current_platform().is_nvidia or current_platform().is_cdna4)
+            and (
+                current_platform().is_nvidia
+                or current_platform().is_cdna4
+                or current_platform().is_cdna5
+            )
             and isinstance(self.wq_b.quant_method, _ReferenceFp8LinearMethod)
         ):
             qr, q_input, q_scale = rmsnorm_quantize_fp8_group32(
@@ -1137,17 +1143,43 @@ class DeepseekV41Attention(nn.Module):
                         rows.query.request_indices,
                     )
                 if self.indexer is not None:
+                    partition = None
                     if backend.indexer_needs_scores(
                         self.layer_id, positions, requests, mode
                     ):
-                        index_q, index_weights = self.indexer(
+                        partition = (
+                            backend.plan_indexer_queries(
+                                self.layer_id, positions, requests, mode, index_group
+                            )
+                            if hidden_states.is_cuda
+                            and mode.is_extend()
+                            and not mode.is_mixed()
+                            else None
+                        )
+                        index_x, index_input, index_scale, index_positions = (
                             hidden_states,
                             index_q_input,
                             index_q_scale,
                             positions,
+                        )
+                        if partition is not None:
+                            # Only indexer projections consume the local query rows.
+                            index_x, index_input, index_positions = (
+                                t[partition.local_slice].contiguous()
+                                for t in (hidden_states, index_q_input, positions)
+                            )
+                            if index_q_scale is not None:
+                                index_scale = index_q_scale[
+                                    partition.local_slice
+                                ].contiguous()
+                        index_q, index_weights = self.indexer(
+                            index_x,
+                            index_input,
+                            index_scale,
+                            index_positions,
                             self.rotary_emb,
                         )
-                    if mode.is_decode():
+                    if mode.is_decode() or partition is not None:
                         prepared = backend.prepare_global_selection(
                             self.layer_id,
                             index_q,
@@ -1156,6 +1188,7 @@ class DeepseekV41Attention(nn.Module):
                             requests,
                             mode,
                             index_group,
+                            projected_partition=partition,
                         )
                         index_q = index_weights = None
             q, _ = self.wq_b(
@@ -1173,7 +1206,11 @@ class DeepseekV41Attention(nn.Module):
             if swa.is_cuda and self.head_dim == 512 and self.rotary_emb.dim == 64:
                 self.rotary_emb._prepare_cache(swa.device)
                 swa_rope_cache = self.rotary_emb.cos_sin_cache
-                if current_platform().is_blackwell or current_platform().is_cdna4:
+                if (
+                    current_platform().is_blackwell
+                    or current_platform().is_cdna4
+                    or current_platform().is_cdna5
+                ):
                     swa_norm_weight = self.kv_norm.weight
                 else:
                     swa = _attention_norm(swa, self.kv_norm)
@@ -1192,10 +1229,11 @@ class DeepseekV41Attention(nn.Module):
             if record.candidates is not None:
                 for tensor in (record.candidates.block_ids, record.candidates.lengths):
                     tensor.record_stream(consumer)
-        # CDNA4 rotates the attention output back inside the attention kernel.
+        # CDNA4/5 rotate the attention output back inside the attention kernel.
         out_rope_cache = (
             self.rotary_emb.inverse_cos_sin_cache
-            if q.is_cuda and current_platform().is_cdna4
+            if q.is_cuda
+            and (current_platform().is_cdna4 or current_platform().is_cdna5)
             else None
         )
         out = backend.forward_v41(
@@ -1230,7 +1268,7 @@ class DeepseekV41Attention(nn.Module):
         method = self.wo_b.quant_method
         if (
             grouped.is_cuda
-            and current_platform().is_cdna4
+            and (current_platform().is_cdna4 or current_platform().is_cdna5)
             and isinstance(method, _ReferenceFp8LinearMethod)
             and method.prepared_weight_scales is None
         ):
@@ -1620,16 +1658,16 @@ class DeepseekV41Model(nn.Module):
         super().__init__()
         if mapping.pp_size != 1:
             raise NotImplementedError("V4.1 full-prompt baseline requires PP=1")
-        local_petit = (
-            get_moe_backend().is_gluon_petit()
+        local_fused_ep = (
+            (get_moe_backend().is_gluon_petit() or get_moe_backend().is_mega_moe())
             and mapping.attn.tp_size
             == mapping.dense.tp_size
             == mapping.moe.tp_size
             == 1
         )
-        if mapping.attn.tp_size != mapping.moe.tp_ep_size and not local_petit:
+        if mapping.attn.tp_size != mapping.moe.tp_ep_size and not local_fused_ep:
             raise NotImplementedError(
-                "V4.1 requires attention TP == MoE TPxEP or Gluon Petit with attention/dense/MoE TP1"
+                "V4.1 requires attention TP == MoE TPxEP or fused EP with attention/dense/MoE TP1"
             )
         if config.hc_mult != 4 or config.hc_sinkhorn_iters < 1:
             raise ValueError(
@@ -1874,14 +1912,14 @@ class DeepseekV41Model(nn.Module):
         if (
             view.keep_rows is not None
             and ctx.global_num_tokens is not None
-            and not self.layers[start].ffn.use_gluon_petit
+            and not self.layers[start].ffn.owns_ep_communication
         ):
             raise NotImplementedError(
                 "V4.1 CED narrowing under attention data parallelism needs the "
                 "narrowed row counts exchanged across ranks"
             )
         captured = list(state.captured)
-        # Petit exchanges actual local row counts inside its dispatch. The
+        # Fused EP exchanges actual local row counts inside its dispatch. The
         # original DP counts remain valid capacity bounds after CED narrowing;
         # no host exchange is needed for its routed or rank-local shared experts.
         with report_collective_sizing(ctx, view.metadata.positions.numel(), None):

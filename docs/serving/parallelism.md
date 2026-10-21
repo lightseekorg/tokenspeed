@@ -528,7 +528,7 @@ replicas live on other ranks.
      (`--ep-dispatch-algorithm static*`; the `dynamic*` variants draw at
      random per route). The runtime computes the map only on this path.
    - Under replicated-input EP (every rank routes every token, such as the
-     rl-bitwise aok path) exactly one rank must compute each route, so the
+     rl-bitwise slot-combine path) exactly one rank must compute each route, so the
      replica is a pure function of the token:
      `replicas[logical, (token row + route rank) mod replicas]`, identical
      on every rank. TokenSpeed refuses random replica choice on this path.
