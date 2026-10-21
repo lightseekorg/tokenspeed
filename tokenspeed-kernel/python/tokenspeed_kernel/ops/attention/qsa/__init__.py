@@ -504,8 +504,7 @@ def qwen4_exp_qsa_block_topk(
         max_partial_bytes=max_partial_bytes,
     )
     if path == "auto":
-        # Keep shape routing independent of live device frontiers. The op
-        # README records measurements and the limits of these thresholds.
+        # Keep shape routing independent of live device frontiers.
         min_stream_rows = 512 if num_blocks >= 16384 else 8192
         prefer_stream = supported_layout and rows >= min_stream_rows
         fits_logits = rows * num_blocks * 4 <= max_logits_bytes
