@@ -29,7 +29,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 from utils import assert_no_triton_compile, is_amd
 
 pytestmark = pytest.mark.skipif(not is_amd(), reason="Iris requires AMD ROCm")
@@ -51,8 +51,8 @@ def test_moe_gather_vector_codegen(rank, prefix_is_sharded, tmp_path):
     from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
         iris_k3moe_push_gather,
     )
-    from tokenspeed_kernel.platform import ArchVersion
 
+    policy = iris_arch_policy(ArchVersion(9, 5))
     fn = iris_k3moe_push_gather
     constants = {
         "RANK": rank,
@@ -60,7 +60,8 @@ def test_moe_gather_vector_codegen(rank, prefix_is_sharded, tmp_path):
         "NUM_PROGRAMS": 128,
         "NUM_WARPS": 4,
         "PREFIX_IS_SHARDED": prefix_is_sharded,
-        "WAIT_STORES": iris_arch_policy(ArchVersion(9, 5)).wait_stores,
+        "PEER_PAYLOAD_STORE_CACHE": policy.peer_payload_store,
+        "WAIT_STORES": policy.wait_stores,
     }
     signature = {name: "*bf16" for name in fn.arg_names[:4]}
     signature["ready_flags"] = "*i32"
@@ -118,10 +119,16 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
         iris_k3moe_pull_scatter,
         iris_k3moe_push_gather,
     )
-    from tokenspeed_kernel.ops.communication.iris import create_iris_ar_rmsnorm_state
+    from tokenspeed_kernel.ops.communication.iris import (
+        configure_iris,
+        create_iris_ar_rmsnorm_state,
+    )
     from tokenspeed_kernel.ops.gemm import kimi3_latent_projection_add3
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
 
+    # Automatic sizing guarantees only HEAP_HEADROOM_BYTES beyond K3's buffers,
+    # which is less than the EAGLE3 state below.
+    configure_iris(heap_size=512 << 20, allocator_type=None)
     k3_state = prepare_k3_communication(
         group=group,
         rank_in_group=rank,
@@ -400,10 +407,11 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
             tensor.fill_(rank + 1)
         ordinary_snapshots.extend(k3_state.reduce_moe(other))
     torch.cuda.synchronize()
+    # The projection's rounding can depend on its row count, so only the
+    # unscaled replay is compared with the full-batch reference.
+    torch.testing.assert_close(snapshots[0][1], expected, atol=0.03125, rtol=0.015625)
     for scale, output in snapshots:
-        torch.testing.assert_close(
-            output, expected * scale, atol=0.03125, rtol=0.015625
-        )
+        torch.testing.assert_close(output, snapshots[0][1] * scale, atol=0, rtol=0)
     for output in ordinary_snapshots:
         torch.testing.assert_close(output, torch.full_like(output, 36), atol=0, rtol=0)
     torch.testing.assert_close(held, held_expected, atol=0.03125, rtol=0.015625)

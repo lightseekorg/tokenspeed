@@ -30,7 +30,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 from utils import assert_no_triton_compile, is_amd
 
 pytestmark = pytest.mark.skipif(not is_amd(), reason="Iris requires AMD ROCm")
@@ -48,6 +48,9 @@ def _require_iris():
 def test_attention_row_vector_codegen(rank, operation, has_residual, tmp_path):
     """Preserve vector payload traffic and completion signaling for runtime rows."""
     from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_arch_policy,
+    )
     from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
         iris_k3attn_pull_scatter,
         iris_k3attn_push_gather,
@@ -60,15 +63,13 @@ def test_attention_row_vector_codegen(rank, operation, has_residual, tmp_path):
         "NUM_PROGRAMS": 24 if operation == "reduce" else 32,
         "NUM_WARPS": 4,
     }
+    policy = iris_arch_policy(ArchVersion(9, 5))
     if operation == "reduce":
         constants["HAS_RESIDUAL"] = has_residual
+        constants["PEER_PAYLOAD_LOAD_CACHE"] = policy.peer_payload_load
     else:
-        from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-            iris_arch_policy,
-        )
-        from tokenspeed_kernel.platform import ArchVersion
-
-        constants["WAIT_STORES"] = iris_arch_policy(ArchVersion(9, 5)).wait_stores
+        constants["PEER_PAYLOAD_STORE_CACHE"] = policy.peer_payload_store
+        constants["WAIT_STORES"] = policy.wait_stores
     signature = {}
     for name in fn.arg_names:
         if name in constants:

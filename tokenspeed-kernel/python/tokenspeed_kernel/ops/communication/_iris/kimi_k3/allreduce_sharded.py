@@ -23,7 +23,7 @@
 import math
 
 import torch
-from tokenspeed_kernel._triton import gl, gluon
+from tokenspeed_kernel._triton import gl, gluon, triton
 from tokenspeed_kernel.ops.communication._iris import allocation_bytes
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     ProducerPull,
@@ -31,9 +31,17 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
 )
 from tokenspeed_kernel.platform import current_platform
 
+hip_utils = triton.language.extra.hip.utils
+
 REDUCE_PROGRAMS = 24
 GATHER_PROGRAMS = 128
 _attn_res_mix_gfx950 = None
+
+
+def k3_kernels_supported() -> bool:
+    """Whether the K3 row-sharded and AttnRes kernels compile for this device."""
+    platform = current_platform()
+    return platform.is_cdna4 or platform.is_cdna5
 
 
 @gluon.jit
@@ -44,15 +52,30 @@ def _row_partition_store_completion(
     epoch,
     RANK: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    PEER_PAYLOAD_STORE_CACHE: gl.constexpr,
     WAIT_STORES: gl.constexpr,
 ):
     """Complete local stores, update ready flags, and wait for peer completion."""
     WAIT_STORES(args=[], constraints="=r,~{memory}")
     gl.barrier()
-    layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
+    layout: gl.constexpr = gl.BlockedLayout([1], [SUBGROUP_SIZE], [NUM_WARPS], [0])
     peers = gl.arange(0, 8, layout=layout)
     remote = peers != RANK
-    gl.store(peer_flags + block_id * 8 + RANK, epoch, mask=remote, cache_modifier=".wt")
+    if PEER_PAYLOAD_STORE_CACHE == ".wt":
+        gl.store(
+            peer_flags + block_id * 8 + RANK, epoch, mask=remote, cache_modifier=".wt"
+        )
+    else:
+        # Drained peer stores without write-through can still sit in this GPU's
+        # caches; only a system-scope release makes them visible with the epoch.
+        gl.atomic_xchg(
+            peer_flags + block_id * 8 + RANK,
+            epoch,
+            mask=remote,
+            sem="release",
+            scope="sys",
+        )
     local = flags + block_id * 8 + peers
     seen = gl.load(local, mask=remote, other=epoch, cache_modifier=".cv", volatile=True)
     while gl.sum((remote & ((seen - epoch).to(gl.int32) < 0)).to(gl.int32), 0) != 0:
@@ -73,7 +96,8 @@ def _row_partition_entry_barrier(
 ):
     """Publish the entry epoch and acquire each peer's producer completion."""
     # Prior producers complete on the calling stream before this entry barrier.
-    layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
+    layout: gl.constexpr = gl.BlockedLayout([1], [SUBGROUP_SIZE], [NUM_WARPS], [0])
     peers = gl.arange(0, 8, layout=layout)
     remote = peers != RANK
     gl.atomic_xchg(
@@ -111,7 +135,8 @@ def _peer_buffers(pointer, heaps, RANK: gl.constexpr):
 @gluon.jit
 def _peer_flags(pointer, heaps, RANK: gl.constexpr, NUM_WARPS: gl.constexpr):
     """Map a symmetric flag buffer to all eight peer heaps."""
-    layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
+    layout: gl.constexpr = gl.BlockedLayout([1], [SUBGROUP_SIZE], [NUM_WARPS], [0])
     peers = gl.arange(0, 8, layout=layout)
     bases = gl.full((8,), 0, gl.uint64, layout)
     for peer in gl.static_range(8):
@@ -140,6 +165,7 @@ def iris_k3moe_pull_scatter(
     BLOCK_ELEMENTS: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    PEER_PAYLOAD_LOAD_CACHE: gl.constexpr,
 ):
     """Pull K3 routed/shared partials into each rank's consecutive row shard.
 
@@ -168,7 +194,8 @@ def iris_k3moe_pull_scatter(
     FIRST_ELEMENTS = ROWS // 8 * FIRST_WIDTH
     SECOND_ELEMENTS = ROWS // 8 * SECOND_WIDTH
     PARTITION_ELEMENTS = FIRST_ELEMENTS + SECOND_ELEMENTS
-    layout: gl.constexpr = gl.BlockedLayout([8], [64], [NUM_WARPS], [0])
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
+    layout: gl.constexpr = gl.BlockedLayout([8], [SUBGROUP_SIZE], [NUM_WARPS], [0])
     lanes = gl.arange(0, BLOCK_ELEMENTS, layout=layout)
     for tile in range(
         block_id, gl.cdiv(PARTITION_ELEMENTS, BLOCK_ELEMENTS), NUM_PROGRAMS
@@ -184,7 +211,11 @@ def iris_k3moe_pull_scatter(
         for step in gl.static_range(8):
             values += (
                 gl.amd.cdna4.buffer_load(
-                    inputs[(RANK + step) % 8], source, mask, 0, cache=".cg"
+                    inputs[(RANK + step) % 8],
+                    source,
+                    mask,
+                    0,
+                    cache=PEER_PAYLOAD_LOAD_CACHE,
                 ),
             )
         sums = ()
@@ -220,6 +251,7 @@ def iris_k3moe_push_gather(
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     PREFIX_IS_SHARDED: gl.constexpr,
+    PEER_PAYLOAD_STORE_CACHE: gl.constexpr,
     WAIT_STORES: gl.constexpr,
 ):
     """Add K3 routed/shared outputs and residual, then push rows to every peer.
@@ -250,7 +282,8 @@ def iris_k3moe_push_gather(
     epoch = (
         gl.atomic_add(flags + block_id * 8 + RANK, 1, sem="relaxed", scope="gpu") + 1
     )
-    layout: gl.constexpr = gl.BlockedLayout([8], [64], [NUM_WARPS], [0])
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
+    layout: gl.constexpr = gl.BlockedLayout([8], [SUBGROUP_SIZE], [NUM_WARPS], [0])
     lanes = gl.arange(0, BLOCK_ELEMENTS, layout=layout)
     for tile in range(
         block_id, gl.cdiv(PARTITION_ELEMENTS, BLOCK_ELEMENTS), NUM_PROGRAMS
@@ -277,10 +310,17 @@ def iris_k3moe_push_gather(
                 outputs[(RANK + step) % 8],
                 offsets + RANK * PARTITION_ELEMENTS,
                 mask,
-                cache=".wt",
+                cache=PEER_PAYLOAD_STORE_CACHE,
             )
     _row_partition_store_completion(
-        flags, peer_flags, block_id, epoch, RANK, NUM_WARPS, WAIT_STORES=WAIT_STORES
+        flags,
+        peer_flags,
+        block_id,
+        epoch,
+        RANK,
+        NUM_WARPS,
+        PEER_PAYLOAD_STORE_CACHE,
+        WAIT_STORES=WAIT_STORES,
     )
 
 
@@ -327,6 +367,7 @@ def iris_k3attn_pull_scatter(
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     HAS_RESIDUAL: gl.constexpr,
+    PEER_PAYLOAD_LOAD_CACHE: gl.constexpr,
 ):
     """Pull K3 attn rows into each rank's residual shard.
 
@@ -353,7 +394,8 @@ def iris_k3attn_pull_scatter(
     pid = gl.program_id(0)
     epoch = gl.atomic_add(flags + pid * 8 + RANK, 1, sem="relaxed", scope="gpu") + 1
     _row_partition_entry_barrier(flags, peers, pid, epoch, RANK, NUM_WARPS)
-    layout: gl.constexpr = gl.BlockedLayout([8], [64], [NUM_WARPS], [0])
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
+    layout: gl.constexpr = gl.BlockedLayout([8], [SUBGROUP_SIZE], [NUM_WARPS], [0])
     lanes = gl.arange(0, BLOCK_ELEMENTS, layout=layout)
     for tile in range(pid, gl.cdiv(PARTITION_ELEMENTS, BLOCK_ELEMENTS), NUM_PROGRAMS):
         offsets = tile * BLOCK_ELEMENTS + lanes
@@ -363,7 +405,11 @@ def iris_k3attn_pull_scatter(
         for step in gl.static_range(8):
             values += (
                 gl.amd.cdna4.buffer_load(
-                    inputs[(RANK + step) % 8], source, mask, 0, cache=".cg"
+                    inputs[(RANK + step) % 8],
+                    source,
+                    mask,
+                    0,
+                    cache=PEER_PAYLOAD_LOAD_CACHE,
                 ),
             )
         # Preserve Iris's even/odd FP32 tree and the BF16 boundary before add.
@@ -408,6 +454,7 @@ def iris_k3attn_push_gather(
     BLOCK_ELEMENTS: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    PEER_PAYLOAD_STORE_CACHE: gl.constexpr,
     WAIT_STORES: gl.constexpr,
 ):
     """Push mixed K3 attn rows to every peer.
@@ -431,7 +478,8 @@ def iris_k3attn_push_gather(
     peers = _peer_flags(flags, heaps, RANK, NUM_WARPS)
     pid = gl.program_id(0)
     epoch = gl.atomic_add(flags + pid * 8 + RANK, 1, sem="relaxed", scope="gpu") + 1
-    layout: gl.constexpr = gl.BlockedLayout([8], [64], [NUM_WARPS], [0])
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
+    layout: gl.constexpr = gl.BlockedLayout([8], [SUBGROUP_SIZE], [NUM_WARPS], [0])
     lanes = gl.arange(0, BLOCK_ELEMENTS, layout=layout)
     for tile in range(pid, gl.cdiv(PARTITION_ELEMENTS, BLOCK_ELEMENTS), NUM_PROGRAMS):
         offsets = tile * BLOCK_ELEMENTS + lanes
@@ -444,10 +492,17 @@ def iris_k3attn_push_gather(
                 outputs[(RANK + step) % 8],
                 RANK * PARTITION_ELEMENTS + offsets,
                 mask,
-                cache=".wt",
+                cache=PEER_PAYLOAD_STORE_CACHE,
             )
     _row_partition_store_completion(
-        flags, peers, pid, epoch, RANK, NUM_WARPS, WAIT_STORES=WAIT_STORES
+        flags,
+        peers,
+        pid,
+        epoch,
+        RANK,
+        NUM_WARPS,
+        PEER_PAYLOAD_STORE_CACHE,
+        WAIT_STORES=WAIT_STORES,
     )
 
 
@@ -477,6 +532,7 @@ def iris_k3attn_mix_push_gather(
     OUTPUT_EPS: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    PEER_PAYLOAD_STORE_CACHE: gl.constexpr,
     WAIT_STORES: gl.constexpr,
 ):
     """Mix K3 prefixes with AttnRes history, then push normalized rows.
@@ -500,7 +556,8 @@ def iris_k3attn_mix_push_gather(
     peers = _peer_flags(flags, heaps, RANK, NUM_WARPS)
     pid = gl.program_id(0)
     epoch = gl.atomic_add(flags + pid * 8 + RANK, 1, sem="relaxed", scope="gpu") + 1
-    layout: gl.constexpr = gl.BlockedLayout([8], [64], [NUM_WARPS], [0])
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
+    layout: gl.constexpr = gl.BlockedLayout([8], [SUBGROUP_SIZE], [NUM_WARPS], [0])
     hidden = gl.arange(0, 8192, layout=layout)
     mask = hidden < 7168
     for row in range(pid, LOCAL_ROWS, NUM_PROGRAMS):
@@ -530,10 +587,17 @@ def iris_k3attn_mix_push_gather(
                 outputs[(RANK + step) % 8],
                 token * 7168 + hidden,
                 mask,
-                cache=".wt",
+                cache=PEER_PAYLOAD_STORE_CACHE,
             )
     _row_partition_store_completion(
-        flags, peers, pid, epoch, RANK, NUM_WARPS, WAIT_STORES=WAIT_STORES
+        flags,
+        peers,
+        pid,
+        epoch,
+        RANK,
+        NUM_WARPS,
+        PEER_PAYLOAD_STORE_CACHE,
+        WAIT_STORES=WAIT_STORES,
     )
 
 
@@ -567,7 +631,7 @@ class IrisAllReduceShardedState:
         max_rows: int, world_size: int, dtype: torch.dtype, producer_max_numel: int
     ) -> None:
         if not (
-            current_platform().is_cdna4
+            k3_kernels_supported()
             and world_size == 8
             and dtype == torch.bfloat16
             and 0 < max_rows <= 8192
@@ -575,7 +639,8 @@ class IrisAllReduceShardedState:
             and max_rows * (7168 + 3584) <= producer_max_numel
         ):
             raise ValueError(
-                "Iris row-sharded fusion requires TP8 BF16 producer capacity on CDNA4"
+                "Iris row-sharded fusion requires TP8 BF16 producer capacity on "
+                "CDNA4 or CDNA5"
             )
 
     @staticmethod
@@ -614,7 +679,7 @@ class IrisAllReduceShardedState:
         The caller has verified producer ownership. Reject unsupported operands
         before publishing to peers; each rank handles consecutive rows.
         """
-        if not current_platform().is_cdna4 or routed_partial.ndim != 2:
+        if not k3_kernels_supported() or routed_partial.ndim != 2:
             return None
         rows, latent = routed_partial.shape
         if (
@@ -701,6 +766,7 @@ class IrisAllReduceShardedState:
             BLOCK_ELEMENTS=2048,
             NUM_PROGRAMS=programs,
             NUM_WARPS=4,
+            PEER_PAYLOAD_LOAD_CACHE=self._arch.peer_payload_load,
             num_warps=4,
         )
         normalized = (
@@ -724,6 +790,7 @@ class IrisAllReduceShardedState:
             NUM_PROGRAMS=gather_programs,
             NUM_WARPS=4,
             PREFIX_IS_SHARDED=prefix_is_sharded,
+            PEER_PAYLOAD_STORE_CACHE=self._arch.peer_payload_store,
             num_warps=4,
             WAIT_STORES=self._arch.wait_stores,
         )
@@ -748,7 +815,7 @@ class IrisAllReduceShardedState:
         launching either collective; runtime policy chooses its token window.
         """
         if (
-            not current_platform().is_cdna4
+            not k3_kernels_supported()
             or partial.ndim != 2
             or partial.shape[0] <= 0
             or partial.shape[0] % 8 != 0
@@ -824,9 +891,14 @@ class IrisAllReduceShardedState:
 
         # The ordinary mixer is faster in the middle token range. At larger sizes,
         # longer histories also need enough rows to amortize live peer pointers.
-        fuse_mix = (partial.shape[0] < 1024 or partial.shape[0] >= 4096) and (
-            num_valid_blocks <= 6
-            or (partial.shape[0] >= 7680 and num_valid_blocks <= 8)
+        # gfx1250's attn_res_fwd has no row mix to fuse, so it mixes unfused.
+        fuse_mix = (
+            current_platform().is_cdna4
+            and (partial.shape[0] < 1024 or partial.shape[0] >= 4096)
+            and (
+                num_valid_blocks <= 6
+                or (partial.shape[0] >= 7680 and num_valid_blocks <= 8)
+            )
         )
         # Resolve the fused device function before either collective publishes.
         global _attn_res_mix_gfx950
@@ -849,6 +921,7 @@ class IrisAllReduceShardedState:
             NUM_PROGRAMS=programs,
             NUM_WARPS=4,
             HAS_RESIDUAL=residual is not None,
+            PEER_PAYLOAD_LOAD_CACHE=self._arch.peer_payload_load,
             num_warps=4,
         )
         if fuse_mix:
@@ -872,6 +945,7 @@ class IrisAllReduceShardedState:
                 OUTPUT_EPS=out_norm_eps,
                 NUM_PROGRAMS=gather_programs,
                 NUM_WARPS=num_subgroups,
+                PEER_PAYLOAD_STORE_CACHE=self._arch.peer_payload_store,
                 num_warps=num_subgroups,
                 WAIT_STORES=self._arch.wait_stores,
             )
@@ -901,6 +975,7 @@ class IrisAllReduceShardedState:
                 BLOCK_ELEMENTS=2048,
                 NUM_PROGRAMS=gather_programs,
                 NUM_WARPS=4,
+                PEER_PAYLOAD_STORE_CACHE=self._arch.peer_payload_store,
                 num_warps=4,
                 WAIT_STORES=self._arch.wait_stores,
             )

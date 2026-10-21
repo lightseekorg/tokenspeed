@@ -64,6 +64,9 @@ class IrisArchPolicy:
         peer_signal_store: Store into a peer's memory that the peer polls,
             such as a barrier epoch or a Lamport mailbox; empty selects the
             default.
+        peer_payload_store: Store of data into a peer's memory that a later
+            signal publishes; empty selects the default. Without write-through,
+            the signal must be a system-scope release.
         wait_vmem: Subgroup completion of vector loads and stores; does not
             cover async or tensor copies to LDS.
         wait_loads: Subgroup completion of vector loads.
@@ -78,6 +81,7 @@ class IrisArchPolicy:
 
     peer_payload_load: str
     peer_signal_store: str
+    peer_payload_store: str
     wait_vmem: Callable
     wait_loads: Callable
     wait_stores: Callable
@@ -87,6 +91,7 @@ _IRIS_ARCH_POLICIES = {
     ArchVersion(9, 5): IrisArchPolicy(
         peer_payload_load=".cg",
         peer_signal_store=".wt",
+        peer_payload_store=".wt",
         wait_vmem=wait_vmem,
         wait_loads=wait_vmem,
         wait_stores=wait_vmem,
@@ -97,6 +102,7 @@ _IRIS_ARCH_POLICIES = {
     ArchVersion(12, 5): IrisArchPolicy(
         peer_payload_load="",
         peer_signal_store="",
+        peer_payload_store="",
         wait_vmem=wait_loads_stores,
         wait_loads=wait_loads,
         wait_stores=wait_stores,
