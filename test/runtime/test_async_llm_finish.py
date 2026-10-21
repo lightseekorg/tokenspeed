@@ -51,7 +51,7 @@ class _StubAsyncLLM(AsyncLLM):
         self.enable_metrics = False
         self.tokenizer = None
         self.model_config = SimpleNamespace(is_multimodal_gen=False)
-        self.asyncio_tasks = set()
+        self._abort_tasks = set()
 
 
 async def _finish(reason: dict, *, stream: bool) -> list:

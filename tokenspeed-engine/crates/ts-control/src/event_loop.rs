@@ -789,6 +789,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.outputs.mark_abort(&rid, true);
             }
         }
+        if self.controls.take_cancel_grammar() {
+            // Requests still compiling their grammars produced nothing yet:
+            // cancelled, the grammar queue's next pass ends them toward their
+            // clients instead of withholding them past the drain.
+            for (submission, _, _) in &self.grammar_queue {
+                self.outputs.mark_abort(&submission.rid, true);
+            }
+        }
         if self.controls.admit_blocked() || self.withheld.is_empty() {
             return Ok(());
         }

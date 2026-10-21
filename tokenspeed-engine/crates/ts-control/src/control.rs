@@ -242,6 +242,11 @@ pub struct Controls {
     release_pending: bool,
     /// An `abort` pause still has to abort what runs.
     abort_all: bool,
+    /// An `abort` or `wait` pause, or a release, still has to cancel the
+    /// requests whose grammars compile: they are not in the scheduler, so
+    /// the drain would not wait for them, and once compiled they would be
+    /// withheld until a resume.
+    cancel_grammar: bool,
     /// Gated weight operations, in arrival order.
     weight_ops: VecDeque<ControlRequest>,
     /// Standalone cache flushes received this round.
@@ -276,6 +281,7 @@ impl Controls {
             released: Vec::new(),
             release_pending: false,
             abort_all: false,
+            cancel_grammar: false,
             weight_ops: VecDeque::new(),
             flushes: 0,
             replies: Vec::new(),
@@ -355,6 +361,12 @@ impl Controls {
         std::mem::take(&mut self.abort_all)
     }
 
+    /// Whether to cancel the requests waiting for their grammars, once per
+    /// drain.
+    pub fn take_cancel_grammar(&mut self) -> bool {
+        std::mem::take(&mut self.cancel_grammar)
+    }
+
     /// Take the replies produced so far.
     pub fn take_replies(&mut self) -> Vec<ControlOutput> {
         std::mem::take(&mut self.replies)
@@ -410,6 +422,7 @@ impl Controls {
     fn request_drain(&mut self, abort_inflight: bool, action: Drain) {
         self.state = PauseState::PausedNew;
         self.drain = Some(action);
+        self.cancel_grammar = true;
         if abort_inflight {
             self.abort_all = true;
         }
@@ -630,6 +643,7 @@ impl Controls {
         }
         self.state = PauseState::Unpaused;
         self.abort_all = false;
+        self.cancel_grammar = false;
         self.reply(resume_reply(true, ""));
     }
 
@@ -776,6 +790,8 @@ mod tests {
         controls.handle(pause("abort"), None);
         assert!(controls.take_abort_all());
         assert!(!controls.take_abort_all());
+        assert!(controls.take_cancel_grammar());
+        assert!(!controls.take_cancel_grammar());
         assert_eq!(controls.take_drain(), Some(Drain::Pause));
         controls.finish_pause_drain();
         assert_eq!(

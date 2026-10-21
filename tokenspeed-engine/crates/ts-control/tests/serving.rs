@@ -815,6 +815,25 @@ impl Engine {
     fn idle_forwards(&self, rank: usize) -> usize {
         *self.ranks[rank].idle_forwards.lock().unwrap()
     }
+
+    /// Wait until every rank of a mirrored replica (TP, PP) released the
+    /// requests the frontend's rank did: they end each request in the same
+    /// round, but their threads may get there after the client saw it end.
+    async fn settle(&self) {
+        let rids = |rank: usize| -> Vec<String> {
+            self.released_on(rank)
+                .into_iter()
+                .map(|(rid, _)| rid)
+                .collect()
+        };
+        for _ in 0..500 {
+            let first = rids(0);
+            if (1..self.ranks.len()).all(|rank| rids(rank) == first) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 }
 
 impl Drop for Engine {
@@ -1488,6 +1507,7 @@ async fn an_l3_prefetch_admits_the_prefix_every_rank_landed() {
     for rank in 0..2 {
         assert_eq!(*engine.ranks[rank].l3_probes.lock().unwrap(), [4]);
     }
+    engine.settle().await;
     assert_eq!(engine.released_on(1), engine.released_on(0));
 }
 
@@ -1505,6 +1525,7 @@ async fn tensor_parallel_ranks_mirror_one_scheduler() {
         }
         // The follower admitted, scheduled and released the same requests,
         // and agreed on every cache acknowledgment with the first member.
+        engine.settle().await;
         assert_eq!(engine.released_on(1), engine.released_on(0));
         assert_eq!(engine.released_on(0).len(), 4);
         assert!(engine.cache_ops(CacheOpKind::SnapshotStore) > 0);
@@ -1585,6 +1606,7 @@ async fn constrained_requests_follow_their_grammars_on_every_rank() {
         ));
         assert_eq!(tokens(&outputs[2]), [0, 1, 8]);
         assert_eq!(tokens(&outputs[3]), [1000, 1001, 1002]);
+        engine.settle().await;
         assert_eq!(engine.released_on(1), engine.released_on(0));
     }
 }
@@ -1629,7 +1651,8 @@ async fn a_grammar_unusable_on_one_rank_fails_alike_on_every_rank() {
             };
             assert!(message.contains("timed out"), "{message}");
             assert_eq!(message.contains("gave up"), gave_up, "{message}");
-            // Both ranks ended it in the same round.
+            // Both ranks ended it.
+            engine.settle().await;
             assert_eq!(engine.released_on(1), engine.released_on(0));
             assert_eq!(engine.released_on(0).len(), 1);
         }
@@ -1665,6 +1688,7 @@ async fn epd_requests_wait_for_their_embeddings_on_every_rank() {
         Some("abort")
     );
     assert_eq!(tokens(&outputs[2]), [1000, 1001, 1002]);
+    engine.settle().await;
     for rank in 0..2 {
         assert_eq!(*engine.ranks[rank].epd_admitted.lock().unwrap(), ["img-0"]);
         let released: Vec<String> = engine
@@ -1697,36 +1721,47 @@ async fn expert_parallel_ranks_rebalance_to_the_same_placement() {
         .collect();
     run_all(&engine.client, requests).await;
     // Snapshot, commit and two one-layer chunks complete over the next
-    // rounds, which run on even without requests.
-    let applied = |rank: usize| engine.ranks[rank].applied.lock().unwrap().clone();
+    // rounds, which run on even without requests. How many forwards the
+    // requests took depends on how they were batched, so a later rebalance
+    // may follow; the first one's load is the one known here.
+    let applied: Vec<_> = engine
+        .ranks
+        .iter()
+        .map(|rank| rank.applied.clone())
+        .collect();
+    let chunks = |rank: usize| applied[rank].lock().unwrap().len();
     for _ in 0..200 {
-        if applied(0).len() == 2 && applied(1).len() == 2 {
+        if chunks(0) >= 2 && chunks(1) >= 2 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let (rank0, rank1) = (applied(0), applied(1));
+    // The ranks stop after the same round, so each applied the same chunks.
+    drop(engine);
+    let (rank0, rank1) = (
+        applied[0].lock().unwrap().clone(),
+        applied[1].lock().unwrap().clone(),
+    );
     assert_eq!(
         rank0, rank1,
         "every EP rank applies the broadcast placement"
     );
-    assert_eq!(
-        rank0
-            .iter()
-            .map(|(layers, _)| layers.clone())
-            .collect::<Vec<_>>(),
-        [vec![0], vec![1]]
-    );
+    assert!(rank0.len() >= 2, "{rank0:?}");
+    // One layer per round, in order, rebalance after rebalance.
+    for (index, (layers, _)) in rank0.iter().enumerate() {
+        assert_eq!(*layers, [index % 2], "{rank0:?}");
+    }
+    let rank0 = &rank0[..2];
     // The group load: expert 0 counted 100 + 90 per slot it held, twice,
     // the others 2 per slot; the solver replicates the hot expert.
     let load: Vec<Vec<f64>> = vec![vec![380.0, 4.0, 2.0, 2.0]; 2];
     let expected =
         ts_control::eplb::rebalance_experts(&load, 6, None, 1, 2, Algorithm::Deepseek).unwrap();
-    for (layers, rows) in &rank0 {
+    for (layers, rows) in rank0 {
         let row: Vec<usize> = rows[0].iter().map(|&e| e as usize).collect();
         assert_eq!(row, expected[layers[0]]);
     }
-    assert!(rows_hold_expert_zero_thrice(&rank0));
+    assert!(rows_hold_expert_zero_thrice(rank0));
 }
 
 fn rows_hold_expert_zero_thrice(applied: &[(Vec<usize>, Vec<Vec<i32>>)]) -> bool {
@@ -1783,6 +1818,7 @@ async fn pipeline_stages_commit_the_last_stages_tokens() {
         assert_eq!(tokens(chunks), expected, "r{i}");
     }
     // The first stage finished each request exactly when the last did.
+    engine.settle().await;
     assert_eq!(engine.released_on(0).len(), 4);
     let last: Vec<String> = engine
         .released_on(1)
@@ -2038,6 +2074,80 @@ async fn a_wait_pause_answers_once_drained_and_withholds_new_requests() {
         chunks.push(chunk.unwrap());
     }
     assert_eq!(tokens(&chunks), [1000, 1001, 1002]);
+}
+
+/// A JSON schema the toy vocabulary takes most of a second to compile.
+fn slow_schema() -> String {
+    let names: Vec<String> = (0..3000).map(|i| format!("p{i}")).collect();
+    let properties: serde_json::Map<String, serde_json::Value> = names
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                serde_json::json!({"type": "string", "pattern": "[ab]{3,9}x"}),
+            )
+        })
+        .collect();
+    serde_json::json!({"type": "object", "properties": properties, "required": names}).to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_cancels_the_requests_still_compiling_their_grammars() {
+    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        tags: None,
+    });
+    for (drain, undo) in [
+        (pause("wait"), resume()),
+        (
+            release,
+            ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                tags: None,
+            }),
+        ),
+    ] {
+        let engine = start_ranks_with(
+            Layout::Single,
+            1,
+            Tiers::DeviceOnly,
+            Setup {
+                grammar: true,
+                ..Setup::default()
+            },
+        )
+        .await;
+        let mut cold = request("cold", 8, budget(6));
+        cold.sampling_params.json_schema = Some(slow_schema());
+        let stream = engine.client.generate(cold).await.unwrap();
+        // The drain arrives while the grammar compiles: the request is not
+        // in the scheduler, so the drain must end it rather than answer
+        // with it withheld until the resume.
+        let tag = drain.tag();
+        let drained = control(&engine, drain).await;
+        assert_eq!(drained.len(), 1);
+        assert!(drained[0].1, "{tag}");
+        let chunks = tokio::time::timeout(Duration::from_secs(1), collect(stream))
+            .await
+            .unwrap_or_else(|_| panic!("{tag} answered while the request still waits"));
+        let last = chunks.last().unwrap();
+        assert_eq!(last.finish_reason.as_deref(), Some("abort"), "{tag}");
+        let details = &last.finish_details.as_ref().unwrap().0;
+        assert!(
+            details
+                .iter()
+                .any(|(k, v)| k == "message" && *v == Value::from("Aborted by pause")),
+            "{tag}: {details:?}"
+        );
+        assert!(tokens(&chunks).is_empty());
+        assert!(control(&engine, undo).await[0].1);
+        // The engine serves on.
+        let mut warm = request("warm", 8, budget(2));
+        warm.sampling_params.regex = Some("a(b|x)".to_owned());
+        assert_eq!(tokens(&run(&engine.client, warm).await), [0, 1]);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

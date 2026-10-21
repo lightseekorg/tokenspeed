@@ -184,6 +184,8 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         # Held for writing while a weight update rewrites the model.
         self.model_update_lock = RWLock()
         self.asyncio_tasks = set()
+        # In-flight aborts sent to the engines (``_abort_on_engine``).
+        self._abort_tasks: set[asyncio.Task] = set()
 
         # Frontend admission barrier paired with the scheduler's native pause.
         # It prevents requests buffered by a paused scheduler from holding the
@@ -519,14 +521,15 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self._abort_on_engine(rid)
 
     def _abort_on_engine(self, rid: str) -> None:
-        """Ask the engine to abort ``rid``, without waiting for it."""
+        """Ask the engine to abort ``rid``, without waiting for it. The task
+        is held until it finishes, then dropped."""
 
         async def abort() -> None:
             await self.frontend.abort(rid)
 
-        self.asyncio_tasks.add(
-            asyncio.get_running_loop().create_task(print_exception_wrapper(abort))
-        )
+        task = asyncio.get_running_loop().create_task(print_exception_wrapper(abort))
+        self._abort_tasks.add(task)
+        task.add_done_callback(self._abort_tasks.discard)
 
     def block_generation_admission(self) -> None:
         """Stop requests before they acquire the model-update reader lock."""
