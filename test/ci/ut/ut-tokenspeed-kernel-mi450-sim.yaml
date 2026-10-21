@@ -187,6 +187,8 @@ env:
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_public_entry_point_is_cuda_graph_capturable
     # Iris collectives compile for wave32, and only flag polls bypass the cache.
     tokenspeed-kernel/test/amd/ops/test_iris_codegen.py
+    # K3 fusions drain peer stores before their system-scope release.
+    tokenspeed-kernel/test/amd/ops/test_iris_k3_codegen.py
     # MXFP4 MoE at four experts: static FP8-activation prefill and small-M
     # decode, routing and weighted top-k with invalid expert ids, the small-M
     # route's stable order across chunks and at the 2048-row limit, and the

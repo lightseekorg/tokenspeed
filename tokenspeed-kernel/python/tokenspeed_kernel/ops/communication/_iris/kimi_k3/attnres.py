@@ -28,8 +28,12 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_sync_rank_token,
     iris_arch_policy,
 )
+from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
+    k3_kernels_supported,
+)
 from tokenspeed_kernel.ops.communication._iris.synchronization import iris_wait
-from tokenspeed_kernel.platform import current_platform
+
+hip_utils = triton.language.extra.hip.utils
 
 ATTNRES_WORLD_SIZE = 8
 ATTNRES_HIDDEN_SIZE = 7168
@@ -53,7 +57,7 @@ def attnres_supported(
     rows = partial.shape[0] if partial.ndim == 2 else 0
     hidden = ATTNRES_HIDDEN_SIZE
     return (
-        current_platform().is_cdna4
+        k3_kernels_supported()
         and world_size == ATTNRES_WORLD_SIZE
         and partial.is_cuda
         and 0 < rows <= ATTNRES_MAX_ROWS
@@ -158,7 +162,7 @@ class IrisAttnResState:
             EPS=eps,
             ELEMENTS_PER_THREAD=_ELEMENTS_PER_THREAD,
             NUM_WARPS=_NUM_SUBGROUPS,
-            SUBGROUP_SIZE=64,
+            PEER_PAYLOAD_STORE_CACHE=self._arch.peer_payload_store,
             num_warps=_NUM_SUBGROUPS,
             WAIT_STORES=self._arch.wait_stores,
             WAIT_VMEM=self._arch.wait_vmem,
@@ -280,7 +284,7 @@ def iris_k3attn_push_oneshot(
     EPS: gl.constexpr,
     ELEMENTS_PER_THREAD: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
+    PEER_PAYLOAD_STORE_CACHE: gl.constexpr,
     WAIT_STORES: gl.constexpr,
     WAIT_VMEM: gl.constexpr,
 ):
@@ -289,6 +293,7 @@ def iris_k3attn_push_oneshot(
     Add the residual to the BF16 reduction, merge historical AttnRes partials,
     and RMS-normalize the BF16 mixture. Per-row generations guard slot reuse.
     """
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
     row = gl.program_id(0)
     layout: gl.constexpr = gl.BlockedLayout(
         [ELEMENTS_PER_THREAD], [SUBGROUP_SIZE], [NUM_WARPS], [0]
@@ -336,7 +341,7 @@ def iris_k3attn_push_oneshot(
             destination_inbox + inbox_slot_offset + RANK * MAX_ELEMENTS,
             row_offsets,
             mask=mask,
-            cache=".wt",
+            cache=PEER_PAYLOAD_STORE_CACHE,
         )
     iris_wait(WAIT_STORES, args=[], constraints="=r,~{memory}")
     # Wait for every subgroup's stores before signaling readiness to peers.
