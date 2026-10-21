@@ -386,8 +386,8 @@ def test_scale_bytes_and_loader_validation():
         ),
     ],
 )
-@pytest.mark.parametrize("rank", [1, 2, 3])
-def test_embedding_noncontiguous_ids(device, rank):
+@pytest.mark.parametrize("ndim", [1, 2, 3])
+def test_embedding_noncontiguous_ids(device, ndim):
     embed = RowShardedEngramEmbedding(
         64, 256, _mapping(0, 1, 1), device, False, "gpu", 1
     )
@@ -396,9 +396,9 @@ def test_embedding_noncontiguous_ids(device, rank):
     embed.weight_loader(embed.weight, codes)
     embed.weight_loader(embed.scale, scales)
     storage = torch.arange(96, device=device, dtype=torch.int64) % 70
-    if rank == 1:
+    if ndim == 1:
         ids = storage[::2]
-    elif rank == 2:
+    elif ndim == 2:
         ids = storage.reshape(2, 2, 24)[:, 1]
     else:
         ids = storage.reshape(2, 4, 12).transpose(0, 1)
