@@ -524,6 +524,31 @@ def _iris_drain_subgroup_vmem():
     )
 
 
+@gluon.jit
+def _iris_subgroup_any(flags):
+    """Return whether any lane of this subgroup holds a nonzero int32 flag.
+
+    One v_cmp writes the subgroup's lane mask to scalar registers, so a loop
+    can branch on it without a cross-lane reduction or, in multi-subgroup
+    programs, a shared-memory exchange. The result is uniform per subgroup,
+    not per workgroup: subgroups looping on it iterate independently, so such
+    a loop must not contain a workgroup barrier. The memory clobber keeps the
+    compiler from hoisting polling loads out of the loop. The 64-bit result is
+    the whole lane mask only on wave64 (CDNA4) targets.
+
+    Args:
+        flags: Exactly one int32 per lane (the instruction takes one VGPR).
+    """
+    mask = gl.inline_asm(
+        "v_cmp_ne_u32_e64 $0, 0, $1",
+        "=s,v,~{memory}",
+        [flags],
+        gl.int64,
+        is_pure=False,
+    )
+    return mask != 0
+
+
 @triton.jit
 def iris_pull_oneshot_staged(
     input_ptr,
@@ -679,38 +704,40 @@ def _iris_wait_lamport_slots(
 ):
     """Wait for each peer's BF16 packs in its slot to replace the empty markers.
 
-    Peer p's packs start at slots + p * SLOT_ELEMENTS; offsets index packs.
+    Peer p's packs start at slots + p * SLOT_ELEMENTS; offsets index packs whose
+    axis-1 elements are consecutive and start at an even element, so odd
+    positions are the high halves of 32-bit words. Each subgroup polls until all
+    of its valid lanes have every peer's pack.
     """
+    gl.static_assert(offsets.shape[1] % 2 == 0)
+    odd = gl.arange(0, offsets.shape[1], layout=gl.SliceLayout(0, LAYOUT)) % 2 == 1
     values = ()
     for _ in gl.static_range(1, WORLD_SIZE):
         values += (gl.full(offsets.shape, 0, gl.bfloat16, LAYOUT),)
-    active = valid
-    while gl.any(active, 0):
+    waiting = _iris_subgroup_any(valid.to(gl.int32))
+    while waiting:
+        # Issue every peer's read before checking any; .cv bypasses stale
+        # cache lines. Arrived packs stay unchanged until this rank clears
+        # them, so all valid lanes simply reread them. The compiler regression
+        # tests check that these reads remain in the polling cycle.
         loaded = ()
-        # A lane reloads every peer until all seven packs are ready. Issue the
-        # independent reads before checking them; retired lanes keep their data.
-        # .cv controls hardware caches, not compiler volatility. The compiler
-        # regression test checks that these reads remain in the polling cycle.
         for delta in gl.static_range(1, WORLD_SIZE):
             peer = (RANK + delta) % WORLD_SIZE
             loaded += (
                 gl.amd.cdna4.buffer_load(
                     slots + peer * SLOT_ELEMENTS,
                     offsets,
-                    mask=active[:, None],
-                    other=values[delta - 1],
+                    mask=valid[:, None],
                     cache=".cv",
                 ),
             )
-        active = gl.full(valid.shape, False, gl.int1, gl.SliceLayout(1, LAYOUT))
+        # Payloads never hold negative zero and 32-bit words are written
+        # whole, so a word is still empty exactly when its high half is 0x8000.
+        missing = gl.full(valid.shape, False, gl.int1, gl.SliceLayout(1, LAYOUT))
         for delta in gl.static_range(0, WORLD_SIZE - 1):
-            active |= valid & (
-                gl.max(
-                    (loaded[delta].to(gl.uint16, bitcast=True) == 0x8000).to(gl.int32),
-                    1,
-                )
-                != 0
-            )
+            empty = (loaded[delta].to(gl.uint16, bitcast=True) == 0x8000) & odd[None, :]
+            missing |= valid & (gl.max(empty.to(gl.int32), 1) != 0)
+        waiting = _iris_subgroup_any(missing.to(gl.int32))
         values = loaded
     return values
 
