@@ -48,10 +48,10 @@ def _require_iris():
     pytest.importorskip("tokenspeed_kernel.ops.communication._iris")
 
 
-def _compile_allgather_columns(arch_name):
-    """Compile the eight-rank column all-gather for ``arch_name`` without launching.
+def _compile_allgather_columns(arch_name, world_size, input_published):
+    """Compile the column all-gather for ``arch_name`` without launching.
 
-    The input is already published, so the only stores into peer memory are
+    With the input already published, the only stores into peer memory are
     the barrier epochs.
     """
     from tokenspeed_kernel._triton import gluon, triton
@@ -69,13 +69,13 @@ def _compile_allgather_columns(arch_name):
     signature["LOCAL_WORDS"] = "i32"
     constexprs = {
         "RANK": 0,
-        "WORLD_SIZE": 8,
+        "WORLD_SIZE": world_size,
         "LOCAL_HIDDEN_WORDS": 256,
-        "TOTAL_HIDDEN_WORDS": 8 * 256,
+        "TOTAL_HIDDEN_WORDS": world_size * 256,
         "BLOCK_WORDS": 4 * subgroup_size,
         "NUM_WARPS": 1,
         "WORDS_PER_LANE": 4,
-        "INPUT_PUBLISHED": True,
+        "INPUT_PUBLISHED": input_published,
         "PEER_PAYLOAD_LOAD_CACHE": policy.peer_payload_load,
         "PEER_SIGNAL_STORE_CACHE": policy.peer_signal_store,
     }
@@ -137,8 +137,10 @@ _ISA = {
 }
 
 
+@pytest.mark.parametrize("input_published", (True, False))
+@pytest.mark.parametrize("world_size", (4, 8))
 @pytest.mark.parametrize("arch", _ARCHS)
-def test_iris_arch_policy_codegen(arch, tmp_path):
+def test_iris_arch_policy_codegen(arch, world_size, input_published, tmp_path):
     """Peer accesses carry their architecture's IrisArchPolicy.
 
     gfx950 reads peer data non-temporally and writes peer barrier epochs
@@ -148,7 +150,8 @@ def test_iris_arch_policy_codegen(arch, tmp_path):
     one kernel demonstrates the policy.
     """
     isa = _ISA[arch]
-    assembly = _compile_allgather_columns(arch).asm["amdgcn"]
+    kernel = _compile_allgather_columns(arch, world_size, input_published)
+    assembly = kernel.asm["amdgcn"]
     (tmp_path / f"{arch}-allgather-columns.amdgcn").write_text(assembly)
     lines = assembly.splitlines()
 

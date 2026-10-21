@@ -300,7 +300,7 @@ class IrisBackend(CommBackend):
         self, tensor: torch.Tensor, group: Group, dim: int = 0
     ) -> torch.Tensor:
         if (
-            current_platform().is_cdna4
+            (current_platform().is_cdna4 or current_platform().is_cdna5)
             and len(group) in (4, 8)
             and tensor.ndim == 2
             and dim in (-1, tensor.ndim - 1)

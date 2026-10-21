@@ -50,6 +50,11 @@ if current_platform().is_cdna4:
     )
 
 
+def _column_gather_platform() -> bool:
+    platform = current_platform()
+    return platform.is_cdna4 or platform.is_cdna5
+
+
 class IrisAllGather:
     """Borrow producer storage; retain separate gather epochs and local results.
 
@@ -71,7 +76,7 @@ class IrisAllGather:
     def can_run(self, tensor: torch.Tensor) -> bool:
         """Check prepared TP4/TP8 storage for a possibly chunked hidden-shard gather."""
         return (
-            current_platform().is_cdna4
+            _column_gather_platform()
             and self.producer.peers.world_size in (4, 8)
             and tensor.ndim == 2
             and tensor.dtype == self.producer.data.dtype == torch.bfloat16
@@ -174,13 +179,13 @@ def all_gather_columns_can_run(
         max_bytes: Capacity of the symmetric input and local output buffers.
 
     Returns:
-        Whether the CDNA4 Gluon kernel supports the collective geometry.
+        Whether the Gluon kernel supports the collective geometry.
     """
     total_numel = num_tokens * local_hidden_size * world_size
     element_bytes = dtype.itemsize
     elements_per_word = 8 // element_bytes
     return (
-        current_platform().is_cdna4
+        _column_gather_platform()
         and world_size in (4, 8)
         and num_tokens > 0
         and local_hidden_size > 0

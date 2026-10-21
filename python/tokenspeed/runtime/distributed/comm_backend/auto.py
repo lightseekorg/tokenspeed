@@ -330,7 +330,7 @@ class AutoBackend(CommBackend):
 
     def get_prepared_all_gather(self, group: Group, dtype: torch.dtype):
         if (
-            not current_platform().is_cdna4
+            not (current_platform().is_cdna4 or current_platform().is_cdna5)
             or len(group) not in (4, 8)
             or self._force_deterministic_rsag()
             or self._group_spans_nodes(group)
@@ -562,7 +562,7 @@ class AutoBackend(CommBackend):
             and dim in (-1, tensor.dim() - 1)
         ):
             if (
-                current_platform().is_cdna4
+                (current_platform().is_cdna4 or current_platform().is_cdna5)
                 and not self._group_spans_nodes(group)
                 and not self._trtllm_ar.has_trtllm_ar(group)
             ):

@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tokenspeed.runtime.distributed.comm_backend import auto as auto_module
 from tokenspeed.runtime.distributed.comm_backend import iris as iris_module
 from tokenspeed.runtime.distributed.comm_backend.auto import (
     AutoBackend,
@@ -495,6 +496,27 @@ def test_all_gather_takes_the_workspace_exchange_where_it_serves(routing, monkey
     routing._trtllm_ar.lamport_all_gather.return_value = None
     assert routing.all_gather(ROWS, GROUP, -1) is routing._rsag.all_gather.return_value
     routing._rsag.all_gather.assert_called_once_with(ROWS, GROUP, -1)
+
+
+@pytest.mark.parametrize(
+    "platform",
+    (
+        SimpleNamespace(is_cdna4=True, is_cdna5=False),
+        SimpleNamespace(is_cdna4=False, is_cdna5=True),
+    ),
+    ids=("cdna4", "cdna5"),
+)
+def test_hidden_gathers_take_iris_on_cdna(routing, monkeypatch, platform):
+    _switches(monkeypatch, force=False, invariant=False)
+    monkeypatch.setattr(auto_module, "current_platform", lambda: platform)
+    routing._trtllm_ar.has_trtllm_ar.return_value = False
+    group = tuple(range(8))
+    assert routing.all_gather(ROWS, group, -1) is routing._iris.all_gather.return_value
+    assert (
+        routing.get_prepared_all_gather(group, torch.bfloat16)
+        is routing._iris.get_prepared_all_gather.return_value
+    )
+    routing._trtllm_ar.lamport_all_gather.assert_not_called()
 
 
 def test_route_never_reads_the_row_count(routing, monkeypatch):

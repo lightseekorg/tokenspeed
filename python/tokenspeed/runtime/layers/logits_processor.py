@@ -1247,7 +1247,7 @@ class LogitsProcessor(nn.Module):
                     safe=False,
                 )
             elif (
-                current_platform().is_cdna4
+                (current_platform().is_cdna4 or current_platform().is_cdna5)
                 and not require_full_vocab
                 and (
                     iris := get_global_backend().get_prepared_all_gather(
