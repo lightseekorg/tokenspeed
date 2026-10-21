@@ -350,8 +350,13 @@ def test_input_allocation_covers_decode(
         pass
 
     def check_allocation(
-        max_bs, max_num_tokens, state_write_padding_pool_index, device
+        max_bs,
+        max_num_tokens,
+        state_write_padding_pool_index,
+        device,
+        reads_state_checkpoints,
     ):
+        assert not reads_state_checkpoints
         assert max_bs == 160 // dp_size
         assert max_num_tokens == capacity
         raise AllocationChecked
@@ -370,6 +375,7 @@ def test_input_allocation_covers_decode(
         max_req_pool_size=161,
         spec_algo="EAGLE" if width > 1 else None,
         spec_num_tokens=width,
+        state_checkpoint_in_forward=False,
     )
     with pytest.raises(AllocationChecked):
         ModelExecutor(

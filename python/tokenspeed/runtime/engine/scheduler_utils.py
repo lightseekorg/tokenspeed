@@ -358,6 +358,7 @@ def make_config(
     cache_groups: Sequence[CacheGroupConfig] | None = None,
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
+    state_checkpoint_in_forward: bool = False,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -395,6 +396,11 @@ def make_config(
         cache_groups: The arena's scheduler group configs.
         enable_mixed_prefill_decode: Mixed prefill/decode batches.
         prefix_replay_tokens: Prompt tail recomputed after a prefix hit.
+        state_checkpoint_in_forward:
+            ``--enable-state-checkpoint-in-forward``: the prefill forward that
+            spans a long prompt's last prefix-page boundary before its replay
+            tail also writes the State checkpoint there. Requires prefix
+            caching.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -433,6 +439,12 @@ def make_config(
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
     cfg.prefix_replay_tokens = prefix_replay_tokens
+    if state_checkpoint_in_forward:
+        # Set only when on: off is the binding's default, so the runtime keeps
+        # working with a scheduler wheel released before this field, where
+        # turning the option on raises AttributeError here instead of being
+        # ignored.
+        cfg.state_checkpoint_in_forward = True
     cfg.disable_l2_cache = disable_l2_cache
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode

@@ -268,6 +268,16 @@ class AttentionBackend(CachePoolBinding, ABC):
     cache_consumer_attn_kinds: frozenset[str] = frozenset(
         {"full_history", "sliding_window"}
     )
+
+    @property
+    def stores_in_forward_state_checkpoints(self) -> bool:
+        """Whether every State group this node consumes stores in-forward State
+        checkpoints (``--enable-state-checkpoint-in-forward``): the state at a
+        checkpoint into the third block of an extend row. A node consuming no
+        State group has none to miss; a State consumer opts in, and a composite
+        answers for its children."""
+        return "state" not in self.cache_consumer_attn_kinds
+
     # Only backends whose model skips incomplete-prefill outputs opt in.
     skips_incomplete_prefill_outputs: bool = False
     # MLA sharded history reads/writes and global attention-partial merging,
@@ -372,8 +382,10 @@ class AttentionBackend(CachePoolBinding, ABC):
 
         ``capture`` only retains startup buffers at their captured addresses;
         it must not select different computation. Returns the same answer as
-        :meth:`admits_prefill_graph`; the prefill capture raises if an override
-        refuses a shape that query admitted. Other backends keep
+        :meth:`admits_prefill_graph`, except that a forward writing in-forward
+        State checkpoints keeps its live metadata and gets False; the prefill
+        capture raises if an override refuses a shape that query admitted.
+        Other backends keep
         their existing metadata and attention breaks. Call on the consumer
         stream, after the scheduler-derived metadata is built and before any
         layer consumes it.
