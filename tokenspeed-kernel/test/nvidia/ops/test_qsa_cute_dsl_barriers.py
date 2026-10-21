@@ -147,7 +147,115 @@ def test_qsa_decode_barriers_allow_delayed_pv(bf16_smem_slots: int) -> None:
     )
 
 
+def _run_delayed_stream_producer(enable_pdl: bool) -> None:
+    """Delay one producer warp after publishing each candidate-count update."""
+    import cutlass.cute as cute
+    import cutlass.pipeline as pipeline
+    from cutlass.cutlass_dsl import dsl_user_op
+    from test_qsa_stream_topk import _assert_matches_reference
+    from tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk import kernel
+
+    original_wait = pipeline.NamedBarrier.arrive_and_wait
+
+    @cute.jit
+    def delay_producer(barrier_id):
+        if barrier_id == 11 or barrier_id == 12:
+            tidx, _, _ = cute.arch.thread_idx()
+            if (tidx // 32) % 4 == 3:
+                start = cute.arch.clock64()
+                now = start
+                while now - start < 20000:
+                    now = cute.arch.clock64()
+
+    @dsl_user_op
+    def delayed_wait(self, *, loc=None, ip=None):
+        original_wait(self, loc=loc, ip=ip)
+        delay_producer(self.barrier_id)
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.manual_seed(83)
+    rows, pages = 136, 128
+    query = torch.randn(rows, 5, 128, device="cuda", dtype=torch.bfloat16)[:, :4]
+    keys = torch.randn(pages * 64, 1, 128, device="cuda", dtype=torch.bfloat16)
+    table = torch.arange(pages, device="cuda", dtype=torch.int32)[None, :]
+    requests = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    complete = torch.full((rows,), pages * 64, device="cuda", dtype=torch.int32)
+
+    with pytest.MonkeyPatch.context() as patch:
+        # Perturb real warp scheduling without changing scores or metadata.
+        patch.setattr(pipeline.NamedBarrier, "arrive_and_wait", delayed_wait)
+
+        def forward():
+            return kernel(
+                query,
+                keys,
+                table,
+                requests,
+                complete,
+                page_size=64,
+                block_topk=512,
+                queries_per_request=rows,
+                max_partial_bytes=0,
+                enable_pdl=enable_pdl,
+            )
+
+        eager = forward()
+        torch.cuda.synchronize()
+        _assert_matches_reference(
+            query, keys, table, requests, complete, eager, 64, 512
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            selected = forward()
+        for frontiers in (
+            [8192] * 8,
+            [0, 511, 512, 513, 1023, 1024, 6143, 8192],
+            [512] * 4 + [8192] * 4,
+            [8192] * 4 + [512] * 4,
+            [0] * 8,
+        ):
+            complete.copy_(
+                torch.tensor(frontiers * (rows // len(frontiers)), device="cuda")
+            )
+            for _ in range(3):
+                graph.replay()
+            _assert_matches_reference(
+                query, keys, table, requests, complete, selected, 64, 512
+            )
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_qsa_stream_producer_count_snapshot_allows_delayed_warp(enable_pdl: bool):
+    if not torch.cuda.is_available() or current_platform().arch_version not in (
+        ArchVersion(10, 0),
+        ArchVersion(10, 3),
+    ):
+        pytest.skip("CuTe DSL QSA requires NVIDIA SM100 or SM103")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--stream-producer-pdl",
+            "on" if enable_pdl else "off",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"Delayed stream producer failed with PDL={enable_pdl}:\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bf16-smem-slots", type=int, choices=(2, 3), required=True)
-    _run_delayed_pv(parser.parse_args().bf16_smem_slots)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--bf16-smem-slots", type=int, choices=(2, 3))
+    group.add_argument("--stream-producer-pdl", choices=("on", "off"))
+    args = parser.parse_args()
+    if args.bf16_smem_slots is not None:
+        _run_delayed_pv(args.bf16_smem_slots)
+    else:
+        _run_delayed_stream_producer(args.stream_producer_pdl == "on")

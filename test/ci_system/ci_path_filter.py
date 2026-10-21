@@ -114,6 +114,7 @@ VENDOR_KERNEL_SOLUTIONS = {
             "faster_hadamard_transform",
             "flash_mla",
             "flashinfer",
+            "flashinfer_prims",
             "marlin",
             "mega_moe",
             "tokenspeed_mla",
