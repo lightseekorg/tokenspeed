@@ -1794,7 +1794,9 @@ def triton_qsa_block_topk_stream(
         BLOCK_D=triton.next_power_of_2(query.shape[2]),
         ENABLE_PDL=use_pdl,
         num_warps=8,
-        num_stages=2,
+        # Two pipeline stages need 260 KiB of shared memory at 512-block
+        # tiles; AMD CDNA4 has 160 KiB per CU.
+        num_stages=2 if _is_nvidia else 1,
         **pdl_kwargs,
     )
     if splits * block_topk <= 8192:

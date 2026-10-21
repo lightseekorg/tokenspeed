@@ -130,7 +130,8 @@ class QSAIndexer(nn.Module):
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
 
-    def _fields(self, pool):
+    def cache_fields(self, pool):
+        """``(raw_key, compressed, rope_position)`` views of this layer."""
         layer_id = pool._field_layer_id(self.layer_id)
         raw = pool.arena.field(qsa_raw_key_field(layer_id))
         compressed = pool.arena.field(qsa_compressed_field(layer_id))
@@ -227,7 +228,7 @@ class QSAIndexer(nn.Module):
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
         ),
     ) -> torch.Tensor | None:
-        raw, compressed, position_cache = self._fields(pool)
+        raw, compressed, position_cache = self.cache_fields(pool)
         position_values = self._position_values(rope_positions)
         rotary = self.rotary_emb
         if query is not None and not rotary.is_neox_style:
@@ -404,7 +405,7 @@ class QSAIndexer(nn.Module):
         pool = ctx.token_to_kv_pool
         if pool.layerwise_load_tracker is not None:
             pool.layerwise_load_tracker.wait_for_layer(self.layer_id)
-        _, compressed, _ = self._fields(pool)
+        _, compressed, _ = self.cache_fields(pool)
         backend = qwen4_exp_backend(ctx.attn_backend).indexer_backend
         if backend is None:
             raise RuntimeError("QSA requires an indexer backend")

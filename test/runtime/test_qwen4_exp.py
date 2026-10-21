@@ -97,7 +97,10 @@ from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.ple_lookup import PLELookup
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
-from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
+from tokenspeed.runtime.layers.quantization.utils import (
+    should_exclude_quant_module,
+    should_ignore_quant_layer,
+)
 from tokenspeed.runtime.layers.qwen4_exp_ple import (
     QWEN4_EXP_PLE_CACHE_GROUP,
     Qwen4ExpNGramEmbedding,
@@ -182,6 +185,25 @@ def test_qwen4_exp_nextn_drops_quark_quantization_for_excluded_mtp() -> None:
 
     quantized = Mxfp4Config(ignored_layers=["lm_head"])
     assert qwen4_exp_nextn._resolve_mtp_quant_config(quantized) is quantized
+
+
+def test_qwen4_exp_nextn_keeps_quantized_mtp_with_bf16_fc() -> None:
+    # The W4A8 MX conversion quantizes the MTP layer's linears and keeps only
+    # its fc projections (and the hyper-connections) in BF16.
+    config = Mxfp4Config.from_config(
+        {
+            "quant_method": "quark",
+            "exclude": ["*fc_embedding", "*fc_hidden", "*hyper_connection*", "lm_head"],
+        }
+    )
+    assert qwen4_exp_nextn._resolve_mtp_quant_config(config) is config
+    ignored = config.ignored_layers
+    assert should_ignore_quant_layer("mtp.fc_embedding", ignored)
+    assert should_ignore_quant_layer("mtp.fc_hidden", ignored)
+    assert should_ignore_quant_layer(
+        "mtp.layers.0.attn_hyper_connection.mix_inject_proj", ignored
+    )
+    assert not should_ignore_quant_layer("mtp.layers.0.qkv_proj", ignored)
 
 
 def test_qwen4_exp_gdn_norm_uses_sigmoid_output_gate() -> None:
@@ -781,7 +803,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
         cache_accesses.append(("fields", indexer.layer_id))
         return None, torch.empty(0), None
 
-    indexer._fields = fields
+    indexer.cache_fields = fields
     stacks = router.stacks
     metadata = backend.indexer_backend.metadata_for(ForwardMode.EXTEND)
     qsa_table = metadata.qsa_block_table
@@ -876,7 +898,7 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
     indexer.recent_page_size = 64
     indexer.compress_ratio = 4
     pool = SimpleNamespace(layerwise_load_tracker=None)
-    indexer._fields = lambda pool: (None, torch.empty(0), None)
+    indexer.cache_fields = lambda pool: (None, torch.empty(0), None)
     indexer._project_qk_raw = lambda hidden: (hidden, hidden[:, None, :])
     selection_widths = []
 
@@ -1045,7 +1067,7 @@ def test_qwen4_exp_qsa_pure_verify_skips_recent_write(monkeypatch) -> None:
         mrope_section=None,
         mrope_interleaved=False,
     )
-    indexer._fields = lambda pool: (
+    indexer.cache_fields = lambda pool: (
         torch.empty((2, 4, 1, 8)),
         torch.empty((2, 64, 1, 8)),
         torch.empty((2, 3), dtype=torch.int64),
@@ -1208,7 +1230,7 @@ def _qsa_cache_test_indexer(device: str = "cuda"):
     raw = torch.zeros((3, 4, 1, 2), dtype=torch.float32, device=device)
     compressed = torch.zeros((3, 64, 1, 2), dtype=torch.float32, device=device)
     rope_positions = torch.zeros((3, 3), dtype=torch.int64, device=device)
-    indexer._fields = lambda pool: (raw, compressed, rope_positions)
+    indexer.cache_fields = lambda pool: (raw, compressed, rope_positions)
     indexer._draft_scratch = {}
     return indexer, SimpleNamespace(), raw, compressed, rope_positions
 

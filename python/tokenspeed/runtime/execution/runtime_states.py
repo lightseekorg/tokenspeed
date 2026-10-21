@@ -25,7 +25,10 @@ import itertools
 from collections.abc import Mapping, Sequence
 
 import torch
-from tokenspeed_kernel.ops.metadata import apply_stop_conditions
+from tokenspeed_kernel.ops.metadata import (
+    apply_stop_conditions,
+    mask_stopped_state_tables,
+)
 
 from tokenspeed.runtime.execution.request_token_history import RequestTokenHistoryView
 from tokenspeed.runtime.execution.slot_state import (
@@ -517,10 +520,13 @@ class RuntimeStates:
         forward dispatched behind the one that ended a request leaves the
         request's live state block as that forward found it.
         """
-        stopped_rows = self.stopped.index_select(0, req_pool_indices)[:, None]
         tables = dict(block_tables)
-        for group_id in state_group_ids:
-            tables[group_id] = tables[group_id].masked_fill(stopped_rows, -1)
+        masked = mask_stopped_state_tables(
+            [tables[group_id] for group_id in state_group_ids],
+            self.stopped,
+            req_pool_indices,
+        )
+        tables.update(zip(state_group_ids, masked))
         return tables
 
     def mark_spec_candidates_drafted(self, req_pool_indices: torch.Tensor) -> None:

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Single-bank, sorted-scale MXFP8 SiTU expert pipeline for gfx950."""
+"""Single-bank, sorted-scale MXFP8 x MXFP4 expert pipeline for gfx950."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.mxfp8_quantize import quantize_m
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import n16_mxfp4_shape
 
 
-def mxfp8_situ_prefill(
+def mxfp8_moe_prefill(
     x: torch.Tensor,
     w13: torch.Tensor,
     s13: torch.Tensor,
@@ -45,18 +45,28 @@ def mxfp8_situ_prefill(
     *,
     global_experts: int,
     expert_start: int,
-    situ_beta: float,
-    situ_linear_beta: float,
+    activation: str,
+    situ_beta: float | None,
+    situ_linear_beta: float | None,
     out: torch.Tensor | None,
 ) -> torch.Tensor:
     """Apply the two-stage MXFP8 expert pipeline to BF16 rows and N16 weights.
 
     Values stay token-major; only E8M0 scales follow sorted route order. The
-    BF16 token-slot intermediate separates FP32 SiTU from its quantizer.
-    Repeated expert IDs are distinct route slots. The caller must ensure output
-    elements do not overlap any inputs; disjoint strided workspace views may
-    share storage. Output requires nonoverlapping, dword-aligned rows with unit
-    inner stride for packed BF16 atomics.
+    BF16 token-slot intermediate separates the FP32 gated activation from its
+    quantizer. Repeated expert IDs are distinct route slots. The caller must
+    ensure output elements do not overlap any inputs; disjoint strided
+    workspace views may share storage. Output requires nonoverlapping,
+    dword-aligned rows with unit inner stride for packed BF16 atomics.
+
+    Args:
+        activation: ``"situ"`` (needs both SiTU clamps) or ``"silu"``
+            (``SiLU(gate) * up``; both clamps must be ``None``).
+        situ_beta: SiTU gate clamp, or ``None`` for SiLU.
+        situ_linear_beta: SiTU linear-branch clamp, or ``None`` for SiLU.
+
+    Batches of any size, including decode, run the same two GEMMs; the
+    intermediate width must be a multiple of 256.
     """
     if x.ndim != 2 or x.dtype != torch.bfloat16 or not x.is_cuda:
         raise ValueError("MXFP8 prefill requires rank-2 BF16 GPU activations")
@@ -88,8 +98,15 @@ def mxfp8_situ_prefill(
         raise ValueError(
             "route encoding requires fewer than 256 slots and 2**24 tokens"
         )
-    if any(not math.isfinite(b) or b <= 0 for b in (situ_beta, situ_linear_beta)):
-        raise ValueError("SiTU clamps must be positive finite values")
+    betas = (situ_beta, situ_linear_beta)
+    if activation == "situ":
+        if any(b is None or not math.isfinite(b) or b <= 0 for b in betas):
+            raise ValueError("SiTU clamps must be positive finite values")
+    elif activation == "silu":
+        if any(b is not None for b in betas):
+            raise ValueError("SiLU experts take no SiTU clamps")
+    else:
+        raise ValueError(f"unsupported MXFP8 expert activation {activation!r}")
     inputs = (x, *weights, topk_ids, topk_weights)
     if any(t.device != x.device for t in inputs):
         raise ValueError("MXFP8 prefill tensors must be colocated")
@@ -147,6 +164,7 @@ def mxfp8_situ_prefill(
         situ_linear_beta,
         m * d < 2**31,
         BM=block_m,
+        ACTIVATION=activation,
         num_warps=4,
         num_stages=1,
         enable_fp_fusion=False,

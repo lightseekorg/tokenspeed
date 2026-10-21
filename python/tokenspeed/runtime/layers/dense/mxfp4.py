@@ -25,6 +25,7 @@ from tokenspeed_kernel.ops.gemm import (
     mxfp4_swiglu_linear,
     prepare_mxfp4_linear,
 )
+from tokenspeed_kernel.ops.quantization import quantize_mxfp4
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.quantization.base_config import QuantizeMethodBase
@@ -37,15 +38,31 @@ class Mxfp4LinearMethod(QuantizeMethodBase):
 
     Kimi-K2.5 and Quark MXFP4 checkpoints store dense MLP and MoE
     shared-expert MLP tensors in the same packed FP4/e8m0 format as routed
-    experts. Runtime activations are quantized to MXFP4 (dynamic per-32
-    scales) by the ``mxfp4_linear`` kernels so checkpoint weights stay packed
-    in VRAM. After loading, the weight is reordered once into the layout the
-    selected kernel reads.
+    experts. Runtime activations are quantized to the checkpoint's activation
+    format, MXFP4 or MXFP8 (dynamic per-32 scales), by the ``mxfp4_linear``
+    kernels so checkpoint weights stay packed in VRAM. After loading, the
+    weight is reordered once into the layout the selected kernel reads.
     """
 
     def __init__(self, quant_config):
         self.quant_config = quant_config
         self.group_size = getattr(quant_config, "group_size", MXFP4_BLOCK)
+        activation_format = quant_config.linear_activation_format
+        if activation_format is None:
+            raise ValueError(
+                "Mxfp4LinearMethod needs a checkpoint with MXFP4 or MXFP8 "
+                "dynamic activations"
+            )
+        self.activation_format: str = activation_format
+
+    @classmethod
+    def for_activation_format(cls, activation_format: str) -> Mxfp4LinearMethod:
+        """A method for weights quantized at load time, not by a checkpoint."""
+        method = cls.__new__(cls)
+        method.quant_config = None
+        method.group_size = MXFP4_BLOCK
+        method.activation_format = activation_format
+        return method
 
     def create_weights(
         self,
@@ -115,6 +132,7 @@ class Mxfp4LinearMethod(QuantizeMethodBase):
             layer.weight.data,
             layer.weight_scale.data,
             swiglu=layer.mxfp4_swiglu,
+            activation_format=self.activation_format,
         )
         # Same shape and dtype in the kernel's layout; replacing the data
         # releases the checkpoint-order copy.
@@ -126,7 +144,11 @@ class Mxfp4LinearMethod(QuantizeMethodBase):
             self.process_weights_after_loading(layer)
         input_2d = x.reshape(-1, x.shape[-1])
         output_shape = (*x.shape[:-1], layer.output_size_per_partition)
-        output = mxfp4_linear(input_2d, layer.mxfp4_linear_weight)
+        output = mxfp4_linear(
+            input_2d,
+            layer.mxfp4_linear_weight,
+            activation_format=self.activation_format,
+        )
         if bias is not None:
             output = output + bias
         return output.reshape(*output_shape)
@@ -146,8 +168,59 @@ class Mxfp4LinearMethod(QuantizeMethodBase):
         if layer.mxfp4_linear_weight is None:
             self.process_weights_after_loading(layer)
         input_2d = x.reshape(-1, x.shape[-1])
-        output = mxfp4_swiglu_linear(input_2d, layer.mxfp4_linear_weight)
+        output = mxfp4_swiglu_linear(
+            input_2d,
+            layer.mxfp4_linear_weight,
+            activation_format=self.activation_format,
+        )
         return output.reshape(*x.shape[:-1], layer.output_size_per_partition // 2)
+
+
+# Rows of the LM head quantized per call, to bound the temporary memory.
+_LM_HEAD_CHUNK_ROWS = 16384
+
+
+def quantize_lm_head_mxfp4(lm_head: torch.nn.Module, activation_format: str) -> None:
+    """Quantize a BF16 LM head in place to MXFP4 weights.
+
+    Every 32 weights share one UE8M0 scale (OCP MX rounding, as
+    ``quantize_mxfp4`` does). The head then runs ``mxfp4_linear``, which
+    quantizes its input row to ``activation_format``; this reads a quarter of
+    the BF16 head's bytes and changes the logits by the MXFP4 rounding.
+
+    Args:
+        lm_head: The LM head; its ``weight`` is ``[rows, hidden]`` and it must
+            not share that tensor with the input embedding.
+        activation_format: ``"mxfp4"`` or ``"mxfp8"``.
+    """
+    weight = lm_head.weight.data
+    if weight.dim() != 2 or not weight.dtype.is_floating_point:
+        raise ValueError(
+            f"LM head weight must be a 2-D float tensor, got {weight.dtype}"
+        )
+    rows, hidden = weight.shape
+    _validate_mxfp4_partition(hidden)
+    packed = torch.empty(rows, hidden // 2, dtype=torch.uint8, device=weight.device)
+    scales = torch.empty(
+        rows, hidden // MXFP4_BLOCK, dtype=torch.uint8, device=weight.device
+    )
+    for start in range(0, rows, _LM_HEAD_CHUNK_ROWS):
+        chunk = weight[start : start + _LM_HEAD_CHUNK_ROWS].to(torch.bfloat16)
+        q, s = quantize_mxfp4(chunk, scale_layout="linear")
+        packed[start : start + chunk.shape[0]] = q
+        scales[start : start + chunk.shape[0]] = s.view(torch.uint8).view(
+            chunk.shape[0], -1
+        )
+    method = Mxfp4LinearMethod.for_activation_format(activation_format)
+    # The same fields Mxfp4LinearMethod.create_weights gives a linear layer.
+    lm_head.weight = Parameter(packed, requires_grad=False)
+    lm_head.weight_scale = Parameter(scales, requires_grad=False)
+    lm_head.input_size_per_partition = hidden
+    lm_head.output_size_per_partition = rows
+    lm_head.mxfp4_swiglu = False
+    lm_head.mxfp4_linear_weight = None
+    lm_head.quant_method = method
+    method.process_weights_after_loading(lm_head)
 
 
 def _validate_mxfp4_partition(input_size_per_partition: int) -> None:
@@ -181,4 +254,5 @@ def _wrap_e8m0_scale_loader(weight_loader):
 
 __all__ = [
     "Mxfp4LinearMethod",
+    "quantize_lm_head_mxfp4",
 ]

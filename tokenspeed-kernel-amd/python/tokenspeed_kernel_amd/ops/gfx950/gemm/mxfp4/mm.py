@@ -20,15 +20,25 @@
 
 """Dense MXFP4 linears with in-kernel dynamic activation quantization.
 
-``y = mxfp4(x) @ W.T`` for BF16 ``x [M, K]`` and a packed MXFP4 weight
+``y = q(x) @ W.T`` for BF16 ``x [M, K]`` and a packed MXFP4 weight
 ``W [N, K/2]`` (two E2M1 values per byte, low nibble first, one UE8M0 scale
-per 32 K values). Each BF16 K tile is quantized inside the kernel with the
-dynamic per-32 recipe of ``mxfp4_quantize`` (power-of-two scale from the
-rounded group amax, E2M1 round-to-nearest-even with saturation), bit-identical
-to quantizing first, so there is no separate quantization launch or HBM round
-trip. Products run on CDNA4 scaled MFMAs (``16x16x128``) with FP32
-accumulation. The weight is stored preshuffled (``preshuffle_mxfp4_weight``)
-so each MFMA operand load reads 1 KiB contiguously.
+per 32 K values). Each BF16 K tile is quantized inside the kernel, so there
+is no separate quantization launch or HBM round trip. The activation format
+``q`` is an explicit parameter:
+
+* ``"mxfp4"``: the dynamic per-32 recipe of ``mxfp4_quantize``
+  (power-of-two scale from the rounded group amax, E2M1
+  round-to-nearest-even with saturation), bit-identical to quantizing first.
+* ``"mxfp8"``: E4M3 values with one UE8M0 scale per 32 values. The biased
+  scale exponent is that of ``amax * (1/448)`` (FP32), plus one when that
+  product is not a power of two, clamped to ``[1, 254]``; values are
+  ``x / 2**(E - 127)`` rounded to nearest-even E4M3FN.
+
+Products run on CDNA4 scaled MFMAs (``16x16x128``) with FP32 accumulation;
+the E4M3 A operand holds twice the bytes of the E2M1 one per K tile. The
+weight is stored preshuffled (``preshuffle_mxfp4_weight``) so each MFMA
+operand load reads 1 KiB contiguously; both activation formats read the same
+weight bytes.
 
 Two kernels share the main loop and differ in the epilogue:
 
@@ -56,6 +66,9 @@ cdna4 = gl.amd.cdna4
 
 MXFP4_GROUP = 32
 GROUP = gl.constexpr(MXFP4_GROUP)
+
+# Activation format -> CDNA4 scaled-MFMA operand format.
+_A_FORMATS = {"mxfp4": "e2m1", "mxfp8": "e4m3"}
 
 _partial_cache: dict[tuple[int, int, int], torch.Tensor] = {}
 
@@ -115,13 +128,24 @@ def _gate_up_pair_layout(block_m, half, num_warps):
 
 
 @gluon.jit
-def _quantize_operand(x, a_layout: gl.constexpr, a_scale_layout: gl.constexpr):
-    """Quantize a BF16 ``[rows, BLOCK_K]`` tile to MFMA-ready E2M1 + UE8M0.
+def _quantize_operand(
+    x,
+    a_layout: gl.constexpr,
+    a_scale_layout: gl.constexpr,
+    A_FORMAT: gl.constexpr,
+):
+    """Quantize a BF16 ``[rows, BLOCK_K]`` tile to an MFMA-ready operand.
 
-    Matches ``mxfp4_quantize``: round the group amax up at the third mantissa
-    bit to a power of two, back off two exponents (so the largest value lands
-    in E2M1's 4.0 binade), clamp the biased exponent to ``[0, 254]``, then
-    convert with round-to-nearest-even and saturation.
+    ``A_FORMAT`` ``"e2m1"`` matches ``mxfp4_quantize``: round the group amax
+    up at the third mantissa bit to a power of two, back off two exponents
+    (so the largest value lands in E2M1's 4.0 binade), clamp the biased
+    exponent to ``[0, 254]``, then convert with round-to-nearest-even and
+    saturation; the result is packed ``[rows, BLOCK_K / 2]``.
+
+    ``"e4m3"`` takes the exponent of ``amax * (1/448)``, rounded up when that
+    product has mantissa bits, clamped to ``[1, 254]``, so the largest value
+    fits E4M3's 448; the result is ``[rows, BLOCK_K]`` E4M3 (round to
+    nearest-even).
     """
     ROWS: gl.constexpr = x.shape[0]
     COLS: gl.constexpr = x.shape[1]
@@ -131,12 +155,18 @@ def _quantize_operand(x, a_layout: gl.constexpr, a_scale_layout: gl.constexpr):
     magnitude = x.to(gl.int16, bitcast=True) & 0x7FFF
     grouped = magnitude.reshape((ROWS, COLS // GROUP, GROUP))
     amax_bits = gl.max(grouped, axis=2).to(gl.int32) << 16
-    rounded_bits = (amax_bits + 0x200000) & 0x7F800000
-    exp_biased = (rounded_bits >> 23).to(gl.int32)
-    scale = gl.minimum(gl.maximum(exp_biased - 2, 0), 254).to(gl.uint8)
-    packed = cdna4.scaled_downcast(x, scale, "e2m1", axis=1)
+    if A_FORMAT == "e4m3":
+        ratio = amax_bits.to(gl.float32, bitcast=True) * (1.0 / 448.0)
+        ratio_bits = ratio.to(gl.int32, bitcast=True)
+        exp_biased = (ratio_bits >> 23) + ((ratio_bits & 0x7FFFFF) != 0).to(gl.int32)
+        scale = gl.minimum(gl.maximum(exp_biased, 1), 254).to(gl.uint8)
+    else:
+        rounded_bits = (amax_bits + 0x200000) & 0x7F800000
+        exp_biased = (rounded_bits >> 23).to(gl.int32)
+        scale = gl.minimum(gl.maximum(exp_biased - 2, 0), 254).to(gl.uint8)
+    quantized = cdna4.scaled_downcast(x, scale, A_FORMAT, axis=1)
     return (
-        gl.convert_layout(packed, a_layout),
+        gl.convert_layout(quantized, a_layout),
         gl.convert_layout(scale, a_scale_layout),
     )
 
@@ -189,11 +219,17 @@ def _load_stage(
 
 
 @gluon.jit
-def _mma_stage(stage, acc, dot_a: gl.constexpr, a_scale_layout: gl.constexpr):
-    """Quantize one BF16 A tile and accumulate it."""
+def _mma_stage(
+    stage,
+    acc,
+    dot_a: gl.constexpr,
+    a_scale_layout: gl.constexpr,
+    A_FORMAT: gl.constexpr,
+):
+    """Quantize one BF16 A tile to ``A_FORMAT`` and accumulate it."""
     a, b, b_s = stage
-    a_q, a_s = _quantize_operand(a, dot_a, a_scale_layout)
-    return cdna4.mfma_scaled(a_q, a_s, "e2m1", b, b_s, "e2m1", acc)
+    a_q, a_s = _quantize_operand(a, dot_a, a_scale_layout, A_FORMAT)
+    return cdna4.mfma_scaled(a_q, a_s, A_FORMAT, b, b_s, "e2m1", acc)
 
 
 @gluon.jit
@@ -217,6 +253,7 @@ def _mxfp4_linear_body(
     WARPS_N: gl.constexpr,
     SPLIT_K: gl.constexpr,
     NUM_XCDS: gl.constexpr,
+    A_FORMAT: gl.constexpr,
     SWIGLU: gl.constexpr,
 ):
     """Shared main loop and epilogues.
@@ -342,7 +379,7 @@ def _mxfp4_linear_body(
             K,
             K_TAIL,
         )
-        acc = _mma_stage(cur, acc, dot_a, a_scale_layout)
+        acc = _mma_stage(cur, acc, dot_a, a_scale_layout, A_FORMAT)
         cur = _load_stage(
             a_ptr,
             b_ptr,
@@ -357,7 +394,7 @@ def _mxfp4_linear_body(
             K,
             K_TAIL,
         )
-        acc = _mma_stage(nxt, acc, dot_a, a_scale_layout)
+        acc = _mma_stage(nxt, acc, dot_a, a_scale_layout, A_FORMAT)
     if TILES_PER_SPLIT % 2 == 0:
         nxt = _load_stage(
             a_ptr,
@@ -373,10 +410,10 @@ def _mxfp4_linear_body(
             K,
             K_TAIL,
         )
-        acc = _mma_stage(cur, acc, dot_a, a_scale_layout)
-        acc = _mma_stage(nxt, acc, dot_a, a_scale_layout)
+        acc = _mma_stage(cur, acc, dot_a, a_scale_layout, A_FORMAT)
+        acc = _mma_stage(nxt, acc, dot_a, a_scale_layout, A_FORMAT)
     else:
-        acc = _mma_stage(cur, acc, dot_a, a_scale_layout)
+        acc = _mma_stage(cur, acc, dot_a, a_scale_layout, A_FORMAT)
 
     offs_cm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, mfma))
     offs_cn = gl.arange(0, BLOCK_N, gl.SliceLayout(0, mfma))
@@ -476,8 +513,9 @@ def gluon_mxfp4_linear_gfx950(
     WARPS_N: gl.constexpr,
     SPLIT_K: gl.constexpr,
     NUM_XCDS: gl.constexpr,
+    A_FORMAT: gl.constexpr,
 ):
-    """``y = mxfp4(x) @ W.T`` in BF16."""
+    """``y = q(x) @ W.T`` in BF16, ``q`` quantizing to ``A_FORMAT``."""
     _mxfp4_linear_body(
         a_ptr,
         b_ptr,
@@ -498,6 +536,7 @@ def gluon_mxfp4_linear_gfx950(
         WARPS_N,
         SPLIT_K,
         NUM_XCDS,
+        A_FORMAT,
         False,
     )
 
@@ -523,8 +562,9 @@ def gluon_mxfp4_swiglu_linear_gfx950(
     WARPS_N: gl.constexpr,
     SPLIT_K: gl.constexpr,
     NUM_XCDS: gl.constexpr,
+    A_FORMAT: gl.constexpr,
 ):
-    """``silu(mxfp4(x) @ W_gate.T) * (mxfp4(x) @ W_up.T)`` in BF16."""
+    """``silu(q(x) @ W_gate.T) * (q(x) @ W_up.T)`` in BF16."""
     _mxfp4_linear_body(
         a_ptr,
         b_ptr,
@@ -545,6 +585,7 @@ def gluon_mxfp4_swiglu_linear_gfx950(
         WARPS_N,
         SPLIT_K,
         NUM_XCDS,
+        A_FORMAT,
         True,
     )
 
@@ -686,7 +727,13 @@ def _launch(
     counters: torch.Tensor,
     out: torch.Tensor | None,
     swiglu: bool,
+    activation_format: str,
 ) -> torch.Tensor:
+    if activation_format not in _A_FORMATS:
+        raise ValueError(
+            "gfx950 MXFP4 linear activation_format must be one of "
+            f"{sorted(_A_FORMATS)}, got {activation_format!r}"
+        )
     if x.ndim != 2 or x.dtype != torch.bfloat16 or x.stride(1) != 1:
         raise ValueError("gfx950 MXFP4 linear needs a BF16 [M, K] x with unit stride")
     m, k = x.shape
@@ -755,6 +802,7 @@ def _launch(
         WARPS_N=warps_n,
         SPLIT_K=split_k,
         NUM_XCDS=_NUM_XCDS,
+        A_FORMAT=_A_FORMATS[activation_format],
         num_warps=warps_m * warps_n,
     )
     return out
@@ -765,14 +813,15 @@ def launch_gluon_mxfp4_linear_gfx950(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     *,
+    activation_format: str,
     counters: torch.Tensor,
     out: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Compute ``mxfp4(x) @ W.T`` on gfx950.
+    """Compute ``q(x) @ W.T`` on gfx950.
 
     Args:
         x: BF16 activation ``[M, K]`` with unit inner stride; it is quantized
-            to MXFP4 (per-32 UE8M0 scales) inside the kernel.
+            to ``activation_format`` (per-32 UE8M0 scales) inside the kernel.
         weight: Contiguous uint8 ``[N, K/2]`` packed E2M1 weight in the
             order of ``preshuffle_mxfp4_weight``. ``N % 16 == 0`` and
             ``K % 64 == 0``.
@@ -780,12 +829,22 @@ def launch_gluon_mxfp4_linear_gfx950(
         counters: Zeroed int32 split-K arrival counters, at least
             ``gluon_mxfp4_linear_num_counters_gfx950(M, N, K, False)`` of
             them; the launch leaves them zeroed (see ``splitk.py``).
+        activation_format: ``"mxfp4"`` (E2M1) or ``"mxfp8"`` (E4M3)
+            activations; the module docstring gives the scale rules.
         out: Optional BF16 ``[M, N]`` destination with unit inner stride.
 
     Returns:
         BF16 ``[M, N]``; ``out`` when provided.
     """
-    return _launch(x, weight, weight_scale, counters, out, swiglu=False)
+    return _launch(
+        x,
+        weight,
+        weight_scale,
+        counters,
+        out,
+        swiglu=False,
+        activation_format=activation_format,
+    )
 
 
 def launch_gluon_mxfp4_swiglu_linear_gfx950(
@@ -793,10 +852,11 @@ def launch_gluon_mxfp4_swiglu_linear_gfx950(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     *,
+    activation_format: str,
     counters: torch.Tensor,
     out: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Compute ``silu(mxfp4(x) @ W_gate.T) * (mxfp4(x) @ W_up.T)`` on gfx950.
+    """Compute ``silu(q(x) @ W_gate.T) * (q(x) @ W_up.T)`` on gfx950.
 
     Args:
         x: BF16 activation ``[M, K]`` with unit inner stride.
@@ -807,13 +867,23 @@ def launch_gluon_mxfp4_swiglu_linear_gfx950(
         counters: Zeroed int32 split-K arrival counters, at least
             ``gluon_mxfp4_linear_num_counters_gfx950(M, N, K, True)`` of them;
             the launch leaves them zeroed (see ``splitk.py``).
+        activation_format: ``"mxfp4"`` (E2M1) or ``"mxfp8"`` (E4M3)
+            activations.
         out: Optional BF16 ``[M, N/2]`` destination with unit inner stride.
 
     Returns:
         BF16 ``[M, N/2]``, rounded like the unfused GEMM, SiLU-and-mul path;
         ``out`` when provided.
     """
-    return _launch(x, weight, weight_scale, counters, out, swiglu=True)
+    return _launch(
+        x,
+        weight,
+        weight_scale,
+        counters,
+        out,
+        swiglu=True,
+        activation_format=activation_format,
+    )
 
 
 __all__ = [

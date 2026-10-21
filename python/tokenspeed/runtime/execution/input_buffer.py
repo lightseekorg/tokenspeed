@@ -325,16 +325,18 @@ class InputBuffers:
     def _record_pad_tape(self) -> "PrepTape | None":
         """One launch for the whole padding-tail scrub.
 
-        The six fills below are independent and touch persistent buffers, so a
+        The fills below are independent and touch persistent buffers, so a
         tape records them once and replays them as a single kernel instead of
-        six launches on every step's critical path. Non-CUDA callers keep the
-        torch spelling.
+        one launch each on every step's critical path. Non-CUDA callers keep
+        the torch spelling.
         """
         if torch.device(self.device).type != "cuda":
             return None
         tape = PrepTape(self.device)
         tape.filltail(self.input_ids_buf, Reg.TOKENS, self.max_num_tokens, 1)
         tape.filltail(self.positions_buf, Reg.TOKENS, self.max_num_tokens, 0)
+        for row in self.mrope_positions_buf:
+            tape.filltail(row, Reg.TOKENS, self.max_num_tokens, 0)
         tape.filltail(self.req_pool_indices_buf, Reg.BS, self.max_bs, 0)
         tape.filltail(
             self.state_write_req_pool_indices_buf,
@@ -343,6 +345,7 @@ class InputBuffers:
             self.state_write_padding_pool_index,
         )
         tape.filltail(self.seq_lens_buf, Reg.BS, self.max_bs, 1)
+        tape.filltail(self.input_lengths_buf, Reg.BS, self.input_lengths_buf.numel(), 0)
         tape.finalize()
         return tape
 
@@ -532,19 +535,12 @@ class InputBuffers:
             ] = force_single_token
             runtime_states.spec_candidates_ready[decode_req_pool_indices] = False
 
-        # Decode-only fast path: one fused Triton kernel writes positions and
-        # seq_lens in a single launch and reads valid_cache_lengths[pool_idx]
-        # directly, so the indexSelect + compute_position + seq_lens add are
-        # all gone.
-        if num_extends == 0 and batch_size > 0:
-            fused_decode_input_prep(
-                positions_ptr=self.positions_buf[:total_tokens],
-                seq_lens_out_ptr=self.seq_lens_buf[:batch_size],
-                req_pool_indices=req_pool_indices_device,
-                valid_cache_lengths=runtime_states.valid_cache_lengths,
-                uniform_input_length=total_tokens // batch_size,
-            )
-            # Decode path's seq_lens / positions are done.
+        # Decode-only fast path: one fused Triton kernel (below, once any
+        # explicit decode input ids are in future_input_map) writes positions,
+        # seq_lens and the clamped input ids in a single launch, reading
+        # valid_cache_lengths[pool_idx] directly.
+        decode_only = num_extends == 0 and batch_size > 0
+        if decode_only:
             valid_cache_lengths = None
         else:
             # Mixed / pure-prefill: keep the per-kernel pipeline. indexSelect
@@ -634,13 +630,20 @@ class InputBuffers:
                     batch_size,
                     "decode forward",
                 )
-            width = runtime_states.future_input_map.shape[1]
-            torch.index_select(
-                runtime_states.future_input_map,
-                0,
-                req_pool_indices_device,
-                out=self.input_ids_buf[:total_tokens].view(-1, width),
-            )
+            if decode_only:
+                fused_decode_input_prep(
+                    positions_ptr=self.positions_buf[:total_tokens],
+                    seq_lens_out_ptr=self.seq_lens_buf[:batch_size],
+                    req_pool_indices=req_pool_indices_device,
+                    valid_cache_lengths=runtime_states.valid_cache_lengths,
+                    uniform_input_length=total_tokens // batch_size,
+                    input_ids_out=self.input_ids_buf[:total_tokens],
+                    future_input_map=runtime_states.future_input_map,
+                    # The n-gram inputs read the ids before the clamp.
+                    vocab_size=(
+                        runtime_states.vocab_size if ngram_inputs is None else None
+                    ),
+                )
 
         # Defensive clamp of the target-model IDs into the valid vocab range.
         # Decode IDs come from future_input_map, written by the previous
@@ -652,7 +655,9 @@ class InputBuffers:
         # substituted in-vocab by construction.
         vocab_size = runtime_states.vocab_size
         self.fill_ngram_inputs(ngram_inputs, total_tokens, runtime_states, forward_op)
-        self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
+        if not decode_only or ngram_inputs is not None:
+            # Else fused_decode_input_prep clamped already.
+            self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
 
         if valid_cache_lengths is not None:
             torch.add(
@@ -674,8 +679,6 @@ class InputBuffers:
         # tail-only fills; the active prefix was written above).
         if self._pad_tape is not None:
             self._pad_tape.run({Reg.TOKENS: total_tokens, Reg.BS: batch_size})
-            if total_tokens < self.max_num_tokens:
-                self.mrope_positions_buf[:, total_tokens:].zero_()
         else:
             if total_tokens < self.max_num_tokens:
                 self.input_ids_buf[total_tokens:].fill_(1)
@@ -687,8 +690,7 @@ class InputBuffers:
                     self.state_write_padding_pool_index
                 )
                 self.seq_lens_buf[batch_size:].fill_(1)
-
-        self.input_lengths_buf[batch_size:].zero_()
+            self.input_lengths_buf[batch_size:].zero_()
         return decode_input_ids
 
     def fill_dummy_decode_buffers(self, batch_size: int, total_tokens: int):

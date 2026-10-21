@@ -42,9 +42,11 @@ MAX_BS, MAX_TOKENS, PAD_POOL = 8, 64, 5
 BUFS = (
     "input_ids_buf",
     "positions_buf",
+    "mrope_positions_buf",
     "req_pool_indices_buf",
     "state_write_req_pool_indices_buf",
     "seq_lens_buf",
+    "input_lengths_buf",
 )
 
 
@@ -61,6 +63,8 @@ def _torch_scrub(ib, total_tokens, batch_size):
     if total_tokens < ib.max_num_tokens:
         ib.input_ids_buf[total_tokens:].fill_(1)
         ib.positions_buf[total_tokens:].fill_(0)
+        ib.mrope_positions_buf[:, total_tokens:].zero_()
+    ib.input_lengths_buf[batch_size:].zero_()
     if batch_size < ib.max_bs:
         ib.req_pool_indices_buf[batch_size:].fill_(0)
         ib.state_write_req_pool_indices_buf[batch_size:].fill_(
@@ -113,14 +117,14 @@ def _count_device_work(fn):
 
 
 def test_the_scrub_costs_one_launch():
-    """Five fills on the step's critical path were five launches; collapsing
-    them is the whole point, so the count is the assertion."""
+    """Each fill on the step's critical path was a launch; collapsing them
+    is the whole point, so the count is the assertion."""
     ib = _make()
     taped_k, taped_c = _count_device_work(
         lambda: ib._pad_tape.run({Reg.TOKENS: 4, Reg.BS: 2})
     )
     plain_k, _ = _count_device_work(lambda: _torch_scrub(_make(), 4, 2))
-    assert plain_k >= 5, plain_k
+    assert plain_k >= 7, plain_k
     assert taped_k == 1, taped_k
     assert taped_c <= 1, taped_c
 

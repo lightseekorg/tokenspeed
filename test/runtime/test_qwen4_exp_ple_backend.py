@@ -318,6 +318,31 @@ def test_ple_non_spec_decode_uses_checkpoint_blocks_without_workspace():
     assert backend._verify_commit_ctx is None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_ple_cuda_decode_refresh_matches_the_eager_paging():
+    # CUDA int32 tables take the one-launch prep tape; the pages must equal
+    # the eager chain's (checkpoint slot when set, else live; pad -1).
+    backend = _make_backend(1, False, "cuda")
+    for actual_bs, rows in ((2, [[1, 2], [0, 5]]), (1, [[0, 7]])):
+        backend.refresh_decode_metadata(
+            4,
+            actual_bs,
+            torch.arange(4, device="cuda"),
+            torch.tensor([5, 6, 1, 1], dtype=torch.int32, device="cuda"),
+            forward_mode=ForwardMode.DECODE,
+            block_tables={
+                QWEN4_EXP_PLE_CACHE_GROUP: torch.tensor(
+                    rows, dtype=torch.int32, device="cuda"
+                )
+            },
+        )
+        metadata = backend.forward_metadata
+        want_in = [r[0] if r[0] > 0 else r[1] for r in rows]
+        want_out = [r[1] for r in rows]
+        assert metadata.input_blocks.tolist() == want_in + [-1] * (4 - actual_bs)
+        assert metadata.output_blocks.tolist() == want_out + [-1] * (4 - actual_bs)
+
+
 def test_draft_view_cannot_claim_target_ple_fields():
     backend = _make_backend(3, True, "cpu")
     assert backend._conv_field_ids == ()

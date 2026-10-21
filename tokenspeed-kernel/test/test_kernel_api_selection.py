@@ -3712,13 +3712,13 @@ def test_gfx950_mxfp4_linear_falls_back_beyond_32bit_weight_offsets(
         _mxfp4_linear_traits,
     )
 
-    def select(mode, n, k):
+    def select(mode, n, k, activation_format="mxfp4"):
         return _select_on(
             mi350_platform,
             "gemm",
             mode,
             MXFP4_LINEAR_SIGNATURE,
-            traits=_mxfp4_linear_traits(n, k, None),
+            traits=_mxfp4_linear_traits(n, k, None, activation_format),
         )
 
     # n * k just below and at 2**31.
@@ -3729,6 +3729,11 @@ def test_gfx950_mxfp4_linear_falls_back_beyond_32bit_weight_offsets(
         assert select(mode, 640, 2560) == kernel
         assert select(mode, 2**16, 2**15 - 64) == kernel
         assert select(mode, 2**16, 2**15) == f"triton_{mode}"
+        # Only the Gluon kernels quantize activations to MXFP8, so an
+        # oversized weight has no fallback instead of a silent MXFP4 one.
+        assert select(mode, 640, 2560, "mxfp8") == kernel
+        with pytest.raises(kernel_NoKernelFoundError):
+            select(mode, 2**16, 2**15, "mxfp8")
 
 
 def test_qsa_sparse_attention_selects_gluon_on_gfx950(

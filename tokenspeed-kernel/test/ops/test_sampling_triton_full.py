@@ -33,7 +33,10 @@ from tokenspeed_kernel.ops.sampling.triton import (
 )
 
 
-def test_verify_chain_target_sampled_prefix_compare(device: str) -> None:
+@pytest.mark.parametrize("count_bonus", [False, True])
+def test_verify_chain_target_sampled_prefix_compare(
+    device: str, count_bonus: bool
+) -> None:
     candidates = torch.tensor(
         [
             [10, 11, 12, 13],
@@ -54,7 +57,8 @@ def test_verify_chain_target_sampled_prefix_compare(device: str) -> None:
     ).reshape(-1)
     bs, n = candidates.shape
     predicts = torch.full((bs * n,), -1, dtype=torch.int32, device=device)
-    accept_index = torch.full((bs, n), -1, dtype=torch.int32, device=device)
+    # Stale entries: the kernel writes the whole row.
+    accept_index = torch.full((bs, n), 55, dtype=torch.int32, device=device)
     accept_length = torch.full((bs,), -1, dtype=torch.int32, device=device)
 
     verify_chain_target_sampled(
@@ -63,10 +67,12 @@ def test_verify_chain_target_sampled_prefix_compare(device: str) -> None:
         accept_length,
         candidates,
         target_sampled,
+        count_bonus=count_bonus,
     )
 
     torch.testing.assert_close(
-        accept_length.cpu(), torch.tensor([2, 0, 3], dtype=torch.int32)
+        accept_length.cpu(),
+        torch.tensor([2, 0, 3], dtype=torch.int32) + int(count_bonus),
     )
     torch.testing.assert_close(
         accept_index.cpu(),

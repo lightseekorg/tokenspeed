@@ -104,6 +104,9 @@ change.
   parameter of the chain path (compaction), position vs slot, one tree
   attention path (trtllm-gen prefix plus window cascade), and position-keyed
   sampled verify.
+* `docs/design/megakernel.md` — decode megakernels: one persistent launch
+  per decoder layer, stages handing off through tagged mailboxes, the
+  stream boundary, shared cache layouts and the deadlock rule.
 
 ## Public pull requests
 

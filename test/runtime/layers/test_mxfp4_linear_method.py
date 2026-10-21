@@ -33,8 +33,14 @@ from tokenspeed_kernel.ops.activation.triton import silu_and_mul  # noqa: E402
 from tokenspeed_kernel.ops.gemm.triton import triton_mm_mxfp4  # noqa: E402
 from tokenspeed_kernel.ops.quantization.triton import mxfp4_quantize  # noqa: E402
 
-from tokenspeed.runtime.layers.dense.mxfp4 import Mxfp4LinearMethod  # noqa: E402
+from tokenspeed.runtime.layers.dense.mxfp4 import (  # noqa: E402
+    Mxfp4LinearMethod,
+    quantize_lm_head_mxfp4,
+)
 from tokenspeed.runtime.layers.linear import ReplicatedLinear  # noqa: E402
+from tokenspeed.runtime.layers.logits_processor import (  # noqa: E402
+    should_apply_lm_head_quant_method,
+)
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config  # noqa: E402
 
 _HIDDEN = 2560
@@ -152,3 +158,142 @@ def test_qwen_shared_expert_mlp_fuses_swiglu() -> None:
         atol=1e-3,
         rtol=2**-8,
     )
+
+
+_E2M1 = (0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6)
+
+
+def _dequant_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    table = torch.tensor(_E2M1, device=weight.device, dtype=torch.float32)
+    codes = torch.stack((weight & 0xF, weight >> 4), dim=-1).flatten(-2)
+    return table[codes.long()] * torch.exp2(scale.float() - 127).repeat_interleave(
+        32, dim=-1
+    )
+
+
+def _mxfp8_round_trip(x: torch.Tensor) -> torch.Tensor:
+    groups = x.float().reshape(x.shape[0], -1, 32)
+    ratio = groups.abs().amax(-1) * torch.tensor(1 / 448, dtype=torch.float32)
+    bits = ratio.view(torch.int32)
+    exponent = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    scale = (exponent.clamp(1, 254) << 23).view(torch.float32).unsqueeze(-1)
+    return ((groups / scale).to(torch.float8_e4m3fn).float() * scale).reshape(x.shape)
+
+
+def test_mxfp8_activation_checkpoint_runs_mxfp8_linears() -> None:
+    # A Quark W4A8 MX checkpoint's dense linears quantize activations to
+    # MXFP8 (E4M3, one E8M0 scale per 32 values) against MXFP4 weights.
+    config = Mxfp4Config(
+        is_checkpoint_mxfp4_serialized=True,
+        use_dynamic_mxfp8_activations=True,
+    )
+    with torch.device("cuda"):
+        layer = ReplicatedLinear(
+            _HIDDEN,
+            1280,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=config,
+            prefix="model.layers.0.linear_attn.out_proj",
+        )
+    assert isinstance(layer.quant_method, Mxfp4LinearMethod)
+    assert layer.quant_method.activation_format == "mxfp8"
+    weight, scale = _load(layer)
+    layer.quant_method.process_weights_after_loading(layer)
+    assert layer.mxfp4_linear_weight.activation_format == "mxfp8"
+
+    torch.manual_seed(0)
+    x = torch.randn((5, _HIDDEN), device="cuda", dtype=torch.bfloat16)
+    out, _ = layer(x)
+    expected = _mxfp8_round_trip(x) @ _dequant_weight(weight, scale).T
+    torch.testing.assert_close(out.float(), expected, atol=1e-3, rtol=2**-8)
+
+
+def test_linear_method_needs_dynamic_activations() -> None:
+    # Weight-only MXFP4 configs keep dense linears unquantized; building the
+    # MXFP4 linear method for them is an error, not a silent format choice.
+    with pytest.raises(ValueError, match="MXFP4 or MXFP8"):
+        Mxfp4LinearMethod(Mxfp4Config(is_checkpoint_mxfp4_serialized=True))
+
+
+def test_lm_head_mxfp4_keeps_logits_and_quarters_weight_bytes() -> None:
+    torch.manual_seed(0)
+    vocab = 4096
+    with torch.device("cuda"):
+        head = ReplicatedLinear(
+            _HIDDEN, vocab, bias=False, params_dtype=torch.bfloat16, prefix="lm_head"
+        )
+    head.weight.data.normal_(0.0, 0.02)
+    x = torch.randn(4, _HIDDEN, device="cuda", dtype=torch.bfloat16)
+    reference = (x.float() @ head.weight.float().T).float()
+    bf16_bytes = head.weight.numel() * head.weight.element_size()
+
+    quantize_lm_head_mxfp4(head, activation_format="mxfp8")
+
+    assert should_apply_lm_head_quant_method(head, head.quant_method)
+    assert head.weight.numel() * head.weight.element_size() == bf16_bytes // 4
+    logits = head.quant_method.apply(head, x).float()
+    assert logits.shape == (4, vocab)
+    # MXFP4 weights and MXFP8 rows: about 10 % relative error per weight,
+    # which averages out over the 2560-wide dot products.
+    cos = torch.nn.functional.cosine_similarity(logits, reference, dim=-1)
+    assert torch.all(cos > 0.99), cos
+
+
+def _qwen4_exp_draft(head: torch.nn.Module):
+    """A Qwen4-Exp MTP draft holding only what sharing the target's head touches."""
+    from tokenspeed.runtime.models.qwen4_exp_nextn import Qwen4ExpForCausalLMNextN
+
+    draft = Qwen4ExpForCausalLMNextN.__new__(Qwen4ExpForCausalLMNextN)
+    torch.nn.Module.__init__(draft)
+    draft.model = torch.nn.Module()
+    draft.model.embed_tokens = torch.nn.Embedding(256, _HIDDEN, device="cuda")
+    draft.lm_head = head
+    return draft
+
+
+def test_mtp_draft_adopts_the_quantized_target_head() -> None:
+    from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
+
+    with torch.device("cuda"):
+        target = ParallelLMHead(
+            256,
+            _HIDDEN,
+            params_dtype=torch.bfloat16,
+            tp_rank=0,
+            tp_size=1,
+            tp_group=(0,),
+        )
+        own = ParallelLMHead(
+            256,
+            _HIDDEN,
+            params_dtype=torch.bfloat16,
+            tp_rank=0,
+            tp_size=1,
+            tp_group=(0,),
+        )
+    quantize_lm_head_mxfp4(target, activation_format="mxfp8")
+    draft = _qwen4_exp_draft(own)
+    embed = torch.nn.Parameter(torch.ones(256, _HIDDEN, device="cuda"))
+    draft.set_embed_and_head_module(embed, target)
+    assert draft.model.embed_tokens.weight is embed
+    assert draft.lm_head is target
+
+
+def test_replicated_mtp_draft_head_shares_only_a_bf16_target_weight() -> None:
+    with torch.device("cuda"):
+        target, own = (
+            ReplicatedLinear(
+                _HIDDEN, 256, bias=False, params_dtype=torch.bfloat16, prefix=prefix
+            )
+            for prefix in ("lm_head", "mtp.lm_head")
+        )
+    draft = _qwen4_exp_draft(own)
+    embed = torch.nn.Parameter(torch.ones(256, _HIDDEN, device="cuda"))
+    draft.set_embed_and_head_module(embed, target)
+    assert draft.lm_head is own
+    assert draft.lm_head.weight is target.weight
+
+    quantize_lm_head_mxfp4(target, activation_format="mxfp8")
+    with pytest.raises(ValueError, match="BF16 LM head"):
+        _qwen4_exp_draft(own).set_embed_and_head_module(embed, target)

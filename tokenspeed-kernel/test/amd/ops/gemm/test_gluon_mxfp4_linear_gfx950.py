@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.gemm import (  # noqa: E402
 )
 from tokenspeed_kernel.ops.gemm.triton import triton_mm_mxfp4  # noqa: E402
 from tokenspeed_kernel.ops.quantization.triton import mxfp4_quantize  # noqa: E402
+from tokenspeed_kernel.selection import NoKernelFoundError  # noqa: E402
 from tokenspeed_kernel.workspace import capture_session, zeroed_state  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp4.mm import (  # noqa: E402
     gluon_mxfp4_linear_gfx950,
@@ -70,17 +71,27 @@ def _counters(x, weight, swiglu):
     )
 
 
-def _linear(x, weight, scale, out=None):
+def _linear(x, weight, scale, out=None, activation_format="mxfp4"):
     counters = _counters(x, weight, False)
     return launch_gluon_mxfp4_linear_gfx950(
-        x, weight, scale, counters=counters, out=out
+        x,
+        weight,
+        scale,
+        activation_format=activation_format,
+        counters=counters,
+        out=out,
     )
 
 
-def _swiglu(x, weight, scale, out=None):
+def _swiglu(x, weight, scale, out=None, activation_format="mxfp4"):
     counters = _counters(x, weight, True)
     return launch_gluon_mxfp4_swiglu_linear_gfx950(
-        x, weight, scale, counters=counters, out=out
+        x,
+        weight,
+        scale,
+        activation_format=activation_format,
+        counters=counters,
+        out=out,
     )
 
 
@@ -214,9 +225,156 @@ def test_registry_selects_gluon_and_matches_portable_path() -> None:
     x = torch.randn((24, _HIDDEN), device="cuda", dtype=torch.bfloat16)
     weight, scale = _weight(2 * _INTERMEDIATE, _HIDDEN)
 
-    gluon = prepare_mxfp4_linear(weight, scale, swiglu=True)
-    portable = prepare_mxfp4_linear(weight, scale, swiglu=True, solution="triton")
+    gluon = prepare_mxfp4_linear(weight, scale, swiglu=True, activation_format="mxfp4")
+    portable = prepare_mxfp4_linear(
+        weight, scale, swiglu=True, activation_format="mxfp4", solution="triton"
+    )
     assert gluon.layout == "mfma_16x16"
     assert portable.layout == "linear" and portable.weight is weight
-    _assert_close(mxfp4_swiglu_linear(x, gluon), mxfp4_swiglu_linear(x, portable))
-    _assert_close(mxfp4_linear(x, gluon), mxfp4_linear(x, portable))
+
+    def run(fn, prepared):
+        return fn(x, prepared, activation_format="mxfp4")
+
+    _assert_close(run(mxfp4_swiglu_linear, gluon), run(mxfp4_swiglu_linear, portable))
+    _assert_close(run(mxfp4_linear, gluon), run(mxfp4_linear, portable))
+
+
+# ---------------------------------------------------------------------------
+# MXFP8 (E4M3) activations
+# ---------------------------------------------------------------------------
+
+_E2M1 = (0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6)
+
+
+def _dequant_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    table = torch.tensor(_E2M1, device=weight.device, dtype=torch.float32)
+    codes = torch.stack((weight & 0xF, weight >> 4), dim=-1).flatten(-2)
+    return table[codes.long()] * torch.exp2(scale.float() - 127).repeat_interleave(
+        32, dim=-1
+    )
+
+
+def _mxfp8_round_trip(x: torch.Tensor) -> torch.Tensor:
+    """Dequantized MXFP8 activations: E4M3 RNE under the amax / 448 scale."""
+    groups = x.float().reshape(x.shape[0], -1, 32)
+    ratio = groups.abs().amax(-1) * torch.tensor(1 / 448, dtype=torch.float32)
+    bits = ratio.view(torch.int32)
+    exponent = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    scale = (exponent.clamp(1, 254) << 23).view(torch.float32).unsqueeze(-1)
+    values = (groups / scale).to(torch.float8_e4m3fn).float()
+    return (values * scale).reshape(x.shape)
+
+
+def _mxfp8_reference(x, weight, scale) -> torch.Tensor:
+    return _mxfp8_round_trip(x) @ _dequant_weight(weight, scale).T
+
+
+def test_mxfp8_activation_quantization_is_exact() -> None:
+    # An identity weight (code 2 = 1.0, scale 2^0) returns each quantized
+    # activation as one exact product, so the output is the dequantized E4M3
+    # value bit for bit. Groups probe the scale rule's edges: amax exactly
+    # 448 * 2^k (no round up), just above it, all zeros, tiny, huge, and
+    # E4M3 rounding ties.
+    k = 256
+    weight = torch.zeros((k, k // 2), device="cuda", dtype=torch.uint8)
+    rows = torch.arange(k, device="cuda")
+    weight[rows, rows // 2] = torch.where(rows % 2 == 0, 0x02, 0x20).to(torch.uint8)
+    scale = torch.full((k, k // 32), 127, device="cuda", dtype=torch.uint8)
+    torch.manual_seed(0)
+    x = torch.randn((6, k), device="cuda", dtype=torch.bfloat16)
+    x[0, :32] = torch.linspace(-448, 448, 32)
+    x[0, 32:64] = torch.linspace(-449.0, 449.0, 32)  # just past 448: E rounds up
+    x[0, 64:96] = 0.0
+    x[0, 96:128] *= 1e-30
+    x[0, 128:160] *= 1e30
+    x[1, :32] = 448.0
+    # E4M3 near 1.0 has spacing 1/8; 1 + 1/16 and 1 + 3/16 are ties.
+    x[1, 31] = 1.0625
+    x[1, 30] = 1.1875
+    shuffled = preshuffle_mxfp4_weight(weight)
+    actual = _linear(x, shuffled, scale, activation_format="mxfp8")
+    expected = _mxfp8_round_trip(x).to(torch.bfloat16)
+    assert torch.equal(actual, expected)
+    assert actual[1, 31] == 1.0 and actual[1, 30] == 1.25
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        # Qwen3.8-Flash-Next TP1 shared expert and attention projections,
+        # decode to prefill; plus a ragged N, a K tail and split-K.
+        (1, 2560, 640),
+        (4, 1280, 2560),
+        (16, 12288, 2560),
+        (130, 2560, 6144),
+        (700, 2560, 640),
+        (5, 1000, 1024),
+        (300, 2048, 704),
+    ],
+)
+def test_mxfp8_linear_matches_reference(m: int, n: int, k: int) -> None:
+    torch.manual_seed(0)
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 3
+    weight, scale = _weight(n - n % 16, k)
+    actual = _linear(
+        x, preshuffle_mxfp4_weight(weight), scale, activation_format="mxfp8"
+    )
+    # Exact products under power-of-two scales: only FP32 summation order and
+    # the BF16 output rounding differ.
+    _assert_close(actual, _mxfp8_reference(x, weight, scale))
+
+
+@pytest.mark.parametrize("m", [1, 3, 64, 600])
+def test_mxfp8_swiglu_matches_linear_then_silu_and_mul(m: int) -> None:
+    torch.manual_seed(0)
+    x = torch.randn((m, _HIDDEN), device="cuda", dtype=torch.bfloat16) * 3
+    weight, scale = _weight(2 * 640, _HIDDEN)
+    shuffled = preshuffle_mxfp4_weight(weight)
+    act = _swiglu(x, shuffled, scale, activation_format="mxfp8")
+    gate_up = _linear(x, shuffled, scale, activation_format="mxfp8")
+    expected = silu_and_mul(
+        gate_up, torch.empty((m, 640), device="cuda", dtype=torch.bfloat16)
+    )
+    _assert_close(act, expected)
+
+
+def test_mxfp8_row_count_does_not_recompile() -> None:
+    torch.manual_seed(0)
+    x = torch.randn((4096, _HIDDEN), device="cuda", dtype=torch.bfloat16)
+    gate_up, gate_up_scale = _weight(2 * _INTERMEDIATE, _HIDDEN)
+    gate_up = preshuffle_mxfp4_weight(gate_up)
+
+    def run(rows: int) -> None:
+        _swiglu(x[:rows], gate_up, gate_up_scale, activation_format="mxfp8")
+        _linear(x[:rows], gate_up, gate_up_scale, activation_format="mxfp8")
+
+    for rows in (1, 65, 257, 513, 2049):
+        run(rows)
+    with assert_no_triton_compile(
+        gluon_mxfp4_linear_gfx950, gluon_mxfp4_swiglu_linear_gfx950
+    ):
+        for rows in (2, 4, 17, 64, 300, 1000, 3000):
+            run(rows)
+
+
+def test_registry_runs_mxfp8_on_gluon_only() -> None:
+    torch.manual_seed(0)
+    x = torch.randn((24, _HIDDEN), device="cuda", dtype=torch.bfloat16)
+    weight, scale = _weight(2 * _INTERMEDIATE, _HIDDEN)
+
+    prepared = prepare_mxfp4_linear(
+        weight, scale, swiglu=False, activation_format="mxfp8"
+    )
+    assert prepared.layout == "mfma_16x16"
+    assert prepared.activation_format == "mxfp8"
+    _assert_close(
+        mxfp4_linear(x, prepared, activation_format="mxfp8"),
+        _mxfp8_reference(x, weight, scale),
+    )
+    # A weight runs only with the activation format it was prepared for.
+    with pytest.raises(ValueError, match="prepared for 'mxfp8'"):
+        mxfp4_linear(x, prepared, activation_format="mxfp4")
+    with pytest.raises(NoKernelFoundError):
+        prepare_mxfp4_linear(
+            weight, scale, swiglu=False, activation_format="mxfp8", solution="triton"
+        )

@@ -39,6 +39,7 @@ def _verify_chain_target_sampled_kernel(
     candidates_ptr,
     target_sampled_ptr,
     NUM_DRAFT_TOKENS: tl.constexpr,
+    COUNT_BONUS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     if ENABLE_PDL:
@@ -57,13 +58,14 @@ def _verify_chain_target_sampled_kernel(
         match = (active != 0) & (draft_id == target_id)
 
         tl.store(predicts_ptr + base + i - 1, target_id, mask=match)
-        tl.store(accept_index_ptr + base + i, base + i, mask=match)
+        # The whole row is written: -1 past the accepted prefix.
+        tl.store(accept_index_ptr + base + i, tl.where(match, base + i, -1))
 
         num_accepted = tl.where(match, i, num_accepted)
         active = tl.where(match, 1, 0)
 
     final_id = tl.load(target_sampled_ptr + base + num_accepted)
-    tl.store(accept_token_num_ptr + row, num_accepted)
+    tl.store(accept_token_num_ptr + row, num_accepted + COUNT_BONUS)
     tl.store(predicts_ptr + base + num_accepted, final_id)
 
     if ENABLE_PDL:
@@ -77,9 +79,16 @@ def verify_chain_target_sampled(
     candidates: torch.Tensor,
     target_sampled: torch.Tensor,
     *,
+    count_bonus: bool,
     enable_pdl: bool | None = None,
 ) -> None:
-    """Verify a speculative chain against already-sampled target tokens."""
+    """Verify a speculative chain against already-sampled target tokens.
+
+    Writes ``accept_token_num[r]`` (accepted draft tokens, plus one for the
+    bonus token when ``count_bonus``), the whole ``accept_index`` row
+    (accepted flat indices, then -1) and ``predicts`` at the accepted
+    positions and the bonus position.
+    """
     enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     if candidates.ndim != 2:
         raise ValueError(f"candidates must be 2D, got {candidates.ndim}D")
@@ -127,6 +136,7 @@ def verify_chain_target_sampled(
         candidates,
         target_sampled,
         NUM_DRAFT_TOKENS=num_draft_tokens,
+        COUNT_BONUS=int(count_bonus),
         ENABLE_PDL=enable_pdl,
         num_warps=1,
         **extra_kwargs,

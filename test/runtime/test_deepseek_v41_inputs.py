@@ -130,12 +130,20 @@ def buffers(request, monkeypatch):
             req_pool_indices,
             valid_cache_lengths,
             uniform_input_length,
+            *,
+            input_ids_out,
+            future_input_map,
+            vocab_size,
         ):
             starts = valid_cache_lengths[req_pool_indices]
             positions_ptr.copy_(
                 (starts[:, None] + torch.arange(uniform_input_length)).flatten()
             )
             seq_lens_out_ptr.copy_(starts + uniform_input_length)
+            ids = future_input_map[req_pool_indices].flatten()
+            if vocab_size is not None:
+                ids = ids.clamp(0, vocab_size - 1)
+            input_ids_out.copy_(ids)
 
         monkeypatch.setattr(InputBuffers, "_bulk_pinned", bulk)
         monkeypatch.setattr(input_buffer, "compute_position_triton", positions)

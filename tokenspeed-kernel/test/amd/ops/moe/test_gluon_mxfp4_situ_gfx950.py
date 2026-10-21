@@ -1973,7 +1973,7 @@ def test_ep_situ_package_prefill_matches_reference_gfx950(
     module._situ_output_buffer = output
 
     prefill_calls = []
-    package_prefill = gluon_mxfp4.mxfp8_situ_prefill
+    package_prefill = gluon_mxfp4.mxfp8_moe_prefill
 
     def record_prefill(*args, **kwargs):
         prefill_calls.append(
@@ -1983,7 +1983,7 @@ def test_ep_situ_package_prefill_matches_reference_gfx950(
 
     monkeypatch.setattr(
         gluon_mxfp4,
-        "mxfp8_situ_prefill",
+        "mxfp8_moe_prefill",
         record_prefill,
     )
 

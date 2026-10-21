@@ -135,8 +135,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             raise ValueError("Qwen4-Exp heads_per_ngram must be positive")
         if self.embedding_dim % self.ngram_heads:
             raise ValueError(
-                "ple_embed_dim must be divisible by "
-                "(ngram_size - 1) * heads_per_ngram"
+                "ple_embed_dim must be divisible by (ngram_size - 1) * heads_per_ngram"
             )
 
         self.head_dim = self.embedding_dim // self.ngram_heads
@@ -397,16 +396,18 @@ class Qwen4ExpPLELayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("kv_proj", prefix),
         )
+        # Every kv_proj parameter stacks the key rows over the value rows: the
+        # weight and, for MXFP4 checkpoints, its per-row ``weight_scale``.
         # Unquantized ReplicatedLinear hands back a plain Parameter whose
         # weight_loader is a writable attribute, while a quantized one returns a
         # BaseWeightParameter exposing it as a read-only property. Write to
         # whichever storage exists; picking the wrong one either raises or
         # silently drops the shard routing.
-        weight = self.kv_proj.weight
-        if hasattr(weight, "_weight_loader"):
-            weight._weight_loader = self._load_kv_proj_shard
-        else:
-            weight.weight_loader = self._load_kv_proj_shard
+        for param in self.kv_proj.parameters(recurse=False):
+            if hasattr(param, "_weight_loader"):
+                param._weight_loader = self._load_kv_proj_shard
+            else:
+                param.weight_loader = self._load_kv_proj_shard
         self.norm_key = GroupedGemmaRMSNorm(
             self.hc_hidden_size,
             config.rms_norm_eps,
@@ -453,6 +454,10 @@ class Qwen4ExpPLELayer(nn.Module):
             "value": (self.hc_hidden_size, self.hidden_size),
         }
         start, size = offsets[shard_id]
+        if param.dtype == torch.uint8 and loaded_weight.element_size() == 1:
+            # Packed MXFP4 codes and E8M0 scales (stored as uint8 or
+            # float8_e8m0fnu) are copied as raw bytes.
+            loaded_weight = loaded_weight.view(torch.uint8)
         if loaded_weight.shape[0] != size or param.shape[0] != (
             self.hc_hidden_size + self.hidden_size
         ):
@@ -997,6 +1002,71 @@ class Qwen4ExpPLELayer(nn.Module):
         layout = embedding.lookup.make_layout(ctx.global_num_tokens, ids.shape[0])
         pending = embedding.lookup.start(ids, layout)
         self._prefetched = (plan, pending, final_context, context_tail)
+
+    def fused_operands(self, ctx: ForwardContext) -> dict[str, torch.Tensor]:
+        """What a fused kernel needs to run this block's step itself: its
+        state operands by name (the megakernel's ``PleStep`` fields but the
+        tokens).
+
+        ``context`` ``[pages, context_len]`` int64 and ``conv_state``
+        ``[pages, hc_count * hidden, conv_state_len]`` are the pools as
+        page-indexed views of the cache arena; ``page_in`` holds each row's
+        input page. The kernel does the lookup, the gate and the conv, and
+        writes the state after each row's token to row ``page_out`` of
+        ``context_out`` and ``conv_out``: in decode the pools and the output
+        pages (as a :meth:`start_prefetch` plus :meth:`forward` pair would);
+        in a target verify (``T`` tokens per request, request-major rows)
+        the verify scratch, row ``r * (T + 1) + 1 + t`` for token ``t`` of
+        request ``r``, as the regular verify does, and the post-verify
+        commit then copies the accepted row to the pages.
+        """
+        backend = self._ple_backend(ctx)
+        metadata = self._metadata(backend)
+        pool = ctx.token_to_kv_pool
+        load_tracker = getattr(pool, "layerwise_load_tracker", None)
+        if load_tracker is not None:
+            load_tracker.wait_for_layer(self.layer_id)
+        context_field = pool.arena.field(self.context_field_id)
+        conv_field = pool.arena.field(qwen4_exp_ple_conv_field(self.layer_id))
+        context = context_field.as_strided(
+            (context_field.shape[0], self.context_len),
+            (self._page_row_stride(context_field), 1),
+        )
+        conv = conv_field.as_strided(
+            (conv_field.shape[0], self.hc_hidden_size, self.conv_state_len),
+            (self._page_row_stride(conv_field), self.conv_state_len, 1),
+        )
+        bs = ctx.bs
+        chain = metadata.verify_width
+        if chain is None:
+            return {
+                "context": context,
+                "conv_state": conv,
+                "page_in": metadata.input_blocks[:bs],
+                "page_out": metadata.output_blocks[:bs],
+                "context_out": context,
+                "conv_out": conv,
+            }
+        context_scratch, conv_scratch = backend.ple_verify_scratch(
+            self.context_field_id, self.layer_id, bs
+        )
+        device = metadata.input_blocks.device
+        token = torch.arange(chain, dtype=torch.int32, device=device)
+        first = torch.arange(bs, dtype=torch.int32, device=device) * (chain + 1)
+        return {
+            "context": context,
+            "conv_state": conv,
+            "page_in": metadata.input_blocks[:bs].repeat_interleave(chain),
+            "page_out": (first[:, None] + 1 + token[None, :]).reshape(-1),
+            "context_out": context_scratch.as_strided(
+                (context_scratch.shape[0], self.context_len),
+                (context_scratch.stride(0), 1),
+            ),
+            "conv_out": conv_scratch.as_strided(
+                (conv_scratch.shape[0], self.hc_hidden_size, self.conv_state_len),
+                (conv_scratch.stride(0), self.conv_state_len, 1),
+            ),
+        }
 
     @break_point
     def forward(

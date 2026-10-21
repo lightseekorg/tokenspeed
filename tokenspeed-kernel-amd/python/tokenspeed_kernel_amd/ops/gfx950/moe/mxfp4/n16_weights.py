@@ -207,6 +207,50 @@ def _load_n16_expert(
     )
 
 
+def pad_mxfp4_moe_intermediate(w: torch.nn.Module, multiple: int) -> None:
+    """Zero-pad linear MXFP4 experts' intermediate width to ``multiple``.
+
+    Runs before ``preprocess_n16_mxfp4_weights`` for pipelines whose K tiles
+    need a wider intermediate (the MXFP8 pipeline's 256). Padded W13 rows and
+    W2 columns hold zero codes with unit (127) scales, so they add exactly
+    zero. The padded tensors drop the checkpoint ``weight_loader``: a padded
+    bank cannot take checkpoint updates.
+
+    Args:
+        w: Module with linear ``w13_weight`` ``[E, 2 * I, H / 2]`` (gate rows
+            over up rows), ``w13_weight_scale``, ``w2_weight`` ``[E, H, I / 2]``
+            and ``w2_weight_scale``.
+        multiple: Required multiple of the intermediate width ``I``.
+    """
+    names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+    w13, s13, w2, s2 = (getattr(w, name) for name in names)
+    experts, two_i, packed_d = w13.shape
+    intermediate = two_i // 2
+    padded = (intermediate + multiple - 1) // multiple * multiple
+    if padded == intermediate:
+        return
+    if getattr(w, "w13_input_layout", "concatenated") == "interleaved":
+        raise ValueError("intermediate padding needs concatenated gate/up rows")
+    if intermediate % 32:
+        raise ValueError("intermediate padding needs whole 32-value scale groups")
+    w13_padded = w13.new_zeros((experts, 2, padded, packed_d))
+    w13_padded[:, :, :intermediate] = w13.reshape(experts, 2, intermediate, packed_d)
+    s13_padded = s13.new_full((experts, 2, padded, s13.shape[-1]), 127)
+    s13_padded[:, :, :intermediate] = s13.reshape(experts, 2, intermediate, -1)
+    w2_padded = w2.new_zeros((experts, w2.shape[1], padded // 2))
+    w2_padded[..., : intermediate // 2] = w2
+    s2_padded = s2.new_full((experts, s2.shape[1], padded // 32), 127)
+    s2_padded[..., : intermediate // 32] = s2
+    tensors = (
+        w13_padded.reshape(experts, 2 * padded, packed_d),
+        s13_padded.reshape(experts, 2 * padded, -1),
+        w2_padded,
+        s2_padded,
+    )
+    for name, tensor in zip(names, tensors, strict=True):
+        setattr(w, name, torch.nn.Parameter(tensor, requires_grad=False))
+
+
 def preprocess_n16_mxfp4_weights(w: torch.nn.Module) -> None:
     """Replace linear expert tensors with one N-major N16 bank in place."""
     names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")

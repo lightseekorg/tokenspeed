@@ -24,6 +24,10 @@ The two logical N64 fragments give each wave adjacent N16 gate/up (stage1)
 or output-column (stage2) fragments, with two or eight M16 repeats. Stage1
 uses async activation loads at both row counts; stage2 retains register loads
 and phased LDS publication. Output exchange happens after FP32 arithmetic.
+
+Stage1's gated activation is the constexpr ``ACTIVATION``: ``"situ"``
+(clamped SiTU with ``BETA`` and ``LINEAR_BETA``) or ``"silu"``
+(``SiLU(gate) * up``; the betas must be ``None``).
 """
 
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon
@@ -435,6 +439,15 @@ def _situ(gate, up, BETA: gl.constexpr, LINEAR_BETA: gl.constexpr):
     return (gate * up).to(gl.bfloat16)
 
 
+@gluon.jit
+def _silu(gate, up):
+    # Round like the dense SwiGLU linear: gate and up to BF16, then
+    # SiLU(gate) * up in FP32, rounded to BF16.
+    gate = gate.to(gl.bfloat16).to(gl.float32)
+    up = up.to(gl.bfloat16).to(gl.float32)
+    return (gate * (1.0 / (1.0 + gl.exp(-gate))) * up).to(gl.bfloat16)
+
+
 @gluon.jit(do_not_specialize=("M",))
 def _mxfp8_stage1(
     x,
@@ -454,8 +467,10 @@ def _mxfp8_stage1(
     LINEAR_BETA: gl.constexpr,
     BUFFER_SAFE: gl.constexpr,
     BM: gl.constexpr,
+    ACTIVATION: gl.constexpr,
 ):
     gl.static_assert(BM == 32 or BM == 128)
+    gl.static_assert(ACTIVATION == "situ" or ACTIVATION == "silu")
     m_base = gl.program_id(1) * BM
     if m_base >= gl.load(valid_ids):
         return
@@ -541,9 +556,11 @@ def _mxfp8_stage1(
         gl.bfloat16, [2 * BM, 64], gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     )
     for mi in gl.static_range(BM // 16):
-        c_shared.slice(mi * 16, 16, 0).store(
-            _situ(acc[mi][0], acc[mi][1], BETA, LINEAR_BETA)
-        )
+        if ACTIVATION == "silu":
+            h = _silu(acc[mi][0], acc[mi][1])
+        else:
+            h = _situ(acc[mi][0], acc[mi][1], BETA, LINEAR_BETA)
+        c_shared.slice(mi * 16, 16, 0).store(h)
     store_layout: gl.constexpr = gl.BlockedLayout([1, 2], [2, 32], [2, 2], [1, 0])
     c = c_shared.slice(0, BM, 0).load(store_layout)
     route = tid.load(gl.SliceLayout(1, store_layout)).to(gl.uint32)

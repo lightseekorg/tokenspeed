@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     copy_state_rows,
     state_verify_commit_rows,
 )
+from tokenspeed_kernel.ops.metadata import PrepTape, Reg
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
@@ -45,6 +46,7 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     reject_query_shard,
 )
 from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
+    STATE_TABLE_SLOTS,
     compute_state_block_indices,
 )
 from tokenspeed.runtime.layers.attention.backends.state.utils import row_stride_i32
@@ -98,6 +100,9 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         self._decode_input_blocks: torch.Tensor | None = None
         self._decode_output_blocks: torch.Tensor | None = None
         self._decode_views_by_bs: dict[int, PLEForwardMetadata] = {}
+        # One prep tape per decode batch size: resolves the state pages in
+        # one launch instead of an eager chain of fills, selects and copies.
+        self._decode_tapes: dict[int, PrepTape] = {}
 
     def _cache_fields(
         self, cache_pool: CachePool
@@ -280,6 +285,11 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         if not self._conv_field_ids:
             return
         metadata = self._decode_view(bs)
+        if metadata.verify_width is None and self._refresh_with_tape(
+            metadata, bs, actual_bs, block_tables
+        ):
+            self.forward_metadata = metadata
+            return
         metadata.input_blocks.fill_(-1)
         metadata.output_blocks.fill_(-1)
         if actual_bs:
@@ -302,6 +312,46 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                 metadata.input_blocks[:actual_bs].copy_(input_blocks)
                 metadata.output_blocks[:actual_bs].copy_(output_blocks)
         self.forward_metadata = metadata
+
+    def _refresh_with_tape(
+        self,
+        metadata: PLEForwardMetadata,
+        bs: int,
+        actual_bs: int,
+        block_tables: Mapping[str, torch.Tensor],
+    ) -> bool:
+        """Resolve a plain decode's state pages with one prep-tape launch.
+
+        A decode row always has history, so ``state_in`` is the checkpoint
+        slot when set, else the live slot, as ``compute_state_block_indices``
+        gives. Returns False (the caller runs the eager chain) when the tape's
+        preconditions do not hold.
+        """
+        rows = block_tables.get(QWEN4_EXP_PLE_CACHE_GROUP)
+        if (
+            cache_debug_enabled()
+            or rows is None
+            or not rows.is_cuda
+            or rows.dtype != torch.int32
+            or rows.shape[1] < STATE_TABLE_SLOTS
+        ):
+            return False
+        tape = self._decode_tapes.get(bs)
+        if tape is None:
+            tape = PrepTape(self.device)
+            tape.state_pages(
+                metadata.input_blocks,
+                metadata.output_blocks,
+                rows_ptr=Reg.PTR0,
+                bs=Reg.REAL_BS,
+                row_stride=Reg.USER0,
+            )
+            tape.filltail(metadata.input_blocks, live=Reg.REAL_BS, total=bs, value=-1)
+            tape.filltail(metadata.output_blocks, live=Reg.REAL_BS, total=bs, value=-1)
+            tape.finalize()
+            self._decode_tapes[bs] = tape
+        tape.run({Reg.REAL_BS: actual_bs, Reg.PTR0: rows, Reg.USER0: rows.stride(0)})
+        return True
 
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
         """Allocate rollback rows once and return the recipe-budgeted bytes."""

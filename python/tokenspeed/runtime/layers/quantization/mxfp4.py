@@ -33,59 +33,113 @@ from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_lay
 from tokenspeed.runtime.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 
 
-def _is_fp4_e8m0_per_group(stage: object, *, is_dynamic: bool | None = None) -> bool:
+def _is_e8m0_per_group_32(
+    stage: object, dtypes: frozenset[str], *, is_dynamic: bool | None = None
+) -> bool:
     if not isinstance(stage, Mapping):
         return False
     if is_dynamic is not None and stage.get("is_dynamic") is not is_dynamic:
         return False
     return (
-        str(stage.get("dtype", "")).lower() in {"fp4", "mxfp4"}
+        str(stage.get("dtype", "")).lower() in dtypes
         and str(stage.get("qscheme", "")).lower() == "per_group"
         and stage.get("group_size") in {32, "32"}
         and str(stage.get("scale_format", "")).lower() == "e8m0"
     )
 
 
-def _is_amd_quark_w_mxfp4_a_fp8(config: Mapping[str, Any]) -> bool:
+def _is_fp4_e8m0_per_group(stage: object, *, is_dynamic: bool | None = None) -> bool:
+    return _is_e8m0_per_group_32(
+        stage, frozenset({"fp4", "mxfp4", "fp4_e2m1"}), is_dynamic=is_dynamic
+    )
+
+
+def _is_fp8_e4m3_e8m0_per_group(
+    stage: object, *, is_dynamic: bool | None = None
+) -> bool:
+    """Whether a stage is MXFP8: E4M3 values with one E8M0 scale per 32."""
+    return _is_e8m0_per_group_32(
+        stage, frozenset({"fp8_e4m3", "fp8_e4m3fn"}), is_dynamic=is_dynamic
+    )
+
+
+def _quark_global_stages(
+    config: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any] | None] | None:
+    """Return ``(input_tensors, weight, export)`` of an AMD Quark config.
+
+    ``export`` is ``None`` when the config has no ``export`` section; ``None``
+    overall when the config is not an AMD Quark config.
+    """
     if not isinstance(config, Mapping):
-        return False
+        return None
     if not current_platform().is_amd:
-        return False
+        return None
     if str(config.get("quant_method", "")).lower() != "quark":
-        return False
+        return None
     global_quant_config = config.get("global_quant_config") or {}
-    export = config.get("export") or {}
-    if not isinstance(global_quant_config, Mapping) or not isinstance(export, Mapping):
-        return False
+    export = config.get("export")
+    if not isinstance(global_quant_config, Mapping):
+        return None
+    if export is not None and not isinstance(export, Mapping):
+        return None
     input_tensors = global_quant_config.get("input_tensors") or {}
     weight = global_quant_config.get("weight") or {}
+    if not isinstance(input_tensors, Mapping) or not isinstance(weight, Mapping):
+        return None
+    return input_tensors, weight, export
+
+
+def _is_real_quantized_reorder_export(export: Mapping[str, Any] | None) -> bool:
     return (
-        isinstance(input_tensors, Mapping)
-        and "fp8" in str(input_tensors.get("dtype", "")).lower()
-        and _is_fp4_e8m0_per_group(weight, is_dynamic=False)
+        export is not None
         and str(export.get("pack_method", "")).lower() == "reorder"
         and str(export.get("weight_format", "")).lower() == "real_quantized"
     )
 
 
+def _is_amd_quark_w_mxfp4_a_fp8(config: Mapping[str, Any]) -> bool:
+    """MXFP4 weights with FP8 activations under one per-tensor scale."""
+    stages = _quark_global_stages(config)
+    if stages is None:
+        return False
+    input_tensors, weight, export = stages
+    return (
+        "fp8" in str(input_tensors.get("dtype", "")).lower()
+        # Per-group-32 E8M0 FP8 activations are MXFP8, not per-tensor FP8.
+        and not _is_fp8_e4m3_e8m0_per_group(input_tensors)
+        and _is_fp4_e8m0_per_group(weight, is_dynamic=False)
+        and _is_real_quantized_reorder_export(export)
+    )
+
+
+def _is_amd_quark_dynamic_mxfp8(config: Mapping[str, Any]) -> bool:
+    """MXFP4 weights with dynamic MXFP8 activations (W4A8 MX).
+
+    Checkpoints of this scheme may omit ``export``: their weights are stored
+    as packed ``[N, K/2]`` E2M1 bytes (even element in the low nibble) with
+    ``[N, K/32]`` E8M0 scales, the layout the ``reorder`` export writes.
+    """
+    stages = _quark_global_stages(config)
+    if stages is None:
+        return False
+    input_tensors, weight, export = stages
+    return (
+        _is_fp8_e4m3_e8m0_per_group(input_tensors, is_dynamic=True)
+        and _is_fp4_e8m0_per_group(weight, is_dynamic=False)
+        and (export is None or _is_real_quantized_reorder_export(export))
+    )
+
+
 def _is_amd_quark_dynamic_mxfp4(config: Mapping[str, Any]) -> bool:
-    if not isinstance(config, Mapping):
+    stages = _quark_global_stages(config)
+    if stages is None:
         return False
-    if not current_platform().is_amd:
-        return False
-    if str(config.get("quant_method", "")).lower() != "quark":
-        return False
-    global_quant_config = config.get("global_quant_config") or {}
-    export = config.get("export") or {}
-    if not isinstance(global_quant_config, Mapping) or not isinstance(export, Mapping):
-        return False
-    input_tensors = global_quant_config.get("input_tensors") or {}
-    weight = global_quant_config.get("weight") or {}
+    input_tensors, weight, export = stages
     if not (
         _is_fp4_e8m0_per_group(input_tensors, is_dynamic=True)
         and _is_fp4_e8m0_per_group(weight, is_dynamic=False)
-        and str(export.get("pack_method", "")).lower() == "reorder"
-        and str(export.get("weight_format", "")).lower() == "real_quantized"
+        and _is_real_quantized_reorder_export(export)
     ):
         return False
     # Every MXFP4 activation quantizer (dense and MoE) picks scales in
@@ -102,7 +156,11 @@ def _is_amd_quark_dynamic_mxfp4(config: Mapping[str, Any]) -> bool:
 def _is_amd_quark_mxfp4_checkpoint(config: dict) -> bool:
     if not isinstance(config, Mapping):
         return False
-    return _is_amd_quark_w_mxfp4_a_fp8(config) or _is_amd_quark_dynamic_mxfp4(config)
+    return (
+        _is_amd_quark_w_mxfp4_a_fp8(config)
+        or _is_amd_quark_dynamic_mxfp4(config)
+        or _is_amd_quark_dynamic_mxfp8(config)
+    )
 
 
 # Raw-consumed attention weights: model code reads these as BF16 tensors
@@ -220,11 +278,19 @@ class Mxfp4Config(QuantizationConfig):
         use_dynamic_mxfp4_activations: bool = False,
         quant_method: str | None = None,
         fp8_layer_patterns: list[str] | None = None,
+        use_dynamic_mxfp8_activations: bool = False,
     ):
         super().__init__(ignored_layers=ignored_layers)
+        if use_dynamic_mxfp4_activations and use_dynamic_mxfp8_activations:
+            raise ValueError(
+                "MXFP4 checkpoints quantize activations to MXFP4 or MXFP8, not both"
+            )
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.is_w4a8_fp8 = is_w4a8_fp8
         self.use_dynamic_mxfp4_activations = use_dynamic_mxfp4_activations
+        # Dynamic MXFP8 activations: E4M3 values with one E8M0 scale per 32,
+        # for dense linears and routed experts alike.
+        self.use_dynamic_mxfp8_activations = use_dynamic_mxfp8_activations
         self.quant_method = quant_method
         self.group_size = 32
         # Per-layer FP8 overrides from the checkpoint (e.g. ``*self_attn*``),
@@ -242,8 +308,12 @@ class Mxfp4Config(QuantizationConfig):
         quant_method = str(config.get("quant_method", "")).lower()
         is_w4a8_fp8 = _is_amd_quark_w_mxfp4_a_fp8(config)
         use_dynamic_mxfp4_activations = _is_amd_quark_dynamic_mxfp4(config)
+        use_dynamic_mxfp8_activations = _is_amd_quark_dynamic_mxfp8(config)
         is_checkpoint_mxfp4_serialized = (
-            "mxfp4" in quant_method or is_w4a8_fp8 or use_dynamic_mxfp4_activations
+            "mxfp4" in quant_method
+            or is_w4a8_fp8
+            or use_dynamic_mxfp4_activations
+            or use_dynamic_mxfp8_activations
         )
 
         raw_ignored = cls.get_from_keys_or(config, ["ignored_layers", "exclude"], None)
@@ -261,7 +331,22 @@ class Mxfp4Config(QuantizationConfig):
             use_dynamic_mxfp4_activations=use_dynamic_mxfp4_activations,
             quant_method=quant_method,
             fp8_layer_patterns=fp8_layer_patterns,
+            use_dynamic_mxfp8_activations=use_dynamic_mxfp8_activations,
         )
+
+    @property
+    def linear_activation_format(self) -> str | None:
+        """Activation format of the checkpoint's MXFP4 dense linears.
+
+        ``"mxfp4"`` or ``"mxfp8"`` (the ``mxfp4_linear`` kernels quantize
+        BF16 activations to it), or ``None`` when dense linears are not
+        stored as MXFP4.
+        """
+        if self.use_dynamic_mxfp8_activations:
+            return "mxfp8"
+        if self.use_dynamic_mxfp4_activations:
+            return "mxfp4"
+        return None
 
     def fp8_override_route(self, module_name: str) -> str | None:
         """Return how a module under a per-layer FP8 override is loaded and run.

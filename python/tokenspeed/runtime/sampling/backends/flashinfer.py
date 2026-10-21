@@ -140,6 +140,7 @@ def canonical_greedy_verify(
         target_predict=target_predict,
         batch_size=bs,
         num_draft_tokens=n,
+        count_bonus=False,
     )
     greedy_rows = top_ks.view(bs, n)[:, 0] == 1
     predict.copy_(

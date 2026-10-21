@@ -132,11 +132,16 @@ def fused_decode_input_prep_kernel(
     # Inputs
     req_pool_indices_ptr,  # [batch_size]
     valid_cache_lengths_ptr,  # [req_pool_size+1]
+    future_input_map_ptr,  # [req_pool_size+1, uniform_input_length]
+    future_input_stride,
     # Outputs
     positions_ptr,  # [batch_size * uniform_input_length]
     seq_lens_out_ptr,  # [batch_size]
+    input_ids_ptr,  # [batch_size * uniform_input_length]
     # Scalars
     uniform_input_length,
+    vocab_size,
+    CLAMP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """One launch fuses the decode-uniform path's small prep kernels.
@@ -145,6 +150,8 @@ def fused_decode_input_prep_kernel(
       valid_cache_lengths.index_select(0, req_pool_indices)
       compute_position_triton (decode branch)
       torch.add(input_lengths, valid_cache_lengths, out=seq_lens)
+      future_input_map.index_select(0, req_pool_indices) into the input ids,
+      and (CLAMP) their defensive clamp into [0, vocab_size)
 
     Each program handles one request. We do one GMEM read of
     `valid_cache_lengths[pool_idx]` (runtime state is pool-indexed) and reuse
@@ -171,6 +178,14 @@ def fused_decode_input_prep_kernel(
             cache_start + token_offsets,
             mask=mask,
         )
+        ids = tl.load(
+            future_input_map_ptr + pool_idx * future_input_stride + token_offsets,
+            mask=mask,
+            other=0,
+        )
+        if CLAMP:
+            ids = tl.minimum(tl.maximum(ids, 0), vocab_size - 1)
+        tl.store(input_ids_ptr + output_offset + token_offsets, ids, mask=mask)
 
 
 def fused_decode_input_prep(
@@ -179,20 +194,37 @@ def fused_decode_input_prep(
     req_pool_indices: torch.Tensor,  # [batch_size]
     valid_cache_lengths: torch.Tensor,  # [req_pool_size+1]
     uniform_input_length: int,
+    *,
+    input_ids_out: torch.Tensor,  # [batch_size * uniform_input_length]
+    future_input_map: torch.Tensor,  # [req_pool_size+1, uniform_input_length]
+    vocab_size: int | None,
 ) -> None:
     """Decode-only fast path: one Triton launch writes positions and
     seq_lens, reading `valid_cache_lengths[pool_idx]` directly so the
-    per-iter indexSelect + add are gone too.
+    per-iter indexSelect + add are gone too, and the input ids:
+    ``future_input_map[pool_idx]``, clamped into ``[0, vocab_size)`` (a
+    stale or corrupt id must not reach the embedding gather) unless
+    ``vocab_size`` is None (the caller clamps later).
     """
+    if future_input_map.shape[1] != uniform_input_length:
+        raise ValueError(
+            f"future_input_map width {future_input_map.shape[1]} must equal "
+            f"the decode width {uniform_input_length}"
+        )
     batch_size = req_pool_indices.shape[0]
     BLOCK_SIZE = 128
     grid = (batch_size,)
     fused_decode_input_prep_kernel[grid](
         req_pool_indices,
         valid_cache_lengths,
+        future_input_map,
+        future_input_map.stride(0),
         positions_ptr,
         seq_lens_out_ptr,
+        input_ids_out,
         uniform_input_length,
+        0 if vocab_size is None else vocab_size,
+        CLAMP=vocab_size is not None,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 

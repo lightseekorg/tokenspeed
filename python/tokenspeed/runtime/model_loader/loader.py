@@ -44,6 +44,7 @@ from tokenspeed.runtime.configs.device_config import DeviceConfig
 from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.dense.mxfp4 import quantize_lm_head_mxfp4
 from tokenspeed.runtime.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -71,6 +72,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 )
 from tokenspeed.runtime.models.extensible import ExtensibleLM
 from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_available
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 @contextmanager
@@ -146,6 +148,23 @@ def _get_quantization_config(
             )
         return quant_config
     return None
+
+
+def _quantize_lm_head_mxfp4(model: nn.Module) -> None:
+    """``--lm-head-mxfp4``: run the LM head as MXFP4 weights x MXFP8 rows."""
+    # Imported here: models import the model loader.
+    from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
+
+    if getattr(type(model), "set_embed_and_head_module", None) is not None:
+        # A draft that adopts the target's head module: the target's head is
+        # quantized, and the draft's own checkpoint head is dropped.
+        return
+    if not isinstance(model, BaseCausalLM) or model.lm_head is None:
+        raise ValueError("--lm-head-mxfp4 needs a causal LM with an LM head")
+    # resolve_lm_head returns the input embedding itself for tied weights.
+    if getattr(model.config, "tie_word_embeddings", False):
+        raise ValueError("--lm-head-mxfp4 does not support tied word embeddings")
+    quantize_lm_head_mxfp4(model.lm_head, activation_format="mxfp8")
 
 
 def _initialize_model(
@@ -555,6 +574,8 @@ class DefaultModelLoader(BaseModelLoader):
                     if process_method is not None:
                         with device_loading_context(module, target_device):
                             module.process_weights_after_loading(module)
+                if global_server_args_dict["lm_head_mxfp4"]:
+                    _quantize_lm_head_mxfp4(model)
 
             with startup_phase("weights.post_quant_warmup"):
                 post_quant_warmup = getattr(model, "post_quant_warmup", None)

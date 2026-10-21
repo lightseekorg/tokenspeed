@@ -520,6 +520,7 @@ class _TailFusionLayer(torch.nn.Module, _Qwen4ExpDecoderMixin):
         self.is_moe = False
         self.materialize_tail = False
         self.ple = _TailFusionPLE() if ple else None
+        self.fused_decode = None
         self.comm_manager = SimpleNamespace(
             needs_pre_attn_all_gather=lambda: pre_gather,
             needs_final_all_gather=lambda: final_gather,
@@ -578,6 +579,8 @@ def _tail_fusion_model(
     model.hyper_connection_mixer = GatedResidualSimple(
         config, use_mix=True, use_combine=False
     )
+    model.megakernel_steps = None
+    model.fused_final_mixer = False
     model = model.to(device="cuda", dtype=dtype)
     with torch.no_grad():
         for module in model.modules():

@@ -27,6 +27,7 @@ import re
 from collections.abc import Iterable
 
 import torch
+from tokenspeed_kernel.ops.megakernel import FusedDecodeLayer
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen4_exp_config import (
@@ -75,9 +76,19 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeMLP,
     Qwen3_5MoeSparseMoeBlock,
 )
+from tokenspeed.runtime.models.qwen4_exp_megakernel import (
+    MegakernelSteps,
+    forward_delta_layer,
+    forward_final_qsa_layer,
+    forward_qsa_layer,
+    prepare_delta_layer,
+    prepare_qsa_layer,
+    runs_fused,
+)
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 
@@ -319,6 +330,10 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
                 float(config.rms_norm_eps),
             )
         self._init_qwen4_exp_extensions(config, mapping, layer_id, quant_config, prefix)
+        # Set by Qwen4ExpModel.prepare_decode_megakernels when this layer runs
+        # its decode step as one megakernel launch.
+        self.fused_decode: FusedDecodeLayer | None = None
+        self.megakernel_steps: MegakernelSteps | None = None
 
     def forward(
         self,
@@ -329,6 +344,16 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
         **kwargs,
     ):
         del kwargs
+        if self.fused_decode is not None and runs_fused(hidden_states, ctx):
+            return forward_delta_layer(
+                self,
+                self.fused_decode,
+                self.megakernel_steps,
+                hidden_states,
+                residual,
+                input_ids,
+                ctx,
+            )
         mixed, residuals = self._prepare_attention(
             hidden_states, residual, input_ids, ctx
         )
@@ -460,6 +485,10 @@ class Qwen4ExpAttentionDecoderLayer(
                 rotary_emb=self.rotary_emb,
             )
         self._init_qwen4_exp_extensions(config, mapping, layer_id, quant_config, prefix)
+        # Set by Qwen4ExpModel.prepare_decode_megakernels when this layer runs
+        # its decode step as one megakernel launch.
+        self.fused_decode: FusedDecodeLayer | None = None
+        self.megakernel_steps: MegakernelSteps | None = None
 
     def self_attention(
         self,
@@ -489,6 +518,16 @@ class Qwen4ExpAttentionDecoderLayer(
         **kwargs,
     ):
         del kwargs
+        if self.fused_decode is not None and runs_fused(hidden_states, ctx):
+            return forward_qsa_layer(
+                self,
+                self.fused_decode,
+                self.megakernel_steps,
+                positions,
+                hidden_states,
+                residual,
+                ctx,
+            )
         mixed, residuals = self._prepare_attention(
             hidden_states, residual, input_ids, ctx
         )
@@ -525,11 +564,62 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidualSimple(hc_config, use_combine=False)
+        self.megakernel_steps: MegakernelSteps | None = None
+        # Whether the last layer's megakernel also runs hyper_connection_mixer.
+        self.fused_final_mixer = False
         self.qsa_indexers = tuple(
             layer.indexer
             for layer in self.layers
             if getattr(layer, "indexer", None) is not None
         )
+
+    def prepare_decode_megakernels(self) -> None:
+        """Pack every eligible layer for its decode megakernel (after loading)."""
+        fused = {}
+        last = self.layers[-1] if self.layers else None
+        # A last QSA layer's launch also runs the final mixer, unless the
+        # streams need an all-gather first.
+        fold_final = (
+            last is not None
+            and not isinstance(last, Qwen4ExpLinearDecoderLayer)
+            and not last.comm_manager.needs_final_all_gather()
+        )
+        for layer in self.layers:
+            if isinstance(layer, Qwen4ExpLinearDecoderLayer):
+                prepared = prepare_delta_layer(layer)
+            else:
+                prepared = prepare_qsa_layer(
+                    layer,
+                    (
+                        self.hyper_connection_mixer
+                        if fold_final and layer is last
+                        else None
+                    ),
+                )
+            if prepared is not None:
+                fused[layer] = prepared
+        if not fused:
+            logger.warning("Qwen4-Exp decode megakernel: no eligible layer")
+            return
+        device = next(self.parameters()).device
+        scratch_pairs = max(f.scratch_pairs for f in fused.values())
+        self.megakernel_steps = MegakernelSteps(device, scratch_pairs)
+        for layer, prepared in fused.items():
+            layer.fused_decode = prepared
+            layer.megakernel_steps = self.megakernel_steps
+        self.fused_final_mixer = fold_final and last in fused
+        logger.info(
+            f"Qwen4-Exp decode megakernel: {len(fused)} of {len(self.layers)} "
+            "layers fused"
+        )
+
+    @staticmethod
+    def _prefetches_ple(layer, input_ids: torch.Tensor, ctx: ForwardContext) -> bool:
+        """Whether ``layer`` has a PLE block whose lookup TokenSpeed runs; a
+        decode megakernel does its own lookup."""
+        if layer.ple is None:
+            return False
+        return layer.fused_decode is None or not runs_fused(input_ids, ctx)
 
     def _start_ple_prefetch(
         self, ple: Qwen4ExpPLELayer, input_ids: torch.Tensor, ctx: ForwardContext
@@ -551,17 +641,31 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         input_deepstack_embeds: torch.Tensor | None = None,
     ):
         del pp_proxy_tensors
+        if self.megakernel_steps is not None:
+            self.megakernel_steps.advance()
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
-        if self.layers and self.layers[0].ple is not None:
+        if self.layers and self._prefetches_ple(self.layers[0], input_ids, ctx):
             self._start_ple_prefetch(self.layers[0].ple, input_ids, ctx)
         residual = None
         for layer_id, layer in enumerate(self.layers):
             if layer_id + 1 < len(self.layers):
-                next_ple = self.layers[layer_id + 1].ple
-                if next_ple is not None:
-                    self._start_ple_prefetch(next_ple, input_ids, ctx)
+                next_layer = self.layers[layer_id + 1]
+                if self._prefetches_ple(next_layer, input_ids, ctx):
+                    self._start_ple_prefetch(next_layer.ple, input_ids, ctx)
+            elif self.fused_final_mixer and runs_fused(hidden_states, ctx):
+                # The last layer's launch also runs the final mixer.
+                mixed, streams = forward_final_qsa_layer(
+                    layer,
+                    layer.fused_decode,
+                    layer.megakernel_steps,
+                    positions,
+                    hidden_states,
+                    residual,
+                    ctx,
+                )
+                return mixed, [streams]
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -783,6 +887,12 @@ def load_qwen4_exp_weights(
     return loaded
 
 
+def _prepare_decode_megakernels(model: Qwen4ExpModel | None) -> None:
+    """Pack the decode megakernels when ``--qwen4-exp-decode-megakernel`` is set."""
+    if model is not None and global_server_args_dict["qwen4_exp_decode_megakernel"]:
+        model.prepare_decode_megakernels()
+
+
 class Qwen4ExpForCausalLM(BaseCausalLM):
     """Text-only Qwen4-Exp entry class."""
 
@@ -802,6 +912,9 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
         return load_qwen4_exp_weights(
             self, self.config, self.mapping, weights, include_visual=False
         )
+
+    def post_quant_warmup(self) -> None:
+        _prepare_decode_megakernels(self.model)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -846,6 +959,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             weights,
             include_visual=self.is_multimodal_active,
         )
+
+    def post_quant_warmup(self) -> None:
+        _prepare_decode_megakernels(self.model)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

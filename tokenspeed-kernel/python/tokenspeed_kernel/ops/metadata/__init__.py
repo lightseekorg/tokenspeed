@@ -22,6 +22,7 @@
 
 from tokenspeed_kernel.ops.metadata.accepted_frontier import advance_accepted_frontier
 from tokenspeed_kernel.ops.metadata.prep_tape import PrepTape, Reg
+from tokenspeed_kernel.ops.metadata.state_tables import mask_stopped_state_tables
 from tokenspeed_kernel.ops.metadata.stop_conditions import apply_stop_conditions
 
 __all__ = [
@@ -29,4 +30,5 @@ __all__ = [
     "Reg",
     "advance_accepted_frontier",
     "apply_stop_conditions",
+    "mask_stopped_state_tables",
 ]

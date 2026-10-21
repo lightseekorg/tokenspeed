@@ -77,7 +77,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import (  # noqa: E4
     preprocess_n16_mxfp4_weights,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_mxfp8 import (  # noqa: E402
-    mxfp8_situ_prefill,
+    mxfp8_moe_prefill,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (  # noqa: E402
     _stage2_a16w4_warp_gemv_combine,
@@ -756,6 +756,7 @@ def _check_stage1_basis(d, varying_scales, block_m):
         25.0,
         True,
         BM=block_m,
+        ACTIVATION="situ",
         num_warps=4,
         num_stages=1,
         enable_fp_fusion=False,
@@ -1127,13 +1128,14 @@ def test_prefill_output_validation_and_disjoint_workspace_pitches():
     weights = torch.ones_like(ids, dtype=torch.float32)
 
     def apply(output):
-        return mxfp8_situ_prefill(
+        return mxfp8_moe_prefill(
             x,
             *_bank(module),
             ids,
             weights,
             global_experts=8,
             expert_start=0,
+            activation="situ",
             situ_beta=4.0,
             situ_linear_beta=25.0,
             out=output,
