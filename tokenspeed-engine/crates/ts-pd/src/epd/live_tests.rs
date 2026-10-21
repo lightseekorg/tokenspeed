@@ -55,6 +55,7 @@ fn peer(library: PathBuf, regions: Vec<(usize, usize)>, engine_rank: i64) -> Pee
     PeerConfig {
         library,
         local_ip: "127.0.0.1".to_owned(),
+        protocol: "rdma".to_owned(),
         ib_device: String::new(),
         regions,
         engine_rank,

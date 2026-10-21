@@ -180,6 +180,7 @@ fn peer_config(library: PathBuf, region: &[u8]) -> PeerConfig {
     PeerConfig {
         library,
         local_ip: "127.0.0.1".to_owned(),
+        protocol: "rdma".to_owned(),
         ib_device: String::new(),
         regions: vec![(region.as_ptr() as usize, region.len())],
         engine_rank: 0,

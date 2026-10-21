@@ -41,6 +41,10 @@ use std::{
 
 pub mod store;
 
+#[cfg(test)]
+#[path = "../tests/unit/engine.rs"]
+mod tests;
+
 /// The ABI of the entry points this crate calls.
 const ABI_VERSION: c_int = 1;
 
@@ -226,17 +230,18 @@ unsafe impl Sync for Engine {}
 
 impl Engine {
     /// Start an engine on `hostname`, through peer-to-peer handshakes over
-    /// RDMA, on the devices `device_filter` names (comma-separated; empty
+    /// `protocol`, on the devices `device_filter` names (comma-separated; empty
     /// for all). Its session id is `hostname:rpc_port`, with an IPv6 host in
     /// brackets.
     pub fn start(
         library: Arc<Library>,
         hostname: &str,
+        protocol: &str,
         device_filter: &str,
     ) -> Result<Self, Error> {
         let host = c_string(hostname, "hostname")?;
         let metadata = c_string("P2PHANDSHAKE", "metadata server")?;
-        let protocol = c_string("rdma", "protocol")?;
+        let protocol = c_string(protocol, "protocol")?;
         let devices = c_string(device_filter, "device filter")?;
         // SAFETY: the strings outlive the call.
         let raw = unsafe {
