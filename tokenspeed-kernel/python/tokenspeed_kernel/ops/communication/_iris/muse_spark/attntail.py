@@ -27,6 +27,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_group_heap_base,
     _iris_rendezvous,
     _iris_sanitize_lamport_bf16x2,
+    _iris_subgroup_any,
 )
 
 
@@ -194,34 +195,31 @@ def _iris_muse_wait_mailbox(
     """Reload peers' packed BF16 rows until no element holds the empty marker.
 
     slot holds each thread's WORDS_PER_THREAD consecutive 32-bit word offsets.
-    A thread stops reloading once its words from every peer have arrived; the
-    loop-carried mask also keeps the reloads inside the polling loop.
+    Each subgroup polls on its own, without a workgroup-wide reduction, until
+    its words from every peer have arrived.
     """
     THREADS: gl.constexpr = slot.shape[0] // WORDS_PER_THREAD
     slot = gl.reshape(slot, [THREADS, WORDS_PER_THREAD])
-    waiting = gl.full([THREADS], True, gl.int1, gl.SliceLayout(1, slot.type.layout))
     received = ()
     for _ in gl.static_range(1, WORLD_SIZE):
         received += (gl.zeros_like(slot).to(gl.uint32),)
-    while gl.max(waiting.to(gl.int32), 0) != 0:
+    waiting = True
+    while waiting:
         missing = gl.zeros_like(slot)
         loaded = ()
         for delta in gl.static_range(1, WORLD_SIZE):
             peer = (RANK + delta) % WORLD_SIZE
+            # Arrived words stay unchanged until this row's slot is cleared,
+            # so every thread rereads all of its words.
             words = gl.amd.cdna4.buffer_load(
-                mailbox_ptr,
-                slot + peer * peer_stride,
-                # Comparing slot broadcasts the per-thread flag to every word.
-                mask=waiting[:, None] & (slot >= 0),
-                other=received[delta - 1],
-                cache=".cv",
+                mailbox_ptr, slot + peer * peer_stride, cache=".cv"
             )
             loaded += (words,)
-            missing |= (((words & 0xFFFF) == 0x8000) | ((words >> 16) == 0x8000)).to(
-                gl.int32
-            )
+            # Senders never send negative zero, so a word is still empty
+            # exactly when its high half holds the marker.
+            missing |= ((words >> 16) == 0x8000).to(gl.int32)
         received = loaded
-        waiting = gl.max(missing, 1) != 0
+        waiting = _iris_subgroup_any(gl.max(missing, 1))
     flat = ()
     for delta in gl.static_range(1, WORLD_SIZE):
         flat += (gl.reshape(received[delta - 1], [THREADS * WORDS_PER_THREAD]),)
