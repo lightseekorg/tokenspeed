@@ -962,10 +962,10 @@ def _iris_sync_rank_token(
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
     WAIT_VMEM: gl.constexpr,
 ):
     """Publish a counter to peers and wait for their matching counters."""
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
     layout: gl.constexpr = gl.BlockedLayout([1], [SUBGROUP_SIZE], [NUM_WARPS], [0])
     peers = gl.arange(0, WORLD_SIZE, layout=layout)
     peer_mask = peers != RANK
@@ -1035,7 +1035,6 @@ def _iris_sync_rank_epoch(
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
     PUBLISH: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
 ):
@@ -1045,6 +1044,7 @@ def _iris_sync_rank_epoch(
     otherwise read each peer's counter directly. Counter comparisons allow
     wraparound and peers that have already advanced to the next epoch.
     """
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
     ready_layout: gl.constexpr = gl.BlockedLayout(
         [1], [SUBGROUP_SIZE], [NUM_WARPS], [0]
     )
@@ -1284,7 +1284,6 @@ def iris_pull_oneshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
         PUBLISH=PUBLISH_READY,
         PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
     )
@@ -1390,7 +1389,6 @@ def iris_pull_oneshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
         PUBLISH=PUBLISH_READY,
         PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
     )
@@ -1473,7 +1471,6 @@ def iris_pull_twoshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
         PUBLISH=True,
         PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
     )
@@ -1574,7 +1571,6 @@ def iris_pull_twoshot(
         RANK,
         WORLD_SIZE,
         NUM_WARPS,
-        SUBGROUP_SIZE,
         PUBLISH=True,
         PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
     )
@@ -1641,7 +1637,6 @@ def iris_pull_twoshot(
             RANK,
             WORLD_SIZE,
             NUM_WARPS,
-            SUBGROUP_SIZE,
             PUBLISH=True,
             PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
         )
