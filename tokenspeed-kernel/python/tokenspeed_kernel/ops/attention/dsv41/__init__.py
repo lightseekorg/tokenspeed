@@ -93,6 +93,7 @@ __all__ = [
     "dspark_rows",
     "dspark_anchors",
     "dspark_block",
+    "dspark_workspace",
 ]
 
 
