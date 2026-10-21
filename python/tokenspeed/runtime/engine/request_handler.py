@@ -48,6 +48,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.engine.generation_output_processor import RequestState
 from tokenspeed.runtime.engine.io_struct import (
+    HEALTH_CHECK_RID_PREFIX,
     AbortReq,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
@@ -55,6 +56,7 @@ from tokenspeed.runtime.engine.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    HealthCheckOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
     IsSchedulerPausedReqInput,
@@ -215,6 +217,7 @@ class RequestHandler:
         recv_func,
         send_func,
         can_clear_cache_fn,
+        num_running_fn,
         clear_cache_fn=None,
         architectures: list[str] | None = None,
         *,
@@ -226,6 +229,9 @@ class RequestHandler:
 
         self.forward_ct = 0
         self.server_args = server_args
+        # Requests the scheduler holds; a health probe arriving while it holds
+        # any is answered at once instead of queueing behind them.
+        self.num_running_fn = num_running_fn
         # Owns pause/resume state; shared with the event loop. See pause.py.
         self.pause_controller = pause_controller
         # Owns release/resume_memory_occupation (data plane). See
@@ -391,6 +397,14 @@ class RequestHandler:
         pending_flush_outputs = 0
         for recv_req in recv_reqs:
             if isinstance(recv_req, TokenizedGenerateReqInput):
+                if recv_req.rid.startswith(HEALTH_CHECK_RID_PREFIX) and (
+                    self.num_running_fn()
+                ):
+                    # Reaching this round proves a busy loop alive. Queued
+                    # behind a long-prefill backlog, the probe would see no
+                    # output for minutes and get the worker marked unhealthy.
+                    self.send_func.send_pyobj(HealthCheckOutput())
+                    continue
                 req_spec, req_state, bootstrap_info = self.handle_generate_request(
                     recv_req
                 )

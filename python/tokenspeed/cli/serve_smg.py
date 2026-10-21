@@ -64,6 +64,7 @@ from tokenspeed.cli._proc import (
     wait_grpc_serving,
     wait_http_ready,
 )
+from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.launcher import _ephemeral_port_range, detect_topology
 from tokenspeed.runtime.utils.network import get_free_port
 from tokenspeed.runtime.utils.process import kill_process_tree
@@ -88,6 +89,7 @@ MUSE_SPARK_TOOL_CALL_PARSER = "muse"
 MUSE_SPARK_GATEWAY_PARSER = "symphony"
 MUSE_SPARK_GRAMMAR_BACKEND = "xgrammar"
 DEFAULT_SMG_LOG_LEVEL = "warn"
+HEALTH_CHECK_TIMEOUT_MARGIN_SECS = 5
 GRPC_MAX_MESSAGE_BYTES_ENV = "TOKENSPEED_GRPC_MAX_MESSAGE_BYTES"
 DEFAULT_GRPC_MAX_MESSAGE_BYTES = "536870912"
 # smg routing policy for ``ts serve``. Distinct from DEFAULT_REASONING_PARSER,
@@ -229,18 +231,29 @@ def _gateway_args_with_default_reasoning_parser(
     return [*gateway_args, "--reasoning-parser", DEFAULT_REASONING_PARSER]
 
 
+def _operator_flag_value(gateway_args: list[str], flag: str) -> str | None:
+    """The operator's explicit ``flag`` value (last-wins), or None.
+
+    Reads both the ``flag value`` and the ``flag=value`` spelling, so the
+    defaults stay correct on argv that did not pass through ``split_argv``'s
+    normalization. Call before the matching ``_gateway_args_with_default_*``
+    helper injects a default.
+    """
+    value = None
+    for i, arg in enumerate(gateway_args):
+        if arg == flag and i + 1 < len(gateway_args):
+            value = gateway_args[i + 1]
+        elif arg.startswith(f"{flag}="):
+            value = arg.split("=", 1)[1]
+    return value
+
+
 def _operator_policy(gateway_args: list[str]) -> str | None:
     """The operator's explicit ``--policy`` value (last-wins), or None.
 
     Call before ``_gateway_args_with_default_policy`` injects a default.
     """
-    policy = None
-    for i, arg in enumerate(gateway_args):
-        if arg == "--policy" and i + 1 < len(gateway_args):
-            policy = gateway_args[i + 1]
-        elif arg.startswith("--policy="):
-            policy = arg.split("=", 1)[1]
-    return policy
+    return _operator_flag_value(gateway_args, "--policy")
 
 
 def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str]:
@@ -326,6 +339,29 @@ def _gateway_args_with_default_log_level(gateway_args: list[str]) -> list[str]:
     if "--log-level" in gateway_args:
         return gateway_args
     return [*gateway_args, "--log-level", DEFAULT_SMG_LOG_LEVEL]
+
+
+def _gateway_args_with_default_health_check_timeout(
+    gateway_args: list[str],
+) -> list[str]:
+    """Let smg's health probe outlast the engine's own probe window.
+
+    The engine answers ``HealthCheck`` by waiting up to
+    ``TOKENSPEED_HEALTH_CHECK_TIMEOUT`` seconds for any scheduler output. With
+    smg's 5 s default the gateway gives up first, so a scheduler working through
+    a long-prefill backlog is marked unhealthy and, being the only worker, turns
+    every request into a 503 until two probes pass again.
+    """
+    if _operator_flag_value(gateway_args, "--health-check-timeout-secs") is not None:
+        return gateway_args
+    engine_timeout = envs.TOKENSPEED_HEALTH_CHECK_TIMEOUT.get()
+    if engine_timeout <= 0:
+        raise ValueError(
+            "TOKENSPEED_HEALTH_CHECK_TIMEOUT must be a positive number of seconds, "
+            f"got {engine_timeout}"
+        )
+    timeout = engine_timeout + HEALTH_CHECK_TIMEOUT_MARGIN_SECS
+    return [*gateway_args, "--health-check-timeout-secs", str(timeout)]
 
 
 _FREE_PORT_MAX_ATTEMPTS = 5
@@ -713,6 +749,7 @@ def _gateway_args_with_defaults(
     gateway_args = _gateway_args_with_smg_disable_defaults(gateway_args)
     gateway_args = _gateway_args_with_default_policy(gateway_args)
     gateway_args = _gateway_args_with_default_tokenizer_cache(gateway_args)
+    gateway_args = _gateway_args_with_default_health_check_timeout(gateway_args)
     return _gateway_args_with_default_log_level(gateway_args)
 
 
