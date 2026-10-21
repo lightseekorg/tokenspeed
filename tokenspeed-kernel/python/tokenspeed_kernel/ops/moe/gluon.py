@@ -1238,10 +1238,12 @@ if platform.is_amd:
         )
         # Runtime M has two integer-alignment classes. Sort widths grow only
         # at these bounds; the direct/compact decode kernels have two row tiles.
+        # Five is route_tile_min_m with 32 local experts.
         representatives = (
             1,
             2,
             4,
+            5,
             16,
             17,
             32,

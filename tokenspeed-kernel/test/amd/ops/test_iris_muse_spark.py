@@ -842,7 +842,9 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
         )
         return full, local, poison, positions, cache
 
-    inputs = [make_inputs(rows) for rows in (2047, 2048, 8191)]
+    # Both sides of the gather/owned-QKVG boundary, plus a ragged full chunk.
+    boundary = MUSE_OWNED_QKVG_MIN_TOKENS
+    inputs = [make_inputs(rows) for rows in (boundary - 1, boundary, 8191)]
 
     def run(item):
         full, local, poison, positions, cache = item
@@ -952,7 +954,7 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
     with assert_no_triton_compile(
         iris_a2a_transpose_qkvg, iris_fused_a2a_transpose_qkvg_norm_rope
     ):
-        for rows in (2051, 8190):
+        for rows in (boundary + 3, 8190):
             output, _, _, fused, reference = run(make_inputs(rows))
             for actual, expected in zip(fused, reference):
                 torch.testing.assert_close(
