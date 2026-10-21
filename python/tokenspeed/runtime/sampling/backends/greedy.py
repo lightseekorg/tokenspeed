@@ -125,11 +125,11 @@ def _verify_chain_greedy(
                 f"{tuple(candidates.shape)} and target_predict {tuple(target_predict.shape)}"
             )
         verify_chain_target_sampled(
-            predicts,
-            accept_index,
-            accept_token_num,
-            candidates,
-            target_predict,
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            target_sampled=target_predict,
             write_rejected_targets=True,
         )
         return
