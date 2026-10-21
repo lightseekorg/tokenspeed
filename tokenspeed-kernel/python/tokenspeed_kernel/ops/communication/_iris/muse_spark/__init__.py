@@ -408,6 +408,15 @@ class MuseIrisState:
         )
         return output
 
+    def acquire_owned_route_input(self, rows: int) -> torch.Tensor:
+        """Borrow BF16 ``[rows * 8, 4096]`` route staging for an expert producer.
+
+        Write it on the stream of the next ``reduce_scatter_owned_routes``, which
+        then skips staging.
+        """
+        assert 0 < rows <= self.owned_route_max_rows
+        return self.owned_route_input[:rows].view(rows * _MUSE_TOPK, _MUSE_ROUTE_WIDTH)
+
     def reduce_scatter_owned_routes(
         self, routes: torch.Tensor, route_map: torch.Tensor | None, rows: int
     ) -> torch.Tensor:
@@ -415,7 +424,8 @@ class MuseIrisState:
 
         ``routes`` holds this rank's partial outputs; ``route_map`` maps
         canonical token/route order to its rows, else ``routes`` is canonical
-        and contiguous. Returns borrowed BF16 ``[ceil(rows/P), 8, 4096]``
+        and contiguous; an ``acquire_owned_route_input`` view skips staging, other
+        overlapping sources are rejected. Returns borrowed BF16 ``[ceil(rows/P), 8, 4096]``
         routes with zero padding rows; consume them before the next call.
         """
         assert 0 < rows <= self.owned_route_max_rows
@@ -425,7 +435,14 @@ class MuseIrisState:
         staged = self.owned_route_input[:rows]
         if route_map is None:
             assert routes.is_contiguous() and routes.numel() == staged.numel()
-            staged.copy_(routes.view_as(staged))
+            if routes.data_ptr() != staged.data_ptr():
+                size = staged.numel() * staged.element_size()
+                if (
+                    routes.data_ptr() < staged.data_ptr() + size
+                    and staged.data_ptr() < routes.data_ptr() + size
+                ):
+                    raise ValueError("route staging must not overlap its source")
+                staged.copy_(routes.view_as(staged))
         else:
             gather_moe_routes(
                 routes, route_map, rows, _MUSE_TOPK, _MUSE_ROUTE_WIDTH, output=staged

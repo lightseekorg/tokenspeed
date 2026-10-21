@@ -1284,6 +1284,21 @@ class MuseSparkMoE(nn.Module):
         owned_rows: bool,
     ) -> torch.Tensor:
         """Run FP4 experts and complete sharded routes before normalization."""
+        norm_weight = self.post_expert_norm.weight
+        iris = self.iris_state
+        deferred_out = None
+        if (
+            owned_rows
+            and self.tp_size > 1
+            and self.ep_size == 1
+            and iris is not None
+            and iris.owned_route_max_rows
+            and norm_weight is not None
+            and norm_weight.shape == (4096,)
+            and self.experts.deferred_output_is_token_order
+            and self.experts.supports_deferred_out
+        ):
+            deferred_out = iris.acquire_owned_route_input(topk_ids.shape[0])
         gemm2_out, _, expanded_idx = self.experts(
             hidden_states=compressed,
             topk_output=StandardTopKOutput(topk_weights, topk_ids, router_logits),
@@ -1292,10 +1307,12 @@ class MuseSparkMoE(nn.Module):
             do_finalize=False,
             x_quantized=compressed_quantized,
             routing_prepared=prepared,
+            deferred_out=deferred_out,
         )
+        if deferred_out is not None:
+            assert gemm2_out.data_ptr() == deferred_out.data_ptr()
         if prepared is None:
             self._prepare_routing(compressed_quantized, topk_ids, topk_weights)
-        norm_weight = self.post_expert_norm.weight
         if (
             self.tp_size > 1
             and self.ep_size == 1
