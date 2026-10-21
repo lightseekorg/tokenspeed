@@ -252,14 +252,24 @@ _FP8_PB_WO_LAYERS = {
 
 
 @pytest.mark.parametrize("algo", ["FP8_PB_WO", "FP8_BLOCK_SCALES"])
-def test_from_config_accepts_fp8_pb_wo_aliases(algo: str):
+@pytest.mark.parametrize("hf_algo", ["FP8_PB_WO", "FP8_BLOCK_SCALES"])
+def test_config_sources_accept_fp8_pb_wo_aliases(algo: str, hf_algo: str):
+    from tokenspeed.runtime.model_loader.weight_utils import with_hf_quant_layers
+
     config = ModelOptMixedConfig.from_config(
-        {
-            "quant_algo": "MIXED_PRECISION",
-            "quantized_layers": {
-                "mtp.layers.0.mlp.experts": {"quant_algo": algo},
+        with_hf_quant_layers(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "mtp.layers.0.mlp.experts": {"quant_algo": algo},
+                },
             },
-        }
+            {
+                "quantized_layers": {
+                    "mtp.layers.0.mlp.experts": {"quant_algo": hf_algo},
+                },
+            },
+        )
     )
     assert config.quantized_layers == {
         "mtp.layers.0.mlp.experts": "FP8_PB_WO",

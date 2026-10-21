@@ -2,12 +2,12 @@
   "schema_version": 1,
   "cases": [
     {
-      "id": "glm53_flash.attention.kda_paged_decode/steady-bfloat16",
+      "id": "glm53_flash.attention.kda_fused_paged_decode/decode-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "attention",
-        "mode": "kda_paged_decode",
+        "mode": "kda_fused_paged_decode",
         "parameters": {
           "model_profile": "glm53_flash_tp4",
           "heads": 16,
@@ -17,25 +17,26 @@
           "lower_bound": -5,
           "recurrent_layout": "v_major",
           "batch": [1, 2, 4, 8, 16],
+          "conv_kernel_size": 4,
+          "state_page_bytes": 1179648,
           "state_pages": 841,
-          "state_page_stride": [271872, 294912],
           "state_page_relation": "in_place"
         },
         "cold_cache": true,
-        "seed": 701
+        "seed": 1711
       },
       "policy": {
-        "max_regression_relative": 0.06,
-        "max_regression_absolute_us": 1.0
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.5
       }
     },
     {
-      "id": "glm53_flash.attention.kda_paged_decode/boundary-bfloat16",
+      "id": "glm53_flash.attention.kda_fused_paged_verify/verify-t4-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "attention",
-        "mode": "kda_paged_decode",
+        "mode": "kda_fused_paged_verify",
         "parameters": {
           "model_profile": "glm53_flash_tp4",
           "heads": 16,
@@ -44,17 +45,52 @@
           "dtype": "bfloat16",
           "lower_bound": -5,
           "recurrent_layout": "v_major",
-          "batch": [1, 16],
+          "batch": [1, 2, 4, 8, 16],
+          "draft_token_num": 4,
+          "conv_kernel_size": 4,
+          "state_page_bytes": 1179648,
           "state_pages": 841,
-          "state_page_stride": 294912,
-          "state_page_relation": "distinct"
+          "capture_replay": true,
+          "store_states": false
         },
         "cold_cache": true,
-        "seed": 1701
+        "seed": 1721
       },
       "policy": {
-        "max_regression_relative": 0.06,
+        "max_regression_relative": 0.05,
         "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "glm53_flash.attention.kda_replay_commit/replay-t4-l34-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "kda_replay_commit",
+        "parameters": {
+          "model_profile": "glm53_flash_tp4",
+          "heads": 16,
+          "key_dim": 128,
+          "value_dim": 128,
+          "dtype": "bfloat16",
+          "lower_bound": -5,
+          "recurrent_layout": "v_major",
+          "batch": [1, 2, 4, 8, 16],
+          "draft_token_num": 4,
+          "accepted_length": [1, 4],
+          "layers": 34,
+          "state_groups": 2,
+          "conv_kernel_size": 4,
+          "state_page_bytes": 1179648,
+          "state_pages": 33
+        },
+        "cold_cache": true,
+        "seed": 1731
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
       }
     },
     {

@@ -31,6 +31,7 @@ import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cached_property
+from math import ceil
 from typing import Any, Protocol
 
 import torch
@@ -38,6 +39,9 @@ from tokenspeed_kernel.workspace import capture_session
 
 from tokenspeed.runtime.multimodal.encoder_batching import pack_encoder_batches
 from tokenspeed.runtime.utils import logger
+
+# Longest sequence the padding rows of a budget graph run as, which bounds their attention cost.
+PADDING_SEQUENCE_ROWS = 256
 
 
 @dataclass
@@ -211,19 +215,28 @@ class VisionEncoderCudaGraphAdapter:
         return [[1, a * self.merge, b * self.merge]]
 
     def pad_cu_seqlens(
-        self, metadata: dict[str, Any], metadata_sequence_budget: int
+        self,
+        metadata: dict[str, Any],
+        metadata_sequence_budget: int,
+        real_rows: int,
+        budget_rows: int,
     ) -> None:
         cu = metadata["cu_seqlens"]
-        target = metadata_sequence_budget + 1
-        if cu.shape[0] > target:
+        if cu.shape[0] > metadata_sequence_budget + 1:
             raise RuntimeError(
                 f"{self.modality_name} encoder cudagraph needs {cu.shape[0] - 1} "
                 f"metadata sequences, but the configured limit is "
                 f"{metadata_sequence_budget}"
             )
-        pad = target - cu.shape[0]
-        if pad > 0:
-            metadata["cu_seqlens"] = torch.cat([cu, cu[-1:].expand(pad)])
+        # Attention never writes rows outside every sequence yet reads them past a sequence's end, so padding rows run as sequences too.
+        padding = list(range(real_rows, budget_rows, PADDING_SEQUENCE_ROWS))[1:]
+        if real_rows < budget_rows:
+            padding.append(budget_rows)
+        cu = torch.cat([cu, torch.tensor(padding, dtype=cu.dtype, device=cu.device)])
+        target = (
+            metadata_sequence_budget + 1 + ceil(budget_rows / PADDING_SEQUENCE_ROWS)
+        )
+        metadata["cu_seqlens"] = torch.cat([cu, cu[-1:].expand(target - cu.shape[0])])
 
     def batch_from_items(self, items: list[Any]) -> VisionEncoderBatch:
         tokens, grid = self.pre_encode(items)
@@ -262,10 +275,13 @@ class VisionEncoderCudaGraphAdapter:
             )
         metadata = dict(self.tower.prepare_metadata(batch.grid))
         if encoder_output_token_budget is not None:
-            self.pad_cu_seqlens(metadata, metadata_sequence_budget)
+            budget_rows = encoder_output_token_budget * self.out_div
+            self.pad_cu_seqlens(
+                metadata, metadata_sequence_budget, batch.tokens.shape[0], budget_rows
+            )
             # Non-tensor scalar gets baked at capture. Use the per-budget worst
             # case so replay never exceeds the captured attention max seqlen.
-            metadata["max_seqlen"] = encoder_output_token_budget * self.out_div
+            metadata["max_seqlen"] = budget_rows
         return metadata
 
     def forward(
