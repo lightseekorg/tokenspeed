@@ -668,6 +668,37 @@ def test_index_pack_large_inner_stride(device, weight_dtype):
     assert output_weights is weights
 
 
+@pytest.mark.parametrize("width", [128, 131200])
+@pytest.mark.parametrize("rows", [1, 3])
+def test_block_select_visible_stride_contract(device, width, rows):
+    logits = torch.randn(rows, width, device=device)
+    visible = torch.full((2 * rows,), width, dtype=torch.int64, device=device)[::2]
+    out = torch.empty(rows, 4, dtype=torch.int32, device=device)
+    lengths = torch.empty(rows, dtype=torch.int32, device=device)
+    if rows > 1:
+        with pytest.raises(ValueError, match="contiguous visible row counts"):
+            implementation.index_block_select(
+                logits, visible, 4, out, lengths, visible_capacity=width
+            )
+        return
+    # A single element has no stride-dependent addressing, in either selector.
+    expected_out = torch.empty_like(out)
+    expected_lengths = torch.empty_like(lengths)
+    implementation.index_block_select(
+        logits, visible, 4, out, lengths, visible_capacity=width
+    )
+    implementation.index_block_select(
+        logits,
+        visible.clone(),
+        4,
+        expected_out,
+        expected_lengths,
+        visible_capacity=width,
+    )
+    torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
+    torch.testing.assert_close(lengths, expected_lengths, rtol=0, atol=0)
+
+
 def test_index_pack_boundaries_and_graph_refresh(device):
     q = torch.zeros(8, 32, 128, device=device, dtype=torch.bfloat16)
     weights = torch.zeros(8, 32, device=device, dtype=torch.bfloat16)

@@ -113,16 +113,23 @@ def test_block_selector_bounds_single_and_split_passes(width, capacity):
     logits = torch.randn(10, width, device="cuda")
     columns = torch.arange(width, device="cuda")[None, :]
     logits.masked_fill_(columns >= raw.clamp(0, capacity)[:, None], -torch.inf)
-    a, b = torch.empty(10, 4, dtype=torch.int32, device="cuda"), torch.empty(
-        10, dtype=torch.int32, device="cuda"
-    )
-    c, d = torch.empty_like(a), torch.empty_like(b)
+    expected_out = torch.empty(10, 4, dtype=torch.int32, device="cuda")
+    expected_lengths = torch.empty(10, dtype=torch.int32, device="cuda")
+    actual_out = torch.empty_like(expected_out)
+    actual_lengths = torch.empty_like(expected_lengths)
     index_block_select(
-        logits, raw.clamp(0, capacity), 4, a, b, visible_capacity=capacity
+        logits,
+        raw.clamp(0, capacity),
+        4,
+        expected_out,
+        expected_lengths,
+        visible_capacity=capacity,
     )
-    index_block_select(logits, raw, 4, c, d, visible_capacity=capacity)
-    torch.testing.assert_close(a, c, rtol=0, atol=0)
-    torch.testing.assert_close(b, d, rtol=0, atol=0)
+    index_block_select(
+        logits, raw, 4, actual_out, actual_lengths, visible_capacity=capacity
+    )
+    torch.testing.assert_close(actual_out, expected_out, rtol=0, atol=0)
+    torch.testing.assert_close(actual_lengths, expected_lengths, rtol=0, atol=0)
 
 
 @requires_gpu
