@@ -21,8 +21,16 @@
 # SOFTWARE.
 
 import asyncio
+import os
+import sys
 import unittest
 from dataclasses import dataclass
+
+# CI registration (AST-parsed, runtime no-op).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 from tokenspeed.runtime.engine.async_llm import AsyncLLM
 from tokenspeed.runtime.engine.collector import RequestOutputCollector
