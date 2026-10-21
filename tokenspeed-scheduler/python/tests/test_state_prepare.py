@@ -338,3 +338,29 @@ def test_cpu_delta_ring_materializes_accepted_state_before_publication():
         memory[row(b, "hit")[0]], replay(s0.copy(), 5), rtol=0, atol=0
     )
     assert not np.allclose(memory[block], replay(s0.copy(), 8))
+
+
+@pytest.mark.parametrize("finish_before_result", [False, True])
+def test_stopped_overlap_result_preserves_consumed_frontier(finish_before_result):
+    """A stopped device row reports no tokens but still retires its forward."""
+    s = scheduler(overlap=1)
+    slot, block = started(s)
+    assert forwards(s.next_execution_plan())  # already submitted behind the stop
+    if finish_before_result:
+        control(s, "r", ts.ForwardEvent.Finish)
+        assert not s.next_execution_plan().state_prepares
+    result(s, "r", [])
+    if not finish_before_result:
+        control(s, "r", ts.ForwardEvent.Finish)
+    p = s.next_execution_plan()
+    (op,) = p.state_prepares
+    assert not forwards(p)
+    assert op.request_pool_index == slot
+    assert op.num_computed_tokens == 130
+    assert dict(op.state_blocks) == {"state": block}
+    assert s.active_lcm_blocks() > 0
+    ack(s, op, success=True)
+    submit(s, "hit", list(range(125)) + [1000, 1001, 1002, 1003, 1004, 9999])
+    b = forwards(s.next_execution_plan())[0]
+    assert list(b.extend_prefix_lens) == [130]
+    assert row(b, "hit")[0] == block

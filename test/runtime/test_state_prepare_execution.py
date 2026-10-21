@@ -153,3 +153,56 @@ def test_invalid_slot_binding_is_atomic(slots):
     with pytest.raises(ValueError):
         states.bind_cache_request_slots(["r", "s"], slots)
     assert states.owns_cache_request_slot("old", 2)
+
+
+@pytest.mark.parametrize("stop_reason", ["eos", "length"])
+def test_stopped_overlap_masks_state_and_accepts_no_more_tokens(stop_reason):
+    """Use real stop handling and state-table masking across two forwards."""
+    states = RuntimeStates(4, 32, 8, device="cpu")
+    slots = torch.tensor([2, 1], dtype=torch.int64)
+    states.valid_cache_lengths[2] = 125
+    states.stop_token_ids.fill_(-1)
+    states.token_limits.fill_(10000)
+    if stop_reason == "eos":
+        states.stop_token_ids[2, 0] = 1005
+    else:
+        # The sampled last token is not yet consumed: T=130, token limit=131.
+        states.token_limits[2] = 131
+    tokens = torch.tensor(
+        [[1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008], [9] * 8],
+        dtype=torch.int32,
+    ).flatten()
+    lengths = torch.full((2,), 8, dtype=torch.int32)
+    accepted = lengths.clone()
+
+    def apply():
+        states.apply_stop_conditions(
+            slots,
+            tokens,
+            accepted,
+            lengths,
+            torch.empty(0, dtype=torch.int32),
+            num_extends=0,
+            num_prefill_outputs=0,
+            decode_width=8,
+            padding_index=4,
+        )
+
+    apply()
+    assert accepted.tolist() == [5, 8]
+    assert states.stopped[2] and not states.stopped[1]
+    tables = {
+        "state": torch.tensor([[3, 4], [5, 6]], dtype=torch.int32),
+        "kv": torch.tensor([[7, 8], [9, 10]], dtype=torch.int32),
+    }
+    original = {key: value.clone() for key, value in tables.items()}
+    masked = states.masked_state_tables(tables, slots, ["state"])
+    assert masked["state"].tolist() == [[-1, -1], [5, 6]]
+    for key in tables:
+        torch.testing.assert_close(tables[key], original[key], rtol=0, atol=0)
+    torch.testing.assert_close(masked["kv"], original["kv"], rtol=0, atol=0)
+    states.valid_cache_lengths[2] = 130
+    accepted.fill_(8)
+    apply()  # already submitted next forward: stop is sticky, no new accepts
+    assert accepted.tolist() == [0, 8]
+    assert states.valid_cache_lengths[2].item() == 130
