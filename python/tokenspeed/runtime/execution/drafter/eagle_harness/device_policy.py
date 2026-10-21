@@ -395,8 +395,9 @@ def _check_cost_data(
     context interval, a cache_length_step that is not a nonzero integer, fewer
     ratios than measured widths, more than 32 widths, widths that are not
     strictly increasing integers in [0, 2**31 - 1); a chain's widths other
-    than 1, 2, 4, ..., 16; a tree's without width 1, or (exec mode 1) without a second one within
-    the verify budget ``verify_num``, the width its batch cut verifies."""
+    than 1, 2, 4, ..., 16; a tree's widths without width 1, or (exec mode 1)
+    without a second width within the verify budget ``verify_num``, the width
+    its batch cut verifies."""
     if not cost.intervals:
         raise ValueError(f"{where}: no context interval")
     if not isinstance(cost.cache_length_step, int) or cost.cache_length_step == 0:

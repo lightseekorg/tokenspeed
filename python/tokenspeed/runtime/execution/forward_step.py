@@ -1069,8 +1069,9 @@ class ForwardStepRunner:
         device.
 
         ``settle`` finishes what the inputs still wait on (a pending draft
-        round): a decode calls it after the target's decode metadata, which
-        that round does not read, any other forward first.
+        round): a decode calls it once the target's decode metadata, which
+        that round does not read, is prepared; any other forward calls it
+        first.
 
         Returns ``(output_tokens, output_lengths, output_logprobs,
         forward_logprobs)``; the last is an extend/mixed forward's
