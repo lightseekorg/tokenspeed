@@ -954,6 +954,32 @@ if platform.is_amd:
         },
         priority=Priority.SPECIALIZED + 1,
     )
+    def gluon_fp8_packed_ep1_precomputed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        """Apply packed block-FP8 experts without expert parallelism."""
+        return _gluon_fp8_packed_precomputed_moe_apply(
+            plan,
+            x,
+            w,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            num_tokens_global,
+            max_num_tokens_per_gpu,
+            do_finalize,
+            enable_pdl,
+        )
+
     @register_kernel(
         "moe",
         "apply",
@@ -973,7 +999,33 @@ if platform.is_amd:
         },
         priority=Priority.SPECIALIZED + 1,
     )
-    def gluon_fp8_packed_precomputed_moe_apply(
+    def gluon_fp8_packed_ep4_precomputed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        """Apply packed block-FP8 experts with four expert-parallel ranks."""
+        return _gluon_fp8_packed_precomputed_moe_apply(
+            plan,
+            x,
+            w,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            num_tokens_global,
+            max_num_tokens_per_gpu,
+            do_finalize,
+            enable_pdl,
+        )
+
+    def _gluon_fp8_packed_precomputed_moe_apply(
         plan: dict,
         x: torch.Tensor,
         w: torch.nn.Module,
@@ -1010,7 +1062,7 @@ if platform.is_amd:
         if x.shape[0] == 0:
             return torch.empty_like(x)
 
-        num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
+        num_local_experts = int(w.num_local_experts)
         return launch_gluon_fp8_packed_moe_gfx950(
             x,
             w.w13_weight,
@@ -1020,7 +1072,7 @@ if platform.is_amd:
             validated_ids.to(dtype=torch.int32).contiguous(),
             validated_weights.to(dtype=torch.float32).contiguous(),
             float(swiglu_limit),
-            int(getattr(w, "ep_rank", 0)) * num_local_experts,
+            int(w.ep_rank) * num_local_experts,
             num_experts_total=w.num_experts,
             quantize_activation=_quantize_packed_activation,
         )

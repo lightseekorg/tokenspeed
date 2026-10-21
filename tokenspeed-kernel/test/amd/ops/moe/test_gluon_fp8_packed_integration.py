@@ -286,17 +286,19 @@ def test_packed_fp8_reload_rejects_tile_aligned_partial_input_columns() -> None:
 
 
 def test_packed_fp8_preprocess_packs_plain_tensor_weights() -> None:
-    # The benchmark harness builds weight modules from plain tensors without
-    # checkpoint loaders; packing must not require a weight_loader hook.
-    w13 = _small_fp8_weight(128).detach()
-    w2 = _small_fp8_weight(64).detach()
-    module = SimpleNamespace(
-        w13_weight=w13,
-        w2_weight=w2,
-        w13_weight_scale_inv=torch.ones(2, 2, 1),
-        w2_weight_scale_inv=torch.ones(2, 1, 1),
-    )
-    original13, original2 = w13.clone(), w2.clone()
+    class PlainTensorModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.w13_weight = _small_fp8_weight(128).detach()
+            self.w2_weight = _small_fp8_weight(64).detach()
+            self.w13_weight_scale_inv = torch.ones(2, 2, 1)
+            self.w2_weight_scale_inv = torch.ones(2, 1, 1)
+            # Synthetic weights are already loaded, like the benchmark inputs.
+            self.w13_weight.weight_loader = lambda *args, **kwargs: None
+            self.w2_weight.weight_loader = lambda *args, **kwargs: None
+
+    module = PlainTensorModule()
+    original13, original2 = module.w13_weight.clone(), module.w2_weight.clone()
     fp8.gluon_fp8_packed_moe_weights({}, module)
     assert torch.equal(
         module.w13_weight.view(torch.uint8),
@@ -306,6 +308,10 @@ def test_packed_fp8_preprocess_packs_plain_tensor_weights() -> None:
         module.w2_weight.view(torch.uint8),
         pack_fp8_weight_n16k32(original2).view(torch.uint8),
     )
+    for weight in (module.w13_weight, module.w2_weight):
+        packed = weight.view(torch.uint8).clone()
+        weight.weight_loader(weight, torch.empty(0))
+        assert torch.equal(weight.view(torch.uint8), packed)
 
 
 def test_linear_fp8_preprocessor_receives_original_checkpoint_layout(

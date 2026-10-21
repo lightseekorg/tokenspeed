@@ -46,7 +46,7 @@ from tokenspeed_kernel.selection import (
 
 
 def _use_cpu_allocations(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in ("empty", "full", "zeros"):
+    for name in ("empty", "full", "zeros", "ones"):
         allocation = getattr(torch, name)
 
         def cpu_allocation(*args, _allocation=allocation, **kwargs):
@@ -439,6 +439,11 @@ def test_fp8_weights_retain_global_and_local_expert_counts(monkeypatch, ep_size)
     assert weights.num_experts == 16
     assert weights.num_local_experts == 16 // ep_size
     assert weights.w13_weight.shape[0] == weights.w2_weight.shape[0] == 16 // ep_size
+    for weight in (weights.w13_weight, weights.w2_weight):
+        original = weight.view(torch.uint8).clone()
+        weight.weight_loader(weight, torch.empty(0), weight_copy=None)
+        assert weight.device.type == "cpu"
+        assert torch.equal(weight.view(torch.uint8), original)
 
 
 def test_moe_fp8_weight_shapes_match_tp_and_ep_layouts() -> None:

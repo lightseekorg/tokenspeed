@@ -421,6 +421,10 @@ def _ones(shape: tuple[int, ...]) -> torch.Tensor:
     return torch.ones(shape, dtype=torch.float32, device="cuda")
 
 
+def _noop_weight_loader(*args: object, **kwargs: object) -> None:
+    """Synthetic benchmark weights are already loaded and have no checkpoint."""
+
+
 def _make_fp8_weights(
     *,
     num_experts: int,
@@ -445,10 +449,14 @@ def _make_fp8_weights(
         if activation == "swiglu"
         else None
     )
+    w13_weight = _zero_fp8(shapes["w13"], weight_dtype)
+    w2_weight = _zero_fp8(shapes["w2"], weight_dtype)
+    w13_weight.weight_loader = _noop_weight_loader
+    w2_weight.weight_loader = _noop_weight_loader
     return SimpleNamespace(
-        w13_weight=_zero_fp8(shapes["w13"], weight_dtype),
+        w13_weight=w13_weight,
         w13_weight_scale_inv=_ones(shapes["w13_scale"]),
-        w2_weight=_zero_fp8(shapes["w2"], weight_dtype),
+        w2_weight=w2_weight,
         w2_weight_scale_inv=_ones(shapes["w2_scale"]),
         w13_weight_bias=None,
         w2_weight_bias=None,

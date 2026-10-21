@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -42,33 +41,41 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import (  # noqa: E402
 pytestmark = pytest.mark.skipif(not is_cdna4(), reason="requires AMD gfx950 GPU")
 
 
-def _packed_module(
-    packed13: torch.Tensor | SimpleNamespace,
-    packed2: object,
-    scales13: object,
-    scales2: object,
-    rank: int,
-    num_experts_total: int,
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        w13_weight=packed13,
-        w2_weight=packed2,
-        w13_weight_scale_inv=scales13,
-        w2_weight_scale_inv=scales2,
-        num_local_experts=packed13.shape[0],
-        num_experts=num_experts_total,
-        ep_rank=rank,
-    )
+class _PackedModule(torch.nn.Module):
+    def __init__(
+        self,
+        packed13: torch.Tensor,
+        packed2: torch.Tensor,
+        scales13: torch.Tensor,
+        scales2: torch.Tensor,
+        rank: int,
+        num_experts_total: int,
+    ) -> None:
+        super().__init__()
+        from tokenspeed.runtime.layers.activation import SwigluArg
+
+        self.w13_weight = packed13
+        self.w2_weight = packed2
+        self.w13_weight_scale_inv = scales13
+        self.w2_weight_scale_inv = scales2
+        self.num_local_experts = packed13.shape[0]
+        self.num_experts = num_experts_total
+        self.ep_rank = rank
+        self.ep_size = num_experts_total // self.num_local_experts
+        self.swiglu_arg = SwigluArg(alpha=1.0, limit=7.0)
 
 
 def _run_packed(
-    x: torch.Tensor, module: SimpleNamespace, weights: torch.Tensor, ids: torch.Tensor
+    x: torch.Tensor, module: _PackedModule, weights: torch.Tensor, ids: torch.Tensor
 ) -> torch.Tensor:
     import tokenspeed_kernel.ops.moe.gluon as fp8
 
-    return fp8.gluon_fp8_packed_precomputed_moe_apply(
-        {"activation": "swiglu"}, x, module, torch.empty(0), weights, ids
+    apply = (
+        fp8.gluon_fp8_packed_ep1_precomputed_moe_apply
+        if module.ep_size == 1
+        else fp8.gluon_fp8_packed_ep4_precomputed_moe_apply
     )
+    return apply({"activation": "swiglu"}, x, module, torch.empty(0), weights, ids)
 
 
 def test_packed_fp8_empty_input_returns_empty_output() -> None:
@@ -76,7 +83,7 @@ def test_packed_fp8_empty_input_returns_empty_output() -> None:
     x = torch.empty((0, hidden), device="cuda", dtype=torch.bfloat16)
     ids = torch.empty((0, 8), device="cuda", dtype=torch.int32)
     weights = torch.empty((0, 8), device="cuda", dtype=torch.float32)
-    module = _packed_module(
+    module = _PackedModule(
         torch.empty(
             (1, 2 * intermediate, hidden), device="cuda", dtype=torch.float8_e4m3fn
         ),
@@ -88,7 +95,6 @@ def test_packed_fp8_empty_input_returns_empty_output() -> None:
         rank=0,
         num_experts_total=1,
     )
-    module.swiglu_arg = SimpleNamespace(limit=7.0)
     output = _run_packed(x, module, weights, ids)
     assert output.shape == x.shape
     assert output.dtype == x.dtype
@@ -174,17 +180,12 @@ def test_packed_fp8_runtime_routes_do_not_recompile(
     start = rank * w13.shape[0]
     packed13, packed2 = pack_fp8_weight_n16k32(w13), pack_fp8_weight_n16k32(w2)
     inputs = (x, packed13, packed2, s13, s2, ids, weights)
-    module = _packed_module(
+    module = _PackedModule(
         packed13, packed2, s13, s2, rank, num_experts_total=w13.shape[0] * ep_size
     )
-    module.ep_size = ep_size
-    module.swiglu_arg = SimpleNamespace(limit=7.0)
     if path == "public-warp":
         from test_gluon_fp8_packed_integration import _plan
 
-        from tokenspeed.runtime.layers.activation import SwigluArg
-
-        module.swiglu_arg = SwigluArg(alpha=1.0, limit=7.0)
         public_plan = _plan(ep_size=1, ispp=512)
     pointers = tuple(tensor.data_ptr() for tensor in inputs)
     original_ids, original_weights = ids.clone(), weights.clone()
@@ -425,8 +426,6 @@ def test_packed_plan_reuses_one_bank_across_warp_boundary(record_property) -> No
         pack_fp8_weight_n16k32,
     )
 
-    from tokenspeed.runtime.layers.activation import SwigluArg
-
     x, w13, w2, s13, s2, ids, weights = _fixture(8, 1, 0, False, 4096, 512)
     sizes = (1, 2, 3, 4, 5, 8)
     references = {
@@ -445,8 +444,7 @@ def test_packed_plan_reuses_one_bank_across_warp_boundary(record_property) -> No
         for rows in sizes
     }
     packed13, packed2 = pack_fp8_weight_n16k32(w13), pack_fp8_weight_n16k32(w2)
-    module = _packed_module(packed13, packed2, s13, s2, 0, w13.shape[0])
-    module.swiglu_arg = SwigluArg(alpha=1.0, limit=7.0)
+    module = _PackedModule(packed13, packed2, s13, s2, 0, w13.shape[0])
     del w13, w2
     plan = _plan(ep_size=1, ispp=512)
     registration = plan["apply_kernel_name"]
