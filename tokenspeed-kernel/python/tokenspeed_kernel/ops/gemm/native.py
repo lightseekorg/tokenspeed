@@ -56,7 +56,8 @@ from tokenspeed_kernel.signature import (
         "b_inner_stride_one": frozenset({True}),
         "is_cuda": frozenset({True}),
     },
-    priority=Priority.SPECIALIZED,
+    # Prefer the specialized Gluon kernel regardless of registration order.
+    priority=Priority.PERFORMANT,
 )
 def torch_grouped_bf16_projection_gfx950(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None

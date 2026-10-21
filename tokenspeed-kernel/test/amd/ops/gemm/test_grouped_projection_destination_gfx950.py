@@ -23,7 +23,9 @@
 import pytest
 import torch
 from tokenspeed_kernel.ops.gemm import grouped_bf16_projection
-from tokenspeed_kernel.selection import kernel_override
+from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import kernel_override, select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from utils import is_cdna4
 
 if not torch.cuda.is_available() or not is_cdna4():
@@ -56,6 +58,54 @@ def _inputs(tokens, groups, layout):
     if layout == "weights":
         weight = weight[:, ::2]
     return x, weight
+
+
+@pytest.mark.parametrize("tokens", [2, 24, 192])
+@pytest.mark.parametrize("layout", ["contiguous", "weights"])
+@pytest.mark.parametrize("torch_first", [False, True])
+def test_grouped_projection_dispatch_ignores_registration_order(
+    tokens, layout, torch_first
+):
+    x, weight = _inputs(tokens, 2, layout)
+    registry = KernelRegistry.get()
+    specs = registry.get_for_operator("gemm", "grouped_bf16_projection")
+    implementations = {spec.name: registry.get_impl(spec.name) for spec in specs}
+    try:
+        # Re-register the real implementations in both name orders to expose ties.
+        for spec in sorted(specs, key=lambda spec: spec.name, reverse=torch_first):
+            registry.register(spec, implementations[spec.name])
+        for solution in (None, "torch"):
+            expected_solution = (
+                "gluon" if solution is None and weight.is_contiguous() else "torch"
+            )
+            selected = select_kernel(
+                "gemm",
+                "grouped_bf16_projection",
+                format_signature(
+                    x=dense_tensor_format(x.dtype),
+                    weight=dense_tensor_format(weight.dtype),
+                ),
+                traits={
+                    "batch": weight.shape[0],
+                    "m": x.shape[0],
+                    "n": weight.shape[1],
+                    "k": weight.shape[2],
+                    "a_inner_stride_one": x.stride(-1) == 1,
+                    "b_contiguous": weight.is_contiguous(),
+                    "b_inner_stride_one": weight.stride(-1) == 1,
+                    "is_cuda": x.is_cuda,
+                },
+                solution=solution,
+            )
+            assert (
+                selected.name == f"{expected_solution}_grouped_bf16_projection_gfx950"
+            )
+            actual = grouped_bf16_projection(x, weight, None, solution)
+            expected = grouped_bf16_projection(x, weight, None, expected_solution)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        for spec in specs:
+            registry.register(spec, implementations[spec.name])
 
 
 @pytest.mark.parametrize("tokens", [6, 12, 24, 48, 96, 192])

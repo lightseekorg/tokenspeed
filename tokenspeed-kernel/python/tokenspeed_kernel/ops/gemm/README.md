@@ -58,6 +58,8 @@ K=4096 and output width 1024 use this candidate; single-token, single-group,
 nonunit-inner-stride and other shapes retain the original registered solutions.
 The canonical einsum reference is unchanged, including gradient-enabled calls.
 
-The gfx950 token-major Torch projection remains behind the Gluon implementation
-for supported contiguous weights. Its explicit `solution="torch"` path also
-covers strided weights; the model retains the fused grouped FP8 epilogue.
+The gfx950 token-major Torch projection uses the PERFORMANT priority band,
+below Gluon's SPECIALIZED band, so supported contiguous weights select Gluon
+independently of registration order. Its explicit `solution="torch"` path and
+automatic strided-weight fallback retain the token-major Torch destination;
+the model retains the fused grouped FP8 epilogue.
