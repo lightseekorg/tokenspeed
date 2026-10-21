@@ -119,6 +119,9 @@ public:
     // per-prior cap has dropped since start.
     std::size_t TailEntries() const { return coordinator_.NumTailEntries(); }
     std::int64_t TailCapEvictions() const { return coordinator_.TailCapEvictions(); }
+    // Unproven frequent State checkpoints evicted to keep at most
+    // SchedulerConfig::max_unproven_state_checkpoints of them, since start.
+    std::int64_t UnprovenStateCheckpointTrims() const { return coordinator_.UnprovenStateCheckpointTrims(); }
     // Empty parents of the request-private snapshot pool: every block of it
     // belongs to some retracted request's image, so a request that finished
     // or aborted while retracted must have returned its share (leak check).

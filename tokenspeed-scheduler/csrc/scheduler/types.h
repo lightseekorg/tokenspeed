@@ -100,6 +100,25 @@ struct SchedulerConfig {
     // into the third entry of every State group's row. Requires prefix
     // caching, except on the D role, which never computes a prompt.
     bool state_checkpoint_in_forward{false};
+    // Publish more State checkpoints than the natural points: a local
+    // prefill chunk end that is page-aligned and at least one chunk budget
+    // (max_scheduled_tokens) before the prompt end (FrequentStateCheckpointAt)
+    // publishes every State group's slot 1 there at the next chunk's
+    // admission (PublicationPoint::kStateCheckpoint), and a chunk that would
+    // end past such a page ends on it instead
+    // (ChunkEndingOnFrequentStateCheckpoint). A junction or in-forward
+    // boundary a chunk ends on stays a natural checkpoint. Each one is
+    // unproven until a hit claims it or an endpoint republishes it: evicted
+    // before every established cache entry, kept off Host, and capped by
+    // max_unproven_state_checkpoints. Requires prefix caching, except on the
+    // D role, which never computes a prompt and ignores it.
+    bool frequent_state_checkpoints{false};
+    // The most unproven frequent State checkpoints the Device cache keeps,
+    // pinned ones included: each admission that publishes one evicts the
+    // unpinned ones beyond it, oldest access epoch first, then shallowest.
+    // Required (>= 1) with frequent_state_checkpoints, and 0 without: no
+    // silent default.
+    std::int32_t max_unproven_state_checkpoints{0};
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks

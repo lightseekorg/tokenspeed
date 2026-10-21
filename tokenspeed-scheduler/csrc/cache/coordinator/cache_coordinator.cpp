@@ -39,6 +39,21 @@
 
 namespace tokenspeed {
 
+namespace {
+
+// A State group's Device entry that is an unproven checkpoint: published at a
+// frequent chunk end (kind kChunk at a real logical depth), never acquired by
+// a hit and never republished at an endpoint, which would have raised its
+// kind. The AdmissionPlanner evicts exactly these before every other cache
+// entry; TrimUnprovenStateCheckpoints bounds them; QueueCachedBlocksForStore
+// and PublishedDataSlots keep them off Host.
+bool isUnprovenStateCheckpoint(const PrefixCacheIndex::CachedBlockMetadata& metadata) {
+    return metadata.boundary_kind == CacheBoundaryKind::kChunk && !metadata.was_acquired &&
+           metadata.logical_block_index >= 0;
+}
+
+}  // namespace
+
 CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
                                    bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
                                    bool stream_device_cache_to_host)
@@ -234,6 +249,22 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
         return BoundaryResidency::kNone;
     }
     return cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
+}
+
+bool CacheCoordinator::deviceHoldsPageKv(const ContentHash& page_hash) const {
+    for (std::size_t group_index = 0; group_index < groups_.size(); ++group_index) {
+        const auto group = static_cast<std::int32_t>(group_index);
+        if (GroupIsState(group_index) || GroupIsReplayable(group)) {
+            continue;
+        }
+        for (std::int32_t offset = 0; offset < BlocksPerBoundary(group); ++offset) {
+            const CacheKey key{.group_id = groups_[group_index].Id(), .content_hash = page_hash, .page_offset = offset};
+            if (!groups_[group_index].Index().Contains(pool_, key)) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 std::vector<CacheKey> CacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
@@ -923,9 +954,10 @@ void CacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<c
             continue;  // a state checkpoint is published by its natural point, never by slot
         }
         std::vector<CacheKey> keys = keysForGroup(content_hashes, groups_[i].Id());
-        const std::int32_t pages_per_prefix_hash = BlocksPerBoundary(static_cast<std::int32_t>(i));
-        cacheFullBlocksForGroup<CacheTier::kDevice>(i, tables[i], keys, first_slot * pages_per_prefix_hash,
-                                                    access_epoch, boundary_kind, /*stream_completed_to_host=*/false);
+        const std::int32_t first_block = first_slot * BlocksPerBoundary(static_cast<std::int32_t>(i));
+        cacheFullBlocksForGroup<CacheTier::kDevice>(i, tables[i], keys, first_block,
+                                                    /*first_logical_block=*/first_block, access_epoch, boundary_kind,
+                                                    /*stream_completed_to_host=*/false);
     }
 }
 
@@ -933,12 +965,24 @@ void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> co
     if (host_pool_ == nullptr) {
         return;
     }
-    for (const CacheGroup& group : groups_) {
-        // A tail hash holds fewer blocks than a page; Contains filters.
-        for (CacheKey& key : keysForGroup(content_hashes, group.Id())) {
-            if (group.Index().Contains(pool_, key)) {
-                pending_stores_.push_back(StoreCandidate{.key = std::move(key)});
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const PrefixCacheIndex& index = groups_[i].Index();
+        // A tail hash holds fewer blocks than a page; the lookup filters.
+        for (CacheKey& key : keysForGroup(content_hashes, groups_[i].Id())) {
+            const CacheBlockRef block = index.Find(pool_, key);
+            if (!block) {
+                continue;
             }
+            // An unproven State checkpoint stays on the Device; a hit that
+            // promotes it queues it at the hitter's finish.
+            if (GroupIsState(i)) {
+                const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
+                    index.MetadataFor(pool_, block->Location());
+                if (metadata && isUnprovenStateCheckpoint(*metadata)) {
+                    continue;
+                }
+            }
+            pending_stores_.push_back(StoreCandidate{.key = std::move(key)});
         }
     }
 }
@@ -984,14 +1028,14 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, const 
 template <CacheTier Tier>
 void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
                                                std::span<const CacheKey> keys, std::int32_t first_cache_block,
-                                               std::uint64_t access_epoch, CacheBoundaryKind boundary_kind,
-                                               bool stream_completed_to_host) {
+                                               std::int32_t first_logical_block, std::uint64_t access_epoch,
+                                               CacheBoundaryKind boundary_kind, bool stream_completed_to_host) {
     if (GroupIsReplayable(static_cast<std::int32_t>(group_index))) {
         return;  // regenerated by the model, never published
     }
     cacheBlocksForGroup<Tier>(group_index,
                               groups_[group_index].Allocator().BlocksToPublish(table, first_cache_block, keys.size()),
-                              keys, first_cache_block, access_epoch, boundary_kind, stream_completed_to_host);
+                              keys, first_logical_block, access_epoch, boundary_kind, stream_completed_to_host);
 }
 
 template <CacheTier Tier>
@@ -1215,6 +1259,8 @@ bool CacheCoordinator::evictCachedBlockAlone(std::uint32_t group_id, CacheBlockL
 }
 
 bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location) {
+    const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
+        groups_[group_id].Index().MetadataFor(pool_, location);
     std::optional<CacheKey> removed = groups_[group_id].Index().Evict(pool_, location);
     if (!removed) {
         return false;
@@ -1222,13 +1268,18 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
     if (cache_mutation_sink_) {
         cache_mutation_sink_(*removed, CacheMutation::kRemoved);
     }
+    // A state checkpoint is matched only with the KV below it, and only when
+    // every State group holds it: a KV block of its page gone, it is dead
+    // weight and leaves too; one State group's block of a frequent
+    // checkpoint gone, the other State groups' blocks leave with it. (An
+    // endpoint's State blocks keep their own eviction order.)
+    const bool state_checkpoint_siblings_leave =
+        !GroupIsState(group_id) || (metadata && metadata->boundary_kind == CacheBoundaryKind::kChunk);
     if (const std::optional<std::int32_t> tail_tokens = tails_.TailTokensOf(removed->content_hash)) {
         evictTailEntries(removed->content_hash, *tail_tokens);
-    } else if (!GroupIsState(group_id)) {
-        // A state checkpoint is matched only with the KV below it: a KV block
-        // of its page gone, it is dead weight and leaves too.
+    } else if (state_checkpoint_siblings_leave) {
         for (std::size_t i = 0; i < groups_.size(); ++i) {
-            if (!GroupIsState(i)) {
+            if (!GroupIsState(i) || i == group_id) {
                 continue;
             }
             const CacheKey key{.group_id = groups_[i].Id(), .content_hash = removed->content_hash, .page_offset = 0};
@@ -1239,6 +1290,49 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
     }
     pruneTailIfUnreferenced(removed->content_hash);
     return true;
+}
+
+std::int32_t CacheCoordinator::TrimUnprovenStateCheckpoints(std::int32_t limit) {
+    _assert(limit >= 0, "the unproven State checkpoint cap must be non-negative");
+    const auto state_group = std::ranges::find_if(
+        groups_, [](const CacheGroup& group) { return group.Spec().attn_kind == AttnKind::kState; });
+    if (state_group == groups_.end()) {
+        return 0;
+    }
+    std::int32_t unproven = 0;
+    std::vector<PrefixCacheIndex::EntryView> evictable;
+    for (const PrefixCacheIndex::EntryView& entry : state_group->Index().Entries(pool_)) {
+        if (!isUnprovenStateCheckpoint(entry.metadata)) {
+            continue;
+        }
+        ++unproven;
+        if (!entry.pinned) {
+            evictable.push_back(entry);
+        }
+    }
+    if (unproven <= limit) {
+        return 0;
+    }
+    // The planner's order within its probationary tier, applied across
+    // epochs: the least recently used request's checkpoints first, the
+    // shallowest of them first, so the deepest checkpoint of a chain stays.
+    std::ranges::sort(evictable, {}, [](const PrefixCacheIndex::EntryView& entry) {
+        return std::tuple{entry.metadata.last_access_epoch, entry.metadata.logical_block_index,
+                          entry.location.lcm_block_id, entry.location.slot_index};
+    });
+    std::int32_t evicted = 0;
+    for (const PrefixCacheIndex::EntryView& entry : evictable) {
+        if (unproven <= limit) {
+            break;
+        }
+        // The other State groups' blocks of the checkpoint leave with it.
+        if (evictCachedBlock(state_group->Id(), entry.location)) {
+            --unproven;
+            ++evicted;
+        }
+    }
+    unproven_state_checkpoint_trims_ += evicted;
+    return evicted;
 }
 
 bool CacheCoordinator::evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location) {
@@ -1333,7 +1427,9 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
     const std::int32_t tail_blocks =
         completed.tail ? TailBlocksFor(static_cast<std::int32_t>(group_index), completed.tail->tail_tokens) : 0;
     const auto history_range = [&](std::int32_t first_block, std::int32_t past_end_block) {
-        PublishedRange range{.first_cache_block = first_block, .boundary_kind = completed.boundary_kind};
+        PublishedRange range{.first_cache_block = first_block,
+                             .first_logical_block = first_block,
+                             .boundary_kind = completed.boundary_kind};
         for (std::int32_t block = first_block; block < past_end_block; ++block) {
             range.keys.push_back(historyBlockKey(group_index, completed, block));
         }
@@ -1349,14 +1445,24 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
         return ranges;
     }
     if (GroupIsState(group_index)) {
-        // A natural checkpoint: slot 1 holds the state the forward that ended
-        // at this point wrote, keyed like the point itself.
+        // A natural or frequent checkpoint: slot 1 holds the state the
+        // forward that ended at this point wrote, keyed like the point
+        // itself, at the depth of its full pages.
         if (!completed.publish_state || completed.prefix_hashes.empty() && !completed.tail) {
+            return ranges;
+        }
+        // Keyed by a page an earlier point published, the state continues
+        // KV the Device index may have lost since (a request restored with
+        // no Host cache resumes on private copies of its pages). Nothing
+        // could match it without that KV, so it is not published.
+        if (!completed.tail && completed.first_new_prefix_page == hashed_prefix_pages &&
+            !deviceHoldsPageKv(completed.prefix_hashes.back())) {
             return ranges;
         }
         const ContentHash hash = completed.tail ? completed.tail->hash : completed.prefix_hashes.back();
         ranges.push_back(PublishedRange{
             .first_cache_block = 1,
+            .first_logical_block = hashed_prefix_pages,
             .keys = {CacheKey{.group_id = groups_[group_index].Id(), .content_hash = hash, .page_offset = 0}},
             .boundary_kind = completed.boundary_kind,
         });
@@ -1386,8 +1492,12 @@ template <CacheTier Tier>
 void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, BlockTable& table,
                                                     const CompletedPages& completed, std::uint64_t access_epoch) {
     for (const PublishedRange& range : completedBlockRanges(group_index, completed)) {
-        cacheFullBlocksForGroup<Tier>(group_index, table, range.keys, range.first_cache_block, access_epoch,
-                                      range.boundary_kind, completed.stream_completed_to_host);
+        // A frequent State checkpoint stays on the Device until a hit
+        // promotes it (QueueCachedBlocksForStore stores it from then on).
+        const bool unproven_state = GroupIsState(group_index) && range.boundary_kind == CacheBoundaryKind::kChunk;
+        cacheFullBlocksForGroup<Tier>(group_index, table, range.keys, range.first_cache_block,
+                                      range.first_logical_block, access_epoch, range.boundary_kind,
+                                      completed.stream_completed_to_host && !unproven_state);
     }
     // An in-forward State checkpoint sits outside the table: its block is
     // published like a natural checkpoint's slot 1, under its page's hash.
@@ -1401,7 +1511,8 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, Blo
                 .content_hash = completed.prefix_hashes[static_cast<std::size_t>(completed.state_checkpoint_pages - 1)],
                 .page_offset = 0};
             cacheBlocksForGroup<Tier>(group_index, completed.state_checkpoint_blocks.subspan(group_index, 1),
-                                      std::span<const CacheKey>(&key, 1), /*first_logical_block=*/1, access_epoch,
+                                      std::span<const CacheKey>(&key, 1),
+                                      /*first_logical_block=*/completed.state_checkpoint_pages, access_epoch,
                                       CacheBoundaryKind::kEndpoint, completed.stream_completed_to_host);
         }
     }
@@ -1469,6 +1580,13 @@ std::vector<std::vector<ImageSlot>> CacheCoordinator::PublishedDataSlots(std::sp
                 const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
                     groups_[i].Index().MetadataFor(pool_, block->Location());
                 _assert(metadata.has_value(), "a published slot has an index entry");
+                // An unproven State checkpoint (a prefill's slot 0 after a
+                // frequent chunk end) stays off Host: it rides the snapshot
+                // pool like an unpublished slot, and the restore copies it
+                // back instead of claiming -- and so promoting -- the entry.
+                if (GroupIsState(i) && isUnprovenStateCheckpoint(*metadata)) {
+                    continue;
+                }
                 published[i].push_back(ImageSlot{.slot_index = slot,
                                                  .block = block,
                                                  .key = std::move(*key),
@@ -1561,11 +1679,12 @@ std::vector<std::vector<ImageSlot>> CacheCoordinator::PublishedDataSlotsAfter(st
                     std::ranges::any_of(slots, [slot](const ImageSlot& s) { return s.slot_index == slot; })) {
                     continue;
                 }
-                slots.push_back(ImageSlot{.slot_index = slot,
-                                          .block = blocks[index],
-                                          .key = range.keys[j],
-                                          .logical_block_index = slot,
-                                          .boundary_kind = range.boundary_kind});
+                slots.push_back(
+                    ImageSlot{.slot_index = slot,
+                              .block = blocks[index],
+                              .key = range.keys[j],
+                              .logical_block_index = range.first_logical_block + static_cast<std::int32_t>(j),
+                              .boundary_kind = range.boundary_kind});
             }
         }
         std::ranges::sort(slots, {}, &ImageSlot::slot_index);

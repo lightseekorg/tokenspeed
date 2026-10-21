@@ -263,7 +263,9 @@ public:
     // Those data slots whose Device block is a published prefix entry, with
     // the key it is published under: they can ride Host L2 as that entry
     // (ImageSlot::block is the Device block here; the transfer manager
-    // swaps in the Host block). Everything else goes to the snapshot pool.
+    // swaps in the Host block). Everything else goes to the snapshot pool,
+    // an unproven State checkpoint included: it stays off Host until a hit
+    // promotes it.
     std::vector<std::vector<ImageSlot>> PublishedDataSlots(std::span<const BlockTable> tables,
                                                            std::int32_t num_tokens) const;
     // The same slots once `progress` has been published as well: the entries
@@ -382,9 +384,10 @@ public:
         std::vector<CacheBlockRef> blocks;
         HostAllocationStats stats;
     };
-    // Queue every already-published non-state Device cache entry under these
-    // content hashes (chain hashes and tail hashes alike) for D2H Store.
-    // Missing keys and an absent Host tier are silently skipped.
+    // Queue every already-published Device cache entry under these content
+    // hashes (chain hashes and tail hashes alike) for D2H Store, except an
+    // unproven State checkpoint: a frequent one no hit has claimed stays on
+    // the Device. Missing keys and an absent Host tier are silently skipped.
     void QueueCachedBlocksForStore(std::span<const std::string> content_hashes);
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
@@ -448,6 +451,17 @@ public:
     // per-prior cap has dropped.
     std::size_t NumTailEntries() const { return tails_.Size(); }
     std::int64_t TailCapEvictions() const { return tails_.CapEvictions(); }
+
+    // Bounds the unproven State checkpoints on the Device -- frequent ones
+    // (SchedulerConfig::frequent_state_checkpoints) no hit has claimed and no
+    // endpoint has republished -- to `limit`, counting pinned ones: while
+    // more are cached, evicts the unpinned ones, oldest access epoch first,
+    // then shallowest, each with its blocks in every State group. Counted
+    // over the first State group (every State group publishes a checkpoint
+    // together); returns how many were evicted.
+    std::int32_t TrimUnprovenStateCheckpoints(std::int32_t limit);
+    // Checkpoints TrimUnprovenStateCheckpoints has evicted since start.
+    std::int64_t UnprovenStateCheckpointTrims() const { return unproven_state_checkpoint_trims_; }
     // Group blocks a tail entry holds in group i: every block of the page
     // below T, the last one partial unless T is a multiple of the block span.
     std::int32_t TailBlocksFor(std::int32_t i, std::int32_t tail_tokens) const;
@@ -541,10 +555,13 @@ private:
     CoordinatorMatch acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys, std::int32_t floor_tokens,
                                          PrefixProbe::Tier&& probe, std::uint64_t access_epoch);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
+    // Registers table slots [first_cache_block, first_cache_block +
+    // keys.size()) at logical blocks from first_logical_block on.
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
-                                 std::int32_t first_cache_block, std::uint64_t access_epoch,
-                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
+                                 std::int32_t first_cache_block, std::int32_t first_logical_block,
+                                 std::uint64_t access_epoch, CacheBoundaryKind boundary_kind,
+                                 bool stream_completed_to_host);
     // Registers blocks[j] under keys[j] (logical block first_logical_block + j)
     // and reports and streams what was newly cached; cacheFullBlocksForGroup
     // passes a table window, an in-forward State checkpoint its own block.
@@ -553,20 +570,27 @@ private:
                              std::int32_t first_logical_block, std::uint64_t access_epoch,
                              CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
     // One run of table slots a publication registers in a group, the key of
-    // each (keys[j] is slot first_cache_block + j), and the boundary kind it
-    // registers them under.
+    // each (keys[j] is slot first_cache_block + j), the logical block it
+    // registers keys[0] at -- the slot itself for a History group, the
+    // boundary's full-page count for a State group's slot 1, so eviction can
+    // tell a deeper checkpoint from a shallower one -- and the boundary kind.
     struct PublishedRange {
         std::int32_t first_cache_block{0};
+        std::int32_t first_logical_block{0};
         std::vector<CacheKey> keys;
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     };
     // What publishing `completed` covers in one group -- every newly hashed
     // page plus the tail's blocks of a prefix-closed group, the blocks holding
     // the window behind the newest boundary of a sliding group, slot 1 of a
-    // State group at a non-chunk point, nothing for a replayable one.
+    // State group at a point that publishes state (unless it is keyed by an
+    // earlier page whose KV left the Device), nothing for a replayable one.
     // The one source for cacheCompletedBlocksForGroup and for
     // PublishedDataSlotsAfter.
     std::vector<PublishedRange> completedBlockRanges(std::size_t group_index, const CompletedPages& completed) const;
+    // Whether every token-spanned group that publishes holds the KV of the
+    // prefix page under page_hash on the Device.
+    bool deviceHoldsPageKv(const ContentHash& page_hash) const;
     // The key of table slot `block` of a History group at a publication point:
     // its page's chain hash below the full pages, the tail hash from there on.
     CacheKey historyBlockKey(std::size_t group_index, const CompletedPages& completed, std::int32_t block) const;
@@ -582,9 +606,13 @@ private:
     // Evicts every group's Device entries under a tail hash: a tail's blocks
     // are usable only together, so they leave together.
     void evictTailEntries(const ContentHash& hash, std::int32_t tail_tokens);
+    // Device eviction of one entry and of the entries usable only with it:
+    // every group's blocks of a tail, the State checkpoints under a KV page's
+    // chain hash, and the other State groups' blocks of an unproven-kind
+    // (kChunk) State checkpoint.
     bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location);
-    // Device eviction of one entry without the tail cascade; the cascade
-    // calls it for the companions of the block that left.
+    // Device eviction of one entry without the cascades; they call it for the
+    // companions of the block that left.
     bool evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location);
     bool evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location);
     std::optional<CacheBlockLocation> deviceLocationOf(std::size_t group_index, const CacheKey& key) const;
@@ -616,6 +644,7 @@ private:
     std::int32_t prefix_granularity_{0};
     std::int32_t replay_window_tokens_{0};
     std::uint64_t next_access_epoch_{0};
+    std::int64_t unproven_state_checkpoint_trims_{0};
     TailTable tails_;
     std::vector<StoreCandidate> pending_stores_;
     CacheMutationSink cache_mutation_sink_;

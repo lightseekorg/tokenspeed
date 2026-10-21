@@ -30,10 +30,13 @@ namespace tokenspeed {
 // shaped by what the cache groups need: a junction cut when a hit's KV
 // coverage reached further than its state checkpoint; for replayable groups
 // the re-fed window is debited from a hit chunk's budget and a prompt's final
-// chunk is never shorter than the window (ChunkKeepingFinalWindow). Every
-// function here is pure token arithmetic on the coordinator's facts; the
-// forward planner calls PrefillChunkTokens and never branches on a group kind
-// itself.
+// chunk is never shorter than the window (ChunkKeepingFinalWindow). The
+// opt-in State checkpoint modes may then round a chunk down to a page
+// (ChunkEndingOnFrequentStateCheckpoint, and the forward planner's shaping
+// toward an in-forward checkpoint); no chunk is ever cut at a fixed position.
+// Every function here is pure token arithmetic on the coordinator's facts;
+// the forward planner calls PrefillChunkTokens and never branches on a group
+// kind itself.
 
 // The page boundary before a long prompt's replay tail where a reusable
 // State checkpoint is worth writing: a later prompt that resends this one or
@@ -45,6 +48,24 @@ namespace tokenspeed {
 // state there (SchedulerConfig::state_checkpoint_in_forward); no chunk is cut.
 std::int32_t PrefillStateCheckpointTokens(const CacheCoordinator& coordinator, std::int32_t prompt_tokens,
                                           std::int32_t chunk_budget, std::int32_t prefix_replay_tokens);
+
+// Whether a local prefill chunk ending at boundary_tokens leaves a frequent
+// State checkpoint (SchedulerConfig::frequent_state_checkpoints): a page
+// boundary at least one chunk budget before the prompt end. The prompt's last
+// budget is left to its prompt-end and in-forward checkpoints, so a follow-up
+// that computes little past its hit is chunked as without the mode.
+bool FrequentStateCheckpointAt(std::int32_t boundary_tokens, std::int32_t prompt_tokens, std::int32_t chunk_budget,
+                               std::int32_t prefix_granularity);
+
+// The tokens a local prefill chunk [first_pos, first_pos + tokens) takes when
+// frequent State checkpoints are on: a chunk that ends past a page that is a
+// frequent checkpoint (FrequentStateCheckpointAt) and lies after first_pos
+// ends on that page instead, moving fewer than one page of tokens to the next
+// chunk. A chunk completing the prompt or ending at the junction
+// (junction_tokens, 0 when none) is unchanged.
+std::int32_t ChunkEndingOnFrequentStateCheckpoint(std::int32_t first_pos, std::int32_t tokens,
+                                                  std::int32_t prompt_tokens, std::int32_t junction_tokens,
+                                                  std::int32_t chunk_budget, std::int32_t prefix_granularity);
 
 // Chunk size that never leaves the prompt's final chunk shorter than
 // replay_window: bounded replay narrows the model's decoder to the prompt's

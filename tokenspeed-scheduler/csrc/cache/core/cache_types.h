@@ -37,10 +37,14 @@
 namespace tokenspeed {
 
 // Where a published boundary came from: an interior chunk end or decode
-// step (kChunk), or a point the owner stopped at -- prompt end, finish,
-// retraction, a junction cut (kEndpoint). Eviction ranks an unproven kChunk
-// boundary of a non-closed group behind the rest. The declaration order
-// ranks the kinds: a block republished at a later point keeps the higher one.
+// step (kChunk) -- for a State group, a frequent checkpoint
+// (SchedulerConfig::frequent_state_checkpoints) -- or a point the owner
+// stopped at: prompt end, finish, retraction, a junction cut, an in-forward
+// checkpoint (kEndpoint). Eviction takes an unproven kChunk boundary of a
+// non-closed group (never acquired by a hit) first within its access epoch,
+// and a State group's -- an unproven checkpoint -- before every epoch. The
+// declaration order ranks the kinds: a block republished at a later point
+// keeps the higher one.
 enum class CacheBoundaryKind { kChunk, kEndpoint };
 
 using CacheNamespaceId = std::uint32_t;
@@ -194,11 +198,13 @@ struct CompletedPages {
     // is published in place. Only an admission may set it: the copy needs the
     // transaction's capacity.
     bool owner_continues{false};
-    // This point is a natural checkpoint of the recurrent state (prompt end,
-    // finish, retraction, a junction-cut chunk end): every State group
+    // This point is a checkpoint of the recurrent state -- a natural one
+    // (prompt end, finish, retraction, a junction-cut chunk end) or a
+    // frequent chunk end (boundary_kind kChunk) -- so every State group
     // publishes slot 1 -- the block the forward that ended here wrote --
     // under the point's hash (the chain hash when aligned, the tail hash
-    // otherwise). Ordinary chunk ends and decode steps publish no state.
+    // otherwise), at logical index prefix_hashes.size(). Other chunk ends and
+    // decode steps publish no state.
     bool publish_state{false};
     // An in-forward State checkpoint an earlier forward wrote at the page
     // boundary prefix_hashes[state_checkpoint_pages - 1]: every State group
@@ -208,8 +214,10 @@ struct CompletedPages {
     std::span<CacheBlockRef> state_checkpoint_blocks{};
     // Which kind of boundary the publication ends on (eviction provenance).
     CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
-    // Prefill streams newly published history and state to Host. Decode
-    // leaves this false; only sliding windows keep streaming.
+    // Prefill streams newly published history and state to Host, except a
+    // frequent State checkpoint, which stays on the Device until a hit
+    // promotes it. Decode leaves this false; only sliding windows keep
+    // streaming.
     bool stream_completed_to_host{false};
 };
 

@@ -46,6 +46,7 @@ from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.engine.event_loop import (  # noqa: E402
     scheduler_config_from_args,
 )
+from tokenspeed.runtime.engine.scheduler_utils import make_config  # noqa: E402
 from tokenspeed.runtime.utils.server_args import (  # noqa: E402
     ServerArgs,
     prepare_server_args,
@@ -165,3 +166,106 @@ def test_a_decode_server_takes_the_in_forward_state_checkpoint_flag_as_a_no_op()
     assert not args.writes_state_checkpoints_in_forward
     cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=5, max_retracted=8))
     assert not cfg.state_checkpoint_in_forward
+
+
+def test_frequent_state_checkpoints_are_off_by_default():
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8"])
+    assert not args.writes_frequent_state_checkpoints
+    assert args.max_unproven_state_checkpoints is None
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.frequent_state_checkpoints is False
+    assert cfg.max_unproven_state_checkpoints == 0
+
+
+def test_frequent_state_checkpoints_and_their_cap_reach_the_scheduler():
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--enable-frequent-state-checkpoints",
+            "--max-unproven-state-checkpoints",
+            "16",
+        ]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.frequent_state_checkpoints is True
+    assert cfg.max_unproven_state_checkpoints == 16
+
+
+@pytest.mark.parametrize(
+    "flags, match",
+    [
+        (["--enable-frequent-state-checkpoints"], "requires --max-unproven"),
+        (["--max-unproven-state-checkpoints", "16"], "belongs to"),
+        (
+            [
+                "--enable-frequent-state-checkpoints",
+                "--max-unproven-state-checkpoints",
+                "0",
+            ],
+            "at least 1",
+        ),
+    ],
+)
+def test_frequent_state_checkpoints_and_their_cap_are_given_together(flags, match):
+    # The cap trades Device capacity against reuse: no silent default.
+    with pytest.raises(ValueError, match=match):
+        prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+
+
+def test_frequent_state_checkpoints_are_refused_without_prefix_caching():
+    # Their checkpoints are only reachable through a prefix hit.
+    with pytest.raises(ValueError, match="requires prefix caching"):
+        ServerArgs(
+            model="x",
+            max_num_seqs=8,
+            disable_kvstore=True,
+            enable_prefix_caching=False,
+            enable_frequent_state_checkpoints=True,
+            max_unproven_state_checkpoints=16,
+        )
+
+
+def test_a_decode_server_takes_frequent_state_checkpoints_as_a_no_op():
+    # A decode server computes no prompt, so a PD launcher may pass the flags
+    # to both roles while disabling prefix caching only on decode.
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode="decode",
+        disaggregation_transfer_backend="mooncake",
+        disable_kvstore=True,
+        enable_prefix_caching=False,
+        enable_frequent_state_checkpoints=True,
+        max_unproven_state_checkpoints=16,
+    )
+    assert not args.writes_frequent_state_checkpoints
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=5, max_retracted=8))
+    assert cfg.frequent_state_checkpoints is False
+    assert cfg.max_unproven_state_checkpoints == 0
+
+
+@pytest.mark.parametrize("frequent, cap", [(True, 0), (False, 4), (True, -1)])
+def test_make_config_ties_the_cap_to_frequent_state_checkpoints(frequent, cap):
+    with pytest.raises(ValueError, match="max_unproven_state_checkpoints"):
+        make_config(
+            num_device_pages=32,
+            max_scheduled_tokens=64,
+            max_batch_size=8,
+            prefix_granularity=2,
+            num_host_pages=0,
+            disable_l2_cache=True,
+            enable_l3_storage=False,
+            role="fused",
+            num_snapshot_pages=1,
+            max_retracted_requests=0,
+            storage_config=None,
+            frequent_state_checkpoints=frequent,
+            max_unproven_state_checkpoints=cap,
+        )

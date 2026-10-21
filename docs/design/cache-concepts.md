@@ -253,14 +253,19 @@ A **natural checkpoint** is a state block that exists because a forward ended
 there -- the prompt end (the block rotated out of slot 1 as the first decode
 runs), the finish (slot 1 in place), the chunk the junction cut ended, or the
 retraction image -- published under the hash of that token count, page
-boundary or not. The one interior checkpoint is opt-in
-(`--enable-state-checkpoint-in-forward`): the forward that spans a long
+boundary or not. Two kinds of interior checkpoint are opt-in. With
+`--enable-state-checkpoint-in-forward` the forward that spans a long
 prompt's last page boundary before its replay tail also stores the state at
 that boundary into a third block of its rows (`STATE_CHECKPOINT_SLOT`,
 `InForwardStateCheckpoints`) -- the GDN scan emits it from inside the kernel,
 the conv and PLE windows are the inputs before it -- which is then published
-like a natural checkpoint
-([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
+like a natural checkpoint. With `--enable-frequent-state-checkpoints` a
+prefill chunk end on a page at least one chunk before the prompt end
+publishes its slot 1 like a natural checkpoint, as an unproven one the cache
+evicts first and keeps off Host until a hit claims it; that needs nothing of
+the backend
+([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)
+for both).
 No scan is split into body and tail, and no state group declares a token
 span: a hit resumes
 at the published token count `T` exactly, with its state in slot 0 and the KV
@@ -431,8 +436,8 @@ slot; `scheduler.md` §2 and §4 describe the FSM side):
   copy of it. A published block is never written again, so the restore
   copies the victim's tail blocks into fresh blocks instead of claiming them;
 * the **tail** — every block of a group L2 never holds (a drafter-private
-  group, a replayable group's private pages, a state group's unpublished
-  slot 0, a partial page the index did not take) and the request's slot-state
+  group, a replayable group's private pages, a state group's unpublished or
+  unproven slot 0, a partial page the index did not take) and the request's slot-state
   blob — goes to the **retraction snapshot pool**: a small, request-private, pinned pool
   sized like the Host L2 tier (an explicit `--retraction-snapshot-host-gb`,
   else `--retraction-snapshot-ratio` of the Device KV, else derived: by
@@ -806,12 +811,21 @@ Its responsibilities:
   to special-case.
   A State group publishes its slot 1 — the state after exactly `T` tokens —
   under the same key as the KV at `T` (the chain hash of the last page, or
-  `hash@T` for a tail), and only at a point where the owner stops writing it
+  `hash@T` for a tail), at the logical index of its full-page count, and only
+  at a point where the owner stops writing it
   (`CompletedPages::publish_state`: a prompt end, a junction cut, finish,
-  retraction); a chunk end or decode step publishes no state (see
+  retraction); a chunk end or decode step publishes no state, except a
+  frequent checkpoint's page-aligned chunk end, published with kind `kChunk`
+  (see
   [Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
   Evicting a History block under a chain hash evicts the state checkpoints
-  under that hash as well, so a state never outlives the KV it continues.
+  under that hash as well, so a state never outlives the KV it continues; a
+  state keyed by a page an earlier point published (a restored request
+  resuming at its retraction frontier, on private copies of its pages
+  without a Host cache) is published only while every KV group holds that
+  page on the Device. Evicting one State group's block of a `kChunk`
+  checkpoint evicts the other State groups' blocks of it, which are useless
+  alone.
   Replayable groups are outside `match_order_` and skip publication on both
   tiers — never registered, never streamed to Host, never counted by
   `DeviceBoundaryResidency` — because their rows are approximations the
@@ -828,14 +842,19 @@ Its responsibilities:
   publishes history-cache Device entries but streams none of them and
   publishes no state. At finish — and at the PD transfer ACK — every entry the
   request published (pages, tail, state slot 1) is queued before request
-  ownership is released. Ordinary sliding-window entries always stream when
+  ownership is released. An unproven State checkpoint — a frequent one no hit
+  has claimed — is neither streamed at its publication nor queued at a
+  finish, and a retraction image carries it in the snapshot pool rather than
+  as an L2 entry; a hit promotes it, and the hitter's finish queues it like
+  any entry under its chain hashes. Ordinary sliding-window entries always stream when
   published. The queue is drained by
   `TierTransferManager::StartPendingStores(guard)`, and every store it
   issues pins its Device sources until the ACK. A retraction does not use the
   queue: the scheduler publishes the victim's computed prefix the same way,
   `CacheCoordinator::PublishedDataSlots` names the data slots that are
   published entries (with the key, logical index, and boundary kind each was
-  published under), `TierTransferManager::StartRetractionStores` gives those
+  published under; an unproven State checkpoint is left out, so it stays off
+  Host), `TierTransferManager::StartRetractionStores` gives those
   their Host blocks — keys already Host-cached, or carried by a store in
   flight, are pinned; the rest become one stream-ordered write-back whose
   Host entries the image pins — and `CacheCoordinator::TakeImage` places only
@@ -972,6 +991,17 @@ then tier (uncached request-only block → probationary boundary → established
 boundary → suffix of a closed prefix). Finally, walk the selected blocks in
 reverse and restore every block that is not strictly required, yielding a
 minimal eviction set in `victims`.
+
+One tier goes before the epochs: an unproven State checkpoint (a frequent
+one -- kind `kChunk`, never hit, logical index its page depth) leaves after
+the uncached blocks and before every other entry, whatever their epochs:
+the oldest epoch's first, the shallowest first within one, so a chain keeps
+its deepest one. A group's cursor reaches a newer epoch only after the
+older ones, so these are gathered from the State groups' indexes up front
+(a State group caches few, large blocks) and the cursors skip them. How
+many stay cached when nothing presses is bounded besides, by
+`CacheCoordinator::TrimUnprovenStateCheckpoints` after each publication
+([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
 
 Each cache group uses a non-owning cursor over its tier's eviction index.
 It advances continuously, skips fully pinned epochs, and returns complete

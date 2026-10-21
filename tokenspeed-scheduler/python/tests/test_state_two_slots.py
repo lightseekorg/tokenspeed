@@ -88,6 +88,14 @@ def _finish(scheduler, request_id: str) -> None:
     scheduler.advance(ec)
 
 
+def _abort(scheduler, request_id: str) -> None:
+    ec = ts.ExecutionEvent()
+    ev = ts.ForwardEvent.Abort()
+    ev.request_id = request_id
+    ec.add_event(ev)
+    scheduler.advance(ec)
+
+
 def _dispatched(plan) -> list:
     """Forward batches that actually carry requests (the plan may hold an empty Batch)."""
     return [op for op in plan.forward if list(op.request_ids)]
@@ -266,3 +274,82 @@ class TestStateCheckpointInForward:
             assert {g: row[0] for g, row in second.items()} == {
                 g: row[2] for g, row in rows[1].items()
             }, "resumes from the in-forward checkpoint's blocks"
+
+
+class TestFrequentStateCheckpoints:
+    """``SchedulerConfig.frequent_state_checkpoints``: a prefill chunk end on a
+    page at least one chunk budget before the prompt end publishes every State
+    group's live slot there as an unproven checkpoint, so a later prompt that
+    diverges after it resumes there; ``max_unproven_state_checkpoints`` caps how
+    many of them the Device cache keeps."""
+
+    @staticmethod
+    def _config(frequent: bool, cap: int) -> "ts.SchedulerConfig":
+        cfg = _fused_config(decode_input_tokens=1)
+        cfg.max_scheduled_tokens = 4
+        cfg.frequent_state_checkpoints = frequent
+        cfg.max_unproven_state_checkpoints = cap
+        return cfg
+
+    @staticmethod
+    def _run_prefill(scheduler, request_id: str, prompt: list[int]):
+        """Plans a cold prompt's chunks alone to its end, landing each; returns
+        the chunk sizes and each chunk's State rows."""
+        chunks: list[int] = []
+        rows: list[dict[str, list[int]]] = []
+        while sum(chunks) < len(prompt) and len(chunks) < 8:
+            [batch] = _dispatched(scheduler.next_execution_plan())
+            chunks.append(list(batch.input_lengths)[0])
+            rows.append(_state_rows(batch, request_id))
+            _advance(scheduler, request_id, [201] if sum(chunks) == len(prompt) else [])
+        return chunks, rows
+
+    @pytest.mark.parametrize("frequent", [False, True])
+    def test_a_prompt_diverging_after_a_chunk_end_resumes_there(self, frequent):
+        scheduler = ts.Scheduler(self._config(frequent, cap=8 if frequent else 0))
+        prompt = list(range(1, 12))
+        scheduler.submit_requests([_spec("seed", prompt, MAX_NEW_TOKENS)])
+        chunks, rows = self._run_prefill(scheduler, "seed", prompt)
+        # The budget alone cuts the chunks; the chunk end 4 lies a budget
+        # before the prompt end (4 + 4 <= 11), 8 does not.
+        assert chunks == [4, 4, 3]
+        _finish(scheduler, "seed")
+        scheduler.next_execution_plan()
+
+        scheduler.submit_requests(
+            [_spec("second", prompt[:5] + [99, 98], MAX_NEW_TOKENS)]
+        )
+        [batch] = _dispatched(scheduler.next_execution_plan())
+        assert list(batch.extend_prefix_lens) == [4 if frequent else 0]
+        if frequent:
+            second = _state_rows(batch, "second")
+            assert {g: row[0] for g, row in second.items()} == {
+                g: row[1] for g, row in rows[0].items()
+            }, "resumes from the first chunk's live slot"
+
+    def test_the_mode_and_its_cap_are_stated_together(self):
+        with pytest.raises(ValueError, match="max_unproven_state_checkpoints"):
+            ts.Scheduler(self._config(True, cap=0))
+        with pytest.raises(ValueError, match="max_unproven_state_checkpoints"):
+            ts.Scheduler(self._config(False, cap=4))
+
+    def test_the_cap_evicts_the_shallowest_checkpoint(self):
+        scheduler = ts.Scheduler(self._config(True, cap=1))
+        prompt = list(range(1, 16))
+        scheduler.submit_requests([_spec("seed", prompt, MAX_NEW_TOKENS)])
+        chunks, _ = self._run_prefill(scheduler, "seed", prompt)
+        assert chunks == [4, 4, 4, 3]
+        # The chunk ends 4 and 8 are checkpoints; publishing 8 evicts 4.
+        assert scheduler.unproven_state_checkpoint_trims() == 1
+        _finish(scheduler, "seed")
+        scheduler.next_execution_plan()
+        for shared, resumed in ((5, 0), (9, 8)):
+            rid = f"diverges{shared}"
+            scheduler.submit_requests(
+                [_spec(rid, prompt[:shared] + [99, 98], MAX_NEW_TOKENS)]
+            )
+            [batch] = _dispatched(scheduler.next_execution_plan())
+            assert list(batch.request_ids) == [rid]
+            assert list(batch.extend_prefix_lens) == [resumed], rid
+            _abort(scheduler, rid)
+            scheduler.next_execution_plan()

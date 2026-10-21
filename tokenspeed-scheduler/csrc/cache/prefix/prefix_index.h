@@ -85,6 +85,14 @@ public:
         CachedBlockMetadata metadata;
     };
 
+    // One entry, pinned or not: its metadata and whether an owner besides the
+    // index (a request table, a transfer) holds its block.
+    struct EntryView {
+        CacheBlockLocation location;
+        CachedBlockMetadata metadata;
+        bool pinned{false};
+    };
+
     explicit PrefixCacheIndex(std::uint32_t group_id) : group_id_{group_id} {}
 
     PrefixCacheIndex(const PrefixCacheIndex&) = delete;
@@ -277,6 +285,25 @@ public:
             }
         }
         return candidates;
+    }
+
+    // Every entry of one tier, pinned ones included, in no particular order:
+    // for a policy that counts the entries it cannot evict as well.
+    std::vector<EntryView> Entries(const BlockPool& pool) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return {};
+        }
+        std::vector<EntryView> entries;
+        entries.reserve(cache_index->entries.size());
+        for (const CacheEntry& cache_entry : cache_index->entries) {
+            entries.push_back(EntryView{
+                .location = cache_entry.block_ref->Location(),
+                .metadata = metadataOf(cache_entry),
+                .pinned = !cache_entry.block_ref.unique(),
+            });
+        }
+        return entries;
     }
 
     std::optional<CacheKey> Evict(const BlockPool& pool, CacheBlockLocation location) {

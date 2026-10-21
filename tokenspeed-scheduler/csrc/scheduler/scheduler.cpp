@@ -290,7 +290,15 @@ void Scheduler::registerKvEventPrefixPages(const Request& request, std::span<con
 
 void Scheduler::registerKvEventPublication(const Request& request, std::span<const std::string> prefix_hashes,
                                            const CompletedPages& completed) {
-    registerKvEventPrefixPages(request, prefix_hashes, completed.first_new_prefix_page);
+    // A state published at a page boundary mutates that page's boundary even
+    // when the publication hashes no new page (a prefill resumed at the
+    // frontier its retraction hashed), so its descriptor is registered too;
+    // registering an existing descriptor again changes nothing.
+    std::int32_t first_page = completed.first_new_prefix_page;
+    if (completed.publish_state && !completed.tail && !prefix_hashes.empty()) {
+        first_page = std::min(first_page, static_cast<std::int32_t>(prefix_hashes.size()) - 1);
+    }
+    registerKvEventPrefixPages(request, prefix_hashes, first_page);
     if (!config_.enable_kv_cache_events || !completed.tail) {
         return;
     }

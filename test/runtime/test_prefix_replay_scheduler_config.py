@@ -31,6 +31,8 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
         num_snapshot_pages=1,
         max_retracted_requests=0,
         storage_config=None,
+        frequent_state_checkpoints=False,
+        max_unproven_state_checkpoints=0,
         **kwargs,
     )
 
@@ -152,6 +154,8 @@ def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> N
             if enable_l3_storage
             else None
         ),
+        frequent_state_checkpoints=False,
+        max_unproven_state_checkpoints=0,
         enable_kv_cache_events=False,
         decode_input_tokens=1,
         overlap_schedule_depth=0,

@@ -224,6 +224,8 @@ def _config(**overrides):
         num_snapshot_pages=1,
         max_retracted_requests=0,
         storage_config=None,
+        frequent_state_checkpoints=False,
+        max_unproven_state_checkpoints=0,
     )
     fields.update(overrides)
     return make_config(**fields)

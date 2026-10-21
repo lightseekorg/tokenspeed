@@ -169,6 +169,34 @@ TEST(PrefillStateCheckpointTest, LongPromptsLeaveAReusablePageBeforeTheirReplayT
     EXPECT_EQ(PrefillStateCheckpointTokens(replay, 30, 16, 0), 20) << "leave the largest replayable window";
 }
 
+TEST(FrequentStateCheckpointTest, APageAtLeastOneBudgetBeforeThePromptEndIsACheckpoint) {
+    // prompt 30, budget 8, page 4.
+    EXPECT_FALSE(FrequentStateCheckpointAt(0, 30, 8, 4)) << "the zero state needs no checkpoint";
+    EXPECT_FALSE(FrequentStateCheckpointAt(6, 30, 8, 4)) << "not on a page";
+    EXPECT_TRUE(FrequentStateCheckpointAt(4, 30, 8, 4));
+    EXPECT_TRUE(FrequentStateCheckpointAt(20, 30, 8, 4)) << "20 + 8 <= 30";
+    EXPECT_FALSE(FrequentStateCheckpointAt(24, 30, 8, 4)) << "inside the prompt's last budget";
+    EXPECT_FALSE(FrequentStateCheckpointAt(28, 30, 8, 4));
+    EXPECT_TRUE(FrequentStateCheckpointAt(24, 32, 8, 4)) << "exactly one budget before the end";
+}
+
+TEST(FrequentStateCheckpointTest, AChunkPassingACheckpointsPageEndsOnIt) {
+    // (first_pos, tokens, prompt, junction, budget, page)
+    EXPECT_EQ(ChunkEndingOnFrequentStateCheckpoint(0, 7, 30, 0, 8, 4), 4) << "rounded down to the page";
+    EXPECT_EQ(ChunkEndingOnFrequentStateCheckpoint(4, 7, 30, 0, 8, 4), 4);
+    EXPECT_EQ(ChunkEndingOnFrequentStateCheckpoint(0, 8, 30, 0, 8, 4), 8) << "already on a checkpoint's page";
+    EXPECT_EQ(ChunkEndingOnFrequentStateCheckpoint(22, 8, 40, 0, 8, 4), 6)
+        << "a chunk starting inside a page after a tail hit ends on the next page";
+    // Unchanged: the prompt end, the junction, no page past first_pos, and a
+    // page inside the prompt's last budget.
+    EXPECT_EQ(ChunkEndingOnFrequentStateCheckpoint(23, 7, 30, 0, 8, 4), 7) << "completes the prompt";
+    EXPECT_EQ(ChunkEndingOnFrequentStateCheckpoint(0, 7, 30, /*junction=*/7, 8, 4), 7) << "ends at the junction";
+    EXPECT_EQ(ChunkEndingOnFrequentStateCheckpoint(0, 7, 30, /*junction=*/9, 8, 4), 4) << "a junction beyond it";
+    EXPECT_EQ(ChunkEndingOnFrequentStateCheckpoint(5, 2, 30, 0, 8, 4), 2) << "no page boundary past first_pos";
+    EXPECT_EQ(ChunkEndingOnFrequentStateCheckpoint(20, 7, 30, 0, 8, 4), 7) << "24 lies inside the last budget";
+    EXPECT_EQ(ChunkEndingOnFrequentStateCheckpoint(16, 7, 30, 0, 8, 4), 4) << "20 does not";
+}
+
 TEST(MinPrefillChunkTokensTest, ReservesReplayPlusAWindowOrPage) {
     BlockPool pool(16, {1, 1, 1});
     // W = 8 > P = 4: replay plus another window.

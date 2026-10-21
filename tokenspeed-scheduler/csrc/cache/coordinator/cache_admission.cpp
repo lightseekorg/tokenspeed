@@ -133,12 +133,15 @@ public:
 
 private:
     // Current prefix hits are protected before candidates reach this policy.
-    // A request-only block with no CacheEntry is reclaimed first. Cached
-    // entries then compare request access epoch, followed within one epoch by
-    // the tier order below. Position keeps the deeper unproven non-closed
-    // boundary, while a closed prefix is reclaimed from its suffix.
+    // A request-only block with no CacheEntry is reclaimed first, then every
+    // unproven State checkpoint (a frequent one no hit has claimed) whatever
+    // its epoch. The other cached entries then compare request access epoch,
+    // followed within one epoch by the tier order below. Position keeps the
+    // deeper unproven non-closed boundary, while a closed prefix is reclaimed
+    // from its suffix.
     enum class EvictionTier {
         kUncached,  // physically allocated, but owned only by the request table
+        kUnprovenStateCheckpoint,
         kProbationaryBoundary,
         kEstablishedBoundary,
         kClosedPrefix,
@@ -153,8 +156,12 @@ private:
     };
 
     static auto evictionKey(const VictimCandidate& candidate) {
-        return std::tuple{candidate.last_access_epoch, candidate.eviction_tier,         candidate.position_rank,
-                          candidate.group_id,          candidate.location.lcm_block_id, candidate.location.slot_index};
+        // An uncached block has epoch 0, so it still leads the tiers that go
+        // before the epoch-ordered rest.
+        const bool epoch_ordered = candidate.eviction_tier > EvictionTier::kUnprovenStateCheckpoint;
+        return std::tuple{
+            epoch_ordered,      candidate.last_access_epoch,     candidate.eviction_tier,      candidate.position_rank,
+            candidate.group_id, candidate.location.lcm_block_id, candidate.location.slot_index};
     }
 
     static bool shouldEvictFirst(const VictimCandidate& lhs, const VictimCandidate& rhs) {
@@ -374,7 +381,8 @@ private:
                 return EvictionTier::kUncached;
             }
             if (is_probationary_boundary) {
-                return EvictionTier::kProbationaryBoundary;
+                return groups_[group_id].Spec().attn_kind == AttnKind::kState ? EvictionTier::kUnprovenStateCheckpoint
+                                                                              : EvictionTier::kProbationaryBoundary;
             }
             return is_prefix_closed ? EvictionTier::kClosedPrefix : EvictionTier::kEstablishedBoundary;
         }();
@@ -422,6 +430,7 @@ private:
         if (num_computed_tokens_) {
             collectRequestReclaimCandidates(*num_computed_tokens_);
         }
+        collectUnprovenStateCheckpoints();
 
         cache_group_candidates_.reserve(groups_.size());
         for (std::size_t i = 0; i < groups_.size(); ++i) {
@@ -491,6 +500,31 @@ private:
         std::ranges::sort(request_reclaim_candidates_, shouldEvictFirst);
     }
 
+    // The unpinned unproven State checkpoints of every epoch. They go before
+    // every epoch-ordered entry, but a group's cursor reaches a newer epoch
+    // only after the older ones, so they are gathered here (a State group
+    // caches few, large blocks) and the cursors skip them.
+    void collectUnprovenStateCheckpoints() {
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            if (groups_[i].Spec().attn_kind != AttnKind::kState) {
+                continue;
+            }
+            const auto group_id = static_cast<std::uint32_t>(i);
+            for (const PrefixCacheIndex::EvictionCandidate& entry : groups_[i].Index().EvictableCandidates(pool_)) {
+                if (protected_locations_.contains(entry.location) ||
+                    request_reclaim_locations_.contains(entry.location)) {
+                    continue;
+                }
+                const VictimCandidate candidate = makeVictimCandidate(group_id, entry.location, entry.metadata);
+                if (candidate.eviction_tier == EvictionTier::kUnprovenStateCheckpoint) {
+                    unproven_state_locations_.insert(entry.location);
+                    unproven_state_candidates_.push_back(candidate);
+                }
+            }
+        }
+        std::ranges::sort(unproven_state_candidates_, shouldEvictFirst);
+    }
+
     bool ensureGroupCandidateAvailable(CacheGroupVictimCandidates& group) {
         if (group.next_candidate_index < group.candidates.size()) {
             return true;
@@ -507,7 +541,8 @@ private:
             }
             for (const PrefixCacheIndex::EvictionCandidate& entry : epoch_scratch_) {
                 if (protected_locations_.contains(entry.location) ||
-                    request_reclaim_locations_.contains(entry.location)) {
+                    request_reclaim_locations_.contains(entry.location) ||
+                    unproven_state_locations_.contains(entry.location)) {
                     continue;
                 }
                 group.candidates.push_back(makeVictimCandidate(group.group_id, entry.location, entry.metadata));
@@ -534,18 +569,27 @@ private:
             }
         }
 
-        if (next_request_candidate_index_ < request_reclaim_candidates_.size()) {
-            const VictimCandidate& request_candidate = request_reclaim_candidates_[next_request_candidate_index_];
-            if (selected_group == nullptr || shouldEvictFirst(request_candidate, selected_group->CurrentCandidate())) {
-                ++next_request_candidate_index_;
-                return request_candidate;
+        // The lists gathered up front compete with the groups' current
+        // candidates under the same key.
+        const VictimCandidate* best = selected_group == nullptr ? nullptr : &selected_group->CurrentCandidate();
+        std::size_t* chosen_list_index = nullptr;
+        const auto consider = [&](const std::vector<VictimCandidate>& list, std::size_t& next_index) {
+            if (next_index < list.size() && (best == nullptr || shouldEvictFirst(list[next_index], *best))) {
+                best = &list[next_index];
+                chosen_list_index = &next_index;
             }
-        }
-        if (selected_group == nullptr) {
+        };
+        consider(request_reclaim_candidates_, next_request_candidate_index_);
+        consider(unproven_state_candidates_, next_unproven_state_candidate_index_);
+        if (best == nullptr) {
             return std::nullopt;
         }
-        const VictimCandidate candidate = selected_group->CurrentCandidate();
-        ++selected_group->next_candidate_index;
+        const VictimCandidate candidate = *best;
+        if (chosen_list_index != nullptr) {
+            ++*chosen_list_index;
+        } else {
+            ++selected_group->next_candidate_index;
+        }
         return candidate;
     }
 
@@ -642,6 +686,9 @@ private:
     std::int64_t empty_parent_count_{0};
     std::vector<VictimCandidate> request_reclaim_candidates_;
     std::size_t next_request_candidate_index_{0};
+    std::vector<VictimCandidate> unproven_state_candidates_;
+    std::size_t next_unproven_state_candidate_index_{0};
+    std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> unproven_state_locations_;
     std::vector<CacheGroupVictimCandidates> cache_group_candidates_;
     std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> protected_locations_;
     std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> request_reclaim_locations_;

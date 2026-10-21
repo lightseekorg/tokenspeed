@@ -696,6 +696,60 @@ TEST(SchedulerConfigValidateTest, StateCheckpointInForwardRequiresPrefixCaching)
     }
 }
 
+TEST(SchedulerConfigValidateTest, FrequentStateCheckpointsNeedPrefixCachingAndAnExplicitCap) {
+    SchedulerConfig config = MakeValidConfig();
+    config.frequent_state_checkpoints = true;
+    config.max_unproven_state_checkpoints = 1;
+    EXPECT_NO_THROW(config.Validate());
+    config.max_unproven_state_checkpoints = 64;
+    EXPECT_NO_THROW(config.Validate());
+
+    // The cap is stated with the mode and only with it: no silent default.
+    config.max_unproven_state_checkpoints = 0;
+    try {
+        config.Validate();
+        FAIL() << "the mode without a cap must be rejected";
+    } catch (const std::invalid_argument& error) {
+        EXPECT_NE(std::string(error.what()).find("--max-unproven-state-checkpoints"), std::string::npos)
+            << error.what();
+    }
+    config.frequent_state_checkpoints = false;
+    EXPECT_NO_THROW(config.Validate());
+    config.max_unproven_state_checkpoints = 8;
+    EXPECT_THROW(config.Validate(), std::invalid_argument) << "a cap without the mode";
+    config.max_unproven_state_checkpoints = -1;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+
+    // Its checkpoints are reachable only through a prefix hit; the D role
+    // computes no prompt and takes the flag as a no-op (PD launchers share
+    // one argument list between the roles).
+    for (const Role role : {Role::kFused, Role::kP, Role::kD}) {
+        SCOPED_TRACE(static_cast<int>(role));
+        SchedulerConfig cfg = MakeValidConfig();
+        cfg.role = role;
+        if (role != Role::kFused) {
+            for (CacheGroupConfig& group : cfg.cache_groups) {
+                group.transfer_policy = CacheTransferPolicy::FullSuffix;
+            }
+        }
+        SetTestSnapshotPool(cfg);
+        cfg.frequent_state_checkpoints = true;
+        cfg.max_unproven_state_checkpoints = 16;
+        cfg.disable_prefix_cache = true;
+        if (role == Role::kD) {
+            EXPECT_NO_THROW(cfg.Validate());
+        } else {
+            try {
+                cfg.Validate();
+                FAIL() << "the mode without prefix caching must be rejected";
+            } catch (const std::invalid_argument& error) {
+                EXPECT_NE(std::string(error.what()).find("--enable-frequent-state-checkpoints"), std::string::npos)
+                    << error.what();
+            }
+        }
+    }
+}
+
 TEST(SchedulerConfigValidateTest, SnapshotPoolAndRetractedSlotsAreStatedTogether) {
     // The pool is explicit on every role: 0 pages says nothing, the null page
     // alone says "never retract" (and takes no blob slots), anything above it

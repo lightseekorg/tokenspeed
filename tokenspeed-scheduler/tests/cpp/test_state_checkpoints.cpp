@@ -21,9 +21,9 @@
 // Recurrent-state groups through the Scheduler: the two-slot table (slot 0
 // the checkpoint a forward reads, slot 1 the block it writes) rotating through
 // prefill chunks, the first decode and later decodes; natural checkpoints
-// published at prompt end, finish and retraction only; hits resuming from
-// them; the two-blocks-per-request capacity; and the retraction image of
-// both slots.
+// published at prompt end, finish and retraction; the opt-in in-forward and
+// frequent checkpoints; hits resuming from them; the two-blocks-per-request
+// capacity; and the retraction image of both slots.
 
 #include <gtest/gtest.h>
 
@@ -31,7 +31,9 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -137,6 +139,108 @@ protected:
         PlanOnce();
         return resume;
     }
+
+    // The first `shared` tokens of `tokens`, then two of the prompt's own:
+    // a prompt that diverges from `tokens` after `shared` tokens.
+    static std::vector<std::int32_t> Diverging(const std::vector<std::int32_t>& tokens, std::int32_t shared) {
+        std::vector<std::int32_t> out(tokens.begin(), tokens.begin() + shared);
+        out.push_back(990);
+        out.push_back(991);
+        return out;
+    }
+
+    // The (group id, content hash) rows of every write-back a plan issues.
+    static std::vector<std::pair<std::uint32_t, std::string>> WriteBackRows(const ExecutionPlan& plan) {
+        std::vector<std::pair<std::uint32_t, std::string>> rows;
+        for (const CacheOperation& operation : ExtractCacheOpsOfKind<WriteBackBatch>(plan)) {
+            const auto& batch = std::get<WriteBackBatch>(operation);
+            for (std::size_t op = 0; op < batch.op_ids.size(); ++op) {
+                for (std::size_t row = 0; row < batch.group_ids[op].size(); ++row) {
+                    rows.emplace_back(batch.group_ids[op][row], batch.content_hashes[op][row]);
+                }
+            }
+        }
+        return rows;
+    }
+
+    // One prefill forward of a request, as the planner shaped it.
+    struct Chunk {
+        std::int32_t prefix_tokens{0};
+        std::int32_t tokens{0};
+        std::int32_t checkpoint_len{0};
+        // The state0..state2 rows.
+        std::vector<std::vector<std::int32_t>> state_rows;
+        std::vector<std::int32_t> zeroed_state0;
+        // The rows of the plan's write-backs (WriteBackRows).
+        std::vector<std::pair<std::uint32_t, std::string>> write_backs;
+    };
+
+    // Plans `id`'s prefill from its hit to its end, alone in each batch,
+    // landing every forward (the last with a sampled token).
+    std::vector<Chunk> RunPrefill(const std::string& id, std::int32_t prompt_tokens) {
+        std::vector<Chunk> chunks;
+        std::int32_t scheduled = 0;
+        for (int round = 0; scheduled < prompt_tokens && round < 16; ++round) {
+            const ExecutionPlan plan = PlanOnce();
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            ASSERT_TRUE_OR_RETURN(batch != nullptr && batch->request_ids == std::vector<std::string>{id}, chunks);
+            Chunk chunk{.prefix_tokens = batch->extend_prefix_lens.at(0),
+                        .tokens = batch->input_lengths.at(0),
+                        .checkpoint_len = batch->extend_state_checkpoint_lens.at(0),
+                        .zeroed_state0 = plan.pages_to_zero.at("state0"),
+                        .write_backs = WriteBackRows(plan)};
+            for (const std::string& group : {"state0", "state1", "state2"}) {
+                chunk.state_rows.push_back(StateRow(*batch, group, id));
+            }
+            scheduled = chunk.prefix_tokens + chunk.tokens;
+            chunks.push_back(std::move(chunk));
+            SendForwardDone(id,
+                            scheduled == prompt_tokens ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
+            AckWriteBacks(plan);
+        }
+        return chunks;
+    }
+
+    // Mixed mode (SchedulerConfig::enable_mixed_prefill_decode): one decoding
+    // request takes one token of every round's 8 and leaves 7 for a prefill.
+    void StartDecoding() {
+        Submit(RequestWithTokens("decoding", {501, 502, 503}));
+        AckWriteBacks(PlanOnce());
+        SendForwardDone("decoding", {800});
+    }
+
+    struct MixedPrefill {
+        std::vector<std::pair<std::int32_t, std::int32_t>> chunks;
+        std::int32_t checkpoint_len{0};
+        std::int32_t checkpoint_block{0};
+    };
+
+    // Plans `id`'s prefill beside the decode to its end, landing every round.
+    MixedPrefill RunPrefillBesideTheDecode(const std::string& id, std::int32_t prompt_tokens) {
+        MixedPrefill out;
+        for (std::int32_t round = 0; round < 12; ++round) {
+            const ExecutionPlan plan = PlanOnce();
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            ASSERT_TRUE_OR_RETURN(batch != nullptr && batch->request_ids.size() == 2u, out);
+            const auto row =
+                static_cast<std::size_t>(std::ranges::find(batch->request_ids, id) - batch->request_ids.begin());
+            ASSERT_TRUE_OR_RETURN(row < 2u, out);
+            const std::int32_t start = batch->extend_prefix_lens.at(row);
+            const std::int32_t end = start + batch->input_lengths.at(row);
+            out.chunks.emplace_back(start, end);
+            if (batch->extend_state_checkpoint_lens.at(row) > 0) {
+                out.checkpoint_len = batch->extend_state_checkpoint_lens.at(row);
+                out.checkpoint_block = StateRow(*batch, "state0", id).at(2);
+            }
+            AckWriteBacks(plan);
+            SendForwardDone("decoding", {801 + round});
+            SendForwardDone(id, end == prompt_tokens ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
+            if (end == prompt_tokens) {
+                break;
+            }
+        }
+        return out;
+    }
 };
 
 TEST_F(StateCheckpointSuite, TwoSlotsRotateThroughChunksTheFirstDecodeAndLaterDecodes) {
@@ -222,41 +326,6 @@ protected:
         SchedulerConfig cfg = StateCheckpointSuite::MakeConfig();
         cfg.state_checkpoint_in_forward = true;
         return cfg;
-    }
-
-    // One prefill forward of a request, as the planner shaped it.
-    struct Chunk {
-        std::int32_t prefix_tokens{0};
-        std::int32_t tokens{0};
-        std::int32_t checkpoint_len{0};
-        // The state0..state2 rows.
-        std::vector<std::vector<std::int32_t>> state_rows;
-        std::vector<std::int32_t> zeroed_state0;
-    };
-
-    // Plans `id`'s prefill from its hit to its end, alone in each batch,
-    // landing every forward (the last with a sampled token).
-    std::vector<Chunk> RunPrefill(const std::string& id, std::int32_t prompt_tokens) {
-        std::vector<Chunk> chunks;
-        std::int32_t scheduled = 0;
-        for (int round = 0; scheduled < prompt_tokens && round < 16; ++round) {
-            const ExecutionPlan plan = PlanOnce();
-            const ForwardBatch* batch = FindForwardBatch(plan);
-            ASSERT_TRUE_OR_RETURN(batch != nullptr && batch->request_ids == std::vector<std::string>{id}, chunks);
-            Chunk chunk{.prefix_tokens = batch->extend_prefix_lens.at(0),
-                        .tokens = batch->input_lengths.at(0),
-                        .checkpoint_len = batch->extend_state_checkpoint_lens.at(0),
-                        .zeroed_state0 = plan.pages_to_zero.at("state0")};
-            for (const std::string& group : {"state0", "state1", "state2"}) {
-                chunk.state_rows.push_back(StateRow(*batch, group, id));
-            }
-            scheduled = chunk.prefix_tokens + chunk.tokens;
-            chunks.push_back(std::move(chunk));
-            SendForwardDone(id,
-                            scheduled == prompt_tokens ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
-            AckWriteBacks(plan);
-        }
-        return chunks;
     }
 };
 
@@ -477,45 +546,6 @@ protected:
         SchedulerConfig cfg = StateCheckpointInForwardSuite::MakeConfig();
         cfg.enable_mixed_prefill_decode = true;
         return cfg;
-    }
-
-    void StartDecoding() {
-        Submit(RequestWithTokens("decoding", {501, 502, 503}));
-        AckWriteBacks(PlanOnce());
-        SendForwardDone("decoding", {800});
-    }
-
-    struct MixedPrefill {
-        std::vector<std::pair<std::int32_t, std::int32_t>> chunks;
-        std::int32_t checkpoint_len{0};
-        std::int32_t checkpoint_block{0};
-    };
-
-    // Plans `id`'s prefill beside the decode to its end, landing every round.
-    MixedPrefill RunPrefillBesideTheDecode(const std::string& id, std::int32_t prompt_tokens) {
-        MixedPrefill out;
-        for (std::int32_t round = 0; round < 12; ++round) {
-            const ExecutionPlan plan = PlanOnce();
-            const ForwardBatch* batch = FindForwardBatch(plan);
-            ASSERT_TRUE_OR_RETURN(batch != nullptr && batch->request_ids.size() == 2u, out);
-            const auto row =
-                static_cast<std::size_t>(std::ranges::find(batch->request_ids, id) - batch->request_ids.begin());
-            ASSERT_TRUE_OR_RETURN(row < 2u, out);
-            const std::int32_t start = batch->extend_prefix_lens.at(row);
-            const std::int32_t end = start + batch->input_lengths.at(row);
-            out.chunks.emplace_back(start, end);
-            if (batch->extend_state_checkpoint_lens.at(row) > 0) {
-                out.checkpoint_len = batch->extend_state_checkpoint_lens.at(row);
-                out.checkpoint_block = StateRow(*batch, "state0", id).at(2);
-            }
-            AckWriteBacks(plan);
-            SendForwardDone("decoding", {801 + round});
-            SendForwardDone(id, end == prompt_tokens ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
-            if (end == prompt_tokens) {
-                break;
-            }
-        }
-        return out;
     }
 };
 
@@ -1290,6 +1320,711 @@ TEST_F(StateCheckpointInForwardRetractionPoolSuite, ARetractedVictimIsRestoredIn
         EXPECT_TRUE(out.finished);
         ExpectEveryBlockFreeOrCacheOnly();
     }
+}
+
+// Frequent State checkpoints (SchedulerConfig::frequent_state_checkpoints):
+// a prefill chunk end on a page at least one chunk budget before the prompt
+// end publishes every State group's slot 1 at the next chunk's admission, so
+// a later prompt that diverges before the prompt's last budget resumes within
+// a chunk of its divergence. Each one is unproven -- trimmed to
+// max_unproven_state_checkpoints, oldest request first, shallowest first --
+// until a hit claims it or an endpoint republishes it.
+class FrequentStateCheckpointSuite : public StateCheckpointSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateCheckpointSuite::MakeConfig();
+        cfg.frequent_state_checkpoints = frequent_;
+        cfg.max_unproven_state_checkpoints = frequent_ ? cap_ : 0;
+        cfg.state_checkpoint_in_forward = in_forward_;
+        cfg.prefix_replay_tokens = prefix_replay_tokens_;
+        return cfg;
+    }
+
+    // Rebuilds the scheduler with the mode on or off and the given cap.
+    void ResetFrequent(bool frequent, std::int32_t cap, bool host_cache = false) {
+        frequent_ = frequent;
+        cap_ = cap;
+        Reset(host_cache, /*decode_width=*/1);
+    }
+
+    // Runs `id`'s prefill alone to its prompt end and finishes it there.
+    std::vector<Chunk> RunAndFinish(const std::string& id, std::vector<std::int32_t> tokens) {
+        const auto prompt_tokens = static_cast<std::int32_t>(tokens.size());
+        Submit(RequestWithTokens(id, std::move(tokens)));
+        std::vector<Chunk> chunks = RunPrefill(id, prompt_tokens);
+        SendFinish(id);
+        AckWriteBacks(PlanOnce());
+        return chunks;
+    }
+
+    bool frequent_{true};
+    std::int32_t cap_{8};
+    bool in_forward_{false};
+    std::int32_t prefix_replay_tokens_{0};
+};
+
+// A cold 34-token prompt keeps its 8-token chunks; 8, 16 and 24 are chunk
+// ends at least a budget before its end, 32 is not. Prompts diverging after
+// 13, 21, 29 and 33 tokens resume at the checkpoint before their divergence,
+// from the live slot the chunk ending there wrote; without the mode they
+// start over.
+TEST_F(FrequentStateCheckpointSuite, EveryChunkEndBeforeThePromptsLastBudgetIsACheckpoint) {
+    for (const bool frequent : {true, false}) {
+        SCOPED_TRACE(frequent);
+        ResetFrequent(frequent, /*cap=*/8);
+        const std::vector<std::int32_t> tokens = MakeTokens(34);
+        const std::vector<Chunk> chunks = RunAndFinish("seed", tokens);
+        ASSERT_EQ(chunks.size(), 5u);
+        for (std::size_t i = 0; i < chunks.size(); ++i) {
+            EXPECT_EQ(chunks[i].prefix_tokens, 8 * static_cast<std::int32_t>(i));
+            EXPECT_EQ(chunks[i].tokens, i < 4 ? 8 : 2);
+            EXPECT_EQ(chunks[i].checkpoint_len, 0);
+            EXPECT_EQ(chunks[i].state_rows[0].size(), 2u) << "no third block";
+        }
+        const std::vector<std::pair<std::int32_t, std::int32_t>> shared_and_checkpoint = {
+            {13, 8}, {21, 16}, {29, 24}, {33, 24}};
+        for (const auto& [shared, checkpoint] : shared_and_checkpoint) {
+            SCOPED_TRACE(shared);
+            const Resume resume = Probe("diverges" + std::to_string(shared), Diverging(tokens, shared));
+            EXPECT_EQ(resume.prefix_tokens, frequent ? checkpoint : 0);
+            if (frequent) {
+                EXPECT_EQ(resume.state_row.at(0), chunks[static_cast<std::size_t>(checkpoint / 8 - 1)].state_rows[0][1])
+                    << "the live slot of the chunk ending there";
+            }
+        }
+        EXPECT_EQ(scheduler_->UnprovenStateCheckpointTrims(), 0);
+    }
+}
+
+// The cap counts unproven checkpoints across requests. Under a cap of two the
+// first prompt keeps 16 and 24. The second prompt's checkpoints then evict
+// the older request's first -- 16, then 24 -- and then its own shallowest.
+// The first prompt's prompt-end checkpoint is established and stays, and so
+// does its KV.
+TEST_F(FrequentStateCheckpointSuite, TheCapEvictsTheOldestRequestsShallowestCheckpointsFirst) {
+    ResetFrequent(true, /*cap=*/2);
+    const std::vector<std::int32_t> first = MakeTokens(34);
+    RunAndFinish("first", first);
+    EXPECT_EQ(scheduler_->UnprovenStateCheckpointTrims(), 1) << "8 left when 24 was published";
+    // A hit promotes the checkpoint it claims, so the misses run first.
+    EXPECT_EQ(Probe("first13", Diverging(first, 13)).prefix_tokens, 0);
+
+    const std::vector<std::int32_t> second = MakeTokens(34, 1000);
+    RunAndFinish("second", second);
+    EXPECT_EQ(scheduler_->UnprovenStateCheckpointTrims(), 4);
+    EXPECT_EQ(Probe("first21", Diverging(first, 21)).prefix_tokens, 0);
+    EXPECT_EQ(Probe("first29", Diverging(first, 29)).prefix_tokens, 0);
+    EXPECT_EQ(Probe("second13", Diverging(second, 13)).prefix_tokens, 0);
+    EXPECT_EQ(Probe("first34", Diverging(first, 34)).prefix_tokens, 34) << "the first prompt's end";
+    EXPECT_EQ(Probe("second21", Diverging(second, 21)).prefix_tokens, 16);
+    EXPECT_EQ(Probe("second29", Diverging(second, 29)).prefix_tokens, 24);
+}
+
+// Pool pressure across requests: the planner evicts unproven checkpoints
+// before any established entry, whatever its access epoch.
+class FrequentStateCheckpointPressureSuite : public FrequentStateCheckpointSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FrequentStateCheckpointSuite::MakeConfig();
+        cfg.device_allocator.total_pages = pool_pages_;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = pool_pages_;
+        }
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    std::int32_t pool_pages_{257};
+};
+
+// A second, unrelated prompt that needs room takes the first prompt's
+// unproven checkpoints, then its own, shallowest first, before the first
+// prompt's prompt-end checkpoint: that one stays down to the same pool size
+// as without the mode (36 pages, where the second prompt evicts all six
+// unproven checkpoints).
+TEST_F(FrequentStateCheckpointPressureSuite, UnprovenCheckpointsLeaveBeforeAnOlderPromptsEstablishedCache) {
+    const std::vector<std::int32_t> first = MakeTokens(34);
+    const std::vector<std::int32_t> second = MakeTokens(34, 1000);
+    // Runs both prompts on a fresh scheduler with `pages` Device pages and
+    // reports where a prompt diverging from `prompt` after `shared` tokens
+    // resumes.
+    const auto resume_after_both = [&](bool frequent, std::int32_t pages, const std::vector<std::int32_t>& prompt,
+                                       std::int32_t shared) {
+        pool_pages_ = pages;
+        ResetFrequent(frequent, /*cap=*/8);
+        RunAndFinish("first", first);
+        RunAndFinish("second", second);
+        return Probe("probe", Diverging(prompt, shared)).prefix_tokens;
+    };
+    for (const std::int32_t pages : {44, 40, 36}) {
+        SCOPED_TRACE(pages);
+        EXPECT_EQ(resume_after_both(/*frequent=*/false, pages, first, 34), 34) << "without the mode";
+        EXPECT_EQ(resume_after_both(/*frequent=*/true, pages, first, 34), 34) << "the first prompt's end stays";
+        EXPECT_EQ(resume_after_both(/*frequent=*/true, pages, first, 29), 0) << "its unproven 24 left first";
+    }
+    EXPECT_EQ(resume_after_both(/*frequent=*/true, 44, second, 13), 0) << "the second prompt's 8 left next";
+    EXPECT_EQ(resume_after_both(/*frequent=*/true, 44, second, 21), 16);
+    EXPECT_EQ(resume_after_both(/*frequent=*/true, 44, second, 29), 24);
+    EXPECT_EQ(resume_after_both(/*frequent=*/true, 36, second, 29), 0) << "and at 36 pages its deepest too";
+}
+
+// A checkpoint leaves the cap's count once proven: a hit claims it, or an
+// endpoint republishes it (here the prompt end of a prompt ending on it).
+// Under a cap of two, a hit on the first prompt's 24 keeps it through a later
+// prompt's checkpoints, which evict its unproven 16. A prompt ending at the
+// second prompt's 24 republishes that one as its prompt end, and a third
+// prompt's checkpoints no longer evict it.
+TEST_F(FrequentStateCheckpointSuite, AHitOrAnEndpointRepublicationPromotesACheckpointOutOfTheCap) {
+    ResetFrequent(true, /*cap=*/2);
+    const std::vector<std::int32_t> first = MakeTokens(34);
+    RunAndFinish("first", first);
+    EXPECT_EQ(Probe("hit24", Diverging(first, 29)).prefix_tokens, 24);
+
+    const std::vector<std::int32_t> second = MakeTokens(34, 1000);
+    RunAndFinish("second", second);
+    EXPECT_EQ(scheduler_->UnprovenStateCheckpointTrims(), 3) << "first's 8 and 16, second's 8";
+    EXPECT_EQ(Probe("again24", Diverging(first, 29)).prefix_tokens, 24) << "the promoted checkpoint stays";
+    EXPECT_EQ(Probe("gone16", Diverging(first, 21)).prefix_tokens, 0) << "its unproven sibling did not";
+
+    // second[:24] resumes from second's 16 (its probe bound is 23) with the
+    // junction at 20; its first decode publishes its prompt end at 24.
+    const std::vector<std::int32_t> ends_at_24(second.begin(), second.begin() + 24);
+    Submit(RequestWithTokens("ends_at_24", ends_at_24));
+    const std::vector<Chunk> chunks = RunPrefill("ends_at_24", 24);
+    ASSERT_FALSE(chunks.empty());
+    EXPECT_EQ(chunks[0].prefix_tokens, 16);
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("ends_at_24", {901});
+    SendFinish("ends_at_24");
+    AckWriteBacks(PlanOnce());
+
+    RunAndFinish("third", MakeTokens(34, 2000));
+    EXPECT_EQ(Probe("second24", Diverging(second, 29)).prefix_tokens, 24) << "republished as an endpoint";
+}
+
+// A chunk that ends at a junction publishes the junction's endpoint, also on
+// a frequent position. The second prompt shares 18 tokens of a cached prompt
+// whose checkpoints at 8 and 16 the cap of one has evicted, so it resumes at
+// 0 with its junction at 16: its 8 and 24 are unproven, its 16 is not.
+TEST_F(FrequentStateCheckpointSuite, AJunctionOnAFrequentPositionStaysAnEndpoint) {
+    ResetFrequent(true, /*cap=*/1);
+    const std::vector<std::int32_t> cached = MakeTokens(34);
+    RunAndFinish("cached", cached);
+    EXPECT_EQ(scheduler_->UnprovenStateCheckpointTrims(), 2);
+
+    std::vector<std::int32_t> tokens(cached.begin(), cached.begin() + 18);
+    for (std::int32_t i = 0; i < 16; ++i) {
+        tokens.push_back(700 + i);
+    }
+    const std::vector<Chunk> chunks = RunAndFinish("junction", tokens);
+    ASSERT_EQ(chunks.size(), 5u);
+    EXPECT_EQ(chunks[0].prefix_tokens, 0);
+    EXPECT_EQ(chunks[2].prefix_tokens, 16) << "a chunk ended at the junction";
+    EXPECT_EQ(scheduler_->UnprovenStateCheckpointTrims(), 4) << "its 8 evicted cached's 24; its 24 its own 8";
+
+    RunAndFinish("other", MakeTokens(34, 2000));
+    EXPECT_EQ(Probe("diverges21", Diverging(tokens, 21)).prefix_tokens, 16) << "the junction's endpoint";
+    EXPECT_EQ(Probe("diverges13", Diverging(tokens, 13)).prefix_tokens, 0);
+}
+
+// With the in-forward checkpoint (the recommended setup), chunk ends before
+// the prompt's last budget are frequent checkpoints and the forward spanning
+// the last page before the replay tail still writes that one inside it. The
+// 30-token prompt's chunk ends 8 and 16 are frequent checkpoints, 24 is
+// inside its last budget, and its final chunk [24, 30) writes 28. Only the
+// frequent ones are unproven: an unrelated prompt never evicts 28.
+TEST_F(FrequentStateCheckpointSuite, TheInForwardCheckpointCoversThePromptsLastBudget) {
+    in_forward_ = true;
+    ResetFrequent(true, /*cap=*/1);
+    const std::vector<std::int32_t> tokens = MakeTokens(30);
+    const std::vector<Chunk> chunks = RunAndFinish("seed", tokens);
+    ASSERT_EQ(chunks.size(), 4u);
+    for (std::size_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(chunks[i].prefix_tokens, 8 * static_cast<std::int32_t>(i));
+        EXPECT_EQ(chunks[i].checkpoint_len, 0);
+    }
+    EXPECT_EQ(chunks[3].prefix_tokens, 24);
+    EXPECT_EQ(chunks[3].tokens, 6);
+    EXPECT_EQ(chunks[3].checkpoint_len, 4) << "the in-forward checkpoint at 28";
+    ASSERT_EQ(chunks[3].state_rows[0].size(), 3u);
+    EXPECT_EQ(scheduler_->UnprovenStateCheckpointTrims(), 1) << "8 left when 16 was published";
+    EXPECT_EQ(Probe("diverges25", Diverging(tokens, 25)).prefix_tokens, 16) << "no checkpoint at 24";
+
+    RunAndFinish("other", MakeTokens(34, 1000));
+    EXPECT_EQ(scheduler_->UnprovenStateCheckpointTrims(), 3) << "other's 8 and 16";
+    const Resume resent = Probe("resent", tokens);
+    EXPECT_EQ(resent.prefix_tokens, 28);
+    EXPECT_EQ(resent.state_row.at(0), chunks[3].state_rows[0][2]) << "the in-forward checkpoint's block";
+}
+
+// A chunk end that is both a frequent position and the in-forward boundary
+// (an 8-token replay tail puts the 34-token prompt's boundary at 24, a chunk
+// end) is published as the boundary's endpoint, never as an unproven one.
+TEST_F(FrequentStateCheckpointSuite, ABoundaryAtAChunkEndStaysAnEndpoint) {
+    in_forward_ = true;
+    prefix_replay_tokens_ = 8;
+    ResetFrequent(true, /*cap=*/1);
+    const std::vector<std::int32_t> tokens = MakeTokens(34);
+    const std::vector<Chunk> chunks = RunAndFinish("seed", tokens);
+    ASSERT_EQ(chunks.size(), 5u);
+    for (const Chunk& chunk : chunks) {
+        EXPECT_EQ(chunk.checkpoint_len, 0) << "the boundary is a chunk end";
+    }
+    EXPECT_EQ(scheduler_->UnprovenStateCheckpointTrims(), 1) << "8 left when 16 was published";
+
+    RunAndFinish("other", MakeTokens(42, 1000));
+    EXPECT_EQ(scheduler_->UnprovenStateCheckpointTrims(), 4) << "seed's 16, other's 8 and 16";
+    // The replay tail bounds the probe 8 tokens before its end.
+    std::vector<std::int32_t> probe = Diverging(tokens, 29);
+    probe.push_back(992);
+    EXPECT_EQ(Probe("diverges29", probe).prefix_tokens, 24);
+}
+
+// Mixed batches beside one decoding request, which takes one token of every
+// round's 8 and leaves 7 for the prefill.
+class FrequentStateCheckpointMixedSuite : public FrequentStateCheckpointSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FrequentStateCheckpointSuite::MakeConfig();
+        cfg.enable_mixed_prefill_decode = true;
+        return cfg;
+    }
+};
+
+// A 7-token budget rarely ends on a page. A chunk passing a checkpoint's page
+// ends on it, so the 30-token prompt runs [0, 4) ... [16, 20), each end a
+// checkpoint; its last budget keeps the chunks [20, 27) and [27, 30) whole.
+TEST_F(FrequentStateCheckpointMixedSuite, ChunksEndOnACheckpointsPageUnderABudgetCutShort) {
+    ResetFrequent(true, /*cap=*/8);
+    StartDecoding();
+    const std::vector<std::int32_t> tokens = MakeTokens(30);
+    Submit(RequestWithTokens("seed", tokens));
+    const MixedPrefill prefill = RunPrefillBesideTheDecode("seed", 30);
+    EXPECT_EQ(prefill.chunks, (std::vector<std::pair<std::int32_t, std::int32_t>>{
+                                  {0, 4}, {4, 8}, {8, 12}, {12, 16}, {16, 20}, {20, 27}, {27, 30}}));
+    SendFinish("seed");
+    AckWriteBacks(PlanOnce());
+    for (const std::int32_t checkpoint : {4, 8, 12, 16, 20}) {
+        SCOPED_TRACE(checkpoint);
+        EXPECT_EQ(Probe("diverges" + std::to_string(checkpoint), Diverging(tokens, checkpoint + 1)).prefix_tokens,
+                  checkpoint);
+    }
+}
+
+// A follow-up computing less than about two budgets past its hit is chunked
+// and published as without the mode: its chunk ends lie in its last budget,
+// so no chunk is rounded and no checkpoint is published inside it.
+TEST_F(FrequentStateCheckpointMixedSuite, AShortFollowUpIsChunkedAsWithoutTheMode) {
+    std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>> follow_up_chunks;
+    for (const bool frequent : {false, true}) {
+        SCOPED_TRACE(frequent);
+        ResetFrequent(frequent, /*cap=*/8);
+        StartDecoding();
+        const std::vector<std::int32_t> seed = MakeTokens(30);
+        Submit(RequestWithTokens("seed", seed));
+        RunPrefillBesideTheDecode("seed", 30);
+        SendFinish("seed");
+        AckWriteBacks(PlanOnce());
+
+        // The seed's prompt, whose end is a checkpoint, and 12 new tokens.
+        std::vector<std::int32_t> follow_up = seed;
+        for (std::int32_t i = 0; i < 12; ++i) {
+            follow_up.push_back(600 + i);
+        }
+        Submit(RequestWithTokens("follow_up", follow_up));
+        follow_up_chunks.push_back(RunPrefillBesideTheDecode("follow_up", 42).chunks);
+        SendFinish("follow_up");
+        AckWriteBacks(PlanOnce());
+        EXPECT_EQ(Probe("diverges", Diverging(follow_up, 41)).prefix_tokens, 30)
+            << "no checkpoint inside the follow-up";
+    }
+    ASSERT_EQ(follow_up_chunks.size(), 2u);
+    EXPECT_EQ(follow_up_chunks[0], (std::vector<std::pair<std::int32_t, std::int32_t>>{{30, 37}, {37, 42}}));
+    EXPECT_EQ(follow_up_chunks[1], follow_up_chunks[0]);
+}
+
+// The P role publishes its chunk ends' checkpoints too, and the remote decode
+// hands off the prompt-end state in slot 1 as without the mode.
+class FrequentStateCheckpointPrefillRoleSuite : public FrequentStateCheckpointSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FrequentStateCheckpointSuite::MakeConfig();
+        cfg.role = Role::kP;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.transfer_policy = group.attn_kind == AttnKind::kState ? CacheTransferPolicy::LatestSnapshot
+                                                                        : CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    void SendBootstrapped(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::BootstrappedEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendPdSucceeded(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::SucceededEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+};
+
+TEST_F(FrequentStateCheckpointPrefillRoleSuite, ChunkEndsPublishCheckpointsAndTheHandOffIsUnchanged) {
+    ResetFrequent(true, /*cap=*/8);
+    const std::vector<std::int32_t> tokens = MakeTokens(34);
+    Submit(RequestWithTokens("seed", tokens));
+    SendBootstrapped("seed");
+    const std::vector<Chunk> chunks = RunPrefill("seed", 34);
+    ASSERT_EQ(chunks.size(), 5u);
+    const ExecutionPlan handoff = PlanOnce();
+    ASSERT_TRUE(handoff.remote_decode.has_value());
+    EXPECT_EQ(StateRow(*handoff.remote_decode, "state0", "seed"),
+              (std::vector<std::int32_t>{0, chunks[4].state_rows[0][1]}))
+        << "the prompt-end state in slot 1";
+    AckWriteBacks(handoff);
+
+    Submit(RequestWithTokens("follow_up", Diverging(tokens, 29)));
+    SendBootstrapped("follow_up");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"follow_up"});
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{24});
+    EXPECT_EQ(StateRow(*batch, "state0", "follow_up").at(0), chunks[2].state_rows[0][1])
+        << "resumes from the checkpoint before the seed's PD ACK";
+    AckWriteBacks(plan);
+    SendPdSucceeded("seed");
+    AckWriteBacks(PlanOnce());
+}
+
+// Unproven checkpoints stay on the Device: a chunk end that publishes one
+// streams its KV pages but not its state, and the publisher's finish stores
+// its prompt-end and frontier states but none of them. A hit promotes the
+// checkpoint it claims, and the hitter's finish stores that one.
+TEST_F(FrequentStateCheckpointSuite, UnprovenCheckpointsStayOnTheDeviceUntilAHitPromotesThem) {
+    ResetFrequent(true, /*cap=*/8, /*host_cache=*/true);
+    const std::vector<std::int32_t> tokens = MakeTokens(34);
+    // The chain hashes of the pages ending at 4, 8, ..., 32.
+    const std::vector<std::string> chain = scheduler_->PrefixHashesForTokens(tokens);
+    ASSERT_EQ(chain.size(), 8u);
+    // The State groups' write-back rows by content hash (the full group is 0).
+    const auto state_rows = [](const std::vector<std::pair<std::uint32_t, std::string>>& rows) {
+        std::map<std::string, std::int32_t> by_hash;
+        for (const auto& [group_id, hash] : rows) {
+            if (group_id != 0) {
+                ++by_hash[hash];
+            }
+        }
+        return by_hash;
+    };
+
+    Submit(RequestWithTokens("seed", tokens));
+    const std::vector<Chunk> chunks = RunPrefill("seed", 34);
+    ASSERT_EQ(chunks.size(), 5u);
+    for (std::size_t i = 1; i < chunks.size(); ++i) {
+        EXPECT_FALSE(chunks[i].write_backs.empty()) << "chunk " << i << " streams the pages before it";
+        EXPECT_TRUE(state_rows(chunks[i].write_backs).empty()) << "chunk " << i << " streams no checkpoint";
+    }
+    const ExecutionPlan first_decode = PlanOnce();
+    const std::map<std::string, std::int32_t> prompt_end = state_rows(WriteBackRows(first_decode));
+    ASSERT_EQ(prompt_end.size(), 1u);
+    EXPECT_EQ(prompt_end.begin()->second, 3) << "the prompt end's state streams in every State group";
+    AckWriteBacks(first_decode);
+    SendForwardDone("seed", {901});
+    SendFinish("seed");
+    const ExecutionPlan finish = PlanOnce();
+    const std::map<std::string, std::int32_t> finish_rows = state_rows(WriteBackRows(finish));
+    ASSERT_EQ(finish_rows.size(), 1u) << "the frontier's state alone";
+    for (const std::size_t page : {1, 3, 5}) {
+        EXPECT_FALSE(finish_rows.contains(chain[page])) << "page " << page;
+    }
+    AckWriteBacks(finish);
+
+    // A hit on 24 promotes it; the hitter's finish stores it, and still none
+    // of the unproven 8 and 16.
+    std::vector<std::int32_t> hitter(tokens.begin(), tokens.begin() + 29);
+    for (std::int32_t i = 0; i < 6; ++i) {
+        hitter.push_back(700 + i);
+    }
+    Submit(RequestWithTokens("hitter", hitter));
+    const std::vector<Chunk> hit_chunks = RunPrefill("hitter", 35);
+    ASSERT_FALSE(hit_chunks.empty());
+    EXPECT_EQ(hit_chunks[0].prefix_tokens, 24);
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("hitter", {902});
+    SendFinish("hitter");
+    const std::map<std::string, std::int32_t> hitter_rows = state_rows(WriteBackRows(PlanOnce()));
+    EXPECT_EQ(hitter_rows.contains(chain[5]) ? hitter_rows.at(chain[5]) : 0, 3) << "the promoted checkpoint at 24";
+    EXPECT_FALSE(hitter_rows.contains(chain[1]));
+    EXPECT_FALSE(hitter_rows.contains(chain[3]));
+}
+
+// With KV events a chunk end becomes BlockStored once its checkpoint makes
+// every group hold its page, and BlockRemoved when a trim takes the
+// checkpoint again; the page's KV stays.
+class FrequentStateCheckpointKvEventSuite : public FrequentStateCheckpointSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FrequentStateCheckpointSuite::MakeConfig();
+        cfg.enable_kv_cache_events = true;
+        return cfg;
+    }
+
+    struct Drained {
+        std::vector<std::uint64_t> stored;
+        std::vector<std::uint64_t> removed;
+    };
+    Drained Drain() {
+        Drained out;
+        for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
+            if (const auto* stored = std::get_if<KvBlockStoredEvent>(&event)) {
+                out.stored.push_back(stored->block_hashes.front());
+            } else {
+                out.removed.push_back(std::get<KvBlockRemovedEvent>(event).block_hashes.front());
+            }
+        }
+        return out;
+    }
+};
+
+TEST_F(FrequentStateCheckpointKvEventSuite, ACheckpointedChunkEndIsStoredAndATrimRemovesIt) {
+    ResetFrequent(true, /*cap=*/1);
+    const std::vector<std::int32_t> tokens = MakeTokens(34);
+    const std::span<const std::int32_t> all(tokens);
+    // The KV event hash of each page [4i, 4i + 4).
+    std::vector<std::uint64_t> page_hash;
+    for (std::size_t page = 0; page < 4; ++page) {
+        page_hash.push_back(HashKvBlock(all.subspan(page * 4, 4),
+                                        page == 0 ? std::nullopt : std::optional<std::uint64_t>{page_hash.back()}));
+    }
+    Submit(RequestWithTokens("seed", tokens));
+    // [0, 8): nothing is published yet.
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    SendForwardDone("seed");
+    EXPECT_TRUE(Drain().stored.empty());
+    // [8, 16): its admission publishes the pages through 8 and the checkpoint
+    // at 8, so every group holds the page [4, 8).
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    SendForwardDone("seed");
+    const Drained at_8 = Drain();
+    EXPECT_EQ(at_8.stored, std::vector<std::uint64_t>{page_hash[1]});
+    EXPECT_TRUE(at_8.removed.empty());
+    // [16, 24): the checkpoint at 16 is published and the cap of one evicts 8.
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    SendForwardDone("seed");
+    const Drained at_16 = Drain();
+    EXPECT_EQ(at_16.stored, std::vector<std::uint64_t>{page_hash[3]});
+    EXPECT_EQ(at_16.removed, std::vector<std::uint64_t>{page_hash[1]});
+}
+
+// A request retracted on a page-aligned frontier and restored with no Host
+// cache resumes on private copies of its pages. Here the pool is so tight
+// that the restore evicts their cache entries, and a drain between the
+// restore's ACK and the next chunk drops their descriptors. The next chunk's
+// admission publishes the state at the frontier again without hashing a new
+// page -- a frequent checkpoint (mode on) or the junction the chunk before it
+// was cut at (mode off). That publication must not trip over the dropped
+// descriptor, and with the KV through the frontier gone nothing is reported
+// stored.
+class StateCheckpointRestoreKvEventSuite : public FrequentStateCheckpointKvEventSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FrequentStateCheckpointKvEventSuite::MakeConfig();
+        cfg.debug_force_retraction_interval = -4;
+        // One full and one State group over twelve usable blocks.
+        std::erase_if(cfg.cache_groups, [](const CacheGroupConfig& group) {
+            return group.group_id == "state1" || group.group_id == "state2";
+        });
+        cfg.device_allocator.total_pages = 13;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = cfg.device_allocator.total_pages;
+        }
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    // Plans one round in which `id` runs a prefill chunk alone, lands it and
+    // returns where it started and how many tokens it computed.
+    std::pair<std::int32_t, std::int32_t> RunChunk(const std::string& id, bool completes = false) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        ASSERT_TRUE_OR_RETURN(batch != nullptr && batch->request_ids == std::vector<std::string>{id},
+                              (std::pair<std::int32_t, std::int32_t>{-1, -1}));
+        SendForwardDone(id, completes ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
+        return {batch->extend_prefix_lens.at(0), batch->input_lengths.at(0)};
+    }
+
+    // The forced retraction of the plan after `id`'s last chunk landed, and
+    // the restore of the plan after it, with a drain after each ACK.
+    void RetractAndRestore() {
+        const ExecutionPlan retraction = PlanOnce();
+        ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+        AckImageStores(retraction);
+        Drain();
+        const ExecutionPlan readmit = PlanOnce();
+        ASSERT_NE(FindRestore(readmit), nullptr);
+        AckRestores(readmit);
+        Drain();
+    }
+};
+
+// The 34-token prompt is retracted at 24, a frequent position whose pages the
+// retraction hashed; the chunk [24, 32) resumes there.
+TEST_F(StateCheckpointRestoreKvEventSuite, AFrequentCheckpointAfterARestoreFindsItsDescriptor) {
+    ResetFrequent(true, /*cap=*/8);
+    const std::vector<std::int32_t> tokens = MakeTokens(34);
+    Submit(RequestSpec{.request_id = "seed", .tokens = tokens, .max_new_tokens = 2});
+    // Plans 1-3 run [0, 8), [8, 16) and [16, 24); plan 4 retracts, plan 5
+    // restores.
+    for (std::int32_t chunk = 0; chunk < 3; ++chunk) {
+        EXPECT_EQ(RunChunk("seed").first, 8 * chunk);
+    }
+    Drain();
+    RetractAndRestore();
+    EXPECT_EQ(RunChunk("seed"), (std::pair<std::int32_t, std::int32_t>{24, 8}));
+    EXPECT_TRUE(Drain().stored.empty()) << "nothing new is complete: the KV through 24 is gone";
+    EXPECT_EQ(RunChunk("seed", /*completes=*/true), (std::pair<std::int32_t, std::int32_t>{32, 2}));
+}
+
+// Mode off: the second prompt shares the first one's first 8 tokens and no
+// checkpoint, so its first chunk is cut at the junction at 8; it is retracted
+// there, and the chunk [8, 16) resumes at the junction.
+TEST_F(StateCheckpointRestoreKvEventSuite, AJunctionAfterARestoreFindsItsDescriptor) {
+    ResetFrequent(false, /*cap=*/0);
+    const std::vector<std::int32_t> seed = MakeTokens(12);
+    Submit(RequestSpec{.request_id = "seed", .tokens = seed, .max_new_tokens = 1});
+    RunChunk("seed");
+    RunChunk("seed", /*completes=*/true);
+    SendFinish("seed");
+    // Plans 3-6 run nothing, so the second prompt's first chunk is plan 7 and
+    // the forced retraction of plan 8 takes it.
+    for (std::int32_t plan = 3; plan <= 6; ++plan) {
+        PlanOnce();
+    }
+    Drain();
+    std::vector<std::int32_t> tokens(seed.begin(), seed.begin() + 8);
+    for (std::int32_t i = 0; i < 26; ++i) {
+        tokens.push_back(500 + i);
+    }
+    Submit(RequestSpec{.request_id = "r", .tokens = tokens, .max_new_tokens = 1});
+    EXPECT_EQ(RunChunk("r"), (std::pair<std::int32_t, std::int32_t>{0, 8})) << "cut at the junction";
+    RetractAndRestore();
+    EXPECT_EQ(RunChunk("r"), (std::pair<std::int32_t, std::int32_t>{8, 8}));
+    EXPECT_TRUE(Drain().stored.empty()) << "the KV through 8 is gone";
+}
+
+// A prefill retracted between chunks publishes its page-aligned frontier as
+// an endpoint, as every retraction does. The restored request's next chunk
+// republishes its live slot there, which leaves the endpoint as it was, and
+// the request runs to its finish.
+class FrequentStateCheckpointRetractionSuite : public FrequentStateCheckpointSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FrequentStateCheckpointSuite::MakeConfig();
+        cfg.debug_force_retraction_interval = -4;
+        return cfg;
+    }
+};
+
+TEST_F(FrequentStateCheckpointRetractionSuite, ARetractedPrefillPublishesItsFrontierAsAnEndpoint) {
+    ResetFrequent(true, /*cap=*/1);
+    const std::vector<std::int32_t> tokens = MakeTokens(34);
+    Submit(RequestWithTokens("seed", tokens));
+    // Plans 1-3 run [0, 8), [8, 16) and [16, 24); plan 4 retracts the request.
+    for (std::int32_t chunk = 0; chunk < 3; ++chunk) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        ASSERT_TRUE(batch != nullptr && batch->request_ids == std::vector<std::string>{"seed"});
+        EXPECT_EQ(batch->extend_prefix_lens.at(0), 8 * chunk);
+        SendForwardDone("seed");
+    }
+    const ExecutionPlan retraction = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    AckImageStores(retraction);
+    const ExecutionPlan readmit = PlanOnce();
+    ASSERT_NE(FindRestore(readmit), nullptr);
+    AckRestores(readmit);
+    const std::vector<Chunk> rest = RunPrefill("seed", 34);
+    ASSERT_EQ(rest.size(), 2u);
+    EXPECT_EQ(rest[0].prefix_tokens, 24);
+    SendFinish("seed");
+    AckWriteBacks(PlanOnce());
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(scheduler_->UnprovenStateCheckpointTrims(), 1) << "8 left when 16 was published";
+
+    EXPECT_EQ(Probe("diverges29", Diverging(tokens, 29)).prefix_tokens, 24) << "the retraction's endpoint";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks())
+        << "every block is cache-only or free";
+}
+
+// With a Host cache the image's L2 leg takes the published slots, but an
+// unproven checkpoint stays off Host there too: slot 0 -- the checkpoint at
+// 16 the chunk [16, 24) read -- rides the snapshot pool like an unpublished
+// slot, and only the endpoint the retraction publishes at 24 rides L2. The
+// restore copies slot 0 back from the pool instead of claiming (and so
+// promoting) the Device entry, which stays unproven: a later prompt's
+// checkpoints evict it under the cap.
+TEST_F(FrequentStateCheckpointRetractionSuite, AnUnprovenSlotZeroRidesTheSnapshotPoolNotHost) {
+    ResetFrequent(true, /*cap=*/2, /*host_cache=*/true);
+    const std::vector<std::int32_t> tokens = MakeTokens(34);
+    // The chain hashes of the pages ending at 4, 8, ..., 32.
+    const std::vector<std::string> chain = scheduler_->PrefixHashesForTokens(tokens);
+    ASSERT_EQ(chain.size(), 8u);
+    Submit(RequestWithTokens("seed", tokens));
+    for (std::int32_t chunk = 0; chunk < 3; ++chunk) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        ASSERT_TRUE(batch != nullptr && batch->request_ids == std::vector<std::string>{"seed"});
+        AckWriteBacks(plan);
+        SendForwardDone("seed");
+    }
+    const std::int32_t host_before = scheduler_->HostPoolCachedBlocks();
+    const ExecutionPlan retraction = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    std::map<std::string, std::int32_t> l2_state_rows;
+    for (const auto& [group_id, hash] : WriteBackRows(retraction)) {
+        if (group_id != 0) {
+            ++l2_state_rows[hash];
+        }
+    }
+    EXPECT_EQ(l2_state_rows, (std::map<std::string, std::int32_t>{{chain[5], 3}}))
+        << "the endpoint at 24 in every State group, and not the unproven 16";
+    const SnapshotStoreBatch* store = FindSnapshotStore(retraction);
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(std::ranges::count_if(store->group_ids.at(0), [](std::uint32_t group_id) { return group_id != 0; }), 3)
+        << "slot 0 of every State group rides the pool";
+    AckImageStores(retraction);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), host_before + 2 + 3) << "the pages [16, 24) and the endpoint";
+
+    const ExecutionPlan readmit = PlanOnce();
+    const SnapshotRestoreBatch* restore = FindRestore(readmit);
+    ASSERT_NE(restore, nullptr);
+    std::map<std::uint8_t, std::int32_t> state_rows_by_tier;
+    for (std::size_t i = 0; i < restore->group_ids.at(0).size(); ++i) {
+        if (restore->group_ids.at(0)[i] != 0) {
+            ++state_rows_by_tier[restore->source_tiers.at(0)[i]];
+        }
+    }
+    EXPECT_EQ(state_rows_by_tier,
+              (std::map<std::uint8_t, std::int32_t>{{static_cast<std::uint8_t>(HostTier::kL2), 3},
+                                                    {static_cast<std::uint8_t>(HostTier::kSnapshotPool), 3}}))
+        << "slot 1 from L2 and slot 0 from the pool, each a private copy";
+    AckRestores(readmit);
+    const std::vector<Chunk> rest = RunPrefill("seed", 34);
+    ASSERT_EQ(rest.size(), 2u);
+    EXPECT_EQ(rest[0].prefix_tokens, 24);
+    SendFinish("seed");
+    AckWriteBacks(PlanOnce());
+    EXPECT_EQ(scheduler_->UnprovenStateCheckpointTrims(), 0) << "8 and 16, within the cap";
+
+    // Another prompt's 8 and 16 evict the seed's 8 and 16, the oldest. (Its
+    // 24 tokens prefill in plans 9-11, between two forced retractions.)
+    RunAndFinish("other", MakeTokens(24, 1000));
+    EXPECT_EQ(scheduler_->UnprovenStateCheckpointTrims(), 2);
+    EXPECT_EQ(Probe("diverges21", Diverging(tokens, 21)).prefix_tokens, 0) << "16 was evicted, not promoted";
+    EXPECT_EQ(Probe("diverges29", Diverging(tokens, 29)).prefix_tokens, 24) << "the retraction's endpoint";
 }
 
 }  // namespace tokenspeed::test

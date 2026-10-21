@@ -210,6 +210,13 @@ def scheduler_config_from_args(
         cache_groups=specs.cache_groups,
         enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
+        frequent_state_checkpoints=server_args.writes_frequent_state_checkpoints,
+        # The cap is unset (None) without the mode; the binding takes 0.
+        max_unproven_state_checkpoints=(
+            server_args.max_unproven_state_checkpoints
+            if server_args.writes_frequent_state_checkpoints
+            else 0
+        ),
     )
 
 
@@ -453,6 +460,10 @@ class EventLoop:
             f"prefix_replay_tokens={scheduler_cfg.prefix_replay_tokens!s} "
             f"state_checkpoint_in_forward="
             f"{server_args.writes_state_checkpoints_in_forward!s} "
+            f"frequent_state_checkpoints="
+            f"{server_args.writes_frequent_state_checkpoints!s} "
+            f"max_unproven_state_checkpoints="
+            f"{server_args.max_unproven_state_checkpoints!s} "
             f"cache_groups={[group.group_id for group in cache_groups]!s}",
         )
         self.scheduler = Scheduler(scheduler_cfg)

@@ -161,7 +161,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
-        .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward);
+        .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward)
+        // Page-aligned prefill chunk ends at least one chunk budget before the
+        // prompt end publish unproven State checkpoints; the cap is required
+        // (>= 1) with the mode, 0 without.
+        .def_rw("frequent_state_checkpoints", &tokenspeed::SchedulerConfig::frequent_state_checkpoints)
+        .def_rw("max_unproven_state_checkpoints", &tokenspeed::SchedulerConfig::max_unproven_state_checkpoints);
 
     // The config-only sizing model. Python builds it from a SchedulerConfig
     // whose page counts are still zero, sizes the pool from its answers, and
@@ -586,6 +591,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "Published partial-page boundaries (hash@T) the prefix probe can resume at.")
         .def("tail_cap_evictions", &tokenspeed::Scheduler::TailCapEvictions,
              "Tails dropped because more than eight were published under one prior page.")
+        .def("unproven_state_checkpoint_trims", &tokenspeed::Scheduler::UnprovenStateCheckpointTrims,
+             "Unproven frequent State checkpoints evicted to stay within max_unproven_state_checkpoints.")
         .def("can_abort_before_admission", &tokenspeed::Scheduler::CanAbortBeforeAdmission, nb::arg("id"))
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)

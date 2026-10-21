@@ -65,6 +65,20 @@ void SchedulerConfig::Validate() const {
     if (state_checkpoint_in_forward && disable_prefix_cache && role != Role::kD) {
         throw std::invalid_argument("Scheduler: state_checkpoint_in_forward requires prefix caching");
     }
+    if (frequent_state_checkpoints && disable_prefix_cache && role != Role::kD) {
+        throw std::invalid_argument(
+            "Scheduler: frequent_state_checkpoints (--enable-frequent-state-checkpoints) requires prefix caching");
+    }
+    if (max_unproven_state_checkpoints < 0) {
+        throw std::invalid_argument(
+            "Scheduler: max_unproven_state_checkpoints (--max-unproven-state-checkpoints) must be >= 0");
+    }
+    if (frequent_state_checkpoints != (max_unproven_state_checkpoints > 0)) {
+        throw std::invalid_argument(
+            "Scheduler: frequent_state_checkpoints (--enable-frequent-state-checkpoints) requires "
+            "max_unproven_state_checkpoints >= 1 (--max-unproven-state-checkpoints), and "
+            "max_unproven_state_checkpoints must be 0 without it");
+    }
     if (!enable_l3_storage && storage_config) {
         throw std::invalid_argument("StorageConfig requires L3 storage to be enabled");
     }

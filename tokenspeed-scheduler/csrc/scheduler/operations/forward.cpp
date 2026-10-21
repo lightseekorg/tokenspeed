@@ -106,6 +106,22 @@ std::int32_t inForwardStateCheckpoint(const SchedulerConfig& config, const Cache
                                         config.prefix_replay_tokens);
 }
 
+// Whether local prefill chunk ends publish frequent State checkpoints
+// (SchedulerConfig::frequent_state_checkpoints): the mode is on, something
+// could reuse them, and the model has a State group to checkpoint. The D role
+// computes no prompt.
+bool frequentStateCheckpoints(const SchedulerConfig& config, const CacheCoordinator& coordinator) {
+    if (!config.frequent_state_checkpoints || config.disable_prefix_cache || config.role == Role::kD) {
+        return false;
+    }
+    for (std::int32_t group = 0; group < coordinator.NumGroups(); ++group) {
+        if (coordinator.GroupIsState(static_cast<std::size_t>(group))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Whether the forward computing [first_pos, first_pos + tokens) writes the
 // in-forward checkpoint: the boundary lies strictly inside it (a forward
 // ending there leaves the state in slot 1, published as a natural checkpoint)
@@ -166,8 +182,12 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
         appendCompletedPrefixHashes(cache_progress.prefix_hashes, request.FullPrefixPages(false), filled_prefix_pages);
     }
     RequestProgress progress{.num_computed_tokens = num_computed_tokens};
+    // A frequent State checkpoint sits on a page boundary, so it publishes no
+    // tail and the owner moves off no published block.
+    _assert(point != PublicationPoint::kStateCheckpoint || num_computed_tokens % prefix_granularity == 0,
+            "a frequent State checkpoint sits at a page boundary");
     std::optional<TailPublication> tail;
-    if (point != PublicationPoint::kChunk) {
+    if (point == PublicationPoint::kFinal || point == PublicationPoint::kOwnerContinues) {
         const std::string& prior =
             cache_progress.prefix_hashes.empty() ? std::string{} : cache_progress.prefix_hashes.back();
         tail = request.TailPublicationAt(num_computed_tokens, prior);
@@ -201,8 +221,11 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
             .publish_state = publish_state,
             .state_checkpoint_pages = state_checkpoint_pages,
             .state_checkpoint_blocks = cache_progress.published_state_checkpoint_blocks,
-            .boundary_kind =
-                point == PublicationPoint::kChunk ? CacheBoundaryKind::kChunk : CacheBoundaryKind::kEndpoint,
+            // A frequent State checkpoint is an interior chunk end: unproven
+            // until a hit claims it or an endpoint republishes it.
+            .boundary_kind = point == PublicationPoint::kChunk || point == PublicationPoint::kStateCheckpoint
+                                 ? CacheBoundaryKind::kChunk
+                                 : CacheBoundaryKind::kEndpoint,
             .stream_completed_to_host = stream_completed_to_host,
         };
     }
@@ -453,6 +476,13 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         }
         return demands;
     };
+    // A chunk passing a frequent State checkpoint's page ends on it, so the
+    // next chunk's admission publishes its live slot there.
+    if (source == fsm::PrefillSource::kLocal && frequentStateCheckpoints(config_, coordinator_)) {
+        tokens_this_round =
+            ChunkEndingOnFrequentStateCheckpoint(hit_tokens, tokens_this_round, request->PrefillSize(), junction_tokens,
+                                                 config_.max_scheduled_tokens, prefix_granularity);
+    }
     // The in-forward State checkpoint, when this chunk spans its boundary.
     const std::int32_t state_checkpoint = source == fsm::PrefillSource::kLocal
                                               ? inForwardStateCheckpoint(config_, coordinator_, request->PrefillSize())
@@ -542,25 +572,38 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     if (prefill_tokens == 0) {
         return std::nullopt;
     }
+    const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
+    const bool frequent_checkpoints = frequentStateCheckpoints(config_, coordinator_);
+    if (frequent_checkpoints) {
+        prefill_tokens = ChunkEndingOnFrequentStateCheckpoint(first_pos, prefill_tokens, request->PrefillSize(),
+                                                              cache_progress.junction_tokens,
+                                                              config_.max_scheduled_tokens, prefix_granularity);
+    }
     const std::int32_t state_checkpoint = inForwardStateCheckpoint(config_, coordinator_, request->PrefillSize());
     prefill_tokens =
         chunkTowardInForwardCheckpoint(state_checkpoint, first_pos, prefill_tokens, cache_progress.junction_tokens,
-                                       config_.max_scheduled_tokens, coordinator_.PrefixGranularity());
-    bool writes_checkpoint =
-        writesInForwardCheckpoint(state_checkpoint, first_pos, prefill_tokens, coordinator_.PrefixGranularity());
+                                       config_.max_scheduled_tokens, prefix_granularity);
+    bool writes_checkpoint = writesInForwardCheckpoint(state_checkpoint, first_pos, prefill_tokens, prefix_granularity);
     // The chunk that ended at the junction publishes its natural checkpoint
     // (KV tail and state) and moves off the published blocks, and so does one
-    // that happened to end at the in-forward checkpoint's boundary; every
-    // other chunk end publishes only its completed full pages.
+    // that happened to end at the in-forward checkpoint's boundary. A chunk
+    // that ended on a frequent State checkpoint publishes its full pages and
+    // its live slot, unproven; every other chunk end publishes only its
+    // completed full pages.
     const bool ends_at_junction = cache_progress.junction_tokens > 0 && first_pos == cache_progress.junction_tokens;
     const bool ends_at_state_checkpoint = state_checkpoint > 0 && first_pos == state_checkpoint;
+    const bool ends_at_frequent_checkpoint =
+        !ends_at_junction && !ends_at_state_checkpoint && frequent_checkpoints &&
+        FrequentStateCheckpointAt(first_pos, request->PrefillSize(), config_.max_scheduled_tokens, prefix_granularity);
     if (first_pos >= cache_progress.junction_tokens) {
         cache_progress.junction_tokens = 0;
     }
-    const RequestProgress progress = AdvanceRequestProgress(
-        *request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
-        config_.StreamsDeviceCacheToHost(),
-        ends_at_junction || ends_at_state_checkpoint ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk);
+    const PublicationPoint point = ends_at_junction || ends_at_state_checkpoint ? PublicationPoint::kOwnerContinues
+                                   : ends_at_frequent_checkpoint                ? PublicationPoint::kStateCheckpoint
+                                                                                : PublicationPoint::kChunk;
+    const RequestProgress progress =
+        AdvanceRequestProgress(*request, cache_progress, request->NumComputedTokens(), prefix_granularity,
+                               config_.StreamsDeviceCacheToHost(), point);
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     // A chunk reads the state its predecessor wrote (slot 1 -> slot 0) and
@@ -602,6 +645,12 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     if (writes_checkpoint) {
         cache_progress.state_checkpoint_tokens = state_checkpoint;
         cache_progress.state_checkpoint_blocks = std::move(admission->state_checkpoint_blocks);
+    }
+    if (ends_at_frequent_checkpoint) {
+        // The checkpoint just published is this request's slot 0 now, which
+        // the trim never evicts; the unpinned unproven ones beyond the cap
+        // leave, oldest first.
+        coordinator_.TrimUnprovenStateCheckpoints(config_.max_unproven_state_checkpoints);
     }
 
     request->CacheProgressRef() = std::move(cache_progress);

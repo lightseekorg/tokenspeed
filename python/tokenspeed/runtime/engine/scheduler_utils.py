@@ -350,6 +350,8 @@ def make_config(
     num_snapshot_pages: int,
     max_retracted_requests: int,
     storage_config: StorageConfig | None,
+    frequent_state_checkpoints: bool,
+    max_unproven_state_checkpoints: int,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -385,6 +387,15 @@ def make_config(
             A victim whose image does not fit the Host (L2 pins, pool, rows)
             is aborted by the scheduler instead of imaged.
         storage_config: Explicit asynchronous L3 budgets, or None without L3.
+        frequent_state_checkpoints: ``--enable-frequent-state-checkpoints``
+            (off on a decode server): prefill chunk ends on a prefix page at
+            least one chunk budget before the prompt end also publish the
+            State groups' live slot, as unproven checkpoints. Requires prefix
+            caching.
+        max_unproven_state_checkpoints: ``--max-unproven-state-checkpoints``:
+            the most unproven frequent checkpoints the Device cache keeps.
+            Positive exactly when ``frequent_state_checkpoints`` is on, 0
+            otherwise.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
@@ -420,6 +431,13 @@ def make_config(
         )
     if (storage_config is not None) != enable_l3_storage:
         raise ValueError("storage_config is required exactly when L3 is enabled")
+    cap_given = max_unproven_state_checkpoints > 0
+    if cap_given != frequent_state_checkpoints or max_unproven_state_checkpoints < 0:
+        raise ValueError(
+            "max_unproven_state_checkpoints caps the frequent State checkpoints: "
+            f"positive exactly with them; got {max_unproven_state_checkpoints} with "
+            f"frequent_state_checkpoints={frequent_state_checkpoints}."
+        )
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
@@ -445,6 +463,10 @@ def make_config(
         # turning the option on raises AttributeError here instead of being
         # ignored.
         cfg.state_checkpoint_in_forward = True
+    if frequent_state_checkpoints:
+        # Set only when on, for the same reason as above.
+        cfg.frequent_state_checkpoints = True
+        cfg.max_unproven_state_checkpoints = max_unproven_state_checkpoints
     cfg.disable_l2_cache = disable_l2_cache
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
