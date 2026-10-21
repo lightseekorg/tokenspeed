@@ -547,6 +547,75 @@ if platform.is_amd:
         )
 
 
+if platform.is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.routes_decode import (
+        MAX_TOKENS as _BF16_ROUTES_DECODE_MAX_TOKENS,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.routes_decode import (
+        launch_gluon_bf16_moe_routes_decode_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.routes_prefill import (
+        launch_gluon_bf16_moe_routes_prefill_gfx950,
+    )
+
+    @register_kernel(
+        "moe",
+        "routes",
+        name="gluon_bf16_moe_routes_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            # The kernels address buffers with 32-bit byte offsets. The
+            # zero kernel clears 512-column hidden blocks; the decode and
+            # prefill GEMMs tile the intermediate size by 256.
+            "buffer_offsets_fit_int32": frozenset({True}),
+            "hidden_alignment": frozenset({512}),
+            "ispp_alignment": frozenset({256}),
+            "topk": frozenset({1, 2, 4, 8, 16}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_bf16_moe_routes_gfx950(
+        x: torch.Tensor,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_start: int,
+        output: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Gluon kernel of :func:`tokenspeed_kernel.ops.moe.bf16_moe_routes`.
+
+        Direct per-expert decode GEMMs through 16 tokens, block-aligned grouped
+        GEMMs above; both write zeros for non-local routes, so ``output`` needs
+        no clearing. The facade validates the tensors before selection.
+        """
+        num_tokens, top_k = topk_ids.shape
+        if output is None:
+            output = torch.empty(
+                (num_tokens * top_k, x.shape[1]), dtype=x.dtype, device=x.device
+            )
+        if num_tokens:
+            launch = (
+                launch_gluon_bf16_moe_routes_decode_gfx950
+                if num_tokens <= _BF16_ROUTES_DECODE_MAX_TOKENS
+                else launch_gluon_bf16_moe_routes_prefill_gfx950
+            )
+            launch(
+                x,
+                w13,
+                w2,
+                topk_ids.to(torch.int32).contiguous(),
+                expert_start,
+                output.view(num_tokens * top_k, x.shape[1]),
+            )
+        return output.view(num_tokens, top_k, x.shape[1])
+
+
 # ===-----------------------------------------------------------------------===#
 # FP8 block-scaled experts (AMD gfx950, gfx1250)
 # ===-----------------------------------------------------------------------===#
