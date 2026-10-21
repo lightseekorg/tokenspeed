@@ -37,6 +37,13 @@ that shares the BF16 reduction's mailbox. Exchanges with model-specific head
 layouts, route packets, or normalization semantics stay in the model package,
 along with dispatch and capacities.
 
+Lamport reductions use data as the ready signal: peers push BF16 into
+mailboxes holding an empty marker (negative zero, so payloads send it as zero),
+and the receiver polls until no marker remains, restores the markers, and
+advances a three-stage counter. Fusions sharing the one-shot mailbox keep its
+per-512-element stage counters; the TP8 two-shot owns its mailboxes and
+counters.
+
 Muse Spark prepares its collectives for TP4/EP4 or TP8/EP8 on gfx950. Both
 topologies keep the same global token cutoffs for Lamport, push, pull, and
 owned-row paths. Owned rows use ceil(global rows / world size), with padded

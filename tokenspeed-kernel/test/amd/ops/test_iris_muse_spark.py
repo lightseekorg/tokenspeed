@@ -436,6 +436,7 @@ def _muse_boundary_worker(rank, world_size, device, sharded):
 def _muse_collective_policy_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
         iris_lamport_bf16_allreduce,
+        iris_lamport_twoshot_bf16_allreduce,
         iris_pull_twoshot_allreduce,
         iris_push_twoshot_allreduce,
     )
@@ -501,6 +502,8 @@ def _muse_collective_policy_worker(rank, world_size, device):
     state.reduction.epochs.fill_(2**32 - 4)
     state.reduction.ready_flags.fill_(2**32 - 4)
     state.reduction.lamport_epochs.fill_(2)
+    if state.reduction.lamport_two_shot_epochs is not None:
+        state.reduction.lamport_two_shot_epochs.fill_(2)
     torch.cuda.synchronize()
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
@@ -538,6 +541,7 @@ def _muse_collective_policy_worker(rank, world_size, device):
             )
     with assert_no_triton_compile(
         iris_lamport_bf16_allreduce,
+        iris_lamport_twoshot_bf16_allreduce,
         iris_push_twoshot_allreduce,
         iris_pull_twoshot_allreduce,
     ):
@@ -1068,6 +1072,7 @@ def test_routed_lamport_polling_codegen(rank):
 
 def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_cache_policy,
         iris_lamport_bf16_allreduce,
     )
     from tokenspeed_kernel.ops.quantization import rmsnorm_mxfp4_quant
@@ -1093,6 +1098,7 @@ def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
             total_elements=raw_input.numel(),
             MAX_ELEMENTS=state.reduction.lamport_max_numel,
             NUM_STAGES=3,
+            PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
             num_warps=1,
         )
 
@@ -1173,6 +1179,7 @@ def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
 
 def _muse_routed_lamport_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_cache_policy,
         iris_lamport_bf16_allreduce,
     )
     from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
@@ -1204,6 +1211,7 @@ def _muse_routed_lamport_worker(rank, world_size, device):
             total_elements=value.numel(),
             MAX_ELEMENTS=state.reduction.lamport_max_numel,
             NUM_STAGES=3,
+            PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
             num_warps=1,
         )
 
@@ -1314,10 +1322,11 @@ def _muse_routed_lamport_worker(rank, world_size, device):
 def _muse_decode_step_lamport_worker(rank, world_size, device):
     """Interleave every Lamport user of one decode layer under graph replay.
 
-    The routed-normalization, gather-norm-MXFP4 and generic BF16 reductions
-    share one sentinel mailbox and its per-512-element stage counters while
-    covering different tile prefixes, so the counters diverge per tile. The
-    attention tail keeps its own mailbox but runs in the same step.
+    The routed-normalization, gather-norm-MXFP4 and generic one-shot BF16
+    reductions share one sentinel mailbox and its per-512-element stage
+    counters while covering different tile prefixes, so the counters diverge
+    per tile. TP8's generic two-shot (route payloads from two tokens) and the
+    attention tail keep their own mailboxes but run in the same step.
     """
     from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
         iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum,
@@ -1333,7 +1342,21 @@ def _muse_decode_step_lamport_worker(rank, world_size, device):
     gather_weight = (torch.randn(width, device=device) * 0.1).bfloat16()
     norm = (torch.randn(width, device=device) * 0.1).bfloat16()
     # Start every tile at the last stage so the first replays wrap the counters.
-    state.reduction.lamport_epochs.fill_(2)
+    reduction = state.reduction
+    reduction.lamport_epochs.fill_(2)
+    if reduction.lamport_two_shot_epochs is not None:
+        reduction.lamport_two_shot_epochs.fill_(2)
+    two_shot_tile = world_size * reduction.LAMPORT_TWO_SHOT_TILE
+
+    def two_shot_programs(count):
+        """Programs of the generic reduction's two-shot launch, or zero."""
+        selected = (
+            reduction.LAMPORT_TWO_SHOT_MIN_ELEMENTS
+            <= count
+            <= reduction.lamport_two_shot_max_numel
+            and count % two_shot_tile == 0
+        )
+        return count // two_shot_tile if selected else 0
 
     for rows in (1, 3, 5):
         assert rows * 8 * width <= state.reduction.lamport_max_numel
@@ -1425,28 +1448,46 @@ def _muse_decode_step_lamport_worker(rank, world_size, device):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             outputs = step()
-        # Tiles each Lamport call advances per layer: gather, routed, raw x2.
-        tiles = torch.arange(state.reduction.lamport_epochs.numel(), device=device)
-        advanced = layers * (
-            (tiles < rows * local_width // 512).int()
-            + (tiles < rows * 8).int()
-            + (tiles < rows * 8 * width // 512).int()
-            + (tiles < 3).int()
-        )
+        # Stage counters each Lamport call advances per layer: gather, routed,
+        # and each generic reduction on whichever protocol it selects.
+        tiles = torch.arange(reduction.lamport_epochs.numel(), device=device)
+        advanced = (tiles < rows * local_width // 512).int() + (tiles < rows * 8).int()
+        two_shot_advanced = None
+        if reduction.lamport_two_shot_epochs is not None:
+            programs = torch.arange(
+                reduction.lamport_two_shot_epochs.numel(), device=device
+            )
+            two_shot_advanced = torch.zeros_like(programs)
+        for value in raw_inputs:
+            count = value.numel()
+            if two_shot_programs(count):
+                two_shot_advanced += layers * (programs < two_shot_programs(count))
+            else:
+                advanced += (tiles < count // 512).int()
+        advanced *= layers
+        if world_size == 8 and rows > 1:
+            # Route payloads from two tokens take the TP8 two-shot.
+            assert two_shot_programs(rows * 8 * width)
         for phase in range(4):
             update(phase)
             if rank == phase % world_size:
                 torch.cuda._sleep(20000)
-            before = state.reduction.lamport_epochs.clone()
+            counters = [(reduction.lamport_epochs, advanced)]
+            if two_shot_advanced is not None:
+                counters.append((reduction.lamport_two_shot_epochs, two_shot_advanced))
+            before = [epochs.clone() for epochs, _ in counters]
             graph.replay()
             torch.cuda.synchronize()
-            epochs = state.reduction.lamport_epochs
-            torch.testing.assert_close(
-                epochs, ((before + advanced) % 3).to(epochs.dtype), atol=0, rtol=0
-            )
-            gathered = [torch.empty_like(epochs) for _ in range(world_size)]
-            dist.all_gather(gathered, epochs)
-            assert all(torch.equal(epochs, other) for other in gathered)
+            for (epochs, step_advance), previous in zip(counters, before):
+                torch.testing.assert_close(
+                    epochs,
+                    ((previous + step_advance) % 3).to(epochs.dtype),
+                    atol=0,
+                    rtol=0,
+                )
+                gathered = [torch.empty_like(epochs) for _ in range(world_size)]
+                dist.all_gather(gathered, epochs)
+                assert all(torch.equal(epochs, other) for other in gathered)
 
             # Reference for the routed reduction: the pull one-shot kernel,
             # which shares no state with the Lamport mailbox.
@@ -1511,12 +1552,122 @@ def _muse_decode_step_lamport_worker(rank, world_size, device):
     torch.cuda.synchronize()
     dist.barrier()
     # Every consumed mailbox pack was returned to the empty marker.
-    region = state.reduction.lamport_region.view(torch.int32)
-    assert bool((region == -(2**31)).all())
+    for region in (reduction.lamport_region, reduction.lamport_two_shot_region):
+        if region is not None:
+            assert bool((region.view(torch.int32) == -(2**31)).all())
+
+
+def _muse_lamport_payload_worker(rank, world_size, device):
+    """Distinct per-rank data through each Lamport protocol, grid, and stage."""
+    state = _muse_state(rank, device, 128, True)
+    reduction = state.reduction
+    two_shot = world_size == 8
+    if two_shot:
+        assert reduction.lamport_two_shot_max_numel == 128 * 8192
+    else:
+        assert reduction.lamport_two_shot_epochs is None
+    # (elements, in place, protocol). One-shot: one and eight tiles, one route
+    # token, and a two-shot-sized payload of partial two-shot tiles. TP8
+    # two-shot: the smallest payload, route tokens 2..32 including the largest
+    # one-shot payload, and the full capacity. TP4 has no two-shot; its larger
+    # payloads use push.
+    cases = (
+        (512, False, "one"),
+        (8 * 512, False, "one"),
+        (32768, False, "one"),
+        (32768, True, "one"),
+        (48 * 1024 + 512, False, "one"),
+        (48 * 1024, False, "two"),
+        (65536, False, "two"),
+        (98304, True, "two"),
+        (131072, False, "two"),
+        (43 * 4096, False, "two"),
+        (262144, False, "two"),
+        (524288, True, "two"),
+        (1048576, False, "two"),
+    )
+    if not two_shot:
+        cases = tuple(
+            (count, in_place, "one" if count <= 43 * 4096 else "push")
+            for count, in_place, _ in cases
+        )
+    generator = torch.Generator().manual_seed(4096 + world_size)
+    payloads = []
+    for count, _, _ in cases:
+        values = torch.randint(-512, 512, (world_size, count), generator=generator)
+        values = (values.float() / 64).bfloat16()
+        values[:, 1::97] = -0.0
+        values[:, 2::97] = float("inf")
+        values[:, 3::97] = float("nan")
+        payloads.append(values)
+    inputs = [
+        torch.empty(count, dtype=torch.bfloat16, device=device) for count, _, _ in cases
+    ]
+    outputs = [
+        value if in_place else torch.empty_like(value)
+        for value, (_, in_place, _) in zip(inputs, cases, strict=True)
+    ]
+
+    def load(scale):
+        for values, value in zip(payloads, inputs, strict=True):
+            value.copy_(values[rank] * scale)
+
+    def expected(values, scale):
+        # These FP32 sums are exact, so every protocol's addition order agrees.
+        reduced = (values[0] * scale).float()
+        for peer in range(1, world_size):
+            reduced += (values[peer] * scale).float()
+        return reduced.bfloat16().to(device)
+
+    def run():
+        # Push returns borrowed storage that the next reduction overwrites.
+        return [
+            reduction.run(value, output, value.numel())[: value.numel()].clone()
+            for value, output in zip(inputs, outputs, strict=True)
+        ]
+
+    def check(results, scale):
+        for values, actual in zip(payloads, results, strict=True):
+            torch.testing.assert_close(
+                actual, expected(values, scale), atol=0, rtol=0, equal_nan=True
+            )
+
+    # Each Lamport call advances the stage of exactly the programs it launched.
+    for (count, _, protocol), value, output in zip(cases, inputs, outputs, strict=True):
+        one_shot = reduction.lamport_epochs.clone()
+        two = two_shot and reduction.lamport_two_shot_epochs.clone()
+        value.copy_(payloads[0][rank, :1].expand(count))
+        reduction.run(value, output, count)
+        advanced = (reduction.lamport_epochs != one_shot).sum().item()
+        assert advanced == (count // 512 if protocol == "one" else 0)
+        if two_shot:
+            advanced = (reduction.lamport_two_shot_epochs != two).sum().item()
+            assert advanced == (count // 1024 if protocol == "two" else 0)
+    load(1)
+    check(run(), 1)
+    # Start the capture from the last stage so replays wrap the rotation.
+    reduction.lamport_epochs.fill_(2)
+    if two_shot:
+        reduction.lamport_two_shot_epochs.fill_(2)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        results = run()
+    for step in range(5):
+        scale = float(2**step)
+        load(scale)
+        if rank == step % world_size:
+            torch.cuda._sleep(20000)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(results, scale)
+    dist.barrier()
 
 
 def _muse_tp_routes_worker(rank, world_size, device):
     """Expert TP sums aligned partial routes before nonlinear normalization."""
+
     from tokenspeed.runtime.models.muse_spark import MuseSparkMoE, MuseSparkRMSNorm
 
     torch.set_grad_enabled(False)
@@ -1967,6 +2118,7 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         pytest.param(
             _muse_decode_step_lamport_worker, "nccl", id="decode_step_lamport"
         ),
+        pytest.param(_muse_lamport_payload_worker, "nccl", id="lamport_payloads"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
         pytest.param(_muse_tp_routes_worker, "nccl", id="tp_routes"),
         pytest.param(
