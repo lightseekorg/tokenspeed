@@ -189,13 +189,11 @@ straight there, bypassing load balancing — overload spill is the router's
 job. An invalid pin fails that request. The engine keeps serving. Engines
 without attention DP drop the pin.
 
-Prefill engines ignore the pin: the decode side finds a request's prefill
-rank from its `bootstrap_room` residue (`room % dp_size`), so steer prefill
-placement by minting the room instead. The engine logs and ignores a
-conflicting pin rather than rejecting it. Decode engines honor the pin,
-since any decode rank finds the prefill rank from the room; without one, or
-with one out of range (logged and ignored), the room residue places the
-request.
+Disaggregated prefill and decode engines each honor their own rank pin.
+The `bootstrap_room` still identifies the prefill KV source:
+`room % prefill_dp_size` must match the selected prefill rank. The decode
+rank can differ from the room residue. Without a pin, PD requests follow
+`room % dp_size`.
 
 With the bundled gateway, pass `--policy cache_aware --dp-aware` to
 `ts serve` to enable per-rank affinity routing. This requires bundled smg
