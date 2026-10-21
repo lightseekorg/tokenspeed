@@ -484,12 +484,17 @@ public:
     };
     BlockRange SlidingWindowBlocks(std::int32_t i, std::int32_t boundary_tokens) const;
     // The first of a tail's blocks (page offset) group i needs: 0 for a
-    // History group that keeps every row; for a sliding group the block
-    // holding the window's first row when that lies inside the tail's page,
-    // below which the tail's blocks stay holes.
+    // History group that keeps every row and for a State group's one tail
+    // block; for a sliding group the block holding the window's first row
+    // when that lies inside the tail's page, below which the tail's blocks
+    // stay holes.
     std::int32_t FirstTailBlockNeeded(std::int32_t i, std::int32_t tail_tokens) const {
-        return tokenspeed::FirstTailBlockNeeded(groups_[static_cast<std::size_t>(i)].Spec(),
-                                                geometry_[static_cast<std::size_t>(i)].BlockGranularity(), tail_tokens);
+        const auto index = static_cast<std::size_t>(i);
+        if (GroupIsState(index)) {
+            return 0;
+        }
+        return tokenspeed::FirstTailBlockNeeded(groups_[index].Spec(), geometry_[index].BlockGranularity(),
+                                                tail_tokens);
     }
 
 private:
