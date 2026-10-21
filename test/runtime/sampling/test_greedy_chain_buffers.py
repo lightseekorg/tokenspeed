@@ -66,7 +66,8 @@ def test_verify_refreshes_complete_accepted_path(device, bs, width):
     info = SamplingBatchInfo(vocab_size=64, device=device)
     logits = LogitsProcessorOutput(
         next_token_logits=torch.empty(bs * width, 64, device=device),
-        next_token_ids=target.flatten(),
+        # Match argmax output and the CUDA verifier's target-ID contract.
+        next_token_ids=target.flatten().to(torch.int64),
     )
     for accepted in (width - 1, 0, (width - 1) // 2):
         candidates[:, 1:] = target[:, :-1]
