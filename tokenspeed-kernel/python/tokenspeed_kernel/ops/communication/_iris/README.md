@@ -32,9 +32,10 @@ IDs cover different element ranges. Triton RSAG remains independent.
 Model preparation, dispatch, and fusions live in `kimi_k3/` and
 `muse_spark/`. General collectives live in `all_reduce.py`,
 `reduce_scatter.py`, `all_gather.py`, and `broadcast.py`. The all-gather module
-also owns the width-parameterized RMSNorm/MXFP4 fusion. Exchanges with
-model-specific head layouts, route packets, or normalization semantics stay in
-the model package, along with dispatch and capacities.
+also owns the width-parameterized RMSNorm/MXFP4 fusion, with a Lamport variant
+that shares the BF16 reduction's mailbox. Exchanges with model-specific head
+layouts, route packets, or normalization semantics stay in the model package,
+along with dispatch and capacities.
 
 Muse Spark prepares its collectives for TP4/EP4 or TP8/EP8 on gfx950. Both
 topologies keep the same global token cutoffs for Lamport, push, pull, and
