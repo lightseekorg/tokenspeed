@@ -33,22 +33,42 @@ def test_dsv41_registration_from_empty_registry(entrypoint):
     script = """
 import faulthandler
 import importlib
+import os
 import sys
 import time
 
 started = time.monotonic()
 
 def log(phase):
-    print(
-        f"[dsv41 {sys.argv[1]} +{time.monotonic() - started:.3f}s] {phase}",
-        file=sys.stderr,
-        flush=True,
-    )
+    try:
+        print(
+            f"[dsv41 {sys.argv[1]} +{time.monotonic() - started:.3f}s] {phase}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except (OSError, ValueError):
+        # Diagnostic output must not interrupt the registration checks.
+        pass
 
 # Capture the child stack before the parent's 60-second timeout kills it.
 # Keep the watchdog armed through interpreter shutdown as well as imports.
 faulthandler.enable()
 faulthandler.dump_traceback_later(45)
+
+# Read inherited settings without importing dependencies or probing the GPU.
+environment = {
+    key: os.environ.get(key)
+    for key in (
+        "PYTEST_XDIST_WORKER",
+        "CUDA_VISIBLE_DEVICES",
+        "CUDA_HOME",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "TOKENSPEED_KERNEL_PROFILE",
+        "TOKENSPEED_KERNEL_CAPTURE_SHAPES",
+    )
+}
+log(f"child started: pid={os.getpid()}, environment={environment!a}")
 
 sys.path.insert(0, sys.argv[2])
 log("import registry: start")
