@@ -295,7 +295,7 @@ def prepare_k3_communication(
             3584 + 7168
         )
         if lamport_numel:
-            total_bytes += ProducerLamport.heap_bytes(lamport_numel)
+            total_bytes += ProducerLamport.heap_bytes(lamport_numel, world_size)
     sharded_bytes = (
         IrisAllReduceShardedState.heap_bytes(sharded_max_rows, world_size, dtype)
         if sharded_max_rows
