@@ -823,6 +823,7 @@ def _moe_sigmoid_bias_topk(
     weights_dtype: torch.dtype = torch.float32,
     override: str | None = None,
     solution: str | None = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select experts using ``sigmoid(logits) + correction_bias``.
 
@@ -835,15 +836,19 @@ def _moe_sigmoid_bias_topk(
         logical_to_physical_map: Optional ``[experts]`` integer map applying
             static expert-location dispatch to the selected ids (fused into
             the specialized decode kernel; a gather elsewhere).
-        weights_dtype: Output dtype for the route weights (selection always
-            runs in FP32).
+        weights_dtype: Dtype for allocated route weights (selection always
+            runs in FP32). Supplied output buffers select their own precision.
         override: Optional exact registered kernel name.
         solution: Optional implementation solution.
+        out: Optional contiguous weight and expert-ID output buffers. FP32
+            weight storage retains FP32 precision, including when
+            ``weights_dtype`` is BF16. IDs can use INT32 or INT64. The selected
+            kernel must support these buffers.
 
     Returns:
-        ``(topk_weights, topk_ids)`` with shapes ``[tokens, topk]``. Weights
-        are ``weights_dtype`` and ids are INT32 (physical ids when a dispatch
-        map is given).
+        ``(topk_weights, topk_ids)`` with shapes ``[tokens, topk]``. Supplied
+        output buffers are returned in place. Without buffers, weights use
+        ``weights_dtype`` and IDs use INT32. A dispatch map produces physical IDs.
     """
     if router_logits.dim() != 2:
         raise ValueError("router_logits must have shape [tokens, experts]")
@@ -864,11 +869,33 @@ def _moe_sigmoid_bias_topk(
         )
     if not 0 < topk <= experts:
         raise ValueError(f"topk must be in [1, {experts}], got {topk}")
+    if out is not None:
+        weights, ids = out
+        shape = (tokens, topk)
+        for tensor in out:
+            if (
+                tensor.shape != shape
+                or tensor.device != router_logits.device
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"Routing output must be contiguous {shape} on {router_logits.device}"
+                )
+        if weights.dtype != weights_dtype and not (
+            weights_dtype == torch.bfloat16 and weights.dtype == torch.float32
+        ):
+            raise ValueError(
+                "Routing weights must use the requested dtype or FP32 storage "
+                "for BF16 requests"
+            )
+        if ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Routing expert IDs must use INT32 or INT64")
     if tokens == 0:
-        shape = (0, topk)
+        if out is not None:
+            return out
         return (
-            torch.empty(shape, device=router_logits.device, dtype=weights_dtype),
-            torch.empty(shape, device=router_logits.device, dtype=torch.int32),
+            torch.empty((0, topk), dtype=weights_dtype, device=router_logits.device),
+            torch.empty((0, topk), dtype=torch.int32, device=router_logits.device),
         )
     if (
         override is None
@@ -898,7 +925,15 @@ def _moe_sigmoid_bias_topk(
         except NoKernelFoundError:
             mapped_kernel = None
         if mapped_kernel is not None:
-            topk_weights, topk_ids = mapped_kernel(
+            spec = KernelRegistry.get().get_by_name(mapped_kernel.name)
+            supports_output_buffers = spec is not None and True in spec.traits.get(
+                "supports_output_buffers", frozenset({False})
+            )
+            if out is not None and not supports_output_buffers:
+                raise ValueError(
+                    f"{mapped_kernel.name} does not accept routing output buffers"
+                )
+            kwargs = dict(
                 router_logits=router_logits,
                 correction_bias=correction_bias,
                 topk=topk,
@@ -907,6 +942,10 @@ def _moe_sigmoid_bias_topk(
                 logical_to_physical_map=logical_to_physical_map,
                 weights_dtype=weights_dtype,
             )
+            if supports_output_buffers:
+                topk_weights, topk_ids = mapped_kernel(**kwargs, out=out)
+            else:
+                topk_weights, topk_ids = mapped_kernel(**kwargs)
             return topk_weights, topk_ids
 
     kernel = select_kernel(
@@ -917,7 +956,13 @@ def _moe_sigmoid_bias_topk(
         override=override,
         solution=solution,
     )
-    topk_weights, topk_ids = kernel(
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    supports_output_buffers = spec is not None and True in spec.traits.get(
+        "supports_output_buffers", frozenset({False})
+    )
+    if out is not None and not supports_output_buffers:
+        raise ValueError(f"{kernel.name} does not accept routing output buffers")
+    kwargs = dict(
         router_logits=router_logits,
         correction_bias=correction_bias,
         topk=topk,
@@ -925,8 +970,15 @@ def _moe_sigmoid_bias_topk(
         normalize_topk_weights=normalize_topk_weights,
         weights_dtype=weights_dtype,
     )
+    if supports_output_buffers:
+        topk_weights, topk_ids = kernel(**kwargs, out=out)
+    else:
+        topk_weights, topk_ids = kernel(**kwargs)
     if logical_to_physical_map is not None:
         topk_ids = logical_to_physical_map[topk_ids.long()].to(torch.int32)
+        if out is not None:
+            out[1].copy_(topk_ids)
+            topk_ids = out[1]
     return topk_weights, topk_ids
 
 
@@ -1028,6 +1080,7 @@ def moe_topk(
     topk_weights_dtype: torch.dtype = torch.float32,
     override: str | None = None,
     solution: str | None = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Produce expert weights and ids using a registered MoE TopK kernel.
 
@@ -1052,9 +1105,13 @@ def moe_topk(
             and Triton can write BF16 directly after scaling.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
+        out: Optional (weights, ids) output buffers for biased sigmoid routing.
+            IDs must use topk_indices_dtype. Weights use the supplied buffer's
+            precision; FP32 storage is also accepted for BF16 requests.
+            Omission allocates the outputs in the selected kernel.
     Returns:
         Weights and expert ids shaped [tokens, top_k], using the requested
-        output dtypes (FP32 weights and INT32 ids by default).
+        output dtypes, or the supplied out buffers.
     """
     if selection_method not in {"topk", "hash"}:
         raise ValueError(f"unsupported MoE selection method: {selection_method!r}")
@@ -1069,6 +1126,13 @@ def moe_topk(
         raise ValueError("topk_indices_dtype must be torch.int32 or torch.int64")
     if not topk_weights_dtype.is_floating_point:
         raise ValueError("topk_weights_dtype must be a floating-point dtype")
+    if out is not None:
+        if score_function != "sigmoid":
+            raise ValueError(
+                "Routing output buffers currently support biased sigmoid top-k"
+            )
+        if out[1].dtype != topk_indices_dtype:
+            raise ValueError("Routing expert-ID output must match topk_indices_dtype")
 
     scaling_factor = 1.0 if routed_scaling_factor is None else routed_scaling_factor
     if score_function == "softmax":
@@ -1104,6 +1168,7 @@ def moe_topk(
             weights_dtype=topk_weights_dtype,
             override=override,
             solution=solution,
+            out=out,
         )
         return topk_weights, topk_ids.to(topk_indices_dtype)
 

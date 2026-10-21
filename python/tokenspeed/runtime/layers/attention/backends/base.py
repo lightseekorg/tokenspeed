@@ -97,17 +97,20 @@ class SparseTopKShare:
 
     ``prefill`` covers the extend rows, ``decode`` the decode rows (or the
     verify window); each family stores its own record type. ``qsa_metadata``
-    holds QSA's layer-invariant row geometry so it is built once per forward.
+    holds QSA's layer-invariant row geometry so it is built once per forward;
+    ``qsa_selection`` retains its logical candidates alongside physical slots.
     """
 
     prefill: Any | None = None
     decode: Any | None = None
     qsa_metadata: Any | None = None
+    qsa_selection: Any | None = None
 
     def clear(self) -> None:
         self.prefill = None
         self.decode = None
         self.qsa_metadata = None
+        self.qsa_selection = None
 
 
 class CachePoolBinding:
