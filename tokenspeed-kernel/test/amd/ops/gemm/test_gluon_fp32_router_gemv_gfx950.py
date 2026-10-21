@@ -148,3 +148,27 @@ def test_router_kernel_compiles_once_per_row_bucket() -> None:
             launch_gluon_fp32_router_gemv_gfx950(
                 x[:rows].contiguous(), prepared, MULTIPLIER, False
             )
+
+
+# Both counts exceed the GEMV row limit and take BLAS with alpha.
+@pytest.mark.parametrize("rows", [17, 1031])
+def test_planned_router_matches_scaled_matmul_bitwise(rows: int) -> None:
+    """Rows above the GEMV go to BLAS with the multiplier folded into alpha."""
+    torch.manual_seed(31)
+    hidden, columns = 8192, 256
+    x = torch.randn(rows, hidden, dtype=torch.float32, device="cuda")
+    weight = torch.randn(hidden, columns, dtype=torch.float32, device="cuda") * 0.02
+    plan = fp32_router_gemv_plan(
+        hidden_size=hidden,
+        output_size=columns,
+        dtype=torch.float32,
+        solution=None,
+        batch_invariant=False,
+    )
+    prepared_weight = fp32_router_gemv_process_weight(plan, weight)
+    counters = fp32_router_gemv_counters(columns, x.device)
+    out = fp32_router_gemv_execute(
+        plan, x, prepared_weight, MULTIPLIER, counters, False
+    )
+    expected = torch.matmul(x, prepared_weight.T) * MULTIPLIER
+    assert torch.equal(out.view(torch.int32), expected.view(torch.int32))

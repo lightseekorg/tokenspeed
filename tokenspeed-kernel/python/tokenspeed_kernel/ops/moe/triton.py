@@ -503,6 +503,7 @@ def triton_bf16_moe_routes(
     w2: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_start: int,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Triton kernel of :func:`tokenspeed_kernel.ops.moe.bf16_moe_routes`."""
     _check_bf16_route_tensors(x, w13, w2, topk_ids)
@@ -520,6 +521,7 @@ def triton_bf16_moe_routes(
         None,
         expert_start,
         False,
+        output,
     )
 
 
