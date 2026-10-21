@@ -456,10 +456,9 @@ class ProducerLamport:
         )
 
     @staticmethod
-    def heap_bytes(max_numel: int) -> int:
+    def heap_bytes(max_numel: int, world_size: int) -> int:
         return allocation_bytes(
-            (ProducerLamport.NUM_STAGES, ProducerLamport.WORLD_SIZE, max_numel),
-            torch.bfloat16,
+            (ProducerLamport.NUM_STAGES, world_size, max_numel), torch.bfloat16
         )
 
     def __init__(
@@ -558,16 +557,32 @@ def _iris_subgroup_any(flags):
     compiler from hoisting polling loads out of the loop. The 64-bit result is
     the whole lane mask only on wave64 (CDNA4) targets.
 
+    Wave32 targets reduce the flags instead, since their lanes can hold
+    several; the reduction spans the workgroup. A per-element copy carries the
+    memory clobber there.
+
     Args:
-        flags: Exactly one int32 per lane (the instruction takes one VGPR).
+        flags: On wave64, exactly one int32 per lane (the instruction takes one
+            VGPR).
     """
-    mask = gl.inline_asm(
-        "v_cmp_ne_u32_e64 $0, 0, $1",
-        "=s,v,~{memory}",
-        [flags],
-        gl.int64,
-        is_pure=False,
-    )
+    if hip_utils.num_threads() // hip_utils.num_warps() == 64:
+        mask = gl.inline_asm(
+            "v_cmp_ne_u32_e64 $0, 0, $1",
+            "=s,v,~{memory}",
+            [flags],
+            gl.int64,
+            is_pure=False,
+        )
+    else:
+        flags = gl.inline_asm_elementwise(
+            "v_mov_b32 $0, $1",
+            "=v,v,~{memory}",
+            [flags],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
+        mask = gl.max(flags, 0)
     return mask != 0
 
 
@@ -831,18 +846,22 @@ def iris_lamport_allreduce(
     NUM_STAGES: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
 ):
-    """All-reduce BF16 tiles across eight ranks using data as the ready signal.
+    """All-reduce BF16 tiles across 2, 4 or 8 ranks using data as the ready signal.
 
     Push input_sym_ptr into each peer's rotating mailbox and wait until the
     local mailbox contains every peer's contribution. Sum in FP32 rank order
     and write BF16 output_ptr. Clear consumed mailboxes and advance the tile's
     counter; negative zero is replaced with zero to preserve the empty marker.
     """
-    gl.static_assert(WORLD_SIZE == 8)
+    gl.static_assert(WORLD_SIZE == 2 or WORLD_SIZE == 4 or WORLD_SIZE == 8)
     gl.static_assert(TOTAL_ELEMENTS % 512 == 0)
     gl.static_assert(TOTAL_ELEMENTS <= MAX_ELEMENTS)
     gl.static_assert(NUM_STAGES >= 3)
-    layout: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [1, 1], [0, 1])
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // hip_utils.num_warps()
+    # Each lane owns 64 / SUBGROUP_SIZE consecutive 16-byte packs of the tile.
+    layout: gl.constexpr = gl.BlockedLayout(
+        [64 // SUBGROUP_SIZE, 8], [SUBGROUP_SIZE, 1], [1, 1], [1, 0]
+    )
     pack = gl.program_id(0) * 64 + gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
     element = gl.arange(0, 8, layout=gl.SliceLayout(0, layout))
     offsets = pack[:, None] * 8 + element[None, :]

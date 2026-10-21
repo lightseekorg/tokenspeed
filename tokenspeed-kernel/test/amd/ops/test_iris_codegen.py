@@ -182,3 +182,64 @@ def test_iris_arch_policy_codegen(arch, world_size, input_published, tmp_path):
     assert all(re.search(isa["system"], line) for line in atomics), atomics
 
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
+
+
+@pytest.mark.skipif(not current_platform().is_cdna5, reason="gfx1250 codegen")
+@pytest.mark.parametrize("world_size", (2, 4, 8))
+def test_iris_lamport_codegen_gfx1250(world_size, tmp_path):
+    """Each lane moves two 16-byte packs, and every peer read retries.
+
+    Publication goes to peers with plain stores, which reach the fabric an order
+    of magnitude faster than write-through ones on gfx1250. Only the local
+    sentinel reset keeps its cache bypass.
+    """
+    from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel.ops.communication._iris import all_reduce as ar
+
+    policy = ar.iris_arch_policy(_ARCH_VERSIONS["gfx1250"])
+    fn = ar.iris_lamport_allreduce
+    signature = {
+        name: "*i32" if name == "epochs" else "*bf16" for name in fn.arg_names[:4]
+    }
+    signature.update({name: "i64" for name in fn.arg_names[4:12]})
+    source = gluon._runtime.GluonASTSource(
+        fn,
+        signature,
+        constexprs={
+            "RANK": world_size - 1,
+            "WORLD_SIZE": world_size,
+            "TOTAL_ELEMENTS": 6 * 10752,
+            "MAX_ELEMENTS": 6 * 10752,
+            "NUM_STAGES": ar.ProducerLamport.NUM_STAGES,
+            "PEER_SIGNAL_STORE_CACHE": policy.peer_signal_store,
+        },
+        attrs={(index,): [["tt.divisibility", 16]] for index in range(12)},
+    )
+    kernel = triton.compile(
+        source,
+        target=triton.backends.compiler.GPUTarget("hip", "gfx1250", 32),
+        options={"num_warps": ar.ProducerLamport.NUM_SUBGROUPS},
+    )
+    assembly = kernel.asm["amdgcn"]
+    (tmp_path / f"lamport-ws{world_size}.amdgcn").write_text(assembly)
+    lines = assembly.splitlines()
+
+    peer_reads = 2 * (world_size - 1)
+    polls = [
+        index
+        for index, line in enumerate(lines)
+        if re.search(r"\bbuffer_load_b128\s.*SCOPE_SYS", line)
+    ]
+    assert len(polls) == peer_reads
+    cycles = _backedge_cycles(lines)
+    assert any(
+        all(start <= poll <= end for poll in polls) for start, end in cycles
+    ), "every peer read must execute again on a retry"
+    stores = [line for line in lines if re.search(r"\bbuffer_store_", line)]
+    assert all("buffer_store_b128" in line for line in stores), stores
+    resets = [line for line in stores if "th:" in line]
+    assert len(resets) == peer_reads
+    assert all("SCOPE_SYS" in line for line in resets), resets
+    # Peer publications plus this rank's output.
+    assert len(stores) - len(resets) == peer_reads + 2
+    assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
