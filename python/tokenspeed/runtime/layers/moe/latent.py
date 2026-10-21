@@ -128,11 +128,15 @@ def latent_moe_expert_shared_all_reduce(
 
 @dataclass(frozen=True)
 class Kimi3MoEExecutionPlan:
-    """Construction-time orchestration selected for Kimi-K3 latent MoE."""
+    """Construction-time orchestration selected for Kimi-K3 latent MoE.
+
+    NVIDIA MegaMoE workspace use is separate from fused EP communication ownership.
+    """
 
     use_native: bool
     use_trtllm: bool
     use_mega_moe: bool
+    owns_ep_communication: bool
     overlap_shared_experts: bool
     joint_moe_reduce: bool
     use_marlin: bool = False
@@ -146,15 +150,19 @@ class Kimi3MoEExecutionPlan:
     ) -> "Kimi3MoEExecutionPlan":
         """Select orchestration from the backend, streams, and parallel layout."""
 
-        use_mega_moe = moe_backend in (MoeBackend.MEGA_MOE, MoeBackend.GLUON_PETIT)
-        use_native = not use_mega_moe and native_latent_moe_available()
+        use_mega_moe = moe_backend == MoeBackend.MEGA_MOE
+        owns_ep_communication = moe_backend in (
+            MoeBackend.MEGA_MOE,
+            MoeBackend.GLUON_PETIT,
+        )
+        use_native = not owns_ep_communication and native_latent_moe_available()
         # Hopper (SM90) has no native FP4 tensor cores and no flashinfer SiTU
         # cubin, so K3's MXFP4 SiTU MoE runs weight-only through the Marlin
         # W4A16 GEMM with a fused Triton SiTU epilogue. AUTO picks it whenever
         # neither the AMD-native nor the (Blackwell) TRT-LLM path is available;
         # it can also be forced with ``--moe-backend marlin``.
         use_marlin = (
-            not use_mega_moe
+            not owns_ep_communication
             and not use_native
             and (
                 moe_backend.is_marlin()
@@ -162,7 +170,7 @@ class Kimi3MoEExecutionPlan:
             )
         )
         use_trtllm = (
-            not use_mega_moe
+            not owns_ep_communication
             and not use_native
             and not use_marlin
             and (moe_backend.is_auto() or moe_backend.is_flashinfer_trtllm())
@@ -171,6 +179,7 @@ class Kimi3MoEExecutionPlan:
             use_native=use_native,
             use_trtllm=use_trtllm,
             use_mega_moe=use_mega_moe,
+            owns_ep_communication=owns_ep_communication,
             use_marlin=use_marlin,
             overlap_shared_experts=(
                 use_native and alt_stream is not None and mapping.moe.tp_ep_size == 1

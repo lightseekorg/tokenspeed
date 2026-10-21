@@ -658,7 +658,9 @@ class InputBuffers:
             self.force_single_token_verify_buf[
                 row_offset : row_offset + expected_count
             ] = force_single_token
-            runtime_states.spec_candidates_ready[decode_req_pool_indices] = False
+            runtime_states.spec_candidates_ready.index_fill_(
+                0, decode_req_pool_indices, False
+            )
 
         if num_extends > 0:
             prefill_token_count = sum(forward_op.input_lengths[:num_extends])

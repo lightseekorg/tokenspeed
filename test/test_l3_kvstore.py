@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import ctypes
 import os
+import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import types
 from contextlib import contextmanager
@@ -33,7 +35,6 @@ from unittest import mock
 import pytest
 
 from tokenspeed.runtime.cache.l3.backend import (
-    L3_FLUSH_REQUIRES_WEIGHT_VERSION,
     L3_RUNTIME_COMPAT,
     MemoryKvStore,
     _ext_def_file_from_yaml_text,
@@ -42,15 +43,16 @@ from tokenspeed.runtime.cache.l3.backend import (
     l3_checkpoint_id,
     resolve_l3_weight_version,
     share_l3_checkpoint_ids,
+    storage_deployment_id,
     storage_key_prefix,
     storage_object_key,
 )
-from tokenspeed.runtime.cache.l3.executor import L3HostStore
-from tokenspeed.runtime.cache.l3.factory import create_kvstore_storage_backend
+from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig, parse_extra_config
+from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
+from tokenspeed.runtime.cache.l3.factory import create_storage_backend
 from tokenspeed.runtime.cache.l3.mooncake import (
     MooncakeKvStore,
     MooncakeStoreConfig,
-    parse_extra_config,
 )
 
 
@@ -76,6 +78,110 @@ class _FakeHost:
         return offset, self._payload_size
 
 
+class TestMinimalL3ExecutorTest:
+    def test_roundtrip_without_site_packages(self):
+        # Only the scheduler native package is needed; no inference dependencies.
+        import tokenspeed_scheduler
+        import tokenspeed_scheduler.tokenspeed_scheduler_ext as scheduler_ext
+
+        source = textwrap.dedent("""
+            import importlib.util
+            import os
+            import sys
+            import time
+
+            # ``python -S`` skips the editable-install finder that maps the
+            # scheduler's compiled extension, so register it from the path the
+            # parent resolved before the package import looks for it.
+            spec = importlib.util.spec_from_file_location(
+                "tokenspeed_scheduler.tokenspeed_scheduler_ext",
+                os.environ["_L3_TEST_SCHEDULER_EXT"],
+            )
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+
+            from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
+            from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
+            from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
+
+            class Host:
+                def __init__(self):
+                    self.host_buffer = bytearray(b"tail")
+
+                def host_block_range(self, group_id, block_id):
+                    return 0, 4
+
+            host = Host()
+            executor = L3Executor(
+                MemoryKvStore(), host, key_prefix="minimal", rank=0, ownership=None,
+                config=StorageRuntimeConfig.from_extra_config(
+                    None, host_blocks=8, prefix_granularity=2
+                ),
+                prefix_for_weight_version=None,
+            )
+            def run(op_id, kind):
+                keys, offsets, sizes = executor._page_ranges([(0, 1, "prefix", 0)])
+                executor.submit(StorageJob(op_id, kind, tuple(keys), tuple(offsets), tuple(sizes)))
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    facts = executor.poll().completions
+                    if facts:
+                        assert len(facts) == 1
+                        assert facts[0].retired and facts[0].success == (True,)
+                        return
+                    time.sleep(0.001)
+                raise AssertionError("L3 operation did not finish")
+            try:
+                run(1, "put")
+                host.host_buffer[:] = bytes(4)
+                run(2, "get")
+                assert host.host_buffer == b"tail"
+            finally:
+                executor.close(timeout_s=3)
+            """)
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", source],
+            env={
+                **os.environ,
+                "_L3_TEST_SCHEDULER_EXT": scheduler_ext.__file__,
+                "PYTHONPATH": os.pathsep.join(
+                    [
+                        os.path.abspath(
+                            os.path.join(os.path.dirname(__file__), "..", "python")
+                        ),
+                        os.path.dirname(os.path.dirname(tokenspeed_scheduler.__file__)),
+                    ]
+                ),
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+
+def _deployment_facts():
+    return {
+        "model_name": "org/model",
+        "revision": "abc",
+        "model_overrides": {},
+        "cache_signature": "layout",
+        "pipeline_rank": 0,
+        "attn_tp_size": 1,
+        "draft_model": "",
+        "draft_revision": "",
+        "cache_quantization": "",
+        "runtime_compat": L3_RUNTIME_COMPAT,
+        "attention_backend": "mha",
+        "draft_attention_backend": "",
+        "skip_softmax_threshold": 0.0,
+        "eagle3_layers_to_capture": [],
+        "kv_producer": {"numerics": "resolved", "attn_kvp_size": 1},
+    }
+
+
 class TestStorageKeyTest:
     def test_object_key_includes_group_offset_and_rank(self):
         # The trailing ``|c0`` is the retired context-parallel shard id, kept
@@ -92,42 +198,36 @@ class TestStorageKeyTest:
 
     def test_prefix_is_stable_and_separates_incompatible_cache_objects(self):
         def prefix(**overrides):
-            values = {
-                "model_name": "org/model",
-                "revision": "abc",
-                "weight_version": "v1",
-                "model_overrides": {},
-                "cache_signature": "layout",
-                "pipeline_rank": 0,
-                "attn_tp_size": 1,
-                "draft_model": "",
-                "draft_revision": "",
-                "draft_weight_version": "",
-                "cache_quantization": "",
-                "runtime_compat": L3_RUNTIME_COMPAT,
-                "attention_backend": "mha",
-                "draft_attention_backend": "",
-                "skip_softmax_threshold": 0.0,
-                "eagle3_layers_to_capture": [],
-            }
+            values = _deployment_facts()
+            values.update(weight_version="v1", draft_weight_version="")
             values.update(overrides)
-            return storage_key_prefix(**values)
+            weight_version = values.pop("weight_version")
+            draft_weight_version = values.pop("draft_weight_version")
+            return storage_key_prefix(
+                storage_deployment_id(**values),
+                weight_version=weight_version,
+                draft_weight_version=draft_weight_version,
+            )
 
         base = prefix()
-        assert (base) == (prefix())
-        assert base.startswith("tsl3v1-")
-        assert (base) != (prefix(model_name="org_model"))
-        assert (base) != (prefix(revision="def"))
-        assert (base) != (prefix(weight_version="v2"))
-        assert (base) != (prefix(cache_signature="other"))
-        assert (base) != (prefix(pipeline_rank=1))
-        assert (base) != (prefix(attn_tp_size=8))
-        assert (prefix(attn_tp_size=8)) != (prefix(attn_tp_size=16))
-        assert (base) != (prefix(draft_model="org/draft"))
-        assert (base) != (prefix(cache_quantization='{"quantization":"fp8"}'))
-        assert (base) != (prefix(model_overrides={"rope_theta": 10000.0}))
-        assert (prefix(model_overrides={"rope_theta": 10000.0})) != (
-            prefix(model_overrides={"rope_scaling": {"type": "linear"}})
+        assert base == prefix()
+        assert base.startswith("tsl3-")
+        assert base != prefix(kv_producer={"numerics": "different"})
+        assert base != prefix(model_name="org_model")
+        assert base != prefix(revision="def")
+        assert base != prefix(weight_version="v2")
+        assert base != prefix(cache_signature="other")
+        assert base != prefix(pipeline_rank=1)
+        assert base != prefix(attn_tp_size=8)
+        assert prefix(attn_tp_size=8) != prefix(attn_tp_size=16)
+        assert base != prefix(draft_model="org/draft")
+        assert base != prefix(cache_quantization='{"quantization":"fp8"}')
+        assert base != prefix(model_overrides={"rope_theta": 10000.0})
+        assert prefix(model_overrides={"rope_theta": 10000.0}) != prefix(
+            model_overrides={"rope_scaling": {"type": "linear"}}
+        )
+        assert prefix(model_overrides={"b": 2, "a": 1}) == prefix(
+            model_overrides={"a": 1, "b": 2}
         )
         assert (prefix(model_overrides={"b": 2, "a": 1})) == (
             prefix(model_overrides={"a": 1, "b": 2})
@@ -144,12 +244,14 @@ class TestStorageKeyTest:
         assert (prefix(draft_attention_backend="fa3")) != (
             prefix(draft_attention_backend="fa4")
         )
-        assert (base) != (prefix(runtime_compat="2"))
-        assert (prefix(runtime_compat="1")) == (prefix(runtime_compat="1"))
-        assert (base) != (prefix(skip_softmax_threshold=1e-2))
-        assert (prefix(skip_softmax_threshold=0.0)) == (
-            prefix(skip_softmax_threshold=0.0)
-        )
+        assert base != prefix(runtime_compat="previous-epoch")
+        assert base == prefix(runtime_compat="2")
+        assert base != prefix(runtime_compat="1")
+        assert base != prefix(runtime_compat="3")
+        assert base != prefix(runtime_compat="4")
+        assert prefix(runtime_compat="1") == prefix(runtime_compat="1")
+        assert base != prefix(skip_softmax_threshold=0.01)
+        assert prefix(skip_softmax_threshold=0.0) == prefix(skip_softmax_threshold=0.0)
         assert (base) != (prefix(eagle3_layers_to_capture=[2, 16, 29]))
         assert (prefix(eagle3_layers_to_capture=[2, 16, 29])) != (
             prefix(eagle3_layers_to_capture=[1, 16, 29])
@@ -161,6 +263,51 @@ class TestStorageKeyTest:
             prefix(eagle3_layers_to_capture="2,16,29")
         with pytest.raises((TypeError)):
             prefix(model_overrides=["rope_theta"])
+        with pytest.raises(ValueError):
+            prefix(kv_producer={})
+
+    def test_deployment_snapshot_does_not_retain_mutable_inputs(self):
+        facts = _deployment_facts()
+        deployment = storage_deployment_id(**facts)
+        before = storage_key_prefix(
+            deployment, weight_version="v1", draft_weight_version=""
+        )
+        facts["model_overrides"]["rope_theta"] = 10000.0
+        facts["kv_producer"]["numerics"] = "different"
+        facts["eagle3_layers_to_capture"].append(4)
+        assert (
+            storage_key_prefix(deployment, weight_version="v1", draft_weight_version="")
+            == before
+        )
+        updated = storage_deployment_id(**facts)
+        assert updated != deployment
+        assert (
+            storage_key_prefix(updated, weight_version="v1", draft_weight_version="")
+            != before
+        )
+
+    def test_target_and_draft_weight_generations_are_independent(self):
+        facts = _deployment_facts()
+        facts.update(draft_model="org/draft", draft_revision="draft-abc")
+        deployment = storage_deployment_id(**facts)
+        base = storage_key_prefix(
+            deployment, weight_version="v1", draft_weight_version="draft-v1"
+        )
+        target = storage_key_prefix(
+            deployment, weight_version="v2", draft_weight_version="draft-v1"
+        )
+        draft = storage_key_prefix(
+            deployment, weight_version="v1", draft_weight_version="draft-v2"
+        )
+        assert len({base, target, draft}) == 3
+
+    def test_structured_producer_facts_have_canonical_order(self):
+        facts = _deployment_facts()
+        forward = storage_deployment_id(**facts)
+        facts["kv_producer"] = {"attn_kvp_size": 1, "numerics": "resolved"}
+        assert storage_deployment_id(**facts) == forward
+        facts["kv_producer"]["attn_kvp_size"] = 2
+        assert storage_deployment_id(**facts) != forward
 
     def _checkpoint_id(self, model_path, *, load_format, hf_config, revision):
         return l3_checkpoint_id(
@@ -1305,40 +1452,10 @@ class TestStorageKeyTest:
                 )
             )
 
-    def test_resolve_l3_weight_version_does_not_mint_a_successor(self):
-        assert (
-            resolve_l3_weight_version(
-                "v1",
-                None,
-                flush_cache=True,
-                storage_backend="memory",
-            )
-        ) is None
-        assert (
-            resolve_l3_weight_version(
-                "v1",
-                None,
-                flush_cache=True,
-                storage_backend=None,
-            )
-        ) is None
-        assert (
-            resolve_l3_weight_version(
-                "v1",
-                None,
-                flush_cache=False,
-                storage_backend="memory",
-            )
-        ) is None
-        assert (
-            resolve_l3_weight_version(
-                "v1",
-                "explicit",
-                flush_cache=True,
-                storage_backend="memory",
-            )
-        ) == ("explicit")
-        assert ("require weight_version") in (L3_FLUSH_REQUIRES_WEIGHT_VERSION)
+    def test_resolve_l3_weight_version_preserves_requested_identity(self):
+        assert resolve_l3_weight_version(None) is None
+        assert resolve_l3_weight_version("explicit") == "explicit"
+        assert resolve_l3_weight_version(12) == "12"
 
     def test_layout_signature_includes_dtype_and_byte_geometry(self):
         field = SimpleNamespace(
@@ -1419,177 +1536,112 @@ class TestMemoryKvStoreTest:
         assert (store.batch_exists(["k"])) == ([False])
 
 
-class TestL3HostStoreTest:
-    def test_backups_and_prefetches_packed_pages(self):
+class TestL3NamespaceTest:
+    @contextmanager
+    def executor(self, backend, host, *, prefix, rank):
+        executor = L3Executor(
+            backend,
+            host,
+            key_prefix=prefix,
+            rank=rank,
+            ownership=None,
+            config=StorageRuntimeConfig.from_extra_config(
+                None, host_blocks=32, prefix_granularity=2
+            ),
+            prefix_for_weight_version=lambda version: version,
+        )
+        try:
+            yield executor
+        finally:
+            executor.close(timeout_s=2)
+
+    def test_resolves_packed_pages_for_byte_store_roundtrip(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
-        pages = [(0, 1, "h0", 0)]
-        assert (l3.backup(pages)) == ([True])
-        assert (l3.exists(pages)) == ([True])
-        host.host_buffer[:8] = b"\x00" * 8
-        assert (l3.prefetch(pages)) == ([True])
-        assert (host.host_buffer[:8]) == (b"abcdefgh")
-        groups, hashes, offsets = l3.present_keys(
-            [0, 0], ["h0", "miss"], [0, 0], exists=None
-        )
-        assert (groups) == ([0])
-        assert (hashes) == (["h0"])
-        assert (offsets) == ([0])
-        assert (l3.present_keys([0], ["h0"], [0], exists=[False])) == (([], [], []))
-        l3.close()
+        with self.executor(backend, host, prefix="m", rank=1) as executor:
+            keys, offsets, sizes = executor._page_ranges([(0, 1, "h0", 0)])
+            assert backend.batch_put_from_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            assert backend.batch_exists(keys) == [True]
+            host.host_buffer[:8] = bytes(8)
+            assert backend.batch_get_into_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            assert host.host_buffer[:8] == b"abcdefgh"
+            assert backend.batch_exists(
+                [keys[0], executor._object_key("miss", 0, 0)]
+            ) == [True, False]
 
     def test_namespace_clear_deletes_objects_without_changing_the_prefix(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
-        pages = [(0, 1, "h0", 0)]
-        assert (l3.backup(pages)) == ([True])
-        old_key = l3.object_key("h0", 0, 0)
-        l3.rotate_namespace()
-        assert (old_key) == (l3.object_key("h0", 0, 0))
-        assert (l3.exists(pages)) == ([False])
-        restarted = L3HostStore(backend, host, key_prefix="m", rank=1)
-        assert (restarted.object_key("h0", 0, 0)) == (old_key)
-        assert (restarted.exists(pages)) == ([False])
+        with self.executor(backend, host, prefix="m", rank=1) as executor:
+            keys, offsets, sizes = executor._page_ranges([(0, 1, "h0", 0)])
+            assert backend.batch_put_from_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            old_key = executor._object_key("h0", 0, 0)
+            assert executor.delete_namespace()
+            assert old_key == executor._object_key("h0", 0, 0)
+            assert backend.batch_exists(keys) == [False]
+            with self.executor(backend, host, prefix="m", rank=1) as restarted:
+                assert restarted._object_key("h0", 0, 0) == old_key
+                assert backend.batch_exists([old_key]) == [False]
 
-    def test_clear_returns_false_when_remote_delete_fails_and_keeps_the_prefix(self):
-        backend = mock.Mock()
-        backend.remove_by_prefix.return_value = False
-        l3 = L3HostStore(
-            backend, _FakeHost(b"abcdefgh", size=64), key_prefix="m", rank=1
-        )
-        old_key = l3.object_key("h0", 0, 0)
+    @pytest.mark.parametrize("raises", [False, True])
+    def test_clear_failure_keeps_the_namespace(self, raises):
+        class DeleteFailure(MemoryKvStore):
+            def remove_by_prefix(self, prefix):
+                if raises:
+                    raise RuntimeError("delete failed")
+                return False
 
-        assert not (l3.rotate_namespace())
+        backend = DeleteFailure()
+        host = _FakeHost(b"abcdefgh", size=64)
+        with self.executor(backend, host, prefix="m", rank=1) as executor:
+            keys, offsets, sizes = executor._page_ranges([(0, 1, "h0", 0)])
+            assert backend.batch_put_from_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            old_key = keys[0]
+            assert not executor.delete_namespace()
+            assert executor._object_key("h0", 0, 0) == old_key
+            assert backend.batch_exists([old_key]) == [True]
 
-        assert (old_key) == (l3.object_key("h0", 0, 0))
-
-    def test_clear_returns_false_when_remote_delete_raises(self):
-        backend = mock.Mock()
-        backend.remove_by_prefix.side_effect = RuntimeError("delete failed")
-        l3 = L3HostStore(
-            backend, _FakeHost(b"abcdefgh", size=64), key_prefix="m", rank=1
-        )
-        old_key = l3.object_key("h0", 0, 0)
-
-        assert not (l3.rotate_namespace())
-
-        assert (old_key) == (l3.object_key("h0", 0, 0))
-
-    def test_set_key_prefix_republishes_under_the_new_namespace(self):
+    def test_weight_version_republishes_under_the_new_namespace(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="v1", rank=0)
-        pages = [(0, 1, "h0", 0)]
-        assert (l3.backup(pages)) == ([True])
-        old_key = l3.object_key("h0", 0, 0)
-        l3.rotate_namespace()
-        l3.set_key_prefix("v2")
-        assert (old_key) != (l3.object_key("h0", 0, 0))
-        assert (l3.exists(pages)) == ([False])
-        assert (l3.backup(pages)) == ([True])
-        assert l3.object_key("h0", 0, 0).startswith("v2_")
-        assert (backend.batch_exists([old_key])) == ([False])
-
-
-class TestL3StoreStatsTest:
-    """Per-op exists/GET/PUT counters and latency on ``L3HostStore``."""
-
-    def test_backup_prefetch_and_exists_record_calls_keys_bytes(self):
-        backend = MemoryKvStore()
-        host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
-        pages = [(0, 1, "h0", 0), (0, 2, "h1", 0)]
-
-        assert (l3.backup(pages)) == ([True, True])
-        assert (l3.prefetch(pages)) == ([True, True])
-        assert (l3.exists(pages + [(0, 3, "miss", 0)])) == ([True, True, False])
-
-        stats = l3.stats()
-        assert (stats.put.calls) == (1)
-        assert (stats.put.keys) == (2)
-        assert (stats.put.ok_keys) == (2)
-        # Transferred volume is reported as successful payload bytes.
-        assert (stats.put.payload_bytes) == (16)
-        assert (stats.put.total_seconds) >= (0.0)
-        assert (stats.get.calls) == (1)
-        assert (stats.get.keys) == (2)
-        assert (stats.get.ok_keys) == (2)
-        assert (stats.get.payload_bytes) == (16)
-        assert (stats.exists.calls) == (1)
-        assert (stats.exists.keys) == (3)
-        assert (stats.exists.ok_keys) == (2)
-        # An exists probe carries no payload bytes.
-        assert (stats.exists.payload_bytes) == (0)
-        l3.close()
-
-    def test_slow_get_and_put_latencies_are_measured(self):
-        class SlowStore(MemoryKvStore):
-            def batch_put_from(self, keys, host_buffer, offsets, sizes):
-                time.sleep(0.05)
-                return super().batch_put_from(keys, host_buffer, offsets, sizes)
-
-            def batch_get_into(self, keys, host_buffer, offsets, sizes):
-                time.sleep(0.05)
-                return super().batch_get_into(keys, host_buffer, offsets, sizes)
-
-        host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(SlowStore(), host, key_prefix="m", rank=0)
-        pages = [(0, 1, "h0", 0)]
-        assert (l3.backup(pages)) == ([True])
-        assert (l3.prefetch(pages)) == ([True])
-
-        stats = l3.stats()
-        assert (stats.put.total_seconds) >= (0.04)
-        assert (stats.get.total_seconds) >= (0.04)
-        l3.close()
-
-    def test_failed_put_records_zero_ok_keys_and_bytes(self):
-        class FailingStore(MemoryKvStore):
-            def batch_put_from(self, keys, host_buffer, offsets, sizes):
-                return [False] * len(keys)
-
-        host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(FailingStore(), host, key_prefix="m", rank=0)
-        pages = [(0, 1, "h0", 0), (0, 2, "h1", 0)]
-
-        assert (l3.backup(pages)) == ([False, False])
-
-        stats = l3.stats()
-        assert (stats.put.calls) == (1)
-        assert (stats.put.keys) == (2)
-        assert (stats.put.ok_keys) == (0)
-        assert (stats.put.payload_bytes) == (0)
-        l3.close()
-
-    def test_stats_snapshot_is_detached_from_later_calls(self):
-        backend = MemoryKvStore()
-        host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=0)
-        pages = [(0, 1, "h0", 0)]
-
-        assert (l3.backup(pages)) == ([True])
-        snapshot = l3.stats()
-        assert (l3.backup(pages)) == ([True])
-        assert (snapshot.put.calls) == (1)
-        assert (l3.stats().put.calls) == (2)
-        l3.close()
+        with self.executor(backend, host, prefix="v1", rank=0) as executor:
+            keys, offsets, sizes = executor._page_ranges([(0, 1, "h0", 0)])
+            assert backend.batch_put_from_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            old_key = keys[0]
+            assert executor.delete_namespace()
+            executor.set_weight_version("v2")
+            keys, offsets, sizes = executor._page_ranges([(0, 1, "h0", 0)])
+            assert keys[0] != old_key and keys[0].startswith("v2_")
+            assert backend.batch_exists(keys) == [False]
+            assert backend.batch_put_from_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            assert backend.batch_exists([old_key]) == [False]
 
 
 class TestFactoryTest:
     def test_memory_and_unknown_backend(self):
-        backend = create_kvstore_storage_backend(
+        backend = create_storage_backend(
             "memory", None, host_buffer=object(), tp_size=1, pp_size=1
         )
         assert isinstance((backend), (MemoryKvStore))
         assert (
-            create_kvstore_storage_backend(
+            create_storage_backend(
                 None, None, host_buffer=object(), tp_size=1, pp_size=1
             )
         ) is None
         with pytest.raises((ValueError), match=("unsupported")):
-            create_kvstore_storage_backend(
+            create_storage_backend(
                 "nfs", None, host_buffer=object(), tp_size=1, pp_size=1
             )
 
@@ -1651,7 +1703,7 @@ class TestMooncakeConfigTest:
 
 
 class TestMooncakeKvStoreTest:
-    @pytest.mark.parametrize("failure", ["temporary", "permanent", "hard", "truncated"])
+    @pytest.mark.parametrize("failure", ["permanent", "hard", "truncated"])
     def test_capacity_pressure_keeps_unsaved_pages_unacknowledged(self, failure):
         class Store:
             def __init__(self):
@@ -1668,9 +1720,7 @@ class TestMooncakeKvStoreTest:
                         raise AssertionError(
                             "successful immutable pages must not be rewritten"
                         )
-                    if key == "pressure" and (
-                        failure != "temporary" or self.capacity_failures == 0
-                    ):
+                    if key == "pressure":
                         self.capacity_failures += 1
                         results.append(-1 if failure == "hard" else -200)
                     else:
@@ -1689,20 +1739,16 @@ class TestMooncakeKvStoreTest:
         result = adapter.batch_put_from(
             ["existing", "saved", "pressure"], host, [0, 8, 16], [8, 8, 8]
         )
-        if failure == "temporary":
-            assert result == [True, True, True]
-            assert adapter.store.objects["pressure"] == b"12345678"
-        elif failure == "truncated":
+        if failure == "truncated":
             assert result == [False, False, False]
         else:
             assert result == [True, True, False]
             assert "pressure" not in adapter.store.objects
         assert adapter.store.objects["existing"] == b"original"
         assert adapter.store.objects["saved"] == b"abcdefgh"
-        # A permanent error must terminate; a capacity failure may retry.
-        assert adapter.store.capacity_failures <= 4
-        if failure == "hard":
-            assert adapter.store.capacity_failures == 1
+        # A negative result leaves the page unacknowledged on the first
+        # attempt; the async protocol retries nothing inside the adapter.
+        assert adapter.store.capacity_failures == 1
 
     def test_non_default_tenant_is_never_silently_dropped(self):
         class _Store:
@@ -1744,12 +1790,114 @@ class TestMooncakeKvStoreTest:
 
             def batch_put_from(self, keys, ptrs, sizes):
                 del ptrs, sizes
-                return [-1] * len(keys)
+                return [-705] * len(keys)
 
         adapter = object.__new__(MooncakeKvStore)
         adapter.store = _Store()
         host = SimpleNamespace(data_ptr=lambda: 100)
         assert (adapter.batch_put_from(["k"], host, [0], [8])) == ([True])
+
+    def test_failed_put_cannot_be_retired_by_an_exists_recheck(self):
+        calls = []
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = SimpleNamespace(
+            batch_is_exist=lambda keys: calls.append("exists") or [0] * len(keys),
+            batch_put_from=lambda keys, ptrs, sizes: [-800] * len(keys),
+        )
+        result = adapter.batch_put_from_result(
+            ["k"], SimpleNamespace(data_ptr=lambda: 100), [0], [8]
+        )
+        assert result.success == (False,)
+        assert not result.retired
+        assert calls == ["exists"]
+
+    def test_capacity_pressure_put_retires_as_a_per_page_failure(self):
+        # NO_AVAILABLE_HANDLE (-200) is the master's allocation rejection
+        # before any source transfer: retired, not a quarantine.
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = SimpleNamespace(
+            batch_is_exist=lambda keys: [0] * len(keys),
+            batch_put_from=lambda keys, ptrs, sizes: [-200, 0],
+        )
+        result = adapter.batch_put_from_result(
+            ["pressure", "saved"],
+            SimpleNamespace(data_ptr=lambda: 100),
+            [0, 8],
+            [8, 8],
+        )
+        assert result.success == (False, True)
+        assert result.retired
+        assert result.object_failures == (False, False)
+
+    def test_capacity_pressure_put_keeps_the_executor_in_service(self):
+        class Buffer(bytearray):
+            def data_ptr(self):
+                return ctypes.addressof((ctypes.c_char * len(self)).from_buffer(self))
+
+        class Store:
+            def __init__(self):
+                self.objects = {}
+
+            def batch_is_exist(self, keys):
+                return [int(key in self.objects) for key in keys]
+
+            def batch_put_from(self, keys, ptrs, sizes):
+                results = []
+                for key, ptr, size in zip(keys, ptrs, sizes):
+                    if key == "pressure":
+                        results.append(-200)
+                    else:
+                        self.objects[key] = ctypes.string_at(ptr, size)
+                        results.append(0)
+                return results
+
+        class Host:
+            def __init__(self):
+                self.host_buffer = Buffer(b"abcdefgh")
+
+            def host_block_range(self, group_index, block_id):
+                del group_index, block_id
+                return 0, 4
+
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = Store()
+        adapter.failures_retire = False
+        executor = L3Executor(
+            adapter,
+            Host(),
+            key_prefix="m",
+            rank=0,
+            ownership=None,
+            config=StorageRuntimeConfig.from_extra_config(
+                None, host_blocks=32, prefix_granularity=2
+            ),
+            prefix_for_weight_version=None,
+        )
+
+        def run(op_id, keys, offsets):
+            executor.submit(StorageJob(op_id, "put", keys, offsets, (4,) * len(keys)))
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                completions = executor.poll().completions
+                if completions:
+                    assert len(completions) == 1
+                    return completions[0]
+                time.sleep(0.001)
+            raise AssertionError("L3 operation did not finish")
+
+        try:
+            pressured = run(1, ("pressure", "saved"), (0, 4))
+            assert pressured.success == (False, True)
+            assert pressured.retired
+            assert adapter.store.objects == {"saved": b"efgh"}
+            # Capacity pressure must neither quarantine the executor nor open
+            # its health circuit: the scheduler re-offers the unacknowledged
+            # page on a later round.
+            assert executor.snapshot().health.state == "healthy"
+            assert run(2, ("retry",), (0,)).success == (True,)
+            assert adapter.store.objects["retry"] == b"abcd"
+        finally:
+            executor.close(timeout_s=3)
 
     def test_truncated_exists_does_not_ack_unuploaded_keys(self):
         class _Store:
@@ -1790,6 +1938,27 @@ class TestMooncakeKvStoreTest:
             [False, False]
         )
 
+    def test_object_evicted_after_exists_is_a_retired_miss(self):
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = SimpleNamespace(
+            batch_is_exist=lambda keys: [1] * len(keys),
+            batch_get_into=lambda keys, ptrs, sizes: [-704, 8],
+        )
+        host = SimpleNamespace(data_ptr=lambda: 100)
+        assert adapter.batch_exists(["evicted", "resident"]) == [True, True]
+        result = adapter.batch_get_into_result(
+            ["evicted", "resident"], host, [0, 8], [8, 8]
+        )
+        assert result.success == (False, True)
+        assert result.retired
+        assert result.object_failures == (True, False)
+        adapter.store.batch_get_into = lambda keys, ptrs, sizes: [-704, -800]
+        result = adapter.batch_get_into_result(
+            ["evicted", "unknown"], host, [0, 8], [8, 8]
+        )
+        assert not result.retired
+        assert result.object_failures == (True, False)
+
     def test_truncated_get_into_is_rejected(self):
         adapter = object.__new__(MooncakeKvStore)
         adapter.store = SimpleNamespace(batch_get_into=lambda keys, ptrs, sizes: [1])
@@ -1806,6 +1975,9 @@ class TestMooncakeKvStoreTest:
         assert (adapter.batch_get_into(["k0", "k1"], host, [0, 8], [8, 8])) == (
             [False, True]
         )
+        result = adapter.batch_get_into_result(["k0", "k1"], host, [0, 8], [8, 8])
+        assert result.retired
+        assert result.object_failures == (True, False)
         adapter.store = SimpleNamespace(
             batch_get_into=lambda keys, ptrs, sizes: [0, -1]
         )
@@ -1876,7 +2048,25 @@ class TestMooncakeKvStoreTest:
                 tp_size=4,
                 pp_size=1,
             )
-        assert (captured["segment"]) == (2 * 1024**3)
+        assert captured["segment"] == 2 * 1024**3
+        with mock.patch.dict(
+            sys.modules, {"mooncake": package, "mooncake.store": store_module}
+        ):
+            MooncakeKvStore(
+                dict(extra, global_segment_size=0),
+                host_buffer=host,
+                tp_size=8,
+                pp_size=1,
+            )
+            assert captured["segment"] == 0
+            for size in (-1, 1):
+                with pytest.raises(ValueError, match="too small"):
+                    MooncakeKvStore(
+                        dict(extra, global_segment_size=size),
+                        host_buffer=host,
+                        tp_size=8,
+                        pp_size=1,
+                    )
 
 
 if __name__ == "__main__":

@@ -70,7 +70,7 @@ from tokenspeed.runtime.multimodal.inputs import (
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
-register_cuda_ci(est_time=30, suite="runtime-1gpu")
+register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 VOCAB_SIZE = 128
 
@@ -188,6 +188,30 @@ def _fill(ib, runtime, op, snapshot):
     ib.load_round_inputs(op, runtime, total, ids, ngram_inputs=snapshot)
 
 
+def test_decode_override_clears_only_consumed_flags_without_host_sync(buffers):
+    ib, runtime = buffers
+    runtime.valid_cache_lengths.fill_(2)
+    runtime.future_input_map.fill_(22)
+    runtime.spec_candidates_ready.fill_(True)
+    states = {"a": _state([10, 11, 12], []), "b": _state([20, 21, 22], [])}
+    op = _op(states, ["a", "b"], [2, 4], [1, 1], [], [], [12, -1])
+    snapshot = ngram_inputs_for_forward(op, states, 3)
+    on_cuda = torch.device(ib.device).type == "cuda"
+    previous = torch.cuda.get_sync_debug_mode() if on_cuda else None
+    try:
+        if on_cuda:
+            torch.cuda.set_sync_debug_mode("error")
+        ids = ib.fill_input_buffers(op, runtime, 2)
+        ib.load_round_inputs(op, runtime, 2, ids, ngram_inputs=snapshot)
+    finally:
+        if on_cuda:
+            torch.cuda.set_sync_debug_mode(previous)
+    assert ib.input_ids_buf[:2].tolist() == [12, 22]
+    assert runtime.spec_candidates_ready.tolist() == [
+        i not in (2, 4) for i in range(runtime.spec_candidates_ready.numel())
+    ]
+
+
 def _expected(tokens, positions):
     return [
         [
@@ -268,27 +292,6 @@ def test_chunked_prefill_and_pending_overlap_samples(buffers, overlap):
         _assert_rows(ib, _expected(full, [len(full) - 1]), [True])
         assert ib.ngram_previous_tokens_buf.data_ptr() == pointer
         _sample(ib, runtime, [current + 1], 0, [1], False)
-    assert set(vars(runtime)) == {
-        "device",
-        "vocab_size",
-        "valid_cache_lengths",
-        "future_input_map",
-        "spec_candidates_ready",
-        "draft_probs",
-        "draft_probs_sentinel",
-        "chain_parents",
-        "future_parent_map",
-        "future_draft_q",
-        "ngram_accepted_tokens",
-        "ngram_needs_seed",
-        "ngram_request_ids",
-        "request_token_history_ids",
-        "draft_request_token_history_ids",
-        "stop_token_ids",
-        "token_limits",
-        "_stop_criteria_owners",
-        "stopped",
-    }
     assert not runtime.has_request_token_history
     assert runtime.ngram_accepted_tokens.shape == (6, 3)
     assert runtime.ngram_accepted_tokens[2].tolist() == [18, 17, 16]

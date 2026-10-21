@@ -33,6 +33,8 @@ import re
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
+from tokenspeed.runtime.cache.l3.io_types import StorageIOResult
+
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
 _HF_HUB_REPO_DIR_RE = re.compile(r"(?:models|datasets|spaces)--.+")
 _EXT_DEF_FILE_BLOCK_RE = re.compile(
@@ -68,22 +70,14 @@ _SHARDED_STATE_DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
 _SHARDED_STATE_FIELD_RE = re.compile(r"\{(?:rank|part)(?::[^}]*)?\}")
 
 
-def resolve_l3_weight_version(
-    current: str,
-    requested: str | None,
-    *,
-    flush_cache: bool,
-    storage_backend: str | None,
-) -> str | None:
-    """Choose the namespace to publish after a successful weight load.
+def resolve_l3_weight_version(requested: str | None) -> str | None:
+    """Normalize an explicit namespace without inventing a successor.
 
     An explicit ``requested`` version always wins. ``None`` keeps the
-    current namespace. Flushed L3 updates must pass a caller-supplied
-    identity; minting ``{current}-uN`` would let independent checkpoints
-    collide under the same successor.
+    current namespace. The request handler separately validates whether
+    the update may preserve or change that namespace.
     """
 
-    del current, flush_cache, storage_backend
     if requested is not None:
         return str(requested)
     return None
@@ -925,77 +919,54 @@ def _file_digest(path: str) -> str:
 # value so they still share L3. This is not a git SHA or package version:
 # those would split the store on every non-cache commit while staying
 # 0.1.0 across cache-affecting edits.
-L3_RUNTIME_COMPAT = "1"
+# Isolates this Host-storage contract from earlier producer implementations.
+L3_RUNTIME_COMPAT = "2"
 
 
-def storage_key_prefix(
+def storage_deployment_id(
     model_name: str,
     *,
     revision: str,
-    weight_version: str,
     model_overrides: dict,
     cache_signature: str,
     pipeline_rank: int,
     attn_tp_size: int,
     draft_model: str,
     draft_revision: str,
-    draft_weight_version: str,
     cache_quantization: str,
     runtime_compat: str,
     attention_backend: str,
     draft_attention_backend: str,
     skip_softmax_threshold: float,
     eagle3_layers_to_capture: Sequence[int],
+    kv_producer: dict[str, Any],
 ) -> str:
-    """Return a collision-resistant namespace for compatible L3 objects.
+    """Snapshot static cache compatibility facts into an immutable identity.
 
-    Every component is required so a new caller cannot omit the checkpoint
-    identity, cache layout, pipeline stage, attention-TP width, draft pool,
-    cache-quantization config (target
-    and draft), runtime HF overrides, resolved target/draft attention backends,
-    the KV-producer compat epoch,
-    ``--skip-softmax-threshold``, or the resolved EAGLE3 capture layers
-    and silently collide with an incompatible deployment.
-    ``revision`` is the resolved immutable checkpoint (Hugging Face commit
-    or local fingerprint), not a moving branch name. ``model_overrides``
-    is the ``--hf-overrides`` dict applied to the HF text config
-    (rope_theta, rope_scaling, and the rest of the effective architecture).
-    ``attention_backend`` and ``draft_attention_backend`` are the resolved
-    full-attention backend names from attention construction, including the
-    sub-backend of a hybrid model. An empty draft name means no draft cache
-    backend on this stage. Backend choices can change attention output and
-    therefore downstream K/V even when their packed Host layouts match.
-    ``runtime_compat`` is ``L3_RUNTIME_COMPAT``: the epoch of the runtime
-    that produced the KV, not a build SHA. ``skip_softmax_threshold`` is
-    the resolved gfx950 MHA prefill skip-softmax threshold (0.0 is exact
-    dense attention). A nonzero value changes attention output and
-    therefore downstream cached K/V. ``eagle3_layers_to_capture`` is the
-    resolved EAGLE3 hidden-state capture list (``--eagle3-layers-to-capture``
-    or the draft config's ``eagle_aux_hidden_state_layer_ids``); an empty
-    list means EAGLE3 is off or no capture ids were configured. Different
-    capture layers change which target hidden states the draft consumes
-    and therefore the KV those layers produce. Empty strings and an empty
-    override dict are valid and mean "unset" (no draft pool, no extra cache
-    scales, no HF overrides). The payload keeps a literal ``cp_size`` of 1,
-    the retired context-parallel width, so the namespace of every existing
-    deployment is unchanged until the next deliberate key-format bump.
-    ``attn_tp_size``
-    belongs here rather than only in the per-object ``r{tp_rank}`` shard
-    id: GQA with TP above the KV-head count keeps one local KV head per
-    rank, so packed Host geometry is unchanged, while
-    ``tp_rank // num_kv_head_replicas`` assigns different heads to the
-    same rank.
+    All inputs are explicit: loaded checkpoints and overrides, packed Host
+    layout and quantization, pipeline stage, attention-TP width, resolved
+    target/draft attention backends, numerical/partition producer options,
+    skip-softmax threshold, EAGLE3 capture layers and runtime compatibility.
+    The packed-cache signature already includes the target compute dtype;
+    producer options include draft dtype when a draft pool is present.
+
+    The returned digest retains no mutable inputs. Weight generations are
+    added separately by ``storage_key_prefix``. Empty draft facts mean no
+    draft pool. ``attn_tp_size`` distinguishes head assignments that can
+    otherwise have identical local layouts under replicated KV heads.
     """
-
     if not isinstance(model_overrides, dict):
         raise TypeError("model_overrides must be a dict")
+    if not isinstance(kv_producer, dict):
+        raise TypeError("kv_producer must be a dict")
+    if not kv_producer:
+        raise ValueError("kv_producer must be explicit and nonempty")
     if isinstance(eagle3_layers_to_capture, (str, bytes)):
         raise TypeError("eagle3_layers_to_capture must be a sequence of ints")
     payload = json.dumps(
         {
             "model": str(model_name),
             "revision": str(revision),
-            "weight_version": str(weight_version),
             "model_overrides": model_overrides,
             "cache_signature": str(cache_signature),
             "pipeline_rank": int(pipeline_rank),
@@ -1003,9 +974,9 @@ def storage_key_prefix(
             "cp_size": 1,
             "draft_model": str(draft_model),
             "draft_revision": str(draft_revision),
-            "draft_weight_version": str(draft_weight_version),
             "cache_quantization": str(cache_quantization),
             "runtime_compat": str(runtime_compat),
+            "kv_producer": kv_producer,
             "attention_backend": str(attention_backend),
             "draft_attention_backend": str(draft_attention_backend),
             "skip_softmax_threshold": float(skip_softmax_threshold),
@@ -1016,7 +987,33 @@ def storage_key_prefix(
         sort_keys=True,
         separators=(",", ":"),
     )
-    return "tsl3v1-" + hashlib.sha256(payload.encode()).hexdigest()
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def storage_key_prefix(
+    deployment_id: str,
+    *,
+    weight_version: str,
+    draft_weight_version: str,
+) -> str:
+    """Combine a frozen deployment identity with target/draft weight versions.
+
+    An empty draft version means no draft generation. Both versions are
+    explicit so a caller cannot silently lose an independently updated draft.
+    This does not inspect weights, mutable launch options or Host allocation.
+    """
+    if not isinstance(deployment_id, str) or not deployment_id:
+        raise ValueError("deployment_id must be an explicit nonempty identity")
+    payload = json.dumps(
+        {
+            "deployment_id": deployment_id,
+            "weight_version": str(weight_version),
+            "draft_weight_version": str(draft_weight_version),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "tsl3-" + hashlib.sha256(payload.encode()).hexdigest()
 
 
 def host_buffer_ptr(host_buffer: Any) -> int:
@@ -1052,10 +1049,32 @@ def write_host_bytes(host_buffer: Any, offset: int, payload: bytes) -> None:
 class KvStoreStorage(Protocol):
     """Byte store for packed Host CacheBlocks.
 
-    Implementations must be safe to call from the runtime thread that owns
-    the Host buffer. ``batch_get_into`` / ``batch_put_from`` operate on
+    Implementations must allow concurrent calls from the bounded I/O workers.
+    Workers retain the registered Host buffer for the entire native operation. ``batch_get_into`` / ``batch_put_from`` operate on
     offsets into that registered buffer (SGLang HiCacheStorage v1).
     """
+
+    # An exception or malformed result proves that Host access ended only
+    # under this backend contract. Valid results carry their own retired fact.
+    failures_retire: bool
+
+    def batch_get_into_result(
+        self,
+        keys: Sequence[str],
+        host_buffer: Any,
+        offsets: Sequence[int],
+        sizes: Sequence[int],
+    ) -> StorageIOResult:
+        """Return per-key validity and proof that destination access ended."""
+
+    def batch_put_from_result(
+        self,
+        keys: Sequence[str],
+        host_buffer: Any,
+        offsets: Sequence[int],
+        sizes: Sequence[int],
+    ) -> StorageIOResult:
+        """Return per-key publication and proof that source access ended."""
 
     def batch_exists(self, keys: Sequence[str]) -> list[bool]:
         """Return per-key existence, aligned with ``keys``."""
@@ -1094,6 +1113,7 @@ class MemoryKvStore:
 
     def __init__(self) -> None:
         self._objects: dict[str, bytes] = {}
+        self.failures_retire = True
 
     def batch_exists(self, keys: Sequence[str]) -> list[bool]:
         return [key in self._objects for key in keys]
@@ -1134,6 +1154,21 @@ class MemoryKvStore:
             self._objects[key] = copy_host_bytes(host_buffer, int(offset), int(size))
             results.append(True)
         return results
+
+    def batch_get_into_result(
+        self, keys, host_buffer, offsets, sizes
+    ) -> StorageIOResult:
+        flags = tuple(self.batch_get_into(keys, host_buffer, offsets, sizes))
+        return StorageIOResult(flags, True, tuple(not flag for flag in flags))
+
+    def batch_put_from_result(
+        self, keys, host_buffer, offsets, sizes
+    ) -> StorageIOResult:
+        return StorageIOResult(
+            tuple(self.batch_put_from(keys, host_buffer, offsets, sizes)),
+            True,
+            (False,) * len(keys),
+        )
 
     def remove_by_prefix(self, prefix: str) -> bool:
         self._objects = {

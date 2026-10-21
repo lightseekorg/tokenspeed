@@ -98,6 +98,8 @@ def test_amd_owned_paths_require_only_amd(path):
         "test/ci_system/flashinfer_jit_cache_installer.py",
         f"{KERNEL}/ops/attention/mha/cuda.py",
         f"{KERNEL}/ops/attention/mha/flashinfer.py",
+        f"{KERNEL}/ops/attention/qsa/flashinfer_prims.py",
+        f"{KERNEL}/thirdparty/flashinfer/qsa_prims.py",
         f"{KERNEL}/ops/attention/rmha/_cute_dsl/rel_decode.py",
         f"{KERNEL}/ops/attention/gdn/_flashinfer/adapter.py",
         f"{KERNEL}/ops/moe/_deep_gemm/mega_moe_stage.py",

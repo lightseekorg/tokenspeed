@@ -389,6 +389,7 @@ def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
 
     def refresh(actual_bs: int) -> None:
         backend.sparse_topk.qsa_metadata = object()
+        backend.sparse_topk.qsa_selection = object()
         backend.refresh_decode_metadata(
             2,
             actual_bs,
@@ -400,6 +401,7 @@ def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
             for_graph_replay=use_graph,
         )
         assert backend.sparse_topk.qsa_metadata is None
+        assert backend.sparse_topk.qsa_selection is None
 
     def stage() -> None:
         layout = qsa_forward_layout(
@@ -567,18 +569,24 @@ def test_qsa_indexer_requires_both_live_tables() -> None:
 
 
 @pytest.mark.parametrize(
-    "prefixes, queries, decode_lengths, expected_columns",
+    "prefixes, queries, decode_lengths, expected_columns, expected_width",
     [
-        ([0], [1], [], 1),
-        ([0], [512], [], 2),
-        ([700], [15], [], 3),
-        ([768, 0], [20, 32], [], 4),
-        ([0], [16], [900], 4),
+        ([0], [1], [], 1, 1),
+        ([0], [512], [], 2, 512),
+        ([700], [15], [], 3, 15),
+        ([768, 0], [20, 32], [], 4, None),
+        ([0, 256], [256, 256], [], 2, 256),
+        ([0, 256], [128, 384], [], 3, None),
+        ([0], [16], [900], 4, None),
+        ([0], [4], [900], 4, 4),
+        ([], [], [900], 4, 4),
     ],
 )
 def test_qsa_extend_table_bound_includes_prefix_and_mixed_decode(
-    prefixes, queries, decode_lengths, expected_columns
+    monkeypatch, prefixes, queries, decode_lengths, expected_columns, expected_width
 ) -> None:
+    import tokenspeed.runtime.layers.attention.qsa.metadata as metadata_module
+
     root, indexer = _root_with_indexer(
         _qsa_config(max_bs=4, is_draft=False, device="cpu"),
         _qsa_pool(device="cpu", layer_offset=0),
@@ -617,7 +625,29 @@ def test_qsa_extend_table_bound_includes_prefix_and_mixed_decode(
     assert table.shape == (bs, 4)
     assert metadata.qsa_block_table.shape == (bs, expected_columns)
     assert metadata.qsa_block_table.data_ptr() == table.data_ptr()
+    assert metadata.queries_per_request == expected_width
     torch.testing.assert_close(metadata.qsa_block_table, table[:, :expected_columns])
+    monkeypatch.setattr(
+        indexer.full_attn_backend,
+        "group_view",
+        lambda *args: SimpleNamespace(page_table=table, kernel_page_size=256),
+    )
+    total_rows = sum(queries) + 4 * len(decode_lengths)
+    monkeypatch.setattr(
+        metadata_module,
+        "qwen4_exp_qsa_prepare_metadata",
+        lambda *args, **kwargs: (torch.zeros(total_rows, dtype=torch.int32),) * 5,
+    )
+    layout = qsa_forward_layout(
+        SimpleNamespace(bs=bs, forward_mode=ForwardMode.MIXED, attn_backend=root),
+        total_rows,
+        compressed_token_page_size=256,
+        recent_page_size=64,
+        compress_ratio=4,
+        reset_draft_tags=None,
+    )
+    assert layout.queries_per_request == expected_width
+    assert layout.qsa_page_table is metadata.qsa_block_table
     # A later decode must retain capacity even after a compact extend view.
     indexer.refresh_decode_metadata(
         bs,
@@ -628,6 +658,7 @@ def test_qsa_extend_table_bound_includes_prefix_and_mixed_decode(
         block_tables=tables,
     )
     assert indexer.forward_decode_metadata.qsa_block_table.shape == (bs, 4)
+    assert indexer.forward_decode_metadata.queries_per_request == 4
     assert indexer.forward_extend_metadata is metadata
 
 

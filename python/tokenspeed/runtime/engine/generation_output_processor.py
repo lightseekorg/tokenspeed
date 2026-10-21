@@ -706,6 +706,7 @@ class OutputProcesser:
         if state.abort_notify_client:
             self.publish_finished_at_admission(rid, state)
         else:
+            self._release_multimodal_features(state)
             self.rid_to_state.pop(rid, None)
 
     def _host_advance_matcher(self, completion, model_execution_results):

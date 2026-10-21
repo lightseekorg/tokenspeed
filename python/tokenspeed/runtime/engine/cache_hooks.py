@@ -18,29 +18,22 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Cache-op accounting and rank-synchronized completion tracking.
+"""L2 cache-op submission and rank-synchronized completion tracking.
 
-Owns everything between an execution plan's cache ops -- the Host L2 tier's
-write-backs and load-backs, the L3 prefetches, the retraction snapshot's
-stores and restores -- and the scheduler events their completions eventually
-produce: count what
-the plan puts in flight (``DeviceHandle.execute`` submits the transfers
-themselves, on the data plane, from the same plan), poll completions
-(control-side event queries), and agree across every cache-owning rank in
-the replica (attention TP, then CP, then PP) on which completions EVERY rank
-has seen (the C++ scheduler is mirrored, so an event may only advance once
-all ranks hold it). L3 Host backups complete asynchronously, so a rank-local
-``WriteBackDone`` would ``CacheHostBlock`` on one mirrored scheduler while a
-CP/PP peer still has the op pending; a KVP rank that copied a different
-owned subset of a snapshot op completes at a different time too. Every rank
-enters every replica-group gather, including with an empty intermediate
-intersection; skipping a later CP/PP ``all_gather_object`` hangs ranks whose
-first group already agreed. An L3 backup future that fails is converted into
-a rank-local flag and MAX-reduced on that same first replica all_reduce so
-every rank raises together instead of one rank raising out of
-``poll_results`` while peers wait in the gather. ``poll_ready_events``
-returns events for the event loop to apply — feedback into the scheduler
-stays an explicit ``advance_scheduler`` call in the loop body.
+Owns everything between an execution plan's cache ops and the scheduler
+events their completions eventually produce: count what the plan puts in
+flight (``DeviceHandle.execute`` submits the transfers themselves, on the
+data plane, from the same plan), poll
+completions (control-side event queries), and agree across every
+cache-owning rank in the replica (attention TP, then CP, then PP) on
+which completions EVERY rank has seen (the C++ scheduler is mirrored, so an
+event may only advance once all ranks hold it). Only the GPU copy fences
+these events; L3 backup has independent tickets and completion agreement.
+Every rank enters every replica-group gather, including with an empty
+intermediate intersection, so peers remain in collective order.
+``poll_ready_events`` returns events for the event loop to apply —
+feedback into the scheduler stays an explicit ``advance_scheduler`` call
+in the loop body.
 
 Depends only on the device handle and static parallel-layout config, not on
 live event-loop state. ``device=None`` (the engine can emit no cache op, see
@@ -55,13 +48,13 @@ from collections import OrderedDict
 import torch
 import torch.distributed as dist
 
-from tokenspeed.runtime.cache.transfer.ops import PrefetchOp, RestoreOp, SnapshotOp
+from tokenspeed.runtime.cache.transfer.ops import RestoreOp, SnapshotOp
 from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_from_payload,
     cache_event_key,
     cache_event_to_payload,
-    cache_ops_from_plan,
     cache_sync_debug_enabled,
+    is_device_cache_op,
     pop_common_cache_event_payloads,
 )
 
@@ -123,35 +116,23 @@ class CacheOpHooks:
             replica_groups.append((pp_size, pp_cpu_group))
         self._replica_groups = replica_groups
 
-    def count_plan_ops(self, execution_plan) -> int:
-        """Count the cache ops this plan will put in flight.
+    def count_ops(self, cache_ops) -> int:
+        """Count the prepared Device-copy operations submitted this round.
 
-        ``DeviceHandle.execute`` submits them, from the same plan (write-backs
-        and snapshot stores ahead of the page zeroing, L3 prefetches on their
-        own lane, load-backs and restores behind the zeroing), through the
-        same adapter (``scheduler_utils.cache_ops_from_plan``). An L2 batch
-        carries one ticket per ``op_ids`` entry; each request of a snapshot
-        store, restore or prefetch batch is one ticket, acknowledged on its
-        own. Call this with the SAME plan and only when ``execute`` will run:
-        a plan counted but never submitted leaves ops in flight forever.
-
-        Returns:
-            The number of ``SnapshotOp`` requests in the plan — one per
-            request the scheduler retracted this round (a victim's image
-            store is the retraction signal; see docs/design/scheduler.md §2).
-            The event loop feeds it to the preemption counter. 0 when the
-            hooks are not armed: without cache ops there is no snapshot
-            pool, and without a pool a capacity block aborts instead of
-            retracting.
-
-        Raises:
-            TypeError: The plan carries a cache op kind the runtime cannot run.
+        The loop passes this same snapshot to DeviceHandle.execute. Storage
+        jobs have independent retirement facts and never consume these GPU
+        completion tickets. Returns the snapshot-store count for preemptions.
         """
         if self._device is None:
             return 0
+        cache_ops = tuple(cache_ops)
+        if not all(is_device_cache_op(op) for op in cache_ops):
+            raise TypeError(
+                "cache completion accounting requires Device-copy operations"
+            )
         num_snapshot_ops = 0
-        for op in cache_ops_from_plan(execution_plan):
-            if isinstance(op, (SnapshotOp, RestoreOp, PrefetchOp)):
+        for op in cache_ops:
+            if isinstance(op, (SnapshotOp, RestoreOp)):
                 self._num_inflight += 1
                 self._num_open += 1
                 if isinstance(op, SnapshotOp):
@@ -176,30 +157,15 @@ class CacheOpHooks:
             payload = cache_event_to_payload(event)
             self._pending_payloads[cache_event_key(payload)] = payload
 
-        # Completions are async (CUDA copies, L3 backups) and not lock-step
+        # CUDA copy completions are async and not lock-step
         # across TP/CP/PP, so local state (_num_inflight / _pending_payloads)
         # diverges transiently. A rank-local skip would let some ranks gather
-        # while others return, deadlocking the group. Agree on work and on
-        # backup failure via a two-int MAX all_reduce on each replica group.
+        # while others return, deadlocking the group. Agree on work before
+        # gathering completion payloads on each replica group.
         local_has_work = bool(self._num_inflight != 0 or self._pending_payloads)
-        local_backup_failed = self._device.consume_l3_backup_poll_failure()
         if self._replica_groups:
-            has_work, backup_failed = self._converge_poll_state(
-                local_has_work, local_backup_failed
-            )
-            if backup_failed:
-                raise RuntimeError(
-                    "L3 backup failed on a replica rank; every cache-owning "
-                    "rank raises after the poll all_reduce so peers are not "
-                    "left in all_gather_object"
-                )
-            if not has_work:
+            if not self._converge_poll_state(local_has_work):
                 return []
-        elif local_backup_failed:
-            raise RuntimeError(
-                "L3 backup failed; refusing WriteBackDone until replica "
-                "ranks can converge on the failure"
-            )
         elif not local_has_work:
             return []
 
@@ -219,38 +185,17 @@ class CacheOpHooks:
             events.append(e)
         return events
 
-    def _converge_poll_state(
-        self, local_has_work: bool, local_backup_failed: bool
-    ) -> tuple[bool, bool]:
-        """Replica MAX of in-flight work and L3 backup failure.
-
-        Single two-int MAX all_reduce on attention TP, then CP, then PP
-        (same order as L3 exists / flush). Deciding from rank-local state
-        alone deadlocks the group when a peer still has in-flight backups
-        or when one rank raised out of ``poll_results``; see
-        poll_ready_events.
-
-        Args:
-            local_has_work: This rank's view of whether any cache op is in
-                flight or any polled payload awaits commit.
-            local_backup_failed: Whether this rank's L3 backup future failed
-                since the last poll.
-
-        Returns:
-            ``(has_work, backup_failed)`` after MAX-reducing both flags.
-        """
-        flag = torch.tensor(
-            [1 if local_has_work else 0, 1 if local_backup_failed else 0],
-            dtype=torch.int32,
-        )
+    def _converge_poll_state(self, local_has_work: bool) -> bool:
+        """All owners poll until every local cache transfer is accounted for."""
+        flag = torch.tensor([int(local_has_work)], dtype=torch.int32)
         for _size, group in self._replica_groups:
             dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
-        return bool(flag[0].item()), bool(flag[1].item())
+        return bool(flag[0].item())
 
     def _pop_ready_payloads(self) -> list[dict]:
         """Intersect pending completions across every replica group.
 
-        Attention TP, then CP, then PP, matching L3 exists / flush. Every
+        Attention TP, then CP, then PP, matching cache flush. Every
         rank enters every ``all_gather_object``: an empty intermediate
         intersection still gathers ``[]`` so a peer that is ready on a
         later group is not left unmatched.

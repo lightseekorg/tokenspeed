@@ -82,6 +82,8 @@ def test_beam_scheduler_preserves_nonmixed_capacity_and_explicit_opt_in(mixed):
     config = scheduler_config_from_args(
         args,
         specs,
+        # No storage backend is configured: admission passes no storage limits.
+        storage_config=None,
         max_scheduled_tokens=args.chunked_prefill_size,
         max_batch_size=args.max_num_seqs,
         decode_input_tokens=1,

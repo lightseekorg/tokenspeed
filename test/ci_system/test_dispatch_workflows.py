@@ -804,13 +804,13 @@ def test_only_dedicated_tasks_declare_gb300():
     ]
 
 
-def test_kimi_k3_gb300_is_two_node_per_commit_tp8():
+def test_kimi_k3_gb300_is_two_node_nightly_tp8():
     task = load_yaml(
         REPO_ROOT / "test/ci/eval/"
         "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
     )
 
-    assert task["triggers"] == ["per-commit"]
+    assert task["triggers"] == ["nightly"]
     assert task["runner"]["labels"] == ["slurm-gb300-4gpu"]
     assert task["slurm"] == {"nodes": 2, "gpus_per_node": 4}
     assert "--tensor-parallel-size 8" in task["server"]["command"]
@@ -922,7 +922,7 @@ def test_gb300_slurm_nightly_workflow_is_scheduled_and_isolated():
     assert checkout["with"]["persist-credentials"] is False
 
 
-def test_gb300_slurm_nightly_matrix_selects_the_nightly_kimi_k3_tasks(monkeypatch):
+def test_gb300_slurm_nightly_matrix_selects_all_nightly_kimi_k3_tasks(monkeypatch):
     monkeypatch.delenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", raising=False)
 
     matrix = build_matrix(
@@ -948,7 +948,17 @@ def test_gb300_slurm_nightly_matrix_selects_the_nightly_kimi_k3_tasks(monkeypatc
         ),
         (
             "test/ci/eval/"
+            "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
+            "slurm-gb300-4gpu",
+        ),
+        (
+            "test/ci/eval/"
             "kimi-k3-nvfp4-dflash2-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
+            "slurm-gb300-4gpu",
+        ),
+        (
+            "test/ci/eval/"
+            "kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
             "slurm-gb300-4gpu",
         ),
     }
@@ -1012,7 +1022,7 @@ def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
     assert "gb300-slurm-per-commit" in cancel_groups
 
 
-def test_gb300_slurm_per_commit_matrix_selects_model_tasks(monkeypatch):
+def test_gb300_slurm_per_commit_matrix_excludes_nightly_tp8_tasks(monkeypatch):
     monkeypatch.delenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", raising=False)
 
     matrix = build_matrix(
@@ -1038,18 +1048,6 @@ def test_gb300_slurm_per_commit_matrix_selects_model_tasks(monkeypatch):
             "workflow_stage": "model-test",
         },
         {
-            "name": "eval-kimi-k3-mxfp4-tp8-two-node-aime26-gb300-slurm",
-            "type": "eval",
-            "config": (
-                "test/ci/eval/"
-                "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
-            ),
-            "runner": "slurm-gb300-4gpu",
-            "priority": "normal",
-            "optional": False,
-            "workflow_stage": "model-test",
-        },
-        {
             "name": "eval-kimi-k3-nvfp4-dp16-four-node-aime26-gb300-slurm",
             "type": "eval",
             "config": (
@@ -1067,18 +1065,6 @@ def test_gb300_slurm_per_commit_matrix_selects_model_tasks(monkeypatch):
             "config": (
                 "test/ci/eval/"
                 "kimi-k3-nvfp4-dspark-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
-            ),
-            "runner": "slurm-gb300-4gpu",
-            "priority": "normal",
-            "optional": False,
-            "workflow_stage": "model-test",
-        },
-        {
-            "name": "eval-kimi-k3-nvfp4-tp8-two-node-aime26-gb300-slurm",
-            "type": "eval",
-            "config": (
-                "test/ci/eval/"
-                "kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
             ),
             "runner": "slurm-gb300-4gpu",
             "priority": "normal",

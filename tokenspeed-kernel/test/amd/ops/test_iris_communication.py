@@ -63,7 +63,7 @@ def _skip_if_unsupported(world_size: int, reason_prefix: str) -> None:
     if not current_platform().is_amd:
         pytest.skip(f"{reason_prefix} only targets AMD ROCm")
     try:
-        import iris  # noqa: F401
+        import tokenspeed_kernel.ops.communication._iris  # noqa: F401
     except ImportError:
         pytest.skip("iris is not installed")
 
