@@ -119,7 +119,11 @@ def _verify_chain_greedy(
             candidates.shape != (batch_size, num_draft_tokens)
             or target_predict.shape != candidates.shape
         ):
-            raise ValueError("Greedy verification dimensions disagree with candidates")
+            raise ValueError(
+                f"Greedy verification expects candidates and target_predict shapes "
+                f"{(batch_size, num_draft_tokens)}, got candidates "
+                f"{tuple(candidates.shape)} and target_predict {tuple(target_predict.shape)}"
+            )
         verify_chain_target_sampled(
             predicts,
             accept_index,

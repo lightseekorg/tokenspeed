@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+from tokenspeed.runtime.sampling.backends import greedy
 from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
 from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
@@ -91,3 +92,25 @@ def test_verify_refreshes_complete_accepted_path(device, bs, width):
             rtol=0,
             atol=0,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm")
+@pytest.mark.parametrize(
+    "candidate_shape,target_shape", [((2, 5), (2, 6)), ((2, 6), (1, 6))]
+)
+def test_verify_reports_mismatched_shapes(monkeypatch, candidate_shape, target_shape):
+    monkeypatch.setattr(greedy, "_verify_chain_greedy_cuda", greedy.error_fn)
+    candidates = torch.empty(candidate_shape, device="cuda", dtype=torch.int32)
+    target = torch.empty(target_shape, device="cuda", dtype=torch.int32)
+    outputs = (
+        torch.full((12,), -1, device="cuda", dtype=torch.int32),
+        torch.full((2, 6), -1, device="cuda", dtype=torch.int32),
+        torch.full((2,), -1, device="cuda", dtype=torch.int32),
+    )
+    with pytest.raises(ValueError) as error:
+        greedy._verify_chain_greedy(*outputs, candidates, target, 2, 6)
+    assert "expects candidates and target_predict shapes (2, 6)" in str(error.value)
+    assert f"got candidates {candidate_shape}" in str(error.value)
+    assert f"target_predict {target_shape}" in str(error.value)
+    for output in outputs:
+        assert (output == -1).all()

@@ -32,8 +32,24 @@ from tokenspeed_kernel.platform import pdl_enabled
 
 
 @triton.jit(
-    do_not_specialize=["P0", "A0", "A1", "L0", "C0", "C1", "T0"],
-    do_not_specialize_on_alignment=["P0", "A0", "A1", "L0", "C0", "C1", "T0"],
+    do_not_specialize=[
+        "predicts_stride",
+        "accept_index_row_stride",
+        "accept_index_col_stride",
+        "accept_token_num_stride",
+        "candidates_row_stride",
+        "candidates_col_stride",
+        "target_sampled_stride",
+    ],
+    do_not_specialize_on_alignment=[
+        "predicts_stride",
+        "accept_index_row_stride",
+        "accept_index_col_stride",
+        "accept_token_num_stride",
+        "candidates_row_stride",
+        "candidates_col_stride",
+        "target_sampled_stride",
+    ],
 )
 def _verify_chain_target_sampled_kernel(
     predicts_ptr,
@@ -41,13 +57,13 @@ def _verify_chain_target_sampled_kernel(
     accept_token_num_ptr,
     candidates_ptr,
     target_sampled_ptr,
-    P0,
-    A0,
-    A1,
-    L0,
-    C0,
-    C1,
-    T0,
+    predicts_stride,
+    accept_index_row_stride,
+    accept_index_col_stride,
+    accept_token_num_stride,
+    candidates_row_stride,
+    candidates_col_stride,
+    target_sampled_stride,
     NUM_DRAFT_TOKENS: tl.constexpr,
     WRITE_REJECTED_TARGETS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -58,36 +74,54 @@ def _verify_chain_target_sampled_kernel(
     row = tl.program_id(0).to(tl.int64)
     base = row * NUM_DRAFT_TOKENS
 
-    tl.store(accept_index_ptr + row * A0, base)
+    tl.store(accept_index_ptr + row * accept_index_row_stride, base)
 
     active = tl.full((), 1, tl.int32)
     num_accepted = tl.full((), 0, tl.int32)
     for i in tl.range(1, NUM_DRAFT_TOKENS):
-        target_id = tl.load(target_sampled_ptr + (base + i - 1) * T0)
+        target_id = tl.load(target_sampled_ptr + (base + i - 1) * target_sampled_stride)
         if WRITE_REJECTED_TARGETS:
             # The Torch greedy reference converts target ids before comparing.
             target_id = target_id.to(tl.int32)
-        draft_id = tl.load(candidates_ptr + row * C0 + i * C1)
+        draft_id = tl.load(
+            candidates_ptr + row * candidates_row_stride + i * candidates_col_stride
+        )
         match = (active != 0) & (draft_id == target_id)
 
         if WRITE_REJECTED_TARGETS:
-            tl.store(predicts_ptr + (base + i - 1) * P0, target_id)
+            tl.store(predicts_ptr + (base + i - 1) * predicts_stride, target_id)
             tl.store(
-                accept_index_ptr + row * A0 + i * A1, tl.where(match, base + i, -1)
+                accept_index_ptr
+                + row * accept_index_row_stride
+                + i * accept_index_col_stride,
+                tl.where(match, base + i, -1),
             )
         else:
-            tl.store(predicts_ptr + (base + i - 1) * P0, target_id, mask=match)
-            tl.store(accept_index_ptr + row * A0 + i * A1, base + i, mask=match)
+            tl.store(
+                predicts_ptr + (base + i - 1) * predicts_stride, target_id, mask=match
+            )
+            tl.store(
+                accept_index_ptr
+                + row * accept_index_row_stride
+                + i * accept_index_col_stride,
+                base + i,
+                mask=match,
+            )
 
         num_accepted = tl.where(match, i, num_accepted)
         active = tl.where(match, 1, 0)
 
     if WRITE_REJECTED_TARGETS:
         last = base + NUM_DRAFT_TOKENS - 1
-        tl.store(predicts_ptr + last * P0, tl.load(target_sampled_ptr + last * T0))
-    final_id = tl.load(target_sampled_ptr + (base + num_accepted) * T0)
-    tl.store(accept_token_num_ptr + row * L0, num_accepted)
-    tl.store(predicts_ptr + (base + num_accepted) * P0, final_id)
+        tl.store(
+            predicts_ptr + last * predicts_stride,
+            tl.load(target_sampled_ptr + last * target_sampled_stride),
+        )
+    final_id = tl.load(
+        target_sampled_ptr + (base + num_accepted) * target_sampled_stride
+    )
+    tl.store(accept_token_num_ptr + row * accept_token_num_stride, num_accepted)
+    tl.store(predicts_ptr + (base + num_accepted) * predicts_stride, final_id)
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
