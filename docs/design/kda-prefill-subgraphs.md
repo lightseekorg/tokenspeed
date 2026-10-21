@@ -108,7 +108,7 @@ The shared server configuration supplies this setting to every TP worker.
 
 | Setting | Meaning |
 |---|---|
-| `--prefill-graph-max-tokens` | Largest captured token capacity. Defaults to `min(2048, chunked-prefill size)`; `0` disables prefill graphs. |
+| `--prefill-graph-max-tokens` | Largest captured token capacity. Defaults to `min(8192, chunked-prefill size)`; `0` disables prefill graphs. |
 | `--prefill-graph-capture-token-sizes` | Shared token buckets for outer and KDA captures. There is no separate KDA bucket list. |
 | `--prefill-graph-capture-batch-sizes` | Request capacities captured with inline KDA; replay rounds up to a fitting capacity. Independent of the decode graph's batch-size list. |
 
