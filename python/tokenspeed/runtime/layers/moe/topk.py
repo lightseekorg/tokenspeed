@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.moe import (
     dispatch_topk_ids,
     moe_topk,
 )
+from tokenspeed_kernel.ops.moe import torch_softmax_bias_topk as torch_router_topk
 from tokenspeed_kernel.ops.moe._triton.inkling_topk import inkling_topk
 from tokenspeed_kernel.ops.moe._triton.minimax_topk import minimax_biased_grouped_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
@@ -291,42 +292,6 @@ def torch_native_fused_topk(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     return topk_weights, topk_ids
-
-
-def torch_router_topk(
-    router_logits: torch.Tensor,
-    correction_bias: torch.Tensor,
-    top_k: int,
-    num_real_experts: int,
-    routed_scaling_factor: float,
-    indices_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Correction-bias routing in the trainer's torch order (``--router-topk torch``).
-
-    fp32 ``torch.softmax`` keeps every probability bit; ``torch.topk`` on the
-    biased probabilities with ``sorted=True`` gives PyTorch's tie order; the
-    weights are the UNBIASED probabilities times ``routed_scaling_factor``.
-    Zero experts (ids past the real experts) become ``-1`` and keep their
-    weight so the model can apply its identity residual.
-
-    Args:
-        router_logits: ``[tokens, num_candidates]`` router logits (any float
-            dtype); candidates are the real experts followed by zero experts.
-        correction_bias: ``[num_candidates]`` fp32 selection bias.
-        top_k: Experts selected per token.
-        num_real_experts: Candidates below this id are real experts.
-        routed_scaling_factor: Multiplier on the selected probabilities.
-        indices_dtype: dtype of the returned ids.
-
-    Returns:
-        ``(weights, ids)`` with shapes ``[tokens, top_k]``; weights fp32, ids
-        in ``indices_dtype`` with ``-1`` for zero experts.
-    """
-    probs = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
-    _, ids = torch.topk(probs + correction_bias, k=top_k, dim=-1, sorted=True)
-    weights = probs.gather(1, ids) * routed_scaling_factor
-    ids = ids.masked_fill(ids >= num_real_experts, -1).to(indices_dtype)
-    return weights, ids
 
 
 def grouped_topk_gpu(

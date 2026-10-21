@@ -8,6 +8,7 @@ mempool address stability -- without touching the model or the hot path.
 """
 
 import contextlib
+import dataclasses
 import os
 import sys
 
@@ -555,6 +556,47 @@ class TestBreakPointAndAmbientCtx:
         expected = torch.relu((new_x @ self.w0) @ self.w1) * 5.0
         torch.testing.assert_close(captured, expected, rtol=1e-4, atol=1e-4)
 
+    @pytest.mark.parametrize("frozen", [False, True])
+    def test_dataclass_ctx_rebinds_at_replay(self, frozen):
+        """A ctx arg keeps its identity, so the break still rebinds it to the live
+        ctx at replay -- even a frozen dataclass whose every field is a tensor,
+        which a break would otherwise hold as a copy."""
+
+        @dataclasses.dataclass(frozen=frozen)
+        class Ctx:
+            scale: torch.Tensor
+
+        class M:
+            def __init__(self, w):
+                self.w = w
+
+            @break_point
+            def forward(self, x, ctx):
+                return torch.relu(x @ self.w) * ctx.scale
+
+        m = M(self.w1)
+        dummy = Ctx(scale=torch.full((), 2.0, device=self.dev))
+        live = Ctx(scale=torch.full((), 5.0, device=self.dev))
+
+        def outer():
+            return m.forward(self.x_static @ self.w0, dummy)
+
+        for _ in range(3):
+            with active_forward(dummy):
+                outer()
+        torch.cuda.synchronize()
+        cap = BreakableCapture()
+        with active_forward(dummy):
+            with cap:
+                captured = outer()
+        new_x = torch.randn(8, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static.copy_(new_x)
+        with active_forward(live):
+            cap.replay()
+        torch.cuda.synchronize()
+        expected = torch.relu((new_x @ self.w0) @ self.w1) * 5.0
+        torch.testing.assert_close(captured, expected, rtol=1e-4, atol=1e-4)
+
     def test_break_reads_live_scalar_off_ambient_not_frozen_arg(self):
         """Scalar args freeze at capture; live values must come off the ambient ctx.
 
@@ -843,7 +885,9 @@ class TestPoolReuseAcrossCaptures:
 
     Allocator pool blocks are stream-keyed, so all BreakableCaptures must share
     one capture stream (class-level default) -- a fresh stream per capture makes
-    pool memory grow with the SUM of bucket sizes instead of the max.
+    pool memory grow with the SUM of bucket sizes instead of the max. Break
+    closures must also not own their tensor args (bare, or in a frozen
+    dataclass of tensors), or each capture keeps every layer's break inputs.
     """
 
     @staticmethod
@@ -900,6 +944,75 @@ class TestPoolReuseAcrossCaptures:
         for cap, _ in caps:
             cap.replay()
         torch.cuda.synchronize()
+
+    def test_tensor_bundle_break_args_reuse_pool(self):
+        """A frozen dataclass of segment outputs passed to a break (MLA's
+        prologue output) must not pin its tensors, exactly like a bare tensor
+        arg: otherwise every capture keeps its own copy of each layer's
+        bundle and pool memory grows with the sum of the buckets."""
+        from tokenspeed_kernel.ops.attention.prologue import MLAPrologueOutput
+
+        from tokenspeed.runtime.execution.breakable_cuda_graph import weak_ref_tensor
+
+        probe = torch.empty(1, device="cuda")
+        if weak_ref_tensor(probe) is probe:
+            pytest.skip("weak_ref extension unavailable; identity fallback")
+        torch.manual_seed(3)
+        d, d2, depth = 512, 2048, 4
+        w1 = torch.randn(d, d2, device="cuda") * 0.02
+        w2 = torch.randn(d2, d, device="cuda") * 0.02
+        xbuf = torch.zeros(4096, d, device="cuda")
+        # Outputs land outside the pool, as PrefillGraph's do.
+        outbuf = torch.empty(4096, d, device="cuda")
+
+        class Attention:
+            @break_point
+            def forward(self, x, ctx, *, expanded):
+                return torch.relu(expanded.query) + expanded.key
+
+        attn = Attention()
+
+        def fwd(n):
+            x = xbuf[:n]
+            for _ in range(depth):
+                q = x @ w1
+                expanded = MLAPrologueOutput(query=q, key=q * 2.0, value=None)
+                x = attn.forward(x, None, expanded=expanded) @ w2
+            return outbuf[:n].copy_(x)
+
+        def eager(x):
+            for _ in range(depth):
+                q = x @ w1
+                x = (torch.relu(q) + q * 2.0) @ w2
+            return x
+
+        pool = torch.cuda.graph_pool_handle()
+        handoff_storage = {}
+        caps = []
+        deltas = []
+        for n in (4096, 2048, 4096):
+            for _ in range(2):
+                fwd(n)
+            torch.cuda.synchronize()
+            before = self._pool_mb()
+            cap = BreakableCapture(pool=pool, handoff_storage=handoff_storage)
+            with cap:
+                fwd(n)
+            torch.cuda.synchronize()
+            caps.append((n, cap))
+            deltas.append(self._pool_mb() - before)
+        # Pinned bundles would add depth x 2 x n x d2 floats per capture; with
+        # weak refs the later captures reuse the pool (allocator fragmentation
+        # may still add a block), so together they grow by less than the
+        # bundles of a single 2048-token capture.
+        pinned_2048_mib = depth * 2 * 2048 * d2 * 4 / 2**20
+        assert deltas[1] + deltas[2] < pinned_2048_mib, f"deltas={deltas}"
+        # Replays stay exact after reuse within and across captures.
+        for n, cap in caps:
+            xbuf[:n].copy_(torch.randn(n, d, device="cuda"))
+            cap.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(outbuf[:n], eager(xbuf[:n]))
 
 
 if __name__ == "__main__":

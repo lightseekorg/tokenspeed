@@ -21,7 +21,7 @@
 // Recurrent-state groups through the Scheduler: the two-slot table (slot 0
 // the checkpoint a forward reads, slot 1 the block it writes) rotating through
 // prefill chunks, the first decode and later decodes; natural checkpoints
-// published at prompt end, reusable chunk boundaries, finish and retraction; hits resuming from
+// published at prompt end, finish and retraction only; hits resuming from
 // them; the two-blocks-per-request capacity; and the retraction image of
 // both slots.
 
@@ -139,45 +139,6 @@ protected:
     }
 };
 
-TEST_F(StateCheckpointSuite, SecondLongPromptReusesTheStateBeforeItsChangedTail) {
-    for (const auto [prompt_tokens, checkpoint_tokens] : {std::pair{22, 20}, std::pair{26, 24}}) {
-        SCOPED_TRACE(prompt_tokens);
-        for (const bool host_cache : {false, true}) {
-            SCOPED_TRACE(host_cache);
-            Reset(host_cache, /*decode_width=*/1);
-            std::vector<std::int32_t> tokens = MakeTokens(prompt_tokens);
-            Submit(RequestWithTokens("seed", tokens));
-            std::vector<std::int32_t> checkpoint_rows;
-            std::int32_t scheduled = 0;
-            for (int round = 0; scheduled < prompt_tokens && round < 16; ++round) {
-                const ExecutionPlan plan = PlanOnce();
-                const ForwardBatch* batch = FindForwardBatch(plan);
-                ASSERT_NE(batch, nullptr);
-                ASSERT_EQ(batch->request_ids, std::vector<std::string>{"seed"});
-                scheduled += batch->input_lengths.at(0);
-                if (scheduled == checkpoint_tokens) {
-                    for (const std::string& group : {"state0", "state1", "state2"}) {
-                        checkpoint_rows.push_back(StateRow(*batch, group, "seed").at(1));
-                    }
-                }
-                SendForwardDone(
-                    "seed", scheduled == prompt_tokens ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
-                AckWriteBacks(plan);
-            }
-            ASSERT_EQ(scheduled, prompt_tokens);
-            ASSERT_EQ(checkpoint_rows.size(), 3u);
-            SendFinish("seed");
-            AckWriteBacks(PlanOnce());
-
-            tokens[checkpoint_tokens] = 991;
-            tokens[checkpoint_tokens + 1] = 992;
-            const Resume reused = Probe("second", tokens);
-            EXPECT_EQ(reused.prefix_tokens, checkpoint_tokens);
-            EXPECT_EQ(reused.state_row.at(0), checkpoint_rows.at(0));
-        }
-    }
-}
-
 TEST_F(StateCheckpointSuite, TwoSlotsRotateThroughChunksTheFirstDecodeAndLaterDecodes) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
     // A 10-token prompt under an 8-token chunk: chunk [0, 8), chunk [8, 10),
@@ -201,7 +162,7 @@ TEST_F(StateCheckpointSuite, TwoSlotsRotateThroughChunksTheFirstDecodeAndLaterDe
     EXPECT_GT(chunk2[1], 0);
     EXPECT_NE(chunk2[1], chunk2[0]);
     EXPECT_EQ(plan.pages_to_zero.at("state0"), std::vector<std::int32_t>{chunk2[1]});
-    EXPECT_TRUE(plan.pages_to_copy.at("full").empty()) << "the aligned checkpoint needs no partial-page copy";
+    EXPECT_TRUE(plan.pages_to_copy.at("full").empty()) << "an ordinary chunk end publishes nothing";
     EXPECT_EQ(scheduler_->TailEntries(), 0u);
     SendForwardDone("r", {101});
 
@@ -226,14 +187,14 @@ TEST_F(StateCheckpointSuite, TwoSlotsRotateThroughChunksTheFirstDecodeAndLaterDe
     SendForwardDone("r", {104});
 
     // Another prompt sharing the ten prompt tokens resumes at the published
-    // prompt-end state; one sharing only the first chunk resumes at the
-    // aligned checkpoint before the prompt's replay tail.
+    // prompt-end state; one sharing only the first chunk finds no
+    // checkpoint at 8 and starts over (with the junction at 8).
     const Resume at_prompt_end = Probe("hit", {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 77, 78});
     EXPECT_EQ(at_prompt_end.prefix_tokens, 10);
     EXPECT_EQ(at_prompt_end.state_row.at(0), decode1[0]) << "resumes from the published checkpoint";
-    const Resume at_chunk_end = Probe("chunk-hit", {1, 2, 3, 4, 5, 6, 7, 8, 77, 78, 79, 80});
-    EXPECT_EQ(at_chunk_end.prefix_tokens, 8);
-    EXPECT_EQ(at_chunk_end.state_row.at(0), chunk1[1]) << "resumes from the first chunk's checkpoint";
+    const Resume at_chunk_end = Probe("miss", {1, 2, 3, 4, 5, 6, 7, 8, 77, 78, 79, 80});
+    EXPECT_EQ(at_chunk_end.prefix_tokens, 0);
+    EXPECT_NE(at_chunk_end.state_row.at(0), decode1[0]) << "a fresh zero state, not a checkpoint";
 
     // The two probes above each planned a decode of r; both land before the
     // finish, which publishes the frontier (15 computed tokens: the prompt
@@ -408,8 +369,6 @@ TEST_F(StateCheckpointSuite, AStateCheckpointLeavesWithItsKvTail) {
         SendForwardDone(id);
         PlanOnce();
         SendForwardDone(id);
-        PlanOnce();
-        SendForwardDone(id);  // aligned checkpoint at 20, before the replay tail
         PlanOnce();
         SendForwardDone(id, {7});
         SendFinish(id);

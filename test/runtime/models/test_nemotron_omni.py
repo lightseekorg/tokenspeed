@@ -66,7 +66,13 @@ from tokenspeed.runtime.models.parakeet import (  # noqa: E402
     ParakeetEncoder,
     _relative_positions,
 )
-from tokenspeed.runtime.models.radio import RadioVisionModel  # noqa: E402
+from tokenspeed.runtime.models.radio import (  # noqa: E402
+    RadioEncoderCudaGraphAdapter,
+    RadioVisionModel,
+)
+from tokenspeed.runtime.multimodal.encoder_cudagraph import (  # noqa: E402
+    EncoderForwardStepRunner,
+)
 
 DEVICE = "cuda"
 PATCH = 16
@@ -461,6 +467,70 @@ def test_image_feature_layer_norms_the_vit_output_before_shuffling():
         features = norm(radio.embed_images(patches, [(rows, cols)]))
         expected = projector(nemotron_omni.pixel_shuffle(features, rows, cols))
     assert torch.equal(out, expected)
+
+
+def _image_items(grids: list[tuple[int, int]]) -> list[SimpleNamespace]:
+    return [
+        SimpleNamespace(
+            feature=torch.randn(rows * cols, 3 * PATCH * PATCH, device=DEVICE),
+            image_grid_hw=torch.tensor([rows, cols]),
+        )
+        for rows, cols in grids
+    ]
+
+
+def test_radio_encoder_graph_matches_the_eager_encoder():
+    radio = _radio(final_norm=True)
+    # 44, 28 and 68 packed rows replay budget graphs; 148 exceeds them all and runs eagerly.
+    grids = [(10, 4), (4, 6), (12, 12), (8, 8)]
+    items = _image_items(grids)
+    adapter = RadioEncoderCudaGraphAdapter(
+        tower=radio,
+        post_encode=lambda features, grids: features,
+        max_image_tokens=12 * 12 + radio.num_prefix_tokens,
+        capture_tp_size=1,
+        capture_tp_group=None,
+    )
+    runner = EncoderForwardStepRunner(
+        adapter=adapter, budget_range=(32, 128), max_metadata_sequences_per_batch=8
+    )
+    with torch.no_grad():
+        out = runner(items)
+        expected = radio.embed_images(
+            torch.cat([item.feature for item in items]), grids
+        )
+    assert sorted(runner.budget_graphs) == [32, 64, 128]
+    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+
+def test_image_encoder_graph_serves_get_image_feature():
+    config = _radio_config(final_norm=False, temporal_patch_size=2)
+    config.args["min_num_patches"] = 6
+    radio = _radio(final_norm=False)
+    projector = _projector(4 * radio.blocks[0].norm1.normalized_shape[0])
+    model = _omni_glue(
+        visual=radio,
+        vision_projector=projector,
+        omni_config=SimpleNamespace(vision_config=config),
+    )
+    omni = nemotron_omni.NemotronH_Nano_Omni_Reasoning_V3
+    wrappers = omni.make_encoder_cudagraph_wrappers(
+        model, Mapping(rank=0, world_size=1)
+    )
+    items = _image_items([(4, 6), (6, 2)])
+    with torch.no_grad():
+        out = wrappers["image_encoder"](items)
+        expected = omni.get_image_feature(model, items)
+    # One smallest image is 6 patches plus 4 prefix tokens.
+    assert wrappers["image_encoder"].encoder_output_token_budgets == [
+        10,
+        20,
+        40,
+        80,
+        160,
+        320,
+    ]
+    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
 
 def _parakeet_pair() -> tuple[ParakeetEncoder, HFParakeetEncoder]:

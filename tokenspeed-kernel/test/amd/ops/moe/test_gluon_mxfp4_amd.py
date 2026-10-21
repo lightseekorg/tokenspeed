@@ -353,12 +353,19 @@ def test_dynamic_mxfp4_deferred_ep(
         )
     if input_kind == "packed":
         from tokenspeed_kernel.ops.moe import moe_apply
+        from tokenspeed_kernel.registry import KernelRegistry
+        from tokenspeed_kernel.selection import SelectedKernel
 
         module.num_local_experts = num_local_experts
         module.num_experts = global_num_experts
         module.ep_rank = expert_start // num_local_experts
+        apply_name = "gluon_mxfp4_a4w4_ep_deferred_precomputed_moe_apply"
         plan = {
-            "apply_kernel_name": "gluon_mxfp4_a4w4_ep_deferred_precomputed_moe_apply"
+            "apply_kernel_name": apply_name,
+            "apply_kernel": SelectedKernel(
+                apply_name, KernelRegistry.get().get_impl(apply_name)
+            ),
+            "features": frozenset(),
         }
         route_output, _, expanded_idx = moe_apply(
             plan,

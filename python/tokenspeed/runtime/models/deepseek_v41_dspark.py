@@ -207,6 +207,7 @@ class _WindowAttention:
             None,
             kv.view(-1, 1, kv.shape[-1]),
             self.selection.indices,
+            lse=None,
         )
 
     def _reference_forward(self, q, kv, attn_sink, softmax_scale):
@@ -251,8 +252,8 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         return logits.view(*hidden_states.shape[:-1], head.shape[0])
 
     def __init__(self, config, mapping, quant_config, prefix):
-        if mapping.attn.dp_size != 1 or mapping.pp_size != 1:
-            raise NotImplementedError("V4.1 DSpark requires attention DP=PP=1")
+        if mapping.pp_size != 1:
+            raise NotImplementedError("V4.1 DSpark requires PP=1")
         stages = int(config.dspark_num_stages)
         block_size = int(config.dspark_block_size)
         taps = tuple(config.dspark_target_layer_ids)

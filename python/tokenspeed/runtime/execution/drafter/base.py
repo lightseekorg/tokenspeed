@@ -224,7 +224,11 @@ class BaseDrafter:
         """
 
     def idle_forward_global_num_tokens(
-        self, global_num_tokens: list[int], global_bs: list[int]
+        self,
+        global_num_tokens: list[int],
+        global_bs: list[int],
+        *,
+        global_num_decodes: list[int],
     ) -> list[list[int]]:
         """The IDLE draft forwards an idle attention-DP rank runs per round,
         as the per-rank token counts each one reports: entry ``i`` sizes the
@@ -241,7 +245,8 @@ class BaseDrafter:
 
         Args:
             global_num_tokens: The round's per-rank target token counts.
-            global_bs: The round's per-rank decode request counts.
+            global_bs: The round's per-rank total request counts.
+            global_num_decodes: The round's per-rank decode request counts.
 
         Returns:
             One ``global_num_tokens`` per IDLE draft forward, in step order.

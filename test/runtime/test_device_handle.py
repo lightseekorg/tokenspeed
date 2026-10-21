@@ -38,14 +38,26 @@ back.
 
 from __future__ import annotations
 
+import json
 from concurrent.futures import Future
+from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import pytest
 import torch
-from tokenspeed_scheduler import PD
+from tokenspeed_scheduler import (
+    PD,
+    AttnKind,
+    CacheGroupConfig,
+    ExecutionEvent,
+    ForwardEvent,
+    RequestSpec,
+    Scheduler,
+    SchedulerConfig,
+)
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.cache.transfer.ops import (
@@ -57,6 +69,7 @@ from tokenspeed.runtime.cache.transfer.ops import (
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.engine import scheduler_utils as scheduler_utils_module
 from tokenspeed.runtime.execution.device import DeviceHandle, EncoderModelFacts
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import PlannedForward
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
@@ -67,6 +80,159 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.pd.transfer_hooks import PdTransferHooks
+
+
+@pytest.mark.parametrize(
+    "algorithm,has_draft,prefill_only,reserve,warmup_fails,expected_rewarm",
+    [
+        ("DFLASH", True, False, True, False, True),
+        ("DFLASH", True, False, True, True, True),
+        ("DFLASH", True, True, True, False, False),
+        ("EAGLE3", True, False, True, False, False),
+        (None, False, False, True, False, False),
+        ("DFLASH", True, False, False, False, False),
+    ],
+)
+def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
+    monkeypatch,
+    algorithm,
+    has_draft,
+    prefill_only,
+    reserve,
+    warmup_fails,
+    expected_rewarm,
+):
+    """Drive real startup/rebind; substitute unavailable weights/cache/device work."""
+    from tokenspeed.runtime.engine import scheduler_utils
+    from tokenspeed.runtime.execution import cudagraph_memory, device, factory
+    from tokenspeed.runtime.layers.attention import registry
+
+    events = []
+
+    class FinalCapture(Exception):
+        pass
+
+    class WarmupFailure(Exception):
+        pass
+
+    class Executor:
+        attn_backend = draft_attn_backend = None
+
+        def __init__(self):
+            self.config = SimpleNamespace(prefill_only=prefill_only)
+            self.forward_step = self
+            self.generation = 0
+
+        def warmup_decode_path(self, *, batch_sizes, graph_phase):
+            events.append(("warmup", self.generation, batch_sizes, graph_phase))
+            if self.generation:
+                assert not torch.is_grad_enabled()
+            if self.generation and warmup_fails:
+                raise WarmupFailure("rebound initialization failed")
+
+        def autotune(self):
+            if has_draft and not prefill_only:
+                self.warmup_decode_path(batch_sizes=(1,), graph_phase=False)
+
+        def release_graphs(self):
+            events.append(("release", self.generation))
+
+        def set_cache_pool(self, target, draft):
+            self.generation += 1
+            events.append(("rebind", self.generation, target, draft))
+
+        def capture_graphs(self, *, entries, observer):
+            events.append(("capture", self.generation, entries))
+            if entries is None:
+                raise FinalCapture
+
+    model = SimpleNamespace(
+        model=SimpleNamespace(),
+        prepare_multimodal_runtime=lambda: None,
+        prepare_communication_runtime=lambda count: None,
+    )
+    pool_generation = [0]
+
+    def build(*args, **kwargs):
+        pool_generation[0] += 1
+        return SimpleNamespace(
+            attn_backend=None,
+            draft_attn_backend=None,
+            token_to_kv_pool=f"target{pool_generation[0]}",
+            draft_token_to_kv_pool=f"draft{pool_generation[0]}",
+            profiled_cache_bytes=4096,
+        )
+
+    def probe(executor, args, gpu_id, *, startup_resident_bytes):
+        executor.capture_graphs(entries=5, observer=None)
+        return 4096
+
+    monkeypatch.setattr(
+        factory,
+        "create_model_runner",
+        lambda *args: (model, model if has_draft else None),
+    )
+    monkeypatch.setattr(factory, "create_model_executor", lambda **kwargs: Executor())
+    monkeypatch.setattr(
+        factory,
+        "ModelExecutorConfig",
+        SimpleNamespace(from_server_args=lambda **kwargs: None),
+    )
+    monkeypatch.setattr(registry, "create_attn_components", build)
+    monkeypatch.setattr(cudagraph_memory, "probe_cudagraph_memory", probe)
+    monkeypatch.setattr(device, "probe_arena_floor", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(
+        device,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=False, restore_stack_limit=nullcontext),
+    )
+    monkeypatch.setattr(
+        scheduler_utils,
+        "scheduler_cache_geometry_from_pool",
+        lambda pool: SimpleNamespace(prefix_granularity=1),
+    )
+    monkeypatch.setattr(scheduler_utils, "pool_to_cache_groups", lambda pool: [])
+    args = SimpleNamespace(
+        disaggregation_mode="null",
+        chunked_prefill_size=8192,
+        attention_backend=None,
+        drafter_attention_backend=None,
+        disable_cudagraph_memory_reserve=not reserve,
+        enforce_eager=False,
+        enable_memory_saver=False,
+        device="cuda",
+        speculative_algorithm=algorithm,
+    )
+    failure = WarmupFailure if warmup_fails else FinalCapture
+    with pytest.raises(failure):
+        device.build_device_side(
+            server_args=args,
+            model_config=SimpleNamespace(context_len=4096, is_multimodal_active=False),
+            draft_model_config=None,
+            gpu_id=0,
+            global_rank=0,
+            attn_tp_rank=0,
+            min_per_gpu_mem=0,
+            overlap_schedule_depth=0,
+            decode_input_tokens=16,
+            max_batch_size=16,
+        )
+    rebound_warmup = ("warmup", 1, (1,), False)
+    assert (rebound_warmup in events) == expected_rewarm
+    if reserve:
+        probe_index = events.index(("capture", 0, 5))
+        rebind_index = events.index(("rebind", 1, "target2", "draft2"))
+        assert probe_index < rebind_index
+        if has_draft and not prefill_only:
+            assert events.index(("warmup", 0, (1,), False)) < probe_index
+        if expected_rewarm:
+            assert rebind_index < events.index(rebound_warmup)
+        if warmup_fails:
+            assert ("capture", 1, None) not in events
+        else:
+            assert events[-1] == ("capture", 1, None)
+    else:
+        assert events[-1] == ("capture", 0, None)
 
 
 class _ForwardThread:
@@ -284,6 +450,152 @@ def _planned(*, num_extends, label=None):
         sampled_top_k=0,
         stop_criteria=(),
     )
+
+
+def _profile_batch(mode):
+    """Real immutable scheduler batches, including a resumed prefill chunk."""
+    config = SchedulerConfig()
+    config.prefix_granularity = 16
+    config.max_scheduled_tokens = 8
+    config.max_batch_size = 4
+    config.num_device_pages = 64
+    config.num_snapshot_pages = 1
+    config.enable_mixed_prefill_decode = True
+    config.cache_groups = [
+        CacheGroupConfig(
+            group_id="full_attention",
+            block_granularity=16,
+            total_pages=64,
+            attn_kind=AttnKind.Full,
+        )
+    ]
+    scheduler = Scheduler(config)
+    request = RequestSpec()
+    request.request_id = 'old-"雪'
+    request.tokens = list(range(12 if mode == ForwardMode.EXTEND else 3))
+    scheduler.submit_requests([request])
+    scheduler.next_execution_plan()
+    batch = scheduler.next_execution_plan().forward[0]
+    if mode != ForwardMode.MIXED:
+        return batch
+    event = ForwardEvent.ExtendResult()
+    event.request_id = request.request_id
+    event.tokens = [99]
+    scheduler.advance(ExecutionEvent().add_event(event))
+    request = RequestSpec()
+    request.request_id = "new-\\request"
+    request.tokens = list(range(20))
+    scheduler.submit_requests([request])
+    return scheduler.next_execution_plan().forward[0]
+
+
+@pytest.mark.parametrize(
+    "mode", [ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.MIXED]
+)
+def test_forward_profile_range_preserves_real_batch_metadata_and_result(mode):
+    batch = _profile_batch(mode)
+    trace = []
+    result = SimpleNamespace(sync=lambda: trace.append("sync"))
+
+    def cpu_forward(op, sampling_params, **kwargs):
+        assert op is batch
+        assert kwargs["capture_next_input_ids"]
+        with torch.profiler.record_function("cpu_model_work"):
+            torch.ones(2, device="cpu").add_(1)
+        return result
+
+    handle = DeviceHandle(
+        SimpleNamespace(
+            forward_thread=_ForwardThread(trace),
+            execute_forward_op=cpu_forward,
+        )
+    )
+    planned = replace(_planned(num_extends=batch.num_extends()), forward_op=batch)
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as profiler:
+        assert (
+            handle._submit_forward(planned, capture_next_input_ids=True).result()
+            is result
+        )
+    ranges = [
+        event
+        for event in profiler.events()
+        if event.name.startswith("tokenspeed.forward.v1:")
+    ]
+    assert len(ranges) == 1
+    metadata = json.loads(ranges[0].name.removeprefix("tokenspeed.forward.v1:"))
+    assert metadata == {
+        "mode": mode.name,
+        "num_extends": batch.num_extends(),
+        "request_ids": batch.request_ids,
+        "input_lengths": batch.input_lengths,
+        "prefill_lengths": batch.prefill_lengths,
+        "extend_prefix_lens": batch.extend_prefix_lens,
+    }
+    if mode == ForwardMode.EXTEND:
+        assert metadata["extend_prefix_lens"] == [8]
+        assert metadata["input_lengths"] == [4]
+        assert metadata["prefill_lengths"] == [12]
+    elif mode == ForwardMode.DECODE:
+        assert metadata["extend_prefix_lens"] == []
+        assert metadata["input_lengths"] == [1]
+    else:
+        assert metadata["request_ids"] == ["new-\\request", 'old-"雪']
+        assert metadata["input_lengths"] == [7, 1]
+    inner = next(event for event in profiler.events() if event.name == "cpu_model_work")
+    assert inner.thread == ranges[0].thread
+    assert inner.time_range.start >= ranges[0].time_range.start
+    assert inner.time_range.end <= ranges[0].time_range.end
+    assert trace == ["submit", "sync"]
+
+
+def test_profile_range_closes_and_propagates_original_forward_exception():
+    batch = _profile_batch(ForwardMode.EXTEND)
+    failure = RuntimeError("original forward failure")
+
+    def cpu_forward(*args, **kwargs):
+        raise failure
+
+    handle = DeviceHandle(
+        SimpleNamespace(
+            forward_thread=_ForwardThread([]),
+            execute_forward_op=cpu_forward,
+        )
+    )
+    planned = replace(_planned(num_extends=1), forward_op=batch)
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as profiler:
+        pending = handle._submit_forward(planned)
+        with pytest.raises(RuntimeError) as raised:
+            pending.result()
+        assert raised.value is failure
+        with torch.profiler.record_function("after_failed_forward"):
+            pass
+    phase = next(
+        event
+        for event in profiler.events()
+        if event.name.startswith("tokenspeed.forward.v1:")
+    )
+    after = next(
+        event for event in profiler.events() if event.name == "after_failed_forward"
+    )
+    assert phase.time_range.end <= after.time_range.start
+
+
+@pytest.mark.parametrize("missing_state", [False, True])
+def test_unprofiled_forward_never_reads_profile_metadata(monkeypatch, missing_state):
+    # This ordinary test op intentionally has no profile metadata fields.
+    # Missing internal profiler support must not break nonprofiled serving.
+    if missing_state:
+        monkeypatch.delattr(torch.autograd.profiler, "_is_profiler_enabled")
+    else:
+        assert not torch.autograd.profiler._is_profiler_enabled
+    trace = []
+    handle = _handle(trace)
+    handle._submit_forward(_planned(num_extends=0))
+    assert trace == ["submit", "forward"]
 
 
 def _loop(trace, kv_transfer, state):
@@ -1276,3 +1588,114 @@ def test_expert_placement_chunk_applies_then_synchronizes_the_execution_stream()
     )
     with pytest.raises(RuntimeError, match="--enable-eplb"):
         handle.apply_expert_placement((0,), rows, moves)
+
+
+# ----------------------------------------------------------------------
+# Memory-saver release/wake: what surrounds the unmap runs on the data plane.
+# ----------------------------------------------------------------------
+
+
+class _SleepArena:
+    def __init__(self, trace) -> None:
+        self._trace = trace
+
+    def synchronize(self) -> None:
+        self._trace.append("arena.synchronize")
+
+
+class _SleepPool:
+    def __init__(self, trace) -> None:
+        self._trace = trace
+        self.arena = _SleepArena(trace)
+
+    def clear_kv_buffers(self) -> None:
+        self._trace.append("clear_kv_buffers")
+
+
+class _SleepDeviceModule:
+    def __init__(self, trace) -> None:
+        self._trace = trace
+
+    def synchronize(self) -> None:
+        self._trace.append("device.synchronize")
+
+
+class _SleepExecutor:
+    """Only what the release/wake operations read off the executor."""
+
+    def __init__(self, trace) -> None:
+        self.forward_thread = _ForwardThread(trace)
+        self.device_module = _SleepDeviceModule(trace)
+        self.token_to_kv_pool = _SleepPool(trace)
+
+
+class _RegisteringDecodePeer(DisaggDecodeExecutor):
+    """A decode-role peer; the real ``__init__`` (sockets, engine) is bypassed."""
+
+    def __init__(self, trace) -> None:
+        self._trace = trace
+
+    def release_cache_registration(self) -> None:
+        self._trace.append("peer.deregister")
+
+    def restore_cache_registration(self) -> None:
+        self._trace.append("peer.register")
+
+
+def test_kv_release_quiesces_copies_and_deregisters_the_peer_on_the_forward_thread():
+    trace = []
+    handle = DeviceHandle(
+        _SleepExecutor(trace), kv_transfer=_RegisteringDecodePeer(trace)
+    )
+
+    handle.prepare_kv_release()
+    # One blocking submission: the offload copy streams, then the device, then
+    # the registration that pins the pages about to be unmapped.
+    assert trace == [
+        "run",
+        "arena.synchronize",
+        "device.synchronize",
+        "peer.deregister",
+    ]
+    trace.clear()
+
+    handle.finish_kv_resume()
+    # Zero the re-mapped garbage before a peer can write into it again.
+    assert trace == ["run", "clear_kv_buffers", "peer.register"]
+
+
+def test_kv_release_without_a_peer_only_quiesces_and_repairs():
+    trace = []
+    handle = DeviceHandle(_SleepExecutor(trace))
+
+    handle.prepare_kv_release()
+    handle.finish_kv_resume()
+    handle.synchronize()
+
+    assert trace == [
+        "run",
+        "arena.synchronize",
+        "device.synchronize",
+        "run",
+        "clear_kv_buffers",
+        "run",
+        "device.synchronize",
+    ]
+
+
+def test_nccl_suspend_and_resume_ride_the_forward_thread(monkeypatch):
+    from tokenspeed.runtime.execution import device as device_module
+
+    trace = []
+    monkeypatch.setattr(
+        device_module, "suspend_nccl_communicators", lambda: trace.append("suspend")
+    )
+    monkeypatch.setattr(
+        device_module, "resume_nccl_communicators", lambda: trace.append("resume")
+    )
+    handle = DeviceHandle(_SleepExecutor(trace))
+
+    handle.suspend_nccl()
+    handle.resume_nccl()
+
+    assert trace == ["run", "suspend", "run", "resume"]

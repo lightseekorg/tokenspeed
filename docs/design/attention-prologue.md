@@ -1,9 +1,9 @@
 # Attention prologue
 
 Everything between a layer's projections and its core attention is one
-operation: optional per-head QK RMSNorm, RoPE (full, partial or multimodal),
-quantization and the KV cache write. Models describe which steps apply to a
-`PagedAttention` layer. They never apply its per-head norm, rotate, quantize or
+operation: optional per-head QK RMSNorm, RoPE (full, partial, or multimodal),
+quantization, and the KV cache write. Models describe which steps apply to a
+`PagedAttention` layer. They never apply its per-head norm, rotate, quantize, or
 write its new K/V rows themselves. An MLA model still normalizes its latent
 and projects its absorbed query before the prologue. DeepSeek-V4 and V4.1
 attention is not a `PagedAttention` layer and keeps its own fused steps over
@@ -30,7 +30,7 @@ Head geometry comes from the cache descriptor and the input shapes, and the
 storage format from the cache's rows and planes. No argument restates either.
 Typed holders carry each optional step: `HeadNorm`, `Rotary` (with `MRope`),
 `HeadKVCache` (with `MXFP8Scales`), `LatentKVCache` (with
-`PerTokenHeadPlanes`) and `MLAExpandedKV`.
+`PerTokenHeadPlanes`), and `MLAExpandedKV`.
 
 In the runtime, a layer states its steps once: `PagedAttention(...,
 rotary_emb=..., qk_norm=...)`, with `None` for a step the layer skips.
@@ -53,19 +53,19 @@ fp16.
 The entries validate each request once, from metadata only, and raise
 `ValueError` when it breaks one of these rules:
 
-* the inputs are fp16 or bf16 and share one dtype and one row count (q, k and
-  v; or query, `q_pe` and the latent), and a native cache holds rows of that
+* the inputs are fp16 or bf16 and share one dtype and one row count (q, k, and
+  v; or query, `q_pe`, and the latent), and a native cache holds rows of that
   dtype, or bf16 rows for fp16 inputs (the fused solutions round them once from
   fp32; the composite casts its fp16 result, as the pool did);
 * GQA query heads are dense and `head_dim` wide in 2-D or 3-D rows, keys and
   values are dense 2-D rows of the cache heads, and the key and value caches
   are rows of packed heads of one geometry and dtype;
 * MLA inputs are dense in their channels: the query `[T, H, ·]`, `q_pe`
-  `[T, H, rope]` and the latent `[T, kv_lora_rank + rope]`; an absorbed
+  `[T, H, rope]`, and the latent `[T, kv_lora_rank + rope]`; an absorbed
   query's non-RoPE part is `kv_lora_rank` wide, expanded keys are as wide as
   the query's non-RoPE part and values `[T, H, ·]`, both in the query dtype,
   a dense cache row is `[slots, 1, kv_lora_rank + rope]`, and per-token-head
-  planes are `[slots, 1, kv_lora_rank]`, `[slots, 1, 1]` fp32 and
+  planes are `[slots, 1, kv_lora_rank]`, `[slots, 1, 1]` fp32, and
   `[slots, 1, rope]` with one row count; `q_pe` is the query's RoPE channels
   themselves or shares no element with the query (the entry checks the first
   case's layout, not the second);
@@ -82,7 +82,7 @@ The entries validate each request once, from metadata only, and raise
   takes no M-RoPE sections;
 * the cos/sin table is a contiguous 2-D fp32 tensor of even width, at most
   `head_dim` for GQA and equal to the RoPE channels for MLA;
-* MLA RoPE is 64, 128, 256 or 512 channels wide, or absent;
+* MLA RoPE is 64, 128, 256, or 512 channels wide, or absent;
 * norm weights are dense `[head_dim]` vectors;
 * MXFP8 caches hold 128-wide FP8 heads, their scale pages span a positive
   multiple of 128 tokens, and their scale planes are dense e8m0 starting and
@@ -98,7 +98,7 @@ per activation).
 ## Numerics
 
 In the fused solutions the steps compute in fp32. Every output (query, key,
-value and cache row) rounds once. A norm's weight arrives raw with an fp32
+value, and cache row) rounds once. A norm's weight arrives raw with an fp32
 offset, so Gemma's `1 + w` never rounds to the activation dtype, except under
 Ascend's norm, which forms it in the weight dtype as before. M-RoPE selects
 each rotation pair's position row and then applies the ordinary rotation, so
@@ -116,7 +116,7 @@ them rounded once.
 
 Solutions that round once produce the same bytes wherever two serve a request.
 Tests compare them byte for byte. The CUDA and Triton `embedding.rope`
-kernels, `embedding.rope_mla` and the Triton prologue kernels rotate a pair as
+kernels, `embedding.rope_mla`, and the Triton prologue kernels rotate a pair as
 `fma(x1, cos, -x2 * sin)` and `fma(x2, cos, x1 * sin)`, the CUDA kernel's
 association. The CUDA kernels (the fused RoPE write, and the composite's
 rotation wherever `embedding.rope` or `rope_mla` selects one) differ in two
@@ -167,7 +167,7 @@ to `prepare_sparse_kv_access`. The router's `forward_write_locations` and
 slots to the prologue. Index-K continues to address history directly.
 
 A pool describes its destination with `kv_write_target(layer_id, slots,
-write_mask)`: buffers, scale planes and whether the write sanitizes. Pools do
+write_mask)`: buffers, scale planes, and whether the write sanitizes. Pools do
 not override the prologue's write.
 
 Under KV parallelism the slots a backend publishes are virtual.
@@ -219,7 +219,7 @@ Padding costs only the masked programs of the tile past the real tokens. Core
 attention stays the eager break (`PagedAttention.attend`). A model that overlaps
 work on an auxiliary stream runs `prologue` inside its fork scope and calls
 `attend` after the join, so the norm and the store hide under the branch:
-Inkling's QK norm sat there before the refactor and moving it after the join
+Inkling's QK norm sat there before the refactor, and moving it after the join
 cost 1.7 µs per layer of decode.
 
 An MLA model splits its rows into prefill and decode halves from live metadata
@@ -267,12 +267,14 @@ backend serves the layer. A per-token-head cache keeps the activation dtype.
 MXFP8 is a GQA format for 128-wide key and value heads. FP8 per-token-head is
 an MLA format.
 
+Ascend native DSA exposes BF16 KV cache storage in the runtime.
+
 ## MLA shapes
 
 Absorbed attention reads the latent cache. Its query's non-RoPE part is
 `kv_lora_rank` wide, and the prologue returns only the query. Under attention
 head TP (`--attn-head-tp-size`) the heads-to-tokens exchange runs before the
-prologue, so the query, the latent and the positions still arrive with one
+prologue, so the query, the latent, and the positions still arrive with one
 row count -- this rank's own rows -- and every head. The RoPE part travels
 inside the query and is the query's own RoPE channels when it arrives. Over
 the query shards of a prefill engine the same holds for the shard's rows.
@@ -287,7 +289,7 @@ and values in the returned query's dtype.
 
 `("attention", "gqa_prologue")`: per-head QK RMSNorm, RoPE (NEOX or GPT-J,
 full or partial, or multimodal M-RoPE sections), then the K/V store into a
-native, FP8 or MXFP8 cache; every step but the write is optional.
+native, FP8, or MXFP8 cache; every step but the write is optional.
 
 | Solution | Kernel | Covers |
 | --- | --- | --- |
@@ -301,7 +303,7 @@ on a native cache, since both round once.
 
 `("attention", "mla_prologue")`: RoPE of the query and latent key parts,
 FP8 quantization of the query for an FP8 cache, and the latent write into a
-native, FP8 or per-token-head FP8 cache; expanded (non-absorbed) prefill also
+native, FP8, or per-token-head FP8 cache; expanded (non-absorbed) prefill also
 returns per-head keys and values.
 
 | Solution | Kernel | Covers |
@@ -316,6 +318,39 @@ Register it under `("attention", "gqa_prologue")` or
 it rounds like the solutions it competes with. Add a test that compares it
 with them byte for byte over those cases, and one that shows it declines the
 rest. A trait the kernel does not declare admits every value, so declare each
-behavioral trait (`has_norm`, `mrope`, `return_kv`, `expanded` and the rest)
+behavioral trait (`has_norm`, `mrope`, `return_kv`, `expanded`, and the rest)
 the kernel does not implement for every value. An `override` naming a kernel
 this platform cannot run, or whose traits exclude the request, raises.
+
+## Ascend native DSA model components
+
+`tokenspeed.runtime.layers.attention.dsa.ascend` owns `AscendDSAAttention`,
+`AscendDSAIndexer`, prepared `FusedDSADecode` and bit-preserving projection
+weight layouts. Models supply their configuration, projection dimensions and
+explicit independent-selection/separate-projection choices. The shared module
+has no dependency on model extensions.
+
+The native decode ABI currently supports DCP8, draft8, hidden width 4096,
+64 global index heads and eight local attention heads. Its supported gathered
+row counts are 64/128/256/512. The prepared prologue owns normalization,
+optional independent MLA/indexer RoPE and BF16 cache writes;
+the existing paged backend owns sparse selection and attention. Unsupported
+execution shapes fail instead of selecting another projection path.
+
+The paged backend also accepts the ordinary MLA/indexer projections. A model
+adapter can use them for prefill or capture buckets outside the native shape
+contract while retaining fused decode for supported rows. Both use the same
+causal metadata and cache placement; only the projection and collective provider
+differs.
+
+When a model already owns a SHMEM runtime, attach a separate DSA window to that
+owner before capture instead of initializing another runtime. The model keeps
+the attached window and registered attention outputs alive until its graphs are
+released, closes imported IPC mappings before freeing their exports, then releases
+the DSA window before the owning communication runtime.
+The model adapter supplies these prepared resources through the installed
+provider; the common runtime does not create a second resource manager.
+
+Device projection format conversion stays behind the kernel-package adapter.
+Preparing a weight allocates fresh NZ29 storage without changing coefficients
+or dtype; graph execution consumes the prepared buffers and communication state.

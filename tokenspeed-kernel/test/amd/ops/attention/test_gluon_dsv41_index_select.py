@@ -18,19 +18,33 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""GFX950 CSA2 row selection matches the torch top-k selection."""
+"""GFX950/GFX1250 CSA2 row selection matches the torch top-k selection."""
 
 import pytest
 import torch
-from utils import assert_no_triton_compile, is_cdna4
+from utils import assert_no_triton_compile, is_cdna4, is_cdna5
 
-if not is_cdna4():
-    pytest.skip("AMD CDNA4 is required", allow_module_level=True)
+if not (is_cdna4() or is_cdna5()):
+    pytest.skip("AMD CDNA4 or CDNA5 is required", allow_module_level=True)
 
 from tokenspeed_kernel.ops.attention.dsv41._gluon.indexer import (  # noqa: E402
     select_rows_torch,
 )
-from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import indexer  # noqa: E402
+
+if is_cdna4():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.indexer import (
+        gluon_dsv41_index_topk_select_gfx950 as select_kernel,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.indexer import (
+        launch_gluon_dsv41_index_topk_select_gfx950 as launch_select,
+    )
+else:
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.topk import (
+        gluon_dsv41_index_topk_select_gfx1250 as select_kernel,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.topk import (
+        launch_gluon_dsv41_index_topk_select_gfx1250 as launch_select,
+    )
 
 DEVICE = "cuda"
 
@@ -87,9 +101,7 @@ def test_select_matches_torch(queries, width, topk, candidates):
         if candidates is None
         else _candidates(queries, width, candidates == "ordered", generator)
     )
-    rows, lens = _select(
-        indexer.launch_gluon_dsv41_index_topk_select_gfx950, logits, blocks, topk
-    )
+    rows, lens = _select(launch_select, logits, blocks, topk)
     ref_rows, ref_lens = _select(select_rows_torch, logits, blocks, topk)
     assert torch.equal(lens, ref_lens)
     assert torch.equal(rows, ref_rows)
@@ -107,7 +119,7 @@ def test_select_live_widths_skip_the_dead_tail_of_capacity_rows():
         n = int(visible[q])
         logits[q, :n] = torch.randn(n, device=DEVICE, generator=generator)
     rows, lens = _select(
-        indexer.launch_gluon_dsv41_index_topk_select_gfx950,
+        launch_select,
         logits,
         None,
         topk,
@@ -122,9 +134,7 @@ def test_select_boundary_ties_pick_an_equivalent_subset():
     generator = torch.Generator(device=DEVICE).manual_seed(1)
     queries, width, topk = 32, 4096, 512
     logits = _logits(queries, width, generator, levels=4)
-    rows, lens = _select(
-        indexer.launch_gluon_dsv41_index_topk_select_gfx950, logits, None, topk
-    )
+    rows, lens = _select(launch_select, logits, None, topk)
     ref_rows, ref_lens = _select(select_rows_torch, logits, None, topk)
     assert torch.equal(lens, ref_lens)
     for q in range(queries):
@@ -139,16 +149,29 @@ def test_select_boundary_ties_pick_an_equivalent_subset():
         )
 
 
+def test_select_signed_zero_boundary_ties_keep_lowest_columns():
+    if not is_cdna5():
+        pytest.skip("the gfx950 selector orders -0.0 below +0.0")
+    queries, width, topk = 2, 64, 8
+    logits = torch.zeros(queries, width, device=DEVICE)
+    logits[:, :4] = 1.0
+    logits[:, 4::2] = -0.0
+    rows, lens = _select(launch_select, logits, None, topk)
+    assert torch.all(lens == topk)
+    expected = torch.arange(topk, dtype=torch.int32, device=DEVICE)
+    assert torch.equal(rows, expected.expand(queries, topk))
+
+
 def test_select_batch_shapes_share_one_binary():
     generator = torch.Generator(device=DEVICE).manual_seed(2)
-    select = indexer.launch_gluon_dsv41_index_topk_select_gfx950
+    select = launch_select
 
     def limits(queries, width):
         return torch.full((queries,), width // 2, dtype=torch.int32, device=DEVICE)
 
     _select(select, _logits(3, 1000, generator), None, 512)
     _select(select, _logits(3, 1000, generator), None, 512, limits(3, 1000))
-    with assert_no_triton_compile(indexer.gluon_dsv41_index_topk_select_gfx950):
+    with assert_no_triton_compile(select_kernel):
         for queries, width in ((2, 64), (32, 2048), (192, 4608), (7, 16384)):
             logits = _logits(queries, width, generator)
             _select(select, logits, None, 512)
@@ -162,7 +185,7 @@ def test_select_rejects_layouts_the_kernel_would_misaddress():
     candidates = _candidates(queries, 2 * width, True, generator)
     rows = torch.empty(queries, topk, dtype=torch.int32, device=DEVICE)
     lens = torch.empty(queries, dtype=torch.int32, device=DEVICE)
-    launch = indexer.launch_gluon_dsv41_index_topk_select_gfx950
+    launch = launch_select
     for bad in (
         # Strided candidates would map picks to the wrong block ids.
         dict(candidates=candidates[:, ::2]),

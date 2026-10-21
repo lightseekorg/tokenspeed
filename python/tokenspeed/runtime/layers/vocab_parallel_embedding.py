@@ -28,6 +28,8 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.gemm import plan_dense_gemm
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
@@ -64,6 +66,12 @@ _FUSED_GATHER_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
 
+    def __init__(self):
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        self.batch_invariant = global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+        self.kernel_plan = None
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -86,6 +94,15 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
+        if self.batch_invariant:
+            self.kernel_plan = plan_dense_gemm(
+                mode="mm",
+                input_size=input_size_per_partition,
+                output_size=sum(output_partition_sizes),
+                dtype=params_dtype,
+                batch_size=None,
+                batch_invariant=True,
+            )
 
     def apply(
         self,
@@ -93,14 +110,12 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from tokenspeed.runtime.utils.env import global_server_args_dict
-
-        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
-            # Bitwise envelopes: the logits GEMM must be batch-invariant like
-            # every other row-parallel projection (see layers/dense/unquant).
-            from tokenspeed_kernel.ops.gemm import mm as kernel_mm
-
-            return kernel_mm(x, layer.weight, bias=bias, override="aok")
+        if self.batch_invariant:
+            if self.kernel_plan is None:
+                raise RuntimeError(
+                    "Batch-invariant LM head requires a plan before execution"
+                )
+            return kernel_mm(x, layer.weight, bias=bias, plan=self.kernel_plan)
         return F.linear(x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:

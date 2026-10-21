@@ -85,6 +85,7 @@ from tokenspeed.runtime.sampling.utils import (
     top_token_logprobs,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
 from tokenspeed.runtime.utils.triton import tl, triton
 
 logger = get_colorful_logger(__name__)
@@ -510,7 +511,8 @@ class LogitsProcessor(nn.Module):
         ):
             return None
 
-        vocab_padded = lm_head.weight.size(0) * self.tp_size
+        # A quantized head may keep its weight transposed, so read the shard width, not its rows.
+        vocab_padded = lm_head.num_embeddings_per_partition * self.tp_size
         if vocab_padded % (self.tp_size * 8) != 0:
             return None
 
@@ -562,7 +564,7 @@ class LogitsProcessor(nn.Module):
         device = lm_head.weight.device
         key = (
             self.tp_group,
-            lm_head.weight.size(0),
+            lm_head.num_embeddings_per_partition,
             max_M,
             skip_ping_pong,
             dtype,
@@ -570,10 +572,10 @@ class LogitsProcessor(nn.Module):
         )
         if key in self._LOGITS_DIST_ARGMAX_STATES:
             return self._LOGITS_DIST_ARGMAX_STATES[key]
-        if torch.cuda.is_current_stream_capturing():
+        if is_current_stream_capturing(device):
             return None  # never rendezvous inside capture; warmup probes first
 
-        group = pg_manager.get_process_group("nccl", self.tp_group)
+        group = pg_manager.get_device_process_group(self.tp_group)
         if self._agree_across_tp(
             current_platform().is_nvidia and dist_argmax_available(), group, device
         ):
@@ -592,7 +594,9 @@ class LogitsProcessor(nn.Module):
         self._LOGITS_DIST_ARGMAX_STATES[key] = state
         return state
 
-    def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
+    def _init_dist_argmax_state(
+        self, lm_head: VocabParallelEmbedding, logits_dtype: torch.dtype
+    ):
         if _dist_argmax_vetoed():
             return None
         if not 2 <= self.tp_size <= 32:
@@ -600,20 +604,19 @@ class LogitsProcessor(nn.Module):
         if self.skip_all_gather or self.dp_sampling_enabled:
             return None
 
-        vocab_per_rank = lm_head.weight.size(0)
+        # A quantized head may keep its weight transposed or packed, so take the shard width and logits dtype instead.
+        vocab_per_rank = lm_head.num_embeddings_per_partition
         if vocab_per_rank * self.tp_size != self.config.vocab_size:
             return None  # padded vocab: sharded argmax could pick a pad column
         state = None
-        if supports_dist_argmax_shape(
-            vocab_per_rank, lm_head.weight.dtype, self.tp_size
-        ):
+        if supports_dist_argmax_shape(vocab_per_rank, logits_dtype, self.tp_size):
             state = self.acquire_dist_argmax_state(
                 lm_head,
                 max_M=self._LOGITS_DIST_ARGMAX_MAX_TOKENS,
                 skip_ping_pong=True,
-                dtype=lm_head.weight.dtype,
+                dtype=logits_dtype,
             )
-        if state is None and not torch.cuda.is_current_stream_capturing():
+        if state is None and not is_current_stream_capturing(lm_head.weight.device):
             state = VocabParallelArgmax(self.tp_group, self.tp_rank * vocab_per_rank)
         return state
 
@@ -977,7 +980,7 @@ class LogitsProcessor(nn.Module):
             return dp_group_row_counts(
                 table, self.tp_group, self.tp_group[self.tp_rank], rows
             )
-        if hidden_states.is_cuda and torch.cuda.is_current_stream_capturing():
+        if is_current_stream_capturing(hidden_states.device):
             return [rows] * self.tp_size
         counts = torch.tensor([rows], dtype=torch.int64, device=hidden_states.device)
         return all_gather(counts, self.tp_group, dim=0).tolist()
@@ -1040,10 +1043,24 @@ class LogitsProcessor(nn.Module):
             from tokenspeed.runtime.utils.env import global_server_args_dict
 
             if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
-                logits = kernel_mm(
-                    hidden_states.to(lm_head.weight.dtype),
-                    lm_head.weight,
-                    override="aok",
+                # The weight owner plans with its actual dtype, padding and TP
+                # geometry during construction. The processor must not guess
+                # that geometry or select from the first runtime batch.
+                from tokenspeed.runtime.layers.dense.unquant import (
+                    UnquantizedLinearMethod,
+                )
+                from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+                    UnquantizedEmbeddingMethod,
+                )
+
+                if not isinstance(
+                    quant_method, (UnquantizedLinearMethod, UnquantizedEmbeddingMethod)
+                ):
+                    raise ValueError(
+                        "Batch-invariant dense logits require a planned unquantized LM-head method"
+                    )
+                logits = quant_method.apply(
+                    lm_head, hidden_states.to(lm_head.weight.dtype), embedding_bias
                 )
             else:
                 cast_hidden = hidden_states.to(lm_head.weight.dtype)
@@ -1077,9 +1094,11 @@ class LogitsProcessor(nn.Module):
             if self.do_argmax and not require_full_vocab:
                 if (
                     self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED
-                    and not torch.cuda.is_current_stream_capturing()
+                    and not is_current_stream_capturing(logits.device)
                 ):
-                    self._dist_argmax_state = self._init_dist_argmax_state(lm_head)
+                    self._dist_argmax_state = self._init_dist_argmax_state(
+                        lm_head, logits.dtype
+                    )
 
                 if (
                     self._dist_argmax_state
@@ -1099,7 +1118,7 @@ class LogitsProcessor(nn.Module):
             )
             if state is self._LOGITS_AG_STATE_UNINITIALIZED:
                 # create_state rendezvouses; leave it for an eager call.
-                if torch.cuda.is_current_stream_capturing():
+                if is_current_stream_capturing(logits.device):
                     state = None
                 else:
                     state = self._all_gather_state = self._init_all_gather_state(
@@ -1137,11 +1156,12 @@ class LogitsProcessor(nn.Module):
                     device=logits.device,
                 )
                 all_gather_single(gathered_logits, logits, self.tp_group)
-                logits = (
-                    gathered_logits.view(self.tp_size, num_rows, local_vocab_size)
-                    .transpose(0, 1)
-                    .contiguous()
-                    .view(num_rows, local_vocab_size * self.tp_size)
+                # Copies whole shard rows, several times faster than a transpose copy.
+                logits = torch.cat(
+                    gathered_logits.view(
+                        self.tp_size, num_rows, local_vocab_size
+                    ).unbind(0),
+                    dim=1,
                 )
 
         logits = logits[:, : self.config.vocab_size].contiguous()

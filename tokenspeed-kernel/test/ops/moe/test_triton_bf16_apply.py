@@ -35,12 +35,28 @@ def test_bf16_route_combine_rounds_before_accumulate_and_scale(graph_replay):
     ).to(torch.bfloat16)
     assert not torch.equal(expected, wrong_post_cast)
     assert not torch.equal(expected, wrong_unrounded)
-    _combine(routes, weights, output, True, 2.5)
+    _combine(
+        routes,
+        weights,
+        output,
+        None,
+        0,
+        round_weighted_routes=True,
+        output_scale=2.5,
+    )
     graph = None
     if graph_replay:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            _combine(routes, weights, output, True, 2.5)
+            _combine(
+                routes,
+                weights,
+                output,
+                None,
+                0,
+                round_weighted_routes=True,
+                output_scale=2.5,
+            )
         graph.replay()
     assert torch.equal(output.cpu(), expected)
     # Replay must read live route values/weights, not captured snapshots.
@@ -49,7 +65,15 @@ def test_bf16_route_combine_rounds_before_accumulate_and_scale(graph_replay):
     routes.copy_(routes_cpu)
     weights.copy_(weights_cpu)
     if graph is None:
-        _combine(routes, weights, output, True, 2.5)
+        _combine(
+            routes,
+            weights,
+            output,
+            None,
+            0,
+            round_weighted_routes=True,
+            output_scale=2.5,
+        )
     else:
         graph.replay()
     expected, _ = expected_values()
@@ -124,6 +148,7 @@ def test_triton_bf16_moe_matches_torch(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     if precision_policy != "default":
         plan["precision_policy"] = precision_policy

@@ -545,6 +545,7 @@ if current_platform().is_nvidia:
         dtype: torch.dtype,
         pattern_code: int,
         use_oneshot: bool,
+        ipc_oneshot: bool,
         residual_reduce_scattered: bool = False,
     ):
         """Pick the AR workspace for one call: mnnvl when eligible, else IPC.
@@ -552,8 +553,9 @@ if current_platform().is_nvidia:
         Tier 2 of AR dispatch (Tier 1 chose the trtllm backend in auto.py).
         Decision, first match wins:
           1. compatible IPC workspace exists (single-node, lamport sentinel
-             width matches) AND (payload >= MNNVL_PREFER_IPC_BYTES
-             OR pattern == kAllReduceLatentNorm) ....... IPC lamport/twoshot
+             width matches) AND (pattern == kAllReduceLatentNorm OR
+             (``ipc_oneshot`` AND payload >= MNNVL_PREFER_IPC_BYTES))
+             ............................................ IPC lamport one-shot
           2. mnnvl supports this shape ................. mnnvl (the caller's
              ``use_oneshot`` parameter selects its strategy)
           3. no usable IPC (cross-node, or lamport sentinel width mismatch)
@@ -562,21 +564,16 @@ if current_platform().is_nvidia:
              raise loudly -- never a null workspace into the kernel)
           4. otherwise ................................ IPC
         Cross-node, workspace_tensor is None so only 2/3 apply -- mnnvl serves
-        the whole range (it beats NCCL everywhere there).
+        the whole range (it beats NCCL everywhere there). ``ipc_oneshot`` is
+        the strategy the IPC kernel would run for this call.
         """
         mnnvl = manager.mnnvl_workspace
-        # Byte-based split between the two fused workspaces: multicast (mnnvl)
-        # for small payloads, IPC lamport once bandwidth dominates. Only bites
-        # single-node -- cross-node workspace_tensor is None and mnnvl is the
-        # only option. See MNNVL_PREFER_IPC_BYTES for the measurement.
         from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
 
         payload_bytes = token_num * hidden_dim * dtype.itemsize
-        # Prefer IPC when it exists (single node) for large payloads, and for
-        # latent-norm whose wide lane the mnnvl geometry handles slightly worse.
-        # Cross-node workspace_tensor is None, so mnnvl serves both.
-        prefer_ipc = payload_bytes >= MNNVL_PREFER_IPC_BYTES or (
-            pattern_code == AllReduceFusionPattern.kAllReduceLatentNorm
+        # One node: IPC keeps the latent-norm lane and large one-shot payloads; cross-node mnnvl serves all.
+        prefer_ipc = pattern_code == AllReduceFusionPattern.kAllReduceLatentNorm or (
+            ipc_oneshot and payload_bytes >= MNNVL_PREFER_IPC_BYTES
         )
         # A sentinel-width mismatch corrupts the lamport neg-zero wait/clear protocol.
         ipc_ok = manager.workspace_tensor is not None and (
@@ -744,6 +741,7 @@ if current_platform().is_nvidia:
             tensor_2d.dtype,
             AllReduceFusionPattern.kAllReduce,
             resolved_oneshot,
+            ipc_oneshot=requested_oneshot,
         )
         if workspace is None:
             return None
@@ -898,7 +896,8 @@ if current_platform().is_nvidia:
             input_tensor.dtype,
             pattern_code,
             resolved_oneshot,
-            residual_reduce_scattered,
+            ipc_oneshot=requested_oneshot,
+            residual_reduce_scattered=residual_reduce_scattered,
         )
         # IPC has its own heuristic; only MNNVL uses the workspace's frozen cap.
         if workspace is not manager.mnnvl_workspace:
@@ -1147,6 +1146,7 @@ if current_platform().is_nvidia:
             input_tensor.dtype,
             AllReduceFusionPattern.kARResidualAttnResCombine,
             use_oneshot=True,
+            ipc_oneshot=True,
         )
         if workspace is None:
             # Lands here cross-node out-of-mnnvl-range, or single-node on a
@@ -1230,6 +1230,7 @@ if current_platform().is_nvidia:
             lane.dtype,
             AllReduceFusionPattern.kAllReduceLatentNorm,
             use_oneshot=True,
+            ipc_oneshot=True,
         )
         if workspace is None:
             # Lands here cross-node out-of-mnnvl-range, or single-node on a

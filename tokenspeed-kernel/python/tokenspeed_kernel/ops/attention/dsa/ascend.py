@@ -32,10 +32,26 @@ from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["ascend_dsa_kernels"]
+__all__ = ["ascend_dsa_kernels", "ascend_dsa_cp_metadata"]
 
 platform = current_platform()
 _kernels = None
+
+
+def ascend_dsa_cp_metadata(table, lengths, **kwargs):
+    """Write DSA query/group metadata and slots into caller-provided buffers.
+
+    INT32 ``table[B,P]`` and ``lengths[B]`` expand to R=B*query_width causal
+    query rows. ``out[R,P]`` and the per-query vectors receive local metadata;
+    ``index_*`` buffers have R/query_group_size grouped rows. Optional global
+    ``slots`` map to matching INT64 ``local_slots``, with -1 for skipped writes.
+    Returns None; buffers are updated in place and retained through graph use.
+    See :func:`tokenspeed_kernel_npu.ops.dsa.dsa_cp_metadata` for all keyword
+    arguments, output shapes and ownership semantics.
+    """
+    from tokenspeed_kernel_npu.ops.dsa import dsa_cp_metadata
+
+    dsa_cp_metadata(table, lengths, **kwargs)
 
 
 def ascend_dsa_kernels():

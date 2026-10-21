@@ -360,14 +360,16 @@ def triton_mm_fp8_scaled(
         A_scales: FP32 ``[M, 1]`` per-token or ``[1, 1]`` per-tensor scales.
         B_scales: FP32 ``[N, 1]`` per-channel or ``[1, 1]`` per-tensor scales.
         out_dtype: Output dtype.
-        alpha: Unused; accepted for the ``gemm.mm`` calling convention.
-        block_size: Unused; accepted for the ``gemm.mm`` calling convention.
+        alpha: Must be None; dequantization uses the operand scales.
+        block_size: Must be None; scales are per token/channel or per tensor.
         bias: Optional ``[N]`` bias added in the epilogue.
         out: Optional ``[M, N]`` output buffer.
 
     Returns:
         ``[M, N]`` tensor ``(A * A_scales) @ (B * B_scales^T)`` in ``out_dtype``.
     """
+    if alpha is not None or block_size is not None:
+        raise ValueError("row-wise scaled FP8 GEMM takes no alpha or block_size")
     return triton_scaled_mm(
         A,
         B,

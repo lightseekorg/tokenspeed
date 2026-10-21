@@ -216,6 +216,64 @@ def test_zero_page_fields_matches_host_expansion_without_recompiling(
         )
 
 
+@pytest.mark.parametrize("page_dtype", [torch.int32, torch.int64])
+def test_zero_page_fields_small_grid_strides_pages_and_fields(
+    device: str, page_dtype: torch.dtype
+) -> None:
+    fields = [(3, 32, 7), (257, 192, 137), (2049, 64, 33)]
+    page_ids = [5, 0, 3, 1]
+    expected = torch.full((2600,), 173, dtype=torch.uint8)
+    backing = expected.to(device)
+    for page in page_ids:
+        for base, stride, size in fields:
+            expected[base + page * stride : base + page * stride + size] = 0
+
+    # Two programs must cover twelve ranges, crossing both pages and fields.
+    # Two byte tiles must also loop for the largest field, including its
+    # partial final tile.
+    _zero_page_fields_kernel[(2, 2)](
+        backing,
+        torch.tensor(page_ids, dtype=page_dtype, device=device),
+        torch.tensor(fields, dtype=torch.int64, device=device),
+        len(fields),
+        len(page_ids) * len(fields),
+        BLOCK_SIZE=32,
+        num_warps=4,
+    )
+
+    # Check all bytes, including unselected pages, payload tails and guards.
+    torch.testing.assert_close(backing.cpu(), expected, rtol=0, atol=0)
+
+
+def test_zero_page_fields_large_admission_preserves_unselected_bytes(
+    device: str,
+) -> None:
+    # 1025 pages x 12 fields x 32 tiles exceeded Ascend's 65535 launch limit.
+    capacity = 1100
+    selected = torch.randperm(capacity, generator=torch.Generator().manual_seed(42))[
+        :1025
+    ]
+    fields = []
+    offset = 64
+    for size in [65537, *range(17, 28)]:
+        stride = ((size + 31) // 32 + 1) * 32
+        fields.append((offset, stride, size))
+        offset += capacity * stride + 64
+    expected = torch.full((offset,), 173, dtype=torch.uint8)
+    backing = expected.to(device)
+    for base, stride, size in fields:
+        view = expected[base : base + capacity * stride].view(capacity, stride)
+        view[selected, :size] = 0
+    zero_page_fields(
+        backing,
+        selected.to(device=device, dtype=torch.int32),
+        torch.tensor(fields, dtype=torch.int64, device=device),
+        max_field_bytes=65537,
+    )
+    # Includes fields, padding bytes, guard gaps and the 75 untouched pages.
+    torch.testing.assert_close(backing.cpu(), expected, rtol=0, atol=0)
+
+
 def test_copy_page_fields_matches_host_expansion_without_recompiling(
     device: str,
 ) -> None:

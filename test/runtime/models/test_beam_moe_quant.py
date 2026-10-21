@@ -30,6 +30,7 @@ instead.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import logging
 import os
@@ -40,6 +41,7 @@ from unittest import mock
 import pytest
 import torch
 from safetensors.torch import save_file
+from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
 from tokenspeed_kernel.thirdparty.flashinfer import trtllm_bf16_moe
 
 from tokenspeed.runtime.configs import model_config as model_config_module
@@ -83,6 +85,17 @@ ROUTED_APPLY = "flashinfer_trtllm_unquant_routed_moe_apply"
 FP8_ROUTED = "flashinfer_trtllm_fp8_channel_routed_moe_apply"
 NVFP4_ROUTED = "flashinfer_trtllm_nvfp4_routed_moe_apply"
 FP8 = torch.float8_e4m3fn
+
+
+@pytest.fixture(autouse=True)
+def nvidia_platform():
+    """These vendor policy and launch tests exercise the NVIDIA path on CPU."""
+    original = current_platform()
+    Platform.override(
+        dataclasses.replace(original, vendor="nvidia", arch_version=ArchVersion(10, 3))
+    )
+    yield
+    Platform.override(original)
 
 
 def _moe(mapping=None, config=None, cls=None):
@@ -477,6 +490,17 @@ def test_quantized_experts_need_the_vendor_moe(server, backend):
             _model(quant_config)
 
 
+@pytest.mark.parametrize("backend", ["auto", "triton", "gluon", "flashinfer_trtllm"])
+def test_nvidia_mxfp4_experts_remain_unsupported(server, backend):
+    from test.runtime.models.test_beam_mxfp4 import mxfp4_config
+
+    server(backend)
+    with pytest.raises(
+        ValueError, match="requires? AMD gfx950|needs --moe-backend flashinfer_trtllm"
+    ):
+        _model(mxfp4_config())
+
+
 def _stacked(tensors, layer, names):
     return torch.cat([tensors[f"{layer}.{name}"] for name in names])
 
@@ -572,6 +596,19 @@ def _fp8_linear_stand_in(calls):
     return linear
 
 
+def _fp8_gemm_stand_in(calls):
+    """kernel_mm on CPU: the codes and scales it is given, FP64 product."""
+
+    def gemm(a, b, *, A_scales, B_scales, out_dtype, quant):
+        calls.append(a)
+        out = (a.double() * A_scales.double()) @ (
+            b.double() * B_scales.double().reshape(1, -1)
+        )
+        return out.to(out_dtype)
+
+    return gemm
+
+
 def test_attention_runs_qkv_and_gate_as_one_fp8_gemm(server, monkeypatch):
     """After loading, the Q/K/V and output gate FP8 codes and channel scales
     form one GEMM (Q/K/V rows, then the gate rows) that gives both outputs
@@ -600,6 +637,45 @@ def test_attention_runs_qkv_and_gate_as_one_fp8_gemm(server, monkeypatch):
     separate_qkv, _ = attn.qkv_proj(x)
     separate_gate, _ = attn.gate_proj(x)
     assert torch.equal(qkv, separate_qkv) and torch.equal(gate, separate_gate)
+
+
+def test_the_offered_token_fp8_is_consumed_once(server, monkeypatch):
+    """The input norm's per-token FP8 of the rows it returned serves exactly
+    the one projection of those rows: the fused GEMM runs on the offered codes
+    and scales, then the offer is gone — a second call, even of the same rows,
+    quantizes them again itself."""
+    server("flashinfer_trtllm")
+    tensors, _ = fp8_checkpoint()
+    model = _model(ct())
+    model.load_weights(list(tensors.items()))
+    attn = model.model.layers[0].self_attn
+    _post_load(attn)
+    x = torch.randn(3, attn.qkv_proj.weight.shape[0]).to(torch.bfloat16)
+    # What the input norm's rmsnorm_quantize_fp8 launch offers for x's rows:
+    # the per-token quantization _fp8_linear_stand_in computes again below.
+    x_scale = x.double().abs().amax(-1, keepdim=True) / 448.0
+    codes = (x.double() / x_scale).clamp(-448, 448).float().to(FP8)
+    gemm_calls, linear_calls = [], []
+    monkeypatch.setattr(beam, "kernel_mm", _fp8_gemm_stand_in(gemm_calls))
+    linear = _fp8_linear_stand_in(linear_calls)
+    monkeypatch.setattr(beam, "fp8_dynamic_linear", linear)
+
+    attn.offer_token_fp8(x, codes, x_scale)
+    offered_qkv, offered_gate = attn.project_qkv_gate(x)
+    assert len(gemm_calls) == 1 and gemm_calls[0] is codes
+    assert linear_calls == []
+    assert attn._token_fp8 is None
+
+    again_qkv, again_gate = attn.project_qkv_gate(x)
+    assert len(gemm_calls) == 1 and len(linear_calls) == 1
+    assert torch.equal(again_qkv, offered_qkv)
+    assert torch.equal(again_gate, offered_gate)
+
+    # Rows the norm did not offer get no stale codes either.
+    attn.offer_token_fp8(x, codes, x_scale)
+    attn.project_qkv_gate(x.clone())
+    assert len(gemm_calls) == 1 and len(linear_calls) == 2
+    assert attn._token_fp8 is None
 
 
 Q = "model.layers.0.self_attn.q_proj"

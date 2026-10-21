@@ -28,6 +28,7 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
+    KernelPlan,
     NoKernelFoundError,
     select_kernel,
     spec_matches_traits,
@@ -144,12 +145,46 @@ def mla_project_value_prefers_contiguous_weight(
     return True
 
 
+def plan_mla_project_value(
+    *,
+    num_heads: int,
+    latent_dim: int,
+    value_dim: int,
+    dtype: torch.dtype,
+    gate_kind: str,
+    batch_invariant: bool,
+) -> KernelPlan:
+    """Plan the headwise value projection once from model dimensions."""
+    return KernelPlan.select(
+        "attention",
+        "mla_project_value",
+        format_signature(
+            **{
+                name: dense_tensor_format(dtype)
+                for name in ("attention", "weight", "out")
+            }
+        ),
+        features=frozenset({"batch_invariant"}) if batch_invariant else frozenset(),
+        static_traits={
+            "num_q_heads": num_heads,
+            "kv_lora_rank": latent_dim,
+            "value_head_dim": value_dim,
+            "gate_kind": gate_kind,
+        },
+        variable_traits=frozenset({"batch_size"}),
+        solution=None,
+        declared_traits=frozenset(),
+        ignore_layout=False,
+    )
+
+
 def mla_project_value(
     attention: torch.Tensor,
     weight: torch.Tensor,
     *,
     gate: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    plan: KernelPlan | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -166,6 +201,7 @@ def mla_project_value(
         gate: Optional raw sigmoid gate shaped ``[batch, heads * value_dim]``.
         out: Optional output with the same shape as ``gate`` when provided, or
             ``[batch, heads * value_dim]`` otherwise.
+        plan: Initialization-time selection; incompatible inputs fail without fallback.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
 
@@ -215,19 +251,31 @@ def mla_project_value(
             and out.is_contiguous()
         ),
     }
-    try:
-        kernel = select_kernel(
+    if plan is not None:
+        plan.validate(
             "attention",
             "mla_project_value",
             signature,
             traits=traits,
             solution=solution,
             override=override,
+            features=None,
         )
-    except NoKernelFoundError:
-        if override is not None or solution is not None:
-            raise
-        kernel = None
+        kernel = plan.kernel
+    else:
+        try:
+            kernel = select_kernel(
+                "attention",
+                "mla_project_value",
+                signature,
+                traits=traits,
+                solution=solution,
+                override=override,
+            )
+        except NoKernelFoundError:
+            if override is not None or solution is not None:
+                raise
+            kernel = None
 
     if kernel is None and not traits["inputs_contiguous"]:
         try:
@@ -842,6 +890,7 @@ def mla_extend_with_kvcache(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
     # dispatch options
+    plan: KernelPlan | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> AttentionResult:
@@ -871,6 +920,7 @@ def mla_extend_with_kvcache(
         logit_cap: Optional soft cap applied to logits.
         return_lse: Whether to return natural-log log-sum-exp values.
         out: Optional output shaped ``[total_q, num_q_heads, kv_lora_rank]``.
+        plan: Initialization-time selection; incompatible inputs fail without fallback.
         override: Optional exact kernel name.
         solution: Optional kernel solution backend.
 
@@ -891,14 +941,26 @@ def mla_extend_with_kvcache(
         "return_lse": return_lse,
     }
     signature = _attention_format_signature(q=q, kv_cache=kv_cache)
-    kernel = select_kernel(
-        "attention",
-        "mla_extend_with_kvcache",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
+    if plan is not None:
+        plan.validate(
+            "attention",
+            "mla_extend_with_kvcache",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+            features=None,
+        )
+        kernel = plan.kernel
+    else:
+        kernel = select_kernel(
+            "attention",
+            "mla_extend_with_kvcache",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
 
     shape_params = {
         "batch_size": batch_size,
@@ -1043,6 +1105,7 @@ def mla_decode_with_kvcache(
     window_left: int = -1,
     noncausal_block_size: int = 1,
     # dispatch options
+    plan: KernelPlan | None = None,
     override: str | None = None,
     solution: str | None = None,
     # optional projected-value epilogue
@@ -1143,6 +1206,9 @@ def mla_decode_with_kvcache(
         if gate is not None and gate.shape != expected_output:
             raise ValueError(f"gate must have shape {expected_output}")
 
+    if plan is not None and projected_value:
+        raise ValueError("A latent MLA plan cannot execute fused value projection")
+
     # The fused projected-value kernel serves only unwindowed single-query
     # decode. Otherwise compose latent decode with the standalone projection;
     # kernel choice stays with the sliding_window and q_len traits.
@@ -1210,49 +1276,61 @@ def mla_decode_with_kvcache(
     dispatch_mode = (
         "mla_decode_projected_value" if projected_value else "mla_decode_with_kvcache"
     )
-    try:
-        kernel = select_kernel(
+    if plan is not None:
+        plan.validate(
             "attention",
             dispatch_mode,
             signature,
             traits=traits,
             solution=solution,
             override=override,
+            features=None,
         )
-    except NoKernelFoundError:
-        if projected_value:
-            if override is not None or solution is not None:
+        kernel = plan.kernel
+    else:
+        try:
+            kernel = select_kernel(
+                "attention",
+                dispatch_mode,
+                signature,
+                traits=traits,
+                solution=solution,
+                override=override,
+            )
+        except NoKernelFoundError:
+            if projected_value:
+                if override is not None or solution is not None:
+                    raise
+                attention = mla_decode_with_kvcache(
+                    q=q,
+                    kv_cache=kv_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    max_seqlen_k=max_seqlen_k,
+                    qk_nope_head_dim=qk_nope_head_dim,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    softmax_scale=softmax_scale,
+                    logit_cap=logit_cap,
+                )
+                return mla_project_value(
+                    attention.reshape(q.shape[0], q.shape[2], kv_lora_rank),
+                    value_weight,
+                    gate=gate,
+                    out=out,
+                )
+            if q.dtype == kv_cache.dtype:
                 raise
-            attention = mla_decode_with_kvcache(
-                q=q,
-                kv_cache=kv_cache,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                max_seqlen_k=max_seqlen_k,
-                qk_nope_head_dim=qk_nope_head_dim,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                softmax_scale=softmax_scale,
-                logit_cap=logit_cap,
+            q = q.to(kv_cache.dtype)
+            signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+            kernel = select_kernel(
+                "attention",
+                "mla_decode_with_kvcache",
+                signature,
+                traits=traits,
+                solution=solution,
+                override=override,
             )
-            return mla_project_value(
-                attention.reshape(q.shape[0], q.shape[2], kv_lora_rank),
-                value_weight,
-                gate=gate,
-                out=out,
-            )
-        if q.dtype == kv_cache.dtype:
-            raise
-        q = q.to(kv_cache.dtype)
-        signature = _attention_format_signature(q=q, kv_cache=kv_cache)
-        kernel = select_kernel(
-            "attention",
-            "mla_decode_with_kvcache",
-            signature,
-            traits=traits,
-            solution=solution,
-            override=override,
-        )
 
     shape_params = {
         "batch_size": q.shape[0],

@@ -382,8 +382,8 @@ class AutoBackend(CommBackend):
         if route is Route.NCCL:
             return self._nccl.all_reduce(tensor, group, op=op)
         # Tiered dispatch -- first match wins. This is Tier 1 (which backend);
-        # the trtllm backend then runs Tier 2 (mnnvl vs IPC, by payload bytes)
-        # inside _ar_fusion_workspace.
+        # the trtllm backend then runs Tier 2 (mnnvl vs IPC, by pattern, payload
+        # bytes and the IPC kernel's strategy) inside _ar_fusion_workspace.
         #   1. trtllm_ar armed for this group ...... trtllm_ar   (mnnvl / IPC fusion)
         #   2. group spans nodes ................... NCCL
         #   3. producer-owned memory or Iris can run Iris
@@ -575,7 +575,6 @@ class AutoBackend(CommBackend):
         Projection collectives have an explicit pre-capture lifetime. Their
         large-message and unsupported-topology paths return to this backend;
         batch-invariant reductions retain the rank-ordered fold at every size.
-        Batch-invariant fusion diagnostics apply only to column projections.
         """
         use_lamport = (
             current_platform().is_nvidia
@@ -605,6 +604,20 @@ class AutoBackend(CommBackend):
             tensor, weight, weight_scales, owner_rows, out, workspace
         )
 
+    def try_fused_dp_row_linear(
+        self,
+        tensor: torch.Tensor,
+        input_scales: torch.Tensor | None,
+        weight: torch.Tensor,
+        weight_scales: torch.Tensor | None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> bool:
+        return self._projection.try_fused_dp_row_linear(
+            tensor, input_scales, weight, weight_scales, owner_rows, out, workspace
+        )
+
     def projection_all_gather(
         self,
         tensor: torch.Tensor,
@@ -622,9 +635,11 @@ class AutoBackend(CommBackend):
         quantize: bool,
         out: torch.Tensor | None,
         workspace: ProjectionWorkspace,
+        *,
+        input_scales: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         return self._projection.all_to_all(
-            tensor, rows, inverse, quantize, out, workspace
+            tensor, rows, inverse, quantize, out, workspace, input_scales=input_scales
         )
 
     def acquire_projection_output(

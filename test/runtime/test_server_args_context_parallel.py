@@ -19,8 +19,8 @@
 # SOFTWARE.
 
 """The three context-parallel flags: ``--kv-parallel-size`` (KVP, the sharded
-page storage of a PD role), ``--decode-context-parallel-size`` (DCP, the
-decode role's compute over it) and ``--query-context-parallel-size`` (QCP,
+page storage of an aggregated or PD engine), ``--decode-context-parallel-size``
+(DCP, the decode compute over it) and ``--query-context-parallel-size`` (QCP,
 the prefill role's query-row sharding over it) -- which roles take them, how
 they relate, and the QCP layouts the first landing refuses."""
 
@@ -85,24 +85,24 @@ def test_off_by_default_everywhere():
         dict(kvp_size=4, dcp_size=1, qcp_size=1, disaggregation_mode="prefill"),
         dict(kvp_size=4, dcp_size=1, qcp_size=4, disaggregation_mode="prefill"),
         dict(kvp_size=4, dcp_size=4, qcp_size=1, disaggregation_mode="decode"),
+        dict(kvp_size=8, dcp_size=8, qcp_size=1, disaggregation_mode="null"),
     ],
 )
 def test_the_roles_that_take_the_flags(kwargs):
-    validate_context_parallel_roles(**kwargs)
+    validate_context_parallel_roles(**kwargs, enable_mixed_batch=False)
 
 
 @pytest.mark.parametrize(
     "kwargs,match",
     [
-        # KVP is a PD-role layout: an aggregated engine has no decode compute
-        # over sharded pages.
+        # Every engine serving decode must explicitly select DCP for sharded KV.
         (
             dict(kvp_size=2, dcp_size=1, qcp_size=1, disaggregation_mode="null"),
-            "--kv-parallel-size > 1 requires --disaggregation-mode prefill or decode",
+            "requires --decode-context-parallel-size 2",
         ),
         (
             dict(kvp_size=2, dcp_size=1, qcp_size=1, disaggregation_mode="encode"),
-            "--kv-parallel-size > 1 requires --disaggregation-mode prefill or decode",
+            "--kv-parallel-size > 1 requires --disaggregation-mode null, prefill or decode",
         ),
         # The decode role names its compute explicitly.
         (
@@ -111,7 +111,7 @@ def test_the_roles_that_take_the_flags(kwargs):
         ),
         (
             dict(kvp_size=2, dcp_size=2, qcp_size=1, disaggregation_mode="prefill"),
-            "--decode-context-parallel-size > 1 requires --disaggregation-mode decode",
+            "--decode-context-parallel-size > 1 requires --disaggregation-mode null or decode",
         ),
         (
             dict(kvp_size=4, dcp_size=2, qcp_size=1, disaggregation_mode="decode"),
@@ -124,6 +124,14 @@ def test_the_roles_that_take_the_flags(kwargs):
         (
             dict(kvp_size=1, dcp_size=0, qcp_size=1, disaggregation_mode="decode"),
             "positive integer",
+        ),
+        (
+            dict(kvp_size=8, dcp_size=4, qcp_size=1, disaggregation_mode="null"),
+            "--decode-context-parallel-size must equal --kv-parallel-size",
+        ),
+        (
+            dict(kvp_size=1, dcp_size=2, qcp_size=1, disaggregation_mode="encode"),
+            "--decode-context-parallel-size > 1 requires --disaggregation-mode null or decode",
         ),
         # The query shard is a prefill-role layout over sharded pages.
         (
@@ -142,7 +150,7 @@ def test_the_roles_that_take_the_flags(kwargs):
 )
 def test_the_roles_that_refuse_the_flags(kwargs, match):
     with pytest.raises(ValueError, match=match):
-        validate_context_parallel_roles(**kwargs)
+        validate_context_parallel_roles(**kwargs, enable_mixed_batch=False)
 
 
 def test_the_decode_role_reads_the_shards_with_dcp():
@@ -155,8 +163,27 @@ def test_the_decode_role_reads_the_shards_with_dcp():
         prepare_server_args(without_dcp)
 
 
-def test_an_aggregated_engine_does_not_shard():
-    with pytest.raises(ValueError, match="prefill or decode"):
+@pytest.mark.parametrize("backend", [None, "flashmla", "dsa"])
+def test_an_aggregated_engine_reads_shards_with_dcp(backend):
+    argv = DECODE + ["--disaggregation-mode", "null"]
+    if backend is not None:
+        argv.extend(["--attention-backend", backend])
+    args = prepare_server_args(argv)
+    assert args.disaggregation_mode == "null"
+    assert args.mapping.attn.kvp_size == args.decode_context_parallel_size == 2
+    assert not args.enable_mixed_batch
+    with pytest.raises(ValueError, match="Aggregated DCP.*--enable-mixed-batch"):
+        prepare_server_args(argv + ["--enable-mixed-batch"])
+
+
+@pytest.mark.parametrize("argv", [["--model", "x", "--attn-tp-size", "2"], DECODE])
+def test_mixed_batches_remain_allowed_without_aggregated_dcp(argv):
+    args = prepare_server_args(argv + ["--enable-mixed-batch"])
+    assert args.enable_mixed_batch
+
+
+def test_an_aggregated_engine_requires_explicit_dcp():
+    with pytest.raises(ValueError, match="requires --decode-context-parallel-size 2"):
         prepare_server_args(
             ["--model", "x", "--attn-tp-size", "2", "--kv-parallel-size", "2"]
         )
@@ -191,7 +218,10 @@ def test_the_prefill_role_shards_its_pages_without_a_query_shard():
             ["--attn-tp-size", "4", "--kv-parallel-size", "2"],
             "must be 1 or the attention TP size",
         ),
-        (["--disaggregation-mode", "null"], "prefill or decode"),
+        (
+            ["--disaggregation-mode", "null"],
+            "--query-context-parallel-size > 1 requires --disaggregation-mode prefill",
+        ),
         (
             ["--disaggregation-mode", "decode"],
             "--query-context-parallel-size > 1 requires --disaggregation-mode prefill",
@@ -387,3 +417,38 @@ def test_the_attention_config_pins_query_sharding_to_a_bf16_native_cache():
     _dsa_attn_config(
         kv_cache_dtype=torch.float8_e4m3fn, qcp_size=1, qcp_rank=0, qcp_group=(0,)
     )
+
+
+@pytest.mark.parametrize("size", [2, 4, 8])
+def test_v41_aggregated_kvp_requires_explicit_matching_dcp(size):
+    argv = [
+        "--model",
+        "x",
+        "--attn-tp-size",
+        str(size),
+        "--attention-backend",
+        "deepseek_v41",
+        "--kv-parallel-size",
+        str(size),
+    ]
+    with pytest.raises(ValueError, match="requires --decode-context-parallel-size"):
+        prepare_server_args(argv)
+    args = prepare_server_args(argv + ["--decode-context-parallel-size", str(size)])
+    assert args.mapping.attn.kvp_size == args.decode_context_parallel_size == size
+    assert not args.mapping.attn.has_qcp
+    with pytest.raises(ValueError, match="Aggregated DCP.*--enable-mixed-batch"):
+        prepare_server_args(
+            argv + ["--decode-context-parallel-size", str(size), "--enable-mixed-batch"]
+        )
+    with pytest.raises(ValueError, match="must equal --kv-parallel-size"):
+        prepare_server_args(argv + ["--decode-context-parallel-size", str(size * 2)])
+    with pytest.raises(ValueError, match="requires --disaggregation-mode prefill"):
+        prepare_server_args(
+            argv
+            + [
+                "--decode-context-parallel-size",
+                str(size),
+                "--query-context-parallel-size",
+                str(size),
+            ]
+        )

@@ -11,6 +11,13 @@ On CDNA4, ordinary GEMM dispatch admits the measured single-row
 Callers that publish directly into a collective buffer pass that buffer as
 `out` to the same `mv` operation.
 
+## Per-token/per-channel FP8
+
+Per-channel FP8 projections use FP8 E4M3 weights with FP32 scales per output
+channel and dynamically quantize activations per token. This scale format is
+distinct from block scaling. Native FP8 matrix arithmetic uses FP32
+accumulators but need not match sequential FP32 arithmetic.
+
 ## DeepSeek V4 grouped output projection
 
 The grouped-projection plan describes the projection geometry and source formats.
@@ -34,7 +41,7 @@ not device-side replay.
 default `auto` route remains unchanged; routed experts use their own backend.
 
 This optional DeepGEMM integration requires Hopper, contiguous E4M3 operands
-A[M,K]/B[N,K], BF16 output, N divisible by 64 and K divisible by 128. It
+A[M,K]/B[N,K], BF16 output, N divisible by 64, and K divisible by 128. It
 converts canonical FP32 1x128 activation and 128x128 weight scales to the
 required layout without UE8M0 rounding. Conversion is part of each call,
 including graph capture; no persistent weight cache is created. Unsupported

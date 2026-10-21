@@ -142,6 +142,7 @@ def _quantize_fp8_roundtrip(
     *,
     override: str | None,
     solution: str | None,
+    required_features: frozenset[str] | None = None,
 ) -> torch.Tensor:
     """Simulate grouped FP8 quantization and return the dequantized tensor.
 
@@ -178,6 +179,7 @@ def _quantize_fp8_roundtrip(
         "quantization",
         "fp8",
         signature,
+        features=required_features,
         traits=traits,
         solution=solution,
         override=override,
@@ -219,6 +221,8 @@ def quantize_fp8(
     enable_pdl: bool = False,
     override: str | None = None,
     solution: str | None = None,
+    *,
+    required_features: frozenset[str] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Quantize a tensor to FP8 and return its scale when one is used.
 
@@ -238,8 +242,11 @@ def quantize_fp8(
         dequantize: Reconstruct the input dtype after UE8M0 group quantization.
         enable_pdl: Request Programmatic Dependent Launch where supported.
             Round trips and block quantization reject this option.
-        override: Optional exact registered kernel override.
+        override: Optional exact registered kernel override. Native-layout
+            quantizers may return strided scales; see their documented contract.
         solution: Optional restriction to a registered backend family.
+        required_features: Optional arithmetic or API features the selected
+            kernel must provide, including when an override is supplied.
 
     Returns:
         Quantized values and canonical scales, or reconstructed values and
@@ -264,6 +271,7 @@ def quantize_fp8(
                 scale_encoding=scale_encoding,
                 override=override,
                 solution=solution,
+                required_features=required_features,
             ),
             None,
         )
@@ -280,6 +288,7 @@ def quantize_fp8(
             enable_pdl=enable_pdl,
             override=override,
             solution=solution,
+            required_features=required_features,
         )
 
     traits = {"dequantize": False, "has_scale": scale is not None}
@@ -288,6 +297,7 @@ def quantize_fp8(
         "quantization",
         "fp8",
         signature,
+        features=required_features,
         traits=traits,
         solution=solution,
         override=override,
@@ -317,6 +327,7 @@ def _quantize_fp8_dynamic(
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
+    required_features: frozenset[str] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize x to FP8 while dynamically computing scales.
 
@@ -369,6 +380,7 @@ def _quantize_fp8_dynamic(
         scale_encoding,
         solution=solution,
         override=override,
+        required_features=required_features,
     )
     shape_params = {
         "shape": tuple(x.shape),
@@ -406,8 +418,13 @@ def _select_fp8_dynamic(
     *,
     solution: str | None,
     override: str | None,
+    required_features: frozenset[str] | None = None,
 ) -> SelectedKernel:
-    traits = {"granularity": granularity_trait, "scale_encoding": scale_encoding}
+    traits = {
+        "granularity": granularity_trait,
+        "scale_encoding": scale_encoding,
+        "scale_layout": "token_major",
+    }
     if rows is not None:
         # Rows of a 2-D x, for kernels with a row bound (``m_max``). Kernels
         # without one ignore it; a kernel with one never gets other ranks.
@@ -417,13 +434,19 @@ def _select_fp8_dynamic(
         "fp8_with_scale",
         format_signature(x=dense_tensor_format(dtype)),
         traits=traits,
+        features=required_features,
         solution=solution,
         override=override,
     )
 
 
 def select_fp8_token_quantizer(
-    rows: int, dtype: torch.dtype, *, solution: str | None, override: str | None
+    rows: int,
+    dtype: torch.dtype,
+    *,
+    solution: str | None,
+    override: str | None,
+    required_features: frozenset[str] | None = None,
 ) -> SelectedKernel:
     """The kernel ``quantize_fp8(x, granularity="token")`` runs for a 2-D ``x``
     of ``rows`` rows of ``dtype``; nothing is launched.
@@ -433,12 +456,19 @@ def select_fp8_token_quantizer(
         dtype: ``x``'s dtype.
         solution: Restrict ranked selection to one solution, or ``None``.
         override: Exact kernel name to force, or ``None`` for ranked selection.
+        required_features: Optional features required of the quantizer.
 
     Raises:
         NoKernelFoundError: No registered kernel serves the call.
     """
     return _select_fp8_dynamic(
-        dtype, rows, "token", "float32", solution=solution, override=override
+        dtype,
+        rows,
+        "token",
+        "float32",
+        solution=solution,
+        override=override,
+        required_features=required_features,
     )
 
 

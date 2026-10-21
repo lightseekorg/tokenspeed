@@ -400,6 +400,9 @@ class ModelExecutorConfig:
     # every row.
     query_shard_size: int
     query_shard_rank: int
+    # Sleep/wake (--enable-memory-saver): decode CUDA graphs are captured into
+    # the memory saver's ``cuda_graph`` region so a release can free them.
+    enable_memory_saver: bool
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -503,6 +506,7 @@ class ModelExecutorConfig:
             decode_only_attention=server_args.mapping.attn.head_tp_serves_decode_only,
             query_shard_size=server_args.mapping.attn.qcp_size,
             query_shard_rank=server_args.mapping.attn.qcp_rank,
+            enable_memory_saver=server_args.enable_memory_saver,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
@@ -1870,6 +1874,7 @@ class ModelExecutor:
                 forward_mode=graph_forward_mode,
                 global_num_tokens=dp_metadata.global_num_tokens,
                 global_bs=dp_metadata.global_batch_size,
+                global_num_decodes=dp_metadata.global_num_decodes,
                 all_decode_or_idle=dp_metadata.all_decode_or_idle,
             )
             sampling_info = SamplingBatchInfo(
@@ -1954,7 +1959,9 @@ class ModelExecutor:
                         )
                     )
                 step_global_num_tokens = self.drafter.idle_forward_global_num_tokens(
-                    dp_metadata.global_num_tokens, dp_metadata.global_batch_size
+                    dp_metadata.global_num_tokens,
+                    dp_metadata.global_batch_size,
+                    global_num_decodes=dp_metadata.global_num_decodes,
                 )
                 for step_idx, draft_global_num_tokens in enumerate(
                     step_global_num_tokens
@@ -1969,6 +1976,7 @@ class ModelExecutor:
                         forward_mode=ForwardMode.IDLE,
                         global_num_tokens=draft_global_num_tokens,
                         global_bs=dp_metadata.global_batch_size,
+                        global_num_decodes=dp_metadata.global_num_decodes,
                         all_decode_or_idle=dp_metadata.all_decode_or_idle,
                     )
                     self.drafter.draft_model_runner.forward(
@@ -2403,6 +2411,7 @@ class ModelExecutor:
                         )
                     ctx.global_num_tokens = dp_metadata.global_num_tokens
                     ctx.global_bs = dp_metadata.global_batch_size
+                    ctx.global_num_decodes = dp_metadata.global_num_decodes
                     ctx.all_decode_or_idle = dp_metadata.all_decode_or_idle
                     ctx.all_extend = dp_metadata.all_extend
                 with nvtx_range("sampling_prep", color="yellow"):

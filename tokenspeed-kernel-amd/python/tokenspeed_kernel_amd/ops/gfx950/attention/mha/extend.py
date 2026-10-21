@@ -22,7 +22,7 @@
 
 Ragged, multi-token queries against a paged KV cache. Each program owns one
 kv-head and packs the GQA query-head group with ``BLOCK_Q`` query positions into
-the MFMA ``M`` dimension (``BLOCK_M = BLOCK_Q * GROUP_SIZE``), so each KV tile is
+the MFMA ``M`` dimension (``BLOCK_M = BLOCK_Q * PADDED_GROUP_SIZE``), so each KV tile is
 loaded once and reused across the group. The grid is ragged and token-based,
 ``(total_num_q_blocks, n_kv_heads)``: each program binary-searches
 ``cu_seqlens_q`` to self-locate its request/q-block, keeping the launch
@@ -34,7 +34,7 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2,
     _INV_LN2_VALUE,
@@ -124,11 +124,12 @@ def _select_extend_tile(
         block_m, num_warps = _EXTEND_SHORT_Q_BLOCK_M, _EXTEND_SHORT_Q_NUM_WARPS
     else:
         block_m, num_warps = _EXTEND_LONG_Q_BLOCK_M, _EXTEND_LONG_Q_NUM_WARPS
-    # Floor BLOCK_M down to a whole number of query positions.
-    block_q = block_m // group_size
-    if block_q < 1:
-        block_q = 1
-    block_m = block_q * group_size
+    # Each query position owns a power-of-two head span. Mask unused head
+    # lanes instead of shrinking MFMA/range extents for groups such as 5 or 6.
+    padded_group_size = triton.next_power_of_2(group_size)
+    if block_m < padded_group_size:
+        block_m = padded_group_size
+    block_q = block_m // padded_group_size
     return block_m, block_q, _EXTEND_BLOCK_N, num_warps
 
 
@@ -137,6 +138,7 @@ class ExtendConfig:
     N_HEADS: gl.constexpr
     N_KV_HEADS: gl.constexpr
     GROUP_SIZE: gl.constexpr
+    PADDED_GROUP_SIZE: gl.constexpr
     HEAD_DIM: gl.constexpr
     SM_SCALE: gl.constexpr
     BLOCK_M: gl.constexpr
@@ -185,7 +187,9 @@ class ExtendConfig:
     ):
         assert HEAD_DIM in (64, 128)
         assert BLOCK_N == PAGE_SIZE
-        assert BLOCK_M == BLOCK_Q * (N_HEADS // N_KV_HEADS)
+        assert N_HEADS % N_KV_HEADS == 0
+        padded_group_size = triton.next_power_of_2(N_HEADS // N_KV_HEADS)
+        assert BLOCK_M == BLOCK_Q * padded_group_size
 
         # Extend uses a [32, 32, 16] MFMA with NUM_WARPS warp tiling.
         (
@@ -211,6 +215,7 @@ class ExtendConfig:
         self.N_HEADS = gl.constexpr(N_HEADS)
         self.N_KV_HEADS = gl.constexpr(N_KV_HEADS)
         self.GROUP_SIZE = gl.constexpr(N_HEADS // N_KV_HEADS)
+        self.PADDED_GROUP_SIZE = gl.constexpr(padded_group_size)
         self.HEAD_DIM = gl.constexpr(HEAD_DIM)
         self.SM_SCALE = gl.constexpr(SM_SCALE)
         self.BLOCK_M = gl.constexpr(BLOCK_M)
@@ -331,13 +336,15 @@ class ExtendProgram:
 
     @gluon.jit
     def row_qpos(self, offs_m):
-        # Head-minor packing: row m -> query position (m // GROUP_SIZE).
-        return self.q_pos_base + offs_m // self.cfg.GROUP_SIZE
+        return self.q_pos_base + offs_m // self.cfg.PADDED_GROUP_SIZE
 
     @gluon.jit
     def row_qhead(self, offs_m):
-        # Head-minor packing: row m -> group head (m % GROUP_SIZE).
-        return self.kv_head * self.cfg.GROUP_SIZE + offs_m % self.cfg.GROUP_SIZE
+        return self.kv_head * self.cfg.GROUP_SIZE + offs_m % self.cfg.PADDED_GROUP_SIZE
+
+    @gluon.jit
+    def row_has_head(self, offs_m):
+        return offs_m % self.cfg.PADDED_GROUP_SIZE < self.cfg.GROUP_SIZE
 
     @gluon.jit
     def load_q(self):
@@ -348,7 +355,7 @@ class ExtendProgram:
         q_head = self.row_qhead(offs_m)
         row = self.seq_base + q_pos
         offsets = cfg.q_strides.offsets(row[:, None], q_head[:, None], offs_d[None, :])
-        mask = q_pos[:, None] < self.seq_len
+        mask = (q_pos[:, None] < self.seq_len) & self.row_has_head(offs_m)[:, None]
         return cdna4.buffer_load(self.q_ptr, offsets, mask=mask, other=0.0)
 
     @gluon.jit
@@ -419,7 +426,12 @@ class ExtendProgram:
         if cfg.HAS_SINK:
             offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout))
             q_head = self.row_qhead(offs_m)
-            sink_log2 = gl.load(self.sink_ptr + q_head).to(gl.float32) * _INV_LN2
+            sink_log2 = (
+                gl.load(
+                    self.sink_ptr + q_head, mask=self.row_has_head(offs_m), other=0.0
+                ).to(gl.float32)
+                * _INV_LN2
+            )
             m_i = sink_log2 / cfg.SM_SCALE
         else:
             sink_log2 = gl.full(
@@ -498,7 +510,7 @@ class ExtendProgram:
             * cfg.HEAD_DIM
             + offs_d[None, :]
         ).to(gl.int32)
-        mask = q_pos[:, None] < self.seq_len
+        mask = (q_pos[:, None] < self.seq_len) & self.row_has_head(offs_m)[:, None]
         output = output.to(self.output_ptr.dtype.element_ty)
         cdna4.buffer_store(output, self.output_ptr, offsets, mask=mask)
 
@@ -510,7 +522,7 @@ class ExtendProgram:
             q_pos = self.row_qpos(offs_m)
             q_head = self.row_qhead(offs_m)
             offsets = ((self.seq_base + q_pos) * cfg.N_HEADS + q_head).to(gl.int32)
-            mask = q_pos < self.seq_len
+            mask = (q_pos < self.seq_len) & self.row_has_head(offs_m)
             lse_l_i = gl.where(l_i > 0.0, l_i, 1.0)
             # Softmax runs in base-2 (exp2 hardware fast path), so m_i*SM_SCALE +
             # log2(l_i) is the LSE in base-2 units. Convert to natural log (the
@@ -535,7 +547,7 @@ class ExtendProgram:
         q_pos = self.row_qpos(offs_m)
         q_head = self.row_qhead(offs_m)
         row = self.seq_base + q_pos
-        valid = q_pos < self.seq_len
+        valid = (q_pos < self.seq_len) & self.row_has_head(offs_m)
         has_kv = l_i > 0.0
         acc = gl.convert_layout(acc, cfg.store_layout)
         l_i = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.store_layout))
@@ -647,11 +659,11 @@ def gluon_mha_extend_gfx950(
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_attention_state()
 
-    # Row m packs (query position m // GROUP_SIZE, group head m % GROUP_SIZE);
+    # Each position packs PADDED_GROUP_SIZE head lanes; unused lanes are masked.
     # the causal/sliding masks key off the per-row query position only (heads in
     # a group share visibility), so diag_row broadcasts across the packed heads.
     offs_m_q = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
-    q_pos = program.q_pos_base + offs_m_q // cfg.GROUP_SIZE
+    q_pos = program.row_qpos(offs_m_q)
     offs_n_q = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
     diag_row = program.prefix + q_pos
 
@@ -846,7 +858,7 @@ def gluon_mha_extend_split_gfx950(
     m_i, l_i, acc, sink_log2 = program.init_attention_state()
 
     offs_m_q = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
-    q_pos = program.q_pos_base + offs_m_q // cfg.GROUP_SIZE
+    q_pos = program.row_qpos(offs_m_q)
     offs_n_q = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
     diag_row = program.prefix + q_pos
 

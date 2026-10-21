@@ -327,18 +327,12 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
             "a junction lies inside the unmatched prompt");
 
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
-    const std::int32_t state_checkpoint =
-        config_.disable_prefix_cache
-            ? 0
-            : PrefillStateCheckpointTokens(coordinator_, request->PrefillSize(), config_.max_scheduled_tokens,
-                                           config_.prefix_replay_tokens);
     // A remote landing completes the prompt in one transfer; no junction cut
     // can shorten it.
-    const std::int32_t tokens_this_round =
-        source == fsm::PrefillSource::kRemote
-            ? unscheduled
-            : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, remaining,
-                                 junction_tokens, state_checkpoint);
+    const std::int32_t tokens_this_round = source == fsm::PrefillSource::kRemote
+                                               ? unscheduled
+                                               : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
+                                                                    unscheduled, remaining, junction_tokens);
     if (tokens_this_round == 0) {
         return FirstChunkOutcome{};
     }
@@ -454,13 +448,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const std::int32_t unscheduled = request->UnscheduledPrefillSize();
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     fsm::CacheProgress cache_progress = request->CacheProgress();
-    const std::int32_t state_checkpoint =
-        config_.disable_prefix_cache
-            ? 0
-            : PrefillStateCheckpointTokens(coordinator_, request->PrefillSize(), config_.max_scheduled_tokens,
-                                           config_.prefix_replay_tokens);
     const std::int32_t prefill_tokens = PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled,
-                                                           remaining, cache_progress.junction_tokens, state_checkpoint);
+                                                           remaining, cache_progress.junction_tokens);
     if (prefill_tokens == 0) {
         return std::nullopt;
     }
@@ -473,17 +462,17 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         .completes_prefill = completes_prefill,
         .prompt_headroom_tokens = 0,
     };
-    // A junction or reusable boundary publishes its natural checkpoint and
-    // moves off the published blocks; other chunks publish only full pages.
+    // The chunk that ended at the junction publishes its natural checkpoint
+    // (KV tail and state) and moves off the published blocks; every other
+    // chunk end publishes only its completed full pages.
     const bool ends_at_junction = cache_progress.junction_tokens > 0 && first_pos == cache_progress.junction_tokens;
-    const bool ends_at_state_checkpoint = state_checkpoint > 0 && first_pos == state_checkpoint;
     if (first_pos >= cache_progress.junction_tokens) {
         cache_progress.junction_tokens = 0;
     }
-    const RequestProgress progress = AdvanceRequestProgress(
-        *request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
-        config_.StreamsDeviceCacheToHost(),
-        ends_at_junction || ends_at_state_checkpoint ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk);
+    const RequestProgress progress =
+        AdvanceRequestProgress(*request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
+                               config_.StreamsDeviceCacheToHost(),
+                               ends_at_junction ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk);
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     // A chunk reads the state its predecessor wrote (slot 1 -> slot 0) and

@@ -255,6 +255,7 @@ def test_selected_attention_joint_sink_masking_and_chunking(device, heads, with_
             None,
             None,
             None,
+            lse=None,
         )
         assert result is out
         torch.testing.assert_close(out, expected, rtol=0.008, atol=0.004)
@@ -286,6 +287,7 @@ def test_selected_attention_full_width_online_stability(device):
         None,
         None,
         None,
+        lse=None,
     )
     _, swa_ref = torch_dsv41_cache_quantize(swa_x, "swa")
     _, global_ref = torch_dsv41_cache_quantize(global_x, "global")
@@ -323,6 +325,7 @@ def test_sink_counted_once_and_representations_not_deduplicated(device):
         None,
         None,
         None,
+        lse=None,
     )
     values = (
         dsv41.cache_gather(swa, slots, "swa", None).float()
@@ -820,6 +823,7 @@ def test_empty_cache_and_zero_width_attention(device):
         None,
         None,
         None,
+        lse=None,
     )
     assert not result.any()
 
@@ -1101,6 +1105,7 @@ def test_native_decode_graph_refresh_slots_lengths_and_idle(batch, extra_width):
             schedule,
             None,
             None,
+            lse=None,
         )
 
     stream = torch.cuda.Stream()
@@ -1168,6 +1173,7 @@ def test_native_prefill_workspace_matches_joint_softmax(query_chunk_size):
         None,
         kv,
         indices,
+        lse=None,
     )
     selected = kv[indices.clamp_min(0).long(), 0].float()
     logits = torch.bmm(q.float(), selected.transpose(1, 2)) * 512**-0.5
