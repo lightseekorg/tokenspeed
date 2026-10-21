@@ -4260,7 +4260,7 @@ def index_block_select(
     Args:
         logits: FP32 [Q, width] full-selection scores with unit inner stride;
             columns at or past ``visible[q]`` must be -inf and are not read.
-        visible: Int32/int64 [Q] raw visible row counts.
+        visible: Contiguous int32/int64 [Q] raw visible row counts.
         visible_capacity: Page-table row capacity used to clamp lengths before
             narrowing to int32. This may exceed compact Reindex logits width.
         candidate_topk: Number of blocks to keep.
@@ -4277,6 +4277,8 @@ def index_block_select(
     queries, width = logits.shape
     if not queries:
         return
+    if queries > 1 and visible.stride(0) != 1:
+        raise ValueError("block select requires contiguous visible row counts")
     k = min(int(candidate_topk), width // 8)
     if k < 1:
         block_out.fill_(-1)
