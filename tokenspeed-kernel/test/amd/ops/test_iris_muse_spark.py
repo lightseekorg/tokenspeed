@@ -1050,6 +1050,111 @@ def test_routed_lamport_polling_codegen(rank):
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
 
 
+def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_lamport_bf16_allreduce,
+    )
+    from tokenspeed_kernel.ops.quantization import rmsnorm_mxfp4_quant
+
+    state = _muse_state(rank, device, 8192, True)
+    width, local_width = 4096, 4096 // world_size
+    weight = (torch.randn(width, device=device) * 0.1).bfloat16()
+    # Mixed ranks start from the last stage, so replays wrap the stage counter.
+    state.reduction.lamport_epochs.fill_(2)
+    raw_input = torch.empty(3 * 4096, dtype=torch.bfloat16, device=device)
+    raw_output = torch.empty_like(raw_input)
+
+    def raw():
+        # The gather shares the reduction's mailbox tiles and stage counters.
+        iris_lamport_bf16_allreduce[(raw_input.numel() // 512,)](
+            raw_input,
+            state.reduction.lamport_region,
+            raw_output,
+            state.reduction.lamport_epochs,
+            state.reduction.lamport_peer_addresses[:world_size],
+            RANK=rank,
+            WORLD_SIZE=world_size,
+            total_elements=raw_input.numel(),
+            MAX_ELEMENTS=state.reduction.lamport_max_numel,
+            NUM_STAGES=3,
+            num_warps=1,
+        )
+
+    for rows in (1, 3, 16):
+        if rows == 1:
+            published = state.all_reduce.acquire_outputs(((1, width),))[0]
+            local = published[:, rank * local_width : (rank + 1) * local_width]
+        else:
+            local = torch.empty(
+                (rows, local_width), dtype=torch.bfloat16, device=device
+            )
+        generator = torch.Generator(device=device)
+
+        def update(phase):
+            generator.manual_seed(100 * rows + phase)
+            full = torch.randn((rows, width), generator=generator, device=device)
+            full = full.bfloat16()
+            # Negative zero is exchanged as zero; the empty marker stays unique.
+            full[:, ::7] = -0.0
+            local.copy_(full[:, rank * local_width : (rank + 1) * local_width])
+            raw_input.fill_((rank + 1) * (phase + 1) / 16)
+            return full.abs().where(full == 0, full)
+
+        def run():
+            raw()
+            if rank == 0:
+                torch.cuda._sleep(20000)
+            packed, scales = state.all_gather_rmsnorm_mxfp4_quant(
+                local, weight, 1e-6, 1.0
+            )
+            raw()
+            return packed, scales
+
+        update(0)
+        run()
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            packed, scales = run()
+        for phase in range(4):
+            expected = update(phase)
+            if rank == phase % world_size:
+                torch.cuda._sleep(20000)
+            before = state.reduction.lamport_epochs.clone()
+            graph.replay()
+            # Two reductions advance their 24 tiles; the gather advances its own.
+            tiles = torch.arange(before.numel(), device=device)
+            advanced = 2 * (tiles < 24) + (tiles < rows * local_width // 512)
+            torch.testing.assert_close(
+                state.reduction.lamport_epochs,
+                ((before + advanced) % 3).to(before.dtype),
+                atol=0,
+                rtol=0,
+            )
+            reference = rmsnorm_mxfp4_quant(expected, weight, 1e-6, 1.0)
+            torch.testing.assert_close(packed, reference[0], atol=0, rtol=0)
+            torch.testing.assert_close(
+                _logical_cdna4_scales(scales, rows, width // 32),
+                _logical_cdna4_scales(reference[1], rows, width // 32),
+                atol=0,
+                rtol=0,
+            )
+            torch.testing.assert_close(
+                raw_output,
+                torch.full_like(
+                    raw_output, world_size * (world_size + 1) // 2 * (phase + 1) / 16
+                ),
+                atol=0,
+                rtol=0,
+            )
+    torch.cuda.synchronize()
+    dist.barrier()
+    # Every consumed mailbox pack was returned to the empty marker.
+    region = state.reduction.lamport_region.view(torch.int32)
+    assert bool((region == -(2**31)).all())
+
+
 def _muse_routed_lamport_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
         iris_lamport_bf16_allreduce,
@@ -1636,6 +1741,9 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         pytest.param(_muse_owned_packet_worker, "gloo", id="owned_packets"),
         pytest.param(_muse_owned_qkvg_worker, "nccl", id="qkvg_reload_and_receiver"),
         pytest.param(_muse_routed_lamport_worker, "nccl", id="routed_lamport"),
+        pytest.param(
+            _muse_lamport_gather_mxfp4_worker, "nccl", id="lamport_gather_mxfp4"
+        ),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
         pytest.param(_muse_tp_routes_worker, "nccl", id="tp_routes"),
         pytest.param(

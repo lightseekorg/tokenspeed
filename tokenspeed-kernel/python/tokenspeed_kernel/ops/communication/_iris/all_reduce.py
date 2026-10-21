@@ -623,6 +623,13 @@ def _iris_sanitize_lamport_bf16(values):
 
 
 @gluon.jit
+def _iris_sanitize_lamport_bf16x2(words):
+    """Replace BF16 negative-zero halves so no payload word matches the empty marker."""
+    words = gl.where((words & 0xFFFF) == 0x8000, words & 0xFFFF0000, words)
+    return gl.where((words >> 16) == 0x8000, words & 0xFFFF, words)
+
+
+@gluon.jit
 def _iris_wait_lamport_peers(
     region,
     generation,
