@@ -20,7 +20,11 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
     resolve_dp_sampling_support,
     validate_dp_sampling_lm_head_vocab,
 )
-from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
+from tokenspeed.runtime.sampling.logits_layout import (
+    LogitsLayoutExecutor,
+    LogitsLayoutPlan,
+    LogitsParallelLayout,
+)
 
 
 def _graph_route(
@@ -386,3 +390,64 @@ def test_dp_sampling_slices_graph_effective_hidden_states_before_lm_head():
         [hidden_states[24:30].sum(dim=1), torch.zeros(6, dtype=torch.float32)]
     )
     assert torch.equal(logits[:, 0], expected_rows)
+
+
+@pytest.mark.parametrize(
+    "input_rows,output_rows,vocab_sharded,expected",
+    [
+        (None, None, True, (False, False, False, True)),
+        ((2, 0, 3, 1), (2, 0, 3, 1), True, (True, False, True, False)),
+        ((2, 0, 3, 1), (2, 0, 3, 1), False, (False, False, False, False)),
+        ((2, 0, 3, 1), None, False, (True, False, False, False)),
+        (None, (2, 0, 3, 1), False, (False, True, False, False)),
+        ((2, 0, 3, 1), (1, 1, 2, 2), False, (True, True, False, False)),
+    ],
+)
+def test_logits_parallel_layout_tracks_row_ownership(
+    input_rows, output_rows, vocab_sharded, expected
+):
+    layout = LogitsParallelLayout(
+        tp_size=4,
+        input_rows_per_rank=input_rows,
+        output_rows_per_rank=output_rows,
+        vocab_sharded=vocab_sharded,
+    )
+    assert (
+        layout.gather_hidden,
+        layout.slice_hidden,
+        layout.transpose_logits,
+        layout.gather_vocab,
+    ) == expected
+
+
+@pytest.mark.parametrize("rows", [(1, 2), (1, 0, -1, 2)])
+def test_logits_parallel_layout_rejects_incomplete_or_negative_rows(rows):
+    with pytest.raises(ValueError, match="row counts"):
+        LogitsParallelLayout(
+            tp_size=4,
+            input_rows_per_rank=rows,
+            output_rows_per_rank=None,
+            vocab_sharded=True,
+        )
+
+
+@pytest.mark.parametrize("effective_bs", [0, 1, 3, 8])
+def test_logits_layout_slices_padded_request_rows(effective_bs):
+    plan = LogitsLayoutPlan(effective_bs, 8, 4, 3)
+    hidden = torch.arange(effective_bs * 3 * 2).reshape(-1, 2).float()
+    shards = []
+    for rank in range(4):
+        executor = LogitsLayoutExecutor(
+            tp_rank=rank,
+            tp_size=4,
+            tp_group=(0, 1, 2, 3),
+            max_bucket_bs=8,
+            num_tokens_per_req=3,
+            vocab_size=8,
+            device="cpu",
+        )
+        shards.append(executor.slice_hidden_states(hidden, plan))
+    actual = torch.cat(shards)
+    assert actual.shape == (24, 2)
+    assert torch.equal(actual[: effective_bs * 3], hidden)
+    assert torch.count_nonzero(actual[effective_bs * 3 :]) == 0

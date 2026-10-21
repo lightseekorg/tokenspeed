@@ -451,6 +451,11 @@ exact conversion) instead of materializing an fp32 copy of the `[rows, vocab]`
 tensor first; because both paths go through the one function, whatever
 rounding the kernel applies is applied to both.
 
+Logits row ownership and vocabulary sharding are independent layout facts.
+`LogitsParallelLayout` describes each TP rank's input and output row counts,
+including empty ranks; DP sampling slices the padded request rows from that
+same rank-order contract, independently of device and collective backend.
+
 Vocabulary-parallel argmax packs the shard maximum and its global index into
 an int64 key, reduced with MAX over the vocabulary group. This portable Triton
 kernel runs on CUDA, ROCm and Ascend; signed zeros have one canonical key so

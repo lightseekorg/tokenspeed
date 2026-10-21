@@ -30,12 +30,76 @@ from tokenspeed.runtime.distributed.comm_backend import Group
 from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class LogitsParallelLayout:
+    """Row ownership and vocabulary partitioning over one LM-head TP group.
+
+    ``None`` row counts mean every rank holds the same rows. Otherwise the
+    tuple gives each rank's contiguous row count in group order, including
+    zero-row ranks. These are tensor-layout facts, independent of the device
+    and the collective implementation.
+    """
+
+    tp_size: int
+    input_rows_per_rank: tuple[int, ...] | None
+    output_rows_per_rank: tuple[int, ...] | None
+    vocab_sharded: bool
+
+    def __post_init__(self):
+        if self.tp_size < 1:
+            raise ValueError("logits TP size must be positive")
+        for rows in (self.input_rows_per_rank, self.output_rows_per_rank):
+            if rows is not None and (
+                len(rows) != self.tp_size or any(n < 0 for n in rows)
+            ):
+                raise ValueError("logits row counts must name every TP rank")
+
+    @property
+    def gather_hidden(self) -> bool:
+        return self.input_rows_per_rank is not None and (
+            self.vocab_sharded or self.input_rows_per_rank != self.output_rows_per_rank
+        )
+
+    @property
+    def slice_hidden(self) -> bool:
+        return (
+            not self.vocab_sharded
+            and self.output_rows_per_rank is not None
+            and (self.input_rows_per_rank != self.output_rows_per_rank)
+        )
+
+    @property
+    def transpose_logits(self) -> bool:
+        return self.vocab_sharded and self.output_rows_per_rank is not None
+
+    @property
+    def gather_vocab(self) -> bool:
+        return (
+            self.tp_size > 1
+            and self.vocab_sharded
+            and self.output_rows_per_rank is None
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class LogitsLayoutPlan:
     effective_bs: int
     bucket_bs: int
     tp_size: int
     num_tokens_per_req: int
+
+    @property
+    def rows_per_rank(self) -> tuple[int, ...]:
+        if (
+            self.tp_size < 1
+            or self.num_tokens_per_req < 1
+            or not 0 <= self.effective_bs <= self.bucket_bs
+            or self.bucket_bs % self.tp_size != 0
+        ):
+            raise ValueError("invalid DP logits row layout")
+        return (
+            self.bucket_bs // self.tp_size * self.num_tokens_per_req,
+        ) * self.tp_size
 
 
 class LogitsLayoutExecutor:
@@ -84,9 +148,9 @@ class LogitsLayoutExecutor:
         pad_rows = (plan.bucket_bs - plan.effective_bs) * n
         if pad_rows > 0:
             hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, pad_rows))
-        reqs_per_rank = plan.bucket_bs // self._tp_size
-        start = self._tp_rank * reqs_per_rank * n
-        return hidden_states[start : start + reqs_per_rank * n]
+        counts = plan.rows_per_rank
+        start = sum(counts[: self._tp_rank])
+        return hidden_states[start : start + counts[self._tp_rank]]
 
     def swap_batch_vocab(
         self,
