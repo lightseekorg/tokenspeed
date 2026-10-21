@@ -2417,7 +2417,8 @@ def triton_dsv41_dspark_block(
 def _pack_index_queries(X, V, S, X0, X1):
     row = tl.program_id(0).to(tl.int64)
     d = tl.arange(0, 128)
-    x = tl.load(X + row * X0 + d * X1).to(tl.float32)
+    # Widen before multiplication: large inner strides overflow int32 offsets.
+    x = tl.load(X + row * X0 + d.to(tl.int64) * X1).to(tl.float32)
     grouped = tl.reshape(x, (1, 4, 32))
     amax = tl.maximum(tl.max(tl.abs(grouped), 2), 6 * 2.0**-126)
     packed, exponent = _mxfp4_index_rows(grouped, tl.div_rn(amax, 6.0), 1)
