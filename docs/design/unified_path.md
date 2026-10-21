@@ -299,7 +299,25 @@ The kernel skips input quantization in this case. All ranks must use the same
 input format. For FP8 inputs, empty ranks must supply empty E4M3 inputs and
 FP32 scales.
 
+Prepared FP8 row buckets can transpose activation scales inside 128-row blocks
+so each K group's scales occupy consecutive shared-memory banks. The exchange
+and GEMM use the same layout. This is limited to aligned owner boundaries,
+preserving each owner's byte range when FP8 and BF16 calls share the workspace.
+Scale values, FP32 accumulation order, and output rounding stay unchanged.
+
 The backend prepares kernels before CUDA graph capture.
+Prepared row buckets can use different resident CTA counts. CTA zero advances
+inactive CTA epochs with the active grid so later bucket changes preserve the
+workspace's collective completion protocol.
+Each GEMM tile acquires input readiness from every owner it intersects, including
+tiles that cross an owner boundary. Output stores also wait for those owners to
+finish consuming the preceding call. A grid that keeps each CTA on one M tile
+must still wait for both owners when that tile crosses a boundary.
+TP4 row buckets that clear receive storage during input staging preserve one
+common clean prefix after reduction. It covers every smaller bucket that skips
+this staging clear. Larger buckets clear the remainder before publishing their
+input epoch; all producers and reducers acquire that epoch before using it.
+This contract applies across bucket and input-format changes.
 Supply runtime row counts within the prepared workspace capacity.
 Use each workspace on one stream.
 Do not run other distributed kernels at the same time.

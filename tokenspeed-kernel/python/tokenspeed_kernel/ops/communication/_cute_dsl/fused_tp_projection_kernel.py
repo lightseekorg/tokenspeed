@@ -77,6 +77,9 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+# Every prepared TP4 bucket preserves the same clean receive-buffer prefix.
+_RECEIVE_CLEAR_ROWS = 256
+
 
 @dsl_user_op
 def _tma_l2_policy(*, keep: bool, loc=None, ip=None):
@@ -271,6 +274,7 @@ class FusedTPProjectionKernel:
         self.tile_owner_input = False
         self.independent_operand_stages = False
         self.tma_scales = False
+        self.transposed_input_scales = False
         self.register_scale_prefetch = False
         self.input_phase_clear = False
         self.concurrent_reduction = False
@@ -448,9 +452,11 @@ class FusedTPProjectionKernel:
         if self.shared_mma_completion:
             self.num_ab_stage = self.num_acc_stage
 
-        if not self.row_parallel and self.split_accumulator and row_bucket <= 256:
-            # Packing weight scales beside the barriers leaves room for another
-            # operand stage without reducing scale buffering.
+        if (not self.row_parallel and self.split_accumulator and row_bucket <= 512) or (
+            self.input_phase_clear and row_bucket == 192
+        ):
+            # Register-prefetched scales leave room for a sixth operand stage.
+            # Keep the four scale stages independent of the operand pipeline.
             self.num_ab_stage = 6
 
         if self.tma_scales:
@@ -507,9 +513,12 @@ class FusedTPProjectionKernel:
                     (self.scale_k_total, self.bulk_scale_stages),
                 ),
                 stride=(
-                    (0, self.scale_k_total),
+                    (0, 1 if self.transposed_input_scales else self.scale_k_total),
                     (0, 0),
-                    (1, self.scale_m_per_tile * self.scale_k_total),
+                    (
+                        self.scale_m_per_tile if self.transposed_input_scales else 1,
+                        self.scale_m_per_tile * self.scale_k_total,
+                    ),
                 ),
             )
             self.sfb_smem_layout_staged = cute.make_layout(
@@ -517,7 +526,12 @@ class FusedTPProjectionKernel:
                 stride=((0, 0), (0, 0), (1, self.scale_b_stride)),
             )
         self.sfa_bulk_layout = cute.make_layout(
-            (self.mma_tiler[0], self.scale_k_total), stride=(self.scale_k_total, 1)
+            (self.mma_tiler[0], self.scale_k_total),
+            stride=(
+                (1, self.mma_tiler[0])
+                if self.transposed_input_scales
+                else (self.scale_k_total, 1)
+            ),
         )
         self.sfb_bulk_layout = cute.make_layout(
             (1, self.scale_k_total), stride=(self.scale_k_total, 1)
@@ -612,7 +626,9 @@ class FusedTPProjectionKernel:
         self.num_regs_sched_warps = 64
         self.num_regs_acc_update_warps = 192 if self.split_accumulator else 256
         self.num_regs_epilogue_warps = 64 if self.split_accumulator else 128
-        if cutlass.const_expr(self.input_phase_clear and peers[1].shape[0] == 256):
+        if cutlass.const_expr(
+            self.input_phase_clear and peers[1].shape[0] in (192, 256)
+        ):
             # Leave more registers for control and data movement at this bucket.
             self.num_regs_acc_update_warps = 176
             self.num_regs_epilogue_warps = 80
@@ -674,13 +690,16 @@ class FusedTPProjectionKernel:
         )
         self.tmem_before_scales = self.row_parallel and (
             peers[1].shape[0] >= 512
-            or (self.input_phase_clear and peers[1].shape[0] == 256)
+            or (self.input_phase_clear and peers[1].shape[0] in (192, 256))
         )
         self.tile_owner_input = self.row_parallel and peers[1].shape[0] >= 512
         self.scale_k_total = sfa.shape[1]
         # Aligned K groups allow four adjacent scales per global load.
         self.register_scale_prefetch = (
-            not self.row_parallel
+            (
+                not self.row_parallel
+                or (self.input_phase_clear and peers[1].shape[0] == 192)
+            )
             and self.split_accumulator
             and self.scale_k_total % 4 == 0
         )
@@ -691,8 +710,7 @@ class FusedTPProjectionKernel:
         self.tma_scales = self.row_parallel and (
             (
                 (
-                    peers[1].shape[0] >= 640
-                    or peers[1].shape[0] == 576
+                    peers[1].shape[0] >= 512
                     or (self.input_phase_clear and peers[1].shape[0] == 256)
                 )
                 and len(peer_ready) == 4
@@ -708,12 +726,30 @@ class FusedTPProjectionKernel:
         self.independent_operand_stages = self.row_parallel and (
             (len(peer_ready) == 2 and peers[1].shape[0] >= 512)
             or (len(peer_ready) == 4 and 256 <= peers[1].shape[0] <= 1536)
+            or (self.input_phase_clear and peers[1].shape[0] == 192)
         )
         self.independent_operand_stages = self.independent_operand_stages or (
             not self.row_parallel and self.split_accumulator
         )
         if cutlass.const_expr(self.independent_operand_stages):
             self.shared_mma_completion = False
+        self.transposed_input_scales = (
+            self.tma_scales
+            and self.input_phase_clear
+            and peers[1].shape[0] in (256, 512, 640, 1024)
+            and input_scales is not None
+        )
+        if cutlass.const_expr(self.transposed_input_scales):
+            # Keep each K group contiguous across 128 token rows. Aligned owner
+            # boundaries preserve byte ownership across FP8/BF16 calls.
+            scale_layout = cute.make_layout(
+                ((128, sfa.shape[0] // 128), sfa.shape[1], sfa.shape[2]),
+                stride=((1, 128 * sfa.shape[1]), 128, sfa.shape[0] * sfa.shape[1]),
+            )
+            sfa = cute.make_tensor(sfa.iterator, scale_layout)
+            scale_peers = tuple(
+                cute.make_tensor(peer.iterator, scale_layout) for peer in scale_peers
+            )
         self._setup_attributes(peers[1].shape[0])
         if cutlass.const_expr(self.dynamic_gemm):
             self.num_tile_stage = 1
@@ -877,7 +913,9 @@ class FusedTPProjectionKernel:
             self.reduction_rows = min(128, self.reduction_rows)
         if cutlass.const_expr(self.concurrent_reduction):
             self.reduction_rows = 32
-        if cutlass.const_expr(self.input_phase_clear and peers[1].shape[0] == 256):
+        if cutlass.const_expr(
+            self.input_phase_clear and peers[1].shape[0] in (192, 256)
+        ):
             # Wider channel tiles preserve the number of reduction jobs.
             self.reduction_rows = 32
         self.tile_sched_params, grid = self._compute_grid(
@@ -1364,10 +1402,20 @@ class FusedTPProjectionKernel:
                 ),
             ),
             stride=(
-                (0, self.scale_k_total if self.tma_scales else 1),
+                (
+                    0,
+                    (
+                        self.scale_k_total
+                        if self.tma_scales and not self.transposed_input_scales
+                        else 1
+                    ),
+                ),
                 0,
                 (
-                    (1, self.scale_m_per_tile * self.scale_k_total)
+                    (
+                        self.scale_m_per_tile if self.transposed_input_scales else 1,
+                        self.scale_m_per_tile * self.scale_k_total,
+                    )
                     if self.tma_scales
                     else self.scale_m_per_tile
                 ),
@@ -2153,7 +2201,11 @@ class FusedTPProjectionKernel:
                             * self.scale_k_total,
                             cute.make_layout(
                                 (self.mma_tiler[0], self.scale_k_total),
-                                stride=(self.scale_k_total, 1),
+                                stride=(
+                                    (1, self.mma_tiler[0])
+                                    if self.transposed_input_scales
+                                    else (self.scale_k_total, 1)
+                                ),
                             ),
                         )
                         sb = cute.make_tensor(
@@ -3217,8 +3269,10 @@ class FusedTPProjectionKernel:
                             owners_per_tile = max(
                                 1, self.cta_tile_shape_mnk[0] // peers[1].shape[0]
                             )
-                            # A GEMM tile can intersect two owners at these sizes.
-                            if cutlass.const_expr(peers[1].shape[0] in (224, 576, 960)):
+                            # A GEMM tile can cross an owner boundary.
+                            if cutlass.const_expr(
+                                peers[1].shape[0] % self.cta_tile_shape_mnk[0] != 0
+                            ):
                                 owners_per_tile = (
                                     (
                                         (tile_info[0] + 1) * self.cta_tile_shape_mnk[0]
@@ -3460,7 +3514,9 @@ class FusedTPProjectionKernel:
         cute.arch.barrier()
         if warp_idx >= 8:
             cute.arch.setmaxregister_increase(128)
-        if cutlass.const_expr(self.input_phase_clear and peers[1].shape[0] > 512):
+        if cutlass.const_expr(
+            self.input_phase_clear and peers[1].shape[0] > _RECEIVE_CLEAR_ROWS
+        ):
             # A CTA may skip every padded GEMM tile or compute only other
             # owners' rows. Acquire this owner's receive clear before reducing,
             # just like the initially reserved reducers.
@@ -3642,13 +3698,15 @@ class FusedTPProjectionKernel:
             else:
                 if row < valid_rows:
                     cute.copy(input_copy, input_tile, input_values)
-            if cutlass.const_expr(self.input_phase_clear and rows > 512):
+            if cutlass.const_expr(
+                self.input_phase_clear and rows > _RECEIVE_CLEAR_ROWS
+            ):
                 # Clear the owner's receive storage before publishing its input.
                 # All output producers await that owner's input epoch, so no
                 # new partial can overwrite a clear still in flight.
-                # The first 512 physical rows stay clear after reduction,
-                # covering every smaller bucket without transition cleanup.
-                prefix_vectors = 512 * receive.shape[1] // 8
+                # Reduction leaves enough clean storage for every small
+                # bucket; larger buckets clear the remainder here.
+                prefix_vectors = _RECEIVE_CLEAR_ROWS * receive.shape[1] // 8
                 receive_vectors = cute.size(receive) // 8
                 quant_vectors = rows * groups_per_row * lanes_per_group
                 clear_groups = cute.ceil_div(
@@ -3669,8 +3727,9 @@ class FusedTPProjectionKernel:
                 # Preserve FP8 bytes and scales; do not dequantize or requantize.
                 quantized.store(input_values.load())
                 inverse = cutlass.Float32(1.0)
-                if row < valid_rows:
-                    inverse = source_scales[row, k_group]
+                if cutlass.const_expr(not self.transposed_input_scales):
+                    if row < valid_rows:
+                        inverse = source_scales[row, k_group]
             else:
                 values = input_values.load().to(cutlass.Float32)
                 # The reference one-shot AllGather removes its BF16 -0 sentinel
@@ -3727,8 +3786,29 @@ class FusedTPProjectionKernel:
                         cute.make_layout((values_per_lane,), stride=(1,)),
                     )
                     cute.copy(copy_atom, quantized, target)
-                    if lane % lanes_per_group == 0:
-                        scale_peers[peer][rank * rows + row, peer_group, 0] = inverse
+                    if cutlass.const_expr(not self.transposed_input_scales):
+                        if lane % lanes_per_group == 0:
+                            scale_peers[peer][
+                                rank * rows + row, peer_group, 0
+                            ] = inverse
+        if cutlass.const_expr(self.transposed_input_scales):
+            # Copy scales separately so adjacent lanes store adjacent token rows.
+            peer_groups = groups_per_row // len(input_peers)
+            for index in cutlass.range(
+                block * self.threads_per_cta + tid,
+                rows * groups_per_row,
+                blocks * self.threads_per_cta,
+            ):
+                scale_row = index % rows
+                group = index // rows
+                scale = cutlass.Float32(1)
+                if scale_row < valid_rows:
+                    scale = source_scales[scale_row, group]
+                for peer in cutlass.range_constexpr(len(input_peers)):
+                    if group // peer_groups == (rank + peer) % len(input_peers):
+                        scale_peers[peer][
+                            rank * rows + scale_row, group % peer_groups, 0
+                        ] = scale
         # The CTA barrier orders every writer before its leader's release.
         # CTA zero joins these device-local arrivals, then publishes one
         # system-release epoch for remote input consumers.
@@ -3741,7 +3821,7 @@ class FusedTPProjectionKernel:
                 scope="gpu",
             )
         if block == 0:
-            if cutlass.const_expr(self.row_parallel and blocks < self.num_cta_flags):
+            if cutlass.const_expr(blocks < self.num_cta_flags):
                 # Keep inactive CTA epochs current when prepared buckets use
                 # different resident grids. These slots own no work this time.
                 if tid >= blocks and tid < self.num_cta_flags:
@@ -3841,7 +3921,9 @@ class FusedTPProjectionKernel:
         first_owner = tile_m * self.cta_tile_shape_mnk[0] // rows
         owners_per_tile = max(1, self.cta_tile_shape_mnk[0] // rows)
         # Cache readiness for every owner touched by the tile.
-        if cutlass.const_expr(self.row_parallel and rows in (576, 960)):
+        if cutlass.const_expr(
+            self.row_parallel and rows % self.cta_tile_shape_mnk[0] != 0
+        ):
             owners_per_tile = (
                 ((tile_m + 1) * self.cta_tile_shape_mnk[0] - 1) // rows
                 - first_owner
@@ -3900,8 +3982,10 @@ class FusedTPProjectionKernel:
         )
         first_owner = tile_m * self.cta_tile_shape_mnk[0] // rows
         owners_per_tile = max(1, self.cta_tile_shape_mnk[0] // rows)
-        # A GEMM tile can intersect two owners at these sizes.
-        if cutlass.const_expr(self.row_parallel and rows in (224, 576, 960)):
+        # A GEMM tile can cross an owner boundary.
+        if cutlass.const_expr(
+            self.row_parallel and rows % self.cta_tile_shape_mnk[0] != 0
+        ):
             owners_per_tile = (
                 ((tile_m + 1) * self.cta_tile_shape_mnk[0] - 1) // rows
                 - first_owner
@@ -4047,7 +4131,17 @@ class FusedTPProjectionKernel:
             # the producer by blocks * (rows / 128), hence wraps to the same CTA.
             # Small buckets repeat after max(1, 128 / rows) such steps.
             # Owners larger than a GEMM tile also need each local M-tile producer.
-            for row_tile in cutlass.range_constexpr(max(1, rows // 128)):
+            # These TP4 buckets acquire one M-tile producer per lane.
+            # The CTA barrier below joins these acquires before output reads.
+            wait_lanes = 1
+            polling_lane = tid == 0
+            if cutlass.const_expr(world == 4 and rows in (384, 512)):
+                wait_lanes = rows // 128
+                polling_lane = tid < wait_lanes
+            for row_group in cutlass.range_constexpr(max(1, rows // 128) // wait_lanes):
+                row_tile = row_group
+                if cutlass.const_expr(wait_lanes > 1):
+                    row_tile = tid
                 if row_tile * 128 < valid_rows:
                     for step in cutlass.range_constexpr(max(1, 128 // rows)):
                         if step < tile_count:
@@ -4057,7 +4151,7 @@ class FusedTPProjectionKernel:
                             ) % blocks
                             for peer in cutlass.range_constexpr(len(peer_ready)):
                                 if producer == (rank + peer) % world:
-                                    if tid == 0:
+                                    if polling_lane:
                                         count = cute.arch.load(
                                             peer_ready[peer].iterator
                                             + 16
@@ -4120,7 +4214,7 @@ class FusedTPProjectionKernel:
                 scope="gpu",
             )
         if block == 0:
-            if cutlass.const_expr(self.row_parallel and blocks < self.num_cta_flags):
+            if cutlass.const_expr(blocks < self.num_cta_flags):
                 if tid >= blocks and tid < self.num_cta_flags:
                     cute.arch.store(
                         ready.iterator + 16 + tid,
@@ -4449,12 +4543,18 @@ class FusedTPProjectionKernel:
                                     cute.make_layout((8,), stride=(1,)),
                                 )
                                 if cutlass.const_expr(
-                                    self.input_phase_clear and rows > 512
+                                    self.input_phase_clear
+                                    and rows > _RECEIVE_CLEAR_ROWS
                                 ):
                                     # Receive storage is producer-major. Preserve
                                     # a clean prefix large enough for all small views.
                                     clear_rows = max(
-                                        0, min(rows, 512 * world - producer * rows)
+                                        0,
+                                        min(
+                                            rows,
+                                            _RECEIVE_CLEAR_ROWS * world
+                                            - producer * rows,
+                                        ),
                                     )
                                     if cutlass.const_expr(clear_rows == rows):
                                         _clear_payload_streaming(
