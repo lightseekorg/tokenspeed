@@ -58,6 +58,8 @@ hold each piece:
   needs is ``server_args`` or an object this builder already owns.
 - ``encoder_model_facts`` — a startup-only callable for EPD admission,
   resolved past its gate because a text-only model has no vision tower.
+- ``host_cache`` — startup-only Host storage and immutable payload facts,
+  consumed by Host-only storage construction outside the device builder.
 - ``DeviceHandle`` — the running handle, and the only piece the loop stores.
 
 Startup steps that need a real device object (the layerwise step counter,
@@ -94,7 +96,7 @@ from tokenspeed.runtime.distributed.nccl_suspend import (
     resume_nccl_communicators,
     suspend_nccl_communicators,
 )
-from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
+from tokenspeed.runtime.engine.scheduler_utils import is_device_cache_op
 from tokenspeed.runtime.epd.recv_pool import recv_pool_bytes
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import (
@@ -115,6 +117,7 @@ from tokenspeed.runtime.utils.startup_timing import startup_phase
 logger = get_colorful_logger(__name__)
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.cache.host_storage import HostCacheResources
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.engine.scheduler_utils import SchedulerCacheGeometry
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
@@ -264,6 +267,8 @@ class DeviceBuild:
         specs: Plain values the control plane plans with; safe to keep.
         transfer: The PD transfer peer's control face — bootstrap
             register/abort, event polling — or None outside PD.
+        host_cache: Startup-only Host resources and immutable payload facts,
+            or None without an L2 Host allocation. Contains no Device buffers.
         handle: The running handle; the loop's only reach into the device.
         encoder_model_facts: Zero-argument callable extracting the facts EPD
             admission needs (``EncoderModelFacts``). A callable, not a value:
@@ -276,6 +281,7 @@ class DeviceBuild:
     specs: DeviceSpecs
     transfer: Any
     handle: "DeviceHandle"
+    host_cache: HostCacheResources | None
     encoder_model_facts: Any
 
 
@@ -373,6 +379,8 @@ class DeviceHandle:
         self,
         execution_plan,
         planned: "PlannedForward | None",
+        *,
+        cache_ops: Sequence,
     ) -> PendingExecution | None:
         """Execute one scheduler plan; never blocks on the per-round path.
 
@@ -391,10 +399,7 @@ class DeviceHandle:
         its boundary, an owner's move off the block it just published; the
         source may be re-granted by this very plan, so the copy precedes the
         zeroing), then page zeroing (the new owner's
-        sanitization), then the L3 prefetches (``PrefetchOp``: a waiting
-        request's Host pages filled from L3 on a CPU lane -- no stream, no
-        Device page, acknowledged after the replica converges on the landed
-        prefix), then the Device-bound copies (``LoadBackOp`` and
+        sanitization), then the Device-bound copies (``LoadBackOp`` and
         ``RestoreOp``, ordered behind the zeroing: a load-back lands on
         zeroed pages, a restore overwrites its destinations whole), the
         transfer peer's remote streams, and finally the ``ForwardBatch``. The
@@ -408,9 +413,8 @@ class DeviceHandle:
 
         Args:
             execution_plan: The round's plan, a per-round value copy out of
-                C++. Its cache ops are adapted here, once, on the control
-                plane (``cache_ops_from_plan``: the binding's batched snapshot
-                ops become per-request ops) and read on the data plane.
+                C++. The control plane captures its cache operations once
+                and passes the Device-copy subset explicitly below.
             planned: The control plane's half of the round — the gathered
                 per-batch state only it can produce (sampling params, live
                 grammar matchers, the multimodal snapshot, DP metadata).
@@ -421,11 +425,21 @@ class DeviceHandle:
                 transfers — retraction writebacks, load-back destinations —
                 still run; they do not depend on a forward.
 
+            cache_ops: The validated Device-copy snapshot counted by the
+                cache hooks. Host storage operations belong to L3Executor.
+
         Returns:
             The submitted forward's ``PendingExecution``, or None on rounds
             that run no batch — DP-idle, an empty plan, or a D-role round
             whose only work was the peer's.
         """
+        cache_ops = tuple(cache_ops)
+        for operation in cache_ops:
+            if not is_device_cache_op(operation):
+                raise TypeError(
+                    f"unsupported Device cache op: {type(operation).__name__}"
+                )
+
         # See ``_settle``: a submission that raised produces no transfer event.
         _settle(
             self._transfer_submissions,
@@ -439,7 +453,6 @@ class DeviceHandle:
         )
 
         executor = self._executor
-        cache_ops = cache_ops_from_plan(execution_plan)
         l2 = self._l2 if cache_ops else None
         if l2 is not None:
             # Ahead of the zeroing: a stream-ordered store's sources may be
@@ -484,10 +497,6 @@ class DeviceHandle:
             else None
         )
         if l2 is not None:
-            # The L3 prefetches: CPU work on the executor's own lane, started
-            # here on the control plane -- they touch no stream and no Device
-            # page, so they neither wait on the zeroing nor hold up the FIFO.
-            l2.submit_prefetches(cache_ops)
             # Behind the zeroing: the loads' destinations were zeroed on the
             # default stream, so that is the prerequisite they order after.
             self._l2_submissions.append(
@@ -612,8 +621,7 @@ class DeviceHandle:
         """Collect completed Host cache ops (both tiers); never blocks.
 
         Yields the scheduler's ACK kinds -- ``WriteBackDoneEvent``,
-        ``LoadBackDoneEvent``, ``PrefetchDoneEvent`` (once the hooks
-        converged the op), ``SnapshotDoneEvent``, ``RestoreDoneEvent`` --
+        ``LoadBackDoneEvent``, ``SnapshotDoneEvent``, ``RestoreDoneEvent`` --
         for ``CacheOpHooks`` to replica-intersect and the loop to advance.
 
         Stays on the control plane deliberately: completion is CUDA event
@@ -645,79 +653,13 @@ class DeviceHandle:
         )
         return l2.poll_results()
 
-    def consume_l3_backup_poll_failure(self) -> bool:
-        """Whether an L3 backup future failed since the last consume.
-
-        ``poll_cache_results`` must not raise that failure:
-        ``CacheOpHooks.poll_ready_events`` still has to enter replica
-        collectives. A rank-local raise hangs peers in those waits.
-        """
-
-        l2 = self._l2
-        if l2 is None:
-            return False
-        consume = getattr(l2, "consume_backup_poll_failure", None)
-        if consume is None:
-            return False
-        return bool(consume())
-
-    def query_l3_storage(self, pages) -> list[bool] | None:
-        """Probe immutable L3 objects without exposing the Host-cache tier."""
-
-        l2 = self._l2
-        if l2 is None:
-            return None
-        return l2.l3_exists(pages)
-
-    def l3_prefetch_progress(self) -> dict[int, tuple[bool, int]]:
-        """This rank's in-flight L3 prefetches: op id to ``(done, landed_pages)``.
-
-        Read on the control plane each round by ``L3CacheHooks``, which
-        MIN-reduces the vector across the replica; the op-id set is mirrored.
-        """
-
-        l2 = self._l2
-        if l2 is None:
-            return {}
-        return l2.l3_prefetch_progress()
-
-    def complete_l3_prefetch(self, op_id: int, landed_pages: int) -> None:
-        """Record a prefetch op's replica-converged landed prefix.
-
-        The next ``poll_cache_results`` yields its one ``PrefetchDoneEvent``.
-        """
-
-        l2 = self._l2
-        if l2 is None:
-            raise RuntimeError("L3 prefetch completed without a Host cache executor")
-        l2.complete_l3_prefetch(op_id, landed_pages)
-
-    def delete_l3_namespace(self) -> bool:
-        """Delete L3 objects under the current prefix. Device/Host stay intact.
-
-        Returns True when L2/L3 is unset or the store reports the prefix
-        is gone. Call this before ``ClearCache``; a False must leave
-        every rank's Device/Host indexes untouched. In-flight prefetches
-        are drained first: the lane may still be writing their Host pages.
-        """
-
-        if self._l2 is None:
-            return True
-        return self._l2.delete_l3_namespace()
-
-    def set_l3_weight_version(self, weight_version: str) -> None:
-        """Publish subsequent Host pages under the new checkpoint identity."""
-
-        if self._l2 is not None:
-            self._l2.set_l3_weight_version(weight_version)
-
     def shutdown_cache(self) -> None:
-        """Join every queued data-plane submission, then close the Host cache.
+        """Join queued device submissions, then drain the Host copy streams.
 
         A cache plan, a PD transfer or a page copy the last round queued is
         settled by the next round's execute or poll; at shutdown there is no
         next round, so they are joined here and the first failure re-raised
-        after the Host cache (L2/L3, pool) is closed.
+        after the Device copy executors and their Host pools are drained.
         """
         errors = []
         for submissions in (
@@ -1379,7 +1321,6 @@ def build_device_side(
     from tokenspeed.runtime.engine.scheduler_utils import log_gpu_memory_summary
     from tokenspeed.runtime.execution.factory import (
         ModelExecutorConfig,
-        _eagle_aux_layer_ids,
         create_model_executor,
         create_model_runner,
     )
@@ -1574,6 +1515,7 @@ def build_device_side(
     # model executor's peer: it lays out the slot-state exporters the model
     # executor lists, so it is built after it.
     host_cache_executor = None
+    host_cache = None
     snapshot_pool = _retraction_pool_request(
         server_args,
         views.token_to_kv_pool.arena.runtime_contract,
@@ -1611,126 +1553,17 @@ def build_device_side(
         logger.info(
             NO_POOL.describe(host_lcm_block_bytes=0, blob_bytes=0, l2_tier=False)
         )
-    if server_args.enable_kvstore and server_args.kvstore_storage_backend is not None:
-        # L3 under the L2 tier.
-        from tokenspeed.runtime.cache.l3.backend import (
-            L3_RUNTIME_COMPAT,
-            cache_layout_signature,
-            l3_cache_quantization_id,
-            l3_checkpoint_id,
-            share_l3_checkpoint_ids,
-            storage_key_prefix,
-        )
-        from tokenspeed.runtime.cache.l3.factory import (
-            create_kvstore_storage_backend,
-        )
+    if host_cache_executor is not None and host_cache_executor.host_storage is not None:
+        from tokenspeed.runtime.cache.host_storage import HostCacheResources
 
-        storage_backend = create_kvstore_storage_backend(
-            server_args.kvstore_storage_backend,
-            server_args.kvstore_storage_backend_extra_config,
-            host_buffer=host_cache_executor.host_storage.host_buffer,
-            tp_size=server_args.mapping.attn.tp_size,
-            pp_size=(server_args.mapping.pp_size if server_args.mapping.has_pp else 1),
-        )
-        cache_signature = cache_layout_signature(
-            host_cache_executor.layout,
-            cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
-        )
-        import torch.distributed as dist
-
-        world_size = (
-            dist.get_world_size()
-            if dist.is_available() and dist.is_initialized()
-            else 1
-        )
-        rank = dist.get_rank() if world_size > 1 else 0
-        checkpoint_id = l3_checkpoint_id(
-            model_config.model_path,
-            hf_config=model_config.hf_config,
-            revision=str(model_config.revision or ""),
-            load_format=str(server_args.load_format),
-            # LoadConfig currently gets the same empty extra-config;
-            # both must stay aligned if a shard pattern is wired through.
-            model_loader_extra_config={},
-            ext_yaml=str(server_args.ext_yaml or ""),
-        )
-        if draft_model_config is not None:
-            draft_revision = l3_checkpoint_id(
-                draft_model_config.model_path,
-                hf_config=draft_model_config.hf_config,
-                revision=str(draft_model_config.revision or ""),
-                load_format=str(server_args.load_format),
-                model_loader_extra_config={},
-                ext_yaml=str(server_args.ext_yaml or ""),
-            )
-        else:
-            draft_revision = ""
-
-        def gather_checkpoint_ids(payload: list) -> list:
-            gathered = [None] * world_size
-            dist.all_gather_object(gathered, payload)
-            return gathered
-
-        checkpoint_id, draft_revision = share_l3_checkpoint_ids(
-            [checkpoint_id, draft_revision],
-            rank=rank,
-            world_size=world_size,
-            gather=gather_checkpoint_ids,
-        )
-        pipeline_rank = server_args.mapping.pp_rank if server_args.mapping.has_pp else 0
-        if draft_model_config is not None:
-            draft_model = str(draft_model_config.model_path)
-            draft_quantization = str(draft_model_config.quantization or "")
-        else:
-            draft_model = ""
-            draft_quantization = ""
-        cache_quantization = l3_cache_quantization_id(
-            quantization=str(model_config.quantization or ""),
-            quantization_param_path=str(server_args.quantization_param_path or ""),
-            draft_quantization=draft_quantization,
-        )
-        attn_tp_size = int(server_args.mapping.attn.tp_size)
-        eagle3_layers_to_capture: list[int] = []
-        if server_args.speculative_algorithm == "EAGLE3":
-            configured_layers = server_args.eagle3_layers_to_capture
-            if configured_layers:
-                eagle3_layers_to_capture = [int(layer) for layer in configured_layers]
-            elif draft_model_config is not None:
-                draft_layers = _eagle_aux_layer_ids(draft_model_config.hf_config)
-                if draft_layers:
-                    eagle3_layers_to_capture = [int(layer) for layer in draft_layers]
-
-        attention_backend_name = attention.attention_backend_name
-        draft_attention_backend_name = attention.draft_attention_backend_name
-
-        def prefix_for_weight_version(weight_version: str) -> str:
-            return storage_key_prefix(
-                server_args.model,
-                revision=checkpoint_id,
-                weight_version=weight_version,
-                model_overrides=dict(model_config.model_override_args),
-                cache_signature=cache_signature,
-                pipeline_rank=pipeline_rank,
-                attn_tp_size=attn_tp_size,
-                draft_model=draft_model,
-                draft_revision=draft_revision,
-                draft_weight_version=weight_version if draft_model else "",
-                cache_quantization=cache_quantization,
-                runtime_compat=L3_RUNTIME_COMPAT,
-                attention_backend=attention_backend_name,
-                draft_attention_backend=draft_attention_backend_name,
-                skip_softmax_threshold=float(server_args.skip_softmax_threshold),
-                eagle3_layers_to_capture=eagle3_layers_to_capture,
-            )
-
-        host_cache_executor.attach_l3_storage(
-            storage_backend,
-            key_prefix=prefix_for_weight_version(server_args.weight_version),
-            rank=attn_tp_rank,
-            prefix_for_weight_version=prefix_for_weight_version,
-            prefetch_timeout_base_s=server_args.kvstore_prefetch_timeout_base_s,
-            prefetch_timeout_per_page_s=server_args.kvstore_prefetch_timeout_per_page_s,
-            prefetch_batch_pages=server_args.kvstore_prefetch_batch_pages,
+        assert host_cache_executor.block_owners is not None
+        host_cache = HostCacheResources(
+            storage=host_cache_executor.host_storage,
+            ownership=host_cache_executor.block_owners,
+            groups=host_cache_executor.layout.groups,
+            memory_plan=views.token_to_kv_pool.arena.plan,
+            attention_backend_name=attention.attention_backend_name,
+            draft_attention_backend_name=attention.draft_attention_backend_name,
         )
 
     kv_transfer = _build_kv_transfer(
@@ -1795,6 +1628,7 @@ def build_device_side(
         return EncoderModelFacts.from_model(target.model, device=executor.device)
 
     return DeviceBuild(
+        host_cache=host_cache,
         specs=specs,
         transfer=kv_transfer,
         encoder_model_facts=encoder_model_facts,

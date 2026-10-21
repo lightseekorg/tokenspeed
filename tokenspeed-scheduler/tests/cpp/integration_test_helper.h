@@ -144,25 +144,6 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
-    // A pre-admission L3 prefetch finished with its first landed_pages prefix
-    // pages fetched.
-    void SendPrefetchDone(std::uint32_t op_id, std::int32_t landed_pages) {
-        ExecutionEvent event;
-        event.With(cache::PrefetchDone(op_id, landed_pages));
-        scheduler_->Advance(std::move(event));
-    }
-
-    static const PrefetchBatch* FindPrefetch(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (const auto* cache_op = std::get_if<CacheOperation>(&op)) {
-                if (const auto* prefetch = std::get_if<PrefetchBatch>(cache_op)) {
-                    return prefetch;
-                }
-            }
-        }
-        return nullptr;
-    }
-
     // Send ExtendResult to the scheduler: the forward landed. `tokens` are
     // the new tokens it produced -- empty for an intermediate prefill chunk,
     // which produces only KV.

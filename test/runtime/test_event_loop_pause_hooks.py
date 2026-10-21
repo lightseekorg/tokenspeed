@@ -127,6 +127,7 @@ class _FakeLoop:
     def __init__(self, rid_to_state: dict | None = None) -> None:
         self.output_processor = _OutputProcessor(rid_to_state or {})
         self.scheduler = _Scheduler()
+        self._l3_hooks = SimpleNamespace(cancel_request=lambda rid: False)
         self.has_dp = False
         self.kv_transfer = None
 

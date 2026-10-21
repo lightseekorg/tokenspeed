@@ -108,7 +108,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
     local_page_pairs_by_group,
     local_pages_by_group,
 )
-from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+from tokenspeed.runtime.layers.logits_processor import (
+    LogitsProcessorOutput,
+    prepare_logits_communication,
+)
 from tokenspeed.runtime.layers.paged_attention import (
     bind_cache_groups,
     check_block_drafter_storage,
@@ -732,6 +735,10 @@ class ModelExecutor:
 
         self._graph_support = graph_support
         self.device_module = torch.get_device_module(self.device)
+        if self._pp_is_last_stage:
+            prepare_logits_communication(self.model_runner.model)
+            if self._draft_model_runner is not None:
+                prepare_logits_communication(self._draft_model_runner.model)
         self._build_graph_owners()
 
         # Encoder graphs are installed before KV-cache sizing and retained by

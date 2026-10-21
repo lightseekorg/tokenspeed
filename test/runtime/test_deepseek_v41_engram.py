@@ -44,7 +44,6 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
@@ -542,9 +541,9 @@ def test_cuda_quantized_projection_forward():
     reference.wkv.weight.data.copy_((weight.float() / 64).to(torch.bfloat16))
     expected = reference(hidden, ids, mask)
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
-    # Hopper loads V4.1 FP8 projections as BF16 with the scales folded in.
+    # Hopper uses BF16 projection weights; other supported GPUs retain FP8.
     expected_dtype = (
-        torch.bfloat16 if current_platform().is_hopper else torch.float8_e4m3fn
+        torch.bfloat16 if v41.current_platform().is_hopper else torch.float8_e4m3fn
     )
     assert model.wkv.weight.dtype == expected_dtype
     for _ in range(2):

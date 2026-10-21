@@ -72,6 +72,12 @@ can never see a silently-defaulted one. This is deliberate — a `= False`
 default once hid `extend_with_prefix` being swallowed by a composite's
 `**kwargs`, and FlashMLA planned a ragged prefill for a prefix-cached batch.
 
+Extend planning uses the existing CPU length mirrors for host arithmetic:
+total cache length is the cached prefix plus the current input length.
+FlashInfer receives host CSR metadata derived from those mirrors, with fresh
+pinned sources for asynchronous uploads. Planning does not download device
+lengths or indptrs; mixed batches apply the same rule to their extend rows.
+
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
 `ForwardStepRunner` distinguishes `max_capture_bs` (top of the capture ladder,
@@ -81,6 +87,25 @@ buffers are sized by `max_decode_bs` — `init_cuda_graph_state` runs
 unconditionally at wrapper construction, `enforce_eager` included. A decode
 above the ladder runs the same refresh with no graph; it is a first-class
 path, not a fallback.
+
+State paging finalizes immutable metadata tapes for every supported decode
+batch size when the buffers are built. Finalization uploads CPU descriptions,
+so it belongs to startup, including sizes outside the capture ladder. Refresh
+supplies runtime registers and runs a prepared tape. Rebuilding the buffers
+rebuilds tapes that contain their addresses.
+
+Distributed-argmax eligibility and communication state are prepared after
+heads, draft sharing and sampling configuration are wired, before graph owners
+or any forward. Prefill-only, eager and captured execution use that same
+prepared processor. A prepared fallback is distinct from uninitialized state;
+decode warmup is not an initializer. The kernel state keys on the runtime
+logits dtype, which a quantized head does not declare on its (possibly
+transposed or packed) weight, so preparation builds the state for every
+supported logits dtype up front, keyed by the head's
+`num_embeddings_per_partition`; the forward and the sharded argmax only select
+the prepared state matching `logits.dtype`, with the portable packed-key
+all-reduce prepared as the fallback for any other dtype. They never construct,
+rendezvous or allocate communication state.
 
 ### Ascend context-parallel decode
 
@@ -292,6 +317,11 @@ replicated token rows uses the existing `ColumnParallelLinear` and
 
 The model runner prepares fixed-capacity communication workspaces before
 cache-memory profiling and graph capture.
+Distributed initialization also reserves the shared all-reduce workspace for
+the complete enabled fusion token window. A prefill-only process may never
+warm a decode graph; its first fused reduction must not resize or rendezvous
+for that workspace on the serving thread. Disabled fusion retains the
+ordinary one-shot reduction capacity.
 Preparation binds each Linear and its workspace to the selected communication
 backend; forward operations dispatch through that same backend.
 Generic projection operations use the backend's ordinary collectives.

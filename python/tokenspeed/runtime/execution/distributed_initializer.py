@@ -75,6 +75,8 @@ class DistributedConfig:
     # Run this rank alone, with local stand-ins for its collectives
     # (--emulate-rank-zero).
     emulate_rank_zero: bool
+    # Full enabled fusion window; zero when fused reductions are disabled.
+    comm_fusion_token_capacity: int
 
     dist_init_addr: str | None = None
     distributed_timeout_seconds: int = 1800
@@ -118,6 +120,11 @@ class DistributedConfig:
             moe_ep_rank=mapping.moe.ep_rank,
             nccl_port=port_args.nccl_port,
             emulate_rank_zero=server_args.emulate_rank_zero,
+            comm_fusion_token_capacity=(
+                max(0, server_args.comm_fusion_max_num_tokens)
+                if server_args.enable_allreduce_fusion
+                else 0
+            ),
             dist_init_addr=port_args.dist_init_addr,
             distributed_timeout_seconds=(
                 server_args.distributed_timeout_seconds
@@ -226,9 +233,13 @@ class DistributedInitializer:
             backend = get_global_backend()
             trtllm_ar = getattr(backend, "trtllm_ar", None)
             if trtllm_ar is not None:
-                # One-shot window; configure_group widens cross-node groups.
-                max_oneshot_tokens = max(
-                    1, (2 * 1024 * 1024) // max(config.hidden_size * 2, 1)
+                # Plain one-shot reductions and fused norms share this
+                # workspace. Prefill may never capture a decode graph, so
+                # arm the full fusion window here, before serving begins.
+                max_workspace_tokens = max(
+                    1,
+                    (2 * 1024 * 1024) // max(config.hidden_size * 2, 1),
+                    config.comm_fusion_token_capacity,
                 )
                 for group in {
                     config.mapping.attn.tp_group,
@@ -238,7 +249,7 @@ class DistributedInitializer:
                         ok = trtllm_ar.configure_group(
                             rank=group.index(config.mapping.rank),
                             group=group,
-                            max_token_num=max_oneshot_tokens,
+                            max_token_num=max_workspace_tokens,
                             hidden_dim=config.hidden_size,
                         )
                         logger.info(

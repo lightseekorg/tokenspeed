@@ -503,15 +503,6 @@ class ServerArgs:
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
-    # The L3 prefetch that fills a waiting request's Host pages before its
-    # admission: the shortest L3 prefix worth one (prefix pages), the lane's
-    # deadline (base + per_page * pages seconds) and its batch. Explicit with
-    # an L3 store, unset without one (see validate_l3_prefetch_options).
-    kvstore_prefetch_min_pages: int | None = None
-    kvstore_prefetch_timeout_base_s: float | None = None
-    kvstore_prefetch_timeout_per_page_s: float | None = None
-    kvstore_prefetch_batch_pages: int | None = None
-
     # Retraction snapshot pool (pinned Host, per rank) and its slot-state
     # arena rows: a retracted request is suspended with its image and
     # resumed by restore; a victim whose image does not fit is aborted
@@ -1319,7 +1310,6 @@ class ServerArgs:
         self.resolve_kv_offload()
         # Handle KVStore settings.
         self._handle_kvstore()
-        self.validate_l3_prefetch_options()
         self.validate_cache_options()
         self.resolve_retraction_snapshot_options()
 
@@ -1966,65 +1956,15 @@ class ServerArgs:
                 "unset --disable-kvstore"
             )
 
-    def validate_l3_prefetch_options(self):
-        """The L3 prefetch knobs: all four with an L3 store, none without.
-
-        An L3 hit is fetched into Host pages before the request is admitted,
-        on the Host cache executor's prefetch lane; these size that fetch.
-        None of them has a silent default: the threshold trades a short hit's
-        recompute against a round of admission latency, the deadline bounds
-        how long a request may wait on the store, and the batch is the
-        store's request granularity.
-        """
-        knobs = {
-            "--kvstore-prefetch-min-pages": self.kvstore_prefetch_min_pages,
-            "--kvstore-prefetch-timeout-base-s": self.kvstore_prefetch_timeout_base_s,
-            "--kvstore-prefetch-timeout-per-page-s": (
-                self.kvstore_prefetch_timeout_per_page_s
-            ),
-            "--kvstore-prefetch-batch-pages": self.kvstore_prefetch_batch_pages,
-        }
-        given = [name for name, value in knobs.items() if value is not None]
-        if self.kvstore_storage_backend is None:
-            if given:
-                raise ValueError(
-                    f"{', '.join(given)} belong to the L3 prefetch and need "
-                    "--kvstore-storage-backend"
-                )
-            return
-        missing = [name for name, value in knobs.items() if value is None]
-        if missing:
-            raise ValueError(
-                f"--kvstore-storage-backend needs the L3 prefetch knobs: {', '.join(missing)}"
-            )
-        if self.kvstore_prefetch_min_pages < 1:
-            raise ValueError("--kvstore-prefetch-min-pages must be at least 1 page")
-        if self.kvstore_prefetch_timeout_base_s <= 0:
-            raise ValueError("--kvstore-prefetch-timeout-base-s must be positive")
-        if self.kvstore_prefetch_timeout_per_page_s < 0:
-            raise ValueError("--kvstore-prefetch-timeout-per-page-s must be >= 0")
-        if self.kvstore_prefetch_batch_pages < 1:
-            raise ValueError("--kvstore-prefetch-batch-pages must be at least 1 page")
-
     def validate_cache_options(self):
-        # Runs after _handle_kvstore() has applied the KVStore default, so the
-        # check sees the effective setting rather than the pre-resolution flag.
-        # Both Host tiers -- the L2 KVStore and the retraction snapshot pool --
-        # are legal under KV-page sharding (--kv-parallel-size):
-        # the scheduler allocates every Host block in its Device block's
-        # residue class and the executor translates ownership on both ends of
-        # every row (cache/transfer/ownership.py), so each rank copies the
-        # blocks it owns. L3 is not: its keys name content and position, but
-        # which rank owns a block is decided at allocation, so a rank cannot
-        # answer an existence probe for blocks it did not own when the object
-        # was written (docs/design/cache-concepts.md, the retraction image).
-        if self.kv_parallel_size > 1 and (self.kvstore_storage_backend is not None):
+        if self.kvstore_storage_backend is not None and self.pipeline_parallel_size > 1:
             raise ValueError(
-                "--kvstore-storage-backend (L3) is not supported under "
-                "--kv-parallel-size > 1: a page-cyclic sharded group "
-                "has no owner-stable L3 key. The Host KVStore itself and the "
-                "retraction snapshot pool are supported."
+                "Asynchronous L3 currently requires --pipeline-parallel-size 1"
             )
+        # Host tiers and L3 use the same cyclic owner translation. L3 page
+        # keys name a replica, so a new Host allocation can have another owner.
+        # Device construction validates that sharded payloads are replicated
+        # within the owner subgroup; head-partitioned payloads are rejected.
         # Same-checkpoint DSpark's KVStore support depends on where the draft
         # keeps its context; the engine decides once the draft config resolves
         # (resolve_dspark_prefix_replay_tokens).
@@ -2633,43 +2573,6 @@ class ServerArgs:
             help="JSON object of extra L3 backend settings. For mooncake: "
             "master_server_address, local_hostname, metadata_server, "
             "global_segment_size, protocol, device_name, tenant_id.",
-        )
-        parser.add_argument(
-            "--kvstore-prefetch-min-pages",
-            type=int,
-            default=ServerArgs.kvstore_prefetch_min_pages,
-            help="L3 prefetch threshold, in prefix pages: a waiting request whose "
-            "L3-only prefix is at least this long has it fetched into Host pages "
-            "before admission (the request waits, holding no Device page); a "
-            "shorter one is simply computed. Required with "
-            "--kvstore-storage-backend, refused without it.",
-        )
-        parser.add_argument(
-            "--kvstore-prefetch-timeout-base-s",
-            type=float,
-            default=ServerArgs.kvstore_prefetch_timeout_base_s,
-            help="L3 prefetch deadline, base term in seconds: a prefetch stops "
-            "starting batches base + per-page * pages seconds after it began on "
-            "the prefetch lane and lands the prefix it has. The deadline is "
-            "checked between batches only -- a batch_get_into already issued "
-            "runs to completion (the store API has no timeout), so one batch may "
-            "overrun it and a hung store holds the lane and every later "
-            "prefetch. Positive; required with --kvstore-storage-backend.",
-        )
-        parser.add_argument(
-            "--kvstore-prefetch-timeout-per-page-s",
-            type=float,
-            default=ServerArgs.kvstore_prefetch_timeout_per_page_s,
-            help="L3 prefetch deadline, per-page term in seconds (0 for a fixed "
-            "deadline). Required with --kvstore-storage-backend.",
-        )
-        parser.add_argument(
-            "--kvstore-prefetch-batch-pages",
-            type=int,
-            default=ServerArgs.kvstore_prefetch_batch_pages,
-            help="Prefix pages per L3 get of a prefetch; the fetch stops at the "
-            "first batch with a missing page. Required with "
-            "--kvstore-storage-backend.",
         )
         # Retraction snapshot pool
         parser.add_argument(

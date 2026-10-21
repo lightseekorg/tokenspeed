@@ -35,6 +35,7 @@
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/core/block_pool.h"
 #include "cache/tier/transfer_manager.h"
+#include "cache/tier/storage_manager.h"
 #include "fsm/forward_events.h"
 #include "fsm/pd_events.h"
 #include "resource/allocator/req_pool_allocator.h"
@@ -69,11 +70,16 @@ public:
     // (re-weighted) engine, and its snapshot-pool leg is visible through no
     // pin.
     bool CanClearCache() const;
+    bool StoragePending() const { return storage_transfers_ && storage_transfers_->HasPending(); }
+    std::size_t StorageHeldBlocks() const { return storage_transfers_ ? storage_transfers_->NumHeldBlocks() : 0; }
+    std::size_t StorageQuarantined() const { return storage_transfers_ ? storage_transfers_->NumQuarantined() : 0; }
+    std::size_t StorageNegativeKeys() const { return storage_transfers_ ? storage_transfers_->NumNegativeKeys() : 0; }
+    StorageStats GetStorageStats() const;
 
     // Lifecycle counters read the current FSM state; they do not schedule work.
     std::size_t BootstrappingSize() const;
-    // Requests waiting for an admission: Submitted, Prefetching (their L3
-    // prefix is being fetched into Host first), plus the suspended ones --
+    // Requests waiting for an admission: Submitted or Prefetching once PD
+    // bootstrap is done, plus the suspended ones --
     // Retracted (waiting to be restored) and Restoring (their copy back is in
     // flight) -- which hold no schedulable work until they resume.
     std::size_t WaitingSize() const;
@@ -93,6 +99,9 @@ public:
     // Requests whose pages PD still pins. This resource count overlaps FSM states.
     std::size_t PdTransferSize() const;
     std::int32_t RequestTokenSize(const std::string& id) const;
+    // Only fused, page-less requests can finish without the normal forward/PD
+    // completion fence. This is a read-only check for the head event channel.
+    bool CanAbortBeforeAdmission(const std::string& id) const;
     // Maximum logical request extent that one request can reserve in an
     // otherwise reclaimable device pool. The runtime must enforce this limit
     // before submitting requests.
@@ -120,18 +129,12 @@ public:
     // refuses to flush while this is non-zero.
     std::size_t RetractedSize() const;
 
-    // L3 storage (Mooncake Store, etc.) sits below Host. At submit the
-    // runtime asks the backend which of a prompt's objects exist and
-    // registers the matching CacheKeys; an admission that finds registered
-    // keys beyond its Host hit issues a pre-admission prefetch of them
-    // (PrefetchOperation, fsm::Prefetching) and admits them as a Host hit
-    // once they landed. Admission itself never fetches from L3.
+    // Key geometry helpers; runtime workers receive immutable keys from
+    // storage operations, never a mutable shadow of remote existence.
     std::vector<std::string> PrefixHashesForTokens(const std::vector<std::int32_t>& tokens) const;
     std::vector<CacheKey> ExpandPrefixKeys(std::span<const std::string> content_hashes) const {
         return coordinator_.ExpandPrefixKeys(content_hashes);
     }
-    void RegisterStorageKeys(std::span<const CacheKey> keys) { coordinator_.RegisterStorageKeys(keys); }
-    void UnregisterStorageKeys(std::span<const CacheKey> keys) { coordinator_.UnregisterStorageKeys(keys); }
 
 private:
     bool clearCache(bool include_host);
@@ -179,26 +182,22 @@ private:
     struct BuiltOperations {
         std::vector<ForwardOperation> forward;
         std::vector<LoadBackOperation> load_backs;
-        std::vector<PrefetchOperation> prefetches;
         std::vector<SnapshotStoreOperation> snapshot_stores;
         std::vector<SnapshotRestoreOperation> snapshot_restores;
     };
     BuiltOperations buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> candidates,
                                            std::vector<WriteBackOperation>& write_back_operations);
     // What considering a Submitted request for admission produced: the
-    // first-chunk event (admitted), or a prefetch issued instead (the request
-    // is Prefetching; it is considered again once the fill landed), or
-    // neither (feedback says whether capacity was the reason).
+    // first-chunk event (admitted), or no event (feedback distinguishes
+    // capacity failure from waiting for a request slot).
     struct FirstChunkOutcome {
         // The D role: every State group's prompt-end checkpoint was claimed,
         // so the peer omits the state transfer (PrefillOperation::state_prefix_cached).
         bool state_prefix_cached{false};
         std::optional<fsm::SchedulePrefillFirstChunkEvent> event;
-        bool prefetching{false};
     };
     FirstChunkOutcome schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request,
-                                                std::int32_t remaining, std::int32_t decode_input_tokens,
-                                                std::vector<PrefetchOperation>& prefetches);
+                                                std::int32_t remaining, std::int32_t decode_input_tokens);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t remaining,
                                                              std::int32_t reserve_num_tokens_in_next_schedule_event);
@@ -248,9 +247,15 @@ private:
     // transfers.
     bool pdTransferInFlight(const Request& request) const;
 
+    void handleEvent(const cache::StorageTick& event);
+    void handleEvent(const cache::StorageDone& event);
+    void handleEvent(const cache::StorageDetach& event);
+    void prepareStorage(Request& request);
+    void releaseStorage(Request& request);
+    void expireStorage(Request& request);
+    std::int32_t cacheablePrefixTokens(const Request& request) const;
     void handleEvent(const cache::WriteBackDone& event);
     void handleEvent(const cache::LoadBackDone& event);
-    void handleEvent(const cache::PrefetchDone& event);
     void handleEvent(const cache::SnapshotDone& event);
     void handleEvent(const cache::RestoreDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
@@ -276,8 +281,6 @@ private:
         std::vector<ForwardOperation> remote_decode;
         std::vector<ForwardOperation> remote_prefill;
         std::vector<LoadBackOperation> load_backs;
-        // Pre-admission L3 fills issued this round (fsm::Prefetching).
-        std::vector<PrefetchOperation> prefetches;
         // A retraction's tail-leg store (its L2 leg joins the write-backs) and
         // a readmission's restore: cache ops riding beside the batch.
         std::vector<SnapshotStoreOperation> snapshot_stores;
@@ -326,22 +329,12 @@ private:
         build.operations.push_back(std::move(operation));
     }
 
-    // What scheduling one prefill-work candidate produced: the chunk to run
-    // this round, or none when a Submitted request was sent to prefetch its
-    // L3 prefix instead (fsm::Prefetching; the round carries only its
-    // PrefetchOperation and the request is considered again once it landed).
-    struct PrefillAdmission {
-        std::optional<PrefillOperation> operation;
-    };
-    // Admission for one prefill-work candidate: a resumed chunk for a
-    // Prefilling request, the first chunk (or a prefetch) otherwise. nullopt
-    // when admission fails (feedback.admission_failed says whether capacity
-    // was the reason).
-    std::optional<PrefillAdmission> schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
+    // A resumed chunk or a new prompt's first chunk. Waiting for storage
+    // returns nullopt without reporting a capacity failure.
+    std::optional<PrefillOperation> schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t token_budget,
                                                              std::int32_t decode_reserve,
-                                                             std::vector<LoadBackOperation>& load_backs,
-                                                             std::vector<PrefetchOperation>& prefetches);
+                                                             std::vector<LoadBackOperation>& load_backs);
 
     // The readmissions this round may restore, in rank order: among the
     // retracted requests whose image has landed, victims with generated
@@ -444,6 +437,13 @@ private:
     BlockPool snapshot_pool_;
     CacheCoordinator coordinator_;
     TierTransferManager tier_transfers_;
+    std::unique_ptr<StorageTransferManager> storage_transfers_;
+    std::int64_t storage_now_us_{0};
+    std::uint64_t storage_wait_timeouts_{0};
+    std::uint64_t storage_ready_expirations_{0};
+    bool storage_allowed_{false};
+    std::uint64_t storage_pressure_bypasses_{0};
+    bool forward_allowed_{true};
     std::vector<WriteBackOperation> pending_write_back_operations_;
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};
