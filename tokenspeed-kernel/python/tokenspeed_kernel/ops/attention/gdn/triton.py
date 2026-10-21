@@ -43,6 +43,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
+    GdnStateCheckpoints,
 )
 from tokenspeed_kernel.ops.attention.gdn._triton.causal_conv1d_metadata import (
     CAUSAL_CONV1D_BLOCK_M,
@@ -92,6 +93,7 @@ _TREE_VERIFY_REPLAY_MAX_REGISTERS = 168
     traits={
         "output_h": frozenset({False, True}),
         "qk_l2norm": frozenset({False, True}),
+        "state_checkpoints": frozenset({False}),
     },
 )
 def triton_gdn_chunk_prefill(
@@ -107,7 +109,10 @@ def triton_gdn_chunk_prefill(
     qk_l2norm: bool = False,
     output_final_state: bool = True,
     output_h: bool = False,
+    state_checkpoints: GdnStateCheckpoints | None = None,
 ) -> GdnChunkPrefillResult:
+    if state_checkpoints is not None:
+        raise ValueError("triton_gdn_chunk_prefill stores no state checkpoints")
     # initial_state arrives K-last [N, H, V, K] (the shared contract); this
     # backend's FLA math needs [N, H, K, V], so transpose in (materialized:
     # the Triton kernel below has no dynamic-stride support for h0).

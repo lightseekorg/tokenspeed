@@ -107,6 +107,7 @@ from tokenspeed.runtime.layers.attention.backends.support import resolve_tree_su
 from tokenspeed.runtime.layers.attention.configs.base import is_block_drafter
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     validate_scheduler_config,
+    validate_state_checkpoint_in_forward,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
     local_page_pairs_by_group,
@@ -452,6 +453,9 @@ class ModelExecutorConfig:
     prefill_graph_max_tokens: int = 0
     # Explicit bucket list overriding the ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
+    # The scheduler may give extend rows in-forward State checkpoints
+    # (--enable-state-checkpoint-in-forward).
+    state_checkpoint_in_forward: bool = False
 
     @property
     def spec_draft_tree(self) -> bool:
@@ -514,6 +518,7 @@ class ModelExecutorConfig:
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
             prefill_graph_capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
+            state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
             model_is_mrope=model_is_mrope,
             prefill_only=server_args.disaggregation_mode == "prefill",
             input_logprob_chunk_tokens=server_args.input_logprob_chunk_tokens,
@@ -582,6 +587,10 @@ class ModelExecutor:
             attn_backend=attn_backend,
             kv_pool=token_to_kv_pool,
         )
+        if config.state_checkpoint_in_forward:
+            validate_state_checkpoint_in_forward(
+                attn_backend=attn_backend, kv_pool=token_to_kv_pool
+            )
         self._cache_runtime_contract = token_to_kv_pool.arena.runtime_contract
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
@@ -599,6 +608,7 @@ class ModelExecutor:
             ),
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
+            reads_state_checkpoints=config.state_checkpoint_in_forward,
         )
         # Group-keyed zeroing requests carry scheduler (virtual) block IDs; this
         # rank's position in the KVP group selects the pages it owns.
@@ -922,6 +932,10 @@ class ModelExecutor:
             attn_backend=self.attn_backend,
             kv_pool=token_to_kv_pool,
         )
+        if self.config.state_checkpoint_in_forward:
+            validate_state_checkpoint_in_forward(
+                attn_backend=self.attn_backend, kv_pool=token_to_kv_pool
+            )
         self._cache_runtime_contract = token_to_kv_pool.arena.runtime_contract
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         if self.drafter is not None:
@@ -2561,6 +2575,9 @@ class ModelExecutor:
                             :num_extends
                         ],
                         extend_prompt_lens_cpu=self.input_buffers.extend_prompt_lens_cpu[
+                            :num_extends
+                        ],
+                        extend_state_checkpoint_lens_cpu=self.input_buffers.extend_state_checkpoint_lens_cpu[
                             :num_extends
                         ],
                         block_tables=block_tables,

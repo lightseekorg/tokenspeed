@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel.ops.attention.gdn import (
+    GdnStateCheckpoints,
     gdn_chain_verify_is_chunked,
     gdn_chunk_prefill,
     gdn_decode_mtp,
@@ -79,7 +80,10 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 )
 from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
     STATE_TABLE_SLOTS,
+    InForwardStateCheckpoints,
     compute_state_block_indices,
+    in_forward_state_checkpoints,
+    scan_checkpoint_plan,
 )
 from tokenspeed.runtime.layers.attention.backends.state.utils import row_stride_i32
 from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
@@ -227,6 +231,12 @@ class MambaForwardMetadata:
     # layers select their entry via ``pool.state_group_by_layer[layer_id]``.
     state_in_blocks_by_group: dict[str, torch.Tensor] | None = None
     state_out_blocks_by_group: dict[str, torch.Tensor] | None = None
+    # The in-forward State checkpoints this extend forward writes, and the
+    # chunked scan's plan for them (its interval, buffer and the buffer row of
+    # each checkpoint); None when the forward writes none.
+    state_checkpoints: InForwardStateCheckpoints | None = None
+    scan_state_checkpoints: GdnStateCheckpoints | None = None
+    scan_checkpoint_rows: torch.Tensor | None = None
 
     @property
     def prefill_token_extent(self) -> int | None:
@@ -277,6 +287,9 @@ class MambaAttnBackend(AttentionBackend):
     _decode_packed_qkv_views: bool = False
     # Whether the family's chunked tree verify scan fills the ReplaySSM payload.
     _verify_scan_writes_replay: bool = False
+    # Whether the family's prefill scan stores in-forward State checkpoints
+    # (SchedulerConfig::state_checkpoint_in_forward).
+    _stores_in_forward_state_checkpoints: bool = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig):
         super().__init__(config, spec)
@@ -307,6 +320,10 @@ class MambaAttnBackend(AttentionBackend):
     @property
     def kv_pool(self) -> CachePool | None:
         return self.cache_pool
+
+    @property
+    def stores_in_forward_state_checkpoints(self) -> bool:
+        return self._stores_in_forward_state_checkpoints
 
     def _reset_graph_state(self) -> None:
         """Index buffers init_cuda_graph_state rebuilds; a rebind keeps them."""
@@ -944,6 +961,7 @@ class MambaAttnBackend(AttentionBackend):
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         query_shard: QueryShardPlan | None,
+        extend_state_checkpoint_lens_cpu: torch.Tensor | None = None,
         **kwargs,
     ) -> None:
         reject_query_shard(query_shard, "MambaStateBackend")
@@ -1001,6 +1019,9 @@ class MambaAttnBackend(AttentionBackend):
 
         state_in_blocks_by_group = None
         state_out_blocks_by_group = None
+        state_checkpoints = None
+        scan_state_checkpoints = None
+        scan_checkpoint_rows = None
         scan_query_start_loc = self._prepare_prefill_scan_query_start_loc(
             query_start_loc
         )
@@ -1014,6 +1035,21 @@ class MambaAttnBackend(AttentionBackend):
                     validate=None,
                 )
             )
+            state_checkpoints = in_forward_state_checkpoints(
+                extend_state_checkpoint_lens_cpu,
+                extend_seq_lens_cpu,
+                num_extends,
+                block_tables,
+                self._state_group_ids,
+            )
+        if state_checkpoints is not None:
+            if not self._stores_in_forward_state_checkpoints:
+                raise RuntimeError(
+                    f"{type(self).__name__} cannot store in-forward State checkpoints"
+                )
+            scan_state_checkpoints, scan_checkpoint_rows = self._scan_state_checkpoints(
+                state_checkpoints, extend_seq_lens_cpu
+            )
 
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=query_start_loc,
@@ -1026,6 +1062,44 @@ class MambaAttnBackend(AttentionBackend):
             ),
             state_in_blocks_by_group=state_in_blocks_by_group,
             state_out_blocks_by_group=state_out_blocks_by_group,
+            state_checkpoints=state_checkpoints,
+            scan_state_checkpoints=scan_state_checkpoints,
+            scan_checkpoint_rows=scan_checkpoint_rows,
+        )
+
+    def _scan_state_checkpoints(
+        self,
+        checkpoints: InForwardStateCheckpoints,
+        scan_seq_lens_cpu: torch.Tensor,
+    ) -> tuple[GdnStateCheckpoints, torch.Tensor]:
+        """The scan checkpoint plan and float32 buffer for this forward's checkpoints.
+
+        The plan is the chunked scan's ``scan_checkpoint_plan`` for this
+        forward's in-forward checkpoints; the buffer is what the scan fills.
+
+        Args:
+            checkpoints: This forward's checkpoints.
+            scan_seq_lens_cpu: Host ``[bs]`` tokens of each scanned sequence.
+
+        Returns:
+            ``(scan checkpoints, device int64 buffer row of each checkpoint)``.
+        """
+        every_n_tokens, cu_starts, rows = scan_checkpoint_plan(
+            checkpoints, scan_seq_lens_cpu
+        )
+        ssm_states = self._state_components(self._state_layer_ids()[0])[1]
+        states = torch.empty(
+            (int(cu_starts[-1]), *ssm_states.shape[1:]),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        return (
+            GdnStateCheckpoints(
+                every_n_tokens=every_n_tokens,
+                states=states,
+                cu_starts=cu_starts.to(device=self.device, dtype=torch.int32),
+            ),
+            rows.to(self.device),
         )
 
     # ---- CUDA graph state ----
@@ -1756,6 +1830,18 @@ class MambaAttnBackend(AttentionBackend):
                     mixed_qkv, a, b, g_raw, f_a_out, beta_raw
                 )
 
+            checkpoints = self.forward_metadata.state_checkpoints
+            if checkpoints is not None:
+                # The conv state at a checkpoint is the window of the
+                # conv's inputs just before it (oldest first).
+                window = conv_states.shape[-1]
+                rows = checkpoints.token_index.unsqueeze(1) + torch.arange(
+                    -window, 0, device=checkpoints.token_index.device
+                )
+                conv_states[
+                    checkpoints.blocks_by_group[self._state_group_for(layer_id)].long()
+                ] = (mixed_qkv[rows].transpose(1, 2).to(conv_states.dtype))
+
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv_t,
@@ -1889,11 +1975,22 @@ class MambaAttnBackend(AttentionBackend):
                 num_real_tokens=num_real_tokens,
                 lower_bound=gate_lower_bound,
                 cu_seqlens_cpu=metadata.cu_extend_seq_lens_cpu,
+                state_checkpoints=metadata.scan_state_checkpoints,
             )
             # The final state goes to the live slot. Capacity metadata pads the
             # request dimension with -1 blocks whose dummy scan result the
             # masked writer drops.
             store_state_rows(last_recurrent_state, ssm_states, state_out_blocks)
+            if metadata.state_checkpoints is not None:
+                store_state_rows(
+                    metadata.scan_state_checkpoints.states[
+                        metadata.scan_checkpoint_rows
+                    ],
+                    ssm_states,
+                    metadata.state_checkpoints.blocks_by_group[
+                        self._state_group_for(layer_id)
+                    ],
+                )
             if extend_seq_lens_cpu is not None:
                 # Padded output rows hold the dummy scan's results (or nothing);
                 # the outer forward reads the whole bucket.
@@ -2113,6 +2210,7 @@ class MambaAttnBackend(AttentionBackend):
         num_real_tokens: int,
         lower_bound: float | None,
         cu_seqlens_cpu: torch.Tensor | None = None,
+        state_checkpoints: GdnStateCheckpoints | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Chunked scan of an extend/prefill batch, from the gathered state.
 
@@ -2148,6 +2246,10 @@ class MambaAttnBackend(AttentionBackend):
                 override uses it for exact-length host planning or capacity
                 admission without a per-layer synchronizing D2H. Prepared KDA
                 plans are built on device; GDN plans on device and ignores it.
+            state_checkpoints: The in-forward State checkpoints the scan stores
+                (``MambaForwardMetadata.scan_state_checkpoints``), or ``None``;
+                only a family with ``_stores_in_forward_state_checkpoints``
+                takes them.
 
         Returns:
             ``(core_attn_out, last_recurrent_state)``.
@@ -2171,6 +2273,7 @@ class MambaAttnBackend(AttentionBackend):
             qk_l2norm=True,
             output_final_state=True,
             output_h=False,
+            state_checkpoints=state_checkpoints,
         )
         return gdn_result.out, gdn_result.final_state
 
