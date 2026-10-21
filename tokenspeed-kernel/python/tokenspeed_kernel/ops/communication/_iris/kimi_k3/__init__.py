@@ -78,7 +78,7 @@ class K3IrisState:
         )
         self.lamport = (
             ProducerLamport(
-                all_reduce.producer, max_numel=self.lamport_max_rows * (3584 + 7168)
+                all_reduce.peers, max_numel=self.lamport_max_rows * (3584 + 7168)
             )
             if self.lamport_max_rows
             else None
@@ -107,7 +107,7 @@ class K3IrisState:
                 dtype=self.all_reduce.dtype,
                 device=self.all_reduce.device,
             )
-            self.lamport.run(output)
+            self.lamport.run(self.all_reduce.producer.data, output)
             return self.all_reduce.producer.views(output, shapes)
         return self.all_reduce.all_reduce_symmetric(tensors)
 
