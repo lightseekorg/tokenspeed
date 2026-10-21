@@ -64,6 +64,9 @@ Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
 0.7.2 and compile isolated modules, operators, and tuning caches. They require
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
+Private cold JIT compilations bind their include path to that versioned source
+tree. FlashInfer can share mutable include-directory storage across native
+modules, so a module loaded later must not redirect private kernel compilation.
 The installed FlashInfer package is unchanged. To switch settings, prepare a
 new callable, warm it up, and recapture graphs.
 

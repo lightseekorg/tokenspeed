@@ -166,6 +166,7 @@ def _qsa(rows, solution):
             v_scale=None,
             override=None,
             solution="cute_dsl",
+            sparse_metadata=None,
         )
 
     return forward

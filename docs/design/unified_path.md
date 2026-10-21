@@ -1172,12 +1172,20 @@ Draft step zero still preserves the dense decode-context
 and KV-recording override, while QSA keeps its original context and narrows
 the selected top-k rows with the queries.
 
-The QSA API preserves `decode_query_lengths`: uniform decode/verification
-uses a positive width, as does every single-request forward. Multi-request
-prefill and mixed/ragged queries use `None`.
-Only decode may select CuTe; NVIDIA prefill uses FlashInfer FA2, including
-single-token prefill. Adapting ragged rows to one-token queries must retain
-this distinction. Both use the same cache writer and sparse-attention call.
+QSA uses positive `decode_query_lengths` for uniform decode/verification and
+`None` for prefill or mixed/ragged queries, including one-token prefill.
+Only decode may use CuTe. PrimTS accepts supported BF16 prefill and decode
+with logical block candidates on SM100/SM103; groups stay within each request.
+Other supported NVIDIA inputs use FA2 over equivalent physical slots.
+All kernels share the cache writer and sparse-attention call. The indexer
+returns physical slots across graph breaks and keeps logical candidates
+in the existing per-forward share for both stages. Draft steps carrying
+only physical slots use the direct-slot kernels.
+
+The QSA leaf owns PrimTS plans and per-device scratch for its current KV pool.
+Calls, including graph replays, are ordered across streams. Rebinding drops
+eager plans; capture sessions retain graph plans and allocations until release.
+Scratch may grow without moving graph inputs. Each run regenerates its data.
 
 QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and CuTe read invalid
 candidates from the zero-initialized slot 1 of the reserved null page.

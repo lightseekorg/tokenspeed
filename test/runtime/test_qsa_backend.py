@@ -389,6 +389,7 @@ def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
 
     def refresh(actual_bs: int) -> None:
         backend.sparse_topk.qsa_metadata = object()
+        backend.sparse_topk.qsa_selection = object()
         backend.refresh_decode_metadata(
             2,
             actual_bs,
@@ -400,6 +401,7 @@ def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
             for_graph_replay=use_graph,
         )
         assert backend.sparse_topk.qsa_metadata is None
+        assert backend.sparse_topk.qsa_selection is None
 
     def stage() -> None:
         layout = qsa_forward_layout(

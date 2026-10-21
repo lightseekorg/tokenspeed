@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import functools
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -152,6 +153,17 @@ def _source_tree(
         "#endif",
     )
     directory = cache / tag
+    # FlashInfer's inline include-directory storage may be shared across DSOs.
+    # Bind the private JIT compiler to this immutable source tree, so loading
+    # another MoE module cannot redirect cold compilation to its headers.
+    include_dir = json.dumps(str(directory / "csrc/nv_internal/tensorrt_llm"))
+    patched[compiler] = _replace_once(
+        patched[compiler],
+        "for (auto const& dir : getJitIncludeDirs()) {",
+        "for (auto const& dir : std::vector<std::filesystem::path>{"
+        + include_dir
+        + "}) {",
+    )
     directory.mkdir(parents=True, exist_ok=True)
     with FileLock(str(directory / "source.lock")):
         marker = directory / "ready"
