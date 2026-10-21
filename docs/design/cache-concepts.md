@@ -796,8 +796,9 @@ Its responsibilities:
   A State group publishes its slot 1 — the state after exactly `T` tokens —
   under the same key as the KV at `T` (the chain hash of the last page, or
   `hash@T` for a tail), and only at a point where the owner stops writing it
-  (`CompletedPages::publish_state`: a prompt end, a junction cut, finish,
-  retraction); a chunk end or decode step publishes no state (see
+  (`CompletedPages::publish_state`: a prompt end, a junction cut, the opt-in
+  long-prompt checkpoint, finish, retraction); any other chunk end or a
+  decode step publishes no state (see
   [Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
   Evicting a History block under a chain hash evicts the state checkpoints
   under that hash as well, so a state never outlives the KV it continues.
@@ -812,7 +813,8 @@ Its responsibilities:
   `pending_stores_` queue drives D2H transfers, alongside Host-side
   acquire/contains/pin queries. During prefill, each chunk end queues the
   full-attention pages it published; the prompt end (the first decode's
-  admission, or a junction cut) queues its tail and state checkpoint too;
+  admission), a junction cut or the opt-in long-prompt checkpoint queues its
+  tail and state checkpoint too;
   the candidates are merged into a batched writeback. Ordinary decode
   publishes history-cache Device entries but streams none of them and
   publishes no state. At finish — and at the PD transfer ACK — every entry the

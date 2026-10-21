@@ -674,6 +674,26 @@ TEST(SchedulerConfigValidateTest, StateCheckpointChunkCutRequiresPrefixCaching) 
     EXPECT_THROW(config.Validate(), std::invalid_argument);
     config.enable_state_checkpoint_chunk_cut = false;
     EXPECT_NO_THROW(config.Validate());
+
+    // The D role never cuts, so it takes the flag without prefix caching
+    // (PD launchers share one argument list between the roles); the P role
+    // still refuses it.
+    for (const Role role : {Role::kP, Role::kD}) {
+        SchedulerConfig pd = MakeValidConfig();
+        pd.role = role;
+        for (CacheGroupConfig& group : pd.cache_groups) {
+            group.transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(pd);
+        pd.disable_prefix_cache = true;
+        EXPECT_NO_THROW(pd.Validate());
+        pd.enable_state_checkpoint_chunk_cut = true;
+        if (role == Role::kD) {
+            EXPECT_NO_THROW(pd.Validate());
+        } else {
+            EXPECT_THROW(pd.Validate(), std::invalid_argument);
+        }
+    }
 }
 
 TEST(SchedulerConfigValidateTest, SnapshotPoolAndRetractedSlotsAreStatedTogether) {

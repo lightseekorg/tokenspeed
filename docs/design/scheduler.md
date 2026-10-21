@@ -26,12 +26,13 @@ and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrc
 for why publication rides with admission).
 
 Decode-role remote admission covers the complete unmatched prompt in one
-landing window. Local prefill chunk limits and junction cuts do not shorten
-it: the peer transfers the full prompt's KV past the hit and its prompt-end
-state (unless this node already holds that exact checkpoint, §3.2). The window
-must reach `PrefillSize()` so the first decode consumes its reserved input
-width. A truncated remote window would leave that reserve at zero and delay
-later cache growth even though the device has committed the full prompt.
+landing window. Local prefill chunk limits, junction cuts and the opt-in
+long-prompt State checkpoint cut do not shorten it: the peer transfers the
+full prompt's KV past the hit and its prompt-end state (unless this node
+already holds that exact checkpoint, §3.2). The window must reach
+`PrefillSize()` so the first decode consumes its reserved input width. A
+truncated remote window would leave that reserve at zero and delay later
+cache growth even though the device has committed the full prompt.
 
 **L3 is fetched before admission, never by it.** An admission loads only
 Host entries that exist (`PrefixProbe::host`), so nothing it loads can miss and
@@ -977,8 +978,9 @@ descriptor (`registerKvEventPrefixPages`), and `DrainKvEvents` drops the
 descriptor of a boundary with no cached child. A boundary is `BlockStored`
 only while every group holds its child -- the State groups included, whose
 checkpoint exists only at a natural point -- so a hybrid model emits
-`BlockStored` for its prompt end, its finish and its junction cuts, never
-for an interior chunk end's chain hash; a tail's descriptor carries the
+`BlockStored` for its prompt end, its finish, its junction cuts and, with
+`enable_state_checkpoint_chunk_cut`, its long-prompt checkpoint, never for
+any other interior chunk end's chain hash; a tail's descriptor carries the
 rows below `T` and the residency check counts a tail's blocks from it. Retraction publishes twice
 without an admission: `retractVictim` registers the newly hashed pages before
 `CacheCompletedBlocks` (as the finish-time publication does), and the

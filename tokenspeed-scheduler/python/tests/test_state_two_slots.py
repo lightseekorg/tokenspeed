@@ -218,3 +218,36 @@ class TestFusedStateTwoSlots:
         assert all(
             not pairs for pairs in dict(plan.pages_to_copy).values()
         ), "an aligned hit copies nothing"
+
+
+class TestStateCheckpointChunkCut:
+    """``SchedulerConfig.enable_state_checkpoint_chunk_cut``: a prompt longer than
+    the chunk budget also ends a chunk at its last page boundary before the
+    final token, so a later prompt that changes only its last page resumes
+    there."""
+
+    @pytest.mark.parametrize("cut", [False, True])
+    def test_a_changed_last_page_resumes_from_the_opt_in_checkpoint(self, cut):
+        cfg = _fused_config(decode_input_tokens=1)
+        cfg.max_scheduled_tokens = 4
+        cfg.enable_state_checkpoint_chunk_cut = cut
+        scheduler = ts.Scheduler(cfg)
+        prompt = [1, 2, 3, 4, 5, 6, 7]
+        scheduler.submit_requests([_spec("seed", prompt, MAX_NEW_TOKENS)])
+        chunks: list[int] = []
+        while sum(chunks) < len(prompt) and len(chunks) < 8:
+            [batch] = _dispatched(scheduler.next_execution_plan())
+            chunks.append(list(batch.input_lengths)[0])
+            _advance(scheduler, "seed", [201] if sum(chunks) == len(prompt) else [])
+        # The cut costs one extra round: the second chunk ends at 6, the
+        # last page boundary before the final token.
+        assert chunks == ([4, 2, 1] if cut else [4, 3])
+        _dispatched(scheduler.next_execution_plan())
+        _advance(scheduler, "seed", [202])
+        _finish(scheduler, "seed")
+        scheduler.next_execution_plan()
+
+        scheduler.submit_requests([_spec("second", prompt[:6] + [99], MAX_NEW_TOKENS)])
+        [batch] = _dispatched(scheduler.next_execution_plan())
+        # By default no state was published at 6 and the request starts over.
+        assert list(batch.extend_prefix_lens) == [6 if cut else 0]

@@ -147,3 +147,18 @@ def test_the_state_checkpoint_chunk_cut_is_refused_without_prefix_caching():
             enable_prefix_caching=False,
             enable_state_checkpoint_chunk_cut=True,
         )
+
+
+def test_a_decode_server_takes_the_state_checkpoint_chunk_cut_without_prefix_caching():
+    # A decode server never cuts, so a PD launcher may pass the flag to both
+    # roles while disabling prefix caching only on decode.
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode="decode",
+        disaggregation_transfer_backend="mooncake",
+        disable_kvstore=True,
+        enable_prefix_caching=False,
+        enable_state_checkpoint_chunk_cut=True,
+    )
+    assert args.enable_state_checkpoint_chunk_cut

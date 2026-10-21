@@ -62,7 +62,10 @@ void SchedulerConfig::Validate() const {
     if (prefix_replay_tokens < 0) {
         throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
     }
-    if (enable_state_checkpoint_chunk_cut && disable_prefix_cache) {
+    // The D role never cuts (its prompts land by remote transfer), so a
+    // decode server may take the flag from an argument list it shares with
+    // its prefill server.
+    if (enable_state_checkpoint_chunk_cut && disable_prefix_cache && role != Role::kD) {
         throw std::invalid_argument(
             "Scheduler: enable_state_checkpoint_chunk_cut (--enable-state-checkpoint-chunk-cut) cuts a chunk for a "
             "checkpoint only the prefix cache can reuse; it requires prefix caching");

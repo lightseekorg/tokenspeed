@@ -97,8 +97,8 @@ struct SchedulerConfig {
     // tail, so each State group publishes a page-aligned checkpoint there
     // (PrefillStateCheckpointTokens). A later prompt that shares the prompt
     // but changes only its last page then resumes from it, at the cost of at
-    // most one extra prefill round per long prompt. Requires prefix caching;
-    // no effect without State groups.
+    // most one extra prefill round per long prompt. Requires prefix caching
+    // except on the D role, which never cuts; no effect without State groups.
     bool enable_state_checkpoint_chunk_cut{false};
 
     // The single validation entry point for a scheduler configuration: every

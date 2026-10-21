@@ -380,9 +380,9 @@ class ServerArgs:
     # Scheduler cache-reuse identity granularity in tokens.
     prefix_granularity: int = 64
     # Opt-in: a prompt longer than chunked_prefill_size also ends a prefill
-    # chunk at the last prefix page boundary before its final token, where
-    # hybrid models publish a recurrent-state checkpoint (at most one extra
-    # prefill round per long prompt).
+    # chunk at the last prefix-page boundary before its replay tail (normally
+    # the final token), where hybrid models publish a recurrent-state
+    # checkpoint (at most one extra prefill round per long prompt).
     enable_state_checkpoint_chunk_cut: bool = False
     # JSON on the CLI, normalized once to generic runtime options.
     kv_offload_config: str | dict | None = None
@@ -2042,7 +2042,12 @@ class ServerArgs:
                 "KVStore and disabled prefix caching are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
-        if self.enable_state_checkpoint_chunk_cut and not self.enable_prefix_caching:
+        # A decode server never cuts (its prompts arrive by remote transfer).
+        if (
+            self.enable_state_checkpoint_chunk_cut
+            and not self.enable_prefix_caching
+            and self.disaggregation_mode != "decode"
+        ):
             raise ValueError(
                 "--enable-state-checkpoint-chunk-cut cuts a chunk for a checkpoint "
                 "only the prefix cache can reuse; it requires prefix caching"
@@ -2596,13 +2601,12 @@ class ServerArgs:
             dest="enable_state_checkpoint_chunk_cut",
             default=ServerArgs.enable_state_checkpoint_chunk_cut,
             help="Hybrid (recurrent-state) models: also end a prefill chunk of a "
-            "prompt longer than --chunked-prefill-size at the last prefix page "
-            "boundary before its final token, so the state there is cached. A "
-            "later request that shares the prompt but changes only its last "
-            "page (or resends it) then resumes from that checkpoint instead of "
-            "an earlier one, at the cost of at most one extra prefill round per "
-            "long prompt. Requires prefix caching; no effect on models without "
-            "recurrent-state layers.",
+            "prompt longer than --chunked-prefill-size at the last prefix-page "
+            "boundary before its replay tail (normally the final token), so a "
+            "later request that resends the prompt or diverges from it after "
+            "that boundary resumes there; at most one extra prefill round per "
+            "long prompt. Requires prefix caching. See "
+            "docs/design/scheduler.md section 1.2.",
         )
 
         # KVStore

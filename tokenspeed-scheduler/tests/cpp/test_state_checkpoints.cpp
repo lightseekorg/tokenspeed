@@ -225,11 +225,12 @@ protected:
 };
 
 // Under the 8-token budget, a 22-token prompt pays one extra chunk to end at
-// 20; a 26-token prompt's checkpoint at 24 is already a budget chunk end. A
-// second prompt that changes only the last page resumes from that checkpoint
-// (by default it finds none there and starts over, like the "miss" probe of
+// 20; a 26-token prompt's checkpoint at 24 is already a budget chunk end. The
+// same prompt sent again, or one that changes only the last page, resumes
+// from that checkpoint (by default neither finds one there and starts over,
+// like the "miss" probe of
 // TwoSlotsRotateThroughChunksTheFirstDecodeAndLaterDecodes).
-TEST_F(StateCheckpointCutSuite, SecondLongPromptReusesTheStateBeforeItsChangedTail) {
+TEST_F(StateCheckpointCutSuite, SecondLongPromptReusesTheStateBeforeTheTail) {
     for (const auto [prompt_tokens, checkpoint_tokens] : {std::pair{22, 20}, std::pair{26, 24}}) {
         SCOPED_TRACE(prompt_tokens);
         for (const bool host_cache : {false, true}) {
@@ -259,6 +260,10 @@ TEST_F(StateCheckpointCutSuite, SecondLongPromptReusesTheStateBeforeItsChangedTa
             SendFinish("seed");
             AckWriteBacks(PlanOnce());
 
+            const Resume resent = Probe("resent", tokens);
+            EXPECT_EQ(resent.prefix_tokens, checkpoint_tokens);
+            EXPECT_EQ(resent.state_row.at(0), checkpoint_rows.at(0));
+
             tokens[checkpoint_tokens] = 991;
             tokens[checkpoint_tokens + 1] = 992;
             const Resume reused = Probe("second", tokens);
@@ -266,6 +271,57 @@ TEST_F(StateCheckpointCutSuite, SecondLongPromptReusesTheStateBeforeItsChangedTa
             EXPECT_EQ(reused.state_row.at(0), checkpoint_rows.at(0));
         }
     }
+}
+
+// Multi-turn traffic where each turn keeps all but the previous prompt's
+// final token, as when re-rendering the previous reply re-tokenizes the end of
+// its generation prompt: turn2 hits the seed's checkpoint at 24, the seed's
+// last full page, and although its rest fits one chunk it still ends that
+// first chunk at its own checkpoint (28), where turn3 resumes.
+TEST_F(StateCheckpointCutSuite, AResumedHitCutsItsFirstChunkAtItsCheckpoint) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    std::vector<std::int32_t> seed = MakeTokens(26);
+    Submit(RequestWithTokens("seed", seed));
+    std::int32_t scheduled = 0;
+    for (int round = 0; scheduled < 26 && round < 16; ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        ASSERT_NE(batch, nullptr);
+        scheduled += batch->input_lengths.at(0);
+        SendForwardDone("seed", scheduled == 26 ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
+        AckWriteBacks(plan);
+    }
+    SendFinish("seed");
+    AckWriteBacks(PlanOnce());
+
+    std::vector<std::int32_t> turn2(seed.begin(), seed.end() - 1);
+    for (std::int32_t i = 0; i < 5; ++i) {
+        turn2.push_back(500 + i);
+    }
+    Submit(RequestWithTokens("turn2", turn2));
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"turn2"});
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 24) << "turn2 resumes at the seed's last full page";
+    EXPECT_EQ(batch->input_lengths.at(0), 4) << "the first chunk ends at turn2's checkpoint 28";
+    SendForwardDone("turn2");
+    AckWriteBacks(plan);
+    plan = PlanOnce();
+    batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->input_lengths.at(0), 2);
+    SendForwardDone("turn2", {901});
+    AckWriteBacks(plan);
+    SendFinish("turn2");
+    AckWriteBacks(PlanOnce());
+
+    std::vector<std::int32_t> turn3(turn2.begin(), turn2.end() - 1);
+    for (std::int32_t i = 0; i < 3; ++i) {
+        turn3.push_back(700 + i);
+    }
+    const Resume resumed = Probe("turn3", turn3);
+    EXPECT_EQ(resumed.prefix_tokens, 28) << "turn3 resumes at turn2's checkpoint";
 }
 
 // A request that finishes right after its prefill (a one-token budget) never

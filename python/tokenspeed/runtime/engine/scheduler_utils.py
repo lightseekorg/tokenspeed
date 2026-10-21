@@ -449,8 +449,10 @@ def make_config(
     cfg.disable_prefix_cache = disable_prefix_cache
     cfg.prefix_replay_tokens = prefix_replay_tokens
     if enable_state_checkpoint_chunk_cut:
-        # Off is the binding's default: leaving it unset keeps the runtime
-        # working with scheduler wheels released before this field.
+        # Set only when on: off is the binding's default, so the runtime keeps
+        # working with a scheduler wheel released before this field, where
+        # turning the option on raises AttributeError here instead of being
+        # ignored.
         cfg.enable_state_checkpoint_chunk_cut = True
     cfg.disable_l2_cache = disable_l2_cache
 
