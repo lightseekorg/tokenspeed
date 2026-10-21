@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Factories for PD KV transfer helpers."""
+"""The PD transfer description of a rank's KV arena."""
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
@@ -28,10 +28,7 @@ from tokenspeed.runtime.pd.cache_protocol import (
     build_arena_cache_transfer_contract,
     build_cache_fields_by_producer_step,
 )
-from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
-from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
-from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
-from tokenspeed.runtime.pd.utils import TransferBackend
+from tokenspeed.runtime.pd.mooncake.entities import KVArgs
 
 
 def get_kv_args(
@@ -96,20 +93,3 @@ def get_kv_args(
         cache_fields_by_stage=cache_fields_by_stage,
         wire_cache_layout=wire_layout,
     )
-
-
-def create_kv_transfer(
-    mode: str,
-    backend: TransferBackend,
-    args: KVManagerArgs,
-    kv_args: KVArgs,
-    gloo_group,
-):
-    if backend not in (TransferBackend.MOONCAKE, TransferBackend.MOONCAKE.value):
-        raise NotImplementedError("CachePD supports only the Mooncake backend")
-    if mode == "prefill":
-        return DisaggPrefillExecutor(args, kv_args, gloo_group)
-    elif mode == "decode":
-        return DisaggDecodeExecutor(args, kv_args, gloo_group)
-    else:
-        raise NotImplementedError(f"Unsupported disaggregation mode: {mode}")

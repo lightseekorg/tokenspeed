@@ -1,0 +1,106 @@
+# HELP tokenspeed:iteration_tokens_total Tokens scheduled in one scheduler forward step.
+# HELP tokenspeed:jit_serving_compile_seconds_total Wall time spent in Triton kernel compilations after startup.
+# HELP tokenspeed:jit_serving_compiles_total Triton kernel compilations after startup; each one stalls the forward thread.
+# HELP tokenspeed:kv_cache_usage_perc Fraction of device KV pages in use (0-1).
+# HELP tokenspeed:kv_transfer_failures_total KV transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss on the decode node. Timeouts are counted separately.
+# HELP tokenspeed:kv_transfer_latency_seconds Wall time of one KV cache transfer send to a peer.
+# HELP tokenspeed:kv_transfer_timeouts_total KV transfers that timed out, by transfer stage.
+# HELP tokenspeed:num_capacity_aborted_requests_total Requests the scheduler aborted because a capacity retraction could not image its victim (retraction snapshot pool or image rows exhausted); clients may resubmit them.
+# HELP tokenspeed:num_nan_aborted_requests_total Requests terminated by the NaN guard (NaN in logits or an out-of-vocab sampled token id).
+# HELP tokenspeed:num_preemptions_total Requests preempted by a capacity retraction: the scheduler suspended a resident request (its pages imaged to the Host snapshot pool; it later resumes by restore, nothing is recomputed) to free Device pages for a blocked admission. One increment per retraction victim per round, counted from the plan's snapshot-store ops; forced retractions from --debug-force-retraction-interval count too. A retraction whose victim cannot be imaged aborts it instead — see tokenspeed:num_capacity_aborted_requests.
+# HELP tokenspeed:num_requests_running Requests with scheduler-side generation state (decode path).
+# HELP tokenspeed:num_requests_waiting Requests waiting in the C++ scheduler queue.
+# HELP tokenspeed:request_queue_time_seconds Wall time from submission to the scheduler's waiting queue to first dispatch into a forward batch, observed once per request. Grammar-compile, pause-hold, and EPD embedding waits precede submission and are excluded, as are tokenizer-manager and IPC wait.
+# HELP tokenspeed:spec_decode_num_accepted_tokens_total Accepted speculative draft tokens (excludes the bonus token sampled after verify).
+# HELP tokenspeed:spec_decode_num_draft_tokens_total Draft tokens proposed across verify steps.
+# HELP tokenspeed:spec_decode_num_drafts_total Number of speculative verify rounds (per request-slot).
+# TYPE tokenspeed:iteration_tokens_total histogram
+# TYPE tokenspeed:jit_serving_compile_seconds_total counter
+# TYPE tokenspeed:jit_serving_compiles_total counter
+# TYPE tokenspeed:kv_cache_usage_perc gauge
+# TYPE tokenspeed:kv_transfer_failures_total counter
+# TYPE tokenspeed:kv_transfer_latency_seconds histogram
+# TYPE tokenspeed:kv_transfer_timeouts_total counter
+# TYPE tokenspeed:num_capacity_aborted_requests_total counter
+# TYPE tokenspeed:num_nan_aborted_requests_total counter
+# TYPE tokenspeed:num_preemptions_total counter
+# TYPE tokenspeed:num_requests_running gauge
+# TYPE tokenspeed:num_requests_waiting gauge
+# TYPE tokenspeed:request_queue_time_seconds histogram
+# TYPE tokenspeed:spec_decode_num_accepted_tokens_total counter
+# TYPE tokenspeed:spec_decode_num_draft_tokens_total counter
+# TYPE tokenspeed:spec_decode_num_drafts_total counter
+tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 1.0
+tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="0.0",model_name="m"} 0.0
+tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="1.0",model_name="m"} 0.0
+tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="1024.0",model_name="m"} 1.0
+tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="128.0",model_name="m"} 1.0
+tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="16.0",model_name="m"} 0.0
+tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="2.0",model_name="m"} 0.0
+tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="2048.0",model_name="m"} 1.0
+tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="256.0",model_name="m"} 1.0
+tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="32.0",model_name="m"} 1.0
+tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="4.0",model_name="m"} 0.0
+tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="4096.0",model_name="m"} 1.0
+tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="512.0",model_name="m"} 1.0
+tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="64.0",model_name="m"} 1.0
+tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="8.0",model_name="m"} 0.0
+tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="8192.0",model_name="m"} 1.0
+tokenspeed:iteration_tokens_total_count{app_key="",dp_rank="0",model_name="m"} 1.0
+tokenspeed:iteration_tokens_total_sum{app_key="",dp_rank="0",model_name="m"} 17.0
+tokenspeed:jit_serving_compile_seconds_total{app_key="",dp_rank="0",model_name="m"} 0.5
+tokenspeed:jit_serving_compiles_total{app_key="",dp_rank="0",model_name="m"} 2.0
+tokenspeed:kv_cache_usage_perc{app_key="",dp_rank="0",model_name="m"} 0.1
+tokenspeed:kv_transfer_failures_total{app_key="",model_name="m"} 1.0
+tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="+Inf",model_name="m"} 1.0
+tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="0.001",model_name="m"} 0.0
+tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="0.002",model_name="m"} 0.0
+tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="0.005",model_name="m"} 1.0
+tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="0.01",model_name="m"} 1.0
+tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="0.02",model_name="m"} 1.0
+tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="0.05",model_name="m"} 1.0
+tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="0.1",model_name="m"} 1.0
+tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="0.2",model_name="m"} 1.0
+tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="0.5",model_name="m"} 1.0
+tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="1.0",model_name="m"} 1.0
+tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="10.0",model_name="m"} 1.0
+tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="2.0",model_name="m"} 1.0
+tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="30.0",model_name="m"} 1.0
+tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="5.0",model_name="m"} 1.0
+tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="60.0",model_name="m"} 1.0
+tokenspeed:kv_transfer_latency_seconds_count{app_key="",model_name="m"} 1.0
+tokenspeed:kv_transfer_latency_seconds_sum{app_key="",model_name="m"} 0.003
+tokenspeed:kv_transfer_timeouts_total{app_key="",model_name="m",stage="bootstrapping"} 1.0
+tokenspeed:kv_transfer_timeouts_total{app_key="",model_name="m",stage="waiting_for_input"} 1.0
+tokenspeed:num_capacity_aborted_requests_total{app_key="",dp_rank="0",model_name="m"} 1.0
+tokenspeed:num_nan_aborted_requests_total{app_key="",dp_rank="0",model_name="m"} 1.0
+tokenspeed:num_preemptions_total{app_key="",dp_rank="0",model_name="m"} 2.0
+tokenspeed:num_requests_running{app_key="",dp_rank="0",model_name="m"} 1.0
+tokenspeed:num_requests_waiting{app_key="",dp_rank="0",model_name="m"} 0.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 2.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="0.3",model_name="m"} 0.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="0.5",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="0.8",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="1.0",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="1.5",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="10.0",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="120.0",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="15.0",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="1920.0",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="2.0",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="2.5",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="20.0",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="240.0",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="30.0",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="40.0",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="480.0",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="5.0",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="50.0",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="60.0",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="7680.0",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="960.0",model_name="m"} 1.0
+tokenspeed:request_queue_time_seconds_count{app_key="",dp_rank="0",model_name="m"} 2.0
+tokenspeed:request_queue_time_seconds_sum{app_key="",dp_rank="0",model_name="m"} 9000.4
+tokenspeed:spec_decode_num_accepted_tokens_total{app_key="",dp_rank="0",model_name="m"} 5.0
+tokenspeed:spec_decode_num_draft_tokens_total{app_key="",dp_rank="0",model_name="m"} 12.0
+tokenspeed:spec_decode_num_drafts_total{app_key="",dp_rank="0",model_name="m"} 4.0

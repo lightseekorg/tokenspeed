@@ -926,13 +926,13 @@ class EpdPrefillAdmission:
     Owns the encode->prefill embedding sink (MooncakeEmbeddingManagerPrefill), the
     set of requests whose per-image embeddings are still arriving (``_pending``),
     and the optional NCCL row-shard reassembly. Exists ONLY on a multimodal prefill
-    node; the EventLoop holds one (or None) and drives it each non-overlap cycle.
+    node, where the data plane holds one and the control plane polls it every
+    round.
 
     DECIDE/ACT split: ``drain()`` polls the staged receives, applies the rank-
     lockstep MIN all-reduce + reassembly, and RETURNS ``(admitted, failed)``
-    decisions. The EventLoop performs the acts those imply (P->D sender
-    register/abort, scheduler submit, output-processor finish) -- they touch
-    EventLoop collaborators, so they stay there.
+    decisions. The control plane performs the acts those imply (P->D peer
+    register/abort, scheduler submit, the request's finish).
     """
 
     receives_embeddings = True
@@ -1058,41 +1058,50 @@ class EpdPrefillAdmission:
         """
         if not self._pending:
             return [], []  # rank-identical emptiness -> all ranks skip the collective
-
-        code_of = {FAILED: 0, PENDING: 1, DONE: 2}
-        codes = [code_of[job.poll()] for (_rid, job, _ts) in self._pending]
-
-        # Timeout: a still-PENDING request whose per-image embeddings have not all
-        # arrived within the deadline is marked FAILED (-> rank-agreed abort below).
-        # Without this the prefill waits FOREVER if an embedding is ever lost (a
-        # degraded/dead encode worker, a network drop). Folded into the SAME MIN
-        # all-reduce: a timed-out job -> code 0 -> all ranks abort it together;
-        # union-of-timeout is rank-safe even if ranks cross the deadline a cycle
-        # apart (any rank's 0 propagates via MIN).
-        _now = time.time()
-        for _i in range(len(self._pending)):
-            if codes[_i] == 1 and (_now - self._pending[_i][2]) > self._embed_timeout:
-                codes[_i] = 0
-                logger.warning(
-                    f"EPD embedding receive timed out after {self._embed_timeout:.0f}s "
-                    f"for rid={self._pending[_i][0]!s}; aborting",
-                )
-
+        codes = self.poll_codes()
         if self._attn_tp_size > 1:
             t = torch.tensor(codes, dtype=torch.uint8, device="cpu")
             dist.all_reduce(t, op=dist.ReduceOp.MIN, group=self._attn_tp_cpu_group)
             codes = t.tolist()
+        return self.settle(codes)
 
+    def poll_codes(self) -> list[int]:
+        """This rank's state of every staged receive, in staging order: 0
+        failed or timed out, 1 still receiving, 2 done.
+
+        A still-receiving request whose per-image embeddings have not all
+        arrived within the deadline counts as failed, so a lost embedding (a
+        degraded or dead encode worker, a network drop) aborts the request
+        instead of stalling it forever. The ranks MIN-reduce the codes before
+        ``settle``: any rank's failure or timeout fails the request everywhere,
+        even if the ranks cross the deadline a cycle apart.
+        """
+        code_of = {FAILED: 0, PENDING: 1, DONE: 2}
+        codes = [code_of[job.poll()] for (_rid, job, _ts) in self._pending]
+        now = time.time()
+        for index, (request_id, _job, start_ts) in enumerate(self._pending):
+            if codes[index] == 1 and (now - start_ts) > self._embed_timeout:
+                codes[index] = 0
+                logger.warning(
+                    f"EPD embedding receive timed out after {self._embed_timeout:.0f}s "
+                    f"for rid={request_id!s}; aborting",
+                )
+        return codes
+
+    def settle(self, codes: list[int]):
+        """Act on the replica-agreed ``codes`` (``poll_codes`` order); return
+        ``(admitted_ids, failed_ids)``.
+
+        Rank-lockstep: the codes and ``_pending`` are identical on every rank,
+        so every rank issues the same reassembly collectives in the same order.
+        """
         admitted = []
         failed = []
         leftover = []
-        for (request_id, job, start_ts), code in zip(self._pending, codes):
+        for (request_id, job, start_ts), code in zip(self._pending, codes, strict=True):
             if code == 2:  # DONE on every rank
-                # Sharded receive: rebuild the full rows from the per-rank shards
-                # FIRST -- item.encoded is shard-only until this runs. Rank-lockstep-
-                # safe: codes are identical post-MIN and _pending is rank-identical
-                # in length/order, so every rank issues identical collectives in
-                # identical order this cycle.
+                # Sharded receive: rebuild the full rows from the per-rank
+                # shards first -- item.encoded is shard-only until this runs.
                 if self._shard_embeddings:
                     job.reassemble(self._nccl_group, self._group_ranks)
                 admitted.append(request_id)
@@ -1118,12 +1127,15 @@ class PipelineEpdPrefillAdmission:
         self._pp_ranks = tuple(pp_ranks)
         self._pp_cpu_group = pp_cpu_group
         self._pending: set[str] = set()
+        # The staged ids in staging order, the order ``poll_codes`` reports.
+        self._staged_order: list[str] = []
         self.receives_embeddings = local_admission is not None
 
     def stage(self, request_id: str, mm_items) -> None:
         if self._local is not None:
             self._local.stage(request_id, mm_items)
         self._pending.add(request_id)
+        self._staged_order.append(request_id)
 
     def has_pending(self) -> bool:
         return bool(self._pending)
@@ -1136,7 +1148,31 @@ class PipelineEpdPrefillAdmission:
             payload, src=self._pp_ranks[0], group=self._pp_cpu_group
         )
         admitted, failed = payload[0]
-        self._pending.difference_update(admitted, failed)
+        settled = set(admitted) | set(failed)
+        self._staged_order = [rid for rid in self._staged_order if rid not in settled]
+        self._pending.difference_update(settled)
+        return admitted, failed
+
+    def poll_codes(self) -> list[int]:
+        """PP0's own codes; a later stage receives nothing and agrees with
+        whatever PP0 decides (done, the MIN's neutral value)."""
+        if self._local is not None:
+            return self._local.poll_codes()
+        return [2] * len(self._staged_order)
+
+    def settle(self, codes: list[int]):
+        """Act on the agreed codes: PP0 reassembles or releases; every stage
+        drops the settled ids."""
+        if self._local is not None:
+            admitted, failed = self._local.settle(codes)
+        else:
+            admitted = [
+                rid for rid, code in zip(self._staged_order, codes) if code == 2
+            ]
+            failed = [rid for rid, code in zip(self._staged_order, codes) if code == 0]
+        settled = set(admitted) | set(failed)
+        self._staged_order = [rid for rid in self._staged_order if rid not in settled]
+        self._pending.difference_update(settled)
         return admitted, failed
 
 
@@ -1199,3 +1235,44 @@ def make_epd_prefill_admission(
             pp_cpu_group=pg_manager.get_process_group("gloo", mapping.pp_group),
         )
     return admission
+
+
+def assert_embeddings_received(admission, multimodal_context) -> None:
+    """EPD invariant: every handshaked item this forward scatters is filled
+    with its embedding by the async EPD admission drain
+    (EpdPrefillAdmission.drain) BEFORE admission. This is a defensive check,
+    not a receive: such an item reaching the forward un-received leaked past
+    async admission (the only EPD admission path) -- fail loud instead of
+    running the tower or publishing shard-only rows. An item whose tokens
+    were all prefilled by an earlier chunk no longer holds its encoding
+    (the embedder drops it once nothing reads it) and is not scattered
+    again, so only items overlapping this chunk count. No-op for non-EPD /
+    text-only requests.
+    """
+    if (
+        admission is None
+        or not admission.receives_embeddings
+        or multimodal_context is None
+        or not multimodal_context.has_extend_inputs()
+    ):
+        return
+    for row, mm in enumerate(multimodal_context.mm_inputs):
+        if mm is None or row >= len(multimodal_context.extend_seq_lens):
+            continue
+        chunk_start = multimodal_context.extend_prefix_lens[row]
+        chunk_end = chunk_start + multimodal_context.extend_seq_lens[row]
+        missing = [
+            i
+            for i, item in enumerate(mm.mm_items)
+            if getattr(item, "encode_handshake", None) is not None
+            and item.encoded is None
+            and any(
+                start < chunk_end and chunk_start <= end
+                for start, end in item.offsets or ()
+            )
+        ]
+        if missing:
+            raise RuntimeError(
+                f"EPD: handshaked items {missing} reached the prefill forward "
+                "un-received; they must be admitted via the EPD admission drain"
+            )

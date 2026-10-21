@@ -18,12 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""CPU-only tests for P-side layerwise KV streaming: which blocks each
+prefill chunk sends, the producer steps it waits for (``HostPrefillPeer``,
+whose transfers the Rust peer runs), and the attention backends' step
+publication."""
+
 from __future__ import annotations
 
 import os
 import sys
-from collections import defaultdict
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -41,10 +44,10 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 from test.runtime.cache_pd_test_utils import block_manifest as make_block_manifest
 from test.runtime.cache_pd_test_utils import group as make_group  # noqa: E402
 from test.runtime.cache_pd_test_utils import layout as make_layout
+from test.runtime.cache_pd_test_utils import operation as make_operation
 from test.runtime.cache_pd_test_utils import producer_schedule as make_producer_schedule
 from test.runtime.cache_pd_test_utils import segment as make_segment
 
-from tokenspeed.runtime.pd.base.status import TransferPoll  # noqa: E402
 from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
     CachePDLayerwiseBlockSelection,
     CachePDLayerwiseGroupSelection,
@@ -52,22 +55,29 @@ from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
     CacheTransferContract,
     build_cache_layerwise_block_selection,
 )
+from tokenspeed.runtime.pd.host_peer import (  # noqa: E402
+    HostPrefillPeer,
+    PeerSettings,
+    PrefillSettings,
+)
 from tokenspeed.runtime.pd.mooncake.entities import (  # noqa: E402
-    TransferInfo,
-    TransferKVChunk,
+    KVArgs,
+    KVArgsRegisterInfo,
 )
-from tokenspeed.runtime.pd.transfer_plan import (  # noqa: E402
-    CacheTransferPlanner,
+from tokenspeed.runtime.pd.mooncake.pack import (  # noqa: E402
+    PackedCopy,
+    PageFieldCopies,
+    expand_packed_copy,
 )
-from tokenspeed.runtime.pd.utils import StepCounter  # noqa: E402
+from tokenspeed.runtime.pd.mooncake.prefill import (  # noqa: E402
+    cache_transfer_blocks,
+    prepare_decode_registration,
+)
+from tokenspeed.runtime.pd.topology import PDParallelTopology  # noqa: E402
+from tokenspeed.runtime.pd.transfer_plan import CacheTransferPlanner  # noqa: E402
 
-
-def test_step_counter_readiness_is_strict_and_wrap_safe() -> None:
-    limit = StepCounter.COUNT_NUM_MAX
-    assert not StepCounter.is_step_ready(0, 0)
-    assert not StepCounter.is_step_ready(limit - 1, 0)
-    assert StepCounter.is_step_ready(1, 0)
-    assert StepCounter.is_step_ready(0, limit - 1)
+_SOURCE = 0x1000
+_DESTINATION = 0x9000
 
 
 def _segment(
@@ -183,165 +193,281 @@ def test_group_aware_two_chunk_history_and_state_selection() -> None:
     )
 
 
-def test_prepare_cache_prefill_preflights_batch_and_reserves_once() -> None:
-    from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
+class _Counter:
+    """The producer step counter as the attention backends tick it."""
 
-    layout = _grouped_layout()
-    destination_block_manifest = make_block_manifest(
-        ("history", (20, 21)),
-        ("state-a", (22,)),
-        ("state-b", (23,)),
-        prompt=4,
+    def __init__(self) -> None:
+        self.reserved = 0
+
+    def current_step(self) -> tuple[int, int]:
+        return self.reserved, 0
+
+    def advance_step(self, *, delta_cache_step: int, delta_aux_step: int) -> None:
+        assert delta_aux_step == 0
+        self.reserved += delta_cache_step
+
+
+class _Outbox:
+    """Stands in for the Rust host: records the layerwise chunks it is handed."""
+
+    def __init__(self) -> None:
+        self.layerwise: list[tuple] = []
+
+    def send_layerwise(self, rid, room, chunk_id, target_steps, is_last) -> None:
+        self.layerwise.append((rid, room, chunk_id, list(target_steps), is_last))
+
+
+def _kv_args(layout: CacheTransferContract, schedule=None) -> KVArgs:
+    return KVArgs(
+        engine_rank=0,
+        kv_data_ptr=_SOURCE,
+        ib_device="",
+        gpu_id=0,
+        cache_layout=layout,
+        cache_fields_by_stage=(tuple(field.field_id for field in layout.plan.fields),),
+        cache_producer_schedule=schedule,
     )
-    destination = SimpleNamespace(
-        is_dummy=False,
-        block_manifest=destination_block_manifest,
+
+
+def _registration_frames(layout: CacheTransferContract) -> list[bytes]:
+    return [
+        b"None",
+        b"127.0.0.1",
+        b"9000",
+        b"decode:7000",
+        np.asarray([_DESTINATION], dtype=np.uint64).tobytes(),
+        layout.to_wire_bytes(),
+        b"1",
+        b"0",
+    ]
+
+
+def _layerwise_peer(layout, schedule, interval: int, rooms: dict[str, tuple]):
+    """A Prefill peer streaming layerwise, with a Decode destination for each
+    ``rid -> (room, destination manifest)``."""
+    outbox = _Outbox()
+    topology = PDParallelTopology(
+        tp_size=1, tp_rank=0, dp_size=1, dp_rank=0, world_size=1, global_rank=0
     )
-    calls = []
-
-    class _Sender:
-        def __init__(self, room: int):
-            self.bootstrap_room = room
-            self.started = False
-
-        def layerwise_chunk_submitted(self):
-            return self.started
-
-        def send_layerwise(self, *args, **kwargs):
-            calls.append((self.bootstrap_room, args, kwargs))
-            self.started = True
-
-    reserves = []
-    manager = SimpleNamespace(
-        transfer_infos={
-            9: {"decode-0": destination},
-            10: {"decode-0": destination},
-        },
-        reserve_layerwise_cache_steps=lambda: reserves.append(True) or 77,
-        get_decode_registration=lambda _destination: SimpleNamespace(
-            peer_cache_layout=layout
+    peer = HostPrefillPeer(
+        _kv_args(layout, schedule),
+        topology,
+        outbox,
+        PeerSettings(
+            library="libtokenspeed_transfer_engine.so",
+            local_ip="127.0.0.1",
+            ib_device="",
+            engine_rank=0,
+            regions=((_SOURCE, 4096),),
         ),
+        PrefillSettings(
+            status_rank=0,
+            bootstrap_url="http://127.0.0.1:8998/route",
+            bootstrap_payload="{}",
+            bootstrap_timeout_s=120.0,
+            failed_session_ttl_s=30.0,
+            transfer_workers=1,
+        ),
+    )
+    counter = _Counter()
+    peer.register_layerwise_step_counter(counter, interval)
+    peer.prepare_registration(_registration_frames(layout))
+    for rid, (room, manifest) in rooms.items():
+        peer.accept_preallocation(
+            [str(room).encode(), b"decode:7000", manifest.to_wire_bytes()]
+        )
+        peer.track(rid, room)
+    return peer, outbox, counter
+
+
+def test_a_prefill_forward_checks_every_row_then_reserves_its_steps_once() -> None:
+    layout = _grouped_layout()
+    schedule = make_producer_schedule(*_grouped_groups(), steps=5)
+    manifest = make_block_manifest(
+        ("history", (20, 21)), ("state-a", (22,)), ("state-b", (23,)), prompt=4
+    )
+    peer, outbox, counter = _layerwise_peer(
+        layout,
+        schedule,
+        interval=2,
+        rooms={"request-0": (9, manifest), "request-1": (10, manifest)},
     )
     tables = {
         "history": np.asarray([[1, 2], [3, 4]], dtype=np.int32),
         "state-a": np.asarray([[5, 6], [7, 8]], dtype=np.int32),
         "state-b": np.asarray([[9, 10], [11, 12]], dtype=np.int32),
     }
-    operation = SimpleNamespace(
+    operation = make_operation(
+        tables,
         request_ids=["request-0", "request-1"],
         request_pool_indices=[3, 4],
         extend_prefix_lens=[0, 0],
         input_lengths=[4, 4],
         num_extends=lambda: 2,
-        block_tables_arrays=lambda: tables,
     )
-    executor = object.__new__(DisaggPrefillExecutor)
-    executor.cache_layout = layout
-    executor.senders = {"request-0": _Sender(9), "request-1": _Sender(10)}
-    executor.kv_manager = manager
-    executor._layerwise_interval = 2
 
-    executor._prepare_cache_prefill(operation)
+    peer.prepare_prefill(operation)
 
-    assert reserves == [True]
-    assert [call[2]["begin_cache_step"] for call in calls] == [77, 77]
-    assert [call[2]["layerwise_interval"] for call in calls] == [2, 2]
-    assert all(call[1] == (True,) for call in calls)
+    # One producer range for the forward; each interval of two steps ends
+    # at its last step.
+    assert counter.reserved == 5
+    assert [entry[:2] for entry in outbox.layerwise] == [
+        ("request-0", 9),
+        ("request-1", 10),
+    ]
+    assert all(entry[3] == [1, 3, 4] and entry[4] for entry in outbox.layerwise)
 
     # A later bad row rejects the whole batch before any step is reserved or
-    # an earlier valid row is enqueued.
-    calls.clear()
-    reserves.clear()
+    # an earlier valid row is armed.
+    outbox.layerwise.clear()
     tables["history"][1, 0] = 0
     with pytest.raises(ValueError, match="invalid block ID"):
-        executor._prepare_cache_prefill(operation)
-    assert reserves == []
-    assert calls == []
+        peer.prepare_prefill(operation)
+    assert counter.reserved == 5
+    assert outbox.layerwise == []
 
 
-def test_first_layerwise_chunk_includes_deeper_prefill_cache_hit() -> None:
-    from tokenspeed.runtime.pd.mooncake.sender import MooncakeKVSender
-    from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
+def _host_spans(items) -> list[tuple[int, int, int]]:
+    """Every (source, destination, length) span a host plan writes, in order,
+    as the host expands it."""
+    spans = []
+    for kind, a, b, c in items:
+        if kind == "pages":
+            src_pages = np.frombuffer(a, dtype="<i8")
+            dst_pages = np.frombuffer(b, dtype="<i8")
+            fields = np.frombuffer(c, dtype="<i8").reshape(-1, 5)
+            for src_base, src_stride, dst_base, dst_stride, length in fields:
+                for page, peer in zip(src_pages, dst_pages, strict=True):
+                    spans.append(
+                        (
+                            int(src_base + page * src_stride),
+                            int(dst_base + peer * dst_stride),
+                            int(length),
+                        )
+                    )
+        else:
+            assert kind == "spans"
+            spans.extend(
+                zip(
+                    np.frombuffer(a, dtype="<u8").tolist(),
+                    np.frombuffer(b, dtype="<u8").tolist(),
+                    np.frombuffer(c, dtype="<u8").tolist(),
+                    strict=True,
+                )
+            )
+    return spans
 
+
+def _planner_spans(layout, schedule, manifest, selection) -> list[list[tuple]]:
+    """Per producer step, the spans the transfer planner gives for one
+    chunk's ``selection``."""
+    kv_args = _kv_args(layout, schedule)
+    topology = PDParallelTopology(
+        tp_size=1, tp_rank=0, dp_size=1, dp_rank=0, world_size=1, global_rank=0
+    )
+    registration = prepare_decode_registration(
+        kv_args, topology, KVArgsRegisterInfo.from_zmq(_registration_frames(layout))
+    )
+    intervals = cache_transfer_blocks(
+        kv_args,
+        dst_ptr=registration.dst_kv_ptr,
+        dst_tp_rank=registration.decode_tp_rank,
+        src_block_manifest=None,
+        dst_block_manifest=manifest,
+        transfer_fragments=registration.transfer_fragments,
+        owner_filters=registration.transfer_owner_filters,
+        dst_cache_layout=registration.peer_cache_layout,
+        block_selection=selection,
+        step_field_ids=[
+            schedule.fields_in_range(step, step + 1)
+            for step in range(schedule.step_count)
+        ],
+    )
+    planned = []
+    for items in intervals:
+        spans = []
+        for item in items:
+            if isinstance(item, PageFieldCopies):
+                for (
+                    src_base,
+                    src_stride,
+                    dst_base,
+                    dst_stride,
+                    length,
+                ) in item.fields.tolist():
+                    for page, peer in zip(
+                        item.src_pages.tolist(), item.dst_pages.tolist(), strict=True
+                    ):
+                        spans.append(
+                            (
+                                src_base + page * src_stride,
+                                dst_base + peer * dst_stride,
+                                length,
+                            )
+                        )
+            elif isinstance(item, PackedCopy):
+                spans.extend(expand_packed_copy(item))
+            else:
+                spans.append(tuple(item))
+        planned.append(spans)
+    return planned
+
+
+def test_the_first_layerwise_chunk_carries_a_deeper_prefill_cache_hit() -> None:
     layout = _grouped_layout()
-    destination = SimpleNamespace(
-        is_dummy=False,
-        block_manifest=make_block_manifest(
-            ("history", (20, 21, 22, 23)),
-            ("state-a", (24,)),
-            ("state-b", (25,)),
-            prefix=2,
-            prompt=9,
-        ),
+    schedule = make_producer_schedule(*_grouped_groups(), steps=5)
+    manifest = make_block_manifest(
+        ("history", (20, 21, 22, 23)),
+        ("state-a", (24,)),
+        ("state-b", (25,)),
+        prefix=2,
+        prompt=9,
     )
-    calls = []
-
-    manager = SimpleNamespace(
-        begin_room=lambda _room: None,
-        add_transfer_request=lambda *args, **kwargs: calls.append((args, kwargs)),
-        transfer_infos={9: {"decode-0": destination}},
-        reserve_layerwise_cache_steps=lambda: 77,
+    peer, outbox, _ = _layerwise_peer(
+        layout, schedule, interval=1, rooms={"request-0": (9, manifest)}
     )
-    sender = MooncakeKVSender(manager, "127.0.0.1:9000", 9)
     tables = {
         "history": np.asarray([[1, 2, 3, 4, 5]], dtype=np.int32),
         "state-a": np.asarray([[6, 7, 8, 9, 10]], dtype=np.int32),
         "state-b": np.asarray([[11, 12, 13, 14, 15]], dtype=np.int32),
     }
-    executor = object.__new__(DisaggPrefillExecutor)
-    executor.cache_layout = layout
-    executor.senders = {"request-0": sender}
-    executor.kv_manager = manager
-    executor._layerwise_interval = 1
 
-    def operation(chunk_begin, chunk_length):
-        return SimpleNamespace(
+    def chunk(begin: int, length: int):
+        return make_operation(
+            tables,
             request_ids=["request-0"],
-            extend_prefix_lens=[chunk_begin],
-            input_lengths=[chunk_length],
+            request_pool_indices=[3],
+            extend_prefix_lens=[begin],
+            input_lengths=[length],
             num_extends=lambda: 1,
-            block_tables_arrays=lambda: tables,
         )
 
-    assert not sender.layerwise_chunk_submitted()
-    executor._prepare_cache_prefill(operation(4, 3))
-    assert sender.layerwise_chunk_submitted()
-    assert not sender.layerwise_final_chunk_submitted()
-    executor._prepare_cache_prefill(operation(7, 2))
-    assert sender.layerwise_final_chunk_submitted()
-
-    first_history = calls[0][1]["cache_block_selection"].groups[0]
-    assert first_history.source_block_ids == (2, 3)
-    assert first_history.destination_positions == (0, 1)
-    second_history = calls[1][1]["cache_block_selection"].groups[0]
-    assert second_history.source_block_ids == (4, 5)
-    assert second_history.destination_positions == (2, 3)
-
-
-def _ordinary_layerwise_group():
-    segments = (
-        _segment(
-            "layer.0.k", producer_step=0, page_zero_offset=0, page_stride_bytes=128
-        ),
-        _segment(
-            "layer.0.v", producer_step=0, page_zero_offset=32, page_stride_bytes=128
-        ),
-        _segment(
-            "layer.2.k", producer_step=2, page_zero_offset=64, page_stride_bytes=128
-        ),
-        _segment(
-            "layer.4.v", producer_step=4, page_zero_offset=96, page_stride_bytes=128
+    # Decode holds 2 tokens and this rank's cache 4: the first chunk, [4, 7),
+    # also sends the history blocks of [2, 4) Decode lacks; the last sends
+    # from its own boundary on.
+    peer.prepare_prefill(chunk(4, 3))
+    peer.prepare_prefill(chunk(7, 2))
+    first, last = outbox.layerwise
+    assert (first[4], last[4]) == (False, True)
+    empty = CachePDLayerwiseGroupSelection((), ())
+    expected = CachePDLayerwiseBlockSelection(
+        groups=(CachePDLayerwiseGroupSelection((2, 3), (0, 1)), empty, empty)
+    )
+    (planned,) = peer.plan_layerwise(first[2], ["decode:7000"])
+    assert [_host_spans(items) for items in planned] == _planner_spans(
+        layout, schedule, manifest, expected
+    )
+    # The last chunk's first producer step moves its own history blocks.
+    (planned,) = peer.plan_layerwise(last[2], ["decode:7000"])
+    expected_history = _planner_spans(
+        layout,
+        schedule,
+        manifest,
+        CachePDLayerwiseBlockSelection(
+            groups=(CachePDLayerwiseGroupSelection((4, 5), (2, 3)), empty, empty)
         ),
     )
-    return _group("history", "full_history", *segments)
-
-
-def _ordinary_layerwise_layout() -> CacheTransferContract:
-    return make_layout(
-        _ordinary_layerwise_group(),
-        capacity=8,
-        page_bytes=256,
-    )
+    assert _host_spans(planned[0]) == expected_history[0]
 
 
 def _draft_final_group():
@@ -418,53 +544,37 @@ def _stage_producer_schedule(
         (1, ((0, 1), (1, 2)), 1, True),
     ],
 )
-def test_draft_final_reservation_stays_aligned_across_forwards(
+def test_each_forward_waits_for_its_own_steps_including_the_draft_final_one(
     stage, target_cache_windows, target_steps, draft_final
 ) -> None:
-    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
-
-    class _Counter:
-        def __init__(self):
-            self.reserved = 0
-            self.ready = 0
-
-        def current_step(self):
-            return self.reserved, 0
-
-        def advance_step(self, *, delta_cache_step, delta_aux_step):
-            assert delta_aux_step == 0
-            self.reserved += delta_cache_step
-
     schedule = _stage_producer_schedule(stage, target_cache_windows)
     if stage == 0 and len(target_cache_windows) == 1:
         assert schedule == make_producer_schedule(_draft_final_group(), steps=3)
     steps_per_forward = target_steps + int(draft_final)
     assert schedule.step_count == steps_per_forward
-
-    counter = _Counter()
-    manager = object.__new__(MooncakeKVManagerPrefill)
-    manager.kv_args = SimpleNamespace(
-        cache_layout=_draft_final_layout(), cache_producer_schedule=schedule
+    manifest = make_block_manifest(("history", (5,)), prompt=2)
+    peer, outbox, counter = _layerwise_peer(
+        _draft_final_layout(), schedule, interval=1, rooms={"request-0": (9, manifest)}
     )
-    manager.register_layerwise_step_counter(counter, interval=1)
-
-    for expected_begin in (0, steps_per_forward):
-        begin = manager.reserve_layerwise_cache_steps()
-        assert begin == expected_begin
-        counter.ready += target_steps  # target layers
-        final_target = begin + manager.producer_step_count - 1
-        assert StepCounter.is_step_ready(counter.ready, final_target) is not draft_final
-        if draft_final:
-            counter.ready += 1  # one synthetic draft-final event
-            assert StepCounter.is_step_ready(counter.ready, final_target)
-
-    assert counter.reserved == counter.ready == 2 * steps_per_forward
-
-
-def _single_history_selection() -> CachePDLayerwiseBlockSelection:
-    return CachePDLayerwiseBlockSelection(
-        groups=(CachePDLayerwiseGroupSelection((2,), (0,)),),
-    )
+    tables = {"history": np.asarray([[1]], dtype=np.int32)}
+    for _ in range(2):
+        peer.prepare_prefill(
+            make_operation(
+                tables,
+                request_ids=["request-0"],
+                request_pool_indices=[3],
+                extend_prefix_lens=[0],
+                input_lengths=[2],
+                num_extends=lambda: 1,
+            )
+        )
+    # Every forward reserves its whole range, the draft-final step included,
+    # so the next forward's steps start where its own end.
+    assert [entry[3] for entry in outbox.layerwise] == [
+        list(range(begin, begin + steps_per_forward))
+        for begin in (0, steps_per_forward)
+    ]
+    assert counter.reserved == 2 * steps_per_forward
 
 
 def _heterogeneous_groups(*, destination: bool):
@@ -499,8 +609,6 @@ def _heterogeneous_layout(*, destination: bool) -> CacheTransferContract:
 
 
 def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> None:
-    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
-
     source_layout = _heterogeneous_layout(destination=False)
     destination_layout = _heterogeneous_layout(destination=True)
     planner = CacheTransferPlanner(
@@ -522,12 +630,7 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
         ),
     )
     destination_block_manifest = make_block_manifest(("history", (3,)), ("state", (4,)))
-    manager = object.__new__(MooncakeKVManagerPrefill)
-    manager.kv_args = SimpleNamespace(
-        cache_layout=source_layout,
-        kv_data_ptr=0x10000,
-    )
-    manager.topology = SimpleNamespace(tp_rank=1)
+    kv_args = _kv_args(source_layout)
 
     # Rank 1 has no edge for the replicated latent field in layer 0. An empty
     # fragment set for this interval is a no-op, never a raw-page identity copy.
@@ -537,7 +640,8 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
 
     def blocks(begin, end):
         return next(
-            manager._cache_transfer_blocks(
+            cache_transfer_blocks(
+                kv_args,
                 dst_tp_rank=0,
                 dst_ptr=0x20000,
                 src_block_manifest=None,
@@ -552,180 +656,6 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
 
     assert blocks(0, 1) == []
     assert len(blocks(2, 3)) == 1
-
-
-def _layerwise_fanout_context():
-    from tokenspeed.runtime.metrics.collector import KVTransferMetrics
-    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
-
-    layout = _ordinary_layerwise_layout()
-    block_manifest = make_block_manifest(("history", (3,)))
-    requests = tuple(
-        TransferInfo(
-            room=9,
-            mooncake_session_id=f"session-{rank}",
-            block_manifest=block_manifest,
-        )
-        for rank in range(2)
-    )
-    manager = object.__new__(MooncakeKVManagerPrefill)
-    manager.producer_schedule = make_producer_schedule(
-        _ordinary_layerwise_group(), steps=5
-    )
-    manager.kv_args = SimpleNamespace(cache_layout=layout)
-    manager.producer_step_count = manager.producer_schedule.step_count
-    manager.session_lock = nullcontext()
-    manager._is_session_failed = lambda _session: False
-    manager.decode_kv_args_table = {
-        request.mooncake_session_id: SimpleNamespace(
-            dst_kv_ptr=0x20000 + rank * 0x1000,
-            decode_tp_rank=rank,
-            endpoint=f"decode-{rank}",
-            dst_port=9000 + rank,
-            peer_cache_layout=layout,
-            transfer_fragments=(),
-            transfer_owner_filters={},
-        )
-        for rank, request in enumerate(requests)
-    }
-    manager.layerwise_debug = False
-    manager.kv_transfer_metrics = KVTransferMetrics(
-        {}, reporters=["prometheus"], enabled=False
-    )
-    manager.session_failures = defaultdict(int)
-    return manager, requests
-
-
-def test_layerwise_fanout_is_layer_major_and_completes_once() -> None:
-    from prometheus_client import CollectorRegistry
-
-    from tokenspeed.runtime.metrics.collector import KVTransferMetrics
-
-    manager, requests = _layerwise_fanout_context()
-    registry = CollectorRegistry()
-    manager.kv_transfer_metrics = KVTransferMetrics(
-        {}, reporters=["prometheus"], enabled=True, registry=registry
-    )
-    chunk = TransferKVChunk(
-        room=9,
-        is_last=True,
-        bootstrap_token=42,
-        begin_cache_step=100,
-        layerwise_interval=2,
-        wait_for_bootstrap_token=True,
-        cache_block_selection=_single_history_selection(),
-    )
-    events = []
-    status_updates = []
-    notifications = []
-    manager._wait_until_cache_step = (
-        lambda step, *, room, session_ids=(): events.append(("wait", step, room))
-    )
-
-    def cache_transfer_blocks(**kwargs):
-        destination = kwargs["dst_ptr"]
-        for field_ids in kwargs["step_field_ids"]:
-            events.append(("prepare", destination, field_ids))
-            # The second peer gets no field of layer 2 from this rank.
-            if destination == 0x21000 and field_ids == frozenset(("layer.2.k",)):
-                yield []
-                continue
-            yield [(len(field_ids), destination, len(field_ids))]
-
-    manager._cache_transfer_blocks = cache_transfer_blocks
-
-    def transfer_data(session, blocks, packer=None):
-        events.append(("send", session, tuple(blocks)))
-        return 0
-
-    manager._transfer_data = transfer_data
-    manager._wait_prefill_metadata = lambda *_args: (42, None)
-    manager.check_status = lambda _room: TransferPoll.WaitingForInput
-    manager.update_status = lambda room, status: status_updates.append((room, status))
-    manager.sync_status_to_decode_endpoint = (
-        lambda endpoint, port, room, status, rank, **kwargs: notifications.append(
-            (endpoint, port, room, status, rank, kwargs)
-        )
-    )
-    manager.topology = SimpleNamespace(tp_rank=0)
-    manager.abort_room = lambda *_args: pytest.fail("successful fanout must not abort")
-
-    assert manager._send_cache_layerwise_fanout(chunk, requests)
-
-    assert [event[:2] for event in events] == [
-        ("wait", 101),
-        ("prepare", 0x20000),
-        ("prepare", 0x21000),
-        ("send", "session-0"),
-        ("send", "session-1"),
-        ("wait", 103),
-        ("prepare", 0x20000),
-        ("prepare", 0x21000),
-        ("send", "session-0"),
-        ("wait", 104),
-        ("prepare", 0x20000),
-        ("prepare", 0x21000),
-        ("send", "session-0"),
-        ("send", "session-1"),
-    ]
-    assert [event[2] for event in events if event[0] == "prepare"] == [
-        frozenset(("layer.0.k", "layer.0.v")),
-        frozenset(("layer.0.k", "layer.0.v")),
-        frozenset(("layer.2.k",)),
-        frozenset(("layer.2.k",)),
-        frozenset(("layer.4.v",)),
-        frozenset(("layer.4.v",)),
-    ]
-    assert status_updates == [(9, TransferPoll.Success)]
-    assert [notification[:4] for notification in notifications] == [
-        ("decode-0", 9000, 9, TransferPoll.Success),
-        ("decode-1", 9001, 9, TransferPoll.Success),
-    ]
-    assert all(
-        notification[5]["bootstrap_token"] == 42 for notification in notifications
-    )
-    # One latency sample per send: the empty interval records none.
-    assert (
-        registry.get_sample_value("tokenspeed:kv_transfer_latency_seconds_count") == 5
-    )
-
-
-def test_layerwise_fanout_failure_aborts_before_later_intervals() -> None:
-    manager, requests = _layerwise_fanout_context()
-    chunk = TransferKVChunk(
-        room=9,
-        is_last=True,
-        begin_cache_step=100,
-        layerwise_interval=2,
-        cache_block_selection=_single_history_selection(),
-    )
-    events = []
-    aborts = []
-    manager._wait_until_cache_step = lambda step, **_kwargs: events.append(
-        ("wait", step)
-    )
-    manager._cache_transfer_blocks = lambda **kwargs: iter(
-        [[(1, 2, 3)]] * len(kwargs["step_field_ids"])
-    )
-
-    def transfer(session, _blocks, packer=None):
-        events.append(("send", session))
-        return -1 if session == "session-1" else 0
-
-    manager._transfer_data = transfer
-    manager._mark_session_failed = lambda session, reason: events.append(
-        ("failed", session, reason)
-    )
-    manager.abort_room = lambda room, reason: aborts.append((room, reason))
-
-    assert not manager._send_cache_layerwise_fanout(chunk, requests)
-    assert events[:3] == [
-        ("wait", 101),
-        ("send", "session-0"),
-        ("send", "session-1"),
-    ]
-    assert not any(event == ("wait", 103) for event in events)
-    assert len(aborts) == 1
 
 
 def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(

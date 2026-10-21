@@ -38,6 +38,7 @@ back.
 
 from __future__ import annotations
 
+import functools
 import json
 from concurrent.futures import Future
 from contextlib import nullcontext
@@ -49,7 +50,6 @@ import numpy as np
 import pytest
 import torch
 from tokenspeed_scheduler import (
-    PD,
     AttnKind,
     CacheGroupConfig,
     ExecutionEvent,
@@ -78,9 +78,7 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalInputs,
     multimodal_context_for_forward,
 )
-from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
-from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
-from tokenspeed.runtime.pd.transfer_hooks import PdTransferHooks
+from tokenspeed.runtime.pd.host_peer import build_host_peer  # noqa: E402
 
 
 def _execute(handle, plan, planned):
@@ -223,6 +221,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
             overlap_schedule_depth=0,
             decode_input_tokens=16,
             max_batch_size=16,
+            kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
         )
     rebound_warmup = ("warmup", 1, (1,), False)
     assert (rebound_warmup in events) == expected_rewarm
@@ -273,9 +272,8 @@ class _ForwardThread:
 def _peer(trace=None):
     """A P-role transfer peer the handle will recognize by type."""
 
-    class _Peer(DisaggPrefillExecutor):
-        def __init__(self) -> None:
-            pass
+    class _Peer:
+        mode = "prefill"
 
         def execute(self, op) -> None:
             if trace is not None:
@@ -286,35 +284,6 @@ def _peer(trace=None):
                 trace.append(("arm", op))
 
     return _Peer()
-
-
-class _DecodeExecutor(DisaggDecodeExecutor):
-    """A decode-role kv_transfer the hooks will recognize by type.
-
-    Subclasses rather than fakes because the hooks dispatch on
-    ``isinstance``; the real ``__init__`` (sockets, KV manager) is bypassed
-    on purpose — only the three pop/generate methods are exercised.
-    """
-
-    def __init__(self, events, slot=None, candidates=None) -> None:
-        self._events = events
-        self._slot = slot
-        self._candidates = candidates
-
-    def generate_events(self):
-        return self._events
-
-    def pop_remote_cached_tokens(self, request_id):
-        return 0
-
-    def pop_remote_bootstrap_logprob(self, request_id):
-        return None
-
-    def pop_remote_cache_slot(self, req_id):
-        return self._slot
-
-    def pop_remote_spec_candidate_ids(self, req_id):
-        return self._candidates
 
 
 def _handle(trace, **kwargs):
@@ -595,69 +564,30 @@ def test_unprofiled_forward_never_reads_profile_metadata(monkeypatch, missing_st
     assert trace == ["submit", "forward"]
 
 
-def _loop(trace, kv_transfer, state):
-    output_processor = SimpleNamespace(
-        rid_to_state={"r0": state} if state is not None else {},
-        on_remote_prefill_done=lambda rid, tok, cached_tokens, logprob: trace.append(
-            ("bootstrap", tok)
-        ),
-        finish_remote_prefill_only_request=lambda rid: [],
-    )
-    return SimpleNamespace(
-        kv_transfer=kv_transfer,
-        output_processor=output_processor,
-    )
-
-
-def _decoding_state():
-    return SimpleNamespace(to_abort=False, finished=False)
-
-
 # ----------------------------------------------------------------------
 # PD completion: device writes belong to the data plane, in one submission.
 # ----------------------------------------------------------------------
 
 
-def test_remote_prefill_completion_lands_both_writes_on_the_device():
+def test_remote_prefill_landing_writes_both_on_the_device():
     trace: list = []
-    event = PD.RemotePrefillDoneEvent("r0", 42)
-    kv_transfer = _DecodeExecutor([event], slot=7, candidates=(7, [11, 12]))
-    state = _decoding_state()
-
-    hooks = PdTransferHooks(_loop(trace, kv_transfer, state), _handle(trace))
-    hooks.poll_transfer_events()
-
+    _handle(trace).run_remote_prefill_landing((7, [11, 12]), 7)
     # One crossing, not two, and the candidates precede the readiness arm:
     # hydration reads the row the candidates were just written into.
-    assert trace == [
-        ("bootstrap", 42),
-        "run",
-        ("candidates", 7, [11, 12]),
-        ("ready", 7),
-    ]
+    assert trace == ["run", ("candidates", 7, [11, 12]), ("ready", 7)]
 
 
-def test_completion_without_device_work_submits_nothing():
+def test_a_landing_without_device_work_submits_nothing():
     trace: list = []
-    event = PD.RemotePrefillDoneEvent("r0", 42)
-    kv_transfer = _DecodeExecutor([event], slot=None, candidates=None)
-    state = _decoding_state()
-
-    hooks = PdTransferHooks(_loop(trace, kv_transfer, state), _handle(trace))
-    hooks.poll_transfer_events()
-
-    assert trace == [("bootstrap", 42)]
+    _handle(trace).run_remote_prefill_landing(None, None)
+    assert trace == []
 
 
-def test_an_aborted_request_still_lands_its_candidates_but_is_not_armed():
+def test_an_aborted_request_lands_its_candidates_without_arming():
+    # The control plane passes no slot for a request aborted while its KV
+    # moved: the candidates still land, the slot is not armed.
     trace: list = []
-    event = PD.RemotePrefillDoneEvent("r0", 42)
-    kv_transfer = _DecodeExecutor([event], slot=7, candidates=(7, [11, 12]))
-    aborted = SimpleNamespace(to_abort=True, finished=False)
-
-    hooks = PdTransferHooks(_loop(trace, kv_transfer, aborted), _handle(trace))
-    hooks.poll_transfer_events()
-
+    _handle(trace).run_remote_prefill_landing((7, [11, 12]), None)
     assert trace == ["run", ("candidates", 7, [11, 12])]
 
 
@@ -993,7 +923,7 @@ def test_cache_polling_without_kvstore_refuses_loudly():
 def test_an_unrecognized_transfer_peer_is_refused():
     """The role is read off the peer at construction, so a peer of the wrong
     type is a startup error, not a surprise at the first transfer."""
-    with pytest.raises(TypeError, match="Disagg"):
+    with pytest.raises(TypeError, match="transfer peer"):
         _handle([], kv_transfer=SimpleNamespace())
 
 
@@ -1166,54 +1096,7 @@ def test_gather_resolves_the_decode_delta_on_the_live_struct():
 
 
 # ----------------------------------------------------------------------
-# SHM release: freed behind any forward that captured the features.
-# ----------------------------------------------------------------------
-
-
-def test_shm_release_is_queued_behind_the_forwards_that_may_read_it():
-    from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
-
-    trace: list = []
-    released: list = []
-    processor = OutputProcesser(
-        send_to_tokenizer=lambda *a, **k: None,
-        metrics=SimpleNamespace(),
-        defer_to_device=_handle(trace).run_multimodal_work,
-    )
-    state = SimpleNamespace(
-        has_pending_multimodal_features=lambda: True,
-        release_pending_multimodal_features=lambda: released.append("released"),
-    )
-
-    processor._release_multimodal_features(state)
-
-    assert trace == ["submit"]
-    assert released == ["released"]
-
-
-def test_a_request_with_no_pending_features_releases_inline():
-    from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
-
-    trace: list = []
-    released: list = []
-    processor = OutputProcesser(
-        send_to_tokenizer=lambda *a, **k: None,
-        metrics=SimpleNamespace(),
-        defer_to_device=_handle(trace).run_multimodal_work,
-    )
-    state = SimpleNamespace(
-        has_pending_multimodal_features=lambda: False,
-        release_pending_multimodal_features=lambda: released.append("released"),
-    )
-
-    processor._release_multimodal_features(state)
-
-    assert trace == []
-    assert released == ["released"]
-
-
-# ----------------------------------------------------------------------
-# The opt-in dispatch guard: device work on the control thread raises.
+# The dispatch guard: device work on the pump thread raises.
 # ----------------------------------------------------------------------
 
 
@@ -1310,37 +1193,6 @@ def test_epd_receive_allocation_crosses_through_the_runner(monkeypatch):
 
     assert len(ran) == 1  # exactly the recv-buffer allocation
     assert job._items[0].recv_main.shape == (4, 8)
-
-
-def test_prefill_usage_hook_records_committed_totals_and_skips_retired_requests():
-    from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
-
-    recorded = []
-    logprobs = []
-    transfer = object.__new__(DisaggPrefillExecutor)
-    transfer.senders = {"hit": SimpleNamespace(bootstrap_room=9)}
-    transfer.kv_manager = SimpleNamespace(
-        record_cached_tokens=lambda room, count: recorded.append((room, count)),
-        record_bootstrap_logprob=lambda room, lp: logprobs.append((room, lp)),
-    )
-    state = SimpleNamespace(cached_tokens=1280, output_token_logprobs_val=[])
-    loop = SimpleNamespace(
-        kv_transfer=transfer,
-        output_processor=SimpleNamespace(rid_to_state={"hit": state}),
-    )
-    hooks = PdTransferHooks(loop, None)
-    hooks.record_prefill_usage(["hit", "retired"])
-    # An intermediate chunk has no bootstrap token yet; the final chunk's
-    # commit appends it with its logprob, which then rides the status message.
-    assert logprobs == []
-    state.cached_tokens = 1536
-    state.output_token_logprobs_val = [-0.75]
-    hooks.record_prefill_usage(["hit"])
-    assert recorded == [(9, 1280), (9, 1536)]
-    assert logprobs == [(9, -0.75)]
-    loop.kv_transfer = None
-    hooks.record_prefill_usage(["hit"])
-    assert recorded == [(9, 1280), (9, 1536)]
 
 
 def test_expert_load_reset_and_dump_ride_the_data_plane_on_the_execution_stream(
@@ -1621,11 +1473,16 @@ class _SleepExecutor:
         self.token_to_kv_pool = _SleepPool(trace)
 
 
-class _RegisteringDecodePeer(DisaggDecodeExecutor):
-    """A decode-role peer; the real ``__init__`` (sockets, engine) is bypassed."""
+class _RegisteringDecodePeer:
+    """A decode-role peer: what a sleep release asks of it."""
+
+    mode = "decode"
 
     def __init__(self, trace) -> None:
         self._trace = trace
+
+    def execute(self, op) -> None:
+        self._trace.append(("receive", op))
 
     def release_cache_registration(self) -> None:
         self._trace.append("peer.deregister")

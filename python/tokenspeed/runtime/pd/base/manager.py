@@ -28,7 +28,6 @@ from functools import cache
 import zmq
 
 from tokenspeed.runtime.pd.base.status import TransferPoll
-from tokenspeed.runtime.utils.network import join_host_port
 
 
 def enable_ipv6_for_endpoint(sock: zmq.Socket, endpoint: str) -> None:
@@ -96,20 +95,6 @@ class DisaggManagerBase:
 
     def get_session_id(self) -> str:
         return self.engine.get_session_id()
-
-    def bind_server_socket(self, host: str) -> None:
-        """Bind the control socket to ``host`` on a port the OS picks in the
-        same call, and store that port in ``rank_port``.
-
-        A port probed before the bind could be taken by then, and an IPv4 probe
-        does not see a port held on IPv6.
-        """
-        endpoint = f"tcp://{join_host_port(host, '*')}"
-        enable_ipv6_for_endpoint(self.server_socket, endpoint)
-        self.server_socket.bind(endpoint)
-        # The bound endpoint, such as "tcp://[::1]:40123".
-        bound = self.server_socket.getsockopt_string(zmq.LAST_ENDPOINT)
-        self.rank_port = int(bound.rsplit(":", 1)[1])
 
     @cache
     def _connect(self, endpoint: str):

@@ -20,103 +20,10 @@
 
 from __future__ import annotations
 
-from tokenspeed.runtime.metrics.collector import KVTransferMetrics
-from tokenspeed.runtime.metrics.service import metrics_service
 from tokenspeed.runtime.pd.base.bootstrap import DisaggBootstrapServerBase
-from tokenspeed.runtime.pd.base.manager import DisaggManagerBase
-from tokenspeed.runtime.pd.base.mooncake_engine import (
-    MooncakeTransferEngine,
-)
 from tokenspeed.runtime.pd.cache_protocol import (
     CacheTransferContract,
 )
-from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
-from tokenspeed.runtime.pd.utils import DisaggregationMode
-from tokenspeed.runtime.utils.network import get_local_ip_by_remote
-
-
-class MooncakeKVManagerBase(DisaggManagerBase):
-    """CachePD manager: shared engine/socket/status state and typed slabs."""
-
-    def __init__(
-        self,
-        args: KVManagerArgs,
-        kv_args: KVArgs,
-        disaggregation_mode: DisaggregationMode,
-    ):
-        self.kv_args = kv_args
-        self.topology = args.topology
-        self.disaggregation_mode = disaggregation_mode
-        self.bootstrap_port = args.bootstrap_port
-        self.dist_init_addr = args.dist_init_addr
-        if not args.enable_dp_attention and self.topology.dp_size != 1:
-            raise ValueError(
-                "If dp_attention is not enabled, dp size must be 1 in disaggregation mode."
-            )
-
-        self.kv_transfer_metrics = KVTransferMetrics(
-            labels={
-                "model_name": args.served_model_name,
-                "app_key": args.app_key or "",
-            },
-            enabled=args.enable_metrics,
-            reporters=args.metrics_reporters,
-            event_sink=metrics_service.get_event_sink(),
-        )
-
-        # Build the Mooncake data-plane engine here and inject it into the
-        # transfer manager. self.kv_args is set above so register_buffer_to_engine
-        # (called by the base) sees the KV buffers.
-        engine = MooncakeTransferEngine(
-            hostname=get_local_ip_by_remote(),
-            gpu_id=kv_args.gpu_id,
-            ib_device=kv_args.ib_device,
-        )
-        super().__init__(engine=engine)
-
-    def _registration_regions(self) -> tuple[tuple[int, int], ...]:
-        layout = self.kv_args.cache_layout
-        return self.kv_args.registration_regions or (
-            (self.kv_args.kv_data_ptr, layout.plan.arena_bytes),
-        )
-
-    def register_buffer_to_engine(self):
-        for pointer, size in self._registration_regions():
-            self.engine.register(pointer, size)
-
-    def deregister_buffer_from_engine(self) -> None:
-        """Deregister the cache arena before a sleep release unmaps it.
-
-        A registration pins the physical pages under the arena's virtual
-        range; the memory saver frees exactly those pages.
-        """
-        failed = [
-            pointer
-            for pointer, _ in self._registration_regions()
-            if self.engine.deregister(pointer) != 0
-        ]
-        if failed:
-            raise RuntimeError(
-                f"Mooncake failed to deregister {len(failed)} cache region(s) "
-                "before the memory release"
-            )
-
-    def restore_buffer_registration(self) -> None:
-        """Register the cache arena again after a wake re-maps it.
-
-        The virtual range is unchanged, so every published address stays
-        valid; only the new physical pages need registering.
-        """
-        failed = [
-            pointer
-            for pointer, size in self._registration_regions()
-            if self.engine.register(pointer, size) != 0
-        ]
-        if failed:
-            raise RuntimeError(
-                f"Mooncake failed to register {len(failed)} cache region(s) "
-                "after the memory resume"
-            )
 
 
 class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):

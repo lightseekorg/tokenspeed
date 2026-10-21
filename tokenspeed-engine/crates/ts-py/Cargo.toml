@@ -1,0 +1,25 @@
+[package]
+name = "ts-py"
+description = "Python bindings over ts-client: the frontend of the Python Engine API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+# The extension module `tokenspeed_engine._native`; the package around it is
+# `python/tokenspeed_engine` (see `tokenspeed-engine/pyproject.toml`).
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bytes.workspace = true
+pyo3 = "0.30"
+pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+ts-client = { path = "../ts-client" }
+ts-wire = { path = "../ts-wire" }
+
+[lints]
+workspace = true

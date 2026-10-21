@@ -20,11 +20,13 @@
 
 """The per-rank forward thread: the engine's single data plane.
 
-The event loop is the CONTROL plane: ZMQ input, gloo collectives, the C++
-scheduler, and commit post-processing. Dispatching a round never waits on
+The CONTROL plane is the rank's Rust host (``ts-host``): the frontend wire,
+the cross-rank collectives, the C++ scheduler, and commit post-processing.
+It reaches the data plane through ``DeviceHandle``, called from the host's
+pump thread (``engine/rust_host.py``). Dispatching a round never waits on
 the GPU — it submits and moves on, and only commit joins — so a round is
 microseconds and the cross-rank collectives that keep the redundant
-schedulers aligned (request broadcast, DP sync) always find every rank
+schedulers aligned (request relay, DP sync) always find every rank
 promptly, no matter how deep the GPUs are in queued work. (``DeviceHandle``
 does have blocking ``run_*`` operations, but only on rounds that dispatch
 nothing — the DP idle forward — or off the round path entirely.)
@@ -80,23 +82,22 @@ this becomes a process the interface is already the whole interface.
 4. Device-side state is not reachable from the control plane at all. The
    execution stream, ``runtime_states``, ``input_buffers``, and every
    attention backend's forward metadata live behind ``DeviceHandle``
-   (``device.py``), which is what the event loop holds instead of the
-   executor and which hands back no device object at all. Rules 1 and 2 are
+   (``device.py``), which is what the control plane's pump holds instead
+   of the executor and which hands back no device object at all. Rules 1 and 2 are
    enforced by that shape rather than by anyone remembering them: what the
    loop cannot see, it cannot pass implicitly or mutate afterwards.
 
 5. Two registered exceptions — and new ones belong in this list, not in a
    comment at the call site:
 
-   - Grammar matchers. ``GrammarStepInputs.grammars`` holds the control
-     plane's live matcher objects, and ownership is split by path. Under
-     capturable grammar the side-stream hostfunc advances them and the
-     commit path deliberately does not; under eager grammar the data plane
-     reads them during the fill and the commit path advances them, so the
-     loop drains its in-flight queue before dispatching a grammar batch
-     (``EventLoop._dispatch_depends_on_pending_commit`` is the registry of
-     those drain rules). Copying a matcher per round is not free, which is
-     why this stays an exception rather than becoming rule 2.
+   - Grammar matchers. ``GrammarStepInputs.grammars`` holds handles to the
+     control plane's live matchers (``HostGrammar``), and ownership is split
+     by path. Under capturable grammar the side-stream hostfunc advances
+     them and the commit path deliberately does not; under eager grammar the
+     data plane reads them during the fill and the commit path advances
+     them, so the control plane commits its in-flight forwards before
+     dispatching a grammar batch. Copying a matcher per round is not free,
+     which is why this stays an exception rather than becoming rule 2.
 
    - Multimodal items. The gather's snapshot is shallow on purpose: the
      ``MultimodalDataItem`` objects stay shared, and the data plane WRITES

@@ -1,0 +1,15 @@
+[package]
+name = "ts-mooncake"
+description = "The Mooncake transfer engine through tokenspeed-mooncake's C entry points, loaded at run time"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+libloading = "0.9"
+thiserror.workspace = true
+
+[lints]
+workspace = true

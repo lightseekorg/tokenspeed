@@ -1906,7 +1906,7 @@ class ModelExecutor:
     def execute_idle_forward(self, dp_metadata: DpForwardMetadata):
         """Run a zero-token forward so this rank participates in NCCL collectives.
 
-        Called by the EventLoop when this DP rank has no work but other
+        Called by the control plane when this DP rank has no work but other
         ranks do. The MoE all-to-all is a collective that requires ALL
         ranks to participate.
         """

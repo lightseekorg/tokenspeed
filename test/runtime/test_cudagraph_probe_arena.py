@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import functools
 import pathlib
 import sys
 from types import SimpleNamespace
@@ -44,6 +45,7 @@ from tokenspeed.runtime.execution.cudagraph_memory import (  # noqa: E402
 )
 from tokenspeed.runtime.layers.attention import registry  # noqa: E402
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import setup  # noqa: E402
+from tokenspeed.runtime.pd.host_peer import build_host_peer  # noqa: E402
 
 RUNTIME = pathlib.Path(__file__).resolve().parents[2] / "python/tokenspeed/runtime"
 
@@ -450,6 +452,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
             overlap_schedule_depth=0,
             decode_input_tokens=1,
             max_batch_size=8,
+            kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
         )
     return charged, set(reads), stack[0]
 

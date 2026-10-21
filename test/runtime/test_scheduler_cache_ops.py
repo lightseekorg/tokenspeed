@@ -39,12 +39,9 @@ from tokenspeed.runtime.cache.transfer.ops import (  # noqa: E402
 )
 from tokenspeed.runtime.engine import scheduler_utils  # noqa: E402
 from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
-    cache_event_from_payload,
-    cache_event_key,
     cache_event_to_payload,
     cache_ops_from_plan,
     make_config,
-    pop_common_cache_event_payloads,
 )
 
 
@@ -181,34 +178,16 @@ def test_plan_adapter_rejects_ragged_batches_and_unknown_kinds(wire):
 @pytest.mark.parametrize(
     "kind", ["WriteBackDoneEvent", "SnapshotDoneEvent", "RestoreDoneEvent"]
 )
-def test_cache_acks_round_trip_the_rank_sync_payload(kind):
+def test_cache_acks_become_the_payload_the_host_reads(kind):
     event = getattr(ts.Cache, kind)()
     event.op_id = 42
-    payload = cache_event_to_payload(event)
-    assert payload == {"kind": kind, "op_id": 42}
-    assert cache_event_key(payload) == (kind, 42)
-    rebuilt = cache_event_from_payload(payload)
-    assert type(rebuilt).__name__ == kind and rebuilt.op_id == 42
-    # The rebuilt event is what advance_scheduler hands the binding.
-    ts.ExecutionEvent().add_event(rebuilt)
+    assert cache_event_to_payload(event) == {"kind": kind, "op_id": 42}
 
 
-def test_load_back_and_prefetch_acks_round_trip():
+def test_load_back_acks_become_payloads():
     # A load-back lands or does not happen: no outcome on the ACK.
     payload = cache_event_to_payload(ts.Cache.LoadBackDoneEvent(7))
     assert payload == {"kind": "LoadBackDoneEvent", "op_id": 7}
-    assert cache_event_from_payload(payload).op_id == 7
-    with pytest.raises(ValueError, match="Unsupported cache event type"):
-        cache_event_from_payload({"kind": "RetractDoneEvent", "op_id": 1})
-
-
-def test_replica_intersection_is_per_kind_and_op_id():
-    snapshot = {"kind": "SnapshotDoneEvent", "op_id": 3}
-    restore = {"kind": "RestoreDoneEvent", "op_id": 3}
-    write = {"kind": "WriteBackDoneEvent", "op_id": 3}
-    assert pop_common_cache_event_payloads([[snapshot, restore], [restore, write]]) == [
-        restore
-    ]
 
 
 def _config(**overrides):

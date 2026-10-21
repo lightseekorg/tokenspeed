@@ -261,12 +261,31 @@ def test_pp_layer_window_filters_fragments():
     assert {f.field_id for f in frags0} | {f.field_id for f in frags1} == all_fields
 
 
+def _route(kv_mgr, info) -> SimpleNamespace:
+    """A Decode rank's route to a Prefill deployment (what its host peer plans,
+    ``HostDecodePeer.plan_route``)."""
+    from tokenspeed.runtime.pd.transfer_plan import build_pipeline_transfer_plan
+
+    plan, dummy = build_pipeline_transfer_plan(
+        prefill_tp_size=info.prefill_tp_size_per_dp_rank,
+        decode_tp_size=kv_mgr.topology.tp_size,
+        decode_tp_rank=kv_mgr.topology.tp_rank,
+        prefill_layout=info.cache_layout,
+        decode_layout=kv_mgr.kv_args.cache_layout,
+        cache_fields_by_stage=info.cache_fields_by_stage,
+    )
+    return SimpleNamespace(
+        transfer_plan=plan,
+        dummy_tp_ranks=dummy,
+        target_tp_ranks=tuple(sorted((*plan.target_prefill_ranks, *dummy))),
+    )
+
+
 def test_pp_receiver_calc_merges_stage_routes():
     """Decode's route plan spans pp*tp source ranks with disjoint fields."""
     from types import SimpleNamespace
 
     from tokenspeed.runtime.pd.mooncake.decode import PrefillParallelInfo
-    from tokenspeed.runtime.pd.mooncake.receiver import _calc
 
     layout = _paged_layout(
         local_heads=4, global_heads=4, page_stride=4096, page_zero_offset=128
@@ -283,7 +302,7 @@ def test_pp_receiver_calc_merges_stage_routes():
         pp_size=2,
     )
     assert info.prefill_tp_size_per_dp_rank == 1
-    plan = _calc(kv_mgr, info)
+    plan = _route(kv_mgr, info)
     frags = plan.transfer_plan.fragments_by_prefill_rank
     # Stage-major dense ranks: stage0 -> rank 0 (layer.0), stage1 -> rank 1 (layer.1).
     assert set(frags) == {0, 1}
@@ -296,7 +315,6 @@ def test_pp_receiver_calc_honors_layer_partition():
     from types import SimpleNamespace
 
     from tokenspeed.runtime.pd.mooncake.decode import PrefillParallelInfo
-    from tokenspeed.runtime.pd.mooncake.receiver import _calc
 
     # Three layers so partition (1, 2) differs from the even split (2, 1).
     layout = make_layout(
@@ -331,7 +349,7 @@ def test_pp_receiver_calc_honors_layer_partition():
             cache_layout=layout,
             pp_size=2,
         )
-        frags = _calc(kv_mgr, info).transfer_plan.fragments_by_prefill_rank
+        frags = _route(kv_mgr, info).transfer_plan.fragments_by_prefill_rank
         return {rank: {f.field_id for f in fields} for rank, fields in frags.items()}
 
     # Even split (partition None): stage0 gets layers 0-1, stage1 layer 2.
@@ -537,7 +555,9 @@ def test_equal_tp_sharded_route_sends_through_the_pages_api():
 
     def grids(rank):
         items = next(
-            _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
+            _blocks(
+                prefill_layout,
+                src_ptr,
                 dst_tp_rank=0,
                 dst_ptr=dst_ptr,
                 src_block_manifest=source_manifest,
@@ -708,12 +728,14 @@ def _copies(items) -> list[tuple[int, int, int]]:
     return copies
 
 
-def _sender(layout, src_ptr: int):
-    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
+def _blocks(layout, src_ptr: int, **kwargs):
+    """A Prefill rank's copies of one request's blocks (what its host peer
+    plans), over a pool of ``layout`` at ``src_ptr``."""
+    from tokenspeed.runtime.pd.mooncake.prefill import cache_transfer_blocks
 
-    manager = object.__new__(MooncakeKVManagerPrefill)
-    manager.kv_args = SimpleNamespace(cache_layout=layout, kv_data_ptr=src_ptr)
-    return manager
+    return cache_transfer_blocks(
+        SimpleNamespace(cache_layout=layout, kv_data_ptr=src_ptr), **kwargs
+    )
 
 
 def _hybrid_layout(*, local_kda_heads: int, shard_count: int):
@@ -764,7 +786,9 @@ def test_every_target_rank_of_a_hybrid_route_can_send_with_its_own_decisions():
                 assert decisions["history"] is None
             copies = _copies(
                 next(
-                    _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
+                    _blocks(
+                        prefill_layout,
+                        src_ptr,
                         dst_tp_rank=0,
                         dst_ptr=dst_ptr,
                         src_block_manifest=source_manifest,
@@ -838,7 +862,9 @@ def test_pipeline_stage_without_a_sharded_group_decides_none_and_sends_rest():
     src_ptr, dst_ptr = 0x10000, 0x20000
     copies = _copies(
         next(
-            _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
+            _blocks(
+                prefill_layout,
+                src_ptr,
                 dst_tp_rank=0,
                 dst_ptr=dst_ptr,
                 src_block_manifest=block_manifest(
@@ -862,7 +888,6 @@ def test_receiver_calc_targets_every_rank_of_a_sharded_prefill():
     from types import SimpleNamespace
 
     from tokenspeed.runtime.pd.mooncake.decode import PrefillParallelInfo
-    from tokenspeed.runtime.pd.mooncake.receiver import _calc
 
     kv_mgr = SimpleNamespace(
         topology=SimpleNamespace(tp_size=1, tp_rank=0),
@@ -875,7 +900,7 @@ def test_receiver_calc_targets_every_rank_of_a_sharded_prefill():
         cache_layout=_latent_layout(shard_count=4),
     )
 
-    route = _calc(kv_mgr, info)
+    route = _route(kv_mgr, info)
 
     assert route.target_tp_ranks == (0, 1, 2, 3)
     assert route.dummy_tp_ranks == ()

@@ -81,7 +81,7 @@ from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
 from tokenspeed_kernel.platform import current_platform
@@ -123,9 +123,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
-        CacheMemoryPlan,
-    )
     from tokenspeed.runtime.layers.attention.registry import AttentionBuild
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -622,7 +619,7 @@ class DeviceHandle:
 
         Yields the scheduler's ACK kinds -- ``WriteBackDoneEvent``,
         ``LoadBackDoneEvent``, ``SnapshotDoneEvent``, ``RestoreDoneEvent`` --
-        for ``CacheOpHooks`` to replica-intersect and the loop to advance.
+        for the control plane to replica-intersect and advance.
 
         Stays on the control plane deliberately: completion is CUDA event
         queries plus queue drains (serialized against the data-plane submit
@@ -765,6 +762,17 @@ class DeviceHandle:
 
         self._thread.submit(_logged)
         return None
+
+    def release_grammars(self, grammars: Sequence[Any]) -> None:
+        """Drop the data plane's holds on host-owned grammar matchers
+        (``HostGrammar.release``), behind the queued forwards that still
+        fill bitmasks from them."""
+
+        def _release():
+            for grammar in grammars:
+                grammar.release()
+
+        self._thread.submit(_release)
 
     # ------------------------------------------------------------------
     # Memory-saver release/wake (see engine/memory_occupation.py)
@@ -1069,8 +1077,8 @@ def arm_data_plane_sync_debug(device: str) -> None:
 
     Startup synchronizes on purpose -- weight loading, tuning, graph capture,
     the PD transfer and L2 executor builders, the EPD admission's NCCL
-    warm-up in ``EventLoop.__init__`` -- so the loop arms the mode as its
-    very last step before entering the round loop. It is process-wide:
+    warm-up in the rank's bootstrap -- so the rank arms the mode as its
+    very last step before serving. It is process-wide:
     the control plane's ``copy_event.synchronize()`` and non-blocking D2H
     copies are not flagged, so what it reports is exactly the host
     synchronization that serializes the data plane against the step in
@@ -1282,6 +1290,7 @@ def build_device_side(
     overlap_schedule_depth: int,
     decode_input_tokens: int,
     max_batch_size: int,
+    kv_transfer_builder,
 ) -> DeviceBuild:
     """Construct the whole device side and return the three views of it.
 
@@ -1312,6 +1321,10 @@ def build_device_side(
         max_batch_size: Rank-local scheduler batch bound; the executor
             sizes its request pool one row past it for the graph-padding
             sink row.
+        kv_transfer_builder: Builds the PD transfer peer from the finished
+            attention build, or returns None outside disaggregation: the
+            host's ``build_host_peer`` (``pd/host_peer.py``), bound to the
+            outbox its Rust peer reads.
 
     Returns:
         A ``DeviceBuild``. No device object escapes except inside the
@@ -1567,7 +1580,7 @@ def build_device_side(
             draft_attention_backend_name=attention.draft_attention_backend_name,
         )
 
-    kv_transfer = _build_kv_transfer(
+    kv_transfer = kv_transfer_builder(
         server_args,
         executor,
         cache_fields_by_stage=attention.cache_fields_by_stage,
@@ -1578,6 +1591,7 @@ def build_device_side(
         gpu_id=gpu_id,
         global_rank=global_rank,
     )
+    _arm_layerwise_streaming(server_args, executor, kv_transfer, gpu_id)
 
     spec_num_steps, spec_num_tokens = speculative_widths(
         executor.config.spec_algo,
@@ -1641,6 +1655,19 @@ def build_device_side(
     )
 
 
+@runtime_checkable
+class TransferPeer(Protocol):
+    """What ``DeviceHandle`` asks of a PD transfer peer.
+
+    ``mode`` is the peer's role, a ``DeviceRole`` value (``"prefill"`` or
+    ``"decode"``); ``execute`` takes the plan's remote stream of that role.
+    """
+
+    mode: str
+
+    def execute(self, op) -> None: ...
+
+
 def _only_aliases_inputs(func) -> bool:
     """Whether ``func`` is a metadata-only op: every output aliases an input.
 
@@ -1665,9 +1692,10 @@ class _NoDeviceWork(TorchDispatchMode):
     """Raise on any torch op that puts device work on this thread.
 
     Thread-local by construction (dispatch modes are per-thread stacks), so
-    pushing it on the control-plane thread bans device work THERE while the
-    forward thread runs free — the per-thread "no CUDA context" that CUDA's
-    process-wide primary context cannot give us.
+    pushing it on the Rust host's pump thread -- the control plane's one way
+    into Python -- bans device work THERE while the forward thread runs free:
+    the per-thread "no CUDA context" that CUDA's process-wide primary context
+    cannot give us.
 
     Deliberately porous in exactly the shape of the contract:
 
@@ -1718,13 +1746,13 @@ class _NoDeviceWork(TorchDispatchMode):
 
 
 def maybe_control_plane_guard():
-    """The event loop's enforcement of Principle 1, on by default.
+    """The pump thread's enforcement of Principle 1, on by default.
 
     ``TOKENSPEED_GUARD_CONTROL_PLANE=0`` disables it — the escape hatch for a
     deployment that trips on a control-plane device op we have not routed
     yet; please report such a trip rather than living with the flag. The
     cost while enabled is the dispatch-mode hook (~10us) on each of the
-    control plane's few CPU tensor ops per round.
+    pump's few CPU tensor ops per round.
 
     Returns:
         A context manager: the guard mode unless disabled, else a null
@@ -1739,14 +1767,12 @@ def _resolve_role(kv_transfer) -> DeviceRole:
     """Read the engine's role off its transfer peer. Fixed for the process."""
     if kv_transfer is None:
         return DeviceRole.PLAIN
-    from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
-    from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
-
-    if isinstance(kv_transfer, DisaggDecodeExecutor):
-        return DeviceRole.PD_DECODE
-    if isinstance(kv_transfer, DisaggPrefillExecutor):
-        return DeviceRole.PD_PREFILL
-    raise TypeError("kv_transfer must be a Disagg{Prefill,Decode}Executor.")
+    if not isinstance(kv_transfer, TransferPeer):
+        raise TypeError("kv_transfer must be a prefill or decode transfer peer")
+    role = DeviceRole(kv_transfer.mode)
+    if role is DeviceRole.PLAIN:
+        raise TypeError("kv_transfer must be a prefill or decode transfer peer")
+    return role
 
 
 def _supports_pd_layerwise_finalization(executor, mapping) -> bool:
@@ -1764,80 +1790,17 @@ def _supports_pd_layerwise_finalization(executor, mapping) -> bool:
     return writer is not None and writer.supports_pd_layerwise_finalization
 
 
-def _build_kv_transfer(
-    server_args,
-    executor,
-    *,
-    cache_fields_by_stage: tuple[tuple[str, ...], ...],
-    producer_fields_by_step: tuple[tuple[str, ...], ...],
-    logical_plan: CacheMemoryPlan | None,
-    model_config,
-    draft_model_config,
-    gpu_id: int,
-    global_rank: int,
-):
-    """Build the PD transfer peer, or None outside disaggregation.
-
-    Here rather than in the event loop because everything it needs is either
-    ``server_args`` or the completed attention build: the topology comes from
-    the mapping, the sync group from the process-group manager, and the
-    peer-facing KV description from the pool and explicit cache placement.
-    """
-    if server_args.disaggregation_mode == "null":
-        return None
-
-    from tokenspeed.runtime.distributed.process_group_manager import (
-        process_group_manager as pg_manager,
-    )
-    from tokenspeed.runtime.pd.factory import create_kv_transfer, get_kv_args
-    from tokenspeed.runtime.pd.mooncake.entities import KVManagerArgs
-    from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
-    from tokenspeed.runtime.pd.topology import PDParallelTopology
-
-    mapping = server_args.mapping
-    topology = PDParallelTopology.from_mapping(mapping)
-
-    # PP: transfer-status consensus must span every stage — all ranks run the
-    # same deterministic scheduler and must agree on Bootstrapped/Succeeded
-    # events, and the KV for one request is produced by pp*tp ranks together.
-    sync_group = pg_manager.get_process_group(
-        "gloo", mapping.world_group if mapping.has_pp else mapping.attn.tp_group
-    )
-    kv_transfer = create_kv_transfer(
-        mode=server_args.disaggregation_mode,
-        backend=server_args.disaggregation_transfer_backend,
-        args=KVManagerArgs(
-            bootstrap_port=server_args.disaggregation_bootstrap_port,
-            dist_init_addr=server_args.dist_init_addr,
-            topology=topology,
-            enable_metrics=server_args.enable_metrics,
-            served_model_name=server_args.served_model_name,
-            app_key=server_args.app_key,
-            metrics_reporters=server_args.metrics_reporters,
-            enable_dp_attention=mapping.has_attn_dp,
-        ),
-        kv_args=get_kv_args(
-            global_rank,
-            gpu_id,  # local CUDA index; new threads do not inherit current_device
-            server_args.disaggregation_ib_device,
-            executor.token_to_kv_pool,
-            model_config=model_config,
-            draft_model_config=draft_model_config,
-            cache_fields_by_stage=cache_fields_by_stage,
-            producer_fields_by_step=producer_fields_by_step,
-            logical_plan=logical_plan,
-        ),
-        gloo_group=sync_group,
-    )
+def _arm_layerwise_streaming(server_args, executor, kv_transfer, gpu_id: int) -> None:
+    """P-side layerwise KV streaming: one counter, ticked by the attention
+    backends as each layer's KV lands and read by the transfer peer, whichever
+    builder made it."""
     interval = server_args.disaggregation_layerwise_interval
-    if isinstance(kv_transfer, DisaggPrefillExecutor) and interval > 0:
-        # P-side layerwise KV streaming: one counter, ticked by the attention
-        # backends as each layer's KV lands and read by the sender.
-        from tokenspeed.runtime.pd.utils import StepCounter
+    if kv_transfer is None or kv_transfer.mode != "prefill" or interval <= 0:
+        return
+    from tokenspeed.runtime.pd.utils import StepCounter
 
-        step_counter = StepCounter(executor.device, gpu_id)
-        executor.attn_backend.register_step_counter(step_counter)
-        if executor.draft_attn_backend is not None:
-            executor.register_draft_final_step_counter(step_counter)
-        kv_transfer.register_layerwise_step_counter(step_counter, interval)
-    return kv_transfer
+    step_counter = StepCounter(executor.device, gpu_id)
+    executor.attn_backend.register_step_counter(step_counter)
+    if executor.draft_attn_backend is not None:
+        executor.register_draft_final_step_counter(step_counter)
+    kv_transfer.register_layerwise_step_counter(step_counter, interval)

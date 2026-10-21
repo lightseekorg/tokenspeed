@@ -1,0 +1,28 @@
+[package]
+name = "ts-host"
+description = "One TokenSpeed engine rank: the Rust control plane, with the data plane in an embedded interpreter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+pyo3 = "0.30"
+serde_json = "1"
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ts-collective = { path = "../ts-collective" }
+ts-control = { path = "../ts-control" }
+ts-grammar = { path = "../ts-grammar" }
+ts-metrics = { path = "../ts-metrics" }
+ts-mooncake = { path = "../ts-mooncake" }
+ts-pd = { path = "../ts-pd" }
+ts-scheduler = { path = "../ts-scheduler" }
+ts-wire = { path = "../ts-wire" }
+
+[lints]
+workspace = true

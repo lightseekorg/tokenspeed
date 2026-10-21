@@ -1,3 +1,4 @@
+import functools
 import os
 import sys
 from dataclasses import fields, replace
@@ -51,6 +52,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
 )
 from tokenspeed.runtime.layers.attention.registry import _prepare_fixed_workspaces
+from tokenspeed.runtime.pd.host_peer import build_host_peer  # noqa: E402
 
 register_cuda_ci(
     est_time=10,
@@ -1562,6 +1564,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
             overlap_schedule_depth=0,
             decode_input_tokens=1,
             max_batch_size=8,
+            kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
         )
     budget, rows = sized.value.args
     assert (rows is not None) == probe

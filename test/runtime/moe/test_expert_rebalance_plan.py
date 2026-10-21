@@ -34,12 +34,7 @@ import time
 import pytest
 import torch
 
-from tokenspeed.runtime.moe.expert_rebalance import (
-    SlotMoves,
-    chunk_layer_ids,
-    expected_balancedness,
-    plan_slot_moves,
-)
+from tokenspeed.runtime.moe.expert_rebalance import SlotMoves, plan_slot_moves
 
 
 def _random_rows(rng: random.Random, num_logical: int, num_physical: int):
@@ -270,22 +265,3 @@ def test_plan_rejects_inconsistent_geometry():
         plan_slot_moves([0, 1], [1, 0], ep_rank=0, ep_rank_nodes=(0, 0), num_local=1),
         SlotMoves,
     )
-
-
-def test_chunks_and_expected_balancedness():
-    assert chunk_layer_ids(5, 2) == [(0, 1), (2, 3), (4,)]
-    assert chunk_layer_ids(3, 3) == [(0, 1, 2)]
-    with pytest.raises(ValueError, match="layers_per_chunk"):
-        chunk_layer_ids(3, 4)
-    with pytest.raises(ValueError, match="layers_per_chunk"):
-        chunk_layer_ids(3, 0)
-    # A hot expert replicated across both ranks evens out the rank loads.
-    load = torch.tensor([[12, 2, 2, 2]])
-    assert expected_balancedness(load, torch.tensor([[0, 1, 2, 3]]), 2).tolist() == [
-        pytest.approx(9 / 14)
-    ]
-    # Two replicas of the hot expert: rank loads 6+2+2 and 2+6+2 (replicas
-    # split the expert's load evenly), 9 / 10.
-    assert expected_balancedness(
-        load, torch.tensor([[0, 1, 2, 3, 0, 3]]), 2
-    ).tolist() == [pytest.approx(0.9)]

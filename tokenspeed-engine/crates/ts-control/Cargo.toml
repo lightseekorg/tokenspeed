@@ -1,0 +1,31 @@
+[package]
+name = "ts-control"
+description = "The TokenSpeed engine's control plane: request state, the scheduling loop, outputs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+serde_json = "1"
+crc32fast = "1"
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+ts-collective = { path = "../ts-collective" }
+ts-grammar = { path = "../ts-grammar" }
+ts-metrics = { path = "../ts-metrics" }
+ts-scheduler = { path = "../ts-scheduler" }
+ts-wire = { path = "../ts-wire" }
+zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport", "ipc-transport"] }
+
+[dev-dependencies]
+pyo3 = "0.30"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+ts-client = { path = "../ts-client" }
+
+[lints]
+workspace = true

@@ -51,13 +51,12 @@ register_cuda_ci(
 from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
     ForwardOutputLayout,
 )
+from tokenspeed.runtime.grammar.base_grammar_backend import (  # noqa: E402
+    BaseGrammarObject,
+)
 from tokenspeed.runtime.grammar.capturable_grammar import (  # noqa: E402
     CapturableGrammarExecutor,
     _fill_eager_bitmask,
-)
-from tokenspeed.runtime.grammar.xgrammar_backend import (  # noqa: E402
-    XGrammarGrammar,
-    keep_gil_in_matcher_calls,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -76,15 +75,47 @@ for _id, _text in ((BRACE, "}"), (C, "c"), (BC, "bc")):
 W = 4
 
 
+class _Grammar(BaseGrammarObject):
+    """A real xgrammar matcher behind the grammar interface the data plane
+    drives (in serving, ``HostGrammar`` over the matcher the Rust host owns)."""
+
+    def __init__(self, matcher) -> None:
+        self.matcher = matcher
+        self.stop_token_ids = frozenset(matcher.stop_token_ids)
+        self.finished = False
+
+    def is_terminated(self) -> bool:
+        return self.matcher.is_terminated()
+
+    def accept_token(self, token: int) -> None:
+        if not self.is_terminated() and not self.matcher.accept_token(token):
+            raise ValueError(f"Tokens not accepted: {token}")
+
+    def try_accept_token(self, token: int) -> bool:
+        return not self.is_terminated() and self.matcher.accept_token(token)
+
+    def rollback(self, k: int) -> None:
+        self.matcher.rollback(k)
+
+    def fill_vocab_mask(self, vocab_mask, idx: int) -> None:
+        self.matcher.fill_next_token_bitmask(vocab_mask, idx)
+
+    def fill_vocab_masks_along_drafts(
+        self, vocab_masks, draft_tokens, next_node, next_sibling
+    ) -> None:
+        self.matcher.traverse_draft_tree(
+            next_node, next_sibling, draft_tokens, vocab_masks
+        )
+
+
 @pytest.fixture(scope="module")
 def compiled():
-    keep_gil_in_matcher_calls()
     info = xgr.TokenizerInfo(VOCAB, stop_token_ids=[EOS])
     return xgr.GrammarCompiler(info).compile_grammar('root ::= "a" ("b" | "c")* "}"')
 
 
 def _grammar(compiled, accepted):
-    grammar = XGrammarGrammar(xgr.GrammarMatcher(compiled), len(VOCAB), compiled, None)
+    grammar = _Grammar(xgr.GrammarMatcher(compiled))
     for token in accepted:
         grammar.accept_token(token)
     return grammar

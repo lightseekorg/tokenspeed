@@ -22,9 +22,9 @@
 
 The encode role runs the vision tower and ships image embeddings to prefill
 workers over Mooncake; it owns no KV cache and never runs the language model, so
-it does NOT use the full :class:`EventLoop`/C++ scheduler (that machinery -- paged
-KV, chunked prefill, retract, token budget -- is an impedance mismatch for a ViT).
-Instead ``run_event_loop`` branches here when ``disaggregation_mode == "encode"``.
+it does NOT use an engine rank's control plane or the C++ scheduler (that
+machinery -- paged KV, chunked prefill, retract, token budget -- is an
+impedance mismatch for a ViT).
 
 The assembly is: load the model, stand up the Mooncake encode manager + bootstrap
 server, the DisaggEncodeExecutor, and the EncodeWorker, reusing the SAME request
@@ -32,6 +32,8 @@ IPC the LM scheduler uses: a ZMQ PULL
 on ``port_args.scheduler_input_ipc_name``. The smg grpc_servicer's TokenSpeedEncoder
 handler sends an :class:`EncodeRequest` (msgpack, tagged) over that channel; the loop
 drains them into ``EncodeWorker.submit`` and runs ``step`` to encode + transfer.
+
+``run_encode_process`` is the process entry the launcher starts per rank.
 
 TP: the vision tower is TP-sharded, so all encode ranks run each batch in lockstep
 -- rank 0 owns the gateway ZMQ and broadcasts every batch to the TP group. The
@@ -43,8 +45,12 @@ gateway.
 
 from __future__ import annotations
 
+import faulthandler
+import signal
 import time
 
+import psutil
+import setproctitle
 import torch.distributed as dist
 import zmq
 
@@ -54,9 +60,18 @@ from tokenspeed.runtime.cache.embedding_cache import (
 )
 from tokenspeed.runtime.epd.encode_scheduler import EncodeScheduler
 from tokenspeed.runtime.epd.encode_worker import EncodeRequest, EncodeWorker
-from tokenspeed.runtime.utils import get_colorful_logger, get_zmq_socket
+from tokenspeed.runtime.metrics.service import metrics_service
+from tokenspeed.runtime.utils import (
+    configure_logger,
+    get_colorful_logger,
+    get_zmq_socket,
+)
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict_update
-from tokenspeed.runtime.utils.jit_compile_check import mark_jit_compile_serving
+from tokenspeed.runtime.utils.exceptions import get_exception_traceback
+from tokenspeed.runtime.utils.jit_compile_check import (
+    install_jit_compile_check,
+    mark_jit_compile_serving,
+)
 
 logger = get_colorful_logger(__name__)
 
@@ -331,3 +346,24 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
             not drained and did == 0 and not worker.has_pending()
         ) or worker.has_deferred():
             time.sleep(0.0005)
+
+
+def run_encode_process(server_args, port_args, pipe_writer) -> None:
+    """One encode rank's process: set it up as an engine rank's and run
+    :func:`run_encode_loop`. An internal failure is reported to the
+    launcher (SIGUSR1), which takes the server down."""
+    mapping = server_args.mapping
+    gpu_id = mapping.rank % mapping.nprocs_per_node + server_args.base_gpu_id
+    setproctitle.setproctitle(f"tokenspeed::encode_tp{mapping.attn.tp_rank}")
+    faulthandler.enable()
+    parent_process = psutil.Process().parent()
+    configure_logger(server_args, prefix=f" ATTN TP RANK {mapping.attn.tp_rank}")
+    install_jit_compile_check()
+    try:
+        metrics_service.connect(port_args.metrics_producer_configs)
+        run_encode_loop(server_args, port_args, pipe_writer, gpu_id, mapping.rank)
+    except Exception:  # noqa: BLE001 - process boundary; report and signal parent
+        logger.error(f"Encode worker hit an exception: {get_exception_traceback()!s}")
+        parent_process.send_signal(signal.SIGUSR1)
+    finally:
+        metrics_service.close(timeout=2.0)

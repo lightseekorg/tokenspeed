@@ -51,6 +51,51 @@ class DpForwardMetadata:
     all_extend: bool
     need_idle_forward: bool
 
+    @classmethod
+    def from_ranks(
+        cls,
+        *,
+        global_num_tokens: list[int],
+        global_batch_size: list[int],
+        global_num_extends: list[int],
+        need_idle_forward: bool,
+    ) -> DpForwardMetadata:
+        """The metadata from every rank's batch, in rank order.
+
+        Args:
+            global_num_tokens: Tokens each rank forwards.
+            global_batch_size: Requests in each rank's batch; 0 for a rank
+                without model work.
+            global_num_extends: Prefill rows in each rank's batch.
+            need_idle_forward: This rank has no batch while another has one.
+        """
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+        global_forward_mode = [
+            int(ForwardMode.from_num_extends(num_extends, batch_size))
+            for num_extends, batch_size in zip(global_num_extends, global_batch_size)
+        ]
+        return cls(
+            global_num_tokens=list(global_num_tokens),
+            global_batch_size=list(global_batch_size),
+            global_num_decodes=[
+                batch_size - num_extends
+                for batch_size, num_extends in zip(
+                    global_batch_size, global_num_extends
+                )
+            ],
+            global_forward_mode=global_forward_mode,
+            all_decode_or_idle=all(
+                mode in (int(ForwardMode.DECODE), int(ForwardMode.IDLE))
+                for mode in global_forward_mode
+            ),
+            # Replicated prefill-graph gate (see PrefillGraph._select_bucket).
+            all_extend=all(
+                mode == int(ForwardMode.EXTEND) for mode in global_forward_mode
+            ),
+            need_idle_forward=need_idle_forward,
+        )
+
 
 @dataclass(frozen=True)
 class NGramInputs:

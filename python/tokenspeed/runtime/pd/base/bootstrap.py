@@ -23,20 +23,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from dataclasses import dataclass
 
 from aiohttp import web
 
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
-
-
-@dataclass
-class BootstrapInfo:
-    bootstrap_host: str
-    bootstrap_port: int
-    bootstrap_room: int
 
 
 class DisaggBootstrapServerBase:
