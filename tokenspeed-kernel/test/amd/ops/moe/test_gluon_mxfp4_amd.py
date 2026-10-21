@@ -291,6 +291,8 @@ def test_dynamic_mxfp4_activation_moe(
 @pytest.mark.parametrize(
     ("num_tokens", "global_num_experts", "input_kind"),
     (
+        (0, 8, "tensor"),
+        (0, 8, "packed"),
         (1, 8, "tensor"),
         (8, 8, "tensor"),
         (16, 8, "tensor"),
@@ -329,6 +331,14 @@ def test_dynamic_mxfp4_deferred_ep(
         device="cuda",
         generator=generator,
     )
+    # Inputs and output occupy disjoint slices of one allocation, as with an
+    # Iris heap. Guard rows also expose stores beyond the supplied destination.
+    storage = hidden_states.new_full(
+        (num_tokens + num_tokens * top_k + 2, hidden_size), 17
+    )
+    storage[1 : num_tokens + 1].copy_(hidden_states)
+    hidden_states = storage[1 : num_tokens + 1]
+    destination = storage[num_tokens + 1 : -1]
     local_ids = expert_start + torch.arange(num_tokens, device="cuda") % 2
     remote_ids = torch.arange(num_tokens, device="cuda") % 2
     topk_ids = torch.stack((local_ids, remote_ids), dim=1).to(torch.int32)
@@ -398,6 +408,58 @@ def test_dynamic_mxfp4_deferred_ep(
             out=None,
         )
     torch.cuda.synchronize()
+
+    supplied, _, supplied_map = gluon_mxfp_precomputed_mxfp4_fused_moe(
+        x_quantized if input_kind == "packed" else hidden_states,
+        topk_weights,
+        topk_ids,
+        module.w13_weight_triton_tensor,
+        module.w2_weight_triton_tensor,
+        w13_mx_scale=module.w13_precision_config.b_mx_scale,
+        w2_mx_scale=module.w2_precision_config.b_mx_scale,
+        expert_start=expert_start,
+        global_num_experts=global_num_experts,
+        do_finalize=False,
+        x_quantized=None if input_kind == "packed" else x_quantized,
+        swiglu_alpha=1.0,
+        swiglu_limit=0.0,
+        swiglu_beta=0.0,
+        deferred_out=destination,
+    )
+    assert supplied.data_ptr() == destination.data_ptr()
+    torch.testing.assert_close(supplied_map, expanded_idx, atol=0, rtol=0)
+    valid = expanded_idx >= 0
+    torch.testing.assert_close(supplied[valid], route_output[valid], atol=0, rtol=0)
+    torch.testing.assert_close(
+        storage[0], torch.full_like(storage[0], 17), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        storage[-1], torch.full_like(storage[-1], 17), atol=0, rtol=0
+    )
+    if num_tokens == 17 and input_kind == "tensor":
+        # The output starts beyond input.numel(), but still aliases later
+        # strided rows. Rejection must leave those unread inputs intact.
+        shared = hidden_states.new_full((num_tokens * (4 + top_k), hidden_size), 17)
+        strided = shared[: num_tokens * 4 : 4]
+        strided.copy_(hidden_states)
+        overlapping = shared[num_tokens : num_tokens * (1 + top_k)]
+        before = shared.clone()
+        with pytest.raises(ValueError, match="must not overlap"):
+            gluon_mxfp_precomputed_mxfp4_fused_moe(
+                strided,
+                topk_weights,
+                topk_ids,
+                module.w13_weight_triton_tensor,
+                module.w2_weight_triton_tensor,
+                w13_mx_scale=module.w13_precision_config.b_mx_scale,
+                w2_mx_scale=module.w2_precision_config.b_mx_scale,
+                expert_start=expert_start,
+                global_num_experts=global_num_experts,
+                do_finalize=False,
+                x_quantized=None,
+                deferred_out=overlapping,
+            )
+        torch.testing.assert_close(shared, before, atol=0, rtol=0)
 
     route_output = route_output.view(num_tokens, top_k, hidden_size)
     expected_map = torch.stack(
