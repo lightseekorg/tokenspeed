@@ -584,6 +584,10 @@ class Eagle4CandidateLogitsProcessor(LogitsProcessor):
         self._draft_topk = draft_topk
         return logits
 
+    def _dist_argmax_eligible(self) -> bool:
+        # The gathered candidate logits are whole on every rank, so argmax stays local.
+        return False
+
     def _argmax(self, logits: torch.Tensor) -> torch.Tensor:
         best = super()._argmax(logits)
         return self._candidate_ids.gather(-1, best.view(-1, 1).long()).view(-1)
