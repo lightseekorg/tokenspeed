@@ -118,6 +118,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
     from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
         iris_k3moe_pull_scatter,
         iris_k3moe_push_gather,
+        k3_launch_config,
     )
     from tokenspeed_kernel.ops.communication.iris import (
         configure_iris,
@@ -197,10 +198,12 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
     tail_kernels_warmed = set()
 
     def projected(inputs, prefix, norm_weight, *, prefix_is_sharded):
-        # Warm once, then exercise changing row counts without recompiling
-        # either collective. Projection and normalization have separate kernels.
+        # Warm once per launch shape, then exercise changing row counts without
+        # recompiling either collective. Projection and normalization have
+        # separate kernels.
+        variant = (prefix_is_sharded, k3_launch_config(inputs[0].shape[0]))
         with ExitStack() as stack:
-            if prefix_is_sharded in tail_kernels_warmed:
+            if variant in tail_kernels_warmed:
                 for kernel in (
                     iris_k3moe_pull_scatter,
                     iris_k3moe_push_gather,
@@ -215,7 +218,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
                 eps=1e-5 if norm_weight is not None else None,
             )
         assert output is not None
-        tail_kernels_warmed.add(prefix_is_sharded)
+        tail_kernels_warmed.add(variant)
         return output
 
     held = None
