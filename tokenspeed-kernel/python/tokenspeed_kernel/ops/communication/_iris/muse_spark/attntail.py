@@ -26,17 +26,31 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_drain_subgroup_vmem,
     _iris_group_heap_base,
     _iris_rendezvous,
+    _iris_sanitize_lamport_bf16x2,
 )
+
+
+@gluon.jit
+def _iris_muse_attntail_inputs(
+    stream_ptr, alpha_ptr, beta_ptr, pre_weight_ptr, row, columns, WIDTH: gl.constexpr
+):
+    """Load the residual row and per-column coefficients ahead of the reduction."""
+    offsets = (row * WIDTH + columns).to(gl.int32)
+    stream = gl.amd.cdna4.buffer_load(stream_ptr, offsets)
+    alpha = gl.amd.cdna4.buffer_load(alpha_ptr, columns)
+    beta = gl.amd.cdna4.buffer_load(beta_ptr, columns)
+    pre_weight = gl.amd.cdna4.buffer_load(pre_weight_ptr, columns)
+    return stream, alpha, beta, pre_weight
 
 
 @gluon.jit
 def _iris_muse_attntail(
     branch,
-    stream_ptr,
+    stream,
+    alpha,
+    beta,
+    pre_weight,
     post_weight_ptr,
-    alpha_ptr,
-    beta_ptr,
-    pre_weight_ptr,
     out_stream_ptr,
     pre_fp32_ptr,
     pre_bf16_ptr,
@@ -54,6 +68,7 @@ def _iris_muse_attntail(
     After rounding the reduced attention output to BF16 and post-normalizing it,
     update the residual as alpha * residual + beta * normalized_attention.
     Pre-normalize that FP32 result for the router (FP32) and pre-expert projection (BF16).
+    stream, alpha, beta, and pre_weight come from _iris_muse_attntail_inputs.
     """
     offsets = (row * WIDTH + columns).to(gl.int32)
     branch = branch.to(gl.bfloat16).to(gl.float32)
@@ -61,13 +76,10 @@ def _iris_muse_attntail(
         weight = gl.amd.cdna4.buffer_load(post_weight_ptr, columns).to(gl.float32)
         branch *= (weight + POST_WEIGHT_OFFSET).to(gl.bfloat16).to(gl.float32)
     branch *= gl.rsqrt(gl.sum(branch * branch, 0) / WIDTH + POST_EPS)
-    stream = gl.amd.cdna4.buffer_load(stream_ptr, offsets)
-    alpha = gl.amd.cdna4.buffer_load(alpha_ptr, columns)
-    beta = gl.amd.cdna4.buffer_load(beta_ptr, columns)
     stream = gl.fma(beta, branch, alpha * stream)
     gl.amd.cdna4.buffer_store(stream, out_stream_ptr, offsets)
     pre = stream * gl.rsqrt(gl.sum(stream * stream, 0) / WIDTH + PRE_EPS)
-    weight = gl.amd.cdna4.buffer_load(pre_weight_ptr, columns).to(gl.float32)
+    weight = pre_weight.to(gl.float32)
     pre *= (weight + PRE_WEIGHT_OFFSET).to(gl.bfloat16).to(gl.float32)
     gl.amd.cdna4.buffer_store(pre, pre_fp32_ptr, offsets)
     gl.amd.cdna4.buffer_store(pre.to(gl.bfloat16), pre_bf16_ptr, offsets)
@@ -134,13 +146,16 @@ def iris_fused_pull_allgather_muse_attntail(
             )
             offsets = (local_row * WIDTH + columns).to(gl.int32)
             branch = gl.amd.cdna4.buffer_load(source, offsets, cache=".cg")
+            stream, alpha, beta, pre_weight = _iris_muse_attntail_inputs(
+                stream_ptr, alpha_ptr, beta_ptr, pre_weight_ptr, row, columns, WIDTH
+            )
             _iris_muse_attntail(
                 branch,
-                stream_ptr,
+                stream,
+                alpha,
+                beta,
+                pre_weight,
                 branch_sym_ptr,
-                alpha_ptr,
-                beta_ptr,
-                pre_weight_ptr,
                 out_stream_ptr,
                 pre_fp32_ptr,
                 pre_bf16_ptr,
@@ -168,9 +183,55 @@ def iris_fused_pull_allgather_muse_attntail(
 
 
 @gluon.jit
-def iris_fused_push_oneshot_allreduce_muse_attntail(
+def _iris_muse_wait_mailbox(
+    mailbox_ptr,
+    slot,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    peer_stride,
+    WORDS_PER_THREAD: gl.constexpr,
+):
+    """Reload peers' packed BF16 rows until no element holds the empty marker.
+
+    slot holds each thread's WORDS_PER_THREAD consecutive 32-bit word offsets.
+    A thread stops reloading once its words from every peer have arrived; the
+    loop-carried mask also keeps the reloads inside the polling loop.
+    """
+    THREADS: gl.constexpr = slot.shape[0] // WORDS_PER_THREAD
+    slot = gl.reshape(slot, [THREADS, WORDS_PER_THREAD])
+    waiting = gl.full([THREADS], True, gl.int1, gl.SliceLayout(1, slot.type.layout))
+    received = ()
+    for _ in gl.static_range(1, WORLD_SIZE):
+        received += (gl.zeros_like(slot).to(gl.uint32),)
+    while gl.max(waiting.to(gl.int32), 0) != 0:
+        missing = gl.zeros_like(slot)
+        loaded = ()
+        for delta in gl.static_range(1, WORLD_SIZE):
+            peer = (RANK + delta) % WORLD_SIZE
+            words = gl.amd.cdna4.buffer_load(
+                mailbox_ptr,
+                slot + peer * peer_stride,
+                # Comparing slot broadcasts the per-thread flag to every word.
+                mask=waiting[:, None] & (slot >= 0),
+                other=received[delta - 1],
+                cache=".cv",
+            )
+            loaded += (words,)
+            missing |= (((words & 0xFFFF) == 0x8000) | ((words >> 16) == 0x8000)).to(
+                gl.int32
+            )
+        received = loaded
+        waiting = gl.max(missing, 1) != 0
+    flat = ()
+    for delta in gl.static_range(1, WORLD_SIZE):
+        flat += (gl.reshape(received[delta - 1], [THREADS * WORDS_PER_THREAD]),)
+    return flat
+
+
+@gluon.jit
+def _iris_muse_lamport_reduce_row(
     branch_ptr,
-    inbox_ptr,
+    words_ptr,
     stream_ptr,
     post_weight_ptr,
     alpha_ptr,
@@ -179,9 +240,8 @@ def iris_fused_push_oneshot_allreduce_muse_attntail(
     out_stream_ptr,
     pre_fp32_ptr,
     pre_bf16_ptr,
-    generations,
-    ready_flags,
-    heaps,
+    row,
+    stage,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
     WIDTH: gl.constexpr,
@@ -194,70 +254,57 @@ def iris_fused_push_oneshot_allreduce_muse_attntail(
     ELEMENTS_PER_THREAD: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    """All-reduce TP4/TP8 attention contributions and update Muse's residuals.
-
-    Push each BF16 branch_ptr row into peer inboxes, sum in FP32 rank order, and
-    round to BF16 before post-normalization. Apply the alpha/beta residual update
-    and MoE input norm, writing FP32 residual/router and BF16 pre-expert projection outputs.
-    Per-row generations and two alternating inbox slots protect successive uses.
-    """
-    gl.static_assert(WORLD_SIZE == 4 or WORLD_SIZE == 8)
-    gl.static_assert(WIDTH == 8192)
-    row = gl.program_id(0)
+    """Wait for a row's peer contributions, then reduce and normalize it."""
+    PAIRS: gl.constexpr = WIDTH // 2
     layout: gl.constexpr = gl.BlockedLayout(
         [ELEMENTS_PER_THREAD], [64], [NUM_WARPS], [0]
     )
-    columns = gl.arange(0, WIDTH, layout=layout)
-    offsets = (row * WIDTH + columns).to(gl.int32)
-    local = gl.amd.cdna4.buffer_load(branch_ptr, offsets)
-    generation = gl.load(generations + row) + 1
-    slot = generation & 1
-    local_heap = _iris_group_heap_base(RANK, heaps)
-    inbox_offset = inbox_ptr.to(gl.uint64) - local_heap
-    slot_offset = slot * WORLD_SIZE * MAX_ROWS * WIDTH
-    for delta in gl.static_range(1, WORLD_SIZE):
-        peer = (RANK + delta) % WORLD_SIZE
-        peer_heap = _iris_group_heap_base(peer, heaps)
-        destination = gl.multiple_of(
-            (peer_heap + inbox_offset).to(gl.pointer_type(gl.bfloat16)), 16
-        )
-        gl.amd.cdna4.buffer_store(
-            local,
-            destination + slot_offset + RANK * MAX_ROWS * WIDTH,
-            offsets,
-            cache=".wt",
-        )
-    _iris_drain_subgroup_vmem()
-    gl.barrier()
-    _iris_rendezvous(
-        ready_flags + slot * MAX_ROWS * WORLD_SIZE,
-        heaps,
-        row,
-        generation,
-        RANK,
-        NUM_WARPS,
-        False,
+    pairs: gl.constexpr = gl.BlockedLayout(
+        [ELEMENTS_PER_THREAD // 2], [64], [NUM_WARPS], [0]
     )
+    pair = gl.arange(0, PAIRS, layout=pairs)
+    local = _iris_sanitize_lamport_bf16x2(
+        gl.amd.cdna4.buffer_load(
+            branch_ptr.to(gl.pointer_type(gl.uint32), bitcast=True), row * PAIRS + pair
+        )
+    )
+    # Overlap the residual and coefficient reads with the peer wait.
+    columns = gl.arange(0, WIDTH, layout=layout)
+    stream, alpha, beta, pre_weight = _iris_muse_attntail_inputs(
+        stream_ptr, alpha_ptr, beta_ptr, pre_weight_ptr, row, columns, WIDTH
+    )
+    received = _iris_muse_wait_mailbox(
+        words_ptr,
+        (stage * WORLD_SIZE * MAX_ROWS + row) * PAIRS + pair,
+        RANK,
+        WORLD_SIZE,
+        MAX_ROWS * PAIRS,
+        ELEMENTS_PER_THREAD // 2,
+    )
+    # Widening BF16 to FP32 places its bits in the high half of the word.
     for peer in gl.static_range(0, WORLD_SIZE):
         if peer == RANK:
-            value = local.to(gl.float32)
+            words = local
         else:
-            value = gl.amd.cdna4.buffer_load(
-                inbox_ptr + slot_offset + peer * MAX_ROWS * WIDTH,
-                offsets,
-                cache=".cg",
-            ).to(gl.float32)
+            words = received[(peer - RANK + WORLD_SIZE) % WORLD_SIZE - 1]
+        even = (words << 16).to(gl.float32, bitcast=True)
+        odd = (words & 0xFFFF0000).to(gl.float32, bitcast=True)
         if peer == 0:
-            branch = value
+            branch_even = even
+            branch_odd = odd
         else:
-            branch += value
+            branch_even += even
+            branch_odd += odd
+    branch = gl.convert_layout(
+        gl.reshape(gl.join(branch_even, branch_odd), [WIDTH]), layout
+    )
     _iris_muse_attntail(
         branch,
-        stream_ptr,
+        stream,
+        alpha,
+        beta,
+        pre_weight,
         post_weight_ptr,
-        alpha_ptr,
-        beta_ptr,
-        pre_weight_ptr,
         out_stream_ptr,
         pre_fp32_ptr,
         pre_bf16_ptr,
@@ -270,5 +317,174 @@ def iris_fused_push_oneshot_allreduce_muse_attntail(
         PRE_WEIGHT_OFFSET,
         POST_HAS_WEIGHT,
     )
-    # Two slots make the next entry handshake reclaim this row's old inbox.
-    gl.store(generations + row, generation)
+
+
+@gluon.jit
+def _iris_muse_lamport_send_chunk(
+    branch_ptr,
+    mailbox_ptr,
+    words_ptr,
+    heaps,
+    row,
+    stage,
+    chunk,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    WIDTH: gl.constexpr,
+    MAX_ROWS: gl.constexpr,
+    SENDERS: gl.constexpr,
+    ROTATE_PEERS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """Push one column chunk of a row and clear its previously consumed slot."""
+    PAIRS: gl.constexpr = WIDTH // 2
+    PEER_STRIDE: gl.constexpr = MAX_ROWS * PAIRS
+    gl.static_assert(PAIRS % SENDERS == 0)
+    CHUNK: gl.constexpr = PAIRS // SENDERS
+    THREADS: gl.constexpr = 64 * NUM_WARPS
+    # Chunks smaller than the workgroup leave the remaining threads idle.
+    WORDS: gl.constexpr = max(CHUNK // THREADS, 1)
+    gl.static_assert(CHUNK % (WORDS * THREADS) == 0 or CHUNK < THREADS)
+    layout: gl.constexpr = gl.BlockedLayout([WORDS], [64], [NUM_WARPS], [0])
+    index = gl.arange(0, WORDS * THREADS, layout=layout)
+    valid = index < CHUNK
+    pair = chunk * CHUNK + index
+    local = gl.amd.cdna4.buffer_load(
+        branch_ptr.to(gl.pointer_type(gl.uint32), bitcast=True),
+        row * PAIRS + pair,
+        mask=valid,
+    )
+    local = _iris_sanitize_lamport_bf16x2(local)
+    slot = (stage * WORLD_SIZE * MAX_ROWS + row) * PAIRS + pair
+    mailbox_offset = mailbox_ptr.to(gl.uint64) - _iris_group_heap_base(RANK, heaps)
+    for step in gl.static_range(WORLD_SIZE - 1):
+        if ROTATE_PEERS:
+            peer = (
+                RANK + 1 + (step + row * SENDERS + chunk) % (WORLD_SIZE - 1)
+            ) % WORLD_SIZE
+        else:
+            peer = (RANK + 1 + step) % WORLD_SIZE
+        destination = gl.multiple_of(
+            (_iris_group_heap_base(peer, heaps) + mailbox_offset).to(
+                gl.pointer_type(gl.uint32)
+            ),
+            16,
+        )
+        gl.amd.cdna4.buffer_store(
+            local,
+            destination,
+            slot + RANK * PEER_STRIDE,
+            mask=valid,
+            cache=PEER_SIGNAL_STORE_CACHE,
+        )
+    # The previous call consumed the slot two stages ahead. Write-through
+    # clears reach memory before this kernel completes, and peers rewrite
+    # that slot only after this row's next reduction.
+    previous = slot + ((stage + 2) % 3 - stage) * WORLD_SIZE * PEER_STRIDE
+    empty = gl.full((WORDS * THREADS,), 0x80008000, gl.uint32, layout)
+    for delta in gl.static_range(1, WORLD_SIZE):
+        peer = (RANK + delta) % WORLD_SIZE
+        gl.amd.cdna4.buffer_store(
+            empty,
+            words_ptr,
+            previous + peer * PEER_STRIDE,
+            mask=valid,
+            cache=".wt",
+        )
+
+
+@gluon.jit
+def iris_fused_lamport_allreduce_muse_attntail(
+    branch_ptr,
+    mailbox_ptr,
+    stream_ptr,
+    post_weight_ptr,
+    alpha_ptr,
+    beta_ptr,
+    pre_weight_ptr,
+    out_stream_ptr,
+    pre_fp32_ptr,
+    pre_bf16_ptr,
+    epochs,
+    heaps,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    WIDTH: gl.constexpr,
+    MAX_ROWS: gl.constexpr,
+    POST_EPS: gl.constexpr,
+    POST_WEIGHT_OFFSET: gl.constexpr,
+    PRE_EPS: gl.constexpr,
+    PRE_WEIGHT_OFFSET: gl.constexpr,
+    POST_HAS_WEIGHT: gl.constexpr,
+    SENDERS: gl.constexpr,
+    ROTATE_PEERS: gl.constexpr,
+    ELEMENTS_PER_THREAD: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """All-reduce TP4/TP8 attention rows, then apply Muse's residual update and norms.
+
+    Grid (rows, SENDERS + 1): sender workgroups push column chunks of each BF16
+    row to peer mailboxes and clear the row's previously consumed slot of three;
+    the last workgroup waits for every peer chunk, sums in FP32 rank order, and
+    applies the post-norm, alpha/beta update and MoE input norm. ``epochs`` holds
+    one stage per workgroup and advances only through this kernel. Negative zero
+    is sent as zero. ROTATE_PEERS staggers each sender's peer order.
+    """
+    gl.static_assert(WORLD_SIZE == 4 or WORLD_SIZE == 8)
+    gl.static_assert(WIDTH == 8192)
+    gl.static_assert(ELEMENTS_PER_THREAD % 2 == 0)
+    row = gl.program_id(0)
+    role = gl.program_id(1)
+    epoch = epochs + row * (SENDERS + 1) + role
+    stage = (gl.load(epoch).to(gl.uint32) % 3).to(gl.int32)
+    # Mailboxes hold BF16 pairs as 32-bit words; the low half is the even column.
+    words_ptr = mailbox_ptr.to(gl.pointer_type(gl.uint32), bitcast=True)
+    # The reducer must be the last role so that senders dispatch before any
+    # reducer spins; otherwise peers could wait on senders that never run.
+    if role == SENDERS:
+        _iris_muse_lamport_reduce_row(
+            branch_ptr,
+            words_ptr,
+            stream_ptr,
+            post_weight_ptr,
+            alpha_ptr,
+            beta_ptr,
+            pre_weight_ptr,
+            out_stream_ptr,
+            pre_fp32_ptr,
+            pre_bf16_ptr,
+            row,
+            stage,
+            RANK,
+            WORLD_SIZE,
+            WIDTH,
+            MAX_ROWS,
+            POST_EPS,
+            POST_WEIGHT_OFFSET,
+            PRE_EPS,
+            PRE_WEIGHT_OFFSET,
+            POST_HAS_WEIGHT,
+            ELEMENTS_PER_THREAD,
+            NUM_WARPS,
+        )
+    else:
+        _iris_muse_lamport_send_chunk(
+            branch_ptr,
+            mailbox_ptr,
+            words_ptr,
+            heaps,
+            row,
+            stage,
+            role,
+            RANK,
+            WORLD_SIZE,
+            WIDTH,
+            MAX_ROWS,
+            SENDERS,
+            ROTATE_PEERS,
+            NUM_WARPS,
+            PEER_SIGNAL_STORE_CACHE,
+        )
+    gl.store(epoch, (stage + 1) % 3)
