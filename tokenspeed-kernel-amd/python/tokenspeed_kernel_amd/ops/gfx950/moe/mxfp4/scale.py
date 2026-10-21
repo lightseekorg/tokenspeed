@@ -59,7 +59,7 @@ def _gather_package_cdna4_scale_kernel(
     src_mblock_stride,
     dst_mblock_stride,
     num_sorted_ids,
-    K_SCALE: tl.constexpr,
+    K_BLOCKS: tl.constexpr,
     TOPK: tl.constexpr,
     FLATTEN_TOPK: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -67,39 +67,49 @@ def _gather_package_cdna4_scale_kernel(
     """Gather a CDNA4-swizzled activation scale by sorted-route rows.
 
     Copies directly between the token-order and sorted-route CDNA4 layouts;
-    ``sorted_ids`` packs ``(topk_id << 24) | token_id`` per slot.
+    ``sorted_ids`` packs ``(topk_id << 24) | token_id`` per slot. In both
+    layouts the byte for ``(row, k)`` within a 32-row panel and 8-scale K block
+    sits at ``(k % 4) * 64 + (row % 16) * 4 + (k % 8 // 4) * 2 + row % 32 // 16``,
+    so each destination dword holds rows ``m`` and ``m + 16`` at scales ``k``
+    and ``k + 4``. One lane writes one destination dword from one source dword
+    per row: the row's two scales are bytes ``row % 32 // 16`` and ``2 + that``.
+    Padded slots, and rows past ``num_sorted_ids`` up to the panel boundary,
+    receive 127 (2^0).
     """
-    linear = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    dst_row = linear // K_SCALE
-    k_scale = linear % K_SCALE
-    in_bounds = dst_row < num_sorted_ids
-
-    packed = tl.load(sorted_ids + dst_row, mask=in_bounds, other=source_rows)
-    token = packed & 0xFFFFFF
-    if FLATTEN_TOPK:
-        slot = packed >> 24
-        src_row = token * TOPK + slot
-    else:
-        src_row = token
-    valid = in_bounds & (src_row < source_rows)
-
-    src_m_in = src_row % 32
-    src_m_hi = src_m_in // 16
-    src_m_lo = src_m_in % 16
-    k_block = k_scale // 8
-    k_hi = (k_scale % 8) // 4
-    k_lo = k_scale % 4
-    src_swizzled_k = (((k_block * 4 + k_lo) * 16 + src_m_lo) * 2 + k_hi) * 2 + src_m_hi
-    src_off = src_swizzled_k + (src_row // 32) * src_mblock_stride
-
-    dst_m_in = dst_row % 32
-    dst_m_hi = dst_m_in // 16
-    dst_m_lo = dst_m_in % 16
-    dst_swizzled_k = (((k_block * 4 + k_lo) * 16 + dst_m_lo) * 2 + k_hi) * 2 + dst_m_hi
-    dst_off = dst_swizzled_k + (dst_row // 32) * dst_mblock_stride
-
-    value = tl.load(src_scale + src_off, mask=valid, other=127)
-    tl.store(dst_scale + dst_off, value, mask=in_bounds)
+    src_words = src_scale.to(tl.pointer_type(tl.int32), bitcast=True)
+    dst_words = dst_scale.to(tl.pointer_type(tl.int32), bitcast=True)
+    word = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m_lo = word % 16
+    k_lo = (word // 16) % 4
+    k_block = (word // 64) % K_BLOCKS
+    panel = word // (64 * K_BLOCKS)
+    in_range = panel < tl.cdiv(num_sorted_ids, 32)
+    k_part = k_block * 256 + k_lo * 64
+    result = tl.zeros([BLOCK], dtype=tl.uint32)
+    for m_hi in tl.static_range(2):
+        dst_row = panel * 32 + m_hi * 16 + m_lo
+        in_bounds = in_range & (dst_row < num_sorted_ids)
+        packed = tl.load(sorted_ids + dst_row, mask=in_bounds, other=source_rows)
+        token = packed & 0xFFFFFF
+        if FLATTEN_TOPK:
+            src_row = token * TOPK + (packed >> 24)
+        else:
+            src_row = token
+        valid = in_bounds & (src_row < source_rows)
+        src_word = tl.load(
+            src_words
+            + ((src_row // 32) * src_mblock_stride + k_part + (src_row % 16) * 4) // 4,
+            mask=valid,
+            other=0x7F7F7F7F,
+        ).to(tl.uint32, bitcast=True)
+        shift = ((src_row % 32) // 16 * 8).to(tl.uint32)
+        result |= ((src_word >> shift) & 0xFF) << (m_hi * 8)
+        result |= ((src_word >> (shift + 16)) & 0xFF) << (16 + m_hi * 8)
+    tl.store(
+        dst_words + (panel * dst_mblock_stride + k_part + m_lo * 4) // 4,
+        result.to(tl.int32, bitcast=True),
+        mask=in_range,
+    )
 
 
 def gather_package_cdna4_scale(
@@ -145,8 +155,15 @@ def gather_package_cdna4_scale(
     out = torch.empty((rows_pad, k_scale), dtype=torch.uint8, device=scale.device)
     if sorted_rows == 0:
         return out
-    block = 256
-    _gather_package_cdna4_scale_kernel[(triton.cdiv(sorted_rows * k_scale, block),)](
+    if scale.stride(0) != 1 or scale.stride(1) % 4 or scale.data_ptr() % 4:
+        raise ValueError(
+            "gather_package_cdna4_scale reads 4-byte words and needs stride(0) == 1, "
+            f"stride(1) % 4 == 0 and a 4-byte aligned pointer; got strides "
+            f"{tuple(scale.stride())} and pointer offset {scale.data_ptr() % 4}"
+        )
+    # One lane per destination dword: 32 rows x 8 scales per 256-byte block.
+    block = 512
+    _gather_package_cdna4_scale_kernel[(triton.cdiv(rows_pad * k_scale // 4, block),)](
         scale,
         sorted_ids,
         out,
@@ -154,7 +171,7 @@ def gather_package_cdna4_scale(
         scale.stride(1),
         k_scale * _NON_K_PRESHUFFLE_BLOCK_SIZE,
         sorted_rows,
-        K_SCALE=k_scale,
+        K_BLOCKS=k_scale // _ALIGN_K_SCALE_SWIZZLE,
         TOPK=top_k,
         FLATTEN_TOPK=flatten_topk,
         BLOCK=block,

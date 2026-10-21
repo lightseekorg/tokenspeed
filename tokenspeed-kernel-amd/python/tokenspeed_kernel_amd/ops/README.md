@@ -136,7 +136,8 @@ gfx950 and transposes the router weight once to `[N, K]`.
 #### Contract
 
 - `x` is a contiguous FP32 `[M, K]` matrix and `w` a contiguous FP32 `[N, K]`
-  matrix. `M > 16` or `K > 16384` takes `torch.matmul` and a multiply.
+  matrix. `M > 16` or `K > 16384` takes `torch.addmm` with `multiplier` as
+  alpha.
 - A row's logits are bitwise the same at every `M` the kernel serves.
 - One binary per (shape, multiplier, power-of-two M bucket); `M` is a runtime
   argument.

@@ -233,28 +233,6 @@ class MuseIrisState:
                 chunk.copy_(reduced[: chunk.numel()])
         return tensor
 
-    def can_reduce_borrowed(self, tensor: torch.Tensor) -> bool:
-        """Check the prepared raw-payload reduction without allocating storage."""
-        return (
-            tensor.dtype == self.all_reduce.dtype
-            and tensor.device == self.all_reduce.device
-            and tensor.is_contiguous()
-            and 0 < tensor.numel() <= self.all_reduce.producer_direct_max_numel
-            and tensor.numel() % (self.world_size * 8) == 0
-        )
-
-    def reduce_borrowed(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Reduce ordinary input and borrow the result until the next collective.
-
-        Muse consumes this result on the same stream before a projection or
-        collective can reuse the gather/push buffers. The input need not be
-        symmetric: Lamport and push read it directly; pull stages it once.
-        """
-        if not self.can_reduce_borrowed(tensor):
-            raise ValueError("unsupported Muse borrowed reduction payload")
-        reduced = self.reduction.run(tensor, self.gather.output, tensor.numel())
-        return reduced[: tensor.numel()].view_as(tensor)
-
     def reduce_outputs(
         self, tensors: tuple[torch.Tensor, ...]
     ) -> tuple[torch.Tensor, ...]:

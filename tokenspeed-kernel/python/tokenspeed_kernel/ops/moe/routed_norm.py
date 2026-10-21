@@ -62,6 +62,7 @@ def routed_input_scale_rmsnorm_sum(
     eps: float,
     weight_offset: float,
     enable_pdl: bool,
+    output: torch.Tensor | None,
 ) -> torch.Tensor:
     """Normalize each expert route before its weighted top-k reduction.
 
@@ -75,16 +76,20 @@ def routed_input_scale_rmsnorm_sum(
         eps: Epsilon for each route's variance.
         weight_offset: Center added to the checkpoint's norm weight.
         enable_pdl: Enable NVIDIA programmatic dependent launch.
+        output: Optional contiguous ``[tokens, width]`` destination in
+            ``routes.dtype`` that overlaps no input; None allocates.
 
     Returns:
-        Weighted route sum shaped ``[tokens, width]``.
+        Weighted route sum shaped ``[tokens, width]``, backed by ``output`` when given.
     """
     kernel = select_kernel(
         "moe",
         "routed_input_scale_rmsnorm_sum",
         dense_format_signature(("routes",), (routes.dtype,)),
     )
-    return kernel(routes, route_weights, norm_weight, eps, weight_offset, enable_pdl)
+    return kernel(
+        routes, route_weights, norm_weight, eps, weight_offset, enable_pdl, output
+    )
 
 
 def routed_input_scale_rmsnorm_sum_gathered(
