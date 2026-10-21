@@ -100,14 +100,15 @@ def _compile_k3(kind, rank):
     else:
         fn = getattr(sharded, f"iris_k3{kind}")
         constexprs["BLOCK_ELEMENTS"] = 2048
+        reduce_programs, gather_programs = sharded._max_programs(ArchVersion(12, 5))
         if "pull" in kind:
             constexprs.update(
-                NUM_PROGRAMS=sharded.REDUCE_PROGRAMS,
+                NUM_PROGRAMS=reduce_programs,
                 PEER_PAYLOAD_LOAD_CACHE=policy.peer_payload_load,
             )
         else:
             constexprs.update(
-                NUM_PROGRAMS=sharded.GATHER_PROGRAMS,
+                NUM_PROGRAMS=gather_programs,
                 PEER_PAYLOAD_STORE_CACHE=policy.peer_payload_store,
             )
     constexprs["NUM_WARPS"] = num_warps
