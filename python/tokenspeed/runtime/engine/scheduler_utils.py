@@ -64,6 +64,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
 # ranks as ``(kind, op_id)`` payloads and rebuild the binding event from the
 # payload.
 _CACHE_EVENT_TYPES = {
+    "StatePrepareDoneEvent": Cache.StatePrepareDoneEvent,
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
     "LoadBackDoneEvent": Cache.LoadBackDoneEvent,
     "PrefetchDoneEvent": Cache.PrefetchDoneEvent,
@@ -659,6 +660,8 @@ def cache_event_to_payload(event) -> dict:
     }
     if kind == "PrefetchDoneEvent":
         payload["landed_pages"] = int(event.landed_pages)
+    if kind == "StatePrepareDoneEvent":
+        payload["success"] = bool(event.success)
     return payload
 
 
@@ -666,6 +669,10 @@ def cache_event_from_payload(payload: dict):
     kind = payload["kind"]
     if kind not in _CACHE_EVENT_TYPES:
         raise ValueError(f"Unsupported cache event type: {kind}")
+    if kind == "StatePrepareDoneEvent":
+        return Cache.StatePrepareDoneEvent(
+            int(payload["op_id"]), bool(payload["success"])
+        )
     if kind == "LoadBackDoneEvent":
         return _CACHE_EVENT_TYPES[kind](int(payload["op_id"]))
     if kind == "PrefetchDoneEvent":
@@ -888,7 +895,10 @@ def pop_common_cache_event_payloads(
 
     ready_payloads = []
     for key in sorted(common_keys, key=lambda item: (item[1], item[0])):
-        ready_payloads.append(dict(rank_maps[0][key]))
+        payload = dict(rank_maps[0][key])
+        if payload["kind"] == "StatePrepareDoneEvent":
+            payload["success"] = all(rank[key]["success"] for rank in rank_maps)
+        ready_payloads.append(payload)
     return ready_payloads
 
 

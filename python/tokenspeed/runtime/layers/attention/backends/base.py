@@ -157,6 +157,33 @@ class CachePoolBinding:
     # Slot-state image (SlotStateExporter)
     # ------------------------------------------------------------------
 
+    def deferred_state_group_ids(self) -> tuple[str, ...]:
+        """State groups this node materializes before checkpoint publication.
+
+        Only this node's groups are listed; the executor visits the backend
+        tree once, including draft owners. Eager backends advertise none.
+        """
+        return ()
+
+    def prepare_state_checkpoint(
+        self,
+        *,
+        request_id: str,
+        request_pool_index: int,
+        num_computed_tokens: int,
+        state_blocks: Mapping[str, int],
+    ) -> bool:
+        """Enqueue this node's checkpoint writes on the execution stream.
+
+        The endpoint is consumed input, not returned output. Validate slot
+        ownership and ring coverage before writing. Return False for a
+        rejected preparation; completion is acknowledged only after all
+        enqueued writes drain. Unexpected device errors must raise. Side
+        stream writers must join the execution stream before returning.
+        Eager backends already hold a complete checkpoint.
+        """
+        return True
+
     def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
         """This node's own per-slot rows a retraction snapshot images.
 

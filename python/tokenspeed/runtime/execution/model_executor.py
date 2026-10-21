@@ -2020,6 +2020,72 @@ class ModelExecutor:
         exporters.append(self.sampling_backend)
         return tuple(exporters)
 
+    def state_prepare_backends(self):
+        """Unique attention owners, including a separately configured drafter."""
+        owners = list(self.attn_backend.slot_state_exporters())
+        if self.draft_attn_backend is not None:
+            owners.extend(self.draft_attn_backend.slot_state_exporters())
+        seen = set()
+        result = []
+        for owner in owners:
+            if id(owner) not in seen:
+                seen.add(id(owner))
+                result.append(owner)
+        return tuple(result)
+
+    def deferred_state_group_ids(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    group_id
+                    for owner in self.state_prepare_backends()
+                    for group_id in owner.deferred_state_group_ids()
+                }
+            )
+        )
+
+    def prepare_state_checkpoint(self, operation):
+        """Issue checkpoint writes behind prior forwards; return a drain event.
+
+        The scheduler retains the slot and destination blocks until the
+        completion has converged across cache-owning ranks. A False result
+        still records an event: rejection must not release an earlier
+        owner's writes that are still in flight.
+        """
+        local_blocks = local_pages_by_group(
+            {
+                group_id: [block_id]
+                for group_id, block_id in operation.state_blocks.items()
+            },
+            contract=self._cache_runtime_contract,
+            rank=self._cache_kvp_rank,
+        )
+        success = self.runtime_states.owns_cache_request_slot(
+            operation.request_id, operation.request_pool_index
+        )
+        self.execution_stream.wait_stream(self.default_stream)
+        with self.device_module.stream(self.execution_stream):
+            owners = self.state_prepare_backends() if success else ()
+            for owner in owners:
+                groups = set(owner.deferred_state_group_ids())
+                blocks = {
+                    group_id: int(block_ids[0])
+                    for group_id, block_ids in local_blocks.items()
+                    if group_id in groups and len(block_ids)
+                }
+                if not blocks:
+                    continue
+                prepared = owner.prepare_state_checkpoint(
+                    request_id=operation.request_id,
+                    request_pool_index=operation.request_pool_index,
+                    num_computed_tokens=operation.num_computed_tokens,
+                    state_blocks=blocks,
+                )
+                success = prepared and success
+            done = self.device_module.Event()
+            done.record(self.execution_stream)
+        return done, success
+
     def copy_cache_pages(self, pairs: Mapping[str, Sequence[Sequence[int]]]) -> None:
         """Copy cached blocks whole onto newly granted blocks of the same group.
 
@@ -2162,6 +2228,10 @@ class ModelExecutor:
         num_extends = forward_op.num_extends()
         if num_extends <= 0:
             return
+        self.runtime_states.bind_cache_request_slots(
+            forward_op.request_ids[:num_extends],
+            forward_op.request_pool_indices[:num_extends],
+        )
         self._write_valid_cache_lengths(
             forward_op.request_pool_indices[:num_extends],
             forward_op.prefill_lengths[:num_extends],

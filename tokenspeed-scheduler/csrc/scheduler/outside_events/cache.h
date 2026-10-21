@@ -25,6 +25,11 @@
 
 namespace tokenspeed {
 namespace cache {
+struct StatePrepareDone {
+    std::uint64_t op_id;
+    bool success;
+};
+
 struct WriteBackDone {
     std::uint32_t op_id{};
 };

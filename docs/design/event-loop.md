@@ -6,6 +6,30 @@ where new logic belongs, how components feed results back into the scheduler,
 and what the loop body itself is allowed to contain. The rules below are
 deliberate; treat deviations as bugs in review.
 
+## Deferred state checkpoint publication
+
+A backend may retain accepted recurrent updates in request-owned storage.
+Its `deferred_state_group_ids()` advertises the affected State cache groups
+at startup. All ranks agree on the union before constructing their mirrored
+schedulers, including pipeline stages with no local layer in those groups.
+Eager backends advertise no deferred groups.
+
+The scheduler emits `StatePrepareOp` only after the request's forwards have
+drained, with its actual consumed endpoint and live State blocks. The slot,
+ring and blocks remain owned by that request while preparation is pending.
+`DeviceHandle.execute` sends preparation through the forward-thread FIFO;
+`ModelExecutor` translates virtual blocks to rank-local blocks and invokes
+backend preparation on the execution stream. Backend side-stream writers
+must join that stream before returning.
+
+The handle polls the recorded device event without synchronizing. Only after
+it completes does `StatePrepareDoneEvent` enter the existing cache-op replica
+intersection, with success combined across all cache-owning ranks. This path
+works without Host L2 or a retraction snapshot pool. A rejected preparation
+still waits for its writers before failure is acknowledged; a launch or event
+error with no proven drain is fatal and produces no release ACK. Shutdown
+drains pending preparation events before closing cache resources.
+
 ## Principle 1: the loop runs no GPU work, and cannot reach any
 
 The event loop is the **control plane**: ZMQ input, gloo collectives, the C++

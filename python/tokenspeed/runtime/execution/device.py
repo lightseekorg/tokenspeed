@@ -83,6 +83,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_scheduler import Cache
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from tokenspeed.runtime.cache.l2.sizing import (
@@ -205,6 +206,8 @@ class DeviceSpecs:
             rows (the PD decode role, whose prefill node returns them) or its
             LM head scores every prompt row on this rank (no row narrowing,
             no pipeline split). The ingress refuses such requests otherwise.
+        deferred_state_group_ids: Groups requiring a preparation ACK before
+            publication, agreed across ranks at startup.
         cache_state_group_ids: Group ids of the state cache groups,
             for the per-group page-usage debug line. Empty for pools with no
             recurrent/conv state.
@@ -235,6 +238,7 @@ class DeviceSpecs:
     supports_pd_layerwise_finalization: bool
     supports_prompt_logprobs: bool
     cache_state_group_ids: tuple[str, ...]
+    deferred_state_group_ids: tuple[str, ...]
     num_host_pages: int
     num_snapshot_pages: int
     max_retracted_requests: int
@@ -364,6 +368,9 @@ class DeviceHandle:
         # submission that raised would otherwise vanish with the hitter's
         # block left unfilled.
         self._copy_submissions: deque = deque()
+        # Futures return device events; only an event query may release an ACK.
+        self._state_prepare_submissions: deque = deque()
+        self._state_prepare_events: list = []
 
     # ------------------------------------------------------------------
     # Per-round work
@@ -439,6 +446,15 @@ class DeviceHandle:
         )
 
         executor = self._executor
+        for operation in execution_plan.state_prepares:
+            self._state_prepare_submissions.append(
+                (
+                    operation.op_id,
+                    self._thread.submit(
+                        lambda op=operation: executor.prepare_state_checkpoint(op)
+                    ),
+                )
+            )
         cache_ops = cache_ops_from_plan(execution_plan)
         l2 = self._l2 if cache_ops else None
         if l2 is not None:
@@ -609,10 +625,10 @@ class DeviceHandle:
         return PendingExecution(self._thread.submit(_forward))
 
     def poll_cache_results(self) -> list:
-        """Collect completed Host cache ops (both tiers); never blocks.
+        """Collect completed Host cache and state preparation ops; never blocks.
 
         Yields the scheduler's ACK kinds -- ``WriteBackDoneEvent``,
-        ``LoadBackDoneEvent``, ``PrefetchDoneEvent`` (once the hooks
+        ``StatePrepareDoneEvent``, ``LoadBackDoneEvent``, ``PrefetchDoneEvent`` (once the hooks
         converged the op), ``SnapshotDoneEvent``, ``RestoreDoneEvent`` --
         for ``CacheOpHooks`` to replica-intersect and the loop to advance.
 
@@ -633,17 +649,28 @@ class DeviceHandle:
             RuntimeError: A queued cache submission raised on the data plane.
         """
         l2 = self._l2
-        if l2 is None:
-            raise RuntimeError(
-                "cache results polled without --enable-kvstore or a retraction "
-                "snapshot pool"
-            )
         _settle(
             self._l2_submissions,
             "L2 cache-plan submission failed on the data plane; its ops have "
             "no completion events and would hang their cache-gated requests",
         )
-        return l2.poll_results()
+        while self._state_prepare_submissions:
+            op_id, future = self._state_prepare_submissions[0]
+            if not future.done():
+                break
+            # A launch failure is fatal: without a drain event no ACK is safe.
+            event, success = future.result()
+            self._state_prepare_submissions.popleft()
+            self._state_prepare_events.append((op_id, event, success))
+        results = l2.poll_results() if l2 is not None else []
+        pending = []
+        for op_id, event, success in self._state_prepare_events:
+            if event.query():
+                results.append(Cache.StatePrepareDoneEvent(op_id, success))
+            else:
+                pending.append((op_id, event, success))
+        self._state_prepare_events = pending
+        return results
 
     def consume_l3_backup_poll_failure(self) -> bool:
         """Whether an L3 backup future failed since the last consume.
@@ -731,6 +758,19 @@ class DeviceHandle:
                     future.result()
                 except BaseException as exc:  # noqa: BLE001 — surface after close
                     errors.append(exc)
+        while self._state_prepare_submissions:
+            op_id, future = self._state_prepare_submissions.popleft()
+            try:
+                event, success = future.result()
+                self._state_prepare_events.append((op_id, event, success))
+            except BaseException as exc:  # noqa: BLE001 — surface after close
+                errors.append(exc)
+        for _, event, _ in self._state_prepare_events:
+            try:
+                event.synchronize()
+            except BaseException as exc:  # noqa: BLE001 — surface after close
+                errors.append(exc)
+        self._state_prepare_events.clear()
         if self._l2 is not None:
             self._thread.run(self._l2.shutdown)
         if errors:
@@ -1750,7 +1790,24 @@ def build_device_side(
         executor.config.spec_num_steps,
         executor.config.spec_num_tokens,
     )
+    # Every mirrored scheduler must gate the same groups, including pipeline
+    # stages with no local deferred-state layer. This is startup metadata only.
+    deferred_state_groups = executor.deferred_state_group_ids()
+    if server_args.mapping.world_size > 1:
+        import torch.distributed as dist
+
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
+
+        group = pg_manager.get_process_group("gloo", server_args.mapping.world_group)
+        gathered = [None] * dist.get_world_size(group)
+        dist.all_gather_object(gathered, deferred_state_groups, group=group)
+        deferred_state_groups = tuple(
+            sorted({group_id for rank_groups in gathered for group_id in rank_groups})
+        )
     specs = DeviceSpecs(
+        deferred_state_group_ids=deferred_state_groups,
         cache_geometry=views.cache_geometry,
         cache_groups=views.cache_groups,
         cache_storage=attention.cache_storage,

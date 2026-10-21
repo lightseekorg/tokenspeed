@@ -68,7 +68,12 @@ from tokenspeed.runtime.engine.scheduler_utils import (
 logger = logging.getLogger(__name__)
 
 
-def cache_hooks_armed(*, enable_kvstore: bool, max_retracted_requests: int) -> bool:
+def cache_hooks_armed(
+    *,
+    enable_kvstore: bool,
+    max_retracted_requests: int,
+    deferred_state_groups: tuple[str, ...],
+) -> bool:
     """Whether the engine can emit cache ops, so the hooks must poll for them.
 
     Armed hooks poll completions and run a gloo all-reduce while a cache op is open, so
@@ -77,11 +82,16 @@ def cache_hooks_armed(*, enable_kvstore: bool, max_retracted_requests: int) -> b
     (the scheduler retracts by snapshot store and resumes by restore).
 
     Args:
+        deferred_state_groups: State groups requiring publication preparation.
         enable_kvstore: The Host L2 tier is configured.
         max_retracted_requests: The retraction snapshot pool's slot-state
             rows; positive when a pool is configured.
     """
-    return bool(enable_kvstore) or max_retracted_requests > 0
+    return (
+        bool(enable_kvstore)
+        or max_retracted_requests > 0
+        or bool(deferred_state_groups)
+    )
 
 
 class CacheOpHooks:
@@ -150,6 +160,9 @@ class CacheOpHooks:
         if self._device is None:
             return 0
         num_snapshot_ops = 0
+        num_prepares = len(execution_plan.state_prepares)
+        self._num_inflight += num_prepares
+        self._num_open += num_prepares
         for op in cache_ops_from_plan(execution_plan):
             if isinstance(op, (SnapshotOp, RestoreOp, PrefetchOp)):
                 self._num_inflight += 1

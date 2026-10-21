@@ -182,6 +182,46 @@ def _run_closed_loop(scheduler, rids: list[str]) -> dict:
 
 
 class TestDRoleStateSlots:
+    @pytest.mark.parametrize("deferred", [False, True])
+    def test_slot_full_remote_queue_retries_after_resident_release(self, deferred):
+        """Skipping admission at a full slot pool must not lose queued work.
+
+        A deferred owner keeps the slot through its publication ACK; the
+        queued remote request may only reuse it after that fence.
+        """
+        config = _d_role_config(decode_input_tokens=1)
+        config.max_batch_size = 1
+        scheduler = ts.Scheduler(config, list(K3_STATE_GROUPS) if deferred else [])
+        _submit_and_bootstrap(scheduler, ["resident", "queued"])
+        first = scheduler.next_execution_plan().remote_prefill
+        assert list(first.request_ids) == ["resident"]
+        slot = int(first.request_pool_indices[0])
+        for _ in range(4):
+            plan = scheduler.next_execution_plan()
+            assert plan.remote_prefill is None
+            assert not plan.aborts
+        _land(scheduler, "resident")
+        [batch] = _dispatched(scheduler.next_execution_plan())
+        assert list(batch.request_ids) == ["resident"]
+        _advance(scheduler, "resident", [201])
+        _finish(scheduler, "resident")
+        plan = scheduler.next_execution_plan()
+        if deferred:
+            assert plan.remote_prefill is None
+            (prepare,) = plan.state_prepares
+            assert scheduler.next_execution_plan().remote_prefill is None
+            scheduler.advance(
+                ts.ExecutionEvent().add_event(
+                    ts.Cache.StatePrepareDoneEvent(prepare.op_id, True)
+                )
+            )
+            plan = scheduler.next_execution_plan()
+        assert list(plan.remote_prefill.request_ids) == ["queued"]
+        assert list(plan.remote_prefill.request_pool_indices) == [slot]
+        _land(scheduler, "queued")
+        [batch] = _dispatched(scheduler.next_execution_plan())
+        assert list(batch.request_ids) == ["queued"]
+
     def test_pool_filled_by_remote_admissions_before_landing_never_wedges(self):
         """Every admitted request owns the slot its decodes write; once the KV
         lands, all of them run to completion and release every page."""

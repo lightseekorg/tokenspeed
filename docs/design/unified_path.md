@@ -82,6 +82,10 @@ unconditionally at wrapper construction, `enforce_eager` included. A decode
 above the ladder runs the same refresh with no graph; it is a first-class
 path, not a fallback.
 
+CPU staging for packed block tables is pinned on CUDA and NPU so the per-step
+upload can remain asynchronous. Each forward owns fresh staging storage; later
+steps must not overwrite a buffer still consumed by an overlapping forward.
+
 ### Ascend context-parallel decode
 
 Ascend DSA context-parallel decode uses one prepared communicator for fused

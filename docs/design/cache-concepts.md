@@ -2035,3 +2035,14 @@ KVStore disabled, using the target router directly. Local offloaded prefill
 and mixed-arena sleep/wake are unsupported. Eager and CUDA-graph decode
 use the same batch, access, and accepted-writeback hooks; execution details are
 in `unified_path.md`, "Sparse KV offloading".
+
+
+### KDA convolution field orientation
+
+`conv_state` stores convolution history as `[channel, history]` within a
+page. `conv_state_channels_last` stores `[history, channel]`; the field name
+makes its PD partition axis explicit (0 and 1 respectively). Both schemas
+partition Q, K and V channel segments independently when P and D use different
+TP sizes. The hybrid KDA pool exposes either layout as the same logical
+`[page, channel, history]` compute view, using a transpose for channels-last
+storage without copying the checkpoint. A layer cannot declare both fields.

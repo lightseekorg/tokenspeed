@@ -34,6 +34,9 @@ class _RuntimeStates:
     def __init__(self):
         self.valid_cache_lengths = torch.arange(20, dtype=torch.int32)
 
+    def bind_cache_request_slots(self, request_ids, slots):
+        self.owners = dict(zip(slots, request_ids, strict=True))
+
     def reset_states(self, req_pool_indices, prefix_lens):
         self.valid_cache_lengths[req_pool_indices] = prefix_lens
 
@@ -91,6 +94,7 @@ def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
     executor.runtime_states = _RuntimeStates()
 
     forward_op = SimpleNamespace(
+        request_ids=["r7", "r11", "r13"],
         request_pool_indices=[7, 11, 13],
         prefill_lengths=[15, 17, 19],
         extend_prefix_lens=[0, 0],
@@ -108,6 +112,7 @@ def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
 
     executor.reset_remote_prefill_cache_lengths(forward_op)
 
+    assert executor.runtime_states.owners == {7: "r7", 11: "r11"}
     assert executor.runtime_states.valid_cache_lengths[7].item() == 15
     assert executor.runtime_states.valid_cache_lengths[11].item() == 17
     # Only the extend rows are seeded; the third row is not part of this op.

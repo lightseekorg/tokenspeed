@@ -210,30 +210,60 @@ def fake_cache_ops(monkeypatch: pytest.MonkeyPatch):
 
 def test_disabled_kvstore_is_a_no_op() -> None:
     hooks = _single_rank_hooks(None)
-    hooks.count_plan_ops(SimpleNamespace(cache=[SimpleNamespace()]))
+    hooks.count_plan_ops(SimpleNamespace(state_prepares=[], cache=[SimpleNamespace()]))
     assert hooks.poll_ready_events() == []
 
 
 def test_hooks_arm_for_l2_and_for_the_retraction_snapshot_pool() -> None:
     # Armed hooks all-reduce every round, so only an engine that can emit
     # cache ops arms them: the L2 tier, or a pool the scheduler retracts into.
-    assert cache_hooks_armed(enable_kvstore=True, max_retracted_requests=0)
-    assert cache_hooks_armed(enable_kvstore=True, max_retracted_requests=4)
-    assert cache_hooks_armed(enable_kvstore=False, max_retracted_requests=4)
-    assert not cache_hooks_armed(enable_kvstore=False, max_retracted_requests=0)
+    assert cache_hooks_armed(
+        enable_kvstore=True, max_retracted_requests=0, deferred_state_groups=()
+    )
+    assert cache_hooks_armed(
+        enable_kvstore=True, max_retracted_requests=4, deferred_state_groups=()
+    )
+    assert cache_hooks_armed(
+        enable_kvstore=False, max_retracted_requests=4, deferred_state_groups=()
+    )
+    assert not cache_hooks_armed(
+        enable_kvstore=False, max_retracted_requests=0, deferred_state_groups=()
+    )
+
+
+@pytest.mark.parametrize("success", [True, False])
+def test_state_prepare_ack_closes_its_ticket_with_success_preserved(success):
+    device = _Device()
+    hooks = _single_rank_hooks(device)
+    hooks.count_plan_ops(SimpleNamespace(state_prepares=[object()], cache=[]))
+    assert hooks.poll_ready_events() == []
+    device.results = [Cache.StatePrepareDoneEvent(71, success)]
+    ready = hooks.poll_ready_events()
+    assert [(event.op_id, event.success) for event in ready] == [(71, success)]
+    assert hooks._num_open == 0
+    assert hooks._num_inflight == 0
+    assert hooks.poll_ready_events() == []
+
+
+def test_hooks_arm_for_deferred_state_without_host_cache() -> None:
+    assert cache_hooks_armed(
+        enable_kvstore=False,
+        max_retracted_requests=0,
+        deferred_state_groups=("state",),
+    )
 
 
 def test_submit_counts_in_flight_and_rejects_unknown_ops(fake_cache_ops) -> None:
     device = _Device()
     hooks = _single_rank_hooks(device)
-    plan = SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[1, 2])])
+    plan = SimpleNamespace(state_prepares=[], cache=[_FakeWriteBackOp(op_ids=[1, 2])])
 
     hooks.count_plan_ops(plan)
 
     assert hooks._num_inflight == 2
 
     with pytest.raises(TypeError, match="unsupported cache op kind"):
-        hooks.count_plan_ops(SimpleNamespace(cache=[object()]))
+        hooks.count_plan_ops(SimpleNamespace(state_prepares=[], cache=[object()]))
 
 
 def test_snapshot_and_restore_batches_count_one_ticket_per_request(
@@ -246,12 +276,13 @@ def test_snapshot_and_restore_batches_count_one_ticket_per_request(
     device = _Device()
     hooks = _single_rank_hooks(device)
     plan = SimpleNamespace(
+        state_prepares=[],
         cache=[
             _FakeWriteBackOp(op_ids=[1]),
             _FakeSnapshotBatch(op_ids=[2, 3]),
             _FakeRestoreBatch(op_ids=[4]),
             _FakePrefetchBatch(op_ids=[5, 6]),
-        ]
+        ],
     )
 
     hooks.count_plan_ops(plan)
@@ -273,7 +304,9 @@ def test_snapshot_and_restore_batches_count_one_ticket_per_request(
 def test_poll_returns_completed_events_and_settles_inflight(fake_cache_ops) -> None:
     device = _Device()
     hooks = _single_rank_hooks(device)
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
+    hooks.count_plan_ops(
+        SimpleNamespace(state_prepares=[], cache=[_FakeWriteBackOp(op_ids=[7])])
+    )
 
     # Nothing completed yet: in flight, but no ready payloads.
     assert hooks.poll_ready_events() == []
@@ -302,7 +335,9 @@ def test_pp_peer_missing_writeback_keeps_payload_pending(
         pp_size=2,
         pp_cpu_group=pp_group,
     )
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
+    hooks.count_plan_ops(
+        SimpleNamespace(state_prepares=[], cache=[_FakeWriteBackOp(op_ids=[7])])
+    )
     device.results = [_writeback_done_event(7)]
 
     gather_groups: list = []
@@ -337,7 +372,9 @@ def test_pp_agreed_writeback_emits_event(
         pp_size=2,
         pp_cpu_group=pp_group,
     )
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
+    hooks.count_plan_ops(
+        SimpleNamespace(state_prepares=[], cache=[_FakeWriteBackOp(op_ids=[7])])
+    )
     device.results = [_writeback_done_event(7)]
 
     gather_groups: list = []
@@ -375,7 +412,9 @@ def test_gather_order_is_attention_tp_then_pp(
         pp_size=2,
         pp_cpu_group=pp_group,
     )
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
+    hooks.count_plan_ops(
+        SimpleNamespace(state_prepares=[], cache=[_FakeWriteBackOp(op_ids=[7])])
+    )
     device.results = [_writeback_done_event(7)]
 
     reduce_groups: list = []
@@ -415,7 +454,9 @@ def test_empty_tp_intersection_still_gathers_pp(
         pp_size=2,
         pp_cpu_group=pp_group,
     )
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
+    hooks.count_plan_ops(
+        SimpleNamespace(state_prepares=[], cache=[_FakeWriteBackOp(op_ids=[7])])
+    )
     device.results = [_writeback_done_event(7)]
 
     gather_groups: list = []
@@ -477,7 +518,9 @@ def test_replica_runs_collectives_only_while_a_ticket_is_open(
     )
 
     assert hooks.poll_ready_events() == [] and collectives == []
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
+    hooks.count_plan_ops(
+        SimpleNamespace(state_prepares=[], cache=[_FakeWriteBackOp(op_ids=[7])])
+    )
     device.results = [_writeback_done_event(7)]
     assert [e.op_id for e in hooks.poll_ready_events()] == [7]
     assert collectives == ["reduce", "gather"]
@@ -516,7 +559,9 @@ def test_tickets_stay_open_until_the_replica_commits_them(
     _install_collectives(
         monkeypatch, all_reduce=_all_reduce, all_gather_object=_all_gather_object
     )
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7, 8])]))
+    hooks.count_plan_ops(
+        SimpleNamespace(state_prepares=[], cache=[_FakeWriteBackOp(op_ids=[7, 8])])
+    )
     device.results = [_writeback_done_event(7), _writeback_done_event(8)]
     assert hooks.poll_ready_events() == []  # the peer has neither yet
     assert hooks.poll_ready_events() == []
@@ -543,7 +588,9 @@ def test_replica_backup_failure_raises_after_poll_all_reduce(
         pp_size=2,
         pp_cpu_group=pp_group,
     )
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
+    hooks.count_plan_ops(
+        SimpleNamespace(state_prepares=[], cache=[_FakeWriteBackOp(op_ids=[7])])
+    )
 
     reduce_groups: list = []
     gather_groups: list = []
@@ -622,7 +669,8 @@ def test_tp_pp_grid_counts_stay_equal_and_all_ranks_stop_polling_together(
         21: ("SnapshotDoneEvent", [3, 2, 1, 1]),
     }
     plan = SimpleNamespace(
-        cache=[_FakeWriteBackOp(op_ids=[7, 8]), _FakeSnapshotBatch([20, 21])]
+        state_prepares=[],
+        cache=[_FakeWriteBackOp(op_ids=[7, 8]), _FakeSnapshotBatch([20, 21])],
     )
     num_rounds = 9
     committed = {rank: [] for rank in range(4)}

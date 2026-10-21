@@ -21,12 +21,24 @@
 #pragma once
 
 #include <variant>
+#include <map>
+#include <string>
 
 #include "scheduler/operations/forward.h"
 #include "cache/tier/transfer.h"
 
 namespace tokenspeed {
 
-using Operation = std::variant<CacheOperation, ForwardBatch>;
+// Metadata only. The backend enqueues materialization on the forward thread
+// and acknowledges after its completion event, on every cache-owning rank.
+struct StatePrepareOperation {
+    std::uint64_t op_id;
+    std::string request_id;
+    std::int32_t request_pool_index;
+    std::int32_t num_computed_tokens;
+    std::map<std::string, std::int32_t> state_blocks;
+};
+
+using Operation = std::variant<CacheOperation, ForwardBatch, StatePrepareOperation>;
 
 }  // namespace tokenspeed

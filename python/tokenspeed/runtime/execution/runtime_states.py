@@ -117,6 +117,7 @@ class RuntimeStates:
             device=device,
         )
         self._stop_criteria_owners: list[str | None] = [None] * (req_pool_size + 1)
+        self._cache_slot_owners: list[str | None] = [None] * (req_pool_size + 1)
         # True once a slot's request ended on the device. A forward dispatched
         # behind the one that ended it (the overlap schedule) runs the slot as
         # a padding row: its state rows read nothing and write nothing
@@ -399,7 +400,7 @@ class RuntimeStates:
         # ``decode_input_id`` (no forward of its own is in flight), and the
         # prologue verifies that id single-token exactly when the bit is
         # False -- the unretracted step would have done the same.
-        del request_id
+        self.bind_cache_request_slots([request_id], [slot])
         unpack_slot_rows(self.slot_state_rows(slot), src, stream)
 
     def reset_states(
@@ -421,6 +422,24 @@ class RuntimeStates:
             self.ngram_accepted_tokens.index_fill_(0, extend_request_pool_indices, -1)
             self.ngram_needs_seed.index_fill_(0, extend_request_pool_indices, True)
 
+    def bind_cache_request_slots(
+        self, request_ids: Sequence[str], slots: Sequence[int]
+    ) -> None:
+        """Bind cache ownership on forward, remote admission, or restore."""
+        pairs = list(zip(request_ids, slots, strict=True))
+        if len({slot for _, slot in pairs}) != len(pairs):
+            raise ValueError("a cache request batch cannot repeat a slot")
+        if any(not 0 <= slot < len(self._cache_slot_owners) - 1 for _, slot in pairs):
+            raise ValueError("cache request slot is out of range or is padding")
+        for request_id, slot in pairs:
+            self._cache_slot_owners[slot] = request_id
+
+    def owns_cache_request_slot(self, request_id: str, slot: int) -> bool:
+        return (
+            0 <= slot < len(self._cache_slot_owners) - 1
+            and self._cache_slot_owners[slot] == request_id
+        )
+
     def bind_stop_criteria(
         self,
         request_ids: Sequence[str],
@@ -436,6 +455,7 @@ class RuntimeStates:
             raise ValueError(
                 f"{len(stop_criteria)} stop criteria for {len(request_ids)} requests"
             )
+        self.bind_cache_request_slots(request_ids, request_pool_indices)
         changed = [
             i
             for i, (request_id, slot) in enumerate(

@@ -37,6 +37,7 @@ enum class AbortReason : std::uint8_t {
     // budgets (snapshot pool or blob slots), so its pages were freed by
     // aborting it instead of imaging it (Scheduler::onImageDoesNotFit).
     kImageDoesNotFit = 0,
+    kStatePrepareFailed = 1,
 };
 
 // A request the scheduler finished this round: already Finished on every

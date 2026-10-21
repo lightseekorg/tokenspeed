@@ -328,6 +328,7 @@ def _plan(
     pages_to_zero=(),
     pages_to_copy=None,
     cache=(),
+    state_prepares=(),
     remote_decode=None,
     remote_prefill=None,
 ):
@@ -344,6 +345,7 @@ def _plan(
         pages_to_zero={"kv": list(pages_to_zero), "state": []},
         pages_to_copy_arrays=lambda: copies,
         cache=list(cache),
+        state_prepares=list(state_prepares),
         remote_decode=remote_decode,
         remote_prefill=remote_prefill,
     )
@@ -1025,9 +1027,75 @@ def test_shutdown_cache_surfaces_a_failed_final_round_copy_without_a_host_cache(
     assert list(handle._transfer_submissions) == []
 
 
-def test_cache_polling_without_kvstore_refuses_loudly():
-    with pytest.raises(RuntimeError, match="enable-kvstore"):
-        _handle([]).poll_cache_results()
+class _StatePrepareEvent:
+    """A device event whose asynchronous completion the test controls."""
+
+    def __init__(self):
+        self.ready = False
+        self.waited = False
+
+    def query(self):
+        return self.ready
+
+    def synchronize(self):
+        self.waited = True
+        self.ready = True
+
+
+@pytest.mark.parametrize("success", [True, False])
+def test_state_prepare_waits_for_device_completion_without_host_cache(success):
+    trace = []
+    handle = _handle(trace)
+    event = _StatePrepareEvent()
+    # The bound scheduler operation has no public constructor.
+    operation = SimpleNamespace(op_id=19)
+    handle._executor.prepare_state_checkpoint = lambda op: (event, success)
+    handle.execute(_plan(state_prepares=[operation]), None)
+    assert handle.poll_cache_results() == []
+    assert not event.waited
+    event.ready = True
+    results = handle.poll_cache_results()
+    assert [(result.op_id, result.success) for result in results] == [(19, success)]
+    assert handle.poll_cache_results() == []
+    assert not event.waited
+
+
+def test_state_prepare_pending_launch_does_not_block_polling():
+    handle = _handle([])
+    launched = Future()
+    handle._state_prepare_submissions.append((20, launched))
+    assert handle.poll_cache_results() == []
+    event = _StatePrepareEvent()
+    event.ready = True
+    launched.set_result((event, True))
+    assert [result.op_id for result in handle.poll_cache_results()] == [20]
+
+
+def test_state_prepare_launch_failure_never_acknowledges_or_releases():
+    handle = _handle([])
+    launched = Future()
+    launched.set_exception(RuntimeError("writer launch failed"))
+    handle._state_prepare_submissions.append((21, launched))
+    with pytest.raises(RuntimeError, match="writer launch failed"):
+        handle.poll_cache_results()
+    assert len(handle._state_prepare_submissions) == 1
+    assert not handle._state_prepare_events
+
+
+def test_shutdown_drains_state_prepare_without_host_cache():
+    handle = _handle([])
+    event = _StatePrepareEvent()
+    launched = Future()
+    launched.set_result((event, False))
+    handle._state_prepare_submissions.append((22, launched))
+    handle.shutdown_cache()
+    assert event.waited
+    assert not handle._state_prepare_submissions
+    assert not handle._state_prepare_events
+
+
+def test_cache_polling_without_host_cache_is_empty():
+    assert _handle([]).poll_cache_results() == []
 
 
 # ----------------------------------------------------------------------

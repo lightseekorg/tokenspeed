@@ -89,8 +89,11 @@ CacheKey eventKey(const CacheKey& key) {
 
 }  // namespace
 
-Scheduler::Scheduler(SchedulerConfig config)
+Scheduler::Scheduler(SchedulerConfig config) : Scheduler{std::move(config), {}} {}
+
+Scheduler::Scheduler(SchedulerConfig config, std::vector<std::string> deferred_state_groups)
     : config_{validated(std::move(config))},
+      deferred_state_groups_{std::move(deferred_state_groups)},
       req_pool_allocator_{config_.max_batch_size},
       snapshot_slots_{config_.max_retracted_requests},
       block_pool_{config_.device_allocator.NumUsableBlocks(), slotsPerParentByGroup(config_)},
@@ -101,6 +104,14 @@ Scheduler::Scheduler(SchedulerConfig config)
                                    snapshotPoolBlocks(config_) > 0 ? &snapshot_pool_ : nullptr,
                                    config_.StreamsDeviceCacheToHost())},
       tier_transfers_{coordinator_} {
+    for (const auto& id : deferred_state_groups_) {
+        const auto it = std::ranges::find_if(config_.cache_groups, [&id](const auto& group) {
+            return group.group_id == id && group.attn_kind == AttnKind::kState;
+        });
+        if (it == config_.cache_groups.end()) {
+            throw std::invalid_argument("deferred checkpoint group must name a State group: " + id);
+        }
+    }
     // config_.Validate() already ran; the body only derives state from it.
     cache_group_ids_.reserve(config_.cache_groups.size());
     for (const CacheGroupConfig& group : config_.cache_groups) {
@@ -212,7 +223,7 @@ bool Scheduler::cacheIsClearable(bool include_host) const {
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
-    if (has_pd_transfers || has_tier_transfers || RetractedSize() > 0) {
+    if (has_pd_transfers || has_tier_transfers || !state_prepares_.empty() || RetractedSize() > 0) {
         return false;
     }
     return coordinator_.CacheIsClearable(include_host);
@@ -233,7 +244,7 @@ bool Scheduler::clearCache(bool include_host) {
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
     const std::size_t suspended = RetractedSize();
-    if (has_pd_transfers || has_tier_transfers || suspended > 0) {
+    if (has_pd_transfers || has_tier_transfers || !state_prepares_.empty() || suspended > 0) {
         spdlog::info("[Scheduler] flush {}cache rejected: pd_transfers={} tier_transfers={} suspended_requests={}",
                      include_host ? "" : "L1 ", has_pd_transfers, has_tier_transfers, suspended);
         return false;
@@ -459,6 +470,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     ++plan_calls_;
     const std::size_t num_live_requests = candidates.size();
     ExecutionPlan plan;
+    plan.aborts = std::exchange(pending_prepare_aborts_, {});
     // Every group is listed, empty or not, so the runtime indexes the maps
     // without guarding for absent groups.
     for (const std::string& group_id : cache_group_ids_) {
@@ -499,6 +511,10 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     if (!built.snapshot_restores.empty()) {
         plan.With(CacheOperation{SnapshotRestoreBatch{built.snapshot_restores}});
     }
+    for (auto& operation : pending_state_prepares_) {
+        plan.With(std::move(operation));
+    }
+    pending_state_prepares_.clear();
     trackStalledRounds(num_live_requests,
                        /*plan_is_empty=*/!builds_work && write_back_operations.empty() &&
                            built.snapshot_stores.empty() && built.prefetches.empty() && built.load_backs.empty() &&
@@ -509,7 +525,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
 void Scheduler::trackStalledRounds(std::size_t num_live_requests, bool plan_is_empty) {
     // With nothing out, only a new submission or an abort can change the next
     // plan.
-    const bool stalled = num_live_requests > 0 && plan_is_empty && !tier_transfers_.HasAnyInFlight() &&
+    const bool stalled = num_live_requests > 0 && plan_is_empty && state_prepares_.empty() &&
+                         !tier_transfers_.HasAnyInFlight() &&
                          std::ranges::none_of(requests_, [this](const std::unique_ptr<Request>& request) {
                              return request->ResultsInFlight() > 0 || pdTransferInFlight(*request);
                          });

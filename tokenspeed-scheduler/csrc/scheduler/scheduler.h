@@ -50,6 +50,9 @@ namespace tokenspeed {
 class Scheduler {
 public:
     explicit Scheduler(SchedulerConfig config);
+    // Startup backend capability, not a server argument. Empty preserves
+    // eager backends. These State groups can hold deferred live state.
+    Scheduler(SchedulerConfig config, std::vector<std::string> deferred_state_groups);
 
     void SubmitRequests(const std::vector<RequestSpec>& request_specs);
 
@@ -235,6 +238,9 @@ private:
     // and one whose finish overtook an overlapped decode settles with that
     // decode's result -- paused or not, plan or no plan.
     void settleFinishedRequests();
+    bool ensureCheckpointReady(Request& request);
+    void abortAfterPrepare(Request& request);
+    void handleEvent(const cache::StatePrepareDone& event);
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
 
     std::size_t groupIndex(const std::string& group_id) const;
@@ -393,7 +399,7 @@ private:
     // Why a victim could not be imaged: no snapshot pool at all (the null
     // page alone is configured, so nothing is ever imaged), no blob slot
     // free, or a pool too small for the image.
-    enum class ImageShortfall { kNoPool, kBlobSlot, kSnapshotPool };
+    enum class ImageShortfall { kNoPool, kBlobSlot, kSnapshotPool, kPreparing };
     // Images the victim (Host L2 for its published pages, the snapshot pool
     // for the rest), issues both store legs and suspends it. Returns the
     // shortfall -- with nothing changed but Host entries evicted for the
@@ -433,6 +439,18 @@ private:
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
     SchedulerConfig config_;
+    std::vector<std::string> deferred_state_groups_;
+    struct PendingPrepare {
+        StatePrepareOperation operation;
+        bool ready{false};
+        bool aborted{false};
+    };
+    // Request retains its normal FSM resources while waiting. No forward or
+    // export may consume or replace them until the completion ACK lands.
+    std::map<std::string, PendingPrepare> state_prepares_;
+    std::vector<StatePrepareOperation> pending_state_prepares_;
+    std::vector<SchedulerAbort> pending_prepare_aborts_;
+    std::uint64_t next_state_prepare_id_{1};
     ReqPoolAllocator req_pool_allocator_;
     // One slot per retracted request: the index of its slot-state blob in
     // the runtime's arena, released by the FSM transition that drops the image.

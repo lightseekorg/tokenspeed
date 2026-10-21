@@ -218,6 +218,18 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::module_ pd = m.def_submodule("PD");
     nb::module_ cache = m.def_submodule("Cache");
 
+    nb::class_<tokenspeed::cache::StatePrepareDone>(cache, "StatePrepareDoneEvent")
+        .def(nb::init<std::uint64_t, bool>(), nb::arg("op_id"), nb::arg("success"))
+        .def_ro("op_id", &tokenspeed::cache::StatePrepareDone::op_id)
+        .def_ro("success", &tokenspeed::cache::StatePrepareDone::success);
+
+    nb::class_<tokenspeed::StatePrepareOperation>(cache, "StatePrepareOp")
+        .def_ro("op_id", &tokenspeed::StatePrepareOperation::op_id)
+        .def_ro("request_id", &tokenspeed::StatePrepareOperation::request_id)
+        .def_ro("request_pool_index", &tokenspeed::StatePrepareOperation::request_pool_index)
+        .def_ro("num_computed_tokens", &tokenspeed::StatePrepareOperation::num_computed_tokens)
+        .def_ro("state_blocks", &tokenspeed::StatePrepareOperation::state_blocks);
+
     nb::class_<tokenspeed::cache::WriteBackDone>(cache, "WriteBackDoneEvent")
         .def(nb::init<>())
         .def_rw("op_id", &tokenspeed::cache::WriteBackDone::op_id);
@@ -407,7 +419,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     // fit the host budgets. Already Finished on every rank; the runtime fails
     // it toward the client with `detail` as the message.
     nb::enum_<tokenspeed::AbortReason>(m, "AbortReason", nb::is_arithmetic())
-        .value("ImageDoesNotFit", tokenspeed::AbortReason::kImageDoesNotFit);
+        .value("ImageDoesNotFit", tokenspeed::AbortReason::kImageDoesNotFit)
+        .value("StatePrepareFailed", tokenspeed::AbortReason::kStatePrepareFailed);
     nb::class_<tokenspeed::SchedulerAbort>(m, "SchedulerAbort")
         .def_ro("request_id", &tokenspeed::SchedulerAbort::request_id)
         .def_ro("reason", &tokenspeed::SchedulerAbort::reason)
@@ -415,6 +428,16 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     nb::class_<tokenspeed::ExecutionPlan>(m, "ExecutionPlan")
         .def(nb::init<>())
+        .def_prop_ro("state_prepares",
+                     [](const tokenspeed::ExecutionPlan& plan) {
+                         nb::list result;
+                         for (const auto& operation : plan.Operations()) {
+                             if (const auto* prepare = std::get_if<tokenspeed::StatePrepareOperation>(&operation)) {
+                                 result.append(nb::cast(*prepare, nb::rv_policy::copy));
+                             }
+                         }
+                         return result;
+                     })
         .def_prop_ro("forward", collect_forward)
         .def_prop_ro("cache", collect_cache)
         .def_ro("aborts", &tokenspeed::ExecutionPlan::aborts)
@@ -473,6 +496,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
         .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config"))
+        .def(nb::init<tokenspeed::SchedulerConfig, std::vector<std::string>>(), nb::arg("config"),
+             nb::arg("deferred_state_groups"))
         .def("submit_requests",
              nb::overload_cast<const std::vector<tokenspeed::RequestSpec>&>(&tokenspeed::Scheduler::SubmitRequests),
              nb::arg("request_specs"))

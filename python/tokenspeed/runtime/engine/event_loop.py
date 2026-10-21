@@ -355,6 +355,7 @@ class EventLoop:
         armed = cache_hooks_armed(
             enable_kvstore=server_args.enable_kvstore,
             max_retracted_requests=specs.max_retracted_requests,
+            deferred_state_groups=specs.deferred_state_group_ids,
         )
         self._cache_hooks = CacheOpHooks(
             self._device if armed else None,
@@ -439,7 +440,7 @@ class EventLoop:
             f"prefix_replay_tokens={scheduler_cfg.prefix_replay_tokens!s} "
             f"cache_groups={[group.group_id for group in cache_groups]!s}",
         )
-        self.scheduler = Scheduler(scheduler_cfg)
+        self.scheduler = Scheduler(scheduler_cfg, list(specs.deferred_state_group_ids))
         self._l3_hooks = L3CacheHooks(
             self.scheduler,
             self._device if scheduler_cfg.enable_l3_storage else None,

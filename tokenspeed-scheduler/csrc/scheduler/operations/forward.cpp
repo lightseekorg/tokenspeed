@@ -651,8 +651,9 @@ std::optional<Scheduler::PrefillAdmission> Scheduler::schedulePrefillCandidate(
 // out, a PD transfer pin) do NOT redirect the choice; the caller waits for the
 // chosen victim to quiesce rather than sacrificing a worse-ranked request.
 Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const {
-    const auto retractable = [ignore_exemption](const Request& request) {
+    const auto retractable = [this, ignore_exemption](const Request& request) {
         return request.IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>() &&
+               !state_prepares_.contains(request.Id()) &&
                (ignore_exemption || !request.ReserveCoversGeneration(kRetractionSafeSteps));
     };
     // Rank first, then probe the host fit in rank order, so the probe (which
@@ -750,6 +751,10 @@ std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
     if (snapshot_slots_.AvailableSlots() == 0) {
         return ImageShortfall::kBlobSlot;
     }
+    if (!ensureCheckpointReady(victim)) {
+        build.scheduled.insert(&victim);
+        return ImageShortfall::kPreparing;
+    }
     publishCompletedPrefix(victim);
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
 
@@ -770,6 +775,7 @@ std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
     victim.Apply(fsm::SnapshotRetractEvent{&coordinator_, next_retraction_epoch_++, victim.HasGeneratedOutput(),
                                            std::move(stores->image), std::move(blob_slot),
                                            std::move(stores->pending_store_ops)});
+    state_prepares_.erase(victim.Id());
     spdlog::info("[Scheduler] retract: suspended request {} ({} tokens) with its image", victim.Id(),
                  victim.TokenSize());
     return std::nullopt;
@@ -778,6 +784,8 @@ std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
 void Scheduler::onImageDoesNotFit(Request& victim, ImageShortfall shortfall, PlanBuild& build) {
     std::string detail;
     switch (shortfall) {
+        case ImageShortfall::kPreparing:
+            throw std::logic_error("pending checkpoint is not an image capacity failure");
         case ImageShortfall::kNoPool:
             detail =
                 "the engine has no snapshot pool, so a capacity block aborts a request instead of imaging one "
@@ -926,6 +934,9 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         } else {
             shortfall =
                 snapshot_slots_.AvailableSlots() == 0 ? ImageShortfall::kBlobSlot : ImageShortfall::kSnapshotPool;
+        }
+        if (shortfall == ImageShortfall::kPreparing) {
+            return;  // no pages freed; retry admission after preparation
         }
         if (shortfall) {
             onImageDoesNotFit(*victim, *shortfall, build);
@@ -1336,6 +1347,25 @@ Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan
     // identical on every rank -- so within a phase, older requests win.
     AdmissionFeedback feedback;
     PlanBuild build{plan};
+    // Finish uses Finishing's resource ownership. Retraction keeps its
+    // existing forward state, but sits out every forward while preparing.
+    // Walk submission order so every mirrored scheduler emits identical ops.
+    for (const auto& request : requests_) {
+        const auto it = state_prepares_.find(request->Id());
+        if (it == state_prepares_.end()) {
+            continue;
+        }
+        build.scheduled.insert(request.get());
+        if (it->second.ready && !request->Is<fsm::Finishing>()) {
+            if (auto shortfall = retractVictim(*request, build, write_back_operations)) {
+                state_prepares_.erase(request->Id());
+                onImageDoesNotFit(*request, *shortfall, build);
+            }
+        }
+    }
+    // The phase grammars must not reconsider a held request, including their
+    // capacity-victim and forced-retraction paths.
+    std::erase_if(candidates, [&build](Request* request) { return build.Scheduled(*request); });
     build.token_budget = config_.max_scheduled_tokens;
     switch (config_.role) {
         case Role::kP:

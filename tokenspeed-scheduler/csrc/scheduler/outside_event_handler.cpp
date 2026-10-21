@@ -49,7 +49,7 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
     if (request == nullptr || request->Is<fsm::Finished>()) {
         return;
     }
-    request->Apply(fsm::AbortEvent{&coordinator_});
+    abortAfterPrepare(*request);
 }
 
 void Scheduler::handleEvent(const pd::SucceededEvent& event) {
@@ -100,10 +100,14 @@ void Scheduler::settleFinishedRequests() {
         if (!request->Is<fsm::Finishing>() || request->ResultsInFlight() > 0) {
             continue;
         }
+        if (!ensureCheckpointReady(*request)) {
+            continue;
+        }
         if (auto store = publishCompletedPages(*request)) {
             pending_write_back_operations_.push_back(std::move(*store));
         }
         request->Apply(fsm::ReleaseEvent{&coordinator_});
+        state_prepares_.erase(request->Id());
     }
 }
 
@@ -153,7 +157,67 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
 
 void Scheduler::handleEvent(const forward::Abort& event) {
     if (Request* request = findRequest(event.request_id)) {
-        request->Apply(fsm::AbortEvent{&coordinator_});
+        abortAfterPrepare(*request);
+    }
+}
+
+bool Scheduler::ensureCheckpointReady(Request& request) {
+    if (deferred_state_groups_.empty() || request.NumComputedTokens() == 0) {
+        return true;
+    }
+    const auto it = state_prepares_.find(request.Id());
+    if (it != state_prepares_.end()) {
+        _assert(it->second.operation.num_computed_tokens == request.NumComputedTokens(),
+                "checkpoint frontier changed while preparing");
+        return it->second.ready && !it->second.aborted;
+    }
+    _assert(request.ResultsInFlight() == 0, "checkpoint prepare requires a quiescent request");
+    StatePrepareOperation operation{
+        .op_id = next_state_prepare_id_++,
+        .request_id = request.Id(),
+        .request_pool_index = request.RequestPoolIndex(),
+        .num_computed_tokens = request.NumComputedTokens(),
+        .state_blocks = {},
+    };
+    for (const auto& id : deferred_state_groups_) {
+        const auto index = static_cast<std::int32_t>(groupIndex(id));
+        const auto pages = coordinator_.Allocator(index).BlockTablePageIds(request.BlockTablesRef()[index]);
+        _assert(pages.size() == 2 && pages[1] > 0, "checkpoint prepare requires a live State block");
+        operation.state_blocks.emplace(id, pages[1]);
+    }
+    pending_state_prepares_.push_back(operation);
+    state_prepares_.emplace(request.Id(), PendingPrepare{.operation = std::move(operation)});
+    return false;
+}
+
+void Scheduler::abortAfterPrepare(Request& request) {
+    const auto it = state_prepares_.find(request.Id());
+    if (it != state_prepares_.end() && !it->second.ready) {
+        it->second.aborted = true;
+        return;  // even a cancelled writer must drain before slot/block reuse
+    }
+    state_prepares_.erase(request.Id());
+    request.Apply(fsm::AbortEvent{&coordinator_});
+}
+
+void Scheduler::handleEvent(const cache::StatePrepareDone& event) {
+    const auto it = std::ranges::find_if(
+        state_prepares_, [&event](const auto& entry) { return entry.second.operation.op_id == event.op_id; });
+    if (it == state_prepares_.end() || it->second.ready) {
+        return;  // duplicate or stale ACK cannot release a new owner
+    }
+    Request* request = findRequest(it->first);
+    _assert(request != nullptr, "preparing request lost its resources");
+    it->second.ready = true;
+    if (!event.success || it->second.aborted) {
+        if (!event.success && !it->second.aborted) {
+            pending_prepare_aborts_.push_back(SchedulerAbort{
+                .request_id = request->Id(),
+                .reason = AbortReason::kStatePrepareFailed,
+                .detail = "checkpoint preparation failed; state was not published",
+            });
+        }
+        abortAfterPrepare(*request);  // failed preparation is never published
     }
 }
 
