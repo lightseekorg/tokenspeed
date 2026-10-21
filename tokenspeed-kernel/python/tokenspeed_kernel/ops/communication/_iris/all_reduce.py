@@ -379,7 +379,10 @@ class ProducerPull:
 
     def can_run(self, shapes: tuple[tuple[int, ...], ...]) -> bool:
         data = self.producer.data
-        return current_platform().is_cdna4 and producer_direct_all_reduce_can_run(
+        platform = current_platform()
+        return (
+            platform.is_cdna4 or platform.is_cdna5
+        ) and producer_direct_all_reduce_can_run(
             self.producer.peers.world_size,
             sum(math.prod(shape) for shape in shapes),
             data.dtype,
@@ -439,9 +442,12 @@ class ProducerPull:
 
 
 class ProducerLamport:
-    """Own a TP8 BF16 Lamport mailbox for the shapes selected during preparation."""
+    """Own a BF16 Lamport mailbox into which every rank pushes its local tiles."""
 
     WORLD_SIZE = 8
+    ALL_REDUCE_WORLD_SIZES = (2, 4, 8)
+    # The mailbox holds NUM_STAGES * world_size copies of the largest payload.
+    ALL_REDUCE_MAX_NUMEL = 128 * 10752
     BLOCK_ELEMENTS = 512
     NUM_STAGES = 3
     NUM_SUBGROUPS = 1
@@ -449,6 +455,7 @@ class ProducerLamport:
 
     @staticmethod
     def supported(world_size: int, dtype: torch.dtype) -> bool:
+        """Whether K3's TP8 MoE window can use Lamport."""
         return (
             current_platform().is_cdna4
             and world_size == ProducerLamport.WORLD_SIZE
@@ -456,23 +463,40 @@ class ProducerLamport:
         )
 
     @staticmethod
+    def all_reduce_numel(
+        staged_max_numel: int,
+        producer_max_numel: int,
+        world_size: int,
+        dtype: torch.dtype,
+    ) -> int:
+        """Return the mailbox capacity generic all-reduces use, or 0 for none.
+
+        On CDNA5 (gfx1250), Lamport outruns every flag-synchronized protocol
+        at the measured TP2, TP4 and TP8 sizes, staged or producer-direct. A
+        tray holds four GPUs, so TP8 spans two trays in one fabric domain.
+        """
+        if not (
+            current_platform().is_cdna5
+            and world_size in ProducerLamport.ALL_REDUCE_WORLD_SIZES
+            and dtype == torch.bfloat16
+        ):
+            return 0
+        numel = min(
+            max(staged_max_numel, producer_max_numel),
+            ProducerLamport.ALL_REDUCE_MAX_NUMEL,
+        )
+        return numel // ProducerLamport.BLOCK_ELEMENTS * ProducerLamport.BLOCK_ELEMENTS
+
+    @staticmethod
     def heap_bytes(max_numel: int, world_size: int) -> int:
         return allocation_bytes(
             (ProducerLamport.NUM_STAGES, world_size, max_numel), torch.bfloat16
         )
 
-    def __init__(
-        self,
-        producer: ProducerBuffer,
-        *,
-        max_numel: int,
-    ):
+    def __init__(self, peers: IrisGroup, *, max_numel: int):
+        assert 0 < max_numel and max_numel % self.BLOCK_ELEMENTS == 0
         self._arch = iris_arch_policy()
-        self.producer = producer
-        peers = producer.peers
-        assert self.supported(peers.world_size, producer.data.dtype)
-        assert 0 < max_numel <= producer.data.numel()
-        assert max_numel % self.BLOCK_ELEMENTS == 0
+        self.peers = peers
         self.max_numel = max_numel
         self.mailbox = peers.ctx.zeros(
             (self.NUM_STAGES, peers.world_size, self.max_numel), dtype=torch.bfloat16
@@ -490,15 +514,26 @@ class ProducerLamport:
             address % self.TRANSACTION_BYTES == 0 for address in self.peer_mailboxes
         )
 
-    def run(self, out: torch.Tensor) -> None:
+    def can_run(self, numel: int) -> bool:
+        # Depends on the payload size alone, so every rank picks the same protocol.
+        return 0 < numel <= self.max_numel and numel % self.BLOCK_ELEMENTS == 0
+
+    def run(self, inputs: torch.Tensor, out: torch.Tensor) -> None:
+        """Reduce the first ``out.numel()`` elements of ``inputs`` into ``out``.
+
+        ``inputs`` is read only locally and may be ``out`` itself. Both must be
+        contiguous and 16-byte aligned.
+        """
+        assert inputs.data_ptr() % self.TRANSACTION_BYTES == 0
+        assert out.data_ptr() % self.TRANSACTION_BYTES == 0
         iris_lamport_allreduce[(out.numel() // self.BLOCK_ELEMENTS,)](
-            self.producer.data,
+            inputs,
             self.mailbox,
             out,
             self.epochs,
             *self.peer_mailboxes,
-            RANK=self.producer.peers.rank,
-            WORLD_SIZE=self.producer.peers.world_size,
+            RANK=self.peers.rank,
+            WORLD_SIZE=self.peers.world_size,
             TOTAL_ELEMENTS=out.numel(),
             MAX_ELEMENTS=self.max_numel,
             NUM_STAGES=self.NUM_STAGES,
@@ -542,6 +577,11 @@ def all_reduce_heap_bytes(
             size += StagedPullOneShot.heap_bytes(numel, world_size, dtype, block_size)
         if StagedPullTwoShot.supported(world_size, dtype):
             size += StagedPullTwoShot.heap_bytes(staged_max_numel, world_size, dtype)
+    lamport_numel = ProducerLamport.all_reduce_numel(
+        staged_max_numel, producer_max_numel, world_size, dtype
+    )
+    if lamport_numel:
+        size += ProducerLamport.heap_bytes(lamport_numel, world_size)
     return size
 
 
