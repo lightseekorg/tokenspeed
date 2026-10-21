@@ -854,6 +854,15 @@ the draft's attention to the full history.
 Use `--attention-backend mha` and `--drafter-attention-backend mha` for
 standard or grouped-query attention in the target and draft, respectively.
 
+## PD transport
+
+Mooncake KV transfer selects `ascend_direct` on Ascend NPU and `rdma` on
+GPU platforms. Install a Mooncake build that supports the selected transport
+and exposes `TransferEngine.batch_transfer_sync_write_pages`. The page API
+is required; TokenSpeed does not expand page transfers through an older API.
+Both Prefill and Decode engines select their transport from the detected
+platform.
+
 ## Observability
 
 | Parameter | Purpose |

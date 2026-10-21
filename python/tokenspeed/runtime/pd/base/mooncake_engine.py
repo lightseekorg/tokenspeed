@@ -22,6 +22,7 @@ import logging
 import os
 
 import numpy as np
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.utils.network import is_valid_ipv6_address, join_host_port
 
@@ -119,7 +120,7 @@ class MooncakeTransferEngine:
         ret_value = self.engine.initialize(
             hostname,
             "P2PHANDSHAKE",
-            "rdma",
+            "ascend_direct" if current_platform().is_npu else "rdma",
             device_name if device_name is not None else "",
         )
         if ret_value != 0:
