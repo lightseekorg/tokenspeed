@@ -813,7 +813,7 @@ standard or grouped-query attention in the target and draft, respectively.
 | --- | --- |
 | `--log-level` | Runtime log level. |
 | `--enable-log-requests` | Log request metadata and optionally payloads. On by default; `--no-enable-log-requests` disables. |
-| `--log-requests-level` | Request logging verbosity. |
+| `--log-requests-level` | Request logging verbosity: level 0 logs metadata without reconstructing prompt text; levels 1 and 2 include truncated and full payloads, respectively. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
 | `--enable-metrics` | Enable the selected metrics reporters. |
 | `--metrics-reporters` | Select `prometheus` or an installed metric output; repeat for multiple. Defaults to `prometheus`. |
