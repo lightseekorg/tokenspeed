@@ -126,6 +126,28 @@ independent weight streams in flight per CU, which suits cold weights.
   hipBLASLt) in cold-cache standalone sweeps. The dense decode GEMV's own
   measured shapes route single rows to `mv` separately.
 
+### gfx950 FP32 router GEMV
+
+`gluon_fp32_router_gemv_gfx950` (`gemm/fp32/router_gemv.py`) computes
+`(x @ w.T) * multiplier` in FP32 for router decode batches, `1 <= M <= 16`,
+with one program per output. `gemm.fp32_router_gemv_plan` selects it on
+gfx950 and transposes the router weight once to `[N, K]`.
+
+#### Contract
+
+- `x` is a contiguous FP32 `[M, K]` matrix and `w` a contiguous FP32 `[N, K]`
+  matrix. `M > 16` or `K > 16384` takes `torch.matmul` and a multiply.
+- A row's logits are bitwise the same at every `M` the kernel serves.
+- One binary per (shape, multiplier, power-of-two M bucket); `M` is a runtime
+  argument.
+
+#### Algorithm
+
+A program stages its weight row in LDS with asynchronous `.cg` copies and
+keeps one FP32 FMA partial per row of `x`; one reduction across lanes and
+waves finishes the output. Every weight element is read once for all rows,
+and the summation order depends only on `K`.
+
 ### gfx950 dense BF16 decode GEMV
 
 `gluon_gemv_a16w16_gfx950` (`gemm/fp16/gemv.py`) computes `x @ w.T` for
@@ -162,8 +184,9 @@ constexprs alone.
   128 bytes per lane each) takes the rest: more rows per wave, where it
   measured 1-8% faster, and shares that leave fewer than four ring chunks.
 - M = 2-16 (MFMA tile): a 16-row batched MFMA whose batch dimension is the
-  wave, so the four waves split every K iteration and reduce through LDS once;
-  weights load K-contiguous and reach the operand layout through LDS.
+  wave, so the waves split every K iteration and reduce through LDS once;
+  weights load K-contiguous and reach the operand layout through LDS. K >= 8192
+  uses eight waves instead of four.
 - Weight loads are streaming (`.cg`). K loops are unrolled: a loop-carried
   register copy of a pending load waits for the load and serializes the chunks.
 

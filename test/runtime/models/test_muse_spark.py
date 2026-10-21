@@ -1460,6 +1460,35 @@ def test_attention_output_preserves_dense_projection(
         assert result.data_ptr() == output.data_ptr()
 
 
+@requires_gpu
+@pytest.mark.parametrize("tokens", [2, 16])
+def test_gathered_projection_writes_decode_rows_into_the_caller_buffer(
+    bf16_default_dtype, tokens: int
+) -> None:
+    """Multi-row decode batches land in the gather input, not a copy of a new result."""
+    from tokenspeed_kernel.ops.gemm import mm
+
+    if not current_platform().is_cdna4:
+        pytest.skip("the direct gather-slice projection is the CDNA4 path")
+    torch.manual_seed(5)
+    with torch.device("cuda"):
+        linear = _shard_linear(512, 8192, tp_rank=0, tp_size=1)
+    linear.weight.data.normal_(std=0.02)
+    x = torch.randn((tokens, 8192), device="cuda", dtype=torch.bfloat16)
+    local = torch.full((tokens, 512), torch.nan, device="cuda")
+    linear._project(x, linear.weight, local)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+
+    result = linear._project(x, linear.weight, local)
+
+    # Copying through a fresh [tokens, 512] result would raise the peak.
+    assert torch.cuda.max_memory_allocated() == before
+    assert result is local
+    assert torch.equal(local, mm(x, linear.weight))
+
+
 def _gathered_mxfp4_workspace_worker(rank: int, port: int, world_size: int) -> None:
     from tokenspeed_kernel.ops.communication._iris.muse_spark import (
         prepare_muse_communication,
