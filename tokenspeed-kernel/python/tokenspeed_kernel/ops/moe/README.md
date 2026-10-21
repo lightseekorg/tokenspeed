@@ -9,6 +9,11 @@ execution also returns a map from each original route to its output row, with
 `-1` for remote experts. Consumers normalize each route before weighting and
 summation. Combining routes before normalization changes the operation.
 
+`gather_moe_routes` restores token/route order from a deferred output map and
+zeros absent routes. A kernel declaring `deferred_output_is_token_order` writes
+each route it owns to row `token * topk + slot`; with EP > 1 the other rows are
+stale, so `gather_moe_routes` still zeros them.
+
 The solution modules register these operations. Shared Triton helpers live in
 `_triton/`, and the CuTe DSL routed reduction lives in `_cute_dsl/`. They use
 the same registry and public dispatchers as the other MoE operations.
