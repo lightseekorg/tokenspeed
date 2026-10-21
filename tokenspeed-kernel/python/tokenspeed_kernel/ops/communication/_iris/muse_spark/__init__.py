@@ -37,7 +37,10 @@ from tokenspeed_kernel.ops.communication._iris.all_gather import (
     iris_fused_pull_allgather_rmsnorm_mxfp4,
     iris_pull_allgather_rows,
 )
-from tokenspeed_kernel.ops.communication._iris.all_reduce import ProducerAllReduce
+from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+    ProducerAllReduce,
+    iris_cache_policy,
+)
 from tokenspeed_kernel.ops.communication._iris.broadcast import IrisBroadcast
 from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
     iris_pack_moe_inputs,
@@ -939,7 +942,9 @@ class MuseIrisState:
             and num_tokens * 4096 <= self.reduction.lamport_max_numel
         ):
             assert self.gather.output is not None
-            iris_fused_lamport_allreduce_routed_rmsnorm_sum[(num_tokens,)](
+            iris_fused_lamport_allreduce_routed_rmsnorm_sum[
+                (num_tokens * (4096 // 512),)
+            ](
                 routes,
                 route_map,
                 route_weights,
@@ -954,7 +959,8 @@ class MuseIrisState:
                 EPS=eps,
                 MAX_ELEMENTS=self.reduction.lamport_max_numel,
                 PORTABLE_MATH=num_tokens > 16,
-                num_warps=8,
+                PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
+                num_warps=1,
             )
             return self.gather.output[: num_tokens * 4096].view(num_tokens, 4096)
         assert self.all_reduce.producer.data is not None
