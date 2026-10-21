@@ -99,18 +99,12 @@ def pinned_host_bytes(nbytes: int) -> int:
     return 1 << (nbytes - 1).bit_length() if nbytes > 0 else 0
 
 
-def largest_pinned_fit(room_bytes: int) -> int:
-    """The largest buffer whose pinned size (``pinned_host_bytes``) fits in
-    ``room_bytes``: the largest power of two in it, 0 without room."""
-    return 1 << (room_bytes.bit_length() - 1) if room_bytes > 0 else 0
-
-
 def check_host_memory(requested_bytes: int, *, share_bytes: int, purpose: str) -> None:
     """Refuse a pinned allocation larger than this rank's share of the node.
 
     Args:
         requested_bytes: The Host memory the pinned buffers about to be
-            allocated take, each counted by ``pinned_host_bytes``.
+            allocated take.
         share_bytes: This rank's share (``host_memory_share``).
         purpose: Names the allocation in the error.
 
@@ -120,8 +114,8 @@ def check_host_memory(requested_bytes: int, *, share_bytes: int, purpose: str) -
     if requested_bytes > share_bytes:
         raise ValueError(
             f"Not enough Host memory for {purpose}: requesting "
-            f"{requested_bytes / 1e9:.2f} GB pinned (each buffer rounded up to "
-            f"a power of two), available {share_bytes / 1e9:.2f} GB (this "
+            f"{requested_bytes / 1e9:.2f} GB pinned, available "
+            f"{share_bytes / 1e9:.2f} GB (this "
             "rank's share of the Host memory available on its node)"
         )
 

@@ -233,6 +233,14 @@ class PlatformInfo:
         if int(status) != 0:
             raise RuntimeError(f"cudaHostRegister failed with {status!s}")
 
+    def unregister_host_tensor_for_gpu_access(self, tensor: torch.Tensor) -> None:
+        """Undo ``register_host_tensor_for_gpu_access`` before ``tensor`` is freed."""
+        if tensor.device.type != "cpu" or tensor.numel() == 0:
+            return
+        status = torch.cuda.cudart().cudaHostUnregister(tensor.data_ptr())
+        if int(status) != 0:
+            raise RuntimeError(f"cudaHostUnregister failed with {status!s}")
+
     def device_visible_data_ptr(self, tensor: torch.Tensor) -> int:
         """Return a pointer value that is valid to dereference from GPU kernels."""
         ptr = tensor.data_ptr()
