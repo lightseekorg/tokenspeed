@@ -331,13 +331,11 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesATailDescriptorAtAnUnalignedFini
     EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[1]).block_hashes, page.block_hashes);
 }
 
-class HybridKvCacheEventTestSuite : public SchedulerTestSuite {
+class HybridKvCacheEventTestSuite : public SchedulerKvCacheEventTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        SchedulerConfig cfg = SchedulerKvCacheEventTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 16;
-        cfg.disable_l2_cache = true;
-        cfg.enable_kv_cache_events = true;
         CacheGroupConfig state = cfg.cache_groups.front();
         state.group_id = "linear_attention_0";
         state.attn_kind = AttnKind::kState;
