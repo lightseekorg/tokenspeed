@@ -21,9 +21,9 @@
 // Recurrent-state groups through the Scheduler: the two-slot table (slot 0
 // the checkpoint a forward reads, slot 1 the block it writes) rotating through
 // prefill chunks, the first decode and later decodes; natural checkpoints
-// published at prompt end, finish and retraction only; hits resuming from
-// them; the two-blocks-per-request capacity; and the retraction image of
-// both slots.
+// published at prompt end, finish and retraction, plus the opt-in one before
+// a long prompt's replay tail; hits resuming from them; the
+// two-blocks-per-request capacity; and the retraction image of both slots.
 
 #include <gtest/gtest.h>
 
@@ -209,6 +209,63 @@ TEST_F(StateCheckpointSuite, TwoSlotsRotateThroughChunksTheFirstDecodeAndLaterDe
     EXPECT_EQ(at_finish.state_row.at(0), decode1[1]) << "the live slot published at finish";
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks())
         << "every block is cache-only or free";
+}
+
+// The opt-in long-prompt State checkpoint
+// (SchedulerConfig::enable_state_checkpoint_chunk_cut): a prompt longer than
+// the chunk budget also ends a chunk at the last page boundary before its
+// replay tail, and the next chunk's admission publishes the state there.
+class StateCheckpointCutSuite : public StateCheckpointSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateCheckpointSuite::MakeConfig();
+        cfg.enable_state_checkpoint_chunk_cut = true;
+        return cfg;
+    }
+};
+
+// Under the 8-token budget, a 22-token prompt pays one extra chunk to end at
+// 20; a 26-token prompt's checkpoint at 24 is already a budget chunk end. A
+// second prompt that changes only the last page resumes from that checkpoint
+// (by default it finds none there and starts over, like the "miss" probe of
+// TwoSlotsRotateThroughChunksTheFirstDecodeAndLaterDecodes).
+TEST_F(StateCheckpointCutSuite, SecondLongPromptReusesTheStateBeforeItsChangedTail) {
+    for (const auto [prompt_tokens, checkpoint_tokens] : {std::pair{22, 20}, std::pair{26, 24}}) {
+        SCOPED_TRACE(prompt_tokens);
+        for (const bool host_cache : {false, true}) {
+            SCOPED_TRACE(host_cache);
+            Reset(host_cache, /*decode_width=*/1);
+            std::vector<std::int32_t> tokens = MakeTokens(prompt_tokens);
+            Submit(RequestWithTokens("seed", tokens));
+            std::vector<std::int32_t> checkpoint_rows;
+            std::int32_t scheduled = 0;
+            for (int round = 0; scheduled < prompt_tokens && round < 16; ++round) {
+                const ExecutionPlan plan = PlanOnce();
+                const ForwardBatch* batch = FindForwardBatch(plan);
+                ASSERT_NE(batch, nullptr);
+                ASSERT_EQ(batch->request_ids, std::vector<std::string>{"seed"});
+                scheduled += batch->input_lengths.at(0);
+                if (scheduled == checkpoint_tokens) {
+                    for (const std::string& group : {"state0", "state1", "state2"}) {
+                        checkpoint_rows.push_back(StateRow(*batch, group, "seed").at(1));
+                    }
+                }
+                SendForwardDone(
+                    "seed", scheduled == prompt_tokens ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
+                AckWriteBacks(plan);
+            }
+            ASSERT_EQ(scheduled, prompt_tokens);
+            ASSERT_EQ(checkpoint_rows.size(), 3u) << "a chunk ends at the checkpoint";
+            SendFinish("seed");
+            AckWriteBacks(PlanOnce());
+
+            tokens[checkpoint_tokens] = 991;
+            tokens[checkpoint_tokens + 1] = 992;
+            const Resume reused = Probe("second", tokens);
+            EXPECT_EQ(reused.prefix_tokens, checkpoint_tokens);
+            EXPECT_EQ(reused.state_row.at(0), checkpoint_rows.at(0));
+        }
+    }
 }
 
 // A request that finishes right after its prefill (a one-token budget) never

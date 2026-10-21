@@ -3641,6 +3641,101 @@ TEST_F(JunctionCutSuite, CutsTheFirstChunkAtTheJunctionAndPublishesTheCheckpoint
     FAIL() << "third was never scheduled";
 }
 
+// With the opt-in long-prompt State checkpoint
+// (SchedulerConfig::enable_state_checkpoint_chunk_cut), a 12-token prompt
+// under the 8-token budget also ends a chunk at 10, the last page boundary
+// before its final token. The junction and that checkpoint cut successive
+// chunks; each chunk end publishes its natural checkpoint.
+class JunctionAndStateCheckpointCutSuite : public JunctionCutSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = JunctionCutSuite::MakeConfig();
+        cfg.enable_state_checkpoint_chunk_cut = true;
+        return cfg;
+    }
+};
+
+TEST_F(JunctionAndStateCheckpointCutSuite, CutsAtTheJunctionAndThenAtTheCheckpointBeforeTheReplayTail) {
+    RequestSpec seed = MakeRequestSpec("seed", /*num_pages=*/6);
+    Submit(seed);
+    PlanOnce();  // chunk end at token 8: KV pages published, no state
+    PlanOnce();  // aligned checkpoint at token 10, before the replay tail
+    PlanOnce();  // prompt end at token 12
+    SendForwardDone("seed", {42});
+    PlanOnce();  // first decode: the prompt-end checkpoint (state@12) is published
+    SendForwardDone("seed", {43});
+    SendFinish("seed");
+    PlanOnce();
+    ASSERT_EQ(scheduler_->WaitingSize(), 0u);
+    ASSERT_EQ(scheduler_->DecodingSize(), 0u);
+
+    // `first` shares the seed's first six tokens: the KV hit reaches 6, no
+    // state checkpoint lies at or below it, so it resumes at 0 with the
+    // junction at 6 -- and, incomplete, holds the head of line.
+    RequestSpec first = seed;
+    first.request_id = "first";
+    for (std::size_t i = 6; i < first.tokens.size(); ++i) {
+        first.tokens[i] += 1000;
+    }
+    RequestSpec second = MakeRequestSpec("second", /*num_pages=*/6, /*start=*/2001);
+    Submit({first, second});
+    ASSERT_EQ(scheduler_->WaitingSize(), 2u);
+
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{0});
+    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{6}) << "the chunk ends at the junction";
+    const std::vector<std::int32_t> state_row = batch->block_tables.at("state").at(0);
+    ASSERT_EQ(state_row.size(), 2u);
+    SendForwardDone("first");
+
+    // The next chunk's admission publishes the junction's natural checkpoint
+    // (state@6) and rotates the slots. This chunk ends at the aligned
+    // checkpoint, still holding the head of line.
+    plan = PlanOnce();
+    batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 6);
+    EXPECT_EQ(batch->input_lengths.at(0), 4);
+    const std::vector<std::int32_t> rotated = batch->block_tables.at("state").at(0);
+    EXPECT_EQ(rotated[0], state_row[1]) << "the previous chunk's output is this chunk's input";
+    SendForwardDone("first");
+
+    // The final chunk completes the prompt, so `second` joins behind it.
+    plan = PlanOnce();
+    batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, (std::vector<std::string>{"first", "second"}));
+    EXPECT_EQ(batch->input_lengths.at(0), 2);
+    SendForwardDone("first", {7});
+    SendForwardDone("second");
+
+    // `third` shares the same six tokens and resumes at the junction.
+    RequestSpec third = seed;
+    third.request_id = "third";
+    for (std::size_t i = 6; i < third.tokens.size(); ++i) {
+        third.tokens[i] += 3000;
+    }
+    Submit(third);
+    for (int round = 0; round < 4; ++round) {
+        plan = PlanOnce();
+        batch = FindForwardBatch(plan);
+        ASSERT_NE(batch, nullptr);
+        const auto it = std::ranges::find(batch->request_ids, "third");
+        if (it == batch->request_ids.end()) {
+            continue;
+        }
+        const auto row = static_cast<std::size_t>(it - batch->request_ids.begin());
+        EXPECT_EQ(batch->extend_prefix_lens.at(row), 6) << "the junction checkpoint is a hit";
+        EXPECT_EQ(batch->block_tables.at("state").at(row)[0], rotated[0]) << "resumes from the published checkpoint";
+        return;
+    }
+    FAIL() << "third was never scheduled";
+}
+
 TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     BlockPool pool(/*num_lcm_blocks=*/8, {1});
     std::vector<CacheGroupSpec> specs{

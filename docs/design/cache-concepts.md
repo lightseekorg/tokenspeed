@@ -251,9 +251,10 @@ prompt-end checkpoint it still holds in slot 0 is the canonical block.
 
 A **natural checkpoint** is a state block that exists because a forward ended
 there -- the prompt end (the block rotated out of slot 1 as the first decode
-runs), the finish (slot 1 in place), the chunk the junction cut ended, or the
-retraction image -- published under the hash of that token count, page
-boundary or not. No forward computes an interior checkpoint, no scan is split
+runs), the finish (slot 1 in place), the chunk the junction cut ended (or
+the opt-in cut before a long prompt's last page), or the retraction image --
+published under the hash of that token count, page boundary or not. No
+forward computes an interior checkpoint, no scan is split
 into body and tail, and no state group declares a token span: a hit resumes
 at the published token count `T` exactly, with its state in slot 0 and the KV
 tail of the same instant in the history groups

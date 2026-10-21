@@ -465,6 +465,7 @@ for gateway discovery.
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
 | `--prefix-granularity` | Scheduler prefix granularity in tokens — the identity boundary of cache reuse (`--block-size` is a deprecated alias). |
 | `--enable-prefix-caching` / `--disable-prefix-caching` | Enable or disable prefix cache reuse. |
+| `--enable-state-checkpoint-chunk-cut` | Hybrid (recurrent-state) models: a prompt longer than `--chunked-prefill-size` also ends a prefill chunk at the last prefix page boundary before its final token, where its state is cached. A later request that shares the prompt but changes only its last page (such as a multi-turn follow-up that re-renders the end of the previous prompt), or resends it, resumes there instead of from an earlier checkpoint, at the cost of at most one extra prefill round per long prompt ([Scheduler §1.2](../design/scheduler.md#12-state-groups-two-slots-natural-checkpoints)). Off by default; requires prefix caching. |
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
 | `--disable-kda-prefill-graph` | Disable KDA prefill CUDA graphs while retaining ordinary prefill and decode graph settings. Enabled by default for supported `cutedsl_kda` prefill attention when prefill graphs are enabled. |

@@ -208,6 +208,7 @@ def scheduler_config_from_args(
         prefix_replay_tokens=prefix_replay_tokens,
         cache_groups=specs.cache_groups,
         enable_mixed_prefill_decode=server_args.enable_mixed_batch,
+        enable_state_checkpoint_chunk_cut=server_args.enable_state_checkpoint_chunk_cut,
     )
 
 
@@ -437,6 +438,8 @@ class EventLoop:
             f"{server_args.max_num_seqs!s}, dp_size={self.dp_size!s}) "
             f"disable_prefix_cache={scheduler_cfg.disable_prefix_cache!s} "
             f"prefix_replay_tokens={scheduler_cfg.prefix_replay_tokens!s} "
+            f"enable_state_checkpoint_chunk_cut="
+            f"{server_args.enable_state_checkpoint_chunk_cut!s} "
             f"cache_groups={[group.group_id for group in cache_groups]!s}",
         )
         self.scheduler = Scheduler(scheduler_cfg)

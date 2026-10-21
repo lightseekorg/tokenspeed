@@ -45,7 +45,10 @@ pytest.importorskip("tokenspeed_scheduler")
 from tokenspeed.runtime.engine.event_loop import (  # noqa: E402
     scheduler_config_from_args,
 )
-from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
+from tokenspeed.runtime.utils.server_args import (  # noqa: E402
+    ServerArgs,
+    prepare_server_args,
+)
 
 PREFETCH = dict(
     kvstore_prefetch_min_pages=2,
@@ -120,3 +123,27 @@ def test_pd_roles_configure_their_pools_as_resolved(role):
     )
     assert (cfg.num_snapshot_pages, cfg.max_retracted_requests) == pool
     assert cfg.debug_force_retraction_interval == (0 if role == "prefill" else 3)
+
+
+@pytest.mark.parametrize(
+    "flags, enabled",
+    [([], False), (["--enable-state-checkpoint-chunk-cut"], True)],
+)
+def test_the_state_checkpoint_chunk_cut_is_off_unless_the_flag_is_given(flags, enabled):
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.enable_state_checkpoint_chunk_cut is enabled
+
+
+def test_the_state_checkpoint_chunk_cut_is_refused_without_prefix_caching():
+    # Its checkpoint is only reachable through a prefix hit.
+    with pytest.raises(ValueError, match="requires prefix caching"):
+        ServerArgs(
+            model="x",
+            max_num_seqs=8,
+            disable_kvstore=True,
+            enable_prefix_caching=False,
+            enable_state_checkpoint_chunk_cut=True,
+        )

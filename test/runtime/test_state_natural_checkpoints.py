@@ -49,7 +49,13 @@ def _groups(with_state: bool) -> list:
     return groups
 
 
-def _scheduler(*, token_budget: int, with_state: bool, disable_prefix_cache: bool):
+def _scheduler(
+    *,
+    token_budget: int,
+    with_state: bool,
+    disable_prefix_cache: bool,
+    state_checkpoint_chunk_cut: bool,
+):
     cfg = make_config(
         num_device_pages=64,
         max_scheduled_tokens=token_budget,
@@ -69,8 +75,18 @@ def _scheduler(*, token_budget: int, with_state: bool, disable_prefix_cache: boo
         cache_groups=_groups(with_state),
         enable_mixed_prefill_decode=False,
         prefix_replay_tokens=0,
+        enable_state_checkpoint_chunk_cut=state_checkpoint_chunk_cut,
     )
     return ts.Scheduler(cfg)
+
+
+def _advance(scheduler, request_id: str, tokens: list[int]) -> None:
+    result = ts.ForwardEvent.ExtendResult()
+    result.request_id = request_id
+    result.tokens = tokens
+    event = ts.ExecutionEvent()
+    event.add_event(result)
+    scheduler.advance(event)
 
 
 def _state_row(batch) -> list[int]:
@@ -94,6 +110,7 @@ def test_chunks_follow_the_budget_alone(
         token_budget=token_budget,
         with_state=with_state,
         disable_prefix_cache=disable_prefix_cache,
+        state_checkpoint_chunk_cut=False,
     )
     request = ts.RequestSpec()
     request.request_id = "prefill"
@@ -126,6 +143,54 @@ def test_chunks_follow_the_budget_alone(
     assert forwards[0].num_extends() == 0
 
 
+@pytest.mark.parametrize("state_checkpoint_chunk_cut", [False, True])
+def test_the_opt_in_cut_leaves_a_state_checkpoint_before_the_last_page(
+    state_checkpoint_chunk_cut: bool,
+) -> None:
+    """``enable_state_checkpoint_chunk_cut`` ends one more chunk of a State
+    prompt longer than the budget at the last page boundary before its final
+    token (768 of 868 here), so a prompt that changes only the last page
+    resumes there. By default the chunks follow the budget and that prompt
+    finds no state below the seed's prompt end: it starts over."""
+    scheduler = _scheduler(
+        token_budget=300,
+        with_state=True,
+        disable_prefix_cache=False,
+        state_checkpoint_chunk_cut=state_checkpoint_chunk_cut,
+    )
+    seed = ts.RequestSpec()
+    seed.request_id = "seed"
+    seed.tokens = list(range(868))
+    seed.max_new_tokens = 2
+    scheduler.submit_requests([seed])
+    lengths = []
+    while sum(lengths) < 868:
+        plan = scheduler.next_execution_plan()
+        (batch,) = [op for op in plan.forward if op.request_ids]
+        lengths.extend(batch.input_lengths)
+        _advance(scheduler, "seed", [900] if sum(lengths) == 868 else [])
+    assert lengths == (
+        [300, 300, 168, 100] if state_checkpoint_chunk_cut else [300, 300, 268]
+    )
+    finish = ts.ForwardEvent.Finish()
+    finish.request_id = "seed"
+    event = ts.ExecutionEvent()
+    event.add_event(finish)
+    scheduler.advance(event)
+
+    second = ts.RequestSpec()
+    second.request_id = "second"
+    second.tokens = list(range(768)) + list(range(5000, 5100))
+    second.max_new_tokens = 2
+    scheduler.submit_requests([second])
+    plan = scheduler.next_execution_plan()
+    (batch,) = [op for op in plan.forward if op.request_ids]
+    assert list(batch.request_ids) == ["second"]
+    assert list(batch.extend_prefix_lens) == (
+        [768] if state_checkpoint_chunk_cut else [0]
+    )
+
+
 @pytest.mark.parametrize("disable_prefix_cache", [False, True])
 def test_state_rows_rotate_between_chunks_and_into_the_first_decode(
     disable_prefix_cache: bool,
@@ -139,7 +204,10 @@ def test_state_rows_rotate_between_chunks_and_into_the_first_decode(
     decode evolves the live block in place from the first step. Every later
     decode evolves the live block in place with slot 0 null."""
     scheduler = _scheduler(
-        token_budget=300, with_state=True, disable_prefix_cache=disable_prefix_cache
+        token_budget=300,
+        with_state=True,
+        disable_prefix_cache=disable_prefix_cache,
+        state_checkpoint_chunk_cut=False,
     )
     request = ts.RequestSpec()
     request.request_id = "r"

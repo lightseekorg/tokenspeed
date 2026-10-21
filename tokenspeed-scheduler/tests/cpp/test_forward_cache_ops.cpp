@@ -664,6 +664,18 @@ TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowOnEveryRole) {
     }
 }
 
+TEST(SchedulerConfigValidateTest, StateCheckpointChunkCutRequiresPrefixCaching) {
+    // The cut only pays off through a prefix hit on its checkpoint; without
+    // prefix caching it would add a prefill round for nothing.
+    SchedulerConfig config = MakeValidConfig();
+    config.enable_state_checkpoint_chunk_cut = true;
+    EXPECT_NO_THROW(config.Validate());
+    config.disable_prefix_cache = true;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    config.enable_state_checkpoint_chunk_cut = false;
+    EXPECT_NO_THROW(config.Validate());
+}
+
 TEST(SchedulerConfigValidateTest, SnapshotPoolAndRetractedSlotsAreStatedTogether) {
     // The pool is explicit on every role: 0 pages says nothing, the null page
     // alone says "never retract" (and takes no blob slots), anything above it

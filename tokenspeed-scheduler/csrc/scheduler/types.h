@@ -92,6 +92,14 @@ struct SchedulerConfig {
     // Zero preserves the default logits contract, which already recomputes at
     // least the final prompt token. The effective hit is page-aligned down.
     std::int32_t prefix_replay_tokens{0};
+    // Opt-in (off by default): a prompt longer than max_scheduled_tokens also
+    // cuts a local chunk at the last prefix-page boundary before its replay
+    // tail, so each State group publishes a page-aligned checkpoint there
+    // (PrefillStateCheckpointTokens). A later prompt that shares the prompt
+    // but changes only its last page then resumes from it, at the cost of at
+    // most one extra prefill round per long prompt. Requires prefix caching;
+    // no effect without State groups.
+    bool enable_state_checkpoint_chunk_cut{false};
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks

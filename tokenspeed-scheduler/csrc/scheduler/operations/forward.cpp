@@ -93,6 +93,17 @@ void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes,
                          std::make_move_iterator(new_hashes.end()));
 }
 
+// The opt-in reusable State checkpoint before a long prompt's replay tail
+// (SchedulerConfig::enable_state_checkpoint_chunk_cut); 0 means none.
+std::int32_t stateCheckpointCut(const SchedulerConfig& config, const CacheCoordinator& coordinator,
+                                std::int32_t prompt_tokens) {
+    if (!config.enable_state_checkpoint_chunk_cut) {
+        return 0;
+    }
+    return PrefillStateCheckpointTokens(coordinator, prompt_tokens, config.max_scheduled_tokens,
+                                        config.prefix_replay_tokens);
+}
+
 bool canConsumeReservedTokensInPlace(const CacheCoordinator& coordinator, std::span<const BlockTable> tables,
                                      std::int32_t num_tokens, std::int32_t num_computed_tokens) {
     for (std::int32_t i = 0; i < coordinator.NumGroups(); ++i) {
@@ -327,12 +338,13 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
             "a junction lies inside the unmatched prompt");
 
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
-    // A remote landing completes the prompt in one transfer; no junction cut
-    // can shorten it.
-    const std::int32_t tokens_this_round = source == fsm::PrefillSource::kRemote
-                                               ? unscheduled
-                                               : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
-                                                                    unscheduled, remaining, junction_tokens);
+    // A remote landing completes the prompt in one transfer; no junction or
+    // State checkpoint cut can shorten it.
+    const std::int32_t tokens_this_round =
+        source == fsm::PrefillSource::kRemote
+            ? unscheduled
+            : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, remaining,
+                                 junction_tokens, stateCheckpointCut(config_, coordinator_, request->PrefillSize()));
     if (tokens_this_round == 0) {
         return FirstChunkOutcome{};
     }
@@ -448,8 +460,9 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const std::int32_t unscheduled = request->UnscheduledPrefillSize();
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     fsm::CacheProgress cache_progress = request->CacheProgress();
+    const std::int32_t state_checkpoint = stateCheckpointCut(config_, coordinator_, request->PrefillSize());
     const std::int32_t prefill_tokens = PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled,
-                                                           remaining, cache_progress.junction_tokens);
+                                                           remaining, cache_progress.junction_tokens, state_checkpoint);
     if (prefill_tokens == 0) {
         return std::nullopt;
     }
@@ -462,17 +475,19 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         .completes_prefill = completes_prefill,
         .prompt_headroom_tokens = 0,
     };
-    // The chunk that ended at the junction publishes its natural checkpoint
-    // (KV tail and state) and moves off the published blocks; every other
-    // chunk end publishes only its completed full pages.
+    // A chunk that ended at the junction or at the opt-in State checkpoint
+    // publishes its natural checkpoint (KV tail and state) and moves off the
+    // published blocks; every other chunk end publishes only its completed
+    // full pages.
     const bool ends_at_junction = cache_progress.junction_tokens > 0 && first_pos == cache_progress.junction_tokens;
+    const bool ends_at_state_checkpoint = state_checkpoint > 0 && first_pos == state_checkpoint;
     if (first_pos >= cache_progress.junction_tokens) {
         cache_progress.junction_tokens = 0;
     }
-    const RequestProgress progress =
-        AdvanceRequestProgress(*request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
-                               config_.StreamsDeviceCacheToHost(),
-                               ends_at_junction ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk);
+    const RequestProgress progress = AdvanceRequestProgress(
+        *request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
+        config_.StreamsDeviceCacheToHost(),
+        ends_at_junction || ends_at_state_checkpoint ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk);
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     // A chunk reads the state its predecessor wrote (slot 1 -> slot 0) and
