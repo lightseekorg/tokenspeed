@@ -47,6 +47,7 @@ from tokenspeed_kernel.ops.moe import (
     FUSED_ROUTING_MAX_TOKENS,
     PreparedNvfp4Routing,
     bf16_moe_routes,
+    gather_moe_routes,
     moe_sigmoid_bias_topk_routing,
     moe_topk,
     moe_warmup,
@@ -156,7 +157,7 @@ def _muse_all_reduce(
             tensor.dtype == torch.bfloat16
             and tensor.device == iris.all_reduce.device
             and tensor.is_contiguous()
-            and 0 < tensor.numel() <= iris.all_reduce.producer_direct_max_numel
+            and tensor.numel() > 0
             and tensor.numel() % (iris.world_size * 8) == 0
         ):
             results.append(iris.reduce(tensor))
@@ -709,10 +710,10 @@ class MuseSparkAttention(nn.Module):
                 layer_id > 0
                 and current_platform().is_cdna4
                 and mapping.pp_size == 1
-                and mapping.attn.tp_size == mapping.moe.ep_size
+                and mapping.attn.tp_size == mapping.moe.tp_ep_size
                 and mapping.attn.tp_size in (4, 8)
-                and mapping.moe.tp_size == 1
-                and mapping.attn.tp_group == mapping.moe.ep_group
+                and (mapping.moe.tp_size == 1 or mapping.moe.ep_size == 1)
+                and mapping.attn.tp_group == mapping.moe.tp_ep_group
                 and config.hidden_size == 8192
                 and config.num_attention_heads == 128
                 and config.num_key_value_heads == 16
@@ -981,7 +982,7 @@ class MuseSparkRouter(PreparedFP32RouterGEMV):
 
 
 class MuseSparkMoE(nn.Module):
-    """Expert-parallel SwiGLU with per-route post normalization.
+    """Sharded SwiGLU experts with per-route post normalization.
 
     The experts run as raw BF16 weights through the portable Triton route
     kernel, or as FP4 weights through ``MoELayer``'s planned kernel when the
@@ -1003,14 +1004,18 @@ class MuseSparkMoE(nn.Module):
         self.stream_fork = StreamFork(alt_stream)
         if torch.get_default_dtype() != torch.bfloat16:
             raise ValueError("Muse Spark requires --dtype bfloat16")
-        if mapping.moe.tp_size != 1:
-            raise ValueError("Muse Spark MoE requires moe_tp_size=1")
-        if mapping.attn.tp_group != mapping.moe.ep_group:
+        if mapping.moe.tp_size > 1 and mapping.moe.ep_size > 1:
             raise ValueError(
-                "Muse Spark requires the attention TP and expert groups to match"
+                "Muse Spark MoE requires pure tensor or expert parallelism"
+            )
+        if mapping.attn.tp_group != mapping.moe.tp_ep_group:
+            raise ValueError(
+                "Muse Spark requires the attention TP and MoE groups to match"
             )
         if config.num_local_experts % mapping.moe.ep_size:
             raise ValueError("the expert count must divide evenly across EP ranks")
+        if config.moe_intermediate_size % mapping.moe.tp_size:
+            raise ValueError("the expert intermediate size must divide across TP ranks")
         self.num_experts = config.num_local_experts
         self.topk = config.num_experts_per_tok
         self.route_scale = config.routed_scaling_factor
@@ -1019,8 +1024,11 @@ class MuseSparkMoE(nn.Module):
         self.experts_per_rank = config.num_local_experts // self.ep_size
         self.expert_start = self.ep_rank * self.experts_per_rank
         self.ep_group = mapping.moe.ep_group
+        self.tp_rank = mapping.moe.tp_rank
+        self.tp_size = mapping.moe.tp_size
+        self.tp_group = mapping.moe.tp_group
         compressed_size = config.moe_hidden_size
-        intermediate_size = config.moe_intermediate_size
+        intermediate_size = config.moe_intermediate_size // self.tp_size
 
         self.gate = MuseSparkRouter(
             hidden_size=config.hidden_size,
@@ -1058,10 +1066,12 @@ class MuseSparkMoE(nn.Module):
                 top_k=self.topk,
                 num_experts=self.num_experts,
                 hidden_size=compressed_size,
-                intermediate_size=intermediate_size,
+                intermediate_size=config.moe_intermediate_size,
                 quant_config=quant_config,
                 layer_index=layer_id,
                 prefix=experts_prefix,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
                 ep_rank=self.ep_rank,
                 ep_size=self.ep_size,
                 # "swiglu" would force one shared gate/up scale; this model is plain silu(gate) * up.
@@ -1126,9 +1136,55 @@ class MuseSparkMoE(nn.Module):
         *,
         owned_rows: bool,
     ) -> torch.Tensor:
-        """Normalize each route before weighting, then complete the EP sum."""
+        """Complete TP routes before normalization, or sum normalized EP routes."""
         norm = self.post_expert_norm
         iris = self.iris_state
+        if self.tp_size > 1:
+            assert norm.weight is not None
+            width = norm.weight.shape[0]
+            if owned_rows:
+                assert iris is not None
+                routes = iris.reduce_scatter_owned_routes(routes, route_map, num_tokens)
+                num_tokens = routes.shape[0]
+                first = iris.all_reduce.rank_in_group * num_tokens
+                route_weights = route_weights[first : first + num_tokens]
+                if route_weights.shape[0] < num_tokens:
+                    route_weights = torch.nn.functional.pad(
+                        route_weights, (0, 0, 0, num_tokens - route_weights.shape[0])
+                    )
+            elif route_map is not None:
+                output = _acquire_all_reduce_output(
+                    (num_tokens * self.topk, width), routes, self.tp_group
+                )
+                routes = gather_moe_routes(
+                    routes,
+                    route_map,
+                    num_tokens,
+                    self.topk,
+                    width,
+                    output=(
+                        output.reshape(num_tokens, self.topk, width)
+                        if output is not None
+                        else None
+                    ),
+                )
+            # Each TP rank contributes only its intermediate-column slice.
+            # RMSNorm must see the complete route before top-k weighting.
+            if not owned_rows:
+                routes = routes.reshape(num_tokens * self.topk, width)
+                if iris is not None and iris.can_reduce_borrowed(routes):
+                    routes = iris.reduce_borrowed(routes)
+                else:
+                    (routes,) = _muse_all_reduce(iris, (routes,), self.tp_group)
+            # Consume borrowed collective storage before the next projection.
+            return routed_input_scale_rmsnorm_sum(
+                routes.reshape(num_tokens, self.topk, width),
+                route_weights,
+                norm.weight,
+                norm.eps,
+                norm.weight_offset,
+                pdl_enabled(),
+            )
         if owned_rows:
             assert iris is not None and iris.can_use_owned_rows(num_tokens)
             if route_map is not None and norm.weight is not None:
@@ -1227,7 +1283,7 @@ class MuseSparkMoE(nn.Module):
         prepared: PreparedNvfp4Routing | None,
         owned_rows: bool,
     ) -> torch.Tensor:
-        """Run FP4 experts and normalize routes before their weighted EP sum."""
+        """Run FP4 experts and complete sharded routes before normalization."""
         gemm2_out, _, expanded_idx = self.experts(
             hidden_states=compressed,
             topk_output=StandardTopKOutput(topk_weights, topk_ids, router_logits),
@@ -1239,8 +1295,20 @@ class MuseSparkMoE(nn.Module):
         )
         if prepared is None:
             self._prepare_routing(compressed_quantized, topk_ids, topk_weights)
-        # The permute map marks routes this rank does not own with -1; the
-        # kernel pads gemm2_out's hidden dimension.
+        norm_weight = self.post_expert_norm.weight
+        if (
+            self.tp_size > 1
+            and self.ep_size == 1
+            and self.experts.deferred_output_is_token_order
+            and norm_weight is not None
+            and gemm2_out.shape == (topk_ids.numel(), norm_weight.shape[0])
+            and gemm2_out.is_contiguous()
+        ):
+            # EP1 owns every valid Muse route. Canonical, unpadded rows need
+            # no map gather before the TP reduction.
+            gemm2_out = gemm2_out.view(*topk_ids.shape, norm_weight.shape[0])
+            expanded_idx = None
+        # Other deferred outputs retain their map and any hidden-width padding.
         return self._reduce_expert_routes(
             routes=gemm2_out,
             route_map=expanded_idx,
@@ -1331,7 +1399,10 @@ class MuseSparkMoE(nn.Module):
                 compressed = self.pre_expert_proj.forward_owned_rows(
                     hidden_states, output
                 )
-                if self.expert_quant_kind == "mxfp4":
+                if (
+                    self.expert_quant_kind == "mxfp4"
+                    and self.experts.supports_prequantized_input
+                ):
                     compressed_quantized = rmsnorm_mxfp4_quant(
                         compressed,
                         norm_weight,
@@ -1391,7 +1462,13 @@ class MuseSparkMoE(nn.Module):
                 topk_ids,
                 topk_weights,
                 owned_global_rows,
-                min(local_rows, max(0, owned_global_rows - self.ep_rank * local_rows)),
+                min(
+                    local_rows,
+                    max(
+                        0,
+                        owned_global_rows - iris.all_reduce.rank_in_group * local_rows,
+                    ),
+                ),
             )
             compressed_quantized = None
             router_logits = None
@@ -1793,10 +1870,10 @@ class MuseSparkModel(BaseTransformerModel):
             and not ctx.forward_mode.is_idle()
             and not ctx.forward_mode.is_mixed()
             and mapping.pp_size == 1
-            and mapping.attn.tp_size == mapping.moe.ep_size
+            and mapping.attn.tp_size == mapping.moe.tp_ep_size
             and mapping.attn.tp_size in (4, 8)
-            and mapping.moe.tp_size == 1
-            and mapping.attn.tp_group == mapping.moe.ep_group
+            and (mapping.moe.tp_size == 1 or mapping.moe.ep_size == 1)
+            and mapping.attn.tp_group == mapping.moe.tp_ep_group
             and self.config.hidden_size == 8192
             and self.config.moe_hidden_size == 4096
             and self.config.num_local_experts == 256
@@ -1824,7 +1901,11 @@ class MuseSparkModel(BaseTransformerModel):
             ):
                 return False
         iris = self.iris_state
-        return iris is not None and iris.can_use_owned_rows(rows)
+        return (
+            iris is not None
+            and iris.can_use_owned_rows(rows)
+            and (mapping.moe.tp_size == 1 or rows <= iris.owned_route_max_rows)
+        )
 
     def forward(
         self,
@@ -2081,6 +2162,50 @@ def load_expert_input_scale(
     parameter.data.copy_(scales[expert_start : expert_start + local])
 
 
+def shard_expert_projection(
+    loaded_weight: torch.Tensor,
+    target: torch.Tensor,
+    tp_rank: int,
+    tp_size: int,
+    *,
+    gate_up: bool,
+    fused_gate_up: bool,
+) -> torch.Tensor:
+    """Select one TP slice in the checkpoint's packed-weight or scale units.
+
+    Gate and up own matching intermediate rows; the down projection owns the
+    corresponding input columns. Fused gate/up tensors need a slice from each
+    half, rather than one contiguous slice of their concatenation.
+
+    Args:
+        loaded_weight: Full expert projection or its block scales, after EP slicing.
+        target: Local parameter view, including only the selected gate/up half
+            for a separately stored projection.
+        tp_rank: Rank within the expert tensor-parallel group.
+        tp_size: Number of expert tensor-parallel ranks.
+        gate_up: Select output rows when true, or down-projection input columns.
+        fused_gate_up: Whether the loaded tensor concatenates both gate and up.
+
+    Returns:
+        The checkpoint shard corresponding to ``target``.
+    """
+    if tp_size == 1:
+        return loaded_weight
+    dim = -2 if gate_up else -1
+    width = target.shape[dim]
+    if fused_gate_up:
+        width //= 2
+        gate, up = loaded_weight.chunk(2, dim=dim)
+        return torch.cat(
+            (
+                gate.narrow(dim, tp_rank * width, width),
+                up.narrow(dim, tp_rank * width, width),
+            ),
+            dim=dim,
+        )
+    return loaded_weight.narrow(dim, tp_rank * width, width)
+
+
 class MuseSparkForConditionalGeneration(BaseCausalLM):
     """Muse Spark conditional generation model with shared vision and audio towers."""
 
@@ -2106,6 +2231,14 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         )
 
         capacity = min(max_num_tokens, 8192) * self.config.hidden_size
+        owned_route_max_rows = (
+            min(max_num_tokens, 8192)
+            if mapping.moe.tp_size > 1
+            and mapping.moe.ep_size == 1
+            and self.config.moe_hidden_size == 4096
+            and self.config.num_experts_per_tok == 8
+            else 0
+        )
         state = self.model.iris_state
         if state is None:
             state = prepare_muse_communication(
@@ -2114,13 +2247,17 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 staged_max_numel=min(capacity, (512 << 10) // torch.bfloat16.itemsize),
                 producer_direct_max_numel=capacity,
                 enable_lamport=True,
+                owned_route_max_rows=owned_route_max_rows,
                 all_reduce=backend.iris.state(group, torch.bfloat16),
                 device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             )
             backend.iris.install(group, state.all_reduce)
             backend.iris.install_all_gather(group, state.gather)
             backend.iris.install_broadcast(group, state.broadcast)
-        elif state.all_reduce.producer_direct_max_numel < capacity:
+        elif (
+            state.all_reduce.producer_direct_max_numel < capacity
+            or state.owned_route_max_rows < owned_route_max_rows
+        ):
             raise RuntimeError(
                 "Muse communication was prepared below the requested capacity"
             )
@@ -2321,6 +2458,14 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 if half is not None:
                     rows = target.shape[0] // 2
                     target = target.narrow(0, half * rows, rows)
+                loaded_weight = shard_expert_projection(
+                    loaded_weight,
+                    target,
+                    moe.tp_rank,
+                    moe.tp_size,
+                    gate_up=half is not None,
+                    fused_gate_up=False,
+                )
                 if target.shape != loaded_weight.shape:
                     raise ValueError(
                         f"checkpoint tensor '{name}' has shape "
@@ -2345,10 +2490,20 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 if parameter_name.endswith("_input_scale"):
                     load_expert_input_scale(parameter, loaded_weight, moe.expert_start)
                     continue
-                default_weight_loader(
-                    parameter,
-                    loaded_weight.narrow(0, moe.expert_start, moe.experts_per_rank),
+                loaded_weight = loaded_weight.narrow(
+                    0, moe.expert_start, moe.experts_per_rank
                 )
+                if parameter_name.endswith(("_weight", "_weight_scale")):
+                    gate_up = ".w13_" in parameter_name
+                    loaded_weight = shard_expert_projection(
+                        loaded_weight,
+                        parameter,
+                        moe.tp_rank,
+                        moe.tp_size,
+                        gate_up=gate_up,
+                        fused_gate_up=gate_up,
+                    )
+                default_weight_loader(parameter, loaded_weight)
                 continue
             if parameter_name.endswith(".mlp.gate.weight"):
                 loaded_weight = loaded_weight.T.contiguous()

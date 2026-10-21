@@ -4028,10 +4028,13 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
     assert plan["apply_kernel_name"] == kernel_name
 
 
-def test_gluon_mxfp4_a4w4_deferred_ep4_traits_select_matching_kernel(
+@pytest.mark.parametrize("ep_size,ispp", [(4, 4096), (8, 4096), (1, 512)])
+def test_gluon_mxfp4_a4w4_deferred_traits_select_matching_kernel(
     mi350_platform: PlatformInfo,
+    ep_size: int,
+    ispp: int,
 ) -> None:
-    """The deferred A4W4 route path is selected for EP4."""
+    """Both expert and tensor partitions retain deferred per-route outputs."""
     registry = KernelRegistry.get()
     kernel_name = "gluon_mxfp4_a4w4_ep_deferred_precomputed_moe_apply"
     if registry.get_by_name(kernel_name) is None:
@@ -4048,8 +4051,8 @@ def test_gluon_mxfp4_a4w4_deferred_ep4_traits_select_matching_kernel(
             requires_deferred_finalize=True,
             routing_mode="precomputed_topk",
             a2a_backend="none",
-            ep_size=4,
-            ispp=4096,
+            ep_size=ep_size,
+            ispp=ispp,
             internal_activation_dtype="mxfp4",
             with_bias=False,
             solution="gluon",
@@ -4067,6 +4070,7 @@ def test_gluon_mxfp4_a4w4_deferred_ep4_traits_select_matching_kernel(
 
     assert plan["apply_kernel_name"] == kernel_name
     assert plan["supports_prequantized_input"] is True
+    assert plan["deferred_output_is_token_order"] is True
 
 
 def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
