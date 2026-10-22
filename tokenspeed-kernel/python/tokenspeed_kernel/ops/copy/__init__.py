@@ -19,3 +19,35 @@
 # SOFTWARE.
 
 """Device copy helpers."""
+
+from __future__ import annotations
+
+import torch
+
+
+def zero_rows_after(tensor: torch.Tensor, live_rows: torch.Tensor) -> None:
+    """Zero rows ``[live_rows, tensor.shape[0])`` of ``tensor`` in place.
+
+    The count is read on the device, so the call never synchronizes and a
+    captured CUDA graph replays it against whatever count the tensor holds at
+    replay. Rows before the count are not read or written.
+
+    Args:
+        tensor: Rows along dim 0. Its trailing dims must form one strided
+            dimension (a 2-D tensor of any strides, or contiguous trailing
+            dims); otherwise a ``RuntimeError`` is raised rather than zeroing
+            a copy.
+        live_rows: One-element int32 or int64 tensor on ``tensor``'s device
+            holding the number of leading rows to keep.
+
+    Returns:
+        None.
+    """
+    if tensor.device.type == "cpu":
+        if live_rows.numel() != 1:
+            raise ValueError("live_rows must be a one-element tensor")
+        tensor[int(live_rows.reshape(())) :].zero_()
+        return
+    from tokenspeed_kernel.ops.copy.triton import triton_zero_rows_after
+
+    triton_zero_rows_after(tensor, live_rows)
