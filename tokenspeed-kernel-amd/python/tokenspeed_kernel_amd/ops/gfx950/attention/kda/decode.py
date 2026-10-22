@@ -1004,7 +1004,7 @@ def gluon_kda_fused_replay_gfx950(
     panel_count: gl.constexpr = D // panel_rows
     panel_value_offsets = gl.arange(0, panel_rows, layout=value_layout)
     _off = panel_value_offsets[:, None] * D + key_offsets[None, :]
-    _raw = gl.load(state_pool + read_base + _off).to(gl.float32)
+    _raw = gl.load(state_pool + read_base + _off, cache_modifier=".cg").to(gl.float32)
     off_pipe = (_off,)
     raw_pipe = (_raw,)
 
@@ -1091,7 +1091,9 @@ def gluon_kda_fused_replay_gfx950(
         prefetch_offsets = (
             panel_value_offsets[:, None] + prefetch_idx * panel_rows
         ) * D + key_offsets[None, :]
-        prefetch_raw = gl.load(state_pool + read_base + prefetch_offsets).to(gl.float32)
+        prefetch_raw = gl.load(
+            state_pool + read_base + prefetch_offsets, cache_modifier=".cg"
+        ).to(gl.float32)
         off_pipe = off_pipe + (prefetch_offsets,)
         raw_pipe = raw_pipe + (prefetch_raw,)
 
@@ -1116,7 +1118,9 @@ def gluon_kda_fused_replay_gfx950(
             next_offsets = (
                 panel_value_offsets[:, None] + next_idx * panel_rows
             ) * D + key_offsets[None, :]
-            next_raw = gl.load(state_pool + read_base + next_offsets).to(gl.float32)
+            next_raw = gl.load(
+                state_pool + read_base + next_offsets, cache_modifier=".cg"
+            ).to(gl.float32)
             off_pipe = off_pipe[1:] + (next_offsets,)
             raw_pipe = raw_pipe[1:] + (next_raw,)
         else:

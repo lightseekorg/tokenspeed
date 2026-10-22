@@ -987,7 +987,7 @@ def gluon_kda_fused_replay_gfx1250(
     read_base = read_page_offset * state_stride + head_idx * D * D
     panel_value_offsets = gl.arange(0, 16, layout=value_layout)
     _off = panel_value_offsets[:, None] * D + key_offsets[None, :]
-    _raw = gl.load(state_pool + read_base + _off).to(gl.float32)
+    _raw = gl.load(state_pool + read_base + _off, cache_modifier=".cg").to(gl.float32)
     off_pipe = (_off,)
     raw_pipe = (_raw,)
 
@@ -1089,7 +1089,9 @@ def gluon_kda_fused_replay_gfx1250(
             next_offsets = (
                 panel_value_offsets[:, None] + next_idx * 16
             ) * D + key_offsets[None, :]
-            next_raw = gl.load(state_pool + read_base + next_offsets).to(gl.float32)
+            next_raw = gl.load(
+                state_pool + read_base + next_offsets, cache_modifier=".cg"
+            ).to(gl.float32)
             off_pipe = off_pipe[1:] + (next_offsets,)
             raw_pipe = raw_pipe[1:] + (next_raw,)
         else:
