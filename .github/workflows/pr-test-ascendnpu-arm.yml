@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-name: PR Test Ascend NPU ARM
+name: Ascend NPU Tests
 
 "on":
   push:
