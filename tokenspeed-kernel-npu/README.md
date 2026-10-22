@@ -65,6 +65,19 @@ repacking is used. Reserve history/current receive planes and bounded uneven-row
 send padding before sizing the cache arena. Decode and the shared cache writer
 keep their existing contracts.
 
+Ascend dense MLA Prefill reuses this ABI with only the 576-wide KV plane;
+it allocates no Index-K plane and retains the original head-sharded weights.
+Historical KV gathers can start in preceding KDA layers. After the local
+QKV-A projection and norms, current KV gathers on the same AICPU stream while
+the normalized Q latent gathers over TP and QB projects this rank's heads.
+The receive table aliases aligned current pages and stitches boundary pages
+using the existing copy kernel. Each rank expands all visible KV with its own
+KV-B weight, calls the existing dense MLA attention once per request, and
+projects its local-head output with the original O shard. CommManager retains
+the output ReduceScatter. No additional LSE merge or complete-weight copy is
+needed. Causal attention with a cached prefix uses bottom-right alignment;
+CPU scheduler lengths are passed directly, without a device length readback.
+
 Run the operator correctness suite on a visible NPU with:
 
 ```bash

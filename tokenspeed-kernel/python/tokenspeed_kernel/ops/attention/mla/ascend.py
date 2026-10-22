@@ -35,6 +35,19 @@ def ascend_mla_dcp_kernels():
     return mla_dcp
 
 
+def prepare_ascend_mla_prefill(cache, *, ranks, bootstrap_group, max_current_rows):
+    """Reuse the DSA AICPU gather/owner-commit transport with no Index-K plane."""
+    from tokenspeed_kernel_npu.ops.dsa import AscendDSAPrefill
+
+    return AscendDSAPrefill(
+        cache,
+        None,
+        ranks=ranks,
+        bootstrap_group=bootstrap_group,
+        max_current_rows=max_current_rows,
+    )
+
+
 if current_platform().is_npu:
     from tokenspeed_kernel_npu.ops.mla import (
         mla_decode_with_kvcache as _mla_decode_with_kvcache,

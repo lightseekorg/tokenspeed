@@ -25,7 +25,7 @@ Cache ownership and page compaction live in dcp.placement and dcp.metadata.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 
 import torch
 import torch.distributed as dist
@@ -109,6 +109,51 @@ class AscendDCPContext:
             .flatten(1, 2)
             .contiguous()
         )
+
+    def gather_cache_rows(
+        self,
+        cache: torch.Tensor,
+        slot_groups: Sequence[torch.Tensor],
+        *,
+        block_granularity: int,
+        virtual_block_count: int,
+    ) -> Iterator[torch.Tensor]:
+        """Gather the whole local cache plane, then select virtual-slot rows.
+
+        Each owner contributes its entire physical plane, including its null
+        block. The temporary result is rank-major; virtual block ``v`` is on
+        owner ``(v - 1) % degree`` at local block ``(v - 1) // degree + 1``.
+        Every slot group reads that same gathered plane in its original order.
+        No gathered rows are retained on the context or written back to cache.
+        """
+        if not any(slots.numel() for slots in slot_groups):
+            return
+        if block_granularity <= 0 or virtual_block_count <= 1:
+            raise ValueError("cache geometry must include usable blocks")
+        local_rows = cache.shape[0]
+        local_blocks = (virtual_block_count - 2) // self.degree + 2
+        if (
+            local_rows % block_granularity
+            or local_rows < local_blocks * block_granularity
+        ):
+            raise ValueError("local cache plane does not cover its virtual blocks")
+        # Communicate bytes, preserving BF16 values (including NaN payloads).
+        gathered = self.all_gather(
+            cache.contiguous().view(torch.uint8), auxiliary=False
+        ).view(cache.dtype)
+        for slots in slot_groups:
+            if slots.ndim != 1 or slots.dtype not in (torch.int32, torch.int64):
+                raise ValueError("cache slots must be a one-dimensional integer tensor")
+            safe = slots.to(torch.int64).clamp_min(0)
+            block = safe // block_granularity
+            positive = (block - 1).clamp_min(0)
+            owner = positive % self.degree
+            local = (
+                positive // self.degree + 1
+            ) * block_granularity + safe % block_granularity
+            valid = (slots >= block_granularity) & (block < virtual_block_count)
+            index = torch.where(valid, owner * local_rows + local, 0)
+            yield gathered.index_select(0, index)
 
     def all_to_all(self, output, input_tensor, *, auxiliary: bool):
         group = self._process_group(auxiliary=auxiliary)

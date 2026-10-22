@@ -137,7 +137,7 @@ def mla_prefill(
         num_key_value_heads=k.shape[1],
         scale=softmax_scale,
         input_layout="TND",
-        sparse_mode=2 if is_causal else 0,
+        sparse_mode=3 if is_causal else 0,
         softmax_lse_flag=return_lse,
     )
     return _result(

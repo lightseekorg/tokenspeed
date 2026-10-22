@@ -1351,6 +1351,15 @@ copy of the KVP group, whose communicators are apart from the attention TP
 collectives, one window of loops ahead, so each transfer runs under the compute
 before its layer instead of queueing with those collectives. GPU DSA sparse
 prefill instead combines local sparse-attention partials.
+Ascend MLA prefill all-gathers each owner's entire local latent-cache plane
+once per layer with a cached prefix, then selects that forward's prefix slots
+from the rank-major result. The gather preserves cache bytes, including the
+separate null block on each owner. The gathered plane is temporary and is not
+published as cache storage; persistent KV still occupies only the owner's
+shard. A fresh prefill with no cached prefix needs no history gather because
+its expanded keys and values are already available from the current tokens.
+The temporary allocation and communication scale with the layer's whole
+cache capacity, rather than just the requests' live prefix rows.
 Dense MLA uses FlashMLA or CuTe MLA within each backend's device/dtype support;
 KVP does not make unsupported kernels portable. Speculative decoding runs
 on sharded caches: `OrdinaryRecipe.groups()` shards a draft group like the

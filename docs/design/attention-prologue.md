@@ -377,3 +377,32 @@ provider; the common runtime does not create a second resource manager.
 Device projection format conversion stays behind the kernel-package adapter.
 Preparing a weight allocates fresh NZ29 storage without changing coefficients
 or dtype; graph execution consumes the prepared buffers and communication state.
+
+## Ascend dense MLA Prefill over owner-sharded KV
+
+The Ascend MLA adapter keeps projection weights head-sharded. Local QKV-A
+and normalization produce the query latent and the normalized 576-wide KV rows.
+The current KV rows use the existing DSA AICPU gather/owner-commit transport,
+with no Index-K plane, while the query latent gathers over attention TP before
+the local QB projection. This is the same cache-write exception as native DSA:
+one exact byte-copy update commits each owned row and makes gathered rows
+visible through the prepared receive table. The persistent cache remains
+owner-sharded and the shared receive workspace is budgeted before arena sizing.
+The model passes the router's padded write slots into the commit; a paged leaf
+does not reconstruct request slots or own the router's write-location API.
+The shared Ascend transport accepts those int32 slots and widens them at its
+int64 native ABI boundary without changing the framework's slot layout.
+
+Historical gathers can be enqueued before preceding KDA computation; the next
+MLA layer consumes them only after its producer event. An aligned current page
+aliases its final receive address, while boundary pages are stitched by the
+existing transport kernel. The receive workspace cannot be reused until the
+consumer event from the preceding layer. Cache rebind and shutdown drain and
+close the owned communicator.
+
+Each rank reads the complete visible sequence and expands only its local heads.
+One dense MLA attention call per request uses bottom-right causal alignment,
+then the original O shard and CommManager output reduction. There is no
+additional KV chunking or LSE merge and no full-head projection-weight copy.
+The model adapter currently covers ungated BF16 NoPE Q-LoRA; native Decode
+projections, cache reads and merge retain their existing contracts.
