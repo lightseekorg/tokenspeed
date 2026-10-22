@@ -34,6 +34,7 @@ from tokenspeed_kernel_amd.ops._kda_records import (
 cdna5 = gl.amd.cdna5
 
 _GFX1250_NUM_CUS = 256
+_NUM_XCDS = gl.constexpr(8)
 
 
 def _kda_value_splits(batch: int) -> int:
@@ -580,8 +581,17 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
 ):
     """Run fused no-store verify and save U plus K/raw-g recovery records."""
     head_program_idx = gl.program_id(0)
-    head_idx = head_program_idx // VALUE_SPLITS
-    value_split_idx = head_program_idx % VALUE_SPLITS
+    if VALUE_SPLITS > 1:
+        # Workgroups go round-robin over the XCDs; keep every split of a head
+        # on one XCD so the splits sharing its cache lines share one L2.
+        xcd_slot = head_program_idx // _NUM_XCDS
+        head_idx = head_program_idx % _NUM_XCDS + _NUM_XCDS * (xcd_slot // VALUE_SPLITS)
+        value_split_idx = xcd_slot % VALUE_SPLITS
+        if head_idx >= H:
+            return
+    else:
+        head_idx = head_program_idx
+        value_split_idx = 0
     sequence_idx = gl.program_id(1)
 
     # Physical state tiles are [V, K]; two value rows per wave32 warp keep the
@@ -1474,9 +1484,12 @@ def gluon_kda_fused_verify_gfx1250(
             "fused KDA verify requires four-tap convolution and V-major state"
         )
     value_splits = _kda_value_splits(batch)
-    gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250[
-        (num_heads * value_splits, batch)
-    ](
+    head_programs = num_heads
+    if value_splits > 1:
+        head_programs = (
+            triton.cdiv(num_heads, _NUM_XCDS.value) * _NUM_XCDS.value * value_splits
+        )
+    gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250[(head_programs, batch)](
         mixed_qkv,
         original_qkv,
         conv_weights,
