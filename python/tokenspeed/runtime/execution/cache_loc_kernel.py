@@ -127,7 +127,7 @@ def compute_out_cache_loc_kernel(
         tl.store(output_ptrs, cache_locs, mask=mask)
 
 
-@triton.jit(do_not_specialize=["max_pages"])
+@triton.jit(do_not_specialize=["uniform_input_length"])
 def fused_decode_input_prep_kernel(
     # Inputs
     req_pool_indices_ptr,  # [batch_size]

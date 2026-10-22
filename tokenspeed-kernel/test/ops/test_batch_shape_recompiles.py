@@ -226,6 +226,50 @@ def test_mxfp4_mm_row_count():
             torch.testing.assert_close(run(rows), full[:rows], rtol=0, atol=0)
 
 
+def test_fused_decode_input_prep_uniform_length_does_not_recompile():
+    from tokenspeed.runtime.execution.cache_loc_kernel import (
+        fused_decode_input_prep,
+        fused_decode_input_prep_kernel,
+    )
+
+    batch = 4
+    req_pool_indices = torch.arange(1, batch + 1, dtype=torch.int64, device=DEVICE)
+    valid_cache_lengths = torch.tensor(
+        [0, 10, 20, 30, 40], dtype=torch.int32, device=DEVICE
+    )
+
+    def run(uniform_input_length):
+        positions = torch.empty(
+            batch * uniform_input_length, dtype=torch.int32, device=DEVICE
+        )
+        seq_lens = torch.empty(batch, dtype=torch.int32, device=DEVICE)
+        fused_decode_input_prep(
+            positions,
+            seq_lens,
+            req_pool_indices,
+            valid_cache_lengths,
+            uniform_input_length,
+        )
+        expected_positions = (
+            valid_cache_lengths[req_pool_indices, None]
+            + torch.arange(
+                uniform_input_length, dtype=torch.int32, device=DEVICE
+            )
+        ).flatten()
+        torch.testing.assert_close(positions, expected_positions, rtol=0, atol=0)
+        torch.testing.assert_close(
+            seq_lens,
+            valid_cache_lengths[req_pool_indices] + uniform_input_length,
+            rtol=0,
+            atol=0,
+        )
+
+    run(1)
+    with assert_no_triton_compile(fused_decode_input_prep_kernel):
+        for uniform_input_length in (2, 3, 4, 7, 16):
+            run(uniform_input_length)
+
+
 def test_dsa_index_candidates_table_width():
     from tokenspeed_kernel.ops.attention.dsa._triton import index_candidates as ic
 
