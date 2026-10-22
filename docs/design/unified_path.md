@@ -1302,8 +1302,9 @@ table expanded to its leaf's `kernel_page_size` and padded to the leaf's
 `[G, max_bs * N]` decode write-location stack. Both are allocated once and
 refilled in place: leaves copy their view out, while the decode write-slot
 views and the block drafters' `draft_history_view` read the stack storage
-inside captured graphs. A leaf whose decode refresh is only that copy
-(`decode_buffer_targets`, then `publish_decode_metadata`) is filled by the
+inside captured graphs. A leaf whose decode refresh is only that copy,
+`seq_lens` clamped to its `decode_seq_lens_floor` (`decode_buffer_targets`,
+then `publish_decode_metadata`), is filled by the
 router together with every other such leaf in one batched copy, since at
 bs=1 each separate stream copy costs a few microseconds. QSA's indexer
 owns separate stacks for its two raw groups using the same fill at ratio
@@ -1343,7 +1344,8 @@ each refresh; they do not alias router storage. A single-group model is a
 router with one leaf; there is no single-table special case anywhere.
 
 The sanctioned per-leaf residue, all kernel-imposed: `verify_floor` /
-`block_decode_active` (spec verify geometry as a clamp floor),
+`block_decode_active` (spec verify geometry as a clamp floor, which the
+router applies once per distinct floor in its batched copy),
 `block_decode_expansion` (whether block decode materializes one metadata
 entry per block position, or the leaf repeats one per request at forward
 time — FlashMLA, TRT-LLM MLA), FlashMLA's `for_graph_replay` tile-schedule
