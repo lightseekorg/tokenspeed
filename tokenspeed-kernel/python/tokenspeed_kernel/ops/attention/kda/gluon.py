@@ -442,17 +442,17 @@ if current_platform().is_amd:
         replay_records: KdaReplayRecords,
         g_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Fuse convolution and verification, saving records for accepted-state commit."""
+        """Fuse gate, convolution and verify; a supplied raw gate takes precedence."""
         if replay_records is None:
             raise ValueError("AMD no-store verify requires recovery records")
-        if g_raw is None:
-            g_raw = torch.nn.functional.linear(f_a_out, f_b_weight)
         return _kda_fused_verify_gfx1250_impl(
             mixed_qkv=mixed_qkv,
             original_qkv=replay_records.original_qkv,
             conv_weights=conv_weights,
             conv_pool=conv_states,
             raw_g=g_raw,
+            f_a_out=f_a_out if g_raw is None else None,
+            f_b_weight=f_b_weight if g_raw is None else None,
             beta_logits=beta_logits,
             A_log=A_log,
             dt_bias=dt_bias,

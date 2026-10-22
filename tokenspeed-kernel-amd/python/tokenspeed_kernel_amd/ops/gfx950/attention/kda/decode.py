@@ -545,6 +545,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     D: gl.constexpr,
     F_A: gl.constexpr,
     TOKENS_PER_SEQUENCE: gl.constexpr,
+    TOKEN_WIDTH: gl.constexpr,
     VALUE_SPLITS: gl.constexpr,
     MIXED_ROW_STRIDE,
     ORIGINAL_QKV_ROW_STRIDE,
@@ -607,6 +608,11 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     output_base = (token_base * H + head_idx) * D
 
     read_idx = gl.load(read_indices + sequence_idx * read_stride)
+    # Issue the record metadata with the read index so the state loads wait on
+    # one round trip rather than two.
+    slot = gl.load(metadata + sequence_idx * 3)
+    generation = gl.load(metadata + sequence_idx * 3 + 1)
+    start = gl.load(metadata + sequence_idx * 3 + 2)
     valid_read = (read_idx > 0) & (read_idx < NUM_POOL_SLOTS)
     if not valid_read:
         if value_split_idx == 0:
@@ -618,9 +624,6 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
                 )
         return
 
-    slot = gl.load(metadata + sequence_idx * 3)
-    generation = gl.load(metadata + sequence_idx * 3 + 1)
-    start = gl.load(metadata + sequence_idx * 3 + 2)
     valid = (
         (slot >= 0)
         & (slot < record_slots)
@@ -632,6 +635,12 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     gl.device_assert(valid, "invalid replay metadata")
     if not valid:
         return
+    if token_count == 0:
+        return
+    # Rows past the window reload the last live row instead of masking the
+    # loads: a uniform mask becomes a branch with a memory wait per load. Only
+    # masked stores consume those rows.
+    last_row = token_base + token_count - 1
 
     read_page_offset = read_idx.to(gl.int64)
     read_base = read_page_offset * STATE_POOL_PAGE_STRIDE + head_idx * D * D
@@ -690,11 +699,8 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
 
     for token_offset in gl.static_range(TOKENS_PER_SEQUENCE):
         token_idx = token_base + token_offset
-        qkv_input_raw = gl.load(
-            mixed_qkv + token_idx * MIXED_ROW_STRIDE + qkv_channel,
-            mask=token_offset < token_count,
-            other=0.0,
-        )
+        load_idx = gl.minimum(token_idx, last_row)
+        qkv_input_raw = gl.load(mixed_qkv + load_idx * MIXED_ROW_STRIDE + qkv_channel)
         if original_qkv is not None:
             # One value split retains the pre-convolution bytes for commit.
             gl.store(
@@ -720,11 +726,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
         qkv_value = qkv_value.to(mixed_qkv.dtype.element_ty).to(gl.float32)
 
         if raw_g is None:
-            f_a_value = gl.load(
-                f_a_out + token_idx * F_A_ROW_STRIDE + f_a_offsets,
-                mask=token_offset < token_count,
-                other=0.0,
-            )
+            f_a_value = gl.load(f_a_out + load_idx * F_A_ROW_STRIDE + f_a_offsets)
             projected_gate = (
                 gl.sum(
                     f_b_tile.to(gl.float32) * f_a_value.to(gl.float32)[None, :], axis=1
@@ -734,9 +736,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
             )
         else:
             raw_gate_value = gl.load(
-                raw_g + token_idx * GATE_ROW_STRIDE + decay_channel,
-                mask=token_offset < token_count,
-                other=0.0,
+                raw_g + load_idx * GATE_ROW_STRIDE + decay_channel
             ).to(gl.float32)
         position = start + token_offset
         ring = position % CAPACITY
@@ -761,10 +761,6 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
             gl.store(projected_record, projected_gate, mask=owner)
         else:
             gl.store(record_base + D, raw_gate_value, mask=owner & is_decay)
-        if head_idx == 0 and value_split_idx == 0:
-            stamp = stamps + (slot * CAPACITY + ring) * 2
-            gl.store(stamp, position, mask=token_offset < token_count)
-            gl.store(stamp + 1, generation, mask=token_offset < token_count)
         if raw_g is None:
             decay_value = _kda_decay(
                 projected_gate, gate_bias, a_value, HAS_LOWER_BOUND, LOWER_BOUND
@@ -786,6 +782,16 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
         qkv_history1 = qkv_history2
         qkv_history2 = qkv_input
 
+    # Stamp the whole window at once; a guarded pair per token costs a branch
+    # and its memory wait each.
+    if head_idx == 0 and value_split_idx == 0:
+        stamp_offsets = gl.arange(0, TOKEN_WIDTH, layout=compact_layout)
+        stamp_positions = start + stamp_offsets
+        stamp = stamps + (slot * CAPACITY + stamp_positions % CAPACITY) * 2
+        stamp_live = stamp_offsets < token_count
+        gl.store(stamp, stamp_positions, mask=stamp_live)
+        gl.store(stamp + 1, stamp_positions * 0 + generation, mask=stamp_live)
+
     q_values = ()
     k_values = ()
     decay_values = ()
@@ -793,7 +799,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     key_queries = ()
     value_panels_by_token = ()
     for token_offset in gl.static_range(TOKENS_PER_SEQUENCE):
-        token_idx = token_base + token_offset
+        load_idx = gl.minimum(token_base + token_offset, last_row)
         vectors = shared_vectors.index(token_offset)
         q_value = vectors.slice(0, D, dim=0).load(key_layout)
         k_value = vectors.slice(D, D, dim=0).load(key_layout)
@@ -803,11 +809,9 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
             decay = projected_decay.index(token_offset).load(key_layout)
         else:
             decay = vectors.slice(3 * D, D, dim=0).load(key_layout)
-        beta_value = gl.load(
-            beta_logits + token_idx * BETA_ROW_STRIDE + head_idx,
-            mask=token_offset < token_count,
-            other=0.0,
-        ).to(gl.float32)
+        beta_value = gl.load(beta_logits + load_idx * BETA_ROW_STRIDE + head_idx).to(
+            gl.float32
+        )
         beta_value = 1.0 / (1.0 + gl.exp(-beta_value))
         if panel_rows == 16:
             value_panels = _kda_value_panels(vectors, D, value_layout)
@@ -951,26 +955,8 @@ def gluon_kda_fused_replay_gfx950(
     head_idx = gl.program_id(0)
     sequence_idx = gl.program_id(1)
     layer_idx = gl.program_id(2)
-    group_idx = gl.load(group_indices + layer_idx).to(gl.int64)
-    read_idx = gl.load(reads + group_idx * BATCH + sequence_idx).to(gl.int64)
-    write_idx = gl.load(writes + group_idx * BATCH + sequence_idx).to(gl.int64)
-    if read_idx <= 0 or write_idx <= 0:
-        return
-    replay_steps = gl.load(accepted + sequence_idx)
-    slot, start, valid = kda_record_interval(
-        metadata,
-        stamps,
-        sequence_idx,
-        layer_idx,
-        replay_steps,
-        record_slots,
-        CAPACITY,
-        stamp_layer_stride,
-        T,
-        64,
-    )
-    if not valid:
-        return
+    # Descriptors and step counts depend only on the program, so they share the
+    # group-index round trip instead of waiting behind the record validation.
     descriptor_base = layer_idx * 10
     mixed_qkv = gl.load(descriptors + descriptor_base).to(
         gl.pointer_type(activation_ref.dtype.element_ty)
@@ -989,6 +975,12 @@ def gluon_kda_fused_replay_gfx950(
     state_pool = gl.load(descriptors + descriptor_base + 8).to(
         gl.pointer_type(gl.float32)
     )
+    group_idx = gl.load(group_indices + layer_idx).to(gl.int64)
+    replay_steps = gl.load(accepted + sequence_idx)
+    read_idx = gl.load(reads + group_idx * BATCH + sequence_idx).to(gl.int64)
+    write_idx = gl.load(writes + group_idx * BATCH + sequence_idx).to(gl.int64)
+    if read_idx <= 0 or write_idx <= 0:
+        return
 
     state_layout: gl.constexpr = gl.BlockedLayout(
         [1, 8],
@@ -1028,6 +1020,20 @@ def gluon_kda_fused_replay_gfx950(
         qkv_history0 = gl.where(token_active, qkv_history1, qkv_history0)
         qkv_history1 = gl.where(token_active, qkv_history2, qkv_history1)
         qkv_history2 = gl.where(token_active, qkv_input, qkv_history2)
+    slot, start, valid = kda_record_interval(
+        metadata,
+        stamps,
+        sequence_idx,
+        layer_idx,
+        replay_steps,
+        record_slots,
+        CAPACITY,
+        stamp_layer_stride,
+        T,
+        64,
+    )
+    if not valid:
+        return
     qkv_write_base = conv_pool + write_idx * conv_stride + qkv_channel * 3
     gl.store(qkv_write_base, qkv_history0, mask=slot_id != 3)
     gl.store(qkv_write_base + 1, qkv_history1, mask=slot_id != 3)
@@ -1037,6 +1043,9 @@ def gluon_kda_fused_replay_gfx950(
     bias = gl.load(dt_bias + head_idx * D + key_offsets).to(gl.float32)
     # Stage accepted records once for key normalization and state updates.
     record_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
+    # Rows past the accepted prefix reload the last live record instead of
+    # masking: a uniform mask becomes a branch with a memory wait per load.
+    last_step = gl.maximum(replay_steps - 1, 0)
     correction_offsets = gl.arange(0, D, layout=record_layout)
     key_gate_offsets = gl.arange(0, 2 * D, layout=record_layout)
     correction_shared = gl.allocate_shared_memory(
@@ -1048,19 +1057,15 @@ def gluon_kda_fused_replay_gfx950(
         gl.SwizzledSharedLayout(1, 1, 1, order=[0]),
     )
     for token_offset in gl.static_range(T):
-        record_row = slot * CAPACITY + (start + token_offset) % CAPACITY
+        record_row = (
+            slot * CAPACITY + (start + gl.minimum(token_offset, last_step)) % CAPACITY
+        )
         correction_value = gl.load(
-            correction + record_row * u_stride + head_idx * D + correction_offsets,
-            mask=token_offset < replay_steps,
-            other=0.0,
+            correction + record_row * u_stride + head_idx * D + correction_offsets
         )
         correction_shared.index(token_offset).store(correction_value)
         record_base = key_gate + record_row * kg_stride + head_idx * 2 * D
-        key_gate_value = gl.load(
-            record_base + key_gate_offsets,
-            mask=token_offset < replay_steps,
-            other=0.0,
-        )
+        key_gate_value = gl.load(record_base + key_gate_offsets)
         key_gate_shared.index(token_offset).store(key_gate_value)
 
     k_values = ()
@@ -1540,6 +1545,7 @@ def gluon_kda_fused_verify_gfx950(
         D=head_dim,
         F_A=head_dim,
         TOKENS_PER_SEQUENCE=draft_token_num,
+        TOKEN_WIDTH=triton.next_power_of_2(draft_token_num),
         VALUE_SPLITS=value_splits,
         MIXED_ROW_STRIDE=mixed_qkv.stride(0),
         ORIGINAL_QKV_ROW_STRIDE=(0 if original_qkv is None else original_qkv.stride(0)),
