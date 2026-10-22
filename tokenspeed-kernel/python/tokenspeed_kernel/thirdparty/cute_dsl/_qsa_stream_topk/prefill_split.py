@@ -30,6 +30,9 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.common import (
     _copy_u128 as _copy_gmem_to_smem_u128,
 )
+from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.common import (
+    _query_group_bounds,
+)
 from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.prefill import PrefillTopK
 
 _QUERY_GROUP = 8
@@ -49,9 +52,10 @@ _MMA_WARP = _TOPK_FIRST_WARP + _QUERY_GROUP * _SELECTOR_WARPS_PER_ROW
 
 
 class SplitPrefillTopK(PrefillTopK):
-    def __init__(self, enable_pdl: bool, splits: int):
+    def __init__(self, enable_pdl: bool, splits: int, has_tail: bool):
         self.splits = splits
         self.enable_pdl = enable_pdl
+        self.has_tail = has_tail
         self.query_group = _QUERY_GROUP
         self.stream_tile = _STREAM_TILE
         self.selector_warps_per_row = _SELECTOR_WARPS_PER_ROW
@@ -76,6 +80,7 @@ class SplitPrefillTopK(PrefillTopK):
         selected: cute.Tensor,
         q_stride_row: cutlass.Int32,
         q_stride_head: cutlass.Int32,
+        queries_per_request: cutlass.Int32,
         page_size: cutlass.Constexpr[int],
         stream: cuda.CUstream,
     ):
@@ -114,6 +119,11 @@ class SplitPrefillTopK(PrefillTopK):
         tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(), source, page_layout, (64, 64)
         )
+        groups = query.shape[0] // self.query_group
+        if cutlass.const_expr(self.has_tail):
+            groups = (query.shape[0] // queries_per_request) * cute.ceil_div(
+                queries_per_request, self.query_group
+            )
         self._kernel(
             tiled_mma,
             smem_layout_k,
@@ -129,9 +139,10 @@ class SplitPrefillTopK(PrefillTopK):
             selected,
             q_stride_row,
             q_stride_head,
+            queries_per_request,
             page_size,
         ).launch(
-            grid=(query.shape[0] // self.query_group * self.splits, 1, 1),
+            grid=(groups * self.splits, 1, 1),
             block=(self.threads, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
@@ -155,6 +166,7 @@ class SplitPrefillTopK(PrefillTopK):
         selected: cute.Tensor,
         q_stride_row: cutlass.Int32,
         q_stride_head: cutlass.Int32,
+        queries_per_request: cutlass.Int32,
         page_size: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -163,7 +175,9 @@ class SplitPrefillTopK(PrefillTopK):
         warp_idx = cute.arch.make_warp_uniform(tidx // 32)
         warpgroup_idx = cute.arch.make_warp_uniform(tidx // 128)
         warpgroup_tidx = tidx % 128
-        row_base = (block_idx // self.splits) * self.query_group
+        row_base, valid_rows = _query_group_bounds(
+            block_idx // self.splits, queries_per_request, self.has_tail
+        )
         split = block_idx % self.splits
         split_base = split * self.stream_tile
         num_blocks = page_table.shape[1] * page_size
@@ -277,9 +291,13 @@ class SplitPrefillTopK(PrefillTopK):
                 col = (vector - q_head * 16) * 8
                 q_row = q_head // _HEADS
                 head = q_head - q_row * _HEADS
+                # Keep inactive rows in the pipelines without reading past the run.
+                source_row = row_base + q_row
+                if cutlass.const_expr(self.has_tail) and q_row >= valid_rows:
+                    source_row = row_base
                 source = (
                     query.iterator
-                    + (row_base + q_row) * q_stride_row
+                    + source_row * q_stride_row
                     + head * q_stride_head
                     + col
                 )
@@ -316,7 +334,12 @@ class SplitPrefillTopK(PrefillTopK):
                 if thread_in_row == 0:
                     for item in cutlass.range_constexpr(6):
                         scalars[row_in_group, item] = cutlass.Int32(0)
-                    row_complete = complete_blocks[row_base + row_in_group]
+                    row_complete = cutlass.Int32(0)
+                    if (
+                        cutlass.const_expr(not self.has_tail)
+                        or row_in_group < valid_rows
+                    ):
+                        row_complete = complete_blocks[row_base + row_in_group]
                     if row_complete > num_blocks:
                         row_complete = cutlass.Int32(num_blocks)
                     row_complete -= split_base
@@ -333,7 +356,9 @@ class SplitPrefillTopK(PrefillTopK):
         request = request_indices[row_base]
         group_complete = cutlass.Int32(0)
         for query_row in cutlass.range_constexpr(self.query_group):
-            count = complete_blocks[row_base + query_row]
+            count = cutlass.Int32(0)
+            if cutlass.const_expr(not self.has_tail) or query_row < valid_rows:
+                count = complete_blocks[row_base + query_row]
             if count > group_complete:  # noqa: PLR1730
                 group_complete = count
         if group_complete > num_blocks:
@@ -588,4 +613,8 @@ class SplitPrefillTopK(PrefillTopK):
                             )
                         else:
                             value = running_values[item] + cutlass.Int64(split_base)
-                    selected_row[split * _TOPK + index] = value
+                    if (
+                        cutlass.const_expr(not self.has_tail)
+                        or row_in_group < valid_rows
+                    ):
+                        selected_row[split * _TOPK + index] = value

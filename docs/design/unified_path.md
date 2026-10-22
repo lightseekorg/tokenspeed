@@ -1162,7 +1162,8 @@ matrix would exceed it. Explicit paths bypass that automatic budget.
 Supported Blackwell stream layouts use CuTe DSL; other layouts and vendors
 retain portable Triton. The Blackwell CuTe specializations use four
 BF16 index heads of width 128, 64-block pages, and block top-k 512. Grouped
-scoring requires explicit eight-row request runs; small query grids can score
+scoring uses eight-row CTAs within explicit uniform request runs of at least
+eight rows, including each run's partial final group. Small query grids can score
 rows independently, including ragged queries. Grouped streams keep exact
 running selections in selector registers, with double-buffered score
 candidates overlapping selection and MMA across tiles. Small grids can split
@@ -1173,8 +1174,8 @@ uniform request run and keeps each row's running top-k locally, with no split/me
 buffers. Ragged runs use group size one in the same kernel. Candidate pruning must
 prove that discarded scores cannot enter the top-k, or perform a full-score
 fallback. Each row retains its complete-block frontier. Query count, request
-count, page-table width, and Q strides remain runtime values; split geometry is
-bucketed before specializing the compiled signature. PDL waits precede
+count, page-table width, and Q strides remain runtime values; request alignment
+and bucketed split geometry specialize the compiled signature. PDL waits precede
 asynchronous Q copies and producer-owned metadata reads.
 Trimmed batched page-table views retain a runtime row stride. Speculative
 context padding counts toward their capacity; compact candidate offsets must

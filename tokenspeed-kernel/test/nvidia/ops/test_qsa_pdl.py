@@ -288,6 +288,10 @@ def test_qsa_selection_waits_for_query_cache_and_metadata(
         (256, 256, 32),
         (256, 256, 64),
         (256, 256, 128),
+        (9, 9, 1024),
+        (153, 17, 32),
+        (171, 19, 64),
+        (207, 23, 128),
     ],
 )
 def test_cute_dsl_qsa_stream_waits_before_query_copy_and_frontiers(
@@ -311,7 +315,7 @@ def test_cute_dsl_qsa_stream_waits_before_query_copy_and_frontiers(
     if rows < 8:
         counts = [capacity, 513][:rows]
     else:
-        counts *= rows // 8
+        counts = (counts * ((rows + 7) // 8))[:rows]
     complete = torch.tensor(
         counts,
         device="cuda",
