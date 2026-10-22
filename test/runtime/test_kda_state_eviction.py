@@ -22,7 +22,7 @@
 
 The small three-group pool and KDA kernels come from the existing numerical
 harness. Every block id and prefix hit comes from the real C++ scheduler
-through the runtime contract bridge: a state group's row is its two slots, an
+through the runtime contract bridge. A state group's row has two slots;
 complete-page chunk ends become reusable checkpoints that can later be evicted,
 and the prompt-end checkpoint is the one a later prompt resumes from. This is
 not a model or MLA numerical test: history blocks participate in scheduling

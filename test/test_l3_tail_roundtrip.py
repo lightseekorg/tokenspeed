@@ -213,34 +213,54 @@ def test_cold_tail_restores_actual_put_bytes(
         cleanup.callback(writer_io.close, timeout_s=5)
         query = _submit(writer, list(range(5)), reuse_bound=4)
         assert not any(_complete(writer, writer_io, query).success)
-        plan = writer.next_execution_plan()
-        assert list(plan.forward[0].extend_prefix_lens) == [0]
-        advanced = ts.ForwardEvent.ExtendResult()
-        advanced.request_id, advanced.tokens = "r", [77]
-        _send(writer, advanced)
+
+        def persist(plan):
+            for operation in plan.cache:
+                if isinstance(operation, ts.Cache.WriteBackOp):
+                    for op_id in operation.op_ids:
+                        done = ts.Cache.WriteBackDoneEvent()
+                        done.op_id = op_id
+                        _send(writer, done)
+            puts = [op for op in storage_ops(plan) if op.kind == ts.StorageKind.Put]
+            for operation in puts:
+                for key, block in zip(
+                    operation.keys, operation.host_blocks, strict=True
+                ):
+                    key = tuple(key)
+                    payload = hashlib.sha256(repr(key).encode()).digest()[:8]
+                    expected[key] = payload
+                    offset, _ = writer_host.host_block_range(key[0], block)
+                    write_host_bytes(writer_host.host_buffer, offset, payload)
+                assert all(_complete(writer, writer_io, operation).success)
+            return bool(puts) or any(
+                isinstance(op, ts.Cache.WriteBackOp) for op in plan.cache
+            )
+
+        # State groups retain a checkpoint at 4 before the unaligned tail.
+        # Persist both the intermediate checkpoint and the final tail.
+        for step in range(5):
+            plan = writer.next_execution_plan()
+            persist(plan)
+            batch = plan.forward[0]
+            if step == 0:
+                assert list(batch.extend_prefix_lens) == [0]
+            complete = batch.extend_prefix_lens[0] + batch.input_lengths[0] == 5
+            advanced = ts.ForwardEvent.ExtendResult()
+            advanced.request_id, advanced.tokens = "r", [77] if complete else []
+            _send(writer, advanced)
+            if complete:
+                break
+        else:
+            pytest.fail("writer prefill did not finish")
         finished = ts.ForwardEvent.Finish()
         finished.request_id = "r"
         _send(writer, finished)
-        for operation in writer.next_execution_plan().cache:
-            if isinstance(operation, ts.Cache.WriteBackOp):
-                for op_id in operation.op_ids:
-                    done = ts.Cache.WriteBackDoneEvent()
-                    done.op_id = op_id
-                    _send(writer, done)
-        puts = [
-            op
-            for op in storage_ops(writer.next_execution_plan())
-            if op.kind == ts.StorageKind.Put
-        ]
-        assert puts
-        for operation in puts:
-            for key, block in zip(operation.keys, operation.host_blocks, strict=True):
-                key = tuple(key)
-                payload = hashlib.sha256(repr(key).encode()).digest()[:8]
-                expected[key] = payload
-                offset, _ = writer_host.host_block_range(key[0], block)
-                write_host_bytes(writer_host.host_buffer, offset, payload)
-            assert all(_complete(writer, writer_io, operation).success)
+        for _ in range(10):
+            if not persist(writer.next_execution_plan()):
+                break
+        else:
+            pytest.fail("writer storage operations did not drain")
+        assert expected
         if backend_kind == "mooncake":
             # The independent owner retains native objects after client close.
             writer_io.close(timeout_s=5)
@@ -273,7 +293,9 @@ def test_cold_tail_restores_actual_put_bytes(
             )
         plan = reader.next_execution_plan()
         assert list(plan.forward[0].extend_prefix_lens) == [5]
-        assert list(plan.forward[0].input_lengths) == [suffix_tokens]
+        # A four-token suffix retains state at 8 before the final token at 9.
+        first_chunk = 3 if "state" in kinds and suffix_tokens == 4 else suffix_tokens
+        assert list(plan.forward[0].input_lengths) == [first_chunk]
         assert any(isinstance(op, ts.Cache.LoadBackOp) for op in plan.cache)
         assert reader.storage_quarantined() == 0
         assert reader_io.backend.remove_by_prefix(namespace)
