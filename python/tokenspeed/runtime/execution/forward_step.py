@@ -590,7 +590,7 @@ class ForwardStepRunner:
 
         # Bind whichever grammar buffer is active so the captured sampler
         # records the apply_vocab_mask call. At replay, runtime fills the
-        # bound buffer in place (hostfunc for capturable, sync H2D for
+        # bound buffer in place (host node for capturable, sync H2D for
         # eager) — the captured graph reads from the same memory.
         bind_grammar_mask_buf(
             sampling_info,
@@ -602,8 +602,8 @@ class ForwardStepRunner:
         )
 
         def run_once():
-            # Dummy add_batch keeps the grammar gate 1:1 with replays: the
-            # hostfunc pops one decision per forward.
+            # Dummy add_batch keeps grammar batches 1:1 with replays: the
+            # host node pops one batch per forward.
             if self.capturable_grammar is not None:
                 self.capturable_grammar.add_batch(
                     grammars=[None] * bs,
@@ -687,7 +687,7 @@ class ForwardStepRunner:
         _is_capture_mode = False
         _is_cuda_graph_phase = False
 
-        # Drop the capture's unconsumed gate decision; the first replay would pop it.
+        # Drop the capture's unconsumed batch; the first replay would pop it.
         if self.capturable_grammar is not None:
             self.capturable_grammar.reset_state()
 

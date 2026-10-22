@@ -709,39 +709,6 @@ class OutputProcesser:
             self._release_multimodal_features(state)
             self.rid_to_state.pop(rid, None)
 
-    def _host_advance_matcher(self, completion, model_execution_results):
-        """Host-side fallback for the grammar matcher advance.
-
-        Reads already-synced CPU tensors. Fires when no next step arrives to run
-        the hostfunc (e.g., last live request finished).
-        """
-        grammars = completion.grammars or []
-        bs = completion.bs
-        advance_mask = completion.advance_mask or [True] * bs
-        output_tokens = model_execution_results.output_tokens
-        accept_lengths = model_execution_results.output_lengths
-        terminated_at = [-1] * bs
-        for i, grammar in enumerate(grammars):
-            if (
-                grammar is None
-                or grammar.finished
-                or grammar.is_terminated()
-                or not advance_mask[i]
-            ):
-                continue
-            n_accepted = int(accept_lengths[i].item())
-            offset = completion.output_layout.token_offset(i)
-            for j in range(n_accepted):
-                tok = int(output_tokens[offset + j].item())
-                try:
-                    grammar.accept_token(tok)
-                except Exception:
-                    break
-                if grammar.is_terminated():
-                    terminated_at[i] = j
-                    break
-        completion.terminated_at = terminated_at
-
     @staticmethod
     def _aggregate_spec_decode_step(
         *,
@@ -815,20 +782,18 @@ class OutputProcesser:
         )
         self._emit_spec_decode_metrics(forward_op, model_execution_results)
 
-        # Wait briefly for the next step's build hostfunc to advance
-        # the matcher; if it doesn't come, advance on host. The lock
-        # on the completion ensures exactly one path wins.
+        # Wait briefly for the next step's host node to advance the
+        # matcher; if it doesn't come, advance on host. Exactly one path
+        # advances: a host advance that loses waits for the host node.
         grammar_completion = model_execution_results.grammar_completion
         grammar_terminated_at = None
         if grammar_completion is not None:
-            if not grammar_completion.event.wait(timeout=0.005):
-                with grammar_completion.lock:
-                    if not grammar_completion.event.is_set():
-                        self._host_advance_matcher(
-                            grammar_completion, model_execution_results
-                        )
-                        grammar_completion.event.set()
-            grammar_terminated_at = grammar_completion.terminated_at
+            if not grammar_completion.wait(timeout=0.005):
+                grammar_completion.advance_on_host(
+                    model_execution_results.output_tokens.tolist(),
+                    model_execution_results.output_lengths.tolist(),
+                )
+            grammar_terminated_at = grammar_completion.terminated_at()
         self.log_cnt += 1
         num_extends = forward_op.num_extends()
 

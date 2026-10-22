@@ -1762,7 +1762,7 @@ class ModelExecutor:
         self.nan_guard.merge_oov(output_tokens, ctx, self.runtime_states.vocab_size)
 
         # Fork sampler-output D2H onto the grammar side stream so the
-        # next step's build hostfunc can advance the matcher.
+        # next step's host node can advance the matcher.
         if self.capturable_grammar is not None:
             self.capturable_grammar.schedule_post_sampler(output_tokens, accept_lengths)
 
@@ -1924,8 +1924,8 @@ class ModelExecutor:
                     batch_size=padded_bs,
                     total_tokens=padded_bs * self.config.output_length,
                 )
-                # Captured hostfunc pops one gate decision per replay; add a
-                # dummy for this idle replay, same as run_once.
+                # The captured host node pops one grammar batch per replay;
+                # add a dummy for this idle replay, same as run_once.
                 if self.capturable_grammar is not None:
                     self.capturable_grammar.add_batch(
                         grammars=[None] * padded_bs,

@@ -160,7 +160,10 @@ def _repeated_failure_cleanup(writer):
             assert reader.recv() == {"status": "ready"}
         try:
             triggers[0].set()
-            threading.Event().wait(_TIMEOUT_S)
+            # A signal received by another thread does not wake this wait.
+            # Return to Python so its handler runs before the peer times out.
+            for _ in range(_TIMEOUT_S * 10):
+                threading.Event().wait(0.1)
         except SystemExit as exc:
             outcome = exc.code
         finally:
