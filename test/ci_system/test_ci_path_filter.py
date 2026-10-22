@@ -11,7 +11,9 @@ from ci_path_filter import (
 from pipeline import load_yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-NVIDIA_GROUPS = tuple(group for group in RUNNER_GROUPS if group not in ("amd-mi350", "amd-mi450"))
+NVIDIA_GROUPS = tuple(
+    group for group in RUNNER_GROUPS if group not in ("amd-mi350", "amd-mi450")
+)
 KERNEL = "tokenspeed-kernel/python/tokenspeed_kernel"
 
 
