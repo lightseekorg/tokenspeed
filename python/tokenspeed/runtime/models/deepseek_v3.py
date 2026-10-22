@@ -39,7 +39,7 @@ from tokenspeed_kernel.ops.attention.mla import (
 )
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV, MLAPrologueOutput
-from tokenspeed_kernel.ops.gemm import bmm, mm
+from tokenspeed_kernel.ops.gemm import bmm, mm, plan_dense_gemm
 from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
@@ -811,6 +811,18 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         self.w_kc = None
         self.w_vc = None
+        self.absorption_kernel_plan = (
+            plan_dense_gemm(
+                mode="bmm",
+                input_size=self.qk_nope_head_dim,
+                output_size=self.kv_lora_rank,
+                dtype=torch.get_default_dtype(),
+                batch_size=self.num_local_heads,
+                batch_invariant=True,
+            )
+            if global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+            else None
+        )
 
     def _make_qkv_a_projection(
         self, *, quant_config: QuantizationConfig | None, prefix: str
@@ -1353,11 +1365,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 q_nope.transpose(0, 1),
                 self.w_kc.transpose(1, 2),
                 out=Q[..., : self.kv_lora_rank].transpose(0, 1),
-                override=(
-                    "aok"
-                    if global_server_args_dict["numerics"] in BITWISE_ENVELOPES
-                    else None
-                ),
+                plan=self.absorption_kernel_plan,
             )
         return Q, q_pe
 

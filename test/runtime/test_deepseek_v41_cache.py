@@ -90,6 +90,12 @@ def _config(device):
         num_kv_heads=1,
         head_dim=512,
         attn_tp_size=1,
+        attention_query_swa_min_tokens=4096,
+        attention_query_min_tokens=1024,
+        attention_query_rank=0,
+        attention_query_group=(0,),
+        indexer_query_rank=0,
+        indexer_query_group=(0,),
         cache_layer_types=("sliding_attention",) * 40,
         sliding_window_tokens=128,
         compress_ratios=RATIOS,
@@ -747,7 +753,13 @@ def _decode_compute(backend, inputs, bs):
             order = torch.arange(bs - 1, -1, -2, device=backend.device)
             outputs.extend(
                 backend.select_global(
-                    21, None, None, pos[order], req[order], mode, None
+                    21,
+                    None,
+                    None,
+                    pos[order],
+                    req[order],
+                    mode,
+                    None,
                 )
             )
     return outputs
@@ -968,6 +980,10 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
         model="x",
         device="cpu",
         attn_tp_size=1,
+        deepseek_v41_attention_query_swa_min_tokens=4096,
+        deepseek_v41_attention_query_min_tokens=1024,
+        deepseek_v41_attention_query_parallel_size=1,
+        deepseek_v41_indexer_query_parallel_size=1,
         data_parallel_size=2,
         prefix_granularity=128,
         max_num_seqs=4,
@@ -1683,7 +1699,13 @@ def test_gpu_quantized_joint_attention_and_reindex_reuse():
     pick = torch.tensor([18, 16, 4], device="cuda")
     positions, requests = meta.positions[pick], meta.request_indices[pick]
     reuse, _ = backend.select_global(
-        21, None, None, positions, requests, ForwardMode.EXTEND, None
+        21,
+        None,
+        None,
+        positions,
+        requests,
+        ForwardMode.EXTEND,
+        None,
     )
     want = backend.global_read_slots(
         20, record.logical_rows[pick], positions, requests, ForwardMode.EXTEND
@@ -1691,7 +1713,13 @@ def test_gpu_quantized_joint_attention_and_reindex_reuse():
     torch.testing.assert_close(reuse, want)
     for layer in (24, 28):
         slots, lengths = backend.select_global(
-            layer, iq[pick], iw[pick], positions, requests, ForwardMode.EXTEND, None
+            layer,
+            iq[pick],
+            iw[pick],
+            positions,
+            requests,
+            ForwardMode.EXTEND,
+            None,
         )
         assert backend.sparse_topk.prefill.candidates is candidates
         assert (lengths > 0).all() and (slots[:, 0] >= 0).all()
@@ -2033,7 +2061,8 @@ def test_native_decode_receives_compact_window_and_real_lengths(monkeypatch, pos
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     captured = []
 
-    def selected(*args):
+    def selected(*args, lse):
+        assert lse is None
         captured.append(args)
         return torch.zeros_like(args[0])
 
@@ -2914,3 +2943,99 @@ def test_index_geometry_scope_preserves_all_indexer_selections_in_graph(monkeypa
         graph.replay()
         for got, want in zip(captured, expected, strict=True):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "mode,layer,total,history,head_group,expected",
+    [
+        (ForwardMode.EXTEND, 2, 8192, 65536, None, True),
+        (ForwardMode.EXTEND, 8, 8192, 65536, None, True),
+        (ForwardMode.EXTEND, 14, 8192, 65536, None, True),
+        (ForwardMode.EXTEND, 2, 4095, 65536, None, False),
+        (ForwardMode.EXTEND, 2, 8192, 4096, None, False),
+        (ForwardMode.EXTEND, 3, 8192, 65536, None, False),
+        (ForwardMode.EXTEND, 20, 8192, 65536, None, False),
+        (ForwardMode.EXTEND, 24, 8192, 65536, None, False),
+        (ForwardMode.DECODE, 2, 8192, 65536, None, False),
+        (ForwardMode.MIXED, 2, 8192, 65536, None, False),
+        (ForwardMode.EXTEND, 2, 8192, 65536, object(), False),
+    ],
+)
+def test_indexer_projection_plan_preserves_execution_boundaries(
+    mode, layer, total, history, head_group, expected
+):
+    backend = _backend("cpu", 2)
+    backend.spec = replace(
+        backend.spec, indexer_query_rank=3, indexer_query_group=tuple(range(8))
+    )
+    # The planner uses host metadata only; no CUDA runtime is needed here.
+    positions = SimpleNamespace(is_cuda=True, numel=lambda: total)
+    spans = (SimpleNamespace(prefix=history * 2 - total, count=total),)
+    with patch.object(backend, "_window", return_value=(None, spans)):
+        plan = backend.plan_indexer_queries(layer, positions, None, mode, head_group)
+    assert (plan is not None) == expected
+    if expected:
+        assert plan.local_rows == 1024
+        assert plan.local_slice == slice(3, total, 8)
+
+
+@pytest.mark.parametrize("projected", [False, True])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_projected_indexer_queries_are_not_sliced_twice(projected, deferred):
+    from tokenspeed.runtime.layers.attention.query_partition import InterleavedQueryPlan
+
+    backend = _backend("cpu", 2)
+    _extend(backend, _tables("cpu"), [5, 4], [20, 20], [0, 0], [25, 24])
+    meta = backend.query_metadata(ForwardMode.EXTEND)
+    plan = InterleavedQueryPlan(total_rows=9, rank=1, size=2)
+    backend.spec = replace(
+        backend.spec, indexer_query_rank=1, indexer_query_group=(0, 1)
+    )
+    q = torch.arange(9, dtype=torch.bfloat16).reshape(9, 1, 1).expand(9, 2, 128)
+    weights = torch.ones(9, 2, dtype=torch.bfloat16)
+    seen = []
+
+    if deferred:
+        q = dsv41.IndexQueryInput(
+            q, meta.positions, torch.zeros(25, 64), weight_scale=0.25
+        )
+
+    def score(*args):
+        query = args[0]
+        values = query.values if deferred else query
+        seen.extend(values[:, 0, 0].tolist())
+        if deferred:
+            expected_positions = meta.positions[values[:, 0, 0].long()]
+            torch.testing.assert_close(query.positions, expected_positions)
+            assert query.weight_scale == 0.25
+        rows, lengths, _, _ = args[12]
+        rows.fill_(0)
+        lengths.fill_(1)
+
+    def gather(self, rows, lengths, group):
+        assert self == plan and group == (0, 1)
+        assert rows.shape[0] == 4 and lengths.tolist() == [1] * 4
+        return torch.zeros(9, rows.shape[1], dtype=torch.int32), torch.ones(
+            9, dtype=torch.int32
+        )
+
+    with (
+        patch.object(backend, "plan_indexer_queries", return_value=plan),
+        patch("tokenspeed_kernel.ops.attention.dsv41.index_topk", side_effect=score),
+        patch.object(InterleavedQueryPlan, "gather_selection", new=gather),
+    ):
+        slots, lengths = backend.prepare_global_selection(
+            2,
+            q[plan.local_slice] if projected else q,
+            weights[plan.local_slice] if projected else weights,
+            meta.positions,
+            meta.request_indices,
+            ForwardMode.EXTEND,
+            None,
+            projected_partition=plan if projected else None,
+        )
+    assert seen == [1, 3, 5, 7]
+    assert slots.shape[0] == 9 and lengths.shape == (9,)
+    record = backend.sparse_topk.prefill
+    assert record.positions is meta.positions
+    assert record.request_indices is meta.request_indices

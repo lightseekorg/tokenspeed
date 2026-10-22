@@ -513,6 +513,11 @@ class MoELayer(torch.nn.Module):
                 deepep_low_latency_max_num_tokens_per_gpu
             ),
             persistent_max_num_tokens_per_gpu=persistent_max_num_tokens_per_gpu,
+            features=(
+                frozenset({"batch_invariant"})
+                if global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+                else frozenset()
+            ),
             solution=moe_backend,
             # rl-bitwise promises one reduction order; fast-math epilogues
             # trade exactly that away.

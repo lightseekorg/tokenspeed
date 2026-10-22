@@ -121,6 +121,7 @@ def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
             locations,
             pool,
             batch,
+            fused=False,
             index_key=index_keys,
             index_query=index_query,
             index_weights=weights,

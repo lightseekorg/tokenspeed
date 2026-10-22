@@ -45,14 +45,21 @@ class _QsaModelProfile:
     num_q_heads: int
     num_kv_heads: int
     head_dim: int
-    selected_width: int
+    block_size: int
+    block_topk: int
+    page_size: int
 
 
 # Per-rank QSA geometry: Qwen3.8-Flash-Next has 24 query / 2 KV heads of 256
 # dims split over TP2, and selects 2051 KV slots per query row.
 _MODEL_PROFILES = {
     "qwen38_flash_tp2": _QsaModelProfile(
-        num_q_heads=12, num_kv_heads=1, head_dim=256, selected_width=2051
+        num_q_heads=12,
+        num_kv_heads=1,
+        head_dim=256,
+        block_size=4,
+        block_topk=512,
+        page_size=64,
     ),
 }
 _KV_DTYPES = {
@@ -158,14 +165,27 @@ def prepare_qsa_sparse_attention(
     rows = batch * q_len
 
     generator = torch.Generator(device="cuda").manual_seed(request.seed)
-    selected = qsa_selected_slots(
-        positions,
-        request_index,
-        context,
-        profile.selected_width,
-        generator=generator,
+    # Sample complete logical blocks; the physical-slot expansion adds the
+    # causal tail. Every solution then attends to the same candidates.
+    num_blocks = (context + profile.block_size - 1) // profile.block_size
+    scores = torch.rand((rows, num_blocks), device="cuda", generator=generator)
+    completed = positions // profile.block_size
+    scores.masked_fill_(
+        torch.arange(num_blocks, device="cuda")[None, :] >= completed[:, None], -1
     )
-    cache_slots = _FIRST_REQUEST_SLOT + batch * context
+    chosen_scores, blocks = scores.topk(min(profile.block_topk, num_blocks), dim=1)
+    blocks.masked_fill_(chosen_scores < 0, -1)
+    if blocks.shape[1] < profile.block_topk:
+        blocks = torch.cat(
+            (blocks, blocks.new_full((rows, profile.block_topk - blocks.shape[1]), -1)),
+            dim=1,
+        )
+    blocks = blocks.to(torch.int32)
+    pages_per_request = (context + profile.page_size - 1) // profile.page_size
+    block_table = torch.arange(
+        1, 1 + batch * pages_per_request, device="cuda", dtype=torch.int32
+    ).view(batch, pages_per_request)
+    cache_slots = (1 + batch * pages_per_request) * profile.page_size
     q = torch.randn(
         (rows, profile.num_q_heads, profile.head_dim),
         device="cuda",
@@ -181,11 +201,38 @@ def prepare_qsa_sparse_attention(
         ).to(kv_dtype)
         for _ in range(2)
     )
+    k_cache[: profile.page_size].zero_()
+    v_cache[: profile.page_size].zero_()
     descale = 1.0 if kv_dtype == torch.float8_e4m3fn else None
 
     from tokenspeed_kernel.ops.attention.qsa import (
+        QSASparseMetadata,
+        QSAWorkspace,
         qsa_sparse_attention,
         select_qsa_sparse_attention_kernel,
+    )
+    from tokenspeed_kernel.ops.attention.qsa.triton import qwen4_exp_qsa_selected_slots
+
+    sparse_metadata = QSASparseMetadata(
+        selected_blocks=blocks,
+        block_table=block_table,
+        token_to_request=request_index.to(torch.int32),
+        query_positions=positions - 1,
+        query_start_loc=tuple(range(0, rows + 1, q_len)),
+        page_size=profile.page_size,
+        block_size=profile.block_size,
+        workspace=QSAWorkspace(),
+    )
+    selected = qwen4_exp_qsa_selected_slots(
+        blocks,
+        completed.to(torch.int32),
+        sparse_metadata.query_positions,
+        sparse_metadata.token_to_request,
+        block_table,
+        profile.page_size,
+        profile.block_size,
+        profile.block_topk * profile.block_size,
+        enable_pdl=False,
     )
 
     load_builtin_kernels()
@@ -196,6 +243,9 @@ def prepare_qsa_sparse_attention(
             v_cache,
             selected,
             max_seqlen_q=max_seqlen_q,
+            k_scale=descale,
+            v_scale=descale,
+            sparse_metadata=sparse_metadata,
             override=request.registration,
             solution=request.solution,
         )
@@ -221,6 +271,7 @@ def prepare_qsa_sparse_attention(
             v_scale=descale,
             override=request.registration,
             solution=request.solution,
+            sparse_metadata=sparse_metadata,
         )
 
     return PreparedBenchmark(

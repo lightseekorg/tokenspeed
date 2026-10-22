@@ -610,6 +610,71 @@ def test_quantize_fp8_dynamic_token_group(
     assert torch.norm(reconstructed - x.float()) / torch.norm(x.float()) < 0.04
 
 
+def _quantize_fp8_native_scales(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return quantize_fp8(
+        x,
+        granularity="token_group",
+        group_size=128,
+        scale_encoding="float32",
+        override="trtllm_quantize_fp8_mn_major",
+    )
+
+
+@pytest.mark.parametrize("rows", [1, 13, 32, 128])
+@pytest.mark.parametrize("columns", [256, 4096])
+def test_native_fp8_scales_match_canonical(
+    device: str, rows: int, columns: int, require
+) -> None:
+    require("quantization", "fp8_with_scale", "trtllm", torch.bfloat16, "x")
+    torch.manual_seed(7)
+    x = torch.randn(rows, columns, device=device, dtype=torch.bfloat16)
+    q, scales = _quantize_fp8_native_scales(x)
+    expected_q, expected_scales = quantize_fp8(
+        x, granularity="token_group", group_size=128, solution="trtllm"
+    )
+    torch.testing.assert_close(q.float(), expected_q.float(), rtol=0, atol=0)
+    torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+    # Preserve the producer's stride instead of requiring padding on every ABI.
+    _, native_scales = torch.ops.trtllm.fp8_quantize_1x128(x, False)
+    if native_scales.ndim == 1:
+        expected_stride = (1, (rows + 3) // 4 * 4)
+    else:
+        expected_stride = native_scales.stride()[::-1]
+    assert scales.stride() == expected_stride
+    assert scales.stride(0) == 1
+    assert scales.stride(1) >= rows
+    assert expected_scales.is_contiguous()
+    reconstructed = q.float() * scales.repeat_interleave(128, -1)
+    assert (reconstructed - x.float()).norm() / x.float().norm() < 0.04
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_q, captured_scales = _quantize_fp8_native_scales(x)
+    x.mul_(0.5)
+    graph.replay()
+    expected_q, expected_scales = quantize_fp8(
+        x, granularity="token_group", group_size=128, solution="trtllm"
+    )
+    torch.testing.assert_close(captured_q.float(), expected_q.float(), rtol=0, atol=0)
+    torch.testing.assert_close(captured_scales, expected_scales, rtol=0, atol=0)
+    assert captured_scales.stride() == expected_stride
+
+
+def test_native_fp8_quantization_rejects_pdl(device: str, require) -> None:
+    require("quantization", "fp8_with_scale", "trtllm", torch.bfloat16, "x")
+    x = torch.zeros(1, 256, device=device, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="PDL"):
+        quantize_fp8(
+            x,
+            granularity="token_group",
+            group_size=128,
+            override="trtllm_quantize_fp8_mn_major",
+            enable_pdl=True,
+        )
+
+
 @pytest.mark.parametrize("solution", ["flashinfer"])
 def test_quantize_mxfp8_shape_and_scale(
     device: str,

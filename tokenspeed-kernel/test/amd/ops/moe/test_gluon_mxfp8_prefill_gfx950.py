@@ -122,6 +122,7 @@ def _plan(policy: str):
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
 
 

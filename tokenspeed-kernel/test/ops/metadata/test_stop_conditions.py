@@ -20,16 +20,75 @@
 
 """Stop conditions cut accepted widths where the control plane ends a request."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 from tokenspeed_kernel.ops.metadata import apply_stop_conditions
 from tokenspeed_kernel.ops.metadata.stop_conditions import (
     _apply_stop_conditions_kernel,
+    _apply_stop_conditions_torch,
 )
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import KernelRegistry, Priority, register_kernel
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from utils import assert_no_triton_compile
 
 _STOP_IDS = 16
 _STOP = 7
+
+
+def test_ascend_selects_portable_fallback_and_prefers_device_plugin(
+    monkeypatch, h100_platform
+):
+    # Keep the real built-in registration, but isolate device plugins and the
+    # selection cache so the fallback is exercised even on plugin-enabled hosts.
+    builtin = KernelRegistry.get().get_by_name("triton_apply_stop_conditions")
+    registry = KernelRegistry()
+    registry.register(
+        builtin, KernelRegistry.get().get_impl("triton_apply_stop_conditions")
+    )
+    monkeypatch.setattr(KernelRegistry, "_instance", registry)
+    ascend = replace(h100_platform, vendor="ascend", device_name="Ascend")
+    signature = format_signature(req_pool_indices=dense_tensor_format(torch.int64))
+
+    selected = select_kernel(
+        "metadata", "apply_stop_conditions", signature, platform=ascend
+    )
+    assert selected.name == "triton_apply_stop_conditions"
+
+    # CPU reference stands in for the unavailable device implementation; the
+    # real registry must invalidate its cached fallback and prefer the plugin.
+    register_kernel(
+        "metadata",
+        "apply_stop_conditions",
+        name="test_ascend_stop_conditions",
+        solution="test_ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=builtin.format_signatures,
+        priority=Priority.PERFORMANT,
+    )(_apply_stop_conditions_torch)
+    selected = select_kernel(
+        "metadata", "apply_stop_conditions", signature, platform=ascend
+    )
+    assert selected.name == "test_ascend_stop_conditions"
+    state = _state(3)
+    accepts = torch.tensor([3], dtype=torch.int32)
+    selected(
+        torch.tensor([1], dtype=torch.int64),
+        torch.tensor([5, _STOP, 5], dtype=torch.int32),
+        accepts,
+        torch.tensor([3], dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
+        *state,
+        0,
+        0,
+        3,
+        2,
+    )
+    assert accepts.tolist() == [2]
+    assert state[3].tolist() == [False, True, False]
 
 
 def _state(pool, device="cpu"):

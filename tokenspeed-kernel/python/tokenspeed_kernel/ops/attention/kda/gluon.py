@@ -155,7 +155,6 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "conv_kernel_size": frozenset({4}),
             "paged_state": frozenset({True}),
@@ -222,14 +221,14 @@ if current_platform().is_amd:
         replay_gate: torch.Tensor | None = None,
         replay_beta: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run target verify and optionally capture a complete raw-g replay tape."""
-        raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
+        """Run target verify, decay projection included, with optional capture."""
         return _kda_fused_verify_impl(
             mixed_qkv=mixed_qkv,
             conv_weights=conv_weights,
             conv_pool=conv_states,
             conv_scratch=conv_scratch,
-            raw_g=raw_g,
+            f_a_out=f_a_out,
+            f_b_weight=f_b_weight,
             beta_logits=beta_logits,
             A_log=A_log,
             dt_bias=dt_bias,
@@ -259,7 +258,6 @@ if current_platform().is_amd:
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
         priority=Priority.SPECIALIZED,
         traits={
-            "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "paged_state": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
@@ -282,7 +280,6 @@ if current_platform().is_amd:
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
         priority=Priority.SPECIALIZED,
         traits={
-            "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "batched_layers": frozenset({True}),
             "flat_state": frozenset({True}),
@@ -374,7 +371,6 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "conv_kernel_size": frozenset({4}),
             "paged_state": frozenset({True}),
@@ -399,13 +395,13 @@ if current_platform().is_amd:
         cu_seqlens: torch.Tensor,
         lower_bound: float | None,
     ):
-        """Run the decay projection and V-major gfx1250 fused decode."""
-        raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
+        """Run V-major gfx1250 fused decode, decay projection included."""
         return _kda_fused_decode_gfx1250_impl(
             mixed_qkv=mixed_qkv,
             conv_weights=conv_weights,
             conv_states=conv_states,
-            raw_g=raw_g,
+            f_a_out=f_a_out,
+            f_b_weight=f_b_weight,
             beta_logits=beta_logits,
             A_log=A_log,
             dt_bias=dt_bias,
@@ -441,14 +437,14 @@ if current_platform().is_amd:
         replay_gate: torch.Tensor | None = None,
         replay_beta: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run target verify and optionally capture a complete raw-g replay tape."""
-        raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
+        """Run target verify, decay projection included, with optional capture."""
         return _kda_fused_verify_gfx1250_impl(
             mixed_qkv=mixed_qkv,
             conv_weights=conv_weights,
             conv_pool=conv_states,
             conv_scratch=conv_scratch,
-            raw_g=raw_g,
+            f_a_out=f_a_out,
+            f_b_weight=f_b_weight,
             beta_logits=beta_logits,
             A_log=A_log,
             dt_bias=dt_bias,
@@ -478,7 +474,6 @@ if current_platform().is_amd:
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
         priority=Priority.SPECIALIZED,
         traits={
-            "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "paged_state": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
@@ -501,7 +496,6 @@ if current_platform().is_amd:
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
         priority=Priority.SPECIALIZED,
         traits={
-            "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "batched_layers": frozenset({True}),
             "flat_state": frozenset({True}),

@@ -228,6 +228,47 @@ def test_reuse_persisted_cache_ignores_measurement_policy(
     assert fi.AutoTuner.search_cache is original_search
 
 
+@pytest.mark.parametrize("require_profiling_policy", [False, True])
+def test_reuse_cache_preserves_explicit_profiling_policy(
+    monkeypatch, require_profiling_policy
+):
+    fi = pytest.importorskip("flashinfer.autotuner.autotuner")
+    monkeypatch.setattr(tuning, "_autotuner", fi)
+    monkeypatch.delenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", raising=False)
+
+    class Runner(fi.TunableRunner):
+        def get_valid_tactics(self, inputs, profile):
+            return [7]
+
+        def forward(self, inputs, tactic=-1, **kwargs):
+            raise AssertionError("Cache lookup must not launch a kernel")
+
+    tuner = fi.AutoTuner()
+    runner = Runner()
+    config = fi.TuningConfig(use_cuda_graph=True, use_cold_l2_cache=True)
+    inputs = [torch.empty(1, 128)]
+    shapes = ((1, 128),)
+    key = tuner._get_cache_key("probe", runner, shapes, config, ())
+    # An entry without measurement provenance is treated as hot-L2. A strict
+    # cold-L2 lookup must miss even inside the serving-cache reuse adapter.
+    tuner.profiling_cache[key] = (7, None)
+    tuner.is_tuning_mode = True
+    original_search = fi.AutoTuner.search_cache
+    with tuning._reuse_autotune_cache():
+        hit, _, tactic, _ = tuner.search_cache(
+            "probe",
+            [runner],
+            shapes,
+            config,
+            inputs=inputs,
+            require_profiling_policy=require_profiling_policy,
+        )
+        assert hit is not require_profiling_policy
+        assert tactic == (-1 if require_profiling_policy else 7)
+        assert tuner.is_tuning_mode
+    assert fi.AutoTuner.search_cache is original_search
+
+
 @pytest.mark.parametrize(
     "tokens,local,queries",
     [(512, 112, [512, 64]), (513, 112, [513, 65]), (512, 896, [512])],

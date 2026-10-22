@@ -1274,15 +1274,21 @@ class TestReplayStateTapeGPUTest:
             )
             rows[1::3, 0] = 0
             tables[f"state_{g}"] = rows
-        backend.refresh_decode_metadata(
-            bs,
-            real_bs,
-            torch.arange(bs, dtype=torch.int32, device="cuda"),
-            seq_lens,
-            forward_mode=ForwardMode.DECODE,
-            for_graph_replay=True,
-            block_tables=tables,
-        )
+        slots = torch.arange(bs, dtype=torch.int32, device="cuda")
+        previous = torch.cuda.get_sync_debug_mode()
+        try:
+            torch.cuda.set_sync_debug_mode("error")
+            backend.refresh_decode_metadata(
+                bs,
+                real_bs,
+                slots,
+                seq_lens,
+                forward_mode=ForwardMode.DECODE,
+                for_graph_replay=True,
+                block_tables=tables,
+            )
+        finally:
+            torch.cuda.set_sync_debug_mode(previous)
         torch.cuda.synchronize()
         md = backend.forward_metadata
         for gid, rows in tables.items():
@@ -1324,10 +1330,28 @@ class TestReplayStateTapeGPUTest:
         torch.manual_seed(1)
         backend = self._backend(5, bs=8)
         self._refresh(backend, 5, bs=8, real_bs=6)
+        previous_buffers = [
+            values[7]
+            for buffers in (backend.state_in_by_group, backend.state_out_by_group)
+            for values in buffers.values()
+        ]
         backend.init_cuda_graph_state(max_bs=8)
-        assert not (backend._replay_state_tapes)
+        for buffer in previous_buffers:
+            buffer.fill_(-77)
         # The refresh must write the rebuilt buffers a recaptured graph reads.
         self._refresh(backend, 5, bs=8, real_bs=6)
+        assert all(bool((buffer == -77).all()) for buffer in previous_buffers)
+
+    def test_first_refresh_at_every_supported_size_is_already_prepared(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            pytest.skip("GPU required")
+        backend = self._backend(5, bs=8)
+        # A graph ladder may warm only 1/2/4. The first eager or replay refresh
+        # at any other supported size must not upload a tape description.
+        for bs in (1, 2, 3, 4, 5, 6, 7, 8):
+            self._refresh(backend, 5, bs=bs, real_bs=max(0, bs - 1))
 
 
 if __name__ == "__main__":

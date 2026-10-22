@@ -33,36 +33,26 @@ must reach `PrefillSize()` so the first decode consumes its reserved input
 width. A truncated remote window would leave that reserve at zero and delay
 later cache growth even though the device has committed the full prompt.
 
-**L3 is fetched before admission, never by it.** An admission loads only
-Host entries that exist (`PrefixProbe::host`), so nothing it loads can miss and
-the Host-to-Device leg keeps its layer-wise overlap with the first chunk. The
-objects the L3 shadow knows beyond the Host hit (`PrefixProbe::storage`, the
-same matchers run over "Host-cached or registered") are handled by
-`CacheCoordinator::PlanPrefetch` first: it decides before it touches the Host
-pool — sizing the first `SchedulerConfig::l3_prefetch_min_pages` pages (the
-explicit threshold; required with L3) against the free slots, the evictable
-entries and the empty LCM parents, so a prefetch that cannot reach the
-threshold evicts nothing and the request admits normally and computes those
-pages — and only then acquires a Host block for every storage-tier row, prefix
-page by prefix page, stopping at the first page the Host pool cannot take
-whole (the pages before it stay). With a plan, `schedulePrefillFirstChunk` emits one
-`PrefetchOperation` (`Cache.PrefetchOp`: rows in prefix-page order with their
-`page_indices`, one op per request) and the request moves to
-**`fsm::Prefetching`**: it pins only the Host blocks being filled — no Device
-pages, no request-pool row — is skipped by admission without holding the head
-of line (later `Submitted` prompts are admitted past it), is never a victim,
-and can be aborted (the op's own pins keep the blocks until its ACK). The
-runtime fetches in order, stops at the first failure or its timeout, and
-acknowledges once with `cache::PrefetchDone{op_id, landed_pages}`
-(replica-converged); the scheduler publishes the first `landed_pages` pages as
-Host entries, frees the rest, forgets the unlanded keys from the storage
-shadow, and returns the request to `Submitted` at its original queue position,
-holding the published entries pinned until its admission acquires them. A
-`landed_pages` outside `[0, num_pages]` is a runtime bug, not a scheduler
-invariant: the ACK is logged and ignored and the op stays in flight. The
-next admission is an ordinary Host hit. The cost: an L3 hit waits one fetch
-before it is admitted, holding no Device page meanwhile. The D role probes the
-Device alone (`ProbeDecodeDevicePrefix`) and never prefetches.
+**L3 is fetched before admission, never by it.** A request waiting for QUERY
+or GET is `Prefetching` and absent from forward candidates. `Submitted` keeps
+its ordinary admission meaning, including mixed-mode token reservations and
+retraction demand. The wait carries a `Bootstrapping` or `Submitted`
+continuation so PD bootstrap can overlap it. A completed read's bounded Ready
+hold moves with that continuation until admission acquires its Host sources.
+`StorageTransferManager` owns query/GET/PUT tickets, Host references and the
+bounded backup queue. The request holds no Device pages or request-pool slot
+while preparing. Runtime workers report object and retirement facts; the C++
+group matcher chooses the
+reusable boundary and ordinary admission acquires the resulting Host entries.
+A soft deadline permits recomputation without retiring native I/O. Failed GET
+rows and detached GET jobs cannot publish data. An attached, retired GET may
+publish its successful rows even when other rows failed; ordinary group
+matching determines the reusable boundary. Buffers still owned by native I/O
+remain held.
+State groups use the same checkpoint matcher and fixed two-slot layout as
+local hits. Retraction remains an exact image restore, never an L3 re-prefill.
+The D role probes Device history and receives missing data from its peer.
+See [asynchronous L3](async-l3-cache.md) for lifetime and admission limits.
 
 **What the probe may claim.** Before the first chunk, `matchPrefixAtAdmission`
 probes the prefix cache for the prompt's leading pages and for a published
@@ -229,8 +219,7 @@ admission states what the pair does through the group's `StateStep`
 stops writing it — the same `PublicationPoint` that publishes the KV tail
 (§1): a fused prompt end (the first decode's admission publishes slot 1 under
 the prompt's key before rotating it into slot 0), a chunk end that falls on a
-junction (§1) or the reusable boundary described below, and a finish or
-retraction on every role (`kFinal`: the P's
+junction (§1), and a finish or retraction on every role (`kFinal`: the P's
 transferred prompt, the D's and the fused engine's last decoded state). An
 ordinary chunk end or decode step publishes nothing for a State group
 (`CompletedPages::publish_state` is false). The key is the key of the exact
@@ -240,17 +229,6 @@ request's progress across every group kind (`cache-concepts.md`). A published
 state block is never written again: rotation moves it to slot 0, where it is
 read only, and the next step releases the request's reference while the
 cache keeps the block.
-
-With prefix caching enabled, a prompt longer than `max_scheduled_tokens`
-leaves one extra checkpoint at the last prefix-page boundary before its
-replay tail. The tail is at least one token, `prefix_replay_tokens`, and the
-largest replayable group's window. Cutting a chunk there makes a second
-request with a changed ending reuse the common prefix immediately: the
-prompt-end state cannot serve a hit that must replay its final token. This
-uses the same rotation and publication as a junction, costs at most one
-additional forward, and retains an evictable cache block per State group.
-Prompts within one configured chunk and models without State groups do not
-add this checkpoint; the D role still lands remote prefill in one transfer.
 
 **A finish settles when its last forward has landed.** `forward::Finish`
 (and the P role's `pd::SucceededEvent`) moves a page-holding request to
@@ -290,10 +268,9 @@ claimed cache block (a Host checkpoint is loaded into a fresh slot 0 like any
 Host hit). When the KV groups reach further than the state (`kv_tokens >
 num_common_tokens`), the difference is the junction: the first chunk ends
 there and publishes the checkpoint the cache lacked, so the next prompt that
-shares the prefix resumes at the KV boundary in every group. Junctions can
-be unaligned; the additional checkpoint before the replay tail is page
-aligned. No checkpoint is produced inside a forward: a chunk's state output
-is its own natural checkpoint.
+shares the prefix resumes at the KV boundary in every group. No alignment is
+ever imposed on a chunk for the state's sake, and no checkpoint is produced
+inside a forward: a chunk's state output is its own natural checkpoint.
 `CacheProgress::junction_tokens` is the only progress a State group adds to
 the request; the backend contract for the two slots is in
 [Cache concepts](cache-concepts.md#recurrent-state-two-slots-natural-checkpoints).
@@ -448,8 +425,10 @@ blocks are still in its table. A tail is at most `P − 1` tokens, so that is
 copy); a sliding group caps it at its lookback. The charge is what lets a
 pool sized for a request fund its copy-in; when a pool cannot (several
 retraction-exempt requests reaching their first decode together, each
-needing a copy), the owner publishes nothing at that point instead of
-waiting (§1).
+needing a copy, or a sharded group whose copy's bucket is full while other
+buckets have holes — the charge is bucket-blind), the owner publishes
+nothing at that point instead of waiting (§1), and a hitter's admission
+waits.
 
 Speculative decode admission grows from the committed token frontier plus the verify
 spans still in flight, the span being scheduled and the next span, which the
@@ -1053,9 +1032,10 @@ with no request suspended both must read empty and zero.
 (`1` = the null page alone = no image ever fits, so a capacity block aborts
 the newest resident instead of imaging one; §2) and `max_retracted_requests`
 (`0` with no pool, `> 0` with one; the runtime's slot-state arena has that
-many rows plus the null row) are validated together, the P role refuses a
-pool, and L3 storage is refused with a page-cyclic sharded group
-(`cache-concepts.md`). `debug_force_retraction_interval` (§2) is the only
+many rows plus the null row) are validated together. The P role refuses a
+snapshot pool. L3 addresses page-cyclic sharded groups through replica-stable
+object keys ([cache concepts](cache-concepts.md)).
+`debug_force_retraction_interval` (§2) is the only
 knob that chooses victims outside capacity pressure, and it is refused
 without a pool. Every diagnostic names the binding field and the server arg
 behind it (`num_snapshot_pages` from the pool the runtime resolved --
@@ -1068,26 +1048,14 @@ at them (the Host KVStore-style size-over-ratio rule, the tail-per-request
 default beside L2 that this model's `SingleRequestGroupPages` and
 `LcmBlocksNeededFor` count) is `python/tokenspeed/runtime/cache/l2/sizing.py`.
 
-**Release note — the runtime lands with the pin.** This scheduler is not a
-drop-in for the runtime on `main`: `SchedulerConfig.num_snapshot_pages` is
-required (there is no default; `make_config` in
-`python/tokenspeed/runtime/engine/scheduler_utils.py` must pass it, `1` on
-engines that never retract), `ForwardEvent.Retract` is gone with nothing in
-its place (`make_retract_event` in `scheduler_utils.py` and the forward-skip
-in `engine/l3_cache_hooks.py` go), `Cache.LoadBackDoneEvent` loses its
-`success` argument and `Cache.LoadBackOp` its `prefetch_from_storage` rows,
-`waiting_prefix_hashes` is gone (the prefetch op is the probe), L3 engines
-pass `SchedulerConfig.l3_prefetch_min_pages`, and the plan carries three new
-cache op kinds (`Cache.PrefetchOp`, `Cache.SnapshotOp`, `Cache.RestoreOp`)
-with three new ACKs (`Cache.PrefetchDoneEvent`, `Cache.SnapshotDoneEvent`,
-`Cache.RestoreDoneEvent`) that `DeviceHandle` and the cache hooks must
-execute and count, and `ExecutionPlan.aborts` lists the requests a capacity
-retraction aborted (§2) for the runtime to fail toward their clients.
-Following AGENTS.md's release
-sequence, the `tokenspeed-scheduler` version bump is published first and the
-runtime PR that pins it (`feat/retraction-snapshot-consume`: server args,
-`make_config`, the event rename, the op dispatch and the slot-state exporters)
-lands in the same change as the pin, never a release apart.
+**Runtime contract.** `num_snapshot_pages` is explicit (`1` without a pool).
+The runtime executes and counts snapshot and restore ops alongside L2 copies.
+Query, GET, PUT and cancellation are Host-only variants of `CacheOperation`.
+Their `StorageDone`, `StorageTick` and `StorageDetach` events enter the same
+scheduler head feedback point. `Prefetching` is a request waiting state; it
+does not add a second admission or forward path. `ExecutionPlan.aborts` reports capacity
+aborts for the runtime to finish toward clients. The runtime and scheduler
+must use matching contracts; releases follow the sequence in AGENTS.md.
 
 ## 5. Invariants a change must preserve
 
@@ -1158,8 +1126,8 @@ lands in the same change as the pin, never a release apart.
   it when it builds a batch, so under page-cyclic sharding the rank that owns
   one end owns the other (`cache-concepts.md`).
 - An admission loads Host entries only; L3 objects reach Host through a
-  `PrefetchOperation` issued before admission (1), and a `Prefetching`
-  request holds no Device page, no request-pool row and no head of line.
+  storage transaction issued before admission (1); its waiting request
+  holds no Device page, no request-pool row and no head of line.
 - Only computed tokens are published as a prefix, and exactly those.
   `Request::NumComputedTokens()` is the one frontier for prefix hashing and
   retention on admission and retraction, and the extent an image covers: the

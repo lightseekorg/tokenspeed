@@ -137,6 +137,8 @@ def _handler(device) -> RequestHandler:
     handler.send_func = mock.Mock()
     handler.server_args = mock.Mock(weight_version="v1", kvstore_storage_backend=None)
     handler._device = device
+    handler._l3 = mock.Mock()
+    handler._l3.delete_namespace.return_value = True
     handler._replica_tp_size = 1
     handler._replica_tp_cpu_group = None
     handler.attn_cp_size = 1
@@ -158,7 +160,6 @@ def _handler(device) -> RequestHandler:
 def _mock_device(ok: bool = True, message: str = "loaded"):
     device = mock.Mock()
     device.update_weights = mock.Mock(return_value=(ok, message))
-    device.delete_l3_namespace.return_value = True
     return device
 
 
@@ -225,7 +226,7 @@ class TestSchedulerDispatch:
         )
 
         assert (handler.server_args.weight_version) == ("v2")
-        handler._device.set_l3_weight_version.assert_called_once_with("v2")
+        handler._l3.set_weight_version.assert_called_once_with("v2")
 
     def test_l3_flush_without_weight_version_is_rejected_before_the_load(self):
         handler = _handler(_mock_device())
@@ -505,8 +506,15 @@ class TestPostLoadTransforms:
                 )
                 weight, values = layer.weight, layer.weight.detach().clone()
                 attributes = set(vars(layer)), set(layer._parameters)
+                # The unquantized method's hook reads its own planning state,
+                # so it runs on a real method; module hooks run on the layer.
+                owner = (
+                    UnquantizedLinearMethod()
+                    if hook is UnquantizedLinearMethod.process_weights_after_loading
+                    else layer
+                )
 
-                hook(layer, layer)
+                hook(owner, layer)
 
                 assert (layer.weight) is (weight)
                 assert torch.equal(layer.weight.detach(), values)

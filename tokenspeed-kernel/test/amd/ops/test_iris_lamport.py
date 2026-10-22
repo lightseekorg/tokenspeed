@@ -133,6 +133,8 @@ def _check_lamport_state(rank, device):
         atol=0,
         rtol=0,
     )
+    # Peers may push into this mailbox as soon as they pass their own check.
+    dist.barrier()
     expected_epochs = torch.zeros_like(epochs)
     for rows in range(1, 9):
         widths_cases = ((3584, 7168), (7168, 3584))

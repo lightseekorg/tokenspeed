@@ -386,6 +386,7 @@ def _plan_on(platform, **overrides) -> dict:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     kwargs.update(overrides)
     registry = KernelRegistry.get()

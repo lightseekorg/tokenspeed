@@ -503,15 +503,6 @@ class ServerArgs:
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
-    # The L3 prefetch that fills a waiting request's Host pages before its
-    # admission: the shortest L3 prefix worth one (prefix pages), the lane's
-    # deadline (base + per_page * pages seconds) and its batch. Explicit with
-    # an L3 store, unset without one (see validate_l3_prefetch_options).
-    kvstore_prefetch_min_pages: int | None = None
-    kvstore_prefetch_timeout_base_s: float | None = None
-    kvstore_prefetch_timeout_per_page_s: float | None = None
-    kvstore_prefetch_batch_pages: int | None = None
-
     # Retraction snapshot pool (pinned Host, per rank) and its slot-state
     # arena rows: a retracted request is suspended with its image and
     # resumed by restore; a victim whose image does not fit is aborted
@@ -572,6 +563,10 @@ class ServerArgs:
     # forward's rows over the attention TP group (1 = off; equals
     # kv_parallel_size when on).
     query_context_parallel_size: int = 1
+    deepseek_v41_attention_query_swa_min_tokens: int = 4096
+    deepseek_v41_attention_query_min_tokens: int = 1024
+    deepseek_v41_attention_query_parallel_size: int = 1
+    deepseek_v41_indexer_query_parallel_size: int = 1
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
@@ -683,7 +678,7 @@ class ServerArgs:
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
     disable_kda_prefill_graph: bool = False
-    # Breakable prefill graph bucket cap: None = auto min(2048, chunk); 0 disables.
+    # Breakable prefill graph bucket cap: None = auto min(8192, chunk); 0 disables.
     prefill_graph_max_tokens: int | None = None
     # Explicit prefill bucket list; unset = the relative-stride ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
@@ -1145,6 +1140,24 @@ class ServerArgs:
         )
 
         # Impl constraints:
+        if self.deepseek_v41_attention_query_swa_min_tokens < 1:
+            raise ValueError(
+                "--deepseek-v41-attention-query-swa-min-tokens must be positive"
+            )
+        if self.deepseek_v41_attention_query_min_tokens < 1:
+            raise ValueError(
+                "--deepseek-v41-attention-query-min-tokens must be positive"
+            )
+        if self.deepseek_v41_attention_query_parallel_size not in (1, attn_tp_size):
+            raise ValueError(
+                "--deepseek-v41-attention-query-parallel-size must be 1 or the "
+                f"attention TP size {attn_tp_size}"
+            )
+        if self.deepseek_v41_indexer_query_parallel_size not in (1, attn_tp_size):
+            raise ValueError(
+                "--deepseek-v41-indexer-query-parallel-size must be 1 or the "
+                f"attention TP size {attn_tp_size}"
+            )
         validate_context_parallel_roles(
             kvp_size=self.mapping.attn.kvp_size,
             dcp_size=self.decode_context_parallel_size,
@@ -1297,7 +1310,6 @@ class ServerArgs:
         self.resolve_kv_offload()
         # Handle KVStore settings.
         self._handle_kvstore()
-        self.validate_l3_prefetch_options()
         self.validate_cache_options()
         self.resolve_retraction_snapshot_options()
 
@@ -1768,25 +1780,8 @@ class ServerArgs:
         self.disable_autotune = True
         self.disable_tf32 = True
         self.disable_pdl = True
-        # MoE: the batch-invariant grouped leaves. An explicitly chosen
-        # backend cannot honour the contract, so it is refused rather than
-        # kept (a draft left unset inherits the target's).
-        if self.moe_backend == "auto":
-            self.moe_backend = "aok"
-        elif self.moe_backend != "aok":
-            raise ValueError(
-                f"--numerics {self.numerics} needs the batch-invariant MoE "
-                f"solution 'aok'; --moe-backend {self.moe_backend} makes no such "
-                "claim"
-            )
-        if self.draft_moe_backend == "auto":
-            self.draft_moe_backend = "aok"
-        elif self.draft_moe_backend not in (None, "aok"):
-            raise ValueError(
-                f"--numerics {self.numerics} needs the batch-invariant MoE "
-                f"solution 'aok'; --draft-moe-backend {self.draft_moe_backend} "
-                "makes no such claim"
-            )
+        # MoE keeps auto or the user's provider restriction. The expert
+        # plan checks the batch_invariant feature against actual layer geometry.
         # Sampling: greedy rows must break exact logit ties canonically, and
         # sampled rows must draw from a stream the co-batch cannot move.
         if self.sampling_backend not in RL_BITWISE_SAMPLING_BACKENDS:
@@ -1961,65 +1956,15 @@ class ServerArgs:
                 "unset --disable-kvstore"
             )
 
-    def validate_l3_prefetch_options(self):
-        """The L3 prefetch knobs: all four with an L3 store, none without.
-
-        An L3 hit is fetched into Host pages before the request is admitted,
-        on the Host cache executor's prefetch lane; these size that fetch.
-        None of them has a silent default: the threshold trades a short hit's
-        recompute against a round of admission latency, the deadline bounds
-        how long a request may wait on the store, and the batch is the
-        store's request granularity.
-        """
-        knobs = {
-            "--kvstore-prefetch-min-pages": self.kvstore_prefetch_min_pages,
-            "--kvstore-prefetch-timeout-base-s": self.kvstore_prefetch_timeout_base_s,
-            "--kvstore-prefetch-timeout-per-page-s": (
-                self.kvstore_prefetch_timeout_per_page_s
-            ),
-            "--kvstore-prefetch-batch-pages": self.kvstore_prefetch_batch_pages,
-        }
-        given = [name for name, value in knobs.items() if value is not None]
-        if self.kvstore_storage_backend is None:
-            if given:
-                raise ValueError(
-                    f"{', '.join(given)} belong to the L3 prefetch and need "
-                    "--kvstore-storage-backend"
-                )
-            return
-        missing = [name for name, value in knobs.items() if value is None]
-        if missing:
-            raise ValueError(
-                f"--kvstore-storage-backend needs the L3 prefetch knobs: {', '.join(missing)}"
-            )
-        if self.kvstore_prefetch_min_pages < 1:
-            raise ValueError("--kvstore-prefetch-min-pages must be at least 1 page")
-        if self.kvstore_prefetch_timeout_base_s <= 0:
-            raise ValueError("--kvstore-prefetch-timeout-base-s must be positive")
-        if self.kvstore_prefetch_timeout_per_page_s < 0:
-            raise ValueError("--kvstore-prefetch-timeout-per-page-s must be >= 0")
-        if self.kvstore_prefetch_batch_pages < 1:
-            raise ValueError("--kvstore-prefetch-batch-pages must be at least 1 page")
-
     def validate_cache_options(self):
-        # Runs after _handle_kvstore() has applied the KVStore default, so the
-        # check sees the effective setting rather than the pre-resolution flag.
-        # Both Host tiers -- the L2 KVStore and the retraction snapshot pool --
-        # are legal under KV-page sharding (--kv-parallel-size):
-        # the scheduler allocates every Host block in its Device block's
-        # residue class and the executor translates ownership on both ends of
-        # every row (cache/transfer/ownership.py), so each rank copies the
-        # blocks it owns. L3 is not: its keys name content and position, but
-        # which rank owns a block is decided at allocation, so a rank cannot
-        # answer an existence probe for blocks it did not own when the object
-        # was written (docs/design/cache-concepts.md, the retraction image).
-        if self.kv_parallel_size > 1 and (self.kvstore_storage_backend is not None):
+        if self.kvstore_storage_backend is not None and self.pipeline_parallel_size > 1:
             raise ValueError(
-                "--kvstore-storage-backend (L3) is not supported under "
-                "--kv-parallel-size > 1: a page-cyclic sharded group "
-                "has no owner-stable L3 key. The Host KVStore itself and the "
-                "retraction snapshot pool are supported."
+                "Asynchronous L3 currently requires --pipeline-parallel-size 1"
             )
+        # Host tiers and L3 use the same cyclic owner translation. L3 page
+        # keys name a replica, so a new Host allocation can have another owner.
+        # Device construction validates that sharded payloads are replicated
+        # within the owner subgroup; head-partitioned payloads are rejected.
         # Same-checkpoint DSpark's KVStore support depends on where the draft
         # keeps its context; the engine decides once the draft config resolves
         # (resolve_dspark_prefix_replay_tokens).
@@ -2629,43 +2574,6 @@ class ServerArgs:
             "master_server_address, local_hostname, metadata_server, "
             "global_segment_size, protocol, device_name, tenant_id.",
         )
-        parser.add_argument(
-            "--kvstore-prefetch-min-pages",
-            type=int,
-            default=ServerArgs.kvstore_prefetch_min_pages,
-            help="L3 prefetch threshold, in prefix pages: a waiting request whose "
-            "L3-only prefix is at least this long has it fetched into Host pages "
-            "before admission (the request waits, holding no Device page); a "
-            "shorter one is simply computed. Required with "
-            "--kvstore-storage-backend, refused without it.",
-        )
-        parser.add_argument(
-            "--kvstore-prefetch-timeout-base-s",
-            type=float,
-            default=ServerArgs.kvstore_prefetch_timeout_base_s,
-            help="L3 prefetch deadline, base term in seconds: a prefetch stops "
-            "starting batches base + per-page * pages seconds after it began on "
-            "the prefetch lane and lands the prefix it has. The deadline is "
-            "checked between batches only -- a batch_get_into already issued "
-            "runs to completion (the store API has no timeout), so one batch may "
-            "overrun it and a hung store holds the lane and every later "
-            "prefetch. Positive; required with --kvstore-storage-backend.",
-        )
-        parser.add_argument(
-            "--kvstore-prefetch-timeout-per-page-s",
-            type=float,
-            default=ServerArgs.kvstore_prefetch_timeout_per_page_s,
-            help="L3 prefetch deadline, per-page term in seconds (0 for a fixed "
-            "deadline). Required with --kvstore-storage-backend.",
-        )
-        parser.add_argument(
-            "--kvstore-prefetch-batch-pages",
-            type=int,
-            default=ServerArgs.kvstore_prefetch_batch_pages,
-            help="Prefix pages per L3 get of a prefetch; the fetch stops at the "
-            "first batch with a missing page. Required with "
-            "--kvstore-storage-backend.",
-        )
         # Retraction snapshot pool
         parser.add_argument(
             "--retraction-snapshot-host-gb",
@@ -3013,8 +2921,8 @@ class ServerArgs:
             default=ServerArgs.moe_backend,
             help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
             "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe, "
-            "gluon_petit, aok (the batch-invariant leaves; --numerics rl-bitwise "
-            "folds auto to it)",
+            "gluon_petit, or a registered plugin solution. Under --numerics "
+            "rl-bitwise the selected kernel must declare batch invariance.",
         )
         parser.add_argument(
             "--moe-mxfp4-fp8-activation",
@@ -3551,7 +3459,7 @@ class ServerArgs:
             type=int,
             default=ServerArgs.prefill_graph_max_tokens,
             help="Largest token bucket captured by the breakable prefill CUDA "
-            "graph. Default (unset) = min(2048, chunked-prefill size); "
+            "graph. Default (unset) = min(8192, chunked-prefill size); "
             "0 disables.",
         )
         prefill_token_sizes = parser.add_mutually_exclusive_group()
@@ -3724,6 +3632,42 @@ class ServerArgs:
             "o_proj / down_proj weights.",
         )
         parser.add_argument(
+            "--deepseek-v41-attention-query-swa-min-tokens",
+            type=int,
+            default=ServerArgs.deepseek_v41_attention_query_swa_min_tokens,
+            help="Additional minimum query rows per request for SWA-only V4.1 "
+            "attention QCP head exchange (default: 4096). The larger of this and "
+            "--deepseek-v41-attention-query-min-tokens applies. Tune for the "
+            "deployment; this is not a hardware auto-tuner.",
+        )
+        parser.add_argument(
+            "--deepseek-v41-attention-query-min-tokens",
+            type=int,
+            default=ServerArgs.deepseek_v41_attention_query_min_tokens,
+            help="Minimum query rows per request in the current prefill window "
+            "for V4.1 attention QCP head exchange (default: 1024). Also requires "
+            "at least one query per rank. This threshold does not enable "
+            "exchange or auto-tune for the GPU/interconnect.",
+        )
+        parser.add_argument(
+            "--deepseek-v41-attention-query-parallel-size",
+            type=int,
+            default=ServerArgs.deepseek_v41_attention_query_parallel_size,
+            help="Enable DeepSeek V4.1 prefill attention QCP via query/head exchange "
+            "over attention TP. Set 1 to disable (default), or attention TP "
+            "size to enable for eligible long requests with 64 total heads. "
+            "KV storage and model projections remain unchanged.",
+        )
+        parser.add_argument(
+            "--deepseek-v41-indexer-query-parallel-size",
+            type=int,
+            default=ServerArgs.deepseek_v41_indexer_query_parallel_size,
+            help="Enable DeepSeek V4.1 long-prefill encoder indexer QCP for query "
+            "projections and scoring over attention TP. Set 1 to disable "
+            "(default), or the attention TP size to enable. KV remains "
+            "replicated; this does not enable the generic QCP execution path.",
+        )
+        parser.add_argument(
             "--query-context-parallel-size",
             type=int,
             default=ServerArgs.query_context_parallel_size,
@@ -3885,7 +3829,7 @@ class ServerArgs:
             "in fp32 slot order across the EP group itself, zero-expert "
             "residual included, as the trainer's grouped MLP does, and the "
             "host reduces nothing; needs MoE TP 1 and a kernel declaring the "
-            "combine_order trait with slot (the batch-invariant 'aok' leaf), "
+            "combine_order trait with slot (a registered batch-invariant leaf), "
             "and vetoes all-reduce+norm fusion. Folded to slot by --numerics "
             "rl-bitwise.",
         )
@@ -3899,7 +3843,7 @@ class ServerArgs:
             "them (every core). 'sorted': ascending slot order, so the "
             "reduction is batch-invariant whenever the selected set is; "
             "served only by cores declaring the slot_order trait (the "
-            "batch-invariant 'aok' leaves). Folded to sorted by --numerics "
+            "registered batch-invariant leaves). Folded to sorted by --numerics "
             "rl-bitwise.",
         )
         parser.add_argument(

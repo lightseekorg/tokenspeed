@@ -49,6 +49,8 @@ from tokenspeed_kernel.numerics.torch.moe import (
 from tokenspeed_kernel.numerics.torch.quantization import dequantize_nvfp4_blocks
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import SelectedKernel
 
 NUM_EXPERTS = 16
 TOP_K = 10  # scaled-down test shape (real Kimi-K3 num_experts_per_token=16)
@@ -118,6 +120,8 @@ class _MoEWeights(torch.nn.Module):
     """Minimal module carrying what the preprocessor and apply consume."""
 
     def __init__(self, raw: dict[str, torch.Tensor]) -> None:
+        from flashinfer.fused_moe import RoutingMethodType
+
         super().__init__()
         for name in (
             "w13_weight",
@@ -132,6 +136,8 @@ class _MoEWeights(torch.nn.Module):
             setattr(self, name, torch.nn.Parameter(raw[name], requires_grad=False))
         self.activation_situ_beta = SITU_BETA
         self.activation_situ_linear_beta = SITU_LINEAR_BETA
+        self._routing_method_type = RoutingMethodType.RenormalizeNaive
+        self._routing_logits_dtype = torch.bfloat16
         self._spec = SimpleNamespace(
             num_experts=NUM_EXPERTS,
             num_local_experts=NUM_EXPERTS,
@@ -310,9 +316,14 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
         is_sf_swizzled_layout=False,
         enable_pdl=False,
     )
+    apply_name = "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"
     quantized_result = kernel_moe_apply(
         {
-            "apply_kernel_name": "flashinfer_trtllm_nvfp4_situ_routed_moe_apply",
+            "apply_kernel_name": apply_name,
+            "apply_kernel": SelectedKernel(
+                apply_name, KernelRegistry.get().get_impl(apply_name)
+            ),
+            "features": frozenset(),
             "a2a_backend": "none",
         },
         prequantized,
@@ -427,6 +438,7 @@ def test_moe_plan_selects_nvfp4_situ_routed_kernel(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"
     assert plan["support_routing"] is False
@@ -494,8 +506,13 @@ def test_nvfp4_trtllm_registry_declares_ispp_alignment(kernel_name: str) -> None
         ("flashinfer_trtllm_nvfp4_situ_routed_moe_apply", (9, 0), False),
         ("flashinfer_trtllm_nvfp4_situ_routed_moe_apply", (10, 7), True),
         ("flashinfer_trtllm_nvfp4_situ_routed_moe_apply", (10, 8), False),
-        # Keep sibling NVFP4 paths capped until they are validated on SM107.
-        ("flashinfer_trtllm_nvfp4_routed_moe_apply", (10, 7), False),
+        ("flashinfer_trtllm_nvfp4_moe_apply", (10, 7), True),
+        ("flashinfer_trtllm_nvfp4_routed_moe_apply", (10, 7), True),
+        ("flashinfer_trtllm_nvfp4_moe_apply", (10, 8), False),
+        ("flashinfer_trtllm_nvfp4_routed_moe_apply", (10, 8), False),
+        # Keep ReLU2 paths capped until they are validated on SM107.
+        ("flashinfer_trtllm_nvfp4_relu2_moe_apply", (10, 7), False),
+        ("flashinfer_trtllm_nvfp4_relu2_routed_moe_apply", (10, 7), False),
     ],
 )
 def test_nvfp4_trtllm_capability_range(
@@ -516,6 +533,67 @@ def test_nvfp4_trtllm_capability_range(
         arch_version=ArchVersion(*arch_version),
     )
     assert spec.capability.satisfied_by(platform) is expected
+
+
+@requires_flashinfer_situ
+@pytest.mark.parametrize("activation", ["silu", "swiglu"])
+@pytest.mark.parametrize("routing_mode", ["kernel_routing", "precomputed_topk"])
+@pytest.mark.parametrize("num_tokens", [1, 32, 64, 256])
+def test_nvfp4_silu_plan_executes_and_replays(
+    activation: str, routing_mode: str, num_tokens: int
+) -> None:
+    plan = kernel_moe_plan(
+        "nvfp4",
+        input_dtype=torch.bfloat16,
+        activation=activation,
+        routing_mode=routing_mode,
+        ep_size=1,
+        ispp=ISPP,
+        hidden=HIDDEN,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        internal_activation_dtype="input",
+        fast_math=True,
+        combine_order="rank",
+        features=frozenset(),
+        solution="flashinfer_trtllm",
+    )
+    generator = torch.Generator().manual_seed(42)
+    raw = _make_nvfp4_moe_weights(generator)
+    w = _MoEWeights({key: value.clone() for key, value in raw.items()}).cuda()
+    x = (torch.randn(num_tokens, HIDDEN, generator=generator) * 0.2).bfloat16().cuda()
+    logits = torch.randn(num_tokens, NUM_EXPERTS, generator=generator).bfloat16().cuda()
+    weights, ids = logits.float().softmax(dim=-1).topk(TOP_K, dim=-1)
+    weights = (weights / weights.sum(dim=-1, keepdim=True)).bfloat16()
+    ids = ids.int()
+    plan["weight_preprocessor"](plan, w)
+
+    def apply():
+        return kernel_moe_apply(
+            plan,
+            x,
+            w,
+            router_logits=logits,
+            topk_weights=weights if routing_mode == "precomputed_topk" else None,
+            topk_ids=ids if routing_mode == "precomputed_topk" else None,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            actual = apply()
+    torch.cuda.current_stream().wait_stream(stream)
+    expected = _reference_moe(x, raw, ids, weights, situ=False)
+    error = _rel_l2(actual, expected)
+    assert error < 0.04, f"{error=:.4f}"
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = apply()
+    for _ in range(3):
+        graph.replay()
+    torch.testing.assert_close(replayed, actual, atol=0, rtol=0)
 
 
 @requires_flashinfer_situ

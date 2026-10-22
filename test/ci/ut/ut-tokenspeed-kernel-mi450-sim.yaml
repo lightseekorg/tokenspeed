@@ -76,14 +76,17 @@ env:
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_project_value_amd_batches[8]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.mla_project_value/gluon_mla_project_value_gfx1250/batch8-sigmoid-gate@mi450]
     # KDA: native-layout paged prefill, specialized paged decode, fused paged
-    # decode, and all-layer replay with uneven cache groups.
+    # decode, fused verify into replay, and all-layer replay with uneven cache
+    # groups.
     tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_paged_prefill_preserves_native_state_layout
     tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_paged_decode_defaults_to_specialized_kernel_on_amd[2-8-8-False--5.0]
-    tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_fused_paged_decode_matches_reference[1-1]
+    tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_fused_paged_decode_matches_reference[1-1-12]
+    tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_fused_verify_and_replay_match_sequential_reference[1-8]
     tokenspeed-kernel/test/ops/attention/test_kda_replay_commit.py::test_gluon_batched_replay_uneven_groups_match_per_layer_launches
     # DeepSeek V4.1 index top-k: CSA2 scoring, reindexing, missing and
     # out-of-table latest pages, arena page strides, raw gfx1250 logits, and
-    # the row-wise radix top-k: widths past k, threshold ties, CSA2 dispatch.
+    # the Gluon row selector: a width below k, boundary ties past k, and the
+    # lowest-column order of signed-zero ties.
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.dsv41_index_topk/gluon_dsv41_index_topk_gfx1250@mi450]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_full_and_reindex_gluon[65-17-32]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_missing_latest_page[-1-gluon]
@@ -93,10 +96,9 @@ env:
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_preserves_arena_page_stride[True-byte-strided]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_preserves_arena_page_stride[True-unaligned-pages]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_gfx1250_index_logits_match_reference[40-False]
-    tokenspeed-kernel/test/amd/ops/attention/test_dsv41_topk_gfx1250.py::test_topk_matches_torch_on_random_rows[513-512]
-    tokenspeed-kernel/test/amd/ops/attention/test_dsv41_topk_gfx1250.py::test_topk_matches_torch_on_random_rows[6250-2048]
-    tokenspeed-kernel/test/amd/ops/attention/test_dsv41_topk_gfx1250.py::test_topk_takes_threshold_ties_in_column_order
-    tokenspeed-kernel/test/amd/ops/attention/test_dsv41_topk_gfx1250.py::test_csa2_selector_uses_radix_topk_for_full_score_tiles[128-True]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_select.py::test_select_matches_torch[8-100-512-None]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_select.py::test_select_boundary_ties_pick_an_equivalent_subset
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_select.py::test_select_signed_zero_boundary_ties_keep_lowest_columns
     # DeepSeek V4.1 fused selected attention, with and without the global cache.
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_selected.py::test_fused_gluon_is_selected_on_supported_amd
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_selected.py::test_fused_selected_attention_matches_gather_softmax[True-16]
@@ -183,6 +185,8 @@ env:
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_triton_matches_softmax_topk[2-896-16-dtype4-True]
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_triton_matches_softmax_topk[7-16-3-dtype3-False]
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_public_entry_point_is_cuda_graph_capturable
+    # Iris collectives compile for wave32, and only flag polls bypass the cache.
+    tokenspeed-kernel/test/amd/ops/test_iris_codegen.py
     # MXFP4 MoE at four experts: static FP8-activation prefill and small-M
     # decode, routing and weighted top-k with invalid expert ids, the small-M
     # route's stable order across chunks and at the 2048-row limit, and the

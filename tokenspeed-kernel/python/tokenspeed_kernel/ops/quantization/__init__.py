@@ -242,7 +242,8 @@ def quantize_fp8(
         dequantize: Reconstruct the input dtype after UE8M0 group quantization.
         enable_pdl: Request Programmatic Dependent Launch where supported.
             Round trips and block quantization reject this option.
-        override: Optional exact registered kernel override.
+        override: Optional exact registered kernel override. Native-layout
+            quantizers may return strided scales; see their documented contract.
         solution: Optional restriction to a registered backend family.
         required_features: Optional arithmetic or API features the selected
             kernel must provide, including when an override is supplied.
@@ -419,7 +420,11 @@ def _select_fp8_dynamic(
     override: str | None,
     required_features: frozenset[str] | None = None,
 ) -> SelectedKernel:
-    traits = {"granularity": granularity_trait, "scale_encoding": scale_encoding}
+    traits = {
+        "granularity": granularity_trait,
+        "scale_encoding": scale_encoding,
+        "scale_layout": "token_major",
+    }
     if rows is not None:
         # Rows of a 2-D x, for kernels with a row bound (``m_max``). Kernels
         # without one ignore it; a kernel with one never gets other ranks.

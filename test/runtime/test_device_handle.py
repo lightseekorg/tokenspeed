@@ -62,12 +62,12 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.cache.transfer.ops import (
     HostTier,
-    PrefetchOp,
     RestoreOp,
     SnapshotOp,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.engine import scheduler_utils as scheduler_utils_module
+from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.execution.device import DeviceHandle, EncoderModelFacts
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import PlannedForward
@@ -80,6 +80,10 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.pd.transfer_hooks import PdTransferHooks
+
+
+def _execute(handle, plan, planned):
+    return handle.execute(plan, planned, cache_ops=cache_ops_from_plan(plan).device)
 
 
 @pytest.mark.parametrize(
@@ -184,7 +188,9 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     monkeypatch.setattr(
         device,
         "current_platform",
-        lambda: SimpleNamespace(is_nvidia=False, restore_stack_limit=nullcontext),
+        lambda: SimpleNamespace(
+            is_nvidia=False, is_cdna4=False, restore_stack_limit=nullcontext
+        ),
     )
     monkeypatch.setattr(
         scheduler_utils,
@@ -399,22 +405,6 @@ class _RestoreBatch:
         self.source_tiers = [[int(HostTier.SNAPSHOT_POOL)] for _ in rows]
 
 
-class _PrefetchBatch:
-    """The wire face of ``Cache.PrefetchOp``: ``rows`` is
-    ``[(op_id, pages)]``, one op per waiting request, one row per page."""
-
-    def __init__(self, rows) -> None:
-        self.op_ids = [op_id for op_id, _ in rows]
-        self.request_ids = [f"r{op_id}" for op_id, _ in rows]
-        self.first_pages = [0 for _ in rows]
-        self.num_pages = [pages for _, pages in rows]
-        self.group_ids = [[0] * pages for _, pages in rows]
-        self.host_pages = [[1 + i for i in range(pages)] for _, pages in rows]
-        self.content_hashes = [[f"h{i}" for i in range(pages)] for _, pages in rows]
-        self.page_offsets = [list(range(pages)) for _, pages in rows]
-        self.page_indices = [list(range(pages)) for _, pages in rows]
-
-
 @pytest.fixture()
 def wire_ops(monkeypatch):
     """Dispatch the plan adapter on the fakes above instead of the bindings."""
@@ -426,7 +416,10 @@ def wire_ops(monkeypatch):
             LoadBackOp=_LoadBackOp,
             SnapshotOp=_SnapshotBatch,
             RestoreOp=_RestoreBatch,
-            PrefetchOp=_PrefetchBatch,
+            StorageQueryOp=scheduler_utils_module.Cache.StorageQueryOp,
+            StorageGetOp=scheduler_utils_module.Cache.StorageGetOp,
+            StoragePutOp=scheduler_utils_module.Cache.StoragePutOp,
+            StorageCancelOp=scheduler_utils_module.Cache.StorageCancelOp,
         ),
     )
 
@@ -679,7 +672,7 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
     named: the copies are told which stream wrote the pages and which one
     the fence lands on; the loads are told which stream zeroed their
     destinations. The executor sees the plan's cache ops once, adapted, and
-    the same list on both submissions."""
+    the same tuple on both submissions."""
     trace: list = []
     store, load = _WriteBackOp("store"), _LoadBackOp("load")
     plan = _plan(pages_to_zero=[3, 4], cache=[store, load])
@@ -692,7 +685,6 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
             submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
                 ("load_backs", ops, prerequisite_stream)
             ),
-            submit_prefetches=lambda ops: None,
             poll_results=lambda: ["done"],
         ),
     )
@@ -700,15 +692,15 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
         ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
-    handle.execute(plan, None)
+    _execute(handle, plan, None)
 
     assert trace == [
         "submit",
-        ("write_backs", [store, load], "execution-stream", "default-stream"),
+        ("write_backs", (store, load), "execution-stream", "default-stream"),
         "submit",
         ("zero", {"kv": (3, 4)}),
         "submit",
-        ("load_backs", [store, load], "default-stream"),
+        ("load_backs", (store, load), "default-stream"),
     ]
     # Polling never touches the FIFO — the round head must not wait on it.
     assert handle.poll_cache_results() == ["done"]
@@ -737,7 +729,6 @@ def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
             submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
                 ("load_backs", ops)
             ),
-            submit_prefetches=lambda ops: None,
         ),
     )
     handle._executor.copy_cache_pages = lambda pairs: trace.append(
@@ -747,22 +738,22 @@ def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
         ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
-    handle.execute(plan, None)
+    _execute(handle, plan, None)
 
     assert trace == [
         "submit",
-        ("write_backs", [store]),
+        ("write_backs", (store,)),
         "submit",
         ("copy", {"kv": [[3, 8], [5, 9]]}),
         "submit",
         ("zero", {"kv": (3,)}),
         "submit",
-        ("load_backs", [store]),
+        ("load_backs", (store,)),
     ]
 
     # A plan with no pairs submits no copy at all.
     trace.clear()
-    handle.execute(_plan(pages_to_zero=[2], pages_to_copy={"kv": []}), None)
+    _execute(handle, _plan(pages_to_zero=[2], pages_to_copy={"kv": []}), None)
     assert trace == ["submit", ("zero", {"kv": (2,)})]
 
 
@@ -777,9 +768,9 @@ def test_a_failed_page_copy_surfaces_at_the_next_round(wire_ops):
         raise IndexError("local block ID 99 outside [0, 8)")
 
     handle._executor.copy_cache_pages = failing_copy
-    handle.execute(_plan(pages_to_copy={"kv": [(1, 99)]}), None)
+    _execute(handle, _plan(pages_to_copy={"kv": [(1, 99)]}), None)
     with pytest.raises(RuntimeError, match="page copy submission failed"):
-        handle.execute(_plan(), None)
+        _execute(handle, _plan(), None)
 
 
 def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
@@ -811,14 +802,13 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
         host_cache_executor=SimpleNamespace(
             submit_write_backs=submit_write_backs,
             submit_load_backs=submit_load_backs,
-            submit_prefetches=lambda ops: None,
         ),
     )
     handle._executor.zero_cache_pages = lambda pages: trace.append(
         ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
-    handle.execute(plan, None)
+    _execute(handle, plan, None)
 
     kinds = [entry[0] if isinstance(entry, tuple) else entry for entry in trace]
     assert kinds == ["submit", "write_backs", "submit", "zero", "submit", "load_backs"]
@@ -866,7 +856,6 @@ def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
             submit_load_backs=lambda ops, *, prerequisite_stream: (
                 trace.append("load_backs")
             ),
-            submit_prefetches=lambda ops: None,
         ),
     )
     handle._executor.zero_cache_pages = lambda pages: trace.append("zero")
@@ -876,7 +865,7 @@ def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
     planned = _planned(num_extends=1)
     planned.forward_op.request_pool_indices = [6]  # the slot just freed
 
-    handle.execute(plan, planned)
+    _execute(handle, plan, planned)
 
     order = [entry for entry in trace if entry != "submit"]
     assert order == [("store", [6]), "zero", "load_backs", ("forward", [6])]
@@ -889,7 +878,7 @@ def test_page_zeroing_without_l2_submits_only_zeroing():
         ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
-    handle.execute(_plan(pages_to_zero=[3, 4]), None)
+    _execute(handle, _plan(pages_to_zero=[3, 4]), None)
 
     assert trace == ["submit", ("zero", {"kv": (3, 4)})]
 
@@ -898,7 +887,7 @@ def test_a_plan_with_no_device_work_submits_nothing():
     trace: list = []
     handle = _handle(trace, host_cache_executor=SimpleNamespace())
 
-    handle.execute(_plan(), None)
+    _execute(handle, _plan(), None)
 
     assert trace == []
 
@@ -916,67 +905,16 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll(wire_ops):
         host_cache_executor=SimpleNamespace(
             submit_write_backs=exploding,
             submit_load_backs=lambda ops, *, prerequisite_stream: None,
-            submit_prefetches=lambda ops: None,
             poll_results=lambda: [],
         ),
     )
 
     # Submission itself never raises (fire-and-forget)...
-    handle.execute(_plan(cache=[_WriteBackOp("op")]), None)
+    _execute(handle, _plan(cache=[_WriteBackOp("op")]), None)
     # ...the failure re-raises at the round head, data-plane cause chained.
     with pytest.raises(RuntimeError, match="cache-plan submission failed") as info:
         handle.poll_cache_results()
     assert isinstance(info.value.__cause__, ValueError)
-
-
-def test_prefetches_start_on_the_control_plane_between_zeroing_and_loads(wire_ops):
-    """An L3 prefetch fills Host pages on the executor's own lane: no stream,
-    no Device page, so it is started right on the control plane -- after the
-    stores and the zeroing were queued, before the loads -- and never rides
-    the FIFO. Each op reaches the executor once, per request."""
-    trace: list = []
-    plan = _plan(
-        pages_to_zero=[2],
-        cache=[
-            _WriteBackOp("store"),
-            _PrefetchBatch([(4, 3), (5, 1)]),
-            _LoadBackOp("load"),
-        ],
-    )
-    handle = _handle(
-        trace,
-        host_cache_executor=SimpleNamespace(
-            submit_write_backs=lambda ops, *, prerequisite_stream, fence_stream: (
-                trace.append("write_backs")
-            ),
-            submit_prefetches=lambda ops: trace.append(
-                (
-                    "prefetches",
-                    [
-                        (op.op_id, len(op.rows))
-                        for op in ops
-                        if isinstance(op, PrefetchOp)
-                    ],
-                )
-            ),
-            submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
-                "load_backs"
-            ),
-        ),
-    )
-    handle._executor.zero_cache_pages = lambda pages: trace.append("zero")
-
-    handle.execute(plan, None)
-
-    assert trace == [
-        "submit",
-        "write_backs",
-        "submit",
-        "zero",
-        ("prefetches", [(4, 3), (5, 1)]),
-        "submit",
-        "load_backs",
-    ]
 
 
 def test_shutdown_cache_joins_submissions_then_closes_on_the_forward_thread():
@@ -1052,8 +990,8 @@ def test_the_remote_decode_and_the_arming_ride_the_fifo():
     chunk = _planned(num_extends=1, label="CHUNK")
     remote_decode = SimpleNamespace(request_ids=["done"])
 
-    handle.execute(_plan(), chunk)
-    handle.execute(_plan(remote_decode=remote_decode), None)
+    _execute(handle, _plan(), chunk)
+    _execute(handle, _plan(remote_decode=remote_decode), None)
 
     # Arming is enqueued before the forward it arms; the send follows the
     # forwards whose KV it reads (the scheduler emits a remote decode only
@@ -1588,6 +1526,43 @@ def test_expert_placement_chunk_applies_then_synchronizes_the_execution_stream()
     )
     with pytest.raises(RuntimeError, match="--enable-eplb"):
         handle.apply_expert_placement((0,), rows, moves)
+
+
+def test_device_rejects_storage_commands_before_submitting_any_work():
+    from test.l3_test_utils import storage_ops, storage_scheduler
+
+    plan = storage_scheduler().next_execution_plan()
+    trace = []
+    handle = _handle(trace)
+    with pytest.raises(TypeError, match="unsupported Device cache op"):
+        handle.execute(plan, None, cache_ops=storage_ops(plan))
+    assert trace == []
+
+
+def test_device_consumes_the_explicit_snapshot_without_reading_plan_cache():
+    class Plan:
+        def __init__(self):
+            self.pages_to_zero = {}
+            self.remote_decode = None
+            self.remote_prefill = None
+            self.reads = 0
+
+        def pages_to_copy_arrays(self):
+            return {}
+
+        @property
+        def cache(self):
+            self.reads += 1
+            if self.reads > 1:
+                raise AssertionError("plan.cache was already captured")
+            return ()
+
+    plan = Plan()
+    prepared = cache_ops_from_plan(plan)
+    trace = []
+    handle = _handle(trace)
+    handle.execute(plan, None, cache_ops=prepared.device)
+    assert plan.reads == 1 and trace == []
 
 
 # ----------------------------------------------------------------------

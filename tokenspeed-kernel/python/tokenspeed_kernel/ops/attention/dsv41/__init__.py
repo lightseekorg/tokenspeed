@@ -62,6 +62,7 @@ __all__ = [
     "decode_rows",
     "decode_window",
     "global_slots",
+    "compact_slots",
     "selection_table",
     "cache_pack",
     "cache_unpack",
@@ -79,6 +80,9 @@ __all__ = [
     "index_topk",
     "new_index_metadata",
     "index_select_all",
+    "local_index_supported",
+    "index_candidates",
+    "merge_index_candidates",
     "compressor_tail_scatter",
     "compressor_pool",
     "compressor_metadata",
@@ -359,13 +363,15 @@ def selected_attention(
     global_cache: torch.Tensor | None,
     global_slots: torch.Tensor | None,
     global_lens: torch.Tensor | None,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,
     softmax_scale: float,
     out: torch.Tensor | None,
     query_chunk_size: int,
     schedule: object | None,
     prefill_kv: torch.Tensor | None,
     prefill_indices: torch.Tensor | None,
+    *,
+    lse: torch.Tensor | None,
 ) -> torch.Tensor:
     """Joint SWA/global softmax with one zero-valued sink, returning BF16.
 
@@ -380,7 +386,7 @@ def selected_attention(
             iff global_cache is None. This is a separate physical address domain.
         global_lens: Int32/int64 [T] active prefix lengths, or None with no global.
         attn_sink: FP32 [H] sink logits, or a pre-padded 64/128-head vector;
-            each real head includes its sink exactly once.
+            each real head includes its sink exactly once. None requests no sink.
         softmax_scale: QK multiplier; reference uses 512**-0.5.
         out: Contiguous BF16 destination shaped like q, or None to allocate.
         query_chunk_size: Positive query tile bound for gather/dequant scratch.
@@ -391,6 +397,9 @@ def selected_attention(
         prefill_indices: Optional int32 [T,width] indices into prefill_kv.
             With a workspace, paged slots/lengths are None. The backend gathers
             all required old prefix rows before publishing this layer's writes.
+
+        lse: Optional contiguous FP32 [T, H] natural-log LSE destination.
+            Requires attn_sink=None for distributed partial attention.
 
     Returns:
         Output shaped like q; all-invalid selections return zero. SWA/global
@@ -403,6 +412,19 @@ def selected_attention(
     from tokenspeed_kernel.ops.attention.dsv41.flash_mla import (
         is_flash_mla_v41_available,
     )
+
+    if lse is not None:
+        if attn_sink is not None:
+            raise ValueError("partial attention LSE requires no sink")
+        if (
+            lse.shape != q.shape[:2]
+            or lse.dtype != torch.float32
+            or lse.device != q.device
+            or not lse.is_contiguous()
+        ):
+            raise ValueError(
+                "lse must be contiguous FP32 [tokens, heads] on the query device"
+            )
 
     native = (
         schedule is not None or prefill_kv is not None
@@ -432,6 +454,7 @@ def selected_attention(
         schedule,
         prefill_kv,
         prefill_indices,
+        **({"lse": lse} if lse is not None else {}),
     )
 
 
@@ -482,6 +505,7 @@ def selected_attention_rope(
             schedule,
             None,
             None,
+            lse=None,
         )
         return rope_inplace(out, positions, cos_sin_cache, None)
     return kernel(
@@ -1192,6 +1216,47 @@ def compressor_metadata(
     )
 
 
+def local_index_supported(index_q, index_cache, candidates):
+    """Whether local FP8 candidate scoring has a native implementation."""
+    from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
+        is_hopper_indexer_available,
+    )
+
+    return (
+        isinstance(index_q, torch.Tensor)
+        and index_q.is_cuda
+        and is_hopper_indexer_available()
+        and index_cache.shape[-1] == 132
+        and index_q.shape[1] % 8 == 0
+        and (
+            candidates is None
+            or (candidates.shape[1] > 0 and candidates.shape[1] % 16 == 0)
+        )
+    )
+
+
+def index_candidates(index_q, weights, index_cache, table, visible, candidates, topk):
+    """Return local TopK as int32 [N,K,2] (logical ID, FP32 score bits).
+
+    Table entries address local Index K pages; nonowned pages are -1.
+    Candidate blocks and causal lengths retain global logical coordinates.
+    candidates=None scans all locally owned visible pages for a Full pass.
+    Scores are transported as raw bits, never rounded or numerically reduced.
+    """
+    return _kernel("index_candidates", index_q)(
+        index_q, weights, index_cache, table, visible, candidates, topk
+    )
+
+
+def merge_index_candidates(packed, rows, lengths):
+    """Select from gathered int32 [N,ranks*K,2] ID/score pairs.
+
+    Writes sorted global logical IDs to rows [N,K], padded -1, and valid
+    counts to lengths [N]. All tensors have fixed shapes for graph replay.
+    """
+    return _kernel("merge_index_candidates", packed)(packed, rows, lengths)
+
+
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.dsv41.triton  # noqa: E402,F401
@@ -1285,3 +1350,27 @@ def new_index_metadata(page_table: torch.Tensor, visible_lens: torch.Tensor) -> 
     from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexMetadata
 
     return IndexMetadata(page_table, visible_lens)
+
+
+def compact_slots(slots: torch.Tensor, lengths: torch.Tensor):
+    """Stably pack valid physical slots within each row's scan length.
+
+    Integer slots [N,K] use negative values for holes. Integer lengths [N]
+    bound each row's input scan. Returns contiguous slots [N,K], padded with
+    -1, and int32 valid counts [N]. Output shapes remain fixed for graph replay.
+    """
+    if (
+        slots.ndim != 2
+        or lengths.shape != slots.shape[:1]
+        or slots.dtype not in (torch.int32, torch.int64)
+        or lengths.dtype not in (torch.int32, torch.int64)
+        or slots.device != lengths.device
+    ):
+        raise ValueError("Expected integer slots [N,K] and lengths [N] on one device")
+    if not slots.is_cuda:
+        columns = torch.arange(slots.shape[1], device=slots.device)
+        valid = (slots >= 0) & (columns[None, :] < lengths[:, None])
+        order = torch.where(valid, columns, columns + slots.shape[1]).argsort(dim=-1)
+        packed = slots.masked_fill(~valid, -1).gather(1, order)
+        return packed, valid.sum(dim=-1, dtype=torch.int32)
+    return _kernel("compact_slots", slots)(slots, lengths)

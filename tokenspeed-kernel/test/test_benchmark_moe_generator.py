@@ -235,6 +235,7 @@ def test_beam_channel_ordinary_admission_without_a_timing_override(mi350_platfor
             with_bias=False,
             fast_math=True,
             combine_order="rank",
+            features=frozenset(),
             solution=None,
         )
     finally:

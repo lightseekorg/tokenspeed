@@ -337,6 +337,20 @@ optional independent MLA/indexer RoPE and BF16 cache writes;
 the existing paged backend owns sparse selection and attention. Unsupported
 execution shapes fail instead of selecting another projection path.
 
+The paged backend also accepts the ordinary MLA/indexer projections. A model
+adapter can use them for prefill or capture buckets outside the native shape
+contract while retaining fused decode for supported rows. Both use the same
+causal metadata and cache placement; only the projection and collective provider
+differs.
+
+When a model already owns a SHMEM runtime, attach a separate DSA window to that
+owner before capture instead of initializing another runtime. The model keeps
+the attached window and registered attention outputs alive until its graphs are
+released, closes imported IPC mappings before freeing their exports, then releases
+the DSA window before the owning communication runtime.
+The model adapter supplies these prepared resources through the installed
+provider; the common runtime does not create a second resource manager.
+
 Device projection format conversion stays behind the kernel-package adapter.
 Preparing a weight allocates fresh NZ29 storage without changing coefficients
 or dtype; graph execution consumes the prepared buffers and communication state.

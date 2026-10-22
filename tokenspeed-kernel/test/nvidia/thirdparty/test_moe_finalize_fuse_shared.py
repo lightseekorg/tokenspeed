@@ -150,6 +150,7 @@ def test_routed_deferred_finalize_matches_finalized(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_unquant_routed_moe_apply"
     assert plan["supports_deferred_finalize"] is True

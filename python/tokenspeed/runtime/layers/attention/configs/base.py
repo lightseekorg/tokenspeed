@@ -264,6 +264,9 @@ class AttnConfig:
                 # composing the hybrid components, and validates it before
                 # cache allocation. The composite name is not a capability.
                 pass
+            elif softmax.backend_name == "deepseek_v41":
+                if self.is_draft:
+                    raise ValueError("V4.1 KVP requires the target attention backend")
             else:
                 raise ValueError(
                     "--kv-parallel-size > 1 (DCP decode) currently requires "

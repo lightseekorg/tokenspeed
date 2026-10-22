@@ -24,6 +24,8 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.metadata import apply_stop_conditions
 from tokenspeed_kernel.ops.metadata.stop_conditions import _apply_stop_conditions_torch
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 pytest.importorskip("torch_npu")
 pytestmark = pytest.mark.skipif(
@@ -44,7 +46,10 @@ pytestmark = pytest.mark.skipif(
 )
 @pytest.mark.parametrize("capture", [False, True])
 @pytest.mark.parametrize("stop_count", [0, 16])
-def test_stop_conditions_match_cpu(batch, extends, outputs, width, capture, stop_count):
+@pytest.mark.parametrize("implementation", ["public", "triton"])
+def test_stop_conditions_match_cpu(
+    batch, extends, outputs, width, capture, stop_count, implementation
+):
     gen = torch.Generator().manual_seed(batch + width)
     pool = batch + 4
     slots = torch.randperm(pool - 1, generator=gen)[:batch].to(torch.int64)
@@ -84,11 +89,27 @@ def test_stop_conditions_match_cpu(batch, extends, outputs, width, capture, stop
         decode_width=width,
         padding_index=pool - 1,
     )
-    apply_stop_conditions(*device, **kwargs)  # compile before capture
+    if implementation == "triton":
+        # Restrict the solution while retaining capability filtering: a plugin
+        # must not hide the portable Ascend fallback's numerical behavior.
+        kernel = select_kernel(
+            "metadata",
+            "apply_stop_conditions",
+            format_signature(req_pool_indices=dense_tensor_format(torch.int64)),
+            solution="triton",
+        )
+
+    def run():
+        if implementation == "public":
+            apply_stop_conditions(*device, **kwargs)
+        else:
+            kernel(*device, extends, outputs, width, pool - 1)
+
+    run()  # compile before capture
     if capture:
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
-            apply_stop_conditions(*device, **kwargs)
+            run()
         # Replay must read updated buffers, including stop IDs and accepted widths.
         initial[1] = (tokens + 3) % 12
         initial[6] = torch.where(stop_ids >= 0, (stop_ids + 2) % 12, stop_ids)

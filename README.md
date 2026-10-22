@@ -27,6 +27,7 @@ More importantly, TokenSpeed is the **Switzerland** of open-source LLM inference
 
 ## News
 
+- [2026/10] [EAGLE-4](https://blog.eagle.ai/blog/introducing-eagle-4) training and serving with TorchSpec and TokenSpeed. [[blog](https://lightseek.org/blog/eagle-4.html)]
 - [2026/10] Reflection's [Beam](https://developers.reflection.ai/deployment-overview) at day 0: 501B MoE serving in NVFP4 on NVIDIA GB200 with TokenSpeed. [[blog](https://lightseek.org/blog/tokenspeed-reflection-beam.html)]
 - [2026/10] 🔥 [TokenSpeed MLA 2](https://github.com/lightseekorg/tokenspeed/tree/main/tokenspeed-mla#mla-2-decode-benchmarks) for [NVIDIA Vera Rubin](https://www.nvidia.com/en-us/data-center/technologies/rubin/). [[blog](https://lightseek.org/blog/tokenspeed-mla-2.html)]
 - [2026/10] 🔥 685 tokens/s per user: serving Qwen3.8-Flash-Next on NVIDIA GB300 with TokenSpeed. [[blog](https://lightseek.org/blog/tokenspeed-qwen3-8-flash-next.html)]

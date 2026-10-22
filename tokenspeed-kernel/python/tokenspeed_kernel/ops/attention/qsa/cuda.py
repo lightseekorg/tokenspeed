@@ -53,6 +53,7 @@ if current_platform().is_nvidia:
             ),
             traits={"topk": frozenset({512, 1024, 2048})},
             priority=Priority.SPECIALIZED,
+            features=frozenset({"logits"}),
         )
         def cuda_qsa_block_topk_select(
             logits: torch.Tensor,

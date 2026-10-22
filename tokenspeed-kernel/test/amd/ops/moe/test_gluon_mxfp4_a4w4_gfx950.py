@@ -97,6 +97,7 @@ def _plan(solution: str | None) -> dict:
         expert_id_repeats=False,
         fast_math=False,
         combine_order="rank",
+        features=frozenset(),
     )
 
 

@@ -98,6 +98,13 @@ preceding goals (still evolving; subject to change):
   priority, and returns a callable. Selection supports per-call `solution=`
   and `override=` plus config-file overrides for development.
 
+For call sites requiring batch invariance, `KernelPlan.select()` selects from declared
+capabilities at initialization using static geometry. Execution reuses that
+plan and validates its input contract without re-ranking by batch size. This
+is opt-in; ordinary auto-selection keeps its existing policy. A planned leaf
+that can be recorded into a CUDA graph also declares the `cuda_graph` feature;
+callers that plan their leaves capture only through leaves declaring it.
+
 ### Directory structure
 
 ```
@@ -158,6 +165,8 @@ stream. A graph captured inside `capture_session` gets buffers of its own,
 zeroed once after capture outside the graph and kept alive as long as the
 graph, so replays carry no zeroing node. The runtime opens a session around
 every graph it captures.
+Prepared plans can use `retain_for_capture` in that session to keep their
+allocations alive until the graph owner is released.
 
 ### Solution choices
 

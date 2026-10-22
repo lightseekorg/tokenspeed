@@ -55,6 +55,12 @@ class DeepseekV41Config(SoftmaxAttnConfig):
     candidate_block_size: int
     max_query_tokens: int
     cache_format: str
+    attention_query_swa_min_tokens: int
+    attention_query_min_tokens: int
+    attention_query_rank: int
+    attention_query_group: tuple[int, ...]
+    indexer_query_rank: int
+    indexer_query_group: tuple[int, ...]
 
     @classmethod
     def generate(cls, server_args, model_config, is_draft: bool) -> AttnConfig:
@@ -62,6 +68,15 @@ class DeepseekV41Config(SoftmaxAttnConfig):
             raise NotImplementedError(
                 "V4.1 FlatKV config describes target attention only"
             )
+        if server_args.mapping.attn.kvp_size > 1:
+            if server_args.disaggregation_mode not in ("null", "prefill"):
+                raise ValueError("V4.1 KVP supports aggregate or prefill roles only")
+            if server_args.speculative_algorithm not in (None, "DSPARK"):
+                raise ValueError("V4.1 KVP supports DSpark speculation only")
+            if not server_args.disable_prefill_graph or server_args.enable_mixed_batch:
+                raise ValueError(
+                    "V4.1 KVP requires eager prefill without mixed batches"
+                )
         verify_width = (
             resolve_speculative_num_tokens(server_args, is_draft)
             if server_args.speculative_algorithm is not None
@@ -98,12 +113,48 @@ class DeepseekV41Config(SoftmaxAttnConfig):
             tuple(hf.index_source_layers),
             int(hf.candidate_source_layer),
         )
+        query_size = server_args.deepseek_v41_indexer_query_parallel_size
+        attn = server_args.mapping.attn
+        if query_size not in (1, attn.tp_size):
+            raise ValueError(
+                "V4.1 indexer query parallel size must be 1 or attention TP"
+            )
+        query_rank = attn.tp_rank if query_size > 1 else 0
+        query_group = (
+            attn.tp_group if query_size > 1 else (attn.tp_group[attn.tp_rank],)
+        )
+        attention_swa_min_tokens = (
+            server_args.deepseek_v41_attention_query_swa_min_tokens
+        )
+        if attention_swa_min_tokens < 1:
+            raise ValueError("V4.1 SWA attention query minimum tokens must be positive")
+        attention_min_tokens = server_args.deepseek_v41_attention_query_min_tokens
+        if attention_min_tokens < 1:
+            raise ValueError("V4.1 attention query minimum tokens must be positive")
+        attention_size = server_args.deepseek_v41_attention_query_parallel_size
+        if attention_size not in (1, attn.tp_size):
+            raise ValueError(
+                "V4.1 attention query parallel size must be 1 or attention TP"
+            )
+        if attention_size > 1 and not server_args.disable_prefill_graph:
+            raise ValueError(
+                "V4.1 attention query exchange requires --disable-prefill-graph"
+            )
+        attention_group = (
+            attn.tp_group if attention_size > 1 else (attn.tp_group[attn.tp_rank],)
+        )
         spec = cls(
             backend_name="deepseek_v41",
             num_attention_heads=model_config.num_attention_heads,
             num_kv_heads=1,
             head_dim=int(hf.head_dim),
             attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
+            attention_query_swa_min_tokens=attention_swa_min_tokens,
+            attention_query_min_tokens=attention_min_tokens,
+            attention_query_rank=attn.tp_rank if attention_size > 1 else 0,
+            attention_query_group=attention_group,
+            indexer_query_rank=query_rank,
+            indexer_query_group=query_group,
             cache_layer_types=("sliding_attention",) * len(ratios),
             sliding_window_tokens=int(hf.sliding_window),
             compress_ratios=ratios,
