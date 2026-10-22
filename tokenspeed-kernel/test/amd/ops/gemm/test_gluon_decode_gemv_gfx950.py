@@ -40,6 +40,7 @@ from tokenspeed_kernel.ops.layernorm import (  # noqa: E402
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (  # noqa: E402
     _PREFERRED_SHAPES,
+    _ROWS_CONFIGS,
     gluon_rowcta_bf16_gemv_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
@@ -66,6 +67,42 @@ def test_gluon_rowcta_bf16_gemv_matches_reference(n: int, k: int) -> None:
     gluon_rowcta_bf16_gemv_gfx950(x, weight, actual)
     expected = x.float() @ weight.float().T
     torch.testing.assert_close(actual.float(), expected, atol=0.5, rtol=8e-3)
+
+
+@pytest.mark.parametrize(("n", "k"), sorted(_ROWS_CONFIGS))
+def test_few_row_gemv_rows_match_the_single_row_gemv(n: int, k: int) -> None:
+    """Every row of a measured few-row bucket is bitwise its single-row GEMV.
+
+    ``gemm.mv`` selects the GEMV for those buckets, and a row count inside a
+    bucket (3 in the 4-row bucket) masks the rows it does not fill.
+    """
+    generator = torch.Generator(device="cuda").manual_seed(20261022 + n + k)
+    buckets = sorted(_ROWS_CONFIGS[(n, k)])
+    total = buckets[-1]
+    x = torch.randn(
+        (total, k), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    weight = (
+        torch.randn((n, k), dtype=torch.bfloat16, device="cuda", generator=generator)
+        / k**0.5
+    )
+    expected = torch.empty((total, n), dtype=torch.bfloat16, device="cuda")
+    for row in range(total):
+        gluon_rowcta_bf16_gemv_gfx950(x[row : row + 1], weight, expected[row : row + 1])
+    for bucket in buckets:
+        assert _select_mv(
+            bucket, n, k, True, torch.bfloat16, torch.bfloat16, False
+        ).__name__ == ("gluon_rowcta_bf16_gemv_gfx950")
+        assert torch.equal(mv(x[:bucket], weight), expected[:bucket])
+    # Rows past the largest bucket keep the decode GEMM.
+    past = 2 * buckets[-1]
+    assert _select_mv(
+        past, n, k, True, torch.bfloat16, torch.bfloat16, False
+    ).__name__ != ("gluon_rowcta_bf16_gemv_gfx950")
+    rows = [m for m in range(2, total + 1) if 1 << (m - 1).bit_length() in buckets]
+    for m in rows:
+        out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device="cuda")
+        assert torch.equal(mv(x[:m], weight, out=out), expected[:m])
 
 
 def test_gated_gemv_matches_the_gate_norm_then_the_gemv() -> None:

@@ -73,6 +73,9 @@ if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
         gluon_rowcta_bf16_gemv_gfx950 as _rowcta_bf16_gemv_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
+        supports_gluon_rowcta_bf16_gemv_gfx950 as _supports_rowcta_bf16_gemv,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         launch_gluon_gemv_a16w16_gfx950 as _gemv_a16w16_impl,
     )
@@ -148,9 +151,9 @@ if platform.is_amd:
         ),
         priority=Priority.SPECIALIZED + 1,
         traits={
-            "m": frozenset({1}),
             "n_min": frozenset({128}),
             "k_min": frozenset({128}),
+            "mnk_problem_filter": frozenset({_supports_rowcta_bf16_gemv}),
         },
     )
     def gluon_rowcta_bf16_gemv_gfx950(
@@ -158,10 +161,10 @@ if platform.is_amd:
         weight: torch.Tensor,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Dispatch one-row BF16 GEMV to the gfx950 Gluon implementation."""
+        """Dispatch single rows, and measured few-row shapes, to the gfx950 GEMV."""
         if out is None:
             out = torch.empty(
-                (1, weight.shape[0]),
+                (x.shape[0], weight.shape[0]),
                 dtype=x.dtype,
                 device=x.device,
             )

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Cold-weight, single-row BF16 GEMV for gfx950."""
+"""Cold-weight BF16 GEMV for one or a few decode rows on gfx950."""
 
 from __future__ import annotations
 
@@ -67,6 +67,138 @@ def gluon_rowcta_bf16_gemv_geometry_gfx950(n: int, k: int) -> tuple[int, int]:
     return _rowcta_config(n, k)
 
 
+# (N, K) -> {power-of-two row bucket: (outputs per wave, waves per program)}
+# where projecting a few rows with the single-row reduction beat the default
+# selection of ``gemm.mv`` (Gluon MFMA decode GEMM) in cold-weight graph replay
+# on MI355X (median of six alternating trials). Eight rows and the 8192x1024
+# attention output measured slower than the MFMA GEMM.
+_ROWS_CONFIGS: dict[tuple[int, int], dict[int, tuple[int, int]]] = {
+    (512, 8192): {2: (2, 8), 4: (1, 8)},  # Muse Spark pre-expert TP8
+}
+
+
+def _rows_config(m: int, n: int, k: int) -> tuple[int, int, int, int] | None:
+    """``(BLOCK_K, waves per output, outputs per wave, waves per program)``."""
+    if m < 2:
+        return None
+    bucket = 1 << (m - 1).bit_length()
+    config = _ROWS_CONFIGS.get((n, k), {}).get(bucket)
+    if config is None:
+        return None
+    block_k, waves = _rowcta_config(n, k)
+    outputs_per_wave, num_warps = config
+    # This runs inside the selection predicate: a shape the tile does not
+    # divide falls back to the default selection.
+    if k % block_k or n % (num_warps // waves * outputs_per_wave):
+        return None
+    return block_k, waves, outputs_per_wave, num_warps
+
+
+def supports_gluon_rowcta_bf16_gemv_gfx950(m: int, n: int, k: int) -> bool:
+    """Whether ``m`` rows of ``[N, K]`` run here: any single row, or a measured
+    few-row bucket."""
+    return m == 1 or _rows_config(m, n, k) is not None
+
+
+@gluon.jit
+def gluon_rowcta_bf16_gemv_rows_sums_gfx950(
+    x_ptr,
+    weight_ptr,
+    first,
+    M,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    WAVES_PER_OUTPUT: gl.constexpr,
+    OUTPUTS_PER_WAVE: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Return ``[BLOCK_M, OUTPUTS]`` sums of outputs ``first ..`` for every row.
+
+    Each (row, output) keeps the single-row kernel's reduction for
+    ``(BLOCK_K, WAVES_PER_OUTPUT)``: per-lane FP32 chunks accumulated in K order,
+    then one sum over the output's subgroups, so row ``m`` is bitwise the
+    single-row GEMV of ``x[m]``. Rows sit in each lane's registers, so every
+    weight load serves all of them.
+    """
+    OUTPUTS: gl.constexpr = NUM_WARPS // WAVES_PER_OUTPUT * OUTPUTS_PER_WAVE
+    layout: gl.constexpr = gl.BlockedLayout(
+        [BLOCK_M, OUTPUTS_PER_WAVE, BLOCK_K // (64 * WAVES_PER_OUTPUT)],
+        [1, 1, 64],
+        [1, NUM_WARPS // WAVES_PER_OUTPUT, WAVES_PER_OUTPUT],
+        [2, 1, 0],
+    )
+    w_layout: gl.constexpr = gl.SliceLayout(0, layout)
+    x_layout: gl.constexpr = gl.SliceLayout(1, layout)
+    outputs = first + gl.arange(0, OUTPUTS, layout=gl.SliceLayout(1, w_layout))
+    w_columns = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, w_layout))
+    rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, x_layout))
+    x_columns = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, x_layout))
+    accumulator = gl.zeros((BLOCK_M, OUTPUTS, BLOCK_K), gl.float32, layout=layout)
+    for start in range(0, K, BLOCK_K):
+        weight = gl.amd.cdna4.buffer_load(
+            weight_ptr,
+            (outputs[:, None] * K + start + w_columns[None, :]).to(gl.int32),
+            cache=".cg",
+        ).to(gl.float32)
+        x = gl.amd.cdna4.buffer_load(
+            x_ptr,
+            (rows[:, None] * K + start + x_columns[None, :]).to(gl.int32),
+            mask=(rows < M)[:, None],
+            other=0.0,
+        ).to(gl.float32)
+        accumulator += x[:, None, :] * weight[None, :, :]
+    return gl.sum(accumulator, axis=2)
+
+
+def _rows_launch_metadata(grid, kernel, args):
+    """Report weight, input and output bytes to Proton."""
+    m, n, k = args["M"], args["N"], args["K"]
+    return {
+        "name": kernel.name,
+        "bytes": (n * k + m * k + m * n) * args["weight_ptr"].element_size(),
+        "flops": 2 * m * n * k,
+    }
+
+
+@gluon.jit(launch_metadata=_rows_launch_metadata, do_not_specialize=("M",))
+def gluon_rowcta_bf16_gemv_rows_gfx950(
+    x_ptr,
+    weight_ptr,
+    out_ptr,
+    M,
+    N,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    WAVES_PER_OUTPUT: gl.constexpr,
+    OUTPUTS_PER_WAVE: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    OUTPUTS: gl.constexpr = NUM_WARPS // WAVES_PER_OUTPUT * OUTPUTS_PER_WAVE
+    first = gl.program_id(0) * OUTPUTS
+    sums = gluon_rowcta_bf16_gemv_rows_sums_gfx950(
+        x_ptr,
+        weight_ptr,
+        first,
+        M,
+        K,
+        BLOCK_M,
+        BLOCK_K,
+        WAVES_PER_OUTPUT,
+        OUTPUTS_PER_WAVE,
+        NUM_WARPS,
+    )
+    layout: gl.constexpr = sums.type.layout
+    rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, layout))
+    outputs = first + gl.arange(0, OUTPUTS, layout=gl.SliceLayout(0, layout))
+    gl.store(
+        out_ptr + rows[:, None] * N + outputs[None, :],
+        sums.to(gl.bfloat16),
+        mask=(rows < M)[:, None],
+    )
+
+
 @gluon.jit
 def _rowcta_bf16_gemv_kernel(
     x_ptr,
@@ -111,24 +243,27 @@ def gluon_rowcta_bf16_gemv_gfx950(
     weight: torch.Tensor,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute ``x @ weight.T`` for one contiguous BF16 row.
+    """Compute ``x @ weight.T`` for one or a few contiguous BF16 rows.
+
+    Row ``m`` of the result is bitwise the single-row projection of ``x[m]``.
+    More than one row needs a measured bucket (see
+    ``supports_gluon_rowcta_bf16_gemv_gfx950``).
 
     Args:
-        x: Contiguous BF16 input shaped ``[1, K]``.
+        x: Contiguous BF16 input shaped ``[M, K]``.
         weight: Contiguous BF16 weight shaped ``[N, K]``.
-        out: Contiguous BF16 destination shaped ``[1, N]``.
+        out: Contiguous BF16 destination shaped ``[M, N]``.
 
     Returns:
         ``out`` after the projection completes.
     """
     if (
         x.ndim != 2
-        or x.shape[0] != 1
         or x.dtype != torch.bfloat16
         or not x.is_cuda
         or not x.is_contiguous()
     ):
-        raise ValueError("x must be one contiguous BF16 GPU row")
+        raise ValueError("x must be contiguous BF16 GPU rows")
     if (
         weight.ndim != 2
         or weight.shape[1] != x.shape[1]
@@ -137,27 +272,48 @@ def gluon_rowcta_bf16_gemv_gfx950(
         or not weight.is_contiguous()
     ):
         raise ValueError("weight must be contiguous BF16 [N, K] beside x")
+    m, k = x.shape
+    n = weight.shape[0]
     if (
-        out.shape != (1, weight.shape[0])
+        out.shape != (m, n)
         or out.dtype != torch.bfloat16
         or out.device != x.device
         or not out.is_contiguous()
     ):
-        raise ValueError("out must be contiguous BF16 [1, N] beside x")
-    k = x.shape[1]
+        raise ValueError("out must be contiguous BF16 [M, N] beside x")
     if k <= 0:
         raise ValueError("K must be positive")
-    block_k, num_warps = _rowcta_config(weight.shape[0], k)
-    _rowcta_bf16_gemv_kernel[(weight.shape[0],)](
+    if m == 1:
+        block_k, num_warps = _rowcta_config(n, k)
+        _rowcta_bf16_gemv_kernel[(n,)](
+            x,
+            weight,
+            out,
+            K=k,
+            BLOCK_K=block_k,
+            NUM_WARPS=num_warps,
+            SUBGROUP_SIZE=_SUBGROUP_SIZE,
+            num_warps=num_warps,
+            waves_per_eu=0,
+        )
+        return out
+    config = _rows_config(m, n, k)
+    if config is None:
+        raise ValueError(f"no measured {m}-row rowcta GEMV for [{n}, {k}]")
+    block_k, waves, outputs_per_wave, num_warps = config
+    gluon_rowcta_bf16_gemv_rows_gfx950[(n // (num_warps // waves * outputs_per_wave),)](
         x,
         weight,
         out,
+        m,
+        n,
         K=k,
+        BLOCK_M=1 << (m - 1).bit_length(),
         BLOCK_K=block_k,
+        WAVES_PER_OUTPUT=waves,
+        OUTPUTS_PER_WAVE=outputs_per_wave,
         NUM_WARPS=num_warps,
-        SUBGROUP_SIZE=_SUBGROUP_SIZE,
         num_warps=num_warps,
-        waves_per_eu=0,
     )
     return out
 
@@ -399,6 +555,8 @@ __all__ = [
     "launch_gluon_gated_rowcta_bf16_gemv_gfx950",
     "gluon_rowcta_bf16_gemv_geometry_gfx950",
     "gluon_rowcta_bf16_gemv_gfx950",
+    "gluon_rowcta_bf16_gemv_rows_sums_gfx950",
     "prefers_gluon_rowcta_bf16_gemv_gfx950",
     "supports_gluon_gated_rowcta_bf16_gemv_gfx950",
+    "supports_gluon_rowcta_bf16_gemv_gfx950",
 ]
