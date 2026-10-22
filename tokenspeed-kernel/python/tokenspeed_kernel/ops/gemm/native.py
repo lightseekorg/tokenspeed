@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.numerics.torch.gemm import torch_grouped_bf16_projection
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
@@ -60,7 +61,7 @@ from tokenspeed_kernel.signature import (
     priority=Priority.PERFORMANT,
 )
 def torch_grouped_bf16_projection_gfx950(
-    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
 ) -> torch.Tensor:
     """Project BF16 groups into their final contiguous token-major layout.
 
@@ -78,10 +79,6 @@ def torch_grouped_bf16_projection_gfx950(
     # PyTorch's out= GEMM does not support autograd; retain the reference
     # behavior for callers that explicitly request gradients.
     if torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad):
-        from tokenspeed_kernel.numerics.torch.gemm import (
-            torch_grouped_bf16_projection,
-        )
-
         return torch_grouped_bf16_projection(x, weight, out)
     if out is None:
         out = x.new_empty((x.shape[0], weight.shape[0], weight.shape[1]))

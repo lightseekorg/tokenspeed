@@ -27,8 +27,8 @@ from tokenspeed_kernel.ops.gemm.native import torch_grouped_bf16_projection_gfx9
 
 
 @pytest.mark.parametrize("layout", ["contiguous", "tokens", "groups", "weights"])
-@pytest.mark.parametrize("provided_out", [False, True])
-def test_direct_grouped_projection_destination_cpu(layout, provided_out):
+@pytest.mark.parametrize("output_mode", ["omitted", "none", "provided"])
+def test_direct_grouped_projection_destination_cpu(layout, output_mode):
     tokens, groups, width, rank = 6, 2, 64, 32
     if layout == "tokens":
         x = torch.randn(tokens, groups * width + 32, dtype=torch.bfloat16)[
@@ -46,10 +46,13 @@ def test_direct_grouped_projection_destination_cpu(layout, provided_out):
     expected = torch.einsum("tgd,grd->tgr", x, weight)
     out = (
         torch.empty(tokens, groups, rank, dtype=torch.bfloat16)
-        if provided_out
+        if output_mode == "provided"
         else None
     )
-    actual = torch_grouped_bf16_projection_gfx950(x, weight, out)
+    if output_mode == "omitted":
+        actual = torch_grouped_bf16_projection_gfx950(x, weight)
+    else:
+        actual = torch_grouped_bf16_projection_gfx950(x, weight, out)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert actual.is_contiguous()
     assert actual.flatten(1).data_ptr() == actual.data_ptr()
@@ -60,7 +63,7 @@ def test_direct_grouped_projection_destination_cpu(layout, provided_out):
 def test_direct_grouped_projection_retains_gradient_reference():
     x = torch.randn(3, 2, 8, dtype=torch.bfloat16, requires_grad=True)
     weight = torch.randn(2, 4, 8, dtype=torch.bfloat16, requires_grad=True)
-    actual = torch_grouped_bf16_projection_gfx950(x, weight, None)
+    actual = torch_grouped_bf16_projection_gfx950(x, weight)
     expected = torch.einsum("tgd,grd->tgr", x, weight)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     actual_grads = torch.autograd.grad(actual.sum(), (x, weight))
