@@ -966,7 +966,24 @@ if platform.is_amd:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ) -> torch.Tensor:
-        """Apply packed block-FP8 experts without expert parallelism."""
+        """Apply packed block-FP8 experts without expert parallelism.
+
+        Args:
+            plan: MoE execution plan selecting standard clamped SwiGLU.
+            x: Contiguous BF16 hidden states ``[tokens, 4096]``.
+            w: Module holding prepared packed E4M3 expert weights and FP32
+                inverse scales per 128-by-128 block.
+            router_logits: Accepted but unused; routing must be precomputed.
+            topk_weights: Required global route weights ``[tokens, 8]``.
+            topk_ids: Required global expert ids ``[tokens, 8]``.
+            num_tokens_global: Accepted but unused EP token count.
+            max_num_tokens_per_gpu: Accepted but unused token-capacity hint.
+            do_finalize: Must be true; deferred finalization is unsupported.
+            enable_pdl: Accepted but unused launch hint.
+
+        Returns:
+            Finalized BF16 expert contribution ``[tokens, 4096]``.
+        """
         return _gluon_fp8_packed_precomputed_moe_apply(
             plan,
             x,
@@ -1011,7 +1028,25 @@ if platform.is_amd:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ) -> torch.Tensor:
-        """Apply packed block-FP8 experts with four expert-parallel ranks."""
+        """Apply packed block-FP8 experts with four expert-parallel ranks.
+
+        Args:
+            plan: MoE execution plan selecting standard clamped SwiGLU.
+            x: Contiguous BF16 hidden states ``[tokens, 4096]``.
+            w: Module holding this rank's prepared packed E4M3 expert weights
+                and FP32 inverse scales per 128-by-128 block.
+            router_logits: Accepted but unused; routing must be precomputed.
+            topk_weights: Required global route weights ``[tokens, 8]``.
+            topk_ids: Required global expert ids ``[tokens, 8]``.
+            num_tokens_global: Accepted but unused EP token count.
+            max_num_tokens_per_gpu: Accepted but unused token-capacity hint.
+            do_finalize: Must be true; deferred finalization is unsupported.
+            enable_pdl: Accepted but unused launch hint.
+
+        Returns:
+            Finalized BF16 local expert contribution ``[tokens, 4096]``;
+            the caller performs any cross-rank reduction.
+        """
         return _gluon_fp8_packed_precomputed_moe_apply(
             plan,
             x,
