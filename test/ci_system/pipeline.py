@@ -61,7 +61,15 @@ SUPPORTED_SETUP_MODES = ("ci", "slurm")
 # jobs in the same workflow stage contend for the same hardware.
 SUPPORTED_PRIORITIES = ("high", "normal", "low")
 DEFAULT_PRIORITY = "normal"
-SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
+SUPPORTED_RUNNER_GROUPS = (
+    "all",
+    "amd",
+    "amd-mi350",
+    "amd-mi450",
+    "nvidia",
+    "nvidia-arm",
+    "nvidia-x86",
+)
 SUPPORTED_MULTI_NODE_FILTERS = ("all", "only", "exclude")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
@@ -95,6 +103,7 @@ AMD_RUNNER_PREFIXES = (
     "amd-mi450-",
     "amd-mi45x-",
 )
+AMD_MI450_RUNNER_PREFIXES = ("amd-mi450-", "amd-mi45x-")
 # A pool whose label names cpu instead of a GPU count holds no accelerator.
 CPU_ONLY_RUNNER_MARKER = "-cpu-"
 NVIDIA_ARM_RUNNER_PREFIXES = (
@@ -131,6 +140,12 @@ def runner_matches_group(runner: str, runner_group: str) -> bool:
         return True
     if runner_group == "amd":
         return is_amd_runner(runner)
+    if runner_group == "amd-mi450":
+        return runner.startswith(AMD_MI450_RUNNER_PREFIXES)
+    if runner_group == "amd-mi350":
+        return is_amd_runner(runner) and not runner.startswith(
+            AMD_MI450_RUNNER_PREFIXES
+        )
     if runner_group == "nvidia":
         return not is_amd_runner(runner)
     if runner_group == "nvidia-arm":
