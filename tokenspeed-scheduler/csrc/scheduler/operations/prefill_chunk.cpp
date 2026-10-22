@@ -37,9 +37,17 @@ std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t u
     return std::max(0, unscheduled - replay_window);
 }
 
+std::int32_t PrefillStateCheckpointTokens(const CacheCoordinator& coordinator, std::int32_t prompt_tokens,
+                                          std::int32_t prefix_replay_tokens) {
+    _assert(prompt_tokens >= 0 && prefix_replay_tokens >= 0, "prompt and replay sizes must be non-negative");
+    const std::int32_t replay_tokens = std::max({1, coordinator.ReplayWindowTokens(), prefix_replay_tokens});
+    const std::int32_t grain = coordinator.PrefixGranularity();
+    return std::max(0, prompt_tokens - replay_tokens) / grain * grain;
+}
+
 std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_t first_pos, bool resumes_hit,
                                 std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens,
-                                bool enable_prefix_cache) {
+                                std::int32_t prefix_replay_tokens, bool enable_prefix_cache) {
     _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
     // The re-fed window of a hit rides in the same forward, so it comes out of
     // the budget before any new token; with nothing left the request waits.
@@ -59,7 +67,8 @@ std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_
         // A later turn can retokenize the generation-prefix tail. Keep a
         // checkpoint before that tail, even when the prompt ends on a page.
         // Bounded replay must still carry its entire final window together.
-        const std::int32_t checkpoint = std::max(0, first_pos + unscheduled - std::max(1, window)) / grain * grain;
+        const std::int32_t checkpoint =
+            PrefillStateCheckpointTokens(coordinator, first_pos + unscheduled, prefix_replay_tokens);
         if (checkpoint > first_pos) {
             prefill_tokens = std::min(prefill_tokens, checkpoint - first_pos);
         }

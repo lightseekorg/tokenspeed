@@ -21,7 +21,7 @@
 // Recurrent-state groups through the Scheduler: the two-slot table (slot 0
 // the checkpoint a forward reads, slot 1 the block it writes) rotating through
 // prefill chunks, the first decode and later decodes; natural checkpoints
-// published at prompt end, finish and retraction only; hits resuming from
+// published at aligned chunks, prompt end, finish and retraction; hits resuming from
 // them; the two-blocks-per-request capacity; and the retraction image of
 // both slots.
 
@@ -196,6 +196,14 @@ TEST_F(HybridPrefixReuseSuite, AnIdenticalPromptReusesStateBeforeItsLogitsReplay
     EXPECT_EQ(Probe("identical", MakeTokens(31)).prefix_tokens, 28);
 }
 
+TEST_F(HybridPrefixReuseSuite, ACheckpointPrecedesTheConfiguredPrefixReplayTail) {
+    config_ = MakeConfig();
+    config_.prefix_replay_tokens = 2;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    ASSERT_FALSE(CompletePrompt("previous", MakeTokens(33)).empty());
+    EXPECT_EQ(Probe("identical", MakeTokens(33)).prefix_tokens, 28);
+}
+
 TEST_F(HybridPrefixReuseSuite, ABranchInsideThePromptReusesAnOrdinaryChunkCheckpoint) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
     ASSERT_FALSE(CompletePrompt("previous", MakeTokens(31)).empty());
@@ -213,6 +221,24 @@ TEST_F(HybridPrefixReuseSuite, DisablingPrefixCachingDoesNotSplitAPromptForCheck
     ASSERT_EQ(batches.size(), 1u);
     EXPECT_EQ(batches.front().input_lengths, std::vector<std::int32_t>{7});
     EXPECT_EQ(Probe("next", {1, 2, 3, 4, 5, 6, 1001, 1002}).prefix_tokens, 0);
+}
+
+TEST_F(HybridPrefixReuseSuite, AReusedPromptCheckpointSurvivesUnprovenBranchCheckpoints) {
+    config_ = MakeConfig();
+    config_.device_allocator.total_pages = 49;
+    for (CacheGroupConfig& group : config_.cache_groups) {
+        group.total_pages = config_.device_allocator.total_pages;
+    }
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    ASSERT_FALSE(CompletePrompt("previous", MakeTokens(7)).empty());
+    // The branch refreshes the shared checkpoint's access epoch. Its unused
+    // interior outputs must be evicted first within that same epoch.
+    auto branch = MakeTokens(127, 1000);
+    std::ranges::copy(MakeTokens(4), branch.begin());
+    const auto batches = CompletePrompt("branch", std::move(branch));
+    ASSERT_FALSE(batches.empty());
+    ASSERT_EQ(batches.front().extend_prefix_lens.front(), 4);
+    EXPECT_EQ(Probe("next", {1, 2, 3, 4, 5, 6, 1001, 1002}).prefix_tokens, 4);
 }
 
 TEST_F(StateCheckpointSuite, TwoSlotsRotateThroughChunksTheFirstDecodeAndLaterDecodes) {

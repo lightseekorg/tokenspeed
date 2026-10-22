@@ -93,10 +93,16 @@ state. A subsequent chat turn can also retokenize the generation-prefix tail.
 Keeping an earlier checkpoint prevents either case from discarding an
 otherwise cached prompt. Every such complete-page
 chunk publishes all State groups together with its KV (§1.2). A sub-page
-budget still advances without publishing a checkpoint. Bounded replay keeps
-its entire final window together, so the last checkpoint precedes that window
-instead. Models without State groups, and requests with prefix caching off,
-keep their ordinary budget-sized chunks. This may add one final tail forward;
+budget still advances without publishing a checkpoint. The last checkpoint
+precedes the larger of the configured `prefix_replay_tokens` tail, one logits
+token, and the bounded replay window. Bounded replay keeps its entire final
+window together. Within the same request access epoch, the retained pre-tail
+checkpoint has endpoint eviction priority, like a prompt end or junction;
+ordinary intermediate checkpoints keep chunk provenance and remain
+probationary until reused. A branch that acquires an older checkpoint
+refreshes its epoch, so its unused interior states are evicted before the
+shared checkpoint. Models without State groups, and requests with prefix
+caching off, keep their ordinary budget-sized chunks. This may add one final tail forward;
 the tradeoff is reusable state without extra backend-private buffers or
 interior kernel snapshots.
 
@@ -232,13 +238,15 @@ admission states what the pair does through the group's `StateStep`
   fresh block the peer's transfer fills.
 
 **Natural checkpoints.** A state is published only at a point where its owner
-stops writing it — the same `PublicationPoint` that publishes the KV tail
-(§1): a fused prompt end (the first decode's admission publishes slot 1 under
-the prompt's key before rotating it into slot 0), a complete-page prefill
+stops writing it: a fused prompt end (the first decode's admission publishes
+slot 1 under the prompt's key before rotating it into slot 0), a complete-page prefill
 chunk end or an exact junction (§1), and a finish or retraction on every role
 (`kFinal`: the P's transferred prompt, the D's and the fused engine's last
-decoded state). An unaligned chunk end that is not a junction, or a later
-decode step, publishes nothing for a State group
+decoded state). An aligned interior chunk uses `kChunkCheckpoint`: it
+publishes State and completed pages without a partial tail, retaining chunk
+eviction provenance. The pre-tail checkpoint and junction use
+`kOwnerContinues`, as does the prompt end. An unaligned chunk end that is not
+a junction, or a later decode step, publishes nothing for a State group
 (`CompletedPages::publish_state` is false). The key is the key of the exact
 token count `T`: the chain hash of the last page when `T` is a page multiple,
 otherwise the tail hash `hash@T` the KV groups use — so one key names a

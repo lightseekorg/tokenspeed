@@ -34,6 +34,9 @@ enum class PublicationPoint {
     // An ordinary chunk end or decode step: only newly completed full pages
     // are published; the partial page stays request-private.
     kChunk,
+    // An aligned prefill chunk also publishes its State output. Like other
+    // interior chunk boundaries, it stays probationary until reused.
+    kChunkCheckpoint,
     // The frontier is final for the owner (finish, retraction): the partial
     // page is published in place as a tail, and so is the state.
     kFinal,
@@ -44,9 +47,9 @@ enum class PublicationPoint {
 };
 
 // Hashes the full prefix pages num_computed_tokens has filled since the
-// previous publication, and at a non-chunk point the partial page beyond
-// them, and states the request's progress for the coordinator. A non-chunk
-// point with nothing new to hash still publishes the frontier's state. The
+// previous publication, and at an endpoint the partial page beyond them,
+// and states the request's progress for the coordinator. Every point except
+// kChunk publishes the frontier's state even with nothing new to hash. The
 // returned spans view cache_progress, which must outlive their use.
 RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgress& cache_progress,
                                        std::int32_t num_computed_tokens, std::int32_t prefix_granularity,

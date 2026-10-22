@@ -45,6 +45,12 @@ namespace tokenspeed {
 // replay_window 0 the chunk is returned unchanged.
 std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t unscheduled, std::int32_t replay_window);
 
+// Last complete prefix page before the prompt's required replay tail. A
+// reusable State checkpoint must precede both the configured logits replay
+// and any bounded replay window, and always leave at least the final token.
+std::int32_t PrefillStateCheckpointTokens(const CacheCoordinator& coordinator, std::int32_t prompt_tokens,
+                                          std::int32_t prefix_replay_tokens);
+
 // Token count of a local prefill chunk starting at first_pos with the given
 // unscheduled prompt, remaining round budget and pending junction (0 means
 // none): a chunk is cut to end at the junction so the natural checkpoint it
@@ -55,12 +61,12 @@ std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t u
 // window rule: the chunk passes the junction rather than waiting for a chunk
 // end that satisfies both. With prefix caching and State groups, chunks also
 // stop at complete prefix pages, including the last page before the prompt's
-// final token/window, so changing the generation-prefix tail does not discard
+// required replay tail, so changing the generation-prefix tail does not discard
 // the prompt's only checkpoint. Sub-page budgets still make progress.
 // Returns 0 when no chunk fits this round's budget.
 std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_t first_pos, bool resumes_hit,
                                 std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens,
-                                bool enable_prefix_cache);
+                                std::int32_t prefix_replay_tokens, bool enable_prefix_cache);
 
 // Budget a fused mixed-mode decode batch leaves untouched so a pending local
 // prefill can still advance: for replayable groups the replay window plus the

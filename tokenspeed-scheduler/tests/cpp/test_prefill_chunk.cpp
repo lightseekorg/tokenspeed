@@ -99,26 +99,31 @@ TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
                                                    /*snapshot_pool=*/nullptr, false);
     // A hit at 16 re-feeds 8 tokens first: 40 of budget leave 32 for new
     // tokens; a hit shorter than the window re-feeds only itself.
-    EXPECT_EQ(
-        PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/true, 100, 40, 0, /*enable_prefix_cache=*/true),
-        32);
-    EXPECT_EQ(
-        PrefillChunkTokens(coord, /*first_pos=*/4, /*resumes_hit=*/true, 100, 40, 0, /*enable_prefix_cache=*/true), 36);
+    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/true, 100, 40, 0, /*prefix_replay_tokens=*/0,
+                                 /*enable_prefix_cache=*/true),
+              32);
+    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/4, /*resumes_hit=*/true, 100, 40, 0, /*prefix_replay_tokens=*/0,
+                                 /*enable_prefix_cache=*/true),
+              36);
     // Nothing left for a new token: wait for a fresher budget.
-    EXPECT_EQ(
-        PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/true, 100, 8, 0, /*enable_prefix_cache=*/true), 0);
+    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/true, 100, 8, 0, /*prefix_replay_tokens=*/0,
+                                 /*enable_prefix_cache=*/true),
+              0);
     // A later chunk starts where the previous one ended and re-feeds nothing.
-    EXPECT_EQ(
-        PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/false, 100, 40, 0, /*enable_prefix_cache=*/true),
-        40);
+    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/false, 100, 40, 0, /*prefix_replay_tokens=*/0,
+                                 /*enable_prefix_cache=*/true),
+              40);
     // The final chunk is never shorter than the window: 70 unscheduled under
     // a budget of 64 leaves 62 so that 8 remain; the remainder itself fits.
-    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/0, /*resumes_hit=*/true, 70, 64, 0, /*enable_prefix_cache=*/true),
+    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/0, /*resumes_hit=*/true, 70, 64, 0, /*prefix_replay_tokens=*/0,
+                                 /*enable_prefix_cache=*/true),
               62);
-    EXPECT_EQ(
-        PrefillChunkTokens(coord, /*first_pos=*/62, /*resumes_hit=*/false, 8, 64, 0, /*enable_prefix_cache=*/true), 8);
+    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/62, /*resumes_hit=*/false, 8, 64, 0, /*prefix_replay_tokens=*/0,
+                                 /*enable_prefix_cache=*/true),
+              8);
     // A junction cuts the chunk at any token, under the debited budget.
     EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/true, 100, 40, /*junction=*/27,
+                                 /*prefix_replay_tokens=*/0,
                                  /*enable_prefix_cache=*/true),
               11);
     // A junction inside the final window cannot be honored without leaving a
@@ -126,10 +131,10 @@ TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
     // of waiting forever; when the whole remainder does not fit the budget
     // yet, it waits like any other final window.
     EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/48, /*resumes_hit=*/false, /*unscheduled=*/8, 64,
-                                 /*junction=*/52, /*enable_prefix_cache=*/true),
+                                 /*junction=*/52, /*prefix_replay_tokens=*/0, /*enable_prefix_cache=*/true),
               8);
     EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/48, /*resumes_hit=*/false, /*unscheduled=*/8, 6,
-                                 /*junction=*/52, /*enable_prefix_cache=*/true),
+                                 /*junction=*/52, /*prefix_replay_tokens=*/0, /*enable_prefix_cache=*/true),
               0);
 
     // Without replayable groups the helper is min(budget, unscheduled), cut
@@ -137,10 +142,16 @@ TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
     BlockPool plain_pool(16, {1});
     const CacheCoordinator plain = MakeCoordinator(FullOnlySpecs(), 4, plain_pool, /*enable_l3_storage=*/false, nullptr,
                                                    /*snapshot_pool=*/nullptr, false);
-    EXPECT_EQ(PrefillChunkTokens(plain, 16, true, 100, 40, 0, /*enable_prefix_cache=*/true), 40);
-    EXPECT_EQ(PrefillChunkTokens(plain, 16, true, 30, 40, 0, /*enable_prefix_cache=*/true), 30);
-    EXPECT_EQ(PrefillChunkTokens(plain, 16, false, 100, 40, /*junction=*/21, /*enable_prefix_cache=*/true), 5);
-    EXPECT_EQ(PrefillChunkTokens(plain, 21, false, 95, 40, /*junction=*/21, /*enable_prefix_cache=*/true), 40)
+    EXPECT_EQ(PrefillChunkTokens(plain, 16, true, 100, 40, 0, /*prefix_replay_tokens=*/0, /*enable_prefix_cache=*/true),
+              40);
+    EXPECT_EQ(PrefillChunkTokens(plain, 16, true, 30, 40, 0, /*prefix_replay_tokens=*/0, /*enable_prefix_cache=*/true),
+              30);
+    EXPECT_EQ(PrefillChunkTokens(plain, 16, false, 100, 40, /*junction=*/21, /*prefix_replay_tokens=*/0,
+                                 /*enable_prefix_cache=*/true),
+              5);
+    EXPECT_EQ(PrefillChunkTokens(plain, 21, false, 95, 40, /*junction=*/21, /*prefix_replay_tokens=*/0,
+                                 /*enable_prefix_cache=*/true),
+              40)
         << "a junction already passed";
     // With prefix caching disabled, State chunks are cut by budget alone.
     BlockPool state_pool(16, {1, 1});
@@ -153,18 +164,26 @@ TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
     };
     const CacheCoordinator hybrid = MakeCoordinator(with_state, 4, state_pool, /*enable_l3_storage=*/false, nullptr,
                                                     /*snapshot_pool=*/nullptr, false);
-    EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 100, 7, 0, /*enable_prefix_cache=*/false), 7);
-    EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 5, 7, 0, /*enable_prefix_cache=*/false), 5);
+    EXPECT_EQ(
+        PrefillChunkTokens(hybrid, 3, false, 100, 7, 0, /*prefix_replay_tokens=*/0, /*enable_prefix_cache=*/false), 7);
+    EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 5, 7, 0, /*prefix_replay_tokens=*/0, /*enable_prefix_cache=*/false),
+              5);
     // With caching, retain complete-page states before the changing prompt
     // tail. An exact-page prompt still needs a preceding checkpoint.
-    EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 100, 7, 0, /*enable_prefix_cache=*/true), 5);
-    EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 5, 7, 0, /*enable_prefix_cache=*/true), 1);
-    EXPECT_EQ(PrefillChunkTokens(hybrid, 4, false, 4, 7, 0, /*enable_prefix_cache=*/true), 4);
-    EXPECT_EQ(PrefillChunkTokens(hybrid, 0, false, 8, 8, 0, /*enable_prefix_cache=*/true), 4);
+    EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 100, 7, 0, /*prefix_replay_tokens=*/0, /*enable_prefix_cache=*/true),
+              5);
+    EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 5, 7, 0, /*prefix_replay_tokens=*/0, /*enable_prefix_cache=*/true),
+              1);
+    EXPECT_EQ(PrefillChunkTokens(hybrid, 4, false, 4, 7, 0, /*prefix_replay_tokens=*/0, /*enable_prefix_cache=*/true),
+              4);
+    EXPECT_EQ(PrefillChunkTokens(hybrid, 0, false, 8, 8, 0, /*prefix_replay_tokens=*/0, /*enable_prefix_cache=*/true),
+              4);
     // No usable boundary in this budget: make progress rather than waiting.
-    EXPECT_EQ(PrefillChunkTokens(hybrid, 4, false, 100, 2, 0, /*enable_prefix_cache=*/true), 2);
+    EXPECT_EQ(PrefillChunkTokens(hybrid, 4, false, 100, 2, 0, /*prefix_replay_tokens=*/0, /*enable_prefix_cache=*/true),
+              2);
     // An exact unaligned KV junction takes precedence over page alignment.
-    EXPECT_EQ(PrefillChunkTokens(hybrid, 4, false, 100, 8, 7, /*enable_prefix_cache=*/true), 3);
+    EXPECT_EQ(PrefillChunkTokens(hybrid, 4, false, 100, 8, 7, /*prefix_replay_tokens=*/0, /*enable_prefix_cache=*/true),
+              3);
 }
 
 TEST(PrefillChunkTokensTest, StateCheckpointsPreserveTheFinalReplayWindowAndProgress) {
@@ -174,16 +193,16 @@ TEST(PrefillChunkTokensTest, StateCheckpointsPreserveTheFinalReplayWindowAndProg
     BlockPool pool(32, {1, 1, 1, 1});
     const CacheCoordinator coordinator = MakeCoordinator(groups, 4, pool, /*enable_l3_storage=*/false, nullptr,
                                                          /*snapshot_pool=*/nullptr, false);
-    EXPECT_EQ(PrefillChunkTokens(coordinator, 0, false, 70, 64, 0, true), 60);
-    EXPECT_EQ(PrefillChunkTokens(coordinator, 60, false, 10, 64, 0, true), 10);
-    EXPECT_EQ(PrefillChunkTokens(coordinator, 48, false, 8, 64, 52, true), 8);
+    EXPECT_EQ(PrefillChunkTokens(coordinator, 0, false, 70, 64, 0, /*prefix_replay_tokens=*/0, true), 60);
+    EXPECT_EQ(PrefillChunkTokens(coordinator, 60, false, 10, 64, 0, /*prefix_replay_tokens=*/0, true), 10);
+    EXPECT_EQ(PrefillChunkTokens(coordinator, 48, false, 8, 64, 52, /*prefix_replay_tokens=*/0, true), 8);
     for (const bool caching : {false, true}) {
         for (const bool resumes_hit : {false, true}) {
             for (std::int32_t first = 0; first <= 16; ++first) {
                 for (std::int32_t remaining = 1; remaining <= 70; ++remaining) {
                     for (std::int32_t budget = 0; budget <= 32; ++budget) {
-                        const auto length =
-                            PrefillChunkTokens(coordinator, first, resumes_hit, remaining, budget, 0, caching);
+                        const auto length = PrefillChunkTokens(coordinator, first, resumes_hit, remaining, budget, 0,
+                                                               /*prefix_replay_tokens=*/0, caching);
                         const auto available =
                             std::max(0, budget - (resumes_hit ? coordinator.ReplayTokens(first) : 0));
                         ASSERT_GE(length, 0);

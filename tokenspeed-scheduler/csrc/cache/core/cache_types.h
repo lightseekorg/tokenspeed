@@ -38,7 +38,8 @@ namespace tokenspeed {
 
 // Where a published boundary came from: an interior chunk end or decode
 // step (kChunk), or a point the owner stopped at -- prompt end, finish,
-// retraction, a junction cut (kEndpoint). Eviction ranks an unproven kChunk
+// retraction, a junction cut, or the retained pre-tail State checkpoint
+// (kEndpoint). Eviction ranks an unproven kChunk
 // boundary of a non-closed group behind the rest. The declaration order
 // ranks the kinds: a block republished at a later point keeps the higher one.
 enum class CacheBoundaryKind { kChunk, kEndpoint };
@@ -182,18 +183,18 @@ struct CompletedPages {
     // The partial page at this publication point, absent when the point is
     // page-aligned (T = prefix_hashes.size() * P).
     std::optional<TailPublication> tail{};
-    // The owner keeps writing the partial page after this publication (a
-    // prompt end followed by decode, a junction-cut chunk end): the admission
+    // The owner continues after this publication. For a partial page (a
+    // prompt end followed by decode, a junction-cut chunk end), the admission
     // swaps a fresh block into the table slot and copies the published bytes
     // into it. False at finish and retraction, where the block is final and
     // is published in place. Only an admission may set it: the copy needs the
     // transaction's capacity.
     bool owner_continues{false};
-    // This point is a natural checkpoint of the recurrent state (prompt end,
-    // finish, retraction, a junction-cut chunk end): every State group
-    // publishes slot 1 -- the block the forward that ended here wrote --
+    // This point is a natural checkpoint of the recurrent state (an aligned
+    // prefill chunk, prompt end, finish, retraction, or junction cut): every
+    // State group publishes slot 1 -- the block the forward that ended here wrote --
     // under the point's hash (the chain hash when aligned, the tail hash
-    // otherwise). Ordinary chunk ends and decode steps publish no state.
+    // otherwise). Other chunk ends and decode steps publish no state.
     bool publish_state{false};
     // Which kind of boundary the publication ends on (eviction provenance).
     CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};

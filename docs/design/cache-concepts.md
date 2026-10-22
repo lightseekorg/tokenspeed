@@ -254,7 +254,8 @@ there -- the prompt end (the block rotated out of slot 1 as the first decode
 runs), the finish (slot 1 in place), a complete-page prefill chunk, the chunk
 the junction cut ended, or the retraction image -- published under the hash of that token count, page
 boundary or not. With prefix caching, hybrid prefills stop on complete prefix
-pages and before the final prompt token (or replay window), retaining a
+pages and before the required replay tail (the largest of one final token,
+`prefix_replay_tokens`, and the bounded replay window), retaining a
 checkpoint a later turn can reuse when its generation-prefix tail retokenizes.
 The cut is a scheduler token boundary shared by every group; the runtime
 keeps the same two-slot contract. No forward computes an interior checkpoint,
@@ -965,6 +966,14 @@ then tier (uncached request-only block → probationary boundary → established
 boundary → suffix of a closed prefix). Finally, walk the selected blocks in
 reverse and restore every block that is not strictly required, yielding a
 minimal eviction set in `victims`.
+
+An aligned interior prefill checkpoint keeps chunk provenance: until a later
+request acquires it, its State and sliding-window boundaries are probationary.
+The retained checkpoint immediately before the prompt's required replay tail
+has endpoint provenance, like a prompt end, junction, finish, or retraction.
+These tiers break ties within one access epoch; the policy still compares
+epochs first. A branch that reuses a checkpoint refreshes its epoch, and its
+unproven interior checkpoints must not displace that shared boundary first.
 
 Each cache group uses a non-owning cursor over its tier's eviction index.
 It advances continuously, skips fully pinned epochs, and returns complete
