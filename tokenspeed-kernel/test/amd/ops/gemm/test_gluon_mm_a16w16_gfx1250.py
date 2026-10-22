@@ -33,7 +33,9 @@ if not is_cdna5():
 from tokenspeed_kernel.ops.gemm import (  # noqa: E402
     dsv4_linear_fp32,
     grouped_bf16_projection,
+    grouped_bf16_projection_quantize_fp8,
 )
+from tokenspeed_kernel.ops.quantization import quantize_fp8  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16 import mm as mm_mod  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (  # noqa: E402
     gluon_mm_a16w16_gfx1250,
@@ -175,6 +177,41 @@ def test_grouped_bf16_projection_single_group_uses_gfx1250_kernel(
     out = torch.empty_like(actual)
     assert grouped_bf16_projection(x, weight, out, None).data_ptr() == out.data_ptr()
     assert torch.equal(out, actual)
+
+
+def _two_group_operands(tokens: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+    torch.manual_seed(seed)
+    heads = torch.randn(tokens, 16, 512, device="cuda", dtype=torch.bfloat16) / 64
+    weight = torch.randn(2, 1024, 4096, device="cuda", dtype=torch.bfloat16)
+    return heads.reshape(tokens, 2, -1), weight
+
+
+@pytest.mark.parametrize("tokens", [1, 5, 40, 80, 300, 2048])
+def test_grouped_bf16_projection_two_groups_match_reference(tokens: int) -> None:
+    x, weight = _two_group_operands(tokens, seed=tokens)
+    actual = grouped_bf16_projection(x, weight, None, None)
+    assert actual.shape == (tokens, 2, 1024)
+    for group in range(2):
+        _assert_bf16_close(actual[:, group], _reference(x[:, group], weight[group]))
+
+
+@pytest.mark.parametrize("groups", [1, 2])
+@pytest.mark.parametrize("tokens", [1, 5, 40, 80, 300, 2048])
+def test_grouped_bf16_projection_fp8_matches_unfused(groups: int, tokens: int) -> None:
+    x, weight = _two_group_operands(tokens, seed=tokens + 7)
+    x, weight = x[:, :groups], weight[:groups]
+    codes, scales = grouped_bf16_projection_quantize_fp8(x, weight)
+    expected_codes, expected_scales = quantize_fp8(
+        grouped_bf16_projection(x, weight, None, None).flatten(1),
+        granularity="token_group",
+        group_size=32,
+        scale_encoding="ue8m0",
+        enable_pdl=False,
+        override=None,
+        solution=None,
+    )
+    assert torch.equal(codes.view(torch.uint8), expected_codes.view(torch.uint8))
+    assert torch.equal(scales, expected_scales)
 
 
 def test_grouped_bf16_projection_keeps_torch_beyond_tuned_rows() -> None:

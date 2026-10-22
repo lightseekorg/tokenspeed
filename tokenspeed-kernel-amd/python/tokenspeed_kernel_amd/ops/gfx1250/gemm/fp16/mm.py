@@ -80,7 +80,7 @@ def use_gluon_largem_gfx1250(m: int, k: int, n: int) -> bool:
 def _wmma_tdm_dense_launch_metadata(grid, kernel, args):
     """Report dense WMMA work, partial or output stores, and add3 operand reads."""
     m = args["ACTUAL_M"]
-    n = args["N"]
+    n = args["N"] * args["GROUPS"]
     k = args["K"]
     split_k = args["SPLIT_K"]
     output = args["partial_ptr"] if split_k > 1 else args["out_ptr"]
@@ -116,6 +116,9 @@ def _wmma_tdm_dense_kernel(
     addend_b_ptr,
     stride_addend_am,
     stride_addend_bm,
+    stride_ag,
+    stride_bg,
+    stride_og,
     ACTUAL_M,
     N,
     BLOCK_M: gl.constexpr,
@@ -127,6 +130,7 @@ def _wmma_tdm_dense_kernel(
     WARP_BASES: gl.constexpr,
     EVEN_N: gl.constexpr,
     ADD3: gl.constexpr,
+    GROUPS: gl.constexpr,
 ):
     """CDNA5 dense projection with an optional add3 epilogue.
 
@@ -136,10 +140,23 @@ def _wmma_tdm_dense_kernel(
     past ACTUAL_M and, unless EVEN_N, columns past N load as zero and are not
     stored. A single partition stores in ``out_ptr``'s dtype; several store
     FP32 partials for a separate reduction.
+
+    ``GROUPS > 1`` runs that many independent GEMMs in one launch: axis 0 holds
+    every group's column tiles, group g reads A, B and writes the output at
+    element offsets g * stride_ag/bg/og, and its partials are columns
+    [g * N, (g + 1) * N) of ``GROUPS * N``-wide partial rows.
     """
     pid_n = gl.program_id(0)
     pid_split = gl.program_id(1)
     off_m = gl.program_id(2) * BLOCK_M
+    if GROUPS > 1:
+        n_tiles = gl.cdiv(N, BLOCK_N)
+        group = pid_n // n_tiles
+        pid_n = pid_n % n_tiles
+        a_ptr += group * stride_ag
+        b_ptr += group * stride_bg
+        out_ptr += group * stride_og
+        partial_ptr += group * N
 
     gl.static_assert(
         BLOCK_M == 16 or BLOCK_M == 32 or BLOCK_M == 64 or BLOCK_M == 128,
@@ -356,6 +373,73 @@ def gluon_wmma_dense_reduce_gfx1250(
     )
 
 
+def _gluon_wmma_dense_reduce_fp8_gfx1250_launch_metadata(grid, kernel, args):
+    """Report the FP32 partial reduction and the codes and scales it stores."""
+    rows = grid[0]
+    n = args["n"]
+    split_k = args["SPLIT_K"]
+    values = rows * n
+    return {
+        "name": kernel.name,
+        "flops32": values * (split_k - 1),
+        "bytes": values * split_k * args["partial_ptr"].element_size()
+        + values
+        + values // 32,
+    }
+
+
+@gluon.jit(launch_metadata=_gluon_wmma_dense_reduce_fp8_gfx1250_launch_metadata)
+def gluon_wmma_dense_reduce_fp8_gfx1250(
+    partial_ptr,
+    codes_ptr,
+    scales_ptr,
+    split_stride,
+    row_stride,
+    n,
+    SPLIT_K: gl.constexpr,
+    BLOCK: gl.constexpr,
+):
+    """Sum split-K FP32 partials in split order, round to BF16, and store the
+    row tile as group-32 E4M3 codes and UE8M0 scales.
+
+    Rounded like ``gluon_quantize_fp8_group32_ue8m0_gfx1250`` reading the BF16
+    result, so it matches the unfused reduction and quantization exactly. Each
+    thread loads four contiguous partials; eight threads hold one group.
+    """
+    row = gl.program_id(0)
+    tile = gl.program_id(1)
+    gl.static_assert(BLOCK == 512, "vectorized reduction tile is 512 columns")
+    layout: gl.constexpr = gl.BlockedLayout([1, 4], [4, 8], [4, 1], [1, 0])
+    groups = tile * (BLOCK // 32) + gl.arange(
+        0, BLOCK // 32, layout=gl.SliceLayout(1, layout)
+    )
+    lanes = gl.arange(0, 32, layout=gl.SliceLayout(0, layout))
+    offs = groups[:, None] * 32 + lanes[None, :]
+    mask = offs < n
+    acc = gl.zeros([BLOCK // 32, 32], gl.float32, layout)
+    base = row * row_stride
+    for split in range(0, SPLIT_K):
+        acc += gl.amd.cdna5.buffer_load(
+            partial_ptr + split * split_stride + base,
+            offs.to(gl.int32),
+            mask=mask,
+            other=0.0,
+        )
+    values = acc.to(gl.bfloat16).to(gl.float32)
+    amax = gl.maximum(gl.max(gl.abs(values), axis=1), 1.0e-4)
+    bits = (amax * (1.0 / 448.0)).to(gl.int32, bitcast=True)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(gl.int32)
+    scale = (exponent << 23).to(gl.float32, bitcast=True)
+    codes = gl.div_rn(values, scale[:, None]).to(gl.float8e4nv)
+    gl.amd.cdna5.buffer_store(codes, codes_ptr + row * n, offs.to(gl.int32), mask=mask)
+    gl.amd.cdna5.buffer_store(
+        exponent.to(gl.uint8),
+        scales_ptr + row * (n // 32),
+        groups.to(gl.int32),
+        mask=groups < n // 32,
+    )
+
+
 def _dense_split_k(
     n: int,
     block_n: int,
@@ -412,21 +496,30 @@ def _launch_wmma_tdm_dense_tiles(
     block_m: int,
     warp_bases: tuple[tuple[int, int], ...],
     addends: tuple[torch.Tensor, torch.Tensor] | None = None,
+    fp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     """Launch one dense WMMA grid over every ``block_m``-row tile of ``A``.
 
     ``warp_bases`` places the warps on 16x16 WMMA tiles. ``addends`` fuses
     ``bf16(A @ B.T) + addends[0] + addends[1]`` and needs one K split.
     The result is stored in ``out``'s dtype.
+
+    A ``[M, G, K]`` ``A`` with ``[G, N, K]`` ``B`` and contiguous
+    ``[M, G, N]`` ``out`` runs the G group products in the same grid.
+    ``fp8_out`` (codes ``[M, G * N]``, scales ``[M, G * N / 32]``) replaces
+    ``out`` with the group-32 FP8 quantization of the BF16 result, written by
+    the split-K reduction, so it needs more than one K split.
     """
+    grouped = A.ndim == 3
+    groups = A.shape[1] if grouped else 1
     m = A.shape[0]
-    k_tiles = A.shape[1] // block_k
-    n = B.shape[0]
+    k_tiles = A.shape[-1] // block_k
+    n = B.shape[-2]
     if split_k is None:
         split_k = (
             1
             if addends is not None
-            else _dense_split_k(n, block_n, k_tiles, num_buffers)
+            else _dense_split_k(groups * n, block_n, k_tiles, num_buffers)
         )
     if k_tiles % split_k != 0:
         raise ValueError(f"split_k={split_k} must divide K/{block_k}={k_tiles}")
@@ -436,38 +529,53 @@ def _launch_wmma_tdm_dense_tiles(
         )
     if split_k > 1 and addends is not None:
         raise ValueError("the add3 epilogue needs split_k=1")
+    if fp8_out is not None and split_k == 1:
+        raise ValueError("the FP8 output is quantized by the split-K reduction")
     num_buffers = _dense_num_buffers(
         num_buffers,
         k_tiles // split_k,
-        triton.cdiv(n, block_n) * split_k * triton.cdiv(m, block_m),
+        groups * triton.cdiv(n, block_n) * split_k * triton.cdiv(m, block_m),
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
     )
     partial = (
-        torch.empty((split_k, m, n), device=A.device, dtype=torch.float32)
+        torch.empty((split_k, m, groups * n), device=A.device, dtype=torch.float32)
         if split_k > 1
         else out
     )
+    if out is None:
+        # Every program stores a partial; the FP8 reduction writes the result.
+        out = partial
+    if grouped:
+        group_strides = (A.stride(1), B.stride(0), out.stride(-2))
+        A, B = A[:, 0], B[0]
+        tile_out = out if out is partial else out[:, 0]
+    else:
+        group_strides = (0, 0, 0)
+        tile_out = out
     if addends is None:
         # None compiles the unused add3 operands out of the kernel arguments.
         addend_args = (None, None, None, None)
     else:
         addend_args = (*addends, addends[0].stride(0), addends[1].stride(0))
-    _wmma_tdm_dense_kernel[(triton.cdiv(n, block_n), split_k, triton.cdiv(m, block_m))](
+    _wmma_tdm_dense_kernel[
+        (groups * triton.cdiv(n, block_n), split_k, triton.cdiv(m, block_m))
+    ](
         A,
         B,
-        out,
+        tile_out,
         A.stride(0),
         A.stride(1),
         B.stride(0),
         B.stride(1),
-        out.stride(0),
-        out.stride(1),
+        tile_out.stride(0),
+        tile_out.stride(-1),
         partial,
         partial.stride(0),
         partial.stride(1),
         *addend_args,
+        *group_strides,
         ACTUAL_M=m,
         N=n,
         BLOCK_M=block_m,
@@ -479,12 +587,29 @@ def _launch_wmma_tdm_dense_tiles(
         WARP_BASES=warp_bases,
         EVEN_N=n % block_n == 0,
         ADD3=addends is not None,
+        GROUPS=groups,
         num_warps=1 << len(warp_bases),
         num_stages=1,
         waves_per_eu=1,
     )
-    if split_k > 1:
-        _reduce_dense_partials(partial, out)
+    if fp8_out is not None:
+        codes, scales = fp8_out
+        gluon_wmma_dense_reduce_fp8_gfx1250[
+            (m, triton.cdiv(groups * n, _REDUCE_BLOCK_N))
+        ](
+            partial,
+            codes,
+            scales,
+            partial.stride(0),
+            partial.stride(1),
+            groups * n,
+            SPLIT_K=split_k,
+            BLOCK=_REDUCE_BLOCK_N,
+            num_warps=4,
+            num_stages=1,
+        )
+    elif split_k > 1:
+        _reduce_dense_partials(partial, out.view(m, groups * n) if grouped else out)
 
 
 def _reduce_dense_partials(partial: torch.Tensor, out: torch.Tensor) -> None:
@@ -1810,9 +1935,132 @@ def gluon_mm_a16w16_gfx1250(
     return out
 
 
+def _mm_a16w16_fp8_tiles(
+    m: int, n: int, k: int
+) -> tuple[int, int, int, int, tuple[tuple[int, int], ...], int] | None:
+    """Return the dense tiles for a quantized ``[M, N]`` result, or None.
+
+    The split-K reduction writes the codes, so up to 32 rows trade the
+    unsplit tiles for 32-column tiles split K in two.
+    """
+    if m <= 32:
+        block_k = 256 if k % 256 == 0 else 128
+        if (k // block_k) % 2 or k // block_k < 4:
+            return None
+        if m <= 16:
+            return 16, 32, block_k, 6, _WARP_BASES_2, 2
+        return 32, 32, block_k, 6, _WARP_BASES_4, 2
+    tiles = _mm_a16w16_tiles(m, n, k)
+    return tiles if tiles is not None and tiles[5] > 1 else None
+
+
+def supports_gluon_grouped_mm_a16w16_fp8_gfx1250(
+    m: int, g: int, n: int, k: int
+) -> bool:
+    """Return whether the grouped GEMM can quantize its output here: the
+    dense tiles split K, so the reduction writes the codes."""
+    if not use_gluon_mm_a16w16_gfx1250(m, k, n) or n % 32:
+        return False
+    return _mm_a16w16_fp8_tiles(m, g * n, k) is not None
+
+
+def gluon_grouped_mm_a16w16_gfx1250(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    out: torch.Tensor | None,
+    quantize: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Compute ``out[:, g] = x[:, g] @ weight[g].T`` for every group in one grid.
+
+    Batches the dense tiles cover run every group in one launch (plus the
+    split-K reduction); larger ones run ``gluon_mm_a16w16_gfx1250`` per group.
+
+    Args:
+        x: BF16 ``[M, G, K]`` with unit inner stride; token and group strides
+            are free (e.g. a slice of padded attention heads).
+        weight: Contiguous BF16 ``[G, N, K]`` on x's device.
+        out: Optional contiguous BF16 ``[M, G, N]`` destination; None with
+            ``quantize``.
+        quantize: Return instead the group-32 E4M3 codes ``[M, G * N]`` and
+            uint8 UE8M0 scales ``[M, G * N / 32]`` of the BF16 result, which
+            needs ``supports_gluon_grouped_mm_a16w16_fp8_gfx1250``.
+
+    Returns:
+        BF16 ``[M, G, N]``, or (codes, scales) with ``quantize``.
+    """
+    if x.ndim != 3 or weight.ndim != 3:
+        raise ValueError("grouped GEMM expects [M, G, K] and [G, N, K]")
+    m, g, k = x.shape
+    n = weight.shape[1]
+    if weight.shape[0] != g or weight.shape[2] != k:
+        raise ValueError("grouped GEMM group/K mismatch")
+    if (
+        x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or not x.is_cuda
+        or weight.device != x.device
+        or x.stride(2) != 1
+        or not weight.is_contiguous()
+    ):
+        raise ValueError(
+            "x must be GPU BF16 with unit inner stride and weight contiguous "
+            "GPU BF16 colocated with x"
+        )
+    if not use_gluon_mm_a16w16_gfx1250(m, k, n):
+        raise ValueError(
+            f"grouped GEMM needs M >= 1, N % 16 == 0 and K % 128 == 0, "
+            f"got M={m}, N={n}, K={k}"
+        )
+    if quantize:
+        if out is not None:
+            raise ValueError("the quantized grouped GEMM allocates its output")
+        if not supports_gluon_grouped_mm_a16w16_fp8_gfx1250(m, g, n, k):
+            raise ValueError(f"no split-K grouped tiles for M={m} G={g} N={n} K={k}")
+        tiles = _mm_a16w16_fp8_tiles(m, g * n, k)
+        fp8_out = (
+            torch.empty((m, g * n), dtype=torch.float8_e4m3fn, device=x.device),
+            torch.empty((m, g * n // 32), dtype=torch.uint8, device=x.device),
+        )
+    else:
+        tiles = _mm_a16w16_tiles(m, g * n, k)
+        fp8_out = None
+        if out is None:
+            out = torch.empty((m, g, n), dtype=x.dtype, device=x.device)
+        elif (
+            tuple(out.shape) != (m, g, n)
+            or out.dtype != x.dtype
+            or out.device != x.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(f"out must be contiguous GPU BF16 ({m}, {g}, {n})")
+        if tiles is None:
+            for group in range(g):
+                gluon_mm_a16w16_gfx1250(
+                    x[:, group], weight[group], x.dtype, out=out[:, group]
+                )
+            return out
+    block_m, block_n, block_k, num_buffers, warp_bases, split_k = tiles
+    _launch_wmma_tdm_dense_tiles(
+        x,
+        weight,
+        out,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_buffers=num_buffers,
+        warp_bases=warp_bases,
+        split_k=split_k,
+        fp8_out=fp8_out,
+    )
+    return out if fp8_out is None else fp8_out
+
+
 __all__ = [
     "use_gluon_largem_gfx1250",
     "use_gluon_mm_a16w16_gfx1250",
+    "supports_gluon_grouped_mm_a16w16_fp8_gfx1250",
+    "gluon_grouped_mm_a16w16_gfx1250",
     "use_gluon_wmma_dense_gfx1250",
     "gluon_mm_a16w16_gfx1250",
     "gluon_mm_a16w16_largem_gfx1250",

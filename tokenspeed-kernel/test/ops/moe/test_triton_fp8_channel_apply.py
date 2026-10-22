@@ -44,6 +44,7 @@ def _plan(**overrides) -> dict:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
         # On SM100 and SM103 FlashInfer's TRT-LLM kernel ranks first.
         solution="triton",
     )

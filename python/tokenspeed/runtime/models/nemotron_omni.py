@@ -38,7 +38,7 @@ Each multimodal item fills one placeholder row per embedding, in order:
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 
 import torch
 from tokenspeed_kernel.ops.activation import relu2
@@ -53,12 +53,16 @@ from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.nemotron_h import NemotronHForCausalLM
 from tokenspeed.runtime.models.nemotron_h_nextn import NemotronHForCausalLMNextN
 from tokenspeed.runtime.models.parakeet import ParakeetEncoder
-from tokenspeed.runtime.models.radio import RadioVisionModel
+from tokenspeed.runtime.models.radio import (
+    RadioEncoderCudaGraphAdapter,
+    RadioVisionModel,
+)
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     MultimodalEmbedder,
     pad_input_tokens,
 )
+from tokenspeed.runtime.multimodal.encoder_cudagraph import EncoderForwardStepRunner
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
@@ -149,6 +153,9 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
         self.audio_tower: ParakeetEncoder | None = None
         self.audio_projector: NemotronOmniProjector | None = None
         self.multimodal_embedder: MultimodalEmbedder | None = None
+        self.image_encoder: (
+            Callable[[list[MultimodalDataItem]], torch.Tensor] | None
+        ) = None
         if not is_multimodal_active:
             return
 
@@ -189,6 +196,7 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
                 eps=sound.projection_eps,
             )
         self.multimodal_embedder = MultimodalEmbedder(encoder_mapping=mapping.vision)
+        self.image_encoder = self.get_image_feature
 
     def pad_input_ids(
         self, input_ids: list[int], mm_inputs: MultimodalInputs
@@ -272,12 +280,34 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
             )
         ]
 
+    def make_encoder_cudagraph_wrappers(
+        self, mapping: Mapping
+    ) -> dict[str, EncoderForwardStepRunner]:
+        vision = self.omni_config.vision_config
+        prefix = vision.num_prefix_tokens
+        smallest = vision.image_patch_floor + prefix
+        adapter = RadioEncoderCudaGraphAdapter(
+            tower=self.visual,
+            post_encode=self._project_vision,
+            max_image_tokens=vision.image_patch_budget + prefix,
+            capture_tp_size=mapping.vision.tp_size,
+            capture_tp_group=mapping.vision.tp_group,
+        )
+        # Budgets double from one smallest image to 32 of them, a prefill chunk.
+        return {
+            "image_encoder": EncoderForwardStepRunner(
+                adapter=adapter,
+                budget_range=(smallest, 32 * smallest),
+                max_metadata_sequences_per_batch=32,
+            )
+        }
+
     def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
         if self.visual is None:
             return {}
         specs = {
             Modality.IMAGE: EncoderSpec(
-                self.get_image_feature, make_warmup_items=self.make_image_warmup_items
+                self.image_encoder, make_warmup_items=self.make_image_warmup_items
             ),
             Modality.VIDEO: EncoderSpec(
                 self.get_video_feature, make_warmup_items=self.make_video_warmup_items

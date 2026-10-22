@@ -637,6 +637,7 @@ def _prepare_routed_weights(
         with_bias=False,
         fast_math=fast_math,
         combine_order="rank",
+        features=frozenset(),
         solution=None,
     )
     if weight_dtype_name == "fp8":

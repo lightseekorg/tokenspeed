@@ -141,7 +141,7 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   │                               sparse core keeps it (dsa_decode /
 │   │                               dsa_prefill slot_order trait); silent
 │   │                               kernels are refused rather than assumed
-│   └── per-row GEMMs               fixed-order GEMM leaves (see aok below)
+│   └── per-row GEMMs               fixed-order GEMM leaves (see plans below)
 ├── logprob.topology-invariant      (deferred) TP-invariant projection
 │                                   layouts on top of the vocab-block
 │                                   log-softmax of alignment.trainer
@@ -270,7 +270,7 @@ the contract tightens, and `rl-bitwise` neither selects nor refuses one.
 Within one deployment they keep the contract as follows.
 
 - Run and batch invariance hold under every layout. The head, dense and
-  LM-head GEMMs take the same `aok` pins as their replicated forms; the
+  LM-head GEMMs take the same batch-invariant plans as their replicated forms; the
   exchanges (token all-gather, all-gather of a reduction dimension, the
   even and uneven all-to-all transposes) are permutations of bytes and need
   no fold; the remaining reductions (`o_proj` and `down_proj` reduce-scatter
@@ -351,19 +351,66 @@ The registry's two matching mechanisms split the work:
   a leaf that affirmatively declares `features={"batch_invariant"}` is the
   only kind a batch-invariant request can be served by.
 
-Deterministic leaves live where any other vendor solution lives: registered
-under `solution="aok"` (the fixed-reduction-order operator kit: GEMM family
-including grouped MoE and BMM, lightning-indexer scoring, stable top-k with
-native forced initial/local windows, no-split sparse MLA attention) with the
-`batch_invariant` feature, at reference priority so `--numerics auto` never
-selects them. Under rl-bitwise each selection point on the served path pins
-that solution: the DSA backend's sparse decode and prefill, the MLA
-absorption and value projections, the dense and LM-head GEMMs, and the MoE
-plan (the envelope folds `--moe-backend auto` to `"aok"`, so the
-routed-expert apply plans through the ordinary `moe_plan(solution=...)`
-path). A pinned solution with no registered leaf fails selection at startup
-or at the first call instead of falling back — the FluentLLM discipline
-("no silent fallback") expressed through the existing registry.
+Batch-invariant leaves register the `batch_invariant` feature at the ordinary
+kernel boundary. The numerical envelope requires capabilities, not a provider
+name. Dense/LM-head and router projections, MLA absorption, sparse attention
+and expert execution bind their eligible implementations during initialization.
+MoE leaves additionally declare the requested routing and combine order;
+`--moe-backend auto` leaves provider selection to that constrained plan, while
+an explicit backend restricts its candidates without bypassing the capability
+check. Weight preparation and execution share the selected implementation.
+Missing capabilities fail planning instead of silently falling back. A capability
+declaration does not promise identical bits between different providers or
+agreement with a trainer; those comparisons need numerical acceptance for the
+chosen implementation and operation order.
+
+### Initialization-time kernel plans
+
+A numerical requirement is independent of its provider. Dense projections and
+absorbed MLA request the `batch_invariant` feature through a `KernelPlan`.
+Initialization filters by formats, hardware and static model geometry, then
+ranks once, with the kernel name breaking equal-score ties. No representative
+batch is used. Candidates constraining a variable dimension are excluded:
+its exact values or the registry's `_min`, `_max`, and `_align` bounds.
+Static semantic traits such as `topk_layout` remain independent of a variable
+`topk` dimension. Planning a bounded deployment domain is not currently supported.
+
+Execution validates the same formats and static traits and calls the saved
+implementation. It does not consult the registry, retune, or use an unplanned
+GEMV/fused fallback. A missing provider or an incompatible input fails. The
+provider's declaration covers its internal choices across the varying rows.
+`plan_dsa_topk` and `plan_mla_project_value` offer the same contract for the
+DSA indexer top-k and the MLA value projection: the index-key format, head
+geometry and slot order are static, while request counts and history lengths
+vary without provider selection. These operators run inside the model, so the
+model builds their plans and passes them in (`kernel_plan=` on
+`dsa_prefill_topk` / `dsa_decode_topk`, `plan=` on `mla_project_value`). No
+in-tree model plans them yet, since none is verified under `rl-bitwise` (see
+the per-model verification below); out-of-tree models that are verified are
+the current callers.
+Plans for different operators or phases still require cross-phase numerical
+acceptance; an individual capability declaration does not establish that.
+
+A planned attention leaf that can be recorded into a CUDA graph also declares
+the `cuda_graph` feature. `MLAAttnBackend` and `DSABackend` derive their graph
+support from the leaves they planned (`CudaGraphSupport.from_plans`), so a
+leaf without the feature runs eagerly instead of being captured; startup logs
+which backend disabled which graph.
+
+### Absorbed MLA
+
+Under a bitwise envelope, `MLAAttnBackend` plans the standard
+`mla_extend_with_kvcache` and `mla_decode_with_kvcache` operators with the
+`batch_invariant` requirement. Initial prefill and cached extend both prepare
+absorbed paged metadata, independent of the prefix length or query-length
+heuristic used in auto mode. The model supplies absorbed queries and writes
+the latent cache through its prepared-input path.
+
+The current absorbed extend interface cannot express a sliding window, so
+this path rejects windowed configurations rather than widening their mask.
+Value projection stays separate to preserve its explicit rounding boundary.
+Provider registration owns dtype, head geometry and hardware constraints.
+The ordinary auto envelope retains its existing dynamic selection policy.
 
 ## Logprobs: one arithmetic for prompt and output
 
@@ -373,7 +420,7 @@ consumers call: `log_softmax(logits, -1, dtype=float32)` gathered at the token
 under `torch`, Megatron's vocab-parallel cross-entropy order under `megatron`
 (alignment.trainer above) -- with the logits produced by the same LM-head
 route the sampler takes (`LogitsProcessor._get_logits`: quantized or dense
-GEMM, the `aok` GEMM under rl-bitwise, the TP gather, softcap). The sampler's
+GEMM, the planned batch-invariant GEMM under rl-bitwise, the TP gather, softcap). The sampler's
 output logprobs and the prompt (input) logprobs of the SGLang dialect
 (`LogitsProcessor.compute_input_token_logprobs`, requested through
 `return_logprob` + `logprob_start_len`) share that function, so the logprob of
@@ -574,3 +621,20 @@ quantized GEMM leaf exists, so their linears would select shape-dependent
 ones) and a vocabulary that is not a multiple of `MEGATRON_VOCAB_BLOCK`
 (the envelope's logprob order folds fixed blocks of it; MoE TP other than 1
 is refused by `resolve_numerics` for the same reason on the MoE side).
+
+### Shared torch-order correction-bias routing
+
+`torch_router_topk` in the runtime re-exports the kernel package's
+`torch_softmax_bias_topk`. Its arithmetic is unchanged: FP32 softmax, sorted
+PyTorch top-k on probabilities plus correction bias, gathering unbiased
+probabilities, scaling, then mapping identity candidates to -1. Exact ties
+retain PyTorch's order, not an independently imposed expert-ID order.
+
+Callers needing a frozen choice use `plan_softmax_bias_topk` and execute
+`softmax_bias_topk` with that plan. The registered batch-invariant domain is
+NVIDIA SM90+ with at most 2048 candidates; larger widths fail planning rather
+than inheriting an unvalidated claim. The direct torch entry keeps the existing
+runtime behavior on other platforms and widths. Tests preserve the old formula
+independently and compare weights/IDs byte-for-byte on ties, cutoff ties, bias,
+identity candidates, near ties, batch packing/reordering and CUDA graph replay.
+This does not promise cross-version PyTorch tie compatibility.

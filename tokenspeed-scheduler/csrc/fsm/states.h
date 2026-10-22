@@ -25,6 +25,7 @@
 
 #include "fsm/forward_states.h"
 #include "fsm/pd_states.h"
+#include "fsm/storage_states.h"
 
 // Put resources into each particular state
 namespace tokenspeed::fsm {

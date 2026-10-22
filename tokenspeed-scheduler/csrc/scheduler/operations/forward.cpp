@@ -282,31 +282,8 @@ bool Scheduler::admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback&
 
 Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   Request* request, std::int32_t remaining,
-                                                                  std::int32_t decode_input_tokens,
-                                                                  std::vector<PrefetchOperation>& prefetches) {
+                                                                  std::int32_t decode_input_tokens) {
     AdmissionMatch match = matchPrefixAtAdmission(request);
-    // L3 objects beyond the Host hit are fetched into Host BEFORE admission:
-    // the request waits (holding only the Host blocks being filled, no Device
-    // pages, no slot) and is admitted as an ordinary Host hit once they
-    // landed, so nothing an admission loads can miss. Below the threshold
-    // the pages are simply computed. The D role probes the Device alone and
-    // never gets here with a storage tier.
-    if (config_.enable_l3_storage && config_.role != Role::kD) {
-        if (std::optional<CacheCoordinator::PrefetchPlan> prefetch =
-                coordinator_.PlanPrefetch(match.probe, config_.l3_prefetch_min_pages)) {
-            std::vector<CacheBlockRef> host_blocks;
-            host_blocks.reserve(prefetch->rows.size());
-            for (const CacheCoordinator::PrefetchRow& row : prefetch->rows) {
-                host_blocks.push_back(row.host_block);
-            }
-            PrefetchOperation op = tier_transfers_.StartPrefetch(request->Id(), std::move(*prefetch));
-            spdlog::info("[Scheduler] prefetch: request {} waits for {} L3 page(s) beyond its Host hit", request->Id(),
-                         op.num_pages);
-            request->Apply(fsm::SchedulePrefetchEvent{std::move(host_blocks), op.op_id});
-            prefetches.push_back(std::move(op));
-            return FirstChunkOutcome{.prefetching = true};
-        }
-    }
     if (req_pool_allocator_.AvailableSlots() == 0) {
         return FirstChunkOutcome{};
     }
@@ -559,13 +536,16 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
 
 PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
                                                         std::vector<LoadBackOperation>& load_back_operations) {
+    const auto* admission = request->AdmissionResourcesPtr();
+    const auto storage_id = admission->storage_hold ? admission->storage_hold->operation_id : 0;
     PrefillOperation operation = applyPrefillEvent(*request, event, coordinator_, cache_group_ids_);
     std::vector<BlockTransfer> load_pairs = event.TakeLoadPairs();
-    if (load_pairs.empty()) {
-        return operation;
+    if (!load_pairs.empty()) {
+        load_back_operations.push_back(tier_transfers_.StartPrefixLoad(std::move(load_pairs)));
     }
-
-    load_back_operations.push_back(tier_transfers_.StartPrefixLoad(std::move(load_pairs)));
+    // Admission and the ordinary H2D ticket now own the Host sources. The
+    // Submitted state was consumed above, so retire its saved Ready hold here.
+    if (storage_id) storage_transfers_->Detach(storage_id);
     return operation;
 }
 
@@ -599,25 +579,21 @@ DecodeOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::Sc
     return operation;
 }
 
-std::optional<Scheduler::PrefillAdmission> Scheduler::schedulePrefillCandidate(
-    ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request, std::int32_t token_budget,
-    std::int32_t decode_reserve, std::vector<LoadBackOperation>& load_backs,
-    std::vector<PrefetchOperation>& prefetches) {
+std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
+                                                                    Request* request, std::int32_t token_budget,
+                                                                    std::int32_t decode_reserve,
+                                                                    std::vector<LoadBackOperation>& load_backs) {
     if (request->Is<fsm::Prefilling>()) {
         if (auto event = schedulePrefill(plan, feedback, request, token_budget, decode_reserve)) {
-            return PrefillAdmission{.operation = applyEventAndBuildOperation(request, std::move(*event))};
+            return applyEventAndBuildOperation(request, std::move(*event));
         }
         return std::nullopt;
     }
-    FirstChunkOutcome outcome =
-        schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve, prefetches);
-    if (outcome.prefetching) {
-        return PrefillAdmission{};
-    }
+    FirstChunkOutcome outcome = schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve);
     if (outcome.event) {
         PrefillOperation operation = applyEventAndBuildOperation(request, std::move(*outcome.event), load_backs);
         operation.state_prefix_cached = outcome.state_prefix_cached;
-        return PrefillAdmission{.operation = std::move(operation)};
+        return operation;
     }
     return std::nullopt;
 }
@@ -967,20 +943,15 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             // plan.remote_prefill beside whatever batch this round built.
             // Everything else is local prefill work joining the model batch.
             const std::int32_t budget = remote_grant ? blocker->PrefillSize() : build.token_budget;
-            if (auto admitted =
-                    schedulePrefillCandidate(build.plan, feedback, blocker, budget, config_.decode_input_tokens,
-                                             build.load_backs, build.prefetches)) {
-                if (!admitted->operation) {
-                    // The blocker went to prefetch its L3 prefix first; it is
-                    // admitted on the freed pages once that landed.
-                    build.scheduled.insert(blocker);
-                } else if (remote_grant) {
+            if (auto admitted = schedulePrefillCandidate(build.plan, feedback, blocker, budget,
+                                                         config_.decode_input_tokens, build.load_backs)) {
+                if (remote_grant) {
                     // The blocker is now RemotePrefilling: the peer's prefill
                     // is out against its pages (pdTransferInFlight).
                     build.scheduled.insert(blocker);
-                    build.remote_prefill.emplace_back(std::move(*admitted->operation));
+                    build.remote_prefill.emplace_back(std::move(*admitted));
                 } else {
-                    pushOperation(build, *blocker, std::move(*admitted->operation));
+                    pushOperation(build, *blocker, std::move(*admitted));
                     blocker->TrackScheduledForward();
                 }
                 return;
@@ -1167,14 +1138,8 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             }
             feedback.admission_failed = false;
             if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget,
-                                                         decode_reserve, build.load_backs, build.prefetches)) {
-                if (!admitted->operation) {
-                    // Gone to prefetch its L3 prefix (Prefetching): it holds
-                    // no head of line, so the prompts behind it go on.
-                    build.scheduled.insert(request);
-                    continue;
-                }
-                pushOperation(build, *request, std::move(*admitted->operation));
+                                                         decode_reserve, build.load_backs)) {
+                pushOperation(build, *request, std::move(*admitted));
                 request->TrackScheduledForward();
                 if (holdsHeadOfLine(*request)) {
                     return;
@@ -1281,14 +1246,10 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
                 continue;
             }
             feedback.admission_failed = false;
-            if (auto admitted =
-                    schedulePrefillCandidate(build.plan, feedback, request, request->PrefillSize(),
-                                             config_.decode_input_tokens, build.load_backs, build.prefetches)) {
-                // The D role probes the Device alone, so no admission here
-                // ever goes to prefetch.
-                _assert(admitted->operation.has_value(), "a D-role admission never prefetches from L3");
+            if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, request->PrefillSize(),
+                                                         config_.decode_input_tokens, build.load_backs)) {
                 build.scheduled.insert(request);
-                build.remote_prefill.emplace_back(std::move(*admitted->operation));
+                build.remote_prefill.emplace_back(std::move(*admitted));
                 break;
             }
             if (feedback.admission_failed) {
@@ -1358,7 +1319,6 @@ Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan
     return BuiltOperations{
         .forward = std::move(build.operations),
         .load_backs = std::move(build.load_backs),
-        .prefetches = std::move(build.prefetches),
         .snapshot_stores = std::move(build.snapshot_stores),
         .snapshot_restores = std::move(build.snapshot_restores),
     };

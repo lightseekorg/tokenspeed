@@ -172,7 +172,7 @@ def _adapted_ops():
     with patch.object(scheduler_utils, "Cache", fake_cache):
         ops = scheduler_utils.cache_ops_from_plan(
             SimpleNamespace(cache=[store, restore])
-        )
+        ).device
     (snapshot_op,) = [op for op in ops if isinstance(op, SnapshotOp)]
     (restore_op,) = [op for op in ops if isinstance(op, RestoreOp)]
     return snapshot_op, restore_op

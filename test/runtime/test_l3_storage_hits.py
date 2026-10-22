@@ -18,519 +18,685 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""L3 hooks tests with a real component and fake scheduler/device boundaries.
+"""Async L3 control feedback and immutable Host operation snapshots."""
 
-The hooks need neither EventLoop construction nor a model/GPU. Exercise the
-submit-time probe, the replica convergence of exists and of in-flight
-prefetches, and the loop's ordering of the convergence against the cache poll;
-loop-level tests separately cover centralized scheduler feedback.
-"""
-
-from __future__ import annotations
-
-import ast
-import inspect
-import os
-import sys
-from collections import deque
-from contextlib import nullcontext
-from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock
+import threading
+import time
+from test.l3_test_utils import storage_ops
 
 import pytest
+import tokenspeed_scheduler as ts
+from prometheus_client import CollectorRegistry
 
-# CPU-only tests scheduled with the other runtime hooks tests.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ci_system.ci_register import register_cuda_ci  # noqa: E402
-
-register_cuda_ci(est_time=10, suite="runtime-1gpu")
-
-from tokenspeed.runtime.engine import l3_cache_hooks as hooks_module  # noqa: E402
-from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks  # noqa: E402
-
-
-class _Scheduler:
-    def __init__(self) -> None:
-        self.submitted: list[list] = []
-        self.registered = None
-        self.hash_calls: list[list[int]] = []
-
-    def submit_requests(self, specs) -> None:
-        self.submitted.append(list(specs))
-
-    def prefix_hashes_for_tokens(self, tokens):
-        self.hash_calls.append(list(tokens))
-        return [f"h{len(tokens)}"]
-
-    def expand_prefix_keys(self, hashes):
-        return [0] * len(hashes), list(hashes), [0] * len(hashes)
-
-    def register_storage_keys(self, groups, hashes, offsets) -> None:
-        self.registered = (list(groups), list(hashes), list(offsets))
+from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
+from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
+from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
+from tokenspeed.runtime.cache.l3.metrics import L3Metrics
+from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks
 
 
-class _Device:
-    """The DeviceHandle surface the hooks use: the exists probe and the
-    prefetch lane's progress/completion."""
+class _Host:
+    """CPU allocation in place of the pinned allocation used for GPU copies."""
 
-    def __init__(self, exists_flags: list[bool] | None) -> None:
-        self.exists_flags = exists_flags
-        self.pages = None
-        self.progress: dict[int, tuple[bool, int]] = {}
-        self.completed: list[tuple[int, int]] = []
+    def __init__(self):
+        self.host_buffer = bytearray(256)
+        self.block_bytes = 8
 
-    def query_l3_storage(self, pages):
-        self.pages = list(pages)
-        return None if self.exists_flags is None else list(self.exists_flags)
-
-    def l3_prefetch_progress(self):
-        return dict(self.progress)
-
-    def complete_l3_prefetch(self, op_id, landed_pages) -> None:
-        self.completed.append((int(op_id), int(landed_pages)))
-        self.progress.pop(int(op_id))
+    def host_block_range(self, group, block):
+        assert group == 0
+        return (block - 1) * self.block_bytes, self.block_bytes
 
 
-class _Harness:
-    """Construct the real hooks with explicit scheduler/device dependencies."""
-
-    def __init__(self, exists_flags) -> None:
-        self.device = _Device(exists_flags)
-        self.scheduler = _Scheduler()
-        self.hooks = L3CacheHooks(
-            self.scheduler,
-            self.device if exists_flags is not None else None,
-            attn_tp_size=1,
-            attn_tp_cpu_group=None,
-            pp_size=1,
-            pp_cpu_group=None,
-        )
-
-
-def test_hooks_require_explicit_configuration() -> None:
-    for param in inspect.signature(L3CacheHooks.__init__).parameters.values():
-        assert param.default is inspect.Parameter.empty
-
-
-def test_l3_exists_reduce_doubles_require_op_and_group() -> None:
-    tree = ast.parse(Path(__file__).read_text())
-    found = False
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef) or node.name != "fake_all_reduce":
-            continue
-        found = True
-        defaults = dict(
-            zip((arg.arg for arg in node.args.kwonlyargs), node.args.kw_defaults)
-        )
-        assert node.args.defaults == []
-        assert defaults["op"] is None
-        assert defaults["group"] is None
-    assert found
-
-
-def _spec(rid: str, tokens: list[int]):
-    return SimpleNamespace(request_id=rid, tokens=tokens)
-
-
-def test_submit_without_l3_still_admits() -> None:
-    ctx = _Harness(exists_flags=None)
-    spec = _spec("r0", [1, 2, 3, 4])
-
-    ctx.hooks.submit_requests([spec])
-
-    assert ctx.scheduler.submitted == [[spec]]
-    assert ctx.scheduler.registered is None
-    assert ctx.scheduler.hash_calls == []
-    assert ctx.device.pages is None
-
-
-def test_submit_registers_only_keys_l3_reports_present() -> None:
-    ctx = _Harness(exists_flags=[True])
-    spec = _spec("r0", [1, 2, 3, 4])
-
-    ctx.hooks.submit_requests([spec])
-
-    assert ctx.scheduler.submitted == [[spec]]
-    assert ctx.scheduler.hash_calls == [[1, 2, 3, 4]]
-    assert ctx.device.pages == [(0, 0, "h4", 0)]
-    assert ctx.scheduler.registered == ([0], ["h4"], [0])
-
-
-def test_submit_skips_register_when_l3_misses() -> None:
-    ctx = _Harness(exists_flags=[False])
-    spec = _spec("r0", [1, 2, 3, 4])
-
-    ctx.hooks.submit_requests([spec])
-
-    assert ctx.scheduler.submitted == [[spec]]
-    assert ctx.scheduler.registered is None
-
-
-def test_replica_min_reduces_tp_then_pp(monkeypatch) -> None:
-    groups_seen = []
-
-    def fake_all_reduce(flags, *, op, group):
-        groups_seen.append(group)
-        flags.fill_(0)
-
-    monkeypatch.setattr(
-        "tokenspeed.runtime.engine.l3_cache_hooks.dist.all_reduce",
-        fake_all_reduce,
-    )
-
-    ctx = _Harness(exists_flags=[True])
-    ctx.hooks = L3CacheHooks(
-        ctx.scheduler,
-        ctx.device,
+def test_disabled_storage_admits_without_owner_agreement_or_storage_events():
+    config = ts.SchedulerConfig()
+    config.prefix_granularity = 2
+    config.num_snapshot_pages = 1
+    config.num_device_pages = 32
+    config.num_host_pages = 32
+    config.max_batch_size = 4
+    config.max_scheduled_tokens = 16
+    config.cache_groups = [ts.CacheGroupConfig("kv", 2, 32, ts.AttnKind.Full)]
+    scheduler = ts.Scheduler(config)
+    hooks = L3CacheHooks(
+        scheduler,
+        None,
+        config=None,
         attn_tp_size=2,
-        attn_tp_cpu_group="tp",
-        pp_size=2,
-        pp_cpu_group="pp",
-    )
-
-    ctx.hooks.submit_requests([_spec("r0", [1, 2, 3, 4])])
-
-    assert groups_seen == ["tp", "pp"]
-    assert ctx.scheduler.registered is None
-
-
-def test_pp_min_runs_when_attn_tp_is_one(monkeypatch) -> None:
-    groups_seen = []
-
-    def fake_all_reduce(flags, *, op, group):
-        groups_seen.append(group)
-
-    monkeypatch.setattr(
-        "tokenspeed.runtime.engine.l3_cache_hooks.dist.all_reduce",
-        fake_all_reduce,
-    )
-
-    ctx = _Harness(exists_flags=[True])
-    ctx.hooks = L3CacheHooks(
-        ctx.scheduler,
-        ctx.device,
-        attn_tp_size=1,
         attn_tp_cpu_group=None,
-        pp_size=2,
-        pp_cpu_group="pp",
-    )
-
-    ctx.hooks.submit_requests([_spec("r0", [1, 2, 3, 4])])
-
-    assert groups_seen == ["pp"]
-    assert ctx.scheduler.registered == ([0], ["h4"], [0])
-
-
-def test_exists_rpc_error_converges_as_misses() -> None:
-    """A local batch_exists exception must still enter the replica MIN."""
-
-    ctx = _Harness(exists_flags=[True])
-    probed: list[list[bool]] = []
-    bound = ctx.hooks._converge_l3_exists
-
-    def wrapped(exists):
-        probed.append(list(exists))
-        return bound(exists)
-
-    ctx.hooks._converge_l3_exists = wrapped
-
-    def boom(pages):
-        ctx.device.pages = list(pages)
-        raise RuntimeError("batch_is_exist failed")
-
-    ctx.device.query_l3_storage = boom
-    ctx.hooks.submit_requests([_spec("r0", [1, 2, 3, 4])])
-    assert probed == [[False]]
-    assert ctx.scheduler.registered is None
-
-
-def test_exists_length_mismatch_converges_as_misses() -> None:
-    ctx = _Harness(exists_flags=[True, True])
-    probed: list[list[bool]] = []
-    bound = ctx.hooks._converge_l3_exists
-
-    def wrapped(exists):
-        probed.append(list(exists))
-        return bound(exists)
-
-    ctx.hooks._converge_l3_exists = wrapped
-    ctx.hooks.submit_requests([_spec("r0", [1, 2, 3, 4])])
-    assert probed == [[False]]
-    assert ctx.scheduler.registered is None
-
-
-def test_empty_submit_does_not_probe() -> None:
-    ctx = _Harness(exists_flags=[True])
-    ctx.hooks.submit_requests([])
-    assert ctx.scheduler.submitted == [[]]
-    assert ctx.scheduler.hash_calls == []
-    assert ctx.device.pages is None
-
-
-# ----------------------------------------------------------------------
-# Per-round convergence of in-flight prefetches
-# ----------------------------------------------------------------------
-
-
-def test_converge_completes_only_ops_every_rank_finished(monkeypatch) -> None:
-    """The replica MIN of (done, landed): a rank still fetching holds the op
-    (its landed count is the sentinel), a finished one is completed with the
-    common prefix, and the collective runs once per round in TP-then-PP order
-    over the mirrored op-id set."""
-    reductions = []
-
-    def fake_all_reduce(flags, *, op, group):
-        reductions.append((group, flags.tolist()))
-        # The peer: op 3 done with 2 pages, op 5 still fetching, op 8 done with 7.
-        peer = {3: (1, 2), 5: (0, hooks_module._UNLANDED), 8: (1, 7)}
-        for index, op_id in enumerate((3, 5, 8)):
-            flags[2 * index] = min(int(flags[2 * index]), peer[op_id][0])
-            flags[2 * index + 1] = min(int(flags[2 * index + 1]), peer[op_id][1])
-
-    monkeypatch.setattr(hooks_module.dist, "all_reduce", fake_all_reduce)
-    ctx = _Harness(exists_flags=[True])
-    ctx.hooks = L3CacheHooks(
-        ctx.scheduler,
-        ctx.device,
-        attn_tp_size=2,
-        attn_tp_cpu_group="tp",
-        pp_size=2,
-        pp_cpu_group="pp",
-    )
-    # This rank: op 3 landed 4 (the peer only 2), op 5 done with 1 (the peer
-    # is not done), op 8 landed 7 (agreed).
-    ctx.device.progress = {8: (True, 7), 3: (True, 4), 5: (True, 1)}
-
-    ctx.hooks.converge_prefetches()
-
-    assert [group for group, _ in reductions] == ["tp", "pp"]
-    assert reductions[0][1] == [1, 4, 1, 1, 1, 7]  # op-id order: 3, 5, 8
-    assert ctx.device.completed == [(3, 2), (8, 7)]
-    assert ctx.device.progress == {5: (True, 1)}
-
-
-def test_converge_is_a_no_op_with_nothing_in_flight_or_without_l3(monkeypatch) -> None:
-    def fake_all_reduce(flags, *, op, group):
-        raise AssertionError("no collective without an in-flight prefetch")
-
-    monkeypatch.setattr(hooks_module.dist, "all_reduce", fake_all_reduce)
-    ctx = _Harness(exists_flags=[True])
-    ctx.hooks = L3CacheHooks(
-        ctx.scheduler,
-        ctx.device,
-        attn_tp_size=2,
-        attn_tp_cpu_group="tp",
         pp_size=1,
         pp_cpu_group=None,
+        metrics=None,
     )
-    ctx.hooks.converge_prefetches()
-    assert ctx.device.completed == []
-    _Harness(exists_flags=None).hooks.converge_prefetches()
+    request = ts.RequestSpec()
+    request.request_id = "plain"
+    request.tokens = [1, 2, 3, 4]
+    scheduler.submit_requests([request])
+    assert hooks.poll_ready_events(allow_forward=True, allow_storage=True) == []
+    hooks.record_metrics()
+    assert not hooks.cancel_request("plain")
+    plan = scheduler.next_execution_plan()
+    assert [rid for batch in plan.forward for rid in batch.request_ids] == ["plain"]
+    assert list(plan.forward[0].extend_prefix_lens) == [0]
+    assert not storage_ops(plan)
 
 
-def test_single_rank_converges_locally() -> None:
-    ctx = _Harness(exists_flags=[True])
-    ctx.device.progress = {2: (False, 0), 4: (True, 3)}
-    ctx.hooks.converge_prefetches()
-    assert ctx.device.completed == [(4, 3)]
-    assert ctx.device.progress == {2: (False, 0)}
+class _ControlledMemoryStore(MemoryKvStore):
+    """Real memory reads with a controllable transport stall or failure."""
 
+    def __init__(self):
+        super().__init__()
+        self.read_started = threading.Event()
+        self.release_reads = threading.Event()
+        self.release_reads.set()
+        self.fail_next_read = False
 
-def test_the_hooks_no_longer_skip_forwards_or_reprobe_queued_hits() -> None:
-    # Only the L3-to-Host leg can miss, and it runs before admission: the
-    # hooks have no forward to skip, nothing to retract and no queue to
-    # re-probe. The surface is the submit-time probe and the convergence.
-    public = sorted(name for name in vars(L3CacheHooks) if not name.startswith("_"))
-    assert public == ["converge_prefetches", "submit_requests"]
+    def batch_get_into_result(self, keys, host_buffer, offsets, sizes):
+        self.read_started.set()
+        if not self.release_reads.wait(5):
+            raise TimeoutError("Test did not release the storage read")
+        if self.fail_next_read:
+            self.fail_next_read = False
+            raise OSError("Storage transport failed before writing Host bytes")
+        return super().batch_get_into_result(keys, host_buffer, offsets, sizes)
 
 
 @pytest.fixture
-def loop_methods():
-    # Load the actual scheduling methods without importing model/GPU backends.
-    # No rewriting: the collaborator boundaries below are the same ones the
-    # running loop uses. This keeps the complete round test runnable on CPU.
-    path = (
-        Path(__file__).resolve().parents[2]
-        / "python/tokenspeed/runtime/engine/event_loop.py"
+def runtime():
+    config = StorageRuntimeConfig.from_extra_config(
+        '{"async":{"read_workers":1,"max_operations":2}}',
+        host_blocks=31,
+        prefix_granularity=2,
     )
-    cls = next(
-        node
-        for node in ast.parse(path.read_text()).body
-        if isinstance(node, ast.ClassDef) and node.name == "EventLoop"
+    host = _Host()
+    backend = _ControlledMemoryStore()
+    now = [time.monotonic()]
+    executor = L3Executor(
+        backend,
+        host,
+        key_prefix="old",
+        rank=0,
+        ownership=None,
+        config=config,
+        prefix_for_weight_version=lambda version: f"new-{version}",
+        clock=lambda: now[0],
     )
-    names = {"event_loop", "_drain_in_flight", "_get_forward_op"}
-    methods = [
-        node
-        for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name in names
+    try:
+        yield config, host, backend, executor, now
+    finally:
+        backend.release_reads.set()
+        executor.close(timeout_s=2)
+
+
+def _scheduler(config):
+    cfg = ts.SchedulerConfig()
+    cfg.prefix_granularity = 2
+    cfg.num_snapshot_pages = 1
+    cfg.num_device_pages = 32
+    cfg.num_host_pages = 32
+    cfg.max_batch_size = 4
+    cfg.max_scheduled_tokens = 16
+    cfg.enable_l3_storage = True
+    cfg.storage_config = config.scheduler
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id="kv",
+            block_granularity=2,
+            total_pages=32,
+            attn_kind=ts.AttnKind.Full,
+        )
     ]
-    namespace = {
-        "deque": deque,
-        "maybe_control_plane_guard": nullcontext,
-        # The loop labels its scheduler calls for the torch profiler; here
-        # that is a no-op context like the control-plane guard.
-        "torch": SimpleNamespace(
-            profiler=SimpleNamespace(record_function=lambda _name: nullcontext())
-        ),
-        "PlannedForward": SimpleNamespace,
-        "ngram_inputs_for_forward": lambda *args: None,
-        "input_logprob_plan_for_forward": lambda *args: None,
-        "sampled_top_k_for_forward": lambda *args: 0,
-        "advance_scheduler": lambda scheduler, events: scheduler.advance(events),
-    }
-    exec(
-        compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"), namespace
-    )
-    return namespace
+    scheduler = ts.Scheduler(cfg)
+    _send(scheduler, ts.Cache.StorageTick(1, True, True, ts.StoragePressure(0, 0, 0)))
+    return scheduler
 
 
-@pytest.mark.parametrize("depth", [0, 1, 4])
-@pytest.mark.parametrize("has_dp", [False, True])
-def test_prefetch_convergence_precedes_the_rounds_cache_poll(
-    loop_methods, monkeypatch, depth, has_dp
-) -> None:
-    """Each round converges the in-flight prefetches before the cache poll,
-    so an op that landed is acknowledged in that round and reaches the
-    scheduler at the head advance; the forward is never touched and the
-    remote prefill always goes out."""
-    trace = []
-    first_forward = SimpleNamespace(request_ids=["running"], input_lengths=[1])
-    first_plan = SimpleNamespace(
-        forward=[first_forward], remote_prefill=None, aborts=[]
-    )
-    second_plan = SimpleNamespace(
-        forward=[], remote_prefill=SimpleNamespace(request_ids=["remote"]), aborts=[]
-    )
-    plans = iter([first_plan, second_plan])
-
-    def next_plan():
-        plan = next(plans)
-        trace.append(("plan", plan))
-        return plan
-
-    scheduler = SimpleNamespace(
-        next_execution_plan=next_plan,
-        advance=lambda events: trace.append(("advance", list(events))),
-    )
-
-    def execute(plan, planned):
-        trace.append(("execute", plan, planned))
-        return object() if planned is not None else None
-
-    progress = {7: (False, 0)}
-
-    def l3_prefetch_progress():
-        trace.append(("progress", dict(progress)))
-        return dict(progress)
-
-    def complete_l3_prefetch(op_id, landed):
-        trace.append(("complete", op_id, landed))
-        progress.pop(op_id)
-
-    device = SimpleNamespace(
-        query_l3_storage=lambda pages: [True],
-        l3_prefetch_progress=l3_prefetch_progress,
-        complete_l3_prefetch=complete_l3_prefetch,
-        execute=execute,
-        run_idle_forward=lambda metadata: trace.append(("idle",)),
-    )
-    hooks = L3CacheHooks(
+def _hooks(scheduler, executor, config, metrics):
+    return L3CacheHooks(
         scheduler,
-        device,
+        executor,
+        config=config.scheduler,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
         pp_size=1,
         pp_cpu_group=None,
+        metrics=metrics,
     )
 
-    def poll_ready_events():
-        trace.append(("poll",))
-        # The lane lands op 7 between the rounds; the second round's
-        # convergence completes it and this poll yields its ACK.
-        if ("complete", 7, 3) in trace:
-            return ["prefetch_done:7"]
-        progress[7] = (True, 3)
-        return ["cache0"]
 
-    def commit(forward, result):
-        assert forward is first_forward
-        trace.append(("commit",))
-        return ["committed:running"]
+def _send(scheduler, event):
+    message = ts.ExecutionEvent()
+    message.add_event(event)
+    scheduler.advance(message)
 
-    loop = SimpleNamespace(
-        in_flight_depth=depth,
-        _shutdown_complete=Mock(side_effect=[False, False, True]),
-        _process_new_requests=Mock(),
-        _get_forward_op=lambda plan: loop_methods["_get_forward_op"](loop, plan),
-        _drain_in_flight=lambda pending: loop_methods["_drain_in_flight"](
-            loop, pending
+
+def _query(scheduler, request_id):
+    request = ts.RequestSpec()
+    request.request_id = request_id
+    request.tokens = list(range(8))
+    request.max_new_tokens = 2
+    scheduler.submit_requests([request])
+    operation = storage_ops(scheduler.next_execution_plan())[0]
+    assert operation.kind == ts.StorageKind.Query
+    return operation
+
+
+def _keys(executor, operation):
+    return [executor._object_key(h, g, o) for g, h, o in operation.keys]
+
+
+def _seed(backend, keys, payload):
+    assert backend.batch_put_from(
+        keys,
+        bytearray(payload * len(keys)),
+        tuple(8 * i for i in range(len(keys))),
+        (8,) * len(keys),
+    ) == [True] * len(keys)
+
+
+def _wait_until(predicate):
+    deadline = time.perf_counter() + 3
+    while not predicate():
+        assert time.perf_counter() < deadline, "Storage worker did not finish"
+        time.sleep(0.001)
+
+
+def _completions(executor, count):
+    results = []
+
+    def finished():
+        results.extend(executor.poll().completions)
+        return len(results) >= count
+
+    _wait_until(finished)
+    assert len(results) == count
+    return results
+
+
+def _finish(scheduler, result):
+    _send(
+        scheduler,
+        ts.Cache.StorageDone(
+            result.op_id,
+            list(result.success),
+            result.retired,
+            list(result.object_failures),
         ),
-        _epd_hooks=SimpleNamespace(
-            drain_ready_embeddings=Mock(), assert_embeddings_received=Mock()
-        ),
-        _eplb_hooks=SimpleNamespace(note_round=Mock()),
-        _gc_hooks=SimpleNamespace(note_round=Mock()),
-        _cache_hooks=SimpleNamespace(
-            poll_ready_events=poll_ready_events, count_plan_ops=Mock(return_value=0)
-        ),
-        _l3_hooks=hooks,
-        _pause=SimpleNamespace(forward_blocked=False, maybe_finish_drain=Mock()),
-        scheduler=scheduler,
-        _device=device,
-        _get_scheduler_stats=Mock(return_value={}),
-        load_reporter=SimpleNamespace(observe=Mock()),
-        _num_running=Mock(return_value=1),
-        _record_scheduler_iteration_metrics=Mock(),
-        has_dp=has_dp,
-        _dp_sync_and_check=lambda forward: SimpleNamespace(
-            need_idle_forward=forward is None
-        ),
-        _gather_sampling_params=Mock(return_value=[]),
-        _gather_stop_criteria=Mock(return_value=()),
-        _gather_grammar_state=Mock(return_value=None),
-        output_processor=SimpleNamespace(
-            rid_to_state={},
-            finish_scheduler_aborted_requests=lambda aborts: trace.append(
-                ("aborts", list(aborts))
-            ),
-        ),
-        _ngram_context_len=0,
-        _request_history_rows=None,
-        _dispatch_depends_on_pending_commit=Mock(return_value=False),
-        _mark_stats_scheduled=Mock(),
-        _record_request_queue_time=Mock(),
-        _batch_logger=SimpleNamespace(log_dispatch=Mock()),
-        model_config=SimpleNamespace(is_multimodal_active=False),
-        _pd_hooks=SimpleNamespace(poll_transfer_events=Mock(return_value=[])),
-        _commit_forward_results=commit,
-        _publish_scheduler_kv_events=Mock(),
     )
-    loop_methods["event_loop"](loop)
-
-    executions = [entry for entry in trace if entry[0] == "execute"]
-    assert len(executions) == 2
-    assert executions[0][2].forward_op is first_forward
-    # The plan's remote prefill is submitted unconditionally: no withhold.
-    assert executions[1] == ("execute", second_plan, None)
-    assert sum(entry[0] == "idle" for entry in trace) == int(has_dp)
-    # Round 1: the op is still fetching; round 2: converged and acknowledged
-    # before the poll, so the ACK reaches the scheduler at the head.
-    kinds = [entry[0] for entry in trace]
-    first_progress = kinds.index("progress")
-    assert kinds[first_progress + 1] == "poll"
-    assert ("complete", 7, 3) in trace
-    assert kinds.index("complete") < kinds.index("poll", kinds.index("complete"))
-    advances = [entry[1] for entry in trace if entry[0] == "advance"]
-    if depth == 0:
-        assert advances == [["cache0"], ["committed:running"], ["prefetch_done:7"]]
-    else:
-        assert advances == [["cache0"], ["prefetch_done:7"], ["committed:running"]]
-    for plan in (first_plan, second_plan):
-        plan_index = trace.index(("plan", plan))
-        assert trace[plan_index + 1] == ("aborts", [])
-    loop._cache_hooks.count_plan_ops.assert_any_call(second_plan)
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
+def _get_descriptor(config, backend, executor):
+    scheduler = _scheduler(config)
+    query = _query(scheduler, "snapshot")
+    keys = _keys(executor, query)
+    _seed(backend, keys, b"snapshot")
+    _send(
+        scheduler,
+        ts.Cache.StorageDone(
+            query.op_id, backend.batch_exists(keys), True, [False] * len(keys)
+        ),
+    )
+    operation = storage_ops(scheduler.next_execution_plan())[0]
+    assert operation.kind == ts.StorageKind.Get
+    return scheduler, operation, keys
+
+
+def test_parsed_storage_deadline_controls_scheduler_admission():
+    config = StorageRuntimeConfig.from_extra_config(
+        '{"async":{"wait_timeout_ms":7,"metadata_entries":124}}',
+        host_blocks=31,
+        prefix_granularity=2,
+    )
+    scheduler = _scheduler(config)
+    query = _query(scheduler, "deadline")
+    _send(
+        scheduler,
+        ts.Cache.StorageTick(7000, True, True, ts.StoragePressure(0, 0, 0)),
+    )
+    assert not any(
+        batch.request_ids for batch in scheduler.next_execution_plan().forward
+    )
+    _send(
+        scheduler,
+        ts.Cache.StorageTick(7002, True, True, ts.StoragePressure(0, 0, 0)),
+    )
+    plan = scheduler.next_execution_plan()
+    assert [rid for batch in plan.forward for rid in batch.request_ids] == ["deadline"]
+    assert scheduler.storage_stats().wait_timeouts == 1
+    cancellations = storage_ops(plan)
+    assert len(cancellations) == 1
+    assert cancellations[0].kind == ts.StorageKind.Cancel
+    assert cancellations[0].op_id == query.op_id
+
+
+def test_local_completion_is_reported_once_and_does_not_select_a_prefix(runtime):
+    config, host, backend, executor, _ = runtime
+    scheduler = _scheduler(config)
+    h = _hooks(scheduler, executor, config, None)
+    _seed(backend, ["present"], b"restored")
+    executor.submit(StorageJob(7, "get", ("present", "missing"), (0, 8), (8, 8)))
+    events = []
+
+    def reported():
+        events.extend(h.poll_ready_events(allow_forward=True, allow_storage=True)[1:])
+        return bool(events)
+
+    _wait_until(reported)
+    assert len(events) == 1
+    assert events[0].op_id == 7
+    assert list(events[0].success) == [1, 0]
+    assert list(events[0].object_failures) == [0, 1]
+    assert host.host_buffer[:16] == b"restored" + bytes(8)
+    assert len(h.poll_ready_events(allow_forward=False, allow_storage=False)) == 1
+    assert not scheduler.storage_pending()
+    assert all(
+        not batch.request_ids for batch in scheduler.next_execution_plan().forward
+    )
+
+
+def test_storage_ranges_and_namespace_are_captured_before_queueing(runtime):
+    config, host, backend, executor, _ = runtime
+    _, operation, keys = _get_descriptor(config, backend, executor)
+    ranges = [
+        host.host_block_range(g, b)
+        for (g, _, _), b in zip(operation.keys, operation.host_blocks, strict=True)
+    ]
+    _seed(backend, ["blocker"], b"blocking")
+    backend.release_reads.clear()
+    executor.submit(StorageJob(1, "get", ("blocker",), (240,), (8,)))
+    assert backend.read_started.wait(2)
+    executor.submit_operations([operation])
+    # Bypass the management guard only to expose descriptor lifetime: workers
+    # must consume the namespace and byte ranges captured at submission.
+    executor._key_prefix = "changed"
+    host.block_bytes = 16
+    _seed(backend, _keys(executor, operation), b"wrong!!!")
+    backend.release_reads.set()
+    results = _completions(executor, 2)
+    assert all(result.retired and all(result.success) for result in results)
+    for offset, size in ranges:
+        assert host.host_buffer[offset : offset + size] == b"snapshot"
+    assert backend.batch_exists(keys) == [True] * len(keys)
+    executor.set_weight_version("v2")
+    assert executor.key_prefix == "new-v2"
+
+
+def test_cancelled_queued_scheduler_get_retires_without_writing_host(runtime):
+    config, host, backend, executor, _ = runtime
+    scheduler, operation, _ = _get_descriptor(config, backend, executor)
+    _seed(backend, ["blocker"], b"blocking")
+    backend.release_reads.clear()
+    executor.submit(StorageJob(1, "get", ("blocker",), (240,), (8,)))
+    assert backend.read_started.wait(2)
+    executor.submit_operations([operation])
+    aborted = ts.ForwardEvent.Abort()
+    aborted.request_id = "snapshot"
+    _send(scheduler, aborted)
+    cancellations = storage_ops(scheduler.next_execution_plan())
+    assert len(cancellations) == 1 and cancellations[0].kind == ts.StorageKind.Cancel
+    executor.submit_operations(cancellations)
+    result = _completions(executor, 1)[0]
+    assert result.op_id == operation.op_id and result.retired
+    assert not any(result.success) and not any(result.object_failures)
+    assert host.host_buffer[:240] == bytes(240)
+    backend.release_reads.set()
+    assert _completions(executor, 1)[0].op_id == 1
+    assert host.host_buffer[:240] == bytes(240)
+
+
+def test_expired_queued_get_retires_while_active_get_keeps_host_references(runtime):
+    config, host, backend, executor, _ = runtime
+    scheduler, active, _ = _get_descriptor(config, backend, executor)
+    backend.release_reads.clear()
+    executor.submit_operations([active])
+    assert backend.read_started.wait(2)
+
+    query = _query(scheduler, "queued")
+    keys = _keys(executor, query)
+    _send(
+        scheduler,
+        ts.Cache.StorageDone(
+            query.op_id, backend.batch_exists(keys), True, [False] * len(keys)
+        ),
+    )
+    queued = storage_ops(scheduler.next_execution_plan())[0]
+    assert queued.kind == ts.StorageKind.Get
+    executor.submit_operations([queued])
+
+    # Both deadlines include queue wait. Expiration permits ordinary admission
+    # while the active native call still owns its destinations.
+    _send(
+        scheduler,
+        ts.Cache.StorageTick(
+            config.scheduler.wait_timeout_us + 2,
+            True,
+            True,
+            ts.StoragePressure(0, 0, 0),
+        ),
+    )
+    plan = scheduler.next_execution_plan()
+    assert {rid for batch in plan.forward for rid in batch.request_ids} == {
+        "snapshot",
+        "queued",
+    }
+    assert all(
+        prefix == 0 for batch in plan.forward for prefix in batch.extend_prefix_lens
+    )
+    assert scheduler.storage_stats().wait_timeouts == 2
+    cancellations = storage_ops(plan)
+    assert {op.op_id for op in cancellations} == {active.op_id, queued.op_id}
+    assert all(op.kind == ts.StorageKind.Cancel for op in cancellations)
+    executor.submit_operations(cancellations)
+
+    result = _completions(executor, 1)[0]
+    assert result.op_id == queued.op_id and result.retired
+    assert not any(result.success) and not any(result.object_failures)
+    _finish(scheduler, result)
+    assert not executor.poll().completions  # Repeated polling cannot replay the ACK.
+    assert scheduler.storage_held_blocks() == len(active.host_blocks)
+    assert scheduler.storage_pending()
+    assert executor.delete_namespace() is False
+    with pytest.raises(RuntimeError, match="must retire"):
+        executor.set_weight_version("v2")
+    assert host.host_buffer == bytes(len(host.host_buffer))
+
+    backend.release_reads.set()
+    result = _completions(executor, 1)[0]
+    assert result.op_id == active.op_id and result.retired and all(result.success)
+    _finish(scheduler, result)
+    assert not scheduler.storage_pending()
+    assert scheduler.storage_held_blocks() == 0
+    assert scheduler.host_pool_cached_blocks() == 0  # Detached reads cannot publish.
+    for block in active.host_blocks:
+        offset, size = host.host_block_range(0, block)
+        assert host.host_buffer[offset : offset + size] == b"snapshot"
+    for block in queued.host_blocks:
+        offset, size = host.host_block_range(0, block)
+        assert host.host_buffer[offset : offset + size] == bytes(size)
+    executor.set_weight_version("v2")
+
+
+@pytest.mark.parametrize("phase", ["running", "ready", "detached"])
+def test_reused_warm_host_address_preserves_get_results(phase):
+    config = StorageRuntimeConfig.from_extra_config(
+        '{"async":{"read_workers":1,"max_operations":2,"max_host_blocks":2}}',
+        host_blocks=2,
+        prefix_granularity=2,
+    )
+    host = _Host()
+    backend = _ControlledMemoryStore()
+    cfg = ts.SchedulerConfig()
+    cfg.prefix_granularity = 2
+    cfg.num_snapshot_pages = 1
+    cfg.num_device_pages = 32
+    cfg.num_host_pages = 3  # Two usable Host slots: one warm and one GET destination.
+    cfg.max_batch_size = 4
+    cfg.max_scheduled_tokens = 8
+    cfg.enable_l3_storage = True
+    cfg.storage_config = config.scheduler
+    cfg.cache_groups = [ts.CacheGroupConfig("kv", 2, 32, ts.AttnKind.Full)]
+    scheduler = ts.Scheduler(cfg)
+    _send(scheduler, ts.Cache.StorageTick(1, False, True, ts.StoragePressure(0, 0, 0)))
+    executor = L3Executor(
+        backend,
+        host,
+        key_prefix="warm-lifetime",
+        rank=0,
+        ownership=None,
+        config=config,
+        prefix_for_weight_version=None,
+    )
+
+    def prepare_read(request_id, tokens, bound, payload):
+        spec = ts.RequestSpec()
+        spec.request_id = request_id
+        spec.tokens = tokens
+        spec.max_cached_prefix_tokens = bound
+        scheduler.submit_requests([spec])
+        operations = storage_ops(scheduler.next_execution_plan())
+        assert len(operations) == 1 and operations[0].kind == ts.StorageKind.Query
+        query = operations[0]
+        _seed(backend, _keys(executor, query), payload)
+        executor.submit_operations([query])
+        _finish(scheduler, _completions(executor, 1)[0])
+        operations = storage_ops(scheduler.next_execution_plan())
+        assert len(operations) == 1 and operations[0].kind == ts.StorageKind.Get
+        return operations[0]
+
+    try:
+        seed = prepare_read("seed", [0, 1, 2], 2, b"warmdata")
+        executor.submit_operations([seed])
+        _finish(scheduler, _completions(executor, 1)[0])
+        assert not any(
+            batch.request_ids for batch in scheduler.next_execution_plan().forward
+        )
+        abort = ts.ForwardEvent.Abort()
+        abort.request_id = "seed"
+        _send(scheduler, abort)
+        scheduler.next_execution_plan()
+        assert scheduler.storage_held_blocks() == 0
+        assert scheduler.host_pool_cached_blocks() == 1
+
+        active = prepare_read("active", [0, 1, 2, 3, 4], 4, b"readback")
+        backend.read_started.clear()
+        backend.release_reads.clear()
+        executor.submit_operations([active])
+        assert backend.read_started.wait(2)
+        assert scheduler.storage_held_blocks() == len(active.host_blocks)
+        if phase == "ready":
+            backend.release_reads.set()
+            _finish(scheduler, _completions(executor, 1)[0])
+            scheduler.next_execution_plan()
+            assert scheduler.storage_stats().ready_requests == 1
+
+        # A second real reservation must evict the old warm entry and reuse
+        # its address while the first GET or Ready hold owns its destination.
+        replacement = prepare_read("replacement", [10, 11, 12], 2, b"newowner")
+        assert list(replacement.host_blocks) == list(seed.host_blocks)
+        warm_offset, size = host.host_block_range(0, replacement.host_blocks[0])
+        host.host_buffer[warm_offset : warm_offset + size] = b"newowner"
+        if phase == "detached":
+            abort = ts.ForwardEvent.Abort()
+            abort.request_id = "active"
+            _send(scheduler, abort)
+            executor.submit_operations(storage_ops(scheduler.next_execution_plan()))
+
+        if phase != "ready":
+            backend.release_reads.set()
+            result = _completions(executor, 1)[0]
+            assert (
+                result.op_id == active.op_id and result.retired and all(result.success)
+            )
+            _finish(scheduler, result)
+        assert host.host_buffer[warm_offset : warm_offset + size] == b"newowner"
+        offset, size = host.host_block_range(0, active.host_blocks[0])
+        assert host.host_buffer[offset : offset + size] == b"readback"
+        _send(
+            scheduler, ts.Cache.StorageTick(2, True, True, ts.StoragePressure(0, 0, 0))
+        )
+        plan = scheduler.next_execution_plan()
+        if phase == "detached":
+            assert not any(batch.request_ids for batch in plan.forward)
+        else:
+            assert list(plan.forward[0].request_ids) == ["active"]
+            assert list(plan.forward[0].extend_prefix_lens) == [0]
+
+        executor.submit_operations([replacement])
+        _finish(scheduler, _completions(executor, 1)[0])
+        plan = scheduler.next_execution_plan()
+        batch = next(
+            batch for batch in plan.forward if "replacement" in batch.request_ids
+        )
+        index = list(batch.request_ids).index("replacement")
+        assert batch.extend_prefix_lens[index] == 2
+        assert scheduler.storage_held_blocks() == 0
+        assert (
+            scheduler.host_pool_pinned_blocks() > 0
+        )  # Ordinary H2D owns the new prefix.
+        for operation in plan.cache:
+            if isinstance(operation, ts.Cache.LoadBackOp):
+                for op_id in operation.op_ids:
+                    _send(scheduler, ts.Cache.LoadBackDoneEvent(op_id))
+        assert scheduler.storage_quarantined() == 0
+    finally:
+        backend.release_reads.set()
+        executor.close(timeout_s=2)
+
+
+def test_namespace_mutation_rejects_inflight_io_without_waiting(runtime):
+    _, host, backend, executor, _ = runtime
+    old_key = executor._object_key("hash", 0, 0)
+    _seed(backend, [old_key, "other_hash"], b"original")
+    backend.release_reads.clear()
+    executor.submit(StorageJob(1, "get", (old_key,), (0,), (8,)))
+    assert backend.read_started.wait(2)
+    started = time.perf_counter()
+    assert executor.delete_namespace() is False
+    with pytest.raises(RuntimeError, match="must retire"):
+        executor.set_weight_version("v2")
+    assert time.perf_counter() - started < 1
+    assert not backend.release_reads.is_set()
+    assert executor.key_prefix == "old"
+    assert backend.batch_exists([old_key, "other_hash"]) == [True, True]
+    assert host.host_buffer[:8] == bytes(8)
+    backend.release_reads.set()
+    assert _completions(executor, 1)[0].success == (True,)
+    assert host.host_buffer[:8] == b"original"
+    assert executor.delete_namespace()
+    assert backend.batch_exists([old_key, "other_hash"]) == [False, True]
+    executor.set_weight_version("v2")
+    assert executor.key_prefix == "new-v2"
+    new_key = executor._object_key("hash", 0, 0)
+    _seed(backend, [new_key], b"newbytes")
+    assert executor.delete_namespace()
+    assert backend.batch_exists([new_key, "other_hash"]) == [False, True]
+
+
+def test_metrics_sample_pending_transitions_without_extra_feedback(
+    runtime, monkeypatch
+):
+    import tokenspeed.runtime.engine.l3_cache_hooks as module
+
+    config, _, _, executor, _ = runtime
+    now = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    registry = CollectorRegistry()
+    metrics = L3Metrics(
+        labels={},
+        enabled=True,
+        reporters=["prometheus"],
+        event_sink=None,
+        registry=registry,
+    )
+    scheduler = _scheduler(config)
+    h = _hooks(scheduler, executor, config, metrics)
+
+    def value(metric, **labels):
+        return registry.get_sample_value(f"tokenspeed:l3_{metric}", labels)
+
+    def completed(kind):
+        row = next(row for row in executor.snapshot().operations if row.kind == kind)
+        return dict(row.events)["completed"]
+
+    h.record_metrics()
+    assert value("scheduler_resources", resource="operations") == 0
+    query = _query(scheduler, "metrics")
+    executor.submit_operations([query])
+    _wait_until(lambda: completed("query") == 1)
+    h.record_metrics()
+    assert value("scheduler_resources", resource="waiting_requests") == 1
+    assert value("io_events_total", kind="query", event="completed") == 1
+    assert scheduler.storage_pending() and not executor.is_idle()
+
+    # An unchanged pending state is throttled even when new I/O has completed.
+    executor.submit(StorageJob(2, "put", ("metrics-object",), (0,), (8,)))
+    _wait_until(lambda: completed("put") == 1)
+    h.record_metrics()
+    assert value("io_events_total", kind="put", event="completed") is None
+    now[0] += 1
+    h.record_metrics()
+    assert value("io_events_total", kind="put", event="completed") == 1
+
+    for result in _completions(executor, 2):
+        if result.op_id == query.op_id:
+            _finish(scheduler, result)
+    plan = scheduler.next_execution_plan()
+    assert list(plan.forward[0].extend_prefix_lens) == [0]
+    assert not scheduler.storage_pending()
+    # Returning to idle is visible immediately, without another second passing.
+    h.record_metrics()
+    assert value("scheduler_resources", resource="operations") == 0
+    assert value("io_events_total", kind="query", event="completed") == 1
+
+
+def test_full_read_queue_rejects_without_invalidating_and_recovers(runtime):
+    _, host, backend, executor, _ = runtime
+    _seed(backend, ["blocker", "retry"], b"restored")
+    backend.release_reads.clear()
+    executor.submit(StorageJob(1, "get", ("blocker",), (240,), (8,)))
+    assert backend.read_started.wait(2)
+    # Cancelled descriptors keep occupying the bounded queue until its worker
+    # returns, even after polling has returned their operation credits.
+    for op_id in (2, 3):
+        executor.submit(StorageJob(op_id, "get", ("retry",), ((op_id - 1) * 8,), (8,)))
+        executor.cancel(op_id)
+        result = _completions(executor, 1)[0]
+        assert result.op_id == op_id and result.retired
+        assert result.success == (False,) and result.object_failures == (False,)
+    executor.submit(StorageJob(4, "get", ("retry",), (24,), (8,)))
+    result = _completions(executor, 1)[0]
+    assert result.op_id == 4 and result.retired
+    assert result.success == (False,) and result.object_failures == (False,)
+    assert host.host_buffer[:32] == bytes(32)
+    row = next(row for row in executor.snapshot().operations if row.kind == "get")
+    assert dict(row.events)["rejected"] == 1
+    assert dict(row.events)["backend_calls"] == 1
+    backend.release_reads.set()
+    assert _completions(executor, 1)[0].success == (True,)
+    _wait_until(lambda: executor._queues["get"].empty())
+    executor.submit(StorageJob(5, "get", ("retry",), (32,), (8,)))
+    assert _completions(executor, 1)[0].success == (True,)
+    assert host.host_buffer[8:32] == bytes(24)
+    assert host.host_buffer[32:40] == b"restored"
+    assert executor.snapshot().health.state == "healthy"
+
+
+def test_transient_get_failure_retries_same_remote_keys_after_recovery(runtime):
+    config, host, backend, executor, now = runtime
+    scheduler = _scheduler(config)
+    query = _query(scheduler, "first")
+    keys = _keys(executor, query)
+    _seed(backend, keys, b"abcdefgh")
+    executor.submit_operations([query])
+    _finish(scheduler, _completions(executor, 1)[0])
+    read = storage_ops(scheduler.next_execution_plan())[0]
+    assert read.kind == ts.StorageKind.Get
+    backend.fail_next_read = True
+    executor.submit_operations([read])
+    result = _completions(executor, 1)[0]
+    assert result.retired and not any(result.object_failures)
+    _finish(scheduler, result)
+    assert scheduler.storage_negative_keys() == 0
+    assert executor.snapshot().health.state == "open"
+    plan = scheduler.next_execution_plan()
+    assert list(plan.forward[0].extend_prefix_lens) == [0]
+    finished = ts.ForwardEvent.Abort()
+    finished.request_id = "first"
+    _send(scheduler, finished)
+    now[0] += 100  # Permit the monitor's single recovery probe.
+    query2 = _query(scheduler, "after-recovery")
+    assert _keys(executor, query2) == keys
+    executor.submit_operations([query2])
+    _finish(scheduler, _completions(executor, 1)[0])
+    assert executor.snapshot().health.state == "healthy"
+    read2 = storage_ops(scheduler.next_execution_plan())[0]
+    assert read2.keys == read.keys
+    executor.submit_operations([read2])
+    _finish(scheduler, _completions(executor, 1)[0])
+    plan = scheduler.next_execution_plan()
+    assert list(plan.forward[0].extend_prefix_lens) == [7]
+    assert all(
+        host.host_buffer[(block - 1) * 8 : block * 8] == b"abcdefgh"
+        for block in read2.host_blocks
+    )
+    assert scheduler.storage_negative_keys() == 0
+    assert scheduler.storage_quarantined() == 0

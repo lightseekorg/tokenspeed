@@ -7,6 +7,9 @@
 # copies of the Software, and to permit persons to whom the Software is
 # furnished to do so, subject to the following conditions:
 #
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -16,7 +19,7 @@
 # SOFTWARE.
 from __future__ import annotations
 
-from functools import wraps
+from functools import cache, wraps
 from inspect import signature
 
 import torch
@@ -100,7 +103,99 @@ if platform.is_nvidia and platform.is_blackwell:
         nvfp4_block_scale_interleave,
     )
 
-    fp4_quantize = _with_pdl_default(_fp4_quantize)
+    _fp4_quantize = _with_pdl_default(_fp4_quantize)
+
+    @cache
+    def _fp4_output_module(major: int, minor: int):
+        from flashinfer.quantization.fp4_quantization import (
+            gen_fp4_quantization_sm100_module,
+            gen_fp4_quantization_sm103_module,
+            gen_fp4_quantization_sm107_module,
+        )
+
+        generators = {
+            (10, 0): gen_fp4_quantization_sm100_module,
+            (10, 3): gen_fp4_quantization_sm103_module,
+            (10, 7): gen_fp4_quantization_sm107_module,
+        }
+        if (major, minor) not in generators:
+            raise ValueError(f"FP4 output buffers do not support SM{major}{minor}")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Initialize FP4 output buffers before graph capture")
+        return generators[major, minor]().build_and_load()
+
+    def fp4_quantize(
+        input: torch.Tensor,
+        global_scale: torch.Tensor | None = None,
+        *args,
+        out: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward FP4 quantization, or write linear NVFP4 into ``out``.
+
+        Without ``out``, all arguments follow FlashInfer's API. With ``out``,
+        pass FP16/BF16 ``input`` [M, K], ``global_scale``,
+        ``is_sf_swizzled_layout=False``, and optional ``enable_pdl`` only.
+        Output buffers are contiguous uint8 [M, K/2] and [ceil(M/16)*16, K/16].
+        Return the packed values and the first M scale rows.
+        """
+        if out is None:
+            return _fp4_quantize(input, global_scale, *args, **kwargs)
+        if args or kwargs.keys() - {"is_sf_swizzled_layout", "enable_pdl"}:
+            raise ValueError(
+                "FP4 output buffers accept only linear layout and PDL options"
+            )
+        if kwargs.get("is_sf_swizzled_layout", True):
+            raise ValueError("FP4 output buffers require linear scales")
+        from flashinfer.quantization.nvfp4_quantization_utils import (
+            nvfp4_4over6_code,
+            resolve_nvfp4_4over6,
+        )
+
+        x = input
+        if (
+            x.ndim != 2
+            or not x.is_cuda
+            or not x.is_contiguous()
+            or x.dtype not in (torch.float16, torch.bfloat16)
+            or x.shape[1] % 64 != 0
+        ):
+            raise ValueError(
+                "FP4 output buffers require contiguous CUDA FP16/BF16 [M, K], K % 64 == 0"
+            )
+        values, scales = out
+        rows, cols = x.shape
+        expected = ((rows, cols // 2), ((rows + 15) // 16 * 16, cols // 16))
+        for tensor, shape in zip(out, expected, strict=True):
+            if (
+                tensor.shape != shape
+                or tensor.dtype != torch.uint8
+                or tensor.device != x.device
+                or not tensor.is_contiguous()
+                or tensor.data_ptr() % 16 != 0
+            ):
+                raise ValueError(
+                    f"FP4 output buffer must be aligned contiguous uint8 {shape} on {x.device}"
+                )
+        if rows == 0:
+            return values, scales
+        if global_scale is not None:
+            global_scale = global_scale.to(device=x.device, dtype=torch.float32)
+        major, minor = torch.cuda.get_device_capability(x.device)
+        _fp4_output_module(major, minor).fp4_quantize(
+            x,
+            global_scale,
+            values,
+            scales.reshape(-1),
+            16,
+            False,
+            False,
+            False,
+            False,
+            _resolve_enable_pdl(kwargs.get("enable_pdl")),
+            nvfp4_4over6_code(resolve_nvfp4_4over6()),
+        )
+        return values, scales[:rows]
 
     @register_kernel(
         "quantization",

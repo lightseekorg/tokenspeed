@@ -321,6 +321,8 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         layer.weight.data.unflatten(-1, (-1, 32)).mul_(scale.unsqueeze(-1))
         layer.register_parameter("weight_scale_inv", None)
         layer.quant_method = UnquantizedLinearMethod()
+        # Plans the batch-invariant GEMM under a bitwise envelope.
+        layer.quant_method.process_weights_after_loading(layer)
 
     @torch.no_grad()
     def prepare_weight_scales(self, layer: nn.Module) -> None:
@@ -691,8 +693,8 @@ def _reduce_hc_post(
 def _v41_hc_input_fp8(
     x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    """HC input, plus its group-32 FP8 codes and scales on CDNA4 (else None)."""
-    if not (x.is_cuda and current_platform().is_cdna4):
+    """HC input, plus its group-32 FP8 codes and scales on CDNA4/5 (else None)."""
+    if not (x.is_cuda and (current_platform().is_cdna4 or current_platform().is_cdna5)):
         return _v41_hc_input(x, pre, norm), None, None
     return mhc_apply_pre_quantize_fp8(x, pre, norm.weight, norm.variance_epsilon)
 
@@ -1066,7 +1068,11 @@ class DeepseekV41Attention(nn.Module):
         if (
             qr.is_cuda
             and qr.dtype == torch.bfloat16
-            and (current_platform().is_nvidia or current_platform().is_cdna4)
+            and (
+                current_platform().is_nvidia
+                or current_platform().is_cdna4
+                or current_platform().is_cdna5
+            )
             and isinstance(self.wq_b.quant_method, _ReferenceFp8LinearMethod)
         ):
             qr, q_input, q_scale = rmsnorm_quantize_fp8_group32(
@@ -1200,7 +1206,11 @@ class DeepseekV41Attention(nn.Module):
             if swa.is_cuda and self.head_dim == 512 and self.rotary_emb.dim == 64:
                 self.rotary_emb._prepare_cache(swa.device)
                 swa_rope_cache = self.rotary_emb.cos_sin_cache
-                if current_platform().is_blackwell or current_platform().is_cdna4:
+                if (
+                    current_platform().is_blackwell
+                    or current_platform().is_cdna4
+                    or current_platform().is_cdna5
+                ):
                     swa_norm_weight = self.kv_norm.weight
                 else:
                     swa = _attention_norm(swa, self.kv_norm)
@@ -1219,10 +1229,11 @@ class DeepseekV41Attention(nn.Module):
             if record.candidates is not None:
                 for tensor in (record.candidates.block_ids, record.candidates.lengths):
                     tensor.record_stream(consumer)
-        # CDNA4 rotates the attention output back inside the attention kernel.
+        # CDNA4/5 rotate the attention output back inside the attention kernel.
         out_rope_cache = (
             self.rotary_emb.inverse_cos_sin_cache
-            if q.is_cuda and current_platform().is_cdna4
+            if q.is_cuda
+            and (current_platform().is_cdna4 or current_platform().is_cdna5)
             else None
         )
         out = backend.forward_v41(
@@ -1257,7 +1268,7 @@ class DeepseekV41Attention(nn.Module):
         method = self.wo_b.quant_method
         if (
             grouped.is_cuda
-            and current_platform().is_cdna4
+            and (current_platform().is_cdna4 or current_platform().is_cdna5)
             and isinstance(method, _ReferenceFp8LinearMethod)
             and method.prepared_weight_scales is None
         ):
