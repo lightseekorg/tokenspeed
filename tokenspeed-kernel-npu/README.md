@@ -25,6 +25,10 @@ The BF16 local-expert chain keeps FP32 router coefficients through
 FinalizeRouting. Expert GEMM inputs, weights and outputs remain BF16; routing
 coefficients are not rounded to BF16 before the weighted sum.
 
+The runtime's unclamped `SiluAndMul` uses the fused NPU SwiGLU operator through
+`tokenspeed-kernel`, including shared-expert FFNs. Clamped activations keep
+the native FP32 calculation; FP8 output is unsupported on NPU.
+
 The Ascend plugin's explicit prefill composition can prepare a
 `W4A4GroupedPlan` from the existing fused W4A4 weight plan. It shares NZ
 weights, encodes official GMM scales once, and executes Cube FlatQuant before
