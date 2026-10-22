@@ -727,7 +727,7 @@ scratch initialization remains necessary for unscored columns and atomic sums.
 The gfx950 and gfx1250 row selectors read live-width strides directly, including
 broadcast limits and strided single-row tail tiles. Such tails retain their stride
 after PyTorch `contiguous()`, so selection cannot require a unit limit stride.
-Block selection suppresses scalar specialization only for the new table bound.
+Block selection suppresses scalar specialization only for the table bound.
 Its existing scalar arguments retain their alignment information: removing that
 information scalarizes vector score loads and regresses the measured Full
 candidate-source path. Widths and strides still arrive as runtime integers;
