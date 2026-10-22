@@ -1471,7 +1471,8 @@ class MuseSparkMoE(nn.Module):
         Without ``project`` the combined expert rows are returned unprojected
         for a boundary that applies ``post_expert_proj`` itself.
         """
-        # The graph phase warms the fork serially, so capture never first-touches it.
+        # Without an auxiliary stream (gfx950) the branch runs inline. Otherwise
+        # the graph phase warms the fork serially, so capture never first-touches it.
         with self.stream_fork.scope(
             enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
         ) as fork:
@@ -1970,8 +1971,14 @@ class MuseSparkModel(BaseTransformerModel):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> nn.ModuleList:
-        """Build the decoder layers around one shared auxiliary stream."""
-        self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        """Build decoder layers, sharing an auxiliary stream where enabled."""
+        # On gfx950 a CUDA-graph fork/join idles the GPU for longer than the
+        # router work it would hide, so the router runs in the main stream there.
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if torch.cuda.is_available() and not current_platform().is_cdna4
+            else None
+        )
         return make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: self.layer_cls(
