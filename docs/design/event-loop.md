@@ -677,3 +677,12 @@ termination and constructor-error cleanup share one process-local shutdown
 latch: once cleanup starts, later worker notifications cannot interrupt it.
 Signal callbacks do not log or enumerate processes; cleanup runs outside the
 callback.
+
+## External encoder with an aggregated language model
+
+`--enable-encoder-disaggregation` explicitly enables the existing EPD admission
+and receive-buffer budgeting in aggregated (`null`) mode. Only requests carrying
+encoder handshakes wait for remote embeddings; local image and text requests
+retain their normal admission path. The device side owns receive buffers and
+reassembly as on a prefill node. This does not construct a P/D KV-transfer peer
+or change where decode executes.
