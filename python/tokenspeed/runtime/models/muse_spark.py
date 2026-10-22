@@ -1847,7 +1847,7 @@ class MuseSparkDecoderLayer(nn.Module):
             )
         )
         projection = self.mlp.post_expert_proj
-        # One decode row projects only this rank's post-expert columns; the
+        # A few decode rows project only this rank's post-expert columns; the
         # boundary gathers them, which beats streaming the replicated weight.
         project_in_boundary = (
             owned_global_rows is None
