@@ -1551,6 +1551,7 @@ def test_kda_fused_verify_and_replay_match_sequential_reference(
         f_a_stride=f_a_out.stride(0),
         beta_stride=replay_beta.stride(0),
         state_stride=state_pool.stride(0),
+        state_dtype=state_pool.dtype,
         gate_stride=replay_gate.stride(0),
         conv_width=4,
         lower_bound=LOWER_BOUND,
